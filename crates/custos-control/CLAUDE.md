@@ -39,8 +39,14 @@ epoch compare-and-swap transactions.
   driver snapshots + rewrites the WAL to `wal_image()` (snapshot + hard + log
   tail) via atomic `Disk::replace` — bounding both. Recovery restores the
   snapshot and **re-applies the tail** (commit re-advances), so a CAS lands once.
-  A follower behind the leader's compacted prefix is caught up via
-  `InstallSnapshot`. See `docs/wal.md`.
+  A follower behind the leader's compacted prefix is caught up via a **chunked**
+  `InstallSnapshot`: the leader serializes `Metadata` and ships it in
+  offset-addressed chunks of `SNAPSHOT_CHUNK_BYTES` (one per round trip, resuming
+  from the per-peer `snapshot_offset`); the follower reassembles into a
+  contiguous buffer (`incoming_snapshot`) and installs **atomically** only when
+  the final chunk completes the buffer. `InstallSnapshotResp.next_offset` drives
+  the next chunk; its `last_index` is non-zero only on completion. Chunking is
+  all in the sync core (no I/O), so it stays deterministic. See `docs/wal.md`.
 - `CasTabletReplicas` applies only if the tablet's epoch matches, then bumps it
   — evaluated identically on every replica, so accept/reject is consistent.
 - **Automatic placement (ADR 0005).** Policies are replicated in `Metadata`
@@ -54,7 +60,9 @@ epoch compare-and-swap transactions.
   epoch-rejected). `custos-placement` is a **normal** dependency now (no cycle).
 - Commit advances only for **current-term** entries via majority `matchIndex`
   (the Raft safety rule). Don't relax this.
-- Not implemented: chunked snapshot transfer (snapshots ship whole).
+- Snapshot transfer is **chunked** (see above). Deferred: cross-leader resumption
+  (a transfer interrupted by a leader change restarts at offset 0) and chunk-stream
+  flow-control.
 
 ## Tests
 
@@ -62,6 +70,7 @@ epoch compare-and-swap transactions.
 multi-seed convergence (`control_raft.rs`), durability/recovery
 (`persistence.rs`), split/merge (`tablet_split_merge.rs`), snapshot truncation
 (`wal_compaction.rs`), a partitioned follower catching up via `InstallSnapshot`
+plus a far-behind follower catching up via a **multi-chunk** `InstallSnapshot`
 (`install_snapshot.rs`), process restart-and-rejoin (`restart.rs`, using
 `Simulator::stop`), caller-driven placement reconcile through Raft under a
 replica death + follower crash (`placement_reconcile.rs`, driving

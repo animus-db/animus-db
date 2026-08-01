@@ -52,8 +52,19 @@ truncation, commit only of current-term entries via majority `matchIndex`).
   flow is diagrammed in [`docs/wal.md`](../wal.md). Restart-and-rejoin is now
   tested end-to-end in the simulator (`Simulator::stop` drops a node's tasks +
   volatile state; a fresh node started on the same disk recovers and rejoins —
-  see `tests/restart.rs`). **Still deferred:** chunked snapshot transfer (the
-  snapshot ships in a single message).
+  see `tests/restart.rs`). The `InstallSnapshot` RPC is **chunked**: the leader
+  splits the serialized `Metadata` into offset-addressed chunks of at most
+  `SNAPSHOT_CHUNK_BYTES` and ships them one per round trip (tracking each
+  follower's byte offset in `snapshot_offset`); the follower reassembles them in
+  a contiguous buffer and installs the snapshot atomically only once every byte
+  has arrived (`InstallSnapshotResp.next_offset` drives the next chunk, and
+  `last_index` is echoed non-zero only on completion). Chunking lives entirely in
+  the sync `RaftCore` (chunk production + follower reassembly), so it stays
+  I/O-free and deterministic. A multi-chunk transfer is tested in
+  `tests/install_snapshot.rs::follower_catches_up_via_multi_chunk_snapshot`.
+  **Still deferred:** a transfer interrupted by a leader change restarts from
+  offset 0 (no cross-leader resumption), and there is no flow-control on the
+  chunk stream.
 - If we later need the maturity of `openraft`, the `Env`-driven boundary (a sync
   core + an I/O driver) is a clean place to swap implementations, and a `madsim`
   backend behind `Env` (ADR 0003) would let a third-party Raft run
