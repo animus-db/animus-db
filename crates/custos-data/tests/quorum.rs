@@ -11,7 +11,7 @@ use custos_data::{DataClient, ReadResult, TabletView, serve_replica};
 use custos_env::EnvExt;
 use custos_sim::{SimEnv, Simulator};
 use custos_storage::MemoryEngine;
-use custos_tablet::Epoch;
+use custos_tablet::{Epoch, TabletId};
 
 const REPLICAS: [u64; 3] = [0, 1, 2];
 const CLIENT: u64 = 10;
@@ -20,6 +20,7 @@ const TIMEOUT: Duration = Duration::from_secs(2);
 fn view(epoch: Epoch) -> TabletView {
     // R + W = 4 > N = 3 ⇒ a read intersects every acknowledged write.
     TabletView {
+        tablet: TabletId(1),
         replicas: REPLICAS.to_vec(),
         epoch,
         r: 2,

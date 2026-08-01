@@ -69,6 +69,19 @@ pub enum MetaCommand {
         expected_epoch: Epoch,
         replicas: Vec<NodeId>,
     },
+    /// Split `tablet` at `split_key` into `[start, split_key)` (the original,
+    /// with a bumped epoch) and `[split_key, end)` (a new tablet `new_id`,
+    /// inheriting the replica set at [`Epoch::INITIAL`]). The split key must lie
+    /// strictly inside the tablet's range.
+    SplitTablet {
+        tablet: TabletId,
+        split_key: Vec<u8>,
+        new_id: TabletId,
+    },
+    /// Merge adjacent tablets `left` and `right` (where `left.end == right.start`
+    /// and they share a replica set) into `left`, extended to cover both ranges
+    /// with a bumped epoch; `right` is removed.
+    MergeTablets { left: TabletId, right: TabletId },
 }
 
 /// The deterministic result of applying a [`MetaCommand`].
@@ -132,6 +145,44 @@ impl Metadata {
                     ApplyOutcome::Applied
                 }
             },
+            MetaCommand::SplitTablet {
+                tablet,
+                split_key,
+                new_id,
+            } => {
+                if self.tablets.contains_key(new_id) {
+                    return ApplyOutcome::Rejected("new tablet id already exists");
+                }
+                let Some(source) = self.tablets.get(tablet) else {
+                    return ApplyOutcome::Rejected("no such tablet");
+                };
+                let Some((left, right)) = source.range.split_at(split_key) else {
+                    return ApplyOutcome::Rejected("split key not strictly inside range");
+                };
+                let new_tablet = Tablet::new(*new_id, right, source.replicas.clone());
+                let source = self.tablets.get_mut(tablet).expect("tablet present");
+                source.range = left;
+                source.epoch = source.epoch.next();
+                self.tablets.insert(*new_id, new_tablet);
+                ApplyOutcome::Applied
+            }
+            MetaCommand::MergeTablets { left, right } => {
+                let (Some(l), Some(r)) = (self.tablets.get(left), self.tablets.get(right)) else {
+                    return ApplyOutcome::Rejected("no such tablet");
+                };
+                if !l.range.abuts(&r.range) {
+                    return ApplyOutcome::Rejected("tablets are not adjacent");
+                }
+                if l.replicas != r.replicas {
+                    return ApplyOutcome::Rejected("tablets have different replica sets");
+                }
+                let new_end = r.range.end.clone();
+                let l = self.tablets.get_mut(left).expect("tablet present");
+                l.range.end = new_end;
+                l.epoch = l.epoch.next();
+                self.tablets.remove(right);
+                ApplyOutcome::Applied
+            }
         }
     }
 }

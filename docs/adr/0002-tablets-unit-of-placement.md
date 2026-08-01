@@ -21,10 +21,12 @@ tablet's replica set or range.
 
 The epoch is the fencing token for the data plane (ADR 0001): a data-plane
 operation carries the epoch the client/router believed current, and a replica
-rejects it if the operation's epoch is older than the replica's. Tablets are
-designed to **split and merge** later, but split/merge is explicitly out of
-scope for the first milestones — the initial model is a single tablet covering
-the whole keyspace.
+rejects it if the operation's epoch is older than the replica's (fencing is
+tracked **per tablet**). Tablets **split and merge** via control-plane
+commands (`SplitTablet`/`MergeTablets`), each bumping the affected tablet's
+epoch; the data-plane `Router` resolves a key to its owning tablet from a cached
+tablet map. Choosing split points automatically, and rebalancing replica sets on
+split/merge, remain future work — splits here keep the parent's replica set.
 
 ## Consequences
 

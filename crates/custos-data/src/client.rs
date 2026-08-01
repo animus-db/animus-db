@@ -4,16 +4,19 @@
 use std::time::Duration;
 
 use custos_env::{Env, NodeId};
-use custos_tablet::{Epoch, Tablet};
+use custos_tablet::{Epoch, Tablet, TabletId};
 use futures::future::{Either, select};
 
 use crate::DataMsg;
 
-/// The coordinator's routing view of a tablet: its replica set, the epoch to
-/// fence with, and the read/write quorum sizes. Read from cached control-plane
-/// metadata (ADR 0001). Choose `r + w > replicas.len()` for read-your-writes.
+/// The coordinator's routing view of a tablet: which tablet, its replica set,
+/// the epoch to fence with, and the read/write quorum sizes. Read from cached
+/// control-plane metadata (ADR 0001). Choose `r + w > replicas.len()` for
+/// read-your-writes.
 #[derive(Clone, Debug)]
 pub struct TabletView {
+    /// The tablet this view routes to.
+    pub tablet: TabletId,
     /// The tablet's replica node ids.
     pub replicas: Vec<NodeId>,
     /// The epoch stamped on operations (the fencing token).
@@ -29,11 +32,40 @@ impl TabletView {
     #[must_use]
     pub fn from_tablet(tablet: &Tablet, r: usize, w: usize) -> Self {
         Self {
+            tablet: tablet.id,
             replicas: tablet.replicas.clone(),
             epoch: tablet.epoch,
             r,
             w,
         }
+    }
+}
+
+/// Routes a key to the tablet that owns it, using a cached snapshot of the
+/// tablet map. The tablets are expected to partition the keyspace into disjoint
+/// ranges (the control plane maintains this via split/merge).
+#[derive(Clone, Debug)]
+pub struct Router {
+    tablets: Vec<Tablet>,
+    r: usize,
+    w: usize,
+}
+
+impl Router {
+    /// Build a router over a tablet map with the given quorum sizes.
+    #[must_use]
+    pub fn new(tablets: Vec<Tablet>, r: usize, w: usize) -> Self {
+        Self { tablets, r, w }
+    }
+
+    /// Resolve the [`TabletView`] for the tablet owning `key`, or `None` if no
+    /// tablet covers it.
+    #[must_use]
+    pub fn view_for(&self, key: &[u8]) -> Option<TabletView> {
+        self.tablets
+            .iter()
+            .find(|t| t.range.contains(key))
+            .map(|t| TabletView::from_tablet(t, self.r, self.w))
     }
 }
 
@@ -72,6 +104,7 @@ impl<E: Env> DataClient<E> {
         let req = self.env.next_u64();
         let msg = DataMsg::Write {
             req,
+            tablet: view.tablet,
             epoch: view.epoch,
             key: key.to_vec(),
             value: value.to_vec(),
@@ -102,6 +135,7 @@ impl<E: Env> DataClient<E> {
         let req = self.env.next_u64();
         let msg = DataMsg::Read {
             req,
+            tablet: view.tablet,
             epoch: view.epoch,
             key: key.to_vec(),
         };

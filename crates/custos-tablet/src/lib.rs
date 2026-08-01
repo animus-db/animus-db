@@ -2,9 +2,10 @@
 //! and migration, each with a replica set and a monotonic epoch (see
 //! `docs/adr/0002-tablets-unit-of-placement.md`).
 //!
-//! Split/merge and multi-tablet routing are out of scope for now; the initial
-//! model is a single tablet covering the whole keyspace. The epoch is the
-//! fencing token used by the data plane (ADR 0001).
+//! Ranges support [`KeyRange::split_at`] and [`KeyRange::abuts`] (the
+//! primitives behind control-plane tablet split/merge); the epoch is the
+//! fencing token used by the data plane (ADR 0001). Automatic split-point
+//! selection and replica rebalancing on split/merge remain future work.
 
 use custos_env::NodeId;
 use serde::{Deserialize, Serialize};
@@ -62,6 +63,36 @@ impl KeyRange {
     #[must_use]
     pub fn contains(&self, key: &[u8]) -> bool {
         key >= self.start.as_slice() && self.end.as_deref().is_none_or(|e| key < e)
+    }
+
+    /// Split into `[start, at)` and `[at, end)`. Returns `None` unless `at` lies
+    /// strictly inside the range (`start < at < end`), so neither side is empty.
+    #[must_use]
+    pub fn split_at(&self, at: &[u8]) -> Option<(KeyRange, KeyRange)> {
+        if at <= self.start.as_slice() {
+            return None;
+        }
+        if let Some(end) = self.end.as_deref() {
+            if at >= end {
+                return None;
+            }
+        }
+        let left = KeyRange {
+            start: self.start.clone(),
+            end: Some(at.to_vec()),
+        };
+        let right = KeyRange {
+            start: at.to_vec(),
+            end: self.end.clone(),
+        };
+        Some((left, right))
+    }
+
+    /// Whether this range is immediately followed by `next` (`self.end ==
+    /// next.start`), so the two can be merged into one contiguous range.
+    #[must_use]
+    pub fn abuts(&self, next: &KeyRange) -> bool {
+        self.end.as_deref() == Some(next.start.as_slice())
     }
 }
 
@@ -127,5 +158,44 @@ mod tests {
         assert!(t.has_replica(2));
         assert!(!t.has_replica(9));
         assert_eq!(t.epoch, Epoch::INITIAL);
+    }
+
+    #[test]
+    fn split_partitions_the_range() {
+        let (left, right) = KeyRange::whole().split_at(b"m").unwrap();
+        assert!(left.contains(b"a") && left.contains(b"l"));
+        assert!(!left.contains(b"m"));
+        assert!(right.contains(b"m") && right.contains(b"z"));
+        // The two halves are adjacent and recombine to the whole keyspace.
+        assert!(left.abuts(&right));
+    }
+
+    #[test]
+    fn split_rejects_out_of_range_or_boundary_keys() {
+        let r = KeyRange::new(b"b".to_vec(), Some(b"d".to_vec()));
+        assert!(
+            r.split_at(b"b").is_none(),
+            "split at start would make an empty left"
+        );
+        assert!(
+            r.split_at(b"d").is_none(),
+            "split at end would make an empty right"
+        );
+        assert!(r.split_at(b"a").is_none(), "split before start");
+        assert!(r.split_at(b"e").is_none(), "split after end");
+        assert!(r.split_at(b"c").is_some());
+    }
+
+    #[test]
+    fn abuts_only_when_contiguous() {
+        let a = KeyRange::new(b"a".to_vec(), Some(b"m".to_vec()));
+        let b = KeyRange::new(b"m".to_vec(), Some(b"z".to_vec()));
+        let gap = KeyRange::new(b"n".to_vec(), Some(b"z".to_vec()));
+        assert!(a.abuts(&b));
+        assert!(!a.abuts(&gap));
+        assert!(
+            !KeyRange::whole().abuts(&b),
+            "unbounded-above range abuts nothing"
+        );
     }
 }

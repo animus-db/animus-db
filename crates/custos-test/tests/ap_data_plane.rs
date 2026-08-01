@@ -94,6 +94,7 @@ async fn snapshot(env: &SimEnv, view: &TabletView, keys: &[u64]) -> Lists {
 
 fn view(epoch: Epoch, r: usize, w: usize) -> TabletView {
     TabletView {
+        tablet: custos_tablet::TabletId(1),
         replicas: REPLICAS.to_vec(),
         epoch,
         r,

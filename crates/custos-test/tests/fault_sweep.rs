@@ -16,7 +16,7 @@ use custos_data::{DataClient, ReadResult, TabletView, serve_replica};
 use custos_env::{Clock, EnvExt};
 use custos_sim::{NetConfig, SimEnv, Simulator};
 use custos_storage::MemoryEngine;
-use custos_tablet::Epoch;
+use custos_tablet::{Epoch, TabletId};
 use custos_test::history::Mop;
 use custos_test::{Recorder, check_convergence, check_durability};
 
@@ -36,6 +36,7 @@ fn kb(key: u64) -> Vec<u8> {
 }
 fn view() -> TabletView {
     TabletView {
+        tablet: TabletId(1),
         replicas: REPLICAS.to_vec(),
         epoch: Epoch::INITIAL,
         r: 2,

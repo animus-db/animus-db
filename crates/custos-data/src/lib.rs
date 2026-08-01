@@ -20,21 +20,25 @@
 pub mod client;
 pub mod replica;
 
-pub use client::{DataClient, ReadResult, TabletView};
+pub use client::{DataClient, ReadResult, Router, TabletView};
 pub use replica::{ReplicaHandle, serve_replica};
 
-use custos_tablet::Epoch;
+use custos_tablet::{Epoch, TabletId};
 use serde::{Deserialize, Serialize};
 
 /// Correlates a request with its responses.
 pub type ReqId = u64;
 
 /// Data-plane wire messages between a coordinator and a replica.
+///
+/// Each operation names the `tablet` it targets and carries the `epoch` the
+/// coordinator believes current; the replica fences per tablet (ADR 0002).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum DataMsg {
     /// Coordinator → replica: store `value` at `key` with MVCC `version`.
     Write {
         req: ReqId,
+        tablet: TabletId,
         epoch: Epoch,
         key: Vec<u8>,
         value: Vec<u8>,
@@ -45,6 +49,7 @@ pub enum DataMsg {
     /// Coordinator → replica: read the latest value at `key`.
     Read {
         req: ReqId,
+        tablet: TabletId,
         epoch: Epoch,
         key: Vec<u8>,
     },

@@ -1,34 +1,56 @@
 //! The per-node data replica server: applies quorum writes/reads to local
-//! storage and enforces epoch fencing.
+//! storage and enforces epoch fencing, per tablet.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use custos_env::{Env, EnvExt};
 use custos_storage::StorageEngine;
-use custos_tablet::Epoch;
+use custos_tablet::{Epoch, TabletId};
 
 use crate::DataMsg;
 
-/// A handle to a running replica, for inspection and epoch updates.
+/// Per-tablet known epochs, defaulting to a floor for tablets not yet seen.
+#[derive(Debug)]
+struct Epochs {
+    known: BTreeMap<TabletId, Epoch>,
+    floor: Epoch,
+}
+
+impl Epochs {
+    fn get(&self, tablet: TabletId) -> Epoch {
+        self.known.get(&tablet).copied().unwrap_or(self.floor)
+    }
+}
+
+/// A handle to a running replica, for inspection and per-tablet epoch updates.
 ///
-/// The replica's known epoch is advanced by the control plane on a topology
-/// change; an operation bearing an older epoch is fenced (rejected).
+/// A replica's known epoch for a tablet is advanced by the control plane on a
+/// topology change; an operation bearing an older epoch for that tablet is
+/// fenced (rejected).
 #[derive(Clone)]
 pub struct ReplicaHandle<S: StorageEngine> {
-    epoch: Arc<Mutex<Epoch>>,
+    epochs: Arc<Mutex<Epochs>>,
     storage: S,
 }
 
 impl<S: StorageEngine> ReplicaHandle<S> {
-    /// The replica's current known epoch.
-    pub fn epoch(&self) -> Epoch {
-        *self.epoch.lock().expect("replica epoch poisoned")
+    /// The replica's current known epoch for `tablet`.
+    pub fn epoch(&self, tablet: TabletId) -> Epoch {
+        self.epochs
+            .lock()
+            .expect("replica epochs poisoned")
+            .get(tablet)
     }
 
-    /// Update the replica's known epoch (e.g. on a control-plane topology
-    /// change). Operations older than this are fenced.
-    pub fn set_epoch(&self, epoch: Epoch) {
-        *self.epoch.lock().expect("replica epoch poisoned") = epoch;
+    /// Set the replica's known epoch for `tablet` (e.g. on a control-plane
+    /// topology change). Operations older than this for that tablet are fenced.
+    pub fn set_epoch(&self, tablet: TabletId, epoch: Epoch) {
+        self.epochs
+            .lock()
+            .expect("replica epochs poisoned")
+            .known
+            .insert(tablet, epoch);
     }
 
     /// The replica's local storage engine (clones share state).
@@ -37,18 +59,22 @@ impl<S: StorageEngine> ReplicaHandle<S> {
     }
 }
 
-/// Start a replica server on `env`, backed by `storage`, knowing `epoch`.
+/// Start a replica server on `env`, backed by `storage`, with a `floor` epoch
+/// applied to any tablet it has not yet learned an epoch for.
 ///
 /// Spawns the serve loop and returns a handle. The serve loop runs until the
 /// task is dropped (i.e. for the life of the simulation/process).
-pub fn serve_replica<E, S>(env: E, storage: S, epoch: Epoch) -> ReplicaHandle<S>
+pub fn serve_replica<E, S>(env: E, storage: S, floor: Epoch) -> ReplicaHandle<S>
 where
     E: Env,
     S: StorageEngine + 'static,
 {
-    let epoch = Arc::new(Mutex::new(epoch));
+    let epochs = Arc::new(Mutex::new(Epochs {
+        known: BTreeMap::new(),
+        floor,
+    }));
     let handle = ReplicaHandle {
-        epoch: Arc::clone(&epoch),
+        epochs: Arc::clone(&epochs),
         storage: storage.clone(),
     };
 
@@ -59,8 +85,7 @@ where
                 tracing::warn!("undecodable data message dropped");
                 continue;
             };
-            let reply = handle_msg(&storage, &epoch, msg);
-            if let Some(reply) = reply {
+            if let Some(reply) = handle_msg(&storage, &epochs, msg) {
                 let bytes = serde_json::to_vec(&reply).expect("data message serializes");
                 env.send(envelope.from, bytes).await;
             }
@@ -71,24 +96,21 @@ where
 }
 
 /// Handle one inbound message, returning the reply to send (if any).
-///
-/// Fencing rule (ADR 0002): reject an operation whose epoch is *older* than the
-/// replica's known epoch. An operation with a newer epoch is honored and
-/// advances the replica's epoch (the replica was behind on topology).
 fn handle_msg<S: StorageEngine>(
     storage: &S,
-    epoch: &Arc<Mutex<Epoch>>,
+    epochs: &Arc<Mutex<Epochs>>,
     msg: DataMsg,
 ) -> Option<DataMsg> {
     match msg {
         DataMsg::Write {
             req,
-            epoch: op_epoch,
+            tablet,
+            epoch,
             key,
             value,
             version,
         } => {
-            if fenced(epoch, op_epoch) {
+            if fenced(epochs, tablet, epoch) {
                 return Some(DataMsg::WriteAck { req, ok: false });
             }
             // A monotonic-version conflict means a newer write already won
@@ -99,10 +121,11 @@ fn handle_msg<S: StorageEngine>(
         }
         DataMsg::Read {
             req,
-            epoch: op_epoch,
+            tablet,
+            epoch,
             key,
         } => {
-            if fenced(epoch, op_epoch) {
+            if fenced(epochs, tablet, epoch) {
                 return Some(DataMsg::ReadResp {
                     req,
                     ok: false,
@@ -125,15 +148,17 @@ fn handle_msg<S: StorageEngine>(
     }
 }
 
-/// Whether `op_epoch` is stale relative to the replica's known epoch. Advances
-/// the known epoch when the operation carries a newer one.
-fn fenced(epoch: &Arc<Mutex<Epoch>>, op_epoch: Epoch) -> bool {
-    let mut known = epoch.lock().expect("replica epoch poisoned");
-    if op_epoch < *known {
+/// Whether `op_epoch` is stale for `tablet` relative to the replica's known
+/// epoch. Advances the known epoch when the operation carries a newer one
+/// (the replica was behind on this tablet's topology). Fencing rule: ADR 0002.
+fn fenced(epochs: &Arc<Mutex<Epochs>>, tablet: TabletId, op_epoch: Epoch) -> bool {
+    let mut e = epochs.lock().expect("replica epochs poisoned");
+    let known = e.get(tablet);
+    if op_epoch < known {
         true
     } else {
-        if op_epoch > *known {
-            *known = op_epoch;
+        if op_epoch > known {
+            e.known.insert(tablet, op_epoch);
         }
         false
     }
