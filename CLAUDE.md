@@ -15,7 +15,11 @@ log-truncating snapshots with `InstallSnapshot`),
 the quorum data-plane vertical slice (with read-repair, background
 anti-entropy convergence via segment-digest exchange of only divergent ranges,
 delete/tombstone propagation, and residency-bounded repair), tablet split/merge
-+ multi-tablet routing, the Elle-style recorder/checker (`custos-test`), a
++ multi-tablet routing, the Elle-style recorder/checker (`custos-test`) — now
+including an **end-to-end correctness test of the assembled stack** (control
+plane + data plane at scale: 3 Raft nodes, 2 tablets, 6 replicas, 4 concurrent
+clients) under fault injection (partition + leader kill + crash + heal), checked
+for serializability/durability/convergence — a
 DynamoDB-style item API over the core plus a **DynamoDB JSON wire protocol**
 (`custos-dynamo`: CreateTable/PutItem/GetItem/DeleteItem/Query AttributeValue-JSON
 translation, with a per-table schema registry, sort-key conditions =/BETWEEN/

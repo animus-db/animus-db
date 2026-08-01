@@ -18,6 +18,7 @@ serde_json.workspace = true
 [dev-dependencies]
 custos-env.workspace = true
 custos-sim.workspace = true
+custos-control.workspace = true
 custos-data.workspace = true
 custos-storage.workspace = true
 custos-tablet.workspace = true
