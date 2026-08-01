@@ -12,3 +12,14 @@ description = "CustosDB leaderless data plane: quorum read/write, routing, epoch
 workspace = true
 
 [dependencies]
+custos-env.workspace = true
+custos-tablet.workspace = true
+custos-storage.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+futures.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+custos-sim.workspace = true
+custos-control.workspace = true

@@ -1,5 +1,58 @@
-//! Leaderless AP data plane: quorum reads/writes for a tablet, routing via the
-//! control-plane tablet map, and epoch fencing (see
-//! `docs/adr/0001` and `docs/adr/0002`).
+//! Leaderless AP data plane: quorum reads/writes for a single tablet, routing
+//! via the control-plane tablet map, and epoch fencing (see ADR 0001, 0002).
 //!
-//! Populated in milestone M4.
+//! The data plane is the available half of CustosDB. A [`DataClient`]
+//! coordinator routes an operation to a tablet's replica set (a [`TabletView`]
+//! it reads from cached control-plane metadata) and collects a quorum of
+//! responses. With `R + W > N` a read observes the latest acknowledged write.
+//! Each operation carries the epoch the coordinator believed current; a
+//! [`replica`](crate::replica) **fences** operations bearing a stale epoch
+//! (ADR 0002), which is how a replica rejects a coordinator acting on an
+//! out-of-date tablet map.
+//!
+//! Because the coordinator routes from a *cached* view, the data plane keeps
+//! serving even while the control plane is unavailable — only topology changes
+//! (which bump the epoch) need the control plane (ADR 0001).
+//!
+//! - [`replica`] — the per-node storage replica server ([`serve_replica`]).
+//! - [`client`] — the [`DataClient`] quorum coordinator.
+
+pub mod client;
+pub mod replica;
+
+pub use client::{DataClient, ReadResult, TabletView};
+pub use replica::{ReplicaHandle, serve_replica};
+
+use custos_tablet::Epoch;
+use serde::{Deserialize, Serialize};
+
+/// Correlates a request with its responses.
+pub type ReqId = u64;
+
+/// Data-plane wire messages between a coordinator and a replica.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum DataMsg {
+    /// Coordinator → replica: store `value` at `key` with MVCC `version`.
+    Write {
+        req: ReqId,
+        epoch: Epoch,
+        key: Vec<u8>,
+        value: Vec<u8>,
+        version: u64,
+    },
+    /// Replica → coordinator: write acknowledgement (`ok == false` if fenced).
+    WriteAck { req: ReqId, ok: bool },
+    /// Coordinator → replica: read the latest value at `key`.
+    Read {
+        req: ReqId,
+        epoch: Epoch,
+        key: Vec<u8>,
+    },
+    /// Replica → coordinator: read response. `ok == false` if fenced; `value`
+    /// is `(version, bytes)` or `None` if the key is absent.
+    ReadResp {
+        req: ReqId,
+        ok: bool,
+        value: Option<(u64, Vec<u8>)>,
+    },
+}
