@@ -16,10 +16,11 @@ tablets, placement, consensus — not in local storage.
 We will hide storage behind a `StorageEngine` trait (ADR 0004) and not write a
 storage engine yet. The first backing implementation is a simple, fully
 deterministic **in-memory `BTreeMap`** engine, sufficient to exercise the
-distributed layer under simulation. A real persistent backend (RocksDB or
-`fjall`) can be added later behind the same trait, feature-gated, without
-touching the distributed code. A custom LSM engine is explicitly deferred,
-possibly indefinitely.
+distributed layer under simulation. A real persistent backend is added behind
+the same trait, feature-gated, without touching the distributed code: the
+pure-Rust **`fjall` LSM** (`FjallEngine`, feature `fjall`), with MVCC layered on
+top via an order-preserving, prefix-free key encoding plus an inverted-version
+suffix. A custom LSM engine is explicitly deferred, possibly indefinitely.
 
 ## Consequences
 

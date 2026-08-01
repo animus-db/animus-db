@@ -22,7 +22,13 @@
 
 mod memory;
 
+#[cfg(feature = "fjall")]
+mod fjall_engine;
+
 pub use memory::{MemoryEngine, MemorySnapshot};
+
+#[cfg(feature = "fjall")]
+pub use fjall_engine::{FjallEngine, FjallSnapshot};
 
 /// A storage key.
 pub type Key = Vec<u8>;
@@ -108,6 +114,9 @@ pub enum StorageError {
     /// the monotonic-version contract.
     #[error("non-monotonic version: {got} <= {latest}")]
     NonMonotonicVersion { got: Version, latest: Version },
+    /// An error from an underlying persistent backend.
+    #[error("storage backend error: {0}")]
+    Backend(String),
 }
 
 /// Result alias for storage operations.
