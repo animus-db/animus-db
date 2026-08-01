@@ -19,9 +19,14 @@ common map-of-maps core (ADR 0004) and the distributed planes (ADR 0001). The
 adapters translate surface syntax and semantics to core operations; they do not
 each carry their own engine.
 
-The adapters are **explicitly out of scope for the first milestones** and must
-not be started until the M4 vertical slice proves the distributed architecture.
-The crate skeletons exist only to fix the boundary.
+A first slice now exists: `custos-dynamo` provides a DynamoDB-style **item API**
+(`PutItem`/`GetItem`/`DeleteItem`/`Query`) mapped directly onto the
+`StorageEngine` core, demonstrating that the Dynamo-lineage data model
+translates cleanly. What remains is the surface-specific work — the DynamoDB
+HTTP/JSON wire protocol, and for CQL the binary protocol framing plus a
+parser/type system — and wiring the adapters to the distributed request path
+rather than a local engine. `custos-cql` stays a skeleton that maps onto the
+same core in the same way.
 
 ## Consequences
 

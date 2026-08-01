@@ -6,9 +6,13 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "CustosDB DynamoDB API adapter (later)."
+description = "CustosDB DynamoDB-style item API adapter over the common core."
 
 [lints]
 workspace = true
 
 [dependencies]
+custos-storage.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

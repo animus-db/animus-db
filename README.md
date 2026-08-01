@@ -59,7 +59,7 @@ data nodes keep serving on cached metadata; only topology changes block. See
 | `custos-placement` | Placement groups + topology labels + residency *(later)* |
 | `custos-consensus` | Accord-style transactional escalation *(later)* |
 | `custos-cql` | CQL (Cassandra) wire adapter *(later)* |
-| `custos-dynamo` | DynamoDB API adapter *(later)* |
+| `custos-dynamo` | DynamoDB-style item API over the common core (wire protocol later) |
 | `custos-test` | Elle-style history recorder + checker |
 | `custosd` | Node server binary |
 | `custos-cli` | Operator CLI |
