@@ -12,3 +12,7 @@ description = "CustosDB StorageEngine trait + in-memory implementation."
 workspace = true
 
 [dependencies]
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
