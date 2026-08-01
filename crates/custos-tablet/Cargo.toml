@@ -12,3 +12,5 @@ description = "CustosDB tablet model: key ranges, replica sets, epochs."
 workspace = true
 
 [dependencies]
+custos-env.workspace = true
+serde.workspace = true

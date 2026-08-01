@@ -332,8 +332,41 @@ impl Simulator {
     }
 
     /// Run until quiescence: no ready tasks and no scheduled events remain.
+    ///
+    /// Do not use this for protocols with perpetual timers (e.g. Raft
+    /// heartbeats), which never quiesce; use [`run_until`](Self::run_until) or
+    /// [`run_for`](Self::run_for) instead.
     pub fn run(&mut self) {
         self.run_until_quiescent(usize::MAX);
+    }
+
+    /// Run until virtual time reaches `deadline` (or the run quiesces earlier),
+    /// then advance the clock to exactly `deadline`. Events scheduled after
+    /// `deadline` are left pending.
+    pub fn run_until(&mut self, deadline: Nanos) {
+        loop {
+            while let Some(task) = self.pop_ready() {
+                self.poll_task(task);
+            }
+            let next_key = {
+                let st = self.shared.lock();
+                st.timeline.keys().next().copied()
+            };
+            match next_key {
+                Some(key) if key.0 <= deadline.0 => self.fire_event(key),
+                _ => {
+                    let mut st = self.shared.lock();
+                    st.clock = st.clock.max(deadline.0);
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Run for `dur` of virtual time from now.
+    pub fn run_for(&mut self, dur: Duration) {
+        let deadline = Nanos(self.shared.lock().clock.saturating_add(dur_nanos(dur)));
+        self.run_until(deadline);
     }
 
     /// Run until quiescence or until `max_steps` events have fired (a guard
@@ -485,6 +518,17 @@ impl Network for SimEnv {
         let t = st.clock;
         let len = payload.len();
         st.trace.push(TraceEvent::Send { t, from, to, len });
+
+        // A crashed node produces no output: it is dead, not merely unreachable.
+        if st.crashed.contains(&from) {
+            st.trace.push(TraceEvent::Drop {
+                t,
+                from,
+                to,
+                reason: "sender-crashed",
+            });
+            return;
+        }
 
         // Independent random drop at send time.
         if st.net.drop_threshold > 0 && st.rng.next_u64() < st.net.drop_threshold {

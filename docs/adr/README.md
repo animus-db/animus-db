@@ -15,3 +15,4 @@ relevant ADR (or supersede it) in the same PR as the code change.
 | [0006](0006-dual-cql-dynamo-adapters.md) | Dual CQL + DynamoDB adapters over a common core | Accepted |
 | [0007](0007-agpl-cla.md) | AGPL-3.0 + CLA | Accepted |
 | [0008](0008-borrowed-storage-first.md) | Borrowed storage engine first, custom LSM deferred | Accepted |
+| [0009](0009-in-house-raft-over-env.md) | In-house Raft over the `Env` seam (deviation from openraft) | Accepted |
