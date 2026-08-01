@@ -114,10 +114,11 @@ impl MemoryEngine {
     }
 }
 
+#[async_trait::async_trait]
 impl StorageEngine for MemoryEngine {
     type Snapshot = MemorySnapshot;
 
-    fn put(&self, key: &[u8], value: &[u8], version: Version) -> Result<()> {
+    async fn put(&self, key: &[u8], value: &[u8], version: Version) -> Result<()> {
         let mut inner = self.lock();
         inner.check_monotonic(version)?;
         inner.apply(
@@ -131,7 +132,7 @@ impl StorageEngine for MemoryEngine {
         Ok(())
     }
 
-    fn merge(&self, key: &[u8], value: &[u8], version: Version) -> Result<bool> {
+    async fn merge(&self, key: &[u8], value: &[u8], version: Version) -> Result<bool> {
         let mut inner = self.lock();
         // Per-key LWW: apply only if strictly newer than this key's own latest.
         if inner
@@ -151,7 +152,7 @@ impl StorageEngine for MemoryEngine {
         Ok(true)
     }
 
-    fn merge_tombstone(&self, key: &[u8], version: Version) -> Result<bool> {
+    async fn merge_tombstone(&self, key: &[u8], version: Version) -> Result<bool> {
         let mut inner = self.lock();
         // Per-key LWW: apply only if strictly newer than this key's own latest.
         if inner
@@ -165,7 +166,7 @@ impl StorageEngine for MemoryEngine {
         Ok(true)
     }
 
-    fn delete(&self, key: &[u8], version: Version) -> Result<()> {
+    async fn delete(&self, key: &[u8], version: Version) -> Result<()> {
         let mut inner = self.lock();
         inner.check_monotonic(version)?;
         inner.apply(&WriteOp::Delete { key: key.to_vec() }, version);
@@ -173,7 +174,7 @@ impl StorageEngine for MemoryEngine {
         Ok(())
     }
 
-    fn delete_range(&self, start: &[u8], end: &[u8], version: Version) -> Result<()> {
+    async fn delete_range(&self, start: &[u8], end: &[u8], version: Version) -> Result<()> {
         if start > end {
             return Err(StorageError::InvalidRange);
         }
@@ -190,7 +191,7 @@ impl StorageEngine for MemoryEngine {
         Ok(())
     }
 
-    fn write_batch(&self, batch: WriteBatch) -> Result<()> {
+    async fn write_batch(&self, batch: WriteBatch) -> Result<()> {
         let mut inner = self.lock();
         inner.check_monotonic(batch.version)?;
         for op in &batch.ops {
@@ -207,22 +208,22 @@ impl StorageEngine for MemoryEngine {
         Ok(())
     }
 
-    fn get(&self, key: &[u8]) -> Result<Option<VersionedValue>> {
+    async fn get(&self, key: &[u8]) -> Result<Option<VersionedValue>> {
         Ok(self.lock().read_at(key, Version::MAX))
     }
 
-    fn get_at(&self, key: &[u8], version: Version) -> Result<Option<VersionedValue>> {
+    async fn get_at(&self, key: &[u8], version: Version) -> Result<Option<VersionedValue>> {
         Ok(self.lock().read_at(key, version))
     }
 
-    fn scan(&self, start: &[u8], end: &[u8]) -> Result<Vec<(Key, VersionedValue)>> {
+    async fn scan(&self, start: &[u8], end: &[u8]) -> Result<Vec<(Key, VersionedValue)>> {
         if start > end {
             return Err(StorageError::InvalidRange);
         }
         Ok(self.lock().scan_at(start, end, Version::MAX))
     }
 
-    fn entries(&self) -> Result<Vec<(Key, VersionedValue)>> {
+    async fn entries(&self) -> Result<Vec<(Key, VersionedValue)>> {
         let inner = self.lock();
         let mut out = Vec::new();
         for key in inner.data.keys() {
@@ -233,7 +234,7 @@ impl StorageEngine for MemoryEngine {
         Ok(out)
     }
 
-    fn entries_with_tombstones(&self) -> Result<Vec<(Key, Option<Value>, Version)>> {
+    async fn entries_with_tombstones(&self) -> Result<Vec<(Key, Option<Value>, Version)>> {
         let inner = self.lock();
         let mut out = Vec::new();
         for (key, history) in &inner.data {
@@ -266,19 +267,20 @@ pub struct MemorySnapshot {
     version: Version,
 }
 
+#[async_trait::async_trait]
 impl Snapshot for MemorySnapshot {
     fn version(&self) -> Version {
         self.version
     }
 
-    fn get(&self, key: &[u8]) -> Option<VersionedValue> {
+    async fn get(&self, key: &[u8]) -> Option<VersionedValue> {
         self.inner
             .lock()
             .expect("storage poisoned")
             .read_at(key, self.version)
     }
 
-    fn scan(&self, start: &[u8], end: &[u8]) -> Vec<(Key, VersionedValue)> {
+    async fn scan(&self, start: &[u8], end: &[u8]) -> Vec<(Key, VersionedValue)> {
         if start > end {
             return Vec::new();
         }

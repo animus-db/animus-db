@@ -235,10 +235,12 @@ snapshotting, data-plane/`StorageEngine` integration, and sharding — see ADR
 
 `StorageEngine` trait (put/get, `get_at` historical read, range scan, atomic
 batch, range delete, MVCC `Snapshot`). Backed by `MemoryEngine` (a `BTreeMap`
-MVCC store; ADR 0008 — real engines slot in behind the trait later). **Version
-contract:** writers assign strictly increasing versions (enforced via
-`NonMonotonicVersion`); given that, a snapshot taken at version `v` is isolated
-from later writes.
+MVCC store; ADR 0008 — real engines slot in behind the trait later). The trait
+is **async** (`#[async_trait]`): the I/O-ish methods are `async fn` so an
+on-disk LSM can reach the async `Disk` seam behind the same trait, while
+`snapshot()` / `latest_version()` stay synchronous. **Version contract:**
+writers assign strictly increasing versions (enforced via `NonMonotonicVersion`);
+given that, a snapshot taken at version `v` is isolated from later writes.
 
 ### A node's inbox is single-consumer
 

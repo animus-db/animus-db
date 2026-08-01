@@ -55,7 +55,9 @@ fn run_op<T: Clone + Send + 'static>(
 }
 
 fn value_at(handle: &custos_data::ReplicaHandle<MemoryEngine>, key: &[u8]) -> Option<Vec<u8>> {
-    handle.storage().get(key).unwrap().map(|vv| vv.value)
+    futures::executor::block_on(handle.storage().get(key))
+        .unwrap()
+        .map(|vv| vv.value)
 }
 
 /// The replica's latest *raw* record for `key`: `(Some(value)|None, version)`,
@@ -65,9 +67,7 @@ fn raw_at(
     handle: &custos_data::ReplicaHandle<MemoryEngine>,
     key: &[u8],
 ) -> Option<(Option<Vec<u8>>, u64)> {
-    handle
-        .storage()
-        .entries_with_tombstones()
+    futures::executor::block_on(handle.storage().entries_with_tombstones())
         .unwrap()
         .into_iter()
         .find(|(k, _, _)| k == key)
@@ -172,7 +172,9 @@ fn a_converged_read_does_not_repair() {
     assert_eq!(read, ReadResult::Value(Some(b"v1".to_vec())));
     for id in REPLICAS {
         // Every replica that received the write holds exactly v1 at version 1.
-        if let Some(vv) = handles[id as usize].storage().get(b"k").unwrap() {
+        if let Some(vv) =
+            futures::executor::block_on(handles[id as usize].storage().get(b"k")).unwrap()
+        {
             assert_eq!((vv.version, vv.value), (1, b"v1".to_vec()));
         }
     }

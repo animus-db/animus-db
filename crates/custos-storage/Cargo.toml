@@ -18,9 +18,11 @@ workspace = true
 fjall = ["dep:fjall"]
 
 [dependencies]
+async-trait.workspace = true
 thiserror.workspace = true
 fjall = { version = "2", optional = true }
 
 [dev-dependencies]
+futures.workspace = true
 proptest.workspace = true
 tempfile = "3"

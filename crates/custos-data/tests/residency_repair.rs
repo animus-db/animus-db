@@ -83,7 +83,9 @@ fn run_op<T: Clone + Send + 'static>(
 }
 
 fn value_at(handle: &ReplicaHandle<MemoryEngine>, key: &[u8]) -> Option<Vec<u8>> {
-    handle.storage().get(key).unwrap().map(|vv| vv.value)
+    futures::executor::block_on(handle.storage().get(key))
+        .unwrap()
+        .map(|vv| vv.value)
 }
 
 #[test]

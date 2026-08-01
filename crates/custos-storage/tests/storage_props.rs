@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 
 use custos_storage::{MemoryEngine, Snapshot, StorageEngine};
+use futures::executor::block_on;
 use proptest::prelude::*;
 
 /// Small byte strings keep the search space dense so keys actually collide and
@@ -25,12 +26,12 @@ proptest! {
 
         for (i, (k, v)) in ops.iter().enumerate() {
             let version = i as u64 + 1;
-            engine.put(k, v, version).unwrap();
+            block_on(engine.put(k, v, version)).unwrap();
             model.insert(k.clone(), v.clone());
         }
 
         for (k, v) in &model {
-            let got = engine.get(k).unwrap();
+            let got = block_on(engine.get(k)).unwrap();
             prop_assert_eq!(got.map(|vv| vv.value), Some(v.clone()));
         }
         prop_assert_eq!(engine.latest_version(), ops.len() as u64);
@@ -46,11 +47,11 @@ proptest! {
     ) {
         let engine = MemoryEngine::new();
         for (i, (k, v)) in entries.iter().enumerate() {
-            engine.put(k, v, i as u64 + 1).unwrap();
+            block_on(engine.put(k, v, i as u64 + 1)).unwrap();
         }
         let (start, end) = if a <= b { (a, b) } else { (b, a) };
 
-        let got = engine.scan(&start, &end).unwrap();
+        let got = block_on(engine.scan(&start, &end)).unwrap();
 
         // Ordered ascending by key.
         for pair in got.windows(2) {
@@ -79,7 +80,7 @@ proptest! {
 
         for (k, v) in &initial {
             version += 1;
-            engine.put(k, v, version).unwrap();
+            block_on(engine.put(k, v, version)).unwrap();
             reference.insert(k.clone(), v.clone());
         }
 
@@ -92,9 +93,9 @@ proptest! {
         for (k, v, is_delete) in &updates {
             version += 1;
             if *is_delete {
-                engine.delete(k, version).unwrap();
+                block_on(engine.delete(k, version)).unwrap();
             } else {
-                engine.put(k, v, version).unwrap();
+                block_on(engine.put(k, v, version)).unwrap();
             }
             touched_keys.push(k.clone());
         }
@@ -102,7 +103,7 @@ proptest! {
         // The snapshot still reflects exactly the reference (pre-snapshot) state.
         for (k, v) in &reference {
             prop_assert_eq!(
-                snap.get(k).map(|vv| vv.value),
+                block_on(snap.get(k)).map(|vv| vv.value),
                 Some(v.clone()),
                 "snapshot read changed after later writes"
             );
@@ -110,7 +111,7 @@ proptest! {
         // Keys that only exist post-snapshot are invisible to the snapshot.
         for k in &touched_keys {
             if !reference.contains_key(k) {
-                prop_assert_eq!(snap.get(k), None, "snapshot saw a post-snapshot key");
+                prop_assert_eq!(block_on(snap.get(k)), None, "snapshot saw a post-snapshot key");
             }
         }
     }

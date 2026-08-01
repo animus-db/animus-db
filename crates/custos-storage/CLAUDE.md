@@ -17,6 +17,19 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
 
 ## What's non-obvious
 
+- **The traits are `async`** (`#[async_trait::async_trait]`). The I/O-ish
+  methods — `put`/`merge`/`merge_tombstone`/`delete`/`delete_range`/
+  `write_batch`/`get`/`get_at`/`scan`/`entries`/`entries_with_tombstones` on
+  `StorageEngine`, and `get`/`scan` on `Snapshot` — are `async fn`; callers
+  `.await` them. This is so an on-disk LSM can reach the async `Disk` seam
+  (SSTable block reads/flushes) behind the same trait. `snapshot()` and
+  `latest_version()` (and `Snapshot::version()`) stay **synchronous** — pinning
+  a version and reading the floor are cheap, in-memory on every backend.
+  `MemoryEngine`/`FjallEngine` await nothing real (the bodies are unchanged
+  logic inside `async fn`; Fjall's blocking calls run inline — it's the
+  prod-only, feature-gated backend). Storage-only tests with no `Env` drive the
+  futures with `futures::executor::block_on`; code already inside a `SimEnv`
+  task just `.await`s.
 - **Versions are MVCC commit timestamps supplied by the caller and must be
   strictly increasing** (enforced via `StorageError::NonMonotonicVersion`).
   Given that, a `Snapshot` taken at version `v` is isolated from later writes —

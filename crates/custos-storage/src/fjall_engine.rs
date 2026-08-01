@@ -237,10 +237,11 @@ impl FjallEngine {
     }
 }
 
+#[async_trait::async_trait]
 impl StorageEngine for FjallEngine {
     type Snapshot = FjallSnapshot;
 
-    fn put(&self, key: &[u8], value: &[u8], version: Version) -> Result<()> {
+    async fn put(&self, key: &[u8], value: &[u8], version: Version) -> Result<()> {
         self.check_and_bump(version)?;
         self.write_op(
             &WriteOp::Put {
@@ -251,7 +252,7 @@ impl StorageEngine for FjallEngine {
         )
     }
 
-    fn merge(&self, key: &[u8], value: &[u8], version: Version) -> Result<bool> {
+    async fn merge(&self, key: &[u8], value: &[u8], version: Version) -> Result<bool> {
         // Per-key LWW: apply only if strictly newer than this key's own latest.
         if self
             .latest_version_of(key)?
@@ -270,7 +271,7 @@ impl StorageEngine for FjallEngine {
         Ok(true)
     }
 
-    fn merge_tombstone(&self, key: &[u8], version: Version) -> Result<bool> {
+    async fn merge_tombstone(&self, key: &[u8], version: Version) -> Result<bool> {
         // Per-key LWW: apply only if strictly newer than this key's own latest.
         if self
             .latest_version_of(key)?
@@ -283,12 +284,12 @@ impl StorageEngine for FjallEngine {
         Ok(true)
     }
 
-    fn delete(&self, key: &[u8], version: Version) -> Result<()> {
+    async fn delete(&self, key: &[u8], version: Version) -> Result<()> {
         self.check_and_bump(version)?;
         self.write_op(&WriteOp::Delete { key: key.to_vec() }, version)
     }
 
-    fn delete_range(&self, start: &[u8], end: &[u8], version: Version) -> Result<()> {
+    async fn delete_range(&self, start: &[u8], end: &[u8], version: Version) -> Result<()> {
         if start > end {
             return Err(StorageError::InvalidRange);
         }
@@ -302,7 +303,7 @@ impl StorageEngine for FjallEngine {
         )
     }
 
-    fn write_batch(&self, batch: WriteBatch) -> Result<()> {
+    async fn write_batch(&self, batch: WriteBatch) -> Result<()> {
         for op in &batch.ops {
             if let WriteOp::DeleteRange { start, end } = op {
                 if start > end {
@@ -317,22 +318,22 @@ impl StorageEngine for FjallEngine {
         Ok(())
     }
 
-    fn get(&self, key: &[u8]) -> Result<Option<VersionedValue>> {
+    async fn get(&self, key: &[u8]) -> Result<Option<VersionedValue>> {
         self.read_at(key, Version::MAX)
     }
 
-    fn get_at(&self, key: &[u8], version: Version) -> Result<Option<VersionedValue>> {
+    async fn get_at(&self, key: &[u8], version: Version) -> Result<Option<VersionedValue>> {
         self.read_at(key, version)
     }
 
-    fn scan(&self, start: &[u8], end: &[u8]) -> Result<Vec<(Key, VersionedValue)>> {
+    async fn scan(&self, start: &[u8], end: &[u8]) -> Result<Vec<(Key, VersionedValue)>> {
         if start > end {
             return Err(StorageError::InvalidRange);
         }
         self.scan_at(start, end, Version::MAX)
     }
 
-    fn entries(&self) -> Result<Vec<(Key, VersionedValue)>> {
+    async fn entries(&self) -> Result<Vec<(Key, VersionedValue)>> {
         let mut out = Vec::new();
         let mut last_prefix: Option<Vec<u8>> = None;
         // Newest-first within each user key, so the first entry per prefix wins.
@@ -350,7 +351,7 @@ impl StorageEngine for FjallEngine {
         Ok(out)
     }
 
-    fn entries_with_tombstones(&self) -> Result<Vec<(Key, Option<Value>, Version)>> {
+    async fn entries_with_tombstones(&self) -> Result<Vec<(Key, Option<Value>, Version)>> {
         let mut out = Vec::new();
         let mut last_prefix: Option<Vec<u8>> = None;
         // Newest-first within each user key, so the first entry per prefix wins
@@ -391,16 +392,17 @@ pub struct FjallSnapshot {
     version: Version,
 }
 
+#[async_trait::async_trait]
 impl Snapshot for FjallSnapshot {
     fn version(&self) -> Version {
         self.version
     }
 
-    fn get(&self, key: &[u8]) -> Option<VersionedValue> {
+    async fn get(&self, key: &[u8]) -> Option<VersionedValue> {
         self.engine.read_at(key, self.version).ok().flatten()
     }
 
-    fn scan(&self, start: &[u8], end: &[u8]) -> Vec<(Key, VersionedValue)> {
+    async fn scan(&self, start: &[u8], end: &[u8]) -> Vec<(Key, VersionedValue)> {
         if start > end {
             return Vec::new();
         }

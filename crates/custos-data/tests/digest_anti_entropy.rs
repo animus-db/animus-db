@@ -51,7 +51,9 @@ fn run_op<T: Clone + Send + 'static>(
 }
 
 fn value_at(handle: &ReplicaHandle<MemoryEngine>, key: &[u8]) -> Option<Vec<u8>> {
-    handle.storage().get(key).unwrap().map(|vv| vv.value)
+    futures::executor::block_on(handle.storage().get(key))
+        .unwrap()
+        .map(|vv| vv.value)
 }
 
 fn start_anti_entropy(sim: &Simulator, handles: &[ReplicaHandle<MemoryEngine>]) {
@@ -135,7 +137,8 @@ fn digest_anti_entropy_converges_one_divergent_key_among_many() {
     let full_push_one_round: usize = handles
         .iter()
         .map(|h| {
-            let entries = h.storage().entries_with_tombstones().unwrap();
+            let entries =
+                futures::executor::block_on(h.storage().entries_with_tombstones()).unwrap();
             // payload size × (peers it pushes to)
             serde_json::to_vec(&custos_data::DataMsg::Sync {
                 tablet: TABLET,
@@ -200,8 +203,9 @@ fn converged_replicas_transfer_no_entry_data() {
     // Bound the whole converged run by a few such rounds: if entry-carrying
     // `Sync` traffic were generated it would blow past this bound.
     let one_digest = {
-        let segs =
-            custos_data::digest::digest(&handles[0].storage().entries_with_tombstones().unwrap());
+        let segs = custos_data::digest::digest(
+            &futures::executor::block_on(handles[0].storage().entries_with_tombstones()).unwrap(),
+        );
         serde_json::to_vec(&custos_data::DataMsg::SyncDigest {
             tablet: TABLET,
             epoch: Epoch::INITIAL,

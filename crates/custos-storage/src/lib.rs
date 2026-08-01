@@ -126,12 +126,21 @@ pub type Result<T> = std::result::Result<T, StorageError>;
 ///
 /// Implementations are cheap to clone (clones share state) and `Send + Sync`.
 /// See the [crate docs](crate) for the MVCC model.
+///
+/// The I/O-ish methods are `async`: the in-memory engine satisfies them
+/// trivially (no real awaiting), but an on-disk LSM reaches the async [`Disk`]
+/// seam to read/flush SSTable blocks. `snapshot()` and `latest_version()` stay
+/// synchronous — pinning a version and reading the current floor are cheap,
+/// in-memory operations on every backend.
+///
+/// [`Disk`]: custos_env::Disk
+#[async_trait::async_trait]
 pub trait StorageEngine: Clone + Send + Sync {
     /// A consistent point-in-time read view.
     type Snapshot: Snapshot;
 
     /// Write `value` at `key` as of `version`.
-    fn put(&self, key: &[u8], value: &[u8], version: Version) -> Result<()>;
+    async fn put(&self, key: &[u8], value: &[u8], version: Version) -> Result<()>;
 
     /// Merge `value` at `key` with **per-key** last-writer-wins: apply iff
     /// `version` is strictly greater than the key's current latest version,
@@ -144,7 +153,7 @@ pub trait StorageEngine: Clone + Send + Sync {
     /// *original* version (which may sit below the engine's latest), and `merge`
     /// is idempotent and commutative under it, so replicas converge to the
     /// highest version seen per key regardless of delivery order.
-    fn merge(&self, key: &[u8], value: &[u8], version: Version) -> Result<bool>;
+    async fn merge(&self, key: &[u8], value: &[u8], version: Version) -> Result<bool>;
 
     /// Merge a **tombstone** at `key` with per-key last-writer-wins: apply iff
     /// `version` is strictly greater than the key's current latest version,
@@ -156,37 +165,37 @@ pub trait StorageEngine: Clone + Send + Sync {
     /// engine-wide monotonic floor. Idempotent and commutative under per-key
     /// LWW alongside `merge`, so a value and a later tombstone (or vice versa)
     /// converge regardless of delivery order.
-    fn merge_tombstone(&self, key: &[u8], version: Version) -> Result<bool>;
+    async fn merge_tombstone(&self, key: &[u8], version: Version) -> Result<bool>;
 
     /// Tombstone `key` as of `version`.
-    fn delete(&self, key: &[u8], version: Version) -> Result<()>;
+    async fn delete(&self, key: &[u8], version: Version) -> Result<()>;
 
     /// Tombstone every key in `[start, end)` as of `version`.
-    fn delete_range(&self, start: &[u8], end: &[u8], version: Version) -> Result<()>;
+    async fn delete_range(&self, start: &[u8], end: &[u8], version: Version) -> Result<()>;
 
     /// Apply a batch of mutations atomically.
-    fn write_batch(&self, batch: WriteBatch) -> Result<()>;
+    async fn write_batch(&self, batch: WriteBatch) -> Result<()>;
 
     /// Read the latest value at `key`.
-    fn get(&self, key: &[u8]) -> Result<Option<VersionedValue>>;
+    async fn get(&self, key: &[u8]) -> Result<Option<VersionedValue>>;
 
     /// Read the value at `key` as of `version`.
-    fn get_at(&self, key: &[u8], version: Version) -> Result<Option<VersionedValue>>;
+    async fn get_at(&self, key: &[u8], version: Version) -> Result<Option<VersionedValue>>;
 
     /// Scan the latest values for keys in `[start, end)`, ordered by key.
-    fn scan(&self, start: &[u8], end: &[u8]) -> Result<Vec<(Key, VersionedValue)>>;
+    async fn scan(&self, start: &[u8], end: &[u8]) -> Result<Vec<(Key, VersionedValue)>>;
 
     /// Every live (non-tombstoned) latest entry, as `(key, versioned value)`,
     /// ordered by key. This is the full digest anti-entropy reconciles against;
     /// it is `scan` over the whole keyspace.
-    fn entries(&self) -> Result<Vec<(Key, VersionedValue)>>;
+    async fn entries(&self) -> Result<Vec<(Key, VersionedValue)>>;
 
     /// Every key's latest entry **including tombstones**, as
     /// `(key, Option<value>, version)` where `None` is a tombstone, ordered by
     /// key. Unlike [`entries`](StorageEngine::entries) this retains deleted
     /// keys, so anti-entropy can propagate a delete to a replica that still
     /// holds the value (ADR 0010).
-    fn entries_with_tombstones(&self) -> Result<Vec<(Key, Option<Value>, Version)>>;
+    async fn entries_with_tombstones(&self) -> Result<Vec<(Key, Option<Value>, Version)>>;
 
     /// Take a consistent snapshot at the engine's current latest version.
     fn snapshot(&self) -> Self::Snapshot;
@@ -199,13 +208,14 @@ pub trait StorageEngine: Clone + Send + Sync {
 ///
 /// Given monotonic write versions, a snapshot is unaffected by writes that
 /// happen after it is taken.
+#[async_trait::async_trait]
 pub trait Snapshot: Send + Sync {
     /// The version this snapshot reads as of.
     fn version(&self) -> Version;
 
     /// Read the value at `key` as of the snapshot version.
-    fn get(&self, key: &[u8]) -> Option<VersionedValue>;
+    async fn get(&self, key: &[u8]) -> Option<VersionedValue>;
 
     /// Scan keys in `[start, end)` as of the snapshot version, ordered by key.
-    fn scan(&self, start: &[u8], end: &[u8]) -> Vec<(Key, VersionedValue)>;
+    async fn scan(&self, start: &[u8], end: &[u8]) -> Vec<(Key, VersionedValue)>;
 }

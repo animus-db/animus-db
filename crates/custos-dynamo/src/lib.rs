@@ -179,42 +179,46 @@ impl<S: StorageEngine> Table<S> {
     }
 
     /// `PutItem`: insert or replace an item (keyed by its key attributes).
-    pub fn put_item(&self, item: Item) -> Result<()> {
+    pub async fn put_item(&self, item: Item) -> Result<()> {
         let key = self.key_for_item(&item)?;
         let value = serde_json::to_vec(&item).expect("item serializes");
-        self.engine.put(&key, &value, self.next_version())?;
+        self.engine.put(&key, &value, self.next_version()).await?;
         Ok(())
     }
 
     /// `GetItem`: fetch the item with the given key, if present.
-    pub fn get_item(
+    pub async fn get_item(
         &self,
         pk: &AttributeValue,
         sk: Option<&AttributeValue>,
     ) -> Result<Option<Item>> {
         let key = self.storage_key(pk, sk);
-        match self.engine.get(&key)? {
+        match self.engine.get(&key).await? {
             Some(vv) => Ok(Some(decode_item(&vv.value)?)),
             None => Ok(None),
         }
     }
 
     /// `DeleteItem`: remove the item with the given key (a tombstone).
-    pub fn delete_item(&self, pk: &AttributeValue, sk: Option<&AttributeValue>) -> Result<()> {
+    pub async fn delete_item(
+        &self,
+        pk: &AttributeValue,
+        sk: Option<&AttributeValue>,
+    ) -> Result<()> {
         let key = self.storage_key(pk, sk);
-        self.engine.delete(&key, self.next_version())?;
+        self.engine.delete(&key, self.next_version()).await?;
         Ok(())
     }
 
     /// `Query`: all live items in a partition, ordered by sort key.
-    pub fn query(&self, pk: &AttributeValue) -> Result<Vec<Item>> {
-        self.query_with(pk, None)
+    pub async fn query(&self, pk: &AttributeValue) -> Result<Vec<Item>> {
+        self.query_with(pk, None).await
     }
 
     /// `Query` with an optional sort-key `condition` (`=`, `BETWEEN`,
     /// `begins_with`): the live items in `pk`'s partition that satisfy it,
     /// ordered by sort key. With `None` this is the whole partition.
-    pub fn query_with(
+    pub async fn query_with(
         &self,
         pk: &AttributeValue,
         condition: Option<&crate::condition::SortKeyCondition>,
@@ -226,7 +230,7 @@ impl<S: StorageEngine> Table<S> {
         let mut end = prefix.clone();
         *end.last_mut().expect("escape is non-empty") = 0x01;
         let mut items = Vec::new();
-        for (key, vv) in self.engine.scan(&prefix, &end)? {
+        for (key, vv) in self.engine.scan(&prefix, &end).await? {
             if let Some(cond) = condition {
                 // The sort-key bytes are everything after the escaped pk; test
                 // the condition against them directly (storage-order bytes).

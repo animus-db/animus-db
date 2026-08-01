@@ -127,7 +127,7 @@ where
                 tracing::warn!("undecodable data message dropped");
                 continue;
             };
-            for reply in handle_msg(&storage, &epochs, me, &allowed, envelope.from, msg) {
+            for reply in handle_msg(&storage, &epochs, me, &allowed, envelope.from, msg).await {
                 let bytes = serde_json::to_vec(&reply).expect("data message serializes");
                 env.send(envelope.from, bytes).await;
             }
@@ -172,7 +172,7 @@ pub fn serve_anti_entropy<E, S>(
             env.sleep(interval).await;
             // Carry tombstones too, so a delete converges to a replica that
             // still holds the value (ADR 0010).
-            let entries: Vec<crate::SyncEntry> = match storage.entries_with_tombstones() {
+            let entries: Vec<crate::SyncEntry> = match storage.entries_with_tombstones().await {
                 Ok(es) => es,
                 Err(_) => continue,
             };
@@ -202,7 +202,7 @@ pub fn serve_anti_entropy<E, S>(
 /// Handle one inbound message, returning the replies to send back to `from`
 /// (if any). `me` is this replica's node id; `allowed`, when `Some`, restricts
 /// which peers repair traffic is accepted from (residency, ADR 0005).
-fn handle_msg<S: StorageEngine>(
+async fn handle_msg<S: StorageEngine>(
     storage: &S,
     epochs: &Arc<Mutex<Epochs>>,
     me: NodeId,
@@ -225,7 +225,7 @@ fn handle_msg<S: StorageEngine>(
             // Per-key last-writer-wins: `merge` applies iff this version is
             // newer for the key, so a write superseded by a higher-versioned
             // one is an accepted no-op and concurrent coordinators converge.
-            let _ = storage.merge(&key, &value, version);
+            let _ = storage.merge(&key, &value, version).await;
             vec![DataMsg::WriteAck { req, ok: true }]
         }
         DataMsg::Delete {
@@ -240,7 +240,7 @@ fn handle_msg<S: StorageEngine>(
             }
             // Per-key LWW tombstone: superseded by a higher-versioned write or
             // delete, so concurrent coordinators converge regardless of order.
-            let _ = storage.merge_tombstone(&key, version);
+            let _ = storage.merge_tombstone(&key, version).await;
             vec![DataMsg::DeleteAck { req, ok: true }]
         }
         DataMsg::Read {
@@ -258,6 +258,7 @@ fn handle_msg<S: StorageEngine>(
             }
             let value = storage
                 .get(&key)
+                .await
                 .ok()
                 .flatten()
                 .map(|vv| (vv.version, vv.value));
@@ -278,8 +279,8 @@ fn handle_msg<S: StorageEngine>(
             if residency_ok(allowed, from) && !fenced(epochs, tablet, epoch) {
                 for (key, value, version) in entries {
                     let _ = match value {
-                        Some(v) => storage.merge(&key, &v, version),
-                        None => storage.merge_tombstone(&key, version),
+                        Some(v) => storage.merge(&key, &v, version).await,
+                        None => storage.merge_tombstone(&key, version).await,
                     };
                 }
             }
@@ -296,7 +297,7 @@ fn handle_msg<S: StorageEngine>(
             if !residency_ok(allowed, from) || fenced(epochs, tablet, epoch) {
                 return vec![];
             }
-            let mine = match storage.entries_with_tombstones() {
+            let mine = match storage.entries_with_tombstones().await {
                 Ok(es) => digest::digest(&es),
                 Err(_) => return vec![],
             };
@@ -321,7 +322,7 @@ fn handle_msg<S: StorageEngine>(
             if !residency_ok(allowed, from) || fenced(epochs, tablet, epoch) {
                 return vec![];
             }
-            let entries = match storage.entries_with_tombstones() {
+            let entries = match storage.entries_with_tombstones().await {
                 Ok(es) => digest::entries_in_segments(&es, &segments),
                 Err(_) => return vec![],
             };
