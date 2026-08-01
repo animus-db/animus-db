@@ -216,6 +216,45 @@ impl Disk for ProdEnv {
         }
     }
 
+    async fn read_at(&self, file: &str, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+        let mut f = match tokio::fs::File::open(self.path(file)).await {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+        if f.seek(std::io::SeekFrom::Start(offset)).await? != offset {
+            return Ok(Vec::new());
+        }
+        let mut buf = vec![0u8; len];
+        let mut filled = 0;
+        while filled < len {
+            let n = f.read(&mut buf[filled..]).await?;
+            if n == 0 {
+                break; // EOF
+            }
+            filled += n;
+        }
+        buf.truncate(filled);
+        Ok(buf)
+    }
+
+    async fn size(&self, file: &str) -> std::io::Result<u64> {
+        match tokio::fs::metadata(self.path(file)).await {
+            Ok(m) => Ok(m.len()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn remove(&self, file: &str) -> std::io::Result<()> {
+        match tokio::fs::remove_file(self.path(file)).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
     async fn replace(&self, file: &str, bytes: &[u8]) -> std::io::Result<()> {
         // Write a temp file, fsync it, then atomically rename over the target.
         let target = self.path(file);

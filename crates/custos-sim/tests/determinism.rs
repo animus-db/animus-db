@@ -142,6 +142,62 @@ fn crash_drops_unsynced_disk_bytes() {
     );
 }
 
+#[test]
+fn disk_random_access_size_remove_and_crash() {
+    let seed = seed_from_env(11);
+    let mut sim = Simulator::new(seed);
+
+    // Sync 10 durable bytes, then append 3 un-synced bytes.
+    let snap = Arc::new(Mutex::new((Vec::new(), Vec::new(), 0u64, 0u64)));
+    {
+        let env = sim.env(0);
+        let out = Arc::clone(&snap);
+        env.clone().spawn_task(async move {
+            env.append("sst", b"0123456789").await.unwrap();
+            env.sync("sst").await.unwrap();
+            env.append("sst", b"abc").await.unwrap(); // un-synced tail
+            let mid = env.read_at("sst", 3, 4).await.unwrap(); // "3456"
+            let tail = env.read_at("sst", 10, 9).await.unwrap(); // "abc" (clamped at EOF)
+            let size = env.size("sst").await.unwrap(); // 13
+            let past = env.size("missing").await.unwrap(); // 0
+            *out.lock().unwrap() = (mid, tail, size, past);
+        });
+        sim.run();
+    }
+    let (mid, tail, size, past) = snap.lock().unwrap().clone();
+    assert_eq!(mid, b"3456", "read_at offset/len wrong (seed={seed})");
+    assert_eq!(
+        tail, b"abc",
+        "read_at must clamp at EOF over the buffered tail"
+    );
+    assert_eq!(size, 13, "size must include the un-synced tail");
+    assert_eq!(past, 0, "size of a missing file is 0");
+
+    // Crash drops the un-synced tail; random reads see only the durable prefix.
+    sim.crash(0);
+    sim.restart(0);
+    let after = Arc::new(Mutex::new((0u64, Vec::new(), 0u64)));
+    {
+        let env = sim.env(0);
+        let out = Arc::clone(&after);
+        env.clone().spawn_task(async move {
+            let size = env.size("sst").await.unwrap(); // back to 10
+            let tail = env.read_at("sst", 10, 3).await.unwrap(); // empty: tail gone
+            env.remove("sst").await.unwrap();
+            let after_remove = env.size("sst").await.unwrap(); // 0
+            *out.lock().unwrap() = (size, tail, after_remove);
+        });
+        sim.run();
+    }
+    let (size, tail, after_remove) = after.lock().unwrap().clone();
+    assert_eq!(size, 10, "crash must drop the un-synced tail (seed={seed})");
+    assert!(
+        tail.is_empty(),
+        "the un-synced tail must be gone after crash"
+    );
+    assert_eq!(after_remove, 0, "remove must delete the file (seed={seed})");
+}
+
 /// A node parked on `recv()` that is crashed and then restarted must resume
 /// receiving: a message delivered after the restart should wake it and be
 /// processed. (Regression: `crash` dropped the parked recv waker, so after

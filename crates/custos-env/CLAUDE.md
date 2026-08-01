@@ -30,7 +30,11 @@ the production implementation; the deterministic implementation lives in
 - `Disk` is append + explicit `sync`; bytes are not durable until `sync`
   returns. This models real crash semantics and is what `custos-sim` exploits.
   `Disk::replace` atomically swaps a file's whole contents (temp-file + rename
-  in `ProdEnv`) — used for WAL compaction.
+  in `ProdEnv`) — used for WAL compaction. `read_at(file, offset, len)` /
+  `size(file)` / `remove(file)` are the random-access + delete primitives an
+  on-disk LSM needs (SSTable block reads, file sizing, compaction cleanup); they
+  view the same durable + buffered bytes as `read`, so a crash drops an un-synced
+  tail consistently across all of them.
 - `ProdEnv` is *not* covered by the simulation tests (it's the nondeterministic
   side). Don't add logic here that the deterministic path needs to share.
 

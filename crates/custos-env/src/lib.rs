@@ -148,6 +148,21 @@ pub trait Disk: Send + Sync {
     /// vector if it does not exist.
     async fn read(&self, file: &str) -> std::io::Result<Vec<u8>>;
 
+    /// Read up to `len` bytes from `file` starting at byte `offset` (over the
+    /// durable + buffered view, like [`read`](Disk::read)). Returns fewer bytes
+    /// at end-of-file and an empty vector if the file does not exist or `offset`
+    /// is past the end. This is the random-access primitive an on-disk LSM uses
+    /// to fetch a single SSTable block without loading the whole file.
+    async fn read_at(&self, file: &str, offset: u64, len: usize) -> std::io::Result<Vec<u8>>;
+
+    /// The current length of `file` in bytes (durable + buffered), or 0 if it
+    /// does not exist.
+    async fn size(&self, file: &str) -> std::io::Result<u64>;
+
+    /// Delete `file`. A no-op (not an error) if it does not exist. Used to drop
+    /// SSTables that compaction has superseded.
+    async fn remove(&self, file: &str) -> std::io::Result<()>;
+
     /// Atomically replace `file`'s durable contents with `bytes`. On return the
     /// new contents are durable; a crash before or after sees the whole old or
     /// whole new contents, never a mix (production does this with a temp file +

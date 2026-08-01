@@ -666,6 +666,43 @@ impl Disk for SimEnv {
         }))
     }
 
+    async fn read_at(&self, file: &str, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
+        let st = self.shared.lock();
+        let key = (self.node_id, file.to_owned());
+        Ok(st.disks.get(&key).map_or_else(Vec::new, |f| {
+            // The durable + buffered view, sliced — mirrors `read`. A crash clears
+            // `buffered`, so an un-synced tail is correctly invisible afterward.
+            let total = f.durable.len() + f.buffered.len();
+            let start = (offset as usize).min(total);
+            let end = start.saturating_add(len).min(total);
+            (start..end)
+                .map(|i| {
+                    if i < f.durable.len() {
+                        f.durable[i]
+                    } else {
+                        f.buffered[i - f.durable.len()]
+                    }
+                })
+                .collect()
+        }))
+    }
+
+    async fn size(&self, file: &str) -> std::io::Result<u64> {
+        let st = self.shared.lock();
+        let key = (self.node_id, file.to_owned());
+        Ok(st
+            .disks
+            .get(&key)
+            .map_or(0, |f| (f.durable.len() + f.buffered.len()) as u64))
+    }
+
+    async fn remove(&self, file: &str) -> std::io::Result<()> {
+        let mut st = self.shared.lock();
+        let key = (self.node_id, file.to_owned());
+        st.disks.remove(&key);
+        Ok(())
+    }
+
     async fn replace(&self, file: &str, bytes: &[u8]) -> std::io::Result<()> {
         // Atomic under the state lock: durable jumps straight to `bytes`, with no
         // un-synced remainder. A crash keeps exactly the new contents.
