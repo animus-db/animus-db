@@ -50,5 +50,7 @@ epoch compare-and-swap transactions.
 multi-seed convergence (`control_raft.rs`), durability/recovery
 (`persistence.rs`), split/merge (`tablet_split_merge.rs`), snapshot truncation
 (`wal_compaction.rs`), a partitioned follower catching up via `InstallSnapshot`
-(`install_snapshot.rs`), and process restart-and-rejoin (`restart.rs`, using
-`Simulator::stop`). Use `run_for`, never `run()` (perpetual heartbeats).
+(`install_snapshot.rs`), process restart-and-rejoin (`restart.rs`, using
+`Simulator::stop`), and placement reconcile through Raft under a replica death +
+follower crash (`placement_reconcile.rs`, driving `custos-placement`). Use
+`run_for`, never `run()` (perpetual heartbeats).

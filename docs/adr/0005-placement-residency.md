@@ -34,3 +34,22 @@ designed with residency in mind, so they must be addressed deliberately.
 - Residency is only as strong as its weakest path: hinted handoff, repair, and
   backup must all honor the same constraints, which is significant future work
   and a correctness (and compliance) risk if rushed.
+
+## Status of implementation
+
+The **placement selection engine** is implemented in `custos-placement` as a
+pure, deterministic policy library: a `PlacementPolicy` (replication factor +
+residency `required_labels` + an optional failure-domain `SpreadPolicy`),
+`select_replicas` (fresh placement) and `replan` (churn-minimizing replacement
+that keeps surviving replicas). It is dependency-light (only `NodeId`) to stay
+out of a cycle with `custos-control`; the control plane builds `Candidate`s from
+the replicated `Active` membership, calls it, and commits the result as a
+`CasTabletReplicas`. `custos-control/tests/placement_reconcile.rs` drives this
+end-to-end through real Raft under simulation, including a replica death and a
+control-follower crash mid-reconcile, reproducible from a seed.
+
+**Still deferred** (the weakest-path work above): residency enforcement across
+read-repair, anti-entropy, hinted handoff, and backup; an automatic reconciler
+loop *inside* the control-plane node (today the reconcile is caller-driven —
+compute `replan`, propose the CAS); and persisting placement policies in
+`Metadata` (today a policy is supplied by the caller, not replicated).

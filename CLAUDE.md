@@ -15,11 +15,13 @@ log-truncating snapshots with `InstallSnapshot`),
 the quorum data-plane vertical slice (with read-repair + background
 anti-entropy convergence), tablet split/merge + multi-tablet routing,
 the Elle-style recorder/checker (`custos-test`), a DynamoDB-style item API over
-the core (`custos-dynamo`), and a **runnable node + CLI** assembling the planes
+the core (`custos-dynamo`), a **runnable node + CLI** assembling the planes
 over `ProdEnv` and serving clients over TCP — runnable as one process
 (`custosd --cluster N`) or one process per node (`custosd --config FILE --node I`,
-config via `gen-config`). Skeletons / future work: `custos-placement`
-(residency), `custos-consensus` (Accord transactions), `custos-cql` (wire
+config via `gen-config`) — and the **topology-aware placement engine**
+(`custos-placement`: residency + failure-domain spread, driving control-plane
+`CasTabletReplicas`). Skeletons / future work:
+`custos-consensus` (Accord transactions), `custos-cql` (wire
 protocol), plus the DynamoDB/CQL wire protocols.
 
 ## Per-crate guides
@@ -161,6 +163,20 @@ divergent quorum read pushes the winner back (read-repair), and
 `serve_anti_entropy` periodically full-pushes a replica's digest to peers so
 even unread keys converge. The `repair.rs` test partitions a replica during a
 write and asserts convergence both via a read and with no reads at all.
+
+### Placement & residency (`custos-placement`)
+
+A **pure, deterministic** policy engine (ADR 0005): given `Candidate`s (a node
+id + its topology labels) and a `PlacementPolicy` (replication factor +
+residency `required_labels` + optional failure-domain `SpreadPolicy`), it
+chooses a tablet's replica set — `select_replicas` for a fresh tablet,
+`replan` for a membership change (keeping eligible survivors so only the lost
+replica moves). It depends only on `NodeId` (no dep on `custos-control`, which
+would be a cycle); the control plane builds candidates from `Active` membership,
+calls it, and commits the result as a `CasTabletReplicas`. End-to-end through
+real Raft under fault injection in `custos-control/tests/placement_reconcile.rs`.
+Deferred: residency on the repair/handoff/backup paths, an in-node reconciler
+loop, and replicating policies in `Metadata`.
 
 ### Storage (`custos-storage`)
 
