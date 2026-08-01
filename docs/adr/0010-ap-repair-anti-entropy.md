@@ -61,11 +61,33 @@ primitive:
    already agree.
 
 3. **Anti-entropy** (eager, background): `serve_anti_entropy` runs a per-replica
-   timer loop that periodically pushes its full digest
-   (`entries_with_tombstones()`, so deletes ride along) to its peers as a
-   `Sync`. This converges replicas that are **never read**, which read-repair
-   alone cannot. Both paths are fenced per tablet by epoch, exactly like
-   ordinary writes (ADR 0002).
+   timer loop that periodically reconciles with its peers. This converges
+   replicas that are **never read**, which read-repair alone cannot. Both paths
+   are fenced per tablet by epoch, exactly like ordinary writes (ADR 0002).
+
+   **Range/segment digests (added later).** The original scheme *full-pushed*
+   `entries_with_tombstones()` to every peer each round — `O(data)` even when the
+   replicas already agree. It is now a **digest exchange** (the Merkle/range
+   refinement): each round a replica sends a compact `SyncDigest` — its data
+   bucketed into a fixed number of key *segments*, each summarized by an
+   order-independent (XOR-folded) content hash plus an entry count. A peer
+   compares it against its own digest (`digest::divergent`) and asks (via
+   `SyncPull`) only for the segments that differ; the sender answers with a
+   `Sync` of just those segments' entries (tombstones included, as before). A
+   converged pair therefore transfers **no entry data at all**, and a pair
+   differing in one key moves only that key's segment — not the whole dataset.
+   The segment of a key and the hash of an entry are pure functions of their
+   bytes, so the digest is deterministic across replicas and on replay (ADR
+   0003).
+
+   **Residency on repair (added later, ADR 0005).** Both repair paths are bound
+   to a tablet's residency-eligible placement. The send side already only targets
+   the tablet's replica set (read-repair → `TabletView::replicas`, anti-entropy →
+   the caller's peer list). The receive side adds a guard:
+   `serve_replica_with_residency(allowed)` **drops any `Sync`/`SyncDigest`/
+   `SyncPull` from a node outside `allowed`**, so repair cannot move data across a
+   residency boundary even to a reachable node. `serve_replica` (no allowed set)
+   keeps the unrestricted behavior.
 
 ## Consequences
 
@@ -74,11 +96,15 @@ primitive:
   anti-entropy round — proven under simulation by partitioning a replica during
   a write and asserting convergence both with a read (read-repair) and with **no
   reads at all** (anti-entropy) in `custos-data/tests/repair.rs`.
-- The sync wire shape is a **full-push** of the digest: simple and provably
-  convergent, but `O(data)` per round. Sending only divergent ranges via a
-  **Merkle-tree digest** is the obvious optimization and is deferred. Read-repair
-  likewise repairs only the replicas that responded within the read; stragglers
-  rely on anti-entropy.
+- Anti-entropy is no longer a full-push: the **segment-digest exchange** moves
+  only divergent ranges, so a converged pair exchanges only tiny digests and a
+  single divergent key out of many converges for **less than one full-push round
+  of bytes** — proven at the wire level (the simulator's `Send` trace) in
+  `custos-data/tests/digest_anti_entropy.rs`. Read-repair still repairs only the
+  replicas that responded within the read; stragglers rely on anti-entropy.
+- **Residency holds on the repair paths** (ADR 0005): a residency-ineligible but
+  reachable node never receives repaired data, and a repair message from outside
+  the placement is rejected — proven in `custos-data/tests/residency_repair.rs`.
 - **Deletes now propagate** through repair: a data-plane `DataMsg::Delete`
   tombstones by per-key LWW (`merge_tombstone`), and the tombstone-carrying
   `Sync` digest converges it through both read-repair and anti-entropy — proven
@@ -89,8 +115,8 @@ primitive:
 - **Tombstone GC is deferred.** Tombstones currently live forever in a key's
   MVCC history (so they win LWW and stay in the digest). A real system reclaims
   them after a grace period exceeding the max anti-entropy lag; this — and its
-  interaction with a replica that was offline longer than the grace period —
-  is future work. The full-push digest also still sends every tombstone each
-  round (the Merkle-tree / divergent-range optimization remains deferred).
+  interaction with a replica that was offline longer than the grace period — is
+  future work. (Tombstones are now only re-sent when their segment diverges, but
+  they are still never *reclaimed*.)
 - ADR 0001 (two-plane) and ADR 0002 (epoch fencing) are unchanged; this refines
   the data plane's convergence story within them.

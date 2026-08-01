@@ -18,16 +18,24 @@
 //! - [`client`] — the [`DataClient`] quorum coordinator.
 
 pub mod client;
+pub mod digest;
 pub mod replica;
 
 pub use client::{DataClient, ReadResult, Router, TabletView};
-pub use replica::{ReplicaHandle, serve_anti_entropy, serve_replica};
+pub use replica::{ReplicaHandle, serve_anti_entropy, serve_replica, serve_replica_with_residency};
 
+use custos_env::NodeId;
 use custos_tablet::{Epoch, TabletId};
 use serde::{Deserialize, Serialize};
 
 /// Correlates a request with its responses.
 pub type ReqId = u64;
+
+/// One reconciliation record carried by repair traffic: a `key`, its latest
+/// value (`None` is a tombstone), and the MVCC `version` at which it was written.
+/// This is the per-key unit a [`Sync`](DataMsg::Sync) batches and a segment
+/// [`digest`](crate::digest) summarizes.
+pub type SyncEntry = (Vec<u8>, Option<Vec<u8>>, u64);
 
 /// Data-plane wire messages between a coordinator and a replica.
 ///
@@ -79,6 +87,48 @@ pub enum DataMsg {
     Sync {
         tablet: TabletId,
         epoch: Epoch,
-        entries: Vec<(Vec<u8>, Option<Vec<u8>>, u64)>,
+        entries: Vec<SyncEntry>,
     },
+    /// Peer → peer (anti-entropy): the sender's **segment digest** — a summary of
+    /// its data partitioned into a fixed number of key segments, each carrying a
+    /// content hash and entry count. The receiver compares it against its own
+    /// digest and asks (via [`SyncPull`](DataMsg::SyncPull)) only for the segments
+    /// that differ, so a converged pair exchanges no data at all and a divergent
+    /// pair transfers only the affected ranges — not the full digest each round
+    /// (ADR 0010, the Merkle/segment-digest optimization). Fenced on a stale
+    /// `epoch`.
+    SyncDigest {
+        tablet: TabletId,
+        epoch: Epoch,
+        from: NodeId,
+        segments: Vec<SegmentDigest>,
+    },
+    /// Peer → peer (anti-entropy): in response to a [`SyncDigest`](DataMsg::SyncDigest),
+    /// the receiver asks the sender to push back the contents of the named
+    /// `segments` (the ones whose digest disagreed). The sender replies with a
+    /// [`Sync`](DataMsg::Sync) of just those segments' entries. Fenced on a stale
+    /// `epoch`.
+    SyncPull {
+        tablet: TabletId,
+        epoch: Epoch,
+        from: NodeId,
+        segments: Vec<u32>,
+    },
+}
+
+/// One segment of a replica's [segment digest](DataMsg::SyncDigest): a segment
+/// index plus a content hash and entry count over the keys that fall in it. Two
+/// replicas agree on a segment iff `(hash, count)` match; a mismatch is the
+/// signal to exchange that segment's entries. Including `count` makes an
+/// empty-vs-nonempty segment always differ even on a hash of `0`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SegmentDigest {
+    /// The segment index (a bucket over the hashed keyspace).
+    pub segment: u32,
+    /// Order-independent content hash of every `(key, value, version)` in the
+    /// segment (folded by XOR, so it is commutative and the digest does not
+    /// depend on entry order).
+    pub hash: u64,
+    /// Number of entries (live or tombstoned) in the segment.
+    pub count: u32,
 }

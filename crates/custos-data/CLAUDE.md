@@ -10,11 +10,17 @@ tablet map, and per-tablet epoch fencing (ADR 0001, 0002).
 ## Entry points
 
 - `lib.rs` — `DataMsg` wire protocol (each op names its `tablet` + `epoch`;
-  quorum `Write`/`Delete` + `Sync`, which carries a `(key, Option<value>,
-  version)` batch for repair — `None` is a tombstone, so deletes propagate).
+  quorum `Write`/`Delete` + repair traffic: `Sync` carries a `SyncEntry =
+  (key, Option<value>, version)` batch — `None` is a tombstone — and the
+  segment-digest pair `SyncDigest`/`SyncPull` drives range-based anti-entropy).
+- `digest.rs` — pure, deterministic segment digests: `digest(entries)` →
+  `Vec<SegmentDigest>`, `divergent(mine, theirs)` → the segments to pull,
+  `entries_in_segments(entries, segments)` → the entries to push back.
 - `replica.rs` — `serve_replica(env, storage, floor_epoch) -> ReplicaHandle`:
-  the per-node server over a `StorageEngine`; plus `serve_anti_entropy(...)`,
-  the background convergence loop.
+  the per-node server over a `StorageEngine`; `serve_replica_with_residency(...,
+  allowed)` is the same but rejects repair traffic from peers outside `allowed`
+  (residency, ADR 0005); plus `serve_anti_entropy(...)`, the background
+  convergence loop (now a digest exchange, not a full push).
 - `client.rs` — `DataClient` (quorum coordinator, incl. read-repair),
   `TabletView` (replicas + epoch + R/W for one tablet), `Router` (key → owning
   tablet), `ReadResult`.
@@ -40,11 +46,20 @@ tablet map, and per-tablet epoch fencing (ADR 0001, 0002).
   would reject re-applying at the original version). **Read-repair**: a quorum
   read that sees responders disagree pushes the winner back as a fire-and-forget
   `Sync` (repairs the read's participants only). **Anti-entropy**:
-  `serve_anti_entropy` full-pushes a replica's `entries_with_tombstones()`
-  digest to peers on a timer, converging even keys nobody reads — tombstones
-  included, so a delete reaches a replica that still holds the value. Both are
-  epoch-fenced. Deferred: Merkle digests (vs. full-push) and tombstone GC (a
-  grace period before reclaiming tombstones).
+  `serve_anti_entropy` runs a timer loop that exchanges a **segment digest**
+  (`SyncDigest`) with peers; a peer pulls (`SyncPull`) only the segments whose
+  hash differs, answered by a `Sync` of just those entries (tombstones included,
+  so a delete reaches a replica that still holds the value). A converged pair
+  moves no entry data; a one-key difference moves only that key's segment —
+  `digest.rs` holds the pure logic. Both paths are epoch-fenced.
+- **Residency on repair (ADR 0005)**: `serve_replica_with_residency(allowed)`
+  drops any `Sync`/`SyncDigest`/`SyncPull` from a node outside `allowed`, so
+  repair cannot leak across a residency boundary even to a reachable node. The
+  send side is already bounded (read-repair → `view.replicas`, anti-entropy →
+  the caller's `peers` list — both the tablet placement). Derive `allowed` from
+  `PlacementPolicy::admits`, the same check the control plane places with.
+  Deferred: tombstone GC (a grace period before reclaiming tombstones), and
+  residency on hinted handoff / backup.
 - A replica serves over any `StorageEngine`; values are opaque bytes. Higher
   layers (e.g. the dynamo adapter, or list-append test workloads) define their
   own value encoding.
@@ -57,4 +72,8 @@ tablet map, and per-tablet epoch fencing (ADR 0001, 0002).
 `cargo test -p custos-data` — quorum + node-kill + fencing (`quorum.rs`),
 two-plane integration (`two_plane.rs`), multi-tablet routing (`routing.rs`),
 read-repair + background anti-entropy convergence, incl. tombstone propagation
-(`repair.rs`).
+(`repair.rs`), segment-digest anti-entropy converging only divergent ranges
+(`digest_anti_entropy.rs`, asserted at the wire level via the sim `Send` trace),
+and residency on the repair paths — a reachable but ineligible peer never
+receives repaired data (`residency_repair.rs`). `digest.rs` has inline unit
+tests for the digest itself.

@@ -13,7 +13,8 @@ Status: pre-alpha. Implemented: the scaffold, the `Env` seam, storage (in-memory
 + persistent `fjall`), the control-plane Raft (WAL durability + recovery +
 log-truncating snapshots with `InstallSnapshot`),
 the quorum data-plane vertical slice (with read-repair, background
-anti-entropy convergence, and delete/tombstone propagation), tablet split/merge
+anti-entropy convergence via segment-digest exchange of only divergent ranges,
+delete/tombstone propagation, and residency-bounded repair), tablet split/merge
 + multi-tablet routing, the Elle-style recorder/checker (`custos-test`), a
 DynamoDB-style item API over the core plus a **minimal DynamoDB JSON wire
 protocol** (`custos-dynamo`: PutItem/GetItem/DeleteItem AttributeValue-JSON
@@ -171,9 +172,13 @@ responds. Choose `R + W > N` so reads see acknowledged writes.
 diverges when a replica misses a write. **Repair/anti-entropy** (ADR 0010)
 closes that: replica writes apply via `StorageEngine::merge` (per-key LWW) and
 deletes via `merge_tombstone`, a divergent quorum read pushes the winner back
-(read-repair), and `serve_anti_entropy` periodically full-pushes a replica's
-digest (`entries_with_tombstones`, so deletes ride along) to peers so even
-unread keys converge. The data plane carries quorum `Write`/`Delete` and a
+(read-repair), and `serve_anti_entropy` periodically reconciles with peers via a
+**segment-digest exchange** (`SyncDigest`/`SyncPull`) that moves only divergent
+ranges — not the whole digest each round — so even unread keys converge cheaply
+(tombstones included, so deletes ride along). Repair is **residency-bounded**
+(ADR 0005): `serve_replica_with_residency` drops repair traffic from peers
+outside a tablet's placement, so it cannot leak data across a residency boundary
+even to a reachable node. The data plane carries quorum `Write`/`Delete` and a
 tombstone-aware `Sync`, so deletes propagate the same way writes do. The
 `repair.rs` test partitions a replica during a write/delete and asserts
 convergence both via a read and with no reads at all.
