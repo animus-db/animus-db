@@ -12,3 +12,8 @@ description = "CustosDB deterministic simulator (virtual clock, net, disk, sched
 workspace = true
 
 [dependencies]
+custos-env.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true

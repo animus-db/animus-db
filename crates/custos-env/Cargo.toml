@@ -12,3 +12,7 @@ description = "CustosDB Env seam: Clock/Rng/Network/Disk/Spawner traits + ProdEn
 workspace = true
 
 [dependencies]
+async-trait.workspace = true
+tokio.workspace = true
+rand.workspace = true
+tracing.workspace = true

@@ -1,0 +1,213 @@
+//! Production [`Env`] implementation.
+//!
+//! Real wall-derived monotonic clock, OS randomness, `tokio` task spawning,
+//! length-prefixed TCP messaging, and `tokio::fs` with real `fsync`. This is the
+//! non-deterministic side of the seam: it is **not** exercised by the
+//! simulation tests, which run against `custos-sim`'s `SimEnv`. Keep production
+//! behavior here so the rest of the codebase stays environment-agnostic.
+
+use std::collections::BTreeMap;
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{Mutex, mpsc};
+
+use crate::{Clock, Disk, Env, Envelope, Nanos, Network, NodeId, Rng, Spawner};
+
+/// A production environment for a single node.
+///
+/// Cheap to clone (everything shared lives behind an `Arc`). Construct one per
+/// process with [`ProdEnv::bind`].
+#[derive(Clone)]
+pub struct ProdEnv {
+    inner: Arc<Inner>,
+}
+
+struct Inner {
+    node_id: NodeId,
+    start: Instant,
+    peers: BTreeMap<NodeId, SocketAddr>,
+    data_dir: PathBuf,
+    inbox: Mutex<mpsc::UnboundedReceiver<Envelope>>,
+}
+
+impl ProdEnv {
+    /// Bind this node's listener and start accepting peer connections.
+    ///
+    /// `peers` maps every node id (including this one) to its socket address;
+    /// `data_dir` is where [`Disk`] files live.
+    ///
+    /// # Errors
+    /// Returns an error if the listen address cannot be bound or the data
+    /// directory cannot be created.
+    pub async fn bind(
+        node_id: NodeId,
+        listen: SocketAddr,
+        peers: BTreeMap<NodeId, SocketAddr>,
+        data_dir: impl Into<PathBuf>,
+    ) -> std::io::Result<Self> {
+        let data_dir = data_dir.into();
+        tokio::fs::create_dir_all(&data_dir).await?;
+        let listener = TcpListener::bind(listen).await?;
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        // Accept loop: one reader task per inbound connection, each demuxing
+        // length-prefixed frames into the shared inbox.
+        tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((stream, _addr)) => {
+                        let tx = tx.clone();
+                        tokio::spawn(async move {
+                            if let Err(err) = read_frames(stream, tx).await {
+                                tracing::debug!(?err, "peer connection closed");
+                            }
+                        });
+                    }
+                    Err(err) => {
+                        tracing::warn!(?err, "accept failed");
+                        return;
+                    }
+                }
+            }
+        });
+
+        Ok(Self {
+            inner: Arc::new(Inner {
+                node_id,
+                start: Instant::now(),
+                peers,
+                data_dir,
+                inbox: Mutex::new(rx),
+            }),
+        })
+    }
+
+    fn path(&self, file: &str) -> PathBuf {
+        self.inner.data_dir.join(file)
+    }
+}
+
+/// Read length-prefixed `[from: u64][len: u32][payload]` frames until EOF.
+async fn read_frames(
+    mut stream: TcpStream,
+    tx: mpsc::UnboundedSender<Envelope>,
+) -> std::io::Result<()> {
+    loop {
+        let from = match stream.read_u64().await {
+            Ok(v) => v,
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        let len = stream.read_u32().await? as usize;
+        let mut payload = vec![0u8; len];
+        stream.read_exact(&mut payload).await?;
+        if tx.send(Envelope { from, payload }).is_err() {
+            return Ok(()); // receiver gone; node shutting down
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Clock for ProdEnv {
+    fn now(&self) -> Nanos {
+        Nanos(
+            self.inner
+                .start
+                .elapsed()
+                .as_nanos()
+                .min(u128::from(u64::MAX)) as u64,
+        )
+    }
+
+    async fn sleep(&self, dur: Duration) {
+        tokio::time::sleep(dur).await;
+    }
+}
+
+impl Rng for ProdEnv {
+    fn next_u64(&self) -> u64 {
+        rand::RngCore::next_u64(&mut rand::rngs::OsRng)
+    }
+
+    fn fill_bytes(&self, dst: &mut [u8]) {
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, dst);
+    }
+}
+
+#[async_trait::async_trait]
+impl Network for ProdEnv {
+    async fn send(&self, to: NodeId, payload: Vec<u8>) {
+        let Some(&addr) = self.inner.peers.get(&to) else {
+            tracing::warn!(to, "send to unknown peer");
+            return;
+        };
+        // Fire-and-forget semantics: a transport error is the network dropping
+        // the message, not an error to the caller (see `Network::send`).
+        let from = self.inner.node_id;
+        if let Err(err) = send_frame(addr, from, &payload).await {
+            tracing::debug!(?err, to, "send failed (dropped)");
+        }
+    }
+
+    async fn recv(&self) -> Envelope {
+        let mut rx = self.inner.inbox.lock().await;
+        rx.recv()
+            .await
+            .expect("inbox sender dropped while env is alive")
+    }
+}
+
+async fn send_frame(addr: SocketAddr, from: NodeId, payload: &[u8]) -> std::io::Result<()> {
+    let mut stream = TcpStream::connect(addr).await?;
+    stream.write_u64(from).await?;
+    stream.write_u32(payload.len() as u32).await?;
+    stream.write_all(payload).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+#[async_trait::async_trait]
+impl Disk for ProdEnv {
+    async fn append(&self, file: &str, bytes: &[u8]) -> std::io::Result<()> {
+        let mut f = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.path(file))
+            .await?;
+        f.write_all(bytes).await?;
+        Ok(())
+    }
+
+    async fn sync(&self, file: &str) -> std::io::Result<()> {
+        let f = tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(self.path(file))
+            .await?;
+        f.sync_all().await
+    }
+
+    async fn read(&self, file: &str) -> std::io::Result<Vec<u8>> {
+        match tokio::fs::read(self.path(file)).await {
+            Ok(bytes) => Ok(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+impl Spawner for ProdEnv {
+    fn spawn(&self, fut: crate::BoxFuture<'static, ()>) {
+        tokio::spawn(fut);
+    }
+}
+
+impl Env for ProdEnv {
+    fn node_id(&self) -> NodeId {
+        self.inner.node_id
+    }
+}

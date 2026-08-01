@@ -1,0 +1,153 @@
+//! M1 acceptance tests for the deterministic simulator.
+//!
+//! These exercise the core guarantee (ADR 0003): an entire distributed run —
+//! tasks exchanging timed messages, with injected partitions and crashes — is a
+//! pure function of its seed, so the recorded history is byte-identical across
+//! repeated runs and any failure is replayable from its printed seed.
+
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use custos_env::{Clock, Disk, Env, EnvExt, Network};
+use custos_sim::Simulator;
+
+const N: u64 = 3;
+const MAX_HOPS: u8 = 9;
+
+/// Build a ring scenario: each node forwards a token to its successor after a
+/// short think-time; node 0 kicks it off. The hop counter bounds the run.
+fn build_ring(sim: &Simulator) {
+    for id in 0..N {
+        let env = sim.env(id);
+        env.clone().spawn_task(async move {
+            loop {
+                let msg = env.recv().await;
+                let hop = msg.payload[0];
+                if hop >= MAX_HOPS {
+                    continue; // park: token has finished its journey
+                }
+                env.sleep(Duration::from_micros(100)).await;
+                let next = (env.node_id() + 1) % N;
+                env.send(next, vec![hop + 1]).await;
+            }
+        });
+    }
+    let starter = sim.env(0);
+    starter.clone().spawn_task(async move {
+        starter.sleep(Duration::from_millis(1)).await;
+        starter.send(1, vec![0]).await;
+    });
+}
+
+fn run_ring(seed: u64, partition_1_2: bool) -> Vec<String> {
+    let mut sim = Simulator::new(seed);
+    build_ring(&sim);
+    if partition_1_2 {
+        sim.partition_pair(1, 2);
+    }
+    // Guard against a scenario that fails to settle; the ring is bounded so
+    // this should never trip.
+    assert!(
+        sim.run_until_quiescent(100_000),
+        "ring did not reach quiescence (seed={})",
+        sim.seed()
+    );
+    sim.trace_lines()
+}
+
+#[test]
+fn trace_is_byte_identical_across_runs() {
+    let seed = seed_from_env(0xC057_05DB);
+    let first = run_ring(seed, false);
+    let second = run_ring(seed, false);
+
+    assert!(
+        !first.is_empty(),
+        "expected a non-trivial history (seed={seed})"
+    );
+    assert!(
+        first.iter().any(|l| l.contains("DELIVER")),
+        "expected message deliveries in the history (seed={seed})"
+    );
+    assert_eq!(
+        first, second,
+        "history diverged across identical runs — nondeterminism leaked in (seed={seed})"
+    );
+}
+
+#[test]
+fn partition_is_reproducible_and_changes_history() {
+    let seed = seed_from_env(0xBEEF_F00D);
+    let partitioned_a = run_ring(seed, true);
+    let partitioned_b = run_ring(seed, true);
+    let healthy = run_ring(seed, false);
+
+    assert_eq!(
+        partitioned_a, partitioned_b,
+        "partitioned run was not reproducible from its seed (seed={seed})"
+    );
+    assert!(
+        partitioned_a
+            .iter()
+            .any(|l| l.contains("DROP") && l.contains("partition")),
+        "expected a partition-induced drop in the history (seed={seed})"
+    );
+    assert_ne!(
+        partitioned_a, healthy,
+        "partition did not change observable history (seed={seed})"
+    );
+}
+
+#[test]
+fn crash_drops_unsynced_disk_bytes() {
+    let seed = seed_from_env(7);
+    let mut sim = Simulator::new(seed);
+
+    // Phase 1: sync "aaa", then append un-synced "bbb"; capture the live view.
+    let live_view = Arc::new(Mutex::new(Vec::new()));
+    {
+        let env = sim.env(0);
+        let live = Arc::clone(&live_view);
+        env.clone().spawn_task(async move {
+            env.append("wal", b"aaa").await.unwrap();
+            env.sync("wal").await.unwrap();
+            env.append("wal", b"bbb").await.unwrap();
+            *live.lock().unwrap() = env.read("wal").await.unwrap();
+        });
+        sim.run();
+    }
+    assert_eq!(
+        &*live_view.lock().unwrap(),
+        b"aaabbb",
+        "before crash, a read should see synced + un-synced bytes (seed={seed})"
+    );
+
+    // Crash: the un-synced "bbb" must be lost; the synced "aaa" survives.
+    sim.crash(0);
+    sim.restart(0);
+
+    let after = Arc::new(Mutex::new(Vec::new()));
+    {
+        let env = sim.env(0);
+        let out = Arc::clone(&after);
+        env.clone().spawn_task(async move {
+            *out.lock().unwrap() = env.read("wal").await.unwrap();
+        });
+        sim.run();
+    }
+    assert_eq!(
+        &*after.lock().unwrap(),
+        b"aaa",
+        "after crash, only synced bytes should remain (seed={seed})"
+    );
+}
+
+/// Read a seed from `CUSTOS_SEED` for replay, falling back to `default`. A
+/// failing run prints its seed (see the assertion messages) so it can be
+/// replayed with `CUSTOS_SEED=<seed> cargo test`.
+fn seed_from_env(default: u64) -> u64 {
+    match std::env::var("CUSTOS_SEED") {
+        Ok(s) => s.parse().unwrap_or(default),
+        Err(_) => default,
+    }
+}

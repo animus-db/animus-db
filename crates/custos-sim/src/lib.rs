@@ -1,5 +1,657 @@
-//! Deterministic simulator for CustosDB: a single seeded `SimEnv` providing a
-//! virtual clock, an in-memory fault-injecting network, a fake disk, and a
-//! cooperative scheduler (see `docs/adr/0003-deterministic-simulation.md`).
+//! Deterministic simulator for CustosDB.
 //!
-//! Populated in milestone M1.
+//! A [`Simulator`] owns a single shared `SimState` and hands out one [`SimEnv`]
+//! handle per node. Every source of nondeterminism — time, randomness, the
+//! network, disk, and task scheduling — is driven from this one place, so an
+//! entire distributed run is a pure function of its seed.
+//!
+//! The loop ([`Simulator::run`]) repeatedly: (1) polls every ready task to
+//! quiescence, then (2) advances virtual time to the earliest scheduled event (a
+//! timer firing or a message delivery) and dispatches it, which wakes tasks.
+//! When there are no ready tasks and no scheduled events, the run is quiescent
+//! and returns.
+//!
+//! Fault injection — [`partition`](Simulator::partition),
+//! [`heal`](Simulator::heal), [`crash`](Simulator::crash),
+//! [`restart`](Simulator::restart), and the [`NetConfig`] delay/drop model — is
+//! all reproducible from the seed. A recorded [`trace`](Simulator::trace) is
+//! byte-identical across repeated runs of the same scenario and seed.
+//!
+//! See `docs/adr/0003-deterministic-simulation.md`.
+
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex, Weak};
+use std::task::{Context, Poll, Waker};
+use std::time::Duration;
+
+use custos_env::{
+    BoxFuture, Clock, Disk, Env, Envelope, Nanos, Network, NodeId, Rng as RngTrait, Spawner,
+};
+use futures::task::ArcWake;
+use rand::{RngCore, SeedableRng};
+use rand_chacha::ChaCha8Rng;
+
+type TaskId = u64;
+type Seq = u64;
+type TimerId = u64;
+
+/// Per-file disk state, distinguishing durable (synced) bytes from buffered
+/// (un-synced) bytes. A crash drops the buffer; the durable prefix survives.
+#[derive(Default, Clone)]
+struct FileState {
+    durable: Vec<u8>,
+    buffered: Vec<u8>,
+}
+
+/// A scheduled future event on the virtual timeline.
+enum Event {
+    /// A `sleep` timer fires.
+    Timer(TimerId),
+    /// A message is delivered to a node's inbox.
+    Deliver { to: NodeId, env: Envelope },
+}
+
+/// Network delay and drop model. Delay jitter and drop sampling draw from the
+/// simulation RNG, so they are reproducible from the seed.
+#[derive(Clone)]
+pub struct NetConfig {
+    /// Minimum one-way delivery delay.
+    pub base_delay: Duration,
+    /// Maximum additional uniform jitter on top of `base_delay`.
+    pub max_jitter: Duration,
+    /// A message is dropped when `rng.next_u64() < drop_threshold`.
+    drop_threshold: u64,
+}
+
+impl Default for NetConfig {
+    fn default() -> Self {
+        Self {
+            base_delay: Duration::from_millis(1),
+            max_jitter: Duration::from_millis(4),
+            drop_threshold: 0,
+        }
+    }
+}
+
+impl NetConfig {
+    /// Set the independent per-message drop probability in `[0.0, 1.0]`.
+    pub fn set_drop_prob(&mut self, p: f64) {
+        self.drop_threshold = (p.clamp(0.0, 1.0) * (u64::MAX as f64)) as u64;
+    }
+}
+
+/// One recorded line of the simulation history. The `Display` form is stable and
+/// is what the byte-identical-trace guarantee is about.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TraceEvent {
+    /// A task was spawned.
+    Spawn { task: TaskId },
+    /// A node handed a message to the network.
+    Send {
+        t: u64,
+        from: NodeId,
+        to: NodeId,
+        len: usize,
+    },
+    /// A message was delivered to a node's inbox.
+    Deliver {
+        t: u64,
+        from: NodeId,
+        to: NodeId,
+        len: usize,
+    },
+    /// A message was dropped (lossy link, partition, or crashed target).
+    Drop {
+        t: u64,
+        from: NodeId,
+        to: NodeId,
+        reason: &'static str,
+    },
+    /// A sleep timer fired.
+    Timer { t: u64, id: TimerId },
+}
+
+impl std::fmt::Display for TraceEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TraceEvent::Spawn { task } => write!(f, "SPAWN task={task}"),
+            TraceEvent::Send { t, from, to, len } => {
+                write!(f, "t={t} SEND {from}->{to} len={len}")
+            }
+            TraceEvent::Deliver { t, from, to, len } => {
+                write!(f, "t={t} DELIVER {from}->{to} len={len}")
+            }
+            TraceEvent::Drop {
+                t,
+                from,
+                to,
+                reason,
+            } => {
+                write!(f, "t={t} DROP {from}->{to} ({reason})")
+            }
+            TraceEvent::Timer { t, id } => write!(f, "t={t} TIMER id={id}"),
+        }
+    }
+}
+
+/// The single shared mutable state of a simulation run.
+struct SimState {
+    clock: u64,
+    rng: ChaCha8Rng,
+    net: NetConfig,
+
+    next_task_id: TaskId,
+    // `None` while a task's future is checked out for polling.
+    tasks: BTreeMap<TaskId, Option<BoxFuture<'static, ()>>>,
+
+    next_seq: Seq,
+    timeline: BTreeMap<(u64, Seq), Event>,
+
+    next_timer_id: TimerId,
+    timer_wakers: BTreeMap<TimerId, Waker>,
+
+    nodes: BTreeSet<NodeId>,
+    inboxes: BTreeMap<NodeId, VecDeque<Envelope>>,
+    recv_wakers: BTreeMap<NodeId, Waker>,
+
+    disks: BTreeMap<(NodeId, String), FileState>,
+
+    // Directed blocked pairs: `(a, b)` blocks delivery from `a` to `b`.
+    partitions: BTreeSet<(NodeId, NodeId)>,
+    crashed: BTreeSet<NodeId>,
+
+    trace: Vec<TraceEvent>,
+}
+
+/// State shared between the simulator and every task waker / env handle.
+struct Shared {
+    state: Mutex<SimState>,
+    ready: Mutex<VecDeque<TaskId>>,
+}
+
+impl Shared {
+    fn lock(&self) -> std::sync::MutexGuard<'_, SimState> {
+        self.state.lock().expect("sim state poisoned")
+    }
+
+    fn push_ready(&self, task: TaskId) {
+        self.ready
+            .lock()
+            .expect("ready queue poisoned")
+            .push_back(task);
+    }
+}
+
+/// Waker that, when invoked, marks its task ready. Holds a `Weak` to avoid a
+/// reference cycle (wakers are stored inside the state they point back to).
+struct TaskWaker {
+    shared: Weak<Shared>,
+    task: TaskId,
+}
+
+impl ArcWake for TaskWaker {
+    fn wake_by_ref(arc_self: &Arc<Self>) {
+        if let Some(shared) = arc_self.shared.upgrade() {
+            shared.push_ready(arc_self.task);
+        }
+    }
+}
+
+/// The deterministic simulator. Construct with a seed, register nodes via
+/// [`env`](Simulator::env), spawn work, then drive with [`run`](Simulator::run).
+pub struct Simulator {
+    shared: Arc<Shared>,
+    seed: u64,
+}
+
+impl Simulator {
+    /// Create a simulator driven by `seed`.
+    #[must_use]
+    pub fn new(seed: u64) -> Self {
+        let state = SimState {
+            clock: 0,
+            rng: ChaCha8Rng::seed_from_u64(seed),
+            net: NetConfig::default(),
+            next_task_id: 0,
+            tasks: BTreeMap::new(),
+            next_seq: 0,
+            timeline: BTreeMap::new(),
+            next_timer_id: 0,
+            timer_wakers: BTreeMap::new(),
+            nodes: BTreeSet::new(),
+            inboxes: BTreeMap::new(),
+            recv_wakers: BTreeMap::new(),
+            disks: BTreeMap::new(),
+            partitions: BTreeSet::new(),
+            crashed: BTreeSet::new(),
+            trace: Vec::new(),
+        };
+        Self {
+            shared: Arc::new(Shared {
+                state: Mutex::new(state),
+                ready: Mutex::new(VecDeque::new()),
+            }),
+            seed,
+        }
+    }
+
+    /// The seed driving this run. Print it on failure so a run can be replayed.
+    #[must_use]
+    pub fn seed(&self) -> u64 {
+        self.seed
+    }
+
+    /// Obtain (registering if necessary) the [`SimEnv`] handle for `node`.
+    #[must_use]
+    pub fn env(&self, node: NodeId) -> SimEnv {
+        let mut st = self.shared.lock();
+        st.nodes.insert(node);
+        st.inboxes.entry(node).or_default();
+        SimEnv {
+            shared: Arc::clone(&self.shared),
+            node_id: node,
+        }
+    }
+
+    /// Replace the network delay/drop model.
+    pub fn set_net_config(&self, cfg: NetConfig) {
+        self.shared.lock().net = cfg;
+    }
+
+    /// Block delivery in the direction `from -> to`. Use
+    /// [`partition_pair`](Simulator::partition_pair) for a symmetric split.
+    pub fn partition(&self, from: NodeId, to: NodeId) {
+        self.shared.lock().partitions.insert((from, to));
+    }
+
+    /// Symmetrically partition `a` and `b` from each other.
+    pub fn partition_pair(&self, a: NodeId, b: NodeId) {
+        let mut st = self.shared.lock();
+        st.partitions.insert((a, b));
+        st.partitions.insert((b, a));
+    }
+
+    /// Heal any partition between `from` and `to` (both directions).
+    pub fn heal(&self, from: NodeId, to: NodeId) {
+        let mut st = self.shared.lock();
+        st.partitions.remove(&(from, to));
+        st.partitions.remove(&(to, from));
+    }
+
+    /// Crash `node`: drop its un-synced disk bytes and its volatile in-memory
+    /// inbox. Messages later delivered to a crashed node are dropped until it
+    /// [`restart`](Self::restart)s.
+    pub fn crash(&self, node: NodeId) {
+        let mut st = self.shared.lock();
+        st.crashed.insert(node);
+        if let Some(inbox) = st.inboxes.get_mut(&node) {
+            inbox.clear();
+        }
+        st.recv_wakers.remove(&node);
+        let keys: Vec<_> = st
+            .disks
+            .keys()
+            .filter(|(n, _)| *n == node)
+            .cloned()
+            .collect();
+        for k in keys {
+            if let Some(f) = st.disks.get_mut(&k) {
+                f.buffered.clear();
+            }
+        }
+    }
+
+    /// Bring a crashed `node` back. Its durable disk state remains.
+    pub fn restart(&self, node: NodeId) {
+        self.shared.lock().crashed.remove(&node);
+    }
+
+    /// The recorded history of this run.
+    #[must_use]
+    pub fn trace(&self) -> Vec<TraceEvent> {
+        self.shared.lock().trace.clone()
+    }
+
+    /// The recorded history rendered as stable text lines.
+    #[must_use]
+    pub fn trace_lines(&self) -> Vec<String> {
+        self.shared
+            .lock()
+            .trace
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    /// Current virtual time.
+    #[must_use]
+    pub fn now(&self) -> Nanos {
+        Nanos(self.shared.lock().clock)
+    }
+
+    /// Run until quiescence: no ready tasks and no scheduled events remain.
+    pub fn run(&mut self) {
+        self.run_until_quiescent(usize::MAX);
+    }
+
+    /// Run until quiescence or until `max_steps` events have fired (a guard
+    /// against a scenario that never settles). Returns `true` if quiescent.
+    pub fn run_until_quiescent(&mut self, max_steps: usize) -> bool {
+        let mut steps = 0;
+        loop {
+            // 1. Drain all ready tasks.
+            while let Some(task) = self.pop_ready() {
+                self.poll_task(task);
+            }
+            // 2. No ready tasks: fire the earliest scheduled event, which wakes
+            //    tasks for the next drain.
+            let next_key = {
+                let st = self.shared.lock();
+                st.timeline.keys().next().copied()
+            };
+            match next_key {
+                Some(key) => {
+                    self.fire_event(key);
+                    steps += 1;
+                    if steps >= max_steps {
+                        return false;
+                    }
+                }
+                None => return true,
+            }
+        }
+    }
+
+    fn pop_ready(&self) -> Option<TaskId> {
+        self.shared
+            .ready
+            .lock()
+            .expect("ready queue poisoned")
+            .pop_front()
+    }
+
+    fn poll_task(&self, task: TaskId) {
+        // Check the future out of the map so the poll can re-enter the state
+        // lock (e.g. via `env.send`) without deadlocking.
+        let fut = {
+            let mut st = self.shared.lock();
+            st.tasks.get_mut(&task).and_then(Option::take)
+        };
+        let Some(mut fut) = fut else { return };
+
+        let waker = futures::task::waker(Arc::new(TaskWaker {
+            shared: Arc::downgrade(&self.shared),
+            task,
+        }));
+        let mut cx = Context::from_waker(&waker);
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(()) => {
+                self.shared.lock().tasks.remove(&task);
+            }
+            Poll::Pending => {
+                if let Some(slot) = self.shared.lock().tasks.get_mut(&task) {
+                    *slot = Some(fut);
+                }
+            }
+        }
+    }
+
+    fn fire_event(&self, key: (u64, Seq)) {
+        let waker = {
+            let mut st = self.shared.lock();
+            let event = st.timeline.remove(&key).expect("event present");
+            st.clock = st.clock.max(key.0);
+            let t = st.clock;
+            match event {
+                Event::Timer(id) => {
+                    st.trace.push(TraceEvent::Timer { t, id });
+                    st.timer_wakers.remove(&id)
+                }
+                Event::Deliver { to, env } => {
+                    let from = env.from;
+                    if st.crashed.contains(&to) {
+                        st.trace.push(TraceEvent::Drop {
+                            t,
+                            from,
+                            to,
+                            reason: "crashed",
+                        });
+                        None
+                    } else if st.partitions.contains(&(from, to)) {
+                        st.trace.push(TraceEvent::Drop {
+                            t,
+                            from,
+                            to,
+                            reason: "partition",
+                        });
+                        None
+                    } else {
+                        let len = env.payload.len();
+                        st.trace.push(TraceEvent::Deliver { t, from, to, len });
+                        st.inboxes.entry(to).or_default().push_back(env);
+                        st.recv_wakers.remove(&to)
+                    }
+                }
+            }
+        };
+        if let Some(w) = waker {
+            w.wake();
+        }
+    }
+}
+
+/// A per-node handle into the simulation. Implements [`Env`]: cloning is cheap
+/// and all clones for the same `node_id` share one inbox and one view of state.
+#[derive(Clone)]
+pub struct SimEnv {
+    shared: Arc<Shared>,
+    node_id: NodeId,
+}
+
+#[async_trait::async_trait]
+impl Clock for SimEnv {
+    fn now(&self) -> Nanos {
+        Nanos(self.shared.lock().clock)
+    }
+
+    async fn sleep(&self, dur: Duration) {
+        let deadline = self.shared.lock().clock.saturating_add(dur_nanos(dur));
+        Sleep {
+            shared: Arc::clone(&self.shared),
+            deadline,
+            timer: None,
+        }
+        .await;
+    }
+}
+
+impl RngTrait for SimEnv {
+    fn next_u64(&self) -> u64 {
+        self.shared.lock().rng.next_u64()
+    }
+
+    fn fill_bytes(&self, dst: &mut [u8]) {
+        self.shared.lock().rng.fill_bytes(dst);
+    }
+}
+
+#[async_trait::async_trait]
+impl Network for SimEnv {
+    async fn send(&self, to: NodeId, payload: Vec<u8>) {
+        let mut st = self.shared.lock();
+        let from = self.node_id;
+        let t = st.clock;
+        let len = payload.len();
+        st.trace.push(TraceEvent::Send { t, from, to, len });
+
+        // Independent random drop at send time.
+        if st.net.drop_threshold > 0 && st.rng.next_u64() < st.net.drop_threshold {
+            st.trace.push(TraceEvent::Drop {
+                t,
+                from,
+                to,
+                reason: "lossy",
+            });
+            return;
+        }
+
+        let base = dur_nanos(st.net.base_delay);
+        let jitter_max = dur_nanos(st.net.max_jitter);
+        let jitter = if jitter_max == 0 {
+            0
+        } else {
+            gen_below(&mut st.rng, jitter_max + 1)
+        };
+        let deliver_at = st.clock.saturating_add(base + jitter);
+        let seq = st.next_seq;
+        st.next_seq += 1;
+        st.timeline.insert(
+            (deliver_at, seq),
+            Event::Deliver {
+                to,
+                env: Envelope { from, payload },
+            },
+        );
+    }
+
+    async fn recv(&self) -> Envelope {
+        Recv {
+            shared: Arc::clone(&self.shared),
+            node: self.node_id,
+        }
+        .await
+    }
+}
+
+#[async_trait::async_trait]
+impl Disk for SimEnv {
+    async fn append(&self, file: &str, bytes: &[u8]) -> std::io::Result<()> {
+        let mut st = self.shared.lock();
+        let key = (self.node_id, file.to_owned());
+        st.disks
+            .entry(key)
+            .or_default()
+            .buffered
+            .extend_from_slice(bytes);
+        Ok(())
+    }
+
+    async fn sync(&self, file: &str) -> std::io::Result<()> {
+        let mut st = self.shared.lock();
+        let key = (self.node_id, file.to_owned());
+        if let Some(f) = st.disks.get_mut(&key) {
+            let mut buffered = std::mem::take(&mut f.buffered);
+            f.durable.append(&mut buffered);
+        }
+        Ok(())
+    }
+
+    async fn read(&self, file: &str) -> std::io::Result<Vec<u8>> {
+        let st = self.shared.lock();
+        let key = (self.node_id, file.to_owned());
+        Ok(st.disks.get(&key).map_or_else(Vec::new, |f| {
+            let mut out = f.durable.clone();
+            out.extend_from_slice(&f.buffered);
+            out
+        }))
+    }
+}
+
+impl Spawner for SimEnv {
+    fn spawn(&self, fut: BoxFuture<'static, ()>) {
+        let mut st = self.shared.lock();
+        let task = st.next_task_id;
+        st.next_task_id += 1;
+        st.tasks.insert(task, Some(fut));
+        st.trace.push(TraceEvent::Spawn { task });
+        drop(st);
+        self.shared.push_ready(task);
+    }
+}
+
+impl Env for SimEnv {
+    fn node_id(&self) -> NodeId {
+        self.node_id
+    }
+}
+
+/// Future that completes once virtual time reaches its deadline.
+struct Sleep {
+    shared: Arc<Shared>,
+    deadline: u64,
+    timer: Option<TimerId>,
+}
+
+impl Future for Sleep {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let mut st = self.shared.lock();
+        if st.clock >= self.deadline {
+            return Poll::Ready(());
+        }
+        match self.timer {
+            Some(id) => {
+                st.timer_wakers.insert(id, cx.waker().clone());
+            }
+            None => {
+                let id = st.next_timer_id;
+                st.next_timer_id += 1;
+                st.timer_wakers.insert(id, cx.waker().clone());
+                let seq = st.next_seq;
+                st.next_seq += 1;
+                let deadline = self.deadline;
+                st.timeline.insert((deadline, seq), Event::Timer(id));
+                drop(st);
+                self.timer = Some(id);
+            }
+        }
+        Poll::Pending
+    }
+}
+
+/// Future that yields the next message addressed to a node.
+struct Recv {
+    shared: Arc<Shared>,
+    node: NodeId,
+}
+
+impl Future for Recv {
+    type Output = Envelope;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Envelope> {
+        let mut st = self.shared.lock();
+        if let Some(env) = st.inboxes.get_mut(&self.node).and_then(VecDeque::pop_front) {
+            Poll::Ready(env)
+        } else {
+            st.recv_wakers.insert(self.node, cx.waker().clone());
+            Poll::Pending
+        }
+    }
+}
+
+fn dur_nanos(d: Duration) -> u64 {
+    d.as_nanos().min(u128::from(u64::MAX)) as u64
+}
+
+/// Lemire-debiased `[0, n)` draw directly on a `ChaCha8Rng` (used internally for
+/// network jitter; mirrors `custos_env::Rng::gen_below`).
+fn gen_below(rng: &mut ChaCha8Rng, n: u64) -> u64 {
+    if n == 0 {
+        return 0;
+    }
+    let mut x = rng.next_u64();
+    let mut m = u128::from(x) * u128::from(n);
+    let mut low = m as u64;
+    if low < n {
+        let threshold = n.wrapping_neg() % n;
+        while low < threshold {
+            x = rng.next_u64();
+            m = u128::from(x) * u128::from(n);
+            low = m as u64;
+        }
+    }
+    (m >> 64) as u64
+}
