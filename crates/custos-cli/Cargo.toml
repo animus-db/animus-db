@@ -16,3 +16,5 @@ name = "custos"
 path = "src/main.rs"
 
 [dependencies]
+custosd.workspace = true
+tokio.workspace = true

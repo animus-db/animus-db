@@ -61,8 +61,20 @@ data nodes keep serving on cached metadata; only topology changes block. See
 | `custos-cql` | CQL (Cassandra) wire adapter *(later)* |
 | `custos-dynamo` | DynamoDB-style item API over the common core (wire protocol later) |
 | `custos-test` | Elle-style history recorder + checker |
-| `custosd` | Node server binary |
-| `custos-cli` | Operator CLI |
+| `custosd` | Node server: assembles control + data + a client API over `ProdEnv` (runnable `--cluster` mode) |
+| `custos-cli` | Operator/client CLI (`status` / `put` / `get`) |
+
+## Running a cluster
+
+```sh
+cargo run -p custosd --bin custosd -- --cluster 3   # prints each node's client address
+cargo run -p custos-cli -- status 127.0.0.1:<port>
+cargo run -p custos-cli -- put    127.0.0.1:<port> mykey myvalue
+cargo run -p custos-cli -- get    127.0.0.1:<port> mykey
+```
+
+This runs a 3-node cluster in one process over loopback TCP (real `ProdEnv`);
+per-process deployment with a config file is future work.
 
 ## Building
 

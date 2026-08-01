@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -21,7 +21,9 @@ use crate::{Clock, Disk, Env, Envelope, Nanos, Network, NodeId, Rng, Spawner};
 /// A production environment for a single node.
 ///
 /// Cheap to clone (everything shared lives behind an `Arc`). Construct one per
-/// process with [`ProdEnv::bind`].
+/// node role with [`ProdEnv::bind`], then install the peer address book with
+/// [`set_peers`](ProdEnv::set_peers) (deferred so a whole cluster can bind to
+/// ephemeral ports first, then exchange addresses).
 #[derive(Clone)]
 pub struct ProdEnv {
     inner: Arc<Inner>,
@@ -30,16 +32,18 @@ pub struct ProdEnv {
 struct Inner {
     node_id: NodeId,
     start: Instant,
-    peers: BTreeMap<NodeId, SocketAddr>,
+    peers: StdMutex<BTreeMap<NodeId, SocketAddr>>,
     data_dir: PathBuf,
     inbox: Mutex<mpsc::UnboundedReceiver<Envelope>>,
 }
 
 impl ProdEnv {
-    /// Bind this node's listener and start accepting peer connections.
+    /// Bind this node's listener (start accepting peer connections) and create
+    /// its data directory. Returns the environment and the actual bound address
+    /// (useful when `listen` has port 0 for an OS-assigned port).
     ///
-    /// `peers` maps every node id (including this one) to its socket address;
-    /// `data_dir` is where [`Disk`] files live.
+    /// The peer address book starts empty; install it with
+    /// [`set_peers`](Self::set_peers) before sending.
     ///
     /// # Errors
     /// Returns an error if the listen address cannot be bound or the data
@@ -47,12 +51,12 @@ impl ProdEnv {
     pub async fn bind(
         node_id: NodeId,
         listen: SocketAddr,
-        peers: BTreeMap<NodeId, SocketAddr>,
         data_dir: impl Into<PathBuf>,
-    ) -> std::io::Result<Self> {
+    ) -> std::io::Result<(Self, SocketAddr)> {
         let data_dir = data_dir.into();
         tokio::fs::create_dir_all(&data_dir).await?;
         let listener = TcpListener::bind(listen).await?;
+        let local_addr = listener.local_addr()?;
         let (tx, rx) = mpsc::unbounded_channel();
 
         // Accept loop: one reader task per inbound connection, each demuxing
@@ -76,15 +80,22 @@ impl ProdEnv {
             }
         });
 
-        Ok(Self {
+        let env = Self {
             inner: Arc::new(Inner {
                 node_id,
                 start: Instant::now(),
-                peers,
+                peers: StdMutex::new(BTreeMap::new()),
                 data_dir,
                 inbox: Mutex::new(rx),
             }),
-        })
+        };
+        Ok((env, local_addr))
+    }
+
+    /// Install (or replace) the peer address book: a map from node id to socket
+    /// address for every node this env may send to.
+    pub fn set_peers(&self, peers: BTreeMap<NodeId, SocketAddr>) {
+        *self.inner.peers.lock().expect("peers poisoned") = peers;
     }
 
     fn path(&self, file: &str) -> PathBuf {
@@ -142,9 +153,15 @@ impl Rng for ProdEnv {
 #[async_trait::async_trait]
 impl Network for ProdEnv {
     async fn send(&self, to: NodeId, payload: Vec<u8>) {
-        let Some(&addr) = self.inner.peers.get(&to) else {
-            tracing::warn!(to, "send to unknown peer");
-            return;
+        let addr = {
+            let peers = self.inner.peers.lock().expect("peers poisoned");
+            match peers.get(&to) {
+                Some(&addr) => addr,
+                None => {
+                    tracing::warn!(to, "send to unknown peer");
+                    return;
+                }
+            }
         };
         // Fire-and-forget semantics: a transport error is the network dropping
         // the message, not an error to the caller (see `Network::send`).

@@ -132,6 +132,35 @@ impl<E: Env> DataClient<E> {
 
     /// Quorum read: return the latest value for `key` once `r` replicas respond.
     pub async fn read(&self, view: &TabletView, key: &[u8], timeout: Duration) -> ReadResult {
+        match self.quorum_read(view, key, timeout).await {
+            Some(best) => ReadResult::Value(best.map(|(_, v)| v)),
+            None => ReadResult::Failed,
+        }
+    }
+
+    /// The highest version observed for `key` across a read quorum: `Some(0)` if
+    /// no value exists, `Some(v)` for the latest version, `None` if a read
+    /// quorum could not be reached. Used to assign a strictly-increasing version
+    /// to the next write regardless of which coordinator issues it.
+    pub async fn read_version(
+        &self,
+        view: &TabletView,
+        key: &[u8],
+        timeout: Duration,
+    ) -> Option<u64> {
+        self.quorum_read(view, key, timeout)
+            .await
+            .map(|best| best.map_or(0, |(ver, _)| ver))
+    }
+
+    /// Collect a read quorum, returning `None` if unreachable, else the
+    /// highest-versioned `(version, value)` observed (or inner `None` if absent).
+    async fn quorum_read(
+        &self,
+        view: &TabletView,
+        key: &[u8],
+        timeout: Duration,
+    ) -> Option<Option<(u64, Vec<u8>)>> {
         let req = self.env.next_u64();
         let msg = DataMsg::Read {
             req,
@@ -163,11 +192,7 @@ impl<E: Env> DataClient<E> {
         })
         .await;
 
-        if oks >= view.r {
-            ReadResult::Value(best.map(|(_, v)| v))
-        } else {
-            ReadResult::Failed
-        }
+        (oks >= view.r).then_some(best)
     }
 
     async fn broadcast(&self, replicas: &[NodeId], msg: &DataMsg) {
