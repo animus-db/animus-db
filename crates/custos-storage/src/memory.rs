@@ -151,6 +151,20 @@ impl StorageEngine for MemoryEngine {
         Ok(true)
     }
 
+    fn merge_tombstone(&self, key: &[u8], version: Version) -> Result<bool> {
+        let mut inner = self.lock();
+        // Per-key LWW: apply only if strictly newer than this key's own latest.
+        if inner
+            .latest_version_of(key)
+            .is_some_and(|cur| version <= cur)
+        {
+            return Ok(false);
+        }
+        inner.apply(&WriteOp::Delete { key: key.to_vec() }, version);
+        inner.max_version = inner.max_version.max(version);
+        Ok(true)
+    }
+
     fn delete(&self, key: &[u8], version: Version) -> Result<()> {
         let mut inner = self.lock();
         inner.check_monotonic(version)?;
@@ -214,6 +228,18 @@ impl StorageEngine for MemoryEngine {
         for key in inner.data.keys() {
             if let Some(vv) = inner.read_at(key, Version::MAX) {
                 out.push((key.clone(), vv));
+            }
+        }
+        Ok(out)
+    }
+
+    fn entries_with_tombstones(&self) -> Result<Vec<(Key, Option<Value>, Version)>> {
+        let inner = self.lock();
+        let mut out = Vec::new();
+        for (key, history) in &inner.data {
+            // The greatest recorded version, value or tombstone.
+            if let Some((&version, slot)) = history.iter().next_back() {
+                out.push((key.clone(), slot.clone(), version));
             }
         }
         Ok(out)

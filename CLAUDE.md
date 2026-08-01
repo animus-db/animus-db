@@ -158,11 +158,14 @@ responds. Choose `R + W > N` so reads see acknowledged writes.
 
 `R + W > N` only makes quorum *reads* intersect; raw replica state still
 diverges when a replica misses a write. **Repair/anti-entropy** (ADR 0010)
-closes that: replica writes apply via `StorageEngine::merge` (per-key LWW), a
-divergent quorum read pushes the winner back (read-repair), and
-`serve_anti_entropy` periodically full-pushes a replica's digest to peers so
-even unread keys converge. The `repair.rs` test partitions a replica during a
-write and asserts convergence both via a read and with no reads at all.
+closes that: replica writes apply via `StorageEngine::merge` (per-key LWW) and
+deletes via `merge_tombstone`, a divergent quorum read pushes the winner back
+(read-repair), and `serve_anti_entropy` periodically full-pushes a replica's
+digest (`entries_with_tombstones`, so deletes ride along) to peers so even
+unread keys converge. The data plane carries quorum `Write`/`Delete` and a
+tombstone-aware `Sync`, so deletes propagate the same way writes do. The
+`repair.rs` test partitions a replica during a write/delete and asserts
+convergence both via a read and with no reads at all.
 
 ### Placement & residency (`custos-placement`)
 

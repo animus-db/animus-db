@@ -10,7 +10,8 @@ tablet map, and per-tablet epoch fencing (ADR 0001, 0002).
 ## Entry points
 
 - `lib.rs` — `DataMsg` wire protocol (each op names its `tablet` + `epoch`;
-  `Sync` carries a `(key, value, version)` batch for repair).
+  quorum `Write`/`Delete` + `Sync`, which carries a `(key, Option<value>,
+  version)` batch for repair — `None` is a tombstone, so deletes propagate).
 - `replica.rs` — `serve_replica(env, storage, floor_epoch) -> ReplicaHandle`:
   the per-node server over a `StorageEngine`; plus `serve_anti_entropy(...)`,
   the background convergence loop.
@@ -34,14 +35,16 @@ tablet map, and per-tablet epoch fencing (ADR 0001, 0002).
 - **Repair / anti-entropy (ADR 0010)** is what makes *raw replica state*
   converge — `R + W > N` only makes quorum *reads* intersect, so a replica that
   missed a write stays stale until repaired. Replica writes apply via
-  `StorageEngine::merge` (per-key LWW, idempotent/commutative — not `put`'s
-  engine-wide monotonic version, which would reject re-applying a value at its
-  original version). **Read-repair**: a quorum read that sees responders disagree
-  pushes the winner back as a fire-and-forget `Sync` (repairs the read's
-  participants only). **Anti-entropy**: `serve_anti_entropy` full-pushes a
-  replica's `entries()` digest to peers on a timer, converging even keys nobody
-  reads. Both are epoch-fenced. Deferred: Merkle digests (vs. full-push) and
-  tombstone propagation (no data-plane delete yet).
+  `StorageEngine::merge` and deletes via `merge_tombstone` (per-key LWW,
+  idempotent/commutative — not `put`'s engine-wide monotonic version, which
+  would reject re-applying at the original version). **Read-repair**: a quorum
+  read that sees responders disagree pushes the winner back as a fire-and-forget
+  `Sync` (repairs the read's participants only). **Anti-entropy**:
+  `serve_anti_entropy` full-pushes a replica's `entries_with_tombstones()`
+  digest to peers on a timer, converging even keys nobody reads — tombstones
+  included, so a delete reaches a replica that still holds the value. Both are
+  epoch-fenced. Deferred: Merkle digests (vs. full-push) and tombstone GC (a
+  grace period before reclaiming tombstones).
 - A replica serves over any `StorageEngine`; values are opaque bytes. Higher
   layers (e.g. the dynamo adapter, or list-append test workloads) define their
   own value encoding.
@@ -53,4 +56,5 @@ tablet map, and per-tablet epoch fencing (ADR 0001, 0002).
 
 `cargo test -p custos-data` — quorum + node-kill + fencing (`quorum.rs`),
 two-plane integration (`two_plane.rs`), multi-tablet routing (`routing.rs`),
-read-repair + background anti-entropy convergence (`repair.rs`).
+read-repair + background anti-entropy convergence, incl. tombstone propagation
+(`repair.rs`).

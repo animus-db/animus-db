@@ -144,6 +144,36 @@ fn merge_is_per_key_lww_and_entries_lists_live_latest() {
 }
 
 #[test]
+fn merge_tombstone_is_per_key_lww_and_entries_with_tombstones_retains_deletes() {
+    let (_dir, e) = engine();
+    e.put(b"other", b"x", 100).unwrap(); // raise the global floor
+
+    // A fresh tombstone below the floor applies (per-key LWW).
+    assert!(e.merge_tombstone(b"k", 5).unwrap(), "fresh key applies");
+    assert_eq!(e.get(b"k").unwrap(), None);
+
+    // A newer value resurrects, a newer tombstone deletes again; equal/older no-op.
+    assert!(e.merge(b"k", b"v2", 7).unwrap());
+    assert_eq!(e.get(b"k").unwrap().unwrap().value, b"v2");
+    assert!(e.merge_tombstone(b"k", 9).unwrap());
+    assert!(!e.merge_tombstone(b"k", 9).unwrap(), "equal is a no-op");
+    assert!(!e.merge(b"k", b"v0", 6).unwrap(), "older value is a no-op");
+    assert_eq!(e.get(b"k").unwrap(), None);
+
+    // `entries` hides the delete; `entries_with_tombstones` retains it as `None`.
+    let live: Vec<_> = e.entries().unwrap().into_iter().map(|(k, _)| k).collect();
+    assert_eq!(live, vec![b"other".to_vec()]);
+    let with_ts = e.entries_with_tombstones().unwrap();
+    assert_eq!(
+        with_ts,
+        vec![
+            (b"k".to_vec(), None, 9),
+            (b"other".to_vec(), Some(b"x".to_vec()), 100),
+        ]
+    );
+}
+
+#[test]
 fn data_and_version_floor_survive_reopen() {
     let dir = tempfile::tempdir().unwrap();
     {

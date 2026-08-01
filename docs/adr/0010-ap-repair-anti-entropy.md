@@ -41,6 +41,18 @@ primitive:
    `StorageEngine::entries()` exposes the full live digest a sync reconciles
    against.
 
+   **Deletes (added later).** A delete is the same per-key LWW idea applied to a
+   tombstone: `StorageEngine::merge_tombstone(key, version) -> bool` applies a
+   tombstone iff `version` is strictly newer than the key's own latest, exactly
+   like `merge` applies a value. For anti-entropy to *propagate* a delete, the
+   digest must retain tombstoned keys (the live `entries()` hides them), so
+   `StorageEngine::entries_with_tombstones() -> Vec<(key, Option<value>,
+   version)>` carries each key's latest record (`None` = tombstone). The
+   data-plane gains a quorum `DataMsg::Delete`/`DeleteAck` (epoch-fenced like
+   `Write`), and `DataMsg::Sync` now carries `(key, Option<value>, version)` so a
+   tombstone reconciles through both repair paths just as a value does. Both
+   `MemoryEngine` and `FjallEngine` implement the two new primitives.
+
 2. **Read-repair** (lazy, on the read path): when a quorum read finds the
    responding replicas disagree — some returned an older version, or none — the
    coordinator pushes the winning `(value, version)` back to the tablet's
@@ -49,7 +61,8 @@ primitive:
    already agree.
 
 3. **Anti-entropy** (eager, background): `serve_anti_entropy` runs a per-replica
-   timer loop that periodically pushes its full digest to its peers as a
+   timer loop that periodically pushes its full digest
+   (`entries_with_tombstones()`, so deletes ride along) to its peers as a
    `Sync`. This converges replicas that are **never read**, which read-repair
    alone cannot. Both paths are fenced per tablet by epoch, exactly like
    ordinary writes (ADR 0002).
@@ -66,9 +79,18 @@ primitive:
   **Merkle-tree digest** is the obvious optimization and is deferred. Read-repair
   likewise repairs only the replicas that responded within the read; stragglers
   rely on anti-entropy.
-- **Deletes do not yet propagate** through repair: the data-plane protocol
-  carries only writes, so `merge` reconciles values, not tombstones. Tombstone
-  anti-entropy (and its GC/grace-period concerns) is future work alongside a
-  data-plane delete.
+- **Deletes now propagate** through repair: a data-plane `DataMsg::Delete`
+  tombstones by per-key LWW (`merge_tombstone`), and the tombstone-carrying
+  `Sync` digest converges it through both read-repair and anti-entropy — proven
+  under simulation by isolating a replica that *holds the value* during a delete
+  and asserting it converges to the tombstone with **no reads at all**, and that
+  the lagging replica pushing its stale value back does not resurrect the key
+  (`custos-data/tests/repair.rs`).
+- **Tombstone GC is deferred.** Tombstones currently live forever in a key's
+  MVCC history (so they win LWW and stay in the digest). A real system reclaims
+  them after a grace period exceeding the max anti-entropy lag; this — and its
+  interaction with a replica that was offline longer than the grace period —
+  is future work. The full-push digest also still sends every tombstone each
+  round (the Merkle-tree / divergent-range optimization remains deferred).
 - ADR 0001 (two-plane) and ADR 0002 (epoch fencing) are unchanged; this refines
   the data plane's convergence story within them.

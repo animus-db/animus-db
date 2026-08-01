@@ -138,6 +138,46 @@ impl<E: Env> DataClient<E> {
         acks >= view.w
     }
 
+    /// Quorum delete: tombstone `key` with MVCC `version`, returning `true` once
+    /// `w` replicas acknowledge (within `timeout`). Epoch-fenced and applied by
+    /// per-key LWW exactly like [`write`](DataClient::write), so the tombstone
+    /// propagates to lagging replicas through anti-entropy / read-repair just as
+    /// a value does (ADR 0010).
+    pub async fn delete(
+        &self,
+        view: &TabletView,
+        key: &[u8],
+        version: u64,
+        timeout: Duration,
+    ) -> bool {
+        let req = self.env.next_u64();
+        let msg = DataMsg::Delete {
+            req,
+            tablet: view.tablet,
+            epoch: view.epoch,
+            key: key.to_vec(),
+            version,
+        };
+        self.broadcast(&view.replicas, &msg).await;
+
+        let mut acks = 0usize;
+        let mut responded = 0usize;
+        self.collect(view.replicas.len(), timeout, |reply| {
+            if let DataMsg::DeleteAck { req: r, ok } = reply {
+                if r == req {
+                    responded += 1;
+                    if ok {
+                        acks += 1;
+                    }
+                    return acks >= view.w || responded >= view.replicas.len();
+                }
+            }
+            false
+        })
+        .await;
+        acks >= view.w
+    }
+
     /// Quorum read: return the latest value for `key` once `r` replicas respond.
     ///
     /// If the responding replicas disagreed — some returned an older version, or
@@ -167,7 +207,7 @@ impl<E: Env> DataClient<E> {
         let msg = DataMsg::Sync {
             tablet: view.tablet,
             epoch: view.epoch,
-            entries: vec![(key.to_vec(), value.to_vec(), version)],
+            entries: vec![(key.to_vec(), Some(value.to_vec()), version)],
         };
         self.broadcast(&view.replicas, &msg).await;
     }

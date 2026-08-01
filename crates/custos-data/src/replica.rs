@@ -123,13 +123,13 @@ pub fn serve_anti_entropy<E, S>(
     env.clone().spawn_task(async move {
         loop {
             env.sleep(interval).await;
-            let entries: Vec<(Vec<u8>, Vec<u8>, u64)> = match storage.entries() {
-                Ok(es) => es
-                    .into_iter()
-                    .map(|(k, vv)| (k, vv.value, vv.version))
-                    .collect(),
-                Err(_) => continue,
-            };
+            // Carry tombstones too, so a delete converges to a replica that
+            // still holds the value (ADR 0010).
+            let entries: Vec<(Vec<u8>, Option<Vec<u8>>, u64)> =
+                match storage.entries_with_tombstones() {
+                    Ok(es) => es,
+                    Err(_) => continue,
+                };
             if entries.is_empty() {
                 continue;
             }
@@ -172,6 +172,21 @@ fn handle_msg<S: StorageEngine>(
             let _ = storage.merge(&key, &value, version);
             Some(DataMsg::WriteAck { req, ok: true })
         }
+        DataMsg::Delete {
+            req,
+            tablet,
+            epoch,
+            key,
+            version,
+        } => {
+            if fenced(epochs, tablet, epoch) {
+                return Some(DataMsg::DeleteAck { req, ok: false });
+            }
+            // Per-key LWW tombstone: superseded by a higher-versioned write or
+            // delete, so concurrent coordinators converge regardless of order.
+            let _ = storage.merge_tombstone(&key, version);
+            Some(DataMsg::DeleteAck { req, ok: true })
+        }
         DataMsg::Read {
             req,
             tablet,
@@ -205,13 +220,16 @@ fn handle_msg<S: StorageEngine>(
             // Fenced as a whole on a stale epoch; otherwise fire-and-forget.
             if !fenced(epochs, tablet, epoch) {
                 for (key, value, version) in entries {
-                    let _ = storage.merge(&key, &value, version);
+                    let _ = match value {
+                        Some(v) => storage.merge(&key, &v, version),
+                        None => storage.merge_tombstone(&key, version),
+                    };
                 }
             }
             None
         }
         // Replicas never receive responses.
-        DataMsg::WriteAck { .. } | DataMsg::ReadResp { .. } => None,
+        DataMsg::WriteAck { .. } | DataMsg::ReadResp { .. } | DataMsg::DeleteAck { .. } => None,
     }
 }
 
