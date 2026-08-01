@@ -1,7 +1,7 @@
-# ADR 0008 — Borrowed storage engine first, custom LSM deferred
+# ADR 0008 — Borrowed storage engine first, then a custom on-disk LSM
 
-- **Status:** Accepted
-- **Date:** 2026-08-01
+- **Status:** Accepted (custom-engine half now implemented)
+- **Date:** 2026-08-01 (revised 2026-08-01)
 
 ## Context
 
@@ -13,14 +13,44 @@ tablets, placement, consensus — not in local storage.
 
 ## Decision
 
-We will hide storage behind a `StorageEngine` trait (ADR 0004) and not write a
-storage engine yet. The first backing implementation is a simple, fully
-deterministic **in-memory `BTreeMap`** engine, sufficient to exercise the
-distributed layer under simulation. A real persistent backend is added behind
-the same trait, feature-gated, without touching the distributed code: the
-pure-Rust **`fjall` LSM** (`FjallEngine`, feature `fjall`), with MVCC layered on
-top via an order-preserving, prefix-free key encoding plus an inverted-version
-suffix. A custom LSM engine is explicitly deferred, possibly indefinitely.
+We hide storage behind a `StorageEngine` trait (ADR 0004). The first backing
+implementation is a simple, fully deterministic **in-memory `BTreeMap`** engine,
+sufficient to exercise the distributed layer under simulation. A real persistent
+backend was then added behind the same trait, feature-gated, without touching the
+distributed code: the pure-Rust **`fjall` LSM** (`FjallEngine`, feature `fjall`),
+with MVCC layered on top via an order-preserving, prefix-free key encoding plus an
+inverted-version suffix.
+
+The custom engine, originally deferred "possibly indefinitely", is now **built**:
+`LsmEngine<E: Env>` is a real on-disk log-structured merge tree implemented
+against the `StorageEngine` trait, doing **all** of its I/O through the `Env`
+`Disk` seam (`append`/`sync`/`read`/`read_at`/`size`/`remove`/`replace`). Because
+it touches the disk only through that seam, it is **deterministically
+crash-testable under `SimEnv`** — the differentiator a borrowed engine cannot
+offer, since RocksDB/`fjall` do their own nondeterministic real I/O outside the
+seam and so cannot be driven by the simulator.
+
+`LsmEngine` is a textbook LSM, correctness-first:
+
+- a **memtable** (`BTreeMap` MVCC store, identical shape to `MemoryEngine`);
+- a **write-ahead log** (`<prefix>wal`): each mutation is appended + `sync`ed
+  before the call returns, so an ack means durable (mirroring the control-plane
+  Raft WAL pattern, ADR 0009);
+- immutable, sorted, checksummed **SSTables** (`<prefix>sst-NNNNNN`) with a block
+  layout, an in-file block index, and a footer — point reads fetch one block via
+  `read_at`, never the whole file (`crc32fast` per block);
+- a **MANIFEST** (`<prefix>MANIFEST`): the durable source of truth listing live
+  SSTables + metadata, written **atomically** via `Disk::replace`, the single
+  linearization point for flush and compaction;
+- **size-tiered compaction** merging accumulated SSTables, dropping superseded
+  versions and GC-able tombstones;
+- **recovery** on open: read the manifest, open the named SSTables, replay the
+  WAL into the memtable, restore the monotonic floor.
+
+Crash safety is argued at the manifest swap: a crash mid-flush or mid-compaction
+(new SSTable written but the manifest not yet swapped) recovers the last durable
+manifest plus the intact WAL — no loss, no torn-table read, the orphan file
+ignored. This is tested under fault injection in `custos-storage/tests/lsm_crash.rs`.
 
 ## Consequences
 
@@ -29,8 +59,14 @@ suffix. A custom LSM engine is explicitly deferred, possibly indefinitely.
 - The `StorageEngine` trait must be driven by what the distributed layer needs
   (snapshots, MVCC, range delete, atomic batches), not by what any one engine
   happens to offer, so the trait stays portable across backends.
-- Until a persistent backend lands, the system is not durable across process
-  restarts on real hardware; that is acceptable for the current milestones,
-  whose durability is defined and tested at the simulation layer.
-- If we ever do need a custom engine, the trait boundary means it is an additive
-  change, not a rewrite.
+- The custom `LsmEngine` lands as a purely additive change behind the existing
+  trait boundary, exactly as this ADR anticipated — no rewrite of the distributed
+  code, which remains generic over `StorageEngine`.
+- `LsmEngine` provides on-disk durability that is **simulation-testable**: unlike
+  the borrowed `fjall`, its crash-recovery story is exercised deterministically
+  under `SimEnv`, closing the gap where durability could previously only be
+  asserted at the in-memory simulation layer.
+- Deferred within `LsmEngine` (correctness-first, performance later): bloom
+  filters (only a key-range gate today), leveled compaction (size-tiered only),
+  WAL segment rotation / fsync batching, block compression, and a more compact
+  binary manifest (JSON today). None affect the trait or correctness.

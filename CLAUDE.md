@@ -9,8 +9,10 @@ lineage). It pairs a **leaderless AP data plane** (tunable quorum consistency)
 with a small **strongly-consistent Raft control plane** that owns cluster
 metadata. Correctness is established by **deterministic simulation testing**.
 
-Status: pre-alpha. Implemented: the scaffold, the `Env` seam, storage (in-memory
-+ persistent `fjall`), the control-plane Raft (WAL durability + recovery +
+Status: pre-alpha. Implemented: the scaffold, the `Env` seam, storage (in-memory,
+persistent `fjall`, and a **custom on-disk `LsmEngine`** — a real WAL + SSTable +
+compaction LSM doing all I/O through the `Env` disk seam, so it is deterministically
+crash-tested under `SimEnv`), the control-plane Raft (WAL durability + recovery +
 log-truncating snapshots with `InstallSnapshot`),
 the quorum data-plane vertical slice (with read-repair, background
 anti-entropy convergence via segment-digest exchange of only divergent ranges,
@@ -235,10 +237,15 @@ snapshotting, data-plane/`StorageEngine` integration, and sharding — see ADR
 
 `StorageEngine` trait (put/get, `get_at` historical read, range scan, atomic
 batch, range delete, MVCC `Snapshot`). Backed by `MemoryEngine` (a `BTreeMap`
-MVCC store; ADR 0008 — real engines slot in behind the trait later). The trait
-is **async** (`#[async_trait]`): the I/O-ish methods are `async fn` so an
-on-disk LSM can reach the async `Disk` seam behind the same trait, while
-`snapshot()` / `latest_version()` stay synchronous. **Version contract:**
+MVCC store; the engine used under simulation), the feature-gated `FjallEngine`
+(borrowed `fjall` LSM), and now a **custom on-disk `LsmEngine<E: Env>`** — a real
+log-structured merge tree (WAL → memtable → flushed, CRC-checksummed SSTables with
+a block index + footer → size-tiered compaction → atomically-swapped MANIFEST,
+recovered on open) that does **all** I/O through the `Env` `Disk` seam, so its
+crash recovery is **deterministically simulation-tested** under `SimEnv` (ADR
+0008). The trait is **async** (`#[async_trait]`): the I/O-ish methods are `async
+fn` so the on-disk LSM can reach the async `Disk` seam behind the same trait,
+while `snapshot()` / `latest_version()` stay synchronous. **Version contract:**
 writers assign strictly increasing versions (enforced via `NonMonotonicVersion`);
 given that, a snapshot taken at version `v` is isolated from later writes.
 

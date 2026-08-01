@@ -20,11 +20,13 @@
 //! satisfy this. Given monotonic versions, a [`Snapshot`] taken at version `v`
 //! is isolated from all later writes.
 
+mod lsm;
 mod memory;
 
 #[cfg(feature = "fjall")]
 mod fjall_engine;
 
+pub use lsm::{LsmEngine, LsmOptions, LsmSnapshot};
 pub use memory::{MemoryEngine, MemorySnapshot};
 
 #[cfg(feature = "fjall")]

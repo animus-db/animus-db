@@ -13,6 +13,10 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
   `VersionedValue`, `StorageError`.
 - `memory.rs` — `MemoryEngine`: `BTreeMap` MVCC store, deterministic; the engine
   used under simulation.
+- `lsm.rs` (+ `lsm/sstable.rs`) — `LsmEngine<E: Env>`: a **real on-disk LSM**
+  doing all I/O through the `Env` `Disk` seam, so it is deterministically
+  crash-testable under `SimEnv` (ADR 0008). `LsmOptions` tunes the flush
+  threshold + compaction trigger.
 - `fjall_engine.rs` — `FjallEngine`: persistent LSM behind feature `fjall`.
 
 ## What's non-obvious
@@ -54,9 +58,43 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
   reopen). The same escape scheme is mirrored in `custos-dynamo`.
 - The distributed layer must never depend on `fjall` — it's an additive,
   feature-gated backend, off by default.
+- **`LsmEngine` is the simulation-testable on-disk engine** (no feature gate).
+  `LsmEngine::open(env, prefix)` (or `open_with(.., LsmOptions)`) opens at a
+  filename `prefix` over the node-scoped `Env` disk. Files: `MANIFEST` (durable
+  source of truth, swapped **atomically** via `Disk::replace` — the single
+  flush/compaction linearization point), `wal` (each write `append`+`sync`ed
+  *before* it returns, so an ack means durable; mirrors the Raft WAL pattern),
+  and `sst-NNNNNN` (immutable, sorted, **per-block CRC32** via `crc32fast`, with
+  an in-file block index + footer; point reads fetch one block with `read_at`,
+  never the whole file). Writes go to the WAL then the in-memory memtable
+  (`BTreeMap` MVCC, same shape as `MemoryEngine`); a size threshold flushes the
+  memtable to an SSTable, then swaps the manifest and starts a fresh WAL.
+  Size-tiered compaction merges accumulated SSTables. Reads merge the memtable
+  (newest) with SSTables newest→oldest by version, matching `MemoryEngine`
+  exactly (a differential proptest in `lsm_semantics.rs` pins this).
+- **The `std::sync::Mutex` guard is never held across an `.await`** in
+  `LsmEngine`: every op does its disk I/O (await) lock-free — snapshotting the
+  cheap `SsTableReader` clones (metadata + block index, no block bytes) under a
+  brief lock first — then takes the lock again only to mutate in-memory state.
+  This keeps futures `Send` and ordering deterministic (ADR 0003). Block bytes
+  are read from disk outside any lock.
+- **Crash safety** holds at the manifest swap: a crash mid-flush or
+  mid-compaction recovers the last durable manifest + the intact WAL — the orphan
+  SSTable (un-synced, never manifest-referenced, at a seq beyond the manifest's
+  `next_seq`) is ignored; no torn-table read is possible because a table is only
+  read once a *synced* manifest names it. Argued in `lsm.rs` module docs,
+  exercised in `lsm_crash.rs`.
 
 ## Tests
 
 `cargo test -p custos-storage` (proptest semantics + units). The fjall backend:
 `cargo test -p custos-storage --features fjall`. CI lints `--all-features`, so
 keep the fjall path clippy-clean too.
+
+`LsmEngine` tests run under `SimEnv` via `Simulator` (a dev-dep): `lsm_semantics.rs`
+mirrors the `MemoryEngine` units + a differential proptest, and `lsm_crash.rs`
+fault-injects crashes (synced writes survive; a flushed SSTable survives; mid-flush
+and mid-compaction crashes lose nothing) and asserts flush+compaction actually
+happen — all seed-reproducible. `LsmEngine` exposes `#[doc(hidden)]`
+`sstable_count`/`flush_count`/`compaction_count`/`test_write_orphan_sstable`
+introspection helpers for these tests.

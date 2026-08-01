@@ -20,9 +20,14 @@ fjall = ["dep:fjall"]
 [dependencies]
 async-trait.workspace = true
 thiserror.workspace = true
+custos-env.workspace = true
+crc32fast.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
 fjall = { version = "2", optional = true }
 
 [dev-dependencies]
+custos-sim.workspace = true
 futures.workspace = true
 proptest.workspace = true
 tempfile = "3"
