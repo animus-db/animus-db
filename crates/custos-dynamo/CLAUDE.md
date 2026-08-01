@@ -42,10 +42,9 @@ adapter wedge. The transport (HTTP, sockets) and the distributed routing live in
   storage, no network, `BTreeMap`/`BTreeSet` only (ADR 0003). `custosd::dynamo`
   owns the HTTP edge, holds one process-wide `SchemaRegistry` behind a lock, and
   routes decoded ops through the data plane.
-- Storage key = `escape(partition_key) || sort_key`, using the same
-  order-preserving, prefix-free escape as `custos-storage`'s fjall backend. So a
-  partition's items are contiguous and sort-ordered, and `query` is one range
-  scan. Numbers (`N`) are carried as text and sort lexicographically (a
+- Storage key = `escape(partition_key) || sort_key`, using an order-preserving,
+  prefix-free escape (no key's encoding prefixes another's). So a partition's
+  items are contiguous and sort-ordered, and `query` is one range scan. Numbers (`N`) are carried as text and sort lexicographically (a
   documented simplification). `SortKeyCondition::matches` compares the same
   key-bytes, so it agrees with the scan range.
 - `Query` over the **distributed** plane: the data plane (`custos-data`) has no

@@ -52,7 +52,7 @@ data nodes keep serving on cached metadata; only topology changes block. See
 |-------|---------|
 | `custos-env` | `Env` traits + `ProdEnv` (real clock/net/disk/spawn) |
 | `custos-sim` | Deterministic simulator: virtual clock, in-memory net, fake disk, scheduler, fault injection |
-| `custos-storage` | `StorageEngine` trait + in-memory `BTreeMap` impl (+ persistent `fjall` LSM behind feature `fjall`) |
+| `custos-storage` | `StorageEngine` trait + in-memory `BTreeMap` impl + custom on-disk `LsmEngine` (WAL/SSTable/compaction over the `Env` seam) |
 | `custos-control` | Control-plane RSM: Raft, metadata model, epochs |
 | `custos-data` | Leaderless data plane: quorum read/write, routing, epoch fencing |
 | `custos-tablet` | Tablet model (key ranges, replica sets, epochs) |

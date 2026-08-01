@@ -51,7 +51,8 @@ primitive:
    data-plane gains a quorum `DataMsg::Delete`/`DeleteAck` (epoch-fenced like
    `Write`), and `DataMsg::Sync` now carries `(key, Option<value>, version)` so a
    tombstone reconciles through both repair paths just as a value does. Both
-   `MemoryEngine` and `FjallEngine` implement the two new primitives.
+   storage engines (`MemoryEngine` and `LsmEngine`) implement the two new
+   primitives.
 
 2. **Read-repair** (lazy, on the read path): when a quorum read finds the
    responding replicas disagree — some returned an older version, or none — the

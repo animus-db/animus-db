@@ -107,7 +107,8 @@ pub enum DynamoError {
 
 type Result<T> = std::result::Result<T, DynamoError>;
 
-/// Order-preserving, prefix-free escape (shared scheme with the `fjall` backend).
+/// Order-preserving, prefix-free escape: a key's encoding never prefixes
+/// another's, so a partition's items stay contiguous and sort-ordered.
 pub(crate) fn escape(bytes: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(bytes.len() + 2);
     for &b in bytes {

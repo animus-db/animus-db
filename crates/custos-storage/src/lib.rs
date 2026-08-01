@@ -3,12 +3,12 @@
 //! The [`StorageEngine`] trait is driven by what the distributed layer needs
 //! (ADR 0004): point `put`/`get`, ordered range scan, atomic batch write,
 //! consistent snapshots, MVCC versions, and range delete. It is deliberately
-//! storage-engine-agnostic so a persistent backend (RocksDB, `fjall`) can slot
-//! in behind it later without touching the distributed code (ADR 0008).
-//!
-//! The only implementation today is the in-memory [`MemoryEngine`], a
-//! `BTreeMap`-backed MVCC store that is trivially deterministic — ideal for
-//! simulation testing.
+//! storage-engine-agnostic (ADR 0008). Two implementations live behind it: the
+//! in-memory [`MemoryEngine`], a `BTreeMap`-backed MVCC store that is trivially
+//! deterministic — ideal for simulation testing — and [`LsmEngine`], a custom
+//! on-disk log-structured merge tree that does all its I/O through the `Env`
+//! disk seam, so even a persistent engine stays deterministically
+//! crash-testable under simulation.
 //!
 //! ## MVCC model
 //!
@@ -23,14 +23,8 @@
 mod lsm;
 mod memory;
 
-#[cfg(feature = "fjall")]
-mod fjall_engine;
-
 pub use lsm::{LsmEngine, LsmOptions, LsmSnapshot};
 pub use memory::{MemoryEngine, MemorySnapshot};
-
-#[cfg(feature = "fjall")]
-pub use fjall_engine::{FjallEngine, FjallSnapshot};
 
 /// A storage key.
 pub type Key = Vec<u8>;

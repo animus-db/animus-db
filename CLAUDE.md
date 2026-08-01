@@ -10,7 +10,7 @@ with a small **strongly-consistent Raft control plane** that owns cluster
 metadata. Correctness is established by **deterministic simulation testing**.
 
 Status: pre-alpha. Implemented: the scaffold, the `Env` seam, storage (in-memory,
-persistent `fjall`, and a **custom on-disk `LsmEngine`** — a real WAL + SSTable +
+plus a **custom on-disk `LsmEngine`** — a real WAL + SSTable +
 compaction LSM doing all I/O through the `Env` disk seam, so it is deterministically
 crash-tested under `SimEnv`), the control-plane Raft (WAL durability + recovery +
 log-truncating snapshots with `InstallSnapshot`),
@@ -242,8 +242,8 @@ snapshotting, data-plane/`StorageEngine` integration, and sharding — see ADR
 
 `StorageEngine` trait (put/get, `get_at` historical read, range scan, atomic
 batch, range delete, MVCC `Snapshot`). Backed by `MemoryEngine` (a `BTreeMap`
-MVCC store; the engine used under simulation), the feature-gated `FjallEngine`
-(borrowed `fjall` LSM), and now a **custom on-disk `LsmEngine<E: Env>`** — a real
+MVCC store; the engine used under simulation) and a **custom on-disk
+`LsmEngine<E: Env>`** — a real
 log-structured merge tree (WAL → memtable → flushed, CRC-checksummed SSTables with
 a block index + footer → size-tiered compaction → atomically-swapped MANIFEST,
 recovered on open) that does **all** I/O through the `Env` `Disk` seam, so its

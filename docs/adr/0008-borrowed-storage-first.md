@@ -16,10 +16,13 @@ tablets, placement, consensus — not in local storage.
 We hide storage behind a `StorageEngine` trait (ADR 0004). The first backing
 implementation is a simple, fully deterministic **in-memory `BTreeMap`** engine,
 sufficient to exercise the distributed layer under simulation. A real persistent
-backend was then added behind the same trait, feature-gated, without touching the
-distributed code: the pure-Rust **`fjall` LSM** (`FjallEngine`, feature `fjall`),
-with MVCC layered on top via an order-preserving, prefix-free key encoding plus an
-inverted-version suffix.
+backend was then borrowed behind the same trait, feature-gated, without touching
+the distributed code: the pure-Rust **`fjall` LSM** (`FjallEngine`, feature
+`fjall`). It proved the trait was portable to a real on-disk engine, but it could
+not be driven by `SimEnv` (it does its own real I/O outside the `Env` seam), so
+once the custom `LsmEngine` below landed and was wired into `custosd`, the
+borrowed `FjallEngine` and the `fjall` dependency were **removed** — the project
+relies only on its own engines now.
 
 The custom engine, originally deferred "possibly indefinitely", is now **built**:
 `LsmEngine<E: Env>` is a real on-disk log-structured merge tree implemented

@@ -11,12 +11,6 @@ description = "CustosDB StorageEngine trait + in-memory implementation."
 [lints]
 workspace = true
 
-[features]
-# A persistent LSM backend (pure-Rust `fjall`) behind the StorageEngine trait.
-# Off by default so the core build and simulation stay dependency-light; the
-# distributed layer never depends on it (ADR 0008).
-fjall = ["dep:fjall"]
-
 [dependencies]
 async-trait.workspace = true
 thiserror.workspace = true
@@ -24,10 +18,8 @@ custos-env.workspace = true
 crc32fast.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true
-fjall = { version = "2", optional = true }
 
 [dev-dependencies]
 custos-sim.workspace = true
 futures.workspace = true
 proptest.workspace = true
-tempfile = "3"

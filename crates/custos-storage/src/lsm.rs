@@ -2,12 +2,13 @@
 //! [`StorageEngine`] trait, doing **all** its I/O through the `Env` [`Disk`] seam
 //! so it is deterministically crash-testable under simulation (ADR 0003, 0008).
 //!
-//! This is the "custom engine" half of ADR 0008: where [`FjallEngine`] *borrows*
-//! a third-party LSM, `LsmEngine` *is* the LSM, written against the same
-//! `StorageEngine` trait and the same MVCC contract as [`MemoryEngine`] (it is
-//! observationally identical to `MemoryEngine`).
+//! This is the "custom engine" of ADR 0008: rather than *borrow* a third-party
+//! LSM, `LsmEngine` *is* the LSM, written against the same `StorageEngine` trait
+//! and the same MVCC contract as [`MemoryEngine`] (it is observationally
+//! identical to `MemoryEngine`), but built over the `Env` seam so its
+//! crash-recovery is deterministically simulation-tested — which a borrowed
+//! engine doing its own real I/O cannot offer.
 //!
-//! [`FjallEngine`]: crate::FjallEngine
 //! [`MemoryEngine`]: crate::MemoryEngine
 //! [`Disk`]: custos_env::Disk
 //!

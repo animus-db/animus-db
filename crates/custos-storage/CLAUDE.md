@@ -17,7 +17,6 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
   doing all I/O through the `Env` `Disk` seam, so it is deterministically
   crash-testable under `SimEnv` (ADR 0008). `LsmOptions` tunes the flush
   threshold + compaction trigger.
-- `fjall_engine.rs` — `FjallEngine`: persistent LSM behind feature `fjall`.
 
 ## What's non-obvious
 
@@ -29,11 +28,10 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
   (SSTable block reads/flushes) behind the same trait. `snapshot()` and
   `latest_version()` (and `Snapshot::version()`) stay **synchronous** — pinning
   a version and reading the floor are cheap, in-memory on every backend.
-  `MemoryEngine`/`FjallEngine` await nothing real (the bodies are unchanged
-  logic inside `async fn`; Fjall's blocking calls run inline — it's the
-  prod-only, feature-gated backend). Storage-only tests with no `Env` drive the
-  futures with `futures::executor::block_on`; code already inside a `SimEnv`
-  task just `.await`s.
+  `MemoryEngine` awaits nothing real (its bodies are unchanged logic inside
+  `async fn`); `LsmEngine` is the one that actually reaches the disk. Storage-only
+  tests with no `Env` drive the futures with `futures::executor::block_on`; code
+  already inside a `SimEnv` task just `.await`s.
 - **Versions are MVCC commit timestamps supplied by the caller and must be
   strictly increasing** (enforced via `StorageError::NonMonotonicVersion`).
   Given that, a `Snapshot` taken at version `v` is isolated from later writes —
@@ -50,15 +48,7 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
   global contract for single-writer callers (control plane, dynamo adapter).
 - Per key, history is `version -> Some(value) | None`; `None` is a tombstone, so
   `delete`/`delete_range` preserve older versions for `get_at`.
-- `FjallEngine` layers MVCC over a plain ordered KV store: physical key =
-  `escape(user_key) || (u64::MAX - version)`. `escape` (0x00→0x00 0x01, 0x00
-  0x00 terminator) is **order-preserving and prefix-free** so a key's versions
-  are contiguous and no key prefixes another; the inverted suffix sorts newest
-  first. The monotonic floor is persisted to a `meta` partition (survives
-  reopen). The same escape scheme is mirrored in `custos-dynamo`.
-- The distributed layer must never depend on `fjall` — it's an additive,
-  feature-gated backend, off by default.
-- **`LsmEngine` is the simulation-testable on-disk engine** (no feature gate).
+- **`LsmEngine` is the simulation-testable on-disk engine.**
   `LsmEngine::open(env, prefix)` (or `open_with(.., LsmOptions)`) opens at a
   filename `prefix` over the node-scoped `Env` disk. Files: `MANIFEST` (durable
   source of truth, swapped **atomically** via `Disk::replace` — the single
@@ -87,9 +77,7 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
 
 ## Tests
 
-`cargo test -p custos-storage` (proptest semantics + units). The fjall backend:
-`cargo test -p custos-storage --features fjall`. CI lints `--all-features`, so
-keep the fjall path clippy-clean too.
+`cargo test -p custos-storage` (proptest semantics + units).
 
 `LsmEngine` tests run under `SimEnv` via `Simulator` (a dev-dep): `lsm_semantics.rs`
 mirrors the `MemoryEngine` units + a differential proptest, and `lsm_crash.rs`
