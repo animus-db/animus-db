@@ -6,11 +6,12 @@
 //! on them (granting a vote, acknowledging an append). On startup the driver
 //! replays the log into a [`PersistedState`] and recovers the core.
 //!
-//! The applied state machine is checkpointed (a full [`Metadata`] snapshot plus
-//! `last_applied`) so recovery restores it directly rather than re-applying the
-//! log — which would double-apply non-idempotent commands such as a
-//! compare-and-swap. **Not yet implemented:** log compaction/truncation of the
-//! WAL (it grows unbounded; recovery just uses the latest snapshot).
+//! The state machine is snapshotted as a full [`Metadata`] image at a committed
+//! `(last_index, last_term)`; the log keeps only entries *after* that index.
+//! Recovery restores the snapshot, then re-applies the log tail as the leader
+//! re-advances commit — so a committed command is applied exactly once relative
+//! to the snapshot base (no double-applied compare-and-swap), while the log
+//! prefix the snapshot covers is discarded.
 
 use custos_env::NodeId;
 use serde::{Deserialize, Serialize};
@@ -31,10 +32,13 @@ pub enum WalRecord {
     Append(LogEntry),
     /// The log was truncated to `keep` entries (conflict resolution).
     Truncate { keep: usize },
-    /// A state-machine checkpoint: the applied metadata at `last_applied`.
+    /// A state-machine snapshot: the metadata covering all entries through
+    /// `last_index` (whose term is `last_term`). The log keeps only entries
+    /// after `last_index`.
     Snapshot {
         metadata: Metadata,
-        last_applied: u64,
+        last_index: u64,
+        last_term: u64,
     },
 }
 
@@ -45,10 +49,10 @@ pub struct PersistedState {
     pub term: u64,
     /// Persisted vote for the current term.
     pub voted_for: Option<NodeId>,
-    /// The reconstructed log.
+    /// The reconstructed log (entries after the snapshot's `last_index`).
     pub log: Vec<LogEntry>,
-    /// The latest state-machine checkpoint: `(metadata, last_applied)`.
-    pub snapshot: Option<(Metadata, u64)>,
+    /// The latest snapshot: `(metadata, last_index, last_term)`.
+    pub snapshot: Option<(Metadata, u64, u64)>,
 }
 
 impl PersistedState {
@@ -71,9 +75,10 @@ impl PersistedState {
                 WalRecord::Truncate { keep } => state.log.truncate(keep),
                 WalRecord::Snapshot {
                     metadata,
-                    last_applied,
+                    last_index,
+                    last_term,
                 } => {
-                    state.snapshot = Some((metadata, last_applied));
+                    state.snapshot = Some((metadata, last_index, last_term));
                 }
             }
         }

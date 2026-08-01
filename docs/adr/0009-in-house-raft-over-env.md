@@ -38,20 +38,21 @@ truncation, commit only of current-term entries via majority `matchIndex`).
 - The control plane is deterministic and testable under simulation today, which
   is the whole point of the project.
 - We own and must maintain a Raft implementation. It is deliberately minimal.
-  Durability is now implemented (follow-up to M3): the core emits a write-ahead
-  log of hard-state/log/checkpoint records that the driver `fsync`s before
-  acting, and recovers from on startup (see `persist.rs`); the state machine is
-  checkpointed so recovery does not re-apply (and thus double-apply) committed
-  commands. The WAL is **compacted** to its live image (latest checkpoint + hard
-  state + current log) on a threshold, written via an atomic `Disk::replace`
-  (temp-file + rename in production), so it is bounded by the live state rather
-  than growing a fresh checkpoint per apply. The full WAL write/compact/recover
-  flow is diagrammed in [`docs/wal.md`](../wal.md). **Still deferred:** truncating the
-  *committed log prefix* in memory (true Raft log compaction) — which additionally
-  requires an `InstallSnapshot` RPC to catch up a follower that has fallen behind
-  the compacted point — and a full in-simulation process *restart-and-rejoin*
-  test (the simulator cannot yet stop and replace a node's tasks; recovery is
-  validated at the `RaftCore` level).
+  Durability is implemented (follow-up to M3): the core emits a write-ahead log
+  of hard-state/log/snapshot records that the driver `fsync`s before acting, and
+  recovers from on startup (see `persist.rs`). The log is offset by a
+  state-machine **snapshot**; on a threshold the node snapshots its applied state
+  and **truncates** the covered log prefix, and the WAL is rewritten to its live
+  image (snapshot + hard state + log tail) via an atomic `Disk::replace`
+  (temp-file + rename in production) — so both the log and the WAL are bounded by
+  the live tail. A follower that has fallen behind the leader's compacted prefix
+  is caught up by an `InstallSnapshot` RPC. Recovery restores the snapshot and
+  re-applies the tail, so each committed command lands exactly once relative to
+  the snapshot base (no double-applied CAS). The full WAL write/compact/recover
+  flow is diagrammed in [`docs/wal.md`](../wal.md). **Still deferred:** a full
+  in-simulation process *restart-and-rejoin* test (the simulator cannot yet stop
+  and replace a node's tasks; recovery is validated at the `RaftCore` level), and
+  chunked snapshot transfer (the snapshot ships in a single message).
 - If we later need the maturity of `openraft`, the `Env`-driven boundary (a sync
   core + an I/O driver) is a clean place to swap implementations, and a `madsim`
   backend behind `Env` (ADR 0003) would let a third-party Raft run

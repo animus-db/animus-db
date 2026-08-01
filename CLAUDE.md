@@ -10,8 +10,8 @@ with a small **strongly-consistent Raft control plane** that owns cluster
 metadata. Correctness is established by **deterministic simulation testing**.
 
 Status: pre-alpha. Implemented: the scaffold, the `Env` seam, storage (in-memory
-+ persistent `fjall`), the control-plane Raft (with WAL durability, recovery,
-and compaction),
++ persistent `fjall`), the control-plane Raft (WAL durability + recovery +
+log-truncating snapshots with `InstallSnapshot`),
 the quorum data-plane vertical slice, tablet split/merge + multi-tablet routing,
 the Elle-style recorder/checker (`custos-test`), a DynamoDB-style item API over
 the core (`custos-dynamo`), and a **runnable node + CLI** assembling the planes
@@ -19,8 +19,8 @@ over `ProdEnv` and serving clients over TCP — runnable as one process
 (`custosd --cluster N`) or one process per node (`custosd --config FILE --node I`,
 config via `gen-config`). Skeletons / future work: `custos-placement`
 (residency), `custos-consensus` (Accord transactions), `custos-cql` (wire
-protocol), plus Raft committed-log-prefix truncation + `InstallSnapshot`, and
-the DynamoDB/CQL wire protocols.
+protocol), plus the DynamoDB/CQL wire protocols and in-sim node
+restart-and-rejoin.
 
 ## Per-crate guides
 
@@ -138,10 +138,12 @@ deterministically by `SimEnv`. The split:
 Metadata mutations are `MetaCommand`s applied in log order; tablet placement is
 changed via epoch-keyed **compare-and-swap** (`CasTabletReplicas`), evaluated
 identically on every replica. The core emits WAL records the driver `fsync`s and
-recovers from, compacting the WAL to its live image on a threshold (`persist.rs`,
-`node.rs`). Not yet implemented: truncating the committed log prefix in memory +
-`InstallSnapshot`, and a full in-sim restart-and-rejoin (recovery is validated at
-the `RaftCore` level).
+recovers from. The log is offset by a state-machine snapshot: on a threshold the
+node snapshots and **truncates** the covered prefix, rewriting the WAL to its
+live image (`persist.rs`, `node.rs`); a follower behind the compacted prefix is
+caught up via `InstallSnapshot`; recovery restores the snapshot and re-applies
+the tail. Not yet implemented: a full in-sim restart-and-rejoin (recovery is
+validated at the `RaftCore` level) and chunked snapshot transfer.
 
 ### Data plane (`custos-data`)
 

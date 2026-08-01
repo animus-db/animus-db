@@ -17,7 +17,7 @@ WalRecord
 ├─ Hard      { term, voted_for }              ← persisted term + vote (one current value)
 ├─ Append    (LogEntry{ term, index, cmd })   ← one per log entry appended
 ├─ Truncate  { keep }                         ← log shrank to `keep` entries (conflict fix)
-└─ Snapshot  { metadata, last_applied }       ← state-machine checkpoint
+└─ Snapshot  { metadata, last_index, last_term }  ← state-machine snapshot @ last_index
 ```
 
 On disk: newline-delimited JSON, one record per line
@@ -30,8 +30,8 @@ On disk: newline-delimited JSON, one record per line
         ───────────────────────                  ──────────────────────────          ───────────────
  handle()/tick()/propose()
    │ log_append(e)   → pending += Append(e)
-   │ log_truncate(k) → pending += Truncate{k}
-   │ apply()         → pending += Snapshot{meta,last_applied}   (once per apply call)
+   │ log_truncate(k) → pending += Truncate{k}    (suffix conflict fix)
+   │ apply()         → updates the state machine (no record; snapshot covers it)
    ▼
  drain_persist() ──────────────────────────────▶ for r in records:
    • checkpoint_hard():                             env.append("raft.wal", r) ─────────▶ buffered
@@ -47,38 +47,37 @@ The ordering is the safety rule: a granted vote / acknowledged append is
 (to catch a client `propose`) and again after each `handle`/`tick` (before
 sending the responses that depend on it).
 
-## 3. Compaction — keep the file ≈ live state
+## 3. Snapshot & compaction — keep the file ≈ live tail
 
-The driver counts records appended since the last rewrite; past a threshold it
-replaces the whole file with a compact *image*.
+Once enough applied entries have piled up beyond the snapshot base, the driver
+takes a snapshot (truncating the covered log prefix) and replaces the whole file
+with a compact *image*.
 
 ```
- flush_wal() returns N  ──▶  since_compaction += N
-                                   │
-                        since_compaction ≥ WAL_COMPACT_THRESHOLD ?
+ applied_since_snapshot() ≥ SNAPSHOT_THRESHOLD ?
                                    │ yes
                                    ▼
-        core.wal_image()  =  [ Snapshot{meta,last_applied}? ,   ← latest only (omitted if nothing applied)
-                               Hard{term,voted_for} ,           ← current
-                               Append(e) for e in log ]         ← whole current log
+        core.snapshot()   ── advance snapshot base to last_applied,
+                             drop log entries with index ≤ that base
+                                   │
+        core.wal_image()  =  [ Snapshot{meta, last_index, last_term}? ,  ← snapshot base (if any)
+                               Hard{term,voted_for} ,                    ← current
+                               Append(e) for e in log ]                  ← the *tail* after the base
                                    │  encode all → bytes
                                    ▼
         env.replace("raft.wal", bytes)  ──▶  ATOMIC swap of file contents
                                              (ProdEnv: tmp file + fsync + rename;
                                               SimEnv: durable = bytes under lock)
-        since_compaction = 0
 ```
 
-Same recovery result, bounded size:
+Same recovery result, bounded size — the prefix is gone, not just deduplicated:
 
 ```
-BEFORE (grows per apply)                     AFTER replace()
+BEFORE (every entry appended)                AFTER snapshot @ idx 81 + replace()
 ─────────────────────────                    ─────────────────────────
-Hard{t=1,v=0}                                Snapshot{meta@81, la=81}   ← 1 checkpoint
-Append(idx1 noop)                            Hard{t=1,v=0}
-Append(idx2) Snapshot{la=2}                  Append(idx1 .. idx81)      ← current log
-Append(idx3) Snapshot{la=3}
-… 80 more Append + 80 more Snapshot …        (per-apply Snapshot churn gone)
+Hard{t=1,v=0}                                Snapshot{meta@81, last_index=81}
+Append(idx1) … Append(idx81)                 Hard{t=1,v=0}
+Append(idx82) Append(idx83) …                Append(idx82 ..)            ← only the tail
 ```
 
 `replace` is atomic, so a crash mid-rewrite leaves the **whole old** or **whole
@@ -101,26 +100,38 @@ crash mid-write) is also tolerated: `decode` drops an unparsable last line.
    PersistedState { term, voted_for, log, snapshot }
         │ RaftCore::recovered(id, peers, state, now, entropy)
         ▼
-   term/vote/log restored verbatim;  metadata + last_applied + commit_index
-   restored from the checkpoint  →  committed commands are NOT re-applied
-   (so a CAS isn't double-applied);  role = Follower, election timer armed.
+   term/vote/log-tail restored verbatim;  metadata + last_applied + commit_index
+   set to the snapshot base (`last_index`);  role = Follower, election timer armed.
+   The leader re-advances commit over the tail, re-applying it.
 ```
 
-### Why a checkpoint instead of replaying the log into the state machine?
+### Why re-apply the tail instead of restoring it?
 
-Re-applying committed entries on recovery would double-apply non-idempotent
-commands — e.g. `CasTabletReplicas` bumps an epoch each time. The `Snapshot`
-record carries the already-applied `metadata` + `last_applied`, so recovery
-jumps straight there and only the *uncommitted* tail of the log is left for the
-leader to drive.
+Recovery restores the state machine to the **snapshot base** and re-applies the
+log tail as commit re-advances. Because the base does *not* include those tail
+entries, each committed command applies exactly once relative to it — so a
+`CasTabletReplicas` lands once (epoch bumps once), never twice. (The earlier
+per-apply-checkpoint scheme avoided re-apply entirely; this snapshot-base scheme
+gets the same once-only guarantee while letting the log prefix be discarded.)
+
+## Truncation & catch-up
+
+The in-memory log is offset by the snapshot: it holds only entries with
+`index > snapshot_index`. On a threshold (applied entries beyond the snapshot),
+the node **snapshots** its applied state and drops the covered prefix
+(`RaftCore::snapshot`), then rewrites the WAL to the now-smaller image — bounding
+both the log and the WAL to the live tail.
+
+A leader that has compacted past a follower's `next_index` can no longer build a
+valid `AppendEntries` (the `prev` entry is gone), so it ships its snapshot whole
+via an **`InstallSnapshot`** RPC; the follower replaces its state machine, sets
+its snapshot base, and resumes from there.
 
 ## What this does *not* do (yet)
 
-The in-memory log still keeps **all** entries — the WAL is bounded to the *live
-state*, not to a constant. Truncating the committed log prefix (true Raft log
-compaction) additionally needs an `InstallSnapshot` RPC to catch up a follower
-that has fallen behind the compaction point; that is noted as remaining work in
-[ADR 0009](adr/0009-in-house-raft-over-env.md). Full in-simulation
-restart-and-rejoin is likewise pending (recovery is currently validated at the
-`RaftCore` level — see `crates/custos-control/tests/wal_compaction.rs` and
-`tests/persistence.rs`).
+The snapshot ships in a single message (no chunked transfer), and a full
+in-simulation process *restart-and-rejoin* is still pending — the simulator
+can't yet stop and replace a node's tasks, so recovery is validated at the
+`RaftCore` level (see `crates/custos-control/tests/wal_compaction.rs`,
+`tests/persistence.rs`, and `tests/install_snapshot.rs`). Tracked in
+[ADR 0009](adr/0009-in-house-raft-over-env.md).

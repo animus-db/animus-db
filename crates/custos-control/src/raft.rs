@@ -9,14 +9,17 @@
 //! Implemented Raft rules: terms and single-vote-per-term, log up-to-dateness
 //! for granting votes, randomized election timeouts, `AppendEntries` consistency
 //! check with conflict truncation, and commit advancement restricted to
-//! current-term entries via majority `matchIndex`. Durability is handled
-//! out-of-band: the core emits [`WalRecord`]s (see [`drain_persist`]) that the
-//! driver persists, compacting the WAL to [`wal_image`] on a threshold;
-//! recovery is via [`recovered`]. Not yet implemented: truncating the committed
-//! log prefix in memory (true log compaction) + `InstallSnapshot` (ADR 0009).
+//! current-term entries via majority `matchIndex`. The log is offset by a
+//! state-machine snapshot: [`snapshot`] truncates the covered prefix, and a
+//! follower that has fallen behind the leader's compacted prefix is caught up
+//! with `InstallSnapshot`. Durability is handled out-of-band: the core emits
+//! [`WalRecord`]s (see [`drain_persist`]) that the driver persists, rewriting the
+//! WAL to [`wal_image`] on a snapshot; [`recovered`] restores the snapshot and
+//! re-applies the tail.
 //!
 //! [`drain_persist`]: RaftCore::drain_persist
 //! [`wal_image`]: RaftCore::wal_image
+//! [`snapshot`]: RaftCore::snapshot
 //! [`recovered`]: RaftCore::recovered
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -67,6 +70,18 @@ pub enum RaftMsg {
         /// Highest log index now known to match on the follower.
         match_index: u64,
     },
+    /// Leader ships its state-machine snapshot to a follower whose log has
+    /// fallen behind the leader's compacted prefix (sent whole, not chunked).
+    InstallSnapshot {
+        term: u64,
+        leader: NodeId,
+        last_index: u64,
+        last_term: u64,
+        metadata: Metadata,
+    },
+    /// Response to [`RaftMsg::InstallSnapshot`]; `last_index` echoes the
+    /// installed index so the leader can advance `next_index`/`match_index`.
+    InstallSnapshotResp { term: u64, last_index: u64 },
 }
 
 impl RaftMsg {
@@ -75,7 +90,9 @@ impl RaftMsg {
             RaftMsg::RequestVote { term, .. }
             | RaftMsg::RequestVoteResp { term, .. }
             | RaftMsg::AppendEntries { term, .. }
-            | RaftMsg::AppendEntriesResp { term, .. } => *term,
+            | RaftMsg::AppendEntriesResp { term, .. }
+            | RaftMsg::InstallSnapshot { term, .. }
+            | RaftMsg::InstallSnapshotResp { term, .. } => *term,
         }
     }
 }
@@ -109,7 +126,12 @@ pub struct RaftCore {
     role: Role,
     current_term: u64,
     voted_for: Option<NodeId>,
+    // The log holds entries with index > `snapshot_index`; `log[i].index ==
+    // snapshot_index + 1 + i`. Entries up to `snapshot_index` are covered by the
+    // state-machine snapshot (`metadata` reflects them) and discarded.
     log: Vec<LogEntry>,
+    snapshot_index: u64,
+    snapshot_term: u64,
     commit_index: u64,
     last_applied: u64,
     leader_id: Option<NodeId>,
@@ -135,6 +157,9 @@ pub struct RaftCore {
     // marked for persistence (to detect term/vote changes).
     pending: Vec<WalRecord>,
     persisted_hard: (u64, Option<NodeId>),
+    // Set when the snapshot base moved (a local snapshot or an installed one),
+    // signalling the driver to rewrite the WAL rather than append.
+    snapshot_dirty: bool,
 }
 
 impl RaftCore {
@@ -150,6 +175,8 @@ impl RaftCore {
             current_term: 0,
             voted_for: None,
             log: Vec::new(),
+            snapshot_index: 0,
+            snapshot_term: 0,
             commit_index: 0,
             last_applied: 0,
             leader_id: None,
@@ -164,6 +191,7 @@ impl RaftCore {
             applied: Vec::new(),
             pending: Vec::new(),
             persisted_hard: (0, None),
+            snapshot_dirty: false,
         };
         core.reset_election_timer(now, entropy);
         core
@@ -171,10 +199,11 @@ impl RaftCore {
 
     /// Recover a node from its durable state, then resume as a follower.
     ///
-    /// The log, term, and vote are restored verbatim; the state machine is
-    /// restored from the latest checkpoint (so committed, non-idempotent
-    /// commands are not re-applied). `commit_index` starts at the checkpoint and
-    /// is re-advanced by the leader.
+    /// Term, vote, and the log tail are restored verbatim; the state machine is
+    /// restored from the snapshot (its base), and `commit`/`last_applied` start
+    /// at the snapshot index. The leader re-advances commit over the recovered
+    /// tail, re-applying it — so each committed command is applied exactly once
+    /// relative to the snapshot base (no double-applied CAS).
     pub fn recovered(
         id: NodeId,
         all_nodes: &[NodeId],
@@ -186,10 +215,12 @@ impl RaftCore {
         core.current_term = persisted.term;
         core.voted_for = persisted.voted_for;
         core.log = persisted.log;
-        if let Some((metadata, last_applied)) = persisted.snapshot {
+        if let Some((metadata, last_index, last_term)) = persisted.snapshot {
             core.metadata = metadata;
-            core.last_applied = last_applied;
-            core.commit_index = last_applied;
+            core.snapshot_index = last_index;
+            core.snapshot_term = last_term;
+            core.last_applied = last_index;
+            core.commit_index = last_index;
         }
         // Already durable: do not re-emit it.
         core.persisted_hard = (core.current_term, core.voted_for);
@@ -207,20 +238,21 @@ impl RaftCore {
     }
 
     /// A minimal write-ahead-log image that replays to exactly the current
-    /// durable state: the latest state-machine checkpoint, the current hard
-    /// state, and the current log. The driver writes this in place of the
-    /// accumulated history during compaction, so the WAL is bounded by the live
-    /// state instead of growing with every apply (which appends a fresh
-    /// checkpoint each time).
+    /// durable state: the snapshot (if any), the current hard state, and the log
+    /// tail. The driver writes this in place of the accumulated history during
+    /// compaction, so the WAL is bounded by the *live* state — and once the log
+    /// prefix has been truncated by [`snapshot`](Self::snapshot), the image (and
+    /// thus the WAL) shrinks accordingly.
     ///
     /// Call only after [`drain_persist`](Self::drain_persist) has been flushed,
     /// so the image and the on-disk WAL agree.
     pub fn wal_image(&self) -> Vec<WalRecord> {
         let mut image = Vec::with_capacity(self.log.len() + 2);
-        if self.last_applied > 0 {
+        if self.snapshot_index > 0 {
             image.push(WalRecord::Snapshot {
                 metadata: self.metadata.clone(),
-                last_applied: self.last_applied,
+                last_index: self.snapshot_index,
+                last_term: self.snapshot_term,
             });
         }
         image.push(WalRecord::Hard {
@@ -229,6 +261,45 @@ impl RaftCore {
         });
         image.extend(self.log.iter().cloned().map(WalRecord::Append));
         image
+    }
+
+    /// Snapshot the applied state and **truncate** the log prefix it covers:
+    /// advance the snapshot base to `last_applied` and drop entries through it.
+    /// No-op if nothing new has been applied. Sets the snapshot-dirty flag so the
+    /// driver rewrites the WAL (the truncation is materialized as a full rewrite,
+    /// never incremental records).
+    pub fn snapshot(&mut self) {
+        if self.last_applied <= self.snapshot_index {
+            return;
+        }
+        let new_index = self.last_applied;
+        let new_term = self.term_at(new_index);
+        self.log.retain(|e| e.index > new_index);
+        self.snapshot_index = new_index;
+        self.snapshot_term = new_term;
+        self.snapshot_dirty = true;
+    }
+
+    /// Take and clear the snapshot-dirty flag (the driver uses this to decide
+    /// whether the WAL needs a full rewrite this iteration).
+    pub fn take_snapshot_dirty(&mut self) -> bool {
+        std::mem::replace(&mut self.snapshot_dirty, false)
+    }
+
+    /// The current snapshot base index (0 if no snapshot has been taken).
+    pub fn snapshot_index(&self) -> u64 {
+        self.snapshot_index
+    }
+
+    /// Applied entries not yet covered by the snapshot — the log prefix a
+    /// snapshot would truncate. The driver snapshots once this grows large.
+    pub fn applied_since_snapshot(&self) -> u64 {
+        self.last_applied.saturating_sub(self.snapshot_index)
+    }
+
+    /// Number of log entries currently retained (the tail after the snapshot).
+    pub fn log_len(&self) -> usize {
+        self.log.len()
     }
 
     // ---- accessors -------------------------------------------------------
@@ -285,18 +356,28 @@ impl RaftCore {
     // ---- log helpers -----------------------------------------------------
 
     fn last_log_index(&self) -> u64 {
-        self.log.last().map_or(0, |e| e.index)
+        self.log.last().map_or(self.snapshot_index, |e| e.index)
     }
 
     fn last_log_term(&self) -> u64 {
-        self.log.last().map_or(0, |e| e.term)
+        self.log.last().map_or(self.snapshot_term, |e| e.term)
     }
 
+    /// Term of the entry at `index`. `snapshot_index` resolves to `snapshot_term`;
+    /// an index below the snapshot (compacted away) or above the log returns 0
+    /// (callers guard those cases).
     fn term_at(&self, index: u64) -> u64 {
         if index == 0 {
             return 0;
         }
-        self.log.get((index - 1) as usize).map_or(0, |e| e.term)
+        if index == self.snapshot_index {
+            return self.snapshot_term;
+        }
+        if index < self.snapshot_index {
+            return 0;
+        }
+        let offset = (index - self.snapshot_index - 1) as usize;
+        self.log.get(offset).map_or(0, |e| e.term)
     }
 
     fn majority(&self) -> usize {
@@ -405,6 +486,18 @@ impl RaftCore {
                 success,
                 match_index,
             } => self.handle_append_resp(from, term, success, match_index),
+            RaftMsg::InstallSnapshot {
+                term,
+                leader,
+                last_index,
+                last_term,
+                metadata,
+            } => self.handle_install_snapshot(
+                term, leader, last_index, last_term, metadata, now, entropy,
+            ),
+            RaftMsg::InstallSnapshotResp { term, last_index } => {
+                self.handle_install_snapshot_resp(from, term, last_index)
+            }
         }
     }
 
@@ -504,7 +597,21 @@ impl RaftCore {
         self.leader_id = Some(leader);
         self.reset_election_timer(now, entropy);
 
-        // Consistency check at prev_log_index.
+        // The leader's prev is behind our snapshot: those entries are already in
+        // our snapshot, so report we match up to the snapshot and let the leader
+        // resend from there. (Common right after we compacted past the leader.)
+        if prev_log_index < self.snapshot_index {
+            return vec![(
+                leader,
+                RaftMsg::AppendEntriesResp {
+                    term: self.current_term,
+                    success: true,
+                    match_index: self.snapshot_index,
+                },
+            )];
+        }
+
+        // Consistency check at prev_log_index (>= snapshot_index now).
         if prev_log_index > 0
             && (self.last_log_index() < prev_log_index
                 || self.term_at(prev_log_index) != prev_log_term)
@@ -525,7 +632,8 @@ impl RaftCore {
             idx += 1;
             if self.last_log_index() >= idx {
                 if self.term_at(idx) != entry.term {
-                    self.log_truncate((idx - 1) as usize);
+                    let keep = (idx - self.snapshot_index - 1) as usize;
+                    self.log_truncate(keep);
                     self.log_append(entry);
                 }
                 // else: already present and matching; skip.
@@ -567,7 +675,7 @@ impl RaftCore {
             self.maybe_advance_commit();
             self.apply();
             if self.next_index.get(&from).copied().unwrap_or(1) <= self.last_log_index() {
-                return vec![self.append_to(from)];
+                return vec![self.replicate_to(from)];
             }
             Vec::new()
         } else {
@@ -575,8 +683,83 @@ impl RaftCore {
             if *ni > 1 {
                 *ni -= 1;
             }
-            vec![self.append_to(from)]
+            vec![self.replicate_to(from)]
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn handle_install_snapshot(
+        &mut self,
+        term: u64,
+        leader: NodeId,
+        last_index: u64,
+        last_term: u64,
+        metadata: Metadata,
+        now: Nanos,
+        entropy: u64,
+    ) -> Vec<Out> {
+        if term < self.current_term {
+            return vec![(
+                leader,
+                RaftMsg::InstallSnapshotResp {
+                    term: self.current_term,
+                    last_index: 0,
+                },
+            )];
+        }
+        self.role = Role::Follower;
+        self.leader_id = Some(leader);
+        self.reset_election_timer(now, entropy);
+
+        // Already at least this far along: just acknowledge our position.
+        if last_index <= self.snapshot_index {
+            return vec![(
+                leader,
+                RaftMsg::InstallSnapshotResp {
+                    term: self.current_term,
+                    last_index: self.snapshot_index,
+                },
+            )];
+        }
+
+        // Install: replace the state machine with the snapshot and discard the
+        // log (the leader re-replicates any entries past `last_index`). The
+        // driver rewrites the WAL (snapshot-dirty) before this ack is sent.
+        self.metadata = metadata;
+        self.snapshot_index = last_index;
+        self.snapshot_term = last_term;
+        self.last_applied = last_index;
+        self.commit_index = last_index;
+        self.log.clear();
+        self.applied.clear();
+        self.snapshot_dirty = true;
+        vec![(
+            leader,
+            RaftMsg::InstallSnapshotResp {
+                term: self.current_term,
+                last_index,
+            },
+        )]
+    }
+
+    fn handle_install_snapshot_resp(
+        &mut self,
+        from: NodeId,
+        term: u64,
+        last_index: u64,
+    ) -> Vec<Out> {
+        if self.role != Role::Leader || term != self.current_term {
+            return Vec::new();
+        }
+        let m = self.match_index.entry(from).or_insert(0);
+        *m = (*m).max(last_index);
+        self.next_index.insert(from, last_index + 1);
+        self.maybe_advance_commit();
+        self.apply();
+        if self.next_index.get(&from).copied().unwrap_or(1) <= self.last_log_index() {
+            return vec![self.replicate_to(from)];
+        }
+        Vec::new()
     }
 
     // ---- role transitions & replication ---------------------------------
@@ -629,11 +812,27 @@ impl RaftCore {
     }
 
     fn broadcast_append(&self) -> Vec<Out> {
-        self.peers.iter().map(|&p| self.append_to(p)).collect()
+        self.peers.iter().map(|&p| self.replicate_to(p)).collect()
     }
 
-    fn append_to(&self, peer: NodeId) -> Out {
+    /// Build the right replication message for `peer`: an `InstallSnapshot` if
+    /// the entries it needs have been compacted away, otherwise `AppendEntries`.
+    fn replicate_to(&self, peer: NodeId) -> Out {
         let next = self.next_index.get(&peer).copied().unwrap_or(1).max(1);
+        // The entry before `next` is in our snapshot (or earlier) — we can't form
+        // a valid `prev_log_term`, so ship the snapshot instead.
+        if next <= self.snapshot_index {
+            return (
+                peer,
+                RaftMsg::InstallSnapshot {
+                    term: self.current_term,
+                    leader: self.id,
+                    last_index: self.snapshot_index,
+                    last_term: self.snapshot_term,
+                    metadata: self.metadata.clone(),
+                },
+            );
+        }
         let prev_log_index = next - 1;
         let prev_log_term = self.term_at(prev_log_index);
         let entries: Vec<LogEntry> = self
@@ -677,21 +876,15 @@ impl RaftCore {
     }
 
     fn apply(&mut self) {
-        let start = self.last_applied;
         while self.last_applied < self.commit_index {
             self.last_applied += 1;
-            let command = self.log[(self.last_applied - 1) as usize].command.clone();
+            let offset = (self.last_applied - self.snapshot_index - 1) as usize;
+            let command = self.log[offset].command.clone();
             self.metadata.apply(&command);
             self.applied.push(command);
         }
-        if self.last_applied > start {
-            // Checkpoint the applied state so recovery need not re-apply
-            // (which would double-apply non-idempotent commands like CAS).
-            self.pending.push(WalRecord::Snapshot {
-                metadata: self.metadata.clone(),
-                last_applied: self.last_applied,
-            });
-        }
+        // No per-apply checkpoint: durability comes from the snapshot taken by
+        // `snapshot()` plus the persisted log tail; recovery re-applies the tail.
     }
 
     fn heartbeat_nanos(&self) -> u64 {

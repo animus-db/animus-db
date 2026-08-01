@@ -1,6 +1,6 @@
 //! Raft durability: the write-ahead log round-trips, and a core recovered from
-//! its WAL restores the log, term/vote, and the applied state machine *without
-//! re-applying* committed commands (which would double-apply a compare-and-swap).
+//! its WAL restores term/vote/log and then re-applies its tail from the snapshot
+//! base *exactly once* (so a compare-and-swap is not double-applied).
 
 use custos_control::MetaCommand;
 use custos_control::persist::{PersistedState, WalRecord};
@@ -38,7 +38,7 @@ fn run_single_node() -> (RaftCore, Vec<WalRecord>) {
 }
 
 #[test]
-fn recovered_core_matches_and_does_not_double_apply() {
+fn recovery_reapplies_the_tail_exactly_once() {
     let (original, wal) = run_single_node();
     assert!(original.is_leader());
     assert_eq!(
@@ -48,25 +48,22 @@ fn recovered_core_matches_and_does_not_double_apply() {
     );
 
     let state = PersistedState::replay(wal);
-    let recovered = RaftCore::recovered(0, &[0], state, Nanos(0), 7);
-
+    let mut recovered = RaftCore::recovered(0, &[0], state, Nanos(0), 7);
     assert_eq!(recovered.term(), original.term(), "term not recovered");
-    assert_eq!(
-        recovered.last_applied(),
-        original.last_applied(),
-        "applied index not recovered"
-    );
-    assert_eq!(
-        recovered.metadata(),
-        original.metadata(),
-        "state machine not recovered exactly"
-    );
-    // The decisive check: the CAS was applied exactly once across the restart.
+
+    // Drive the recovered node: it re-elects (sole voter) and re-advances commit
+    // over its recovered log, re-applying the tail. A current-term entry (the
+    // proposed no-op) is what lets prior-term entries commit.
+    recovered.tick(Nanos(2_000_000_000), 7);
+    recovered.propose(MetaCommand::NoOp);
+
+    // The CAS landed exactly once — epoch 2, not 3 — and the state matches.
     assert_eq!(
         recovered.metadata().tablets[&TabletId(1)].epoch,
         Epoch(2),
-        "recovery re-applied the log and double-applied the CAS"
+        "tail re-applied more than once (double-applied CAS)"
     );
+    assert_eq!(recovered.metadata(), original.metadata());
 }
 
 #[test]

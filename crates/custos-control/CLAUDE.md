@@ -29,25 +29,29 @@ epoch compare-and-swap transactions.
 - The driver races `env.recv()` against a timer via `futures::select`. It draws
   `entropy` every iteration (deterministic) and passes it in for randomized
   election timeouts.
-- Durability: the core emits `WalRecord`s at log-append/truncate/apply sites;
+- Durability: the core emits `WalRecord`s at log-append/truncate sites;
   `drain_persist` also folds in any hard-state (term/vote) change, so a granted
-  vote is persisted before it's sent. The state machine is checkpointed so
-  recovery does **not** re-apply committed commands (which would double-apply a
-  CAS). The driver compacts the WAL to `RaftCore::wal_image()` (latest
-  checkpoint + hard state + current log) on a threshold, via atomic
-  `Disk::replace`, so it stays bounded by the live state.
+  vote is persisted before it's sent. The log is offset by a snapshot:
+  `snapshot()` truncates the committed prefix it covers, and on a threshold the
+  driver snapshots + rewrites the WAL to `wal_image()` (snapshot + hard + log
+  tail) via atomic `Disk::replace` — bounding both. Recovery restores the
+  snapshot and **re-applies the tail** (commit re-advances), so a CAS lands once.
+  A follower behind the leader's compacted prefix is caught up via
+  `InstallSnapshot`. See `docs/wal.md`.
 - `CasTabletReplicas` applies only if the tablet's epoch matches, then bumps it
   — evaluated identically on every replica, so accept/reject is consistent.
 - Commit advances only for **current-term** entries via majority `matchIndex`
   (the Raft safety rule). Don't relax this.
-- Not implemented: truncating the committed log prefix in memory (true log
-  compaction) + `InstallSnapshot` to catch up far-behind followers; full in-sim
-  restart-and-rejoin (recovery is validated at the `RaftCore` level — see
-  `tests/persistence.rs` and `tests/wal_compaction.rs`).
+- Not implemented: a full in-sim restart-and-rejoin (recovery is validated at
+  the `RaftCore` level — see `tests/persistence.rs`, `tests/wal_compaction.rs`,
+  `tests/install_snapshot.rs`), and chunked snapshot transfer (snapshots ship
+  whole).
 
 ## Tests
 
 `cargo test -p custos-control` — election/replication/leader-kill +
 multi-seed convergence (`control_raft.rs`), durability/recovery
-(`persistence.rs`), split/merge (`tablet_split_merge.rs`). Use `run_for`, never
-`run()` (perpetual heartbeats).
+(`persistence.rs`), split/merge (`tablet_split_merge.rs`), snapshot truncation
+(`wal_compaction.rs`), and a partitioned follower catching up via
+`InstallSnapshot` (`install_snapshot.rs`). Use `run_for`, never `run()`
+(perpetual heartbeats).
