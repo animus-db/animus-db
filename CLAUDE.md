@@ -27,8 +27,13 @@ DynamoDB-style item API over the core plus a **DynamoDB JSON wire protocol**
 translation, with a per-table schema registry, sort-key conditions =/BETWEEN/
 begins_with, and a `ConditionExpression` subset for conditional writes), a
 **runnable node + CLI** assembling the planes over `ProdEnv` and
-serving clients over TCP — runnable as one process (`custosd --cluster N`) or one
-process per node (`custosd --config FILE --node I`, config via `gen-config`),
+serving clients over TCP, with a now **durable data plane** — each node's data
+replica is backed by the on-disk `LsmEngine` over `ProdEnv` by default, so a
+value acked to a client survives a process restart (the control plane already
+persisted its Raft WAL; the data plane is no longer in-memory-only) — runnable
+as one process (`custosd --cluster N`) or one process per node (`custosd --config
+FILE --node I`, config via `gen-config`; `--ephemeral` selects the volatile
+in-memory engine for dev runs),
 which now also **serves the DynamoDB JSON protocol over HTTP**, routing those
 requests through the same data-plane coordinator — plus a **minimal CQL v4 wire
 protocol** (`custos-cql`: STARTUP/READY handshake + simple INSERT/SELECT-by-key,

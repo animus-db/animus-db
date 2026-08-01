@@ -36,9 +36,9 @@ mod cql;
 mod dynamo;
 
 use custos_control::{MetaCommand, Metadata, NodeStatus, RaftNode};
-use custos_data::{DataClient, ReadResult, ReplicaHandle, TabletView, serve_replica};
+use custos_data::{DataClient, ReadResult, TabletView, serve_replica};
 use custos_env::{NodeId, ProdEnv};
-use custos_storage::MemoryEngine;
+use custos_storage::{LsmEngine, MemoryEngine};
 use custos_tablet::{Epoch, KeyRange, TabletId};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -48,6 +48,30 @@ use tokio::net::{TcpListener, TcpStream};
 /// The single bootstrap tablet covering the whole keyspace.
 const TABLET: TabletId = TabletId(1);
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Filename prefix namespacing the data replica's on-disk LSM under the node's
+/// data `ProdEnv` directory (its files become `db-MANIFEST`/`db-wal`/`db-sst-*`).
+///
+/// The prefix is a flat filename prefix, **not** a subdirectory (no `/`):
+/// `ProdEnv`'s disk opens files directly under the role's data dir and does not
+/// create intermediate directories, so a slash-bearing prefix would fail to
+/// create the engine's files. The data role's dir is dedicated to this replica,
+/// so a flat prefix already isolates it.
+const LSM_PREFIX: &str = "db-";
+
+/// Which storage engine backs a node's data replica.
+///
+/// The default, [`StorageBackend::Lsm`], is the durable on-disk
+/// [`LsmEngine`] over the node's data `ProdEnv` — data survives a process
+/// restart. [`StorageBackend::Memory`] is the volatile [`MemoryEngine`], for
+/// ephemeral/dev runs that intentionally start empty each time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StorageBackend {
+    /// Durable on-disk LSM (default).
+    #[default]
+    Lsm,
+    /// Volatile in-memory engine (ephemeral runs).
+    Memory,
+}
 
 /// A request from a client to a node (length-prefixed JSON over TCP).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -143,23 +167,72 @@ impl BoundNode {
         self.cql_addr
     }
 
-    /// Wire the peer address book into every env and start all protocols.
-    /// `control_ids`/`data_ids` are the full control group and the tablet's
-    /// replica set; `r`/`w` are the quorum sizes.
-    pub fn start(
+    /// Wire the peer address book into every env and start all protocols, with
+    /// the data replica backed by the durable on-disk [`LsmEngine`]
+    /// ([`StorageBackend::Lsm`]). `control_ids`/`data_ids` are the full control
+    /// group and the tablet's replica set; `r`/`w` are the quorum sizes.
+    ///
+    /// # Errors
+    /// Propagates a failure to open the data replica's on-disk engine.
+    pub async fn start(
         self,
         peers: BTreeMap<NodeId, SocketAddr>,
         control_ids: Vec<NodeId>,
         data_ids: Vec<NodeId>,
         r: usize,
         w: usize,
-    ) -> Node {
+    ) -> std::io::Result<Node> {
+        self.start_with(
+            peers,
+            control_ids,
+            data_ids,
+            r,
+            w,
+            StorageBackend::default(),
+        )
+        .await
+    }
+
+    /// Like [`start`](Self::start), but selects the data replica's storage
+    /// engine. [`StorageBackend::Lsm`] is durable (survives restart);
+    /// [`StorageBackend::Memory`] is volatile (ephemeral runs).
+    ///
+    /// # Errors
+    /// Propagates a failure to open the data replica's on-disk engine (LSM
+    /// backend only).
+    pub async fn start_with(
+        self,
+        peers: BTreeMap<NodeId, SocketAddr>,
+        control_ids: Vec<NodeId>,
+        data_ids: Vec<NodeId>,
+        r: usize,
+        w: usize,
+        backend: StorageBackend,
+    ) -> std::io::Result<Node> {
         self.control_env.set_peers(peers.clone());
         self.data_env.set_peers(peers.clone());
         self.coord_env.set_peers(peers);
 
         let raft = RaftNode::start(self.control_env, control_ids.clone());
-        let replica = serve_replica(self.data_env, MemoryEngine::new(), Epoch::INITIAL);
+        // The data replica's durable store. The on-disk LSM does its disk I/O
+        // through a *clone* of the data env's handle (the env is node-scoped, so
+        // its files live under this node's data dir, namespaced by `LSM_PREFIX`);
+        // the replica's serve loop keeps the original handle for network `recv`.
+        // The LSM only touches the disk, so the single-consumer inbox is
+        // unaffected.
+        let replica: Box<dyn std::any::Any + Send + Sync> = match backend {
+            StorageBackend::Lsm => {
+                let lsm = LsmEngine::open(self.data_env.clone(), LSM_PREFIX)
+                    .await
+                    .map_err(|e| std::io::Error::other(format!("opening data replica LSM: {e}")))?;
+                Box::new(serve_replica(self.data_env, lsm, Epoch::INITIAL))
+            }
+            StorageBackend::Memory => Box::new(serve_replica(
+                self.data_env,
+                MemoryEngine::new(),
+                Epoch::INITIAL,
+            )),
+        };
         let coordinator = DataClient::new(self.coord_env);
 
         // Bootstrap: whichever node is leader registers membership + the tablet
@@ -186,20 +259,23 @@ impl BoundNode {
             tokio::spawn(cql::serve(self.cql_listener, ctx));
         }
 
-        Node {
+        Ok(Node {
             raft,
             _replica: replica,
             client_addr: self.client_addr,
             dynamo_addr: self.dynamo_addr,
             cql_addr: self.cql_addr,
-        }
+        })
     }
 }
 
 /// A running node. Holds the handles that keep its envs and tasks alive.
 pub struct Node {
     raft: RaftNode<ProdEnv>,
-    _replica: ReplicaHandle<MemoryEngine>,
+    /// The data replica handle, type-erased because the backing engine
+    /// (`LsmEngine` or `MemoryEngine`) is chosen at runtime. Kept alive so the
+    /// replica's serve loop keeps running for the life of the node.
+    _replica: Box<dyn std::any::Any + Send + Sync>,
     client_addr: SocketAddr,
     dynamo_addr: SocketAddr,
     cql_addr: SocketAddr,
@@ -424,43 +500,93 @@ pub async fn bind_cluster(
     Ok(nodes)
 }
 
-/// Start a cluster previously bound with [`bind_cluster`] (quorum `r`/`w`).
-pub fn start_cluster(bound: Vec<BoundNode>, r: usize, w: usize) -> Vec<Node> {
+/// Start a cluster previously bound with [`bind_cluster`] (quorum `r`/`w`),
+/// each node's data replica backed by the durable on-disk [`LsmEngine`].
+///
+/// # Errors
+/// Propagates a failure to open any node's data replica engine.
+pub async fn start_cluster(
+    bound: Vec<BoundNode>,
+    r: usize,
+    w: usize,
+) -> std::io::Result<Vec<Node>> {
+    start_cluster_with(bound, r, w, StorageBackend::default()).await
+}
+
+/// Like [`start_cluster`], but selects the data replicas' storage `backend`.
+///
+/// # Errors
+/// Propagates a failure to open any node's data replica engine (LSM backend
+/// only).
+pub async fn start_cluster_with(
+    bound: Vec<BoundNode>,
+    r: usize,
+    w: usize,
+    backend: StorageBackend,
+) -> std::io::Result<Vec<Node>> {
     let n = bound.len();
     let control_ids: Vec<NodeId> = (0..n).map(config::control_id).collect();
     let data_ids: Vec<NodeId> = (0..n).map(config::data_id).collect();
     let peers: BTreeMap<NodeId, SocketAddr> =
         bound.iter().flat_map(BoundNode::peer_entries).collect();
-    bound
-        .into_iter()
-        .map(|b| b.start(peers.clone(), control_ids.clone(), data_ids.clone(), r, w))
-        .collect()
+    let mut nodes = Vec::with_capacity(n);
+    for b in bound {
+        let node = b
+            .start_with(
+                peers.clone(),
+                control_ids.clone(),
+                data_ids.clone(),
+                r,
+                w,
+                backend,
+            )
+            .await?;
+        nodes.push(node);
+    }
+    Ok(nodes)
 }
 
 /// Start the single node at `index` in `config` (per-process deployment): bind
 /// this node's configured listeners, wire the cluster's peer address book from
-/// the config, and start its protocols.
+/// the config, and start its protocols with the durable on-disk [`LsmEngine`]
+/// data replica.
 ///
 /// # Errors
-/// Returns `InvalidInput` if `index` is out of range, or propagates a bind
-/// failure.
+/// Returns `InvalidInput` if `index` is out of range, or propagates a bind /
+/// engine-open failure.
 pub async fn run_node(
     config: &ClusterConfig,
     index: usize,
     dir: impl Into<PathBuf>,
+) -> std::io::Result<Node> {
+    run_node_with(config, index, dir, StorageBackend::default()).await
+}
+
+/// Like [`run_node`], but selects the data replica's storage `backend`.
+///
+/// # Errors
+/// As [`run_node`].
+pub async fn run_node_with(
+    config: &ClusterConfig,
+    index: usize,
+    dir: impl Into<PathBuf>,
+    backend: StorageBackend,
 ) -> std::io::Result<Node> {
     let addrs = *config.nodes.get(index).ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "node index out of range")
     })?;
     let (control_id, data_id, coord_id) = config.role_ids(index);
     let bound = Node::bind(control_id, data_id, coord_id, addrs, dir).await?;
-    Ok(bound.start(
-        config.peer_book(),
-        config.control_ids(),
-        config.data_ids(),
-        config.r,
-        config.w,
-    ))
+    bound
+        .start_with(
+            config.peer_book(),
+            config.control_ids(),
+            config.data_ids(),
+            config.r,
+            config.w,
+            backend,
+        )
+        .await
 }
 
 /// Write a length-prefixed (`u32` big-endian) JSON frame.

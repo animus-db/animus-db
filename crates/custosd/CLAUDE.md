@@ -39,6 +39,23 @@ CLI wrapper. `custos-cli` depends on this crate for the client protocol types.
   on the `Network`: coordination is server-side, so the coordinator is a static
   cluster member and replica replies route without knowing dynamic client
   addresses.
+- **The data replica is durable by default**: `serve_replica` is backed by the
+  on-disk `LsmEngine` opened over a *clone* of the node's **data** `ProdEnv`
+  (`StorageBackend::Lsm`), so a value acked to a client survives a process
+  restart (the LSM recovers from its WAL/SSTables/manifest on reopen) — like the
+  control plane, which already persists its Raft WAL. The LSM does its disk I/O
+  through the cloned data-env handle while the replica keeps the original handle
+  for network `recv`; since the LSM only touches the disk, the single-consumer
+  inbox is unaffected. The engine's files use a **flat filename prefix**
+  (`LSM_PREFIX = "db-"`), *not* a subdirectory — `ProdEnv`'s disk opens files
+  directly under the role's data dir and does not create intermediate
+  directories, so a slash-bearing prefix (e.g. `"db/"`) would fail to create the
+  files. `--ephemeral` (or `StorageBackend::Memory`) selects the volatile
+  `MemoryEngine` instead, for dev runs that intentionally start empty.
+  `start`/`start_cluster`/`run_node` default to the durable backend;
+  `start_with`/`start_cluster_with`/`run_node_with` take an explicit
+  `StorageBackend`. These are now **async + fallible** (opening the LSM is async
+  and can fail), so the node-start entry points return `io::Result`.
 - Each node also serves a **fifth listener, the DynamoDB JSON/HTTP endpoint**
   (`RoleAddrs.dynamo`, `Node::dynamo_addr`). It is a *production-only I/O edge*
   (real tokio sockets + hand-rolled HTTP/1.1, like `ProdEnv`); below the edge it
@@ -67,9 +84,15 @@ CLI wrapper. `custos-cli` depends on this crate for the client protocol types.
 `cargo test -p custosd` — `tests/cluster.rs` (in-process cluster),
 `tests/per_process.rs` (nodes started independently from a shared config),
 `tests/dynamo_wire.rs` (PutItem → GetItem → DeleteItem over the real DynamoDB
-JSON/HTTP wire), and `tests/cql_wire.rs` (STARTUP handshake → INSERT → SELECT
-over the real CQL binary wire). All use real TCP/time, so they poll with
-timeouts, not deterministic assertions.
+JSON/HTTP wire), `tests/cql_wire.rs` (STARTUP handshake → INSERT → SELECT
+over the real CQL binary wire), and `tests/durable_restart.rs` (a key written
+through the client API survives a node stop + restart on the **same dir +
+addresses** with the LSM backend, and is lost with the `--ephemeral` memory
+backend). All use real TCP/time, so they poll with timeouts, not deterministic
+assertions. The restart test runs each node "incarnation" in its own tokio
+runtime and shuts it down between incarnations to abort the node's detached
+tasks and free its listener ports (dropping a `Node` does not stop them) — this
+stands in for an OS process restart.
 
 Per-process run:
 ```sh

@@ -66,6 +66,16 @@ ignored. This is tested under fault injection in `custos-storage/tests/lsm_crash
   the borrowed `fjall`, its crash-recovery story is exercised deterministically
   under `SimEnv`, closing the gap where durability could previously only be
   asserted at the in-memory simulation layer.
+- **The runnable node (`custosd`) now backs its data-plane replicas with
+  `LsmEngine` over `ProdEnv` by default**, so the data plane is durable
+  end-to-end — a value acked to a client survives a process restart (the engine
+  recovers from its on-disk WAL/SSTables/manifest on reopen), matching the
+  control plane, which already persists its Raft WAL. The volatile `MemoryEngine`
+  remains the simulator's engine and is selectable for ephemeral runs via
+  `custosd --ephemeral`. The data role's `ProdEnv` dir is dedicated to the engine,
+  so its files use a flat filename prefix (`db-…`), not a subdirectory (`ProdEnv`
+  opens files without creating intermediate directories). End-to-end durability
+  across a real restart is asserted in `custosd/tests/durable_restart.rs`.
 - Deferred within `LsmEngine` (correctness-first, performance later): bloom
   filters (only a key-range gate today), leveled compaction (size-tiered only),
   WAL segment rotation / fsync batching, block compression, and a more compact

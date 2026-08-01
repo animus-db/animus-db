@@ -4,9 +4,13 @@
 //!
 //! ```text
 //! custosd gen-config --nodes N [--host H] [--base-port P]   # print a cluster config (JSON)
-//! custosd --config FILE --node I [--dir DIR]                # run node I of a cluster (one process)
-//! custosd --cluster N [--dir DIR] [--ip ADDR]               # run an N-node cluster in one process
+//! custosd --config FILE --node I [--dir DIR] [--ephemeral] # run node I of a cluster (one process)
+//! custosd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral]# run an N-node cluster in one process
 //! ```
+//!
+//! The data replica is durable by default (an on-disk LSM under the node's data
+//! dir, so values survive a restart); `--ephemeral` selects a volatile
+//! in-memory engine instead.
 //!
 //! Per-process deployment: generate a config once, copy it to each host, and run
 //! `custosd --config cluster.json --node I` with a distinct `I` per process.
@@ -40,8 +44,8 @@ async fn main() -> ExitCode {
 
 const USAGE: &str = "usage:\n  \
     custosd gen-config --nodes N [--host H] [--base-port P]\n  \
-    custosd --config FILE --node I [--dir DIR]\n  \
-    custosd --cluster N [--dir DIR] [--ip ADDR]";
+    custosd --config FILE --node I [--dir DIR] [--ephemeral]\n  \
+    custosd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral]";
 
 /// `gen-config`: print a generated cluster config as JSON.
 fn gen_config(args: &[String]) -> Result<(), String> {
@@ -75,6 +79,9 @@ async fn run(args: &[String]) -> Result<(), String> {
     let mut cluster: Option<usize> = None;
     let mut dir: Option<std::path::PathBuf> = None;
     let mut ip: IpAddr = "127.0.0.1".parse().unwrap();
+    // Data replica engine: durable on-disk LSM by default; `--ephemeral` selects
+    // the volatile in-memory engine (data does not survive restart).
+    let mut backend = custosd::StorageBackend::default();
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -84,6 +91,7 @@ async fn run(args: &[String]) -> Result<(), String> {
             "--cluster" => cluster = Some(parse_next(&mut it, "--cluster")?),
             "--dir" => dir = Some(parse_next::<String>(&mut it, "--dir")?.into()),
             "--ip" => ip = parse_next(&mut it, "--ip")?,
+            "--ephemeral" => backend = custosd::StorageBackend::Memory,
             other => return Err(format!("unknown argument `{other}`")),
         }
     }
@@ -92,9 +100,9 @@ async fn run(args: &[String]) -> Result<(), String> {
         (Some(_), Some(_)) => Err("use either --config or --cluster, not both".into()),
         (Some(path), None) => {
             let index = node.ok_or("--config requires --node I")?;
-            run_single(&path, index, dir).await
+            run_single(&path, index, dir, backend).await
         }
-        (None, Some(n)) => run_in_process_cluster(n, ip, dir).await,
+        (None, Some(n)) => run_in_process_cluster(n, ip, dir, backend).await,
         (None, None) => Err("nothing to do".into()),
     }
 }
@@ -104,12 +112,13 @@ async fn run_single(
     path: &str,
     index: usize,
     dir: Option<std::path::PathBuf>,
+    backend: custosd::StorageBackend,
 ) -> Result<(), String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("reading {path}: {e}"))?;
     let config = ClusterConfig::from_json(&text).map_err(|e| format!("parsing {path}: {e}"))?;
     let dir = dir.unwrap_or_else(|| std::env::temp_dir().join(format!("custosd-node-{index}")));
 
-    let node = custosd::run_node(&config, index, &dir)
+    let node = custosd::run_node_with(&config, index, &dir, backend)
         .await
         .map_err(|e| format!("failed to start node {index}: {e}"))?;
     println!(
@@ -131,6 +140,7 @@ async fn run_in_process_cluster(
     n: usize,
     ip: IpAddr,
     dir: Option<std::path::PathBuf>,
+    backend: custosd::StorageBackend,
 ) -> Result<(), String> {
     if n == 0 {
         return Err("--cluster must be at least 1".into());
@@ -140,7 +150,9 @@ async fn run_in_process_cluster(
     let bound = custosd::bind_cluster(n, ip, &dir)
         .await
         .map_err(|e| format!("failed to bind cluster: {e}"))?;
-    let nodes = custosd::start_cluster(bound, majority, majority);
+    let nodes = custosd::start_cluster_with(bound, majority, majority, backend)
+        .await
+        .map_err(|e| format!("failed to start cluster: {e}"))?;
 
     println!("custosd: started {n}-node cluster (R={majority}, W={majority})");
     for (i, node) in nodes.iter().enumerate() {
