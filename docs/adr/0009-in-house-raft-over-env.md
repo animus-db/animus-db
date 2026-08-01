@@ -49,10 +49,11 @@ truncation, commit only of current-term entries via majority `matchIndex`).
   is caught up by an `InstallSnapshot` RPC. Recovery restores the snapshot and
   re-applies the tail, so each committed command lands exactly once relative to
   the snapshot base (no double-applied CAS). The full WAL write/compact/recover
-  flow is diagrammed in [`docs/wal.md`](../wal.md). **Still deferred:** a full
-  in-simulation process *restart-and-rejoin* test (the simulator cannot yet stop
-  and replace a node's tasks; recovery is validated at the `RaftCore` level), and
-  chunked snapshot transfer (the snapshot ships in a single message).
+  flow is diagrammed in [`docs/wal.md`](../wal.md). Restart-and-rejoin is now
+  tested end-to-end in the simulator (`Simulator::stop` drops a node's tasks +
+  volatile state; a fresh node started on the same disk recovers and rejoins —
+  see `tests/restart.rs`). **Still deferred:** chunked snapshot transfer (the
+  snapshot ships in a single message).
 - If we later need the maturity of `openraft`, the `Env`-driven boundary (a sync
   core + an I/O driver) is a clean place to swap implementations, and a `madsim`
   backend behind `Env` (ADR 0003) would let a third-party Raft run

@@ -13,9 +13,10 @@
 //!
 //! Fault injection — [`partition`](Simulator::partition),
 //! [`heal`](Simulator::heal), [`crash`](Simulator::crash),
-//! [`restart`](Simulator::restart), and the [`NetConfig`] delay/drop model — is
-//! all reproducible from the seed. A recorded [`trace`](Simulator::trace) is
-//! byte-identical across repeated runs of the same scenario and seed.
+//! [`restart`](Simulator::restart), [`stop`](Simulator::stop) (process exit),
+//! and the [`NetConfig`] delay/drop model — is all reproducible from the seed. A
+//! recorded [`trace`](Simulator::trace) is byte-identical across repeated runs
+//! of the same scenario and seed.
 //!
 //! See `docs/adr/0003-deterministic-simulation.md`.
 
@@ -145,6 +146,8 @@ struct SimState {
     next_task_id: TaskId,
     // `None` while a task's future is checked out for polling.
     tasks: BTreeMap<TaskId, Option<BoxFuture<'static, ()>>>,
+    // Which node spawned each task, so `stop(node)` can drop a node's tasks.
+    task_owner: BTreeMap<TaskId, NodeId>,
 
     next_seq: Seq,
     timeline: BTreeMap<(u64, Seq), Event>,
@@ -216,6 +219,7 @@ impl Simulator {
             net: NetConfig::default(),
             next_task_id: 0,
             tasks: BTreeMap::new(),
+            task_owner: BTreeMap::new(),
             next_seq: 0,
             timeline: BTreeMap::new(),
             next_timer_id: 0,
@@ -306,6 +310,44 @@ impl Simulator {
     /// Bring a crashed `node` back. Its durable disk state remains.
     pub fn restart(&self, node: NodeId) {
         self.shared.lock().crashed.remove(&node);
+    }
+
+    /// Stop `node` as if its process exited: drop all of its tasks (their
+    /// in-memory state — e.g. a node's `RaftCore` and driver loop — is gone) and
+    /// its volatile state (inbox, un-synced disk bytes). **Durable** (synced)
+    /// disk survives. A fresh node started afterward on the same node id reads
+    /// that disk and recovers — modelling a real process restart.
+    ///
+    /// Unlike [`crash`](Self::crash), this does not mute or set the node
+    /// `crashed`; the node simply has no tasks until one is started again.
+    pub fn stop(&self, node: NodeId) {
+        let mut st = self.shared.lock();
+        let task_ids: Vec<TaskId> = st
+            .task_owner
+            .iter()
+            .filter(|&(_, &owner)| owner == node)
+            .map(|(&task, _)| task)
+            .collect();
+        for task in task_ids {
+            st.tasks.remove(&task);
+            st.task_owner.remove(&task);
+        }
+        // Volatile state dies with the process; durable disk is kept.
+        if let Some(inbox) = st.inboxes.get_mut(&node) {
+            inbox.clear();
+        }
+        st.recv_wakers.remove(&node);
+        let keys: Vec<_> = st
+            .disks
+            .keys()
+            .filter(|(n, _)| *n == node)
+            .cloned()
+            .collect();
+        for k in keys {
+            if let Some(f) = st.disks.get_mut(&k) {
+                f.buffered.clear();
+            }
+        }
     }
 
     /// The recorded history of this run.
@@ -620,6 +662,7 @@ impl Spawner for SimEnv {
         let task = st.next_task_id;
         st.next_task_id += 1;
         st.tasks.insert(task, Some(fut));
+        st.task_owner.insert(task, self.node_id);
         st.trace.push(TraceEvent::Spawn { task });
         drop(st);
         self.shared.push_ready(task);

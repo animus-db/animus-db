@@ -13,8 +13,8 @@ function of one seed. This is the substrate every distributed test runs on.
 - `Simulator::new(seed)`, `sim.env(node_id) -> SimEnv`.
 - Driving: `run()` (to quiescence), `run_for(dur)` / `run_until(deadline)`
   (bounded virtual time), `run_until_quiescent(max_steps)`.
-- Faults: `partition`/`partition_pair`/`heal`, `crash`/`restart`,
-  `set_net_config(NetConfig)` (delay/jitter/drop).
+- Faults: `partition`/`partition_pair`/`heal`, `crash`/`restart`, `stop`
+  (process exit), `set_net_config(NetConfig)` (delay/jitter/drop).
 - Observability: `trace()` / `trace_lines()`, `now()`, `seed()`.
 
 ## What's non-obvious
@@ -31,6 +31,12 @@ function of one seed. This is the substrate every distributed test runs on.
 - `crash(node)` drops un-synced disk + the inbox **and mutes the node's
   outbound sends** (a dead node emits nothing); deliveries to a crashed node are
   dropped until `restart`.
+- `stop(node)` models a **process exit**: it removes the node's tasks (each
+  spawned task is tagged with its owner node id) and volatile state (inbox,
+  un-synced disk), keeping durable disk. Start a fresh node on the same id
+  afterward and it recovers from disk — the real restart-and-rejoin path (see
+  `custos-control/tests/restart.rs`). `crash` keeps the tasks running but mute;
+  `stop` ends them.
 - Determinism invariants to preserve when editing: only `BTreeMap`/`BTreeSet`,
   RNG drawn only in deterministic order, no wall clock. Disk ops add no timeline
   events and draw no RNG, so they don't perturb traces.

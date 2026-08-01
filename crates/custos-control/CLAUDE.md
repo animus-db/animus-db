@@ -42,16 +42,13 @@ epoch compare-and-swap transactions.
   — evaluated identically on every replica, so accept/reject is consistent.
 - Commit advances only for **current-term** entries via majority `matchIndex`
   (the Raft safety rule). Don't relax this.
-- Not implemented: a full in-sim restart-and-rejoin (recovery is validated at
-  the `RaftCore` level — see `tests/persistence.rs`, `tests/wal_compaction.rs`,
-  `tests/install_snapshot.rs`), and chunked snapshot transfer (snapshots ship
-  whole).
+- Not implemented: chunked snapshot transfer (snapshots ship whole).
 
 ## Tests
 
 `cargo test -p custos-control` — election/replication/leader-kill +
 multi-seed convergence (`control_raft.rs`), durability/recovery
 (`persistence.rs`), split/merge (`tablet_split_merge.rs`), snapshot truncation
-(`wal_compaction.rs`), and a partitioned follower catching up via
-`InstallSnapshot` (`install_snapshot.rs`). Use `run_for`, never `run()`
-(perpetual heartbeats).
+(`wal_compaction.rs`), a partitioned follower catching up via `InstallSnapshot`
+(`install_snapshot.rs`), and process restart-and-rejoin (`restart.rs`, using
+`Simulator::stop`). Use `run_for`, never `run()` (perpetual heartbeats).

@@ -19,8 +19,7 @@ over `ProdEnv` and serving clients over TCP — runnable as one process
 (`custosd --cluster N`) or one process per node (`custosd --config FILE --node I`,
 config via `gen-config`). Skeletons / future work: `custos-placement`
 (residency), `custos-consensus` (Accord transactions), `custos-cql` (wire
-protocol), plus the DynamoDB/CQL wire protocols and in-sim node
-restart-and-rejoin.
+protocol), plus the DynamoDB/CQL wire protocols.
 
 ## Per-crate guides
 
@@ -142,8 +141,9 @@ recovers from. The log is offset by a state-machine snapshot: on a threshold the
 node snapshots and **truncates** the covered prefix, rewriting the WAL to its
 live image (`persist.rs`, `node.rs`); a follower behind the compacted prefix is
 caught up via `InstallSnapshot`; recovery restores the snapshot and re-applies
-the tail. Not yet implemented: a full in-sim restart-and-rejoin (recovery is
-validated at the `RaftCore` level) and chunked snapshot transfer.
+the tail. Restart-and-rejoin is tested end-to-end via `Simulator::stop`
+(`custos-control/tests/restart.rs`). Not yet implemented: chunked snapshot
+transfer.
 
 ### Data plane (`custos-data`)
 
