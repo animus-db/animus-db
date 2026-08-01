@@ -9,10 +9,35 @@ lineage). It pairs a **leaderless AP data plane** (tunable quorum consistency)
 with a small **strongly-consistent Raft control plane** that owns cluster
 metadata. Correctness is established by **deterministic simulation testing**.
 
-Status: pre-alpha. Milestones M0–M4 are implemented (scaffold, `Env` seam,
-storage, control-plane Raft, quorum data-plane vertical slice). M5 (Elle-style
-checker) and the `placement`/`consensus`/`cql`/`dynamo` crates and the
-`custosd`/`custos-cli` binaries are documented skeletons.
+Status: pre-alpha. Implemented: the scaffold, the `Env` seam, storage (in-memory
++ persistent `fjall`), the control-plane Raft (with WAL durability + recovery),
+the quorum data-plane vertical slice, tablet split/merge + multi-tablet routing,
+the Elle-style recorder/checker (`custos-test`), and a DynamoDB-style item API
+over the core (`custos-dynamo`). Skeletons / future work: `custos-placement`
+(residency), `custos-consensus` (Accord transactions), `custos-cql` (wire
+protocol), the `custosd`/`custos-cli` binaries, plus Raft WAL compaction and the
+DynamoDB/CQL wire protocols.
+
+## Per-crate guides
+
+Each crate has its own `CLAUDE.md` with local entry points and gotchas — read
+the relevant one before working in a crate:
+
+| Crate | Guide |
+|-------|-------|
+| `custos-env` | [crates/custos-env/CLAUDE.md](crates/custos-env/CLAUDE.md) |
+| `custos-sim` | [crates/custos-sim/CLAUDE.md](crates/custos-sim/CLAUDE.md) |
+| `custos-storage` | [crates/custos-storage/CLAUDE.md](crates/custos-storage/CLAUDE.md) |
+| `custos-tablet` | [crates/custos-tablet/CLAUDE.md](crates/custos-tablet/CLAUDE.md) |
+| `custos-control` | [crates/custos-control/CLAUDE.md](crates/custos-control/CLAUDE.md) |
+| `custos-data` | [crates/custos-data/CLAUDE.md](crates/custos-data/CLAUDE.md) |
+| `custos-test` | [crates/custos-test/CLAUDE.md](crates/custos-test/CLAUDE.md) |
+| `custos-dynamo` | [crates/custos-dynamo/CLAUDE.md](crates/custos-dynamo/CLAUDE.md) |
+| `custos-placement` | [crates/custos-placement/CLAUDE.md](crates/custos-placement/CLAUDE.md) |
+| `custos-consensus` | [crates/custos-consensus/CLAUDE.md](crates/custos-consensus/CLAUDE.md) |
+| `custos-cql` | [crates/custos-cql/CLAUDE.md](crates/custos-cql/CLAUDE.md) |
+| `custosd` | [crates/custosd/CLAUDE.md](crates/custosd/CLAUDE.md) |
+| `custos-cli` | [crates/custos-cli/CLAUDE.md](crates/custos-cli/CLAUDE.md) |
 
 ## Commands
 
