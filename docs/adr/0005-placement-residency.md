@@ -65,8 +65,24 @@ on control). `custos-control/tests/placement_auto_reconcile.rs` proves a marked
 preserving residency + spread and moving only the dead replica, reproducible
 from a seed.
 
-**Still deferred** (the weakest-path work above): residency enforcement across
-read-repair, anti-entropy, hinted handoff, and backup. The reconciler keeps a
-tablet's *surviving* eligible replicas (minimal churn), so it repairs drift but
-does not re-optimize an already-placed compliant-enough set; a cluster-default
-policy and operator-facing policy management (CLI/wire) are also future work.
+**Residency now extends to the repair paths.** The data plane's read-repair and
+background anti-entropy (ADR 0010) are bound to a tablet's residency-eligible
+placement on **both** sides, closing the leak where repair could push data to a
+reachable but ineligible node. The sender side already only targets the tablet's
+replica set (read-repair broadcasts to `TabletView::replicas`; anti-entropy to a
+caller-supplied peer list — both the placement, hence residency-eligible). The
+receive side is the new guard: `serve_replica_with_residency` takes the allowed
+peer set and **drops any `Sync`/`SyncDigest`/`SyncPull` from a node outside it**,
+so even a misconfigured or hostile peer cannot inject or solicit cross-boundary
+data. The allowed set is derived from the same `PlacementPolicy::admits` the
+control plane uses for placement. Quorum `Write`/`Delete`/`Read` need no new
+guard: an ineligible node is never a replica in a `TabletView`, so it is never
+sent one. Proven under simulation in `custos-data/tests/residency_repair.rs`: a
+reachable non-EU node actively soliciting anti-entropy from EU replicas never
+receives the EU data, and a direct `Sync` from it is rejected.
+
+**Still deferred** (the remaining weakest-path work above): residency enforcement
+across hinted handoff and backup. The reconciler keeps a tablet's *surviving*
+eligible replicas (minimal churn), so it repairs drift but does not re-optimize
+an already-placed compliant-enough set; a cluster-default policy and
+operator-facing policy management (CLI/wire) are also future work.
