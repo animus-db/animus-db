@@ -120,6 +120,30 @@ fn write_batch_is_atomic_at_one_version() {
 }
 
 #[test]
+fn merge_is_per_key_lww_and_entries_lists_live_latest() {
+    let (_dir, e) = engine();
+    e.put(b"other", b"x", 100).unwrap(); // raise the global floor
+
+    assert!(
+        e.merge(b"k", b"v1", 5).unwrap(),
+        "fresh key below floor applies"
+    );
+    assert!(e.merge(b"k", b"v2", 7).unwrap(), "newer wins");
+    assert!(!e.merge(b"k", b"v2-dup", 7).unwrap(), "equal is a no-op");
+    assert!(!e.merge(b"k", b"v0", 3).unwrap(), "older is a no-op");
+    assert_eq!(e.get(b"k").unwrap().unwrap().value, b"v2");
+
+    e.delete(b"other", 101).unwrap(); // tombstoned -> excluded from entries
+    let entries: Vec<_> = e
+        .entries()
+        .unwrap()
+        .into_iter()
+        .map(|(k, vv)| (k, vv.value))
+        .collect();
+    assert_eq!(entries, vec![(b"k".to_vec(), b"v2".to_vec())]);
+}
+
+#[test]
 fn data_and_version_floor_survive_reopen() {
     let dir = tempfile::tempdir().unwrap();
     {

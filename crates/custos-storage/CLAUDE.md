@@ -21,6 +21,13 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
   strictly increasing** (enforced via `StorageError::NonMonotonicVersion`).
   Given that, a `Snapshot` taken at version `v` is isolated from later writes —
   snapshots are version-pinned read views, not copies.
+- `merge(key, value, version)` is the **leaderless-replication** primitive (ADR
+  0010): per-key LWW that applies iff `version` is newer for *that key*,
+  bypassing the engine-wide monotonic floor `put` enforces (so a repair can
+  re-apply a value at its original, below-floor version). Idempotent and
+  commutative ⇒ convergence regardless of delivery order. `entries()` returns
+  the full live digest anti-entropy reconciles against. `put` keeps its global
+  contract for single-writer callers (control plane, dynamo adapter).
 - Per key, history is `version -> Some(value) | None`; `None` is a tombstone, so
   `delete`/`delete_range` preserve older versions for `get_at`.
 - `FjallEngine` layers MVCC over a plain ordered KV store: physical key =

@@ -12,7 +12,8 @@ metadata. Correctness is established by **deterministic simulation testing**.
 Status: pre-alpha. Implemented: the scaffold, the `Env` seam, storage (in-memory
 + persistent `fjall`), the control-plane Raft (WAL durability + recovery +
 log-truncating snapshots with `InstallSnapshot`),
-the quorum data-plane vertical slice, tablet split/merge + multi-tablet routing,
+the quorum data-plane vertical slice (with read-repair + background
+anti-entropy convergence), tablet split/merge + multi-tablet routing,
 the Elle-style recorder/checker (`custos-test`), a DynamoDB-style item API over
 the core (`custos-dynamo`), and a **runnable node + CLI** assembling the planes
 over `ProdEnv` and serving clients over TCP — runnable as one process
@@ -152,6 +153,14 @@ transfer.
 epoch is rejected. `DataClient` is the quorum coordinator: it broadcasts to a
 `TabletView`'s replicas and returns as soon as a W (write) or R (read) quorum
 responds. Choose `R + W > N` so reads see acknowledged writes.
+
+`R + W > N` only makes quorum *reads* intersect; raw replica state still
+diverges when a replica misses a write. **Repair/anti-entropy** (ADR 0010)
+closes that: replica writes apply via `StorageEngine::merge` (per-key LWW), a
+divergent quorum read pushes the winner back (read-repair), and
+`serve_anti_entropy` periodically full-pushes a replica's digest to peers so
+even unread keys converge. The `repair.rs` test partitions a replica during a
+write and asserts convergence both via a read and with no reads at all.
 
 ### Storage (`custos-storage`)
 

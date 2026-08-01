@@ -3,8 +3,9 @@
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use custos_env::{Env, EnvExt};
+use custos_env::{Env, EnvExt, NodeId};
 use custos_storage::StorageEngine;
 use custos_tablet::{Epoch, TabletId};
 
@@ -95,6 +96,58 @@ where
     handle
 }
 
+/// Start a background **anti-entropy** loop on `env` for `tablet`: every
+/// `interval` of (virtual) time, push this replica's full data digest to each
+/// peer in `peers` (itself excluded) as a [`DataMsg::Sync`]. Peers reconcile by
+/// per-key last-writer-wins, so a replica that missed writes — because it was
+/// partitioned or briefly down — converges in the background **without needing
+/// a read to repair it**. This is what guarantees eventual convergence of raw
+/// replica state, beyond the read-time intersection that `R + W > N` gives.
+///
+/// Full-push (the whole digest each round) is the simplest scheme that provably
+/// converges; sending only divergent ranges via a Merkle-tree digest is a later
+/// optimization. The loop is send-only, so it shares a node's `env` with
+/// [`serve_replica`] without contending on the single-consumer inbox.
+pub fn serve_anti_entropy<E, S>(
+    env: E,
+    storage: S,
+    tablet: TabletId,
+    epoch: Epoch,
+    peers: Vec<NodeId>,
+    interval: Duration,
+) where
+    E: Env,
+    S: StorageEngine + 'static,
+{
+    let me = env.node_id();
+    env.clone().spawn_task(async move {
+        loop {
+            env.sleep(interval).await;
+            let entries: Vec<(Vec<u8>, Vec<u8>, u64)> = match storage.entries() {
+                Ok(es) => es
+                    .into_iter()
+                    .map(|(k, vv)| (k, vv.value, vv.version))
+                    .collect(),
+                Err(_) => continue,
+            };
+            if entries.is_empty() {
+                continue;
+            }
+            let msg = DataMsg::Sync {
+                tablet,
+                epoch,
+                entries,
+            };
+            let bytes = serde_json::to_vec(&msg).expect("data message serializes");
+            for &peer in &peers {
+                if peer != me {
+                    env.send(peer, bytes.clone()).await;
+                }
+            }
+        }
+    });
+}
+
 /// Handle one inbound message, returning the reply to send (if any).
 fn handle_msg<S: StorageEngine>(
     storage: &S,
@@ -113,10 +166,10 @@ fn handle_msg<S: StorageEngine>(
             if fenced(epochs, tablet, epoch) {
                 return Some(DataMsg::WriteAck { req, ok: false });
             }
-            // A monotonic-version conflict means a newer write already won
-            // (last-write-wins); treat it as an accepted no-op rather than an
-            // error, so concurrent coordinators converge.
-            let _ = storage.put(&key, &value, version);
+            // Per-key last-writer-wins: `merge` applies iff this version is
+            // newer for the key, so a write superseded by a higher-versioned
+            // one is an accepted no-op and concurrent coordinators converge.
+            let _ = storage.merge(&key, &value, version);
             Some(DataMsg::WriteAck { req, ok: true })
         }
         DataMsg::Read {
@@ -142,6 +195,20 @@ fn handle_msg<S: StorageEngine>(
                 ok: true,
                 value,
             })
+        }
+        DataMsg::Sync {
+            tablet,
+            epoch,
+            entries,
+        } => {
+            // Reconcile a batch by per-key LWW (anti-entropy / read-repair).
+            // Fenced as a whole on a stale epoch; otherwise fire-and-forget.
+            if !fenced(epochs, tablet, epoch) {
+                for (key, value, version) in entries {
+                    let _ = storage.merge(&key, &value, version);
+                }
+            }
+            None
         }
         // Replicas never receive responses.
         DataMsg::WriteAck { .. } | DataMsg::ReadResp { .. } => None,

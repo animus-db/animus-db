@@ -16,3 +16,4 @@ relevant ADR (or supersede it) in the same PR as the code change.
 | [0007](0007-agpl-cla.md) | AGPL-3.0 + CLA | Accepted |
 | [0008](0008-borrowed-storage-first.md) | Borrowed storage engine first, custom LSM deferred | Accepted |
 | [0009](0009-in-house-raft-over-env.md) | In-house Raft over the `Env` seam (deviation from openraft) | Accepted |
+| [0010](0010-ap-repair-anti-entropy.md) | AP repair: read-repair + background anti-entropy | Accepted |

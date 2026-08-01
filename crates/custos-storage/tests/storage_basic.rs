@@ -81,6 +81,50 @@ fn non_monotonic_version_is_rejected() {
 }
 
 #[test]
+fn merge_is_per_key_lww_ignoring_the_global_floor() {
+    let e = MemoryEngine::new();
+    // Bump the engine-wide floor high on an unrelated key.
+    e.put(b"other", b"x", 100).unwrap();
+
+    // A merge below the global floor still applies, because the key is fresh.
+    assert!(e.merge(b"k", b"v1", 5).unwrap(), "fresh key applies");
+    assert_eq!(e.get(b"k").unwrap().unwrap().value, b"v1");
+
+    // A strictly-newer version for the same key wins.
+    assert!(e.merge(b"k", b"v2", 7).unwrap());
+    assert_eq!(e.get(b"k").unwrap().unwrap().value, b"v2");
+
+    // Equal or older versions are no-ops (idempotent / commutative).
+    assert!(!e.merge(b"k", b"v2-dup", 7).unwrap(), "equal is a no-op");
+    assert!(!e.merge(b"k", b"v0", 3).unwrap(), "older is a no-op");
+    assert_eq!(e.get(b"k").unwrap().unwrap().value, b"v2");
+}
+
+#[test]
+fn entries_returns_every_live_latest_in_key_order() {
+    let e = MemoryEngine::new();
+    e.put(b"a", b"1", 1).unwrap();
+    e.put(b"b", b"2", 2).unwrap();
+    e.put(b"a", b"1b", 3).unwrap(); // newer wins
+    e.put(b"c", b"3", 4).unwrap();
+    e.delete(b"c", 5).unwrap(); // tombstoned -> excluded
+
+    let entries: Vec<_> = e
+        .entries()
+        .unwrap()
+        .into_iter()
+        .map(|(k, vv)| (k, vv.value))
+        .collect();
+    assert_eq!(
+        entries,
+        vec![
+            (b"a".to_vec(), b"1b".to_vec()),
+            (b"b".to_vec(), b"2".to_vec()),
+        ]
+    );
+}
+
+#[test]
 fn snapshot_scan_is_isolated() {
     let e = MemoryEngine::new();
     e.put(b"a", b"1", 1).unwrap();

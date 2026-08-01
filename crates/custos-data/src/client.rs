@@ -78,6 +78,14 @@ pub enum ReadResult {
     Failed,
 }
 
+/// The outcome of [`DataClient::quorum_read`]: the winning `(version, value)`
+/// (inner `None` if the key is absent everywhere) and whether the responding
+/// replicas diverged, which drives read-repair.
+struct QuorumRead {
+    best: Option<(u64, Vec<u8>)>,
+    diverged: bool,
+}
+
 /// A quorum coordinator. It is a network participant in its own right (its
 /// `env`'s node id), distinct from the replica nodes it talks to.
 #[derive(Clone)]
@@ -131,11 +139,37 @@ impl<E: Env> DataClient<E> {
     }
 
     /// Quorum read: return the latest value for `key` once `r` replicas respond.
+    ///
+    /// If the responding replicas disagreed — some returned an older version, or
+    /// none at all — the coordinator performs **read-repair**: it pushes the
+    /// winning `(value, version)` back to the tablet's replicas (a fire-and-forget
+    /// [`DataMsg::Sync`], reconciled by per-key LWW), so the replicas that took
+    /// part in this read converge. Replicas that did not respond in time are
+    /// caught up by background [`serve_anti_entropy`](crate::serve_anti_entropy).
     pub async fn read(&self, view: &TabletView, key: &[u8], timeout: Duration) -> ReadResult {
         match self.quorum_read(view, key, timeout).await {
-            Some(best) => ReadResult::Value(best.map(|(_, v)| v)),
+            Some(qr) => {
+                if qr.diverged {
+                    if let Some((ver, val)) = &qr.best {
+                        self.read_repair(view, key, val, *ver).await;
+                    }
+                }
+                ReadResult::Value(qr.best.map(|(_, v)| v))
+            }
             None => ReadResult::Failed,
         }
+    }
+
+    /// Push the winning `(value, version)` for `key` to every replica in `view`
+    /// as a fire-and-forget repair. Idempotent: replicas already at or beyond
+    /// this version merge it as a no-op.
+    async fn read_repair(&self, view: &TabletView, key: &[u8], value: &[u8], version: u64) {
+        let msg = DataMsg::Sync {
+            tablet: view.tablet,
+            epoch: view.epoch,
+            entries: vec![(key.to_vec(), value.to_vec(), version)],
+        };
+        self.broadcast(&view.replicas, &msg).await;
     }
 
     /// The highest version observed for `key` across a read quorum: `Some(0)` if
@@ -150,17 +184,17 @@ impl<E: Env> DataClient<E> {
     ) -> Option<u64> {
         self.quorum_read(view, key, timeout)
             .await
-            .map(|best| best.map_or(0, |(ver, _)| ver))
+            .map(|qr| qr.best.map_or(0, |(ver, _)| ver))
     }
 
-    /// Collect a read quorum, returning `None` if unreachable, else the
-    /// highest-versioned `(version, value)` observed (or inner `None` if absent).
+    /// Collect a read quorum, returning `None` if unreachable, else the winning
+    /// value plus whether the responders diverged (so the caller can repair).
     async fn quorum_read(
         &self,
         view: &TabletView,
         key: &[u8],
         timeout: Duration,
-    ) -> Option<Option<(u64, Vec<u8>)>> {
+    ) -> Option<QuorumRead> {
         let req = self.env.next_u64();
         let msg = DataMsg::Read {
             req,
@@ -173,12 +207,16 @@ impl<E: Env> DataClient<E> {
         let mut oks = 0usize;
         let mut responded = 0usize;
         let mut best: Option<(u64, Vec<u8>)> = None;
+        // The version each ok-responder returned (`None` = key absent there);
+        // used after the fact to decide whether read-repair is warranted.
+        let mut seen: Vec<Option<u64>> = Vec::new();
         self.collect(view.replicas.len(), timeout, |reply| {
             if let DataMsg::ReadResp { req: r, ok, value } = reply {
                 if r == req {
                     responded += 1;
                     if ok {
                         oks += 1;
+                        seen.push(value.as_ref().map(|(ver, _)| *ver));
                         if let Some((ver, val)) = value {
                             if best.as_ref().is_none_or(|(bv, _)| ver > *bv) {
                                 best = Some((ver, val));
@@ -192,7 +230,15 @@ impl<E: Env> DataClient<E> {
         })
         .await;
 
-        (oks >= view.r).then_some(best)
+        if oks < view.r {
+            return None;
+        }
+        // Diverged if any responder lagged the winning version (or lacked the
+        // key while a winner exists).
+        let diverged = best
+            .as_ref()
+            .is_some_and(|(bv, _)| seen.iter().any(|v| v.is_none_or(|ver| ver < *bv)));
+        Some(QuorumRead { best, diverged })
     }
 
     async fn broadcast(&self, replicas: &[NodeId], msg: &DataMsg) {

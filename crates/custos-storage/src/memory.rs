@@ -33,6 +33,12 @@ impl Inner {
         })
     }
 
+    /// The highest version recorded for `key`, tombstones included, or `None`
+    /// if the key has never been written.
+    fn latest_version_of(&self, key: &[u8]) -> Option<Version> {
+        self.data.get(key)?.keys().next_back().copied()
+    }
+
     fn scan_at(&self, start: &[u8], end: &[u8], version: Version) -> Vec<(Key, VersionedValue)> {
         let mut out = Vec::new();
         for key in self
@@ -125,6 +131,26 @@ impl StorageEngine for MemoryEngine {
         Ok(())
     }
 
+    fn merge(&self, key: &[u8], value: &[u8], version: Version) -> Result<bool> {
+        let mut inner = self.lock();
+        // Per-key LWW: apply only if strictly newer than this key's own latest.
+        if inner
+            .latest_version_of(key)
+            .is_some_and(|cur| version <= cur)
+        {
+            return Ok(false);
+        }
+        inner.apply(
+            &WriteOp::Put {
+                key: key.to_vec(),
+                value: value.to_vec(),
+            },
+            version,
+        );
+        inner.max_version = inner.max_version.max(version);
+        Ok(true)
+    }
+
     fn delete(&self, key: &[u8], version: Version) -> Result<()> {
         let mut inner = self.lock();
         inner.check_monotonic(version)?;
@@ -180,6 +206,17 @@ impl StorageEngine for MemoryEngine {
             return Err(StorageError::InvalidRange);
         }
         Ok(self.lock().scan_at(start, end, Version::MAX))
+    }
+
+    fn entries(&self) -> Result<Vec<(Key, VersionedValue)>> {
+        let inner = self.lock();
+        let mut out = Vec::new();
+        for key in inner.data.keys() {
+            if let Some(vv) = inner.read_at(key, Version::MAX) {
+                out.push((key.clone(), vv));
+            }
+        }
+        Ok(out)
     }
 
     fn snapshot(&self) -> MemorySnapshot {

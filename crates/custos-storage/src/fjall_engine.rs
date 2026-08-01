@@ -166,6 +166,34 @@ impl FjallEngine {
         Ok(out)
     }
 
+    /// The highest version recorded for `user_key`, tombstones included, or
+    /// `None` if the key has never been written. Versions sort newest-first
+    /// within a user key's prefix, so the first physical entry wins.
+    fn latest_version_of(&self, user_key: &[u8]) -> Result<Option<Version>> {
+        let prefix = escape(user_key);
+        match self.data.range(prefix.clone()..).next() {
+            Some(item) => {
+                let (k, _) = item.map_err(backend)?;
+                Ok(k.starts_with(&prefix).then(|| version_of(&k)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Raise the persisted max version to at least `version`, without the
+    /// monotonic check (used by [`merge`](StorageEngine::merge), whose versions
+    /// need not exceed the engine-wide latest).
+    fn raise_max(&self, version: Version) -> Result<()> {
+        let mut max = self.max_version.lock().expect("max_version poisoned");
+        if version > *max {
+            *max = version;
+            self.meta
+                .insert(META_MAX_VERSION, version.to_be_bytes())
+                .map_err(backend)?;
+        }
+        Ok(())
+    }
+
     fn check_and_bump(&self, version: Version) -> Result<()> {
         let mut max = self.max_version.lock().expect("max_version poisoned");
         if version <= *max {
@@ -223,6 +251,25 @@ impl StorageEngine for FjallEngine {
         )
     }
 
+    fn merge(&self, key: &[u8], value: &[u8], version: Version) -> Result<bool> {
+        // Per-key LWW: apply only if strictly newer than this key's own latest.
+        if self
+            .latest_version_of(key)?
+            .is_some_and(|cur| version <= cur)
+        {
+            return Ok(false);
+        }
+        self.write_op(
+            &WriteOp::Put {
+                key: key.to_vec(),
+                value: value.to_vec(),
+            },
+            version,
+        )?;
+        self.raise_max(version)?;
+        Ok(true)
+    }
+
     fn delete(&self, key: &[u8], version: Version) -> Result<()> {
         self.check_and_bump(version)?;
         self.write_op(&WriteOp::Delete { key: key.to_vec() }, version)
@@ -270,6 +317,24 @@ impl StorageEngine for FjallEngine {
             return Err(StorageError::InvalidRange);
         }
         self.scan_at(start, end, Version::MAX)
+    }
+
+    fn entries(&self) -> Result<Vec<(Key, VersionedValue)>> {
+        let mut out = Vec::new();
+        let mut last_prefix: Option<Vec<u8>> = None;
+        // Newest-first within each user key, so the first entry per prefix wins.
+        for item in self.data.iter() {
+            let (k, v) = item.map_err(backend)?;
+            let prefix = k[..k.len() - 8].to_vec();
+            if last_prefix.as_deref() == Some(&prefix) {
+                continue;
+            }
+            last_prefix = Some(prefix);
+            if let Some(vv) = decode_value(&v, version_of(&k)) {
+                out.push((unescape_prefix(&k), vv));
+            }
+        }
+        Ok(out)
     }
 
     fn snapshot(&self) -> FjallSnapshot {

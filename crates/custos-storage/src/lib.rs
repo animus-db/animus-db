@@ -133,6 +133,19 @@ pub trait StorageEngine: Clone + Send + Sync {
     /// Write `value` at `key` as of `version`.
     fn put(&self, key: &[u8], value: &[u8], version: Version) -> Result<()>;
 
+    /// Merge `value` at `key` with **per-key** last-writer-wins: apply iff
+    /// `version` is strictly greater than the key's current latest version,
+    /// returning whether it took effect.
+    ///
+    /// Unlike [`put`](StorageEngine::put), `merge` does **not** enforce the
+    /// engine-wide monotonic-version contract — it compares only against the
+    /// key's own history. This is the convergence primitive for leaderless
+    /// replication: anti-entropy and read-repair re-apply a value at its
+    /// *original* version (which may sit below the engine's latest), and `merge`
+    /// is idempotent and commutative under it, so replicas converge to the
+    /// highest version seen per key regardless of delivery order.
+    fn merge(&self, key: &[u8], value: &[u8], version: Version) -> Result<bool>;
+
     /// Tombstone `key` as of `version`.
     fn delete(&self, key: &[u8], version: Version) -> Result<()>;
 
@@ -150,6 +163,11 @@ pub trait StorageEngine: Clone + Send + Sync {
 
     /// Scan the latest values for keys in `[start, end)`, ordered by key.
     fn scan(&self, start: &[u8], end: &[u8]) -> Result<Vec<(Key, VersionedValue)>>;
+
+    /// Every live (non-tombstoned) latest entry, as `(key, versioned value)`,
+    /// ordered by key. This is the full digest anti-entropy reconciles against;
+    /// it is `scan` over the whole keyspace.
+    fn entries(&self) -> Result<Vec<(Key, VersionedValue)>>;
 
     /// Take a consistent snapshot at the engine's current latest version.
     fn snapshot(&self) -> Self::Snapshot;

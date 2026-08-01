@@ -21,7 +21,7 @@ pub mod client;
 pub mod replica;
 
 pub use client::{DataClient, ReadResult, Router, TabletView};
-pub use replica::{ReplicaHandle, serve_replica};
+pub use replica::{ReplicaHandle, serve_anti_entropy, serve_replica};
 
 use custos_tablet::{Epoch, TabletId};
 use serde::{Deserialize, Serialize};
@@ -59,5 +59,14 @@ pub enum DataMsg {
         req: ReqId,
         ok: bool,
         value: Option<(u64, Vec<u8>)>,
+    },
+    /// Peer → peer (anti-entropy) or coordinator → replica (read-repair):
+    /// reconcile a batch of `(key, value, version)` into the replica's storage
+    /// by per-key last-writer-wins. Fire-and-forget — no acknowledgement, and
+    /// fenced as a whole on a stale `epoch` (ADR 0002).
+    Sync {
+        tablet: TabletId,
+        epoch: Epoch,
+        entries: Vec<(Vec<u8>, Vec<u8>, u64)>,
     },
 }
