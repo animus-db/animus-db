@@ -27,10 +27,12 @@ membership and a placement policy, decide which nodes replicate a tablet.
   so it leans on `BTreeMap`/`BTreeSet` ordering and sorts its output. Don't
   introduce a clock, RNG, or `HashMap` here.
 - It depends only on `custos-env` (`NodeId`), **not** on `custos-control` — the
-  control plane depends (logically) on placement, so a reverse dep would be a
-  cycle. The caller adapts: builds `Candidate`s from `Metadata` members and
-  turns the result into a `CasTabletReplicas`. The sim integration test lives in
-  `custos-control/tests/placement_reconcile.rs` (control dev-depends on this).
+  control plane depends on placement (now a *normal* dependency: `Metadata`
+  stores `PlacementPolicy` and `Metadata::reconcile` calls `replan`), so a
+  reverse dep would be a cycle. The control plane builds `Candidate`s from
+  `Active` `Metadata` members and turns the result into a `CasTabletReplicas`.
+  Sim integration tests: `custos-control/tests/placement_reconcile.rs`
+  (caller-driven) and `placement_auto_reconcile.rs` (leader-driven, automatic).
 - Selection is greedy **least-loaded-domain-first**, which gives even spread for
   fresh placement and, seeded with the survivors, prefers fresh domains on a
   `replan` — so a single replica death is replaced like-for-like in its own
@@ -49,6 +51,7 @@ through-Raft, fault-injecting integration test is
 
 ## Deferred (ADR 0005)
 
-Residency across read-repair / anti-entropy / hinted handoff / backup; an
-automatic reconciler loop inside the control-plane node (today caller-driven);
-and replicating policies in `Metadata`.
+Residency across read-repair / anti-entropy / hinted handoff / backup. (Policy
+replication in `Metadata` and the in-node automatic reconciler now exist — see
+`custos-control`'s `SetTabletPolicy` + `Metadata::reconcile` + `reconcile_loop`.)
+A cluster-default policy and operator-facing policy management are future work.

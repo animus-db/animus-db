@@ -20,6 +20,11 @@ const WAL: &str = "raft.wal";
 /// bounds both the in-memory log and the WAL to roughly the live tail.
 const SNAPSHOT_THRESHOLD: u64 = 64;
 
+/// How often the leader re-evaluates placement and proposes any corrective
+/// `CasTabletReplicas` (ADR 0005). Long relative to the heartbeat interval:
+/// reconciliation is a slow background activity, not on any request path.
+const RECONCILE_INTERVAL: Duration = Duration::from_millis(500);
+
 /// A running control-plane node. Cheap to clone; clones share one [`RaftCore`].
 #[derive(Clone)]
 pub struct RaftNode<E: Env> {
@@ -41,7 +46,11 @@ impl<E: Env> RaftNode<E> {
             env: env.clone(),
             core: Arc::clone(&core),
         };
-        env.spawn_task(drive(env.clone(), core, all_nodes));
+        env.spawn_task(drive(env.clone(), Arc::clone(&core), all_nodes));
+        // The placement reconciler runs alongside the driver; it only ever
+        // *proposes* on the core (no I/O of its own), and proposals are honored
+        // only when this node is leader — so it is safe to run on every node.
+        env.spawn_task(reconcile_loop(env.clone(), core));
         node
     }
 
@@ -155,6 +164,36 @@ async fn drive<E: Env>(env: E, core: Arc<Mutex<RaftCore>>, all_nodes: Vec<NodeId
         for (to, msg) in outs {
             let bytes = serde_json::to_vec(&msg).expect("raft message serializes");
             env.send(to, bytes).await;
+        }
+    }
+}
+
+/// The leader's placement reconciler (ADR 0005): on a slow timer, if this node
+/// is leader, recompute the desired replica set for every tablet that has a
+/// policy and propose a `CasTabletReplicas` for any that drifted out of
+/// compliance (e.g. a replica's member went `Down`).
+///
+/// The decision is the **pure, deterministic** [`Metadata::reconcile`]; this
+/// driver supplies only timing (over the `Env` seam) and the propose. It runs on
+/// every node but is a no-op off the leader (`propose` returns `NotLeader`), and
+/// a no-op when nothing drifted (`reconcile` returns no commands) — so it is
+/// idempotent and produces no churn at steady state. The proposed entries are
+/// flushed and replicated by the [`drive`] loop's regular WAL handling.
+async fn reconcile_loop<E: Env>(env: E, core: Arc<Mutex<RaftCore>>) {
+    loop {
+        env.sleep(RECONCILE_INTERVAL).await;
+        let proposals = {
+            let core = core.lock().expect("raft core poisoned");
+            if !core.is_leader() {
+                continue;
+            }
+            core.metadata().reconcile()
+        };
+        for command in proposals {
+            // Off-leader transitions between the check and here are harmless:
+            // a stale `CasTabletReplicas` is rejected by the epoch guard, and a
+            // non-leader `propose` is dropped.
+            core.lock().expect("raft core poisoned").propose(command);
         }
     }
 }

@@ -48,8 +48,25 @@ the replicated `Active` membership, calls it, and commits the result as a
 end-to-end through real Raft under simulation, including a replica death and a
 control-follower crash mid-reconcile, reproducible from a seed.
 
+**Policies are now replicated and reconciliation is automatic.** A placement
+policy is persisted *in* the control-plane `Metadata` via a `SetTabletPolicy`
+`MetaCommand` (a `BTreeMap<TabletId, PlacementPolicy>`), so it survives leader
+change and recovery and every replica sees the same policy. The decision —
+`Metadata::reconcile` — is a pure, deterministic function of the metadata: for
+each policied tablet it runs `replan` over the `Active` membership and emits a
+`CasTabletReplicas` only when the current set violates the policy, so it is
+idempotent (no churn at steady state). The **leader** drives it: `RaftNode`'s
+`reconcile_loop` calls it on a slow `Env` timer (`env.sleep`, never wall clock)
+and proposes the result; off-leader nodes propose nothing and a stale proposal
+is rejected by the epoch guard. `custos-control` therefore now takes
+`custos-placement` as a normal dependency (no cycle — placement does not depend
+on control). `custos-control/tests/placement_auto_reconcile.rs` proves a marked
+`Down` replica is replaced **automatically**, with no test-driven `replan`/CAS,
+preserving residency + spread and moving only the dead replica, reproducible
+from a seed.
+
 **Still deferred** (the weakest-path work above): residency enforcement across
-read-repair, anti-entropy, hinted handoff, and backup; an automatic reconciler
-loop *inside* the control-plane node (today the reconcile is caller-driven —
-compute `replan`, propose the CAS); and persisting placement policies in
-`Metadata` (today a policy is supplied by the caller, not replicated).
+read-repair, anti-entropy, hinted handoff, and backup. The reconciler keeps a
+tablet's *surviving* eligible replicas (minimal churn), so it repairs drift but
+does not re-optimize an already-placed compliant-enough set; a cluster-default
+policy and operator-facing policy management (CLI/wire) are also future work.

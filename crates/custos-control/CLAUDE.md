@@ -12,13 +12,16 @@ epoch compare-and-swap transactions.
 
 - `meta.rs` — `Metadata` (members + tablet map) and `MetaCommand`
   (`UpsertMember`, `CreateTablet`, `CasTabletReplicas`, `SplitTablet`,
-  `MergeTablets`). `Metadata::apply` is the deterministic state machine.
+  `MergeTablets`, `SetTabletPolicy`). `Metadata::apply` is the deterministic
+  state machine; `Metadata::reconcile` is the pure placement decision (see
+  below).
 - `raft.rs` — `RaftCore`: a **synchronous, I/O-free** Raft state machine. Time
   and randomness are parameters (`now`, `entropy`); it returns outbound messages
   and emits WAL records.
 - `persist.rs` — `WalRecord`, `PersistedState` (durability/recovery). The WAL
   write/compact/recover flow is diagrammed in `docs/wal.md`.
-- `node.rs` — `RaftNode<E>`: the `Env` driver wrapping the core.
+- `node.rs` — `RaftNode<E>`: the `Env` driver wrapping the core, plus
+  `reconcile_loop` (the leader's automatic placement reconciler).
 
 ## What's non-obvious
 
@@ -40,6 +43,15 @@ epoch compare-and-swap transactions.
   `InstallSnapshot`. See `docs/wal.md`.
 - `CasTabletReplicas` applies only if the tablet's epoch matches, then bumps it
   — evaluated identically on every replica, so accept/reject is consistent.
+- **Automatic placement (ADR 0005).** Policies are replicated in `Metadata`
+  (`SetTabletPolicy` → `policies` map). The decision lives in the pure
+  `Metadata::reconcile` (runs `custos_placement::replan` over `Active` members,
+  emits a `CasTabletReplicas` only for tablets whose set violates the policy —
+  idempotent). The **leader** drives it: `node.rs`'s `reconcile_loop` ticks on a
+  slow `env.sleep` timer and proposes the result. Keep the *timing* in the
+  driver and the *decision* pure — don't put a clock or RNG in `reconcile`, and
+  don't reconcile off-leader (a non-leader `propose` is dropped; a stale CAS is
+  epoch-rejected). `custos-placement` is a **normal** dependency now (no cycle).
 - Commit advances only for **current-term** entries via majority `matchIndex`
   (the Raft safety rule). Don't relax this.
 - Not implemented: chunked snapshot transfer (snapshots ship whole).
@@ -51,6 +63,8 @@ multi-seed convergence (`control_raft.rs`), durability/recovery
 (`persistence.rs`), split/merge (`tablet_split_merge.rs`), snapshot truncation
 (`wal_compaction.rs`), a partitioned follower catching up via `InstallSnapshot`
 (`install_snapshot.rs`), process restart-and-rejoin (`restart.rs`, using
-`Simulator::stop`), and placement reconcile through Raft under a replica death +
-follower crash (`placement_reconcile.rs`, driving `custos-placement`). Use
+`Simulator::stop`), caller-driven placement reconcile through Raft under a
+replica death + follower crash (`placement_reconcile.rs`, driving
+`custos-placement`), and **leader-driven automatic** reconcile from a replicated
+policy (`placement_auto_reconcile.rs` — no test-side `replan`/CAS). Use
 `run_for`, never `run()` (perpetual heartbeats).

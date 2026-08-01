@@ -10,6 +10,7 @@
 use std::collections::BTreeMap;
 
 use custos_env::NodeId;
+use custos_placement::{Candidate, PlacementPolicy, replan};
 use custos_tablet::{Epoch, KeyRange, Tablet, TabletId};
 use serde::{Deserialize, Serialize};
 
@@ -43,6 +44,11 @@ pub struct Metadata {
     pub members: BTreeMap<NodeId, Member>,
     /// The tablet map keyed by tablet id.
     pub tablets: BTreeMap<TabletId, Tablet>,
+    /// Per-tablet placement policies (ADR 0005). A tablet with a policy here is
+    /// reconciled automatically by the leader; tablets without one are left as
+    /// placed. Keyed by tablet id, so the in-node reconciler can recompute the
+    /// desired replica set deterministically on every replica.
+    pub policies: BTreeMap<TabletId, PlacementPolicy>,
 }
 
 /// A mutation of [`Metadata`], replicated through Raft and applied in log order.
@@ -82,6 +88,16 @@ pub enum MetaCommand {
     /// and they share a replica set) into `left`, extended to cover both ranges
     /// with a bumped epoch; `right` is removed.
     MergeTablets { left: TabletId, right: TabletId },
+    /// Set (or clear) a tablet's placement policy (ADR 0005). Once a tablet has
+    /// a policy, the leader's reconciler keeps its replica set satisfying it;
+    /// `policy: None` removes the policy and stops automatic reconciliation. The
+    /// tablet must exist. This replicates the policy in [`Metadata`] so it
+    /// survives leader change and recovery, and so every replica computes the
+    /// same desired set.
+    SetTabletPolicy {
+        tablet: TabletId,
+        policy: Option<PlacementPolicy>,
+    },
 }
 
 /// The deterministic result of applying a [`MetaCommand`].
@@ -96,6 +112,57 @@ pub enum ApplyOutcome {
 }
 
 impl Metadata {
+    /// Build placement candidates from the `Active` members and their labels.
+    /// Liveness is the control plane's job (ADR 0005): only `Active` members are
+    /// offered to the placement engine, which then enforces *policy* (residency
+    /// + spread). Iteration is over a `BTreeMap`, so the order is deterministic.
+    fn active_candidates(&self) -> Vec<Candidate> {
+        self.members
+            .iter()
+            .filter(|(_, m)| m.status == NodeStatus::Active)
+            .map(|(id, m)| Candidate::new(*id, m.labels.clone()))
+            .collect()
+    }
+
+    /// Recompute placement for every tablet that has a policy and return the
+    /// [`CasTabletReplicas`](MetaCommand::CasTabletReplicas) commands needed to
+    /// bring the cluster into compliance — only for tablets whose current set
+    /// already violates the policy (a member went `Down`/`Leaving`, or the set
+    /// otherwise no longer satisfies residency + spread).
+    ///
+    /// This is a **pure, deterministic** function of the metadata: it does no
+    /// I/O, draws no randomness, and iterates over `BTreeMap`s, so every replica
+    /// (and a replay) computes the same proposals. The leader's reconciler
+    /// (`node.rs`) calls it on a timer and proposes the result through Raft; a
+    /// tablet already satisfying its policy yields nothing, so the loop is
+    /// **idempotent** (no churn at steady state). A tablet whose policy cannot be
+    /// satisfied with the current candidates (e.g. too few eligible nodes) is
+    /// skipped, leaving the existing replicas in place rather than shrinking the
+    /// set.
+    #[must_use]
+    pub fn reconcile(&self) -> Vec<MetaCommand> {
+        let candidates = self.active_candidates();
+        self.policies
+            .iter()
+            .filter_map(|(tablet, policy)| {
+                let t = self.tablets.get(tablet)?;
+                let desired = replan(&t.replicas, &candidates, policy).ok()?;
+                // `replan` returns a sorted set; `t.replicas` is normalized
+                // (sorted + deduped) by `Tablet::new` / `CasTabletReplicas`, so a
+                // direct comparison is a faithful "already satisfied" check.
+                if desired == t.replicas {
+                    None
+                } else {
+                    Some(MetaCommand::CasTabletReplicas {
+                        tablet: *tablet,
+                        expected_epoch: t.epoch,
+                        replicas: desired,
+                    })
+                }
+            })
+            .collect()
+    }
+
     /// Apply a command, returning the (deterministic) outcome.
     pub fn apply(&mut self, command: &MetaCommand) -> ApplyOutcome {
         match command {
@@ -181,6 +248,22 @@ impl Metadata {
                 l.range.end = new_end;
                 l.epoch = l.epoch.next();
                 self.tablets.remove(right);
+                // The merged-away tablet can no longer be reconciled.
+                self.policies.remove(right);
+                ApplyOutcome::Applied
+            }
+            MetaCommand::SetTabletPolicy { tablet, policy } => {
+                if !self.tablets.contains_key(tablet) {
+                    return ApplyOutcome::Rejected("no such tablet");
+                }
+                match policy {
+                    Some(p) => {
+                        self.policies.insert(*tablet, p.clone());
+                    }
+                    None => {
+                        self.policies.remove(tablet);
+                    }
+                }
                 ApplyOutcome::Applied
             }
         }

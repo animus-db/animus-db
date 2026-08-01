@@ -173,10 +173,15 @@ chooses a tablet's replica set — `select_replicas` for a fresh tablet,
 `replan` for a membership change (keeping eligible survivors so only the lost
 replica moves). It depends only on `NodeId` (no dep on `custos-control`, which
 would be a cycle); the control plane builds candidates from `Active` membership,
-calls it, and commits the result as a `CasTabletReplicas`. End-to-end through
-real Raft under fault injection in `custos-control/tests/placement_reconcile.rs`.
-Deferred: residency on the repair/handoff/backup paths, an in-node reconciler
-loop, and replicating policies in `Metadata`.
+calls it, and commits the result as a `CasTabletReplicas`. Policies are
+**replicated in `Metadata`** (`SetTabletPolicy`) and the **leader reconciles
+automatically**: `RaftNode`'s `reconcile_loop` ticks on an `Env` timer and
+proposes corrective `CasTabletReplicas` from the pure `Metadata::reconcile`.
+End-to-end through real Raft under fault injection in
+`custos-control/tests/placement_reconcile.rs` (caller-driven) and
+`placement_auto_reconcile.rs` (automatic). Deferred: residency on the
+repair/handoff/backup paths, a cluster-default policy, and operator-facing
+policy management.
 
 ### Storage (`custos-storage`)
 
