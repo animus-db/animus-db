@@ -50,19 +50,21 @@ pub struct ClusterConfig {
 }
 
 impl ClusterConfig {
-    /// Generate a config for `n` nodes on `host`, assigning each node four
+    /// Generate a config for `n` nodes on `host`, assigning each node five
     /// consecutive ports starting at `base_port` (node `i` uses
-    /// `base_port + 4*i .. +4`). Quorum defaults to a majority (`R = W > N/2`).
+    /// `base_port + 5*i .. +5`): control, data, coord, client, dynamo. Quorum
+    /// defaults to a majority (`R = W > N/2`).
     #[must_use]
     pub fn generate(n: usize, host: IpAddr, base_port: u16) -> Self {
         let nodes = (0..n)
             .map(|i| {
-                let p = |role: u16| SocketAddr::new(host, base_port + (i as u16) * 4 + role);
+                let p = |role: u16| SocketAddr::new(host, base_port + (i as u16) * 5 + role);
                 RoleAddrs {
                     control: p(0),
                     data: p(1),
                     coord: p(2),
                     client: p(3),
+                    dynamo: p(4),
                 }
             })
             .collect();
@@ -148,8 +150,9 @@ mod tests {
         assert_eq!(cfg.w, 2);
         assert_eq!(cfg.nodes[0].control.port(), 7000);
         assert_eq!(cfg.nodes[0].client.port(), 7003);
-        assert_eq!(cfg.nodes[1].control.port(), 7004);
-        assert_eq!(cfg.nodes[2].coord.port(), 7010);
+        assert_eq!(cfg.nodes[0].dynamo.port(), 7004);
+        assert_eq!(cfg.nodes[1].control.port(), 7005);
+        assert_eq!(cfg.nodes[2].coord.port(), 7012);
     }
 
     #[test]
@@ -158,11 +161,13 @@ mod tests {
         let book = cfg.peer_book();
         assert_eq!(book.len(), 9, "3 nodes x 3 internal roles");
         // Conventional ids resolve to the right ports.
-        assert_eq!(book[&control_id(1)].port(), 7004);
-        assert_eq!(book[&data_id(1)].port(), 7005);
-        assert_eq!(book[&coord_id(2)].port(), 7010);
-        // Client addresses are intentionally absent from the internal book.
+        assert_eq!(book[&control_id(1)].port(), 7005);
+        assert_eq!(book[&data_id(1)].port(), 7006);
+        assert_eq!(book[&coord_id(2)].port(), 7012);
+        // Client and dynamo addresses are intentionally absent from the
+        // internal book (they are external client channels, not the network).
         assert!(!book.values().any(|a| a.port() == 7003));
+        assert!(!book.values().any(|a| a.port() == 7004));
     }
 
     #[test]

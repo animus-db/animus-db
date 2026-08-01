@@ -19,14 +19,28 @@ common map-of-maps core (ADR 0004) and the distributed planes (ADR 0001). The
 adapters translate surface syntax and semantics to core operations; they do not
 each carry their own engine.
 
-A first slice now exists: `custos-dynamo` provides a DynamoDB-style **item API**
-(`PutItem`/`GetItem`/`DeleteItem`/`Query`) mapped directly onto the
+Two slices now exist. First, `custos-dynamo` provides a DynamoDB-style **item
+API** (`PutItem`/`GetItem`/`DeleteItem`/`Query`) mapped directly onto the
 `StorageEngine` core, demonstrating that the Dynamo-lineage data model
-translates cleanly. What remains is the surface-specific work — the DynamoDB
-HTTP/JSON wire protocol, and for CQL the binary protocol framing plus a
-parser/type system — and wiring the adapters to the distributed request path
-rather than a local engine. `custos-cql` stays a skeleton that maps onto the
-same core in the same way.
+translates cleanly. Second, a **minimal DynamoDB JSON wire protocol** is now
+served: `custos-dynamo::wire` is the pure, deterministic translation between
+the DynamoDB AttributeValue JSON (`{"S":..}` / `{"N":..}` / `{"B":..}` /
+`{"BOOL":..}` / `{"NULL":..}`) and the in-memory item model, and `custosd`
+exposes a real HTTP/1.1 endpoint that decodes `X-Amz-Target:
+DynamoDB_20120810.{PutItem,GetItem,DeleteItem}` requests and routes the
+resulting keys/values **through the distributed data plane** (the same quorum
+coordinator the plain-TCP client API uses) rather than a local engine. The HTTP
+edge is production-only I/O (hand-rolled over a tokio `TcpListener`, mirroring
+`ProdEnv`'s placement of real I/O); everything below it stays on the `Env`-based
+paths. The data plane has no native delete yet (ADR 0010), so `DeleteItem`
+writes a tombstone value that `GetItem` reads back as absent.
+
+What remains is the rest of the surface: `Query`/`Scan` over the wire,
+conditional/`ReturnValues` semantics, document/set attribute types, an explicit
+`CreateTable` with per-table key schemas (the wire edge currently uses a fixed
+`pk`/`sk` convention), and the parallel CQL binary protocol framing plus a
+parser/type system. `custos-cql` stays a skeleton that maps onto the same core
+in the same way.
 
 ## Consequences
 

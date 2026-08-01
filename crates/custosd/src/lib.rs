@@ -32,6 +32,8 @@ use std::time::Duration;
 pub mod config;
 pub use config::ClusterConfig;
 
+mod dynamo;
+
 use custos_control::{MetaCommand, Metadata, NodeStatus, RaftNode};
 use custos_data::{DataClient, ReadResult, ReplicaHandle, TabletView, serve_replica};
 use custos_env::{NodeId, ProdEnv};
@@ -70,13 +72,23 @@ pub enum ClientResponse {
     Error(String),
 }
 
-/// Listen addresses for a node's four endpoints (use port 0 for ephemeral).
+/// Listen addresses for a node's five endpoints (use port 0 for ephemeral).
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct RoleAddrs {
     pub control: SocketAddr,
     pub data: SocketAddr,
     pub coord: SocketAddr,
     pub client: SocketAddr,
+    /// The DynamoDB JSON-over-HTTP endpoint. Defaults (when absent in older
+    /// configs) to the client port + 1.
+    #[serde(default = "default_dynamo_addr")]
+    pub dynamo: SocketAddr,
+}
+
+/// Fallback DynamoDB endpoint for configs written before the field existed:
+/// an ephemeral port on the loopback (the real port is learned after bind).
+fn default_dynamo_addr() -> SocketAddr {
+    SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0)
 }
 
 /// A node whose listeners are bound but whose protocols are not yet started.
@@ -94,6 +106,8 @@ pub struct BoundNode {
     coord_addr: SocketAddr,
     client_listener: TcpListener,
     client_addr: SocketAddr,
+    dynamo_listener: TcpListener,
+    dynamo_addr: SocketAddr,
 }
 
 impl BoundNode {
@@ -110,6 +124,11 @@ impl BoundNode {
     /// The address clients connect to.
     pub fn client_addr(&self) -> SocketAddr {
         self.client_addr
+    }
+
+    /// The address the DynamoDB JSON/HTTP endpoint listens on.
+    pub fn dynamo_addr(&self) -> SocketAddr {
+        self.dynamo_addr
     }
 
     /// Wire the peer address book into every env and start all protocols.
@@ -140,7 +159,8 @@ impl BoundNode {
             tokio::spawn(bootstrap(raft, members, data_ids));
         }
 
-        // Client request server.
+        // Client request server + DynamoDB HTTP endpoint share one context
+        // (the same coordinator, raft view, and serialization lock).
         {
             let ctx = ClientCtx {
                 raft: raft.clone(),
@@ -149,13 +169,15 @@ impl BoundNode {
                 r,
                 w,
             };
-            tokio::spawn(serve_clients(self.client_listener, ctx));
+            tokio::spawn(serve_clients(self.client_listener, ctx.clone()));
+            tokio::spawn(dynamo::serve(self.dynamo_listener, ctx));
         }
 
         Node {
             raft,
             _replica: replica,
             client_addr: self.client_addr,
+            dynamo_addr: self.dynamo_addr,
         }
     }
 }
@@ -165,6 +187,7 @@ pub struct Node {
     raft: RaftNode<ProdEnv>,
     _replica: ReplicaHandle<MemoryEngine>,
     client_addr: SocketAddr,
+    dynamo_addr: SocketAddr,
 }
 
 impl Node {
@@ -188,6 +211,8 @@ impl Node {
             ProdEnv::bind(coord_id, addrs.coord, dir.join("coord")).await?;
         let client_listener = TcpListener::bind(addrs.client).await?;
         let client_addr = client_listener.local_addr()?;
+        let dynamo_listener = TcpListener::bind(addrs.dynamo).await?;
+        let dynamo_addr = dynamo_listener.local_addr()?;
         Ok(BoundNode {
             control_id,
             data_id,
@@ -200,12 +225,19 @@ impl Node {
             coord_addr,
             client_listener,
             client_addr,
+            dynamo_listener,
+            dynamo_addr,
         })
     }
 
     /// The address clients connect to.
     pub fn client_addr(&self) -> SocketAddr {
         self.client_addr
+    }
+
+    /// The address the DynamoDB JSON/HTTP endpoint listens on.
+    pub fn dynamo_addr(&self) -> SocketAddr {
+        self.dynamo_addr
     }
 
     /// Whether this node's control replica currently believes it is leader.
@@ -219,12 +251,14 @@ impl Node {
     }
 }
 
-/// Shared context for the client request server.
+/// Shared context for the client request server and the DynamoDB HTTP endpoint:
+/// the cached metadata view for routing, the quorum coordinator, and the
+/// per-node serialization lock around the single-consumer coord inbox.
 #[derive(Clone)]
-struct ClientCtx {
+pub(crate) struct ClientCtx {
     raft: RaftNode<ProdEnv>,
-    coordinator: DataClient<ProdEnv>,
-    coord_lock: Arc<tokio::sync::Mutex<()>>,
+    pub(crate) coordinator: DataClient<ProdEnv>,
+    pub(crate) coord_lock: Arc<tokio::sync::Mutex<()>>,
     r: usize,
     w: usize,
 }
@@ -320,7 +354,7 @@ async fn handle_client(mut stream: TcpStream, ctx: ClientCtx) -> std::io::Result
 
 impl ClientCtx {
     /// Resolve the routing view for `key` from cached metadata.
-    fn view_for(&self, key: &[u8]) -> Option<TabletView> {
+    pub(crate) fn view_for(&self, key: &[u8]) -> Option<TabletView> {
         self.raft
             .metadata()
             .tablets
@@ -349,6 +383,7 @@ pub async fn bind_cluster(
             data: addr(),
             coord: addr(),
             client: addr(),
+            dynamo: addr(),
         };
         let node = Node::bind(
             config::control_id(i),

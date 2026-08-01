@@ -15,14 +15,19 @@ log-truncating snapshots with `InstallSnapshot`),
 the quorum data-plane vertical slice (with read-repair + background
 anti-entropy convergence), tablet split/merge + multi-tablet routing,
 the Elle-style recorder/checker (`custos-test`), a DynamoDB-style item API over
-the core (`custos-dynamo`), a **runnable node + CLI** assembling the planes
+the core plus a **minimal DynamoDB JSON wire protocol**
+(`custos-dynamo`: PutItem/GetItem/DeleteItem AttributeValue-JSON translation),
+a **runnable node + CLI** assembling the planes
 over `ProdEnv` and serving clients over TCP — runnable as one process
 (`custosd --cluster N`) or one process per node (`custosd --config FILE --node I`,
-config via `gen-config`) — and the **topology-aware placement engine**
+config via `gen-config`) — which now also **serves the DynamoDB JSON protocol
+over HTTP**, routing those requests through the same data-plane coordinator —
+and the **topology-aware placement engine**
 (`custos-placement`: residency + failure-domain spread, driving control-plane
 `CasTabletReplicas`). Skeletons / future work:
 `custos-consensus` (Accord transactions), `custos-cql` (wire
-protocol), plus the DynamoDB/CQL wire protocols.
+protocol), plus the rest of the DynamoDB surface (Query/Scan, CreateTable,
+conditional writes) and the CQL wire protocol.
 
 ## Per-crate guides
 

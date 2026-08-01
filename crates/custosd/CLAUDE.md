@@ -21,6 +21,10 @@ CLI wrapper. `custos-cli` depends on this crate for the client protocol types.
   `--cluster N` mode and `tests/cluster.rs`).
 - `ClientRequest` / `ClientResponse` + `read_frame` / `write_frame` — the
   length-prefixed JSON client protocol (reused by `custos-cli`).
+- `dynamo` module — the **DynamoDB JSON-over-HTTP endpoint** (a fifth listener
+  per node). A hand-rolled HTTP/1.1 server decodes `X-Amz-Target` +
+  AttributeValue-JSON via `custos_dynamo::wire`, then routes through the **same
+  `ClientCtx`** (coordinator + cached routing view) as the plain-TCP API.
 
 ## What's non-obvious
 
@@ -30,6 +34,13 @@ CLI wrapper. `custos-cli` depends on this crate for the client protocol types.
   on the `Network`: coordination is server-side, so the coordinator is a static
   cluster member and replica replies route without knowing dynamic client
   addresses.
+- Each node also serves a **fifth listener, the DynamoDB JSON/HTTP endpoint**
+  (`RoleAddrs.dynamo`, `Node::dynamo_addr`). It is a *production-only I/O edge*
+  (real tokio sockets + hand-rolled HTTP/1.1, like `ProdEnv`); below the edge it
+  reuses the existing `DataClient`/`Env` paths, so determinism is unaffected.
+  The data plane has no native delete, so DynamoDB `DeleteItem` writes a
+  tombstone value that `GetItem` reads back as absent. No `CreateTable` yet — the
+  edge uses a fixed `pk`/`sk` key-attribute convention.
 - Writes get a **quorum-derived version** (`DataClient::read_version` + 1), not a
   per-node counter — otherwise two coordinators assign the same version and the
   replica's monotonic-version check silently drops the later write. Global
@@ -42,13 +53,20 @@ CLI wrapper. `custos-cli` depends on this crate for the client protocol types.
 
 ## Tests / running
 
-`cargo test -p custosd` — `tests/cluster.rs` (in-process cluster) and
-`tests/per_process.rs` (nodes started independently from a shared config). Both
-use real TCP/time, so they poll with timeouts, not deterministic assertions.
+`cargo test -p custosd` — `tests/cluster.rs` (in-process cluster),
+`tests/per_process.rs` (nodes started independently from a shared config), and
+`tests/dynamo_wire.rs` (PutItem → GetItem → DeleteItem over the real DynamoDB
+JSON/HTTP wire). All use real TCP/time, so they poll with timeouts, not
+deterministic assertions.
 
 Per-process run:
 ```sh
 custosd gen-config --nodes 3 > cluster.json
 custosd --config cluster.json --node 0   # one process per node, distinct --node
 custos status <node-0 client addr>
+# the node also prints its DynamoDB HTTP endpoint; talk to it with any
+# DynamoDB JSON client, e.g.:
+curl -s <dynamo addr>/ \
+  -H 'X-Amz-Target: DynamoDB_20120810.PutItem' \
+  -d '{"TableName":"t","Item":{"pk":{"S":"a"},"v":{"N":"1"}}}'
 ```
