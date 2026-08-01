@@ -16,7 +16,8 @@ epoch compare-and-swap transactions.
 - `raft.rs` — `RaftCore`: a **synchronous, I/O-free** Raft state machine. Time
   and randomness are parameters (`now`, `entropy`); it returns outbound messages
   and emits WAL records.
-- `persist.rs` — `WalRecord`, `PersistedState` (durability/recovery).
+- `persist.rs` — `WalRecord`, `PersistedState` (durability/recovery). The WAL
+  write/compact/recover flow is diagrammed in `docs/wal.md`.
 - `node.rs` — `RaftNode<E>`: the `Env` driver wrapping the core.
 
 ## What's non-obvious

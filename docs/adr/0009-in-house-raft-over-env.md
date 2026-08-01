@@ -45,7 +45,8 @@ truncation, commit only of current-term entries via majority `matchIndex`).
   commands. The WAL is **compacted** to its live image (latest checkpoint + hard
   state + current log) on a threshold, written via an atomic `Disk::replace`
   (temp-file + rename in production), so it is bounded by the live state rather
-  than growing a fresh checkpoint per apply. **Still deferred:** truncating the
+  than growing a fresh checkpoint per apply. The full WAL write/compact/recover
+  flow is diagrammed in [`docs/wal.md`](../wal.md). **Still deferred:** truncating the
   *committed log prefix* in memory (true Raft log compaction) — which additionally
   requires an `InstallSnapshot` RPC to catch up a follower that has fallen behind
   the compacted point — and a full in-simulation process *restart-and-rejoin*
