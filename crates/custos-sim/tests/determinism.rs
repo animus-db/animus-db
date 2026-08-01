@@ -142,6 +142,65 @@ fn crash_drops_unsynced_disk_bytes() {
     );
 }
 
+/// A node parked on `recv()` that is crashed and then restarted must resume
+/// receiving: a message delivered after the restart should wake it and be
+/// processed. (Regression: `crash` dropped the parked recv waker, so after
+/// `restart` nothing re-polled the task and later deliveries were never woken.)
+#[test]
+fn restart_resumes_a_parked_recv() {
+    let seed = seed_from_env(0x5EED_0FEE);
+    let mut sim = Simulator::new(seed);
+
+    // A receiver that records every message payload byte it observes.
+    let seen = Arc::new(Mutex::new(Vec::<u8>::new()));
+    {
+        let env = sim.env(0);
+        let out = Arc::clone(&seen);
+        env.clone().spawn_task(async move {
+            loop {
+                let msg = env.recv().await;
+                out.lock().unwrap().push(msg.payload[0]);
+            }
+        });
+    }
+
+    // Deliver a first message and let it be processed, so the task is now parked
+    // back on `recv()` with an empty inbox (its waker registered).
+    {
+        let sender = sim.env(1);
+        sender.clone().spawn_task(async move {
+            sender.send(0, vec![1]).await;
+        });
+    }
+    sim.run_for(Duration::from_millis(10));
+    assert_eq!(
+        &*seen.lock().unwrap(),
+        &[1],
+        "receiver should have processed the pre-crash message (seed={seed})"
+    );
+
+    // Crash the receiver while it is parked on `recv()`, then restart it.
+    sim.crash(0);
+    sim.restart(0);
+
+    // Deliver another message after the restart; the re-armed task must wake and
+    // process it.
+    {
+        let sender = sim.env(1);
+        sender.clone().spawn_task(async move {
+            sender.send(0, vec![2]).await;
+        });
+    }
+    sim.run_for(Duration::from_millis(10));
+
+    assert_eq!(
+        &*seen.lock().unwrap(),
+        &[1, 2],
+        "restarted node never processed the post-restart message — its parked \
+         recv was not re-armed (seed={seed})"
+    );
+}
+
 /// Read a seed from `CUSTOS_SEED` for replay, falling back to `default`. A
 /// failing run prints its seed (see the assertion messages) so it can be
 /// replayed with `CUSTOS_SEED=<seed> cargo test`.

@@ -120,7 +120,8 @@ Driving runs:
 
 Fault injection: `partition`/`partition_pair`/`heal`, `crash`/`restart`
 (a crashed node drops un-synced disk + inbox and is muted: its sends are
-dropped). `sim.trace_lines()` gives the stable history used for
+dropped; `restart` re-arms the node's tasks so one parked on `recv()` resumes
+receiving). `sim.trace_lines()` gives the stable history used for
 byte-identical-trace assertions.
 
 ### Two planes (ADR 0001)
@@ -151,10 +152,10 @@ identically on every replica. The core emits WAL records the driver `fsync`s and
 recovers from. The log is offset by a state-machine snapshot: on a threshold the
 node snapshots and **truncates** the covered prefix, rewriting the WAL to its
 live image (`persist.rs`, `node.rs`); a follower behind the compacted prefix is
-caught up via `InstallSnapshot`; recovery restores the snapshot and re-applies
-the tail. Restart-and-rejoin is tested end-to-end via `Simulator::stop`
-(`custos-control/tests/restart.rs`). Not yet implemented: chunked snapshot
-transfer.
+caught up via a **chunked** `InstallSnapshot` (offset-addressed chunks of
+`SNAPSHOT_CHUNK_BYTES`, reassembled and installed atomically by the follower);
+recovery restores the snapshot and re-applies the tail. Restart-and-rejoin is
+tested end-to-end via `Simulator::stop` (`custos-control/tests/restart.rs`).
 
 ### Data plane (`custos-data`)
 

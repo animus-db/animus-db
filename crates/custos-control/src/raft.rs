@@ -31,6 +31,13 @@ use serde::{Deserialize, Serialize};
 use crate::meta::{MetaCommand, Metadata};
 use crate::persist::{PersistedState, WalRecord};
 
+/// Maximum bytes of serialized snapshot carried by a single `InstallSnapshot`
+/// message. A snapshot larger than this is shipped over several offset-addressed
+/// chunks and reassembled by the follower (ADR 0009). Small enough that a
+/// realistic metadata snapshot spans multiple chunks; the value only affects
+/// message granularity, never correctness.
+pub const SNAPSHOT_CHUNK_BYTES: usize = 1024;
+
 /// A replicated log entry.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogEntry {
@@ -70,18 +77,39 @@ pub enum RaftMsg {
         /// Highest log index now known to match on the follower.
         match_index: u64,
     },
-    /// Leader ships its state-machine snapshot to a follower whose log has
-    /// fallen behind the leader's compacted prefix (sent whole, not chunked).
+    /// One **offset-addressed chunk** of the leader's state-machine snapshot,
+    /// shipped to a follower whose log has fallen behind the leader's compacted
+    /// prefix. The snapshot (a serialized [`Metadata`]) is split into chunks of
+    /// at most `SNAPSHOT_CHUNK_BYTES`; the follower reassembles them by `offset`
+    /// and installs once `done` (the final chunk) arrives. `total` is the full
+    /// serialized length, so the follower can detect a complete transfer. The
+    /// snapshot is installed atomically only once every byte is present —
+    /// partial chunks never touch the state machine.
     InstallSnapshot {
         term: u64,
         leader: NodeId,
         last_index: u64,
         last_term: u64,
-        metadata: Metadata,
+        /// Byte offset of this chunk within the serialized snapshot.
+        offset: u64,
+        /// The chunk bytes.
+        data: Vec<u8>,
+        /// Total serialized snapshot length (same for every chunk of a transfer).
+        total: u64,
+        /// Whether this is the final chunk.
+        done: bool,
     },
-    /// Response to [`RaftMsg::InstallSnapshot`]; `last_index` echoes the
-    /// installed index so the leader can advance `next_index`/`match_index`.
-    InstallSnapshotResp { term: u64, last_index: u64 },
+    /// Response to [`RaftMsg::InstallSnapshot`]. `next_offset` is the number of
+    /// contiguous snapshot bytes the follower now holds — the offset the leader
+    /// should send next (it equals `total` once the whole snapshot is installed).
+    /// `last_index` echoes the installed snapshot index once the transfer
+    /// completes (0 while still in progress), so the leader can then advance
+    /// `next_index`/`match_index`.
+    InstallSnapshotResp {
+        term: u64,
+        last_index: u64,
+        next_offset: u64,
+    },
 }
 
 impl RaftMsg {
@@ -117,6 +145,20 @@ pub enum ProposeResult {
 /// An outbound message: `(destination, message)`.
 pub type Out = (NodeId, RaftMsg);
 
+/// Follower-side reassembly state for an in-progress chunked snapshot transfer.
+/// Bytes accumulate in `buf` until `buf.len() == total`, at which point the
+/// follower deserializes `Metadata` and installs the snapshot atomically.
+struct IncomingSnapshot {
+    /// Snapshot index/term this transfer will install at.
+    last_index: u64,
+    last_term: u64,
+    /// Expected full serialized length.
+    total: u64,
+    /// Contiguously received bytes (only chunks at the current offset extend it,
+    /// so a delayed/duplicate chunk can't leave a gap).
+    buf: Vec<u8>,
+}
+
 /// The Raft state machine for one node.
 pub struct RaftCore {
     id: NodeId,
@@ -141,6 +183,13 @@ pub struct RaftCore {
     // Leader state.
     next_index: BTreeMap<NodeId, u64>,
     match_index: BTreeMap<NodeId, u64>,
+    // Per-follower byte offset reached in the in-flight snapshot transfer, so the
+    // leader resumes shipping the next chunk on each heartbeat / ack. Cleared for
+    // a peer once it has fully installed the snapshot.
+    snapshot_offset: BTreeMap<NodeId, u64>,
+
+    // Follower reassembly buffer for an in-progress chunked `InstallSnapshot`.
+    incoming_snapshot: Option<IncomingSnapshot>,
 
     // Timing (virtual). Election timeout is randomized in `[base, 2*base)`.
     election_base: Duration,
@@ -183,6 +232,8 @@ impl RaftCore {
             votes: BTreeSet::new(),
             next_index: BTreeMap::new(),
             match_index: BTreeMap::new(),
+            snapshot_offset: BTreeMap::new(),
+            incoming_snapshot: None,
             election_base: Duration::from_millis(150),
             heartbeat_interval: Duration::from_millis(50),
             election_deadline: Nanos(0),
@@ -491,13 +542,18 @@ impl RaftCore {
                 leader,
                 last_index,
                 last_term,
-                metadata,
+                offset,
+                data,
+                total,
+                done,
             } => self.handle_install_snapshot(
-                term, leader, last_index, last_term, metadata, now, entropy,
+                term, leader, last_index, last_term, offset, data, total, done, now, entropy,
             ),
-            RaftMsg::InstallSnapshotResp { term, last_index } => {
-                self.handle_install_snapshot_resp(from, term, last_index)
-            }
+            RaftMsg::InstallSnapshotResp {
+                term,
+                last_index,
+                next_offset,
+            } => self.handle_install_snapshot_resp(from, term, last_index, next_offset),
         }
     }
 
@@ -687,6 +743,12 @@ impl RaftCore {
         }
     }
 
+    /// Receive one chunk of a chunked snapshot transfer. Bytes are reassembled by
+    /// `offset` into a follower-side buffer; the snapshot is installed atomically
+    /// only when the final (`done`) chunk completes a contiguous buffer of length
+    /// `total`. The ack reports `next_offset` (contiguous bytes held), which the
+    /// leader uses to ship the next chunk; `last_index` is non-zero only once
+    /// fully installed.
     #[allow(clippy::too_many_arguments)]
     fn handle_install_snapshot(
         &mut self,
@@ -694,7 +756,10 @@ impl RaftCore {
         leader: NodeId,
         last_index: u64,
         last_term: u64,
-        metadata: Metadata,
+        offset: u64,
+        data: Vec<u8>,
+        total: u64,
+        done: bool,
         now: Nanos,
         entropy: u64,
     ) -> Vec<Out> {
@@ -704,6 +769,7 @@ impl RaftCore {
                 RaftMsg::InstallSnapshotResp {
                     term: self.current_term,
                     last_index: 0,
+                    next_offset: 0,
                 },
             )];
         }
@@ -711,33 +777,101 @@ impl RaftCore {
         self.leader_id = Some(leader);
         self.reset_election_timer(now, entropy);
 
-        // Already at least this far along: just acknowledge our position.
+        // Already at least this far along: drop any partial transfer and just
+        // acknowledge our position (the leader will stop sending chunks).
         if last_index <= self.snapshot_index {
+            self.incoming_snapshot = None;
             return vec![(
                 leader,
                 RaftMsg::InstallSnapshotResp {
                     term: self.current_term,
                     last_index: self.snapshot_index,
+                    next_offset: total,
                 },
             )];
         }
 
-        // Install: replace the state machine with the snapshot and discard the
-        // log (the leader re-replicates any entries past `last_index`). The
-        // driver rewrites the WAL (snapshot-dirty) before this ack is sent.
-        self.metadata = metadata;
-        self.snapshot_index = last_index;
-        self.snapshot_term = last_term;
-        self.last_applied = last_index;
-        self.commit_index = last_index;
-        self.log.clear();
-        self.applied.clear();
-        self.snapshot_dirty = true;
+        // Start (or restart) reassembly when this is the first chunk, or when the
+        // in-flight transfer is for a different/older snapshot.
+        let fresh = match &self.incoming_snapshot {
+            Some(inc) => inc.last_index != last_index || inc.total != total,
+            None => true,
+        };
+        if fresh && offset == 0 {
+            self.incoming_snapshot = Some(IncomingSnapshot {
+                last_index,
+                last_term,
+                total,
+                buf: Vec::new(),
+            });
+        }
+
+        // Append only a chunk that lands exactly at our current end, keeping the
+        // buffer contiguous (a reordered/duplicate chunk is ignored and re-driven
+        // by the next ack's `next_offset`).
+        if let Some(inc) = &mut self.incoming_snapshot {
+            if inc.last_index == last_index && offset == inc.buf.len() as u64 {
+                inc.buf.extend_from_slice(&data);
+            }
+        }
+
+        // Complete? Install atomically.
+        let next_offset = self
+            .incoming_snapshot
+            .as_ref()
+            .map_or(0, |inc| inc.buf.len() as u64);
+        let complete = done
+            && self
+                .incoming_snapshot
+                .as_ref()
+                .is_some_and(|inc| inc.buf.len() as u64 == inc.total);
+        if complete {
+            let inc = self
+                .incoming_snapshot
+                .take()
+                .expect("present when complete");
+            // A malformed snapshot would be a leader bug; drop the transfer and
+            // re-request on the next chunk rather than installing garbage.
+            match serde_json::from_slice::<Metadata>(&inc.buf) {
+                Ok(metadata) => {
+                    self.metadata = metadata;
+                    self.snapshot_index = inc.last_index;
+                    self.snapshot_term = inc.last_term;
+                    self.last_applied = inc.last_index;
+                    self.commit_index = inc.last_index;
+                    self.log.clear();
+                    self.applied.clear();
+                    self.snapshot_dirty = true;
+                    return vec![(
+                        leader,
+                        RaftMsg::InstallSnapshotResp {
+                            term: self.current_term,
+                            last_index: inc.last_index,
+                            next_offset: inc.total,
+                        },
+                    )];
+                }
+                Err(_) => {
+                    return vec![(
+                        leader,
+                        RaftMsg::InstallSnapshotResp {
+                            term: self.current_term,
+                            last_index: 0,
+                            next_offset: 0,
+                        },
+                    )];
+                }
+            }
+        }
+
+        // Still in progress: ack how far we've got so the leader sends the next
+        // chunk.
         vec![(
             leader,
             RaftMsg::InstallSnapshotResp {
                 term: self.current_term,
-                last_index,
+                last_index: 0,
+                next_offset,
             },
         )]
     }
@@ -747,19 +881,27 @@ impl RaftCore {
         from: NodeId,
         term: u64,
         last_index: u64,
+        next_offset: u64,
     ) -> Vec<Out> {
         if self.role != Role::Leader || term != self.current_term {
             return Vec::new();
         }
-        let m = self.match_index.entry(from).or_insert(0);
-        *m = (*m).max(last_index);
-        self.next_index.insert(from, last_index + 1);
-        self.maybe_advance_commit();
-        self.apply();
-        if self.next_index.get(&from).copied().unwrap_or(1) <= self.last_log_index() {
-            return vec![self.replicate_to(from)];
+        if last_index > 0 {
+            // Transfer complete: the follower installed the snapshot.
+            self.snapshot_offset.remove(&from);
+            let m = self.match_index.entry(from).or_insert(0);
+            *m = (*m).max(last_index);
+            self.next_index.insert(from, last_index + 1);
+            self.maybe_advance_commit();
+            self.apply();
+            if self.next_index.get(&from).copied().unwrap_or(1) <= self.last_log_index() {
+                return vec![self.replicate_to(from)];
+            }
+            return Vec::new();
         }
-        Vec::new()
+        // Still mid-transfer: record progress and ship the next chunk.
+        self.snapshot_offset.insert(from, next_offset);
+        vec![self.replicate_to(from)]
     }
 
     // ---- role transitions & replication ---------------------------------
@@ -801,6 +943,8 @@ impl RaftCore {
             self.next_index.insert(p, last + 1);
             self.match_index.insert(p, 0);
         }
+        // A fresh term restarts any snapshot transfer from offset 0.
+        self.snapshot_offset.clear();
         // No-op entry so prior-term entries can be committed under our term.
         self.log_append(LogEntry {
             term: self.current_term,
@@ -820,18 +964,10 @@ impl RaftCore {
     fn replicate_to(&self, peer: NodeId) -> Out {
         let next = self.next_index.get(&peer).copied().unwrap_or(1).max(1);
         // The entry before `next` is in our snapshot (or earlier) — we can't form
-        // a valid `prev_log_term`, so ship the snapshot instead.
+        // a valid `prev_log_term`, so ship the snapshot instead, as the next
+        // offset-addressed chunk for this peer.
         if next <= self.snapshot_index {
-            return (
-                peer,
-                RaftMsg::InstallSnapshot {
-                    term: self.current_term,
-                    leader: self.id,
-                    last_index: self.snapshot_index,
-                    last_term: self.snapshot_term,
-                    metadata: self.metadata.clone(),
-                },
-            );
+            return self.snapshot_chunk_for(peer);
         }
         let prev_log_index = next - 1;
         let prev_log_term = self.term_at(prev_log_index);
@@ -850,6 +986,38 @@ impl RaftCore {
                 prev_log_term,
                 entries,
                 leader_commit: self.commit_index,
+            },
+        )
+    }
+
+    /// Build the next `InstallSnapshot` chunk for `peer`, starting at the byte
+    /// offset recorded in `snapshot_offset` (0 if no transfer is in flight).
+    /// Pure: it serializes the current `metadata` and slices out one chunk, so
+    /// repeated calls at the same offset are byte-identical and deterministic.
+    fn snapshot_chunk_for(&self, peer: NodeId) -> Out {
+        let serialized = serde_json::to_vec(&self.metadata).expect("metadata serializes");
+        let total = serialized.len() as u64;
+        let offset = self
+            .snapshot_offset
+            .get(&peer)
+            .copied()
+            .unwrap_or(0)
+            .min(total);
+        let start = offset as usize;
+        let end = (start + SNAPSHOT_CHUNK_BYTES).min(serialized.len());
+        let data = serialized[start..end].to_vec();
+        let done = end as u64 == total;
+        (
+            peer,
+            RaftMsg::InstallSnapshot {
+                term: self.current_term,
+                leader: self.id,
+                last_index: self.snapshot_index,
+                last_term: self.snapshot_term,
+                offset,
+                data,
+                total,
+                done,
             },
         )
     }

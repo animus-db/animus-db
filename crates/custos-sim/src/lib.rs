@@ -308,8 +308,30 @@ impl Simulator {
     }
 
     /// Bring a crashed `node` back. Its durable disk state remains.
+    ///
+    /// Crashing a node drops the waker of any task parked on `recv()` (the inbox
+    /// is volatile), so nothing would re-poll that task — a later delivery would
+    /// find no registered `recv` waker and the task would never wake. To repair
+    /// this, `restart` re-arms every task owned by the node: it marks them ready
+    /// so the run loop re-polls them, which re-registers their `recv` waker.
+    /// Re-polling a parked `Recv` on an empty inbox is a side-effect-free,
+    /// idempotent reinstallation — it draws no RNG and schedules no timeline
+    /// event, so determinism is preserved. Tasks are re-armed in ascending id
+    /// order (the `BTreeMap` iteration order), keeping the ready-queue order a
+    /// deterministic function of the seed.
     pub fn restart(&self, node: NodeId) {
-        self.shared.lock().crashed.remove(&node);
+        let tasks: Vec<TaskId> = {
+            let mut st = self.shared.lock();
+            st.crashed.remove(&node);
+            st.task_owner
+                .iter()
+                .filter(|&(_, &owner)| owner == node)
+                .map(|(&task, _)| task)
+                .collect()
+        };
+        for task in tasks {
+            self.shared.push_ready(task);
+        }
     }
 
     /// Stop `node` as if its process exited: drop all of its tasks (their

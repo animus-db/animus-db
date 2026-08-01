@@ -31,6 +31,14 @@ function of one seed. This is the substrate every distributed test runs on.
 - `crash(node)` drops un-synced disk + the inbox **and mutes the node's
   outbound sends** (a dead node emits nothing); deliveries to a crashed node are
   dropped until `restart`.
+- `restart(node)` **re-arms** the node's tasks: it clears `crashed` *and* marks
+  every task the node owns ready so the run loop re-polls them. This is load-
+  bearing — crashing drops the waker of any task parked on `recv()` (the inbox is
+  volatile), so without the re-poll a later delivery would find no registered
+  recv waker and the task would never wake again. Re-polling a parked `Recv` on
+  an empty inbox is side-effect-free (no RNG, no timeline event), and tasks are
+  re-armed in ascending id order, so determinism holds. Regression test:
+  `determinism.rs::restart_resumes_a_parked_recv`.
 - `stop(node)` models a **process exit**: it removes the node's tasks (each
   spawned task is tagged with its owner node id) and volatile state (inbox,
   un-synced disk), keeping durable disk. Start a fresh node on the same id
