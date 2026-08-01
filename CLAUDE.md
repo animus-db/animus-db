@@ -14,7 +14,11 @@ Status: pre-alpha. Implemented: the scaffold, the `Env` seam, storage (in-memory
 log-truncating snapshots with `InstallSnapshot`),
 the quorum data-plane vertical slice (with read-repair, background
 anti-entropy convergence, and delete/tombstone propagation), tablet split/merge
-+ multi-tablet routing, the Elle-style recorder/checker (`custos-test`), a
++ multi-tablet routing, the Elle-style recorder/checker (`custos-test`) — now
+including an **end-to-end correctness test of the assembled stack** (control
+plane + data plane at scale: 3 Raft nodes, 2 tablets, 6 replicas, 4 concurrent
+clients) under fault injection (partition + leader kill + crash + heal), checked
+for serializability/durability/convergence — a
 DynamoDB-style item API over the core plus a **minimal DynamoDB JSON wire
 protocol** (`custos-dynamo`: PutItem/GetItem/DeleteItem AttributeValue-JSON
 translation), a **runnable node + CLI** assembling the planes over `ProdEnv` and
