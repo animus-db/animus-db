@@ -1,7 +1,7 @@
 //! The DynamoDB-style item API maps onto the storage core: put/get/delete and
 //! ordered Query within a partition, over the in-memory engine.
 
-use custos_dynamo::{AttributeValue as Av, Item, Table, TableSchema};
+use custos_dynamo::{AttributeValue as Av, Item, SortKeyCondition, Table, TableSchema};
 use custos_storage::MemoryEngine;
 
 fn item(pairs: &[(&str, Av)]) -> Item {
@@ -70,6 +70,51 @@ fn query_returns_a_partition_ordered_by_sort_key() {
 
     // The other partition is isolated.
     assert_eq!(table.query(&Av::S("p2".into())).unwrap().len(), 1);
+}
+
+#[test]
+fn query_with_sort_conditions_narrows_a_partition() {
+    let table = Table::new(MemoryEngine::new(), TableSchema::composite("pk", "sk"));
+    for sk in ["a", "ab", "abc", "b", "c"] {
+        table
+            .put_item(item(&[("pk", Av::S("p".into())), ("sk", Av::S(sk.into()))]))
+            .unwrap();
+    }
+    let sks = |rows: Vec<Item>| -> Vec<String> {
+        rows.iter()
+            .map(|r| match r.get("sk").unwrap() {
+                Av::S(s) => s.clone(),
+                other => panic!("unexpected sk {other:?}"),
+            })
+            .collect()
+    };
+
+    let eq = table
+        .query_with(
+            &Av::S("p".into()),
+            Some(&SortKeyCondition::Equals(Av::S("b".into()))),
+        )
+        .unwrap();
+    assert_eq!(sks(eq), vec!["b".to_string()]);
+
+    let between = table
+        .query_with(
+            &Av::S("p".into()),
+            Some(&SortKeyCondition::Between(
+                Av::S("ab".into()),
+                Av::S("b".into()),
+            )),
+        )
+        .unwrap();
+    assert_eq!(sks(between), vec!["ab", "abc", "b"]);
+
+    let begins = table
+        .query_with(
+            &Av::S("p".into()),
+            Some(&SortKeyCondition::BeginsWith(Av::S("ab".into()))),
+        )
+        .unwrap();
+    assert_eq!(sks(begins), vec!["ab", "abc"]);
 }
 
 #[test]

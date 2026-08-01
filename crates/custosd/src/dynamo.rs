@@ -18,33 +18,72 @@
 //!
 //! ## Operations and storage mapping
 //!
-//! Supported: `PutItem`, `GetItem`, `DeleteItem`. The data-plane key for an
-//! item is `escape(table) || escape(pk) || sk` (so tables share one keyspace
-//! without colliding). The data plane has no native delete, so `DeleteItem`
-//! writes a tombstone value that `GetItem` reads back as absent.
+//! Supported: `CreateTable`, `PutItem`, `GetItem`, `DeleteItem`, `Query`. The
+//! data-plane key for an item is `escape(table) || escape(pk) || sk` (so tables
+//! share one keyspace without colliding). The data plane has no native delete,
+//! so `DeleteItem` writes a tombstone value that `GetItem` reads back as absent.
 //!
-//! ## Schema simplification
+//! ## Per-table schemas (CreateTable)
 //!
-//! DynamoDB tables are created with an explicit key schema (CreateTable). We do
-//! not implement CreateTable yet, so this edge uses a **fixed convention**: the
-//! partition key is the attribute named `pk` and the optional sort key is named
-//! `sk`. A request whose `Key`/`Item` lacks `pk` is a `ValidationException`.
-//! CreateTable and per-table schemas are deferred.
+//! `CreateTable` records a table's key schema in a process-wide
+//! [`SchemaRegistry`]. Later requests resolve their key attributes against it,
+//! so the key convention is no longer hard-coded. For backward compatibility, a
+//! request against a table that was never `CreateTable`d **auto-registers** the
+//! legacy convention (partition key `pk`, optional sort key `sk`).
+//!
+//! The registry is **in-memory and not durable**: schemas (and the `Query` key
+//! index below) are lost on restart, and in the single-process `--cluster N`
+//! dev mode every node shares one registry (in a one-process-per-node
+//! deployment each process keeps its own). Replicating schemas through the
+//! control plane is future work.
+//!
+//! ## Query
+//!
+//! The data plane has no quorum range scan (only point read/write/delete), so
+//! `Query` is served by tracking, per table, the storage keys of written items
+//! ([`SchemaRegistry::query_keys`]) and quorum-reading each matching key through
+//! the same coordinator. The partition (`pk = ..`) plus an optional sort-key
+//! condition (`=`, `BETWEEN`, `begins_with`) selects the contiguous key
+//! sub-range; tombstoned/absent keys are skipped. Like the schema map, the key
+//! index is in-memory and observation-built.
 
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use custos_dynamo::wire::{self, Operation, WireError};
-use custos_dynamo::{AttributeValue, Item, storage_key};
+use custos_dynamo::{
+    AttributeValue, ConditionExpression, Item, SchemaRegistry, SortKeyCondition, storage_key,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::ClientCtx;
 
-/// The convention partition-key attribute name (no CreateTable yet).
-const PARTITION_KEY: &str = "pk";
-/// The convention sort-key attribute name (optional).
-const SORT_KEY: &str = "sk";
 const DYNAMO_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Process-wide table-schema + Query-key registry. Not durable; see module docs.
+fn registry() -> &'static Mutex<SchemaRegistry> {
+    static REGISTRY: OnceLock<Mutex<SchemaRegistry>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(SchemaRegistry::new()))
+}
+
+/// Resolve `table`'s key attribute values from `item`. A registered table uses
+/// its recorded schema; an unregistered table falls back to the legacy
+/// convention (partition key `pk` required, sort key `sk` optional), so
+/// pre-`CreateTable` clients keep working without change.
+fn resolve_key(
+    table: &str,
+    item: &Item,
+) -> Result<(AttributeValue, Option<AttributeValue>), WireError> {
+    let mut reg = registry().lock().expect("registry poisoned");
+    if !reg.has_table(table) {
+        // Pre-CreateTable clients keep working under the legacy `pk`/`sk`
+        // convention (pk required, sk optional); this also lets `Query` track
+        // the table's keys.
+        reg.create_table_legacy(table);
+    }
+    reg.extract_key(table, item).map_err(registry_error)
+}
 /// Cap on a request body, so a malformed `Content-Length` can't exhaust memory.
 const MAX_BODY: usize = 1 << 20;
 
@@ -210,43 +249,142 @@ fn error_status(err: &WireError) -> u16 {
 /// Execute a decoded operation against the data plane via the shared coordinator.
 async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireError> {
     match op {
-        Operation::PutItem { table, item } => {
-            let (pk, sk) = extract_key(&item)?;
-            let key = data_key(&table, &pk, sk.as_ref());
+        Operation::CreateTable { table, schema } => {
+            registry()
+                .lock()
+                .expect("registry poisoned")
+                .create_table(&table, schema.clone())
+                .map_err(registry_error)?;
+            Ok(wire::create_table_response(&table, &schema))
+        }
+        Operation::PutItem {
+            table,
+            item,
+            condition,
+        } => {
+            let (pk, sk) = resolve_key(&table, &item)?;
+            let within = storage_key(&pk, sk.as_ref());
+            let key = data_key(&table, &within);
+            if let Some(cond) = &condition {
+                check_condition(ctx, &key, cond).await?;
+            }
             let value = wire::encode_stored_item(&item);
             quorum_write(ctx, &key, &value).await?;
+            note_put(&table, &within);
             Ok(wire::empty_response())
         }
-        Operation::DeleteItem { table, key } => {
-            let (pk, sk) = extract_key(&key)?;
-            let data_key = data_key(&table, &pk, sk.as_ref());
+        Operation::DeleteItem {
+            table,
+            key,
+            condition,
+        } => {
+            let (pk, sk) = resolve_key(&table, &key)?;
+            let within = storage_key(&pk, sk.as_ref());
+            let data_key = data_key(&table, &within);
+            if let Some(cond) = &condition {
+                check_condition(ctx, &data_key, cond).await?;
+            }
             let value = wire::encode_tombstone();
             quorum_write(ctx, &data_key, &value).await?;
+            note_delete(&table, &within);
             Ok(wire::empty_response())
         }
         Operation::GetItem { table, key } => {
-            let (pk, sk) = extract_key(&key)?;
-            let data_key = data_key(&table, &pk, sk.as_ref());
+            let (pk, sk) = resolve_key(&table, &key)?;
+            let data_key = data_key(&table, &storage_key(&pk, sk.as_ref()));
             let item = quorum_read(ctx, &data_key).await?;
             Ok(wire::get_item_response(item.as_ref()))
         }
+        Operation::Query {
+            table,
+            partition_value,
+            sort_condition,
+        } => run_query(ctx, &table, &partition_value, sort_condition.as_ref()).await,
     }
 }
 
-/// Pull the convention key attributes (`pk`, optional `sk`) out of an item.
-fn extract_key(item: &Item) -> Result<(AttributeValue, Option<AttributeValue>), WireError> {
-    let pk = item.get(PARTITION_KEY).cloned().ok_or_else(|| WireError {
-        code: "ValidationException",
-        message: format!("item is missing the partition-key attribute `{PARTITION_KEY}`"),
-    })?;
-    let sk = item.get(SORT_KEY).cloned();
-    Ok((pk, sk))
+/// Resolve the partition's matching within-table keys from the registry, then
+/// quorum-read each to assemble the result (the data plane has no range scan).
+async fn run_query(
+    ctx: &ClientCtx,
+    table: &str,
+    partition_value: &AttributeValue,
+    sort_condition: Option<&SortKeyCondition>,
+) -> Result<String, WireError> {
+    let within_keys = {
+        let reg = registry().lock().expect("registry poisoned");
+        reg.query_keys(table, partition_value, sort_condition)
+            .map_err(registry_error)?
+    };
+    let mut items = Vec::with_capacity(within_keys.len());
+    for within in &within_keys {
+        let data_key = data_key(table, within);
+        if let Some(item) = quorum_read(ctx, &data_key).await? {
+            items.push(item);
+        }
+    }
+    Ok(wire::query_response(&items))
 }
 
-/// The data-plane key for an item: `escape(table) || storage_key(pk, sk)`.
-fn data_key(table: &str, pk: &AttributeValue, sk: Option<&AttributeValue>) -> Vec<u8> {
+/// Enforce a `ConditionExpression` by reading the current item under the coord
+/// lock; a false predicate is a `ConditionalCheckFailedException`.
+async fn check_condition(
+    ctx: &ClientCtx,
+    key: &[u8],
+    condition: &ConditionExpression,
+) -> Result<(), WireError> {
+    let current = quorum_read(ctx, key).await?;
+    if condition.evaluate(current.as_ref()) {
+        Ok(())
+    } else {
+        Err(WireError::conditional_check_failed(
+            "the conditional request failed",
+        ))
+    }
+}
+
+fn note_put(table: &str, within_key: &[u8]) {
+    let mut reg = registry().lock().expect("registry poisoned");
+    if !reg.has_table(table) {
+        reg.create_table_legacy(table);
+    }
+    let _ = reg.note_put(table, within_key);
+}
+
+fn note_delete(table: &str, within_key: &[u8]) {
+    let mut reg = registry().lock().expect("registry poisoned");
+    let _ = reg.note_delete(table, within_key);
+}
+
+/// Map a registry error to a DynamoDB wire error code.
+fn registry_error(err: custos_dynamo::RegistryError) -> WireError {
+    use custos_dynamo::RegistryError as R;
+    match err {
+        R::NoSuchTable(t) => WireError {
+            code: "ResourceNotFoundException",
+            message: format!("table `{t}` does not exist"),
+        },
+        R::TableExists(t) => WireError {
+            code: "ResourceInUseException",
+            message: format!("table `{t}` already exists"),
+        },
+        R::MissingKey(k) => WireError {
+            code: "ValidationException",
+            message: format!("missing key attribute `{k}`"),
+        },
+        R::SortKeyMismatch(t) => WireError {
+            code: "ValidationException",
+            message: format!("table `{t}` has no sort key for this condition"),
+        },
+    }
+}
+
+/// The data-plane key for an item: `escape(table) || within_key`, where
+/// `within_key` is `storage_key(pk, sk)`. Sharing one keyspace, tables don't
+/// collide because the escaped table name is prefix-free.
+fn data_key(table: &str, within_key: &[u8]) -> Vec<u8> {
     let mut key = storage_key(&AttributeValue::S(table.to_owned()), None);
-    key.extend_from_slice(&storage_key(pk, sk));
+    key.extend_from_slice(within_key);
     key
 }
 
