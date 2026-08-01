@@ -35,12 +35,30 @@ edge is production-only I/O (hand-rolled over a tokio `TcpListener`, mirroring
 paths. The data plane has no native delete yet (ADR 0010), so `DeleteItem`
 writes a tombstone value that `GetItem` reads back as absent.
 
-What remains is the rest of the surface: `Query`/`Scan` over the wire,
-conditional/`ReturnValues` semantics, document/set attribute types, an explicit
-`CreateTable` with per-table key schemas (the wire edge currently uses a fixed
-`pk`/`sk` convention), and the parallel CQL binary protocol framing plus a
-parser/type system. `custos-cql` stays a skeleton that maps onto the same core
-in the same way.
+A third slice now exists on the CQL side: a **minimal Cassandra CQL v4 binary
+protocol** is served alongside the DynamoDB endpoint. `custos-cql` is the pure,
+deterministic protocol layer — frame header (version/flags/stream/opcode/length)
+encode/decode, the body primitives the handshake needs, and a deliberately tiny
+CQL recognizer that extracts the operation + primary key (+ value) from a single
+`INSERT INTO t (pk, v) VALUES (..)` or `SELECT * FROM t WHERE pk = ..` (it is not
+a CQL grammar). `custosd` exposes a real TCP endpoint that does the
+`STARTUP → READY` (and `OPTIONS → SUPPORTED`) handshake and routes those two
+statements **through the same quorum coordinator** the plain-TCP and DynamoDB
+edges use; an `INSERT` replies `RESULT/Void`, a `SELECT` replies `RESULT/Rows`.
+Like the DynamoDB endpoint it is production-only I/O (real tokio sockets +
+hand-rolled framing, no third-party CQL/Cassandra crate); everything below the
+socket stays on the `Env`-based paths. There is no schema catalog yet, so a row
+is a fixed `(pk, v)` pair keyed by the partition key (data-plane key
+`escape(table) || pk_bytes`).
+
+What remains is the rest of both surfaces. DynamoDB: `Query`/`Scan` over the
+wire, conditional/`ReturnValues` semantics, document/set attribute types, an
+explicit `CreateTable` with per-table key schemas (the wire edge currently uses
+a fixed `pk`/`sk` convention). CQL: a real type system + column metadata, a
+proper CQL grammar (prepared statements, batches, clustering columns, more
+statement kinds), `USE`/keyspaces and `CREATE TABLE`, paging, authentication,
+and honoring the requested consistency level (currently ignored). Both surfaces
+share the same fixed key-attribute convention until `CreateTable` lands.
 
 ## Consequences
 

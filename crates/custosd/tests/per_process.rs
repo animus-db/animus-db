@@ -48,14 +48,15 @@ fn free_addrs(count: usize) -> Vec<SocketAddr> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn per_process_nodes_form_a_cluster_from_shared_config() {
     let n = 3;
-    let addrs = free_addrs(n * 5);
+    let addrs = free_addrs(n * 6);
     let nodes_cfg: Vec<RoleAddrs> = (0..n)
         .map(|i| RoleAddrs {
-            control: addrs[5 * i],
-            data: addrs[5 * i + 1],
-            coord: addrs[5 * i + 2],
-            client: addrs[5 * i + 3],
-            dynamo: addrs[5 * i + 4],
+            control: addrs[6 * i],
+            data: addrs[6 * i + 1],
+            coord: addrs[6 * i + 2],
+            client: addrs[6 * i + 3],
+            dynamo: addrs[6 * i + 4],
+            cql: addrs[6 * i + 5],
         })
         .collect();
     let config = ClusterConfig {

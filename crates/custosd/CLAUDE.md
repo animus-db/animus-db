@@ -13,7 +13,7 @@ CLI wrapper. `custos-cli` depends on this crate for the client protocol types.
 - `Node::bind` → `BoundNode::start` — two-phase construction (bind listeners,
   then install the peer address book and start protocols), so a cluster can use
   ephemeral ports and exchange addresses afterward.
-- `config::ClusterConfig` — the per-process deployment config (every node's four
+- `config::ClusterConfig` — the per-process deployment config (every node's six
   addresses + quorum sizes). Node ids follow a fixed convention from the index
   (control `i`, data `100+i`, coord `200+i`) so processes agree without listing
   ids. `run_node(config, index, dir)` binds *this* node and starts it.
@@ -25,6 +25,11 @@ CLI wrapper. `custos-cli` depends on this crate for the client protocol types.
   per node). A hand-rolled HTTP/1.1 server decodes `X-Amz-Target` +
   AttributeValue-JSON via `custos_dynamo::wire`, then routes through the **same
   `ClientCtx`** (coordinator + cached routing view) as the plain-TCP API.
+- `cql` module — the **CQL (Cassandra) v4 binary-protocol endpoint** (a sixth
+  listener per node). A hand-rolled framed server does the `STARTUP → READY` /
+  `OPTIONS → SUPPORTED` handshake and a tiny `QUERY` path (`INSERT`/`SELECT`)
+  via the pure `custos_cql` crate, routing through the **same `ClientCtx`** as
+  the other edges.
 
 ## What's non-obvious
 
@@ -41,6 +46,12 @@ CLI wrapper. `custos-cli` depends on this crate for the client protocol types.
   The data plane has no native delete, so DynamoDB `DeleteItem` writes a
   tombstone value that `GetItem` reads back as absent. No `CreateTable` yet — the
   edge uses a fixed `pk`/`sk` key-attribute convention.
+- And a **sixth listener, the CQL binary-protocol endpoint** (`RoleAddrs.cql`,
+  `Node::cql_addr`). Same shape: a production-only I/O edge (real tokio sockets +
+  hand-rolled CQL v4 framing in `cql.rs`; the pure protocol logic is in
+  `custos-cql`), routed through the same `ClientCtx`. No schema catalog yet, so a
+  row is the fixed `(pk, v)` convention keyed by the partition key (data-plane
+  key `escape(table) || pk_bytes`); only `INSERT`/`SELECT` are recognized.
 - Writes get a **quorum-derived version** (`DataClient::read_version` + 1), not a
   per-node counter — otherwise two coordinators assign the same version and the
   replica's monotonic-version check silently drops the later write. Global
@@ -54,10 +65,11 @@ CLI wrapper. `custos-cli` depends on this crate for the client protocol types.
 ## Tests / running
 
 `cargo test -p custosd` — `tests/cluster.rs` (in-process cluster),
-`tests/per_process.rs` (nodes started independently from a shared config), and
+`tests/per_process.rs` (nodes started independently from a shared config),
 `tests/dynamo_wire.rs` (PutItem → GetItem → DeleteItem over the real DynamoDB
-JSON/HTTP wire). All use real TCP/time, so they poll with timeouts, not
-deterministic assertions.
+JSON/HTTP wire), and `tests/cql_wire.rs` (STARTUP handshake → INSERT → SELECT
+over the real CQL binary wire). All use real TCP/time, so they poll with
+timeouts, not deterministic assertions.
 
 Per-process run:
 ```sh
