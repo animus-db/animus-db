@@ -1,0 +1,18 @@
+[package]
+name = "custos-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "CustosDB operator CLI."
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "custos"
+path = "src/main.rs"
+
+[dependencies]

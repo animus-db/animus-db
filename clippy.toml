@@ -1,0 +1,7 @@
+# Determinism enforcement (see docs/adr/0003). System logic must not depend on
+# the iteration order of hashed collections. Tests and non-logic code that
+# genuinely need a hash map can opt out with #[allow(clippy::disallowed_types)].
+disallowed-types = [
+    { path = "std::collections::HashMap", reason = "nondeterministic iteration order; use BTreeMap" },
+    { path = "std::collections::HashSet", reason = "nondeterministic iteration order; use BTreeSet" },
+]

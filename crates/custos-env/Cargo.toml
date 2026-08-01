@@ -1,0 +1,14 @@
+[package]
+name = "custos-env"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "CustosDB Env seam: Clock/Rng/Network/Disk/Spawner traits + ProdEnv."
+
+[lints]
+workspace = true
+
+[dependencies]

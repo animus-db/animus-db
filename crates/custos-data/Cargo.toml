@@ -1,0 +1,14 @@
+[package]
+name = "custos-data"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "CustosDB leaderless data plane: quorum read/write, routing, epoch fencing."
+
+[lints]
+workspace = true
+
+[dependencies]

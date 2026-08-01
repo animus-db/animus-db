@@ -1,0 +1,63 @@
+# CustosDB — Cargo workspace root.
+#
+# A masterless, linearly-scalable NoSQL database in Rust. See README.md and the
+# architecture decision records under docs/adr/ for the design rationale.
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85"
+license = "AGPL-3.0-only"
+repository = "https://github.com/custosdb/custosdb"
+authors = ["The CustosDB Authors"]
+
+[workspace.dependencies]
+# Internal crates (path deps so the workspace builds standalone).
+custos-env = { path = "crates/custos-env" }
+custos-sim = { path = "crates/custos-sim" }
+custos-storage = { path = "crates/custos-storage" }
+custos-control = { path = "crates/custos-control" }
+custos-data = { path = "crates/custos-data" }
+custos-tablet = { path = "crates/custos-tablet" }
+custos-placement = { path = "crates/custos-placement" }
+custos-consensus = { path = "crates/custos-consensus" }
+custos-cql = { path = "crates/custos-cql" }
+custos-dynamo = { path = "crates/custos-dynamo" }
+custos-test = { path = "crates/custos-test" }
+
+# Third-party.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = [
+    "rt",
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "io-util",
+    "time",
+    "sync",
+    "fs",
+] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+async-trait = "0.1"
+futures = "0.3"
+rand = "0.8"
+rand_chacha = "0.3"
+proptest = "1"
+thiserror = "2"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+# Determinism is the load-bearing constraint (see docs/adr/0003). HashMap/HashSet
+# iteration order is nondeterministic; system code must use BTreeMap/BTreeSet.
+# These lints are a backstop, not a substitute for review.
+disallowed_types = "warn"
+
+[profile.release]
+debug = 1
