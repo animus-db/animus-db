@@ -17,3 +17,4 @@ relevant ADR (or supersede it) in the same PR as the code change.
 | [0008](0008-borrowed-storage-first.md) | Borrowed storage engine first, custom LSM deferred | Accepted |
 | [0009](0009-in-house-raft-over-env.md) | In-house Raft over the `Env` seam (deviation from openraft) | Accepted |
 | [0010](0010-ap-repair-anti-entropy.md) | AP repair: read-repair + background anti-entropy | Accepted |
+| [0011](0011-accord-consensus.md) | Accord-style leaderless transaction consensus (first minimal slice) | Accepted |
