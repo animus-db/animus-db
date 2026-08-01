@@ -24,13 +24,15 @@ which now also **serves the DynamoDB JSON protocol over HTTP**, routing those
 requests through the same data-plane coordinator — the **topology-aware placement
 engine** (`custos-placement`: residency + failure-domain spread, with the leader
 automatically reconciling tablet placement via control-plane `CasTabletReplicas`),
-and a **first minimal slice of Accord-style leaderless transaction consensus**
+and a **slice of Accord-style leaderless transaction consensus**
 (`custos-consensus`: PreAccept→Commit fast path + PreAccept→Accept→Commit slow
-path, dependency tracking, consistent commit order — but no
-execution/durability/recovery yet; ADR 0011). Skeletons / future work:
+path, dependency tracking, consistent commit order, plus **durable execution** —
+each replica executes committed transactions in agreed order against a WAL it
+recovers from on restart; ADR 0011). Skeletons / future work:
 `custos-cql` (CQL wire protocol), the rest of the DynamoDB surface (Query/Scan,
 CreateTable, conditional writes), and the deferred remainder of Accord
-(execution/Apply, durability, coordinator failover).
+(coordinator failover, the full dependency wait-graph, WAL snapshotting,
+data-plane integration).
 
 ## Per-crate guides
 
@@ -205,8 +207,12 @@ commits at `t0` in one round trip (fast path, when a fast quorum agrees on `t0`
 and deps) or runs an `Accept` round to pick a higher execution timestamp and
 union deps (slow path) before `Commit`. Conflicts are intersecting key sets;
 the slice proves two conflicting transactions commit in a *consistent timestamp
-order on every replica*. **Deferred:** execution/Apply, durability/recovery,
-coordinator failover, the full dependency wait-graph, and sharding — see ADR
+order on every replica*. Each replica then **executes** committed transactions
+in agreed `(execute_at, txn)` order (blocking on earlier-ordered conflicts) and
+**durably**: `AccordCore` emits `WalRecord`s the `AccordNode` driver fsyncs to
+`accord.wal` before acting and recovers on restart — mirroring `RaftCore`'s WAL.
+**Deferred:** coordinator failover, the full dependency wait-graph, WAL
+snapshotting, data-plane/`StorageEngine` integration, and sharding — see ADR
 0011 and the crate guide.
 
 ### Storage (`custos-storage`)

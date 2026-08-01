@@ -12,7 +12,9 @@ use serde::{Deserialize, Serialize};
 /// A transaction timestamp: a logical clock value tagged with the node that
 /// minted it. Ordered first by `logical`, then by `node`, so the order is total
 /// and every distinct `(logical, node)` is unique.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
+)]
 pub struct Timestamp {
     /// The logical-clock component. Advanced past every timestamp this node has
     /// observed, so it never goes backwards.

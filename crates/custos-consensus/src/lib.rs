@@ -26,26 +26,37 @@
 //! - Totally-ordered [`Timestamp`]s with a per-node [`LogicalClock`].
 //! - A thin [`AccordNode`] driver over the `Env` seam.
 //!
+//! ## What this slice now does (execution + durability milestone)
+//!
+//! - **Execution / Apply**: a committed transaction is executed (applied to a
+//!   small opaque key→last-writer store) in agreed `(execute_at, txn)` order,
+//!   only after every dependency that orders before it has executed — a
+//!   per-replica execution queue, so every replica applies conflicting
+//!   transactions in the **same order**.
+//! - **Durability / recovery**: [`AccordCore`] emits [`WalRecord`]s at each
+//!   phase transition; [`AccordNode`] fsyncs them before acting and recovers the
+//!   core from the WAL on restart — mirroring `RaftCore`.
+//!
 //! ## What this slice deliberately does NOT do (see ADR 0011)
 //!
-//! - **Execution / Apply**: transactions agree on an order but no effect is
-//!   applied to storage; there is no integration with the data plane yet.
-//! - **Durability / recovery**: the core keeps state in memory; there is no WAL
-//!   and no recovery (contrast `RaftCore`, which already has both).
 //! - **Coordinator failover / recovery**: a coordinator that dies mid-flight
-//!   strands its transaction; there is no recovery coordinator.
-//! - **The full dependency wait-graph**: we record deps and can show two
-//!   conflicting transactions commit in a consistent order, but do not implement
-//!   the execution-time blocking-on-deps semantics in full.
-//! - **Contention / livelock handling, the precise fast-path quorum bound, and
-//!   sharding/placement** (one global replica set for now).
+//!   strands its transaction; there is no recovery coordinator. (A *replica*
+//!   restart is now recovered.)
+//! - **Full data-plane / `StorageEngine` integration**: the executed store here
+//!   is a stand-in to demonstrate consistent order, not the real data plane.
+//! - **WAL snapshotting / log truncation**: the WAL holds the full
+//!   per-transaction history (no compaction yet — contrast `RaftCore`).
+//! - **Contention / livelock handling, timeouts/retries, the precise fast-path
+//!   quorum bound, and sharding/placement** (one global replica set for now).
 
 mod core;
 mod message;
 mod node;
+mod persist;
 mod timestamp;
 
 pub use crate::core::{AccordCore, Decision, Key, Phase, TxnId};
 pub use crate::message::{AccordMsg, Out};
 pub use crate::node::AccordNode;
+pub use crate::persist::{PersistedState, PersistedTxn, WalRecord};
 pub use crate::timestamp::{LogicalClock, Timestamp};

@@ -26,18 +26,35 @@
 //!   highest returned timestamp, unions the deps, and runs an Accept round before
 //!   committing.
 //!
-//! **Deliberately out of scope** (see ADR 0011): execution/Apply of the
-//! transaction effect, durability/recovery, coordinator failover, and the
-//! dependency *wait graph* for cross-key serializability — we record deps and
-//! check the simple "all deps committed earlier" condition, which is enough to
-//! prove two conflicting transactions commit in a consistent timestamp order on
-//! every replica, but is not a full execution protocol.
+//! **Execution / Apply (this milestone).** Once a transaction commits, the
+//! replica executes it — but only in agreed-timestamp order and only after every
+//! conflicting dependency that orders before it has itself executed. This is a
+//! per-replica execution queue: a committed transaction becomes *applicable*
+//! when every dependency is known-committed (so we know its `execute_at`) and
+//! every dependency that orders before it has already applied; applicable
+//! transactions are then drained in `(execute_at, txn)` order. The effect is an
+//! opaque op against a tiny in-memory key→last-writer store, enough to
+//! demonstrate that every replica applies conflicting transactions in the
+//! **same order**.
+//!
+//! **Durability (this milestone).** The core emits [`WalRecord`]s at each phase
+//! transition (`PreAccept`/`Accept`/`Commit`/`Apply`); the [`crate::node`]
+//! driver fsyncs them before acting, and [`AccordCore::recovered`] rebuilds the
+//! core from a replayed [`crate::persist::PersistedState`] — mirroring
+//! `custos-control`'s `RaftCore`. The core itself stays synchronous and
+//! I/O-free; it only *accumulates* records in `pending`, which the driver
+//! drains.
+//!
+//! **Deliberately out of scope** (see ADR 0011): coordinator failover, the full
+//! data-plane/`StorageEngine` integration (the store here is a stand-in),
+//! sharding, and timeout/livelock handling.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use custos_env::NodeId;
 
 use crate::message::{AccordMsg, Out};
+use crate::persist::{PersistedState, WalRecord};
 use crate::timestamp::{LogicalClock, Timestamp};
 
 /// A transaction identifier: its original proposed timestamp `t0`, which is
@@ -49,15 +66,28 @@ pub type TxnId = Timestamp;
 /// `u64` for this slice; the real system will key by partition/range.
 pub type Key = u64;
 
-/// The lifecycle phase of a transaction at a replica.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The lifecycle phase of a transaction at a replica. Ordered by progress
+/// (`PreAccepted < Accepted < Committed < Applied`); a phase never moves
+/// backwards, which [`Phase::max_phase`] enforces on replay/merge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub enum Phase {
     /// Seen via `PreAccept`; `t0` witnessed, not yet given a final timestamp.
+    #[default]
     PreAccepted,
     /// A coordinator-chosen execution timestamp adopted via `Accept`.
     Accepted,
     /// Final `(execute_at, deps)` recorded via `Commit`.
     Committed,
+    /// The transaction's effect has been executed against the store.
+    Applied,
+}
+
+impl Phase {
+    /// The further-along of two phases (phases only ever advance).
+    #[must_use]
+    pub fn max_phase(self, other: Phase) -> Phase {
+        self.max(other)
+    }
 }
 
 /// What a replica knows about one transaction.
@@ -112,6 +142,18 @@ pub struct AccordCore {
     coordinating: BTreeMap<TxnId, Coordinating>,
     /// Decisions reached as coordinator, in the order they were reached.
     decisions: Vec<Decision>,
+
+    /// The executed effect: the opaque per-key state. The op of a transaction
+    /// is "write your own id to every key you touch", so a key maps to the
+    /// `TxnId` of the last transaction that executed over it. The point is not
+    /// the value but that every replica produces the *same* key→writer mapping
+    /// because it executes conflicting transactions in the same order.
+    store: BTreeMap<Key, TxnId>,
+    /// The order in which this replica has executed (applied) transactions.
+    applied_order: Vec<TxnId>,
+    /// Durable-state records the driver must fsync before acting on them. The
+    /// core only accumulates; [`AccordCore::drain_persist`] hands them off.
+    pending: Vec<WalRecord>,
 }
 
 impl AccordCore {
@@ -129,7 +171,50 @@ impl AccordCore {
             txns: BTreeMap::new(),
             coordinating: BTreeMap::new(),
             decisions: Vec::new(),
+            store: BTreeMap::new(),
+            applied_order: Vec::new(),
+            pending: Vec::new(),
         }
+    }
+
+    /// Rebuild a core for `id` from a replayed [`PersistedState`] (recovery after
+    /// a restart). Replica facts and the executed store/order are restored from
+    /// the WAL; coordinator state is *not* recovered (a coordinator that died
+    /// mid-flight strands its transaction — see ADR 0011). The logical clock is
+    /// advanced past every timestamp seen so freshly-minted stamps stay
+    /// monotonic. No new `pending` records are produced: recovery is silent.
+    #[must_use]
+    pub fn recovered(id: NodeId, all_nodes: &[NodeId], state: PersistedState) -> AccordCore {
+        let mut core = AccordCore::new(id, all_nodes);
+        for (txn, p) in state.txns {
+            core.clock.witness(txn);
+            core.clock.witness(p.execute_at);
+            // An applied transaction recovers to the `Applied` phase even though
+            // the phase-bearing records only reach `Committed`; the separate
+            // `Applied` WAL record sets `p.applied`.
+            let phase = if p.applied { Phase::Applied } else { p.phase };
+            core.txns.insert(
+                txn,
+                ReplicaTxn {
+                    keys: p.keys,
+                    execute_at: p.execute_at,
+                    deps: p.deps,
+                    phase,
+                },
+            );
+        }
+        // Rebuild the executed store by replaying the recovered apply order. The
+        // order is durable (WAL `Applied` records), so the store is identical to
+        // pre-crash.
+        for txn in state.applied_order {
+            core.applied_order.push(txn);
+            if let Some(t) = core.txns.get(&txn) {
+                for &k in &t.keys {
+                    core.store.insert(k, txn);
+                }
+            }
+        }
+        core
     }
 
     // ---- quorum arithmetic ----------------------------------------------
@@ -162,13 +247,14 @@ impl AccordCore {
         &self.decisions
     }
 
-    /// The committed execution timestamp this replica recorded for `txn`, if it
-    /// has reached the committed phase here.
+    /// The agreed execution timestamp this replica recorded for `txn`, if it has
+    /// reached the committed phase here (committed *or* already applied — both
+    /// carry the final timestamp).
     #[must_use]
     pub fn committed_execute_at(&self, txn: TxnId) -> Option<Timestamp> {
         self.txns
             .get(&txn)
-            .filter(|t| t.phase == Phase::Committed)
+            .filter(|t| t.phase >= Phase::Committed)
             .map(|t| t.execute_at)
     }
 
@@ -178,13 +264,44 @@ impl AccordCore {
         self.txns.get(&txn).map(|t| t.phase)
     }
 
-    /// The dependencies this replica recorded for `txn` at commit, if committed.
+    /// The dependencies this replica recorded for `txn`, if it is committed *or*
+    /// applied (both have the final `(execute_at, deps)`).
     #[must_use]
     pub fn committed_deps(&self, txn: TxnId) -> Option<BTreeSet<TxnId>> {
         self.txns
             .get(&txn)
-            .filter(|t| t.phase == Phase::Committed)
+            .filter(|t| t.phase >= Phase::Committed)
             .map(|t| t.deps.clone())
+    }
+
+    /// The order in which this replica has executed (applied) transactions. The
+    /// core property: two replicas that have applied the same set of conflicting
+    /// transactions produce the same relative order here.
+    #[must_use]
+    pub fn applied_order(&self) -> &[TxnId] {
+        &self.applied_order
+    }
+
+    /// The last transaction that executed a write over `key` at this replica, if
+    /// any — the opaque store the test inspects for cross-replica agreement.
+    #[must_use]
+    pub fn store_writer(&self, key: Key) -> Option<TxnId> {
+        self.store.get(&key).copied()
+    }
+
+    /// Whether this replica has executed `txn`.
+    #[must_use]
+    pub fn is_applied(&self, txn: TxnId) -> bool {
+        self.txns
+            .get(&txn)
+            .is_some_and(|t| t.phase == Phase::Applied)
+    }
+
+    /// Take the durable-state records accumulated since the last drain. The
+    /// driver appends and `fsync`s these before sending outbound messages or
+    /// otherwise acting on them.
+    pub fn drain_persist(&mut self) -> Vec<WalRecord> {
+        std::mem::take(&mut self.pending)
     }
 
     // ---- coordinator entry point ----------------------------------------
@@ -323,6 +440,15 @@ impl AccordCore {
         entry.deps.extend(deps.iter().copied());
         let reply_deps = entry.deps.clone();
         let reply_ts = entry.execute_at;
+        let record_keys = entry.keys.clone();
+        // Durable before we reply: the coordinator's quorum counts a PreAcceptOk
+        // only after it is on this replica's disk.
+        self.pending.push(WalRecord::PreAccepted {
+            txn,
+            keys: record_keys,
+            execute_at: reply_ts,
+            deps: reply_deps.clone(),
+        });
         (reply_ts, reply_deps)
     }
 
@@ -341,11 +467,18 @@ impl AccordCore {
         if entry.phase == Phase::PreAccepted {
             entry.phase = Phase::Accepted;
         }
+        let record_ts = entry.execute_at;
+        let record_deps = entry.deps.clone();
+        self.pending.push(WalRecord::Accepted {
+            txn,
+            execute_at: record_ts,
+            deps: record_deps,
+        });
     }
 
-    /// Replica side of `Commit`: record the final execution timestamp and deps.
-    /// This is the durable agreement point in the full protocol; here it just
-    /// marks the replica entry committed (no execution — see ADR 0011).
+    /// Replica side of `Commit`: record the final execution timestamp and deps —
+    /// the durable agreement point — then try to execute any transactions that
+    /// have become applicable.
     fn replica_commit(&mut self, txn: TxnId, execute_at: Timestamp, deps: BTreeSet<TxnId>) {
         self.clock.witness(execute_at);
         let entry = self.txns.entry(txn).or_insert_with(|| ReplicaTxn {
@@ -354,9 +487,107 @@ impl AccordCore {
             deps: BTreeSet::new(),
             phase: Phase::Committed,
         });
+        // A txn already applied stays applied (idempotent under a duplicate
+        // Commit); otherwise mark it committed and (re)record the final state.
+        if entry.phase < Phase::Committed {
+            entry.phase = Phase::Committed;
+        }
         entry.execute_at = execute_at;
-        entry.deps = deps;
-        entry.phase = Phase::Committed;
+        entry.deps = deps.clone();
+        if entry.phase == Phase::Committed {
+            let keys = entry.keys.clone();
+            self.pending.push(WalRecord::Committed {
+                txn,
+                keys,
+                execute_at,
+                deps,
+            });
+        }
+        self.try_execute();
+    }
+
+    // ---- execution -------------------------------------------------------
+
+    /// Execute every transaction that has become *applicable*, in agreed order.
+    ///
+    /// A committed transaction is applicable when every *conflicting* transaction
+    /// that could order before it has already applied. Crucially, "could order
+    /// before" is judged against **every conflicting transaction this replica
+    /// knows of, in any phase** — not just the committed ones, and not only the
+    /// recorded dependency set: a conflicting transaction that is not yet
+    /// committed has an as-yet-unknown final timestamp that might land lower, so
+    /// we must wait for it to commit (and apply, if it then orders earlier)
+    /// before running. We then apply the applicable transaction with the
+    /// smallest `(execute_at, txn)` and repeat. Because the order
+    /// `(execute_at, txn)` is total and every replica converges to the same
+    /// committed `(execute_at, deps)` for every transaction, all replicas
+    /// execute conflicting transactions in the same order.
+    fn try_execute(&mut self) {
+        while let Some(txn) = self.next_applicable() {
+            self.apply(txn);
+        }
+    }
+
+    /// The applicable committed transaction with the smallest `(execute_at,
+    /// txn)`, or `None` if none is ready.
+    fn next_applicable(&self) -> Option<TxnId> {
+        let mut best: Option<(Timestamp, TxnId)> = None;
+        for (&txn, t) in &self.txns {
+            if t.phase != Phase::Committed {
+                continue; // not committed, or already applied
+            }
+            if !self.conflicts_clear_for(txn, t.execute_at, &t.keys) {
+                continue;
+            }
+            let key = (t.execute_at, txn);
+            if best.is_none_or(|b| key < b) {
+                best = Some(key);
+            }
+        }
+        best.map(|(_, txn)| txn)
+    }
+
+    /// Whether nothing this replica knows of could still need to execute before
+    /// `txn`. For every other transaction whose key set intersects `txn`'s:
+    ///
+    /// - if it is not yet committed, its final timestamp is unknown and might
+    ///   order before `txn` — block until it commits;
+    /// - if it is committed and orders before `txn` (`(execute_at, other) <
+    ///   (execute_at, txn)`) but has not applied, block until it does.
+    ///
+    /// A conflict that is committed and orders *after* `txn` does not block: it
+    /// will run later.
+    fn conflicts_clear_for(&self, txn: TxnId, execute_at: Timestamp, keys: &BTreeSet<Key>) -> bool {
+        for (&other, o) in &self.txns {
+            if other == txn || o.keys.is_disjoint(keys) {
+                continue;
+            }
+            if o.phase < Phase::Committed {
+                return false; // order not yet final; it might land before us
+            }
+            let orders_before = (o.execute_at, other) < (execute_at, txn);
+            if orders_before && o.phase != Phase::Applied {
+                return false; // an earlier-ordered conflict has not executed yet
+            }
+        }
+        true
+    }
+
+    /// Apply `txn`'s effect: write its id to each of its keys, append it to the
+    /// execution order, mark it applied, and record a durable `Applied`.
+    fn apply(&mut self, txn: TxnId) {
+        let keys = match self.txns.get_mut(&txn) {
+            Some(t) if t.phase == Phase::Committed => {
+                t.phase = Phase::Applied;
+                t.keys.clone()
+            }
+            _ => return,
+        };
+        for k in keys {
+            self.store.insert(k, txn);
+        }
+        self.applied_order.push(txn);
+        self.pending.push(WalRecord::Applied { txn });
     }
 
     // ---- coordinator handlers -------------------------------------------

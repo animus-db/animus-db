@@ -1,7 +1,7 @@
 # ADR 0011 — Accord-style leaderless transaction consensus
 
-- **Status:** Accepted (first minimal slice)
-- **Date:** 2026-08-01
+- **Status:** Accepted (first minimal slice; extended with execution + durability)
+- **Date:** 2026-08-01 (execution + durability increment: 2026-08-01)
 
 ## Context
 
@@ -80,27 +80,61 @@ earlier one as a dependency.
   Accord's exact tight bound (`f + ⌊(f+1)/2⌋` over `2f+1` replicas). For the
   tested N=3 this is all 3 replicas; the slice proves the *mechanism*, and the
   precise bound is deferred.
-- **Deliberately deferred** (each a substantial follow-up, none implemented
-  here):
-  - **Execution / Apply**: transactions agree on an order but no effect is
-    applied to storage; no integration with the data plane or `StorageEngine`.
-  - **The full dependency wait-graph**: we record deps and show consistent
-    commit order, but do not implement execution-time blocking on dependencies
-    or the recovery of transitive dependency closure.
-  - **Durability / recovery**: the core is in-memory only — no WAL, no recovery
-    (contrast `RaftCore`, which already persists and recovers). A restart loses
-    all transaction state.
+## Execution + durability increment (2026-08-01)
+
+The second increment takes the slice from "commits a timestamp + deps" to
+"executes durably", without reshaping the sync-core / `Env`-driver split:
+
+- **Execution / Apply.** Once a transaction commits, the replica *executes* it,
+  but only in agreed order. A committed transaction is *applicable* when every
+  **conflicting** transaction this replica knows of (intersecting key set, any
+  phase) that could order before it has already applied — specifically: every
+  conflict not yet committed blocks (its final timestamp is still unknown and
+  might land lower), and every committed conflict ordered before it
+  (`(execute_at, txn)` total order) blocks until it has applied. Applicable
+  transactions drain smallest-`(execute_at, txn)`-first. The effect is an opaque
+  op — "write your id to each key you touch" — against a tiny in-memory
+  key→last-writer store. Because the order is total and every replica converges
+  to the same committed `(execute_at)` for every transaction, **all replicas
+  execute conflicting transactions in the same order** and their stores
+  converge. This is the execution-time wait condition; the broader transitive
+  wait-graph and recovery of a dependency closure remain future work.
+- **Durability / recovery.** `AccordCore` now emits `WalRecord`s
+  (`PreAccepted` / `Accepted` / `Committed` / `Applied`) into a `pending` buffer
+  at each phase transition, mirroring `RaftCore`. `AccordNode` drains them,
+  appends + `fsync`s them to a per-node `accord.wal` on the `Env` disk **before**
+  shipping the messages that depend on them, and on startup replays the WAL
+  (`PersistedState`) into `AccordCore::recovered`. A stopped-and-restarted
+  replica recovers its committed/executed transactions, its execution order, and
+  its store. The WAL is the full per-transaction history — **snapshotting / log
+  truncation is deferred** (contrast `RaftCore`, which compacts). Replay is
+  order-insensitive (the per-record merge is commutative for our fields), so the
+  driver may flush from either `submit` or the recv loop.
+
+Tests added in `custos-consensus/tests/accord_execute.rs`: conflicting
+transactions execute in a consistent order with a converged store (single seed +
+a 48-seed sweep including a slow-path third coordinator), replica restart
+recovers executed state from disk, and execution-path trace reproducibility.
+
+- **Still deliberately deferred** (each a substantial follow-up):
+  - **The full dependency wait-graph**: the execution wait condition above is
+    conflict-and-timestamp based; the transitive dependency closure and its
+    recovery are not implemented.
+  - **WAL snapshotting / log truncation**: the WAL grows with the transaction
+    count; no compaction yet.
   - **Coordinator failover**: a coordinator that dies mid-flight strands its
     transaction; there is no recovery coordinator and no PreAccept/Accept ballot
-    for recovery.
+    for recovery. (A *replica* restart is now recovered.)
+  - **Full data-plane / `StorageEngine` integration**: the executed store is a
+    stand-in to demonstrate consistent order, not the real data plane.
   - **Contention / livelock handling**, **timeouts and retries** (the slice
     assumes a reliable enough network to gather a quorum; lost messages can stall
     a transaction), and **sharding/placement** (one global replica set — every
     transaction goes to every node; no tablet/partition routing yet).
   - **The Elle cycle checker** (`custos-test`) is *not* yet wired to this path;
-    that becomes worthwhile once execution and a real history exist.
-- The clean sync-core boundary means each deferred piece (durability like
-  `RaftCore`'s WAL, recovery, execution) can be added incrementally without
-  reshaping the driver.
+    now that a real execution history exists, wiring it is the natural next step.
+- The clean sync-core boundary held: execution and durability slotted in behind
+  the existing `handle`/`submit` entry points and the `Env`-driver, exactly as
+  the first slice anticipated.
 - ADR 0001's two-plane split is unchanged; this layer sits above the data plane
   and does not alter the control plane.
