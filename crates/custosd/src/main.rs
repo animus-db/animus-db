@@ -113,11 +113,12 @@ async fn run_single(
         .await
         .map_err(|e| format!("failed to start node {index}: {e}"))?;
     println!(
-        "custosd: node {index}/{} up (R={}, W={}) — client {}",
+        "custosd: node {index}/{} up (R={}, W={}) — client {} — dynamo http {}",
         config.len(),
         config.r,
         config.w,
-        node.client_addr()
+        node.client_addr(),
+        node.dynamo_addr(),
     );
     println!("custosd: ready — Ctrl-C to stop");
     wait_for_ctrl_c().await;
@@ -142,7 +143,11 @@ async fn run_in_process_cluster(
 
     println!("custosd: started {n}-node cluster (R={majority}, W={majority})");
     for (i, node) in nodes.iter().enumerate() {
-        println!("  node {i}: client {}", node.client_addr());
+        println!(
+            "  node {i}: client {} — dynamo http {}",
+            node.client_addr(),
+            node.dynamo_addr(),
+        );
     }
     println!("custosd: ready — Ctrl-C to stop");
     wait_for_ctrl_c().await;

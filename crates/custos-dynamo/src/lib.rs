@@ -22,6 +22,8 @@ use std::collections::BTreeMap;
 use custos_storage::{StorageEngine, Version};
 use serde::{Deserialize, Serialize};
 
+pub mod wire;
+
 /// A DynamoDB-style attribute value (a useful subset).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AttributeValue {
@@ -41,7 +43,7 @@ impl AttributeValue {
     /// Byte encoding used when an attribute is part of a key. String/number/
     /// binary sort by these bytes (numbers therefore sort lexicographically — a
     /// documented simplification of DynamoDB's numeric ordering).
-    fn key_bytes(&self) -> Vec<u8> {
+    pub(crate) fn key_bytes(&self) -> Vec<u8> {
         match self {
             AttributeValue::S(s) => s.clone().into_bytes(),
             AttributeValue::N(n) => n.clone().into_bytes(),
@@ -101,7 +103,7 @@ pub enum DynamoError {
 type Result<T> = std::result::Result<T, DynamoError>;
 
 /// Order-preserving, prefix-free escape (shared scheme with the `fjall` backend).
-fn escape(bytes: &[u8]) -> Vec<u8> {
+pub(crate) fn escape(bytes: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(bytes.len() + 2);
     for &b in bytes {
         out.push(b);
@@ -111,6 +113,19 @@ fn escape(bytes: &[u8]) -> Vec<u8> {
     }
     out.extend_from_slice(&[0x00, 0x00]);
     out
+}
+
+/// The storage key for an item addressed by partition key `pk` and optional
+/// sort key `sk`: `escape(pk) || sk`. This is the engine/data-plane key the
+/// item maps onto — exposed so the wire layer can route an item through the
+/// distributed data plane without instantiating a local-engine [`Table`].
+#[must_use]
+pub fn storage_key(pk: &AttributeValue, sk: Option<&AttributeValue>) -> Vec<u8> {
+    let mut key = escape(&pk.key_bytes());
+    if let Some(sk) = sk {
+        key.extend_from_slice(&sk.key_bytes());
+    }
+    key
 }
 
 /// A table backed by a [`StorageEngine`]. Writes use a monotonic version
@@ -155,11 +170,7 @@ impl<S: StorageEngine> Table<S> {
     }
 
     fn storage_key(&self, pk: &AttributeValue, sk: Option<&AttributeValue>) -> Vec<u8> {
-        let mut key = escape(&pk.key_bytes());
-        if let Some(sk) = sk {
-            key.extend_from_slice(&sk.key_bytes());
-        }
-        key
+        storage_key(pk, sk)
     }
 
     /// `PutItem`: insert or replace an item (keyed by its key attributes).

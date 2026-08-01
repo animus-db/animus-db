@@ -12,21 +12,25 @@ metadata. Correctness is established by **deterministic simulation testing**.
 Status: pre-alpha. Implemented: the scaffold, the `Env` seam, storage (in-memory
 + persistent `fjall`), the control-plane Raft (WAL durability + recovery +
 log-truncating snapshots with `InstallSnapshot`),
-the quorum data-plane vertical slice (with read-repair + background
-anti-entropy convergence), tablet split/merge + multi-tablet routing,
-the Elle-style recorder/checker (`custos-test`), a DynamoDB-style item API over
-the core (`custos-dynamo`), a **runnable node + CLI** assembling the planes
-over `ProdEnv` and serving clients over TCP — runnable as one process
-(`custosd --cluster N`) or one process per node (`custosd --config FILE --node I`,
-config via `gen-config`) — the **topology-aware placement engine**
-(`custos-placement`: residency + failure-domain spread, driving control-plane
-`CasTabletReplicas`), and a **first minimal slice of Accord-style leaderless
-transaction consensus** (`custos-consensus`: PreAccept→Commit fast path +
-PreAccept→Accept→Commit slow path, dependency tracking, consistent commit order
-— but no execution/durability/recovery yet; ADR 0011). Skeletons / future work:
-`custos-cql` (wire protocol), plus the DynamoDB/CQL wire protocols, and the
-deferred remainder of Accord (execution/Apply, durability, coordinator
-failover).
+the quorum data-plane vertical slice (with read-repair, background
+anti-entropy convergence, and delete/tombstone propagation), tablet split/merge
++ multi-tablet routing, the Elle-style recorder/checker (`custos-test`), a
+DynamoDB-style item API over the core plus a **minimal DynamoDB JSON wire
+protocol** (`custos-dynamo`: PutItem/GetItem/DeleteItem AttributeValue-JSON
+translation), a **runnable node + CLI** assembling the planes over `ProdEnv` and
+serving clients over TCP — runnable as one process (`custosd --cluster N`) or one
+process per node (`custosd --config FILE --node I`, config via `gen-config`),
+which now also **serves the DynamoDB JSON protocol over HTTP**, routing those
+requests through the same data-plane coordinator — the **topology-aware placement
+engine** (`custos-placement`: residency + failure-domain spread, with the leader
+automatically reconciling tablet placement via control-plane `CasTabletReplicas`),
+and a **first minimal slice of Accord-style leaderless transaction consensus**
+(`custos-consensus`: PreAccept→Commit fast path + PreAccept→Accept→Commit slow
+path, dependency tracking, consistent commit order — but no
+execution/durability/recovery yet; ADR 0011). Skeletons / future work:
+`custos-cql` (CQL wire protocol), the rest of the DynamoDB surface (Query/Scan,
+CreateTable, conditional writes), and the deferred remainder of Accord
+(execution/Apply, durability, coordinator failover).
 
 ## Per-crate guides
 
