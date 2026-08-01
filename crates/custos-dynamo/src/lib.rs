@@ -22,7 +22,12 @@ use std::collections::BTreeMap;
 use custos_storage::{StorageEngine, Version};
 use serde::{Deserialize, Serialize};
 
+pub mod condition;
+pub mod registry;
 pub mod wire;
+
+pub use condition::{ConditionExpression, SortKeyCondition};
+pub use registry::{RegistryError, SchemaRegistry};
 
 /// A DynamoDB-style attribute value (a useful subset).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -58,7 +63,7 @@ impl AttributeValue {
 pub type Item = BTreeMap<String, AttributeValue>;
 
 /// A table's key schema.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TableSchema {
     /// Partition (hash) key attribute name.
     pub partition_key: String,
@@ -203,6 +208,17 @@ impl<S: StorageEngine> Table<S> {
 
     /// `Query`: all live items in a partition, ordered by sort key.
     pub fn query(&self, pk: &AttributeValue) -> Result<Vec<Item>> {
+        self.query_with(pk, None)
+    }
+
+    /// `Query` with an optional sort-key `condition` (`=`, `BETWEEN`,
+    /// `begins_with`): the live items in `pk`'s partition that satisfy it,
+    /// ordered by sort key. With `None` this is the whole partition.
+    pub fn query_with(
+        &self,
+        pk: &AttributeValue,
+        condition: Option<&crate::condition::SortKeyCondition>,
+    ) -> Result<Vec<Item>> {
         let prefix = escape(&pk.key_bytes());
         // The partition's keys all start with `prefix` (which ends in
         // `0x00 0x00`); bumping the final byte to `0x01` is the first key past
@@ -210,7 +226,15 @@ impl<S: StorageEngine> Table<S> {
         let mut end = prefix.clone();
         *end.last_mut().expect("escape is non-empty") = 0x01;
         let mut items = Vec::new();
-        for (_k, vv) in self.engine.scan(&prefix, &end)? {
+        for (key, vv) in self.engine.scan(&prefix, &end)? {
+            if let Some(cond) = condition {
+                // The sort-key bytes are everything after the escaped pk; test
+                // the condition against them directly (storage-order bytes).
+                let sk_bytes = AttributeValue::B(key[prefix.len()..].to_vec());
+                if !cond.matches(&sk_bytes) {
+                    continue;
+                }
+            }
             items.push(decode_item(&vv.value)?);
         }
         Ok(items)

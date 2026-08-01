@@ -15,9 +15,11 @@ log-truncating snapshots with `InstallSnapshot`),
 the quorum data-plane vertical slice (with read-repair, background
 anti-entropy convergence, and delete/tombstone propagation), tablet split/merge
 + multi-tablet routing, the Elle-style recorder/checker (`custos-test`), a
-DynamoDB-style item API over the core plus a **minimal DynamoDB JSON wire
-protocol** (`custos-dynamo`: PutItem/GetItem/DeleteItem AttributeValue-JSON
-translation), a **runnable node + CLI** assembling the planes over `ProdEnv` and
+DynamoDB-style item API over the core plus a **DynamoDB JSON wire protocol**
+(`custos-dynamo`: CreateTable/PutItem/GetItem/DeleteItem/Query AttributeValue-JSON
+translation, with a per-table schema registry, sort-key conditions =/BETWEEN/
+begins_with, and a `ConditionExpression` subset for conditional writes), a
+**runnable node + CLI** assembling the planes over `ProdEnv` and
 serving clients over TCP — runnable as one process (`custosd --cluster N`) or one
 process per node (`custosd --config FILE --node I`, config via `gen-config`),
 which now also **serves the DynamoDB JSON protocol over HTTP**, routing those
@@ -28,8 +30,9 @@ and a **first minimal slice of Accord-style leaderless transaction consensus**
 (`custos-consensus`: PreAccept→Commit fast path + PreAccept→Accept→Commit slow
 path, dependency tracking, consistent commit order — but no
 execution/durability/recovery yet; ADR 0011). Skeletons / future work:
-`custos-cql` (CQL wire protocol), the rest of the DynamoDB surface (Query/Scan,
-CreateTable, conditional writes), and the deferred remainder of Accord
+`custos-cql` (CQL wire protocol), the rest of the DynamoDB surface (Scan,
+projection/filter expressions, `ReturnValues`, document/set types, secondary
+indexes, durable/replicated table schemas), and the deferred remainder of Accord
 (execution/Apply, durability, coordinator failover).
 
 ## Per-crate guides

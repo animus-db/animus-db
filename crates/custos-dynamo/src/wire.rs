@@ -11,18 +11,23 @@
 //!
 //! ## Supported subset
 //!
-//! Operations: `PutItem`, `GetItem`, `DeleteItem`. AttributeValue types: `S`
-//! (string), `N` (number, carried as text), `B` (binary, base64), `BOOL`,
-//! `NULL` — matching [`AttributeValue`]. Not supported (rejected with a clear
-//! error): document types (`M`/`L`), sets (`SS`/`NS`/`BS`), conditional
-//! expressions, projection expressions, and `ReturnValues` — all deferred.
+//! Operations: `CreateTable`, `PutItem`, `GetItem`, `DeleteItem`, `Query`.
+//! AttributeValue types: `S` (string), `N` (number, carried as text), `B`
+//! (binary, base64), `BOOL`, `NULL` — matching [`AttributeValue`]. `PutItem` /
+//! `DeleteItem` accept a small `ConditionExpression` subset (see
+//! [`crate::condition`]); `Query` accepts a partition-key equality plus an
+//! optional sort-key condition (`=`, `BETWEEN`, `begins_with`). Not supported
+//! (rejected with a clear error): document types (`M`/`L`), sets
+//! (`SS`/`NS`/`BS`), projection/filter expressions, `Scan`, secondary indexes,
+//! and `ReturnValues` — all deferred.
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::{AttributeValue, Item};
+use crate::condition::{ConditionExpression, SortKeyCondition};
+use crate::{AttributeValue, Item, TableSchema};
 
 /// The `X-Amz-Target` service+version prefix DynamoDB clients send.
 pub const TARGET_PREFIX: &str = "DynamoDB_20120810.";
@@ -30,12 +35,21 @@ pub const TARGET_PREFIX: &str = "DynamoDB_20120810.";
 /// A decoded DynamoDB wire operation (the supported subset).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Operation {
+    /// `CreateTable`: register `schema` under `table`.
+    CreateTable {
+        /// New table name.
+        table: String,
+        /// The key schema (partition key + optional sort key).
+        schema: TableSchema,
+    },
     /// `PutItem`: insert or replace `item` in `table`.
     PutItem {
         /// Target table name.
         table: String,
         /// The item to write (must contain the table's key attributes).
         item: Item,
+        /// Optional condition the write is gated on (e.g. `attribute_not_exists`).
+        condition: Option<ConditionExpression>,
     },
     /// `GetItem`: fetch the item identified by `key` from `table`.
     GetItem {
@@ -50,6 +64,18 @@ pub enum Operation {
         table: String,
         /// The key attributes.
         key: Item,
+        /// Optional condition the delete is gated on.
+        condition: Option<ConditionExpression>,
+    },
+    /// `Query`: items in a partition (`pk = ..`) matching an optional sort-key
+    /// condition.
+    Query {
+        /// Target table name.
+        table: String,
+        /// The partition-key value (equality).
+        partition_value: AttributeValue,
+        /// Optional sort-key narrowing.
+        sort_condition: Option<SortKeyCondition>,
     },
 }
 
@@ -58,9 +84,11 @@ impl Operation {
     #[must_use]
     pub fn table(&self) -> &str {
         match self {
-            Operation::PutItem { table, .. }
+            Operation::CreateTable { table, .. }
+            | Operation::PutItem { table, .. }
             | Operation::GetItem { table, .. }
-            | Operation::DeleteItem { table, .. } => table,
+            | Operation::DeleteItem { table, .. }
+            | Operation::Query { table, .. } => table,
         }
     }
 }
@@ -98,6 +126,15 @@ impl WireError {
     pub fn serialization(message: impl Into<String>) -> Self {
         Self {
             code: "SerializationException",
+            message: message.into(),
+        }
+    }
+
+    /// A `ConditionExpression` evaluated to false — the write is rejected.
+    #[must_use]
+    pub fn conditional_check_failed(message: impl Into<String>) -> Self {
+        Self {
+            code: "ConditionalCheckFailedException",
             message: message.into(),
         }
     }
@@ -142,10 +179,20 @@ pub fn decode_request(target: &str, body: &[u8]) -> Result<Operation, WireError>
         .ok_or_else(|| WireError::validation("request body must be a JSON object"))?;
 
     match op {
+        "CreateTable" => {
+            let table = table_name(obj)?;
+            let schema = decode_key_schema(obj)?;
+            Ok(Operation::CreateTable { table, schema })
+        }
         "PutItem" => {
             let table = table_name(obj)?;
             let item = decode_item_field(obj, "Item")?;
-            Ok(Operation::PutItem { table, item })
+            let condition = decode_condition(obj)?;
+            Ok(Operation::PutItem {
+                table,
+                item,
+                condition,
+            })
         }
         "GetItem" => {
             let table = table_name(obj)?;
@@ -155,10 +202,180 @@ pub fn decode_request(target: &str, body: &[u8]) -> Result<Operation, WireError>
         "DeleteItem" => {
             let table = table_name(obj)?;
             let key = decode_item_field(obj, "Key")?;
-            Ok(Operation::DeleteItem { table, key })
+            let condition = decode_condition(obj)?;
+            Ok(Operation::DeleteItem {
+                table,
+                key,
+                condition,
+            })
         }
+        "Query" => decode_query(obj),
         _ => Err(WireError::unknown_operation(target)),
     }
+}
+
+/// Decode a `CreateTable` body's `KeySchema` + `AttributeDefinitions` into a
+/// [`TableSchema`]. We use the `KeySchema` (`HASH` / `RANGE`) for the key
+/// attribute names; `AttributeDefinitions` types are accepted but, since our
+/// model carries types per value, not enforced.
+fn decode_key_schema(obj: &Map<String, Value>) -> Result<TableSchema, WireError> {
+    let key_schema = obj
+        .get("KeySchema")
+        .and_then(Value::as_array)
+        .ok_or_else(|| WireError::validation("missing array field `KeySchema`"))?;
+    let mut partition_key = None;
+    let mut sort_key = None;
+    for entry in key_schema {
+        let e = entry
+            .as_object()
+            .ok_or_else(|| WireError::validation("each `KeySchema` entry must be an object"))?;
+        let name = e
+            .get("AttributeName")
+            .and_then(Value::as_str)
+            .ok_or_else(|| WireError::validation("`KeySchema` entry missing `AttributeName`"))?;
+        let role = e
+            .get("KeyType")
+            .and_then(Value::as_str)
+            .ok_or_else(|| WireError::validation("`KeySchema` entry missing `KeyType`"))?;
+        match role {
+            "HASH" => partition_key = Some(name.to_owned()),
+            "RANGE" => sort_key = Some(name.to_owned()),
+            other => {
+                return Err(WireError::validation(format!(
+                    "unknown KeyType `{other}` (expected HASH or RANGE)"
+                )));
+            }
+        }
+    }
+    let partition_key = partition_key
+        .ok_or_else(|| WireError::validation("`KeySchema` has no HASH (partition) key"))?;
+    Ok(TableSchema {
+        partition_key,
+        sort_key,
+    })
+}
+
+/// Decode the optional `ConditionExpression` + `ExpressionAttributeValues` of a
+/// write. Supported forms: `attribute_not_exists(attr)`,
+/// `attribute_exists(attr)`, and `attr = :placeholder`. Absent ⇒ `Ok(None)`.
+fn decode_condition(obj: &Map<String, Value>) -> Result<Option<ConditionExpression>, WireError> {
+    let Some(expr) = obj.get("ConditionExpression").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    let expr = expr.trim();
+    let cond = if let Some(inner) = func_arg(expr, "attribute_not_exists") {
+        ConditionExpression::AttributeNotExists(inner.to_owned())
+    } else if let Some(inner) = func_arg(expr, "attribute_exists") {
+        ConditionExpression::AttributeExists(inner.to_owned())
+    } else if let Some((lhs, rhs)) = expr.split_once('=') {
+        let attr = lhs.trim();
+        let rhs = rhs.trim();
+        let value = resolve_placeholder(obj, rhs)?;
+        ConditionExpression::Equals(attr.to_owned(), value)
+    } else {
+        return Err(WireError::validation(format!(
+            "unsupported ConditionExpression `{expr}` (supported: \
+             attribute_not_exists(a), attribute_exists(a), a = :v)"
+        )));
+    };
+    Ok(Some(cond))
+}
+
+/// If `expr` is exactly `name(arg)`, return the trimmed `arg`.
+fn func_arg<'a>(expr: &'a str, name: &str) -> Option<&'a str> {
+    let rest = expr.strip_prefix(name)?.trim_start();
+    let inner = rest.strip_prefix('(')?.strip_suffix(')')?;
+    Some(inner.trim())
+}
+
+/// Resolve a `:placeholder` against `ExpressionAttributeValues`.
+fn resolve_placeholder(
+    obj: &Map<String, Value>,
+    placeholder: &str,
+) -> Result<AttributeValue, WireError> {
+    if !placeholder.starts_with(':') {
+        return Err(WireError::validation(format!(
+            "condition right-hand side `{placeholder}` must be a `:` value placeholder"
+        )));
+    }
+    let values = obj
+        .get("ExpressionAttributeValues")
+        .and_then(Value::as_object)
+        .ok_or_else(|| WireError::validation("missing `ExpressionAttributeValues`"))?;
+    let raw = values.get(placeholder).ok_or_else(|| {
+        WireError::validation(format!("placeholder `{placeholder}` is not defined"))
+    })?;
+    decode_attribute_value(placeholder, raw)
+}
+
+/// Decode a `Query` body: a `KeyConditionExpression` of the form
+/// `<pk> = :pv [AND <sort-condition>]`, with values supplied via
+/// `ExpressionAttributeValues`. The supported sort conditions are
+/// `<sk> = :v`, `<sk> BETWEEN :lo AND :hi`, and `begins_with(<sk>, :p)`.
+fn decode_query(obj: &Map<String, Value>) -> Result<Operation, WireError> {
+    let table = table_name(obj)?;
+    let expr = obj
+        .get("KeyConditionExpression")
+        .and_then(Value::as_str)
+        .ok_or_else(|| WireError::validation("missing string field `KeyConditionExpression`"))?;
+    // Split off an optional sort clause on the first ` AND ` (DynamoDB requires
+    // the partition equality first).
+    let (pk_clause, sort_clause) = match split_once_ci(expr, " AND ") {
+        Some((a, b)) => (a.trim(), Some(b.trim())),
+        None => (expr.trim(), None),
+    };
+    // Partition: `<attr> = :placeholder`.
+    let (_pk_attr, pk_placeholder) = pk_clause
+        .split_once('=')
+        .ok_or_else(|| WireError::validation("partition key condition must be `pk = :v`"))?;
+    let partition_value = resolve_placeholder(obj, pk_placeholder.trim())?;
+
+    let sort_condition = match sort_clause {
+        None => None,
+        Some(clause) => Some(decode_sort_condition(obj, clause)?),
+    };
+    Ok(Operation::Query {
+        table,
+        partition_value,
+        sort_condition,
+    })
+}
+
+fn decode_sort_condition(
+    obj: &Map<String, Value>,
+    clause: &str,
+) -> Result<SortKeyCondition, WireError> {
+    let clause = clause.trim();
+    if let Some(inner) = func_arg(clause, "begins_with") {
+        // begins_with(<sk>, :p)
+        let (_attr, ph) = inner.split_once(',').ok_or_else(|| {
+            WireError::validation("begins_with takes two arguments: begins_with(sk, :p)")
+        })?;
+        let value = resolve_placeholder(obj, ph.trim())?;
+        return Ok(SortKeyCondition::BeginsWith(value));
+    }
+    if let Some((_attr, rest)) = split_once_ci(clause, " BETWEEN ") {
+        let (lo, hi) = split_once_ci(rest, " AND ")
+            .ok_or_else(|| WireError::validation("BETWEEN takes `:lo AND :hi`"))?;
+        let lo = resolve_placeholder(obj, lo.trim())?;
+        let hi = resolve_placeholder(obj, hi.trim())?;
+        return Ok(SortKeyCondition::Between(lo, hi));
+    }
+    if let Some((_attr, ph)) = clause.split_once('=') {
+        let value = resolve_placeholder(obj, ph.trim())?;
+        return Ok(SortKeyCondition::Equals(value));
+    }
+    Err(WireError::validation(format!(
+        "unsupported sort-key condition `{clause}` (supported: =, BETWEEN, begins_with)"
+    )))
+}
+
+/// Case-insensitive `split_once` on a `needle` (used for ` AND `/` BETWEEN `,
+/// which clients may send in any case). Returns byte-sliced halves of `s`.
+fn split_once_ci<'a>(s: &'a str, needle: &str) -> Option<(&'a str, &'a str)> {
+    let lower = s.to_ascii_lowercase();
+    let pos = lower.find(&needle.to_ascii_lowercase())?;
+    Some((&s[..pos], &s[pos + needle.len()..]))
 }
 
 fn table_name(obj: &Map<String, Value>) -> Result<String, WireError> {
@@ -281,6 +498,45 @@ pub fn empty_response() -> String {
     "{}".to_string()
 }
 
+/// The JSON body for a successful `Query`: `{"Items": [..], "Count": n,
+/// "ScannedCount": n}`. Items are emitted in sort order, as the caller supplies
+/// them.
+#[must_use]
+pub fn query_response(items: &[Item]) -> String {
+    let encoded: Vec<Value> = items.iter().map(encode_item).collect();
+    let count = Value::from(items.len());
+    let mut obj = Map::new();
+    obj.insert("Items".into(), Value::Array(encoded));
+    obj.insert("Count".into(), count.clone());
+    obj.insert("ScannedCount".into(), count);
+    serde_json::to_string(&Value::Object(obj)).expect("query response serializes")
+}
+
+/// The JSON body for a successful `CreateTable`: a minimal `TableDescription`
+/// echoing the name, key schema, and an `ACTIVE` status (tables are immediately
+/// usable here — there is no provisioning phase).
+#[must_use]
+pub fn create_table_response(table: &str, schema: &TableSchema) -> String {
+    let mut key_schema = vec![key_schema_entry(&schema.partition_key, "HASH")];
+    if let Some(sk) = &schema.sort_key {
+        key_schema.push(key_schema_entry(sk, "RANGE"));
+    }
+    let mut desc = Map::new();
+    desc.insert("TableName".into(), Value::String(table.to_owned()));
+    desc.insert("KeySchema".into(), Value::Array(key_schema));
+    desc.insert("TableStatus".into(), Value::String("ACTIVE".into()));
+    let mut obj = Map::new();
+    obj.insert("TableDescription".into(), Value::Object(desc));
+    serde_json::to_string(&Value::Object(obj)).expect("create-table response serializes")
+}
+
+fn key_schema_entry(name: &str, role: &str) -> Value {
+    let mut e = Map::new();
+    e.insert("AttributeName".into(), Value::String(name.to_owned()));
+    e.insert("KeyType".into(), Value::String(role.to_owned()));
+    Value::Object(e)
+}
+
 // --- base64 (standard alphabet, with padding) ------------------------------
 //
 // A tiny self-contained codec so the crate takes no new dependency for the `B`
@@ -401,7 +657,7 @@ mod tests {
         let body = br#"{"TableName":"users","Item":{"id":{"S":"u1"},"n":{"N":"42"},
                         "ok":{"BOOL":true},"void":{"NULL":true}}}"#;
         let op = decode_request("DynamoDB_20120810.PutItem", body).unwrap();
-        let Operation::PutItem { table, item } = op else {
+        let Operation::PutItem { table, item, .. } = op else {
             panic!("expected PutItem");
         };
         assert_eq!(table, "users");
@@ -477,5 +733,143 @@ mod tests {
         assert_eq!(decode_stored_item(&bytes).unwrap(), Some(item));
         let tomb = encode_tombstone();
         assert_eq!(decode_stored_item(&tomb).unwrap(), None);
+    }
+
+    #[test]
+    fn decodes_create_table_with_composite_key() {
+        let body = br#"{"TableName":"t",
+            "KeySchema":[{"AttributeName":"pk","KeyType":"HASH"},
+                         {"AttributeName":"sk","KeyType":"RANGE"}],
+            "AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"},
+                                    {"AttributeName":"sk","AttributeType":"S"}]}"#;
+        match decode_request("DynamoDB_20120810.CreateTable", body).unwrap() {
+            Operation::CreateTable { table, schema } => {
+                assert_eq!(table, "t");
+                assert_eq!(schema, TableSchema::composite("pk", "sk"));
+            }
+            other => panic!("expected CreateTable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_table_simple_key() {
+        let body = br#"{"TableName":"t",
+            "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#;
+        match decode_request("DynamoDB_20120810.CreateTable", body).unwrap() {
+            Operation::CreateTable { schema, .. } => {
+                assert_eq!(schema, TableSchema::simple("id"));
+            }
+            other => panic!("expected CreateTable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decodes_put_with_attribute_not_exists_condition() {
+        let body = br#"{"TableName":"t","Item":{"pk":{"S":"a"}},
+            "ConditionExpression":"attribute_not_exists(pk)"}"#;
+        let Operation::PutItem { condition, .. } =
+            decode_request("DynamoDB_20120810.PutItem", body).unwrap()
+        else {
+            panic!("expected PutItem");
+        };
+        assert_eq!(
+            condition,
+            Some(ConditionExpression::AttributeNotExists("pk".into()))
+        );
+    }
+
+    #[test]
+    fn decodes_put_with_equality_condition() {
+        let body = br#"{"TableName":"t","Item":{"pk":{"S":"a"}},
+            "ConditionExpression":"v = :want",
+            "ExpressionAttributeValues":{":want":{"N":"7"}}}"#;
+        let Operation::PutItem { condition, .. } =
+            decode_request("DynamoDB_20120810.PutItem", body).unwrap()
+        else {
+            panic!("expected PutItem");
+        };
+        assert_eq!(
+            condition,
+            Some(ConditionExpression::Equals(
+                "v".into(),
+                AttributeValue::N("7".into())
+            ))
+        );
+    }
+
+    #[test]
+    fn decodes_query_partition_only() {
+        let body = br#"{"TableName":"t",
+            "KeyConditionExpression":"pk = :p",
+            "ExpressionAttributeValues":{":p":{"S":"part"}}}"#;
+        match decode_request("DynamoDB_20120810.Query", body).unwrap() {
+            Operation::Query {
+                table,
+                partition_value,
+                sort_condition,
+            } => {
+                assert_eq!(table, "t");
+                assert_eq!(partition_value, s("part"));
+                assert_eq!(sort_condition, None);
+            }
+            other => panic!("expected Query, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decodes_query_sort_conditions() {
+        // equality
+        let body = br#"{"TableName":"t",
+            "KeyConditionExpression":"pk = :p AND sk = :s",
+            "ExpressionAttributeValues":{":p":{"S":"x"},":s":{"S":"y"}}}"#;
+        let Operation::Query { sort_condition, .. } =
+            decode_request("DynamoDB_20120810.Query", body).unwrap()
+        else {
+            panic!("expected Query");
+        };
+        assert_eq!(sort_condition, Some(SortKeyCondition::Equals(s("y"))));
+
+        // between (mixed case AND/BETWEEN)
+        let body = br#"{"TableName":"t",
+            "KeyConditionExpression":"pk = :p and sk between :lo and :hi",
+            "ExpressionAttributeValues":{":p":{"S":"x"},":lo":{"S":"a"},":hi":{"S":"m"}}}"#;
+        let Operation::Query { sort_condition, .. } =
+            decode_request("DynamoDB_20120810.Query", body).unwrap()
+        else {
+            panic!("expected Query");
+        };
+        assert_eq!(
+            sort_condition,
+            Some(SortKeyCondition::Between(s("a"), s("m")))
+        );
+
+        // begins_with
+        let body = br#"{"TableName":"t",
+            "KeyConditionExpression":"pk = :p AND begins_with(sk, :pre)",
+            "ExpressionAttributeValues":{":p":{"S":"x"},":pre":{"S":"ab"}}}"#;
+        let Operation::Query { sort_condition, .. } =
+            decode_request("DynamoDB_20120810.Query", body).unwrap()
+        else {
+            panic!("expected Query");
+        };
+        assert_eq!(sort_condition, Some(SortKeyCondition::BeginsWith(s("ab"))));
+    }
+
+    #[test]
+    fn query_response_shape() {
+        let mut a = Item::new();
+        a.insert("pk".into(), s("p"));
+        let body = query_response(&[a]);
+        assert!(body.contains("\"Items\""));
+        assert!(body.contains("\"Count\":1"));
+        assert!(body.contains("\"ScannedCount\":1"));
+    }
+
+    #[test]
+    fn create_table_response_shape() {
+        let body = create_table_response("t", &TableSchema::composite("pk", "sk"));
+        assert!(body.contains("\"TableStatus\":\"ACTIVE\""));
+        assert!(body.contains("\"HASH\""));
+        assert!(body.contains("\"RANGE\""));
     }
 }
