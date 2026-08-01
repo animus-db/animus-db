@@ -25,9 +25,12 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
   0010): per-key LWW that applies iff `version` is newer for *that key*,
   bypassing the engine-wide monotonic floor `put` enforces (so a repair can
   re-apply a value at its original, below-floor version). Idempotent and
-  commutative ⇒ convergence regardless of delivery order. `entries()` returns
-  the full live digest anti-entropy reconciles against. `put` keeps its global
-  contract for single-writer callers (control plane, dynamo adapter).
+  commutative ⇒ convergence regardless of delivery order. `merge_tombstone(key,
+  version)` is its delete counterpart: same per-key LWW, applying a tombstone.
+  `entries()` returns the full *live* digest; `entries_with_tombstones()`
+  returns each key's latest record including tombstones (`(key, Option<value>,
+  version)`), which anti-entropy uses so deletes propagate too. `put` keeps its
+  global contract for single-writer callers (control plane, dynamo adapter).
 - Per key, history is `version -> Some(value) | None`; `None` is a tombstone, so
   `delete`/`delete_range` preserve older versions for `get_at`.
 - `FjallEngine` layers MVCC over a plain ordered KV store: physical key =

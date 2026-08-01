@@ -46,6 +46,17 @@ pub enum DataMsg {
     },
     /// Replica → coordinator: write acknowledgement (`ok == false` if fenced).
     WriteAck { req: ReqId, ok: bool },
+    /// Coordinator → replica: tombstone `key` with MVCC `version` (per-key LWW,
+    /// epoch-fenced exactly like [`Write`](DataMsg::Write)).
+    Delete {
+        req: ReqId,
+        tablet: TabletId,
+        epoch: Epoch,
+        key: Vec<u8>,
+        version: u64,
+    },
+    /// Replica → coordinator: delete acknowledgement (`ok == false` if fenced).
+    DeleteAck { req: ReqId, ok: bool },
     /// Coordinator → replica: read the latest value at `key`.
     Read {
         req: ReqId,
@@ -62,11 +73,12 @@ pub enum DataMsg {
     },
     /// Peer → peer (anti-entropy) or coordinator → replica (read-repair):
     /// reconcile a batch of `(key, value, version)` into the replica's storage
-    /// by per-key last-writer-wins. Fire-and-forget — no acknowledgement, and
-    /// fenced as a whole on a stale `epoch` (ADR 0002).
+    /// by per-key last-writer-wins, where `value` is `None` for a **tombstone**
+    /// (so deletes propagate too, ADR 0010). Fire-and-forget — no
+    /// acknowledgement, and fenced as a whole on a stale `epoch` (ADR 0002).
     Sync {
         tablet: TabletId,
         epoch: Epoch,
-        entries: Vec<(Vec<u8>, Vec<u8>, u64)>,
+        entries: Vec<(Vec<u8>, Option<Vec<u8>>, u64)>,
     },
 }

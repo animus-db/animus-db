@@ -146,6 +146,18 @@ pub trait StorageEngine: Clone + Send + Sync {
     /// highest version seen per key regardless of delivery order.
     fn merge(&self, key: &[u8], value: &[u8], version: Version) -> Result<bool>;
 
+    /// Merge a **tombstone** at `key` with per-key last-writer-wins: apply iff
+    /// `version` is strictly greater than the key's current latest version,
+    /// returning whether it took effect.
+    ///
+    /// This is the delete counterpart of [`merge`](StorageEngine::merge): a
+    /// data-plane delete and its anti-entropy / read-repair propagation
+    /// re-apply a tombstone at its *original* version, bypassing the
+    /// engine-wide monotonic floor. Idempotent and commutative under per-key
+    /// LWW alongside `merge`, so a value and a later tombstone (or vice versa)
+    /// converge regardless of delivery order.
+    fn merge_tombstone(&self, key: &[u8], version: Version) -> Result<bool>;
+
     /// Tombstone `key` as of `version`.
     fn delete(&self, key: &[u8], version: Version) -> Result<()>;
 
@@ -168,6 +180,13 @@ pub trait StorageEngine: Clone + Send + Sync {
     /// ordered by key. This is the full digest anti-entropy reconciles against;
     /// it is `scan` over the whole keyspace.
     fn entries(&self) -> Result<Vec<(Key, VersionedValue)>>;
+
+    /// Every key's latest entry **including tombstones**, as
+    /// `(key, Option<value>, version)` where `None` is a tombstone, ordered by
+    /// key. Unlike [`entries`](StorageEngine::entries) this retains deleted
+    /// keys, so anti-entropy can propagate a delete to a replica that still
+    /// holds the value (ADR 0010).
+    fn entries_with_tombstones(&self) -> Result<Vec<(Key, Option<Value>, Version)>>;
 
     /// Take a consistent snapshot at the engine's current latest version.
     fn snapshot(&self) -> Self::Snapshot;

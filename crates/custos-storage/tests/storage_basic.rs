@@ -125,6 +125,39 @@ fn entries_returns_every_live_latest_in_key_order() {
 }
 
 #[test]
+fn merge_tombstone_is_per_key_lww_and_entries_with_tombstones_retains_deletes() {
+    let e = MemoryEngine::new();
+    e.put(b"other", b"x", 100).unwrap(); // bump the global floor on another key
+
+    // A fresh tombstone below the global floor applies (per-key LWW).
+    assert!(e.merge_tombstone(b"k", 5).unwrap(), "fresh key applies");
+    assert_eq!(e.get(b"k").unwrap(), None, "tombstoned key reads absent");
+
+    // A value strictly newer than the tombstone resurrects the key.
+    assert!(e.merge(b"k", b"v2", 7).unwrap());
+    assert_eq!(e.get(b"k").unwrap().unwrap().value, b"v2");
+
+    // A tombstone strictly newer than that wins again; equal/older are no-ops.
+    assert!(e.merge_tombstone(b"k", 9).unwrap());
+    assert!(!e.merge_tombstone(b"k", 9).unwrap(), "equal is a no-op");
+    assert!(!e.merge(b"k", b"v0", 6).unwrap(), "older value is a no-op");
+    assert_eq!(e.get(b"k").unwrap(), None);
+
+    // `entries` hides the deleted key; `entries_with_tombstones` retains it as a
+    // `None` at the tombstone's version, so anti-entropy can propagate the delete.
+    let live: Vec<_> = e.entries().unwrap().into_iter().map(|(k, _)| k).collect();
+    assert_eq!(live, vec![b"other".to_vec()], "k is hidden from `entries`");
+    let with_ts = e.entries_with_tombstones().unwrap();
+    assert_eq!(
+        with_ts,
+        vec![
+            (b"k".to_vec(), None, 9),
+            (b"other".to_vec(), Some(b"x".to_vec()), 100),
+        ]
+    );
+}
+
+#[test]
 fn snapshot_scan_is_isolated() {
     let e = MemoryEngine::new();
     e.put(b"a", b"1", 1).unwrap();

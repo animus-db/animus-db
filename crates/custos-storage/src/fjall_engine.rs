@@ -270,6 +270,19 @@ impl StorageEngine for FjallEngine {
         Ok(true)
     }
 
+    fn merge_tombstone(&self, key: &[u8], version: Version) -> Result<bool> {
+        // Per-key LWW: apply only if strictly newer than this key's own latest.
+        if self
+            .latest_version_of(key)?
+            .is_some_and(|cur| version <= cur)
+        {
+            return Ok(false);
+        }
+        self.write_op(&WriteOp::Delete { key: key.to_vec() }, version)?;
+        self.raise_max(version)?;
+        Ok(true)
+    }
+
     fn delete(&self, key: &[u8], version: Version) -> Result<()> {
         self.check_and_bump(version)?;
         self.write_op(&WriteOp::Delete { key: key.to_vec() }, version)
@@ -333,6 +346,27 @@ impl StorageEngine for FjallEngine {
             if let Some(vv) = decode_value(&v, version_of(&k)) {
                 out.push((unescape_prefix(&k), vv));
             }
+        }
+        Ok(out)
+    }
+
+    fn entries_with_tombstones(&self) -> Result<Vec<(Key, Option<Value>, Version)>> {
+        let mut out = Vec::new();
+        let mut last_prefix: Option<Vec<u8>> = None;
+        // Newest-first within each user key, so the first entry per prefix wins
+        // — tombstones included (unlike `entries`).
+        for item in self.data.iter() {
+            let (k, v) = item.map_err(backend)?;
+            let prefix = k[..k.len() - 8].to_vec();
+            if last_prefix.as_deref() == Some(&prefix) {
+                continue;
+            }
+            last_prefix = Some(prefix);
+            let value = match v.split_first() {
+                Some((&TAG_VALUE, payload)) => Some(payload.to_vec()),
+                _ => None, // tombstone or empty
+            };
+            out.push((unescape_prefix(&k), value, version_of(&k)));
         }
         Ok(out)
     }
