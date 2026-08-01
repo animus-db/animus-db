@@ -18,11 +18,15 @@ the Elle-style recorder/checker (`custos-test`), a DynamoDB-style item API over
 the core (`custos-dynamo`), a **runnable node + CLI** assembling the planes
 over `ProdEnv` and serving clients over TCP — runnable as one process
 (`custosd --cluster N`) or one process per node (`custosd --config FILE --node I`,
-config via `gen-config`) — and the **topology-aware placement engine**
+config via `gen-config`) — the **topology-aware placement engine**
 (`custos-placement`: residency + failure-domain spread, driving control-plane
-`CasTabletReplicas`). Skeletons / future work:
-`custos-consensus` (Accord transactions), `custos-cql` (wire
-protocol), plus the DynamoDB/CQL wire protocols.
+`CasTabletReplicas`), and a **first minimal slice of Accord-style leaderless
+transaction consensus** (`custos-consensus`: PreAccept→Commit fast path +
+PreAccept→Accept→Commit slow path, dependency tracking, consistent commit order
+— but no execution/durability/recovery yet; ADR 0011). Skeletons / future work:
+`custos-cql` (wire protocol), plus the DynamoDB/CQL wire protocols, and the
+deferred remainder of Accord (execution/Apply, durability, coordinator
+failover).
 
 ## Per-crate guides
 
@@ -182,6 +186,21 @@ End-to-end through real Raft under fault injection in
 `placement_auto_reconcile.rs` (automatic). Deferred: residency on the
 repair/handoff/backup paths, a cluster-default policy, and operator-facing
 policy management.
+
+### Transaction consensus (`custos-consensus`)
+
+A **first minimal slice** of Accord-style leaderless transactions (ADR 0011),
+built in the same shape as the control-plane Raft: a synchronous, I/O-free
+`AccordCore` (logical-clock timestamps, replica + coordinator state, returns
+outbound messages) wrapped by a thin `AccordNode<E>` driver over `Env`. A
+coordinator mints a unique timestamp `t0`, broadcasts `PreAccept`, and either
+commits at `t0` in one round trip (fast path, when a fast quorum agrees on `t0`
+and deps) or runs an `Accept` round to pick a higher execution timestamp and
+union deps (slow path) before `Commit`. Conflicts are intersecting key sets;
+the slice proves two conflicting transactions commit in a *consistent timestamp
+order on every replica*. **Deferred:** execution/Apply, durability/recovery,
+coordinator failover, the full dependency wait-graph, and sharding — see ADR
+0011 and the crate guide.
 
 ### Storage (`custos-storage`)
 

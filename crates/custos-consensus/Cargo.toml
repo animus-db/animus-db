@@ -6,9 +6,18 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "CustosDB Accord-style transactional escalation (later)."
+description = "CustosDB Accord-style leaderless transaction consensus."
 
 [lints]
 workspace = true
 
 [dependencies]
+custos-env.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+custos-sim.workspace = true
