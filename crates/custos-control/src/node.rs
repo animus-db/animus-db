@@ -9,7 +9,11 @@ use custos_env::{Env, EnvExt, NodeId};
 use futures::future::{Either, select};
 
 use crate::meta::{MetaCommand, Metadata};
+use crate::persist::PersistedState;
 use crate::raft::{ProposeResult, RaftCore, RaftMsg, Role};
+
+/// File name of the per-node Raft write-ahead log on the `Env` disk.
+const WAL: &str = "raft.wal";
 
 /// A running control-plane node. Cheap to clone; clones share one [`RaftCore`].
 #[derive(Clone)]
@@ -32,7 +36,7 @@ impl<E: Env> RaftNode<E> {
             env: env.clone(),
             core: Arc::clone(&core),
         };
-        env.spawn_task(drive(env.clone(), core));
+        env.spawn_task(drive(env.clone(), core, all_nodes));
         node
     }
 
@@ -86,10 +90,23 @@ impl<E: Env> RaftNode<E> {
     }
 }
 
-/// The per-node driver loop: wait for the next message or timer, hand it to the
-/// core, and ship whatever the core wants sent.
-async fn drive<E: Env>(env: E, core: Arc<Mutex<RaftCore>>) {
+/// The per-node driver loop: recover durable state, then repeatedly wait for the
+/// next message or timer, hand it to the core, persist the resulting durable
+/// changes, and ship whatever the core wants sent.
+async fn drive<E: Env>(env: E, core: Arc<Mutex<RaftCore>>, all_nodes: Vec<NodeId>) {
+    // Recover from the WAL before serving anything.
+    let bytes = env.read(WAL).await.unwrap_or_default();
+    let state = PersistedState::replay(PersistedState::decode(&bytes));
+    if !state.is_empty() {
+        let recovered =
+            RaftCore::recovered(env.node_id(), &all_nodes, state, env.now(), env.next_u64());
+        *core.lock().expect("raft core poisoned") = recovered;
+    }
+
     loop {
+        // Persist anything queued out-of-band (e.g. a client `propose`).
+        flush_wal(&env, &core).await;
+
         let now = env.now();
         let deadline = core.lock().expect("raft core poisoned").next_deadline();
         let wait = Duration::from_nanos(deadline.0.saturating_sub(now.0));
@@ -118,9 +135,28 @@ async fn drive<E: Env>(env: E, core: Arc<Mutex<RaftCore>>) {
             }
         };
 
+        // Durability before action: persist (and fsync) the core's state changes
+        // before sending the responses that depend on them (a granted vote, an
+        // acknowledged append).
+        flush_wal(&env, &core).await;
+
         for (to, msg) in outs {
             let bytes = serde_json::to_vec(&msg).expect("raft message serializes");
             env.send(to, bytes).await;
         }
     }
+}
+
+/// Append and `fsync` any pending durable-state records to the WAL.
+async fn flush_wal<E: Env>(env: &E, core: &Arc<Mutex<RaftCore>>) {
+    let records = core.lock().expect("raft core poisoned").drain_persist();
+    if records.is_empty() {
+        return;
+    }
+    for record in &records {
+        env.append(WAL, &PersistedState::encode_record(record))
+            .await
+            .expect("wal append");
+    }
+    env.sync(WAL).await.expect("wal sync");
 }

@@ -56,7 +56,8 @@ struct Recovered {
 impl Recovered {
     /// All appends to `key`, as `((key, value), appender_txn)` pairs.
     fn appends_to(&self, key: Key) -> impl Iterator<Item = (&(Key, ListVal), &usize)> {
-        self.appender.range((key, ListVal::MIN)..=(key, ListVal::MAX))
+        self.appender
+            .range((key, ListVal::MIN)..=(key, ListVal::MAX))
     }
 }
 

@@ -9,8 +9,13 @@
 //! Implemented Raft rules: terms and single-vote-per-term, log up-to-dateness
 //! for granting votes, randomized election timeouts, `AppendEntries` consistency
 //! check with conflict truncation, and commit advancement restricted to
-//! current-term entries via majority `matchIndex`. Not yet implemented:
-//! persistence/restart-recovery and log compaction (ADR 0009).
+//! current-term entries via majority `matchIndex`. Durability is handled
+//! out-of-band: the core emits [`WalRecord`]s (see [`drain_persist`]) that the
+//! driver persists; recovery is via [`recovered`]. Not yet implemented: WAL
+//! compaction (ADR 0009).
+//!
+//! [`drain_persist`]: RaftCore::drain_persist
+//! [`recovered`]: RaftCore::recovered
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
@@ -19,6 +24,7 @@ use custos_env::{Nanos, NodeId};
 use serde::{Deserialize, Serialize};
 
 use crate::meta::{MetaCommand, Metadata};
+use crate::persist::{PersistedState, WalRecord};
 
 /// A replicated log entry.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -122,6 +128,11 @@ pub struct RaftCore {
     // divergence checks).
     metadata: Metadata,
     applied: Vec<MetaCommand>,
+
+    // Durable-state changes awaiting write to the WAL, plus the hard state last
+    // marked for persistence (to detect term/vote changes).
+    pending: Vec<WalRecord>,
+    persisted_hard: (u64, Option<NodeId>),
 }
 
 impl RaftCore {
@@ -149,9 +160,48 @@ impl RaftCore {
             heartbeat_deadline: Nanos(0),
             metadata: Metadata::default(),
             applied: Vec::new(),
+            pending: Vec::new(),
+            persisted_hard: (0, None),
         };
         core.reset_election_timer(now, entropy);
         core
+    }
+
+    /// Recover a node from its durable state, then resume as a follower.
+    ///
+    /// The log, term, and vote are restored verbatim; the state machine is
+    /// restored from the latest checkpoint (so committed, non-idempotent
+    /// commands are not re-applied). `commit_index` starts at the checkpoint and
+    /// is re-advanced by the leader.
+    pub fn recovered(
+        id: NodeId,
+        all_nodes: &[NodeId],
+        persisted: PersistedState,
+        now: Nanos,
+        entropy: u64,
+    ) -> Self {
+        let mut core = Self::new(id, all_nodes, now, entropy);
+        core.current_term = persisted.term;
+        core.voted_for = persisted.voted_for;
+        core.log = persisted.log;
+        if let Some((metadata, last_applied)) = persisted.snapshot {
+            core.metadata = metadata;
+            core.last_applied = last_applied;
+            core.commit_index = last_applied;
+        }
+        // Already durable: do not re-emit it.
+        core.persisted_hard = (core.current_term, core.voted_for);
+        core.pending.clear();
+        core
+    }
+
+    /// Take the durable-state changes accumulated since the last drain. The
+    /// driver writes and `fsync`s these before sending any outbound message.
+    /// Captures any term/vote change first, so a granted vote is durable before
+    /// it is sent.
+    pub fn drain_persist(&mut self) -> Vec<WalRecord> {
+        self.checkpoint_hard();
+        std::mem::take(&mut self.pending)
     }
 
     // ---- accessors -------------------------------------------------------
@@ -230,6 +280,33 @@ impl RaftCore {
         let base = self.election_base.as_nanos() as u64;
         let extra = if base == 0 { 0 } else { entropy % base };
         self.election_deadline = Nanos(now.0.saturating_add(base + extra));
+    }
+
+    // ---- durable-state helpers ------------------------------------------
+
+    /// Append a log entry and record it for persistence.
+    fn log_append(&mut self, entry: LogEntry) {
+        self.pending.push(WalRecord::Append(entry.clone()));
+        self.log.push(entry);
+    }
+
+    /// Truncate the log to `keep` entries and record it for persistence.
+    fn log_truncate(&mut self, keep: usize) {
+        self.log.truncate(keep);
+        self.pending.push(WalRecord::Truncate { keep });
+    }
+
+    /// Emit a hard-state record if the term or vote changed since last persisted.
+    /// Called at the end of every public entry point.
+    fn checkpoint_hard(&mut self) {
+        let hard = (self.current_term, self.voted_for);
+        if hard != self.persisted_hard {
+            self.persisted_hard = hard;
+            self.pending.push(WalRecord::Hard {
+                term: hard.0,
+                voted_for: hard.1,
+            });
+        }
     }
 
     // ---- driving entry points -------------------------------------------
@@ -313,7 +390,7 @@ impl RaftCore {
             };
         }
         let index = self.last_log_index() + 1;
-        self.log.push(LogEntry {
+        self.log_append(LogEntry {
             term: self.current_term,
             index,
             command,
@@ -421,12 +498,12 @@ impl RaftCore {
             idx += 1;
             if self.last_log_index() >= idx {
                 if self.term_at(idx) != entry.term {
-                    self.log.truncate((idx - 1) as usize);
-                    self.log.push(entry);
+                    self.log_truncate((idx - 1) as usize);
+                    self.log_append(entry);
                 }
                 // else: already present and matching; skip.
             } else {
-                self.log.push(entry);
+                self.log_append(entry);
             }
         }
         let match_index = idx;
@@ -515,7 +592,7 @@ impl RaftCore {
             self.match_index.insert(p, 0);
         }
         // No-op entry so prior-term entries can be committed under our term.
-        self.log.push(LogEntry {
+        self.log_append(LogEntry {
             term: self.current_term,
             index: last + 1,
             command: MetaCommand::NoOp,
@@ -573,11 +650,20 @@ impl RaftCore {
     }
 
     fn apply(&mut self) {
+        let start = self.last_applied;
         while self.last_applied < self.commit_index {
             self.last_applied += 1;
             let command = self.log[(self.last_applied - 1) as usize].command.clone();
             self.metadata.apply(&command);
             self.applied.push(command);
+        }
+        if self.last_applied > start {
+            // Checkpoint the applied state so recovery need not re-apply
+            // (which would double-apply non-idempotent commands like CAS).
+            self.pending.push(WalRecord::Snapshot {
+                metadata: self.metadata.clone(),
+                last_applied: self.last_applied,
+            });
         }
     }
 

@@ -15,8 +15,10 @@
 
 pub mod meta;
 pub mod node;
+pub mod persist;
 pub mod raft;
 
 pub use meta::{ApplyOutcome, Member, MetaCommand, Metadata, NodeStatus};
 pub use node::RaftNode;
+pub use persist::{PersistedState, WalRecord};
 pub use raft::{LogEntry, ProposeResult, RaftCore, RaftMsg, Role};

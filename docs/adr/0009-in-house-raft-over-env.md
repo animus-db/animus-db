@@ -37,11 +37,15 @@ truncation, commit only of current-term entries via majority `matchIndex`).
 
 - The control plane is deterministic and testable under simulation today, which
   is the whole point of the project.
-- We own and must maintain a Raft implementation. It is deliberately minimal:
-  **persistence/restart-recovery of Raft hard state and snapshotting/log
-  compaction are not implemented yet** — a crashed control node stays down
-  rather than recovering, which is sufficient for the M3 acceptance (surviving a
-  leader kill) but must be addressed before production.
+- We own and must maintain a Raft implementation. It is deliberately minimal.
+  Durability is now implemented (follow-up to M3): the core emits a write-ahead
+  log of hard-state/log/checkpoint records that the driver `fsync`s before
+  acting, and recovers from on startup (see `persist.rs`); the state machine is
+  checkpointed so recovery does not re-apply (and thus double-apply) committed
+  commands. **Still deferred:** WAL compaction/truncation (it grows unbounded),
+  and a full in-simulation process *restart-and-rejoin* test — the latter needs
+  the simulator to support stopping and replacing a node's tasks, which it does
+  not yet; recovery is currently validated at the `RaftCore` level.
 - If we later need the maturity of `openraft`, the `Env`-driven boundary (a sync
   core + an I/O driver) is a clean place to swap implementations, and a `madsim`
   backend behind `Env` (ADR 0003) would let a third-party Raft run
