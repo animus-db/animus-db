@@ -1,16 +1,20 @@
 //! CustosDB node server (`custosd`).
 //!
-//! Usage:
-//!   custosd --cluster N [--dir DIR] [--ip ADDR]
+//! Three modes:
 //!
-//! Starts an `N`-node CustosDB cluster in one process over real TCP loopback
-//! (each node still runs its own control/data/coord `ProdEnv` listeners and a
-//! client server), prints each node's client address, and runs until Ctrl-C.
-//! This is the simplest runnable form; per-process deployment with a config
-//! file is future work.
+//! ```text
+//! custosd gen-config --nodes N [--host H] [--base-port P]   # print a cluster config (JSON)
+//! custosd --config FILE --node I [--dir DIR]                # run node I of a cluster (one process)
+//! custosd --cluster N [--dir DIR] [--ip ADDR]               # run an N-node cluster in one process
+//! ```
+//!
+//! Per-process deployment: generate a config once, copy it to each host, and run
+//! `custosd --config cluster.json --node I` with a distinct `I` per process.
 
 use std::net::IpAddr;
 use std::process::ExitCode;
+
+use custosd::ClusterConfig;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -20,78 +24,143 @@ async fn main() -> ExitCode {
         )
         .init();
 
-    let args = match Args::parse(std::env::args().skip(1)) {
-        Ok(args) => args,
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let result = match args.first().map(String::as_str) {
+        Some("gen-config") => gen_config(&args[1..]),
+        _ => run(&args).await,
+    };
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
         Err(msg) => {
-            eprintln!("custosd: {msg}\n\nusage: custosd --cluster N [--dir DIR] [--ip ADDR]");
-            return ExitCode::FAILURE;
+            eprintln!("custosd: {msg}\n\n{USAGE}");
+            ExitCode::FAILURE
         }
-    };
+    }
+}
 
-    let (r, w) = quorum(args.cluster);
-    let bound = match custosd::bind_cluster(args.cluster, args.ip, &args.dir).await {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("custosd: failed to bind cluster: {e}");
-            return ExitCode::FAILURE;
+const USAGE: &str = "usage:\n  \
+    custosd gen-config --nodes N [--host H] [--base-port P]\n  \
+    custosd --config FILE --node I [--dir DIR]\n  \
+    custosd --cluster N [--dir DIR] [--ip ADDR]";
+
+/// `gen-config`: print a generated cluster config as JSON.
+fn gen_config(args: &[String]) -> Result<(), String> {
+    let mut nodes = None;
+    let mut host: IpAddr = "127.0.0.1".parse().unwrap();
+    let mut base_port: u16 = 7100;
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--nodes" => nodes = Some(parse_next(&mut it, "--nodes")?),
+            "--host" => host = parse_next(&mut it, "--host")?,
+            "--base-port" => base_port = parse_next(&mut it, "--base-port")?,
+            other => return Err(format!("unknown gen-config argument `{other}`")),
         }
-    };
-    let nodes = custosd::start_cluster(bound, r, w);
-
+    }
+    let nodes: usize = nodes.ok_or("gen-config needs --nodes N")?;
+    if nodes == 0 {
+        return Err("--nodes must be at least 1".into());
+    }
     println!(
-        "custosd: started {}-node cluster (R={r}, W={w})",
-        nodes.len()
+        "{}",
+        ClusterConfig::generate(nodes, host, base_port).to_json()
     );
+    Ok(())
+}
+
+/// `--config/--node` (per-process) or `--cluster` (in-process) run modes.
+async fn run(args: &[String]) -> Result<(), String> {
+    let mut config_path: Option<String> = None;
+    let mut node: Option<usize> = None;
+    let mut cluster: Option<usize> = None;
+    let mut dir: Option<std::path::PathBuf> = None;
+    let mut ip: IpAddr = "127.0.0.1".parse().unwrap();
+
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--config" => config_path = Some(parse_next(&mut it, "--config")?),
+            "--node" => node = Some(parse_next(&mut it, "--node")?),
+            "--cluster" => cluster = Some(parse_next(&mut it, "--cluster")?),
+            "--dir" => dir = Some(parse_next::<String>(&mut it, "--dir")?.into()),
+            "--ip" => ip = parse_next(&mut it, "--ip")?,
+            other => return Err(format!("unknown argument `{other}`")),
+        }
+    }
+
+    match (config_path, cluster) {
+        (Some(_), Some(_)) => Err("use either --config or --cluster, not both".into()),
+        (Some(path), None) => {
+            let index = node.ok_or("--config requires --node I")?;
+            run_single(&path, index, dir).await
+        }
+        (None, Some(n)) => run_in_process_cluster(n, ip, dir).await,
+        (None, None) => Err("nothing to do".into()),
+    }
+}
+
+/// Per-process: run node `index` from the config file.
+async fn run_single(
+    path: &str,
+    index: usize,
+    dir: Option<std::path::PathBuf>,
+) -> Result<(), String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("reading {path}: {e}"))?;
+    let config = ClusterConfig::from_json(&text).map_err(|e| format!("parsing {path}: {e}"))?;
+    let dir = dir.unwrap_or_else(|| std::env::temp_dir().join(format!("custosd-node-{index}")));
+
+    let node = custosd::run_node(&config, index, &dir)
+        .await
+        .map_err(|e| format!("failed to start node {index}: {e}"))?;
+    println!(
+        "custosd: node {index}/{} up (R={}, W={}) — client {}",
+        config.len(),
+        config.r,
+        config.w,
+        node.client_addr()
+    );
+    println!("custosd: ready — Ctrl-C to stop");
+    wait_for_ctrl_c().await;
+    Ok(())
+}
+
+/// In-process: run an `n`-node cluster (dev convenience).
+async fn run_in_process_cluster(
+    n: usize,
+    ip: IpAddr,
+    dir: Option<std::path::PathBuf>,
+) -> Result<(), String> {
+    if n == 0 {
+        return Err("--cluster must be at least 1".into());
+    }
+    let dir = dir.unwrap_or_else(|| std::env::temp_dir().join("custosd"));
+    let majority = n / 2 + 1;
+    let bound = custosd::bind_cluster(n, ip, &dir)
+        .await
+        .map_err(|e| format!("failed to bind cluster: {e}"))?;
+    let nodes = custosd::start_cluster(bound, majority, majority);
+
+    println!("custosd: started {n}-node cluster (R={majority}, W={majority})");
     for (i, node) in nodes.iter().enumerate() {
         println!("  node {i}: client {}", node.client_addr());
     }
     println!("custosd: ready — Ctrl-C to stop");
+    wait_for_ctrl_c().await;
+    Ok(())
+}
 
+async fn wait_for_ctrl_c() {
     if let Err(e) = tokio::signal::ctrl_c().await {
         tracing::warn!(?e, "failed to listen for Ctrl-C");
     }
     println!("custosd: shutting down");
-    ExitCode::SUCCESS
 }
 
-/// A simple majority quorum for `n` replicas with `R + W > N`.
-fn quorum(n: usize) -> (usize, usize) {
-    let majority = n / 2 + 1;
-    (majority, majority)
-}
-
-struct Args {
-    cluster: usize,
-    dir: std::path::PathBuf,
-    ip: IpAddr,
-}
-
-impl Args {
-    fn parse(mut args: impl Iterator<Item = String>) -> Result<Self, String> {
-        let mut cluster = None;
-        let mut dir = std::env::temp_dir().join("custosd");
-        let mut ip: IpAddr = "127.0.0.1".parse().unwrap();
-        while let Some(arg) = args.next() {
-            match arg.as_str() {
-                "--cluster" => {
-                    let v = args.next().ok_or("--cluster needs a value")?;
-                    cluster = Some(v.parse().map_err(|_| "--cluster must be a number")?);
-                }
-                "--dir" => dir = args.next().ok_or("--dir needs a value")?.into(),
-                "--ip" => {
-                    ip = args
-                        .next()
-                        .ok_or("--ip needs a value")?
-                        .parse()
-                        .map_err(|_| "--ip must be an IP address")?;
-                }
-                other => return Err(format!("unknown argument `{other}`")),
-            }
-        }
-        let cluster = cluster.ok_or("--cluster N is required")?;
-        if cluster == 0 {
-            return Err("--cluster must be at least 1".into());
-        }
-        Ok(Self { cluster, dir, ip })
-    }
+fn parse_next<T: std::str::FromStr>(
+    it: &mut std::slice::Iter<'_, String>,
+    flag: &str,
+) -> Result<T, String> {
+    let raw = it.next().ok_or_else(|| format!("{flag} needs a value"))?;
+    raw.parse()
+        .map_err(|_| format!("invalid value for {flag}: `{raw}`"))
 }

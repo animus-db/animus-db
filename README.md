@@ -66,6 +66,8 @@ data nodes keep serving on cached metadata; only topology changes block. See
 
 ## Running a cluster
 
+In one process (dev convenience):
+
 ```sh
 cargo run -p custosd --bin custosd -- --cluster 3   # prints each node's client address
 cargo run -p custos-cli -- status 127.0.0.1:<port>
@@ -73,8 +75,14 @@ cargo run -p custos-cli -- put    127.0.0.1:<port> mykey myvalue
 cargo run -p custos-cli -- get    127.0.0.1:<port> mykey
 ```
 
-This runs a 3-node cluster in one process over loopback TCP (real `ProdEnv`);
-per-process deployment with a config file is future work.
+One process per node (real deployment) — generate a config once, then run a
+process per node with a distinct `--node` index (on one host or many):
+
+```sh
+custosd gen-config --nodes 3 --host 10.0.0.1 > cluster.json
+custosd --config cluster.json --node 0      # on each node, with a distinct --node
+custos status 10.0.0.1:<node-0 client port>
+```
 
 ## Building
 

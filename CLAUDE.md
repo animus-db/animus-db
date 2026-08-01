@@ -13,11 +13,12 @@ Status: pre-alpha. Implemented: the scaffold, the `Env` seam, storage (in-memory
 + persistent `fjall`), the control-plane Raft (with WAL durability + recovery),
 the quorum data-plane vertical slice, tablet split/merge + multi-tablet routing,
 the Elle-style recorder/checker (`custos-test`), a DynamoDB-style item API over
-the core (`custos-dynamo`), and a **runnable node + CLI** (`custosd --cluster N`
-+ `custos`) assembling the planes over `ProdEnv` and serving clients over TCP.
-Skeletons / future work: `custos-placement` (residency), `custos-consensus`
-(Accord transactions), `custos-cql` (wire protocol), plus Raft WAL compaction,
-per-process `custosd` deployment, and the DynamoDB/CQL wire protocols.
+the core (`custos-dynamo`), and a **runnable node + CLI** assembling the planes
+over `ProdEnv` and serving clients over TCP — runnable as one process
+(`custosd --cluster N`) or one process per node (`custosd --config FILE --node I`,
+config via `gen-config`). Skeletons / future work: `custos-placement`
+(residency), `custos-consensus` (Accord transactions), `custos-cql` (wire
+protocol), plus Raft WAL compaction and the DynamoDB/CQL wire protocols.
 
 ## Per-crate guides
 

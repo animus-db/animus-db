@@ -13,6 +13,10 @@ CLI wrapper. `custos-cli` depends on this crate for the client protocol types.
 - `Node::bind` → `BoundNode::start` — two-phase construction (bind listeners,
   then install the peer address book and start protocols), so a cluster can use
   ephemeral ports and exchange addresses afterward.
+- `config::ClusterConfig` — the per-process deployment config (every node's four
+  addresses + quorum sizes). Node ids follow a fixed convention from the index
+  (control `i`, data `100+i`, coord `200+i`) so processes agree without listing
+  ids. `run_node(config, index, dir)` binds *this* node and starts it.
 - `bind_cluster` / `start_cluster` — spin up an in-process cluster (the binary's
   `--cluster N` mode and `tests/cluster.rs`).
 - `ClientRequest` / `ClientResponse` + `read_frame` / `write_frame` — the
@@ -32,12 +36,19 @@ CLI wrapper. `custos-cli` depends on this crate for the client protocol types.
   version assignment (HLC) is still future work.
 - Client ops are serialized per node behind `coord_lock` so concurrent ops don't
   contend on the single coord inbox. Concurrency is future work.
-- `--cluster N` runs the whole cluster in one process over loopback TCP;
-  per-process deployment with a config file is future work.
+- Two run modes: `--cluster N` (whole cluster in one process, dev convenience)
+  and `--config FILE --node I` (one node per process — real deployment). Both
+  share `Node::bind`/`start`; only address/peer assembly differs.
 
 ## Tests / running
 
-`cargo test -p custosd --test cluster` — a real-TCP 3-node cluster (uses real
-time, so it polls with timeouts, not deterministic assertions).
-Run it: `cargo run -p custosd --bin custosd -- --cluster 3` then
-`cargo run -p custos-cli -- status <printed-addr>`.
+`cargo test -p custosd` — `tests/cluster.rs` (in-process cluster) and
+`tests/per_process.rs` (nodes started independently from a shared config). Both
+use real TCP/time, so they poll with timeouts, not deterministic assertions.
+
+Per-process run:
+```sh
+custosd gen-config --nodes 3 > cluster.json
+custosd --config cluster.json --node 0   # one process per node, distinct --node
+custos status <node-0 client addr>
+```

@@ -29,6 +29,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+pub mod config;
+pub use config::ClusterConfig;
+
 use custos_control::{MetaCommand, Metadata, NodeStatus, RaftNode};
 use custos_data::{DataClient, ReadResult, ReplicaHandle, TabletView, serve_replica};
 use custos_env::{NodeId, ProdEnv};
@@ -68,7 +71,7 @@ pub enum ClientResponse {
 }
 
 /// Listen addresses for a node's four endpoints (use port 0 for ephemeral).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct RoleAddrs {
     pub control: SocketAddr,
     pub data: SocketAddr,
@@ -327,8 +330,8 @@ impl ClientCtx {
     }
 }
 
-/// Bind an `n`-node cluster on `ip` with ephemeral ports and conventional ids
-/// (control `i`, data `100+i`, coord `200+i`), each under `dir/node-i`.
+/// Bind an `n`-node cluster on `ip` with ephemeral ports and the conventional
+/// ids (control `i`, data `100+i`, coord `200+i`), each under `dir/node-i`.
 ///
 /// # Errors
 /// Propagates any bind failure.
@@ -340,17 +343,17 @@ pub async fn bind_cluster(
     let dir = dir.into();
     let mut nodes = Vec::with_capacity(n);
     for i in 0..n {
-        let addr = |port| SocketAddr::new(ip, port);
+        let addr = || SocketAddr::new(ip, 0);
         let addrs = RoleAddrs {
-            control: addr(0),
-            data: addr(0),
-            coord: addr(0),
-            client: addr(0),
+            control: addr(),
+            data: addr(),
+            coord: addr(),
+            client: addr(),
         };
         let node = Node::bind(
-            i as NodeId,
-            100 + i as NodeId,
-            200 + i as NodeId,
+            config::control_id(i),
+            config::data_id(i),
+            config::coord_id(i),
             addrs,
             dir.join(format!("node-{i}")),
         )
@@ -363,14 +366,40 @@ pub async fn bind_cluster(
 /// Start a cluster previously bound with [`bind_cluster`] (quorum `r`/`w`).
 pub fn start_cluster(bound: Vec<BoundNode>, r: usize, w: usize) -> Vec<Node> {
     let n = bound.len();
-    let control_ids: Vec<NodeId> = (0..n as NodeId).collect();
-    let data_ids: Vec<NodeId> = (0..n as NodeId).map(|i| 100 + i).collect();
+    let control_ids: Vec<NodeId> = (0..n).map(config::control_id).collect();
+    let data_ids: Vec<NodeId> = (0..n).map(config::data_id).collect();
     let peers: BTreeMap<NodeId, SocketAddr> =
         bound.iter().flat_map(BoundNode::peer_entries).collect();
     bound
         .into_iter()
         .map(|b| b.start(peers.clone(), control_ids.clone(), data_ids.clone(), r, w))
         .collect()
+}
+
+/// Start the single node at `index` in `config` (per-process deployment): bind
+/// this node's configured listeners, wire the cluster's peer address book from
+/// the config, and start its protocols.
+///
+/// # Errors
+/// Returns `InvalidInput` if `index` is out of range, or propagates a bind
+/// failure.
+pub async fn run_node(
+    config: &ClusterConfig,
+    index: usize,
+    dir: impl Into<PathBuf>,
+) -> std::io::Result<Node> {
+    let addrs = *config.nodes.get(index).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "node index out of range")
+    })?;
+    let (control_id, data_id, coord_id) = config.role_ids(index);
+    let bound = Node::bind(control_id, data_id, coord_id, addrs, dir).await?;
+    Ok(bound.start(
+        config.peer_book(),
+        config.control_ids(),
+        config.data_ids(),
+        config.r,
+        config.w,
+    ))
 }
 
 /// Write a length-prefixed (`u32` big-endian) JSON frame.
