@@ -32,6 +32,7 @@ use std::time::Duration;
 pub mod config;
 pub use config::ClusterConfig;
 
+mod cql;
 mod dynamo;
 
 use custos_control::{MetaCommand, Metadata, NodeStatus, RaftNode};
@@ -72,7 +73,7 @@ pub enum ClientResponse {
     Error(String),
 }
 
-/// Listen addresses for a node's five endpoints (use port 0 for ephemeral).
+/// Listen addresses for a node's six endpoints (use port 0 for ephemeral).
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct RoleAddrs {
     pub control: SocketAddr,
@@ -80,14 +81,18 @@ pub struct RoleAddrs {
     pub coord: SocketAddr,
     pub client: SocketAddr,
     /// The DynamoDB JSON-over-HTTP endpoint. Defaults (when absent in older
-    /// configs) to the client port + 1.
-    #[serde(default = "default_dynamo_addr")]
+    /// configs) to an ephemeral loopback port.
+    #[serde(default = "default_ephemeral_addr")]
     pub dynamo: SocketAddr,
+    /// The CQL (Cassandra) binary-protocol endpoint. Defaults (when absent in
+    /// older configs) to an ephemeral loopback port.
+    #[serde(default = "default_ephemeral_addr")]
+    pub cql: SocketAddr,
 }
 
-/// Fallback DynamoDB endpoint for configs written before the field existed:
-/// an ephemeral port on the loopback (the real port is learned after bind).
-fn default_dynamo_addr() -> SocketAddr {
+/// Fallback endpoint for configs written before a field existed: an ephemeral
+/// port on the loopback (the real port is learned after bind).
+fn default_ephemeral_addr() -> SocketAddr {
     SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0)
 }
 
@@ -108,6 +113,8 @@ pub struct BoundNode {
     client_addr: SocketAddr,
     dynamo_listener: TcpListener,
     dynamo_addr: SocketAddr,
+    cql_listener: TcpListener,
+    cql_addr: SocketAddr,
 }
 
 impl BoundNode {
@@ -129,6 +136,11 @@ impl BoundNode {
     /// The address the DynamoDB JSON/HTTP endpoint listens on.
     pub fn dynamo_addr(&self) -> SocketAddr {
         self.dynamo_addr
+    }
+
+    /// The address the CQL binary-protocol endpoint listens on.
+    pub fn cql_addr(&self) -> SocketAddr {
+        self.cql_addr
     }
 
     /// Wire the peer address book into every env and start all protocols.
@@ -159,8 +171,8 @@ impl BoundNode {
             tokio::spawn(bootstrap(raft, members, data_ids));
         }
 
-        // Client request server + DynamoDB HTTP endpoint share one context
-        // (the same coordinator, raft view, and serialization lock).
+        // Client request server + DynamoDB HTTP + CQL endpoints share one
+        // context (the same coordinator, raft view, and serialization lock).
         {
             let ctx = ClientCtx {
                 raft: raft.clone(),
@@ -170,7 +182,8 @@ impl BoundNode {
                 w,
             };
             tokio::spawn(serve_clients(self.client_listener, ctx.clone()));
-            tokio::spawn(dynamo::serve(self.dynamo_listener, ctx));
+            tokio::spawn(dynamo::serve(self.dynamo_listener, ctx.clone()));
+            tokio::spawn(cql::serve(self.cql_listener, ctx));
         }
 
         Node {
@@ -178,6 +191,7 @@ impl BoundNode {
             _replica: replica,
             client_addr: self.client_addr,
             dynamo_addr: self.dynamo_addr,
+            cql_addr: self.cql_addr,
         }
     }
 }
@@ -188,11 +202,13 @@ pub struct Node {
     _replica: ReplicaHandle<MemoryEngine>,
     client_addr: SocketAddr,
     dynamo_addr: SocketAddr,
+    cql_addr: SocketAddr,
 }
 
 impl Node {
-    /// Bind this node's four listeners (control/data/coord internal envs + the
-    /// client TCP server) and create its data directory.
+    /// Bind this node's listeners (control/data/coord internal envs + the client
+    /// TCP server + the DynamoDB HTTP and CQL endpoints) and create its data
+    /// directory.
     ///
     /// # Errors
     /// Propagates any bind / directory-creation failure.
@@ -213,6 +229,8 @@ impl Node {
         let client_addr = client_listener.local_addr()?;
         let dynamo_listener = TcpListener::bind(addrs.dynamo).await?;
         let dynamo_addr = dynamo_listener.local_addr()?;
+        let cql_listener = TcpListener::bind(addrs.cql).await?;
+        let cql_addr = cql_listener.local_addr()?;
         Ok(BoundNode {
             control_id,
             data_id,
@@ -227,6 +245,8 @@ impl Node {
             client_addr,
             dynamo_listener,
             dynamo_addr,
+            cql_listener,
+            cql_addr,
         })
     }
 
@@ -238,6 +258,11 @@ impl Node {
     /// The address the DynamoDB JSON/HTTP endpoint listens on.
     pub fn dynamo_addr(&self) -> SocketAddr {
         self.dynamo_addr
+    }
+
+    /// The address the CQL binary-protocol endpoint listens on.
+    pub fn cql_addr(&self) -> SocketAddr {
+        self.cql_addr
     }
 
     /// Whether this node's control replica currently believes it is leader.
@@ -384,6 +409,7 @@ pub async fn bind_cluster(
             coord: addr(),
             client: addr(),
             dynamo: addr(),
+            cql: addr(),
         };
         let node = Node::bind(
             config::control_id(i),

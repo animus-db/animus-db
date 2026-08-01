@@ -57,12 +57,27 @@ The surface now extends past the original three point ops:
   `DeleteItem`: the edge quorum-reads the current item under the coordinator
   lock and rejects a failing predicate with `ConditionalCheckFailedException`.
 
-What remains is the rest of the surface: `Scan`, projection/filter expressions,
-`ReturnValues`, document/set attribute types, secondary indexes, durable
-control-plane-replicated table schemas (and a native quorum range scan so
-`Query` need not track keys), and the parallel CQL binary protocol framing plus
-a parser/type system. `custos-cql` stays a skeleton that maps onto the same core
-in the same way.
+A third slice now exists on the CQL side: a **minimal Cassandra CQL v4 binary
+protocol** is served alongside the DynamoDB endpoint. `custos-cql` is the pure,
+deterministic protocol layer — frame header (version/flags/stream/opcode/length)
+encode/decode, the body primitives the handshake needs, and a deliberately tiny
+CQL recognizer that extracts the operation + primary key (+ value) from a single
+`INSERT INTO t (pk, v) VALUES (..)` or `SELECT * FROM t WHERE pk = ..` (it is not
+a CQL grammar). `custosd` exposes a real TCP endpoint that does the
+`STARTUP → READY` (and `OPTIONS → SUPPORTED`) handshake and routes those two
+statements **through the same quorum coordinator** the plain-TCP and DynamoDB
+edges use; an `INSERT` replies `RESULT/Void`, a `SELECT` replies `RESULT/Rows`.
+Like the DynamoDB endpoint it is production-only I/O (real tokio sockets +
+hand-rolled framing, no third-party CQL/Cassandra crate); everything below the
+socket stays on the `Env`-based paths.
+
+What remains. DynamoDB: `Scan`, projection/filter expressions, `ReturnValues`,
+document/set attribute types, secondary indexes, and durable
+control-plane-replicated table schemas (plus a native quorum range scan so
+`Query` need not track keys). CQL: a real type system + column metadata, a
+proper CQL grammar (prepared statements, batches, clustering columns, more
+statement kinds), `USE`/keyspaces and `CREATE TABLE`, paging, authentication,
+and honoring the requested consistency level (currently ignored).
 
 ## Consequences
 

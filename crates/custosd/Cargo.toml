@@ -26,6 +26,7 @@ custos-data.workspace = true
 custos-storage.workspace = true
 custos-tablet.workspace = true
 custos-dynamo.workspace = true
+custos-cql.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

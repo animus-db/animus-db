@@ -24,7 +24,9 @@ begins_with, and a `ConditionExpression` subset for conditional writes), a
 serving clients over TCP — runnable as one process (`custosd --cluster N`) or one
 process per node (`custosd --config FILE --node I`, config via `gen-config`),
 which now also **serves the DynamoDB JSON protocol over HTTP**, routing those
-requests through the same data-plane coordinator — the **topology-aware placement
+requests through the same data-plane coordinator — plus a **minimal CQL v4 wire
+protocol** (`custos-cql`: STARTUP/READY handshake + simple INSERT/SELECT-by-key,
+routed through that same coordinator) — the **topology-aware placement
 engine** (`custos-placement`: residency + failure-domain spread, with the leader
 automatically reconciling tablet placement via control-plane `CasTabletReplicas`),
 and a **slice of Accord-style leaderless transaction consensus**
@@ -32,7 +34,8 @@ and a **slice of Accord-style leaderless transaction consensus**
 path, dependency tracking, consistent commit order, plus **durable execution** —
 each replica executes committed transactions in agreed order against a WAL it
 recovers from on restart; ADR 0011). Skeletons / future work:
-`custos-cql` (CQL wire protocol), the rest of the DynamoDB surface (Scan,
+the fuller CQL surface (a real type system, CQL grammar, keyspaces,
+prepared statements) and the rest of the DynamoDB surface (Scan,
 projection/filter expressions, `ReturnValues`, document/set types, secondary
 indexes, durable/replicated table schemas), and the deferred remainder of Accord
 (coordinator failover, the full dependency wait-graph, WAL snapshotting,
