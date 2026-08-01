@@ -15,6 +15,12 @@ use crate::raft::{ProposeResult, RaftCore, RaftMsg, Role};
 /// File name of the per-node Raft write-ahead log on the `Env` disk.
 const WAL: &str = "raft.wal";
 
+/// Rewrite the WAL to its compact image once this many records have been
+/// appended since the last compaction. Bounds the WAL to the live state
+/// (latest checkpoint + hard state + current log) instead of growing with every
+/// apply.
+const WAL_COMPACT_THRESHOLD: usize = 64;
+
 /// A running control-plane node. Cheap to clone; clones share one [`RaftCore`].
 #[derive(Clone)]
 pub struct RaftNode<E: Env> {
@@ -103,9 +109,10 @@ async fn drive<E: Env>(env: E, core: Arc<Mutex<RaftCore>>, all_nodes: Vec<NodeId
         *core.lock().expect("raft core poisoned") = recovered;
     }
 
+    let mut since_compaction = 0usize;
     loop {
         // Persist anything queued out-of-band (e.g. a client `propose`).
-        flush_wal(&env, &core).await;
+        flush_and_maybe_compact(&env, &core, &mut since_compaction).await;
 
         let now = env.now();
         let deadline = core.lock().expect("raft core poisoned").next_deadline();
@@ -138,7 +145,7 @@ async fn drive<E: Env>(env: E, core: Arc<Mutex<RaftCore>>, all_nodes: Vec<NodeId
         // Durability before action: persist (and fsync) the core's state changes
         // before sending the responses that depend on them (a granted vote, an
         // acknowledged append).
-        flush_wal(&env, &core).await;
+        flush_and_maybe_compact(&env, &core, &mut since_compaction).await;
 
         for (to, msg) in outs {
             let bytes = serde_json::to_vec(&msg).expect("raft message serializes");
@@ -147,11 +154,26 @@ async fn drive<E: Env>(env: E, core: Arc<Mutex<RaftCore>>, all_nodes: Vec<NodeId
     }
 }
 
-/// Append and `fsync` any pending durable-state records to the WAL.
-async fn flush_wal<E: Env>(env: &E, core: &Arc<Mutex<RaftCore>>) {
+/// Flush pending records, counting them toward the next compaction; rewrite the
+/// WAL to its compact image once the threshold is crossed.
+async fn flush_and_maybe_compact<E: Env>(
+    env: &E,
+    core: &Arc<Mutex<RaftCore>>,
+    since_compaction: &mut usize,
+) {
+    *since_compaction += flush_wal(env, core).await;
+    if *since_compaction >= WAL_COMPACT_THRESHOLD {
+        compact_wal(env, core).await;
+        *since_compaction = 0;
+    }
+}
+
+/// Append and `fsync` any pending durable-state records to the WAL. Returns how
+/// many records were written.
+async fn flush_wal<E: Env>(env: &E, core: &Arc<Mutex<RaftCore>>) -> usize {
     let records = core.lock().expect("raft core poisoned").drain_persist();
     if records.is_empty() {
-        return;
+        return 0;
     }
     for record in &records {
         env.append(WAL, &PersistedState::encode_record(record))
@@ -159,4 +181,17 @@ async fn flush_wal<E: Env>(env: &E, core: &Arc<Mutex<RaftCore>>) {
             .expect("wal append");
     }
     env.sync(WAL).await.expect("wal sync");
+    records.len()
+}
+
+/// Atomically rewrite the WAL to the core's compact image (latest checkpoint +
+/// hard state + current log). Safe because [`flush_wal`] has already persisted
+/// everything the image is built from.
+async fn compact_wal<E: Env>(env: &E, core: &Arc<Mutex<RaftCore>>) {
+    let image = core.lock().expect("raft core poisoned").wal_image();
+    let mut bytes = Vec::new();
+    for record in &image {
+        bytes.extend(PersistedState::encode_record(record));
+    }
+    env.replace(WAL, &bytes).await.expect("wal compaction");
 }

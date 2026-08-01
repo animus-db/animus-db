@@ -601,6 +601,17 @@ impl Disk for SimEnv {
             out
         }))
     }
+
+    async fn replace(&self, file: &str, bytes: &[u8]) -> std::io::Result<()> {
+        // Atomic under the state lock: durable jumps straight to `bytes`, with no
+        // un-synced remainder. A crash keeps exactly the new contents.
+        let mut st = self.shared.lock();
+        let key = (self.node_id, file.to_owned());
+        let f = st.disks.entry(key).or_default();
+        f.durable = bytes.to_vec();
+        f.buffered.clear();
+        Ok(())
+    }
 }
 
 impl Spawner for SimEnv {

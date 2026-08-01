@@ -11,10 +11,12 @@
 //! check with conflict truncation, and commit advancement restricted to
 //! current-term entries via majority `matchIndex`. Durability is handled
 //! out-of-band: the core emits [`WalRecord`]s (see [`drain_persist`]) that the
-//! driver persists; recovery is via [`recovered`]. Not yet implemented: WAL
-//! compaction (ADR 0009).
+//! driver persists, compacting the WAL to [`wal_image`] on a threshold;
+//! recovery is via [`recovered`]. Not yet implemented: truncating the committed
+//! log prefix in memory (true log compaction) + `InstallSnapshot` (ADR 0009).
 //!
 //! [`drain_persist`]: RaftCore::drain_persist
+//! [`wal_image`]: RaftCore::wal_image
 //! [`recovered`]: RaftCore::recovered
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -202,6 +204,31 @@ impl RaftCore {
     pub fn drain_persist(&mut self) -> Vec<WalRecord> {
         self.checkpoint_hard();
         std::mem::take(&mut self.pending)
+    }
+
+    /// A minimal write-ahead-log image that replays to exactly the current
+    /// durable state: the latest state-machine checkpoint, the current hard
+    /// state, and the current log. The driver writes this in place of the
+    /// accumulated history during compaction, so the WAL is bounded by the live
+    /// state instead of growing with every apply (which appends a fresh
+    /// checkpoint each time).
+    ///
+    /// Call only after [`drain_persist`](Self::drain_persist) has been flushed,
+    /// so the image and the on-disk WAL agree.
+    pub fn wal_image(&self) -> Vec<WalRecord> {
+        let mut image = Vec::with_capacity(self.log.len() + 2);
+        if self.last_applied > 0 {
+            image.push(WalRecord::Snapshot {
+                metadata: self.metadata.clone(),
+                last_applied: self.last_applied,
+            });
+        }
+        image.push(WalRecord::Hard {
+            term: self.current_term,
+            voted_for: self.voted_for,
+        });
+        image.extend(self.log.iter().cloned().map(WalRecord::Append));
+        image
     }
 
     // ---- accessors -------------------------------------------------------

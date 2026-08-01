@@ -147,6 +147,12 @@ pub trait Disk: Send + Sync {
     /// Read the current contents of `file` (durable + buffered), or an empty
     /// vector if it does not exist.
     async fn read(&self, file: &str) -> std::io::Result<Vec<u8>>;
+
+    /// Atomically replace `file`'s durable contents with `bytes`. On return the
+    /// new contents are durable; a crash before or after sees the whole old or
+    /// whole new contents, never a mix (production does this with a temp file +
+    /// rename). Used for log/WAL compaction.
+    async fn replace(&self, file: &str, bytes: &[u8]) -> std::io::Result<()>;
 }
 
 /// Task spawning. Under production this is `tokio::spawn`; under simulation it

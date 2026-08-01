@@ -10,7 +10,8 @@ with a small **strongly-consistent Raft control plane** that owns cluster
 metadata. Correctness is established by **deterministic simulation testing**.
 
 Status: pre-alpha. Implemented: the scaffold, the `Env` seam, storage (in-memory
-+ persistent `fjall`), the control-plane Raft (with WAL durability + recovery),
++ persistent `fjall`), the control-plane Raft (with WAL durability, recovery,
+and compaction),
 the quorum data-plane vertical slice, tablet split/merge + multi-tablet routing,
 the Elle-style recorder/checker (`custos-test`), a DynamoDB-style item API over
 the core (`custos-dynamo`), and a **runnable node + CLI** assembling the planes
@@ -18,7 +19,8 @@ over `ProdEnv` and serving clients over TCP — runnable as one process
 (`custosd --cluster N`) or one process per node (`custosd --config FILE --node I`,
 config via `gen-config`). Skeletons / future work: `custos-placement`
 (residency), `custos-consensus` (Accord transactions), `custos-cql` (wire
-protocol), plus Raft WAL compaction and the DynamoDB/CQL wire protocols.
+protocol), plus Raft committed-log-prefix truncation + `InstallSnapshot`, and
+the DynamoDB/CQL wire protocols.
 
 ## Per-crate guides
 
@@ -135,8 +137,11 @@ deterministically by `SimEnv`. The split:
 
 Metadata mutations are `MetaCommand`s applied in log order; tablet placement is
 changed via epoch-keyed **compare-and-swap** (`CasTabletReplicas`), evaluated
-identically on every replica. Not yet implemented: Raft persistence/restart-
-recovery and log compaction (a crashed control node stays down).
+identically on every replica. The core emits WAL records the driver `fsync`s and
+recovers from, compacting the WAL to its live image on a threshold (`persist.rs`,
+`node.rs`). Not yet implemented: truncating the committed log prefix in memory +
+`InstallSnapshot`, and a full in-sim restart-and-rejoin (recovery is validated at
+the `RaftCore` level).
 
 ### Data plane (`custos-data`)
 

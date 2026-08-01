@@ -215,6 +215,18 @@ impl Disk for ProdEnv {
             Err(e) => Err(e),
         }
     }
+
+    async fn replace(&self, file: &str, bytes: &[u8]) -> std::io::Result<()> {
+        // Write a temp file, fsync it, then atomically rename over the target.
+        let target = self.path(file);
+        let tmp = self.path(&format!("{file}.tmp"));
+        {
+            let mut f = tokio::fs::File::create(&tmp).await?;
+            f.write_all(bytes).await?;
+            f.sync_all().await?;
+        }
+        tokio::fs::rename(&tmp, &target).await
+    }
 }
 
 impl Spawner for ProdEnv {

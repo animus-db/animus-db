@@ -29,6 +29,8 @@ the production implementation; the deterministic implementation lives in
   **single-consumer per node** — never run two receive loops on one `NodeId`.
 - `Disk` is append + explicit `sync`; bytes are not durable until `sync`
   returns. This models real crash semantics and is what `custos-sim` exploits.
+  `Disk::replace` atomically swaps a file's whole contents (temp-file + rename
+  in `ProdEnv`) — used for WAL compaction.
 - `ProdEnv` is *not* covered by the simulation tests (it's the nondeterministic
   side). Don't add logic here that the deterministic path needs to share.
 
