@@ -19,21 +19,25 @@
 //!
 //! - `<prefix>MANIFEST` — the durable source of truth: the ordered list of live
 //!   SSTable files plus per-table metadata (key range, version range, index
-//!   offset/len, size) and the engine's monotonic `max_version`. Written
-//!   **atomically** via [`Disk::replace`], so a crash sees either the whole old
-//!   or whole new manifest, never a mix.
-//! - `<prefix>wal` — a write-ahead log of [`WalRecord`]s, each one newline-framed
-//!   JSON, `append`ed then `sync`ed **before** a write is acknowledged (an ack
-//!   means durable). Holds the writes not yet folded into an SSTable.
+//!   offset/len, size), the engine's monotonic `max_version`, and the **live WAL
+//!   segment numbers**. Written **atomically** via [`Disk::replace`], so a crash
+//!   sees either the whole old or whole new manifest, never a mix.
+//! - `<prefix>wal-NNNNNN` — the write-ahead log, split into **numbered segments**
+//!   of [`WalRecord`]s, each one newline-framed JSON, `append`ed then `sync`ed
+//!   **before** a write is acknowledged (an ack means durable). The group-commit
+//!   coordinator appends to the active segment and rolls to a fresh one once it
+//!   passes a byte threshold; a flush removes whole segments it has folded into an
+//!   SSTable (see [`wal`]). Holds the writes not yet folded into an SSTable.
 //! - `<prefix>sst-NNNNNN` — immutable, sorted SSTables (see [`sstable`]).
 //!
 //! ## Write path
 //!
-//! Every mutation: serialize a [`WalRecord`], `append` + `sync` it (durable
-//! first), then apply it to the in-memory memtable (a `BTreeMap` MVCC store, the
-//! same shape as [`MemoryEngine`]'s). When the memtable crosses a size threshold
-//! it is **flushed** to a fresh SSTable, then the manifest is atomically swapped
-//! to add that table and drop the (now-redundant) WAL, and a fresh WAL begins.
+//! Every mutation: serialize a [`WalRecord`], `append` + `sync` it to the active
+//! WAL segment (durable first, via group commit), then apply it to the in-memory
+//! memtable (a `BTreeMap` MVCC store, the same shape as [`MemoryEngine`]'s). When
+//! the memtable crosses a size threshold it is **flushed** to a fresh SSTable, the
+//! manifest is atomically swapped to add that table and record the surviving WAL
+//! segments, and the WAL segments the flush fully covered are then `remove`d.
 //!
 //! ## Read path
 //!
@@ -71,9 +75,9 @@
 //!
 //! - **Mid-flush crash** (new SSTable's bytes written but not yet referenced by
 //!   the manifest, or written-and-synced but the manifest swap not done): on
-//!   reopen the manifest still names the *old* set and the WAL is intact, so the
-//!   memtable is rebuilt from the WAL and nothing is lost. An orphan SSTable file
-//!   not named by the manifest is simply ignored (and overwritten by the next
+//!   reopen the manifest still names the *old* set and the WAL segments are intact,
+//!   so the memtable is rebuilt from the WAL and nothing is lost. An orphan SSTable
+//!   file not named by the manifest is simply ignored (and overwritten by the next
 //!   flush, which reuses the next sequence number derived from the manifest).
 //! - **Mid-compaction crash** (the merged output table(s) written but manifest
 //!   not yet swapped): the manifest still names the old inputs, which are all
@@ -81,6 +85,16 @@
 //!   old set; the orphan output files (at seqs beyond the manifest's `next_seq`)
 //!   are ignored. No torn-table read is possible because a
 //!   table is only ever read once it is named by a synced manifest.
+//! - **Mid-rotation / mid-WAL-GC crash**: a WAL segment is removed only *after* a
+//!   manifest that no longer names it is durable. A crash before the swap recovers
+//!   a manifest still naming the segment (intact on disk) and replays it; a crash
+//!   after the swap but before the `remove` leaves an orphan segment file below the
+//!   live set that recovery ignores (its records are already in the SSTable).
+//!   Recovery also replays any segment file present beyond the manifest's highest
+//!   recorded segment — those carry acked writes made after the last flush — so an
+//!   un-flushed segment is never lost. A new segment's first record is `sync`ed
+//!   before its write is acked, so a half-created (un-synced) segment a crash drops
+//!   carried no ack.
 //!
 //! These properties are argued here and exercised in `tests/lsm_crash.rs`.
 
@@ -118,6 +132,11 @@ const DEFAULT_TARGET_TABLE_BYTES: usize = 2 * 1024 * 1024;
 const DEFAULT_LEVEL_FANOUT: usize = 4;
 /// Base table budget for L1 (multiplied by the fanout for deeper levels).
 const L1_TABLE_BUDGET: usize = 4;
+/// Default WAL segment size budget: once the active segment passes this many
+/// bytes, the next group-commit batch rotates to a fresh segment file. Sized near
+/// the default flush threshold so a flush usually covers and removes one or more
+/// whole segments.
+const DEFAULT_WAL_SEGMENT_BYTES: u64 = 64 * 1024;
 
 /// Tuning knobs for an [`LsmEngine`]. Defaults are sized for tests; production
 /// wiring can raise them.
@@ -133,6 +152,10 @@ pub struct LsmOptions {
     /// Level fanout: level `n` (n≥1) holds up to `L1_TABLE_BUDGET * fanout^(n-1)`
     /// tables before it cascades into level `n+1`.
     pub level_fanout: usize,
+    /// WAL segment byte budget: once the active WAL segment exceeds this, the next
+    /// group-commit batch rolls to a fresh segment file, so a flush can drop whole
+    /// covered segments rather than rewriting one growing WAL.
+    pub wal_segment_bytes: u64,
 }
 
 impl Default for LsmOptions {
@@ -142,6 +165,7 @@ impl Default for LsmOptions {
             compaction_trigger: DEFAULT_COMPACTION_TRIGGER,
             target_table_bytes: DEFAULT_TARGET_TABLE_BYTES,
             level_fanout: DEFAULT_LEVEL_FANOUT,
+            wal_segment_bytes: DEFAULT_WAL_SEGMENT_BYTES,
         }
     }
 }
@@ -203,6 +227,13 @@ struct Manifest {
     /// The engine-wide monotonic floor (highest version ever written via the
     /// `put`/`delete`/`write_batch` contract, raised by `merge` too).
     max_version: Version,
+    /// Live WAL segment numbers (ascending) the engine must replay on recovery —
+    /// the files `<prefix>wal-NNNNNN` not yet fully folded into an SSTable. An
+    /// empty list (e.g. a legacy manifest from the single-file-WAL era) is treated
+    /// as "no segmented WAL recorded" and recovery falls back to the legacy
+    /// `<prefix>wal` file (see [`LsmEngine::open_with`]).
+    #[serde(default)]
+    wal_segments: Vec<u64>,
 }
 
 /// Mutable in-memory state, guarded by a [`std::sync::Mutex`]. **No guard is
@@ -303,12 +334,39 @@ impl<E: Env> LsmEngine<E> {
         format!("{}MANIFEST", self.prefix)
     }
 
-    fn wal_file(&self) -> String {
-        format!("{}wal", self.prefix)
-    }
-
     fn sst_file(&self, seq: u64) -> String {
         format!("{}sst-{seq:06}", self.prefix)
+    }
+
+    /// Discover the WAL segments to replay on recovery: the manifest's recorded
+    /// `live` segments, augmented with any present-on-disk segments that follow the
+    /// last recorded one (created by writes after the last flush, or by a crash
+    /// mid-GC, so not yet manifest-named — but they carry acks and must be
+    /// replayed). Returns them ascending. An empty result means the legacy
+    /// single-file WAL path (no segmented WAL on disk yet).
+    async fn discover_wal_segments(env: &E, prefix: &str, live: &[u64]) -> Result<Vec<u64>> {
+        // Start from the recorded set (already ascending in the manifest).
+        let mut segs: Vec<u64> = live.to_vec();
+        // Probe forward from just past the highest recorded segment (or 0 when the
+        // manifest names none) for contiguous segment files written since. We stop
+        // at the first gap: segments are allocated strictly increasing and never
+        // reused, so a missing number means nothing higher exists.
+        let mut next = live.last().map_or(0, |&hi| hi + 1);
+        loop {
+            let file = format!("{prefix}wal-{next:06}");
+            if env.size(&file).await.map_err(io)? == 0 {
+                // Either the file does not exist, or it exists but is empty (an
+                // un-synced create dropped by a crash) — nothing to replay, and no
+                // higher contiguous segment can exist.
+                break;
+            }
+            segs.push(next);
+            next += 1;
+        }
+        // When the manifest named no segments but probing from 0 found some, those
+        // are the live set already; when probing found nothing and the manifest had
+        // none, `segs` is empty and the caller takes the legacy path.
+        Ok(segs)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -358,16 +416,41 @@ impl<E: Env> LsmEngine<E> {
             );
         }
 
-        // Replay the WAL tail into the memtable. A torn trailing record (crash
-        // mid-append, never synced/acked) is dropped by `decode`.
+        // Determine the live WAL segments to replay, then replay them in order
+        // into the memtable. A torn trailing record (crash mid-append, never
+        // synced/acked) is dropped by `decode`.
+        //
+        // The live set is the manifest's `wal_segments` *plus* any contiguous
+        // higher-numbered segment files present on disk but not yet named by a
+        // manifest — those were created by writes after the last flush (or by a
+        // crash mid-GC), and they may hold acked-but-unflushed records, so they
+        // must be replayed. This mirrors the orphan-SSTable rule, except a WAL
+        // segment is recovered (it carries acks) rather than ignored.
+        let segments = Self::discover_wal_segments(&env, &prefix, &manifest.wal_segments).await?;
+
         let mut memtable: BTreeMap<Key, History> = BTreeMap::new();
         let mut memtable_bytes = 0usize;
         let mut max_version = manifest.max_version;
-        let wal_file = format!("{prefix}wal");
-        let wal_bytes = env.read(&wal_file).await.map_err(io)?;
-        for record in decode_wal(&wal_bytes) {
-            max_version = max_version.max(record_max_version(&record));
-            apply_wal_record(&mut memtable, &mut memtable_bytes, record);
+        if segments.is_empty() {
+            // Legacy migration: a directory written by the single-file-WAL era has
+            // no recorded segments. Replay the old `<prefix>wal` file (if any) so
+            // an upgrade loses nothing; the first new flush rewrites the layout to
+            // segments and this file is left as a harmless orphan.
+            let legacy = format!("{prefix}wal");
+            let wal_bytes = env.read(&legacy).await.map_err(io)?;
+            for record in decode_wal(&wal_bytes) {
+                max_version = max_version.max(record_max_version(&record));
+                apply_wal_record(&mut memtable, &mut memtable_bytes, record);
+            }
+        } else {
+            for &seg in &segments {
+                let file = format!("{prefix}wal-{seg:06}");
+                let wal_bytes = env.read(&file).await.map_err(io)?;
+                for record in decode_wal(&wal_bytes) {
+                    max_version = max_version.max(record_max_version(&record));
+                    apply_wal_record(&mut memtable, &mut memtable_bytes, record);
+                }
+            }
         }
 
         let inner = Inner {
@@ -386,8 +469,15 @@ impl<E: Env> LsmEngine<E> {
 
         // The WAL has been fully replayed into the memtable, so every recovered
         // record is already reflected in memory: the group-commit sequence space
-        // starts fresh at 0 (the next new write is the first durable sequence).
-        let wal = Arc::new(GroupCommit::new(format!("{prefix}wal")));
+        // resumes at 0 (the next new write is the first durable sequence). The
+        // highest discovered segment becomes the active one; the rest are sealed,
+        // so a later flush can GC the covered ones. An empty discovered set means a
+        // fresh (or legacy) engine: the first write opens segment 0.
+        let wal = Arc::new(GroupCommit::new(
+            prefix.to_string(),
+            &segments,
+            opts.wal_segment_bytes,
+        ));
 
         Ok(Self {
             env,
@@ -555,9 +645,12 @@ impl<E: Env> LsmEngine<E> {
             !inner.memtable.is_empty()
                 && inner.memtable_bytes >= self.opts.flush_threshold_bytes
                 // Don't flush while a concurrent write is durable-but-unapplied:
-                // truncating the WAL now could drop that record. The writer will
-                // re-attempt the flush from its own `maybe_flush_and_compact` once
-                // it has applied. (See `Inner::applies_in_flight` and `flush`.)
+                // the flush's watermark = `durable_seq`, and only with no in-flight
+                // apply is every durable record (seq ≤ watermark) already in the
+                // memtable snapshot — the invariant that makes GCing a fully-covered
+                // WAL segment safe. The writer re-attempts the flush from its own
+                // `maybe_flush_and_compact` once it has applied. (See
+                // `Inner::applies_in_flight` and `flush`.)
                 && inner.applies_in_flight == 0
         };
         if should_flush {
@@ -612,13 +705,16 @@ impl<E: Env> LsmEngine<E> {
     }
 
     /// Write the current memtable to a fresh SSTable, atomically add it to the
-    /// manifest, drop the folded WAL, and start a fresh (empty) WAL + memtable.
+    /// manifest, then GC the WAL segments the flush fully covers.
     async fn flush(&self) -> Result<()> {
         // Snapshot the memtable + the seq to allocate, lock-free for the write.
         // The caller (`maybe_flush_and_compact`) only calls us with no writes
-        // in-flight, so the memtable snapshot captures every WAL record that is
-        // durable *so far*; we record that WAL watermark to decide later whether
-        // the WAL can be safely truncated.
+        // in-flight (`applies_in_flight == 0`), so at this instant every durable
+        // WAL record (seq ≤ `wal_watermark`) is already applied to the memtable,
+        // and the snapshot folds all of them into the new SSTable. That watermark
+        // is what later tells us which WAL segments are fully covered (so they may
+        // be removed) — a segment whose highest seq ≤ watermark holds only records
+        // now durably in the SSTable.
         let (records, seq, mut new_manifest, wal_watermark) = {
             let inner = self.lock();
             if inner.memtable.is_empty() {
@@ -638,31 +734,37 @@ impl<E: Env> LsmEngine<E> {
         self.env.sync(&file).await.map_err(io)?;
         let reader = self.open_reader(file, meta.clone()).await?;
 
-        // Atomically swap the manifest to reference the new table. Until this
-        // returns durably, a crash recovers the old manifest + the intact WAL.
+        // Compute the WAL segments fully covered by this flush (all their records
+        // ≤ watermark, so now in the SSTable). Record the *surviving* segment set
+        // in the manifest before the swap, so the durable manifest never names a
+        // segment we are about to remove — a crash mid-GC then recovers a manifest
+        // that lists only the survivors, and the (orphaned) covered files, whose
+        // data is in the SSTable, are simply ignored on recovery.
+        let covered = self.wal.segments_covered_by(wal_watermark);
+        let surviving: Vec<u64> = self
+            .wal
+            .live_segments()
+            .into_iter()
+            .filter(|s| !covered.contains(s))
+            .collect();
+
+        // Atomically swap the manifest to reference the new table and the surviving
+        // WAL segments. Until this returns durably, a crash recovers the old
+        // manifest + the intact WAL segments.
         new_manifest.tables.push(meta);
+        new_manifest.wal_segments = surviving;
         self.write_manifest(&new_manifest).await?;
 
-        // The flushed records now live durably in the SSTable, so the WAL prefix
-        // that produced them is redundant. We may truncate the WAL to reclaim it
-        // **only** if nothing new became durable since the snapshot and no write
-        // is mid-apply — otherwise a newer record, durable in the WAL but not yet
-        // in this SSTable, would be lost. When we cannot truncate, the WAL keeps
-        // those already-flushed records too; replaying them on recovery just
-        // re-inserts identical `(key, version)` slots (idempotent), so it stays
-        // correct — they are simply reclaimed by a later flush instead.
-        //
-        // `begin_truncate` latches out new `commit`s and refuses if any writer is
-        // mid-`commit`; combined with the watermark + in-flight checks this makes
-        // the WAL `replace`+reset safe against a concurrent writer.
-        let safe_to_truncate = {
-            let inner = self.lock();
-            inner.applies_in_flight == 0 && self.wal.durable_seq() == wal_watermark
-        };
-        if safe_to_truncate && self.wal.begin_truncate() {
-            self.env.replace(&self.wal_file(), &[]).await.map_err(io)?;
-            self.wal.finish_truncate();
+        // The new manifest is durable and no longer names the covered segments, so
+        // their files can be removed (bounding WAL size — no whole-file rewrite).
+        // Remove the files, then drop them from the coordinator's live set.
+        for seg in &covered {
+            self.env
+                .remove(&self.wal.segment_file(*seg))
+                .await
+                .map_err(io)?;
         }
+        self.wal.forget_segments(&covered);
 
         // Commit the in-memory swap: clear the flushed memtable, add the reader.
         {
@@ -775,6 +877,9 @@ impl<E: Env> LsmEngine<E> {
                 next_seq: seq,
                 tables,
                 max_version: inner.manifest.max_version,
+                // Compaction does not touch the WAL: carry the live segment set
+                // through unchanged so the swap doesn't drop it.
+                wal_segments: inner.manifest.wal_segments.clone(),
             };
             (new_manifest, old_files)
         };
@@ -855,6 +960,22 @@ impl<E: Env> LsmEngine<E> {
     #[must_use]
     pub fn wal_batch_sync_count(&self) -> u64 {
         self.wal.batch_sync_count()
+    }
+
+    /// Number of live WAL segments (sealed + the active one). Test/introspection —
+    /// used by the rotation test to assert writes spanned multiple segments and a
+    /// flush GC'd the covered ones.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn wal_segment_count(&self) -> usize {
+        self.wal.segment_count()
+    }
+
+    /// The live WAL segment numbers (ascending). Test/introspection.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn wal_segments(&self) -> Vec<u64> {
+        self.wal.live_segments()
     }
 
     /// Total SSTable blocks fetched from disk since open (read amplification).
@@ -1373,6 +1494,7 @@ fn decode_wal(bytes: &[u8]) -> Vec<WalRecord> {
 //
 //   MAGIC(4 = b"CMF1") | version(u8) | next_seq(u64) | max_version(u64)
 //   | table_count(u32) | table[0] | table[1] | ...
+//   | wal_seg_count(u32) | wal_seg[0](u64) | ...        (version >= 2 only)
 //
 // One table record (mirrors `SsTableMeta`):
 //   seq(u64) | level(u32)
@@ -1384,15 +1506,22 @@ fn decode_wal(bytes: &[u8]) -> Vec<WalRecord> {
 //   opt_bytes := present(u8) [ len(u32) bytes ]   (present 0 => None)
 //   bytes     := len(u32) bytes
 //
+// Version history within the `CMF1` family:
+//   v1 — header + tables (single-file WAL era; no `wal_segments`).
+//   v2 — adds the trailing live WAL-segment list (WAL segment rotation).
+// `decode_manifest` reads either: a v1 image yields an empty `wal_segments`
+// (recovery then takes the legacy single-file WAL path), a v2 image reads the
+// trailing list.
+//
 // Forward-compat: a legacy JSON manifest begins with `{` (0x7B), which can never
 // be our magic's first byte (`C` = 0x43), so `decode_manifest` detects and falls
-// back to `serde_json`. Bumping `MANIFEST_VERSION` lets future binary revisions
-// be distinguished without another format break.
+// back to `serde_json`.
 
 /// Binary manifest magic: "CMF1" (CustosDB ManiFest, format family 1).
 const MANIFEST_MAGIC: [u8; 4] = *b"CMF1";
-/// Binary manifest format version (within the `CMF1` family).
-const MANIFEST_VERSION: u8 = 1;
+/// Binary manifest format version (within the `CMF1` family). v2 adds the live
+/// WAL-segment list; v1 (no segment list) is still decoded.
+const MANIFEST_VERSION: u8 = 2;
 
 /// Append a length-prefixed (`u32`) byte string.
 fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
@@ -1434,6 +1563,11 @@ fn encode_manifest(m: &Manifest) -> Vec<u8> {
         out.extend_from_slice(&k.to_be_bytes());
         put_bytes(&mut out, bits);
         out.extend_from_slice(&t.format.to_be_bytes());
+    }
+    // v2 trailer: the live WAL-segment list.
+    out.extend_from_slice(&(m.wal_segments.len() as u32).to_be_bytes());
+    for &seg in &m.wal_segments {
+        out.extend_from_slice(&seg.to_be_bytes());
     }
     out
 }
@@ -1499,7 +1633,7 @@ fn decode_manifest(bytes: &[u8]) -> Result<Manifest> {
     let mut c = Cursor::new(bytes);
     let _magic = c.take(4)?;
     let version = c.u8()?;
-    if version != MANIFEST_VERSION {
+    if version == 0 || version > MANIFEST_VERSION {
         return Err(StorageError::Backend(format!(
             "unsupported manifest version {version}"
         )));
@@ -1537,10 +1671,23 @@ fn decode_manifest(bytes: &[u8]) -> Result<Manifest> {
             format,
         });
     }
+    // v2 trailer: the live WAL-segment list. A v1 image has none, so recovery
+    // falls back to the legacy single-file WAL path.
+    let wal_segments = if version >= 2 {
+        let count = c.u32()? as usize;
+        let mut segs = Vec::with_capacity(count);
+        for _ in 0..count {
+            segs.push(c.u64()?);
+        }
+        segs
+    } else {
+        Vec::new()
+    };
     Ok(Manifest {
         next_seq,
         tables,
         max_version,
+        wal_segments,
     })
 }
 
@@ -1594,6 +1741,7 @@ mod manifest_tests {
                         ..sample_meta(3, false)
                     },
                 ],
+                wal_segments: vec![2, 3, 5],
             },
         ] {
             let bytes = encode_manifest(&m);
@@ -1602,6 +1750,7 @@ mod manifest_tests {
             let back = decode_manifest(&bytes).expect("decode");
             assert_eq!(back.next_seq, m.next_seq);
             assert_eq!(back.max_version, m.max_version);
+            assert_eq!(back.wal_segments, m.wal_segments, "wal segments round-trip");
             assert_eq!(back.tables.len(), m.tables.len());
             for (a, b) in m.tables.iter().zip(&back.tables) {
                 assert_eq!(a.seq, b.seq);
@@ -1630,6 +1779,7 @@ mod manifest_tests {
             next_seq: 20,
             max_version: 99_999,
             tables: (1..=12).map(|s| sample_meta(s, true)).collect(),
+            wal_segments: vec![18, 19, 20],
         };
         let bin = encode_manifest(&m);
         let json = serde_json::to_vec(&m).unwrap();
@@ -1666,10 +1816,43 @@ mod manifest_tests {
         assert_eq!(m.next_seq, 3);
         assert_eq!(m.max_version, 50);
         assert_eq!(m.tables.len(), 1);
+        assert!(
+            m.wal_segments.is_empty(),
+            "legacy json manifest has no recorded WAL segments"
+        );
         let t = &m.tables[0];
         assert_eq!(t.seq, 1);
         assert_eq!(t.format, 1, "legacy table defaults to format v1");
         assert!(!t.has_bloom, "legacy table has no bloom");
         assert_eq!(t.level, 0, "legacy table defaults to L0");
+    }
+
+    /// A **v1 binary** manifest (pre-segment-rotation: header + tables, no trailing
+    /// WAL-segment list) still decodes, yielding an empty `wal_segments` so recovery
+    /// falls back to the legacy single-file WAL.
+    #[test]
+    fn legacy_v1_binary_manifest_decodes_with_no_segments() {
+        // Encode a v1 image by hand: the v2 encoder minus the trailing segment list,
+        // with the version byte forced to 1.
+        let m = Manifest {
+            next_seq: 4,
+            max_version: 77,
+            tables: vec![sample_meta(1, true), sample_meta(2, false)],
+            wal_segments: vec![1, 2], // present in memory but NOT written for v1
+        };
+        let mut v2 = encode_manifest(&m);
+        // Drop the v2 trailer (u32 count + count*u64) to get the v1 body ...
+        let trailer = 4 + m.wal_segments.len() * 8;
+        v2.truncate(v2.len() - trailer);
+        // ... and stamp the version byte (immediately after the 4-byte magic) to 1.
+        v2[4] = 1;
+        let back = decode_manifest(&v2).expect("v1 binary decodes");
+        assert_eq!(back.next_seq, 4);
+        assert_eq!(back.max_version, 77);
+        assert_eq!(back.tables.len(), 2);
+        assert!(
+            back.wal_segments.is_empty(),
+            "v1 binary manifest carries no WAL-segment list"
+        );
     }
 }

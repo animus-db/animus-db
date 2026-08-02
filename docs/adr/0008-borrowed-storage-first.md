@@ -36,9 +36,15 @@ seam and so cannot be driven by the simulator.
 `LsmEngine` is a textbook LSM, correctness-first:
 
 - a **memtable** (`BTreeMap` MVCC store, identical shape to `MemoryEngine`);
-- a **write-ahead log** (`<prefix>wal`): each mutation is appended + `sync`ed
-  before the call returns, so an ack means durable (mirroring the control-plane
-  Raft WAL pattern, ADR 0009);
+- a **write-ahead log** split into **rotating numbered segments**
+  (`<prefix>wal-NNNNNN`): each mutation is appended + `sync`ed before the call
+  returns, so an ack means durable (mirroring the control-plane Raft WAL pattern,
+  ADR 0009). The group-commit coordinator appends to the active segment and rolls
+  to a fresh segment once it passes `wal_segment_bytes`; a flush then `remove`s the
+  segments it fully covers (their records all folded into the new SSTable) — so WAL
+  size is bounded and a flush never rewrites a growing single file. The live
+  segment set is recorded in the MANIFEST so recovery knows which segments to
+  replay;
 - immutable, sorted, checksummed **SSTables** (`<prefix>sst-NNNNNN`) with a block
   layout, an in-file block index, a footer, and a per-table **Bloom filter** over
   the table's keys — point reads fetch one block via `read_at`, never the whole
@@ -48,9 +54,10 @@ seam and so cannot be driven by the simulator.
   otherwise; the CRC covers the framed `tag || payload`. The table format is
   versioned so legacy uncompressed tables still read;
 - a **MANIFEST** (`<prefix>MANIFEST`): the durable source of truth listing live
-  SSTables + metadata (including each table's LSM level and Bloom filter),
-  encoded with a **compact hand-rolled binary codec** (a legacy JSON manifest is
-  still read for forward-compat) and written **atomically** via `Disk::replace`,
+  SSTables + metadata (including each table's LSM level and Bloom filter) **and the
+  live WAL segment numbers**, encoded with a **compact hand-rolled binary codec**
+  (manifest format v2 adds the segment list; v1 binary and legacy JSON manifests
+  are still read for forward-compat) and written **atomically** via `Disk::replace`,
   the single linearization point for flush and compaction;
 - **leveled compaction**: tables carry a level; **L0** is the (overlapping) flush
   tier, **L1+** hold non-overlapping runs (re-partitioned on a key boundary to
@@ -60,12 +67,19 @@ seam and so cannot be driven by the simulator.
   `(key, version)` record is preserved across a compaction, keeping the merged
   view observationally identical to `MemoryEngine`;
 - **recovery** on open: read the manifest, open the named SSTables, replay the
-  WAL into the memtable, restore the monotonic floor.
+  live WAL segments (in order) into the memtable, restore the monotonic floor.
 
 Crash safety is argued at the manifest swap: a crash mid-flush or mid-compaction
 (new SSTable written but the manifest not yet swapped) recovers the last durable
 manifest plus the intact WAL — no loss, no torn-table read, the orphan file
-ignored. This is tested under fault injection in `custos-storage/tests/lsm_crash.rs`.
+ignored. WAL segment GC is safe at the same swap: a segment file is `remove`d only
+after a manifest that no longer names it is durable, so a crash mid-GC recovers a
+manifest that still lists the segment (intact) or an orphan covered segment below
+the live set whose records are already in the SSTable (ignored). Recovery also
+replays any segment file present beyond the manifest's recorded set — writes acked
+after the last flush — so an un-flushed segment is never lost. These are tested
+under fault injection in `custos-storage/tests/lsm_crash.rs` and
+`custos-storage/tests/lsm_wal_rotation.rs`.
 
 ## Consequences
 
@@ -140,6 +154,23 @@ ignored. This is tested under fault injection in `custos-storage/tests/lsm_crash
   decoded via `serde_json`, so an existing on-disk directory still opens. The
   codec is round-trip + legacy-JSON-decode + size unit-tested in `lsm.rs`; all
   crash tests (which reopen through the binary decoder) stay green.
+- **WAL segment rotation** (`lsm/wal.rs`, `lsm.rs`): the WAL is now a sequence of
+  numbered segment files (`<prefix>wal-NNNNNN`) instead of one growing file. The
+  group-commit leader appends each batch to the active segment and rolls to a fresh
+  one past `wal_segment_bytes`, sealing the old segment with the highest `wal_seq`
+  it holds. On a flush, segments fully covered by the flush watermark are `remove`d
+  (rather than the whole WAL rewritten via `replace`), bounding WAL size; the
+  surviving segment set is recorded in the manifest (format v2) before the swap, so
+  GC is crash-safe at the same single linearization point. Recovery replays the
+  manifest's live segments plus any present-on-disk segments beyond them (writes
+  acked since the last flush), reconstructing the memtable exactly as the old
+  single-file replay did; a legacy single-file `<prefix>wal` is still replayed when
+  no segments are recorded (upgrade path). The manifest's old single-file
+  truncation machinery (`begin_truncate`/`finish_truncate`/WAL `replace`) is gone.
+  Covered by the differential proptest + all crash tests (now multi-segment) and a
+  new `lsm_wal_rotation.rs` (rotation, covered-segment GC, multi-segment recovery,
+  crash mid-rotation). The group-commit liveness invariant (no mutex guard across
+  `.await`, `DurableUpTo` re-leads) is unchanged and still covered by
+  `lsm_concurrent.rs`.
 - **Still deferred within `LsmEngine`** (correctness-first, performance later):
-  WAL segment rotation (the WAL is a single file). None affect the trait or
-  correctness.
+  none of the remaining ideas affect the trait or correctness.

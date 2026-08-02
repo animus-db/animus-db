@@ -32,6 +32,9 @@ fn opts() -> LsmOptions {
         compaction_trigger: 100,
         target_table_bytes: 1 << 20,
         level_fanout: 8,
+        // Large so the WAL never rotates mid-test: these tests exercise the
+        // group-commit path on one segment, not rotation.
+        wal_segment_bytes: 1 << 20,
     }
 }
 

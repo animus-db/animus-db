@@ -24,6 +24,9 @@ fn open(seed: u64) -> LsmEngine<custos_sim::SimEnv> {
         // L1+ runs, exercising the partitioning path under the differential test.
         target_table_bytes: 256,
         level_fanout: 2,
+        // Small so the WAL rotates across segments under the differential test,
+        // keeping semantics identical to `MemoryEngine` through rotation + GC.
+        wal_segment_bytes: 96,
     };
     block_on(LsmEngine::open_with(sim.env(0), "db/", opts)).expect("open")
 }

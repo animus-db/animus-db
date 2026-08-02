@@ -259,6 +259,8 @@ async fn main() {
         compaction_trigger: 4,
         target_table_bytes: 128 * 1024,
         level_fanout: 8,
+        // Roll the WAL near the flush threshold so a flush typically GCs a segment.
+        wal_segment_bytes: 48 * 1024,
     };
     let lsm = LsmEngine::open_with(env, "db-", opts)
         .await
