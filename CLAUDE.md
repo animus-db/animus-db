@@ -18,7 +18,9 @@ detection** that auto-marks members `Down`/`Active` and cascades into placement
 re-reconciliation — ADR 0012),
 the quorum data-plane vertical slice (with read-repair, background
 anti-entropy convergence via segment-digest exchange of only divergent ranges,
-delete/tombstone propagation, and residency-bounded repair), tablet split/merge
+delete/tombstone propagation, residency-bounded repair, and **hinted handoff** —
+a write missing a down replica buffers a residency-bounded hint replayed when the
+replica returns), tablet split/merge
 + multi-tablet routing, the Elle-style recorder/checker (`animus-test`) — now
 including an **end-to-end correctness test of the assembled stack** (control
 plane + data plane at scale: 3 Raft nodes, 2 tablets, 6 replicas, 4 concurrent
@@ -241,7 +243,16 @@ outside a tablet's placement, so it cannot leak data across a residency boundary
 even to a reachable node. The data plane carries quorum `Write`/`Delete` and a
 tombstone-aware `Sync`, so deletes propagate the same way writes do. The
 `repair.rs` test partitions a replica during a write/delete and asserts
-convergence both via a read and with no reads at all.
+convergence both via a read and with no reads at all. A third convergence path,
+**hinted handoff** (ADR 0010), acts on the *write* side: a hinting `DataClient`
+(`with_hints`) buffers a hint for any tablet replica that missed a committed
+write/delete (down/partitioned) into a `HintStore`, and a replay loop
+(`serve_hint_handoff`, probe-based; or `serve_hint_replay`, send-only for a
+shared inbox) delivers it via the ordinary `Sync` path the moment the replica
+returns — promptly converging a briefly-unavailable replica without a read or an
+anti-entropy round. It is residency-bounded (`AllowedTargets`, from
+`PlacementPolicy::admits`): a placement-ineligible node is never hinted
+(`hinted_handoff.rs`).
 
 ### Placement & residency (`animus-placement`)
 

@@ -81,6 +81,19 @@ sent one. Proven under simulation in `animus-data/tests/residency_repair.rs`: a
 reachable non-EU node actively soliciting anti-entropy from EU replicas never
 receives the EU data, and a direct `Sync` from it is rejected.
 
+**Residency now also extends to hinted handoff.** Hinted handoff (ADR 0010)
+buffers a hint at the coordinator for a replica that missed a committed
+write/delete and replays it when the replica returns. It is residency-bounded the
+same way repair is: the coordinator holds an `AllowedTargets` set (derived from
+`PlacementPolicy::admits`, the same check used to place) and **records a hint for,
+and replays a hint to, only an admitted target** — so a hint never crosses a
+residency boundary, even to a reachable node. The replica's
+`serve_replica_with_residency` receive guard is the backstop (it must admit the
+holder/coordinator node, a trusted in-region participant, exactly as it must for
+coordinator-driven read-repair). Proven under simulation in
+`animus-data/tests/hinted_handoff.rs`
+(`no_hint_is_buffered_or_replayed_for_a_residency_ineligible_replica`).
+
 **The reconciler now runs in the production binary.** `animusd` registers the
 **data nodes** as the cluster's `Active` members (not the control-group ids),
 places its bootstrap tablet on the first `min(N, 3)` of them, and attaches a
@@ -92,7 +105,7 @@ bootstrap policy carries no labels yet, so it is a plain replication-factor
 constraint; topology labels from config are future work.)
 
 **Still deferred** (the remaining weakest-path work above): residency enforcement
-across hinted handoff and backup. The reconciler keeps a tablet's *surviving*
+across backup. The reconciler keeps a tablet's *surviving*
 eligible replicas (minimal churn), so it repairs drift but does not re-optimize
 an already-placed compliant-enough set; a cluster-default policy, topology labels
 in `animusd`'s deployment config, and operator-facing policy management (CLI/wire)

@@ -26,7 +26,17 @@ tablet map, and per-tablet epoch fencing (ADR 0001, 0002).
   reconcile bumps the epoch (see the anti-entropy bullet below).
 - `client.rs` — `DataClient` (quorum coordinator, incl. read-repair),
   `TabletView` (replicas + epoch + R/W for one tablet), `Router` (key → owning
-  tablet), `ReadResult`.
+  tablet), `ReadResult`. `DataClient::with_hints(env, store, allowed)` enables
+  **hinted handoff** (a write/delete that misses a replica buffers a hint);
+  `DataClient::new` keeps the no-hint behavior. The `write`/`read`/`delete`
+  signatures are unchanged.
+- `hint.rs` — hinted handoff (ADR 0010 + 0005): a `HintStore` (per-coordinator,
+  in-memory, `BTreeMap`-keyed by `(target, tablet, key)`, per-key LWW) plus two
+  replay drivers — `serve_hint_handoff` (probe-based, for a holder with a
+  dedicated node id; `DataMsg::Probe`/`ProbeAck` confirm reachability, then a
+  `Sync` replay clears the hint) and `serve_hint_replay` (send-only, for a holder
+  sharing its inbox with a co-located `recv` consumer; re-sends each round). Both
+  are residency-bounded (`AllowedTargets`).
 
 ## What's non-obvious
 
@@ -82,8 +92,25 @@ tablet map, and per-tablet epoch fencing (ADR 0001, 0002).
   send side is already bounded (read-repair → `view.replicas`, anti-entropy →
   the caller's `peers` list — both the tablet placement). Derive `allowed` from
   `PlacementPolicy::admits`, the same check the control plane places with.
-  Deferred: tombstone GC (a grace period before reclaiming tombstones), and
-  residency on hinted handoff / backup.
+- **Hinted handoff (ADR 0010 + 0005)**: a third convergence path, on the *write*
+  side. When a quorum `write`/`delete` commits at `W` but a tablet replica did
+  not ack it (down/partitioned), a hinting `DataClient` (built with
+  `with_hints`) buffers a hint `(target, tablet, epoch, key, value/tombstone,
+  version)` in a `HintStore` — but **only for a target the placement admits**
+  (`AllowedTargets`, derived from `PlacementPolicy::admits`). A replay driver
+  delivers the hint via the ordinary `Sync` path (epoch-fenced, per-key LWW,
+  idempotent) when the target returns: `serve_hint_handoff` probes first
+  (dedicated holder env), `serve_hint_replay` re-sends each round (shared inbox,
+  as in `animusd`). It is an **accelerator** layered on anti-entropy — a lost
+  hint costs only promptness, never a write (the `W` durable replicas converge
+  the laggard via anti-entropy regardless). The store is keyed per
+  `(target, tablet, key)` so a superseding write clears a stale hint. **No lock is
+  held across an `.await`** in `hint.rs` (the store `Mutex` is taken and dropped
+  inside each synchronous helper). Residency backstop: the replica's
+  `serve_replica_with_residency` must admit the holder/coordinator node (a
+  trusted in-region participant), exactly as it must for coordinator read-repair.
+  Deferred: tombstone GC (a grace period before reclaiming tombstones); a
+  capped/TTL'd + durable hint store; and residency on backup.
 - A replica serves over any `StorageEngine`; values are opaque bytes. Higher
   layers (e.g. the dynamo adapter, or list-append test workloads) define their
   own value encoding.
@@ -99,11 +126,16 @@ read-repair + background anti-entropy convergence, incl. tombstone propagation
 (`repair.rs`), segment-digest anti-entropy converging only divergent ranges
 (`digest_anti_entropy.rs`, asserted at the wire level via the sim `Send` trace),
 and residency on the repair paths — a reachable but ineligible peer never
-receives repaired data (`residency_repair.rs`), and ack-durability — a replica
+receives repaired data (`residency_repair.rs`), ack-durability — a replica
 whose storage `merge`/`merge_tombstone` errors replies `ok: false` so the quorum
 write/delete fails rather than falsely succeeding (`ack_durability.rs`, with a
-failing-engine test double). `digest.rs` has inline unit tests for the digest
-itself.
+failing-engine test double), and hinted handoff (`hinted_handoff.rs`): a write
+(then a delete) with one replica crashed buffers a hint, the replica recovers,
+and the hint is replayed so it converges with **no read and no anti-entropy**
+(via both the probe-based `serve_hint_handoff` and the send-only
+`serve_hint_replay`); plus the residency bound — a placement-ineligible replica
+is never hinted nor replayed to, while an eligible one is. `digest.rs` has inline
+unit tests for the digest itself.
 
 `concurrent_multithread.rs` is a **real multi-threaded** liveness regression
 (`#[tokio::test(flavor = "multi_thread", worker_threads = 4)]` over `ProdEnv`,

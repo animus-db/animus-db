@@ -359,8 +359,19 @@ async fn handle_msg<S: StorageEngine>(
                 entries,
             }]
         }
+        // Hinted handoff (ADR 0010): a liveness probe from a hint holder. Answer
+        // it (we are reachable) so the holder replays buffered hints to us as a
+        // `Sync`. It carries no data, so it is not epoch-fenced; the subsequent
+        // `Sync` is fenced and residency-checked exactly as any repair is. The
+        // probe itself is unrestricted by residency: an out-of-policy holder may
+        // learn we are up, but the `Sync` it then sends is dropped by the
+        // residency guard above, so no data crosses the boundary.
+        DataMsg::Probe { req } => vec![DataMsg::ProbeAck { req }],
         // Replicas never receive responses.
-        DataMsg::WriteAck { .. } | DataMsg::ReadResp { .. } | DataMsg::DeleteAck { .. } => vec![],
+        DataMsg::WriteAck { .. }
+        | DataMsg::ReadResp { .. }
+        | DataMsg::DeleteAck { .. }
+        | DataMsg::ProbeAck { .. } => vec![],
     }
 }
 

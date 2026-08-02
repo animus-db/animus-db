@@ -90,6 +90,46 @@ primitive:
    residency boundary even to a reachable node. `serve_replica` (no allowed set)
    keeps the unrestricted behavior.
 
+4. **Hinted handoff** (added later): a third convergence path, this time on the
+   *write* path, for availability + faster convergence. When a quorum
+   write/delete commits at `W` but a tablet replica did not ack it (down /
+   partitioned / slow past the timeout), the **coordinator** buffers a *hint* —
+   `(target, tablet, epoch, key, value/tombstone, version)` — in a per-coordinator
+   `HintStore`, and a background loop replays it to the target when it is reachable
+   again. Replay rides the existing `DataMsg::Sync` path, so it is epoch-fenced and
+   applied by the same per-key LWW `merge`/`merge_tombstone` (idempotent: a hint
+   the replica already holds, or has superseded, is a no-op). It is keyed per
+   `(target, tablet, key)`, so a later write to the same key supersedes a pending
+   hint (the store stays bounded by the keys a target is behind on).
+
+   The coordinator records hints additively: `DataClient::with_hints(env, store,
+   allowed)` enables it; `DataClient::new` keeps the original no-hint behavior
+   (`write`/`read`/`delete` signatures are unchanged). Two replay drivers:
+   - `serve_hint_handoff` — **probe-based**, for a holder with a dedicated node id:
+     a `DataMsg::Probe`/`ProbeAck` round confirms the target is reachable before
+     replaying, and the delivered hint is cleared. The probe carries no data, so it
+     is not fenced; the subsequent `Sync` is.
+   - `serve_hint_replay` — **send-only**, for a holder that shares its inbox with a
+     co-located `recv` consumer (e.g. `animusd`'s coordinator, where the
+     `DataClient` already owns the coord inbox). It cannot probe (that would need a
+     second `recv` on the same node, violating single-consumer), so it re-sends the
+     buffered hints each round and lets a still-down target pick them up on a later
+     round; a hint leaves the store only when a newer write supersedes it.
+
+   Hinted handoff is strictly an **accelerator** layered on anti-entropy: a hint
+   lost (coordinator restart, target dead past the placement reconcile) costs only
+   *promptness* — the durable record on the `W` replicas that acked still converges
+   the lagging replica via anti-entropy.
+
+   **Residency (ADR 0005).** Hinting is residency-bounded the same way repair is:
+   a hint is recorded for, and replayed to, only a target the placement *admits*
+   (`AllowedTargets`, derived from `PlacementPolicy::admits` — the same check the
+   control plane places with). So hinted handoff cannot move data across a
+   residency boundary even to a reachable node. The replica's receive-side
+   `serve_replica_with_residency` guard is the defence-in-depth backstop (it must
+   admit the holder/coordinator node, which is a trusted in-region participant,
+   exactly as it must for coordinator-driven read-repair).
+
 ## Consequences
 
 - Raw replica state now converges, not just quorum-read results. A replica that
@@ -130,11 +170,28 @@ primitive:
   and asserting it converges to the tombstone with **no reads at all**, and that
   the lagging replica pushing its stale value back does not resurrect the key
   (`animus-data/tests/repair.rs`).
+- **Hinted handoff converges a briefly-unavailable replica on the write path.** A
+  write/delete that committed at `W` while a replica was down buffers a hint at
+  the coordinator and replays it (via `Sync`) the moment the replica returns —
+  proven under simulation by writing/deleting with a replica crashed, asserting a
+  hint is buffered, restarting the replica, and asserting it converges **with no
+  read and no anti-entropy** (`animus-data/tests/hinted_handoff.rs`:
+  `a_hint_is_buffered_for_a_down_replica_and_replayed_on_recovery`,
+  `a_hinted_delete_replays_as_a_tombstone`,
+  `send_only_replay_converges_a_replica_that_recovers_a_later_round`). It is
+  residency-bounded: a hint is never recorded for or replayed to a placement-
+  ineligible node (`no_hint_is_buffered_or_replayed_for_a_residency_ineligible_replica`).
 - **Tombstone GC is deferred.** Tombstones currently live forever in a key's
   MVCC history (so they win LWW and stay in the digest). A real system reclaims
   them after a grace period exceeding the max anti-entropy lag; this — and its
   interaction with a replica that was offline longer than the grace period — is
   future work. (Tombstones are now only re-sent when their segment diverges, but
   they are still never *reclaimed*.)
+- **Hint store bounding/durability deferred.** The `HintStore` is in-memory and
+  per-coordinator (a hint lost on restart falls back to anti-entropy), and the
+  send-only `serve_hint_replay` re-sends until a hint is superseded — so a target
+  that is permanently dead (rather than re-placed, which a reconcile + epoch bump
+  handles) leaves hints pending until overwritten. A capped/TTL'd store and a
+  durable hint log are future work, alongside tombstone GC.
 - ADR 0001 (two-plane) and ADR 0002 (epoch fencing) are unchanged; this refines
   the data plane's convergence story within them.

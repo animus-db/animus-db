@@ -8,6 +8,7 @@ use animus_tablet::{Epoch, Tablet, TabletId};
 use futures::future::{Either, select};
 
 use crate::DataMsg;
+use crate::hint::{AllowedTargets, HintStore};
 
 /// The coordinator's routing view of a tablet: which tablet, its replica set,
 /// the epoch to fence with, and the read/write quorum sizes. Read from cached
@@ -88,15 +89,52 @@ struct QuorumRead {
 
 /// A quorum coordinator. It is a network participant in its own right (its
 /// `env`'s node id), distinct from the replica nodes it talks to.
+///
+/// It optionally carries a [`HintStore`] for **hinted handoff** (ADR 0010): when
+/// a quorum write/delete is acked by `W` replicas but a tablet replica did not
+/// respond (it was down/partitioned), the coordinator buffers a hint for that
+/// replica and a background [`serve_hint_handoff`](crate::serve_hint_handoff)
+/// loop replays it once the replica is reachable again. Hints are
+/// residency-bounded (ADR 0005): one is recorded only for a target the placement
+/// admits. A coordinator built with [`new`](DataClient::new) holds no store and
+/// records no hints (the original behavior), so this is purely additive.
 #[derive(Clone)]
 pub struct DataClient<E: Env> {
     env: E,
+    /// Buffered hints for unavailable replicas; `None` ⇒ hinted handoff off.
+    hints: Option<HintStore>,
+    /// Residency bound on which replicas may be hinted (ADR 0005); `None` ⇒ no
+    /// boundary. Only consulted when `hints` is `Some`.
+    allowed: AllowedTargets,
 }
 
 impl<E: Env> DataClient<E> {
-    /// Create a coordinator on `env`.
+    /// Create a coordinator on `env` with **no** hinted handoff (hints disabled).
     pub fn new(env: E) -> Self {
-        Self { env }
+        Self {
+            env,
+            hints: None,
+            allowed: None,
+        }
+    }
+
+    /// Create a coordinator on `env` that **buffers hints** for replicas a
+    /// write/delete could not reach, into `hints`, bounded by `allowed` residency
+    /// (ADR 0005; `None` ⇒ no residency boundary). Pair it with
+    /// [`serve_hint_handoff`](crate::serve_hint_handoff) over the same `env` and
+    /// `hints`/`allowed` so the buffered hints are replayed when a target returns.
+    pub fn with_hints(env: E, hints: HintStore, allowed: AllowedTargets) -> Self {
+        Self {
+            env,
+            hints: Some(hints),
+            allowed,
+        }
+    }
+
+    /// The coordinator's hint store, if hinted handoff is enabled.
+    #[must_use]
+    pub fn hint_store(&self) -> Option<&HintStore> {
+        self.hints.as_ref()
     }
 
     /// Quorum write: store `value` at `key` with MVCC `version`, returning
@@ -122,12 +160,16 @@ impl<E: Env> DataClient<E> {
 
         let mut acks = 0usize;
         let mut responded = 0usize;
-        self.collect(view.replicas.len(), timeout, |reply| {
+        // Track which replicas acked `ok`, so a replica that was unavailable can
+        // be hinted (hinted handoff, ADR 0010). BTreeSet ⇒ deterministic.
+        let mut acked: std::collections::BTreeSet<NodeId> = std::collections::BTreeSet::new();
+        self.collect(view.replicas.len(), timeout, |from, reply| {
             if let DataMsg::WriteAck { req: r, ok } = reply {
                 if r == req {
                     responded += 1;
                     if ok {
                         acks += 1;
+                        acked.insert(from);
                     }
                     return acks >= view.w || responded >= view.replicas.len();
                 }
@@ -135,7 +177,13 @@ impl<E: Env> DataClient<E> {
             false
         })
         .await;
-        acks >= view.w
+        let committed = acks >= view.w;
+        // On a committed write, buffer a hint for every replica that did not ack
+        // it, so it converges promptly when it returns (residency-bounded).
+        if committed {
+            self.hint_unreached(view, &acked, key, Some(value.to_vec()), version);
+        }
+        committed
     }
 
     /// Quorum delete: tombstone `key` with MVCC `version`, returning `true` once
@@ -162,12 +210,14 @@ impl<E: Env> DataClient<E> {
 
         let mut acks = 0usize;
         let mut responded = 0usize;
-        self.collect(view.replicas.len(), timeout, |reply| {
+        let mut acked: std::collections::BTreeSet<NodeId> = std::collections::BTreeSet::new();
+        self.collect(view.replicas.len(), timeout, |from, reply| {
             if let DataMsg::DeleteAck { req: r, ok } = reply {
                 if r == req {
                     responded += 1;
                     if ok {
                         acks += 1;
+                        acked.insert(from);
                     }
                     return acks >= view.w || responded >= view.replicas.len();
                 }
@@ -175,7 +225,13 @@ impl<E: Env> DataClient<E> {
             false
         })
         .await;
-        acks >= view.w
+        let committed = acks >= view.w;
+        // A committed delete hints the unreached replicas with a tombstone
+        // (`None`), so the delete converges to them just as a value would.
+        if committed {
+            self.hint_unreached(view, &acked, key, None, version);
+        }
+        committed
     }
 
     /// Quorum read: return the latest value for `key` once `r` replicas respond.
@@ -250,7 +306,7 @@ impl<E: Env> DataClient<E> {
         // The version each ok-responder returned (`None` = key absent there);
         // used after the fact to decide whether read-repair is warranted.
         let mut seen: Vec<Option<u64>> = Vec::new();
-        self.collect(view.replicas.len(), timeout, |reply| {
+        self.collect(view.replicas.len(), timeout, |_from, reply| {
             if let DataMsg::ReadResp { req: r, ok, value } = reply {
                 if r == req {
                     responded += 1;
@@ -288,13 +344,15 @@ impl<E: Env> DataClient<E> {
         }
     }
 
-    /// Receive replies until `done(reply)` returns `true` or `timeout` elapses.
-    /// `done` accumulates state and decides when the quorum is satisfied.
+    /// Receive replies until `done(from, reply)` returns `true` or `timeout`
+    /// elapses. `done` accumulates state (including, for writes/deletes, which
+    /// replica `from` acked, to drive hinted handoff) and decides when the quorum
+    /// is satisfied.
     async fn collect(
         &self,
         _total: usize,
         timeout: Duration,
-        mut done: impl FnMut(DataMsg) -> bool,
+        mut done: impl FnMut(NodeId, DataMsg) -> bool,
     ) {
         let deadline = self.env.now().0.saturating_add(dur_nanos(timeout));
         loop {
@@ -306,12 +364,41 @@ impl<E: Env> DataClient<E> {
             match select(self.env.recv(), self.env.sleep(remaining)).await {
                 Either::Left((envelope, _)) => {
                     if let Ok(reply) = serde_json::from_slice::<DataMsg>(&envelope.payload) {
-                        if done(reply) {
+                        if done(envelope.from, reply) {
                             return;
                         }
                     }
                 }
                 Either::Right(((), _)) => return,
+            }
+        }
+    }
+
+    /// Buffer a hint for every replica in `view` that did not appear in `acked`
+    /// (it was unavailable for this committed write/delete), so hinted handoff
+    /// replays the `(value, version)` to it when it returns. No-op when hinted
+    /// handoff is disabled. Residency-bounded: [`HintStore::record`] refuses a
+    /// target the placement does not admit (ADR 0005).
+    fn hint_unreached(
+        &self,
+        view: &TabletView,
+        acked: &std::collections::BTreeSet<NodeId>,
+        key: &[u8],
+        value: Option<Vec<u8>>,
+        version: u64,
+    ) {
+        let Some(hints) = &self.hints else {
+            return;
+        };
+        for &replica in &view.replicas {
+            if !acked.contains(&replica) {
+                hints.record(
+                    &self.allowed,
+                    replica,
+                    view.tablet,
+                    view.epoch,
+                    (key.to_vec(), value.clone(), version),
+                );
             }
         }
     }
