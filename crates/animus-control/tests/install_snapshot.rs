@@ -137,6 +137,10 @@ fn follower_catches_up_via_multi_chunk_snapshot() {
             );
         }
     }
+    // Simulate the leader's fsync so its committed entries are durable and thus
+    // applied (durable-before-visible, ADR 0009): `snapshot()` compacts the
+    // *applied* prefix, so the watermark must advance first.
+    leader.mark_durable_through(leader.last_log_index());
     leader.snapshot();
     assert!(
         leader.snapshot_index() > 0,

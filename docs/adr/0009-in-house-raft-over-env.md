@@ -72,37 +72,55 @@ truncation, commit only of current-term entries via majority `matchIndex`).
 - This ADR supersedes the brief's dependency suggestion for the control plane;
   ADR 0001 (two-plane architecture) is otherwise unchanged.
 
-## Known limitation / follow-up: apply-before-fsync (acked-but-not-durable window)
+## Durable-before-visible: closing the apply-before-fsync window (resolved)
 
-`RaftCore::propose` (and the commit path generally) advances `commit_index` and
-**applies the command to the in-memory `Metadata` state machine synchronously**,
-then returns `Accepted` — while the WAL `append + fsync` runs **asynchronously**
-in the `RaftNode` driver loop (`flush_wal`), which is normally parked in its
-`select` between ticks. So an applied command is **client-visible (and acked)
-before it is durable on disk**: a caller that proposes and then observes the
-applied state (e.g. the DynamoDB edge's `CreateTable` waiting on
-`has_table_schema`) gets a `200` while the entry may still be only in memory.
+**The bug.** `RaftCore::propose` advanced `commit_index` and **applied the command
+to `Metadata` synchronously**, then returned `Accepted` — while the WAL `append +
+fsync` ran **asynchronously** in the driver loop (`flush_wal`), normally parked in
+its `select` between ticks. So an applied command was **client-visible (and acked)
+before it was durable on disk**: the DynamoDB edge's `CreateTable` waits on
+`has_table_schema`, so it returned `200` while the entry might still be only in
+memory. A crash in that window lost an acknowledged command (recovery restores the
+last fsynced snapshot + WAL tail, without it) — the intermittent failure of
+`animusd`'s `tests/dynamo_schema.rs::create_table_survives_node_restart`.
 
-A crash in that window loses an acknowledged command — on restart, `Metadata`
-recovers from the last fsynced snapshot + WAL tail, without it. This surfaced as
-an intermittent failure of `animusd`'s
-`tests/dynamo_schema.rs::create_table_survives_node_restart` (an abrupt
-`Node::shutdown` aborted the driver mid-window, losing the acked `CreateTable`).
+**The fix (shipped): a durable watermark.** `RaftCore` now carries a
+`durable_index`, and `apply` advances `last_applied` only up to
+`min(commit_index, durable_index)` — never past what is fsynced. The driver
+advances the watermark via `RaftCore::mark_durable_through` **immediately after
+`env.sync(WAL)`** in `flush_wal` (passing the log high-water captured at drain), so
+a committed entry becomes applied/visible **only once it is on disk**. A proposer
+that observes applied state (`has_table_schema`, `metadata()`) therefore waits for
+durability for free — no caller change needed.
 
-**Partial mitigation (shipped):** `RaftNode::flush` durably syncs the pending WAL
-tail on demand, and `animusd`'s `Node::shutdown_graceful` calls it before aborting
-tasks — so a *clean* teardown (and the restart test, which models a clean process
-restart) is durable. The driver is parked at that point, so the flush is the sole
-WAL writer.
+This is the same "ack-means-synced" rule the data plane already enforces
+(`animus-data` `ack_durability`) and mirrors `animus-consensus`'s `persist_then_ship`
+ordering (WAL fsync *before* the apply effect). Multi-node safety was already in
+place — the driver flushes **before** sending outbound (`drive`'s
+"durability before action"), so a follower fsyncs before its `AppendEntriesResp`
+and the leader before its `AppendEntries`; commit therefore already rested on
+durable logs. This change closes the remaining gap: the **leader applying/exposing
+its own entry** before its local fsync (acute in a single-node group, where commit
+is self-only).
 
-**Still open:** this does **not** close the *crash* (`kill -9`) window. The proper
-fix is **durable-before-visible**: a committed entry must not become client-visible
-(applied / ack-returnable) until its WAL entry is fsynced — e.g. apply only up to a
-*durable* watermark the driver advances after `env.sync(WAL)`, and have a proposer
-that needs a durability guarantee wait on that watermark rather than on
-`commit_index`/applied state. This mirrors the data plane's existing
-"ack-means-synced" rule (`animus-data` `ack_durability`) and the
-`animus-consensus` `persist_then_ship` ordering (WAL fsync *before* the apply
-effect/ack). It is a change to the `RaftCore`/driver commit path with its own
-sim coverage (a crash injected in the apply→fsync window must not lose an acked
-command), tracked separately.
+`recovered()` sets `durable_index` to the recovered `last_log_index` (everything
+from the WAL/snapshot is durable). Regression coverage:
+`persistence.rs::a_command_is_visible_only_after_it_is_durable` (a committed-but-
+unsynced command is invisible and does not survive a crash; after the fsync it is
+both visible and crash-durable). A core driven by hand must simulate the driver's
+fsync — drain, then `mark_durable_through(last_log_index())` — or its `metadata()`
+never reflects proposals (see the `persist` helper in `persistence.rs`).
+
+**Note (test consequence, not a regression):** gating follower visibility on the
+follower's own fsync widened a pre-existing *cross-node* race — a query/read issued
+on a follower immediately after a `CreateTable` on the leader can outrun
+replication+apply to that follower. The cure is the same everywhere: wait for the
+replicated definition on the target node before reading it
+(`await_table_schema`/`await_table_index` in the `animusd` tests), exactly as the
+restart tests already do.
+
+**Still deferred:** a follower also gates its *read* visibility on its own fsync,
+which is stronger than necessary for read safety (a committed entry is already
+durable on a quorum, so a follower could expose it pre-local-fsync without risking a
+lost ack). Relaxing follower-read visibility to apply-on-commit (while keeping the
+leader's ack-path gated) is a possible optimization, not a correctness need.

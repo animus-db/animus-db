@@ -134,18 +134,25 @@ epoch compare-and-swap transactions.
   (`ProdEnv`'s real sink); use **`start_with_metrics`** to thread a recording
   handle a sim test can read — `SimEnv::metrics()` is the no-op default, so no
   `animus-sim` change is needed.
-- **Apply happens before the WAL fsync (acked-but-not-durable window).**
-  `RaftCore::propose` advances `commit_index` + **applies to `Metadata`
-  synchronously** and returns; the driver's `flush_wal` (`append` + `env.sync`)
-  runs **asynchronously**, and the driver is normally parked in its `select`
-  between ticks. So an applied command is client-visible/acked before it is on
-  disk — a crash in that window loses it (it surfaced as a flaky
-  `animusd` `create_table_survives_node_restart`). `RaftNode::flush` durably syncs
-  the pending tail on demand (used by `animusd`'s `Node::shutdown_graceful` for a
-  durable *clean* teardown); the `kill -9` window — making a commit
-  durable-*before*-visible — is a tracked follow-up (ADR 0009 "apply-before-fsync"
-  section). When you change the propose/commit/apply path, preserve or close this
-  ordering deliberately; don't widen the window.
+- **Durable-before-visible: `apply` is gated on a `durable_index`, not just
+  `commit_index`.** `RaftCore::propose` advances `commit_index` synchronously, but
+  `apply` only advances `last_applied` up to `min(commit_index, durable_index)` —
+  so a command is client-visible (`metadata()`/`applied()`, what a proposer waits
+  on) **only after it is fsynced**, never before (ADR 0009). The driver advances
+  the watermark via **`mark_durable_through`** in `flush_wal`, *immediately after*
+  `env.sync(WAL)` (passing the drain-time `last_log_index`); `recovered()` sets it
+  to the recovered `last_log_index`. This closed the acked-before-durable window
+  that flaked `animusd`'s `create_table_survives_node_restart`. Multi-node was
+  already safe (the driver flushes *before* sending outbound, so a follower fsyncs
+  before its `AppendEntriesResp`); this closed the leader-applies-own-entry gap
+  (acute single-node). **Gotchas:** (1) a core driven by hand (not via `RaftNode`)
+  must simulate the fsync — drain, then `mark_durable_through(last_log_index())` —
+  or `metadata()` never reflects proposals (see `persistence.rs`'s `persist`
+  helper). (2) Gating follower visibility on its own fsync widens cross-node
+  replication races: a read on a follower right after a leader `CreateTable` must
+  wait for the definition to replicate there (`await_table_*` in the `animusd`
+  tests). When you touch propose/commit/apply, preserve this ordering — don't apply
+  past `durable_index`.
 - Commit advances only for **current-term** entries via majority `matchIndex`
   (the Raft safety rule). Don't relax this.
 - Snapshot transfer is **chunked** (see above). Deferred: cross-leader resumption

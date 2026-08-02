@@ -578,10 +578,18 @@ async fn flush_and_maybe_compact<E: Env>(env: &E, core: &Arc<Mutex<RaftCore>>) {
     }
 }
 
-/// Append and `fsync` any pending durable-state records to the WAL. Returns how
-/// many records were written.
+/// Append and `fsync` any pending durable-state records to the WAL, then advance
+/// the core's durable watermark so the now-on-disk entries become client-visible
+/// (durable-before-visible, ADR 0009). Returns how many records were written.
 async fn flush_wal<E: Env>(env: &E, core: &Arc<Mutex<RaftCore>>) -> usize {
-    let records = core.lock().expect("raft core poisoned").drain_persist();
+    // Capture the log high-water under the same lock as the drain: after we sync
+    // the drained records, every entry up to here is durable. Entries appended
+    // after this point ride the next flush.
+    let (records, through) = {
+        let mut core = core.lock().expect("raft core poisoned");
+        let records = core.drain_persist();
+        (records, core.last_log_index())
+    };
     if records.is_empty() {
         return 0;
     }
@@ -591,6 +599,11 @@ async fn flush_wal<E: Env>(env: &E, core: &Arc<Mutex<RaftCore>>) -> usize {
             .expect("wal append");
     }
     env.sync(WAL).await.expect("wal sync");
+    // The records are now durable: advance the watermark (which applies any
+    // now-durable committed entries). Only after this is the proposal observable.
+    core.lock()
+        .expect("raft core poisoned")
+        .mark_durable_through(through);
     records.len()
 }
 

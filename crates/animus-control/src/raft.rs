@@ -186,6 +186,13 @@ pub struct RaftCore {
     snapshot_term: u64,
     commit_index: u64,
     last_applied: u64,
+    // Highest log index whose WAL record is durably fsynced. The driver advances
+    // it (via `mark_durable_through`) after `env.sync(WAL)`; `apply` never advances
+    // `last_applied` past it. This is the **durable-before-visible** invariant: a
+    // command becomes client-visible (via `metadata`/`applied`, what a proposer
+    // waits on) only once it is on disk, so a crash in the commit→fsync window
+    // cannot lose an entry a client already observed (ADR 0009).
+    durable_index: u64,
     leader_id: Option<NodeId>,
 
     // Candidate state.
@@ -238,6 +245,7 @@ impl RaftCore {
             snapshot_term: 0,
             commit_index: 0,
             last_applied: 0,
+            durable_index: 0,
             leader_id: None,
             votes: BTreeSet::new(),
             next_index: BTreeMap::new(),
@@ -283,6 +291,10 @@ impl RaftCore {
             core.last_applied = last_index;
             core.commit_index = last_index;
         }
+        // Everything restored from the WAL/snapshot is by definition durable, so
+        // the durable watermark covers the whole recovered log. The tail re-applies
+        // (durable-gated, a no-op gate) once commit re-advances post-recovery.
+        core.durable_index = core.last_log_index();
         // Already durable: do not re-emit it.
         core.persisted_hard = (core.current_term, core.voted_for);
         core.pending.clear();
@@ -390,6 +402,24 @@ impl RaftCore {
         self.commit_index
     }
 
+    /// Highest log index known durable on disk (the **durable-before-visible**
+    /// frontier; see [`RaftCore::mark_durable_through`]).
+    pub fn durable_index(&self) -> u64 {
+        self.durable_index
+    }
+
+    /// Record that the WAL is durably fsynced through log index `index`, then apply
+    /// any now-durable committed entries. **The driver must call this after every
+    /// `env.sync(WAL)`** (and only then), passing the last log index it just made
+    /// durable — that is what advances client-visible state. Idempotent and
+    /// monotonic; an `index` below the current watermark is ignored.
+    pub fn mark_durable_through(&mut self, index: u64) {
+        if index > self.durable_index {
+            self.durable_index = index;
+            self.apply();
+        }
+    }
+
     /// Highest applied log index.
     pub fn last_applied(&self) -> u64 {
         self.last_applied
@@ -416,7 +446,8 @@ impl RaftCore {
 
     // ---- log helpers -----------------------------------------------------
 
-    fn last_log_index(&self) -> u64 {
+    /// Index of the last log entry (the snapshot base if the log tail is empty).
+    pub fn last_log_index(&self) -> u64 {
         self.log.last().map_or(self.snapshot_index, |e| e.index)
     }
 
@@ -1058,7 +1089,14 @@ impl RaftCore {
     }
 
     fn apply(&mut self) {
-        while self.last_applied < self.commit_index {
+        // Apply only up to the **durable** frontier, never just the committed one:
+        // a command must be on disk before it becomes client-visible (durable-
+        // before-visible, ADR 0009). `durable_index` is advanced by the driver
+        // after `env.sync(WAL)` (`mark_durable_through`), so an entry committed but
+        // not yet fsynced stays invisible — a crash in that window loses nothing a
+        // client could have observed.
+        let frontier = self.commit_index.min(self.durable_index);
+        while self.last_applied < frontier {
             self.last_applied += 1;
             let offset = (self.last_applied - self.snapshot_index - 1) as usize;
             let command = self.log[offset].command.clone();

@@ -40,6 +40,11 @@ fn snapshot_truncates_the_log_prefix_and_recovers() {
         "log holds the proposed entries (got {before})"
     );
 
+    // Simulate the driver's fsync so the committed entries are durable and thus
+    // applied (durable-before-visible, ADR 0009) — `snapshot()` covers the
+    // *applied* prefix, so without this the watermark never advances.
+    core.mark_durable_through(core.last_log_index());
+
     core.snapshot(); // advance the snapshot base to last_applied, drop the prefix
     assert!(
         core.log_len() < before,

@@ -166,12 +166,23 @@ cross-cutting ones. Prune/merge entries that become obsolete.
   because (a) its post-restart probe raced the Raft **catalog recovery** — gate on
   the recovered artifact (`await_table_schema` polls `has_table_schema`), the
   pattern the sibling GSI test already used; and (b) deeper, the control plane
-  **applies + acks a proposal before its WAL is fsynced** (apply-before-fsync), so
-  an abrupt teardown lost the acked schema. A restart test models a *clean*
-  process restart, so make teardown durable (`Node::shutdown_graceful` →
-  `RaftNode::flush`); the `kill -9` window is a tracked Raft follow-up (ADR 0009).
-  **A real-time restart test must wait for the recovered state and tear down
-  gracefully.**
+  **applied + acked a proposal before its WAL was fsynced** (apply-before-fsync),
+  so an abrupt teardown lost the acked schema. Both are now fixed — see the
+  durable-before-visible pattern below. **A real-time restart test must wait for
+  the recovered state and tear down gracefully.**
+- **Durable-before-visible: never expose state a crash could lose.** A node must
+  not make a committed entry client-visible (readable / ack-returnable) until it is
+  fsynced. The control plane enforces this with a `durable_index` watermark the
+  driver advances *after* `env.sync(WAL)`, gating `apply`
+  (`min(commit_index, durable_index)`) — so `metadata()`, and any proposer waiting
+  on it, only sees durable state (ADR 0009; mirrors `animus-data` `ack_durability`
+  and `animus-consensus` `persist_then_ship`). Two consequences worth remembering:
+  a core/component driven by hand must **simulate the fsync** (advance the
+  watermark) or its applied state never moves; and gating *follower* visibility on
+  the follower's own fsync **widens cross-node replication races** — a read on a
+  follower right after a create on the leader must wait for the definition to
+  replicate to that node (`await_table_*`), not assume the leader's ack made it
+  visible everywhere.
 - **Determinism (ADR 0003) proves logic and ordering, not real-thread liveness.**
   `SimEnv` is single-threaded + cooperative, so a `Mutex` guard held across an
   `.await`, a lost waker, or a leader-election/group-commit deadlock can pass
