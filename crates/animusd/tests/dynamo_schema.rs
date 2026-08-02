@@ -28,6 +28,7 @@
 //! Real time/sockets (the ProdEnv edge), so we poll with generous timeouts.
 
 use std::net::SocketAddr;
+use std::path::Path;
 use std::time::Duration;
 
 use animusd::{ClusterConfig, Node, RoleAddrs, bind_cluster, start_cluster};
@@ -149,6 +150,29 @@ fn single_node_config() -> ClusterConfig {
     }
 }
 
+/// Start a single node, retrying with **fresh ephemeral ports** on a bind/startup
+/// failure. `fixed_addrs` binds `:0`, reads the addr, then drops the listener —
+/// under `cargo test --workspace` (many test binaries in parallel) another binder
+/// can steal a freed port in that TOCTOU window, so the subsequent `run_node`
+/// rebind intermittently fails with `AddrInUse`. Retrying with a brand-new config
+/// makes the first bring-up robust. Returns the started `Node` **and** the
+/// `ClusterConfig` it actually bound, so a restart-style test can reuse the same
+/// addresses (its reuse window is tiny and acceptable).
+async fn start_single_node(dir: &Path) -> (Node, ClusterConfig) {
+    let mut last_err = None;
+    for attempt in 0..10 {
+        let config = single_node_config();
+        match animusd::run_node(&config, 0, dir).await {
+            Ok(node) => return (node, config),
+            Err(e) => {
+                last_err = Some(e);
+                sleep(Duration::from_millis(50 * (attempt + 1))).await;
+            }
+        }
+    }
+    panic!("single node failed to start after 10 attempts: {last_err:?}");
+}
+
 async fn stop(node: Node) {
     // Graceful: durably flush the control-plane WAL before aborting tasks, so a
     // just-acked `CreateTable` schema survives the restart (a bare `shutdown`
@@ -160,15 +184,12 @@ async fn stop(node: Node) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn create_table_survives_node_restart() {
-    let config = single_node_config();
-    let dynamo_addr = config.nodes[0].dynamo;
     let dir = tempfile::tempdir().unwrap();
     let node_dir = dir.path().join("node-0");
 
     // --- First incarnation: create a composite table, write + read an item. ---
-    let node = animusd::run_node(&config, 0, &node_dir)
-        .await
-        .expect("first start");
+    let (node, config) = start_single_node(&node_dir).await;
+    let dynamo_addr = config.nodes[0].dynamo;
     await_node_bootstrap(&node).await;
 
     let (status, body) = dynamo(
@@ -195,7 +216,8 @@ async fn create_table_survives_node_restart() {
 
     // --- Second incarnation: SAME dir + addresses. The schema must survive, so a
     // bare PutItem (no re-CreateTable) resolves the composite key correctly and
-    // a re-CreateTable is rejected as already existing. ---
+    // a re-CreateTable is rejected as already existing. The restart reuses the
+    // exact config that bound on the first bring-up (same addresses). ---
     let node = animusd::run_node(&config, 0, &node_dir)
         .await
         .expect("restart");
@@ -241,16 +263,13 @@ async fn create_table_survives_node_restart() {
 /// end-to-end proof that the former written-key tracking is gone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn scan_and_query_read_live_storage_after_restart() {
-    let config = single_node_config();
-    let dynamo_addr = config.nodes[0].dynamo;
     let dir = tempfile::tempdir().unwrap();
     let node_dir = dir.path().join("node-0");
 
     // --- First incarnation: create a composite table and write three rows in two
     // partitions, then stop the node (this wipes the in-memory registry). ---
-    let node = animusd::run_node(&config, 0, &node_dir)
-        .await
-        .expect("first start");
+    let (node, config) = start_single_node(&node_dir).await;
+    let dynamo_addr = config.nodes[0].dynamo;
     await_node_bootstrap(&node).await;
 
     let (status, body) = dynamo(
@@ -439,15 +458,12 @@ async fn create_table_index_replicates_to_second_node() {
 /// node, and a re-CreateTable is rejected as already existing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn create_table_index_survives_node_restart() {
-    let config = single_node_config();
-    let dynamo_addr = config.nodes[0].dynamo;
     let dir = tempfile::tempdir().unwrap();
     let node_dir = dir.path().join("node-0");
 
     // --- First incarnation: create a table with a GSI + write an indexed item. ---
-    let node = animusd::run_node(&config, 0, &node_dir)
-        .await
-        .expect("first start");
+    let (node, config) = start_single_node(&node_dir).await;
+    let dynamo_addr = config.nodes[0].dynamo;
     await_node_bootstrap(&node).await;
 
     let (status, body) = dynamo(

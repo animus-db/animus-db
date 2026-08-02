@@ -17,6 +17,7 @@
 //! (the ProdEnv edge).
 
 use std::net::SocketAddr;
+use std::path::Path;
 use std::time::Duration;
 
 use animusd::{ClientRequest, ClientResponse, ClusterConfig, Node, RoleAddrs, StorageBackend};
@@ -76,6 +77,29 @@ fn single_node_config() -> ClusterConfig {
     }
 }
 
+/// Start a single node, retrying with **fresh ephemeral ports** on a bind/startup
+/// failure. `fixed_addrs` binds `:0`, reads the addr, then drops the listener —
+/// under `cargo test --workspace` (many test binaries in parallel) another binder
+/// can steal a freed port in that TOCTOU window, so the subsequent `run_node`
+/// rebind intermittently fails with `AddrInUse`. Retrying with a brand-new config
+/// makes the first bring-up robust. Returns the started `Node` **and** the
+/// `ClusterConfig` it actually bound, so the restart can reuse the same addresses
+/// (its reuse window is tiny and acceptable).
+async fn start_single_node(dir: &Path, backend: StorageBackend) -> (Node, ClusterConfig) {
+    let mut last_err = None;
+    for attempt in 0..10 {
+        let config = single_node_config();
+        match animusd::run_node_with(&config, 0, dir, backend).await {
+            Ok(node) => return (node, config),
+            Err(e) => {
+                last_err = Some(e);
+                sleep(Duration::from_millis(50 * (attempt + 1))).await;
+            }
+        }
+    }
+    panic!("single node failed to start after 10 attempts: {last_err:?}");
+}
+
 /// Stop a node cleanly and give the OS a moment to release its now-aborted
 /// listeners' ports, so the replacement can rebind the same addresses.
 async fn stop(node: Node) {
@@ -86,15 +110,12 @@ async fn stop(node: Node) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn data_survives_node_restart_on_disk() {
-    let config = single_node_config();
-    let client = config.nodes[0].client;
     let dir = TempDir::new().unwrap();
     let node_dir = dir.path().join("node-0");
 
     // --- First incarnation: write a durable key, then shut down cleanly. ---
-    let node = animusd::run_node(&config, 0, &node_dir)
-        .await
-        .expect("first start");
+    let (node, config) = start_single_node(&node_dir, StorageBackend::default()).await;
+    let client = config.nodes[0].client;
     await_bootstrap(&node).await;
 
     let put = call(
@@ -168,14 +189,11 @@ async fn data_survives_node_restart_on_disk() {
 /// WAL recovers metadata either way).
 #[tokio::test(flavor = "multi_thread")]
 async fn data_is_lost_on_restart_with_memory_backend() {
-    let config = single_node_config();
-    let client = config.nodes[0].client;
     let dir = TempDir::new().unwrap();
     let node_dir = dir.path().join("node-0");
 
-    let node = animusd::run_node_with(&config, 0, &node_dir, StorageBackend::Memory)
-        .await
-        .expect("first start (memory)");
+    let (node, config) = start_single_node(&node_dir, StorageBackend::Memory).await;
+    let client = config.nodes[0].client;
     await_bootstrap(&node).await;
 
     let put = call(

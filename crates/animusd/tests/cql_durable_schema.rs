@@ -17,6 +17,7 @@
 //! Like the other `animusd` tests it uses real TCP/time and polls with timeouts.
 
 use std::net::SocketAddr;
+use std::path::Path;
 use std::time::Duration;
 
 use animus_cql::frame::{self, Frame, Opcode, REQUEST_VERSION};
@@ -180,17 +181,37 @@ async fn stop(node: Node) {
     sleep(Duration::from_millis(200)).await;
 }
 
+/// Start a single node, retrying with **fresh ephemeral ports** on a bind/startup
+/// failure. `fixed_addrs` binds `:0`, reads the addr, then drops the listener —
+/// under `cargo test --workspace` (many test binaries in parallel) another binder
+/// can steal a freed port in that TOCTOU window, so the subsequent `run_node`
+/// rebind intermittently fails with `AddrInUse`. Retrying with a brand-new config
+/// makes the first bring-up robust. Returns the started `Node` **and** the
+/// `ClusterConfig` it actually bound, so a restart-style test can reuse the same
+/// addresses (its reuse window is tiny and acceptable).
+async fn start_single_node(dir: &Path) -> (Node, ClusterConfig) {
+    let mut last_err = None;
+    for attempt in 0..10 {
+        let config = single_node_config();
+        match animusd::run_node(&config, 0, dir).await {
+            Ok(node) => return (node, config),
+            Err(e) => {
+                last_err = Some(e);
+                sleep(Duration::from_millis(50 * (attempt + 1))).await;
+            }
+        }
+    }
+    panic!("single node failed to start after 10 attempts: {last_err:?}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cql_schema_and_row_survive_node_restart() {
-    let config = single_node_config();
-    let cql_addr = config.nodes[0].cql;
     let dir = tempfile::TempDir::new().unwrap();
     let node_dir = dir.path().join("node-0");
 
     // --- First incarnation: CREATE TABLE (replicated) + INSERT a row. ---
-    let node = animusd::run_node(&config, 0, &node_dir)
-        .await
-        .expect("first start");
+    let (node, config) = start_single_node(&node_dir).await;
+    let cql_addr = config.nodes[0].cql;
     await_bootstrap(&node).await;
 
     {
@@ -272,12 +293,9 @@ async fn cql_schema_and_row_survive_node_restart() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cql_batch_alter_drop_surface() {
-    let config = single_node_config();
-    let cql_addr = config.nodes[0].cql;
     let dir = tempfile::TempDir::new().unwrap();
-    let node = animusd::run_node(&config, 0, dir.path().join("node-0"))
-        .await
-        .expect("start");
+    let (node, config) = start_single_node(&dir.path().join("node-0")).await;
+    let cql_addr = config.nodes[0].cql;
     await_bootstrap(&node).await;
 
     let mut conn = TcpStream::connect(cql_addr).await.expect("connect cql");
