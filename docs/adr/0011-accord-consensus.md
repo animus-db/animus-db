@@ -2,11 +2,13 @@
 
 - **Status:** Accepted (first minimal slice; extended with execution + durability;
   then storage-backed execution + coordinator failover; then read transactions +
-  multi-thread liveness regression; then message retry + the data-plane frontier)
+  multi-thread liveness regression; then message retry + the data-plane frontier;
+  then data-plane reads + an interactive transaction API)
 - **Date:** 2026-08-01 (execution + durability increment: 2026-08-01;
   storage-backed execution + coordinator-failover increment: 2026-08-01;
   read-transactions + multi-thread-liveness increment: 2026-08-02;
-  message-retry + data-plane-frontier increment: 2026-08-02)
+  message-retry + data-plane-frontier increment: 2026-08-02;
+  data-plane-reads + interactive-transaction-API increment: 2026-08-02)
 
 ## Context
 
@@ -327,3 +329,68 @@ integration** — again without reshaping the sync-core / `Env`-driver split.
   retry tick is a fixed-interval re-send, not an adaptive timeout or a backoff,
   and it does not itself *detect* a dead coordinator (that remains the explicit
   `recover` path). The Elle cycle checker is still unwired.
+
+## Data-plane reads + interactive transaction API increment (2026-08-02)
+
+This increment closes the two data-plane/UX gaps the frontier slice named — a
+read transaction reading a *private local snapshot* rather than the replicated
+data plane, and the lack of an *interactive* transaction API — again without
+reshaping the sync-core / `Env`-driver split.
+
+- **Reads through the data plane.** When an `AccordNode` is wired to the data
+  plane (`start_with_data_plane`), a committed read-only transaction now observes
+  the **replicated data plane** at execution time — the same store committed
+  *write* transactions land in — instead of the per-node local engine. The sync
+  core is untouched: it still orders the read like a write and emits a
+  `ReadEffect` when the read becomes applicable. Only the driver's `satisfy_reads`
+  changed: with a `DataSink` it issues a data-plane **quorum read**
+  (`DataClient::read`) for each key rather than a local `get_at`. This is correct
+  *because* of the existing execution-order gate — the core emits the read effect
+  only once every earlier-ordered conflicting write has `Applied`, and an applied
+  write's effect was already pushed through the same data-plane quorum, so a
+  *current* quorum read at execution time observes exactly the writes ordered
+  before the read and none after. The data-plane wire still carries **no**
+  historical `get_at`-by-version read; we rely on the ordering gate, not a
+  versioned snapshot, which is why a *recovered* read is still re-satisfied from
+  the local recovery substrate (the local engine was repopulated in execution
+  order on recovery; a live quorum read would instead reflect current, possibly
+  newer, state). A transient quorum miss reads as absent and converges via the
+  data plane's own anti-entropy. Tests in
+  `animus-consensus/tests/accord_data_plane_read.rs` assemble Accord + data-plane
+  replicas and prove a read transaction observes a prior write transaction's data
+  through the quorum (and an unwritten key reads as absent), consistently on every
+  replica.
+
+- **Interactive transaction API.** A `begin → read* → write* → commit` handle
+  (`AccordNode::begin` → `InteractiveTxn`) lets a caller run a multi-step
+  read-modify-write under **one** Accord transaction instead of submitting a
+  pre-baked op set. `read(key)` returns the current committed writer of a key
+  (through the data plane when wired, else the local store) so the caller can
+  *decide*; `write(key)` buffers a write; `commit()` submits the buffered write
+  set as a single Accord write transaction via the existing `submit` entry point —
+  agreed, ordered, and applied atomically at one execution timestamp, so
+  conflicting interactive transactions are ordered consistently on every replica
+  and each lands all-or-nothing. The **core stays sync + I/O-free**: the handle is
+  pure driver state and reaches the core only through `submit` at commit time.
+  Tests prove an interactive read-modify-write commits atomically and two
+  conflicting interactive transactions are ordered consistently across replicas
+  (`accord_data_plane_read.rs`).
+
+- **Deliberately scoped this slice.** The interactive session's *reads* inform
+  the commit decision but are **not** yet serialized into the committed
+  transaction's conflict/dependency set — full Accord read/write transactions in a
+  single round (where the read set also carries dependencies, against
+  read-set-vs-write-set conflicts) are the natural next step. The committed write
+  effect is still "write my id" (the standard execution effect), not an arbitrary
+  caller-supplied value.
+
+- **Still deferred after this increment:** **sharded** (multi-tablet)
+  transactions — the frontier still routes a single `TabletView`, so a
+  transaction's key set must live in one tablet; folding the interactive read set
+  into the transaction's dependency tracking (full read/write transactions in one
+  round); an **adaptive** retry timeout / backoff (the retry tick is still a
+  fixed-interval re-send and does not itself detect a dead coordinator — that
+  remains the explicit `recover` path); the full transitive dependency wait-graph;
+  the precise Accord recovery ballot + duelling recoverers + a failure detector;
+  WAL snapshotting / log truncation; the precise fast-path quorum bound; and
+  wiring the Elle cycle checker.

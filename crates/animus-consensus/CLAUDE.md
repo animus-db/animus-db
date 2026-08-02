@@ -13,9 +13,12 @@ Commit, or PreAccept → Accept → Commit (slow path), then each replica
 another replica (**coordinator failover**, first slice). Dropped messages are
 **retried** on a driver timer so a lossy network does not strand a transaction.
 A committed transaction's write effect can land in the **replicated data plane**
-(`animus-data` quorum) — the "frontier" path — so this is the layer that gives
-the AP data plane multi-key atomicity and a strict serialization order. No
-leader.
+(`animus-data` quorum) — the "frontier" path — and a wired read transaction
+**reads from that same data plane** (quorum read at execution time), so this is
+the layer that gives the AP data plane multi-key atomicity and a strict
+serialization order. An **interactive** `begin → read → decide → write → commit`
+handle (`AccordNode::begin`) runs a multi-step read-modify-write under one Accord
+transaction. No leader.
 
 ## Entry points
 
@@ -64,7 +67,16 @@ leader.
   Apply a committed *write* effect is also pushed through the data-plane quorum
   (`DataClient::write`) so it is readable via data-plane quorum reads. The
   data-plane coordinator uses a **distinct node id** (`coordinator_env`) — the
-  inbox is single-consumer.
+  inbox is single-consumer. **Data-plane reads:** with a `DataSink`,
+  `satisfy_reads` issues a data-plane **quorum read** (`DataClient::read`) per key
+  instead of a local `get_at`, so a read observes the same replicated state writes
+  land in (recovery still re-satisfies reads from the local substrate — `None`
+  sink). **Interactive API:** `begin()` returns an `InteractiveTxn`
+  (`read(key).await` → current committed writer through the data plane or local
+  store; `write(key)` buffers; `commit()` submits the buffered write set as one
+  Accord write txn). Pure driver state — the core stays sync + I/O-free, reached
+  only via `submit` at commit. `current_writer(key).await` is the ad-hoc read it
+  uses.
 
 ## What's non-obvious
 
@@ -147,9 +159,28 @@ leader.
   the data plane already holds the committed writes durably, so a restart must not
   re-storm it. The data-plane write result is not asserted in the apply path (a
   transient quorum miss converges via the data plane's own anti-entropy); the test
-  verifies through a quorum read. Read-only transactions are **not** routed to the
-  data plane yet (no `get_at`-by-version on the data-plane wire) — they still use
-  the local engine snapshot.
+  verifies through a quorum read.
+- **Data-plane reads ride the execution-order gate, not a versioned snapshot.**
+  With a `DataSink`, `satisfy_reads` does a data-plane **quorum read**
+  (`DataClient::read`) per key — *not* a `get_at`-by-version (the data-plane wire
+  has none). That is sound only because the core emits a read's `ReadEffect`
+  **after** every earlier-ordered conflicting write has `Applied`, and an applied
+  write was already pushed through the same quorum — so a *current* quorum read
+  observes exactly the writes ordered before the read and none after. Keep the
+  effect-emission gate intact: routing the read to a live quorum read would be
+  unsound without it. **Recovery is the exception:** a recovered read is
+  re-satisfied from the *local* engine (`None` sink in `drive`), because the local
+  substrate was repopulated in execution order on recovery, whereas a live quorum
+  read would reflect current (possibly newer) state. A transient quorum miss reads
+  as absent and converges via anti-entropy.
+- **The interactive API lives entirely in the driver.** `InteractiveTxn` is pure
+  driver state (`reads`/`writes` key sets + a node clone); it never touches the
+  sync core except through the existing `submit` at `commit()`. So the core stays
+  I/O-free and the atomicity/ordering guarantees are exactly `submit`'s. **Scope
+  this slice:** the session reads *inform* the decision but are **not** serialized
+  into the committed transaction's conflict set (read/write transactions in one
+  Accord round are deferred — ADR 0011), and the committed write effect is still
+  "write my id", not an arbitrary value. An empty write set commits to `None`.
 - **Recovery sets phase to `Applied` when `PersistedTxn.applied`** even though
   the phase-bearing records stop at `Committed` — the separate `Applied` WAL
   record carries the executed bit. On recovery the core **re-emits the apply
@@ -177,22 +208,25 @@ leader.
 
 ## Deferred (see ADR 0011)
 
-The full transitive dependency wait-graph (the execution wait is conflict +
+**Sharded** (multi-tablet) transactions whose key set spans more than one tablet
+(the frontier routes a single `TabletView`), folding the interactive session's
+read set into the transaction's conflict/dependency tracking (full read/write
+transactions in one Accord round, with arbitrary write values), an **adaptive**
+retry timeout / backoff (today the retry is a fixed-interval re-send and does not
+itself detect a dead coordinator — that is still the explicit `recover` path),
+the full transitive dependency wait-graph (the execution wait is conflict +
 timestamp based), the precise Accord recovery ballot rules + duelling recovery
 coordinators + a failure detector to trigger recovery (today `recover` is called
 explicitly), WAL snapshotting/log truncation (the WAL is the full per-txn
-history — contrast `RaftCore`), **data-plane reads** (a read txn still uses the
-local engine's `get_at` snapshot — the data-plane wire has no
-historical-by-version read), **sharded** transactions whose key set spans more
-than one tablet (the frontier routes one `TabletView`), an interactive
-read/write transaction API, livelock handling, an **adaptive** retry timeout /
-backoff (today the retry is a fixed-interval re-send and does not itself detect a
-dead coordinator — that is still the explicit `recover` path), and wiring the
-Elle cycle checker (`animus-test`). **Now implemented:** read-only transactions
-(`submit_read`), **message retry** (the driver's retry tick + `resend_pending`),
-and the **data-plane frontier** (`start_with_data_plane` — committed writes land
-in the `animus-data` quorum, readable via quorum reads). The sync-core boundary
-is where each remaining piece slots in.
+history — contrast `RaftCore`), the precise fast-path quorum bound, and wiring
+the Elle cycle checker (`animus-test`). **Now implemented:** read-only
+transactions (`submit_read`), **message retry** (the driver's retry tick +
+`resend_pending`), the **data-plane frontier** (`start_with_data_plane` —
+committed writes land in the `animus-data` quorum, readable via quorum reads),
+**data-plane reads** (a wired read txn observes the data plane via a quorum read
+at execution time), and an **interactive transaction API** (`AccordNode::begin`
+→ `InteractiveTxn`). The sync-core boundary is where each remaining piece slots
+in.
 
 ## Tests
 
@@ -236,6 +270,14 @@ is where each remaining piece slots in.
   **atomically and in a consistent order** (shared key → second-ordered txn; each
   private key → its own txn). Plus the stored-value encoding guard and frontier
   trace reproducibility.
+- `tests/accord_data_plane_read.rs` (**data-plane reads + interactive API**):
+  same assembly as `accord_data_plane.rs` (Accord 0–2, coordinators 10–12, data
+  replicas 3–5). A read transaction observes a prior write transaction's data
+  **through the data-plane quorum** (and an unwritten key reads absent),
+  consistently on every replica; an **interactive** read-modify-write commits
+  atomically (both keys carry the committed txn on every replica); two conflicting
+  interactive transactions are ordered consistently; an empty interactive txn is a
+  no-op; plus trace reproducibility.
 - `tests/accord_concurrent.rs` (**real multi-threaded**, *not* `SimEnv`):
   `#[tokio::test(flavor = "multi_thread", worker_threads = 4)]` over `ProdEnv`,
   timeout-guarded — several replicas + concurrent coordinators committing
