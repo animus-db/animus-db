@@ -81,7 +81,12 @@ re-sends un-acknowledged round messages on a timer so a dropped fire-and-forget
 `send` no longer strands a transaction), and a **data-plane frontier** — a
 committed transaction's writes can land in the replicated AP data plane
 (`animus-data` quorum), readable via ordinary quorum reads, atomically in agreed
-order; ADR 0011). Skeletons / future work:
+order; transactions can also be **sharded** across tablets — a single
+transaction's key set may span more than one tablet, each key's effect routed to
+its own tablet's quorum while one global execution timestamp orders all shards —
+and an **interactive read-modify-write** folds its read set into the committed
+transaction's conflict tracking, with **adaptive (exponential) retry backoff**;
+ADR 0011). Skeletons / future work:
 the rest of the CQL surface (composite multi-column partition keys,
 `BATCH`/`ALTER`/`DROP`, per-column `DELETE`, range/`IN`/`ORDER BY`/`LIMIT`,
 collection/UDT types, paging, auth, `LWT`) and the rest of the
@@ -91,8 +96,9 @@ plane now holds a **replicated table-schema catalog** (ADR 0013) the adapters ca
 consume to replace their per-process in-memory catalogs (that adapter wiring is
 the follow-up) — and the deferred remainder of Accord
 (the full dependency wait-graph, the precise recovery ballot + duelling
-recoverers + a failure detector, WAL snapshotting, and sharded transactions
-across tablets).
+recoverers + a failure detector, WAL snapshotting, arbitrary caller-supplied
+write values, and per-shard consensus replica sets / placement of the consensus
+participants themselves).
 
 ## Per-crate guides
 
@@ -342,15 +348,21 @@ time, sound because the read's effect is emitted only after every earlier-ordere
 write has applied to the quorum). An **interactive** `begin → read → decide →
 write → commit` handle (`AccordNode::begin` → `InteractiveTxn`) runs a multi-step
 read-modify-write under one Accord transaction — the handle is pure driver state,
-committing through `submit`, so conflicting interactive transactions are ordered
-consistently and land atomically.
+committing through `submit_rw`, so the **session's reads fold into the committed
+transaction's conflict set** (a concurrent write to a key it read is ordered
+correctly) and conflicting interactive transactions are ordered consistently and
+land atomically. Transactions may be **sharded**: `start_with_router` routes each
+key's data-plane effect to **its own** tablet's quorum, so one transaction's keys
+can span multiple tablets while the Accord round agrees one global execution
+timestamp ordering every shard. The retry tick uses **adaptive (exponential)
+backoff** — it backs off while a round is stuck (fewer redundant sends) and
+resets on progress.
 The driver's real-thread liveness (no mutex guard held across `.await`) is
 guarded by a multi-threaded `ProdEnv` regression test, since `SimEnv` proves
-order but not thread liveness. **Deferred:** **sharded** (multi-tablet)
-transactions, folding the interactive read set into the transaction's dependency
-tracking (full read/write transactions in one round), an adaptive retry
-backoff, the full dependency wait-graph, the precise recovery ballot + duelling
-recoverers + a failure detector, and WAL snapshotting — see ADR 0011 and the
+order but not thread liveness. **Deferred:** the full dependency wait-graph, the
+precise recovery ballot + duelling recoverers + a failure detector, WAL
+snapshotting, arbitrary caller-supplied write values, and per-shard consensus
+replica sets / placement of the consensus participants — see ADR 0011 and the
 crate guide.
 
 ### Storage (`animus-storage`)
