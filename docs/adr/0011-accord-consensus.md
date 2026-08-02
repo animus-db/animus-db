@@ -4,14 +4,15 @@
   then storage-backed execution + coordinator failover; then read transactions +
   multi-thread liveness regression; then message retry + the data-plane frontier;
   then data-plane reads + an interactive transaction API; then sharded
-  transactions + read-set dependency folding + adaptive retry backoff)
+  transactions + read-set dependency folding + adaptive retry backoff; then
+  arbitrary caller-supplied write values)
 - **Date:** 2026-08-01 (execution + durability increment: 2026-08-01;
   storage-backed execution + coordinator-failover increment: 2026-08-01;
   read-transactions + multi-thread-liveness increment: 2026-08-02;
   message-retry + data-plane-frontier increment: 2026-08-02;
   data-plane-reads + interactive-transaction-API increment: 2026-08-02;
   sharded-transactions + read-set-folding + adaptive-backoff increment:
-  2026-08-02)
+  2026-08-02; arbitrary-write-values increment: 2026-08-02)
 
 ## Context
 
@@ -475,10 +476,55 @@ sync-core / `Env`-driver split.
   wait-graph; the precise Accord recovery ballot + duelling recoverers + a failure
   detector to *trigger* both recovery and a retry escalation (the adaptive tick
   backs off but does not itself declare a coordinator dead — that remains the
-  explicit `recover` path); WAL snapshotting / log truncation; the precise
-  fast-path quorum bound; arbitrary caller-supplied write *values* (the execution
-  effect is still "write my id"); and wiring the Elle cycle checker
-  (`animus-test`). Sharding here routes the *execution effect* per tablet; the
-  Accord replica set is still one global group (every transaction is replicated to
-  every consensus node), so per-shard consensus replica sets / placement of the
-  consensus participants themselves remain future work.
+  explicit `recover` path); WAL snapshotting / log truncation; and the precise
+  fast-path quorum bound. Sharding here routes the *execution effect* per tablet;
+  the Accord replica set is still one global group (every transaction is
+  replicated to every consensus node), so per-shard consensus replica sets /
+  placement of the consensus participants themselves remain future work.
+
+## Arbitrary caller-supplied write values increment (2026-08-02)
+
+This increment closes the last execution-effect gap the earlier slices named as
+deferred — **arbitrary caller-supplied write values** — again without reshaping
+the sync-core / `Env`-driver split. It also unblocks a *true black-box* Elle
+check over Accord (ADR 0014).
+
+- **A transaction carries an explicit write set as `(key → value)`.** Previously
+  the execution effect was hard-coded to "write my transaction id" (a register).
+  A `ReplicaTxn` now carries, alongside its `write_keys`, a `write_values:
+  BTreeMap<Key, Vec<u8>>` of caller-supplied bytes; the conflict set is still the
+  union of read + write keys, and ordering is unchanged. On execution the
+  `AccordNode` driver writes each key's **actual value** to the `StorageEngine`
+  (and, on the frontier, the data-plane quorum) at the execution timestamp; a key
+  *absent* from `write_values` defaults at the driver to the transaction's encoded
+  id, so the classic register effect (and `store_writer`/`store_value` read-back)
+  is exactly preserved for valueless callers. The `AccordCore` stays synchronous
+  + I/O-free: values flow through it purely as data on the `ApplyEffect`; the
+  driver does all the storage I/O.
+- **The API is additive.** `submit`/`submit_rw` (txn-id effect) are unchanged;
+  `submit_writes(BTreeMap<Key, Vec<u8>>)` and `submit_writes_rw(read_keys,
+  BTreeMap<Key, Vec<u8>>)` carry explicit values, and `InteractiveTxn` grows
+  `write_value(key, value)` / `read_value(key)` (raw bytes) so an interactive
+  read-modify-write over arbitrary values (e.g. list-append) works. Reads now
+  record **raw value bytes**: `read_value_result(txn)` returns them verbatim
+  while `read_result(txn)` still decodes them as a writer id for the register
+  view; `store_value`/`current_value` expose the raw bytes too.
+- **Durability + failover replay the values.** The `write_values` ride the
+  `PreAccept`/`Commit`/`RecoverOk` wire messages and the `PreAccepted`/`Committed`
+  WAL records (new `write_values` fields, `#[serde(default)]` for
+  forward-compat), so a replica that learns a transaction only at `Commit` writes
+  the right value, recovery replays the actual bytes into a fresh engine, and a
+  recovery coordinator unions the write values across the recovery quorum.
+  Determinism is preserved (values are opaque `Vec<u8>` data; no new
+  nondeterminism). Tests in `animus-consensus/tests/accord_values.rs`: a write's
+  actual value lands on every replica; conflicting values resolve in agreed order;
+  a read observes the actual value; the value survives stop/restart; an
+  interactive read-modify-write carries a real value through the data plane; a
+  sharded transaction routes the real value per tablet; trace reproducibility.
+- **Still deferred after this increment:** the full transitive dependency
+  wait-graph; the precise Accord recovery ballot + duelling recoverers + a failure
+  detector to trigger recovery/retry escalation; WAL snapshotting / log
+  truncation; the precise fast-path quorum bound; and per-shard consensus replica
+  sets / placement (one global Accord group). The Elle cycle checker is now wired
+  (ADR 0014) — and, with real write values, it is a *genuine black-box* check
+  (reads observe stored state, not a reconstruction from `applied_order`).

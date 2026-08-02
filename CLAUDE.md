@@ -184,15 +184,20 @@ cross-cutting ones. Prune/merge entries that become obsolete.
   matrix (fault type × target class × timing × workload); keep bug-finding
   scenarios in the corpus forever as regressions. (Done: ADR 0014 / `animus-test`
   `corpus.rs` — ~119 frozen, name-seeded scenarios over Accord.)
-- **Match the Elle datatype to the storage model, and recover "final state" from
-  the layer that holds order.** Accord's effect is "write my txn id" — a
-  *register*. Running `check_durability` against a final *register* read flags
-  every overwritten value as a "lost write" (the register keeps only the last
-  writer) — a false positive, not a bug. Recover the list-append final state from
-  the ordering layer's own log (`AccordNode::applied_order`) instead, and take
-  convergence from **two distinct replicas'** orders so it's a real cross-replica
-  agreement check. The list-append abstraction lives in the order Accord agrees,
-  not the bytes the register stores.
+- **For a *true black-box* Elle check, store the datatype and observe it — don't
+  reconstruct it from the ordering layer's log.** Reconstructing each read's list
+  from `AccordNode::applied_order` (the old register modelling) limits the
+  checker's teeth to cross-replica *divergence*: a single globally-agreed but
+  non-serializable order can't show as a cycle, because the lists are derived from
+  the very order under test. With **arbitrary write values** (ADR 0011) each key
+  now stores a real list and reads observe stored bytes
+  (`AccordNode::read_value_result`), so `check_cycles` is genuinely black-box
+  (`animus-test/tests/support/mod.rs`). Read "final state" straight from stored
+  values on **two distinct replicas** (a real cross-replica agreement check), and
+  use **single-writer-per-key** so per-key LWW doesn't lose appends — and build
+  each append on the client's own authoritative list, not a begin-time quorum read
+  (the apply flips `is_applied` before its fire-and-forget data-plane write lands,
+  so a begin-time read can be stale and lose the client's own earlier appends).
 - **Never `let _ = storage.merge(...)` on the write path** — an ack must mean the
   write durably applied; surface storage errors so a non-durable write isn't
   counted toward the quorum (`animus-data` `ack_durability.rs`).

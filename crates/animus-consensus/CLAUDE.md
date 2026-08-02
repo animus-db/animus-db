@@ -68,9 +68,12 @@ conflict set** (`submit_rw`). No leader.
   timer with **exponential backoff** (`RETRY_BASE_INTERVAL` doubling to
   `RETRY_MAX_INTERVAL`, reset on progress) — a **perpetual timer**, so drive tests
   with `run_for`/`run_until`, never `run()`. `submit_read(keys)` runs a read-only
-  transaction; `submit_rw(reads, writes)` a read-modify-write; `read_result(txn)`
-  returns the per-key writer it observed (populated once `is_applied(txn)`).
-  `store_writer(key)` is `async` (it reads the engine). **Frontier:**
+  transaction; `submit_rw(reads, writes)` a read-modify-write (txn-id effect);
+  `submit_writes(map)` / `submit_writes_rw(reads, map)` carry **arbitrary write
+  values** (ADR 0011). `read_result(txn)` returns the per-key *writer id* it
+  observed and `read_value_result(txn)` the **raw value bytes** (populated once
+  `is_applied(txn)`). `store_writer(key)` (decoded id) / `store_value(key)` (raw
+  bytes) / `current_value(key)` are `async` (they read the engine / data plane). **Frontier:**
   `start_with_data_plane(env, all_nodes, storage, coordinator_env, view)` attaches
   a `DataSink { DataClient, DataRouting::Single(TabletView) }`; on Apply a
   committed *write* effect is also pushed through the data-plane quorum
@@ -85,13 +88,14 @@ conflict set** (`submit_rw`). No leader.
   instead of a local `get_at`, so a read observes the same replicated state writes
   land in (recovery still re-satisfies reads from the local substrate — `None`
   sink). **Interactive API:** `begin()` returns an `InteractiveTxn`
-  (`read(key).await` → current committed writer through the data plane or local
-  store; `write(key)` buffers; `commit()` submits the session as one Accord
-  read-modify-write via `submit_rw(reads, writes)` — so the **session's reads fold
-  into the committed transaction's conflict set** and are ordered against
-  conflicting writes). Pure driver state — the core stays sync + I/O-free, reached
-  only via `submit_rw` at commit. `current_writer(key).await` is the ad-hoc read
-  it uses.
+  (`read(key).await` → current committed writer id, `read_value(key).await` → raw
+  bytes, through the data plane or local store; `write(key)` buffers a txn-id
+  write, `write_value(key, bytes)` an arbitrary-value write; `commit()` submits the
+  session as one Accord read-modify-write via `submit_rw`/`submit_writes_rw` — so
+  the **session's reads fold into the committed transaction's conflict set** and
+  are ordered against conflicting writes). Pure driver state — the core stays sync
+  + I/O-free, reached only at commit. `current_writer`/`current_value` are the
+  ad-hoc reads it uses.
 
 ## What's non-obvious
 
@@ -123,13 +127,28 @@ conflict set** (`submit_rw`). No leader.
   txns) lets two concurrent same-timestamp-but-different-node txns execute in
   arrival order and diverge across replicas; the seed sweep guards this.
 - **Execution effect goes to a real `StorageEngine`, not an in-core map.** The
-  core emits an `ApplyEffect { txn, keys, version }` when a txn becomes
-  applicable; the driver `merge`s the txn's id into each key at `version =
+  core emits an `ApplyEffect { txn, keys, values, version }` when a txn becomes
+  applicable; the driver `merge`s each key's value at `version =
   execute_at.logical`. Use **`merge`, not `put`** — execution timestamps are not
   globally monotonic across keys (so `put`'s engine-wide floor would reject
   them), and `merge`'s per-key LWW is idempotent + commutative, so the
-  recovery/duplicate re-apply converges. The value stored is the writer's
-  `TxnId` (encoded as two big-endian u64s); `store_writer` decodes it back.
+  recovery/duplicate re-apply converges.
+- **Arbitrary write values are additive (ADR 0011).** `ApplyEffect.values` is a
+  `BTreeMap<Key, Vec<u8>>` of caller-supplied bytes; a key **absent** from it
+  defaults *at the driver* to the writer's `TxnId` (two big-endian u64s — the
+  classic register effect, which `store_writer` decodes back). So
+  `submit`/`submit_rw` (valueless) still "write my id", while
+  `submit_writes(map)` / `submit_writes_rw(reads, map)` /
+  `InteractiveTxn::write_value(k, v)` write the **actual bytes**. Values flow
+  through the sync core purely as data (on `ReplicaTxn.write_values`, the
+  `PreAccept`/`Commit`/`RecoverOk` wire, and the `PreAccepted`/`Committed` WAL —
+  `#[serde(default)]`), so the core never encodes a txn id and the values survive
+  recovery + failover (recovery unions them across the quorum). Reads expose raw
+  bytes: `read_value_result(txn)` / `store_value(key)` / `current_value(key)`
+  return them verbatim; `read_result(txn)` / `store_writer(key)` decode them as a
+  writer id for the register view. **`merge`'s per-key LWW is still the substrate**
+  — concurrent writers to one key lose updates by the data model, so a list-append
+  workload over this needs single-writer-per-key (see `animus-test`).
 - **Read-only transactions are ordered like writes; only the effect differs.**
   `submit_read` mints a `t0`, intersects conflicting keys, and runs the same
   PreAccept/(Accept)/Commit machinery (the `read_only` flag rides on
@@ -200,9 +219,14 @@ conflict set** (`submit_rw`). No leader.
   and the atomicity/ordering guarantees are exactly `submit_rw`'s. The session's
   **reads are folded into the committed transaction's conflict set** (conflict set
   = reads ∪ writes), so a concurrent write to a key the session read is ordered
-  relative to the commit (the read-then-write hazard). The committed write effect
-  is still "write my id", not an arbitrary value. An empty write set commits to
-  `None`.
+  relative to the commit (the read-then-write hazard). A buffered `write(key)`
+  writes the committed txn id; `write_value(key, bytes)` writes arbitrary bytes
+  (ADR 0011), and `read_value(key)` returns the current raw bytes (vs `read`'s
+  decoded writer id) — so an interactive read-modify-write over arbitrary values
+  (e.g. list-append) works. `commit()` routes to `submit_rw` (txn-id effect) when
+  no values were supplied, else `submit_writes_rw` (real values); mixing valued
+  and valueless writes in one session is unsupported (debug-asserted). An empty
+  write set commits to `None`.
 - **`write_keys` vs `keys` (read/write transactions).** A `ReplicaTxn` carries
   both its full conflict `keys` (every key read *or* written) and the `write_keys`
   subset it writes. Conflict/ordering uses `keys`; the write `ApplyEffect` uses
@@ -252,18 +276,20 @@ coordinators + a failure detector to trigger recovery and a retry *escalation*
 (today `recover` is called explicitly; the adaptive tick backs off but does not
 itself declare a coordinator dead), WAL snapshotting/log truncation (the WAL is
 the full per-txn history — contrast `RaftCore`), the precise fast-path quorum
-bound, **arbitrary caller-supplied write values** (the execution effect is still
-"write my id"), **per-shard consensus replica sets / placement of the consensus
+bound, and **per-shard consensus replica sets / placement of the consensus
 participants** (sharding routes only the *effect* per tablet; the Accord replica
-set is still one global group), and wiring the Elle cycle checker
-(`animus-test`). **Now implemented:** read-only transactions (`submit_read`),
-**message retry with adaptive (exponential) backoff** (the driver's retry tick +
-`resend_pending`), the **data-plane frontier** (`start_with_data_plane`), **data-
-plane reads**, an **interactive transaction API** (`AccordNode::begin` →
-`InteractiveTxn`), **sharded (multi-tablet) transactions** (`start_with_router` —
-each key's effect routed to its own tablet's quorum), and **folding the
-interactive/RMW read set into dependency tracking** (`submit_rw` — conflict set =
-reads ∪ writes). The sync-core boundary is where each remaining piece slots in.
+set is still one global group). **Now implemented:** read-only transactions
+(`submit_read`), **message retry with adaptive (exponential) backoff** (the
+driver's retry tick + `resend_pending`), the **data-plane frontier**
+(`start_with_data_plane`), **data-plane reads**, an **interactive transaction
+API** (`AccordNode::begin` → `InteractiveTxn`), **sharded (multi-tablet)
+transactions** (`start_with_router` — each key's effect routed to its own tablet's
+quorum), **folding the interactive/RMW read set into dependency tracking**
+(`submit_rw` — conflict set = reads ∪ writes), **arbitrary caller-supplied write
+values** (`submit_writes`/`submit_writes_rw`/`InteractiveTxn::write_value` — the
+execution effect is the supplied bytes, defaulting to the txn id when absent), and
+**wiring the Elle cycle checker** (`animus-test`, ADR 0014 — now genuine
+black-box). The sync-core boundary is where each remaining piece slots in.
 
 ## Tests
 
@@ -327,6 +353,14 @@ reads ∪ writes). The sync-core boundary is where each remaining piece slots in
   against a conflicting write to the key it *read* (and the conflict is recorded as
   a dependency), a control proving the same transactions are disjoint when the read
   is dropped, a seed sweep, and trace reproducibility.
+- `tests/accord_values.rs` (**arbitrary write values**): a value-carrying write's
+  actual bytes land on every replica's store; two conflicting values resolve in
+  agreed order (shared key → the second-ordered txn's value); a read observes the
+  actual value; the value survives a stop/restart (WAL replay); a value lands in
+  the data plane and is readable via a quorum read; an **interactive**
+  read-modify-write reads the current value, appends, and writes the modified
+  value back; a **sharded** transaction routes the real value per tablet; plus
+  trace reproducibility.
 - `tests/accord_backoff.rs` (**adaptive retry backoff**): a fully-partitioned
   coordinator's re-send count over a long window is far sub-linear (backoff vs the
   fixed-interval count); the transaction still converges promptly after a heal; it

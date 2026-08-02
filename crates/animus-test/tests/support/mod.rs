@@ -7,30 +7,41 @@
 //! declarative [`Scenario`] / [`NemesisAction`] model and the [`run_scenario`]
 //! runner that the frozen corpus (`corpus.rs`) is built from.
 //!
-//! # Why Accord, and why list-append over a register
+//! # Genuine black-box list-append over Accord (ADR 0014, closed limitation)
 //!
 //! Accord is the layer that *claims* a consistent serialization order, so it is
 //! where a serializability checker has teeth (the AP/LWW data plane only offers
-//! convergence/read-your-writes — checked elsewhere). Accord's execution effect
-//! is "write my transaction id" — a *register*, not an append. We recover Elle
-//! list-append semantics from it as follows:
+//! convergence/read-your-writes — checked elsewhere). Earlier this harness had a
+//! limitation: Accord's execution effect was hard-coded to "write my transaction
+//! id" (a register), so the harness *reconstructed* each read's observed list
+//! from a replica's `applied_order` rather than from actually-stored state. That
+//! limited the checker's teeth to cross-replica order divergence.
 //!
-//! - Each key's **list** is the sequence of write-transaction ids Accord ordered
-//!   to that key, in `applied_order`. Each write transaction is assigned a
-//!   **globally-unique** value (a monotonic counter) so the recovered order has
-//!   no duplicate elements — the Elle modelling requirement.
-//! - A **write** op over keys `K` is recorded as `Append { k, value }` for each
-//!   `k in K` (the transaction's unique value).
-//! - A **read** op over keys `K` observes, per key, the prefix of that key's
-//!   writers that Accord ordered *before* the read — reconstructed from the
-//!   replica's `applied_order` (the read itself has a position there once it
-//!   executes). This is exactly the list Accord claims the read should see, on
-//!   every replica.
+//! With **arbitrary caller-supplied write values** (ADR 0011) that limitation is
+//! closed: each key stores a *real list value*, and the workload is genuine
+//! black-box list-append:
 //!
-//! If Accord ever ordered transactions inconsistently across replicas, two
-//! replicas' reads would observe non-prefix-compatible lists (caught by the
-//! checker's `recover` as a *divergent read*) and/or a genuine dependency cycle
-//! would form — which is the whole point of pointing the checker here.
+//! - A key's value is an encoded `Vec<u64>` (the list). A **write** op is a real
+//!   **read-modify-write** (`InteractiveTxn`: `read_value` the current list,
+//!   append a **globally-unique** element, `write_value` the new list back) — so
+//!   the stored bytes *are* the list, ordered by Accord. Recorded as
+//!   `Append { k, value }` for each written key.
+//! - A **read** op observes the **actual stored list** (decoded from the bytes a
+//!   read transaction returns via `read_value_result`), recorded as
+//!   `Read { k, observed: Some(list) }`.
+//!
+//! The order is now recovered from observed *values* by Elle's `recover`, **not**
+//! from `applied_order`. So `check_cycles` is a real black-box serializability
+//! check: a single globally-agreed-but-non-serializable order would surface as a
+//! dependency cycle, not merely as cross-replica divergence.
+//!
+//! **Single-writer-per-key (the LWW guard).** Each key is written by exactly one
+//! client (`owner(key) = key % clients`); a write transaction only appends to the
+//! keys it owns. Concurrent writers to one key would lose updates by the *data
+//! model* (per-key LWW) — not a consistency bug, and it would drown the checker
+//! in false positives. Cross-transaction conflict (the wr/rw/ww edges the cycle
+//! checker chews on) still comes from **multi-key transactions** and from reads
+//! observing keys *other* clients write. (See `animus-test` CLAUDE.md.)
 //!
 //! All nondeterminism is the simulator's (ADR 0003); a run is a pure function of
 //! its seed. The Accord driver has a perpetual retry timer, so we always drive
@@ -370,14 +381,9 @@ pub struct Cluster {
 /// Shared state across the concurrent client tasks.
 struct Shared {
     rec: Mutex<Recorder>,
-    /// Monotonic source of globally-unique appended values.
+    /// Monotonic source of globally-unique appended values (the Elle uniqueness
+    /// requirement — every appended element is distinct across the whole run).
     next_value: Mutex<u64>,
-    /// Map from a write transaction id to the unique value it appended (so a
-    /// read's observed list reconstruction can map ordered writer ids back to
-    /// their list values).
-    value_of: Mutex<BTreeMap<TxnId, u64>>,
-    /// Map from a write transaction id to the keys it wrote.
-    keys_of: Mutex<BTreeMap<TxnId, BTreeSet<Key>>>,
 }
 
 impl Shared {
@@ -386,25 +392,30 @@ impl Shared {
         *v += 1;
         *v
     }
-    fn record_write(&self, txn: TxnId, value: u64, keys: BTreeSet<Key>) {
-        self.value_of.lock().unwrap().insert(txn, value);
-        self.keys_of.lock().unwrap().insert(txn, keys);
-    }
-    fn value_of(&self, txn: TxnId) -> Option<u64> {
-        self.value_of.lock().unwrap().get(&txn).copied()
-    }
-    fn keys_of(&self, txn: TxnId) -> Option<BTreeSet<Key>> {
-        self.keys_of.lock().unwrap().get(&txn).cloned()
-    }
 }
 
 fn accord_ids(n: usize) -> Vec<u64> {
     ACCORD_IDS[..n].to_vec()
 }
 
-/// Storage-key bytes for an Accord key (big-endian, matching the node internals).
-fn key_bytes(key: Key) -> Vec<u8> {
-    key.to_be_bytes().to_vec()
+/// Encode a list value (`Vec<u64>`) as the stored bytes: each element as 8
+/// big-endian bytes, concatenated. The empty list encodes to empty bytes.
+fn encode_list(list: &[u64]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(list.len() * 8);
+    for v in list {
+        bytes.extend_from_slice(&v.to_be_bytes());
+    }
+    bytes
+}
+
+/// Decode stored bytes back into a list value (inverse of [`encode_list`]). A
+/// length not a multiple of 8 (never produced by [`encode_list`]) decodes the
+/// whole-8-byte prefix.
+fn decode_list(bytes: &[u8]) -> Vec<u64> {
+    bytes
+        .chunks_exact(8)
+        .map(|c| u64::from_be_bytes(c.try_into().unwrap()))
+        .collect()
 }
 
 fn lossy(p: f64) -> NetConfig {
@@ -444,8 +455,6 @@ impl Cluster {
         let shared = Arc::new(Shared {
             rec: Mutex::new(Recorder::new(seed)),
             next_value: Mutex::new(0),
-            value_of: Mutex::new(BTreeMap::new()),
-            keys_of: Mutex::new(BTreeMap::new()),
         });
 
         Cluster {
@@ -569,9 +578,14 @@ impl Cluster {
 }
 
 /// One client coordinator's loop: in each round, run a read or a write
-/// transaction over a randomly-chosen set of keys, then wait (bounded) for it to
-/// execute and record the outcome. Keys overlap across clients (shared key
-/// space) so concurrent transactions genuinely conflict.
+/// transaction, then wait (bounded) for it to execute and record the outcome.
+///
+/// **Single-writer-per-key (the LWW guard).** A write transaction only touches
+/// keys this client *owns* (`owner(key) = key % clients`); a read may touch any
+/// key. So no two clients ever write the same key (per-key LWW would otherwise
+/// lose appends — a data-model artefact, not a consistency bug). Cross-transaction
+/// conflict (the wr/rw/ww edges the cycle checker chews on) still comes from
+/// multi-key transactions and from a read observing keys *other* clients wrote.
 async fn client_loop(
     node: AccordNode<SimEnv>,
     shared: Arc<Shared>,
@@ -579,15 +593,27 @@ async fn client_loop(
     spec: WorkloadSpec,
 ) {
     let env = node.env().clone();
+    // This client's own view of the keys it owns (it is the *sole* writer of
+    // those keys, single-writer-per-key). It builds each append on top of its own
+    // last-written list rather than a begin-time quorum read — a begin-time read
+    // can lag the previous write's data-plane propagation (the apply marks the txn
+    // `Applied` before the fire-and-forget quorum write lands), which would make
+    // the RMW read a stale base and *lose* its own earlier appends. Because the
+    // client is the only writer and runs its rounds serially, this in-memory list
+    // is exactly the authoritative state of the key.
+    let mut my_lists: BTreeMap<Key, Vec<u64>> = BTreeMap::new();
     for round in 0..spec.rounds {
         // Deterministic key selection from the simulator RNG (seeded), so the
         // workload is a pure function of the seed.
-        let keys = pick_keys(&env, spec.keyspace, spec.keys_per_txn);
         let is_read = env.gen_below(100) < spec.read_pct;
         if is_read {
+            // A read may observe any key in the shared space.
+            let keys = pick_keys(&env, spec.keyspace, spec.keys_per_txn);
             run_read(&node, &shared, proc, round, keys).await;
         } else {
-            run_write(&node, &shared, proc, round, keys).await;
+            // A write only appends to keys this client owns (single-writer).
+            let keys = pick_owned_keys(&env, spec, proc);
+            run_write(&node, &shared, proc, round, keys, &mut my_lists).await;
         }
         // Small gap between this client's ops so others interleave.
         env.sleep(POLL).await;
@@ -609,17 +635,64 @@ fn pick_keys(env: &SimEnv, keyspace: u64, count: usize) -> BTreeSet<Key> {
     keys
 }
 
-/// Submit a **write** transaction over `keys`, record `invoke`, wait (bounded)
-/// for it to execute on the coordinating replica, and record `ok` (it applied)
-/// or `info` (indeterminate). Each key gets the transaction's globally-unique
-/// value as the appended element.
+/// The owner client of `key` under single-writer-per-key: `key % clients`.
+fn owner(key: Key, clients: usize) -> Process {
+    (key % clients as u64) as Process
+}
+
+/// Pick up to `keys_per_txn` distinct keys this `proc` *owns* (`owner(k) ==
+/// proc`) from the shared key space, using the seeded RNG. Always returns ≥ 1
+/// owned key (a client always owns at least its own residue class, present iff
+/// `keyspace > proc`). Falls back to `proc` itself if the keyspace is too small
+/// to contain an owned key by sampling.
+fn pick_owned_keys(env: &SimEnv, spec: WorkloadSpec, proc: Process) -> BTreeSet<Key> {
+    let owned: Vec<Key> = (0..spec.keyspace)
+        .filter(|&k| owner(k, spec.clients) == proc)
+        .collect();
+    if owned.is_empty() {
+        // No key in the space maps to this client; nothing to write this round.
+        // (Should not happen for keyspace ≥ clients, which the corpus ensures.)
+        return BTreeSet::new();
+    }
+    let mut keys = BTreeSet::new();
+    let mut guard = 0;
+    let want = spec.keys_per_txn.min(owned.len());
+    while keys.len() < want && guard < want * 8 {
+        let pick = owned[env.gen_below(owned.len() as u64) as usize];
+        keys.insert(pick);
+        guard += 1;
+    }
+    if keys.is_empty() {
+        keys.insert(owned[0]);
+    }
+    keys
+}
+
+/// Run a **write** transaction over `keys` (all owned by `proc`) as a genuine
+/// **list-append with real values** (ADR 0011 arbitrary write values; ADR 0014
+/// true black-box list-append): for each owned key, append this transaction's
+/// globally-unique value to the client's own authoritative list for that key and
+/// write the **whole new list** back as the real stored value (via the
+/// value-carrying [`AccordNode::submit_writes`]). Reads later observe exactly
+/// these stored bytes, so the recovered order is genuinely from observed values.
+///
+/// `my_lists` is this client's own per-key list — it is the *sole* writer of its
+/// owned keys and runs serially, so this is the authoritative state; building the
+/// append on it (rather than a begin-time quorum read that can lag the previous
+/// write's propagation) keeps appends from being lost. Record `invoke` then `ok`
+/// (it applied) or `info` (indeterminate — never `fail`); each key as
+/// `Append { k, value }`.
 async fn run_write(
     node: &AccordNode<SimEnv>,
     shared: &Arc<Shared>,
     proc: Process,
     _round: u64,
     keys: BTreeSet<Key>,
+    my_lists: &mut BTreeMap<Key, Vec<u64>>,
 ) {
+    if keys.is_empty() {
+        return; // this client owns no key in the space — nothing to append.
+    }
     let env = node.env().clone();
     let value = shared.fresh_value();
     let mops: Vec<Mop> = keys
@@ -632,8 +705,15 @@ async fn run_write(
         .unwrap()
         .invoke(proc, env.now().0, mops.clone());
 
-    let txn = node.submit(keys.clone());
-    shared.record_write(txn, value, keys);
+    // Append our unique value to each owned key's authoritative list and write the
+    // whole new list back as the real stored value.
+    let mut writes: BTreeMap<Key, Vec<u8>> = BTreeMap::new();
+    for &k in &keys {
+        let list = my_lists.entry(k).or_default();
+        list.push(value);
+        writes.insert(k, encode_list(list));
+    }
+    let txn = node.submit_writes(writes);
 
     if wait_applied(node, txn).await {
         shared.rec.lock().unwrap().ok(proc, env.now().0, mops);
@@ -644,10 +724,10 @@ async fn run_write(
 }
 
 /// Submit a **read** transaction over `keys`, wait for it to execute, and record
-/// the per-key observed list reconstructed from the coordinating replica's
-/// Accord execution order. The observed list for key `k` is the values of the
-/// write transactions that wrote `k` and are ordered before this read in
-/// `applied_order`.
+/// the per-key **actually-observed list** — decoded from the bytes the read
+/// transaction returns ([`AccordNode::read_value_result`]). This is genuine
+/// black-box observation: the recovered order comes from these observed values
+/// (Elle's `recover`), not from any out-of-band `applied_order` reconstruction.
 async fn run_read(
     node: &AccordNode<SimEnv>,
     shared: &Arc<Shared>,
@@ -670,39 +750,44 @@ async fn run_read(
         .invoke(proc, env.now().0, invoke_mops);
 
     let txn = node.submit_read(keys.clone());
-    if wait_applied(node, txn).await {
-        // Reconstruct each key's observed list from this replica's order.
-        let order = node.applied_order();
-        let pos = order.iter().position(|t| *t == txn).unwrap_or(order.len());
-        let mut mops = Vec::new();
-        for &k in &keys {
-            let mut list = Vec::new();
-            for w in &order[..pos] {
-                if let (Some(wk), Some(val)) = (shared.keys_of(*w), shared.value_of(*w)) {
-                    if wk.contains(&k) {
-                        list.push(val);
-                    }
-                }
-            }
-            mops.push(Mop::Read {
-                key: k,
-                observed: Some(list),
-            });
-        }
-        shared.rec.lock().unwrap().ok(proc, env.now().0, mops);
+    let observed = if wait_applied(node, txn).await {
+        node.read_value_result(txn)
     } else {
-        let info_mops: Vec<Mop> = keys
-            .iter()
-            .map(|&k| Mop::Read {
-                key: k,
-                observed: None,
-            })
-            .collect();
-        shared
-            .rec
-            .lock()
-            .unwrap()
-            .info(proc, env.now().0, info_mops);
+        None
+    };
+    match observed {
+        Some(result) => {
+            // Decode each key's actually-stored list from the observed bytes.
+            let mops: Vec<Mop> = keys
+                .iter()
+                .map(|&k| {
+                    let list = result
+                        .get(&k)
+                        .and_then(|o| o.as_ref())
+                        .map(|bytes| decode_list(bytes))
+                        .unwrap_or_default();
+                    Mop::Read {
+                        key: k,
+                        observed: Some(list),
+                    }
+                })
+                .collect();
+            shared.rec.lock().unwrap().ok(proc, env.now().0, mops);
+        }
+        None => {
+            let info_mops: Vec<Mop> = keys
+                .iter()
+                .map(|&k| Mop::Read {
+                    key: k,
+                    observed: None,
+                })
+                .collect();
+            shared
+                .rec
+                .lock()
+                .unwrap()
+                .info(proc, env.now().0, info_mops);
+        }
     }
 }
 
@@ -776,13 +861,11 @@ pub fn run_scenario(scenario: &Scenario) -> ScenarioResult {
     // workload to finish (clients run rounds * (op budget + poll) at most).
     cluster.sim.run_for(Duration::from_secs(40));
 
-    // Final list-append state, recovered as the full ordered chain of writers per
-    // key from two *distinct* Accord replicas' execution orders. This is the
-    // faithful "final state" of the list-append abstraction (the data plane is a
-    // register — last writer only — so it cannot itself witness the full list;
-    // Accord's `applied_order` is the order it *claims*). Reading from two
-    // different replicas makes convergence a genuine cross-replica agreement
-    // check, and durability ("every ok append is in the final list") meaningful.
+    // Final list-append state, read straight from each key's actually-stored
+    // value on two *distinct* Accord replicas (genuine black-box final state, not
+    // a reconstruction). Reading from two different replicas makes convergence a
+    // real cross-replica agreement check, and durability ("every ok append is in
+    // the final list") meaningful under single-writer-per-key.
     let keys: Vec<Key> = (0..scenario.workload.keyspace).collect();
     let final_a = list_state(&cluster, 0, &keys);
     let final_b = list_state(&cluster, cluster.nodes.len() - 1, &keys);
@@ -828,38 +911,25 @@ pub fn run_scenario(scenario: &Scenario) -> ScenarioResult {
     }
 }
 
-/// The **final list-append state** as recovered from Accord replica `node_idx`'s
-/// execution order: for each key, the values of every *acknowledged* write
-/// transaction that wrote that key, in the replica's `applied_order`. This is the
-/// list the list-append abstraction holds (the data-plane register only retains
-/// the last writer, so it cannot witness the full list; Accord's order can).
+/// The **final list-append state** read straight from Accord replica
+/// `node_idx`'s **actually-stored** state: for each key, the list decoded from
+/// the bytes currently winning at that key in the replica's executed store
+/// (`store_value`). This is genuine black-box final state — the real list each
+/// key holds, not a reconstruction from the consensus order.
 ///
-/// Reading this from two *distinct* replicas turns [`check_convergence`] into a
-/// genuine cross-replica agreement check on the consensus order, and makes
+/// Reading this from two *distinct* replicas keeps [`check_convergence`] a real
+/// cross-replica agreement check (do both replicas' stored lists agree?), and
 /// [`check_durability`] ("every acknowledged append is in the final list")
-/// meaningful for a register substrate.
-///
-/// Every write transaction that **executed** on this replica is included, in
-/// execution order — whether the *issuing client* recorded `ok` or `info`. The
-/// list-append universe is "what Accord ordered and executed", recovered
-/// uniformly from the replica's `applied_order`; the client's ok/info only
-/// reflects whether *its* poll saw the execution in time, not whether the effect
-/// happened. Durability (every `ok` append present here) holds because an `ok`
-/// write is by definition applied, hence in `applied_order`.
+/// meaningful: single-writer-per-key means appends accumulate, so an `ok` append
+/// must be present in its key's final list.
 fn list_state(cluster: &Cluster, node_idx: usize, keys: &[Key]) -> BTreeMap<Key, Vec<u64>> {
-    let order = cluster.nodes[node_idx].applied_order();
+    let node = &cluster.nodes[node_idx];
     let mut map: BTreeMap<Key, Vec<u64>> = BTreeMap::new();
-    for k in keys {
-        let mut list = Vec::new();
-        for w in &order {
-            if let (Some(wk), Some(val)) = (cluster.shared.keys_of(*w), cluster.shared.value_of(*w))
-            {
-                if wk.contains(k) {
-                    list.push(val);
-                }
-            }
-        }
-        map.insert(*k, list);
+    for &k in keys {
+        let list = futures::executor::block_on(node.store_value(k))
+            .map(|bytes| decode_list(&bytes))
+            .unwrap_or_default();
+        map.insert(k, list);
     }
     map
 }
