@@ -270,10 +270,11 @@ data-plane integration, and sharding — see ADR 0011 and the crate guide.
 batch, range delete, MVCC `Snapshot`). Backed by `MemoryEngine` (a `BTreeMap`
 MVCC store; the engine used under simulation) and a **custom on-disk
 `LsmEngine<E: Env>`** — a real
-log-structured merge tree (WAL → memtable → flushed, CRC-checksummed SSTables with
-a block index + footer + per-table **Bloom filter** → **leveled compaction**
-(overlapping L0 flush tier, non-overlapping L1+ runs) → atomically-swapped
-MANIFEST, recovered on open) that does **all** I/O through the `Env` `Disk` seam,
+log-structured merge tree (WAL → memtable → flushed, CRC-checksummed,
+**LZ4-compressed** SSTables with a block index + footer + per-table **Bloom
+filter** → **leveled compaction** (overlapping L0 flush tier, non-overlapping
+L1+ runs) → atomically-swapped, **compact binary** MANIFEST, recovered on open)
+that does **all** I/O through the `Env` `Disk` seam,
 so its crash recovery is **deterministically simulation-tested** under `SimEnv`
 (ADR 0008). A point read skips a table whose key range or Bloom filter proves the
 key absent. The trait is **async** (`#[async_trait]`): the I/O-ish methods are

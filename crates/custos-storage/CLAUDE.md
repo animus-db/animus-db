@@ -52,11 +52,20 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
   `LsmEngine::open(env, prefix)` (or `open_with(.., LsmOptions)`) opens at a
   filename `prefix` over the node-scoped `Env` disk. Files: `MANIFEST` (durable
   source of truth, swapped **atomically** via `Disk::replace` — the single
-  flush/compaction linearization point), `wal` (each write `append`+`sync`ed
+  flush/compaction linearization point; encoded with a **compact hand-rolled
+  binary codec** — `CMF1` magic + version, big-endian ints + length-prefixed
+  byte strings — not JSON; a legacy JSON manifest, which starts with `{`, is
+  still decoded for forward-compat — see `encode_manifest`/`decode_manifest` in
+  `lsm.rs`), `wal` (each write `append`+`sync`ed
   *before* it returns, so an ack means durable; mirrors the Raft WAL pattern),
   and `sst-NNNNNN` (immutable, sorted, **per-block CRC32** via `crc32fast`, with
   an in-file block index + footer, plus a per-table **Bloom filter** in the
   manifest; point reads fetch one block with `read_at`, never the whole file).
+  Each data block is **LZ4-compressed** (`lz4_flex`, pure-Rust/MIT, safe-only
+  build) when that is smaller, else stored verbatim — framed `tag(u8) || payload
+  || crc`, the CRC covering `tag || payload`. The table **format version** (v2 =
+  compression-capable; v1 = legacy uncompressed) lives in `SsTableMeta::format`,
+  and `read_block` decodes either, so old tables still read.
   Writes go to the WAL then the in-memory memtable (`BTreeMap` MVCC, same shape as
   `MemoryEngine`); a size threshold flushes the memtable to an SSTable, then swaps
   the manifest and starts a fresh WAL. **Leveled compaction** (`lsm.rs`):
@@ -87,7 +96,11 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
 
 ## Tests & benchmark
 
-`cargo test -p custos-storage` (proptest semantics + units).
+`cargo test -p custos-storage` (proptest semantics + units). Library unit tests
+also cover the new perf formats: `sstable::tests` round-trips a compressible and
+an incompressible block (asserting LZ4 shrinks the former and never inflates the
+latter), and `manifest_tests` round-trips the binary manifest codec, checks it is
+smaller than JSON, and confirms a legacy JSON manifest still decodes.
 
 `LsmEngine` tests run under `SimEnv` via `Simulator` (a dev-dep): `lsm_semantics.rs`
 mirrors the `MemoryEngine` units + a differential proptest, plus a Bloom test

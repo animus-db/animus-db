@@ -48,6 +48,14 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 async-trait = "0.1"
 futures = "0.3"
 crc32fast = "1"
+# Pure-Rust LZ4 block (de)compressor for SSTable data blocks (ADR 0008). MIT
+# licensed; built with only its safe (no-unsafe) encode/decode paths, so it
+# honours the workspace `unsafe_code = "forbid"` posture and adds no C/FFI.
+lz4_flex = { version = "0.13", default-features = false, features = [
+    "safe-encode",
+    "safe-decode",
+    "std",
+] }
 rand = "0.8"
 rand_chacha = "0.3"
 proptest = "1"
