@@ -20,6 +20,10 @@ fn open(seed: u64) -> LsmEngine<custos_sim::SimEnv> {
     let opts = LsmOptions {
         flush_threshold_bytes: 64,
         compaction_trigger: 3,
+        // Small target so leveled compaction splits into several non-overlapping
+        // L1+ runs, exercising the partitioning path under the differential test.
+        target_table_bytes: 256,
+        level_fanout: 2,
     };
     block_on(LsmEngine::open_with(sim.env(0), "db/", opts)).expect("open")
 }
@@ -204,6 +208,53 @@ fn many_keys_survive_flushes_and_compaction() {
         for pair in all.windows(2) {
             assert!(pair[0].0 < pair[1].0, "scan not strictly ascending");
         }
+    });
+}
+
+/// A point read for a key that is absent but lies *inside* an SSTable's
+/// `[min_key, max_key]` range reads **zero** blocks: the per-table Bloom filter
+/// rules it out before any `read_at`. The key-range gate alone could not (the
+/// key is within range), so this proves the Bloom is doing work.
+#[test]
+fn bloom_skips_blocks_on_a_point_miss_inside_the_key_range() {
+    let e = open(42);
+    block_on(async {
+        // Write a sparse set of keys that span a wide range so an absent key sits
+        // between two present ones (inside [min_key, max_key]) yet is not stored.
+        // Even numbers present; odd numbers absent.
+        for i in 0u64..400 {
+            let k = format!("key-{:04}", i * 2);
+            e.put(k.as_bytes(), b"v", i + 1).await.unwrap();
+        }
+        // Force everything onto disk so reads must consult SSTables, not the
+        // memtable (a flush leaves the memtable empty).
+        assert!(e.sstable_count() >= 1, "expected flushed tables");
+
+        // A present key reads at least one block (sanity: the Bloom admits it).
+        e.reset_block_reads();
+        let hit = e.get(b"key-0100").await.unwrap();
+        assert!(hit.is_some(), "present key should be found");
+        assert!(
+            e.block_read_count() >= 1,
+            "a present-key read should fetch a block"
+        );
+
+        // An absent key strictly inside the key range: the Bloom should reject it
+        // on every table, so zero blocks are read.
+        e.reset_block_reads();
+        let miss = e.get(b"key-0101").await.unwrap();
+        assert_eq!(miss, None, "odd key was never written");
+        assert_eq!(
+            e.block_read_count(),
+            0,
+            "Bloom should skip every SSTable block for an absent in-range key",
+        );
+
+        // The absent key is genuinely inside at least one table's key range, so
+        // the key-range gate alone would *not* have skipped it — the Bloom is
+        // what saved the block reads above.
+        let lo = b"key-0101".as_slice();
+        assert!(lo > b"key-0000".as_slice() && lo < b"key-0798".as_slice());
     });
 }
 

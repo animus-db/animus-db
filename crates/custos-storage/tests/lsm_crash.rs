@@ -25,6 +25,8 @@ fn opts() -> LsmOptions {
     LsmOptions {
         flush_threshold_bytes: 128,
         compaction_trigger: 3,
+        target_table_bytes: 512,
+        level_fanout: 2,
     }
 }
 
@@ -197,47 +199,69 @@ fn crash_mid_compaction_keeps_old_tables() {
     });
 }
 
-/// A flush followed by a compaction both actually happen: many writes trigger
-/// repeated flushes, and the compaction trigger collapses the accumulated
-/// SSTables — so the live count stays bounded (≤ the trigger) even though far
-/// more tables were flushed than that. Data is intact throughout the churn.
+/// A flush followed by leveled compaction both actually happen: many writes
+/// trigger repeated flushes, L0→L1(+) compaction fires repeatedly, the L0 (flush)
+/// tier never exceeds its trigger, the live table count stays far below the flush
+/// count, every level ≥1 stays non-overlapping, and data is intact throughout.
 #[test]
 fn flush_then_compaction_happen_and_keep_data() {
     let seed = 0xABCD;
     let sim = Simulator::new(seed);
     let e = open(&sim);
     block_on(async {
-        let mut max_live = 0usize;
+        let mut max_l0 = 0usize;
         for i in 0u64..400 {
             let k = format!("key{i:04}");
             e.put(k.as_bytes(), format!("value-number-{i}").as_bytes(), i + 1)
                 .await
                 .unwrap();
-            max_live = max_live.max(e.sstable_count());
+            // L0 (the flush tier) is the only level whose overlap we don't bound;
+            // it must never exceed the compaction trigger (it is drained at it).
+            let l0 = e
+                .level_table_counts()
+                .into_iter()
+                .find(|(lvl, _)| *lvl == 0)
+                .map_or(0, |(_, c)| c);
+            max_l0 = max_l0.max(l0);
         }
-        // Many flushes happened (far more than the live count) ...
+        // Many flushes happened ...
         assert!(
             e.flush_count() >= 4,
             "seed={seed}: expected several flushes, got {}",
             e.flush_count(),
         );
-        // ... and compaction fired, collapsing them so the live count never
-        // exceeded the trigger.
+        // ... and compaction fired.
         assert!(
             e.compaction_count() >= 1,
             "seed={seed}: expected at least one compaction, got {}",
             e.compaction_count(),
         );
+        // L0 is drained at the trigger, so it never grew past it.
         assert!(
-            max_live <= opts().compaction_trigger,
-            "seed={seed}: live table count ({max_live}) grew past the trigger ({})",
+            max_l0 <= opts().compaction_trigger,
+            "seed={seed}: L0 table count ({max_l0}) grew past the trigger ({})",
             opts().compaction_trigger,
         );
+        // Compaction collapsed flushed tables: far more flushes than live tables.
         assert!(
             e.flush_count() > e.sstable_count() as u64,
             "seed={seed}: compaction did not collapse flushed tables (flushes={}, live={})",
             e.flush_count(),
             e.sstable_count(),
+        );
+        // The leveled invariant: every level ≥1 holds non-overlapping runs.
+        assert!(
+            e.levels_non_overlapping(),
+            "seed={seed}: a level ≥1 has overlapping key ranges: {:?}",
+            e.level_table_counts(),
+        );
+        // We actually built at least one L1+ run (leveling, not just L0 churn).
+        assert!(
+            e.level_table_counts()
+                .iter()
+                .any(|(lvl, c)| *lvl >= 1 && *c >= 1),
+            "seed={seed}: expected at least one L1+ table, levels={:?}",
+            e.level_table_counts(),
         );
         // Data is intact after all the flush/compaction churn.
         for i in 0u64..400 {
