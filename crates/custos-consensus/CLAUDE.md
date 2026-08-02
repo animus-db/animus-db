@@ -8,9 +8,11 @@ Accord-style **leaderless transaction consensus** (ADR 0011). Each transaction
 gets a unique, totally-ordered timestamp; a coordinator agrees with the replicas
 on an *execution* timestamp and a *dependency* set via PreAccept → (fast path)
 Commit, or PreAccept → Accept → Commit (slow path), then each replica
-**executes** the transaction in agreed order, **durably** (WAL + recovery). No
-leader. This is the layer that will eventually give the AP data plane multi-key
-atomicity and a strict serialization order.
+**executes** the transaction in agreed order against a real `StorageEngine`,
+**durably** (WAL + recovery). A dead coordinator's transaction is recoverable by
+another replica (**coordinator failover**, first slice). No leader. This is the
+layer that will eventually give the AP data plane multi-key atomicity and a
+strict serialization order.
 
 ## Entry points
 
@@ -19,21 +21,30 @@ atomicity and a strict serialization order.
   strictly-greater fresh stamp).
 - `core.rs` — `AccordCore`: a **synchronous, I/O-free** state machine mirroring
   `custos-control`'s `RaftCore`. `submit(keys)` starts a transaction this node
-  coordinates; `handle(from, msg)` processes an inbound message. Both return
+  coordinates; `recover(txn)` takes over a stranded transaction as a *recovery
+  coordinator*; `handle(from, msg)` processes an inbound message. All return
   `Vec<Out>` and never touch `Env`. Holds the replica view (`txns`), the
-  coordinator view (`coordinating`), reached `decisions`, the executed `store` +
-  `applied_order`, and a `pending` buffer of `WalRecord`s. `drain_persist` hands
-  the records to the driver; `recovered` rebuilds the core from a
-  `PersistedState`.
-- `message.rs` — `AccordMsg` (PreAccept/PreAcceptOk/Accept/AcceptOk/Commit),
-  (de)serialized with `serde_json` over the `Network`'s `Vec<u8>` payloads.
-  Execution/Apply is *local* — no new wire message.
+  coordinator view (`coordinating`), the recovery-coordinator view
+  (`recovering`), reached `decisions`, `applied_order`, a `pending` buffer of
+  `WalRecord`s, and a `pending_apply` buffer of `ApplyEffect`s (the execution
+  work the driver applies to storage — the core decides *order*, the driver does
+  the *I/O*). `drain_persist`/`drain_apply` hand these to the driver; `recovered`
+  rebuilds the core from a `PersistedState` and re-emits the apply effects for
+  its recovered execution order.
+- `message.rs` — `AccordMsg` (PreAccept/PreAcceptOk/Accept/AcceptOk/Commit, plus
+  `Recover`/`RecoverOk` for failover), (de)serialized with `serde_json` over the
+  `Network`'s `Vec<u8>` payloads. Execution/Apply is *local* — no wire message.
 - `persist.rs` — `WalRecord` (PreAccepted/Accepted/Committed/Applied) and
   `PersistedState` (replay/decode/encode), mirroring `custos-control::persist`.
-- `node.rs` — `AccordNode<E>`: the thin `Env` driver. `persist_then_ship` drains
-  the core's `WalRecord`s, appends + `fsync`s them to `accord.wal`, then ships
-  outbound (durable before action); `drive` recovers from the WAL on startup. A
-  plain `recv` loop — still no perpetual timers.
+- `node.rs` — `AccordNode<E, S = MemoryEngine>`: the thin `Env` driver, generic
+  over the `StorageEngine` backing execution (defaults to the in-memory
+  `MemoryEngine`; `start_with_storage` injects another). `persist_then_ship`
+  drains the core's `WalRecord`s + `ApplyEffect`s, appends + `fsync`s the records
+  to `accord.wal`, **then** `merge`s the execution effects into the engine, then
+  ships outbound (durable before action). `drive` recovers from the WAL on
+  startup and replays the recovered execution order into the (fresh) engine. A
+  plain `recv` loop — still no perpetual timers. `store_writer(key)` is `async`
+  (it reads the engine).
 
 ## What's non-obvious
 
@@ -64,39 +75,76 @@ atomicity and a strict serialization order.
   timestamp might land lower. Gating only on the deps set (or only on committed
   txns) lets two concurrent same-timestamp-but-different-node txns execute in
   arrival order and diverge across replicas; the seed sweep guards this.
+- **Execution effect goes to a real `StorageEngine`, not an in-core map.** The
+  core emits an `ApplyEffect { txn, keys, version }` when a txn becomes
+  applicable; the driver `merge`s the txn's id into each key at `version =
+  execute_at.logical`. Use **`merge`, not `put`** — execution timestamps are not
+  globally monotonic across keys (so `put`'s engine-wide floor would reject
+  them), and `merge`'s per-key LWW is idempotent + commutative, so the
+  recovery/duplicate re-apply converges. The value stored is the writer's
+  `TxnId` (encoded as two big-endian u64s); `store_writer` decodes it back.
 - **Recovery sets phase to `Applied` when `PersistedTxn.applied`** even though
   the phase-bearing records stop at `Committed` — the separate `Applied` WAL
-  record carries the executed bit. The store is rebuilt by replaying
-  `applied_order` against the recovered key sets.
+  record carries the executed bit. On recovery the core **re-emits the apply
+  effects** for `applied_order` so the driver repopulates a *fresh, volatile*
+  storage engine in the original order (the `MemoryEngine` dies on `stop`; the
+  WAL is the source of truth).
 - WAL replay is **order-insensitive** (per-record merge is commutative for our
   fields: `max` on timestamp/phase, union on deps, single `Committed`/`Applied`
   per txn), so the driver may flush from either `submit` or the recv loop.
+- **Coordinator failover is a separate sub-protocol** (`recover` / `Recover` /
+  `RecoverOk`, state in `recovering`, *not* `coordinating`). A recovery
+  coordinator: (1) **adopts** any `Committed`/`Applied` decision a recovery
+  quorum reports verbatim; else (2) **re-broadcasts `PreAccept` with the union
+  of keys** the replies carried (so a replica that missed the original PreAccept
+  learns the keys — otherwise it would execute an *empty* write) and forces the
+  **slow path** (recovery never takes the fast path — see the `recovery` flag
+  threaded through `advance_from_pre_accept`'s fast-path + `fast_still_possible`
+  gates). Safe because any recovery (majority) quorum intersects the fast quorum
+  that a fast-path commit required. **Gotcha that bit during development:** the
+  recovered txn's *keys* must reach every replica, or replicas that never saw the
+  original PreAccept commit with empty key sets and execute nothing — hence the
+  re-broadcast. The precise Accord recovery ballot, duelling recoverers, and a
+  failure detector to *trigger* recovery are out of scope (recovery is invoked
+  explicitly).
 
 ## Deferred (see ADR 0011)
 
 The full transitive dependency wait-graph (the execution wait is conflict +
-timestamp based), WAL snapshotting/log truncation (the WAL is the full
-per-txn history — contrast `RaftCore`), coordinator failover (a *replica*
-restart is recovered; a dead coordinator still strands its txn), full
-data-plane/`StorageEngine` integration (the executed store is a stand-in),
-timeouts/retries/livelock handling, sharding/placement (one global replica
-set), and wiring the Elle cycle checker (`custos-test`) — now natural since a
-real execution history exists. The sync-core boundary is where each slots in.
+timestamp based), the precise Accord recovery ballot rules + duelling recovery
+coordinators + a failure detector to trigger recovery (today `recover` is called
+explicitly), WAL snapshotting/log truncation (the WAL is the full per-txn
+history — contrast `RaftCore`), integration with the **live** data-plane
+replicas (`custos-data`) and read transactions (execution is a per-node
+consensus store, not yet the shared data plane), timeouts/retries/livelock
+handling, sharding/placement (one global replica set), and wiring the Elle cycle
+checker (`custos-test`) — now natural since a real execution history exists. The
+sync-core boundary is where each slots in.
 
 ## Tests
 
-`cargo test -p custos-consensus` — unit tests on the timestamp/clock, plus two
+`cargo test -p custos-consensus` — unit tests on the timestamp/clock, plus three
 `SimEnv` test files:
 
 - `tests/accord_commit.rs`: single-transaction fast-path commit on all replicas,
   two conflicting transactions committing in a consistent timestamp order
   (including a 64-seed sweep), disjoint-transaction independence, trace
   reproducibility.
-- `tests/accord_execute.rs` (execution + durability): conflicting transactions
-  **execute** in a consistent order with a converged store (single seed + a
-  48-seed sweep with a slow-path third coordinator), a replica restarted via
-  `Simulator::stop` recovering its executed state from `accord.wal`, and
-  execution-path trace reproducibility.
+- `tests/accord_execute.rs` (execution + durability + storage): conflicting
+  transactions **execute** into the `MemoryEngine` in a consistent order with a
+  converged store (single seed + a 48-seed sweep with a slow-path third
+  coordinator), a replica restarted via `Simulator::stop` recovering its executed
+  state from `accord.wal` (and replaying it into a fresh engine), and
+  execution-path trace reproducibility. `store_writer` is `async`; tests resolve
+  it with `futures::executor::block_on` (the `MemoryEngine` awaits nothing real).
+- `tests/accord_recover.rs` (coordinator failover): a coordinator stalled by a
+  partition has its transaction recovered by another replica to a consistent
+  commit + execution on the survivors (single seed + a 32-seed sweep), recovery
+  adopting an already-committed decision verbatim (idempotent), and recovery-path
+  trace reproducibility. The stall is set up by partitioning the coordinator from
+  one peer so it never reaches a fast quorum while a *different* peer still
+  witnessed the `PreAccept` (and its keys) — then recovery runs from the peer
+  that can still reach the key-bearing replica.
 
 Use `run_for` (the driver has no perpetual timers today, but follow the house
 convention).

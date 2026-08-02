@@ -26,28 +26,55 @@
 //!   highest returned timestamp, unions the deps, and runs an Accept round before
 //!   committing.
 //!
-//! **Execution / Apply (this milestone).** Once a transaction commits, the
-//! replica executes it — but only in agreed-timestamp order and only after every
-//! conflicting dependency that orders before it has itself executed. This is a
-//! per-replica execution queue: a committed transaction becomes *applicable*
-//! when every dependency is known-committed (so we know its `execute_at`) and
-//! every dependency that orders before it has already applied; applicable
-//! transactions are then drained in `(execute_at, txn)` order. The effect is an
-//! opaque op against a tiny in-memory key→last-writer store, enough to
-//! demonstrate that every replica applies conflicting transactions in the
-//! **same order**.
+//! **Execution / Apply.** Once a transaction commits, the replica executes it —
+//! but only in agreed-timestamp order and only after every conflicting
+//! dependency that orders before it has itself executed. This is a per-replica
+//! execution queue: a committed transaction becomes *applicable* when every
+//! dependency is known-committed (so we know its `execute_at`) and every
+//! dependency that orders before it has already applied; applicable transactions
+//! are then drained in `(execute_at, txn)` order.
 //!
-//! **Durability (this milestone).** The core emits [`WalRecord`]s at each phase
-//! transition (`PreAccept`/`Accept`/`Commit`/`Apply`); the [`crate::node`]
-//! driver fsyncs them before acting, and [`AccordCore::recovered`] rebuilds the
-//! core from a replayed [`crate::persist::PersistedState`] — mirroring
-//! `custos-control`'s `RaftCore`. The core itself stays synchronous and
-//! I/O-free; it only *accumulates* records in `pending`, which the driver
-//! drains.
+//! The core decides **order**; the *effect* of execution is performed by the
+//! [`crate::node`] driver against a real (async) `StorageEngine`. The core stays
+//! synchronous and I/O-free: when a transaction becomes applicable it emits an
+//! [`ApplyEffect`] into a `pending_apply` queue (write each key the transaction
+//! touches, stamped with the transaction's `execute_at` as the MVCC version);
+//! the driver drains that queue and applies it via the engine's per-key
+//! last-writer-wins `merge`. Because every replica converges to the same
+//! committed `(execute_at)` and applies in the same total `(execute_at, txn)`
+//! order, every replica's store ends identical.
 //!
-//! **Deliberately out of scope** (see ADR 0011): coordinator failover, the full
-//! data-plane/`StorageEngine` integration (the store here is a stand-in),
-//! sharding, and timeout/livelock handling.
+//! **Durability.** The core emits [`WalRecord`]s at each phase transition
+//! (`PreAccept`/`Accept`/`Commit`/`Apply`); the [`crate::node`] driver fsyncs
+//! them before acting, and [`AccordCore::recovered`] rebuilds the core from a
+//! replayed [`crate::persist::PersistedState`] — mirroring `custos-control`'s
+//! `RaftCore`. The core itself stays synchronous and I/O-free; it only
+//! *accumulates* records in `pending`, which the driver drains. On recovery the
+//! core re-emits the [`ApplyEffect`]s for its recovered execution order, so a
+//! restarted node repopulates a fresh (volatile) storage engine in the original
+//! order — `merge` makes the re-apply idempotent.
+//!
+//! **Coordinator failover (this milestone, first slice).** If the coordinator of
+//! an in-flight transaction dies after PreAccept/Accept but before the replicas
+//! learn the `Commit`, any replica can take over as a *recovery coordinator*:
+//! [`AccordCore::recover`] broadcasts `Recover`, replicas answer `RecoverOk` with
+//! their recorded `(phase, execute_at, deps)`, and the recovery coordinator
+//! drives the transaction to a `Commit` consistent with whatever the original
+//! could have committed. The recovery rules (simplified — see below and ADR
+//! 0011): if any replica already committed, adopt that decision verbatim;
+//! otherwise **never** take the fast path — pick the highest `execute_at` and the
+//! union of deps a recovery quorum reports and run a normal `Accept` → `Commit`
+//! slow path. This is safe because a fast-path commit at `t0` requires a *fast
+//! quorum* to have agreed on `t0`+deps, and any recovery quorum (a simple
+//! majority) intersects that fast quorum, so the recovered slow-path decision can
+//! only equal or supersede it.
+//!
+//! **Deliberately out of scope** (see ADR 0011): the full transitive dependency
+//! wait-graph, the precise Accord recovery ballot/`PreAcceptOk`-witness rules
+//! (we use a simpler "max-ts + union-deps, force slow path" recovery),
+//! competing/duelling recovery coordinators, sharding, and timeout/livelock
+//! handling (the driver does not yet *detect* a dead coordinator — recovery is
+//! triggered explicitly, e.g. by a test or a future failure detector).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -69,7 +96,18 @@ pub type Key = u64;
 /// The lifecycle phase of a transaction at a replica. Ordered by progress
 /// (`PreAccepted < Accepted < Committed < Applied`); a phase never moves
 /// backwards, which [`Phase::max_phase`] enforces on replay/merge.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub enum Phase {
     /// Seen via `PreAccept`; `t0` witnessed, not yet given a final timestamp.
     #[default]
@@ -108,6 +146,9 @@ struct Coordinating {
     replies: BTreeMap<NodeId, (Timestamp, BTreeSet<TxnId>)>,
     /// Whether we have already moved past the PreAccept round.
     phase: CoordPhase,
+    /// True when this is a *recovery* coordinator (took over a dead
+    /// coordinator's transaction). Recovery never uses the fast path.
+    recovery: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -115,6 +156,14 @@ enum CoordPhase {
     PreAccept,
     Accept,
     Done,
+}
+
+/// Recovery-coordinator state: the `RecoverOk` replies gathered so far for a
+/// transaction this node is recovering.
+#[derive(Clone, Debug)]
+struct Recovering {
+    /// Per-responder `(phase, execute_at, deps, keys)`.
+    replies: BTreeMap<NodeId, (Phase, Timestamp, BTreeSet<TxnId>, BTreeSet<Key>)>,
 }
 
 /// Outcome of a coordinator finishing (committing) a transaction it owns.
@@ -126,6 +175,24 @@ pub struct Decision {
     pub execute_at: Timestamp,
     /// Whether the fast path (single round trip of agreement) was taken.
     pub fast_path: bool,
+}
+
+/// A unit of execution work the core has decided to perform, handed to the
+/// driver to apply against the (async) `StorageEngine`. The core decides the
+/// order; the driver does the I/O.
+///
+/// The effect is "write the transaction's id to each key it touches", stamped
+/// with `version` (the transaction's `execute_at.logical`) as the MVCC version.
+/// The driver applies it with per-key last-writer-wins (`merge`), which is
+/// idempotent and commutative, so re-applying on recovery is harmless.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ApplyEffect {
+    /// The transaction being executed.
+    pub txn: TxnId,
+    /// The keys it writes.
+    pub keys: BTreeSet<Key>,
+    /// The MVCC version to stamp each write with (its execution timestamp).
+    pub version: Timestamp,
 }
 
 /// The Accord state machine for one node: replica state for every transaction it
@@ -140,17 +207,19 @@ pub struct AccordCore {
     txns: BTreeMap<TxnId, ReplicaTxn>,
     /// Coordinator view: transactions this node is driving.
     coordinating: BTreeMap<TxnId, Coordinating>,
+    /// Recovery-coordinator view: transactions this node is recovering (gathering
+    /// `RecoverOk` for). Distinct from `coordinating`, which holds the normal
+    /// PreAccept/Accept rounds the recovery transitions into.
+    recovering: BTreeMap<TxnId, Recovering>,
     /// Decisions reached as coordinator, in the order they were reached.
     decisions: Vec<Decision>,
 
-    /// The executed effect: the opaque per-key state. The op of a transaction
-    /// is "write your own id to every key you touch", so a key maps to the
-    /// `TxnId` of the last transaction that executed over it. The point is not
-    /// the value but that every replica produces the *same* key→writer mapping
-    /// because it executes conflicting transactions in the same order.
-    store: BTreeMap<Key, TxnId>,
     /// The order in which this replica has executed (applied) transactions.
     applied_order: Vec<TxnId>,
+    /// Execution effects the driver must apply to the `StorageEngine`, in order.
+    /// The core decides the order and accumulates here; the driver drains via
+    /// [`AccordCore::drain_apply`] and performs the async storage writes.
+    pending_apply: Vec<ApplyEffect>,
     /// Durable-state records the driver must fsync before acting on them. The
     /// core only accumulates; [`AccordCore::drain_persist`] hands them off.
     pending: Vec<WalRecord>,
@@ -170,19 +239,26 @@ impl AccordCore {
             clock: LogicalClock::new(id),
             txns: BTreeMap::new(),
             coordinating: BTreeMap::new(),
+            recovering: BTreeMap::new(),
             decisions: Vec::new(),
-            store: BTreeMap::new(),
             applied_order: Vec::new(),
+            pending_apply: Vec::new(),
             pending: Vec::new(),
         }
     }
 
     /// Rebuild a core for `id` from a replayed [`PersistedState`] (recovery after
-    /// a restart). Replica facts and the executed store/order are restored from
-    /// the WAL; coordinator state is *not* recovered (a coordinator that died
-    /// mid-flight strands its transaction — see ADR 0011). The logical clock is
-    /// advanced past every timestamp seen so freshly-minted stamps stay
-    /// monotonic. No new `pending` records are produced: recovery is silent.
+    /// a restart). Replica facts and the execution order are restored from the
+    /// WAL; coordinator state is *not* recovered (a coordinator that died
+    /// mid-flight is recovered by a *different* replica via the recovery
+    /// sub-protocol — see [`AccordCore::recover`] and ADR 0011). The logical
+    /// clock is advanced past every timestamp seen so freshly-minted stamps stay
+    /// monotonic.
+    ///
+    /// Recovery re-emits an [`ApplyEffect`] for each transaction in the recovered
+    /// execution order so the driver repopulates a fresh (volatile) storage
+    /// engine in the original order; `merge` makes the re-apply idempotent. No
+    /// new `pending` *WAL* records are produced: durable recovery is silent.
     #[must_use]
     pub fn recovered(id: NodeId, all_nodes: &[NodeId], state: PersistedState) -> AccordCore {
         let mut core = AccordCore::new(id, all_nodes);
@@ -203,15 +279,18 @@ impl AccordCore {
                 },
             );
         }
-        // Rebuild the executed store by replaying the recovered apply order. The
-        // order is durable (WAL `Applied` records), so the store is identical to
-        // pre-crash.
+        // Replay the recovered apply order: restore `applied_order` and re-emit
+        // the apply effects so the driver rebuilds the (volatile) store in the
+        // original execution order. The order is durable (WAL `Applied` records),
+        // so the re-applied store is identical to pre-crash.
         for txn in state.applied_order {
             core.applied_order.push(txn);
             if let Some(t) = core.txns.get(&txn) {
-                for &k in &t.keys {
-                    core.store.insert(k, txn);
-                }
+                core.pending_apply.push(ApplyEffect {
+                    txn,
+                    keys: t.keys.clone(),
+                    version: t.execute_at,
+                });
             }
         }
         core
@@ -282,13 +361,6 @@ impl AccordCore {
         &self.applied_order
     }
 
-    /// The last transaction that executed a write over `key` at this replica, if
-    /// any — the opaque store the test inspects for cross-replica agreement.
-    #[must_use]
-    pub fn store_writer(&self, key: Key) -> Option<TxnId> {
-        self.store.get(&key).copied()
-    }
-
     /// Whether this replica has executed `txn`.
     #[must_use]
     pub fn is_applied(&self, txn: TxnId) -> bool {
@@ -302,6 +374,13 @@ impl AccordCore {
     /// otherwise acting on them.
     pub fn drain_persist(&mut self) -> Vec<WalRecord> {
         std::mem::take(&mut self.pending)
+    }
+
+    /// Take the execution effects accumulated since the last drain. The driver
+    /// applies these to the `StorageEngine` (async) in order. Drained after the
+    /// `Applied` WAL records are fsynced, so a re-apply after a crash is safe.
+    pub fn drain_apply(&mut self) -> Vec<ApplyEffect> {
+        std::mem::take(&mut self.pending_apply)
     }
 
     // ---- coordinator entry point ----------------------------------------
@@ -326,6 +405,7 @@ impl AccordCore {
                 t0,
                 replies,
                 phase: CoordPhase::PreAccept,
+                recovery: false,
             },
         );
 
@@ -383,6 +463,29 @@ impl AccordCore {
             } => {
                 self.replica_commit(txn, execute_at, deps);
                 Vec::new()
+            }
+            AccordMsg::Recover { txn } => {
+                let (phase, execute_at, deps, keys) = self.replica_recover(txn);
+                vec![(
+                    from,
+                    AccordMsg::RecoverOk {
+                        txn,
+                        phase,
+                        execute_at,
+                        deps,
+                        keys,
+                    },
+                )]
+            }
+            AccordMsg::RecoverOk {
+                txn,
+                phase,
+                execute_at,
+                deps,
+                keys,
+            } => {
+                self.recovery_record(from, txn, phase, execute_at, deps, keys);
+                self.try_advance_recovery(txn).unwrap_or_default()
             }
         }
     }
@@ -573,19 +676,22 @@ impl AccordCore {
         true
     }
 
-    /// Apply `txn`'s effect: write its id to each of its keys, append it to the
-    /// execution order, mark it applied, and record a durable `Applied`.
+    /// Apply `txn`'s effect: emit an [`ApplyEffect`] (the driver writes its id to
+    /// each of its keys against the `StorageEngine`), append it to the execution
+    /// order, mark it applied, and record a durable `Applied`.
     fn apply(&mut self, txn: TxnId) {
-        let keys = match self.txns.get_mut(&txn) {
+        let (keys, execute_at) = match self.txns.get_mut(&txn) {
             Some(t) if t.phase == Phase::Committed => {
                 t.phase = Phase::Applied;
-                t.keys.clone()
+                (t.keys.clone(), t.execute_at)
             }
             _ => return,
         };
-        for k in keys {
-            self.store.insert(k, txn);
-        }
+        self.pending_apply.push(ApplyEffect {
+            txn,
+            keys,
+            version: execute_at,
+        });
         self.applied_order.push(txn);
         self.pending.push(WalRecord::Applied { txn });
     }
@@ -632,18 +738,21 @@ impl AccordCore {
     }
 
     fn advance_from_pre_accept(&mut self, txn: TxnId) -> Option<Vec<Out>> {
-        let (replies, t0) = {
+        let (replies, t0, recovery) = {
             let c = self.coordinating.get(&txn)?;
-            (c.replies.clone(), c.t0)
+            (c.replies.clone(), c.t0, c.recovery)
         };
 
         let fast_n = self.fast_quorum();
         let slow_n = self.slow_quorum();
 
         // Fast path: a fast quorum returned `t0` unchanged and identical deps.
+        // A *recovery* coordinator never takes the fast path (it cannot prove the
+        // original fast quorum existed); it always escalates to Accept once a
+        // simple majority has replied. See the recovery rules in the module docs.
         let agree_t0: Vec<&(Timestamp, BTreeSet<TxnId>)> =
             replies.values().filter(|(ts, _)| *ts == t0).collect();
-        if agree_t0.len() >= fast_n {
+        if !recovery && agree_t0.len() >= fast_n {
             // All fast-quorum deps must match for the fast path. Union them; if
             // they are all equal the union equals each, so check equality.
             let first = &agree_t0[0].1;
@@ -663,7 +772,8 @@ impl AccordCore {
         // escalate in that case too, otherwise an all-agree-on-`t0`-but-deps-
         // differ quorum would stall forever.
         let outstanding = self.cluster_size.saturating_sub(replies.len());
-        let fast_still_possible = outstanding > 0 && agree_t0.len() + outstanding >= fast_n;
+        let fast_still_possible =
+            !recovery && outstanding > 0 && agree_t0.len() + outstanding >= fast_n;
 
         // Slow path: once a simple majority has replied AND the fast path can no
         // longer succeed, pick the highest returned timestamp and union all
@@ -762,5 +872,185 @@ impl AccordCore {
                 )
             })
             .collect()
+    }
+
+    // ---- coordinator failover / recovery --------------------------------
+
+    /// Take over a transaction whose original coordinator is suspected dead.
+    ///
+    /// This node becomes a *recovery coordinator* for `txn`: it broadcasts
+    /// `Recover` to its peers and seeds the recovery reply set with its own
+    /// recorded state (it is a replica too). When a simple-majority recovery
+    /// quorum of `RecoverOk`s is in, [`AccordCore::try_advance_recovery`] decides
+    /// the outcome (see the module docs for the rules).
+    ///
+    /// Idempotent-ish: if this node already committed `txn`, recovery is a no-op
+    /// (it re-broadcasts the recovery query, which is harmless). Recovery of a
+    /// transaction this node already coordinates is rejected (returns no
+    /// outbound) — recover from a *different* replica.
+    pub fn recover(&mut self, txn: TxnId) -> Vec<Out> {
+        if self.coordinating.contains_key(&txn) {
+            // We are (or were) the original coordinator; nothing to recover.
+            return Vec::new();
+        }
+        let (phase, execute_at, deps, keys) = self.replica_recover(txn);
+        let mut replies = BTreeMap::new();
+        replies.insert(self.id, (phase, execute_at, deps, keys));
+        self.recovering.insert(txn, Recovering { replies });
+
+        let outs: Vec<Out> = self
+            .peers
+            .iter()
+            .map(|&p| (p, AccordMsg::Recover { txn }))
+            .collect();
+        let mut all = outs;
+        if let Some(extra) = self.try_advance_recovery(txn) {
+            all.extend(extra);
+        }
+        all
+    }
+
+    /// Replica side of `Recover`: report this replica's recorded state for `txn`.
+    /// If the replica had never heard of `txn`, it witnesses it now as a fresh
+    /// `PreAccepted` entry (keys unknown, `execute_at == t0`, no deps) so it
+    /// joins the recovery — and records it durably like a `PreAccept` would.
+    fn replica_recover(
+        &mut self,
+        txn: TxnId,
+    ) -> (Phase, Timestamp, BTreeSet<TxnId>, BTreeSet<Key>) {
+        self.clock.witness(txn);
+        if let Some(t) = self.txns.get(&txn) {
+            return (t.phase, t.execute_at, t.deps.clone(), t.keys.clone());
+        }
+        // Never seen: witness as PreAccepted at t0 with no keys/deps known.
+        let entry = ReplicaTxn {
+            keys: BTreeSet::new(),
+            execute_at: txn,
+            deps: BTreeSet::new(),
+            phase: Phase::PreAccepted,
+        };
+        self.txns.insert(txn, entry.clone());
+        self.pending.push(WalRecord::PreAccepted {
+            txn,
+            keys: BTreeSet::new(),
+            execute_at: txn,
+            deps: BTreeSet::new(),
+        });
+        (entry.phase, entry.execute_at, entry.deps, entry.keys)
+    }
+
+    fn recovery_record(
+        &mut self,
+        from: NodeId,
+        txn: TxnId,
+        phase: Phase,
+        execute_at: Timestamp,
+        deps: BTreeSet<TxnId>,
+        keys: BTreeSet<Key>,
+    ) {
+        self.clock.witness(execute_at);
+        if let Some(rec) = self.recovering.get_mut(&txn) {
+            rec.replies.insert(from, (phase, execute_at, deps, keys));
+        }
+    }
+
+    /// Drive recovery for `txn` forward once a simple-majority recovery quorum of
+    /// `RecoverOk`s is in. Applies the recovery rules:
+    ///
+    /// - If any replica reports `Committed`/`Applied`, **adopt that decision
+    ///   verbatim** and broadcast `Commit` — a committed value is already
+    ///   immutable, so the recovered decision must match it.
+    /// - Otherwise force the **slow path**: build a normal coordinator round from
+    ///   the recovery replies (`recovery = true`), feed it into
+    ///   `advance_from_pre_accept`, which picks the highest reported `execute_at`,
+    ///   unions the deps, and runs `Accept` → `Commit`. Never the fast path.
+    fn try_advance_recovery(&mut self, txn: TxnId) -> Option<Vec<Out>> {
+        let replies = {
+            let rec = self.recovering.get(&txn)?;
+            rec.replies.clone()
+        };
+        if replies.len() < self.slow_quorum() {
+            return None;
+        }
+
+        // Recovery decided: drop the recovering state so we don't re-fire.
+        self.recovering.remove(&txn);
+
+        // (1) Adopt an already-committed decision if any replica has one.
+        if let Some((_, execute_at, deps, _)) = replies
+            .values()
+            .filter(|(phase, ..)| *phase >= Phase::Committed)
+            .max_by_key(|(_, ts, ..)| *ts)
+        {
+            let execute_at = *execute_at;
+            let deps = deps.clone();
+            return Some(self.commit_recovered(txn, execute_at, deps));
+        }
+
+        // (2) Re-drive the transaction as a fresh, recovery-flagged coordinator.
+        // The original `PreAccept` may not have reached every replica (that is
+        // why recovery was needed), so the keys could be missing on some — and a
+        // replica with no keys would execute an empty write. Re-broadcast
+        // `PreAccept` carrying the **union of keys** any RecoverOk reported, so
+        // every replica (re)witnesses the transaction with its keys before we
+        // commit. Then, being a recovery coordinator, we never take the fast path
+        // (`advance_from_pre_accept` forces Accept → Commit).
+        let union_keys: BTreeSet<Key> = replies
+            .values()
+            .flat_map(|(_, _, _, keys)| keys.iter().copied())
+            .collect();
+
+        let (ts, deps) = self.replica_pre_accept(txn, &union_keys);
+        let mut coord_replies: BTreeMap<NodeId, (Timestamp, BTreeSet<TxnId>)> = BTreeMap::new();
+        coord_replies.insert(self.id, (ts, deps));
+        self.coordinating.insert(
+            txn,
+            Coordinating {
+                t0: txn,
+                replies: coord_replies,
+                phase: CoordPhase::PreAccept,
+                recovery: true,
+            },
+        );
+        let mut outs: Vec<Out> = self
+            .peers
+            .iter()
+            .map(|&p| {
+                (
+                    p,
+                    AccordMsg::PreAccept {
+                        txn,
+                        keys: union_keys.clone(),
+                    },
+                )
+            })
+            .collect();
+        if let Some(extra) = self.try_advance_coordinator(txn) {
+            outs.extend(extra);
+        }
+        Some(outs)
+    }
+
+    /// Commit a transaction the recovery quorum found already committed: install
+    /// it as a normal coordinator-driven `Coordinating` so `commit` records the
+    /// decision and broadcasts, then commit with the adopted `(execute_at, deps)`.
+    fn commit_recovered(
+        &mut self,
+        txn: TxnId,
+        execute_at: Timestamp,
+        deps: BTreeSet<TxnId>,
+    ) -> Vec<Out> {
+        self.coordinating.insert(
+            txn,
+            Coordinating {
+                t0: txn,
+                replies: BTreeMap::new(),
+                phase: CoordPhase::PreAccept,
+                recovery: true,
+            },
+        );
+        // A recovered commit is, by Accord's recovery rules, equivalent to a
+        // slow-path commit (we never assert the fast path on recovery).
+        self.commit(txn, execute_at, deps, false)
     }
 }

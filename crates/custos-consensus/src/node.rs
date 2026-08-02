@@ -8,20 +8,31 @@
 //! ships its initial `PreAccept` burst out-of-band.
 //!
 //! **Durability before action** (ADR 0011 follow-up). The core accumulates
-//! [`WalRecord`]s as it advances a transaction's phase; the driver drains them,
-//! appends them to the per-node WAL on the `Env` disk, and `fsync`s **before**
-//! shipping the outbound messages that depend on them (a PreAcceptOk a peer
-//! quorum will count, a Commit a peer will execute on). On startup the driver
-//! replays the WAL and recovers the core, so a restarted replica keeps every
-//! committed/executed transaction. This is the exact shape of `RaftNode`'s WAL
-//! handling, minus the snapshot/log-truncation (deferred — see the crate guide).
+//! [`WalRecord`](crate::WalRecord)s as it advances a transaction's phase; the
+//! driver drains them, appends them to the per-node WAL on the `Env` disk, and
+//! `fsync`s **before** shipping the outbound messages that depend on them (a
+//! PreAcceptOk a peer quorum will count, a Commit a peer will execute on). On
+//! startup the driver replays the WAL and recovers the core, so a restarted
+//! replica keeps every committed/executed transaction.
+//!
+//! **Storage-backed execution.** The core decides *when* and in *what order* a
+//! committed transaction executes; the **effect** is applied here, against a
+//! real (async) [`StorageEngine`]. After fsyncing the durable records, the
+//! driver drains the core's [`ApplyEffect`]s and `merge`s each transaction's
+//! writes into the engine, stamped with the transaction's execution timestamp as
+//! the MVCC version. `merge` (per-key last-writer-wins) makes the apply
+//! idempotent and commutative, so a re-apply after a crash/restart converges to
+//! the same store. The engine defaults to the in-memory [`MemoryEngine`] used
+//! under simulation; a recovered node repopulates a *fresh* engine in the
+//! original execution order from the WAL.
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
 use custos_env::{Env, EnvExt, NodeId};
+use custos_storage::{MemoryEngine, StorageEngine};
 
-use crate::core::{AccordCore, Decision, Key, TxnId};
+use crate::core::{AccordCore, ApplyEffect, Decision, Key, TxnId};
 use crate::message::{AccordMsg, Out};
 use crate::persist::PersistedState;
 use crate::timestamp::Timestamp;
@@ -29,24 +40,49 @@ use crate::timestamp::Timestamp;
 /// File name of the per-node Accord write-ahead log on the `Env` disk.
 const WAL: &str = "accord.wal";
 
-/// A running consensus replica. Cheap to clone; clones share one [`AccordCore`].
-#[derive(Clone)]
-pub struct AccordNode<E: Env> {
+/// A running consensus replica. Cheap to clone; clones share one [`AccordCore`]
+/// and one storage engine.
+///
+/// Generic over the [`StorageEngine`] backing execution; defaults to the
+/// in-memory [`MemoryEngine`] used under simulation.
+pub struct AccordNode<E: Env, S: StorageEngine = MemoryEngine> {
     env: E,
     core: Arc<Mutex<AccordCore>>,
+    storage: S,
 }
 
-impl<E: Env> AccordNode<E> {
-    /// Start a node: build its [`AccordCore`] and spawn the driver loop on `env`.
-    /// `all_nodes` is the full replica set (including this node). The driver
-    /// recovers durable state from the WAL before serving anything.
-    pub fn start(env: E, all_nodes: Vec<NodeId>) -> AccordNode<E> {
+impl<E: Env, S: StorageEngine> Clone for AccordNode<E, S> {
+    fn clone(&self) -> Self {
+        AccordNode {
+            env: self.env.clone(),
+            core: Arc::clone(&self.core),
+            storage: self.storage.clone(),
+        }
+    }
+}
+
+impl<E: Env> AccordNode<E, MemoryEngine> {
+    /// Start a node backed by a fresh in-memory [`MemoryEngine`]. `all_nodes` is
+    /// the full replica set (including this node). The driver recovers durable
+    /// state from the WAL before serving anything.
+    pub fn start(env: E, all_nodes: Vec<NodeId>) -> AccordNode<E, MemoryEngine> {
+        AccordNode::start_with_storage(env, all_nodes, MemoryEngine::new())
+    }
+}
+
+impl<E: Env, S: StorageEngine + 'static> AccordNode<E, S> {
+    /// Start a node backed by an explicit [`StorageEngine`]. `all_nodes` is the
+    /// full replica set (including this node). The driver recovers durable state
+    /// from the WAL before serving anything, replaying its execution order into
+    /// `storage`.
+    pub fn start_with_storage(env: E, all_nodes: Vec<NodeId>, storage: S) -> AccordNode<E, S> {
         let core = Arc::new(Mutex::new(AccordCore::new(env.node_id(), &all_nodes)));
         let node = AccordNode {
             env: env.clone(),
             core: Arc::clone(&core),
+            storage: storage.clone(),
         };
-        env.spawn_task(drive(env.clone(), Arc::clone(&core), all_nodes));
+        env.spawn_task(drive(env.clone(), Arc::clone(&core), storage, all_nodes));
         node
     }
 
@@ -55,13 +91,26 @@ impl<E: Env> AccordNode<E> {
     /// burst depends on), and returns the transaction id.
     pub fn submit(&self, keys: BTreeSet<Key>) -> TxnId {
         let (txn, outs) = self.lock().submit(keys);
-        persist_then_ship(&self.env, &self.core, outs);
+        persist_then_ship(&self.env, &self.core, &self.storage, outs);
         txn
+    }
+
+    /// Take over `txn` as a *recovery coordinator* (its original coordinator is
+    /// suspected dead). Broadcasts `Recover` and drives the transaction to a
+    /// consistent commit. See [`AccordCore::recover`].
+    pub fn recover(&self, txn: TxnId) {
+        let outs = self.lock().recover(txn);
+        persist_then_ship(&self.env, &self.core, &self.storage, outs);
     }
 
     /// This node's environment handle.
     pub fn env(&self) -> &E {
         &self.env
+    }
+
+    /// This node's storage engine (the executed store).
+    pub fn storage(&self) -> &S {
+        &self.storage
     }
 
     /// The agreed execution timestamp this replica recorded for `txn`, if it has
@@ -80,9 +129,12 @@ impl<E: Env> AccordNode<E> {
         self.lock().applied_order().to_vec()
     }
 
-    /// The last transaction that wrote `key` in this replica's executed store.
-    pub fn store_writer(&self, key: Key) -> Option<TxnId> {
-        self.lock().store_writer(key)
+    /// The transaction whose write currently wins at `key` in this replica's
+    /// executed store, decoded from the storage engine, if any. (Each executed
+    /// transaction writes its own id as the value; see [`ApplyEffect`].)
+    pub async fn store_writer(&self, key: Key) -> Option<TxnId> {
+        let vv = self.storage.get(&storage_key(key)).await.ok()??;
+        decode_txn(&vv.value)
     }
 
     /// Whether this replica has executed `txn`.
@@ -100,14 +152,51 @@ impl<E: Env> AccordNode<E> {
     }
 }
 
-/// Drain the core's pending durable records, append + `fsync` them to the WAL,
-/// then ship the outbound messages. Spawned as a task so the synchronous call
-/// sites (`submit`, and each `handle` in the recv loop) stay synchronous; the
-/// simulator runs it promptly, and the fsync completes before the sends inside
-/// the same task, preserving "durable before action".
-fn persist_then_ship<E: Env>(env: &E, core: &Arc<Mutex<AccordCore>>, outs: Vec<Out>) {
-    let records = core.lock().expect("accord core poisoned").drain_persist();
+/// The storage key bytes for an Accord [`Key`]: big-endian so the byte order
+/// matches the numeric order (tidy, though not load-bearing for this slice).
+fn storage_key(key: Key) -> Vec<u8> {
+    key.to_be_bytes().to_vec()
+}
+
+/// Encode a transaction id as the stored value (the executed effect is "write
+/// my id"): `(logical, node)` as two big-endian u64s.
+fn encode_txn(txn: TxnId) -> Vec<u8> {
+    let mut v = Vec::with_capacity(16);
+    v.extend_from_slice(&txn.logical.to_be_bytes());
+    v.extend_from_slice(&txn.node.to_be_bytes());
+    v
+}
+
+/// Inverse of [`encode_txn`].
+fn decode_txn(bytes: &[u8]) -> Option<TxnId> {
+    if bytes.len() != 16 {
+        return None;
+    }
+    let logical = u64::from_be_bytes(bytes[0..8].try_into().ok()?);
+    let node = u64::from_be_bytes(bytes[8..16].try_into().ok()?);
+    Some(Timestamp::new(logical, node))
+}
+
+/// Drain the core's pending durable records and execution effects, append +
+/// `fsync` the records to the WAL, apply the effects to the storage engine, then
+/// ship the outbound messages.
+///
+/// Spawned as a task so the synchronous call sites (`submit`/`recover`, and each
+/// `handle` in the recv loop) stay synchronous; the simulator runs it promptly,
+/// and within the task the fsync precedes the storage apply which precedes the
+/// sends, preserving "durable before action".
+fn persist_then_ship<E: Env, S: StorageEngine + 'static>(
+    env: &E,
+    core: &Arc<Mutex<AccordCore>>,
+    storage: &S,
+    outs: Vec<Out>,
+) {
+    let (records, applies) = {
+        let mut c = core.lock().expect("accord core poisoned");
+        (c.drain_persist(), c.drain_apply())
+    };
     let env = env.clone();
+    let storage = storage.clone();
     env.clone().spawn_task(async move {
         for record in &records {
             env.append(WAL, &PersistedState::encode_record(record))
@@ -117,6 +206,7 @@ fn persist_then_ship<E: Env>(env: &E, core: &Arc<Mutex<AccordCore>>, outs: Vec<O
         if !records.is_empty() {
             env.sync(WAL).await.expect("wal sync");
         }
+        apply_all(&storage, &applies).await;
         for (to, msg) in outs {
             let bytes = serde_json::to_vec(&msg).expect("accord message serializes");
             env.send(to, bytes).await;
@@ -124,16 +214,45 @@ fn persist_then_ship<E: Env>(env: &E, core: &Arc<Mutex<AccordCore>>, outs: Vec<O
     });
 }
 
+/// Apply the execution effects to the storage engine. Each effect writes the
+/// transaction's id to each key it touches via `merge` (per-key LWW) at the
+/// transaction's execution timestamp as the MVCC version — idempotent and
+/// commutative, so a re-apply on recovery converges.
+async fn apply_all<S: StorageEngine>(storage: &S, applies: &[ApplyEffect]) {
+    for effect in applies {
+        let value = encode_txn(effect.txn);
+        let version = effect.version.logical;
+        for &key in &effect.keys {
+            storage
+                .merge(&storage_key(key), &value, version)
+                .await
+                .expect("storage merge");
+        }
+    }
+}
+
 /// The per-node driver loop: recover durable state, then repeatedly wait for the
-/// next message, hand it to the core, persist the resulting durable changes, and
-/// ship whatever the core wants sent.
-async fn drive<E: Env>(env: E, core: Arc<Mutex<AccordCore>>, all_nodes: Vec<NodeId>) {
+/// next message, hand it to the core, persist the resulting durable changes,
+/// apply execution effects, and ship whatever the core wants sent.
+async fn drive<E: Env, S: StorageEngine + 'static>(
+    env: E,
+    core: Arc<Mutex<AccordCore>>,
+    storage: S,
+    all_nodes: Vec<NodeId>,
+) {
     // Recover from the WAL before serving anything.
     let bytes = env.read(WAL).await.unwrap_or_default();
     let state = PersistedState::replay(PersistedState::decode(&bytes));
     if !state.is_empty() {
         let recovered = AccordCore::recovered(env.node_id(), &all_nodes, state);
-        *core.lock().expect("accord core poisoned") = recovered;
+        let applies = {
+            let mut guard = core.lock().expect("accord core poisoned");
+            *guard = recovered;
+            // The core emitted apply effects for its recovered execution order;
+            // repopulate the (fresh, volatile) storage engine in that order.
+            guard.drain_apply()
+        };
+        apply_all(&storage, &applies).await;
     }
 
     loop {
@@ -149,7 +268,7 @@ async fn drive<E: Env>(env: E, core: Arc<Mutex<AccordCore>>, all_nodes: Vec<Node
             }
         };
         // Durable before action: fsync the core's state changes (e.g. a Commit
-        // we just executed) before shipping the messages that depend on them.
-        persist_then_ship(&env, &core, outs);
+        // we just executed) before applying effects and shipping messages.
+        persist_then_ship(&env, &core, &storage, outs);
     }
 }

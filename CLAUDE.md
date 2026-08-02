@@ -42,15 +42,18 @@ engine** (`custos-placement`: residency + failure-domain spread, with the leader
 automatically reconciling tablet placement via control-plane `CasTabletReplicas`),
 and a **slice of Accord-style leaderless transaction consensus**
 (`custos-consensus`: PreAccept→Commit fast path + PreAccept→Accept→Commit slow
-path, dependency tracking, consistent commit order, plus **durable execution** —
-each replica executes committed transactions in agreed order against a WAL it
-recovers from on restart; ADR 0011). Skeletons / future work:
+path, dependency tracking, consistent commit order, **durable storage-backed
+execution** — each replica executes committed transactions in agreed order
+against a real `StorageEngine` (`MemoryEngine` under sim) via a WAL it recovers
+from on restart — and a **first slice of coordinator failover** (a replica can
+recover a stranded transaction whose coordinator died, adopting a committed
+decision or forcing the slow path); ADR 0011). Skeletons / future work:
 the fuller CQL surface (a real type system, CQL grammar, keyspaces,
 prepared statements) and the rest of the DynamoDB surface (Scan,
 projection/filter expressions, `ReturnValues`, document/set types, secondary
 indexes, durable/replicated table schemas), and the deferred remainder of Accord
-(coordinator failover, the full dependency wait-graph, WAL snapshotting,
-data-plane integration).
+(the full dependency wait-graph, the precise recovery ballot + duelling
+recoverers + a failure detector, WAL snapshotting, live data-plane integration).
 
 ## Per-crate guides
 
@@ -235,12 +238,19 @@ and deps) or runs an `Accept` round to pick a higher execution timestamp and
 union deps (slow path) before `Commit`. Conflicts are intersecting key sets;
 the slice proves two conflicting transactions commit in a *consistent timestamp
 order on every replica*. Each replica then **executes** committed transactions
-in agreed `(execute_at, txn)` order (blocking on earlier-ordered conflicts) and
-**durably**: `AccordCore` emits `WalRecord`s the `AccordNode` driver fsyncs to
-`accord.wal` before acting and recovers on restart — mirroring `RaftCore`'s WAL.
-**Deferred:** coordinator failover, the full dependency wait-graph, WAL
-snapshotting, data-plane/`StorageEngine` integration, and sharding — see ADR
-0011 and the crate guide.
+in agreed `(execute_at, txn)` order (blocking on earlier-ordered conflicts)
+against a real `StorageEngine` (the in-memory `MemoryEngine` under simulation):
+the sync `AccordCore` decides the order and emits `ApplyEffect`s, the
+`AccordNode` driver `merge`s each transaction's writes into the engine at its
+execution timestamp. It is also **durable**: `AccordCore` emits `WalRecord`s the
+driver fsyncs to `accord.wal` before acting and recovers on restart (replaying
+its execution order into a fresh engine) — mirroring `RaftCore`'s WAL. A **dead
+coordinator's transaction is recoverable**: another replica runs a
+`Recover`/`RecoverOk` round and drives the transaction to a commit consistent
+with whatever the original could have committed (adopt-committed, else force the
+slow path). **Deferred:** the full dependency wait-graph, the precise recovery
+ballot + duelling recoverers + a failure detector, WAL snapshotting, live
+data-plane integration, and sharding — see ADR 0011 and the crate guide.
 
 ### Storage (`custos-storage`)
 

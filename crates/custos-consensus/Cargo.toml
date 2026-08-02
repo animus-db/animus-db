@@ -13,6 +13,7 @@ workspace = true
 
 [dependencies]
 custos-env.workspace = true
+custos-storage.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 async-trait.workspace = true
