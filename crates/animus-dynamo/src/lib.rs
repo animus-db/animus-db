@@ -27,9 +27,15 @@ pub mod registry;
 pub mod wire;
 
 pub use condition::{ConditionExpression, SortKeyCondition};
-pub use registry::{GlobalSecondaryIndex, RegistryError, SchemaRegistry};
+pub use registry::{
+    GlobalSecondaryIndex, LocalSecondaryIndex, RegistryError, SchemaRegistry, SecondaryIndex,
+};
 
-/// A DynamoDB-style attribute value (a useful subset).
+/// A DynamoDB-style attribute value (a useful subset). Beyond the scalar
+/// types (`S`/`N`/`B`/`BOOL`/`NULL`), this carries the **document** types
+/// `M` (a nested attribute map) and `L` (a heterogeneous list), and the
+/// homogeneous **set** types `SS` (string set), `NS` (number set), and `BS`
+/// (binary set).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AttributeValue {
     /// String (`S`).
@@ -42,19 +48,38 @@ pub enum AttributeValue {
     Bool(bool),
     /// Null (`NULL`).
     Null,
+    /// Map (`M`) — a nested attribute map (a document type).
+    M(BTreeMap<String, AttributeValue>),
+    /// List (`L`) — an ordered, heterogeneous list of values (a document type).
+    L(Vec<AttributeValue>),
+    /// String set (`SS`) — a set of unique strings, kept sorted/deduplicated.
+    SS(Vec<String>),
+    /// Number set (`NS`) — a set of unique numbers (text), sorted/deduplicated.
+    NS(Vec<String>),
+    /// Binary set (`BS`) — a set of unique binary values, sorted/deduplicated.
+    BS(Vec<Vec<u8>>),
 }
 
 impl AttributeValue {
     /// Byte encoding used when an attribute is part of a key. String/number/
     /// binary sort by these bytes (numbers therefore sort lexicographically — a
     /// documented simplification of DynamoDB's numeric ordering).
+    ///
+    /// Only scalar types are valid key attributes in DynamoDB; the document
+    /// and set types return an empty encoding (the schema/registry layers
+    /// reject them as keys before this is reached).
     pub(crate) fn key_bytes(&self) -> Vec<u8> {
         match self {
             AttributeValue::S(s) => s.clone().into_bytes(),
             AttributeValue::N(n) => n.clone().into_bytes(),
             AttributeValue::B(b) => b.clone(),
             AttributeValue::Bool(b) => vec![u8::from(*b)],
-            AttributeValue::Null => Vec::new(),
+            AttributeValue::Null
+            | AttributeValue::M(_)
+            | AttributeValue::L(_)
+            | AttributeValue::SS(_)
+            | AttributeValue::NS(_)
+            | AttributeValue::BS(_) => Vec::new(),
         }
     }
 }
