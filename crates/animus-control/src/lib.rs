@@ -29,7 +29,10 @@ pub mod schema;
 pub use detector::{FailureDetector, Liveness};
 pub use meta::{ApplyOutcome, Member, MetaCommand, Metadata, NodeStatus};
 pub use node::RaftNode;
-pub use schema::{ColumnDef, ColumnType, SchemaCatalog, SchemaError, TableName, TableSchema};
+pub use schema::{
+    ColumnDef, ColumnType, IndexDef, IndexKind, IndexProjection, SchemaCatalog, SchemaError,
+    TableName, TableSchema,
+};
 // Re-exported so downstream assemblers (e.g. `animusd`) can set a tablet's
 // placement policy via `SetTabletPolicy` without taking a direct
 // `animus-placement` dependency. The policy is part of the control plane's

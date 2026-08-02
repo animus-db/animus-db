@@ -99,10 +99,33 @@ in-place schema evolution is still future work — see Consequences).
   process-global set of registered control handles (working for the in-process
   `--cluster N` mode; cross-process proposal forwarding over the network is still
   future work — DDL otherwise commits when the connected node is the leader).
-- **Costs / follow-up:** secondary indexes (DynamoDB GSIs) and CQL keyspace
-  objects are **not** modelled here — the schema captures key structure + typed
-  columns, the shared core; index/keyspace metadata can extend
-  `TableSchema`/`SchemaCatalog` later without changing the replication mechanism.
-  In-place schema *evolution* is still future work: the CQL edge's `ALTER TABLE
-  ADD` is a non-atomic drop+recreate, and there is no `AlterTableSchema`
-  `MetaCommand` yet.
+- **Secondary-index *definitions* now replicate.** A table's `TableSchema` carries
+  an ordered `indexes: Vec<IndexDef>` (GSI/LSI: name, kind, hash/sort attributes,
+  projection), mutated by two new deterministic `MetaCommand`s —
+  `CreateTableIndex { table, index }` (rejected if the table is unknown or the
+  resulting schema is malformed, e.g. an LSI with no sort attribute; replaces an
+  index of the same name) and `DropTableIndex { table, index }` (idempotent). They
+  ride the same Raft/WAL/snapshot path as the rest of `Metadata`, so an index
+  *definition* is durable and cluster-agreed, recovered on restart from the
+  replicated catalog rather than per-process memory. Read it via
+  `Metadata::table_indexes(table)` (and `TableSchema::index`). Proven end-to-end
+  under `SimEnv` in `animus-control/tests/schema_indexes.rs` (create a GSI → a
+  second node sees it; reject an index on a phantom table + a malformed LSI;
+  restart a node → the definition survives; drop → it disappears cluster-wide),
+  reproducible from a seed. The DynamoDB adapter bridges its `SecondaryIndex` ↔
+  `IndexDef` (`animus_dynamo::schema::{index_to_control, index_to_dynamo,
+  indexes_to_dynamo}`) and rebuilds its index-maintenance machinery from the
+  catalog via `SchemaRegistry::sync_indexes` (preserving entry data for an
+  unchanged index, clearing it for a changed-shape one).
+- **Still deferred (index *data*):** the index *entry data* — the actual indexed
+  rows — is **not** replicated; it stays maintained at the wire edge by observed
+  `note_put`/`note_delete` writes (rebuilt from writes, so a freshly restarted
+  node's index is empty until it observes writes or back-fills). Only the index
+  *definition* is now cluster-wide and durable. Replicating index data (or
+  back-filling it from a base-table scan on restart) is future work.
+- **Costs / follow-up:** CQL keyspace objects are still **not** modelled here —
+  the schema captures key structure + typed columns + index definitions; keyspace
+  metadata can extend `SchemaCatalog` later without changing the replication
+  mechanism. In-place schema *evolution* is still future work: the CQL edge's
+  `ALTER TABLE ADD` is a non-atomic drop+recreate, and there is no
+  `AlterTableSchema` `MetaCommand` yet.

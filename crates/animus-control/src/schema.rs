@@ -71,6 +71,55 @@ pub enum ColumnType {
     Uuid,
 }
 
+/// What attributes a secondary index projects — the replicated counterpart of a
+/// DynamoDB `CreateTable` index `Projection` (ADR 0013). The control plane stores
+/// only the *declaration*; an adapter maps it onto its own projection type when it
+/// reads the catalog. Plain data (`Vec`), deterministic.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IndexProjection {
+    /// Every attribute (`ALL`).
+    All,
+    /// Only the base-table key + index key attributes (`KEYS_ONLY`).
+    KeysOnly,
+    /// The keys plus an explicit list of non-key attributes (`INCLUDE`).
+    Include(Vec<String>),
+}
+
+/// Whether a secondary index is **global** (its own hash keyspace, independent of
+/// the base partition) or **local** (shares the base partition key, alternate sort
+/// only). Mirrors DynamoDB's GSI / LSI distinction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IndexKind {
+    /// Global secondary index: hashes by `hash_attribute` (an independent
+    /// keyspace), optionally plus a range attribute.
+    Global,
+    /// Local secondary index: hashes by the base table's partition key, sorts by
+    /// `sort_attribute` (always present for an LSI).
+    Local,
+}
+
+/// A secondary-index **definition** as replicated in the schema catalog (ADR
+/// 0013): its name, kind, key attributes, and projection. This is the *shape* of
+/// the index — the cluster-wide, durable agreement on which indexes exist — not
+/// its entry data (the actual indexed rows), whose maintenance stays at the wire
+/// edge (see ADR 0013 Consequences). Plain data, deterministic.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexDef {
+    /// The index name (unique within its table; the `IndexName` a query targets).
+    pub name: String,
+    /// Global vs local.
+    pub kind: IndexKind,
+    /// The item attribute the index hashes by. For a [`Global`](IndexKind::Global)
+    /// index this is its own hash key; for a [`Local`](IndexKind::Local) index it
+    /// is, by convention, the base table's partition key (the adapter sets it so).
+    pub hash_attribute: String,
+    /// The optional range/sort attribute. Always present for an LSI; present for a
+    /// composite GSI; `None` for a hash-only GSI.
+    pub sort_attribute: Option<String>,
+    /// What attributes a query against this index returns.
+    pub projection: IndexProjection,
+}
+
 /// One column's declared name and type. The name is stored as written
 /// (case-preserved); an adapter that wants case-insensitivity normalizes before
 /// it gets here.
@@ -114,6 +163,14 @@ pub struct TableSchema {
     pub clustering_keys: Vec<String>,
     /// Every column (keys included), in declaration order.
     pub columns: Vec<ColumnDef>,
+    /// Declared **secondary indexes** (GSI/LSI), by definition (ADR 0013). Empty
+    /// for a table with none. This carries the index *shape* cluster-wide and
+    /// durably; the index *entry data* (the actual indexed rows) is maintained at
+    /// the wire edge. Mutated only through `MetaCommand::{CreateTableIndex,
+    /// DropTableIndex}` (so they replicate), kept sorted by name for a
+    /// deterministic order. Validated by [`TableSchema::validate`].
+    #[serde(default)]
+    pub indexes: Vec<IndexDef>,
 }
 
 /// Why a [`TableSchema`] was rejected as malformed.
@@ -131,6 +188,10 @@ pub enum SchemaError {
     PartitionKeyIsClustering,
     /// The same clustering key appears more than once.
     DuplicateClusteringKey,
+    /// Two secondary indexes share a name.
+    DuplicateIndex,
+    /// A local secondary index declared no sort attribute (an LSI must have one).
+    LocalIndexMissingSort,
 }
 
 impl TableSchema {
@@ -143,6 +204,7 @@ impl TableSchema {
             columns: vec![ColumnDef::new(pk.clone(), ty)],
             partition_key: pk,
             clustering_keys: Vec::new(),
+            indexes: Vec::new(),
         }
     }
 
@@ -164,6 +226,7 @@ impl TableSchema {
             ],
             partition_key: pk,
             clustering_keys: vec![sk],
+            indexes: Vec::new(),
         }
     }
 
@@ -181,6 +244,7 @@ impl TableSchema {
             partition_key: partition_key.into(),
             clustering_keys,
             columns,
+            indexes: Vec::new(),
         }
     }
 
@@ -239,7 +303,48 @@ impl TableSchema {
                 return Err(SchemaError::DuplicateClusteringKey);
             }
         }
+        // Secondary indexes: unique names; an LSI must carry a sort attribute.
+        let mut index_names = BTreeSet::new();
+        for idx in &self.indexes {
+            if !index_names.insert(idx.name.as_str()) {
+                return Err(SchemaError::DuplicateIndex);
+            }
+            if idx.kind == IndexKind::Local && idx.sort_attribute.is_none() {
+                return Err(SchemaError::LocalIndexMissingSort);
+            }
+        }
         Ok(())
+    }
+
+    /// Look up a secondary index by name.
+    #[must_use]
+    pub fn index(&self, name: &str) -> Option<&IndexDef> {
+        self.indexes.iter().find(|i| i.name == name)
+    }
+
+    /// Add or replace a secondary index by name, keeping `indexes` sorted by name
+    /// (deterministic order). Returns whether an index of that name already
+    /// existed. Used by the state machine; callers go through `MetaCommand`.
+    pub(crate) fn upsert_index(&mut self, index: IndexDef) -> bool {
+        match self.indexes.iter_mut().find(|i| i.name == index.name) {
+            Some(slot) => {
+                *slot = index;
+                true
+            }
+            None => {
+                self.indexes.push(index);
+                self.indexes.sort_by(|a, b| a.name.cmp(&b.name));
+                false
+            }
+        }
+    }
+
+    /// Remove a secondary index by name, returning whether it existed. Used by the
+    /// state machine; callers go through `MetaCommand`.
+    pub(crate) fn remove_index(&mut self, name: &str) -> bool {
+        let before = self.indexes.len();
+        self.indexes.retain(|i| i.name != name);
+        self.indexes.len() != before
     }
 }
 
@@ -271,6 +376,12 @@ impl SchemaCatalog {
     #[must_use]
     pub fn get(&self, table: &str) -> Option<&TableSchema> {
         self.tables.get(table)
+    }
+
+    /// A mutable handle to `table`'s schema (used by the state machine to mutate
+    /// secondary indexes; callers go through `MetaCommand`).
+    pub(crate) fn get_mut(&mut self, table: &str) -> Option<&mut TableSchema> {
+        self.tables.get_mut(table)
     }
 
     /// The number of registered tables.
@@ -393,6 +504,79 @@ mod tests {
             ],
         );
         assert_eq!(s.validate(), Err(SchemaError::DuplicateClusteringKey));
+    }
+
+    fn gsi(name: &str, hash: &str) -> IndexDef {
+        IndexDef {
+            name: name.into(),
+            kind: IndexKind::Global,
+            hash_attribute: hash.into(),
+            sort_attribute: None,
+            projection: IndexProjection::All,
+        }
+    }
+
+    #[test]
+    fn upsert_index_keeps_sorted_and_replaces_by_name() {
+        let mut s = TableSchema::simple("id", ColumnType::String);
+        assert!(!s.upsert_index(gsi("by-b", "b")));
+        assert!(!s.upsert_index(gsi("by-a", "a")));
+        // Sorted by name regardless of insertion order.
+        assert_eq!(
+            s.indexes
+                .iter()
+                .map(|i| i.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["by-a", "by-b"]
+        );
+        // Re-upsert replaces in place and reports it existed.
+        assert!(s.upsert_index(gsi("by-a", "a2")));
+        assert_eq!(s.index("by-a").unwrap().hash_attribute, "a2");
+        assert_eq!(s.indexes.len(), 2);
+    }
+
+    #[test]
+    fn remove_index_is_idempotent() {
+        let mut s = TableSchema::simple("id", ColumnType::String);
+        s.upsert_index(gsi("by-a", "a"));
+        assert!(s.remove_index("by-a"));
+        assert!(!s.remove_index("by-a"));
+        assert!(s.index("by-a").is_none());
+    }
+
+    #[test]
+    fn rejects_duplicate_index_name() {
+        let mut s = TableSchema::simple("id", ColumnType::String);
+        // Bypass `upsert_index`'s dedup to construct a malformed schema directly.
+        s.indexes = vec![gsi("dup", "a"), gsi("dup", "b")];
+        assert_eq!(s.validate(), Err(SchemaError::DuplicateIndex));
+    }
+
+    #[test]
+    fn rejects_lsi_without_sort_attribute() {
+        let mut s = TableSchema::composite("pk", ColumnType::String, "sk", ColumnType::String);
+        s.indexes = vec![IndexDef {
+            name: "lsi".into(),
+            kind: IndexKind::Local,
+            hash_attribute: "pk".into(),
+            sort_attribute: None,
+            projection: IndexProjection::All,
+        }];
+        assert_eq!(s.validate(), Err(SchemaError::LocalIndexMissingSort));
+    }
+
+    #[test]
+    fn valid_indexes_pass_validation() {
+        let mut s = TableSchema::simple("id", ColumnType::String);
+        s.upsert_index(gsi("by-email", "email"));
+        s.upsert_index(IndexDef {
+            name: "by-ts".into(),
+            kind: IndexKind::Local,
+            hash_attribute: "id".into(),
+            sort_attribute: Some("ts".into()),
+            projection: IndexProjection::KeysOnly,
+        });
+        assert!(s.validate().is_ok());
     }
 
     #[test]

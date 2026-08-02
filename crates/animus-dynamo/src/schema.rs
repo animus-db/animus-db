@@ -30,9 +30,13 @@
 //! the two adapters can coexist in one catalog without the DynamoDB edge choking
 //! on a CQL table it does not own.
 
-use animus_control::{ColumnDef, ColumnType, TableSchema as ControlSchema};
+use animus_control::{
+    ColumnDef, ColumnType, IndexDef, IndexKind, IndexProjection as ControlProjection,
+    TableSchema as ControlSchema,
+};
 
 use crate::TableSchema;
+use crate::registry::{GlobalSecondaryIndex, IndexProjection, LocalSecondaryIndex, SecondaryIndex};
 
 /// The DynamoDB key `AttributeType` an attribute was declared with, mapped onto a
 /// control-plane [`ColumnType`]. Only the three scalar key families are valid
@@ -91,6 +95,84 @@ pub fn to_dynamo(schema: &ControlSchema) -> TableSchema {
     }
 }
 
+/// Translate a DynamoDB [`SecondaryIndex`] declaration into the control plane's
+/// replicated [`IndexDef`] (ADR 0013), so a `CreateTable`/`CreateGlobalSecondaryIndex`
+/// can propose the index *definition* into the replicated catalog.
+///
+/// A GSI carries its own hash attribute and optional range; an LSI carries an
+/// alternate sort attribute and, by the catalog's convention, hashes by
+/// `base_partition_key` (DynamoDB LSIs share the base partition key).
+#[must_use]
+pub fn index_to_control(index: &SecondaryIndex, base_partition_key: &str) -> IndexDef {
+    match index {
+        SecondaryIndex::Global(g) => IndexDef {
+            name: g.name.clone(),
+            kind: IndexKind::Global,
+            hash_attribute: g.key_attribute.clone(),
+            sort_attribute: g.sort_attribute.clone(),
+            projection: projection_to_control(&g.projection),
+        },
+        SecondaryIndex::Local(l) => IndexDef {
+            name: l.name.clone(),
+            kind: IndexKind::Local,
+            hash_attribute: base_partition_key.to_owned(),
+            sort_attribute: Some(l.sort_attribute.clone()),
+            projection: projection_to_control(&l.projection),
+        },
+    }
+}
+
+/// Recover the DynamoDB [`SecondaryIndex`] declaration from a control-plane
+/// [`IndexDef`] read out of the replicated catalog, so the wire edge can rebuild
+/// its index-maintenance machinery from cluster-agreed definitions (not local
+/// memory).
+#[must_use]
+pub fn index_to_dynamo(def: &IndexDef) -> SecondaryIndex {
+    match def.kind {
+        IndexKind::Global => SecondaryIndex::Global(GlobalSecondaryIndex {
+            name: def.name.clone(),
+            key_attribute: def.hash_attribute.clone(),
+            sort_attribute: def.sort_attribute.clone(),
+            projection: projection_to_dynamo(&def.projection),
+        }),
+        // An LSI's hash is the base partition key (carried in `hash_attribute`);
+        // the dynamo `LocalSecondaryIndex` is defined by its alternate sort
+        // attribute. A control LSI always has a sort attribute (validated), but be
+        // defensive and fall back to the hash attribute if it is somehow absent.
+        IndexKind::Local => SecondaryIndex::Local(LocalSecondaryIndex {
+            name: def.name.clone(),
+            sort_attribute: def
+                .sort_attribute
+                .clone()
+                .unwrap_or_else(|| def.hash_attribute.clone()),
+            projection: projection_to_dynamo(&def.projection),
+        }),
+    }
+}
+
+/// Translate a list of control-plane [`IndexDef`]s (as read from the replicated
+/// catalog) into DynamoDB [`SecondaryIndex`] declarations, preserving order.
+#[must_use]
+pub fn indexes_to_dynamo(defs: &[IndexDef]) -> Vec<SecondaryIndex> {
+    defs.iter().map(index_to_dynamo).collect()
+}
+
+fn projection_to_control(p: &IndexProjection) -> ControlProjection {
+    match p {
+        IndexProjection::All => ControlProjection::All,
+        IndexProjection::KeysOnly => ControlProjection::KeysOnly,
+        IndexProjection::Include(names) => ControlProjection::Include(names.clone()),
+    }
+}
+
+fn projection_to_dynamo(p: &ControlProjection) -> IndexProjection {
+    match p {
+        ControlProjection::All => IndexProjection::All,
+        ControlProjection::KeysOnly => IndexProjection::KeysOnly,
+        ControlProjection::Include(names) => IndexProjection::Include(names.clone()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,6 +205,36 @@ mod tests {
         let dynamo = TableSchema::simple("id");
         let control = to_control(&dynamo, &[]);
         assert_eq!(control.column("id").unwrap().ty, ColumnType::String);
+    }
+
+    #[test]
+    fn gsi_round_trips_through_control_index_def() {
+        let dynamo = SecondaryIndex::Global(GlobalSecondaryIndex {
+            name: "by-email".into(),
+            key_attribute: "email".into(),
+            sort_attribute: Some("created".into()),
+            projection: IndexProjection::Include(vec!["name".into()]),
+        });
+        let def = index_to_control(&dynamo, "id");
+        assert_eq!(def.kind, IndexKind::Global);
+        assert_eq!(def.hash_attribute, "email");
+        assert_eq!(def.sort_attribute.as_deref(), Some("created"));
+        assert_eq!(index_to_dynamo(&def), dynamo);
+    }
+
+    #[test]
+    fn lsi_round_trips_and_hashes_by_base_partition_key() {
+        let dynamo = SecondaryIndex::Local(LocalSecondaryIndex {
+            name: "by-ts".into(),
+            sort_attribute: "ts".into(),
+            projection: IndexProjection::KeysOnly,
+        });
+        let def = index_to_control(&dynamo, "pk");
+        assert_eq!(def.kind, IndexKind::Local);
+        // The LSI hashes by the base partition key in the control model.
+        assert_eq!(def.hash_attribute, "pk");
+        assert_eq!(def.sort_attribute.as_deref(), Some("ts"));
+        assert_eq!(index_to_dynamo(&def), dynamo);
     }
 
     #[test]

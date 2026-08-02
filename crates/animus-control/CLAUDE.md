@@ -13,15 +13,20 @@ epoch compare-and-swap transactions.
 - `meta.rs` — `Metadata` (members + tablet map + placement policies + the
   table-schema catalog) and `MetaCommand` (`UpsertMember`, `CreateTablet`,
   `CasTabletReplicas`, `SplitTablet`, `MergeTablets`, `SetTabletPolicy`,
-  `CreateTableSchema`, `DropTableSchema`). `Metadata::apply` is the deterministic
-  state machine; `Metadata::reconcile` is the pure placement decision (see
-  below); `table_schema`/`has_table_schema`/`table_schemas` read the catalog.
+  `CreateTableSchema`, `DropTableSchema`, `CreateTableIndex`, `DropTableIndex`).
+  `Metadata::apply` is the deterministic state machine; `Metadata::reconcile` is
+  the pure placement decision (see below);
+  `table_schema`/`has_table_schema`/`table_schemas`/`table_indexes` read the
+  catalog.
 - `schema.rs` — the replicated **table-schema catalog** (ADR 0013): `TableSchema`
-  (partition key + ordered clustering keys + typed `ColumnDef`s),
-  `ColumnType` (the union of CQL scalars + DynamoDB key families), and
-  `SchemaCatalog` (a `BTreeMap<TableName, TableSchema>` held in `Metadata`).
-  `TableSchema::validate` is the pure malformed-schema check the state machine
-  applies. All plain data — no I/O, no clock, no RNG.
+  (partition key + ordered clustering keys + typed `ColumnDef`s + `indexes:
+  Vec<IndexDef>`), `ColumnType` (the union of CQL scalars + DynamoDB key families),
+  and `SchemaCatalog` (a `BTreeMap<TableName, TableSchema>` held in `Metadata`).
+  `IndexDef`/`IndexKind`/`IndexProjection` carry a **secondary-index definition**
+  (GSI/LSI: name, kind, hash/sort attributes, projection) — the replicated index
+  *shape*, not its entry data. `TableSchema::validate` is the pure
+  malformed-schema check the state machine applies (incl. unique index names + an
+  LSI requiring a sort attribute). All plain data — no I/O, no clock, no RNG.
 - `raft.rs` — `RaftCore`: a **synchronous, I/O-free** Raft state machine. Time
   and randomness are parameters (`now`, `entropy`); it returns outbound messages
   and emits WAL records.
@@ -111,6 +116,13 @@ epoch compare-and-swap transactions.
   image). Read it via `Metadata::table_schema`/`has_table_schema`/`table_schemas`.
   The shape (partition key + clustering keys + typed columns) is the union of both
   wire adapters' needs; **the adapters consuming it is a deliberate follow-up.**
+  **Secondary-index definitions** (GSI/LSI) ride the same path:
+  `TableSchema.indexes` holds the `IndexDef`s, mutated by
+  `MetaCommand::{CreateTableIndex, DropTableIndex}` (create rejects an unknown
+  table or a malformed schema and replaces an index of the same name; drop is
+  idempotent). Read via `Metadata::table_indexes(table)`. Only the index *shape* is
+  replicated — the index *entry data* (the actual rows) stays at the wire edge
+  (rebuilt from observed writes). End-to-end in `schema_indexes.rs`.
 - **Observability metrics (ADR 0015).** The driver records, all from
   `Env`-supplied or core-derived inputs (deterministic): `elections_started`/
   `elections_won` + an `is_leader` gauge (from role/term transitions in
@@ -147,7 +159,11 @@ it, then the member restarts and returns to `Active`; plus detector unit tests i
 and the **replicated table-schema catalog** end to end (`schema_catalog.rs`, ADR
 0013 — propose schemas, reject a duplicate + a malformed one on the state machine,
 kill the leader, assert the schemas survive + survivors agree, drop one and see it
-replicate; plus `schema.rs` unit tests), and **control-plane metrics** moving
+replicate; plus `schema.rs` unit tests), the **replicated secondary-index
+definitions** end to end (`schema_indexes.rs`, ADR 0013 — create a GSI so a second
+node sees it, reject an index on a phantom table + a malformed LSI, restart a node
+and see the definition survive from the catalog, drop it cluster-wide; reproducible
+from a seed), and **control-plane metrics** moving
 under known events (`metrics.rs`, ADR 0015 — a forced election bumps the election
 counters + the leadership gauge; a crashed heartbeating member bumps
 `failure_detector_down`, its recovery bumps `failure_detector_up`; plus a

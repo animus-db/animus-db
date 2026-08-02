@@ -172,6 +172,46 @@ struct IndexState {
     entries: BTreeSet<Vec<u8>>,
 }
 
+impl IndexState {
+    /// Whether two index states declare the *same shape* (hash/sort attributes +
+    /// projection), ignoring accumulated entry data. Used by
+    /// [`SchemaRegistry::sync_indexes`] to decide whether a catalog definition can
+    /// reuse an existing index's entries or must clear and re-declare them.
+    fn same_shape(&self, other: &IndexState) -> bool {
+        self.hash_attribute == other.hash_attribute
+            && self.sort_attribute == other.sort_attribute
+            && self.projection == other.projection
+    }
+}
+
+/// Build the `(index_name, IndexState)` for a [`SecondaryIndex`] declaration,
+/// given the base table's partition key (an LSI hashes by it). The state starts
+/// with no entries; writes populate them.
+fn index_state(index: &SecondaryIndex, base_partition_key: &str) -> (String, IndexState) {
+    match index {
+        SecondaryIndex::Global(g) => (
+            g.name.clone(),
+            IndexState {
+                hash_attribute: g.key_attribute.clone(),
+                sort_attribute: g.sort_attribute.clone(),
+                projection: g.projection.clone(),
+                entries: BTreeSet::new(),
+            },
+        ),
+        // An LSI hashes by the base table's partition key and sorts by its
+        // alternate sort attribute.
+        SecondaryIndex::Local(l) => (
+            l.name.clone(),
+            IndexState {
+                hash_attribute: base_partition_key.to_owned(),
+                sort_attribute: Some(l.sort_attribute.clone()),
+                projection: l.projection.clone(),
+                entries: BTreeSet::new(),
+            },
+        ),
+    }
+}
+
 /// An in-memory registry of table schemas + per-table item-key indexes.
 #[derive(Clone, Debug, Default)]
 pub struct SchemaRegistry {
@@ -228,28 +268,7 @@ impl SchemaRegistry {
         }
         let indexes = indexes
             .into_iter()
-            .map(|index| match index {
-                SecondaryIndex::Global(g) => (
-                    g.name,
-                    IndexState {
-                        hash_attribute: g.key_attribute,
-                        sort_attribute: g.sort_attribute,
-                        projection: g.projection,
-                        entries: BTreeSet::new(),
-                    },
-                ),
-                // An LSI hashes by the base table's partition key and sorts by
-                // its alternate sort attribute.
-                SecondaryIndex::Local(l) => (
-                    l.name,
-                    IndexState {
-                        hash_attribute: schema.partition_key.clone(),
-                        sort_attribute: Some(l.sort_attribute),
-                        projection: l.projection,
-                        entries: BTreeSet::new(),
-                    },
-                ),
-            })
+            .map(|index| index_state(&index, &schema.partition_key))
             .collect();
         self.tables.insert(
             table.to_owned(),
@@ -259,6 +278,63 @@ impl SchemaRegistry {
                 indexes,
             },
         );
+        Ok(())
+    }
+
+    /// Reconcile `table`'s declared secondary indexes to match `indexes` — the
+    /// **definitions read from the control plane's replicated catalog** (ADR 0013).
+    /// This is how the wire edge rebuilds its index-maintenance machinery from the
+    /// cluster-agreed, durable index *definitions* (surviving a restart) rather
+    /// than from process-local `create_table_with_indexes` state.
+    ///
+    /// The table is registered with `schema` if absent (no indexes yet), then its
+    /// index set is reconciled: an index whose definition is **unchanged** keeps
+    /// its accumulated entry data; a **new** index is added empty (later writes
+    /// populate it); an index whose definition **changed shape** has its (now
+    /// stale) entries cleared and is re-declared; and an index no longer in
+    /// `indexes` is dropped. The entry *data* itself is still rebuilt by observed
+    /// `note_put`/`note_delete` writes — only the *definitions* are now authoritative
+    /// from the catalog.
+    ///
+    /// # Errors
+    /// [`RegistryError::NoSuchTable`] never occurs (the table is created if
+    /// absent); the signature returns `Result` for symmetry and future use.
+    pub fn sync_indexes(
+        &mut self,
+        table: &str,
+        schema: TableSchema,
+        indexes: &[SecondaryIndex],
+    ) -> Result<(), RegistryError> {
+        if !self.tables.contains_key(table) {
+            // Register fresh with the desired indexes in one shot.
+            return self.create_table_with_indexes(table, schema, indexes.to_vec());
+        }
+        let partition_key = self
+            .tables
+            .get(table)
+            .map(|t| t.schema.partition_key.clone())
+            .unwrap_or_default();
+        let state = self.tables.get_mut(table).expect("table present");
+        // Desired index name -> its freshly-built (empty) IndexState shape.
+        let desired: BTreeMap<String, IndexState> = indexes
+            .iter()
+            .map(|index| {
+                let (name, st) = index_state(index, &partition_key);
+                (name, st)
+            })
+            .collect();
+        // Drop indexes that are no longer declared.
+        state.indexes.retain(|name, _| desired.contains_key(name));
+        // Add new indexes and replace changed-shape ones (preserving entries when
+        // the shape is identical).
+        for (name, fresh) in desired {
+            match state.indexes.get(&name) {
+                Some(existing) if existing.same_shape(&fresh) => {} // keep entries
+                _ => {
+                    state.indexes.insert(name, fresh);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -819,6 +895,78 @@ mod tests {
                 storage_key(&s("p1"), Some(&s("b"))),
                 storage_key(&s("p1"), Some(&s("c"))),
             ]
+        );
+    }
+
+    #[test]
+    fn sync_indexes_creates_table_with_indexes_when_absent() {
+        let mut reg = SchemaRegistry::new();
+        let defs = vec![SecondaryIndex::Global(GlobalSecondaryIndex {
+            name: "by-email".into(),
+            key_attribute: "email".into(),
+            sort_attribute: None,
+            projection: IndexProjection::All,
+        })];
+        reg.sync_indexes("users", TableSchema::simple("id"), &defs)
+            .unwrap();
+        assert!(reg.has_table("users"));
+        // The index exists; a write then indexes through it.
+        let key = storage_key(&s("u1"), None);
+        reg.note_put(
+            "users",
+            &key,
+            &item(&[("id", s("u1")), ("email", s("a@x"))]),
+        )
+        .unwrap();
+        assert_eq!(
+            reg.index_query_keys("users", "by-email", &s("a@x"), None)
+                .unwrap(),
+            vec![key]
+        );
+    }
+
+    #[test]
+    fn sync_indexes_preserves_entries_on_unchanged_shape_and_drops_removed() {
+        let mut reg = SchemaRegistry::new();
+        let email = SecondaryIndex::Global(GlobalSecondaryIndex {
+            name: "by-email".into(),
+            key_attribute: "email".into(),
+            sort_attribute: None,
+            projection: IndexProjection::All,
+        });
+        let org = SecondaryIndex::Global(GlobalSecondaryIndex {
+            name: "by-org".into(),
+            key_attribute: "org".into(),
+            sort_attribute: None,
+            projection: IndexProjection::All,
+        });
+        reg.create_table_with_indexes(
+            "users",
+            TableSchema::simple("id"),
+            vec![email.clone(), org.clone()],
+        )
+        .unwrap();
+        let key = storage_key(&s("u1"), None);
+        reg.note_put(
+            "users",
+            &key,
+            &item(&[("id", s("u1")), ("email", s("a@x")), ("org", s("acme"))]),
+        )
+        .unwrap();
+
+        // Re-sync with `by-org` dropped and `by-email` unchanged.
+        reg.sync_indexes("users", TableSchema::simple("id"), &[email])
+            .unwrap();
+        // `by-email`'s entry survives (shape unchanged, entries preserved).
+        assert_eq!(
+            reg.index_query_keys("users", "by-email", &s("a@x"), None)
+                .unwrap(),
+            vec![key]
+        );
+        // `by-org` is gone.
+        assert_eq!(
+            reg.index_query_keys("users", "by-org", &s("acme"), None),
+            Err(RegistryError::NoSuchIndex("by-org".into()))
         );
     }
 
