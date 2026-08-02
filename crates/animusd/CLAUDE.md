@@ -108,6 +108,18 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   through the cluster's set of registered control handles (held in
   `ClusterEdgeState`, threaded via `ClientCtx::edge` — see below). A
   never-`CreateTable`d table falls back to the legacy `pk`/`sk` convention.
+  **`CreateTable`'s GSI/LSI *definitions* are also replicated now** (ADR 0013):
+  after the schema commits, `create_table` proposes one
+  `MetaCommand::CreateTableIndex` per declared index (built via
+  `animus_dynamo::schema::index_to_control`, passing the base partition key) and
+  waits for each to replicate. The local registry is then reconciled to the
+  replicated set via `mirror_catalog_schema` → `SchemaRegistry::sync_indexes`
+  (called on the read/write paths too), so a freshly restarted node — or a follower
+  that never saw the `CreateTable` — rebuilds its index machinery from
+  `Metadata::table_indexes`, not process-local memory. Only the index *entry data*
+  (the `escape(hash)||…||base_key` index) stays in-memory, rebuilt from observed
+  `note_put`/`note_delete` writes (proven in `tests/dynamo_schema.rs`'s
+  `create_table_index_replicates_to_second_node` / `…_survives_node_restart`).
   **Base-table `Query`/`Scan` now use the data plane's native quorum range scan**
   (`DataClient::scan`) over a contiguous data-plane key range (a partition prefix
   for `Query`, the whole-table prefix for `Scan`), decoding each live pair and
