@@ -25,20 +25,25 @@ pub struct Column {
     pub ty: CqlType,
 }
 
-/// A table's schema: ordered columns plus which one is the partition key.
+/// A table's schema: ordered columns plus which one is the partition key and,
+/// optionally, an ordered list of clustering columns.
 ///
-/// This subset supports a **single partition-key column** and any number of
-/// non-key (regular) columns. Clustering columns and composite partition keys
-/// are future work; a `CREATE TABLE` that asks for them is rejected by the
-/// parser, not silently truncated.
+/// This subset supports a **single partition-key column** plus any number of
+/// **clustering columns** (a compound primary key `PRIMARY KEY (pk, c1, c2)`)
+/// and any number of non-key (regular) columns. Composite (multi-column)
+/// partition keys are still future work; a `CREATE TABLE` that asks for one is
+/// rejected by the parser, not silently truncated.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TableSchema {
     /// The table name.
     pub name: String,
-    /// All columns in declaration order (the partition key included).
+    /// All columns in declaration order (the partition + clustering keys included).
     pub columns: Vec<Column>,
     /// The index into [`TableSchema::columns`] of the partition-key column.
     pub partition_key: usize,
+    /// The indices (into [`TableSchema::columns`]) of the clustering columns, in
+    /// clustering order. Empty for a partition-key-only table.
+    pub clustering_keys: Vec<usize>,
 }
 
 impl TableSchema {
@@ -46,6 +51,21 @@ impl TableSchema {
     #[must_use]
     pub fn pk_column(&self) -> &Column {
         &self.columns[self.partition_key]
+    }
+
+    /// The clustering columns, in clustering order.
+    #[must_use]
+    pub fn clustering_columns(&self) -> Vec<&Column> {
+        self.clustering_keys
+            .iter()
+            .map(|i| &self.columns[*i])
+            .collect()
+    }
+
+    /// Whether `index` is part of the primary key (partition or clustering).
+    #[must_use]
+    pub fn is_primary_key(&self, index: usize) -> bool {
+        index == self.partition_key || self.clustering_keys.contains(&index)
     }
 
     /// Look up a column by name (case-insensitive), returning its index.
@@ -204,6 +224,7 @@ mod tests {
                 },
             ],
             partition_key: 0,
+            clustering_keys: vec![],
         }
     }
 

@@ -29,9 +29,14 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   listener per node). A hand-rolled framed server does the `STARTUP → READY` /
   `OPTIONS → SUPPORTED` handshake and runs `QUERY`/`PREPARE`/`EXECUTE` via the
   pure `animus_cql` crate (a typed `CREATE KEYSPACE`/`USE`/`CREATE TABLE` schema
-  catalog + typed `INSERT`/`SELECT` + prepared statements), routing through the
-  **same `ClientCtx`** as the other edges. The catalog + prepared-statement store
-  are **process-global edge state** (see below).
+  catalog incl. **clustering/compound primary keys**, typed
+  `INSERT`/`SELECT`/`UPDATE`/`DELETE` + prepared statements), routing through the
+  **same `ClientCtx`** as the other edges and **honoring the requested
+  consistency level** (it overrides the routing view's R/W per request). A
+  *partition* is one data-plane value, so `INSERT`/`UPDATE`/`DELETE` are
+  read-modify-write of that value under the coord lock, and a `DELETE` that
+  empties the partition issues a data-plane delete/tombstone. The catalog +
+  prepared-statement store are **process-global edge state** (see below).
 
 ## What's non-obvious
 
@@ -143,7 +148,10 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
 `tests/dynamo_wire.rs` (PutItem → GetItem → DeleteItem over the real DynamoDB
 JSON/HTTP wire), `tests/cql_wire.rs` (STARTUP → CREATE KEYSPACE/USE/CREATE
 TABLE → PREPARE INSERT → EXECUTE with typed bound values → typed SELECT, columns
-round-tripping, over the real CQL binary wire), `tests/durable_restart.rs` (a key written
+round-tripping, over the real CQL binary wire), `tests/cql_clustering.rs`
+(compound primary key: INSERT rows out of clustering order → clustering-ordered
+SELECT → single-row SELECT → UPDATE → single-row + whole-partition DELETE, at
+QUORUM consistency), `tests/durable_restart.rs` (a key written
 through the client API survives a node stop + restart on the **same dir +
 addresses** with the LSM backend, and is lost with the `--ephemeral` memory
 backend), and `tests/self_heal.rs` (**live self-healing**: a 4-node cluster
