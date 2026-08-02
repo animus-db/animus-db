@@ -25,3 +25,4 @@ custos-sim.workspace = true
 custos-control.workspace = true
 custos-placement.workspace = true
 async-trait.workspace = true
+tokio.workspace = true

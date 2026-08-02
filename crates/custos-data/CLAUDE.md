@@ -89,3 +89,21 @@ whose storage `merge`/`merge_tombstone` errors replies `ok: false` so the quorum
 write/delete fails rather than falsely succeeding (`ack_durability.rs`, with a
 failing-engine test double). `digest.rs` has inline unit tests for the digest
 itself.
+
+`concurrent_multithread.rs` is a **real multi-threaded** liveness regression
+(`#[tokio::test(flavor = "multi_thread", worker_threads = 4)]` over `ProdEnv`,
+timeout-guarded): the deterministic single-threaded `SimEnv` proves logic/order
+but **not** real-thread liveness, so a `std::sync::Mutex` guard stranded across
+an `.await`, or the serve loop / anti-entropy loop / a coordinator wedging on a
+lock or waker handoff under contention, would pass the sim and only deadlock
+here. It stands up a 3-replica tablet (each running `serve_replica` +
+`serve_anti_entropy` on a tight interval over its own `MemoryEngine`) and drives
+several concurrent `DataClient`s hammering the same keys with interleaved
+write/read/delete, then probes that a read quorum still answers. **Audit
+result:** the data plane holds **no** lock across an await — the epoch `Mutex` is
+taken and released inside the synchronous `fenced()` helper *before* any storage/
+network await, and the compiler's `Send` bound on `spawn_task` makes the
+cross-await `MutexGuard` pattern a **build error**, not merely a test failure. So
+the regression is clean; the passing test is the liveness *confidence*, not a bug
+fix. **Lesson** (mirrors `custos-storage/tests/lsm_concurrent.rs`): concurrency
+primitives need a `ProdEnv` multi-thread test; the sim proves order, not races.
