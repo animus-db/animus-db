@@ -82,7 +82,7 @@ use animus_env::NodeId;
 
 use crate::message::{AccordMsg, Out};
 use crate::persist::{PersistedState, WalRecord};
-use crate::timestamp::{LogicalClock, Timestamp};
+use crate::timestamp::{Ballot, LogicalClock, Timestamp};
 
 /// A transaction identifier: its original proposed timestamp `t0`, which is
 /// globally unique (minted by exactly one coordinator). Doubles as the txn id.
@@ -161,6 +161,18 @@ struct ReplicaTxn {
     /// `write_keys.is_empty()`; kept explicit so it rides the wire/WAL and a
     /// read-modify-write (non-empty `write_keys`) is never treated as read-only.
     read_only: bool,
+    /// The highest **recovery ballot** this replica has promised for the txn (ADR
+    /// 0011, duelling recoverers). A `Recover`/`Accept` carrying a *lower* ballot
+    /// is rejected (the sender was superseded by a higher recoverer); a `Recover`
+    /// reports this so the superseded recoverer can retry higher. The original
+    /// coordinator runs at [`Ballot::ZERO`], so promising any recovery ballot
+    /// (`round >= 1`) also fences the original coordinator's late `Accept`.
+    promised: Ballot,
+    /// The ballot under which `execute_at`/`deps` were last **accepted** (via
+    /// `Accept`), or [`Ballot::ZERO`] if only PreAccepted. Reported in `RecoverOk`
+    /// so a recoverer adopts the `(execute_at, deps)` of the highest accepted
+    /// ballot — the most recent proposal any replica committed to.
+    accepted_ballot: Ballot,
 }
 
 /// Coordinator-side progress for a transaction this node owns.
@@ -196,6 +208,11 @@ struct Coordinating {
     /// otherwise fire-and-forget, so a retry tick re-sends it to peers absent
     /// here until every peer has it.
     commit_acks: BTreeSet<NodeId>,
+    /// The **ballot** this coordinator's `Accept` round runs under (ADR 0011):
+    /// [`Ballot::ZERO`] for the original coordinator, the adopted recovery ballot
+    /// for a recovery coordinator. A replica rejects an `Accept` below its
+    /// promised ballot, so a superseded recoverer's `Accept` is fenced.
+    ballot: Ballot,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -209,7 +226,12 @@ enum CoordPhase {
 /// transaction this node is recovering.
 #[derive(Clone, Debug)]
 struct Recovering {
-    /// What each responder recorded for the transaction being recovered.
+    /// The recovery ballot this round runs under (ADR 0011). Carried so the retry
+    /// tick re-sends `Recover` at the same ballot, and so a `RecoverOk`/`Nack` for
+    /// a *different* (superseded) ballot is ignored.
+    ballot: Ballot,
+    /// What each responder recorded for the transaction being recovered (only
+    /// replies that **promised** `ballot`).
     replies: BTreeMap<NodeId, RecoverReply>,
 }
 
@@ -220,10 +242,22 @@ struct RecoverFacts {
     phase: Phase,
     execute_at: Timestamp,
     deps: BTreeSet<TxnId>,
+    /// The ballot under which this replica last accepted `(execute_at, deps)`.
+    accepted_ballot: Ballot,
     keys: BTreeSet<Key>,
     write_keys: BTreeSet<Key>,
     write_values: BTreeMap<Key, Vec<u8>>,
     read_only: bool,
+}
+
+/// Outcome of a replica handling a ballot-bearing `Recover`/`Accept`: it either
+/// **promised** (and reports its facts) or **rejected** because it had already
+/// promised a strictly higher ballot.
+enum BallotReply {
+    /// The ballot was promised; act on the request.
+    Promised(RecoverFacts),
+    /// Rejected: the replica had promised this strictly-higher ballot.
+    Nack(Ballot),
 }
 
 /// One replica's recorded state for a transaction under recovery, as reported in
@@ -233,6 +267,11 @@ struct RecoverReply {
     phase: Phase,
     execute_at: Timestamp,
     deps: BTreeSet<TxnId>,
+    /// The ballot under which this replica last accepted `(execute_at, deps)`,
+    /// or [`Ballot::ZERO`] if only PreAccepted. The recoverer re-proposes the
+    /// `(execute_at, deps)` carried by the reply with the **highest** accepted
+    /// ballot (the most recent prior proposal) so duelling recoverers converge.
+    accepted_ballot: Ballot,
     keys: BTreeSet<Key>,
     /// The write subset the replica recorded. Recovery derives read-only-ness
     /// from the *union* of these across the quorum (a transaction is read-only
@@ -391,6 +430,11 @@ impl AccordCore {
                     deps: p.deps,
                     phase,
                     read_only: p.read_only,
+                    // Restore the promised/accepted ballots so a restarted replica
+                    // keeps its recovery promise and reports the right accepted
+                    // ballot — it must not let a superseded recoverer win.
+                    promised: p.promised,
+                    accepted_ballot: p.accepted_ballot,
                 },
             );
         }
@@ -568,6 +612,7 @@ impl AccordCore {
                                     p,
                                     AccordMsg::Accept {
                                         txn,
+                                        ballot: c.ballot,
                                         execute_at: *execute_at,
                                         deps: deps.clone(),
                                     },
@@ -600,7 +645,13 @@ impl AccordCore {
         for (&txn, rec) in &self.recovering {
             for &p in &self.peers {
                 if !rec.replies.contains_key(&p) {
-                    outs.push((p, AccordMsg::Recover { txn }));
+                    outs.push((
+                        p,
+                        AccordMsg::Recover {
+                            txn,
+                            ballot: rec.ballot,
+                        },
+                    ));
                 }
             }
         }
@@ -715,6 +766,9 @@ impl AccordCore {
                 write_values: write_values.clone(),
                 chosen: None,
                 commit_acks: BTreeSet::new(),
+                // The original coordinator runs at the zero ballot; only a
+                // recovery coordinator adopts a higher one.
+                ballot: Ballot::ZERO,
             },
         );
 
@@ -765,16 +819,20 @@ impl AccordCore {
             }
             AccordMsg::Accept {
                 txn,
+                ballot,
                 execute_at,
                 deps,
-            } => {
-                self.replica_accept(txn, execute_at, &deps);
-                vec![(from, AccordMsg::AcceptOk { txn })]
-            }
+            } => match self.replica_accept(txn, ballot, execute_at, &deps) {
+                Ok(()) => vec![(from, AccordMsg::AcceptOk { txn })],
+                // A higher recoverer fenced this `Accept`; tell the sender the
+                // ballot that superseded it so it stops (or retries higher).
+                Err(promised) => vec![(from, AccordMsg::AcceptNack { txn, promised })],
+            },
             AccordMsg::AcceptOk { txn } => {
                 self.coordinator_record_accept(from, txn);
                 self.try_advance_coordinator(txn).unwrap_or_default()
             }
+            AccordMsg::AcceptNack { txn, promised } => self.handle_superseded(txn, promised),
             AccordMsg::Commit {
                 txn,
                 execute_at,
@@ -795,33 +853,47 @@ impl AccordCore {
                 }
                 Vec::new()
             }
-            AccordMsg::Recover { txn } => {
-                let f = self.replica_recover(txn);
-                vec![(
+            AccordMsg::Recover { txn, ballot } => match self.replica_recover(txn, ballot) {
+                BallotReply::Promised(f) => vec![(
                     from,
                     AccordMsg::RecoverOk {
                         txn,
+                        ballot,
                         phase: f.phase,
                         execute_at: f.execute_at,
                         deps: f.deps,
+                        accepted_ballot: f.accepted_ballot,
                         keys: f.keys,
                         write_keys: f.write_keys,
                         write_values: f.write_values,
                         read_only: f.read_only,
                     },
-                )]
-            }
+                )],
+                // A higher recoverer already holds this txn; report its ballot so
+                // the superseded recoverer can retry strictly above it.
+                BallotReply::Nack(promised) => {
+                    vec![(from, AccordMsg::RecoverNack { txn, promised })]
+                }
+            },
             AccordMsg::RecoverOk {
                 txn,
+                ballot,
                 phase,
                 execute_at,
                 deps,
+                accepted_ballot,
                 keys,
                 write_keys,
                 write_values,
                 read_only,
             } => {
                 let _ = read_only; // read-only-ness is derived from write_keys
+                // Ignore a `RecoverOk` for a *different* ballot than the round we
+                // are currently driving (a stale reply to a superseded attempt).
+                let current = self.recovering.get(&txn).map(|r| r.ballot);
+                if current != Some(ballot) {
+                    return Vec::new();
+                }
                 self.recovery_record(
                     from,
                     txn,
@@ -829,6 +901,7 @@ impl AccordCore {
                         phase,
                         execute_at,
                         deps,
+                        accepted_ballot,
                         keys,
                         write_keys,
                         write_values,
@@ -836,7 +909,55 @@ impl AccordCore {
                 );
                 self.try_advance_recovery(txn).unwrap_or_default()
             }
+            AccordMsg::RecoverNack { txn, promised } => self.handle_superseded(txn, promised),
         }
+    }
+
+    /// React to being **superseded** by a higher ballot (a `RecoverNack` to our
+    /// `Recover`, or an `AcceptNack` to our recovery `Accept`): a strictly-higher
+    /// recovery coordinator exists for `txn`.
+    ///
+    /// We abandon our current attempt. We then **yield to the higher recoverer**
+    /// rather than immediately bumping our ballot and re-broadcasting — that naïve
+    /// "retry higher now" rule produces the classic duelling-proposers **livelock**
+    /// (two recoverers ratchet each other's ballot forever within one instant,
+    /// emitting an unbounded message storm). Instead we use a deterministic
+    /// tiebreak: only the recoverer with the **higher node id** keeps going; a
+    /// lower-id recoverer stands down and lets the winner finish. The winner's
+    /// `Commit` then reaches us (directly or via its retry tick), and a *plain*
+    /// replica simply records it — no further recovery from us. Standing down is
+    /// safe: the surviving higher recoverer either commits (we adopt it) or itself
+    /// gets recovered later by an even higher ballot. We only act if *this* node is
+    /// the one driving recovery; a plain replica that merely promised a higher
+    /// ballot does nothing. A committed txn is never perturbed.
+    fn handle_superseded(&mut self, txn: TxnId, promised: Ballot) -> Vec<Out> {
+        // If we already committed this txn as a coordinator, the decision stands.
+        if self
+            .coordinating
+            .get(&txn)
+            .is_some_and(|c| c.phase == CoordPhase::Done)
+        {
+            return Vec::new();
+        }
+        let was_recovering = self.recovering.contains_key(&txn);
+        let was_recovery_coord = self.coordinating.get(&txn).is_some_and(|c| c.recovery);
+        if !was_recovering && !was_recovery_coord {
+            // Not our recovery to retry (e.g. a Nack arriving after we already
+            // moved on, or for a txn we never recovered).
+            return Vec::new();
+        }
+        // Drop the superseded attempt either way — it cannot make progress.
+        self.recovering.remove(&txn);
+        self.coordinating.remove(&txn);
+        // Deterministic yield: only the higher-id recoverer retries (above the
+        // ballot that fenced it). The winner of the id tiebreak drives to a commit;
+        // lower-id recoverers stand down and will adopt that commit. This makes the
+        // duel converge in a bounded number of rounds instead of livelocking.
+        if self.id <= promised.node {
+            return Vec::new();
+        }
+        let next = Ballot::next_above(promised.max(self.highest_promised(txn)), self.id);
+        self.start_recovery_at(txn, next)
     }
 
     // ---- replica handlers ------------------------------------------------
@@ -890,6 +1011,8 @@ impl AccordCore {
             deps: BTreeSet::new(),
             phase: Phase::PreAccepted,
             read_only,
+            promised: Ballot::ZERO,
+            accepted_ballot: Ballot::ZERO,
         });
         entry.keys.extend(keys.iter().copied());
         entry.write_keys.extend(write_keys.iter().copied());
@@ -928,9 +1051,27 @@ impl AccordCore {
         (reply_ts, reply_deps)
     }
 
-    /// Replica side of `Accept`: adopt the coordinator's chosen execution
-    /// timestamp and dependency set (it is `>=` ours by construction).
-    fn replica_accept(&mut self, txn: TxnId, execute_at: Timestamp, deps: &BTreeSet<TxnId>) {
+    /// Replica side of `Accept`: **promise** `ballot` and adopt the coordinator's
+    /// chosen execution timestamp and dependency set (it is `>=` ours by
+    /// construction). Returns `Ok(())` on a promise, or `Err(promised)` if the
+    /// replica has already promised a strictly higher ballot — a higher recovery
+    /// coordinator superseded this `Accept`, so it must be rejected
+    /// ([`AccordMsg::AcceptNack`]) and *not* adopted (ADR 0011, duelling
+    /// recoverers). Accepting under `ballot` also records it as the
+    /// `accepted_ballot`, which `RecoverOk` reports so a later recoverer adopts the
+    /// highest-ballot proposal.
+    fn replica_accept(
+        &mut self,
+        txn: TxnId,
+        ballot: Ballot,
+        execute_at: Timestamp,
+        deps: &BTreeSet<TxnId>,
+    ) -> Result<(), Ballot> {
+        if let Some(t) = self.txns.get(&txn) {
+            if ballot < t.promised {
+                return Err(t.promised);
+            }
+        }
         self.clock.witness(execute_at);
         let entry = self.txns.entry(txn).or_insert_with(|| ReplicaTxn {
             keys: BTreeSet::new(),
@@ -940,19 +1081,28 @@ impl AccordCore {
             deps: BTreeSet::new(),
             phase: Phase::Accepted,
             read_only: false,
+            promised: Ballot::ZERO,
+            accepted_ballot: Ballot::ZERO,
         });
         entry.execute_at = entry.execute_at.max(execute_at);
         entry.deps.extend(deps.iter().copied());
         if entry.phase == Phase::PreAccepted {
             entry.phase = Phase::Accepted;
         }
+        // Accepting under `ballot` promises it (a later Accept/Recover below it is
+        // fenced) and records it as the ballot the proposal was accepted under.
+        entry.promised = entry.promised.max(ballot);
+        entry.accepted_ballot = entry.accepted_ballot.max(ballot);
         let record_ts = entry.execute_at;
         let record_deps = entry.deps.clone();
+        let record_ballot = entry.accepted_ballot;
         self.pending.push(WalRecord::Accepted {
             txn,
             execute_at: record_ts,
             deps: record_deps,
+            accepted_ballot: record_ballot,
         });
+        Ok(())
     }
 
     /// Replica side of `Commit`: record the final execution timestamp and deps —
@@ -976,6 +1126,8 @@ impl AccordCore {
             deps: BTreeSet::new(),
             phase: Phase::Committed,
             read_only,
+            promised: Ballot::ZERO,
+            accepted_ballot: Ballot::ZERO,
         });
         // The Commit carries the authoritative write set (so a replica that
         // missed PreAccept still executes the right write); the write keys are
@@ -1217,8 +1369,16 @@ impl AccordCore {
             for (_, d) in replies.values() {
                 deps.extend(d.iter().copied());
             }
+            // The ballot this Accept round runs under: `Ballot::ZERO` for the
+            // original coordinator, the adopted recovery ballot otherwise.
+            let ballot = self
+                .coordinating
+                .get(&txn)
+                .map_or(Ballot::ZERO, |c| c.ballot);
             // Move to Accept phase: reset replies, apply to ourselves, broadcast.
-            self.replica_accept(txn, execute_at, &deps);
+            // Our own Accept cannot be superseded by us (our ballot is our floor),
+            // so this never self-Nacks.
+            let _ = self.replica_accept(txn, ballot, execute_at, &deps);
             let mut self_replies = BTreeMap::new();
             self_replies.insert(self.id, (execute_at, deps.clone()));
             if let Some(c) = self.coordinating.get_mut(&txn) {
@@ -1236,6 +1396,7 @@ impl AccordCore {
                         p,
                         AccordMsg::Accept {
                             txn,
+                            ballot,
                             execute_at,
                             deps: deps.clone(),
                         },
@@ -1343,7 +1504,30 @@ impl AccordCore {
             // We are (or were) the original coordinator; nothing to recover.
             return Vec::new();
         }
-        let f = self.replica_recover(txn);
+        // Mint a recovery ballot strictly above the highest this node has already
+        // promised for `txn` (ADR 0011, duelling recoverers): a first recovery is
+        // `round = 1` (above the original coordinator's [`Ballot::ZERO`]); a
+        // *re*-recovery after being superseded (a `RecoverNack`/`AcceptNack` raised
+        // our promised floor) bumps strictly past whatever ballot fenced us, so the
+        // retry can actually win. Two recoverers thus never share a ballot.
+        let ballot = Ballot::next_above(self.highest_promised(txn), self.id);
+        self.start_recovery_at(txn, ballot)
+    }
+
+    /// Begin (or re-begin, at a higher ballot) recovery of `txn` under `ballot`.
+    /// Promises the ballot locally, seeds the recovery reply set with this node's
+    /// own facts, and broadcasts `Recover` at `ballot`. Shared by [`Self::recover`]
+    /// (initial) and the supersede-and-retry path (a `RecoverNack`/`AcceptNack`).
+    fn start_recovery_at(&mut self, txn: TxnId, ballot: Ballot) -> Vec<Out> {
+        // We are the recoverer, so we promise our own ballot and report our facts.
+        // Our ballot is `>= ` our promise floor by construction, so this never
+        // self-Nacks.
+        let f = match self.replica_recover(txn, ballot) {
+            BallotReply::Promised(f) => f,
+            // Unreachable in practice (our ballot supersedes our own promise), but
+            // stay total: if we somehow promised higher, do not recover lower.
+            BallotReply::Nack(_) => return Vec::new(),
+        };
         let mut replies = BTreeMap::new();
         replies.insert(
             self.id,
@@ -1351,17 +1535,18 @@ impl AccordCore {
                 phase: f.phase,
                 execute_at: f.execute_at,
                 deps: f.deps,
+                accepted_ballot: f.accepted_ballot,
                 keys: f.keys,
                 write_keys: f.write_keys,
                 write_values: f.write_values,
             },
         );
-        self.recovering.insert(txn, Recovering { replies });
+        self.recovering.insert(txn, Recovering { ballot, replies });
 
         let outs: Vec<Out> = self
             .peers
             .iter()
-            .map(|&p| (p, AccordMsg::Recover { txn }))
+            .map(|&p| (p, AccordMsg::Recover { txn, ballot }))
             .collect();
         let mut all = outs;
         if let Some(extra) = self.try_advance_recovery(txn) {
@@ -1370,52 +1555,82 @@ impl AccordCore {
         all
     }
 
-    /// Replica side of `Recover`: report this replica's recorded state for `txn`.
+    /// The highest recovery ballot this node has promised for `txn` across its
+    /// roles: the replica promise, plus any in-flight recovery this node is
+    /// driving. [`Ballot::ZERO`] if it has never promised one. A re-recovery mints
+    /// strictly above this so it supersedes every ballot it has itself seen.
+    fn highest_promised(&self, txn: TxnId) -> Ballot {
+        let replica = self.txns.get(&txn).map_or(Ballot::ZERO, |t| t.promised);
+        let recovering = self.recovering.get(&txn).map_or(Ballot::ZERO, |r| r.ballot);
+        replica.max(recovering)
+    }
+
+    /// Replica side of `Recover`: **promise** `ballot` (rejecting it if the replica
+    /// has already promised a strictly higher one) and, on a promise, report this
+    /// replica's recorded state for `txn`. Promising fences any later
+    /// `Recover`/`Accept` below `ballot` — including the original coordinator's
+    /// [`Ballot::ZERO`] `Accept` — so a superseded coordinator cannot still commit
+    /// behind the winning recoverer's back (ADR 0011, duelling recoverers).
+    ///
     /// If the replica had never heard of `txn`, it witnesses it now as a fresh
-    /// `PreAccepted` entry (keys unknown, `execute_at == t0`, no deps) so it
-    /// joins the recovery — and records it durably like a `PreAccept` would.
-    fn replica_recover(&mut self, txn: TxnId) -> RecoverFacts {
+    /// `PreAccepted` entry (keys unknown, `execute_at == t0`, no deps) so it joins
+    /// the recovery — and records it durably like a `PreAccept` would. The promise
+    /// itself is durable (a `WalRecord::Promised`) so a restarted replica does not
+    /// renege and let a superseded recoverer win.
+    fn replica_recover(&mut self, txn: TxnId, ballot: Ballot) -> BallotReply {
         self.clock.witness(txn);
+        // Reject a stale ballot: report the strictly-higher ballot we promised so
+        // the superseded recoverer can retry above it (or give up).
         if let Some(t) = self.txns.get(&txn) {
-            return RecoverFacts {
-                phase: t.phase,
-                execute_at: t.execute_at,
-                deps: t.deps.clone(),
-                keys: t.keys.clone(),
-                write_keys: t.write_keys.clone(),
-                write_values: t.write_values.clone(),
-                read_only: t.read_only,
-            };
+            if ballot < t.promised {
+                return BallotReply::Nack(t.promised);
+            }
         }
-        // Never seen: witness as PreAccepted at t0 with no keys/deps known.
-        let entry = ReplicaTxn {
-            keys: BTreeSet::new(),
-            write_keys: BTreeSet::new(),
-            write_values: BTreeMap::new(),
-            execute_at: txn,
-            deps: BTreeSet::new(),
-            phase: Phase::PreAccepted,
-            read_only: false,
-        };
-        self.txns.insert(txn, entry.clone());
-        self.pending.push(WalRecord::PreAccepted {
-            txn,
-            keys: BTreeSet::new(),
-            write_keys: BTreeSet::new(),
-            write_values: BTreeMap::new(),
-            execute_at: txn,
-            deps: BTreeSet::new(),
-            read_only: false,
+        // Never seen: witness as PreAccepted at t0 with no keys/deps known, and
+        // record it durably like a `PreAccept` would.
+        let mut newly_witnessed = false;
+        self.txns.entry(txn).or_insert_with(|| {
+            newly_witnessed = true;
+            ReplicaTxn {
+                keys: BTreeSet::new(),
+                write_keys: BTreeSet::new(),
+                write_values: BTreeMap::new(),
+                execute_at: txn,
+                deps: BTreeSet::new(),
+                phase: Phase::PreAccepted,
+                read_only: false,
+                promised: Ballot::ZERO,
+                accepted_ballot: Ballot::ZERO,
+            }
         });
-        RecoverFacts {
+        if newly_witnessed {
+            self.pending.push(WalRecord::PreAccepted {
+                txn,
+                keys: BTreeSet::new(),
+                write_keys: BTreeSet::new(),
+                write_values: BTreeMap::new(),
+                execute_at: txn,
+                deps: BTreeSet::new(),
+                read_only: false,
+            });
+        }
+        let entry = self.txns.get_mut(&txn).expect("just inserted");
+        // Promise the ballot durably (it is `>=` our floor). A duplicate `Recover`
+        // at the same ballot re-promises harmlessly (idempotent under `max`).
+        if ballot > entry.promised {
+            entry.promised = ballot;
+            self.pending.push(WalRecord::Promised { txn, ballot });
+        }
+        BallotReply::Promised(RecoverFacts {
             phase: entry.phase,
             execute_at: entry.execute_at,
-            deps: entry.deps,
-            keys: entry.keys,
-            write_keys: entry.write_keys,
-            write_values: entry.write_values,
+            deps: entry.deps.clone(),
+            accepted_ballot: entry.accepted_ballot,
+            keys: entry.keys.clone(),
+            write_keys: entry.write_keys.clone(),
+            write_values: entry.write_values.clone(),
             read_only: entry.read_only,
-        }
+        })
     }
 
     fn recovery_record(&mut self, from: NodeId, txn: TxnId, reply: RecoverReply) {
@@ -1426,19 +1641,27 @@ impl AccordCore {
     }
 
     /// Drive recovery for `txn` forward once a simple-majority recovery quorum of
-    /// `RecoverOk`s is in. Applies the recovery rules:
+    /// `RecoverOk`s is in (all having **promised** this round's ballot). Applies
+    /// the recovery rules (ADR 0011):
     ///
     /// - If any replica reports `Committed`/`Applied`, **adopt that decision
     ///   verbatim** and broadcast `Commit` — a committed value is already
     ///   immutable, so the recovered decision must match it.
-    /// - Otherwise force the **slow path**: build a normal coordinator round from
-    ///   the recovery replies (`recovery = true`), feed it into
-    ///   `advance_from_pre_accept`, which picks the highest reported `execute_at`,
-    ///   unions the deps, and runs `Accept` → `Commit`. Never the fast path.
+    /// - Else if any reply was **`Accept`ed** under some ballot (`accepted_ballot >
+    ///   Ballot::ZERO`), adopt the `(execute_at, deps)` of the reply with the
+    ///   **highest `accepted_ballot`** — the most recent prior proposal, which may
+    ///   already have been committed by that recoverer, so a later recoverer must
+    ///   re-propose it rather than invent a fresh timestamp. Two recoverers thus
+    ///   converge on the same value.
+    /// - Otherwise (only `PreAccepted` replies) force the **slow path** from the
+    ///   recovery replies (`recovery = true`): pick the highest reported
+    ///   `execute_at`, union the deps, and run `Accept` → `Commit`. Never the fast
+    ///   path. The `Accept` carries this round's recovery ballot, so a replica
+    ///   that promised a higher one fences it (an `AcceptNack` makes us retry).
     fn try_advance_recovery(&mut self, txn: TxnId) -> Option<Vec<Out>> {
-        let replies = {
+        let (ballot, replies) = {
             let rec = self.recovering.get(&txn)?;
-            rec.replies.clone()
+            (rec.ballot, rec.replies.clone())
         };
         if replies.len() < self.slow_quorum() {
             return None;
@@ -1479,6 +1702,7 @@ impl AccordCore {
             let deps = r.deps.clone();
             return Some(self.commit_recovered(
                 txn,
+                ballot,
                 execute_at,
                 deps,
                 union_write_keys,
@@ -1487,7 +1711,35 @@ impl AccordCore {
             ));
         }
 
-        // (2) Re-drive the transaction as a fresh, recovery-flagged coordinator.
+        // (2) Adopt the highest-ballot **accepted** proposal verbatim, if any. A
+        // prior recoverer that ran an `Accept` under `accepted_ballot` may have
+        // gone on to `Commit` that exact `(execute_at, deps)` on a quorum we don't
+        // intersect; re-proposing it (rather than a fresh max-ts/union-deps value)
+        // is the only choice that cannot contradict such a commit. With ballots
+        // totally ordered, every recoverer that reaches step (2) adopts the *same*
+        // highest-ballot proposal, so duelling recoverers converge. We re-run it
+        // through an `Accept` round under *our* (strictly higher) ballot so the
+        // decision is freshly re-accepted on a quorum that has promised us.
+        if let Some(r) = replies
+            .values()
+            .filter(|r| r.accepted_ballot > Ballot::ZERO)
+            .max_by_key(|r| r.accepted_ballot)
+        {
+            let execute_at = r.execute_at;
+            let deps = r.deps.clone();
+            return Some(self.redrive_accept(
+                txn,
+                ballot,
+                execute_at,
+                deps,
+                union_keys,
+                union_write_keys,
+                union_write_values,
+                read_only,
+            ));
+        }
+
+        // (3) Re-drive the transaction as a fresh, recovery-flagged coordinator.
         // The original `PreAccept` may not have reached every replica (that is
         // why recovery was needed), so the keys could be missing on some — and a
         // replica with no keys would execute an empty write. Re-broadcast
@@ -1518,6 +1770,9 @@ impl AccordCore {
                 write_values: union_write_values.clone(),
                 chosen: None,
                 commit_acks: BTreeSet::new(),
+                // This recovery round's ballot rides the slow-path `Accept` so a
+                // replica that promised a higher recoverer fences us.
+                ballot,
             },
         );
         let mut outs: Vec<Out> = self
@@ -1542,12 +1797,84 @@ impl AccordCore {
         Some(outs)
     }
 
+    /// Re-propose a recovered `(execute_at, deps)` — adopted verbatim from the
+    /// highest-ballot prior `Accept` (step (2) of [`Self::try_advance_recovery`]) —
+    /// through a fresh `Accept` round under this recovery's `ballot`. Installs a
+    /// recovery `Coordinating` already in the `Accept` phase with the adopted value
+    /// `chosen`, applies the `Accept` to ourselves, and broadcasts it; a replica
+    /// that promised a higher ballot `AcceptNack`s us (→ retry higher).
+    #[allow(clippy::too_many_arguments)]
+    fn redrive_accept(
+        &mut self,
+        txn: TxnId,
+        ballot: Ballot,
+        execute_at: Timestamp,
+        deps: BTreeSet<TxnId>,
+        union_keys: BTreeSet<Key>,
+        union_write_keys: BTreeSet<Key>,
+        union_write_values: BTreeMap<Key, Vec<u8>>,
+        read_only: bool,
+    ) -> Vec<Out> {
+        // Make sure our own replica knows the keys (so it can execute the write)
+        // before adopting the proposal: a recoverer may have missed the original
+        // PreAccept. This folds the union keys/values into our replica entry.
+        let _ = self.replica_pre_accept(
+            txn,
+            &union_keys,
+            &union_write_keys,
+            &union_write_values,
+            read_only,
+        );
+        // Apply the adopted Accept to ourselves under our ballot (cannot self-Nack).
+        let _ = self.replica_accept(txn, ballot, execute_at, &deps);
+        let mut self_replies: BTreeMap<NodeId, (Timestamp, BTreeSet<TxnId>)> = BTreeMap::new();
+        self_replies.insert(self.id, (execute_at, deps.clone()));
+        self.coordinating.insert(
+            txn,
+            Coordinating {
+                t0: txn,
+                replies: self_replies,
+                phase: CoordPhase::Accept,
+                recovery: true,
+                read_only,
+                keys: BTreeSet::new(),
+                write_keys: union_write_keys.clone(),
+                write_values: union_write_values.clone(),
+                chosen: Some((execute_at, deps.clone())),
+                commit_acks: BTreeSet::new(),
+                ballot,
+            },
+        );
+        let mut outs: Vec<Out> = self
+            .peers
+            .iter()
+            .map(|&p| {
+                (
+                    p,
+                    AccordMsg::Accept {
+                        txn,
+                        ballot,
+                        execute_at,
+                        deps: deps.clone(),
+                    },
+                )
+            })
+            .collect();
+        // A single-replica cluster reaches the Accept quorum immediately.
+        if let Some(extra) = self.advance_from_accept(txn) {
+            outs.extend(extra);
+        }
+        outs
+    }
+
     /// Commit a transaction the recovery quorum found already committed: install
     /// it as a normal coordinator-driven `Coordinating` so `commit` records the
     /// decision and broadcasts, then commit with the adopted `(execute_at, deps)`.
+    #[allow(clippy::too_many_arguments)]
     fn commit_recovered(
         &mut self,
         txn: TxnId,
+        ballot: Ballot,
         execute_at: Timestamp,
         deps: BTreeSet<TxnId>,
         write_keys: BTreeSet<Key>,
@@ -1567,6 +1894,7 @@ impl AccordCore {
                 write_values,
                 chosen: None,
                 commit_acks: BTreeSet::new(),
+                ballot,
             },
         );
         // A recovered commit is, by Accord's recovery rules, equivalent to a

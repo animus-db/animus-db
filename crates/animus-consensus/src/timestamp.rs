@@ -37,6 +37,50 @@ impl Timestamp {
     }
 }
 
+/// A **recovery ballot** (ADR 0011): the proposal number a recovery coordinator
+/// runs under, so duelling recoverers converge deterministically. Ordered first
+/// by `round`, then by the recovering `node` (tiebreak), so the order is total
+/// and two recoverers can never share a ballot.
+///
+/// The implicit [`Ballot::ZERO`] is the *original* coordinator's ballot — every
+/// recoverer mints `round >= 1`, so a recoverer always outranks the original
+/// coordinator's steady-state `Accept`. A replica promises the highest ballot it
+/// has seen for a transaction and rejects any `Recover`/`Accept` carrying a lower
+/// one, reporting the promised ballot so a superseded recoverer can retry higher.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
+)]
+pub struct Ballot {
+    /// The proposal round. The original coordinator runs at round 0; recoverers
+    /// mint strictly-increasing rounds (`>= 1`), bumping past any promised ballot.
+    pub round: u64,
+    /// The recovering node id, a tiebreaker so two recoverers at the same round
+    /// hold distinct, totally-ordered ballots.
+    pub node: NodeId,
+}
+
+impl Ballot {
+    /// The original coordinator's implicit ballot (lower than every recoverer's).
+    pub const ZERO: Ballot = Ballot { round: 0, node: 0 };
+
+    /// A recovery ballot for `node` at `round`.
+    #[must_use]
+    pub fn new(round: u64, node: NodeId) -> Ballot {
+        Ballot { round, node }
+    }
+
+    /// This node's recovery ballot one round above `highest` — the ballot a
+    /// recoverer adopts to supersede every ballot promised so far (`highest` is
+    /// the maximum promised ballot it has learned of, [`Ballot::ZERO`] if none).
+    #[must_use]
+    pub fn next_above(highest: Ballot, node: NodeId) -> Ballot {
+        Ballot {
+            round: highest.round + 1,
+            node,
+        }
+    }
+}
+
 /// A per-node logical clock. Minting always returns a value strictly greater
 /// than any timestamp this clock has seen, keeping minted timestamps monotonic
 /// even after observing a peer's higher timestamp (`witness`).
@@ -78,6 +122,26 @@ mod tests {
         assert!(Timestamp::new(1, 9) < Timestamp::new(2, 0));
         assert!(Timestamp::new(2, 0) < Timestamp::new(2, 1));
         assert_eq!(Timestamp::new(3, 4), Timestamp::new(3, 4));
+    }
+
+    #[test]
+    fn ballot_order_is_round_then_node() {
+        assert!(Ballot::ZERO < Ballot::new(1, 0));
+        assert!(Ballot::new(1, 9) < Ballot::new(2, 0));
+        assert!(Ballot::new(2, 0) < Ballot::new(2, 1));
+        assert_eq!(Ballot::new(3, 4), Ballot::new(3, 4));
+    }
+
+    #[test]
+    fn ballot_next_above_supersedes() {
+        // A recoverer always outranks the highest promised ballot, regardless of
+        // which node held it.
+        let highest = Ballot::new(5, 2);
+        let mine = Ballot::next_above(highest, 0);
+        assert!(mine > highest, "next_above must supersede the highest seen");
+        // From the zero (original-coordinator) ballot, the first recoverer is
+        // round 1.
+        assert_eq!(Ballot::next_above(Ballot::ZERO, 1), Ballot::new(1, 1));
     }
 
     #[test]
