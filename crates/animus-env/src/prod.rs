@@ -16,7 +16,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, mpsc};
 
-use crate::{Clock, Disk, Env, Envelope, Nanos, Network, NodeId, Rng, Spawner};
+use crate::{Clock, Disk, Env, Envelope, MetricsHandle, Nanos, Network, NodeId, Rng, Spawner};
 
 /// A production environment for a single node.
 ///
@@ -41,6 +41,12 @@ struct Inner {
     /// aborts them all so the node can be torn down and its listener port
     /// freed.
     tasks: StdMutex<Vec<tokio::task::AbortHandle>>,
+    /// This node's recording metrics sink (ADR 0015). A real recording handle
+    /// (unlike the no-op an arbitrary `Env` returns by default), so the assembled
+    /// production node accumulates control-plane counters; integration exposes a
+    /// snapshot of it (see `metrics_text`). Cheap to clone; shared across this
+    /// env's clones so every role-handle records into one sink.
+    metrics: MetricsHandle,
 }
 
 impl ProdEnv {
@@ -94,6 +100,7 @@ impl ProdEnv {
                 data_dir,
                 inbox: Mutex::new(rx),
                 tasks: StdMutex::new(vec![accept.abort_handle()]),
+                metrics: MetricsHandle::recording(),
             }),
         };
         Ok((env, local_addr))
@@ -118,6 +125,15 @@ impl ProdEnv {
 
     fn path(&self, file: &str) -> PathBuf {
         self.inner.data_dir.join(file)
+    }
+
+    /// A point-in-time text export of this env's recorded metrics (ADR 0015):
+    /// one `name value` line per counter plus the leadership gauge, in stable
+    /// order. This is what an integration-level `/metrics` endpoint serves; the
+    /// `Env` seam itself does no HTTP. A pure read of the atomic sink.
+    #[must_use]
+    pub fn metrics_text(&self) -> String {
+        self.inner.metrics.snapshot().to_text()
     }
 }
 
@@ -315,6 +331,10 @@ impl Spawner for ProdEnv {
 impl Env for ProdEnv {
     fn node_id(&self) -> NodeId {
         self.inner.node_id
+    }
+
+    fn metrics(&self) -> MetricsHandle {
+        self.inner.metrics.clone()
     }
 }
 

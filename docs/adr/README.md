@@ -21,3 +21,4 @@ relevant ADR (or supersede it) in the same PR as the code change.
 | [0012](0012-failure-detection.md) | Heartbeat-based failure detection in the control plane | Accepted |
 | [0013](0013-replicated-schemas.md) | Replicated table-schema catalog in the control plane | Accepted |
 | [0014](0014-elle-accord-scenario-corpus.md) | Elle consistency testing against Accord + a frozen scenario corpus | Accepted |
+| [0015](0015-observability.md) | Deterministic-safe observability seam (metrics) | Accepted |

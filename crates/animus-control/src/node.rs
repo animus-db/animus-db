@@ -5,13 +5,13 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use animus_env::{Env, EnvExt, NodeId};
+use animus_env::{Env, EnvExt, Metric, MetricsHandle, NodeId};
 use futures::future::{Either, select};
 
 use crate::detector::FailureDetector;
 use crate::meta::{Member, MetaCommand, Metadata, NodeStatus};
 use crate::persist::PersistedState;
-use crate::raft::{ProposeResult, RaftCore, RaftMsg, Role};
+use crate::raft::{Out, ProposeResult, RaftCore, RaftMsg, Role};
 
 /// File name of the per-node Raft write-ahead log on the `Env` disk.
 const WAL: &str = "raft.wal";
@@ -63,12 +63,34 @@ pub struct RaftNode<E: Env> {
     /// heartbeats; the `detect_loop` reads it and, when leader, proposes liveness
     /// transitions. Shared so both run against one view.
     detector: Arc<Mutex<FailureDetector>>,
+    /// Observability sink (ADR 0015). The driver loops record control-plane
+    /// counters into it (elections, append-entries, snapshot installs, failure
+    /// detector transitions) and keep the leadership gauge current. Cheap to
+    /// clone; a clone is moved into each spawned loop.
+    metrics: MetricsHandle,
 }
 
 impl<E: Env> RaftNode<E> {
     /// Start a node: build its [`RaftCore`] and spawn the driver loop on `env`.
     /// `all_nodes` is the full control-group membership (including this node).
+    ///
+    /// Metrics (ADR 0015) are recorded into the env's own sink (`env.metrics()`)
+    /// — for `ProdEnv` a real recording handle, so an assembled production node
+    /// accumulates control-plane counters with no extra wiring. To observe the
+    /// counters under deterministic simulation (where `SimEnv::metrics()` is the
+    /// no-op default), construct with [`start_with_metrics`](Self::start_with_metrics)
+    /// and pass a recording [`MetricsHandle`] the test keeps.
     pub fn start(env: E, all_nodes: Vec<NodeId>) -> Self {
+        let metrics = env.metrics();
+        Self::start_with_metrics(env, all_nodes, metrics)
+    }
+
+    /// Like [`start`](Self::start), but records into the supplied `metrics`
+    /// handle instead of `env.metrics()`. Additive (existing callers use
+    /// `start`); the sim observability test threads in a recording handle here so
+    /// it can read counters back without editing `animus-sim`, and integration
+    /// can pass `env.metrics()` (or any chosen sink) explicitly.
+    pub fn start_with_metrics(env: E, all_nodes: Vec<NodeId>, metrics: MetricsHandle) -> Self {
         let core = Arc::new(Mutex::new(RaftCore::new(
             env.node_id(),
             &all_nodes,
@@ -80,12 +102,14 @@ impl<E: Env> RaftNode<E> {
             env: env.clone(),
             core: Arc::clone(&core),
             detector: Arc::clone(&detector),
+            metrics: metrics.clone(),
         };
         env.spawn_task(drive(
             env.clone(),
             Arc::clone(&core),
             Arc::clone(&detector),
             all_nodes,
+            metrics.clone(),
         ));
         // The placement reconciler runs alongside the driver; it only ever
         // *proposes* on the core (no I/O of its own), and proposals are honored
@@ -94,8 +118,15 @@ impl<E: Env> RaftNode<E> {
         // The failure detector evaluates member liveness on a timer and, when
         // leader, proposes `UpsertMember` transitions (ADR 0012). Like the
         // reconciler it only *proposes*, so it is safe to run on every node.
-        env.spawn_task(detect_loop(env.clone(), core, detector));
+        env.spawn_task(detect_loop(env.clone(), core, detector, metrics));
         node
+    }
+
+    /// This node's metrics handle (ADR 0015). A snapshot of it
+    /// (`node.metrics().snapshot()`) is the control-plane observability surface.
+    #[must_use]
+    pub fn metrics(&self) -> &MetricsHandle {
+        &self.metrics
     }
 
     /// Propose a metadata command. See [`ProposeResult`].
@@ -201,6 +232,7 @@ async fn drive<E: Env>(
     core: Arc<Mutex<RaftCore>>,
     detector: Arc<Mutex<FailureDetector>>,
     all_nodes: Vec<NodeId>,
+    metrics: MetricsHandle,
 ) {
     // Recover from the WAL before serving anything.
     let bytes = env.read(WAL).await.unwrap_or_default();
@@ -219,6 +251,15 @@ async fn drive<E: Env>(
         let deadline = core.lock().expect("raft core poisoned").next_deadline();
         let wait = Duration::from_nanos(deadline.0.saturating_sub(now.0));
 
+        // Snapshot role/term before stepping the core so we can attribute any
+        // state transition the step causes to a metric (ADR 0015). All inputs to
+        // the metric decisions are `Env`-supplied or core-derived, so recording
+        // stays a deterministic function of the run.
+        let (before_role, before_term) = {
+            let c = core.lock().expect("raft core poisoned");
+            (c.role(), c.term())
+        };
+
         let outs = match select(env.recv(), env.sleep(wait)).await {
             Either::Left((envelope, _)) => {
                 let entropy = env.next_u64();
@@ -234,12 +275,21 @@ async fn drive<E: Env>(
                             .observe(node, env.now());
                         Vec::new()
                     }
-                    Ok(msg) => core.lock().expect("raft core poisoned").handle(
-                        envelope.from,
-                        msg,
-                        env.now(),
-                        entropy,
-                    ),
+                    Ok(msg) => {
+                        // A follower rejecting an `AppendEntries` surfaces as an
+                        // outbound `AppendEntriesResp { success: false }`, so the
+                        // "rejected" counter is recorded from the core's output
+                        // (`record_outbound`) where the rejection is produced —
+                        // not from the inbound message.
+                        let outs = core.lock().expect("raft core poisoned").handle(
+                            envelope.from,
+                            msg,
+                            env.now(),
+                            entropy,
+                        );
+                        record_outbound(&metrics, &outs);
+                        outs
+                    }
                     Err(err) => {
                         tracing::warn!(?err, "undecodable raft message dropped");
                         Vec::new()
@@ -248,11 +298,22 @@ async fn drive<E: Env>(
             }
             Either::Right(((), _)) => {
                 let entropy = env.next_u64();
-                core.lock()
+                let outs = core
+                    .lock()
                     .expect("raft core poisoned")
-                    .tick(env.now(), entropy)
+                    .tick(env.now(), entropy);
+                record_outbound(&metrics, &outs);
+                outs
             }
         };
+
+        // Attribute role/term transitions to election metrics + keep the
+        // leadership gauge current.
+        let (after_role, after_term) = {
+            let c = core.lock().expect("raft core poisoned");
+            (c.role(), c.term())
+        };
+        record_transition(&metrics, before_role, before_term, after_role, after_term);
 
         // Durability before action: persist (and fsync) the core's state changes
         // before sending the responses that depend on them (a granted vote, an
@@ -263,6 +324,51 @@ async fn drive<E: Env>(
             let bytes = serde_json::to_vec(&msg).expect("raft message serializes");
             env.send(to, bytes).await;
         }
+    }
+}
+
+/// Record the metrics implied by the messages the core just emitted (ADR 0015):
+/// every outbound `AppendEntries` is one replication/heartbeat *sent*; an
+/// outbound `AppendEntriesResp { success: false }` is a *rejection* this follower
+/// produced; an outbound `InstallSnapshotResp` whose `last_index > 0` marks a
+/// completed snapshot *install* on this follower. A pure read of `outs`.
+fn record_outbound(metrics: &MetricsHandle, outs: &[Out]) {
+    for (_, msg) in outs {
+        match msg {
+            RaftMsg::AppendEntries { .. } => metrics.incr(Metric::AppendEntriesSent),
+            RaftMsg::AppendEntriesResp { success: false, .. } => {
+                metrics.incr(Metric::AppendEntriesRejected);
+            }
+            RaftMsg::InstallSnapshotResp { last_index, .. } if *last_index > 0 => {
+                metrics.incr(Metric::SnapshotInstalls);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Record election metrics + the leadership gauge from a role/term transition
+/// (ADR 0015). Becoming a candidate at a higher term is an election *started*;
+/// transitioning into `Leader` is an election *won*. The gauge tracks whether
+/// this node currently believes it is leader. Pure in its inputs.
+fn record_transition(
+    metrics: &MetricsHandle,
+    before_role: Role,
+    before_term: u64,
+    after_role: Role,
+    after_term: u64,
+) {
+    // A new election: this node bumped its term and is now a candidate.
+    if after_role == Role::Candidate && after_term > before_term {
+        metrics.incr(Metric::ElectionsStarted);
+    }
+    // Won: entered the leader role from a non-leader role.
+    if after_role == Role::Leader && before_role != Role::Leader {
+        metrics.incr(Metric::ElectionsWon);
+    }
+    // Keep the gauge level current on any leadership change.
+    if (after_role == Role::Leader) != (before_role == Role::Leader) {
+        metrics.set_leader(after_role == Role::Leader);
     }
 }
 
@@ -324,6 +430,7 @@ async fn detect_loop<E: Env>(
     env: E,
     core: Arc<Mutex<RaftCore>>,
     detector: Arc<Mutex<FailureDetector>>,
+    metrics: MetricsHandle,
 ) {
     // The (term, instant) at which this node last observed itself leader. `None`
     // while not leader; re-armed on each fresh leadership/term so the cold-start
@@ -358,6 +465,21 @@ async fn detect_loop<E: Env>(
             )
         };
         for command in proposals {
+            // Attribute each liveness transition to its failure-detector metric
+            // (ADR 0012/0015) before proposing it. `liveness_transitions` only
+            // emits an `UpsertMember` when a tracked member's status actually
+            // changes, so a `Down` here is a fresh Active->Down verdict and an
+            // `Active` is a Down->Active recovery — the exact up/down edges we
+            // want to count. Recording from the proposed command keeps the metric
+            // a deterministic function of the (pure) verdict, and counts the edge
+            // once on the leader that drives it.
+            if let MetaCommand::UpsertMember { status, .. } = &command {
+                match status {
+                    NodeStatus::Down => metrics.incr(Metric::FailureDetectorDown),
+                    NodeStatus::Active => metrics.incr(Metric::FailureDetectorUp),
+                    _ => {}
+                }
+            }
             core.lock().expect("raft core poisoned").propose(command);
         }
     }

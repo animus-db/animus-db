@@ -20,6 +20,9 @@ use std::time::Duration;
 pub mod prod;
 pub use prod::ProdEnv;
 
+pub mod metrics;
+pub use metrics::{Metric, MetricSink, MetricSnapshot, MetricsHandle};
+
 /// Stable identifier for a node in the cluster.
 pub type NodeId = u64;
 
@@ -183,6 +186,19 @@ pub trait Spawner: Send + Sync {
 pub trait Env: Clock + Rng + Network + Disk + Spawner + Clone + Send + Sync + 'static {
     /// The identity of the node this handle acts as.
     fn node_id(&self) -> NodeId;
+
+    /// The metrics sink for this env (ADR 0015). Additive with a default: an env
+    /// that does not record metrics returns the shared no-op handle
+    /// ([`MetricsHandle::noop`]), so every existing `E: Env` implementation —
+    /// `SimEnv` included — keeps compiling and behaving identically without
+    /// change. `ProdEnv` overrides this to return its own recording handle; a
+    /// component that wants to record into a test-readable sink under simulation
+    /// is handed a recording [`MetricsHandle`] directly rather than relying on
+    /// this default. Returning a handle (not `Option`) means recording sites need
+    /// no `if let Some(..)` guard.
+    fn metrics(&self) -> MetricsHandle {
+        MetricsHandle::noop()
+    }
 }
 
 /// Convenience extension for spawning an `async` block without writing

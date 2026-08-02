@@ -15,7 +15,11 @@ the production implementation; the deterministic implementation lives in
   into the **`Env` supertrait** (scoped to one `NodeId`), plus `Nanos`,
   `Envelope`, `BoxFuture`, and the `EnvExt::spawn_task` convenience.
 - `prod.rs` — `ProdEnv`: real monotonic clock, `OsRng`, `tokio::spawn`,
-  length-prefixed TCP, `tokio::fs` + `fsync`.
+  length-prefixed TCP, `tokio::fs` + `fsync`. Owns a real recording metrics sink
+  and exposes `metrics_text()` (ADR 0015).
+- `metrics.rs` — the **observability seam** (ADR 0015): a closed `Metric` enum,
+  a fixed-array lock-free `MetricSink`, the cheap-to-clone `MetricsHandle`, and
+  the `MetricSnapshot` text export.
 
 ## What's non-obvious
 
@@ -45,10 +49,21 @@ the production implementation; the deterministic implementation lives in
   spawned `AbortHandle`s). `animusd`'s `Node::shutdown` calls it on each of the
   node's three role envs to tear the node down and free its listener ports for a
   restart in the same runtime. Production-edge only; determinism is unaffected.
+- **Metrics are additive and determinism-safe (ADR 0015).** `Env::metrics()` has
+  a **default** returning a shared no-op `MetricsHandle`, so the supertrait is
+  unchanged and every `E: Env` impl (`SimEnv` included) compiles untouched.
+  Recording is a relaxed atomic add — no wall clock (a timestamped metric takes
+  `Clock::now`), no I/O, no `HashMap` (a snapshot uses `BTreeMap`). `ProdEnv`
+  overrides `metrics()` with a recording sink; a sim test that wants to *read*
+  counters threads a recording handle into the component (e.g.
+  `RaftNode::start_with_metrics`) rather than relying on the no-op default — so
+  no change to `animus-sim` is needed to observe metrics.
 
 ## Tests
 
 The seam is exercised end-to-end through `animus-sim` (`cargo test -p
 animus-sim`). One `ProdEnv` unit test (`prod::tests`, real temp dir) asserts a
 nested `"sub/dir/file"` `append`+`sync`+`read` round-trips — i.e. the disk
-creates parent directories. `cargo test -p animus-env`.
+creates parent directories. `cargo test -p animus-env`. `metrics.rs::tests`
+cover incr/snapshot round-trips, that clones share one sink, and that the text
+export is stable + ordered.
