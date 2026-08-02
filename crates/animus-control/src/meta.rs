@@ -14,6 +14,8 @@ use animus_placement::{Candidate, PlacementPolicy, replan};
 use animus_tablet::{Epoch, KeyRange, Tablet, TabletId};
 use serde::{Deserialize, Serialize};
 
+use crate::schema::{SchemaCatalog, TableName, TableSchema};
+
 /// Lifecycle status of a cluster member.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NodeStatus {
@@ -49,6 +51,14 @@ pub struct Metadata {
     /// placed. Keyed by tablet id, so the in-node reconciler can recompute the
     /// desired replica set deterministically on every replica.
     pub policies: BTreeMap<TabletId, PlacementPolicy>,
+    /// The replicated table-schema catalog (ADR 0013): which tables exist and
+    /// their key structure + typed columns, shared by both wire adapters. Mutated
+    /// only through [`MetaCommand::CreateTableSchema`] /
+    /// [`MetaCommand::DropTableSchema`], so it is Raft-replicated and recovered
+    /// from the WAL/snapshot like every other metadata field. The adapters
+    /// consume it (a deliberate follow-up) so a `CreateTable`/`CREATE TABLE`
+    /// survives restart and is agreed cluster-wide.
+    pub schemas: SchemaCatalog,
 }
 
 /// A mutation of [`Metadata`], replicated through Raft and applied in log order.
@@ -98,6 +108,19 @@ pub enum MetaCommand {
         tablet: TabletId,
         policy: Option<PlacementPolicy>,
     },
+    /// Register a table's schema in the replicated catalog (ADR 0013). Rejected
+    /// if a schema for `table` already exists (a `CreateTable` does not silently
+    /// overwrite) or if the schema is malformed
+    /// ([`TableSchema::validate`](crate::schema::TableSchema::validate) fails).
+    /// Otherwise records it; because it is a replicated `MetaCommand`, the schema
+    /// survives restart and is consistent on every replica.
+    CreateTableSchema {
+        table: TableName,
+        schema: TableSchema,
+    },
+    /// Remove a table's schema from the catalog (ADR 0013). Idempotent: a no-op
+    /// if no schema is registered for `table`.
+    DropTableSchema { table: TableName },
 }
 
 /// The deterministic result of applying a [`MetaCommand`].
@@ -266,6 +289,41 @@ impl Metadata {
                 }
                 ApplyOutcome::Applied
             }
+            MetaCommand::CreateTableSchema { table, schema } => {
+                if self.schemas.contains(table) {
+                    return ApplyOutcome::Rejected("table schema already exists");
+                }
+                if schema.validate().is_err() {
+                    return ApplyOutcome::Rejected("malformed table schema");
+                }
+                self.schemas.insert(table.clone(), schema.clone());
+                ApplyOutcome::Applied
+            }
+            MetaCommand::DropTableSchema { table } => {
+                if self.schemas.remove(table) {
+                    ApplyOutcome::Applied
+                } else {
+                    ApplyOutcome::NoOp
+                }
+            }
         }
+    }
+
+    /// The schema registered for `table`, if any (ADR 0013). A read accessor for
+    /// the wire adapters that consume the replicated catalog.
+    #[must_use]
+    pub fn table_schema(&self, table: &str) -> Option<&TableSchema> {
+        self.schemas.get(table)
+    }
+
+    /// Whether a schema is registered for `table`.
+    #[must_use]
+    pub fn has_table_schema(&self, table: &str) -> bool {
+        self.schemas.contains(table)
+    }
+
+    /// All `(name, schema)` pairs in the catalog, in ascending name order.
+    pub fn table_schemas(&self) -> impl Iterator<Item = (&TableName, &TableSchema)> {
+        self.schemas.iter()
     }
 }

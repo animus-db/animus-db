@@ -10,11 +10,18 @@ epoch compare-and-swap transactions.
 
 ## Entry points
 
-- `meta.rs` — `Metadata` (members + tablet map) and `MetaCommand`
-  (`UpsertMember`, `CreateTablet`, `CasTabletReplicas`, `SplitTablet`,
-  `MergeTablets`, `SetTabletPolicy`). `Metadata::apply` is the deterministic
+- `meta.rs` — `Metadata` (members + tablet map + placement policies + the
+  table-schema catalog) and `MetaCommand` (`UpsertMember`, `CreateTablet`,
+  `CasTabletReplicas`, `SplitTablet`, `MergeTablets`, `SetTabletPolicy`,
+  `CreateTableSchema`, `DropTableSchema`). `Metadata::apply` is the deterministic
   state machine; `Metadata::reconcile` is the pure placement decision (see
-  below).
+  below); `table_schema`/`has_table_schema`/`table_schemas` read the catalog.
+- `schema.rs` — the replicated **table-schema catalog** (ADR 0013): `TableSchema`
+  (partition key + ordered clustering keys + typed `ColumnDef`s),
+  `ColumnType` (the union of CQL scalars + DynamoDB key families), and
+  `SchemaCatalog` (a `BTreeMap<TableName, TableSchema>` held in `Metadata`).
+  `TableSchema::validate` is the pure malformed-schema check the state machine
+  applies. All plain data — no I/O, no clock, no RNG.
 - `raft.rs` — `RaftCore`: a **synchronous, I/O-free** Raft state machine. Time
   and randomness are parameters (`now`, `entropy`); it returns outbound messages
   and emits WAL records.
@@ -84,7 +91,23 @@ epoch compare-and-swap transactions.
   on each data node and relies on `RaftNode::start`'s `detect_loop`/`reconcile_loop`
   to mark a dead data member `Down` and re-place its tablet — proven live over
   `ProdEnv`/TCP in `animusd/tests/self_heal.rs` (the sim coverage here remains the
-  deterministic source of truth).
+  deterministic source of truth). A freshly elected leader's detector is **cold**
+  (per-node volatile state), so `detect_loop` applies a **post-election grace
+  period** (`LEADER_GRACE`, one `DETECT_TIMEOUT`): it tracks `leader_since`
+  (`Env` time, re-armed per term) and passes `allow_down = false` to
+  `liveness_transitions` until the grace elapses, so a new leader can't falsely
+  mark live members `Down` before heartbeats repopulate the detector. Recoveries
+  are never suppressed. The gate is `Env`-time only (deterministic).
+- **Replicated table-schema catalog (ADR 0013).** `Metadata.schemas`
+  (`SchemaCatalog`, in `schema.rs`) holds each table's `TableSchema`, mutated only
+  by `MetaCommand::{CreateTableSchema, DropTableSchema}` applied in
+  `Metadata::apply`: create is rejected on a duplicate or a malformed schema
+  (`TableSchema::validate`), drop is idempotent. Because it lives in `Metadata`,
+  it is Raft-replicated and recovered from the WAL/snapshot like all metadata (no
+  `persist.rs`/`InstallSnapshot` change — the snapshot is a full `Metadata`
+  image). Read it via `Metadata::table_schema`/`has_table_schema`/`table_schemas`.
+  The shape (partition key + clustering keys + typed columns) is the union of both
+  wire adapters' needs; **the adapters consuming it is a deliberate follow-up.**
 - Commit advances only for **current-term** entries via majority `matchIndex`
   (the Raft safety rule). Don't relax this.
 - Snapshot transfer is **chunked** (see above). Deferred: cross-leader resumption
@@ -106,4 +129,9 @@ policy (`placement_auto_reconcile.rs` — no test-side `replan`/CAS), and
 **heartbeat-based failure detection** end to end (`failure_detection.rs`, ADR
 0012 — a member crashes, the leader auto-commits `Down`, placement reconciles off
 it, then the member restarts and returns to `Active`; plus detector unit tests in
-`detector.rs`). Use `run_for`, never `run()` (perpetual heartbeats).
+`detector.rs` and grace-gate unit tests for `liveness_transitions` in `node.rs`),
+and the **replicated table-schema catalog** end to end (`schema_catalog.rs`, ADR
+0013 — propose schemas, reject a duplicate + a malformed one on the state machine,
+kill the leader, assert the schemas survive + survivors agree, drop one and see it
+replicate; plus `schema.rs` unit tests). Use `run_for`, never `run()` (perpetual
+heartbeats).

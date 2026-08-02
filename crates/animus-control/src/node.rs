@@ -40,6 +40,19 @@ pub const DETECT_TIMEOUT: Duration = Duration::from_millis(500);
 /// `UpsertMember{status}` transitions (ADR 0012).
 const DETECT_INTERVAL: Duration = Duration::from_millis(100);
 
+/// Grace period after this node first observes itself leader for a term, during
+/// which it will **not** mark any member `Down` (ADR 0012). The
+/// [`FailureDetector`] is per-node volatile state (only the transitions it drives
+/// are replicated), so a freshly elected leader starts with a **cold** detector:
+/// it has observed no heartbeats yet and would otherwise immediately judge every
+/// live member silent and propose a flurry of false `Down`s before the first
+/// heartbeat round arrives. Suppressing `Down` proposals for at least one
+/// [`DETECT_TIMEOUT`] worth of time after gaining leadership gives heartbeats
+/// time to repopulate the detector first. Recoveries (`Down`→`Active`) are *not*
+/// suppressed — a heartbeat is positive evidence, with no false-positive risk —
+/// and the gate is purely `Env`-time based, so it stays deterministic.
+const LEADER_GRACE: Duration = DETECT_TIMEOUT;
+
 /// A running control-plane node. Cheap to clone; clones share one [`RaftCore`]
 /// and one [`FailureDetector`].
 #[derive(Clone)]
@@ -301,21 +314,48 @@ async fn reconcile_loop<E: Env>(env: E, core: Arc<Mutex<RaftCore>>) {
 /// judged, so a freshly-registered member is never marked `Down` before its
 /// first heartbeat. `Joining`/`Leaving` members are left alone — their lifecycle
 /// is operator-driven, not liveness-driven.
+///
+/// A freshly elected leader observes a **grace period** ([`LEADER_GRACE`]) before
+/// proposing any `Down`: its detector is cold (per-node volatile state), so it
+/// must hear a heartbeat round before it can fairly judge silence. The loop
+/// records when it first sees itself leader for a term (`leader_since`) and
+/// re-arms the grace whenever leadership or term changes.
 async fn detect_loop<E: Env>(
     env: E,
     core: Arc<Mutex<RaftCore>>,
     detector: Arc<Mutex<FailureDetector>>,
 ) {
+    // The (term, instant) at which this node last observed itself leader. `None`
+    // while not leader; re-armed on each fresh leadership/term so the cold-start
+    // grace applies after every election, not just the first.
+    let mut leader_since: Option<(u64, animus_env::Nanos)> = None;
     loop {
         env.sleep(DETECT_INTERVAL).await;
+        let now = env.now();
         let proposals = {
             let core = core.lock().expect("raft core poisoned");
             if !core.is_leader() {
+                leader_since = None;
                 continue;
             }
+            let term = core.term();
+            // Re-arm the grace on a fresh leadership or a new term.
+            let since = match leader_since {
+                Some((t, since)) if t == term => since,
+                _ => {
+                    leader_since = Some((term, now));
+                    now
+                }
+            };
+            // Suppress `Down` until the cold detector has had a heartbeat round.
+            let allow_down = now.duration_since(since) >= LEADER_GRACE;
             let meta = core.metadata();
-            let now = env.now();
-            liveness_transitions(&meta, &detector.lock().expect("detector poisoned"), now)
+            liveness_transitions(
+                &meta,
+                &detector.lock().expect("detector poisoned"),
+                now,
+                allow_down,
+            )
         };
         for command in proposals {
             core.lock().expect("raft core poisoned").propose(command);
@@ -327,11 +367,17 @@ async fn detect_loop<E: Env>(
 /// member's replicated status in line with the detector's liveness verdict at
 /// `now`. Returns commands only for members whose status would actually change
 /// (idempotent), in ascending node-id order (the detector iterates a `BTreeMap`),
-/// so the result is a deterministic function of `(meta, detector, now)`.
+/// so the result is a deterministic function of `(meta, detector, now, allow_down)`.
+///
+/// `allow_down` gates the `Active`→`Down` transition: a freshly elected leader
+/// passes `false` during its post-election grace period so a cold detector does
+/// not falsely mark live members `Down` before their heartbeats arrive
+/// (ADR 0012). Recoveries (`Down`→`Active`) are always allowed.
 fn liveness_transitions(
     meta: &Metadata,
     detector: &FailureDetector,
     now: animus_env::Nanos,
+    allow_down: bool,
 ) -> Vec<MetaCommand> {
     detector
         .evaluate(now)
@@ -341,10 +387,12 @@ fn liveness_transitions(
             let desired = match (member.status, l.alive) {
                 // A live member believed dead recovers to `Active`.
                 (NodeStatus::Down, true) => NodeStatus::Active,
-                // A silent member believed alive is marked `Down`.
-                (NodeStatus::Active, false) => NodeStatus::Down,
-                // Already consistent, or a status we don't drive
-                // (`Joining`/`Leaving`): nothing to propose.
+                // A silent member believed alive is marked `Down` — unless this
+                // leader is still inside its post-election grace period.
+                (NodeStatus::Active, false) if allow_down => NodeStatus::Down,
+                // Already consistent, a status we don't drive (`Joining`/
+                // `Leaving`), or a `Down` suppressed by the grace period: nothing
+                // to propose.
                 _ => return None,
             };
             Some(transition(l.node, member, desired))
@@ -414,4 +462,75 @@ async fn compact_wal<E: Env>(env: &E, core: &Arc<Mutex<RaftCore>>) {
         bytes.extend(PersistedState::encode_record(record));
     }
     env.replace(WAL, &bytes).await.expect("wal compaction");
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use animus_env::Nanos;
+
+    use super::*;
+    use crate::detector::FailureDetector;
+    use crate::meta::{Member, Metadata};
+
+    fn meta_with(node: NodeId, status: NodeStatus) -> Metadata {
+        let mut m = Metadata::default();
+        m.members.insert(
+            node,
+            Member {
+                labels: BTreeMap::new(),
+                status,
+            },
+        );
+        m
+    }
+
+    fn detector_silent_since(node: NodeId, last_seen: Nanos) -> FailureDetector {
+        let mut d = FailureDetector::new(DETECT_TIMEOUT);
+        d.observe(node, last_seen);
+        d
+    }
+
+    #[test]
+    fn grace_period_suppresses_down_then_allows_it() {
+        // An Active member that has been silent past DETECT_TIMEOUT.
+        let meta = meta_with(7, NodeStatus::Active);
+        let det = detector_silent_since(7, Nanos(0));
+        let now = Nanos(DETECT_TIMEOUT.as_nanos() as u64 + 1);
+
+        // Inside the grace period (allow_down = false): no Down proposed.
+        assert!(liveness_transitions(&meta, &det, now, false).is_empty());
+
+        // Grace elapsed (allow_down = true): the Down transition is proposed.
+        let outs = liveness_transitions(&meta, &det, now, true);
+        assert_eq!(outs.len(), 1);
+        assert!(matches!(
+            &outs[0],
+            MetaCommand::UpsertMember {
+                node: 7,
+                status: NodeStatus::Down,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn recovery_is_allowed_even_during_grace() {
+        // A Down member whose heartbeat just arrived recovers regardless of the
+        // grace gate (positive evidence, no false-positive risk).
+        let meta = meta_with(7, NodeStatus::Down);
+        let det = detector_silent_since(7, Nanos(1_000));
+        let now = Nanos(1_000); // fresh heartbeat → alive
+        let outs = liveness_transitions(&meta, &det, now, false);
+        assert_eq!(outs.len(), 1);
+        assert!(matches!(
+            &outs[0],
+            MetaCommand::UpsertMember {
+                node: 7,
+                status: NodeStatus::Active,
+                ..
+            }
+        ));
+    }
 }

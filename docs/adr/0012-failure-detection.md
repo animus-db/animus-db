@@ -94,7 +94,19 @@ ordinary `UpsertMember` log entries committed under the current term.
   over real `ProdEnv`/TCP in `animusd/tests/self_heal.rs` (the deterministic sim
   coverage in `animus-control/tests/failure_detection.rs` remains the source of
   truth).
-- **Deferred:** tuning the timeout adaptively (or a φ-accrual detector) under real
-  network jitter; a grace period after a leader change before acting on a cold
-  detector; and heartbeating only the leader (vs. all control nodes) once leader
-  discovery is cheap.
+- **Post-election grace period (added).** Because detector state is per-node
+  volatile, a freshly elected leader starts with a *cold* detector and would, on
+  its first `detect_loop` tick, judge every live member silent and propose a
+  flurry of false `Down`s before the first heartbeat round arrives. The
+  `detect_loop` now records when it first observes itself leader for a term
+  (`leader_since`, in `Env` time, re-armed on each fresh leadership/term) and
+  **suppresses `Down` proposals** until at least one `DETECT_TIMEOUT`
+  (`LEADER_GRACE`) has elapsed since then — long enough for heartbeats to
+  repopulate the detector. Recoveries (`Down`→`Active`) are *not* suppressed (a
+  heartbeat is positive evidence, no false-positive risk). The gate is a pure
+  function of `Env`-supplied time, so it stays deterministic; the decision helper
+  `liveness_transitions` takes an `allow_down` flag and is unit-tested in
+  `node.rs`.
+- **Deferred:** tuning the timeout adaptively (or a full φ-accrual detector) under
+  real network jitter; and heartbeating only the leader (vs. all control nodes)
+  once leader discovery is cheap.

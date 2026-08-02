@@ -14,8 +14,12 @@ plus a **custom on-disk `LsmEngine`** — a real WAL + SSTable +
 compaction LSM doing all I/O through the `Env` disk seam, so it is deterministically
 crash-tested under `SimEnv`), the control-plane Raft (WAL durability + recovery +
 log-truncating snapshots with `InstallSnapshot`, plus **heartbeat-based failure
-detection** that auto-marks members `Down`/`Active` and cascades into placement
-re-reconciliation — ADR 0012),
+detection** that auto-marks members `Down`/`Active` (with a post-election grace
+period so a freshly elected leader's cold detector doesn't falsely mark live
+members `Down`) and cascades into placement re-reconciliation — ADR 0012, and a
+**replicated table-schema catalog** in `Metadata` — `CreateTableSchema`/
+`DropTableSchema`, durable + cluster-wide, ready for the wire adapters to consume
+— ADR 0013),
 the quorum data-plane vertical slice (with read-repair, background
 anti-entropy convergence via segment-digest exchange of only divergent ranges,
 delete/tombstone propagation, and residency-bounded repair), tablet split/merge
@@ -69,10 +73,12 @@ committed transaction's writes can land in the replicated AP data plane
 order; ADR 0011). Skeletons / future work:
 the rest of the CQL surface (clustering/composite keys,
 `UPDATE`/`DELETE`/`BATCH`/`ALTER`/`DROP`, collection/UDT types, paging, auth,
-`LWT`, consistency levels, durable replicated schemas) and the rest of the
+`LWT`, consistency levels) and the rest of the
 DynamoDB surface (projection expressions, `ReturnValues`, document/set types,
-composite/multiple GSIs + local secondary indexes, durable/replicated table
-schemas), and the deferred remainder of Accord
+composite/multiple GSIs + local secondary indexes) — note the control plane now
+holds a **replicated table-schema catalog** (ADR 0013) the adapters can consume
+to replace their per-process in-memory catalogs (that adapter wiring is the
+follow-up) — and the deferred remainder of Accord
 (the full dependency wait-graph, the precise recovery ballot + duelling
 recoverers + a failure detector, WAL snapshotting, data-plane *reads*, and
 sharded transactions across tablets).
@@ -210,7 +216,21 @@ when a member falls silent past a timeout and `{Active}` when it recovers
 (idempotent, no flapping). Because the placement reconciler already reacts to
 `Down`, a detected failure **cascades** into automatic tablet re-placement —
 proven end-to-end (crash → `Down` → reconcile → restart → `Active`) in
-`animus-control/tests/failure_detection.rs`.
+`animus-control/tests/failure_detection.rs`. A freshly elected leader applies a
+**post-election grace period** before it will mark anyone `Down`, since its
+failure detector is per-node volatile and starts cold.
+
+The control plane also owns a **replicated table-schema catalog** (ADR 0013):
+`Metadata.schemas` maps each table to a `TableSchema` (partition key + ordered
+clustering keys + typed columns — a shape that fits both the DynamoDB and CQL
+adapters), mutated only by `MetaCommand::{CreateTableSchema, DropTableSchema}`
+applied deterministically (create rejects duplicates + malformed schemas; drop is
+idempotent). Living in `Metadata`, it is Raft-replicated and recovered from the
+WAL/snapshot like all metadata, so a `CreateTable`/`CREATE TABLE` survives restart
+and is agreed cluster-wide — replacing the adapters' per-process in-memory
+catalogs (the adapter wiring is a follow-up). Proven in
+`animus-control/tests/schema_catalog.rs` (propose → reject duplicate/malformed →
+leader kill → survives + survivors agree → drop replicates).
 
 ### Data plane (`animus-data`)
 
