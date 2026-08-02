@@ -44,39 +44,51 @@
 //! `CreateTable` must target the leader.
 //!
 //! The in-memory `SchemaRegistry` now holds only the **secondary-index
-//! declarations** and the observation-built **written-key index** (below). Those
-//! remain **in-memory and not durable** — rebuilt from observed writes — and are
-//! **per-cluster**: held in the cluster's `ClusterEdgeState` (threaded through
-//! `ClientCtx`), not a process `OnceLock`, so two in-process clusters in one test
-//! do not share a registry. In `--cluster N` dev mode the cluster's nodes share
-//! one registry. Only the *table key schema* moves to the control plane.
+//! declarations** (the GSI/LSI `escape(hash) [|| escape(sort)] || base_key`
+//! index). That remains **in-memory and not durable** — rebuilt from observed
+//! writes — and is **per-cluster**: held in the cluster's `ClusterEdgeState`
+//! (threaded through `ClientCtx`), not a process `OnceLock`, so two in-process
+//! clusters in one test do not share a registry. In `--cluster N` dev mode the
+//! cluster's nodes share one registry. Only the *table key schema* moves to the
+//! control plane.
 //!
 //! ## Query, Scan, and secondary indexes
 //!
-//! The data plane has no quorum range scan (only point read/write/delete), so
-//! `Query` is served by tracking, per table, the storage keys of written items
-//! ([`SchemaRegistry::query_keys`]) and quorum-reading each matching key through
-//! the same coordinator. The partition (`pk = ..`) plus an optional sort-key
-//! condition (`=`, `BETWEEN`, `begins_with`) selects the contiguous key
-//! sub-range; tombstoned/absent keys are skipped. Like the schema map, the key
-//! index is in-memory and observation-built.
+//! A **base-table** `Query` and a `Scan` are served by a **native quorum range
+//! scan** ([`DataClient::scan`]) — no in-memory written-key tracking. The data
+//! plane scans a contiguous data-plane key range across the tablet's replica
+//! quorum (epoch-fenced, ADR 0002; merged per-key by newest version, tombstones
+//! excluded) and returns the live `(key, value)` pairs in key order:
 //!
-//! `Scan` walks that same per-table key index across all partitions
-//! ([`SchemaRegistry::scan_keys`]), quorum-reading each key. It paginates with
-//! `Limit` + `ExclusiveStartKey`/`LastEvaluatedKey` (the cursor is the last
-//! base storage key of a page, surfaced to the client as the key item's
-//! AttributeValue map) and applies an optional `FilterExpression` after the
-//! read. The cursor advances over *tracked* keys, so the in-memory caveat above
-//! applies to `Scan` too.
+//! - `Query` (`pk = ..`) scans the partition's contiguous sub-range
+//!   `[escape(table) || escape(pk), …)` (the escape is prefix-free, ending
+//!   `0x00 0x00`, so a partition's keys are contiguous and sort-ordered), then
+//!   applies an optional sort-key condition (`=`, `BETWEEN`, `begins_with`) on the
+//!   recovered sort bytes.
+//! - `Scan` scans the whole table's range `[escape(table), …)` across every
+//!   partition. It paginates with `Limit` + `ExclusiveStartKey`/`LastEvaluatedKey`
+//!   (the cursor is the last storage key of a truncated page, surfaced to the
+//!   client as that item's key-attribute map) and applies an optional
+//!   `FilterExpression` after the read. The cursor now advances over the
+//!   **live data-plane keys** the scan returns, not a tracked set — so it survives
+//!   a restart or a follower that never saw the write.
+//!
+//! Because the scan reads live storage on a read quorum, a `DeleteItem` (which
+//! stores a *tombstone value*, not a data-plane tombstone) still appears as a
+//! live pair to the scan; the edge drops it when `decode_stored_item` decodes a
+//! tombstone. A table the scan must reject as unknown is checked against the
+//! replicated catalog / legacy registration ([`table_known`]).
 //!
 //! `CreateTable` may declare any number of **global / local secondary indexes**,
 //! each with a `Projection` (`ALL`/`KEYS_ONLY`/`INCLUDE`); the registry maintains
 //! an `escape(hash) [|| escape(sort)] || base_key` index per index on every
 //! `note_put`/`note_delete` (no item copies — the base item stays authoritative),
 //! and a `Query` with an `IndexName` resolves an index value back to its base
-//! storage keys, which are quorum-read the same way. An index query with no
-//! explicit `ProjectionExpression` returns the index's declared projected
-//! attributes (applied at the edge after the base item is read).
+//! storage keys, which are quorum-read the same way (the native scan covers the
+//! base keyspace, not an index's alternate ordering, so an *index* query keeps the
+//! in-memory index). An index query with no explicit `ProjectionExpression`
+//! returns the index's declared projected attributes (applied at the edge after
+//! the base item is read).
 
 use std::time::Duration;
 
@@ -695,10 +707,14 @@ async fn run_transact(ctx: &ClientCtx, actions: &[TransactAction]) -> Result<Str
     Ok(wire::empty_response())
 }
 
-/// Resolve the partition's matching within-table keys from the registry (or, with
-/// an `index`, a secondary index's base keys), then quorum-read each to assemble
-/// the result (the data plane has no range scan). An optional `projection` keeps
-/// only the requested attributes of each returned item.
+/// Serve a `Query`. A **base-table** query (`index` is `None`) is a **native
+/// quorum range scan** ([`DataClient::scan`]) over the partition's contiguous
+/// key sub-range `[escape(table)||escape(pk), …)` — no in-memory key tracking —
+/// applying an optional sort-key condition on the recovered sort bytes. An
+/// **index** query still resolves the index's base storage keys from the
+/// in-memory GSI/LSI index (the native scan covers the base keyspace, not an
+/// index's alternate ordering) and quorum-reads each. An optional `projection`
+/// keeps only the requested attributes of each returned item.
 async fn run_query(
     ctx: &ClientCtx,
     table: &str,
@@ -707,16 +723,85 @@ async fn run_query(
     sort_condition: Option<&SortKeyCondition>,
     projection: Option<&Projection>,
 ) -> Result<String, WireError> {
-    // Mirror a catalog table's schema (so its key/GSI index exists after a
-    // restart or on a follower that has not seen a write). A table absent from
-    // the catalog is left unregistered, so `query_keys` below reports it unknown
-    // (ResourceNotFoundException) — matching DynamoDB.
+    // Mirror a catalog table's schema (so its GSI index exists after a restart or
+    // on a follower that has not seen a write). A table absent from the catalog is
+    // reported unknown below (ResourceNotFoundException) — matching DynamoDB.
     mirror_catalog_schema(ctx, table);
+    match index {
+        Some(index) => {
+            run_index_query(
+                ctx,
+                table,
+                index,
+                partition_value,
+                sort_condition,
+                projection,
+            )
+            .await
+        }
+        None => run_base_query(ctx, table, partition_value, sort_condition, projection).await,
+    }
+}
+
+/// A base-table `Query`: native range scan over the partition's key prefix.
+async fn run_base_query(
+    ctx: &ClientCtx,
+    table: &str,
+    partition_value: &AttributeValue,
+    sort_condition: Option<&SortKeyCondition>,
+    projection: Option<&Projection>,
+) -> Result<String, WireError> {
+    // A base-table query must reject an unknown table the way the registry path
+    // did (ResourceNotFoundException). A table is known iff it is in the
+    // replicated catalog or auto-registered locally (legacy clients).
+    if !table_known(ctx, table) {
+        return Err(registry_error(animus_dynamo::RegistryError::NoSuchTable(
+            table.to_owned(),
+        )));
+    }
+    // The partition's data-plane keys are exactly those prefixed by
+    // `escape(table) || escape(pk)` (each escape is prefix-free, ending `00 00`),
+    // so the contiguous range is `[prefix, prefix-with-last-byte-bumped)`.
+    let prefix = partition_prefix(table, partition_value);
+    let end = range_end(&prefix);
+    let pairs = native_scan(ctx, &prefix, &end, None).await?;
+    let mut items = Vec::new();
+    for (key, value) in pairs {
+        // A DynamoDB delete stores a tombstone *value* (not a data-plane
+        // tombstone), so the scan returns it as a live pair; decode drops it.
+        let Some(item) = wire::decode_stored_item(&value)? else {
+            continue;
+        };
+        if let Some(cond) = sort_condition {
+            // The sort-key bytes are everything after the escaped table+pk
+            // prefix; test the condition on those bytes directly (storage order),
+            // exactly as the local-engine `query_with` does.
+            let sk_bytes = AttributeValue::B(key[prefix.len()..].to_vec());
+            if !cond.matches(&sk_bytes) {
+                continue;
+            }
+        }
+        items.push(wire::project(projection, &item));
+    }
+    Ok(wire::query_response(&items))
+}
+
+/// A secondary-index `Query`: resolve the index's base storage keys from the
+/// in-memory GSI/LSI index and quorum-read each (the native scan covers the base
+/// keyspace, not an index's alternate ordering).
+async fn run_index_query(
+    ctx: &ClientCtx,
+    table: &str,
+    index: &str,
+    partition_value: &AttributeValue,
+    sort_condition: Option<&SortKeyCondition>,
+    projection: Option<&Projection>,
+) -> Result<String, WireError> {
     // An index query with no explicit `ProjectionExpression` falls back to the
     // index's *declared* projection (`ALL` / `KEYS_ONLY` / `INCLUDE`), applied at
-    // the edge after the base item is read (the registry stores only base keys).
-    let index_projection = match index {
-        Some(index) if projection.is_none() => ctx
+    // the edge after the base item is read (the index stores only base keys).
+    let index_projection = match projection {
+        None => ctx
             .edge
             .dynamo_registry()
             .lock()
@@ -724,7 +809,7 @@ async fn run_query(
             .index_projected_attributes(table, index)
             .map_err(registry_error)?
             .map(Projection),
-        _ => None,
+        Some(_) => None,
     };
     let effective = projection.or(index_projection.as_ref());
     let within_keys = {
@@ -733,16 +818,10 @@ async fn run_query(
             .dynamo_registry()
             .lock()
             .expect("registry poisoned");
-        match index {
-            // A secondary index: a hash-only GSI takes no sort condition; a
-            // composite GSI / LSI may narrow by one (the registry enforces this).
-            Some(index) => reg
-                .index_query_keys(table, index, partition_value, sort_condition)
-                .map_err(registry_error)?,
-            None => reg
-                .query_keys(table, partition_value, sort_condition)
-                .map_err(registry_error)?,
-        }
+        // A hash-only GSI takes no sort condition; a composite GSI / LSI may
+        // narrow by one (the registry enforces this).
+        reg.index_query_keys(table, index, partition_value, sort_condition)
+            .map_err(registry_error)?
     };
     let mut items = Vec::with_capacity(within_keys.len());
     for within in &within_keys {
@@ -754,10 +833,21 @@ async fn run_query(
     Ok(wire::query_response(&items))
 }
 
-/// Walk the table's whole key index (paginated by `limit` + `exclusive_start_key`)
-/// and quorum-read each key, applying an optional post-read `filter`. The
-/// pagination cursor is the last base storage key of a truncated page, surfaced
-/// to the client as that item's key-attribute AttributeValue map.
+/// Serve a `Scan` via a **native quorum range scan** ([`DataClient::scan`]) over
+/// the whole table's data-plane key range `[escape(table), …)` — no in-memory
+/// key tracking. The scan returns live `(key, value)` pairs in key order across a
+/// read quorum (tombstones already excluded by the data plane); the edge decodes
+/// each, drops a DynamoDB tombstone *value*, applies an optional post-read
+/// `filter`, then `projection`.
+///
+/// DynamoDB pagination is layered on top: `exclusive_start_key` resolves to the
+/// storage key to scan strictly *after*; `limit` caps the **examined** (decoded,
+/// live) items, applied at the edge so a DynamoDB tombstone value never consumes a
+/// slot and the page boundary always lands on a live, decodable item; and when the
+/// page is truncated the `LastEvaluatedKey` is that boundary item's key attributes.
+/// The cursor thus advances over the **live data-plane keys** the scan returned —
+/// not a tracked set — so it is correct after a restart or on a follower that never
+/// saw a write.
 async fn run_scan(
     ctx: &ClientCtx,
     table: &str,
@@ -767,45 +857,59 @@ async fn run_scan(
     projection: Option<&Projection>,
 ) -> Result<String, WireError> {
     mirror_catalog_schema(ctx, table);
-    // Resolve the cursor item (if any) to its base storage key.
-    let start_after = match &exclusive_start_key {
+    if !table_known(ctx, table) {
+        return Err(registry_error(animus_dynamo::RegistryError::NoSuchTable(
+            table.to_owned(),
+        )));
+    }
+    // Scan the whole table's contiguous data-plane range `[escape(table), …)`.
+    let start = data_key(table, &[]);
+    let end = range_end(&start);
+    // `ExclusiveStartKey`: resume strictly after the cursor item's data key.
+    let from = match &exclusive_start_key {
         Some(key_item) => {
             let (pk, sk) = resolve_key(ctx, table, key_item)?;
-            Some(storage_key(&pk, sk.as_ref()))
+            let mut after = data_key(table, &storage_key(&pk, sk.as_ref()));
+            after.push(0x00); // first key strictly past the cursor (keys are unique)
+            after
         }
-        None => None,
+        None => start,
     };
-    let (within_keys, cursor) = {
-        let reg = ctx
-            .edge
-            .dynamo_registry()
-            .lock()
-            .expect("registry poisoned");
-        reg.scan_keys(table, start_after.as_deref(), limit)
-            .map_err(registry_error)?
-    };
-    let scanned = within_keys.len();
-    let mut items = Vec::new();
-    for within in &within_keys {
-        let data_key = data_key(table, within);
-        if let Some(item) = quorum_read(ctx, &data_key).await? {
-            // The filter sees the whole item; projection then trims the result.
-            if filter.is_none_or(|f| f.evaluate(Some(&item))) {
-                items.push(wire::project(projection, &item));
-            }
+    // The native scan returns live data-plane pairs in key order. A DynamoDB
+    // `DeleteItem` stores a *tombstone value* (a live pair to the data plane), so
+    // decode each and drop the ones that decode to a tombstone — those items are
+    // logically absent and are neither examined nor counted.
+    let pairs = native_scan(ctx, &from, &end, None).await?;
+    let mut examined: Vec<(Vec<u8>, Item)> = Vec::new();
+    for (key, value) in pairs {
+        if let Some(item) = wire::decode_stored_item(&value)? {
+            examined.push((key, item));
         }
     }
-    // The `LastEvaluatedKey` is the cursor item's key attributes — recover them
-    // from the last scanned item we read (whether or not it passed the filter).
-    let last_evaluated_key = match &cursor {
-        Some(cursor) => {
-            let data_key = data_key(table, cursor);
-            quorum_read(ctx, &data_key)
-                .await?
-                .and_then(|item| key_item_of(ctx, table, &item))
-        }
-        None => None,
+    // `Limit` caps the **examined** items; we apply it at the edge (over decoded
+    // live items) rather than passing it to the native scan, so a tombstone value
+    // never consumes a slot and the page boundary always falls on a live, decodable
+    // item — its key attributes are recoverable for `LastEvaluatedKey`.
+    let truncated = limit.is_some_and(|n| examined.len() > n);
+    if let Some(n) = limit {
+        examined.truncate(n);
+    }
+    let scanned = examined.len();
+    // The pagination cursor is the last examined item; recover its key attributes.
+    let last_evaluated_key = if truncated {
+        examined
+            .last()
+            .and_then(|(_, item)| key_item_of(ctx, table, item))
+    } else {
+        None
     };
+    let mut items = Vec::new();
+    for (_key, item) in &examined {
+        // The filter sees the whole item; projection then trims the result.
+        if filter.is_none_or(|f| f.evaluate(Some(item))) {
+            items.push(wire::project(projection, item));
+        }
+    }
     Ok(wire::scan_response(
         &items,
         scanned,
@@ -895,6 +999,63 @@ fn data_key(table: &str, within_key: &[u8]) -> Vec<u8> {
     let mut key = storage_key(&AttributeValue::S(table.to_owned()), None);
     key.extend_from_slice(within_key);
     key
+}
+
+/// The contiguous data-plane key prefix of a `Query` partition:
+/// `escape(table) || escape(partition_value)`. Every item in that partition has a
+/// data key starting with this prefix, and (the escape being prefix-free, ending
+/// `0x00 0x00`) no other partition's key does — so the partition is one
+/// half-open range `[prefix, range_end(prefix))`.
+fn partition_prefix(table: &str, partition_value: &AttributeValue) -> Vec<u8> {
+    // `storage_key(pk, None) == escape(pk)`, so `data_key(table, escape(pk))`
+    // is `escape(table) || escape(pk)`.
+    data_key(table, &storage_key(partition_value, None))
+}
+
+/// The exclusive upper bound of the half-open range that covers exactly the keys
+/// starting with `prefix`: the prefix with its final byte bumped by one. The
+/// escape used to build a prefix always ends `0x00 0x00`, so the last byte is
+/// `0x00` and the bumped bound is `… 0x00 0x01` — the first key past the
+/// partition/table. (Mirrors `SchemaRegistry::query_keys`' former range math.)
+fn range_end(prefix: &[u8]) -> Vec<u8> {
+    let mut end = prefix.to_vec();
+    *end.last_mut().expect("a data-plane prefix is non-empty") = 0x01;
+    end
+}
+
+/// Native quorum range scan over the half-open data-plane range `[start, end)`,
+/// returning the live `(key, value)` pairs in key order (tombstones already
+/// excluded by the data plane), optionally capped at `limit` keys. Routes through
+/// the shared coordinator under the coord lock, exactly like a point read/write.
+/// A scan that cannot reach a read quorum is an internal error (the scan analog of
+/// a failed read).
+async fn native_scan(
+    ctx: &ClientCtx,
+    start: &[u8],
+    end: &[u8],
+    limit: Option<usize>,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>, WireError> {
+    let view = ctx.view_for(start).ok_or_else(internal_no_tablet)?;
+    let _guard = ctx.coord_lock.lock().await;
+    ctx.coordinator
+        .scan(&view, start, end, limit, DYNAMO_TIMEOUT)
+        .await
+        .ok_or_else(|| internal("scan did not reach a read quorum"))
+}
+
+/// Whether `table` is known: present in the replicated catalog (ADR 0013) or
+/// already auto-registered locally (a legacy `pk`/`sk` client). A base-table
+/// `Query`/`Scan` rejects an unknown table (`ResourceNotFoundException`), matching
+/// what the former written-key path did via the registry.
+fn table_known(ctx: &ClientCtx, table: &str) -> bool {
+    if metadata(ctx).has_table_schema(table) {
+        return true;
+    }
+    ctx.edge
+        .dynamo_registry()
+        .lock()
+        .expect("registry poisoned")
+        .has_table(table)
 }
 
 async fn quorum_write(ctx: &ClientCtx, key: &[u8], value: &[u8]) -> Result<(), WireError> {

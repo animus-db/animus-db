@@ -52,26 +52,32 @@ The surface now extends past the original three point ops:
   registry uses); in a one-process-per-node deployment that is the node's own
   handle, so `CreateTable` must target the leader (or a node that can reach it).
   **Still in-memory (not control-plane state):** the per-table **secondary-index
-  declarations** (GSI/LSI) and the observation-built **written-key index** that
-  backs `Query`/`Scan` — both rebuilt from observed writes, and the catalog only
-  carries the *table key schema* for now (index metadata can extend
-  `TableSchema`/`SchemaCatalog` later, per ADR 0013).
+  declarations** (GSI/LSI), rebuilt from observed writes; the catalog only carries
+  the *table key schema* for now (index metadata can extend
+  `TableSchema`/`SchemaCatalog` later, per ADR 0013). The former observation-built
+  **written-key index** that backed `Query`/`Scan` is **gone** — base `Query`/`Scan`
+  now use the data plane's native range scan (below), so they no longer depend on
+  any in-memory tracked key set.
 - **`Query`.** Partition-key equality plus an optional sort-key condition (`=`,
-  `BETWEEN`, `begins_with`), returning matching items in sort order. The data
-  plane exposes only point read/write/delete (no quorum range scan), so the
-  registry additionally tracks per-table written item keys; `Query` selects the
-  partition's contiguous matching sub-range and quorum-reads each key through
-  the coordinator (an honest range scan over a *tracked*, in-memory keyspace).
+  `BETWEEN`, `begins_with`), returning matching items in sort order. A base-table
+  `Query` is a **native quorum range scan** (`DataClient::scan`) over the
+  partition's contiguous data-plane key sub-range `[escape(table) || escape(pk), …)`
+  — no in-memory tracking — applying the sort-key condition on the recovered sort
+  bytes after the scan. An **index** `Query` still resolves base keys from the
+  in-memory GSI/LSI index (the scan covers the base keyspace, not an index's
+  alternate ordering) and quorum-reads each.
 - **Conditional writes.** A `ConditionExpression` subset
   (`attribute_not_exists(a)`, `attribute_exists(a)`, `a = :v`) gates `PutItem` /
   `DeleteItem`: the edge quorum-reads the current item under the coordinator
   lock and rejects a failing predicate with `ConditionalCheckFailedException`.
-- **`Scan`.** A full-table read over the same per-table key index, walked across
-  all partitions (`scan_keys`) and quorum-read key by key. It paginates with
-  `Limit` + `ExclusiveStartKey`/`LastEvaluatedKey` (the cursor is a page's last
-  base storage key, surfaced to the client as the key item's AttributeValue map)
-  and applies an optional `FilterExpression` (the same predicate subset as a
-  conditional write) after the read. Same in-memory-keyspace caveat as `Query`.
+- **`Scan`.** A full-table **native quorum range scan** (`DataClient::scan`) over
+  the table's whole data-plane range `[escape(table), …)` across all partitions —
+  no in-memory key index. It paginates with `Limit` + `ExclusiveStartKey`/
+  `LastEvaluatedKey` (the cursor is a truncated page's last storage key, surfaced
+  to the client as that item's key-attribute map) and applies an optional
+  `FilterExpression` (the same predicate subset as a conditional write) after the
+  read. Because the scan reads live storage, the cursor advances over real keys —
+  correct even after a restart or on a node that never observed the write.
 - **Secondary indexes (GSI + LSI).** `CreateTable` may declare any number of
   secondary indexes. A **global** secondary index (`GlobalSecondaryIndexes`) has
   a `HASH` key attribute plus an optional `RANGE` (a composite GSI); a **local**
@@ -211,10 +217,9 @@ process-global set of registered control handles.
 
 What remains. DynamoDB: atomic `TransactWriteItems` (via Accord, ADR 0011),
 `BatchGetItem`, list-index document paths (`a[0]`), `ADD`/`DELETE`
-`UpdateExpression` arithmetic, durable control-plane-replicated secondary-index +
-written-key state (only the table key schema is replicated; index/key-index state
-stays in-memory), and a native quorum range scan so `Query`/`Scan` need not track
-keys. CQL: composite (multi-column) partition keys, per-column `DELETE`, atomic
+`UpdateExpression` arithmetic, and durable control-plane-replicated **secondary-index**
+state (only the table key schema is replicated; the GSI/LSI index stays in-memory).
+CQL: composite (multi-column) partition keys, per-column `DELETE`, atomic
 logged `BATCH`, in-place `ALTER`, range/`IN`/`ORDER BY`/`LIMIT` predicates with a
 native quorum range scan (so a partition need not be one value), collection/UDT
 types, paging, authentication, `LWT`/conditional writes, and replicated
@@ -223,7 +228,11 @@ consume the replicated schema catalog so `CreateTable`/`CREATE TABLE` is durable
 cluster-agreed; DynamoDB per-index projections, document-path projections,
 `UpdateItem`/`BatchWriteItem`/`TransactWriteItems`, document/set types,
 `ReturnValues`, composite/multiple GSIs + LSI; CQL clustering/compound primary
-keys, `UPDATE`/`DELETE`, consistency levels, `DROP`/`ALTER ADD`/`BATCH`.)
+keys, `UPDATE`/`DELETE`, consistency levels, `DROP`/`ALTER ADD`/`BATCH`; and a
+**native quorum range scan** in the data plane (`DataClient::scan`), now backing
+DynamoDB base-table `Query`/`Scan` so they no longer track written keys in memory —
+the CQL side still stores a whole partition as one value, but the same primitive can
+later carry CQL range/`LIMIT` predicates.)
 
 ## Consequences
 

@@ -107,12 +107,17 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   survives a restart — `tests/dynamo_schema.rs`); the edge reaches the leader
   through the cluster's set of registered control handles (held in
   `ClusterEdgeState`, threaded via `ClientCtx::edge` — see below). A
-  never-`CreateTable`d table falls back to the legacy `pk`/`sk` convention. The
-  edge's GSI declarations + written-key index (for `Query`/`Scan`) remain
-  in-memory, now held **per-cluster** in `ClusterEdgeState` (not a process
-  `OnceLock`). The surface now also covers `UpdateItem`/`BatchWriteItem`/
-  `TransactWriteItems` (the last condition-gated but not yet atomic), per-index
-  projections, and document-path projections.
+  never-`CreateTable`d table falls back to the legacy `pk`/`sk` convention.
+  **Base-table `Query`/`Scan` now use the data plane's native quorum range scan**
+  (`DataClient::scan`) over a contiguous data-plane key range (a partition prefix
+  for `Query`, the whole-table prefix for `Scan`), decoding each live pair and
+  dropping DynamoDB tombstone values — **no in-memory written-key tracking**
+  (proven across a restart in `tests/dynamo_schema.rs`). The edge keeps only the
+  **GSI/LSI index declarations** in-memory (for an *index* `Query`), held
+  **per-cluster** in `ClusterEdgeState` (not a process `OnceLock`). The surface now
+  also covers `UpdateItem`/`BatchWriteItem`/`TransactWriteItems` (the last
+  condition-gated but not yet atomic), per-index projections, and document-path
+  projections.
 - And a **sixth listener, the CQL binary-protocol endpoint** (`RoleAddrs.cql`,
   `Node::cql_addr`). Same shape: a production-only I/O edge (real tokio sockets +
   hand-rolled CQL v4 framing in `cql.rs`; the pure protocol/type/catalog/planning
@@ -151,8 +156,9 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
 - **The wire edges' mutable state is `ClusterEdgeState`, scoped to one cluster**
   (not the whole process). It holds the set of control `RaftNode` handles a schema
   DDL proposal fans out to (so a follower-connected `CreateTable`/`CREATE TABLE`
-  still reaches the leader), the DynamoDB `SchemaRegistry` (GSI + written-key
-  index), and the CQL `CqlState` (keyspaces + prepared statements). It is created
+  still reaches the leader), the DynamoDB `SchemaRegistry` (GSI/LSI index
+  declarations — the base written-key index is gone, replaced by the native range
+  scan), and the CQL `CqlState` (keyspaces + prepared statements). It is created
   once per cluster — in `start_cluster_with` (shared by every node of that
   cluster, so `--cluster N` dev mode agrees) and freshly in `run_node_with` (one
   per process) — and threaded into `start_with` → `ClientCtx::edge`. In

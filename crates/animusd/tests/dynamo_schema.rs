@@ -8,6 +8,11 @@
 //!   **same dir + addresses**, and the table is still known (its key schema rode
 //!   the control-plane Raft WAL, not the in-memory registry). This is the headline
 //!   ADR 0013 consumption: a created table is now durable + cluster-agreed.
+//! - `scan_and_query_read_live_storage_after_restart` proves the native range
+//!   scan reads **live storage**, not an in-memory written-key index: after a
+//!   restart wipes the registry, a base `Query` and a `Scan` still return the
+//!   previously-written rows (they come from the durable data plane via
+//!   `DataClient::scan`, not a tracked key set).
 //! - `extended_surface` mirrors `dynamo_extended.rs`: a 3-node in-process cluster
 //!   exercises UpdateItem, BatchWriteItem, TransactWriteItems, a document-path
 //!   projection, and a `KEYS_ONLY` GSI projection.
@@ -184,6 +189,109 @@ async fn create_table_survives_node_restart() {
     .await;
     assert_eq!(status, 200, "GetItem failed: {body}");
     assert!(body.contains(r#""v":{"N":"1"}"#), "item missing: {body}");
+
+    stop(node).await;
+}
+
+/// The native range scan reads **live storage**, not an in-memory written-key
+/// index: after a node restart the in-memory `SchemaRegistry` is empty (no
+/// `note_put` was ever replayed), yet a base-table `Query` and a `Scan` still
+/// return the previously-written rows — because the rows come from the durable
+/// data plane via `DataClient::scan`, not from any tracked key set. This is the
+/// end-to-end proof that the former written-key tracking is gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn scan_and_query_read_live_storage_after_restart() {
+    let config = single_node_config();
+    let dynamo_addr = config.nodes[0].dynamo;
+    let dir = tempfile::tempdir().unwrap();
+    let node_dir = dir.path().join("node-0");
+
+    // --- First incarnation: create a composite table and write three rows in two
+    // partitions, then stop the node (this wipes the in-memory registry). ---
+    let node = animusd::run_node(&config, 0, &node_dir)
+        .await
+        .expect("first start");
+    await_node_bootstrap(&node).await;
+
+    let (status, body) = dynamo(
+        dynamo_addr,
+        "DynamoDB_20120810.CreateTable",
+        r#"{"TableName":"events",
+            "KeySchema":[{"AttributeName":"pk","KeyType":"HASH"},
+                         {"AttributeName":"sk","KeyType":"RANGE"}],
+            "AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"},
+                                    {"AttributeName":"sk","AttributeType":"S"}]}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "CreateTable failed: {body}");
+
+    for (pk, sk) in [("u1", "a"), ("u1", "b"), ("u2", "a")] {
+        let (status, _) = dynamo(
+            dynamo_addr,
+            "DynamoDB_20120810.PutItem",
+            &format!(
+                r#"{{"TableName":"events","Item":{{"pk":{{"S":"{pk}"}},
+                    "sk":{{"S":"{sk}"}},"v":{{"S":"{pk}-{sk}"}}}}}}"#
+            ),
+        )
+        .await;
+        assert_eq!(status, 200);
+    }
+
+    stop(node).await;
+
+    // --- Second incarnation: SAME dir + addresses. The schema survives (Raft WAL)
+    // and the rows survive (durable LSM), but the registry's written-key set does
+    // NOT — it was never tracked and is never replayed. A Scan/Query must still
+    // find the rows, proving they are read from live storage. ---
+    let node = animusd::run_node(&config, 0, &node_dir)
+        .await
+        .expect("restart");
+    await_node_bootstrap(&node).await;
+
+    // A full Scan returns all three rows (read straight from the data plane).
+    let (status, all) = dynamo(
+        dynamo_addr,
+        "DynamoDB_20120810.Scan",
+        r#"{"TableName":"events"}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "Scan failed: {all}");
+    assert!(all.contains("\"Count\":3"), "scan after restart: {all}");
+    assert!(all.contains(r#""v":{"S":"u1-a"}"#), "u1-a missing: {all}");
+    assert!(all.contains(r#""v":{"S":"u1-b"}"#), "u1-b missing: {all}");
+    assert!(all.contains(r#""v":{"S":"u2-a"}"#), "u2-a missing: {all}");
+
+    // A base-table Query (pk = u1) returns just that partition's two rows, in sort
+    // order, again with no in-memory tracking to lean on.
+    let (status, q) = dynamo(
+        dynamo_addr,
+        "DynamoDB_20120810.Query",
+        r#"{"TableName":"events","KeyConditionExpression":"pk = :p",
+            "ExpressionAttributeValues":{":p":{"S":"u1"}}}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "Query failed: {q}");
+    assert!(q.contains("\"Count\":2"), "query after restart: {q}");
+    assert!(q.contains(r#""v":{"S":"u1-a"}"#), "u1-a missing: {q}");
+    assert!(q.contains(r#""v":{"S":"u1-b"}"#), "u1-b missing: {q}");
+    assert!(!q.contains(r#""v":{"S":"u2-a"}"#), "u2 leaked into u1: {q}");
+
+    // A base Query with a sort-key condition narrows within the partition.
+    let (status, narrowed) = dynamo(
+        dynamo_addr,
+        "DynamoDB_20120810.Query",
+        r#"{"TableName":"events",
+            "KeyConditionExpression":"pk = :p AND sk = :s",
+            "ExpressionAttributeValues":{":p":{"S":"u1"},":s":{"S":"b"}}}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "narrowed Query failed: {narrowed}");
+    assert!(narrowed.contains("\"Count\":1"), "narrowed: {narrowed}");
+    assert!(
+        narrowed.contains(r#""v":{"S":"u1-b"}"#),
+        "narrowed: {narrowed}"
+    );
 
     stop(node).await;
 }
