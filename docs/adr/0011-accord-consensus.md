@@ -3,12 +3,15 @@
 - **Status:** Accepted (first minimal slice; extended with execution + durability;
   then storage-backed execution + coordinator failover; then read transactions +
   multi-thread liveness regression; then message retry + the data-plane frontier;
-  then data-plane reads + an interactive transaction API)
+  then data-plane reads + an interactive transaction API; then sharded
+  transactions + read-set dependency folding + adaptive retry backoff)
 - **Date:** 2026-08-01 (execution + durability increment: 2026-08-01;
   storage-backed execution + coordinator-failover increment: 2026-08-01;
   read-transactions + multi-thread-liveness increment: 2026-08-02;
   message-retry + data-plane-frontier increment: 2026-08-02;
-  data-plane-reads + interactive-transaction-API increment: 2026-08-02)
+  data-plane-reads + interactive-transaction-API increment: 2026-08-02;
+  sharded-transactions + read-set-folding + adaptive-backoff increment:
+  2026-08-02)
 
 ## Context
 
@@ -394,3 +397,88 @@ reshaping the sync-core / `Env`-driver split.
   the precise Accord recovery ballot + duelling recoverers + a failure detector;
   WAL snapshotting / log truncation; the precise fast-path quorum bound; and
   wiring the Elle cycle checker.
+
+## Sharded transactions + read-set folding + adaptive backoff increment (2026-08-02)
+
+This increment closes the three depth gaps the previous slice named — **sharded
+(multi-tablet) transactions**, **folding the interactive read set into dependency
+tracking**, and an **adaptive retry backoff** — again without reshaping the
+sync-core / `Env`-driver split.
+
+- **Sharded (multi-tablet) transactions.** A transaction whose key set spans more
+  than one tablet/replica-set is now coordinated across the involved shards.
+  Accord is naturally multi-shard, and that falls out cleanly from this slice's
+  shape: the consensus round already replicates *every* transaction to the whole
+  Accord replica set and agrees **one global execution timestamp** and one
+  dependency set, independent of which tablets the keys live in — so the
+  agreement is already correct across shards. The only place sharding shows up is
+  the *execution effect*: each key must be written to (and read from) the quorum
+  of **its own** tablet. The `AccordNode`'s data-plane sink therefore now routes
+  per key: `start_with_router(env, all_nodes, storage, coordinator_env, router)`
+  attaches a `DataRouting::Sharded(Router)` (an `animus-data::Router` over a
+  multi-tablet map) instead of a single `DataRouting::Single(TabletView)`, and the
+  apply/read paths resolve each key's `TabletView` via `Router::view_for` before
+  issuing the quorum write/read. Because the agreed execution timestamp is the
+  MVCC version on every key regardless of tablet, the per-tablet writes stay
+  consistently ordered across shards; a conflicting cross-tablet transaction lands
+  the shared key's winner and each private key's own transaction in the same order
+  on every shard. `start_with_data_plane` (single-tablet frontier) is retained
+  unchanged. The Accord protocol traffic and the data-plane coordinator's quorum
+  replies still use distinct node ids (single-consumer inbox). Tests in
+  `animus-consensus/tests/accord_sharded.rs` (two tablets split at a key boundary,
+  replicas {3,4} and {4,5}): a 2-tablet transaction commits atomically and both
+  keys are readable via the data plane in agreed order; a conflicting cross-tablet
+  transaction orders consistently on all shards.
+
+- **Folding the interactive read set into dependency tracking.** A
+  read-modify-write transaction now declares a **conflict set = reads ∪ writes**.
+  The sync core grows a `ReplicaTxn.write_keys` (the subset of `keys` it writes);
+  `keys` is the full conflict set (every key read *or* written). `submit_rw(read_
+  keys, write_keys)` mints a `t0`, conflicts on the union, and commits at an agreed
+  `execute_at` exactly like a write — but at execution only the `write_keys` carry
+  the write `ApplyEffect`; the extra read-only keys order the transaction (and
+  carry it as a dependency to a later conflicting write) but produce no write. So
+  a concurrent write to a key the transaction *read* is ordered relative to it
+  (the read-then-write hazard) and recorded as a dependency, identically on every
+  replica. The write set / conflict set ride the `PreAccept`/`Commit`/`RecoverOk`
+  wire messages and the `PreAccepted`/`Committed` WAL records (new
+  `write_keys` fields, `#[serde(default)]` for forward-compat), so the
+  distinction survives recovery and coordinator failover (recovery unions both the
+  conflict keys and the write keys across the recovery quorum). `read_only` is now
+  exactly "writes nothing" (`write_keys.is_empty()`). `InteractiveTxn::commit`
+  submits via `submit_rw(reads, writes)`, so an interactive session's reads fold
+  into the committed transaction's dependency tracking (previously they merely
+  informed the caller's decision). Tests in
+  `animus-consensus/tests/accord_rw_conflict.rs`: a read-then-write transaction is
+  ordered consistently against a conflicting write to the key it read (with the
+  conflict recorded as a dependency), a control showing the same transactions are
+  disjoint when the read is dropped, a seed sweep, and trace reproducibility.
+
+- **Adaptive retry backoff.** The driver's retry tick replaces its fixed
+  interval with **exponential backoff**: the wait starts at a base interval and
+  doubles (capped) each round in which the same-or-more messages are still owed,
+  and resets to the base the moment a round makes progress (strictly fewer
+  messages owed — a reply got through) or completes (none owed). So a transaction
+  that genuinely cannot gather a quorum is retried ever less often — far fewer
+  redundant sends under persistent loss — while a transient drop is still
+  recovered promptly at the base interval. The backoff state is a plain local in
+  the driver's `retry_loop`; the timer is still a deterministic `Env` timer (the
+  core's `resend_pending` is unchanged — it only decides *what* is owed), so the
+  run stays byte-reproducible. Tests in
+  `animus-consensus/tests/accord_backoff.rs`: a fully-partitioned coordinator's
+  re-send count over a long window is far sub-linear (backoff, vs the
+  fixed-interval count), the transaction still converges promptly after a heal,
+  and it still commits everywhere under lossy-but-unpartitioned operation across a
+  seed sweep.
+
+- **Still deferred after this increment:** the full transitive dependency
+  wait-graph; the precise Accord recovery ballot + duelling recoverers + a failure
+  detector to *trigger* both recovery and a retry escalation (the adaptive tick
+  backs off but does not itself declare a coordinator dead — that remains the
+  explicit `recover` path); WAL snapshotting / log truncation; the precise
+  fast-path quorum bound; arbitrary caller-supplied write *values* (the execution
+  effect is still "write my id"); and wiring the Elle cycle checker
+  (`animus-test`). Sharding here routes the *execution effect* per tablet; the
+  Accord replica set is still one global group (every transaction is replicated to
+  every consensus node), so per-shard consensus replica sets / placement of the
+  consensus participants themselves remain future work.

@@ -16,9 +16,13 @@ A committed transaction's write effect can land in the **replicated data plane**
 (`animus-data` quorum) — the "frontier" path — and a wired read transaction
 **reads from that same data plane** (quorum read at execution time), so this is
 the layer that gives the AP data plane multi-key atomicity and a strict
-serialization order. An **interactive** `begin → read → decide → write → commit`
-handle (`AccordNode::begin`) runs a multi-step read-modify-write under one Accord
-transaction. No leader.
+serialization order. Transactions may be **sharded** — a single transaction's key
+set can span more than one tablet, each key's effect routed to its own tablet's
+quorum (`start_with_router`) while one global execution timestamp orders all
+shards. An **interactive** `begin → read → decide → write → commit` handle
+(`AccordNode::begin`) runs a multi-step read-modify-write under one Accord
+transaction, with the **session's reads folded into the committed transaction's
+conflict set** (`submit_rw`). No leader.
 
 ## Entry points
 
@@ -28,6 +32,9 @@ transaction. No leader.
 - `core.rs` — `AccordCore`: a **synchronous, I/O-free** state machine mirroring
   `animus-control`'s `RaftCore`. `submit(keys)` starts a **write** transaction
   this node coordinates; `submit_read(keys)` starts a **read-only** transaction;
+  `submit_rw(read_keys, write_keys)` starts a **read-modify-write** whose conflict
+  set is the union (reads ∪ writes) but whose write *effect* hits only
+  `write_keys` (so a read key participates in ordering but produces no write);
   `recover(txn)` takes over a stranded transaction as a *recovery coordinator*;
   `handle(from, msg)` processes an inbound message. All return `Vec<Out>` and
   never touch `Env`. Holds the replica view (`txns`), the coordinator view
@@ -58,25 +65,33 @@ transaction. No leader.
   then ships outbound (durable before action). `drive` recovers from the WAL on
   startup and replays the recovered execution order into the (fresh) engine.
   Alongside the `recv` loop the driver now runs a **`retry_loop`** on an `Env`
-  timer (`RETRY_INTERVAL`) — a **perpetual timer**, so drive tests with
-  `run_for`/`run_until`, never `run()`. `submit_read(keys)` runs a read-only
-  transaction; `read_result(txn)` returns the per-key writer it observed
-  (populated once `is_applied(txn)`). `store_writer(key)` is `async` (it reads
-  the engine). **Frontier:** `start_with_data_plane(env, all_nodes, storage,
-  coordinator_env, view)` attaches a `DataSink { DataClient, TabletView }`; on
-  Apply a committed *write* effect is also pushed through the data-plane quorum
-  (`DataClient::write`) so it is readable via data-plane quorum reads. The
-  data-plane coordinator uses a **distinct node id** (`coordinator_env`) — the
-  inbox is single-consumer. **Data-plane reads:** with a `DataSink`,
+  timer with **exponential backoff** (`RETRY_BASE_INTERVAL` doubling to
+  `RETRY_MAX_INTERVAL`, reset on progress) — a **perpetual timer**, so drive tests
+  with `run_for`/`run_until`, never `run()`. `submit_read(keys)` runs a read-only
+  transaction; `submit_rw(reads, writes)` a read-modify-write; `read_result(txn)`
+  returns the per-key writer it observed (populated once `is_applied(txn)`).
+  `store_writer(key)` is `async` (it reads the engine). **Frontier:**
+  `start_with_data_plane(env, all_nodes, storage, coordinator_env, view)` attaches
+  a `DataSink { DataClient, DataRouting::Single(TabletView) }`; on Apply a
+  committed *write* effect is also pushed through the data-plane quorum
+  (`DataClient::write`) so it is readable via data-plane quorum reads.
+  **Sharded:** `start_with_router(.., router)` attaches `DataRouting::Sharded(
+  Router)` instead, routing each key's data-plane write/read to **its own**
+  tablet's `TabletView` via `Router::view_for` — so one transaction's keys can
+  span multiple tablets (the Accord round agrees one global execution timestamp;
+  only the effect is sharded). The data-plane coordinator uses a **distinct node
+  id** (`coordinator_env`) — the inbox is single-consumer. **Data-plane reads:** with a `DataSink`,
   `satisfy_reads` issues a data-plane **quorum read** (`DataClient::read`) per key
   instead of a local `get_at`, so a read observes the same replicated state writes
   land in (recovery still re-satisfies reads from the local substrate — `None`
   sink). **Interactive API:** `begin()` returns an `InteractiveTxn`
   (`read(key).await` → current committed writer through the data plane or local
-  store; `write(key)` buffers; `commit()` submits the buffered write set as one
-  Accord write txn). Pure driver state — the core stays sync + I/O-free, reached
-  only via `submit` at commit. `current_writer(key).await` is the ad-hoc read it
-  uses.
+  store; `write(key)` buffers; `commit()` submits the session as one Accord
+  read-modify-write via `submit_rw(reads, writes)` — so the **session's reads fold
+  into the committed transaction's conflict set** and are ordered against
+  conflicting writes). Pure driver state — the core stays sync + I/O-free, reached
+  only via `submit_rw` at commit. `current_writer(key).await` is the ad-hoc read
+  it uses.
 
 ## What's non-obvious
 
@@ -150,7 +165,13 @@ transaction. No leader.
   (handlers fold by `max`/union, de-dup), and a completed round emits nothing, so
   retries stop on their own. The retry timer is a real `Env` timer — a perpetual
   timer — so it is deterministic and the run stays seed-reproducible, but you must
-  bound test time with `run_for`.
+  bound test time with `run_for`. The interval uses **exponential backoff**
+  (`RETRY_BASE_INTERVAL` doubling to `RETRY_MAX_INTERVAL`), **reset to the base on
+  progress** (strictly fewer messages owed than the previous tick) or completion
+  (none owed) — so a stuck round retries ever less often (fewer redundant sends)
+  while a transient drop is still recovered promptly. The backoff state is a plain
+  local in `retry_loop`; the core's `resend_pending` is unchanged (it only decides
+  *what* is owed), so determinism is untouched.
 - **Frontier execution is additive, not a replacement.** With a `DataSink`, the
   apply effect still `merge`s the writer id into the **local** engine (kept as the
   recovery substrate, and what `store_writer` reads) **and** writes it through the
@@ -175,12 +196,29 @@ transaction. No leader.
   as absent and converges via anti-entropy.
 - **The interactive API lives entirely in the driver.** `InteractiveTxn` is pure
   driver state (`reads`/`writes` key sets + a node clone); it never touches the
-  sync core except through the existing `submit` at `commit()`. So the core stays
-  I/O-free and the atomicity/ordering guarantees are exactly `submit`'s. **Scope
-  this slice:** the session reads *inform* the decision but are **not** serialized
-  into the committed transaction's conflict set (read/write transactions in one
-  Accord round are deferred — ADR 0011), and the committed write effect is still
-  "write my id", not an arbitrary value. An empty write set commits to `None`.
+  sync core except through `submit_rw` at `commit()`. So the core stays I/O-free
+  and the atomicity/ordering guarantees are exactly `submit_rw`'s. The session's
+  **reads are folded into the committed transaction's conflict set** (conflict set
+  = reads ∪ writes), so a concurrent write to a key the session read is ordered
+  relative to the commit (the read-then-write hazard). The committed write effect
+  is still "write my id", not an arbitrary value. An empty write set commits to
+  `None`.
+- **`write_keys` vs `keys` (read/write transactions).** A `ReplicaTxn` carries
+  both its full conflict `keys` (every key read *or* written) and the `write_keys`
+  subset it writes. Conflict/ordering uses `keys`; the write `ApplyEffect` uses
+  only `write_keys` (the extra read-only keys order but produce no write). Both
+  ride the `PreAccept`/`Commit`/`RecoverOk` wire and the `PreAccepted`/`Committed`
+  WAL (`#[serde(default)]` write-key fields), so the distinction survives recovery
+  + failover (recovery unions both across the quorum). `read_only` is now exactly
+  `write_keys.is_empty()` — a read-modify-write (non-empty `write_keys`) is never
+  treated as read-only.
+- **Sharding is in the *effect*, not the consensus.** Every transaction is still
+  replicated to the whole Accord replica set and agrees one global `execute_at`
+  regardless of tablet — that is why Accord is naturally multi-shard. Only the
+  data-plane write/read is routed per key (`DataRouting::Sharded(Router)` →
+  `Router::view_for`), so a key's effect lands in its own tablet's quorum. The
+  global `execute_at` is the MVCC version on every key, so per-tablet writes stay
+  consistently ordered across shards.
 - **Recovery sets phase to `Applied` when `PersistedTxn.applied`** even though
   the phase-bearing records stop at `Committed` — the separate `Applied` WAL
   record carries the executed bit. On recovery the core **re-emits the apply
@@ -208,25 +246,24 @@ transaction. No leader.
 
 ## Deferred (see ADR 0011)
 
-**Sharded** (multi-tablet) transactions whose key set spans more than one tablet
-(the frontier routes a single `TabletView`), folding the interactive session's
-read set into the transaction's conflict/dependency tracking (full read/write
-transactions in one Accord round, with arbitrary write values), an **adaptive**
-retry timeout / backoff (today the retry is a fixed-interval re-send and does not
-itself detect a dead coordinator — that is still the explicit `recover` path),
-the full transitive dependency wait-graph (the execution wait is conflict +
+The full transitive dependency wait-graph (the execution wait is conflict +
 timestamp based), the precise Accord recovery ballot rules + duelling recovery
-coordinators + a failure detector to trigger recovery (today `recover` is called
-explicitly), WAL snapshotting/log truncation (the WAL is the full per-txn
-history — contrast `RaftCore`), the precise fast-path quorum bound, and wiring
-the Elle cycle checker (`animus-test`). **Now implemented:** read-only
-transactions (`submit_read`), **message retry** (the driver's retry tick +
-`resend_pending`), the **data-plane frontier** (`start_with_data_plane` —
-committed writes land in the `animus-data` quorum, readable via quorum reads),
-**data-plane reads** (a wired read txn observes the data plane via a quorum read
-at execution time), and an **interactive transaction API** (`AccordNode::begin`
-→ `InteractiveTxn`). The sync-core boundary is where each remaining piece slots
-in.
+coordinators + a failure detector to trigger recovery and a retry *escalation*
+(today `recover` is called explicitly; the adaptive tick backs off but does not
+itself declare a coordinator dead), WAL snapshotting/log truncation (the WAL is
+the full per-txn history — contrast `RaftCore`), the precise fast-path quorum
+bound, **arbitrary caller-supplied write values** (the execution effect is still
+"write my id"), **per-shard consensus replica sets / placement of the consensus
+participants** (sharding routes only the *effect* per tablet; the Accord replica
+set is still one global group), and wiring the Elle cycle checker
+(`animus-test`). **Now implemented:** read-only transactions (`submit_read`),
+**message retry with adaptive (exponential) backoff** (the driver's retry tick +
+`resend_pending`), the **data-plane frontier** (`start_with_data_plane`), **data-
+plane reads**, an **interactive transaction API** (`AccordNode::begin` →
+`InteractiveTxn`), **sharded (multi-tablet) transactions** (`start_with_router` —
+each key's effect routed to its own tablet's quorum), and **folding the
+interactive/RMW read set into dependency tracking** (`submit_rw` — conflict set =
+reads ∪ writes). The sync-core boundary is where each remaining piece slots in.
 
 ## Tests
 
@@ -278,6 +315,23 @@ in.
   atomically (both keys carry the committed txn on every replica); two conflicting
   interactive transactions are ordered consistently; an empty interactive txn is a
   no-op; plus trace reproducibility.
+- `tests/accord_sharded.rs` (**sharded / multi-tablet transactions**): two
+  tablets split at a key boundary (replicas {3,4} and {4,5}), Accord nodes wired
+  via `start_with_router`. A cross-tablet transaction commits atomically and both
+  keys are readable via the data plane (each from its own tablet) at its id; two
+  conflicting cross-tablet transactions order consistently on every shard (shared
+  key → second-ordered txn; each private key in the *other* tablet → its own txn);
+  plus trace reproducibility.
+- `tests/accord_rw_conflict.rs` (**read-set folded into deps**): a
+  read-then-write transaction (`submit_rw(reads, writes)`) is ordered consistently
+  against a conflicting write to the key it *read* (and the conflict is recorded as
+  a dependency), a control proving the same transactions are disjoint when the read
+  is dropped, a seed sweep, and trace reproducibility.
+- `tests/accord_backoff.rs` (**adaptive retry backoff**): a fully-partitioned
+  coordinator's re-send count over a long window is far sub-linear (backoff vs the
+  fixed-interval count); the transaction still converges promptly after a heal; it
+  still commits everywhere under lossy-but-unpartitioned operation across a seed
+  sweep; plus trace reproducibility.
 - `tests/accord_concurrent.rs` (**real multi-threaded**, *not* `SimEnv`):
   `#[tokio::test(flavor = "multi_thread", worker_threads = 4)]` over `ProdEnv`,
   timeout-guarded — several replicas + concurrent coordinators committing

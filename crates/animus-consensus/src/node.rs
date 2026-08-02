@@ -34,7 +34,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use animus_data::{DataClient, ReadResult, TabletView};
+use animus_data::{DataClient, ReadResult, Router, TabletView};
 use animus_env::{Env, EnvExt, NodeId};
 use animus_storage::{MemoryEngine, StorageEngine};
 
@@ -46,12 +46,23 @@ use crate::timestamp::Timestamp;
 /// File name of the per-node Accord write-ahead log on the `Env` disk.
 const WAL: &str = "accord.wal";
 
-/// How often the driver's retry tick fires to re-send un-acknowledged protocol
-/// messages for in-flight rounds (ADR 0011, message retry). The network is
-/// fire-and-forget and may drop, so without this a dropped message strands a
+/// The **base** retry interval: how soon after a round still has un-acknowledged
+/// messages the driver first re-sends them (ADR 0011, message retry). The network
+/// is fire-and-forget and may drop, so without this a dropped message strands a
 /// transaction. Chosen well above the simulator's default link delay so a retry
-/// only fires when a message was genuinely lost, not merely in flight.
-const RETRY_INTERVAL: Duration = Duration::from_millis(200);
+/// only fires when a message was genuinely lost, not merely in flight. The retry
+/// tick uses **exponential backoff** from this base (see [`RETRY_MAX_INTERVAL`]
+/// and [`retry_loop`]).
+const RETRY_BASE_INTERVAL: Duration = Duration::from_millis(200);
+
+/// The **ceiling** on the adaptive retry interval. Under persistent loss the
+/// interval doubles from [`RETRY_BASE_INTERVAL`] up to this cap, so a transaction
+/// that cannot yet gather a quorum is retried ever less often instead of
+/// hammering the network every base interval — fewer redundant sends while still
+/// guaranteeing eventual delivery. The interval **resets to the base** the moment
+/// a round makes progress (fewer messages owed) or completes (none owed), so a
+/// transient drop is still recovered promptly.
+const RETRY_MAX_INTERVAL: Duration = Duration::from_millis(1600);
 
 /// Timeout for a single data-plane quorum write/read issued by the execution
 /// effect when the node is wired to the **live data plane** (the "frontier"
@@ -80,9 +91,41 @@ type ReadResults = Arc<Mutex<BTreeMap<TxnId, BTreeMap<Key, Option<TxnId>>>>>;
 /// The data-plane coordinator runs on its **own** `Env` (a distinct node id):
 /// the node's inbox is single-consumer, so the Accord protocol traffic and the
 /// data-plane coordinator's quorum replies must not share an inbox.
+///
+/// **Sharded (multi-tablet) transactions (ADR 0011).** A transaction's key set
+/// may span more than one tablet/replica-set. Accord is naturally multi-shard —
+/// the consensus round here already replicates every transaction to the whole
+/// Accord replica set, agreeing one *global* execution timestamp and one
+/// dependency set regardless of which tablets the keys live in. The only place
+/// sharding shows up is the *execution effect*: each key must be written to (and
+/// read from) **its own** tablet's quorum. The sink therefore routes per key via
+/// [`DataRouting`] — a single `TabletView` (the original frontier) or a `Router`
+/// over a multi-tablet map. Because the agreed execution timestamp is the MVCC
+/// version on every key regardless of tablet, the per-tablet writes stay
+/// consistently ordered across shards.
 struct DataSink<E: Env> {
     client: DataClient<E>,
-    view: TabletView,
+    routing: DataRouting,
+}
+
+/// How a [`DataSink`] resolves a key to the tablet quorum that owns it.
+enum DataRouting {
+    /// A single tablet covering the whole key space (the original frontier).
+    Single(TabletView),
+    /// A multi-tablet map: each key routes to its owning tablet's view. A key
+    /// outside every tablet's range resolves to `None` (and is skipped).
+    Sharded(Router),
+}
+
+impl DataRouting {
+    /// The [`TabletView`] for the tablet owning `key` (the storage-key bytes),
+    /// or `None` if no tablet covers it.
+    fn view_for(&self, key: &[u8]) -> Option<TabletView> {
+        match self {
+            DataRouting::Single(view) => Some(view.clone()),
+            DataRouting::Sharded(router) => router.view_for(key),
+        }
+    }
 }
 
 /// A running consensus replica. Cheap to clone; clones share one [`AccordCore`]
@@ -194,7 +237,35 @@ impl<E: Env, S: StorageEngine + 'static> AccordNode<E, S> {
     ) -> AccordNode<E, S> {
         let sink = Arc::new(DataSink {
             client: DataClient::new(coordinator_env),
-            view,
+            routing: DataRouting::Single(view),
+        });
+        Self::start_inner(env, all_nodes, storage, Some(sink))
+    }
+
+    /// Start a node whose committed write effects land in a **multi-tablet**
+    /// (sharded) data plane (ADR 0011, sharded transactions). Like
+    /// [`AccordNode::start_with_data_plane`] but the data-plane keys are routed
+    /// **per key** through a [`Router`] over a multi-tablet map, so a single
+    /// Accord transaction whose keys span more than one tablet writes each key to
+    /// *its own* tablet's replica set — coordinated across shards under one global
+    /// execution timestamp (the Accord round already agrees that timestamp and the
+    /// dependency set over the whole replica set; only the execution effect is
+    /// sharded). A wired read transaction reads each key from its owning tablet's
+    /// quorum the same way.
+    ///
+    /// `coordinator_env` must be a **distinct node id** from this Accord replica
+    /// (and from every data replica any tablet in the `router` routes to), since
+    /// the network inbox is single-consumer.
+    pub fn start_with_router(
+        env: E,
+        all_nodes: Vec<NodeId>,
+        storage: S,
+        coordinator_env: E,
+        router: Router,
+    ) -> AccordNode<E, S> {
+        let sink = Arc::new(DataSink {
+            client: DataClient::new(coordinator_env),
+            routing: DataRouting::Sharded(router),
         });
         Self::start_inner(env, all_nodes, storage, Some(sink))
     }
@@ -223,6 +294,28 @@ impl<E: Env, S: StorageEngine + 'static> AccordNode<E, S> {
     /// holds for the returned id.
     pub fn submit_read(&self, keys: BTreeSet<Key>) -> TxnId {
         let (txn, outs) = self.lock().submit_read(keys);
+        persist_then_ship(
+            &self.env,
+            &self.core,
+            &self.storage,
+            &self.reads,
+            &self.sink,
+            outs,
+        );
+        txn
+    }
+
+    /// Submit a **read-modify-write** transaction that reads `read_keys` and
+    /// writes `write_keys` under a single Accord transaction. Its conflict set is
+    /// the union of the two, so a key it merely read participates in ordering
+    /// exactly like one it writes — a concurrent write to a read key is ordered
+    /// relative to this transaction (the read-then-write hazard). Only the
+    /// `write_keys` carry the write effect at execution. See
+    /// [`AccordCore::submit_rw`]; this is what [`InteractiveTxn::commit`] uses so
+    /// an interactive session's reads fold into the committed transaction's
+    /// dependency tracking.
+    pub fn submit_rw(&self, read_keys: BTreeSet<Key>, write_keys: BTreeSet<Key>) -> TxnId {
+        let (txn, outs) = self.lock().submit_rw(read_keys, write_keys);
         persist_then_ship(
             &self.env,
             &self.core,
@@ -321,12 +414,13 @@ impl<E: Env, S: StorageEngine + 'static> AccordNode<E, S> {
     /// write sets conflict are ordered consistently on every replica, and each
     /// transaction's writes land all-or-nothing.
     ///
-    /// The reads *inform* the decision; they are not themselves part of the
-    /// committed write transaction's conflict set in this slice. Folding the
-    /// interactive read set into the transaction's conflict/dependency tracking
-    /// (full read/write transactions in one Accord round) is the natural next
-    /// step — see ADR 0011. The core stays sync + I/O-free: the handle is pure
-    /// driver state and uses the existing `submit` entry point.
+    /// The session's reads are **folded into the committed transaction's conflict
+    /// set** (ADR 0011): `commit()` submits a read-modify-write whose conflict set
+    /// is the union of the keys read and written (via [`AccordNode::submit_rw`]),
+    /// so a concurrent write to a key this session read is ordered relative to
+    /// this transaction — the read-then-write hazard is detected. The core stays
+    /// sync + I/O-free: the handle is pure driver state and reaches the core only
+    /// through `submit_rw` at commit time.
     #[must_use]
     pub fn begin(&self) -> InteractiveTxn<E, S> {
         InteractiveTxn {
@@ -343,14 +437,16 @@ impl<E: Env, S: StorageEngine + 'static> AccordNode<E, S> {
     /// without opening a transaction.
     pub async fn current_writer(&self, key: Key) -> Option<TxnId> {
         match &self.sink {
-            Some(sink) => match sink
-                .client
-                .read(&sink.view, &storage_key(key), DATA_TIMEOUT)
-                .await
-            {
-                ReadResult::Value(Some(bytes)) => decode_txn(&bytes),
-                ReadResult::Value(None) | ReadResult::Failed => None,
-            },
+            Some(sink) => {
+                let sk = storage_key(key);
+                match sink.routing.view_for(&sk) {
+                    Some(view) => match sink.client.read(&view, &sk, DATA_TIMEOUT).await {
+                        ReadResult::Value(Some(bytes)) => decode_txn(&bytes),
+                        ReadResult::Value(None) | ReadResult::Failed => None,
+                    },
+                    None => None,
+                }
+            }
             None => self.store_writer(key).await,
         }
     }
@@ -375,15 +471,16 @@ impl<E: Env, S: StorageEngine + 'static> AccordNode<E, S> {
 /// The handle is **pure driver state** — it holds no lock and touches the sync
 /// core only through `submit` at commit time, so the core stays I/O-free.
 ///
-/// **This slice's scope.** The session reads *inform* the commit decision but are
-/// not themselves serialized into the committed transaction's conflict set
-/// (Accord read/write transactions in one round, where the read set also carries
-/// dependencies, are the deferred next step — see ADR 0011). A `commit` with an
-/// empty write set is a no-op that returns `None`.
+/// **Conflict set.** The session's reads are folded into the committed
+/// transaction's conflict set: `commit()` submits a read-modify-write whose
+/// conflict set is the union of the keys read and written, so a concurrent write
+/// to a key this session read is ordered relative to this transaction (ADR 0011,
+/// the read-then-write hazard). Only the write set carries the write effect. A
+/// `commit` with an empty write set is a no-op that returns `None`.
 pub struct InteractiveTxn<E: Env, S: StorageEngine = MemoryEngine> {
     node: AccordNode<E, S>,
-    /// Keys read during the session (kept for introspection / a future read-set
-    /// conflict fold; not yet serialized into the committed transaction).
+    /// Keys read during the session; folded into the committed transaction's
+    /// conflict set at `commit()` (so they carry dependencies).
     reads: BTreeSet<Key>,
     /// Keys the session will write when committed.
     writes: BTreeSet<Key>,
@@ -419,17 +516,21 @@ impl<E: Env, S: StorageEngine + 'static> InteractiveTxn<E, S> {
         &self.writes
     }
 
-    /// Commit the buffered writes as a single Accord write transaction. Returns
-    /// the committed [`TxnId`], or `None` if nothing was written (an empty
-    /// transaction is a no-op). The transaction is agreed, ordered, and applied
-    /// atomically at one execution timestamp exactly like [`AccordNode::submit`],
-    /// so conflicting interactive transactions are ordered consistently on every
-    /// replica.
+    /// Commit the session as a single Accord read-modify-write transaction.
+    /// Returns the committed [`TxnId`], or `None` if nothing was written (an empty
+    /// write set is a no-op). The transaction's **conflict set is the union of the
+    /// keys read and written** (via [`AccordNode::submit_rw`]), so the session's
+    /// reads fold into the committed transaction's dependency tracking: a
+    /// concurrent write to a key this session read is ordered relative to this
+    /// transaction (the read-then-write hazard is detected), while only the write
+    /// set carries the write effect. Agreed, ordered, and applied atomically at
+    /// one execution timestamp, so conflicting interactive transactions are
+    /// ordered consistently on every replica.
     pub fn commit(self) -> Option<TxnId> {
         if self.writes.is_empty() {
             return None;
         }
-        Some(self.node.submit(self.writes))
+        Some(self.node.submit_rw(self.reads, self.writes))
     }
 }
 
@@ -524,22 +625,27 @@ async fn apply_all<E: Env, S: StorageEngine>(
         let value = encode_txn(effect.txn);
         let version = effect.version.logical;
         for &key in &effect.keys {
+            let sk = storage_key(key);
             storage
-                .merge(&storage_key(key), &value, version)
+                .merge(&sk, &value, version)
                 .await
                 .expect("storage merge");
             if let Some(sink) = sink {
                 // Land the committed write in the replicated data plane in agreed
-                // order. The version is the execution timestamp, strictly
-                // increasing in the total order, so the data plane's per-key LWW
-                // keeps the same winner everywhere. Fire-and-await: the result is
-                // not asserted here (a transient quorum miss is reconciled by the
-                // data plane's own anti-entropy), the test verifies via a quorum
-                // read.
-                let _ = sink
-                    .client
-                    .write(&sink.view, &storage_key(key), &value, version, DATA_TIMEOUT)
-                    .await;
+                // order, routing the key to **its own** tablet's quorum (sharded
+                // transactions, ADR 0011). The version is the execution timestamp,
+                // strictly increasing in the total order, so the data plane's
+                // per-key LWW keeps the same winner everywhere. Fire-and-await: the
+                // result is not asserted here (a transient quorum miss is
+                // reconciled by the data plane's own anti-entropy); the test
+                // verifies via a quorum read. A key no tablet covers is skipped
+                // (it still lands in the local engine above).
+                if let Some(view) = sink.routing.view_for(&sk) {
+                    let _ = sink
+                        .client
+                        .write(&view, &sk, &value, version, DATA_TIMEOUT)
+                        .await;
+                }
             }
         }
     }
@@ -577,22 +683,24 @@ async fn satisfy_reads<E: Env, S: StorageEngine>(
         let version = effect.version.logical;
         let mut observed: BTreeMap<Key, Option<TxnId>> = BTreeMap::new();
         for &key in &effect.keys {
+            let sk = storage_key(key);
             let writer = match sink {
-                // Frontier: observe the replicated data plane (quorum read).
-                Some(sink) => match sink
-                    .client
-                    .read(&sink.view, &storage_key(key), DATA_TIMEOUT)
-                    .await
-                {
-                    ReadResult::Value(Some(bytes)) => decode_txn(&bytes),
-                    // Absent everywhere, or a quorum could not be reached: the
-                    // read observes nothing for this key (a transient quorum
-                    // miss converges via the data plane's own anti-entropy).
-                    ReadResult::Value(None) | ReadResult::Failed => None,
+                // Frontier: observe the replicated data plane (quorum read),
+                // routing the key to its own tablet's quorum (sharded reads).
+                Some(sink) => match sink.routing.view_for(&sk) {
+                    Some(view) => match sink.client.read(&view, &sk, DATA_TIMEOUT).await {
+                        ReadResult::Value(Some(bytes)) => decode_txn(&bytes),
+                        // Absent everywhere, or a quorum could not be reached: the
+                        // read observes nothing for this key (a transient quorum
+                        // miss converges via the data plane's own anti-entropy).
+                        ReadResult::Value(None) | ReadResult::Failed => None,
+                    },
+                    // No tablet covers the key: nothing to observe.
+                    None => None,
                 },
                 // Local consensus store: snapshot read as of the execution ts.
                 None => storage
-                    .get_at(&storage_key(key), version)
+                    .get_at(&sk, version)
                     .await
                     .expect("storage get_at")
                     .and_then(|vv| decode_txn(&vv.value)),
@@ -660,16 +768,28 @@ async fn drive<E: Env, S: StorageEngine + 'static>(
     }
 }
 
-/// The retry tick: on a periodic `Env` timer, re-send the outbound messages for
-/// every in-flight round that has not completed (ADR 0011, message retry).
+/// The retry tick: on an **adaptive (exponential-backoff)** `Env` timer, re-send
+/// the outbound messages for every in-flight round that has not completed (ADR
+/// 0011, message retry + adaptive backoff).
 ///
 /// `Network::send` is fire-and-forget and may drop, which would otherwise strand
 /// a transaction. The synchronous core decides *what* is still owed and *to
-/// whom* ([`AccordCore::resend_pending`]); this driver only sleeps on the timer,
+/// whom* ([`AccordCore::resend_pending`]); this driver only times the re-sends,
 /// drains, and ships — so determinism stays in the core and no lock is held
-/// across an `.await`. A completed round emits nothing, so retries stop on their
-/// own. We route through `persist_then_ship` so any incidental durable records or
-/// effects drain too (in steady state there are none on a pure retry).
+/// across an `.await`.
+///
+/// **Backoff.** Instead of a fixed interval, the wait starts at
+/// [`RETRY_BASE_INTERVAL`] and **doubles** (capped at [`RETRY_MAX_INTERVAL`])
+/// each round in which the same-or-more messages are still owed — so a
+/// transaction that genuinely cannot gather a quorum is retried ever less often,
+/// cutting redundant sends under persistent loss. It **resets to the base** the
+/// moment a round makes progress (strictly fewer messages owed than last tick —
+/// a reply got through) or completes (none owed), so a transient drop is still
+/// recovered promptly. The backoff state is a plain local, so the timer stays a
+/// deterministic `Env` timer and the run remains seed-reproducible. A completed
+/// round emits nothing, so retries stop on their own. We route through
+/// `persist_then_ship` so any incidental durable records/effects drain too (in
+/// steady state there are none on a pure retry).
 async fn retry_loop<E: Env, S: StorageEngine + 'static>(
     env: E,
     core: Arc<Mutex<AccordCore>>,
@@ -677,12 +797,25 @@ async fn retry_loop<E: Env, S: StorageEngine + 'static>(
     reads: ReadResults,
     sink: Option<Arc<DataSink<E>>>,
 ) {
+    let mut interval = RETRY_BASE_INTERVAL;
+    // The number of messages owed on the previous tick, to detect progress.
+    let mut last_owed: usize = 0;
     loop {
-        env.sleep(RETRY_INTERVAL).await;
+        env.sleep(interval).await;
         let outs = {
             let mut c = core.lock().expect("accord core poisoned");
             c.resend_pending()
         };
+        let owed = outs.len();
+        // Adapt the next interval: reset to base on progress (fewer owed, incl.
+        // dropping to zero), otherwise back off (double, capped). A round that is
+        // still stuck at the same owed count is retried less and less often.
+        if owed == 0 || owed < last_owed {
+            interval = RETRY_BASE_INTERVAL;
+        } else {
+            interval = (interval * 2).min(RETRY_MAX_INTERVAL);
+        }
+        last_owed = owed;
         if !outs.is_empty() {
             persist_then_ship(&env, &core, &storage, &reads, &sink, outs);
         }

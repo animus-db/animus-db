@@ -21,13 +21,18 @@ use crate::timestamp::Timestamp;
 /// learned the `Commit` — see [`crate::core`] and ADR 0011.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AccordMsg {
-    /// Coordinator → replicas: proposes transaction `txn` (its `t0`) over `keys`.
-    /// `read_only` marks a read transaction (executes a `get_at` snapshot at its
-    /// execution timestamp, writes nothing) — ordered exactly like a write, only
-    /// its execution *effect* differs.
+    /// Coordinator → replicas: proposes transaction `txn` (its `t0`) over `keys`
+    /// (its full conflict set — every key read *or* written). `write_keys` is the
+    /// subset it writes (empty ⇒ a pure read; equal to `keys` ⇒ a pure write; a
+    /// non-empty strict subset ⇒ a read-modify-write whose extra `keys` are
+    /// read-only and participate only in conflict/dependency tracking).
+    /// `read_only` marks a transaction that writes nothing — ordered exactly like
+    /// a write, only its execution *effect* differs.
     PreAccept {
         txn: TxnId,
         keys: BTreeSet<Key>,
+        #[serde(default)]
+        write_keys: BTreeSet<Key>,
         read_only: bool,
     },
     /// Replica → coordinator: the timestamp this replica proposes for `txn`
@@ -54,6 +59,11 @@ pub enum AccordMsg {
         txn: TxnId,
         execute_at: Timestamp,
         deps: BTreeSet<TxnId>,
+        /// The subset of the transaction's keys it writes (so a replica that
+        /// learns the transaction only at `Commit` still executes the correct
+        /// write effect). Empty for a read-only transaction.
+        #[serde(default)]
+        write_keys: BTreeSet<Key>,
         read_only: bool,
     },
     /// Replica → coordinator: acknowledges the `Commit` was recorded. `Commit`
@@ -76,8 +86,11 @@ pub enum AccordMsg {
         execute_at: Timestamp,
         /// The best-known dependency set.
         deps: BTreeSet<TxnId>,
-        /// The transaction's key set, as known to this replica.
+        /// The transaction's full conflict key set, as known to this replica.
         keys: BTreeSet<Key>,
+        /// The subset of `keys` the transaction writes, as known to this replica.
+        #[serde(default)]
+        write_keys: BTreeSet<Key>,
         /// Whether this replica recorded the transaction as read-only.
         read_only: bool,
     },

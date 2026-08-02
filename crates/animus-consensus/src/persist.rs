@@ -30,6 +30,10 @@ pub enum WalRecord {
     PreAccepted {
         txn: TxnId,
         keys: BTreeSet<Key>,
+        /// The subset of `keys` the transaction writes (recovers the write
+        /// effect's target keys for a read-modify-write).
+        #[serde(default)]
+        write_keys: BTreeSet<Key>,
         execute_at: Timestamp,
         deps: BTreeSet<TxnId>,
         /// Whether the transaction is read-only (recovers the execution effect
@@ -50,6 +54,9 @@ pub enum WalRecord {
     Committed {
         txn: TxnId,
         keys: BTreeSet<Key>,
+        /// The subset of `keys` the transaction writes.
+        #[serde(default)]
+        write_keys: BTreeSet<Key>,
         execute_at: Timestamp,
         deps: BTreeSet<TxnId>,
         /// Whether the transaction is read-only.
@@ -78,8 +85,10 @@ impl WalRecord {
 /// The durable replica facts about one transaction, rebuilt by folding the WAL.
 #[derive(Clone, Debug, Default)]
 pub struct PersistedTxn {
-    /// The transaction's key set (known once PreAccepted or Committed).
+    /// The transaction's conflict key set (known once PreAccepted or Committed).
     pub keys: BTreeSet<Key>,
+    /// The subset of `keys` the transaction writes (its write effect's targets).
+    pub write_keys: BTreeSet<Key>,
     /// Best-known execution timestamp.
     pub execute_at: Timestamp,
     /// Best-known dependency set.
@@ -116,6 +125,7 @@ impl PersistedState {
             match record {
                 WalRecord::PreAccepted {
                     keys,
+                    write_keys,
                     execute_at,
                     deps,
                     read_only,
@@ -123,6 +133,7 @@ impl PersistedState {
                 } => {
                     let entry = state.txns.entry(txn).or_default();
                     entry.keys.extend(keys);
+                    entry.write_keys.extend(write_keys);
                     entry.execute_at = entry.execute_at.max(execute_at);
                     entry.deps.extend(deps);
                     entry.phase = entry.phase.max_phase(Phase::PreAccepted);
@@ -138,6 +149,7 @@ impl PersistedState {
                 }
                 WalRecord::Committed {
                     keys,
+                    write_keys,
                     execute_at,
                     deps,
                     read_only,
@@ -145,6 +157,7 @@ impl PersistedState {
                 } => {
                     let entry = state.txns.entry(txn).or_default();
                     entry.keys.extend(keys);
+                    entry.write_keys.extend(write_keys);
                     entry.execute_at = execute_at;
                     entry.deps = deps;
                     entry.phase = Phase::Committed;
