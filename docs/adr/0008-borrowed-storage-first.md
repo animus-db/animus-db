@@ -64,10 +64,23 @@ seam and so cannot be driven by the simulator.
   ≈`target_table_bytes`), so read amplification is bounded by the number of levels
   rather than the total table count. L0→L1 fires at `compaction_trigger`; deeper
   levels cascade when over a fanout-scaled table budget. Every distinct
-  `(key, version)` record is preserved across a compaction, keeping the merged
-  view observationally identical to `MemoryEngine`;
-- **recovery** on open: read the manifest, open the named SSTables, replay the
-  live WAL segments (in order) into the memtable, restore the monotonic floor.
+  `(key, version)` record above the GC floor is preserved across a compaction,
+  keeping the retained-window view observationally identical to `MemoryEngine`;
+- **tombstone GC** (during compaction): a tombstone (and the older versions it
+  shadows) is reclaimed once it has aged below the **GC floor** =
+  `max_version - LsmOptions::tombstone_grace_versions` **and** no deeper,
+  uncompacted level could still hold an older value for the key (which would
+  otherwise resurface). Below the floor, a key's history is also compacted to its
+  floor anchor — pure space reclamation. Nothing in the retained window
+  `(gc_floor, max_version]` is touched, so every `get_at` above the floor is
+  unchanged and the differential proptest stays green for it. The grace should
+  exceed the maximum anti-entropy lag so a delete still propagates before its
+  tombstone is reclaimed (ADR 0010);
+- **recovery** on open: read the manifest, open the named SSTables, **reclaim
+  orphan WAL segments below the live set** (covered files a crash-after-swap-
+  before-`remove` leaked — data-safe to delete, since their records are already in
+  an SSTable), replay the live WAL segments (in order) into the memtable, restore
+  the monotonic floor.
 
 Crash safety is argued at the manifest swap: a crash mid-flush or mid-compaction
 (new SSTable written but the manifest not yet swapped) recovers the last durable
@@ -75,11 +88,15 @@ manifest plus the intact WAL — no loss, no torn-table read, the orphan file
 ignored. WAL segment GC is safe at the same swap: a segment file is `remove`d only
 after a manifest that no longer names it is durable, so a crash mid-GC recovers a
 manifest that still lists the segment (intact) or an orphan covered segment below
-the live set whose records are already in the SSTable (ignored). Recovery also
-replays any segment file present beyond the manifest's recorded set — writes acked
-after the last flush — so an un-flushed segment is never lost. These are tested
-under fault injection in `animus-storage/tests/lsm_crash.rs` and
-`animus-storage/tests/lsm_wal_rotation.rs`.
+the live set whose records are already in the SSTable (ignored, and now **removed
+on the next open** so it does not leak — `remove_orphan_wal_segments`). Recovery
+also replays any segment file present beyond the manifest's recorded set — writes
+acked after the last flush — so an un-flushed segment is never lost. Tombstone GC
+is likewise crash-safe: it happens inside a compaction, whose merged output is an
+orphan until the single manifest swap, so a crash mid-GC recovers the pre-GC
+inputs (still named + intact). These are tested under fault injection in
+`animus-storage/tests/lsm_crash.rs`, `animus-storage/tests/lsm_wal_rotation.rs`
+(including orphan-segment cleanup), and `animus-storage/tests/lsm_gc.rs`.
 
 ## Consequences
 
@@ -172,5 +189,22 @@ under fault injection in `animus-storage/tests/lsm_crash.rs` and
   crash mid-rotation). The group-commit liveness invariant (no mutex guard across
   `.await`, `DurableUpTo` re-leads) is unchanged and still covered by
   `lsm_concurrent.rs`.
+- **Tombstone GC + orphan WAL cleanup** (`lsm.rs`): the two tail items of the
+  LSM are done. (1) **Tombstone GC during compaction**: `run_compaction` now
+  reclaims a tombstone — and the versions it shadows — once it sits at/below the
+  **GC floor** (`max_version - LsmOptions::tombstone_grace_versions`) and no
+  deeper, uncompacted level overlaps the key (the deeper-level guard prevents
+  resurrecting an older value). `gc_obsolete_records` does this per key over the
+  merged record stream; versions in the retained window `(gc_floor, max_version]`
+  are untouched, so reads above the floor are unchanged and the differential
+  proptest stays green for that window (it now asserts the only digest difference
+  is below-floor reclaimed tombstones). New `lsm_gc.rs` asserts an aged tombstone
+  is physically gone (key + shadowed value) while a within-grace one is preserved,
+  and that GC never resurrects a key with a deeper old value. (2) **Orphan WAL
+  cleanup**: `open` calls `remove_orphan_wal_segments` to delete WAL segment files
+  below the live set — the covered files a crash-after-manifest-swap-before-
+  `remove` can leak (recovery already ignored them; now it also reclaims them).
+  Tested in `lsm_wal_rotation.rs`. Both are crash-safe at the existing single
+  manifest swap; no trait change, no new dependency.
 - **Still deferred within `LsmEngine`** (correctness-first, performance later):
   none of the remaining ideas affect the trait or correctness.

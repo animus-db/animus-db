@@ -77,6 +77,17 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
   `compaction_trigger`; deeper levels cascade over a fanout-scaled budget. Reads
   merge the memtable (newest) with SSTables newest→oldest by version, matching
   `MemoryEngine` exactly (a differential proptest in `lsm_semantics.rs` pins this).
+- **Tombstone GC happens during compaction** (`gc_obsolete_records` in `lsm.rs`):
+  a tombstone (and the versions it shadows) is reclaimed once it is at/below the
+  **GC floor** = `max_version - LsmOptions::tombstone_grace_versions` AND no
+  deeper, uncompacted level overlaps the key (the deeper-level guard — else an
+  older value would resurface). Nothing in the retained window
+  `(gc_floor, max_version]` is touched, so every `get_at` above the floor is
+  unchanged; the differential proptest stays green for that window and now asserts
+  the only `entries_with_tombstones` difference vs `MemoryEngine` is below-floor
+  reclaimed tombstones (`MemoryEngine` never GCs). Set the grace **above the max
+  anti-entropy lag** so a delete propagates before its tombstone is reclaimed (ADR
+  0010). `lsm_gc.rs` is the dedicated test.
 - **Two read gates skip an SSTable before any disk read** (`sstable.rs`
   `SsTableMeta::may_contain`): the key range `[min_key, max_key]`, then the
   per-table **Bloom filter** (`lsm/bloom.rs` — a hand-rolled FNV-1a
@@ -103,7 +114,10 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
   it reconstructs the memtable exactly as the single-file replay did; a directory
   with no recorded segments falls back to replaying a legacy single-file
   `<prefix>wal` (upgrade path). The seq space is monotonic for the engine's life
-  (rotation/GC never reset it).
+  (rotation/GC never reset it). **Orphan WAL segments below the live set** (covered
+  files a crash-after-manifest-swap-before-`remove` leaked) are deleted on open by
+  `remove_orphan_wal_segments` — recovery already ignored them (it only probes
+  *forward*), this also reclaims them so they don't leak.
 - **Crash safety** holds at the manifest swap: a crash mid-flush or
   mid-compaction recovers the last durable manifest + the intact WAL segments — the
   orphan SSTable (un-synced, never manifest-referenced, at a seq beyond the
@@ -111,8 +125,11 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
   is only read once a *synced* manifest names it. WAL GC is safe at the same swap:
   a segment is `remove`d only after a manifest not naming it is durable, so a crash
   mid-GC recovers a manifest that still lists it (intact) or an orphan covered
-  segment *below* the live set (ignored — its data is in the SSTable). Argued in
-  `lsm.rs` module docs, exercised in `lsm_crash.rs` + `lsm_wal_rotation.rs`.
+  segment *below* the live set (ignored — its data is in the SSTable — and removed
+  on the next open). **Tombstone GC is crash-safe at the same swap**: it runs
+  inside a compaction whose merged output is an orphan until the manifest swap, so
+  a crash mid-GC recovers the pre-GC inputs. Argued in `lsm.rs` module docs,
+  exercised in `lsm_crash.rs` + `lsm_wal_rotation.rs` + `lsm_gc.rs`.
 
 ## Tests & benchmark
 
@@ -136,7 +153,10 @@ SSTables + live WAL segments), and a crash mid-rotation recovering correctly
 `sstable_count`/`flush_count`/`compaction_count`/`block_read_count`/
 `reset_block_reads`/`level_table_counts`/`levels_non_overlapping`/
 `wal_segment_count`/`wal_segments`/`wal_batch_sync_count`/
-`test_write_orphan_sstable` introspection helpers for these tests.
+`test_write_orphan_sstable`/`test_write_orphan_wal_segment`/`test_disk_versions_of`
+introspection helpers for these tests. `lsm_gc.rs` covers tombstone GC: an aged
+tombstone (and its shadowed value) is physically reclaimed while a within-grace
+tombstone is preserved, and GC never resurrects a key with a deeper old value.
 
 `lsm_concurrent.rs` is a **real multi-threaded** regression (`#[tokio::test(flavor
 = "multi_thread")]` over `ProdEnv`, timeout-guarded): the deterministic single-

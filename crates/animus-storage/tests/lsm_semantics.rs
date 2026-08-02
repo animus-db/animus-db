@@ -13,6 +13,10 @@ use animus_storage::{LsmEngine, LsmOptions, Snapshot, StorageEngine, StorageErro
 use futures::executor::block_on;
 use proptest::prelude::*;
 
+/// Tombstone GC grace (in versions) used by the differential test, kept in sync
+/// with the `LsmOptions` below so the test can compute the GC floor.
+const GRACE: u64 = 4;
+
 /// Open a fresh LSM engine on a fresh simulated disk, with a small flush
 /// threshold so tests exercise the on-disk path, not just the memtable.
 fn open(seed: u64) -> LsmEngine<animus_sim::SimEnv> {
@@ -27,6 +31,9 @@ fn open(seed: u64) -> LsmEngine<animus_sim::SimEnv> {
         // Small so the WAL rotates across segments under the differential test,
         // keeping semantics identical to `MemoryEngine` through rotation + GC.
         wal_segment_bytes: 96,
+        // Small grace so tombstone GC actually fires during the differential test:
+        // reads in the retained window must still match `MemoryEngine` exactly.
+        tombstone_grace_versions: GRACE,
     };
     block_on(LsmEngine::open_with(sim.env(0), "db/", opts)).expect("open")
 }
@@ -307,12 +314,42 @@ proptest! {
                     }
                 }
             }
-            // Compare full live digest and tombstone digest.
+            // The live digest (`entries`) is GC-invariant: tombstone reclamation
+            // never changes any live key, so it must match exactly.
             prop_assert_eq!(lsm.entries().await.unwrap(), mem.entries().await.unwrap());
-            prop_assert_eq!(
-                lsm.entries_with_tombstones().await.unwrap(),
-                mem.entries_with_tombstones().await.unwrap()
-            );
+
+            // The tombstone digest (`entries_with_tombstones`) may legitimately
+            // differ from `MemoryEngine` *only* by below-floor tombstones the LSM
+            // reclaimed during compaction (`MemoryEngine` never GCs). Assert that
+            // the only difference is exactly that: every entry the LSM kept matches
+            // `MemoryEngine`, and every entry `MemoryEngine` has but the LSM dropped
+            // is a tombstone at a version at/below the GC floor (the retained window
+            // `(gc_floor, max]` is untouched — the deliverable's invariant).
+            let gc_floor = version.saturating_sub(GRACE);
+            let lsm_ts: std::collections::BTreeMap<_, _> = lsm
+                .entries_with_tombstones()
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|(k, slot, v)| (k, (slot, v)))
+                .collect();
+            for (k, slot, v) in mem.entries_with_tombstones().await.unwrap() {
+                match lsm_ts.get(&k) {
+                    Some((lslot, lv)) => {
+                        prop_assert_eq!((lslot, *lv), (&slot, v), "kept tombstone entry diverged");
+                    }
+                    None => {
+                        prop_assert!(
+                            slot.is_none() && v <= gc_floor,
+                            "LSM dropped a non-reclaimable entry: key={:?} slot={:?} v={} floor={}",
+                            k,
+                            slot,
+                            v,
+                            gc_floor
+                        );
+                    }
+                }
+            }
             // Compare point reads for every key in [0..3]^len up to length 2.
             for a in 0u8..3 {
                 let k1 = vec![a];

@@ -26,6 +26,7 @@ fn opts() -> LsmOptions {
         target_table_bytes: 1 << 20,
         level_fanout: 8,
         wal_segment_bytes: 64,
+        tombstone_grace_versions: 1 << 20,
     }
 }
 
@@ -245,6 +246,91 @@ fn crash_mid_rotation_recovers_all_acked_writes() {
                 .value,
             format!("v{}", count - 1).as_bytes(),
             "seed={seed}: re-recovery lost the tail",
+        );
+    });
+}
+
+/// Orphan WAL-segment cleanup on open: a crash *after* a flush swapped the manifest
+/// (dropping a covered segment from the live set) but *before* the GC `remove` ran
+/// leaves the covered segment file on disk, below the live set. Recovery already
+/// ignores it (its records are in the SSTable), but it would leak forever; `open`
+/// reclaims it. We model the leak directly by injecting a durable orphan segment
+/// below the live set, reopening, and asserting it is removed and recovery is
+/// unchanged.
+#[test]
+fn open_removes_orphan_wal_segments_below_the_live_set() {
+    let seed = 0xABBA5E6_u64;
+    let sim = Simulator::new(seed);
+    let count = 120u64;
+    {
+        let e = open(&sim);
+        block_on(async {
+            for i in 0..count {
+                let k = format!("key-{i:04}");
+                e.put(k.as_bytes(), format!("val-{i}").as_bytes(), i + 1)
+                    .await
+                    .unwrap();
+            }
+            assert!(
+                e.flush_count() >= 1,
+                "seed={seed}: need a flush so some segments were GC'd"
+            );
+        });
+
+        // Inject a durable orphan segment file *below* the live set: this is exactly
+        // what a crash-after-swap-before-remove leaves behind. Its number is below
+        // the lowest live segment, so it must be treated as a covered orphan.
+        let live = block_on(LsmEngine::open_with(sim.env(0), PREFIX, opts()))
+            .unwrap()
+            .wal_segments();
+        let lowest_live = *live.iter().min().unwrap();
+        assert!(
+            lowest_live > 0,
+            "seed={seed}: expected a GC'd prefix so an orphan below the live set is possible (live={live:?})"
+        );
+        let orphan_seg = lowest_live - 1;
+        let e = open(&sim);
+        block_on(async {
+            // Bytes that, if ever replayed, would be a junk WAL line (it is not — it
+            // sits below the live set and must be removed, not replayed).
+            e.test_write_orphan_wal_segment(orphan_seg, b"garbage-orphan-not-replayed\n")
+                .await;
+        });
+        let env = sim.env(0);
+        assert!(
+            block_on(env.size(&format!("{PREFIX}wal-{orphan_seg:06}"))).unwrap() > 0,
+            "seed={seed}: orphan should be present before reopen"
+        );
+    }
+
+    // Reopen: the orphan below the live set is removed, and every acked write is
+    // still recovered correctly (orphan removal does not perturb recovery).
+    let e = open(&sim);
+    let env = sim.env(0);
+    block_on(async {
+        let live = e.wal_segments();
+        let lowest_live = *live.iter().min().unwrap();
+        let orphan_seg = lowest_live - 1;
+        assert_eq!(
+            env.size(&format!("{PREFIX}wal-{orphan_seg:06}"))
+                .await
+                .unwrap(),
+            0,
+            "seed={seed}: orphan WAL segment {orphan_seg} should have been removed on open"
+        );
+        // Recovery is correct: all acked writes present.
+        for i in 0..count {
+            let k = format!("key-{i:04}");
+            assert_eq!(
+                e.get(k.as_bytes()).await.unwrap().unwrap().value,
+                format!("val-{i}").as_bytes(),
+                "seed={seed}: key {k} lost after orphan cleanup"
+            );
+        }
+        assert_eq!(
+            e.latest_version(),
+            count,
+            "seed={seed}: monotonic floor preserved across orphan cleanup"
         );
     });
 }

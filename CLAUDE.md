@@ -335,8 +335,10 @@ segments group-committed and GC'd whole on flush → memtable → flushed,
 CRC-checksummed,
 **LZ4-compressed** SSTables with a block index + footer + per-table **Bloom
 filter** → **leveled compaction** (overlapping L0 flush tier, non-overlapping
-L1+ runs) → atomically-swapped, **compact binary** MANIFEST (also recording the
-live WAL segments), recovered on open)
+L1+ runs, with **tombstone GC** reclaiming deletes aged below a grace floor) →
+atomically-swapped, **compact binary** MANIFEST (also recording the
+live WAL segments), recovered on open — which also reclaims orphan WAL segments a
+crash left below the live set)
 that does **all** I/O through the `Env` `Disk` seam,
 so its crash recovery is **deterministically simulation-tested** under `SimEnv`
 (ADR 0008). A point read skips a table whose key range or Bloom filter proves the

@@ -30,6 +30,8 @@ fn opts() -> LsmOptions {
         // Small so the WAL rolls into several segments and crash recovery exercises
         // multi-segment replay + the GC path.
         wal_segment_bytes: 96,
+        // Default-ish large grace: these tests assert durability/recovery, not GC.
+        tombstone_grace_versions: 1 << 20,
     }
 }
 

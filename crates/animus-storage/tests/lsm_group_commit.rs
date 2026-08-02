@@ -35,6 +35,7 @@ fn opts() -> LsmOptions {
         // Large so the WAL never rotates mid-test: these tests exercise the
         // group-commit path on one segment, not rotation.
         wal_segment_bytes: 1 << 20,
+        tombstone_grace_versions: 1 << 20,
     }
 }
 
