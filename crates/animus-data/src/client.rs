@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use animus_env::{Env, NodeId};
+use animus_env::{Env, Metric, MetricsHandle, NodeId};
 use animus_tablet::{Epoch, Tablet, TabletId};
 use futures::future::{Either, select};
 
@@ -106,16 +106,41 @@ pub struct DataClient<E: Env> {
     /// Residency bound on which replicas may be hinted (ADR 0005); `None` ⇒ no
     /// boundary. Only consulted when `hints` is `Some`.
     allowed: AllowedTargets,
+    /// Observability sink (ADR 0015). Defaults to `env.metrics()` (the env's own
+    /// recording handle under `ProdEnv`, the shared no-op under `SimEnv`); a sim
+    /// test threads a recording handle via [`with_metrics`](DataClient::with_metrics)
+    /// to read the coordinator's counters back. Recording is a relaxed atomic add,
+    /// so it never perturbs determinism and never changes quorum behavior.
+    metrics: MetricsHandle,
 }
 
 impl<E: Env> DataClient<E> {
     /// Create a coordinator on `env` with **no** hinted handoff (hints disabled).
     pub fn new(env: E) -> Self {
+        let metrics = env.metrics();
         Self {
             env,
             hints: None,
             allowed: None,
+            metrics,
         }
+    }
+
+    /// Record this coordinator's quorum/read-repair counters into `metrics`
+    /// instead of `env.metrics()` (ADR 0015). Additive and observe-only — it
+    /// changes no quorum behavior. Used by a sim test to read counters back
+    /// (`SimEnv::metrics()` is the no-op default), and composes with
+    /// [`with_hints`](DataClient::with_hints).
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: MetricsHandle) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
+    /// This coordinator's metrics handle (ADR 0015).
+    #[must_use]
+    pub fn metrics(&self) -> &MetricsHandle {
+        &self.metrics
     }
 
     /// Create a coordinator on `env` that **buffers hints** for replicas a
@@ -124,10 +149,12 @@ impl<E: Env> DataClient<E> {
     /// [`serve_hint_handoff`](crate::serve_hint_handoff) over the same `env` and
     /// `hints`/`allowed` so the buffered hints are replayed when a target returns.
     pub fn with_hints(env: E, hints: HintStore, allowed: AllowedTargets) -> Self {
+        let metrics = env.metrics();
         Self {
             env,
             hints: Some(hints),
             allowed,
+            metrics,
         }
     }
 
@@ -147,6 +174,7 @@ impl<E: Env> DataClient<E> {
         version: u64,
         timeout: Duration,
     ) -> bool {
+        self.metrics.incr(Metric::DataQuorumWritesAttempted);
         let req = self.env.next_u64();
         let msg = DataMsg::Write {
             req,
@@ -178,10 +206,13 @@ impl<E: Env> DataClient<E> {
         })
         .await;
         let committed = acks >= view.w;
-        // On a committed write, buffer a hint for every replica that did not ack
-        // it, so it converges promptly when it returns (residency-bounded).
         if committed {
+            self.metrics.incr(Metric::DataQuorumWritesSucceeded);
+            // On a committed write, buffer a hint for every replica that did not
+            // ack it, so it converges promptly when it returns (residency-bounded).
             self.hint_unreached(view, &acked, key, Some(value.to_vec()), version);
+        } else {
+            self.metrics.incr(Metric::DataQuorumWritesFailed);
         }
         committed
     }
@@ -198,6 +229,8 @@ impl<E: Env> DataClient<E> {
         version: u64,
         timeout: Duration,
     ) -> bool {
+        // A delete is a quorum mutation, counted under the write counters.
+        self.metrics.incr(Metric::DataQuorumWritesAttempted);
         let req = self.env.next_u64();
         let msg = DataMsg::Delete {
             req,
@@ -226,10 +259,13 @@ impl<E: Env> DataClient<E> {
         })
         .await;
         let committed = acks >= view.w;
-        // A committed delete hints the unreached replicas with a tombstone
-        // (`None`), so the delete converges to them just as a value would.
         if committed {
+            self.metrics.incr(Metric::DataQuorumWritesSucceeded);
+            // A committed delete hints the unreached replicas with a tombstone
+            // (`None`), so the delete converges to them just as a value would.
             self.hint_unreached(view, &acked, key, None, version);
+        } else {
+            self.metrics.incr(Metric::DataQuorumWritesFailed);
         }
         committed
     }
@@ -247,6 +283,10 @@ impl<E: Env> DataClient<E> {
             Some(qr) => {
                 if qr.diverged {
                     if let Some((ver, val)) = &qr.best {
+                        // One repair push per divergent read; it carries exactly
+                        // one key (the winning `(value, version)`).
+                        self.metrics.incr(Metric::DataReadRepairTriggered);
+                        self.metrics.incr(Metric::DataReadRepairKeysRepaired);
                         self.read_repair(view, key, val, *ver).await;
                     }
                 }
@@ -377,6 +417,7 @@ impl<E: Env> DataClient<E> {
         key: &[u8],
         timeout: Duration,
     ) -> Option<QuorumRead> {
+        self.metrics.incr(Metric::DataQuorumReadsAttempted);
         let req = self.env.next_u64();
         let msg = DataMsg::Read {
             req,
@@ -413,8 +454,10 @@ impl<E: Env> DataClient<E> {
         .await;
 
         if oks < view.r {
+            self.metrics.incr(Metric::DataQuorumReadsFailed);
             return None;
         }
+        self.metrics.incr(Metric::DataQuorumReadsSucceeded);
         // Diverged if any responder lagged the winning version (or lacked the
         // key while a winner exists).
         let diverged = best
@@ -478,13 +521,16 @@ impl<E: Env> DataClient<E> {
         };
         for &replica in &view.replicas {
             if !acked.contains(&replica) {
-                hints.record(
+                let stored = hints.record(
                     &self.allowed,
                     replica,
                     view.tablet,
                     view.epoch,
                     (key.to_vec(), value.clone(), version),
                 );
+                if stored {
+                    self.metrics.incr(Metric::DataHintsStored);
+                }
             }
         }
     }

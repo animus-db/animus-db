@@ -120,6 +120,22 @@ tablet map, and per-tablet epoch fencing (ADR 0001, 0002).
   trusted in-region participant), exactly as it must for coordinator read-repair.
   Deferred: tombstone GC (a grace period before reclaiming tombstones); a
   capped/TTL'd + durable hint store; and residency on backup.
+- **Observability (ADR 0015)** is *observe-only* — recording changes no quorum
+  semantics and every public signature stays additive. The `DataClient`
+  coordinator records `data_quorum_writes_*`/`data_quorum_reads_*`
+  (attempted/succeeded/failed; a delete is a quorum mutation counted under the
+  *write* counters), `data_read_repair_triggered` + `_keys_repaired` (a divergent
+  read pushes the winner back), and `data_hints_stored` (per residency-admitted
+  hint buffered for an unreached replica). The background loops record
+  `data_hints_delivered` (a hint batch re-sent to a returning target) and
+  `data_anti_entropy_rounds` (each round emitting a non-empty digest). The
+  coordinator's handle defaults to `env.metrics()`; thread a recording handle in
+  with `DataClient::with_metrics` / `serve_anti_entropy_with_metrics` /
+  `serve_hint_{handoff,replay}_with_metrics` (the originals forward
+  `env.metrics()`) — that's how a sim test reads counters back without touching
+  `SimEnv` (`SimEnv::metrics()` is the no-op default). Recording is a relaxed
+  atomic add (no wall clock, no `HashMap`, no I/O), so it never perturbs
+  determinism.
 - A replica serves over any `StorageEngine`; values are opaque bytes. Higher
   layers (e.g. the dynamo adapter, or list-append test workloads) define their
   own value encoding.
@@ -149,6 +165,16 @@ and the hint is replayed so it converges with **no read and no anti-entropy**
 `serve_hint_replay`); plus the residency bound — a placement-ineligible replica
 is never hinted nor replayed to, while an eligible one is. `digest.rs` has inline
 unit tests for the digest itself.
+
+`metrics.rs` (ADR 0015) drives a known workload and asserts the `data_*`
+counters move by the expected amounts — a quorum write+read bumps the
+attempted/succeeded counters; a two-replica crash makes a write fail sub-quorum;
+an `R=3` read against a deliberately-stale replica triggers exactly one
+read-repair / one repaired key; a crash-then-return replica buffers a hint that
+the replay loop delivers; a seeded replica's anti-entropy loop counts its rounds
+— and that the recorded snapshot is byte-identical across two runs of one seed
+(determinism). It threads a recording `MetricsHandle` into the coordinator/loops
+since `SimEnv::metrics()` is the no-op default.
 
 `concurrent_multithread.rs` is a **real multi-threaded** liveness regression
 (`#[tokio::test(flavor = "multi_thread", worker_threads = 4)]` over `ProdEnv`,

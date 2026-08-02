@@ -17,9 +17,12 @@ the production implementation; the deterministic implementation lives in
 - `prod.rs` — `ProdEnv`: real monotonic clock, `OsRng`, `tokio::spawn`,
   length-prefixed TCP, `tokio::fs` + `fsync`. Owns a real recording metrics sink
   and exposes `metrics_text()` (ADR 0015).
-- `metrics.rs` — the **observability seam** (ADR 0015): a closed `Metric` enum,
-  a fixed-array lock-free `MetricSink`, the cheap-to-clone `MetricsHandle`, and
-  the `MetricSnapshot` text export.
+- `metrics.rs` — the **observability seam** (ADR 0015): a closed `Metric` enum
+  (`control_*` Raft + `data_*` leaderless-AP counters), a fixed-array lock-free
+  `MetricSink`, the cheap-to-clone `MetricsHandle`, and the `MetricSnapshot` text
+  export. The enum is **append-only**: add new variants *after* the existing ones
+  (and a matching row in `Metric::ALL`) so slots and the export order stay stable
+  and the snapshot remains byte-reproducible.
 
 ## What's non-obvious
 
@@ -57,7 +60,11 @@ the production implementation; the deterministic implementation lives in
   overrides `metrics()` with a recording sink; a sim test that wants to *read*
   counters threads a recording handle into the component (e.g.
   `RaftNode::start_with_metrics`) rather than relying on the no-op default — so
-  no change to `animus-sim` is needed to observe metrics.
+  no change to `animus-sim` is needed to observe metrics. The data plane follows
+  the same pattern: the `DataClient` coordinator defaults to `env.metrics()` and
+  takes an explicit handle via `DataClient::with_metrics`; the background loops
+  have additive `serve_anti_entropy_with_metrics` / `serve_hint_*_with_metrics`
+  variants (the originals forward `env.metrics()`).
 
 ## Tests
 

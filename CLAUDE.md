@@ -212,6 +212,13 @@ cross-cutting ones. Prune/merge entries that become obsolete.
 - **Never hold a `std::sync::Mutex` guard across an `.await`** in `<E: Env>`
   code — it breaks `Send` (often a *compile* error via `spawn_task`'s bound) and
   risks nondeterminism. Take the lock, mutate, drop it; do I/O lock-free.
+- **Count a metric at the site that knows the *real* outcome, not the attempt.**
+  A counter recorded where an op is *requested* over-counts when a downstream
+  helper silently no-ops (e.g. `HintStore::record` drops a hint on a residency or
+  LWW-supersede miss). Have the helper *return* whether it acted and count on that
+  (`data_hints_stored` counts only hints actually stored). This keeps the closed
+  `Metric` enum (ADR 0015) append-only/byte-reproducible and the seam observe-only
+  — instrumenting must never change the path it measures.
 - **Don't react to "I was superseded" by *immediately* re-proposing higher** —
   that is the classic duelling-proposers **livelock** (two recoverers ratchet each
   other's ballot forever within one logical instant, an unbounded message storm).
