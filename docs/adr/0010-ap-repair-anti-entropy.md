@@ -130,11 +130,22 @@ primitive:
   and asserting it converges to the tombstone with **no reads at all**, and that
   the lagging replica pushing its stale value back does not resurrect the key
   (`animus-data/tests/repair.rs`).
-- **Tombstone GC is deferred.** Tombstones currently live forever in a key's
-  MVCC history (so they win LWW and stay in the digest). A real system reclaims
-  them after a grace period exceeding the max anti-entropy lag; this — and its
-  interaction with a replica that was offline longer than the grace period — is
-  future work. (Tombstones are now only re-sent when their segment diverges, but
-  they are still never *reclaimed*.)
+- **Tombstone GC (now implemented in `LsmEngine`).** Tombstones no longer live
+  forever in the on-disk engine: `LsmEngine` reclaims a tombstone (and the
+  versions it shadows) **during compaction** once it has aged below a configurable
+  **GC floor** = `max_version - LsmOptions::tombstone_grace_versions`, and only
+  when no deeper, uncompacted level could still hold an older value for the key
+  (which would otherwise resurface). The reclamation is **invisible above the
+  floor**: every historical read at a version in the retained window
+  `(gc_floor, max_version]` reads exactly as before, so the differential proptest
+  against `MemoryEngine` stays green for that window (it now asserts the only
+  digest difference is below-floor reclaimed tombstones). The grace should be set
+  **above the maximum anti-entropy lag** so a long-offline replica is still
+  repaired with the delete before the tombstone is reclaimed; the interaction with
+  a replica offline *longer* than the grace remains the operator's responsibility
+  (the classic Dynamo trade-off). `MemoryEngine` still retains tombstones forever
+  (it has no compaction); GC is an `LsmEngine` storage-layer reclamation, not a
+  change to the data-plane convergence contract. See ADR 0008 and
+  `animus-storage/tests/lsm_gc.rs`.
 - ADR 0001 (two-plane) and ADR 0002 (epoch fencing) are unchanged; this refines
   the data plane's convergence story within them.

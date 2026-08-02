@@ -137,6 +137,12 @@ const L1_TABLE_BUDGET: usize = 4;
 /// the default flush threshold so a flush usually covers and removes one or more
 /// whole segments.
 const DEFAULT_WAL_SEGMENT_BYTES: u64 = 64 * 1024;
+/// Default tombstone GC grace, in **versions**: a tombstone (and the versions it
+/// shadows) is only reclaimed during compaction once it sits below
+/// `max_version - this`, so any historical read within the most-recent
+/// `this`-versions window is unaffected. Sized generously by default so GC is a
+/// no-op under ordinary use; the data plane / tests lower it to reclaim sooner.
+const DEFAULT_TOMBSTONE_GRACE_VERSIONS: Version = 1 << 20;
 
 /// Tuning knobs for an [`LsmEngine`]. Defaults are sized for tests; production
 /// wiring can raise them.
@@ -156,6 +162,16 @@ pub struct LsmOptions {
     /// group-commit batch rolls to a fresh segment file, so a flush can drop whole
     /// covered segments rather than rewriting one growing WAL.
     pub wal_segment_bytes: u64,
+    /// Tombstone GC grace, in **versions**. During compaction a tombstone (and the
+    /// versions it shadows) is reclaimed only once its version is at or below the
+    /// **GC floor** = `max_version.saturating_sub(this)` — and only when no deeper,
+    /// uncompacted level could still hold an older value for that key (which would
+    /// otherwise resurface). This keeps every historical read at a version *above*
+    /// the floor (the retained `[floor+1, max_version]` window) observationally
+    /// identical to before GC. A larger value retains tombstones longer (set it
+    /// above the maximum anti-entropy lag so a long-offline replica is still
+    /// repaired with the delete before the tombstone is reclaimed; ADR 0010).
+    pub tombstone_grace_versions: Version,
 }
 
 impl Default for LsmOptions {
@@ -166,6 +182,7 @@ impl Default for LsmOptions {
             target_table_bytes: DEFAULT_TARGET_TABLE_BYTES,
             level_fanout: DEFAULT_LEVEL_FANOUT,
             wal_segment_bytes: DEFAULT_WAL_SEGMENT_BYTES,
+            tombstone_grace_versions: DEFAULT_TOMBSTONE_GRACE_VERSIONS,
         }
     }
 }
@@ -369,6 +386,25 @@ impl<E: Env> LsmEngine<E> {
         Ok(segs)
     }
 
+    /// Remove orphan WAL segment files that sit **below** the live (replayed) set —
+    /// covered segments a crash-after-manifest-swap-before-`remove` leaked. `live`
+    /// is the ascending set [`discover_wal_segments`](Self::discover_wal_segments)
+    /// returned; every segment numbered below its minimum is a covered orphan whose
+    /// records are already in an SSTable, so removing it is data-safe. No-op when
+    /// the live set is empty (legacy single-file WAL) or starts at 0.
+    async fn remove_orphan_wal_segments(env: &E, prefix: &str, live: &[u64]) -> Result<()> {
+        let Some(&lowest_live) = live.iter().min() else {
+            return Ok(());
+        };
+        for seg in 0..lowest_live {
+            let file = format!("{prefix}wal-{seg:06}");
+            if env.size(&file).await.map_err(io)? > 0 {
+                env.remove(&file).await.map_err(io)?;
+            }
+        }
+        Ok(())
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
         self.inner.lock().expect("lsm storage poisoned")
     }
@@ -427,6 +463,17 @@ impl<E: Env> LsmEngine<E> {
         // must be replayed. This mirrors the orphan-SSTable rule, except a WAL
         // segment is recovered (it carries acks) rather than ignored.
         let segments = Self::discover_wal_segments(&env, &prefix, &manifest.wal_segments).await?;
+
+        // Reclaim orphan WAL segment files left below the live set. A flush GCs a
+        // covered segment by swapping the manifest (dropping it from `wal_segments`)
+        // and *then* `remove`ing the file; a crash in that window leaves the file on
+        // disk below the live set. Recovery already *ignores* it (its records are in
+        // the SSTable, and `discover_wal_segments` only probes forward), but the file
+        // would leak forever. Every segment numbered below the lowest live one is
+        // exactly such a covered orphan (segments are allocated strictly increasing
+        // and never reused), so it is data-safe to remove on open. Doing it here
+        // closes the leak at the next reopen even if the GC `remove` never ran.
+        Self::remove_orphan_wal_segments(&env, &prefix, &segments).await?;
 
         let mut memtable: BTreeMap<Key, History> = BTreeMap::new();
         let mut memtable_bytes = 0usize;
@@ -793,8 +840,13 @@ impl<E: Env> LsmEngine<E> {
         let target_level = plan.source_level + 1;
 
         // Pick inputs under the lock: all readers at the source level, plus the
-        // target-level readers overlapping the source's combined key range.
-        let (input_readers, input_seqs, base_seq) = {
+        // target-level readers overlapping the source's combined key range. Also
+        // capture (a) the engine's monotonic floor (`max_version`), which fixes the
+        // tombstone GC floor, and (b) the key ranges of every table at a level
+        // **deeper** than the target — a tombstone may only be fully reclaimed when
+        // no such deeper table could still hold an older value for the key (which
+        // would otherwise resurface once the tombstone is gone).
+        let (input_readers, input_seqs, base_seq, max_version, deeper_ranges) = {
             let inner = self.lock();
             let mut input_readers: Vec<SsTableReader> = Vec::new();
             let mut source_bounds: Option<(Key, Key)> = None;
@@ -818,7 +870,25 @@ impl<E: Env> LsmEngine<E> {
                 }
             }
             let input_seqs: Vec<u64> = input_readers.iter().map(|r| r.meta().seq).collect();
-            (input_readers, input_seqs, inner.manifest.next_seq)
+            // Key ranges of all tables strictly below the target level (and not
+            // themselves inputs — none are, since inputs are at source/target level).
+            let deeper_ranges: Vec<(Key, Key)> = inner
+                .manifest
+                .tables
+                .iter()
+                .filter(|m| m.level > target_level)
+                .filter_map(|m| match (&m.min_key, &m.max_key) {
+                    (Some(lo), Some(hi)) => Some((lo.clone(), hi.clone())),
+                    _ => None,
+                })
+                .collect();
+            (
+                input_readers,
+                input_seqs,
+                inner.manifest.next_seq,
+                inner.manifest.max_version,
+                deeper_ranges,
+            )
         };
 
         if input_readers.is_empty() {
@@ -833,6 +903,11 @@ impl<E: Env> LsmEngine<E> {
                 merged.insert((k, v), slot);
             }
         }
+
+        // Tombstone GC: reclaim obsolete tombstones (and the versions they shadow)
+        // that have aged below the GC floor, without changing any read above it.
+        let gc_floor = max_version.saturating_sub(self.opts.tombstone_grace_versions);
+        gc_obsolete_records(&mut merged, gc_floor, &deeper_ranges);
 
         // Partition into non-overlapping runs of ≈target_table_bytes, splitting
         // only on a key boundary so each run owns a disjoint key range.
@@ -1046,6 +1121,42 @@ impl<E: Env> LsmEngine<E> {
         let file = self.sst_file(seq);
         // Append some bytes without syncing and without touching the manifest.
         let _ = self.env.append(&file, marker).await;
+    }
+
+    /// Every `(version, is_tombstone)` record physically present **on disk** (across
+    /// all live SSTables, not the memtable) for `key`, ascending by version.
+    /// Test/introspection — lets the GC test assert that shadowed versions and a
+    /// reclaimed tombstone are physically gone, while a within-grace tombstone is
+    /// still present.
+    #[doc(hidden)]
+    pub async fn test_disk_versions_of(&self, key: &[u8]) -> Vec<(Version, bool)> {
+        let readers = {
+            let inner = self.lock();
+            inner.readers.clone()
+        };
+        let mut out: BTreeMap<Version, bool> = BTreeMap::new();
+        for reader in &readers {
+            if !reader.meta().may_contain(key) {
+                continue;
+            }
+            for (k, v, slot) in reader.full_scan(&self.env).await.unwrap_or_default() {
+                if k == key {
+                    out.insert(v, slot.is_none());
+                }
+            }
+        }
+        out.into_iter().collect()
+    }
+
+    /// Inject a **durable** orphan WAL segment file at `seg` (appended + synced),
+    /// modelling a covered segment that a crash left on disk after the manifest
+    /// swap dropped it from the live set but before the GC `remove` ran. It must be
+    /// below the live set to be treated as a covered orphan. Test-only.
+    #[doc(hidden)]
+    pub async fn test_write_orphan_wal_segment(&self, seg: u64, bytes: &[u8]) {
+        let file = self.wal.segment_file(seg);
+        let _ = self.env.append(&file, bytes).await;
+        let _ = self.env.sync(&file).await;
     }
 }
 
@@ -1386,6 +1497,88 @@ fn partition_records(
         partitions.push(current);
     }
     partitions
+}
+
+/// Reclaim obsolete tombstones (and the versions they shadow) from a compaction's
+/// merged `(key, version) -> slot` records **in place**, preserving every read at
+/// a version *above* `gc_floor`.
+///
+/// Operating per key on its versions in ascending order:
+///
+/// - The **floor anchor** is the greatest version `<= gc_floor`. Every version
+///   strictly below it is shadowed for all reads at versions `>= ` the anchor's,
+///   and reads at versions `> gc_floor` always see the anchor or a higher version,
+///   so the sub-anchor versions are invisible to the retained window and are
+///   dropped. (This compacts MVCC history below the floor for live keys too — pure
+///   space reclamation that no `get_at(v > gc_floor)` can observe.)
+/// - If the floor anchor is itself a **tombstone**, it reads as *absent*. With
+///   everything older dropped, absence is preserved by simply removing it — **iff**
+///   no deeper, uncompacted level overlaps the key (a deeper older value would
+///   resurface, resurrecting the key). When a deeper table could hold the key we
+///   keep the anchor tombstone (still dropping the versions below it).
+///
+/// Versions above `gc_floor` are never touched, so the `(gc_floor, max_version]`
+/// window — including any tombstone in it — is observationally identical to before
+/// GC, and the differential proptest against `MemoryEngine` stays green for it.
+fn gc_obsolete_records(
+    merged: &mut BTreeMap<(Key, Version), Option<Value>>,
+    gc_floor: Version,
+    deeper_ranges: &[(Key, Key)],
+) {
+    // Per key, gather its sub-floor versions (records are globally sorted by
+    // (key, version), so they arrive grouped and ascending), decide which to drop,
+    // and collect the decisions; then apply them in a second pass.
+    let mut to_drop: Vec<(Key, Version)> = Vec::new();
+    // Versions of the current key that are `<= gc_floor`, ascending: (version, is_tombstone).
+    let mut floor_versions: Vec<(Version, bool)> = Vec::new();
+    let mut cur_key: Option<Key> = None;
+
+    // Closes out the current key: drop everything below its floor anchor, and the
+    // anchor itself when it is a tombstone with no deeper level holding the key.
+    fn flush_key(
+        key: &Key,
+        floor_versions: &mut Vec<(Version, bool)>,
+        deeper_ranges: &[(Key, Key)],
+        to_drop: &mut Vec<(Key, Version)>,
+    ) {
+        if let Some(&(anchor_v, anchor_is_tombstone)) = floor_versions.last() {
+            for &(v, _) in floor_versions.iter() {
+                if v < anchor_v {
+                    to_drop.push((key.clone(), v));
+                }
+            }
+            if anchor_is_tombstone && !key_overlaps_any(key, deeper_ranges) {
+                to_drop.push((key.clone(), anchor_v));
+            }
+        }
+        floor_versions.clear();
+    }
+
+    for ((key, version), slot) in merged.iter() {
+        if cur_key.as_ref() != Some(key) {
+            if let Some(prev) = &cur_key {
+                flush_key(prev, &mut floor_versions, deeper_ranges, &mut to_drop);
+            }
+            cur_key = Some(key.clone());
+        }
+        if *version <= gc_floor {
+            floor_versions.push((*version, slot.is_none()));
+        }
+    }
+    if let Some(prev) = &cur_key {
+        flush_key(prev, &mut floor_versions, deeper_ranges, &mut to_drop);
+    }
+
+    for k in to_drop {
+        merged.remove(&k);
+    }
+}
+
+/// Whether `key` falls inside any of the inclusive `[lo, hi]` ranges.
+fn key_overlaps_any(key: &[u8], ranges: &[(Key, Key)]) -> bool {
+    ranges
+        .iter()
+        .any(|(lo, hi)| key >= lo.as_slice() && key <= hi.as_slice())
 }
 
 /// Fold the winning record for `key` into `merged`: a strictly greater version
