@@ -43,14 +43,21 @@
 //! in a one-process-per-node deployment that is the node's own handle, so
 //! `CreateTable` must target the leader.
 //!
-//! The in-memory `SchemaRegistry` now holds only the **secondary-index
-//! declarations** (the GSI/LSI `escape(hash) [|| escape(sort)] || base_key`
-//! index). That remains **in-memory and not durable** — rebuilt from observed
-//! writes — and is **per-cluster**: held in the cluster's `ClusterEdgeState`
-//! (threaded through `ClientCtx`), not a process `OnceLock`, so two in-process
-//! clusters in one test do not share a registry. In `--cluster N` dev mode the
-//! cluster's nodes share one registry. Only the *table key schema* moves to the
-//! control plane.
+//! The secondary-index **definitions** (GSI/LSI name, kind, hash/sort attributes,
+//! projection) now also live in the **replicated catalog** (ADR 0013):
+//! `CreateTable` proposes a `MetaCommand::CreateTableIndex` per declared index
+//! (after the table schema commits) and waits for it to replicate, so the index
+//! definitions are durable + cluster-agreed. The in-memory `SchemaRegistry` is
+//! reconciled to that replicated set via `SchemaRegistry::sync_indexes`
+//! ([`mirror_catalog_schema`]) — on `CreateTable`, and lazily on a read/write path
+//! — so a freshly restarted node (or a follower that never saw a write) rebuilds
+//! its index machinery from the catalog, not from process-local memory. Only the
+//! index **entry data** (the `escape(hash) [|| escape(sort)] || base_key` index)
+//! stays in-memory and not durable, rebuilt from observed `note_put`/`note_delete`
+//! writes. The registry is **per-cluster**: held in the cluster's
+//! `ClusterEdgeState` (threaded through `ClientCtx`), not a process `OnceLock`, so
+//! two in-process clusters in one test do not share a registry. In `--cluster N`
+//! dev mode the cluster's nodes share one registry.
 //!
 //! ## Query, Scan, and secondary indexes
 //!
@@ -132,23 +139,32 @@ fn schema_for(ctx: &ClientCtx, table: &str) -> TableSchema {
     }
 }
 
-/// Mirror a **catalog** table's key schema into the cluster's registry if it is
-/// known to the replicated catalog (ADR 0013) but not yet mirrored — so the
-/// registry's key-index / GSI machinery has the right schema after a restart or
-/// on a follower that has not seen a write. A table absent from the catalog is
-/// left untouched here (the read path then reports it unknown; the write path
-/// legacy-registers it via [`legacy_register`]).
+/// Mirror a **catalog** table's key schema **and its replicated secondary-index
+/// definitions** (ADR 0013) into the cluster's registry — so the registry's
+/// key-index / GSI machinery is rebuilt from the cluster-agreed catalog after a
+/// restart or on a follower that has not seen a write. We always reconcile the
+/// index *definitions* via [`SchemaRegistry::sync_indexes`] (which registers the
+/// table if absent, preserves entry data for an unchanged-shape index, clears it
+/// for a changed-shape one, and drops a removed one), so a freshly restarted node
+/// rebuilds its index machinery from the **replicated** definitions rather than
+/// process-local memory. A table absent from the catalog is left untouched here
+/// (the read path then reports it unknown; the write path legacy-registers it via
+/// [`legacy_register`]).
 fn mirror_catalog_schema(ctx: &ClientCtx, table: &str) {
-    if metadata(ctx).has_table_schema(table) {
+    let meta = metadata(ctx);
+    if meta.has_table_schema(table) {
         let schema = schema_for(ctx, table);
+        let indexes = schema_bridge::indexes_to_dynamo(meta.table_indexes(table));
         let mut reg = ctx
             .edge
             .dynamo_registry()
             .lock()
             .expect("registry poisoned");
-        if !reg.has_table(table) {
-            let _ = reg.create_table(table, schema);
-        }
+        // Reconcile the index definitions to the replicated set (registering the
+        // table on first sight). `sync_indexes` preserves the in-memory entry data
+        // of an unchanged-shape index, so repeated mirroring is cheap and does not
+        // discard observed-write index state.
+        let _ = reg.sync_indexes(table, schema, &indexes);
     }
 }
 
@@ -518,11 +534,13 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
     }
 }
 
-/// Propose `table`'s key schema into the **replicated catalog** (ADR 0013) via the
-/// control-plane leader and wait until it commits, then mirror the schema +
-/// secondary-index declarations into the local in-memory registry (for the GSI /
-/// Query-key bookkeeping that stays edge-local). The committed schema is durable
-/// and cluster-agreed, so it survives a restart.
+/// Propose `table`'s key schema **and each declared secondary-index definition**
+/// into the **replicated catalog** (ADR 0013) via the control-plane leader and
+/// wait until they commit, then reconcile the cluster's in-memory registry to the
+/// replicated set (for the GSI / Query-key bookkeeping that stays edge-local). The
+/// committed schema + index definitions are durable and cluster-agreed, so they
+/// survive a restart and are visible on every node — the edge no longer holds the
+/// index *definitions* in process-local memory.
 async fn create_table(
     ctx: &ClientCtx,
     table: &str,
@@ -559,18 +577,45 @@ async fn create_table(
         }
         tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
     }
-    // Mirror the schema + index declarations into the cluster's registry for the
-    // edge-local Query/Scan key index and GSI machinery.
-    {
-        let mut reg = ctx
-            .edge
-            .dynamo_registry()
-            .lock()
-            .expect("registry poisoned");
-        if !reg.has_table(table) {
-            let _ = reg.create_table_with_indexes(table, schema.clone(), indexes.to_vec());
+    // Now that the table schema exists in the catalog, propose each declared
+    // secondary-index *definition* (`CreateTableIndex` is rejected unless the table
+    // schema is present, hence the ordering) and wait for it to replicate, so the
+    // index definitions are durable + cluster-agreed alongside the key schema.
+    //
+    // Each index is bridged to the control-plane `IndexDef` via
+    // `schema::index_to_control`, supplying the base partition key (an LSI hashes by
+    // it). We compare against the replicated `table_indexes` set by name to know it
+    // committed.
+    for index in indexes {
+        let def = schema_bridge::index_to_control(index, &schema.partition_key);
+        let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
+        loop {
+            if let Some(leader) = ctx.edge.leader_handle() {
+                leader.propose(MetaCommand::CreateTableIndex {
+                    table: table.to_owned(),
+                    index: def.clone(),
+                });
+            }
+            if metadata(ctx)
+                .table_indexes(table)
+                .iter()
+                .any(|d| d.name == def.name)
+            {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(internal(
+                    "CreateTable index definition did not commit to the control \
+                     plane in time (no leader reachable?)",
+                ));
+            }
+            tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
         }
     }
+    // Reconcile the cluster's registry to the **replicated** index set (rebuilding
+    // the edge-local Query/Scan key index + GSI machinery from the catalog, not from
+    // the request's declarations — so the source of truth is the committed catalog).
+    mirror_catalog_schema(ctx, table);
     Ok(wire::create_table_response(table, schema, indexes))
 }
 

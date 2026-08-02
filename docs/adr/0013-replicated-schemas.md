@@ -116,7 +116,16 @@ in-place schema evolution is still future work — see Consequences).
   `IndexDef` (`animus_dynamo::schema::{index_to_control, index_to_dynamo,
   indexes_to_dynamo}`) and rebuilds its index-maintenance machinery from the
   catalog via `SchemaRegistry::sync_indexes` (preserving entry data for an
-  unchanged index, clearing it for a changed-shape one).
+  unchanged index, clearing it for a changed-shape one). **`animusd` now wires this
+  end to end:** its DynamoDB edge (`animusd::dynamo::create_table`) proposes one
+  `CreateTableIndex` per declared GSI/LSI (after the table schema commits, since the
+  command is rejected unless the table is known) and waits for each to replicate,
+  and its catalog-mirror path (`mirror_catalog_schema`) reconciles the local
+  registry to `Metadata::table_indexes` via `sync_indexes` — so a created index
+  definition is durable + cluster-agreed and a restarted/follower node rebuilds its
+  index machinery from the catalog, not process memory. Proven over the real
+  DynamoDB JSON/HTTP wire in `animusd/tests/dynamo_schema.rs`
+  (`create_table_index_replicates_to_second_node`, `..._survives_node_restart`).
 - **Still deferred (index *data*):** the index *entry data* — the actual indexed
   rows — is **not** replicated; it stays maintained at the wire edge by observed
   `note_put`/`note_delete` writes (rebuilt from writes, so a freshly restarted
