@@ -19,3 +19,5 @@ relevant ADR (or supersede it) in the same PR as the code change.
 | [0010](0010-ap-repair-anti-entropy.md) | AP repair: read-repair + background anti-entropy | Accepted |
 | [0011](0011-accord-consensus.md) | Accord-style leaderless transaction consensus (first minimal slice) | Accepted |
 | [0012](0012-failure-detection.md) | Heartbeat-based failure detection in the control plane | Accepted |
+| [0013](0013-replicated-schemas.md) | Replicated table-schema catalog in the control plane | Accepted |
+| [0014](0014-elle-accord-scenario-corpus.md) | Elle consistency testing against Accord + a frozen scenario corpus | Accepted |

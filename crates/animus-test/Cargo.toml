@@ -19,6 +19,7 @@ serde_json.workspace = true
 animus-env.workspace = true
 animus-sim.workspace = true
 animus-control.workspace = true
+animus-consensus.workspace = true
 animus-data.workspace = true
 animus-storage.workspace = true
 animus-tablet.workspace = true

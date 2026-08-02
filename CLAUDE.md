@@ -182,7 +182,17 @@ cross-cutting ones. Prune/merge entries that become obsolete.
   the suite is reproducible and a failure maps to a specific scenario — not a
   one-off RNG state. Aim for structured/combinatorial coverage of the fault
   matrix (fault type × target class × timing × workload); keep bug-finding
-  scenarios in the corpus forever as regressions.
+  scenarios in the corpus forever as regressions. (Done: ADR 0014 / `animus-test`
+  `corpus.rs` — ~119 frozen, name-seeded scenarios over Accord.)
+- **Match the Elle datatype to the storage model, and recover "final state" from
+  the layer that holds order.** Accord's effect is "write my txn id" — a
+  *register*. Running `check_durability` against a final *register* read flags
+  every overwritten value as a "lost write" (the register keeps only the last
+  writer) — a false positive, not a bug. Recover the list-append final state from
+  the ordering layer's own log (`AccordNode::applied_order`) instead, and take
+  convergence from **two distinct replicas'** orders so it's a real cross-replica
+  agreement check. The list-append abstraction lives in the order Accord agrees,
+  not the bytes the register stores.
 - **Never `let _ = storage.merge(...)` on the write path** — an ack must mean the
   write durably applied; surface storage errors so a non-durable write isn't
   counted toward the quorum (`animus-data` `ack_durability.rs`).
