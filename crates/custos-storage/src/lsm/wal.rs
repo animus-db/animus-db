@@ -298,8 +298,20 @@ impl Inner {
     }
 }
 
-/// Parks until `gc.durable_seq >= seq` (or the batch failed). Registers its waker
-/// under the lock so the leader's post-`sync` `take_wakers_up_to` re-readies it.
+/// Parks a non-leading writer **only while a flush is actually in progress**,
+/// then resolves so the `commit` loop re-decides its action. Registers its waker
+/// under the lock so the leader's post-`sync` wake re-readies it.
+///
+/// Resolving as soon as `!flushing` (rather than only on `durable_seq >= seq`) is
+/// load-bearing for liveness under real multithreading: a writer whose record was
+/// enqueued *after* the current leader claimed its batch is not covered by that
+/// flush, so once the leader finishes this must return to the loop and become the
+/// **next** leader for its own record. Parking until `durable_seq >= seq` here
+/// stranded it — nothing else would ever flush its record — which deadlocked the
+/// multi-threaded `ProdEnv` path (the single-threaded `SimEnv` cannot produce that
+/// interleaving). The `commit` loop re-checks `durable`/`failed`/`flushing` under
+/// the lock, so an early resolve just causes a re-decision (it re-parks if a flush
+/// is still running, or leads otherwise).
 struct DurableUpTo<'a> {
     gc: &'a GroupCommit,
     seq: u64,
@@ -310,7 +322,7 @@ impl Future for DurableUpTo<'_> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         let mut inner = self.gc.lock();
-        if inner.durable_seq >= self.seq || inner.failed_through >= self.seq {
+        if inner.durable_seq >= self.seq || inner.failed_through >= self.seq || !inner.flushing {
             Poll::Ready(())
         } else {
             inner

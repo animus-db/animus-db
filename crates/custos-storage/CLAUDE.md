@@ -100,6 +100,15 @@ non-overlapping) — all seed-reproducible. `LsmEngine` exposes `#[doc(hidden)]`
 `reset_block_reads`/`level_table_counts`/`levels_non_overlapping`/
 `test_write_orphan_sstable` introspection helpers for these tests.
 
+`lsm_concurrent.rs` is a **real multi-threaded** regression (`#[tokio::test(flavor
+= "multi_thread")]` over `ProdEnv`, timeout-guarded): the deterministic single-
+threaded `SimEnv` cannot exercise a preemptive interleaving, so the WAL group-
+commit's liveness under genuine parallelism is covered here. (A writer that
+enqueued its record while the leader was mid-`fsync` once parked forever; the
+`DurableUpTo` future now resolves as soon as `!flushing` so it re-leads — see
+`wal.rs`.) **Lesson:** concurrency primitives need a `ProdEnv` multi-thread test;
+the sim proves logic/order, not real-thread races.
+
 `cargo bench -p custos-storage` runs `benches/engine_bench.rs`: a hand-rolled
 (no criterion) macro-benchmark over **`ProdEnv`** comparing `LsmEngine` vs
 `MemoryEngine` on put/get/scan throughput + latency and reporting flush/
