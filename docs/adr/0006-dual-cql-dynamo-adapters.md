@@ -56,6 +56,20 @@ The surface now extends past the original three point ops:
   (`attribute_not_exists(a)`, `attribute_exists(a)`, `a = :v`) gates `PutItem` /
   `DeleteItem`: the edge quorum-reads the current item under the coordinator
   lock and rejects a failing predicate with `ConditionalCheckFailedException`.
+- **`Scan`.** A full-table read over the same per-table key index, walked across
+  all partitions (`scan_keys`) and quorum-read key by key. It paginates with
+  `Limit` + `ExclusiveStartKey`/`LastEvaluatedKey` (the cursor is a page's last
+  base storage key, surfaced to the client as the key item's AttributeValue map)
+  and applies an optional `FilterExpression` (the same predicate subset as a
+  conditional write) after the read. Same in-memory-keyspace caveat as `Query`.
+- **Global secondary indexes (GSI).** `CreateTable` may declare a single
+  hash-only GSI (`GlobalSecondaryIndexes`, one `HASH` key attribute). The
+  registry maintains a second `escape(gsi_value) || base_key` index on every
+  write/delete (it stores only base keys, not item copies, so the base item
+  stays authoritative), and a `Query` with an `IndexName` resolves a GSI value
+  back to its base storage keys, which are quorum-read like a base query.
+  Deferred: projections, composite (hash+range) GSIs, multiple GSIs, and local
+  secondary indexes.
 
 A third slice now exists on the CQL side: a **minimal Cassandra CQL v4 binary
 protocol** is served alongside the DynamoDB endpoint. `custos-cql` is the pure,
@@ -71,10 +85,11 @@ Like the DynamoDB endpoint it is production-only I/O (real tokio sockets +
 hand-rolled framing, no third-party CQL/Cassandra crate); everything below the
 socket stays on the `Env`-based paths.
 
-What remains. DynamoDB: `Scan`, projection/filter expressions, `ReturnValues`,
-document/set attribute types, secondary indexes, and durable
-control-plane-replicated table schemas (plus a native quorum range scan so
-`Query` need not track keys). CQL: a real type system + column metadata, a
+What remains. DynamoDB: projection expressions, `ReturnValues`, document/set
+attribute types, composite/multiple GSIs and local secondary indexes, and
+durable control-plane-replicated table schemas + key/GSI indexes (plus a native
+quorum range scan so `Query`/`Scan` need not track keys). CQL: a real type
+system + column metadata, a
 proper CQL grammar (prepared statements, batches, clustering columns, more
 statement kinds), `USE`/keyspaces and `CREATE TABLE`, paging, authentication,
 and honoring the requested consistency level (currently ignored).

@@ -18,10 +18,11 @@
 //!
 //! ## Operations and storage mapping
 //!
-//! Supported: `CreateTable`, `PutItem`, `GetItem`, `DeleteItem`, `Query`. The
-//! data-plane key for an item is `escape(table) || escape(pk) || sk` (so tables
-//! share one keyspace without colliding). The data plane has no native delete,
-//! so `DeleteItem` writes a tombstone value that `GetItem` reads back as absent.
+//! Supported: `CreateTable`, `PutItem`, `GetItem`, `DeleteItem`, `Query`,
+//! `Scan`. The data-plane key for an item is `escape(table) || escape(pk) || sk`
+//! (so tables share one keyspace without colliding). The data plane has no
+//! native delete, so `DeleteItem` writes a tombstone value that `GetItem` reads
+//! back as absent.
 //!
 //! ## Per-table schemas (CreateTable)
 //!
@@ -37,7 +38,7 @@
 //! deployment each process keeps its own). Replicating schemas through the
 //! control plane is future work.
 //!
-//! ## Query
+//! ## Query, Scan, and secondary indexes
 //!
 //! The data plane has no quorum range scan (only point read/write/delete), so
 //! `Query` is served by tracking, per table, the storage keys of written items
@@ -46,6 +47,21 @@
 //! condition (`=`, `BETWEEN`, `begins_with`) selects the contiguous key
 //! sub-range; tombstoned/absent keys are skipped. Like the schema map, the key
 //! index is in-memory and observation-built.
+//!
+//! `Scan` walks that same per-table key index across all partitions
+//! ([`SchemaRegistry::scan_keys`]), quorum-reading each key. It paginates with
+//! `Limit` + `ExclusiveStartKey`/`LastEvaluatedKey` (the cursor is the last
+//! base storage key of a page, surfaced to the client as the key item's
+//! AttributeValue map) and applies an optional `FilterExpression` after the
+//! read. The cursor advances over *tracked* keys, so the in-memory caveat above
+//! applies to `Scan` too.
+//!
+//! `CreateTable` may declare a single hash-only **global secondary index**; the
+//! registry maintains a second `escape(gsi_value) || base_key` index on every
+//! `note_put`/`note_delete` (no item copies — the base item stays authoritative),
+//! and a `Query` with an `IndexName` resolves a GSI value back to its base
+//! storage keys, which are quorum-read the same way. Deferred: projections,
+//! composite/multiple GSIs, local secondary indexes.
 
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
@@ -249,13 +265,17 @@ fn error_status(err: &WireError) -> u16 {
 /// Execute a decoded operation against the data plane via the shared coordinator.
 async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireError> {
     match op {
-        Operation::CreateTable { table, schema } => {
+        Operation::CreateTable {
+            table,
+            schema,
+            indexes,
+        } => {
             registry()
                 .lock()
                 .expect("registry poisoned")
-                .create_table(&table, schema.clone())
+                .create_table_with_indexes(&table, schema.clone(), indexes.clone())
                 .map_err(registry_error)?;
-            Ok(wire::create_table_response(&table, &schema))
+            Ok(wire::create_table_response(&table, &schema, &indexes))
         }
         Operation::PutItem {
             table,
@@ -270,7 +290,7 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             }
             let value = wire::encode_stored_item(&item);
             quorum_write(ctx, &key, &value).await?;
-            note_put(&table, &within);
+            note_put(&table, &within, &item);
             Ok(wire::empty_response())
         }
         Operation::DeleteItem {
@@ -297,24 +317,48 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
         }
         Operation::Query {
             table,
+            index,
             partition_value,
             sort_condition,
-        } => run_query(ctx, &table, &partition_value, sort_condition.as_ref()).await,
+        } => {
+            run_query(
+                ctx,
+                &table,
+                index.as_deref(),
+                &partition_value,
+                sort_condition.as_ref(),
+            )
+            .await
+        }
+        Operation::Scan {
+            table,
+            limit,
+            exclusive_start_key,
+            filter,
+        } => run_scan(ctx, &table, limit, exclusive_start_key, filter.as_ref()).await,
     }
 }
 
-/// Resolve the partition's matching within-table keys from the registry, then
-/// quorum-read each to assemble the result (the data plane has no range scan).
+/// Resolve the partition's matching within-table keys from the registry (or, with
+/// an `index`, a GSI value's base keys), then quorum-read each to assemble the
+/// result (the data plane has no range scan).
 async fn run_query(
     ctx: &ClientCtx,
     table: &str,
+    index: Option<&str>,
     partition_value: &AttributeValue,
     sort_condition: Option<&SortKeyCondition>,
 ) -> Result<String, WireError> {
     let within_keys = {
         let reg = registry().lock().expect("registry poisoned");
-        reg.query_keys(table, partition_value, sort_condition)
-            .map_err(registry_error)?
+        match index {
+            Some(index) => reg
+                .index_query_keys(table, index, partition_value)
+                .map_err(registry_error)?,
+            None => reg
+                .query_keys(table, partition_value, sort_condition)
+                .map_err(registry_error)?,
+        }
     };
     let mut items = Vec::with_capacity(within_keys.len());
     for within in &within_keys {
@@ -324,6 +368,77 @@ async fn run_query(
         }
     }
     Ok(wire::query_response(&items))
+}
+
+/// Walk the table's whole key index (paginated by `limit` + `exclusive_start_key`)
+/// and quorum-read each key, applying an optional post-read `filter`. The
+/// pagination cursor is the last base storage key of a truncated page, surfaced
+/// to the client as that item's key-attribute AttributeValue map.
+async fn run_scan(
+    ctx: &ClientCtx,
+    table: &str,
+    limit: Option<usize>,
+    exclusive_start_key: Option<Item>,
+    filter: Option<&ConditionExpression>,
+) -> Result<String, WireError> {
+    // Resolve the cursor item (if any) to its base storage key.
+    let start_after = match &exclusive_start_key {
+        Some(key_item) => {
+            let (pk, sk) = resolve_key(table, key_item)?;
+            Some(storage_key(&pk, sk.as_ref()))
+        }
+        None => None,
+    };
+    let (within_keys, cursor) = {
+        let reg = registry().lock().expect("registry poisoned");
+        reg.scan_keys(table, start_after.as_deref(), limit)
+            .map_err(registry_error)?
+    };
+    let scanned = within_keys.len();
+    let mut items = Vec::new();
+    for within in &within_keys {
+        let data_key = data_key(table, within);
+        if let Some(item) = quorum_read(ctx, &data_key).await? {
+            if filter.is_none_or(|f| f.evaluate(Some(&item))) {
+                items.push(item);
+            }
+        }
+    }
+    // The `LastEvaluatedKey` is the cursor item's key attributes — recover them
+    // from the last scanned item we read (whether or not it passed the filter).
+    let last_evaluated_key = match &cursor {
+        Some(cursor) => {
+            let data_key = data_key(table, cursor);
+            quorum_read(ctx, &data_key)
+                .await?
+                .and_then(|item| key_item_of(table, &item))
+        }
+        None => None,
+    };
+    Ok(wire::scan_response(
+        &items,
+        scanned,
+        last_evaluated_key.as_ref(),
+    ))
+}
+
+/// Build the key-attribute-only [`Item`] (the `LastEvaluatedKey` shape) for a
+/// full item, per `table`'s schema. `None` if the table is unknown or the item
+/// lacks a key attribute (shouldn't happen for a stored item).
+fn key_item_of(table: &str, item: &Item) -> Option<Item> {
+    let reg = registry().lock().expect("registry poisoned");
+    let schema = reg.schema(table)?;
+    let mut key = Item::new();
+    key.insert(
+        schema.partition_key.clone(),
+        item.get(&schema.partition_key)?.clone(),
+    );
+    if let Some(sk) = &schema.sort_key {
+        if let Some(v) = item.get(sk) {
+            key.insert(sk.clone(), v.clone());
+        }
+    }
+    Some(key)
 }
 
 /// Enforce a `ConditionExpression` by reading the current item under the coord
@@ -343,12 +458,12 @@ async fn check_condition(
     }
 }
 
-fn note_put(table: &str, within_key: &[u8]) {
+fn note_put(table: &str, within_key: &[u8], item: &Item) {
     let mut reg = registry().lock().expect("registry poisoned");
     if !reg.has_table(table) {
         reg.create_table_legacy(table);
     }
-    let _ = reg.note_put(table, within_key);
+    let _ = reg.note_put(table, within_key, item);
 }
 
 fn note_delete(table: &str, within_key: &[u8]) {
@@ -375,6 +490,10 @@ fn registry_error(err: custos_dynamo::RegistryError) -> WireError {
         R::SortKeyMismatch(t) => WireError {
             code: "ValidationException",
             message: format!("table `{t}` has no sort key for this condition"),
+        },
+        R::NoSuchIndex(i) => WireError {
+            code: "ValidationException",
+            message: format!("index `{i}` does not exist on this table"),
         },
     }
 }

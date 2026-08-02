@@ -11,15 +11,19 @@
 //!
 //! ## Supported subset
 //!
-//! Operations: `CreateTable`, `PutItem`, `GetItem`, `DeleteItem`, `Query`.
-//! AttributeValue types: `S` (string), `N` (number, carried as text), `B`
-//! (binary, base64), `BOOL`, `NULL` — matching [`AttributeValue`]. `PutItem` /
-//! `DeleteItem` accept a small `ConditionExpression` subset (see
+//! Operations: `CreateTable`, `PutItem`, `GetItem`, `DeleteItem`, `Query`,
+//! `Scan`. AttributeValue types: `S` (string), `N` (number, carried as text),
+//! `B` (binary, base64), `BOOL`, `NULL` — matching [`AttributeValue`].
+//! `PutItem` / `DeleteItem` accept a small `ConditionExpression` subset (see
 //! [`crate::condition`]); `Query` accepts a partition-key equality plus an
-//! optional sort-key condition (`=`, `BETWEEN`, `begins_with`). Not supported
-//! (rejected with a clear error): document types (`M`/`L`), sets
-//! (`SS`/`NS`/`BS`), projection/filter expressions, `Scan`, secondary indexes,
-//! and `ReturnValues` — all deferred.
+//! optional sort-key condition (`=`, `BETWEEN`, `begins_with`), and an optional
+//! `IndexName` to query a global secondary index instead of the base table.
+//! `CreateTable` accepts a `GlobalSecondaryIndexes` declaration (one hash-only
+//! GSI). `Scan` reads a whole table with `Limit` / `ExclusiveStartKey`
+//! pagination and an optional `FilterExpression` (the same predicate subset as
+//! `ConditionExpression`). Not supported (rejected with a clear error): document
+//! types (`M`/`L`), sets (`SS`/`NS`/`BS`), projection expressions, composite or
+//! multiple GSIs, local secondary indexes, and `ReturnValues` — all deferred.
 
 use std::collections::BTreeMap;
 
@@ -27,6 +31,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::condition::{ConditionExpression, SortKeyCondition};
+use crate::registry::GlobalSecondaryIndex;
 use crate::{AttributeValue, Item, TableSchema};
 
 /// The `X-Amz-Target` service+version prefix DynamoDB clients send.
@@ -35,12 +40,15 @@ pub const TARGET_PREFIX: &str = "DynamoDB_20120810.";
 /// A decoded DynamoDB wire operation (the supported subset).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Operation {
-    /// `CreateTable`: register `schema` under `table`.
+    /// `CreateTable`: register `schema` under `table`, with any global
+    /// secondary indexes in `indexes`.
     CreateTable {
         /// New table name.
         table: String,
         /// The key schema (partition key + optional sort key).
         schema: TableSchema,
+        /// Declared global secondary indexes (a hash-only first slice).
+        indexes: Vec<GlobalSecondaryIndex>,
     },
     /// `PutItem`: insert or replace `item` in `table`.
     PutItem {
@@ -68,14 +76,28 @@ pub enum Operation {
         condition: Option<ConditionExpression>,
     },
     /// `Query`: items in a partition (`pk = ..`) matching an optional sort-key
-    /// condition.
+    /// condition — against the base table, or a GSI when `index` is set (a GSI
+    /// query is a hash-key equality only; no sort condition).
     Query {
         /// Target table name.
         table: String,
-        /// The partition-key value (equality).
+        /// The GSI to query, if any (else the base table).
+        index: Option<String>,
+        /// The partition/index-key value (equality).
         partition_value: AttributeValue,
-        /// Optional sort-key narrowing.
+        /// Optional sort-key narrowing (base-table queries only).
         sort_condition: Option<SortKeyCondition>,
+    },
+    /// `Scan`: a full-table read with pagination and an optional filter.
+    Scan {
+        /// Target table name.
+        table: String,
+        /// Max items to return this page (`None` = all remaining).
+        limit: Option<usize>,
+        /// The exclusive start key (pagination cursor) from a previous page.
+        exclusive_start_key: Option<Item>,
+        /// Optional post-read filter (the `ConditionExpression` predicate set).
+        filter: Option<ConditionExpression>,
     },
 }
 
@@ -88,7 +110,8 @@ impl Operation {
             | Operation::PutItem { table, .. }
             | Operation::GetItem { table, .. }
             | Operation::DeleteItem { table, .. }
-            | Operation::Query { table, .. } => table,
+            | Operation::Query { table, .. }
+            | Operation::Scan { table, .. } => table,
         }
     }
 }
@@ -182,7 +205,12 @@ pub fn decode_request(target: &str, body: &[u8]) -> Result<Operation, WireError>
         "CreateTable" => {
             let table = table_name(obj)?;
             let schema = decode_key_schema(obj)?;
-            Ok(Operation::CreateTable { table, schema })
+            let indexes = decode_gsis(obj)?;
+            Ok(Operation::CreateTable {
+                table,
+                schema,
+                indexes,
+            })
         }
         "PutItem" => {
             let table = table_name(obj)?;
@@ -210,6 +238,7 @@ pub fn decode_request(target: &str, body: &[u8]) -> Result<Operation, WireError>
             })
         }
         "Query" => decode_query(obj),
+        "Scan" => decode_scan(obj),
         _ => Err(WireError::unknown_operation(target)),
     }
 }
@@ -255,11 +284,57 @@ fn decode_key_schema(obj: &Map<String, Value>) -> Result<TableSchema, WireError>
     })
 }
 
+/// Decode the optional `GlobalSecondaryIndexes` of a `CreateTable` into a list
+/// of [`GlobalSecondaryIndex`]. Each entry's `KeySchema` must be a single
+/// `HASH` attribute (this slice supports hash-only GSIs; a `RANGE` is rejected).
+/// Absent ⇒ an empty list.
+fn decode_gsis(obj: &Map<String, Value>) -> Result<Vec<GlobalSecondaryIndex>, WireError> {
+    let Some(gsis) = obj.get("GlobalSecondaryIndexes") else {
+        return Ok(Vec::new());
+    };
+    let gsis = gsis
+        .as_array()
+        .ok_or_else(|| WireError::validation("`GlobalSecondaryIndexes` must be an array"))?;
+    let mut out = Vec::with_capacity(gsis.len());
+    for gsi in gsis {
+        let g = gsi
+            .as_object()
+            .ok_or_else(|| WireError::validation("each GSI must be an object"))?;
+        let name = g
+            .get("IndexName")
+            .and_then(Value::as_str)
+            .ok_or_else(|| WireError::validation("GSI missing `IndexName`"))?
+            .to_owned();
+        let schema = decode_key_schema(g)?;
+        if schema.sort_key.is_some() {
+            return Err(WireError::validation(format!(
+                "GSI `{name}` has a RANGE key; only hash-only GSIs are supported"
+            )));
+        }
+        out.push(GlobalSecondaryIndex {
+            name,
+            key_attribute: schema.partition_key,
+        });
+    }
+    Ok(out)
+}
+
 /// Decode the optional `ConditionExpression` + `ExpressionAttributeValues` of a
 /// write. Supported forms: `attribute_not_exists(attr)`,
 /// `attribute_exists(attr)`, and `attr = :placeholder`. Absent ⇒ `Ok(None)`.
 fn decode_condition(obj: &Map<String, Value>) -> Result<Option<ConditionExpression>, WireError> {
-    let Some(expr) = obj.get("ConditionExpression").and_then(Value::as_str) else {
+    decode_predicate(obj, "ConditionExpression")
+}
+
+/// Decode a predicate from the string field named `field` (one of
+/// `ConditionExpression` / `FilterExpression`) into a [`ConditionExpression`]:
+/// `attribute_not_exists(attr)`, `attribute_exists(attr)`, or `attr = :v`
+/// (resolved against `ExpressionAttributeValues`). Absent ⇒ `Ok(None)`.
+fn decode_predicate(
+    obj: &Map<String, Value>,
+    field: &str,
+) -> Result<Option<ConditionExpression>, WireError> {
+    let Some(expr) = obj.get(field).and_then(Value::as_str) else {
         return Ok(None);
     };
     let expr = expr.trim();
@@ -274,7 +349,7 @@ fn decode_condition(obj: &Map<String, Value>) -> Result<Option<ConditionExpressi
         ConditionExpression::Equals(attr.to_owned(), value)
     } else {
         return Err(WireError::validation(format!(
-            "unsupported ConditionExpression `{expr}` (supported: \
+            "unsupported {field} `{expr}` (supported: \
              attribute_not_exists(a), attribute_exists(a), a = :v)"
         )));
     };
@@ -330,14 +405,55 @@ fn decode_query(obj: &Map<String, Value>) -> Result<Operation, WireError> {
         .ok_or_else(|| WireError::validation("partition key condition must be `pk = :v`"))?;
     let partition_value = resolve_placeholder(obj, pk_placeholder.trim())?;
 
+    let index = obj
+        .get("IndexName")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+
     let sort_condition = match sort_clause {
         None => None,
         Some(clause) => Some(decode_sort_condition(obj, clause)?),
     };
+    if index.is_some() && sort_condition.is_some() {
+        return Err(WireError::validation(
+            "a GSI query is a hash-key equality only (no sort-key condition)",
+        ));
+    }
     Ok(Operation::Query {
         table,
+        index,
         partition_value,
         sort_condition,
+    })
+}
+
+/// Decode a `Scan` body: an optional `Limit`, an optional `ExclusiveStartKey`
+/// (the AttributeValue-map cursor from a previous page's `LastEvaluatedKey`),
+/// and an optional `FilterExpression` (the `ConditionExpression` predicate set).
+fn decode_scan(obj: &Map<String, Value>) -> Result<Operation, WireError> {
+    let table = table_name(obj)?;
+    let limit = match obj.get("Limit") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(
+            v.as_u64()
+                .and_then(|n| usize::try_from(n).ok())
+                .ok_or_else(|| WireError::validation("`Limit` must be a non-negative integer"))?,
+        ),
+    };
+    let exclusive_start_key = match obj.get("ExclusiveStartKey") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(
+            v.as_object()
+                .ok_or_else(|| WireError::validation("`ExclusiveStartKey` must be an object"))
+                .and_then(decode_item)?,
+        ),
+    };
+    let filter = decode_predicate(obj, "FilterExpression")?;
+    Ok(Operation::Scan {
+        table,
+        limit,
+        exclusive_start_key,
+        filter,
     })
 }
 
@@ -512,11 +628,32 @@ pub fn query_response(items: &[Item]) -> String {
     serde_json::to_string(&Value::Object(obj)).expect("query response serializes")
 }
 
-/// The JSON body for a successful `CreateTable`: a minimal `TableDescription`
-/// echoing the name, key schema, and an `ACTIVE` status (tables are immediately
-/// usable here — there is no provisioning phase).
+/// The JSON body for a successful `Scan`: `{"Items": [..], "Count": n,
+/// "ScannedCount": s}`, plus a `LastEvaluatedKey` (the AttributeValue-map
+/// pagination cursor) when the page was truncated by a `Limit`. `scanned` counts
+/// the items read before filtering; `Count` the items returned after.
 #[must_use]
-pub fn create_table_response(table: &str, schema: &TableSchema) -> String {
+pub fn scan_response(items: &[Item], scanned: usize, last_evaluated_key: Option<&Item>) -> String {
+    let encoded: Vec<Value> = items.iter().map(encode_item).collect();
+    let mut obj = Map::new();
+    obj.insert("Items".into(), Value::Array(encoded));
+    obj.insert("Count".into(), Value::from(items.len()));
+    obj.insert("ScannedCount".into(), Value::from(scanned));
+    if let Some(key) = last_evaluated_key {
+        obj.insert("LastEvaluatedKey".into(), encode_item(key));
+    }
+    serde_json::to_string(&Value::Object(obj)).expect("scan response serializes")
+}
+
+/// The JSON body for a successful `CreateTable`: a minimal `TableDescription`
+/// echoing the name, key schema, any GSIs, and an `ACTIVE` status (tables are
+/// immediately usable here — there is no provisioning phase).
+#[must_use]
+pub fn create_table_response(
+    table: &str,
+    schema: &TableSchema,
+    indexes: &[GlobalSecondaryIndex],
+) -> String {
     let mut key_schema = vec![key_schema_entry(&schema.partition_key, "HASH")];
     if let Some(sk) = &schema.sort_key {
         key_schema.push(key_schema_entry(sk, "RANGE"));
@@ -525,6 +662,22 @@ pub fn create_table_response(table: &str, schema: &TableSchema) -> String {
     desc.insert("TableName".into(), Value::String(table.to_owned()));
     desc.insert("KeySchema".into(), Value::Array(key_schema));
     desc.insert("TableStatus".into(), Value::String("ACTIVE".into()));
+    if !indexes.is_empty() {
+        let gsis: Vec<Value> = indexes
+            .iter()
+            .map(|gsi| {
+                let mut g = Map::new();
+                g.insert("IndexName".into(), Value::String(gsi.name.clone()));
+                g.insert(
+                    "KeySchema".into(),
+                    Value::Array(vec![key_schema_entry(&gsi.key_attribute, "HASH")]),
+                );
+                g.insert("IndexStatus".into(), Value::String("ACTIVE".into()));
+                Value::Object(g)
+            })
+            .collect();
+        desc.insert("GlobalSecondaryIndexes".into(), Value::Array(gsis));
+    }
     let mut obj = Map::new();
     obj.insert("TableDescription".into(), Value::Object(desc));
     serde_json::to_string(&Value::Object(obj)).expect("create-table response serializes")
@@ -685,7 +838,7 @@ mod tests {
 
     #[test]
     fn unknown_target_is_rejected() {
-        let err = decode_request("DynamoDB_20120810.Scan", b"{}").unwrap_err();
+        let err = decode_request("DynamoDB_20120810.BatchWriteItem", b"{}").unwrap_err();
         assert_eq!(err.code, "UnknownOperationException");
     }
 
@@ -743,9 +896,14 @@ mod tests {
             "AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"},
                                     {"AttributeName":"sk","AttributeType":"S"}]}"#;
         match decode_request("DynamoDB_20120810.CreateTable", body).unwrap() {
-            Operation::CreateTable { table, schema } => {
+            Operation::CreateTable {
+                table,
+                schema,
+                indexes,
+            } => {
                 assert_eq!(table, "t");
                 assert_eq!(schema, TableSchema::composite("pk", "sk"));
+                assert!(indexes.is_empty());
             }
             other => panic!("expected CreateTable, got {other:?}"),
         }
@@ -805,10 +963,12 @@ mod tests {
         match decode_request("DynamoDB_20120810.Query", body).unwrap() {
             Operation::Query {
                 table,
+                index,
                 partition_value,
                 sort_condition,
             } => {
                 assert_eq!(table, "t");
+                assert_eq!(index, None);
                 assert_eq!(partition_value, s("part"));
                 assert_eq!(sort_condition, None);
             }
@@ -867,9 +1027,103 @@ mod tests {
 
     #[test]
     fn create_table_response_shape() {
-        let body = create_table_response("t", &TableSchema::composite("pk", "sk"));
+        let body = create_table_response("t", &TableSchema::composite("pk", "sk"), &[]);
         assert!(body.contains("\"TableStatus\":\"ACTIVE\""));
         assert!(body.contains("\"HASH\""));
         assert!(body.contains("\"RANGE\""));
+        assert!(!body.contains("GlobalSecondaryIndexes"));
+    }
+
+    #[test]
+    fn decodes_create_table_with_gsi() {
+        let body = br#"{"TableName":"t",
+            "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
+            "GlobalSecondaryIndexes":[
+                {"IndexName":"by-email",
+                 "KeySchema":[{"AttributeName":"email","KeyType":"HASH"}],
+                 "Projection":{"ProjectionType":"ALL"}}]}"#;
+        match decode_request("DynamoDB_20120810.CreateTable", body).unwrap() {
+            Operation::CreateTable { indexes, .. } => {
+                assert_eq!(
+                    indexes,
+                    vec![GlobalSecondaryIndex {
+                        name: "by-email".into(),
+                        key_attribute: "email".into(),
+                    }]
+                );
+            }
+            other => panic!("expected CreateTable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_gsi_with_range_key() {
+        let body = br#"{"TableName":"t",
+            "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
+            "GlobalSecondaryIndexes":[
+                {"IndexName":"i",
+                 "KeySchema":[{"AttributeName":"a","KeyType":"HASH"},
+                              {"AttributeName":"b","KeyType":"RANGE"}]}]}"#;
+        let err = decode_request("DynamoDB_20120810.CreateTable", body).unwrap_err();
+        assert_eq!(err.code, "ValidationException");
+    }
+
+    #[test]
+    fn decodes_query_against_an_index() {
+        let body = br#"{"TableName":"t","IndexName":"by-email",
+            "KeyConditionExpression":"email = :e",
+            "ExpressionAttributeValues":{":e":{"S":"a@x"}}}"#;
+        match decode_request("DynamoDB_20120810.Query", body).unwrap() {
+            Operation::Query {
+                index,
+                partition_value,
+                sort_condition,
+                ..
+            } => {
+                assert_eq!(index.as_deref(), Some("by-email"));
+                assert_eq!(partition_value, s("a@x"));
+                assert_eq!(sort_condition, None);
+            }
+            other => panic!("expected Query, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decodes_scan_with_limit_and_filter() {
+        let body = br#"{"TableName":"t","Limit":2,
+            "ExclusiveStartKey":{"id":{"S":"k5"}},
+            "FilterExpression":"attribute_exists(v)"}"#;
+        match decode_request("DynamoDB_20120810.Scan", body).unwrap() {
+            Operation::Scan {
+                table,
+                limit,
+                exclusive_start_key,
+                filter,
+            } => {
+                assert_eq!(table, "t");
+                assert_eq!(limit, Some(2));
+                assert_eq!(exclusive_start_key.unwrap().get("id"), Some(&s("k5")));
+                assert_eq!(
+                    filter,
+                    Some(ConditionExpression::AttributeExists("v".into()))
+                );
+            }
+            other => panic!("expected Scan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scan_response_includes_cursor_when_truncated() {
+        let mut a = Item::new();
+        a.insert("id".into(), s("k1"));
+        let mut key = Item::new();
+        key.insert("id".into(), s("k1"));
+        let body = scan_response(&[a.clone()], 3, Some(&key));
+        assert!(body.contains("\"Count\":1"));
+        assert!(body.contains("\"ScannedCount\":3"));
+        assert!(body.contains("\"LastEvaluatedKey\""));
+        // No cursor when the page was not truncated.
+        let body = scan_response(&[a], 1, None);
+        assert!(!body.contains("LastEvaluatedKey"));
     }
 }
