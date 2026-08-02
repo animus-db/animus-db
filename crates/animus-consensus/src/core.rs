@@ -81,7 +81,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use animus_env::NodeId;
 
 use crate::message::{AccordMsg, Out};
-use crate::persist::{PersistedState, WalRecord};
+use crate::persist::{PersistedState, PersistedTxn, WalRecord};
 use crate::timestamp::{Ballot, LogicalClock, Timestamp};
 
 /// A transaction identifier: its original proposed timestamp `t0`, which is
@@ -380,6 +380,16 @@ pub struct AccordCore {
     /// Durable-state records the driver must fsync before acting on them. The
     /// core only accumulates; [`AccordCore::drain_persist`] hands them off.
     pending: Vec<WalRecord>,
+
+    /// **Snapshot / log-truncation bookkeeping** (ADR 0011). The number of applied
+    /// transactions covered by the last [`AccordCore::snapshot`]. The driver
+    /// compares it to `applied_order.len()` to decide when enough new transactions
+    /// have applied to be worth compacting the WAL.
+    snapshotted_applied: usize,
+    /// Set by [`AccordCore::snapshot`] to tell the driver the WAL should be
+    /// **rewritten** to the compact image ([`AccordCore::wal_image`]) — the
+    /// truncation is materialised as a full atomic replace, never incremental.
+    snapshot_dirty: bool,
 }
 
 impl AccordCore {
@@ -402,6 +412,8 @@ impl AccordCore {
             pending_apply: Vec::new(),
             pending_read: Vec::new(),
             pending: Vec::new(),
+            snapshotted_applied: 0,
+            snapshot_dirty: false,
         }
     }
 
@@ -479,18 +491,55 @@ impl AccordCore {
 
     // ---- quorum arithmetic ----------------------------------------------
 
-    /// Slow-path (simple-majority) quorum: a strict majority of replicas.
+    /// Slow-path / recovery quorum: a strict majority of replicas (`⌊N/2⌋ + 1`).
+    /// This is the size of the `Accept`/`Commit` quorum and of a recovery quorum.
+    /// The implied failure tolerance is `f = N − slow_quorum = ⌊(N−1)/2⌋`.
     fn slow_quorum(&self) -> usize {
         self.cluster_size / 2 + 1
     }
 
-    /// Fast-path quorum. Accord's fast quorum is larger than a simple majority
-    /// (`f + (f+1)/2`-ish); for this minimal slice we use a conservative
-    /// `ceil(3N/4)`, which for the tested N=3 is 3 (all replicas) and for N=5 is
-    /// 4. The point this slice proves is the *mechanism*, not the exact tight
-    /// bound — see ADR 0011 for the deferred precise quorum.
+    /// The implied failure tolerance `f`: the number of replicas that may fail
+    /// while a slow/recovery quorum remains available, i.e. `N − slow_quorum`
+    /// (`= ⌊(N−1)/2⌋`).
+    fn failure_tolerance(&self) -> usize {
+        self.cluster_size - self.slow_quorum()
+    }
+
+    /// The **precise fast-path quorum** for Accord's *simplified* recovery (the one
+    /// this core implements — a recovery coordinator always forces the slow path;
+    /// ADR 0011). Replaces the earlier conservative `⌈3N/4⌉` placeholder.
+    ///
+    /// The fast path commits at `t0` in one round only if a fast quorum of this
+    /// size all reply identical `(t0, deps)`. For the simplified recovery procedure
+    /// the safe, tight bound is **all-but-the-failure-tolerance** replicas — for the
+    /// common `N = 2f+1` that is `F = N − 1` — sized so it **intersects every
+    /// recovery quorum in ≥ 1 replica** *and* **every other fast quorum in ≥ 1
+    /// replica** (the recoverability condition the simplified protocol requires):
+    ///
+    /// - **Fast ∩ recovery** `= F + slow_quorum − N = (N−1) + (⌊N/2⌋+1) − N =
+    ///   ⌊N/2⌋ ≥ 1` (for `N ≥ 2`). Any recovery quorum thus contains ≥ 1 replica
+    ///   that witnessed the fast-path `(t0, deps)`, so recovery can never miss that
+    ///   a fast decision was possible — and our recovery's max-ts/union-deps rule
+    ///   over a quorum that includes a fast-path witness reproduces (never
+    ///   contradicts) the fast value.
+    /// - **Fast ∩ fast** `= 2(N−1) − N = N − 2 ≥ 1` (for `N ≥ 3`). Two concurrent
+    ///   fast attempts on the same transaction share a replica, so they cannot
+    ///   fast-commit *different* values.
+    ///
+    /// The *optimized* bound `f + ⌊(f+1)/2⌋` is smaller but needs Accord's full
+    /// PreAcceptOk-witness recovery (still deferred, ADR 0011); pairing it with our
+    /// slow-path-only recovery would be unsafe, so we take the simplified bound.
+    /// For the degenerate `f = 0` (`N ≤ 2`, no fault tolerance) the fast quorum is
+    /// the whole cluster, so no single stray reply can wrongly fast-commit.
     fn fast_quorum(&self) -> usize {
-        (self.cluster_size * 3).div_ceil(4)
+        let n = self.cluster_size;
+        if self.failure_tolerance() == 0 {
+            // N <= 2: require unanimity (a recovery quorum is the whole cluster too).
+            return n;
+        }
+        // The tight, recoverable simplified bound: all but one replica, never below
+        // the slow quorum.
+        (n - 1).max(self.slow_quorum())
     }
 
     // ---- accessors -------------------------------------------------------
@@ -569,6 +618,99 @@ impl AccordCore {
     /// to satisfy the read-only transaction's snapshot.
     pub fn drain_reads(&mut self) -> Vec<ReadEffect> {
         std::mem::take(&mut self.pending_read)
+    }
+
+    // ---- snapshot / log truncation --------------------------------------
+
+    /// The current durable image of this replica's state as a [`PersistedState`]:
+    /// every transaction the core still tracks, collapsed to one `PersistedTxn`
+    /// each, plus the recovered execution order. This is exactly what
+    /// [`AccordCore::recovered`] consumes, so a WAL of just
+    /// `Snapshot { state: persisted_state() }` replays to the identical core.
+    #[must_use]
+    pub fn persisted_state(&self) -> PersistedState {
+        let mut txns = BTreeMap::new();
+        for (&txn, t) in &self.txns {
+            txns.insert(
+                txn,
+                PersistedTxn {
+                    keys: t.keys.clone(),
+                    write_keys: t.write_keys.clone(),
+                    write_values: t.write_values.clone(),
+                    execute_at: t.execute_at,
+                    deps: t.deps.clone(),
+                    // `Applied` is folded back into `phase` on recovery via the
+                    // `applied` flag, mirroring how the WAL `Applied` record works:
+                    // store the committed-or-earlier phase here and set `applied`.
+                    phase: if t.phase == Phase::Applied {
+                        Phase::Committed
+                    } else {
+                        t.phase
+                    },
+                    applied: t.phase == Phase::Applied,
+                    read_only: t.read_only,
+                    promised: t.promised,
+                    accepted_ballot: t.accepted_ballot,
+                    commit_ballot: t.commit_ballot,
+                },
+            );
+        }
+        PersistedState {
+            txns,
+            applied_order: self.applied_order.clone(),
+        }
+    }
+
+    /// The compact WAL image that replays to exactly the current durable state: a
+    /// **single** [`WalRecord::Snapshot`] carrying [`AccordCore::persisted_state`].
+    /// The driver atomically **replaces** the WAL with this during compaction,
+    /// collapsing every covered transaction's multi-record phase history (up to
+    /// `PreAccepted`+`Accepted`+`Promised`+`Committed`+`Applied`) into one record —
+    /// so the WAL is bounded by the *live transaction set*, not the unbounded
+    /// append history. Mirrors `RaftCore::wal_image`.
+    ///
+    /// Call only after [`drain_persist`](Self::drain_persist) has been flushed so
+    /// the image and the on-disk WAL agree.
+    #[must_use]
+    pub fn wal_image(&self) -> Vec<WalRecord> {
+        if self.txns.is_empty() {
+            return Vec::new();
+        }
+        let state = self.persisted_state();
+        vec![WalRecord::Snapshot {
+            txns: state.txns.into_iter().collect(),
+            applied_order: state.applied_order,
+        }]
+    }
+
+    /// Take a snapshot of the current applied state and mark the WAL for a
+    /// truncating rewrite. The snapshot base advances to cover every applied
+    /// transaction, and [`AccordCore::wal_image`] (the compact rewrite the driver
+    /// then materialises) folds the whole tracked state into one record. No-op (and
+    /// no rewrite) if nothing new has applied since the last snapshot. Mirrors
+    /// `RaftCore::snapshot`.
+    pub fn snapshot(&mut self) {
+        if self.applied_order.len() <= self.snapshotted_applied {
+            return; // nothing new applied; a rewrite would not shrink anything
+        }
+        self.snapshotted_applied = self.applied_order.len();
+        self.snapshot_dirty = true;
+    }
+
+    /// Take and clear the snapshot-dirty flag — the driver uses it to decide
+    /// whether to rewrite the WAL to [`AccordCore::wal_image`] this iteration.
+    pub fn take_snapshot_dirty(&mut self) -> bool {
+        std::mem::replace(&mut self.snapshot_dirty, false)
+    }
+
+    /// Applied transactions not yet covered by the last [`AccordCore::snapshot`] —
+    /// how much the WAL would shrink by compacting now. The driver snapshots once
+    /// this crosses a threshold. Mirrors `RaftCore::applied_since_snapshot`.
+    #[must_use]
+    pub fn applied_since_snapshot(&self) -> usize {
+        self.applied_order
+            .len()
+            .saturating_sub(self.snapshotted_applied)
     }
 
     // ---- failure-detector support ---------------------------------------
@@ -1316,18 +1458,33 @@ impl AccordCore {
 
     /// Execute every transaction that has become *applicable*, in agreed order.
     ///
-    /// A committed transaction is applicable when every *conflicting* transaction
-    /// that could order before it has already applied. Crucially, "could order
-    /// before" is judged against **every conflicting transaction this replica
-    /// knows of, in any phase** — not just the committed ones, and not only the
-    /// recorded dependency set: a conflicting transaction that is not yet
-    /// committed has an as-yet-unknown final timestamp that might land lower, so
-    /// we must wait for it to commit (and apply, if it then orders earlier)
-    /// before running. We then apply the applicable transaction with the
-    /// smallest `(execute_at, txn)` and repeat. Because the order
-    /// `(execute_at, txn)` is total and every replica converges to the same
-    /// committed `(execute_at, deps)` for every transaction, all replicas
-    /// execute conflicting transactions in the same order.
+    /// A committed transaction is applicable when every transaction that orders
+    /// before it in the agreed serialization order and could constrain it has
+    /// already applied. Two conditions, both required (see [`Self::next_applicable`]):
+    ///
+    /// 1. **Direct-conflict gate** ([`Self::conflicts_clear_for`]) — every
+    ///    *key-conflicting* transaction this replica knows of (any phase): a
+    ///    not-yet-committed one might still land before us (its final timestamp is
+    ///    unknown), and a committed-earlier one must have applied. This catches the
+    ///    conflicts whose dependency edge is **not yet recorded** (the new
+    ///    transaction may have raced ahead of theirs).
+    /// 2. **Transitive dependency-closure gate** ([`Self::deps_clear_for`]) — every
+    ///    transaction in the **transitive closure** of `txn`'s recorded `deps` that
+    ///    orders before `txn` must be committed *and* applied. This is the piece the
+    ///    direct gate misses: a dependency may be known here only as an *id* (learnt
+    ///    via a peer's `Commit`/`Accept` dep set, never its own `PreAccept`, so this
+    ///    replica has no key intersection to detect it), or be a *transitive* dep —
+    ///    a conflict-of-a-conflict that does not share a key with `txn`. Without the
+    ///    closure gate `txn` could execute before such a predecessor and violate the
+    ///    agreed order. The closure is **cycle-aware**: Accord deps can be mutual
+    ///    (each carries the other), and a dep that orders *after* `txn`
+    ///    (`(execute_at, dep) > (execute_at, txn)`) does not block — the cycle is
+    ///    broken by the total `(execute_at, txn)` order, so a finite closure always
+    ///    drains.
+    ///
+    /// We apply the applicable transaction with the smallest `(execute_at, txn)`
+    /// and repeat. Because the order is total and every replica converges to the
+    /// same committed `(execute_at, deps)`, all replicas execute in the same order.
     fn try_execute(&mut self) {
         while let Some(txn) = self.next_applicable() {
             self.apply(txn);
@@ -1335,7 +1492,9 @@ impl AccordCore {
     }
 
     /// The applicable committed transaction with the smallest `(execute_at,
-    /// txn)`, or `None` if none is ready.
+    /// txn)`, or `None` if none is ready. Applicable = both the direct-conflict
+    /// gate ([`Self::conflicts_clear_for`]) and the transitive dependency-closure
+    /// gate ([`Self::deps_clear_for`]) are clear.
     fn next_applicable(&self) -> Option<TxnId> {
         let mut best: Option<(Timestamp, TxnId)> = None;
         for (&txn, t) in &self.txns {
@@ -1343,6 +1502,9 @@ impl AccordCore {
                 continue; // not committed, or already applied
             }
             if !self.conflicts_clear_for(txn, t.execute_at, &t.keys) {
+                continue;
+            }
+            if !self.deps_clear_for(txn, t.execute_at, &t.deps) {
                 continue;
             }
             let key = (t.execute_at, txn);
@@ -1353,8 +1515,9 @@ impl AccordCore {
         best.map(|(_, txn)| txn)
     }
 
-    /// Whether nothing this replica knows of could still need to execute before
-    /// `txn`. For every other transaction whose key set intersects `txn`'s:
+    /// Whether nothing this replica knows of *by key conflict* could still need to
+    /// execute before `txn`. For every other transaction whose key set intersects
+    /// `txn`'s:
     ///
     /// - if it is not yet committed, its final timestamp is unknown and might
     ///   order before `txn` — block until it commits;
@@ -1362,7 +1525,9 @@ impl AccordCore {
     ///   (execute_at, txn)`) but has not applied, block until it does.
     ///
     /// A conflict that is committed and orders *after* `txn` does not block: it
-    /// will run later.
+    /// will run later. This gate sees only conflicts whose **keys** this replica
+    /// knows; the [`Self::deps_clear_for`] gate covers recorded (incl. transitive)
+    /// dependencies whose keys it may not.
     fn conflicts_clear_for(&self, txn: TxnId, execute_at: Timestamp, keys: &BTreeSet<Key>) -> bool {
         for (&other, o) in &self.txns {
             if other == txn || o.keys.is_disjoint(keys) {
@@ -1374,6 +1539,57 @@ impl AccordCore {
             let orders_before = (o.execute_at, other) < (execute_at, txn);
             if orders_before && o.phase != Phase::Applied {
                 return false; // an earlier-ordered conflict has not executed yet
+            }
+        }
+        true
+    }
+
+    /// Whether the **transitive closure** of `txn`'s recorded dependencies that
+    /// orders before `txn` has fully committed and applied — the transitive
+    /// dependency wait-graph (ADR 0011).
+    ///
+    /// Walks `deps`, then each committed dependency's own `deps`, and so on. For
+    /// each transaction `d` reached:
+    ///
+    /// - if `d` is not yet committed, its final `(execute_at, d)` is unknown — it
+    ///   could order before `txn`, so we **block** (the dependency edge is real;
+    ///   we must wait to learn its position and effect);
+    /// - if `d` is committed and **orders before** `txn`
+    ///   (`(execute_at, d) < (execute_at, txn)`) it must have **applied**, else
+    ///   block; and we **recurse** into `d`'s own deps (transitivity);
+    /// - if `d` is committed and orders **after** `txn`, it does not block and we
+    ///   do **not** recurse through it — the `(execute_at, txn)` total order breaks
+    ///   any dependency cycle here, so the walk is finite.
+    ///
+    /// A dependency this replica has never heard of at all (no `txns` entry) blocks
+    /// like an un-committed one: its order is unknown and it might precede `txn`.
+    /// Deterministic (`BTreeSet` walk order); no allocation beyond the visited set
+    /// and a small stack.
+    fn deps_clear_for(&self, txn: TxnId, execute_at: Timestamp, deps: &BTreeSet<TxnId>) -> bool {
+        let here = (execute_at, txn);
+        let mut visited: BTreeSet<TxnId> = BTreeSet::new();
+        let mut stack: Vec<TxnId> = deps.iter().copied().collect();
+        while let Some(d) = stack.pop() {
+            if d == txn || !visited.insert(d) {
+                continue;
+            }
+            match self.txns.get(&d) {
+                // Never heard of this dependency, or it has not committed: its
+                // final position is unknown and might precede `txn`. Block.
+                None => return false,
+                Some(dt) if dt.phase < Phase::Committed => return false,
+                Some(dt) => {
+                    // Committed: only a dep ordering *before* `txn` constrains it.
+                    if (dt.execute_at, d) < here {
+                        if dt.phase != Phase::Applied {
+                            return false; // earlier-ordered predecessor not applied
+                        }
+                        // Recurse: its own (transitive) earlier predecessors must
+                        // have applied too. A dep ordering after `txn` is skipped,
+                        // so cycles are broken by the total order and the walk ends.
+                        stack.extend(dt.deps.iter().copied());
+                    }
+                }
             }
         }
         true
@@ -2059,5 +2275,300 @@ impl AccordCore {
         // A recovered commit is, by Accord's recovery rules, equivalent to a
         // slow-path commit (we never assert the fast path on recovery).
         self.commit(txn, execute_at, deps, false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Hand a replica a `Commit` for `txn` at `execute_at` writing `write_keys`,
+    /// with the given transitive `deps`. Mirrors what the wire delivers — the core
+    /// records the decision and tries to execute.
+    fn commit(
+        core: &mut AccordCore,
+        from: NodeId,
+        txn: TxnId,
+        execute_at: Timestamp,
+        deps: &[TxnId],
+        write_keys: &[Key],
+    ) {
+        core.handle(
+            from,
+            AccordMsg::Commit {
+                txn,
+                ballot: Ballot::ZERO,
+                execute_at,
+                deps: deps.iter().copied().collect(),
+                write_keys: write_keys.iter().copied().collect(),
+                write_values: BTreeMap::new(),
+                read_only: false,
+            },
+        );
+    }
+
+    /// The **transitive dependency wait-graph** (ADR 0011): a committed
+    /// transaction must not execute before a dependency that orders before it —
+    /// **even one this replica knows only as an id, on a disjoint key set** (so the
+    /// direct key-conflict gate cannot see it). The direct-only gate would execute
+    /// `t` immediately and mis-order it ahead of `d`; the dependency-closure gate
+    /// makes it wait.
+    #[test]
+    fn transitive_dep_blocks_execution_until_predecessor_applies() {
+        // Replica id 2 in a 3-node cluster. We feed it Commits directly.
+        let mut core = AccordCore::new(2, &[0, 1, 2]);
+
+        // `d` writes key {a}, orders *before* `t`. `t` writes key {b} (disjoint
+        // from `d`), and was committed carrying `d` as a dependency — but this
+        // replica never saw `d`'s PreAccept, so it knows `d` only as an id and
+        // shares no key with it. A direct-conflict-only gate is blind to `d`.
+        let d = Timestamp::new(5, 0);
+        let t = Timestamp::new(10, 1);
+
+        // Commit `t` first, with deps = {d}. The direct gate is clear (nothing
+        // shares key b); the dependency gate must block on the unknown `d`.
+        commit(&mut core, 1, t, t, &[d], &[20]);
+        assert!(
+            !core.is_applied(t),
+            "t executed before its transitive dependency d was even known — \
+             the dependency-closure gate failed (direct-only mis-order)"
+        );
+        assert!(core.applied_order().is_empty(), "nothing should apply yet");
+
+        // Now `d` commits, ordering before `t`. It applies first, then `t` becomes
+        // applicable and applies — the agreed order [d, t].
+        commit(&mut core, 0, d, d, &[], &[10]);
+        assert!(core.is_applied(d), "d must apply (no predecessors)");
+        assert!(core.is_applied(t), "t must apply once d has");
+        assert_eq!(
+            core.applied_order(),
+            &[d, t],
+            "execution order must respect the transitive dependency d -> t"
+        );
+    }
+
+    /// The closure gate must **recurse**: `t`'s dep `m` is committed and orders
+    /// before `t`, and `m` in turn depends on `d` (a deeper, disjoint predecessor
+    /// `t` never directly saw). `t` must wait for the *whole chain* d -> m -> t.
+    #[test]
+    fn transitive_closure_waits_for_indirect_predecessor() {
+        let mut core = AccordCore::new(2, &[0, 1, 2]);
+        let d = Timestamp::new(3, 0); // writes {a}
+        let m = Timestamp::new(6, 1); // writes {a, b} — bridges d and t
+        let t = Timestamp::new(9, 2); // writes {b}; dep set {m}
+
+        // Commit t (dep m) then m (dep d): m orders before t, d before m. t and d
+        // are disjoint; only the recursive closure links them.
+        commit(&mut core, 1, t, t, &[m], &[200]);
+        commit(&mut core, 1, m, m, &[d], &[100, 200]);
+        // m's predecessor d is still unknown → neither m nor t may apply.
+        assert!(
+            !core.is_applied(m) && !core.is_applied(t),
+            "m (and thus t) must block until the indirect predecessor d applies"
+        );
+
+        commit(&mut core, 0, d, d, &[], &[100]);
+        assert_eq!(
+            core.applied_order(),
+            &[d, m, t],
+            "the full transitive chain d -> m -> t must be respected"
+        );
+    }
+
+    /// The **precise fast-path quorum** (ADR 0011): the simplified-recovery bound
+    /// is all-but-the-failure-tolerance replicas — `N − 1` for the common
+    /// `N = 2f+1` — replacing the old conservative `⌈3N/4⌉`. Check the exact value
+    /// for a range of cluster sizes, and that it never drops below the slow quorum.
+    #[test]
+    fn fast_quorum_is_the_precise_bound() {
+        // (N, expected fast quorum). For N=2f+1 the precise simplified bound is
+        // N-1; for N<=2 (no fault tolerance) it is the whole cluster.
+        let cases = [
+            (1usize, 1usize), // f=0: unanimity
+            (2, 2),           // f=0: unanimity
+            (3, 2),           // f=1: N-1 = 2  (was ceil(9/4)=3)
+            (4, 3),           // f=1: N-1 = 3
+            (5, 4),           // f=2: N-1 = 4
+            (6, 5),           // f=2
+            (7, 6),           // f=3: N-1 = 6
+        ];
+        for (n, expected) in cases {
+            let all: Vec<NodeId> = (0..n as u64).collect();
+            let core = AccordCore::new(0, &all);
+            assert_eq!(
+                core.fast_quorum(),
+                expected,
+                "fast quorum for N={n} should be {expected}"
+            );
+            assert!(
+                core.fast_quorum() >= core.slow_quorum(),
+                "fast quorum must never be below the slow quorum (N={n})"
+            );
+        }
+    }
+
+    /// A fast-path decision must be **recoverable under f failures**: every
+    /// recovery quorum (a simple majority) intersects every fast quorum in **at
+    /// least one** replica, so a recovery coordinator always hears from a fast-path
+    /// witness and cannot miss that a fast commit was possible. Also: two fast
+    /// quorums always intersect, so concurrent fast attempts cannot decide
+    /// differently. Verified over the full quorum arithmetic for many N.
+    #[test]
+    fn fast_path_decision_is_recoverable_under_f_failures() {
+        for n in 1usize..=15 {
+            let all: Vec<NodeId> = (0..n as u64).collect();
+            let core = AccordCore::new(0, &all);
+            let fast = core.fast_quorum();
+            let slow = core.slow_quorum(); // = recovery quorum size
+            let f = core.failure_tolerance();
+
+            // The recovery quorum stays available under f failures.
+            assert_eq!(
+                slow,
+                n - f,
+                "recovery quorum must survive f failures (N={n})"
+            );
+
+            // Fast ∩ recovery >= 1: any two sets of these sizes drawn from N
+            // overlap in at least (fast + slow - N) replicas; that must be >= 1.
+            let fast_recovery_overlap = (fast + slow).saturating_sub(n);
+            assert!(
+                fast_recovery_overlap >= 1,
+                "fast({fast}) ∩ recovery({slow}) must be >= 1 for N={n}, got \
+                 {fast_recovery_overlap} — a fast decision could be unrecoverable"
+            );
+
+            // Fast ∩ fast >= 1: concurrent fast attempts share a witness, so they
+            // cannot fast-commit different values.
+            let fast_fast_overlap = (2 * fast).saturating_sub(n);
+            assert!(
+                fast_fast_overlap >= 1,
+                "fast({fast}) ∩ fast({fast}) must be >= 1 for N={n}, got \
+                 {fast_fast_overlap} — two fast quorums could diverge"
+            );
+        }
+    }
+
+    /// **WAL snapshotting / log truncation** (ADR 0011): the compact `wal_image`
+    /// (a single `Snapshot` record) replays to a core **identical** to the one that
+    /// produced it. Drives a replica to several applied transactions, snapshots,
+    /// then rebuilds from `wal_image` alone and asserts the recovered state matches.
+    #[test]
+    fn snapshot_image_replays_to_identical_state() {
+        let mut core = AccordCore::new(2, &[0, 1, 2]);
+        // A few committed, executed transactions plus one still in-flight, so the
+        // snapshot must capture both applied (terminal) and uncommitted state.
+        let d = Timestamp::new(2, 0);
+        let m = Timestamp::new(5, 1);
+        let t = Timestamp::new(9, 0);
+        commit(&mut core, 0, d, d, &[], &[10]);
+        commit(&mut core, 1, m, m, &[d], &[10, 20]);
+        commit(&mut core, 0, t, t, &[m], &[20]);
+        // An uncommitted (PreAccepted-only) transaction this replica has witnessed.
+        let pending = Timestamp::new(12, 1);
+        core.handle(
+            1,
+            AccordMsg::PreAccept {
+                txn: pending,
+                keys: [30].into_iter().collect(),
+                write_keys: [30].into_iter().collect(),
+                write_values: BTreeMap::new(),
+                read_only: false,
+            },
+        );
+
+        let before_order = core.applied_order().to_vec();
+        assert_eq!(before_order, vec![d, m, t], "all three applied in order");
+
+        // Snapshot + compact image, then rebuild a fresh core from the image alone.
+        core.snapshot();
+        assert!(
+            core.applied_since_snapshot() == 0,
+            "snapshot covers all applies"
+        );
+        let image = core.wal_image();
+        assert_eq!(
+            image.len(),
+            1,
+            "the compact image is a single Snapshot record"
+        );
+        let state = PersistedState::replay(image);
+        let recovered = AccordCore::recovered(2, &[0, 1, 2], state);
+
+        // The recovered core matches: same execution order, same committed
+        // decisions, same phase for the in-flight transaction.
+        assert_eq!(
+            recovered.applied_order(),
+            before_order.as_slice(),
+            "recovered execution order diverged from the snapshot"
+        );
+        for txn in [d, m, t] {
+            assert!(
+                recovered.is_applied(txn),
+                "recovered {txn:?} lost applied state"
+            );
+            assert_eq!(
+                recovered.committed_execute_at(txn),
+                core.committed_execute_at(txn),
+                "recovered {txn:?} execute_at diverged"
+            );
+            assert_eq!(
+                recovered.committed_deps(txn),
+                core.committed_deps(txn),
+                "recovered {txn:?} deps diverged"
+            );
+        }
+        assert_eq!(
+            recovered.phase(pending),
+            Some(Phase::PreAccepted),
+            "the in-flight transaction must survive the snapshot un-committed"
+        );
+        // The two persisted images are byte-for-byte identical (idempotent).
+        assert_eq!(
+            recovered.persisted_state(),
+            core.persisted_state(),
+            "re-snapshotting the recovered core must reproduce the same image"
+        );
+    }
+
+    /// `snapshot()` is a no-op when nothing new has applied — it must not flag a
+    /// pointless WAL rewrite.
+    #[test]
+    fn snapshot_is_noop_without_new_applies() {
+        let mut core = AccordCore::new(2, &[0, 1, 2]);
+        let a = Timestamp::new(3, 0);
+        commit(&mut core, 0, a, a, &[], &[1]);
+        core.snapshot();
+        assert!(
+            core.take_snapshot_dirty(),
+            "first snapshot should flag a rewrite"
+        );
+        // Nothing new applied since: snapshot must not re-flag.
+        core.snapshot();
+        assert!(
+            !core.take_snapshot_dirty(),
+            "a snapshot with no new applies must be a no-op"
+        );
+        assert_eq!(core.applied_since_snapshot(), 0);
+    }
+
+    /// Cycle-awareness: mutual dependencies (`a` deps `b`, `b` deps `a`) must not
+    /// deadlock — the total `(execute_at, txn)` order breaks the cycle, so the
+    /// lower-ordered one applies first.
+    #[test]
+    fn dependency_cycle_is_broken_by_timestamp_order() {
+        let mut core = AccordCore::new(2, &[0, 1, 2]);
+        let a = Timestamp::new(4, 0); // writes {k}
+        let b = Timestamp::new(7, 1); // writes {k} — conflicts a, mutual deps
+
+        // Both committed, each carrying the other as a dep (Accord deps can be
+        // mutual). a orders before b; the cycle must not stall execution.
+        commit(&mut core, 0, a, a, &[b], &[1]);
+        commit(&mut core, 1, b, b, &[a], &[1]);
+        assert_eq!(
+            core.applied_order(),
+            &[a, b],
+            "a mutual-dependency cycle must drain in (execute_at, txn) order"
+        );
     }
 }

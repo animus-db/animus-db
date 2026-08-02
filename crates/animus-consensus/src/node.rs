@@ -732,6 +732,41 @@ fn storage_key(key: Key) -> Vec<u8> {
     key.to_be_bytes().to_vec()
 }
 
+/// Bits of the MVCC [`Version`](animus_storage::Version) reserved for the node-id
+/// tiebreak of an execution timestamp (see [`mvcc_version`]). 16 bits ⇒ up to
+/// 65 535 distinct node ids; the high 48 bits carry the logical clock.
+const MVCC_NODE_BITS: u32 = 16;
+
+/// The MVCC storage version for an Accord execution timestamp, **preserving the
+/// full `(logical, node)` total order** — not just `logical`.
+///
+/// Two *conflicting* transactions can legitimately agree the **same `logical`**
+/// execution timestamp (the later one carries the earlier as a dependency and is
+/// ordered after it purely by the `node` tiebreak — this is correct Accord, and is
+/// now reachable since the precise fast-path quorum lets both fast-commit at their
+/// own `t0`). The store's `merge` is strictly-newer per-key LWW on a single `u64`
+/// version, so stamping both writes with `logical` alone would collide and keep
+/// whichever applied *first*, diverging from the agreed `(execute_at, txn)` order
+/// (the later-ordered transaction must win the shared key). Folding the `node`
+/// tiebreak into the low [`MVCC_NODE_BITS`] bits makes the version strictly
+/// increasing in `(logical, node)`, so per-key LWW keeps exactly the agreed winner
+/// on every replica. A read uses the same encoding, so `get_at` still observes
+/// every write ordered before the read and none after.
+fn mvcc_version(ts: Timestamp) -> u64 {
+    debug_assert!(
+        ts.node < (1 << MVCC_NODE_BITS),
+        "node id {} exceeds the {MVCC_NODE_BITS}-bit MVCC tiebreak field",
+        ts.node
+    );
+    debug_assert!(
+        ts.logical < (1 << (64 - MVCC_NODE_BITS)),
+        "logical clock {} exceeds the {}-bit MVCC version field",
+        ts.logical,
+        64 - MVCC_NODE_BITS
+    );
+    (ts.logical << MVCC_NODE_BITS) | (ts.node & ((1 << MVCC_NODE_BITS) - 1))
+}
+
 /// Encode a transaction id as the stored value (the executed effect is "write
 /// my id"): `(logical, node)` as two big-endian u64s.
 fn encode_txn(txn: TxnId) -> Vec<u8> {
@@ -775,6 +810,7 @@ fn persist_then_ship<E: Env, S: StorageEngine + 'static>(
     let storage = storage.clone();
     let reads = Arc::clone(reads);
     let sink = sink.clone();
+    let compact_core = Arc::clone(core);
     env.clone().spawn_task(async move {
         for record in &records {
             env.append(WAL, &PersistedState::encode_record(record))
@@ -790,11 +826,51 @@ fn persist_then_ship<E: Env, S: StorageEngine + 'static>(
         // so their write effects were drained no later than this one).
         apply_all(&storage, sink.as_deref(), &applies).await;
         satisfy_reads(&storage, sink.as_deref(), &reads, &read_effects).await;
+        // Now that the records are durable, compact the WAL if enough has applied:
+        // collapse the appended per-phase history into one snapshot record (ADR
+        // 0011, log truncation). Safe here because the appends above are fsynced.
+        maybe_compact(&env, &compact_core).await;
         for (to, msg) in outs {
             let bytes = serde_json::to_vec(&msg).expect("accord message serializes");
             env.send(to, bytes).await;
         }
     });
+}
+
+/// How many applied transactions must accumulate beyond the current snapshot base
+/// before the driver rewrites the WAL to its compact image (ADR 0011, log
+/// truncation). Bounds the WAL to roughly the live transaction set plus this many
+/// recent applies of append history. Mirrors the control-plane Raft's
+/// `SNAPSHOT_THRESHOLD`.
+const SNAPSHOT_THRESHOLD: usize = 64;
+
+/// Take a snapshot and **atomically replace** the WAL with the compact image when
+/// enough transactions have applied since the last snapshot (or the core already
+/// flagged the WAL dirty). The truncation is materialised as a full rewrite via
+/// `env.replace`, never incremental records — so a crash sees either the whole old
+/// or whole new WAL, and the rewritten WAL replays to the identical core
+/// ([`AccordCore::wal_image`] / [`AccordCore::recovered`]). Mirrors the control
+/// plane's `flush_and_maybe_compact`.
+async fn maybe_compact<E: Env>(env: &E, core: &Arc<Mutex<AccordCore>>) {
+    let (rewrite, image) = {
+        let mut c = core.lock().expect("accord core poisoned");
+        if c.applied_since_snapshot() >= SNAPSHOT_THRESHOLD {
+            c.snapshot();
+        }
+        let rewrite = c.take_snapshot_dirty();
+        // Build the image under the same lock so it matches the snapshot we just
+        // took; cheap (a clone of live state) and lock-free I/O follows.
+        let image = if rewrite { c.wal_image() } else { Vec::new() };
+        (rewrite, image)
+    };
+    if !rewrite {
+        return;
+    }
+    let mut bytes = Vec::new();
+    for record in &image {
+        bytes.extend(PersistedState::encode_record(record));
+    }
+    env.replace(WAL, &bytes).await.expect("wal compaction");
 }
 
 /// Apply the execution effects. Each effect writes the transaction's id to each
@@ -819,7 +895,11 @@ async fn apply_all<E: Env, S: StorageEngine>(
         // supplied an arbitrary value (`submit_writes`/`InteractiveTxn::write_value`)
         // gets exactly those bytes written (arbitrary write values, ADR 0011).
         let default_value = encode_txn(effect.txn);
-        let version = effect.version.logical;
+        // Stamp the write with the full `(execute_at, txn)` order, not just the
+        // logical component, so two conflicting writes that agreed the same logical
+        // timestamp still converge to the agreed (node-tiebroken) winner under the
+        // store's per-key LWW. See [`mvcc_version`].
+        let version = mvcc_version(effect.version);
         for &key in &effect.keys {
             let sk = storage_key(key);
             let value = effect.values.get(&key).unwrap_or(&default_value);
@@ -878,7 +958,12 @@ async fn satisfy_reads<E: Env, S: StorageEngine>(
     read_effects: &[ReadEffect],
 ) {
     for effect in read_effects {
-        let version = effect.version.logical;
+        // Read as of the read's full `(execute_at, txn)` order (same encoding as
+        // the write version, [`mvcc_version`]): `get_at` returns the greatest write
+        // with a packed version `<=` the read's, i.e. every write ordered before
+        // the read and none after (txn ids are distinct, so no write collides with
+        // the read's own version).
+        let version = mvcc_version(effect.version);
         let mut observed: BTreeMap<Key, Option<Vec<u8>>> = BTreeMap::new();
         for &key in &effect.keys {
             let sk = storage_key(key);

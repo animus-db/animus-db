@@ -36,19 +36,25 @@ fn store_writer(node: &AccordNode<SimEnv>, key: Key) -> Option<TxnId> {
 }
 
 /// The original coordinator (node 0) reaches one survivor (node 1) with its
-/// `PreAccept` but is partitioned from node 2, so it can never gather a fast
-/// quorum and stalls — it never commits. A *different* survivor (node 2) takes
-/// over: it queries the replicas, learns the transaction's keys from node 1's
-/// recorded `PreAccept`, re-drives the slow path, and reaches a commit +
-/// execution that is consistent on both survivors.
+/// `PreAccept` — so node 1 witnesses the transaction's keys — but never hears
+/// node 1's reply back and is fully cut off from node 2, so it can never gather a
+/// quorum and stalls. (Under the *precise* fast quorum of 2 for N=3, merely
+/// partitioning 0↔2 would let 0+1 fast-commit; we additionally block node 1's
+/// **reply** to node 0 so the coordinator is genuinely stranded while node 1 still
+/// holds the keys.) A *different* survivor (node 2) takes over: it queries the
+/// replicas, learns the transaction's keys from node 1's recorded `PreAccept`,
+/// re-drives the slow path, and reaches a commit + execution consistent on both
+/// survivors.
 #[test]
 fn recovery_commits_a_stranded_transaction() {
     let seed = 0xFA11_0001;
     let (mut sim, nodes) = cluster(seed);
 
-    // The coordinator can reach node 1 but not node 2: it stalls (no fast quorum)
-    // but node 1 still witnesses the PreAccept (and its keys).
+    // Node 0 cannot reach node 2 at all, and node 1's *reply* to node 0 is dropped
+    // (the PreAccept 0→1 still gets through, so node 1 learns the keys). Node 0
+    // thus has only its own vote and stalls; node 2 can still reach node 1.
     sim.partition_pair(0, 2);
+    sim.partition(1, 0);
 
     let txn = nodes[0].submit(keys(&[7]));
     // Settle the (failed) fast-quorum attempt, but stay **inside** the driver's

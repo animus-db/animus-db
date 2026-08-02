@@ -7,7 +7,9 @@
   transactions + read-set dependency folding + adaptive retry backoff; then
   arbitrary caller-supplied write values; then recovery ballots + duelling
   recoverers; then a **failure detector** that auto-triggers recovery + commit-ballot
-  fencing; then **per-shard consensus** — one Accord group per tablet)
+  fencing; then **per-shard consensus** — one Accord group per tablet; then the
+  **transitive dependency wait-graph** + the **precise fast-path quorum bound** +
+  **WAL snapshotting / log truncation**)
 - **Date:** 2026-08-01 (execution + durability increment: 2026-08-01;
   storage-backed execution + coordinator-failover increment: 2026-08-01;
   read-transactions + multi-thread-liveness increment: 2026-08-02;
@@ -17,7 +19,9 @@
   2026-08-02; arbitrary-write-values increment: 2026-08-02;
   recovery-ballots + duelling-recoverers increment: 2026-08-02;
   failure-detector-triggered-recovery + commit-ballot-fencing increment: 2026-08-02;
-  per-shard-consensus increment: 2026-08-02)
+  per-shard-consensus increment: 2026-08-02;
+  transitive-wait-graph + precise-fast-path-quorum + WAL-snapshotting increment:
+  2026-08-02)
 
 ## Context
 
@@ -784,3 +788,94 @@ group — again without reshaping (indeed without touching) the sync `AccordCore
   membership-aware failure detector. Placement of the consensus participants is now
   exactly tablet placement (ADR 0005) — `ShardRouter` derives the groups from the
   same tablet map the control plane already maintains.
+
+## Transitive wait-graph + precise fast-path quorum + WAL snapshotting (2026-08-02)
+
+This increment closes three long-standing core-correctness / housekeeping
+deferrals at once — the **full transitive dependency wait-graph**, the **precise
+fast-path quorum bound**, and **WAL snapshotting / log truncation** — again
+without reshaping the sync-core / `Env`-driver split.
+
+- **Transitive dependency wait-graph.** Execution previously gated only on
+  *direct key conflicts* (`conflicts_clear_for`): a committed transaction applied
+  once every key-intersecting transaction this replica knew (any phase) that
+  orders before it had applied. That under-waits for a dependency the replica
+  knows **only as an id** — learnt via a peer's `Commit`/`Accept` dependency set,
+  never the dependency's own `PreAccept`, so there is no local key to detect it —
+  or a **transitive** dependency (a conflict-of-a-conflict that shares no key with
+  the transaction). Such a predecessor could execute *after* the transaction,
+  violating the agreed serialization order. `next_applicable` now additionally
+  requires `deps_clear_for`: the **transitive closure** of the transaction's
+  recorded `deps` that orders before it must be committed *and* applied. The walk
+  is **cycle-aware** — Accord dependencies can be mutual, and a dependency ordering
+  *after* the transaction (`(execute_at, dep) > (execute_at, txn)`) neither blocks
+  nor is recursed through, so the total `(execute_at, txn)` order breaks every
+  cycle and the closure is finite. A dependency this replica has never heard of at
+  all blocks like an un-committed one (its position is unknown and might precede);
+  the failure detector / retry guarantees it eventually arrives. The core stays
+  synchronous + I/O-free. White-box unit tests in `core.rs` prove a transitive
+  dependency on a disjoint key set (and a deeper `d → m → t` chain) blocks
+  execution until the predecessor applies — and **fail without the new gate** — and
+  that a mutual-dependency cycle drains in timestamp order without deadlocking.
+
+- **Precise fast-path quorum bound.** The fast quorum was a conservative
+  placeholder `⌈3N/4⌉`. The precise bound for the *simplified* recovery this core
+  uses (recovery always forces the slow path) is **all-but-the-failure-tolerance**
+  replicas — `F = N − 1` for the common `N = 2f+1` (e.g. **2** for N=3, vs the old
+  3) — sized so it **intersects every recovery (simple-majority) quorum in ≥ 1
+  replica** (`F + slow − N = ⌊N/2⌋ ≥ 1`) and **every other fast quorum in ≥ 1**
+  (`2F − N = N − 2 ≥ 1`). The first intersection is exactly the recoverability
+  condition: any recovery quorum contains a fast-path witness, so the
+  max-ts/union-deps recovery over it reproduces (never contradicts) a fast value.
+  The *optimized* bound `f + ⌊(f+1)/2⌋` is smaller but needs Accord's full
+  `PreAcceptOk`-witness recovery (still deferred), so pairing it with our slow-path
+  recovery would be unsafe — we take the simplified bound. **A latent bug the
+  tighter bound exposed and this increment fixes:** two *conflicting* transactions
+  can now legitimately fast-commit at the **same logical timestamp** (the later one
+  carries the earlier as a dependency and is ordered after it purely by the `node`
+  tiebreak). The data-plane / storage MVCC version was `execute_at.logical` alone,
+  dropping that tiebreak, so the per-key LWW kept whichever *applied first* instead
+  of the agreed `(execute_at, txn)` winner. The driver now stamps writes (and
+  reads) with `mvcc_version` = `(logical << 16) | node`, preserving the full order,
+  so conflicting same-logical writes converge to the agreed winner on every
+  replica. White-box unit tests assert the exact bound and the recoverability
+  intersection arithmetic over many `N`; a 5-node `SimEnv` test
+  (`accord_fast_path.rs`) takes a genuine fast-path commit, kills the coordinator,
+  and proves a recovery quorum that **excludes** it reconstructs the identical
+  decision.
+
+- **WAL snapshotting / log truncation.** The per-node WAL grew with every phase
+  transition of every transaction (`PreAccepted` + `Accepted`/`Promised` +
+  `Committed` + `Applied`). Mirroring the control-plane Raft's compaction, the core
+  now produces a compact `wal_image` — a **single** `WalRecord::Snapshot` carrying
+  the `PersistedState` image (one `PersistedTxn` per tracked transaction + the
+  recovered execution order) — and the driver **atomically replaces**
+  (`env.replace`) the WAL with it once `applied_since_snapshot()` crosses a
+  threshold (64). The truncation is a full rewrite, never incremental, so a crash
+  sees the whole old or whole new WAL; replay folds the `Snapshot` first, then the
+  live tail on top (additive — a WAL with no `Snapshot` replays exactly as before).
+  The per-transaction facts ride the `Snapshot` as a `Vec<(TxnId, PersistedTxn)>`
+  (a JSON object cannot key on a `Timestamp` struct). The new core methods
+  (`persisted_state`, `wal_image`, `snapshot`, `take_snapshot_dirty`,
+  `applied_since_snapshot`) are additive and the core stays I/O-free. Tests: a core
+  unit test proves `wal_image` replays to an **identical** core (same execution
+  order, decisions, in-flight phase, and a byte-identical re-snapshot); a `SimEnv`
+  test (`accord_snapshot.rs`) drives past the threshold and asserts the on-disk WAL
+  collapsed to a `Snapshot`-led image with a record count far below the applied
+  count (it **fails** when compaction is disabled), and that a node restarted on
+  the truncated WAL recovers identical executed state + store.
+
+- **Public signatures stayed additive.** No existing entry point changed; the new
+  `AccordCore` methods, the `WalRecord::Snapshot` variant (`#[serde]`-additive),
+  and `PersistedState`/`PersistedTxn` serde derives are all additive. The whole
+  existing suite stays green, including the frozen Elle corpus (`animus-test`).
+
+- **Still deferred after this increment:** the optimized fast-path quorum
+  (`f + ⌊(f+1)/2⌋`) and the precise `PreAcceptOk`-witness fast-path-recovery
+  decision it requires (we still force the slow path on re-proposal); the unified
+  global cross-shard timestamp + 2PC atomic commit; and an adaptive /
+  membership-aware failure detector. The snapshot collapses the per-phase *history*
+  into one record per live transaction but does **not** garbage-collect terminal
+  (applied) transactions — they still gate successors via the dependency closure,
+  and dropping them safely would need a dependency low-water-mark; so the WAL is
+  bounded by the *live transaction set*, not by a fixed window.

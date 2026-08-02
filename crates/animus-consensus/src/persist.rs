@@ -8,10 +8,16 @@
 //! [`PersistedState`] and recovers the core. This mirrors the control plane's
 //! `animus-control::persist` exactly.
 //!
-//! Unlike Raft, there is no snapshot/log-truncation here yet: the WAL is the
-//! full per-transaction history. Snapshotting committed/applied transactions is
-//! deferred (see ADR 0011) — for the slice the WAL is bounded by the number of
-//! transactions, not unbounded log growth.
+//! **Snapshotting / log truncation** (ADR 0011), mirroring the control-plane
+//! Raft's compaction. Left unchecked the WAL grows with every *phase transition*
+//! of every transaction (a transaction emits up to four-plus records:
+//! `PreAccepted`, `Accepted`, `Promised`, `Committed`, `Applied`). The core can
+//! take a [`WalRecord::Snapshot`] — a single record carrying the compact
+//! [`PersistedState`] image of every transaction it still tracks — and the driver
+//! atomically **replaces** the WAL with `[Snapshot] ++ [live tail]`, collapsing
+//! each transaction's multi-record history into one and so bounding the WAL to
+//! roughly one record per live transaction. Recovery replays the snapshot first,
+//! then folds the tail on top.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -99,10 +105,29 @@ pub enum WalRecord {
     /// a recovered replica does not re-apply an already-applied effect and
     /// reconstructs the same execution order.
     Applied { txn: TxnId },
+    /// A **snapshot** of the durable replica state (ADR 0011, log truncation): a
+    /// single record carrying the compact image of every transaction the core
+    /// still tracks, plus the recovered execution order. The driver writes this at
+    /// the head of a freshly-**replaced** WAL, collapsing the per-phase history of
+    /// every covered transaction into this one record, then appends only the live
+    /// tail afterwards. Replay folds it **first** (it is the base every later record
+    /// builds on); a WAL with no `Snapshot` replays exactly as before (additive).
+    ///
+    /// The per-transaction facts ride as a **`Vec` of `(TxnId, PersistedTxn)`
+    /// entries**, not a `BTreeMap` — a JSON object cannot key on a `Timestamp`
+    /// struct. [`PersistedState::snapshot_record`] / replay convert to and from the
+    /// map form.
+    Snapshot {
+        txns: Vec<(TxnId, PersistedTxn)>,
+        applied_order: Vec<TxnId>,
+    },
 }
 
 impl WalRecord {
-    /// The transaction this record concerns.
+    /// The transaction this record concerns. A [`WalRecord::Snapshot`] covers many
+    /// transactions at once, so it has no single id — it returns
+    /// [`TxnId::ZERO`](crate::Timestamp::ZERO); callers handle `Snapshot`
+    /// explicitly (see [`PersistedState::replay`]) and never key it by `txn()`.
     #[must_use]
     pub fn txn(&self) -> TxnId {
         match self {
@@ -111,12 +136,14 @@ impl WalRecord {
             | WalRecord::Committed { txn, .. }
             | WalRecord::Promised { txn, .. }
             | WalRecord::Applied { txn } => *txn,
+            WalRecord::Snapshot { .. } => crate::timestamp::Timestamp::ZERO,
         }
     }
 }
 
 /// The durable replica facts about one transaction, rebuilt by folding the WAL.
-#[derive(Clone, Debug, Default)]
+/// `Serialize`/`Deserialize` so it can ride inside a [`WalRecord::Snapshot`].
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistedTxn {
     /// The transaction's conflict key set (known once PreAccepted or Committed).
     pub keys: BTreeSet<Key>,
@@ -151,7 +178,9 @@ pub struct PersistedTxn {
 }
 
 /// Durable Accord replica state reconstructed by replaying the write-ahead log.
-#[derive(Clone, Debug, Default)]
+/// `Serialize`/`Deserialize` so the whole image can ride inside a single
+/// [`WalRecord::Snapshot`] for log truncation.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistedState {
     /// Per-transaction durable facts, keyed by transaction id (== `t0`).
     pub txns: BTreeMap<TxnId, PersistedTxn>,
@@ -244,6 +273,36 @@ impl PersistedState {
                     if !entry.applied {
                         entry.applied = true;
                         state.applied_order.push(txn);
+                    }
+                }
+                WalRecord::Snapshot {
+                    txns: snap_txns,
+                    applied_order: snap_order,
+                } => {
+                    // The compact base every later record builds on. Fold it in
+                    // monotonically (max/union) so replay stays order-insensitive
+                    // even if a stray later record duplicates a snapshotted fact.
+                    for (stxn, st) in snap_txns {
+                        let entry = state.txns.entry(stxn).or_default();
+                        entry.keys.extend(st.keys);
+                        entry.write_keys.extend(st.write_keys);
+                        entry.write_values.extend(st.write_values);
+                        entry.execute_at = entry.execute_at.max(st.execute_at);
+                        entry.deps.extend(st.deps);
+                        entry.phase = entry.phase.max_phase(st.phase);
+                        entry.applied |= st.applied;
+                        entry.read_only |= st.read_only;
+                        entry.promised = entry.promised.max(st.promised);
+                        entry.accepted_ballot = entry.accepted_ballot.max(st.accepted_ballot);
+                        entry.commit_ballot = entry.commit_ballot.max(st.commit_ballot);
+                    }
+                    // Preserve the snapshotted execution order, appending any txns
+                    // not already recorded (the snapshot is the prefix; the tail
+                    // adds later applies).
+                    for stxn in snap_order {
+                        if !state.applied_order.contains(&stxn) {
+                            state.applied_order.push(stxn);
+                        }
                     }
                 }
             }

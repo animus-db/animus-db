@@ -62,8 +62,16 @@ conflict set** (`submit_rw`). No leader.
   lower-ballot `Commit`** (a healed original coordinator's late `Ballot::ZERO`
   commit can't revert a recovered decision). Execution/Apply is *local* — no wire
   message.
-- `persist.rs` — `WalRecord` (PreAccepted/Accepted/Committed/Applied/`Promised`)
-  and `PersistedState` (replay/decode/encode), mirroring `animus-control::persist`.
+- `persist.rs` — `WalRecord` (PreAccepted/Accepted/Committed/Applied/`Promised`/
+  **`Snapshot`**) and `PersistedState` (replay/decode/encode), mirroring
+  `animus-control::persist`. `Snapshot { txns: Vec<(TxnId, PersistedTxn)>,
+  applied_order }` is the **compact log-truncation image** (ADR 0011): the driver
+  atomically `replace`s the WAL with one `Snapshot` collapsing every txn's
+  per-phase history into one entry, then a live tail. Replay folds the `Snapshot`
+  first (it is the base every later record builds on); a WAL with no `Snapshot`
+  replays exactly as before (additive). The txns ride as a `Vec` of entries, not a
+  `BTreeMap`, because **a JSON object cannot key on a `Timestamp` struct** — a real
+  gotcha (serde_json silently fails to serialize a struct-keyed map at runtime).
   `Accepted` now carries the `accepted_ballot`, `Committed` the `commit_ballot`
   (durable on `PersistedTxn.commit_ballot`; replay fences a stale lower-ballot
   `Committed`), and `Promised { txn, ballot }` records a durable recovery-ballot
@@ -144,18 +152,38 @@ conflict set** (`submit_rw`). No leader.
   escalate once every replica has answered and the fast path didn't fire (the
   all-agree-on-`t0`-but-deps-differ case), or it stalls forever. That bug bit
   during development; the multi-seed test guards it.
-- The **fast quorum is a placeholder `ceil(3N/4)`**, not Accord's exact bound.
-  See ADR 0011.
+- The **fast quorum is the precise simplified-recovery bound** `fast_quorum() =
+  max(N-1, slow_quorum)` (`N-1` for `N=2f+1`; the whole cluster when `f=0`), not
+  the old `ceil(3N/4)` placeholder. It is sized so any recovery (majority) quorum
+  intersects every fast quorum in ≥1 replica (so a fast decision is recoverable by
+  our slow-path recovery) and two fast quorums always intersect. The smaller
+  *optimized* bound `f+⌊(f+1)/2⌋` would need Accord's full PreAcceptOk-witness
+  recovery (still deferred), so don't drop to it without that. **Gotcha the tighter
+  bound exposed:** two *conflicting* txns can now fast-commit at the **same
+  `logical` timestamp** (ordered by the `node` tiebreak); the driver therefore
+  stamps storage/data-plane writes with `mvcc_version(ts) = (logical<<16)|node`
+  (not `logical` alone), so per-key LWW keeps the agreed `(execute_at, txn)` winner
+  — reads use the same encoding. See ADR 0011.
 - Conflict = intersecting key sets. `Key` is a bare `u64` for now (the real
   system keys by partition/range).
-- **Execution gating is the subtle part** (`conflicts_clear_for` /
-  `next_applicable`): a committed txn executes only once every *conflicting* txn
-  that could order before it has applied. "Could order before" is judged against
-  **every conflicting txn known in any phase**, not just the recorded deps and
-  not only committed ones — a not-yet-committed conflict blocks because its final
-  timestamp might land lower. Gating only on the deps set (or only on committed
-  txns) lets two concurrent same-timestamp-but-different-node txns execute in
-  arrival order and diverge across replicas; the seed sweep guards this.
+- **Execution gating is the subtle part** (`next_applicable`), now **two** gates
+  that are both required:
+  - `conflicts_clear_for` — the **direct key-conflict** gate: a committed txn
+    executes only once every *conflicting* txn that could order before it has
+    applied. "Could order before" is judged against **every conflicting txn known
+    in any phase**, not just the recorded deps and not only committed ones — a
+    not-yet-committed conflict blocks because its final timestamp might land lower.
+    Gating only on committed txns lets two concurrent same-timestamp-different-node
+    txns execute in arrival order and diverge; the seed sweep guards this.
+  - `deps_clear_for` — the **transitive dependency-closure** gate (ADR 0011): the
+    transitive closure of the txn's recorded `deps` that orders before it must be
+    committed *and* applied. This catches deps the direct gate is blind to — one
+    known only as an *id* (no local key), or a *transitive* (conflict-of-a-conflict)
+    dep on a disjoint key set. It is **cycle-aware**: a dep ordering *after* the txn
+    is skipped (not blocked, not recursed), so the total `(execute_at, txn)` order
+    breaks every cycle and the walk is finite; an *unknown* dep blocks (its position
+    is unknown), and recovery/retry guarantees it arrives. Removing this gate fails
+    the `core::tests` transitive-wait tests.
 - **Execution effect goes to a real `StorageEngine`, not an in-core map.** The
   core emits an `ApplyEffect { txn, keys, values, version }` when a txn becomes
   applicable; the driver `merge`s each key's value at `version =
@@ -357,16 +385,15 @@ conflict set** (`submit_rw`). No leader.
 
 ## Deferred (see ADR 0011)
 
-The full transitive dependency wait-graph (the execution wait is conflict +
-timestamp based), a **richer (heartbeat/liveness-oracle) failure detector** (the
+A **richer (heartbeat/liveness-oracle) failure detector** (the
 driver now *does* auto-trigger recovery via a per-txn stall timer — see below —
 but a real detector would not need a bound large enough to absorb a
-partition-and-heal window, nor assume the whole replica set is alive), WAL
-snapshotting/log truncation (the WAL is the full per-txn history — contrast
-`RaftCore`), the precise fast-path quorum bound, the precise `PreAcceptOk`-witness
-*fast-path*-recovery decision (we always force the slow path on re-proposal, and
-the duel converges by an id tiebreak rather than Accord's full randomized-backoff
-rules), and the **unified global cross-shard timestamp + 2PC atomic commit** (per-
+partition-and-heal window, nor assume the whole replica set is alive), the
+**optimized** fast-path quorum `f+⌊(f+1)/2⌋` and the precise `PreAcceptOk`-witness
+*fast-path*-recovery decision it needs (we now use the precise *simplified* bound
+`N-1` and always force the slow path on re-proposal; the duel converges by an id
+tiebreak rather than Accord's full randomized-backoff rules), and the **unified
+global cross-shard timestamp + 2PC atomic commit** (per-
 shard consensus now exists — see below — but a cross-shard txn is *independent
 per-shard agreement*, not one global Accord round: each shard agrees its slice and
 the cross-shard atomicity is the all-slices-applied read point, not a unified
@@ -390,9 +417,16 @@ transactions** (`start_with_router` — each key's effect routed to its own tabl
 quorum), **folding the interactive/RMW read set into dependency tracking**
 (`submit_rw` — conflict set = reads ∪ writes), **arbitrary caller-supplied write
 values** (`submit_writes`/`submit_writes_rw`/`InteractiveTxn::write_value` — the
-execution effect is the supplied bytes, defaulting to the txn id when absent), and
+execution effect is the supplied bytes, defaulting to the txn id when absent),
 **wiring the Elle cycle checker** (`animus-test`, ADR 0014 — now genuine
-black-box). The sync-core boundary is where each remaining piece slots in.
+black-box), the **transitive dependency wait-graph** (`deps_clear_for` —
+cycle-aware closure over recorded deps, `core::tests` + via the corpus), the
+**precise fast-path quorum bound** (`fast_quorum() = N-1`, recoverable by our
+slow-path recovery; `tests/accord_fast_path.rs` + `core::tests`), and **WAL
+snapshotting / log truncation** (`AccordCore::snapshot`/`wal_image` +
+`WalRecord::Snapshot`; the driver's `maybe_compact` atomically `replace`s the WAL
+past a threshold; `tests/accord_snapshot.rs` + `core::tests`). The sync-core
+boundary is where each remaining piece slots in.
 
 ## Tests
 
@@ -499,6 +533,16 @@ black-box). The sync-core boundary is where each remaining piece slots in.
   fixed-interval count); the transaction still converges promptly after a heal; it
   still commits everywhere under lossy-but-unpartitioned operation across a seed
   sweep; plus trace reproducibility.
+- `tests/accord_fast_path.rs` (**precise fast-path quorum bound**, 5-node cluster):
+  an uncontended txn commits on the fast path on every replica; a fast-path commit
+  is **recoverable after the coordinator dies** — a recovery quorum that excludes
+  it reconstructs the identical decision (this is the recoverability the `N-1`
+  bound guarantees); consistent across a seed sweep; trace reproducibility.
+- `tests/accord_snapshot.rs` (**WAL snapshotting / log truncation**): driving past
+  the compaction threshold rewrites the WAL to a `Snapshot`-led image whose record
+  count is far below the applied count (fails if compaction is disabled); a node
+  restarted on the truncated WAL recovers identical executed state + store; trace
+  reproducibility.
 - `tests/accord_concurrent.rs` (**real multi-threaded**, *not* `SimEnv`):
   `#[tokio::test(flavor = "multi_thread", worker_threads = 4)]` over `ProdEnv`,
   timeout-guarded — several replicas + concurrent coordinators committing
@@ -506,6 +550,11 @@ black-box). The sync-core boundary is where each remaining piece slots in.
   (consistent order + converged store) must hold under genuine parallelism. This
   is the liveness regression `SimEnv` cannot give; mirrors
   `animus-storage/tests/lsm_concurrent.rs`.
+- `src/core.rs` `#[cfg(test)] mod tests` (**white-box core gates**): the transitive
+  wait-graph (a disjoint/id-only dep and a `d→m→t` chain block until the
+  predecessor applies; a cycle drains in timestamp order), the precise fast-path
+  quorum value + recoverability intersection arithmetic over many `N`, and the
+  snapshot round-trip (`wal_image` replays to an identical core).
 
 Use `run_for`/`run_until` for the `SimEnv` tests — the driver now has a
 **perpetual retry timer**, so `run()` would never return; the multi-thread test
