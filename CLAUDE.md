@@ -260,9 +260,16 @@ its execution order into a fresh engine) — mirroring `RaftCore`'s WAL. A **dea
 coordinator's transaction is recoverable**: another replica runs a
 `Recover`/`RecoverOk` round and drives the transaction to a commit consistent
 with whatever the original could have committed (adopt-committed, else force the
-slow path). **Deferred:** the full dependency wait-graph, the precise recovery
-ballot + duelling recoverers + a failure detector, WAL snapshotting, live
-data-plane integration, and sharding — see ADR 0011 and the crate guide.
+slow path). It also serves **read-only transactions** (`submit_read`): a read is
+ordered exactly like a write (timestamp + conflict deps) and, at its execution
+timestamp, snapshot-reads each key (`get_at`) — observing the writes ordered
+before it and none after, consistently on every replica — but writes nothing.
+The driver's real-thread liveness (no mutex guard held across `.await`) is
+guarded by a multi-threaded `ProdEnv` regression test, since `SimEnv` proves
+order but not thread liveness. **Deferred:** the full dependency wait-graph, the
+precise recovery ballot + duelling recoverers + a failure detector, WAL
+snapshotting, live data-plane integration, message retry/timeouts, and
+sharding — see ADR 0011 and the crate guide.
 
 ### Storage (`custos-storage`)
 

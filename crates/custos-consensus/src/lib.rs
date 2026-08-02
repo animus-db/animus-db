@@ -73,7 +73,7 @@ mod node;
 mod persist;
 mod timestamp;
 
-pub use crate::core::{AccordCore, ApplyEffect, Decision, Key, Phase, TxnId};
+pub use crate::core::{AccordCore, ApplyEffect, Decision, Key, Phase, ReadEffect, TxnId};
 pub use crate::message::{AccordMsg, Out};
 pub use crate::node::AccordNode;
 pub use crate::persist::{PersistedState, PersistedTxn, WalRecord};

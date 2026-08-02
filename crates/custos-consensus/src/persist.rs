@@ -32,6 +32,10 @@ pub enum WalRecord {
         keys: BTreeSet<Key>,
         execute_at: Timestamp,
         deps: BTreeSet<TxnId>,
+        /// Whether the transaction is read-only (recovers the execution effect
+        /// kind: a read snapshot vs. a write).
+        #[serde(default)]
+        read_only: bool,
     },
     /// A coordinator-chosen execution timestamp and dependency set were adopted
     /// via `Accept`.
@@ -48,6 +52,9 @@ pub enum WalRecord {
         keys: BTreeSet<Key>,
         execute_at: Timestamp,
         deps: BTreeSet<TxnId>,
+        /// Whether the transaction is read-only.
+        #[serde(default)]
+        read_only: bool,
     },
     /// The transaction's effect was applied to the store (executed). Recorded so
     /// a recovered replica does not re-apply an already-applied effect and
@@ -81,6 +88,8 @@ pub struct PersistedTxn {
     pub phase: Phase,
     /// Whether the transaction's effect was applied (executed) durably.
     pub applied: bool,
+    /// Whether the transaction is read-only (a read snapshot, no write effect).
+    pub read_only: bool,
 }
 
 /// Durable Accord replica state reconstructed by replaying the write-ahead log.
@@ -109,6 +118,7 @@ impl PersistedState {
                     keys,
                     execute_at,
                     deps,
+                    read_only,
                     ..
                 } => {
                     let entry = state.txns.entry(txn).or_default();
@@ -116,6 +126,7 @@ impl PersistedState {
                     entry.execute_at = entry.execute_at.max(execute_at);
                     entry.deps.extend(deps);
                     entry.phase = entry.phase.max_phase(Phase::PreAccepted);
+                    entry.read_only |= read_only;
                 }
                 WalRecord::Accepted {
                     execute_at, deps, ..
@@ -129,6 +140,7 @@ impl PersistedState {
                     keys,
                     execute_at,
                     deps,
+                    read_only,
                     ..
                 } => {
                     let entry = state.txns.entry(txn).or_default();
@@ -136,6 +148,7 @@ impl PersistedState {
                     entry.execute_at = execute_at;
                     entry.deps = deps;
                     entry.phase = Phase::Committed;
+                    entry.read_only |= read_only;
                 }
                 WalRecord::Applied { .. } => {
                     let entry = state.txns.entry(txn).or_default();

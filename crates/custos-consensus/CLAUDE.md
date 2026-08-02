@@ -20,17 +20,18 @@ strict serialization order.
   the per-node `LogicalClock` (`witness` to advance past a peer; `mint` for a
   strictly-greater fresh stamp).
 - `core.rs` — `AccordCore`: a **synchronous, I/O-free** state machine mirroring
-  `custos-control`'s `RaftCore`. `submit(keys)` starts a transaction this node
-  coordinates; `recover(txn)` takes over a stranded transaction as a *recovery
-  coordinator*; `handle(from, msg)` processes an inbound message. All return
-  `Vec<Out>` and never touch `Env`. Holds the replica view (`txns`), the
-  coordinator view (`coordinating`), the recovery-coordinator view
-  (`recovering`), reached `decisions`, `applied_order`, a `pending` buffer of
-  `WalRecord`s, and a `pending_apply` buffer of `ApplyEffect`s (the execution
-  work the driver applies to storage — the core decides *order*, the driver does
-  the *I/O*). `drain_persist`/`drain_apply` hand these to the driver; `recovered`
-  rebuilds the core from a `PersistedState` and re-emits the apply effects for
-  its recovered execution order.
+  `custos-control`'s `RaftCore`. `submit(keys)` starts a **write** transaction
+  this node coordinates; `submit_read(keys)` starts a **read-only** transaction;
+  `recover(txn)` takes over a stranded transaction as a *recovery coordinator*;
+  `handle(from, msg)` processes an inbound message. All return `Vec<Out>` and
+  never touch `Env`. Holds the replica view (`txns`), the coordinator view
+  (`coordinating`), the recovery-coordinator view (`recovering`), reached
+  `decisions`, `applied_order`, a `pending` buffer of `WalRecord`s, a
+  `pending_apply` buffer of `ApplyEffect`s (write execution work), and a
+  `pending_read` buffer of `ReadEffect`s (read execution work) — the core decides
+  *order*, the driver does the *I/O*. `drain_persist`/`drain_apply`/`drain_reads`
+  hand these to the driver; `recovered` rebuilds the core from a `PersistedState`
+  and re-emits the apply/read effects for its recovered execution order.
 - `message.rs` — `AccordMsg` (PreAccept/PreAcceptOk/Accept/AcceptOk/Commit, plus
   `Recover`/`RecoverOk` for failover), (de)serialized with `serde_json` over the
   `Network`'s `Vec<u8>` payloads. Execution/Apply is *local* — no wire message.
@@ -39,11 +40,14 @@ strict serialization order.
 - `node.rs` — `AccordNode<E, S = MemoryEngine>`: the thin `Env` driver, generic
   over the `StorageEngine` backing execution (defaults to the in-memory
   `MemoryEngine`; `start_with_storage` injects another). `persist_then_ship`
-  drains the core's `WalRecord`s + `ApplyEffect`s, appends + `fsync`s the records
-  to `accord.wal`, **then** `merge`s the execution effects into the engine, then
-  ships outbound (durable before action). `drive` recovers from the WAL on
+  drains the core's `WalRecord`s + `ApplyEffect`s + `ReadEffect`s, appends +
+  `fsync`s the records to `accord.wal`, **then** `merge`s the write effects into
+  the engine (`apply_all`) and `get_at`s the read effects (`satisfy_reads`),
+  then ships outbound (durable before action). `drive` recovers from the WAL on
   startup and replays the recovered execution order into the (fresh) engine. A
-  plain `recv` loop — still no perpetual timers. `store_writer(key)` is `async`
+  plain `recv` loop — still no perpetual timers. `submit_read(keys)` runs a
+  read-only transaction; `read_result(txn)` returns the per-key writer it
+  observed (populated once `is_applied(txn)`). `store_writer(key)` is `async`
   (it reads the engine).
 
 ## What's non-obvious
@@ -83,6 +87,31 @@ strict serialization order.
   them), and `merge`'s per-key LWW is idempotent + commutative, so the
   recovery/duplicate re-apply converges. The value stored is the writer's
   `TxnId` (encoded as two big-endian u64s); `store_writer` decodes it back.
+- **Read-only transactions are ordered like writes; only the effect differs.**
+  `submit_read` mints a `t0`, intersects conflicting keys, and runs the same
+  PreAccept/(Accept)/Commit machinery (the `read_only` flag rides on
+  `PreAccept`/`Commit`/`RecoverOk` and the `PreAccepted`/`Committed` WAL
+  records). At apply time the core emits a **`ReadEffect`** (not an
+  `ApplyEffect`) and the driver does `StorageEngine::get_at(key, execute_at)` —
+  so the read sees the writes ordered before it (lower MVCC version) and none
+  after, identically on every replica. **It writes nothing.** Reads execute in
+  the *same* gated `(execute_at, txn)` order as writes (`apply` branches on
+  `read_only`), so a read waits for the earlier-ordered conflicting writes to
+  apply before it reads — that is what makes the snapshot consistent. Driver
+  ordering matters: in a single drain the writes (`apply_all`) are applied
+  **before** the reads (`satisfy_reads`); across drains the read effect is only
+  emitted after its earlier-ordered conflicts are `Applied`, so their write
+  effects were drained no later. Don't reorder those two in the driver task.
+- **The multi-thread liveness lesson is now wired here too**
+  (`tests/accord_concurrent.rs`, `#[tokio::test(multi_thread)]` over `ProdEnv`,
+  timeout-guarded). `SimEnv` proves order/logic, **not** real-thread liveness.
+  `AccordNode` is audited clean for the deadlock class — the core lock is taken
+  only to drain, then dropped; all I/O happens lock-free in a spawned task, so
+  **no `std::sync::Mutex` guard is ever held across an `.await`**. Keep it that
+  way: drain under the lock, drop it, then `await`. This slice has **no message
+  retry** (`Network::send` is fire-and-forget), so don't pile unbounded in-flight
+  work on the transport in a liveness test — that flakes on transport drops, not
+  on the bug class the test targets.
 - **Recovery sets phase to `Applied` when `PersistedTxn.applied`** even though
   the phase-bearing records stop at `Committed` — the separate `Applied` WAL
   record carries the executed bit. On recovery the core **re-emits the apply
@@ -115,11 +144,14 @@ timestamp based), the precise Accord recovery ballot rules + duelling recovery
 coordinators + a failure detector to trigger recovery (today `recover` is called
 explicitly), WAL snapshotting/log truncation (the WAL is the full per-txn
 history — contrast `RaftCore`), integration with the **live** data-plane
-replicas (`custos-data`) and read transactions (execution is a per-node
-consensus store, not yet the shared data plane), timeouts/retries/livelock
-handling, sharding/placement (one global replica set), and wiring the Elle cycle
-checker (`custos-test`) — now natural since a real execution history exists. The
-sync-core boundary is where each slots in.
+replicas (`custos-data`) — execution (reads included) is a per-node consensus
+store, not yet the shared data plane — message **retry/timeouts** (a stalled
+transaction is not retried; `Network::send` is fire-and-forget), an interactive
+read/write transaction API, livelock handling, sharding/placement (one global
+replica set), and wiring the Elle cycle checker (`custos-test`) — now natural
+since a real execution history exists. **Read-only transactions** are now
+implemented (`submit_read`); see the read-transaction note above. The sync-core
+boundary is where each remaining piece slots in.
 
 ## Tests
 
@@ -145,6 +177,19 @@ sync-core boundary is where each slots in.
   one peer so it never reaches a fast quorum while a *different* peer still
   witnessed the `PreAccept` (and its keys) — then recovery runs from the peer
   that can still reach the key-bearing replica.
+- `tests/accord_read.rs` (read transactions): a read observes the write ordered
+  before it and not the one ordered after; a read of an unwritten key observes
+  nothing; the read snapshot is identical on every replica across a 48-seed
+  sweep; a read's observation recovers from disk through a stop/restart; and the
+  read path is trace-reproducible.
+- `tests/accord_concurrent.rs` (**real multi-threaded**, *not* `SimEnv`):
+  `#[tokio::test(flavor = "multi_thread", worker_threads = 4)]` over `ProdEnv`,
+  timeout-guarded — several replicas + concurrent coordinators committing
+  conflicting transactions must not deadlock/strand, and the safety property
+  (consistent order + converged store) must hold under genuine parallelism. This
+  is the liveness regression `SimEnv` cannot give; mirrors
+  `custos-storage/tests/lsm_concurrent.rs`.
 
-Use `run_for` (the driver has no perpetual timers today, but follow the house
-convention).
+Use `run_for` for the `SimEnv` tests (the driver has no perpetual timers today,
+but follow the house convention); the multi-thread test polls real time with a
+timeout.
