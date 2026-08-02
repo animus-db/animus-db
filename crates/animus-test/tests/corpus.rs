@@ -23,7 +23,10 @@ mod support;
 
 use std::collections::BTreeSet;
 
-use support::{NemesisAction, corpus, run_scenario};
+use support::{
+    NemesisAction, Topology, corpus, corpus_base, corpus_extended, run_scenario, run_scenario_with,
+    seed_expand,
+};
 
 /// Run a single scenario and assert all three checkers pass, with the scenario
 /// name + seed in every message for attributable, replayable failures.
@@ -49,6 +52,10 @@ fn assert_scenario_consistent(scenario: &support::Scenario) {
 }
 
 /// The whole corpus passes every checker. This is the headline suite.
+///
+/// Size scales with the env knobs (`ANIMUS_CORPUS_SEEDS` / `ANIMUS_CORPUS_FULL`);
+/// at their defaults this is the frozen base set. The structural guards below
+/// deliberately run against [`corpus_base`] so they stay fast and env-independent.
 #[test]
 fn corpus_is_consistent() {
     let scenarios = corpus();
@@ -62,12 +69,40 @@ fn corpus_is_consistent() {
     }
 }
 
+/// The **frontier corpus**: the same scenarios run against the AP data-plane
+/// frontier ([`Topology::Frontier`]), checked for what that layer *offers* —
+/// **convergence** (two final reads agree) and **durability** (every acked write
+/// is in the final state). It deliberately does **not** assert `cycles`: a read
+/// through the eventually-consistent quorum can transiently observe a torn/stale
+/// multi-key write under a data-replica fault (it converges via anti-entropy), so
+/// serializability is unsound to assert here — that is the authoritative topology's
+/// job ([`corpus_is_consistent`]). This pairs with the repo principle: point the
+/// serializability checker at Accord, check the AP plane for convergence/RYW.
+#[test]
+fn frontier_corpus_converges_and_is_durable() {
+    for scenario in &corpus_base() {
+        let r = run_scenario_with(scenario, Topology::Frontier);
+        let name = &scenario.name;
+        let seed = scenario.seed;
+        assert!(
+            r.convergence.ok,
+            "[frontier {name}] final replica states diverged (seed={seed}): {:?}",
+            r.convergence.violations
+        );
+        assert!(
+            r.durability.ok,
+            "[frontier {name}] acknowledged write lost from final state (seed={seed}): {:?}",
+            r.durability.violations
+        );
+    }
+}
+
 /// Coverage guard: the corpus must actually exercise every fault type and both
 /// cluster shapes — otherwise a dimension silently stopped being tested. This
 /// keeps the matrix honest as the generator evolves.
 #[test]
 fn corpus_covers_the_fault_matrix() {
-    let scenarios = corpus();
+    let scenarios = corpus_base();
 
     // Every single-fault nemesis action appears somewhere.
     let mut seen_faults: BTreeSet<NemesisAction> = BTreeSet::new();
@@ -135,7 +170,7 @@ fn corpus_covers_the_fault_matrix() {
 /// the tight-contention scenarios, which should always contend.
 #[test]
 fn corpus_has_real_contention() {
-    let scenarios = corpus();
+    let scenarios = corpus_base();
     let mut contended = 0usize;
     let mut sampled = 0usize;
     for s in &scenarios {
@@ -166,7 +201,7 @@ fn corpus_has_real_contention() {
 #[test]
 fn corpus_scenarios_are_deterministic() {
     // Pick a faulted scenario (more moving parts → a stronger determinism test).
-    let scenarios = corpus();
+    let scenarios = corpus_base();
     let scenario = scenarios
         .iter()
         .find(|s| s.name.contains("crash") && s.name.contains("mid"))
@@ -177,5 +212,88 @@ fn corpus_scenarios_are_deterministic() {
         a.history.entries, b.history.entries,
         "[{}] scenario not deterministic from seed {}",
         scenario.name, scenario.seed
+    );
+}
+
+/// Seed-depth lever (`ANIMUS_CORPUS_SEEDS`): expanding the base set by `k` yields
+/// exactly `k×` scenarios, every name and seed stays unique, and **variant 0
+/// preserves the canonical (frozen) name+seed** — so growing depth never moves an
+/// existing regression seed. This is a pure structural check (no scenario runs).
+#[test]
+fn seed_expansion_is_additive_and_unique() {
+    let base = corpus_base();
+    let k = 3;
+    let expanded = seed_expand(base.clone(), k);
+
+    assert_eq!(
+        expanded.len(),
+        base.len() * k,
+        "seed-expansion must yield exactly k× scenarios"
+    );
+
+    let names: BTreeSet<&str> = expanded.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names.len(), expanded.len(), "expanded names must be unique");
+    let seeds: BTreeSet<u64> = expanded.iter().map(|s| s.seed).collect();
+    assert_eq!(seeds.len(), expanded.len(), "expanded seeds must be unique");
+
+    // Every base scenario survives byte-identical (canonical name + seed) — the
+    // frozen-regression guarantee under growth.
+    for b in &base {
+        let kept = expanded
+            .iter()
+            .find(|s| s.name == b.name)
+            .unwrap_or_else(|| panic!("base scenario {} missing after expansion", b.name));
+        assert_eq!(
+            kept.seed, b.seed,
+            "base scenario {} seed must be preserved by expansion",
+            b.name
+        );
+    }
+
+    // k == 1 is the identity (the always-on default is byte-identical to base).
+    assert_eq!(seed_expand(base.clone(), 1).len(), base.len());
+}
+
+/// Breadth lever (`ANIMUS_CORPUS_FULL`): the extended tier adds genuinely new
+/// dimension values — the `SlowLinks` fault, a 7-replica shape, and an asymmetric
+/// shape — without colliding with or perturbing any base name/seed. Structural
+/// only (no scenario runs).
+#[test]
+fn extended_tier_adds_new_dimensions() {
+    let base = corpus_base();
+    let ext = corpus_extended();
+    assert!(!ext.is_empty(), "extended tier must produce scenarios");
+
+    // Names are all `ext_`-prefixed and disjoint from the base set, so merging the
+    // tiers can never perturb a frozen base name/seed.
+    let base_names: BTreeSet<&str> = base.iter().map(|s| s.name.as_str()).collect();
+    for s in &ext {
+        assert!(
+            s.name.starts_with("ext_"),
+            "extended scenario {} must be ext_-prefixed",
+            s.name
+        );
+        assert!(
+            !base_names.contains(s.name.as_str()),
+            "extended scenario {} collides with a base name",
+            s.name
+        );
+    }
+
+    // New fault dimension: SlowLinks appears (it never does in the base set).
+    let has_slow = ext
+        .iter()
+        .any(|s| s.faults.iter().any(|(_, f)| *f == NemesisAction::SlowLinks));
+    assert!(has_slow, "extended tier must exercise SlowLinks");
+
+    // New cluster dimensions: a 7-replica shape and an asymmetric shape.
+    assert!(
+        ext.iter().any(|s| s.cluster.accord_replicas == 7),
+        "extended tier must exercise a 7-replica shape"
+    );
+    assert!(
+        ext.iter()
+            .any(|s| s.cluster.accord_replicas != s.cluster.data_replicas),
+        "extended tier must exercise an asymmetric shape"
     );
 }

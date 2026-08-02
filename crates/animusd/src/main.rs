@@ -132,7 +132,7 @@ async fn run_single(
     );
     println!("animusd: ready — Ctrl-C to stop");
     wait_for_ctrl_c().await;
-    node.shutdown();
+    node.shutdown_graceful().await;
     Ok(())
 }
 
@@ -167,7 +167,7 @@ async fn run_in_process_cluster(
     println!("animusd: ready — Ctrl-C to stop");
     wait_for_ctrl_c().await;
     for node in &nodes {
-        node.shutdown();
+        node.shutdown_graceful().await;
     }
     Ok(())
 }

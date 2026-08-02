@@ -64,9 +64,43 @@ so it doesn't actually exercise `check_cycles`. The Accord-targeted suite does:
   sweep + a determinism check, with teeth-guards asserting the run genuinely
   contended.
 - `corpus.rs` — the parametric runner over the **frozen, named, seeded** corpus
-  (~119 scenarios: fault type × timing × workload shape × cluster shape, plus
+  (119 base scenarios: fault type × timing × workload shape × cluster shape, plus
   baselines and compound lossy/overlapping scenarios), a coverage guard, a
-  non-vacuity guard, and a determinism check.
+  non-vacuity guard, a determinism check, the seed-expansion / extended-tier
+  structural guards, and the **frontier corpus**
+  (`frontier_corpus_converges_and_is_durable`). Coverage scales by two env knobs
+  (depth/breadth — see below); the headline `corpus_is_consistent` runs the
+  env-scaled `corpus()`, the structural guards run the env-independent
+  `corpus_base()`.
+
+### Scaling coverage: the two env knobs + the topology split (ADR 0014)
+
+- **Depth — `ANIMUS_CORPUS_SEEDS=K` (default 1).** `support::seed_expand` emits
+  `K` seed variants of every structural cell. Variant 0 keeps the cell's
+  **canonical (frozen) name+seed**; variants `1..K` get a `_sNN` suffix + a fresh
+  name-derived seed. `K=1` is the identity, so the always-on default is
+  byte-identical to the committed corpus — a frozen regression seed never moves.
+  This is the dominant bug-finding lever: one structural cell × many interleavings.
+- **Breadth — `ANIMUS_CORPUS_FULL=1` (default off).** `support::corpus_extended`
+  adds new dimension *values* (`SlowLinks` fault; 7-node + asymmetric 3+5/5+3
+  shapes; very-early/wind-down timings; write-only/big-txn/low-contention
+  workloads; triple-fault + partition→heal→repartition schedules). All
+  `ext_`-prefixed, so they never collide with or perturb a base name/seed.
+- **Tiering.** Default `cargo test` → `K=1`, no FULL → the frozen 119. Deep tier
+  (`ANIMUS_CORPUS_SEEDS=40 ANIMUS_CORPUS_FULL=1`) runs **nightly** in CI
+  (`.github/workflows/corpus-deep.yml`), not per-push.
+- **`Topology` is load-bearing — `check_cycles` is only sound against
+  `Authoritative`.** The corpus runs **pure Accord** (`AccordNode::start`): local
+  execution + versioned-snapshot reads (`get_at(execute_at)`), the
+  serialization-authoritative layer, robust to faults. The **`Frontier`** topology
+  (`start_with_data_plane`) is the AP data-plane wiring; its quorum read is only
+  *eventually* consistent, so under a data-replica fault a read can observe a torn
+  multi-key write (an acked write that isn't yet quorum-durable). It is checked for
+  **convergence + durability only** (`frontier_corpus_converges_and_is_durable`),
+  **never** serializability. Do not point `check_cycles` at the frontier — that
+  was the latent unsoundness depth exposed (faulted `wide_write` cells flagged
+  cycle-only false positives; convergence/durability always passed). See the root
+  CLAUDE.md engineering-practices note.
 
 - **Genuine black-box list-append over Accord (ADR 0014, closed limitation).**
   With **arbitrary write values** (ADR 0011) each key stores a *real list value*:

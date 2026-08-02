@@ -64,15 +64,16 @@ use animus_test::{History, Recorder, check_convergence, check_cycles, check_dura
 
 // --- Topology. One inbox per node id (single-consumer), so every role gets a
 // distinct id. Accord replicas, each Accord node's own data-plane coordinator,
-// the data-plane replicas, and a standalone verifier. We size for up to 5 Accord
-// replicas + 5 data replicas; smaller clusters use a prefix. ---
+// the data-plane replicas, and a standalone verifier. We size for up to 7 Accord
+// replicas + 7 data replicas; smaller clusters use a prefix. The id *bands*
+// (0.., 10.., 20..) stay disjoint up to 7 each so a 7+7 shape never collides. ---
 
 /// Accord consensus replica node ids.
-const ACCORD_IDS: [u64; 5] = [0, 1, 2, 3, 4];
+const ACCORD_IDS: [u64; 7] = [0, 1, 2, 3, 4, 5, 6];
 /// Per-Accord-node data-plane coordinator ids (distinct inbox per coordinator).
-const COORD_IDS: [u64; 5] = [10, 11, 12, 13, 14];
+const COORD_IDS: [u64; 7] = [10, 11, 12, 13, 14, 15, 16];
 /// Data-plane replica node ids.
-const DATA_IDS: [u64; 5] = [20, 21, 22, 23, 24];
+const DATA_IDS: [u64; 7] = [20, 21, 22, 23, 24, 25, 26];
 /// Standalone verifier coordinator for final quorum snapshots.
 const VERIFIER: u64 = 30;
 
@@ -111,6 +112,21 @@ impl ClusterShape {
     pub const LARGE: ClusterShape = ClusterShape {
         accord_replicas: 5,
         data_replicas: 5,
+    };
+    /// A 7+7 cluster (extended tier): the largest quorums and partition surface.
+    pub const HUGE: ClusterShape = ClusterShape {
+        accord_replicas: 7,
+        data_replicas: 7,
+    };
+    /// Asymmetric: a small consensus group over a wider data fan-out.
+    pub const ACCORD_LIGHT: ClusterShape = ClusterShape {
+        accord_replicas: 3,
+        data_replicas: 5,
+    };
+    /// Asymmetric: a wider consensus group over a small data fan-out.
+    pub const DATA_LIGHT: ClusterShape = ClusterShape {
+        accord_replicas: 5,
+        data_replicas: 3,
     };
 }
 
@@ -171,6 +187,37 @@ pub enum NemesisAction {
     HealAll,
     /// Inject lossy links (independent per-message drop) for the rest of the run.
     Lossy,
+    /// Inject high-latency links (large base delay + jitter, no drops) for the
+    /// rest of the run. Models a degraded-but-connected network: a coordinator is
+    /// *slow*, not dead. This is the adversary a timeout-based failure detector
+    /// must not mistake for a crash — recovering a live-but-slow coordinator
+    /// re-orders its transaction and can silently lose later same-key writes (the
+    /// failure-detector-bound hazard documented in the root CLAUDE.md). Healed by
+    /// `HealAll` (which restores the default `NetConfig`).
+    SlowLinks,
+}
+
+/// Which layer the cluster's reads observe — i.e. *what the checkers can soundly
+/// assert*. This is the load-bearing distinction the repo principle demands:
+/// serializability is a property of **Accord's order**, not of the AP data plane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Topology {
+    /// **Pure Accord** (no data-plane sink): each replica executes the agreed
+    /// order into its **local** store and a read is a versioned snapshot
+    /// (`get_at(key, execute_at)`) — exactly the writes ordered before it, none
+    /// after, identically on every replica. This is the serialization-authoritative
+    /// layer and the **only sound target for the cycle (serializability) check**.
+    /// Robust to faults: a fault delays/strands consensus but never makes a read
+    /// observe a torn or stale order.
+    Authoritative,
+    /// **Accord wired to the replicated AP data-plane frontier**
+    /// (`start_with_data_plane`): a committed write is pushed through the quorum
+    /// (fire-and-forget) and a read is a *current quorum read*. Eventually
+    /// consistent: under a data-replica fault an acked multi-key write can be
+    /// transiently torn/stale at a read quorum (it converges via anti-entropy).
+    /// So this layer is checked for **convergence + durability** — what the AP
+    /// data plane offers — **never** serializability.
+    Frontier,
 }
 
 /// A declarative, seed-reproducible test scenario: a named cluster shape +
@@ -250,31 +297,112 @@ fn corpus_workloads() -> [(&'static str, WorkloadSpec); 3] {
     ]
 }
 
-/// Build the **frozen scenario corpus**: a deterministic, structured cross-product
-/// over { fault type × timing × workload shape × cluster shape }, plus a handful
-/// of no-fault and lossy/compound baselines. Each scenario is named (so a failure
-/// is attributable) and seeded by a stable hash of its coordinates (so the same
-/// scenario reproduces every run, and growing the corpus does not perturb
-/// existing seeds).
+/// A stable per-scenario seed from its name. FNV-1a over the bytes — deterministic
+/// (no `std::hash` nondeterminism), so a name maps 1:1 to a seed and the same
+/// scenario reproduces every run. Growing the corpus never perturbs an existing
+/// scenario's seed because the seed depends only on that scenario's own name.
+fn seed_for(name: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in name.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// Read a `usize` env knob, falling back to `default` when unset/empty/unparsable.
+/// Env access is the only nondeterminism here and it happens *before* any sim run,
+/// purely to size the corpus — each scenario itself is still a pure function of
+/// its seed.
+fn env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
+/// Whether the *extended* dimension tier is enabled (`ANIMUS_CORPUS_FULL` set to a
+/// non-empty, non-`0`/`false` value).
+fn corpus_full_enabled() -> bool {
+    match std::env::var("ANIMUS_CORPUS_FULL") {
+        Ok(v) => {
+            let v = v.trim();
+            !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
+        }
+        Err(_) => false,
+    }
+}
+
+/// Number of seeds per structural cell (`ANIMUS_CORPUS_SEEDS`, default 1). Each
+/// extra seed re-runs the same structural scenario down a *different* interleaving
+/// — the depth lever that surfaces schedule-dependent bugs a single frozen seed
+/// misses. Clamped to ≥ 1.
+fn corpus_seeds_per_cell() -> usize {
+    env_usize("ANIMUS_CORPUS_SEEDS", 1).max(1)
+}
+
+/// The **scenario corpus**, tiered by two env knobs so the default `cargo test`
+/// stays fast while a nightly/deep run can scale coverage by orders of magnitude:
+///
+/// - `ANIMUS_CORPUS_SEEDS=K` (default 1) — *depth*: emit `K` seed variants of every
+///   structural cell. Variant 0 keeps the cell's canonical (frozen) name+seed; the
+///   rest are `…_sNN` variants seeded by their own name.
+/// - `ANIMUS_CORPUS_FULL=1` (default off) — *breadth*: add the extended dimension
+///   set (7-node + asymmetric shapes, the `SlowLinks` fault, extra timings/workloads,
+///   richer multi-fault schedules), named `ext_…` so they never perturb base names.
+///
+/// With both at their defaults this returns exactly the frozen base set (every name
+/// and seed byte-identical to the committed corpus), so the always-on suite is
+/// unchanged. The structural guards in `corpus.rs` deliberately call
+/// [`corpus_base`] (env-independent) so they stay stable and fast regardless.
+pub fn corpus() -> Vec<Scenario> {
+    let mut cells = corpus_base();
+    if corpus_full_enabled() {
+        cells.extend(corpus_extended());
+    }
+    seed_expand(cells, corpus_seeds_per_cell())
+}
+
+/// Expand each structural cell into `k` seed variants. Variant 0 is the cell itself
+/// (canonical name + seed preserved, so a frozen regression seed never moves);
+/// variants `1..k` get a `_sNN` name suffix and a fresh name-derived seed. With
+/// `k == 1` this is the identity, so the default corpus is byte-identical to the
+/// base set.
+pub fn seed_expand(cells: Vec<Scenario>, k: usize) -> Vec<Scenario> {
+    if k <= 1 {
+        return cells;
+    }
+    let mut out = Vec::with_capacity(cells.len() * k);
+    for cell in cells {
+        for i in 0..k {
+            if i == 0 {
+                out.push(cell.clone());
+            } else {
+                let name = format!("{}_s{i:02}", cell.name);
+                out.push(Scenario {
+                    seed: seed_for(&name),
+                    cluster: cell.cluster,
+                    workload: cell.workload,
+                    faults: cell.faults.clone(),
+                    name,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Build the **frozen base scenario corpus**: a deterministic, structured
+/// cross-product over { fault type × timing × workload shape × cluster shape },
+/// plus no-fault and lossy/compound baselines. Each scenario is named (so a failure
+/// is attributable) and seeded by a stable hash of its name. This is the canonical,
+/// always-on set; [`corpus`] layers seed-depth and the extended tier on top.
 ///
 /// This is the explicit "regenerate" step: editing this function changes the
 /// corpus. A scenario that ever catches a bug stays here forever as a regression.
-pub fn corpus() -> Vec<Scenario> {
+pub fn corpus_base() -> Vec<Scenario> {
     let mut out = Vec::new();
     let mut idx: u64 = 0;
-
-    // A stable per-scenario seed from its coordinates and ordinal. Keeping the
-    // ordinal out of the *hash inputs* would be fragile; instead we fold a fixed
-    // salt with the coordinate string so names map 1:1 to seeds.
-    let seed_for = |name: &str| -> u64 {
-        // FNV-1a over the name — deterministic, no std Hasher nondeterminism.
-        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-        for b in name.as_bytes() {
-            h ^= u64::from(*b);
-            h = h.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-        h
-    };
 
     let shapes = [("c33", ClusterShape::SMALL), ("c55", ClusterShape::LARGE)];
 
@@ -361,16 +489,203 @@ pub fn corpus() -> Vec<Scenario> {
     out
 }
 
+/// Push a named scenario, deriving its seed from its name (so the name alone fixes
+/// the run). Used by the extended generator to keep each cell a one-liner.
+fn push_named(
+    out: &mut Vec<Scenario>,
+    name: String,
+    cluster: ClusterShape,
+    workload: WorkloadSpec,
+    faults: Vec<(Duration, NemesisAction)>,
+) {
+    out.push(Scenario {
+        seed: seed_for(&name),
+        cluster,
+        workload,
+        faults,
+        name,
+    });
+}
+
+/// Extended workload regimes the base set lacks (only used in the FULL tier).
+fn ext_workloads() -> [(&'static str, WorkloadSpec); 3] {
+    [
+        // Write-only: no reads → pure ww-ordering stress at maximum append load.
+        (
+            "write_only",
+            WorkloadSpec {
+                clients: 4,
+                rounds: 6,
+                keyspace: 4,
+                keys_per_txn: 2,
+                read_pct: 0,
+            },
+        ),
+        // Big transactions: wide write sets (more keys per txn) → more overlap and
+        // larger conflict graphs for the checker.
+        (
+            "big_txn",
+            WorkloadSpec {
+                clients: 4,
+                rounds: 5,
+                keyspace: 8,
+                keys_per_txn: 4,
+                read_pct: 30,
+            },
+        ),
+        // Low-contention control: a large key space → few conflicts. Should always
+        // pass; a failure here points at the harness, not the system.
+        (
+            "low_contention",
+            WorkloadSpec {
+                clients: 3,
+                rounds: 5,
+                keyspace: 16,
+                keys_per_txn: 2,
+                read_pct: 50,
+            },
+        ),
+    ]
+}
+
+/// Build the **extended dimension tier** (only included when `ANIMUS_CORPUS_FULL`
+/// is set). Everything here is named `ext_…` so it can never collide with or
+/// perturb a base-corpus name/seed. It widens the matrix along axes the base set
+/// fixes: the `SlowLinks` fault, 7-node + asymmetric cluster shapes, extra fault
+/// timings, extra workload regimes, and richer multi-fault schedules.
+pub fn corpus_extended() -> Vec<Scenario> {
+    let mut out = Vec::new();
+    let ws = corpus_workloads();
+    let (_, tight) = ws[0];
+    let (_, mid) = CORPUS_TIMINGS[1];
+
+    // (1) SlowLinks — the degraded-but-connected fault (a coordinator looks *slow*,
+    // not dead) — across all timings, both base shapes, and the tight + read-heavy
+    // regimes most likely to trip a failure detector's slow-vs-dead bound.
+    for (sname, shape) in [("c33", ClusterShape::SMALL), ("c55", ClusterShape::LARGE)] {
+        for (wname, w) in [ws[0], ws[2]] {
+            for (tname, at) in CORPUS_TIMINGS {
+                push_named(
+                    &mut out,
+                    format!("ext_slow_{sname}_{wname}_{tname}"),
+                    shape,
+                    w,
+                    vec![(at, NemesisAction::SlowLinks)],
+                );
+            }
+        }
+    }
+
+    // (2) Extended cluster shapes: the base single-fault matrix at the steady-state
+    // 'mid' timing on the 7+7 and the two asymmetric shapes, tight + wide_write.
+    let ext_shapes = [
+        ("c77", ClusterShape::HUGE),
+        ("a35", ClusterShape::ACCORD_LIGHT),
+        ("d53", ClusterShape::DATA_LIGHT),
+    ];
+    for (sname, shape) in ext_shapes {
+        for (wname, w) in [ws[0], ws[1]] {
+            for (fname, fault) in CORPUS_FAULTS {
+                push_named(
+                    &mut out,
+                    format!("ext_{sname}_{wname}_{fname}_mid"),
+                    shape,
+                    w,
+                    vec![(mid, fault)],
+                );
+            }
+        }
+    }
+
+    // (3) Extra fault timings: very early (a fault landing during PreAccept) and at
+    // wind-down (during execution/drain), across the base faults, small + tight.
+    let ext_timings = [
+        ("vearly", Duration::from_millis(300)),
+        ("winddown", Duration::from_millis(5500)),
+    ];
+    for (tname, at) in ext_timings {
+        for (fname, fault) in CORPUS_FAULTS {
+            push_named(
+                &mut out,
+                format!("ext_t_{fname}_{tname}"),
+                ClusterShape::SMALL,
+                tight,
+                vec![(at, fault)],
+            );
+        }
+    }
+
+    // (4) Extended workloads: a no-fault baseline + a crash-mid run for each.
+    for (wname, w) in ext_workloads() {
+        push_named(
+            &mut out,
+            format!("ext_baseline_{wname}"),
+            ClusterShape::SMALL,
+            w,
+            Vec::new(),
+        );
+        push_named(
+            &mut out,
+            format!("ext_{wname}_crash_mid"),
+            ClusterShape::SMALL,
+            w,
+            vec![(mid, NemesisAction::Crash)],
+        );
+    }
+
+    // (5) Richer multi-fault schedules on the large + huge shapes: a three-fault
+    // stack (slow → partition → crash) and a partition→heal→repartition flap.
+    for (sname, shape) in [("c55", ClusterShape::LARGE), ("c77", ClusterShape::HUGE)] {
+        push_named(
+            &mut out,
+            format!("ext_triple_{sname}"),
+            shape,
+            tight,
+            vec![
+                (Duration::from_millis(800), NemesisAction::SlowLinks),
+                (
+                    Duration::from_millis(2000),
+                    NemesisAction::PartitionMinority,
+                ),
+                (Duration::from_millis(3500), NemesisAction::Crash),
+            ],
+        );
+        push_named(
+            &mut out,
+            format!("ext_flap_{sname}"),
+            shape,
+            tight,
+            vec![
+                (
+                    Duration::from_millis(1000),
+                    NemesisAction::PartitionMinority,
+                ),
+                (Duration::from_millis(2200), NemesisAction::HealAll),
+                (
+                    Duration::from_millis(3000),
+                    NemesisAction::PartitionMinority,
+                ),
+            ],
+        );
+    }
+
+    out
+}
+
 // ---------------------------------------------------------------------------
 // The running cluster.
 // ---------------------------------------------------------------------------
 
-/// A live Accord-over-data-plane cluster plus the shared workload recorder.
+/// A live Accord cluster plus the shared workload recorder. The cluster is either
+/// pure-Accord ([`Topology::Authoritative`]) or wired to the AP data-plane
+/// frontier ([`Topology::Frontier`]); the [`Cluster::topology`] field records
+/// which, so faults that target the data plane behave correctly in each.
 pub struct Cluster {
     sim: Simulator,
     nodes: Vec<AccordNode<SimEnv>>,
     view: TabletView,
     shape: ClusterShape,
+    topology: Topology,
     shared: Arc<Shared>,
     /// Accord replica ids that have been stopped and not yet re-started.
     stopped: BTreeSet<u64>,
@@ -424,13 +739,49 @@ fn lossy(p: f64) -> NetConfig {
     cfg
 }
 
+/// A degraded-but-connected network: large base delay + jitter, no drops. The
+/// numbers are well above a healthy heartbeat interval so a coordinator looks
+/// *slow* (not dead) to a peer's failure detector.
+fn slow_links() -> NetConfig {
+    let mut cfg = NetConfig::default();
+    cfg.base_delay = Duration::from_millis(400);
+    cfg.max_jitter = Duration::from_millis(400);
+    cfg
+}
+
+/// Construct Accord replica `i` in the given topology: pure-Accord
+/// ([`AccordNode::start`] — local execution + snapshot reads, the serialization
+/// authority) or wired to the data-plane frontier ([`AccordNode::start_with_data_plane`]).
+fn make_node(
+    sim: &Simulator,
+    all: &[u64],
+    i: usize,
+    topology: Topology,
+    view: &TabletView,
+) -> AccordNode<SimEnv> {
+    match topology {
+        Topology::Authoritative => AccordNode::start(sim.env(ACCORD_IDS[i]), all.to_vec()),
+        Topology::Frontier => AccordNode::start_with_data_plane(
+            sim.env(ACCORD_IDS[i]),
+            all.to_vec(),
+            MemoryEngine::new(),
+            sim.env(COORD_IDS[i]),
+            view.clone(),
+        ),
+    }
+}
+
 impl Cluster {
-    /// Bring up an Accord replica set wired to a single-tablet data plane.
-    pub fn start(seed: u64, shape: ClusterShape) -> Cluster {
+    /// Bring up an Accord replica set in the given [`Topology`]. In both modes the
+    /// data-plane replicas + `view` are created (so partition/crash/heal nemeses
+    /// behave identically); the modes differ only in how the Accord nodes are
+    /// wired — pure (local execution + snapshot reads) vs. frontier (data-plane
+    /// quorum writes/reads).
+    pub fn start(seed: u64, shape: ClusterShape, topology: Topology) -> Cluster {
         let sim = Simulator::new(seed);
         let a = shape.accord_replicas;
         let d = shape.data_replicas;
-        assert!((3..=5).contains(&a) && (3..=5).contains(&d));
+        assert!((3..=7).contains(&a) && (3..=7).contains(&d));
 
         // Data-plane replicas over the whole key space.
         for &id in &DATA_IDS[..d] {
@@ -441,15 +792,7 @@ impl Cluster {
 
         let all = accord_ids(a);
         let nodes: Vec<AccordNode<SimEnv>> = (0..a)
-            .map(|i| {
-                AccordNode::start_with_data_plane(
-                    sim.env(ACCORD_IDS[i]),
-                    all.clone(),
-                    MemoryEngine::new(),
-                    sim.env(COORD_IDS[i]),
-                    view.clone(),
-                )
-            })
+            .map(|i| make_node(&sim, &all, i, topology, &view))
             .collect();
 
         let shared = Arc::new(Shared {
@@ -462,6 +805,7 @@ impl Cluster {
             nodes,
             view,
             shape,
+            topology,
             shared,
             stopped: BTreeSet::new(),
             crashed: BTreeSet::new(),
@@ -534,21 +878,21 @@ impl Cluster {
             NemesisAction::StopRestart => {
                 let victim = ids[a - 1];
                 self.sim.stop(victim);
-                // Start a fresh node on the same id; it recovers from its WAL.
-                let fresh = AccordNode::start_with_data_plane(
-                    self.sim.env(victim),
-                    ids.clone(),
-                    MemoryEngine::new(),
-                    self.sim.env(COORD_IDS[a - 1]),
-                    self.view.clone(),
-                );
+                // Start a fresh node on the same id (recovers from its WAL), in the
+                // same topology as the rest of the cluster.
+                let fresh = make_node(&self.sim, &ids, a - 1, self.topology, &self.view);
                 self.nodes[a - 1] = fresh;
             }
             NemesisAction::LeaderKill => {
-                // Accord is leaderless; the data plane's primary is the first
-                // data replica (in every R=2 quorum that includes it). Crashing
-                // it forces quorums onto the remaining replicas.
-                let victim = DATA_IDS[0];
+                // In Frontier mode, crash the first *data* replica (the one in every
+                // R=2 quorum) to force quorums onto the rest. In Authoritative mode
+                // the data plane is idle, so target the first *Accord* replica
+                // instead (distinct from `Crash`, which downs the last one) — losing
+                // a hot consensus node.
+                let victim = match self.topology {
+                    Topology::Frontier => DATA_IDS[0],
+                    Topology::Authoritative => ids[0],
+                };
                 self.sim.crash(victim);
                 self.crashed.insert(victim);
             }
@@ -572,6 +916,9 @@ impl Cluster {
             }
             NemesisAction::Lossy => {
                 self.sim.set_net_config(lossy(0.1));
+            }
+            NemesisAction::SlowLinks => {
+                self.sim.set_net_config(slow_links());
             }
         }
     }
@@ -828,11 +1175,21 @@ pub struct ScenarioResult {
     pub contended: bool,
 }
 
-/// Run a scenario end to end: bring up the cluster, spawn the workload, apply the
-/// fault schedule at the listed virtual times while the workload runs, heal,
-/// quiesce, snapshot two final quorum reads, and run all three checkers.
+/// Run a scenario against the **serialization-authoritative** topology (pure
+/// Accord). This is the sound target for the cycle (serializability) check; all
+/// three checkers are meaningful and robust to faults. The corpus uses this.
 pub fn run_scenario(scenario: &Scenario) -> ScenarioResult {
-    let mut cluster = Cluster::start(scenario.seed, scenario.cluster);
+    run_scenario_with(scenario, Topology::Authoritative)
+}
+
+/// Run a scenario end to end in the given [`Topology`]: bring up the cluster,
+/// spawn the workload, apply the fault schedule at the listed virtual times while
+/// the workload runs, heal, quiesce, snapshot two final reads, and run all three
+/// checkers. In [`Topology::Frontier`] the `cycles` report is **not** sound to
+/// assert (the AP read path is only eventually consistent under faults) — assert
+/// `convergence` + `durability` there, which is what the data plane offers.
+pub fn run_scenario_with(scenario: &Scenario, topology: Topology) -> ScenarioResult {
+    let mut cluster = Cluster::start(scenario.seed, scenario.cluster, topology);
 
     // Let the cluster settle, then start the concurrent workload.
     cluster.sim.run_for(Duration::from_millis(500));

@@ -157,6 +157,21 @@ gotchas also belong in that crate's `CLAUDE.md`; entries here are the
 cross-cutting ones. Prune/merge entries that become obsolete.
 
 ### Testing
+- **A flaky `ProdEnv` integration test is a real-world bug, not a determinism
+  hole — the determinism guarantee (ADR 0003) is `SimEnv`-only.** The `animusd`
+  tests run over `ProdEnv` (real sockets/time/threads) and *poll with timeouts,
+  not deterministic assertions* — so an intermittent failure there means a
+  genuine timing/durability race, exactly the class `SimEnv` can't catch. Debug it
+  (don't just bump the timeout): `create_table_survives_node_restart` flaked
+  because (a) its post-restart probe raced the Raft **catalog recovery** — gate on
+  the recovered artifact (`await_table_schema` polls `has_table_schema`), the
+  pattern the sibling GSI test already used; and (b) deeper, the control plane
+  **applies + acks a proposal before its WAL is fsynced** (apply-before-fsync), so
+  an abrupt teardown lost the acked schema. A restart test models a *clean*
+  process restart, so make teardown durable (`Node::shutdown_graceful` →
+  `RaftNode::flush`); the `kill -9` window is a tracked Raft follow-up (ADR 0009).
+  **A real-time restart test must wait for the recovered state and tear down
+  gracefully.**
 - **Determinism (ADR 0003) proves logic and ordering, not real-thread liveness.**
   `SimEnv` is single-threaded + cooperative, so a `Mutex` guard held across an
   `.await`, a lost waker, or a leader-election/group-commit deadlock can pass
@@ -217,6 +232,27 @@ cross-cutting ones. Prune/merge entries that become obsolete.
   (`cargo test -p animus-test`) after any change to recovery/execution timing**, it
   exercises interactions a single-feature test never will. (ADR 0011 failure-detector
   slice.)
+- **A serializability checker must observe the layer that *claims* serializability,
+  not an eventually-consistent projection of it.** The Elle corpus observed Accord
+  through the **AP data-plane frontier** (a current quorum read); under a
+  data-replica fault a committed multi-key write is acked *before* it is
+  quorum-durable (fire-and-forget), so a later read can see one key's new value but
+  not the other's — a torn read that `check_cycles` correctly flags as a cycle,
+  even though **Accord's order is fine**. The signature is unmistakable: cycle-only
+  failures, **never** no-fault, convergence + durability always green. Fix is *not*
+  to weaken the checker — point it at the serialization authority (pure Accord:
+  local execution + versioned-snapshot reads, `Topology::Authoritative`) and check
+  the AP frontier for **convergence + durability** only. (ADR 0014 topology split.)
+- **A frozen corpus is broad but shallow — one cell × one seed misses
+  schedule-dependent bugs; scale *depth* (seeds/cell), env-gated and tiered.** The
+  119-cell corpus explored each structural configuration down a single
+  name-hashed interleaving; multiplying seeds per cell
+  (`ANIMUS_CORPUS_SEEDS=K`, default 1, nightly 40) is what surfaced the
+  frontier-read unsoundness above on the *first* deep run. Keep variant 0 = the
+  canonical frozen name+seed (so `K=1` is byte-identical and no regression seed
+  moves) and `_sNN`-suffix the rest; gate the cost so default `cargo test` stays at
+  the frozen base while the deep tier (`ANIMUS_CORPUS_FULL=1` too) runs in a nightly
+  CI job, not per-push. (ADR 0014 coverage-expansion increment.)
 
 ### Code patterns
 - **No process-global mutable state (`OnceLock`/`static`) for per-instance

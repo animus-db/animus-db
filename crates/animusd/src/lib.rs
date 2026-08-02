@@ -475,6 +475,24 @@ impl Node {
             env.shutdown();
         }
     }
+
+    /// Graceful teardown: durably flush the control-plane WAL **before** aborting
+    /// the node's tasks, then [`shutdown`](Self::shutdown).
+    ///
+    /// `shutdown` alone aborts the Raft driver, but a `MetaCommand` (e.g. a
+    /// `CreateTable` schema proposal) is applied + acked **synchronously** in
+    /// `propose` while the driver fsyncs the WAL asynchronously — and the driver is
+    /// usually parked between ticks. So a bare `shutdown` can abort the driver in
+    /// the apply→fsync window and lose an *acked* schema across a restart (the
+    /// flaky `tests/dynamo_schema.rs::create_table_survives_node_restart`).
+    /// `RaftNode::flush` syncs that pending tail first, so a clean teardown is
+    /// actually durable — which is what a restart test (a clean teardown standing
+    /// in for an OS process restart) needs. (A `kill -9` is still exposed; the
+    /// durable-before-ack control-plane fix is a tracked follow-up.)
+    pub async fn shutdown_graceful(&self) {
+        self.raft.flush().await;
+        self.shutdown();
+    }
 }
 
 /// The wire edges' mutable state, scoped to **one cluster** (one process in

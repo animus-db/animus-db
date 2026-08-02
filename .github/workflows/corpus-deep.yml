@@ -1,0 +1,44 @@
+name: corpus-deep
+
+# The deep tier of the Elle-against-Accord scenario corpus (ADR 0014): every
+# structural cell explored over many seeds, plus the extended dimension set. This
+# is far too large for the per-push `cargo test` gate, so it runs on a nightly
+# schedule (and on demand) instead. The default `cargo test` still runs the frozen
+# base set on every push via the `gates` job in ci.yml.
+on:
+  schedule:
+    # 03:17 UTC nightly (off the hour to avoid the scheduler stampede).
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      seeds:
+        description: "Seeds per structural cell (ANIMUS_CORPUS_SEEDS)"
+        required: false
+        default: "40"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  deep-corpus:
+    name: deep-corpus
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (1.85)
+        uses: dtolnay/rust-toolchain@1.85.0
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      # Depth (ANIMUS_CORPUS_SEEDS) × breadth (ANIMUS_CORPUS_FULL). Each scenario
+      # is a pure function of its seed, so a failure names one scenario + seed and
+      # is replayable. The runner is the serialization-authoritative topology, so a
+      # cycle here is a genuine Accord serializability violation.
+      - name: deep corpus (serializability + frontier convergence/durability)
+        env:
+          ANIMUS_CORPUS_SEEDS: ${{ github.event.inputs.seeds || '40' }}
+          ANIMUS_CORPUS_FULL: "1"
+        run: cargo test -p animus-test --test corpus -- --nocapture

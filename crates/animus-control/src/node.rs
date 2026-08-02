@@ -134,6 +134,26 @@ impl<E: Env> RaftNode<E> {
         self.lock().propose(command)
     }
 
+    /// Drain and durably persist (append + `fsync`) any WAL records the core has
+    /// buffered but the driver loop has not yet flushed; returns the count.
+    ///
+    /// `propose` advances commit/apply and returns **synchronously**, while the
+    /// driver loop fsyncs the WAL **asynchronously** — and that loop is normally
+    /// parked in its `select` between ticks. So there is a window where an applied
+    /// (already client-visible, already acked) command is not yet durable on disk.
+    /// A graceful teardown calls this **before** stopping the driver so a clean
+    /// shutdown does not lose an acked command (see `animusd`'s
+    /// `Node::shutdown_graceful`). Because the driver is parked at that point, this
+    /// is the sole WAL writer.
+    ///
+    /// NOTE: this does **not** close the *crash* window — a `kill -9` between apply
+    /// and the next flush still loses the entry. Making the commit itself durable
+    /// *before* it becomes client-visible is the proper fix, tracked as a follow-up
+    /// (ADR 0009 — see the root CLAUDE.md engineering-practices note).
+    pub async fn flush(&self) -> usize {
+        flush_wal(&self.env, &self.core).await
+    }
+
     /// This node's environment handle.
     pub fn env(&self) -> &E {
         &self.env

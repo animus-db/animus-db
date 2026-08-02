@@ -71,3 +71,38 @@ truncation, commit only of current-term entries via majority `matchIndex`).
   deterministically.
 - This ADR supersedes the brief's dependency suggestion for the control plane;
   ADR 0001 (two-plane architecture) is otherwise unchanged.
+
+## Known limitation / follow-up: apply-before-fsync (acked-but-not-durable window)
+
+`RaftCore::propose` (and the commit path generally) advances `commit_index` and
+**applies the command to the in-memory `Metadata` state machine synchronously**,
+then returns `Accepted` — while the WAL `append + fsync` runs **asynchronously**
+in the `RaftNode` driver loop (`flush_wal`), which is normally parked in its
+`select` between ticks. So an applied command is **client-visible (and acked)
+before it is durable on disk**: a caller that proposes and then observes the
+applied state (e.g. the DynamoDB edge's `CreateTable` waiting on
+`has_table_schema`) gets a `200` while the entry may still be only in memory.
+
+A crash in that window loses an acknowledged command — on restart, `Metadata`
+recovers from the last fsynced snapshot + WAL tail, without it. This surfaced as
+an intermittent failure of `animusd`'s
+`tests/dynamo_schema.rs::create_table_survives_node_restart` (an abrupt
+`Node::shutdown` aborted the driver mid-window, losing the acked `CreateTable`).
+
+**Partial mitigation (shipped):** `RaftNode::flush` durably syncs the pending WAL
+tail on demand, and `animusd`'s `Node::shutdown_graceful` calls it before aborting
+tasks — so a *clean* teardown (and the restart test, which models a clean process
+restart) is durable. The driver is parked at that point, so the flush is the sole
+WAL writer.
+
+**Still open:** this does **not** close the *crash* (`kill -9`) window. The proper
+fix is **durable-before-visible**: a committed entry must not become client-visible
+(applied / ack-returnable) until its WAL entry is fsynced — e.g. apply only up to a
+*durable* watermark the driver advances after `env.sync(WAL)`, and have a proposer
+that needs a durability guarantee wait on that watermark rather than on
+`commit_index`/applied state. This mirrors the data plane's existing
+"ack-means-synced" rule (`animus-data` `ack_durability`) and the
+`animus-consensus` `persist_then_ship` ordering (WAL fsync *before* the apply
+effect/ack). It is a change to the `RaftCore`/driver commit path with its own
+sim coverage (a crash injected in the apply→fsync window must not lose an acked
+command), tracked separately.

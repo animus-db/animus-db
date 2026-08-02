@@ -100,6 +100,32 @@ async fn await_node_bootstrap(node: &Node) {
         .expect("node did not bootstrap within 20s");
 }
 
+/// Wait (bounded) until `table`'s schema is visible in this node's replicated
+/// catalog.
+///
+/// `await_node_bootstrap` only gates on leadership + a non-empty tablet map, which
+/// does **not** imply the Raft state machine has finished applying a
+/// *previously-committed* `CreateTable`: a freshly-restarted leader can be elected
+/// (and report a non-empty tablet map) a beat before it replays the catalog entry
+/// from its WAL. Probing the schema in that window races recovery — the table
+/// briefly looks absent, so a re-`CreateTable` spuriously succeeds (200/ACTIVE)
+/// instead of being rejected. These are real-time `ProdEnv` tests (no `SimEnv`
+/// determinism), so the sound fix is to poll for the recovered artifact before
+/// asserting on it — the same pattern the GSI restart test already uses.
+async fn await_table_schema(node: &Node, table: &str) {
+    let visible = async {
+        loop {
+            if node.metadata().has_table_schema(table) {
+                return;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    };
+    timeout(Duration::from_secs(20), visible)
+        .await
+        .unwrap_or_else(|_| panic!("table {table} schema not recovered within 20s"));
+}
+
 fn fixed_addrs(count: usize) -> Vec<SocketAddr> {
     let listeners: Vec<std::net::TcpListener> = (0..count)
         .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
@@ -124,7 +150,10 @@ fn single_node_config() -> ClusterConfig {
 }
 
 async fn stop(node: Node) {
-    node.shutdown();
+    // Graceful: durably flush the control-plane WAL before aborting tasks, so a
+    // just-acked `CreateTable` schema survives the restart (a bare `shutdown`
+    // races the driver's async fsync — see `Node::shutdown_graceful`).
+    node.shutdown_graceful().await;
     drop(node);
     sleep(Duration::from_millis(200)).await;
 }
@@ -171,6 +200,9 @@ async fn create_table_survives_node_restart() {
         .await
         .expect("restart");
     await_node_bootstrap(&node).await;
+    // Wait for the catalog to recover the table from the Raft WAL before probing —
+    // otherwise the re-CreateTable below races recovery and spuriously succeeds.
+    await_table_schema(&node, "events").await;
 
     // Re-creating the surviving table is rejected (ResourceInUseException).
     let (status, body) = dynamo(
@@ -256,6 +288,9 @@ async fn scan_and_query_read_live_storage_after_restart() {
         .await
         .expect("restart");
     await_node_bootstrap(&node).await;
+    // The Query below resolves the composite key from the recovered schema; wait
+    // for the catalog to replay it before probing (it races bootstrap otherwise).
+    await_table_schema(&node, "events").await;
 
     // A full Scan returns all three rows (read straight from the data plane).
     let (status, all) = dynamo(
@@ -455,13 +490,25 @@ async fn create_table_index_survives_node_restart() {
     await_node_bootstrap(&node).await;
 
     // The definition survived the restart (recovered from the replicated catalog).
-    assert!(
-        node.metadata()
-            .table_indexes("users")
-            .iter()
-            .any(|d| d.name == "by-email"),
-        "GSI definition lost across restart"
-    );
+    // Poll for it: the index entry replays from the Raft WAL *after* the table
+    // schema, a beat behind leadership/bootstrap, so a bare assert here races
+    // recovery (same hazard as `await_table_schema`).
+    let recovered = async {
+        loop {
+            if node
+                .metadata()
+                .table_indexes("users")
+                .iter()
+                .any(|d| d.name == "by-email")
+            {
+                return;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    };
+    timeout(Duration::from_secs(20), recovered)
+        .await
+        .expect("GSI definition lost across restart");
 
     // Re-creating the surviving table is rejected (ResourceInUseException) — the
     // schema (and its index) is known from the catalog, not local memory.

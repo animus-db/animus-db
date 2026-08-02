@@ -129,3 +129,61 @@ limitation is closed.
   entirely in `animus-test/tests/support/mod.rs` plus the additive
   `animus-consensus` value API; the corpus seeds/names are untouched, so every
   frozen scenario reproduces exactly.
+
+## Coverage expansion: seed-depth, dimension-breadth, and the topology split (2026-08-02)
+
+The frozen corpus was **broad but shallow** — one structural cell (fault ×
+timing × workload × shape) explored down exactly **one** interleaving (its
+name-hashed seed). Deterministic simulation's bug-finding power comes from many
+seeds per configuration, so coverage was scaled along two tiered, env-gated axes,
+and a latent unsoundness the single seeds had masked was fixed.
+
+- **Depth (`ANIMUS_CORPUS_SEEDS=K`, default 1).** `support::seed_expand` emits `K`
+  seed variants of every structural cell. Variant 0 keeps the cell's canonical
+  (frozen) name+seed; variants `1..K` get a `_sNN` suffix and a fresh
+  name-derived seed. `K=1` is the identity, so the always-on default is
+  byte-identical to the committed corpus.
+- **Breadth (`ANIMUS_CORPUS_FULL=1`, default off).** `support::corpus_extended`
+  adds new dimension *values* — the `SlowLinks` fault (a degraded-but-connected
+  network: a coordinator looks *slow*, not dead, stressing the failure-detector
+  bound), 7-node and asymmetric (3+5 / 5+3) cluster shapes, extra fault timings
+  (very-early / wind-down), extra workloads (write-only / big-txn /
+  low-contention), and richer multi-fault schedules. Extended scenarios are
+  `ext_`-prefixed so they never perturb a base name/seed.
+- **Tiering.** Defaults (`K=1`, no FULL) keep `cargo test` at the frozen base
+  set. The deep tier (`ANIMUS_CORPUS_SEEDS=40 ANIMUS_CORPUS_FULL=1`) runs nightly
+  in CI (`.github/workflows/corpus-deep.yml`). The structural guards in
+  `corpus.rs` assert against the env-independent `corpus_base()` so they stay fast
+  and stable regardless of the knobs.
+
+**The unsoundness depth exposed (and the fix).** The deep run immediately flagged
+serializability cycles — but only on **faulted `wide_write`** cells, **never**
+no-fault, and always cycle-only (convergence + durability passed). Root cause: the
+harness observed workload reads through the **AP data-plane frontier**
+(`read_value_result` → a current quorum read), while final-state reads used
+`store_value` (Accord's local executed store). Under a data-replica fault a
+committed multi-key write is acked by Accord *before* it is quorum-durable
+(fire-and-forget), so a later conflicting read could observe one key's new value
+but not the other's — a torn read the cycle checker correctly flagged. This is the
+AP data plane being *eventually* consistent, **not** an Accord ordering bug; it
+directly violated the repo principle *"point a serializability checker at the
+layer that claims it (Accord); check the AP plane for convergence/RYW, not
+serializability."*
+
+The fix introduces a **`Topology`** to the harness:
+
+- **`Authoritative`** (pure Accord, `AccordNode::start`): each replica executes
+  the agreed order into its **local** store and a read is a versioned snapshot
+  (`get_at(key, execute_at)`) — exactly the writes ordered before it, none after,
+  identically on every replica, **robust to faults**. This is the *only sound
+  target for `check_cycles`*, and it is what the corpus now runs. All three
+  checkers are meaningful here.
+- **`Frontier`** (`start_with_data_plane`): the AP data-plane wiring, exercised by
+  a separate corpus (`corpus.rs::frontier_corpus_converges_and_is_durable`) that
+  asserts **convergence + durability only** — what that layer offers.
+
+With the authoritative topology the entire deep tier
+(`ANIMUS_CORPUS_SEEDS=5 ANIMUS_CORPUS_FULL=1`, ~945 scenarios) is green, and the
+stronger coverage confirms Accord's serialization order holds under the full fault
+matrix. The change is confined to `animus-test` (tests only); no production code
+changed.

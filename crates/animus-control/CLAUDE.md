@@ -134,6 +134,18 @@ epoch compare-and-swap transactions.
   (`ProdEnv`'s real sink); use **`start_with_metrics`** to thread a recording
   handle a sim test can read — `SimEnv::metrics()` is the no-op default, so no
   `animus-sim` change is needed.
+- **Apply happens before the WAL fsync (acked-but-not-durable window).**
+  `RaftCore::propose` advances `commit_index` + **applies to `Metadata`
+  synchronously** and returns; the driver's `flush_wal` (`append` + `env.sync`)
+  runs **asynchronously**, and the driver is normally parked in its `select`
+  between ticks. So an applied command is client-visible/acked before it is on
+  disk — a crash in that window loses it (it surfaced as a flaky
+  `animusd` `create_table_survives_node_restart`). `RaftNode::flush` durably syncs
+  the pending tail on demand (used by `animusd`'s `Node::shutdown_graceful` for a
+  durable *clean* teardown); the `kill -9` window — making a commit
+  durable-*before*-visible — is a tracked follow-up (ADR 0009 "apply-before-fsync"
+  section). When you change the propose/commit/apply path, preserve or close this
+  ordering deliberately; don't widen the window.
 - Commit advances only for **current-term** entries via majority `matchIndex`
   (the Raft safety rule). Don't relax this.
 - Snapshot transfer is **chunked** (see above). Deferred: cross-leader resumption
