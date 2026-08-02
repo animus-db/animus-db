@@ -122,13 +122,24 @@ integration; the seam itself does **no** HTTP.
   Prometheus exposition format, but is trivially adaptable to it; choosing a
   timeless, dependency-free format keeps the seam pure and avoids pulling a
   metrics crate into the determinism-critical core.
-- **Integration is the only remaining wiring.** `animusd` exposes the data
-  surface by serving `ProdEnv::metrics_text()` (or a per-control-node
-  `RaftNode::metrics().snapshot().to_text()`) from an HTTP `/metrics` handler.
-  The exact one-line hook is documented in `docs/getting-started.md`; no HTTP
-  lives in `animus-env`.
-- **Deferred:** storage-engine counters (LSM compactions, SSTable reads);
-  histograms/latency (would need a deterministic bucketing scheme); and the live
-  `/metrics` HTTP endpoint in `animusd` (the seam and the text export are ready
-  for it). Data-plane counters (quorum reads/writes, read-repair, hinted handoff,
-  anti-entropy) are now **done** (see the data-plane decision above).
+- **The live endpoint is wired in `animusd`.** A running node serves
+  `GET /metrics` on its **HTTP endpoint** (the same hand-rolled HTTP/1.1 listener
+  as the DynamoDB JSON wire — `Node::dynamo_addr()`, so no seventh port or config
+  field), returning the text export as `text/plain`. No HTTP lives in
+  `animus-env`; the edge is production-only I/O like the rest of that listener.
+  - **It aggregates the node's three role sinks.** A node runs three internal
+    `ProdEnv` roles on distinct ids (control / data / coord), each recording into
+    its **own** sink (`RaftNode::start` records into the control env's sink; the
+    replica and the coordinator into theirs). The handler
+    (`ClientCtx::metrics_text`) snapshots all three **at request time** — so the
+    export reflects live activity, not a cached value — sums the counters
+    counter-by-counter, and takes the max of the leadership gauge (leadership is
+    the control plane's, recorded only in the control sink). So both control- and
+    data-plane counters surface from one endpoint. Proven over real TCP in
+    `animusd/tests/metrics_endpoint.rs` (a 3-node cluster elects a leader,
+    `GET /metrics` returns the text format with `control_elections_won >= 1` and
+    `control_is_leader 1` on the leader, `0` on a follower).
+- **Deferred:** storage-engine counters (LSM compactions, SSTable reads); and
+  histograms/latency (would need a deterministic bucketing scheme). Data-plane
+  counters (quorum reads/writes, read-repair, hinted handoff, anti-entropy) and
+  the live `/metrics` endpoint are now **done** (see above).
