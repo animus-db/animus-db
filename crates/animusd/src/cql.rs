@@ -64,7 +64,7 @@
 //! loop and this shared state live here.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use animus_control::{ColumnDef, ColumnType, TableSchema as ControlSchema};
@@ -91,13 +91,17 @@ struct Prepared {
     bind_specs: Vec<ColumnSpec>,
 }
 
-/// Process-wide CQL edge state shared across all connections of a node: the
+/// Per-cluster CQL edge state shared across all connections of a cluster: the
 /// known keyspaces (not control-plane replicated, see the module docs) and the
 /// prepared-statement store, both behind one async mutex (contention here is
 /// negligible — these are tiny in-memory maps). The *table schemas* no longer
 /// live here: they are in the control plane's replicated catalog (ADR 0013).
+///
+/// It is owned by the cluster's [`ClusterEdgeState`](crate::ClusterEdgeState)
+/// (threaded through [`ClientCtx`]) rather than a process `OnceLock`, so two
+/// in-process clusters in one test do not share keyspaces or prepared statements.
 #[derive(Default)]
-struct CqlState {
+pub(crate) struct CqlState {
     /// Created keyspaces (lowercased). Keyspace metadata is not replicated; a
     /// keyspace also counts as existing if a replicated `ks.table` belongs to it.
     keyspaces: BTreeSet<String>,
@@ -109,16 +113,6 @@ struct CqlState {
 #[derive(Default)]
 struct Session {
     keyspace: Option<String>,
-}
-
-/// The process-wide CQL edge state (keyspaces + prepared statements), shared
-/// across all nodes' CQL listeners in one process. Table schemas are **not** here
-/// anymore — they live in the control plane's replicated catalog.
-fn shared_state() -> Arc<Mutex<CqlState>> {
-    static STATE: OnceLock<Arc<Mutex<CqlState>>> = OnceLock::new();
-    STATE
-        .get_or_init(|| Arc::new(Mutex::new(CqlState::default())))
-        .clone()
 }
 
 // --- schema mapping: CQL <-> control-plane (ADR 0013) -----------------------
@@ -245,10 +239,10 @@ fn resolve_table(
 }
 
 /// Accept loop for the CQL endpoint. Each connection is handled on its own task.
-/// The keyspace set and prepared statements live in the process-wide
-/// [`shared_state`]; table schemas live in the control plane.
+/// The keyspace set and prepared statements live in the cluster's per-cluster
+/// [`CqlState`](crate::ClusterEdgeState); table schemas live in the control plane.
 pub(crate) async fn serve(listener: TcpListener, ctx: ClientCtx) {
-    let state = shared_state();
+    let state = ctx.edge.cql_state().clone();
     loop {
         match listener.accept().await {
             Ok((stream, _addr)) => {

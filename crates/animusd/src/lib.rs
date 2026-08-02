@@ -26,7 +26,7 @@
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub mod config;
@@ -212,6 +212,7 @@ impl BoundNode {
             r,
             w,
             StorageBackend::default(),
+            ClusterEdgeState::new(),
         )
         .await
     }
@@ -223,6 +224,7 @@ impl BoundNode {
     /// # Errors
     /// Propagates a failure to open the data replica's on-disk engine (LSM
     /// backend only).
+    #[allow(clippy::too_many_arguments)] // cluster assembly: ids + quorum + backend + edge state
     pub async fn start_with(
         self,
         peers: BTreeMap<NodeId, SocketAddr>,
@@ -231,6 +233,7 @@ impl BoundNode {
         r: usize,
         w: usize,
         backend: StorageBackend,
+        edge: ClusterEdgeState,
     ) -> std::io::Result<Node> {
         self.control_env.set_peers(peers.clone());
         self.data_env.set_peers(peers.clone());
@@ -246,12 +249,14 @@ impl BoundNode {
         ];
 
         let raft = RaftNode::start(self.control_env, control_ids.clone());
-        // Register this node's control handle in the process-global set the wire
+        // Register this node's control handle in the **per-cluster** set the wire
         // edges use to reach the control-plane leader for schema proposals
         // (ADR 0013). In `--cluster N` mode this lets any node's CQL/DynamoDB edge
         // propose a `CreateTableSchema` on whichever in-process node is currently
-        // leader, so DDL on a follower-connected client still commits.
-        register_control(raft.clone());
+        // leader, so DDL on a follower-connected client still commits. The set is
+        // owned by the `ClusterEdgeState` (one per cluster), not a process global,
+        // so two in-process clusters in one test do not share handles.
+        edge.register_control(raft.clone());
 
         // The data replica's durable store, plus the autonomous data-plane loops.
         // The on-disk LSM does its disk I/O through a *clone* of the data env's
@@ -329,14 +334,12 @@ impl BoundNode {
                 coord_lock: Arc::new(tokio::sync::Mutex::new(())),
                 r,
                 w,
+                edge: edge.clone(),
             };
             tasks.push(tokio::spawn(serve_clients(
                 self.client_listener,
                 ctx.clone(),
             )));
-            // Give the DynamoDB edge a control-plane handle so `CreateTable` can
-            // propose a replicated `CreateTableSchema` to the leader (ADR 0013).
-            dynamo::register_control(raft.clone());
             tasks.push(tokio::spawn(dynamo::serve(
                 self.dynamo_listener,
                 ctx.clone(),
@@ -464,9 +467,102 @@ impl Node {
     }
 }
 
+/// The wire edges' mutable state, scoped to **one cluster** (one process in
+/// `--cluster N` mode; one node in one-process-per-node mode) rather than to the
+/// whole process (ADR 0013). Holding it here — threaded through [`ClientCtx`] —
+/// instead of in `OnceLock` process statics is what lets a test harness run
+/// several independent clusters in one process without their edge state leaking
+/// across them (registries, prepared statements, and especially the set of
+/// control handles a schema proposal fans out to).
+///
+/// Cloning shares the same underlying state (it is `Arc`-backed), so every node
+/// and every connection of a cluster sees one registry / handle set; a fresh
+/// [`ClusterEdgeState::new`] is a distinct, isolated set.
+#[derive(Clone)]
+pub struct ClusterEdgeState {
+    /// This cluster's control `RaftNode` handles, so a wire edge (CQL/DynamoDB)
+    /// can reach the control-plane **leader** to propose a schema `MetaCommand`
+    /// even when the client connected to a follower (ADR 0013). In `--cluster N`
+    /// mode every node of the cluster registers here, so the leader is always
+    /// present; in one-process-per-node mode only the local handle is registered
+    /// (cross-process proposal forwarding is future work — DDL then commits when
+    /// this node is the leader, like the bootstrap path).
+    control: Arc<Mutex<Vec<RaftNode<ProdEnv>>>>,
+    /// The DynamoDB edge's in-memory GSI declarations + observation-built
+    /// written-key index (ADR 0006). Not durable / not replicated; per-cluster.
+    dynamo_registry: Arc<Mutex<animus_dynamo::SchemaRegistry>>,
+    /// The CQL edge's keyspaces + prepared-statement store (ADR 0013). Not
+    /// durable / not replicated; per-cluster.
+    cql_state: Arc<tokio::sync::Mutex<cql::CqlState>>,
+}
+
+impl Default for ClusterEdgeState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ClusterEdgeState {
+    /// A fresh, isolated edge-state set for one cluster.
+    pub fn new() -> Self {
+        Self {
+            control: Arc::new(Mutex::new(Vec::new())),
+            dynamo_registry: Arc::new(Mutex::new(animus_dynamo::SchemaRegistry::new())),
+            cql_state: Arc::new(tokio::sync::Mutex::new(cql::CqlState::default())),
+        }
+    }
+
+    /// Register a node's control handle for schema-proposal routing. Called once
+    /// per node in [`BoundNode::start_with`].
+    fn register_control(&self, raft: RaftNode<ProdEnv>) {
+        self.control
+            .lock()
+            .expect("control handles poisoned")
+            .push(raft);
+    }
+
+    /// Propose `command` on **every** registered control handle that currently
+    /// believes it is leader. Normally exactly one live node is leader; proposing
+    /// on all self-styled leaders is robust to a stale handle. A non-leader
+    /// `propose` is dropped (`NotLeader`), so this is safe to call every tick.
+    fn propose_on_leaders(&self, command: &MetaCommand) {
+        for raft in self
+            .control
+            .lock()
+            .expect("control handles poisoned")
+            .iter()
+        {
+            if raft.is_leader() {
+                let _ = raft.propose(command.clone());
+            }
+        }
+    }
+
+    /// The control handle that currently believes it is leader, if any.
+    pub(crate) fn leader_handle(&self) -> Option<RaftNode<ProdEnv>> {
+        self.control
+            .lock()
+            .expect("control handles poisoned")
+            .iter()
+            .find(|r| r.is_leader())
+            .cloned()
+    }
+
+    /// The DynamoDB edge's per-cluster registry.
+    pub(crate) fn dynamo_registry(&self) -> &Arc<Mutex<animus_dynamo::SchemaRegistry>> {
+        &self.dynamo_registry
+    }
+
+    /// The CQL edge's per-cluster state.
+    pub(crate) fn cql_state(&self) -> &Arc<tokio::sync::Mutex<cql::CqlState>> {
+        &self.cql_state
+    }
+}
+
 /// Shared context for the client request server and the DynamoDB HTTP endpoint:
-/// the cached metadata view for routing, the quorum coordinator, and the
-/// per-node serialization lock around the single-consumer coord inbox.
+/// the cached metadata view for routing, the quorum coordinator, the per-node
+/// serialization lock around the single-consumer coord inbox, and the
+/// per-cluster wire-edge state.
 #[derive(Clone)]
 pub(crate) struct ClientCtx {
     raft: RaftNode<ProdEnv>,
@@ -474,6 +570,7 @@ pub(crate) struct ClientCtx {
     pub(crate) coord_lock: Arc<tokio::sync::Mutex<()>>,
     r: usize,
     w: usize,
+    pub(crate) edge: ClusterEdgeState,
 }
 
 /// Spawn the data replica over `storage` plus its two background loops
@@ -636,46 +733,6 @@ const SCHEMA_COMMIT_TIMEOUT: Duration = Duration::from_secs(10);
 /// leader to settle so the proposal can be (re)submitted.
 const SCHEMA_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-/// The process-global set of this process's control `RaftNode` handles, so a
-/// wire edge (CQL/DynamoDB) can reach the control-plane **leader** to propose a
-/// schema `MetaCommand` even when the client connected to a follower (ADR 0013).
-/// In `--cluster N` mode every in-process node registers here, so the leader is
-/// always present; in one-process-per-node mode only the local handle is
-/// registered (cross-process proposal forwarding over the network is future
-/// work — DDL then commits when this node is the leader, like the existing
-/// bootstrap path).
-fn control_handles() -> &'static Mutex<Vec<RaftNode<ProdEnv>>> {
-    static HANDLES: OnceLock<Mutex<Vec<RaftNode<ProdEnv>>>> = OnceLock::new();
-    HANDLES.get_or_init(|| Mutex::new(Vec::new()))
-}
-
-/// Register a node's control handle for schema-proposal routing (see
-/// [`control_handles`]). Called once per node in [`BoundNode::start_with`].
-fn register_control(raft: RaftNode<ProdEnv>) {
-    control_handles()
-        .lock()
-        .expect("control handles poisoned")
-        .push(raft);
-}
-
-/// Propose `command` on **every** registered control handle that currently
-/// believes it is leader. Normally exactly one live node is leader; proposing on
-/// all self-styled leaders is robust to a stale handle left by a shut-down node
-/// in a multi-incarnation test (a dead handle's `propose` is a harmless no-op,
-/// while the live leader actually appends + replicates). A non-leader `propose`
-/// is dropped (`NotLeader`), so this is safe to call every poll tick.
-fn propose_on_leaders(command: &MetaCommand) {
-    for raft in control_handles()
-        .lock()
-        .expect("control handles poisoned")
-        .iter()
-    {
-        if raft.is_leader() {
-            let _ = raft.propose(command.clone());
-        }
-    }
-}
-
 impl ClientCtx {
     /// Resolve the routing view for `key` from cached metadata.
     pub(crate) fn view_for(&self, key: &[u8]) -> Option<TabletView> {
@@ -789,7 +846,7 @@ impl ClientCtx {
                     SCHEMA_COMMIT_TIMEOUT.as_secs()
                 ));
             }
-            propose_on_leaders(&command);
+            self.edge.propose_on_leaders(&command);
             tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
         }
     }
@@ -812,7 +869,7 @@ impl ClientCtx {
             if tokio::time::Instant::now() >= deadline {
                 return Err(());
             }
-            propose_on_leaders(&command);
+            self.edge.propose_on_leaders(&command);
             tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
         }
     }
@@ -882,6 +939,10 @@ pub async fn start_cluster_with(
     let data_ids: Vec<NodeId> = (0..n).map(config::data_id).collect();
     let peers: BTreeMap<NodeId, SocketAddr> =
         bound.iter().flat_map(BoundNode::peer_entries).collect();
+    // One edge-state set shared by every node of *this* cluster (so any node's
+    // edge can reach the cluster's leader and they agree on GSI/keyspace state),
+    // but distinct from any other cluster in the same process.
+    let edge = ClusterEdgeState::new();
     let mut nodes = Vec::with_capacity(n);
     for b in bound {
         let node = b
@@ -892,6 +953,7 @@ pub async fn start_cluster_with(
                 r,
                 w,
                 backend,
+                edge.clone(),
             )
             .await?;
         nodes.push(node);
@@ -930,6 +992,9 @@ pub async fn run_node_with(
     })?;
     let (control_id, data_id, coord_id) = config.role_ids(index);
     let bound = Node::bind(control_id, data_id, coord_id, addrs, dir).await?;
+    // One node per process: a fresh per-process edge-state set (it registers only
+    // this node's control handle — cross-process proposal forwarding is future
+    // work, ADR 0013).
     bound
         .start_with(
             config.peer_book(),
@@ -938,6 +1003,7 @@ pub async fn run_node_with(
             config.r,
             config.w,
             backend,
+            ClusterEdgeState::new(),
         )
         .await
 }

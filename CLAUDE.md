@@ -262,8 +262,8 @@ WAL/snapshot like all metadata, so a `CreateTable`/`CREATE TABLE` survives resta
 and is agreed cluster-wide — replacing the adapters' per-process in-memory
 catalogs. **Both wire edges consume it**: `animusd::{cql,dynamo}` propose
 `CreateTableSchema`/`DropTableSchema` on DDL (routed to the leader via a
-process-global set of registered control handles) and resolve reads/writes from
-the replicated `Metadata`. Proven in `animus-control/tests/schema_catalog.rs`
+**per-cluster** set of registered control handles, held in `animusd`'s
+`ClusterEdgeState`) and resolve reads/writes from the replicated `Metadata`. Proven in `animus-control/tests/schema_catalog.rs`
 (propose → reject duplicate/malformed → leader kill → survives + survivors agree →
 drop replicates) and end-to-end over the wire in
 `animusd/tests/cql_durable_schema.rs` (CREATE TABLE + a row survive a node

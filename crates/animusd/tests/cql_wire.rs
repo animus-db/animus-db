@@ -260,15 +260,34 @@ async fn cql_wire_prepare_execute_typed_round_trip() {
     .await;
     assert_eq!(use1.opcode, Opcode::Result);
 
-    let rows = round_trip(
-        &mut conn1,
-        &request(
-            2,
-            Opcode::Query,
-            &query_body("SELECT * FROM users WHERE id = 7"),
-        ),
-    )
-    .await;
+    // The CREATE TABLE committed on node 0's leader; node 1 resolves the table
+    // from its own replicated `Metadata`, which may still be catching up the
+    // committed entry, so poll the cross-node SELECT until the schema has
+    // replicated (it returns an error frame, not a RESULT, until then).
+    let rows = {
+        let mut stream = 2i16;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let rows = round_trip(
+                &mut conn1,
+                &request(
+                    stream,
+                    Opcode::Query,
+                    &query_body("SELECT * FROM users WHERE id = 7"),
+                ),
+            )
+            .await;
+            if rows.opcode == Opcode::Result {
+                break rows;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "node 1 never saw the replicated `users` schema within 10s",
+            );
+            stream += 1;
+            sleep(Duration::from_millis(50)).await;
+        }
+    };
     assert_eq!(rows.opcode, Opcode::Result);
     let cells = parse_single_row(&rows.body).expect("row should be present");
     assert_eq!(cells.len(), 3, "id, name, active");

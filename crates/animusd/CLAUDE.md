@@ -35,8 +35,8 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   consistency level** (it overrides the routing view's R/W per request). A
   *partition* is one data-plane value, so `INSERT`/`UPDATE`/`DELETE` are
   read-modify-write of that value under the coord lock, and a `DELETE` that
-  empties the partition issues a data-plane delete/tombstone. The catalog +
-  prepared-statement store are **process-global edge state** (see below).
+  empties the partition issues a data-plane delete/tombstone. The keyspace set +
+  prepared-statement store are **per-cluster edge state** (see below).
 
 ## What's non-obvious
 
@@ -105,28 +105,37 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   proposes its key schema into the control plane's replicated catalog (ADR 0013)
   and waits for commit**, so a created table is durable + cluster-agreed (it
   survives a restart — `tests/dynamo_schema.rs`); the edge reaches the leader
-  through a process-global set of registered control handles
-  (`dynamo::register_control`, wired once per node in `start_with`). A
+  through the cluster's set of registered control handles (held in
+  `ClusterEdgeState`, threaded via `ClientCtx::edge` — see below). A
   never-`CreateTable`d table falls back to the legacy `pk`/`sk` convention. The
   edge's GSI declarations + written-key index (for `Query`/`Scan`) remain
-  in-memory. The surface now also covers `UpdateItem`/`BatchWriteItem`/
+  in-memory, now held **per-cluster** in `ClusterEdgeState` (not a process
+  `OnceLock`). The surface now also covers `UpdateItem`/`BatchWriteItem`/
   `TransactWriteItems` (the last condition-gated but not yet atomic), per-index
   projections, and document-path projections.
 - And a **sixth listener, the CQL binary-protocol endpoint** (`RoleAddrs.cql`,
   `Node::cql_addr`). Same shape: a production-only I/O edge (real tokio sockets +
   hand-rolled CQL v4 framing in `cql.rs`; the pure protocol/type/catalog/planning
   logic is in `animus-cql`), routed through the same `ClientCtx`. It runs
-  `QUERY`/`PREPARE`/`EXECUTE`: `CREATE KEYSPACE`/`USE`/`CREATE TABLE` record a
-  typed schema in an in-memory catalog, and `INSERT`/`SELECT` resolve columns
-  against it (a typed row is one data-plane value keyed by `escape(table) ||
-  pk_key_bytes`; the partition key is not stored in the value).
-  - **The catalog + prepared-statement store are process-global edge state**
-    (`shared_state()` over a `OnceLock<Arc<Mutex<CqlState>>>`), shared across all
-    nodes' CQL listeners in one process — like the DynamoDB `SchemaRegistry`, so
-    `--cluster N` dev mode sees one node's `CREATE TABLE` from another. They are
-    **not durable and not control-plane replicated**: lost on restart, and a
-    one-process-per-node deployment has a per-process catalog (re-create schemas
-    per process). Per-connection state (the `USE`d keyspace) lives in `Session`.
+  `QUERY`/`PREPARE`/`EXECUTE`: `CREATE TABLE` proposes a typed schema into the
+  control plane's **replicated catalog** (ADR 0013) and `INSERT`/`SELECT` resolve
+  columns from it (a typed row is one data-plane value keyed by `escape(table) ||
+  pk_key_bytes`; the partition key is not stored in the value). `CREATE KEYSPACE`
+  records the keyspace in the per-cluster `CqlState` (keyspaces are not yet
+  replicated).
+  - **The keyspace set + prepared-statement store (`CqlState`) are per-cluster
+    edge state**, held in the cluster's `ClusterEdgeState` (threaded through
+    `ClientCtx::edge`), **not** a process `OnceLock` — like the DynamoDB
+    `SchemaRegistry`. They are shared across the cluster's CQL listeners (so
+    `--cluster N` dev mode sees one node's `CREATE KEYSPACE` from another) but
+    **isolated between two clusters in one process** (so a test harness can run
+    several independent clusters without their edge state leaking — the fix for
+    the former process-global `OnceLock` state-leak). They are still **not durable
+    and not control-plane replicated**: lost on restart, and a one-process-per-node
+    deployment has a per-process catalog (re-create schemas per process). Note
+    table *schemas* are no longer here at all — they live in the control plane's
+    replicated catalog (ADR 0013). Per-connection state (the `USE`d keyspace)
+    lives in `Session`.
   - The **prepared-statement id is content-addressed** — a stable hash of the
     statement text (FNV-1a, no RNG so the edge stays deterministic) — so `PREPARE`
     on one connection and `EXECUTE` on another resolve to the same statement.
@@ -139,6 +148,23 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
 - Two run modes: `--cluster N` (whole cluster in one process, dev convenience)
   and `--config FILE --node I` (one node per process — real deployment). Both
   share `Node::bind`/`start`; only address/peer assembly differs.
+- **The wire edges' mutable state is `ClusterEdgeState`, scoped to one cluster**
+  (not the whole process). It holds the set of control `RaftNode` handles a schema
+  DDL proposal fans out to (so a follower-connected `CreateTable`/`CREATE TABLE`
+  still reaches the leader), the DynamoDB `SchemaRegistry` (GSI + written-key
+  index), and the CQL `CqlState` (keyspaces + prepared statements). It is created
+  once per cluster — in `start_cluster_with` (shared by every node of that
+  cluster, so `--cluster N` dev mode agrees) and freshly in `run_node_with` (one
+  per process) — and threaded into `start_with` → `ClientCtx::edge`. In
+  `--cluster N` mode one process is one cluster, so this is equivalent to the old
+  process-global; the point is that a **test harness running several independent
+  clusters in one process gets a distinct, isolated edge-state set per cluster**,
+  so two clusters never share a registry or a handle set. (This replaced the
+  former `OnceLock` process statics, which leaked across tests in one binary —
+  a later test's `CreateTable` fanned its proposal across every still-running
+  cluster's leaders and timed out.) Schema DDL routes through
+  `ClusterEdgeState::{leader_handle, propose_on_leaders}`; reads/writes resolve
+  the table schema from this node's own replicated `Metadata`.
 - **`Node::shutdown()` is a graceful teardown**: it aborts the node's
   client-facing listener tasks (client/dynamo/cql, on plain `tokio::spawn`) and
   calls `ProdEnv::shutdown()` on each of the three internal role envs, which
