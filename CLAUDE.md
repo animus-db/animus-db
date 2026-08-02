@@ -183,7 +183,11 @@ tested end-to-end via `Simulator::stop` (`custos-control/tests/restart.rs`).
 **epoch fencing**: an operation whose epoch is older than the replica's known
 epoch is rejected. `DataClient` is the quorum coordinator: it broadcasts to a
 `TabletView`'s replicas and returns as soon as a W (write) or R (read) quorum
-responds. Choose `R + W > N` so reads see acknowledged writes.
+responds. Choose `R + W > N` so reads see acknowledged writes. An ack means the
+write durably applied: a replica only acks `ok` when its storage
+`merge`/`merge_tombstone` succeeded, so a write that fewer than W replicas could
+persist fails rather than being falsely reported committed (it matters now the
+replica can be the durable on-disk LSM).
 
 `R + W > N` only makes quorum *reads* intersect; raw replica state still
 diverges when a replica misses a write. **Repair/anti-entropy** (ADR 0010)

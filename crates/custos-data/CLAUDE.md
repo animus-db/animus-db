@@ -31,6 +31,15 @@ tablet map, and per-tablet epoch fencing (ADR 0001, 0002).
   coordinator returns as soon as a quorum responds, so a down replica never
   blocks; ops it can't quorum on fail (the caller records them `info`, never
   lost-write).
+- **An ack means the write durably applied.** A replica replies
+  `WriteAck { ok: true }` / `DeleteAck { ok: true }` only when its
+  `StorageEngine::merge` / `merge_tombstone` returned `Ok` — a superseded no-op
+  (`Ok(false)`) still counts (durable state already reflects a newer write), but
+  a storage `Err` is `ok: false`. The coordinator counts only `ok` acks toward W,
+  so a write/delete that fewer than W replicas could persist *fails* instead of
+  being falsely reported committed (it never silently swallows the storage
+  result). Matters now that the replica can be backed by the durable on-disk LSM
+  (`custosd`), where a persist can genuinely fail.
 - **Routing reads from a cached `TabletView`/`Router`**, not from a live control
   query — that's what keeps the data plane serving during a control-plane outage
   (only topology changes, which bump epochs, need the control plane).
@@ -75,5 +84,8 @@ read-repair + background anti-entropy convergence, incl. tombstone propagation
 (`repair.rs`), segment-digest anti-entropy converging only divergent ranges
 (`digest_anti_entropy.rs`, asserted at the wire level via the sim `Send` trace),
 and residency on the repair paths — a reachable but ineligible peer never
-receives repaired data (`residency_repair.rs`). `digest.rs` has inline unit
-tests for the digest itself.
+receives repaired data (`residency_repair.rs`), and ack-durability — a replica
+whose storage `merge`/`merge_tombstone` errors replies `ok: false` so the quorum
+write/delete fails rather than falsely succeeding (`ack_durability.rs`, with a
+failing-engine test double). `digest.rs` has inline unit tests for the digest
+itself.

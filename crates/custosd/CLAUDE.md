@@ -78,6 +78,16 @@ CLI wrapper. `custos-cli` depends on this crate for the client protocol types.
 - Two run modes: `--cluster N` (whole cluster in one process, dev convenience)
   and `--config FILE --node I` (one node per process — real deployment). Both
   share `Node::bind`/`start`; only address/peer assembly differs.
+- **`Node::shutdown()` is a graceful teardown**: it aborts the node's
+  client-facing listener tasks (client/dynamo/cql, on plain `tokio::spawn`) and
+  calls `ProdEnv::shutdown()` on each of the three internal role envs, which
+  aborts every task they own (the Raft driver, the replica serve loop, the
+  internal accept loops). This frees all six listener ports so a replacement node
+  can rebind the same addresses on the same data dir — the clean teardown a
+  stopped OS process would provide. On-disk state is untouched (a value acked to
+  a client was WAL-synced before the ack, so it survives). Wired to the Ctrl-C
+  path in `main`. Dropping a `Node` without `shutdown()` still leaves its detached
+  tasks running (they hold the ports), so call `shutdown()` to restart in-place.
 
 ## Tests / running
 
@@ -89,10 +99,11 @@ over the real CQL binary wire), and `tests/durable_restart.rs` (a key written
 through the client API survives a node stop + restart on the **same dir +
 addresses** with the LSM backend, and is lost with the `--ephemeral` memory
 backend). All use real TCP/time, so they poll with timeouts, not deterministic
-assertions. The restart test runs each node "incarnation" in its own tokio
-runtime and shuts it down between incarnations to abort the node's detached
-tasks and free its listener ports (dropping a `Node` does not stop them) — this
-stands in for an OS process restart.
+assertions. The restart test runs both incarnations in the **same** runtime,
+calling `Node::shutdown()` between them to abort the node's detached tasks and
+free its listener ports (dropping a `Node` does not stop them), then rebinds the
+same addresses and recovers — a clean teardown → rebind → recover cycle standing
+in for an OS process restart.
 
 Per-process run:
 ```sh

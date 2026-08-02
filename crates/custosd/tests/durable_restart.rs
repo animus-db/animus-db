@@ -6,13 +6,15 @@
 //! — the engine recovers its state from disk on reopen. This mirrors a real
 //! `custosd` process being stopped and restarted.
 //!
-//! Each "incarnation" runs in its **own tokio runtime**: the node's protocols
-//! are detached background tasks (Raft, the replica serve loop, the listeners'
-//! accept loops), and dropping a `Node` does not stop them. Shutting the runtime
-//! down between incarnations aborts those tasks and releases the listener ports,
-//! standing in for the OS reclaiming a stopped process — so the replacement can
-//! rebind the same addresses. Like the other `custosd` tests this uses real
-//! TCP/time and is non-deterministic by design (the ProdEnv edge).
+//! The incarnations run in the **same tokio runtime**: between them,
+//! [`Node::shutdown`] aborts the node's spawned protocols (Raft driver, replica
+//! serve loop, the internal accept loops) and its client/dynamo/cql listeners,
+//! freeing all six listener ports so the replacement can rebind the same
+//! addresses — a clean teardown → rebind → recover cycle. (Before `shutdown`
+//! existed, dropping a `Node` left those detached tasks running, so the test had
+//! to spin up a fresh runtime per incarnation to abort them.) Like the other
+//! `custosd` tests this uses real TCP/time and is non-deterministic by design
+//! (the ProdEnv edge).
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -20,7 +22,6 @@ use std::time::Duration;
 use custosd::{ClientRequest, ClientResponse, ClusterConfig, Node, RoleAddrs, StorageBackend};
 use tempfile::TempDir;
 use tokio::net::TcpStream;
-use tokio::runtime::Runtime;
 use tokio::time::{sleep, timeout};
 
 async fn call(addr: SocketAddr, req: ClientRequest) -> ClientResponse {
@@ -75,144 +76,138 @@ fn single_node_config() -> ClusterConfig {
     }
 }
 
-/// Run one node "incarnation" to completion in its own multi-thread runtime,
-/// then shut the runtime down (aborting the node's detached tasks and releasing
-/// its listener ports), standing in for an OS process restart.
-fn incarnation<F, Fut>(body: F)
-where
-    F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = ()>,
-{
-    let rt = Runtime::new().expect("build runtime");
-    rt.block_on(body());
-    // Force-abort the node's background tasks so the ports are free for the next
-    // incarnation to rebind (mirrors the OS reclaiming a stopped process).
-    rt.shutdown_timeout(Duration::from_secs(5));
+/// Stop a node cleanly and give the OS a moment to release its now-aborted
+/// listeners' ports, so the replacement can rebind the same addresses.
+async fn stop(node: Node) {
+    node.shutdown();
+    drop(node);
+    sleep(Duration::from_millis(200)).await;
 }
 
-#[test]
-fn data_survives_node_restart_on_disk() {
+#[tokio::test(flavor = "multi_thread")]
+async fn data_survives_node_restart_on_disk() {
     let config = single_node_config();
     let client = config.nodes[0].client;
     let dir = TempDir::new().unwrap();
     let node_dir = dir.path().join("node-0");
 
-    // --- First incarnation: write a durable key. ---
-    incarnation(|| async {
-        let node = custosd::run_node(&config, 0, &node_dir)
-            .await
-            .expect("first start");
-        await_bootstrap(&node).await;
+    // --- First incarnation: write a durable key, then shut down cleanly. ---
+    let node = custosd::run_node(&config, 0, &node_dir)
+        .await
+        .expect("first start");
+    await_bootstrap(&node).await;
 
-        let put = call(
-            client,
-            ClientRequest::Put {
-                key: b"durable".to_vec(),
-                value: b"survives".to_vec(),
-            },
-        )
-        .await;
-        assert!(matches!(put, ClientResponse::PutOk), "put failed: {put:?}");
+    let put = call(
+        client,
+        ClientRequest::Put {
+            key: b"durable".to_vec(),
+            value: b"survives".to_vec(),
+        },
+    )
+    .await;
+    assert!(matches!(put, ClientResponse::PutOk), "put failed: {put:?}");
 
-        // A returned PutOk means the on-disk LSM WAL-synced the write before
-        // acking, so it is durable. Confirm it reads back while still up.
-        assert_eq!(
-            call(
-                client,
-                ClientRequest::Get {
-                    key: b"durable".to_vec()
-                }
-            )
-            .await,
-            ClientResponse::Value(Some(b"survives".to_vec())),
-        );
-    });
-
-    // --- Second incarnation: SAME data dir + SAME addresses. ---
-    incarnation(|| async {
-        let node = custosd::run_node(&config, 0, &node_dir)
-            .await
-            .expect("restart on the same dir/addresses");
-        await_bootstrap(&node).await;
-
-        // The previously-written value survived because the LSM recovered it
-        // from disk — the whole point of the on-disk data plane.
-        let got = call(
+    // A returned PutOk means the on-disk LSM WAL-synced the write before
+    // acking, so it is durable. Confirm it reads back while still up.
+    assert_eq!(
+        call(
             client,
             ClientRequest::Get {
-                key: b"durable".to_vec(),
-            },
+                key: b"durable".to_vec()
+            }
         )
-        .await;
-        assert_eq!(
-            got,
-            ClientResponse::Value(Some(b"survives".to_vec())),
-            "durable key did not survive the restart (got {got:?})",
-        );
+        .await,
+        ClientResponse::Value(Some(b"survives".to_vec())),
+    );
 
-        // A key that was never written stays absent across the restart — the
-        // engine recovered exactly what was durably committed, nothing more.
-        let absent = call(
-            client,
-            ClientRequest::Get {
-                key: b"never".to_vec(),
-            },
-        )
-        .await;
-        assert_eq!(
-            absent,
-            ClientResponse::Value(None),
-            "an unwritten key should be absent after recovery (got {absent:?})",
-        );
-    });
+    stop(node).await;
+
+    // --- Second incarnation: SAME runtime, SAME data dir + SAME addresses. ---
+    // The clean shutdown above freed the ports, so the replacement rebinds them.
+    let node = custosd::run_node(&config, 0, &node_dir)
+        .await
+        .expect("restart on the same dir/addresses after a clean shutdown");
+    await_bootstrap(&node).await;
+
+    // The previously-written value survived because the LSM recovered it from
+    // disk — the whole point of the on-disk data plane.
+    let got = call(
+        client,
+        ClientRequest::Get {
+            key: b"durable".to_vec(),
+        },
+    )
+    .await;
+    assert_eq!(
+        got,
+        ClientResponse::Value(Some(b"survives".to_vec())),
+        "durable key did not survive the restart (got {got:?})",
+    );
+
+    // A key that was never written stays absent across the restart — the engine
+    // recovered exactly what was durably committed, nothing more.
+    let absent = call(
+        client,
+        ClientRequest::Get {
+            key: b"never".to_vec(),
+        },
+    )
+    .await;
+    assert_eq!(
+        absent,
+        ClientResponse::Value(None),
+        "an unwritten key should be absent after recovery (got {absent:?})",
+    );
+
+    stop(node).await;
 }
 
 /// The contrast: with the `--ephemeral` in-memory backend, a restart on the same
 /// dir/addresses starts empty — proving the durability above comes from the
 /// on-disk engine, not from anything else in the stack (the control plane's own
 /// WAL recovers metadata either way).
-#[test]
-fn data_is_lost_on_restart_with_memory_backend() {
+#[tokio::test(flavor = "multi_thread")]
+async fn data_is_lost_on_restart_with_memory_backend() {
     let config = single_node_config();
     let client = config.nodes[0].client;
     let dir = TempDir::new().unwrap();
     let node_dir = dir.path().join("node-0");
 
-    incarnation(|| async {
-        let node = custosd::run_node_with(&config, 0, &node_dir, StorageBackend::Memory)
-            .await
-            .expect("first start (memory)");
-        await_bootstrap(&node).await;
+    let node = custosd::run_node_with(&config, 0, &node_dir, StorageBackend::Memory)
+        .await
+        .expect("first start (memory)");
+    await_bootstrap(&node).await;
 
-        let put = call(
-            client,
-            ClientRequest::Put {
-                key: b"volatile".to_vec(),
-                value: b"gone".to_vec(),
-            },
-        )
-        .await;
-        assert!(matches!(put, ClientResponse::PutOk), "put failed: {put:?}");
-    });
+    let put = call(
+        client,
+        ClientRequest::Put {
+            key: b"volatile".to_vec(),
+            value: b"gone".to_vec(),
+        },
+    )
+    .await;
+    assert!(matches!(put, ClientResponse::PutOk), "put failed: {put:?}");
 
-    incarnation(|| async {
-        let node = custosd::run_node_with(&config, 0, &node_dir, StorageBackend::Memory)
-            .await
-            .expect("restart (memory)");
-        await_bootstrap(&node).await;
+    stop(node).await;
 
-        // The in-memory replica started empty, so the value is gone.
-        let got = call(
-            client,
-            ClientRequest::Get {
-                key: b"volatile".to_vec(),
-            },
-        )
-        .await;
-        assert_eq!(
-            got,
-            ClientResponse::Value(None),
-            "in-memory backend should lose data across a restart (got {got:?})",
-        );
-    });
+    let node = custosd::run_node_with(&config, 0, &node_dir, StorageBackend::Memory)
+        .await
+        .expect("restart (memory)");
+    await_bootstrap(&node).await;
+
+    // The in-memory replica started empty, so the value is gone.
+    let got = call(
+        client,
+        ClientRequest::Get {
+            key: b"volatile".to_vec(),
+        },
+    )
+    .await;
+    assert_eq!(
+        got,
+        ClientResponse::Value(None),
+        "in-memory backend should lose data across a restart (got {got:?})",
+    );
+
+    stop(node).await;
 }

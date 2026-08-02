@@ -77,8 +77,23 @@ ignored. This is tested under fault injection in `custos-storage/tests/lsm_crash
   remains the simulator's engine and is selectable for ephemeral runs via
   `custosd --ephemeral`. The data role's `ProdEnv` dir is dedicated to the engine,
   so its files use a flat filename prefix (`db-…`), not a subdirectory (`ProdEnv`
-  opens files without creating intermediate directories). End-to-end durability
-  across a real restart is asserted in `custosd/tests/durable_restart.rs`.
+  opens files without creating intermediate directories — though `ProdEnv` now
+  `create_dir_all`s a file's parent on `append`/`replace`, so a slash-bearing
+  prefix would also work). End-to-end durability across a real restart is
+  asserted in `custosd/tests/durable_restart.rs`, which restarts the node in the
+  same runtime via `Node::shutdown()` (a clean teardown → rebind → recover cycle).
+- **An ack must mean the write durably applied.** The data replica
+  (`custos-data`'s `serve_replica`) now propagates the storage result into its
+  reply: a `WriteAck`/`DeleteAck` is `ok: true` only when
+  `StorageEngine::merge`/`merge_tombstone` returned `Ok` (a superseded no-op,
+  `Ok(false)`, still counts — the durable state already reflects a newer write),
+  and `ok: false` on a storage `Err`. Previously the replica swallowed the result
+  (`let _ = storage.merge(..)`) and always acked `true`, so with the durable LSM
+  a write that failed to persist would still be counted toward the W quorum and
+  falsely reported as committed. The coordinator only counts `ok` acks, so a
+  quorum write/delete now fails rather than lying when fewer than W replicas
+  could persist (asserted under `SimEnv` with a failing-engine test double in
+  `custos-data/tests/ack_durability.rs`).
 - Deferred within `LsmEngine` (correctness-first, performance later): bloom
   filters (only a key-range gate today), leveled compaction (size-tiered only),
   WAL segment rotation / fsync batching, block compression, and a more compact

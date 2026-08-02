@@ -30,15 +30,25 @@ the production implementation; the deterministic implementation lives in
 - `Disk` is append + explicit `sync`; bytes are not durable until `sync`
   returns. This models real crash semantics and is what `custos-sim` exploits.
   `Disk::replace` atomically swaps a file's whole contents (temp-file + rename
-  in `ProdEnv`) — used for WAL compaction. `read_at(file, offset, len)` /
+  in `ProdEnv`) — used for WAL compaction. In `ProdEnv`, the file-creating paths
+  (`append`/`replace`) `create_dir_all` the file's parent first, so a filename
+  carrying a subdirectory prefix (e.g. `"db/wal"`) works instead of silently
+  failing on a missing parent. `read_at(file, offset, len)` /
   `size(file)` / `remove(file)` are the random-access + delete primitives an
   on-disk LSM needs (SSTable block reads, file sizing, compaction cleanup); they
   view the same durable + buffered bytes as `read`, so a crash drops an un-synced
   tail consistently across all of them.
 - `ProdEnv` is *not* covered by the simulation tests (it's the nondeterministic
   side). Don't add logic here that the deterministic path needs to share.
+- `ProdEnv::shutdown()` aborts every task the env owns — its inbound-connection
+  accept loop plus everything spawned through `Spawner::spawn` (so the env tracks
+  spawned `AbortHandle`s). `custosd`'s `Node::shutdown` calls it on each of the
+  node's three role envs to tear the node down and free its listener ports for a
+  restart in the same runtime. Production-edge only; determinism is unaffected.
 
 ## Tests
 
-No unit tests here; the seam is exercised end-to-end through `custos-sim`.
-`cargo test -p custos-sim`.
+The seam is exercised end-to-end through `custos-sim` (`cargo test -p
+custos-sim`). One `ProdEnv` unit test (`prod::tests`, real temp dir) asserts a
+nested `"sub/dir/file"` `append`+`sync`+`read` round-trips — i.e. the disk
+creates parent directories. `cargo test -p custos-env`.

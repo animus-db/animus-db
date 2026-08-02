@@ -132,6 +132,7 @@ async fn run_single(
     );
     println!("custosd: ready — Ctrl-C to stop");
     wait_for_ctrl_c().await;
+    node.shutdown();
     Ok(())
 }
 
@@ -165,6 +166,9 @@ async fn run_in_process_cluster(
     }
     println!("custosd: ready — Ctrl-C to stop");
     wait_for_ctrl_c().await;
+    for node in &nodes {
+        node.shutdown();
+    }
     Ok(())
 }
 

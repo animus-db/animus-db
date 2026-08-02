@@ -213,6 +213,15 @@ impl BoundNode {
         self.data_env.set_peers(peers.clone());
         self.coord_env.set_peers(peers);
 
+        // Keep clones of the three internal envs so [`Node::shutdown`] can abort
+        // every task they own (Raft driver, replica serve loop, accept loops),
+        // freeing their listener ports for a restart.
+        let envs = [
+            self.control_env.clone(),
+            self.data_env.clone(),
+            self.coord_env.clone(),
+        ];
+
         let raft = RaftNode::start(self.control_env, control_ids.clone());
         // The data replica's durable store. The on-disk LSM does its disk I/O
         // through a *clone* of the data env's handle (the env is node-scoped, so
@@ -236,12 +245,15 @@ impl BoundNode {
         let coordinator = DataClient::new(self.coord_env);
 
         // Bootstrap: whichever node is leader registers membership + the tablet
-        // (idempotent).
+        // (idempotent). Track the client-facing task handles so `shutdown` can
+        // abort them and release the client/dynamo/cql listener ports (these run
+        // on plain `tokio::spawn`, off the `Env` network).
+        let mut tasks = Vec::with_capacity(4);
         {
             let raft = raft.clone();
             let members = control_ids.clone();
             let data_ids = data_ids.clone();
-            tokio::spawn(bootstrap(raft, members, data_ids));
+            tasks.push(tokio::spawn(bootstrap(raft, members, data_ids)));
         }
 
         // Client request server + DynamoDB HTTP + CQL endpoints share one
@@ -254,14 +266,22 @@ impl BoundNode {
                 r,
                 w,
             };
-            tokio::spawn(serve_clients(self.client_listener, ctx.clone()));
-            tokio::spawn(dynamo::serve(self.dynamo_listener, ctx.clone()));
-            tokio::spawn(cql::serve(self.cql_listener, ctx));
+            tasks.push(tokio::spawn(serve_clients(
+                self.client_listener,
+                ctx.clone(),
+            )));
+            tasks.push(tokio::spawn(dynamo::serve(
+                self.dynamo_listener,
+                ctx.clone(),
+            )));
+            tasks.push(tokio::spawn(cql::serve(self.cql_listener, ctx)));
         }
 
         Ok(Node {
             raft,
             _replica: replica,
+            envs,
+            tasks,
             client_addr: self.client_addr,
             dynamo_addr: self.dynamo_addr,
             cql_addr: self.cql_addr,
@@ -276,6 +296,13 @@ pub struct Node {
     /// (`LsmEngine` or `MemoryEngine`) is chosen at runtime. Kept alive so the
     /// replica's serve loop keeps running for the life of the node.
     _replica: Box<dyn std::any::Any + Send + Sync>,
+    /// The node's three internal `ProdEnv` roles (control/data/coord), kept so
+    /// [`shutdown`](Node::shutdown) can abort every task they own and free their
+    /// listener ports.
+    envs: [ProdEnv; 3],
+    /// The client-facing listener tasks (client TCP / dynamo HTTP / cql), which
+    /// run on plain `tokio::spawn` off the `Env` network; aborted on shutdown.
+    tasks: Vec<tokio::task::JoinHandle<()>>,
     client_addr: SocketAddr,
     dynamo_addr: SocketAddr,
     cql_addr: SocketAddr,
@@ -349,6 +376,24 @@ impl Node {
     /// This node's cached cluster metadata.
     pub fn metadata(&self) -> Metadata {
         self.raft.metadata()
+    }
+
+    /// Gracefully stop the node: abort its client-facing listeners (client /
+    /// dynamo / cql) and every task its three internal `ProdEnv` roles own (the
+    /// Raft driver, the replica serve loop, and the internal accept loops). This
+    /// releases all six listener ports so a replacement node can rebind the same
+    /// addresses on the same data directory — the clean teardown a stopped OS
+    /// process would otherwise provide. Idempotent.
+    ///
+    /// On-disk state is unaffected: a value already acked to a client was synced
+    /// to the data replica's LSM WAL before the ack, so it survives the restart.
+    pub fn shutdown(&self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+        for env in &self.envs {
+            env.shutdown();
+        }
     }
 }
 

@@ -225,8 +225,12 @@ async fn handle_msg<S: StorageEngine>(
             // Per-key last-writer-wins: `merge` applies iff this version is
             // newer for the key, so a write superseded by a higher-versioned
             // one is an accepted no-op and concurrent coordinators converge.
-            let _ = storage.merge(&key, &value, version).await;
-            vec![DataMsg::WriteAck { req, ok: true }]
+            // An ack must mean the write durably applied: a no-op merge
+            // (superseded, `Ok(false)`) is still success, but a storage `Err`
+            // means we did NOT persist, so reply `ok: false` and the
+            // coordinator does not count us toward the W quorum.
+            let ok = storage.merge(&key, &value, version).await.is_ok();
+            vec![DataMsg::WriteAck { req, ok }]
         }
         DataMsg::Delete {
             req,
@@ -240,8 +244,10 @@ async fn handle_msg<S: StorageEngine>(
             }
             // Per-key LWW tombstone: superseded by a higher-versioned write or
             // delete, so concurrent coordinators converge regardless of order.
-            let _ = storage.merge_tombstone(&key, version).await;
-            vec![DataMsg::DeleteAck { req, ok: true }]
+            // As with `Write`, an ack must mean the tombstone durably applied:
+            // a superseded no-op is success, a storage `Err` is `ok: false`.
+            let ok = storage.merge_tombstone(&key, version).await.is_ok();
+            vec![DataMsg::DeleteAck { req, ok }]
         }
         DataMsg::Read {
             req,

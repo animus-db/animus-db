@@ -35,6 +35,12 @@ struct Inner {
     peers: StdMutex<BTreeMap<NodeId, SocketAddr>>,
     data_dir: PathBuf,
     inbox: Mutex<mpsc::UnboundedReceiver<Envelope>>,
+    /// Abort handles for every task this env owns — the inbound-connection
+    /// accept loop and everything spawned through [`Spawner::spawn`] (the Raft
+    /// driver, the replica serve loop, etc.). [`shutdown`](ProdEnv::shutdown)
+    /// aborts them all so the node can be torn down and its listener port
+    /// freed.
+    tasks: StdMutex<Vec<tokio::task::AbortHandle>>,
 }
 
 impl ProdEnv {
@@ -61,7 +67,7 @@ impl ProdEnv {
 
         // Accept loop: one reader task per inbound connection, each demuxing
         // length-prefixed frames into the shared inbox.
-        tokio::spawn(async move {
+        let accept = tokio::spawn(async move {
             loop {
                 match listener.accept().await {
                     Ok((stream, _addr)) => {
@@ -87,6 +93,7 @@ impl ProdEnv {
                 peers: StdMutex::new(BTreeMap::new()),
                 data_dir,
                 inbox: Mutex::new(rx),
+                tasks: StdMutex::new(vec![accept.abort_handle()]),
             }),
         };
         Ok((env, local_addr))
@@ -98,9 +105,30 @@ impl ProdEnv {
         *self.inner.peers.lock().expect("peers poisoned") = peers;
     }
 
+    /// Abort every task this env owns — its inbound-connection accept loop and
+    /// everything spawned through [`Spawner::spawn`] — so the node can be torn
+    /// down cleanly and its listener port freed for a restart. Idempotent; once
+    /// called, this env should no longer be used to spawn or receive.
+    pub fn shutdown(&self) {
+        let handles = std::mem::take(&mut *self.inner.tasks.lock().expect("tasks poisoned"));
+        for h in handles {
+            h.abort();
+        }
+    }
+
     fn path(&self, file: &str) -> PathBuf {
         self.inner.data_dir.join(file)
     }
+}
+
+/// Ensure the parent directory of `path` exists, so opening a file whose name
+/// carries a subdirectory prefix (e.g. `"db/wal"`) creates the intervening
+/// directories instead of silently failing on a missing parent.
+async fn ensure_parent(path: &std::path::Path) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    Ok(())
 }
 
 /// Read length-prefixed `[from: u64][len: u32][payload]` frames until EOF.
@@ -191,10 +219,12 @@ async fn send_frame(addr: SocketAddr, from: NodeId, payload: &[u8]) -> std::io::
 #[async_trait::async_trait]
 impl Disk for ProdEnv {
     async fn append(&self, file: &str, bytes: &[u8]) -> std::io::Result<()> {
+        let path = self.path(file);
+        ensure_parent(&path).await?;
         let mut f = tokio::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(self.path(file))
+            .open(&path)
             .await?;
         f.write_all(bytes).await?;
         Ok(())
@@ -259,6 +289,7 @@ impl Disk for ProdEnv {
         // Write a temp file, fsync it, then atomically rename over the target.
         let target = self.path(file);
         let tmp = self.path(&format!("{file}.tmp"));
+        ensure_parent(&target).await?;
         {
             let mut f = tokio::fs::File::create(&tmp).await?;
             f.write_all(bytes).await?;
@@ -270,12 +301,60 @@ impl Disk for ProdEnv {
 
 impl Spawner for ProdEnv {
     fn spawn(&self, fut: crate::BoxFuture<'static, ()>) {
-        tokio::spawn(fut);
+        // Register the handle so [`ProdEnv::shutdown`] can abort the task on
+        // teardown (the Raft driver, the replica serve loop, etc.).
+        let handle = tokio::spawn(fut);
+        self.inner
+            .tasks
+            .lock()
+            .expect("tasks poisoned")
+            .push(handle.abort_handle());
     }
 }
 
 impl Env for ProdEnv {
     fn node_id(&self) -> NodeId {
         self.inner.node_id
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Disk;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// A unique temp directory for one test (no extra deps): the system temp dir
+    /// plus pid + a process-local counter. Removed at the end of the test.
+    fn unique_tmp_dir() -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("custos-prodenv-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    /// `append` + `sync` + `read` of a file whose name carries a subdirectory
+    /// prefix (`"sub/dir/file"`) round-trips: `ProdEnv` creates the intervening
+    /// directories rather than silently failing on a missing parent.
+    #[tokio::test]
+    async fn disk_creates_parent_dirs_for_nested_file() {
+        let dir = unique_tmp_dir();
+        let (env, _addr) = ProdEnv::bind(0, "127.0.0.1:0".parse().unwrap(), &dir)
+            .await
+            .expect("bind");
+
+        let file = "sub/dir/file";
+        let payload = b"durable-nested-bytes";
+        env.append(file, payload).await.expect("append nested");
+        env.sync(file).await.expect("sync nested");
+
+        let got = env.read(file).await.expect("read nested");
+        assert_eq!(got, payload, "nested append/sync/read must round-trip");
+
+        // The nested directories really exist on disk.
+        assert!(dir.join("sub/dir/file").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
