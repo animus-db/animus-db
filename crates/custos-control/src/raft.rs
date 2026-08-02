@@ -110,9 +110,18 @@ pub enum RaftMsg {
         last_index: u64,
         next_offset: u64,
     },
+    /// A liveness heartbeat from a cluster member (ADR 0012). It carries **no
+    /// Raft term** and is *not* consensus traffic: the node driver intercepts it
+    /// to feed the failure detector and never hands it to the [`RaftCore`]. It
+    /// rides the same `RaftMsg` wire enum (and thus the single per-node inbox) so
+    /// a member needs only one message channel to the control group.
+    Heartbeat { node: NodeId },
 }
 
 impl RaftMsg {
+    /// The Raft term carried by this message. A [`Heartbeat`](RaftMsg::Heartbeat)
+    /// is not consensus traffic and carries none, so it reports 0 (never forcing a
+    /// step-down); the driver intercepts heartbeats before the core sees one.
     fn term(&self) -> u64 {
         match self {
             RaftMsg::RequestVote { term, .. }
@@ -121,6 +130,7 @@ impl RaftMsg {
             | RaftMsg::AppendEntriesResp { term, .. }
             | RaftMsg::InstallSnapshot { term, .. }
             | RaftMsg::InstallSnapshotResp { term, .. } => *term,
+            RaftMsg::Heartbeat { .. } => 0,
         }
     }
 }
@@ -554,6 +564,10 @@ impl RaftCore {
                 last_index,
                 next_offset,
             } => self.handle_install_snapshot_resp(from, term, last_index, next_offset),
+            // Heartbeats are intercepted by the driver and fed to the failure
+            // detector (ADR 0012); they are not consensus traffic, so the core
+            // ignores any that reach it.
+            RaftMsg::Heartbeat { .. } => Vec::new(),
         }
     }
 

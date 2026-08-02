@@ -12,12 +12,16 @@
 //! - [`meta`] — the replicated state machine: [`Metadata`], [`MetaCommand`].
 //! - [`raft`] — the synchronous [`RaftCore`] consensus state machine.
 //! - [`node`] — [`RaftNode`], the `Env`-driven node wrapping the core.
+//! - [`detector`] — the pure [`FailureDetector`] (ADR 0012): heartbeat-based
+//!   liveness, driven by the leader to mark members `Down`/`Active` automatically.
 
+pub mod detector;
 pub mod meta;
 pub mod node;
 pub mod persist;
 pub mod raft;
 
+pub use detector::{FailureDetector, Liveness};
 pub use meta::{ApplyOutcome, Member, MetaCommand, Metadata, NodeStatus};
 pub use node::RaftNode;
 pub use persist::{PersistedState, WalRecord};

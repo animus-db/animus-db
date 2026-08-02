@@ -8,7 +8,8 @@ use std::time::Duration;
 use custos_env::{Env, EnvExt, NodeId};
 use futures::future::{Either, select};
 
-use crate::meta::{MetaCommand, Metadata};
+use crate::detector::FailureDetector;
+use crate::meta::{Member, MetaCommand, Metadata, NodeStatus};
 use crate::persist::PersistedState;
 use crate::raft::{ProposeResult, RaftCore, RaftMsg, Role};
 
@@ -25,11 +26,30 @@ const SNAPSHOT_THRESHOLD: u64 = 64;
 /// reconciliation is a slow background activity, not on any request path.
 const RECONCILE_INTERVAL: Duration = Duration::from_millis(500);
 
-/// A running control-plane node. Cheap to clone; clones share one [`RaftCore`].
+/// How often a member emits a liveness heartbeat to the control group
+/// (ADR 0012). On the order of the Raft heartbeat interval, and short relative to
+/// [`DETECT_TIMEOUT`] so a live member is comfortably seen within the window.
+pub const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(100);
+
+/// How long the leader tolerates silence from a member before marking it `Down`
+/// (ADR 0012). Several heartbeat intervals, so a single delayed/dropped heartbeat
+/// does not flap a healthy member.
+pub const DETECT_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// How often the leader re-evaluates member liveness and proposes any
+/// `UpsertMember{status}` transitions (ADR 0012).
+const DETECT_INTERVAL: Duration = Duration::from_millis(100);
+
+/// A running control-plane node. Cheap to clone; clones share one [`RaftCore`]
+/// and one [`FailureDetector`].
 #[derive(Clone)]
 pub struct RaftNode<E: Env> {
     env: E,
     core: Arc<Mutex<RaftCore>>,
+    /// Shared heartbeat failure detector (ADR 0012). The driver feeds it observed
+    /// heartbeats; the `detect_loop` reads it and, when leader, proposes liveness
+    /// transitions. Shared so both run against one view.
+    detector: Arc<Mutex<FailureDetector>>,
 }
 
 impl<E: Env> RaftNode<E> {
@@ -42,15 +62,26 @@ impl<E: Env> RaftNode<E> {
             env.now(),
             env.next_u64(),
         )));
+        let detector = Arc::new(Mutex::new(FailureDetector::new(DETECT_TIMEOUT)));
         let node = Self {
             env: env.clone(),
             core: Arc::clone(&core),
+            detector: Arc::clone(&detector),
         };
-        env.spawn_task(drive(env.clone(), Arc::clone(&core), all_nodes));
+        env.spawn_task(drive(
+            env.clone(),
+            Arc::clone(&core),
+            Arc::clone(&detector),
+            all_nodes,
+        ));
         // The placement reconciler runs alongside the driver; it only ever
         // *proposes* on the core (no I/O of its own), and proposals are honored
         // only when this node is leader — so it is safe to run on every node.
-        env.spawn_task(reconcile_loop(env.clone(), core));
+        env.spawn_task(reconcile_loop(env.clone(), Arc::clone(&core)));
+        // The failure detector evaluates member liveness on a timer and, when
+        // leader, proposes `UpsertMember` transitions (ADR 0012). Like the
+        // reconciler it only *proposes*, so it is safe to run on every node.
+        env.spawn_task(detect_loop(env.clone(), core, detector));
         node
     }
 
@@ -106,15 +137,58 @@ impl<E: Env> RaftNode<E> {
         self.lock().snapshot_index()
     }
 
+    /// Whether this node's failure detector currently judges `member` alive
+    /// (a heartbeat seen within the timeout). Observability for tests; the
+    /// authoritative liveness lives in the replicated `Metadata` status, which
+    /// the leader drives from this verdict.
+    pub fn believes_alive(&self, member: NodeId) -> bool {
+        self.detector
+            .lock()
+            .expect("detector poisoned")
+            .is_alive(member, self.env.now())
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, RaftCore> {
         self.core.lock().expect("raft core poisoned")
+    }
+}
+
+/// Emit a liveness heartbeat (ADR 0012) from this `env`'s node to every node in
+/// `control`, once. A member spawns [`heartbeat_loop`] (which calls this on a
+/// timer) so the control-plane leader can detect its failure. Sends are
+/// fire-and-forget over the `Env` network; a partitioned/crashed member's
+/// heartbeats are simply not delivered, which is exactly what the detector keys
+/// off.
+pub async fn send_heartbeat<E: Env>(env: &E, control: &[NodeId]) {
+    let msg = RaftMsg::Heartbeat {
+        node: env.node_id(),
+    };
+    let bytes = serde_json::to_vec(&msg).expect("heartbeat serializes");
+    for &c in control {
+        env.send(c, bytes.clone()).await;
+    }
+}
+
+/// A member's heartbeat loop: every [`HEARTBEAT_INTERVAL`] of `Env` time, send a
+/// heartbeat to every control node. Run by a (data-plane) member node so the
+/// control plane can detect its liveness; stop it (e.g. `Simulator::stop`) or
+/// partition the member to simulate a failure.
+pub async fn heartbeat_loop<E: Env>(env: E, control: Vec<NodeId>) {
+    loop {
+        send_heartbeat(&env, &control).await;
+        env.sleep(HEARTBEAT_INTERVAL).await;
     }
 }
 
 /// The per-node driver loop: recover durable state, then repeatedly wait for the
 /// next message or timer, hand it to the core, persist the resulting durable
 /// changes, and ship whatever the core wants sent.
-async fn drive<E: Env>(env: E, core: Arc<Mutex<RaftCore>>, all_nodes: Vec<NodeId>) {
+async fn drive<E: Env>(
+    env: E,
+    core: Arc<Mutex<RaftCore>>,
+    detector: Arc<Mutex<FailureDetector>>,
+    all_nodes: Vec<NodeId>,
+) {
     // Recover from the WAL before serving anything.
     let bytes = env.read(WAL).await.unwrap_or_default();
     let state = PersistedState::replay(PersistedState::decode(&bytes));
@@ -136,6 +210,17 @@ async fn drive<E: Env>(env: E, core: Arc<Mutex<RaftCore>>, all_nodes: Vec<NodeId
             Either::Left((envelope, _)) => {
                 let entropy = env.next_u64();
                 match serde_json::from_slice::<RaftMsg>(&envelope.payload) {
+                    // A heartbeat is not consensus traffic (ADR 0012): record it
+                    // in the failure detector and don't hand it to the core. The
+                    // `now` we observe at is `Env`-supplied, so the recorded
+                    // instant is deterministic.
+                    Ok(RaftMsg::Heartbeat { node }) => {
+                        detector
+                            .lock()
+                            .expect("detector poisoned")
+                            .observe(node, env.now());
+                        Vec::new()
+                    }
                     Ok(msg) => core.lock().expect("raft core poisoned").handle(
                         envelope.from,
                         msg,
@@ -195,6 +280,85 @@ async fn reconcile_loop<E: Env>(env: E, core: Arc<Mutex<RaftCore>>) {
             // non-leader `propose` is dropped.
             core.lock().expect("raft core poisoned").propose(command);
         }
+    }
+}
+
+/// The leader's failure detector (ADR 0012): on a timer, if this node is leader,
+/// compare each tracked member's heartbeat liveness against its replicated
+/// status and propose an `UpsertMember{status}` transition for any whose
+/// liveness changed.
+///
+/// The **decision** is the pure [`FailureDetector`] verdict, taken at an
+/// `Env`-supplied `now`; this driver supplies only timing (over the `Env` seam)
+/// and the propose — mirroring the placement reconciler. It is **idempotent**: a
+/// member already at the status its liveness implies yields no proposal, so a
+/// steady cluster produces no churn and there is no flapping at the status level
+/// (the detector's `timeout` absorbs a single delayed/dropped heartbeat). Once
+/// committed, a `Down` transition is exactly what the placement reconciler reacts
+/// to (ADR 0005), so a detected failure cascades into tablet re-placement.
+///
+/// Only members the detector *tracks* (have heartbeated at least once) are
+/// judged, so a freshly-registered member is never marked `Down` before its
+/// first heartbeat. `Joining`/`Leaving` members are left alone — their lifecycle
+/// is operator-driven, not liveness-driven.
+async fn detect_loop<E: Env>(
+    env: E,
+    core: Arc<Mutex<RaftCore>>,
+    detector: Arc<Mutex<FailureDetector>>,
+) {
+    loop {
+        env.sleep(DETECT_INTERVAL).await;
+        let proposals = {
+            let core = core.lock().expect("raft core poisoned");
+            if !core.is_leader() {
+                continue;
+            }
+            let meta = core.metadata();
+            let now = env.now();
+            liveness_transitions(&meta, &detector.lock().expect("detector poisoned"), now)
+        };
+        for command in proposals {
+            core.lock().expect("raft core poisoned").propose(command);
+        }
+    }
+}
+
+/// Pure helper: the `UpsertMember` transitions needed to bring each tracked
+/// member's replicated status in line with the detector's liveness verdict at
+/// `now`. Returns commands only for members whose status would actually change
+/// (idempotent), in ascending node-id order (the detector iterates a `BTreeMap`),
+/// so the result is a deterministic function of `(meta, detector, now)`.
+fn liveness_transitions(
+    meta: &Metadata,
+    detector: &FailureDetector,
+    now: custos_env::Nanos,
+) -> Vec<MetaCommand> {
+    detector
+        .evaluate(now)
+        .into_iter()
+        .filter_map(|l| {
+            let member = meta.members.get(&l.node)?;
+            let desired = match (member.status, l.alive) {
+                // A live member believed dead recovers to `Active`.
+                (NodeStatus::Down, true) => NodeStatus::Active,
+                // A silent member believed alive is marked `Down`.
+                (NodeStatus::Active, false) => NodeStatus::Down,
+                // Already consistent, or a status we don't drive
+                // (`Joining`/`Leaving`): nothing to propose.
+                _ => return None,
+            };
+            Some(transition(l.node, member, desired))
+        })
+        .collect()
+}
+
+/// Build an `UpsertMember` that changes only `member`'s status, preserving its
+/// topology labels (so a liveness transition never disturbs residency/spread).
+fn transition(node: NodeId, member: &Member, status: NodeStatus) -> MetaCommand {
+    MetaCommand::UpsertMember {
+        node,
+        labels: member.labels.clone(),
+        status,
     }
 }
 

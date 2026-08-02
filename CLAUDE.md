@@ -13,7 +13,9 @@ Status: pre-alpha. Implemented: the scaffold, the `Env` seam, storage (in-memory
 plus a **custom on-disk `LsmEngine`** — a real WAL + SSTable +
 compaction LSM doing all I/O through the `Env` disk seam, so it is deterministically
 crash-tested under `SimEnv`), the control-plane Raft (WAL durability + recovery +
-log-truncating snapshots with `InstallSnapshot`),
+log-truncating snapshots with `InstallSnapshot`, plus **heartbeat-based failure
+detection** that auto-marks members `Down`/`Active` and cascades into placement
+re-reconciliation — ADR 0012),
 the quorum data-plane vertical slice (with read-repair, background
 anti-entropy convergence via segment-digest exchange of only divergent ranges,
 delete/tombstone propagation, and residency-bounded repair), tablet split/merge
@@ -179,6 +181,16 @@ caught up via a **chunked** `InstallSnapshot` (offset-addressed chunks of
 `SNAPSHOT_CHUNK_BYTES`, reassembled and installed atomically by the follower);
 recovery restores the snapshot and re-applies the tail. Restart-and-rejoin is
 tested end-to-end via `Simulator::stop` (`custos-control/tests/restart.rs`).
+
+The control plane also runs **heartbeat-based failure detection** (ADR 0012):
+members heartbeat the control group on an `Env` timer (`RaftMsg::Heartbeat`,
+intercepted by the driver and fed to a pure `FailureDetector` — never the
+consensus core), and the leader's `detect_loop` proposes `UpsertMember{Down}`
+when a member falls silent past a timeout and `{Active}` when it recovers
+(idempotent, no flapping). Because the placement reconciler already reacts to
+`Down`, a detected failure **cascades** into automatic tablet re-placement —
+proven end-to-end (crash → `Down` → reconcile → restart → `Active`) in
+`custos-control/tests/failure_detection.rs`.
 
 ### Data plane (`custos-data`)
 

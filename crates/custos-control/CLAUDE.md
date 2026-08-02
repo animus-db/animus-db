@@ -21,7 +21,13 @@ epoch compare-and-swap transactions.
 - `persist.rs` — `WalRecord`, `PersistedState` (durability/recovery). The WAL
   write/compact/recover flow is diagrammed in `docs/wal.md`.
 - `node.rs` — `RaftNode<E>`: the `Env` driver wrapping the core, plus
-  `reconcile_loop` (the leader's automatic placement reconciler).
+  `reconcile_loop` (the leader's automatic placement reconciler) and
+  `detect_loop` (the leader's failure detector, ADR 0012). Also the
+  `heartbeat_loop`/`send_heartbeat` helpers a member runs to heartbeat the
+  control group.
+- `detector.rs` — `FailureDetector` (ADR 0012): a **pure**, unit-tested
+  interval+timeout liveness detector — last-heartbeat instants + `now` + a
+  `timeout` decide alive/dead. No clock, no RNG.
 
 ## What's non-obvious
 
@@ -58,6 +64,18 @@ epoch compare-and-swap transactions.
   driver and the *decision* pure — don't put a clock or RNG in `reconcile`, and
   don't reconcile off-leader (a non-leader `propose` is dropped; a stale CAS is
   epoch-rejected). `custos-placement` is a **normal** dependency now (no cycle).
+- **Automatic failure detection (ADR 0012).** Members heartbeat the control group
+  (`heartbeat_loop` → `RaftMsg::Heartbeat`, a term-less message the driver
+  **intercepts** in its `recv` arm and feeds to the shared `FailureDetector` —
+  the core never sees it). The decision is the pure `FailureDetector` (in
+  `detector.rs`); the **leader** drives it: `detect_loop` ticks on an `Env` timer
+  and proposes `UpsertMember{Active/Down}` for any tracked member whose liveness
+  changed (`liveness_transitions`, idempotent — preserves labels, skips
+  `Joining`/`Leaving`, only judges members that have heartbeated). A committed
+  `Down` is what the placement reconciler already reacts to, so a detected failure
+  **cascades** into re-placement. Keep timing in the driver and the decision pure
+  — don't put a clock/RNG in the detector. Detector state is per-node volatile (a
+  new leader re-learns over one `timeout`); only the transitions are replicated.
 - Commit advances only for **current-term** entries via majority `matchIndex`
   (the Raft safety rule). Don't relax this.
 - Snapshot transfer is **chunked** (see above). Deferred: cross-leader resumption
@@ -75,5 +93,8 @@ plus a far-behind follower catching up via a **multi-chunk** `InstallSnapshot`
 `Simulator::stop`), caller-driven placement reconcile through Raft under a
 replica death + follower crash (`placement_reconcile.rs`, driving
 `custos-placement`), and **leader-driven automatic** reconcile from a replicated
-policy (`placement_auto_reconcile.rs` — no test-side `replan`/CAS). Use
-`run_for`, never `run()` (perpetual heartbeats).
+policy (`placement_auto_reconcile.rs` — no test-side `replan`/CAS), and
+**heartbeat-based failure detection** end to end (`failure_detection.rs`, ADR
+0012 — a member crashes, the leader auto-commits `Down`, placement reconciles off
+it, then the member restarts and returns to `Active`; plus detector unit tests in
+`detector.rs`). Use `run_for`, never `run()` (perpetual heartbeats).
