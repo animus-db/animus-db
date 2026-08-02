@@ -31,7 +31,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use animus_env::{Env, EnvExt, NodeId};
+use animus_env::{Env, EnvExt, Metric, MetricsHandle, NodeId};
 use animus_tablet::{Epoch, TabletId};
 
 use crate::DataMsg;
@@ -156,6 +156,10 @@ impl HintStore {
     /// forbids the target (residency, ADR 0005). Per-key LWW: a stored hint is
     /// overwritten only by a version at least as new for the same
     /// `(target, tablet, key)`, so a stale hint never clobbers a fresher one.
+    ///
+    /// Returns whether a hint was actually stored (residency-admitted *and* it
+    /// superseded any prior hint for the key), so the caller can count it
+    /// (ADR 0015) without re-deriving the residency/LWW decision.
     pub(crate) fn record(
         &self,
         allowed: &AllowedTargets,
@@ -163,9 +167,9 @@ impl HintStore {
         tablet: TabletId,
         epoch: Epoch,
         entry: crate::SyncEntry,
-    ) {
+    ) -> bool {
         if !target_allowed(allowed, target) {
-            return;
+            return false;
         }
         let (key, value, version) = entry;
         let mut map = self.inner.lock().expect("hint store poisoned");
@@ -182,6 +186,7 @@ impl HintStore {
             );
             enforce_bounds(&mut map, target, &self.limits);
         }
+        supersedes
     }
 
     /// The distinct targets that currently have at least one pending hint, sorted
@@ -375,6 +380,23 @@ pub fn serve_hint_handoff<E>(env: E, store: HintStore, allowed: AllowedTargets, 
 where
     E: Env,
 {
+    let metrics = env.metrics();
+    serve_hint_handoff_with_metrics(env, store, allowed, interval, metrics);
+}
+
+/// Like [`serve_hint_handoff`], but records `data_hints_delivered` (ADR 0015)
+/// into `metrics` rather than `env.metrics()`. Additive and observe-only — it
+/// changes no handoff behavior. A sim test threads a recording handle here to
+/// read the counter back (`SimEnv::metrics()` is the no-op default).
+pub fn serve_hint_handoff_with_metrics<E>(
+    env: E,
+    store: HintStore,
+    allowed: AllowedTargets,
+    interval: Duration,
+    metrics: MetricsHandle,
+) where
+    E: Env,
+{
     env.clone().spawn_task(async move {
         loop {
             env.sleep(interval).await;
@@ -389,6 +411,9 @@ where
                 if probe(&env, target, interval).await {
                     let batches = store.drain_target(target);
                     let delivered = replay(&env, target, &batches).await;
+                    if delivered && !batches.is_empty() {
+                        metrics.incr(Metric::DataHintsDelivered);
+                    }
                     if !delivered {
                         store.restore(target, &batches);
                     }
@@ -429,6 +454,27 @@ pub fn serve_hint_replay<E>(env: E, store: HintStore, allowed: AllowedTargets, i
 where
     E: Env,
 {
+    let metrics = env.metrics();
+    serve_hint_replay_with_metrics(env, store, allowed, interval, metrics);
+}
+
+/// Like [`serve_hint_replay`], but records `data_hints_delivered` (ADR 0015) into
+/// `metrics` rather than `env.metrics()`. Each round that actually re-sends a
+/// non-empty batch to a target counts one delivery. Additive and observe-only.
+///
+/// Note this is a *send-only* loop (no `ProbeAck` to confirm receipt), so a
+/// "delivery" here means the `Sync` was emitted on the wire — a still-down target
+/// will be re-sent (and re-counted) next round. That is the honest meaning of the
+/// counter for this variant: replay attempts emitted, not acks observed.
+pub fn serve_hint_replay_with_metrics<E>(
+    env: E,
+    store: HintStore,
+    allowed: AllowedTargets,
+    interval: Duration,
+    metrics: MetricsHandle,
+) where
+    E: Env,
+{
     env.clone().spawn_task(async move {
         loop {
             env.sleep(interval).await;
@@ -440,7 +486,10 @@ where
                 // Re-send without draining: a still-down target gets it on a
                 // later round; a superseding write clears it via LWW.
                 let batches = store.snapshot_target(target);
-                replay(&env, target, &batches).await;
+                if !batches.is_empty() {
+                    replay(&env, target, &batches).await;
+                    metrics.incr(Metric::DataHintsDelivered);
+                }
             }
         }
     });

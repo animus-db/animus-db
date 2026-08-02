@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use animus_env::{Env, EnvExt, NodeId};
+use animus_env::{Env, EnvExt, Metric, MetricsHandle, NodeId};
 use animus_storage::StorageEngine;
 use animus_tablet::{Epoch, TabletId};
 
@@ -178,6 +178,26 @@ pub fn serve_anti_entropy<E, S>(
     E: Env,
     S: StorageEngine + 'static,
 {
+    let metrics = env.metrics();
+    serve_anti_entropy_with_metrics(env, handle, tablet, peers, interval, metrics);
+}
+
+/// Like [`serve_anti_entropy`], but records `data_anti_entropy_rounds` (ADR 0015)
+/// into `metrics` rather than `env.metrics()` — one count per round that actually
+/// emits a (non-empty) segment digest to its peers. Additive and observe-only: it
+/// changes no convergence behavior. A sim test threads a recording handle here to
+/// read the counter back (`SimEnv::metrics()` is the no-op default).
+pub fn serve_anti_entropy_with_metrics<E, S>(
+    env: E,
+    handle: ReplicaHandle<S>,
+    tablet: TabletId,
+    peers: Vec<NodeId>,
+    interval: Duration,
+    metrics: MetricsHandle,
+) where
+    E: Env,
+    S: StorageEngine + 'static,
+{
     let me = env.node_id();
     let storage = handle.storage().clone();
     env.clone().spawn_task(async move {
@@ -201,6 +221,8 @@ pub fn serve_anti_entropy<E, S>(
             if segments.is_empty() {
                 continue;
             }
+            // A round that emits a digest to its peers — count it (ADR 0015).
+            metrics.incr(Metric::DataAntiEntropyRounds);
             let msg = DataMsg::SyncDigest {
                 tablet,
                 epoch,

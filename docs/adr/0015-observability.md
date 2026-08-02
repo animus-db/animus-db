@@ -65,6 +65,27 @@ integration; the seam itself does **no** HTTP.
   observes metrics **without changing `animus-sim` at all**. `RaftNode::start`
   forwards `env.metrics()`, so production keeps recording into the env's sink.
 
+- **What the data plane records (ADR 0001/0010/0005).** The leaderless-AP data
+  plane records, all from `Env`-supplied inputs so recording stays a deterministic
+  function of the run, at the real coordinator/replica sites:
+  `data_quorum_writes_attempted`/`_succeeded`/`_failed` and
+  `data_quorum_reads_attempted`/`_succeeded`/`_failed` (the `DataClient`
+  coordinator — a write/delete is a quorum mutation counted under the *write*
+  counters, succeeded iff `W` acked, failed otherwise; a read succeeds iff `R`
+  responded); `data_read_repair_triggered` + `data_read_repair_keys_repaired` (a
+  divergent quorum read pushes the winner back, one repair / one key);
+  `data_hints_stored` (a committed write/delete buffers a residency-admitted hint
+  per unreached replica) + `data_hints_delivered` (a hint-handoff/replay loop
+  re-sends a buffered batch to a returning target); and
+  `data_anti_entropy_rounds` (each background round that emits a non-empty segment
+  digest). Names are `data_*`-prefixed. The coordinator's handle defaults to
+  `env.metrics()`; the background loops (`serve_anti_entropy`,
+  `serve_hint_handoff`, `serve_hint_replay`) gain additive
+  `*_with_metrics` variants (the originals forward `env.metrics()`), so a sim test
+  threads a recording handle in to read counters back without changing `SimEnv`.
+  Recording is observe-only — it changes **no** quorum semantics, and all public
+  signatures stay additive/stable.
+
 - **What the control plane records.** The `RaftNode` driver loops record, all
   from `Env`-supplied or core-derived inputs (so recording is a deterministic
   function of the run): `elections_started`/`elections_won` (from role/term
@@ -78,6 +99,16 @@ integration; the seam itself does **no** HTTP.
 
 ## Consequences
 
+- The data plane is **observable** at runtime with zero determinism risk: every
+  data counter is exercised under the deterministic simulator and asserted to move
+  by the expected amount under a known workload
+  (`animus-data/tests/metrics.rs` — a quorum write+read moves the
+  attempted/succeeded counters; a two-replica crash makes a write fail
+  sub-quorum; an `R=3` read against a deliberately-stale replica triggers exactly
+  one read-repair / one repaired key; a crash-then-return replica buffers a hint
+  and the replay loop delivers it; a seeded replica's anti-entropy loop counts its
+  rounds), and the recorded snapshot is asserted byte-identical across two runs of
+  the same seed.
 - The control plane is **observable** at runtime with zero determinism risk:
   every counter is exercised under the deterministic simulator and asserted to
   move under known events (`animus-control/tests/metrics.rs` — a forced election
@@ -96,7 +127,8 @@ integration; the seam itself does **no** HTTP.
   `RaftNode::metrics().snapshot().to_text()`) from an HTTP `/metrics` handler.
   The exact one-line hook is documented in `docs/getting-started.md`; no HTTP
   lives in `animus-env`.
-- **Deferred:** data-plane and storage-engine counters (read/write quorums,
-  read-repair, anti-entropy, LSM compactions); histograms/latency (would need a
-  deterministic bucketing scheme); and the live `/metrics` HTTP endpoint in
-  `animusd` (the seam and the text export are ready for it).
+- **Deferred:** storage-engine counters (LSM compactions, SSTable reads);
+  histograms/latency (would need a deterministic bucketing scheme); and the live
+  `/metrics` HTTP endpoint in `animusd` (the seam and the text export are ready
+  for it). Data-plane counters (quorum reads/writes, read-repair, hinted handoff,
+  anti-entropy) are now **done** (see the data-plane decision above).

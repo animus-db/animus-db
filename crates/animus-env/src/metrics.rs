@@ -26,13 +26,16 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
-/// The control-plane metrics this seam knows how to record (ADR 0015). Each
-/// variant maps to one slot in the fixed-size [`MetricSink`] array, so recording
-/// is a single atomic op with no map lookup and no allocation.
+/// The metrics this seam knows how to record (ADR 0015) — control-plane Raft and
+/// leaderless-AP data-plane counters. Each variant maps to one slot in the
+/// fixed-size [`MetricSink`] array, so recording is a single atomic op with no
+/// map lookup and no allocation.
 ///
 /// The set is deliberately closed and small: a closed enum keeps recording
 /// O(1)/lock-free and makes the exported names a stable, reviewable surface.
-/// Add a variant (and a row to [`Metric::ALL`]) to instrument something new.
+/// Add a variant (and a row to [`Metric::ALL`]) to instrument something new —
+/// **append** new variants after the existing ones so their array slots and the
+/// text-export order stay stable (the snapshot is byte-reproducible).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Metric {
     /// A leader election was started (a follower/candidate timed out and bumped
@@ -54,12 +57,46 @@ pub enum Metric {
     /// A member's failure-detector verdict transitioned `Down`->`Active` (a
     /// recovery was proposed by the leader, ADR 0012).
     FailureDetectorUp,
+
+    // --- Data plane (ADR 0001/0010/0005, ADR 0015 data-plane extension) ---
+    // Added after the control-plane variants; their array slots follow, so the
+    // existing variants/order/slots stay stable and the export is byte-reproducible.
+    /// A quorum write was attempted by the coordinator (a `Write` broadcast to a
+    /// tablet's replicas).
+    DataQuorumWritesAttempted,
+    /// A quorum write committed: `W` replicas durably acked it.
+    DataQuorumWritesSucceeded,
+    /// A quorum write failed: fewer than `W` replicas acked within the timeout
+    /// (sub-quorum / fenced / down replicas).
+    DataQuorumWritesFailed,
+    /// A quorum read was attempted by the coordinator (a `Read` broadcast).
+    DataQuorumReadsAttempted,
+    /// A quorum read succeeded: `R` replicas responded.
+    DataQuorumReadsSucceeded,
+    /// A quorum read failed: a read quorum could not be reached (sub-quorum /
+    /// fenced / down replicas).
+    DataQuorumReadsFailed,
+    /// A read observed divergent responders and triggered read-repair (one push
+    /// per divergent quorum read).
+    DataReadRepairTriggered,
+    /// Keys pushed back by read-repair (the winning `(value, version)` re-sent to
+    /// the read's participants). One per repaired key.
+    DataReadRepairKeysRepaired,
+    /// A hint was stored for a replica that missed a committed write/delete
+    /// (hinted handoff, ADR 0010). One per `(target, key)` buffered.
+    DataHintsStored,
+    /// A buffered hint batch was replayed to a returning target (a `Sync` of the
+    /// missed entries sent on the handoff/replay path).
+    DataHintsDelivered,
+    /// A background anti-entropy round fired and emitted a segment digest to its
+    /// peers (one per non-empty round, segment-digest exchange).
+    DataAntiEntropyRounds,
 }
 
 impl Metric {
     /// Every metric, in a fixed order. The array index of a metric in `ALL` is
     /// its slot in the [`MetricSink`]; keep this in sync with the enum.
-    pub const ALL: [Metric; 7] = [
+    pub const ALL: [Metric; 18] = [
         Metric::ElectionsStarted,
         Metric::ElectionsWon,
         Metric::AppendEntriesSent,
@@ -67,6 +104,17 @@ impl Metric {
         Metric::SnapshotInstalls,
         Metric::FailureDetectorDown,
         Metric::FailureDetectorUp,
+        Metric::DataQuorumWritesAttempted,
+        Metric::DataQuorumWritesSucceeded,
+        Metric::DataQuorumWritesFailed,
+        Metric::DataQuorumReadsAttempted,
+        Metric::DataQuorumReadsSucceeded,
+        Metric::DataQuorumReadsFailed,
+        Metric::DataReadRepairTriggered,
+        Metric::DataReadRepairKeysRepaired,
+        Metric::DataHintsStored,
+        Metric::DataHintsDelivered,
+        Metric::DataAntiEntropyRounds,
     ];
 
     /// The stable exported name of this metric (snake_case, used as the text
@@ -81,6 +129,17 @@ impl Metric {
             Metric::SnapshotInstalls => "control_snapshot_installs",
             Metric::FailureDetectorDown => "control_failure_detector_down",
             Metric::FailureDetectorUp => "control_failure_detector_up",
+            Metric::DataQuorumWritesAttempted => "data_quorum_writes_attempted",
+            Metric::DataQuorumWritesSucceeded => "data_quorum_writes_succeeded",
+            Metric::DataQuorumWritesFailed => "data_quorum_writes_failed",
+            Metric::DataQuorumReadsAttempted => "data_quorum_reads_attempted",
+            Metric::DataQuorumReadsSucceeded => "data_quorum_reads_succeeded",
+            Metric::DataQuorumReadsFailed => "data_quorum_reads_failed",
+            Metric::DataReadRepairTriggered => "data_read_repair_triggered",
+            Metric::DataReadRepairKeysRepaired => "data_read_repair_keys_repaired",
+            Metric::DataHintsStored => "data_hints_stored",
+            Metric::DataHintsDelivered => "data_hints_delivered",
+            Metric::DataAntiEntropyRounds => "data_anti_entropy_rounds",
         }
     }
 

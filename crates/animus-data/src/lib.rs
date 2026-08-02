@@ -23,8 +23,14 @@ pub mod hint;
 pub mod replica;
 
 pub use client::{DataClient, ReadResult, Router, TabletView};
-pub use hint::{HintLimits, HintStore, serve_hint_handoff, serve_hint_replay};
-pub use replica::{ReplicaHandle, serve_anti_entropy, serve_replica, serve_replica_with_residency};
+pub use hint::{
+    HintLimits, HintStore, serve_hint_handoff, serve_hint_handoff_with_metrics, serve_hint_replay,
+    serve_hint_replay_with_metrics,
+};
+pub use replica::{
+    ReplicaHandle, serve_anti_entropy, serve_anti_entropy_with_metrics, serve_replica,
+    serve_replica_with_residency,
+};
 
 use animus_env::NodeId;
 use animus_tablet::{Epoch, TabletId};
