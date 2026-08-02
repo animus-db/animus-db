@@ -101,6 +101,7 @@ mod bloom;
 mod sstable;
 mod wal;
 
+use bloom::BloomFilter;
 use sstable::{Record, SsTableMeta, SsTableReader, SsTableWriter};
 use wal::GroupCommit;
 
@@ -184,8 +185,12 @@ enum BatchOp {
     DeleteKeys { keys: Vec<Key> },
 }
 
-/// The durable manifest: the live SSTable set plus engine metadata. Serialized
-/// to JSON and written atomically with [`Disk::replace`].
+/// The durable manifest: the live SSTable set plus engine metadata. Encoded with
+/// a **compact binary codec** ([`encode_manifest`]) and written atomically with
+/// [`Disk::replace`] — the single flush/compaction linearization point. The
+/// serde derives remain so a *legacy* JSON manifest (written before the binary
+/// codec) can still be read on open ([`decode_manifest`] falls back to
+/// `serde_json` when the binary magic is absent).
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct Manifest {
     /// Highest sequence number ever allocated to an SSTable file. The next flush
@@ -332,13 +337,13 @@ impl<E: Env> LsmEngine<E> {
         let prefix: Arc<str> = Arc::from(prefix.into());
         let manifest_file = format!("{prefix}MANIFEST");
 
-        // Load the durable manifest (or a fresh empty one).
+        // Load the durable manifest (or a fresh empty one). Decodes the compact
+        // binary format, transparently falling back to a legacy JSON manifest.
         let manifest_bytes = env.read(&manifest_file).await.map_err(io)?;
         let manifest: Manifest = if manifest_bytes.is_empty() {
             Manifest::default()
         } else {
-            serde_json::from_slice(&manifest_bytes)
-                .map_err(|e| StorageError::Backend(format!("corrupt manifest: {e}")))?
+            decode_manifest(&manifest_bytes)?
         };
 
         // Open the SSTables the manifest names (reads their footer + index only).
@@ -809,11 +814,11 @@ impl<E: Env> LsmEngine<E> {
         Ok(())
     }
 
-    /// Atomically persist the manifest. Bumps `max_version` from the live in-
-    /// memory floor first so it is never lost across the swap.
+    /// Atomically persist the manifest using the compact binary codec. The
+    /// `replace` is the single durability linearization point: a crash sees the
+    /// whole old or whole new manifest, never a mix.
     async fn write_manifest(&self, manifest: &Manifest) -> Result<()> {
-        let bytes = serde_json::to_vec(manifest)
-            .map_err(|e| StorageError::Backend(format!("manifest encode: {e}")))?;
+        let bytes = encode_manifest(manifest);
         self.env
             .replace(&self.manifest_file(), &bytes)
             .await
@@ -1357,6 +1362,314 @@ fn decode_wal(bytes: &[u8]) -> Vec<WalRecord> {
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// Compact binary MANIFEST codec
+// ---------------------------------------------------------------------------
+//
+// The manifest is small but written on every flush/compaction, so a compact,
+// dependency-free binary encoding beats JSON on both size and parse cost. The
+// layout is a fixed header followed by length-prefixed records — all integers
+// big-endian (`to_be_bytes`), all byte strings `u32`-length-prefixed:
+//
+//   MAGIC(4 = b"CMF1") | version(u8) | next_seq(u64) | max_version(u64)
+//   | table_count(u32) | table[0] | table[1] | ...
+//
+// One table record (mirrors `SsTableMeta`):
+//   seq(u64) | level(u32)
+//   | min_key: opt_bytes | max_key: opt_bytes
+//   | min_version(u64) | max_version(u64)
+//   | index_offset(u64) | index_len(u64) | file_size(u64)
+//   | has_bloom(u8) | bloom_k(u32) | bloom_bits: bytes | format(u32)
+//
+//   opt_bytes := present(u8) [ len(u32) bytes ]   (present 0 => None)
+//   bytes     := len(u32) bytes
+//
+// Forward-compat: a legacy JSON manifest begins with `{` (0x7B), which can never
+// be our magic's first byte (`C` = 0x43), so `decode_manifest` detects and falls
+// back to `serde_json`. Bumping `MANIFEST_VERSION` lets future binary revisions
+// be distinguished without another format break.
+
+/// Binary manifest magic: "CMF1" (CustosDB ManiFest, format family 1).
+const MANIFEST_MAGIC: [u8; 4] = *b"CMF1";
+/// Binary manifest format version (within the `CMF1` family).
+const MANIFEST_VERSION: u8 = 1;
+
+/// Append a length-prefixed (`u32`) byte string.
+fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
+    out.extend_from_slice(&(b.len() as u32).to_be_bytes());
+    out.extend_from_slice(b);
+}
+
+/// Append an optional length-prefixed byte string (1-byte present flag).
+fn put_opt_bytes(out: &mut Vec<u8>, b: &Option<Vec<u8>>) {
+    match b {
+        Some(v) => {
+            out.push(1);
+            put_bytes(out, v);
+        }
+        None => out.push(0),
+    }
+}
+
+/// Encode a [`Manifest`] in the compact binary format described above.
+fn encode_manifest(m: &Manifest) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&MANIFEST_MAGIC);
+    out.push(MANIFEST_VERSION);
+    out.extend_from_slice(&m.next_seq.to_be_bytes());
+    out.extend_from_slice(&m.max_version.to_be_bytes());
+    out.extend_from_slice(&(m.tables.len() as u32).to_be_bytes());
+    for t in &m.tables {
+        out.extend_from_slice(&t.seq.to_be_bytes());
+        out.extend_from_slice(&t.level.to_be_bytes());
+        put_opt_bytes(&mut out, &t.min_key);
+        put_opt_bytes(&mut out, &t.max_key);
+        out.extend_from_slice(&t.min_version.to_be_bytes());
+        out.extend_from_slice(&t.max_version.to_be_bytes());
+        out.extend_from_slice(&t.index_offset.to_be_bytes());
+        out.extend_from_slice(&t.index_len.to_be_bytes());
+        out.extend_from_slice(&t.file_size.to_be_bytes());
+        out.push(u8::from(t.has_bloom));
+        let (bits, k) = t.bloom.as_parts();
+        out.extend_from_slice(&k.to_be_bytes());
+        put_bytes(&mut out, bits);
+        out.extend_from_slice(&t.format.to_be_bytes());
+    }
+    out
+}
+
+/// A forward-only cursor over manifest bytes, returning a backend error on any
+/// short read (a truncated/corrupt manifest).
+struct Cursor<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Cursor<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, pos: 0 }
+    }
+
+    fn take(&mut self, n: usize) -> Result<&'a [u8]> {
+        if self.pos + n > self.bytes.len() {
+            return Err(StorageError::Backend("truncated manifest".into()));
+        }
+        let s = &self.bytes[self.pos..self.pos + n];
+        self.pos += n;
+        Ok(s)
+    }
+
+    fn u8(&mut self) -> Result<u8> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn u32(&mut self) -> Result<u32> {
+        Ok(u32::from_be_bytes(self.take(4)?.try_into().unwrap()))
+    }
+
+    fn u64(&mut self) -> Result<u64> {
+        Ok(u64::from_be_bytes(self.take(8)?.try_into().unwrap()))
+    }
+
+    fn bytes(&mut self) -> Result<Vec<u8>> {
+        let len = self.u32()? as usize;
+        Ok(self.take(len)?.to_vec())
+    }
+
+    fn opt_bytes(&mut self) -> Result<Option<Vec<u8>>> {
+        match self.u8()? {
+            0 => Ok(None),
+            1 => Ok(Some(self.bytes()?)),
+            other => Err(StorageError::Backend(format!(
+                "bad manifest option flag {other}"
+            ))),
+        }
+    }
+}
+
+/// Decode a [`Manifest`]. Detects the compact binary format by its magic; if the
+/// bytes are instead a legacy JSON manifest (no binary magic), falls back to
+/// `serde_json` so an engine opened on an older directory still recovers.
+fn decode_manifest(bytes: &[u8]) -> Result<Manifest> {
+    if bytes.len() < 4 || bytes[..4] != MANIFEST_MAGIC {
+        // Legacy JSON manifest (pre-binary). Read it for forward-compat.
+        return serde_json::from_slice(bytes)
+            .map_err(|e| StorageError::Backend(format!("corrupt manifest: {e}")));
+    }
+    let mut c = Cursor::new(bytes);
+    let _magic = c.take(4)?;
+    let version = c.u8()?;
+    if version != MANIFEST_VERSION {
+        return Err(StorageError::Backend(format!(
+            "unsupported manifest version {version}"
+        )));
+    }
+    let next_seq = c.u64()?;
+    let max_version = c.u64()?;
+    let table_count = c.u32()? as usize;
+    let mut tables = Vec::with_capacity(table_count);
+    for _ in 0..table_count {
+        let seq = c.u64()?;
+        let level = c.u32()?;
+        let min_key = c.opt_bytes()?;
+        let max_key = c.opt_bytes()?;
+        let min_version = c.u64()?;
+        let tbl_max_version = c.u64()?;
+        let index_offset = c.u64()?;
+        let index_len = c.u64()?;
+        let file_size = c.u64()?;
+        let has_bloom = c.u8()? != 0;
+        let bloom_k = c.u32()?;
+        let bloom_bits = c.bytes()?;
+        let format = c.u32()?;
+        tables.push(SsTableMeta {
+            seq,
+            level,
+            min_key,
+            max_key,
+            min_version,
+            max_version: tbl_max_version,
+            index_offset,
+            index_len,
+            file_size,
+            bloom: BloomFilter::from_parts(bloom_bits, bloom_k),
+            has_bloom,
+            format,
+        });
+    }
+    Ok(Manifest {
+        next_seq,
+        tables,
+        max_version,
+    })
+}
+
 fn io(e: std::io::Error) -> StorageError {
     StorageError::Backend(e.to_string())
+}
+
+#[cfg(test)]
+mod manifest_tests {
+    use super::*;
+
+    fn sample_meta(seq: u64, with_bloom: bool) -> SsTableMeta {
+        let bloom = if with_bloom {
+            BloomFilter::build(&[b"a".as_slice(), b"bbb".as_slice(), b"cc".as_slice()])
+        } else {
+            BloomFilter::default()
+        };
+        SsTableMeta {
+            seq,
+            level: (seq % 3) as u32,
+            min_key: Some(format!("min-{seq}").into_bytes()),
+            max_key: Some(format!("max-{seq}").into_bytes()),
+            min_version: seq * 10,
+            max_version: seq * 10 + 5,
+            index_offset: seq * 1000,
+            index_len: 42,
+            file_size: seq * 2000,
+            bloom,
+            has_bloom: with_bloom,
+            format: 2,
+        }
+    }
+
+    /// The binary codec is an exact round trip across an empty manifest and one
+    /// with several tables (with and without a bloom, and an empty-key table).
+    #[test]
+    fn binary_manifest_round_trips() {
+        for m in [
+            Manifest::default(),
+            Manifest {
+                next_seq: 7,
+                max_version: 1234,
+                tables: vec![
+                    sample_meta(1, true),
+                    sample_meta(2, false),
+                    SsTableMeta {
+                        min_key: None,
+                        max_key: None,
+                        has_bloom: false,
+                        bloom: BloomFilter::default(),
+                        ..sample_meta(3, false)
+                    },
+                ],
+            },
+        ] {
+            let bytes = encode_manifest(&m);
+            // Binary, not JSON: starts with our magic.
+            assert_eq!(&bytes[..4], &MANIFEST_MAGIC);
+            let back = decode_manifest(&bytes).expect("decode");
+            assert_eq!(back.next_seq, m.next_seq);
+            assert_eq!(back.max_version, m.max_version);
+            assert_eq!(back.tables.len(), m.tables.len());
+            for (a, b) in m.tables.iter().zip(&back.tables) {
+                assert_eq!(a.seq, b.seq);
+                assert_eq!(a.level, b.level);
+                assert_eq!(a.min_key, b.min_key);
+                assert_eq!(a.max_key, b.max_key);
+                assert_eq!(a.min_version, b.min_version);
+                assert_eq!(a.max_version, b.max_version);
+                assert_eq!(a.index_offset, b.index_offset);
+                assert_eq!(a.index_len, b.index_len);
+                assert_eq!(a.file_size, b.file_size);
+                assert_eq!(a.has_bloom, b.has_bloom);
+                assert_eq!(a.format, b.format);
+                // Bloom round-trips bit-for-bit: same membership answers.
+                assert_eq!(a.bloom.may_contain(b"a"), b.bloom.may_contain(b"a"));
+                assert_eq!(a.bloom.as_parts(), b.bloom.as_parts());
+            }
+        }
+    }
+
+    /// The binary encoding is materially smaller than the old JSON encoding for a
+    /// representative manifest (the point of the change).
+    #[test]
+    fn binary_is_smaller_than_json() {
+        let m = Manifest {
+            next_seq: 20,
+            max_version: 99_999,
+            tables: (1..=12).map(|s| sample_meta(s, true)).collect(),
+        };
+        let bin = encode_manifest(&m);
+        let json = serde_json::to_vec(&m).unwrap();
+        assert!(
+            bin.len() < json.len(),
+            "binary manifest ({} bytes) not smaller than JSON ({} bytes)",
+            bin.len(),
+            json.len()
+        );
+    }
+
+    /// A legacy JSON manifest still decodes (forward-compat fallback): tables get
+    /// their serde defaults (`format = 1`, no bloom), so an old directory opens.
+    #[test]
+    fn legacy_json_manifest_still_decodes() {
+        // A pre-format/pre-bloom JSON manifest: omit `format`, `bloom`, `has_bloom`.
+        let json = br#"{
+            "next_seq": 3,
+            "max_version": 50,
+            "tables": [
+                {
+                    "seq": 1,
+                    "min_key": [97],
+                    "max_key": [98],
+                    "min_version": 1,
+                    "max_version": 9,
+                    "index_offset": 100,
+                    "index_len": 20,
+                    "file_size": 200
+                }
+            ]
+        }"#;
+        let m = decode_manifest(json).expect("legacy json decodes");
+        assert_eq!(m.next_seq, 3);
+        assert_eq!(m.max_version, 50);
+        assert_eq!(m.tables.len(), 1);
+        let t = &m.tables[0];
+        assert_eq!(t.seq, 1);
+        assert_eq!(t.format, 1, "legacy table defaults to format v1");
+        assert!(!t.has_bloom, "legacy table has no bloom");
+        assert_eq!(t.level, 0, "legacy table defaults to L0");
+    }
 }

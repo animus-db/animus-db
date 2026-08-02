@@ -68,6 +68,17 @@ impl BloomFilter {
         Self { bits, k }
     }
 
+    /// The raw `(bits, k)` parts, for the compact binary manifest codec.
+    pub(super) fn as_parts(&self) -> (&[u8], u32) {
+        (&self.bits, self.k)
+    }
+
+    /// Reconstruct a filter from its raw `(bits, k)` parts (binary manifest
+    /// decode). The inverse of [`as_parts`](BloomFilter::as_parts).
+    pub(super) fn from_parts(bits: Vec<u8>, k: u32) -> Self {
+        Self { bits, k }
+    }
+
     /// Whether `key` *might* be present. `false` is definitive (the key was
     /// never inserted); `true` may be a false positive. An empty bit vector
     /// (built from zero keys) answers `false` for everything.

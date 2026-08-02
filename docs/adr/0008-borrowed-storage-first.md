@@ -1,7 +1,7 @@
 # ADR 0008 — Borrowed storage engine first, then a custom on-disk LSM
 
 - **Status:** Accepted (custom-engine half now implemented)
-- **Date:** 2026-08-01 (revised 2026-08-01)
+- **Date:** 2026-08-01 (revised 2026-08-02)
 
 ## Context
 
@@ -43,11 +43,15 @@ seam and so cannot be driven by the simulator.
   layout, an in-file block index, a footer, and a per-table **Bloom filter** over
   the table's keys — point reads fetch one block via `read_at`, never the whole
   file (`crc32fast` per block), and skip a table entirely when its Bloom proves
-  the key absent (tighter than the key-range gate);
+  the key absent (tighter than the key-range gate). Each data block is
+  **LZ4-compressed** (pure-Rust `lz4_flex`) when that shrinks it, stored verbatim
+  otherwise; the CRC covers the framed `tag || payload`. The table format is
+  versioned so legacy uncompressed tables still read;
 - a **MANIFEST** (`<prefix>MANIFEST`): the durable source of truth listing live
-  SSTables + metadata (including each table's LSM level and Bloom filter), written
-  **atomically** via `Disk::replace`, the single linearization point for flush and
-  compaction;
+  SSTables + metadata (including each table's LSM level and Bloom filter),
+  encoded with a **compact hand-rolled binary codec** (a legacy JSON manifest is
+  still read for forward-compat) and written **atomically** via `Disk::replace`,
+  the single linearization point for flush and compaction;
 - **leveled compaction**: tables carry a level; **L0** is the (overlapping) flush
   tier, **L1+** hold non-overlapping runs (re-partitioned on a key boundary to
   ≈`target_table_bytes`), so read amplification is bounded by the number of levels
@@ -113,7 +117,29 @@ ignored. This is tested under fault injection in `custos-storage/tests/lsm_crash
   put/get/scan throughput + latency and flush/compaction cost of `LsmEngine` over
   `ProdEnv` against `MemoryEngine` — no new runtime dependency (hand-rolled
   timing; `tokio` is a dev-dependency only).
+- **SSTable block compression** (`lsm/sstable.rs`): each data block is now framed
+  `tag(u8) || payload || crc`, where the payload is **LZ4-compressed** (via
+  `lz4_flex`, a pure-Rust, MIT-licensed compressor built in its safe-only mode,
+  so it honours `unsafe_code = "forbid"`) when that is strictly smaller, and
+  stored verbatim otherwise — so an incompressible block is never inflated. The
+  CRC32 covers `tag || payload`, so it validates the tag and the (possibly
+  compressed) bytes; the in-file block index + footer geometry is unchanged. The
+  table **format version** is bumped to `2` (footer magic `MAGIC_V2`, mirrored
+  into `SsTableMeta::format`); a `read_block` decodes v2 or the **legacy v1**
+  framing (`record_bytes || crc`, no tag/compression) per `format`, so SSTables
+  written by an older engine still read after an upgrade. Round-trips (including
+  an incompressible block) are unit-tested in `sstable.rs`.
+- **Compact binary MANIFEST** (`lsm.rs`): the manifest is now encoded with a
+  hand-rolled, dependency-free binary codec (a `CMF1` magic + 1-byte version,
+  then big-endian fixed ints and `u32`-length-prefixed byte strings for each
+  table's `SsTableMeta`) instead of JSON — smaller and cheaper to parse, written
+  on every flush/compaction. It remains **crash-safe**: still written atomically
+  via `Disk::replace` (the single linearization point), so a crash sees the whole
+  old or whole new manifest. Reading is **forward-compatible**: a legacy JSON
+  manifest (which begins with `{`, never the `CMF1` magic) is detected and
+  decoded via `serde_json`, so an existing on-disk directory still opens. The
+  codec is round-trip + legacy-JSON-decode + size unit-tested in `lsm.rs`; all
+  crash tests (which reopen through the binary decoder) stay green.
 - **Still deferred within `LsmEngine`** (correctness-first, performance later):
-  WAL segment rotation / fsync group-commit batching (the benchmark shows the
-  per-put WAL fsync is the dominant write cost), block compression, and a more
-  compact binary manifest (JSON today). None affect the trait or correctness.
+  WAL segment rotation (the WAL is a single file). None affect the trait or
+  correctness.
