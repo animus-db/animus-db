@@ -84,6 +84,11 @@ pub(super) struct GroupCommit {
     /// Count of batch `fsync`s performed (one per group commit). Introspection:
     /// fewer than the number of writes proves coalescing happened.
     batch_syncs: AtomicU64,
+    /// Count of WAL segment rotations (the active segment crossed its byte budget
+    /// and a fresh segment file was opened). Monotonic for the engine's life;
+    /// observability (ADR 0015) reads its delta. Lock-free so the leader can bump
+    /// it under the `Inner` lock without extra contention on read-back.
+    rotations: AtomicU64,
 }
 
 struct Inner {
@@ -143,6 +148,7 @@ impl GroupCommit {
             prefix,
             seg_threshold: seg_threshold.max(1),
             batch_syncs: AtomicU64::new(0),
+            rotations: AtomicU64::new(0),
             inner: Mutex::new(Inner {
                 next_seq: 0,
                 durable_seq: 0,
@@ -265,6 +271,8 @@ impl GroupCommit {
                         inner.sealed.insert(sealed_seg, sealed_max);
                         inner.active_seg += 1;
                         inner.active_seg_bytes = 0;
+                        // Observability (ADR 0015): a rotation actually happened.
+                        self.rotations.fetch_add(1, Ordering::Relaxed);
                     }
                     let seg = inner.active_seg;
                     // Account the bytes now so the *next* batch's rotation decision
@@ -340,6 +348,12 @@ impl GroupCommit {
     /// Number of batch `fsync`s performed since open (introspection / tests).
     pub(super) fn batch_sync_count(&self) -> u64 {
         self.batch_syncs.load(Ordering::Relaxed)
+    }
+
+    /// Number of WAL segment rotations performed since open (monotonic).
+    /// Observability (ADR 0015) records the delta after each `commit`.
+    pub(super) fn rotation_count(&self) -> u64 {
+        self.rotations.load(Ordering::Relaxed)
     }
 
     /// Number of live WAL segments (sealed + active). Introspection / tests.

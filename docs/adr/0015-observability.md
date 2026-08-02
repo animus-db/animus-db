@@ -86,6 +86,29 @@ integration; the seam itself does **no** HTTP.
   Recording is observe-only — it changes **no** quorum semantics, and all public
   signatures stay additive/stable.
 
+- **What the storage engine records (ADR 0004/0008).** The on-disk `LsmEngine`
+  records, at the real LSM site that knows the *outcome* (not merely a schedule),
+  all observe-only and deterministic (counters only, no wall clock): `storage_flushes`
+  (one per memtable flush, counted *after* the manifest swap commits the new table);
+  `storage_compactions` + `storage_compaction_tables_merged` +
+  `storage_compaction_bytes_merged` (one per compaction whose manifest swap
+  committed, plus the input tables it merged away — the "segments compacted" — and
+  their on-disk `file_size` bytes); `storage_tombstones_reclaimed` (the records a
+  compaction's tombstone-GC physically dropped below the GC floor — the drop in the
+  merged record count); `storage_sstable_block_reads` (one per block fetched from
+  disk, recorded in `SsTableReader::read_block` — the read-amplification counter);
+  `storage_bloom_hits`/`storage_bloom_misses` (the per-table Bloom verdict for a
+  point lookup whose key was inside the table's key range — a "miss" is a block
+  read the Bloom saved, so it is counted at the gate, before any block read); and
+  `storage_wal_segment_rotations` (one per WAL segment rotation, counted at the
+  group-commit site via a monotonic coordinator counter whose delta the engine
+  records around each `commit`). Names are `storage_*`-prefixed. The engine's handle
+  defaults to `env.metrics()` (the no-op under `SimEnv`, the recording one under
+  `ProdEnv`); a sim test threads a recording handle in via the additive
+  `LsmEngine::open_with_metrics`, and the `SsTableReader` takes it via the additive
+  `with_metrics` — so the deterministic suite reads storage counters back without
+  changing `animus-sim`, and all public signatures stay additive/stable.
+
 - **What the control plane records.** The `RaftNode` driver loops record, all
   from `Env`-supplied or core-derived inputs (so recording is a deterministic
   function of the run): `elections_started`/`elections_won` (from role/term
@@ -109,6 +132,16 @@ integration; the seam itself does **no** HTTP.
   and the replay loop delivers it; a seeded replica's anti-entropy loop counts its
   rounds), and the recorded snapshot is asserted byte-identical across two runs of
   the same seed.
+- The storage engine is **observable** at runtime with zero determinism risk:
+  every storage counter is exercised under the deterministic simulator and asserted
+  to move under a known workload (`animus-storage/tests/lsm_metrics.rs` — a write
+  workload forces several flushes, an L0→L1 compaction (tables + bytes merged), WAL
+  segment rotations, and on-disk point reads; a proven-absent in-range key is a
+  Bloom *miss* that reads **zero** blocks; an aged tombstone is counted reclaimed),
+  and the recorded snapshot is asserted byte-identical across two runs of the same
+  seed. The counters fire on the cooperative write/read path, so the single-threaded
+  `SimEnv` exercises them all — no `ProdEnv` multi-thread test is required for
+  coverage (recording is a relaxed atomic add at sites already proven correct).
 - The control plane is **observable** at runtime with zero determinism risk:
   every counter is exercised under the deterministic simulator and asserted to
   move under known events (`animus-control/tests/metrics.rs` — a forced election
@@ -139,7 +172,11 @@ integration; the seam itself does **no** HTTP.
     `animusd/tests/metrics_endpoint.rs` (a 3-node cluster elects a leader,
     `GET /metrics` returns the text format with `control_elections_won >= 1` and
     `control_is_leader 1` on the leader, `0` on a follower).
-- **Deferred:** storage-engine counters (LSM compactions, SSTable reads); and
-  histograms/latency (would need a deterministic bucketing scheme). Data-plane
-  counters (quorum reads/writes, read-repair, hinted handoff, anti-entropy) and
-  the live `/metrics` endpoint are now **done** (see above).
+- **Deferred:** histograms/latency (would need a deterministic bucketing scheme).
+  Storage-engine counters (flushes, compactions + bytes/segments merged, tombstone
+  GC, SSTable block reads, Bloom hits/misses, WAL segment rotations), data-plane
+  counters (quorum reads/writes, read-repair, hinted handoff, anti-entropy), and the
+  live `/metrics` endpoint are now **done** (see above). The storage-engine counters
+  are recorded only into the env/handle the engine was opened with; wiring them into
+  `animusd`'s aggregated `/metrics` endpoint (alongside the control/data role sinks)
+  is a thin follow-up at the assembly point and is not part of this change.

@@ -18,7 +18,7 @@ the production implementation; the deterministic implementation lives in
   length-prefixed TCP, `tokio::fs` + `fsync`. Owns a real recording metrics sink
   and exposes `metrics_text()` (ADR 0015).
 - `metrics.rs` — the **observability seam** (ADR 0015): a closed `Metric` enum
-  (`control_*` Raft + `data_*` leaderless-AP counters), a fixed-array lock-free
+  (`control_*` Raft + `data_*` leaderless-AP + `storage_*` LSM-engine counters), a fixed-array lock-free
   `MetricSink`, the cheap-to-clone `MetricsHandle`, and the `MetricSnapshot` text
   export. The enum is **append-only**: add new variants *after* the existing ones
   (and a matching row in `Metric::ALL`) so slots and the export order stay stable
@@ -64,7 +64,9 @@ the production implementation; the deterministic implementation lives in
   the same pattern: the `DataClient` coordinator defaults to `env.metrics()` and
   takes an explicit handle via `DataClient::with_metrics`; the background loops
   have additive `serve_anti_entropy_with_metrics` / `serve_hint_*_with_metrics`
-  variants (the originals forward `env.metrics()`).
+  variants (the originals forward `env.metrics()`). The storage engine follows it
+  too: `LsmEngine::open`/`open_with` forward `env.metrics()`, and the additive
+  `LsmEngine::open_with_metrics` threads a recording handle in for a sim test.
 
 ## Tests
 

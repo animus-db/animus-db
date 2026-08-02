@@ -48,7 +48,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use animus_env::Env;
+use animus_env::{Env, Metric, MetricsHandle};
 use serde::{Deserialize, Serialize};
 
 use super::bloom::BloomFilter;
@@ -394,6 +394,10 @@ pub struct SsTableReader {
     /// engine's read-amplification introspection (tests). `None` until the engine
     /// wires one in via [`Self::with_block_counter`].
     block_reads: Option<Arc<AtomicU64>>,
+    /// Observability sink (ADR 0015): a block fetched from disk bumps
+    /// `storage_sstable_block_reads`. `None` until the engine wires one in via
+    /// [`Self::with_metrics`]; recording is observe-only and changes no behavior.
+    metrics: Option<MetricsHandle>,
 }
 
 impl SsTableReader {
@@ -417,6 +421,7 @@ impl SsTableReader {
             meta: Arc::new(meta),
             index: Arc::new(index),
             block_reads: None,
+            metrics: None,
         })
     }
 
@@ -425,6 +430,14 @@ impl SsTableReader {
     #[must_use]
     pub fn with_block_counter(mut self, counter: Arc<AtomicU64>) -> Self {
         self.block_reads = Some(counter);
+        self
+    }
+
+    /// Attach the observability sink (ADR 0015), so a block fetched from disk bumps
+    /// `storage_sstable_block_reads`. Returns `self` for chaining at open time.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: MetricsHandle) -> Self {
+        self.metrics = Some(metrics);
         self
     }
 
@@ -440,6 +453,9 @@ impl SsTableReader {
     async fn read_block<E: Env>(&self, env: &E, bi: &BlockIndex) -> Result<Vec<Record>> {
         if let Some(counter) = &self.block_reads {
             counter.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Some(metrics) = &self.metrics {
+            metrics.incr(Metric::StorageSstableBlockReads);
         }
         let raw = env
             .read_at(&self.file, bi.offset, bi.len as usize)
