@@ -19,9 +19,11 @@
 
 pub mod client;
 pub mod digest;
+pub mod hint;
 pub mod replica;
 
 pub use client::{DataClient, ReadResult, Router, TabletView};
+pub use hint::{HintStore, serve_hint_handoff, serve_hint_replay};
 pub use replica::{ReplicaHandle, serve_anti_entropy, serve_replica, serve_replica_with_residency};
 
 use animus_env::NodeId;
@@ -114,6 +116,16 @@ pub enum DataMsg {
         from: NodeId,
         segments: Vec<u32>,
     },
+    /// Hint holder → replica: a liveness probe used by **hinted handoff**
+    /// (ADR 0010). When a coordinator holds hints for a replica that was
+    /// unavailable during a write/delete, it periodically probes the replica;
+    /// a matching [`ProbeAck`](DataMsg::ProbeAck) means the replica is reachable
+    /// again and the holder replays its hints (as a [`Sync`](DataMsg::Sync)).
+    /// Not epoch-fenced — it carries no data, only liveness.
+    Probe { req: ReqId },
+    /// Replica → hint holder: acknowledges a [`Probe`](DataMsg::Probe), proving
+    /// the replica is reachable so the holder may replay buffered hints to it.
+    ProbeAck { req: ReqId },
 }
 
 /// One segment of a replica's [segment digest](DataMsg::SyncDigest): a segment

@@ -41,7 +41,10 @@ mod dynamo;
 
 use animus_control::node::heartbeat_loop;
 use animus_control::{MetaCommand, PlacementPolicy, RaftNode};
-use animus_data::{DataClient, ReadResult, TabletView, serve_anti_entropy, serve_replica};
+use animus_data::{
+    DataClient, HintStore, ReadResult, TabletView, serve_anti_entropy, serve_hint_replay,
+    serve_replica,
+};
 use animus_env::{EnvExt, NodeId, ProdEnv};
 use animus_storage::{LsmEngine, MemoryEngine, StorageEngine};
 use animus_tablet::{Epoch, KeyRange, TabletId};
@@ -63,6 +66,11 @@ const MAX_REPLICATION_FACTOR: usize = 3;
 /// How often each data replica runs a background anti-entropy round to converge
 /// with its peers (ADR 0010). A slow background activity, off any request path.
 const ANTI_ENTROPY_INTERVAL: Duration = Duration::from_secs(1);
+/// How often the coordinator replays buffered **hints** to the replicas they were
+/// recorded for (hinted handoff, ADR 0010). Tighter than anti-entropy: hinting is
+/// the *prompt* convergence path for a replica that was briefly unavailable for a
+/// write, with anti-entropy the slower full-coverage backstop.
+const HINT_REPLAY_INTERVAL: Duration = Duration::from_millis(500);
 /// Filename prefix namespacing the data replica's on-disk LSM under the node's
 /// data `ProdEnv` directory (its files become `db-MANIFEST`/`db-wal`/`db-sst-*`).
 ///
@@ -274,7 +282,26 @@ impl BoundNode {
                 anti_entropy_peers,
             ),
         };
-        let coordinator = DataClient::new(self.coord_env);
+        // Hinted handoff (ADR 0010): the coordinator buffers a hint for any tablet
+        // replica that did not ack a committed write/delete (it was down /
+        // partitioned), and a send-only replay loop on a *clone* of the coord env
+        // replays the buffered hints to those replicas on a timer — so a replica
+        // that was briefly unavailable converges promptly when it returns, not only
+        // on the next read or anti-entropy round. The loop is **send-only** (it
+        // does not `recv`), so it shares the coord env with the `DataClient` without
+        // violating the single-consumer rule (`serve_hint_replay`, not the
+        // probe-based `serve_hint_handoff`, for exactly that reason). `animusd` has
+        // no residency labels yet, so the residency bound is `None` (no boundary);
+        // when residency is configured, derive an `allowed` set from
+        // `PlacementPolicy::admits` exactly as the repair guard does (ADR 0005).
+        let hints = HintStore::new();
+        serve_hint_replay(
+            self.coord_env.clone(),
+            hints.clone(),
+            None,
+            HINT_REPLAY_INTERVAL,
+        );
+        let coordinator = DataClient::with_hints(self.coord_env, hints, None);
 
         // Bootstrap: whichever node is leader registers membership + the tablet
         // (idempotent). Track the client-facing task handles so `shutdown` can
