@@ -27,9 +27,11 @@ CLI wrapper. `custos-cli` depends on this crate for the client protocol types.
   `ClientCtx`** (coordinator + cached routing view) as the plain-TCP API.
 - `cql` module — the **CQL (Cassandra) v4 binary-protocol endpoint** (a sixth
   listener per node). A hand-rolled framed server does the `STARTUP → READY` /
-  `OPTIONS → SUPPORTED` handshake and a tiny `QUERY` path (`INSERT`/`SELECT`)
-  via the pure `custos_cql` crate, routing through the **same `ClientCtx`** as
-  the other edges.
+  `OPTIONS → SUPPORTED` handshake and runs `QUERY`/`PREPARE`/`EXECUTE` via the
+  pure `custos_cql` crate (a typed `CREATE KEYSPACE`/`USE`/`CREATE TABLE` schema
+  catalog + typed `INSERT`/`SELECT` + prepared statements), routing through the
+  **same `ClientCtx`** as the other edges. The catalog + prepared-statement store
+  are **process-global edge state** (see below).
 
 ## What's non-obvious
 
@@ -97,10 +99,22 @@ CLI wrapper. `custos-cli` depends on this crate for the client protocol types.
   edge uses a fixed `pk`/`sk` key-attribute convention.
 - And a **sixth listener, the CQL binary-protocol endpoint** (`RoleAddrs.cql`,
   `Node::cql_addr`). Same shape: a production-only I/O edge (real tokio sockets +
-  hand-rolled CQL v4 framing in `cql.rs`; the pure protocol logic is in
-  `custos-cql`), routed through the same `ClientCtx`. No schema catalog yet, so a
-  row is the fixed `(pk, v)` convention keyed by the partition key (data-plane
-  key `escape(table) || pk_bytes`); only `INSERT`/`SELECT` are recognized.
+  hand-rolled CQL v4 framing in `cql.rs`; the pure protocol/type/catalog/planning
+  logic is in `custos-cql`), routed through the same `ClientCtx`. It runs
+  `QUERY`/`PREPARE`/`EXECUTE`: `CREATE KEYSPACE`/`USE`/`CREATE TABLE` record a
+  typed schema in an in-memory catalog, and `INSERT`/`SELECT` resolve columns
+  against it (a typed row is one data-plane value keyed by `escape(table) ||
+  pk_key_bytes`; the partition key is not stored in the value).
+  - **The catalog + prepared-statement store are process-global edge state**
+    (`shared_state()` over a `OnceLock<Arc<Mutex<CqlState>>>`), shared across all
+    nodes' CQL listeners in one process — like the DynamoDB `SchemaRegistry`, so
+    `--cluster N` dev mode sees one node's `CREATE TABLE` from another. They are
+    **not durable and not control-plane replicated**: lost on restart, and a
+    one-process-per-node deployment has a per-process catalog (re-create schemas
+    per process). Per-connection state (the `USE`d keyspace) lives in `Session`.
+  - The **prepared-statement id is content-addressed** — a stable hash of the
+    statement text (FNV-1a, no RNG so the edge stays deterministic) — so `PREPARE`
+    on one connection and `EXECUTE` on another resolve to the same statement.
 - Writes get a **quorum-derived version** (`DataClient::read_version` + 1), not a
   per-node counter — otherwise two coordinators assign the same version and the
   replica's monotonic-version check silently drops the later write. Global
@@ -126,8 +140,9 @@ CLI wrapper. `custos-cli` depends on this crate for the client protocol types.
 `cargo test -p custosd` — `tests/cluster.rs` (in-process cluster),
 `tests/per_process.rs` (nodes started independently from a shared config),
 `tests/dynamo_wire.rs` (PutItem → GetItem → DeleteItem over the real DynamoDB
-JSON/HTTP wire), `tests/cql_wire.rs` (STARTUP handshake → INSERT → SELECT
-over the real CQL binary wire), `tests/durable_restart.rs` (a key written
+JSON/HTTP wire), `tests/cql_wire.rs` (STARTUP → CREATE KEYSPACE/USE/CREATE
+TABLE → PREPARE INSERT → EXECUTE with typed bound values → typed SELECT, columns
+round-tripping, over the real CQL binary wire), `tests/durable_restart.rs` (a key written
 through the client API survives a node stop + restart on the **same dir +
 addresses** with the LSM backend, and is lost with the `--ephemeral` memory
 backend), and `tests/self_heal.rs` (**live self-healing**: a 4-node cluster

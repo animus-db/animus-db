@@ -1,45 +1,112 @@
-//! A deliberately tiny CQL recognizer for the minimal `QUERY` path.
+//! A small (still not full-grammar) CQL recognizer.
 //!
-//! This is **not** a CQL grammar. It recognizes exactly two statement shapes
-//! and pulls out the table, primary key, and (for inserts) the value. Anything
-//! else is rejected with [`QueryError::Unsupported`], which the wire layer turns
-//! into a CQL `ERROR` frame.
+//! This parses a practical subset of CQL into a [`Statement`] tree without
+//! resolving it against a schema — schema resolution lives in [`crate::plan`].
+//! Anything outside the subset is rejected with [`QueryError::Unsupported`],
+//! which the wire layer turns into a CQL `ERROR` frame.
 //!
 //! Accepted shapes (case-insensitive keywords, optional trailing `;`):
 //!
 //! ```cql
-//! INSERT INTO <table> (pk, v) VALUES (<pk>, <v>)
-//! SELECT * FROM <table> WHERE pk = <pk>
+//! USE <keyspace>
+//! CREATE KEYSPACE [IF NOT EXISTS] <keyspace> [WITH ...]   -- WITH clause ignored
+//! CREATE TABLE [IF NOT EXISTS] <table> (
+//!     <col> <type>, ... , PRIMARY KEY (<col>)
+//! )
+//! INSERT INTO <table> (<c1>, <c2>, ...) VALUES (<v1>, <v2>, ...)
+//! SELECT * | <c1>, <c2>, ... FROM <table> WHERE <pk> = <value>
 //! ```
 //!
-//! Identifiers are bare words; literals are either single-quoted strings
-//! (`'ada'`, with `''` as an escaped quote) or bare numeric/word tokens. The
-//! `(pk, v)` column list is fixed by the no-schema convention documented in the
-//! crate root: a row is a single `(pk, v)` pair. Column names other than `pk`
-//! and `v` are rejected so a typo fails loudly rather than silently writing the
-//! wrong shape.
+//! Values are literals — single-quoted strings (`'ada'`, `''`-escaped), bare
+//! numbers/words (`42`, `true`, a `uuid`/`0x..blob` literal), or a `?` bind
+//! marker (filled in at `EXECUTE` time). Table names may be `keyspace.table`.
+//!
+//! It is **not** a CQL grammar: no clustering columns, no composite partition
+//! keys, no `IF`/`USING`/`LIMIT`/ordering, no functions.
 
 use std::fmt;
 
-/// A recognized CQL statement.
+use crate::types::CqlType;
+
+/// A recognized CQL statement (pre-schema-resolution).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Query {
-    /// `INSERT INTO t (pk, v) VALUES (pk, v)`.
-    Insert {
-        /// The table name.
-        table: String,
-        /// The partition-key value (raw text bytes).
-        pk: String,
-        /// The `v` column value (raw text bytes).
-        value: String,
+pub enum Statement {
+    /// `USE <keyspace>`.
+    Use {
+        /// The keyspace to select for the connection.
+        keyspace: String,
     },
-    /// `SELECT * FROM t WHERE pk = pk`.
-    Select {
-        /// The table name.
-        table: String,
-        /// The partition-key value to look up.
-        pk: String,
+    /// `CREATE KEYSPACE [IF NOT EXISTS] <keyspace> [WITH ...]`.
+    CreateKeyspace {
+        /// The keyspace name.
+        keyspace: String,
+        /// Whether `IF NOT EXISTS` was present.
+        if_not_exists: bool,
     },
+    /// `CREATE TABLE [IF NOT EXISTS] <table> (...)`.
+    CreateTable(CreateTable),
+    /// `INSERT INTO <table> (...) VALUES (...)`.
+    Insert(Insert),
+    /// `SELECT ... FROM <table> WHERE <pk> = <value>`.
+    Select(Select),
+}
+
+/// A parsed `CREATE TABLE`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreateTable {
+    /// Optional `keyspace.` qualifier on the table name.
+    pub keyspace: Option<String>,
+    /// The table name.
+    pub table: String,
+    /// Whether `IF NOT EXISTS` was present.
+    pub if_not_exists: bool,
+    /// Columns in declaration order: `(name, type)`.
+    pub columns: Vec<(String, CqlType)>,
+    /// The partition-key column name (a single column in this subset).
+    pub partition_key: String,
+}
+
+/// A parsed `INSERT` (columns + literal/bind values, not yet typed).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Insert {
+    /// Optional `keyspace.` qualifier.
+    pub keyspace: Option<String>,
+    /// The table name.
+    pub table: String,
+    /// The named columns being written.
+    pub columns: Vec<String>,
+    /// The values, positionally aligned with `columns`.
+    pub values: Vec<Term>,
+}
+
+/// A parsed `SELECT` (projection + single `pk = value` predicate).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Select {
+    /// Optional `keyspace.` qualifier.
+    pub keyspace: Option<String>,
+    /// The table name.
+    pub table: String,
+    /// The projected columns; empty means `*` (all columns).
+    pub projection: Vec<String>,
+    /// The `WHERE` predicate column (must be the partition key).
+    pub where_column: String,
+    /// The `WHERE` predicate value.
+    pub where_value: Term,
+}
+
+/// A value position in a statement: a literal or a positional bind marker.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Term {
+    /// A literal value as written. `quoted` records whether it was a quoted
+    /// string (so a quoted number stays text and an unquoted `true` is a bool).
+    Literal {
+        /// The literal text (quotes already stripped).
+        text: String,
+        /// Whether the source literal was single-quoted.
+        quoted: bool,
+    },
+    /// A `?` positional bind marker.
+    Bind,
 }
 
 /// Why a query string was not recognized.
@@ -62,92 +129,233 @@ impl fmt::Display for QueryError {
 
 impl std::error::Error for QueryError {}
 
-/// The convention partition-key column name (no schema catalog yet).
-pub const PK_COLUMN: &str = "pk";
-/// The convention value column name.
-pub const V_COLUMN: &str = "v";
-
-/// Parse a CQL query string into a [`Query`], or fail.
+/// Parse a CQL query string into a [`Statement`], or fail.
 ///
 /// # Errors
 /// [`QueryError::Empty`] for blank input, [`QueryError::Unsupported`] for
-/// anything outside the two accepted shapes.
-pub fn parse_query(cql: &str) -> Result<Query, QueryError> {
+/// anything outside the accepted subset.
+pub fn parse_statement(cql: &str) -> Result<Statement, QueryError> {
     let trimmed = cql.trim().trim_end_matches(';').trim();
     if trimmed.is_empty() {
         return Err(QueryError::Empty);
     }
     let tokens = tokenize(trimmed);
-    let lower_first = tokens.first().map(|t| t.to_ascii_lowercase());
-    match lower_first.as_deref() {
-        Some("insert") => parse_insert(&tokens),
-        Some("select") => parse_select(&tokens),
+    let mut it = TokenStream::new(&tokens);
+    let first = it.peek().map(str::to_ascii_lowercase);
+    match first.as_deref() {
+        Some("use") => parse_use(&mut it),
+        Some("create") => parse_create(&mut it),
+        Some("insert") => parse_insert(&mut it),
+        Some("select") => parse_select(&mut it),
         _ => Err(QueryError::Unsupported(
-            "only INSERT and SELECT are supported".into(),
+            "expected USE, CREATE, INSERT, or SELECT".into(),
         )),
     }
 }
 
-/// `INSERT INTO <table> ( pk , v ) VALUES ( <pk> , <v> )`.
-fn parse_insert(tokens: &[String]) -> Result<Query, QueryError> {
-    // tokens: insert into <table> ( pk , v ) values ( <pk> , <v> )
-    let mut it = TokenStream::new(tokens);
-    expect_kw(&mut it, "insert")?;
-    expect_kw(&mut it, "into")?;
-    let table = next_ident(&mut it, "table name")?;
-    expect_punct(&mut it, "(")?;
-    let col1 = next_ident(&mut it, "first column")?;
-    expect_punct(&mut it, ",")?;
-    let col2 = next_ident(&mut it, "second column")?;
-    expect_punct(&mut it, ")")?;
-    expect_kw(&mut it, "values")?;
-    expect_punct(&mut it, "(")?;
-    let val1 = next_literal(&mut it, "first value")?;
-    expect_punct(&mut it, ",")?;
-    let val2 = next_literal(&mut it, "second value")?;
-    expect_punct(&mut it, ")")?;
-    if it.next().is_some() {
-        return Err(QueryError::Unsupported(
-            "trailing tokens after INSERT".into(),
-        ));
+fn parse_use(it: &mut TokenStream<'_>) -> Result<Statement, QueryError> {
+    expect_kw(it, "use")?;
+    let keyspace = next_ident(it, "keyspace name")?;
+    end(it, "USE")?;
+    Ok(Statement::Use { keyspace })
+}
+
+fn parse_create(it: &mut TokenStream<'_>) -> Result<Statement, QueryError> {
+    expect_kw(it, "create")?;
+    match it.peek().map(str::to_ascii_lowercase).as_deref() {
+        Some("keyspace") => parse_create_keyspace(it),
+        Some("table") => parse_create_table(it),
+        other => Err(QueryError::Unsupported(format!(
+            "expected KEYSPACE or TABLE after CREATE, got {}",
+            describe(other)
+        ))),
     }
-    if !col1.eq_ignore_ascii_case(PK_COLUMN) || !col2.eq_ignore_ascii_case(V_COLUMN) {
-        return Err(QueryError::Unsupported(format!(
-            "columns must be ({PK_COLUMN}, {V_COLUMN}); got ({col1}, {col2})"
-        )));
+}
+
+fn parse_create_keyspace(it: &mut TokenStream<'_>) -> Result<Statement, QueryError> {
+    expect_kw(it, "keyspace")?;
+    let if_not_exists = take_if_not_exists(it)?;
+    let keyspace = next_ident(it, "keyspace name")?;
+    // An optional `WITH replication = {...}` clause is accepted and ignored:
+    // this single-cluster engine has no per-keyspace replication settings.
+    if it.peek().is_some_and(|t| t.eq_ignore_ascii_case("with")) {
+        while it.next().is_some() {} // consume the rest of the statement
     }
-    Ok(Query::Insert {
-        table,
-        pk: val1,
-        value: val2,
+    end(it, "CREATE KEYSPACE")?;
+    Ok(Statement::CreateKeyspace {
+        keyspace,
+        if_not_exists,
     })
 }
 
-/// `SELECT * FROM <table> WHERE pk = <pk>`.
-fn parse_select(tokens: &[String]) -> Result<Query, QueryError> {
-    let mut it = TokenStream::new(tokens);
-    expect_kw(&mut it, "select")?;
-    expect_punct(&mut it, "*")?;
-    expect_kw(&mut it, "from")?;
-    let table = next_ident(&mut it, "table name")?;
-    expect_kw(&mut it, "where")?;
-    let col = next_ident(&mut it, "predicate column")?;
-    expect_punct(&mut it, "=")?;
-    let pk = next_literal(&mut it, "predicate value")?;
-    if it.next().is_some() {
-        return Err(QueryError::Unsupported(
-            "trailing tokens after SELECT".into(),
-        ));
+fn parse_create_table(it: &mut TokenStream<'_>) -> Result<Statement, QueryError> {
+    expect_kw(it, "table")?;
+    let if_not_exists = take_if_not_exists(it)?;
+    let (keyspace, table) = next_table_name(it)?;
+    expect_punct(it, "(")?;
+
+    let mut columns: Vec<(String, CqlType)> = Vec::new();
+    let mut inline_pk: Option<String> = None;
+    let mut pk_clause: Option<String> = None;
+    loop {
+        // A `PRIMARY KEY (col)` clause, or a `<name> <type> [PRIMARY KEY]`.
+        if it.peek().is_some_and(|t| t.eq_ignore_ascii_case("primary")) {
+            expect_kw(it, "primary")?;
+            expect_kw(it, "key")?;
+            expect_punct(it, "(")?;
+            let pk = next_ident(it, "primary key column")?;
+            // Reject composite / clustering keys for now (loudly).
+            if it.peek() == Some(",") {
+                return Err(QueryError::Unsupported(
+                    "composite / clustering primary keys are not supported yet".into(),
+                ));
+            }
+            expect_punct(it, ")")?;
+            pk_clause = Some(pk);
+        } else {
+            let name = next_ident(it, "column name")?;
+            let type_name = next_ident(it, "column type")?;
+            let ty = CqlType::parse(&type_name).ok_or_else(|| {
+                QueryError::Unsupported(format!("unsupported column type `{type_name}`"))
+            })?;
+            // Inline `PRIMARY KEY` on the column.
+            if it.peek().is_some_and(|t| t.eq_ignore_ascii_case("primary")) {
+                expect_kw(it, "primary")?;
+                expect_kw(it, "key")?;
+                inline_pk = Some(name.clone());
+            }
+            columns.push((name, ty));
+        }
+        match it.next() {
+            Some(",") => continue,
+            Some(")") => break,
+            other => {
+                return Err(QueryError::Unsupported(format!(
+                    "expected `,` or `)` in column list, got {}",
+                    describe(other)
+                )));
+            }
+        }
     }
-    if !col.eq_ignore_ascii_case(PK_COLUMN) {
+    end(it, "CREATE TABLE")?;
+
+    let partition_key = match (inline_pk, pk_clause) {
+        (Some(_), Some(_)) => {
+            return Err(QueryError::Unsupported(
+                "primary key declared twice (inline and PRIMARY KEY clause)".into(),
+            ));
+        }
+        (Some(pk), None) | (None, Some(pk)) => pk,
+        (None, None) => {
+            return Err(QueryError::Unsupported("no PRIMARY KEY declared".into()));
+        }
+    };
+    if !columns
+        .iter()
+        .any(|(n, _)| n.eq_ignore_ascii_case(&partition_key))
+    {
         return Err(QueryError::Unsupported(format!(
-            "WHERE column must be {PK_COLUMN}; got {col}"
+            "PRIMARY KEY column `{partition_key}` is not a declared column"
         )));
     }
-    Ok(Query::Select { table, pk })
+    if columns.is_empty() {
+        return Err(QueryError::Unsupported("table has no columns".into()));
+    }
+
+    Ok(Statement::CreateTable(CreateTable {
+        keyspace,
+        table,
+        if_not_exists,
+        columns,
+        partition_key,
+    }))
 }
 
-/// A simple cursor over the token slice yielding `&str`s.
+fn parse_insert(it: &mut TokenStream<'_>) -> Result<Statement, QueryError> {
+    expect_kw(it, "insert")?;
+    expect_kw(it, "into")?;
+    let (keyspace, table) = next_table_name(it)?;
+    expect_punct(it, "(")?;
+    let mut columns = Vec::new();
+    loop {
+        columns.push(next_ident(it, "column name")?);
+        match it.next() {
+            Some(",") => continue,
+            Some(")") => break,
+            other => {
+                return Err(QueryError::Unsupported(format!(
+                    "expected `,` or `)` in column list, got {}",
+                    describe(other)
+                )));
+            }
+        }
+    }
+    expect_kw(it, "values")?;
+    expect_punct(it, "(")?;
+    let mut values = Vec::new();
+    loop {
+        values.push(next_term(it, "value")?);
+        match it.next() {
+            Some(",") => continue,
+            Some(")") => break,
+            other => {
+                return Err(QueryError::Unsupported(format!(
+                    "expected `,` or `)` in values, got {}",
+                    describe(other)
+                )));
+            }
+        }
+    }
+    end(it, "INSERT")?;
+    if columns.len() != values.len() {
+        return Err(QueryError::Unsupported(format!(
+            "INSERT has {} columns but {} values",
+            columns.len(),
+            values.len()
+        )));
+    }
+    Ok(Statement::Insert(Insert {
+        keyspace,
+        table,
+        columns,
+        values,
+    }))
+}
+
+fn parse_select(it: &mut TokenStream<'_>) -> Result<Statement, QueryError> {
+    expect_kw(it, "select")?;
+    let mut projection = Vec::new();
+    if it.peek() == Some("*") {
+        it.next();
+    } else {
+        loop {
+            projection.push(next_ident(it, "projected column")?);
+            if it.peek() == Some(",") {
+                it.next();
+            } else {
+                break;
+            }
+        }
+    }
+    expect_kw(it, "from")?;
+    let (keyspace, table) = next_table_name(it)?;
+    expect_kw(it, "where")?;
+    let where_column = next_ident(it, "predicate column")?;
+    expect_punct(it, "=")?;
+    let where_value = next_term(it, "predicate value")?;
+    end(it, "SELECT")?;
+    Ok(Statement::Select(Select {
+        keyspace,
+        table,
+        projection,
+        where_column,
+        where_value,
+    }))
+}
+
+// --- token-stream helpers ---------------------------------------------------
+
+/// A cursor over the token slice yielding `&str`s, with a one-token lookahead.
 struct TokenStream<'a> {
     tokens: &'a [String],
     pos: usize,
@@ -161,6 +369,32 @@ impl<'a> TokenStream<'a> {
         let tok = self.tokens.get(self.pos)?;
         self.pos += 1;
         Some(tok.as_str())
+    }
+    /// Peek at the next token *as written* (a quoted-string token keeps its `\0`
+    /// sentinel here; callers comparing to keywords/punct never match it).
+    fn peek(&self) -> Option<&'a str> {
+        self.tokens.get(self.pos).map(String::as_str)
+    }
+}
+
+fn take_if_not_exists(it: &mut TokenStream<'_>) -> Result<bool, QueryError> {
+    if it.peek().is_some_and(|t| t.eq_ignore_ascii_case("if")) {
+        expect_kw(it, "if")?;
+        expect_kw(it, "not")?;
+        expect_kw(it, "exists")?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+fn end(it: &mut TokenStream<'_>, what: &str) -> Result<(), QueryError> {
+    match it.next() {
+        None => Ok(()),
+        Some(tok) => Err(QueryError::Unsupported(format!(
+            "trailing tokens after {what}: {}",
+            describe(Some(tok))
+        ))),
     }
 }
 
@@ -194,15 +428,34 @@ fn next_ident(it: &mut TokenStream<'_>, what: &str) -> Result<String, QueryError
     }
 }
 
-/// A literal is a quoted string (already unquoted by the tokenizer) or a bare
-/// word/number token.
-fn next_literal(it: &mut TokenStream<'_>, what: &str) -> Result<String, QueryError> {
+/// A possibly-qualified table name `[keyspace.]table`. The tokenizer keeps a
+/// dotted identifier as one token, so we split on the first `.`.
+fn next_table_name(it: &mut TokenStream<'_>) -> Result<(Option<String>, String), QueryError> {
+    let raw = next_ident(it, "table name")?;
+    match raw.split_once('.') {
+        Some((ks, table)) if !ks.is_empty() && !table.is_empty() && !table.contains('.') => {
+            Ok((Some(ks.to_owned()), table.to_owned()))
+        }
+        Some(_) => Err(QueryError::Unsupported(format!(
+            "malformed table name `{raw}`"
+        ))),
+        None => Ok((None, raw)),
+    }
+}
+
+/// A value term: a `?` bind marker, a quoted string, or a bare literal.
+fn next_term(it: &mut TokenStream<'_>, what: &str) -> Result<Term, QueryError> {
     match it.next() {
-        // A quoted-string token is prefixed with a NUL sentinel by the tokenizer
-        // so `''` (an empty string) is distinguishable from a missing token and
-        // a quoted keyword is not treated as punctuation.
-        Some(tok) if tok.starts_with('\0') => Ok(tok[1..].to_owned()),
-        Some(tok) if is_ident(tok) => Ok(tok.to_owned()),
+        Some("?") => Ok(Term::Bind),
+        // A quoted string is sentinel-prefixed by the tokenizer.
+        Some(tok) if tok.starts_with('\0') => Ok(Term::Literal {
+            text: tok[1..].to_owned(),
+            quoted: true,
+        }),
+        Some(tok) if is_ident(tok) => Ok(Term::Literal {
+            text: tok.to_owned(),
+            quoted: false,
+        }),
         other => Err(QueryError::Unsupported(format!(
             "expected {what}, got {}",
             describe(other)
@@ -221,15 +474,16 @@ fn describe(tok: Option<&str>) -> String {
 fn is_ident(tok: &str) -> bool {
     !tok.is_empty()
         && !tok.starts_with('\0')
+        && tok != "?"
         && tok
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-')
 }
 
 /// Split a statement into tokens: identifiers/numbers, single punctuation
-/// characters (`( ) , = *`), and single-quoted strings. A quoted string is
-/// emitted with a leading `\0` sentinel so the parser can tell it apart from a
-/// bare word (and accept an empty string).
+/// characters (`( ) , = * ? { } :`), and single-quoted strings. A quoted string
+/// is emitted with a leading `\0` sentinel so the parser can tell it apart from
+/// a bare word (and accept an empty string).
 fn tokenize(input: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut chars = input.chars().peekable();
@@ -258,14 +512,19 @@ fn tokenize(input: &str) -> Vec<String> {
                 }
                 tokens.push(format!("\0{s}"));
             }
-            '(' | ')' | ',' | '=' | '*' => {
+            '(' | ')' | ',' | '=' | '*' | '?' | '{' | '}' | ':' => {
                 chars.next();
                 tokens.push(c.to_string());
             }
             _ => {
                 let mut word = String::new();
                 while let Some(&c) = chars.peek() {
-                    if c.is_whitespace() || matches!(c, '(' | ')' | ',' | '=' | '*' | '\'') {
+                    if c.is_whitespace()
+                        || matches!(
+                            c,
+                            '(' | ')' | ',' | '=' | '*' | '?' | '\'' | '{' | '}' | ':'
+                        )
+                    {
                         break;
                     }
                     word.push(c);
@@ -283,11 +542,11 @@ fn tokenize(input: &str) -> Vec<String> {
 /// The table name is length-escaped (its UTF-8 bytes prefixed with a big-endian
 /// `u32` length) so two tables never produce overlapping keys even when one
 /// partition key is a prefix of another table+key concatenation. This mirrors
-/// the framing `custos-dynamo` uses for the same reason.
+/// the framing `custos-dynamo` uses for the same reason. `pk_bytes` is the
+/// type-canonical key encoding (see [`crate::types::CqlValue::to_key_bytes`]).
 #[must_use]
-pub fn data_key(table: &str, pk: &str) -> Vec<u8> {
+pub fn data_key(table: &str, pk_bytes: &[u8]) -> Vec<u8> {
     let table_bytes = table.as_bytes();
-    let pk_bytes = pk.as_bytes();
     let mut key = Vec::with_capacity(4 + table_bytes.len() + pk_bytes.len());
     key.extend_from_slice(&(table_bytes.len() as u32).to_be_bytes());
     key.extend_from_slice(table_bytes);
@@ -300,89 +559,108 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_a_simple_insert() {
-        let q = parse_query("INSERT INTO t (pk, v) VALUES ('a', 'hello')").unwrap();
-        assert_eq!(
-            q,
-            Query::Insert {
-                table: "t".into(),
-                pk: "a".into(),
-                value: "hello".into(),
-            }
-        );
-    }
-
-    #[test]
-    fn parses_a_simple_select_with_trailing_semicolon() {
-        let q = parse_query("SELECT * FROM t WHERE pk = 'a';").unwrap();
-        assert_eq!(
-            q,
-            Query::Select {
-                table: "t".into(),
-                pk: "a".into(),
-            }
-        );
-    }
-
-    #[test]
-    fn keywords_are_case_insensitive() {
-        let q = parse_query("insert into Users (PK, V) values ('u1', '42')").unwrap();
-        assert_eq!(
-            q,
-            Query::Insert {
-                table: "Users".into(),
-                pk: "u1".into(),
-                value: "42".into(),
-            }
-        );
-    }
-
-    #[test]
-    fn accepts_bare_numeric_values() {
-        let q = parse_query("INSERT INTO t (pk, v) VALUES (7, 99)").unwrap();
-        assert_eq!(
-            q,
-            Query::Insert {
-                table: "t".into(),
-                pk: "7".into(),
-                value: "99".into(),
-            }
-        );
-    }
-
-    #[test]
-    fn handles_escaped_quotes_and_empty_strings() {
-        let q = parse_query("INSERT INTO t (pk, v) VALUES ('a', 'it''s')").unwrap();
-        let Query::Insert { value, .. } = q else {
-            panic!("expected insert")
+    fn parses_create_table() {
+        let stmt = parse_statement(
+            "CREATE TABLE app.users (id uuid, name text, age int, PRIMARY KEY (id))",
+        )
+        .unwrap();
+        let Statement::CreateTable(ct) = stmt else {
+            panic!("expected create table");
         };
-        assert_eq!(value, "it's");
-
-        let q = parse_query("INSERT INTO t (pk, v) VALUES ('a', '')").unwrap();
-        let Query::Insert { value, .. } = q else {
-            panic!("expected insert")
-        };
-        assert_eq!(value, "");
+        assert_eq!(ct.keyspace.as_deref(), Some("app"));
+        assert_eq!(ct.table, "users");
+        assert_eq!(ct.partition_key, "id");
+        assert_eq!(ct.columns.len(), 3);
+        assert_eq!(ct.columns[2], ("age".into(), CqlType::Int));
     }
 
     #[test]
-    fn rejects_wrong_columns() {
-        let err = parse_query("INSERT INTO t (id, v) VALUES ('a', 'b')").unwrap_err();
+    fn parses_inline_primary_key() {
+        let stmt = parse_statement("CREATE TABLE t (k int PRIMARY KEY, v text)").unwrap();
+        let Statement::CreateTable(ct) = stmt else {
+            panic!("expected create table");
+        };
+        assert_eq!(ct.partition_key, "k");
+    }
+
+    #[test]
+    fn rejects_composite_pk() {
+        let err = parse_statement("CREATE TABLE t (a int, b int, PRIMARY KEY (a, b))").unwrap_err();
         assert!(matches!(err, QueryError::Unsupported(_)));
+    }
+
+    #[test]
+    fn parses_use_and_create_keyspace() {
+        assert_eq!(
+            parse_statement("USE app").unwrap(),
+            Statement::Use {
+                keyspace: "app".into()
+            }
+        );
+        let stmt = parse_statement("CREATE KEYSPACE IF NOT EXISTS app WITH replication = {'x': 1}")
+            .unwrap();
+        assert_eq!(
+            stmt,
+            Statement::CreateKeyspace {
+                keyspace: "app".into(),
+                if_not_exists: true,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_insert_with_binds_and_literals() {
+        let stmt =
+            parse_statement("INSERT INTO users (id, name, age) VALUES (?, 'Ada', 36)").unwrap();
+        let Statement::Insert(ins) = stmt else {
+            panic!("expected insert");
+        };
+        assert_eq!(ins.columns, vec!["id", "name", "age"]);
+        assert_eq!(ins.values[0], Term::Bind);
+        assert_eq!(
+            ins.values[1],
+            Term::Literal {
+                text: "Ada".into(),
+                quoted: true
+            }
+        );
+        assert_eq!(
+            ins.values[2],
+            Term::Literal {
+                text: "36".into(),
+                quoted: false
+            }
+        );
+    }
+
+    #[test]
+    fn parses_select_projection_and_star() {
+        let star = parse_statement("SELECT * FROM users WHERE id = ?").unwrap();
+        let Statement::Select(s) = star else {
+            panic!("expected select")
+        };
+        assert!(s.projection.is_empty());
+        assert_eq!(s.where_column, "id");
+        assert_eq!(s.where_value, Term::Bind);
+
+        let proj = parse_statement("SELECT name, age FROM users WHERE id = 'u1'").unwrap();
+        let Statement::Select(s) = proj else {
+            panic!("expected select")
+        };
+        assert_eq!(s.projection, vec!["name", "age"]);
     }
 
     #[test]
     fn rejects_unknown_statements() {
         assert!(matches!(
-            parse_query("DELETE FROM t WHERE pk = 'a'"),
+            parse_statement("DROP TABLE t"),
             Err(QueryError::Unsupported(_))
         ));
-        assert!(matches!(parse_query("   "), Err(QueryError::Empty)));
+        assert!(matches!(parse_statement("   "), Err(QueryError::Empty)));
     }
 
     #[test]
     fn data_key_disambiguates_tables() {
-        // "ab" + key "c" must differ from "a" + key "bc".
-        assert_ne!(data_key("ab", "c"), data_key("a", "bc"));
+        assert_ne!(data_key("ab", b"c"), data_key("a", b"bc"));
     }
 }

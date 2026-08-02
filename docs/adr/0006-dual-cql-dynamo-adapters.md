@@ -57,27 +57,50 @@ The surface now extends past the original three point ops:
   `DeleteItem`: the edge quorum-reads the current item under the coordinator
   lock and rejects a failing predicate with `ConditionalCheckFailedException`.
 
-A third slice now exists on the CQL side: a **minimal Cassandra CQL v4 binary
-protocol** is served alongside the DynamoDB endpoint. `custos-cql` is the pure,
-deterministic protocol layer — frame header (version/flags/stream/opcode/length)
-encode/decode, the body primitives the handshake needs, and a deliberately tiny
-CQL recognizer that extracts the operation + primary key (+ value) from a single
-`INSERT INTO t (pk, v) VALUES (..)` or `SELECT * FROM t WHERE pk = ..` (it is not
-a CQL grammar). `custosd` exposes a real TCP endpoint that does the
-`STARTUP → READY` (and `OPTIONS → SUPPORTED`) handshake and routes those two
-statements **through the same quorum coordinator** the plain-TCP and DynamoDB
-edges use; an `INSERT` replies `RESULT/Void`, a `SELECT` replies `RESULT/Rows`.
-Like the DynamoDB endpoint it is production-only I/O (real tokio sockets +
-hand-rolled framing, no third-party CQL/Cassandra crate); everything below the
-socket stays on the `Env`-based paths.
+A third slice exists on the CQL side: a **Cassandra CQL v4 binary protocol** is
+served alongside the DynamoDB endpoint. `custos-cql` is the pure, deterministic
+protocol layer; `custosd::cql` is the production-only I/O edge (real tokio
+sockets + hand-rolled framing, no third-party CQL/Cassandra crate). It now
+carries a real type system and a schema catalog rather than a fixed `(pk, v)`
+convention:
+
+- **A type/value system.** `custos_cql::types` models the common scalar CQL
+  types — `text`, `int`, `bigint`, `boolean`, `blob`, `uuid` — with
+  encode/decode of cell bytes (the contents of a protocol `[bytes]`) and literal
+  parsing. Result frames carry proper `[column metadata]` with the real type ids,
+  and bound values decode/type-check against the column type.
+- **`CREATE TABLE` + keyspaces.** `CREATE KEYSPACE`, `USE <keyspace>`, and
+  `CREATE TABLE (... PRIMARY KEY (col))` record a schema (one partition-key
+  column + typed columns) in an in-memory `Catalog`, so `INSERT`/`SELECT` resolve
+  their columns against the declared schema. A row is serialized to one
+  data-plane value (a versioned, self-describing blob of `(schema column index,
+  cell)` pairs) keyed by `escape(table) || pk_key_bytes`. The catalog is
+  **in-memory and not durable** (lost on restart; shared across in-process nodes
+  in `--cluster N` dev mode) — replicating schemas through the control plane is
+  future work, exactly as on the DynamoDB side.
+- **Prepared statements.** `PREPARE` parses + resolves a statement's `?` bind
+  markers against the catalog and replies `RESULT/Prepared` (a
+  content-addressed statement id + the bind-variable metadata); `EXECUTE` decodes
+  the bound cells against that metadata and runs the statement on the same path
+  as `QUERY`. The id is a stable hash of the statement text, so a driver's
+  prepare-then-execute path works across connections.
+
+The recognizer (`parse_statement`) accepts `USE` / `CREATE KEYSPACE` /
+`CREATE TABLE` / `INSERT` / `SELECT` (with `?` markers and `keyspace.table`
+names); anything outside the subset is rejected cleanly with a CQL `ERROR` frame.
+`INSERT`/`EXECUTE` reply `RESULT/Void`, `SELECT` replies a typed `RESULT/Rows`,
+and `USE`/`CREATE` reply `SetKeyspace`/`SchemaChange`. Everything routes through
+the **same quorum coordinator** the plain-TCP and DynamoDB edges use; everything
+below the socket stays on the `Env`-based paths.
 
 What remains. DynamoDB: `Scan`, projection/filter expressions, `ReturnValues`,
 document/set attribute types, secondary indexes, and durable
 control-plane-replicated table schemas (plus a native quorum range scan so
-`Query` need not track keys). CQL: a real type system + column metadata, a
-proper CQL grammar (prepared statements, batches, clustering columns, more
-statement kinds), `USE`/keyspaces and `CREATE TABLE`, paging, authentication,
-and honoring the requested consistency level (currently ignored).
+`Query` need not track keys). CQL: clustering columns + composite/compound
+partition keys, more statement kinds (`UPDATE`/`DELETE`/`BATCH`/`ALTER`/`DROP`),
+collection/UDT types, paging, authentication, `LWT`/conditional writes, honoring
+the requested consistency level (currently ignored), and durable
+control-plane-replicated schemas.
 
 ## Consequences
 

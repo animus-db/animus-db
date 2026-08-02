@@ -43,9 +43,13 @@ as one process (`custosd --cluster N`) or one process per node (`custosd --confi
 FILE --node I`, config via `gen-config`; `--ephemeral` selects the volatile
 in-memory engine for dev runs),
 which now also **serves the DynamoDB JSON protocol over HTTP**, routing those
-requests through the same data-plane coordinator — plus a **minimal CQL v4 wire
-protocol** (`custos-cql`: STARTUP/READY handshake + simple INSERT/SELECT-by-key,
-routed through that same coordinator) — the **topology-aware placement
+requests through the same data-plane coordinator — plus a **CQL v4 wire
+protocol** (`custos-cql`: STARTUP/READY handshake; a scalar **type system**
+(text/int/bigint/boolean/blob/uuid) with typed column metadata + bound values;
+`CREATE KEYSPACE`/`USE`/`CREATE TABLE` recording a schema in an in-memory
+catalog; `INSERT`/`SELECT` resolved against that schema; and **prepared
+statements** (PREPARE→Prepared, EXECUTE with bound values) — all routed through
+that same coordinator) — the **topology-aware placement
 engine** (`custos-placement`: residency + failure-domain spread, with the leader
 automatically reconciling tablet placement via control-plane `CasTabletReplicas`),
 and a **slice of Accord-style leaderless transaction consensus**
@@ -56,8 +60,9 @@ against a real `StorageEngine` (`MemoryEngine` under sim) via a WAL it recovers
 from on restart — and a **first slice of coordinator failover** (a replica can
 recover a stranded transaction whose coordinator died, adopting a committed
 decision or forcing the slow path); ADR 0011). Skeletons / future work:
-the fuller CQL surface (a real type system, CQL grammar, keyspaces,
-prepared statements) and the rest of the DynamoDB surface (Scan,
+the rest of the CQL surface (clustering/composite keys, UPDATE/DELETE/BATCH,
+collection types, paging, auth, durable replicated schemas) and the rest of the
+DynamoDB surface (Scan,
 projection/filter expressions, `ReturnValues`, document/set types, secondary
 indexes, durable/replicated table schemas), and the deferred remainder of Accord
 (the full dependency wait-graph, the precise recovery ballot + duelling
