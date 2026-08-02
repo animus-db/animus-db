@@ -7,7 +7,7 @@
   transactions + read-set dependency folding + adaptive retry backoff; then
   arbitrary caller-supplied write values; then recovery ballots + duelling
   recoverers; then a **failure detector** that auto-triggers recovery + commit-ballot
-  fencing)
+  fencing; then **per-shard consensus** — one Accord group per tablet)
 - **Date:** 2026-08-01 (execution + durability increment: 2026-08-01;
   storage-backed execution + coordinator-failover increment: 2026-08-01;
   read-transactions + multi-thread-liveness increment: 2026-08-02;
@@ -16,7 +16,8 @@
   sharded-transactions + read-set-folding + adaptive-backoff increment:
   2026-08-02; arbitrary-write-values increment: 2026-08-02;
   recovery-ballots + duelling-recoverers increment: 2026-08-02;
-  failure-detector-triggered-recovery + commit-ballot-fencing increment: 2026-08-02)
+  failure-detector-triggered-recovery + commit-ballot-fencing increment: 2026-08-02;
+  per-shard-consensus increment: 2026-08-02)
 
 ## Context
 
@@ -692,3 +693,94 @@ The `AccordNode` driver now does, again without reshaping the sync-core /
   whole replica set is alive — a real detector would use heartbeats / a liveness
   oracle rather than a per-txn stall timer, and would not need a bound large enough
   to absorb a partition-and-heal window).
+
+## Per-shard consensus increment (2026-08-02)
+
+This increment closes the long-standing **per-shard consensus replica sets /
+placement** deferral that every prior slice named: until now there was **one
+global Accord replica set** over the whole key space, and "sharding" routed only
+the *execution effect* per tablet (`start_with_router`). This increment runs **one
+Accord consensus group per tablet** — a tablet's replica set *is* its own Accord
+group — again without reshaping (indeed without touching) the sync `AccordCore`.
+
+- **A tablet is a consensus group.** Accord conflicts on intersecting key sets,
+  and the keyspace already partitions into disjoint tablets (ADR 0002), each with
+  its own replica set in the control plane's tablet map (ADR 0001). So per-shard
+  consensus falls out by *composition*: for each tablet `T`, an `AccordNode` whose
+  `all_nodes` is `T`'s replica set, keyed only on `T`'s keys, **is** the consensus
+  group for that shard. Two transactions touching disjoint tablets never conflict,
+  so they never share a group; a transaction touching only `T` is agreed entirely
+  within `T`'s replicas. This adds **no** new control-plane state — the groups are
+  *derived from the existing tablet map* (`ShardRouter` over the same `Vec<Tablet>`
+  that `animus-data::Router` already routes data-plane I/O with).
+
+- **`ShardRouter` + `ShardedOwner` (driver-level, the sync core untouched).**
+  `ShardRouter` maps an Accord `Key` → owning `Tablet` (id + replica set) and
+  splits a transaction's key set into one per-tablet **slice**. `ShardedOwner` is
+  what a *physical* node runs: it hosts **one `AccordNode` per local shard** — one
+  per tablet whose replica set includes this node — each on its **own** `Env`
+  node-id (a distinct inbox *and* a distinct `accord.wal`, because a node's inbox
+  is single-consumer, ADR 0001). The owner is the routing front-end. The
+  `AccordCore` and `AccordNode` are entirely unchanged: per-shard consensus is a
+  composition of existing per-group nodes, so every group keeps the full Accord
+  machinery (fast/slow path, durability, recovery ballots, the failure-detector
+  tick) independently.
+
+- **Single-shard transactions (the common case).** When every key falls in one
+  tablet, the transaction is submitted to **that group only** via
+  `ShardedOwner::submit`; every other group is untouched. A fault on an unrelated
+  shard therefore cannot stall it — the groups are independent consensus instances
+  on disjoint env-ids. (Tested: a partition that strands one shard's coordinator
+  leaves an unrelated shard committing + executing within the window.)
+
+- **Cross-shard transactions.** When the key set spans tablets, the transaction is
+  split into one per-tablet slice and **each slice is submitted to its own group**
+  as a sub-transaction (`ShardedTxn` names the per-group ids). What this guarantees
+  today:
+  - **Atomic visibility:** the coordinator (`ShardedOwner::is_applied`) treats the
+    transaction as done only when **all** slices have applied — all-or-nothing at
+    the read point.
+  - **Consistent ordering of conflicting cross-shard transactions:** any two
+    cross-shard transactions that conflict must share at least one key, hence one
+    common tablet/group, and **that shared group serializes them** (the Accord
+    order on the shared tablet decides the winner); every key's data is owned by
+    exactly one group, so there is no torn write set across shards once all slices
+    commit.
+  - The coordinator must replicate every tablet the transaction touches (so it can
+    drive each slice locally); `submit` returns `ShardError::NotLocal` rather than
+    silently dropping a slice otherwise.
+
+- **What is deliberately *not* yet done (the precise scope of this slice).** This
+  is **independent per-shard agreement under a shared logical-clock domain**, not a
+  single unified cross-shard Accord round. Specifically deferred: a **single global
+  execution timestamp** computed as the max of the per-shard `PreAccept` replies
+  (each shard agrees its slice's own `execute_at`), and a **2PC-style atomic-commit
+  protocol** that makes a cross-shard transaction commit-or-abort as one unit even
+  under a coordinator crash mid-commit (today a stranded slice is finished by *that
+  shard's* own recovery nominee, so the cross-shard transaction completes shard by
+  shard rather than via a unified abort/commit decision). Also deferred: a
+  cross-node slice dispatch so a coordinator need not replicate every involved
+  tablet; folding a cross-shard transaction's deps across shards into one global
+  dependency set; and dynamic tablet split/merge re-sharding a live consensus
+  group. These are the remaining steps toward full multi-shard Accord.
+
+- **Tests** in `animus-consensus/tests/accord_per_shard.rs` (`SimEnv`, two tablets
+  on overlapping replica sets so one node coordinates cross-shard; every run
+  seed-reproducible): a single-shard transaction executes on its owning group only
+  and the other group is wholly untouched; single-shard transactions on distinct
+  tablets are independent; a non-local key is rejected; a cross-shard transaction
+  commits atomically on both groups (each key carries its own slice on every
+  replica of its shard); two conflicting cross-shard transactions serialize via the
+  shared group (and neither private key is torn); arbitrary write values route per
+  shard; and a fault confined to one shard does not stall an unrelated shard. The
+  whole existing suite stays green, including `accord_sharded.rs` (effect-sharding,
+  retained unchanged) and the frozen Elle corpus (`animus-test`).
+
+- **Still deferred after this increment** (unchanged from above, minus per-shard
+  consensus which this closes): the unified global cross-shard timestamp + 2PC
+  atomic commit described above; the full transitive dependency wait-graph; WAL
+  snapshotting / log truncation; the precise fast-path quorum bound; the precise
+  `PreAcceptOk`-witness fast-path-recovery decision; and an adaptive /
+  membership-aware failure detector. Placement of the consensus participants is now
+  exactly tablet placement (ADR 0005) — `ShardRouter` derives the groups from the
+  same tablet map the control plane already maintains.
