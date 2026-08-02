@@ -181,6 +181,55 @@ async fn run_workload<E: StorageEngine>(engine: &E, cfg: &Config) -> (Stats, Sta
     )
 }
 
+/// Aggregate write throughput with `writers` tasks issuing writes **concurrently**
+/// against one shared engine. This is the workload WAL group commit targets: many
+/// in-flight writes coalescing their `fsync`s. Returns (writes/s, elapsed).
+///
+/// Uses `merge` (per-key last-writer-wins), the data-plane's actual write
+/// primitive — unlike `put` it does not enforce the engine-wide monotonic floor,
+/// so concurrent writers on disjoint keys never collide on the version contract.
+/// Each writer owns a disjoint key partition, so every merge applies.
+async fn concurrent_put_throughput<E>(
+    engine: &E,
+    total: u64,
+    value_bytes: usize,
+    writers: u64,
+) -> (f64, Duration)
+where
+    E: StorageEngine + 'static,
+{
+    let per = total / writers;
+    let start = Instant::now();
+    let mut handles = Vec::with_capacity(writers as usize);
+    for w in 0..writers {
+        let engine = engine.clone();
+        handles.push(tokio::spawn(async move {
+            for j in 0..per {
+                // Disjoint key per (writer, j); a strictly increasing per-key
+                // version (always 1 here, since each key is written once).
+                let idx = j * writers + w;
+                let k = key_for(idx);
+                let v = value_for(idx, value_bytes);
+                engine
+                    .merge(&k, &v, idx + 1)
+                    .await
+                    .expect("concurrent merge");
+            }
+        }));
+    }
+    for h in handles {
+        h.await.expect("writer task");
+    }
+    let elapsed = start.elapsed();
+    let done = per * writers;
+    let tput = if elapsed.is_zero() {
+        0.0
+    } else {
+        done as f64 / elapsed.as_secs_f64()
+    };
+    (tput, elapsed)
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
     let cfg = Config::from_env();
@@ -228,6 +277,35 @@ async fn main() {
         lsm.sstable_count(),
         total.as_secs_f64(),
     );
+
+    // ---- Concurrent-write throughput (WAL group commit) ----
+    // The sequential `put` loop above coalesces nothing (one in-flight write at a
+    // time). Group commit pays off when writes are concurrent: this measures
+    // aggregate put throughput as the writer count grows, on a fresh engine each
+    // time. The per-batch fsync count is reported so the coalescing is visible.
+    let writers_set: Vec<u64> = std::env::var("CUSTOS_BENCH_WRITERS")
+        .ok()
+        .map(|s| s.split(',').filter_map(|p| p.trim().parse().ok()).collect())
+        .unwrap_or_else(|| vec![1, 8, 32, 128]);
+    let conc_keys = cfg.keys;
+    println!("\nLsmEngine concurrent put throughput (group commit):");
+    for &writers in &writers_set {
+        let cdir = std::env::temp_dir().join(format!(
+            "custos-bench-conc-{}-{writers}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&cdir);
+        let (cenv, _cb) = ProdEnv::bind(0, addr, &cdir).await.expect("bind ProdEnv");
+        let clsm = LsmEngine::open_with(cenv, "db-", opts).await.expect("open");
+        let (tput, elapsed) =
+            concurrent_put_throughput(&clsm, conc_keys, cfg.value_bytes, writers).await;
+        println!(
+            "  writers={writers:<4} {tput:>10.0} puts/s   batch_fsyncs={:<6} ({:.2}s for {conc_keys} puts)",
+            clsm.wal_batch_sync_count(),
+            elapsed.as_secs_f64(),
+        );
+        let _ = std::fs::remove_dir_all(&cdir);
+    }
 
     // Best-effort cleanup of the temp data dir.
     let _ = std::fs::remove_dir_all(&dir);

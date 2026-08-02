@@ -99,8 +99,10 @@ use crate::{
 
 mod bloom;
 mod sstable;
+mod wal;
 
 use sstable::{Record, SsTableMeta, SsTableReader, SsTableWriter};
+use wal::GroupCommit;
 
 /// Default memtable flush threshold: total bytes of buffered key+value data.
 const DEFAULT_FLUSH_BYTES: usize = 64 * 1024;
@@ -220,6 +222,13 @@ struct Inner {
     /// reader so the engine can report read amplification (introspection /
     /// tests — e.g. that a Bloom-rejected point-miss reads zero blocks).
     block_reads: Arc<AtomicU64>,
+    /// Writes that are **durable in the WAL but not yet applied to the memtable**:
+    /// a writer increments this before logging and decrements it after the apply.
+    /// A flush must not truncate the WAL while this is non-zero, or it would drop a
+    /// durable-but-unapplied record that is in neither the memtable nor the new
+    /// SSTable. With WAL group commit a writer yields between log and apply, so this
+    /// window is now observable; the gate closes it (see [`LsmEngine::flush`]).
+    applies_in_flight: u64,
 }
 
 impl Inner {
@@ -253,6 +262,20 @@ impl Inner {
     }
 }
 
+/// Decrements [`Inner::applies_in_flight`] on drop, so the in-flight gate is
+/// released on every path (a normal apply, an early-return error, or a panic).
+struct InFlightGuard {
+    inner: Arc<Mutex<Inner>>,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.applies_in_flight = inner.applies_in_flight.saturating_sub(1);
+        }
+    }
+}
+
 /// A real on-disk LSM storage engine. Cheap to clone; clones share state.
 ///
 /// Open one with [`LsmEngine::open`]. All I/O flows through the `Env` it was
@@ -264,6 +287,10 @@ pub struct LsmEngine<E: Env> {
     prefix: Arc<str>,
     opts: LsmOptions,
     inner: Arc<Mutex<Inner>>,
+    /// WAL group-commit coordinator: concurrent writes batch their records and
+    /// share a single `fsync`. Has its own lock (never the `Inner` lock), so a
+    /// writer can park awaiting durability without serializing the memtable.
+    wal: Arc<GroupCommit>,
 }
 
 impl<E: Env> LsmEngine<E> {
@@ -349,22 +376,50 @@ impl<E: Env> LsmEngine<E> {
             flushes: 0,
             compactions: 0,
             block_reads,
+            applies_in_flight: 0,
         };
+
+        // The WAL has been fully replayed into the memtable, so every recovered
+        // record is already reflected in memory: the group-commit sequence space
+        // starts fresh at 0 (the next new write is the first durable sequence).
+        let wal = Arc::new(GroupCommit::new(format!("{prefix}wal")));
 
         Ok(Self {
             env,
             prefix,
             opts,
             inner: Arc::new(Mutex::new(inner)),
+            wal,
         })
     }
 
-    /// Durably log a record (append + sync) **before** it is applied in memory.
-    async fn log(&self, record: &WalRecord) -> Result<()> {
+    /// Durably log `record` then apply it to the memtable via `apply`, holding the
+    /// **in-flight gate** across the whole window so a concurrent flush cannot
+    /// truncate this still-unapplied record out of the WAL.
+    ///
+    /// The record is made durable via WAL **group commit** (the encoded record
+    /// joins a shared pending batch and this returns only once a single `fsync`
+    /// covering it has completed; ADR 0008), then `apply` mutates the memtable
+    /// under the `Inner` lock. Durability precedes the in-memory apply, so an ack
+    /// means durable; the apply runs only on a successful sync.
+    async fn log_and_apply(
+        &self,
+        record: &WalRecord,
+        apply: impl FnOnce(&mut Inner),
+    ) -> Result<()> {
+        // Enter the in-flight gate: a flush will not truncate the WAL while any
+        // durable-but-unapplied record exists. A guard decrements on every path.
+        self.lock().applies_in_flight += 1;
+        let guard = InFlightGuard {
+            inner: Arc::clone(&self.inner),
+        };
         let bytes = encode_wal(record);
-        let wal = self.wal_file();
-        self.env.append(&wal, &bytes).await.map_err(io)?;
-        self.env.sync(&wal).await.map_err(io)?;
+        self.wal.commit(&self.env, bytes).await?;
+        {
+            let mut inner = self.lock();
+            apply(&mut inner);
+        }
+        drop(guard);
         Ok(())
     }
 
@@ -492,7 +547,13 @@ impl<E: Env> LsmEngine<E> {
     async fn maybe_flush_and_compact(&self) -> Result<()> {
         let should_flush = {
             let inner = self.lock();
-            !inner.memtable.is_empty() && inner.memtable_bytes >= self.opts.flush_threshold_bytes
+            !inner.memtable.is_empty()
+                && inner.memtable_bytes >= self.opts.flush_threshold_bytes
+                // Don't flush while a concurrent write is durable-but-unapplied:
+                // truncating the WAL now could drop that record. The writer will
+                // re-attempt the flush from its own `maybe_flush_and_compact` once
+                // it has applied. (See `Inner::applies_in_flight` and `flush`.)
+                && inner.applies_in_flight == 0
         };
         if should_flush {
             self.flush().await?;
@@ -549,7 +610,11 @@ impl<E: Env> LsmEngine<E> {
     /// manifest, drop the folded WAL, and start a fresh (empty) WAL + memtable.
     async fn flush(&self) -> Result<()> {
         // Snapshot the memtable + the seq to allocate, lock-free for the write.
-        let (records, seq, mut new_manifest) = {
+        // The caller (`maybe_flush_and_compact`) only calls us with no writes
+        // in-flight, so the memtable snapshot captures every WAL record that is
+        // durable *so far*; we record that WAL watermark to decide later whether
+        // the WAL can be safely truncated.
+        let (records, seq, mut new_manifest, wal_watermark) = {
             let inner = self.lock();
             if inner.memtable.is_empty() {
                 return Ok(());
@@ -558,7 +623,7 @@ impl<E: Env> LsmEngine<E> {
             let seq = inner.manifest.next_seq + 1;
             let mut m = inner.manifest.clone();
             m.next_seq = seq;
-            (records, seq, m)
+            (records, seq, m, self.wal.durable_seq())
         };
 
         // Build + sync the new SSTable file (outside the lock). A flush always
@@ -573,8 +638,26 @@ impl<E: Env> LsmEngine<E> {
         new_manifest.tables.push(meta);
         self.write_manifest(&new_manifest).await?;
 
-        // The WAL is now redundant (its writes live in the SSTable). Start fresh.
-        self.env.replace(&self.wal_file(), &[]).await.map_err(io)?;
+        // The flushed records now live durably in the SSTable, so the WAL prefix
+        // that produced them is redundant. We may truncate the WAL to reclaim it
+        // **only** if nothing new became durable since the snapshot and no write
+        // is mid-apply — otherwise a newer record, durable in the WAL but not yet
+        // in this SSTable, would be lost. When we cannot truncate, the WAL keeps
+        // those already-flushed records too; replaying them on recovery just
+        // re-inserts identical `(key, version)` slots (idempotent), so it stays
+        // correct — they are simply reclaimed by a later flush instead.
+        //
+        // `begin_truncate` latches out new `commit`s and refuses if any writer is
+        // mid-`commit`; combined with the watermark + in-flight checks this makes
+        // the WAL `replace`+reset safe against a concurrent writer.
+        let safe_to_truncate = {
+            let inner = self.lock();
+            inner.applies_in_flight == 0 && self.wal.durable_seq() == wal_watermark
+        };
+        if safe_to_truncate && self.wal.begin_truncate() {
+            self.env.replace(&self.wal_file(), &[]).await.map_err(io)?;
+            self.wal.finish_truncate();
+        }
 
         // Commit the in-memory swap: clear the flushed memtable, add the reader.
         {
@@ -760,6 +843,15 @@ impl<E: Env> LsmEngine<E> {
         self.lock().compactions
     }
 
+    /// Number of WAL **group-commit batch `fsync`s** performed since open. With
+    /// per-write fsyncs this would equal the write count; group commit makes it
+    /// strictly smaller when writes coalesce. Test/introspection.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn wal_batch_sync_count(&self) -> u64 {
+        self.wal.batch_sync_count()
+    }
+
     /// Total SSTable blocks fetched from disk since open (read amplification).
     /// Test/introspection — used to assert a Bloom-rejected point-miss reads no
     /// block.
@@ -845,17 +937,18 @@ impl<E: Env> StorageEngine for LsmEngine<E> {
                 });
             }
         }
-        self.log(&WalRecord::Put {
-            key: key.to_vec(),
-            value: value.to_vec(),
-            version,
-        })
+        self.log_and_apply(
+            &WalRecord::Put {
+                key: key.to_vec(),
+                value: value.to_vec(),
+                version,
+            },
+            |inner| {
+                inner.apply_put(key, value, version);
+                inner.manifest.max_version = version;
+            },
+        )
         .await?;
-        {
-            let mut inner = self.lock();
-            inner.apply_put(key, value, version);
-            inner.manifest.max_version = version;
-        }
         self.maybe_flush_and_compact().await
     }
 
@@ -869,17 +962,18 @@ impl<E: Env> StorageEngine for LsmEngine<E> {
         {
             return Ok(false);
         }
-        self.log(&WalRecord::Put {
-            key: key.to_vec(),
-            value: value.to_vec(),
-            version,
-        })
+        self.log_and_apply(
+            &WalRecord::Put {
+                key: key.to_vec(),
+                value: value.to_vec(),
+                version,
+            },
+            |inner| {
+                inner.apply_put(key, value, version);
+                inner.manifest.max_version = inner.manifest.max_version.max(version);
+            },
+        )
         .await?;
-        {
-            let mut inner = self.lock();
-            inner.apply_put(key, value, version);
-            inner.manifest.max_version = inner.manifest.max_version.max(version);
-        }
         self.maybe_flush_and_compact().await?;
         Ok(true)
     }
@@ -892,16 +986,17 @@ impl<E: Env> StorageEngine for LsmEngine<E> {
         {
             return Ok(false);
         }
-        self.log(&WalRecord::Delete {
-            key: key.to_vec(),
-            version,
-        })
+        self.log_and_apply(
+            &WalRecord::Delete {
+                key: key.to_vec(),
+                version,
+            },
+            |inner| {
+                inner.apply_delete(key, version);
+                inner.manifest.max_version = inner.manifest.max_version.max(version);
+            },
+        )
         .await?;
-        {
-            let mut inner = self.lock();
-            inner.apply_delete(key, version);
-            inner.manifest.max_version = inner.manifest.max_version.max(version);
-        }
         self.maybe_flush_and_compact().await?;
         Ok(true)
     }
@@ -916,16 +1011,17 @@ impl<E: Env> StorageEngine for LsmEngine<E> {
                 });
             }
         }
-        self.log(&WalRecord::Delete {
-            key: key.to_vec(),
-            version,
-        })
+        self.log_and_apply(
+            &WalRecord::Delete {
+                key: key.to_vec(),
+                version,
+            },
+            |inner| {
+                inner.apply_delete(key, version);
+                inner.manifest.max_version = version;
+            },
+        )
         .await?;
-        {
-            let mut inner = self.lock();
-            inner.apply_delete(key, version);
-            inner.manifest.max_version = version;
-        }
         self.maybe_flush_and_compact().await
     }
 
@@ -945,20 +1041,21 @@ impl<E: Env> StorageEngine for LsmEngine<E> {
         // Expand to the live keys in range (memtable + SSTables) so the WAL record
         // and the apply are a pure key set — replay needs no live-state lookup.
         let keys = self.live_keys_in_range(start, end, version).await?;
-        self.log(&WalRecord::DeleteRange {
-            start: start.to_vec(),
-            end: end.to_vec(),
-            keys: keys.clone(),
-            version,
-        })
+        self.log_and_apply(
+            &WalRecord::DeleteRange {
+                start: start.to_vec(),
+                end: end.to_vec(),
+                keys: keys.clone(),
+                version,
+            },
+            |inner| {
+                for k in &keys {
+                    inner.apply_delete(k, version);
+                }
+                inner.manifest.max_version = version;
+            },
+        )
         .await?;
-        {
-            let mut inner = self.lock();
-            for k in &keys {
-                inner.apply_delete(k, version);
-            }
-            inner.manifest.max_version = version;
-        }
         self.maybe_flush_and_compact().await
     }
 
@@ -997,26 +1094,27 @@ impl<E: Env> StorageEngine for LsmEngine<E> {
                 }
             }
         }
-        self.log(&WalRecord::Batch {
-            version: batch.version,
-            ops: logged.clone(),
-        })
-        .await?;
-        {
-            let mut inner = self.lock();
-            for op in &logged {
-                match op {
-                    BatchOp::Put { key, value } => inner.apply_put(key, value, batch.version),
-                    BatchOp::Delete { key } => inner.apply_delete(key, batch.version),
-                    BatchOp::DeleteKeys { keys } => {
-                        for k in keys {
-                            inner.apply_delete(k, batch.version);
+        self.log_and_apply(
+            &WalRecord::Batch {
+                version: batch.version,
+                ops: logged.clone(),
+            },
+            |inner| {
+                for op in &logged {
+                    match op {
+                        BatchOp::Put { key, value } => inner.apply_put(key, value, batch.version),
+                        BatchOp::Delete { key } => inner.apply_delete(key, batch.version),
+                        BatchOp::DeleteKeys { keys } => {
+                            for k in keys {
+                                inner.apply_delete(k, batch.version);
+                            }
                         }
                     }
                 }
-            }
-            inner.manifest.max_version = batch.version;
-        }
+                inner.manifest.max_version = batch.version;
+            },
+        )
+        .await?;
         self.maybe_flush_and_compact().await
     }
 
