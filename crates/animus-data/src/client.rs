@@ -256,6 +256,92 @@ impl<E: Env> DataClient<E> {
         }
     }
 
+    /// Quorum range scan over the half-open key range `[start, end)` (an empty
+    /// `end` scans to the end of the keyspace). Broadcasts a
+    /// [`DataMsg::ScanRange`] to the tablet's replicas and, once `r` replicas
+    /// respond, **merges** their per-replica results by per-key newest MVCC
+    /// version (last-writer-wins, exactly like a point read): the highest-version
+    /// record wins for each key. Tombstones ride along in the merge (so a newer
+    /// delete on one replica correctly shadows a stale value on another) and are
+    /// then excluded from the returned set. The result is the merged, **sorted**
+    /// `(key, value)` set; an optional `limit` caps it to the first `limit` keys
+    /// in key order.
+    ///
+    /// Returns `None` if a read quorum could not be reached (too many replicas
+    /// down or fenced) — the scan analog of [`ReadResult::Failed`]. This is a
+    /// *snapshot-free* range read: it reflects whatever the responding quorum
+    /// holds at response time, with the same `R + W > N` intersection guarantee a
+    /// point read has per key. It does **not** perform read-repair (a divergent
+    /// range is converged by background anti-entropy); it is the native primitive
+    /// the wire adapters use instead of tracking keys in-memory.
+    pub async fn scan(
+        &self,
+        view: &TabletView,
+        start: &[u8],
+        end: &[u8],
+        limit: Option<usize>,
+        timeout: Duration,
+    ) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
+        let req = self.env.next_u64();
+        let msg = DataMsg::ScanRange {
+            req,
+            tablet: view.tablet,
+            epoch: view.epoch,
+            start: start.to_vec(),
+            end: end.to_vec(),
+        };
+        self.broadcast(&view.replicas, &msg).await;
+
+        let mut oks = 0usize;
+        let mut responded = 0usize;
+        // Merge each responder's records by per-key newest version (LWW). A
+        // tombstone (`None`) competes on version just like a value, so a newer
+        // delete shadows a stale value; deleted keys are dropped after merging.
+        // BTreeMap ⇒ sorted-by-key result, deterministic.
+        let mut merged: std::collections::BTreeMap<Vec<u8>, (u64, Option<Vec<u8>>)> =
+            std::collections::BTreeMap::new();
+        self.collect(view.replicas.len(), timeout, |_from, reply| {
+            if let DataMsg::ScanResp {
+                req: r,
+                ok,
+                entries,
+            } = reply
+            {
+                if r == req {
+                    responded += 1;
+                    if ok {
+                        oks += 1;
+                        for (key, value, version) in entries {
+                            merged
+                                .entry(key)
+                                .and_modify(|cur| {
+                                    if version > cur.0 {
+                                        *cur = (version, value.clone());
+                                    }
+                                })
+                                .or_insert((version, value));
+                        }
+                    }
+                    return oks >= view.r || responded >= view.replicas.len();
+                }
+            }
+            false
+        })
+        .await;
+
+        if oks < view.r {
+            return None;
+        }
+        let mut out: Vec<(Vec<u8>, Vec<u8>)> = merged
+            .into_iter()
+            .filter_map(|(key, (_ver, value))| value.map(|v| (key, v)))
+            .collect();
+        if let Some(limit) = limit {
+            out.truncate(limit);
+        }
+        Some(out)
+    }
+
     /// Push the winning `(value, version)` for `key` to every replica in `view`
     /// as a fire-and-forget repair. Idempotent: replicas already at or beyond
     /// this version merge it as a no-op.

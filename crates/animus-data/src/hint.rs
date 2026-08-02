@@ -36,6 +36,66 @@ use animus_tablet::{Epoch, TabletId};
 
 use crate::DataMsg;
 
+/// Bounds on how many hints — and how old — a [`HintStore`] retains per target,
+/// so a permanently-unavailable target cannot accumulate hints without limit
+/// (the original store was unbounded, the deferred hardening in ADR 0010).
+///
+/// Eviction is **safe by construction**: a dropped hint costs only promptness,
+/// never a write. The hint was buffered *after* a quorum of `W` replicas durably
+/// acked the write, so the durable record always lives on those replicas and
+/// background anti-entropy converges the laggard regardless (ADR 0010). The hint
+/// is purely an accelerator; bounding it trades the convergence-latency win for a
+/// down node away once it has been down "too long" (by count or by version age),
+/// keeping the store's memory bounded.
+///
+/// Both bounds are per **target** (a stuck node is the failure mode); `None`
+/// disables that bound. The default ([`HintLimits::unbounded`]) disables both,
+/// preserving the original behavior.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct HintLimits {
+    /// Max pending hints retained per target. When exceeded, the **lowest-version**
+    /// hints for that target are evicted first (oldest writes — the most likely to
+    /// have already converged via anti-entropy). `None` ⇒ no count cap.
+    pub per_target_cap: Option<usize>,
+    /// Version-age TTL: a hint is evicted once it is more than `ttl_versions`
+    /// behind the **highest** hint version seen for its target (the target's most
+    /// recent missed write). A small TTL keeps only the freshest tail of misses.
+    /// `None` ⇒ no TTL.
+    pub ttl_versions: Option<u64>,
+}
+
+impl HintLimits {
+    /// No bounds — the original unbounded behavior.
+    #[must_use]
+    pub fn unbounded() -> Self {
+        Self::default()
+    }
+
+    /// Cap each target at `cap` pending hints (evicting the lowest-version first).
+    #[must_use]
+    pub fn capped(cap: usize) -> Self {
+        Self {
+            per_target_cap: Some(cap),
+            ttl_versions: None,
+        }
+    }
+
+    /// Drop a hint once it is more than `ttl_versions` behind the freshest hint
+    /// version for its target.
+    #[must_use]
+    pub fn ttl(ttl_versions: u64) -> Self {
+        Self {
+            per_target_cap: None,
+            ttl_versions: Some(ttl_versions),
+        }
+    }
+
+    /// Whether any bound is active.
+    fn is_bounded(&self) -> bool {
+        self.per_target_cap.is_some() || self.ttl_versions.is_some()
+    }
+}
+
 /// Which targets a coordinator may store / replay hints for — the tablet's
 /// residency-eligible placement (ADR 0005). `None` ⇒ no residency boundary (any
 /// target); `Some(set)` ⇒ only members of the set. Mirrors the receive-side
@@ -68,13 +128,27 @@ type HintKey = (NodeId, TabletId, Vec<u8>);
 #[derive(Clone, Default)]
 pub struct HintStore {
     inner: Arc<Mutex<BTreeMap<HintKey, Hint>>>,
+    /// Per-target retention bounds. `unbounded` by default ⇒ the original
+    /// behavior (no eviction).
+    limits: HintLimits,
 }
 
 impl HintStore {
-    /// An empty store.
+    /// An empty, **unbounded** store (the original behavior — no eviction).
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// An empty store that retains at most `limits` hints per target, evicting
+    /// the oldest (lowest-version / most-aged) hints beyond the bound. Eviction
+    /// is safe: anti-entropy is the backstop for any dropped hint (ADR 0010).
+    #[must_use]
+    pub fn with_limits(limits: HintLimits) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(BTreeMap::new())),
+            limits,
+        }
     }
 
     /// Record a hint that `target` missed an `entry = (key, value, version)` for
@@ -106,6 +180,7 @@ impl HintStore {
                     version,
                 },
             );
+            enforce_bounds(&mut map, target, &self.limits);
         }
     }
 
@@ -192,6 +267,7 @@ impl HintStore {
                 }
             }
         }
+        enforce_bounds(&mut map, target, &self.limits);
     }
 
     /// Number of pending hints (for tests/diagnostics).
@@ -212,6 +288,58 @@ impl std::fmt::Debug for HintStore {
         f.debug_struct("HintStore")
             .field("len", &self.len())
             .finish()
+    }
+}
+
+/// Evict hints for `target` that fall outside `limits`, in place.
+///
+/// Applied after every insert for `target`, so the store stays bounded
+/// incrementally rather than growing unbounded between sweeps. Eviction order
+/// (lowest version first) drops the **oldest** missed writes — the ones most
+/// likely already converged via anti-entropy — and keeps the freshest tail, the
+/// hints whose prompt replay is still worth the most.
+///
+/// Operates only on the `target`'s slice of the map (`(target, _, _)` keys),
+/// leaving other targets untouched. Safe per ADR 0010: every evicted hint's
+/// write is already durable on `W` replicas, so anti-entropy is the backstop.
+fn enforce_bounds(map: &mut BTreeMap<HintKey, Hint>, target: NodeId, limits: &HintLimits) {
+    if !limits.is_bounded() {
+        return;
+    }
+    // Collect this target's hints as (version, key) so we can rank by age.
+    let mut owned: Vec<(u64, HintKey)> = map
+        .range((target, TabletId(u64::MIN), Vec::new())..)
+        .take_while(|((t, _, _), _)| *t == target)
+        .map(|(hk, h)| (h.version, hk.clone()))
+        .collect();
+    if owned.is_empty() {
+        return;
+    }
+    // TTL: drop anything more than `ttl_versions` behind the freshest version
+    // seen for this target.
+    if let Some(ttl) = limits.ttl_versions {
+        let high_water = owned.iter().map(|(v, _)| *v).max().unwrap_or(0);
+        let floor = high_water.saturating_sub(ttl);
+        owned.retain(|(v, hk)| {
+            if *v < floor {
+                map.remove(hk);
+                false
+            } else {
+                true
+            }
+        });
+    }
+    // Count cap: keep the highest-version `cap` hints; evict the rest (lowest
+    // versions first). Sort ascending by (version, key) for a deterministic,
+    // stable eviction order.
+    if let Some(cap) = limits.per_target_cap {
+        if owned.len() > cap {
+            owned.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+            let evict = owned.len() - cap;
+            for (_, hk) in owned.into_iter().take(evict) {
+                map.remove(&hk);
+            }
+        }
     }
 }
 

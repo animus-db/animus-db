@@ -292,6 +292,46 @@ async fn handle_msg<S: StorageEngine>(
                 value,
             }]
         }
+        DataMsg::ScanRange {
+            req,
+            tablet,
+            epoch,
+            start,
+            end,
+        } => {
+            if fenced(epochs, tablet, epoch) {
+                return vec![DataMsg::ScanResp {
+                    req,
+                    ok: false,
+                    entries: vec![],
+                }];
+            }
+            // Return each key's latest record in `[start, end)` **including
+            // tombstones**, so the coordinator can merge by per-key newest
+            // version and then exclude deleted keys: a replica holding a stale
+            // value must not mask a peer's newer tombstone. We range-filter
+            // `entries_with_tombstones` rather than `scan` (which drops
+            // tombstones) for exactly that reason; `entries_with_tombstones` is
+            // `scan` over the whole keyspace, tombstones retained (ADR 0010).
+            let entries = match storage.entries_with_tombstones().await {
+                Ok(es) => es
+                    .into_iter()
+                    .filter(|(k, _, _)| in_range(k, &start, &end))
+                    .collect(),
+                Err(_) => {
+                    return vec![DataMsg::ScanResp {
+                        req,
+                        ok: false,
+                        entries: vec![],
+                    }];
+                }
+            };
+            vec![DataMsg::ScanResp {
+                req,
+                ok: true,
+                entries,
+            }]
+        }
         DataMsg::Sync {
             tablet,
             epoch,
@@ -371,8 +411,16 @@ async fn handle_msg<S: StorageEngine>(
         DataMsg::WriteAck { .. }
         | DataMsg::ReadResp { .. }
         | DataMsg::DeleteAck { .. }
+        | DataMsg::ScanResp { .. }
         | DataMsg::ProbeAck { .. } => vec![],
     }
+}
+
+/// Whether `key` falls in the half-open range `[start, end)`. An empty `end`
+/// means "no upper bound" (scan to the end of the keyspace), mirroring how an
+/// open-ended range is conventionally encoded; `start` is inclusive.
+fn in_range(key: &[u8], start: &[u8], end: &[u8]) -> bool {
+    key >= start && (end.is_empty() || key < end)
 }
 
 /// Whether `from` is permitted to send repair traffic to this replica. With no

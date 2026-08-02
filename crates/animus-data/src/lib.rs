@@ -23,7 +23,7 @@ pub mod hint;
 pub mod replica;
 
 pub use client::{DataClient, ReadResult, Router, TabletView};
-pub use hint::{HintStore, serve_hint_handoff, serve_hint_replay};
+pub use hint::{HintLimits, HintStore, serve_hint_handoff, serve_hint_replay};
 pub use replica::{ReplicaHandle, serve_anti_entropy, serve_replica, serve_replica_with_residency};
 
 use animus_env::NodeId;
@@ -80,6 +80,27 @@ pub enum DataMsg {
         req: ReqId,
         ok: bool,
         value: Option<(u64, Vec<u8>)>,
+    },
+    /// Coordinator → replica: scan the half-open key range `[start, end)`,
+    /// returning each key's latest record (value or tombstone) the replica holds.
+    /// Epoch-fenced exactly like a point [`Read`](DataMsg::Read).
+    ScanRange {
+        req: ReqId,
+        tablet: TabletId,
+        epoch: Epoch,
+        start: Vec<u8>,
+        end: Vec<u8>,
+    },
+    /// Replica → coordinator: scan response. `ok == false` if fenced; otherwise
+    /// `entries` is the replica's latest record per key in `[start, end)`,
+    /// sorted by key, **including tombstones** (`value == None`), so the
+    /// coordinator can merge by per-key newest version and then drop deleted
+    /// keys — a replica that holds a stale value must not mask a peer's newer
+    /// tombstone.
+    ScanResp {
+        req: ReqId,
+        ok: bool,
+        entries: Vec<SyncEntry>,
     },
     /// Peer → peer (anti-entropy) or coordinator → replica (read-repair):
     /// reconcile a batch of `(key, value, version)` into the replica's storage
