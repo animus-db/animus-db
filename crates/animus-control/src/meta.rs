@@ -14,7 +14,7 @@ use animus_placement::{Candidate, PlacementPolicy, replan};
 use animus_tablet::{Epoch, KeyRange, Tablet, TabletId};
 use serde::{Deserialize, Serialize};
 
-use crate::schema::{SchemaCatalog, TableName, TableSchema};
+use crate::schema::{IndexDef, SchemaCatalog, TableName, TableSchema};
 
 /// Lifecycle status of a cluster member.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -121,6 +121,17 @@ pub enum MetaCommand {
     /// Remove a table's schema from the catalog (ADR 0013). Idempotent: a no-op
     /// if no schema is registered for `table`.
     DropTableSchema { table: TableName },
+    /// Add (or replace, by name) a **secondary index** definition on an existing
+    /// table's schema (ADR 0013). Rejected if the table has no schema or if the
+    /// resulting schema is malformed (duplicate index name reuse aside — an
+    /// existing index of the same name is replaced — or an LSI with no sort
+    /// attribute). Because it is a replicated `MetaCommand`, the index definition
+    /// is durable and agreed cluster-wide. This carries the index *shape*; the
+    /// index *entry data* (the actual indexed rows) is maintained at the wire edge.
+    CreateTableIndex { table: TableName, index: IndexDef },
+    /// Remove a secondary index definition from a table's schema (ADR 0013).
+    /// Idempotent: a no-op if the table or the named index does not exist.
+    DropTableIndex { table: TableName, index: String },
 }
 
 /// The deterministic result of applying a [`MetaCommand`].
@@ -306,6 +317,32 @@ impl Metadata {
                     ApplyOutcome::NoOp
                 }
             }
+            MetaCommand::CreateTableIndex { table, index } => {
+                let Some(schema) = self.schemas.get_mut(table) else {
+                    return ApplyOutcome::Rejected("no such table schema");
+                };
+                // Tentatively apply, then validate the resulting schema so a
+                // malformed index (e.g. an LSI with no sort attribute) is rejected
+                // deterministically and leaves the schema unchanged.
+                let mut candidate = schema.clone();
+                candidate.upsert_index(index.clone());
+                if candidate.validate().is_err() {
+                    return ApplyOutcome::Rejected("malformed table index");
+                }
+                *schema = candidate;
+                ApplyOutcome::Applied
+            }
+            MetaCommand::DropTableIndex { table, index } => {
+                let removed = self
+                    .schemas
+                    .get_mut(table)
+                    .is_some_and(|schema| schema.remove_index(index));
+                if removed {
+                    ApplyOutcome::Applied
+                } else {
+                    ApplyOutcome::NoOp
+                }
+            }
         }
     }
 
@@ -325,5 +362,14 @@ impl Metadata {
     /// All `(name, schema)` pairs in the catalog, in ascending name order.
     pub fn table_schemas(&self) -> impl Iterator<Item = (&TableName, &TableSchema)> {
         self.schemas.iter()
+    }
+
+    /// The secondary-index definitions registered for `table` (ADR 0013), in
+    /// ascending index-name order. Empty if the table is unknown or has no
+    /// indexes. A read accessor for the wire adapters that consume the replicated
+    /// index definitions.
+    #[must_use]
+    pub fn table_indexes(&self, table: &str) -> &[IndexDef] {
+        self.schemas.get(table).map_or(&[], |s| &s.indexes)
     }
 }

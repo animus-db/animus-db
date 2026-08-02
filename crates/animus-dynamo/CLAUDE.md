@@ -40,16 +40,27 @@ adapter wedge. The transport (HTTP, sockets) and the distributed routing live in
   `Include(names)`; `index_projected_attributes` resolves it to the returned
   attribute set (`None` ⇒ all). `RegistryError` carries the failure cause (incl.
   `IndexSortMismatch` for a sort condition against a hash-only index).
-  **Note:** `animusd` now keeps the *table key schema* in the **control plane's
-  replicated catalog** (ADR 0013) and uses this registry only for the GSI/LSI
-  declarations + the written-key index (both still in-memory, rebuilt from writes).
+  `sync_indexes(table, schema, &[SecondaryIndex])` reconciles a table's index
+  *definitions* to a desired set (registering the table if absent), **preserving
+  entry data for an unchanged-shape index, clearing it for a changed-shape one, and
+  dropping a removed one** — how the edge rebuilds its index machinery from the
+  **replicated** definitions (ADR 0013) rather than process-local
+  `create_table_with_indexes` state.
+  **Note:** `animusd` now keeps the *table key schema* **and the GSI/LSI
+  definitions** in the **control plane's replicated catalog** (ADR 0013) and uses
+  this registry only for the GSI/LSI *entry data* (still in-memory, rebuilt from
+  writes).
 - `schema` module — the pure bridge between this crate's DynamoDB `TableSchema`
   (partition key + optional sort key) and the control plane's `TableSchema`
   (`animus_control`: partition key + ordered clustering keys + typed columns):
   `to_control(schema, key_types)` (DynamoDB simple/composite → control schema,
   recording key columns with their `AttributeType`) and `to_dynamo(control)` (back,
   taking the first clustering key as the DynamoDB sort key, ignoring extra CQL
-  clustering columns). `animusd` uses it to propose/read schemas via the catalog.
+  clustering columns). It also bridges **secondary-index definitions**:
+  `index_to_control(&SecondaryIndex, base_pk)` ↔ `index_to_dynamo(&IndexDef)` /
+  `indexes_to_dynamo(&[IndexDef])` (an LSI's control `hash_attribute` is the base
+  partition key). `animusd` uses it to propose/read schemas + index definitions via
+  the catalog.
 - `storage_key(pk, sk)` — the data-plane key for an item, exposed so a caller
   can route an item through `animus-data` without instantiating a local `Table`.
 - `wire` module — the DynamoDB JSON translation: `decode_request(target, body)
@@ -149,8 +160,10 @@ adapter wedge. The transport (HTTP, sockets) and the distributed routing live in
 - **Still deferred** (don't represent as a full adapter): truly atomic
   `TransactWriteItems`, `BatchGetItem`, list-index document paths (`a[0]`),
   `ADD`/`DELETE` `UpdateExpression` arithmetic, and durable/replicated
-  **secondary-index** state (only the *table key schema* is in the control plane;
-  the GSI/LSI index stays in-memory). (Base `Query`/`Scan` no longer track keys —
+  **secondary-index *entry data*** (the GSI/LSI *definitions* now live in the
+  control plane's replicated catalog per ADR 0013 — `sync_indexes` rebuilds the
+  edge machinery from them — but the index *entries* themselves stay in-memory,
+  rebuilt from observed writes). (Base `Query`/`Scan` no longer track keys —
   they use the data plane's native quorum range scan.) The
   `Scan`/`Query` `FilterExpression` reuses the `ConditionExpression` predicate
   subset (`attribute_exists`/`attribute_not_exists`/`a = :v`), not the fuller
@@ -164,8 +177,9 @@ unit tests (JSON decode/encode incl. document/set types + document-path projecti
 + ReturnValues + UpdateItem/BatchWriteItem/TransactWriteItems decode + index
 projection types, base64 round-trip, tombstone, sort/condition predicates,
 GSI/LSI write/overwrite/delete + index
-query, multiple GSIs, composite-index sort narrowing, and the DynamoDB↔control
-`TableSchema` bridge). The wire protocol is exercised end-to-end over real HTTP in
+query, multiple GSIs, composite-index sort narrowing, `sync_indexes` preserving
+entries on an unchanged shape + dropping a removed index, and the DynamoDB↔control
+`TableSchema` + `IndexDef` bridge). The wire protocol is exercised end-to-end over real HTTP in
 `animusd`'s `tests/dynamo_wire.rs` (Put/Get/Delete), `tests/dynamo_extended.rs`
 (CreateTable/Query/conditional writes), `tests/dynamo_indexes.rs` (Scan with
 pagination + filter, and a GSI write-then-query), `tests/dynamo_documents.rs`

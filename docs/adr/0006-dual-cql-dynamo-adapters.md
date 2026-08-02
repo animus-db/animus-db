@@ -51,10 +51,12 @@ The surface now extends past the original three point ops:
   registered control handles (the same process-global pattern the in-memory
   registry uses); in a one-process-per-node deployment that is the node's own
   handle, so `CreateTable` must target the leader (or a node that can reach it).
-  **Still in-memory (not control-plane state):** the per-table **secondary-index
-  declarations** (GSI/LSI), rebuilt from observed writes; the catalog only carries
-  the *table key schema* for now (index metadata can extend
-  `TableSchema`/`SchemaCatalog` later, per ADR 0013). The former observation-built
+  **Secondary-index *definitions* now replicate too (ADR 0013):** the per-table
+  GSI/LSI declarations live in the table's replicated `TableSchema.indexes`
+  (`MetaCommand::{CreateTableIndex, DropTableIndex}`), so index existence/shape is
+  cluster-agreed and survives restart. Only the index *entry data* (the actual
+  indexed rows) is still maintained in edge-local memory, rebuilt from observed
+  writes. The former observation-built
   **written-key index** that backed `Query`/`Scan` is **gone** — base `Query`/`Scan`
   now use the data plane's native range scan (below), so they no longer depend on
   any in-memory tracked key set.
@@ -82,7 +84,12 @@ The surface now extends past the original three point ops:
   secondary indexes. A **global** secondary index (`GlobalSecondaryIndexes`) has
   a `HASH` key attribute plus an optional `RANGE` (a composite GSI); a **local**
   secondary index (`LocalSecondaryIndexes`) shares the base partition `HASH` and
-  adds an alternate `RANGE` sort attribute. The registry maintains, per index, an
+  adds an alternate `RANGE` sort attribute. Their **definitions** are replicated in
+  the control plane's table-schema catalog (ADR 0013) — `TableSchema.indexes`,
+  mutated by `MetaCommand::{CreateTableIndex, DropTableIndex}` — so index
+  existence/shape is durable + cluster-agreed; the edge rebuilds its in-memory
+  index-maintenance machinery from those definitions. The registry maintains, per
+  index, an
   `escape(hash) [|| escape(sort)] || base_key` index on every write/delete (it
   stores only base keys, not item copies, so the base item stays authoritative),
   and a `Query` with an `IndexName` resolves a hash value back to its base storage
@@ -217,15 +224,18 @@ process-global set of registered control handles.
 
 What remains. DynamoDB: atomic `TransactWriteItems` (via Accord, ADR 0011),
 `BatchGetItem`, list-index document paths (`a[0]`), `ADD`/`DELETE`
-`UpdateExpression` arithmetic, and durable control-plane-replicated **secondary-index**
-state (only the table key schema is replicated; the GSI/LSI index stays in-memory).
+`UpdateExpression` arithmetic, and durable control-plane-replicated **secondary-index
+*data*** (the index *definitions* now replicate via ADR 0013, but the GSI/LSI
+*entry data* — the indexed rows — is still rebuilt from observed writes at the edge).
 CQL: composite (multi-column) partition keys, per-column `DELETE`, atomic
 logged `BATCH`, in-place `ALTER`, range/`IN`/`ORDER BY`/`LIMIT` predicates with a
 native quorum range scan (so a partition need not be one value), collection/UDT
 types, paging, authentication, `LWT`/conditional writes, and replicated
 **keyspace** metadata (only tables are replicated today). (Now done: both adapters
 consume the replicated schema catalog so `CreateTable`/`CREATE TABLE` is durable +
-cluster-agreed; DynamoDB per-index projections, document-path projections,
+cluster-agreed, and DynamoDB **secondary-index definitions** now replicate in the
+same catalog (ADR 0013) so index existence/shape survives restart; DynamoDB
+per-index projections, document-path projections,
 `UpdateItem`/`BatchWriteItem`/`TransactWriteItems`, document/set types,
 `ReturnValues`, composite/multiple GSIs + LSI; CQL clustering/compound primary
 keys, `UPDATE`/`DELETE`, consistency levels, `DROP`/`ALTER ADD`/`BATCH`; and a

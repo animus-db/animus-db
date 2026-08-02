@@ -228,6 +228,16 @@ cross-cutting ones. Prune/merge entries that become obsolete.
 - **Never hold a `std::sync::Mutex` guard across an `.await`** in `<E: Env>`
   code — it breaks `Send` (often a *compile* error via `spawn_task`'s bound) and
   risks nondeterminism. Take the lock, mutate, drop it; do I/O lock-free.
+- **Replicate the *definition*, keep the *bulk data* at the edge — and split them
+  cleanly.** When promoting per-process state to the control plane (ADR 0013), move
+  only the small, must-agree *shape* (e.g. a secondary-index definition: name/keys/
+  projection) into replicated `Metadata`; leave the large derived *data* (the index
+  entries) edge-local, rebuilt from observed writes. Make the edge reconcile its
+  in-memory machinery *from* the replicated definitions (a `sync_indexes`-style
+  method that preserves entries on an unchanged shape, clears on a changed one) so a
+  restart recovers the shape from Raft, not local memory. Additive `MetaCommand`
+  variants + a `#[serde(default)]` new field keep older snapshots/consumers working.
+  (Found replicating DynamoDB GSI/LSI definitions; `animus-control` `schema.rs`.)
 - **Count a metric at the site that knows the *real* outcome, not the attempt.**
   A counter recorded where an op is *requested* over-counts when a downstream
   helper silently no-ops (e.g. `HintStore::record` drops a hint on a residency or
