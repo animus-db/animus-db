@@ -238,6 +238,27 @@ cross-cutting ones. Prune/merge entries that become obsolete.
   each append on the client's own authoritative list, not a begin-time quorum read
   (the apply flips `is_applied` before its fire-and-forget data-plane write lands,
   so a begin-time read can be stale and lose the client's own earlier appends).
+- **Judge an *eventual* property (convergence, durability) with a converged-or-timeout
+  poll, not a fixed-drain snapshot — then it scales to depth like a safety property.**
+  A fixed post-heal `run_for(N)` then a one-shot check imposes a false deadline: at
+  adversarial seed-depth a compound fault can leave anti-entropy still in flight when
+  the drain ends, so the check flakes without revealing a bug — which is why the
+  frontier corpus was once pinned to the bounded base set. Instead drive a *bounded*
+  poll (`run_for` an increment, re-read, re-check; stop early once it holds) up to a
+  generous budget; only budget exhaustion is a genuine failure. Keep it a pure
+  function of the seed (`run_for`/`run_until` only, no wall clock). This let
+  `frontier_corpus_converges_and_is_durable` scale to the full deep tier. (ADR 0014;
+  `animus-test` `support/mod.rs::run_scenario_with`.)
+- **A test helper that binds `:0`, reads `local_addr()`, then *drops* the listener
+  has a port TOCTOU — retry the (allocate-fresh-ports + start) as a unit.** The
+  freed ephemeral port can be stolen by another test binary before the real bind,
+  so the subsequent `run_node` rebind fails `AddrInUse` intermittently under
+  `cargo test --workspace` (it flaked the `animusd` restart tests' *first* bring-up).
+  Wrap the bring-up in a bounded retry that re-allocates fresh ports each attempt
+  (`start_single_node` → `(Node, ClusterConfig)`). Only the *first* bring-up can do
+  this — a same-address **restart** must reuse the captured config (it's testing
+  same-address recovery), so it keeps a tiny irreducible window; that's acceptable
+  because the first bring-up is the dominant contention. (`animusd` tests.)
 - **Never `let _ = storage.merge(...)` on the write path** — an ack must mean the
   write durably applied; surface storage errors so a non-durable write isn't
   counted toward the quorum (`animus-data` `ack_durability.rs`).

@@ -104,15 +104,19 @@ so it doesn't actually exercise `check_cycles`. The Accord-targeted suite does:
     property** → asserted on `Authoritative` and **scaled to the full deep tier**
     (`corpus_is_consistent` over `corpus()`); it held 7,560/7,560.
     **Convergence + durability are *eventual* properties** (anti-entropy +
-    coordinator retry) → asserted on `Frontier` over the **bounded base corpus**
-    (`frontier_corpus_converges_and_is_durable` over `corpus_base()`, 119), **not**
-    scaled to depth. Within a *fixed* drain window, a compound fault can leave
-    convergence in flight on **either** topology (deep tier:
-    `lossy_stop_restart_mid_s36` diverged on the frontier while pure Accord
-    converged; `ext_t_stop_restart_winddown_s39` did the reverse) — so a hard
-    deadline-assertion at adversarial depth is flaky without revealing a safety
-    bug. Don't scale the eventual checks to depth. See the root CLAUDE.md
-    engineering-practices note + ADR 0014.
+    coordinator retry) → asserted on `Frontier` with a **converged-or-timeout**
+    verdict (`frontier_corpus_converges_and_is_durable` over the env-scaled
+    `corpus()`), so they now **scale to depth** like serializability. The runner
+    snapshots the history (the `cycles` verdict) after the fixed `DRAIN`, then drives
+    a **bounded poll** (`run_for(CONVERGENCE_POLL_STEP)` up to `CONVERGENCE_BUDGET`),
+    re-reading the two final replicas and stopping early once they converge AND every
+    acked append is durable. This removes the false deadline a *fixed* drain imposed:
+    a compound fault that left anti-entropy in flight at a fixed window (deep tier:
+    `lossy_stop_restart_mid_s36`, `ext_t_stop_restart_winddown_s39`) now gets time to
+    heal; if the generous bound elapses without converging, that is a **genuine**
+    failure surfaced with scenario+seed+divergence. Keep the poll a pure function of
+    the seed (`run_for`/`run_until` only). See the root CLAUDE.md engineering-practices
+    note + ADR 0014.
 
 - **Genuine black-box list-append over Accord (ADR 0014, closed limitation).**
   With **arbitrary write values** (ADR 0011) each key stores a *real list value*:

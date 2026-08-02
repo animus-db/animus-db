@@ -89,6 +89,23 @@ const OP_BUDGET: Duration = Duration::from_secs(8);
 /// Poll granularity while a client waits for its transaction to execute.
 const POLL: Duration = Duration::from_millis(100);
 
+/// Post-heal drain that fully runs the workload tail (clients run
+/// `rounds * (OP_BUDGET + POLL)` at most) before the convergence/durability poll
+/// begins. After this drain the recorded history is stable (the workload has
+/// finished issuing ops), so the `cycles` verdict is snapshotted here — keeping
+/// the authoritative-topology run byte-identical to the fixed-drain era.
+const DRAIN: Duration = Duration::from_secs(40);
+/// Increment the converged-or-timeout poll advances virtual time by between
+/// re-reads of the two final replicas.
+const CONVERGENCE_POLL_STEP: Duration = Duration::from_secs(2);
+/// Upper bound of *additional* virtual time (beyond [`DRAIN`]) the poll will
+/// spend waiting for convergence + durability before declaring a genuine
+/// non-convergence failure. Convergence/durability are **eventual** properties
+/// (anti-entropy + coordinator retry), so a generous bound lets a compound fault
+/// finish healing; if it elapses without converging that is a real finding, not
+/// a too-short window. Tuned so the base set passes comfortably.
+const CONVERGENCE_BUDGET: Duration = Duration::from_secs(120);
+
 // ---------------------------------------------------------------------------
 // Declarative scenario model (deliverable 3).
 // ---------------------------------------------------------------------------
@@ -1215,22 +1232,44 @@ pub fn run_scenario_with(scenario: &Scenario, topology: Topology) -> ScenarioRes
     cluster.apply(NemesisAction::HealAll);
 
     // Drive long enough for in-flight transactions to drain and execute, plus the
-    // workload to finish (clients run rounds * (op budget + poll) at most).
-    cluster.sim.run_for(Duration::from_secs(40));
+    // workload to finish (clients run rounds * (op budget + poll) at most). After
+    // this the workload has stopped issuing ops, so the recorded history — hence
+    // the `cycles` verdict — is stable; snapshot it here, keeping the
+    // authoritative run byte-identical to the fixed-drain era.
+    cluster.sim.run_for(DRAIN);
 
-    // Final list-append state, read straight from each key's actually-stored
-    // value on two *distinct* Accord replicas (genuine black-box final state, not
-    // a reconstruction). Reading from two different replicas makes convergence a
-    // real cross-replica agreement check, and durability ("every ok append is in
-    // the final list") meaningful under single-writer-per-key.
     let keys: Vec<Key> = (0..scenario.workload.keyspace).collect();
-    let final_a = list_state(&cluster, 0, &keys);
-    let final_b = list_state(&cluster, cluster.nodes.len() - 1, &keys);
-
     let history = cluster.shared.rec.lock().unwrap().history().clone();
     let cycles = check_cycles(&history);
-    let durability = check_durability(&history, &final_a);
-    let convergence = check_convergence(scenario.seed, &final_a, &final_b);
+
+    // Convergence + durability are **eventual** properties (anti-entropy +
+    // coordinator retry), so rather than judging them off a single fixed-drain
+    // snapshot — which at adversarial seed-depth can catch a compound fault still
+    // healing — drive a deterministic **converged-or-timeout** poll. Re-read the
+    // two final replicas' actually-stored list state in fixed virtual-time
+    // increments; stop early the moment they have converged AND every acked append
+    // is durable. If [`CONVERGENCE_BUDGET`] of *additional* virtual time elapses
+    // without that, surface the last (failing) verdict as a genuine
+    // non-convergence/durability failure. Pure function of the seed: only
+    // `run_for`/`run_until` advance time, in a bounded loop.
+    //
+    // Final state is read straight from each key's actually-stored value on two
+    // *distinct* Accord replicas (genuine black-box final state, not a
+    // reconstruction): reading from two different replicas makes convergence a real
+    // cross-replica agreement check, and durability ("every ok append is in the
+    // final list") meaningful under single-writer-per-key.
+    let mut final_a = list_state(&cluster, 0, &keys);
+    let mut final_b = list_state(&cluster, cluster.nodes.len() - 1, &keys);
+    let mut durability = check_durability(&history, &final_a);
+    let mut convergence = check_convergence(scenario.seed, &final_a, &final_b);
+    let poll_deadline = cluster.sim.now().0 + CONVERGENCE_BUDGET.as_nanos() as u64;
+    while !(convergence.ok && durability.ok) && cluster.sim.now().0 < poll_deadline {
+        cluster.sim.run_for(CONVERGENCE_POLL_STEP);
+        final_a = list_state(&cluster, 0, &keys);
+        final_b = list_state(&cluster, cluster.nodes.len() - 1, &keys);
+        durability = check_durability(&history, &final_a);
+        convergence = check_convergence(scenario.seed, &final_a, &final_b);
+    }
 
     // Coverage counters.
     let ok_writes = history

@@ -85,22 +85,26 @@ fn corpus_is_consistent() {
 /// job ([`corpus_is_consistent`]). This pairs with the repo principle: point the
 /// serializability checker at Accord, check the AP plane for convergence/RYW.
 ///
-/// Runs the **bounded base corpus** (`corpus_base`, 119), *not* the seed-expanded
-/// / extended set — deliberately. Convergence + durability are **eventual**
-/// properties (anti-entropy + coordinator retry), so "did it converge within the
-/// runner's fixed post-heal drain?" is only a sound *hard* assertion on a bounded,
-/// non-pathological set. At adversarial seed-depth a compound fault
-/// (e.g. `lossy` + `stop_restart`) can legitimately leave convergence still in
-/// flight when the drain ends — on **either** topology — so scaling this to depth
-/// makes it flaky without revealing a safety bug. Serializability (a *safety*
-/// property) is the lever that scales to depth ([`corpus_is_consistent`]); this
-/// stays bounded. (Found by the deep tier: `lossy_stop_restart_mid_s36` diverged
-/// here while pure Accord converged, and `ext_t_stop_restart_winddown_s39` did the
-/// reverse — neither layer converges within a fixed bound under every compound
-/// fault. See ADR 0014.)
+/// Runs the **env-scaled corpus** (`corpus()`), like [`corpus_is_consistent`] —
+/// it scales to the full deep tier via `ANIMUS_CORPUS_SEEDS` / `ANIMUS_CORPUS_FULL`.
+/// This is sound because the runner no longer judges convergence/durability off a
+/// single fixed-drain snapshot: it drives a deterministic **converged-or-timeout**
+/// poll (see `run_scenario_with`) — after healing it re-reads the two final replicas
+/// in bounded virtual-time increments and stops the moment they converge AND every
+/// acked append is durable. Convergence + durability are **eventual** properties
+/// (anti-entropy + coordinator retry), so a generous poll bound lets a compound
+/// fault (e.g. `lossy` + `stop_restart`) finish healing at adversarial seed-depth
+/// rather than failing on a too-short fixed window. If that bound elapses without
+/// converging, that is a **genuine** non-convergence/durability failure and is
+/// surfaced here with the scenario name + replay seed + the divergence. (Earlier
+/// this was bounded to `corpus_base()` because a fixed drain made depth flaky: the
+/// deep tier showed `lossy_stop_restart_mid_s36` diverge on the frontier while pure
+/// Accord converged, and `ext_t_stop_restart_winddown_s39` do the reverse — neither
+/// layer converges within a *fixed* bound under every compound fault. The
+/// converged-or-timeout poll removes that false deadline. See ADR 0014.)
 #[test]
 fn frontier_corpus_converges_and_is_durable() {
-    for scenario in &corpus_base() {
+    for scenario in &corpus() {
         let r = run_scenario_with(scenario, Topology::Frontier);
         let name = &scenario.name;
         let seed = scenario.seed;

@@ -222,12 +222,46 @@ Resulting design (what the corpus asserts):
   (`corpus_is_consistent` over the env-scaled `corpus()`). This is the high-value,
   sound, hard check, and it is green at depth.
 - **Convergence + durability are *eventual* properties** → asserted on the
-  **`Frontier`** topology over the **bounded base corpus** only
-  (`frontier_corpus_converges_and_is_durable` over `corpus_base()`, 119), where the
-  drain reliably suffices. They are **not** scaled to adversarial depth.
+  **`Frontier`** topology with a **converged-or-timeout** verdict (see the
+  increment below), which makes them sound to scale to the full deep tier alongside
+  serializability.
 
 This is the same "check each layer for what it offers" principle, now also split by
-*property class*: safety scales to depth; eventual/liveness stays bounded. A future
-option is to assert convergence/durability at depth with a *converged-or-timeout*
-verdict (poll until convergence, bounded) rather than a fixed-drain snapshot, so
-depth could cover them without false deadlines — deferred.
+*property class*: safety is judged at a point; eventual/liveness is judged with a
+bounded poll. Both now scale to depth.
+
+## Converged-or-timeout verdict: scaling the frontier corpus to depth (2026-08-02)
+
+The deep-tier finding above bounded `frontier_corpus_converges_and_is_durable` to
+`corpus_base()` because the runner judged convergence/durability off a **single
+fixed post-heal drain snapshot** (`run_for(40s)`): at adversarial seed-depth a
+compound fault can legitimately leave anti-entropy still in flight when that fixed
+drain ends, so a hard deadline-assertion was flaky without revealing any safety
+bug. The "future option" deferred there — a *converged-or-timeout* verdict — is now
+**done**.
+
+- **The runner polls instead of snapshotting (eventual checks only).** After
+  healing, the runner still drives the fixed `DRAIN` (so the recorded history, hence
+  the `cycles` verdict, is snapshotted at exactly the same point as before — the
+  authoritative run is byte-identical to the fixed-drain era). It then drives a
+  **bounded converged-or-timeout poll**: in fixed virtual-time increments
+  (`CONVERGENCE_POLL_STEP`), re-read the two final replicas' actually-stored list
+  state and re-run `check_convergence` + `check_durability`; **stop early** the
+  moment both hold. If `CONVERGENCE_BUDGET` (120s of *additional* virtual time)
+  elapses without converging, the last (failing) verdict is surfaced as a **genuine**
+  non-convergence/durability failure (scenario name + replay seed + the divergence),
+  not masked by widening the bound. The poll is a pure function of the seed — only
+  `run_for`/`run_until` advance time, in a bounded loop (ADR 0003).
+- **The frontier corpus scales to depth.** With a sound verdict at depth,
+  `frontier_corpus_converges_and_is_durable` now iterates the **env-scaled**
+  `corpus()` (like `corpus_is_consistent`), so `ANIMUS_CORPUS_SEEDS` /
+  `ANIMUS_CORPUS_FULL` scale convergence + durability coverage to the full deep tier.
+  The two previously-divergent seed variants (`lossy_stop_restart_mid_s36`,
+  `ext_t_stop_restart_winddown_s39`) converge within the poll bound — confirming
+  they were anti-entropy still in flight at a fixed deadline, not safety bugs.
+- **Validation.** Default `cargo test -p animus-test` stays green (all 7 corpus
+  tests; `K=1`, no FULL → the frozen 119). The deep smoke
+  (`ANIMUS_CORPUS_SEEDS=10 ANIMUS_CORPUS_FULL=1 cargo test -p animus-test --test
+  corpus`) is green in ~113s — both the cycles-at-depth and the
+  convergence/durability-at-depth verdicts. Change confined to `animus-test`
+  (tests only); no production code changed; corpus seeds/names untouched.
