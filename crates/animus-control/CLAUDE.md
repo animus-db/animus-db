@@ -31,7 +31,10 @@ epoch compare-and-swap transactions.
   `reconcile_loop` (the leader's automatic placement reconciler) and
   `detect_loop` (the leader's failure detector, ADR 0012). Also the
   `heartbeat_loop`/`send_heartbeat` helpers a member runs to heartbeat the
-  control group.
+  control group. The driver records control-plane **metrics** (ADR 0015) via
+  `record_outbound`/`record_transition` and the `detect_loop` propose path;
+  `RaftNode::metrics()` exposes the handle and `start_with_metrics` lets a caller
+  supply the sink.
 - `detector.rs` — `FailureDetector` (ADR 0012): a **pure**, unit-tested
   interval+timeout liveness detector — last-heartbeat instants + `now` + a
   `timeout` decide alive/dead. No clock, no RNG.
@@ -108,6 +111,17 @@ epoch compare-and-swap transactions.
   image). Read it via `Metadata::table_schema`/`has_table_schema`/`table_schemas`.
   The shape (partition key + clustering keys + typed columns) is the union of both
   wire adapters' needs; **the adapters consuming it is a deliberate follow-up.**
+- **Observability metrics (ADR 0015).** The driver records, all from
+  `Env`-supplied or core-derived inputs (deterministic): `elections_started`/
+  `elections_won` + an `is_leader` gauge (from role/term transitions in
+  `record_transition`); `append_entries_sent`/`append_entries_rejected` +
+  `snapshot_installs` (read off the messages the core emits, in `record_outbound`
+  — a rejection is an outbound `AppendEntriesResp { success: false }`); and
+  `failure_detector_down`/`failure_detector_up` (the `Active`↔`Down` edges
+  `detect_loop` proposes). `RaftNode::start` records into `env.metrics()`
+  (`ProdEnv`'s real sink); use **`start_with_metrics`** to thread a recording
+  handle a sim test can read — `SimEnv::metrics()` is the no-op default, so no
+  `animus-sim` change is needed.
 - Commit advances only for **current-term** entries via majority `matchIndex`
   (the Raft safety rule). Don't relax this.
 - Snapshot transfer is **chunked** (see above). Deferred: cross-leader resumption
@@ -133,5 +147,9 @@ it, then the member restarts and returns to `Active`; plus detector unit tests i
 and the **replicated table-schema catalog** end to end (`schema_catalog.rs`, ADR
 0013 — propose schemas, reject a duplicate + a malformed one on the state machine,
 kill the leader, assert the schemas survive + survivors agree, drop one and see it
-replicate; plus `schema.rs` unit tests). Use `run_for`, never `run()` (perpetual
-heartbeats).
+replicate; plus `schema.rs` unit tests), and **control-plane metrics** moving
+under known events (`metrics.rs`, ADR 0015 — a forced election bumps the election
+counters + the leadership gauge; a crashed heartbeating member bumps
+`failure_detector_down`, its recovery bumps `failure_detector_up`; plus a
+same-seed byte-identical-snapshot reproducibility check). Use `run_for`, never
+`run()` (perpetual heartbeats).
