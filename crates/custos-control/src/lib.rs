@@ -24,5 +24,10 @@ pub mod raft;
 pub use detector::{FailureDetector, Liveness};
 pub use meta::{ApplyOutcome, Member, MetaCommand, Metadata, NodeStatus};
 pub use node::RaftNode;
+// Re-exported so downstream assemblers (e.g. `custosd`) can set a tablet's
+// placement policy via `SetTabletPolicy` without taking a direct
+// `custos-placement` dependency. The policy is part of the control plane's
+// public metadata surface (`Metadata::policies`).
+pub use custos_placement::PlacementPolicy;
 pub use persist::{PersistedState, WalRecord};
 pub use raft::{LogEntry, ProposeResult, RaftCore, RaftMsg, Role};

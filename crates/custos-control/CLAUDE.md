@@ -28,6 +28,10 @@ epoch compare-and-swap transactions.
 - `detector.rs` — `FailureDetector` (ADR 0012): a **pure**, unit-tested
   interval+timeout liveness detector — last-heartbeat instants + `now` + a
   `timeout` decide alive/dead. No clock, no RNG.
+- `lib.rs` re-exports `custos_placement::PlacementPolicy`, so a downstream
+  assembler (e.g. `custosd`) can `SetTabletPolicy` without taking a direct
+  `custos-placement` dependency — the policy is part of this plane's public
+  metadata surface (`Metadata::policies`).
 
 ## What's non-obvious
 
@@ -76,6 +80,11 @@ epoch compare-and-swap transactions.
   **cascades** into re-placement. Keep timing in the driver and the decision pure
   — don't put a clock/RNG in the detector. Detector state is per-node volatile (a
   new leader re-learns over one `timeout`); only the transitions are replicated.
+  These loops are **now driven in production**: `custosd` spawns `heartbeat_loop`
+  on each data node and relies on `RaftNode::start`'s `detect_loop`/`reconcile_loop`
+  to mark a dead data member `Down` and re-place its tablet — proven live over
+  `ProdEnv`/TCP in `custosd/tests/self_heal.rs` (the sim coverage here remains the
+  deterministic source of truth).
 - Commit advances only for **current-term** entries via majority `matchIndex`
   (the Raft safety rule). Don't relax this.
 - Snapshot transfer is **chunked** (see above). Deferred: cross-leader resumption

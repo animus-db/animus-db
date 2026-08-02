@@ -39,6 +39,38 @@ CLI wrapper. `custos-cli` depends on this crate for the client protocol types.
   on the `Network`: coordination is server-side, so the coordinator is a static
   cluster member and replica replies route without knowing dynamic client
   addresses.
+- **The cluster's members are the DATA nodes, not the control ids** (this is what
+  makes self-healing work end to end). The control ids `0..N` are only the Raft
+  *consensus group*; `bootstrap` registers the **data ids** (`100+i`) as `Active`
+  `Metadata` members, places the bootstrap tablet on the first
+  `min(N, MAX_REPLICATION_FACTOR)` of them, and attaches a `PlacementPolicy`
+  (`SetTabletPolicy`). So the failure detector (ADR 0012) and the placement
+  reconciler (ADR 0005) — both of which operate over `Active` members — act on the
+  nodes that actually hold data. Capping the RF at 3 leaves a **spare** in a
+  larger cluster, which is what a detected `Down` can be re-placed onto.
+- **The autonomous loops are wired here, over `ProdEnv` timers** (the mechanisms
+  are sim-proven in `custos-control`/`custos-data`; this is the production
+  assembly):
+  - The **control-plane heartbeat + failure detection** are driven from the data
+    nodes: each data replica's `start_replica` spawns `heartbeat_loop(data_env,
+    control_ids)` (send-only on a clone of the data env, so it does not contend on
+    the replica's single-consumer inbox), and `RaftNode::start` already runs the
+    `detect_loop`/`reconcile_loop` on every control node (no-ops off the leader).
+    A killed data node stops heartbeating → the leader marks its member `Down` →
+    the reconciler moves the tablet off it.
+  - **Anti-entropy** runs per data replica: `serve_anti_entropy(data_env, storage,
+    TABLET, Epoch::INITIAL, peers, ANTI_ENTROPY_INTERVAL)`, also send-only on the
+    data env (its `SyncPull` replies arrive back through the replica's inbox).
+    **Gotcha:** the loop's epoch is fixed at `Epoch::INITIAL`, so it converges
+    while the tablet is at its initial epoch (the steady state). A placement
+    reconcile bumps the tablet epoch, after which the replica fences the
+    stale-epoch anti-entropy traffic; a re-placed spare is then filled by
+    **read-repair** on the first read that includes it, not by anti-entropy.
+    Threading the live tablet epoch into the loop is deferred.
+- Proven live in `tests/self_heal.rs`: a 4-node cluster (RF 3 + one spare) writes a
+  key, kills a replica node, and the cluster autonomously marks it `Down`,
+  re-places the tablet onto the spare (epoch bumps), and still serves the key from
+  the survivors — observable self-healing in the assembled binary.
 - **The data replica is durable by default**: `serve_replica` is backed by the
   on-disk `LsmEngine` opened over a *clone* of the node's **data** `ProdEnv`
   (`StorageBackend::Lsm`), so a value acked to a client survives a process
@@ -95,11 +127,14 @@ CLI wrapper. `custos-cli` depends on this crate for the client protocol types.
 `tests/per_process.rs` (nodes started independently from a shared config),
 `tests/dynamo_wire.rs` (PutItem → GetItem → DeleteItem over the real DynamoDB
 JSON/HTTP wire), `tests/cql_wire.rs` (STARTUP handshake → INSERT → SELECT
-over the real CQL binary wire), and `tests/durable_restart.rs` (a key written
+over the real CQL binary wire), `tests/durable_restart.rs` (a key written
 through the client API survives a node stop + restart on the **same dir +
 addresses** with the LSM backend, and is lost with the `--ephemeral` memory
-backend). All use real TCP/time, so they poll with timeouts, not deterministic
-assertions. The restart test runs both incarnations in the **same** runtime,
+backend), and `tests/self_heal.rs` (**live self-healing**: a 4-node cluster
+detects a killed replica node, marks it `Down`, re-places the tablet onto the
+spare, and still serves the key from the survivors; plus a concurrent-client
+smoke test that the assembled node does not deadlock under load). All use real
+TCP/time, so they poll with timeouts, not deterministic assertions. The restart test runs both incarnations in the **same** runtime,
 calling `Node::shutdown()` between them to abort the node's detached tasks and
 free its listener ports (dropping a `Node` does not stop them), then rebinds the
 same addresses and recovers — a clean teardown → rebind → recover cycle standing

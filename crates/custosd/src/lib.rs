@@ -31,14 +31,19 @@ use std::time::Duration;
 
 pub mod config;
 pub use config::ClusterConfig;
+// Re-exported so callers (CLI, tests, operators) can inspect a node's cached
+// cluster metadata — membership status and the tablet map — without depending on
+// `custos-control` directly.
+pub use custos_control::{Metadata, NodeStatus};
 
 mod cql;
 mod dynamo;
 
-use custos_control::{MetaCommand, Metadata, NodeStatus, RaftNode};
-use custos_data::{DataClient, ReadResult, TabletView, serve_replica};
-use custos_env::{NodeId, ProdEnv};
-use custos_storage::{LsmEngine, MemoryEngine};
+use custos_control::node::heartbeat_loop;
+use custos_control::{MetaCommand, PlacementPolicy, RaftNode};
+use custos_data::{DataClient, ReadResult, TabletView, serve_anti_entropy, serve_replica};
+use custos_env::{EnvExt, NodeId, ProdEnv};
+use custos_storage::{LsmEngine, MemoryEngine, StorageEngine};
 use custos_tablet::{Epoch, KeyRange, TabletId};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -48,6 +53,16 @@ use tokio::net::{TcpListener, TcpStream};
 /// The single bootstrap tablet covering the whole keyspace.
 const TABLET: TabletId = TabletId(1);
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
+/// The bootstrap tablet's replication factor (ADR 0005). Capped so a cluster
+/// larger than this keeps **spare** data nodes the leader can re-place a failed
+/// replica onto — that spare is what makes failure detection cascade into
+/// observable self-healing. A cluster of `<= MAX_REPLICATION_FACTOR` nodes simply
+/// places on all of them (no spare), so failure detection still marks the dead
+/// member `Down` but there is nowhere to move its tablet to.
+const MAX_REPLICATION_FACTOR: usize = 3;
+/// How often each data replica runs a background anti-entropy round to converge
+/// with its peers (ADR 0010). A slow background activity, off any request path.
+const ANTI_ENTROPY_INTERVAL: Duration = Duration::from_secs(1);
 /// Filename prefix namespacing the data replica's on-disk LSM under the node's
 /// data `ProdEnv` directory (its files become `db-MANIFEST`/`db-wal`/`db-sst-*`).
 ///
@@ -223,24 +238,41 @@ impl BoundNode {
         ];
 
         let raft = RaftNode::start(self.control_env, control_ids.clone());
-        // The data replica's durable store. The on-disk LSM does its disk I/O
-        // through a *clone* of the data env's handle (the env is node-scoped, so
-        // its files live under this node's data dir, namespaced by `LSM_PREFIX`);
-        // the replica's serve loop keeps the original handle for network `recv`.
-        // The LSM only touches the disk, so the single-consumer inbox is
-        // unaffected.
+
+        // The data replica's durable store, plus the autonomous data-plane loops.
+        // The on-disk LSM does its disk I/O through a *clone* of the data env's
+        // handle (the env is node-scoped, so its files live under this node's data
+        // dir, namespaced by `LSM_PREFIX`); the replica's serve loop keeps the
+        // original handle for network `recv`. The LSM only touches the disk, so
+        // the single-consumer inbox is unaffected.
+        //
+        // Alongside the replica we spawn the two background data-plane loops, both
+        // *send-only* on the data env (so they never contend with the replica's
+        // single-consumer inbox):
+        //  - the **liveness heartbeat** to the control group, so the control
+        //    plane's failure detector (ADR 0012) sees this node's data member
+        //    alive — and its silence when the node dies; and
+        //  - **anti-entropy** with peer data replicas (ADR 0010), so a replica
+        //    that missed writes (e.g. a freshly re-placed spare) converges in the
+        //    background.
+        let anti_entropy_peers: Vec<NodeId> = data_ids
+            .iter()
+            .copied()
+            .filter(|&d| d != self.data_id)
+            .collect();
         let replica: Box<dyn std::any::Any + Send + Sync> = match backend {
             StorageBackend::Lsm => {
                 let lsm = LsmEngine::open(self.data_env.clone(), LSM_PREFIX)
                     .await
                     .map_err(|e| std::io::Error::other(format!("opening data replica LSM: {e}")))?;
-                Box::new(serve_replica(self.data_env, lsm, Epoch::INITIAL))
+                start_replica(self.data_env, lsm, control_ids.clone(), anti_entropy_peers)
             }
-            StorageBackend::Memory => Box::new(serve_replica(
+            StorageBackend::Memory => start_replica(
                 self.data_env,
                 MemoryEngine::new(),
-                Epoch::INITIAL,
-            )),
+                control_ids.clone(),
+                anti_entropy_peers,
+            ),
         };
         let coordinator = DataClient::new(self.coord_env);
 
@@ -251,9 +283,8 @@ impl BoundNode {
         let mut tasks = Vec::with_capacity(4);
         {
             let raft = raft.clone();
-            let members = control_ids.clone();
             let data_ids = data_ids.clone();
-            tasks.push(tokio::spawn(bootstrap(raft, members, data_ids)));
+            tasks.push(tokio::spawn(bootstrap(raft, data_ids)));
         }
 
         // Client request server + DynamoDB HTTP + CQL endpoints share one
@@ -409,10 +440,70 @@ pub(crate) struct ClientCtx {
     w: usize,
 }
 
-async fn bootstrap(raft: RaftNode<ProdEnv>, members: Vec<NodeId>, data_ids: Vec<NodeId>) {
+/// Spawn the data replica over `storage` plus its two background loops
+/// (liveness heartbeat to `control_ids`, anti-entropy with `peers`) on `env`, and
+/// return the type-erased replica handle that keeps the serve loop alive for the
+/// life of the node.
+///
+/// All three share the node's data `env`. The replica's serve loop is the inbox's
+/// single consumer; the heartbeat and anti-entropy loops are **send-only** on a
+/// clone of the same env (anti-entropy's `SyncPull` replies arrive back through
+/// the replica's inbox), so they do not contend on the single-consumer rule.
+fn start_replica<S>(
+    env: ProdEnv,
+    storage: S,
+    control_ids: Vec<NodeId>,
+    peers: Vec<NodeId>,
+) -> Box<dyn std::any::Any + Send + Sync>
+where
+    S: StorageEngine + 'static,
+{
+    let handle = serve_replica(env.clone(), storage.clone(), Epoch::INITIAL);
+    // This node's data member heartbeats the control group so the leader's
+    // failure detector (ADR 0012) tracks it — and notices its silence on death.
+    env.clone()
+        .spawn_task(heartbeat_loop(env.clone(), control_ids));
+    // Background convergence among the data replicas (ADR 0010). The epoch is the
+    // tablet's initial epoch; it is only bumped by a placement reconcile (after a
+    // real failure), after which read-repair carries fresh data to a re-placed
+    // spare instead — see the crate guide.
+    serve_anti_entropy(
+        env,
+        storage,
+        TABLET,
+        Epoch::INITIAL,
+        peers,
+        ANTI_ENTROPY_INTERVAL,
+    );
+    Box::new(handle)
+}
+
+/// The bootstrap policy pinning the tablet's replica set: a plain replication
+/// factor (no residency/spread, as `custosd` has no topology labels yet). With
+/// the factor capped below the cluster size, the leader's reconciler
+/// (ADR 0005/0012) can move a tablet off a member detected `Down` onto a spare.
+fn bootstrap_policy(replication_factor: usize) -> PlacementPolicy {
+    PlacementPolicy::simple("custosd-default", replication_factor)
+}
+
+/// The leader's one-time cluster bootstrap, retried on a timer until it lands.
+///
+/// It registers **the data nodes** as `Active` members (so the failure detector
+/// and the placement reconciler operate on the nodes that actually hold data —
+/// not the control-group ids), places the single bootstrap tablet on the first
+/// `min(N, MAX_REPLICATION_FACTOR)` of them, and attaches a `PlacementPolicy` so
+/// the leader's reconciler keeps the replica set satisfying it: when a member is
+/// detected `Down`, the tablet is automatically re-placed onto a spare. Idempotent
+/// (skips once the tablet exists), so only the first leader to win does the work
+/// and a re-election does not duplicate it.
+async fn bootstrap(raft: RaftNode<ProdEnv>, data_ids: Vec<NodeId>) {
+    let rf = data_ids.len().min(MAX_REPLICATION_FACTOR);
+    let replicas: Vec<NodeId> = data_ids.iter().copied().take(rf).collect();
     loop {
         if raft.is_leader() && !raft.metadata().tablets.contains_key(&TABLET) {
-            for &node in &members {
+            // The cluster members are the data nodes (they heartbeat and hold
+            // data); the control-group ids are only the Raft consensus group.
+            for &node in &data_ids {
                 raft.propose(MetaCommand::UpsertMember {
                     node,
                     labels: BTreeMap::new(),
@@ -422,7 +513,11 @@ async fn bootstrap(raft: RaftNode<ProdEnv>, members: Vec<NodeId>, data_ids: Vec<
             raft.propose(MetaCommand::CreateTablet {
                 tablet: TABLET,
                 range: KeyRange::whole(),
-                replicas: data_ids.clone(),
+                replicas: replicas.clone(),
+            });
+            raft.propose(MetaCommand::SetTabletPolicy {
+                tablet: TABLET,
+                policy: Some(bootstrap_policy(rf)),
             });
         }
         tokio::time::sleep(Duration::from_millis(200)).await;

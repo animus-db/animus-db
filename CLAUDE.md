@@ -32,7 +32,13 @@ begins_with, and a `ConditionExpression` subset for conditional writes), a
 serving clients over TCP, with a now **durable data plane** — each node's data
 replica is backed by the on-disk `LsmEngine` over `ProdEnv` by default, so a
 value acked to a client survives a process restart (the control plane already
-persisted its Raft WAL; the data plane is no longer in-memory-only) — runnable
+persisted its Raft WAL; the data plane is no longer in-memory-only) — and now
+**self-healing**: the assembled node registers its data nodes as the cluster
+members, runs the control-plane heartbeat/failure-detector + placement reconciler
++ data-plane anti-entropy over `ProdEnv` timers, so a killed data node is detected
+`Down` and its tablet automatically re-placed onto a spare while reads keep
+succeeding via the survivors (proven live in `custosd/tests/self_heal.rs`) —
+runnable
 as one process (`custosd --cluster N`) or one process per node (`custosd --config
 FILE --node I`, config via `gen-config`; `--ephemeral` selects the volatile
 in-memory engine for dev runs),
