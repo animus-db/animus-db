@@ -15,8 +15,15 @@ use std::time::Duration;
 
 use custos_consensus::{AccordNode, Key, TxnId};
 use custos_sim::{SimEnv, Simulator};
+use futures::executor::block_on;
 
 const NODES: [u64; 3] = [0, 1, 2];
+
+/// Read a replica's executed-store writer for `key`. The `MemoryEngine` behind
+/// it awaits nothing real, so a plain `block_on` resolves it immediately.
+fn store_writer(node: &AccordNode<SimEnv>, key: Key) -> Option<TxnId> {
+    block_on(node.store_writer(key))
+}
 
 fn cluster(seed: u64) -> (Simulator, Vec<AccordNode<SimEnv>>) {
     let sim = Simulator::new(seed);
@@ -81,7 +88,7 @@ fn conflicting_transactions_execute_in_consistent_order() {
     let last = *order0.last().unwrap();
     for (i, n) in nodes.iter().enumerate() {
         assert_eq!(
-            n.store_writer(7),
+            store_writer(n, 7),
             Some(last),
             "node {i} store diverged on the shared key (seed={seed})"
         );
@@ -122,11 +129,11 @@ fn execution_order_consistent_across_seeds() {
             assert_eq!(got, want, "node {i} execution order diverged (seed={seed})");
         }
         // The single shared key (6) has one final writer everywhere.
-        let w = nodes[0].store_writer(6);
+        let w = store_writer(&nodes[0], 6);
         assert!(w.is_some(), "shared key never written (seed={seed})");
         for (i, n) in nodes.iter().enumerate() {
             assert_eq!(
-                n.store_writer(6),
+                store_writer(n, 6),
                 w,
                 "node {i} store diverged (seed={seed})"
             );
@@ -148,7 +155,7 @@ fn replica_recovers_executed_state_from_disk() {
 
     // Capture node 2's executed view before the restart.
     let before_order = relative_order(&nodes[2].applied_order(), a, b);
-    let before_writer = nodes[2].store_writer(3);
+    let before_writer = store_writer(&nodes[2], 3);
     assert_eq!(before_order.len(), 2, "node 2 executed both (seed={seed})");
     assert!(before_writer.is_some());
     assert!(nodes[2].is_applied(a) && nodes[2].is_applied(b));
@@ -171,15 +178,15 @@ fn replica_recovers_executed_state_from_disk() {
         "recovered node lost its execution order (seed={seed})"
     );
     assert_eq!(
-        nodes[2].store_writer(3),
+        store_writer(&nodes[2], 3),
         before_writer,
         "recovered node lost its executed store (seed={seed})"
     );
 
     // It still agrees with a live replica.
     assert_eq!(
-        nodes[2].store_writer(3),
-        nodes[0].store_writer(3),
+        store_writer(&nodes[2], 3),
+        store_writer(&nodes[0], 3),
         "recovered node diverged from a live replica (seed={seed})"
     );
 }

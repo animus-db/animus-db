@@ -26,24 +26,42 @@
 //! - Totally-ordered [`Timestamp`]s with a per-node [`LogicalClock`].
 //! - A thin [`AccordNode`] driver over the `Env` seam.
 //!
-//! ## What this slice now does (execution + durability milestone)
+//! ## What this slice now does (execution, durability, storage, failover)
 //!
-//! - **Execution / Apply**: a committed transaction is executed (applied to a
-//!   small opaque key→last-writer store) in agreed `(execute_at, txn)` order,
-//!   only after every dependency that orders before it has executed — a
-//!   per-replica execution queue, so every replica applies conflicting
-//!   transactions in the **same order**.
+//! - **Storage-backed execution / Apply**: a committed transaction is executed
+//!   in agreed `(execute_at, txn)` order, only after every dependency that orders
+//!   before it has executed — a per-replica execution queue, so every replica
+//!   applies conflicting transactions in the **same order**. The effect is
+//!   applied to a real (async) [`StorageEngine`](custos_storage::StorageEngine)
+//!   (the in-memory [`MemoryEngine`](custos_storage::MemoryEngine) under
+//!   simulation): each executed transaction `merge`s its id into every key it
+//!   touches, stamped with its execution timestamp as the MVCC version. The
+//!   sync [`AccordCore`] decides the order and emits [`ApplyEffect`]s; the
+//!   [`AccordNode`] driver performs the async storage writes.
 //! - **Durability / recovery**: [`AccordCore`] emits [`WalRecord`]s at each
 //!   phase transition; [`AccordNode`] fsyncs them before acting and recovers the
-//!   core from the WAL on restart — mirroring `RaftCore`.
+//!   core from the WAL on restart — mirroring `RaftCore` — replaying its
+//!   execution order back into a fresh storage engine.
+//! - **Coordinator failover (first slice)**: if a coordinator dies after
+//!   PreAccept/Accept but before replicas learn the Commit, another replica can
+//!   take over via [`AccordCore::recover`] / [`AccordNode::recover`]: it queries
+//!   replicas (`Recover`/`RecoverOk`) for their recorded `(phase, execute_at,
+//!   deps)` and drives the transaction to a consistent commit — adopting an
+//!   already-committed decision, else forcing the slow path (never the fast
+//!   path). See the recovery rules in [`crate::core`].
 //!
 //! ## What this slice deliberately does NOT do (see ADR 0011)
 //!
-//! - **Coordinator failover / recovery**: a coordinator that dies mid-flight
-//!   strands its transaction; there is no recovery coordinator. (A *replica*
-//!   restart is now recovered.)
-//! - **Full data-plane / `StorageEngine` integration**: the executed store here
-//!   is a stand-in to demonstrate consistent order, not the real data plane.
+//! - **The precise Accord recovery rules**: the recovery here is a simplified
+//!   "adopt-committed, else max-ts + union-deps + force-slow-path"; the exact
+//!   `PreAcceptOk`-witness/ballot recovery and duelling recovery coordinators are
+//!   deferred. There is also no *failure detector* yet — recovery is triggered
+//!   explicitly (e.g. by a test).
+//! - **Full data-plane integration**: execution is backed by a `StorageEngine`,
+//!   but it is a per-node consensus store, not yet wired to the live data-plane
+//!   replicas (`custos-data`); read transactions are also out of scope.
+//! - **The full transitive dependency wait-graph**: the execution wait is
+//!   conflict-and-timestamp based.
 //! - **WAL snapshotting / log truncation**: the WAL holds the full
 //!   per-transaction history (no compaction yet — contrast `RaftCore`).
 //! - **Contention / livelock handling, timeouts/retries, the precise fast-path
@@ -55,7 +73,7 @@ mod node;
 mod persist;
 mod timestamp;
 
-pub use crate::core::{AccordCore, Decision, Key, Phase, TxnId};
+pub use crate::core::{AccordCore, ApplyEffect, Decision, Key, Phase, TxnId};
 pub use crate::message::{AccordMsg, Out};
 pub use crate::node::AccordNode;
 pub use crate::persist::{PersistedState, PersistedTxn, WalRecord};

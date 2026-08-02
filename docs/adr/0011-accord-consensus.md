@@ -1,7 +1,9 @@
 # ADR 0011 — Accord-style leaderless transaction consensus
 
-- **Status:** Accepted (first minimal slice; extended with execution + durability)
-- **Date:** 2026-08-01 (execution + durability increment: 2026-08-01)
+- **Status:** Accepted (first minimal slice; extended with execution + durability;
+  then storage-backed execution + coordinator failover)
+- **Date:** 2026-08-01 (execution + durability increment: 2026-08-01;
+  storage-backed execution + coordinator-failover increment: 2026-08-01)
 
 ## Context
 
@@ -122,11 +124,6 @@ recovers executed state from disk, and execution-path trace reproducibility.
     recovery are not implemented.
   - **WAL snapshotting / log truncation**: the WAL grows with the transaction
     count; no compaction yet.
-  - **Coordinator failover**: a coordinator that dies mid-flight strands its
-    transaction; there is no recovery coordinator and no PreAccept/Accept ballot
-    for recovery. (A *replica* restart is now recovered.)
-  - **Full data-plane / `StorageEngine` integration**: the executed store is a
-    stand-in to demonstrate consistent order, not the real data plane.
   - **Contention / livelock handling**, **timeouts and retries** (the slice
     assumes a reliable enough network to gather a quorum; lost messages can stall
     a transaction), and **sharding/placement** (one global replica set — every
@@ -138,3 +135,71 @@ recovers executed state from disk, and execution-path trace reproducibility.
   the first slice anticipated.
 - ADR 0001's two-plane split is unchanged; this layer sits above the data plane
   and does not alter the control plane.
+
+## Storage-backed execution + coordinator failover increment (2026-08-01)
+
+This increment swaps the stand-in execution store for a real `StorageEngine`
+and adds a first slice of coordinator failover, again without reshaping the
+sync-core / `Env`-driver split.
+
+- **Storage-backed execution.** Execution still happens in the same agreed
+  `(execute_at, txn)` order, but the *effect* is now applied to a real (async)
+  `custos-storage::StorageEngine` instead of an opaque in-core map. The sync
+  `AccordCore` keeps deciding the order: when a transaction becomes applicable it
+  pushes an `ApplyEffect { txn, keys, version }` into a `pending_apply` buffer
+  (`version` is the transaction's `execute_at.logical`); the `AccordNode<E, S>`
+  driver drains it and `merge`s the transaction's id into each key it touches at
+  that MVCC version. `merge` (per-key last-writer-wins) is the right primitive:
+  the execution timestamps are not globally monotonic across keys, and `merge`
+  bypasses the engine-wide monotonic floor while staying idempotent and
+  commutative — so a re-apply on recovery (the driver replays the recovered
+  execution order into a *fresh*, volatile engine) converges to the identical
+  store. The node defaults to the in-memory `MemoryEngine` used under simulation;
+  `AccordNode::start_with_storage` accepts any engine. The crate now depends on
+  `custos-storage` (no cycle — storage does not depend on consensus).
+
+- **Coordinator failover (first slice).** A coordinator that dies after
+  PreAccept/Accept but before the replicas learn the `Commit` no longer strands
+  its transaction. Any replica can take over as a **recovery coordinator**
+  (`AccordCore::recover` / `AccordNode::recover`): it broadcasts a `Recover`
+  query, replicas reply `RecoverOk` with their recorded `(phase, execute_at,
+  deps, keys)` (witnessing the transaction as a fresh `PreAccepted` if they had
+  never seen it), and once a simple-majority recovery quorum is in the recovery
+  coordinator decides:
+  - if any quorum replica reports `Committed`/`Applied`, it **adopts that
+    decision verbatim** (a committed value is immutable);
+  - otherwise it **re-drives the slow path**: it re-broadcasts `PreAccept`
+    carrying the *union of keys* the replies reported (so a replica that missed
+    the original PreAccept learns the keys and can execute the write), then —
+    being a recovery coordinator — *never* takes the fast path, picks the highest
+    proposed `execute_at`, unions the deps, and runs `Accept` → `Commit`.
+
+  **Why this is safe (the simplification we accept).** A fast-path commit at
+  `t0` requires a *fast quorum* (`ceil(3N/4)` here) to have agreed on `t0` and
+  deps. Any recovery quorum (a simple majority) intersects that fast quorum, so
+  if the original committed on the fast path at least one recovery replica
+  carries `t0`/deps; forcing the slow path with the max-ts/union-deps rule can
+  only reproduce or supersede that, never contradict an *already-committed*
+  value (which we adopt outright). We deliberately do **not** implement Accord's
+  precise recovery (the `PreAcceptOk`-witness/superseding-ballot rules, recovery
+  ballots, and duelling recovery coordinators) — concurrent recovery
+  coordinators for the same transaction, and a real *failure detector* to
+  *trigger* recovery, are out of scope; recovery is invoked explicitly (e.g. by a
+  test).
+
+  Tests in `custos-consensus/tests/accord_recover.rs`: a stalled/partitioned
+  coordinator's transaction recovered to a consistent commit + execution on the
+  survivors (single seed + a 32-seed sweep), recovery adopting an
+  already-committed decision verbatim (idempotent), and recovery-path trace
+  reproducibility. The existing `accord_execute.rs` tests now assert against the
+  real `StorageEngine` (a recovered replica re-applies its execution order into a
+  fresh `MemoryEngine`).
+
+- **Still deferred after this increment:** the full transitive dependency
+  wait-graph, the precise Accord recovery ballot rules + duelling recoverers + a
+  failure detector to trigger recovery, WAL snapshotting / log truncation,
+  integration with the *live* data-plane replicas (`custos-data`) and read
+  transactions (execution is backed by a per-node consensus store, not yet the
+  shared data plane), contention/livelock handling and timeouts/retries, and
+  sharding/placement (one global replica set). The Elle cycle checker is still
+  unwired.
