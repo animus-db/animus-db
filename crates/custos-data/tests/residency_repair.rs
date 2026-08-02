@@ -137,9 +137,8 @@ fn anti_entropy_never_leaks_data_to_a_residency_ineligible_peer() {
     for &id in &EU_REPLICAS {
         serve_anti_entropy(
             sim.env(id),
-            eu[id as usize].storage().clone(),
+            eu[id as usize].clone(),
             TABLET,
-            Epoch::INITIAL,
             EU_REPLICAS.to_vec(), // residency-restricted: only EU peers
             interval,
         );
@@ -147,9 +146,8 @@ fn anti_entropy_never_leaks_data_to_a_residency_ineligible_peer() {
     // The US node tries to participate in anti-entropy against the EU replicas.
     serve_anti_entropy(
         sim.env(US_NODE),
-        us.storage().clone(),
+        us.clone(),
         TABLET,
-        Epoch::INITIAL,
         EU_REPLICAS.to_vec(),
         interval,
     );

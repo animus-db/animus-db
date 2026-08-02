@@ -295,15 +295,9 @@ fn assembled_system_stays_consistent_under_faults() {
         for &id in replicas {
             let handle = serve_replica(sim.env(id), MemoryEngine::new(), Epoch::INITIAL);
             // Anti-entropy is send-only, so it shares the node's env with the
-            // replica server without contending on the single-consumer inbox.
-            serve_anti_entropy(
-                sim.env(id),
-                handle.storage().clone(),
-                tablet,
-                Epoch::INITIAL,
-                replicas.to_vec(),
-                AE_INTERVAL,
-            );
+            // replica server without contending on the single-consumer inbox. It
+            // reads the tablet's live epoch from the handle each round.
+            serve_anti_entropy(sim.env(id), handle, tablet, replicas.to_vec(), AE_INTERVAL);
         }
     };
     bring_up(&TABLET1_REPLICAS, TABLET1);

@@ -106,6 +106,23 @@ primitive:
 - **Residency holds on the repair paths** (ADR 0005): a residency-ineligible but
   reachable node never receives repaired data, and a repair message from outside
   the placement is rejected — proven in `custos-data/tests/residency_repair.rs`.
+- **Anti-entropy follows the tablet's live epoch.** `serve_anti_entropy` takes
+  the replica's `ReplicaHandle` and reads its current known epoch for the tablet
+  (`handle.epoch(tablet)`) at the start of *each* round, stamping the outbound
+  `SyncDigest` with it — not a constant captured when the loop started. This
+  matters after a topology change: a placement reconcile bumps the tablet's epoch
+  and the control plane advances each replica's known epoch (via
+  `ReplicaHandle::set_epoch`), so a round still stamping the old epoch would be
+  fenced by every up-to-date peer (ADR 0002) and a re-placed spare would converge
+  only lazily via read-repair on its first read. Reading the epoch live keeps
+  **background** convergence working across a reconcile, while a genuinely
+  stale-epoch peer is still fenced — both proven under simulation in
+  `custos-data/tests/repair.rs`
+  (`anti_entropy_tracks_the_live_epoch_after_a_reconcile`,
+  `anti_entropy_still_fences_a_genuinely_stale_epoch_peer`). The epoch is read
+  under a brief lock released before any `.await` (the no-guard-across-await
+  discipline). This closes the gap previously deferred in `custosd`, which passed
+  a fixed `Epoch::INITIAL` into the loop.
 - **Deletes now propagate** through repair: a data-plane `DataMsg::Delete`
   tombstones by per-key LWW (`merge_tombstone`), and the tombstone-carrying
   `Sync` digest converges it through both read-repair and anti-entropy — proven

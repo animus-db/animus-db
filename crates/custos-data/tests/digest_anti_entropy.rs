@@ -60,9 +60,8 @@ fn start_anti_entropy(sim: &Simulator, handles: &[ReplicaHandle<MemoryEngine>]) 
     for &id in &REPLICAS {
         serve_anti_entropy(
             sim.env(id),
-            handles[id as usize].storage().clone(),
+            handles[id as usize].clone(),
             TABLET,
-            Epoch::INITIAL,
             REPLICAS.to_vec(),
             Duration::from_millis(50),
         );

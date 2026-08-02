@@ -19,8 +19,11 @@ tablet map, and per-tablet epoch fencing (ADR 0001, 0002).
 - `replica.rs` — `serve_replica(env, storage, floor_epoch) -> ReplicaHandle`:
   the per-node server over a `StorageEngine`; `serve_replica_with_residency(...,
   allowed)` is the same but rejects repair traffic from peers outside `allowed`
-  (residency, ADR 0005); plus `serve_anti_entropy(...)`, the background
-  convergence loop (now a digest exchange, not a full push).
+  (residency, ADR 0005); plus `serve_anti_entropy(env, handle, tablet, peers,
+  interval)`, the background convergence loop (a digest exchange, not a full
+  push). It takes the `ReplicaHandle` — not a `(storage, epoch)` pair — and reads
+  the tablet's **live** epoch from it each round, so it is not fenced after a
+  reconcile bumps the epoch (see the anti-entropy bullet below).
 - `client.rs` — `DataClient` (quorum coordinator, incl. read-repair),
   `TabletView` (replicas + epoch + R/W for one tablet), `Router` (key → owning
   tablet), `ReadResult`.
@@ -61,6 +64,18 @@ tablet map, and per-tablet epoch fencing (ADR 0001, 0002).
   so a delete reaches a replica that still holds the value). A converged pair
   moves no entry data; a one-key difference moves only that key's segment —
   `digest.rs` holds the pure logic. Both paths are epoch-fenced.
+- **Anti-entropy follows the LIVE tablet epoch.** `serve_anti_entropy` takes the
+  `ReplicaHandle` and stamps each round's `SyncDigest` with
+  `handle.epoch(tablet)` read **live that round** — *not* a constant captured at
+  start. After a placement reconcile bumps the tablet epoch (the control plane
+  advances each replica via `ReplicaHandle::set_epoch`), a loop still stamping the
+  old epoch would be fenced by up-to-date peers, leaving a re-placed spare reliant
+  on read-repair on its first read; reading the epoch live keeps **background**
+  convergence working across the reconcile. Fencing is *not* weakened: a
+  genuinely older-epoch peer's repair is still rejected. The epoch is read under a
+  brief lock released before any `.await` (no guard held across an await). Proven
+  in `repair.rs` (`anti_entropy_tracks_the_live_epoch_after_a_reconcile` and
+  `anti_entropy_still_fences_a_genuinely_stale_epoch_peer`).
 - **Residency on repair (ADR 0005)**: `serve_replica_with_residency(allowed)`
   drops any `Sync`/`SyncDigest`/`SyncPull` from a node outside `allowed`, so
   repair cannot leak across a residency boundary even to a reachable node. The

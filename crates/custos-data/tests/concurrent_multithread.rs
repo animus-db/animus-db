@@ -102,13 +102,12 @@ async fn concurrent_clients_do_not_deadlock_and_converge() {
     // replica state converge (R + W > N only makes quorum reads intersect).
     for (id, env) in &replica_envs {
         let storage = MemoryEngine::new();
-        let _handle = serve_replica(env.clone(), storage.clone(), Epoch::INITIAL);
+        let handle = serve_replica(env.clone(), storage, Epoch::INITIAL);
         let peers_for: Vec<NodeId> = REPLICAS.iter().copied().filter(|&p| p != *id).collect();
         serve_anti_entropy(
             env.clone(),
-            storage,
+            handle,
             TABLET,
-            Epoch::INITIAL,
             peers_for,
             // Tight interval to maximize contention between the background loop
             // and the foreground serve loop on the shared inbox/epoch lock.

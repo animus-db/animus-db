@@ -147,6 +147,19 @@ where
 /// background **without needing a read to repair it**, and a converged pair
 /// transfers no entry data at all.
 ///
+/// The loop takes the replica's [`ReplicaHandle`] as its source of **both** the
+/// data (its storage engine) and the **live tablet epoch**: each round stamps
+/// the outbound `SyncDigest` with `handle.epoch(tablet)` — the replica's
+/// currently-known epoch for the tablet — *not* a constant captured at start.
+/// This matters after a topology change: a placement reconcile bumps the
+/// tablet's epoch (and the control plane advances the replica's known epoch via
+/// [`ReplicaHandle::set_epoch`]), so a round that still stamped the old epoch
+/// would be **fenced** by every up-to-date peer and a re-placed spare would only
+/// be filled lazily by read-repair. Reading the epoch live keeps background
+/// convergence working across a reconcile (ADR 0010/0002); a genuinely
+/// stale-epoch peer is still fenced. The epoch is read with a brief lock that is
+/// released before any `.await` (no guard held across an await).
+///
 /// This is the Merkle/range-digest refinement of the original full-push scheme
 /// (ADR 0010): the periodic round is `O(segments)`, and only divergent ranges
 /// carry entry bytes. The loop is send-only on the timer (replies to a
@@ -157,9 +170,8 @@ where
 /// also rejects out-of-policy repair (ADR 0005).
 pub fn serve_anti_entropy<E, S>(
     env: E,
-    storage: S,
+    handle: ReplicaHandle<S>,
     tablet: TabletId,
-    epoch: Epoch,
     peers: Vec<NodeId>,
     interval: Duration,
 ) where
@@ -167,9 +179,15 @@ pub fn serve_anti_entropy<E, S>(
     S: StorageEngine + 'static,
 {
     let me = env.node_id();
+    let storage = handle.storage().clone();
     env.clone().spawn_task(async move {
         loop {
             env.sleep(interval).await;
+            // Stamp the digest with the replica's *current* known epoch for the
+            // tablet (read live each round; the lock is released before any await
+            // below), so a post-reconcile round carries the bumped epoch and is
+            // not fenced by up-to-date peers (ADR 0002).
+            let epoch = handle.epoch(tablet);
             // Carry tombstones too, so a delete converges to a replica that
             // still holds the value (ADR 0010).
             let entries: Vec<crate::SyncEntry> = match storage.entries_with_tombstones().await {

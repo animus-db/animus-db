@@ -9,8 +9,8 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use custos_data::{DataClient, ReadResult, TabletView, serve_anti_entropy, serve_replica};
-use custos_env::EnvExt;
+use custos_data::{DataClient, DataMsg, ReadResult, TabletView, serve_anti_entropy, serve_replica};
+use custos_env::{EnvExt, Network};
 use custos_sim::{SimEnv, Simulator};
 use custos_storage::{MemoryEngine, StorageEngine};
 use custos_tablet::{Epoch, TabletId};
@@ -100,9 +100,8 @@ fn anti_entropy_converges_a_lagging_replica_without_reads() {
     for &id in &REPLICAS {
         serve_anti_entropy(
             sim.env(id),
-            handles[id as usize].storage().clone(),
+            handles[id as usize].clone(),
             TabletId(1),
-            Epoch::INITIAL,
             REPLICAS.to_vec(),
             Duration::from_millis(50),
         );
@@ -200,17 +199,12 @@ fn rejoin(sim: &Simulator, node: u64) {
     }
 }
 
-fn start_anti_entropy(
-    sim: &Simulator,
-    handles: &[custos_data::ReplicaHandle<MemoryEngine>],
-    epoch: Epoch,
-) {
+fn start_anti_entropy(sim: &Simulator, handles: &[custos_data::ReplicaHandle<MemoryEngine>]) {
     for &id in &REPLICAS {
         serve_anti_entropy(
             sim.env(id),
-            handles[id as usize].storage().clone(),
+            handles[id as usize].clone(),
             TabletId(1),
-            epoch,
             REPLICAS.to_vec(),
             Duration::from_millis(50),
         );
@@ -260,7 +254,7 @@ fn anti_entropy_propagates_a_tombstone_to_a_lagging_replica_without_reads() {
 
     // Heal, but *nothing reads `k`* — only background anti-entropy runs.
     rejoin(&sim, 2);
-    start_anti_entropy(&sim, &handles, Epoch::INITIAL);
+    start_anti_entropy(&sim, &handles);
     sim.run_for(Duration::from_secs(1));
 
     // The tombstone (version 2) has propagated: the key now reads as absent and
@@ -301,7 +295,7 @@ fn anti_entropy_does_not_resurrect_a_deleted_key() {
 
     // Anti-entropy on every replica, including replica 2 (which pushes its stale
     // v1 back). LWW (delete v2 > value v1) must win everywhere.
-    start_anti_entropy(&sim, &handles, Epoch::INITIAL);
+    start_anti_entropy(&sim, &handles);
     sim.run_for(Duration::from_secs(1));
 
     for id in REPLICAS {
@@ -311,4 +305,97 @@ fn anti_entropy_does_not_resurrect_a_deleted_key() {
             "replica {id} did not converge to the tombstone (seed={seed})"
         );
     }
+}
+
+#[test]
+fn anti_entropy_tracks_the_live_epoch_after_a_reconcile() {
+    // Background anti-entropy must follow the tablet's LIVE epoch, not a constant
+    // captured at start: after a placement reconcile bumps the tablet epoch (and
+    // the control plane advances each replica's known epoch via `set_epoch`), a
+    // re-placed spare must converge in the BACKGROUND — anti-entropy stamped with
+    // the bumped epoch is not fenced. This is the gap that previously left a
+    // re-placed spare reliant on read-repair on the first read.
+    let seed = 0x00AE_202B;
+    let (mut sim, handles) = cluster(seed, Epoch::INITIAL);
+
+    // A write lands on the W=2 quorum {0,1} while replica 2 is isolated, so it
+    // misses the write and must later be repaired.
+    sim.crash(2);
+    let vw = view(Epoch::INITIAL);
+    assert!(
+        run_op(&mut sim, move |c| Box::pin(async move {
+            c.write(&vw, b"k", b"v1", 1, TIMEOUT).await
+        })),
+        "write reached the surviving W=2 quorum (seed={seed})"
+    );
+    assert_eq!(value_at(&handles[2], b"k"), None, "(seed={seed})");
+
+    // A placement reconcile bumps the tablet epoch; the control plane advances
+    // every replica's known epoch for the tablet (incl. the re-placed spare).
+    let bumped = Epoch::INITIAL.next();
+    for h in &handles {
+        h.set_epoch(TabletId(1), bumped);
+    }
+
+    // Replica 2 rejoins; *nothing reads `k`* — only background anti-entropy runs,
+    // and only at the BUMPED epoch (each loop reads it live from its handle).
+    sim.restart(2);
+    start_anti_entropy(&sim, &handles);
+    sim.run_for(Duration::from_secs(1));
+
+    assert_eq!(
+        value_at(&handles[2], b"k"),
+        Some(b"v1".to_vec()),
+        "anti-entropy at the bumped epoch did not converge the re-placed spare \
+         (it was fenced — the loop is not following the live epoch) (seed={seed})"
+    );
+}
+
+#[test]
+fn anti_entropy_still_fences_a_genuinely_stale_epoch_peer() {
+    // Following the live epoch must NOT weaken fencing: a peer whose anti-entropy
+    // traffic carries an epoch OLDER than the replica's known epoch for the tablet
+    // is still rejected. A stale-epoch coordinator/peer cannot inject data.
+    let seed = 0x00AE_202C;
+    let sim = Simulator::new(seed);
+    // The receiving replica is at the bumped epoch (post-reconcile).
+    let bumped = Epoch::INITIAL.next();
+    let target = serve_replica(sim.env(0), MemoryEngine::new(), bumped);
+    let mut sim = sim;
+
+    // A stale peer (still at INITIAL) hand-crafts a `Sync` — the digest/pull
+    // response shape anti-entropy ultimately uses to move data — at the OLD epoch.
+    let stale_env = sim.env(1);
+    stale_env.clone().spawn_task(async move {
+        let msg = DataMsg::Sync {
+            tablet: TabletId(1),
+            epoch: Epoch::INITIAL,
+            entries: vec![(b"stale".to_vec(), Some(b"x".to_vec()), 1)],
+        };
+        stale_env.send(0, serde_json::to_vec(&msg).unwrap()).await;
+    });
+    sim.run_for(Duration::from_millis(200));
+    assert_eq!(
+        value_at(&target, b"stale"),
+        None,
+        "fencing regressed: a stale-epoch Sync was applied (seed={seed})"
+    );
+
+    // Control: the same `Sync` at the CURRENT (bumped) epoch IS accepted, proving
+    // it is the epoch — not some other guard — that rejected the stale one.
+    let fresh_env = sim.env(2);
+    fresh_env.clone().spawn_task(async move {
+        let msg = DataMsg::Sync {
+            tablet: TabletId(1),
+            epoch: bumped,
+            entries: vec![(b"fresh".to_vec(), Some(b"y".to_vec()), 1)],
+        };
+        fresh_env.send(0, serde_json::to_vec(&msg).unwrap()).await;
+    });
+    sim.run_for(Duration::from_millis(200));
+    assert_eq!(
+        value_at(&target, b"fresh"),
+        Some(b"y".to_vec()),
+        "a current-epoch Sync was wrongly rejected (seed={seed})"
+    );
 }

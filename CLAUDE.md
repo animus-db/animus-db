@@ -217,7 +217,11 @@ deletes via `merge_tombstone`, a divergent quorum read pushes the winner back
 (read-repair), and `serve_anti_entropy` periodically reconciles with peers via a
 **segment-digest exchange** (`SyncDigest`/`SyncPull`) that moves only divergent
 ranges — not the whole digest each round — so even unread keys converge cheaply
-(tombstones included, so deletes ride along). Repair is **residency-bounded**
+(tombstones included, so deletes ride along). The anti-entropy loop reads the
+tablet's **live** epoch from the replica's `ReplicaHandle` each round, so after a
+placement reconcile bumps the epoch a re-placed spare still converges in the
+background (its digests carry the bumped epoch and are not fenced) rather than
+waiting for read-repair on the first read. Repair is **residency-bounded**
 (ADR 0005): `serve_replica_with_residency` drops repair traffic from peers
 outside a tablet's placement, so it cannot leak data across a residency boundary
 even to a reachable node. The data plane carries quorum `Write`/`Delete` and a

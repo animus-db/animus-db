@@ -58,15 +58,16 @@ CLI wrapper. `custos-cli` depends on this crate for the client protocol types.
     `detect_loop`/`reconcile_loop` on every control node (no-ops off the leader).
     A killed data node stops heartbeating → the leader marks its member `Down` →
     the reconciler moves the tablet off it.
-  - **Anti-entropy** runs per data replica: `serve_anti_entropy(data_env, storage,
-    TABLET, Epoch::INITIAL, peers, ANTI_ENTROPY_INTERVAL)`, also send-only on the
-    data env (its `SyncPull` replies arrive back through the replica's inbox).
-    **Gotcha:** the loop's epoch is fixed at `Epoch::INITIAL`, so it converges
-    while the tablet is at its initial epoch (the steady state). A placement
-    reconcile bumps the tablet epoch, after which the replica fences the
-    stale-epoch anti-entropy traffic; a re-placed spare is then filled by
-    **read-repair** on the first read that includes it, not by anti-entropy.
-    Threading the live tablet epoch into the loop is deferred.
+  - **Anti-entropy** runs per data replica: `serve_anti_entropy(data_env, handle,
+    TABLET, peers, ANTI_ENTROPY_INTERVAL)`, also send-only on the data env (its
+    `SyncPull` replies arrive back through the replica's inbox). It is given the
+    replica `handle` and reads the tablet's **live** epoch from it each round, so
+    after a placement reconcile bumps the tablet epoch — and the control plane
+    advances this replica via `ReplicaHandle::set_epoch` — the digest round
+    carries the bumped epoch and is **not** fenced: a re-placed spare converges in
+    the **background**, not only via read-repair on its first read. (This closes
+    the formerly-deferred fixed-`Epoch::INITIAL` gotcha; the live-epoch behavior
+    is sim-proven in `custos-data/tests/repair.rs`.)
 - Proven live in `tests/self_heal.rs`: a 4-node cluster (RF 3 + one spare) writes a
   key, kills a replica node, and the cluster autonomously marks it `Down`,
   re-places the tablet onto the spare (epoch bumps), and still serves the key from

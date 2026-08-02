@@ -449,6 +449,10 @@ pub(crate) struct ClientCtx {
 /// single consumer; the heartbeat and anti-entropy loops are **send-only** on a
 /// clone of the same env (anti-entropy's `SyncPull` replies arrive back through
 /// the replica's inbox), so they do not contend on the single-consumer rule.
+/// Anti-entropy takes the replica `handle` and reads the tablet's **live** epoch
+/// from it each round (advanced by the control plane via `set_epoch` on a
+/// reconcile), so a re-placed spare converges in the background after a topology
+/// change instead of waiting for the first read's read-repair (ADR 0010/0002).
 fn start_replica<S>(
     env: ProdEnv,
     storage: S,
@@ -458,23 +462,18 @@ fn start_replica<S>(
 where
     S: StorageEngine + 'static,
 {
-    let handle = serve_replica(env.clone(), storage.clone(), Epoch::INITIAL);
+    let handle = serve_replica(env.clone(), storage, Epoch::INITIAL);
     // This node's data member heartbeats the control group so the leader's
     // failure detector (ADR 0012) tracks it — and notices its silence on death.
     env.clone()
         .spawn_task(heartbeat_loop(env.clone(), control_ids));
-    // Background convergence among the data replicas (ADR 0010). The epoch is the
-    // tablet's initial epoch; it is only bumped by a placement reconcile (after a
-    // real failure), after which read-repair carries fresh data to a re-placed
-    // spare instead — see the crate guide.
-    serve_anti_entropy(
-        env,
-        storage,
-        TABLET,
-        Epoch::INITIAL,
-        peers,
-        ANTI_ENTROPY_INTERVAL,
-    );
+    // Background convergence among the data replicas (ADR 0010). The loop reads
+    // the replica's *live* known epoch for the tablet each round from `handle`,
+    // so after a placement reconcile bumps the tablet epoch (and the control
+    // plane advances this replica via `ReplicaHandle::set_epoch`), the digest
+    // round carries the bumped epoch and is **not** fenced — a re-placed spare
+    // converges in the background, not only via read-repair on the first read.
+    serve_anti_entropy(env, handle.clone(), TABLET, peers, ANTI_ENTROPY_INTERVAL);
     Box::new(handle)
 }
 
