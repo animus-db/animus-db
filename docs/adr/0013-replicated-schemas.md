@@ -70,8 +70,15 @@ same shape as the existing metadata.
   `MetaCommand`s.
 
 Wiring the adapters to actually consume this catalog (replacing their in-memory
-registries) is a **deliberate follow-up** — this ADR delivers the control-plane
-substrate and the accessors.
+registries) was a **deliberate follow-up** — and is now done. Both the CQL
+(`animusd::cql`) and DynamoDB (`animusd::dynamo`) edges propose
+`CreateTableSchema`/`DropTableSchema` on `CREATE TABLE`/`DROP TABLE` and wait for
+commit, and resolve reads/writes against the replicated `Metadata` rather than a
+per-process catalog. The CQL edge maps its `CqlType` onto `ColumnType` (and back),
+keys tables `keyspace.table`, and reaches the leader through a process-global set
+of registered control handles (the same mechanism the DynamoDB edge uses); it also
+adds `ALTER TABLE ... ADD` on top (a non-atomic drop+recreate of the schema, since
+in-place schema evolution is still future work — see Consequences).
 
 ## Consequences
 
@@ -84,11 +91,18 @@ substrate and the accessors.
   see it replicate), reproducible from a seed.
 - `Metadata::apply` stays a pure deterministic function and `RaftCore` stays
   I/O-free; the only new types are plain data with `BTree*` collections.
-- **Costs / follow-up:** the adapters still hold their own in-memory catalogs
-  until a separate change routes their `CreateTable`/`CREATE TABLE` through a
-  `CreateTableSchema` proposal and resolves reads against `Metadata`. Secondary
-  indexes (DynamoDB GSIs) and CQL keyspace objects are **not** modelled here yet —
-  the schema captures key structure + typed columns, which is the shared core;
-  index/keyspace metadata can extend `TableSchema`/`SchemaCatalog` later without
-  changing the replication mechanism. Schema *evolution* (`ALTER`) is also future
-  work.
+- **Adapters now consume it.** Both wire edges route `CREATE TABLE`/`DROP TABLE`
+  through these `MetaCommand`s and resolve against `Metadata`, so a created table
+  is durable and cluster-agreed across the wire — proven over real TCP with a node
+  restart in `animusd/tests/cql_durable_schema.rs` (CQL) and the DynamoDB edge's
+  schema test. DDL proposals route to the control-plane leader via a
+  process-global set of registered control handles (working for the in-process
+  `--cluster N` mode; cross-process proposal forwarding over the network is still
+  future work — DDL otherwise commits when the connected node is the leader).
+- **Costs / follow-up:** secondary indexes (DynamoDB GSIs) and CQL keyspace
+  objects are **not** modelled here — the schema captures key structure + typed
+  columns, the shared core; index/keyspace metadata can extend
+  `TableSchema`/`SchemaCatalog` later without changing the replication mechanism.
+  In-place schema *evolution* is still future work: the CQL edge's `ALTER TABLE
+  ADD` is a non-atomic drop+recreate, and there is no `AlterTableSchema`
+  `MetaCommand` yet.

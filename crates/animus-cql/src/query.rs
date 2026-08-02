@@ -17,6 +17,9 @@
 //! SELECT * | <c1>, <c2>, ... FROM <table> WHERE <pk> = <value> [AND <ck> = <value> ...]
 //! UPDATE <table> SET <col> = <value>, ... WHERE <pk> = <value> [AND <ck> = <value> ...]
 //! DELETE FROM <table> WHERE <pk> = <value> [AND <ck> = <value> ...]
+//! DROP TABLE [IF EXISTS] <table>
+//! ALTER TABLE <table> ADD <col> <type> [, <col> <type> ...]
+//! BEGIN [UNLOGGED|LOGGED] BATCH <mutation>; ... APPLY BATCH
 //! ```
 //!
 //! Values are literals — single-quoted strings (`'ada'`, `''`-escaped), bare
@@ -56,6 +59,46 @@ pub enum Statement {
     Update(Update),
     /// `DELETE FROM <table> WHERE <pk> = <value> [AND <ck> = <value> ...]`.
     Delete(Delete),
+    /// `DROP TABLE [IF EXISTS] <table>`.
+    DropTable(DropTable),
+    /// `ALTER TABLE <table> ADD <col> <type> [, <col> <type> ...]`.
+    AlterTable(AlterTable),
+    /// `BEGIN [UNLOGGED|LOGGED] BATCH <stmt>; ... APPLY BATCH` — a sequence of
+    /// mutation statements (`INSERT`/`UPDATE`/`DELETE`) applied together.
+    Batch(Batch),
+}
+
+/// A parsed `DROP TABLE [IF EXISTS] <table>`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DropTable {
+    /// Optional `keyspace.` qualifier.
+    pub keyspace: Option<String>,
+    /// The table name.
+    pub table: String,
+    /// Whether `IF EXISTS` was present (drop is then a no-op on a missing table).
+    pub if_exists: bool,
+}
+
+/// A parsed `ALTER TABLE <table> ADD ...`. Only `ADD <col> <type>` is supported
+/// (the common, schema-compatible alteration); `DROP`/`RENAME`/`WITH` are
+/// rejected as unsupported.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AlterTable {
+    /// Optional `keyspace.` qualifier.
+    pub keyspace: Option<String>,
+    /// The table name.
+    pub table: String,
+    /// The columns to add: `(name, type)`, in declaration order.
+    pub add_columns: Vec<(String, CqlType)>,
+}
+
+/// A parsed `BATCH`: a sequence of mutation statements applied together. Each
+/// member is an `INSERT`, `UPDATE`, or `DELETE` (no nested batches, no
+/// `SELECT`/DDL inside a batch).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Batch {
+    /// The batched mutation statements, in source order.
+    pub statements: Vec<Statement>,
 }
 
 /// A parsed `CREATE TABLE`.
@@ -177,7 +220,20 @@ impl std::error::Error for QueryError {}
 /// [`QueryError::Empty`] for blank input, [`QueryError::Unsupported`] for
 /// anything outside the accepted subset.
 pub fn parse_statement(cql: &str) -> Result<Statement, QueryError> {
-    let trimmed = cql.trim().trim_end_matches(';').trim();
+    let trimmed = cql.trim();
+    if trimmed.is_empty() {
+        return Err(QueryError::Empty);
+    }
+    // A BATCH spans several `;`-separated statements, so it is parsed from the raw
+    // text before the single-statement `;` trimming below would mangle it.
+    if trimmed
+        .split_whitespace()
+        .next()
+        .is_some_and(|w| w.eq_ignore_ascii_case("begin"))
+    {
+        return parse_batch(trimmed);
+    }
+    let trimmed = trimmed.trim_end_matches(';').trim();
     if trimmed.is_empty() {
         return Err(QueryError::Empty);
     }
@@ -191,10 +247,121 @@ pub fn parse_statement(cql: &str) -> Result<Statement, QueryError> {
         Some("select") => parse_select(&mut it),
         Some("update") => parse_update(&mut it),
         Some("delete") => parse_delete(&mut it),
+        Some("drop") => parse_drop(&mut it),
+        Some("alter") => parse_alter(&mut it),
         _ => Err(QueryError::Unsupported(
-            "expected USE, CREATE, INSERT, SELECT, UPDATE, or DELETE".into(),
+            "expected USE, CREATE, INSERT, SELECT, UPDATE, DELETE, DROP, ALTER, or BATCH".into(),
         )),
     }
+}
+
+/// Parse a `BEGIN [UNLOGGED|LOGGED] BATCH <stmt>; <stmt>; ... APPLY BATCH`. The
+/// inner statements must be mutations (`INSERT`/`UPDATE`/`DELETE`); a nested
+/// batch, a `SELECT`, or DDL inside the batch is rejected. Batch-level options
+/// (`UNLOGGED`, `LOGGED`, `USING TIMESTAMP`) are accepted and ignored — this
+/// subset applies the members in order with no atomicity guarantee across them
+/// (documented).
+fn parse_batch(raw: &str) -> Result<Statement, QueryError> {
+    // Strip the `BEGIN [UNLOGGED|LOGGED|COUNTER] BATCH` prefix and the trailing
+    // `APPLY BATCH`, then split the middle on `;` into member statements.
+    let lower = raw.to_ascii_lowercase();
+    let begin = lower
+        .find("batch")
+        .ok_or_else(|| QueryError::Unsupported("BEGIN without BATCH".into()))?;
+    let apply = lower
+        .rfind("apply")
+        .ok_or_else(|| QueryError::Unsupported("BATCH without APPLY BATCH".into()))?;
+    if apply <= begin {
+        return Err(QueryError::Unsupported("malformed BATCH".into()));
+    }
+    let body = &raw[begin + "batch".len()..apply];
+    let mut statements = Vec::new();
+    for piece in body.split(';') {
+        let piece = piece.trim();
+        if piece.is_empty() {
+            continue;
+        }
+        let stmt = parse_statement(piece)?;
+        match stmt {
+            Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_) => {
+                statements.push(stmt);
+            }
+            _ => {
+                return Err(QueryError::Unsupported(
+                    "a BATCH may only contain INSERT, UPDATE, or DELETE statements".into(),
+                ));
+            }
+        }
+    }
+    if statements.is_empty() {
+        return Err(QueryError::Unsupported("empty BATCH".into()));
+    }
+    Ok(Statement::Batch(Batch { statements }))
+}
+
+fn parse_drop(it: &mut TokenStream<'_>) -> Result<Statement, QueryError> {
+    expect_kw(it, "drop")?;
+    // Only `DROP TABLE` is supported (not `DROP KEYSPACE`/`INDEX`/`TYPE`).
+    if !it.peek().is_some_and(|t| t.eq_ignore_ascii_case("table")) {
+        return Err(QueryError::Unsupported(
+            "only DROP TABLE is supported".into(),
+        ));
+    }
+    expect_kw(it, "table")?;
+    let if_exists = take_if_exists(it)?;
+    let (keyspace, table) = next_table_name(it)?;
+    end(it, "DROP TABLE")?;
+    Ok(Statement::DropTable(DropTable {
+        keyspace,
+        table,
+        if_exists,
+    }))
+}
+
+fn parse_alter(it: &mut TokenStream<'_>) -> Result<Statement, QueryError> {
+    expect_kw(it, "alter")?;
+    if !it.peek().is_some_and(|t| t.eq_ignore_ascii_case("table")) {
+        return Err(QueryError::Unsupported(
+            "only ALTER TABLE is supported".into(),
+        ));
+    }
+    expect_kw(it, "table")?;
+    let (keyspace, table) = next_table_name(it)?;
+    // Only `ADD` is supported (the schema-compatible alteration).
+    if !it.peek().is_some_and(|t| t.eq_ignore_ascii_case("add")) {
+        return Err(QueryError::Unsupported(
+            "only ALTER TABLE ... ADD <col> <type> is supported".into(),
+        ));
+    }
+    expect_kw(it, "add")?;
+    // `ADD (a int, b text)` or `ADD a int [, b text ...]` — accept both shapes.
+    let parenthesized = it.peek() == Some("(");
+    if parenthesized {
+        expect_punct(it, "(")?;
+    }
+    let mut add_columns = Vec::new();
+    loop {
+        let name = next_ident(it, "column name")?;
+        let type_name = next_ident(it, "column type")?;
+        let ty = CqlType::parse(&type_name).ok_or_else(|| {
+            QueryError::Unsupported(format!("unsupported column type `{type_name}`"))
+        })?;
+        add_columns.push((name, ty));
+        if it.peek() == Some(",") {
+            it.next();
+        } else {
+            break;
+        }
+    }
+    if parenthesized {
+        expect_punct(it, ")")?;
+    }
+    end(it, "ALTER TABLE")?;
+    Ok(Statement::AlterTable(AlterTable {
+        keyspace,
+        table,
+        add_columns,
+    }))
 }
 
 fn parse_use(it: &mut TokenStream<'_>) -> Result<Statement, QueryError> {
@@ -514,6 +681,16 @@ fn take_if_not_exists(it: &mut TokenStream<'_>) -> Result<bool, QueryError> {
     if it.peek().is_some_and(|t| t.eq_ignore_ascii_case("if")) {
         expect_kw(it, "if")?;
         expect_kw(it, "not")?;
+        expect_kw(it, "exists")?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+fn take_if_exists(it: &mut TokenStream<'_>) -> Result<bool, QueryError> {
+    if it.peek().is_some_and(|t| t.eq_ignore_ascii_case("if")) {
+        expect_kw(it, "if")?;
         expect_kw(it, "exists")?;
         Ok(true)
     } else {
@@ -850,10 +1027,91 @@ mod tests {
     #[test]
     fn rejects_unknown_statements() {
         assert!(matches!(
-            parse_statement("DROP TABLE t"),
+            parse_statement("TRUNCATE t"),
+            Err(QueryError::Unsupported(_))
+        ));
+        assert!(matches!(
+            parse_statement("DROP KEYSPACE app"),
             Err(QueryError::Unsupported(_))
         ));
         assert!(matches!(parse_statement("   "), Err(QueryError::Empty)));
+    }
+
+    #[test]
+    fn parses_drop_table() {
+        let s = parse_statement("DROP TABLE app.users").unwrap();
+        let Statement::DropTable(d) = s else {
+            panic!("expected drop table")
+        };
+        assert_eq!(d.keyspace.as_deref(), Some("app"));
+        assert_eq!(d.table, "users");
+        assert!(!d.if_exists);
+
+        let s = parse_statement("DROP TABLE IF EXISTS users").unwrap();
+        let Statement::DropTable(d) = s else {
+            panic!("expected drop table")
+        };
+        assert!(d.if_exists);
+    }
+
+    #[test]
+    fn parses_alter_table_add() {
+        let s = parse_statement("ALTER TABLE users ADD nickname text").unwrap();
+        let Statement::AlterTable(a) = s else {
+            panic!("expected alter table")
+        };
+        assert_eq!(a.table, "users");
+        assert_eq!(a.add_columns, vec![("nickname".into(), CqlType::Text)]);
+
+        // Multi-column ADD, parenthesized.
+        let s = parse_statement("ALTER TABLE users ADD (a int, b bigint)").unwrap();
+        let Statement::AlterTable(a) = s else {
+            panic!("expected alter table")
+        };
+        assert_eq!(
+            a.add_columns,
+            vec![("a".into(), CqlType::Int), ("b".into(), CqlType::BigInt)]
+        );
+
+        // ALTER ... DROP is unsupported.
+        assert!(matches!(
+            parse_statement("ALTER TABLE users DROP nickname"),
+            Err(QueryError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn parses_batch_of_mutations() {
+        let s = parse_statement(
+            "BEGIN BATCH \
+             INSERT INTO users (id, name) VALUES (1, 'a'); \
+             UPDATE users SET name = 'b' WHERE id = 2; \
+             DELETE FROM users WHERE id = 3; \
+             APPLY BATCH",
+        )
+        .unwrap();
+        let Statement::Batch(b) = s else {
+            panic!("expected batch")
+        };
+        assert_eq!(b.statements.len(), 3);
+        assert!(matches!(b.statements[0], Statement::Insert(_)));
+        assert!(matches!(b.statements[1], Statement::Update(_)));
+        assert!(matches!(b.statements[2], Statement::Delete(_)));
+    }
+
+    #[test]
+    fn batch_accepts_unlogged_option() {
+        let s = parse_statement("BEGIN UNLOGGED BATCH INSERT INTO t (id) VALUES (1); APPLY BATCH")
+            .unwrap();
+        assert!(matches!(s, Statement::Batch(_)));
+    }
+
+    #[test]
+    fn batch_rejects_select_member() {
+        assert!(matches!(
+            parse_statement("BEGIN BATCH SELECT * FROM t WHERE id = 1; APPLY BATCH"),
+            Err(QueryError::Unsupported(_))
+        ));
     }
 
     #[test]

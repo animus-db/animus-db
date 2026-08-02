@@ -99,15 +99,31 @@ convention:
   encode/decode of cell bytes (the contents of a protocol `[bytes]`) and literal
   parsing. Result frames carry proper `[column metadata]` with the real type ids,
   and bound values decode/type-check against the column type.
-- **`CREATE TABLE` + keyspaces.** `CREATE KEYSPACE`, `USE <keyspace>`, and
-  `CREATE TABLE (... PRIMARY KEY (col))` record a schema (one partition-key
-  column + typed columns) in an in-memory `Catalog`, so `INSERT`/`SELECT` resolve
-  their columns against the declared schema. A row is serialized to one
-  data-plane value (a versioned, self-describing blob of `(schema column index,
-  cell)` pairs) keyed by `escape(table) || pk_key_bytes`. The catalog is
-  **in-memory and not durable** (lost on restart; shared across in-process nodes
-  in `--cluster N` dev mode) — replicating schemas through the control plane is
-  future work, exactly as on the DynamoDB side.
+- **`CREATE TABLE` + keyspaces — control-plane replicated (ADR 0013).**
+  `CREATE KEYSPACE`, `USE <keyspace>`, and `CREATE TABLE (... PRIMARY KEY (col))`
+  declare a schema (one partition-key column + typed columns). `CREATE TABLE` now
+  **proposes the schema into the control plane's Raft-replicated catalog**
+  (`MetaCommand::CreateTableSchema`, keyed `keyspace.table`) and waits for it to
+  commit, so the table is **durable** (recovered from the Raft WAL/snapshot on
+  restart) and **cluster-agreed**, replacing the old per-process in-memory
+  catalog. `INSERT`/`SELECT`/`UPDATE`/`DELETE` resolve the schema from the
+  replicated `Metadata`. The `animusd` edge maps the CQL type system onto the
+  shared `ColumnType` vocabulary and reaches the leader through a process-global
+  set of registered control handles (mirroring the DynamoDB edge). A row is
+  serialized to one data-plane value (a versioned blob of `(schema column index,
+  cell)` pairs) keyed by `escape(table) || pk_key_bytes`. Keyspaces themselves are
+  not separately replicated (the catalog models tables); the edge keeps a
+  process-local keyspace set plus treats a keyspace with a replicated `ks.table`
+  as existing — replicating keyspace metadata is future work.
+- **`DROP TABLE` / `ALTER TABLE ... ADD`.** `DROP TABLE [IF EXISTS]` proposes
+  `DropTableSchema` and waits for it to replicate. `ALTER TABLE ... ADD <col>
+  <type>` appends columns by dropping + recreating the replicated schema with the
+  extended column list (column indices are preserved, so stored rows still decode)
+  — not atomic across the two steps; an in-place schema-mutation command is future
+  work.
+- **`BATCH`.** `BEGIN [UNLOGGED|LOGGED] BATCH <mutation>; ... APPLY BATCH` applies
+  a sequence of `INSERT`/`UPDATE`/`DELETE` statements in order (not atomically;
+  CQL logged-batch atomicity is future work).
 - **Prepared statements.** `PREPARE` parses + resolves a statement's `?` bind
   markers against the catalog and replies `RESULT/Prepared` (a
   content-addressed statement id + the bind-variable metadata); `EXECUTE` decodes
@@ -116,10 +132,11 @@ convention:
   prepare-then-execute path works across connections.
 
 The recognizer (`parse_statement`) accepts `USE` / `CREATE KEYSPACE` /
-`CREATE TABLE` / `INSERT` / `SELECT` / `UPDATE` / `DELETE` (with `?` markers and
-`keyspace.table` names); anything outside the subset is rejected cleanly with a
-CQL `ERROR` frame. `INSERT`/`UPDATE`/`DELETE`/`EXECUTE` reply `RESULT/Void`,
-`SELECT` replies a typed `RESULT/Rows`, and `USE`/`CREATE` reply
+`CREATE TABLE` / `INSERT` / `SELECT` / `UPDATE` / `DELETE` / `DROP TABLE` /
+`ALTER TABLE ... ADD` / `BATCH` (with `?` markers and `keyspace.table` names);
+anything outside the subset is rejected cleanly with a CQL `ERROR` frame.
+`INSERT`/`UPDATE`/`DELETE`/`EXECUTE`/`BATCH` reply `RESULT/Void`, `SELECT` replies
+a typed `RESULT/Rows`, and `USE`/`CREATE`/`DROP`/`ALTER` reply
 `SetKeyspace`/`SchemaChange`. Everything routes through the **same quorum
 coordinator** the plain-TCP and DynamoDB edges use; everything below the socket
 stays on the `Env`-based paths.
@@ -150,18 +167,25 @@ The CQL surface now also covers the row-mutation and key-modeling gaps:
   `TWO`/`THREE`→that many (clamped) — instead of being ignored: the edge
   overrides the `TabletView`'s `r`/`w` per request.
 
+Both adapters now **consume the control plane's replicated table-schema catalog**
+(ADR 0013): `CREATE TABLE` proposes a `CreateTableSchema` and waits for commit, so
+schemas are durable + cluster-agreed (the in-memory per-process catalogs are
+gone). The edge maps each adapter's type system onto the shared `ColumnType`
+vocabulary and routes the proposal to the control-plane leader via a
+process-global set of registered control handles.
+
 What remains. DynamoDB: per-index projection attribute lists (every index
-projects `ALL`), document-path projections (`a.b`),
-`UpdateItem`/`BatchWriteItem`/`TransactWrite`, and durable
-control-plane-replicated table schemas + key/index state (plus a native quorum
-range scan so `Query`/`Scan` need not track keys). CQL: composite (multi-column)
-partition keys, the remaining statement kinds (`BATCH`/`ALTER`/`DROP`, per-column
-`DELETE`), range/`IN`/`ORDER BY`/`LIMIT` predicates with a native quorum range
-scan (so a partition need not be one value), collection/UDT types, paging,
-authentication, `LWT`/conditional writes, and durable control-plane-replicated
-schemas. (Now done: clustering/compound primary keys, `UPDATE`/`DELETE`, CQL
-consistency levels; DynamoDB document/set types, projection, `ReturnValues`,
-composite/multiple GSIs + LSI.)
+projects `ALL`), document-path projections (`a.b`), atomic `TransactWrite`, and a
+native quorum range scan so `Query`/`Scan` need not track keys; replicated
+per-index/key state. CQL: composite (multi-column) partition keys, per-column
+`DELETE`, atomic logged `BATCH`, in-place `ALTER`, range/`IN`/`ORDER BY`/`LIMIT`
+predicates with a native quorum range scan (so a partition need not be one value),
+collection/UDT types, paging, authentication, and `LWT`/conditional writes; plus
+replicated **keyspace** metadata (only tables are replicated today). (Now done:
+clustering/compound primary keys, `UPDATE`/`DELETE`, CQL consistency levels,
+**durable control-plane-replicated schemas + `DROP`/`ALTER ADD`/`BATCH`**;
+DynamoDB document/set types, projection, `ReturnValues`, composite/multiple
+GSIs + LSI, **replicated `CreateTable` schemas**.)
 
 ## Consequences
 

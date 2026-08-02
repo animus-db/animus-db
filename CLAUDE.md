@@ -59,14 +59,16 @@ requests through the same data-plane coordinator — plus a **CQL v4 wire
 protocol** (`animus-cql`: STARTUP/READY handshake; a scalar **type system**
 (text/int/bigint/boolean/blob/uuid) with typed column metadata + bound values;
 `CREATE KEYSPACE`/`USE`/`CREATE TABLE` (incl. **compound primary keys** — a
-partition key + clustering columns) recording a schema in an in-memory catalog;
-`INSERT`/`SELECT`/`UPDATE`/`DELETE` resolved against that schema — a partition
-(all rows sharing a partition key, ordered by clustering key) is one data-plane
-value so reads/writes stay point ops, a `SELECT pk = ?` returns rows
-clustering-ordered, and a `DELETE` emptying a partition tombstones the key; the
-requested **consistency level** is honored (mapped to the data-plane R/W quorum);
-plus **prepared statements** (PREPARE→Prepared, EXECUTE with bound values) — all
-routed through that same coordinator) — the **topology-aware placement
+partition key + clustering columns) now **proposing the schema into the control
+plane's Raft-replicated catalog** (ADR 0013) and waiting for commit, so a created
+table is durable + cluster-agreed — plus `DROP TABLE`, `ALTER TABLE ... ADD`, and
+`BATCH`; `INSERT`/`SELECT`/`UPDATE`/`DELETE` resolved against the **replicated**
+schema — a partition (all rows sharing a partition key, ordered by clustering key)
+is one data-plane value so reads/writes stay point ops, a `SELECT pk = ?` returns
+rows clustering-ordered, and a `DELETE` emptying a partition tombstones the key;
+the requested **consistency level** is honored (mapped to the data-plane R/W
+quorum); plus **prepared statements** (PREPARE→Prepared, EXECUTE with bound
+values) — all routed through that same coordinator) — the **topology-aware placement
 engine** (`animus-placement`: residency + failure-domain spread, with the leader
 automatically reconciling tablet placement via control-plane `CasTabletReplicas`),
 and a **slice of Accord-style leaderless transaction consensus**
@@ -86,15 +88,19 @@ transaction's key set may span more than one tablet, each key's effect routed to
 its own tablet's quorum while one global execution timestamp orders all shards —
 and an **interactive read-modify-write** folds its read set into the committed
 transaction's conflict tracking, with **adaptive (exponential) retry backoff**;
-ADR 0011). Skeletons / future work:
+ADR 0011). Both wire adapters now **consume the control plane's replicated
+table-schema catalog** (ADR 0013): `CREATE TABLE`/`DROP TABLE` propose a
+`CreateTableSchema`/`DropTableSchema` and wait for commit, and reads/writes
+resolve schema from the replicated `Metadata` — so a created table is durable +
+cluster-agreed (proven surviving a node restart over real TCP in
+`animusd/tests/cql_durable_schema.rs`), replacing the per-process in-memory
+catalogs. Skeletons / future work:
 the rest of the CQL surface (composite multi-column partition keys,
-`BATCH`/`ALTER`/`DROP`, per-column `DELETE`, range/`IN`/`ORDER BY`/`LIMIT`,
-collection/UDT types, paging, auth, `LWT`) and the rest of the
+per-column `DELETE`, atomic logged `BATCH`, in-place `ALTER`,
+range/`IN`/`ORDER BY`/`LIMIT`, collection/UDT types, paging, auth, `LWT`,
+replicated **keyspace** metadata) and the rest of the
 DynamoDB surface (per-index projection attribute lists, document-path
-projections, `UpdateItem`/`BatchWriteItem`/`TransactWrite`) — note the control
-plane now holds a **replicated table-schema catalog** (ADR 0013) the adapters can
-consume to replace their per-process in-memory catalogs (that adapter wiring is
-the follow-up) — and the deferred remainder of Accord
+projections, atomic `TransactWrite`) — and the deferred remainder of Accord
 (the full dependency wait-graph, the precise recovery ballot + duelling
 recoverers + a failure detector, WAL snapshotting, arbitrary caller-supplied
 write values, and per-shard consensus replica sets / placement of the consensus
@@ -245,9 +251,14 @@ applied deterministically (create rejects duplicates + malformed schemas; drop i
 idempotent). Living in `Metadata`, it is Raft-replicated and recovered from the
 WAL/snapshot like all metadata, so a `CreateTable`/`CREATE TABLE` survives restart
 and is agreed cluster-wide — replacing the adapters' per-process in-memory
-catalogs (the adapter wiring is a follow-up). Proven in
-`animus-control/tests/schema_catalog.rs` (propose → reject duplicate/malformed →
-leader kill → survives + survivors agree → drop replicates).
+catalogs. **Both wire edges consume it**: `animusd::{cql,dynamo}` propose
+`CreateTableSchema`/`DropTableSchema` on DDL (routed to the leader via a
+process-global set of registered control handles) and resolve reads/writes from
+the replicated `Metadata`. Proven in `animus-control/tests/schema_catalog.rs`
+(propose → reject duplicate/malformed → leader kill → survives + survivors agree →
+drop replicates) and end-to-end over the wire in
+`animusd/tests/cql_durable_schema.rs` (CREATE TABLE + a row survive a node
+restart).
 
 ### Data plane (`animus-data`)
 

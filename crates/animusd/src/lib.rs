@@ -26,7 +26,7 @@
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 pub mod config;
@@ -40,7 +40,7 @@ mod cql;
 mod dynamo;
 
 use animus_control::node::heartbeat_loop;
-use animus_control::{MetaCommand, PlacementPolicy, RaftNode};
+use animus_control::{MetaCommand, PlacementPolicy, RaftNode, TableSchema};
 use animus_data::{
     DataClient, HintStore, ReadResult, TabletView, serve_anti_entropy, serve_hint_replay,
     serve_replica,
@@ -246,6 +246,12 @@ impl BoundNode {
         ];
 
         let raft = RaftNode::start(self.control_env, control_ids.clone());
+        // Register this node's control handle in the process-global set the wire
+        // edges use to reach the control-plane leader for schema proposals
+        // (ADR 0013). In `--cluster N` mode this lets any node's CQL/DynamoDB edge
+        // propose a `CreateTableSchema` on whichever in-process node is currently
+        // leader, so DDL on a follower-connected client still commits.
+        register_control(raft.clone());
 
         // The data replica's durable store, plus the autonomous data-plane loops.
         // The on-disk LSM does its disk I/O through a *clone* of the data env's
@@ -619,6 +625,54 @@ async fn handle_client(mut stream: TcpStream, ctx: ClientCtx) -> std::io::Result
     Ok(())
 }
 
+/// How long the CQL/DynamoDB edges wait for a proposed schema `MetaCommand`
+/// (`CreateTableSchema`/`DropTableSchema`) to commit through the control plane
+/// before giving up. Generous: a fresh cluster may still be electing a leader.
+const SCHEMA_COMMIT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Poll interval while waiting for a proposed schema command to commit / for a
+/// leader to settle so the proposal can be (re)submitted.
+const SCHEMA_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// The process-global set of this process's control `RaftNode` handles, so a
+/// wire edge (CQL/DynamoDB) can reach the control-plane **leader** to propose a
+/// schema `MetaCommand` even when the client connected to a follower (ADR 0013).
+/// In `--cluster N` mode every in-process node registers here, so the leader is
+/// always present; in one-process-per-node mode only the local handle is
+/// registered (cross-process proposal forwarding over the network is future
+/// work — DDL then commits when this node is the leader, like the existing
+/// bootstrap path).
+fn control_handles() -> &'static Mutex<Vec<RaftNode<ProdEnv>>> {
+    static HANDLES: OnceLock<Mutex<Vec<RaftNode<ProdEnv>>>> = OnceLock::new();
+    HANDLES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Register a node's control handle for schema-proposal routing (see
+/// [`control_handles`]). Called once per node in [`BoundNode::start_with`].
+fn register_control(raft: RaftNode<ProdEnv>) {
+    control_handles()
+        .lock()
+        .expect("control handles poisoned")
+        .push(raft);
+}
+
+/// Propose `command` on **every** registered control handle that currently
+/// believes it is leader. Normally exactly one live node is leader; proposing on
+/// all self-styled leaders is robust to a stale handle left by a shut-down node
+/// in a multi-incarnation test (a dead handle's `propose` is a harmless no-op,
+/// while the live leader actually appends + replicates). A non-leader `propose`
+/// is dropped (`NotLeader`), so this is safe to call every poll tick.
+fn propose_on_leaders(command: &MetaCommand) {
+    for raft in control_handles()
+        .lock()
+        .expect("control handles poisoned")
+        .iter()
+    {
+        if raft.is_leader() {
+            let _ = raft.propose(command.clone());
+        }
+    }
+}
+
 impl ClientCtx {
     /// Resolve the routing view for `key` from cached metadata.
     pub(crate) fn view_for(&self, key: &[u8]) -> Option<TabletView> {
@@ -628,6 +682,136 @@ impl ClientCtx {
             .values()
             .find(|t| t.range.contains(key))
             .map(|t| TabletView::from_tablet(t, self.r, self.w))
+    }
+
+    /// The replicated schema for `table` (the control plane's `ks.table`-keyed
+    /// catalog, ADR 0013), read from this node's cached `Metadata`. Every node
+    /// applies committed metadata, so a follower sees a table the leader created
+    /// once the entry replicates. Returns `None` for an unknown table.
+    pub(crate) fn table_schema(&self, table: &str) -> Option<TableSchema> {
+        self.raft.metadata().table_schema(table).cloned()
+    }
+
+    /// Whether `table` has a replicated schema (cached `Metadata`, ADR 0013).
+    pub(crate) fn has_table_schema(&self, table: &str) -> bool {
+        self.raft.metadata().has_table_schema(table)
+    }
+
+    /// Whether any replicated table name starts with `prefix`. Used by the CQL
+    /// edge to recognize a keyspace (keyed `ks.table`) as existing because it has
+    /// at least one table, even across a restart (keyspaces are not separately
+    /// replicated — ADR 0013).
+    pub(crate) fn has_table_schema_with_prefix(&self, prefix: &str) -> bool {
+        self.raft
+            .metadata()
+            .table_schemas()
+            .any(|(name, _)| name.starts_with(prefix))
+    }
+
+    /// Propose `MetaCommand::CreateTableSchema` to the control-plane **leader**
+    /// and wait for it to commit, so a `CREATE TABLE` is **durable +
+    /// cluster-agreed** (ADR 0013) before the client is told it succeeded.
+    ///
+    /// A proposal must land on the Raft leader. The client may have connected to
+    /// a follower, so the proposal is routed to whichever registered control
+    /// handle ([`control_handles`]) currently believes it is leader, rather than
+    /// blindly to the local node. It re-proposes each poll tick (leadership may
+    /// still be settling, or a leader change drops the in-flight entry) until the
+    /// table appears in this node's replicated catalog — `CreateTableSchema`
+    /// rejects a duplicate, so a racing double-create settles to one schema.
+    /// Times out after [`SCHEMA_COMMIT_TIMEOUT`].
+    ///
+    /// Returns `Ok(())` once the schema is committed and visible here. Returns
+    /// `Err` if it did not commit in time (e.g. no leader reachable) or if a
+    /// *different* schema is already registered for `table` (a conflicting
+    /// `CREATE TABLE`).
+    pub(crate) async fn create_table_schema(
+        &self,
+        table: String,
+        schema: TableSchema,
+    ) -> Result<(), String> {
+        // Already present? Treat an identical schema as success (idempotent
+        // re-create); a different one is a conflict the caller should surface.
+        if let Some(existing) = self.table_schema(&table) {
+            return if existing == schema {
+                Ok(())
+            } else {
+                Err(format!(
+                    "table `{table}` already exists with a different schema"
+                ))
+            };
+        }
+        let command = MetaCommand::CreateTableSchema {
+            table: table.clone(),
+            schema: schema.clone(),
+        };
+        self.propose_and_await(command, SCHEMA_COMMIT_TIMEOUT, || self.table_schema(&table))
+            .await
+            .map_err(|()| {
+                format!(
+                    "CREATE TABLE `{table}` did not commit within {}s (no control-plane leader reachable?)",
+                    SCHEMA_COMMIT_TIMEOUT.as_secs()
+                )
+            })
+            .and_then(|committed| {
+                if committed == schema {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "table `{table}` already exists with a different schema"
+                    ))
+                }
+            })
+    }
+
+    /// Propose `MetaCommand::DropTableSchema` and wait for the table to disappear
+    /// from the replicated catalog (ADR 0013). Idempotent: dropping an absent
+    /// table returns `Ok(())` immediately. Routes to the leader exactly as
+    /// [`create_table_schema`](Self::create_table_schema).
+    pub(crate) async fn drop_table_schema(&self, table: String) -> Result<(), String> {
+        if !self.has_table_schema(&table) {
+            return Ok(());
+        }
+        let command = MetaCommand::DropTableSchema {
+            table: table.clone(),
+        };
+        let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
+        loop {
+            if !self.has_table_schema(&table) {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "DROP TABLE `{table}` did not commit within {}s (no control-plane leader reachable?)",
+                    SCHEMA_COMMIT_TIMEOUT.as_secs()
+                ));
+            }
+            propose_on_leaders(&command);
+            tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+        }
+    }
+
+    /// Propose `command` on the current leader and poll `committed` until it
+    /// reports the change visible in this node's replicated metadata (or time
+    /// out). Re-proposes each tick so a leader change does not strand it.
+    /// Returns the committed value `committed` observed, or `Err(())` on timeout.
+    async fn propose_and_await<T>(
+        &self,
+        command: MetaCommand,
+        timeout: Duration,
+        committed: impl Fn() -> Option<T>,
+    ) -> Result<T, ()> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if let Some(value) = committed() {
+                return Ok(value);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(());
+            }
+            propose_on_leaders(&command);
+            tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+        }
     }
 }
 

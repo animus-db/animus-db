@@ -339,10 +339,11 @@ async fn cql_wire_prepare_execute_typed_round_trip() {
     let back_cells = parse_single_row(&back.body).expect("row present");
     assert_eq!(back_cells[0].as_deref(), Some(&b"Grace"[..]));
 
-    // An unsupported statement is a CQL ERROR, not a panic.
+    // An unsupported statement is a CQL ERROR, not a panic. (`DROP TABLE` is now
+    // supported, so use a statement still outside the subset.)
     let bad = round_trip(
         &mut conn1,
-        &request(7, Opcode::Query, &query_body("DROP TABLE users")),
+        &request(7, Opcode::Query, &query_body("TRUNCATE users")),
     )
     .await;
     assert_eq!(bad.opcode, Opcode::Error, "unsupported query should ERROR");
