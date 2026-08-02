@@ -22,3 +22,4 @@ tracing.workspace = true
 
 [dev-dependencies]
 custos-sim.workspace = true
+tokio = { workspace = true }

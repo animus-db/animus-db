@@ -26,19 +26,26 @@
 //! under simulation; a recovered node repopulates a *fresh* engine in the
 //! original execution order from the WAL.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use custos_env::{Env, EnvExt, NodeId};
 use custos_storage::{MemoryEngine, StorageEngine};
 
-use crate::core::{AccordCore, ApplyEffect, Decision, Key, TxnId};
+use crate::core::{AccordCore, ApplyEffect, Decision, Key, ReadEffect, TxnId};
 use crate::message::{AccordMsg, Out};
 use crate::persist::PersistedState;
 use crate::timestamp::Timestamp;
 
 /// File name of the per-node Accord write-ahead log on the `Env` disk.
 const WAL: &str = "accord.wal";
+
+/// The per-node store of read-transaction results: for each executed read-only
+/// transaction, the writer ([`TxnId`]) observed at each key at the read's
+/// execution timestamp (`None` = the key had no committed write before the
+/// read). Populated by the driver as it satisfies [`ReadEffect`]s, so the result
+/// is available once [`AccordNode::is_applied`] holds for the read txn.
+type ReadResults = Arc<Mutex<BTreeMap<TxnId, BTreeMap<Key, Option<TxnId>>>>>;
 
 /// A running consensus replica. Cheap to clone; clones share one [`AccordCore`]
 /// and one storage engine.
@@ -49,6 +56,8 @@ pub struct AccordNode<E: Env, S: StorageEngine = MemoryEngine> {
     env: E,
     core: Arc<Mutex<AccordCore>>,
     storage: S,
+    /// Results of executed read-only transactions (see [`ReadResults`]).
+    reads: ReadResults,
 }
 
 impl<E: Env, S: StorageEngine> Clone for AccordNode<E, S> {
@@ -57,6 +66,7 @@ impl<E: Env, S: StorageEngine> Clone for AccordNode<E, S> {
             env: self.env.clone(),
             core: Arc::clone(&self.core),
             storage: self.storage.clone(),
+            reads: Arc::clone(&self.reads),
         }
     }
 }
@@ -77,21 +87,41 @@ impl<E: Env, S: StorageEngine + 'static> AccordNode<E, S> {
     /// `storage`.
     pub fn start_with_storage(env: E, all_nodes: Vec<NodeId>, storage: S) -> AccordNode<E, S> {
         let core = Arc::new(Mutex::new(AccordCore::new(env.node_id(), &all_nodes)));
+        let reads: ReadResults = Arc::new(Mutex::new(BTreeMap::new()));
         let node = AccordNode {
             env: env.clone(),
             core: Arc::clone(&core),
             storage: storage.clone(),
+            reads: Arc::clone(&reads),
         };
-        env.spawn_task(drive(env.clone(), Arc::clone(&core), storage, all_nodes));
+        env.spawn_task(drive(
+            env.clone(),
+            Arc::clone(&core),
+            storage,
+            reads,
+            all_nodes,
+        ));
         node
     }
 
-    /// Submit a new transaction over `keys` for this node to coordinate. Mints
-    /// `t0`, ships the `PreAccept` burst (after fsyncing the durable state the
-    /// burst depends on), and returns the transaction id.
+    /// Submit a new **write** transaction over `keys` for this node to
+    /// coordinate. Mints `t0`, ships the `PreAccept` burst (after fsyncing the
+    /// durable state the burst depends on), and returns the transaction id.
     pub fn submit(&self, keys: BTreeSet<Key>) -> TxnId {
         let (txn, outs) = self.lock().submit(keys);
-        persist_then_ship(&self.env, &self.core, &self.storage, outs);
+        persist_then_ship(&self.env, &self.core, &self.storage, &self.reads, outs);
+        txn
+    }
+
+    /// Submit a **read-only** transaction over `keys`. It is ordered exactly like
+    /// a write (timestamp + conflict deps) and, once it executes, reads each key
+    /// as of its execution timestamp — observing the writes of every transaction
+    /// ordered before it and none ordered after. The observed values are
+    /// retrievable via [`AccordNode::read_result`] once [`AccordNode::is_applied`]
+    /// holds for the returned id.
+    pub fn submit_read(&self, keys: BTreeSet<Key>) -> TxnId {
+        let (txn, outs) = self.lock().submit_read(keys);
+        persist_then_ship(&self.env, &self.core, &self.storage, &self.reads, outs);
         txn
     }
 
@@ -100,7 +130,20 @@ impl<E: Env, S: StorageEngine + 'static> AccordNode<E, S> {
     /// consistent commit. See [`AccordCore::recover`].
     pub fn recover(&self, txn: TxnId) {
         let outs = self.lock().recover(txn);
-        persist_then_ship(&self.env, &self.core, &self.storage, outs);
+        persist_then_ship(&self.env, &self.core, &self.storage, &self.reads, outs);
+    }
+
+    /// The result of an executed read-only transaction: the writer this replica
+    /// observed at each key at the read's execution timestamp (`None` = no
+    /// committed write at that key ordered before the read). Returns `None` until
+    /// the read has executed here (see [`AccordNode::is_applied`]).
+    #[must_use]
+    pub fn read_result(&self, txn: TxnId) -> Option<BTreeMap<Key, Option<TxnId>>> {
+        self.reads
+            .lock()
+            .expect("read results poisoned")
+            .get(&txn)
+            .cloned()
     }
 
     /// This node's environment handle.
@@ -189,14 +232,16 @@ fn persist_then_ship<E: Env, S: StorageEngine + 'static>(
     env: &E,
     core: &Arc<Mutex<AccordCore>>,
     storage: &S,
+    reads: &ReadResults,
     outs: Vec<Out>,
 ) {
-    let (records, applies) = {
+    let (records, applies, read_effects) = {
         let mut c = core.lock().expect("accord core poisoned");
-        (c.drain_persist(), c.drain_apply())
+        (c.drain_persist(), c.drain_apply(), c.drain_reads())
     };
     let env = env.clone();
     let storage = storage.clone();
+    let reads = Arc::clone(reads);
     env.clone().spawn_task(async move {
         for record in &records {
             env.append(WAL, &PersistedState::encode_record(record))
@@ -206,7 +251,12 @@ fn persist_then_ship<E: Env, S: StorageEngine + 'static>(
         if !records.is_empty() {
             env.sync(WAL).await.expect("wal sync");
         }
+        // Apply writes first, then satisfy reads: a read effect emitted in the
+        // same drain as a write it orders after sees that write (the core only
+        // emits a read effect once its earlier-ordered conflicts are `Applied`,
+        // so their write effects were drained no later than this one).
         apply_all(&storage, &applies).await;
+        satisfy_reads(&storage, &reads, &read_effects).await;
         for (to, msg) in outs {
             let bytes = serde_json::to_vec(&msg).expect("accord message serializes");
             env.send(to, bytes).await;
@@ -231,6 +281,34 @@ async fn apply_all<S: StorageEngine>(storage: &S, applies: &[ApplyEffect]) {
     }
 }
 
+/// Satisfy read-only transactions: for each [`ReadEffect`], read every key it
+/// touches **as of** the read's execution timestamp (`get_at`) — so the read
+/// observes exactly the writes that executed before it (lower MVCC version) and
+/// none after — decode the observed writer id, and record the per-key result in
+/// the shared [`ReadResults`] under the read txn's id.
+async fn satisfy_reads<S: StorageEngine>(
+    storage: &S,
+    reads: &ReadResults,
+    read_effects: &[ReadEffect],
+) {
+    for effect in read_effects {
+        let version = effect.version.logical;
+        let mut observed: BTreeMap<Key, Option<TxnId>> = BTreeMap::new();
+        for &key in &effect.keys {
+            let writer = storage
+                .get_at(&storage_key(key), version)
+                .await
+                .expect("storage get_at")
+                .and_then(|vv| decode_txn(&vv.value));
+            observed.insert(key, writer);
+        }
+        reads
+            .lock()
+            .expect("read results poisoned")
+            .insert(effect.txn, observed);
+    }
+}
+
 /// The per-node driver loop: recover durable state, then repeatedly wait for the
 /// next message, hand it to the core, persist the resulting durable changes,
 /// apply execution effects, and ship whatever the core wants sent.
@@ -238,6 +316,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(
     env: E,
     core: Arc<Mutex<AccordCore>>,
     storage: S,
+    reads: ReadResults,
     all_nodes: Vec<NodeId>,
 ) {
     // Recover from the WAL before serving anything.
@@ -245,14 +324,16 @@ async fn drive<E: Env, S: StorageEngine + 'static>(
     let state = PersistedState::replay(PersistedState::decode(&bytes));
     if !state.is_empty() {
         let recovered = AccordCore::recovered(env.node_id(), &all_nodes, state);
-        let applies = {
+        let (applies, read_effects) = {
             let mut guard = core.lock().expect("accord core poisoned");
             *guard = recovered;
-            // The core emitted apply effects for its recovered execution order;
-            // repopulate the (fresh, volatile) storage engine in that order.
-            guard.drain_apply()
+            // The core emitted apply/read effects for its recovered execution
+            // order; repopulate the (fresh, volatile) storage engine and re-run
+            // the recovered reads in that order.
+            (guard.drain_apply(), guard.drain_reads())
         };
         apply_all(&storage, &applies).await;
+        satisfy_reads(&storage, &reads, &read_effects).await;
     }
 
     loop {
@@ -269,6 +350,6 @@ async fn drive<E: Env, S: StorageEngine + 'static>(
         };
         // Durable before action: fsync the core's state changes (e.g. a Commit
         // we just executed) before applying effects and shipping messages.
-        persist_then_ship(&env, &core, &storage, outs);
+        persist_then_ship(&env, &core, &storage, &reads, outs);
     }
 }

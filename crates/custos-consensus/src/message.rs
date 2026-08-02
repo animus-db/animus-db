@@ -22,7 +22,14 @@ use crate::timestamp::Timestamp;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AccordMsg {
     /// Coordinator → replicas: proposes transaction `txn` (its `t0`) over `keys`.
-    PreAccept { txn: TxnId, keys: BTreeSet<Key> },
+    /// `read_only` marks a read transaction (executes a `get_at` snapshot at its
+    /// execution timestamp, writes nothing) — ordered exactly like a write, only
+    /// its execution *effect* differs.
+    PreAccept {
+        txn: TxnId,
+        keys: BTreeSet<Key>,
+        read_only: bool,
+    },
     /// Replica → coordinator: the timestamp this replica proposes for `txn`
     /// (`t0` unless a conflict bumped it) and the conflicting transactions it
     /// has seen (`txn`'s dependencies).
@@ -41,10 +48,13 @@ pub enum AccordMsg {
     /// Replica → coordinator: acknowledges the `Accept`.
     AcceptOk { txn: TxnId },
     /// Coordinator → replicas: the agreed final execution timestamp and deps.
+    /// Carries `read_only` so a replica that learns the transaction only at
+    /// `Commit` (missed its `PreAccept`) still knows to execute it as a read.
     Commit {
         txn: TxnId,
         execute_at: Timestamp,
         deps: BTreeSet<TxnId>,
+        read_only: bool,
     },
     /// Recovery coordinator → replicas: "tell me everything you recorded about
     /// `txn`". Sent by a *new* coordinator taking over a transaction whose
@@ -63,6 +73,8 @@ pub enum AccordMsg {
         deps: BTreeSet<TxnId>,
         /// The transaction's key set, as known to this replica.
         keys: BTreeSet<Key>,
+        /// Whether this replica recorded the transaction as read-only.
+        read_only: bool,
     },
 }
 

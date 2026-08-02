@@ -1,9 +1,11 @@
 # ADR 0011 — Accord-style leaderless transaction consensus
 
 - **Status:** Accepted (first minimal slice; extended with execution + durability;
-  then storage-backed execution + coordinator failover)
+  then storage-backed execution + coordinator failover; then read transactions +
+  multi-thread liveness regression)
 - **Date:** 2026-08-01 (execution + durability increment: 2026-08-01;
-  storage-backed execution + coordinator-failover increment: 2026-08-01)
+  storage-backed execution + coordinator-failover increment: 2026-08-01;
+  read-transactions + multi-thread-liveness increment: 2026-08-02)
 
 ## Context
 
@@ -203,3 +205,58 @@ sync-core / `Env`-driver split.
   shared data plane), contention/livelock handling and timeouts/retries, and
   sharding/placement (one global replica set). The Elle cycle checker is still
   unwired.
+
+## Read transactions + multi-thread liveness increment (2026-08-02)
+
+This increment adds **read-only transactions** and hardens the driver's liveness
+with a real multi-threaded regression test — again without reshaping the
+sync-core / `Env`-driver split.
+
+- **Read-only transactions.** A read transaction is **ordered exactly like a
+  write**: it mints a `t0`, intersects conflicting keys (so it carries the
+  conflicting writes as dependencies), and is committed at an agreed
+  `execute_at` via the same PreAccept/(Accept)/Commit machinery. Only its
+  *execution effect* differs. When it becomes applicable (every earlier-ordered
+  conflict has applied), the sync `AccordCore` emits a `ReadEffect { txn, keys,
+  version = execute_at }` into a `pending_read` buffer instead of an
+  `ApplyEffect`, and **writes nothing**. The `AccordNode` driver drains it and
+  performs an async `StorageEngine::get_at(key, version)` for each key, so the
+  read observes the value as of its execution timestamp — i.e. the write of
+  every transaction ordered **before** it (which executed at a strictly lower
+  MVCC version) and **none** ordered after. Because every replica converges to
+  the same committed order, the read observes the **same** snapshot on every
+  replica. The read/write nature is carried on `PreAccept`/`Commit`/`RecoverOk`
+  and the `PreAccepted`/`Committed` WAL records, so it survives recovery (a
+  recovered read re-runs its `get_at` in the recovered execution order). The
+  observed per-key writer ids are exposed via `AccordNode::read_result(txn)`.
+  Tests in `custos-consensus/tests/accord_read.rs` (under `SimEnv`): a read
+  observes the write ordered before it and not the one after; a read of an
+  unwritten key observes nothing; the read snapshot is identical on every
+  replica across a 48-seed sweep; the read result recovers from disk; and the
+  read path is trace-reproducible.
+
+- **Multi-thread liveness regression (race audit).** The deterministic
+  single-threaded `SimEnv` proves ordering/logic but not real-thread liveness —
+  it cannot surface a `std::sync::Mutex` guard held across an `.await` or a
+  stranded waker handoff (the class that bit the storage WAL group-commit). We
+  audited `AccordNode` for that class and **found no bug**: the driver takes the
+  core lock only briefly to drain (`drain_persist`/`drain_apply`/`drain_reads`),
+  drops it, and does all I/O lock-free inside a spawned task — no guard is held
+  across any `.await`, and there is no custom future/waker. To lock that in,
+  `custos-consensus/tests/accord_concurrent.rs` drives several Accord replicas
+  over the **real multi-threaded `ProdEnv`** (tokio multi-thread runtime + real
+  TCP + real disk) with multiple coordinators concurrently committing conflicting
+  transactions, guarded by `tokio::time::timeout` so a strand fails loudly
+  instead of hanging. It also re-asserts the safety property under genuine
+  parallelism (consistent execution order + converged store). The test
+  deliberately keeps per-round conflict depth bounded and drives each round to
+  completion, because this slice has **no message retry** (`Network::send` is
+  fire-and-forget) — a transport drop is a deferred limitation, not the
+  mutex/waker liveness bug the test targets.
+
+- **Still deferred** (unchanged, plus): multi-key read *snapshot atomicity* in
+  the presence of concurrent commits to different keys of the read set is only
+  as strong as the per-key `(execute_at, txn)` ordering gives (sufficient for
+  the conflict-set the read declares); a richer interactive read/write
+  transaction API, and message retry/timeouts (a stalled transaction is not yet
+  retried).
