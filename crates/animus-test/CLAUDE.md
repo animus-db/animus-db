@@ -55,10 +55,11 @@ so it doesn't actually exercise `check_cycles`. The Accord-targeted suite does:
   trusting any green corpus run.
 - `support/mod.rs` — the shared harness: assembles an Accord replica set wired to
   the data plane (`start_with_data_plane`), drives **concurrent conflicting**
-  multi-key read/write transactions over a small shared key space, records an
-  Elle list-append `History`, and runs all three checkers. Also defines the
-  declarative `Scenario` / `NemesisAction` model, the `run_scenario` runner, and
-  the frozen `corpus()` generator.
+  multi-key read/write transactions over a small shared key space as **genuine
+  black-box list-append** (real list values stored and observed — see below),
+  records an Elle list-append `History`, and runs all three checkers. Also defines
+  the declarative `Scenario` / `NemesisAction` model, the `run_scenario` runner,
+  and the frozen `corpus()` generator.
 - `elle_accord.rs` — Accord under contention: a no-fault contended run + seed
   sweep + a determinism check, with teeth-guards asserting the run genuinely
   contended.
@@ -67,37 +68,50 @@ so it doesn't actually exercise `check_cycles`. The Accord-targeted suite does:
   baselines and compound lossy/overlapping scenarios), a coverage guard, a
   non-vacuity guard, and a determinism check.
 
-- **List-append over a register (the Accord modelling).** Accord's execution
-  effect is "write my txn id" — a *register*, not list-append. The harness
-  recovers each key's list from Accord's agreed **`applied_order`**: a key's list
-  is the (globally-unique) values of the write transactions Accord ordered to it;
-  a read observes the prefix ordered before it. This is faithful — it is exactly
-  the order Accord claims, so an ordering bug surfaces as a divergent read or a
-  real cycle. **Do not** run `check_durability` against a final *register* read of
-  this data plane: the register holds only the last writer, so every overwritten
-  append looks "lost". Build the final list-append state from `applied_order`
-  (the harness's `list_state`), and read convergence from **two distinct
-  replicas'** orders (a genuine cross-replica agreement check).
+- **Genuine black-box list-append over Accord (ADR 0014, closed limitation).**
+  With **arbitrary write values** (ADR 0011) each key stores a *real list value*:
+  a write is a list-append (append this txn's globally-unique element to the key's
+  list, write the whole new list back as the stored value via
+  `AccordNode::submit_writes`), and a read observes the **actual stored list**
+  (decoded from `AccordNode::read_value_result`). The recovered order comes from
+  observed *values* (Elle's `recover`), **not** from `applied_order` — so
+  `check_cycles` is a real black-box serializability check (a single
+  globally-agreed-but-non-serializable order now shows as a cycle, not just
+  cross-replica divergence). The earlier "recover the list from `applied_order`"
+  modelling is **obsolete** — do not reintroduce it.
+- **`list_state` reads stored values, not the order.** Final state is read
+  straight from each key's actually-stored value on two *distinct* replicas
+  (`store_value` → `decode_list`), keeping convergence a real cross-replica
+  agreement check and durability ("every ok append is in the final list")
+  meaningful. **Do not** run `check_durability` against a single raw per-replica
+  read with no read-repair expectation; read the converged stored list per
+  replica.
+- **Single-writer-per-key is load-bearing here (not just an optimisation).** Each
+  key is written by exactly one client (`owner(key) = key % clients`); a write
+  only appends to keys it owns. Two clients appending to one key lose updates by
+  the *data model* (per-key LWW), which would show as a false-positive durability
+  failure / divergent read — not a consistency bug. Cross-transaction conflict
+  (the wr/rw/ww edges) still comes from multi-key transactions and from reads
+  observing keys *other* clients write. **A client builds each append on its own
+  authoritative in-memory list**, *not* a begin-time quorum read: the apply marks
+  a txn `Applied` before its fire-and-forget data-plane write lands, so a
+  begin-time read can see a stale base and lose the client's own earlier appends
+  (this bit during development — the seed sweep caught it as a divergent read).
 - **The corpus is a committed generator, not a live-random test.** Each
   scenario's seed is a stable hash of its name, so the suite runs the same set
   every time and a failure names one scenario + seed. Regenerating/growing it is
   an explicit edit to `support::corpus`; a bug-catching scenario stays forever.
-- **Indeterminate (`info`) vs the recovered universe.** A write whose client
-  timed out is recorded `info`, but if it actually executed it still appears in
-  `applied_order` (hence in reads and the final list). That's sound: reads and
-  the final state both derive uniformly from the consensus order, so they stay
-  prefix-consistent; `info` values simply have no `ok` appender, so they form no
-  dependency edges. Never record an indeterminate op `ok`.
-
+- **Indeterminate (`info`) vs the observed universe.** A write whose client timed
+  out is recorded `info`, but if it actually executed its element is in the key's
+  stored list (hence observed by later reads and present in the final list).
+  That's sound: reads and the final state both read stored values, so they stay
+  prefix-consistent under single-writer-per-key; `info` values simply have no `ok`
+  appender, so they form no dependency edges. Never record an indeterminate op
+  `ok`.
 - **Workload modeling gotcha (Elle).** Every appended element must be **globally
-  unique**, not just per-key-per-round. Reusing a value across rounds/phases (a
-  single-writer key that re-appends the "same" element) makes `recover` collapse
-  distinct transactions onto one `(key, value)` appender, manufacturing
-  **spurious cycles** the checker correctly flags. `end_to_end.rs` draws values
-  from one monotonic `fresh_value()` source for exactly this reason. If
+  unique**, not just per-key-per-round. Reusing a value across rounds/phases makes
+  `recover` collapse distinct transactions onto one `(key, value)` appender,
+  manufacturing **spurious cycles** the checker correctly flags. The harness draws
+  values from one monotonic `fresh_value()` source for exactly this reason. If
   `check_cycles` trips on a single-writer-per-key workload, suspect value reuse
   before suspecting the system.
-- Use **single-writer-per-key** for list-append over the LWW KV store:
-  concurrent writers to one key lose updates by the *data model* (LWW), which is
-  not a consistency bug and would otherwise drown the checker in false positives.
-  Concurrency still comes from many clients running interleaved across keys.

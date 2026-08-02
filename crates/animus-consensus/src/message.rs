@@ -3,7 +3,7 @@
 //! Higher layers (de)serialize these with `serde_json` over the `Vec<u8>`
 //! payloads the `Network` moves, exactly like the control plane's `RaftMsg`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use animus_env::NodeId;
 use serde::{Deserialize, Serialize};
@@ -33,6 +33,11 @@ pub enum AccordMsg {
         keys: BTreeSet<Key>,
         #[serde(default)]
         write_keys: BTreeSet<Key>,
+        /// Caller-supplied value bytes per written key (arbitrary write values,
+        /// ADR 0011). A `write_keys` entry absent here executes as the txn id.
+        /// Empty for valueless callers (`submit`/`submit_rw`).
+        #[serde(default)]
+        write_values: BTreeMap<Key, Vec<u8>>,
         read_only: bool,
     },
     /// Replica → coordinator: the timestamp this replica proposes for `txn`
@@ -64,6 +69,11 @@ pub enum AccordMsg {
         /// write effect). Empty for a read-only transaction.
         #[serde(default)]
         write_keys: BTreeSet<Key>,
+        /// Caller-supplied value bytes per written key (arbitrary write values,
+        /// ADR 0011), so a replica that learns the transaction only at `Commit`
+        /// writes the right value. A key absent executes as the txn id.
+        #[serde(default)]
+        write_values: BTreeMap<Key, Vec<u8>>,
         read_only: bool,
     },
     /// Replica → coordinator: acknowledges the `Commit` was recorded. `Commit`
@@ -91,6 +101,10 @@ pub enum AccordMsg {
         /// The subset of `keys` the transaction writes, as known to this replica.
         #[serde(default)]
         write_keys: BTreeSet<Key>,
+        /// The caller-supplied write values this replica recorded (arbitrary
+        /// write values, ADR 0011); recovery unions them across the quorum.
+        #[serde(default)]
+        write_values: BTreeMap<Key, Vec<u8>>,
         /// Whether this replica recorded the transaction as read-only.
         read_only: bool,
     },

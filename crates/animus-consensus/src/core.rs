@@ -142,6 +142,13 @@ struct ReplicaTxn {
     /// read's is empty; a read-modify-write's holds the write keys while `keys`
     /// additionally covers the read-only keys. See [`AccordCore::submit_rw`].
     write_keys: BTreeSet<Key>,
+    /// Caller-supplied value bytes for the keys this transaction writes
+    /// (arbitrary write values, ADR 0011). A `write_keys` entry absent here
+    /// executes as the transaction's encoded id (the classic register effect),
+    /// so a valueless caller (`submit`/`submit_rw`) leaves this empty. Carried so
+    /// a replica that learns the transaction only at `Commit` still writes the
+    /// right value, and so recovery/failover replay the same bytes.
+    write_values: BTreeMap<Key, Vec<u8>>,
     /// Best-known execution timestamp: `t0` until `Accept`/`Commit` raise it.
     execute_at: Timestamp,
     deps: BTreeSet<TxnId>,
@@ -176,6 +183,10 @@ struct Coordinating {
     /// The subset of `keys` the transaction writes, kept for the same retry
     /// re-send (rides the `PreAccept` / `Commit`).
     write_keys: BTreeSet<Key>,
+    /// Caller-supplied value bytes per written key (arbitrary write values, ADR
+    /// 0011), kept so a retry tick re-sends the same values on the
+    /// `PreAccept`/`Commit`. Empty for a valueless caller.
+    write_values: BTreeMap<Key, Vec<u8>>,
     /// The agreed `(execute_at, deps)` once the coordinator has chosen them
     /// (slow-path `Accept`, or `Commit`), kept so a retry tick can re-send the
     /// `Accept`/`Commit` to peers that have not yet acknowledged it. `None`
@@ -202,6 +213,19 @@ struct Recovering {
     replies: BTreeMap<NodeId, RecoverReply>,
 }
 
+/// What a replica reports about a transaction when it answers a `Recover` (the
+/// facts that become a `RecoverOk`). Factored into a struct to keep
+/// [`AccordCore::replica_recover`]'s return type readable.
+struct RecoverFacts {
+    phase: Phase,
+    execute_at: Timestamp,
+    deps: BTreeSet<TxnId>,
+    keys: BTreeSet<Key>,
+    write_keys: BTreeSet<Key>,
+    write_values: BTreeMap<Key, Vec<u8>>,
+    read_only: bool,
+}
+
 /// One replica's recorded state for a transaction under recovery, as reported in
 /// its `RecoverOk`.
 #[derive(Clone, Debug)]
@@ -214,6 +238,10 @@ struct RecoverReply {
     /// from the *union* of these across the quorum (a transaction is read-only
     /// iff it writes nothing), so the wire `read_only` flag is not stored here.
     write_keys: BTreeSet<Key>,
+    /// The caller-supplied write values the replica recorded (arbitrary write
+    /// values, ADR 0011). Recovery unions these across the quorum so a recovered
+    /// transaction executes with the same values the original would have.
+    write_values: BTreeMap<Key, Vec<u8>>,
 }
 
 /// Outcome of a coordinator finishing (committing) a transaction it owns.
@@ -231,16 +259,25 @@ pub struct Decision {
 /// driver to apply against the (async) `StorageEngine`. The core decides the
 /// order; the driver does the I/O.
 ///
-/// The effect is "write the transaction's id to each key it touches", stamped
-/// with `version` (the transaction's `execute_at.logical`) as the MVCC version.
-/// The driver applies it with per-key last-writer-wins (`merge`), which is
-/// idempotent and commutative, so re-applying on recovery is harmless.
+/// Each key in `keys` is written, stamped with `version` (the transaction's
+/// `execute_at.logical`) as the MVCC version. The **value** written is the
+/// caller-supplied bytes in `values` for that key if present (arbitrary
+/// caller-supplied write values, ADR 0011); a key absent from `values` defaults
+/// (at the driver) to the transaction's encoded id — the classic register effect
+/// for callers that supply no value. The driver applies with per-key
+/// last-writer-wins (`merge`), which is idempotent and commutative, so
+/// re-applying on recovery is harmless. Keys and values flow through the core
+/// purely as data — the core never touches the store nor encodes a txn id.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ApplyEffect {
     /// The transaction being executed.
     pub txn: TxnId,
     /// The keys it writes.
     pub keys: BTreeSet<Key>,
+    /// The caller-supplied value for each written key. A key present in `keys`
+    /// but absent here defaults (at the driver) to the transaction's encoded id,
+    /// preserving the classic "write my id" effect for valueless callers.
+    pub values: BTreeMap<Key, Vec<u8>>,
     /// The MVCC version to stamp each write with (its execution timestamp).
     pub version: Timestamp,
 }
@@ -349,6 +386,7 @@ impl AccordCore {
                 ReplicaTxn {
                     keys: p.keys,
                     write_keys: p.write_keys,
+                    write_values: p.write_values,
                     execute_at: p.execute_at,
                     deps: p.deps,
                     phase,
@@ -376,6 +414,7 @@ impl AccordCore {
                     core.pending_apply.push(ApplyEffect {
                         txn,
                         keys: t.write_keys.clone(),
+                        values: t.write_values.clone(),
                         version: t.execute_at,
                     });
                 }
@@ -514,6 +553,7 @@ impl AccordCore {
                                     txn,
                                     keys: c.keys.clone(),
                                     write_keys: c.write_keys.clone(),
+                                    write_values: c.write_values.clone(),
                                     read_only: c.read_only,
                                 },
                             ));
@@ -547,6 +587,7 @@ impl AccordCore {
                                         execute_at: *execute_at,
                                         deps: deps.clone(),
                                         write_keys: c.write_keys.clone(),
+                                        write_values: c.write_values.clone(),
                                         read_only: c.read_only,
                                     },
                                 ));
@@ -575,7 +616,41 @@ impl AccordCore {
     /// Returns `(txn_id, outbound)`.
     pub fn submit(&mut self, keys: BTreeSet<Key>) -> (TxnId, Vec<Out>) {
         let write_keys = keys.clone();
-        self.submit_inner(keys, write_keys, false)
+        self.submit_inner(keys, write_keys, BTreeMap::new(), false)
+    }
+
+    /// Begin coordinating a **write** transaction with explicit
+    /// caller-supplied **values** (arbitrary write values, ADR 0011): each
+    /// `(key, value)` writes `value` to `key` at execution. The write key set is
+    /// the map's keys; the conflict set equals it (a pure write). Unlike
+    /// [`AccordCore::submit`] — whose effect is "write my id" — the executed value
+    /// is exactly the bytes supplied here, so a black-box reader observes a real
+    /// value. With an empty map this commits and writes nothing.
+    ///
+    /// Returns `(txn_id, outbound)`.
+    pub fn submit_writes(&mut self, writes: BTreeMap<Key, Vec<u8>>) -> (TxnId, Vec<Out>) {
+        self.submit_writes_rw(BTreeSet::new(), writes)
+    }
+
+    /// Begin coordinating a **read-modify-write** transaction with explicit
+    /// caller-supplied write **values** (arbitrary write values, ADR 0011): it
+    /// reads `read_keys` (which join the conflict set but produce no write) and
+    /// writes each `(key, value)` in `writes`. The conflict set is `read_keys ∪
+    /// writes.keys()`. This is the value-carrying form of
+    /// [`AccordCore::submit_rw`]; the executed value at each written key is the
+    /// supplied bytes, not the txn id. A read-modify-write with a non-empty write
+    /// map is never read-only.
+    ///
+    /// Returns `(txn_id, outbound)`.
+    pub fn submit_writes_rw(
+        &mut self,
+        read_keys: BTreeSet<Key>,
+        writes: BTreeMap<Key, Vec<u8>>,
+    ) -> (TxnId, Vec<Out>) {
+        let write_keys: BTreeSet<Key> = writes.keys().copied().collect();
+        let keys: BTreeSet<Key> = read_keys.union(&write_keys).copied().collect();
+        let read_only = write_keys.is_empty();
+        self.submit_inner(keys, write_keys, writes, read_only)
     }
 
     /// Begin coordinating a **read-modify-write** transaction: it *reads*
@@ -596,7 +671,7 @@ impl AccordCore {
         let keys: BTreeSet<Key> = read_keys.union(&write_keys).copied().collect();
         // A transaction that writes nothing is read-only regardless of its reads.
         let read_only = write_keys.is_empty();
-        self.submit_inner(keys, write_keys, read_only)
+        self.submit_inner(keys, write_keys, BTreeMap::new(), read_only)
     }
 
     /// Begin coordinating a **read-only** transaction over `keys`. Ordered
@@ -609,20 +684,21 @@ impl AccordCore {
     ///
     /// Returns `(txn_id, outbound)`.
     pub fn submit_read(&mut self, keys: BTreeSet<Key>) -> (TxnId, Vec<Out>) {
-        self.submit_inner(keys, BTreeSet::new(), true)
+        self.submit_inner(keys, BTreeSet::new(), BTreeMap::new(), true)
     }
 
     fn submit_inner(
         &mut self,
         keys: BTreeSet<Key>,
         write_keys: BTreeSet<Key>,
+        write_values: BTreeMap<Key, Vec<u8>>,
         read_only: bool,
     ) -> (TxnId, Vec<Out>) {
         let t0 = self.clock.mint();
 
         // Apply to our own replica state and seed the coordinator's reply set
         // with our own PreAcceptOk (we are a replica of every txn in this slice).
-        let (ts, deps) = self.replica_pre_accept(t0, &keys, &write_keys, read_only);
+        let (ts, deps) = self.replica_pre_accept(t0, &keys, &write_keys, &write_values, read_only);
 
         let mut replies = BTreeMap::new();
         replies.insert(self.id, (ts, deps));
@@ -636,6 +712,7 @@ impl AccordCore {
                 read_only,
                 keys: keys.clone(),
                 write_keys: write_keys.clone(),
+                write_values: write_values.clone(),
                 chosen: None,
                 commit_acks: BTreeSet::new(),
             },
@@ -651,6 +728,7 @@ impl AccordCore {
                         txn: t0,
                         keys: keys.clone(),
                         write_keys: write_keys.clone(),
+                        write_values: write_values.clone(),
                         read_only,
                     },
                 )
@@ -674,9 +752,11 @@ impl AccordCore {
                 txn,
                 keys,
                 write_keys,
+                write_values,
                 read_only,
             } => {
-                let (ts, deps) = self.replica_pre_accept(txn, &keys, &write_keys, read_only);
+                let (ts, deps) =
+                    self.replica_pre_accept(txn, &keys, &write_keys, &write_values, read_only);
                 vec![(from, AccordMsg::PreAcceptOk { txn, ts, deps })]
             }
             AccordMsg::PreAcceptOk { txn, ts, deps } => {
@@ -700,9 +780,10 @@ impl AccordCore {
                 execute_at,
                 deps,
                 write_keys,
+                write_values,
                 read_only,
             } => {
-                self.replica_commit(txn, execute_at, deps, write_keys, read_only);
+                self.replica_commit(txn, execute_at, deps, write_keys, write_values, read_only);
                 // Acknowledge so the coordinator stops re-sending `Commit` to us
                 // on its retry tick (ADR 0011, message retry). Idempotent: a
                 // duplicate `Commit` re-acks harmlessly.
@@ -715,18 +796,18 @@ impl AccordCore {
                 Vec::new()
             }
             AccordMsg::Recover { txn } => {
-                let (phase, execute_at, deps, keys, write_keys, read_only) =
-                    self.replica_recover(txn);
+                let f = self.replica_recover(txn);
                 vec![(
                     from,
                     AccordMsg::RecoverOk {
                         txn,
-                        phase,
-                        execute_at,
-                        deps,
-                        keys,
-                        write_keys,
-                        read_only,
+                        phase: f.phase,
+                        execute_at: f.execute_at,
+                        deps: f.deps,
+                        keys: f.keys,
+                        write_keys: f.write_keys,
+                        write_values: f.write_values,
+                        read_only: f.read_only,
                     },
                 )]
             }
@@ -737,6 +818,7 @@ impl AccordCore {
                 deps,
                 keys,
                 write_keys,
+                write_values,
                 read_only,
             } => {
                 let _ = read_only; // read-only-ness is derived from write_keys
@@ -749,6 +831,7 @@ impl AccordCore {
                         deps,
                         keys,
                         write_keys,
+                        write_values,
                     },
                 );
                 self.try_advance_recovery(txn).unwrap_or_default()
@@ -767,6 +850,7 @@ impl AccordCore {
         txn: TxnId,
         keys: &BTreeSet<Key>,
         write_keys: &BTreeSet<Key>,
+        write_values: &BTreeMap<Key, Vec<u8>>,
         read_only: bool,
     ) -> (Timestamp, BTreeSet<TxnId>) {
         self.clock.witness(txn);
@@ -801,6 +885,7 @@ impl AccordCore {
         let entry = self.txns.entry(txn).or_insert_with(|| ReplicaTxn {
             keys: keys.clone(),
             write_keys: write_keys.clone(),
+            write_values: write_values.clone(),
             execute_at: txn,
             deps: BTreeSet::new(),
             phase: Phase::PreAccepted,
@@ -808,6 +893,12 @@ impl AccordCore {
         });
         entry.keys.extend(keys.iter().copied());
         entry.write_keys.extend(write_keys.iter().copied());
+        // Caller-supplied write values are authoritative for the keys they cover;
+        // fold them in (a duplicate PreAccept carries the same values, so this is
+        // idempotent — last write of identical bytes wins).
+        for (k, v) in write_values {
+            entry.write_values.insert(*k, v.clone());
+        }
         if proposed > entry.execute_at {
             entry.execute_at = proposed;
         }
@@ -821,6 +912,7 @@ impl AccordCore {
         let reply_ts = entry.execute_at;
         let record_keys = entry.keys.clone();
         let record_write_keys = entry.write_keys.clone();
+        let record_write_values = entry.write_values.clone();
         let record_read_only = entry.read_only;
         // Durable before we reply: the coordinator's quorum counts a PreAcceptOk
         // only after it is on this replica's disk.
@@ -828,6 +920,7 @@ impl AccordCore {
             txn,
             keys: record_keys,
             write_keys: record_write_keys,
+            write_values: record_write_values,
             execute_at: reply_ts,
             deps: reply_deps.clone(),
             read_only: record_read_only,
@@ -842,6 +935,7 @@ impl AccordCore {
         let entry = self.txns.entry(txn).or_insert_with(|| ReplicaTxn {
             keys: BTreeSet::new(),
             write_keys: BTreeSet::new(),
+            write_values: BTreeMap::new(),
             execute_at,
             deps: BTreeSet::new(),
             phase: Phase::Accepted,
@@ -870,12 +964,14 @@ impl AccordCore {
         execute_at: Timestamp,
         deps: BTreeSet<TxnId>,
         write_keys: BTreeSet<Key>,
+        write_values: BTreeMap<Key, Vec<u8>>,
         read_only: bool,
     ) {
         self.clock.witness(execute_at);
         let entry = self.txns.entry(txn).or_insert_with(|| ReplicaTxn {
             keys: write_keys.clone(),
             write_keys: write_keys.clone(),
+            write_values: write_values.clone(),
             execute_at,
             deps: BTreeSet::new(),
             phase: Phase::Committed,
@@ -883,9 +979,12 @@ impl AccordCore {
         });
         // The Commit carries the authoritative write set (so a replica that
         // missed PreAccept still executes the right write); the write keys are
-        // also part of the conflict set.
+        // also part of the conflict set, and the values it must execute.
         entry.keys.extend(write_keys.iter().copied());
         entry.write_keys.extend(write_keys.iter().copied());
+        for (k, v) in &write_values {
+            entry.write_values.insert(*k, v.clone());
+        }
         // Read-only iff it writes nothing (consistent with `write_keys`).
         entry.read_only = (entry.read_only && read_only) && entry.write_keys.is_empty();
         // A txn already applied stays applied (idempotent under a duplicate
@@ -898,11 +997,13 @@ impl AccordCore {
         if entry.phase == Phase::Committed {
             let keys = entry.keys.clone();
             let record_write_keys = entry.write_keys.clone();
+            let record_write_values = entry.write_values.clone();
             let record_read_only = entry.read_only;
             self.pending.push(WalRecord::Committed {
                 txn,
                 keys,
                 write_keys: record_write_keys,
+                write_values: record_write_values,
                 execute_at,
                 deps,
                 read_only: record_read_only,
@@ -986,12 +1087,14 @@ impl AccordCore {
     /// way — only the effect differs — so a read observes exactly the writes that
     /// executed before it (lower `execute_at`) and none after.
     fn apply(&mut self, txn: TxnId) {
-        let (keys, write_keys, execute_at, read_only) = match self.txns.get_mut(&txn) {
+        let (keys, write_keys, write_values, execute_at, read_only) = match self.txns.get_mut(&txn)
+        {
             Some(t) if t.phase == Phase::Committed => {
                 t.phase = Phase::Applied;
                 (
                     t.keys.clone(),
                     t.write_keys.clone(),
+                    t.write_values.clone(),
                     t.execute_at,
                     t.read_only,
                 )
@@ -1008,9 +1111,12 @@ impl AccordCore {
         } else {
             // A write (incl. read-modify-write) writes only its `write_keys`;
             // any extra read-only keys ordered it but produce no write effect.
+            // The caller-supplied values ride along (a key absent from
+            // `write_values` defaults at the driver to the txn id).
             self.pending_apply.push(ApplyEffect {
                 txn,
                 keys: write_keys,
+                values: write_values,
                 version: execute_at,
             });
         }
@@ -1172,11 +1278,11 @@ impl AccordCore {
         deps: BTreeSet<TxnId>,
         fast_path: bool,
     ) -> Vec<Out> {
-        let (read_only, write_keys) = self
+        let (read_only, write_keys, write_values) = self
             .coordinating
             .get(&txn)
-            .map_or((false, BTreeSet::new()), |c| {
-                (c.read_only, c.write_keys.clone())
+            .map_or((false, BTreeSet::new(), BTreeMap::new()), |c| {
+                (c.read_only, c.write_keys.clone(), c.write_values.clone())
             });
         if let Some(c) = self.coordinating.get_mut(&txn) {
             if c.phase == CoordPhase::Done {
@@ -1187,7 +1293,14 @@ impl AccordCore {
             // to peers that have not yet acknowledged it.
             c.chosen = Some((execute_at, deps.clone()));
         }
-        self.replica_commit(txn, execute_at, deps.clone(), write_keys.clone(), read_only);
+        self.replica_commit(
+            txn,
+            execute_at,
+            deps.clone(),
+            write_keys.clone(),
+            write_values.clone(),
+            read_only,
+        );
         self.decisions.push(Decision {
             txn,
             execute_at,
@@ -1203,6 +1316,7 @@ impl AccordCore {
                         execute_at,
                         deps: deps.clone(),
                         write_keys: write_keys.clone(),
+                        write_values: write_values.clone(),
                         read_only,
                     },
                 )
@@ -1229,16 +1343,17 @@ impl AccordCore {
             // We are (or were) the original coordinator; nothing to recover.
             return Vec::new();
         }
-        let (phase, execute_at, deps, keys, write_keys, _read_only) = self.replica_recover(txn);
+        let f = self.replica_recover(txn);
         let mut replies = BTreeMap::new();
         replies.insert(
             self.id,
             RecoverReply {
-                phase,
-                execute_at,
-                deps,
-                keys,
-                write_keys,
+                phase: f.phase,
+                execute_at: f.execute_at,
+                deps: f.deps,
+                keys: f.keys,
+                write_keys: f.write_keys,
+                write_values: f.write_values,
             },
         );
         self.recovering.insert(txn, Recovering { replies });
@@ -1259,32 +1374,24 @@ impl AccordCore {
     /// If the replica had never heard of `txn`, it witnesses it now as a fresh
     /// `PreAccepted` entry (keys unknown, `execute_at == t0`, no deps) so it
     /// joins the recovery — and records it durably like a `PreAccept` would.
-    fn replica_recover(
-        &mut self,
-        txn: TxnId,
-    ) -> (
-        Phase,
-        Timestamp,
-        BTreeSet<TxnId>,
-        BTreeSet<Key>,
-        BTreeSet<Key>,
-        bool,
-    ) {
+    fn replica_recover(&mut self, txn: TxnId) -> RecoverFacts {
         self.clock.witness(txn);
         if let Some(t) = self.txns.get(&txn) {
-            return (
-                t.phase,
-                t.execute_at,
-                t.deps.clone(),
-                t.keys.clone(),
-                t.write_keys.clone(),
-                t.read_only,
-            );
+            return RecoverFacts {
+                phase: t.phase,
+                execute_at: t.execute_at,
+                deps: t.deps.clone(),
+                keys: t.keys.clone(),
+                write_keys: t.write_keys.clone(),
+                write_values: t.write_values.clone(),
+                read_only: t.read_only,
+            };
         }
         // Never seen: witness as PreAccepted at t0 with no keys/deps known.
         let entry = ReplicaTxn {
             keys: BTreeSet::new(),
             write_keys: BTreeSet::new(),
+            write_values: BTreeMap::new(),
             execute_at: txn,
             deps: BTreeSet::new(),
             phase: Phase::PreAccepted,
@@ -1295,18 +1402,20 @@ impl AccordCore {
             txn,
             keys: BTreeSet::new(),
             write_keys: BTreeSet::new(),
+            write_values: BTreeMap::new(),
             execute_at: txn,
             deps: BTreeSet::new(),
             read_only: false,
         });
-        (
-            entry.phase,
-            entry.execute_at,
-            entry.deps,
-            entry.keys,
-            entry.write_keys,
-            entry.read_only,
-        )
+        RecoverFacts {
+            phase: entry.phase,
+            execute_at: entry.execute_at,
+            deps: entry.deps,
+            keys: entry.keys,
+            write_keys: entry.write_keys,
+            write_values: entry.write_values,
+            read_only: entry.read_only,
+        }
     }
 
     fn recovery_record(&mut self, from: NodeId, txn: TxnId, reply: RecoverReply) {
@@ -1349,6 +1458,15 @@ impl AccordCore {
             .values()
             .flat_map(|r| r.write_keys.iter().copied())
             .collect();
+        // Union the caller-supplied write values across the quorum so a recovered
+        // transaction executes the same bytes the original would have (a replica
+        // that missed the original PreAccept contributes nothing here).
+        let mut union_write_values: BTreeMap<Key, Vec<u8>> = BTreeMap::new();
+        for r in replies.values() {
+            for (k, v) in &r.write_values {
+                union_write_values.insert(*k, v.clone());
+            }
+        }
         let read_only = union_write_keys.is_empty();
 
         // (1) Adopt an already-committed decision if any replica has one.
@@ -1359,7 +1477,14 @@ impl AccordCore {
         {
             let execute_at = r.execute_at;
             let deps = r.deps.clone();
-            return Some(self.commit_recovered(txn, execute_at, deps, union_write_keys, read_only));
+            return Some(self.commit_recovered(
+                txn,
+                execute_at,
+                deps,
+                union_write_keys,
+                union_write_values,
+                read_only,
+            ));
         }
 
         // (2) Re-drive the transaction as a fresh, recovery-flagged coordinator.
@@ -1371,7 +1496,13 @@ impl AccordCore {
         // with its keys before we commit. Then, being a recovery coordinator, we
         // never take the fast path (`advance_from_pre_accept` forces Accept →
         // Commit).
-        let (ts, deps) = self.replica_pre_accept(txn, &union_keys, &union_write_keys, read_only);
+        let (ts, deps) = self.replica_pre_accept(
+            txn,
+            &union_keys,
+            &union_write_keys,
+            &union_write_values,
+            read_only,
+        );
         let mut coord_replies: BTreeMap<NodeId, (Timestamp, BTreeSet<TxnId>)> = BTreeMap::new();
         coord_replies.insert(self.id, (ts, deps));
         self.coordinating.insert(
@@ -1384,6 +1515,7 @@ impl AccordCore {
                 read_only,
                 keys: union_keys.clone(),
                 write_keys: union_write_keys.clone(),
+                write_values: union_write_values.clone(),
                 chosen: None,
                 commit_acks: BTreeSet::new(),
             },
@@ -1398,6 +1530,7 @@ impl AccordCore {
                         txn,
                         keys: union_keys.clone(),
                         write_keys: union_write_keys.clone(),
+                        write_values: union_write_values.clone(),
                         read_only,
                     },
                 )
@@ -1418,6 +1551,7 @@ impl AccordCore {
         execute_at: Timestamp,
         deps: BTreeSet<TxnId>,
         write_keys: BTreeSet<Key>,
+        write_values: BTreeMap<Key, Vec<u8>>,
         read_only: bool,
     ) -> Vec<Out> {
         self.coordinating.insert(
@@ -1430,6 +1564,7 @@ impl AccordCore {
                 read_only,
                 keys: write_keys.clone(),
                 write_keys,
+                write_values,
                 chosen: None,
                 commit_acks: BTreeSet::new(),
             },

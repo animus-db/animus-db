@@ -71,11 +71,14 @@ const RETRY_MAX_INTERVAL: Duration = Duration::from_millis(1600);
 const DATA_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The per-node store of read-transaction results: for each executed read-only
-/// transaction, the writer ([`TxnId`]) observed at each key at the read's
+/// transaction, the **raw value bytes** observed at each key at the read's
 /// execution timestamp (`None` = the key had no committed write before the
 /// read). Populated by the driver as it satisfies [`ReadEffect`]s, so the result
-/// is available once [`AccordNode::is_applied`] holds for the read txn.
-type ReadResults = Arc<Mutex<BTreeMap<TxnId, BTreeMap<Key, Option<TxnId>>>>>;
+/// is available once [`AccordNode::is_applied`] holds for the read txn. Stored as
+/// raw bytes so a read of an arbitrary value (list-append, ADR 0011) is observed
+/// verbatim; [`AccordNode::read_result`] decodes them as a writer txn id for the
+/// classic register view, [`AccordNode::read_value_result`] returns them raw.
+type ReadResults = Arc<Mutex<BTreeMap<TxnId, BTreeMap<Key, Option<Vec<u8>>>>>>;
 
 /// The **frontier** wiring: a sink that lands a committed transaction's writes in
 /// the replicated **data plane** (`animus-data`) instead of (only) a per-node
@@ -327,6 +330,53 @@ impl<E: Env, S: StorageEngine + 'static> AccordNode<E, S> {
         txn
     }
 
+    /// Submit a **write** transaction with explicit caller-supplied **values**
+    /// (arbitrary write values, ADR 0011): each `(key, value)` writes the given
+    /// bytes to `key` at execution, instead of the transaction's own id. The
+    /// write key set is the map's keys; the conflict set equals it. Ordered,
+    /// committed, and applied atomically at one execution timestamp exactly like
+    /// [`AccordNode::submit`]. A black-box reader (or a data-plane quorum read)
+    /// then observes the real value, not a register id. See
+    /// [`AccordCore::submit_writes`].
+    pub fn submit_writes(&self, writes: BTreeMap<Key, Vec<u8>>) -> TxnId {
+        let (txn, outs) = self.lock().submit_writes(writes);
+        persist_then_ship(
+            &self.env,
+            &self.core,
+            &self.storage,
+            &self.reads,
+            &self.sink,
+            outs,
+        );
+        txn
+    }
+
+    /// Submit a **read-modify-write** transaction with explicit caller-supplied
+    /// write **values** (arbitrary write values, ADR 0011): it reads `read_keys`
+    /// (which join the conflict set but produce no write) and writes each
+    /// `(key, value)` in `writes` with the supplied bytes. The conflict set is the
+    /// union of the read keys and the write keys, so a concurrent write to a key
+    /// this transaction *read* is ordered relative to it (the read-then-write
+    /// hazard). This is the value-carrying form of [`AccordNode::submit_rw`];
+    /// [`InteractiveTxn::commit`] uses it so an interactive session writes real
+    /// values that survive read-back. See [`AccordCore::submit_writes_rw`].
+    pub fn submit_writes_rw(
+        &self,
+        read_keys: BTreeSet<Key>,
+        writes: BTreeMap<Key, Vec<u8>>,
+    ) -> TxnId {
+        let (txn, outs) = self.lock().submit_writes_rw(read_keys, writes);
+        persist_then_ship(
+            &self.env,
+            &self.core,
+            &self.storage,
+            &self.reads,
+            &self.sink,
+            outs,
+        );
+        txn
+    }
+
     /// Take over `txn` as a *recovery coordinator* (its original coordinator is
     /// suspected dead). Broadcasts `Recover` and drives the transaction to a
     /// consistent commit. See [`AccordCore::recover`].
@@ -348,6 +398,23 @@ impl<E: Env, S: StorageEngine + 'static> AccordNode<E, S> {
     /// the read has executed here (see [`AccordNode::is_applied`]).
     #[must_use]
     pub fn read_result(&self, txn: TxnId) -> Option<BTreeMap<Key, Option<TxnId>>> {
+        let raw = self.read_value_result(txn)?;
+        Some(
+            raw.into_iter()
+                .map(|(k, v)| (k, v.as_deref().and_then(decode_txn)))
+                .collect(),
+        )
+    }
+
+    /// The result of an executed read-only transaction as **raw value bytes**: the
+    /// bytes this replica observed at each key at the read's execution timestamp
+    /// (`None` = no committed write at that key ordered before the read). Returns
+    /// `None` until the read has executed here (see [`AccordNode::is_applied`]).
+    /// Unlike [`AccordNode::read_result`], the bytes are returned verbatim — so a
+    /// read of an arbitrary value (list-append, ADR 0011) is observed exactly as
+    /// it was written, which is what a black-box consistency checker needs.
+    #[must_use]
+    pub fn read_value_result(&self, txn: TxnId) -> Option<BTreeMap<Key, Option<Vec<u8>>>> {
         self.reads
             .lock()
             .expect("read results poisoned")
@@ -389,6 +456,17 @@ impl<E: Env, S: StorageEngine + 'static> AccordNode<E, S> {
         decode_txn(&vv.value)
     }
 
+    /// The raw stored **value bytes** currently winning at `key` in this replica's
+    /// executed local store, if any. Unlike [`AccordNode::store_writer`] (which
+    /// decodes the bytes as a txn id) this returns the bytes verbatim, so a caller
+    /// reading back an arbitrary value written via
+    /// [`AccordNode::submit_writes`]/[`InteractiveTxn::write_value`] sees exactly
+    /// what was written (arbitrary write values, ADR 0011).
+    pub async fn store_value(&self, key: Key) -> Option<Vec<u8>> {
+        let vv = self.storage.get(&storage_key(key)).await.ok()??;
+        Some(vv.value)
+    }
+
     /// Whether this replica has executed `txn`.
     pub fn is_applied(&self, txn: TxnId) -> bool {
         self.lock().is_applied(txn)
@@ -427,6 +505,7 @@ impl<E: Env, S: StorageEngine + 'static> AccordNode<E, S> {
             node: self.clone(),
             reads: BTreeSet::new(),
             writes: BTreeSet::new(),
+            values: BTreeMap::new(),
         }
     }
 
@@ -436,18 +515,32 @@ impl<E: Env, S: StorageEngine + 'static> AccordNode<E, S> {
     /// [`InteractiveTxn::read`]; exposed so a caller can do an ad-hoc current read
     /// without opening a transaction.
     pub async fn current_writer(&self, key: Key) -> Option<TxnId> {
+        self.current_value(key)
+            .await
+            .as_deref()
+            .and_then(decode_txn)
+    }
+
+    /// Read the current committed **value bytes** of `key` as seen by this node:
+    /// through the replicated data-plane quorum when wired to it (the frontier
+    /// path), else from the local execution store. Unlike
+    /// [`AccordNode::current_writer`] this returns the raw bytes, so a caller doing
+    /// a read-modify-write over arbitrary values (e.g. list-append) sees the
+    /// actual value to modify (arbitrary write values, ADR 0011). `None` if the
+    /// key has no committed write (or a quorum could not be reached).
+    pub async fn current_value(&self, key: Key) -> Option<Vec<u8>> {
         match &self.sink {
             Some(sink) => {
                 let sk = storage_key(key);
                 match sink.routing.view_for(&sk) {
                     Some(view) => match sink.client.read(&view, &sk, DATA_TIMEOUT).await {
-                        ReadResult::Value(Some(bytes)) => decode_txn(&bytes),
+                        ReadResult::Value(Some(bytes)) => Some(bytes),
                         ReadResult::Value(None) | ReadResult::Failed => None,
                     },
                     None => None,
                 }
             }
-            None => self.store_writer(key).await,
+            None => self.store_value(key).await,
         }
     }
 
@@ -482,26 +575,51 @@ pub struct InteractiveTxn<E: Env, S: StorageEngine = MemoryEngine> {
     /// Keys read during the session; folded into the committed transaction's
     /// conflict set at `commit()` (so they carry dependencies).
     reads: BTreeSet<Key>,
-    /// Keys the session will write when committed.
+    /// Keys the session will write when committed (the full write set). A key
+    /// also present in `values` writes those bytes; a key only here writes the
+    /// transaction's id (the classic register effect).
     writes: BTreeSet<Key>,
+    /// Caller-supplied value bytes for keys written with [`InteractiveTxn::write_value`]
+    /// (arbitrary write values, ADR 0011). A key in `writes` but absent here
+    /// defaults to the transaction's id at execution.
+    values: BTreeMap<Key, Vec<u8>>,
 }
 
 impl<E: Env, S: StorageEngine + 'static> InteractiveTxn<E, S> {
-    /// Read the current committed writer of `key` and record it in the read set.
+    /// Read the current committed value of `key` and record it in the read set.
     /// Reads through the replicated data plane when the node is wired to it (the
-    /// frontier path), else the local execution store. Returns the observed
-    /// writer (`None` if the key has no committed write), so the caller can
-    /// decide what to write next.
+    /// frontier path), else the local execution store. Returns the observed value
+    /// writer (`None` if the key has no committed write), so the caller can decide
+    /// what to write next.
     pub async fn read(&mut self, key: Key) -> Option<TxnId> {
         self.reads.insert(key);
         self.node.current_writer(key).await
     }
 
-    /// Buffer a write to `key`. The value written when the transaction commits is
-    /// the committed transaction's own id (the standard Accord execution effect;
-    /// see [`ApplyEffect`]). Multiple writes to distinct keys land atomically.
+    /// Read the current committed **value bytes** of `key` (through the data plane
+    /// when wired, else the local store), recording it in the read set. Unlike
+    /// [`InteractiveTxn::read`] — which decodes the writer txn id — this returns
+    /// the raw stored bytes, so a caller doing a read-modify-write over arbitrary
+    /// values (e.g. list-append) sees the actual value to modify (ADR 0011).
+    pub async fn read_value(&mut self, key: Key) -> Option<Vec<u8>> {
+        self.reads.insert(key);
+        self.node.current_value(key).await
+    }
+
+    /// Buffer a write to `key` whose value is the committed transaction's own id
+    /// (the classic register effect; see [`ApplyEffect`]). Multiple writes to
+    /// distinct keys land atomically.
     pub fn write(&mut self, key: Key) {
         self.writes.insert(key);
+    }
+
+    /// Buffer a write to `key` of an explicit, caller-supplied **value**
+    /// (arbitrary write values, ADR 0011), so a later read observes those exact
+    /// bytes rather than a register id. Multiple writes (valued or not) to
+    /// distinct keys land atomically at one execution timestamp.
+    pub fn write_value(&mut self, key: Key, value: Vec<u8>) {
+        self.writes.insert(key);
+        self.values.insert(key, value);
     }
 
     /// The keys read so far in this session.
@@ -519,18 +637,39 @@ impl<E: Env, S: StorageEngine + 'static> InteractiveTxn<E, S> {
     /// Commit the session as a single Accord read-modify-write transaction.
     /// Returns the committed [`TxnId`], or `None` if nothing was written (an empty
     /// write set is a no-op). The transaction's **conflict set is the union of the
-    /// keys read and written** (via [`AccordNode::submit_rw`]), so the session's
-    /// reads fold into the committed transaction's dependency tracking: a
-    /// concurrent write to a key this session read is ordered relative to this
-    /// transaction (the read-then-write hazard is detected), while only the write
-    /// set carries the write effect. Agreed, ordered, and applied atomically at
-    /// one execution timestamp, so conflicting interactive transactions are
-    /// ordered consistently on every replica.
+    /// keys read and written**, so the session's reads fold into the committed
+    /// transaction's dependency tracking: a concurrent write to a key this session
+    /// read is ordered relative to this transaction (the read-then-write hazard is
+    /// detected), while only the write set carries the write effect. Each written
+    /// key carries its caller-supplied value (from [`InteractiveTxn::write_value`])
+    /// or defaults to the transaction's id (from [`InteractiveTxn::write`]).
+    /// Agreed, ordered, and applied atomically at one execution timestamp, so
+    /// conflicting interactive transactions are ordered consistently on every
+    /// replica.
     pub fn commit(self) -> Option<TxnId> {
         if self.writes.is_empty() {
             return None;
         }
-        Some(self.node.submit_rw(self.reads, self.writes))
+        if self.values.is_empty() {
+            // No explicit values: keep the classic txn-id write effect.
+            Some(self.node.submit_rw(self.reads, self.writes))
+        } else {
+            // Build the per-key value map: a write key with no explicit value
+            // carries the transaction's own id (added at the driver as the default
+            // when a value is absent), so the conflict/write set stays exactly
+            // `writes`. A key with an explicit value writes those bytes.
+            let writes: BTreeMap<Key, Vec<u8>> = self.values;
+            // `submit_writes_rw` derives the write-key set from the value map; any
+            // valueless write keys would otherwise be dropped, so include them by
+            // also passing the full write set as part of the read conflict set is
+            // wrong — instead, ensure every write key is in the value map.
+            debug_assert!(
+                self.writes.iter().all(|k| writes.contains_key(k)),
+                "mixing valued and valueless interactive writes is unsupported; \
+                 use write_value for every key when any value is supplied"
+            );
+            Some(self.node.submit_writes_rw(self.reads, writes))
+        }
     }
 }
 
@@ -622,12 +761,17 @@ async fn apply_all<E: Env, S: StorageEngine>(
     applies: &[ApplyEffect],
 ) {
     for effect in applies {
-        let value = encode_txn(effect.txn);
+        // The default value (no caller-supplied bytes) is the txn's own id — the
+        // classic register effect, which `store_writer` decodes back. A caller who
+        // supplied an arbitrary value (`submit_writes`/`InteractiveTxn::write_value`)
+        // gets exactly those bytes written (arbitrary write values, ADR 0011).
+        let default_value = encode_txn(effect.txn);
         let version = effect.version.logical;
         for &key in &effect.keys {
             let sk = storage_key(key);
+            let value = effect.values.get(&key).unwrap_or(&default_value);
             storage
-                .merge(&sk, &value, version)
+                .merge(&sk, value, version)
                 .await
                 .expect("storage merge");
             if let Some(sink) = sink {
@@ -643,7 +787,7 @@ async fn apply_all<E: Env, S: StorageEngine>(
                 if let Some(view) = sink.routing.view_for(&sk) {
                     let _ = sink
                         .client
-                        .write(&view, &sk, &value, version, DATA_TIMEOUT)
+                        .write(&view, &sk, value, version, DATA_TIMEOUT)
                         .await;
                 }
             }
@@ -652,8 +796,9 @@ async fn apply_all<E: Env, S: StorageEngine>(
 }
 
 /// Satisfy read-only transactions: for each [`ReadEffect`], read every key it
-/// touches and record the observed per-key writer id in the shared
-/// [`ReadResults`] under the read txn's id.
+/// touches and record the observed per-key **raw value bytes** in the shared
+/// [`ReadResults`] under the read txn's id (so an arbitrary value — list-append,
+/// ADR 0011 — is observed verbatim; the register-writer view decodes them).
 ///
 /// **Where the read lands depends on the wiring** (ADR 0011):
 ///
@@ -681,15 +826,15 @@ async fn satisfy_reads<E: Env, S: StorageEngine>(
 ) {
     for effect in read_effects {
         let version = effect.version.logical;
-        let mut observed: BTreeMap<Key, Option<TxnId>> = BTreeMap::new();
+        let mut observed: BTreeMap<Key, Option<Vec<u8>>> = BTreeMap::new();
         for &key in &effect.keys {
             let sk = storage_key(key);
-            let writer = match sink {
+            let value = match sink {
                 // Frontier: observe the replicated data plane (quorum read),
                 // routing the key to its own tablet's quorum (sharded reads).
                 Some(sink) => match sink.routing.view_for(&sk) {
                     Some(view) => match sink.client.read(&view, &sk, DATA_TIMEOUT).await {
-                        ReadResult::Value(Some(bytes)) => decode_txn(&bytes),
+                        ReadResult::Value(Some(bytes)) => Some(bytes),
                         // Absent everywhere, or a quorum could not be reached: the
                         // read observes nothing for this key (a transient quorum
                         // miss converges via the data plane's own anti-entropy).
@@ -703,9 +848,9 @@ async fn satisfy_reads<E: Env, S: StorageEngine>(
                     .get_at(&sk, version)
                     .await
                     .expect("storage get_at")
-                    .and_then(|vv| decode_txn(&vv.value)),
+                    .map(|vv| vv.value),
             };
-            observed.insert(key, writer);
+            observed.insert(key, value);
         }
         reads
             .lock()

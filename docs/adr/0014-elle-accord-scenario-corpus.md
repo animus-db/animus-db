@@ -1,7 +1,8 @@
 # ADR 0014 — Elle consistency testing against Accord + a frozen scenario corpus
 
-- **Status:** Accepted
-- **Date:** 2026-08-02
+- **Status:** Accepted (the register-recovery limitation **closed** 2026-08-02:
+  reads are now genuinely observed from stored state, see the increment below)
+- **Date:** 2026-08-02 (genuine-black-box increment: 2026-08-02)
 
 ## Context
 
@@ -78,14 +79,53 @@ drive it from a frozen, generated scenario corpus.**
   119 genuinely contend (verified). Coverage and non-vacuity are themselves
   asserted (`corpus_covers_the_fault_matrix`, `corpus_has_real_contention`) so a
   dimension cannot silently stop being tested.
-- The list-append-over-register recovery is read from `applied_order`, an existing
-  public accessor — no change to `animus-consensus`. The cost is that the
-  "list" is a reconstruction, not bytes the system stores; this is sound because
-  it is precisely Accord's agreed order, and any inconsistency surfaces as a
-  divergent read or a cycle.
+- The list-append-over-register recovery was originally read from `applied_order`
+  — a reconstruction, not bytes the system stores. **This limitation is now
+  closed** (see the increment below): with arbitrary write values (ADR 0011) each
+  key stores a real list and reads observe it directly.
 - A scenario that ever catches a bug stays in the corpus forever as a regression.
   No real consistency violation surfaced at introduction.
 - Determinism (ADR 0003) is preserved: the workload's key choice and read/write
   mix are drawn from the seeded simulator RNG, faults fire on virtual-time
   deadlines, and the Accord driver's perpetual retry timer means the runner
   always uses `run_for`/`run_until`, never `run()`.
+
+## Genuine black-box list-append increment (2026-08-02)
+
+The original modelling **recovered** each read's observed list from a replica's
+`applied_order` rather than from actually-stored state, because Accord's effect
+was a register ("write my txn id"). That limited the checker's teeth to
+cross-replica order *divergence*: a single globally-agreed-but-non-serializable
+order could not show as a cycle, because the lists were derived from the very
+order under test. With **arbitrary caller-supplied write values** (ADR 0011) that
+limitation is closed.
+
+- **The workload is now genuine black-box list-append.** Each key stores a real
+  `Vec<u64>` (encoded as concatenated big-endian u64s). A **write** appends this
+  transaction's globally-unique value to the key's list and writes the **whole
+  new list back** as the real stored value (the value-carrying
+  `AccordNode::submit_writes`). A **read** observes the **actual stored list**,
+  decoded from the bytes the read transaction returns
+  (`AccordNode::read_value_result`). The recovered order now comes from observed
+  *values* (Elle's `recover`), **not** from `applied_order`. So `check_cycles` is
+  a real black-box serializability check: a non-serializable agreed order would
+  surface as a dependency cycle.
+- **Single-writer-per-key (the LWW guard).** Each key is written by exactly one
+  client (`owner(key) = key % clients`); a write only appends to keys it owns. Two
+  clients writing the same key would lose appends by the *data model* (per-key
+  LWW) — not a consistency bug, and it would drown the checker in false positives.
+  Cross-transaction conflict (the wr/rw/ww edges the cycle checker needs) still
+  comes from **multi-key transactions** and from reads observing keys *other*
+  clients write. A client builds each append on its own authoritative in-memory
+  list (it is the sole serial writer), because a begin-time quorum read can lag
+  the previous write's fire-and-forget data-plane propagation and read a stale
+  base — which would lose the client's own earlier appends.
+- **Final state is read straight from stored values** on two *distinct* replicas
+  (`store_value` → decode), keeping convergence a real cross-replica agreement
+  check and durability ("every ok append is in the final list") meaningful.
+- The negative control, teeth-guards (`ok_writes ≥ 8`, contention witness,
+  `nonempty_reads ≥ 1`), and all ~119 frozen corpus scenarios stay green; the
+  stronger check surfaced **no** real serializability violation. The change is
+  entirely in `animus-test/tests/support/mod.rs` plus the additive
+  `animus-consensus` value API; the corpus seeds/names are untouched, so every
+  frozen scenario reproduces exactly.
