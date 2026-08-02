@@ -57,13 +57,19 @@ execution** — each replica executes committed transactions in agreed order
 against a real `StorageEngine` (`MemoryEngine` under sim) via a WAL it recovers
 from on restart — and a **first slice of coordinator failover** (a replica can
 recover a stranded transaction whose coordinator died, adopting a committed
-decision or forcing the slow path); ADR 0011). Skeletons / future work:
+decision or forcing the slow path), **message retry/timeouts** (the driver
+re-sends un-acknowledged round messages on a timer so a dropped fire-and-forget
+`send` no longer strands a transaction), and a **data-plane frontier** — a
+committed transaction's writes can land in the replicated AP data plane
+(`custos-data` quorum), readable via ordinary quorum reads, atomically in agreed
+order; ADR 0011). Skeletons / future work:
 the fuller CQL surface (a real type system, CQL grammar, keyspaces,
 prepared statements) and the rest of the DynamoDB surface (projection
 expressions, `ReturnValues`, document/set types, composite/multiple GSIs + local
 secondary indexes, durable/replicated table schemas), and the deferred remainder of Accord
 (the full dependency wait-graph, the precise recovery ballot + duelling
-recoverers + a failure detector, WAL snapshotting, live data-plane integration).
+recoverers + a failure detector, WAL snapshotting, data-plane *reads*, and
+sharded transactions across tablets).
 
 ## Per-crate guides
 
@@ -276,12 +282,21 @@ slow path). It also serves **read-only transactions** (`submit_read`): a read is
 ordered exactly like a write (timestamp + conflict deps) and, at its execution
 timestamp, snapshot-reads each key (`get_at`) — observing the writes ordered
 before it and none after, consistently on every replica — but writes nothing.
+Dropped messages are **retried**: the driver re-sends the un-acknowledged
+messages of any in-flight round on an `Env` timer (the sync core decides *what*
+via `resend_pending`; replicas `CommitAck` so a committed coordinator stops
+re-sending), so a lossy network no longer strands a transaction. A committed
+write transaction can also be wired to the **replicated data plane**
+(`AccordNode::start_with_data_plane`): on Apply its keys are written through the
+`custos-data` quorum coordinator at the execution timestamp, so the transaction's
+atomic, ordered effect becomes readable via ordinary data-plane quorum reads (no
+dependency cycle — `custos-data` does not depend on consensus).
 The driver's real-thread liveness (no mutex guard held across `.await`) is
 guarded by a multi-threaded `ProdEnv` regression test, since `SimEnv` proves
 order but not thread liveness. **Deferred:** the full dependency wait-graph, the
 precise recovery ballot + duelling recoverers + a failure detector, WAL
-snapshotting, live data-plane integration, message retry/timeouts, and
-sharding — see ADR 0011 and the crate guide.
+snapshotting, data-plane *reads*, and **sharded** (multi-tablet)
+transactions — see ADR 0011 and the crate guide.
 
 ### Storage (`custos-storage`)
 

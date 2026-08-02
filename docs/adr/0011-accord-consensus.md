@@ -2,10 +2,11 @@
 
 - **Status:** Accepted (first minimal slice; extended with execution + durability;
   then storage-backed execution + coordinator failover; then read transactions +
-  multi-thread liveness regression)
+  multi-thread liveness regression; then message retry + the data-plane frontier)
 - **Date:** 2026-08-01 (execution + durability increment: 2026-08-01;
   storage-backed execution + coordinator-failover increment: 2026-08-01;
-  read-transactions + multi-thread-liveness increment: 2026-08-02)
+  read-transactions + multi-thread-liveness increment: 2026-08-02;
+  message-retry + data-plane-frontier increment: 2026-08-02)
 
 ## Context
 
@@ -260,3 +261,69 @@ sync-core / `Env`-driver split.
   the conflict-set the read declares); a richer interactive read/write
   transaction API, and message retry/timeouts (a stalled transaction is not yet
   retried).
+
+## Message retry + data-plane frontier increment (2026-08-02)
+
+This increment closes the two remaining transport/integration gaps the earlier
+slices named as deferred — **message retry/timeouts** and **live data-plane
+integration** — again without reshaping the sync-core / `Env`-driver split.
+
+- **Message retry / timeouts.** `Network::send` is fire-and-forget and may drop,
+  which previously could strand a transaction (a coordinator blocked on a quorum
+  reply that never arrives, or a replica that never learns the `Commit`). The
+  driver now runs a periodic retry tick on an `Env` timer; the synchronous core
+  exposes `AccordCore::resend_pending()`, which **recomputes** the outbound
+  messages still owed for every in-flight round and to whom — a coordinating txn
+  in PreAccept re-sends `PreAccept` to peers absent from its reply set; in Accept,
+  `Accept`; once `Done` (committed), `Commit` to peers that have not yet
+  acknowledged it; and a recovering txn re-sends `Recover`. Retries are
+  idempotent at the replica (every handler folds by `max`/union and de-dups), and
+  a completed round emits nothing so retries stop on their own. To know when a
+  `Commit` has landed (it was otherwise fire-and-forget), a replica now replies
+  `CommitAck` and the coordinator tracks acked peers. The core stays I/O-free —
+  it only decides *what* to re-send; the driver (no lock held across the
+  `.await`) does the I/O. Determinism is preserved: the retry timer is an `Env`
+  timer and the run remains byte-reproducible from its seed. Tests in
+  `custos-consensus/tests/accord_retry.rs` inject a **lossy** network (an
+  independent per-message drop probability) and assert a transaction — and two
+  conflicting transactions, across a seed sweep — still commit and execute in a
+  consistent order on every replica.
+
+- **The data-plane frontier — Accord over the replicated data plane.** A
+  committed transaction's *write effect* can now land in the leaderless AP **data
+  plane** (`custos-data`), not only a per-node consensus store. An `AccordNode`
+  started via `AccordNode::start_with_data_plane(env, all_nodes, storage,
+  coordinator_env, view)` carries a `DataSink { DataClient, TabletView }`: on
+  Apply, for each key a committed *write* transaction touches, the node writes the
+  transaction's id through the data-plane **quorum** coordinator
+  (`DataClient::write`) to the tablet's replica set, stamped with the
+  transaction's execution timestamp as the MVCC version. Because every replica
+  executes the same committed effect at the same version and the data plane
+  reconciles by per-key last-writer-wins, the data plane converges to a single
+  writer per key in the agreed order. Those writes are then **readable via
+  ordinary data-plane quorum reads** — the transaction's atomic, ordered effect
+  made durable across the replicated AP store. The local `StorageEngine` is kept
+  as the per-node recovery substrate (and recovery re-applies into it only, since
+  the data plane already holds the committed writes durably); the sink is purely
+  additive. **No dependency cycle:** `custos-consensus` depends on `custos-data`,
+  which does not depend on consensus. The node inbox is single-consumer, so the
+  data-plane coordinator runs on a **distinct node id** from the Accord replica.
+  Tests in `custos-consensus/tests/accord_data_plane.rs` assemble Accord
+  coordinators + data-plane replicas under `SimEnv` and prove: a **multi-key**
+  transaction's writes are all readable via quorum reads at its id; an untouched
+  key is absent; and two conflicting multi-key transactions land **atomically and
+  in a consistent order** (the shared key carries the second-ordered txn; each
+  txn's private keys all carry that same txn — no torn write set).
+
+- **Still deferred after this increment:** wiring data-plane *reads* into Accord
+  (a read transaction still executes against the local engine's `get_at`
+  snapshot — the data plane has no historical/`get_at`-by-version read on the
+  wire yet); **sharded** transactions whose key set spans more than one tablet
+  (the frontier routes through a single `TabletView`); an interactive
+  begin/read/write/commit transaction API; the full transitive dependency
+  wait-graph; the precise Accord recovery ballot + duelling recoverers + a
+  failure detector to *trigger* both recovery and retry escalation; WAL
+  snapshotting / log truncation; and the precise fast-path quorum bound. The
+  retry tick is a fixed-interval re-send, not an adaptive timeout or a backoff,
+  and it does not itself *detect* a dead coordinator (that remains the explicit
+  `recover` path). The Elle cycle checker is still unwired.

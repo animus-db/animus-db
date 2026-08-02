@@ -10,9 +10,12 @@ on an *execution* timestamp and a *dependency* set via PreAccept → (fast path)
 Commit, or PreAccept → Accept → Commit (slow path), then each replica
 **executes** the transaction in agreed order against a real `StorageEngine`,
 **durably** (WAL + recovery). A dead coordinator's transaction is recoverable by
-another replica (**coordinator failover**, first slice). No leader. This is the
-layer that will eventually give the AP data plane multi-key atomicity and a
-strict serialization order.
+another replica (**coordinator failover**, first slice). Dropped messages are
+**retried** on a driver timer so a lossy network does not strand a transaction.
+A committed transaction's write effect can land in the **replicated data plane**
+(`custos-data` quorum) — the "frontier" path — so this is the layer that gives
+the AP data plane multi-key atomicity and a strict serialization order. No
+leader.
 
 ## Entry points
 
@@ -32,9 +35,15 @@ strict serialization order.
   *order*, the driver does the *I/O*. `drain_persist`/`drain_apply`/`drain_reads`
   hand these to the driver; `recovered` rebuilds the core from a `PersistedState`
   and re-emits the apply/read effects for its recovered execution order.
-- `message.rs` — `AccordMsg` (PreAccept/PreAcceptOk/Accept/AcceptOk/Commit, plus
-  `Recover`/`RecoverOk` for failover), (de)serialized with `serde_json` over the
-  `Network`'s `Vec<u8>` payloads. Execution/Apply is *local* — no wire message.
+  `resend_pending()` recomputes the outbound messages still owed for every
+  in-flight round (PreAccept/Accept/Commit/Recover) and to whom — the driver's
+  retry tick calls it (message retry).
+- `message.rs` — `AccordMsg` (PreAccept/PreAcceptOk/Accept/AcceptOk/Commit/
+  `CommitAck`, plus `Recover`/`RecoverOk` for failover), (de)serialized with
+  `serde_json` over the `Network`'s `Vec<u8>` payloads. `CommitAck` lets the
+  coordinator's retry tick know a replica has the `Commit` (otherwise
+  fire-and-forget) so it stops re-sending. Execution/Apply is *local* — no wire
+  message.
 - `persist.rs` — `WalRecord` (PreAccepted/Accepted/Committed/Applied) and
   `PersistedState` (replay/decode/encode), mirroring `custos-control::persist`.
 - `node.rs` — `AccordNode<E, S = MemoryEngine>`: the thin `Env` driver, generic
@@ -44,11 +53,18 @@ strict serialization order.
   `fsync`s the records to `accord.wal`, **then** `merge`s the write effects into
   the engine (`apply_all`) and `get_at`s the read effects (`satisfy_reads`),
   then ships outbound (durable before action). `drive` recovers from the WAL on
-  startup and replays the recovered execution order into the (fresh) engine. A
-  plain `recv` loop — still no perpetual timers. `submit_read(keys)` runs a
-  read-only transaction; `read_result(txn)` returns the per-key writer it
-  observed (populated once `is_applied(txn)`). `store_writer(key)` is `async`
-  (it reads the engine).
+  startup and replays the recovered execution order into the (fresh) engine.
+  Alongside the `recv` loop the driver now runs a **`retry_loop`** on an `Env`
+  timer (`RETRY_INTERVAL`) — a **perpetual timer**, so drive tests with
+  `run_for`/`run_until`, never `run()`. `submit_read(keys)` runs a read-only
+  transaction; `read_result(txn)` returns the per-key writer it observed
+  (populated once `is_applied(txn)`). `store_writer(key)` is `async` (it reads
+  the engine). **Frontier:** `start_with_data_plane(env, all_nodes, storage,
+  coordinator_env, view)` attaches a `DataSink { DataClient, TabletView }`; on
+  Apply a committed *write* effect is also pushed through the data-plane quorum
+  (`DataClient::write`) so it is readable via data-plane quorum reads. The
+  data-plane coordinator uses a **distinct node id** (`coordinator_env`) — the
+  inbox is single-consumer.
 
 ## What's non-obvious
 
@@ -108,10 +124,32 @@ strict serialization order.
   `AccordNode` is audited clean for the deadlock class — the core lock is taken
   only to drain, then dropped; all I/O happens lock-free in a spawned task, so
   **no `std::sync::Mutex` guard is ever held across an `.await`**. Keep it that
-  way: drain under the lock, drop it, then `await`. This slice has **no message
-  retry** (`Network::send` is fire-and-forget), so don't pile unbounded in-flight
-  work on the transport in a liveness test — that flakes on transport drops, not
-  on the bug class the test targets.
+  way: drain under the lock, drop it, then `await`. The driver's retry tick keeps
+  the same discipline: it locks only to call `resend_pending()`, drops the lock,
+  then ships via `persist_then_ship` (lock-free in a spawned task).
+- **Message retry lives in the driver; the core only decides what to re-send.**
+  `resend_pending()` (sync, I/O-free) recomputes the still-owed outbound for each
+  in-flight round to peers that have not answered: PreAccept → `replies` absent;
+  Accept → `replies` absent (using the `chosen` `(execute_at, deps)`); Done →
+  `Commit` to peers absent from `commit_acks`; recovering → `Recover` to
+  `replies` absent. `Coordinating` now carries `keys` / `chosen` / `commit_acks`
+  to rebuild those messages. Replicas reply `CommitAck` so a committed coordinator
+  knows when to stop re-sending `Commit`. Re-sends are idempotent at the replica
+  (handlers fold by `max`/union, de-dup), and a completed round emits nothing, so
+  retries stop on their own. The retry timer is a real `Env` timer — a perpetual
+  timer — so it is deterministic and the run stays seed-reproducible, but you must
+  bound test time with `run_for`.
+- **Frontier execution is additive, not a replacement.** With a `DataSink`, the
+  apply effect still `merge`s the writer id into the **local** engine (kept as the
+  recovery substrate, and what `store_writer` reads) **and** writes it through the
+  data-plane quorum (`DataClient::write`) at `version = execute_at.logical`.
+  Recovery re-applies into the local engine **only** (`apply_all(.., None, ..)`) —
+  the data plane already holds the committed writes durably, so a restart must not
+  re-storm it. The data-plane write result is not asserted in the apply path (a
+  transient quorum miss converges via the data plane's own anti-entropy); the test
+  verifies through a quorum read. Read-only transactions are **not** routed to the
+  data plane yet (no `get_at`-by-version on the data-plane wire) — they still use
+  the local engine snapshot.
 - **Recovery sets phase to `Applied` when `PersistedTxn.applied`** even though
   the phase-bearing records stop at `Committed` — the separate `Applied` WAL
   record carries the executed bit. On recovery the core **re-emits the apply
@@ -143,15 +181,18 @@ The full transitive dependency wait-graph (the execution wait is conflict +
 timestamp based), the precise Accord recovery ballot rules + duelling recovery
 coordinators + a failure detector to trigger recovery (today `recover` is called
 explicitly), WAL snapshotting/log truncation (the WAL is the full per-txn
-history — contrast `RaftCore`), integration with the **live** data-plane
-replicas (`custos-data`) — execution (reads included) is a per-node consensus
-store, not yet the shared data plane — message **retry/timeouts** (a stalled
-transaction is not retried; `Network::send` is fire-and-forget), an interactive
-read/write transaction API, livelock handling, sharding/placement (one global
-replica set), and wiring the Elle cycle checker (`custos-test`) — now natural
-since a real execution history exists. **Read-only transactions** are now
-implemented (`submit_read`); see the read-transaction note above. The sync-core
-boundary is where each remaining piece slots in.
+history — contrast `RaftCore`), **data-plane reads** (a read txn still uses the
+local engine's `get_at` snapshot — the data-plane wire has no
+historical-by-version read), **sharded** transactions whose key set spans more
+than one tablet (the frontier routes one `TabletView`), an interactive
+read/write transaction API, livelock handling, an **adaptive** retry timeout /
+backoff (today the retry is a fixed-interval re-send and does not itself detect a
+dead coordinator — that is still the explicit `recover` path), and wiring the
+Elle cycle checker (`custos-test`). **Now implemented:** read-only transactions
+(`submit_read`), **message retry** (the driver's retry tick + `resend_pending`),
+and the **data-plane frontier** (`start_with_data_plane` — committed writes land
+in the `custos-data` quorum, readable via quorum reads). The sync-core boundary
+is where each remaining piece slots in.
 
 ## Tests
 
@@ -182,6 +223,19 @@ boundary is where each remaining piece slots in.
   nothing; the read snapshot is identical on every replica across a 48-seed
   sweep; a read's observation recovers from disk through a stop/restart; and the
   read path is trace-reproducible.
+- `tests/accord_retry.rs` (**message retry**): under a **lossy** network (an
+  independent per-message drop probability via `NetConfig::set_drop_prob`) a
+  single transaction, two conflicting transactions, and a seed sweep all still
+  commit and execute in a consistent order — the retry tick re-drives dropped
+  messages. Plus retry-path trace reproducibility.
+- `tests/accord_data_plane.rs` (**the frontier**): assembles Accord coordinators
+  (ids 0–2) + per-node data-plane coordinators (10–12) + `serve_replica`
+  data-plane replicas (3–5) + a verifier `DataClient` (20). A **multi-key**
+  transaction's writes are readable via data-plane quorum reads at its id (and an
+  untouched key is absent); two conflicting multi-key transactions land
+  **atomically and in a consistent order** (shared key → second-ordered txn; each
+  private key → its own txn). Plus the stored-value encoding guard and frontier
+  trace reproducibility.
 - `tests/accord_concurrent.rs` (**real multi-threaded**, *not* `SimEnv`):
   `#[tokio::test(flavor = "multi_thread", worker_threads = 4)]` over `ProdEnv`,
   timeout-guarded — several replicas + concurrent coordinators committing
@@ -190,6 +244,6 @@ boundary is where each remaining piece slots in.
   is the liveness regression `SimEnv` cannot give; mirrors
   `custos-storage/tests/lsm_concurrent.rs`.
 
-Use `run_for` for the `SimEnv` tests (the driver has no perpetual timers today,
-but follow the house convention); the multi-thread test polls real time with a
-timeout.
+Use `run_for`/`run_until` for the `SimEnv` tests — the driver now has a
+**perpetual retry timer**, so `run()` would never return; the multi-thread test
+polls real time with a timeout.

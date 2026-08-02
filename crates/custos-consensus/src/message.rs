@@ -56,6 +56,11 @@ pub enum AccordMsg {
         deps: BTreeSet<TxnId>,
         read_only: bool,
     },
+    /// Replica → coordinator: acknowledges the `Commit` was recorded. `Commit`
+    /// is otherwise fire-and-forget; this ack lets the coordinator's retry tick
+    /// stop re-sending `Commit` to a replica once it has it (ADR 0011, message
+    /// retry). Idempotent — a duplicate `Commit` produces a duplicate ack.
+    CommitAck { txn: TxnId },
     /// Recovery coordinator → replicas: "tell me everything you recorded about
     /// `txn`". Sent by a *new* coordinator taking over a transaction whose
     /// original coordinator is suspected dead.
