@@ -228,6 +228,22 @@ cross-cutting ones. Prune/merge entries that become obsolete.
 - **Never hold a `std::sync::Mutex` guard across an `.await`** in `<E: Env>`
   code — it breaks `Send` (often a *compile* error via `spawn_task`'s bound) and
   risks nondeterminism. Take the lock, mutate, drop it; do I/O lock-free.
+- **`serde_json` cannot serialize a map keyed by a struct** — it fails at
+  *runtime*, not compile time (`expect("...serializes")` panics). A
+  `BTreeMap<Timestamp, _>` (or any non-string/non-integer key) in a `Serialize`
+  type must ride as a `Vec<(K, V)>` instead. Bit when adding a WAL `Snapshot`
+  record carrying `BTreeMap<TxnId, _>` (animus-consensus); integer-keyed maps
+  (`BTreeMap<u64, _>`) are fine (stringified), struct-keyed are not.
+- **Tightening a quorum/threshold can *expose* a latent ordering bug elsewhere —
+  re-derive the safe bound from first principles and check the whole pipeline.**
+  Making Accord's fast quorum precise (`N-1`, down from `ceil(3N/4)`) let two
+  *conflicting* txns legitimately commit at the same `logical` timestamp (ordered
+  by the node tiebreak); the downstream MVCC `version` was `logical` alone, so
+  per-key LWW kept the wrong (first-applied) winner. Encode the *full* order
+  (`(logical<<16)|node`) wherever a total order is collapsed to one `u64`. Also:
+  pair a quorum bound with its *recovery* procedure — the smaller "optimized"
+  Accord/EPaxos fast quorum needs the full witness-recovery; the simplified
+  slow-path recovery requires the larger `N-1` bound.
 - **Replicate the *definition*, keep the *bulk data* at the edge — and split them
   cleanly.** When promoting per-process state to the control plane (ADR 0013), move
   only the small, must-agree *shape* (e.g. a secondary-index definition: name/keys/
