@@ -45,9 +45,13 @@ as one process (`custosd --cluster N`) or one process per node (`custosd --confi
 FILE --node I`, config via `gen-config`; `--ephemeral` selects the volatile
 in-memory engine for dev runs),
 which now also **serves the DynamoDB JSON protocol over HTTP**, routing those
-requests through the same data-plane coordinator — plus a **minimal CQL v4 wire
-protocol** (`custos-cql`: STARTUP/READY handshake + simple INSERT/SELECT-by-key,
-routed through that same coordinator) — the **topology-aware placement
+requests through the same data-plane coordinator — plus a **CQL v4 wire
+protocol** (`custos-cql`: STARTUP/READY handshake; a scalar **type system**
+(text/int/bigint/boolean/blob/uuid) with typed column metadata + bound values;
+`CREATE KEYSPACE`/`USE`/`CREATE TABLE` recording a schema in an in-memory
+catalog; `INSERT`/`SELECT` resolved against that schema; and **prepared
+statements** (PREPARE→Prepared, EXECUTE with bound values) — all routed through
+that same coordinator) — the **topology-aware placement
 engine** (`custos-placement`: residency + failure-domain spread, with the leader
 automatically reconciling tablet placement via control-plane `CasTabletReplicas`),
 and a **slice of Accord-style leaderless transaction consensus**
@@ -63,10 +67,12 @@ re-sends un-acknowledged round messages on a timer so a dropped fire-and-forget
 committed transaction's writes can land in the replicated AP data plane
 (`custos-data` quorum), readable via ordinary quorum reads, atomically in agreed
 order; ADR 0011). Skeletons / future work:
-the fuller CQL surface (a real type system, CQL grammar, keyspaces,
-prepared statements) and the rest of the DynamoDB surface (projection
-expressions, `ReturnValues`, document/set types, composite/multiple GSIs + local
-secondary indexes, durable/replicated table schemas), and the deferred remainder of Accord
+the rest of the CQL surface (clustering/composite keys,
+`UPDATE`/`DELETE`/`BATCH`/`ALTER`/`DROP`, collection/UDT types, paging, auth,
+`LWT`, consistency levels, durable replicated schemas) and the rest of the
+DynamoDB surface (projection expressions, `ReturnValues`, document/set types,
+composite/multiple GSIs + local secondary indexes, durable/replicated table
+schemas), and the deferred remainder of Accord
 (the full dependency wait-graph, the precise recovery ballot + duelling
 recoverers + a failure detector, WAL snapshotting, data-plane *reads*, and
 sharded transactions across tablets).

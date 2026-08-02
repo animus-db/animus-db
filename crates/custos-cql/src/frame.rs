@@ -62,7 +62,11 @@ pub enum Opcode {
     Supported = 0x06,
     /// `QUERY` (client → server): a CQL query string + parameters.
     Query = 0x07,
-    /// `RESULT` (server → client): the answer to a `QUERY`.
+    /// `PREPARE` (client → server): prepare a statement for later `EXECUTE`.
+    Prepare = 0x09,
+    /// `EXECUTE` (client → server): run a prepared statement with bound values.
+    Execute = 0x0A,
+    /// `RESULT` (server → client): the answer to a `QUERY`/`PREPARE`/`EXECUTE`.
     Result = 0x08,
 }
 
@@ -77,6 +81,8 @@ impl Opcode {
             0x05 => Opcode::Options,
             0x06 => Opcode::Supported,
             0x07 => Opcode::Query,
+            0x09 => Opcode::Prepare,
+            0x0A => Opcode::Execute,
             0x08 => Opcode::Result,
             _ => return None,
         })
@@ -255,6 +261,65 @@ pub fn read_long_string(buf: &[u8], pos: &mut usize) -> Result<String, FrameErro
         .to_owned();
     *pos = end;
     Ok(s)
+}
+
+/// Read a CQL `[bytes]`: an `i32` length followed by that many raw bytes. A
+/// negative length is the protocol's "null"; we return `None` for it. Advances
+/// `pos`.
+///
+/// # Errors
+/// [`FrameError::Truncated`] if a non-negative length runs past the buffer.
+pub fn read_bytes(buf: &[u8], pos: &mut usize) -> Result<Option<Vec<u8>>, FrameError> {
+    let len = read_i32(buf, pos)?;
+    if len < 0 {
+        return Ok(None);
+    }
+    let len = len as usize;
+    let end = pos.checked_add(len).ok_or(FrameError::Truncated)?;
+    if end > buf.len() {
+        return Err(FrameError::Truncated);
+    }
+    let out = buf[*pos..end].to_vec();
+    *pos = end;
+    Ok(Some(out))
+}
+
+/// Read a CQL `[short bytes]`: a `u16` length followed by that many raw bytes
+/// (used for the prepared-statement id). Advances `pos`.
+///
+/// # Errors
+/// [`FrameError::Truncated`] if the length runs past the buffer.
+pub fn read_short_bytes(buf: &[u8], pos: &mut usize) -> Result<Vec<u8>, FrameError> {
+    let len = read_u16(buf, pos)? as usize;
+    let end = pos.checked_add(len).ok_or(FrameError::Truncated)?;
+    if end > buf.len() {
+        return Err(FrameError::Truncated);
+    }
+    let out = buf[*pos..end].to_vec();
+    *pos = end;
+    Ok(out)
+}
+
+/// Write a CQL `[short bytes]` (`u16` length prefix) to `out`.
+pub fn write_short_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
+    out.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+    out.extend_from_slice(bytes);
+}
+
+/// Read a CQL `[short]` (`u16`). Advances `pos`.
+///
+/// # Errors
+/// [`FrameError::Truncated`] if fewer than 2 bytes remain.
+pub fn read_short(buf: &[u8], pos: &mut usize) -> Result<u16, FrameError> {
+    read_u16(buf, pos)
+}
+
+/// Read a CQL `[int]` (`i32`). Advances `pos`.
+///
+/// # Errors
+/// [`FrameError::Truncated`] if fewer than 4 bytes remain.
+pub fn read_int(buf: &[u8], pos: &mut usize) -> Result<i32, FrameError> {
+    read_i32(buf, pos)
 }
 
 /// Write a CQL `[string]` (u16 length prefix) to `out`.
