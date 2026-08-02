@@ -24,11 +24,13 @@ use serde::{Deserialize, Serialize};
 
 pub mod condition;
 pub mod registry;
+pub mod schema;
 pub mod wire;
 
 pub use condition::{ConditionExpression, SortKeyCondition};
 pub use registry::{
-    GlobalSecondaryIndex, LocalSecondaryIndex, RegistryError, SchemaRegistry, SecondaryIndex,
+    GlobalSecondaryIndex, IndexProjection, LocalSecondaryIndex, RegistryError, SchemaRegistry,
+    SecondaryIndex,
 };
 
 /// A DynamoDB-style attribute value (a useful subset). Beyond the scalar

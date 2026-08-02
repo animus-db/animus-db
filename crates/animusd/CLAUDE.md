@@ -101,8 +101,17 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   (real tokio sockets + hand-rolled HTTP/1.1, like `ProdEnv`); below the edge it
   reuses the existing `DataClient`/`Env` paths, so determinism is unaffected.
   The data plane has no native delete, so DynamoDB `DeleteItem` writes a
-  tombstone value that `GetItem` reads back as absent. No `CreateTable` yet — the
-  edge uses a fixed `pk`/`sk` key-attribute convention.
+  tombstone value that `GetItem` reads back as absent. **`CreateTable` now
+  proposes its key schema into the control plane's replicated catalog (ADR 0013)
+  and waits for commit**, so a created table is durable + cluster-agreed (it
+  survives a restart — `tests/dynamo_schema.rs`); the edge reaches the leader
+  through a process-global set of registered control handles
+  (`dynamo::register_control`, wired once per node in `start_with`). A
+  never-`CreateTable`d table falls back to the legacy `pk`/`sk` convention. The
+  edge's GSI declarations + written-key index (for `Query`/`Scan`) remain
+  in-memory. The surface now also covers `UpdateItem`/`BatchWriteItem`/
+  `TransactWriteItems` (the last condition-gated but not yet atomic), per-index
+  projections, and document-path projections.
 - And a **sixth listener, the CQL binary-protocol endpoint** (`RoleAddrs.cql`,
   `Node::cql_addr`). Same shape: a production-only I/O edge (real tokio sockets +
   hand-rolled CQL v4 framing in `cql.rs`; the pure protocol/type/catalog/planning

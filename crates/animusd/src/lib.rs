@@ -328,6 +328,9 @@ impl BoundNode {
                 self.client_listener,
                 ctx.clone(),
             )));
+            // Give the DynamoDB edge a control-plane handle so `CreateTable` can
+            // propose a replicated `CreateTableSchema` to the leader (ADR 0013).
+            dynamo::register_control(raft.clone());
             tasks.push(tokio::spawn(dynamo::serve(
                 self.dynamo_listener,
                 ctx.clone(),

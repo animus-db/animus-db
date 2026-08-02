@@ -35,32 +35,73 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::condition::{ConditionExpression, SortKeyCondition};
-use crate::registry::{GlobalSecondaryIndex, LocalSecondaryIndex, SecondaryIndex};
+use crate::registry::{GlobalSecondaryIndex, IndexProjection, LocalSecondaryIndex, SecondaryIndex};
 use crate::{AttributeValue, Item, TableSchema};
 
 /// The `X-Amz-Target` service+version prefix DynamoDB clients send.
 pub const TARGET_PREFIX: &str = "DynamoDB_20120810.";
 
-/// A projection: the set of top-level attribute names a read should return
-/// (from `ProjectionExpression` or the legacy `AttributesToGet`). `None` on an
-/// operation means "all attributes"; `Some(names)` keeps only those that are
-/// present (a requested-but-absent attribute is simply omitted, as in DynamoDB).
+/// A projection: the document paths a read should return (from a
+/// `ProjectionExpression` or the legacy `AttributesToGet`). `None` on an
+/// operation means "all attributes"; `Some(paths)` keeps only the requested
+/// paths (a requested-but-absent path is simply omitted, as in DynamoDB).
 ///
-/// This is a **top-level** projection only — document-path projections
-/// (`a.b[0].c`) are deferred; a name containing a `.` or `[` is rejected at
-/// decode time so the limitation is explicit rather than silently wrong.
+/// Each element is a **dotted document path** `a.b.c`: a top-level attribute name
+/// optionally followed by `.`-separated map keys, so a projection can reach into
+/// nested `M` (map) attributes. A path that traverses into a non-map value (or an
+/// absent key) yields nothing for that path. List-index paths (`a[0]`) remain
+/// deferred — a `[` is rejected at decode time so the limitation is explicit.
+///
+/// The string form is kept (`Projection(pub Vec<String>)`), so a plain top-level
+/// name is just a one-segment path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Projection(pub Vec<String>);
 
 impl Projection {
-    /// Apply the projection to `item`, keeping only the requested top-level
-    /// attributes (in the item's own order). Absent names are skipped.
+    /// Apply the projection to `item`, keeping only the requested document paths,
+    /// reconstructing the nested structure each path reaches (so projecting
+    /// `a.b` yields `{a:{b:..}}`). Absent paths are skipped. Multiple paths
+    /// sharing a prefix are merged.
     #[must_use]
     pub fn apply(&self, item: &Item) -> Item {
-        item.iter()
-            .filter(|(name, _)| self.0.iter().any(|want| want == *name))
-            .map(|(name, value)| (name.clone(), value.clone()))
-            .collect()
+        let mut out = Item::new();
+        for path in &self.0 {
+            let segments: Vec<&str> = path.split('.').collect();
+            project_path(item, &segments, &mut out);
+        }
+        out
+    }
+}
+
+/// Project one dotted path's `segments` from `src` into `dst`, reconstructing the
+/// nested map structure. The head names a top-level attribute; each further
+/// segment descends into an `M` value. A path that does not resolve to a present
+/// value (wrong type or absent key) contributes nothing.
+fn project_path(src: &Item, segments: &[&str], dst: &mut Item) {
+    let Some((head, rest)) = segments.split_first() else {
+        return;
+    };
+    let Some(value) = src.get(*head) else {
+        return;
+    };
+    if rest.is_empty() {
+        // Whole sub-tree at this leaf. Merge with anything already projected
+        // under `head` (e.g. a sibling deeper path) by preferring the broader
+        // (whole-value) projection.
+        dst.insert((*head).to_owned(), value.clone());
+        return;
+    }
+    // Descend into a nested map only.
+    let AttributeValue::M(inner) = value else {
+        return;
+    };
+    // Recurse into the nested map, accumulating into the nested entry under
+    // `head` (created/extended as a map).
+    let entry = dst
+        .entry((*head).to_owned())
+        .or_insert_with(|| AttributeValue::M(BTreeMap::new()));
+    if let AttributeValue::M(nested_dst) = entry {
+        project_path(inner, rest, nested_dst);
     }
 }
 
@@ -82,6 +123,99 @@ pub enum ReturnValues {
     None,
     /// `ALL_OLD` — return the item's previous state (the whole prior item).
     AllOld,
+}
+
+/// The `ReturnValues` selector on an `UpdateItem` — a superset of [`ReturnValues`]
+/// that also reports the *new* state (`UpdateItem` is the only op that builds a
+/// new item rather than replacing/removing it wholesale).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UpdateReturnValues {
+    /// `NONE` (default) — return `{}`.
+    #[default]
+    None,
+    /// `ALL_OLD` — the whole item before the update.
+    AllOld,
+    /// `ALL_NEW` — the whole item after the update.
+    AllNew,
+}
+
+/// One action of an `UpdateItem` `UpdateExpression` (the supported subset): set a
+/// top-level attribute to a value, or remove one. `ADD`/`DELETE` (set/number
+/// arithmetic) are deferred.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpdateAction {
+    /// `SET attr = :v` — set (or overwrite) a top-level attribute.
+    Set(String, AttributeValue),
+    /// `REMOVE attr` — drop a top-level attribute if present.
+    Remove(String),
+}
+
+/// One sub-request of a `BatchWriteItem` (within a single table's request list):
+/// a put or a delete.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteRequest {
+    /// `PutRequest`: write `item`.
+    Put(Item),
+    /// `DeleteRequest`: delete the item identified by `key`.
+    Delete(Item),
+}
+
+/// One action of a `TransactWriteItems` request. Each is condition-gated like a
+/// conditional write; see [`Operation::TransactWriteItems`] for the (documented)
+/// non-atomicity caveat.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransactAction {
+    /// `Put`: write `item` in `table`, gated on `condition`.
+    Put {
+        /// Target table.
+        table: String,
+        /// The item to write.
+        item: Item,
+        /// Optional gate.
+        condition: Option<ConditionExpression>,
+    },
+    /// `Delete`: delete `key` from `table`, gated on `condition`.
+    Delete {
+        /// Target table.
+        table: String,
+        /// The key to delete.
+        key: Item,
+        /// Optional gate.
+        condition: Option<ConditionExpression>,
+    },
+    /// `Update`: apply `actions` to `key` in `table`, gated on `condition`.
+    Update {
+        /// Target table.
+        table: String,
+        /// The key to update.
+        key: Item,
+        /// The update actions (`SET`/`REMOVE`).
+        actions: Vec<UpdateAction>,
+        /// Optional gate.
+        condition: Option<ConditionExpression>,
+    },
+    /// `ConditionCheck`: assert `condition` on `key` in `table` without writing.
+    ConditionCheck {
+        /// Target table.
+        table: String,
+        /// The key to check.
+        key: Item,
+        /// The asserted condition.
+        condition: ConditionExpression,
+    },
+}
+
+impl TransactAction {
+    /// The table this action targets.
+    #[must_use]
+    pub fn table(&self) -> &str {
+        match self {
+            TransactAction::Put { table, .. }
+            | TransactAction::Delete { table, .. }
+            | TransactAction::Update { table, .. }
+            | TransactAction::ConditionCheck { table, .. } => table,
+        }
+    }
 }
 
 /// A decoded DynamoDB wire operation (the supported subset).
@@ -157,19 +291,48 @@ pub enum Operation {
         /// Optional projection (the attributes to return; `None` = all).
         projection: Option<Projection>,
     },
+    /// `UpdateItem`: read-modify-write the item at `key`, applying `actions`
+    /// (`SET`/`REMOVE`), gated on an optional `condition`.
+    UpdateItem {
+        /// Target table name.
+        table: String,
+        /// The key attributes.
+        key: Item,
+        /// The update actions to apply.
+        actions: Vec<UpdateAction>,
+        /// Optional condition the update is gated on.
+        condition: Option<ConditionExpression>,
+        /// What to echo back (`NONE`/`ALL_OLD`/`ALL_NEW`).
+        return_values: UpdateReturnValues,
+    },
+    /// `BatchWriteItem`: a batch of put/delete requests grouped by table. Applied
+    /// request-by-request (no cross-request atomicity, as in DynamoDB).
+    BatchWriteItem {
+        /// Per-table request lists, keyed by table name.
+        requests: BTreeMap<String, Vec<WriteRequest>>,
+    },
+    /// `TransactWriteItems`: a list of condition-gated put/delete/update/check
+    /// actions. See the (documented) non-atomicity caveat at the edge.
+    TransactWriteItems {
+        /// The transaction's actions, in order.
+        actions: Vec<TransactAction>,
+    },
 }
 
 impl Operation {
-    /// The table this operation targets.
+    /// The single table this operation targets, if it has one. `BatchWriteItem`
+    /// and `TransactWriteItems` span multiple tables, so they return `None`.
     #[must_use]
-    pub fn table(&self) -> &str {
+    pub fn table(&self) -> Option<&str> {
         match self {
             Operation::CreateTable { table, .. }
             | Operation::PutItem { table, .. }
             | Operation::GetItem { table, .. }
             | Operation::DeleteItem { table, .. }
             | Operation::Query { table, .. }
-            | Operation::Scan { table, .. } => table,
+            | Operation::Scan { table, .. }
+            | Operation::UpdateItem { table, .. } => Some(table),
+            Operation::BatchWriteItem { .. } | Operation::TransactWriteItems { .. } => None,
         }
     }
 }
@@ -306,8 +469,234 @@ pub fn decode_request(target: &str, body: &[u8]) -> Result<Operation, WireError>
         }
         "Query" => decode_query(obj),
         "Scan" => decode_scan(obj),
+        "UpdateItem" => decode_update_item(obj),
+        "BatchWriteItem" => decode_batch_write(obj),
+        "TransactWriteItems" => decode_transact_write(obj),
         _ => Err(WireError::unknown_operation(target)),
     }
+}
+
+/// Decode an `UpdateItem` body: `Key`, an `UpdateExpression` (`SET`/`REMOVE`
+/// clauses), an optional `ConditionExpression`, and an optional `ReturnValues`.
+fn decode_update_item(obj: &Map<String, Value>) -> Result<Operation, WireError> {
+    let table = table_name(obj)?;
+    let key = decode_item_field(obj, "Key")?;
+    let expr = obj
+        .get("UpdateExpression")
+        .and_then(Value::as_str)
+        .ok_or_else(|| WireError::validation("missing string field `UpdateExpression`"))?;
+    let actions = decode_update_expression(obj, expr)?;
+    if actions.is_empty() {
+        return Err(WireError::validation(
+            "`UpdateExpression` has no SET/REMOVE actions",
+        ));
+    }
+    let condition = decode_condition(obj)?;
+    let return_values = decode_update_return_values(obj)?;
+    Ok(Operation::UpdateItem {
+        table,
+        key,
+        actions,
+        condition,
+        return_values,
+    })
+}
+
+/// Decode a DynamoDB `UpdateExpression` (the supported subset). Recognized
+/// clauses are `SET a = :v, b = :w` and `REMOVE c, d`, in either order; the
+/// attribute names may use `#alias` placeholders and the values `:placeholder`s.
+/// `ADD`/`DELETE` clauses are rejected (deferred).
+fn decode_update_expression(
+    obj: &Map<String, Value>,
+    expr: &str,
+) -> Result<Vec<UpdateAction>, WireError> {
+    // Split into clauses on the SET/REMOVE/ADD/DELETE keywords (case-insensitive).
+    // We do a simple scan: find each keyword and the text up to the next keyword.
+    let lower = expr.to_ascii_lowercase();
+    let keywords = ["set ", "remove ", "add ", "delete "];
+    // Collect (keyword, start-of-args) positions in order.
+    let mut spans: Vec<(usize, usize, &str)> = Vec::new();
+    for kw in keywords {
+        let mut from = 0;
+        while let Some(rel) = lower[from..].find(kw) {
+            let at = from + rel;
+            // Only at a clause boundary (start, or preceded by whitespace).
+            if at == 0 || lower.as_bytes()[at - 1].is_ascii_whitespace() {
+                spans.push((at, at + kw.len(), kw.trim()));
+            }
+            from = at + kw.len();
+        }
+    }
+    spans.sort_by_key(|(at, _, _)| *at);
+    if spans.is_empty() {
+        return Err(WireError::validation(format!(
+            "unsupported `UpdateExpression` `{expr}` (supported clauses: SET, REMOVE)"
+        )));
+    }
+    let mut actions = Vec::new();
+    for (i, (_, args_start, kw)) in spans.iter().enumerate() {
+        let args_end = spans.get(i + 1).map_or(expr.len(), |(at, _, _)| *at);
+        let args = expr[*args_start..args_end].trim().trim_end_matches(',');
+        match *kw {
+            "set" => {
+                for clause in args.split(',') {
+                    let (lhs, rhs) = clause.split_once('=').ok_or_else(|| {
+                        WireError::validation("SET clause must be `attr = :value`")
+                    })?;
+                    let attr = resolve_attr_name(obj, lhs.trim())?;
+                    let value = resolve_placeholder(obj, rhs.trim())?;
+                    actions.push(UpdateAction::Set(attr, value));
+                }
+            }
+            "remove" => {
+                for name in args.split(',') {
+                    let attr = resolve_attr_name(obj, name.trim())?;
+                    actions.push(UpdateAction::Remove(attr));
+                }
+            }
+            other => {
+                return Err(WireError::validation(format!(
+                    "`UpdateExpression` clause `{other}` is not supported (SET, REMOVE only)"
+                )));
+            }
+        }
+    }
+    Ok(actions)
+}
+
+/// Resolve a single top-level attribute name in an update clause, following a
+/// `#alias` through `ExpressionAttributeNames`. Document paths are rejected here
+/// (updates target a top-level attribute in this subset).
+fn resolve_attr_name(obj: &Map<String, Value>, raw: &str) -> Result<String, WireError> {
+    let name = if let Some(alias) = raw.strip_prefix('#') {
+        obj.get("ExpressionAttributeNames")
+            .and_then(Value::as_object)
+            .and_then(|m| m.get(&format!("#{alias}")))
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                WireError::validation(format!("name placeholder `#{alias}` is not defined"))
+            })?
+    } else {
+        raw
+    };
+    Ok(reject_path(name)?.to_owned())
+}
+
+/// Decode an `UpdateItem` `ReturnValues` (`NONE`/`ALL_OLD`/`ALL_NEW`). Absent ⇒
+/// `NONE`. `UPDATED_OLD`/`UPDATED_NEW` are deferred (rejected).
+fn decode_update_return_values(obj: &Map<String, Value>) -> Result<UpdateReturnValues, WireError> {
+    match obj.get("ReturnValues") {
+        None | Some(Value::Null) => Ok(UpdateReturnValues::None),
+        Some(v) => match v.as_str() {
+            Some("NONE") => Ok(UpdateReturnValues::None),
+            Some("ALL_OLD") => Ok(UpdateReturnValues::AllOld),
+            Some("ALL_NEW") => Ok(UpdateReturnValues::AllNew),
+            Some(other) => Err(WireError::validation(format!(
+                "unsupported `ReturnValues` `{other}` (supported: NONE, ALL_OLD, ALL_NEW)"
+            ))),
+            None => Err(WireError::validation("`ReturnValues` must be a string")),
+        },
+    }
+}
+
+/// Decode a `BatchWriteItem` body: `{"RequestItems": {table: [{PutRequest|
+/// DeleteRequest}, ..], ..}}`.
+fn decode_batch_write(obj: &Map<String, Value>) -> Result<Operation, WireError> {
+    let items = obj
+        .get("RequestItems")
+        .and_then(Value::as_object)
+        .ok_or_else(|| WireError::validation("missing object field `RequestItems`"))?;
+    let mut requests = BTreeMap::new();
+    for (table, list) in items {
+        let arr = list.as_array().ok_or_else(|| {
+            WireError::validation(format!("`RequestItems.{table}` must be an array"))
+        })?;
+        let mut reqs = Vec::with_capacity(arr.len());
+        for entry in arr {
+            let e = entry
+                .as_object()
+                .ok_or_else(|| WireError::validation("each batch request must be an object"))?;
+            if let Some(put) = e.get("PutRequest").and_then(Value::as_object) {
+                reqs.push(WriteRequest::Put(decode_sub_item(put, "Item")?));
+            } else if let Some(del) = e.get("DeleteRequest").and_then(Value::as_object) {
+                reqs.push(WriteRequest::Delete(decode_sub_item(del, "Key")?));
+            } else {
+                return Err(WireError::validation(
+                    "batch request must have a `PutRequest` or `DeleteRequest`",
+                ));
+            }
+        }
+        requests.insert(table.clone(), reqs);
+    }
+    Ok(Operation::BatchWriteItem { requests })
+}
+
+/// Decode a `TransactWriteItems` body: `{"TransactItems": [{Put|Delete|Update|
+/// ConditionCheck}, ..]}`.
+fn decode_transact_write(obj: &Map<String, Value>) -> Result<Operation, WireError> {
+    let items = obj
+        .get("TransactItems")
+        .and_then(Value::as_array)
+        .ok_or_else(|| WireError::validation("missing array field `TransactItems`"))?;
+    let mut actions = Vec::with_capacity(items.len());
+    for entry in items {
+        let e = entry
+            .as_object()
+            .ok_or_else(|| WireError::validation("each `TransactItems` entry must be an object"))?;
+        let (kind, inner) = e.iter().next().filter(|_| e.len() == 1).ok_or_else(|| {
+            WireError::validation("each transact item is one Put/Delete/Update/ConditionCheck")
+        })?;
+        let inner = inner
+            .as_object()
+            .ok_or_else(|| WireError::validation(format!("`{kind}` must be an object")))?;
+        let table = table_name(inner)?;
+        let action = match kind.as_str() {
+            "Put" => TransactAction::Put {
+                table,
+                item: decode_sub_item(inner, "Item")?,
+                condition: decode_condition(inner)?,
+            },
+            "Delete" => TransactAction::Delete {
+                table,
+                key: decode_sub_item(inner, "Key")?,
+                condition: decode_condition(inner)?,
+            },
+            "Update" => {
+                let key = decode_sub_item(inner, "Key")?;
+                let expr = inner
+                    .get("UpdateExpression")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        WireError::validation("transact Update needs `UpdateExpression`")
+                    })?;
+                TransactAction::Update {
+                    table,
+                    key,
+                    actions: decode_update_expression(inner, expr)?,
+                    condition: decode_condition(inner)?,
+                }
+            }
+            "ConditionCheck" => TransactAction::ConditionCheck {
+                table,
+                key: decode_sub_item(inner, "Key")?,
+                condition: decode_condition(inner)?.ok_or_else(|| {
+                    WireError::validation("ConditionCheck requires a `ConditionExpression`")
+                })?,
+            },
+            other => {
+                return Err(WireError::validation(format!(
+                    "unsupported transact action `{other}`"
+                )));
+            }
+        };
+        actions.push(action);
+    }
+    Ok(Operation::TransactWriteItems { actions })
+}
+
+/// Decode the attribute-map at `field` of a nested request object into an [`Item`].
+fn decode_sub_item(obj: &Map<String, Value>, field: &str) -> Result<Item, WireError> {
+    decode_item_field(obj, field)
 }
 
 /// Decode a `CreateTable` body's `KeySchema` + `AttributeDefinitions` into a
@@ -363,11 +752,12 @@ fn decode_indexes(obj: &Map<String, Value>) -> Result<Vec<SecondaryIndex>, WireE
             .as_array()
             .ok_or_else(|| WireError::validation("`GlobalSecondaryIndexes` must be an array"))?;
         for gsi in gsis {
-            let (name, schema) = decode_index_entry(gsi, "GSI")?;
+            let (name, schema, projection) = decode_index_entry(gsi, "GSI")?;
             out.push(SecondaryIndex::Global(GlobalSecondaryIndex {
                 name,
                 key_attribute: schema.partition_key,
                 sort_attribute: schema.sort_key,
+                projection,
             }));
         }
     }
@@ -377,7 +767,7 @@ fn decode_indexes(obj: &Map<String, Value>) -> Result<Vec<SecondaryIndex>, WireE
             .ok_or_else(|| WireError::validation("`LocalSecondaryIndexes` must be an array"))?;
         let base = decode_key_schema(obj)?;
         for lsi in lsis {
-            let (name, schema) = decode_index_entry(lsi, "LSI")?;
+            let (name, schema, projection) = decode_index_entry(lsi, "LSI")?;
             // An LSI's HASH must be the base table's partition key, and it must
             // declare a RANGE (its alternate sort key).
             if schema.partition_key != base.partition_key {
@@ -392,6 +782,7 @@ fn decode_indexes(obj: &Map<String, Value>) -> Result<Vec<SecondaryIndex>, WireE
             out.push(SecondaryIndex::Local(LocalSecondaryIndex {
                 name,
                 sort_attribute,
+                projection,
             }));
         }
     }
@@ -408,8 +799,11 @@ fn decode_indexes(obj: &Map<String, Value>) -> Result<Vec<SecondaryIndex>, WireE
     Ok(out)
 }
 
-/// Decode one index declaration object into its `(name, KeySchema)`.
-fn decode_index_entry(value: &Value, kind: &str) -> Result<(String, TableSchema), WireError> {
+/// Decode one index declaration object into its `(name, KeySchema, Projection)`.
+fn decode_index_entry(
+    value: &Value,
+    kind: &str,
+) -> Result<(String, TableSchema, IndexProjection), WireError> {
     let g = value
         .as_object()
         .ok_or_else(|| WireError::validation(format!("each {kind} must be an object")))?;
@@ -419,7 +813,49 @@ fn decode_index_entry(value: &Value, kind: &str) -> Result<(String, TableSchema)
         .ok_or_else(|| WireError::validation(format!("{kind} missing `IndexName`")))?
         .to_owned();
     let schema = decode_key_schema(g)?;
-    Ok((name, schema))
+    let projection = decode_index_projection(g)?;
+    Ok((name, schema, projection))
+}
+
+/// Decode an index's optional `Projection` object
+/// (`{"ProjectionType":"ALL"|"KEYS_ONLY"|"INCLUDE", "NonKeyAttributes":[..]}`).
+/// Absent ⇒ `ALL`. `INCLUDE` requires a non-empty `NonKeyAttributes` list; the
+/// other types must not carry one.
+fn decode_index_projection(g: &Map<String, Value>) -> Result<IndexProjection, WireError> {
+    let Some(proj) = g.get("Projection") else {
+        return Ok(IndexProjection::All);
+    };
+    let proj = proj
+        .as_object()
+        .ok_or_else(|| WireError::validation("`Projection` must be an object"))?;
+    let kind = proj
+        .get("ProjectionType")
+        .and_then(Value::as_str)
+        .unwrap_or("ALL");
+    let non_key = proj.get("NonKeyAttributes");
+    match kind {
+        "ALL" => Ok(IndexProjection::All),
+        "KEYS_ONLY" => Ok(IndexProjection::KeysOnly),
+        "INCLUDE" => {
+            let arr = non_key.and_then(Value::as_array).ok_or_else(|| {
+                WireError::validation("INCLUDE projection needs `NonKeyAttributes`")
+            })?;
+            let mut names = Vec::with_capacity(arr.len());
+            for v in arr {
+                let name = v.as_str().ok_or_else(|| {
+                    WireError::validation("`NonKeyAttributes` elements must be strings")
+                })?;
+                names.push(reject_path(name)?.to_owned());
+            }
+            if names.is_empty() {
+                return Err(WireError::validation("INCLUDE `NonKeyAttributes` is empty"));
+            }
+            Ok(IndexProjection::Include(names))
+        }
+        other => Err(WireError::validation(format!(
+            "unsupported ProjectionType `{other}` (ALL, KEYS_ONLY, INCLUDE)"
+        ))),
+    }
 }
 
 /// Decode the optional `ConditionExpression` + `ExpressionAttributeValues` of a
@@ -472,37 +908,62 @@ fn decode_projection(obj: &Map<String, Value>) -> Result<Option<Projection>, Wir
     Ok(None)
 }
 
-/// Resolve one `ProjectionExpression` element to a top-level attribute name,
-/// following a `#alias` through `ExpressionAttributeNames`. Document-path
-/// syntax (`.`/`[`) is rejected (top-level projection only).
+/// Resolve one `ProjectionExpression` element into a **dotted document path**,
+/// resolving a `#alias` on each `.`-separated segment through
+/// `ExpressionAttributeNames`. The result is the path with aliases substituted
+/// (e.g. `#p.#c` → `profile.city`). List-index syntax (`[`) is still rejected.
 fn resolve_projection_name(obj: &Map<String, Value>, raw: &str) -> Result<String, WireError> {
-    let name = if let Some(alias) = raw.strip_prefix('#') {
-        let names = obj
-            .get("ExpressionAttributeNames")
-            .and_then(Value::as_object)
-            .ok_or_else(|| {
-                WireError::validation(format!(
-                    "projection uses name placeholder `#{alias}` but `ExpressionAttributeNames` is absent"
-                ))
-            })?;
-        names
-            .get(&format!("#{alias}"))
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                WireError::validation(format!("name placeholder `#{alias}` is not defined"))
-            })?
-    } else {
-        raw
-    };
-    Ok(reject_path(name)?.to_owned())
+    let mut segments = Vec::new();
+    for seg in raw.split('.') {
+        let seg = seg.trim();
+        if seg.is_empty() {
+            return Err(WireError::validation(format!(
+                "projection path `{raw}` has an empty segment"
+            )));
+        }
+        let resolved = if let Some(alias) = seg.strip_prefix('#') {
+            let names = obj
+                .get("ExpressionAttributeNames")
+                .and_then(Value::as_object)
+                .ok_or_else(|| {
+                    WireError::validation(format!(
+                        "projection uses name placeholder `#{alias}` but `ExpressionAttributeNames` is absent"
+                    ))
+                })?;
+            names
+                .get(&format!("#{alias}"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    WireError::validation(format!("name placeholder `#{alias}` is not defined"))
+                })?
+                .to_owned()
+        } else {
+            seg.to_owned()
+        };
+        reject_list_index(&resolved)?;
+        segments.push(resolved);
+    }
+    Ok(segments.join("."))
 }
 
-/// Reject a document-path attribute name (containing `.` or `[`): only
-/// top-level projection is supported in this slice.
+/// Reject a list-index attribute path (containing `[`): nested-map document
+/// paths (`a.b`) are supported, but list indexing (`a[0]`) is deferred.
+fn reject_list_index(name: &str) -> Result<(), WireError> {
+    if name.contains('[') {
+        return Err(WireError::validation(format!(
+            "list-index projection `{name}` is not supported (map paths `a.b` only)"
+        )));
+    }
+    Ok(())
+}
+
+/// Reject a non-top-level attribute name (containing `.` or `[`), used where only
+/// a flat attribute name is meaningful (`AttributesToGet`, index
+/// `NonKeyAttributes`).
 fn reject_path(name: &str) -> Result<&str, WireError> {
     if name.contains('.') || name.contains('[') {
         return Err(WireError::validation(format!(
-            "document-path projection `{name}` is not supported (top-level names only)"
+            "attribute path `{name}` is not supported here (top-level names only)"
         )));
     }
     Ok(name)
@@ -923,6 +1384,58 @@ pub fn write_response(return_values: ReturnValues, old: Option<&Item>) -> String
     }
 }
 
+/// The JSON body for a successful `UpdateItem` echoing `ReturnValues`: `ALL_OLD`
+/// returns the item before the update under `Attributes`, `ALL_NEW` the item
+/// after, `NONE` returns `{}`. An absent `old`/`new` (e.g. `ALL_OLD` on a key the
+/// update created) yields `{}`.
+#[must_use]
+pub fn update_response(
+    return_values: UpdateReturnValues,
+    old: Option<&Item>,
+    new: Option<&Item>,
+) -> String {
+    let attrs = match return_values {
+        UpdateReturnValues::None => None,
+        UpdateReturnValues::AllOld => old,
+        UpdateReturnValues::AllNew => new,
+    };
+    match attrs {
+        Some(item) => {
+            let mut obj = Map::new();
+            obj.insert("Attributes".into(), encode_item(item));
+            serde_json::to_string(&Value::Object(obj)).expect("update response serializes")
+        }
+        None => empty_response(),
+    }
+}
+
+/// The JSON body for a successful `BatchWriteItem`: `{"UnprocessedItems": {}}`
+/// (we process every request, so nothing is ever left unprocessed).
+#[must_use]
+pub fn batch_write_response() -> String {
+    let mut obj = Map::new();
+    obj.insert("UnprocessedItems".into(), Value::Object(Map::new()));
+    serde_json::to_string(&Value::Object(obj)).expect("batch response serializes")
+}
+
+/// Apply a sequence of [`UpdateAction`]s to a starting item (`None` ⇒ a fresh
+/// item is built from the key by the caller before this), returning the new item.
+/// `SET` sets/overwrites a top-level attribute; `REMOVE` drops one. Pure.
+#[must_use]
+pub fn apply_update(mut item: Item, actions: &[UpdateAction]) -> Item {
+    for action in actions {
+        match action {
+            UpdateAction::Set(attr, value) => {
+                item.insert(attr.clone(), value.clone());
+            }
+            UpdateAction::Remove(attr) => {
+                item.remove(attr);
+            }
+        }
+    }
+    item
+}
+
 /// The JSON body for a successful `Query`: `{"Items": [..], "Count": n,
 /// "ScannedCount": n}`. Items are emitted in sort order, as the caller supplies
 /// them.
@@ -1168,7 +1681,8 @@ mod tests {
 
     #[test]
     fn unknown_target_is_rejected() {
-        let err = decode_request("DynamoDB_20120810.BatchWriteItem", b"{}").unwrap_err();
+        // `BatchGetItem` is still unsupported (BatchWriteItem now is supported).
+        let err = decode_request("DynamoDB_20120810.BatchGetItem", b"{}").unwrap_err();
         assert_eq!(err.code, "UnknownOperationException");
     }
 
@@ -1288,11 +1802,45 @@ mod tests {
     }
 
     #[test]
-    fn rejects_document_path_projection() {
+    fn decodes_document_path_projection() {
+        // Document-path projections (`a.b`) are now supported.
         let body = br#"{"TableName":"t","Key":{"id":{"S":"k"}},
-            "ProjectionExpression":"a.b"}"#;
+            "ProjectionExpression":"a.b, c"}"#;
+        let Operation::GetItem { projection, .. } =
+            decode_request("DynamoDB_20120810.GetItem", body).unwrap()
+        else {
+            panic!("expected GetItem");
+        };
+        assert_eq!(projection, Some(Projection(vec!["a.b".into(), "c".into()])));
+    }
+
+    #[test]
+    fn rejects_list_index_projection() {
+        // List-index paths (`a[0]`) remain deferred.
+        let body = br#"{"TableName":"t","Key":{"id":{"S":"k"}},
+            "ProjectionExpression":"a[0]"}"#;
         let err = decode_request("DynamoDB_20120810.GetItem", body).unwrap_err();
         assert_eq!(err.code, "ValidationException");
+    }
+
+    #[test]
+    fn document_path_projection_reconstructs_nested() {
+        let mut inner = BTreeMap::new();
+        inner.insert("b".into(), s("keep"));
+        inner.insert("z".into(), s("drop"));
+        let mut item = Item::new();
+        item.insert("a".into(), AttributeValue::M(inner));
+        item.insert("c".into(), s("top"));
+        item.insert("d".into(), s("gone"));
+        let projected = Projection(vec!["a.b".into(), "c".into()]).apply(&item);
+        // `a` is reconstructed with only `b`; `c` kept; `d` dropped.
+        let AttributeValue::M(a) = projected.get("a").expect("a present") else {
+            panic!("a is a map");
+        };
+        assert_eq!(a.get("b"), Some(&s("keep")));
+        assert!(!a.contains_key("z"));
+        assert_eq!(projected.get("c"), Some(&s("top")));
+        assert!(!projected.contains_key("d"));
     }
 
     #[test]
@@ -1512,6 +2060,7 @@ mod tests {
                         name: "by-email".into(),
                         key_attribute: "email".into(),
                         sort_attribute: None,
+                        projection: IndexProjection::All,
                     })]
                 );
             }
@@ -1541,10 +2090,12 @@ mod tests {
                             name: "g".into(),
                             key_attribute: "a".into(),
                             sort_attribute: Some("b".into()),
+                            projection: IndexProjection::All,
                         }),
                         SecondaryIndex::Local(LocalSecondaryIndex {
                             name: "l".into(),
                             sort_attribute: "alt".into(),
+                            projection: IndexProjection::All,
                         }),
                     ]
                 );
@@ -1625,5 +2176,124 @@ mod tests {
         // No cursor when the page was not truncated.
         let body = scan_response(&[a], 1, None);
         assert!(!body.contains("LastEvaluatedKey"));
+    }
+
+    #[test]
+    fn decodes_update_item_set_and_remove() {
+        let body = br#"{"TableName":"t","Key":{"id":{"S":"k"}},
+            "UpdateExpression":"SET a = :v, b = :w REMOVE c",
+            "ExpressionAttributeValues":{":v":{"S":"x"},":w":{"N":"3"}},
+            "ReturnValues":"ALL_NEW"}"#;
+        let Operation::UpdateItem {
+            actions,
+            return_values,
+            ..
+        } = decode_request("DynamoDB_20120810.UpdateItem", body).unwrap()
+        else {
+            panic!("expected UpdateItem");
+        };
+        assert_eq!(
+            actions,
+            vec![
+                UpdateAction::Set("a".into(), s("x")),
+                UpdateAction::Set("b".into(), AttributeValue::N("3".into())),
+                UpdateAction::Remove("c".into()),
+            ]
+        );
+        assert_eq!(return_values, UpdateReturnValues::AllNew);
+    }
+
+    #[test]
+    fn apply_update_sets_and_removes() {
+        let mut item = Item::new();
+        item.insert("id".into(), s("k"));
+        item.insert("c".into(), s("drop"));
+        let new = apply_update(
+            item,
+            &[
+                UpdateAction::Set("a".into(), s("x")),
+                UpdateAction::Remove("c".into()),
+            ],
+        );
+        assert_eq!(new.get("a"), Some(&s("x")));
+        assert!(!new.contains_key("c"));
+        assert_eq!(new.get("id"), Some(&s("k")));
+    }
+
+    #[test]
+    fn decodes_batch_write() {
+        let body = br#"{"RequestItems":{
+            "t":[{"PutRequest":{"Item":{"id":{"S":"a"}}}},
+                 {"DeleteRequest":{"Key":{"id":{"S":"b"}}}}]}}"#;
+        let Operation::BatchWriteItem { requests } =
+            decode_request("DynamoDB_20120810.BatchWriteItem", body).unwrap()
+        else {
+            panic!("expected BatchWriteItem");
+        };
+        let reqs = requests.get("t").expect("table t present");
+        assert_eq!(reqs.len(), 2);
+        assert!(matches!(reqs[0], WriteRequest::Put(_)));
+        assert!(matches!(reqs[1], WriteRequest::Delete(_)));
+    }
+
+    #[test]
+    fn decodes_transact_write() {
+        let body = br#"{"TransactItems":[
+            {"Put":{"TableName":"t","Item":{"id":{"S":"a"}},
+                    "ConditionExpression":"attribute_not_exists(id)"}},
+            {"Update":{"TableName":"t","Key":{"id":{"S":"b"}},
+                       "UpdateExpression":"SET v = :v",
+                       "ExpressionAttributeValues":{":v":{"N":"1"}}}},
+            {"ConditionCheck":{"TableName":"t","Key":{"id":{"S":"c"}},
+                               "ConditionExpression":"attribute_exists(id)"}}]}"#;
+        let Operation::TransactWriteItems { actions } =
+            decode_request("DynamoDB_20120810.TransactWriteItems", body).unwrap()
+        else {
+            panic!("expected TransactWriteItems");
+        };
+        assert_eq!(actions.len(), 3);
+        assert!(matches!(actions[0], TransactAction::Put { .. }));
+        assert!(matches!(actions[1], TransactAction::Update { .. }));
+        assert!(matches!(actions[2], TransactAction::ConditionCheck { .. }));
+    }
+
+    #[test]
+    fn update_response_echoes_new_for_all_new() {
+        let mut new = Item::new();
+        new.insert("a".into(), s("x"));
+        let body = update_response(UpdateReturnValues::AllNew, None, Some(&new));
+        assert!(body.contains("\"Attributes\""));
+        assert!(body.contains("\"S\":\"x\""));
+        assert_eq!(
+            update_response(UpdateReturnValues::None, None, Some(&new)),
+            "{}"
+        );
+    }
+
+    #[test]
+    fn decodes_index_projection_types() {
+        let body = br#"{"TableName":"t",
+            "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
+            "GlobalSecondaryIndexes":[
+                {"IndexName":"k","KeySchema":[{"AttributeName":"e","KeyType":"HASH"}],
+                 "Projection":{"ProjectionType":"KEYS_ONLY"}},
+                {"IndexName":"i","KeySchema":[{"AttributeName":"o","KeyType":"HASH"}],
+                 "Projection":{"ProjectionType":"INCLUDE","NonKeyAttributes":["x","y"]}}]}"#;
+        let Operation::CreateTable { indexes, .. } =
+            decode_request("DynamoDB_20120810.CreateTable", body).unwrap()
+        else {
+            panic!("expected CreateTable");
+        };
+        let SecondaryIndex::Global(k) = &indexes[0] else {
+            panic!("gsi 0");
+        };
+        assert_eq!(k.projection, IndexProjection::KeysOnly);
+        let SecondaryIndex::Global(i) = &indexes[1] else {
+            panic!("gsi 1");
+        };
+        assert_eq!(
+            i.projection,
+            IndexProjection::Include(vec!["x".into(), "y".into()])
+        );
     }
 }

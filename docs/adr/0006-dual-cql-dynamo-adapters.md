@@ -38,14 +38,24 @@ absent.
 
 The surface now extends past the original three point ops:
 
-- **`CreateTable` + per-table schemas.** A `CreateTable` request records a
-  table's key schema (partition `HASH` + optional sort `RANGE` attribute names)
-  in a `SchemaRegistry`, so the key convention is no longer hard-coded; later
-  requests resolve their key attributes against it. A request against a
-  never-created table falls back to the legacy `pk`/`sk` convention. The
-  registry is **in-memory and not durable** (lost on restart; shared across
-  nodes in single-process `--cluster N` dev mode) — replicating schemas through
-  the control plane is future work.
+- **`CreateTable` + per-table schemas, now consuming the replicated catalog
+  (ADR 0013).** A `CreateTable` request **proposes a `MetaCommand::CreateTableSchema`
+  to the control-plane leader** and waits until it commits in `Metadata`, then
+  resolves subsequent `PutItem`/`GetItem`/`Query`/`Scan` key attributes from the
+  **replicated** `Metadata::table_schema(...)` (translated DynamoDB key attrs ↔
+  the control plane's `TableSchema` by `animus_dynamo::schema`). So a created
+  table is now **durable and cluster-agreed**: its key schema survives a restart
+  (it rode the Raft WAL, not the in-memory registry) and is known on every node.
+  A request against a never-created table still falls back to the legacy `pk`/`sk`
+  convention. The DynamoDB edge reaches the leader through a process-global set of
+  registered control handles (the same process-global pattern the in-memory
+  registry uses); in a one-process-per-node deployment that is the node's own
+  handle, so `CreateTable` must target the leader (or a node that can reach it).
+  **Still in-memory (not control-plane state):** the per-table **secondary-index
+  declarations** (GSI/LSI) and the observation-built **written-key index** that
+  backs `Query`/`Scan` — both rebuilt from observed writes, and the catalog only
+  carries the *table key schema* for now (index metadata can extend
+  `TableSchema`/`SchemaCatalog` later, per ADR 0013).
 - **`Query`.** Partition-key equality plus an optional sort-key condition (`=`,
   `BETWEEN`, `begins_with`), returning matching items in sort order. The data
   plane exposes only point read/write/delete (no quorum range scan), so the
@@ -71,21 +81,46 @@ The surface now extends past the original three point ops:
   stores only base keys, not item copies, so the base item stays authoritative),
   and a `Query` with an `IndexName` resolves a hash value back to its base storage
   keys — narrowed by an optional sort-key condition on a composite GSI / LSI (a
-  hash-only GSI rejects one) — which are quorum-read like a base query. Deferred:
-  per-index projection attribute lists (every index projects `ALL`).
+  hash-only GSI rejects one) — which are quorum-read like a base query. Each index
+  carries a **declared projection** (`ALL` / `KEYS_ONLY` / `INCLUDE
+  NonKeyAttributes`): an index `Query` with no explicit `ProjectionExpression`
+  returns exactly the index's projected attribute set (`KEYS_ONLY` ⇒ the base + index
+  key attributes; `INCLUDE` ⇒ those plus the listed non-key attributes), applied at
+  the edge after the base item is read (the index stores only base keys, never item
+  copies, so the projection bounds what is *returned*, not what is stored).
 - **Document & set attribute types.** The AttributeValue codec carries the
   document types `M` (map) and `L` (list) and the set types `SS`/`NS`/`BS`
   (string/number/binary sets, kept sorted + deduplicated so the in-memory form is
   canonical), alongside the scalars. Stored items serialize them transparently.
-- **Projection expressions.** GetItem/Query/Scan accept a `ProjectionExpression`
-  (a comma-separated list of top-level attribute names, with `#alias`
-  placeholders via `ExpressionAttributeNames`) or the legacy `AttributesToGet`
-  array; the edge keeps only the requested attributes after the read. Top-level
-  only — a document-path name (`a.b`) is rejected. For `Scan` the
-  `FilterExpression` sees the whole item before projection trims it.
+- **Projection expressions, incl. document paths.** GetItem/Query/Scan accept a
+  `ProjectionExpression` (a comma-separated list of **dotted document paths**
+  `a.b.c`, with `#alias` placeholders per segment via `ExpressionAttributeNames`)
+  or the legacy `AttributesToGet` array; the edge keeps only the requested paths
+  after the read, **reconstructing the nested map structure** each path reaches
+  (projecting `a.b` yields `{a:{b:..}}`). List-index paths (`a[0]`) remain deferred
+  (a `[` is rejected). For `Scan` the `FilterExpression` sees the whole item before
+  projection trims it.
 - **`ReturnValues`.** PutItem/DeleteItem accept `ReturnValues: NONE` (default) or
   `ALL_OLD`; the edge reads the prior item once (reusing it for any condition
   check, so no double read) and echoes it under `Attributes` for `ALL_OLD`.
+  `UpdateItem` additionally accepts `ALL_NEW` (the item after the update).
+- **`UpdateItem`.** A read-modify-write of one item: the edge reads the current
+  item under the coord lock, applies an `UpdateExpression`'s `SET attr = :v` /
+  `REMOVE attr` clauses (top-level attributes; `#alias`/`:value` placeholders
+  resolved; `ADD`/`DELETE` arithmetic deferred), gating on an optional
+  `ConditionExpression`, then quorum-writes the new item (an upsert when the key
+  was absent) and echoes `NONE`/`ALL_OLD`/`ALL_NEW`.
+- **`BatchWriteItem`.** A batch of `PutRequest`/`DeleteRequest`s grouped by table
+  in `RequestItems`, applied request-by-request through the same write path (no
+  cross-request atomicity, matching DynamoDB). Always replies
+  `{"UnprocessedItems":{}}` (every request is processed).
+- **`TransactWriteItems`.** A list of condition-gated `Put`/`Delete`/`Update`/
+  `ConditionCheck` actions, each honoring its `ConditionExpression`. **Not yet
+  truly atomic:** there is no cross-action rollback (full ACID transactional
+  writes route through Accord, ADR 0011, which is deferred), so a failed condition
+  rejects the request but actions sequenced before it have already applied. The
+  documented gap is the all-or-nothing guarantee; the assert-then-write use is
+  served correctly.
 
 A third slice exists on the CQL side: a **Cassandra CQL v4 binary protocol** is
 served alongside the DynamoDB endpoint. `animus-cql` is the pure, deterministic
@@ -150,18 +185,22 @@ The CQL surface now also covers the row-mutation and key-modeling gaps:
   `TWO`/`THREE`→that many (clamped) — instead of being ignored: the edge
   overrides the `TabletView`'s `r`/`w` per request.
 
-What remains. DynamoDB: per-index projection attribute lists (every index
-projects `ALL`), document-path projections (`a.b`),
-`UpdateItem`/`BatchWriteItem`/`TransactWrite`, and durable
-control-plane-replicated table schemas + key/index state (plus a native quorum
-range scan so `Query`/`Scan` need not track keys). CQL: composite (multi-column)
+What remains. DynamoDB: **truly atomic** `TransactWriteItems` (via Accord, ADR
+0011), `BatchGetItem`, list-index document paths (`a[0]`), `ADD`/`DELETE`
+`UpdateExpression` arithmetic, durable control-plane-replicated **secondary-index
++ written-key state** (only the *table key schema* moves to the control plane in
+this slice — index/key-index state stays in-memory), and a native quorum range
+scan so `Query`/`Scan` need not track keys. CQL: composite (multi-column)
 partition keys, the remaining statement kinds (`BATCH`/`ALTER`/`DROP`, per-column
 `DELETE`), range/`IN`/`ORDER BY`/`LIMIT` predicates with a native quorum range
 scan (so a partition need not be one value), collection/UDT types, paging,
-authentication, `LWT`/conditional writes, and durable control-plane-replicated
-schemas. (Now done: clustering/compound primary keys, `UPDATE`/`DELETE`, CQL
-consistency levels; DynamoDB document/set types, projection, `ReturnValues`,
-composite/multiple GSIs + LSI.)
+authentication, `LWT`/conditional writes, and consuming the replicated schema
+catalog (the CQL adapter's catalog is still in-memory). (Now done: DynamoDB
+**consumes the replicated schema catalog** (ADR 0013) so `CreateTable` is durable
++ cluster-agreed, per-index projection attribute lists, document-path
+projections, `UpdateItem`/`BatchWriteItem`/`TransactWriteItems`; clustering/
+compound primary keys, `UPDATE`/`DELETE`, CQL consistency levels; DynamoDB
+document/set types, projection, `ReturnValues`, composite/multiple GSIs + LSI.)
 
 ## Consequences
 

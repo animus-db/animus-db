@@ -52,6 +52,25 @@ use crate::{AttributeValue, Item, TableSchema, escape};
 /// the page, else `None`.
 pub type ScanPage = (Vec<Vec<u8>>, Option<Vec<u8>>);
 
+/// What attributes a secondary index projects (the `Projection` of a
+/// `CreateTable` index declaration). Because this registry stores only base keys
+/// (never item copies — the base item is the single source of truth), the
+/// projection does not change what is *stored*; it bounds what a `Query` against
+/// the index is allowed to **return**, applied at the edge after the base item is
+/// read. (Real DynamoDB also bounds what a non-projected attribute fetch costs;
+/// here the edge always has the whole base item, so the projection is purely a
+/// returned-attribute filter.)
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub enum IndexProjection {
+    /// `ALL` — every attribute (the default).
+    #[default]
+    All,
+    /// `KEYS_ONLY` — only the base table key + index key attributes.
+    KeysOnly,
+    /// `INCLUDE` — the keys plus an explicit list of non-key attributes.
+    Include(Vec<String>),
+}
+
 /// A global secondary index declaration: a hash key attribute, optionally plus a
 /// range (sort) attribute for a composite GSI. Its keyspace is independent of the
 /// base table.
@@ -63,6 +82,8 @@ pub struct GlobalSecondaryIndex {
     pub key_attribute: String,
     /// The optional range attribute (a composite GSI). `None` ⇒ hash-only.
     pub sort_attribute: Option<String>,
+    /// What attributes a query against this index returns.
+    pub projection: IndexProjection,
 }
 
 /// A local secondary index declaration: it shares the base table's partition key
@@ -75,6 +96,8 @@ pub struct LocalSecondaryIndex {
     /// The item attribute used as this index's sort key (within the base
     /// partition).
     pub sort_attribute: String,
+    /// What attributes a query against this index returns.
+    pub projection: IndexProjection,
 }
 
 /// A secondary index of either kind, the unit `CreateTable` declares and the
@@ -150,6 +173,8 @@ struct IndexState {
     /// The optional range/sort attribute (LSI: always; composite GSI: yes;
     /// hash-only GSI: `None`).
     sort_attribute: Option<String>,
+    /// What attributes a query against this index returns (ADR 0006).
+    projection: IndexProjection,
     /// `escape(hash) [|| escape(sort)] || base_storage_key` per indexed live item.
     entries: BTreeSet<Vec<u8>>,
 }
@@ -216,6 +241,7 @@ impl SchemaRegistry {
                     IndexState {
                         hash_attribute: g.key_attribute,
                         sort_attribute: g.sort_attribute,
+                        projection: g.projection,
                         entries: BTreeSet::new(),
                     },
                 ),
@@ -226,6 +252,7 @@ impl SchemaRegistry {
                     IndexState {
                         hash_attribute: schema.partition_key.clone(),
                         sort_attribute: Some(l.sort_attribute),
+                        projection: l.projection,
                         entries: BTreeSet::new(),
                     },
                 ),
@@ -447,6 +474,63 @@ impl SchemaRegistry {
             .get(index)
             .ok_or_else(|| RegistryError::NoSuchIndex(index.to_owned()))?;
         Ok(idx.sort_attribute.is_some())
+    }
+
+    /// The set of top-level attribute names a `Query` against `index` returns,
+    /// per the index's declared [`IndexProjection`]. `None` means "all attributes"
+    /// (`ALL`); `Some(names)` is the projected set: for `KEYS_ONLY` the base
+    /// table's key attributes plus the index's own key attributes, and for
+    /// `INCLUDE` those keys plus the explicitly included non-key attributes. The
+    /// caller applies this set the same way a `ProjectionExpression` would, after
+    /// reading the base item.
+    ///
+    /// # Errors
+    /// [`RegistryError::NoSuchTable`] or [`RegistryError::NoSuchIndex`].
+    pub fn index_projected_attributes(
+        &self,
+        table: &str,
+        index: &str,
+    ) -> Result<Option<Vec<String>>, RegistryError> {
+        let state = self.state(table)?;
+        let idx = state
+            .indexes
+            .get(index)
+            .ok_or_else(|| RegistryError::NoSuchIndex(index.to_owned()))?;
+        match &idx.projection {
+            IndexProjection::All => Ok(None),
+            IndexProjection::KeysOnly => Ok(Some(self.key_attributes(state, idx))),
+            IndexProjection::Include(extra) => {
+                let mut names = self.key_attributes(state, idx);
+                for name in extra {
+                    if !names.contains(name) {
+                        names.push(name.clone());
+                    }
+                }
+                Ok(Some(names))
+            }
+        }
+    }
+
+    /// The base-table + index key attribute names of an index (the always-present
+    /// projected attributes for `KEYS_ONLY` / `INCLUDE`), de-duplicated, in a
+    /// stable order: base partition key, base sort key, index hash attribute,
+    /// index sort attribute.
+    fn key_attributes(&self, state: &TableState, idx: &IndexState) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut push = |name: &str| {
+            if !names.iter().any(|n: &String| n == name) {
+                names.push(name.to_owned());
+            }
+        };
+        push(&state.schema.partition_key);
+        if let Some(sk) = &state.schema.sort_key {
+            push(sk);
+        }
+        push(&idx.hash_attribute);
+        if let Some(sort) = &idx.sort_attribute {
+            push(sort);
+        }
+        names
     }
 
     /// All live base storage keys of `table` in key order, starting *after*
@@ -738,6 +822,7 @@ mod tests {
                 name: "by-email".into(),
                 key_attribute: "email".into(),
                 sort_attribute: None,
+                projection: IndexProjection::All,
             })],
         )
         .unwrap();
@@ -803,11 +888,13 @@ mod tests {
                     name: "by-email".into(),
                     key_attribute: "email".into(),
                     sort_attribute: None,
+                    projection: IndexProjection::All,
                 }),
                 SecondaryIndex::Global(GlobalSecondaryIndex {
                     name: "by-org".into(),
                     key_attribute: "org".into(),
                     sort_attribute: None,
+                    projection: IndexProjection::All,
                 }),
             ],
         )
@@ -840,6 +927,7 @@ mod tests {
             vec![SecondaryIndex::Local(LocalSecondaryIndex {
                 name: "by-ts".into(),
                 sort_attribute: "ts".into(),
+                projection: IndexProjection::All,
             })],
         )
         .unwrap();
@@ -903,6 +991,7 @@ mod tests {
                 name: "by-email".into(),
                 key_attribute: "email".into(),
                 sort_attribute: None,
+                projection: IndexProjection::All,
             })],
         )
         .unwrap();
