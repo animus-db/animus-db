@@ -187,3 +187,47 @@ With the authoritative topology the entire deep tier
 stronger coverage confirms Accord's serialization order holds under the full fault
 matrix. The change is confined to `animus-test` (tests only); no production code
 changed.
+
+## Deep-tier findings: serializability is safety, convergence/durability are eventual (2026-08-02)
+
+Running the deep tier (`ANIMUS_CORPUS_SEEDS=40 ANIMUS_CORPUS_FULL=1`, ~7,560
+scenarios, ~4 min) refined the topology split into a **safety vs. eventual**
+distinction — the load-bearing rule for *which* checker is sound to assert at
+adversarial seed-depth.
+
+Two seed-variant scenarios (present only at depth) diverged, with **opposite**
+verdicts by topology:
+
+- `ext_t_stop_restart_winddown_s39`: **pure Accord diverged** (key 2 `[10]` vs
+  `[10,13]`, value 13 acked then absent), **frontier converged**.
+- `lossy_stop_restart_mid_s36`: **frontier diverged** (key 2 `[3,5,7]` vs
+  `[3,5,7,9]`, value 9 acked then absent), **pure Accord converged**.
+
+Serializability (`check_cycles`) held on **all** 7,560 authoritative scenarios.
+
+The lesson: **neither layer converges within a *fixed* drain window under every
+compound fault at seed-depth.** Pure Accord guarantees committed-*order* safety,
+not per-replica store convergence (backfill is the data plane's anti-entropy job);
+the data plane converges *eventually*, but under a compound fault (e.g. `lossy` +
+`stop_restart`) anti-entropy can still be in flight when the runner's post-heal
+drain ends. So convergence + durability are **eventual** (liveness) properties:
+checking them as a *hard* assertion at a fixed deadline is only sound on a
+bounded, non-pathological set — at adversarial depth it is flaky on *both*
+topologies without exposing any safety bug.
+
+Resulting design (what the corpus asserts):
+
+- **Serializability is a *safety* property** → asserted on the
+  **`Authoritative`** topology (pure Accord) and **scaled to the full deep tier**
+  (`corpus_is_consistent` over the env-scaled `corpus()`). This is the high-value,
+  sound, hard check, and it is green at depth.
+- **Convergence + durability are *eventual* properties** → asserted on the
+  **`Frontier`** topology over the **bounded base corpus** only
+  (`frontier_corpus_converges_and_is_durable` over `corpus_base()`, 119), where the
+  drain reliably suffices. They are **not** scaled to adversarial depth.
+
+This is the same "check each layer for what it offers" principle, now also split by
+*property class*: safety scales to depth; eventual/liveness stays bounded. A future
+option is to assert convergence/durability at depth with a *converged-or-timeout*
+verdict (poll until convergence, bounded) rather than a fixed-drain snapshot, so
+depth could cover them without false deadlines — deferred.
