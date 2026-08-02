@@ -91,12 +91,50 @@ pub enum Metric {
     /// A background anti-entropy round fired and emitted a segment digest to its
     /// peers (one per non-empty round, segment-digest exchange).
     DataAntiEntropyRounds,
+
+    // --- Storage engine (LSM, ADR 0004/0008, ADR 0015 storage extension) ---
+    // Appended after the data-plane variants; their array slots follow, so every
+    // earlier variant's slot and the text-export order stay stable and the
+    // snapshot remains byte-reproducible. All recorded at the real LSM site that
+    // knows the outcome (a flush/compaction actually performed, a block fetched
+    // from disk), all observe-only — they change no engine behavior — and all
+    // deterministic (counters only, no wall clock).
+    /// A memtable was flushed to a fresh SSTable (one per completed flush, counted
+    /// after the manifest swap commits the new table).
+    StorageFlushes,
+    /// A leveled compaction was performed (one per compaction whose manifest swap
+    /// committed — a compaction *actually run*, not merely scheduled).
+    StorageCompactions,
+    /// Input SSTables consumed by compactions (the "segments compacted": the source
+    /// + overlapping target tables merged away). Summed across compactions.
+    StorageCompactionTablesMerged,
+    /// Input SSTable bytes consumed by compactions (the on-disk `file_size` of every
+    /// merged input table). Summed across compactions — the read-side I/O a
+    /// compaction folded.
+    StorageCompactionBytesMerged,
+    /// An SSTable data block was fetched from disk (one per `read_at` of a block;
+    /// the read-amplification counter). A point read that the key-range / Bloom
+    /// gates reject reads no block, so this stays flat for a proven-absent key.
+    StorageSstableBlockReads,
+    /// A per-table Bloom filter answered "may contain" for a point lookup whose key
+    /// was inside the table's key range (a candidate that will read a block).
+    StorageBloomHits,
+    /// A per-table Bloom filter ruled a key absent (key inside the table's range but
+    /// the Bloom said no), saving a block read. Only counted for tables that
+    /// actually carry a Bloom (`has_bloom`).
+    StorageBloomMisses,
+    /// A WAL segment was rotated: the active segment crossed its byte budget and a
+    /// fresh segment file was opened (one per rotation, at the group-commit site).
+    StorageWalSegmentRotations,
+    /// Tombstone-GC records reclaimed during compaction (a tombstone or a version it
+    /// shadowed, physically dropped below the GC floor). Summed across compactions.
+    StorageTombstonesReclaimed,
 }
 
 impl Metric {
     /// Every metric, in a fixed order. The array index of a metric in `ALL` is
     /// its slot in the [`MetricSink`]; keep this in sync with the enum.
-    pub const ALL: [Metric; 18] = [
+    pub const ALL: [Metric; 27] = [
         Metric::ElectionsStarted,
         Metric::ElectionsWon,
         Metric::AppendEntriesSent,
@@ -115,6 +153,15 @@ impl Metric {
         Metric::DataHintsStored,
         Metric::DataHintsDelivered,
         Metric::DataAntiEntropyRounds,
+        Metric::StorageFlushes,
+        Metric::StorageCompactions,
+        Metric::StorageCompactionTablesMerged,
+        Metric::StorageCompactionBytesMerged,
+        Metric::StorageSstableBlockReads,
+        Metric::StorageBloomHits,
+        Metric::StorageBloomMisses,
+        Metric::StorageWalSegmentRotations,
+        Metric::StorageTombstonesReclaimed,
     ];
 
     /// The stable exported name of this metric (snake_case, used as the text
@@ -140,6 +187,15 @@ impl Metric {
             Metric::DataHintsStored => "data_hints_stored",
             Metric::DataHintsDelivered => "data_hints_delivered",
             Metric::DataAntiEntropyRounds => "data_anti_entropy_rounds",
+            Metric::StorageFlushes => "storage_flushes",
+            Metric::StorageCompactions => "storage_compactions",
+            Metric::StorageCompactionTablesMerged => "storage_compaction_tables_merged",
+            Metric::StorageCompactionBytesMerged => "storage_compaction_bytes_merged",
+            Metric::StorageSstableBlockReads => "storage_sstable_block_reads",
+            Metric::StorageBloomHits => "storage_bloom_hits",
+            Metric::StorageBloomMisses => "storage_bloom_misses",
+            Metric::StorageWalSegmentRotations => "storage_wal_segment_rotations",
+            Metric::StorageTombstonesReclaimed => "storage_tombstones_reclaimed",
         }
     }
 

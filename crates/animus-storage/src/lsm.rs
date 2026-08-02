@@ -103,7 +103,7 @@ use std::ops::Bound;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use animus_env::Env;
+use animus_env::{Env, Metric, MetricsHandle};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -344,6 +344,12 @@ pub struct LsmEngine<E: Env> {
     /// share a single `fsync`. Has its own lock (never the `Inner` lock), so a
     /// writer can park awaiting durability without serializing the memtable.
     wal: Arc<GroupCommit>,
+    /// Observability sink (ADR 0015). Defaults to `env.metrics()` at open (the
+    /// no-op handle under `SimEnv`, a recording one under `ProdEnv`); a sim test
+    /// threads a recording handle via [`open_with_metrics`](Self::open_with_metrics)
+    /// to read storage counters back. Recording is observe-only — a relaxed atomic
+    /// add at the real LSM site — and changes no engine behavior.
+    metrics: MetricsHandle,
 }
 
 impl<E: Env> LsmEngine<E> {
@@ -423,11 +429,33 @@ impl<E: Env> LsmEngine<E> {
         Self::open_with(env, prefix, LsmOptions::default()).await
     }
 
-    /// [`open`](Self::open) with explicit [`LsmOptions`].
+    /// [`open`](Self::open) with explicit [`LsmOptions`]. Records storage metrics
+    /// (ADR 0015) into the env's own sink (`env.metrics()`) — the no-op handle
+    /// under `SimEnv`, the recording one under `ProdEnv`. A sim test that wants to
+    /// read storage counters back opens with [`open_with_metrics`](Self::open_with_metrics).
     ///
     /// # Errors
     /// As [`open`](Self::open).
     pub async fn open_with(env: E, prefix: impl Into<String>, opts: LsmOptions) -> Result<Self> {
+        let metrics = env.metrics();
+        Self::open_with_metrics(env, prefix, opts, metrics).await
+    }
+
+    /// [`open_with`](Self::open_with) with an explicit metrics [`MetricsHandle`]
+    /// (ADR 0015), so a deterministic sim test can thread a *recording* handle in
+    /// and read storage counters back without changing `animus-sim` (the same
+    /// additive `*_with_metrics` pattern as `RaftNode::start_with_metrics` /
+    /// `DataClient::with_metrics`). Production wiring uses [`open`](Self::open) /
+    /// [`open_with`](Self::open_with), which forward `env.metrics()`.
+    ///
+    /// # Errors
+    /// As [`open`](Self::open).
+    pub async fn open_with_metrics(
+        env: E,
+        prefix: impl Into<String>,
+        opts: LsmOptions,
+        metrics: MetricsHandle,
+    ) -> Result<Self> {
         let prefix: Arc<str> = Arc::from(prefix.into());
         let manifest_file = format!("{prefix}MANIFEST");
 
@@ -448,7 +476,8 @@ impl<E: Env> LsmEngine<E> {
             readers.push(
                 SsTableReader::open(&env, file, meta.clone())
                     .await?
-                    .with_block_counter(Arc::clone(&block_reads)),
+                    .with_block_counter(Arc::clone(&block_reads))
+                    .with_metrics(metrics.clone()),
             );
         }
 
@@ -532,6 +561,7 @@ impl<E: Env> LsmEngine<E> {
             opts,
             inner: Arc::new(Mutex::new(inner)),
             wal,
+            metrics,
         })
     }
 
@@ -556,13 +586,44 @@ impl<E: Env> LsmEngine<E> {
             inner: Arc::clone(&self.inner),
         };
         let bytes = encode_wal(record);
+        // Observability (ADR 0015): record any WAL segment rotation this commit
+        // performed (the active segment crossed its byte budget). Sampling the
+        // coordinator's monotonic rotation counter around the commit attributes
+        // the rotation to the write that caused it, with no behavior change.
+        let rotations_before = self.wal.rotation_count();
         self.wal.commit(&self.env, bytes).await?;
+        let rotated = self.wal.rotation_count() - rotations_before;
+        if rotated > 0 {
+            self.metrics
+                .incr_by(Metric::StorageWalSegmentRotations, rotated);
+        }
         {
             let mut inner = self.lock();
             apply(&mut inner);
         }
         drop(guard);
         Ok(())
+    }
+
+    /// Whether `meta` may contain `key`, recording the per-table Bloom outcome for
+    /// observability (ADR 0015). When the key is inside the table's range and the
+    /// table carries a Bloom, a "maybe" bumps `storage_bloom_hits` and a definite
+    /// "no" bumps `storage_bloom_misses` (a block read saved). Tables with no Bloom,
+    /// or a key outside the range, record nothing (no Bloom decision was made).
+    /// Observe-only — returns exactly what [`SsTableMeta::may_contain`] would.
+    fn may_contain_observed(&self, meta: &SsTableMeta, key: &[u8]) -> bool {
+        let in_range = match (&meta.min_key, &meta.max_key) {
+            (Some(lo), Some(hi)) => key >= lo.as_slice() && key <= hi.as_slice(),
+            _ => false,
+        };
+        if in_range && meta.has_bloom {
+            if meta.bloom.may_contain(key) {
+                self.metrics.incr(Metric::StorageBloomHits);
+            } else {
+                self.metrics.incr(Metric::StorageBloomMisses);
+            }
+        }
+        meta.may_contain(key)
     }
 
     /// The highest version recorded for `key` anywhere (memtable + SSTables),
@@ -577,7 +638,7 @@ impl<E: Env> LsmEngine<E> {
         };
         let mut best = memtable_latest;
         for reader in readers.iter().rev() {
-            if !reader.meta().may_contain(key) {
+            if !self.may_contain_observed(reader.meta(), key) {
                 continue;
             }
             if let Some((v, _)) = reader.latest(&self.env, key).await? {
@@ -608,7 +669,7 @@ impl<E: Env> LsmEngine<E> {
         for reader in readers.iter().rev() {
             // Take the max-version hit across all sources; a key range that can't
             // contain `key` is skipped cheaply.
-            if !reader.meta().may_contain(key) {
+            if !self.may_contain_observed(reader.meta(), key) {
                 continue;
             }
             if let Some((v, slot)) = reader.get_at(&self.env, key, version).await? {
@@ -717,7 +778,8 @@ impl<E: Env> LsmEngine<E> {
         let counter = Arc::clone(&self.lock().block_reads);
         Ok(SsTableReader::open(&self.env, file, meta)
             .await?
-            .with_block_counter(counter))
+            .with_block_counter(counter)
+            .with_metrics(self.metrics.clone()))
     }
 
     /// Decide the next compaction to run, if any. Prefers an L0→L1 compaction
@@ -822,6 +884,9 @@ impl<E: Env> LsmEngine<E> {
             inner.memtable_bytes = 0;
             inner.flushes += 1;
         }
+        // Observability (ADR 0015): a flush actually committed (the manifest swap
+        // is done and the new table is live).
+        self.metrics.incr(Metric::StorageFlushes);
         Ok(())
     }
 
@@ -895,6 +960,12 @@ impl<E: Env> LsmEngine<E> {
             return Ok(());
         }
 
+        // Observability (ADR 0015): the input tables this compaction merges away
+        // ("segments compacted") and their on-disk bytes. Captured before the
+        // inputs are consumed; recorded only once the compaction commits below.
+        let merged_tables = input_readers.len() as u64;
+        let merged_bytes: u64 = input_readers.iter().map(|r| r.meta().file_size).sum();
+
         // Merge all inputs into one sorted record stream, keeping every distinct
         // (key, version) so MVCC history / get_at is preserved.
         let mut merged: BTreeMap<(Key, Version), Option<Value>> = BTreeMap::new();
@@ -906,8 +977,11 @@ impl<E: Env> LsmEngine<E> {
 
         // Tombstone GC: reclaim obsolete tombstones (and the versions they shadow)
         // that have aged below the GC floor, without changing any read above it.
+        // The drop in record count is exactly what GC reclaimed (observability).
         let gc_floor = max_version.saturating_sub(self.opts.tombstone_grace_versions);
+        let before_gc = merged.len();
         gc_obsolete_records(&mut merged, gc_floor, &deeper_ranges);
+        let reclaimed = (before_gc - merged.len()) as u64;
 
         // Partition into non-overlapping runs of ≈target_table_bytes, splitting
         // only on a key boundary so each run owns a disjoint key range.
@@ -987,6 +1061,17 @@ impl<E: Env> LsmEngine<E> {
             inner.readers = readers;
             inner.manifest = new_manifest;
             inner.compactions += 1;
+        }
+        // Observability (ADR 0015): a compaction actually committed. Record the
+        // event, the tables + bytes it merged, and any tombstones it reclaimed.
+        self.metrics.incr(Metric::StorageCompactions);
+        self.metrics
+            .incr_by(Metric::StorageCompactionTablesMerged, merged_tables);
+        self.metrics
+            .incr_by(Metric::StorageCompactionBytesMerged, merged_bytes);
+        if reclaimed > 0 {
+            self.metrics
+                .incr_by(Metric::StorageTombstonesReclaimed, reclaimed);
         }
         for f in old_files {
             self.env.remove(&f).await.map_err(io)?;

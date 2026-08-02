@@ -131,6 +131,22 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
   a crash mid-GC recovers the pre-GC inputs. Argued in `lsm.rs` module docs,
   exercised in `lsm_crash.rs` + `lsm_wal_rotation.rs` + `lsm_gc.rs`.
 
+- **Observability (ADR 0015) is observe-only and deterministic.** `LsmEngine`
+  records `storage_*` counters through the `Env` metrics seam at the real LSM site
+  that knows the outcome: a flush *after* its manifest swap (`storage_flushes`); a
+  compaction *after* its swap (`storage_compactions` + `_tables_merged` +
+  `_bytes_merged` from the consumed inputs' `file_size`, + `_tombstones_reclaimed`
+  from the GC record-count drop); a block fetched in `SsTableReader::read_block`
+  (`storage_sstable_block_reads`); the per-table Bloom verdict at the point-read gate
+  in `may_contain_observed` (`storage_bloom_hits`/`_misses` — a miss is counted
+  *before* any block read, so a proven-absent in-range key reads zero blocks); and a
+  WAL rotation at the group-commit site (`storage_wal_segment_rotations`, via the
+  coordinator's monotonic `rotation_count` whose delta `log_and_apply` records around
+  each `commit`). The handle defaults to `env.metrics()` (no-op under `SimEnv`); a
+  sim test reads counters back via the additive `LsmEngine::open_with_metrics`
+  (`SsTableReader::with_metrics` carries it to the readers). Counters only — never
+  read the wall clock; recording changes no engine behavior or signatures.
+
 ## Tests & benchmark
 
 `cargo test -p animus-storage` (proptest semantics + units). Library unit tests
@@ -157,6 +173,13 @@ SSTables + live WAL segments), and a crash mid-rotation recovering correctly
 introspection helpers for these tests. `lsm_gc.rs` covers tombstone GC: an aged
 tombstone (and its shadowed value) is physically reclaimed while a within-grace
 tombstone is preserved, and GC never resurrects a key with a deeper old value.
+
+`lsm_metrics.rs` covers the ADR 0015 storage counters: a write workload forces
+several flushes, an L0→L1 compaction (asserting tables/bytes merged), WAL segment
+rotations, and on-disk point reads (block reads + Bloom hits); a proven-absent
+in-range key is a Bloom *miss* that reads **zero** blocks; an aged tombstone is
+counted reclaimed; and the recorded snapshot is asserted byte-identical across two
+runs of the same seed (determinism). All under `SimEnv` via `open_with_metrics`.
 
 `lsm_concurrent.rs` is a **real multi-threaded** regression (`#[tokio::test(flavor
 = "multi_thread")]` over `ProdEnv`, timeout-guarded): the deterministic single-
