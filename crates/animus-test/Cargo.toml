@@ -1,0 +1,25 @@
+[package]
+name = "animus-test"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "AnimusDB Elle-style history recorder + checker."
+
+[lints]
+workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+animus-env.workspace = true
+animus-sim.workspace = true
+animus-control.workspace = true
+animus-data.workspace = true
+animus-storage.workspace = true
+animus-tablet.workspace = true
+futures.workspace = true

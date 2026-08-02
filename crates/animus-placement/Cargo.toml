@@ -1,0 +1,17 @@
+[package]
+name = "animus-placement"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "AnimusDB placement groups + topology-aware data residency."
+
+[lints]
+workspace = true
+
+[dependencies]
+animus-env.workspace = true
+serde.workspace = true
+thiserror.workspace = true

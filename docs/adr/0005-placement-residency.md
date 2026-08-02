@@ -37,14 +37,14 @@ designed with residency in mind, so they must be addressed deliberately.
 
 ## Status of implementation
 
-The **placement selection engine** is implemented in `custos-placement` as a
+The **placement selection engine** is implemented in `animus-placement` as a
 pure, deterministic policy library: a `PlacementPolicy` (replication factor +
 residency `required_labels` + an optional failure-domain `SpreadPolicy`),
 `select_replicas` (fresh placement) and `replan` (churn-minimizing replacement
 that keeps surviving replicas). It is dependency-light (only `NodeId`) to stay
-out of a cycle with `custos-control`; the control plane builds `Candidate`s from
+out of a cycle with `animus-control`; the control plane builds `Candidate`s from
 the replicated `Active` membership, calls it, and commits the result as a
-`CasTabletReplicas`. `custos-control/tests/placement_reconcile.rs` drives this
+`CasTabletReplicas`. `animus-control/tests/placement_reconcile.rs` drives this
 end-to-end through real Raft under simulation, including a replica death and a
 control-follower crash mid-reconcile, reproducible from a seed.
 
@@ -58,9 +58,9 @@ each policied tablet it runs `replan` over the `Active` membership and emits a
 idempotent (no churn at steady state). The **leader** drives it: `RaftNode`'s
 `reconcile_loop` calls it on a slow `Env` timer (`env.sleep`, never wall clock)
 and proposes the result; off-leader nodes propose nothing and a stale proposal
-is rejected by the epoch guard. `custos-control` therefore now takes
-`custos-placement` as a normal dependency (no cycle — placement does not depend
-on control). `custos-control/tests/placement_auto_reconcile.rs` proves a marked
+is rejected by the epoch guard. `animus-control` therefore now takes
+`animus-placement` as a normal dependency (no cycle — placement does not depend
+on control). `animus-control/tests/placement_auto_reconcile.rs` proves a marked
 `Down` replica is replaced **automatically**, with no test-driven `replan`/CAS,
 preserving residency + spread and moving only the dead replica, reproducible
 from a seed.
@@ -77,17 +77,17 @@ so even a misconfigured or hostile peer cannot inject or solicit cross-boundary
 data. The allowed set is derived from the same `PlacementPolicy::admits` the
 control plane uses for placement. Quorum `Write`/`Delete`/`Read` need no new
 guard: an ineligible node is never a replica in a `TabletView`, so it is never
-sent one. Proven under simulation in `custos-data/tests/residency_repair.rs`: a
+sent one. Proven under simulation in `animus-data/tests/residency_repair.rs`: a
 reachable non-EU node actively soliciting anti-entropy from EU replicas never
 receives the EU data, and a direct `Sync` from it is rejected.
 
-**The reconciler now runs in the production binary.** `custosd` registers the
+**The reconciler now runs in the production binary.** `animusd` registers the
 **data nodes** as the cluster's `Active` members (not the control-group ids),
 places its bootstrap tablet on the first `min(N, 3)` of them, and attaches a
 `PlacementPolicy` via `SetTabletPolicy`. The leader's `reconcile_loop` is then
 driven over `ProdEnv` timers, so when failure detection (ADR 0012) marks a data
 member `Down`, the tablet is re-placed onto a live spare with no operator —
-observable end-to-end over real TCP in `custosd/tests/self_heal.rs`. (The
+observable end-to-end over real TCP in `animusd/tests/self_heal.rs`. (The
 bootstrap policy carries no labels yet, so it is a plain replication-factor
 constraint; topology labels from config are future work.)
 
@@ -95,5 +95,5 @@ constraint; topology labels from config are future work.)
 across hinted handoff and backup. The reconciler keeps a tablet's *surviving*
 eligible replicas (minimal churn), so it repairs drift but does not re-optimize
 an already-placed compliant-enough set; a cluster-default policy, topology labels
-in `custosd`'s deployment config, and operator-facing policy management (CLI/wire)
+in `animusd`'s deployment config, and operator-facing policy management (CLI/wire)
 are also future work.

@@ -1,0 +1,31 @@
+[package]
+name = "animus-consensus"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "AnimusDB Accord-style leaderless transaction consensus."
+
+[lints]
+workspace = true
+
+[dependencies]
+animus-env.workspace = true
+animus-storage.workspace = true
+# Frontier: a committed transaction's writes land in the replicated data plane
+# (DataClient quorum) — no cycle, animus-data does not depend on consensus.
+animus-data.workspace = true
+animus-tablet.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+animus-sim.workspace = true
+animus-control.workspace = true
+animus-tablet.workspace = true
+tokio = { workspace = true }

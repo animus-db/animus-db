@@ -13,19 +13,19 @@ compatibility is the project's long-term wedge.
 
 ## Decision
 
-We will expose **both** a CQL wire-protocol adapter (`custos-cql`) and a
-DynamoDB API adapter (`custos-dynamo`) as thin translation layers over the
+We will expose **both** a CQL wire-protocol adapter (`animus-cql`) and a
+DynamoDB API adapter (`animus-dynamo`) as thin translation layers over the
 common map-of-maps core (ADR 0004) and the distributed planes (ADR 0001). The
 adapters translate surface syntax and semantics to core operations; they do not
 each carry their own engine.
 
-Two slices now exist. First, `custos-dynamo` provides a DynamoDB-style **item
+Two slices now exist. First, `animus-dynamo` provides a DynamoDB-style **item
 API** (`PutItem`/`GetItem`/`DeleteItem`/`Query`) mapped directly onto the
 `StorageEngine` core, demonstrating that the Dynamo-lineage data model
 translates cleanly. Second, a **DynamoDB JSON wire protocol** is now served:
-`custos-dynamo::wire` is the pure, deterministic translation between the
+`animus-dynamo::wire` is the pure, deterministic translation between the
 DynamoDB AttributeValue JSON (`{"S":..}` / `{"N":..}` / `{"B":..}` /
-`{"BOOL":..}` / `{"NULL":..}`) and the in-memory item model, and `custosd`
+`{"BOOL":..}` / `{"NULL":..}`) and the in-memory item model, and `animusd`
 exposes a real HTTP/1.1 endpoint that decodes `X-Amz-Target:
 DynamoDB_20120810.{CreateTable,PutItem,GetItem,DeleteItem,Query}` requests and
 routes the resulting keys/values **through the distributed data plane** (the
@@ -72,13 +72,13 @@ The surface now extends past the original three point ops:
   secondary indexes.
 
 A third slice exists on the CQL side: a **Cassandra CQL v4 binary protocol** is
-served alongside the DynamoDB endpoint. `custos-cql` is the pure, deterministic
-protocol layer; `custosd::cql` is the production-only I/O edge (real tokio
+served alongside the DynamoDB endpoint. `animus-cql` is the pure, deterministic
+protocol layer; `animusd::cql` is the production-only I/O edge (real tokio
 sockets + hand-rolled framing, no third-party CQL/Cassandra crate). It now
 carries a real type system and a schema catalog rather than a fixed `(pk, v)`
 convention:
 
-- **A type/value system.** `custos_cql::types` models the common scalar CQL
+- **A type/value system.** `animus_cql::types` models the common scalar CQL
   types — `text`, `int`, `bigint`, `boolean`, `blob`, `uuid` — with
   encode/decode of cell bytes (the contents of a protocol `[bytes]`) and literal
   parsing. Result frames carry proper `[column metadata]` with the real type ids,
@@ -118,7 +118,7 @@ level (currently ignored), and durable control-plane-replicated schemas.
 
 ## Consequences
 
-- Migrating applications can point at CustosDB with minimal change once the
+- Migrating applications can point at AnimusDB with minimal change once the
   adapters exist, which is the adoption wedge.
 - Maintaining a single core under two surfaces forces the core to stay
   general-purpose and prevents either surface from leaking into the engine.

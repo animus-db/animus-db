@@ -36,7 +36,7 @@ Examples of unacceptable behavior include:
 
 Instances of abusive, harassing, or otherwise unacceptable behavior may be
 reported to the community leaders responsible for enforcement at
-**conduct@custosdb.org**. All complaints will be reviewed and investigated
+**conduct@animusdb.org**. All complaints will be reviewed and investigated
 promptly and fairly.
 
 ## Attribution

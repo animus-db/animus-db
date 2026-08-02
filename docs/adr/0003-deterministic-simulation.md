@@ -21,7 +21,7 @@ so the same code runs in production and under simulation with no branches.
 
 - `ProdEnv` provides real time, `tokio` task spawning, TCP, real `fsync`, and
   OS randomness.
-- `SimEnv` (crate `custos-sim`) provides a virtual clock, a seeded ChaCha RNG, an
+- `SimEnv` (crate `animus-sim`) provides a virtual clock, a seeded ChaCha RNG, an
   in-memory network with controllable delay/drop/reorder/partition, a fake disk
   that distinguishes synced from un-synced bytes (a "crash" drops un-synced
   bytes), and a cooperative single-threaded run-queue.

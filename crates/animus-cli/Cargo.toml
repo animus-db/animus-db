@@ -1,0 +1,20 @@
+[package]
+name = "animus-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "AnimusDB operator CLI."
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "animus"
+path = "src/main.rs"
+
+[dependencies]
+animusd.workspace = true
+tokio.workspace = true

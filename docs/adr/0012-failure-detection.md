@@ -74,7 +74,7 @@ ordinary `UpsertMember` log entries committed under the current term.
   is detected, marked `Down`, and its tablets re-placed with no operator — and it
   returns to `Active` (and to placement) when it recovers. This is proven
   end-to-end under fault injection in
-  `custos-control/tests/failure_detection.rs` (a member crashes, the leader
+  `animus-control/tests/failure_detection.rs` (a member crashes, the leader
   commits `Down` on every control node, placement reconciles off it preserving
   residency + spread, then the member restarts and returns to `Active`),
   reproducible from a seed.
@@ -86,13 +86,13 @@ ordinary `UpsertMember` log entries committed under the current term.
   with a cold detector and re-learns liveness over one `timeout` window as
   heartbeats keep arriving on every control node. This is acceptable for this
   slice; persisting/replicating raw liveness would buy little.
-- **Now wired in production.** `custosd`'s node assembly spawns `heartbeat_loop`
+- **Now wired in production.** `animusd`'s node assembly spawns `heartbeat_loop`
   on every data node (over its data-role `ProdEnv`) and registers the **data
   nodes** as the cluster's `Active` members, so the leader's `detect_loop` tracks
   the nodes that actually hold data; a killed node's silence is detected, marked
   `Down`, and cascades into placement re-reconciliation onto a spare. Proven live
-  over real `ProdEnv`/TCP in `custosd/tests/self_heal.rs` (the deterministic sim
-  coverage in `custos-control/tests/failure_detection.rs` remains the source of
+  over real `ProdEnv`/TCP in `animusd/tests/self_heal.rs` (the deterministic sim
+  coverage in `animus-control/tests/failure_detection.rs` remains the source of
   truth).
 - **Deferred:** tuning the timeout adaptively (or a φ-accrual detector) under real
   network jitter; a grace period after a leader change before acting on a cold

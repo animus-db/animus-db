@@ -1,6 +1,6 @@
-# Contributing to CustosDB
+# Contributing to AnimusDB
 
-Thanks for your interest. CustosDB is foundational distributed-systems code; we
+Thanks for your interest. AnimusDB is foundational distributed-systems code; we
 optimize for clarity and testability over completeness.
 
 ## Build & test
@@ -18,7 +18,7 @@ All of the above must be green in CI before a PR merges.
 ## The non-negotiable rule: determinism
 
 System code must be deterministic. Concretely, in any crate other than
-`custos-env` (the `ProdEnv` implementation) and tests:
+`animus-env` (the `ProdEnv` implementation) and tests:
 
 - **No wall clock.** No `std::time::Instant::now`, `SystemTime::now`, or
   `tokio::time` directly — get time from `Env::clock()`.

@@ -1,0 +1,19 @@
+[package]
+name = "animus-sim"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "AnimusDB deterministic simulator (virtual clock, net, disk, scheduler, faults)."
+
+[lints]
+workspace = true
+
+[dependencies]
+animus-env.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true

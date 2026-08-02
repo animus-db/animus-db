@@ -9,11 +9,11 @@ ignore = []
 
 [licenses]
 version = 2
-# CustosDB is AGPL-3.0 (see docs/adr/0007). The project's own crates carry that
+# AnimusDB is AGPL-3.0 (see docs/adr/0007). The project's own crates carry that
 # license, so it must be allowed; third-party dependencies must carry permissive
 # licenses compatible with AGPL redistribution.
 allow = [
-    # CustosDB's own workspace crates.
+    # AnimusDB's own workspace crates.
     "AGPL-3.0-only",
     # Permissive third-party licenses.
     "MIT",

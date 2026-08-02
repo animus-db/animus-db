@@ -96,16 +96,16 @@ primitive:
   missed writes is repaired either on the next divergent read or by the next
   anti-entropy round — proven under simulation by partitioning a replica during
   a write and asserting convergence both with a read (read-repair) and with **no
-  reads at all** (anti-entropy) in `custos-data/tests/repair.rs`.
+  reads at all** (anti-entropy) in `animus-data/tests/repair.rs`.
 - Anti-entropy is no longer a full-push: the **segment-digest exchange** moves
   only divergent ranges, so a converged pair exchanges only tiny digests and a
   single divergent key out of many converges for **less than one full-push round
   of bytes** — proven at the wire level (the simulator's `Send` trace) in
-  `custos-data/tests/digest_anti_entropy.rs`. Read-repair still repairs only the
+  `animus-data/tests/digest_anti_entropy.rs`. Read-repair still repairs only the
   replicas that responded within the read; stragglers rely on anti-entropy.
 - **Residency holds on the repair paths** (ADR 0005): a residency-ineligible but
   reachable node never receives repaired data, and a repair message from outside
-  the placement is rejected — proven in `custos-data/tests/residency_repair.rs`.
+  the placement is rejected — proven in `animus-data/tests/residency_repair.rs`.
 - **Anti-entropy follows the tablet's live epoch.** `serve_anti_entropy` takes
   the replica's `ReplicaHandle` and reads its current known epoch for the tablet
   (`handle.epoch(tablet)`) at the start of *each* round, stamping the outbound
@@ -117,11 +117,11 @@ primitive:
   only lazily via read-repair on its first read. Reading the epoch live keeps
   **background** convergence working across a reconcile, while a genuinely
   stale-epoch peer is still fenced — both proven under simulation in
-  `custos-data/tests/repair.rs`
+  `animus-data/tests/repair.rs`
   (`anti_entropy_tracks_the_live_epoch_after_a_reconcile`,
   `anti_entropy_still_fences_a_genuinely_stale_epoch_peer`). The epoch is read
   under a brief lock released before any `.await` (the no-guard-across-await
-  discipline). This closes the gap previously deferred in `custosd`, which passed
+  discipline). This closes the gap previously deferred in `animusd`, which passed
   a fixed `Epoch::INITIAL` into the loop.
 - **Deletes now propagate** through repair: a data-plane `DataMsg::Delete`
   tombstones by per-key LWW (`merge_tombstone`), and the tombstone-carrying
@@ -129,7 +129,7 @@ primitive:
   under simulation by isolating a replica that *holds the value* during a delete
   and asserting it converges to the tombstone with **no reads at all**, and that
   the lagging replica pushing its stale value back does not resurrect the key
-  (`custos-data/tests/repair.rs`).
+  (`animus-data/tests/repair.rs`).
 - **Tombstone GC is deferred.** Tombstones currently live forever in a key's
   MVCC history (so they win LWW and stay in the digest). A real system reclaims
   them after a grace period exceeding the max anti-entropy lag; this — and its

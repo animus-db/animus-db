@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-CustosDB is a masterless, linearly-scalable NoSQL database in Rust (Dynamo
+AnimusDB is a masterless, linearly-scalable NoSQL database in Rust (Dynamo
 lineage). It pairs a **leaderless AP data plane** (tunable quorum consistency)
 with a small **strongly-consistent Raft control plane** that owns cluster
 metadata. Correctness is established by **deterministic simulation testing**.
@@ -19,13 +19,13 @@ re-reconciliation — ADR 0012),
 the quorum data-plane vertical slice (with read-repair, background
 anti-entropy convergence via segment-digest exchange of only divergent ranges,
 delete/tombstone propagation, and residency-bounded repair), tablet split/merge
-+ multi-tablet routing, the Elle-style recorder/checker (`custos-test`) — now
++ multi-tablet routing, the Elle-style recorder/checker (`animus-test`) — now
 including an **end-to-end correctness test of the assembled stack** (control
 plane + data plane at scale: 3 Raft nodes, 2 tablets, 6 replicas, 4 concurrent
 clients) under fault injection (partition + leader kill + crash + heal), checked
 for serializability/durability/convergence — a
 DynamoDB-style item API over the core plus a **DynamoDB JSON wire protocol**
-(`custos-dynamo`: CreateTable/PutItem/GetItem/DeleteItem/Query/Scan
+(`animus-dynamo`: CreateTable/PutItem/GetItem/DeleteItem/Query/Scan
 AttributeValue-JSON translation, with a per-table schema registry, sort-key
 conditions =/BETWEEN/begins_with, a `ConditionExpression` subset for conditional
 writes, `Scan` with `Limit`/`ExclusiveStartKey` pagination + `FilterExpression`,
@@ -39,23 +39,23 @@ persisted its Raft WAL; the data plane is no longer in-memory-only) — and now
 members, runs the control-plane heartbeat/failure-detector + placement reconciler
 + data-plane anti-entropy over `ProdEnv` timers, so a killed data node is detected
 `Down` and its tablet automatically re-placed onto a spare while reads keep
-succeeding via the survivors (proven live in `custosd/tests/self_heal.rs`) —
+succeeding via the survivors (proven live in `animusd/tests/self_heal.rs`) —
 runnable
-as one process (`custosd --cluster N`) or one process per node (`custosd --config
+as one process (`animusd --cluster N`) or one process per node (`animusd --config
 FILE --node I`, config via `gen-config`; `--ephemeral` selects the volatile
 in-memory engine for dev runs),
 which now also **serves the DynamoDB JSON protocol over HTTP**, routing those
 requests through the same data-plane coordinator — plus a **CQL v4 wire
-protocol** (`custos-cql`: STARTUP/READY handshake; a scalar **type system**
+protocol** (`animus-cql`: STARTUP/READY handshake; a scalar **type system**
 (text/int/bigint/boolean/blob/uuid) with typed column metadata + bound values;
 `CREATE KEYSPACE`/`USE`/`CREATE TABLE` recording a schema in an in-memory
 catalog; `INSERT`/`SELECT` resolved against that schema; and **prepared
 statements** (PREPARE→Prepared, EXECUTE with bound values) — all routed through
 that same coordinator) — the **topology-aware placement
-engine** (`custos-placement`: residency + failure-domain spread, with the leader
+engine** (`animus-placement`: residency + failure-domain spread, with the leader
 automatically reconciling tablet placement via control-plane `CasTabletReplicas`),
 and a **slice of Accord-style leaderless transaction consensus**
-(`custos-consensus`: PreAccept→Commit fast path + PreAccept→Accept→Commit slow
+(`animus-consensus`: PreAccept→Commit fast path + PreAccept→Accept→Commit slow
 path, dependency tracking, consistent commit order, **durable storage-backed
 execution** — each replica executes committed transactions in agreed order
 against a real `StorageEngine` (`MemoryEngine` under sim) via a WAL it recovers
@@ -65,7 +65,7 @@ decision or forcing the slow path), **message retry/timeouts** (the driver
 re-sends un-acknowledged round messages on a timer so a dropped fire-and-forget
 `send` no longer strands a transaction), and a **data-plane frontier** — a
 committed transaction's writes can land in the replicated AP data plane
-(`custos-data` quorum), readable via ordinary quorum reads, atomically in agreed
+(`animus-data` quorum), readable via ordinary quorum reads, atomically in agreed
 order; ADR 0011). Skeletons / future work:
 the rest of the CQL surface (clustering/composite keys,
 `UPDATE`/`DELETE`/`BATCH`/`ALTER`/`DROP`, collection/UDT types, paging, auth,
@@ -84,28 +84,28 @@ the relevant one before working in a crate:
 
 | Crate | Guide |
 |-------|-------|
-| `custos-env` | [crates/custos-env/CLAUDE.md](crates/custos-env/CLAUDE.md) |
-| `custos-sim` | [crates/custos-sim/CLAUDE.md](crates/custos-sim/CLAUDE.md) |
-| `custos-storage` | [crates/custos-storage/CLAUDE.md](crates/custos-storage/CLAUDE.md) |
-| `custos-tablet` | [crates/custos-tablet/CLAUDE.md](crates/custos-tablet/CLAUDE.md) |
-| `custos-control` | [crates/custos-control/CLAUDE.md](crates/custos-control/CLAUDE.md) |
-| `custos-data` | [crates/custos-data/CLAUDE.md](crates/custos-data/CLAUDE.md) |
-| `custos-test` | [crates/custos-test/CLAUDE.md](crates/custos-test/CLAUDE.md) |
-| `custos-dynamo` | [crates/custos-dynamo/CLAUDE.md](crates/custos-dynamo/CLAUDE.md) |
-| `custos-placement` | [crates/custos-placement/CLAUDE.md](crates/custos-placement/CLAUDE.md) |
-| `custos-consensus` | [crates/custos-consensus/CLAUDE.md](crates/custos-consensus/CLAUDE.md) |
-| `custos-cql` | [crates/custos-cql/CLAUDE.md](crates/custos-cql/CLAUDE.md) |
-| `custosd` | [crates/custosd/CLAUDE.md](crates/custosd/CLAUDE.md) |
-| `custos-cli` | [crates/custos-cli/CLAUDE.md](crates/custos-cli/CLAUDE.md) |
+| `animus-env` | [crates/animus-env/CLAUDE.md](crates/animus-env/CLAUDE.md) |
+| `animus-sim` | [crates/animus-sim/CLAUDE.md](crates/animus-sim/CLAUDE.md) |
+| `animus-storage` | [crates/animus-storage/CLAUDE.md](crates/animus-storage/CLAUDE.md) |
+| `animus-tablet` | [crates/animus-tablet/CLAUDE.md](crates/animus-tablet/CLAUDE.md) |
+| `animus-control` | [crates/animus-control/CLAUDE.md](crates/animus-control/CLAUDE.md) |
+| `animus-data` | [crates/animus-data/CLAUDE.md](crates/animus-data/CLAUDE.md) |
+| `animus-test` | [crates/animus-test/CLAUDE.md](crates/animus-test/CLAUDE.md) |
+| `animus-dynamo` | [crates/animus-dynamo/CLAUDE.md](crates/animus-dynamo/CLAUDE.md) |
+| `animus-placement` | [crates/animus-placement/CLAUDE.md](crates/animus-placement/CLAUDE.md) |
+| `animus-consensus` | [crates/animus-consensus/CLAUDE.md](crates/animus-consensus/CLAUDE.md) |
+| `animus-cql` | [crates/animus-cql/CLAUDE.md](crates/animus-cql/CLAUDE.md) |
+| `animusd` | [crates/animusd/CLAUDE.md](crates/animusd/CLAUDE.md) |
+| `animus-cli` | [crates/animus-cli/CLAUDE.md](crates/animus-cli/CLAUDE.md) |
 
 ## Commands
 
 ```sh
 cargo build --workspace --all-targets
 cargo test --workspace
-cargo test -p custos-control                       # one crate
-cargo test -p custos-control --test control_raft   # one test binary
-cargo test -p custos-control survives_leader_kill  # one test by name substring
+cargo test -p animus-control                       # one crate
+cargo test -p animus-control --test control_raft   # one test binary
+cargo test -p animus-control survives_leader_kill  # one test by name substring
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo fmt --all --check
 cargo deny check                                   # licenses + advisories (cargo install cargo-deny)
@@ -118,13 +118,13 @@ for GPG-signed commits.
 ### Replaying a failed simulation
 
 Every simulation run is a pure function of its seed. Tests print the seed in
-assertion messages; replay with `CUSTOS_SEED=<seed> cargo test <name>`. The
+assertion messages; replay with `ANIMUS_SEED=<seed> cargo test <name>`. The
 `Simulator` is driven by `Simulator::new(seed)`.
 
 ## The load-bearing constraint: determinism
 
 This is the single most important rule (ADR 0003). **All nondeterminism flows
-through the `Env` seam.** In every crate except `custos-env`'s `ProdEnv` and
+through the `Env` seam.** In every crate except `animus-env`'s `ProdEnv` and
 test code:
 
 - No wall clock — use `env.now()` / `env.sleep()`, never `std::time` or
@@ -141,16 +141,16 @@ test code:
 Components are generic over `E: Env` (monomorphized, never `dyn`). `Env` is a
 supertrait combining `Clock + Rng + Network + Disk + Spawner`, scoped to one
 node id. Production wiring uses `ProdEnv` (the only place real time/IO/RNG
-live); tests use `custos-sim`'s `SimEnv`.
+live); tests use `animus-sim`'s `SimEnv`.
 
 When a design decision changes, update the relevant ADR in `docs/adr/` in the
 same change.
 
 ## Architecture (the parts that span multiple files)
 
-### The `Env` seam and the simulator (`custos-env`, `custos-sim`)
+### The `Env` seam and the simulator (`animus-env`, `animus-sim`)
 
-`custos-sim::Simulator` owns one shared `SimState` (virtual clock, seeded
+`animus-sim::Simulator` owns one shared `SimState` (virtual clock, seeded
 ChaCha RNG, per-node network inboxes with delay/drop/partition, a fake disk
 distinguishing synced vs. un-synced bytes, and a cooperative run-queue). It
 hands out a `SimEnv` per node via `sim.env(node_id)`. The run loop polls ready
@@ -171,15 +171,15 @@ byte-identical-trace assertions.
 
 ### Two planes (ADR 0001)
 
-The **control plane** (`custos-control`) is consistent (Raft) and owns metadata
-(`Metadata` = membership + tablet map). The **data plane** (`custos-data`) is
+The **control plane** (`animus-control`) is consistent (Raft) and owns metadata
+(`Metadata` = membership + tablet map). The **data plane** (`animus-data`) is
 leaderless/AP and serves reads/writes. The decoupling is deliberate: the data
 plane coordinator routes from a **cached `TabletView`**, so a control-plane
 outage does not stop reads/writes — only topology changes (which bump a tablet's
 epoch) need the control plane. The integration test
-`custos-data/tests/two_plane.rs` exercises exactly this.
+`animus-data/tests/two_plane.rs` exercises exactly this.
 
-### Control-plane Raft (`custos-control`)
+### Control-plane Raft (`animus-control`)
 
 This is an **in-house Raft, not openraft** (ADR 0009) — openraft can't be driven
 deterministically by `SimEnv`. The split:
@@ -200,7 +200,7 @@ live image (`persist.rs`, `node.rs`); a follower behind the compacted prefix is
 caught up via a **chunked** `InstallSnapshot` (offset-addressed chunks of
 `SNAPSHOT_CHUNK_BYTES`, reassembled and installed atomically by the follower);
 recovery restores the snapshot and re-applies the tail. Restart-and-rejoin is
-tested end-to-end via `Simulator::stop` (`custos-control/tests/restart.rs`).
+tested end-to-end via `Simulator::stop` (`animus-control/tests/restart.rs`).
 
 The control plane also runs **heartbeat-based failure detection** (ADR 0012):
 members heartbeat the control group on an `Env` timer (`RaftMsg::Heartbeat`,
@@ -210,9 +210,9 @@ when a member falls silent past a timeout and `{Active}` when it recovers
 (idempotent, no flapping). Because the placement reconciler already reacts to
 `Down`, a detected failure **cascades** into automatic tablet re-placement —
 proven end-to-end (crash → `Down` → reconcile → restart → `Active`) in
-`custos-control/tests/failure_detection.rs`.
+`animus-control/tests/failure_detection.rs`.
 
-### Data plane (`custos-data`)
+### Data plane (`animus-data`)
 
 `serve_replica` runs a per-node replica over a `StorageEngine`, enforcing
 **epoch fencing**: an operation whose epoch is older than the replica's known
@@ -243,26 +243,26 @@ tombstone-aware `Sync`, so deletes propagate the same way writes do. The
 `repair.rs` test partitions a replica during a write/delete and asserts
 convergence both via a read and with no reads at all.
 
-### Placement & residency (`custos-placement`)
+### Placement & residency (`animus-placement`)
 
 A **pure, deterministic** policy engine (ADR 0005): given `Candidate`s (a node
 id + its topology labels) and a `PlacementPolicy` (replication factor +
 residency `required_labels` + optional failure-domain `SpreadPolicy`), it
 chooses a tablet's replica set — `select_replicas` for a fresh tablet,
 `replan` for a membership change (keeping eligible survivors so only the lost
-replica moves). It depends only on `NodeId` (no dep on `custos-control`, which
+replica moves). It depends only on `NodeId` (no dep on `animus-control`, which
 would be a cycle); the control plane builds candidates from `Active` membership,
 calls it, and commits the result as a `CasTabletReplicas`. Policies are
 **replicated in `Metadata`** (`SetTabletPolicy`) and the **leader reconciles
 automatically**: `RaftNode`'s `reconcile_loop` ticks on an `Env` timer and
 proposes corrective `CasTabletReplicas` from the pure `Metadata::reconcile`.
 End-to-end through real Raft under fault injection in
-`custos-control/tests/placement_reconcile.rs` (caller-driven) and
+`animus-control/tests/placement_reconcile.rs` (caller-driven) and
 `placement_auto_reconcile.rs` (automatic). Deferred: residency on the
 repair/handoff/backup paths, a cluster-default policy, and operator-facing
 policy management.
 
-### Transaction consensus (`custos-consensus`)
+### Transaction consensus (`animus-consensus`)
 
 A **first minimal slice** of Accord-style leaderless transactions (ADR 0011),
 built in the same shape as the control-plane Raft: a synchronous, I/O-free
@@ -294,9 +294,9 @@ via `resend_pending`; replicas `CommitAck` so a committed coordinator stops
 re-sending), so a lossy network no longer strands a transaction. A committed
 write transaction can also be wired to the **replicated data plane**
 (`AccordNode::start_with_data_plane`): on Apply its keys are written through the
-`custos-data` quorum coordinator at the execution timestamp, so the transaction's
+`animus-data` quorum coordinator at the execution timestamp, so the transaction's
 atomic, ordered effect becomes readable via ordinary data-plane quorum reads (no
-dependency cycle — `custos-data` does not depend on consensus).
+dependency cycle — `animus-data` does not depend on consensus).
 The driver's real-thread liveness (no mutex guard held across `.await`) is
 guarded by a multi-threaded `ProdEnv` regression test, since `SimEnv` proves
 order but not thread liveness. **Deferred:** the full dependency wait-graph, the
@@ -304,7 +304,7 @@ precise recovery ballot + duelling recoverers + a failure detector, WAL
 snapshotting, data-plane *reads*, and **sharded** (multi-tablet)
 transactions — see ADR 0011 and the crate guide.
 
-### Storage (`custos-storage`)
+### Storage (`animus-storage`)
 
 `StorageEngine` trait (put/get, `get_at` historical read, range scan, atomic
 batch, range delete, MVCC `Snapshot`). Backed by `MemoryEngine` (a `BTreeMap`
@@ -325,7 +325,7 @@ key absent. The trait is **async** (`#[async_trait]`): the I/O-ish methods are
 trait, while `snapshot()` / `latest_version()` stay synchronous. **Version
 contract:** writers assign strictly increasing versions (enforced via
 `NonMonotonicVersion`); given that, a snapshot taken at version `v` is isolated
-from later writes. A `cargo bench -p custos-storage` harness measures engine
+from later writes. A `cargo bench -p animus-storage` harness measures engine
 throughput/latency over `ProdEnv`.
 
 ### A node's inbox is single-consumer

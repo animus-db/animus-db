@@ -1,0 +1,33 @@
+[package]
+name = "animus-storage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "AnimusDB StorageEngine trait + in-memory implementation."
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait.workspace = true
+thiserror.workspace = true
+animus-env.workspace = true
+crc32fast.workspace = true
+lz4_flex.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+
+[dev-dependencies]
+animus-sim.workspace = true
+futures.workspace = true
+proptest.workspace = true
+tokio = { workspace = true }
+
+# A hand-rolled throughput/latency benchmark (no external bench framework), run
+# with `cargo bench -p animus-storage`. `harness = false` => it's a plain `main`.
+[[bench]]
+name = "engine_bench"
+harness = false

@@ -8,7 +8,7 @@
 A production storage engine (an LSM tree with compaction, bloom filters, a WAL,
 and crash recovery) is a multi-year effort and a solved problem with mature Rust
 options (RocksDB via `rust-rocksdb`, or the pure-Rust `fjall`). The novel risk
-and differentiation of CustosDB live in the **distributed** layer — quorums,
+and differentiation of AnimusDB live in the **distributed** layer — quorums,
 tablets, placement, consensus — not in local storage.
 
 ## Decision
@@ -20,7 +20,7 @@ backend was then borrowed behind the same trait, feature-gated, without touching
 the distributed code: the pure-Rust **`fjall` LSM** (`FjallEngine`, feature
 `fjall`). It proved the trait was portable to a real on-disk engine, but it could
 not be driven by `SimEnv` (it does its own real I/O outside the `Env` seam), so
-once the custom `LsmEngine` below landed and was wired into `custosd`, the
+once the custom `LsmEngine` below landed and was wired into `animusd`, the
 borrowed `FjallEngine` and the `fjall` dependency were **removed** — the project
 relies only on its own engines now.
 
@@ -78,8 +78,8 @@ manifest that still lists the segment (intact) or an orphan covered segment belo
 the live set whose records are already in the SSTable (ignored). Recovery also
 replays any segment file present beyond the manifest's recorded set — writes acked
 after the last flush — so an un-flushed segment is never lost. These are tested
-under fault injection in `custos-storage/tests/lsm_crash.rs` and
-`custos-storage/tests/lsm_wal_rotation.rs`.
+under fault injection in `animus-storage/tests/lsm_crash.rs` and
+`animus-storage/tests/lsm_wal_rotation.rs`.
 
 ## Consequences
 
@@ -95,21 +95,21 @@ under fault injection in `custos-storage/tests/lsm_crash.rs` and
   the borrowed `fjall`, its crash-recovery story is exercised deterministically
   under `SimEnv`, closing the gap where durability could previously only be
   asserted at the in-memory simulation layer.
-- **The runnable node (`custosd`) now backs its data-plane replicas with
+- **The runnable node (`animusd`) now backs its data-plane replicas with
   `LsmEngine` over `ProdEnv` by default**, so the data plane is durable
   end-to-end — a value acked to a client survives a process restart (the engine
   recovers from its on-disk WAL/SSTables/manifest on reopen), matching the
   control plane, which already persists its Raft WAL. The volatile `MemoryEngine`
   remains the simulator's engine and is selectable for ephemeral runs via
-  `custosd --ephemeral`. The data role's `ProdEnv` dir is dedicated to the engine,
+  `animusd --ephemeral`. The data role's `ProdEnv` dir is dedicated to the engine,
   so its files use a flat filename prefix (`db-…`), not a subdirectory (`ProdEnv`
   opens files without creating intermediate directories — though `ProdEnv` now
   `create_dir_all`s a file's parent on `append`/`replace`, so a slash-bearing
   prefix would also work). End-to-end durability across a real restart is
-  asserted in `custosd/tests/durable_restart.rs`, which restarts the node in the
+  asserted in `animusd/tests/durable_restart.rs`, which restarts the node in the
   same runtime via `Node::shutdown()` (a clean teardown → rebind → recover cycle).
 - **An ack must mean the write durably applied.** The data replica
-  (`custos-data`'s `serve_replica`) now propagates the storage result into its
+  (`animus-data`'s `serve_replica`) now propagates the storage result into its
   reply: a `WriteAck`/`DeleteAck` is `ok: true` only when
   `StorageEngine::merge`/`merge_tombstone` returned `Ok` (a superseded no-op,
   `Ok(false)`, still counts — the durable state already reflects a newer write),
@@ -119,7 +119,7 @@ under fault injection in `custos-storage/tests/lsm_crash.rs` and
   falsely reported as committed. The coordinator only counts `ok` acks, so a
   quorum write/delete now fails rather than lying when fewer than W replicas
   could persist (asserted under `SimEnv` with a failing-engine test double in
-  `custos-data/tests/ack_durability.rs`).
+  `animus-data/tests/ack_durability.rs`).
 - **Done since (performance work that does not touch the trait or correctness):**
   per-SSTable **Bloom filters** (hand-rolled FNV-1a double-hashing bit vector,
   persisted in the manifest; a point-miss inside a table's key range now reads
@@ -127,7 +127,7 @@ under fault injection in `custos-storage/tests/lsm_crash.rs` and
   `lsm_semantics.rs`) and **leveled compaction** (L0 overlapping flush tier; L1+
   non-overlapping runs; crash-safe at the same single manifest swap; the
   differential proptest and all crash tests stay green). A **benchmark harness**
-  (`benches/engine_bench.rs`, `cargo bench -p custos-storage`) measures
+  (`benches/engine_bench.rs`, `cargo bench -p animus-storage`) measures
   put/get/scan throughput + latency and flush/compaction cost of `LsmEngine` over
   `ProdEnv` against `MemoryEngine` — no new runtime dependency (hand-rolled
   timing; `tokio` is a dev-dependency only).

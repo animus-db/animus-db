@@ -1,12 +1,12 @@
-# CustosDB
+# AnimusDB
 
-[![CI](https://github.com/custosdb/custosdb/actions/workflows/ci.yml/badge.svg)](https://github.com/custosdb/custosdb/actions/workflows/ci.yml)
+[![CI](https://github.com/animusdb/animusdb/actions/workflows/ci.yml/badge.svg)](https://github.com/animusdb/animusdb/actions/workflows/ci.yml)
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
 
 > **Status: pre-alpha, foundational.** Not usable as a database yet. The work in
 > progress is the distributed core and its deterministic test harness.
 
-**CustosDB** is a masterless, linearly-scalable, open-source NoSQL database
+**AnimusDB** is a masterless, linearly-scalable, open-source NoSQL database
 written in Rust (no JVM). It descends from the Dynamo lineage shared by Cassandra
 and DynamoDB: a wide-column / key-value model over a partitioned, sorted
 *map-of-maps* storage primitive.
@@ -50,38 +50,38 @@ data nodes keep serving on cached metadata; only topology changes block. See
 
 | Crate | Purpose |
 |-------|---------|
-| `custos-env` | `Env` traits + `ProdEnv` (real clock/net/disk/spawn) |
-| `custos-sim` | Deterministic simulator: virtual clock, in-memory net, fake disk, scheduler, fault injection |
-| `custos-storage` | `StorageEngine` trait + in-memory `BTreeMap` impl + custom on-disk `LsmEngine` (WAL/SSTable/compaction over the `Env` seam) |
-| `custos-control` | Control-plane RSM: Raft, metadata model, epochs |
-| `custos-data` | Leaderless data plane: quorum read/write, routing, epoch fencing |
-| `custos-tablet` | Tablet model (key ranges, replica sets, epochs) |
-| `custos-placement` | Placement groups + topology labels + residency *(later)* |
-| `custos-consensus` | Accord-style transactional escalation *(later)* |
-| `custos-cql` | CQL (Cassandra) wire adapter *(later)* |
-| `custos-dynamo` | DynamoDB-style item API over the common core (wire protocol later) |
-| `custos-test` | Elle-style history recorder + checker |
-| `custosd` | Node server: assembles control + data + a client API over `ProdEnv` (runnable `--cluster` mode) |
-| `custos-cli` | Operator/client CLI (`status` / `put` / `get`) |
+| `animus-env` | `Env` traits + `ProdEnv` (real clock/net/disk/spawn) |
+| `animus-sim` | Deterministic simulator: virtual clock, in-memory net, fake disk, scheduler, fault injection |
+| `animus-storage` | `StorageEngine` trait + in-memory `BTreeMap` impl + custom on-disk `LsmEngine` (WAL/SSTable/compaction over the `Env` seam) |
+| `animus-control` | Control-plane RSM: Raft, metadata model, epochs |
+| `animus-data` | Leaderless data plane: quorum read/write, routing, epoch fencing |
+| `animus-tablet` | Tablet model (key ranges, replica sets, epochs) |
+| `animus-placement` | Placement groups + topology labels + residency *(later)* |
+| `animus-consensus` | Accord-style transactional escalation *(later)* |
+| `animus-cql` | CQL (Cassandra) wire adapter *(later)* |
+| `animus-dynamo` | DynamoDB-style item API over the common core (wire protocol later) |
+| `animus-test` | Elle-style history recorder + checker |
+| `animusd` | Node server: assembles control + data + a client API over `ProdEnv` (runnable `--cluster` mode) |
+| `animus-cli` | Operator/client CLI (`status` / `put` / `get`) |
 
 ## Running a cluster
 
 In one process (dev convenience):
 
 ```sh
-cargo run -p custosd --bin custosd -- --cluster 3   # prints each node's client address
-cargo run -p custos-cli -- status 127.0.0.1:<port>
-cargo run -p custos-cli -- put    127.0.0.1:<port> mykey myvalue
-cargo run -p custos-cli -- get    127.0.0.1:<port> mykey
+cargo run -p animusd --bin animusd -- --cluster 3   # prints each node's client address
+cargo run -p animus-cli -- status 127.0.0.1:<port>
+cargo run -p animus-cli -- put    127.0.0.1:<port> mykey myvalue
+cargo run -p animus-cli -- get    127.0.0.1:<port> mykey
 ```
 
 One process per node (real deployment) — generate a config once, then run a
 process per node with a distinct `--node` index (on one host or many):
 
 ```sh
-custosd gen-config --nodes 3 --host 10.0.0.1 > cluster.json
-custosd --config cluster.json --node 0      # on each node, with a distinct --node
-custos status 10.0.0.1:<node-0 client port>
+animusd gen-config --nodes 3 --host 10.0.0.1 > cluster.json
+animusd --config cluster.json --node 0      # on each node, with a distinct --node
+animus status 10.0.0.1:<node-0 client port>
 ```
 
 ## Building
@@ -94,7 +94,7 @@ cargo fmt --check
 ```
 
 A reproducible simulation test that fails prints its seed; re-run it with
-`CUSTOS_SEED=<seed> cargo test <name>` to replay the exact history.
+`ANIMUS_SEED=<seed> cargo test <name>` to replay the exact history.
 
 ## License & contributing
 

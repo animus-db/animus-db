@@ -10,7 +10,7 @@
 
 ## Context
 
-CustosDB's data plane is leaderless and AP (ADR 0001): it serves single-key
+AnimusDB's data plane is leaderless and AP (ADR 0001): it serves single-key
 reads/writes with tunable quorums and converges via repair/anti-entropy (ADR
 0010). That gives no multi-key atomicity and no strict serialization order — the
 job of a *transaction* layer. The bootstrap brief earmarks **Accord** (Apache
@@ -33,7 +33,7 @@ correctness we can demonstrate, not a broad sketch.
 
 ## Decision
 
-Implement a **first, minimal slice** of Accord in `custos-consensus`, mirroring
+Implement a **first, minimal slice** of Accord in `animus-consensus`, mirroring
 the control-plane Raft architecture:
 
 - `core::AccordCore` is a **synchronous, I/O-free** state machine. It holds the
@@ -78,7 +78,7 @@ earlier one as a dependency.
 - We have a real, deterministic, seed-reproducible Accord increment that fits
   the established sync-core / `Env`-driver shape, so it slots into the simulator
   exactly like the control plane. Tests live in
-  `custos-consensus/tests/accord_commit.rs` (single-txn fast-path commit;
+  `animus-consensus/tests/accord_commit.rs` (single-txn fast-path commit;
   conflicting-txn consistent order, including a 64-seed sweep; disjoint-txn
   independence; trace reproducibility).
 - The fast-path quorum is a **conservative `ceil(3N/4)`** placeholder, not
@@ -116,7 +116,7 @@ The second increment takes the slice from "commits a timestamp + deps" to
   order-insensitive (the per-record merge is commutative for our fields), so the
   driver may flush from either `submit` or the recv loop.
 
-Tests added in `custos-consensus/tests/accord_execute.rs`: conflicting
+Tests added in `animus-consensus/tests/accord_execute.rs`: conflicting
 transactions execute in a consistent order with a converged store (single seed +
 a 48-seed sweep including a slow-path third coordinator), replica restart
 recovers executed state from disk, and execution-path trace reproducibility.
@@ -131,7 +131,7 @@ recovers executed state from disk, and execution-path trace reproducibility.
     assumes a reliable enough network to gather a quorum; lost messages can stall
     a transaction), and **sharding/placement** (one global replica set — every
     transaction goes to every node; no tablet/partition routing yet).
-  - **The Elle cycle checker** (`custos-test`) is *not* yet wired to this path;
+  - **The Elle cycle checker** (`animus-test`) is *not* yet wired to this path;
     now that a real execution history exists, wiring it is the natural next step.
 - The clean sync-core boundary held: execution and durability slotted in behind
   the existing `handle`/`submit` entry points and the `Env`-driver, exactly as
@@ -147,7 +147,7 @@ sync-core / `Env`-driver split.
 
 - **Storage-backed execution.** Execution still happens in the same agreed
   `(execute_at, txn)` order, but the *effect* is now applied to a real (async)
-  `custos-storage::StorageEngine` instead of an opaque in-core map. The sync
+  `animus-storage::StorageEngine` instead of an opaque in-core map. The sync
   `AccordCore` keeps deciding the order: when a transaction becomes applicable it
   pushes an `ApplyEffect { txn, keys, version }` into a `pending_apply` buffer
   (`version` is the transaction's `execute_at.logical`); the `AccordNode<E, S>`
@@ -159,7 +159,7 @@ sync-core / `Env`-driver split.
   execution order into a *fresh*, volatile engine) converges to the identical
   store. The node defaults to the in-memory `MemoryEngine` used under simulation;
   `AccordNode::start_with_storage` accepts any engine. The crate now depends on
-  `custos-storage` (no cycle — storage does not depend on consensus).
+  `animus-storage` (no cycle — storage does not depend on consensus).
 
 - **Coordinator failover (first slice).** A coordinator that dies after
   PreAccept/Accept but before the replicas learn the `Commit` no longer strands
@@ -190,7 +190,7 @@ sync-core / `Env`-driver split.
   *trigger* recovery, are out of scope; recovery is invoked explicitly (e.g. by a
   test).
 
-  Tests in `custos-consensus/tests/accord_recover.rs`: a stalled/partitioned
+  Tests in `animus-consensus/tests/accord_recover.rs`: a stalled/partitioned
   coordinator's transaction recovered to a consistent commit + execution on the
   survivors (single seed + a 32-seed sweep), recovery adopting an
   already-committed decision verbatim (idempotent), and recovery-path trace
@@ -201,7 +201,7 @@ sync-core / `Env`-driver split.
 - **Still deferred after this increment:** the full transitive dependency
   wait-graph, the precise Accord recovery ballot rules + duelling recoverers + a
   failure detector to trigger recovery, WAL snapshotting / log truncation,
-  integration with the *live* data-plane replicas (`custos-data`) and read
+  integration with the *live* data-plane replicas (`animus-data`) and read
   transactions (execution is backed by a per-node consensus store, not yet the
   shared data plane), contention/livelock handling and timeouts/retries, and
   sharding/placement (one global replica set). The Elle cycle checker is still
@@ -230,7 +230,7 @@ sync-core / `Env`-driver split.
   and the `PreAccepted`/`Committed` WAL records, so it survives recovery (a
   recovered read re-runs its `get_at` in the recovered execution order). The
   observed per-key writer ids are exposed via `AccordNode::read_result(txn)`.
-  Tests in `custos-consensus/tests/accord_read.rs` (under `SimEnv`): a read
+  Tests in `animus-consensus/tests/accord_read.rs` (under `SimEnv`): a read
   observes the write ordered before it and not the one after; a read of an
   unwritten key observes nothing; the read snapshot is identical on every
   replica across a 48-seed sweep; the read result recovers from disk; and the
@@ -244,7 +244,7 @@ sync-core / `Env`-driver split.
   core lock only briefly to drain (`drain_persist`/`drain_apply`/`drain_reads`),
   drops it, and does all I/O lock-free inside a spawned task — no guard is held
   across any `.await`, and there is no custom future/waker. To lock that in,
-  `custos-consensus/tests/accord_concurrent.rs` drives several Accord replicas
+  `animus-consensus/tests/accord_concurrent.rs` drives several Accord replicas
   over the **real multi-threaded `ProdEnv`** (tokio multi-thread runtime + real
   TCP + real disk) with multiple coordinators concurrently committing conflicting
   transactions, guarded by `tokio::time::timeout` so a strand fails loudly
@@ -284,14 +284,14 @@ integration** — again without reshaping the sync-core / `Env`-driver split.
   it only decides *what* to re-send; the driver (no lock held across the
   `.await`) does the I/O. Determinism is preserved: the retry timer is an `Env`
   timer and the run remains byte-reproducible from its seed. Tests in
-  `custos-consensus/tests/accord_retry.rs` inject a **lossy** network (an
+  `animus-consensus/tests/accord_retry.rs` inject a **lossy** network (an
   independent per-message drop probability) and assert a transaction — and two
   conflicting transactions, across a seed sweep — still commit and execute in a
   consistent order on every replica.
 
 - **The data-plane frontier — Accord over the replicated data plane.** A
   committed transaction's *write effect* can now land in the leaderless AP **data
-  plane** (`custos-data`), not only a per-node consensus store. An `AccordNode`
+  plane** (`animus-data`), not only a per-node consensus store. An `AccordNode`
   started via `AccordNode::start_with_data_plane(env, all_nodes, storage,
   coordinator_env, view)` carries a `DataSink { DataClient, TabletView }`: on
   Apply, for each key a committed *write* transaction touches, the node writes the
@@ -305,10 +305,10 @@ integration** — again without reshaping the sync-core / `Env`-driver split.
   made durable across the replicated AP store. The local `StorageEngine` is kept
   as the per-node recovery substrate (and recovery re-applies into it only, since
   the data plane already holds the committed writes durably); the sink is purely
-  additive. **No dependency cycle:** `custos-consensus` depends on `custos-data`,
+  additive. **No dependency cycle:** `animus-consensus` depends on `animus-data`,
   which does not depend on consensus. The node inbox is single-consumer, so the
   data-plane coordinator runs on a **distinct node id** from the Accord replica.
-  Tests in `custos-consensus/tests/accord_data_plane.rs` assemble Accord
+  Tests in `animus-consensus/tests/accord_data_plane.rs` assemble Accord
   coordinators + data-plane replicas under `SimEnv` and prove: a **multi-key**
   transaction's writes are all readable via quorum reads at its id; an untouched
   key is absent; and two conflicting multi-key transactions land **atomically and

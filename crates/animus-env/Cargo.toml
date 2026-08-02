@@ -1,0 +1,18 @@
+[package]
+name = "animus-env"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "AnimusDB Env seam: Clock/Rng/Network/Disk/Spawner traits + ProdEnv."
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait.workspace = true
+tokio.workspace = true
+rand.workspace = true
+tracing.workspace = true

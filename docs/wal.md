@@ -1,8 +1,8 @@
 # The control-plane write-ahead log (WAL)
 
-How `custos-control` makes its Raft state durable: the per-node WAL, how it is
+How `animus-control` makes its Raft state durable: the per-node WAL, how it is
 written, compacted, and recovered. See also
-[ADR 0009](adr/0009-in-house-raft-over-env.md) and `crates/custos-control`
+[ADR 0009](adr/0009-in-house-raft-over-env.md) and `crates/animus-control`
 (`persist.rs`, `raft.rs`, `node.rs`).
 
 The design keeps the consensus logic in a pure, I/O-free `RaftCore`: the core
@@ -132,6 +132,6 @@ its snapshot base, and resumes from there.
 The snapshot ships in a single message (no chunked transfer), and a full
 in-simulation process *restart-and-rejoin* is still pending — the simulator
 can't yet stop and replace a node's tasks, so recovery is validated at the
-`RaftCore` level (see `crates/custos-control/tests/wal_compaction.rs`,
+`RaftCore` level (see `crates/animus-control/tests/wal_compaction.rs`,
 `tests/persistence.rs`, and `tests/install_snapshot.rs`). Tracked in
 [ADR 0009](adr/0009-in-house-raft-over-env.md).

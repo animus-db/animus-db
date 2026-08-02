@@ -1,4 +1,4 @@
-# CustosDB — Cargo workspace root.
+# AnimusDB — Cargo workspace root.
 #
 # A masterless, linearly-scalable NoSQL database in Rust. See README.md and the
 # architecture decision records under docs/adr/ for the design rationale.
@@ -11,23 +11,23 @@ version = "0.0.0"
 edition = "2024"
 rust-version = "1.85"
 license = "AGPL-3.0-only"
-repository = "https://github.com/custosdb/custosdb"
-authors = ["The CustosDB Authors"]
+repository = "https://github.com/animusdb/animusdb"
+authors = ["The AnimusDB Authors"]
 
 [workspace.dependencies]
 # Internal crates (path deps so the workspace builds standalone).
-custos-env = { path = "crates/custos-env" }
-custos-sim = { path = "crates/custos-sim" }
-custos-storage = { path = "crates/custos-storage" }
-custos-control = { path = "crates/custos-control" }
-custos-data = { path = "crates/custos-data" }
-custos-tablet = { path = "crates/custos-tablet" }
-custos-placement = { path = "crates/custos-placement" }
-custos-consensus = { path = "crates/custos-consensus" }
-custos-cql = { path = "crates/custos-cql" }
-custos-dynamo = { path = "crates/custos-dynamo" }
-custos-test = { path = "crates/custos-test" }
-custosd = { path = "crates/custosd" }
+animus-env = { path = "crates/animus-env" }
+animus-sim = { path = "crates/animus-sim" }
+animus-storage = { path = "crates/animus-storage" }
+animus-control = { path = "crates/animus-control" }
+animus-data = { path = "crates/animus-data" }
+animus-tablet = { path = "crates/animus-tablet" }
+animus-placement = { path = "crates/animus-placement" }
+animus-consensus = { path = "crates/animus-consensus" }
+animus-cql = { path = "crates/animus-cql" }
+animus-dynamo = { path = "crates/animus-dynamo" }
+animus-test = { path = "crates/animus-test" }
+animusd = { path = "crates/animusd" }
 
 # Third-party.
 serde = { version = "1", features = ["derive"] }

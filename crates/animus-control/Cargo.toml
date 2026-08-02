@@ -1,0 +1,24 @@
+[package]
+name = "animus-control"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "AnimusDB control plane: Raft-replicated metadata state machine."
+
+[lints]
+workspace = true
+
+[dependencies]
+animus-env.workspace = true
+animus-tablet.workspace = true
+animus-placement.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+futures.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+animus-sim.workspace = true
