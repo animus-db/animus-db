@@ -27,6 +27,9 @@ fn opts() -> LsmOptions {
         compaction_trigger: 3,
         target_table_bytes: 512,
         level_fanout: 2,
+        // Small so the WAL rolls into several segments and crash recovery exercises
+        // multi-segment replay + the GC path.
+        wal_segment_bytes: 96,
     }
 }
 

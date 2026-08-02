@@ -56,9 +56,10 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
   binary codec** — `CMF1` magic + version, big-endian ints + length-prefixed
   byte strings — not JSON; a legacy JSON manifest, which starts with `{`, is
   still decoded for forward-compat — see `encode_manifest`/`decode_manifest` in
-  `lsm.rs`), `wal` (each write `append`+`sync`ed
-  *before* it returns, so an ack means durable; mirrors the Raft WAL pattern),
-  and `sst-NNNNNN` (immutable, sorted, **per-block CRC32** via `crc32fast`, with
+  `lsm.rs`; the manifest also records the **live WAL segment numbers**, format v2),
+  `wal-NNNNNN` (the WAL split into **rotating numbered segments** — each write
+  `append`+`sync`ed *before* it returns, so an ack means durable; mirrors the Raft
+  WAL pattern), and `sst-NNNNNN` (immutable, sorted, **per-block CRC32** via `crc32fast`, with
   an in-file block index + footer, plus a per-table **Bloom filter** in the
   manifest; point reads fetch one block with `read_at`, never the whole file).
   Each data block is **LZ4-compressed** (`lz4_flex`, pure-Rust/MIT, safe-only
@@ -68,7 +69,8 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
   and `read_block` decodes either, so old tables still read.
   Writes go to the WAL then the in-memory memtable (`BTreeMap` MVCC, same shape as
   `MemoryEngine`); a size threshold flushes the memtable to an SSTable, then swaps
-  the manifest and starts a fresh WAL. **Leveled compaction** (`lsm.rs`):
+  the manifest (recording the surviving WAL segments) and `remove`s the WAL
+  segments the flush fully covered. **Leveled compaction** (`lsm.rs`):
   tables carry a `level`; L0 is the overlapping flush tier, L1+ hold
   non-overlapping runs (re-partitioned on key boundaries to ≈`target_table_bytes`),
   so read amplification is bounded by level count. L0→L1 fires at
@@ -87,12 +89,30 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
   brief lock first — then takes the lock again only to mutate in-memory state.
   This keeps futures `Send` and ordering deterministic (ADR 0003). Block bytes
   are read from disk outside any lock.
+- **WAL segment rotation** (`lsm/wal.rs`): the WAL is a sequence of numbered
+  segment files `wal-NNNNNN`, not one growing file. The `GroupCommit` leader
+  appends each batch to the **active** segment and rolls to a fresh one past
+  `LsmOptions::wal_segment_bytes`, sealing the old segment with the highest
+  `wal_seq` it holds. A flush computes the segments fully covered by its watermark
+  (`segments_covered_by`), records the **survivors** in the manifest *before* the
+  swap, then `remove`s the covered files and `forget_segments`. The old
+  single-file truncation path (`begin_truncate`/`finish_truncate`/WAL `replace`) is
+  gone. Recovery (`discover_wal_segments` + replay in `open_with`) replays the
+  manifest's live segments plus any contiguous segment files present beyond the
+  highest recorded one (acked writes since the last flush, or a crash mid-GC), so
+  it reconstructs the memtable exactly as the single-file replay did; a directory
+  with no recorded segments falls back to replaying a legacy single-file
+  `<prefix>wal` (upgrade path). The seq space is monotonic for the engine's life
+  (rotation/GC never reset it).
 - **Crash safety** holds at the manifest swap: a crash mid-flush or
-  mid-compaction recovers the last durable manifest + the intact WAL — the orphan
-  SSTable (un-synced, never manifest-referenced, at a seq beyond the manifest's
-  `next_seq`) is ignored; no torn-table read is possible because a table is only
-  read once a *synced* manifest names it. Argued in `lsm.rs` module docs,
-  exercised in `lsm_crash.rs`.
+  mid-compaction recovers the last durable manifest + the intact WAL segments — the
+  orphan SSTable (un-synced, never manifest-referenced, at a seq beyond the
+  manifest's `next_seq`) is ignored; no torn-table read is possible because a table
+  is only read once a *synced* manifest names it. WAL GC is safe at the same swap:
+  a segment is `remove`d only after a manifest not naming it is durable, so a crash
+  mid-GC recovers a manifest that still lists it (intact) or an orphan covered
+  segment *below* the live set (ignored — its data is in the SSTable). Argued in
+  `lsm.rs` module docs, exercised in `lsm_crash.rs` + `lsm_wal_rotation.rs`.
 
 ## Tests & benchmark
 
@@ -108,9 +128,14 @@ asserting a point-miss inside a table's key range reads **zero** blocks; and
 `lsm_crash.rs` fault-injects crashes (synced writes survive; a flushed SSTable
 survives; mid-flush and mid-compaction crashes lose nothing) and asserts
 flush + leveled compaction actually happen (L0 bounded by the trigger, L1+
-non-overlapping) — all seed-reproducible. `LsmEngine` exposes `#[doc(hidden)]`
+non-overlapping) — all seed-reproducible. `lsm_wal_rotation.rs` covers segment
+rotation specifically: writes spanning multiple segments, a flush removing the
+covered segment files, multi-segment recovery restoring all acked data (across
+SSTables + live WAL segments), and a crash mid-rotation recovering correctly
+(including idempotent re-recovery). `LsmEngine` exposes `#[doc(hidden)]`
 `sstable_count`/`flush_count`/`compaction_count`/`block_read_count`/
 `reset_block_reads`/`level_table_counts`/`levels_non_overlapping`/
+`wal_segment_count`/`wal_segments`/`wal_batch_sync_count`/
 `test_write_orphan_sstable` introspection helpers for these tests.
 
 `lsm_concurrent.rs` is a **real multi-threaded** regression (`#[tokio::test(flavor
