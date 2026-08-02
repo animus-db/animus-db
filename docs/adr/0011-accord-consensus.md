@@ -5,14 +5,18 @@
   multi-thread liveness regression; then message retry + the data-plane frontier;
   then data-plane reads + an interactive transaction API; then sharded
   transactions + read-set dependency folding + adaptive retry backoff; then
-  arbitrary caller-supplied write values)
+  arbitrary caller-supplied write values; then recovery ballots + duelling
+  recoverers; then a **failure detector** that auto-triggers recovery + commit-ballot
+  fencing)
 - **Date:** 2026-08-01 (execution + durability increment: 2026-08-01;
   storage-backed execution + coordinator-failover increment: 2026-08-01;
   read-transactions + multi-thread-liveness increment: 2026-08-02;
   message-retry + data-plane-frontier increment: 2026-08-02;
   data-plane-reads + interactive-transaction-API increment: 2026-08-02;
   sharded-transactions + read-set-folding + adaptive-backoff increment:
-  2026-08-02; arbitrary-write-values increment: 2026-08-02)
+  2026-08-02; arbitrary-write-values increment: 2026-08-02;
+  recovery-ballots + duelling-recoverers increment: 2026-08-02;
+  failure-detector-triggered-recovery + commit-ballot-fencing increment: 2026-08-02)
 
 ## Context
 
@@ -600,3 +604,91 @@ this slice makes **concurrent recovery coordinators converge deterministically**
   fast-path-recovery rules; the precise `PreAcceptOk`-witness fast-path-recovery
   decision procedure remains a simplification (we always force the slow path on
   re-proposal).
+
+## Failure-detector-triggered recovery + commit-ballot fencing (2026-08-02)
+
+This increment closes the **failure detector to *trigger* recovery** deferral the
+previous slices left open: recovery ballots made *concurrent* recoveries safe, but
+recovery was still invoked **explicitly** — nothing declared a coordinator dead.
+The `AccordNode` driver now does, again without reshaping the sync-core /
+`Env`-driver split.
+
+- **A driver-side failure detector.** Alongside the recv loop and the retry tick,
+  `AccordNode` runs a periodic **liveness tick** on an `Env` timer. Each tick it
+  asks the sync core for the transactions this replica holds **un-committed**
+  (`AccordCore::uncommitted_txns`, phase `< Committed`) and re-samples a monotone
+  per-transaction **progress fingerprint** (`AccordCore::progress_fingerprint` —
+  phase + execute_at + dep/promised-ballot summary, strictly increasing on any
+  advance). A transaction whose fingerprint *changes* between ticks is making
+  progress, so the stall counter resets — a **slow-but-live coordinator is never
+  spuriously recovered**. Only a transaction stuck at the same fingerprint for a
+  whole bound (`LIVENESS_INTERVAL × LIVENESS_STALL_TICKS`, ≈5s) is suspected
+  stranded. The core stays synchronous + I/O-free and time-free: it only reports
+  *what* is un-committed and its progress summary; the driver owns the clock and
+  the bound (no wall clock — `env.now`/`env.sleep`/`env.spawn_task`).
+
+- **Deterministic nominee to keep duels rare.** When the bound trips, the driver
+  does not blindly self-recover: it asks `AccordCore::is_recovery_nominee(txn,
+  tier)` whether *this* node is the designated recoverer. The candidates are the
+  replica set with the transaction's **original coordinator** (`txn.node`, the
+  minting node, presumed dead) removed, ascending by id; the tier-0 nominee is the
+  lowest-id survivor, so in the common case exactly **one** node recovers each
+  stranded transaction — no duel. If that nominee is itself dead/partitioned, the
+  next full stall window promotes the next **tier** (the next-lowest survivor),
+  until recovery lands. When duels *do* still occur, the **ballot** machinery makes
+  them safe and convergent; the nominee only reduces their frequency.
+
+- **Commit-ballot fencing (a safety fix the detector exposed).** A `Commit` now
+  carries the **ballot** it was decided under (`Ballot::ZERO` for the original
+  coordinator, the recovery ballot otherwise). A replica records the highest
+  commit-ballot it has seen and **ignores a `Commit` whose ballot is below it**
+  (`AccordCore::replica_commit`, durable via `WalRecord::Committed.commit_ballot` /
+  `PersistedTxn.commit_ballot`). This closes the **heal race** the detector can
+  provoke: if a coordinator is only transiently partitioned and a survivor recovers
+  its transaction at a higher ballot, the original's late `Ballot::ZERO` `Commit`
+  (re-driven by its own retry tick after a heal) can no longer **revert** the
+  recovered decision. (`Accept` was already ballot-fenced; `Commit` was not.)
+
+- **The bound is set by a real workload interaction, not just latency.** A
+  *replica* can only watch its own view of a transaction it does not coordinate,
+  which advances solely on a phase change — it cannot see the coordinator slowly
+  gathering a same-timestamp `PreAcceptOk` quorum, so *slow-but-live* and *dead*
+  are indistinguishable except by elapsed time. The bound must therefore exceed a
+  realistic slow-commit / partition-and-heal window: recovering a transaction that
+  *would* have committed at its original `t0` re-orders it **after** every
+  conflicting transaction committed in the meantime (`replica_pre_accept` bumps the
+  recovered timestamp past them), which for a **single-writer list-append**
+  workload (ADR 0014 / `animus-test`) lets a stale earlier write land last and lose
+  later appends. A genuinely dead coordinator (crash/stop) never heals, so it is
+  recovered after the bound; ~5s of recovery latency for a dead coordinator is
+  acceptable, and correctness rests on the ballot fence + the bound exceeding the
+  live-but-slow window, not on the exact value. (This interaction was caught by the
+  frozen corpus — `wide_write`/`isolate_one` scenarios — when an over-aggressive
+  600ms bound recovered slow-but-live coordinators.)
+
+- **All public signatures stayed additive.** `AccordNode::recover` /
+  `AccordCore::recover` are unchanged; the new core methods (`uncommitted_txns`,
+  `progress_fingerprint`, `is_recovery_nominee`, `is_driving`, `is_uncommitted`)
+  are additive; the `Commit.ballot` wire field and `WalRecord::Committed.commit_
+  ballot` are `#[serde(default)]` (absent ⇒ `Ballot::ZERO`), so older wire/WAL
+  bytes remain readable. `AccordCore` stays synchronous + I/O-free.
+
+- **Tests** in `animus-consensus/tests/accord_auto_recover.rs` (5-node cluster,
+  `SimEnv`, every long run bounded by `run_for`): a coordinator that dies after
+  `PreAccept` is **auto-recovered within the bound** (no explicit `recover`) and
+  commits + executes on every survivor; escalating auto-recoverers **converge** to
+  one decision (ballots); a **slow-but-progressing** coordinator is **not**
+  spuriously recovered (the nominee records no decision) and a healthy cluster
+  never auto-recovers; auto-recovery **preserves arbitrary write values**; and the
+  run is reproducible from its seed. The whole existing suite stays green,
+  including the frozen Elle corpus (`animus-test`).
+
+- **Still deferred after this increment:** the full transitive dependency
+  wait-graph; WAL snapshotting / log truncation; the precise fast-path quorum
+  bound; the precise `PreAcceptOk`-witness fast-path-recovery decision (we still
+  force the slow path on re-proposal); per-shard consensus replica sets / placement
+  (one global Accord group); and an **adaptive / membership-aware** failure
+  detector (the bound is a fixed virtual-time threshold and the nominee assumes the
+  whole replica set is alive — a real detector would use heartbeats / a liveness
+  oracle rather than a per-txn stall timer, and would not need a bound large enough
+  to absorb a partition-and-heal window).

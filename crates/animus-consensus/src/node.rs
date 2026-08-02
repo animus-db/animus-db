@@ -64,6 +64,48 @@ const RETRY_BASE_INTERVAL: Duration = Duration::from_millis(200);
 /// transient drop is still recovered promptly.
 const RETRY_MAX_INTERVAL: Duration = Duration::from_millis(1600);
 
+/// How often the **failure-detector** tick samples in-flight transactions (ADR
+/// 0011, failure-detector-triggered recovery). Each tick the driver checks every
+/// transaction this replica holds *un-committed* and asks the core whether it has
+/// progressed since the last sample (see [`AccordCore::progress_fingerprint`]).
+const LIVENESS_INTERVAL: Duration = Duration::from_millis(100);
+
+/// How many consecutive [`LIVENESS_INTERVAL`] ticks an un-committed transaction
+/// must go **without progressing** before its coordinator is suspected dead and
+/// recovery is auto-triggered. The bound is the product
+/// `LIVENESS_INTERVAL * LIVENESS_STALL_TICKS` (≈ 5s here) of stalled virtual time.
+/// Two forces set it:
+///
+/// 1. **Avoid spurious recovery of a slow-but-live coordinator.** A *replica* only
+///    watches its own view of a transaction it does not coordinate, which advances
+///    only on a phase change (PreAccepted→Accepted→Committed) — it cannot see the
+///    coordinator slowly gathering a quorum of *same-timestamp* `PreAcceptOk`s (no
+///    phase change, so [`AccordCore::progress_fingerprint`] does not move). So a
+///    coordinator that is merely slow or transiently partitioned looks
+///    indistinguishable from a dead one *except by elapsed time*. The bound must
+///    therefore comfortably exceed a realistic slow-commit / partition-and-heal
+///    window so a coordinator that *will* commit on its own (at its original `t0`)
+///    gets to — recovering it instead re-orders its transaction **after** every
+///    conflicting transaction committed in the meantime (`replica_pre_accept`
+///    bumps the recovered timestamp past them), which for a single-writer
+///    list-append workload would let a stale earlier write land last and lose
+///    later appends. (This is the corpus regression that set this bound; ADR
+///    0014 / `animus-test`.)
+/// 2. **Still recover a genuinely dead coordinator promptly enough.** A crashed or
+///    stopped coordinator never heals, so after the bound the deterministic
+///    nominee takes over. ~5s of recovery latency for a dead coordinator is
+///    acceptable; correctness does not depend on the exact value, only on it being
+///    larger than the live-but-slow window.
+///
+/// Each *further* full window with no progress promotes the next escalation
+/// **tier** ([`AccordCore::is_recovery_nominee`]), so a dead nominee is eventually
+/// replaced by the next live survivor. The recovered commit is additionally
+/// **ballot-fenced** ([`AccordMsg::Commit`]'s `ballot`,
+/// [`AccordCore::replica_commit`]) so a late lower-ballot `Commit` from a healed
+/// original coordinator cannot *revert* a recovered decision — a genuine safety
+/// improvement, independent of the bound.
+const LIVENESS_STALL_TICKS: u32 = 50;
+
 /// Timeout for a single data-plane quorum write/read issued by the execution
 /// effect when the node is wired to the **live data plane** (the "frontier"
 /// path). Generous so a transient drop is absorbed by the data plane's own
@@ -205,6 +247,17 @@ impl<E: Env, S: StorageEngine + 'static> AccordNode<E, S> {
         // transaction (ADR 0011). A perpetual timer, so tests must drive bounded
         // virtual time (`run_for`/`run_until`), never `run()`.
         env.spawn_task(retry_loop(
+            env.clone(),
+            Arc::clone(&core),
+            node.storage.clone(),
+            Arc::clone(&node.reads),
+            node.sink.clone(),
+        ));
+        // Failure-detector tick: auto-trigger recovery of a transaction that has
+        // been held un-committed past a time bound without progressing — its
+        // coordinator is suspected dead (ADR 0011). Also a perpetual timer, so
+        // tests must drive bounded virtual time.
+        env.spawn_task(liveness_loop(
             env.clone(),
             Arc::clone(&core),
             node.storage.clone(),
@@ -963,6 +1016,133 @@ async fn retry_loop<E: Env, S: StorageEngine + 'static>(
         last_owed = owed;
         if !outs.is_empty() {
             persist_then_ship(&env, &core, &storage, &reads, &sink, outs);
+        }
+    }
+}
+
+/// Per-transaction liveness bookkeeping kept by [`liveness_loop`]: the last
+/// progress fingerprint observed for an un-committed transaction and how many
+/// consecutive ticks it has gone without changing. A `tier` records how many
+/// full stall windows have elapsed, used to escalate the deterministic recoverer
+/// nominee if the previous nominee was itself dead.
+#[derive(Clone, Copy)]
+struct Liveness {
+    /// The last [`AccordCore::progress_fingerprint`] seen for the txn.
+    fingerprint: u64,
+    /// Consecutive ticks the fingerprint has not advanced.
+    stale_ticks: u32,
+    /// Escalation tier already attempted (which deterministic nominee fired).
+    tier: usize,
+}
+
+/// The failure-detector tick: on a periodic `Env` timer, auto-trigger recovery of
+/// any transaction this replica has held **un-committed** past a time bound
+/// **without progressing** — its coordinator is suspected dead (ADR 0011,
+/// failure-detector-triggered recovery).
+///
+/// This closes the loop the earlier recovery slices left open: recovery ballots
+/// make *concurrent* recoveries safe, but nothing yet *declared* a coordinator
+/// dead — `recover` was invoked explicitly. Now the driver does it.
+///
+/// **How a slow-but-live coordinator is spared.** The synchronous core exposes a
+/// monotone [`AccordCore::progress_fingerprint`] per transaction (phase +
+/// execute_at + dep/ballot summary) that strictly increases whenever the
+/// transaction advances. Each tick the driver re-samples it: if it *changed*, the
+/// transaction is making progress, so the stall counter resets and recovery is
+/// deferred — a coordinator that is merely slow (still exchanging PreAccept/Accept
+/// messages) is never recovered. Only a transaction stuck at the *same*
+/// fingerprint for [`LIVENESS_STALL_TICKS`] consecutive ticks (the bound) is
+/// suspected stranded.
+///
+/// **How duels are kept rare.** When the bound trips, the driver does **not**
+/// always self-recover: it asks the core whether *this* node is the deterministic
+/// nominee for the transaction at the current escalation tier
+/// ([`AccordCore::is_recovery_nominee`] — the lowest-id survivor that is not the
+/// dead coordinator at tier 0). So in the common case exactly one node recovers
+/// each stranded transaction — no duel. If that nominee is itself dead, the next
+/// full stall window promotes the next tier (the next-lowest survivor), until
+/// recovery lands. When duels *do* still occur, the **ballot** machinery (in the
+/// core) guarantees safety and convergence; this tick only reduces their
+/// frequency. An already-committed transaction (or one this node is itself
+/// driving) is never recovered: it leaves `uncommitted_txns` / `is_driving`
+/// filters it.
+///
+/// Determinism + liveness discipline are preserved: the timer is an `Env` timer;
+/// the core decides *what* is stalled and *who* recovers (no time, no I/O); the
+/// driver only times the sampling, drops the lock, then ships via
+/// `persist_then_ship` (no lock held across an `.await`).
+async fn liveness_loop<E: Env, S: StorageEngine + 'static>(
+    env: E,
+    core: Arc<Mutex<AccordCore>>,
+    storage: S,
+    reads: ReadResults,
+    sink: Option<Arc<DataSink<E>>>,
+) {
+    // Per-txn stall tracking. A txn drops out once it commits (no longer in
+    // `uncommitted_txns`), so this stays bounded by the in-flight set.
+    let mut tracked: BTreeMap<TxnId, Liveness> = BTreeMap::new();
+    loop {
+        env.sleep(LIVENESS_INTERVAL).await;
+        // Decide (under the lock) which stranded txns this node should recover,
+        // then drop the lock before any I/O.
+        let to_recover: Vec<TxnId> = {
+            let c = core.lock().expect("accord core poisoned");
+            let uncommitted: BTreeSet<TxnId> = c.uncommitted_txns().into_iter().collect();
+            // Forget txns that have committed (or vanished) since last tick.
+            tracked.retain(|txn, _| uncommitted.contains(txn));
+
+            let mut due = Vec::new();
+            for &txn in &uncommitted {
+                // A txn this node is itself coordinating/recovering is driven by
+                // its own retry tick; never self-recover it.
+                if c.is_driving(txn) {
+                    tracked.remove(&txn);
+                    continue;
+                }
+                let Some(fp) = c.progress_fingerprint(txn) else {
+                    continue;
+                };
+                let entry = tracked.entry(txn).or_insert(Liveness {
+                    fingerprint: fp,
+                    stale_ticks: 0,
+                    tier: 0,
+                });
+                if fp != entry.fingerprint {
+                    // Progress since last tick: reset the stall counter and the
+                    // fingerprint (a slow-but-live coordinator is spared).
+                    entry.fingerprint = fp;
+                    entry.stale_ticks = 0;
+                    continue;
+                }
+                entry.stale_ticks += 1;
+                if entry.stale_ticks >= LIVENESS_STALL_TICKS {
+                    // The bound tripped with no progress: suspect the coordinator
+                    // dead. Recover only if this node is the deterministic nominee
+                    // at the current escalation tier (keeps duels rare).
+                    if c.is_recovery_nominee(txn, entry.tier) {
+                        due.push(txn);
+                    }
+                    // Reset the window and promote the tier so, if this nominee's
+                    // recovery does not take (e.g. the nominee was itself
+                    // partitioned and `recover` shipped into a void), the next
+                    // window promotes the next-lowest survivor.
+                    entry.stale_ticks = 0;
+                    entry.tier += 1;
+                }
+            }
+            due
+        };
+
+        for txn in to_recover {
+            // `recover` mints a fresh ballot (above any it has promised) and ships
+            // the `Recover` burst; ballots keep a concurrent recovery safe.
+            let outs = {
+                let mut c = core.lock().expect("accord core poisoned");
+                c.recover(txn)
+            };
+            if !outs.is_empty() {
+                persist_then_ship(&env, &core, &storage, &reads, &sink, outs);
+            }
         }
     }
 }
