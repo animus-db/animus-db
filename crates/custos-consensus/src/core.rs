@@ -157,6 +157,19 @@ struct Coordinating {
     recovery: bool,
     /// True when the transaction this coordinator drives is read-only.
     read_only: bool,
+    /// The transaction's key set, kept so a retry tick can **re-send** the
+    /// `PreAccept` to peers that have not yet replied (the network is
+    /// fire-and-forget and may drop — ADR 0011, message retry).
+    keys: BTreeSet<Key>,
+    /// The agreed `(execute_at, deps)` once the coordinator has chosen them
+    /// (slow-path `Accept`, or `Commit`), kept so a retry tick can re-send the
+    /// `Accept`/`Commit` to peers that have not yet acknowledged it. `None`
+    /// while still in the PreAccept round.
+    chosen: Option<(Timestamp, BTreeSet<TxnId>)>,
+    /// Peers that have acknowledged the `Commit` (via `CommitAck`). `Commit` is
+    /// otherwise fire-and-forget, so a retry tick re-sends it to peers absent
+    /// here until every peer has it.
+    commit_acks: BTreeSet<NodeId>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -446,6 +459,92 @@ impl AccordCore {
         std::mem::take(&mut self.pending_read)
     }
 
+    // ---- message retry ---------------------------------------------------
+
+    /// Re-emit the outbound messages for every in-flight round that has not yet
+    /// completed, addressed only to peers that have not yet answered.
+    ///
+    /// `Network::send` is fire-and-forget and may drop a message, which would
+    /// otherwise strand a transaction (a coordinator waiting on a quorum reply
+    /// that never arrives, or a replica that never learns the `Commit`). The
+    /// driver calls this on a periodic `Env` timer; the core stays synchronous
+    /// and I/O-free — it only *recomputes* what is still owed and to whom:
+    ///
+    /// - a coordinating txn in **PreAccept**: re-send `PreAccept` to peers not in
+    ///   `replies`;
+    /// - in **Accept**: re-send `Accept` (its chosen `(execute_at, deps)`) to
+    ///   peers not in `replies`;
+    /// - **Done** (committed): re-send `Commit` to peers not in `commit_acks`;
+    /// - a **recovering** txn: re-send `Recover` to peers not in `replies`.
+    ///
+    /// Re-sends are idempotent at the replica (every handler folds by `max`/union
+    /// and de-dups), so a duplicate that races the original is harmless. A round
+    /// that has completed (a `Done` coordinator with every peer acked, or a
+    /// recovery already decided) emits nothing, so retries naturally stop.
+    #[must_use]
+    pub fn resend_pending(&mut self) -> Vec<Out> {
+        let mut outs = Vec::new();
+        for (&txn, c) in &self.coordinating {
+            match c.phase {
+                CoordPhase::PreAccept => {
+                    for &p in &self.peers {
+                        if !c.replies.contains_key(&p) {
+                            outs.push((
+                                p,
+                                AccordMsg::PreAccept {
+                                    txn,
+                                    keys: c.keys.clone(),
+                                    read_only: c.read_only,
+                                },
+                            ));
+                        }
+                    }
+                }
+                CoordPhase::Accept => {
+                    if let Some((execute_at, deps)) = &c.chosen {
+                        for &p in &self.peers {
+                            if !c.replies.contains_key(&p) {
+                                outs.push((
+                                    p,
+                                    AccordMsg::Accept {
+                                        txn,
+                                        execute_at: *execute_at,
+                                        deps: deps.clone(),
+                                    },
+                                ));
+                            }
+                        }
+                    }
+                }
+                CoordPhase::Done => {
+                    if let Some((execute_at, deps)) = &c.chosen {
+                        for &p in &self.peers {
+                            if !c.commit_acks.contains(&p) {
+                                outs.push((
+                                    p,
+                                    AccordMsg::Commit {
+                                        txn,
+                                        execute_at: *execute_at,
+                                        deps: deps.clone(),
+                                        read_only: c.read_only,
+                                    },
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for (&txn, rec) in &self.recovering {
+            for &p in &self.peers {
+                if !rec.replies.contains_key(&p) {
+                    outs.push((p, AccordMsg::Recover { txn }));
+                }
+            }
+        }
+        outs
+    }
+
     // ---- coordinator entry point ----------------------------------------
 
     /// Begin coordinating a new **write** transaction over `keys`. Mints a fresh
@@ -487,6 +586,9 @@ impl AccordCore {
                 phase: CoordPhase::PreAccept,
                 recovery: false,
                 read_only,
+                keys: keys.clone(),
+                chosen: None,
+                commit_acks: BTreeSet::new(),
             },
         );
 
@@ -549,6 +651,15 @@ impl AccordCore {
                 read_only,
             } => {
                 self.replica_commit(txn, execute_at, deps, read_only);
+                // Acknowledge so the coordinator stops re-sending `Commit` to us
+                // on its retry tick (ADR 0011, message retry). Idempotent: a
+                // duplicate `Commit` re-acks harmlessly.
+                vec![(from, AccordMsg::CommitAck { txn })]
+            }
+            AccordMsg::CommitAck { txn } => {
+                if let Some(c) = self.coordinating.get_mut(&txn) {
+                    c.commit_acks.insert(from);
+                }
                 Vec::new()
             }
             AccordMsg::Recover { txn } => {
@@ -924,6 +1035,9 @@ impl AccordCore {
             if let Some(c) = self.coordinating.get_mut(&txn) {
                 c.phase = CoordPhase::Accept;
                 c.replies = self_replies;
+                c.chosen = Some((execute_at, deps.clone()));
+                // Past PreAccept now: the key set is no longer needed for retry.
+                c.keys = BTreeSet::new();
             }
             let mut outs: Vec<Out> = self
                 .peers
@@ -981,6 +1095,9 @@ impl AccordCore {
                 return Vec::new();
             }
             c.phase = CoordPhase::Done;
+            // Record the committed values so a retry tick can re-send `Commit`
+            // to peers that have not yet acknowledged it.
+            c.chosen = Some((execute_at, deps.clone()));
         }
         self.replica_commit(txn, execute_at, deps.clone(), read_only);
         self.decisions.push(Decision {
@@ -1160,6 +1277,9 @@ impl AccordCore {
                 phase: CoordPhase::PreAccept,
                 recovery: true,
                 read_only,
+                keys: union_keys.clone(),
+                chosen: None,
+                commit_acks: BTreeSet::new(),
             },
         );
         let mut outs: Vec<Out> = self
@@ -1200,6 +1320,9 @@ impl AccordCore {
                 phase: CoordPhase::PreAccept,
                 recovery: true,
                 read_only,
+                keys: BTreeSet::new(),
+                chosen: None,
+                commit_acks: BTreeSet::new(),
             },
         );
         // A recovered commit is, by Accord's recovery rules, equivalent to a
