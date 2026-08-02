@@ -220,6 +220,18 @@ async fn handle_conn(mut stream: TcpStream, ctx: ClientCtx) -> std::io::Result<(
             return Ok(()); // clean EOF
         };
         let keep_alive = request.keep_alive;
+        // The admin `/metrics` route (ADR 0015) shares this HTTP listener — the
+        // node's only HTTP edge — rather than opening a seventh port. It is a
+        // plain `GET` returning the text-format snapshot, distinct from the
+        // DynamoDB `POST /` + `X-Amz-Target` protocol.
+        if request.method.eq_ignore_ascii_case("GET") && request.path == "/metrics" {
+            let body = ctx.metrics_text();
+            write_text_response(&mut stream, 200, &body, keep_alive).await?;
+            if !keep_alive {
+                return Ok(());
+            }
+            continue;
+        }
         let (status, body) = dispatch(&ctx, &request).await;
         write_http_response(&mut stream, status, &body, keep_alive).await?;
         if !keep_alive {
@@ -231,9 +243,12 @@ async fn handle_conn(mut stream: TcpStream, ctx: ClientCtx) -> std::io::Result<(
     }
 }
 
-/// A parsed HTTP request: the `X-Amz-Target` header value, the body bytes, and
-/// whether the client wants the connection kept alive.
+/// A parsed HTTP request: the method and path (request line), the
+/// `X-Amz-Target` header value, the body bytes, and whether the client wants the
+/// connection kept alive.
 struct HttpRequest {
+    method: String,
+    path: String,
     target: String,
     body: Vec<u8>,
     keep_alive: bool,
@@ -271,6 +286,10 @@ async fn read_http_request(
     // HTTP/1.1 defaults to keep-alive; HTTP/1.0 defaults to close. An explicit
     // `Connection` header overrides either way.
     let request_line = lines.next().unwrap_or("");
+    // Request line: `METHOD SP request-target SP HTTP-version`.
+    let mut request_parts = request_line.split_whitespace();
+    let method = request_parts.next().unwrap_or("").to_owned();
+    let path = request_parts.next().unwrap_or("").to_owned();
     let mut keep_alive = request_line.contains("HTTP/1.1");
     let mut target = String::new();
     let mut content_length = 0usize;
@@ -314,6 +333,8 @@ async fn read_http_request(
     *buf = leftover;
 
     Ok(Some(HttpRequest {
+        method,
+        path,
         target,
         body: body_buf,
         keep_alive,
@@ -1120,6 +1141,28 @@ async fn write_http_response(
     let response = format!(
         "HTTP/1.1 {status} {reason}\r\n\
          Content-Type: application/x-amz-json-1.0\r\n\
+         Content-Length: {}\r\n\
+         Connection: {connection}\r\n\
+         \r\n\
+         {body}",
+        body.len(),
+    );
+    stream.write_all(response.as_bytes()).await?;
+    stream.flush().await
+}
+
+/// Write a `text/plain` response — used by the admin `/metrics` route (ADR 0015),
+/// whose body is the line-oriented metrics export, not DynamoDB JSON.
+async fn write_text_response(
+    stream: &mut TcpStream,
+    status: u16,
+    body: &str,
+    keep_alive: bool,
+) -> std::io::Result<()> {
+    let connection = if keep_alive { "keep-alive" } else { "close" };
+    let response = format!(
+        "HTTP/1.1 {status} OK\r\n\
+         Content-Type: text/plain; charset=utf-8\r\n\
          Content-Length: {}\r\n\
          Connection: {connection}\r\n\
          \r\n\

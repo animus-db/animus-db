@@ -45,7 +45,7 @@ use animus_data::{
     DataClient, HintStore, ReadResult, TabletView, serve_anti_entropy, serve_hint_replay,
     serve_replica,
 };
-use animus_env::{EnvExt, NodeId, ProdEnv};
+use animus_env::{Env, EnvExt, Metric, MetricsHandle, NodeId, ProdEnv};
 use animus_storage::{LsmEngine, MemoryEngine, StorageEngine};
 use animus_tablet::{Epoch, KeyRange, TabletId};
 use serde::Serialize;
@@ -248,6 +248,14 @@ impl BoundNode {
             self.coord_env.clone(),
         ];
 
+        // Capture the data- and coord-role metrics sinks before their envs are
+        // consumed below. The control-plane sink is reached at request time via
+        // `raft.metrics()` (`RaftNode::start` records into `control_env.metrics()`);
+        // the data replica and the coordinator record into their own role envs'
+        // sinks. The `/metrics` endpoint aggregates all three (ADR 0015).
+        let data_metrics = self.data_env.metrics();
+        let coord_metrics = self.coord_env.metrics();
+
         let raft = RaftNode::start(self.control_env, control_ids.clone());
         // Register this node's control handle in the **per-cluster** set the wire
         // edges use to reach the control-plane leader for schema proposals
@@ -335,6 +343,8 @@ impl BoundNode {
                 r,
                 w,
                 edge: edge.clone(),
+                data_metrics,
+                coord_metrics,
             };
             tasks.push(tokio::spawn(serve_clients(
                 self.client_listener,
@@ -571,6 +581,57 @@ pub(crate) struct ClientCtx {
     r: usize,
     w: usize,
     pub(crate) edge: ClusterEdgeState,
+    /// The data-role env's recording metrics sink (the replica + data-plane
+    /// loops record here). Aggregated into the `/metrics` export (ADR 0015).
+    data_metrics: MetricsHandle,
+    /// The coord-role env's recording metrics sink (the `DataClient` coordinator
+    /// records here). Aggregated into the `/metrics` export (ADR 0015).
+    coord_metrics: MetricsHandle,
+}
+
+impl ClientCtx {
+    /// Render this node's **live** metrics as the ADR 0015 text export
+    /// (`name value` lines), aggregated across the node's three role sinks.
+    ///
+    /// A node runs three internal `ProdEnv` roles on distinct ids — control
+    /// (Raft), data (replica), coord (`DataClient`) — and each records into its
+    /// **own** sink (`RaftNode::start` records into the control env's sink; the
+    /// replica and coordinator into theirs). To surface both control- and
+    /// data-plane counters from one endpoint, this sums the three snapshots
+    /// counter-by-counter and takes the max of the leadership gauge (leadership is
+    /// the control plane's, recorded only in the control sink). The snapshots are
+    /// read **at call time**, so the export reflects current activity rather than a
+    /// cached value. Today only the control sink moves; the data/coord sinks are
+    /// included so data-plane counters surface automatically once recorded, with no
+    /// further endpoint change.
+    pub(crate) fn metrics_text(&self) -> String {
+        let snaps = [
+            self.raft.metrics().snapshot(),
+            self.data_metrics.snapshot(),
+            self.coord_metrics.snapshot(),
+        ];
+        let mut counters: BTreeMap<Metric, u64> = BTreeMap::new();
+        let mut is_leader: i64 = 0;
+        for snap in &snaps {
+            for (&metric, &value) in &snap.counters {
+                *counters.entry(metric).or_insert(0) += value;
+            }
+            is_leader = is_leader.max(snap.is_leader);
+        }
+        // Render in the same stable order as `MetricSnapshot::to_text`.
+        let mut out = String::new();
+        for m in Metric::ALL {
+            let v = counters.get(&m).copied().unwrap_or(0);
+            out.push_str(m.name());
+            out.push(' ');
+            out.push_str(&v.to_string());
+            out.push('\n');
+        }
+        out.push_str("control_is_leader ");
+        out.push_str(&is_leader.to_string());
+        out.push('\n');
+        out
+    }
 }
 
 /// Spawn the data replica over `storage` plus its two background loops

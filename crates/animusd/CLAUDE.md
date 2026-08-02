@@ -144,6 +144,21 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   - The **prepared-statement id is content-addressed** — a stable hash of the
     statement text (FNV-1a, no RNG so the edge stays deterministic) — so `PREPARE`
     on one connection and `EXECUTE` on another resolve to the same statement.
+- **A `GET /metrics` admin route shares the DynamoDB HTTP listener** (ADR 0015) —
+  no seventh port or `RoleAddrs` field. The DynamoDB edge's request parser now
+  captures the request method + path; a `GET /metrics` is answered with the
+  text-format snapshot as `text/plain` (everything else is the existing
+  `POST /` + `X-Amz-Target` DynamoDB protocol). The body is **aggregated across the
+  node's three role sinks** (control / data / coord) by `ClientCtx::metrics_text`:
+  each role records into its **own** `ProdEnv` sink (`RaftNode::start` →
+  `control_env.metrics()`; the replica + coordinator → their envs'), so the handler
+  snapshots all three **at request time** (live, not cached), sums the counters,
+  and takes the max leadership gauge. Both control- and data-plane counters surface
+  from one endpoint; today only the control-plane counters move, and a data-plane
+  counter surfaces automatically once recorded (no endpoint change). The two
+  data/coord sinks are captured in `start_with` before their envs are moved and
+  threaded into `ClientCtx`. The endpoint is on `Node::dynamo_addr()`
+  (`curl -s <dynamo addr>/metrics`).
 - Writes get a **quorum-derived version** (`DataClient::read_version` + 1), not a
   per-node counter — otherwise two coordinators assign the same version and the
   replica's monotonic-version check silently drops the later write. Global
@@ -195,7 +210,10 @@ SELECT → single-row SELECT → UPDATE → single-row + whole-partition DELETE,
 QUORUM consistency), `tests/durable_restart.rs` (a key written
 through the client API survives a node stop + restart on the **same dir +
 addresses** with the LSM backend, and is lost with the `--ephemeral` memory
-backend), and `tests/self_heal.rs` (**live self-healing**: a 4-node cluster
+backend), `tests/metrics_endpoint.rs` (the admin `GET /metrics` HTTP route, ADR 0015: a
+3-node cluster elects a leader, the scrape returns the `text/plain` `name value`
+export with `control_elections_won >= 1` and `control_is_leader 1` on the leader /
+`0` on a follower), and `tests/self_heal.rs` (**live self-healing**: a 4-node cluster
 detects a killed replica node, marks it `Down`, re-places the tablet onto the
 spare, and still serves the key from the survivors; plus a concurrent-client
 smoke test that the assembled node does not deadlock under load). All use real

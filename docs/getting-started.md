@@ -81,21 +81,32 @@ For a control node specifically, the same export is reachable from its
 let text: String = raft_node.metrics().snapshot().to_text();
 ```
 
-### Exposing it as a live endpoint (integration)
+### The live endpoint
 
-The seam deliberately does **no HTTP** — keeping it pure. Wiring a live
-`/metrics` endpoint is a one-line integration step in `animusd`: serve the
-control node's export from an HTTP handler. Inside `animusd`, given the
-assembled `Node` (which holds `raft: RaftNode<ProdEnv>`), the body of a
-`GET /metrics` handler is exactly:
+The seam deliberately does **no HTTP** — keeping it pure — so the live endpoint
+is wired in `animusd`. A running node serves `GET /metrics` on its **HTTP
+endpoint** (the same listener as the DynamoDB JSON wire — `Node::dynamo_addr()`),
+returning the text export as `text/plain`:
 
-```rust
-node.raft.metrics().snapshot().to_text()
+```sh
+curl -s <dynamo addr>/metrics
+# control_elections_started 1
+# control_elections_won 1
+# control_append_entries_sent 42
+# ...
+# control_is_leader 1
 ```
 
-(`RaftNode::start` records into `control_env.metrics()`, the `ProdEnv` recording
-sink, so this reflects live control-plane activity with no extra wiring.) The
-export is timeless `name value` text; a Prometheus scrape adds its own timestamp.
+The body is **aggregated across the node's three role sinks** (control, data,
+coord), read at request time so it reflects live activity. A node runs three
+internal `ProdEnv` roles on distinct ids, each recording into its own sink:
+`RaftNode::start` records into the control env's sink, the data replica and the
+coordinator into theirs. The handler sums the three snapshots counter-by-counter
+(and takes the max of the leadership gauge, which only the control plane sets), so
+both control- and data-plane counters surface from one endpoint. Today only the
+control-plane counters move; data-plane counters surface automatically once
+recorded, with no endpoint change. The export is timeless `name value` text; a
+Prometheus scrape adds its own timestamp.
 
 ## Replaying a failed simulation
 
