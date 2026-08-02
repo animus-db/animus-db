@@ -56,10 +56,15 @@ which now also **serves the DynamoDB JSON protocol over HTTP**, routing those
 requests through the same data-plane coordinator — plus a **CQL v4 wire
 protocol** (`animus-cql`: STARTUP/READY handshake; a scalar **type system**
 (text/int/bigint/boolean/blob/uuid) with typed column metadata + bound values;
-`CREATE KEYSPACE`/`USE`/`CREATE TABLE` recording a schema in an in-memory
-catalog; `INSERT`/`SELECT` resolved against that schema; and **prepared
-statements** (PREPARE→Prepared, EXECUTE with bound values) — all routed through
-that same coordinator) — the **topology-aware placement
+`CREATE KEYSPACE`/`USE`/`CREATE TABLE` (incl. **compound primary keys** — a
+partition key + clustering columns) recording a schema in an in-memory catalog;
+`INSERT`/`SELECT`/`UPDATE`/`DELETE` resolved against that schema — a partition
+(all rows sharing a partition key, ordered by clustering key) is one data-plane
+value so reads/writes stay point ops, a `SELECT pk = ?` returns rows
+clustering-ordered, and a `DELETE` emptying a partition tombstones the key; the
+requested **consistency level** is honored (mapped to the data-plane R/W quorum);
+plus **prepared statements** (PREPARE→Prepared, EXECUTE with bound values) — all
+routed through that same coordinator) — the **topology-aware placement
 engine** (`animus-placement`: residency + failure-domain spread, with the leader
 automatically reconciling tablet placement via control-plane `CasTabletReplicas`),
 and a **slice of Accord-style leaderless transaction consensus**
@@ -75,9 +80,9 @@ re-sends un-acknowledged round messages on a timer so a dropped fire-and-forget
 committed transaction's writes can land in the replicated AP data plane
 (`animus-data` quorum), readable via ordinary quorum reads, atomically in agreed
 order; ADR 0011). Skeletons / future work:
-the rest of the CQL surface (clustering/composite keys,
-`UPDATE`/`DELETE`/`BATCH`/`ALTER`/`DROP`, collection/UDT types, paging, auth,
-`LWT`, consistency levels) and the rest of the
+the rest of the CQL surface (composite multi-column partition keys,
+`BATCH`/`ALTER`/`DROP`, per-column `DELETE`, range/`IN`/`ORDER BY`/`LIMIT`,
+collection/UDT types, paging, auth, `LWT`) and the rest of the
 DynamoDB surface (per-index projection attribute lists, document-path
 projections, `UpdateItem`/`BatchWriteItem`/`TransactWrite`) — note the control
 plane now holds a **replicated table-schema catalog** (ADR 0013) the adapters can

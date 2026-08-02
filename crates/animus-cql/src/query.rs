@@ -11,18 +11,21 @@
 //! USE <keyspace>
 //! CREATE KEYSPACE [IF NOT EXISTS] <keyspace> [WITH ...]   -- WITH clause ignored
 //! CREATE TABLE [IF NOT EXISTS] <table> (
-//!     <col> <type>, ... , PRIMARY KEY (<col>)
-//! )
+//!     <col> <type>, ... , PRIMARY KEY (<pk> [, <ck1>, <ck2> ...])
+//! )                                          -- WITH clause (e.g. CLUSTERING ORDER) ignored
 //! INSERT INTO <table> (<c1>, <c2>, ...) VALUES (<v1>, <v2>, ...)
-//! SELECT * | <c1>, <c2>, ... FROM <table> WHERE <pk> = <value>
+//! SELECT * | <c1>, <c2>, ... FROM <table> WHERE <pk> = <value> [AND <ck> = <value> ...]
+//! UPDATE <table> SET <col> = <value>, ... WHERE <pk> = <value> [AND <ck> = <value> ...]
+//! DELETE FROM <table> WHERE <pk> = <value> [AND <ck> = <value> ...]
 //! ```
 //!
 //! Values are literals — single-quoted strings (`'ada'`, `''`-escaped), bare
 //! numbers/words (`42`, `true`, a `uuid`/`0x..blob` literal), or a `?` bind
 //! marker (filled in at `EXECUTE` time). Table names may be `keyspace.table`.
 //!
-//! It is **not** a CQL grammar: no clustering columns, no composite partition
-//! keys, no `IF`/`USING`/`LIMIT`/ordering, no functions.
+//! It is **not** a CQL grammar: a single-column partition key only (compound
+//! clustering keys *are* supported, composite partition keys are not), equality
+//! predicates only (no ranges/ordering/`LIMIT`), no `IF`/`USING`, no functions.
 
 use std::fmt;
 
@@ -47,8 +50,12 @@ pub enum Statement {
     CreateTable(CreateTable),
     /// `INSERT INTO <table> (...) VALUES (...)`.
     Insert(Insert),
-    /// `SELECT ... FROM <table> WHERE <pk> = <value>`.
+    /// `SELECT ... FROM <table> WHERE <pk> = <value> [AND <ck> = <value> ...]`.
     Select(Select),
+    /// `UPDATE <table> SET ... WHERE <pk> = <value> [AND <ck> = <value> ...]`.
+    Update(Update),
+    /// `DELETE FROM <table> WHERE <pk> = <value> [AND <ck> = <value> ...]`.
+    Delete(Delete),
 }
 
 /// A parsed `CREATE TABLE`.
@@ -64,6 +71,8 @@ pub struct CreateTable {
     pub columns: Vec<(String, CqlType)>,
     /// The partition-key column name (a single column in this subset).
     pub partition_key: String,
+    /// The clustering-key column names, in clustering order (may be empty).
+    pub clustering_keys: Vec<String>,
 }
 
 /// A parsed `INSERT` (columns + literal/bind values, not yet typed).
@@ -79,7 +88,16 @@ pub struct Insert {
     pub values: Vec<Term>,
 }
 
-/// A parsed `SELECT` (projection + single `pk = value` predicate).
+/// One `<column> = <term>` equality predicate from a `WHERE` clause.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Predicate {
+    /// The predicate column name.
+    pub column: String,
+    /// The predicate value (literal or bind marker).
+    pub value: Term,
+}
+
+/// A parsed `SELECT` (projection + a `pk = value [AND ck = value ...]` `WHERE`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Select {
     /// Optional `keyspace.` qualifier.
@@ -88,10 +106,34 @@ pub struct Select {
     pub table: String,
     /// The projected columns; empty means `*` (all columns).
     pub projection: Vec<String>,
-    /// The `WHERE` predicate column (must be the partition key).
-    pub where_column: String,
-    /// The `WHERE` predicate value.
-    pub where_value: Term,
+    /// The `WHERE` equality predicates (partition key, then any clustering keys
+    /// in order). A partition-key-only `WHERE` selects the whole partition.
+    pub predicates: Vec<Predicate>,
+}
+
+/// A parsed `UPDATE` (assignments + a full primary-key `WHERE`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Update {
+    /// Optional `keyspace.` qualifier.
+    pub keyspace: Option<String>,
+    /// The table name.
+    pub table: String,
+    /// The `SET` assignments: `(column, value)`, positionally ordered.
+    pub assignments: Vec<(String, Term)>,
+    /// The `WHERE` equality predicates (partition key + every clustering key).
+    pub predicates: Vec<Predicate>,
+}
+
+/// A parsed `DELETE` (whole-row delete by a full primary-key `WHERE`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Delete {
+    /// Optional `keyspace.` qualifier.
+    pub keyspace: Option<String>,
+    /// The table name.
+    pub table: String,
+    /// The `WHERE` equality predicates (partition key, then any clustering keys
+    /// in order). A partition-key-only `WHERE` deletes the whole partition.
+    pub predicates: Vec<Predicate>,
 }
 
 /// A value position in a statement: a literal or a positional bind marker.
@@ -147,8 +189,10 @@ pub fn parse_statement(cql: &str) -> Result<Statement, QueryError> {
         Some("create") => parse_create(&mut it),
         Some("insert") => parse_insert(&mut it),
         Some("select") => parse_select(&mut it),
+        Some("update") => parse_update(&mut it),
+        Some("delete") => parse_delete(&mut it),
         _ => Err(QueryError::Unsupported(
-            "expected USE, CREATE, INSERT, or SELECT".into(),
+            "expected USE, CREATE, INSERT, SELECT, UPDATE, or DELETE".into(),
         )),
     }
 }
@@ -197,18 +241,25 @@ fn parse_create_table(it: &mut TokenStream<'_>) -> Result<Statement, QueryError>
     let mut columns: Vec<(String, CqlType)> = Vec::new();
     let mut inline_pk: Option<String> = None;
     let mut pk_clause: Option<String> = None;
+    let mut clustering_keys: Vec<String> = Vec::new();
     loop {
-        // A `PRIMARY KEY (col)` clause, or a `<name> <type> [PRIMARY KEY]`.
+        // A `PRIMARY KEY (pk [, ck ...])` clause, or a `<name> <type> [PRIMARY KEY]`.
         if it.peek().is_some_and(|t| t.eq_ignore_ascii_case("primary")) {
             expect_kw(it, "primary")?;
             expect_kw(it, "key")?;
             expect_punct(it, "(")?;
-            let pk = next_ident(it, "primary key column")?;
-            // Reject composite / clustering keys for now (loudly).
-            if it.peek() == Some(",") {
+            // A composite partition key — `PRIMARY KEY ((a, b), c)` — is not
+            // supported; reject the parenthesized form loudly.
+            if it.peek() == Some("(") {
                 return Err(QueryError::Unsupported(
-                    "composite / clustering primary keys are not supported yet".into(),
+                    "composite (multi-column) partition keys are not supported yet".into(),
                 ));
+            }
+            let pk = next_ident(it, "primary key column")?;
+            // Any further comma-separated columns are clustering keys.
+            while it.peek() == Some(",") {
+                it.next();
+                clustering_keys.push(next_ident(it, "clustering key column")?);
             }
             expect_punct(it, ")")?;
             pk_clause = Some(pk);
@@ -237,6 +288,12 @@ fn parse_create_table(it: &mut TokenStream<'_>) -> Result<Statement, QueryError>
             }
         }
     }
+    // An optional trailing `WITH ...` clause (e.g. `WITH CLUSTERING ORDER BY
+    // (...)`) is accepted and ignored — this subset stores rows in ascending
+    // clustering order only.
+    if it.peek().is_some_and(|t| t.eq_ignore_ascii_case("with")) {
+        while it.next().is_some() {}
+    }
     end(it, "CREATE TABLE")?;
 
     let partition_key = match (inline_pk, pk_clause) {
@@ -250,13 +307,21 @@ fn parse_create_table(it: &mut TokenStream<'_>) -> Result<Statement, QueryError>
             return Err(QueryError::Unsupported("no PRIMARY KEY declared".into()));
         }
     };
-    if !columns
-        .iter()
-        .any(|(n, _)| n.eq_ignore_ascii_case(&partition_key))
-    {
-        return Err(QueryError::Unsupported(format!(
-            "PRIMARY KEY column `{partition_key}` is not a declared column"
-        )));
+    // The partition key + every clustering key must be a declared column, and no
+    // primary-key column may be named twice.
+    let mut seen: Vec<String> = Vec::new();
+    for name in std::iter::once(&partition_key).chain(clustering_keys.iter()) {
+        if !columns.iter().any(|(n, _)| n.eq_ignore_ascii_case(name)) {
+            return Err(QueryError::Unsupported(format!(
+                "PRIMARY KEY column `{name}` is not a declared column"
+            )));
+        }
+        if seen.iter().any(|s| s.eq_ignore_ascii_case(name)) {
+            return Err(QueryError::Unsupported(format!(
+                "PRIMARY KEY column `{name}` declared twice"
+            )));
+        }
+        seen.push(name.clone());
     }
     if columns.is_empty() {
         return Err(QueryError::Unsupported("table has no columns".into()));
@@ -268,6 +333,7 @@ fn parse_create_table(it: &mut TokenStream<'_>) -> Result<Statement, QueryError>
         if_not_exists,
         columns,
         partition_key,
+        clustering_keys,
     }))
 }
 
@@ -340,17 +406,84 @@ fn parse_select(it: &mut TokenStream<'_>) -> Result<Statement, QueryError> {
     expect_kw(it, "from")?;
     let (keyspace, table) = next_table_name(it)?;
     expect_kw(it, "where")?;
-    let where_column = next_ident(it, "predicate column")?;
-    expect_punct(it, "=")?;
-    let where_value = next_term(it, "predicate value")?;
+    let predicates = parse_where(it)?;
     end(it, "SELECT")?;
     Ok(Statement::Select(Select {
         keyspace,
         table,
         projection,
-        where_column,
-        where_value,
+        predicates,
     }))
+}
+
+fn parse_update(it: &mut TokenStream<'_>) -> Result<Statement, QueryError> {
+    expect_kw(it, "update")?;
+    let (keyspace, table) = next_table_name(it)?;
+    expect_kw(it, "set")?;
+    let mut assignments = Vec::new();
+    loop {
+        let column = next_ident(it, "assignment column")?;
+        expect_punct(it, "=")?;
+        let value = next_term(it, "assignment value")?;
+        assignments.push((column, value));
+        if it.peek() == Some(",") {
+            it.next();
+        } else {
+            break;
+        }
+    }
+    if assignments.is_empty() {
+        return Err(QueryError::Unsupported(
+            "UPDATE has no SET assignments".into(),
+        ));
+    }
+    expect_kw(it, "where")?;
+    let predicates = parse_where(it)?;
+    end(it, "UPDATE")?;
+    Ok(Statement::Update(Update {
+        keyspace,
+        table,
+        assignments,
+        predicates,
+    }))
+}
+
+fn parse_delete(it: &mut TokenStream<'_>) -> Result<Statement, QueryError> {
+    expect_kw(it, "delete")?;
+    // This subset deletes whole rows only — no per-column `DELETE a, b FROM ...`.
+    if !it.peek().is_some_and(|t| t.eq_ignore_ascii_case("from")) {
+        return Err(QueryError::Unsupported(
+            "only whole-row DELETE (`DELETE FROM <table> WHERE ...`) is supported".into(),
+        ));
+    }
+    expect_kw(it, "from")?;
+    let (keyspace, table) = next_table_name(it)?;
+    expect_kw(it, "where")?;
+    let predicates = parse_where(it)?;
+    end(it, "DELETE")?;
+    Ok(Statement::Delete(Delete {
+        keyspace,
+        table,
+        predicates,
+    }))
+}
+
+/// Parse a `WHERE` clause of one or more `<column> = <term>` equality
+/// predicates joined by `AND`. Only equality is supported (no ranges/`IN`).
+fn parse_where(it: &mut TokenStream<'_>) -> Result<Vec<Predicate>, QueryError> {
+    let mut predicates = Vec::new();
+    loop {
+        let column = next_ident(it, "predicate column")?;
+        expect_punct(it, "=")?;
+        let value = next_term(it, "predicate value")?;
+        predicates.push(Predicate { column, value });
+        if it.peek().is_some_and(|t| t.eq_ignore_ascii_case("and")) {
+            it.next();
+        } else {
+            break;
+        }
+    }
+    Ok(predicates)
 }
 
 // --- token-stream helpers ---------------------------------------------------
@@ -584,9 +717,33 @@ mod tests {
     }
 
     #[test]
-    fn rejects_composite_pk() {
-        let err = parse_statement("CREATE TABLE t (a int, b int, PRIMARY KEY (a, b))").unwrap_err();
+    fn parses_compound_primary_key() {
+        let stmt =
+            parse_statement("CREATE TABLE t (a int, b int, c text, PRIMARY KEY (a, b))").unwrap();
+        let Statement::CreateTable(ct) = stmt else {
+            panic!("expected create table");
+        };
+        assert_eq!(ct.partition_key, "a");
+        assert_eq!(ct.clustering_keys, vec!["b"]);
+    }
+
+    #[test]
+    fn rejects_composite_partition_key() {
+        let err =
+            parse_statement("CREATE TABLE t (a int, b int, PRIMARY KEY ((a, b)))").unwrap_err();
         assert!(matches!(err, QueryError::Unsupported(_)));
+    }
+
+    #[test]
+    fn ignores_clustering_order_with_clause() {
+        let stmt = parse_statement(
+            "CREATE TABLE t (a int, b int, PRIMARY KEY (a, b)) WITH CLUSTERING ORDER BY (b DESC)",
+        )
+        .unwrap();
+        let Statement::CreateTable(ct) = stmt else {
+            panic!("expected create table");
+        };
+        assert_eq!(ct.clustering_keys, vec!["b"]);
     }
 
     #[test]
@@ -640,14 +797,54 @@ mod tests {
             panic!("expected select")
         };
         assert!(s.projection.is_empty());
-        assert_eq!(s.where_column, "id");
-        assert_eq!(s.where_value, Term::Bind);
+        assert_eq!(s.predicates.len(), 1);
+        assert_eq!(s.predicates[0].column, "id");
+        assert_eq!(s.predicates[0].value, Term::Bind);
 
         let proj = parse_statement("SELECT name, age FROM users WHERE id = 'u1'").unwrap();
         let Statement::Select(s) = proj else {
             panic!("expected select")
         };
         assert_eq!(s.projection, vec!["name", "age"]);
+    }
+
+    #[test]
+    fn parses_select_with_clustering_predicate() {
+        let s = parse_statement("SELECT * FROM t WHERE pk = 'a' AND ck = 3").unwrap();
+        let Statement::Select(s) = s else {
+            panic!("expected select")
+        };
+        assert_eq!(s.predicates.len(), 2);
+        assert_eq!(s.predicates[1].column, "ck");
+        assert_eq!(
+            s.predicates[1].value,
+            Term::Literal {
+                text: "3".into(),
+                quoted: false
+            }
+        );
+    }
+
+    #[test]
+    fn parses_update() {
+        let s = parse_statement("UPDATE users SET name = 'Ada', age = ? WHERE id = 7").unwrap();
+        let Statement::Update(u) = s else {
+            panic!("expected update")
+        };
+        assert_eq!(u.assignments.len(), 2);
+        assert_eq!(u.assignments[0].0, "name");
+        assert_eq!(u.assignments[1].1, Term::Bind);
+        assert_eq!(u.predicates[0].column, "id");
+    }
+
+    #[test]
+    fn parses_delete() {
+        let s = parse_statement("DELETE FROM users WHERE id = 7 AND ck = 'x'").unwrap();
+        let Statement::Delete(d) = s else {
+            panic!("expected delete")
+        };
+        assert_eq!(d.table, "users");
+        assert_eq!(d.predicates.len(), 2);
     }
 
     #[test]

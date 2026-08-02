@@ -40,24 +40,97 @@ pub fn parse_startup(
     frame::read_string_map(body, &mut pos)
 }
 
-/// A parsed `QUERY` request: the CQL text. (We ignore the trailing consistency
-/// level + query flags for this subset; a `QUERY` carries no bound values in our
-/// path — those arrive via `PREPARE`/`EXECUTE`.)
+/// The CQL consistency levels this subset recognizes (the `[consistency]` short
+/// on a `QUERY`/`EXECUTE`). The numeric values are fixed by the CQL v4 spec.
+///
+/// We map each to a per-request **quorum requirement** ([`consistency_quorum`])
+/// over the tablet's replica set, rather than ignoring it: `ONE`/`ANY` need one
+/// ack, `QUORUM`/`LOCAL_QUORUM`/`EACH_QUORUM` a majority, `ALL` every replica,
+/// and `TWO`/`THREE` that many.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Consistency {
+    /// `ANY` (write only) — treated as one ack here.
+    Any,
+    /// `ONE` — a single replica.
+    One,
+    /// `TWO` — two replicas.
+    Two,
+    /// `THREE` — three replicas.
+    Three,
+    /// `QUORUM` — a strict majority.
+    Quorum,
+    /// `ALL` — every replica.
+    All,
+    /// `LOCAL_QUORUM` — a majority (no DC awareness here).
+    LocalQuorum,
+    /// `EACH_QUORUM` — a majority (no DC awareness here).
+    EachQuorum,
+    /// `LOCAL_ONE` — a single replica.
+    LocalOne,
+}
+
+impl Consistency {
+    /// Map a `[consistency]` short to a level. Unknown values fall back to
+    /// [`Consistency::Quorum`] (the safe default).
+    #[must_use]
+    pub fn from_short(short: u16) -> Consistency {
+        match short {
+            0x0000 => Consistency::Any,
+            0x0001 => Consistency::One,
+            0x0002 => Consistency::Two,
+            0x0003 => Consistency::Three,
+            0x0004 => Consistency::Quorum,
+            0x0005 => Consistency::All,
+            0x0006 => Consistency::LocalQuorum,
+            0x0007 => Consistency::EachQuorum,
+            0x000A => Consistency::LocalOne,
+            _ => Consistency::Quorum,
+        }
+    }
+}
+
+/// Map a consistency level to the number of replica acks required over a tablet
+/// of `replicas` replicas (used for both the read and write quorum sizes). Always
+/// clamped to `1..=replicas` so a tiny dev cluster can still serve. A strict
+/// **majority** is `replicas / 2 + 1`.
+#[must_use]
+pub fn consistency_quorum(level: Consistency, replicas: usize) -> usize {
+    let replicas = replicas.max(1);
+    let majority = replicas / 2 + 1;
+    let want = match level {
+        Consistency::Any | Consistency::One | Consistency::LocalOne => 1,
+        Consistency::Two => 2,
+        Consistency::Three => 3,
+        Consistency::Quorum | Consistency::LocalQuorum | Consistency::EachQuorum => majority,
+        Consistency::All => replicas,
+    };
+    want.clamp(1, replicas)
+}
+
+/// A parsed `QUERY` request: the CQL text and the requested consistency. (We
+/// ignore the trailing query flags for this subset; a `QUERY` carries no bound
+/// values in our path — those arrive via `PREPARE`/`EXECUTE`.)
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QueryRequest {
     /// The CQL query string.
     pub cql: String,
+    /// The requested consistency level.
+    pub consistency: Consistency,
 }
 
 /// Parse a `QUERY` request body: a `[long string]` query followed by a
-/// `[consistency]` and flags we currently ignore.
+/// `[consistency]` (honored) and flags we currently ignore.
 ///
 /// # Errors
 /// Propagates a [`frame::FrameError`] if the query string is malformed.
 pub fn parse_query_request(body: &[u8]) -> Result<QueryRequest, frame::FrameError> {
     let mut pos = 0;
     let cql = read_long_string(body, &mut pos)?;
-    Ok(QueryRequest { cql })
+    // The consistency short follows; a well-behaved driver always sends it, but
+    // tolerate a truncated body by defaulting to QUORUM.
+    let consistency =
+        read_short(body, &mut pos).map_or(Consistency::Quorum, Consistency::from_short);
+    Ok(QueryRequest { cql, consistency })
 }
 
 /// Parse a `PREPARE` request body: a single `[long string]` CQL statement.
@@ -76,6 +149,8 @@ pub fn parse_prepare_request(body: &[u8]) -> Result<String, frame::FrameError> {
 pub struct ExecuteRequest {
     /// The opaque prepared-statement id (echoed from the `PREPARED` result).
     pub id: Vec<u8>,
+    /// The requested consistency level.
+    pub consistency: Consistency,
     /// The bound value cells, in order. `None` is a CQL null.
     pub values: Vec<Option<Vec<u8>>>,
 }
@@ -94,7 +169,7 @@ const FLAG_VALUES: u8 = 0x01;
 pub fn parse_execute_request(body: &[u8]) -> Result<ExecuteRequest, frame::FrameError> {
     let mut pos = 0;
     let id = read_short_bytes(body, &mut pos)?;
-    let _consistency = read_short(body, &mut pos)?;
+    let consistency = Consistency::from_short(read_short(body, &mut pos)?);
     let flags = read_byte(body, &mut pos)?;
     let mut values = Vec::new();
     if flags & FLAG_VALUES != 0 {
@@ -103,7 +178,11 @@ pub fn parse_execute_request(body: &[u8]) -> Result<ExecuteRequest, frame::Frame
             values.push(read_bytes(body, &mut pos)?);
         }
     }
-    Ok(ExecuteRequest { id, values })
+    Ok(ExecuteRequest {
+        id,
+        consistency,
+        values,
+    })
 }
 
 fn read_byte(buf: &[u8], pos: &mut usize) -> Result<u8, frame::FrameError> {
@@ -240,6 +319,28 @@ pub fn typed_rows_result(
     Frame::encode_response(stream, Opcode::Result, &body)
 }
 
+/// Encode a `RESULT/Rows` with typed column metadata and any number of rows
+/// (in the supplied order). Each row is a slice of per-column cells (`None` for a
+/// null cell), aligned with `columns`.
+#[must_use]
+pub fn typed_rows_multi(
+    stream: i16,
+    keyspace: &str,
+    table: &str,
+    columns: &[ColumnSpec],
+    rows: &[Vec<Option<Vec<u8>>>],
+) -> Vec<u8> {
+    let mut body = result_kind::ROWS.to_be_bytes().to_vec();
+    write_metadata(&mut body, keyspace, table, columns);
+    body.extend_from_slice(&(rows.len() as i32).to_be_bytes());
+    for row in rows {
+        for cell in row {
+            write_bytes(&mut body, cell.as_deref());
+        }
+    }
+    Frame::encode_response(stream, Opcode::Result, &body)
+}
+
 /// Convenience: build the single result row's cells from typed values, encoding
 /// each per its column spec. A `None` value produces a null cell.
 ///
@@ -314,10 +415,23 @@ mod tests {
         let mut body = Vec::new();
         body.extend_from_slice(&(cql.len() as i32).to_be_bytes());
         body.extend_from_slice(cql.as_bytes());
-        body.extend_from_slice(&1u16.to_be_bytes());
+        body.extend_from_slice(&0x0004u16.to_be_bytes()); // QUORUM
         body.push(0);
         let req = parse_query_request(&body).unwrap();
         assert_eq!(req.cql, cql);
+        assert_eq!(req.consistency, Consistency::Quorum);
+    }
+
+    #[test]
+    fn consistency_maps_to_quorum_sizes() {
+        assert_eq!(consistency_quorum(Consistency::One, 3), 1);
+        assert_eq!(consistency_quorum(Consistency::Quorum, 3), 2);
+        assert_eq!(consistency_quorum(Consistency::All, 3), 3);
+        assert_eq!(consistency_quorum(Consistency::Two, 3), 2);
+        // THREE clamps down on a 2-replica tablet.
+        assert_eq!(consistency_quorum(Consistency::Three, 2), 2);
+        // ALL still needs at least one ack on an empty replica set.
+        assert_eq!(consistency_quorum(Consistency::All, 0), 1);
     }
 
     #[test]
@@ -332,6 +446,7 @@ mod tests {
         write_bytes(&mut body, Some(b"Ada"));
         let req = parse_execute_request(&body).unwrap();
         assert_eq!(req.id, vec![1, 2, 3, 4]);
+        assert_eq!(req.consistency, Consistency::One);
         assert_eq!(req.values.len(), 2);
         assert_eq!(req.values[1].as_deref(), Some(&b"Ada"[..]));
         assert_eq!(execute_statement_id(&body).unwrap(), vec![1, 2, 3, 4]);

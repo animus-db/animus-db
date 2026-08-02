@@ -116,22 +116,52 @@ convention:
   prepare-then-execute path works across connections.
 
 The recognizer (`parse_statement`) accepts `USE` / `CREATE KEYSPACE` /
-`CREATE TABLE` / `INSERT` / `SELECT` (with `?` markers and `keyspace.table`
-names); anything outside the subset is rejected cleanly with a CQL `ERROR` frame.
-`INSERT`/`EXECUTE` reply `RESULT/Void`, `SELECT` replies a typed `RESULT/Rows`,
-and `USE`/`CREATE` reply `SetKeyspace`/`SchemaChange`. Everything routes through
-the **same quorum coordinator** the plain-TCP and DynamoDB edges use; everything
-below the socket stays on the `Env`-based paths.
+`CREATE TABLE` / `INSERT` / `SELECT` / `UPDATE` / `DELETE` (with `?` markers and
+`keyspace.table` names); anything outside the subset is rejected cleanly with a
+CQL `ERROR` frame. `INSERT`/`UPDATE`/`DELETE`/`EXECUTE` reply `RESULT/Void`,
+`SELECT` replies a typed `RESULT/Rows`, and `USE`/`CREATE` reply
+`SetKeyspace`/`SchemaChange`. Everything routes through the **same quorum
+coordinator** the plain-TCP and DynamoDB edges use; everything below the socket
+stays on the `Env`-based paths.
+
+The CQL surface now also covers the row-mutation and key-modeling gaps:
+
+- **Clustering columns / compound primary keys.** `CREATE TABLE` accepts
+  `PRIMARY KEY (pk, ck1, ck2, ...)` — a single partition-key column plus any
+  number of clustering columns (composite multi-column *partition* keys are
+  still rejected). Because the data plane offers only point read/write/delete
+  (no quorum range scan), the **whole partition** — every row sharing a partition
+  key — is stored as one data-plane value keyed by `escape(table) ||
+  pk_key_bytes`, an ordered map of clustering-key blob → row. A `SELECT pk = ?`
+  returns every row in **clustering order**; adding `AND ck = ?` (every
+  clustering column, in order) selects one row. The clustering blob is the
+  order-preserving `to_key_bytes` of each clustering value, so a `BTreeMap` over
+  it yields clustering order for free.
+- **`UPDATE` and `DELETE`.** Both address a row (or partition) by a primary-key
+  `WHERE`, routed through the same coordinator. They are **read-modify-write** of
+  the partition value at the edge (read the partition, apply the mutation, write
+  it back); `UPDATE` is an upsert of non-key cells, `DELETE` removes one row (full
+  primary key) or the whole partition (partition-key-only `WHERE`). A `DELETE`
+  that empties the partition issues a **data-plane delete/tombstone** (ADR 0010)
+  on the key, so it reads back absent and propagates like any tombstone.
+- **Consistency levels.** The QUERY/EXECUTE `[consistency]` is decoded and mapped
+  (`consistency_quorum`) to a per-request R/W quorum over the tablet's replica
+  count — `ONE`→1, `QUORUM`/`LOCAL_QUORUM`→majority, `ALL`→all,
+  `TWO`/`THREE`→that many (clamped) — instead of being ignored: the edge
+  overrides the `TabletView`'s `r`/`w` per request.
 
 What remains. DynamoDB: per-index projection attribute lists (every index
 projects `ALL`), document-path projections (`a.b`),
 `UpdateItem`/`BatchWriteItem`/`TransactWrite`, and durable
 control-plane-replicated table schemas + key/index state (plus a native quorum
-range scan so `Query`/`Scan` need not track keys). CQL: clustering columns
-+ composite/compound partition keys, more statement kinds
-(`UPDATE`/`DELETE`/`BATCH`/`ALTER`/`DROP`), collection/UDT types, paging,
-authentication, `LWT`/conditional writes, honoring the requested consistency
-level (currently ignored), and durable control-plane-replicated schemas.
+range scan so `Query`/`Scan` need not track keys). CQL: composite (multi-column)
+partition keys, the remaining statement kinds (`BATCH`/`ALTER`/`DROP`, per-column
+`DELETE`), range/`IN`/`ORDER BY`/`LIMIT` predicates with a native quorum range
+scan (so a partition need not be one value), collection/UDT types, paging,
+authentication, `LWT`/conditional writes, and durable control-plane-replicated
+schemas. (Now done: clustering/compound primary keys, `UPDATE`/`DELETE`, CQL
+consistency levels; DynamoDB document/set types, projection, `ReturnValues`,
+composite/multiple GSIs + LSI.)
 
 ## Consequences
 
