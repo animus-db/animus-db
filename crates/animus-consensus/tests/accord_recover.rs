@@ -51,7 +51,12 @@ fn recovery_commits_a_stranded_transaction() {
     sim.partition_pair(0, 2);
 
     let txn = nodes[0].submit(keys(&[7]));
-    sim.run_for(Duration::from_secs(1));
+    // Settle the (failed) fast-quorum attempt, but stay **inside** the driver's
+    // failure-detector bound so this test exercises an *explicit* `recover` — not
+    // the auto-recovery that `accord_auto_recover.rs` covers. (The detector fires
+    // only after a transaction is stalled for its full bound; ~200ms is well under
+    // it.)
+    sim.run_for(Duration::from_millis(200));
 
     // The coordinator is stranded: nobody has committed.
     assert!(

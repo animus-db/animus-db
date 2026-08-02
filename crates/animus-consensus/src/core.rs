@@ -173,6 +173,13 @@ struct ReplicaTxn {
     /// so a recoverer adopts the `(execute_at, deps)` of the highest accepted
     /// ballot — the most recent proposal any replica committed to.
     accepted_ballot: Ballot,
+    /// The **ballot a `Commit` was decided under** at this replica (ADR 0011): the
+    /// original coordinator commits at [`Ballot::ZERO`], a recovery coordinator at
+    /// its higher ballot. A later `Commit` carrying a *lower* ballot is **ignored**
+    /// (it cannot revert the recorded decision) — this fences a stale
+    /// original-coordinator `Commit` that arrives after a higher-ballot recovered
+    /// commit (the failure-detector heal race). [`Ballot::ZERO`] until committed.
+    commit_ballot: Ballot,
 }
 
 /// Coordinator-side progress for a transaction this node owns.
@@ -435,6 +442,9 @@ impl AccordCore {
                     // ballot — it must not let a superseded recoverer win.
                     promised: p.promised,
                     accepted_ballot: p.accepted_ballot,
+                    // Restore the commit ballot so a restarted replica still fences
+                    // a stale lower-ballot `Commit` after recovery.
+                    commit_ballot: p.commit_ballot,
                 },
             );
         }
@@ -561,6 +571,109 @@ impl AccordCore {
         std::mem::take(&mut self.pending_read)
     }
 
+    // ---- failure-detector support ---------------------------------------
+
+    /// Whether `txn` is **known here but not yet committed** — i.e. this replica
+    /// has a `PreAccepted`/`Accepted` entry for it but never recorded a `Commit`.
+    /// Such a transaction is *stranded* if its coordinator has died: it will never
+    /// commit on its own. The driver's liveness tick uses this (together with a
+    /// per-txn time bound) to decide whether to auto-trigger recovery. A committed
+    /// or applied transaction returns `false` (it needs no recovery), as does an
+    /// unknown one.
+    #[must_use]
+    pub fn is_uncommitted(&self, txn: TxnId) -> bool {
+        self.txns
+            .get(&txn)
+            .is_some_and(|t| t.phase < Phase::Committed)
+    }
+
+    /// The transactions this replica currently knows of that have **not yet
+    /// committed** here (phase `< Committed`). These are the candidates a liveness
+    /// detector watches: if one stays here past a time bound without progressing to
+    /// `Commit`, its coordinator is suspected dead and recovery is auto-triggered.
+    ///
+    /// Pure read of replica state — the core stays I/O-free and time-free; the
+    /// driver owns the clock and the bound. Deterministic (`BTreeMap` order).
+    #[must_use]
+    pub fn uncommitted_txns(&self) -> Vec<TxnId> {
+        self.txns
+            .iter()
+            .filter(|(_, t)| t.phase < Phase::Committed)
+            .map(|(&txn, _)| txn)
+            .collect()
+    }
+
+    /// The progress "fingerprint" of a transaction at this replica: a value that
+    /// **strictly increases** whenever the transaction advances (phase forward, or
+    /// a higher `execute_at` / more deps / a higher promised ballot adopted). The
+    /// driver compares it across liveness ticks: if it *changed*, the transaction
+    /// is making progress and recovery is deferred (a *slow-but-live* coordinator
+    /// must not be spuriously recovered); if it is unchanged for the whole bound,
+    /// the transaction is stalled. `None` if the transaction is unknown here.
+    ///
+    /// This is intrinsic replica state, so it is identical on every replica that
+    /// has seen the same messages and stays deterministic. It is a monotone summary
+    /// only — never decreases — so a transient reorder cannot fake progress.
+    #[must_use]
+    pub fn progress_fingerprint(&self, txn: TxnId) -> Option<u64> {
+        self.txns.get(&txn).map(|t| {
+            // Mix the monotone facts into one increasing-on-progress number:
+            // phase dominates, then execute_at, then dep count, then promised
+            // ballot round. Each only ever advances, so the sum only grows.
+            (t.phase as u64) << 56
+                | (t.execute_at.logical & 0x000F_FFFF_FFFF_FFFF) << 8
+                | ((t.deps.len() as u64 + t.promised.round).min(0xFF))
+        })
+    }
+
+    /// Whether this node is **actively driving** `txn` itself — either as its
+    /// original coordinator or as an in-flight recovery coordinator. The liveness
+    /// detector skips such a transaction: a node already driving a round (and
+    /// re-sending via its retry tick) must not also self-recover it.
+    #[must_use]
+    pub fn is_driving(&self, txn: TxnId) -> bool {
+        self.coordinating.contains_key(&txn) || self.recovering.contains_key(&txn)
+    }
+
+    /// Whether **this** node is the designated recoverer for a stalled `txn` at
+    /// escalation `tier` (0 = first attempt). To minimise duelling recoverers the
+    /// choice is **deterministic**: the candidates are the replica set with the
+    /// transaction's original coordinator (`txn.node` — the minting node, presumed
+    /// dead) removed, sorted ascending by id; the nominee at tier `t` is the
+    /// `t`-th of those. So at tier 0 exactly **one** node (the lowest-id survivor)
+    /// self-nominates — no duel in the common case — and if that nominee is itself
+    /// dead/partitioned the next tier promotes the next-lowest survivor, and so on,
+    /// until recovery succeeds. When duels do still happen (two tiers fire close
+    /// together, or a healed coordinator), the **ballot** machinery guarantees
+    /// safety and convergence; this only reduces how often they occur.
+    ///
+    /// Returns `false` once `tier` exhausts the candidate list (no nominee), so the
+    /// driver stops escalating. The original coordinator never nominates itself
+    /// (it is the suspected-dead node), so a coordinator that is merely slow but
+    /// alive keeps driving its own transaction via its retry tick without a
+    /// competing self-recovery.
+    #[must_use]
+    pub fn is_recovery_nominee(&self, txn: TxnId, tier: usize) -> bool {
+        // Candidate recoverers: every replica except the (presumed-dead) original
+        // coordinator, ascending by id. `txn.node` is the coordinator that minted
+        // the timestamp/id.
+        let coordinator = txn.node;
+        let nominee = self
+            .all_nodes_sorted()
+            .into_iter()
+            .filter(|&n| n != coordinator)
+            .nth(tier);
+        nominee == Some(self.id)
+    }
+
+    /// The full replica set (this node + peers), ascending by id. Deterministic.
+    fn all_nodes_sorted(&self) -> Vec<NodeId> {
+        let mut all: Vec<NodeId> = self.peers.clone();
+        all.push(self.id);
+        all.sort_unstable();
+        all
+    }
+
     // ---- message retry ---------------------------------------------------
 
     /// Re-emit the outbound messages for every in-flight round that has not yet
@@ -629,6 +742,7 @@ impl AccordCore {
                                     p,
                                     AccordMsg::Commit {
                                         txn,
+                                        ballot: c.ballot,
                                         execute_at: *execute_at,
                                         deps: deps.clone(),
                                         write_keys: c.write_keys.clone(),
@@ -835,13 +949,22 @@ impl AccordCore {
             AccordMsg::AcceptNack { txn, promised } => self.handle_superseded(txn, promised),
             AccordMsg::Commit {
                 txn,
+                ballot,
                 execute_at,
                 deps,
                 write_keys,
                 write_values,
                 read_only,
             } => {
-                self.replica_commit(txn, execute_at, deps, write_keys, write_values, read_only);
+                self.replica_commit(
+                    txn,
+                    ballot,
+                    execute_at,
+                    deps,
+                    write_keys,
+                    write_values,
+                    read_only,
+                );
                 // Acknowledge so the coordinator stops re-sending `Commit` to us
                 // on its retry tick (ADR 0011, message retry). Idempotent: a
                 // duplicate `Commit` re-acks harmlessly.
@@ -1013,6 +1136,7 @@ impl AccordCore {
             read_only,
             promised: Ballot::ZERO,
             accepted_ballot: Ballot::ZERO,
+            commit_ballot: Ballot::ZERO,
         });
         entry.keys.extend(keys.iter().copied());
         entry.write_keys.extend(write_keys.iter().copied());
@@ -1083,6 +1207,7 @@ impl AccordCore {
             read_only: false,
             promised: Ballot::ZERO,
             accepted_ballot: Ballot::ZERO,
+            commit_ballot: Ballot::ZERO,
         });
         entry.execute_at = entry.execute_at.max(execute_at);
         entry.deps.extend(deps.iter().copied());
@@ -1108,9 +1233,11 @@ impl AccordCore {
     /// Replica side of `Commit`: record the final execution timestamp and deps —
     /// the durable agreement point — then try to execute any transactions that
     /// have become applicable.
+    #[allow(clippy::too_many_arguments)]
     fn replica_commit(
         &mut self,
         txn: TxnId,
+        ballot: Ballot,
         execute_at: Timestamp,
         deps: BTreeSet<TxnId>,
         write_keys: BTreeSet<Key>,
@@ -1128,10 +1255,12 @@ impl AccordCore {
             read_only,
             promised: Ballot::ZERO,
             accepted_ballot: Ballot::ZERO,
+            commit_ballot: Ballot::ZERO,
         });
         // The Commit carries the authoritative write set (so a replica that
         // missed PreAccept still executes the right write); the write keys are
-        // also part of the conflict set, and the values it must execute.
+        // also part of the conflict set, and the values it must execute. These are
+        // monotone facts, folded regardless of ballot.
         entry.keys.extend(write_keys.iter().copied());
         entry.write_keys.extend(write_keys.iter().copied());
         for (k, v) in &write_values {
@@ -1139,6 +1268,22 @@ impl AccordCore {
         }
         // Read-only iff it writes nothing (consistent with `write_keys`).
         entry.read_only = (entry.read_only && read_only) && entry.write_keys.is_empty();
+
+        // **Ballot fence on the decision.** A `Commit` whose ballot is *below* the
+        // ballot a commit was already recorded under here is stale — e.g. a late
+        // original-coordinator `Commit` (`Ballot::ZERO`) arriving after a survivor's
+        // higher-ballot recovered commit (the failure-detector heal race). Adopting
+        // it would revert the recovered `(execute_at, deps)` and diverge the store,
+        // so we **ignore** the decision part of it (the monotone facts above were
+        // still folded). A commit at an equal-or-higher ballot is adopted.
+        let already_committed = entry.phase >= Phase::Committed;
+        if already_committed && ballot < entry.commit_ballot {
+            // Stale lower-ballot commit: keep the recorded decision. Still try to
+            // execute in case the folded facts unblocked something.
+            self.try_execute();
+            return;
+        }
+
         // A txn already applied stays applied (idempotent under a duplicate
         // Commit); otherwise mark it committed and (re)record the final state.
         if entry.phase < Phase::Committed {
@@ -1146,11 +1291,13 @@ impl AccordCore {
         }
         entry.execute_at = execute_at;
         entry.deps = deps.clone();
+        entry.commit_ballot = entry.commit_ballot.max(ballot);
         if entry.phase == Phase::Committed {
             let keys = entry.keys.clone();
             let record_write_keys = entry.write_keys.clone();
             let record_write_values = entry.write_values.clone();
             let record_read_only = entry.read_only;
+            let record_ballot = entry.commit_ballot;
             self.pending.push(WalRecord::Committed {
                 txn,
                 keys,
@@ -1159,6 +1306,7 @@ impl AccordCore {
                 execute_at,
                 deps,
                 read_only: record_read_only,
+                commit_ballot: record_ballot,
             });
         }
         self.try_execute();
@@ -1439,12 +1587,20 @@ impl AccordCore {
         deps: BTreeSet<TxnId>,
         fast_path: bool,
     ) -> Vec<Out> {
-        let (read_only, write_keys, write_values) = self
-            .coordinating
-            .get(&txn)
-            .map_or((false, BTreeSet::new(), BTreeMap::new()), |c| {
-                (c.read_only, c.write_keys.clone(), c.write_values.clone())
-            });
+        let (read_only, write_keys, write_values, ballot) = self.coordinating.get(&txn).map_or(
+            (false, BTreeSet::new(), BTreeMap::new(), Ballot::ZERO),
+            |c| {
+                (
+                    c.read_only,
+                    c.write_keys.clone(),
+                    c.write_values.clone(),
+                    // The ballot the decision is committed under: `Ballot::ZERO`
+                    // for the original coordinator, the recovery ballot otherwise.
+                    // It fences a stale lower-ballot `Commit` at every replica.
+                    c.ballot,
+                )
+            },
+        );
         if let Some(c) = self.coordinating.get_mut(&txn) {
             if c.phase == CoordPhase::Done {
                 return Vec::new();
@@ -1456,6 +1612,7 @@ impl AccordCore {
         }
         self.replica_commit(
             txn,
+            ballot,
             execute_at,
             deps.clone(),
             write_keys.clone(),
@@ -1474,6 +1631,7 @@ impl AccordCore {
                     p,
                     AccordMsg::Commit {
                         txn,
+                        ballot,
                         execute_at,
                         deps: deps.clone(),
                         write_keys: write_keys.clone(),
@@ -1601,6 +1759,7 @@ impl AccordCore {
                 read_only: false,
                 promised: Ballot::ZERO,
                 accepted_ballot: Ballot::ZERO,
+                commit_ballot: Ballot::ZERO,
             }
         });
         if newly_witnessed {

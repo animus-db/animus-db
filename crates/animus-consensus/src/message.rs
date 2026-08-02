@@ -83,6 +83,15 @@ pub enum AccordMsg {
     /// `Commit` (missed its `PreAccept`) still knows to execute it as a read.
     Commit {
         txn: TxnId,
+        /// The **ballot** this commit was decided under (ADR 0011): the original
+        /// coordinator commits at the implicit [`Ballot::ZERO`](crate::Ballot::ZERO);
+        /// a *recovery* coordinator at the higher ballot it ran. A replica records
+        /// the highest commit-ballot it has seen and **ignores a `Commit` whose
+        /// ballot is below it**, so a late original-coordinator commit cannot revert
+        /// a higher-ballot recovered decision after a heal (the failure-detector
+        /// heal race). `#[serde(default)]` for additivity (absent ⇒ `Ballot::ZERO`).
+        #[serde(default)]
+        ballot: Ballot,
         execute_at: Timestamp,
         deps: BTreeSet<TxnId>,
         /// The subset of the transaction's keys it writes (so a replica that

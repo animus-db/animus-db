@@ -87,6 +87,13 @@ pub enum WalRecord {
         /// Whether the transaction is read-only.
         #[serde(default)]
         read_only: bool,
+        /// The **ballot** this commit was decided under (ADR 0011): `Ballot::ZERO`
+        /// for the original coordinator, the recovery ballot for a recovered one.
+        /// Recorded so a restarted replica keeps the highest commit-ballot it saw
+        /// and still fences a stale lower-ballot `Commit`. `#[serde(default)]` ⇒
+        /// `Ballot::ZERO` for forward-compat.
+        #[serde(default)]
+        commit_ballot: Ballot,
     },
     /// The transaction's effect was applied to the store (executed). Recorded so
     /// a recovered replica does not re-apply an already-applied effect and
@@ -136,6 +143,11 @@ pub struct PersistedTxn {
     /// `Accept`). Reported in `RecoverOk` so a later recoverer adopts the
     /// highest-ballot proposal. [`Ballot::ZERO`] if only PreAccepted.
     pub accepted_ballot: Ballot,
+    /// The highest ballot a **`Commit`** for this transaction was decided under
+    /// (ADR 0011). A restarted replica fences any later `Commit` below this, so a
+    /// stale original-coordinator commit cannot revert a recovered decision.
+    /// [`Ballot::ZERO`] if not committed, or committed only by the original.
+    pub commit_ballot: Ballot,
 }
 
 /// Durable Accord replica state reconstructed by replaying the write-ahead log.
@@ -206,16 +218,26 @@ impl PersistedState {
                     execute_at,
                     deps,
                     read_only,
+                    commit_ballot,
                     ..
                 } => {
                     let entry = state.txns.entry(txn).or_default();
+                    // Keys/values/read-only are monotone facts — always fold them.
                     entry.keys.extend(keys);
                     entry.write_keys.extend(write_keys);
                     entry.write_values.extend(write_values);
-                    entry.execute_at = execute_at;
-                    entry.deps = deps;
-                    entry.phase = Phase::Committed;
                     entry.read_only |= read_only;
+                    // Fence the **decision** by commit ballot: a `Commit` at a ballot
+                    // below the highest already committed here is stale (e.g. a late
+                    // original-coordinator commit replayed after a recovered one) and
+                    // must not overwrite the higher-ballot `(execute_at, deps)`.
+                    let not_yet_committed = entry.phase < Phase::Committed;
+                    if not_yet_committed || commit_ballot >= entry.commit_ballot {
+                        entry.execute_at = execute_at;
+                        entry.deps = deps;
+                        entry.commit_ballot = entry.commit_ballot.max(commit_ballot);
+                    }
+                    entry.phase = entry.phase.max_phase(Phase::Committed);
                 }
                 WalRecord::Applied { .. } => {
                     let entry = state.txns.entry(txn).or_default();
