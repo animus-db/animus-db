@@ -91,8 +91,8 @@ plane now holds a **replicated table-schema catalog** (ADR 0013) the adapters ca
 consume to replace their per-process in-memory catalogs (that adapter wiring is
 the follow-up) — and the deferred remainder of Accord
 (the full dependency wait-graph, the precise recovery ballot + duelling
-recoverers + a failure detector, WAL snapshotting, data-plane *reads*, and
-sharded transactions across tablets).
+recoverers + a failure detector, WAL snapshotting, and sharded transactions
+across tablets).
 
 ## Per-crate guides
 
@@ -336,13 +336,22 @@ write transaction can also be wired to the **replicated data plane**
 (`AccordNode::start_with_data_plane`): on Apply its keys are written through the
 `animus-data` quorum coordinator at the execution timestamp, so the transaction's
 atomic, ordered effect becomes readable via ordinary data-plane quorum reads (no
-dependency cycle — `animus-data` does not depend on consensus).
+dependency cycle — `animus-data` does not depend on consensus). A wired **read
+transaction reads from that same data plane** (a quorum read at its execution
+time, sound because the read's effect is emitted only after every earlier-ordered
+write has applied to the quorum). An **interactive** `begin → read → decide →
+write → commit` handle (`AccordNode::begin` → `InteractiveTxn`) runs a multi-step
+read-modify-write under one Accord transaction — the handle is pure driver state,
+committing through `submit`, so conflicting interactive transactions are ordered
+consistently and land atomically.
 The driver's real-thread liveness (no mutex guard held across `.await`) is
 guarded by a multi-threaded `ProdEnv` regression test, since `SimEnv` proves
-order but not thread liveness. **Deferred:** the full dependency wait-graph, the
-precise recovery ballot + duelling recoverers + a failure detector, WAL
-snapshotting, data-plane *reads*, and **sharded** (multi-tablet)
-transactions — see ADR 0011 and the crate guide.
+order but not thread liveness. **Deferred:** **sharded** (multi-tablet)
+transactions, folding the interactive read set into the transaction's dependency
+tracking (full read/write transactions in one round), an adaptive retry
+backoff, the full dependency wait-graph, the precise recovery ballot + duelling
+recoverers + a failure detector, and WAL snapshotting — see ADR 0011 and the
+crate guide.
 
 ### Storage (`animus-storage`)
 

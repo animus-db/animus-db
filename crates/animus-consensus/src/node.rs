@@ -34,7 +34,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use animus_data::{DataClient, TabletView};
+use animus_data::{DataClient, ReadResult, TabletView};
 use animus_env::{Env, EnvExt, NodeId};
 use animus_storage::{MemoryEngine, StorageEngine};
 
@@ -306,8 +306,130 @@ impl<E: Env, S: StorageEngine + 'static> AccordNode<E, S> {
         self.lock().decisions().to_vec()
     }
 
+    /// Begin an **interactive** transaction on this node: a `begin → read* →
+    /// write* → commit` handle that lets a caller run a multi-step
+    /// read-modify-write under **one** Accord transaction, instead of submitting
+    /// a pre-baked op set.
+    ///
+    /// The handle's [`InteractiveTxn::read`] observes the current committed value
+    /// of a key (through the data plane when the node is wired to it, else the
+    /// local execution store) so the caller can *decide* what to write;
+    /// [`InteractiveTxn::write`] buffers a write; and [`InteractiveTxn::commit`]
+    /// submits the buffered writes as a single Accord **write** transaction —
+    /// agreed, ordered and applied atomically at one execution timestamp, exactly
+    /// like [`AccordNode::submit`]. So concurrent interactive transactions whose
+    /// write sets conflict are ordered consistently on every replica, and each
+    /// transaction's writes land all-or-nothing.
+    ///
+    /// The reads *inform* the decision; they are not themselves part of the
+    /// committed write transaction's conflict set in this slice. Folding the
+    /// interactive read set into the transaction's conflict/dependency tracking
+    /// (full read/write transactions in one Accord round) is the natural next
+    /// step — see ADR 0011. The core stays sync + I/O-free: the handle is pure
+    /// driver state and uses the existing `submit` entry point.
+    #[must_use]
+    pub fn begin(&self) -> InteractiveTxn<E, S> {
+        InteractiveTxn {
+            node: self.clone(),
+            reads: BTreeSet::new(),
+            writes: BTreeSet::new(),
+        }
+    }
+
+    /// Read the current committed writer of `key` as seen by this node: through
+    /// the replicated **data plane** quorum when the node is wired to it (the
+    /// frontier path), else from the local execution store. Used by
+    /// [`InteractiveTxn::read`]; exposed so a caller can do an ad-hoc current read
+    /// without opening a transaction.
+    pub async fn current_writer(&self, key: Key) -> Option<TxnId> {
+        match &self.sink {
+            Some(sink) => match sink
+                .client
+                .read(&sink.view, &storage_key(key), DATA_TIMEOUT)
+                .await
+            {
+                ReadResult::Value(Some(bytes)) => decode_txn(&bytes),
+                ReadResult::Value(None) | ReadResult::Failed => None,
+            },
+            None => self.store_writer(key).await,
+        }
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, AccordCore> {
         self.core.lock().expect("accord core poisoned")
+    }
+}
+
+/// An **interactive** transaction handle: `begin → read* → write* → commit`
+/// (ADR 0011). Created by [`AccordNode::begin`].
+///
+/// A caller runs a multi-step read-modify-write under **one** Accord
+/// transaction: [`InteractiveTxn::read`] returns the current committed writer of
+/// a key (so the caller can branch on it), [`InteractiveTxn::write`] buffers a
+/// write, and [`InteractiveTxn::commit`] submits the buffered write set as a
+/// single Accord write transaction (via [`AccordNode::submit`]) — agreed,
+/// ordered, and applied atomically at one execution timestamp. So two interactive
+/// transactions whose write sets conflict are ordered consistently on every
+/// replica and each lands all-or-nothing.
+///
+/// The handle is **pure driver state** — it holds no lock and touches the sync
+/// core only through `submit` at commit time, so the core stays I/O-free.
+///
+/// **This slice's scope.** The session reads *inform* the commit decision but are
+/// not themselves serialized into the committed transaction's conflict set
+/// (Accord read/write transactions in one round, where the read set also carries
+/// dependencies, are the deferred next step — see ADR 0011). A `commit` with an
+/// empty write set is a no-op that returns `None`.
+pub struct InteractiveTxn<E: Env, S: StorageEngine = MemoryEngine> {
+    node: AccordNode<E, S>,
+    /// Keys read during the session (kept for introspection / a future read-set
+    /// conflict fold; not yet serialized into the committed transaction).
+    reads: BTreeSet<Key>,
+    /// Keys the session will write when committed.
+    writes: BTreeSet<Key>,
+}
+
+impl<E: Env, S: StorageEngine + 'static> InteractiveTxn<E, S> {
+    /// Read the current committed writer of `key` and record it in the read set.
+    /// Reads through the replicated data plane when the node is wired to it (the
+    /// frontier path), else the local execution store. Returns the observed
+    /// writer (`None` if the key has no committed write), so the caller can
+    /// decide what to write next.
+    pub async fn read(&mut self, key: Key) -> Option<TxnId> {
+        self.reads.insert(key);
+        self.node.current_writer(key).await
+    }
+
+    /// Buffer a write to `key`. The value written when the transaction commits is
+    /// the committed transaction's own id (the standard Accord execution effect;
+    /// see [`ApplyEffect`]). Multiple writes to distinct keys land atomically.
+    pub fn write(&mut self, key: Key) {
+        self.writes.insert(key);
+    }
+
+    /// The keys read so far in this session.
+    #[must_use]
+    pub fn read_set(&self) -> &BTreeSet<Key> {
+        &self.reads
+    }
+
+    /// The keys buffered to write on commit.
+    #[must_use]
+    pub fn write_set(&self) -> &BTreeSet<Key> {
+        &self.writes
+    }
+
+    /// Commit the buffered writes as a single Accord write transaction. Returns
+    /// the committed [`TxnId`], or `None` if nothing was written (an empty
+    /// transaction is a no-op). The transaction is agreed, ordered, and applied
+    /// atomically at one execution timestamp exactly like [`AccordNode::submit`],
+    /// so conflicting interactive transactions are ordered consistently on every
+    /// replica.
+    pub fn commit(self) -> Option<TxnId> {
+        if self.writes.is_empty() {
+            return None;
+        }
+        Some(self.node.submit(self.writes))
     }
 }
 
@@ -374,7 +496,7 @@ fn persist_then_ship<E: Env, S: StorageEngine + 'static>(
         // emits a read effect once its earlier-ordered conflicts are `Applied`,
         // so their write effects were drained no later than this one).
         apply_all(&storage, sink.as_deref(), &applies).await;
-        satisfy_reads(&storage, &reads, &read_effects).await;
+        satisfy_reads(&storage, sink.as_deref(), &reads, &read_effects).await;
         for (to, msg) in outs {
             let bytes = serde_json::to_vec(&msg).expect("accord message serializes");
             env.send(to, bytes).await;
@@ -424,12 +546,30 @@ async fn apply_all<E: Env, S: StorageEngine>(
 }
 
 /// Satisfy read-only transactions: for each [`ReadEffect`], read every key it
-/// touches **as of** the read's execution timestamp (`get_at`) — so the read
-/// observes exactly the writes that executed before it (lower MVCC version) and
-/// none after — decode the observed writer id, and record the per-key result in
-/// the shared [`ReadResults`] under the read txn's id.
-async fn satisfy_reads<S: StorageEngine>(
+/// touches and record the observed per-key writer id in the shared
+/// [`ReadResults`] under the read txn's id.
+///
+/// **Where the read lands depends on the wiring** (ADR 0011):
+///
+/// - **Local execution store** (no [`DataSink`]): read each key *as of* the
+///   read's execution timestamp (`get_at`) — so it observes exactly the writes
+///   that executed before it (lower MVCC version) and none after. This is the
+///   per-node consensus store path.
+/// - **Replicated data plane** (a [`DataSink`] is present, the frontier path):
+///   read each key through the data-plane **quorum** coordinator
+///   ([`DataClient::read`]) — so a read observes the same replicated state the
+///   committed *write* transactions land in (the data-plane write effect in
+///   [`apply_all`]), not a private local snapshot. This is correct *because*
+///   the read is ordered like a write: the core only emits its [`ReadEffect`]
+///   once every earlier-ordered conflicting write has `Applied`, and an applied
+///   write's effect has already been pushed through the same data-plane quorum
+///   — so a current quorum read at execution time observes exactly those writes
+///   and none ordered after. (The data-plane wire carries no historical
+///   `get_at`-by-version read, so this relies on the execution-order gate, not a
+///   versioned snapshot.)
+async fn satisfy_reads<E: Env, S: StorageEngine>(
     storage: &S,
+    sink: Option<&DataSink<E>>,
     reads: &ReadResults,
     read_effects: &[ReadEffect],
 ) {
@@ -437,11 +577,26 @@ async fn satisfy_reads<S: StorageEngine>(
         let version = effect.version.logical;
         let mut observed: BTreeMap<Key, Option<TxnId>> = BTreeMap::new();
         for &key in &effect.keys {
-            let writer = storage
-                .get_at(&storage_key(key), version)
-                .await
-                .expect("storage get_at")
-                .and_then(|vv| decode_txn(&vv.value));
+            let writer = match sink {
+                // Frontier: observe the replicated data plane (quorum read).
+                Some(sink) => match sink
+                    .client
+                    .read(&sink.view, &storage_key(key), DATA_TIMEOUT)
+                    .await
+                {
+                    ReadResult::Value(Some(bytes)) => decode_txn(&bytes),
+                    // Absent everywhere, or a quorum could not be reached: the
+                    // read observes nothing for this key (a transient quorum
+                    // miss converges via the data plane's own anti-entropy).
+                    ReadResult::Value(None) | ReadResult::Failed => None,
+                },
+                // Local consensus store: snapshot read as of the execution ts.
+                None => storage
+                    .get_at(&storage_key(key), version)
+                    .await
+                    .expect("storage get_at")
+                    .and_then(|vv| decode_txn(&vv.value)),
+            };
             observed.insert(key, writer);
         }
         reads
@@ -477,9 +632,14 @@ async fn drive<E: Env, S: StorageEngine + 'static>(
         };
         // Recovery re-applies into the *local* engine only (the per-node recovery
         // substrate): the data plane already holds the committed writes durably,
-        // so there is no need to re-push them on every restart.
+        // so there is no need to re-push them on every restart. For the same
+        // reason recovered reads are re-satisfied from the *local* engine
+        // (`None` sink) — the writes ordered before each recovered read were
+        // re-applied locally just above, so the recovered observation matches the
+        // original; a live data-plane quorum read would instead reflect current
+        // (possibly newer) state.
         apply_all::<E, S>(&storage, None, &applies).await;
-        satisfy_reads(&storage, &reads, &read_effects).await;
+        satisfy_reads::<E, S>(&storage, None, &reads, &read_effects).await;
     }
 
     loop {
