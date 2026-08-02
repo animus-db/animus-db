@@ -65,8 +65,8 @@ pub use plan::{
     encode_clustering, plan_delete, plan_insert, plan_select, plan_update, schema_of,
 };
 pub use query::{
-    CreateTable, Delete, Insert, Predicate, QueryError, Select, Statement, Term, Update, data_key,
-    parse_statement,
+    AlterTable, Batch, CreateTable, Delete, DropTable, Insert, Predicate, QueryError, Select,
+    Statement, Term, Update, data_key, parse_statement,
 };
 pub use response::{
     Consistency, ExecuteRequest, QueryRequest, consistency_quorum, parse_execute_request,

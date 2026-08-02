@@ -6,3 +6,6 @@ Cargo.lock
 /.idea
 /.vscode
 *:Zone.Identifier
+
+# Agent-isolation worktrees (not part of the repo)
+.claude/worktrees/

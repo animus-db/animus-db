@@ -27,13 +27,20 @@ stays deterministic and unit-testable. The socket edge that drives it lives in
   `to_key_bytes` is the order-preserving partition/clustering-key encoding (ints
   xor the sign bit so byte order matches numeric order).
 - `catalog` — `Catalog` of keyspaces → `TableSchema` (ordered typed columns +
-  the partition-key index + the ordered `clustering_keys` indices).
-  **In-memory, not durable** (see below).
+  the partition-key index + the ordered `clustering_keys` indices). This is the
+  pure planner's input shape; the **durable** catalog now lives in the control
+  plane (ADR 0013) and the `animusd` edge builds an ephemeral one-table `Catalog`
+  from the replicated schema per request (see below). The type still also serves
+  the crate's own unit tests.
 - `query::parse_statement` — recognizes `USE` / `CREATE KEYSPACE` /
   `CREATE TABLE` (with compound `PRIMARY KEY (pk, ck1, ...)`) / `INSERT` /
-  `SELECT` / `UPDATE` / `DELETE` into a `Statement` tree, with `?` bind markers
-  (`Term::Bind`), `keyspace.table` names, and a `WHERE` of equality `Predicate`s.
-  **Not** a full grammar (single-column partition key, equality only).
+  `SELECT` / `UPDATE` / `DELETE` / `DROP TABLE [IF EXISTS]` /
+  `ALTER TABLE ... ADD <col> <type>` / `BEGIN [UNLOGGED] BATCH ... APPLY BATCH`
+  into a `Statement` tree, with `?` bind markers (`Term::Bind`), `keyspace.table`
+  names, and a `WHERE` of equality `Predicate`s. **Not** a full grammar
+  (single-column partition key, equality only). A `BATCH` is parsed from the raw
+  text (it spans several `;`-separated members) and may contain only
+  `INSERT`/`UPDATE`/`DELETE`.
 - `plan` — schema resolution + the **partition** (de)serialization. `plan_insert`
   / `plan_update` / `plan_delete` / `plan_select` resolve a parsed statement (+
   bound `CqlValue`s) against the catalog, type-check, and produce an
@@ -85,14 +92,36 @@ stays deterministic and unit-testable. The socket edge that drives it lives in
 - Determinism (ADR 0003): no `HashMap`/`HashSet`; the catalog and row decode use
   `BTreeMap`, and the `[string map]` parser returns a `BTreeMap`. No clock/RNG/IO.
 
+## Schemas are control-plane replicated (ADR 0013)
+
+The durable catalog now lives in the **control plane**, not here. The `animusd`
+edge maps this crate's `TableSchema` ⇄ `animus_control::TableSchema` (`CqlType`
+⇄ `ColumnType`: text↔String, int↔Int, bigint↔BigInt, boolean↔Bool, blob↔Binary,
+uuid↔Uuid) and:
+- `CREATE TABLE` proposes `MetaCommand::CreateTableSchema` (keyed `ks.table`) and
+  waits for commit, so the table is **durable + cluster-agreed**;
+- `DROP TABLE` proposes `DropTableSchema`; `ALTER TABLE ... ADD` drops + recreates
+  the schema with appended columns (column indices are preserved, so stored rows
+  still decode — but the two steps are not atomic);
+- `INSERT`/`SELECT`/`UPDATE`/`DELETE` resolve the schema from the replicated
+  `Metadata` and plan against a throwaway one-table `Catalog`.
+
+This crate stays **pure** (no `animus-control` dependency): the mapping and the
+proposal/wait live in `animusd::cql`. Keep it that way — all
+parsing/encoding/planning stays here, control-plane wiring stays at the edge.
+
 ## Limitations (documented)
 
-- The catalog is **in-memory and not durable** — schemas are lost on restart;
-  replicating them through the control plane is future work (ADR 0006). At the
-  `animusd` edge the catalog is **process-global** (shared across all nodes'
-  listeners in one process), so in `--cluster N` dev mode a `CREATE TABLE` on one
-  node is visible on another — but a one-process-per-node deployment has a
-  per-process catalog.
+- A `BATCH` applies its members **in order but not atomically** — there is no
+  cross-statement rollback; a member failing mid-batch returns its error with
+  earlier members already applied. (CQL logged-batch atomicity is future work.)
+- `ALTER TABLE` supports only `ADD <col> <type>`, implemented as a non-atomic
+  drop+recreate of the replicated schema (an in-place schema-mutation
+  `MetaCommand` is future work).
+- **Keyspaces** are not separately replicated (the control catalog models tables,
+  keyed `ks.table`): the edge keeps a process-local keyspace set for
+  `USE`/qualifier checks, plus treating a keyspace with a replicated `ks.table`
+  as existing. Replicating keyspace metadata is future work (ADR 0006/0013).
 - A table has a **single partition-key column** (composite/multi-column
   partition keys are rejected loudly by the parser), but may have any number of
   **clustering columns**. `SELECT`/`UPDATE`/`DELETE` accept a `pk = value`
@@ -115,19 +144,22 @@ stays deterministic and unit-testable. The socket edge that drives it lives in
 kinds incl. compound primary keys + `UPDATE`/`DELETE` + rejections), the planner
 (typed INSERT→SELECT round-trip, clustering-ordered partition decode, UPDATE/
 DELETE plans, bind resolution + type-mismatch rejection), and the
-consistency→quorum mapping. End-to-end wire tests over real TCP live in
-`animusd/tests/cql_wire.rs` (STARTUP → CREATE KEYSPACE/USE/CREATE TABLE →
-PREPARE → EXECUTE → typed SELECT) and `animusd/tests/cql_clustering.rs`
-(compound primary key → INSERT several rows out of order → clustering-ordered
-SELECT → single-row SELECT → UPDATE → single-row + whole-partition DELETE, at
-QUORUM consistency).
+consistency→quorum mapping, plus the recognizer for `DROP`/`ALTER ADD`/`BATCH`.
+End-to-end wire tests over real TCP live in `animusd/tests/cql_wire.rs`
+(STARTUP → CREATE KEYSPACE/USE/CREATE TABLE → PREPARE → EXECUTE → typed SELECT),
+`animusd/tests/cql_clustering.rs` (compound primary key → INSERT several rows out
+of order → clustering-ordered SELECT → single-row SELECT → UPDATE → single-row +
+whole-partition DELETE, at QUORUM consistency), and
+`animusd/tests/cql_durable_schema.rs` (ADR 0013: `CREATE TABLE` + an `INSERT`'d
+row **survive a node restart** via the replicated schema catalog; plus the
+`BATCH`/`ALTER ADD`/`DROP TABLE` surface over the wire).
 
 ## When you extend this
 
-- Composite (multi-column) partition keys, `BATCH`/`ALTER`/`DROP`, per-column
-  `DELETE`, range/`IN`/`ORDER BY`/`LIMIT` predicates with native quorum range
-  scan (so a partition need not be one value), collection/UDT types, paging,
-  authentication, conditional writes (`LWT`), and durable
-  control-plane-replicated schemas are the next steps. Keep all
-  parsing/encoding/planning here (pure) and only the socket loop + the shared
-  catalog/prepared-statement state in `animusd`.
+- Composite (multi-column) partition keys, per-column `DELETE`, atomic logged
+  `BATCH`, in-place `ALTER`, range/`IN`/`ORDER BY`/`LIMIT` predicates with native
+  quorum range scan (so a partition need not be one value), collection/UDT types,
+  paging, authentication, and conditional writes (`LWT`) are the next steps.
+  (Now done: durable control-plane-replicated schemas, `DROP`/`ALTER ADD`,
+  `BATCH`.) Keep all parsing/encoding/planning here (pure) and only the socket
+  loop + the schema mapping/proposal + the prepared-statement state in `animusd`.

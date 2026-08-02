@@ -23,38 +23,55 @@
 //! - `OPTIONS` → `SUPPORTED` (CQL 3.0.0, no compression).
 //! - `QUERY`:
 //!   - `CREATE KEYSPACE` / `USE <keyspace>` — record / select a keyspace.
-//!   - `CREATE TABLE` — record a schema (one partition key column + typed
-//!     columns) in the in-memory catalog.
-//!   - `INSERT` / `SELECT` — resolved against the catalog, with a real
-//!     `text/int/bigint/boolean/blob/uuid` type system; quorum write / read.
+//!   - `CREATE TABLE` — **propose the schema to the control plane** and wait for
+//!     it to commit (ADR 0013), so the table is durable + cluster-agreed.
+//!   - `DROP TABLE` — propose `DropTableSchema` and wait for it to replicate.
+//!   - `ALTER TABLE ... ADD` — append columns (drop + recreate the replicated
+//!     schema with the extended column list; see the gotcha below).
+//!   - `INSERT` / `SELECT` / `UPDATE` / `DELETE` — resolved against the
+//!     **replicated** schema, with a real `text/int/bigint/boolean/blob/uuid`
+//!     type system; quorum write / read.
+//!   - `BATCH` — a sequence of `INSERT`/`UPDATE`/`DELETE` applied in order.
 //! - `PREPARE` → `RESULT/Prepared` (statement id + bind metadata); `EXECUTE`
 //!   (bound values) → the same result a `QUERY` would give. A real driver's
 //!   prepare/execute path works.
 //!
-//! ## State that lives at the edge (not below it)
+//! ## Schemas are now control-plane replicated (ADR 0013)
 //!
-//! Two pieces of mutable state are owned by this **production edge** because
-//! they are not (yet) replicated through the control plane:
+//! `CREATE TABLE` / `DROP TABLE` mutate the **Raft-replicated** schema catalog in
+//! the control plane (`MetaCommand::{CreateTableSchema, DropTableSchema}`), and
+//! `INSERT`/`SELECT`/`UPDATE`/`DELETE` resolve their schema from the cached,
+//! replicated `Metadata` ([`ClientCtx::table_schema`]). So a created table is
+//! **durable** (survives a node restart — recovered from the Raft WAL/snapshot)
+//! and **cluster-agreed** (every node sees the same schema), replacing the old
+//! per-process in-memory catalog. The control-plane catalog keys tables by a
+//! `ks.table` convention (the `TableName` is opaque to the control plane), so the
+//! CQL edge namespaces every table as `keyspace.table`.
 //!
-//! - the **schema catalog** ([`animus_cql::Catalog`]) — *in-memory, not
-//!   durable*: lost on restart, shared across in-process nodes in `--cluster N`
-//!   dev mode. Control-plane-replicated schemas are future work (ADR 0006), as
-//!   on the DynamoDB side.
-//! - the **prepared-statement store** — content-addressed: a statement's id is a
+//! ## State that still lives at the edge (not control-plane replicated)
+//!
+//! - The **prepared-statement store** — content-addressed: a statement's id is a
 //!   stable hash of its text, so `PREPARE` then `EXECUTE` works even across
-//!   connections.
+//!   connections. Re-parsed on `EXECUTE`, so the planning path is shared.
+//! - **Keyspaces** are *not* separately replicated (the control-plane catalog
+//!   models tables, not keyspaces): the edge keeps a process-local set of created
+//!   keyspaces for `USE`/qualifier validation, and additionally treats a keyspace
+//!   as existing if any replicated `ks.table` belongs to it (so a keyspace with
+//!   tables is recognized after a restart). Replicating keyspace metadata itself
+//!   is future work (ADR 0006/0013).
 //!
 //! The pure protocol/type/catalog logic stays in `animus_cql`; only the socket
 //! loop and this shared state live here.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use animus_control::{ColumnDef, ColumnType, TableSchema as ControlSchema};
 use animus_cql::frame::{self, Frame, Opcode};
 use animus_cql::{
-    Catalog, ColumnSpec, Consistency, CqlType, CqlValue, DeletePlan, InsertPlan, Partition,
-    ReadPlan, Statement, UpdatePlan, response,
+    AlterTable, Catalog, Column, ColumnSpec, Consistency, CqlType, CqlValue, DeletePlan,
+    InsertPlan, Partition, ReadPlan, Statement, TableSchema as CqlSchema, UpdatePlan, response,
 };
 use animus_data::TabletView;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -75,11 +92,15 @@ struct Prepared {
 }
 
 /// Process-wide CQL edge state shared across all connections of a node: the
-/// schema catalog and the prepared-statement store, both behind one async mutex
-/// (contention here is negligible — these are tiny in-memory maps).
+/// known keyspaces (not control-plane replicated, see the module docs) and the
+/// prepared-statement store, both behind one async mutex (contention here is
+/// negligible — these are tiny in-memory maps). The *table schemas* no longer
+/// live here: they are in the control plane's replicated catalog (ADR 0013).
 #[derive(Default)]
 struct CqlState {
-    catalog: Catalog,
+    /// Created keyspaces (lowercased). Keyspace metadata is not replicated; a
+    /// keyspace also counts as existing if a replicated `ks.table` belongs to it.
+    keyspaces: BTreeSet<String>,
     /// statement id → prepared statement (id is a content hash of the text).
     prepared: BTreeMap<Vec<u8>, Prepared>,
 }
@@ -90,13 +111,9 @@ struct Session {
     keyspace: Option<String>,
 }
 
-/// The process-wide CQL edge state. It is shared across **all nodes' CQL
-/// listeners in one process** — matching the DynamoDB `SchemaRegistry`'s
-/// behavior, so in single-process `--cluster N` dev mode a `CREATE TABLE` on one
-/// node is visible to a `SELECT` on another (the catalog is not control-plane
-/// replicated). In a one-process-per-node deployment each process has its own
-/// catalog, so schemas must be (re)created per process — an accepted limitation
-/// until schemas are replicated (ADR 0006).
+/// The process-wide CQL edge state (keyspaces + prepared statements), shared
+/// across all nodes' CQL listeners in one process. Table schemas are **not** here
+/// anymore — they live in the control plane's replicated catalog.
 fn shared_state() -> Arc<Mutex<CqlState>> {
     static STATE: OnceLock<Arc<Mutex<CqlState>>> = OnceLock::new();
     STATE
@@ -104,9 +121,132 @@ fn shared_state() -> Arc<Mutex<CqlState>> {
         .clone()
 }
 
+// --- schema mapping: CQL <-> control-plane (ADR 0013) -----------------------
+
+/// The control-plane catalog key for a CQL table: the keyspace-qualified name
+/// `keyspace.table`, lowercased so it is case-insensitive like CQL identifiers.
+/// The control plane treats this as an opaque `TableName`.
+fn control_table_name(keyspace: &str, table: &str) -> String {
+    format!(
+        "{}.{}",
+        keyspace.to_ascii_lowercase(),
+        table.to_ascii_lowercase()
+    )
+}
+
+/// Map a CQL scalar type to the control plane's shared `ColumnType` vocabulary.
+fn cql_to_column_type(ty: CqlType) -> ColumnType {
+    match ty {
+        CqlType::Text => ColumnType::String,
+        CqlType::Int => ColumnType::Int,
+        CqlType::BigInt => ColumnType::BigInt,
+        CqlType::Boolean => ColumnType::Bool,
+        CqlType::Blob => ColumnType::Binary,
+        CqlType::Uuid => ColumnType::Uuid,
+    }
+}
+
+/// Map a control-plane `ColumnType` back to a CQL scalar type. The DynamoDB-only
+/// `Number` family (no fixed CQL width) is surfaced to CQL as `bigint`.
+fn column_type_to_cql(ty: ColumnType) -> CqlType {
+    match ty {
+        ColumnType::String => CqlType::Text,
+        ColumnType::Int => CqlType::Int,
+        ColumnType::BigInt | ColumnType::Number => CqlType::BigInt,
+        ColumnType::Bool => CqlType::Boolean,
+        ColumnType::Binary => CqlType::Blob,
+        ColumnType::Uuid => CqlType::Uuid,
+    }
+}
+
+/// Convert a pure-`animus_cql` table schema (from `schema_of(&CreateTable)`) into
+/// the control plane's replicated `TableSchema`. Column order is preserved (the
+/// partition-storage format keys cells by schema index, so order is part of the
+/// contract), and the partition/clustering keys are recorded by name.
+fn cql_schema_to_control(schema: &CqlSchema) -> ControlSchema {
+    let columns: Vec<ColumnDef> = schema
+        .columns
+        .iter()
+        .map(|c| ColumnDef::new(c.name.clone(), cql_to_column_type(c.ty)))
+        .collect();
+    let partition_key = schema.pk_column().name.clone();
+    let clustering_keys: Vec<String> = schema
+        .clustering_keys
+        .iter()
+        .map(|&i| schema.columns[i].name.clone())
+        .collect();
+    ControlSchema::with_columns(partition_key, clustering_keys, columns)
+}
+
+/// Convert a replicated control-plane `TableSchema` back into the pure
+/// `animus_cql` schema the planner needs (the same column order, with the
+/// partition/clustering keys resolved to their column indices). `table` is the
+/// CQL table name to display in result metadata.
+///
+/// Returns `None` if the control schema is internally inconsistent (a key names
+/// a missing column) — which `TableSchema::validate` already prevents on write,
+/// so this is defensive only.
+fn control_schema_to_cql(table: &str, schema: &ControlSchema) -> Option<CqlSchema> {
+    let columns: Vec<Column> = schema
+        .columns
+        .iter()
+        .map(|c| Column {
+            name: c.name.clone(),
+            ty: column_type_to_cql(c.ty),
+        })
+        .collect();
+    let partition_key = columns
+        .iter()
+        .position(|c| c.name == schema.partition_key)?;
+    let mut clustering_keys = Vec::with_capacity(schema.clustering_keys.len());
+    for ck in &schema.clustering_keys {
+        clustering_keys.push(columns.iter().position(|c| &c.name == ck)?);
+    }
+    Some(CqlSchema {
+        name: table.to_owned(),
+        columns,
+        partition_key,
+        clustering_keys,
+    })
+}
+
+/// Build a one-table [`Catalog`] so the existing pure planner functions
+/// (`plan_insert`/`plan_select`/...) can resolve `table` against its replicated
+/// schema without holding any edge-side catalog. The keyspace is whatever the
+/// statement qualified or the session `USE`d.
+fn ephemeral_catalog(keyspace: &str, table: &str, schema: &ControlSchema) -> Option<Catalog> {
+    let cql_schema = control_schema_to_cql(table, schema)?;
+    let mut cat = Catalog::new();
+    cat.create_keyspace(keyspace);
+    // `create_table` only fails on a missing keyspace (just created) or a
+    // duplicate (the catalog is fresh), so this cannot error here.
+    cat.create_table(keyspace, cql_schema, false).ok()?;
+    Some(cat)
+}
+
+/// Resolve a CQL table reference to `(keyspace, control_name, control_schema)`
+/// from the replicated catalog, given the optional `keyspace.` qualifier and the
+/// session's `USE`d keyspace. `Err` carries a client-facing message.
+fn resolve_table(
+    ctx: &ClientCtx,
+    qualifier: Option<&str>,
+    selected: Option<&str>,
+    table: &str,
+) -> Result<(String, String, ControlSchema), String> {
+    let keyspace = qualifier
+        .or(selected)
+        .ok_or_else(|| "no keyspace selected; USE one or qualify the table name".to_owned())?
+        .to_owned();
+    let control_name = control_table_name(&keyspace, table);
+    let schema = ctx
+        .table_schema(&control_name)
+        .ok_or_else(|| format!("table `{keyspace}.{table}` does not exist"))?;
+    Ok((keyspace, control_name, schema))
+}
+
 /// Accept loop for the CQL endpoint. Each connection is handled on its own task.
-/// The schema catalog and prepared statements live in the process-wide
-/// [`shared_state`].
+/// The keyspace set and prepared statements live in the process-wide
+/// [`shared_state`]; table schemas live in the control plane.
 pub(crate) async fn serve(listener: TcpListener, ctx: ClientCtx) {
     let state = shared_state();
     loop {
@@ -183,7 +323,7 @@ async fn dispatch(
             Err(e) => response::error(stream, response::ERR_PROTOCOL, &e.to_string()),
         },
         Opcode::Prepare => match response::parse_prepare_request(&frame.body) {
-            Ok(cql) => prepare(state, session, stream, &cql).await,
+            Ok(cql) => prepare(ctx, state, session, stream, &cql).await,
             Err(e) => response::error(stream, response::ERR_PROTOCOL, &e.to_string()),
         },
         Opcode::Execute => execute(ctx, state, session, stream, &frame.body).await,
@@ -217,9 +357,11 @@ fn fnv1a(bytes: &[u8], mut hash: u64) -> u64 {
     hash
 }
 
-/// `PREPARE`: parse + resolve the statement's bind markers against the catalog,
-/// store it under its content id, and reply `RESULT/Prepared`.
+/// `PREPARE`: parse + resolve the statement's bind markers against the
+/// **replicated** schema, store it under its content id, and reply
+/// `RESULT/Prepared`.
 async fn prepare(
+    ctx: &ClientCtx,
     state: &Arc<Mutex<CqlState>>,
     session: &Session,
     stream: i16,
@@ -229,32 +371,41 @@ async fn prepare(
         Ok(s) => s,
         Err(e) => return response::error(stream, response::ERR_INVALID, &e.to_string()),
     };
-    let mut guard = state.lock().await;
     let selected = session.keyspace.clone();
     let (bind_specs, keyspace, table) = match &stmt {
         Statement::Insert(ins) => {
-            match animus_cql::plan::insert_bind_types(&guard.catalog, selected.as_deref(), ins) {
-                Ok(specs) => {
-                    let ks = ins
-                        .keyspace
-                        .clone()
-                        .or_else(|| selected.clone())
-                        .unwrap_or_default();
-                    (specs, ks, ins.table.clone())
-                }
+            let (ks, _name, schema) = match resolve_table(
+                ctx,
+                ins.keyspace.as_deref(),
+                selected.as_deref(),
+                &ins.table,
+            ) {
+                Ok(t) => t,
+                Err(msg) => return response::error(stream, response::ERR_INVALID, &msg),
+            };
+            let Some(cat) = ephemeral_catalog(&ks, &ins.table, &schema) else {
+                return response::error(stream, response::ERR_SERVER, "corrupt schema");
+            };
+            match animus_cql::plan::insert_bind_types(&cat, Some(&ks), ins) {
+                Ok(specs) => (specs, ks, ins.table.clone()),
                 Err(e) => return response::error(stream, response::ERR_INVALID, &e.to_string()),
             }
         }
         Statement::Select(sel) => {
-            match animus_cql::plan::select_bind_types(&guard.catalog, selected.as_deref(), sel) {
-                Ok(specs) => {
-                    let ks = sel
-                        .keyspace
-                        .clone()
-                        .or_else(|| selected.clone())
-                        .unwrap_or_default();
-                    (specs, ks, sel.table.clone())
-                }
+            let (ks, _name, schema) = match resolve_table(
+                ctx,
+                sel.keyspace.as_deref(),
+                selected.as_deref(),
+                &sel.table,
+            ) {
+                Ok(t) => t,
+                Err(msg) => return response::error(stream, response::ERR_INVALID, &msg),
+            };
+            let Some(cat) = ephemeral_catalog(&ks, &sel.table, &schema) else {
+                return response::error(stream, response::ERR_SERVER, "corrupt schema");
+            };
+            match animus_cql::plan::select_bind_types(&cat, Some(&ks), sel) {
+                Ok(specs) => (specs, ks, sel.table.clone()),
                 Err(e) => return response::error(stream, response::ERR_INVALID, &e.to_string()),
             }
         }
@@ -267,13 +418,16 @@ async fn prepare(
         }
     };
     let id = statement_id(cql);
-    guard.prepared.insert(
-        id.clone(),
-        Prepared {
-            cql: cql.to_owned(),
-            bind_specs: bind_specs.clone(),
-        },
-    );
+    {
+        let mut guard = state.lock().await;
+        guard.prepared.insert(
+            id.clone(),
+            Prepared {
+                cql: cql.to_owned(),
+                bind_specs: bind_specs.clone(),
+            },
+        );
+    }
     response::prepared_result(stream, &id, &keyspace, &table, &bind_specs)
 }
 
@@ -357,13 +511,23 @@ async fn run_cql(
         Ok(s) => s,
         Err(e) => return response::error(stream, response::ERR_INVALID, &e.to_string()),
     };
+    run_statement(ctx, state, session, stream, stmt, binds, consistency).await
+}
+
+/// Execute one parsed statement. Split out from [`run_cql`] so a `BATCH` can run
+/// each member through it.
+async fn run_statement(
+    ctx: &ClientCtx,
+    state: &Arc<Mutex<CqlState>>,
+    session: &mut Session,
+    stream: i16,
+    stmt: Statement,
+    binds: &[CqlValue],
+    consistency: Consistency,
+) -> Vec<u8> {
     match stmt {
         Statement::Use { keyspace } => {
-            let known = {
-                let guard = state.lock().await;
-                guard.catalog.has_keyspace(&keyspace)
-            };
-            if !known {
+            if !keyspace_exists(ctx, state, &keyspace).await {
                 return response::error(
                     stream,
                     response::ERR_INVALID,
@@ -377,8 +541,11 @@ async fn run_cql(
             keyspace,
             if_not_exists: _,
         } => {
-            let mut guard = state.lock().await;
-            guard.catalog.create_keyspace(&keyspace);
+            // Keyspaces are not control-plane replicated; record it process-local.
+            {
+                let mut guard = state.lock().await;
+                guard.keyspaces.insert(keyspace.to_ascii_lowercase());
+            }
             response::schema_change_result(stream, "CREATED", "KEYSPACE", &keyspace, "")
         }
         Statement::CreateTable(ct) => {
@@ -392,74 +559,231 @@ async fn run_cql(
                     );
                 }
             };
-            let schema = animus_cql::schema_of(&ct);
-            let mut guard = state.lock().await;
-            match guard
-                .catalog
-                .create_table(&keyspace, schema, ct.if_not_exists)
-            {
+            let cql_schema = animus_cql::schema_of(&ct);
+            let control_schema = cql_schema_to_control(&cql_schema);
+            let control_name = control_table_name(&keyspace, &ct.table);
+            // IF NOT EXISTS: a table already present is a no-op success.
+            if ct.if_not_exists && ctx.has_table_schema(&control_name) {
+                return response::schema_change_result(
+                    stream, "CREATED", "TABLE", &keyspace, &ct.table,
+                );
+            }
+            match ctx.create_table_schema(control_name, control_schema).await {
                 Ok(()) => {
                     response::schema_change_result(stream, "CREATED", "TABLE", &keyspace, &ct.table)
                 }
-                Err(e) => response::error(stream, response::ERR_INVALID, &e.to_string()),
+                Err(msg) => response::error(stream, response::ERR_INVALID, &msg),
             }
         }
-        Statement::Insert(ins) => {
-            let plan = {
-                let guard = state.lock().await;
-                animus_cql::plan_insert(&guard.catalog, session.keyspace.as_deref(), &ins, binds)
+        Statement::DropTable(dt) => {
+            let keyspace = match dt.keyspace.clone().or_else(|| session.keyspace.clone()) {
+                Some(k) => k,
+                None => {
+                    return response::error(
+                        stream,
+                        response::ERR_INVALID,
+                        "no keyspace selected; USE one or qualify the table name",
+                    );
+                }
             };
-            match plan {
-                Ok(plan) => run_insert(ctx, state, session, stream, plan, consistency).await,
+            let control_name = control_table_name(&keyspace, &dt.table);
+            if !ctx.has_table_schema(&control_name) {
+                if dt.if_exists {
+                    return response::schema_change_result(
+                        stream, "DROPPED", "TABLE", &keyspace, &dt.table,
+                    );
+                }
+                return response::error(
+                    stream,
+                    response::ERR_INVALID,
+                    &format!("table `{keyspace}.{}` does not exist", dt.table),
+                );
+            }
+            match ctx.drop_table_schema(control_name).await {
+                Ok(()) => {
+                    response::schema_change_result(stream, "DROPPED", "TABLE", &keyspace, &dt.table)
+                }
+                Err(msg) => response::error(stream, response::ERR_SERVER, &msg),
+            }
+        }
+        Statement::AlterTable(at) => alter_table(ctx, session, stream, at).await,
+        Statement::Batch(batch) => {
+            // Run each member in order, sharing the session/binds. Returns the
+            // first error; otherwise a single RESULT/Void (CQL batches return
+            // void). NOTE: not atomic across members — see the crate docs.
+            for member in batch.statements {
+                let reply = Box::pin(run_statement(
+                    ctx,
+                    state,
+                    session,
+                    stream,
+                    member,
+                    binds,
+                    consistency,
+                ))
+                .await;
+                if is_error_frame(&reply) {
+                    return reply;
+                }
+            }
+            response::void_result(stream)
+        }
+        Statement::Insert(ins) => {
+            let (ks, _name, schema) = match resolve_table(
+                ctx,
+                ins.keyspace.as_deref(),
+                session.keyspace.as_deref(),
+                &ins.table,
+            ) {
+                Ok(t) => t,
+                Err(msg) => return response::error(stream, response::ERR_INVALID, &msg),
+            };
+            let Some(cat) = ephemeral_catalog(&ks, &ins.table, &schema) else {
+                return response::error(stream, response::ERR_SERVER, "corrupt schema");
+            };
+            match animus_cql::plan_insert(&cat, Some(&ks), &ins, binds) {
+                Ok(plan) => run_insert(ctx, stream, plan, consistency).await,
                 Err(e) => response::error(stream, response::ERR_INVALID, &e.to_string()),
             }
         }
         Statement::Update(upd) => {
-            let plan = {
-                let guard = state.lock().await;
-                animus_cql::plan_update(&guard.catalog, session.keyspace.as_deref(), &upd, binds)
+            let (ks, _name, schema) = match resolve_table(
+                ctx,
+                upd.keyspace.as_deref(),
+                session.keyspace.as_deref(),
+                &upd.table,
+            ) {
+                Ok(t) => t,
+                Err(msg) => return response::error(stream, response::ERR_INVALID, &msg),
             };
-            match plan {
-                Ok(plan) => run_update(ctx, state, session, stream, plan, consistency).await,
+            let Some(cat) = ephemeral_catalog(&ks, &upd.table, &schema) else {
+                return response::error(stream, response::ERR_SERVER, "corrupt schema");
+            };
+            let cql_schema = match control_schema_to_cql(&upd.table, &schema) {
+                Some(s) => s,
+                None => return response::error(stream, response::ERR_SERVER, "corrupt schema"),
+            };
+            match animus_cql::plan_update(&cat, Some(&ks), &upd, binds) {
+                Ok(plan) => run_update(ctx, stream, plan, &cql_schema, consistency).await,
                 Err(e) => response::error(stream, response::ERR_INVALID, &e.to_string()),
             }
         }
         Statement::Delete(del) => {
-            let plan = {
-                let guard = state.lock().await;
-                animus_cql::plan_delete(&guard.catalog, session.keyspace.as_deref(), &del, binds)
+            let (ks, _name, schema) = match resolve_table(
+                ctx,
+                del.keyspace.as_deref(),
+                session.keyspace.as_deref(),
+                &del.table,
+            ) {
+                Ok(t) => t,
+                Err(msg) => return response::error(stream, response::ERR_INVALID, &msg),
             };
-            match plan {
-                Ok(plan) => run_delete(ctx, state, session, stream, plan, consistency).await,
+            let Some(cat) = ephemeral_catalog(&ks, &del.table, &schema) else {
+                return response::error(stream, response::ERR_SERVER, "corrupt schema");
+            };
+            let cql_schema = match control_schema_to_cql(&del.table, &schema) {
+                Some(s) => s,
+                None => return response::error(stream, response::ERR_SERVER, "corrupt schema"),
+            };
+            match animus_cql::plan_delete(&cat, Some(&ks), &del, binds) {
+                Ok(plan) => run_delete(ctx, stream, plan, &cql_schema, consistency).await,
                 Err(e) => response::error(stream, response::ERR_INVALID, &e.to_string()),
             }
         }
         Statement::Select(sel) => {
-            let plan = {
-                let guard = state.lock().await;
-                animus_cql::plan_select(&guard.catalog, session.keyspace.as_deref(), &sel, binds)
+            let (ks, _name, schema) = match resolve_table(
+                ctx,
+                sel.keyspace.as_deref(),
+                session.keyspace.as_deref(),
+                &sel.table,
+            ) {
+                Ok(t) => t,
+                Err(msg) => return response::error(stream, response::ERR_INVALID, &msg),
             };
-            match plan {
-                Ok(plan) => run_select(ctx, state, session, stream, plan, consistency).await,
+            let Some(cat) = ephemeral_catalog(&ks, &sel.table, &schema) else {
+                return response::error(stream, response::ERR_SERVER, "corrupt schema");
+            };
+            let cql_schema = match control_schema_to_cql(&sel.table, &schema) {
+                Some(s) => s,
+                None => return response::error(stream, response::ERR_SERVER, "corrupt schema"),
+            };
+            match animus_cql::plan_select(&cat, Some(&ks), &sel, binds) {
+                Ok(plan) => run_select(ctx, stream, plan, &cql_schema, consistency).await,
                 Err(e) => response::error(stream, response::ERR_INVALID, &e.to_string()),
             }
         }
     }
 }
 
-/// Resolve the table schema for a planned op, cloned out from under the catalog
-/// lock so the partition (de)serialization can run without holding it.
-async fn schema_for(
-    state: &Arc<Mutex<CqlState>>,
-    selected: Option<&str>,
-    table: &str,
-) -> Result<animus_cql::TableSchema, String> {
-    let guard = state.lock().await;
-    guard
-        .catalog
-        .resolve(None, selected, table)
-        .cloned()
-        .map_err(|e| e.to_string())
+/// Whether `keyspace` is known: created process-locally, or implied by a
+/// replicated `ks.table` schema (so a keyspace with tables is recognized even
+/// after a restart, before any in-process `CREATE KEYSPACE`).
+async fn keyspace_exists(ctx: &ClientCtx, state: &Arc<Mutex<CqlState>>, keyspace: &str) -> bool {
+    let ks = keyspace.to_ascii_lowercase();
+    {
+        let guard = state.lock().await;
+        if guard.keyspaces.contains(&ks) {
+            return true;
+        }
+    }
+    let prefix = format!("{ks}.");
+    ctx.has_table_schema_with_prefix(&prefix)
+}
+
+/// `ALTER TABLE ... ADD`: append the new columns to the replicated schema. The
+/// control plane has no in-place schema update, so this **drops and recreates**
+/// the schema with the extended column list. Appending columns preserves every
+/// existing column's index, and the partition-storage format keys cells by index,
+/// so stored rows still decode correctly under the new schema. NOTE: drop +
+/// recreate is **not atomic** — a crash between them could leave the table
+/// dropped; an in-place schema-mutation `MetaCommand` is future work (ADR 0013).
+async fn alter_table(ctx: &ClientCtx, session: &Session, stream: i16, at: AlterTable) -> Vec<u8> {
+    let keyspace = match at.keyspace.clone().or_else(|| session.keyspace.clone()) {
+        Some(k) => k,
+        None => {
+            return response::error(
+                stream,
+                response::ERR_INVALID,
+                "no keyspace selected; USE one or qualify the table name",
+            );
+        }
+    };
+    let control_name = control_table_name(&keyspace, &at.table);
+    let Some(mut schema) = ctx.table_schema(&control_name) else {
+        return response::error(
+            stream,
+            response::ERR_INVALID,
+            &format!("table `{keyspace}.{}` does not exist", at.table),
+        );
+    };
+    for (name, ty) in &at.add_columns {
+        if schema.column(name).is_some() {
+            return response::error(
+                stream,
+                response::ERR_INVALID,
+                &format!(
+                    "column `{name}` already exists in `{keyspace}.{}`",
+                    at.table
+                ),
+            );
+        }
+        schema
+            .columns
+            .push(ColumnDef::new(name.clone(), cql_to_column_type(*ty)));
+    }
+    // Drop then recreate with the extended schema (see the doc comment).
+    if let Err(msg) = ctx.drop_table_schema(control_name.clone()).await {
+        return response::error(stream, response::ERR_SERVER, &msg);
+    }
+    match ctx.create_table_schema(control_name, schema).await {
+        Ok(()) => response::schema_change_result(stream, "UPDATED", "TABLE", &keyspace, &at.table),
+        Err(msg) => response::error(stream, response::ERR_SERVER, &msg),
+    }
+}
+
+/// Whether `reply` is a CQL `ERROR` frame (opcode byte at index 4 of the header).
+fn is_error_frame(reply: &[u8]) -> bool {
+    reply.get(4) == Some(&(Opcode::Error as u8))
 }
 
 /// Execute a planned `INSERT` as a partition read-modify-write: read the current
@@ -467,8 +791,6 @@ async fn schema_for(
 /// back. Reply `RESULT/Void`.
 async fn run_insert(
     ctx: &ClientCtx,
-    _state: &Arc<Mutex<CqlState>>,
-    _session: &Session,
     stream: i16,
     plan: InsertPlan,
     consistency: Consistency,
@@ -491,18 +813,13 @@ async fn run_insert(
 /// assignments over the addressed row (creating it if absent — CQL upsert).
 async fn run_update(
     ctx: &ClientCtx,
-    state: &Arc<Mutex<CqlState>>,
-    session: &Session,
     stream: i16,
     plan: UpdatePlan,
+    schema: &CqlSchema,
     consistency: Consistency,
 ) -> Vec<u8> {
-    let schema = match schema_for(state, session.keyspace.as_deref(), &plan.table).await {
-        Ok(s) => s,
-        Err(msg) => return response::error(stream, response::ERR_SERVER, &msg),
-    };
-    let result = mutate_partition_with_schema(ctx, &plan.key, consistency, &schema, |part| {
-        let clustering_values = decode_clustering_for(&plan.clustering, &schema);
+    let result = mutate_partition_with_schema(ctx, &plan.key, consistency, schema, |part| {
+        let clustering_values = decode_clustering_for(&plan.clustering, schema);
         let row = part
             .rows
             .entry(plan.clustering.clone())
@@ -527,16 +844,11 @@ async fn run_update(
 /// `delete`); otherwise the remaining partition is written back.
 async fn run_delete(
     ctx: &ClientCtx,
-    state: &Arc<Mutex<CqlState>>,
-    session: &Session,
     stream: i16,
     plan: DeletePlan,
+    schema: &CqlSchema,
     consistency: Consistency,
 ) -> Vec<u8> {
-    let schema = match schema_for(state, session.keyspace.as_deref(), &plan.table).await {
-        Ok(s) => s,
-        Err(msg) => return response::error(stream, response::ERR_SERVER, &msg),
-    };
     let view = match view_for(ctx, &plan.key, consistency) {
         Ok(v) => v,
         Err(msg) => return response::error(stream, response::ERR_SERVER, &msg),
@@ -546,7 +858,7 @@ async fn run_delete(
         Ok(r) => r,
         Err(msg) => return response::error(stream, response::ERR_SERVER, &msg),
     };
-    let mut part = match Partition::decode(&bytes.unwrap_or_default(), &schema) {
+    let mut part = match Partition::decode(&bytes.unwrap_or_default(), schema) {
         Ok(p) => p,
         Err(e) => return response::error(stream, response::ERR_SERVER, &e.to_string()),
     };
@@ -582,16 +894,11 @@ async fn run_delete(
 /// partition) in clustering order as a typed `RESULT/Rows`.
 async fn run_select(
     ctx: &ClientCtx,
-    state: &Arc<Mutex<CqlState>>,
-    session: &Session,
     stream: i16,
     plan: ReadPlan,
+    schema: &CqlSchema,
     consistency: Consistency,
 ) -> Vec<u8> {
-    let schema = match schema_for(state, session.keyspace.as_deref(), &plan.table).await {
-        Ok(s) => s,
-        Err(msg) => return response::error(stream, response::ERR_SERVER, &msg),
-    };
     let view = match view_for(ctx, &plan.key, consistency) {
         Ok(v) => v,
         Err(msg) => return response::error(stream, response::ERR_SERVER, &msg),
@@ -612,19 +919,13 @@ async fn run_select(
     let Some(bytes) = bytes else {
         return response::typed_rows_multi(stream, "animus", &plan.table, &plan.projection, &[]);
     };
-    let part = match Partition::decode(&bytes, &schema) {
+    let part = match Partition::decode(&bytes, schema) {
         Ok(p) => p,
         Err(e) => return response::error(stream, response::ERR_SERVER, &e.to_string()),
     };
     let mut rows = Vec::new();
     for row in part.rows_matching(&plan.clustering_prefix) {
-        match build_row(
-            &plan.projection,
-            &plan.pk_name,
-            &plan.pk_value,
-            &schema,
-            row,
-        ) {
+        match build_row(&plan.projection, &plan.pk_name, &plan.pk_value, schema, row) {
             Ok(cells) => rows.push(cells),
             Err(msg) => return response::error(stream, response::ERR_SERVER, &msg),
         }
@@ -634,7 +935,7 @@ async fn run_select(
 
 /// Decode the typed clustering values for a row from its clustering blob, used
 /// when `UPDATE` creates a previously-absent row.
-fn decode_clustering_for(clustering: &[u8], schema: &animus_cql::TableSchema) -> Vec<CqlValue> {
+fn decode_clustering_for(clustering: &[u8], schema: &CqlSchema) -> Vec<CqlValue> {
     let mut part = Partition::default();
     part.rows.insert(
         clustering.to_vec(),
@@ -659,7 +960,7 @@ fn build_row(
     projection: &[ColumnSpec],
     pk_name: &str,
     pk_value: &CqlValue,
-    schema: &animus_cql::TableSchema,
+    schema: &CqlSchema,
     row: &animus_cql::Row,
 ) -> Result<Vec<Option<Vec<u8>>>, String> {
     let mut cells = Vec::with_capacity(projection.len());
@@ -727,7 +1028,7 @@ async fn mutate_partition(
     consistency: Consistency,
     mutate: impl FnOnce(&mut Partition),
 ) -> Result<(), String> {
-    let schema_agnostic = animus_cql::TableSchema {
+    let schema_agnostic = CqlSchema {
         name: String::new(),
         columns: Vec::new(),
         partition_key: 0,
@@ -742,7 +1043,7 @@ async fn mutate_partition_with_schema(
     ctx: &ClientCtx,
     key: &[u8],
     consistency: Consistency,
-    schema: &animus_cql::TableSchema,
+    schema: &CqlSchema,
     mutate: impl FnOnce(&mut Partition),
 ) -> Result<(), String> {
     let view = view_for(ctx, key, consistency)?;
