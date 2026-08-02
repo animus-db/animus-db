@@ -81,8 +81,19 @@ sent one. Proven under simulation in `custos-data/tests/residency_repair.rs`: a
 reachable non-EU node actively soliciting anti-entropy from EU replicas never
 receives the EU data, and a direct `Sync` from it is rejected.
 
+**The reconciler now runs in the production binary.** `custosd` registers the
+**data nodes** as the cluster's `Active` members (not the control-group ids),
+places its bootstrap tablet on the first `min(N, 3)` of them, and attaches a
+`PlacementPolicy` via `SetTabletPolicy`. The leader's `reconcile_loop` is then
+driven over `ProdEnv` timers, so when failure detection (ADR 0012) marks a data
+member `Down`, the tablet is re-placed onto a live spare with no operator —
+observable end-to-end over real TCP in `custosd/tests/self_heal.rs`. (The
+bootstrap policy carries no labels yet, so it is a plain replication-factor
+constraint; topology labels from config are future work.)
+
 **Still deferred** (the remaining weakest-path work above): residency enforcement
 across hinted handoff and backup. The reconciler keeps a tablet's *surviving*
 eligible replicas (minimal churn), so it repairs drift but does not re-optimize
-an already-placed compliant-enough set; a cluster-default policy and
-operator-facing policy management (CLI/wire) are also future work.
+an already-placed compliant-enough set; a cluster-default policy, topology labels
+in `custosd`'s deployment config, and operator-facing policy management (CLI/wire)
+are also future work.
