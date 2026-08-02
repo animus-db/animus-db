@@ -27,7 +27,7 @@ pub mod registry;
 pub mod wire;
 
 pub use condition::{ConditionExpression, SortKeyCondition};
-pub use registry::{RegistryError, SchemaRegistry};
+pub use registry::{GlobalSecondaryIndex, RegistryError, SchemaRegistry};
 
 /// A DynamoDB-style attribute value (a useful subset).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

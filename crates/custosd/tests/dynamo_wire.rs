@@ -143,7 +143,7 @@ async fn dynamo_wire_rejects_bad_requests() {
     let addr = nodes[0].dynamo_addr();
 
     // Unknown operation.
-    let (status, body) = dynamo(addr, "DynamoDB_20120810.Scan", "{}").await;
+    let (status, body) = dynamo(addr, "DynamoDB_20120810.BatchWriteItem", "{}").await;
     assert_eq!(status, 400);
     assert!(body.contains("UnknownOperationException"), "got: {body}");
 

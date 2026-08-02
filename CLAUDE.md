@@ -25,9 +25,11 @@ plane + data plane at scale: 3 Raft nodes, 2 tablets, 6 replicas, 4 concurrent
 clients) under fault injection (partition + leader kill + crash + heal), checked
 for serializability/durability/convergence — a
 DynamoDB-style item API over the core plus a **DynamoDB JSON wire protocol**
-(`custos-dynamo`: CreateTable/PutItem/GetItem/DeleteItem/Query AttributeValue-JSON
-translation, with a per-table schema registry, sort-key conditions =/BETWEEN/
-begins_with, and a `ConditionExpression` subset for conditional writes), a
+(`custos-dynamo`: CreateTable/PutItem/GetItem/DeleteItem/Query/Scan
+AttributeValue-JSON translation, with a per-table schema registry, sort-key
+conditions =/BETWEEN/begins_with, a `ConditionExpression` subset for conditional
+writes, `Scan` with `Limit`/`ExclusiveStartKey` pagination + `FilterExpression`,
+and a hash-only **global secondary index** queryable by `IndexName`), a
 **runnable node + CLI** assembling the planes over `ProdEnv` and
 serving clients over TCP, with a now **durable data plane** — each node's data
 replica is backed by the on-disk `LsmEngine` over `ProdEnv` by default, so a
@@ -57,9 +59,9 @@ from on restart — and a **first slice of coordinator failover** (a replica can
 recover a stranded transaction whose coordinator died, adopting a committed
 decision or forcing the slow path); ADR 0011). Skeletons / future work:
 the fuller CQL surface (a real type system, CQL grammar, keyspaces,
-prepared statements) and the rest of the DynamoDB surface (Scan,
-projection/filter expressions, `ReturnValues`, document/set types, secondary
-indexes, durable/replicated table schemas), and the deferred remainder of Accord
+prepared statements) and the rest of the DynamoDB surface (projection
+expressions, `ReturnValues`, document/set types, composite/multiple GSIs + local
+secondary indexes, durable/replicated table schemas), and the deferred remainder of Accord
 (the full dependency wait-graph, the precise recovery ballot + duelling
 recoverers + a failure detector, WAL snapshotting, live data-plane integration).
 
