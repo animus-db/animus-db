@@ -40,13 +40,21 @@ seam and so cannot be driven by the simulator.
   before the call returns, so an ack means durable (mirroring the control-plane
   Raft WAL pattern, ADR 0009);
 - immutable, sorted, checksummed **SSTables** (`<prefix>sst-NNNNNN`) with a block
-  layout, an in-file block index, and a footer — point reads fetch one block via
-  `read_at`, never the whole file (`crc32fast` per block);
+  layout, an in-file block index, a footer, and a per-table **Bloom filter** over
+  the table's keys — point reads fetch one block via `read_at`, never the whole
+  file (`crc32fast` per block), and skip a table entirely when its Bloom proves
+  the key absent (tighter than the key-range gate);
 - a **MANIFEST** (`<prefix>MANIFEST`): the durable source of truth listing live
-  SSTables + metadata, written **atomically** via `Disk::replace`, the single
-  linearization point for flush and compaction;
-- **size-tiered compaction** merging accumulated SSTables, dropping superseded
-  versions and GC-able tombstones;
+  SSTables + metadata (including each table's LSM level and Bloom filter), written
+  **atomically** via `Disk::replace`, the single linearization point for flush and
+  compaction;
+- **leveled compaction**: tables carry a level; **L0** is the (overlapping) flush
+  tier, **L1+** hold non-overlapping runs (re-partitioned on a key boundary to
+  ≈`target_table_bytes`), so read amplification is bounded by the number of levels
+  rather than the total table count. L0→L1 fires at `compaction_trigger`; deeper
+  levels cascade when over a fanout-scaled table budget. Every distinct
+  `(key, version)` record is preserved across a compaction, keeping the merged
+  view observationally identical to `MemoryEngine`;
 - **recovery** on open: read the manifest, open the named SSTables, replay the
   WAL into the memtable, restore the monotonic floor.
 
@@ -94,7 +102,18 @@ ignored. This is tested under fault injection in `custos-storage/tests/lsm_crash
   quorum write/delete now fails rather than lying when fewer than W replicas
   could persist (asserted under `SimEnv` with a failing-engine test double in
   `custos-data/tests/ack_durability.rs`).
-- Deferred within `LsmEngine` (correctness-first, performance later): bloom
-  filters (only a key-range gate today), leveled compaction (size-tiered only),
-  WAL segment rotation / fsync batching, block compression, and a more compact
-  binary manifest (JSON today). None affect the trait or correctness.
+- **Done since (performance work that does not touch the trait or correctness):**
+  per-SSTable **Bloom filters** (hand-rolled FNV-1a double-hashing bit vector,
+  persisted in the manifest; a point-miss inside a table's key range now reads
+  zero blocks — asserted via a block-read introspection counter in
+  `lsm_semantics.rs`) and **leveled compaction** (L0 overlapping flush tier; L1+
+  non-overlapping runs; crash-safe at the same single manifest swap; the
+  differential proptest and all crash tests stay green). A **benchmark harness**
+  (`benches/engine_bench.rs`, `cargo bench -p custos-storage`) measures
+  put/get/scan throughput + latency and flush/compaction cost of `LsmEngine` over
+  `ProdEnv` against `MemoryEngine` — no new runtime dependency (hand-rolled
+  timing; `tokio` is a dev-dependency only).
+- **Still deferred within `LsmEngine`** (correctness-first, performance later):
+  WAL segment rotation / fsync group-commit batching (the benchmark shows the
+  per-put WAL fsync is the dominant write cost), block compression, and a more
+  compact binary manifest (JSON today). None affect the trait or correctness.

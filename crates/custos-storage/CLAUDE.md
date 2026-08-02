@@ -55,13 +55,23 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
   flush/compaction linearization point), `wal` (each write `append`+`sync`ed
   *before* it returns, so an ack means durable; mirrors the Raft WAL pattern),
   and `sst-NNNNNN` (immutable, sorted, **per-block CRC32** via `crc32fast`, with
-  an in-file block index + footer; point reads fetch one block with `read_at`,
-  never the whole file). Writes go to the WAL then the in-memory memtable
-  (`BTreeMap` MVCC, same shape as `MemoryEngine`); a size threshold flushes the
-  memtable to an SSTable, then swaps the manifest and starts a fresh WAL.
-  Size-tiered compaction merges accumulated SSTables. Reads merge the memtable
-  (newest) with SSTables newest→oldest by version, matching `MemoryEngine`
-  exactly (a differential proptest in `lsm_semantics.rs` pins this).
+  an in-file block index + footer, plus a per-table **Bloom filter** in the
+  manifest; point reads fetch one block with `read_at`, never the whole file).
+  Writes go to the WAL then the in-memory memtable (`BTreeMap` MVCC, same shape as
+  `MemoryEngine`); a size threshold flushes the memtable to an SSTable, then swaps
+  the manifest and starts a fresh WAL. **Leveled compaction** (`lsm.rs`):
+  tables carry a `level`; L0 is the overlapping flush tier, L1+ hold
+  non-overlapping runs (re-partitioned on key boundaries to ≈`target_table_bytes`),
+  so read amplification is bounded by level count. L0→L1 fires at
+  `compaction_trigger`; deeper levels cascade over a fanout-scaled budget. Reads
+  merge the memtable (newest) with SSTables newest→oldest by version, matching
+  `MemoryEngine` exactly (a differential proptest in `lsm_semantics.rs` pins this).
+- **Two read gates skip an SSTable before any disk read** (`sstable.rs`
+  `SsTableMeta::may_contain`): the key range `[min_key, max_key]`, then the
+  per-table **Bloom filter** (`lsm/bloom.rs` — a hand-rolled FNV-1a
+  double-hashing bit vector, deterministic, no external dep). A legacy table from
+  a pre-Bloom manifest (`has_bloom == false`) is range-gated only, so an upgrade
+  stays correct. Built over the table's distinct keys on flush/compaction.
 - **The `std::sync::Mutex` guard is never held across an `.await`** in
   `LsmEngine`: every op does its disk I/O (await) lock-free — snapshotting the
   cheap `SsTableReader` clones (metadata + block index, no block bytes) under a
@@ -75,14 +85,25 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
   read once a *synced* manifest names it. Argued in `lsm.rs` module docs,
   exercised in `lsm_crash.rs`.
 
-## Tests
+## Tests & benchmark
 
 `cargo test -p custos-storage` (proptest semantics + units).
 
 `LsmEngine` tests run under `SimEnv` via `Simulator` (a dev-dep): `lsm_semantics.rs`
-mirrors the `MemoryEngine` units + a differential proptest, and `lsm_crash.rs`
-fault-injects crashes (synced writes survive; a flushed SSTable survives; mid-flush
-and mid-compaction crashes lose nothing) and asserts flush+compaction actually
-happen — all seed-reproducible. `LsmEngine` exposes `#[doc(hidden)]`
-`sstable_count`/`flush_count`/`compaction_count`/`test_write_orphan_sstable`
-introspection helpers for these tests.
+mirrors the `MemoryEngine` units + a differential proptest, plus a Bloom test
+asserting a point-miss inside a table's key range reads **zero** blocks; and
+`lsm_crash.rs` fault-injects crashes (synced writes survive; a flushed SSTable
+survives; mid-flush and mid-compaction crashes lose nothing) and asserts
+flush + leveled compaction actually happen (L0 bounded by the trigger, L1+
+non-overlapping) — all seed-reproducible. `LsmEngine` exposes `#[doc(hidden)]`
+`sstable_count`/`flush_count`/`compaction_count`/`block_read_count`/
+`reset_block_reads`/`level_table_counts`/`levels_non_overlapping`/
+`test_write_orphan_sstable` introspection helpers for these tests.
+
+`cargo bench -p custos-storage` runs `benches/engine_bench.rs`: a hand-rolled
+(no criterion) macro-benchmark over **`ProdEnv`** comparing `LsmEngine` vs
+`MemoryEngine` on put/get/scan throughput + latency and reporting flush/
+compaction counts. Workload is tunable via `CUSTOS_BENCH_KEYS` /
+`CUSTOS_BENCH_GETS` / `CUSTOS_BENCH_VALUE_BYTES` / `CUSTOS_BENCH_SCAN`. The
+default run shows the per-put WAL `fsync` is the dominant write cost (group-commit
+batching is the next deferred win).

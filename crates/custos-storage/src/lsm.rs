@@ -41,14 +41,29 @@
 //! MVCC version: for a key the greatest version `≤` the query version wins, and a
 //! tombstone at that version hides older values. SSTable lookups fetch only the
 //! relevant block via [`Disk::read_at`] (guided by the in-memory per-table block
-//! index), never the whole file.
+//! index), never the whole file. Two gates skip a table before any block read:
+//! the per-table key range, and a per-table **Bloom filter** over the table's
+//! keys (so a point-miss inside the key range still reads no block when the
+//! Bloom proves the key absent).
 //!
-//! ## Compaction
+//! ## Compaction (leveled)
 //!
-//! Size-tiered: once enough SSTables accumulate they are merged into one,
-//! dropping versions fully superseded by the memtable-less merged view and
-//! GC-able tombstones, then the manifest is atomically swapped and the old files
-//! removed.
+//! Tables carry a **level**. **L0** holds freshly flushed tables, whose key
+//! ranges may overlap. **L1+** hold *non-overlapping* runs: at most one table per
+//! level can contain a given key, so read amplification is bounded by the number
+//! of levels rather than the total table count.
+//!
+//! - **L0→L1**: once `compaction_trigger` L0 tables accumulate, all L0 tables are
+//!   merged with every L1 table their combined key range overlaps, and the result
+//!   is re-partitioned into non-overlapping L1 runs (each ≈`target_table_bytes`).
+//! - **Ln→L(n+1)** (n≥1): when a level exceeds its table budget
+//!   (`L1_TABLE_BUDGET * level_fanout^(n-1)`), its tables are merged with the
+//!   overlapping L(n+1) tables and re-partitioned into L(n+1).
+//!
+//! Every distinct `(key, version)` record is preserved across a compaction (full
+//! MVCC history, tombstones included), so the merged view of all live tables plus
+//! the memtable stays observationally identical to [`MemoryEngine`]. The manifest
+//! swap remains the single linearization point.
 //!
 //! ## Crash safety
 //!
@@ -60,16 +75,18 @@
 //!   memtable is rebuilt from the WAL and nothing is lost. An orphan SSTable file
 //!   not named by the manifest is simply ignored (and overwritten by the next
 //!   flush, which reuses the next sequence number derived from the manifest).
-//! - **Mid-compaction crash** (merged SSTable written but manifest not yet
-//!   swapped): the manifest still names the old inputs, which are all intact
-//!   (compaction only `remove`s them *after* the swap), so reads see the old set;
-//!   the orphan merged file is ignored. No torn-table read is possible because a
+//! - **Mid-compaction crash** (the merged output table(s) written but manifest
+//!   not yet swapped): the manifest still names the old inputs, which are all
+//!   intact (compaction only `remove`s them *after* the swap), so reads see the
+//!   old set; the orphan output files (at seqs beyond the manifest's `next_seq`)
+//!   are ignored. No torn-table read is possible because a
 //!   table is only ever read once it is named by a synced manifest.
 //!
 //! These properties are argued here and exercised in `tests/lsm_crash.rs`.
 
 use std::collections::BTreeMap;
 use std::ops::Bound;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use custos_env::Env;
@@ -80,14 +97,24 @@ use crate::{
     WriteOp,
 };
 
+mod bloom;
 mod sstable;
 
-use sstable::{SsTableMeta, SsTableReader, SsTableWriter};
+use sstable::{Record, SsTableMeta, SsTableReader, SsTableWriter};
 
 /// Default memtable flush threshold: total bytes of buffered key+value data.
 const DEFAULT_FLUSH_BYTES: usize = 64 * 1024;
-/// Default size-tiered compaction trigger: number of live SSTables.
+/// Default L0 compaction trigger: number of L0 (flush-tier) SSTables that forces
+/// an L0→L1 compaction.
 const DEFAULT_COMPACTION_TRIGGER: usize = 4;
+/// Default soft byte budget for one output SSTable when partitioning a leveled
+/// compaction into non-overlapping runs.
+const DEFAULT_TARGET_TABLE_BYTES: usize = 2 * 1024 * 1024;
+/// Default fanout: level `n` (n≥1) holds up to `base * fanout^(n-1)` tables
+/// before it is compacted down into level `n+1`.
+const DEFAULT_LEVEL_FANOUT: usize = 4;
+/// Base table budget for L1 (multiplied by the fanout for deeper levels).
+const L1_TABLE_BUDGET: usize = 4;
 
 /// Tuning knobs for an [`LsmEngine`]. Defaults are sized for tests; production
 /// wiring can raise them.
@@ -95,8 +122,14 @@ const DEFAULT_COMPACTION_TRIGGER: usize = 4;
 pub struct LsmOptions {
     /// Flush the memtable once its buffered key+value bytes exceed this.
     pub flush_threshold_bytes: usize,
-    /// Compact once the live SSTable count reaches this.
+    /// Compact L0 down into L1 once this many L0 (flush-tier) SSTables accumulate.
     pub compaction_trigger: usize,
+    /// Soft byte budget per output SSTable when partitioning a leveled
+    /// compaction's merged records into non-overlapping runs.
+    pub target_table_bytes: usize,
+    /// Level fanout: level `n` (n≥1) holds up to `L1_TABLE_BUDGET * fanout^(n-1)`
+    /// tables before it cascades into level `n+1`.
+    pub level_fanout: usize,
 }
 
 impl Default for LsmOptions {
@@ -104,6 +137,8 @@ impl Default for LsmOptions {
         Self {
             flush_threshold_bytes: DEFAULT_FLUSH_BYTES,
             compaction_trigger: DEFAULT_COMPACTION_TRIGGER,
+            target_table_bytes: DEFAULT_TARGET_TABLE_BYTES,
+            level_fanout: DEFAULT_LEVEL_FANOUT,
         }
     }
 }
@@ -181,6 +216,10 @@ struct Inner {
     flushes: u64,
     /// Count of compactions performed (introspection / tests).
     compactions: u64,
+    /// Shared counter of SSTable blocks fetched from disk, wired into every
+    /// reader so the engine can report read amplification (introspection /
+    /// tests — e.g. that a Bloom-rejected point-miss reads zero blocks).
+    block_reads: Arc<AtomicU64>,
 }
 
 impl Inner {
@@ -276,10 +315,15 @@ impl<E: Env> LsmEngine<E> {
         };
 
         // Open the SSTables the manifest names (reads their footer + index only).
+        let block_reads = Arc::new(AtomicU64::new(0));
         let mut readers = Vec::with_capacity(manifest.tables.len());
         for meta in &manifest.tables {
             let file = format!("{prefix}sst-{:06}", meta.seq);
-            readers.push(SsTableReader::open(&env, file, meta.clone()).await?);
+            readers.push(
+                SsTableReader::open(&env, file, meta.clone())
+                    .await?
+                    .with_block_counter(Arc::clone(&block_reads)),
+            );
         }
 
         // Replay the WAL tail into the memtable. A torn trailing record (crash
@@ -304,6 +348,7 @@ impl<E: Env> LsmEngine<E> {
             },
             flushes: 0,
             compactions: 0,
+            block_reads,
         };
 
         Ok(Self {
@@ -439,9 +484,11 @@ impl<E: Env> LsmEngine<E> {
         self.merged_at(&[], None, Version::MAX).await
     }
 
-    /// Flush the memtable to a new SSTable if it is over threshold, then maybe
-    /// compact. Called after every write (cheap when nothing is due). Disk I/O
-    /// happens outside the lock; the manifest swap is the durability point.
+    /// Flush the memtable to a new SSTable if it is over threshold, then run any
+    /// due compactions. Called after every write (cheap when nothing is due).
+    /// Disk I/O happens outside the lock; the manifest swap is the durability
+    /// point. Compaction is driven to quiescence so a cascade (L0→L1→L2…) settles
+    /// in one call.
     async fn maybe_flush_and_compact(&self) -> Result<()> {
         let should_flush = {
             let inner = self.lock();
@@ -450,14 +497,52 @@ impl<E: Env> LsmEngine<E> {
         if should_flush {
             self.flush().await?;
         }
-        let should_compact = {
-            let inner = self.lock();
-            inner.manifest.tables.len() >= self.opts.compaction_trigger
-        };
-        if should_compact {
-            self.compact().await?;
+        // Run compactions until none is due (bounded: each pass reduces a level's
+        // table count, and deeper levels have larger budgets).
+        while let Some(plan) = self.next_compaction() {
+            self.run_compaction(plan).await?;
         }
         Ok(())
+    }
+
+    /// Open a reader for `file`/`meta` with the engine's shared block-read
+    /// counter wired in.
+    async fn open_reader(&self, file: String, meta: SsTableMeta) -> Result<SsTableReader> {
+        let counter = Arc::clone(&self.lock().block_reads);
+        Ok(SsTableReader::open(&self.env, file, meta)
+            .await?
+            .with_block_counter(counter))
+    }
+
+    /// Decide the next compaction to run, if any. Prefers an L0→L1 compaction
+    /// (the flush tier fills fastest); otherwise the shallowest L≥1 over budget.
+    fn next_compaction(&self) -> Option<CompactionPlan> {
+        let inner = self.lock();
+        let tables = &inner.manifest.tables;
+        // Count tables per level.
+        let mut by_level: BTreeMap<u32, usize> = BTreeMap::new();
+        for t in tables {
+            *by_level.entry(t.level).or_default() += 1;
+        }
+        // L0 → L1 when enough flush-tier tables piled up.
+        if by_level.get(&0).copied().unwrap_or(0) >= self.opts.compaction_trigger {
+            return Some(CompactionPlan { source_level: 0 });
+        }
+        // Otherwise the shallowest level ≥1 over its table budget cascades down.
+        for (&level, &count) in by_level.range(1..) {
+            if count > self.level_table_budget(level) {
+                return Some(CompactionPlan {
+                    source_level: level,
+                });
+            }
+        }
+        None
+    }
+
+    /// Max tables allowed at `level` (≥1) before it cascades into `level+1`:
+    /// `L1_TABLE_BUDGET * level_fanout^(level-1)`.
+    fn level_table_budget(&self, level: u32) -> usize {
+        L1_TABLE_BUDGET.saturating_mul(self.opts.level_fanout.pow(level - 1))
     }
 
     /// Write the current memtable to a fresh SSTable, atomically add it to the
@@ -476,11 +561,12 @@ impl<E: Env> LsmEngine<E> {
             (records, seq, m)
         };
 
-        // Build + sync the new SSTable file (outside the lock).
+        // Build + sync the new SSTable file (outside the lock). A flush always
+        // lands at L0 (the overlapping flush tier).
         let file = self.sst_file(seq);
-        let meta = SsTableWriter::write(&self.env, &file, seq, &records).await?;
+        let meta = SsTableWriter::write(&self.env, &file, seq, 0, &records).await?;
         self.env.sync(&file).await.map_err(io)?;
-        let reader = SsTableReader::open(&self.env, file, meta.clone()).await?;
+        let reader = self.open_reader(file, meta.clone()).await?;
 
         // Atomically swap the manifest to reference the new table. Until this
         // returns durably, a crash recovers the old manifest + the intact WAL.
@@ -502,61 +588,136 @@ impl<E: Env> LsmEngine<E> {
         Ok(())
     }
 
-    /// Size-tiered compaction: merge **all** current SSTables into one, dropping
-    /// records fully shadowed by a newer table and GC-able tombstones, then
-    /// atomically swap the manifest and remove the old files.
-    async fn compact(&self) -> Result<()> {
-        let (inputs, seq, mut new_manifest, old_files) = {
+    /// Run one leveled compaction: merge every table at `source_level` with the
+    /// tables at `source_level + 1` whose key range overlaps the source's, then
+    /// re-partition the merged records into **non-overlapping** runs at the target
+    /// level. Atomically swap the manifest to {survivors + new runs}, then remove
+    /// the consumed input files.
+    ///
+    /// Every distinct `(key, version)` record is preserved, so the merged view is
+    /// unchanged (observationally identical to [`MemoryEngine`]); only the
+    /// physical layout changes. Crash safety is the same single-swap argument as
+    /// before: the inputs stay named by the manifest (and intact on disk) until
+    /// the swap commits, and the new files are orphans until then.
+    async fn run_compaction(&self, plan: CompactionPlan) -> Result<()> {
+        let target_level = plan.source_level + 1;
+
+        // Pick inputs under the lock: all readers at the source level, plus the
+        // target-level readers overlapping the source's combined key range.
+        let (input_readers, input_seqs, base_seq) = {
             let inner = self.lock();
-            if inner.manifest.tables.len() < 2 {
-                return Ok(());
+            let mut input_readers: Vec<SsTableReader> = Vec::new();
+            let mut source_bounds: Option<(Key, Key)> = None;
+            for (reader, meta) in inner.readers.iter().zip(&inner.manifest.tables) {
+                if meta.level == plan.source_level {
+                    if let (Some(lo), Some(hi)) = (&meta.min_key, &meta.max_key) {
+                        source_bounds = Some(match source_bounds {
+                            None => (lo.clone(), hi.clone()),
+                            Some((slo, shi)) => (slo.min(lo.clone()), shi.max(hi.clone())),
+                        });
+                    }
+                    input_readers.push(reader.clone());
+                }
             }
-            let inputs = inner.readers.clone();
-            let seq = inner.manifest.next_seq + 1;
-            let old_files: Vec<String> = inner
-                .manifest
-                .tables
-                .iter()
-                .map(|m| self.sst_file(m.seq))
-                .collect();
-            let mut m = inner.manifest.clone();
-            m.next_seq = seq;
-            (inputs, seq, m, old_files)
+            // Overlapping target-level tables (non-overlapping among themselves).
+            if let Some((slo, shi)) = &source_bounds {
+                for (reader, meta) in inner.readers.iter().zip(&inner.manifest.tables) {
+                    if meta.level == target_level && ranges_overlap(meta, slo, shi) {
+                        input_readers.push(reader.clone());
+                    }
+                }
+            }
+            let input_seqs: Vec<u64> = input_readers.iter().map(|r| r.meta().seq).collect();
+            (input_readers, input_seqs, inner.manifest.next_seq)
         };
 
-        // Merge inputs oldest→newest into one sorted record stream (newer version
-        // per (key,version) wins; we keep all distinct versions for MVCC/get_at).
+        if input_readers.is_empty() {
+            return Ok(());
+        }
+
+        // Merge all inputs into one sorted record stream, keeping every distinct
+        // (key, version) so MVCC history / get_at is preserved.
         let mut merged: BTreeMap<(Key, Version), Option<Value>> = BTreeMap::new();
-        for reader in &inputs {
+        for reader in &input_readers {
             for (k, v, slot) in reader.full_scan(&self.env).await? {
                 merged.insert((k, v), slot);
             }
         }
-        let records: Vec<sstable::Record> = merged
-            .into_iter()
-            .map(|((key, version), slot)| sstable::Record {
-                key,
-                version,
-                value: slot,
-            })
-            .collect();
 
-        // Write the merged SSTable.
-        let file = self.sst_file(seq);
-        let meta = SsTableWriter::write(&self.env, &file, seq, &records).await?;
-        self.env.sync(&file).await.map_err(io)?;
-        let reader = SsTableReader::open(&self.env, file, meta.clone()).await?;
+        // Partition into non-overlapping runs of ≈target_table_bytes, splitting
+        // only on a key boundary so each run owns a disjoint key range.
+        let partitions = partition_records(&merged, self.opts.target_table_bytes);
 
-        // Atomically swap the manifest to the single merged table. A crash before
-        // this keeps the old inputs (still intact — we remove them only after).
-        new_manifest.tables = vec![meta];
+        // Allocate sequence numbers and write each run at the target level.
+        let mut new_metas: Vec<SsTableMeta> = Vec::with_capacity(partitions.len());
+        let mut new_readers: Vec<SsTableReader> = Vec::with_capacity(partitions.len());
+        let mut new_files: Vec<String> = Vec::with_capacity(partitions.len());
+        let mut seq = base_seq;
+        for records in &partitions {
+            seq += 1;
+            let file = self.sst_file(seq);
+            let meta = SsTableWriter::write(&self.env, &file, seq, target_level, records).await?;
+            self.env.sync(&file).await.map_err(io)?;
+            let reader = self.open_reader(file.clone(), meta.clone()).await?;
+            new_metas.push(meta);
+            new_readers.push(reader);
+            new_files.push(file);
+        }
+
+        // Build the new manifest: survivors (not consumed) + the new runs. A crash
+        // before the swap keeps the old inputs (still named + intact); the new
+        // files are orphans at seqs beyond `next_seq` and are ignored on recovery.
+        let (new_manifest, old_files) = {
+            let inner = self.lock();
+            let mut tables: Vec<SsTableMeta> = Vec::new();
+            let mut old_files: Vec<String> = Vec::new();
+            for meta in &inner.manifest.tables {
+                if input_seqs.contains(&meta.seq) {
+                    old_files.push(self.sst_file(meta.seq));
+                } else {
+                    tables.push(meta.clone());
+                }
+            }
+            tables.extend(new_metas.iter().cloned());
+            // Keep tables ordered oldest→newest by seq so the parallel
+            // readers/tables vectors stay consistent and reverse-scan finds newer
+            // versions first.
+            tables.sort_by_key(|m| m.seq);
+            let new_manifest = Manifest {
+                next_seq: seq,
+                tables,
+                max_version: inner.manifest.max_version,
+            };
+            (new_manifest, old_files)
+        };
         self.write_manifest(&new_manifest).await?;
 
-        // Now drop the superseded input files and swap in-memory state.
+        // Commit in-memory: rebuild the parallel readers vector to match the new
+        // manifest's table order, then remove the consumed input files.
         {
             let mut inner = self.lock();
+            let mut readers_by_seq: BTreeMap<u64, SsTableReader> = BTreeMap::new();
+            for (reader, meta) in inner.readers.iter().zip(&inner.manifest.tables) {
+                if !input_seqs.contains(&meta.seq) {
+                    readers_by_seq.insert(meta.seq, reader.clone());
+                }
+            }
+            for (meta, reader) in new_metas.iter().zip(&new_readers) {
+                readers_by_seq.insert(meta.seq, reader.clone());
+            }
+            // new_manifest.tables is sorted by seq; map it through readers_by_seq.
+            let readers: Vec<SsTableReader> = new_manifest
+                .tables
+                .iter()
+                .map(|m| {
+                    readers_by_seq
+                        .get(&m.seq)
+                        .expect("reader for table")
+                        .clone()
+                })
+                .collect();
+            inner.readers = readers;
             inner.manifest = new_manifest;
-            inner.readers = vec![reader];
             inner.compactions += 1;
         }
         for f in old_files {
@@ -597,6 +758,64 @@ impl<E: Env> LsmEngine<E> {
     #[must_use]
     pub fn compaction_count(&self) -> u64 {
         self.lock().compactions
+    }
+
+    /// Total SSTable blocks fetched from disk since open (read amplification).
+    /// Test/introspection — used to assert a Bloom-rejected point-miss reads no
+    /// block.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn block_read_count(&self) -> u64 {
+        self.lock().block_reads.load(Ordering::Relaxed)
+    }
+
+    /// Reset the block-read counter to zero. Test/introspection.
+    #[doc(hidden)]
+    pub fn reset_block_reads(&self) {
+        self.lock().block_reads.store(0, Ordering::Relaxed);
+    }
+
+    /// Live SSTable count per level, as `(level, count)` ascending. Test/
+    /// introspection — used to assert leveled compaction keeps L1+ runs
+    /// non-overlapping and bounded.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn level_table_counts(&self) -> Vec<(u32, usize)> {
+        let inner = self.lock();
+        let mut by_level: BTreeMap<u32, usize> = BTreeMap::new();
+        for t in &inner.manifest.tables {
+            *by_level.entry(t.level).or_default() += 1;
+        }
+        by_level.into_iter().collect()
+    }
+
+    /// Whether every level ≥1 has non-overlapping key ranges among its tables.
+    /// Test/introspection — the leveled-compaction invariant.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn levels_non_overlapping(&self) -> bool {
+        let inner = self.lock();
+        let mut by_level: BTreeMap<u32, Vec<(Key, Key)>> = BTreeMap::new();
+        for t in &inner.manifest.tables {
+            if t.level >= 1 {
+                if let (Some(lo), Some(hi)) = (&t.min_key, &t.max_key) {
+                    by_level
+                        .entry(t.level)
+                        .or_default()
+                        .push((lo.clone(), hi.clone()));
+                }
+            }
+        }
+        for ranges in by_level.values_mut() {
+            ranges.sort();
+            for pair in ranges.windows(2) {
+                // pair[0].1 (hi) must be strictly less than pair[1].0 (lo).
+                if pair[0].1 >= pair[1].0 {
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     /// Write an **orphan** SSTable-named file (un-synced, never referenced by the
@@ -891,6 +1110,58 @@ impl<E: Env> Snapshot for LsmSnapshot<E> {
             .await
             .unwrap_or_default()
     }
+}
+
+/// A chosen compaction: merge `source_level` (and the overlapping
+/// `source_level + 1` tables) down into `source_level + 1`.
+#[derive(Clone, Copy, Debug)]
+struct CompactionPlan {
+    source_level: u32,
+}
+
+/// Whether table `meta`'s key range overlaps the inclusive range `[lo, hi]`.
+fn ranges_overlap(meta: &SsTableMeta, lo: &[u8], hi: &[u8]) -> bool {
+    match (&meta.min_key, &meta.max_key) {
+        (Some(mlo), Some(mhi)) => mlo.as_slice() <= hi && lo <= mhi.as_slice(),
+        _ => false,
+    }
+}
+
+/// Partition merged `(key, version) -> slot` records into non-overlapping runs,
+/// each ≈`target_bytes` of record payload. A run boundary is only ever placed
+/// between two **distinct keys**, so all versions of a key land in the same run
+/// and runs own disjoint key ranges (the leveled-layout invariant). Returns at
+/// least one (possibly empty) partition is avoided — an empty input yields no
+/// partitions.
+fn partition_records(
+    merged: &BTreeMap<(Key, Version), Option<Value>>,
+    target_bytes: usize,
+) -> Vec<Vec<Record>> {
+    let target = target_bytes.max(1);
+    let mut partitions: Vec<Vec<Record>> = Vec::new();
+    let mut current: Vec<Record> = Vec::new();
+    let mut current_bytes = 0usize;
+    let mut prev_key: Option<&Key> = None;
+
+    for ((key, version), slot) in merged {
+        let on_new_key = prev_key != Some(key);
+        // Only split on a key boundary, and only once the current run is full.
+        if on_new_key && current_bytes >= target && !current.is_empty() {
+            partitions.push(std::mem::take(&mut current));
+            current_bytes = 0;
+        }
+        current_bytes += key.len() + slot.as_ref().map_or(0, Vec::len) + 16;
+        current.push(Record {
+            key: key.clone(),
+            version: *version,
+            value: slot.clone(),
+        });
+        prev_key = Some(key);
+    }
+    if !current.is_empty() {
+        partitions.push(current);
+    }
+    partitions
 }
 
 /// Fold the winning record for `key` into `merged`: a strictly greater version

@@ -27,9 +27,13 @@
 //!
 //! [`Disk::read_at`]: custos_env::Disk::read_at
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use custos_env::Env;
 use serde::{Deserialize, Serialize};
 
+use super::bloom::BloomFilter;
 use crate::{Key, Result, StorageError, Value, Version};
 
 /// Magic in the footer, identifying a CustosDB SSTable v1.
@@ -64,12 +68,17 @@ struct BlockIndex {
     len: u64,
 }
 
-/// Per-table metadata stored in the manifest. Cheap to clone; carries no block
-/// data, only the bounds and the index region's location.
+/// Per-table metadata stored in the manifest. Carries no block data, only the
+/// bounds, the index region's location, the LSM level, and the key Bloom filter.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SsTableMeta {
     /// Sequence number (file is `sst-{seq:06}`).
     pub seq: u64,
+    /// LSM level. `0` is the flush tier (overlapping ranges allowed); `1+` hold
+    /// non-overlapping runs (leveled compaction). Defaults to `0` for manifests
+    /// written before levels existed.
+    #[serde(default)]
+    pub level: u32,
     /// Smallest user key in the table (`None` if the table is empty).
     pub min_key: Option<Key>,
     /// Largest user key in the table.
@@ -84,14 +93,33 @@ pub struct SsTableMeta {
     pub index_len: u64,
     /// Total file size in bytes.
     pub file_size: u64,
+    /// Bloom filter over the table's distinct user keys: a point read can skip
+    /// this table when `bloom.may_contain(key)` is false. Defaults to an empty
+    /// filter for manifests written before Blooms existed — an empty filter
+    /// answers `false`, so to stay correct on such legacy tables we only consult
+    /// the Bloom when it was actually built (see [`Self::may_contain`]).
+    #[serde(default)]
+    pub bloom: BloomFilter,
+    /// Whether [`Self::bloom`] was built for this table (false for legacy tables
+    /// recovered from a pre-Bloom manifest, where the Bloom must not be trusted).
+    #[serde(default)]
+    pub has_bloom: bool,
 }
 
 impl SsTableMeta {
-    /// Whether `key` could possibly be in this table (cheap key-range gate; a
-    /// bloom filter would refine this — deferred).
+    /// Whether `key` could possibly be in this table. First the cheap key-range
+    /// gate (`[min_key, max_key]`), then — if a Bloom filter was built — the
+    /// Bloom, which can rule out keys inside the range that were never written.
+    /// A legacy table without a Bloom (`has_bloom == false`) is gated by range
+    /// only, preserving correctness across an engine upgrade.
     pub fn may_contain(&self, key: &[u8]) -> bool {
         match (&self.min_key, &self.max_key) {
-            (Some(lo), Some(hi)) => lo.as_slice() <= key && key <= hi.as_slice(),
+            (Some(lo), Some(hi)) => {
+                if key < lo.as_slice() || key > hi.as_slice() {
+                    return false;
+                }
+                !self.has_bloom || self.bloom.may_contain(key)
+            }
             _ => false,
         }
     }
@@ -164,8 +192,9 @@ fn decode_block(bytes: &[u8]) -> Result<Vec<Record>> {
 pub struct SsTableWriter;
 
 impl SsTableWriter {
-    /// Write `records` (already sorted by `(key asc, version asc)`) to `file` and
-    /// return its [`SsTableMeta`]. The caller `sync`s the file afterwards.
+    /// Write `records` (already sorted by `(key asc, version asc)`) to `file` at
+    /// LSM `level` and return its [`SsTableMeta`] (including a Bloom filter built
+    /// over the distinct keys). The caller `sync`s the file afterwards.
     ///
     /// # Errors
     /// Returns [`StorageError::Backend`] on an I/O error.
@@ -173,6 +202,7 @@ impl SsTableWriter {
         env: &E,
         file: &str,
         seq: u64,
+        level: u32,
         records: &[Record],
     ) -> Result<SsTableMeta> {
         // Start clean: a prior crashed flush may have left an orphan at this name
@@ -188,6 +218,9 @@ impl SsTableWriter {
 
         let mut block_buf: Vec<u8> = Vec::new();
         let mut block_first_key: Option<Key> = None;
+        // Distinct keys for the Bloom filter. Records are sorted by key, so
+        // pushing only when the key changes yields the distinct set in order.
+        let mut distinct_keys: Vec<Key> = Vec::new();
 
         // Flush the in-progress block: append `block_buf || crc` and index it.
         async fn flush_block<E: Env>(
@@ -224,6 +257,9 @@ impl SsTableWriter {
             max_key = Some(rec.key.clone());
             min_version = min_version.min(rec.version);
             max_version = max_version.max(rec.version);
+            if distinct_keys.last().map(Vec::as_slice) != Some(rec.key.as_slice()) {
+                distinct_keys.push(rec.key.clone());
+            }
 
             if block_first_key.is_none() {
                 block_first_key = Some(rec.key.clone());
@@ -267,8 +303,11 @@ impl SsTableWriter {
         env.append(file, &footer).await.map_err(io)?;
 
         let file_size = index_offset + index_len + FOOTER_LEN;
+        let key_refs: Vec<&[u8]> = distinct_keys.iter().map(Vec::as_slice).collect();
+        let bloom = BloomFilter::build(&key_refs);
         Ok(SsTableMeta {
             seq,
+            level,
             min_key,
             max_key,
             min_version: if records.is_empty() { 0 } else { min_version },
@@ -276,17 +315,24 @@ impl SsTableWriter {
             index_offset,
             index_len,
             file_size,
+            bloom,
+            has_bloom: true,
         })
     }
 }
 
 /// A read handle to an immutable SSTable: holds the metadata + the in-memory
-/// block index, and fetches blocks from disk on demand. Cheap to clone.
+/// block index, and fetches blocks from disk on demand. Cheap to clone (the
+/// `meta` and `index` sit behind `Arc`s).
 #[derive(Clone)]
 pub struct SsTableReader {
-    file: String,
-    meta: SsTableMeta,
-    index: Vec<BlockIndex>,
+    file: Arc<str>,
+    meta: Arc<SsTableMeta>,
+    index: Arc<Vec<BlockIndex>>,
+    /// Shared counter incremented on every block fetched from disk, for the
+    /// engine's read-amplification introspection (tests). `None` until the engine
+    /// wires one in via [`Self::with_block_counter`].
+    block_reads: Option<Arc<AtomicU64>>,
 }
 
 impl SsTableReader {
@@ -305,7 +351,20 @@ impl SsTableReader {
             serde_json::from_slice(&bytes)
                 .map_err(|e| StorageError::Backend(format!("corrupt sstable index: {e}")))?
         };
-        Ok(Self { file, meta, index })
+        Ok(Self {
+            file: Arc::from(file),
+            meta: Arc::new(meta),
+            index: Arc::new(index),
+            block_reads: None,
+        })
+    }
+
+    /// Attach a shared block-read counter (engine introspection). Returns `self`
+    /// for chaining at open time.
+    #[must_use]
+    pub fn with_block_counter(mut self, counter: Arc<AtomicU64>) -> Self {
+        self.block_reads = Some(counter);
+        self
     }
 
     /// This table's metadata.
@@ -315,6 +374,9 @@ impl SsTableReader {
 
     /// Read and verify the block at index entry `bi`, returning its records.
     async fn read_block<E: Env>(&self, env: &E, bi: &BlockIndex) -> Result<Vec<Record>> {
+        if let Some(counter) = &self.block_reads {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
         let raw = env
             .read_at(&self.file, bi.offset, bi.len as usize)
             .await
@@ -446,7 +508,7 @@ impl SsTableReader {
     /// Every record in the table (all keys, all versions), for compaction.
     pub async fn full_scan<E: Env>(&self, env: &E) -> Result<Vec<(Key, Version, Option<Value>)>> {
         let mut out = Vec::new();
-        for bi in &self.index {
+        for bi in self.index.iter() {
             for r in self.read_block(env, bi).await? {
                 out.push((r.key, r.version, r.value));
             }
