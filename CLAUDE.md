@@ -212,6 +212,16 @@ cross-cutting ones. Prune/merge entries that become obsolete.
 - **Never hold a `std::sync::Mutex` guard across an `.await`** in `<E: Env>`
   code — it breaks `Send` (often a *compile* error via `spawn_task`'s bound) and
   risks nondeterminism. Take the lock, mutate, drop it; do I/O lock-free.
+- **Don't react to "I was superseded" by *immediately* re-proposing higher** —
+  that is the classic duelling-proposers **livelock** (two recoverers ratchet each
+  other's ballot forever within one logical instant, an unbounded message storm).
+  Break ties **deterministically** (e.g. only the higher-id contender retries; the
+  other stands down and adopts the winner's result) or back the retry off in time.
+  This also hangs a `SimEnv` test rather than failing it: the single-threaded
+  cooperative executor just spins at one virtual instant (100%+ CPU, no progress,
+  no panic), so **run new sim tests under a `timeout`** the first time — a hang
+  there is a same-instant unbounded-work loop, not slowness. (Found wiring Accord
+  recovery ballots; `animus-consensus` `core.rs::handle_superseded`.)
 
 ### Merge / integration workflow
 - **Run `cargo test --workspace` after *each* merge, not just at the end of a

@@ -28,7 +28,10 @@ conflict set** (`submit_rw`). No leader.
 
 - `timestamp.rs` — `Timestamp { logical, node }` (totally ordered, unique) and
   the per-node `LogicalClock` (`witness` to advance past a peer; `mint` for a
-  strictly-greater fresh stamp).
+  strictly-greater fresh stamp). Also `Ballot { round, node }` (totally ordered:
+  round then node-id) — the recovery proposal number; `Ballot::ZERO` is the
+  original coordinator's, `Ballot::next_above(highest, node)` mints one strictly
+  above the highest seen.
 - `core.rs` — `AccordCore`: a **synchronous, I/O-free** state machine mirroring
   `animus-control`'s `RaftCore`. `submit(keys)` starts a **write** transaction
   this node coordinates; `submit_read(keys)` starts a **read-only** transaction;
@@ -48,14 +51,19 @@ conflict set** (`submit_rw`). No leader.
   `resend_pending()` recomputes the outbound messages still owed for every
   in-flight round (PreAccept/Accept/Commit/Recover) and to whom — the driver's
   retry tick calls it (message retry).
-- `message.rs` — `AccordMsg` (PreAccept/PreAcceptOk/Accept/AcceptOk/Commit/
-  `CommitAck`, plus `Recover`/`RecoverOk` for failover), (de)serialized with
-  `serde_json` over the `Network`'s `Vec<u8>` payloads. `CommitAck` lets the
-  coordinator's retry tick know a replica has the `Commit` (otherwise
-  fire-and-forget) so it stops re-sending. Execution/Apply is *local* — no wire
-  message.
-- `persist.rs` — `WalRecord` (PreAccepted/Accepted/Committed/Applied) and
-  `PersistedState` (replay/decode/encode), mirroring `animus-control::persist`.
+- `message.rs` — `AccordMsg` (PreAccept/PreAcceptOk/Accept/AcceptOk/`AcceptNack`/
+  Commit/`CommitAck`, plus `Recover`/`RecoverOk`/`RecoverNack` for failover),
+  (de)serialized with `serde_json` over the `Network`'s `Vec<u8>` payloads.
+  `CommitAck` lets the coordinator's retry tick know a replica has the `Commit`
+  (otherwise fire-and-forget) so it stops re-sending. `Accept`/`Recover`/
+  `RecoverOk` carry a recovery `ballot` (`#[serde(default)]` → `Ballot::ZERO`);
+  `AcceptNack`/`RecoverNack` report the higher ballot a replica promised so a
+  superseded recoverer learns it. Execution/Apply is *local* — no wire message.
+- `persist.rs` — `WalRecord` (PreAccepted/Accepted/Committed/Applied/`Promised`)
+  and `PersistedState` (replay/decode/encode), mirroring `animus-control::persist`.
+  `Accepted` now carries the `accepted_ballot`, and `Promised { txn, ballot }`
+  records a durable recovery-ballot promise (`PersistedTxn.promised` /
+  `.accepted_ballot`) so a restarted replica does not renege.
 - `node.rs` — `AccordNode<E, S = MemoryEngine>`: the thin `Env` driver, generic
   over the `StorageEngine` backing execution (defaults to the in-memory
   `MemoryEngine`; `start_with_storage` injects another). `persist_then_ship`
@@ -254,31 +262,62 @@ conflict set** (`submit_rw`). No leader.
   per txn), so the driver may flush from either `submit` or the recv loop.
 - **Coordinator failover is a separate sub-protocol** (`recover` / `Recover` /
   `RecoverOk`, state in `recovering`, *not* `coordinating`). A recovery
-  coordinator: (1) **adopts** any `Committed`/`Applied` decision a recovery
-  quorum reports verbatim; else (2) **re-broadcasts `PreAccept` with the union
-  of keys** the replies carried (so a replica that missed the original PreAccept
-  learns the keys — otherwise it would execute an *empty* write) and forces the
-  **slow path** (recovery never takes the fast path — see the `recovery` flag
-  threaded through `advance_from_pre_accept`'s fast-path + `fast_still_possible`
-  gates). Safe because any recovery (majority) quorum intersects the fast quorum
-  that a fast-path commit required. **Gotcha that bit during development:** the
-  recovered txn's *keys* must reach every replica, or replicas that never saw the
-  original PreAccept commit with empty key sets and execute nothing — hence the
-  re-broadcast. The precise Accord recovery ballot, duelling recoverers, and a
-  failure detector to *trigger* recovery are out of scope (recovery is invoked
-  explicitly).
+  coordinator, once a majority quorum (all having **promised its ballot**) is in,
+  decides in order: (1) **adopts** any `Committed`/`Applied` decision a recovery
+  quorum reports verbatim; (2) else, if any reply was **`Accept`ed** under a
+  ballot, re-proposes the `(execute_at, deps)` of the reply with the **highest
+  `accepted_ballot`** under its own (higher) ballot; (3) otherwise **re-broadcasts
+  `PreAccept` with the union of keys** the replies carried (so a replica that
+  missed the original PreAccept learns the keys — otherwise it would execute an
+  *empty* write) and forces the **slow path** (recovery never takes the fast path —
+  see the `recovery` flag threaded through `advance_from_pre_accept`'s fast-path +
+  `fast_still_possible` gates). Safe because any recovery (majority) quorum
+  intersects the fast quorum that a fast-path commit required. **Gotcha that bit
+  during development:** the recovered txn's *keys* must reach the recovery quorum,
+  or replicas that never saw the original PreAccept commit with empty key sets and
+  execute nothing — hence the re-broadcast (and why the failover tests let the
+  original PreAccept reach a quorum *before* isolating the coordinator: with N=5 a
+  recovery quorum can entirely miss a single key-bearing replica).
+- **Recovery ballots + duelling recoverers** (ADR 0011, the precise-ballot slice).
+  `timestamp::Ballot { round, node }` is the proposal number a recovery coordinator
+  runs under (totally ordered: round, then node-id tiebreak). The original
+  coordinator is the implicit `Ballot::ZERO`; recoverers mint `round >= 1`. A
+  replica **promises** the highest ballot it has seen for a txn (`ReplicaTxn.
+  promised`, durable via `WalRecord::Promised` / `PersistedTxn.promised`) and
+  **rejects** a `Recover`/`Accept` below it — replying `RecoverNack`/`AcceptNack`
+  with the promised ballot. An `Accept` records its `accepted_ballot` (durable on
+  the `Accepted` WAL record), which `RecoverOk` reports so step (2) above can adopt
+  the most-recent prior proposal. **Public signatures stayed additive**:
+  `recover(txn)` is unchanged (it mints a ballot strictly above the highest it has
+  promised); the new ballot wire/WAL fields are `#[serde(default)]`. **Livelock
+  gotcha that bit:** "on supersession, bump my ballot and re-broadcast *now*"
+  livelocks two duelling recoverers (an unbounded same-instant message storm — it
+  hung the test). `handle_superseded` instead uses a deterministic **id tiebreak**:
+  the superseded recoverer only retries (higher) if its node id exceeds the
+  winner's; otherwise it **stands down** and adopts the winner's `Commit`. So the
+  duel converges in bounded rounds. A late original coordinator (`Ballot::ZERO`) is
+  simply fenced and cannot revert the recovered decision. A real **failure
+  detector** to *trigger* recovery is still out of scope (recovery is invoked
+  explicitly; the ballots make *concurrent* explicit recoveries safe).
 
 ## Deferred (see ADR 0011)
 
 The full transitive dependency wait-graph (the execution wait is conflict +
-timestamp based), the precise Accord recovery ballot rules + duelling recovery
-coordinators + a failure detector to trigger recovery and a retry *escalation*
-(today `recover` is called explicitly; the adaptive tick backs off but does not
-itself declare a coordinator dead), WAL snapshotting/log truncation (the WAL is
-the full per-txn history — contrast `RaftCore`), the precise fast-path quorum
-bound, and **per-shard consensus replica sets / placement of the consensus
-participants** (sharding routes only the *effect* per tablet; the Accord replica
-set is still one global group). **Now implemented:** read-only transactions
+timestamp based), a **failure detector** to *trigger* recovery and a retry
+*escalation* (today `recover` is called explicitly; the adaptive tick backs off
+but does not itself declare a coordinator dead — recovery **ballots** now make
+*concurrent* explicit recoveries safe, but nothing yet auto-detects a dead
+coordinator), WAL snapshotting/log truncation (the WAL is the full per-txn history
+— contrast `RaftCore`), the precise fast-path quorum bound, the precise
+`PreAcceptOk`-witness *fast-path*-recovery decision (we always force the slow path
+on re-proposal, and the duel converges by an id tiebreak rather than Accord's full
+randomized-backoff rules), and **per-shard consensus replica sets / placement of
+the consensus participants** (sharding routes only the *effect* per tablet; the
+Accord replica set is still one global group). **Now implemented:** read-only
+transactions, **recovery ballots + duelling recovery coordinators** (a replica
+promises the highest ballot seen and fences lower `Recover`/`Accept`; superseded
+recoverers converge via an id tiebreak; `RecoverOk` adopts the highest-ballot
+accepted proposal — `tests/accord_recover_ballots.rs`),
 (`submit_read`), **message retry with adaptive (exponential) backoff** (the
 driver's retry tick + `resend_pending`), the **data-plane frontier**
 (`start_with_data_plane`), **data-plane reads**, an **interactive transaction
@@ -315,6 +354,16 @@ black-box). The sync-core boundary is where each remaining piece slots in.
   one peer so it never reaches a fast quorum while a *different* peer still
   witnessed the `PreAccept` (and its keys) — then recovery runs from the peer
   that can still reach the key-bearing replica.
+- `tests/accord_recover_ballots.rs` (**recovery ballots + duelling recoverers**,
+  5-node cluster): two recoverers racing the same txn converge to one decision on
+  every replica; failover under partition then heal (the healed original cannot
+  revert the recovered decision); a `Recover` racing the original coordinator's
+  `Commit` (recovery adopts the existing commit, never contradicts it); recovery
+  surviving message loss; a superseded recoverer not stranding the txn; trace
+  reproducibility. Every test asserts cross-replica agreement and that **no
+  committed decision is reverted**. The failover tests let the original PreAccept
+  reach a quorum *before* isolating the coordinator (with N=5 a recovery quorum can
+  miss a single key-bearing replica).
 - `tests/accord_read.rs` (read transactions): a read observes the write ordered
   before it and not the one ordered after; a read of an unwritten key observes
   nothing; the read snapshot is identical on every replica across a 48-seed

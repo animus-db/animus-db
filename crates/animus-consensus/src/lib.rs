@@ -77,4 +77,4 @@ pub use crate::core::{AccordCore, ApplyEffect, Decision, Key, Phase, ReadEffect,
 pub use crate::message::{AccordMsg, Out};
 pub use crate::node::{AccordNode, InteractiveTxn};
 pub use crate::persist::{PersistedState, PersistedTxn, WalRecord};
-pub use crate::timestamp::{LogicalClock, Timestamp};
+pub use crate::timestamp::{Ballot, LogicalClock, Timestamp};

@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use crate::core::{Key, Phase, TxnId};
-use crate::timestamp::Timestamp;
+use crate::timestamp::{Ballot, Timestamp};
 
 /// One durable change to a single transaction's replica state, appended to the
 /// write-ahead log. Each record is self-describing for the transaction it names,
@@ -47,12 +47,27 @@ pub enum WalRecord {
         read_only: bool,
     },
     /// A coordinator-chosen execution timestamp and dependency set were adopted
-    /// via `Accept`.
+    /// via `Accept`. `accepted_ballot` is the proposal ballot under which they
+    /// were adopted (ADR 0011, recovery ballots): the original coordinator's
+    /// [`Ballot::ZERO`], or a recovery coordinator's higher ballot. A recovering
+    /// node reports it in `RecoverOk` so a later recoverer adopts the
+    /// highest-ballot proposal, and a restarted replica keeps its promise.
     Accepted {
         txn: TxnId,
         execute_at: Timestamp,
         deps: BTreeSet<TxnId>,
+        /// The ballot under which this `(execute_at, deps)` was accepted.
+        /// `#[serde(default)]` ⇒ [`Ballot::ZERO`] for forward-compat.
+        #[serde(default)]
+        accepted_ballot: Ballot,
     },
+    /// A replica **promised** a recovery ballot for `txn` (answered a `Recover`),
+    /// so it will reject any later `Recover`/`Accept` below it (ADR 0011, duelling
+    /// recoverers). Recorded durably so a restarted replica does not renege on a
+    /// promise and let a superseded recoverer win. Additive — older WALs simply
+    /// have no `Promised` records, so a recovered replica's promise floor is
+    /// [`Ballot::ZERO`].
+    Promised { txn: TxnId, ballot: Ballot },
     /// The final `(execute_at, deps)` was recorded via `Commit`. This is the
     /// durable agreement point: after this record is fsynced the replica may
     /// execute the transaction once its dependencies have executed.
@@ -87,6 +102,7 @@ impl WalRecord {
             WalRecord::PreAccepted { txn, .. }
             | WalRecord::Accepted { txn, .. }
             | WalRecord::Committed { txn, .. }
+            | WalRecord::Promised { txn, .. }
             | WalRecord::Applied { txn } => *txn,
         }
     }
@@ -112,6 +128,14 @@ pub struct PersistedTxn {
     pub applied: bool,
     /// Whether the transaction is read-only (a read snapshot, no write effect).
     pub read_only: bool,
+    /// The highest recovery ballot this replica promised durably (ADR 0011). A
+    /// restarted replica must not accept a `Recover`/`Accept` below this, or a
+    /// superseded recoverer could win. [`Ballot::ZERO`] if it never promised.
+    pub promised: Ballot,
+    /// The ballot under which `execute_at`/`deps` were last accepted (via
+    /// `Accept`). Reported in `RecoverOk` so a later recoverer adopts the
+    /// highest-ballot proposal. [`Ballot::ZERO`] if only PreAccepted.
+    pub accepted_ballot: Ballot,
 }
 
 /// Durable Accord replica state reconstructed by replaying the write-ahead log.
@@ -155,12 +179,25 @@ impl PersistedState {
                     entry.read_only |= read_only;
                 }
                 WalRecord::Accepted {
-                    execute_at, deps, ..
+                    execute_at,
+                    deps,
+                    accepted_ballot,
+                    ..
                 } => {
                     let entry = state.txns.entry(txn).or_default();
                     entry.execute_at = entry.execute_at.max(execute_at);
                     entry.deps.extend(deps);
                     entry.phase = entry.phase.max_phase(Phase::Accepted);
+                    // The accepted ballot only advances (a later Accept ran under
+                    // a higher ballot); keep the max so the recovered replica
+                    // reports the most-recent proposal it ever accepted.
+                    entry.accepted_ballot = entry.accepted_ballot.max(accepted_ballot);
+                    // Accepting under a ballot also implies having promised it.
+                    entry.promised = entry.promised.max(accepted_ballot);
+                }
+                WalRecord::Promised { ballot, .. } => {
+                    let entry = state.txns.entry(txn).or_default();
+                    entry.promised = entry.promised.max(ballot);
                 }
                 WalRecord::Committed {
                     keys,

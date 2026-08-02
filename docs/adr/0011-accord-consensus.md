@@ -528,3 +528,75 @@ check over Accord (ADR 0014).
   sets / placement (one global Accord group). The Elle cycle checker is now wired
   (ADR 0014) — and, with real write values, it is a *genuine black-box* check
   (reads observe stored state, not a reconstruction from `applied_order`).
+
+## Recovery ballots + duelling recoverers increment (2026-08-02)
+
+This increment closes the **precise recovery ballot + duelling recoverers**
+deferral as far as is bounded and well-tested, again without reshaping the
+sync-core / `Env`-driver split. The earlier failover slice was safe only because
+recovery was invoked *once* per transaction (no two recoverers could contend);
+this slice makes **concurrent recovery coordinators converge deterministically**.
+
+- **Recovery ballots.** A new `timestamp::Ballot { round, node }` (totally
+  ordered: round, then node-id tiebreak) is the proposal number a recovery
+  coordinator runs under. The original coordinator runs at the implicit
+  [`Ballot::ZERO`] (`round = 0`); every recoverer mints `round >= 1`, so a
+  recoverer always outranks the original coordinator's steady-state `Accept`. A
+  replica **promises** the highest ballot it has seen for a transaction
+  (`ReplicaTxn.promised`) and **rejects** any `Recover`/`Accept` carrying a lower
+  one, reporting the promised ballot so the sender learns it was superseded
+  (`RecoverNack`/`AcceptNack` carry that ballot). The promise is **durable** (a new
+  `WalRecord::Promised`, and `PersistedTxn.promised`/`.accepted_ballot`), so a
+  restarted replica does not renege and let a superseded recoverer win. An
+  `Accept` also records the ballot it was accepted under (`accepted_ballot`), which
+  `RecoverOk` reports.
+
+- **`RecoverOk` aggregation.** Once a simple-majority recovery quorum (all having
+  *promised this round's ballot*) is in, the recoverer decides, in order: (1) if
+  any reply is `Committed`/`Applied`, adopt that decision verbatim; (2) else if any
+  reply was `Accept`ed under a ballot (`accepted_ballot > ZERO`), adopt the
+  `(execute_at, deps)` of the reply with the **highest `accepted_ballot`** (the
+  most recent prior proposal, which may already have been committed by that
+  recoverer) and re-`Accept` it under our (higher) ballot; (3) otherwise force the
+  slow path over the recovery replies (max-ts/union-deps). With ballots totally
+  ordered, every recoverer that reaches step (2) adopts the *same* value, so
+  duelling recoverers cannot diverge.
+
+- **Duelling convergence (livelock avoidance).** The naïve "on supersession, bump
+  my ballot and re-broadcast now" rule reproduces the classic duelling-proposers
+  **livelock** (two recoverers ratchet each other's ballot forever within one
+  instant — an unbounded message storm; this bit during development and hung the
+  test). We instead use a deterministic **id tiebreak**: a superseded recoverer
+  (`AcceptNack`/`RecoverNack`) abandons its attempt and only retries (above the
+  ballot that fenced it) if its node id is **higher** than the winner's; otherwise
+  it **stands down** and lets the winner finish — the winner's `Commit` (re-driven
+  by its retry tick) then reaches it. So the duel converges in a bounded number of
+  rounds. A late/superseded *original* coordinator (running at `Ballot::ZERO`) is
+  simply fenced and stalls; its decision cannot overturn the recovered one.
+
+- **All public signatures stayed additive.** `AccordNode::recover(txn)` /
+  `AccordCore::recover(txn)` are unchanged (a recoverer mints a ballot strictly
+  above the highest it has promised — `round = 1` initially, higher on retry); the
+  ballot fields on `Accept`/`Recover`/`RecoverOk` and the WAL `Accepted` record are
+  `#[serde(default)]` (an absent ballot decodes to `Ballot::ZERO`), so older wire/
+  WAL bytes remain readable. `AccordCore` stays synchronous + I/O-free.
+
+- **Tests** in `animus-consensus/tests/accord_recover_ballots.rs` (5-node cluster,
+  `SimEnv`): two recoverers racing the same transaction converge to one decision
+  on every replica; coordinator failover under partition then heal (the healed
+  original cannot revert the recovered decision); a `Recover` racing the original
+  coordinator's `Commit` (recovery adopts the existing commit, never contradicts
+  it); recovery surviving message loss; a superseded recoverer not stranding the
+  transaction; and trace reproducibility. Every test asserts cross-replica
+  agreement and that **no committed decision is reverted**.
+
+- **Still deferred after this increment:** the full transitive dependency
+  wait-graph; a real **failure detector** to *trigger* recovery (it is still
+  invoked explicitly — the ballots make *concurrent* explicit recoveries safe, but
+  nothing yet *declares* a coordinator dead); WAL snapshotting / log truncation;
+  the precise fast-path quorum bound; and per-shard consensus replica sets /
+  placement (one global Accord group). The duel tiebreak guarantees convergence by
+  *yielding* the lower-id recoverer rather than Accord's full randomized-backoff
+  fast-path-recovery rules; the precise `PreAcceptOk`-witness fast-path-recovery
+  decision procedure remains a simplification (we always force the slow path on
+  re-proposal).
