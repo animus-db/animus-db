@@ -26,10 +26,14 @@ clients) under fault injection (partition + leader kill + crash + heal), checked
 for serializability/durability/convergence — a
 DynamoDB-style item API over the core plus a **DynamoDB JSON wire protocol**
 (`animus-dynamo`: CreateTable/PutItem/GetItem/DeleteItem/Query/Scan
-AttributeValue-JSON translation, with a per-table schema registry, sort-key
-conditions =/BETWEEN/begins_with, a `ConditionExpression` subset for conditional
-writes, `Scan` with `Limit`/`ExclusiveStartKey` pagination + `FilterExpression`,
-and a hash-only **global secondary index** queryable by `IndexName`), a
+AttributeValue-JSON translation over the full type set — scalars plus the
+document types `M`/`L` and set types `SS`/`NS`/`BS` — with a per-table schema
+registry, sort-key conditions =/BETWEEN/begins_with, a `ConditionExpression`
+subset for conditional writes, `ReturnValues` (`ALL_OLD`) on writes,
+top-level **projection expressions** (`ProjectionExpression`/`AttributesToGet`)
+on reads, `Scan` with `Limit`/`ExclusiveStartKey` pagination + `FilterExpression`,
+and **secondary indexes** — any number of hash-only/composite **global** and
+**local** secondary indexes queryable by `IndexName`), a
 **runnable node + CLI** assembling the planes over `ProdEnv` and
 serving clients over TCP, with a now **durable data plane** — each node's data
 replica is backed by the on-disk `LsmEngine` over `ProdEnv` by default, so a
@@ -70,9 +74,9 @@ order; ADR 0011). Skeletons / future work:
 the rest of the CQL surface (clustering/composite keys,
 `UPDATE`/`DELETE`/`BATCH`/`ALTER`/`DROP`, collection/UDT types, paging, auth,
 `LWT`, consistency levels, durable replicated schemas) and the rest of the
-DynamoDB surface (projection expressions, `ReturnValues`, document/set types,
-composite/multiple GSIs + local secondary indexes, durable/replicated table
-schemas), and the deferred remainder of Accord
+DynamoDB surface (per-index projection attribute lists, document-path
+projections, `UpdateItem`/`BatchWriteItem`/`TransactWrite`, durable/replicated
+table schemas), and the deferred remainder of Accord
 (the full dependency wait-graph, the precise recovery ballot + duelling
 recoverers + a failure detector, WAL snapshotting, data-plane *reads*, and
 sharded transactions across tablets).

@@ -62,14 +62,30 @@ The surface now extends past the original three point ops:
   base storage key, surfaced to the client as the key item's AttributeValue map)
   and applies an optional `FilterExpression` (the same predicate subset as a
   conditional write) after the read. Same in-memory-keyspace caveat as `Query`.
-- **Global secondary indexes (GSI).** `CreateTable` may declare a single
-  hash-only GSI (`GlobalSecondaryIndexes`, one `HASH` key attribute). The
-  registry maintains a second `escape(gsi_value) || base_key` index on every
-  write/delete (it stores only base keys, not item copies, so the base item
-  stays authoritative), and a `Query` with an `IndexName` resolves a GSI value
-  back to its base storage keys, which are quorum-read like a base query.
-  Deferred: projections, composite (hash+range) GSIs, multiple GSIs, and local
-  secondary indexes.
+- **Secondary indexes (GSI + LSI).** `CreateTable` may declare any number of
+  secondary indexes. A **global** secondary index (`GlobalSecondaryIndexes`) has
+  a `HASH` key attribute plus an optional `RANGE` (a composite GSI); a **local**
+  secondary index (`LocalSecondaryIndexes`) shares the base partition `HASH` and
+  adds an alternate `RANGE` sort attribute. The registry maintains, per index, an
+  `escape(hash) [|| escape(sort)] || base_key` index on every write/delete (it
+  stores only base keys, not item copies, so the base item stays authoritative),
+  and a `Query` with an `IndexName` resolves a hash value back to its base storage
+  keys — narrowed by an optional sort-key condition on a composite GSI / LSI (a
+  hash-only GSI rejects one) — which are quorum-read like a base query. Deferred:
+  per-index projection attribute lists (every index projects `ALL`).
+- **Document & set attribute types.** The AttributeValue codec carries the
+  document types `M` (map) and `L` (list) and the set types `SS`/`NS`/`BS`
+  (string/number/binary sets, kept sorted + deduplicated so the in-memory form is
+  canonical), alongside the scalars. Stored items serialize them transparently.
+- **Projection expressions.** GetItem/Query/Scan accept a `ProjectionExpression`
+  (a comma-separated list of top-level attribute names, with `#alias`
+  placeholders via `ExpressionAttributeNames`) or the legacy `AttributesToGet`
+  array; the edge keeps only the requested attributes after the read. Top-level
+  only — a document-path name (`a.b`) is rejected. For `Scan` the
+  `FilterExpression` sees the whole item before projection trims it.
+- **`ReturnValues`.** PutItem/DeleteItem accept `ReturnValues: NONE` (default) or
+  `ALL_OLD`; the edge reads the prior item once (reusing it for any condition
+  check, so no double read) and echoes it under `Attributes` for `ALL_OLD`.
 
 A third slice exists on the CQL side: a **Cassandra CQL v4 binary protocol** is
 served alongside the DynamoDB endpoint. `animus-cql` is the pure, deterministic
@@ -107,10 +123,11 @@ and `USE`/`CREATE` reply `SetKeyspace`/`SchemaChange`. Everything routes through
 the **same quorum coordinator** the plain-TCP and DynamoDB edges use; everything
 below the socket stays on the `Env`-based paths.
 
-What remains. DynamoDB: projection expressions, `ReturnValues`, document/set
-attribute types, composite/multiple GSIs and local secondary indexes, and
-durable control-plane-replicated table schemas + key/GSI indexes (plus a native
-quorum range scan so `Query`/`Scan` need not track keys). CQL: clustering columns
+What remains. DynamoDB: per-index projection attribute lists (every index
+projects `ALL`), document-path projections (`a.b`),
+`UpdateItem`/`BatchWriteItem`/`TransactWrite`, and durable
+control-plane-replicated table schemas + key/index state (plus a native quorum
+range scan so `Query`/`Scan` need not track keys). CQL: clustering columns
 + composite/compound partition keys, more statement kinds
 (`UPDATE`/`DELETE`/`BATCH`/`ALTER`/`DROP`), collection/UDT types, paging,
 authentication, `LWT`/conditional writes, honoring the requested consistency

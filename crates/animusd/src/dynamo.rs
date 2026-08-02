@@ -66,7 +66,7 @@
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use animus_dynamo::wire::{self, Operation, WireError};
+use animus_dynamo::wire::{self, Operation, Projection, ReturnValues, WireError};
 use animus_dynamo::{
     AttributeValue, ConditionExpression, Item, SchemaRegistry, SortKeyCondition, storage_key,
 };
@@ -281,38 +281,66 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             table,
             item,
             condition,
+            return_values,
         } => {
             let (pk, sk) = resolve_key(&table, &item)?;
             let within = storage_key(&pk, sk.as_ref());
             let key = data_key(&table, &within);
+            // For ALL_OLD (or a condition) we need the prior item; read it once.
+            let needs_old = condition.is_some() || return_values == ReturnValues::AllOld;
+            let old = if needs_old {
+                quorum_read(ctx, &key).await?
+            } else {
+                None
+            };
             if let Some(cond) = &condition {
-                check_condition(ctx, &key, cond).await?;
+                if !cond.evaluate(old.as_ref()) {
+                    return Err(WireError::conditional_check_failed(
+                        "the conditional request failed",
+                    ));
+                }
             }
             let value = wire::encode_stored_item(&item);
             quorum_write(ctx, &key, &value).await?;
             note_put(&table, &within, &item);
-            Ok(wire::empty_response())
+            Ok(wire::write_response(return_values, old.as_ref()))
         }
         Operation::DeleteItem {
             table,
             key,
             condition,
+            return_values,
         } => {
             let (pk, sk) = resolve_key(&table, &key)?;
             let within = storage_key(&pk, sk.as_ref());
             let data_key = data_key(&table, &within);
+            let needs_old = condition.is_some() || return_values == ReturnValues::AllOld;
+            let old = if needs_old {
+                quorum_read(ctx, &data_key).await?
+            } else {
+                None
+            };
             if let Some(cond) = &condition {
-                check_condition(ctx, &data_key, cond).await?;
+                if !cond.evaluate(old.as_ref()) {
+                    return Err(WireError::conditional_check_failed(
+                        "the conditional request failed",
+                    ));
+                }
             }
             let value = wire::encode_tombstone();
             quorum_write(ctx, &data_key, &value).await?;
             note_delete(&table, &within);
-            Ok(wire::empty_response())
+            Ok(wire::write_response(return_values, old.as_ref()))
         }
-        Operation::GetItem { table, key } => {
+        Operation::GetItem {
+            table,
+            key,
+            projection,
+        } => {
             let (pk, sk) = resolve_key(&table, &key)?;
             let data_key = data_key(&table, &storage_key(&pk, sk.as_ref()));
             let item = quorum_read(ctx, &data_key).await?;
+            let item = item.map(|i| wire::project(projection.as_ref(), &i));
             Ok(wire::get_item_response(item.as_ref()))
         }
         Operation::Query {
@@ -320,6 +348,7 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             index,
             partition_value,
             sort_condition,
+            projection,
         } => {
             run_query(
                 ctx,
@@ -327,6 +356,7 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
                 index.as_deref(),
                 &partition_value,
                 sort_condition.as_ref(),
+                projection.as_ref(),
             )
             .await
         }
@@ -335,25 +365,40 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             limit,
             exclusive_start_key,
             filter,
-        } => run_scan(ctx, &table, limit, exclusive_start_key, filter.as_ref()).await,
+            projection,
+        } => {
+            run_scan(
+                ctx,
+                &table,
+                limit,
+                exclusive_start_key,
+                filter.as_ref(),
+                projection.as_ref(),
+            )
+            .await
+        }
     }
 }
 
 /// Resolve the partition's matching within-table keys from the registry (or, with
-/// an `index`, a GSI value's base keys), then quorum-read each to assemble the
-/// result (the data plane has no range scan).
+/// an `index`, a secondary index's base keys), then quorum-read each to assemble
+/// the result (the data plane has no range scan). An optional `projection` keeps
+/// only the requested attributes of each returned item.
 async fn run_query(
     ctx: &ClientCtx,
     table: &str,
     index: Option<&str>,
     partition_value: &AttributeValue,
     sort_condition: Option<&SortKeyCondition>,
+    projection: Option<&Projection>,
 ) -> Result<String, WireError> {
     let within_keys = {
         let reg = registry().lock().expect("registry poisoned");
         match index {
+            // A secondary index: a hash-only GSI takes no sort condition; a
+            // composite GSI / LSI may narrow by one (the registry enforces this).
             Some(index) => reg
-                .index_query_keys(table, index, partition_value)
+                .index_query_keys(table, index, partition_value, sort_condition)
                 .map_err(registry_error)?,
             None => reg
                 .query_keys(table, partition_value, sort_condition)
@@ -364,7 +409,7 @@ async fn run_query(
     for within in &within_keys {
         let data_key = data_key(table, within);
         if let Some(item) = quorum_read(ctx, &data_key).await? {
-            items.push(item);
+            items.push(wire::project(projection, &item));
         }
     }
     Ok(wire::query_response(&items))
@@ -380,6 +425,7 @@ async fn run_scan(
     limit: Option<usize>,
     exclusive_start_key: Option<Item>,
     filter: Option<&ConditionExpression>,
+    projection: Option<&Projection>,
 ) -> Result<String, WireError> {
     // Resolve the cursor item (if any) to its base storage key.
     let start_after = match &exclusive_start_key {
@@ -399,8 +445,9 @@ async fn run_scan(
     for within in &within_keys {
         let data_key = data_key(table, within);
         if let Some(item) = quorum_read(ctx, &data_key).await? {
+            // The filter sees the whole item; projection then trims the result.
             if filter.is_none_or(|f| f.evaluate(Some(&item))) {
-                items.push(item);
+                items.push(wire::project(projection, &item));
             }
         }
     }
@@ -441,23 +488,6 @@ fn key_item_of(table: &str, item: &Item) -> Option<Item> {
     Some(key)
 }
 
-/// Enforce a `ConditionExpression` by reading the current item under the coord
-/// lock; a false predicate is a `ConditionalCheckFailedException`.
-async fn check_condition(
-    ctx: &ClientCtx,
-    key: &[u8],
-    condition: &ConditionExpression,
-) -> Result<(), WireError> {
-    let current = quorum_read(ctx, key).await?;
-    if condition.evaluate(current.as_ref()) {
-        Ok(())
-    } else {
-        Err(WireError::conditional_check_failed(
-            "the conditional request failed",
-        ))
-    }
-}
-
 fn note_put(table: &str, within_key: &[u8], item: &Item) {
     let mut reg = registry().lock().expect("registry poisoned");
     if !reg.has_table(table) {
@@ -494,6 +524,10 @@ fn registry_error(err: animus_dynamo::RegistryError) -> WireError {
         R::NoSuchIndex(i) => WireError {
             code: "ValidationException",
             message: format!("index `{i}` does not exist on this table"),
+        },
+        R::IndexSortMismatch(i) => WireError {
+            code: "ValidationException",
+            message: format!("index `{i}` is hash-only and takes no sort-key condition"),
         },
     }
 }
