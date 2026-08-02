@@ -134,25 +134,34 @@ epoch compare-and-swap transactions.
   (`ProdEnv`'s real sink); use **`start_with_metrics`** to thread a recording
   handle a sim test can read — `SimEnv::metrics()` is the no-op default, so no
   `animus-sim` change is needed.
-- **Durable-before-visible: `apply` is gated on a `durable_index`, not just
-  `commit_index`.** `RaftCore::propose` advances `commit_index` synchronously, but
-  `apply` only advances `last_applied` up to `min(commit_index, durable_index)` —
-  so a command is client-visible (`metadata()`/`applied()`, what a proposer waits
-  on) **only after it is fsynced**, never before (ADR 0009). The driver advances
-  the watermark via **`mark_durable_through`** in `flush_wal`, *immediately after*
+- **Durable-before-visible: `apply` is gated on `durable_index` — but only on the
+  *leader*.** `apply`'s frontier is **role-aware** (ADR 0009): the **leader** uses
+  `min(commit_index, durable_index)`, a **non-leader** uses `commit_index`.
+  Rationale: only the leader's applied state is what a proposer *acks* on, so a
+  command is leader-visible (`metadata()`/`applied()`) **only after it is fsynced**,
+  never before — `RaftCore::propose` advances `commit_index` synchronously, but the
+  leader won't apply past what's on disk. A **follower** never acks a write to a
+  client (it only serves *reads*); a committed entry already rests on a quorum of
+  durable logs (the driver flushes *before* sending outbound, so a follower fsyncs
+  before its `AppendEntriesResp` and the leader before its `AppendEntries`), so a
+  follower safely applies on **commit** without waiting on its *own* local fsync —
+  gating it there would only widen cross-node read-visibility lag. `last_applied`
+  only moves forward, so a follower that applied to commit then wins an election
+  keeps those entries, while its *own future* proposals stay durability-gated
+  (their index exceeds `durable_index` until it fsyncs). The driver advances the
+  watermark via **`mark_durable_through`** in `flush_wal`, *immediately after*
   `env.sync(WAL)` (passing the drain-time `last_log_index`); `recovered()` sets it
-  to the recovered `last_log_index`. This closed the acked-before-durable window
-  that flaked `animusd`'s `create_table_survives_node_restart`. Multi-node was
-  already safe (the driver flushes *before* sending outbound, so a follower fsyncs
-  before its `AppendEntriesResp`); this closed the leader-applies-own-entry gap
-  (acute single-node). **Gotchas:** (1) a core driven by hand (not via `RaftNode`)
-  must simulate the fsync — drain, then `mark_durable_through(last_log_index())` —
-  or `metadata()` never reflects proposals (see `persistence.rs`'s `persist`
-  helper). (2) Gating follower visibility on its own fsync widens cross-node
-  replication races: a read on a follower right after a leader `CreateTable` must
-  wait for the definition to replicate there (`await_table_*` in the `animusd`
-  tests). When you touch propose/commit/apply, preserve this ordering — don't apply
-  past `durable_index`.
+  to the recovered `last_log_index`. The leader gate closed the acked-before-durable
+  window that flaked `animusd`'s `create_table_survives_node_restart` (acute
+  single-node, where commit is self-only). **Gotchas:** (1) a *leader* core driven
+  by hand (not via `RaftNode`) must simulate the fsync — drain, then
+  `mark_durable_through(last_log_index())` — or its `metadata()` never reflects
+  proposals (see `persistence.rs`'s `persist` helper); a hand-driven *follower*
+  applies on commit with no fsync (see `follower_visibility.rs`). (2) A read on a
+  follower right after a leader `CreateTable` must still wait for the definition to
+  *replicate* there (`await_table_*` in the `animusd` tests) — a cross-node race
+  independent of the local durable gate. When you touch propose/commit/apply,
+  preserve this ordering — don't apply past `durable_index` *on the leader*.
 - Commit advances only for **current-term** entries via majority `matchIndex`
   (the Raft safety rule). Don't relax this.
 - Snapshot transfer is **chunked** (see above). Deferred: cross-leader resumption
@@ -163,7 +172,11 @@ epoch compare-and-swap transactions.
 
 `cargo test -p animus-control` — election/replication/leader-kill +
 multi-seed convergence (`control_raft.rs`), durability/recovery
-(`persistence.rs`), split/merge (`tablet_split_merge.rs`), snapshot truncation
+(`persistence.rs`), the **role-aware apply gate** (`follower_visibility.rs`,
+ADR 0009 — a hand-driven follower applies a committed entry with `durable_index ==
+0`, a leader stays gated on its own proposal, a follower→leader transition keeps the
+applied entry and gates new proposals, and both followers in a `SimEnv` cluster
+reflect the leader's committed command), split/merge (`tablet_split_merge.rs`), snapshot truncation
 (`wal_compaction.rs`), a partitioned follower catching up via `InstallSnapshot`
 plus a far-behind follower catching up via a **multi-chunk** `InstallSnapshot`
 (`install_snapshot.rs`), process restart-and-rejoin (`restart.rs`, using

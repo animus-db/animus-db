@@ -1089,13 +1089,32 @@ impl RaftCore {
     }
 
     fn apply(&mut self) {
-        // Apply only up to the **durable** frontier, never just the committed one:
-        // a command must be on disk before it becomes client-visible (durable-
-        // before-visible, ADR 0009). `durable_index` is advanced by the driver
-        // after `env.sync(WAL)` (`mark_durable_through`), so an entry committed but
-        // not yet fsynced stays invisible — a crash in that window loses nothing a
-        // client could have observed.
-        let frontier = self.commit_index.min(self.durable_index);
+        // The apply frontier is **role-aware** (ADR 0009, durable-before-visible):
+        //
+        // - **Leader:** `min(commit_index, durable_index)`. The leader's
+        //   `metadata()`/`applied()` is what a proposer *acks* on, so a command
+        //   must be on disk before it becomes client-visible — an entry committed
+        //   but not yet fsynced stays invisible, and a crash in that window loses
+        //   nothing a client could have observed. `durable_index` is advanced by
+        //   the driver after `env.sync(WAL)` (`mark_durable_through`). This is
+        //   acute single-node, where commit rests on the leader alone.
+        //
+        // - **Non-leader:** `commit_index`. A follower never acks a write to a
+        //   client (writes are proposed to the leader); it only serves *reads* of
+        //   its local `Metadata`. A committed entry already rests on a quorum of
+        //   durable logs (the driver fsyncs before sending, so a follower fsyncs
+        //   before its `AppendEntriesResp` and the leader before `AppendEntries`),
+        //   so a follower may safely expose it without waiting on its *own* local
+        //   fsync — gating it there would only widen cross-node replication-
+        //   visibility lag. `last_applied` only moves forward, so a follower that
+        //   applied to commit then wins an election keeps those (committed/quorum-
+        //   durable) entries; its own *future* proposals are still durability-
+        //   gated (their index exceeds `durable_index` until it fsyncs).
+        let frontier = if self.role == Role::Leader {
+            self.commit_index.min(self.durable_index)
+        } else {
+            self.commit_index
+        };
         while self.last_applied < frontier {
             self.last_applied += 1;
             let offset = (self.last_applied - self.snapshot_index - 1) as usize;

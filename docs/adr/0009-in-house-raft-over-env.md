@@ -84,14 +84,14 @@ memory. A crash in that window lost an acknowledged command (recovery restores t
 last fsynced snapshot + WAL tail, without it) — the intermittent failure of
 `animusd`'s `tests/dynamo_schema.rs::create_table_survives_node_restart`.
 
-**The fix (shipped): a durable watermark.** `RaftCore` now carries a
-`durable_index`, and `apply` advances `last_applied` only up to
-`min(commit_index, durable_index)` — never past what is fsynced. The driver
-advances the watermark via `RaftCore::mark_durable_through` **immediately after
-`env.sync(WAL)`** in `flush_wal` (passing the log high-water captured at drain), so
-a committed entry becomes applied/visible **only once it is on disk**. A proposer
-that observes applied state (`has_table_schema`, `metadata()`) therefore waits for
-durability for free — no caller change needed.
+**The fix (shipped): a durable watermark, gated on the *leader*.** `RaftCore` now
+carries a `durable_index`, and on the **leader** `apply` advances `last_applied`
+only up to `min(commit_index, durable_index)` — never past what is fsynced. The
+driver advances the watermark via `RaftCore::mark_durable_through` **immediately
+after `env.sync(WAL)`** in `flush_wal` (passing the log high-water captured at
+drain), so a committed entry becomes applied/visible on the leader **only once it
+is on disk**. A proposer that observes applied state (`has_table_schema`,
+`metadata()`) therefore waits for durability for free — no caller change needed.
 
 This is the same "ack-means-synced" rule the data plane already enforces
 (`animus-data` `ack_durability`) and mirrors `animus-consensus`'s `persist_then_ship`
@@ -111,16 +111,27 @@ both visible and crash-durable). A core driven by hand must simulate the driver'
 fsync — drain, then `mark_durable_through(last_log_index())` — or its `metadata()`
 never reflects proposals (see the `persist` helper in `persistence.rs`).
 
-**Note (test consequence, not a regression):** gating follower visibility on the
-follower's own fsync widened a pre-existing *cross-node* race — a query/read issued
-on a follower immediately after a `CreateTable` on the leader can outrun
-replication+apply to that follower. The cure is the same everywhere: wait for the
-replicated definition on the target node before reading it
-(`await_table_schema`/`await_table_index` in the `animusd` tests), exactly as the
-restart tests already do.
+**Follower reads apply on commit (the gate is leader-only — done).** A follower
+never acks a control-plane write to a client (writes are proposed to the leader);
+it only serves *reads* of its local `Metadata`. A committed entry already rests on
+a quorum of durable logs — the driver flushes **before** sending outbound, so a
+follower fsyncs before its `AppendEntriesResp` and the leader before its
+`AppendEntries`. So a follower may safely expose a committed entry on **commit**,
+without waiting on its **own** local fsync. `apply` is therefore **role-aware**:
+the leader's frontier is `min(commit_index, durable_index)` (ack-path gated), a
+non-leader's is `commit_index` (apply-on-commit). This avoids needlessly widening
+cross-node read-visibility lag. `last_applied` only moves forward, so a follower
+that applied to commit then wins an election keeps those (committed / quorum-
+durable) entries, while its *own future* proposals stay durability-gated (their
+index exceeds `durable_index` until it fsyncs). Coverage:
+`follower_visibility.rs` (a hand-driven follower applies a committed entry with
+`durable_index == 0`; a leader stays gated on its own proposal; a follower→leader
+transition keeps the applied entry and gates new proposals; and end-to-end, both
+followers in a `SimEnv` cluster reflect the leader's committed command).
 
-**Still deferred:** a follower also gates its *read* visibility on its own fsync,
-which is stronger than necessary for read safety (a committed entry is already
-durable on a quorum, so a follower could expose it pre-local-fsync without risking a
-lost ack). Relaxing follower-read visibility to apply-on-commit (while keeping the
-leader's ack-path gated) is a possible optimization, not a correctness need.
+A pre-existing *cross-node* race remains independent of this: a query/read issued
+on a follower immediately after a `CreateTable` on the leader can still outrun
+replication to that follower (the entry has to *arrive* and commit there first).
+The cure is the same everywhere: wait for the replicated definition on the target
+node before reading it (`await_table_schema`/`await_table_index` in the `animusd`
+tests), exactly as the restart tests already do.
