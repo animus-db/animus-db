@@ -238,6 +238,92 @@ async fn gsi_write_then_query() {
     assert!(body.contains("ValidationException"), "got: {body}");
 }
 
+/// A `Scan` after a `DeleteItem` must (a) omit the deleted item and (b) keep
+/// pagination correct even when the page boundary would have fallen on the deleted
+/// item — the `Limit` counts only live, decoded items, so a tombstone value never
+/// consumes a slot or strands the cursor. This guards the native-scan rewrite,
+/// where a DynamoDB delete stores a *tombstone value* the data plane still returns
+/// as a live pair.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn scan_skips_deleted_items_and_paginates() {
+    let dir = tempfile::tempdir().unwrap();
+    let bound = bind_cluster(3, "127.0.0.1".parse().unwrap(), dir.path())
+        .await
+        .unwrap();
+    let nodes = start_cluster(bound, 2, 2).await.unwrap();
+    await_bootstrap(&nodes).await;
+    let addr = nodes[0].dynamo_addr();
+
+    let (status, _) = dynamo(
+        addr,
+        "DynamoDB_20120810.CreateTable",
+        r#"{"TableName":"docs","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    // Five items 0..5.
+    for id in 0..5 {
+        let (status, _) = dynamo(
+            addr,
+            "DynamoDB_20120810.PutItem",
+            &format!(r#"{{"TableName":"docs","Item":{{"id":{{"S":"{id}"}}}}}}"#),
+        )
+        .await;
+        assert_eq!(status, 200);
+    }
+    // Delete "1" — it stores a tombstone value (a live data-plane pair).
+    let (status, _) = dynamo(
+        addr,
+        "DynamoDB_20120810.DeleteItem",
+        r#"{"TableName":"docs","Key":{"id":{"S":"1"}}}"#,
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    // A full scan omits the deleted item: 4 live items, no "1".
+    let (status, all) = dynamo(addr, "DynamoDB_20120810.Scan", r#"{"TableName":"docs"}"#).await;
+    assert_eq!(status, 200, "scan: {all}");
+    assert!(
+        all.contains("\"Count\":4"),
+        "deleted item not omitted: {all}"
+    );
+    assert!(
+        !all.contains(r#""id":{"S":"1"}"#),
+        "deleted item present: {all}"
+    );
+
+    // Limit 2 with the deleted item near the boundary: still exactly 2 live items
+    // and a usable cursor (the tombstone neither fills a slot nor strands it).
+    let (status, page1) = dynamo(
+        addr,
+        "DynamoDB_20120810.Scan",
+        r#"{"TableName":"docs","Limit":2}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "page1: {page1}");
+    assert!(page1.contains("\"Count\":2"), "page1 count: {page1}");
+    assert!(
+        page1.contains("\"LastEvaluatedKey\""),
+        "page1 cursor: {page1}"
+    );
+    let cursor_id = extract_cursor_id(&page1);
+
+    // Continue: the remaining 2 live items (0,2,3,4 minus the first two), no cursor.
+    let (status, page2) = dynamo(
+        addr,
+        "DynamoDB_20120810.Scan",
+        &format!(r#"{{"TableName":"docs","ExclusiveStartKey":{{"id":{{"S":"{cursor_id}"}}}}}}"#),
+    )
+    .await;
+    assert_eq!(status, 200, "page2: {page2}");
+    assert!(page2.contains("\"Count\":2"), "page2 count: {page2}");
+    assert!(
+        !page2.contains(r#""id":{"S":"1"}"#),
+        "deleted item paged in: {page2}"
+    );
+}
+
 /// Pull the `id` string out of a `LastEvaluatedKey` of the form
 /// `"LastEvaluatedKey":{"id":{"S":"<v>"}}` in a scan response body.
 fn extract_cursor_id(body: &str) -> String {

@@ -26,10 +26,13 @@ adapter wedge. The transport (HTTP, sockets) and the distributed routing live in
   `Query` sort conditions and conditional writes.
 - `registry` module — `SchemaRegistry`: a pure, in-memory per-table schema map
   (`create_table` / `create_table_with_indexes` / `create_table_legacy` /
-  `extract_key`) plus a per-table written-key index (`note_put` /
-  `note_delete` / `query_keys` / `scan_keys`) that backs the distributed `Query`
-  and `Scan` (the data plane has no quorum range scan), and per-table secondary
-  indexes (`index_query_keys` + `index_is_composite` + `index_projected_attributes`).
+  `extract_key`) plus per-table secondary indexes (`note_put` / `note_delete`
+  maintain them; `index_query_keys` + `index_is_composite` +
+  `index_projected_attributes` query them). **The base-table written-key index is
+  gone** — base `Query`/`Scan` now use the data plane's native quorum range scan
+  (`DataClient::scan`), so `query_keys`/`scan_keys`/`ScanPage` were removed.
+  `note_put`/`note_delete` now maintain only the GSI/LSI entries (a no-op for a
+  table with no secondary indexes).
   `SecondaryIndex` is either a `GlobalSecondaryIndex` (name + hash key attribute +
   optional sort attribute + `IndexProjection`) or a `LocalSecondaryIndex` (name +
   alternate sort attribute + `IndexProjection`, hashing by the base partition key).
@@ -87,13 +90,16 @@ adapter wedge. The transport (HTTP, sockets) and the distributed routing live in
   items are contiguous and sort-ordered, and `query` is one range scan. Numbers (`N`) are carried as text and sort lexicographically (a
   documented simplification). `SortKeyCondition::matches` compares the same
   key-bytes, so it agrees with the scan range.
-- `Query` / `Scan` over the **distributed** plane: the data plane
-  (`animus-data`) has no quorum range scan, so the registry tracks written item
-  keys per table. `query_keys` returns a partition's matching sub-range;
-  `scan_keys` walks the whole ordered index across partitions with a cursor
-  (`ExclusiveStartKey`/`LastEvaluatedKey` pagination, returned as `ScanPage`);
-  `animusd` quorum-reads each key. The key index (and the schema map) are
-  **in-memory and not durable** — rebuilt only from observed writes.
+- `Query` / `Scan` over the **distributed** plane now use the data plane's
+  **native quorum range scan** (`DataClient::scan`), not a tracked key set. A base
+  `Query` scans the partition's contiguous data-plane sub-range
+  `[escape(table) || escape(pk), …)`; a `Scan` scans the whole table's range
+  `[escape(table), …)` and paginates with `Limit` +
+  `ExclusiveStartKey`/`LastEvaluatedKey` over the **live** keys the scan returns.
+  An **index** `Query` still uses the in-memory GSI/LSI index (`index_query_keys`)
+  — the native scan covers the base keyspace, not an index's alternate ordering.
+  The range math (escape is prefix-free, ending `0x00 0x00`, so the first key past
+  a prefix bumps the last byte to `0x01`) lives at the `animusd` edge now.
   `Table::query_with` is the *local-engine* equivalent (a real engine scan),
   used by the item-API tests.
 - **Secondary indexes** (any number per table, GSI + LSI): `note_put` extracts
@@ -142,9 +148,10 @@ adapter wedge. The transport (HTTP, sockets) and the distributed routing live in
   but without cross-action rollback** (true ACID via Accord, ADR 0011, is deferred).
 - **Still deferred** (don't represent as a full adapter): truly atomic
   `TransactWriteItems`, `BatchGetItem`, list-index document paths (`a[0]`),
-  `ADD`/`DELETE` `UpdateExpression` arithmetic, durable/replicated **secondary-index
-  + written-key state** (only the *table key schema* is in the control plane), and
-  a native quorum range scan (so `Query`/`Scan` need not track keys). The
+  `ADD`/`DELETE` `UpdateExpression` arithmetic, and durable/replicated
+  **secondary-index** state (only the *table key schema* is in the control plane;
+  the GSI/LSI index stays in-memory). (Base `Query`/`Scan` no longer track keys —
+  they use the data plane's native quorum range scan.) The
   `Scan`/`Query` `FilterExpression` reuses the `ConditionExpression` predicate
   subset (`attribute_exists`/`attribute_not_exists`/`a = :v`), not the fuller
   filter grammar. `animus-cql` would map onto the same core the same way.
@@ -156,7 +163,7 @@ adapter wedge. The transport (HTTP, sockets) and the distributed routing live in
 unit tests (JSON decode/encode incl. document/set types + document-path projection
 + ReturnValues + UpdateItem/BatchWriteItem/TransactWriteItems decode + index
 projection types, base64 round-trip, tombstone, sort/condition predicates,
-key-index range queries, scan pagination, GSI/LSI write/overwrite/delete + index
+GSI/LSI write/overwrite/delete + index
 query, multiple GSIs, composite-index sort narrowing, and the DynamoDB↔control
 `TableSchema` bridge). The wire protocol is exercised end-to-end over real HTTP in
 `animusd`'s `tests/dynamo_wire.rs` (Put/Get/Delete), `tests/dynamo_extended.rs`
@@ -165,4 +172,7 @@ pagination + filter, and a GSI write-then-query), `tests/dynamo_documents.rs`
 (document/set types, projection, `ReturnValues: ALL_OLD`, multiple + composite
 GSIs, and an LSI), and `tests/dynamo_schema.rs` (**CreateTable consuming the
 replicated catalog — surviving a node restart**, plus UpdateItem/BatchWriteItem/
-TransactWriteItems, document-path projection, and a `KEYS_ONLY` GSI projection).
+TransactWriteItems, document-path projection, a `KEYS_ONLY` GSI projection, and
+**`scan_and_query_read_live_storage_after_restart`** — base `Query`/`Scan` return
+the rows from live storage after a restart wipes the registry, proving they no
+longer depend on any in-memory written-key tracking).

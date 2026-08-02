@@ -57,9 +57,12 @@ stays deterministic and unit-testable. The socket edge that drives it lives in
 
 ## What's non-obvious
 
-- **A *partition* is the unit of storage (`plan`).** The data plane has only
-  point read/write/delete (no quorum range scan), so everything a
-  `SELECT pk = ?` returns must live under **one** data-plane key. With clustering
+- **A *partition* is the unit of storage (`plan`).** A CQL `SELECT pk = ?` is a
+  **single-partition point read** of one data-plane key (CQL has no cross-partition
+  or range `WHERE`), so everything it returns must live under **one** data-plane
+  key. The data plane *does* now expose a native quorum range scan
+  (`DataClient::scan`, used by the DynamoDB base `Query`/`Scan`), but CQL does not
+  use it yet — a partition is still stored as one value, so SELECT needs no scan. With clustering
   columns a partition key maps to *many* rows, so the whole partition is one
   data-plane value keyed by `data_key(table, pk.to_key_bytes())`: a format byte
   (`ROW_FORMAT_V2`), a `u16` row count, then per row a length-prefixed clustering
@@ -130,7 +133,9 @@ parsing/encoding/planning stays here, control-plane wiring stays at the edge.
   `LIMIT`. `INSERT`/`UPDATE` require the full primary key.
 - Because a partition is one data-plane value, a partition with very many rows is
   a large value (no per-row paging). Acceptable for the subset; native quorum
-  range scan is future work (shared with the DynamoDB side, ADR 0006).
+  range scan is future work (the data-plane primitive `DataClient::scan` now
+  exists — used by the DynamoDB base `Query`/`Scan` — but the CQL planner does not
+  yet model range/`LIMIT` predicates over it; ADR 0006).
 - `UPDATE`/`DELETE` are upsert/whole-row only — no per-column `DELETE`, no `IF`
   (`LWT`), no counters or collection mutation.
 - The requested **consistency level is honored** (mapped to the data-plane

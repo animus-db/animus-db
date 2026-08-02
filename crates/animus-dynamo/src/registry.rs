@@ -7,17 +7,17 @@
 //! HTTP edge; **it is not durable** — schemas (and the key index below) are lost
 //! on restart. Persisting them through the control plane is future work.
 //!
-//! ## Why a key index lives here too
+//! ## What `note_put` / `note_delete` maintain
 //!
-//! The data plane (`animus-data`) exposes only point read/write/delete — it has
-//! no quorum range scan. To serve `Query` / `Scan` over the distributed plane,
-//! the registry also tracks, per table, the set of item **storage keys** written
-//! so far (`note_put` / `note_delete`). `Query` resolves the partition's
-//! contiguous key sub-range from this ordered index, `scan_keys` walks the whole
-//! ordered index (with a cursor for pagination), and the caller quorum-reads each
-//! key. This is an honest range scan over a *tracked* keyspace; the index being
-//! in-memory (rebuilt only by observed writes) is the same non-durability caveat
-//! as the schema map.
+//! The base table's items are **not** tracked here any more: a base-table `Query`
+//! and a `Scan` are served by the data plane's **native quorum range scan**
+//! ([`crate`] is pure, so the scan itself lives in `animus-data` / the `animusd`
+//! edge), reading live storage in key order. The registry only maintains the
+//! **secondary-index** entries below: `note_put` adds each declared index's entry
+//! for an item and `note_delete` drops it. A table with no secondary indexes makes
+//! both a no-op. The index being in-memory (rebuilt only by observed writes) is
+//! the same non-durability caveat as the schema map; durable/replicated index
+//! state is future work.
 //!
 //! ## Secondary indexes (GSI + LSI)
 //!
@@ -31,7 +31,7 @@
 //!   project an alternate **sort** attribute, so they narrow within a partition by
 //!   a different sort key.
 //!
-//! Each index keeps, alongside the base key index, an ordered set of
+//! Each index keeps an ordered set of
 //! `escape(hash_value) [|| escape(range_value)] || base_storage_key` entries.
 //! `note_put` extracts the indexed attribute(s) from the item and records one
 //! such entry (only base storage keys are stored, not item copies, so the base
@@ -46,11 +46,6 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::condition::SortKeyCondition;
 use crate::{AttributeValue, Item, TableSchema, escape};
-
-/// One page of a [`SchemaRegistry::scan_keys`] walk: the base storage keys on
-/// the page, plus the pagination cursor (the last key) when a `limit` truncated
-/// the page, else `None`.
-pub type ScanPage = (Vec<Vec<u8>>, Option<Vec<u8>>);
 
 /// What attributes a secondary index projects (the `Projection` of a
 /// `CreateTable` index declaration). Because this registry stores only base keys
@@ -139,7 +134,9 @@ pub enum RegistryError {
     IndexSortMismatch(String),
 }
 
-/// A table's registered schema plus the storage keys of its known items.
+/// A table's registered schema plus its declared secondary-index entries. The
+/// base table's item keys are **not** tracked here — a base `Query`/`Scan` uses
+/// the data plane's native range scan over live storage.
 #[derive(Clone, Debug)]
 struct TableState {
     schema: TableSchema,
@@ -147,10 +144,6 @@ struct TableState {
     /// extraction (the legacy `pk`/`sk` convention, auto-registered for tables a
     /// pre-`CreateTable` client uses without declaring a schema).
     sort_key_optional: bool,
-    /// Storage keys (`escape(pk) || sk`) of every live item observed via
-    /// `note_put`, minus those `note_delete`d. Ordered, so a partition's keys
-    /// form a contiguous sub-range.
-    keys: BTreeSet<Vec<u8>>,
     /// Declared secondary indexes, by index name.
     indexes: BTreeMap<String, IndexState>,
 }
@@ -263,7 +256,6 @@ impl SchemaRegistry {
             TableState {
                 schema,
                 sort_key_optional,
-                keys: BTreeSet::new(),
                 indexes,
             },
         );
@@ -319,7 +311,9 @@ impl SchemaRegistry {
     }
 
     /// Record that an item at `key` (its base storage key) now exists, given the
-    /// full `item` so any declared GSI entries can be maintained.
+    /// full `item` so any declared GSI/LSI entries can be maintained. A table with
+    /// no secondary indexes is a no-op (the base table is no longer tracked — its
+    /// `Query`/`Scan` reads live storage via the data plane's native range scan).
     ///
     /// # Errors
     /// [`RegistryError::NoSuchTable`].
@@ -328,7 +322,6 @@ impl SchemaRegistry {
             .tables
             .get_mut(table)
             .ok_or_else(|| RegistryError::NoSuchTable(table.to_owned()))?;
-        state.keys.insert(key.to_vec());
         for index in state.indexes.values_mut() {
             // Drop any stale entry for this base key first (an indexed attribute
             // may have changed on an overwrite), then re-index if the item still
@@ -353,8 +346,8 @@ impl SchemaRegistry {
         Ok(())
     }
 
-    /// Record that the item at `key` was deleted (drop it from the base index
-    /// and from every GSI index).
+    /// Record that the item at `key` was deleted (drop it from every secondary
+    /// index). A no-op for a table with no secondary indexes.
     ///
     /// # Errors
     /// [`RegistryError::NoSuchTable`].
@@ -363,51 +356,11 @@ impl SchemaRegistry {
             .tables
             .get_mut(table)
             .ok_or_else(|| RegistryError::NoSuchTable(table.to_owned()))?;
-        state.keys.remove(key);
         for index in state.indexes.values_mut() {
             let segments = if index.sort_attribute.is_some() { 2 } else { 1 };
             index.entries.retain(|e| base_key_of(e, segments) != key);
         }
         Ok(())
-    }
-
-    /// The storage keys of items in `table`'s partition `pk` that satisfy an
-    /// optional sort-key `condition`, in sort order. The caller quorum-reads each
-    /// key to assemble the `Query` result.
-    ///
-    /// # Errors
-    /// [`RegistryError::NoSuchTable`], or [`RegistryError::SortKeyMismatch`] if a
-    /// sort condition is given for a table without a sort key.
-    pub fn query_keys(
-        &self,
-        table: &str,
-        pk: &AttributeValue,
-        condition: Option<&SortKeyCondition>,
-    ) -> Result<Vec<Vec<u8>>, RegistryError> {
-        let state = self.state(table)?;
-        if condition.is_some() && state.schema.sort_key.is_none() {
-            return Err(RegistryError::SortKeyMismatch(table.to_owned()));
-        }
-        // A partition's keys all start with `escape(pk)` (which ends in
-        // `0x00 0x00`); the first key past the partition replaces that final
-        // terminator byte with `0x01`.
-        let prefix = escape(&pk.key_bytes());
-        let mut end = prefix.clone();
-        *end.last_mut().expect("escape is non-empty") = 0x01;
-
-        let mut keys = Vec::new();
-        for key in state.keys.range(prefix.clone()..end) {
-            if let Some(cond) = condition {
-                // Recover the sort-key bytes (everything after the escaped pk)
-                // and test the condition without decoding the stored value.
-                let sk_bytes = &key[prefix.len()..];
-                if !cond.matches(&AttributeValue::B(sk_bytes.to_vec())) {
-                    continue;
-                }
-            }
-            keys.push(key.clone());
-        }
-        Ok(keys)
     }
 
     /// The base storage keys of items whose secondary `index` hash value equals
@@ -531,50 +484,6 @@ impl SchemaRegistry {
             push(sort);
         }
         names
-    }
-
-    /// All live base storage keys of `table` in key order, starting *after*
-    /// `start_after` (exclusive) when given, and capped at `limit` when given.
-    /// Returns the keys plus the last key emitted (the pagination cursor) when
-    /// `limit` truncated the result, else `None`. Backs the distributed `Scan`.
-    ///
-    /// # Errors
-    /// [`RegistryError::NoSuchTable`].
-    pub fn scan_keys(
-        &self,
-        table: &str,
-        start_after: Option<&[u8]>,
-        limit: Option<usize>,
-    ) -> Result<ScanPage, RegistryError> {
-        let state = self.state(table)?;
-        // Range strictly after the cursor: keys are unique, so `cursor || 0x00`
-        // is the first key past it.
-        let lower = start_after.map(|c| {
-            let mut bound = c.to_vec();
-            bound.push(0x00);
-            bound
-        });
-        let iter = match &lower {
-            Some(lower) => state.keys.range(lower.clone()..),
-            None => state.keys.range::<Vec<u8>, _>(..),
-        };
-        let mut keys = Vec::new();
-        let mut truncated = false;
-        for key in iter {
-            if let Some(limit) = limit {
-                if keys.len() == limit {
-                    truncated = true;
-                    break;
-                }
-            }
-            keys.push(key.clone());
-        }
-        let cursor = if truncated {
-            keys.last().cloned()
-        } else {
-            None
-        };
-        Ok((keys, cursor))
     }
 }
 
@@ -710,106 +619,38 @@ mod tests {
     }
 
     #[test]
-    fn query_keys_partition_isolated_and_ordered() {
+    fn note_delete_removes_from_secondary_index() {
+        // The base table is no longer tracked, so observe `note_delete` through a
+        // GSI: a put indexes the item, a delete drops the index entry.
         let mut reg = SchemaRegistry::new();
-        reg.create_table("t", TableSchema::composite("pk", "sk"))
-            .unwrap();
-        for (p, sk) in [("p1", "c"), ("p1", "a"), ("p1", "b"), ("p2", "z")] {
-            let key = storage_key(&s(p), Some(&s(sk)));
-            reg.note_put("t", &key, &item(&[("pk", s(p)), ("sk", s(sk))]))
-                .unwrap();
-        }
-        // p1 yields its three keys in sort order (a, b, c).
-        let got = reg.query_keys("t", &s("p1"), None).unwrap();
-        let expect: Vec<_> = ["a", "b", "c"]
-            .iter()
-            .map(|sk| storage_key(&s("p1"), Some(&s(sk))))
-            .collect();
-        assert_eq!(got, expect);
-        // p2 is isolated.
-        assert_eq!(reg.query_keys("t", &s("p2"), None).unwrap().len(), 1);
-    }
-
-    #[test]
-    fn query_keys_with_sort_conditions() {
-        let mut reg = SchemaRegistry::new();
-        reg.create_table("t", TableSchema::composite("pk", "sk"))
-            .unwrap();
-        for sk in ["a", "ab", "abc", "b", "c"] {
-            reg.note_put(
-                "t",
-                &storage_key(&s("p"), Some(&s(sk))),
-                &item(&[("pk", s("p")), ("sk", s(sk))]),
-            )
-            .unwrap();
-        }
-        let eq = reg
-            .query_keys("t", &s("p"), Some(&SortKeyCondition::Equals(s("b"))))
-            .unwrap();
-        assert_eq!(eq, vec![storage_key(&s("p"), Some(&s("b")))]);
-
-        let between = reg
-            .query_keys(
-                "t",
-                &s("p"),
-                Some(&SortKeyCondition::Between(s("ab"), s("b"))),
-            )
-            .unwrap();
-        assert_eq!(between.len(), 3); // ab, abc, b
-
-        let begins = reg
-            .query_keys("t", &s("p"), Some(&SortKeyCondition::BeginsWith(s("ab"))))
-            .unwrap();
-        assert_eq!(begins.len(), 2); // ab, abc
-    }
-
-    #[test]
-    fn note_delete_removes_from_index() {
-        let mut reg = SchemaRegistry::new();
-        reg.create_table("t", TableSchema::composite("pk", "sk"))
-            .unwrap();
+        reg.create_table_with_indexes(
+            "t",
+            TableSchema::composite("pk", "sk"),
+            vec![SecondaryIndex::Global(GlobalSecondaryIndex {
+                name: "by-g".into(),
+                key_attribute: "g".into(),
+                sort_attribute: None,
+                projection: IndexProjection::All,
+            })],
+        )
+        .unwrap();
         let key = storage_key(&s("p"), Some(&s("a")));
-        reg.note_put("t", &key, &item(&[("pk", s("p")), ("sk", s("a"))]))
-            .unwrap();
+        reg.note_put(
+            "t",
+            &key,
+            &item(&[("pk", s("p")), ("sk", s("a")), ("g", s("gv"))]),
+        )
+        .unwrap();
+        assert_eq!(
+            reg.index_query_keys("t", "by-g", &s("gv"), None).unwrap(),
+            vec![key.clone()]
+        );
         reg.note_delete("t", &key).unwrap();
-        assert!(reg.query_keys("t", &s("p"), None).unwrap().is_empty());
-    }
-
-    #[test]
-    fn scan_keys_paginates_across_partitions() {
-        let mut reg = SchemaRegistry::new();
-        reg.create_table("t", TableSchema::composite("pk", "sk"))
-            .unwrap();
-        // Three partitions, two items each (inserted out of order).
-        for (p, sk) in [
-            ("p2", "a"),
-            ("p1", "b"),
-            ("p3", "a"),
-            ("p1", "a"),
-            ("p2", "b"),
-            ("p3", "b"),
-        ] {
-            reg.note_put(
-                "t",
-                &storage_key(&s(p), Some(&s(sk))),
-                &item(&[("pk", s(p)), ("sk", s(sk))]),
-            )
-            .unwrap();
-        }
-        // First page of 2 from the start, with a cursor back.
-        let (page1, cursor) = reg.scan_keys("t", None, Some(2)).unwrap();
-        assert_eq!(page1.len(), 2);
-        let cursor = cursor.expect("page truncated, so a cursor is returned");
-        assert_eq!(&cursor, page1.last().unwrap());
-        // Continuing from the cursor yields the rest with no overlap.
-        let (page2, cursor2) = reg.scan_keys("t", Some(&cursor), None).unwrap();
-        assert_eq!(page2.len(), 4);
-        assert_eq!(cursor2, None);
-        // The two pages together are the full ordered key set, deduplicated.
-        let (all, _) = reg.scan_keys("t", None, None).unwrap();
-        let mut joined = page1;
-        joined.extend(page2);
-        assert_eq!(joined, all);
+        assert!(
+            reg.index_query_keys("t", "by-g", &s("gv"), None)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

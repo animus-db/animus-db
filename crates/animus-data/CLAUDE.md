@@ -29,7 +29,16 @@ tablet map, and per-tablet epoch fencing (ADR 0001, 0002).
   tablet), `ReadResult`. `DataClient::with_hints(env, store, allowed)` enables
   **hinted handoff** (a write/delete that misses a replica buffers a hint);
   `DataClient::new` keeps the no-hint behavior. The `write`/`read`/`delete`
-  signatures are unchanged.
+  signatures are unchanged. `DataClient::scan(view, start, end, limit, timeout)`
+  is the **native quorum range scan** (`DataMsg::ScanRange`/`ScanResp`): it
+  broadcasts a half-open `[start, end)` range read, and once `r` replicas respond
+  **merges their per-replica records by per-key newest MVCC version** (LWW, exactly
+  like a point read — tombstones ride the merge so a newer delete shadows a stale
+  value on another replica, then are excluded), returning the sorted live
+  `(key, value)` set (`None` if a read quorum is unreachable; optional `limit`
+  caps the first N keys in key order). Epoch-fenced like a point read. The wire
+  adapters (`animusd`'s DynamoDB base `Query`/`Scan`) use it instead of tracking
+  written keys in memory.
 - `hint.rs` — hinted handoff (ADR 0010 + 0005): a `HintStore` (per-coordinator,
   in-memory, `BTreeMap`-keyed by `(target, tablet, key)`, per-key LWW) plus two
   replay drivers — `serve_hint_handoff` (probe-based, for a holder with a
@@ -121,6 +130,10 @@ tablet map, and per-tablet epoch fencing (ADR 0001, 0002).
 ## Tests
 
 `cargo test -p animus-data` — quorum + node-kill + fencing (`quorum.rs`),
+the native range scan (`scan.rs`): merging divergent replicas newest-per-key in
+key order, excluding a tombstoned key even when one replica holds a stale value,
+honoring `limit`, failing (`None`) below a read quorum, fencing a stale-epoch
+scan, and byte-reproducibility from a seed,
 two-plane integration (`two_plane.rs`), multi-tablet routing (`routing.rs`),
 read-repair + background anti-entropy convergence, incl. tombstone propagation
 (`repair.rs`), segment-digest anti-entropy converging only divergent ranges
