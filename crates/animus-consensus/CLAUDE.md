@@ -111,6 +111,22 @@ conflict set** (`submit_rw`). No leader.
   + I/O-free, reached only at commit. `current_writer`/`current_value` are the
   ad-hoc reads it uses.
 
+- `shard.rs` — **per-shard consensus**: one Accord group *per tablet* (ADR 0011).
+  `ShardRouter` maps a `Key` → owning `Tablet` (id + replica set) from the
+  **existing tablet map** (same `Vec<Tablet>` `animus-data::Router` uses — no new
+  control-plane state) and splits a key set into per-tablet **slices**
+  (`slices`/`value_slices`). `ShardedOwner` is what a *physical* node runs: it
+  hosts **one `AccordNode` per local shard** (one per tablet whose replica set
+  includes this node), each on its **own** `Env` node-id (distinct inbox + WAL,
+  single-consumer). `submit`/`submit_writes`/`submit_read` route a transaction to
+  the owning group (single-shard) or split it across groups (cross-shard),
+  returning a `ShardedTxn` naming the per-group sub-txn ids; `is_applied(&txn)` is
+  the all-or-nothing cross-shard visibility point. `start_with(node, router,
+  make_group)` lets the caller wire each group's `AccordNode` (plain / storage /
+  frontier) and own the env-id allocation. **The sync `AccordCore` and `AccordNode`
+  are untouched** — this is pure driver-level composition of existing per-group
+  nodes.
+
 ## What's non-obvious
 
 - **All protocol logic is in the sync `AccordCore`**; the driver only does I/O.
@@ -250,13 +266,20 @@ conflict set** (`submit_rw`). No leader.
   + failover (recovery unions both across the quorum). `read_only` is now exactly
   `write_keys.is_empty()` — a read-modify-write (non-empty `write_keys`) is never
   treated as read-only.
-- **Sharding is in the *effect*, not the consensus.** Every transaction is still
-  replicated to the whole Accord replica set and agrees one global `execute_at`
-  regardless of tablet — that is why Accord is naturally multi-shard. Only the
-  data-plane write/read is routed per key (`DataRouting::Sharded(Router)` →
-  `Router::view_for`), so a key's effect lands in its own tablet's quorum. The
-  global `execute_at` is the MVCC version on every key, so per-tablet writes stay
-  consistently ordered across shards.
+- **Two distinct sharding axes — don't conflate them.** (1) **Effect-sharding**
+  (`AccordNode::start_with_router`, `DataRouting::Sharded`): **one global Accord
+  replica set** agrees one global `execute_at` for every transaction, and only the
+  data-plane write/read *effect* is routed per key to its tablet's quorum. (2)
+  **Per-shard consensus** (`shard.rs`, `ShardedOwner` / `ShardRouter`): a tablet's
+  replica set **is** its own Accord group — the keyspace partitions into
+  *independent* consensus groups, and a transaction is routed to the group(s)
+  owning its keys (single-shard → one group; cross-shard → one slice per group).
+  Axis (2) is built *on top of* `AccordNode` (driver-level composition); the sync
+  core never learns about tablets. A cross-shard transaction under (2) is
+  **independent per-shard agreement** (each shard agrees its slice; conflicting
+  cross-shard txns serialize via the shared group; atomicity is the
+  all-slices-applied read point) — a unified global cross-shard timestamp + 2PC
+  atomic commit is still deferred (ADR 0011).
 - **Recovery sets phase to `Applied` when `PersistedTxn.applied`** even though
   the phase-bearing records stop at `Committed` — the separate `Applied` WAL
   record carries the executed bit. On recovery the core **re-emits the apply
@@ -343,9 +366,14 @@ snapshotting/log truncation (the WAL is the full per-txn history — contrast
 `RaftCore`), the precise fast-path quorum bound, the precise `PreAcceptOk`-witness
 *fast-path*-recovery decision (we always force the slow path on re-proposal, and
 the duel converges by an id tiebreak rather than Accord's full randomized-backoff
-rules), and **per-shard consensus replica sets / placement of the consensus
-participants** (sharding routes only the *effect* per tablet; the Accord replica
-set is still one global group). **Now implemented:** read-only transactions,
+rules), and the **unified global cross-shard timestamp + 2PC atomic commit** (per-
+shard consensus now exists — see below — but a cross-shard txn is *independent
+per-shard agreement*, not one global Accord round: each shard agrees its slice and
+the cross-shard atomicity is the all-slices-applied read point, not a unified
+commit/abort). **Now implemented:** **per-shard consensus** (one Accord group per
+tablet — `shard.rs`'s `ShardedOwner`/`ShardRouter`: single-shard txns route to the
+owning group only; cross-shard txns split into per-tablet slices that serialize via
+the shared group; `tests/accord_per_shard.rs`), read-only transactions,
 **recovery ballots + duelling recovery coordinators** (a replica promises the
 highest ballot seen and fences lower `Recover`/`Accept`; superseded recoverers
 converge via an id tiebreak; `RecoverOk` adopts the highest-ballot accepted
@@ -435,9 +463,20 @@ black-box). The sync-core boundary is where each remaining piece slots in.
   atomically (both keys carry the committed txn on every replica); two conflicting
   interactive transactions are ordered consistently; an empty interactive txn is a
   no-op; plus trace reproducibility.
-- `tests/accord_sharded.rs` (**sharded / multi-tablet transactions**): two
-  tablets split at a key boundary (replicas {3,4} and {4,5}), Accord nodes wired
-  via `start_with_router`. A cross-tablet transaction commits atomically and both
+- `tests/accord_per_shard.rs` (**per-shard consensus** — one Accord group per
+  tablet, not effect-sharding): two tablets on overlapping replica sets (group A
+  {0,1,2}, group B {2,3,4}, so node 2 coordinates cross-shard), each
+  `(physical, tablet)` group on its own env-id via `ShardedOwner::start_with`. A
+  single-shard txn executes on its owning group only (the other group wholly
+  untouched); distinct-tablet single-shard txns are independent; a non-local key is
+  rejected (`ShardError::NotLocal`); a cross-shard txn commits atomically on both
+  groups (each key carries its slice on every replica of its shard); two conflicting
+  cross-shard txns serialize via the shared group (no torn private key); arbitrary
+  write values route per shard; a fault confined to one shard (partition its group's
+  replicas) does not stall an unrelated shard; trace reproducibility.
+- `tests/accord_sharded.rs` (**effect-sharded / multi-tablet transactions** — one
+  global Accord group, sharded effect): two tablets split at a key boundary
+  (replicas {3,4} and {4,5}), Accord nodes wired via `start_with_router`. A cross-tablet transaction commits atomically and both
   keys are readable via the data plane (each from its own tablet) at its id; two
   conflicting cross-tablet transactions order consistently on every shard (shared
   key → second-ordered txn; each private key in the *other* tablet → its own txn);
