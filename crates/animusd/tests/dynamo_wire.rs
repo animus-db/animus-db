@@ -142,8 +142,8 @@ async fn dynamo_wire_rejects_bad_requests() {
     await_bootstrap(&nodes).await;
     let addr = nodes[0].dynamo_addr();
 
-    // Unknown operation.
-    let (status, body) = dynamo(addr, "DynamoDB_20120810.BatchWriteItem", "{}").await;
+    // Unknown operation (BatchGetItem is still unsupported; BatchWriteItem now is).
+    let (status, body) = dynamo(addr, "DynamoDB_20120810.BatchGetItem", "{}").await;
     assert_eq!(status, 400);
     assert!(body.contains("UnknownOperationException"), "got: {body}");
 

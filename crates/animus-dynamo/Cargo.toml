@@ -12,6 +12,7 @@ description = "AnimusDB DynamoDB-style item API adapter over the common core."
 workspace = true
 
 [dependencies]
+animus-control.workspace = true
 animus-storage.workspace = true
 serde.workspace = true
 serde_json.workspace = true

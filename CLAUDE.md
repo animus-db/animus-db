@@ -31,15 +31,20 @@ plane + data plane at scale: 3 Raft nodes, 2 tablets, 6 replicas, 4 concurrent
 clients) under fault injection (partition + leader kill + crash + heal), checked
 for serializability/durability/convergence — a
 DynamoDB-style item API over the core plus a **DynamoDB JSON wire protocol**
-(`animus-dynamo`: CreateTable/PutItem/GetItem/DeleteItem/Query/Scan
-AttributeValue-JSON translation over the full type set — scalars plus the
-document types `M`/`L` and set types `SS`/`NS`/`BS` — with a per-table schema
-registry, sort-key conditions =/BETWEEN/begins_with, a `ConditionExpression`
-subset for conditional writes, `ReturnValues` (`ALL_OLD`) on writes,
-top-level **projection expressions** (`ProjectionExpression`/`AttributesToGet`)
-on reads, `Scan` with `Limit`/`ExclusiveStartKey` pagination + `FilterExpression`,
-and **secondary indexes** — any number of hash-only/composite **global** and
-**local** secondary indexes queryable by `IndexName`), a
+(`animus-dynamo`: CreateTable/PutItem/GetItem/DeleteItem/Query/Scan/**UpdateItem**/
+**BatchWriteItem**/**TransactWriteItems** AttributeValue-JSON translation over the
+full type set — scalars plus the document types `M`/`L` and set types
+`SS`/`NS`/`BS` — with **table key schemas now consumed from the control plane's
+replicated catalog** (ADR 0013: `CreateTable` proposes a `CreateTableSchema` and
+waits for commit, so a created table is durable + cluster-agreed and survives a
+restart; GSI/written-key index stay in-memory), sort-key conditions
+=/BETWEEN/begins_with, a `ConditionExpression` subset for conditional writes,
+`ReturnValues` (`ALL_OLD`/`ALL_NEW`) on writes, **document-path projection
+expressions** (`a.b`, `ProjectionExpression`/`AttributesToGet`) on reads, `Scan`
+with `Limit`/`ExclusiveStartKey` pagination + `FilterExpression`, and **secondary
+indexes** — any number of hash-only/composite **global** and **local** secondary
+indexes queryable by `IndexName`, each with a declared projection
+(`ALL`/`KEYS_ONLY`/`INCLUDE`)), a
 **runnable node + CLI** assembling the planes over `ProdEnv` and
 serving clients over TCP, with a now **durable data plane** — each node's data
 replica is backed by the on-disk `LsmEngine` over `ProdEnv` by default, so a
@@ -84,12 +89,14 @@ committed transaction's writes can land in the replicated AP data plane
 order; ADR 0011). Skeletons / future work:
 the rest of the CQL surface (composite multi-column partition keys,
 `BATCH`/`ALTER`/`DROP`, per-column `DELETE`, range/`IN`/`ORDER BY`/`LIMIT`,
-collection/UDT types, paging, auth, `LWT`) and the rest of the
-DynamoDB surface (per-index projection attribute lists, document-path
-projections, `UpdateItem`/`BatchWriteItem`/`TransactWrite`) — note the control
-plane now holds a **replicated table-schema catalog** (ADR 0013) the adapters can
-consume to replace their per-process in-memory catalogs (that adapter wiring is
-the follow-up) — and the deferred remainder of Accord
+collection/UDT types, paging, auth, `LWT`; and consuming the replicated schema
+catalog — the CQL adapter's catalog is still in-memory) and the rest of the
+DynamoDB surface (truly atomic `TransactWriteItems` via Accord, `BatchGetItem`,
+list-index document paths, `ADD`/`DELETE` update arithmetic, and durable/replicated
+secondary-index + written-key state) — note the **DynamoDB adapter now consumes
+the control plane's replicated table-schema catalog** (ADR 0013) for its table key
+schemas (durable + cluster-agreed), while its index/key-index state stays in-memory
+— and the deferred remainder of Accord
 (the full dependency wait-graph, the precise recovery ballot + duelling
 recoverers + a failure detector, WAL snapshotting, and sharded transactions
 across tablets).

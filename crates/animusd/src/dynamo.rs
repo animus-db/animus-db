@@ -19,24 +19,34 @@
 //! ## Operations and storage mapping
 //!
 //! Supported: `CreateTable`, `PutItem`, `GetItem`, `DeleteItem`, `Query`,
-//! `Scan`. The data-plane key for an item is `escape(table) || escape(pk) || sk`
-//! (so tables share one keyspace without colliding). The data plane has no
-//! native delete, so `DeleteItem` writes a tombstone value that `GetItem` reads
-//! back as absent.
+//! `Scan`, `UpdateItem`, `BatchWriteItem`, `TransactWriteItems`. The data-plane
+//! key for an item is `escape(table) || escape(pk) || sk` (so tables share one
+//! keyspace without colliding). The data plane has no native delete, so
+//! `DeleteItem` writes a tombstone value that `GetItem` reads back as absent.
+//! `UpdateItem` is a read-modify-write (`SET`/`REMOVE`); `BatchWriteItem` applies
+//! put/delete requests one by one; `TransactWriteItems` applies condition-gated
+//! actions in order but **without cross-action atomicity** (true ACID via Accord,
+//! ADR 0011, is deferred — see [`run_transact`]).
 //!
-//! ## Per-table schemas (CreateTable)
+//! ## Per-table schemas: the replicated catalog (ADR 0013)
 //!
-//! `CreateTable` records a table's key schema in a process-wide
-//! [`SchemaRegistry`]. Later requests resolve their key attributes against it,
-//! so the key convention is no longer hard-coded. For backward compatibility, a
-//! request against a table that was never `CreateTable`d **auto-registers** the
-//! legacy convention (partition key `pk`, optional sort key `sk`).
+//! `CreateTable` **proposes a `MetaCommand::CreateTableSchema` to the
+//! control-plane leader** and waits until it commits in `Metadata`; later requests
+//! resolve their key attributes from the **replicated** `Metadata::table_schema`
+//! (translated DynamoDB key attrs ↔ control `TableSchema` by
+//! [`animus_dynamo::schema`]). So a created table's key schema is **durable +
+//! cluster-agreed**: it survives a restart (it rode the Raft WAL) and is known on
+//! every node. A request against a table that was never `CreateTable`d
+//! **auto-registers** the legacy convention (partition key `pk`, optional sort key
+//! `sk`). The edge reaches the leader through a process-global set of registered
+//! control handles ([`register_control`]); in a one-process-per-node deployment
+//! that is the node's own handle, so `CreateTable` must target the leader.
 //!
-//! The registry is **in-memory and not durable**: schemas (and the `Query` key
-//! index below) are lost on restart, and in the single-process `--cluster N`
-//! dev mode every node shares one registry (in a one-process-per-node
-//! deployment each process keeps its own). Replicating schemas through the
-//! control plane is future work.
+//! The in-memory [`SchemaRegistry`] now holds only the **secondary-index
+//! declarations** and the observation-built **written-key index** (below). Those
+//! remain **in-memory and not durable** — rebuilt from observed writes, and shared
+//! across in-process nodes in `--cluster N` dev mode. Only the *table key schema*
+//! moves to the control plane in this slice.
 //!
 //! ## Query, Scan, and secondary indexes
 //!
@@ -56,48 +66,159 @@
 //! read. The cursor advances over *tracked* keys, so the in-memory caveat above
 //! applies to `Scan` too.
 //!
-//! `CreateTable` may declare a single hash-only **global secondary index**; the
-//! registry maintains a second `escape(gsi_value) || base_key` index on every
+//! `CreateTable` may declare any number of **global / local secondary indexes**,
+//! each with a `Projection` (`ALL`/`KEYS_ONLY`/`INCLUDE`); the registry maintains
+//! an `escape(hash) [|| escape(sort)] || base_key` index per index on every
 //! `note_put`/`note_delete` (no item copies — the base item stays authoritative),
-//! and a `Query` with an `IndexName` resolves a GSI value back to its base
-//! storage keys, which are quorum-read the same way. Deferred: projections,
-//! composite/multiple GSIs, local secondary indexes.
+//! and a `Query` with an `IndexName` resolves an index value back to its base
+//! storage keys, which are quorum-read the same way. An index query with no
+//! explicit `ProjectionExpression` returns the index's declared projected
+//! attributes (applied at the edge after the base item is read).
 
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use animus_dynamo::wire::{self, Operation, Projection, ReturnValues, WireError};
-use animus_dynamo::{
-    AttributeValue, ConditionExpression, Item, SchemaRegistry, SortKeyCondition, storage_key,
+use animus_control::{MetaCommand, RaftNode};
+use animus_dynamo::wire::{
+    self, Operation, Projection, ReturnValues, TransactAction, UpdateAction, UpdateReturnValues,
+    WireError, WriteRequest,
 };
+use animus_dynamo::{
+    AttributeValue, ConditionExpression, Item, SchemaRegistry, SortKeyCondition, TableSchema,
+    schema as schema_bridge, storage_key,
+};
+use animus_env::ProdEnv;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::ClientCtx;
 
 const DYNAMO_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long `CreateTable` waits for its `CreateTableSchema` proposal to commit in
+/// the replicated catalog before giving up.
+const SCHEMA_COMMIT_TIMEOUT: Duration = Duration::from_secs(5);
+/// How often `CreateTable` re-checks (and re-proposes against the current leader)
+/// while waiting for the schema to commit.
+const SCHEMA_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-/// Process-wide table-schema + Query-key registry. Not durable; see module docs.
+/// Process-wide registry of this process's control-plane [`RaftNode`] handles
+/// (ADR 0013 consumption). In a one-process-per-node deployment this holds one
+/// handle; in the in-process `--cluster N` dev mode it holds every node's, so the
+/// DynamoDB edge can always reach **the current leader** to propose a
+/// `CreateTableSchema` — the same process-global pattern the in-memory
+/// [`SchemaRegistry`] uses, and the only place the edge couples to consensus.
+fn control_handles() -> &'static Mutex<Vec<RaftNode<ProdEnv>>> {
+    static HANDLES: OnceLock<Mutex<Vec<RaftNode<ProdEnv>>>> = OnceLock::new();
+    HANDLES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Register a node's control-plane handle so the DynamoDB edge can route a
+/// `CreateTableSchema` proposal to the leader. Called once per node from the node
+/// assembly (`lib.rs`).
+pub(crate) fn register_control(raft: RaftNode<ProdEnv>) {
+    control_handles()
+        .lock()
+        .expect("control handles poisoned")
+        .push(raft);
+}
+
+/// The control handle that currently believes it is leader, if any (the one whose
+/// `propose` will be accepted rather than returning `NotLeader`).
+fn leader_handle() -> Option<RaftNode<ProdEnv>> {
+    control_handles()
+        .lock()
+        .expect("control handles poisoned")
+        .iter()
+        .find(|r| r.is_leader())
+        .cloned()
+}
+
+/// A snapshot of the replicated [`Metadata`](animus_control::Metadata): the
+/// leader's view if a registered node leads, else the first registered node's
+/// (the catalog is Raft-replicated, so any node's committed view is sound to
+/// read). `None` only before any node is registered.
+fn metadata() -> Option<animus_control::Metadata> {
+    let handles = control_handles().lock().expect("control handles poisoned");
+    handles
+        .iter()
+        .find(|r| r.is_leader())
+        .or_else(|| handles.first())
+        .map(RaftNode::metadata)
+}
+
+/// Process-wide GSI + Query-key registry (ADR 0006). The **table key schema** now
+/// lives in the control plane's replicated catalog (ADR 0013); this registry
+/// retains only the per-table **secondary-index declarations** and the
+/// observation-built **written-key index** that backs `Query`/`Scan` (the data
+/// plane has no quorum range scan). Both remain **in-memory and not durable** —
+/// rebuilt from observed writes — and in `--cluster N` mode one registry is shared
+/// across the in-process nodes. See the module docs.
 fn registry() -> &'static Mutex<SchemaRegistry> {
     static REGISTRY: OnceLock<Mutex<SchemaRegistry>> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(SchemaRegistry::new()))
 }
 
-/// Resolve `table`'s key attribute values from `item`. A registered table uses
-/// its recorded schema; an unregistered table falls back to the legacy
-/// convention (partition key `pk` required, sort key `sk` optional), so
-/// pre-`CreateTable` clients keep working without change.
+/// The DynamoDB key schema for `table`, resolved from the **replicated catalog**
+/// (ADR 0013) when present, else the legacy `pk`/`sk` convention so a
+/// pre-`CreateTable` client keeps working. `None` only when the control plane is
+/// not yet reachable.
+fn schema_for(table: &str) -> Option<TableSchema> {
+    let meta = metadata()?;
+    Some(match meta.table_schema(table) {
+        Some(control) => schema_bridge::to_dynamo(control),
+        None => TableSchema::composite("pk", "sk"),
+    })
+}
+
+/// Mirror a **catalog** table's key schema into the local registry if it is
+/// known to the replicated catalog (ADR 0013) but not yet mirrored — so the
+/// registry's key-index / GSI machinery has the right schema after a restart or
+/// on a follower that has not seen a write. A table absent from the catalog is
+/// left untouched here (the read path then reports it unknown; the write path
+/// legacy-registers it via [`legacy_register`]).
+fn mirror_catalog_schema(table: &str) {
+    if metadata().is_some_and(|m| m.has_table_schema(table)) {
+        if let Some(schema) = schema_for(table) {
+            let mut reg = registry().lock().expect("registry poisoned");
+            if !reg.has_table(table) {
+                let _ = reg.create_table(table, schema);
+            }
+        }
+    }
+}
+
+/// Auto-register `table` under the legacy `pk`/`sk` convention (sort key
+/// optional) if it is in neither the catalog nor the registry — so a
+/// pre-`CreateTable` client's writes keep working unchanged and their keys get
+/// tracked for `Query`/`Scan`.
+fn legacy_register(table: &str) {
+    if metadata().is_some_and(|m| m.has_table_schema(table)) {
+        return; // a real CreateTable'd table; mirror it instead
+    }
+    let mut reg = registry().lock().expect("registry poisoned");
+    if !reg.has_table(table) {
+        reg.create_table_legacy(table);
+    }
+}
+
+/// Resolve `table`'s key attribute values from `item`, against the replicated
+/// schema (mirrored into the local registry for key-index bookkeeping). Used by
+/// the *write/point* paths (Put/Get/Delete/Update), which auto-register a legacy
+/// table — so an unknown table reads back as empty rather than erroring, matching
+/// the prior behavior.
 fn resolve_key(
     table: &str,
     item: &Item,
 ) -> Result<(AttributeValue, Option<AttributeValue>), WireError> {
-    let mut reg = registry().lock().expect("registry poisoned");
-    if !reg.has_table(table) {
-        // Pre-CreateTable clients keep working under the legacy `pk`/`sk`
-        // convention (pk required, sk optional); this also lets `Query` track
-        // the table's keys.
-        reg.create_table_legacy(table);
+    // Control plane must be reachable to know the key structure.
+    if metadata().is_none() {
+        return Err(internal(
+            "no control-plane handle yet (cluster still bootstrapping)",
+        ));
     }
+    mirror_catalog_schema(table);
+    legacy_register(table);
+    let reg = registry().lock().expect("registry poisoned");
     reg.extract_key(table, item).map_err(registry_error)
 }
 /// Cap on a request body, so a malformed `Content-Length` can't exhaust memory.
@@ -269,14 +390,7 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             table,
             schema,
             indexes,
-        } => {
-            registry()
-                .lock()
-                .expect("registry poisoned")
-                .create_table_with_indexes(&table, schema.clone(), indexes.clone())
-                .map_err(registry_error)?;
-            Ok(wire::create_table_response(&table, &schema, &indexes))
-        }
+        } => create_table(&table, &schema, &indexes).await,
         Operation::PutItem {
             table,
             item,
@@ -332,6 +446,8 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             note_delete(&table, &within);
             Ok(wire::write_response(return_values, old.as_ref()))
         }
+        // (The `put_item` / `delete_item` helpers above serve the batch/transact
+        // paths, which never echo `ReturnValues`, so they avoid the extra read.)
         Operation::GetItem {
             table,
             key,
@@ -377,7 +493,245 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             )
             .await
         }
+        Operation::UpdateItem {
+            table,
+            key,
+            actions,
+            condition,
+            return_values,
+        } => {
+            run_update_item(
+                ctx,
+                &table,
+                &key,
+                &actions,
+                condition.as_ref(),
+                return_values,
+            )
+            .await
+        }
+        Operation::BatchWriteItem { requests } => {
+            for (table, reqs) in &requests {
+                for req in reqs {
+                    match req {
+                        WriteRequest::Put(item) => {
+                            put_item(ctx, table, item, None).await?;
+                        }
+                        WriteRequest::Delete(key) => {
+                            delete_item(ctx, table, key, None).await?;
+                        }
+                    }
+                }
+            }
+            Ok(wire::batch_write_response())
+        }
+        Operation::TransactWriteItems { actions } => run_transact(ctx, &actions).await,
     }
+}
+
+/// Propose `table`'s key schema into the **replicated catalog** (ADR 0013) via the
+/// control-plane leader and wait until it commits, then mirror the schema +
+/// secondary-index declarations into the local in-memory registry (for the GSI /
+/// Query-key bookkeeping that stays edge-local). The committed schema is durable
+/// and cluster-agreed, so it survives a restart.
+async fn create_table(
+    table: &str,
+    schema: &TableSchema,
+    indexes: &[animus_dynamo::SecondaryIndex],
+) -> Result<String, WireError> {
+    // Reject a duplicate up front, matching DynamoDB's `ResourceInUseException`,
+    // before we propose (the state machine also rejects, but this gives the right
+    // wire code without waiting on a commit that will be a no-op).
+    if metadata().is_some_and(|m| m.has_table_schema(table)) {
+        return Err(registry_error(animus_dynamo::RegistryError::TableExists(
+            table.to_owned(),
+        )));
+    }
+    let control_schema = schema_bridge::to_control(schema, &[]);
+    let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
+    loop {
+        // Propose against the current leader (idempotent: the create is rejected
+        // as a no-op if already present, which our success check below catches).
+        if let Some(leader) = leader_handle() {
+            leader.propose(MetaCommand::CreateTableSchema {
+                table: table.to_owned(),
+                schema: control_schema.clone(),
+            });
+        }
+        if metadata().is_some_and(|m| m.has_table_schema(table)) {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(internal(
+                "CreateTable did not commit to the control plane in time \
+                 (no leader reachable?)",
+            ));
+        }
+        tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+    }
+    // Mirror the schema + index declarations into the local registry for the
+    // edge-local Query/Scan key index and GSI machinery.
+    {
+        let mut reg = registry().lock().expect("registry poisoned");
+        if !reg.has_table(table) {
+            let _ = reg.create_table_with_indexes(table, schema.clone(), indexes.to_vec());
+        }
+    }
+    Ok(wire::create_table_response(table, schema, indexes))
+}
+
+/// `PutItem` core (shared by the wire op and `BatchWriteItem`): resolve the key,
+/// optionally gate on `condition`, quorum-write, and update the key index.
+/// Returns the prior item (for `ReturnValues`).
+async fn put_item(
+    ctx: &ClientCtx,
+    table: &str,
+    item: &Item,
+    condition: Option<&ConditionExpression>,
+) -> Result<Option<Item>, WireError> {
+    let (pk, sk) = resolve_key(table, item)?;
+    let within = storage_key(&pk, sk.as_ref());
+    let key = data_key(table, &within);
+    let old = if condition.is_some() {
+        quorum_read(ctx, &key).await?
+    } else {
+        None
+    };
+    if let Some(cond) = condition {
+        if !cond.evaluate(old.as_ref()) {
+            return Err(WireError::conditional_check_failed(
+                "the conditional request failed",
+            ));
+        }
+    }
+    let value = wire::encode_stored_item(item);
+    quorum_write(ctx, &key, &value).await?;
+    note_put(table, &within, item);
+    Ok(old)
+}
+
+/// `DeleteItem` core (shared by the wire op and `BatchWriteItem`): resolve the
+/// key, optionally gate on `condition`, quorum-write a tombstone, and drop the
+/// key from the index. Returns the prior item (for `ReturnValues`).
+async fn delete_item(
+    ctx: &ClientCtx,
+    table: &str,
+    key_item: &Item,
+    condition: Option<&ConditionExpression>,
+) -> Result<Option<Item>, WireError> {
+    let (pk, sk) = resolve_key(table, key_item)?;
+    let within = storage_key(&pk, sk.as_ref());
+    let key = data_key(table, &within);
+    let old = if condition.is_some() {
+        quorum_read(ctx, &key).await?
+    } else {
+        None
+    };
+    if let Some(cond) = condition {
+        if !cond.evaluate(old.as_ref()) {
+            return Err(WireError::conditional_check_failed(
+                "the conditional request failed",
+            ));
+        }
+    }
+    quorum_write(ctx, &key, &wire::encode_tombstone()).await?;
+    note_delete(table, &within);
+    Ok(old)
+}
+
+/// `UpdateItem`: read-modify-write. Reads the current item, applies the SET/REMOVE
+/// actions (starting from the key attributes when the item is absent — an upsert,
+/// as in DynamoDB), gating on an optional `condition`, then quorum-writes the new
+/// item and echoes `ReturnValues`.
+async fn run_update_item(
+    ctx: &ClientCtx,
+    table: &str,
+    key_item: &Item,
+    actions: &[UpdateAction],
+    condition: Option<&ConditionExpression>,
+    return_values: UpdateReturnValues,
+) -> Result<String, WireError> {
+    let (pk, sk) = resolve_key(table, key_item)?;
+    let within = storage_key(&pk, sk.as_ref());
+    let key = data_key(table, &within);
+    let old = quorum_read(ctx, &key).await?;
+    if let Some(cond) = condition {
+        if !cond.evaluate(old.as_ref()) {
+            return Err(WireError::conditional_check_failed(
+                "the conditional request failed",
+            ));
+        }
+    }
+    // Start from the existing item, or (for an upsert) the bare key attributes.
+    let base = old.clone().unwrap_or_else(|| key_item.clone());
+    let new = wire::apply_update(base, actions);
+    let value = wire::encode_stored_item(&new);
+    quorum_write(ctx, &key, &value).await?;
+    note_put(table, &within, &new);
+    Ok(wire::update_response(
+        return_values,
+        old.as_ref(),
+        Some(&new),
+    ))
+}
+
+/// `TransactWriteItems`: apply each condition-gated action in order. **Not truly
+/// atomic** — there is no cross-action rollback (full Accord-backed transactional
+/// writes are deferred; ADR 0011): if action *k* fails its condition, actions
+/// before it have already been applied. We *do* honor each action's condition (so
+/// a failed `ConditionCheck`/conditional write rejects the request), giving the
+/// common "assert-then-write" use the right answer; the documented gap is the
+/// all-or-nothing guarantee.
+async fn run_transact(ctx: &ClientCtx, actions: &[TransactAction]) -> Result<String, WireError> {
+    for action in actions {
+        match action {
+            TransactAction::Put {
+                table,
+                item,
+                condition,
+            } => {
+                put_item(ctx, table, item, condition.as_ref()).await?;
+            }
+            TransactAction::Delete {
+                table,
+                key,
+                condition,
+            } => {
+                delete_item(ctx, table, key, condition.as_ref()).await?;
+            }
+            TransactAction::Update {
+                table,
+                key,
+                actions,
+                condition,
+            } => {
+                run_update_item(
+                    ctx,
+                    table,
+                    key,
+                    actions,
+                    condition.as_ref(),
+                    UpdateReturnValues::None,
+                )
+                .await?;
+            }
+            TransactAction::ConditionCheck {
+                table,
+                key,
+                condition,
+            } => {
+                let (pk, sk) = resolve_key(table, key)?;
+                let data_key = data_key(table, &storage_key(&pk, sk.as_ref()));
+                let current = quorum_read(ctx, &data_key).await?;
+                if !condition.evaluate(current.as_ref()) {
+                    return Err(WireError::conditional_check_failed(
+                        "a transaction condition check failed",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(wire::empty_response())
 }
 
 /// Resolve the partition's matching within-table keys from the registry (or, with
@@ -392,6 +746,24 @@ async fn run_query(
     sort_condition: Option<&SortKeyCondition>,
     projection: Option<&Projection>,
 ) -> Result<String, WireError> {
+    // Mirror a catalog table's schema (so its key/GSI index exists after a
+    // restart or on a follower that has not seen a write). A table absent from
+    // the catalog is left unregistered, so `query_keys` below reports it unknown
+    // (ResourceNotFoundException) — matching DynamoDB.
+    mirror_catalog_schema(table);
+    // An index query with no explicit `ProjectionExpression` falls back to the
+    // index's *declared* projection (`ALL` / `KEYS_ONLY` / `INCLUDE`), applied at
+    // the edge after the base item is read (the registry stores only base keys).
+    let index_projection = match index {
+        Some(index) if projection.is_none() => registry()
+            .lock()
+            .expect("registry poisoned")
+            .index_projected_attributes(table, index)
+            .map_err(registry_error)?
+            .map(Projection),
+        _ => None,
+    };
+    let effective = projection.or(index_projection.as_ref());
     let within_keys = {
         let reg = registry().lock().expect("registry poisoned");
         match index {
@@ -409,7 +781,7 @@ async fn run_query(
     for within in &within_keys {
         let data_key = data_key(table, within);
         if let Some(item) = quorum_read(ctx, &data_key).await? {
-            items.push(wire::project(projection, &item));
+            items.push(wire::project(effective, &item));
         }
     }
     Ok(wire::query_response(&items))
@@ -427,6 +799,7 @@ async fn run_scan(
     filter: Option<&ConditionExpression>,
     projection: Option<&Projection>,
 ) -> Result<String, WireError> {
+    mirror_catalog_schema(table);
     // Resolve the cursor item (if any) to its base storage key.
     let start_after = match &exclusive_start_key {
         Some(key_item) => {
