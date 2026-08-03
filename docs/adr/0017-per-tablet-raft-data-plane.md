@@ -1,6 +1,7 @@
 # ADR 0017 — Per-tablet Raft data plane (leaderful, linearizable KV)
 
-- **Status:** Proposed
+- **Status:** Accepted — **Stages A + B implemented** (a usable single-tablet
+  linearizable KV data plane); Stages C + D in progress.
 - **Date:** 2026-08-03
 
 ## Context
@@ -203,18 +204,32 @@ mode.
   the `SimEnv` clock-injection model and a dedicated safety analysis.
 - **No cross-tablet atomicity** until the follow-up ADR.
 
+### Implemented now (Stages A + B) — a usable single-tablet KV data plane
+
+The `animus-raftdata` crate provides a working, fault-tolerant, **linearizable
+single-tablet KV** store today: `RaftKvNode<E, S>` runs one tablet's Raft group
+over `Env`, backed by any `StorageEngine`. It serves `put`/`delete` (replicated +
+durable once committed), **linearizable `linearizable_get`** (ReadIndex — a
+read-barrier quorum probe, no log entry, no wall clock; a deposed leader returns
+`None`, never stale), survives leader kills + rejoin, and **compacts** its WAL
+(snapshotting the engine image) so a lagging/restarted follower catches up via a
+streaming `InstallSnapshot`. All sim-tested (`tests/single_tablet.rs`,
+`read_index.rs`, `snapshot_catchup.rs`) and reproducible from a seed. It reuses
+the generic `RaftCore<C, S>` with a `DRIVER_APPLIED` KV state machine, leaving the
+control plane unchanged. **Not yet:** dynamic membership (Stage C), tablet split
+(Stage D), per-table mode selection / wiring into `animusd`, cross-tablet txns.
+
 **Implementation sequencing (each a green-keeping increment):**
 
-- **Stage A — apply + snapshot abstraction.** Externalize KV apply to the driver
-  (effects drain) and add streaming snapshots from the engine, reusing chunked
-  `InstallSnapshot`. Prove with a single-tablet group over `SimEnv`.
-- **Stage B — the data plane path.** `RaftKvNode<E>` driver, per-tablet hosting
-  (`ShardedOwner`-style), the Raft-routing client (route-to-leader, `NotLeader`
-  redirect), and **ReadIndex** reads. End-to-end single-tablet linearizable KV,
-  sim-tested with faults.
+- **Stage A — apply + snapshot abstraction.** ✅ Done (A.1 externalized apply, A.2
+  compaction + streaming `InstallSnapshot`). Proven on a single-tablet `SimEnv`
+  group.
+- **Stage B — the data plane path.** ✅ Done (B.1 `RaftKvNode` driver + write path,
+  B.2 ReadIndex reads). End-to-end single-tablet linearizable KV, sim-tested with
+  faults (leader kill + rejoin, deposed-leader-no-stale-read).
 - **Stage C — reconfigure on failure.** Single-server Raft membership change in
-  `RaftCore`, wired to the failure detector + placement reconciler; a killed node's
-  replica moves to a spare and catches up. Fault-injecting sim tests.
+  `RaftCore` (config-in-log), wired so a failed node's replica moves to a spare and
+  catches up. Fault-injecting sim tests. *(In progress.)*
 - **Stage D — tablet split.** The Raft split trigger + new-group bootstrap on
   cluster growth.
 - A **`RaftPerTablet` topology in the Elle corpus** (ADR 0014/0016 step 4) checks
