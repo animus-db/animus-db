@@ -19,7 +19,7 @@
 use std::time::Duration;
 
 use animus_control::raft::ProposeResult;
-use animus_control::{ColumnDef, ColumnType, MetaCommand, RaftNode, TableSchema};
+use animus_control::{ColumnDef, ColumnType, MetaCommand, RaftNode, ReplicationMode, TableSchema};
 use animus_sim::{SimEnv, Simulator};
 
 const NODES: [u64; 3] = [0, 1, 2];
@@ -187,6 +187,63 @@ fn run(seed: u64) {
         assert!(
             m.has_table_schema("events"),
             "node {i}: drop removed the wrong schema (seed={seed})"
+        );
+    }
+}
+
+#[test]
+fn set_table_mode_replicates_and_survives_leader_kill() {
+    // A table's replication mode (ADR 0016/0017) is part of the replicated catalog:
+    // it defaults to AP, a `SetTableMode` flips it to CP, the change replicates to
+    // every node, is rejected for an unknown table, and survives a leader kill.
+    let seed = 0x00C0_DE3A;
+    let (mut sim, nodes) = cluster(seed);
+    sim.run_for(Duration::from_secs(2));
+    let leader = unique_leader(&nodes, &[0, 1, 2], seed);
+
+    nodes[leader].propose(MetaCommand::CreateTableSchema {
+        table: "users".into(),
+        schema: users_schema(),
+    });
+    sim.run_for(Duration::from_secs(1));
+    // Default mode is AP everywhere.
+    for node in &nodes {
+        assert_eq!(node.metadata().table_mode("users"), ReplicationMode::Ap);
+    }
+
+    // Flip "users" to CP; a SetTableMode on an unknown table is rejected.
+    assert!(matches!(
+        nodes[leader].propose(MetaCommand::SetTableMode {
+            table: "users".into(),
+            mode: ReplicationMode::Cp,
+        }),
+        ProposeResult::Accepted { .. }
+    ));
+    nodes[leader].propose(MetaCommand::SetTableMode {
+        table: "ghost".into(),
+        mode: ReplicationMode::Cp,
+    });
+    sim.run_for(Duration::from_secs(1));
+    for node in &nodes {
+        let m = node.metadata();
+        assert_eq!(
+            m.table_mode("users"),
+            ReplicationMode::Cp,
+            "CP mode must replicate to every node (seed={seed})"
+        );
+        // The rejected command left no schema/mode for the unknown table.
+        assert!(!m.has_table_schema("ghost"));
+        assert_eq!(m.table_mode("ghost"), ReplicationMode::Ap);
+    }
+
+    // Kill the leader; the CP mode survives on the durable survivors.
+    sim.crash(leader as u64);
+    sim.run_for(Duration::from_secs(3));
+    for i in (0..3).filter(|&i| i != leader) {
+        assert_eq!(
+            nodes[i].metadata().table_mode("users"),
+            ReplicationMode::Cp,
+            "CP mode must survive a leader kill (seed={seed})"
         );
     }
 }

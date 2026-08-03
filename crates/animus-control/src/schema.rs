@@ -142,6 +142,21 @@ impl ColumnDef {
     }
 }
 
+/// How a table's data is replicated (ADR 0016 / ADR 0017). The default is the
+/// leaderless **AP** data plane (`animus-data`); **CP** selects the leaderful
+/// per-tablet Raft plane (`animus-raftdata`) for linearizable single-tablet
+/// reads/writes. Replicated in the schema catalog so the choice is durable,
+/// cluster-agreed, and recovered from Raft like the rest of the schema; the wire
+/// edges read it to route a table's reads/writes to the right plane.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReplicationMode {
+    /// Leaderless AP data plane (tunable quorum). The default.
+    #[default]
+    Ap,
+    /// Leaderful per-tablet Raft (linearizable single-tablet KV).
+    Cp,
+}
+
 /// A table's replicated schema: its key structure plus its typed columns.
 ///
 /// Invariants enforced by [`TableSchema::validate`] (and thus by
@@ -171,6 +186,11 @@ pub struct TableSchema {
     /// deterministic order. Validated by [`TableSchema::validate`].
     #[serde(default)]
     pub indexes: Vec<IndexDef>,
+    /// The table's replication mode (ADR 0016 / ADR 0017). `#[serde(default)]` →
+    /// [`ReplicationMode::Ap`], so a schema written before this field existed
+    /// deserializes as AP (the prior, only behavior) — additive like `indexes`.
+    #[serde(default)]
+    pub mode: ReplicationMode,
 }
 
 /// Why a [`TableSchema`] was rejected as malformed.
@@ -205,6 +225,7 @@ impl TableSchema {
             partition_key: pk,
             clustering_keys: Vec::new(),
             indexes: Vec::new(),
+            mode: ReplicationMode::Ap,
         }
     }
 
@@ -227,6 +248,7 @@ impl TableSchema {
             partition_key: pk,
             clustering_keys: vec![sk],
             indexes: Vec::new(),
+            mode: ReplicationMode::Ap,
         }
     }
 
@@ -245,7 +267,15 @@ impl TableSchema {
             clustering_keys,
             columns,
             indexes: Vec::new(),
+            mode: ReplicationMode::Ap,
         }
+    }
+
+    /// Set the replication mode (builder; default [`ReplicationMode::Ap`]).
+    #[must_use]
+    pub fn with_mode(mut self, mode: ReplicationMode) -> Self {
+        self.mode = mode;
+        self
     }
 
     /// Look up a column by name (exact match).

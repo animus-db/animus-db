@@ -40,12 +40,14 @@ async fn run(args: &[String]) -> Result<(), String> {
             ClientRequest::Put {
                 key: key.clone().into_bytes(),
                 value: value.clone().into_bytes(),
+                table: None,
             }
         }
         "get" => {
             let key = args.get(2).ok_or("get needs <key>")?;
             ClientRequest::Get {
                 key: key.clone().into_bytes(),
+                table: None,
             }
         }
         other => return Err(format!("unknown command `{other}`")),

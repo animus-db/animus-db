@@ -40,12 +40,31 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
 
 ## What's non-obvious
 
-- A node runs **three internal `ProdEnv` roles on distinct ids/ports** — control
-  (Raft), data (replica), coord (the `DataClient`) — because one inbox is
-  single-consumer. The **client API is a plain request/reply TCP server**, *not*
-  on the `Network`: coordination is server-side, so the coordinator is a static
-  cluster member and replica replies route without knowing dynamic client
-  addresses.
+- A node runs **four internal `ProdEnv` roles on distinct ids/ports** — control
+  (Raft, id `i`), data (AP replica, `100+i`), coord (the `DataClient`, `200+i`),
+  and **raftkv** (the leaderful **CP** per-tablet Raft group, `300+i`, ADR 0017
+  #3a) — because one inbox is single-consumer. `ClusterConfig` assigns seven
+  consecutive ports per node (the four internal roles + client/dynamo/cql). The
+  **client API is a plain request/reply TCP server**, *not* on the `Network`:
+  coordination is server-side, so the coordinator is a static cluster member and
+  replica replies route without knowing dynamic client addresses.
+- **Per-table CP routing (ADR 0017 #3a, Stage 3a).** A table whose replicated
+  schema is `ReplicationMode::Cp` (set via `MetaCommand::SetTableMode`; the interim
+  admin path is `Node::propose_meta`) has its client reads/writes routed to a
+  **leaderful per-tablet Raft group** (`animus-raftdata`) instead of the AP
+  `DataClient`. The `client` API's `Put`/`Get` carry an optional `table`; the
+  handler checks `Metadata::table_mode(table)` and, when `Cp`, calls
+  `ClientCtx::cp_put`/`cp_get` → the group **leader** (found among the per-cluster
+  `ClusterEdgeState::raftkv` handles, mirroring the control-handle registry). A CP
+  write waits to read its value back before acking (durable-before-ack); a CP read
+  is a linearizable ReadIndex read. Stage 3a hosts **one statically-placed CP
+  group** spanning the first `min(N, MAX_REPLICATION_FACTOR)` nodes' `raftkv` ids,
+  each backed by its own durable `LsmEngine` (type aliased `CpGroup`). **Scope:**
+  CP routing works within a `--cluster N` process (shared edge state); cross-process
+  routing, dynamic CP placement/split/reconfigure over `ProdEnv`, and the
+  `Coresident`/`ProdEnv` pre-bound-listener-pool are **Stage 3b**. `tests/cp_plane.rs`
+  proves the end-to-end round-trip (write via one node, read via another) + the AP
+  plane staying untouched.
 - **The cluster's members are the DATA nodes, not the control ids** (this is what
   makes self-healing work end to end). The control ids `0..N` are only the Raft
   *consensus group*; `bootstrap` registers the **data ids** (`100+i`) as `Active`

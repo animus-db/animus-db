@@ -2,11 +2,14 @@
 
 - **Status:** Accepted — **Stages A–D implemented** in `animus-raftdata`
   (linearizable single-tablet KV, compaction + streaming snapshots, single-server
-  membership change, tablet split), all sim-tested, and the plane's
-  linearizability is now verified by a dedicated **Elle corpus**
-  (`animus-test/tests/raftkv_linearizable.rs`). The remaining work is *integration
-  plumbing* (control-plane-automatic membership/split triggers, in-band dynamic
-  group creation, wiring into `animusd`), not new mechanism.
+  membership change, tablet split), all sim-tested; the plane's linearizability is
+  verified by a dedicated **Elle corpus** (`animus-test/tests/raftkv_linearizable.rs`);
+  the **automatic membership-change trigger** and **in-band split group creation**
+  are wired under `SimEnv`; and **Stage 3a** of the production assembly runs the CP
+  plane in `animusd` over `ProdEnv` with per-table AP/CP routing. The remaining work
+  is **Stage 3b** integration plumbing (dynamic CP placement/split/reconfigure over
+  `ProdEnv` — the `ProdEnv` side of `Coresident` + control-plane address
+  distribution — and cross-process CP routing), not new mechanism.
 - **Date:** 2026-08-03
 
 ## Context
@@ -279,6 +282,18 @@ control plane unchanged. **Not yet:** dynamic membership (Stage C), tablet split
   3- and 5-replica), with a depth knob (`ANIMUS_RAFTKV_SEEDS`, default 1; held at
   depth 20 / 360 scenarios). Convergence + durability use the same
   converged-or-timeout poll as the Accord runner.
+- **Production assembly — Stage 3a (`animusd`).** ✅ Done. The leaderful CP plane
+  now runs in the assembled node over `ProdEnv`: per-table replication mode lives
+  in the replicated schema catalog (`ReplicationMode` + `MetaCommand::SetTableMode`,
+  `animus-control`), and `animusd` hosts a statically-placed per-tablet Raft group
+  on a 4th internal `raftkv` role (id `300+i`, its own listener/dir), routing a
+  CP-mode table's client reads/writes to the group leader (`ClientCtx::cp_put`/
+  `cp_get` via the per-cluster `ClusterEdgeState` group registry). `tests/cp_plane.rs`
+  drives it over real TCP (CP write/read round-trip across nodes; AP plane
+  untouched). **Stage 3b** (remaining integration plumbing): dynamic CP
+  placement/split/reconfigure over `ProdEnv` (the `ProdEnv` side of `Coresident`
+  via a pre-bound listener pool + control-plane address distribution), cross-process
+  CP client routing, and per-CP-group failure detection.
 - **Next ADR — cross-tablet transactions** (2PC over the groups + HLC; or Accord
   atop them).
 

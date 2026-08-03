@@ -22,6 +22,10 @@ use crate::RoleAddrs;
 pub const DATA_ID_BASE: NodeId = 100;
 /// Id offset for a node's coordinator role.
 pub const COORD_ID_BASE: NodeId = 200;
+/// Id offset for a node's **leaderful CP** per-tablet Raft role (ADR 0017 #3a).
+/// A node hosting a CP tablet group runs a [`RaftKvNode`](animus_raftdata::RaftKvNode)
+/// on this id — its own `ProdEnv`/inbox, distinct from the AP data role.
+pub const RAFTKV_ID_BASE: NodeId = 300;
 
 /// The control-plane Raft id for node `index`.
 #[must_use]
@@ -38,6 +42,11 @@ pub fn data_id(index: usize) -> NodeId {
 pub fn coord_id(index: usize) -> NodeId {
     COORD_ID_BASE + index as NodeId
 }
+/// The leaderful CP per-tablet Raft id for node `index` (ADR 0017 #3a).
+#[must_use]
+pub fn raftkv_id(index: usize) -> NodeId {
+    RAFTKV_ID_BASE + index as NodeId
+}
 
 /// A whole-cluster configuration shared (identically) by every node's process.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -51,15 +60,15 @@ pub struct ClusterConfig {
 }
 
 impl ClusterConfig {
-    /// Generate a config for `n` nodes on `host`, assigning each node six
+    /// Generate a config for `n` nodes on `host`, assigning each node seven
     /// consecutive ports starting at `base_port` (node `i` uses
-    /// `base_port + 6*i .. +6`): control, data, coord, client, dynamo, cql.
+    /// `base_port + 7*i .. +7`): control, data, coord, client, dynamo, cql, raftkv.
     /// Quorum defaults to a majority (`R = W > N/2`).
     #[must_use]
     pub fn generate(n: usize, host: IpAddr, base_port: u16) -> Self {
         let nodes = (0..n)
             .map(|i| {
-                let p = |role: u16| SocketAddr::new(host, base_port + (i as u16) * 6 + role);
+                let p = |role: u16| SocketAddr::new(host, base_port + (i as u16) * 7 + role);
                 RoleAddrs {
                     control: p(0),
                     data: p(1),
@@ -67,6 +76,7 @@ impl ClusterConfig {
                     client: p(3),
                     dynamo: p(4),
                     cql: p(5),
+                    raftkv: p(6),
                 }
             })
             .collect();
@@ -102,6 +112,13 @@ impl ClusterConfig {
         (0..self.nodes.len()).map(data_id).collect()
     }
 
+    /// The leaderful CP per-tablet Raft ids (one per node) — the universe from
+    /// which a CP tablet group's replica set is drawn (ADR 0017 #3a).
+    #[must_use]
+    pub fn raftkv_ids(&self) -> Vec<NodeId> {
+        (0..self.nodes.len()).map(raftkv_id).collect()
+    }
+
     /// The `(control, data, coord)` ids for node `index`.
     #[must_use]
     pub fn role_ids(&self, index: usize) -> (NodeId, NodeId, NodeId) {
@@ -118,6 +135,7 @@ impl ClusterConfig {
             book.insert(control_id(i), addrs.control);
             book.insert(data_id(i), addrs.data);
             book.insert(coord_id(i), addrs.coord);
+            book.insert(raftkv_id(i), addrs.raftkv);
         }
         book
     }
@@ -154,19 +172,21 @@ mod tests {
         assert_eq!(cfg.nodes[0].client.port(), 7003);
         assert_eq!(cfg.nodes[0].dynamo.port(), 7004);
         assert_eq!(cfg.nodes[0].cql.port(), 7005);
-        assert_eq!(cfg.nodes[1].control.port(), 7006);
-        assert_eq!(cfg.nodes[2].coord.port(), 7014);
+        assert_eq!(cfg.nodes[0].raftkv.port(), 7006);
+        assert_eq!(cfg.nodes[1].control.port(), 7007);
+        assert_eq!(cfg.nodes[2].coord.port(), 7016);
     }
 
     #[test]
     fn peer_book_covers_all_internal_roles() {
         let cfg = ClusterConfig::generate(3, "127.0.0.1".parse().unwrap(), 7000);
         let book = cfg.peer_book();
-        assert_eq!(book.len(), 9, "3 nodes x 3 internal roles");
+        assert_eq!(book.len(), 12, "3 nodes x 4 internal roles");
         // Conventional ids resolve to the right ports.
-        assert_eq!(book[&control_id(1)].port(), 7006);
-        assert_eq!(book[&data_id(1)].port(), 7007);
-        assert_eq!(book[&coord_id(2)].port(), 7014);
+        assert_eq!(book[&control_id(1)].port(), 7007);
+        assert_eq!(book[&data_id(1)].port(), 7008);
+        assert_eq!(book[&coord_id(2)].port(), 7016);
+        assert_eq!(book[&raftkv_id(0)].port(), 7006);
         // Client / dynamo / cql addresses are intentionally absent from the
         // internal book (they are external client channels, not the network).
         assert!(!book.values().any(|a| a.port() == 7003)); // client (node 0)
