@@ -7,7 +7,7 @@
 //! is a deterministic pure function of the command and current state, so every
 //! Raft replica computes the identical accept/reject decision.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use animus_env::NodeId;
 use animus_placement::{Candidate, PlacementPolicy, replan};
@@ -59,6 +59,15 @@ pub struct Metadata {
     /// consume it (a deliberate follow-up) so a `CreateTable`/`CREATE TABLE`
     /// survives restart and is agreed cluster-wide.
     pub schemas: SchemaCatalog,
+    /// Replicated **keyspace** names (ADR 0013 / v1 A3): the CQL keyspace namespace,
+    /// mutated only through [`MetaCommand::CreateKeyspace`] /
+    /// [`MetaCommand::DropKeyspace`] so it is Raft-replicated and recovered from the
+    /// WAL/snapshot — a `CREATE KEYSPACE` survives restart and is agreed
+    /// cluster-wide, instead of living in per-process edge state. Names are stored
+    /// as given (the CQL edge lowercases before proposing). `#[serde(default)]`
+    /// keeps snapshots written before this field existed loading (empty set).
+    #[serde(default)]
+    pub keyspaces: BTreeSet<String>,
 }
 
 /// A mutation of [`Metadata`], replicated through Raft and applied in log order.
@@ -141,6 +150,13 @@ pub enum MetaCommand {
         table: TableName,
         mode: crate::ReplicationMode,
     },
+    /// Register a **keyspace** name (ADR 0013 / v1 A3). Idempotent: a no-op if the
+    /// keyspace already exists. Replicated so a CQL `CREATE KEYSPACE` is durable +
+    /// cluster-agreed.
+    CreateKeyspace { keyspace: String },
+    /// Remove a keyspace name. Idempotent: a no-op if absent. (Tables in the
+    /// keyspace are dropped separately; this removes only the namespace entry.)
+    DropKeyspace { keyspace: String },
 }
 
 /// The deterministic result of applying a [`MetaCommand`].
@@ -362,6 +378,20 @@ impl Metadata {
                 schema.mode = *mode;
                 ApplyOutcome::Applied
             }
+            MetaCommand::CreateKeyspace { keyspace } => {
+                if self.keyspaces.insert(keyspace.clone()) {
+                    ApplyOutcome::Applied
+                } else {
+                    ApplyOutcome::NoOp
+                }
+            }
+            MetaCommand::DropKeyspace { keyspace } => {
+                if self.keyspaces.remove(keyspace) {
+                    ApplyOutcome::Applied
+                } else {
+                    ApplyOutcome::NoOp
+                }
+            }
         }
     }
 
@@ -376,6 +406,13 @@ impl Metadata {
     #[must_use]
     pub fn has_table_schema(&self, table: &str) -> bool {
         self.schemas.contains(table)
+    }
+
+    /// Whether `keyspace` is registered (ADR 0013 / v1 A3). Read by the CQL edge
+    /// for `USE` / qualifier validation, in place of per-process edge state.
+    #[must_use]
+    pub fn has_keyspace(&self, keyspace: &str) -> bool {
+        self.keyspaces.contains(keyspace)
     }
 
     /// The table's replication mode (ADR 0016 / ADR 0017): `Cp` for the leaderful

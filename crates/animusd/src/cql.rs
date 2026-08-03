@@ -53,17 +53,18 @@
 //! - The **prepared-statement store** — content-addressed: a statement's id is a
 //!   stable hash of its text, so `PREPARE` then `EXECUTE` works even across
 //!   connections. Re-parsed on `EXECUTE`, so the planning path is shared.
-//! - **Keyspaces** are *not* separately replicated (the control-plane catalog
-//!   models tables, not keyspaces): the edge keeps a process-local set of created
-//!   keyspaces for `USE`/qualifier validation, and additionally treats a keyspace
-//!   as existing if any replicated `ks.table` belongs to it (so a keyspace with
-//!   tables is recognized after a restart). Replicating keyspace metadata itself
-//!   is future work (ADR 0006/0013).
+//!
+//! Keyspaces **are** now control-plane replicated too (v1 A3): `CREATE KEYSPACE`
+//! proposes `MetaCommand::CreateKeyspace` (durable + cluster-agreed, surviving
+//! restart), and `USE`/qualifier validation reads the replicated keyspace set
+//! (`ClientCtx::has_keyspace`), with a `ks.table`-prefix fallback so a keyspace
+//! that has tables is still recognized. Keyspace *properties* (replication
+//! strategy/factor) are not modelled — only the name namespace.
 //!
 //! The pure protocol/type/catalog logic stays in `animus_cql`; only the socket
 //! loop and this shared state live here.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -91,21 +92,18 @@ struct Prepared {
     bind_specs: Vec<ColumnSpec>,
 }
 
-/// Per-cluster CQL edge state shared across all connections of a cluster: the
-/// known keyspaces (not control-plane replicated, see the module docs) and the
-/// prepared-statement store, both behind one async mutex (contention here is
-/// negligible — these are tiny in-memory maps). The *table schemas* no longer
-/// live here: they are in the control plane's replicated catalog (ADR 0013).
+/// Per-cluster CQL edge state shared across all connections of a cluster: just the
+/// prepared-statement store, behind one async mutex (contention here is negligible
+/// — a tiny in-memory map). Table *schemas* and now *keyspaces* (v1 A3) both live
+/// in the control plane's replicated catalog (ADR 0013), no longer at the edge.
 ///
 /// It is owned by the cluster's [`ClusterEdgeState`](crate::ClusterEdgeState)
 /// (threaded through [`ClientCtx`]) rather than a process `OnceLock`, so two
-/// in-process clusters in one test do not share keyspaces or prepared statements.
+/// in-process clusters in one test do not share prepared statements.
 #[derive(Default)]
 pub(crate) struct CqlState {
-    /// Created keyspaces (lowercased). Keyspace metadata is not replicated; a
-    /// keyspace also counts as existing if a replicated `ks.table` belongs to it.
-    keyspaces: BTreeSet<String>,
     /// statement id → prepared statement (id is a content hash of the text).
+    /// Keyspaces are now **control-plane replicated** (v1 A3), no longer held here.
     prepared: BTreeMap<Vec<u8>, Prepared>,
 }
 
@@ -521,7 +519,7 @@ async fn run_statement(
 ) -> Vec<u8> {
     match stmt {
         Statement::Use { keyspace } => {
-            if !keyspace_exists(ctx, state, &keyspace).await {
+            if !keyspace_exists(ctx, &keyspace).await {
                 return response::error(
                     stream,
                     response::ERR_INVALID,
@@ -535,12 +533,15 @@ async fn run_statement(
             keyspace,
             if_not_exists: _,
         } => {
-            // Keyspaces are not control-plane replicated; record it process-local.
-            {
-                let mut guard = state.lock().await;
-                guard.keyspaces.insert(keyspace.to_ascii_lowercase());
+            // Replicated through the control plane (v1 A3): durable + cluster-agreed,
+            // surviving restart (routed to the leader, so a follower-connected
+            // `CREATE KEYSPACE` still commits).
+            match ctx.create_keyspace(keyspace.to_ascii_lowercase()).await {
+                Ok(()) => {
+                    response::schema_change_result(stream, "CREATED", "KEYSPACE", &keyspace, "")
+                }
+                Err(msg) => response::error(stream, response::ERR_INVALID, &msg),
             }
-            response::schema_change_result(stream, "CREATED", "KEYSPACE", &keyspace, "")
         }
         Statement::CreateTable(ct) => {
             let keyspace = match ct.keyspace.clone().or_else(|| session.keyspace.clone()) {
@@ -709,19 +710,12 @@ async fn run_statement(
     }
 }
 
-/// Whether `keyspace` is known: created process-locally, or implied by a
-/// replicated `ks.table` schema (so a keyspace with tables is recognized even
-/// after a restart, before any in-process `CREATE KEYSPACE`).
-async fn keyspace_exists(ctx: &ClientCtx, state: &Arc<Mutex<CqlState>>, keyspace: &str) -> bool {
+/// Whether `keyspace` is known: registered in the **replicated** catalog (v1 A3),
+/// or implied by a replicated `ks.table` schema (so a keyspace with tables is
+/// recognized even if its `CREATE KEYSPACE` predates replicated keyspaces).
+async fn keyspace_exists(ctx: &ClientCtx, keyspace: &str) -> bool {
     let ks = keyspace.to_ascii_lowercase();
-    {
-        let guard = state.lock().await;
-        if guard.keyspaces.contains(&ks) {
-            return true;
-        }
-    }
-    let prefix = format!("{ks}.");
-    ctx.has_table_schema_with_prefix(&prefix)
+    ctx.has_keyspace(&ks) || ctx.has_table_schema_with_prefix(&format!("{ks}."))
 }
 
 /// `ALTER TABLE ... ADD`: append the new columns to the replicated schema. The

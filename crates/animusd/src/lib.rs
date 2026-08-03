@@ -161,6 +161,8 @@ fn is_schema_command(command: &MetaCommand) -> bool {
             | MetaCommand::CreateTableIndex { .. }
             | MetaCommand::DropTableIndex { .. }
             | MetaCommand::SetTableMode { .. }
+            | MetaCommand::CreateKeyspace { .. }
+            | MetaCommand::DropKeyspace { .. }
     )
 }
 
@@ -1171,6 +1173,38 @@ impl ClientCtx {
             .metadata()
             .table_schemas()
             .any(|(name, _)| name.starts_with(prefix))
+    }
+
+    /// Whether `keyspace` is registered in the replicated catalog (v1 A3) — the
+    /// CQL edge's `USE` / qualifier check, replacing per-process edge state.
+    pub(crate) fn has_keyspace(&self, keyspace: &str) -> bool {
+        self.raft.metadata().has_keyspace(keyspace)
+    }
+
+    /// Propose `CreateKeyspace` to the control-plane leader and wait for it to
+    /// commit + replicate here (v1 A3): a CQL `CREATE KEYSPACE` is durable +
+    /// cluster-agreed, surviving restart, instead of living in per-process edge
+    /// state. Idempotent (an existing keyspace returns immediately). Routes via the
+    /// A2 leader relay; times out after [`SCHEMA_COMMIT_TIMEOUT`].
+    pub(crate) async fn create_keyspace(&self, keyspace: String) -> Result<(), String> {
+        if self.has_keyspace(&keyspace) {
+            return Ok(());
+        }
+        let ks = keyspace.clone();
+        self.propose_and_await(
+            MetaCommand::CreateKeyspace {
+                keyspace: keyspace.clone(),
+            },
+            SCHEMA_COMMIT_TIMEOUT,
+            || self.has_keyspace(&ks).then_some(()),
+        )
+        .await
+        .map_err(|()| {
+            format!(
+                "CREATE KEYSPACE `{keyspace}` did not commit within {}s (no control-plane leader reachable?)",
+                SCHEMA_COMMIT_TIMEOUT.as_secs()
+            )
+        })
     }
 
     /// Propose `MetaCommand::CreateTableSchema` to the control-plane **leader**
