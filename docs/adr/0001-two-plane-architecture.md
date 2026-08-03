@@ -1,6 +1,9 @@
 # ADR 0001 — Masterless AP data plane + Raft control plane
 
-- **Status:** Accepted
+- **Status:** Accepted — **amended for v1 by [ADR 0019](0019-cp-only-v1-defer-ap.md):**
+  v1 ships the **CP** per-tablet-Raft data plane (ADR 0016/0017) only; the
+  leaderless AP data plane decided here is **deferred** (a long-shot future
+  improvement). The control-plane decision below is unchanged.
 - **Date:** 2026-08-01
 
 ## Context

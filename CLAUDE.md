@@ -10,10 +10,13 @@ design *rationale* (that lives in the ADRs, `docs/adr/`) or per-crate *mechanism
 
 ## What this is
 
-AnimusDB is a masterless, linearly-scalable NoSQL database in Rust (Dynamo
-lineage). It pairs a **leaderless AP data plane** (tunable quorum consistency)
-with a small **strongly-consistent Raft control plane** that owns cluster
-metadata. Correctness is established by **deterministic simulation testing**.
+AnimusDB is a masterless, linearly-scalable NoSQL database in Rust. **For v1
+(ADR 0019) it is strongly-consistent (CP):** a **leaderful per-tablet Raft data
+plane** (linearizable single-tablet reads/writes, ADR 0016/0017) under a small
+**Raft control plane** that owns cluster metadata — Cockroach/TiKV-shaped.
+Correctness is established by **deterministic simulation testing**. The original
+Dynamo-lineage **leaderless AP data plane** (ADR 0001) is **deferred** — a
+long-shot future improvement (ADR 0019), its code retained but dormant.
 
 Status: pre-alpha. For *what's implemented* and *why*, read the ADR index
 ([`docs/adr/README.md`](docs/adr/README.md)) and the per-crate guides below —
