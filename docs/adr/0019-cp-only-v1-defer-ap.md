@@ -70,14 +70,16 @@ foundation the deferred long-shot would revive.
   the AP availability ADR 0001 prized.
 - The Dynamo-lineage identity for v1. (Reclaimable via the long shot.)
 
-**Code disposition — retain dormant, do not delete:**
-
-- `animus-data` (AP plane), `animus-consensus`'s AP-frontier paths, and the AP /
-  frontier Elle corpora (ADR 0010, 0014 frontier) are **kept compiling and tested**
-  but removed from the v1 *serving path* and the v1 *acceptance gate*. They are a
-  sunk, working asset and the foundation the long-shot revival builds on; deleting
-  them buys a leaner tree at the cost of that option. (The maintainer may elect
-  physical removal later; this ADR's intent is *defer*, not *destroy* — "for now".)
+**Code disposition — deleted (updated decision):** this ADR originally intended to
+*retain `animus-data` dormant-but-compiling*. The maintainer subsequently elected
+the anticipated **physical removal**: `animus-data` (the AP plane), the
+`animus-consensus` **AP-frontier** paths (`start_with_data_plane`/`start_with_router`
++ `DataSink`/`DataRouting` + data-plane reads), and the AP / frontier Elle corpora
+in `animus-test` are **deleted**, not kept compiling — a leaner tree, the dual-plane
+option preserved in **git history** + this ADR rather than in dormant code. The
+long-shot revival below would re-introduce them from history (Accord, the
+`ReplicationMode` seam, and the dual-plane/pluggable-replication ADRs remain on
+record, so it stays feasible rather than a rewrite).
 
 ## The long shot (reviving AP, post-v1)
 
@@ -95,9 +97,13 @@ rather than a rewrite. It is a stretch goal, not a roadmap commitment.
 2. Remove the AP roles from node assembly (`serve_replica`, `DataClient`,
    anti-entropy, hinted handoff, the `data`/`coord` `ProdEnv` roles and their
    `ClusterConfig` ports) from the v1 path.
-3. Trim the v1 acceptance gate to the CP + control-plane suites; leave the AP /
-   frontier suites compiling but out of the gate.
+3. **Delete `animus-data`** and the AP-frontier paths it backed in
+   `animus-consensus` + `animus-test` (per the updated disposition above), trimming
+   the v1 acceptance gate to the CP + control-plane + pure-Accord suites.
 4. Proceed with Phase 2 (sharding) against CP only.
+
+Steps 1–3 are **done** (the CP re-platform: edges→CP, AP roles removed,
+`animus-raftdata`→`animus-cp-data`, `animus-data` deleted).
 
 This ADR builds on ADR 0017/0018 (the CP stack it makes v1's whole data plane),
 ADR 0016 (pluggable replication — the frame that made one-plane-at-a-time viable),

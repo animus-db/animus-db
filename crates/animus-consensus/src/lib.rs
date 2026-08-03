@@ -57,9 +57,10 @@
 //!   `PreAcceptOk`-witness/ballot recovery and duelling recovery coordinators are
 //!   deferred. There is also no *failure detector* yet — recovery is triggered
 //!   explicitly (e.g. by a test).
-//! - **Full data-plane integration**: execution is backed by a `StorageEngine`,
-//!   but it is a per-node consensus store, not yet wired to the live data-plane
-//!   replicas (`animus-data`); read transactions are also out of scope.
+//! - **Cross-shard atomic commit**: execution is backed by a per-node
+//!   `StorageEngine` consensus store. (v1 is CP-only, ADR 0019: the former AP
+//!   data-plane "frontier" — pushing committed writes through a leaderless quorum
+//!   and reading them back — was removed with `animus-data`.)
 //! - **The full transitive dependency wait-graph**: the execution wait is
 //!   conflict-and-timestamp based.
 //! - **WAL snapshotting / log truncation**: the WAL holds the full

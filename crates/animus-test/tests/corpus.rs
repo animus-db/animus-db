@@ -23,26 +23,19 @@ mod support;
 
 use std::collections::BTreeSet;
 
-use support::{
-    NemesisAction, Topology, corpus, corpus_base, corpus_extended, run_scenario, run_scenario_with,
-    seed_expand,
-};
+use support::{NemesisAction, corpus, corpus_base, corpus_extended, run_scenario, seed_expand};
 
-/// Run a single scenario against the **serialization-authoritative** topology
-/// (pure Accord) and assert **serializability** — the property that layer claims.
+/// Run a single scenario against the pure-Accord cluster and assert
+/// **serializability** — the property that layer claims.
 ///
 /// It deliberately asserts **only `cycles`**, not convergence/durability. Pure
 /// Accord guarantees the committed *order* among replicas that received the
 /// commit; it does **not** guarantee every replica's local store holds every
-/// committed write — backfilling a laggard that missed a `Commit` is the
-/// **data-plane frontier's** job (anti-entropy), not the ordering layer's. So
-/// reading convergence/durability off a single pure-Accord replica's store is
+/// committed write — backfilling a laggard that missed a `Commit` was the AP
+/// data-plane frontier's job (anti-entropy), which v1 drops (CP-only, ADR 0019).
+/// So reading convergence/durability off a single pure-Accord replica's store is
 /// unsound under faults (a `stop_restart` can leave a non-quorum replica behind
-/// forever) — exactly mirroring why `cycles` is unsound over the AP frontier.
-/// Convergence + durability are checked where they hold:
-/// [`frontier_corpus_converges_and_is_durable`]. (Found by the deep tier:
-/// `ext_t_stop_restart_winddown` diverged on pure Accord but converges on the
-/// frontier — see ADR 0014.)
+/// forever); only serializability is asserted here.
 fn assert_scenario_consistent(scenario: &support::Scenario) {
     let r = run_scenario(scenario);
     let name = &scenario.name;
@@ -54,10 +47,10 @@ fn assert_scenario_consistent(scenario: &support::Scenario) {
     );
 }
 
-/// The whole corpus is **serializable** under the authoritative topology. This is
-/// the headline suite — it asserts `cycles` (Accord's serialization claim) on
-/// every scenario; convergence + durability are the data plane's guarantees and
-/// are checked separately by [`frontier_corpus_converges_and_is_durable`].
+/// The whole corpus is **serializable** under the pure-Accord cluster. This is the
+/// headline suite — it asserts `cycles` (Accord's serialization claim) on every
+/// scenario. (Convergence + durability were the AP data plane's guarantees, dropped
+/// with the frontier in v1.)
 ///
 /// Size scales with the env knobs (`ANIMUS_CORPUS_SEEDS` / `ANIMUS_CORPUS_FULL`);
 /// at their defaults this is the frozen base set. The structural guards below
@@ -72,52 +65,6 @@ fn corpus_is_consistent() {
     );
     for scenario in &scenarios {
         assert_scenario_consistent(scenario);
-    }
-}
-
-/// The **frontier corpus**: the same scenarios run against the AP data-plane
-/// frontier ([`Topology::Frontier`]), checked for what that layer *offers* —
-/// **convergence** (two final reads agree) and **durability** (every acked write
-/// is in the final state). It deliberately does **not** assert `cycles`: a read
-/// through the eventually-consistent quorum can transiently observe a torn/stale
-/// multi-key write under a data-replica fault (it converges via anti-entropy), so
-/// serializability is unsound to assert here — that is the authoritative topology's
-/// job ([`corpus_is_consistent`]). This pairs with the repo principle: point the
-/// serializability checker at Accord, check the AP plane for convergence/RYW.
-///
-/// Runs the **env-scaled corpus** (`corpus()`), like [`corpus_is_consistent`] —
-/// it scales to the full deep tier via `ANIMUS_CORPUS_SEEDS` / `ANIMUS_CORPUS_FULL`.
-/// This is sound because the runner no longer judges convergence/durability off a
-/// single fixed-drain snapshot: it drives a deterministic **converged-or-timeout**
-/// poll (see `run_scenario_with`) — after healing it re-reads the two final replicas
-/// in bounded virtual-time increments and stops the moment they converge AND every
-/// acked append is durable. Convergence + durability are **eventual** properties
-/// (anti-entropy + coordinator retry), so a generous poll bound lets a compound
-/// fault (e.g. `lossy` + `stop_restart`) finish healing at adversarial seed-depth
-/// rather than failing on a too-short fixed window. If that bound elapses without
-/// converging, that is a **genuine** non-convergence/durability failure and is
-/// surfaced here with the scenario name + replay seed + the divergence. (Earlier
-/// this was bounded to `corpus_base()` because a fixed drain made depth flaky: the
-/// deep tier showed `lossy_stop_restart_mid_s36` diverge on the frontier while pure
-/// Accord converged, and `ext_t_stop_restart_winddown_s39` do the reverse — neither
-/// layer converges within a *fixed* bound under every compound fault. The
-/// converged-or-timeout poll removes that false deadline. See ADR 0014.)
-#[test]
-fn frontier_corpus_converges_and_is_durable() {
-    for scenario in &corpus() {
-        let r = run_scenario_with(scenario, Topology::Frontier);
-        let name = &scenario.name;
-        let seed = scenario.seed;
-        assert!(
-            r.convergence.ok,
-            "[frontier {name}] final replica states diverged (seed={seed}): {:?}",
-            r.convergence.violations
-        );
-        assert!(
-            r.durability.ok,
-            "[frontier {name}] acknowledged write lost from final state (seed={seed}): {:?}",
-            r.durability.violations
-        );
     }
 }
 

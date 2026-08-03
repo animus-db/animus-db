@@ -14,9 +14,7 @@ workspace = true
 [dependencies]
 animus-env.workspace = true
 animus-storage.workspace = true
-# Frontier: a committed transaction's writes land in the replicated data plane
-# (DataClient quorum) — no cycle, animus-data does not depend on consensus.
-animus-data.workspace = true
+# Per-shard consensus routes by the tablet map (ids + replica sets).
 animus-tablet.workspace = true
 serde.workspace = true
 serde_json.workspace = true

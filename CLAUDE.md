@@ -16,7 +16,9 @@ plane** (linearizable single-tablet reads/writes, ADR 0016/0017) under a small
 **Raft control plane** that owns cluster metadata — Cockroach/TiKV-shaped.
 Correctness is established by **deterministic simulation testing**. The original
 Dynamo-lineage **leaderless AP data plane** (ADR 0001) is **deferred** — a
-long-shot future improvement (ADR 0019), its code retained but dormant.
+long-shot future improvement (ADR 0019); its crate (`animus-data`) and the Accord
+data-plane "frontier" that depended on it were **deleted**, retrievable from git
+history if both-planes is revived.
 
 Status: pre-alpha. For *what's implemented* and *why*, read the ADR index
 ([`docs/adr/README.md`](docs/adr/README.md)) and the per-crate guides below —
@@ -34,7 +36,6 @@ the relevant one before working in a crate:
 | `animus-storage` | [crates/animus-storage/CLAUDE.md](crates/animus-storage/CLAUDE.md) |
 | `animus-tablet` | [crates/animus-tablet/CLAUDE.md](crates/animus-tablet/CLAUDE.md) |
 | `animus-control` | [crates/animus-control/CLAUDE.md](crates/animus-control/CLAUDE.md) |
-| `animus-data` | [crates/animus-data/CLAUDE.md](crates/animus-data/CLAUDE.md) |
 | `animus-cp-data` | [crates/animus-cp-data/CLAUDE.md](crates/animus-cp-data/CLAUDE.md) |
 | `animus-test` | [crates/animus-test/CLAUDE.md](crates/animus-test/CLAUDE.md) |
 | `animus-dynamo` | [crates/animus-dynamo/CLAUDE.md](crates/animus-dynamo/CLAUDE.md) |
@@ -102,34 +103,35 @@ truth; this map is just for navigation.
   boundary for time/rng/network/disk/spawn. `SimEnv` is the deterministic
   single-threaded executor; `ProdEnv` the real one. Drive sims with
   `run_for`/`run_until`, never `run()` for protocols with perpetual timers.
-- **Two planes** — ADR 0001. A consistent Raft **control plane** (`animus-control`,
-  owns `Metadata` = membership + tablet map) vs a leaderless-AP **data plane**
-  (`animus-data`, serving reads/writes from a *cached* `TabletView` so a
-  control-plane outage doesn't stop I/O). See `animus-data/tests/two_plane.rs`.
+- **Two planes** — ADR 0001 / ADR 0019. A consistent Raft **control plane**
+  (`animus-control`, owns `Metadata` = membership + tablet map) vs a **CP data
+  plane** (`animus-cp-data`, leaderful per-tablet Raft, linearizable). v1 is
+  CP-only; the original leaderless-AP data plane (`animus-data`) is **deleted**
+  (retrievable from git history, ADR 0019).
 - **Control-plane Raft** — `animus-control` (ADR 0009; in-house, not openraft, so
   `SimEnv` can drive it). Sync I/O-free `RaftCore` + thin `RaftNode<E>` driver;
   WAL + truncating/chunked-`InstallSnapshot` snapshots; epoch-CAS placement;
   heartbeat **failure detection** (ADR 0012); a replicated **table-schema
   catalog** in `Metadata` (ADR 0013).
-- **Data plane** — `animus-data` (ADR 0001). `serve_replica` + the `DataClient`
-  quorum coordinator; per-tablet **epoch fencing** (ADR 0002); pick `R+W>N`.
-  Convergence via read-repair + segment-digest anti-entropy + hinted handoff,
-  all **residency-bounded** (ADR 0010, 0005). An ack means the write durably
-  applied.
+- **CP data plane** — `animus-cp-data` (ADR 0016, 0017). Each tablet is its own
+  Raft group with a single leader serving **linearizable** single-tablet
+  reads/writes, durable on a real `StorageEngine`; reuses the control plane's sync
+  `RaftCore` with a `DRIVER_APPLIED` KV state machine; ReadIndex reads, compaction +
+  streaming `InstallSnapshot`, single-server membership change, tablet split.
 - **Placement & residency** — `animus-placement` (ADR 0005). Pure policy engine
   (RF + residency labels + failure-domain spread); the leader auto-reconciles
   tablet placement via `reconcile_loop`.
 - **Transaction consensus** — `animus-consensus` (ADR 0011). An Accord slice in
   the same shape as the Raft core: sync `AccordCore` + `AccordNode<E>`; durable
-  execution, coordinator failover, message retry, read / data-plane-backed /
-  sharded / interactive transactions.
+  local execution, coordinator failover, message retry, read / interactive
+  transactions, and per-shard consensus (one group per tablet).
 - **Storage** — `animus-storage` (ADR 0004, 0008). The **async** `StorageEngine`
   trait; `MemoryEngine` (deterministic, for sim) and a custom on-disk
   `LsmEngine<E>` (WAL/SSTable/leveled compaction, all I/O via the `Env` disk seam
   so its crash recovery is sim-tested).
 - **Wire adapters** — `animus-dynamo`, `animus-cql` (ADR 0006). DynamoDB JSON/HTTP
-  and CQL v4, served by `animusd`, routed through the same `DataClient`; both
-  consume the replicated schema catalog (ADR 0013).
+  and CQL v4, served by `animusd`, routed through the **CP data plane** (v1,
+  ADR 0019); both consume the replicated schema catalog (ADR 0013).
 - **Runnable node** — `animusd`, `animus-cli`. v1 (ADR 0019) assembles the
   **control plane + the CP data plane** (`animus-cp-data`) over `ProdEnv` — all
   client reads/writes route to the per-tablet Raft group leader (forwarded

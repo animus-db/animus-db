@@ -34,7 +34,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use animus_data::{DataClient, ReadResult, Router, TabletView};
 use animus_env::{Env, EnvExt, NodeId};
 use animus_storage::{MemoryEngine, StorageEngine};
 
@@ -106,12 +105,6 @@ const LIVENESS_INTERVAL: Duration = Duration::from_millis(100);
 /// improvement, independent of the bound.
 const LIVENESS_STALL_TICKS: u32 = 50;
 
-/// Timeout for a single data-plane quorum write/read issued by the execution
-/// effect when the node is wired to the **live data plane** (the "frontier"
-/// path). Generous so a transient drop is absorbed by the data plane's own
-/// retry-on-next-anti-entropy convergence rather than failing the apply.
-const DATA_TIMEOUT: Duration = Duration::from_secs(2);
-
 /// The per-node store of read-transaction results: for each executed read-only
 /// transaction, the **raw value bytes** observed at each key at the read's
 /// execution timestamp (`None` = the key had no committed write before the
@@ -121,57 +114,6 @@ const DATA_TIMEOUT: Duration = Duration::from_secs(2);
 /// verbatim; [`AccordNode::read_result`] decodes them as a writer txn id for the
 /// classic register view, [`AccordNode::read_value_result`] returns them raw.
 type ReadResults = Arc<Mutex<BTreeMap<TxnId, BTreeMap<Key, Option<Vec<u8>>>>>>;
-
-/// The **frontier** wiring: a sink that lands a committed transaction's writes in
-/// the replicated **data plane** (`animus-data`) instead of (only) a per-node
-/// store. When an [`AccordNode`] is started with one (via
-/// [`AccordNode::start_with_data_plane`]), the execution effect of a committed
-/// *write* transaction is applied through the data-plane quorum coordinator:
-/// each key the transaction touches is written (`DataClient::write`) to the
-/// tablet's replica set at the transaction's execution timestamp as the MVCC
-/// version. Those writes are then readable via ordinary data-plane quorum reads
-/// — the transaction's atomic, ordered effect made durable across the leaderless
-/// AP data plane (ADR 0011 frontier, ADR 0001 two-plane).
-///
-/// The data-plane coordinator runs on its **own** `Env` (a distinct node id):
-/// the node's inbox is single-consumer, so the Accord protocol traffic and the
-/// data-plane coordinator's quorum replies must not share an inbox.
-///
-/// **Sharded (multi-tablet) transactions (ADR 0011).** A transaction's key set
-/// may span more than one tablet/replica-set. Accord is naturally multi-shard —
-/// the consensus round here already replicates every transaction to the whole
-/// Accord replica set, agreeing one *global* execution timestamp and one
-/// dependency set regardless of which tablets the keys live in. The only place
-/// sharding shows up is the *execution effect*: each key must be written to (and
-/// read from) **its own** tablet's quorum. The sink therefore routes per key via
-/// [`DataRouting`] — a single `TabletView` (the original frontier) or a `Router`
-/// over a multi-tablet map. Because the agreed execution timestamp is the MVCC
-/// version on every key regardless of tablet, the per-tablet writes stay
-/// consistently ordered across shards.
-struct DataSink<E: Env> {
-    client: DataClient<E>,
-    routing: DataRouting,
-}
-
-/// How a [`DataSink`] resolves a key to the tablet quorum that owns it.
-enum DataRouting {
-    /// A single tablet covering the whole key space (the original frontier).
-    Single(TabletView),
-    /// A multi-tablet map: each key routes to its owning tablet's view. A key
-    /// outside every tablet's range resolves to `None` (and is skipped).
-    Sharded(Router),
-}
-
-impl DataRouting {
-    /// The [`TabletView`] for the tablet owning `key` (the storage-key bytes),
-    /// or `None` if no tablet covers it.
-    fn view_for(&self, key: &[u8]) -> Option<TabletView> {
-        match self {
-            DataRouting::Single(view) => Some(view.clone()),
-            DataRouting::Sharded(router) => router.view_for(key),
-        }
-    }
-}
 
 /// A running consensus replica. Cheap to clone; clones share one [`AccordCore`]
 /// and one storage engine.
@@ -184,9 +126,6 @@ pub struct AccordNode<E: Env, S: StorageEngine = MemoryEngine> {
     storage: S,
     /// Results of executed read-only transactions (see [`ReadResults`]).
     reads: ReadResults,
-    /// When `Some`, committed write effects land in the replicated data plane
-    /// instead of (only) the local `storage` engine (the frontier path).
-    sink: Option<Arc<DataSink<E>>>,
 }
 
 impl<E: Env, S: StorageEngine> Clone for AccordNode<E, S> {
@@ -196,7 +135,6 @@ impl<E: Env, S: StorageEngine> Clone for AccordNode<E, S> {
             core: Arc::clone(&self.core),
             storage: self.storage.clone(),
             reads: Arc::clone(&self.reads),
-            sink: self.sink.clone(),
         }
     }
 }
@@ -216,15 +154,6 @@ impl<E: Env, S: StorageEngine + 'static> AccordNode<E, S> {
     /// from the WAL before serving anything, replaying its execution order into
     /// `storage`.
     pub fn start_with_storage(env: E, all_nodes: Vec<NodeId>, storage: S) -> AccordNode<E, S> {
-        Self::start_inner(env, all_nodes, storage, None)
-    }
-
-    fn start_inner(
-        env: E,
-        all_nodes: Vec<NodeId>,
-        storage: S,
-        sink: Option<Arc<DataSink<E>>>,
-    ) -> AccordNode<E, S> {
         let core = Arc::new(Mutex::new(AccordCore::new(env.node_id(), &all_nodes)));
         let reads: ReadResults = Arc::new(Mutex::new(BTreeMap::new()));
         let node = AccordNode {
@@ -232,14 +161,12 @@ impl<E: Env, S: StorageEngine + 'static> AccordNode<E, S> {
             core: Arc::clone(&core),
             storage: storage.clone(),
             reads: Arc::clone(&reads),
-            sink: sink.clone(),
         };
         env.spawn_task(drive(
             env.clone(),
             Arc::clone(&core),
             storage,
             reads,
-            sink.clone(),
             all_nodes,
         ));
         // Retry tick: re-send un-acknowledged protocol messages for in-flight
@@ -251,7 +178,6 @@ impl<E: Env, S: StorageEngine + 'static> AccordNode<E, S> {
             Arc::clone(&core),
             node.storage.clone(),
             Arc::clone(&node.reads),
-            node.sink.clone(),
         ));
         // Failure-detector tick: auto-trigger recovery of a transaction that has
         // been held un-committed past a time bound without progressing — its
@@ -262,68 +188,8 @@ impl<E: Env, S: StorageEngine + 'static> AccordNode<E, S> {
             Arc::clone(&core),
             node.storage.clone(),
             Arc::clone(&node.reads),
-            node.sink.clone(),
         ));
         node
-    }
-
-    /// Start a node whose committed write effects land in the **replicated data
-    /// plane** (the frontier path), not (only) a per-node store. `all_nodes` is
-    /// the Accord replica set (the consensus participants); `view` routes the
-    /// data-plane quorum writes for the keys it executes.
-    ///
-    /// The `coordinator_env` must be a **distinct node id** from this Accord
-    /// replica's (and from the data replicas in `view`): the network inbox is
-    /// single-consumer, so the data-plane coordinator's quorum replies cannot
-    /// share an inbox with the Accord protocol traffic. The execution effect of a
-    /// committed write transaction writes each key it touches through the quorum
-    /// (`DataClient::write`) at the transaction's execution timestamp as the MVCC
-    /// version — so the transaction's writes become readable via ordinary
-    /// data-plane quorum reads, atomically in agreed order.
-    ///
-    /// `storage` still backs the local execution path (and recovery); read-only
-    /// transactions execute against it as before — wiring data-plane *reads* into
-    /// Accord is deferred (see ADR 0011).
-    pub fn start_with_data_plane(
-        env: E,
-        all_nodes: Vec<NodeId>,
-        storage: S,
-        coordinator_env: E,
-        view: TabletView,
-    ) -> AccordNode<E, S> {
-        let sink = Arc::new(DataSink {
-            client: DataClient::new(coordinator_env),
-            routing: DataRouting::Single(view),
-        });
-        Self::start_inner(env, all_nodes, storage, Some(sink))
-    }
-
-    /// Start a node whose committed write effects land in a **multi-tablet**
-    /// (sharded) data plane (ADR 0011, sharded transactions). Like
-    /// [`AccordNode::start_with_data_plane`] but the data-plane keys are routed
-    /// **per key** through a [`Router`] over a multi-tablet map, so a single
-    /// Accord transaction whose keys span more than one tablet writes each key to
-    /// *its own* tablet's replica set — coordinated across shards under one global
-    /// execution timestamp (the Accord round already agrees that timestamp and the
-    /// dependency set over the whole replica set; only the execution effect is
-    /// sharded). A wired read transaction reads each key from its owning tablet's
-    /// quorum the same way.
-    ///
-    /// `coordinator_env` must be a **distinct node id** from this Accord replica
-    /// (and from every data replica any tablet in the `router` routes to), since
-    /// the network inbox is single-consumer.
-    pub fn start_with_router(
-        env: E,
-        all_nodes: Vec<NodeId>,
-        storage: S,
-        coordinator_env: E,
-        router: Router,
-    ) -> AccordNode<E, S> {
-        let sink = Arc::new(DataSink {
-            client: DataClient::new(coordinator_env),
-            routing: DataRouting::Sharded(router),
-        });
-        Self::start_inner(env, all_nodes, storage, Some(sink))
     }
 
     /// Submit a new **write** transaction over `keys` for this node to
@@ -331,14 +197,7 @@ impl<E: Env, S: StorageEngine + 'static> AccordNode<E, S> {
     /// durable state the burst depends on), and returns the transaction id.
     pub fn submit(&self, keys: BTreeSet<Key>) -> TxnId {
         let (txn, outs) = self.lock().submit(keys);
-        persist_then_ship(
-            &self.env,
-            &self.core,
-            &self.storage,
-            &self.reads,
-            &self.sink,
-            outs,
-        );
+        persist_then_ship(&self.env, &self.core, &self.storage, &self.reads, outs);
         txn
     }
 
@@ -350,14 +209,7 @@ impl<E: Env, S: StorageEngine + 'static> AccordNode<E, S> {
     /// holds for the returned id.
     pub fn submit_read(&self, keys: BTreeSet<Key>) -> TxnId {
         let (txn, outs) = self.lock().submit_read(keys);
-        persist_then_ship(
-            &self.env,
-            &self.core,
-            &self.storage,
-            &self.reads,
-            &self.sink,
-            outs,
-        );
+        persist_then_ship(&self.env, &self.core, &self.storage, &self.reads, outs);
         txn
     }
 
@@ -372,14 +224,7 @@ impl<E: Env, S: StorageEngine + 'static> AccordNode<E, S> {
     /// dependency tracking.
     pub fn submit_rw(&self, read_keys: BTreeSet<Key>, write_keys: BTreeSet<Key>) -> TxnId {
         let (txn, outs) = self.lock().submit_rw(read_keys, write_keys);
-        persist_then_ship(
-            &self.env,
-            &self.core,
-            &self.storage,
-            &self.reads,
-            &self.sink,
-            outs,
-        );
+        persist_then_ship(&self.env, &self.core, &self.storage, &self.reads, outs);
         txn
     }
 
@@ -393,14 +238,7 @@ impl<E: Env, S: StorageEngine + 'static> AccordNode<E, S> {
     /// [`AccordCore::submit_writes`].
     pub fn submit_writes(&self, writes: BTreeMap<Key, Vec<u8>>) -> TxnId {
         let (txn, outs) = self.lock().submit_writes(writes);
-        persist_then_ship(
-            &self.env,
-            &self.core,
-            &self.storage,
-            &self.reads,
-            &self.sink,
-            outs,
-        );
+        persist_then_ship(&self.env, &self.core, &self.storage, &self.reads, outs);
         txn
     }
 
@@ -419,14 +257,7 @@ impl<E: Env, S: StorageEngine + 'static> AccordNode<E, S> {
         writes: BTreeMap<Key, Vec<u8>>,
     ) -> TxnId {
         let (txn, outs) = self.lock().submit_writes_rw(read_keys, writes);
-        persist_then_ship(
-            &self.env,
-            &self.core,
-            &self.storage,
-            &self.reads,
-            &self.sink,
-            outs,
-        );
+        persist_then_ship(&self.env, &self.core, &self.storage, &self.reads, outs);
         txn
     }
 
@@ -435,14 +266,7 @@ impl<E: Env, S: StorageEngine + 'static> AccordNode<E, S> {
     /// consistent commit. See [`AccordCore::recover`].
     pub fn recover(&self, txn: TxnId) {
         let outs = self.lock().recover(txn);
-        persist_then_ship(
-            &self.env,
-            &self.core,
-            &self.storage,
-            &self.reads,
-            &self.sink,
-            outs,
-        );
+        persist_then_ship(&self.env, &self.core, &self.storage, &self.reads, outs);
     }
 
     /// The result of an executed read-only transaction: the writer this replica
@@ -562,11 +386,9 @@ impl<E: Env, S: StorageEngine + 'static> AccordNode<E, S> {
         }
     }
 
-    /// Read the current committed writer of `key` as seen by this node: through
-    /// the replicated **data plane** quorum when the node is wired to it (the
-    /// frontier path), else from the local execution store. Used by
-    /// [`InteractiveTxn::read`]; exposed so a caller can do an ad-hoc current read
-    /// without opening a transaction.
+    /// Read the current committed writer of `key` as seen by this node, from the
+    /// local execution store. Used by [`InteractiveTxn::read`]; exposed so a caller
+    /// can do an ad-hoc current read without opening a transaction.
     pub async fn current_writer(&self, key: Key) -> Option<TxnId> {
         self.current_value(key)
             .await
@@ -574,27 +396,13 @@ impl<E: Env, S: StorageEngine + 'static> AccordNode<E, S> {
             .and_then(decode_txn)
     }
 
-    /// Read the current committed **value bytes** of `key` as seen by this node:
-    /// through the replicated data-plane quorum when wired to it (the frontier
-    /// path), else from the local execution store. Unlike
-    /// [`AccordNode::current_writer`] this returns the raw bytes, so a caller doing
-    /// a read-modify-write over arbitrary values (e.g. list-append) sees the
-    /// actual value to modify (arbitrary write values, ADR 0011). `None` if the
-    /// key has no committed write (or a quorum could not be reached).
+    /// Read the current committed **value bytes** of `key` as seen by this node,
+    /// from the local execution store. Unlike [`AccordNode::current_writer`] this
+    /// returns the raw bytes, so a caller doing a read-modify-write over arbitrary
+    /// values (e.g. list-append) sees the actual value to modify (arbitrary write
+    /// values, ADR 0011). `None` if the key has no committed write.
     pub async fn current_value(&self, key: Key) -> Option<Vec<u8>> {
-        match &self.sink {
-            Some(sink) => {
-                let sk = storage_key(key);
-                match sink.routing.view_for(&sk) {
-                    Some(view) => match sink.client.read(&view, &sk, DATA_TIMEOUT).await {
-                        ReadResult::Value(Some(bytes)) => Some(bytes),
-                        ReadResult::Value(None) | ReadResult::Failed => None,
-                    },
-                    None => None,
-                }
-            }
-            None => self.store_value(key).await,
-        }
+        self.store_value(key).await
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, AccordCore> {
@@ -639,21 +447,19 @@ pub struct InteractiveTxn<E: Env, S: StorageEngine = MemoryEngine> {
 }
 
 impl<E: Env, S: StorageEngine + 'static> InteractiveTxn<E, S> {
-    /// Read the current committed value of `key` and record it in the read set.
-    /// Reads through the replicated data plane when the node is wired to it (the
-    /// frontier path), else the local execution store. Returns the observed value
-    /// writer (`None` if the key has no committed write), so the caller can decide
-    /// what to write next.
+    /// Read the current committed value of `key` and record it in the read set,
+    /// from the local execution store. Returns the observed value writer (`None` if
+    /// the key has no committed write), so the caller can decide what to write next.
     pub async fn read(&mut self, key: Key) -> Option<TxnId> {
         self.reads.insert(key);
         self.node.current_writer(key).await
     }
 
-    /// Read the current committed **value bytes** of `key` (through the data plane
-    /// when wired, else the local store), recording it in the read set. Unlike
-    /// [`InteractiveTxn::read`] — which decodes the writer txn id — this returns
-    /// the raw stored bytes, so a caller doing a read-modify-write over arbitrary
-    /// values (e.g. list-append) sees the actual value to modify (ADR 0011).
+    /// Read the current committed **value bytes** of `key` from the local store,
+    /// recording it in the read set. Unlike [`InteractiveTxn::read`] — which decodes
+    /// the writer txn id — this returns the raw stored bytes, so a caller doing a
+    /// read-modify-write over arbitrary values (e.g. list-append) sees the actual
+    /// value to modify (ADR 0011).
     pub async fn read_value(&mut self, key: Key) -> Option<Vec<u8>> {
         self.reads.insert(key);
         self.node.current_value(key).await
@@ -799,7 +605,6 @@ fn persist_then_ship<E: Env, S: StorageEngine + 'static>(
     core: &Arc<Mutex<AccordCore>>,
     storage: &S,
     reads: &ReadResults,
-    sink: &Option<Arc<DataSink<E>>>,
     outs: Vec<Out>,
 ) {
     let (records, applies, read_effects) = {
@@ -809,7 +614,6 @@ fn persist_then_ship<E: Env, S: StorageEngine + 'static>(
     let env = env.clone();
     let storage = storage.clone();
     let reads = Arc::clone(reads);
-    let sink = sink.clone();
     let compact_core = Arc::clone(core);
     env.clone().spawn_task(async move {
         for record in &records {
@@ -824,8 +628,8 @@ fn persist_then_ship<E: Env, S: StorageEngine + 'static>(
         // same drain as a write it orders after sees that write (the core only
         // emits a read effect once its earlier-ordered conflicts are `Applied`,
         // so their write effects were drained no later than this one).
-        apply_all(&storage, sink.as_deref(), &applies).await;
-        satisfy_reads(&storage, sink.as_deref(), &reads, &read_effects).await;
+        apply_all(&storage, &applies).await;
+        satisfy_reads(&storage, &reads, &read_effects).await;
         // Now that the records are durable, compact the WAL if enough has applied:
         // collapse the appended per-phase history into one snapshot record (ADR
         // 0011, log truncation). Safe here because the appends above are fsynced.
@@ -873,22 +677,13 @@ async fn maybe_compact<E: Env>(env: &E, core: &Arc<Mutex<AccordCore>>) {
     env.replace(WAL, &bytes).await.expect("wal compaction");
 }
 
-/// Apply the execution effects. Each effect writes the transaction's id to each
-/// key it touches at the transaction's execution timestamp as the MVCC version.
+/// Apply the execution effects. Each effect writes its value to each key it
+/// touches at the transaction's execution timestamp as the MVCC version.
 ///
-/// The id always lands in the local `storage` engine (`merge`, per-key LWW —
+/// The write lands in the local `storage` engine via `merge` (per-key LWW —
 /// idempotent and commutative, so a re-apply on recovery converges, and
-/// `store_writer` can read it back). When a [`DataSink`] is present (the frontier
-/// path), the same write is **also** pushed through the replicated data plane via
-/// the quorum coordinator (`DataClient::write`), so the transaction's effect
-/// becomes readable via ordinary data-plane quorum reads — the local engine
-/// remains the per-node recovery substrate, the data plane is the shared,
-/// replicated landing zone.
-async fn apply_all<E: Env, S: StorageEngine>(
-    storage: &S,
-    sink: Option<&DataSink<E>>,
-    applies: &[ApplyEffect],
-) {
+/// `store_writer`/`store_value` read it back).
+async fn apply_all<S: StorageEngine>(storage: &S, applies: &[ApplyEffect]) {
     for effect in applies {
         // The default value (no caller-supplied bytes) is the txn's own id — the
         // classic register effect, which `store_writer` decodes back. A caller who
@@ -907,23 +702,6 @@ async fn apply_all<E: Env, S: StorageEngine>(
                 .merge(&sk, value, version)
                 .await
                 .expect("storage merge");
-            if let Some(sink) = sink {
-                // Land the committed write in the replicated data plane in agreed
-                // order, routing the key to **its own** tablet's quorum (sharded
-                // transactions, ADR 0011). The version is the execution timestamp,
-                // strictly increasing in the total order, so the data plane's
-                // per-key LWW keeps the same winner everywhere. Fire-and-await: the
-                // result is not asserted here (a transient quorum miss is
-                // reconciled by the data plane's own anti-entropy); the test
-                // verifies via a quorum read. A key no tablet covers is skipped
-                // (it still lands in the local engine above).
-                if let Some(view) = sink.routing.view_for(&sk) {
-                    let _ = sink
-                        .client
-                        .write(&view, &sk, value, version, DATA_TIMEOUT)
-                        .await;
-                }
-            }
         }
     }
 }
@@ -933,27 +711,13 @@ async fn apply_all<E: Env, S: StorageEngine>(
 /// [`ReadResults`] under the read txn's id (so an arbitrary value — list-append,
 /// ADR 0011 — is observed verbatim; the register-writer view decodes them).
 ///
-/// **Where the read lands depends on the wiring** (ADR 0011):
-///
-/// - **Local execution store** (no [`DataSink`]): read each key *as of* the
-///   read's execution timestamp (`get_at`) — so it observes exactly the writes
-///   that executed before it (lower MVCC version) and none after. This is the
-///   per-node consensus store path.
-/// - **Replicated data plane** (a [`DataSink`] is present, the frontier path):
-///   read each key through the data-plane **quorum** coordinator
-///   ([`DataClient::read`]) — so a read observes the same replicated state the
-///   committed *write* transactions land in (the data-plane write effect in
-///   [`apply_all`]), not a private local snapshot. This is correct *because*
-///   the read is ordered like a write: the core only emits its [`ReadEffect`]
-///   once every earlier-ordered conflicting write has `Applied`, and an applied
-///   write's effect has already been pushed through the same data-plane quorum
-///   — so a current quorum read at execution time observes exactly those writes
-///   and none ordered after. (The data-plane wire carries no historical
-///   `get_at`-by-version read, so this relies on the execution-order gate, not a
-///   versioned snapshot.)
-async fn satisfy_reads<E: Env, S: StorageEngine>(
+/// Each key is read from the local execution store *as of* the read's execution
+/// timestamp (`get_at`) — so it observes exactly the writes that executed before
+/// it (lower MVCC version) and none after. This is sound because the core only
+/// emits a read's [`ReadEffect`] once every earlier-ordered conflicting write has
+/// `Applied`.
+async fn satisfy_reads<S: StorageEngine>(
     storage: &S,
-    sink: Option<&DataSink<E>>,
     reads: &ReadResults,
     read_effects: &[ReadEffect],
 ) {
@@ -967,27 +731,11 @@ async fn satisfy_reads<E: Env, S: StorageEngine>(
         let mut observed: BTreeMap<Key, Option<Vec<u8>>> = BTreeMap::new();
         for &key in &effect.keys {
             let sk = storage_key(key);
-            let value = match sink {
-                // Frontier: observe the replicated data plane (quorum read),
-                // routing the key to its own tablet's quorum (sharded reads).
-                Some(sink) => match sink.routing.view_for(&sk) {
-                    Some(view) => match sink.client.read(&view, &sk, DATA_TIMEOUT).await {
-                        ReadResult::Value(Some(bytes)) => Some(bytes),
-                        // Absent everywhere, or a quorum could not be reached: the
-                        // read observes nothing for this key (a transient quorum
-                        // miss converges via the data plane's own anti-entropy).
-                        ReadResult::Value(None) | ReadResult::Failed => None,
-                    },
-                    // No tablet covers the key: nothing to observe.
-                    None => None,
-                },
-                // Local consensus store: snapshot read as of the execution ts.
-                None => storage
-                    .get_at(&sk, version)
-                    .await
-                    .expect("storage get_at")
-                    .map(|vv| vv.value),
-            };
+            let value = storage
+                .get_at(&sk, version)
+                .await
+                .expect("storage get_at")
+                .map(|vv| vv.value);
             observed.insert(key, value);
         }
         reads
@@ -1005,7 +753,6 @@ async fn drive<E: Env, S: StorageEngine + 'static>(
     core: Arc<Mutex<AccordCore>>,
     storage: S,
     reads: ReadResults,
-    sink: Option<Arc<DataSink<E>>>,
     all_nodes: Vec<NodeId>,
 ) {
     // Recover from the WAL before serving anything.
@@ -1021,16 +768,8 @@ async fn drive<E: Env, S: StorageEngine + 'static>(
             // the recovered reads in that order.
             (guard.drain_apply(), guard.drain_reads())
         };
-        // Recovery re-applies into the *local* engine only (the per-node recovery
-        // substrate): the data plane already holds the committed writes durably,
-        // so there is no need to re-push them on every restart. For the same
-        // reason recovered reads are re-satisfied from the *local* engine
-        // (`None` sink) — the writes ordered before each recovered read were
-        // re-applied locally just above, so the recovered observation matches the
-        // original; a live data-plane quorum read would instead reflect current
-        // (possibly newer) state.
-        apply_all::<E, S>(&storage, None, &applies).await;
-        satisfy_reads::<E, S>(&storage, None, &reads, &read_effects).await;
+        apply_all(&storage, &applies).await;
+        satisfy_reads(&storage, &reads, &read_effects).await;
     }
 
     loop {
@@ -1047,7 +786,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(
         };
         // Durable before action: fsync the core's state changes (e.g. a Commit
         // we just executed) before applying effects and shipping messages.
-        persist_then_ship(&env, &core, &storage, &reads, &sink, outs);
+        persist_then_ship(&env, &core, &storage, &reads, outs);
     }
 }
 
@@ -1078,7 +817,6 @@ async fn retry_loop<E: Env, S: StorageEngine + 'static>(
     core: Arc<Mutex<AccordCore>>,
     storage: S,
     reads: ReadResults,
-    sink: Option<Arc<DataSink<E>>>,
 ) {
     let mut interval = RETRY_BASE_INTERVAL;
     // The number of messages owed on the previous tick, to detect progress.
@@ -1100,7 +838,7 @@ async fn retry_loop<E: Env, S: StorageEngine + 'static>(
         }
         last_owed = owed;
         if !outs.is_empty() {
-            persist_then_ship(&env, &core, &storage, &reads, &sink, outs);
+            persist_then_ship(&env, &core, &storage, &reads, outs);
         }
     }
 }
@@ -1161,7 +899,6 @@ async fn liveness_loop<E: Env, S: StorageEngine + 'static>(
     core: Arc<Mutex<AccordCore>>,
     storage: S,
     reads: ReadResults,
-    sink: Option<Arc<DataSink<E>>>,
 ) {
     // Per-txn stall tracking. A txn drops out once it commits (no longer in
     // `uncommitted_txns`), so this stays bounded by the in-flight set.
@@ -1226,7 +963,7 @@ async fn liveness_loop<E: Env, S: StorageEngine + 'static>(
                 c.recover(txn)
             };
             if !outs.is_empty() {
-                persist_then_ship(&env, &core, &storage, &reads, &sink, outs);
+                persist_then_ship(&env, &core, &storage, &reads, outs);
             }
         }
     }

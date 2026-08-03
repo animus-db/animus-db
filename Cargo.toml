@@ -20,7 +20,6 @@ animus-env = { path = "crates/animus-env" }
 animus-sim = { path = "crates/animus-sim" }
 animus-storage = { path = "crates/animus-storage" }
 animus-control = { path = "crates/animus-control" }
-animus-data = { path = "crates/animus-data" }
 animus-tablet = { path = "crates/animus-tablet" }
 animus-placement = { path = "crates/animus-placement" }
 animus-consensus = { path = "crates/animus-consensus" }

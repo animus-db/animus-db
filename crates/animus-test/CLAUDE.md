@@ -20,8 +20,8 @@ properties; it also hosts cross-crate fault sweeps.
 
 - **Indeterminate outcomes (e.g. a timeout) MUST be recorded `info`, never
   `fail`.** `fail` asserts the op definitely did not happen; misclassifying
-  makes a checker draw false conclusions. The data-plane harnesses follow this:
-  a non-quorum write is `info`.
+  makes a checker draw false conclusions. The harnesses follow this: a transaction
+  whose commit could not be confirmed (a crash/partition) is `info`.
 - `check_cycles` is the core Elle idea: recover each key's append order from
   observed reads, build wr/ww/**rw** edges, run Tarjan SCC. The `rw`
   anti-dependency rule (a read precedes the appenders of values it did *not*
@@ -34,50 +34,46 @@ properties; it also hosts cross-crate fault sweeps.
 
 ## Tests
 
-`cargo test -p animus-test` — `cycle_checker.rs` (hand-built histories),
-`ap_data_plane.rs` and `fault_sweep.rs` (the real quorum data plane through the
-recorder, including an injected lost write), and `end_to_end.rs` (the **whole
-assembled stack**: a 3-node control-plane Raft owning a 2-tablet map, six data
-replicas with background anti-entropy, four concurrent client coordinators
-running list-append over disjoint keys spanning both tablets, faults injected
-mid-run — partition + control-plane leader kill + data-replica crash + heal —
-then all three checkers run over the recorded history; `dev-deps` on
-`animus-control` for this).
+`cargo test -p animus-test` — `cycle_checker.rs` (hand-built histories) + the
+Accord serializability corpus + the CP-plane corpus below. (v1 is CP-only,
+ADR 0019: the AP data-plane test files — `ap_data_plane.rs`, `fault_sweep.rs`, the
+assembled-stack `end_to_end.rs` — were removed with `animus-data`, as was the
+`Frontier` topology.)
 
 ### Elle-against-Accord + the frozen scenario corpus (ADR 0014)
 
-`end_to_end.rs`'s disjoint-key workload can never form a serializability cycle,
-so it doesn't actually exercise `check_cycles`. The Accord-targeted suite does:
+The Accord-targeted suite exercises `check_cycles` under contention:
 
 - `negative_control.rs` — the **teeth proof**: hand-built non-serializable
   histories (write skew G2, circular read dep G1c, a 3-txn cycle) the checker
   *must* reject, plus serializable ones it must accept. Run/read this before
   trusting any green corpus run.
-- `support/mod.rs` — the shared harness: assembles an Accord replica set wired to
-  the data plane (`start_with_data_plane`), drives **concurrent conflicting**
-  multi-key read/write transactions over a small shared key space as **genuine
-  black-box list-append** (real list values stored and observed — see below),
-  records an Elle list-append `History`, and runs all three checkers. Also defines
-  the declarative `Scenario` / `NemesisAction` model, the `run_scenario` runner,
-  and the frozen `corpus()` generator.
+- `support/mod.rs` — the shared harness: assembles a **pure-Accord** replica set
+  (`AccordNode::start` — local execution + versioned-snapshot reads, the
+  serialization authority), drives **concurrent conflicting** multi-key read/write
+  transactions over a small shared key space as **genuine black-box list-append**
+  (real list values stored and observed — see below), records an Elle list-append
+  `History`, and runs all three checkers. Also defines the declarative `Scenario` /
+  `NemesisAction` model, the `run_scenario` runner, and the frozen `corpus()`
+  generator. (The former `Frontier` topology + the data-plane scaffolding were
+  removed in v1.)
 - `elle_accord.rs` — Accord under contention: a no-fault contended run + seed
   sweep + a determinism check, with teeth-guards asserting the run genuinely
   contended.
 - `corpus.rs` — the parametric runner over the **frozen, named, seeded** corpus
   (119 base scenarios: fault type × timing × workload shape × cluster shape, plus
   baselines and compound lossy/overlapping scenarios), a coverage guard, a
-  non-vacuity guard, a determinism check, the seed-expansion / extended-tier
-  structural guards, and the **frontier corpus**
-  (`frontier_corpus_converges_and_is_durable`). Coverage scales by two env knobs
-  (depth/breadth — see below); the headline `corpus_is_consistent` runs the
-  env-scaled `corpus()`, the structural guards run the env-independent
-  `corpus_base()`.
+  non-vacuity guard, a determinism check, and the seed-expansion / extended-tier
+  structural guards. The headline `corpus_is_consistent` asserts **serializability**
+  (`check_cycles`) over the env-scaled `corpus()`; the structural guards run the
+  env-independent `corpus_base()`. Coverage scales by two env knobs (depth/breadth —
+  see below).
 
 ### Elle-against-Raft: the leaderful (CP) plane corpus (ADR 0017)
 
 - `raftkv_linearizable.rs` — the **CP counterpart** of the Accord corpus, for the
-  `animus-cp-data` leaderful data plane. Crucially it is **not** a `Topology`
-  variant of `support/mod.rs`: that harness drives **multi-key transactions** via
+  `animus-cp-data` leaderful data plane. Crucially it is **not** built on
+  `support/mod.rs`: that harness drives **multi-key transactions** via
   `AccordNode`, but the Raft KV plane is **single-tablet, non-transactional KV**
   (`put`/`delete`/`linearizable_get`, one key per op), so the transactional
   workload can't run over it. The file is self-contained — it reuses only the
@@ -85,7 +81,7 @@ so it doesn't actually exercise `check_cycles`. The Accord-targeted suite does:
   `Recorder`/`History` model — and drives a **single-key list-append** workload
   over one Raft group (clients route each op to the current leader, tolerating
   crashes/partitions → `info`).
-- **Serializability is sound *and* asserted here** (unlike the AP `Frontier`): a
+- **Serializability is sound *and* asserted here**: a
   single Raft group *is* the serialization authority, so a forked/stale read (the
   failure a deposed leader would cause) shows up as a `check_cycles` cycle. There
   is no eventually-consistent read path to manufacture torn-read false positives,
@@ -114,34 +110,16 @@ so it doesn't actually exercise `check_cycles`. The Accord-targeted suite does:
 - **Tiering.** Default `cargo test` → `K=1`, no FULL → the frozen 119. Deep tier
   (`ANIMUS_CORPUS_SEEDS=40 ANIMUS_CORPUS_FULL=1`) runs **nightly** in CI
   (`.github/workflows/corpus-deep.yml`), not per-push.
-- **`Topology` is load-bearing, and so is the safety-vs-eventual split.** Two
-  orthogonal rules decide *which* checker is sound *where* + *at what depth*:
-  - **By layer (which topology).** `check_cycles` (serializability) is sound only
-    on **`Authoritative`** — pure Accord (`AccordNode::start`): local execution +
-    versioned-snapshot reads (`get_at(execute_at)`), fault-robust. The
-    **`Frontier`** topology (`start_with_data_plane`) is the AP data plane; its
-    quorum read is only eventually consistent, so under a fault a read can observe
-    a torn multi-key write — pointing `check_cycles` there gave cycle-only false
-    positives (`wide_write` cells), so **never** assert serializability on the
-    frontier. Convergence + durability are the **data plane's** guarantees, checked
-    on the frontier.
-  - **By property class (at what depth).** **Serializability is a *safety*
-    property** → asserted on `Authoritative` and **scaled to the full deep tier**
-    (`corpus_is_consistent` over `corpus()`); it held 7,560/7,560.
-    **Convergence + durability are *eventual* properties** (anti-entropy +
-    coordinator retry) → asserted on `Frontier` with a **converged-or-timeout**
-    verdict (`frontier_corpus_converges_and_is_durable` over the env-scaled
-    `corpus()`), so they now **scale to depth** like serializability. The runner
-    snapshots the history (the `cycles` verdict) after the fixed `DRAIN`, then drives
-    a **bounded poll** (`run_for(CONVERGENCE_POLL_STEP)` up to `CONVERGENCE_BUDGET`),
-    re-reading the two final replicas and stopping early once they converge AND every
-    acked append is durable. This removes the false deadline a *fixed* drain imposed:
-    a compound fault that left anti-entropy in flight at a fixed window (deep tier:
-    `lossy_stop_restart_mid_s36`, `ext_t_stop_restart_winddown_s39`) now gets time to
-    heal; if the generous bound elapses without converging, that is a **genuine**
-    failure surfaced with scenario+seed+divergence. Keep the poll a pure function of
-    the seed (`run_for`/`run_until` only). See the root CLAUDE.md engineering-practices
-    note + ADR 0014.
+- **Serializability is the corpus's safety property, scaled to depth.**
+  `check_cycles` is sound on **pure Accord** (`AccordNode::start`: local execution +
+  versioned-snapshot reads `get_at(execute_at)`, fault-robust), which is the only
+  layer the corpus now runs (v1 is CP-only). Serializability is a *safety* property,
+  so `corpus_is_consistent` asserts it over the full env-scaled `corpus()` and it
+  scales to the deep tier (it held 7,560/7,560 historically). (Pre-v1 the corpus also
+  ran a `Frontier` topology — Accord wired to the AP data plane — checked only for
+  **convergence + durability** because its quorum read is eventually consistent and
+  would give `check_cycles` torn-read false positives; that topology + check went
+  with `animus-data`, ADR 0019.)
 
 - **Genuine black-box list-append over Accord (ADR 0014, closed limitation).**
   With **arbitrary write values** (ADR 0011) each key stores a *real list value*:
@@ -168,10 +146,11 @@ so it doesn't actually exercise `check_cycles`. The Accord-targeted suite does:
   failure / divergent read — not a consistency bug. Cross-transaction conflict
   (the wr/rw/ww edges) still comes from multi-key transactions and from reads
   observing keys *other* clients write. **A client builds each append on its own
-  authoritative in-memory list**, *not* a begin-time quorum read: the apply marks
-  a txn `Applied` before its fire-and-forget data-plane write lands, so a
-  begin-time read can see a stale base and lose the client's own earlier appends
-  (this bit during development — the seed sweep caught it as a divergent read).
+  authoritative in-memory list**, *not* a begin-time read: the apply marks a txn
+  `Applied` before the driver's spawned task has merged the write into the engine,
+  so a begin-time read can see a stale base and lose the client's own earlier
+  appends (this bit during development — the seed sweep caught it as a divergent
+  read).
 - **The corpus is a committed generator, not a live-random test.** Each
   scenario's seed is a stable hash of its name, so the suite runs the same set
   every time and a failure names one scenario + seed. Regenerating/growing it is

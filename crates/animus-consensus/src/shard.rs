@@ -10,9 +10,9 @@
 //! ## What lives here
 //!
 //! - [`ShardRouter`]: maps an Accord [`Key`] to the [`Tablet`] (id + replica set)
-//!   that owns it, derived from the **existing tablet map** (`animus-tablet`,
-//!   `animus-data::Router`) — no new control-plane state. It groups a
-//!   transaction's keys into one per-tablet slice.
+//!   that owns it, derived from the **existing tablet map** (`animus-tablet`) — no
+//!   new control-plane state. It groups a transaction's keys into one per-tablet
+//!   slice.
 //! - [`ShardedOwner`]: what a *physical* node runs. A node typically replicates
 //!   several tablets, so it hosts **one [`AccordNode`] per local shard** (one per
 //!   tablet whose replica set includes this node), each on its **own** `Env`
@@ -45,7 +45,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use animus_data::Router;
 use animus_env::{Env, NodeId};
 use animus_storage::{MemoryEngine, StorageEngine};
 use animus_tablet::{Tablet, TabletId};
@@ -56,9 +55,9 @@ use crate::node::AccordNode;
 /// Maps an Accord [`Key`] to the tablet (consensus group) that owns it.
 ///
 /// Derived from the **existing tablet map** — the same `Vec<Tablet>` the control
-/// plane's `Metadata` holds and `animus-data`'s `Router` routes data-plane I/O
-/// with — so per-shard consensus adds **no** new control-plane state (ADR 0011 /
-/// ADR 0001: the tablet map is the single source of placement truth). The tablets
+/// plane's `Metadata` holds — so per-shard consensus adds **no** new control-plane
+/// state (ADR 0011 / ADR 0001: the tablet map is the single source of placement
+/// truth). The tablets
 /// are expected to partition the keyspace into disjoint ranges (the control plane
 /// maintains this via split/merge).
 ///
@@ -139,15 +138,6 @@ impl ShardRouter {
             }
         }
         out
-    }
-
-    /// An `animus-data::Router` over the same tablet map, with the given quorum
-    /// sizes, for wiring each group's data-plane execution effect to its own
-    /// tablet's replica set (the frontier). Convenience so a caller need not keep
-    /// the tablet `Vec` twice.
-    #[must_use]
-    pub fn data_router(&self, r: usize, w: usize) -> Router {
-        Router::new(self.tablets.clone(), r, w)
     }
 }
 

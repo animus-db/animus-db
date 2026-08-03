@@ -10,6 +10,14 @@
   fencing; then **per-shard consensus** — one Accord group per tablet; then the
   **transitive dependency wait-graph** + the **precise fast-path quorum bound** +
   **WAL snapshotting / log truncation**)
+- **Amended for v1 by [ADR 0019](0019-cp-only-v1-defer-ap.md):** the **AP
+  data-plane frontier** paths (`start_with_data_plane`/`start_with_router`,
+  `DataSink`/`DataRouting`, data-plane reads — landing committed writes in the
+  leaderless `animus-data` quorum and reading them back) are **removed** with the AP
+  plane. Pure Accord (local execution + versioned-snapshot reads, the serialization
+  authority), per-shard consensus, recovery, retry, and the interactive API are
+  unchanged. "Effect-sharding" (one global Accord round, AP-routed effect) is gone;
+  "per-shard consensus" (one group per tablet) stays.
 - **Date:** 2026-08-01 (execution + durability increment: 2026-08-01;
   storage-backed execution + coordinator-failover increment: 2026-08-01;
   read-transactions + multi-thread-liveness increment: 2026-08-02;

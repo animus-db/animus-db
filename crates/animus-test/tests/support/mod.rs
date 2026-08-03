@@ -54,33 +54,19 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use animus_consensus::{AccordNode, Key, TxnId};
-use animus_data::{TabletView, serve_replica};
 use animus_env::{Clock, EnvExt, Rng};
 use animus_sim::{NetConfig, SimEnv, Simulator};
-use animus_storage::MemoryEngine;
-use animus_tablet::{Epoch, KeyRange, Tablet, TabletId};
 use animus_test::history::{Mop, Process};
 use animus_test::{History, Recorder, check_convergence, check_cycles, check_durability};
 
 // --- Topology. One inbox per node id (single-consumer), so every role gets a
-// distinct id. Accord replicas, each Accord node's own data-plane coordinator,
-// the data-plane replicas, and a standalone verifier. We size for up to 7 Accord
-// replicas + 7 data replicas; smaller clusters use a prefix. The id *bands*
-// (0.., 10.., 20..) stay disjoint up to 7 each so a 7+7 shape never collides. ---
+// distinct id. v1 (ADR 0019) is CP-only: the corpus drives **pure Accord** (the
+// serialization authority), so the only role is the Accord replica set (the AP
+// data-plane frontier is gone with `animus-data`). Sized for up to 7 replicas; a
+// smaller cluster uses a prefix. ---
 
 /// Accord consensus replica node ids.
 const ACCORD_IDS: [u64; 7] = [0, 1, 2, 3, 4, 5, 6];
-/// Per-Accord-node data-plane coordinator ids (distinct inbox per coordinator).
-const COORD_IDS: [u64; 7] = [10, 11, 12, 13, 14, 15, 16];
-/// Data-plane replica node ids.
-const DATA_IDS: [u64; 7] = [20, 21, 22, 23, 24, 25, 26];
-/// Standalone verifier coordinator for final quorum snapshots.
-const VERIFIER: u64 = 30;
-
-/// Quorum read/write thresholds for the data plane. With the default 3 data
-/// replicas this is the usual `R + W > N`.
-const R: usize = 2;
-const W: usize = 2;
 
 /// How long a single client op waits (polling `is_applied`) before recording it
 /// as indeterminate (`info`). Generous so a slow but eventually-consistent commit
@@ -212,29 +198,6 @@ pub enum NemesisAction {
     /// failure-detector-bound hazard documented in the root CLAUDE.md). Healed by
     /// `HealAll` (which restores the default `NetConfig`).
     SlowLinks,
-}
-
-/// Which layer the cluster's reads observe — i.e. *what the checkers can soundly
-/// assert*. This is the load-bearing distinction the repo principle demands:
-/// serializability is a property of **Accord's order**, not of the AP data plane.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Topology {
-    /// **Pure Accord** (no data-plane sink): each replica executes the agreed
-    /// order into its **local** store and a read is a versioned snapshot
-    /// (`get_at(key, execute_at)`) — exactly the writes ordered before it, none
-    /// after, identically on every replica. This is the serialization-authoritative
-    /// layer and the **only sound target for the cycle (serializability) check**.
-    /// Robust to faults: a fault delays/strands consensus but never makes a read
-    /// observe a torn or stale order.
-    Authoritative,
-    /// **Accord wired to the replicated AP data-plane frontier**
-    /// (`start_with_data_plane`): a committed write is pushed through the quorum
-    /// (fire-and-forget) and a read is a *current quorum read*. Eventually
-    /// consistent: under a data-replica fault an acked multi-key write can be
-    /// transiently torn/stale at a read quorum (it converges via anti-entropy).
-    /// So this layer is checked for **convergence + durability** — what the AP
-    /// data plane offers — **never** serializability.
-    Frontier,
 }
 
 /// A declarative, seed-reproducible test scenario: a named cluster shape +
@@ -693,16 +656,15 @@ pub fn corpus_extended() -> Vec<Scenario> {
 // The running cluster.
 // ---------------------------------------------------------------------------
 
-/// A live Accord cluster plus the shared workload recorder. The cluster is either
-/// pure-Accord ([`Topology::Authoritative`]) or wired to the AP data-plane
-/// frontier ([`Topology::Frontier`]); the [`Cluster::topology`] field records
-/// which, so faults that target the data plane behave correctly in each.
+/// A live **pure-Accord** cluster plus the shared workload recorder. Each replica
+/// executes the agreed order into its local store and a read is a versioned
+/// snapshot — the serialization-authoritative layer, the sound target for the
+/// cycle (serializability) check (v1 is CP-only; the AP data-plane frontier topology
+/// is gone with `animus-data`, ADR 0019).
 pub struct Cluster {
     sim: Simulator,
     nodes: Vec<AccordNode<SimEnv>>,
-    view: TabletView,
     shape: ClusterShape,
-    topology: Topology,
     shared: Arc<Shared>,
     /// Accord replica ids that have been stopped and not yet re-started.
     stopped: BTreeSet<u64>,
@@ -766,51 +728,22 @@ fn slow_links() -> NetConfig {
     cfg
 }
 
-/// Construct Accord replica `i` in the given topology: pure-Accord
-/// ([`AccordNode::start`] — local execution + snapshot reads, the serialization
-/// authority) or wired to the data-plane frontier ([`AccordNode::start_with_data_plane`]).
-fn make_node(
-    sim: &Simulator,
-    all: &[u64],
-    i: usize,
-    topology: Topology,
-    view: &TabletView,
-) -> AccordNode<SimEnv> {
-    match topology {
-        Topology::Authoritative => AccordNode::start(sim.env(ACCORD_IDS[i]), all.to_vec()),
-        Topology::Frontier => AccordNode::start_with_data_plane(
-            sim.env(ACCORD_IDS[i]),
-            all.to_vec(),
-            MemoryEngine::new(),
-            sim.env(COORD_IDS[i]),
-            view.clone(),
-        ),
-    }
+/// Construct pure-Accord replica `i` ([`AccordNode::start`] — local execution +
+/// snapshot reads, the serialization authority).
+fn make_node(sim: &Simulator, all: &[u64], i: usize) -> AccordNode<SimEnv> {
+    AccordNode::start(sim.env(ACCORD_IDS[i]), all.to_vec())
 }
 
 impl Cluster {
-    /// Bring up an Accord replica set in the given [`Topology`]. In both modes the
-    /// data-plane replicas + `view` are created (so partition/crash/heal nemeses
-    /// behave identically); the modes differ only in how the Accord nodes are
-    /// wired — pure (local execution + snapshot reads) vs. frontier (data-plane
-    /// quorum writes/reads).
-    pub fn start(seed: u64, shape: ClusterShape, topology: Topology) -> Cluster {
+    /// Bring up a pure-Accord replica set. `shape.data_replicas` is retained in the
+    /// scenario model but no longer materialises a data plane (v1 is CP-only).
+    pub fn start(seed: u64, shape: ClusterShape) -> Cluster {
         let sim = Simulator::new(seed);
         let a = shape.accord_replicas;
-        let d = shape.data_replicas;
-        assert!((3..=7).contains(&a) && (3..=7).contains(&d));
-
-        // Data-plane replicas over the whole key space.
-        for &id in &DATA_IDS[..d] {
-            serve_replica(sim.env(id), MemoryEngine::new(), Epoch::INITIAL);
-        }
-        let tablet = Tablet::new(TabletId(1), KeyRange::whole(), DATA_IDS[..d].to_vec());
-        let view = TabletView::from_tablet(&tablet, R, W);
+        assert!((3..=7).contains(&a) && (3..=7).contains(&shape.data_replicas));
 
         let all = accord_ids(a);
-        let nodes: Vec<AccordNode<SimEnv>> = (0..a)
-            .map(|i| make_node(&sim, &all, i, topology, &view))
-            .collect();
+        let nodes: Vec<AccordNode<SimEnv>> = (0..a).map(|i| make_node(&sim, &all, i)).collect();
 
         let shared = Arc::new(Shared {
             rec: Mutex::new(Recorder::new(seed)),
@@ -820,9 +753,7 @@ impl Cluster {
         Cluster {
             sim,
             nodes,
-            view,
             shape,
-            topology,
             shared,
             stopped: BTreeSet::new(),
             crashed: BTreeSet::new(),
@@ -873,18 +804,11 @@ impl Cluster {
             }
             NemesisAction::IsolateOne => {
                 let victim = ids[a - 1];
-                // Isolate from all Accord peers, all data replicas, and all
-                // coordinators.
+                // Isolate from all Accord peers.
                 for &o in &ids {
                     if o != victim {
                         self.sim.partition_pair(victim, o);
                     }
-                }
-                for &d in &DATA_IDS[..self.shape.data_replicas] {
-                    self.sim.partition_pair(victim, d);
-                }
-                for &co in &COORD_IDS[..a] {
-                    self.sim.partition_pair(victim, co);
                 }
             }
             NemesisAction::Crash => {
@@ -895,29 +819,20 @@ impl Cluster {
             NemesisAction::StopRestart => {
                 let victim = ids[a - 1];
                 self.sim.stop(victim);
-                // Start a fresh node on the same id (recovers from its WAL), in the
-                // same topology as the rest of the cluster.
-                let fresh = make_node(&self.sim, &ids, a - 1, self.topology, &self.view);
+                // Start a fresh node on the same id (recovers from its WAL).
+                let fresh = make_node(&self.sim, &ids, a - 1);
                 self.nodes[a - 1] = fresh;
             }
             NemesisAction::LeaderKill => {
-                // In Frontier mode, crash the first *data* replica (the one in every
-                // R=2 quorum) to force quorums onto the rest. In Authoritative mode
-                // the data plane is idle, so target the first *Accord* replica
-                // instead (distinct from `Crash`, which downs the last one) — losing
-                // a hot consensus node.
-                let victim = match self.topology {
-                    Topology::Frontier => DATA_IDS[0],
-                    Topology::Authoritative => ids[0],
-                };
+                // Crash the first *Accord* replica (distinct from `Crash`, which
+                // downs the last one) — losing a hot consensus node.
+                let victim = ids[0];
                 self.sim.crash(victim);
                 self.crashed.insert(victim);
             }
             NemesisAction::HealAll => {
-                // Heal every partition among Accord/data/coordinator nodes.
-                let mut all: Vec<u64> = ids.clone();
-                all.extend_from_slice(&DATA_IDS[..self.shape.data_replicas]);
-                all.extend_from_slice(&COORD_IDS[..a]);
+                // Heal every partition among the Accord nodes.
+                let all: Vec<u64> = ids.clone();
                 for i in 0..all.len() {
                     for j in (i + 1)..all.len() {
                         self.sim.heal(all[i], all[j]);
@@ -1192,21 +1107,14 @@ pub struct ScenarioResult {
     pub contended: bool,
 }
 
-/// Run a scenario against the **serialization-authoritative** topology (pure
-/// Accord). This is the sound target for the cycle (serializability) check; all
-/// three checkers are meaningful and robust to faults. The corpus uses this.
+/// Run a scenario end to end against the **serialization-authoritative** pure-Accord
+/// cluster: bring up the cluster, spawn the workload, apply the fault schedule at
+/// the listed virtual times while the workload runs, heal, quiesce, snapshot two
+/// final reads, and run all three checkers. Pure Accord is the sound target for the
+/// cycle (serializability) check, and all three checkers are meaningful and robust
+/// to faults (v1 is CP-only; the AP data-plane frontier topology is gone).
 pub fn run_scenario(scenario: &Scenario) -> ScenarioResult {
-    run_scenario_with(scenario, Topology::Authoritative)
-}
-
-/// Run a scenario end to end in the given [`Topology`]: bring up the cluster,
-/// spawn the workload, apply the fault schedule at the listed virtual times while
-/// the workload runs, heal, quiesce, snapshot two final reads, and run all three
-/// checkers. In [`Topology::Frontier`] the `cycles` report is **not** sound to
-/// assert (the AP read path is only eventually consistent under faults) — assert
-/// `convergence` + `durability` there, which is what the data plane offers.
-pub fn run_scenario_with(scenario: &Scenario, topology: Topology) -> ScenarioResult {
-    let mut cluster = Cluster::start(scenario.seed, scenario.cluster, topology);
+    let mut cluster = Cluster::start(scenario.seed, scenario.cluster);
 
     // Let the cluster settle, then start the concurrent workload.
     cluster.sim.run_for(Duration::from_millis(500));
