@@ -69,6 +69,72 @@ fn put(nodes: &[KvNode], live: &[usize], seed: u64, key: &[u8], value: &[u8]) {
     ));
 }
 
+/// Run a linearizable range scan to completion (spawned, since it awaits a read
+/// barrier), driving the sim up to `budget`.
+#[allow(clippy::type_complexity)]
+fn lin_scan(
+    sim: &mut Simulator,
+    node: &KvNode,
+    start: &[u8],
+    end: &[u8],
+    budget: Duration,
+) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
+    let slot: Arc<Mutex<Option<Option<Vec<(Vec<u8>, Vec<u8>)>>>>> = Arc::new(Mutex::new(None));
+    let n = node.clone();
+    let s = Arc::clone(&slot);
+    let (lo, hi) = (start.to_vec(), end.to_vec());
+    node.env().clone().spawn_task(async move {
+        *s.lock().unwrap() = Some(n.linearizable_scan(&lo, &hi, None).await);
+    });
+    sim.run_for(budget);
+    slot.lock().unwrap().clone().expect("scan did not complete")
+}
+
+#[test]
+fn linearizable_scan_returns_sorted_live_range() {
+    let seed = 0x5CA4;
+    let (mut sim, nodes) = group(seed);
+    sim.run_for(Duration::from_secs(2));
+    let l = leader(&nodes, &[0, 1, 2], seed);
+
+    // Write keys out of order; the scan must return them key-sorted.
+    for (k, v) in [(b"k3", b"v3"), (b"k1", b"v1"), (b"k2", b"v2")] {
+        put(&nodes, &[0, 1, 2], seed, k, v);
+    }
+    sim.run_for(Duration::from_secs(1));
+
+    // Half-open [k1, k3): k1, k2 — not k3.
+    assert_eq!(
+        lin_scan(&mut sim, &nodes[l], b"k1", b"k3", Duration::from_secs(2)),
+        Some(vec![
+            (b"k1".to_vec(), b"v1".to_vec()),
+            (b"k2".to_vec(), b"v2".to_vec()),
+        ]),
+    );
+    // Whole range covers all three, sorted.
+    assert_eq!(
+        lin_scan(&mut sim, &nodes[l], b"k0", b"k9", Duration::from_secs(2)),
+        Some(vec![
+            (b"k1".to_vec(), b"v1".to_vec()),
+            (b"k2".to_vec(), b"v2".to_vec()),
+            (b"k3".to_vec(), b"v3".to_vec()),
+        ]),
+    );
+
+    // A non-leader cannot serve a linearizable scan (no read barrier) → None.
+    let follower = (0..3).find(|&i| i != l).unwrap();
+    assert_eq!(
+        lin_scan(
+            &mut sim,
+            &nodes[follower],
+            b"k0",
+            b"k9",
+            Duration::from_secs(2)
+        ),
+        None,
+    );
+}
+
 #[test]
 fn linearizable_read_reflects_committed_writes() {
     let seed = 0x1EAD;

@@ -333,10 +333,57 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// stale value: a deposed leader cannot collect a quorum ack (a newer leader
     /// requires a quorum at a higher term, which would reject the probe).
     pub async fn linearizable_get(&self, key: &[u8]) -> Option<Vec<u8>> {
+        if self.read_barrier().await {
+            self.local_get(key).await
+        } else {
+            None
+        }
+    }
+
+    /// A **linearizable range scan** via ReadIndex (ADR 0017 / v1): the live
+    /// `(key, value)` pairs with `start <= key < end`, sorted by key, up to
+    /// `limit`. Same barrier as [`linearizable_get`](Self::linearizable_get) — only
+    /// the confirmed leader serves it, so a deposed leader returns `None` rather
+    /// than a stale/partial range. This is the CP read primitive the DynamoDB
+    /// `Query`/`Scan` and CQL `SELECT` edges use in place of the AP quorum scan.
+    pub async fn linearizable_scan(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        limit: Option<usize>,
+    ) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
+        if !self.read_barrier().await {
+            return None;
+        }
+        let mut pairs: Vec<(Vec<u8>, Vec<u8>)> = self
+            .storage
+            .entries()
+            .await
+            .ok()?
+            .into_iter()
+            .filter(|(k, _)| k.as_slice() >= start && k.as_slice() < end)
+            .map(|(k, vv)| (k, vv.value))
+            .collect();
+        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        if let Some(n) = limit {
+            pairs.truncate(n);
+        }
+        Some(pairs)
+    }
+
+    /// The **ReadIndex read barrier** (ADR 0017 B.2): record `read_index =
+    /// commit_index` for the current term, confirm via a quorum of read-probe acks
+    /// that we are still the leader for that term (no log entry, no wall clock),
+    /// and wait until applied state reaches `read_index`. Returns `true` when it is
+    /// safe to serve a local read linearizably; `false` if this node is not (or
+    /// stops being) the leader, or confirmation times out — so a deposed leader
+    /// never serves a stale read (a newer leader needs a quorum at a higher term,
+    /// which rejects the probe). Shared by `linearizable_get` + `linearizable_scan`.
+    async fn read_barrier(&self) -> bool {
         let (term, read_index) = {
             let c = self.lock();
             if !c.is_leader() {
-                return None;
+                return false;
             }
             (c.term(), c.commit_index())
         };
@@ -362,7 +409,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
 
         let majority = self.majority();
         let deadline = self.env.now().0 + READ_TIMEOUT.as_nanos() as u64;
-        let result = loop {
+        let ok = loop {
             // Still the leader for this term? A step-down/term change invalidates
             // the barrier — fail rather than risk a stale read.
             let still_leader = {
@@ -377,10 +424,10 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             };
             let applied = self.lock().last_applied() >= read_index;
             if !still_leader || self.env.now().0 >= deadline {
-                break None;
+                break false;
             }
             if confirmed && applied {
-                break self.local_get(key).await;
+                break true;
             }
             self.env.sleep(READ_POLL).await;
         };
@@ -389,7 +436,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             .expect("read state poisoned")
             .pending
             .remove(&epoch);
-        result
+        ok
     }
 
     /// Whether this node currently believes it is the group's leader.
