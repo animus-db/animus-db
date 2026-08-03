@@ -15,8 +15,11 @@
 //! per-key LWW reproduces the agreed total order). Linearizable reads use
 //! **ReadIndex** ([`RaftKvNode::linearizable_get`]): a read-barrier quorum probe
 //! confirms current leadership (no log entry, no wall clock) before the leader
-//! serves from its local engine. Still ahead: streaming snapshots A.2;
-//! reconfiguration C; tablet split D.
+//! serves from its local engine. **A.2** adds compaction + streaming snapshots:
+//! the leader snapshots its engine image, truncates the Raft log prefix, and
+//! catches a lagging follower up via the chunked `InstallSnapshot` (engine bytes),
+//! which the follower writes into its own engine. Still ahead: reconfiguration C;
+//! tablet split D.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
@@ -82,6 +85,10 @@ enum KvWire {
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// Poll granularity while a linearizable read waits for confirmation.
 const READ_POLL: Duration = Duration::from_millis(20);
+
+/// Compact (snapshot the engine + truncate the Raft log prefix) once this many
+/// entries have been applied past the current snapshot base, bounding the WAL.
+const COMPACT_THRESHOLD: u64 = 64;
 
 /// Leader-side ReadIndex state: per in-flight read `epoch`, the term it was issued
 /// under and the set of peers (including self) that have confirmed leadership.
@@ -265,6 +272,16 @@ async fn flush_and_apply<E: Env, S: StorageEngine>(
             .mark_durable_through(through);
     }
 
+    // Install a fully-received snapshot (a follower catching up) into the engine
+    // *before* applying log-tail effects, so the tail merges on top of the base.
+    let pending_install = core
+        .lock()
+        .expect("raftkv core poisoned")
+        .drain_pending_install();
+    if let Some((_last_index, bytes)) = pending_install {
+        install_engine_image(storage, &bytes).await;
+    }
+
     // Apply the now-durable committed commands to the engine, in commit order.
     // The Raft index is the MVCC version: per-key LWW then reproduces the agreed
     // total order, and re-applying on recovery is idempotent.
@@ -284,6 +301,76 @@ async fn flush_and_apply<E: Env, S: StorageEngine>(
                     .expect("raftkv apply delete");
             }
             KvCommand::NoOp => {}
+        }
+    }
+
+    // Compact once enough has been applied: snapshot the engine image (so a
+    // lagging follower can be caught up via `InstallSnapshot`), truncate the Raft
+    // log prefix, and rewrite the WAL to its bounded image (ADR 0017 A.2). The
+    // engine itself is the durable snapshot for local recovery; the image bytes
+    // are only for shipping to a behind follower.
+    let behind = core
+        .lock()
+        .expect("raftkv core poisoned")
+        .applied_since_snapshot();
+    if behind >= COMPACT_THRESHOLD {
+        let image = engine_image(storage).await;
+        {
+            let mut c = core.lock().expect("raftkv core poisoned");
+            c.set_snapshot_blob(image);
+            c.snapshot();
+        }
+        let bytes = {
+            let c = core.lock().expect("raftkv core poisoned");
+            let mut buf = Vec::new();
+            for record in c.wal_image() {
+                buf.extend(PersistedState::encode_record(&record));
+            }
+            buf
+        };
+        env.replace(WAL, &bytes)
+            .await
+            .expect("raftkv wal compaction");
+        core.lock()
+            .expect("raftkv core poisoned")
+            .take_snapshot_dirty();
+    }
+}
+
+/// One key's snapshot entry: `(key, value-or-tombstone, version)`.
+type ImageEntry = (Vec<u8>, Option<Vec<u8>>, u64);
+
+/// Serialize the engine's full contents (including tombstones) as the snapshot
+/// image shipped to a lagging follower.
+async fn engine_image<S: StorageEngine>(storage: &S) -> Vec<u8> {
+    let entries: Vec<ImageEntry> = storage
+        .entries_with_tombstones()
+        .await
+        .expect("raftkv engine scan");
+    serde_json::to_vec(&entries).expect("engine image serializes")
+}
+
+/// Write a received snapshot image into the engine (a follower catching up),
+/// versioned so per-key LWW keeps it consistent with the log tail merged on top.
+async fn install_engine_image<S: StorageEngine>(storage: &S, bytes: &[u8]) {
+    let entries: Vec<ImageEntry> = match serde_json::from_slice(bytes) {
+        Ok(e) => e,
+        Err(err) => {
+            tracing::warn!(?err, "undecodable raftkv snapshot image dropped");
+            return;
+        }
+    };
+    for (key, value, version) in entries {
+        match value {
+            Some(v) => {
+                storage.merge(&key, &v, version).await.expect("install put");
+            }
+            None => {
+                storage
+                    .merge_tombstone(&key, version)
+                    .await
+                    .expect("install tombstone");
+            }
         }
     }
 }

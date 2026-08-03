@@ -270,6 +270,15 @@ pub struct RaftCore<C = MetaCommand, S = Metadata> {
     // Set when the snapshot base moved (a local snapshot or an installed one),
     // signalling the driver to rewrite the WAL rather than append.
     snapshot_dirty: bool,
+
+    // --- DRIVER_APPLIED snapshot streaming (ADR 0017 A.2). Unused by the in-core
+    // control plane (whose `InstallSnapshot` serializes `metadata` directly). ---
+    // The leader's current engine-image bytes to ship to a lagging follower; the
+    // driver refreshes this from the engine when it compacts (`set_snapshot_blob`).
+    snapshot_blob: Option<Vec<u8>>,
+    // A fully-received snapshot's `(last_index, bytes)` awaiting the driver writing
+    // it into the engine (`drain_pending_install`); set on install completion.
+    pending_install: Option<(u64, Vec<u8>)>,
 }
 
 impl<C, S> RaftCore<C, S>
@@ -307,6 +316,8 @@ where
             metadata: S::default(),
             applied: Vec::new(),
             pending_apply: Vec::new(),
+            snapshot_blob: None,
+            pending_install: None,
             pending: Vec::new(),
             persisted_hard: (0, None),
             snapshot_dirty: false,
@@ -492,6 +503,22 @@ where
     /// `apply` instead). Mirrors `AccordCore::drain_apply` (ADR 0017).
     pub fn drain_apply(&mut self) -> Vec<(u64, C)> {
         std::mem::take(&mut self.pending_apply)
+    }
+
+    /// Provide the engine-image bytes a `DRIVER_APPLIED` leader ships to a lagging
+    /// follower via `InstallSnapshot` (ADR 0017 A.2). The driver refreshes this
+    /// from the `StorageEngine` when it compacts, so the shipped snapshot matches
+    /// the (now-truncated) log prefix. No effect for an in-core state machine
+    /// (which serializes `metadata` directly).
+    pub fn set_snapshot_blob(&mut self, bytes: Vec<u8>) {
+        self.snapshot_blob = Some(bytes);
+    }
+
+    /// Take a fully-received snapshot's `(last_index, engine-image bytes)` for the
+    /// driver to write into the engine (a `DRIVER_APPLIED` follower catching up).
+    /// `None` when no install is pending.
+    pub fn drain_pending_install(&mut self) -> Option<(u64, Vec<u8>)> {
+        self.pending_install.take()
     }
 
     /// The next virtual instant at which this node wants a timer tick.
@@ -946,18 +973,40 @@ where
                 .incoming_snapshot
                 .take()
                 .expect("present when complete");
-            // A malformed snapshot would be a leader bug; drop the transfer and
-            // re-request on the next chunk rather than installing garbage.
+            // Advance the snapshot base + reset the log/applied state common to both
+            // state-machine kinds.
+            let install = |core: &mut Self| {
+                core.snapshot_index = inc.last_index;
+                core.snapshot_term = inc.last_term;
+                core.last_applied = inc.last_index;
+                core.commit_index = inc.last_index;
+                core.log.clear();
+                core.applied.clear();
+                core.snapshot_dirty = true;
+            };
+            if S::DRIVER_APPLIED {
+                // The bytes are the leader's engine image; the driver writes them
+                // into this follower's engine (`drain_pending_install`). The in-core
+                // `metadata` stays the unit placeholder.
+                let bytes = inc.buf;
+                install(self);
+                self.pending_install = Some((inc.last_index, bytes));
+                return vec![(
+                    leader,
+                    RaftMsg::InstallSnapshotResp {
+                        term: self.current_term,
+                        last_index: inc.last_index,
+                        next_offset: inc.total,
+                    },
+                )];
+            }
+            // In-core state machine: deserialize the image into `metadata`. A
+            // malformed snapshot would be a leader bug; drop + re-request rather
+            // than install garbage.
             match serde_json::from_slice::<S>(&inc.buf) {
                 Ok(state) => {
                     self.metadata = state;
-                    self.snapshot_index = inc.last_index;
-                    self.snapshot_term = inc.last_term;
-                    self.last_applied = inc.last_index;
-                    self.commit_index = inc.last_index;
-                    self.log.clear();
-                    self.applied.clear();
-                    self.snapshot_dirty = true;
+                    install(self);
                     return vec![(
                         leader,
                         RaftMsg::InstallSnapshotResp {
@@ -1111,7 +1160,14 @@ where
     /// Pure: it serializes the current `metadata` and slices out one chunk, so
     /// repeated calls at the same offset are byte-identical and deterministic.
     fn snapshot_chunk_for(&self, peer: NodeId) -> Out<C> {
-        let serialized = serde_json::to_vec(&self.metadata).expect("metadata serializes");
+        // A `DRIVER_APPLIED` state machine's image lives in the engine, not in
+        // `metadata`; the driver supplies it via `set_snapshot_blob`. An in-core
+        // state machine serializes its `metadata` directly.
+        let serialized = if S::DRIVER_APPLIED {
+            self.snapshot_blob.clone().unwrap_or_default()
+        } else {
+            serde_json::to_vec(&self.metadata).expect("metadata serializes")
+        };
         let total = serialized.len() as u64;
         let offset = self
             .snapshot_offset

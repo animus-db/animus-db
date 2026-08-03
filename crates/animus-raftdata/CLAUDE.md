@@ -59,7 +59,16 @@ the engine — the `AccordCore` sync-core/async-driver split.
   leader still leads its term, then it serves locally once applied. No log entry,
   no wall clock. `tests/read_index.rs` (reads reflect committed writes + RYW; a
   deposed/partitioned leader returns `None`, never a stale value).
-- **A.2** — engine-as-snapshot + streaming `InstallSnapshot` (follower catch-up).
+- **A.2 (done)** — compaction + streaming `InstallSnapshot`. The driver compacts
+  once `COMPACT_THRESHOLD` entries apply: it snapshots the **engine image**
+  (`set_snapshot_blob`), the core truncates the log prefix, and the WAL is
+  rewritten to its bounded image. A lagging follower (behind the compacted prefix)
+  is caught up by the chunked `InstallSnapshot` carrying the engine bytes, which
+  the driver writes into its engine (`drain_pending_install` → `merge`), then
+  replays the log tail on top. The `RaftCore` snapshot path branches on
+  `DRIVER_APPLIED` (engine blob vs. in-core `metadata`), so the control plane is
+  unchanged. `tests/snapshot_catchup.rs` (crash a follower, write past the
+  threshold so the leader compacts, restart → it catches up via snapshot).
 - **C** — per-tablet hosting + single-server Raft membership change (reconfigure on
   node failure, driven by the control plane).
 - **D** — tablet split on cluster growth.
