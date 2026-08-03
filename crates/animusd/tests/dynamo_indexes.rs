@@ -93,7 +93,7 @@ async fn scan_paginates_a_whole_table() {
     let bound = bind_cluster(3, "127.0.0.1".parse().unwrap(), dir.path())
         .await
         .unwrap();
-    let nodes = start_cluster(bound, 2, 2).await.unwrap(); // R = W = 2 over 3 replicas
+    let nodes = start_cluster(bound).await.unwrap(); // R = W = 2 over 3 replicas
     await_bootstrap(&nodes).await;
 
     let addr0 = nodes[0].dynamo_addr();
@@ -179,7 +179,7 @@ async fn gsi_write_then_query() {
     let bound = bind_cluster(3, "127.0.0.1".parse().unwrap(), dir.path())
         .await
         .unwrap();
-    let nodes = start_cluster(bound, 2, 2).await.unwrap();
+    let nodes = start_cluster(bound).await.unwrap();
     await_bootstrap(&nodes).await;
 
     let addr0 = nodes[0].dynamo_addr();
@@ -278,7 +278,7 @@ async fn scan_skips_deleted_items_and_paginates() {
     let bound = bind_cluster(3, "127.0.0.1".parse().unwrap(), dir.path())
         .await
         .unwrap();
-    let nodes = start_cluster(bound, 2, 2).await.unwrap();
+    let nodes = start_cluster(bound).await.unwrap();
     await_bootstrap(&nodes).await;
     let addr = nodes[0].dynamo_addr();
 

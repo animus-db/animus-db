@@ -122,10 +122,8 @@ async fn run_single(
         .await
         .map_err(|e| format!("failed to start node {index}: {e}"))?;
     println!(
-        "animusd: node {index}/{} up (R={}, W={}) — client {} — dynamo http {} — cql {}",
+        "animusd: node {index}/{} up (CP) — client {} — dynamo http {} — cql {}",
         config.len(),
-        config.r,
-        config.w,
         node.client_addr(),
         node.dynamo_addr(),
         node.cql_addr(),
@@ -147,15 +145,14 @@ async fn run_in_process_cluster(
         return Err("--cluster must be at least 1".into());
     }
     let dir = dir.unwrap_or_else(|| std::env::temp_dir().join("animusd"));
-    let majority = n / 2 + 1;
     let bound = animusd::bind_cluster(n, ip, &dir)
         .await
         .map_err(|e| format!("failed to bind cluster: {e}"))?;
-    let nodes = animusd::start_cluster_with(bound, majority, majority, backend)
+    let nodes = animusd::start_cluster_with(bound, backend)
         .await
         .map_err(|e| format!("failed to start cluster: {e}"))?;
 
-    println!("animusd: started {n}-node cluster (R={majority}, W={majority})");
+    println!("animusd: started {n}-node cluster (CP)");
     for (i, node) in nodes.iter().enumerate() {
         println!(
             "  node {i}: client {} — dynamo http {} — cql {}",

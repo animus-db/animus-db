@@ -71,23 +71,17 @@ async fn propose_on_leader(nodes: &[Node], command: MetaCommand) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn cp_op_on_a_non_leader_node_is_forwarded_to_the_leader() {
     let n = 3;
-    let addrs = free_addrs(n * 7);
+    let addrs = free_addrs(n * 5);
     let nodes_cfg: Vec<animusd::RoleAddrs> = (0..n)
         .map(|i| animusd::RoleAddrs {
-            control: addrs[7 * i],
-            data: addrs[7 * i + 1],
-            coord: addrs[7 * i + 2],
-            client: addrs[7 * i + 3],
-            dynamo: addrs[7 * i + 4],
-            cql: addrs[7 * i + 5],
-            raftkv: addrs[7 * i + 6],
+            control: addrs[5 * i],
+            client: addrs[5 * i + 1],
+            dynamo: addrs[5 * i + 2],
+            cql: addrs[5 * i + 3],
+            raftkv: addrs[5 * i + 4],
         })
         .collect();
-    let config = animusd::ClusterConfig {
-        nodes: nodes_cfg,
-        r: 2,
-        w: 2,
-    };
+    let config = animusd::ClusterConfig { nodes: nodes_cfg };
 
     // One node per process — each gets its own edge state via `run_node`.
     let dir = tempfile::tempdir().unwrap();

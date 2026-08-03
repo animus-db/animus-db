@@ -148,7 +148,7 @@ async fn cql_clustering_update_delete_round_trip() {
     let bound = bind_cluster(3, "127.0.0.1".parse().unwrap(), dir.path())
         .await
         .unwrap();
-    let nodes = start_cluster(bound, 2, 2).await.unwrap();
+    let nodes = start_cluster(bound).await.unwrap();
     await_bootstrap(&nodes).await;
 
     let mut conn = TcpStream::connect(nodes[0].cql_addr())

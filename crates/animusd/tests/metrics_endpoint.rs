@@ -88,7 +88,7 @@ async fn metrics_endpoint_surfaces_control_plane_counters() {
         let bound = bind_cluster(3, "127.0.0.1".parse().unwrap(), dir.path())
             .await
             .unwrap();
-        let nodes = start_cluster(bound, 2, 2).await.unwrap(); // R = W = 2 over 3
+        let nodes = start_cluster(bound).await.unwrap(); // R = W = 2 over 3
 
         await_bootstrap(&nodes).await;
 

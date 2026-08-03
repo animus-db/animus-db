@@ -59,22 +59,18 @@ fn fixed_addrs(count: usize) -> Vec<SocketAddr> {
     // listeners dropped here, freeing the ports for the node to bind.
 }
 
-/// A single-node config (R = W = 1) pinned to fixed addresses, so the same
-/// config can start, stop, and restart the same node.
+/// A single-node config pinned to fixed addresses, so the same config can start,
+/// stop, and restart the same node.
 fn single_node_config() -> ClusterConfig {
-    let a = fixed_addrs(7);
+    let a = fixed_addrs(5);
     ClusterConfig {
         nodes: vec![RoleAddrs {
             control: a[0],
-            data: a[1],
-            coord: a[2],
-            client: a[3],
-            dynamo: a[4],
-            cql: a[5],
-            raftkv: a[6],
+            client: a[1],
+            dynamo: a[2],
+            cql: a[3],
+            raftkv: a[4],
         }],
-        r: 1,
-        w: 1,
     }
 }
 

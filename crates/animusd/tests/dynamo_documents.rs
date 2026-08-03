@@ -70,7 +70,7 @@ async fn document_set_types_projection_and_return_values() {
     let bound = bind_cluster(3, "127.0.0.1".parse().unwrap(), dir.path())
         .await
         .unwrap();
-    let nodes = start_cluster(bound, 2, 2).await.unwrap(); // R = W = 2 over 3 replicas
+    let nodes = start_cluster(bound).await.unwrap(); // R = W = 2 over 3 replicas
     await_bootstrap(&nodes).await;
 
     let addr0 = nodes[0].dynamo_addr();
@@ -172,7 +172,7 @@ async fn multiple_gsis_composite_gsi_and_lsi() {
     let bound = bind_cluster(3, "127.0.0.1".parse().unwrap(), dir.path())
         .await
         .unwrap();
-    let nodes = start_cluster(bound, 2, 2).await.unwrap();
+    let nodes = start_cluster(bound).await.unwrap();
     await_bootstrap(&nodes).await;
 
     let addr0 = nodes[0].dynamo_addr();

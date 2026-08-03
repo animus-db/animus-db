@@ -146,19 +146,15 @@ fn fixed_addrs(count: usize) -> Vec<SocketAddr> {
 }
 
 fn single_node_config() -> ClusterConfig {
-    let a = fixed_addrs(7);
+    let a = fixed_addrs(5);
     ClusterConfig {
         nodes: vec![RoleAddrs {
             control: a[0],
-            data: a[1],
-            coord: a[2],
-            client: a[3],
-            dynamo: a[4],
-            cql: a[5],
-            raftkv: a[6],
+            client: a[1],
+            dynamo: a[2],
+            cql: a[3],
+            raftkv: a[4],
         }],
-        r: 1,
-        w: 1,
     }
 }
 

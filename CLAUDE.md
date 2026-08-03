@@ -130,9 +130,11 @@ truth; this map is just for navigation.
 - **Wire adapters** — `animus-dynamo`, `animus-cql` (ADR 0006). DynamoDB JSON/HTTP
   and CQL v4, served by `animusd`, routed through the same `DataClient`; both
   consume the replicated schema catalog (ADR 0013).
-- **Runnable node** — `animusd`, `animus-cli`. Assembles the three planes over
-  `ProdEnv`; runs as one process (`animusd --cluster N`) or one per node
-  (`animusd --config FILE --node I`).
+- **Runnable node** — `animusd`, `animus-cli`. v1 (ADR 0019) assembles the
+  **control plane + the CP data plane** (`animus-raftdata`) over `ProdEnv` — all
+  client reads/writes route to the per-tablet Raft group leader (forwarded
+  cross-process); the leaderless AP plane is dropped. Runs as one process
+  (`animusd --cluster N`) or one per node (`animusd --config FILE --node I`).
 
 **Cross-cutting gotcha — a node's inbox is single-consumer.** `Network::recv` for
 a node id has exactly one consumer; never run two protocols (e.g. a control

@@ -13,10 +13,10 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
 - `Node::bind` → `BoundNode::start` — two-phase construction (bind listeners,
   then install the peer address book and start protocols), so a cluster can use
   ephemeral ports and exchange addresses afterward.
-- `config::ClusterConfig` — the per-process deployment config (every node's six
-  addresses + quorum sizes). Node ids follow a fixed convention from the index
-  (control `i`, data `100+i`, coord `200+i`) so processes agree without listing
-  ids. `run_node(config, index, dir)` binds *this* node and starts it.
+- `config::ClusterConfig` — the per-process deployment config (every node's five
+  addresses). Node ids follow a fixed convention from the index (control `i`,
+  raftkv `300+i`) so processes agree without listing ids. `run_node(config, index,
+  dir)` binds *this* node and starts it.
 - `bind_cluster` / `start_cluster` — spin up an in-process cluster (the binary's
   `--cluster N` mode and `tests/cluster.rs`).
 - `ClientRequest` / `ClientResponse` + `read_frame` / `write_frame` — the
@@ -45,14 +45,16 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
 
 ## What's non-obvious
 
-- A node runs **four internal `ProdEnv` roles on distinct ids/ports** — control
-  (Raft, id `i`), data (AP replica, `100+i`), coord (the `DataClient`, `200+i`),
-  and **raftkv** (the leaderful **CP** per-tablet Raft group, `300+i`, ADR 0017
-  #3a) — because one inbox is single-consumer. `ClusterConfig` assigns seven
-  consecutive ports per node (the four internal roles + client/dynamo/cql). The
-  **client API is a plain request/reply TCP server**, *not* on the `Network`:
-  coordination is server-side, so the coordinator is a static cluster member and
-  replica replies route without knowing dynamic client addresses.
+- A node runs **two internal `ProdEnv` roles on distinct ids/ports** — control
+  (Raft metadata, id `i`) and **raftkv** (the leaderful **CP** per-tablet Raft
+  group, `300+i`, ADR 0017 #3a — the v1 data plane) — because one inbox is
+  single-consumer. `ClusterConfig` assigns five consecutive ports per node (the two
+  internal roles + client/dynamo/cql). v1 (ADR 0019) is **CP-only**: the leaderless
+  AP `data`/`coord` roles, `serve_replica`, anti-entropy, and hinted handoff are
+  gone. The **client API is a plain request/reply TCP server**, *not* on the
+  `Network`: a node that does not host the CP group leader **forwards** a data op to
+  the leader's node over a fresh client connection (ADR 0017 #3b), so dynamic client
+  addresses never touch the internal network.
 - **CP routing (ADR 0017 #3a / v1 ADR 0019).** The data path is the **leaderful
   per-tablet Raft group** (`animus-raftdata`), reached through four `ClientCtx`
   primitives that all resolve the leader the same way (`cp_route`): `cp_read`
@@ -62,73 +64,55 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   leader's node if a local replica gives a leader hint + a `client_route` exists
   (ADR 0017 #3b cross-process, wrapped in `ClientRequest::Forwarded`, one hop), and
   otherwise **waits** for the local group to elect (it never forwards a CP op to a
-  non-leader — including itself — during election). **The wire edges (DynamoDB, CQL)
-  route every read/write/scan through these** regardless of table mode, and create
-  their tables in `ReplicationMode::Cp`. The plain-client `Put`/`Get` still consult
-  `Metadata::table_mode(table)`: a `Cp` table → CP, an untagged/`Ap` key → the AP
-  coordinator (the AP plain-client path is removed in the next v1 piece). Stage 3a
-  hosts **one statically-placed CP group** spanning the first
-  `min(N, MAX_REPLICATION_FACTOR)` nodes' `raftkv` ids, each backed by its own
-  durable `LsmEngine` (type aliased `CpGroup`). `tests/cp_plane.rs` (in-process
+  non-leader — including itself — during election). **Every data op — the wire edges
+  (DynamoDB, CQL) and the plain-client `Put`/`Get`/`Scan`/`Delete` — routes through
+  these.** The optional `table` no longer selects a plane (there is only the CP
+  plane); the single CP group covers the whole keyspace. The edges create their
+  tables in `ReplicationMode::Cp` (the mode is recorded for truthfulness, but
+  routing no longer depends on it). A just-proposed write is confirmed via a **local**
+  read on the leader (not a quorum barrier — the leader applies only after a quorum
+  commit + WAL fsync, so a local read reflecting the value means it's durable; a
+  per-write barrier would not scale under concurrent load). Stage 3a hosts **one
+  statically-placed CP group** spanning the first `min(N, MAX_REPLICATION_FACTOR)`
+  nodes' `raftkv` ids, each backed by its own `LsmEngine` or `MemoryEngine` per
+  [`StorageBackend`] (an enum-wrapped `CpGroup`). `tests/cp_plane.rs` (in-process
   round-trip) + `tests/cp_cross_process.rs` (forwarding) + the dynamo/cql wire +
   schema tests all exercise the CP path; dynamic CP placement/split/reconfigure over
   `ProdEnv` is later v1 work.
-- **The cluster's members are the DATA nodes, not the control ids** (this is what
-  makes self-healing work end to end). The control ids `0..N` are only the Raft
-  *consensus group*; `bootstrap` registers the **data ids** (`100+i`) as `Active`
-  `Metadata` members, places the bootstrap tablet on the first
-  `min(N, MAX_REPLICATION_FACTOR)` of them, and attaches a `PlacementPolicy`
-  (`SetTabletPolicy`). So the failure detector (ADR 0012) and the placement
-  reconciler (ADR 0005) — both of which operate over `Active` members — act on the
-  nodes that actually hold data. Capping the RF at 3 leaves a **spare** in a
-  larger cluster, which is what a detected `Down` can be re-placed onto.
-- **The autonomous loops are wired here, over `ProdEnv` timers** (the mechanisms
-  are sim-proven in `animus-control`/`animus-data`; this is the production
-  assembly):
-  - The **control-plane heartbeat + failure detection** are driven from the data
-    nodes: each data replica's `start_replica` spawns `heartbeat_loop(data_env,
-    control_ids)` (send-only on a clone of the data env, so it does not contend on
-    the replica's single-consumer inbox), and `RaftNode::start` already runs the
-    `detect_loop`/`reconcile_loop` on every control node (no-ops off the leader).
-    A killed data node stops heartbeating → the leader marks its member `Down` →
-    the reconciler moves the tablet off it.
-  - **Anti-entropy** runs per data replica: `serve_anti_entropy(data_env, handle,
-    TABLET, peers, ANTI_ENTROPY_INTERVAL)`, also send-only on the data env (its
-    `SyncPull` replies arrive back through the replica's inbox). It is given the
-    replica `handle` and reads the tablet's **live** epoch from it each round, so
-    after a placement reconcile bumps the tablet epoch — and the control plane
-    advances this replica via `ReplicaHandle::set_epoch` — the digest round
-    carries the bumped epoch and is **not** fenced: a re-placed spare converges in
-    the **background**, not only via read-repair on its first read. (This closes
-    the formerly-deferred fixed-`Epoch::INITIAL` gotcha; the live-epoch behavior
-    is sim-proven in `animus-data/tests/repair.rs`.)
-- Proven live in `tests/self_heal.rs`: a 4-node cluster (RF 3 + one spare) writes a
-  key, kills a replica node, and the cluster autonomously marks it `Down`,
-  re-places the tablet onto the spare (epoch bumps), and still serves the key from
-  the survivors — observable self-healing in the assembled binary.
-- **The data replica is durable by default**: `serve_replica` is backed by the
-  on-disk `LsmEngine` opened over a *clone* of the node's **data** `ProdEnv`
-  (`StorageBackend::Lsm`), so a value acked to a client survives a process
-  restart (the LSM recovers from its WAL/SSTables/manifest on reopen) — like the
-  control plane, which already persists its Raft WAL. The LSM does its disk I/O
-  through the cloned data-env handle while the replica keeps the original handle
-  for network `recv`; since the LSM only touches the disk, the single-consumer
-  inbox is unaffected. The engine's files use a **flat filename prefix**
-  (`LSM_PREFIX = "db-"`), *not* a subdirectory — `ProdEnv`'s disk opens files
-  directly under the role's data dir and does not create intermediate
-  directories, so a slash-bearing prefix (e.g. `"db/"`) would fail to create the
-  files. `--ephemeral` (or `StorageBackend::Memory`) selects the volatile
-  `MemoryEngine` instead, for dev runs that intentionally start empty.
-  `start`/`start_cluster`/`run_node` default to the durable backend;
-  `start_with`/`start_cluster_with`/`run_node_with` take an explicit
-  `StorageBackend`. These are now **async + fallible** (opening the LSM is async
-  and can fail), so the node-start entry points return `io::Result`.
+- **The cluster's members are the CP `raftkv` nodes, not the control ids.** The
+  control ids `0..N` are only the Raft *consensus group* for metadata; `bootstrap`
+  (leader-only, idempotent) registers the **raftkv ids** (`300+i`) as `Active`
+  `Metadata` members and records the single bootstrap **CP tablet** (whole keyspace)
+  placed on the first `min(N, MAX_REPLICATION_FACTOR)` of them — the same set the CP
+  group spans in `start_with`. This keeps `metadata().tablets`/`status` meaningful
+  and gives dynamic CP reconfigure a hook (`tablets[t].replicas`). No
+  `PlacementPolicy` is attached: the CP group is statically formed at node start,
+  and automatic CP failure-detection / reconfigure over `ProdEnv` is later v1 work
+  (so the v0 heartbeat/anti-entropy/hinted-handoff loops and the `serve_replica`
+  data role are gone). The control-plane `detect_loop`/`reconcile_loop` still run on
+  every control node but no-op without heartbeats/policy. The control-plane
+  mechanisms (failure detection, placement) remain sim-proven in `animus-control`.
+- **The CP group is durable by default**: each hosting node's `RaftKvNode` is
+  backed by the on-disk `LsmEngine` opened over its **raftkv** `ProdEnv`
+  (`StorageBackend::Lsm`), so a value acked to a client (Raft-committed + WAL-fsynced
+  before the ack) survives a process restart (the LSM + Raft WAL recover on reopen).
+  The engine's files use a **flat filename prefix** (`LSM_PREFIX = "db-"`), *not* a
+  subdirectory — `ProdEnv`'s disk opens files directly under the role's data dir and
+  does not create intermediate directories, so a slash-bearing prefix (e.g. `"db/"`)
+  would fail to create the files. `--ephemeral` (or `StorageBackend::Memory`) selects
+  the volatile `MemoryEngine` instead (the `CpGroup` enum wraps either), for dev runs
+  that intentionally start empty. `start`/`start_cluster`/`run_node` default to the
+  durable backend; `start_with`/`start_cluster_with`/`run_node_with` take an explicit
+  `StorageBackend`. These are **async + fallible** (opening the LSM is async and can
+  fail), so the node-start entry points return `io::Result`. (`tests/durable_restart.rs`
+  proves a client write survives a restart on the LSM backend and is lost on the
+  memory backend; `tests/self_heal.rs` is now just a concurrent-load smoke test.)
 - Each node also serves a **fifth listener, the DynamoDB JSON/HTTP endpoint**
   (`RoleAddrs.dynamo`, `Node::dynamo_addr`). It is a *production-only I/O edge*
   (real tokio sockets + hand-rolled HTTP/1.1, like `ProdEnv`); below the edge it
-  reuses the existing `DataClient`/`Env` paths, so determinism is unaffected.
-  The data plane has no native delete, so DynamoDB `DeleteItem` writes a
-  tombstone value that `GetItem` reads back as absent. **`CreateTable` now
+  routes through the CP primitives (`ClientCtx::cp_read`/`cp_write`/`cp_scan`).
+  DynamoDB `DeleteItem` writes a sentinel tombstone *value* that `GetItem` reads
+  back as absent (distinct from the CQL whole-partition `cp_delete`). **`CreateTable` now
   proposes its key schema into the control plane's replicated catalog (ADR 0013)
   and waits for commit**, so a created table is durable + cluster-agreed (it
   survives a restart — `tests/dynamo_schema.rs`); the edge reaches the leader
@@ -188,22 +172,18 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   captures the request method + path; a `GET /metrics` is answered with the
   text-format snapshot as `text/plain` (everything else is the existing
   `POST /` + `X-Amz-Target` DynamoDB protocol). The body is **aggregated across the
-  node's three role sinks** (control / data / coord) by `ClientCtx::metrics_text`:
-  each role records into its **own** `ProdEnv` sink (`RaftNode::start` →
-  `control_env.metrics()`; the replica + coordinator → their envs'), so the handler
-  snapshots all three **at request time** (live, not cached), sums the counters,
-  and takes the max leadership gauge. Both control- and data-plane counters surface
-  from one endpoint; today only the control-plane counters move, and a data-plane
-  counter surfaces automatically once recorded (no endpoint change). The two
-  data/coord sinks are captured in `start_with` before their envs are moved and
-  threaded into `ClientCtx`. The endpoint is on `Node::dynamo_addr()`
-  (`curl -s <dynamo addr>/metrics`).
-- Writes get a **quorum-derived version** (`DataClient::read_version` + 1), not a
-  per-node counter — otherwise two coordinators assign the same version and the
-  replica's monotonic-version check silently drops the later write. Global
-  version assignment (HLC) is still future work.
-- Client ops are serialized per node behind `coord_lock` so concurrent ops don't
-  contend on the single coord inbox. Concurrency is future work.
+  node's two role sinks** (control / raftkv) by `ClientCtx::metrics_text`: each role
+  records into its **own** `ProdEnv` sink (`RaftNode::start` → `control_env.metrics()`;
+  the CP group → the raftkv env's), so the handler snapshots both **at request time**
+  (live, not cached), sums the counters, and takes the max leadership gauge. The
+  raftkv sink is captured in `start_with` before its env is moved and threaded into
+  `ClientCtx`. The endpoint is on `Node::dynamo_addr()` (`curl -s <dynamo addr>/metrics`).
+- CP writes need **no client-assigned version**: the Raft log index *is* the MVCC
+  version, so per-key LWW reproduces the agreed Raft order. (The v0 AP path derived
+  a quorum version via `read_version`+1; that is gone with the AP plane.)
+- A CQL/DynamoDB read-modify-write is serialized per node behind `rmw_lock` so the
+  linearizable CP read + CP write are **atomic per node**. Cross-node atomicity (a
+  CAS on the CP group) is later v1 work.
 - Two run modes: `--cluster N` (whole cluster in one process, dev convenience)
   and `--config FILE --node I` (one node per process — real deployment). Both
   share `Node::bind`/`start`; only address/peer assembly differs.
@@ -227,14 +207,14 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   the table schema from this node's own replicated `Metadata`.
 - **`Node::shutdown()` is a graceful teardown**: it aborts the node's
   client-facing listener tasks (client/dynamo/cql, on plain `tokio::spawn`) and
-  calls `ProdEnv::shutdown()` on each of the three internal role envs, which
-  aborts every task they own (the Raft driver, the replica serve loop, the
-  internal accept loops). This frees all six listener ports so a replacement node
-  can rebind the same addresses on the same data dir — the clean teardown a
-  stopped OS process would provide. On-disk state is untouched (a value acked to
-  a client was WAL-synced before the ack, so it survives). Wired to the Ctrl-C
-  path in `main`. Dropping a `Node` without `shutdown()` still leaves its detached
-  tasks running (they hold the ports), so call `shutdown()` to restart in-place.
+  calls `ProdEnv::shutdown()` on each of the two internal role envs (control +
+  raftkv), which aborts every task they own (the two Raft drivers + internal accept
+  loops). This frees all five listener ports so a replacement node can rebind the
+  same addresses on the same data dir — the clean teardown a stopped OS process
+  would provide. On-disk state is untouched (a value acked to a client was Raft-
+  committed + WAL-fsynced before the ack, so it survives). Wired to the Ctrl-C path
+  in `main`. Dropping a `Node` without `shutdown()` still leaves its detached tasks
+  running (they hold the ports), so call `shutdown()` to restart in-place.
 
 ## Tests / running
 
@@ -252,11 +232,11 @@ addresses** with the LSM backend, and is lost with the `--ephemeral` memory
 backend), `tests/metrics_endpoint.rs` (the admin `GET /metrics` HTTP route, ADR 0015: a
 3-node cluster elects a leader, the scrape returns the `text/plain` `name value`
 export with `control_elections_won >= 1` and `control_is_leader 1` on the leader /
-`0` on a follower), and `tests/self_heal.rs` (**live self-healing**: a 4-node cluster
-detects a killed replica node, marks it `Down`, re-places the tablet onto the
-spare, and still serves the key from the survivors; plus a concurrent-client
-smoke test that the assembled node does not deadlock under load). All use real
-TCP/time, so they poll with timeouts, not deterministic assertions. The restart test runs both incarnations in the **same** runtime,
+`0` on a follower), `tests/cp_plane.rs` (CP round-trip: write via one node, read via
+another — the CP group is the single source of truth), `tests/cp_cross_process.rs`
+(cross-process CP forwarding to the leader's node), and `tests/self_heal.rs` (a
+concurrent-client smoke test that the assembled node does not deadlock under load).
+All use real TCP/time, so they poll with timeouts, not deterministic assertions. The restart test runs both incarnations in the **same** runtime,
 calling `Node::shutdown()` between them to abort the node's detached tasks and
 free its listener ports (dropping a `Node` does not stop them), then rebinds the
 same addresses and recovers — a clean teardown → rebind → recover cycle standing

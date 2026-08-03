@@ -36,23 +36,17 @@ fn free_addrs(count: usize) -> Vec<SocketAddr> {
 
 /// Bring up an `n`-node per-process cluster (each node its own edge state).
 async fn bring_up(n: usize, dir: &std::path::Path) -> (Vec<Node>, animusd::ClusterConfig) {
-    let addrs = free_addrs(n * 7);
+    let addrs = free_addrs(n * 5);
     let nodes_cfg: Vec<animusd::RoleAddrs> = (0..n)
         .map(|i| animusd::RoleAddrs {
-            control: addrs[7 * i],
-            data: addrs[7 * i + 1],
-            coord: addrs[7 * i + 2],
-            client: addrs[7 * i + 3],
-            dynamo: addrs[7 * i + 4],
-            cql: addrs[7 * i + 5],
-            raftkv: addrs[7 * i + 6],
+            control: addrs[5 * i],
+            client: addrs[5 * i + 1],
+            dynamo: addrs[5 * i + 2],
+            cql: addrs[5 * i + 3],
+            raftkv: addrs[5 * i + 4],
         })
         .collect();
-    let config = animusd::ClusterConfig {
-        nodes: nodes_cfg,
-        r: 2,
-        w: 2,
-    };
+    let config = animusd::ClusterConfig { nodes: nodes_cfg };
     let mut nodes = Vec::new();
     for i in 0..n {
         nodes.push(

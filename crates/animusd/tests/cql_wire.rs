@@ -180,7 +180,7 @@ async fn cql_wire_prepare_execute_typed_round_trip() {
     let bound = bind_cluster(3, "127.0.0.1".parse().unwrap(), dir.path())
         .await
         .unwrap();
-    let nodes = start_cluster(bound, 2, 2).await.unwrap(); // R = W = 2 over 3 replicas
+    let nodes = start_cluster(bound).await.unwrap(); // R = W = 2 over 3 replicas
     await_bootstrap(&nodes).await;
 
     let addr0 = nodes[0].cql_addr();
