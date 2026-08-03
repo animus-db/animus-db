@@ -252,9 +252,19 @@ control plane unchanged. **Not yet:** dynamic membership (Stage C), tablet split
 - **Stage D — tablet split.** ✅ Done. A committed `Split { at }` agrees the point;
   each replica tombstones the handed-off range `[at, ∞)`; that range seeds a new
   independent group (`range_snapshot` → `start_seeded`). `tests/split.rs`.
-  *Remaining:* in-band new-group creation needs an `Env`-seam extension to mint a
-  sibling inbox at runtime (the harness/control plane creates it from the handoff
-  for now).
+  **In-band new-group creation is now done** (the deferred `Env`-seam extension):
+  a new **`Coresident` sub-trait** (`fn sibling(&self, id) -> Self`, implemented for
+  `SimEnv`) lets a replica mint a co-resident inbox at runtime; the driver gained an
+  optional **split hook** (`start_with_split_hook` + `in_band_split_hook`) so on
+  apply each original replica mints `sibling(my_new_id)` and starts its own
+  new-tablet replica there, seeded with the handed-off range — the new group forms
+  entirely from the apply path with no external handoff. `Coresident` is a *separate*
+  trait (not part of `Env`), bound only on the split path, so `ProdEnv` and every
+  other `E: Env` are untouched; the external-handoff `split.rs` is unchanged
+  (hook = `None`). `tests/split_in_band.rs`. *Remaining:* recovery-idempotency (the
+  hook fires on every apply, so a `Split` re-applied after a crash would mint twice)
+  and control-plane-driven new-id allocation — part of the `ProdEnv`/`animusd`
+  production assembly.
 - **`RaftPerTablet` Elle corpus** (ADR 0014/0016 step 4). ✅ Done. A self-contained
   linearizability corpus for this plane in `animus-test`
   (`tests/raftkv_linearizable.rs`): a single-key list-append workload over one Raft

@@ -99,11 +99,23 @@ the engine — the `AccordCore` sync-core/async-driver split.
   `[at, ∞)` (it now serves only `[lo, at)`), and that range is seeded into a new
   independent group (`range_snapshot` → `start_seeded`). `tests/split.rs` (the
   original keeps the lower range + drops the upper on every replica; the new group
-  serves the upper range; both operate independently; reproducibility). Full
-  *in-band* new-group creation (each original replica spawning its new-tablet
-  replica on apply) needs an `Env`-seam extension to mint a sibling inbox at
-  runtime; the harness/control plane creates the new group from the handoff for
-  now (integration plumbing, like C's automatic trigger).
+  serves the upper range; both operate independently; reproducibility).
+  **In-band new-group creation is now wired** (the deferred `Env`-seam extension):
+  the new `animus_env::Coresident` sub-trait (`sibling(id) -> Self`, impl'd for
+  `SimEnv`) lets a replica mint a co-resident inbox at runtime, and the driver
+  gained an optional **split hook** (`start_with_split_hook` +
+  `in_band_split_hook`). On apply of `Split`, `flush_and_apply` captures the
+  handed-off `[at, ∞)` range and invokes the hook; the in-band hook mints
+  `sibling(my_new_id)` and `start_seeded`s the new-tablet replica there (collected
+  into a caller sink for observation). Wire one hook per original replica → on
+  apply the new group forms with no external handoff. `tests/split_in_band.rs`.
+  Decided seam (per maintainer): SimEnv first; `Coresident` is a *separate* trait
+  bound only on the split path, so `ProdEnv`/other envs and the external-handoff
+  `split.rs` (hook = `None`) are untouched. **Limitations (production-hardening,
+  deferred to the `animusd` assembly):** the hook fires on every apply, so a
+  `Split` re-applied after a crash recovery would mint the sibling twice
+  (recovery-idempotency); and the new group's ids are wired per-replica here rather
+  than allocated by the control plane's `SplitTablet`.
 
 ## Tests
 
