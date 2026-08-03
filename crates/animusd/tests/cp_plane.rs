@@ -152,3 +152,47 @@ async fn reads_and_writes_route_through_the_raft_group() {
         n.shutdown();
     }
 }
+
+/// Phase 2.3a — **CP member address distribution.** Each CP-group node registers
+/// its `raftkv` listen address in the replicated control-plane `Metadata`
+/// (`cp_member_addrs`), so a peer-sync loop on every node can reach a
+/// runtime-created group member (a split sibling, a joined node). Here we assert
+/// the bootstrap members register and the entries replicate cluster-wide: every
+/// node sees a parseable address for each of the 3 CP group member ids
+/// (`raftkv_id(0..3)` = 300/301/302).
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn cp_member_addresses_register_and_replicate() {
+    let dir = tempfile::tempdir().unwrap();
+    let bound = bind_cluster(3, "127.0.0.1".parse().unwrap(), dir.path())
+        .await
+        .unwrap();
+    let nodes = start_cluster(bound).await.unwrap();
+    await_bootstrap(&nodes).await;
+
+    let want: Vec<u64> = (0..3).map(animusd::config::raftkv_id).collect();
+    let replicated = async {
+        loop {
+            // Every node's replicated view has a parseable address for all 3 members.
+            let ok = nodes.iter().all(|n| {
+                let m = n.metadata();
+                want.iter().all(|id| {
+                    m.cp_member_addrs
+                        .get(id)
+                        .and_then(|a| a.parse::<std::net::SocketAddr>().ok())
+                        .is_some()
+                })
+            });
+            if ok {
+                return;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    };
+    timeout(Duration::from_secs(20), replicated)
+        .await
+        .expect("CP member addresses did not register + replicate within 20s");
+
+    for n in &nodes {
+        n.shutdown();
+    }
+}

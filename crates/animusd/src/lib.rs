@@ -241,11 +241,13 @@ pub enum ClientRequest {
     ProposeSchema(MetaCommand),
 }
 
-/// Whether `command` is a **schema-catalog** mutation (ADR 0013) — the only
-/// `MetaCommand`s a wire client may relay via [`ClientRequest::ProposeSchema`].
+/// Whether `command` may be **relayed to the control leader** via
+/// [`ClientRequest::ProposeSchema`]: the schema-catalog mutations (ADR 0013) that a
+/// wire client drives, plus [`MetaCommand::RegisterCpAddr`] (Phase 2.3a) — a node's
+/// own CP-address self-registration, relayed to the leader when this node isn't it.
 /// Membership / placement / tablet commands are control-plane-internal and are
-/// **not** accepted from the wire.
-fn is_schema_command(command: &MetaCommand) -> bool {
+/// **not** accepted over this path.
+fn is_relayable_command(command: &MetaCommand) -> bool {
     matches!(
         command,
         MetaCommand::CreateTableSchema { .. }
@@ -255,6 +257,7 @@ fn is_schema_command(command: &MetaCommand) -> bool {
             | MetaCommand::SetTableMode { .. }
             | MetaCommand::CreateKeyspace { .. }
             | MetaCommand::DropKeyspace { .. }
+            | MetaCommand::RegisterCpAddr { .. }
     )
 }
 
@@ -383,7 +386,17 @@ impl BoundNode {
         client_route: BTreeMap<NodeId, SocketAddr>,
     ) -> std::io::Result<Node> {
         self.control_env.set_peers(peers.clone());
-        self.raftkv_env.set_peers(peers);
+        self.raftkv_env.set_peers(peers.clone());
+        // The initial (static) peer book + a `raftkv`-env clone, kept for the
+        // **peer-sync loop** (Phase 2.3a): it rebuilds the raftkv family's peer book
+        // as `static ∪ Metadata.cp_member_addrs` so a runtime-created CP member (a
+        // split sibling, a joined node) becomes reachable. `set_peers` replaces the
+        // book and a sibling env shares the same book Arc, so syncing the raftkv env
+        // reaches every co-resident group.
+        let static_peers = peers;
+        let raftkv_sync_env = self.raftkv_env.clone();
+        let my_raftkv_id = self.raftkv_id;
+        let my_raftkv_addr = self.raftkv_addr;
 
         // Keep clones of the two internal envs so [`Node::shutdown`] can abort
         // every task they own (the two Raft drivers + accept loops), freeing their
@@ -419,7 +432,8 @@ impl BoundNode {
         let cp_group: Vec<NodeId> = (0..n.min(MAX_REPLICATION_FACTOR))
             .map(config::raftkv_id)
             .collect();
-        if cp_group.contains(&self.raftkv_id) {
+        let hosts_cp = cp_group.contains(&my_raftkv_id);
+        if hosts_cp {
             let cp = match backend {
                 StorageBackend::Lsm => {
                     let lsm = LsmEngine::open(self.raftkv_env.clone(), LSM_PREFIX)
@@ -443,9 +457,19 @@ impl BoundNode {
         // (idempotent). Track the client-facing task handles so `shutdown` can
         // abort them and release the client/dynamo/cql listener ports (these run
         // on plain `tokio::spawn`, off the `Env` network).
-        let mut tasks = Vec::with_capacity(4);
+        let mut tasks = Vec::with_capacity(6);
         let raftkv_ids: Vec<NodeId> = (0..n).map(config::raftkv_id).collect();
         tasks.push(tokio::spawn(bootstrap(raft.clone(), raftkv_ids)));
+
+        // Peer-sync loop (Phase 2.3a): keep the raftkv family's peer book =
+        // `static ∪ Metadata.cp_member_addrs`, so a runtime-registered CP member
+        // (split sibling / joined node) becomes reachable for the group's internal
+        // Raft traffic. Runs on every node (harmless where no CP group is hosted).
+        tasks.push(tokio::spawn(peer_sync_loop(
+            raft.clone(),
+            raftkv_sync_env,
+            static_peers,
+        )));
 
         // Client request server + DynamoDB HTTP + CQL endpoints share one context
         // (the same raft view, RMW lock, and CP edge state).
@@ -457,6 +481,17 @@ impl BoundNode {
                 raftkv_metrics,
                 client_route: client_route.clone(),
             };
+            // A CP-hosting node registers its `raftkv` address in the replicated
+            // Metadata (Phase 2.3a), so peer-sync on every node can reach it. The
+            // bootstrap members' addrs are already in the static peer book, so this
+            // is the path a *new* member (split sibling / join) reuses.
+            if hosts_cp {
+                let ctx = ctx.clone();
+                tasks.push(tokio::spawn(async move {
+                    ctx.register_cp_addr(my_raftkv_id, my_raftkv_addr.to_string())
+                        .await;
+                }));
+            }
             tasks.push(tokio::spawn(serve_clients(
                 self.client_listener,
                 ctx.clone(),
@@ -1165,6 +1200,34 @@ async fn bootstrap(raft: RaftNode<ProdEnv>, raftkv_ids: Vec<NodeId>) {
     }
 }
 
+/// How often the peer-sync loop rebuilds the `raftkv` peer book from replicated
+/// `Metadata` (Phase 2.3a). Brisk so a runtime-registered CP member becomes
+/// reachable promptly; the work is a cheap map rebuild + `set_peers`.
+const PEER_SYNC_INTERVAL: Duration = Duration::from_millis(200);
+
+/// Keep the `raftkv` env family's peer book = the **static** book ∪ the replicated
+/// `Metadata.cp_member_addrs` (Phase 2.3a address distribution). `set_peers`
+/// replaces the book and a `sibling` env shares the same book `Arc`, so syncing the
+/// `raftkv` env reaches every co-resident CP group. Idempotent each tick; runs for
+/// the life of the node (a perpetual loop, aborted on `shutdown`). A peer entry
+/// whose address fails to parse is skipped (the control plane stores it opaquely).
+async fn peer_sync_loop(
+    raft: RaftNode<ProdEnv>,
+    raftkv_env: ProdEnv,
+    static_peers: BTreeMap<NodeId, SocketAddr>,
+) {
+    loop {
+        let mut book = static_peers.clone();
+        for (id, addr) in raft.metadata().cp_member_addrs {
+            if let Ok(sa) = addr.parse::<SocketAddr>() {
+                book.insert(id, sa);
+            }
+        }
+        raftkv_env.set_peers(book);
+        tokio::time::sleep(PEER_SYNC_INTERVAL).await;
+    }
+}
+
 async fn serve_clients(listener: TcpListener, ctx: ClientCtx) {
     loop {
         match listener.accept().await {
@@ -1205,12 +1268,13 @@ async fn handle_client(mut stream: TcpStream, ctx: ClientCtx) -> std::io::Result
             // A CP op forwarded from another node (cross-process routing, ADR 0017
             // #3b): serve locally iff we are the leader; never re-forward.
             ClientRequest::Forwarded(inner) => ctx.cp_serve_forwarded(*inner).await,
-            // A schema-DDL command relayed to the control leader (A2). Gate to
-            // schema-catalog commands, then propose iff we are the leader (no
-            // re-relay — bounded one hop; the relayer retries with fresh routing).
+            // A metadata command relayed to the control leader (A2 schema DDL, or a
+            // Phase 2.3a CP-address registration). Gate to the relayable set, then
+            // propose iff we are the leader (no re-relay — bounded one hop; the
+            // relayer retries with fresh routing).
             ClientRequest::ProposeSchema(command) => {
-                if !is_schema_command(&command) {
-                    ClientResponse::Error("only schema-catalog commands may be proposed".into())
+                if !is_relayable_command(&command) {
+                    ClientResponse::Error("command not allowed over the relay path".into())
                 } else {
                     // Propose on the control leader (locally if we are it, else relay
                     // toward it). The caller confirms the commit via replicated
@@ -1262,6 +1326,26 @@ impl ClientCtx {
     /// CQL edge's `USE` / qualifier check, replacing per-process edge state.
     pub(crate) fn has_keyspace(&self, keyspace: &str) -> bool {
         self.raft.metadata().has_keyspace(keyspace)
+    }
+
+    /// Register this node's CP group member `id` → `addr` in the replicated
+    /// `Metadata` (Phase 2.3a), so every node's peer-sync loop can reach it. Routes
+    /// to the control leader via the A2 relay (now also accepting `RegisterCpAddr`)
+    /// and waits until the entry is visible here, re-proposing each tick. Best-effort
+    /// (bounded by [`SCHEMA_COMMIT_TIMEOUT`]); idempotent (re-registering the same
+    /// address is a state-machine no-op).
+    pub(crate) async fn register_cp_addr(&self, id: NodeId, addr: String) {
+        if self.raft.metadata().cp_member_addrs.get(&id) == Some(&addr) {
+            return;
+        }
+        let want = addr.clone();
+        let _ = self
+            .propose_and_await(
+                MetaCommand::RegisterCpAddr { id, addr },
+                SCHEMA_COMMIT_TIMEOUT,
+                || (self.raft.metadata().cp_member_addrs.get(&id) == Some(&want)).then_some(()),
+            )
+            .await;
     }
 
     /// Propose `CreateKeyspace` to the control-plane leader and wait for it to
