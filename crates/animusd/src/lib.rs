@@ -433,7 +433,10 @@ impl BoundNode {
                     MemoryEngine::new(),
                 )),
             };
-            edge.register_raftkv(cp);
+            // The statically-placed group serves the bootstrap tablet (the whole
+            // keyspace). A tablet split (Phase 2.2) registers the new tablet's group
+            // alongside it; routing is keyed by tablet (`cp_route`).
+            edge.register_raftkv(TABLET, cp);
         }
 
         // Bootstrap: whichever node is leader registers membership + the CP tablet
@@ -636,12 +639,14 @@ pub struct ClusterEdgeState {
     /// durable / not replicated; per-cluster.
     cql_state: Arc<tokio::sync::Mutex<cql::CqlState>>,
     /// This cluster's **leaderful CP** per-tablet Raft group handles (ADR 0017 #3a),
-    /// so a wire edge can route a CP-mode table's reads/writes to the group
-    /// **leader**. In `--cluster N` mode every hosting node registers here, so the
-    /// leader is always present; one-process-per-node registers only the local
-    /// handle (cross-process CP routing is Stage 3b). Stage 3a hosts a single CP
-    /// group, so this holds at most one handle per node.
-    raftkv: Arc<Mutex<Vec<CpGroup>>>,
+    /// **keyed by tablet** so a wire edge routes a key to its owning tablet's group
+    /// **leader** (Phase 2: multi-tablet CP). Each tablet maps to the locally-hosted
+    /// group handle(s) for it. In `--cluster N` mode every hosting node registers
+    /// here (so the leader is always present in-process); one-process-per-node
+    /// registers only the local handle (cross-process routing forwards). Today the
+    /// cluster has one whole-keyspace tablet, so there is one entry; a tablet split
+    /// adds another.
+    raftkv: Arc<Mutex<BTreeMap<TabletId, Vec<CpGroup>>>>,
 }
 
 impl Default for ClusterEdgeState {
@@ -657,7 +662,7 @@ impl ClusterEdgeState {
             control: Arc::new(Mutex::new(Vec::new())),
             dynamo_registry: Arc::new(Mutex::new(animus_dynamo::SchemaRegistry::new())),
             cql_state: Arc::new(tokio::sync::Mutex::new(cql::CqlState::default())),
-            raftkv: Arc::new(Mutex::new(Vec::new())),
+            raftkv: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -670,37 +675,41 @@ impl ClusterEdgeState {
             .push(raft);
     }
 
-    /// Register a node's CP per-tablet Raft group handle (ADR 0017 #3a). Called in
-    /// [`BoundNode::start_with`] on each node that hosts the CP group.
-    fn register_raftkv(&self, cp: CpGroup) {
+    /// Register a node's CP group handle for `tablet` (ADR 0017 #3a / Phase 2).
+    /// Called on each node that hosts a replica of `tablet`.
+    fn register_raftkv(&self, tablet: TabletId, cp: CpGroup) {
         self.raftkv
             .lock()
             .expect("raftkv handles poisoned")
+            .entry(tablet)
+            .or_default()
             .push(cp);
     }
 
-    /// The CP group handle that currently believes it is leader, if any (ADR 0017
-    /// #3a). The route target for a CP-mode table's reads/writes. Normally exactly
-    /// one registered handle leads; a deposed leader's `linearizable_get` returns
-    /// `None` (never stale) and its `put` returns `NotLeader`, so picking the first
+    /// The CP group handle for `tablet` that currently believes it is leader, if
+    /// any. The route target for a key in `tablet`'s range. Normally exactly one
+    /// registered handle leads; a deposed leader's `linearizable_get` returns `None`
+    /// (never stale) and its `put` returns `NotLeader`, so picking the first
     /// self-styled leader is safe.
-    fn cp_leader(&self) -> Option<CpGroup> {
+    fn cp_leader(&self, tablet: TabletId) -> Option<CpGroup> {
         self.raftkv
             .lock()
             .expect("raftkv handles poisoned")
+            .get(&tablet)?
             .iter()
             .find(|n| n.is_leader())
             .cloned()
     }
 
-    /// Any locally-registered CP group handle (the first), regardless of
-    /// leadership — used to read the group's current leader *hint* for
-    /// cross-process forwarding (ADR 0017 #3b) when this node is not the leader.
-    /// `None` if this node hosts no CP replica.
-    fn local_cp(&self) -> Option<CpGroup> {
+    /// Any locally-registered CP group handle for `tablet` (the first), regardless
+    /// of leadership — used to read the group's current leader *hint* for
+    /// cross-process forwarding (ADR 0017 #3b). `None` if this node hosts no replica
+    /// of `tablet`.
+    fn local_cp(&self, tablet: TabletId) -> Option<CpGroup> {
         self.raftkv
             .lock()
             .expect("raftkv handles poisoned")
+            .get(&tablet)?
             .first()
             .cloned()
     }
@@ -751,36 +760,53 @@ pub(crate) struct ClientCtx {
 }
 
 impl ClientCtx {
-    /// Resolve how to reach the CP group leader for an op originating on this node
-    /// (shared by every CP op — read/write/delete/scan — so the leader-resolution +
-    /// forwarding policy lives in one place):
+    /// The id of the tablet whose key range covers `key`, from this node's cached
+    /// `Metadata` tablet map (the control plane's placement authority). `None` if no
+    /// tablet covers it yet (the cluster is still bootstrapping its first tablet).
+    fn tablet_for(&self, key: &[u8]) -> Option<TabletId> {
+        self.raft
+            .metadata()
+            .tablets
+            .iter()
+            .find(|(_, t)| t.range.contains(key))
+            .map(|(id, _)| *id)
+    }
+
+    /// Resolve how to reach the CP group leader for an op on `key` (shared by every
+    /// CP op — read/write/delete/scan — so the leader-resolution + forwarding policy
+    /// lives in one place). The key first resolves to its **owning tablet** (Phase 2
+    /// multi-tablet CP), then to that tablet's group:
     ///
-    /// - this node hosts the current leader → serve **locally**;
-    /// - this node hosts a CP replica that points at a **remote** leader → **forward**
+    /// - this node hosts the tablet's current leader → serve **locally**;
+    /// - this node hosts a replica that points at a **remote** leader → **forward**
     ///   there (ADR 0017 #3b);
-    /// - this node hosts a CP replica but the group is still electing → **wait** for
-    ///   it to settle (don't forward — the only "route" might be this very node, and
-    ///   forwarding a CP op to a non-leader just errors; the AP plane was always
-    ///   available, so the CP edges must not flap during election);
-    /// - this node hosts **no** CP replica → it can never serve locally, so forward
-    ///   to any known group route (the receiver serves iff it is the leader, else the
-    ///   client retries with fresh routing).
-    async fn cp_route(&self) -> CpRoute {
+    /// - this node hosts a replica but the group is still electing → **wait** for it
+    ///   to settle (don't forward — the only "route" might be this very node, and
+    ///   forwarding a CP op to a non-leader just errors; the edges must not flap
+    ///   during election);
+    /// - this node hosts **no** replica of the tablet → it can never serve locally,
+    ///   so forward to any known route (the receiver serves iff it is the leader,
+    ///   else the client retries with fresh routing);
+    /// - the tablet itself is not in the map yet (bootstrap) → **wait** for it.
+    async fn cp_route(&self, key: &[u8]) -> CpRoute {
         let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
         loop {
-            if let Some(leader) = self.edge.cp_leader() {
-                return CpRoute::Local(leader);
-            }
-            // Forward only to a concrete leader *hint* a local replica gives us.
-            if let Some(addr) = self.cp_forward_target() {
-                return CpRoute::Forward(addr);
-            }
-            // No local leader and no leader hint. A node that hosts no CP replica
-            // can never serve locally, so forward to any known route immediately;
-            // a node that *does* host a replica waits for its own election/hint.
-            if self.edge.local_cp().is_none() {
-                if let Some(addr) = self.client_route.values().next().copied() {
+            if let Some(tablet) = self.tablet_for(key) {
+                if let Some(leader) = self.edge.cp_leader(tablet) {
+                    return CpRoute::Local(leader);
+                }
+                // Forward only to a concrete leader *hint* a local replica gives us.
+                if let Some(addr) = self.cp_forward_target(tablet) {
                     return CpRoute::Forward(addr);
+                }
+                // No local leader and no leader hint. A node hosting no replica of
+                // this tablet can never serve locally, so forward to any known route
+                // immediately; a node that *does* host a replica waits for its own
+                // election/hint.
+                if self.edge.local_cp(tablet).is_none() {
+                    if let Some(addr) = self.client_route.values().next().copied() {
+                        return CpRoute::Forward(addr);
+                    }
                 }
             }
             if tokio::time::Instant::now() >= deadline {
@@ -796,7 +822,7 @@ impl ClientCtx {
     /// leader's ReadIndex returns `None`, treated as absent). The CP read primitive
     /// the wire edges call directly.
     pub(crate) async fn cp_read(&self, key: Vec<u8>) -> Result<Option<Vec<u8>>, String> {
-        match self.cp_route().await {
+        match self.cp_route(&key).await {
             CpRoute::Local(leader) => Ok(leader.linearizable_get(&key).await),
             CpRoute::Forward(addr) => {
                 match self
@@ -817,7 +843,7 @@ impl ClientCtx {
     /// reflects it — before returning `Ok` (durable-before-ack). Forwarded if this
     /// node isn't the leader. The CP write primitive the wire edges call directly.
     pub(crate) async fn cp_write(&self, key: Vec<u8>, value: Vec<u8>) -> Result<(), String> {
-        match self.cp_route().await {
+        match self.cp_route(&key).await {
             CpRoute::Local(leader) => Self::cp_put_local(&leader, key, value).await,
             CpRoute::Forward(addr) => Self::ok_or_err(
                 self.cp_forward(
@@ -841,7 +867,7 @@ impl ClientCtx {
     /// delete; the DynamoDB edge instead writes a sentinel tombstone *value* via
     /// [`cp_write`](Self::cp_write).
     pub(crate) async fn cp_delete(&self, key: Vec<u8>) -> Result<(), String> {
-        match self.cp_route().await {
+        match self.cp_route(&key).await {
             CpRoute::Local(leader) => Self::cp_delete_local(&leader, key).await,
             CpRoute::Forward(addr) => Self::ok_or_err(
                 self.cp_forward(addr, ClientRequest::Delete { key, table: None })
@@ -855,13 +881,18 @@ impl ClientCtx {
     /// Linearizable CP range **scan** over `[start, end)` up to `limit` keys (ADR
     /// 0017): ReadIndex on the group leader, forwarded if this node isn't it. The
     /// CP read primitive behind the DynamoDB `Query`/`Scan` + CQL multi-row reads.
+    ///
+    /// Routes to the tablet owning `start`. Today the cluster has one whole-keyspace
+    /// tablet, so a scan always stays within it; once a tablet split makes a range
+    /// span tablets, this fans out across the overlapping tablets and merges (a
+    /// Phase 2 follow-on with multi-tablet hosting).
     pub(crate) async fn cp_scan(
         &self,
         start: Vec<u8>,
         end: Vec<u8>,
         limit: Option<usize>,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
-        match self.cp_route().await {
+        match self.cp_route(&start).await {
             CpRoute::Local(leader) => leader
                 .linearizable_scan(&start, &end, limit)
                 .await
@@ -957,13 +988,14 @@ impl ClientCtx {
         }
     }
 
-    /// The client-API address to forward a CP op to: the hosting node of the group
-    /// leader as a local CP replica currently sees it (`leader()` hint → `client_route`).
-    /// `None` if this node hosts no CP replica, the replica has no leader hint yet
-    /// (mid-election — the caller waits rather than guessing, so it never forwards a
-    /// CP op to a non-leader, including itself), or the hinted id has no known route.
-    fn cp_forward_target(&self) -> Option<SocketAddr> {
-        let leader_id = self.edge.local_cp().and_then(|n| n.leader())?;
+    /// The client-API address to forward a `tablet` op to: the hosting node of that
+    /// tablet's group leader as a local replica currently sees it (`leader()` hint →
+    /// `client_route`). `None` if this node hosts no replica of `tablet`, the replica
+    /// has no leader hint yet (mid-election — the caller waits rather than guessing,
+    /// so it never forwards a CP op to a non-leader, including itself), or the hinted
+    /// id has no known route.
+    fn cp_forward_target(&self, tablet: TabletId) -> Option<SocketAddr> {
+        let leader_id = self.edge.local_cp(tablet).and_then(|n| n.leader())?;
         self.client_route.get(&leader_id).copied()
     }
 
@@ -1010,28 +1042,43 @@ impl ClientCtx {
         }
     }
 
-    /// Serve a **forwarded** CP op locally: this node must be the leader (it does
-    /// not re-forward — bounding routing to one hop). `Some(resp)` if it was a CP
-    /// op we handled; `None` if the inner request wasn't a CP op we recognize.
+    /// This node's leader handle for the tablet owning `key`, if it hosts it and
+    /// leads — the local serve target for a forwarded op.
+    fn cp_leader_for(&self, key: &[u8]) -> Option<CpGroup> {
+        self.tablet_for(key).and_then(|t| self.edge.cp_leader(t))
+    }
+
+    /// Serve a **forwarded** CP op locally: this node must lead the op's tablet (it
+    /// does not re-forward — bounding routing to one hop). The op's key resolves to
+    /// its owning tablet, then to that tablet's leader on this node.
     async fn cp_serve_forwarded(&self, inner: ClientRequest) -> ClientResponse {
-        let Some(leader) = self.edge.cp_leader() else {
-            return ClientResponse::Error("forwarded CP op: not the leader here".into());
-        };
         match inner {
             ClientRequest::Put { key, value, .. } => {
+                let Some(leader) = self.cp_leader_for(&key) else {
+                    return ClientResponse::Error("forwarded CP op: not the leader here".into());
+                };
                 match Self::cp_put_local(&leader, key, value).await {
                     Ok(()) => ClientResponse::PutOk,
                     Err(e) => ClientResponse::Error(e),
                 }
             }
-            ClientRequest::Get { key, .. } => {
-                ClientResponse::Value(leader.linearizable_get(&key).await)
-            }
-            ClientRequest::Delete { key, .. } => match Self::cp_delete_local(&leader, key).await {
-                Ok(()) => ClientResponse::PutOk,
-                Err(e) => ClientResponse::Error(e),
+            ClientRequest::Get { key, .. } => match self.cp_leader_for(&key) {
+                Some(leader) => ClientResponse::Value(leader.linearizable_get(&key).await),
+                None => ClientResponse::Error("forwarded CP op: not the leader here".into()),
             },
+            ClientRequest::Delete { key, .. } => {
+                let Some(leader) = self.cp_leader_for(&key) else {
+                    return ClientResponse::Error("forwarded CP op: not the leader here".into());
+                };
+                match Self::cp_delete_local(&leader, key).await {
+                    Ok(()) => ClientResponse::PutOk,
+                    Err(e) => ClientResponse::Error(e),
+                }
+            }
             ClientRequest::Scan { start, end, limit } => {
+                let Some(leader) = self.cp_leader_for(&start) else {
+                    return ClientResponse::Error("forwarded CP op: not the leader here".into());
+                };
                 match leader.linearizable_scan(&start, &end, limit).await {
                     Some(p) => ClientResponse::Pairs(p),
                     None => ClientResponse::Error("CP group leader moved; retry".into()),
