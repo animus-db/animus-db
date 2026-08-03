@@ -68,6 +68,16 @@ pub struct Metadata {
     /// keeps snapshots written before this field existed loading (empty set).
     #[serde(default)]
     pub keyspaces: BTreeSet<String>,
+    /// Replicated **CP group member addresses** (Phase 2): each CP per-tablet Raft
+    /// member id → the listen address of its hosting node's `raftkv` role, as an
+    /// opaque string (the control plane never dials it). Mutated only through
+    /// [`MetaCommand::RegisterCpAddr`]. A member created at runtime — a tablet
+    /// split's co-resident sibling, or a newly-joined data node — registers its
+    /// address here so every node's peer-sync loop can install it into its env peer
+    /// book and the new group's internal Raft traffic routes. `#[serde(default)]`
+    /// keeps pre-Phase-2 snapshots loading (empty map).
+    #[serde(default)]
+    pub cp_member_addrs: BTreeMap<NodeId, String>,
 }
 
 /// A mutation of [`Metadata`], replicated through Raft and applied in log order.
@@ -157,6 +167,12 @@ pub enum MetaCommand {
     /// Remove a keyspace name. Idempotent: a no-op if absent. (Tables in the
     /// keyspace are dropped separately; this removes only the namespace entry.)
     DropKeyspace { keyspace: String },
+    /// Register (or update) a **CP group member's address** (Phase 2): the
+    /// `raftkv`-role listen address of member `id`, stored opaquely in
+    /// [`Metadata::cp_member_addrs`] and replicated so every node's peer-sync loop
+    /// can reach a runtime-created group member (a split sibling or a joined data
+    /// node). Idempotent: a no-op if `id` already maps to `addr`.
+    RegisterCpAddr { id: NodeId, addr: String },
 }
 
 /// The deterministic result of applying a [`MetaCommand`].
@@ -392,6 +408,14 @@ impl Metadata {
                     ApplyOutcome::NoOp
                 }
             }
+            MetaCommand::RegisterCpAddr { id, addr } => {
+                if self.cp_member_addrs.get(id) == Some(addr) {
+                    ApplyOutcome::NoOp
+                } else {
+                    self.cp_member_addrs.insert(*id, addr.clone());
+                    ApplyOutcome::Applied
+                }
+            }
         }
     }
 
@@ -453,5 +477,45 @@ impl crate::raft::StateMachine<MetaCommand> for Metadata {
 
     fn noop() -> MetaCommand {
         MetaCommand::NoOp
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `RegisterCpAddr` records a CP member's address, updates on change, and is a
+    /// no-op when re-registering the same address (Phase 2 address distribution).
+    /// It applies in the deterministic state machine like every other `MetaCommand`,
+    /// so it replicates + recovers through Raft by construction.
+    #[test]
+    fn register_cp_addr_records_updates_and_is_idempotent() {
+        let mut m = Metadata::default();
+        let reg = |id, addr: &str| MetaCommand::RegisterCpAddr {
+            id,
+            addr: addr.to_owned(),
+        };
+
+        // First registration applies and is readable.
+        assert_eq!(m.apply(&reg(301, "127.0.0.1:9001")), ApplyOutcome::Applied);
+        assert_eq!(
+            m.cp_member_addrs.get(&301).map(String::as_str),
+            Some("127.0.0.1:9001")
+        );
+
+        // Re-registering the same address is a no-op (so a periodic re-register
+        // does not churn the Raft log).
+        assert_eq!(m.apply(&reg(301, "127.0.0.1:9001")), ApplyOutcome::NoOp);
+
+        // A changed address updates the entry.
+        assert_eq!(m.apply(&reg(301, "127.0.0.1:9002")), ApplyOutcome::Applied);
+        assert_eq!(
+            m.cp_member_addrs.get(&301).map(String::as_str),
+            Some("127.0.0.1:9002")
+        );
+
+        // A distinct member coexists.
+        assert_eq!(m.apply(&reg(401, "127.0.0.1:9101")), ApplyOutcome::Applied);
+        assert_eq!(m.cp_member_addrs.len(), 2);
     }
 }

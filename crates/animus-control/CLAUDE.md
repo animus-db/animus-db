@@ -11,10 +11,13 @@ epoch compare-and-swap transactions.
 ## Entry points
 
 - `meta.rs` — `Metadata` (members + tablet map + placement policies + the
-  table-schema catalog) and `MetaCommand` (`UpsertMember`, `CreateTablet`,
-  `CasTabletReplicas`, `SplitTablet`, `MergeTablets`, `SetTabletPolicy`,
-  `CreateTableSchema`, `DropTableSchema`, `CreateTableIndex`, `DropTableIndex`).
-  `Metadata::apply` is the deterministic state machine; `Metadata::reconcile` is
+  table-schema catalog + keyspaces + **`cp_member_addrs`**: CP group member id →
+  `raftkv` address, Phase 2 address distribution) and `MetaCommand` (`UpsertMember`,
+  `CreateTablet`, `CasTabletReplicas`, `SplitTablet`, `MergeTablets`,
+  `SetTabletPolicy`, `CreateTableSchema`, `DropTableSchema`, `CreateTableIndex`,
+  `DropTableIndex`, `SetTableMode`, `CreateKeyspace`, `DropKeyspace`,
+  **`RegisterCpAddr`**). `Metadata::apply` is the deterministic state machine;
+  `Metadata::reconcile` is
   the pure placement decision (see below);
   `table_schema`/`has_table_schema`/`table_schemas`/`table_indexes` read the
   catalog.
