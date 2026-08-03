@@ -132,6 +132,15 @@ pub enum MetaCommand {
     /// Remove a secondary index definition from a table's schema (ADR 0013).
     /// Idempotent: a no-op if the table or the named index does not exist.
     DropTableIndex { table: TableName, index: String },
+    /// Set a table's **replication mode** (ADR 0016 / ADR 0017): `Ap` (leaderless
+    /// data plane) or `Cp` (leaderful per-tablet Raft). Rejected if the table has
+    /// no schema; a no-op if the mode is already set. Replicated like the rest of
+    /// the catalog, so the choice is durable + cluster-agreed and the wire edges
+    /// route reads/writes accordingly.
+    SetTableMode {
+        table: TableName,
+        mode: crate::ReplicationMode,
+    },
 }
 
 /// The deterministic result of applying a [`MetaCommand`].
@@ -343,6 +352,16 @@ impl Metadata {
                     ApplyOutcome::NoOp
                 }
             }
+            MetaCommand::SetTableMode { table, mode } => {
+                let Some(schema) = self.schemas.get_mut(table) else {
+                    return ApplyOutcome::Rejected("no such table schema");
+                };
+                if schema.mode == *mode {
+                    return ApplyOutcome::NoOp;
+                }
+                schema.mode = *mode;
+                ApplyOutcome::Applied
+            }
         }
     }
 
@@ -357,6 +376,16 @@ impl Metadata {
     #[must_use]
     pub fn has_table_schema(&self, table: &str) -> bool {
         self.schemas.contains(table)
+    }
+
+    /// The table's replication mode (ADR 0016 / ADR 0017): `Cp` for the leaderful
+    /// per-tablet Raft plane, else `Ap` (the default, and the answer for an unknown
+    /// table). Read by the wire edges to route a table's reads/writes.
+    #[must_use]
+    pub fn table_mode(&self, table: &str) -> crate::ReplicationMode {
+        self.schemas
+            .get(table)
+            .map_or(crate::ReplicationMode::Ap, |s| s.mode)
     }
 
     /// All `(name, schema)` pairs in the catalog, in ascending name order.
