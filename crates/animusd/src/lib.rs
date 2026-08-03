@@ -130,6 +130,12 @@ pub enum ClientRequest {
         #[serde(default)]
         table: Option<String>,
     },
+    /// A CP op **forwarded** from a node that received it but does not host the CP
+    /// group leader, to the leader's node (ADR 0017 #3b cross-process routing). The
+    /// receiving node serves it locally **iff** it is the leader; it never
+    /// re-forwards, so routing is bounded to one hop (a stale hint errors and the
+    /// client retries with fresh routing). Carries the original [`Put`]/[`Get`].
+    Forwarded(Box<ClientRequest>),
 }
 
 /// A node's reply to a [`ClientRequest`].
@@ -250,6 +256,7 @@ impl BoundNode {
             w,
             StorageBackend::default(),
             ClusterEdgeState::new(),
+            BTreeMap::new(),
         )
         .await
     }
@@ -271,6 +278,7 @@ impl BoundNode {
         w: usize,
         backend: StorageBackend,
         edge: ClusterEdgeState,
+        cp_route: BTreeMap<NodeId, SocketAddr>,
     ) -> std::io::Result<Node> {
         self.control_env.set_peers(peers.clone());
         self.data_env.set_peers(peers.clone());
@@ -407,6 +415,7 @@ impl BoundNode {
                 edge: edge.clone(),
                 data_metrics,
                 coord_metrics,
+                cp_route: cp_route.clone(),
             };
             tasks.push(tokio::spawn(serve_clients(
                 self.client_listener,
@@ -661,6 +670,18 @@ impl ClusterEdgeState {
             .cloned()
     }
 
+    /// Any locally-registered CP group handle (the first), regardless of
+    /// leadership — used to read the group's current leader *hint* for
+    /// cross-process forwarding (ADR 0017 #3b) when this node is not the leader.
+    /// `None` if this node hosts no CP replica.
+    fn local_cp(&self) -> Option<CpGroup> {
+        self.raftkv
+            .lock()
+            .expect("raftkv handles poisoned")
+            .first()
+            .cloned()
+    }
+
     /// Propose `command` on **every** registered control handle that currently
     /// believes it is leader. Normally exactly one live node is leader; proposing
     /// on all self-styled leaders is robust to a stale handle. A non-leader
@@ -717,6 +738,13 @@ pub(crate) struct ClientCtx {
     /// The coord-role env's recording metrics sink (the `DataClient` coordinator
     /// records here). Aggregated into the `/metrics` export (ADR 0015).
     coord_metrics: MetricsHandle,
+    /// CP-group routing table: each CP group member id (`raftkv_id`, `300+i`) → the
+    /// **client API** address of its hosting node (ADR 0017 #3b). Lets a node that
+    /// received a CP op but doesn't host the group leader **forward** the request to
+    /// the leader's node. Built from the cluster config/bound addresses; empty in a
+    /// single-process `--cluster N` run (where the shared edge state already reaches
+    /// every group handle in-process, so no forwarding is needed).
+    cp_route: BTreeMap<NodeId, SocketAddr>,
 }
 
 impl ClientCtx {
@@ -732,10 +760,31 @@ impl ClientCtx {
     /// matching the AP path's quorum-durability contract. (Stage 3a confirms commit
     /// by reading the value back; a dedicated applied-index await is a 3b refinement,
     /// as is forwarding when this process holds no group leader.)
-    async fn cp_put(&self, key: Vec<u8>, value: Vec<u8>) -> ClientResponse {
-        let Some(leader) = self.edge.cp_leader() else {
-            return ClientResponse::Error("no CP group leader available".into());
-        };
+    async fn cp_put(&self, table: String, key: Vec<u8>, value: Vec<u8>) -> ClientResponse {
+        if let Some(leader) = self.edge.cp_leader() {
+            return Self::cp_put_local(&leader, key, value).await;
+        }
+        // Not the leader here: forward to the leader's node (ADR 0017 #3b).
+        match self.cp_forward_target() {
+            Some(addr) => {
+                self.cp_forward(
+                    addr,
+                    ClientRequest::Put {
+                        key,
+                        value,
+                        table: Some(table),
+                    },
+                )
+                .await
+            }
+            None => ClientResponse::Error("no CP group leader reachable".into()),
+        }
+    }
+
+    /// Propose a CP write on a **known-leader** local handle and wait until it is
+    /// committed + durable + applied (a linearizable read reflects it) before
+    /// acking — durable-before-ack.
+    async fn cp_put_local(leader: &CpGroup, key: Vec<u8>, value: Vec<u8>) -> ClientResponse {
         match leader.put(key.clone(), value.clone()) {
             ProposeResult::Accepted { .. } => {
                 let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
@@ -756,12 +805,69 @@ impl ClientCtx {
     }
 
     /// Route a CP-mode **read** to the per-tablet Raft group leader: a linearizable
-    /// ReadIndex read (no stale value — a deposed leader returns `None`).
-    async fn cp_get(&self, key: Vec<u8>) -> ClientResponse {
+    /// ReadIndex read (no stale value — a deposed leader returns `None`). Forwarded
+    /// to the leader's node if this node isn't it (ADR 0017 #3b).
+    async fn cp_get(&self, table: String, key: Vec<u8>) -> ClientResponse {
+        if let Some(leader) = self.edge.cp_leader() {
+            return ClientResponse::Value(leader.linearizable_get(&key).await);
+        }
+        match self.cp_forward_target() {
+            Some(addr) => {
+                self.cp_forward(
+                    addr,
+                    ClientRequest::Get {
+                        key,
+                        table: Some(table),
+                    },
+                )
+                .await
+            }
+            None => ClientResponse::Error("no CP group leader reachable".into()),
+        }
+    }
+
+    /// The client-API address to forward a CP op to: the hosting node of the group
+    /// leader as a local CP replica currently sees it (`leader()` hint → `cp_route`),
+    /// falling back to any known group node if there is no hint yet (it forwards on
+    /// or serves once a leader settles). `None` if this node knows of no CP route.
+    fn cp_forward_target(&self) -> Option<SocketAddr> {
+        let hint = self.edge.local_cp().and_then(|n| n.leader());
+        match hint {
+            Some(leader_id) => self.cp_route.get(&leader_id).copied(),
+            None => self.cp_route.values().next().copied(),
+        }
+    }
+
+    /// Forward `request` (wrapped so the receiver serves-or-errors, never
+    /// re-forwards) to another node's client API and relay its reply.
+    async fn cp_forward(&self, addr: SocketAddr, request: ClientRequest) -> ClientResponse {
+        let forwarded = ClientRequest::Forwarded(Box::new(request));
+        match tokio::time::timeout(CLIENT_TIMEOUT, async {
+            let mut stream = TcpStream::connect(addr).await.ok()?;
+            write_frame(&mut stream, &forwarded).await.ok()?;
+            read_frame::<ClientResponse>(&mut stream).await.ok()?
+        })
+        .await
+        {
+            Ok(Some(resp)) => resp,
+            _ => ClientResponse::Error("CP forward to leader failed".into()),
+        }
+    }
+
+    /// Serve a **forwarded** CP op locally: this node must be the leader (it does
+    /// not re-forward — bounding routing to one hop). `Some(resp)` if it was a CP
+    /// op we handled; `None` if the inner request wasn't a CP op we recognize.
+    async fn cp_serve_forwarded(&self, inner: ClientRequest) -> ClientResponse {
         let Some(leader) = self.edge.cp_leader() else {
-            return ClientResponse::Error("no CP group leader available".into());
+            return ClientResponse::Error("forwarded CP op: not the leader here".into());
         };
-        ClientResponse::Value(leader.linearizable_get(&key).await)
+        match inner {
+            ClientRequest::Put { key, value, .. } => Self::cp_put_local(&leader, key, value).await,
+            ClientRequest::Get { key, .. } => {
+                ClientResponse::Value(leader.linearizable_get(&key).await)
+            }
+            _ => ClientResponse::Error("unexpected forwarded request".into()),
+        }
     }
 
     /// Render this node's **live** metrics as the ADR 0015 text export
@@ -920,11 +1026,14 @@ async fn handle_client(mut stream: TcpStream, ctx: ClientCtx) -> std::io::Result
                 key,
                 value,
                 table: Some(t),
-            } if ctx.is_cp(&t) => ctx.cp_put(key, value).await,
+            } if ctx.is_cp(&t) => ctx.cp_put(t, key, value).await,
             ClientRequest::Get {
                 key,
                 table: Some(t),
-            } if ctx.is_cp(&t) => ctx.cp_get(key).await,
+            } if ctx.is_cp(&t) => ctx.cp_get(t, key).await,
+            // A CP op forwarded from another node (cross-process routing, ADR 0017
+            // #3b): serve locally iff we are the leader; never re-forward.
+            ClientRequest::Forwarded(inner) => ctx.cp_serve_forwarded(*inner).await,
             ClientRequest::Put { key, value, .. } => match ctx.view_for(&key) {
                 None => ClientResponse::Error("no tablet covers this key yet".into()),
                 Some(view) => {
@@ -1202,6 +1311,9 @@ pub async fn start_cluster_with(
                 w,
                 backend,
                 edge.clone(),
+                // In-process cluster: the shared edge state reaches every CP group
+                // handle in-process, so no cross-process forwarding route is needed.
+                BTreeMap::new(),
             )
             .await?;
         nodes.push(node);
@@ -1251,6 +1363,16 @@ pub async fn run_node_with(
     // One node per process: a fresh per-process edge-state set (it registers only
     // this node's control handle — cross-process proposal forwarding is future
     // work, ADR 0013).
+    //
+    // CP cross-process routing (ADR 0017 #3b): map each node's CP group member id
+    // (`raftkv_id`) to its **client API** address, so a CP op landing on a node
+    // that isn't the group leader forwards to the leader's node.
+    let cp_route: BTreeMap<NodeId, SocketAddr> = config
+        .nodes
+        .iter()
+        .enumerate()
+        .map(|(i, addrs)| (config::raftkv_id(i), addrs.client))
+        .collect();
     bound
         .start_with(
             config.peer_book(),
@@ -1260,6 +1382,7 @@ pub async fn run_node_with(
             config.w,
             backend,
             ClusterEdgeState::new(),
+            cp_route,
         )
         .await
 }

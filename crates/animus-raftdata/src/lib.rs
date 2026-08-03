@@ -397,6 +397,13 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         self.lock().is_leader()
     }
 
+    /// The group's current leader id as this node sees it (its Raft `leader_id`),
+    /// or `None` if unknown (e.g. mid-election). The id is a group member id; a
+    /// caller maps it to the hosting node for cross-process routing (ADR 0017 #3b).
+    pub fn leader(&self) -> Option<NodeId> {
+        self.lock().leader()
+    }
+
     /// This node's `Env` handle.
     pub fn env(&self) -> &E {
         &self.env
