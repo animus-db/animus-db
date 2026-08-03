@@ -87,7 +87,7 @@ fn wal_bytes_round_trip_and_tolerate_a_torn_tail() {
     for record in &wal {
         bytes.extend(PersistedState::encode_record(record));
     }
-    let decoded = PersistedState::decode(&bytes);
+    let decoded: Vec<WalRecord> = PersistedState::decode(&bytes);
     let from_records = PersistedState::replay(wal);
     let from_bytes = PersistedState::replay(decoded);
     assert_eq!(from_bytes.term, from_records.term);
@@ -100,7 +100,8 @@ fn wal_bytes_round_trip_and_tolerate_a_torn_tail() {
     // A crash mid-write leaves a partial trailing line; it must be ignored, and
     // the recovered state must equal the pre-torn-write state.
     bytes.extend_from_slice(b"{\"Hard\":{\"term\":99");
-    let torn = PersistedState::replay(PersistedState::decode(&bytes));
+    let torn_records: Vec<WalRecord> = PersistedState::decode(&bytes);
+    let torn = PersistedState::replay(torn_records);
     assert_eq!(
         torn.term, from_bytes.term,
         "a torn trailing record must be ignored"

@@ -39,4 +39,4 @@ pub use schema::{
 // public metadata surface (`Metadata::policies`).
 pub use animus_placement::PlacementPolicy;
 pub use persist::{PersistedState, WalRecord};
-pub use raft::{LogEntry, ProposeResult, RaftCore, RaftMsg, Role};
+pub use raft::{LogEntry, ProposeResult, RaftCore, RaftMsg, Role, StateMachine};

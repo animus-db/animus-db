@@ -26,10 +26,30 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use animus_env::{Nanos, NodeId};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::meta::{MetaCommand, Metadata};
 use crate::persist::{PersistedState, WalRecord};
+
+/// The replicated state machine a [`RaftCore`] drives. The control plane uses
+/// [`Metadata`] (command = [`MetaCommand`]); a future per-tablet data plane will
+/// supply a key-value store (ADR 0016). The core agrees the *order* of `C`-typed
+/// commands and applies them here; the `S` type is also the snapshot image
+/// (serialized for `InstallSnapshot` and the WAL snapshot record), hence the
+/// `Serialize`/`DeserializeOwned` bounds.
+///
+/// `apply` is deliberately infallible from the core's view — any
+/// accept/reject/no-op decision is the state machine's own business and does not
+/// change the replicated log (the control plane's richer `Metadata::apply`
+/// outcome is simply discarded by the trait impl).
+pub trait StateMachine<C>: Default + Clone + Serialize + DeserializeOwned {
+    /// Apply one agreed command to the state machine, in commit order.
+    fn apply(&mut self, command: &C);
+    /// The no-op command a freshly elected leader appends under its own term so
+    /// that prior-term entries can be committed (Raft's no-op-on-election).
+    fn noop() -> C;
+}
 
 /// Maximum bytes of serialized snapshot carried by a single `InstallSnapshot`
 /// message. A snapshot larger than this is shipped over several offset-addressed
@@ -38,20 +58,23 @@ use crate::persist::{PersistedState, WalRecord};
 /// message granularity, never correctness.
 pub const SNAPSHOT_CHUNK_BYTES: usize = 1024;
 
-/// A replicated log entry.
+/// A replicated log entry, generic over the command type `C` (defaults to the
+/// control plane's [`MetaCommand`]).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LogEntry {
+pub struct LogEntry<C = MetaCommand> {
     /// Leader term in which the entry was created.
     pub term: u64,
     /// 1-based position in the log.
     pub index: u64,
-    /// The metadata mutation.
-    pub command: MetaCommand,
+    /// The state-machine command.
+    pub command: C,
 }
 
-/// Wire messages exchanged between Raft peers.
+/// Wire messages exchanged between Raft peers, generic over the command type `C`
+/// (defaults to [`MetaCommand`]). Only [`AppendEntries`](RaftMsg::AppendEntries)
+/// carries commands; `InstallSnapshot` ships the snapshot as opaque bytes.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum RaftMsg {
+pub enum RaftMsg<C = MetaCommand> {
     /// Candidate solicits a vote.
     RequestVote {
         term: u64,
@@ -67,7 +90,7 @@ pub enum RaftMsg {
         leader: NodeId,
         prev_log_index: u64,
         prev_log_term: u64,
-        entries: Vec<LogEntry>,
+        entries: Vec<LogEntry<C>>,
         leader_commit: u64,
     },
     /// Response to [`RaftMsg::AppendEntries`].
@@ -118,7 +141,7 @@ pub enum RaftMsg {
     Heartbeat { node: NodeId },
 }
 
-impl RaftMsg {
+impl<C> RaftMsg<C> {
     /// The Raft term carried by this message. A [`Heartbeat`](RaftMsg::Heartbeat)
     /// is not consensus traffic and carries none, so it reports 0 (never forcing a
     /// step-down); the driver intercepts heartbeats before the core sees one.
@@ -152,8 +175,9 @@ pub enum ProposeResult {
     NotLeader { leader: Option<NodeId> },
 }
 
-/// An outbound message: `(destination, message)`.
-pub type Out = (NodeId, RaftMsg);
+/// An outbound message: `(destination, message)`. Generic over the command type
+/// `C` (defaults to [`MetaCommand`]).
+pub type Out<C = MetaCommand> = (NodeId, RaftMsg<C>);
 
 /// Follower-side reassembly state for an in-progress chunked snapshot transfer.
 /// Bytes accumulate in `buf` until `buf.len() == total`, at which point the
@@ -169,8 +193,11 @@ struct IncomingSnapshot {
     buf: Vec<u8>,
 }
 
-/// The Raft state machine for one node.
-pub struct RaftCore {
+/// The Raft state machine for one node, generic over the command type `C` and the
+/// applied state-machine `S` (defaults: the control plane's [`MetaCommand`] /
+/// [`Metadata`]). The consensus logic is identical for any `S: StateMachine<C>`;
+/// a per-tablet data plane (ADR 0016) instantiates it with a key-value store.
+pub struct RaftCore<C = MetaCommand, S = Metadata> {
     id: NodeId,
     peers: Vec<NodeId>,
     cluster_size: usize,
@@ -181,7 +208,7 @@ pub struct RaftCore {
     // The log holds entries with index > `snapshot_index`; `log[i].index ==
     // snapshot_index + 1 + i`. Entries up to `snapshot_index` are covered by the
     // state-machine snapshot (`metadata` reflects them) and discarded.
-    log: Vec<LogEntry>,
+    log: Vec<LogEntry<C>>,
     snapshot_index: u64,
     snapshot_term: u64,
     commit_index: u64,
@@ -216,19 +243,23 @@ pub struct RaftCore {
 
     // Applied state machine and the order commands were applied (for tests /
     // divergence checks).
-    metadata: Metadata,
-    applied: Vec<MetaCommand>,
+    metadata: S,
+    applied: Vec<C>,
 
     // Durable-state changes awaiting write to the WAL, plus the hard state last
     // marked for persistence (to detect term/vote changes).
-    pending: Vec<WalRecord>,
+    pending: Vec<WalRecord<C, S>>,
     persisted_hard: (u64, Option<NodeId>),
     // Set when the snapshot base moved (a local snapshot or an installed one),
     // signalling the driver to rewrite the WAL rather than append.
     snapshot_dirty: bool,
 }
 
-impl RaftCore {
+impl<C, S> RaftCore<C, S>
+where
+    C: Clone + std::fmt::Debug + Serialize + DeserializeOwned,
+    S: StateMachine<C>,
+{
     /// Create a follower. `all_nodes` is the full membership (including `id`).
     pub fn new(id: NodeId, all_nodes: &[NodeId], now: Nanos, entropy: u64) -> Self {
         let peers: Vec<NodeId> = all_nodes.iter().copied().filter(|n| *n != id).collect();
@@ -256,7 +287,7 @@ impl RaftCore {
             heartbeat_interval: Duration::from_millis(50),
             election_deadline: Nanos(0),
             heartbeat_deadline: Nanos(0),
-            metadata: Metadata::default(),
+            metadata: S::default(),
             applied: Vec::new(),
             pending: Vec::new(),
             persisted_hard: (0, None),
@@ -276,7 +307,7 @@ impl RaftCore {
     pub fn recovered(
         id: NodeId,
         all_nodes: &[NodeId],
-        persisted: PersistedState,
+        persisted: PersistedState<C, S>,
         now: Nanos,
         entropy: u64,
     ) -> Self {
@@ -305,7 +336,7 @@ impl RaftCore {
     /// driver writes and `fsync`s these before sending any outbound message.
     /// Captures any term/vote change first, so a granted vote is durable before
     /// it is sent.
-    pub fn drain_persist(&mut self) -> Vec<WalRecord> {
+    pub fn drain_persist(&mut self) -> Vec<WalRecord<C, S>> {
         self.checkpoint_hard();
         std::mem::take(&mut self.pending)
     }
@@ -319,7 +350,7 @@ impl RaftCore {
     ///
     /// Call only after [`drain_persist`](Self::drain_persist) has been flushed,
     /// so the image and the on-disk WAL agree.
-    pub fn wal_image(&self) -> Vec<WalRecord> {
+    pub fn wal_image(&self) -> Vec<WalRecord<C, S>> {
         let mut image = Vec::with_capacity(self.log.len() + 2);
         if self.snapshot_index > 0 {
             image.push(WalRecord::Snapshot {
@@ -425,13 +456,14 @@ impl RaftCore {
         self.last_applied
     }
 
-    /// A clone of the applied metadata.
-    pub fn metadata(&self) -> Metadata {
+    /// A clone of the applied state machine. (The control plane reads this as
+    /// `Metadata` via the specialized [`RaftCore::metadata`].)
+    pub fn state(&self) -> S {
         self.metadata.clone()
     }
 
     /// The sequence of commands applied so far, in order.
-    pub fn applied(&self) -> Vec<MetaCommand> {
+    pub fn applied(&self) -> Vec<C> {
         self.applied.clone()
     }
 
@@ -485,7 +517,7 @@ impl RaftCore {
     // ---- durable-state helpers ------------------------------------------
 
     /// Append a log entry and record it for persistence.
-    fn log_append(&mut self, entry: LogEntry) {
+    fn log_append(&mut self, entry: LogEntry<C>) {
         self.pending.push(WalRecord::Append(entry.clone()));
         self.log.push(entry);
     }
@@ -512,7 +544,7 @@ impl RaftCore {
     // ---- driving entry points -------------------------------------------
 
     /// Handle a timer tick at `now`. May start an election or send heartbeats.
-    pub fn tick(&mut self, now: Nanos, entropy: u64) -> Vec<Out> {
+    pub fn tick(&mut self, now: Nanos, entropy: u64) -> Vec<Out<C>> {
         match self.role {
             Role::Leader => {
                 if now.0 >= self.heartbeat_deadline.0 {
@@ -531,7 +563,13 @@ impl RaftCore {
     }
 
     /// Handle an inbound message from `from` at `now`.
-    pub fn handle(&mut self, from: NodeId, msg: RaftMsg, now: Nanos, entropy: u64) -> Vec<Out> {
+    pub fn handle(
+        &mut self,
+        from: NodeId,
+        msg: RaftMsg<C>,
+        now: Nanos,
+        entropy: u64,
+    ) -> Vec<Out<C>> {
         // Any message from a higher term forces us to step down first.
         if msg.term() > self.current_term {
             self.current_term = msg.term();
@@ -604,7 +642,7 @@ impl RaftCore {
 
     /// Propose a command. If leader, append it (replicated on the next
     /// heartbeat); otherwise report the leader hint.
-    pub fn propose(&mut self, command: MetaCommand) -> ProposeResult {
+    pub fn propose(&mut self, command: C) -> ProposeResult {
         if self.role != Role::Leader {
             return ProposeResult::NotLeader {
                 leader: self.leader_id,
@@ -633,7 +671,7 @@ impl RaftCore {
         last_log_term: u64,
         now: Nanos,
         entropy: u64,
-    ) -> Vec<Out> {
+    ) -> Vec<Out<C>> {
         let granted = if term < self.current_term {
             false
         } else {
@@ -658,7 +696,13 @@ impl RaftCore {
         )]
     }
 
-    fn handle_vote_resp(&mut self, from: NodeId, term: u64, granted: bool, now: Nanos) -> Vec<Out> {
+    fn handle_vote_resp(
+        &mut self,
+        from: NodeId,
+        term: u64,
+        granted: bool,
+        now: Nanos,
+    ) -> Vec<Out<C>> {
         if self.role != Role::Candidate || term != self.current_term {
             return Vec::new();
         }
@@ -678,11 +722,11 @@ impl RaftCore {
         leader: NodeId,
         prev_log_index: u64,
         prev_log_term: u64,
-        entries: Vec<LogEntry>,
+        entries: Vec<LogEntry<C>>,
         leader_commit: u64,
         now: Nanos,
         entropy: u64,
-    ) -> Vec<Out> {
+    ) -> Vec<Out<C>> {
         if term < self.current_term {
             return vec![(
                 leader,
@@ -765,7 +809,7 @@ impl RaftCore {
         term: u64,
         success: bool,
         match_index: u64,
-    ) -> Vec<Out> {
+    ) -> Vec<Out<C>> {
         if self.role != Role::Leader || term != self.current_term {
             return Vec::new();
         }
@@ -807,7 +851,7 @@ impl RaftCore {
         done: bool,
         now: Nanos,
         entropy: u64,
-    ) -> Vec<Out> {
+    ) -> Vec<Out<C>> {
         if term < self.current_term {
             return vec![(
                 leader,
@@ -877,9 +921,9 @@ impl RaftCore {
                 .expect("present when complete");
             // A malformed snapshot would be a leader bug; drop the transfer and
             // re-request on the next chunk rather than installing garbage.
-            match serde_json::from_slice::<Metadata>(&inc.buf) {
-                Ok(metadata) => {
-                    self.metadata = metadata;
+            match serde_json::from_slice::<S>(&inc.buf) {
+                Ok(state) => {
+                    self.metadata = state;
                     self.snapshot_index = inc.last_index;
                     self.snapshot_term = inc.last_term;
                     self.last_applied = inc.last_index;
@@ -927,7 +971,7 @@ impl RaftCore {
         term: u64,
         last_index: u64,
         next_offset: u64,
-    ) -> Vec<Out> {
+    ) -> Vec<Out<C>> {
         if self.role != Role::Leader || term != self.current_term {
             return Vec::new();
         }
@@ -951,7 +995,7 @@ impl RaftCore {
 
     // ---- role transitions & replication ---------------------------------
 
-    fn start_election(&mut self, now: Nanos, entropy: u64) -> Vec<Out> {
+    fn start_election(&mut self, now: Nanos, entropy: u64) -> Vec<Out<C>> {
         self.role = Role::Candidate;
         self.current_term += 1;
         self.voted_for = Some(self.id);
@@ -980,7 +1024,7 @@ impl RaftCore {
             .collect()
     }
 
-    fn become_leader(&mut self, now: Nanos) -> Vec<Out> {
+    fn become_leader(&mut self, now: Nanos) -> Vec<Out<C>> {
         self.role = Role::Leader;
         self.leader_id = Some(self.id);
         let last = self.last_log_index();
@@ -994,19 +1038,19 @@ impl RaftCore {
         self.log_append(LogEntry {
             term: self.current_term,
             index: last + 1,
-            command: MetaCommand::NoOp,
+            command: S::noop(),
         });
         self.heartbeat_deadline = Nanos(now.0.saturating_add(self.heartbeat_nanos()));
         self.broadcast_append()
     }
 
-    fn broadcast_append(&self) -> Vec<Out> {
+    fn broadcast_append(&self) -> Vec<Out<C>> {
         self.peers.iter().map(|&p| self.replicate_to(p)).collect()
     }
 
     /// Build the right replication message for `peer`: an `InstallSnapshot` if
     /// the entries it needs have been compacted away, otherwise `AppendEntries`.
-    fn replicate_to(&self, peer: NodeId) -> Out {
+    fn replicate_to(&self, peer: NodeId) -> Out<C> {
         let next = self.next_index.get(&peer).copied().unwrap_or(1).max(1);
         // The entry before `next` is in our snapshot (or earlier) — we can't form
         // a valid `prev_log_term`, so ship the snapshot instead, as the next
@@ -1016,7 +1060,7 @@ impl RaftCore {
         }
         let prev_log_index = next - 1;
         let prev_log_term = self.term_at(prev_log_index);
-        let entries: Vec<LogEntry> = self
+        let entries: Vec<LogEntry<C>> = self
             .log
             .iter()
             .filter(|e| e.index >= next)
@@ -1039,7 +1083,7 @@ impl RaftCore {
     /// offset recorded in `snapshot_offset` (0 if no transfer is in flight).
     /// Pure: it serializes the current `metadata` and slices out one chunk, so
     /// repeated calls at the same offset are byte-identical and deterministic.
-    fn snapshot_chunk_for(&self, peer: NodeId) -> Out {
+    fn snapshot_chunk_for(&self, peer: NodeId) -> Out<C> {
         let serialized = serde_json::to_vec(&self.metadata).expect("metadata serializes");
         let total = serialized.len() as u64;
         let offset = self
@@ -1128,5 +1172,15 @@ impl RaftCore {
 
     fn heartbeat_nanos(&self) -> u64 {
         self.heartbeat_interval.as_nanos() as u64
+    }
+}
+
+/// Control-plane-specific conveniences for the default instantiation
+/// (`RaftCore<MetaCommand, Metadata>`), so existing callers keep reading the
+/// applied state as `Metadata` rather than the generic [`RaftCore::state`].
+impl RaftCore<MetaCommand, Metadata> {
+    /// A clone of the applied metadata state machine.
+    pub fn metadata(&self) -> Metadata {
+        self.state()
     }
 }

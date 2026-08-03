@@ -163,9 +163,17 @@ either inapplicable, retrofittable onto Raft, or already covered elsewhere:
 
 **Follow-up work (sequenced):**
 
-1. This ADR (the decision). 
-2. Generalize `RaftCore` → `RaftCore<SM>` as a no-behavior-change refactor (control
-   plane keeps passing today's `Metadata` SM; full existing suite stays green).
+1. ✅ This ADR (the decision).
+2. ✅ **Generalize `RaftCore` → `RaftCore<C, S>`** as a no-behavior-change refactor.
+   *Done:* a `StateMachine<C>` trait (`apply` + `noop`), `Metadata:
+   StateMachine<MetaCommand>`, and two defaulted type params (`C = MetaCommand`,
+   `S = Metadata`) threaded through `LogEntry`/`RaftMsg`/`WalRecord`/`PersistedState`/
+   `RaftCore`. The defaults keep the control plane (and the whole workspace) source-
+   and WAL-byte-compatible — full suite green (100 binaries). `RaftNode` stays
+   control-plane-specific (its driver bakes in reconcile/failure-detection); the KV
+   driver is step 3. A `tests/generic_state_machine.rs` drives the same core with a
+   toy KV state machine through propose → durable-apply → snapshot → recovery,
+   proving the generalization is real.
 3. The per-tablet Raft KV backend + the replication-backend seam + the Raft-routing
    coordinator (its own build ADR, with the leadership-ownership and cross-tablet
    transaction decisions).

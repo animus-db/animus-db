@@ -27,9 +27,18 @@ epoch compare-and-swap transactions.
   *shape*, not its entry data. `TableSchema::validate` is the pure
   malformed-schema check the state machine applies (incl. unique index names + an
   LSI requiring a sort attribute). All plain data — no I/O, no clock, no RNG.
-- `raft.rs` — `RaftCore`: a **synchronous, I/O-free** Raft state machine. Time
-  and randomness are parameters (`now`, `entropy`); it returns outbound messages
-  and emits WAL records.
+- `raft.rs` — `RaftCore<C, S>`: a **synchronous, I/O-free** Raft state machine,
+  **generic over its command `C` and applied state-machine `S`** (defaults:
+  `MetaCommand` / `Metadata`, so existing references are unchanged). Time and
+  randomness are parameters (`now`, `entropy`); it returns outbound messages and
+  emits WAL records. The state machine is the `StateMachine<C>` trait (`apply` +
+  `noop`), implemented by `Metadata` for the control plane and by a key-value store
+  for the future per-tablet data plane (ADR 0016). The consensus logic
+  (election/replication/commit/snapshot/`InstallSnapshot`/durability) is identical
+  for any `S`; only `apply` and the snapshot image type are `S`-specific. **The
+  driver `RaftNode` stays control-plane-specific** (it bakes in reconcile +
+  failure-detection); the KV data plane gets its own driver. `RaftCore::metadata()`
+  is the `S = Metadata` convenience over the generic `state()`.
 - `persist.rs` — `WalRecord`, `PersistedState` (durability/recovery). The WAL
   write/compact/recover flow is diagrammed in `docs/wal.md`.
 - `node.rs` — `RaftNode<E>`: the `Env` driver wrapping the core, plus

@@ -373,3 +373,19 @@ impl Metadata {
         self.schemas.get(table).map_or(&[], |s| &s.indexes)
     }
 }
+
+/// `Metadata` is the control plane's replicated state machine: the [`RaftCore`]
+/// agrees the order of [`MetaCommand`]s and applies them here. (The inherent
+/// [`Metadata::apply`] returns an [`ApplyOutcome`] for callers that care; the
+/// consensus core only needs the order, so the trait impl discards it.)
+///
+/// [`RaftCore`]: crate::raft::RaftCore
+impl crate::raft::StateMachine<MetaCommand> for Metadata {
+    fn apply(&mut self, command: &MetaCommand) {
+        let _ = Metadata::apply(self, command);
+    }
+
+    fn noop() -> MetaCommand {
+        MetaCommand::NoOp
+    }
+}

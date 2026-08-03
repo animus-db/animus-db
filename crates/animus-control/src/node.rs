@@ -224,7 +224,8 @@ impl<E: Env> RaftNode<E> {
 /// heartbeats are simply not delivered, which is exactly what the detector keys
 /// off.
 pub async fn send_heartbeat<E: Env>(env: &E, control: &[NodeId]) {
-    let msg = RaftMsg::Heartbeat {
+    // Heartbeat carries no command, so pin the default control-plane instantiation.
+    let msg: RaftMsg = RaftMsg::Heartbeat {
         node: env.node_id(),
     };
     let bytes = serde_json::to_vec(&msg).expect("heartbeat serializes");
