@@ -196,3 +196,129 @@ async fn cp_member_addresses_register_and_replicate() {
         n.shutdown();
     }
 }
+
+/// Phase 2.2 — **CP tablet split over `ProdEnv`.** A running CP tablet splits at a
+/// key into two groups: keys below stay on the original group, keys at/above move
+/// to a new co-resident group (minted via `Coresident::sibling`, its address
+/// distributed by 2.3a). Both halves keep serving, and a value written before the
+/// split rides the handoff to the new group.
+///
+/// Real TCP/time: bring up a 3-node cluster, write a lower + an upper key, trigger
+/// the split, then poll until the new tablet is in the map and the upper key is
+/// served by the new group (its election + address propagation take a moment).
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn cp_tablet_splits_and_both_halves_serve() {
+    let dir = tempfile::tempdir().unwrap();
+    let bound = bind_cluster(3, "127.0.0.1".parse().unwrap(), dir.path())
+        .await
+        .unwrap();
+    let nodes = start_cluster(bound).await.unwrap();
+    await_bootstrap(&nodes).await;
+    let addr0 = nodes[0].client_addr();
+
+    // Helper: a Put that retries until PutOk (CP group may still be electing).
+    async fn put_until_ok(addr: std::net::SocketAddr, key: &[u8], value: &[u8]) {
+        let put = async {
+            loop {
+                match call(
+                    addr,
+                    ClientRequest::Put {
+                        key: key.to_vec(),
+                        value: value.to_vec(),
+                        table: None,
+                    },
+                )
+                .await
+                {
+                    ClientResponse::PutOk => return,
+                    ClientResponse::Error(_) => sleep(Duration::from_millis(100)).await,
+                    other => panic!("unexpected put response: {other:?}"),
+                }
+            }
+        };
+        timeout(Duration::from_secs(20), put)
+            .await
+            .expect("put did not succeed within 20s");
+    }
+
+    // Write a lower key and an upper key (split point will be "k5").
+    put_until_ok(addr0, b"k1", b"lower").await;
+    put_until_ok(addr0, b"k9", b"upper").await; // rides the handoff to the new group
+
+    // Trigger the split of the bootstrap tablet (id 1) at "k5".
+    let resp = call(
+        addr0,
+        ClientRequest::SplitTablet {
+            tablet: 1,
+            split_key: b"k5".to_vec(),
+        },
+    )
+    .await;
+    assert!(
+        matches!(resp, ClientResponse::PutOk),
+        "split trigger rejected: {resp:?}"
+    );
+
+    // The control plane now has a second tablet (the new upper-range tablet).
+    let split_recorded = async {
+        loop {
+            if nodes.iter().all(|n| n.metadata().tablets.len() == 2) {
+                return;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    };
+    timeout(Duration::from_secs(20), split_recorded)
+        .await
+        .expect("split was not recorded in the tablet map within 20s");
+
+    // The upper key is now served by the NEW group (seeded from the handoff): read
+    // it back via a different node, retrying while the new group elects + its
+    // members' addresses propagate.
+    let read_upper = async {
+        loop {
+            let got = call(
+                nodes[2].client_addr(),
+                ClientRequest::Get {
+                    key: b"k9".to_vec(),
+                    table: None,
+                },
+            )
+            .await;
+            if got == ClientResponse::Value(Some(b"upper".to_vec())) {
+                return;
+            }
+            sleep(Duration::from_millis(150)).await;
+        }
+    };
+    timeout(Duration::from_secs(30), read_upper)
+        .await
+        .expect("upper key not served by the new tablet's group within 30s");
+
+    // The lower key still round-trips on the original group.
+    let lower = call(
+        addr0,
+        ClientRequest::Get {
+            key: b"k1".to_vec(),
+            table: None,
+        },
+    )
+    .await;
+    assert_eq!(lower, ClientResponse::Value(Some(b"lower".to_vec())));
+
+    // A *new* upper-range write routes to the new group and round-trips.
+    put_until_ok(addr0, b"k7", b"upper2").await;
+    let new_upper = call(
+        nodes[1].client_addr(),
+        ClientRequest::Get {
+            key: b"k7".to_vec(),
+            table: None,
+        },
+    )
+    .await;
+    assert_eq!(new_upper, ClientResponse::Value(Some(b"upper2".to_vec())));
+
+    for n in &nodes {
+        n.shutdown();
+    }
+}

@@ -24,7 +24,7 @@
 //! [`BoundNode::start`]. [`bind_cluster`] / [`start_cluster`] do this for an
 //! in-process cluster (used by the binary's `--cluster` mode and the tests).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -43,8 +43,8 @@ mod cql;
 mod dynamo;
 
 use animus_control::{ProposeResult, RaftNode};
-use animus_cp_data::RaftKvNode;
-use animus_env::{Env, Metric, MetricsHandle, NodeId, ProdEnv};
+use animus_cp_data::{RaftKvNode, SplitHook};
+use animus_env::{Coresident, Env, Metric, MetricsHandle, NodeId, ProdEnv};
 use animus_storage::{LsmEngine, MemoryEngine};
 use animus_tablet::{KeyRange, TabletId};
 use serde::Serialize;
@@ -133,6 +133,17 @@ impl CpGroup {
             CpGroup::Mem(n) => n.leader(),
         }
     }
+
+    /// Propose a **tablet split** at `at` (Phase 2.2): keys `>= at` move to a new
+    /// tablet. Leader-only. On commit every replica tombstones `[at, ∞)` and the
+    /// node's split hook mints the new tablet's co-resident group. See
+    /// [`RaftKvNode::propose_split`].
+    fn propose_split(&self, at: Vec<u8>) -> ProposeResult {
+        match self {
+            CpGroup::Lsm(n) => n.propose_split(at),
+            CpGroup::Mem(n) => n.propose_split(at),
+        }
+    }
 }
 
 /// How a CP op originating on this node reaches the group leader
@@ -161,8 +172,22 @@ const MAX_REPLICATION_FACTOR: usize = 3;
 /// `ProdEnv`'s disk opens files directly under the role's data dir and does not
 /// create intermediate directories, so a slash-bearing prefix would fail to
 /// create the engine's files. The role's dir is dedicated to this group, so a flat
-/// prefix already isolates it.
+/// prefix already isolates it. A split-created tablet's group uses a per-tablet
+/// prefix `db-t{id}-` so co-resident groups' LSM files never collide.
 const LSM_PREFIX: &str = "db-";
+
+/// Size of each `raftkv` env's pre-bound **sibling listener pool** (Phase 2.2): the
+/// number of co-resident CP groups a node can host beyond its bootstrap group, i.e.
+/// the split depth a node can take part in before the pool is exhausted.
+const CP_SIBLING_POOL: usize = 4;
+
+/// Stride for deriving a split-created tablet's CP **member ids** from the parent
+/// group's, deterministically + identically on every replica (Phase 2.2): a new
+/// member is `parent_member + new_tablet_id * CP_SPLIT_ID_STRIDE`. Wide enough that
+/// `300 + i` bootstrap ids and per-tablet bands never overlap for small clusters /
+/// tablet counts. (Deep-split id allocation — a flat allocator that survives many
+/// generations — is a later refinement.)
+const CP_SPLIT_ID_STRIDE: NodeId = 1000;
 
 /// Which storage engine backs a node's CP group.
 ///
@@ -239,6 +264,12 @@ pub enum ClientRequest {
     /// leader). The result replicates back to every node's `Metadata` as usual; the
     /// caller confirms by polling its own replicated view.
     ProposeSchema(MetaCommand),
+    /// **Admin: split a CP tablet** at `split_key` (Phase 2.2). The receiving node
+    /// records the split in the control plane (`SplitTablet`, minting a new tablet
+    /// id) and proposes the data-plane split on the tablet's CP group leader, which
+    /// on commit hands the upper range `[split_key, ∞)` to a new co-resident group.
+    /// The interim manual trigger; an automatic size-telemetry trigger is later work.
+    SplitTablet { tablet: u64, split_key: Vec<u8> },
 }
 
 /// Whether `command` may be **relayed to the control leader** via
@@ -395,6 +426,9 @@ impl BoundNode {
         // reaches every co-resident group.
         let static_peers = peers;
         let raftkv_sync_env = self.raftkv_env.clone();
+        // A second `raftkv`-env clone for the split hook to mint co-resident sibling
+        // inboxes from (Phase 2.2); shares the pool + peer book with the group's env.
+        let raftkv_hook_env = self.raftkv_env.clone();
         let my_raftkv_id = self.raftkv_id;
         let my_raftkv_addr = self.raftkv_addr;
 
@@ -426,30 +460,46 @@ impl BoundNode {
         // that set runs a `RaftKvNode` on its `raftkv_env` (own id/port/dir — the
         // single-consumer inbox rule), backed by its own engine; the handle is
         // registered in the per-cluster edge state so the wire edges route a table's
-        // reads/writes to the group leader. Dynamic CP placement / split /
-        // reconfigure over `ProdEnv` and address distribution are later v1 work.
+        // reads/writes to the group leader. The group is started with a **split
+        // hook** (Phase 2.2): on a committed `Split` it mints the new tablet's
+        // co-resident group. Dynamic CP reconfigure over `ProdEnv` is later v1 work.
         let n = control_ids.len();
         let cp_group: Vec<NodeId> = (0..n.min(MAX_REPLICATION_FACTOR))
             .map(config::raftkv_id)
             .collect();
         let hosts_cp = cp_group.contains(&my_raftkv_id);
         if hosts_cp {
+            let hook = cp_split_hook(
+                raftkv_hook_env,
+                edge.clone(),
+                raft.clone(),
+                cp_group.clone(),
+                my_raftkv_id,
+                backend,
+                Arc::new(Mutex::new(BTreeSet::new())),
+            );
             let cp = match backend {
                 StorageBackend::Lsm => {
                     let lsm = LsmEngine::open(self.raftkv_env.clone(), LSM_PREFIX)
                         .await
                         .map_err(|e| std::io::Error::other(format!("opening CP group LSM: {e}")))?;
-                    CpGroup::Lsm(RaftKvNode::start(self.raftkv_env, cp_group, lsm))
+                    CpGroup::Lsm(RaftKvNode::start_with_split_hook(
+                        self.raftkv_env,
+                        cp_group,
+                        lsm,
+                        hook,
+                    ))
                 }
-                StorageBackend::Memory => CpGroup::Mem(RaftKvNode::start(
+                StorageBackend::Memory => CpGroup::Mem(RaftKvNode::start_with_split_hook(
                     self.raftkv_env,
                     cp_group,
                     MemoryEngine::new(),
+                    hook,
                 )),
             };
             // The statically-placed group serves the bootstrap tablet (the whole
-            // keyspace). A tablet split (Phase 2.2) registers the new tablet's group
-            // alongside it; routing is keyed by tablet (`cp_route`).
+            // keyspace). A tablet split registers the new tablet's group alongside
+            // it; routing is keyed by tablet (`cp_route`).
             edge.register_raftkv(TABLET, cp);
         }
 
@@ -547,9 +597,14 @@ impl Node {
             ProdEnv::bind(control_id, addrs.control, dir.join("control")).await?;
         // The leaderful CP per-tablet Raft role's internal env (ADR 0017 #3a) — the
         // v1 data plane; distinct id/port/dir from the control role (single-consumer
-        // inbox).
+        // inbox). Bound with a **sibling listener pool** (Phase 2.2) so a tablet
+        // split can mint a co-resident group member at runtime; the pool size bounds
+        // how many co-resident CP groups this node can host.
+        let pool: Vec<SocketAddr> = (0..CP_SIBLING_POOL)
+            .map(|_| SocketAddr::new(addrs.raftkv.ip(), 0))
+            .collect();
         let (raftkv_env, raftkv_addr) =
-            ProdEnv::bind(raftkv_id, addrs.raftkv, dir.join("raftkv")).await?;
+            ProdEnv::bind_with_pool(raftkv_id, addrs.raftkv, &pool, dir.join("raftkv")).await?;
         let client_listener = TcpListener::bind(addrs.client).await?;
         let client_addr = client_listener.local_addr()?;
         let dynamo_listener = TcpListener::bind(addrs.dynamo).await?;
@@ -1228,6 +1283,152 @@ async fn peer_sync_loop(
     }
 }
 
+/// Build the **CP split hook** (Phase 2.2) for this node's bootstrap CP group. When
+/// the group commits a `Split { at }`, every replica applies it and invokes this
+/// hook with the handed-off `[at, ∞)` data; the hook spawns [`cp_split_seed`] to
+/// stand up this node's co-resident member of the new tablet's group. The original
+/// group separately tombstones `[at, ∞)` (in `animus-cp-data`), so the keyspace
+/// partitions cleanly.
+///
+/// `parent_members` are the splitting group's member ids (the bootstrap group's =
+/// the node base `raftkv` ids); `my_id` is this node's member id in it.
+fn cp_split_hook(
+    raftkv_env: ProdEnv,
+    edge: ClusterEdgeState,
+    raft: RaftNode<ProdEnv>,
+    parent_members: Vec<NodeId>,
+    my_id: NodeId,
+    backend: StorageBackend,
+    minted: Arc<Mutex<BTreeSet<TabletId>>>,
+) -> SplitHook {
+    Arc::new(move |at, handoff| {
+        tokio::spawn(cp_split_seed(
+            raftkv_env.clone(),
+            edge.clone(),
+            raft.clone(),
+            parent_members.clone(),
+            my_id,
+            backend,
+            Arc::clone(&minted),
+            at,
+            handoff,
+        ));
+    })
+}
+
+/// Stand up this node's co-resident member of a split-created tablet's CP group
+/// (Phase 2.2), seeded with the handed-off `[at, ∞)` `handoff` data.
+///
+/// Resolves the new tablet from replicated `Metadata` (the trigger's `SplitTablet`
+/// created a tablet whose range starts at `at`), derives the new group's member ids
+/// deterministically (`base + new_tablet * CP_SPLIT_ID_STRIDE`, identical on every
+/// replica), mints a `Coresident::sibling` inbox for its own member, opens a
+/// per-tablet engine, `start_seeded`s the group, registers it for routing, and
+/// publishes its address (peer-sync distributes it). **Idempotent** within a
+/// process: if this node already hosts the new tablet's group it returns (the hook
+/// fires on every apply, incl. WAL re-apply on recovery).
+#[allow(clippy::too_many_arguments)] // split context: env + edge + raft + ids + backend + payload
+async fn cp_split_seed(
+    raftkv_env: ProdEnv,
+    edge: ClusterEdgeState,
+    raft: RaftNode<ProdEnv>,
+    parent_members: Vec<NodeId>,
+    my_id: NodeId,
+    backend: StorageBackend,
+    minted: Arc<Mutex<BTreeSet<TabletId>>>,
+    at: Vec<u8>,
+    handoff: Vec<(Vec<u8>, Vec<u8>)>,
+) {
+    // The new tablet is the one the trigger's `SplitTablet` created with range
+    // starting exactly at the split key. Poll briefly for it to replicate here.
+    let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
+    let new_tablet = loop {
+        let found = raft
+            .metadata()
+            .tablets
+            .iter()
+            .find(|(_, t)| t.range.start == at)
+            .map(|(id, _)| *id);
+        if let Some(t) = found {
+            break t;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            tracing::warn!("CP split: new tablet for the split key never appeared");
+            return;
+        }
+        tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+    };
+
+    // Idempotent **per node**: mint this node's member of the new tablet only once
+    // per process. (The per-node `minted` set, not the edge state — in a
+    // `--cluster N` process the edge is *shared* across nodes, so gating on
+    // `edge.local_cp(new_tablet)` would let the first node's mint suppress every
+    // other node's, leaving the new group without a quorum.)
+    {
+        let mut minted = minted.lock().expect("minted set poisoned");
+        if !minted.insert(new_tablet) {
+            return;
+        }
+    }
+
+    // Deterministic member ids for the new group: every replica derives the same set
+    // from the parent members + the new tablet id.
+    let new_members: Vec<NodeId> = parent_members
+        .iter()
+        .map(|m| m + new_tablet.0 * CP_SPLIT_ID_STRIDE)
+        .collect();
+    let my_new_id = my_id + new_tablet.0 * CP_SPLIT_ID_STRIDE;
+
+    // A co-resident inbox for this node's member of the new group, drawn from the
+    // pre-bound listener pool; its address is published for peer-sync.
+    let sibling = raftkv_env.sibling(my_new_id);
+    let sibling_addr = sibling.local_addr();
+    let cp = match backend {
+        StorageBackend::Lsm => {
+            let prefix = format!("db-t{}-", new_tablet.0);
+            match LsmEngine::open(sibling.clone(), &prefix).await {
+                Ok(lsm) => {
+                    CpGroup::Lsm(RaftKvNode::start_seeded(sibling, new_members, lsm, handoff).await)
+                }
+                Err(e) => {
+                    tracing::error!(?e, "CP split: opening new tablet LSM");
+                    return;
+                }
+            }
+        }
+        StorageBackend::Memory => CpGroup::Mem(
+            RaftKvNode::start_seeded(sibling, new_members, MemoryEngine::new(), handoff).await,
+        ),
+    };
+    edge.register_raftkv(new_tablet, cp);
+
+    // Publish this member's address so every node's peer-sync loop can reach it —
+    // the new group's internal Raft traffic (election, replication) cannot make
+    // progress until every member's address is in the peer books. Re-propose until
+    // it is visible in replicated `Metadata` (a single fire-and-forget propose can
+    // be dropped if control leadership is momentarily in flux, which would strand
+    // the new group). Via the in-process control leader; cross-process
+    // split-address relay is later work.
+    let addr = sibling_addr.to_string();
+    let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
+    loop {
+        if raft.metadata().cp_member_addrs.get(&my_new_id) == Some(&addr) {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            tracing::warn!(member = my_new_id, "CP split: address never committed");
+            break;
+        }
+        if let Some(leader) = edge.leader_handle() {
+            let _ = leader.propose(MetaCommand::RegisterCpAddr {
+                id: my_new_id,
+                addr: addr.clone(),
+            });
+        }
+        tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+    }
+}
+
 async fn serve_clients(listener: TcpListener, ctx: ClientCtx) {
     loop {
         match listener.accept().await {
@@ -1265,6 +1466,10 @@ async fn handle_client(mut stream: TcpStream, ctx: ClientCtx) -> std::io::Result
                 Ok(()) => ClientResponse::PutOk,
                 Err(e) => ClientResponse::Error(e),
             },
+            // Admin: split a CP tablet (Phase 2.2).
+            ClientRequest::SplitTablet { tablet, split_key } => {
+                ctx.trigger_split(TabletId(tablet), split_key).await
+            }
             // A CP op forwarded from another node (cross-process routing, ADR 0017
             // #3b): serve locally iff we are the leader; never re-forward.
             ClientRequest::Forwarded(inner) => ctx.cp_serve_forwarded(*inner).await,
@@ -1346,6 +1551,60 @@ impl ClientCtx {
                 || (self.raft.metadata().cp_member_addrs.get(&id) == Some(&want)).then_some(()),
             )
             .await;
+    }
+
+    /// Split CP `tablet` at `split_key` (Phase 2.2): record the split in the control
+    /// plane (a new tablet id covering `[split_key, ∞)`), then trigger the
+    /// data-plane split on the tablet's CP group leader — on commit each replica's
+    /// split hook mints the new tablet's co-resident group. Returns once the
+    /// data-plane split is *accepted* (the new group forms + becomes routable
+    /// asynchronously; the caller polls a read of an upper-range key to observe it).
+    async fn trigger_split(&self, tablet: TabletId, split_key: Vec<u8>) -> ClientResponse {
+        // The new tablet id: one past the current max (deterministic on the leader
+        // that proposes it; replicated to all via `SplitTablet`).
+        let new_id = TabletId(
+            self.raft
+                .metadata()
+                .tablets
+                .keys()
+                .map(|t| t.0)
+                .max()
+                .unwrap_or(0)
+                + 1,
+        );
+        // 1. Record the split in the control plane and wait until the new tablet is
+        //    visible here, so the split hook can resolve `new_id` from `Metadata`
+        //    when the data-plane `Split` applies. Routed to the control leader.
+        let cmd = MetaCommand::SplitTablet {
+            tablet,
+            split_key: split_key.clone(),
+            new_id,
+        };
+        if self
+            .propose_and_await(cmd, SCHEMA_COMMIT_TIMEOUT, || {
+                self.raft
+                    .metadata()
+                    .tablets
+                    .contains_key(&new_id)
+                    .then_some(())
+            })
+            .await
+            .is_err()
+        {
+            return ClientResponse::Error("split metadata did not commit in time".into());
+        }
+        // 2. Trigger the data-plane split on the tablet's CP group leader (it fires
+        //    every replica's split hook on commit). Forwarding a split to a remote
+        //    leader is later work; in-process the shared edge reaches the leader.
+        match self.edge.cp_leader(tablet) {
+            Some(leader) => match leader.propose_split(split_key) {
+                ProposeResult::Accepted { .. } => ClientResponse::PutOk,
+                ProposeResult::NotLeader { .. } => {
+                    ClientResponse::Error("CP group leader moved; retry the split".into())
+                }
+            },
+            None => ClientResponse::Error("no CP group leader for the tablet here".into()),
+        }
     }
 
     /// Propose `CreateKeyspace` to the control-plane leader and wait for it to
