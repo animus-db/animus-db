@@ -10,7 +10,7 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use animus_control::ProposeResult;
-use animus_raftdata::RaftKvNode;
+use animus_cp_data::RaftKvNode;
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::MemoryEngine;
 use futures::executor::block_on;

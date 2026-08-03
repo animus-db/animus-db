@@ -1,4 +1,4 @@
-# CLAUDE.md — animus-raftdata
+# CLAUDE.md — animus-cp-data
 
 This file provides guidance to Claude Code (claude.ai/code) when working in this crate.
 
@@ -119,5 +119,5 @@ the engine — the `AccordCore` sync-core/async-driver split.
 
 ## Tests
 
-`cargo test -p animus-raftdata` — `tests/single_tablet.rs` (SimEnv; drive with
+`cargo test -p animus-cp-data` — `tests/single_tablet.rs` (SimEnv; drive with
 `run_for`, never `run()` — the driver has perpetual heartbeat/election timers).

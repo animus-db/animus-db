@@ -144,7 +144,7 @@ impl ColumnDef {
 
 /// How a table's data is replicated (ADR 0016 / ADR 0017). The default is the
 /// leaderless **AP** data plane (`animus-data`); **CP** selects the leaderful
-/// per-tablet Raft plane (`animus-raftdata`) for linearizable single-tablet
+/// per-tablet Raft plane (`animus-cp-data`) for linearizable single-tablet
 /// reads/writes. Replicated in the schema catalog so the choice is durable,
 /// cluster-agreed, and recovered from Raft like the rest of the schema; the wire
 /// edges read it to route a table's reads/writes to the right plane.

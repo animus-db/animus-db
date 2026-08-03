@@ -76,7 +76,7 @@ so it doesn't actually exercise `check_cycles`. The Accord-targeted suite does:
 ### Elle-against-Raft: the leaderful (CP) plane corpus (ADR 0017)
 
 - `raftkv_linearizable.rs` — the **CP counterpart** of the Accord corpus, for the
-  `animus-raftdata` leaderful data plane. Crucially it is **not** a `Topology`
+  `animus-cp-data` leaderful data plane. Crucially it is **not** a `Topology`
   variant of `support/mod.rs`: that harness drives **multi-key transactions** via
   `AccordNode`, but the Raft KV plane is **single-tablet, non-transactional KV**
   (`put`/`delete`/`linearizable_get`, one key per op), so the transactional

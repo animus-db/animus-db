@@ -35,7 +35,7 @@ the relevant one before working in a crate:
 | `animus-tablet` | [crates/animus-tablet/CLAUDE.md](crates/animus-tablet/CLAUDE.md) |
 | `animus-control` | [crates/animus-control/CLAUDE.md](crates/animus-control/CLAUDE.md) |
 | `animus-data` | [crates/animus-data/CLAUDE.md](crates/animus-data/CLAUDE.md) |
-| `animus-raftdata` | [crates/animus-raftdata/CLAUDE.md](crates/animus-raftdata/CLAUDE.md) |
+| `animus-cp-data` | [crates/animus-cp-data/CLAUDE.md](crates/animus-cp-data/CLAUDE.md) |
 | `animus-test` | [crates/animus-test/CLAUDE.md](crates/animus-test/CLAUDE.md) |
 | `animus-dynamo` | [crates/animus-dynamo/CLAUDE.md](crates/animus-dynamo/CLAUDE.md) |
 | `animus-placement` | [crates/animus-placement/CLAUDE.md](crates/animus-placement/CLAUDE.md) |
@@ -131,7 +131,7 @@ truth; this map is just for navigation.
   and CQL v4, served by `animusd`, routed through the same `DataClient`; both
   consume the replicated schema catalog (ADR 0013).
 - **Runnable node** — `animusd`, `animus-cli`. v1 (ADR 0019) assembles the
-  **control plane + the CP data plane** (`animus-raftdata`) over `ProdEnv` — all
+  **control plane + the CP data plane** (`animus-cp-data`) over `ProdEnv` — all
   client reads/writes route to the per-tablet Raft group leader (forwarded
   cross-process); the leaderless AP plane is dropped. Runs as one process
   (`animusd --cluster N`) or one per node (`animusd --config FILE --node I`).
@@ -327,7 +327,7 @@ cross-cutting ones. Prune/merge entries that become obsolete.
   push command — it keeps the dependency edge one-way and the seam testable.**
   Wiring the control plane to reconfigure a per-tablet Raft KV group on a node
   failure (ADR 0017 C), a control→data "reconfigure now" message would have forced
-  `animus-control` to depend on `animus-raftdata` (a cycle — data already depends on
+  `animus-control` to depend on `animus-cp-data` (a cycle — data already depends on
   control for `RaftCore`) and to track each group's leader. Instead the decision
   already lives in replicated `Metadata` (the placement reconciler's epoch-CAS), so
   each group **leader pulls** its tablet's desired voter set and reconfigures

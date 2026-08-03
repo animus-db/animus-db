@@ -34,9 +34,9 @@ use std::time::Duration;
 
 use animus_control::node::heartbeat_loop;
 use animus_control::{MetaCommand, NodeStatus, ProposeResult, RaftNode};
+use animus_cp_data::RaftKvNode;
 use animus_env::{EnvExt, NodeId};
 use animus_placement::PlacementPolicy;
-use animus_raftdata::RaftKvNode;
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::MemoryEngine;
 use animus_tablet::{KeyRange, TabletId};

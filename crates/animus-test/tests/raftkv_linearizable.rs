@@ -1,5 +1,5 @@
 //! ADR 0017 / ADR 0016 step 4 / ADR 0014: an **Elle linearizability corpus for the
-//! per-tablet Raft KV data plane** (`animus-raftdata`).
+//! per-tablet Raft KV data plane** (`animus-cp-data`).
 //!
 //! This is the CP counterpart of the Accord corpus in `corpus.rs`. The leaderful
 //! data plane offers **single-tablet linearizable KV** (`put`/`delete`/
@@ -35,8 +35,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use animus_control::ProposeResult;
+use animus_cp_data::RaftKvNode;
 use animus_env::{Clock, EnvExt, Rng};
-use animus_raftdata::RaftKvNode;
 use animus_sim::{NetConfig, SimEnv, Simulator};
 use animus_storage::MemoryEngine;
 use animus_test::history::{Key, Mop, Process};

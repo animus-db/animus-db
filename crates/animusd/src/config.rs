@@ -20,7 +20,7 @@ use crate::RoleAddrs;
 
 /// Id offset for a node's **leaderful CP** per-tablet Raft role (ADR 0017 #3a) —
 /// the data plane. A node hosting a CP tablet group runs a
-/// [`RaftKvNode`](animus_raftdata::RaftKvNode) on this id (its own `ProdEnv`/inbox,
+/// [`RaftKvNode`](animus_cp_data::RaftKvNode) on this id (its own `ProdEnv`/inbox,
 /// distinct from the control role). Offset well above the control ids so the two
 /// roles never collide.
 pub const RAFTKV_ID_BASE: NodeId = 300;

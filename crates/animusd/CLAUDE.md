@@ -56,7 +56,7 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   the leader's node over a fresh client connection (ADR 0017 #3b), so dynamic client
   addresses never touch the internal network.
 - **CP routing (ADR 0017 #3a / v1 ADR 0019).** The data path is the **leaderful
-  per-tablet Raft group** (`animus-raftdata`), reached through four `ClientCtx`
+  per-tablet Raft group** (`animus-cp-data`), reached through four `ClientCtx`
   primitives that all resolve the leader the same way (`cp_route`): `cp_read`
   (linearizable ReadIndex), `cp_write` / `cp_delete` (Raft-committed, waited to
   durable+applied — durable-before-ack), and `cp_scan` (linearizable range read).

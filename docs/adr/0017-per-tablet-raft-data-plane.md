@@ -1,6 +1,6 @@
 # ADR 0017 — Per-tablet Raft data plane (leaderful, linearizable KV)
 
-- **Status:** Accepted — **Stages A–D implemented** in `animus-raftdata`
+- **Status:** Accepted — **Stages A–D implemented** in `animus-cp-data`
   (linearizable single-tablet KV, compaction + streaming snapshots, single-server
   membership change, tablet split), all sim-tested; the plane's linearizability is
   verified by a dedicated **Elle corpus** (`animus-test/tests/raftkv_linearizable.rs`);
@@ -58,7 +58,7 @@ transactions deferred but recorded as the next step.
 
 ## Decision
 
-We will build the leaderful data plane as a new crate (`animus-raftdata`),
+We will build the leaderful data plane as a new crate (`animus-cp-data`),
 **additive** — the AP `animus-data` plane is untouched and no dual-mode seam is
 built yet. The control plane remains the metadata authority for both planes.
 
@@ -217,7 +217,7 @@ mode.
 
 ### Implemented now (Stages A + B) — a usable single-tablet KV data plane
 
-The `animus-raftdata` crate provides a working, fault-tolerant, **linearizable
+The `animus-cp-data` crate provides a working, fault-tolerant, **linearizable
 single-tablet KV** store today: `RaftKvNode<E, S>` runs one tablet's Raft group
 over `Env`, backed by any `StorageEngine`. It serves `put`/`delete` (replicated +
 durable once committed), **linearizable `linearizable_get`** (ReadIndex — a

@@ -43,8 +43,8 @@ mod cql;
 mod dynamo;
 
 use animus_control::{ProposeResult, RaftNode};
+use animus_cp_data::RaftKvNode;
 use animus_env::{Env, Metric, MetricsHandle, NodeId, ProdEnv};
-use animus_raftdata::RaftKvNode;
 use animus_storage::{LsmEngine, MemoryEngine};
 use animus_tablet::{KeyRange, TabletId};
 use serde::Serialize;
@@ -885,7 +885,7 @@ impl ClientCtx {
     ///
     /// We confirm via a **local** read on the leader, not a linearizable ReadIndex
     /// barrier: the leader applies an entry only after a quorum commit + WAL fsync
-    /// (durable-before-visible in `animus-raftdata`), so the leader's local read
+    /// (durable-before-visible in `animus-cp-data`), so the leader's local read
     /// reflecting our value means it is durable. A per-write quorum barrier would
     /// not scale under concurrent load. (If we lose leadership before commit, the
     /// entry is truncated and never appears locally → we time out, which is

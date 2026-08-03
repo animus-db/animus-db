@@ -16,7 +16,7 @@ Both data planes are substantially built:
 
 - **AP** (`animus-data`): durable, self-healing (failure → `Down` → re-place →
   converge), wired into `animusd` as the default plane behind both wire adapters.
-- **CP** (`animus-raftdata`): linearizable single-tablet KV, ReadIndex reads,
+- **CP** (`animus-cp-data`): linearizable single-tablet KV, ReadIndex reads,
   membership change, tablet split, an Elle linearizability corpus, and — after v1
   Phase 1 — runnable + cross-process-routable in `animusd` (per-table mode
   selection, ADR 0017 #3a/#3b).

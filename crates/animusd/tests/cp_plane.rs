@@ -1,10 +1,10 @@
 //! The **leaderful CP data plane** runs in the assembled node over `ProdEnv`
 //! (ADR 0017 #3a / v1 ADR 0019: CP-only). Every client read/write is routed to a
-//! per-tablet Raft group (`animus-raftdata`) hosted on the nodes' `raftkv` role —
+//! per-tablet Raft group (`animus-cp-data`) hosted on the nodes' `raftkv` role —
 //! the single, linearizable source of truth.
 //!
 //! This is the production assembly of the CP plane whose mechanism is sim-proven
-//! in `animus-raftdata` (single-tablet linearizable KV, ReadIndex reads). Here we
+//! in `animus-cp-data` (single-tablet linearizable KV, ReadIndex reads). Here we
 //! drive it over real TCP/time through the same client API the CLI uses:
 //!
 //! 1. bring up a 3-node cluster and bootstrap it;
