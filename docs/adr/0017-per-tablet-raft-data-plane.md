@@ -6,10 +6,13 @@
   verified by a dedicated **Elle corpus** (`animus-test/tests/raftkv_linearizable.rs`);
   the **automatic membership-change trigger** and **in-band split group creation**
   are wired under `SimEnv`; and **Stage 3a** of the production assembly runs the CP
-  plane in `animusd` over `ProdEnv` with per-table AP/CP routing. The remaining work
-  is **Stage 3b** integration plumbing (dynamic CP placement/split/reconfigure over
-  `ProdEnv` — the `ProdEnv` side of `Coresident` + control-plane address
-  distribution — and cross-process CP routing), not new mechanism.
+  plane in `animusd` over `ProdEnv` with per-table AP/CP routing; and **Stage 3b**
+  has begun — `ProdEnv` now implements `Coresident` (a pre-bound listener pool, so a
+  node mints co-resident CP-group inboxes at runtime). The remaining **3b** work is
+  control-plane **address distribution** (carry group-replica addresses in
+  `Metadata` + a per-node `set_peers` sync loop), then dynamic CP
+  placement/split/reconfigure over `ProdEnv` and cross-process CP routing — not new
+  mechanism.
 - **Date:** 2026-08-03
 
 ## Context
@@ -290,10 +293,14 @@ control plane unchanged. **Not yet:** dynamic membership (Stage C), tablet split
   CP-mode table's client reads/writes to the group leader (`ClientCtx::cp_put`/
   `cp_get` via the per-cluster `ClusterEdgeState` group registry). `tests/cp_plane.rs`
   drives it over real TCP (CP write/read round-trip across nodes; AP plane
-  untouched). **Stage 3b** (remaining integration plumbing): dynamic CP
-  placement/split/reconfigure over `ProdEnv` (the `ProdEnv` side of `Coresident`
-  via a pre-bound listener pool + control-plane address distribution), cross-process
-  CP client routing, and per-CP-group failure detection.
+  untouched). **Stage 3b** (in progress): the `ProdEnv` side of `Coresident` is
+  **done** — `ProdEnv::bind_with_pool` pre-binds a listener pool and `sibling(id)`
+  hands one out, so a node mints co-resident CP-group inboxes at runtime
+  (`prod.rs`, with a sibling-messaging unit test). Remaining: control-plane
+  **address distribution** (group-replica addresses in `Metadata` + a per-node
+  `set_peers` sync loop — the next 3b step), then dynamic CP
+  placement/split/reconfigure over `ProdEnv`, cross-process CP client routing, and
+  per-CP-group failure detection.
 - **Next ADR — cross-tablet transactions** (2PC over the groups + HLC; or Accord
   atop them).
 

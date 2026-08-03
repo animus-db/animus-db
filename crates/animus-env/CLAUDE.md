@@ -43,8 +43,17 @@ the production implementation; the deterministic implementation lives in
   split path bounds on it, so every other `E: Env` is unaffected and an env that
   can't multiplex inboxes (a transport keyed by one address) simply isn't
   `Coresident`. `SimEnv` implements it (trivially — `Simulator::env` already mints
-  inboxes lazily); `ProdEnv` does **not** (yet) — runtime sibling addressing is the
-  production-assembly piece ADR 0017 defers.
+  inboxes lazily); **`ProdEnv` implements it too now** (ADR 0017 #3b) via a
+  **pre-bound listener pool**: `bind_with_pool(node_id, listen, pool_listens, dir)`
+  binds the main listener plus one spare listener per `pool_listens` addr (each its
+  own accept loop + inbox), and `sibling(id)` hands one out **synchronously** —
+  binding a socket is `async`/fallible but the trait method is sync/infallible, so
+  the listeners are pre-bound. A sibling shares the parent's **peer book** (`Arc`,
+  so a later `set_peers` reaches it) and the pool, but gets its own inbox, id, and
+  data dir (`<dir>/sib-<id>`); the pool size **bounds** co-resident groups
+  (exhaustion panics). The caller publishes the sibling's `local_addr()` for
+  address distribution — which (carrying group-replica addrs in replicated
+  `Metadata` + a per-node `set_peers` sync loop) is the remaining 3b plumbing.
 - `Disk` is append + explicit `sync`; bytes are not durable until `sync`
   returns. This models real crash semantics and is what `animus-sim` exploits.
   `Disk::replace` atomically swaps a file's whole contents (temp-file + rename

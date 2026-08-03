@@ -16,7 +16,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, mpsc};
 
-use crate::{Clock, Disk, Env, Envelope, MetricsHandle, Nanos, Network, NodeId, Rng, Spawner};
+use crate::{
+    Clock, Coresident, Disk, Env, Envelope, MetricsHandle, Nanos, Network, NodeId, Rng, Spawner,
+};
 
 /// A production environment for a single node.
 ///
@@ -29,10 +31,31 @@ pub struct ProdEnv {
     inner: Arc<Inner>,
 }
 
+/// A pre-bound spare listener a [`ProdEnv`] holds for [`Coresident::sibling`]
+/// (ADR 0017 #3b): minting a co-resident handle at runtime needs a new
+/// id-addressable inbox, but binding a socket is `async`/fallible while `sibling`
+/// is sync/infallible — so the listeners are bound up front (at `bind` time) and
+/// handed out synchronously. Each slot is a bound listener + its accept loop's
+/// inbox + the abort handle for that loop.
+struct PoolSlot {
+    addr: SocketAddr,
+    inbox: mpsc::UnboundedReceiver<Envelope>,
+    accept_abort: tokio::task::AbortHandle,
+}
+
 struct Inner {
     node_id: NodeId,
     start: Instant,
-    peers: StdMutex<BTreeMap<NodeId, SocketAddr>>,
+    /// The peer address book, **shared** (via `Arc`) with every sibling minted off
+    /// this env (ADR 0017 #3b), so an address-distribution update (`set_peers` from
+    /// replicated `Metadata`) reaches the co-resident CP groups too.
+    peers: Arc<StdMutex<BTreeMap<NodeId, SocketAddr>>>,
+    /// This env's own listener address (so a caller can publish a freshly-minted
+    /// sibling's `id → addr` for distribution).
+    local_addr: SocketAddr,
+    /// Unclaimed pre-bound listeners for [`Coresident::sibling`], shared so any
+    /// clone of this env can mint a sibling. Empty for an env bound without a pool.
+    pool: Arc<StdMutex<Vec<PoolSlot>>>,
     data_dir: PathBuf,
     inbox: Mutex<mpsc::UnboundedReceiver<Envelope>>,
     /// Abort handles for every task this env owns — the inbound-connection
@@ -65,45 +88,66 @@ impl ProdEnv {
         listen: SocketAddr,
         data_dir: impl Into<PathBuf>,
     ) -> std::io::Result<(Self, SocketAddr)> {
+        Self::bind_with_pool(node_id, listen, &[], data_dir).await
+    }
+
+    /// Like [`bind`](Self::bind), but also binds a **pool** of spare listeners (one
+    /// per address in `pool_listens`, port 0 for OS-assigned) that
+    /// [`Coresident::sibling`] hands out at runtime (ADR 0017 #3b). A node that may
+    /// host co-resident CP per-tablet Raft groups (ADR 0017) binds a pool sized to
+    /// the maximum groups it will host; an env bound with an empty pool is not
+    /// usefully `Coresident` (the first `sibling` call panics on exhaustion).
+    ///
+    /// # Errors
+    /// As [`bind`](Self::bind), for the main listener or any pool listener.
+    pub async fn bind_with_pool(
+        node_id: NodeId,
+        listen: SocketAddr,
+        pool_listens: &[SocketAddr],
+        data_dir: impl Into<PathBuf>,
+    ) -> std::io::Result<(Self, SocketAddr)> {
         let data_dir = data_dir.into();
         tokio::fs::create_dir_all(&data_dir).await?;
         let listener = TcpListener::bind(listen).await?;
         let local_addr = listener.local_addr()?;
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (rx, accept_abort) = spawn_accept(listener);
 
-        // Accept loop: one reader task per inbound connection, each demuxing
-        // length-prefixed frames into the shared inbox.
-        let accept = tokio::spawn(async move {
-            loop {
-                match listener.accept().await {
-                    Ok((stream, _addr)) => {
-                        let tx = tx.clone();
-                        tokio::spawn(async move {
-                            if let Err(err) = read_frames(stream, tx).await {
-                                tracing::debug!(?err, "peer connection closed");
-                            }
-                        });
-                    }
-                    Err(err) => {
-                        tracing::warn!(?err, "accept failed");
-                        return;
-                    }
-                }
-            }
-        });
+        // Pre-bind the sibling pool: each slot is a bound listener + its accept
+        // loop's inbox, held until `sibling` claims it.
+        let mut pool = Vec::with_capacity(pool_listens.len());
+        for &addr in pool_listens {
+            let l = TcpListener::bind(addr).await?;
+            let slot_addr = l.local_addr()?;
+            let (slot_rx, slot_abort) = spawn_accept(l);
+            pool.push(PoolSlot {
+                addr: slot_addr,
+                inbox: slot_rx,
+                accept_abort: slot_abort,
+            });
+        }
 
         let env = Self {
             inner: Arc::new(Inner {
                 node_id,
                 start: Instant::now(),
-                peers: StdMutex::new(BTreeMap::new()),
+                peers: Arc::new(StdMutex::new(BTreeMap::new())),
+                local_addr,
+                pool: Arc::new(StdMutex::new(pool)),
                 data_dir,
                 inbox: Mutex::new(rx),
-                tasks: StdMutex::new(vec![accept.abort_handle()]),
+                tasks: StdMutex::new(vec![accept_abort]),
                 metrics: MetricsHandle::recording(),
             }),
         };
         Ok((env, local_addr))
+    }
+
+    /// This env's own listener address — so a caller can publish a freshly-minted
+    /// [`sibling`](Coresident::sibling)'s `id → addr` for address distribution
+    /// (ADR 0017 #3b).
+    #[must_use]
+    pub fn local_addr(&self) -> SocketAddr {
+        self.inner.local_addr
     }
 
     /// Install (or replace) the peer address book: a map from node id to socket
@@ -120,6 +164,12 @@ impl ProdEnv {
         let handles = std::mem::take(&mut *self.inner.tasks.lock().expect("tasks poisoned"));
         for h in handles {
             h.abort();
+        }
+        // Also abort any still-unclaimed sibling-pool accept loops so their
+        // listener ports are freed too (a claimed slot's abort moved into the
+        // sibling's own `tasks`, torn down when that sibling shuts down).
+        for slot in std::mem::take(&mut *self.inner.pool.lock().expect("pool poisoned")) {
+            slot.accept_abort.abort();
         }
     }
 
@@ -221,6 +271,70 @@ impl Network for ProdEnv {
             .await
             .expect("inbox sender dropped while env is alive")
     }
+}
+
+impl Coresident for ProdEnv {
+    /// Mint a co-resident handle bound to `id` (ADR 0017 #3b): claim a pre-bound
+    /// listener from the pool ([`bind_with_pool`](Self::bind_with_pool)) and return
+    /// a `ProdEnv` on it. The handle **shares this env's peer address book** (so a
+    /// later `set_peers` from distributed `Metadata` reaches it) and the same
+    /// listener pool (so it too can mint siblings), but has its own inbox, id, and
+    /// a distinct data dir (`<dir>/sib-<id>`, created lazily on first write) so its
+    /// WAL never collides with the parent's. The caller publishes the new addr
+    /// ([`local_addr`](Self::local_addr)) for distribution.
+    ///
+    /// **Panics** if the pool is exhausted — the pool size bounds how many
+    /// co-resident groups a node hosts; size it accordingly at `bind_with_pool`.
+    fn sibling(&self, id: NodeId) -> Self {
+        let slot = self
+            .inner
+            .pool
+            .lock()
+            .expect("pool poisoned")
+            .pop()
+            .expect("Coresident::sibling: ProdEnv listener pool exhausted");
+        Self {
+            inner: Arc::new(Inner {
+                node_id: id,
+                start: self.inner.start,
+                peers: Arc::clone(&self.inner.peers),
+                local_addr: slot.addr,
+                pool: Arc::clone(&self.inner.pool),
+                data_dir: self.inner.data_dir.join(format!("sib-{id}")),
+                inbox: Mutex::new(slot.inbox),
+                tasks: StdMutex::new(vec![slot.accept_abort]),
+                metrics: self.inner.metrics.clone(),
+            }),
+        }
+    }
+}
+
+/// Spawn the accept loop for `listener` — one reader task per inbound connection,
+/// each demuxing length-prefixed frames into a fresh inbox channel. Returns the
+/// inbox receiver and the accept task's abort handle (for `shutdown`).
+fn spawn_accept(
+    listener: TcpListener,
+) -> (mpsc::UnboundedReceiver<Envelope>, tokio::task::AbortHandle) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let accept = tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((stream, _addr)) => {
+                    let tx = tx.clone();
+                    tokio::spawn(async move {
+                        if let Err(err) = read_frames(stream, tx).await {
+                            tracing::debug!(?err, "peer connection closed");
+                        }
+                    });
+                }
+                Err(err) => {
+                    tracing::warn!(?err, "accept failed");
+                    return;
+                }
+            }
+        }
+    });
+    (rx, accept.abort_handle())
 }
 
 async fn send_frame(addr: SocketAddr, from: NodeId, payload: &[u8]) -> std::io::Result<()> {
@@ -376,5 +490,67 @@ mod tests {
         assert!(dir.join("sub/dir/file").exists());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `Coresident::sibling` over `ProdEnv` (ADR 0017 #3b): an env bound with a
+    /// listener pool mints a sibling at runtime with its own id-addressable inbox,
+    /// and — once the freshly-minted addresses are distributed (`set_peers`) — two
+    /// siblings on different physical nodes exchange a message over real TCP.
+    #[tokio::test]
+    async fn coresident_siblings_address_and_message_each_other() {
+        use crate::Network;
+
+        let dir_a = unique_tmp_dir();
+        let dir_b = unique_tmp_dir();
+        let loop0 = || "127.0.0.1:0".parse::<SocketAddr>().unwrap();
+        // Two physical nodes, each with a one-slot sibling pool.
+        let (a, _) = ProdEnv::bind_with_pool(0, loop0(), &[loop0()], &dir_a)
+            .await
+            .expect("bind a");
+        let (b, _) = ProdEnv::bind_with_pool(1, loop0(), &[loop0()], &dir_b)
+            .await
+            .expect("bind b");
+
+        // Mint a co-resident group member on each node (ids 300, 301).
+        let a_sib = a.sibling(300);
+        let b_sib = b.sibling(301);
+        assert_eq!(a_sib.node_id(), 300);
+        assert_ne!(
+            a_sib.local_addr(),
+            a.local_addr(),
+            "sibling has its own port"
+        );
+
+        // Distribute the freshly-minted addresses (what the 3b peer-sync loop does
+        // from replicated Metadata) onto the parents — siblings share the book.
+        let book: BTreeMap<NodeId, SocketAddr> =
+            [(300, a_sib.local_addr()), (301, b_sib.local_addr())]
+                .into_iter()
+                .collect();
+        a.set_peers(book.clone());
+        b.set_peers(book);
+
+        // 301 → 300 over real TCP, received on the sibling's own inbox.
+        let recv_handle = {
+            let a_sib = a_sib.clone();
+            tokio::spawn(async move { a_sib.recv().await })
+        };
+        // Give the receiver a moment to park on its inbox, then send.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        b_sib.send(300, b"hello-cp-sibling".to_vec()).await;
+
+        let env = tokio::time::timeout(Duration::from_secs(5), recv_handle)
+            .await
+            .expect("recv timed out")
+            .expect("recv task");
+        assert_eq!(env.from, 301);
+        assert_eq!(env.payload, b"hello-cp-sibling");
+
+        a.shutdown();
+        b.shutdown();
+        a_sib.shutdown();
+        b_sib.shutdown();
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
     }
 }
