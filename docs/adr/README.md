@@ -23,3 +23,4 @@ relevant ADR (or supersede it) in the same PR as the code change.
 | [0014](0014-elle-accord-scenario-corpus.md) | Elle consistency testing against Accord + a frozen scenario corpus | Accepted |
 | [0015](0015-observability.md) | Deterministic-safe observability seam (metrics) | Accepted |
 | [0016](0016-pluggable-replication-per-tablet-raft.md) | Pluggable replication: per-tablet Raft (CP) alongside the AP data plane | Proposed |
+| [0017](0017-per-tablet-raft-data-plane.md) | Per-tablet Raft data plane (leaderful, linearizable KV) | Proposed |

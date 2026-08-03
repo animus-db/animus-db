@@ -1,0 +1,227 @@
+# ADR 0017 — Per-tablet Raft data plane (leaderful, linearizable KV)
+
+- **Status:** Proposed
+- **Date:** 2026-08-03
+
+## Context
+
+ADR 0016 decided that AnimusDB will offer a **strongly-consistent, leaderful**
+replication mode — each tablet its own Raft group, single leader, linearizable
+single-tablet reads/writes — as a modular addition alongside the leaderless AP
+data plane, and chose **Raft** (not Multi-Paxos). Step 2 of that ADR is done:
+`RaftCore` is now generic over its command and state machine (`RaftCore<C, S>`,
+`StateMachine<C>` trait), with the control plane as one instantiation and the
+existing suite green.
+
+This ADR is the **build design** for the leaderful data plane (ADR 0016 step 3),
+settling the decisions deferred there. The shape is essentially a "Cockroach-lite"
+CP data plane: per-range (per-tablet) Raft, range splits, replica rebalancing on
+membership change, backed by the on-disk LSM, all over the deterministic `Env`
+seam.
+
+Load-bearing constraints and prior decisions that shape it:
+
+- **`RaftCore` is synchronous and I/O-free** (ADR 0009): all consensus logic runs
+  in a pure state machine; the driver owns the `Env` and does I/O. The control
+  plane's `Metadata::apply` is in-memory and *synchronous*, called inside the
+  core.
+- **`StorageEngine` (the `LsmEngine`) is `async`** (ADR 0004/0008): applying a
+  committed KV write is async disk I/O.
+- **Determinism is the correctness story** (ADR 0003): every safety property must
+  be establishable under `SimEnv`. A safety property that depends on real wall
+  time is *not* simulation-verifiable.
+- The control plane (`animus-control`) already owns the **tablet map**,
+  **placement** (ADR 0005), **failure detection** (ADR 0012), and the **schema
+  catalog** (ADR 0013), and has `SplitTablet`/`MergeTablets`/`CasTabletReplicas`
+  `MetaCommand`s.
+- The **`ShardedOwner`/`ShardRouter`** precedent (`animus-consensus`) shows how a
+  physical node hosts one consensus group per local tablet, each on its own `Env`
+  id, routed from the existing tablet map.
+
+Decisions taken with the maintainer before this draft: LSM-backed state with
+streaming snapshots (no in-memory-first stage); **deliver reconfiguration** —
+tablet split on cluster growth and replica move on node failure; **ReadIndex**
+reads (leases explicitly *not* a casual optimization — see below); cross-tablet
+transactions deferred but recorded as the next step.
+
+## Decision
+
+We will build the leaderful data plane as a new crate (`animus-raftdata`),
+**additive** — the AP `animus-data` plane is untouched and no dual-mode seam is
+built yet. The control plane remains the metadata authority for both planes.
+
+### 1. Topology, hosting, and leadership
+
+- **One Raft group per tablet**, `RaftCore<KvCommand, _>`, hosted on the
+  `ShardedOwner` precedent: a physical node runs one group instance per local
+  tablet, each on its **own** `Env` id (the inbox is single-consumer), with the
+  replica set + key range read from the **existing tablet map** — no new
+  control-plane partitioning concept (tablets remain the unit, ADR 0002).
+- A new **`RaftKvNode<E>` driver** drives a tablet group over `Env`. It is *not*
+  `RaftNode`: it has **no `reconcile_loop`/`detect_loop`** (those are
+  control-plane-only) and adds the data-plane responsibilities below (apply
+  effects, ReadIndex, client routing).
+- **Leadership is self-elected and reported up**, not assigned: each group runs
+  Raft's own election; its current leader is observable and surfaced into the
+  control plane's view for routing. The control plane owns *placement* (which
+  nodes hold a tablet), not *which replica leads* — the Cockroach/TiKV model.
+
+### 2. State machine, apply path, and snapshots (the LSM decision's consequence)
+
+The KV state machine is **LSM-backed** (`StorageEngine`), not in-memory. Because
+`StorageEngine` is `async` and `RaftCore` is synchronous, **the apply step moves
+out of the sync core into the async driver** — the same sync-core/async-driver
+split `AccordCore` already uses (the core decides *order* and emits effects; the
+driver does the *I/O*):
+
+- The sync core agrees the committed, durable order of `KvCommand`s and exposes a
+  **drain of newly-applicable committed entries** (gated by the durable-before-
+  visible watermark from ADR 0009, so only fsynced entries are applied/visible).
+- The **driver applies** each committed `KvCommand` to the `LsmEngine`
+  asynchronously, then advances the core's `last_applied`. The in-core,
+  synchronous `StateMachine::apply` path (step 2) **remains** for the in-memory
+  control plane; the data plane uses this **effects** path. (Mechanically: factor
+  "apply committed entries" so the control plane keeps its in-core convenience
+  while the KV plane applies via the driver — the precise trait/struct shape is a
+  Stage-A implementation detail, but the *architecture* is: order in the core,
+  apply in the driver.)
+- **Snapshots stream from the engine**, not from a serialized in-memory clone. The
+  step-2 trait's `Default + Clone + Serialize` whole-image model does not scale to
+  a large tablet. Instead the snapshot is produced from an **engine checkpoint /
+  ordered scan** and ingested as a byte stream. The existing **chunked
+  `InstallSnapshot`** machinery is reused unchanged — it already ships opaque bytes
+  in offset-addressed chunks; only the *source* of those bytes generalizes from
+  `serde_json::to_vec(state)` to "read the engine checkpoint." Install ingests the
+  stream into a fresh engine.
+
+### 3. Linearizable reads: ReadIndex
+
+Reads use **ReadIndex**: the leader records `readIndex = commit_index`, confirms
+it is still leader via one heartbeat round to a quorum, waits until its applied
+(and durable) state reaches `readIndex`, then serves locally. No log entry, **no
+wall-clock assumption** — only a quorum confirmation plus the applied watermark we
+already track. It composes with durable-before-visible (a ReadIndex read reflects
+only `min(commit, durable)` state). The no-op-on-election (`become_leader` already
+appends one) gives the leader a committed current-term entry so `readIndex` is
+sound. Follower reads (a follower asks the leader for `readIndex`, waits for its
+own applied state) are a natural later extension, enabled by this design and by
+the follower-applies-on-commit behavior from the durable-before-visible work.
+
+**Leader leases are explicitly NOT adopted, and are a cautionary path, not a
+recommended optimization.** They are recorded here only so a future reader
+understands the hazard and the bar to clear before even considering them:
+
+- A lease replaces the ReadIndex round-trip with a **bet on real elapsed time**,
+  which turns a timing property into a **safety-critical** one — a violation
+  yields a *silent stale read*. Every other timing assumption in the system
+  (election timeouts, failure detection — ADR 0012) is **liveness-only**: a
+  violation costs at most an extra election, never correctness. Leases are the
+  one place a clock bug corrupts a read.
+- The practical killer is **not** steady clock drift (which is tiny) but **process
+  pauses** (VM migration, GC, scheduler starvation): a paused leader's clock
+  effectively stops, so it serves a read inside a lease that has actually expired
+  while a new leader took over.
+- Logical clocks (Lamport/vector/HLC) **cannot** substitute: they provide *order*,
+  not *elapsed real time*, and a lease races a real-time election timeout. HLC
+  *manages* a physical-clock assumption (and is the right tool for cross-tablet
+  transaction timestamps — §5), it does not remove it. The industry answer to
+  "trustworthy time lease" is TrueTime-style *better clocks*, not logical clocks.
+- The determinism story makes it worse *here*: today's `SimEnv` has a single
+  perfect virtual clock, so it **cannot exercise a lease-safety violation** — the
+  hole would be invisible to the deterministic suite (the `ProdEnv`-only class our
+  durability/flaky-test lessons keep surfacing).
+
+**Therefore leases are off the table unless and until** `SimEnv` gains a **per-node
+clock skew + pause injection model** (the `Env` already hands out a per-node clock,
+so this is feasible) that makes a lease-safety violation a deterministic,
+seed-reproducible failure the linearizability checker catches — *and* a dedicated
+safety analysis is written. Even then they remain an optimization to weigh against
+the round-trip they save, not a default. ReadIndex is the baseline indefinitely.
+
+### 4. Reconfiguration
+
+Both forms of reconfiguration are in scope and are driven by the **control plane**
+(it already detects failures and owns placement); the data-plane groups execute
+the mechanics.
+
+- **Replica movement on node failure** requires **Raft membership change**, which
+  `RaftCore` does **not** have today (`all_nodes` is fixed at construction; there
+  are no conf-change messages). We will add **single-server membership change**
+  (add-one / remove-one, the safer, simpler variant — not general joint
+  consensus), as a committed configuration entry in the Raft log. Flow: the
+  failure detector marks a node `Down` (ADR 0012) → the placement reconciler
+  (ADR 0005) decides a replacement replica → it proposes a membership change to
+  that tablet's group to add the spare and remove the dead node; the new replica
+  catches up via `InstallSnapshot` + log. This is safety-critical new consensus
+  code and lands with fault-injecting sim tests.
+- **Tablet split on cluster growth** uses a **Raft split trigger** (the Cockroach
+  range-split model): when the control plane decides to split a tablet (e.g. a new
+  node joins and the rebalancer spreads load, or a size threshold), it commits a
+  `SplitTablet` in `Metadata`; the owning group applies a **special committed Raft
+  command** that atomically divides the key range and hands the right-hand state
+  off to a **new group bootstrapped at the split point**. Splitting a *live
+  consensus group's data* is the most intricate operation here and is sequenced
+  last. (Merge — the inverse — is deferred with cross-tablet work.)
+
+### 5. Cross-tablet transactions: deferred (the explicit next step)
+
+This data plane gives **single-tablet** linearizability only. **Cross-tablet
+atomic transactions are out of scope for this ADR and are the designated next
+step** after it lands. The likely design — to be settled in its own ADR — is
+**2PC across the per-tablet Raft groups** (the Spanner/Cockroach model), with
+**HLC** transaction timestamps for ordering and MVCC snapshot reads; Accord
+(ADR 0011) is the alternative, layered atop the Raft groups as the durable store.
+Until then, a transaction spanning tablets has no atomicity guarantee in this
+mode.
+
+## Consequences
+
+**Enabled:**
+
+- A strongly-consistent, linearizable per-tablet KV mode, durable on the existing
+  LSM, fully sim-testable — the CP counterpart to the AP data plane.
+- Reuse of the proven `RaftCore` (now generic) and the chunked-`InstallSnapshot`
+  machinery; the control plane's placement + failure detection drive
+  reconfiguration with minimal new policy.
+
+**Costs and risks knowingly accepted:**
+
+- **Apply-path refactor**: moving KV apply into the async driver (effects model)
+  is a real change to how committed entries become visible; it must preserve the
+  durable-before-visible invariant.
+- **Membership change is new, safety-critical consensus code** in `RaftCore`.
+  Single-server change reduces the risk surface vs joint consensus, but it must be
+  sim-verified under partitions and crashes before it is trusted.
+- **Tablet split is intricate** (dividing a live group's range + state, bootstrapping
+  a new group atomically) and is the highest-risk, last-sequenced piece.
+- **Operational load**: N tablets × RF replicas = many Raft groups, each with its
+  own timers/heartbeats and `Env` id (the cost AP mode avoids).
+- **Availability trade is inherent**: a tablet is write-unavailable during election
+  / quorum loss (vs the AP plane's sloppy-quorum availability) — the point of the
+  mode, not a defect.
+- **Leases remain a documented hazard, not a feature** (§3): no lease reads without
+  the `SimEnv` clock-injection model and a dedicated safety analysis.
+- **No cross-tablet atomicity** until the follow-up ADR.
+
+**Implementation sequencing (each a green-keeping increment):**
+
+- **Stage A — apply + snapshot abstraction.** Externalize KV apply to the driver
+  (effects drain) and add streaming snapshots from the engine, reusing chunked
+  `InstallSnapshot`. Prove with a single-tablet group over `SimEnv`.
+- **Stage B — the data plane path.** `RaftKvNode<E>` driver, per-tablet hosting
+  (`ShardedOwner`-style), the Raft-routing client (route-to-leader, `NotLeader`
+  redirect), and **ReadIndex** reads. End-to-end single-tablet linearizable KV,
+  sim-tested with faults.
+- **Stage C — reconfigure on failure.** Single-server Raft membership change in
+  `RaftCore`, wired to the failure detector + placement reconciler; a killed node's
+  replica moves to a spare and catches up. Fault-injecting sim tests.
+- **Stage D — tablet split.** The Raft split trigger + new-group bootstrap on
+  cluster growth.
+- A **`RaftPerTablet` topology in the Elle corpus** (ADR 0014/0016 step 4) checks
+  linearizability of this plane as each stage lands.
+- **Next ADR — cross-tablet transactions** (2PC over the groups + HLC; or Accord
+  atop them).
+
+This ADR builds on ADR 0016 (the pluggable-replication decision) and ADR 0009
+(the in-house Raft it extends); the control plane (ADR 0001) remains the metadata
+authority and is unchanged.
