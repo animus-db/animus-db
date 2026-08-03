@@ -560,12 +560,11 @@ async fn create_table(
     loop {
         // Propose against this cluster's current leader (idempotent: the create is
         // rejected as a no-op if already present, which our success check catches).
-        if let Some(leader) = ctx.edge.leader_handle() {
-            leader.propose(MetaCommand::CreateTableSchema {
-                table: table.to_owned(),
-                schema: control_schema.clone(),
-            });
-        }
+        ctx.propose_schema(&MetaCommand::CreateTableSchema {
+            table: table.to_owned(),
+            schema: control_schema.clone(),
+        })
+        .await;
         if metadata(ctx).has_table_schema(table) {
             break;
         }
@@ -590,12 +589,11 @@ async fn create_table(
         let def = schema_bridge::index_to_control(index, &schema.partition_key);
         let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
         loop {
-            if let Some(leader) = ctx.edge.leader_handle() {
-                leader.propose(MetaCommand::CreateTableIndex {
-                    table: table.to_owned(),
-                    index: def.clone(),
-                });
-            }
+            ctx.propose_schema(&MetaCommand::CreateTableIndex {
+                table: table.to_owned(),
+                index: def.clone(),
+            })
+            .await;
             if metadata(ctx)
                 .table_indexes(table)
                 .iter()

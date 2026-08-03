@@ -136,6 +136,32 @@ pub enum ClientRequest {
     /// re-forwards, so routing is bounded to one hop (a stale hint errors and the
     /// client retries with fresh routing). Carries the original [`Put`]/[`Get`].
     Forwarded(Box<ClientRequest>),
+    /// Relay a **schema-catalog** `MetaCommand` to be proposed on the control-plane
+    /// leader (v1 Phase 1 / A2, ADR 0013): a node that received a `CreateTable` /
+    /// `CREATE TABLE` / `SetTableMode` but isn't the control leader sends this to
+    /// the leader's node, so DDL on a follower-connected client still commits. Any
+    /// node accepts it, **gates** it to schema-catalog commands (membership /
+    /// placement commands are rejected — not a general "propose anything" surface),
+    /// and routes it to the control leader (locally if it is the leader, else
+    /// relaying toward the leader — bounded, since a relay only targets a known
+    /// leader). The result replicates back to every node's `Metadata` as usual; the
+    /// caller confirms by polling its own replicated view.
+    ProposeSchema(MetaCommand),
+}
+
+/// Whether `command` is a **schema-catalog** mutation (ADR 0013) — the only
+/// `MetaCommand`s a wire client may relay via [`ClientRequest::ProposeSchema`].
+/// Membership / placement / tablet commands are control-plane-internal and are
+/// **not** accepted from the wire.
+fn is_schema_command(command: &MetaCommand) -> bool {
+    matches!(
+        command,
+        MetaCommand::CreateTableSchema { .. }
+            | MetaCommand::DropTableSchema { .. }
+            | MetaCommand::CreateTableIndex { .. }
+            | MetaCommand::DropTableIndex { .. }
+            | MetaCommand::SetTableMode { .. }
+    )
 }
 
 /// A node's reply to a [`ClientRequest`].
@@ -278,7 +304,7 @@ impl BoundNode {
         w: usize,
         backend: StorageBackend,
         edge: ClusterEdgeState,
-        cp_route: BTreeMap<NodeId, SocketAddr>,
+        client_route: BTreeMap<NodeId, SocketAddr>,
     ) -> std::io::Result<Node> {
         self.control_env.set_peers(peers.clone());
         self.data_env.set_peers(peers.clone());
@@ -415,7 +441,7 @@ impl BoundNode {
                 edge: edge.clone(),
                 data_metrics,
                 coord_metrics,
-                cp_route: cp_route.clone(),
+                client_route: client_route.clone(),
             };
             tasks.push(tokio::spawn(serve_clients(
                 self.client_listener,
@@ -682,23 +708,6 @@ impl ClusterEdgeState {
             .cloned()
     }
 
-    /// Propose `command` on **every** registered control handle that currently
-    /// believes it is leader. Normally exactly one live node is leader; proposing
-    /// on all self-styled leaders is robust to a stale handle. A non-leader
-    /// `propose` is dropped (`NotLeader`), so this is safe to call every tick.
-    fn propose_on_leaders(&self, command: &MetaCommand) {
-        for raft in self
-            .control
-            .lock()
-            .expect("control handles poisoned")
-            .iter()
-        {
-            if raft.is_leader() {
-                let _ = raft.propose(command.clone());
-            }
-        }
-    }
-
     /// The control handle that currently believes it is leader, if any.
     pub(crate) fn leader_handle(&self) -> Option<RaftNode<ProdEnv>> {
         self.control
@@ -744,7 +753,7 @@ pub(crate) struct ClientCtx {
     /// the leader's node. Built from the cluster config/bound addresses; empty in a
     /// single-process `--cluster N` run (where the shared edge state already reaches
     /// every group handle in-process, so no forwarding is needed).
-    cp_route: BTreeMap<NodeId, SocketAddr>,
+    client_route: BTreeMap<NodeId, SocketAddr>,
 }
 
 impl ClientCtx {
@@ -827,30 +836,57 @@ impl ClientCtx {
     }
 
     /// The client-API address to forward a CP op to: the hosting node of the group
-    /// leader as a local CP replica currently sees it (`leader()` hint → `cp_route`),
+    /// leader as a local CP replica currently sees it (`leader()` hint → `client_route`),
     /// falling back to any known group node if there is no hint yet (it forwards on
     /// or serves once a leader settles). `None` if this node knows of no CP route.
     fn cp_forward_target(&self) -> Option<SocketAddr> {
         let hint = self.edge.local_cp().and_then(|n| n.leader());
         match hint {
-            Some(leader_id) => self.cp_route.get(&leader_id).copied(),
-            None => self.cp_route.values().next().copied(),
+            Some(leader_id) => self.client_route.get(&leader_id).copied(),
+            None => self.client_route.values().next().copied(),
         }
     }
 
-    /// Forward `request` (wrapped so the receiver serves-or-errors, never
-    /// re-forwards) to another node's client API and relay its reply.
+    /// Forward a CP op to another node's client API (wrapped so the receiver
+    /// serves-or-errors, never re-forwards) and relay its reply.
     async fn cp_forward(&self, addr: SocketAddr, request: ClientRequest) -> ClientResponse {
-        let forwarded = ClientRequest::Forwarded(Box::new(request));
+        self.relay(addr, ClientRequest::Forwarded(Box::new(request)))
+            .await
+    }
+
+    /// Send `request` to a peer node's client API over a fresh connection and
+    /// return its reply (or an error on any transport failure). The cross-node
+    /// relay primitive for CP forwarding (A1) and schema-DDL relay (A2).
+    async fn relay(&self, addr: SocketAddr, request: ClientRequest) -> ClientResponse {
         match tokio::time::timeout(CLIENT_TIMEOUT, async {
             let mut stream = TcpStream::connect(addr).await.ok()?;
-            write_frame(&mut stream, &forwarded).await.ok()?;
+            write_frame(&mut stream, &request).await.ok()?;
             read_frame::<ClientResponse>(&mut stream).await.ok()?
         })
         .await
         {
             Ok(Some(resp)) => resp,
-            _ => ClientResponse::Error("CP forward to leader failed".into()),
+            _ => ClientResponse::Error("relay to peer node failed".into()),
+        }
+    }
+
+    /// Propose a **schema-catalog** `command` toward the control-plane leader
+    /// (v1 Phase 1 / A2): propose locally if this node is the control leader, else
+    /// relay [`ClientRequest::ProposeSchema`] to the leader's node. Best-effort per
+    /// call — the caller polls its replicated `Metadata` for the commit and
+    /// re-invokes, so a transient relay failure is retried with a re-resolved
+    /// leader. The result replicates to every node via Raft.
+    pub(crate) async fn propose_schema(&self, command: &MetaCommand) {
+        if let Some(leader) = self.edge.leader_handle() {
+            let _ = leader.propose(command.clone());
+            return;
+        }
+        if let Some(leader_id) = self.raft.leader() {
+            if let Some(&addr) = self.client_route.get(&leader_id) {
+                let _ = self
+                    .relay(addr, ClientRequest::ProposeSchema(command.clone()))
+                    .await;
+            }
         }
     }
 
@@ -1034,6 +1070,20 @@ async fn handle_client(mut stream: TcpStream, ctx: ClientCtx) -> std::io::Result
             // A CP op forwarded from another node (cross-process routing, ADR 0017
             // #3b): serve locally iff we are the leader; never re-forward.
             ClientRequest::Forwarded(inner) => ctx.cp_serve_forwarded(*inner).await,
+            // A schema-DDL command relayed to the control leader (A2). Gate to
+            // schema-catalog commands, then propose iff we are the leader (no
+            // re-relay — bounded one hop; the relayer retries with fresh routing).
+            ClientRequest::ProposeSchema(command) => {
+                if !is_schema_command(&command) {
+                    ClientResponse::Error("only schema-catalog commands may be proposed".into())
+                } else {
+                    // Propose on the control leader (locally if we are it, else relay
+                    // toward it). The caller confirms the commit via replicated
+                    // `Metadata`. Cannot loop: a relay only targets a known leader.
+                    ctx.propose_schema(&command).await;
+                    ClientResponse::PutOk
+                }
+            }
             ClientRequest::Put { key, value, .. } => match ctx.view_for(&key) {
                 None => ClientResponse::Error("no tablet covers this key yet".into()),
                 Some(view) => {
@@ -1201,7 +1251,7 @@ impl ClientCtx {
                     SCHEMA_COMMIT_TIMEOUT.as_secs()
                 ));
             }
-            self.edge.propose_on_leaders(&command);
+            self.propose_schema(&command).await;
             tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
         }
     }
@@ -1224,7 +1274,7 @@ impl ClientCtx {
             if tokio::time::Instant::now() >= deadline {
                 return Err(());
             }
-            self.edge.propose_on_leaders(&command);
+            self.propose_schema(&command).await;
             tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
         }
     }
@@ -1364,15 +1414,15 @@ pub async fn run_node_with(
     // this node's control handle — cross-process proposal forwarding is future
     // work, ADR 0013).
     //
-    // CP cross-process routing (ADR 0017 #3b): map each node's CP group member id
-    // (`raftkv_id`) to its **client API** address, so a CP op landing on a node
-    // that isn't the group leader forwards to the leader's node.
-    let cp_route: BTreeMap<NodeId, SocketAddr> = config
-        .nodes
-        .iter()
-        .enumerate()
-        .map(|(i, addrs)| (config::raftkv_id(i), addrs.client))
-        .collect();
+    // Cross-process routing (ADR 0017 #3b): map each node's CP group member id
+    // (`raftkv_id`, for CP data ops — A1) **and** its control id (for schema-DDL
+    // relay — A2) to that node's **client API** address, so an op landing on a node
+    // that isn't the relevant leader forwards to the leader's node.
+    let mut client_route: BTreeMap<NodeId, SocketAddr> = BTreeMap::new();
+    for (i, addrs) in config.nodes.iter().enumerate() {
+        client_route.insert(config::raftkv_id(i), addrs.client);
+        client_route.insert(config::control_id(i), addrs.client);
+    }
     bound
         .start_with(
             config.peer_book(),
@@ -1382,7 +1432,7 @@ pub async fn run_node_with(
             config.w,
             backend,
             ClusterEdgeState::new(),
-            cp_route,
+            client_route,
         )
         .await
 }
