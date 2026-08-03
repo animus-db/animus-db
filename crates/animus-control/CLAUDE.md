@@ -38,7 +38,15 @@ epoch compare-and-swap transactions.
   for any `S`; only `apply` and the snapshot image type are `S`-specific. **The
   driver `RaftNode` stays control-plane-specific** (it bakes in reconcile +
   failure-detection); the KV data plane gets its own driver. `RaftCore::metadata()`
-  is the `S = Metadata` convenience over the generic `state()`.
+  is the `S = Metadata` convenience over the generic `state()`. **Two apply models
+  (ADR 0017):** the control plane's `Metadata` applies **in-core, synchronously**
+  (`StateMachine::DRIVER_APPLIED = false`, the default); a data-plane KV store sets
+  `DRIVER_APPLIED = true`, so the core does *not* apply in-core — it buffers each
+  committed-and-durable command as an effect for the **async driver** to apply to a
+  real `StorageEngine` (drained via `RaftCore::drain_apply`, the `AccordCore`
+  pattern, since engine I/O is async and the core is sync). Effects are still
+  durable-gated, so `drain_apply` only hands out fsynced commands. (Stage A.1 done;
+  engine-as-snapshot + streaming `InstallSnapshot` for the data plane is A.2.)
 - `persist.rs` — `WalRecord`, `PersistedState` (durability/recovery). The WAL
   write/compact/recover flow is diagrammed in `docs/wal.md`.
 - `node.rs` — `RaftNode<E>`: the `Env` driver wrapping the core, plus

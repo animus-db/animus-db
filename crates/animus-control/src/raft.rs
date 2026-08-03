@@ -44,7 +44,18 @@ use crate::persist::{PersistedState, WalRecord};
 /// change the replicated log (the control plane's richer `Metadata::apply`
 /// outcome is simply discarded by the trait impl).
 pub trait StateMachine<C>: Default + Clone + Serialize + DeserializeOwned {
-    /// Apply one agreed command to the state machine, in commit order.
+    /// When `false` (the default — the in-memory control plane), the core applies
+    /// each committed-and-durable command **in-core, synchronously** via
+    /// [`apply`](StateMachine::apply). When `true`, the core does **not** apply
+    /// in-core; it buffers committed-durable commands as effects for an **async
+    /// driver** to apply to a real `StorageEngine` (drained via
+    /// [`RaftCore::drain_apply`]) — the sync-core / async-driver split the
+    /// `animus-consensus` `AccordCore` uses, required because a `StorageEngine`
+    /// apply is async I/O and the core is synchronous (ADR 0017). With this set,
+    /// the in-core `apply` is never called (a unit placeholder `S` suffices).
+    const DRIVER_APPLIED: bool = false;
+    /// Apply one agreed command to the state machine, in commit order. Only called
+    /// when [`DRIVER_APPLIED`](StateMachine::DRIVER_APPLIED) is `false`.
     fn apply(&mut self, command: &C);
     /// The no-op command a freshly elected leader appends under its own term so
     /// that prior-term entries can be committed (Raft's no-op-on-election).
@@ -242,9 +253,15 @@ pub struct RaftCore<C = MetaCommand, S = Metadata> {
     heartbeat_deadline: Nanos,
 
     // Applied state machine and the order commands were applied (for tests /
-    // divergence checks).
+    // divergence checks). For a `DRIVER_APPLIED` state machine `metadata` is an
+    // unused unit placeholder and `applied` stays empty — committed commands ride
+    // `pending_apply` to the driver instead.
     metadata: S,
     applied: Vec<C>,
+    // Committed-and-durable commands a `DRIVER_APPLIED` state machine has not yet
+    // handed to its async driver, as `(index, command)` in commit order. Always
+    // empty for the in-core control plane. Drained by [`RaftCore::drain_apply`].
+    pending_apply: Vec<(u64, C)>,
 
     // Durable-state changes awaiting write to the WAL, plus the hard state last
     // marked for persistence (to detect term/vote changes).
@@ -289,6 +306,7 @@ where
             heartbeat_deadline: Nanos(0),
             metadata: S::default(),
             applied: Vec::new(),
+            pending_apply: Vec::new(),
             pending: Vec::new(),
             persisted_hard: (0, None),
             snapshot_dirty: false,
@@ -465,6 +483,15 @@ where
     /// The sequence of commands applied so far, in order.
     pub fn applied(&self) -> Vec<C> {
         self.applied.clone()
+    }
+
+    /// Take the committed-and-durable commands a `DRIVER_APPLIED` state machine has
+    /// not yet handed to its async driver, as `(index, command)` in commit order.
+    /// **The driver applies each to the real engine (in order) and is the only
+    /// consumer.** Always empty for the in-core control plane (which applies in
+    /// `apply` instead). Mirrors `AccordCore::drain_apply` (ADR 0017).
+    pub fn drain_apply(&mut self) -> Vec<(u64, C)> {
+        std::mem::take(&mut self.pending_apply)
     }
 
     /// The next virtual instant at which this node wants a timer tick.
@@ -1163,8 +1190,15 @@ where
             self.last_applied += 1;
             let offset = (self.last_applied - self.snapshot_index - 1) as usize;
             let command = self.log[offset].command.clone();
-            self.metadata.apply(&command);
-            self.applied.push(command);
+            if S::DRIVER_APPLIED {
+                // The async driver applies this to the real engine (drained via
+                // `drain_apply`); the core only decides the order. Don't grow the
+                // unbounded `applied` log for the data plane.
+                self.pending_apply.push((self.last_applied, command));
+            } else {
+                self.metadata.apply(&command);
+                self.applied.push(command);
+            }
         }
         // No per-apply checkpoint: durability comes from the snapshot taken by
         // `snapshot()` plus the persisted log tail; recovery re-applies the tail.
