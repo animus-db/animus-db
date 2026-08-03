@@ -98,6 +98,11 @@ fn print_response(response: &ClientResponse) {
         ClientResponse::PutOk => println!("OK"),
         ClientResponse::Value(Some(v)) => println!("{}", show(v)),
         ClientResponse::Value(None) => println!("(not found)"),
+        ClientResponse::Pairs(pairs) => {
+            for (k, v) in pairs {
+                println!("{}\t{}", show(k), show(v));
+            }
+        }
         ClientResponse::Error(e) => println!("error: {e}"),
     }
 }

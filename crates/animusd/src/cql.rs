@@ -5,10 +5,11 @@
 //! reads framed requests, does the `STARTUP → READY` (and `OPTIONS →
 //! SUPPORTED`) handshake, and runs `QUERY` / `PREPARE` / `EXECUTE`. Every
 //! statement is parsed, type-checked, and planned by the pure, I/O-free
-//! `animus_cql` crate, then routed through the **same** quorum coordinator the
-//! plain-TCP client API and the DynamoDB endpoint use — so everything below this
-//! socket edge stays on the existing `Env`-based data-plane paths. The edge
-//! itself is production-only I/O, like `ProdEnv`.
+//! `animus_cql` crate, then routed (v1, ADR 0019) through the **leaderful CP data
+//! plane** — `ClientCtx::cp_read`/`cp_write`/`cp_delete` to the per-tablet Raft
+//! group leader (linearizable, forwarded cross-process), the same CP primitives
+//! the plain-TCP client API and the DynamoDB endpoint use. The edge itself is
+//! production-only I/O, like `ProdEnv`.
 //!
 //! ## Why hand-rolled
 //!
@@ -30,7 +31,8 @@
 //!     schema with the extended column list; see the gotcha below).
 //!   - `INSERT` / `SELECT` / `UPDATE` / `DELETE` — resolved against the
 //!     **replicated** schema, with a real `text/int/bigint/boolean/blob/uuid`
-//!     type system; quorum write / read.
+//!     type system; linearizable CP read / write (the requested consistency level
+//!     is accepted but moot — CP is at least as strong as any level).
 //!   - `BATCH` — a sequence of `INSERT`/`UPDATE`/`DELETE` applied in order.
 //! - `PREPARE` → `RESULT/Prepared` (statement id + bind metadata); `EXECUTE`
 //!   (bound values) → the same result a `QUERY` would give. A real driver's
@@ -66,22 +68,18 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Duration;
 
-use animus_control::{ColumnDef, ColumnType, TableSchema as ControlSchema};
+use animus_control::{ColumnDef, ColumnType, ReplicationMode, TableSchema as ControlSchema};
 use animus_cql::frame::{self, Frame, Opcode};
 use animus_cql::{
     AlterTable, Catalog, Column, ColumnSpec, Consistency, CqlType, CqlValue, DeletePlan,
     InsertPlan, Partition, ReadPlan, Statement, TableSchema as CqlSchema, UpdatePlan, response,
 };
-use animus_data::TabletView;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 
 use crate::ClientCtx;
-
-const CQL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A prepared statement: the original CQL text plus the resolved bind-variable
 /// column specs (so `EXECUTE` can type the bound cells). Re-parsed on `EXECUTE`
@@ -517,6 +515,11 @@ async fn run_statement(
     binds: &[CqlValue],
     consistency: Consistency,
 ) -> Vec<u8> {
+    // v1 (ADR 0019): reads/writes are served by the leaderful CP plane, which is
+    // **linearizable** — there is no tunable quorum to size per request. The CQL
+    // consistency level is therefore accepted and satisfied (CP is at least as
+    // strong as any level a client can ask for), but it no longer selects a quorum.
+    let _ = consistency;
     match stmt {
         Statement::Use { keyspace } => {
             if !keyspace_exists(ctx, &keyspace).await {
@@ -555,7 +558,9 @@ async fn run_statement(
                 }
             };
             let cql_schema = animus_cql::schema_of(&ct);
-            let control_schema = cql_schema_to_control(&cql_schema);
+            // v1 (ADR 0019): every wire-created table is served by the leaderful CP
+            // plane, so it is created in `ReplicationMode::Cp`.
+            let control_schema = cql_schema_to_control(&cql_schema).with_mode(ReplicationMode::Cp);
             let control_name = control_table_name(&keyspace, &ct.table);
             // IF NOT EXISTS: a table already present is a no-op success.
             if ct.if_not_exists && ctx.has_table_schema(&control_name) {
@@ -637,7 +642,7 @@ async fn run_statement(
                 return response::error(stream, response::ERR_SERVER, "corrupt schema");
             };
             match animus_cql::plan_insert(&cat, Some(&ks), &ins, binds) {
-                Ok(plan) => run_insert(ctx, stream, plan, consistency).await,
+                Ok(plan) => run_insert(ctx, stream, plan).await,
                 Err(e) => response::error(stream, response::ERR_INVALID, &e.to_string()),
             }
         }
@@ -659,7 +664,7 @@ async fn run_statement(
                 None => return response::error(stream, response::ERR_SERVER, "corrupt schema"),
             };
             match animus_cql::plan_update(&cat, Some(&ks), &upd, binds) {
-                Ok(plan) => run_update(ctx, stream, plan, &cql_schema, consistency).await,
+                Ok(plan) => run_update(ctx, stream, plan, &cql_schema).await,
                 Err(e) => response::error(stream, response::ERR_INVALID, &e.to_string()),
             }
         }
@@ -681,7 +686,7 @@ async fn run_statement(
                 None => return response::error(stream, response::ERR_SERVER, "corrupt schema"),
             };
             match animus_cql::plan_delete(&cat, Some(&ks), &del, binds) {
-                Ok(plan) => run_delete(ctx, stream, plan, &cql_schema, consistency).await,
+                Ok(plan) => run_delete(ctx, stream, plan, &cql_schema).await,
                 Err(e) => response::error(stream, response::ERR_INVALID, &e.to_string()),
             }
         }
@@ -703,7 +708,7 @@ async fn run_statement(
                 None => return response::error(stream, response::ERR_SERVER, "corrupt schema"),
             };
             match animus_cql::plan_select(&cat, Some(&ks), &sel, binds) {
-                Ok(plan) => run_select(ctx, stream, plan, &cql_schema, consistency).await,
+                Ok(plan) => run_select(ctx, stream, plan, &cql_schema).await,
                 Err(e) => response::error(stream, response::ERR_INVALID, &e.to_string()),
             }
         }
@@ -777,17 +782,12 @@ fn is_error_frame(reply: &[u8]) -> bool {
 /// Execute a planned `INSERT` as a partition read-modify-write: read the current
 /// partition, upsert this row by its clustering key, and write the partition
 /// back. Reply `RESULT/Void`.
-async fn run_insert(
-    ctx: &ClientCtx,
-    stream: i16,
-    plan: InsertPlan,
-    consistency: Consistency,
-) -> Vec<u8> {
+async fn run_insert(ctx: &ClientCtx, stream: i16, plan: InsertPlan) -> Vec<u8> {
     // The partition format stores each row's clustering blob verbatim, so the
     // read-modify-write does not need the schema: existing rows round-trip
     // untyped (their blob is the map key) and this new row is merged by its
     // clustering bytes.
-    let result = mutate_partition(ctx, &plan.key, consistency, |part| {
+    let result = mutate_partition(ctx, &plan.key, |part| {
         part.rows.insert(plan.clustering.clone(), plan.row.clone());
     })
     .await;
@@ -799,14 +799,8 @@ async fn run_insert(
 
 /// Execute a planned `UPDATE`: read-modify-write the partition, applying the cell
 /// assignments over the addressed row (creating it if absent — CQL upsert).
-async fn run_update(
-    ctx: &ClientCtx,
-    stream: i16,
-    plan: UpdatePlan,
-    schema: &CqlSchema,
-    consistency: Consistency,
-) -> Vec<u8> {
-    let result = mutate_partition_with_schema(ctx, &plan.key, consistency, schema, |part| {
+async fn run_update(ctx: &ClientCtx, stream: i16, plan: UpdatePlan, schema: &CqlSchema) -> Vec<u8> {
+    let result = mutate_partition_with_schema(ctx, &plan.key, schema, |part| {
         let clustering_values = decode_clustering_for(&plan.clustering, schema);
         let row = part
             .rows
@@ -830,20 +824,13 @@ async fn run_update(
 /// partition; a partition-key-only delete removes the whole partition. When the
 /// partition becomes empty, the data-plane key is tombstoned (a data-plane
 /// `delete`); otherwise the remaining partition is written back.
-async fn run_delete(
-    ctx: &ClientCtx,
-    stream: i16,
-    plan: DeletePlan,
-    schema: &CqlSchema,
-    consistency: Consistency,
-) -> Vec<u8> {
-    let view = match view_for(ctx, &plan.key, consistency) {
-        Ok(v) => v,
-        Err(msg) => return response::error(stream, response::ERR_SERVER, &msg),
-    };
+async fn run_delete(ctx: &ClientCtx, stream: i16, plan: DeletePlan, schema: &CqlSchema) -> Vec<u8> {
+    // Read-modify-write the partition on the CP plane under the coord lock (which
+    // serializes this node's RMWs so the read+write is atomic per node). The Raft
+    // index is the MVCC version, so no client-assigned version is needed.
     let _guard = ctx.coord_lock.lock().await;
-    let (current, bytes) = match read_partition_bytes(ctx, &view, &plan.key).await {
-        Ok(r) => r,
+    let bytes = match ctx.cp_read(plan.key.clone()).await {
+        Ok(b) => b,
         Err(msg) => return response::error(stream, response::ERR_SERVER, &msg),
     };
     let mut part = match Partition::decode(&bytes.unwrap_or_default(), schema) {
@@ -856,53 +843,25 @@ async fn run_delete(
         }
         None => part.rows.clear(),
     }
-    let ok = if part.is_empty() {
-        // Whole partition gone → tombstone the data-plane key so it reads absent.
-        ctx.coordinator
-            .delete(&view, &plan.key, current + 1, CQL_TIMEOUT)
-            .await
+    let result = if part.is_empty() {
+        // Whole partition gone → commit a CP tombstone so the key reads absent.
+        ctx.cp_delete(plan.key.clone()).await
     } else {
-        ctx.coordinator
-            .write(&view, &plan.key, &part.encode(), current + 1, CQL_TIMEOUT)
-            .await
+        ctx.cp_write(plan.key.clone(), part.encode()).await
     };
-    if ok {
-        response::void_result(stream)
-    } else {
-        response::error(
-            stream,
-            response::ERR_SERVER,
-            "delete did not reach a quorum",
-        )
+    match result {
+        Ok(()) => response::void_result(stream),
+        Err(msg) => response::error(stream, response::ERR_SERVER, &msg),
     }
 }
 
 /// Execute a planned `SELECT`: quorum-read the partition, return every matching
 /// row (the clustering prefix filters; an empty prefix returns the whole
 /// partition) in clustering order as a typed `RESULT/Rows`.
-async fn run_select(
-    ctx: &ClientCtx,
-    stream: i16,
-    plan: ReadPlan,
-    schema: &CqlSchema,
-    consistency: Consistency,
-) -> Vec<u8> {
-    let view = match view_for(ctx, &plan.key, consistency) {
+async fn run_select(ctx: &ClientCtx, stream: i16, plan: ReadPlan, schema: &CqlSchema) -> Vec<u8> {
+    let bytes = match ctx.cp_read(plan.key.clone()).await {
         Ok(v) => v,
         Err(msg) => return response::error(stream, response::ERR_SERVER, &msg),
-    };
-    let bytes = {
-        let _guard = ctx.coord_lock.lock().await;
-        match ctx.coordinator.read(&view, &plan.key, CQL_TIMEOUT).await {
-            animus_data::ReadResult::Value(v) => v,
-            animus_data::ReadResult::Failed => {
-                return response::error(
-                    stream,
-                    response::ERR_SERVER,
-                    "read did not reach a quorum",
-                );
-            }
-        }
     };
     let Some(bytes) = bytes else {
         return response::typed_rows_multi(stream, "animus", &plan.table, &plan.projection, &[]);
@@ -978,42 +937,11 @@ fn encode_typed(ty: CqlType, value: &CqlValue) -> Result<Vec<u8>, String> {
 }
 
 /// Build the routing view for `key`, then override its R/W quorum sizes per the
-/// requested CQL consistency level (clamped to the replica count).
-fn view_for(ctx: &ClientCtx, key: &[u8], consistency: Consistency) -> Result<TabletView, String> {
-    let mut view = ctx
-        .view_for(key)
-        .ok_or_else(|| "no tablet covers this key yet (cluster still bootstrapping)".to_owned())?;
-    let q = response::consistency_quorum(consistency, view.replicas.len());
-    view.r = q;
-    view.w = q;
-    Ok(view)
-}
-
-/// Read the current partition bytes + its MVCC version for a read-modify-write.
-/// Returns `(current_version, value)` where `value` is `None` for an absent key.
-async fn read_partition_bytes(
-    ctx: &ClientCtx,
-    view: &TabletView,
-    key: &[u8],
-) -> Result<(u64, Option<Vec<u8>>), String> {
-    let current = ctx
-        .coordinator
-        .read_version(view, key, CQL_TIMEOUT)
-        .await
-        .ok_or_else(|| "could not read current version".to_owned())?;
-    let value = match ctx.coordinator.read(view, key, CQL_TIMEOUT).await {
-        animus_data::ReadResult::Value(v) => v,
-        animus_data::ReadResult::Failed => return Err("read did not reach a quorum".to_owned()),
-    };
-    Ok((current, value))
-}
-
 /// Read-modify-write a partition under the coordinator lock: decode the current
 /// partition (schema-agnostic on the write path), apply `mutate`, write it back.
 async fn mutate_partition(
     ctx: &ClientCtx,
     key: &[u8],
-    consistency: Consistency,
     mutate: impl FnOnce(&mut Partition),
 ) -> Result<(), String> {
     let schema_agnostic = CqlSchema {
@@ -1022,31 +950,25 @@ async fn mutate_partition(
         partition_key: 0,
         clustering_keys: Vec::new(),
     };
-    mutate_partition_with_schema(ctx, key, consistency, &schema_agnostic, mutate).await
+    mutate_partition_with_schema(ctx, key, &schema_agnostic, mutate).await
 }
 
 /// As [`mutate_partition`] but decodes the partition against `schema` (so existing
 /// rows' clustering values are typed — needed when `mutate` reads them).
+///
+/// The CP plane is the source of truth (ADR 0019): the coord lock serializes this
+/// node's read-modify-writes so the linearizable read + CP write are atomic per
+/// node, and the Raft index is the MVCC version (no client-assigned version).
 async fn mutate_partition_with_schema(
     ctx: &ClientCtx,
     key: &[u8],
-    consistency: Consistency,
     schema: &CqlSchema,
     mutate: impl FnOnce(&mut Partition),
 ) -> Result<(), String> {
-    let view = view_for(ctx, key, consistency)?;
     let _guard = ctx.coord_lock.lock().await;
-    let (current, bytes) = read_partition_bytes(ctx, &view, key).await?;
+    let bytes = ctx.cp_read(key.to_vec()).await?;
     let mut part =
         Partition::decode(&bytes.unwrap_or_default(), schema).map_err(|e| e.to_string())?;
     mutate(&mut part);
-    let ok = ctx
-        .coordinator
-        .write(&view, key, &part.encode(), current + 1, CQL_TIMEOUT)
-        .await;
-    if ok {
-        Ok(())
-    } else {
-        Err("write did not reach a quorum".to_owned())
-    }
+    ctx.cp_write(key.to_vec(), part.encode()).await
 }

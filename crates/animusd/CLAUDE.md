@@ -24,19 +24,24 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
 - `dynamo` module — the **DynamoDB JSON-over-HTTP endpoint** (a fifth listener
   per node). A hand-rolled HTTP/1.1 server decodes `X-Amz-Target` +
   AttributeValue-JSON via `animus_dynamo::wire`, then routes through the **same
-  `ClientCtx`** (coordinator + cached routing view) as the plain-TCP API.
+  `ClientCtx`** as the plain-TCP API. v1 (ADR 0019): reads/writes/scans go to the
+  **CP plane** (`ClientCtx::cp_read`/`cp_write`/`cp_scan`), not the AP coordinator.
 - `cql` module — the **CQL (Cassandra) v4 binary-protocol endpoint** (a sixth
   listener per node). A hand-rolled framed server does the `STARTUP → READY` /
   `OPTIONS → SUPPORTED` handshake and runs `QUERY`/`PREPARE`/`EXECUTE` via the
   pure `animus_cql` crate (a typed `CREATE KEYSPACE`/`USE`/`CREATE TABLE` schema
   catalog incl. **clustering/compound primary keys**, typed
   `INSERT`/`SELECT`/`UPDATE`/`DELETE` + prepared statements), routing through the
-  **same `ClientCtx`** as the other edges and **honoring the requested
-  consistency level** (it overrides the routing view's R/W per request). A
-  *partition* is one data-plane value, so `INSERT`/`UPDATE`/`DELETE` are
-  read-modify-write of that value under the coord lock, and a `DELETE` that
-  empties the partition issues a data-plane delete/tombstone. The keyspace set +
-  prepared-statement store are **per-cluster edge state** (see below).
+  **same `ClientCtx`** as the other edges. v1 (ADR 0019): reads/writes go to the
+  **CP plane** (`cp_read`/`cp_write`/`cp_delete`), which is linearizable — the
+  requested **consistency level is accepted but moot** (CP is at least as strong as
+  any level; it no longer sizes a quorum). A *partition* is one CP value, so
+  `INSERT`/`UPDATE`/`DELETE` are read-modify-write of that value **under the coord
+  lock** (which serializes a node's RMWs so the linearizable read + CP write are
+  atomic per node; the Raft index is the MVCC version, so no client-assigned
+  version), and a `DELETE` that empties the partition issues a CP tombstone
+  (`cp_delete`). The keyspace set + prepared-statement store are **per-cluster edge
+  state** (see below).
 
 ## What's non-obvious
 
@@ -48,23 +53,26 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   **client API is a plain request/reply TCP server**, *not* on the `Network`:
   coordination is server-side, so the coordinator is a static cluster member and
   replica replies route without knowing dynamic client addresses.
-- **Per-table CP routing (ADR 0017 #3a, Stage 3a).** A table whose replicated
-  schema is `ReplicationMode::Cp` (set via `MetaCommand::SetTableMode`; the interim
-  admin path is `Node::propose_meta`) has its client reads/writes routed to a
-  **leaderful per-tablet Raft group** (`animus-raftdata`) instead of the AP
-  `DataClient`. The `client` API's `Put`/`Get` carry an optional `table`; the
-  handler checks `Metadata::table_mode(table)` and, when `Cp`, calls
-  `ClientCtx::cp_put`/`cp_get` → the group **leader** (found among the per-cluster
-  `ClusterEdgeState::raftkv` handles, mirroring the control-handle registry). A CP
-  write waits to read its value back before acking (durable-before-ack); a CP read
-  is a linearizable ReadIndex read. Stage 3a hosts **one statically-placed CP
-  group** spanning the first `min(N, MAX_REPLICATION_FACTOR)` nodes' `raftkv` ids,
-  each backed by its own durable `LsmEngine` (type aliased `CpGroup`). **Scope:**
-  CP routing works within a `--cluster N` process (shared edge state); cross-process
-  routing, dynamic CP placement/split/reconfigure over `ProdEnv`, and the
-  `Coresident`/`ProdEnv` pre-bound-listener-pool are **Stage 3b**. `tests/cp_plane.rs`
-  proves the end-to-end round-trip (write via one node, read via another) + the AP
-  plane staying untouched.
+- **CP routing (ADR 0017 #3a / v1 ADR 0019).** The data path is the **leaderful
+  per-tablet Raft group** (`animus-raftdata`), reached through four `ClientCtx`
+  primitives that all resolve the leader the same way (`cp_route`): `cp_read`
+  (linearizable ReadIndex), `cp_write` / `cp_delete` (Raft-committed, waited to
+  durable+applied — durable-before-ack), and `cp_scan` (linearizable range read).
+  `cp_route` serves **locally** if this node hosts the leader, **forwards** to the
+  leader's node if a local replica gives a leader hint + a `client_route` exists
+  (ADR 0017 #3b cross-process, wrapped in `ClientRequest::Forwarded`, one hop), and
+  otherwise **waits** for the local group to elect (it never forwards a CP op to a
+  non-leader — including itself — during election). **The wire edges (DynamoDB, CQL)
+  route every read/write/scan through these** regardless of table mode, and create
+  their tables in `ReplicationMode::Cp`. The plain-client `Put`/`Get` still consult
+  `Metadata::table_mode(table)`: a `Cp` table → CP, an untagged/`Ap` key → the AP
+  coordinator (the AP plain-client path is removed in the next v1 piece). Stage 3a
+  hosts **one statically-placed CP group** spanning the first
+  `min(N, MAX_REPLICATION_FACTOR)` nodes' `raftkv` ids, each backed by its own
+  durable `LsmEngine` (type aliased `CpGroup`). `tests/cp_plane.rs` (in-process
+  round-trip) + `tests/cp_cross_process.rs` (forwarding) + the dynamo/cql wire +
+  schema tests all exercise the CP path; dynamic CP placement/split/reconfigure over
+  `ProdEnv` is later v1 work.
 - **The cluster's members are the DATA nodes, not the control ids** (this is what
   makes self-healing work end to end). The control ids `0..N` are only the Raft
   *consensus group*; `bootstrap` registers the **data ids** (`100+i`) as `Active`
@@ -139,11 +147,11 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   (the `escape(hash)||…||base_key` index) stays in-memory, rebuilt from observed
   `note_put`/`note_delete` writes (proven in `tests/dynamo_schema.rs`'s
   `create_table_index_replicates_to_second_node` / `…_survives_node_restart`).
-  **Base-table `Query`/`Scan` now use the data plane's native quorum range scan**
-  (`DataClient::scan`) over a contiguous data-plane key range (a partition prefix
-  for `Query`, the whole-table prefix for `Scan`), decoding each live pair and
-  dropping DynamoDB tombstone values — **no in-memory written-key tracking**
-  (proven across a restart in `tests/dynamo_schema.rs`). The edge keeps only the
+  **Base-table `Query`/`Scan` use the CP plane's linearizable range scan**
+  (`ClientCtx::cp_scan` → `RaftKvNode::linearizable_scan`) over a contiguous key
+  range (a partition prefix for `Query`, the whole-table prefix for `Scan`),
+  decoding each live pair and dropping DynamoDB tombstone values — **no in-memory
+  written-key tracking** (proven across a restart in `tests/dynamo_schema.rs`). The edge keeps only the
   **GSI/LSI index declarations** in-memory (for an *index* `Query`), held
   **per-cluster** in `ClusterEdgeState` (not a process `OnceLock`). The surface now
   also covers `UpdateItem`/`BatchWriteItem`/`TransactWriteItems` (the last

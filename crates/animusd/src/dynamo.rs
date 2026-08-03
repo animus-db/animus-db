@@ -4,9 +4,10 @@
 //! speaks the DynamoDB JSON protocol: clients `POST /` with an
 //! `X-Amz-Target: DynamoDB_20120810.<Op>` header and an AttributeValue-JSON
 //! body. We decode the request with [`animus_dynamo::wire`] (pure, deterministic
-//! translation) and route the resulting key/value bytes through the **same**
-//! quorum coordinator the plain-TCP client API uses — so everything below this
-//! HTTP edge stays on the existing `Env`-based data-plane paths. The HTTP edge
+//! translation) and route the resulting key/value bytes (v1, ADR 0019) through the
+//! **leaderful CP data plane** — `ClientCtx::cp_read`/`cp_write`/`cp_scan` to the
+//! per-tablet Raft group leader (linearizable, forwarded cross-process), the same
+//! CP primitives the plain-TCP client API and the CQL endpoint use. The HTTP edge
 //! itself is production-only I/O, like `ProdEnv`.
 //!
 //! ## Why hand-rolled HTTP
@@ -99,7 +100,7 @@
 
 use std::time::Duration;
 
-use animus_control::MetaCommand;
+use animus_control::{MetaCommand, ReplicationMode};
 use animus_dynamo::wire::{
     self, Operation, Projection, ReturnValues, TransactAction, UpdateAction, UpdateReturnValues,
     WireError, WriteRequest,
@@ -113,7 +114,6 @@ use tokio::net::{TcpListener, TcpStream};
 
 use crate::ClientCtx;
 
-const DYNAMO_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long `CreateTable` waits for its `CreateTableSchema` proposal to commit in
 /// the replicated catalog before giving up.
 const SCHEMA_COMMIT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -555,7 +555,11 @@ async fn create_table(
             table.to_owned(),
         )));
     }
-    let control_schema = schema_bridge::to_control(schema, &[]);
+    // v1: every wire-created table is served by the leaderful CP plane (ADR 0019),
+    // so it is created in `ReplicationMode::Cp`. The edge routes its reads/writes
+    // through the CP primitives regardless, but recording the mode keeps the
+    // replicated catalog truthful (and the plain-client `is_cp` gate consistent).
+    let control_schema = schema_bridge::to_control(schema, &[]).with_mode(ReplicationMode::Cp);
     let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
     loop {
         // Propose against this cluster's current leader (idempotent: the create is
@@ -1087,24 +1091,20 @@ fn range_end(prefix: &[u8]) -> Vec<u8> {
     end
 }
 
-/// Native quorum range scan over the half-open data-plane range `[start, end)`,
-/// returning the live `(key, value)` pairs in key order (tombstones already
-/// excluded by the data plane), optionally capped at `limit` keys. Routes through
-/// the shared coordinator under the coord lock, exactly like a point read/write.
-/// A scan that cannot reach a read quorum is an internal error (the scan analog of
-/// a failed read).
+/// Linearizable CP range scan over the half-open range `[start, end)`, returning
+/// the live `(key, value)` pairs in key order (tombstones already excluded by the
+/// engine), optionally capped at `limit` keys. Routes to the CP group leader via
+/// [`ClientCtx::cp_scan`] (ReadIndex; forwarded cross-process). A scan the leader
+/// cannot serve is an internal error (the scan analog of a failed read).
 async fn native_scan(
     ctx: &ClientCtx,
     start: &[u8],
     end: &[u8],
     limit: Option<usize>,
 ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, WireError> {
-    let view = ctx.view_for(start).ok_or_else(internal_no_tablet)?;
-    let _guard = ctx.coord_lock.lock().await;
-    ctx.coordinator
-        .scan(&view, start, end, limit, DYNAMO_TIMEOUT)
+    ctx.cp_scan(start.to_vec(), end.to_vec(), limit)
         .await
-        .ok_or_else(|| internal("scan did not reach a read quorum"))
+        .map_err(|e| internal(&e))
 }
 
 /// Whether `table` is known: present in the replicated catalog (ADR 0013) or
@@ -1122,35 +1122,22 @@ fn table_known(ctx: &ClientCtx, table: &str) -> bool {
         .has_table(table)
 }
 
+/// CP write of `value` at `key` (ADR 0017): proposed on the per-tablet Raft group
+/// leader and waited to durable+applied before returning (durable-before-ack). The
+/// Raft index is the MVCC version, so no client-assigned version is needed (the
+/// AP path's `read_version`+1 dance is gone).
 async fn quorum_write(ctx: &ClientCtx, key: &[u8], value: &[u8]) -> Result<(), WireError> {
-    let view = ctx.view_for(key).ok_or_else(internal_no_tablet)?;
-    let _guard = ctx.coord_lock.lock().await;
-    // Quorum-derived version (same as the plain-TCP Put path): read the current
-    // version across a quorum, then write at +1 so cross-coordinator overwrites
-    // are not silently dropped.
-    let current = ctx
-        .coordinator
-        .read_version(&view, key, DYNAMO_TIMEOUT)
+    ctx.cp_write(key.to_vec(), value.to_vec())
         .await
-        .ok_or_else(|| internal("could not read current version"))?;
-    let ok = ctx
-        .coordinator
-        .write(&view, key, value, current + 1, DYNAMO_TIMEOUT)
-        .await;
-    if ok {
-        Ok(())
-    } else {
-        Err(internal("write did not reach a quorum"))
-    }
+        .map_err(|e| internal(&e))
 }
 
+/// Linearizable CP read of `key`, decoding the stored DynamoDB item (an absent
+/// key — including one tombstoned by a `DeleteItem` sentinel — reads as `None`).
 async fn quorum_read(ctx: &ClientCtx, key: &[u8]) -> Result<Option<Item>, WireError> {
-    let view = ctx.view_for(key).ok_or_else(internal_no_tablet)?;
-    let _guard = ctx.coord_lock.lock().await;
-    match ctx.coordinator.read(&view, key, DYNAMO_TIMEOUT).await {
-        animus_data::ReadResult::Value(Some(bytes)) => wire::decode_stored_item(&bytes),
-        animus_data::ReadResult::Value(None) => Ok(None),
-        animus_data::ReadResult::Failed => Err(internal("read did not reach a quorum")),
+    match ctx.cp_read(key.to_vec()).await.map_err(|e| internal(&e))? {
+        Some(bytes) => wire::decode_stored_item(&bytes),
+        None => Ok(None),
     }
 }
 
@@ -1159,10 +1146,6 @@ fn internal(message: &str) -> WireError {
         code: "InternalServerError",
         message: message.to_owned(),
     }
-}
-
-fn internal_no_tablet() -> WireError {
-    internal("no tablet covers this key yet (cluster still bootstrapping)")
 }
 
 /// Write a minimal HTTP/1.1 response with a JSON body. The `Connection` header

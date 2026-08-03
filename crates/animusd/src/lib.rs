@@ -63,6 +63,17 @@ use tokio::net::{TcpListener, TcpStream};
 /// edge-state container readable.
 type CpGroup = RaftKvNode<ProdEnv, LsmEngine<ProdEnv>>;
 
+/// How a CP op originating on this node reaches the group leader
+/// ([`ClientCtx::cp_route`]).
+enum CpRoute {
+    /// This node hosts the current leader — serve from `leader` directly.
+    Local(CpGroup),
+    /// Forward to the leader's node at this client-API address (ADR 0017 #3b).
+    Forward(SocketAddr),
+    /// No leader reachable (no local leader, no route, election did not settle).
+    None,
+}
+
 /// The single bootstrap tablet covering the whole keyspace.
 const TABLET: TabletId = TabletId(1);
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -130,6 +141,25 @@ pub enum ClientRequest {
         #[serde(default)]
         table: Option<String>,
     },
+    /// Delete `key` from the **CP** plane (a Raft-committed tombstone). The CP
+    /// counterpart of [`Put`](ClientRequest::Put) for an explicit delete — used
+    /// by the CQL edge's whole-partition delete. Routed to the CP group leader
+    /// (forwarded if this node isn't it, like `Put`/`Get`).
+    Delete {
+        key: Vec<u8>,
+        #[serde(default)]
+        table: Option<String>,
+    },
+    /// A **linearizable range scan** over the half-open CP range `[start, end)`,
+    /// up to `limit` keys, served from the CP group leader (ReadIndex). The CP
+    /// read primitive behind the DynamoDB `Query`/`Scan` and CQL `SELECT` edges;
+    /// also the cross-process forwarding payload for a scan (ADR 0017 #3b).
+    Scan {
+        start: Vec<u8>,
+        end: Vec<u8>,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
     /// A CP op **forwarded** from a node that received it but does not host the CP
     /// group leader, to the leader's node (ADR 0017 #3b cross-process routing). The
     /// receiving node serves it locally **iff** it is the leader; it never
@@ -175,6 +205,9 @@ pub enum ClientResponse {
     PutOk,
     /// A read reached its quorum; the value (or `None` if absent).
     Value(Option<Vec<u8>>),
+    /// A range scan's live `(key, value)` pairs in key order (reply to
+    /// [`Scan`](ClientRequest::Scan)).
+    Pairs(Vec<(Vec<u8>, Vec<u8>)>),
     /// The operation could not be served (no quorum, no tablet, etc.).
     Error(String),
 }
@@ -765,88 +798,211 @@ impl ClientCtx {
         self.raft.metadata().table_mode(table) == ReplicationMode::Cp
     }
 
-    /// Route a CP-mode **write** to the per-tablet Raft group leader (ADR 0017 #3a):
-    /// propose on the leader, then wait until the value is committed + applied +
-    /// durable — a linearizable read reflects it — before acking. Durable-before-ack,
-    /// matching the AP path's quorum-durability contract. (Stage 3a confirms commit
-    /// by reading the value back; a dedicated applied-index await is a 3b refinement,
-    /// as is forwarding when this process holds no group leader.)
-    async fn cp_put(&self, table: String, key: Vec<u8>, value: Vec<u8>) -> ClientResponse {
-        if let Some(leader) = self.edge.cp_leader() {
-            return Self::cp_put_local(&leader, key, value).await;
+    /// Resolve how to reach the CP group leader for an op originating on this node
+    /// (shared by every CP op — read/write/delete/scan — so the leader-resolution +
+    /// forwarding policy lives in one place):
+    ///
+    /// - this node hosts the current leader → serve **locally**;
+    /// - this node hosts a CP replica that points at a **remote** leader → **forward**
+    ///   there (ADR 0017 #3b);
+    /// - this node hosts a CP replica but the group is still electing → **wait** for
+    ///   it to settle (don't forward — the only "route" might be this very node, and
+    ///   forwarding a CP op to a non-leader just errors; the AP plane was always
+    ///   available, so the CP edges must not flap during election);
+    /// - this node hosts **no** CP replica → it can never serve locally, so forward
+    ///   to any known group route (the receiver serves iff it is the leader, else the
+    ///   client retries with fresh routing).
+    async fn cp_route(&self) -> CpRoute {
+        let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
+        loop {
+            if let Some(leader) = self.edge.cp_leader() {
+                return CpRoute::Local(leader);
+            }
+            // Forward only to a concrete leader *hint* a local replica gives us.
+            if let Some(addr) = self.cp_forward_target() {
+                return CpRoute::Forward(addr);
+            }
+            // No local leader and no leader hint. A node that hosts no CP replica
+            // can never serve locally, so forward to any known route immediately;
+            // a node that *does* host a replica waits for its own election/hint.
+            if self.edge.local_cp().is_none() {
+                if let Some(addr) = self.client_route.values().next().copied() {
+                    return CpRoute::Forward(addr);
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return CpRoute::None;
+            }
+            tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
         }
-        // Not the leader here: forward to the leader's node (ADR 0017 #3b).
-        match self.cp_forward_target() {
-            Some(addr) => {
+    }
+
+    /// Linearizable CP **read** of `key` (ADR 0017): ReadIndex on the group leader,
+    /// forwarded to the leader's node if this node isn't it. `Ok(None)` is an
+    /// absent key; `Err` is "no leader reachable" (never a stale value — a deposed
+    /// leader's ReadIndex returns `None`, treated as absent). The CP read primitive
+    /// the wire edges call directly.
+    pub(crate) async fn cp_read(&self, key: Vec<u8>) -> Result<Option<Vec<u8>>, String> {
+        match self.cp_route().await {
+            CpRoute::Local(leader) => Ok(leader.linearizable_get(&key).await),
+            CpRoute::Forward(addr) => {
+                match self
+                    .cp_forward(addr, ClientRequest::Get { key, table: None })
+                    .await
+                {
+                    ClientResponse::Value(v) => Ok(v),
+                    ClientResponse::Error(e) => Err(e),
+                    other => Err(format!("unexpected reply to forwarded CP read: {other:?}")),
+                }
+            }
+            CpRoute::None => Err("no CP group leader reachable".into()),
+        }
+    }
+
+    /// CP **write** of `key = value` (ADR 0017): propose on the group leader and
+    /// wait until the value is committed + durable + applied — a linearizable read
+    /// reflects it — before returning `Ok` (durable-before-ack). Forwarded if this
+    /// node isn't the leader. The CP write primitive the wire edges call directly.
+    pub(crate) async fn cp_write(&self, key: Vec<u8>, value: Vec<u8>) -> Result<(), String> {
+        match self.cp_route().await {
+            CpRoute::Local(leader) => Self::cp_put_local(&leader, key, value).await,
+            CpRoute::Forward(addr) => Self::ok_or_err(
                 self.cp_forward(
                     addr,
                     ClientRequest::Put {
                         key,
                         value,
-                        table: Some(table),
+                        table: None,
                     },
                 )
+                .await,
+                "forwarded CP write",
+            ),
+            CpRoute::None => Err("no CP group leader reachable".into()),
+        }
+    }
+
+    /// CP **delete** of `key` (ADR 0017): a Raft-committed tombstone, waited to
+    /// durable+applied (a linearizable read then reads `None`) before returning.
+    /// Forwarded if this node isn't the leader. Used by the CQL whole-partition
+    /// delete; the DynamoDB edge instead writes a sentinel tombstone *value* via
+    /// [`cp_write`](Self::cp_write).
+    pub(crate) async fn cp_delete(&self, key: Vec<u8>) -> Result<(), String> {
+        match self.cp_route().await {
+            CpRoute::Local(leader) => Self::cp_delete_local(&leader, key).await,
+            CpRoute::Forward(addr) => Self::ok_or_err(
+                self.cp_forward(addr, ClientRequest::Delete { key, table: None })
+                    .await,
+                "forwarded CP delete",
+            ),
+            CpRoute::None => Err("no CP group leader reachable".into()),
+        }
+    }
+
+    /// Linearizable CP range **scan** over `[start, end)` up to `limit` keys (ADR
+    /// 0017): ReadIndex on the group leader, forwarded if this node isn't it. The
+    /// CP read primitive behind the DynamoDB `Query`/`Scan` + CQL multi-row reads.
+    pub(crate) async fn cp_scan(
+        &self,
+        start: Vec<u8>,
+        end: Vec<u8>,
+        limit: Option<usize>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
+        match self.cp_route().await {
+            CpRoute::Local(leader) => leader
+                .linearizable_scan(&start, &end, limit)
                 .await
+                .ok_or_else(|| "CP group leader moved; retry".into()),
+            CpRoute::Forward(addr) => {
+                match self
+                    .cp_forward(addr, ClientRequest::Scan { start, end, limit })
+                    .await
+                {
+                    ClientResponse::Pairs(p) => Ok(p),
+                    ClientResponse::Error(e) => Err(e),
+                    other => Err(format!("unexpected reply to forwarded CP scan: {other:?}")),
+                }
             }
-            None => ClientResponse::Error("no CP group leader reachable".into()),
+            CpRoute::None => Err("no CP group leader reachable".into()),
         }
     }
 
     /// Propose a CP write on a **known-leader** local handle and wait until it is
     /// committed + durable + applied (a linearizable read reflects it) before
-    /// acking — durable-before-ack.
-    async fn cp_put_local(leader: &CpGroup, key: Vec<u8>, value: Vec<u8>) -> ClientResponse {
+    /// returning — durable-before-ack.
+    async fn cp_put_local(leader: &CpGroup, key: Vec<u8>, value: Vec<u8>) -> Result<(), String> {
         match leader.put(key.clone(), value.clone()) {
             ProposeResult::Accepted { .. } => {
                 let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
                 loop {
                     if leader.linearizable_get(&key).await.as_deref() == Some(value.as_slice()) {
-                        return ClientResponse::PutOk;
+                        return Ok(());
                     }
                     if tokio::time::Instant::now() >= deadline {
-                        return ClientResponse::Error("CP write did not commit in time".into());
+                        return Err("CP write did not commit in time".into());
                     }
                     tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
                 }
             }
-            ProposeResult::NotLeader { .. } => {
-                ClientResponse::Error("CP group leader moved; retry".into())
-            }
+            ProposeResult::NotLeader { .. } => Err("CP group leader moved; retry".into()),
         }
     }
 
-    /// Route a CP-mode **read** to the per-tablet Raft group leader: a linearizable
-    /// ReadIndex read (no stale value — a deposed leader returns `None`). Forwarded
-    /// to the leader's node if this node isn't it (ADR 0017 #3b).
-    async fn cp_get(&self, table: String, key: Vec<u8>) -> ClientResponse {
-        if let Some(leader) = self.edge.cp_leader() {
-            return ClientResponse::Value(leader.linearizable_get(&key).await);
-        }
-        match self.cp_forward_target() {
-            Some(addr) => {
-                self.cp_forward(
-                    addr,
-                    ClientRequest::Get {
-                        key,
-                        table: Some(table),
-                    },
-                )
-                .await
+    /// Propose a CP delete on a **known-leader** local handle and wait until the
+    /// key reads absent (committed + durable + applied tombstone) — durable-before-ack.
+    async fn cp_delete_local(leader: &CpGroup, key: Vec<u8>) -> Result<(), String> {
+        match leader.delete(key.clone()) {
+            ProposeResult::Accepted { .. } => {
+                let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
+                loop {
+                    if leader.linearizable_get(&key).await.is_none() {
+                        return Ok(());
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err("CP delete did not commit in time".into());
+                    }
+                    tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+                }
             }
-            None => ClientResponse::Error("no CP group leader reachable".into()),
+            ProposeResult::NotLeader { .. } => Err("CP group leader moved; retry".into()),
+        }
+    }
+
+    /// Map a forwarded-op reply that should be a bare ack into `Result<(), String>`.
+    fn ok_or_err(resp: ClientResponse, what: &str) -> Result<(), String> {
+        match resp {
+            ClientResponse::PutOk => Ok(()),
+            ClientResponse::Error(e) => Err(e),
+            other => Err(format!("unexpected reply to {what}: {other:?}")),
+        }
+    }
+
+    /// Route a CP-mode **write** for the plain client API (returns a wire
+    /// [`ClientResponse`]). Thin adapter over [`cp_write`](Self::cp_write).
+    async fn cp_put(&self, key: Vec<u8>, value: Vec<u8>) -> ClientResponse {
+        match self.cp_write(key, value).await {
+            Ok(()) => ClientResponse::PutOk,
+            Err(e) => ClientResponse::Error(e),
+        }
+    }
+
+    /// Route a CP-mode **read** for the plain client API (returns a wire
+    /// [`ClientResponse`]). Thin adapter over [`cp_read`](Self::cp_read).
+    async fn cp_get(&self, key: Vec<u8>) -> ClientResponse {
+        match self.cp_read(key).await {
+            Ok(v) => ClientResponse::Value(v),
+            Err(e) => ClientResponse::Error(e),
         }
     }
 
     /// The client-API address to forward a CP op to: the hosting node of the group
-    /// leader as a local CP replica currently sees it (`leader()` hint → `client_route`),
-    /// falling back to any known group node if there is no hint yet (it forwards on
-    /// or serves once a leader settles). `None` if this node knows of no CP route.
+    /// leader as a local CP replica currently sees it (`leader()` hint → `client_route`).
+    /// `None` if this node hosts no CP replica, the replica has no leader hint yet
+    /// (mid-election — the caller waits rather than guessing, so it never forwards a
+    /// CP op to a non-leader, including itself), or the hinted id has no known route.
     fn cp_forward_target(&self) -> Option<SocketAddr> {
-        let hint = self.edge.local_cp().and_then(|n| n.leader());
-        match hint {
-            Some(leader_id) => self.client_route.get(&leader_id).copied(),
-            None => self.client_route.values().next().copied(),
-        }
+        let leader_id = self.edge.local_cp().and_then(|n| n.leader())?;
+        self.client_route.get(&leader_id).copied()
     }
 
     /// Forward a CP op to another node's client API (wrapped so the receiver
@@ -900,9 +1056,24 @@ impl ClientCtx {
             return ClientResponse::Error("forwarded CP op: not the leader here".into());
         };
         match inner {
-            ClientRequest::Put { key, value, .. } => Self::cp_put_local(&leader, key, value).await,
+            ClientRequest::Put { key, value, .. } => {
+                match Self::cp_put_local(&leader, key, value).await {
+                    Ok(()) => ClientResponse::PutOk,
+                    Err(e) => ClientResponse::Error(e),
+                }
+            }
             ClientRequest::Get { key, .. } => {
                 ClientResponse::Value(leader.linearizable_get(&key).await)
+            }
+            ClientRequest::Delete { key, .. } => match Self::cp_delete_local(&leader, key).await {
+                Ok(()) => ClientResponse::PutOk,
+                Err(e) => ClientResponse::Error(e),
+            },
+            ClientRequest::Scan { start, end, limit } => {
+                match leader.linearizable_scan(&start, &end, limit).await {
+                    Some(p) => ClientResponse::Pairs(p),
+                    None => ClientResponse::Error("CP group leader moved; retry".into()),
+                }
             }
             _ => ClientResponse::Error("unexpected forwarded request".into()),
         }
@@ -1064,11 +1235,23 @@ async fn handle_client(mut stream: TcpStream, ctx: ClientCtx) -> std::io::Result
                 key,
                 value,
                 table: Some(t),
-            } if ctx.is_cp(&t) => ctx.cp_put(t, key, value).await,
+            } if ctx.is_cp(&t) => ctx.cp_put(key, value).await,
             ClientRequest::Get {
                 key,
                 table: Some(t),
-            } if ctx.is_cp(&t) => ctx.cp_get(t, key).await,
+            } if ctx.is_cp(&t) => ctx.cp_get(key).await,
+            // CP-only ops (no AP analog at the plain-client surface): always the CP
+            // plane. `Scan` is the linearizable range read; `Delete` a committed
+            // tombstone.
+            ClientRequest::Scan { start, end, limit } => match ctx.cp_scan(start, end, limit).await
+            {
+                Ok(pairs) => ClientResponse::Pairs(pairs),
+                Err(e) => ClientResponse::Error(e),
+            },
+            ClientRequest::Delete { key, .. } => match ctx.cp_delete(key).await {
+                Ok(()) => ClientResponse::PutOk,
+                Err(e) => ClientResponse::Error(e),
+            },
             // A CP op forwarded from another node (cross-process routing, ADR 0017
             // #3b): serve locally iff we are the leader; never re-forward.
             ClientRequest::Forwarded(inner) => ctx.cp_serve_forwarded(*inner).await,
