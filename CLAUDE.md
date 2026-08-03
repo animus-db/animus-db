@@ -414,7 +414,7 @@ cross-cutting ones. Prune/merge entries that become obsolete.
 
 ### Merge / integration workflow
 - **Run `cargo test --workspace` after *each* merge, not just at the end of a
-  batch.** Batching the gate run let a regression onto master via an earlier
+  batch.** Batching the gate run let a regression onto main via an earlier
   merge before it was caught. All five gates (fmt, clippy `--all-features
   -D warnings`, build, test, `cargo deny`) green per merge.
 - **`cargo deny` can be silently broken** (e.g. the repo's own `AGPL-3.0-only`
