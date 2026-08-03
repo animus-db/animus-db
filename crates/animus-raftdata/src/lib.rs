@@ -21,7 +21,10 @@
 //! which the follower writes into its own engine. **C** adds single-server
 //! **membership change** ([`RaftKvNode::change_membership`]) — config-in-log in the
 //! shared `RaftCore` — so the group can grow or reconfigure a replica off a failed
-//! node. Still ahead: tablet split D.
+//! node. **D** adds **tablet split** ([`RaftKvNode::propose_split`]): the split
+//! point is agreed through the Raft log, every replica tombstones the handed-off
+//! upper range, and that range seeds a new independent group
+//! ([`RaftKvNode::start_seeded`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
@@ -42,6 +45,12 @@ pub enum KvCommand {
     Put { key: Vec<u8>, value: Vec<u8> },
     /// Remove `key` (a tombstone in the engine).
     Delete { key: Vec<u8> },
+    /// **Split** this tablet at `at` (ADR 0017 D): keys `>= at` move to a new
+    /// tablet group. Agreed through the Raft log so every replica splits at the
+    /// same point in the command order; on apply each replica tombstones the
+    /// handed-off range `[at, ∞)` from its engine (it now serves only `[lo, at)`).
+    /// The new group is bootstrapped (seeded with the `[at, ∞)` data) separately.
+    Split { at: Vec<u8> },
     /// The leader's no-op-on-election (Raft); applies nothing.
     NoOp,
 }
@@ -165,6 +174,38 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// The group's active Raft voter configuration.
     pub fn config(&self) -> BTreeSet<NodeId> {
         self.lock().config()
+    }
+
+    /// Propose a **tablet split** at key `at` (ADR 0017 D): keys `>= at` move to a
+    /// new tablet. Leader-only. Once committed, every replica tombstones `[at, ∞)`
+    /// from its engine (so this group serves only `[lo, at)`); seed the new group
+    /// with [`range_snapshot`](Self::range_snapshot) data (captured before the
+    /// split) and start it via [`start_seeded`](Self::start_seeded).
+    pub fn propose_split(&self, at: Vec<u8>) -> ProposeResult {
+        self.lock().propose(KvCommand::Split { at })
+    }
+
+    /// The live `(key, value)` pairs with `key >= at` in this replica's engine —
+    /// the data to seed the new tablet's group on a split. Read on the leader
+    /// (its committed state is authoritative) before proposing the split.
+    pub async fn range_snapshot(&self, at: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+        keys_from(&self.storage, at).await
+    }
+
+    /// Start a group whose engine is **pre-seeded** with `seed` `(key, value)`
+    /// pairs (a new tablet bootstrapped from a split's handed-off range). The seed
+    /// is written at version 0 — below any Raft-applied version (the Raft index) —
+    /// so later writes win by per-key LWW.
+    pub async fn start_seeded(
+        env: E,
+        all_nodes: Vec<NodeId>,
+        storage: S,
+        seed: Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> Self {
+        for (key, value) in &seed {
+            storage.merge(key, value, 0).await.expect("raftkv seed");
+        }
+        Self::start(env, all_nodes, storage)
     }
 
     /// Read `key` from this replica's **local engine**. NOTE: this is a local read
@@ -316,6 +357,18 @@ async fn flush_and_apply<E: Env, S: StorageEngine>(
                     .await
                     .expect("raftkv apply delete");
             }
+            KvCommand::Split { at } => {
+                // The handed-off range `[at, ∞)` now belongs to the new tablet, so
+                // tombstone it here — every replica does this from the same
+                // committed command, so they stay consistent (ADR 0017 D). The new
+                // group is seeded with this range's data separately.
+                for (key, _) in keys_from(storage, &at).await {
+                    storage
+                        .merge_tombstone(&key, index)
+                        .await
+                        .expect("raftkv apply split tombstone");
+                }
+            }
             KvCommand::NoOp => {}
         }
     }
@@ -351,6 +404,19 @@ async fn flush_and_apply<E: Env, S: StorageEngine>(
             .expect("raftkv core poisoned")
             .take_snapshot_dirty();
     }
+}
+
+/// The engine's live `(key, value)` pairs with `key >= at` — the data handed off
+/// to the new tablet on a split.
+async fn keys_from<S: StorageEngine>(storage: &S, at: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+    storage
+        .entries()
+        .await
+        .expect("raftkv engine scan")
+        .into_iter()
+        .filter(|(k, _)| k.as_slice() >= at)
+        .map(|(k, vv)| (k, vv.value))
+        .collect()
 }
 
 /// One key's snapshot entry: `(key, value-or-tombstone, version)`.

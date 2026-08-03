@@ -78,7 +78,17 @@ the engine — the `AccordCore` sync-core/async-driver split.
   a crashed node, reject multi-server/self-removal, reproducibility). The
   control-plane-automatic trigger (failure detector + placement reconciler calling
   `change_membership`) is the remaining integration plumbing.
-- **D** — tablet split on cluster growth.
+- **D (done)** — **tablet split** (`propose_split`): the split point is agreed via
+  a committed `KvCommand::Split { at }`, so every replica splits at the same point
+  in the command order; on apply each replica **tombstones the handed-off range**
+  `[at, ∞)` (it now serves only `[lo, at)`), and that range is seeded into a new
+  independent group (`range_snapshot` → `start_seeded`). `tests/split.rs` (the
+  original keeps the lower range + drops the upper on every replica; the new group
+  serves the upper range; both operate independently; reproducibility). Full
+  *in-band* new-group creation (each original replica spawning its new-tablet
+  replica on apply) needs an `Env`-seam extension to mint a sibling inbox at
+  runtime; the harness/control plane creates the new group from the handoff for
+  now (integration plumbing, like C's automatic trigger).
 
 ## Tests
 

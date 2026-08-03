@@ -1,7 +1,10 @@
 # ADR 0017 — Per-tablet Raft data plane (leaderful, linearizable KV)
 
-- **Status:** Accepted — **Stages A + B implemented** (a usable single-tablet
-  linearizable KV data plane); Stages C + D in progress.
+- **Status:** Accepted — **Stages A–D implemented** in `animus-raftdata`
+  (linearizable single-tablet KV, compaction + streaming snapshots, single-server
+  membership change, tablet split), all sim-tested. The remaining work is
+  *integration plumbing* (control-plane-automatic membership/split triggers,
+  in-band dynamic group creation, wiring into `animusd`), not new mechanism.
 - **Date:** 2026-08-03
 
 ## Context
@@ -227,11 +230,18 @@ control plane unchanged. **Not yet:** dynamic membership (Stage C), tablet split
 - **Stage B — the data plane path.** ✅ Done (B.1 `RaftKvNode` driver + write path,
   B.2 ReadIndex reads). End-to-end single-tablet linearizable KV, sim-tested with
   faults (leader kill + rejoin, deposed-leader-no-stale-read).
-- **Stage C — reconfigure on failure.** Single-server Raft membership change in
-  `RaftCore` (config-in-log), wired so a failed node's replica moves to a spare and
-  catches up. Fault-injecting sim tests. *(In progress.)*
-- **Stage D — tablet split.** The Raft split trigger + new-group bootstrap on
-  cluster growth.
+- **Stage C — reconfigure on failure.** ✅ Done. Single-server Raft membership
+  change in `RaftCore` (config-in-log, carried through snapshots + `InstallSnapshot`),
+  `change_membership` (single-server delta, one-in-flight, no leader self-removal,
+  removed node stops campaigning). `tests/membership.rs` (add/remove, reconfigure
+  off a crashed node, rejections, reproducibility). *Remaining:* the automatic
+  trigger (failure detector + reconciler calling `change_membership`).
+- **Stage D — tablet split.** ✅ Done. A committed `Split { at }` agrees the point;
+  each replica tombstones the handed-off range `[at, ∞)`; that range seeds a new
+  independent group (`range_snapshot` → `start_seeded`). `tests/split.rs`.
+  *Remaining:* in-band new-group creation needs an `Env`-seam extension to mint a
+  sibling inbox at runtime (the harness/control plane creates it from the handoff
+  for now).
 - A **`RaftPerTablet` topology in the Elle corpus** (ADR 0014/0016 step 4) checks
   linearizability of this plane as each stage lands.
 - **Next ADR — cross-tablet transactions** (2PC over the groups + HLC; or Accord
