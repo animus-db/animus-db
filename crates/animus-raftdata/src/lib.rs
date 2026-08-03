@@ -176,6 +176,71 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         self.lock().config()
     }
 
+    /// Take **one** single-server step moving this group's Raft configuration
+    /// toward `desired` — the control plane's placement decision for this tablet
+    /// (ADR 0017 Stage C: the automatic reconfigure trigger). The shared
+    /// [`RaftCore::change_membership`] only accepts a single-server delta, with no
+    /// in-flight change and no leader self-removal, so this picks one add/remove
+    /// that makes progress and lets the next tick take the following step — a
+    /// multi-server move (e.g. replace a dead replica with a spare) converges one
+    /// server per call. Returns the proposed config if a step was **accepted**,
+    /// else `None`: already converged, not the leader, a change is in flight, or
+    /// the only remaining delta is removing the leader itself (which needs a
+    /// leadership transfer first — out of scope here).
+    ///
+    /// Order: drop an extra **non-leader** voter (e.g. a `Down` node) before adding
+    /// a missing one, so quorum margin is restored before a fresh replica — which
+    /// must still catch up via log/`InstallSnapshot` — is brought in.
+    pub fn reconfigure_step(&self, desired: &BTreeSet<NodeId>) -> Option<BTreeSet<NodeId>> {
+        let current = self.config();
+        if current == *desired || !self.is_leader() {
+            return None;
+        }
+        let me = self.env.node_id();
+        let next = if let Some(&extra) = current.difference(desired).find(|&&n| n != me) {
+            let mut c = current.clone();
+            c.remove(&extra);
+            c
+        } else if let Some(&missing) = desired.difference(&current).next() {
+            let mut c = current.clone();
+            c.insert(missing);
+            c
+        } else {
+            // The only delta left is removing the leader itself.
+            return None;
+        };
+        match self.change_membership(next.clone()) {
+            ProposeResult::Accepted { .. } => Some(next),
+            ProposeResult::NotLeader { .. } => None,
+        }
+    }
+
+    /// Spawn the **automatic Stage-C reconfigure loop** (ADR 0017): on each
+    /// `interval` tick, poll `desired` for this tablet's target voter set and take
+    /// one [`reconfigure_step`](Self::reconfigure_step) toward it. Idempotent and
+    /// leader-gated — a non-leader or a converged group proposes nothing, so a
+    /// steady cluster produces no churn; a multi-server move converges one server
+    /// per tick. `desired` is the **seam to the control plane**: in production it
+    /// reads `Metadata.tablets[tablet].replicas` (the placement reconciler's
+    /// epoch-CAS decision) and returns it as a voter set; it is a closure so this
+    /// crate takes no dependency on the control-plane driver type. Mirrors the
+    /// control plane's `reconcile_loop` (decision elsewhere, timing here).
+    pub fn spawn_reconfigure_loop<F>(&self, interval: Duration, desired: F)
+    where
+        F: Fn() -> Option<BTreeSet<NodeId>> + Send + 'static,
+    {
+        let node = self.clone();
+        let env = self.env.clone();
+        env.clone().spawn_task(async move {
+            loop {
+                env.sleep(interval).await;
+                if let Some(target) = desired() {
+                    node.reconfigure_step(&target);
+                }
+            }
+        });
+    }
+
     /// Propose a **tablet split** at key `at` (ADR 0017 D): keys `>= at` move to a
     /// new tablet. Leader-only. Once committed, every replica tombstones `[at, ∞)`
     /// from its engine (so this group serves only `[lo, at)`); seed the new group

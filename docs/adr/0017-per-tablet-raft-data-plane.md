@@ -2,9 +2,11 @@
 
 - **Status:** Accepted — **Stages A–D implemented** in `animus-raftdata`
   (linearizable single-tablet KV, compaction + streaming snapshots, single-server
-  membership change, tablet split), all sim-tested. The remaining work is
-  *integration plumbing* (control-plane-automatic membership/split triggers,
-  in-band dynamic group creation, wiring into `animusd`), not new mechanism.
+  membership change, tablet split), all sim-tested, and the plane's
+  linearizability is now verified by a dedicated **Elle corpus**
+  (`animus-test/tests/raftkv_linearizable.rs`). The remaining work is *integration
+  plumbing* (control-plane-automatic membership/split triggers, in-band dynamic
+  group creation, wiring into `animusd`), not new mechanism.
 - **Date:** 2026-08-03
 
 ## Context
@@ -234,16 +236,39 @@ control plane unchanged. **Not yet:** dynamic membership (Stage C), tablet split
   change in `RaftCore` (config-in-log, carried through snapshots + `InstallSnapshot`),
   `change_membership` (single-server delta, one-in-flight, no leader self-removal,
   removed node stops campaigning). `tests/membership.rs` (add/remove, reconfigure
-  off a crashed node, rejections, reproducibility). *Remaining:* the automatic
-  trigger (failure detector + reconciler calling `change_membership`).
+  off a crashed node, rejections, reproducibility). The **automatic trigger** is
+  now wired (SimEnv, per the maintainer's decision): `RaftKvNode::reconfigure_step`
+  takes one single-server step toward a desired voter set, and
+  `spawn_reconfigure_loop` drives it from an **epoch-driven pull** — each group
+  leader polls the control plane's replicated `Metadata.tablets[t].replicas` and
+  reconfigures itself, no new control→data command. `tests/reconfigure_trigger.rs`
+  proves the full cascade under one `SimEnv` (control plane + heartbeats + a Raft KV
+  group + a spare): a crash → detector `Down` → reconciler `CasTabletReplicas` →
+  the surviving leader removes the dead node and adds the same-zone spare, which
+  catches up and the group keeps serving (seed sweep + reproducibility).
+  *Remaining:* the `ProdEnv`/`animusd` production assembly (hosting per-tablet
+  groups + leader-reporting for client routing) — see Stage-D-style integration
+  plumbing below.
 - **Stage D — tablet split.** ✅ Done. A committed `Split { at }` agrees the point;
   each replica tombstones the handed-off range `[at, ∞)`; that range seeds a new
   independent group (`range_snapshot` → `start_seeded`). `tests/split.rs`.
   *Remaining:* in-band new-group creation needs an `Env`-seam extension to mint a
   sibling inbox at runtime (the harness/control plane creates it from the handoff
   for now).
-- A **`RaftPerTablet` topology in the Elle corpus** (ADR 0014/0016 step 4) checks
-  linearizability of this plane as each stage lands.
+- **`RaftPerTablet` Elle corpus** (ADR 0014/0016 step 4). ✅ Done. A self-contained
+  linearizability corpus for this plane in `animus-test`
+  (`tests/raftkv_linearizable.rs`): a single-key list-append workload over one Raft
+  group, recorded as an Elle `History` and checked with the proven
+  `check_cycles`/`check_durability`/`check_convergence`. It is *not* a `Topology`
+  variant of the Accord corpus — the leaderful plane is **single-tablet,
+  non-transactional KV**, so it cannot reuse the multi-key transactional Accord
+  workload; instead it reuses the checkers + `Recorder` model. Serializability is a
+  **sound** check here (the plane is the serialization authority — a forked/stale
+  read shows as a cycle) and is asserted on a frozen, name-seeded scenario set
+  (baselines + leader-kill/follower-kill/partition-leader/lossy × early/mid/late ×
+  3- and 5-replica), with a depth knob (`ANIMUS_RAFTKV_SEEDS`, default 1; held at
+  depth 20 / 360 scenarios). Convergence + durability use the same
+  converged-or-timeout poll as the Accord runner.
 - **Next ADR — cross-tablet transactions** (2PC over the groups + HLC; or Accord
   atop them).
 

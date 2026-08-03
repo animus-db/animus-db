@@ -73,6 +73,31 @@ so it doesn't actually exercise `check_cycles`. The Accord-targeted suite does:
   env-scaled `corpus()`, the structural guards run the env-independent
   `corpus_base()`.
 
+### Elle-against-Raft: the leaderful (CP) plane corpus (ADR 0017)
+
+- `raftkv_linearizable.rs` — the **CP counterpart** of the Accord corpus, for the
+  `animus-raftdata` leaderful data plane. Crucially it is **not** a `Topology`
+  variant of `support/mod.rs`: that harness drives **multi-key transactions** via
+  `AccordNode`, but the Raft KV plane is **single-tablet, non-transactional KV**
+  (`put`/`delete`/`linearizable_get`, one key per op), so the transactional
+  workload can't run over it. The file is self-contained — it reuses only the
+  *checkers* (`check_cycles`/`check_durability`/`check_convergence`) and the
+  `Recorder`/`History` model — and drives a **single-key list-append** workload
+  over one Raft group (clients route each op to the current leader, tolerating
+  crashes/partitions → `info`).
+- **Serializability is sound *and* asserted here** (unlike the AP `Frontier`): a
+  single Raft group *is* the serialization authority, so a forked/stale read (the
+  failure a deposed leader would cause) shows up as a `check_cycles` cycle. There
+  is no eventually-consistent read path to manufacture torn-read false positives,
+  so all three checks run on this one layer. Convergence + durability are still
+  *eventual* (a lagging follower catches up via log/snapshot), so they use the same
+  **converged-or-timeout** poll as the Accord runner.
+- Frozen, name-seeded scenario set (baselines + leader-kill / follower-kill /
+  partition-leader / lossy × early/mid/late × 3- and 5-replica) with a single depth
+  knob **`ANIMUS_RAFTKV_SEEDS`** (default 1 = byte-identical frozen set; held green
+  at depth 20 / 360 scenarios). The teeth-proof is the shared `negative_control.rs`
+  (same `check_cycles`).
+
 ### Scaling coverage: the two env knobs + the topology split (ADR 0014)
 
 - **Depth — `ANIMUS_CORPUS_SEEDS=K` (default 1).** `support::seed_expand` emits

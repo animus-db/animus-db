@@ -76,8 +76,23 @@ the engine — the `AccordCore` sync-core/async-driver split.
   to a single-server delta + one-in-flight + no leader self-removal.
   `tests/membership.rs` (remove a follower, add + catch up a node, reconfigure off
   a crashed node, reject multi-server/self-removal, reproducibility). The
-  control-plane-automatic trigger (failure detector + placement reconciler calling
-  `change_membership`) is the remaining integration plumbing.
+  **automatic trigger is now wired** (SimEnv): `reconfigure_step` takes one
+  single-server step toward a desired voter set (remove an extra non-leader voter
+  before adding a missing one), and `spawn_reconfigure_loop` drives it from an
+  **epoch-driven pull** — each group leader polls the control plane's replicated
+  `Metadata.tablets[t].replicas` and reconfigures itself (no new control→data
+  command; mirrors the control plane's `reconcile_loop` — decision in
+  `reconfigure_step`, timing in the loop). `tests/reconfigure_trigger.rs` proves
+  the end-to-end cascade (crash → detector `Down` → reconciler `CasTabletReplicas`
+  → group leader swaps the dead node for a same-zone spare, which catches up and
+  the group keeps serving). The `ProdEnv`/`animusd` production assembly (hosting
+  groups + leader-reporting for routing) remains.
+  - **Test gotcha (membership):** pre-start a to-be-added node knowing only the
+    *current* voters, NOT itself — a node started inside its own initial config is
+    a voter that can campaign, win, and inject itself into the group before the
+    real add (`RaftCore::start_election` gates on `is_voter`). A `RaftKvNode::start`
+    whose `all_nodes` excludes its own id is a quiet non-voter until the leader adds
+    it. (Caught by the `reconfigure_trigger` seed sweep — a single seed hid it.)
 - **D (done)** — **tablet split** (`propose_split`): the split point is agreed via
   a committed `KvCommand::Split { at }`, so every replica splits at the same point
   in the command order; on apply each replica **tombstones the handed-off range**
