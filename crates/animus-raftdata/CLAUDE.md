@@ -25,9 +25,13 @@ the engine — the `AccordCore` sync-core/async-driver split.
 
 - `KvCommand` (`Put`/`Delete`/`NoOp`), `KvState` (the `DRIVER_APPLIED` SM).
 - `RaftKvNode<E, S>` — a running tablet-group node: `start(env, all_nodes,
-  storage)`, `put`/`delete` (proposed via Raft, honored on the leader), `is_leader`.
-  `local_get` reads this replica's engine (**not** linearizable — that is ReadIndex,
-  Stage B.2; it is a test/observability aid).
+  storage)`, `put`/`delete` (proposed via Raft, honored on the leader), `is_leader`,
+  `linearizable_get` (ReadIndex), `local_get` (a replica's raw engine read — *not*
+  linearizable; a test/observability aid).
+- `KvWire` — the data-plane wire enum wrapping `RaftMsg` plus the ReadIndex
+  read-barrier probes (`ReadProbe`/`ReadProbeAck`). The probes are driver-only, so
+  ReadIndex lives entirely in this crate and the shared `RaftCore`/`RaftMsg` are
+  untouched.
 
 ## What's non-obvious
 
@@ -50,7 +54,11 @@ the engine — the `AccordCore` sync-core/async-driver split.
 - **B.1 (done)** — single-group driver + write path; `tests/single_tablet.rs`
   (writes replicate + apply on every replica; survive a leader kill + rejoin
   catch-up; trace reproducibility).
-- **B.2** — linearizable **ReadIndex** reads.
+- **B.2 (done)** — linearizable **ReadIndex** reads (`linearizable_get`): a
+  read-barrier quorum probe (`KvWire::ReadProbe`/`Ack`, driver-only) confirms the
+  leader still leads its term, then it serves locally once applied. No log entry,
+  no wall clock. `tests/read_index.rs` (reads reflect committed writes + RYW; a
+  deposed/partitioned leader returns `None`, never a stale value).
 - **A.2** — engine-as-snapshot + streaming `InstallSnapshot` (follower catch-up).
 - **C** — per-tablet hosting + single-server Raft membership change (reconfigure on
   node failure, driven by the control plane).
