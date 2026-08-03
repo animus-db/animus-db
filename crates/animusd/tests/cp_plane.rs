@@ -22,7 +22,10 @@
 
 use std::time::Duration;
 
-use animusd::{ClientRequest, ClientResponse, Node, bind_cluster, read_frame, start_cluster};
+use animusd::{
+    ClientRequest, ClientResponse, Node, bind_cluster, read_frame, start_cluster,
+    start_cluster_auto_split,
+};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
@@ -317,6 +320,94 @@ async fn cp_tablet_splits_and_both_halves_serve() {
     )
     .await;
     assert_eq!(new_upper, ClientResponse::Value(Some(b"upper2".to_vec())));
+
+    for n in &nodes {
+        n.shutdown();
+    }
+}
+
+/// Phase 2.4 — **automatic size-telemetry split trigger.** With the auto-split
+/// loop enabled at a low key-count threshold, writing past it causes the tablet's
+/// leader to split it at the median **with no manual trigger**; afterwards both
+/// halves serve. Closes the auto-shard loop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn tablet_auto_splits_when_it_grows() {
+    let dir = tempfile::tempdir().unwrap();
+    let bound = bind_cluster(3, "127.0.0.1".parse().unwrap(), dir.path())
+        .await
+        .unwrap();
+    // Auto-split once a tablet exceeds 16 keys (a test threshold; production is
+    // size-based + higher).
+    let nodes = start_cluster_auto_split(bound, 16).await.unwrap();
+    await_bootstrap(&nodes).await;
+    let addr0 = nodes[0].client_addr();
+
+    // Write 24 distinct keys (> threshold) to the single bootstrap tablet.
+    for i in 0..24u32 {
+        let key = format!("key{i:02}").into_bytes();
+        let value = format!("v{i}").into_bytes();
+        let put = async {
+            loop {
+                match call(
+                    addr0,
+                    ClientRequest::Put {
+                        key: key.clone(),
+                        value: value.clone(),
+                        table: None,
+                    },
+                )
+                .await
+                {
+                    ClientResponse::PutOk => return,
+                    ClientResponse::Error(_) => sleep(Duration::from_millis(100)).await,
+                    other => panic!("unexpected put: {other:?}"),
+                }
+            }
+        };
+        timeout(Duration::from_secs(20), put)
+            .await
+            .unwrap_or_else(|_| panic!("write key{i:02} timed out"));
+    }
+
+    // The auto-split loop (no manual trigger) splits the over-threshold tablet.
+    let auto_split = async {
+        loop {
+            if nodes.iter().all(|n| n.metadata().tablets.len() >= 2) {
+                return;
+            }
+            sleep(Duration::from_millis(200)).await;
+        }
+    };
+    timeout(Duration::from_secs(30), auto_split)
+        .await
+        .expect("tablet did not auto-split within 30s");
+
+    // Both halves serve: a low key and a high key both read back, retrying while the
+    // new (upper) group elects + its addresses propagate.
+    for (k, want) in [
+        (b"key00".to_vec(), b"v0".to_vec()),
+        (b"key23".to_vec(), b"v23".to_vec()),
+    ] {
+        let read = async {
+            loop {
+                let got = call(
+                    nodes[2].client_addr(),
+                    ClientRequest::Get {
+                        key: k.clone(),
+                        table: None,
+                    },
+                )
+                .await;
+                if got == ClientResponse::Value(Some(want.clone())) {
+                    return;
+                }
+                sleep(Duration::from_millis(150)).await;
+            }
+        };
+        timeout(Duration::from_secs(30), read)
+            .await
+            .unwrap_or_else(|_| panic!("key {k:?} not served after auto-split"));
+    }
 
     for n in &nodes {
         n.shutdown();

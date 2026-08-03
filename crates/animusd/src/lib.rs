@@ -144,6 +144,17 @@ impl CpGroup {
             CpGroup::Mem(n) => n.propose_split(at),
         }
     }
+
+    /// This node's live `(key, value)` pairs for the group, in key order, from the
+    /// **local** engine (no quorum barrier). Meaningful on the leader (its committed
+    /// state); the auto-split loop uses it as a cheap size signal + to pick a median
+    /// split key (Phase 2.4). See [`RaftKvNode::range_snapshot`].
+    async fn local_pairs(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
+        match self {
+            CpGroup::Lsm(n) => n.range_snapshot(&[]).await,
+            CpGroup::Mem(n) => n.range_snapshot(&[]).await,
+        }
+    }
 }
 
 /// How a CP op originating on this node reaches the group leader
@@ -397,17 +408,22 @@ impl BoundNode {
             StorageBackend::default(),
             ClusterEdgeState::new(),
             BTreeMap::new(),
+            None,
         )
         .await
     }
 
-    /// Like [`start`](Self::start), but selects the CP group's storage engine.
-    /// [`StorageBackend::Lsm`] is durable (survives restart);
-    /// [`StorageBackend::Memory`] is volatile (ephemeral runs).
+    /// Like [`start`](Self::start), but selects the CP group's storage engine and
+    /// options. [`StorageBackend::Lsm`] is durable (survives restart);
+    /// [`StorageBackend::Memory`] is volatile (ephemeral runs). `auto_split_threshold`
+    /// opts a CP-hosting node into the automatic size-telemetry split trigger (Phase
+    /// 2.4): when a tablet it leads exceeds that many keys, it splits at the median;
+    /// `None` (the default) disables it.
     ///
     /// # Errors
     /// Propagates a failure to open the CP group's on-disk engine (LSM backend
     /// only).
+    #[allow(clippy::too_many_arguments)] // node assembly: ids + backend + edge + route + split opt
     pub async fn start_with(
         self,
         peers: BTreeMap<NodeId, SocketAddr>,
@@ -415,6 +431,7 @@ impl BoundNode {
         backend: StorageBackend,
         edge: ClusterEdgeState,
         client_route: BTreeMap<NodeId, SocketAddr>,
+        auto_split_threshold: Option<usize>,
     ) -> std::io::Result<Node> {
         self.control_env.set_peers(peers.clone());
         self.raftkv_env.set_peers(peers.clone());
@@ -541,6 +558,13 @@ impl BoundNode {
                     ctx.register_cp_addr(my_raftkv_id, my_raftkv_addr.to_string())
                         .await;
                 }));
+            }
+            // Auto-split loop (Phase 2.4), opt-in: a CP-hosting node splits a tablet
+            // it leads once it exceeds the key-count threshold.
+            if let Some(threshold) = auto_split_threshold {
+                if hosts_cp {
+                    tasks.push(tokio::spawn(auto_split_loop(ctx.clone(), threshold)));
+                }
             }
             tasks.push(tokio::spawn(serve_clients(
                 self.client_listener,
@@ -1429,6 +1453,63 @@ async fn cp_split_seed(
     }
 }
 
+/// How often the auto-split loop samples tablet sizes (Phase 2.4). A slow
+/// background activity, well off any request path; spaced so a triggered split
+/// settles (metadata + the new group) before the next sample re-reads sizes.
+const AUTO_SPLIT_INTERVAL: Duration = Duration::from_secs(2);
+/// After triggering a tablet's split, the loop skips re-triggering that tablet for
+/// this long — long enough for the split to apply (the parent tablet's key count
+/// then halves below the threshold, so it won't re-trigger anyway, but this guards
+/// the in-flight window against a duplicate trigger).
+const AUTO_SPLIT_COOLDOWN: Duration = Duration::from_secs(15);
+
+/// The leader-driven **automatic split trigger** (Phase 2.4): on each tick, for
+/// every tablet whose CP group this node currently **leads**, read the leader's
+/// local key count (a cheap size signal) and, if it exceeds `threshold`, propose a
+/// split at the **median** key — bisecting the tablet so each half holds roughly
+/// half the keys. Per-tablet cooldown avoids a duplicate trigger while a split is
+/// in flight; once it applies, the parent's key count halves below the threshold.
+///
+/// Only the node hosting a tablet's leader reads `local_pairs`/triggers, so in a
+/// one-process-per-node deployment exactly one node triggers. (In a single
+/// `--cluster N` process the edge state is shared, so every node's loop sees the
+/// same leader handle and may trigger redundantly — harmless: the control plane
+/// rejects a re-split of an already-split range, and the per-node mint gate dedups
+/// the hook, so it converges to one split.)
+///
+/// `threshold` is a **key count** here — a placeholder size signal; a real
+/// byte/size-based threshold is future tuning. Disabled unless a threshold is wired
+/// (so it never perturbs clusters that don't opt in).
+async fn auto_split_loop(ctx: ClientCtx, threshold: usize) {
+    let mut last_triggered: BTreeMap<TabletId, tokio::time::Instant> = BTreeMap::new();
+    loop {
+        tokio::time::sleep(AUTO_SPLIT_INTERVAL).await;
+        let tablets: Vec<TabletId> = ctx.raft.metadata().tablets.keys().copied().collect();
+        for tablet in tablets {
+            if let Some(at) = last_triggered.get(&tablet) {
+                if at.elapsed() < AUTO_SPLIT_COOLDOWN {
+                    continue;
+                }
+            }
+            // Only the leader's host reads + triggers (else this node doesn't have
+            // the leader handle).
+            let Some(leader) = ctx.edge.cp_leader(tablet) else {
+                continue;
+            };
+            let pairs = leader.local_pairs().await;
+            if pairs.len() <= threshold {
+                continue;
+            }
+            // Median key bisects the tablet; it is strictly inside the range (an
+            // interior key of > threshold >= 2 distinct keys), so `SplitTablet`
+            // accepts it.
+            let median = pairs[pairs.len() / 2].0.clone();
+            last_triggered.insert(tablet, tokio::time::Instant::now());
+            let _ = ctx.trigger_split(tablet, median).await;
+        }
+    }
+}
+
 async fn serve_clients(listener: TcpListener, ctx: ClientCtx) {
     loop {
         match listener.accept().await {
@@ -1790,6 +1871,28 @@ pub async fn start_cluster_with(
     bound: Vec<BoundNode>,
     backend: StorageBackend,
 ) -> std::io::Result<Vec<Node>> {
+    start_cluster_inner(bound, backend, None).await
+}
+
+/// Like [`start_cluster`], but enables the **automatic split trigger** (Phase 2.4)
+/// with the given key-count `threshold`: a CP-hosting node splits a tablet it leads
+/// once it exceeds that many keys. For tests/dev that want to exercise auto-sharding
+/// without the (high, size-based) production threshold.
+///
+/// # Errors
+/// Propagates a failure to open any node's CP group engine.
+pub async fn start_cluster_auto_split(
+    bound: Vec<BoundNode>,
+    threshold: usize,
+) -> std::io::Result<Vec<Node>> {
+    start_cluster_inner(bound, StorageBackend::default(), Some(threshold)).await
+}
+
+async fn start_cluster_inner(
+    bound: Vec<BoundNode>,
+    backend: StorageBackend,
+    auto_split_threshold: Option<usize>,
+) -> std::io::Result<Vec<Node>> {
     let n = bound.len();
     let control_ids: Vec<NodeId> = (0..n).map(config::control_id).collect();
     let peers: BTreeMap<NodeId, SocketAddr> =
@@ -1809,6 +1912,7 @@ pub async fn start_cluster_with(
                 // In-process cluster: the shared edge state reaches every CP group
                 // handle in-process, so no cross-process forwarding route is needed.
                 BTreeMap::new(),
+                auto_split_threshold,
             )
             .await?;
         nodes.push(node);
@@ -1872,6 +1976,7 @@ pub async fn run_node_with(
             backend,
             ClusterEdgeState::new(),
             client_route,
+            None,
         )
         .await
 }
