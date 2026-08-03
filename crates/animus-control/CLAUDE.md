@@ -38,7 +38,13 @@ epoch compare-and-swap transactions.
   for any `S`; only `apply` and the snapshot image type are `S`-specific. **The
   driver `RaftNode` stays control-plane-specific** (it bakes in reconcile +
   failure-detection); the KV data plane gets its own driver. `RaftCore::metadata()`
-  is the `S = Metadata` convenience over the generic `state()`. **Two apply models
+  is the `S = Metadata` convenience over the generic `state()`. **Membership is
+  config-in-log (ADR 0017 C):** `LogEntry` may carry a `config: Option<voters>`;
+  `RaftCore` keeps `peers`/`cluster_size` in sync with the latest log config (the
+  config rides snapshots + `InstallSnapshot`), and `change_membership` appends a
+  single-server config entry (one-in-flight, no leader self-removal). The control
+  plane never reconfigures, so its config stays `= initial_config` and its
+  behavior is unchanged. **Two apply models
   (ADR 0017):** the control plane's `Metadata` applies **in-core, synchronously**
   (`StateMachine::DRIVER_APPLIED = false`, the default); a data-plane KV store sets
   `DRIVER_APPLIED = true`, so the core does *not* apply in-core — it buffers each

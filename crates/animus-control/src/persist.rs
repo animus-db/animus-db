@@ -13,6 +13,8 @@
 //! to the snapshot base (no double-applied compare-and-swap), while the log
 //! prefix the snapshot covers is discarded.
 
+use std::collections::BTreeSet;
+
 use animus_env::NodeId;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -44,6 +46,12 @@ pub enum WalRecord<C = MetaCommand, S = Metadata> {
         metadata: S,
         last_index: u64,
         last_term: u64,
+        /// The Raft voter configuration effective at `last_index` (ADR 0017 C):
+        /// membership lives in the log, so a snapshot that truncates the log must
+        /// carry the config or it is lost. `None` (the default for older records /
+        /// the never-reconfigured control plane) means "the node's initial set".
+        #[serde(default)]
+        config: Option<BTreeSet<NodeId>>,
     },
 }
 
@@ -59,6 +67,9 @@ pub struct PersistedState<C = MetaCommand, S = Metadata> {
     pub log: Vec<LogEntry<C>>,
     /// The latest snapshot: `(state, last_index, last_term)`.
     pub snapshot: Option<(S, u64, u64)>,
+    /// The voter configuration recorded by the latest snapshot, if any (ADR 0017
+    /// C). `None` means the snapshot predates membership changes / there is none.
+    pub snapshot_config: Option<BTreeSet<NodeId>>,
 }
 
 // Manual `Default` (not derived): the derive would demand `C: Default` + `S:
@@ -71,6 +82,7 @@ impl<C, S> Default for PersistedState<C, S> {
             voted_for: None,
             log: Vec::new(),
             snapshot: None,
+            snapshot_config: None,
         }
     }
 }
@@ -101,8 +113,10 @@ where
                     metadata,
                     last_index,
                     last_term,
+                    config,
                 } => {
                     state.snapshot = Some((metadata, last_index, last_term));
+                    state.snapshot_config = config;
                 }
             }
         }

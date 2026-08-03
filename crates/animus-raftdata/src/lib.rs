@@ -18,8 +18,10 @@
 //! serves from its local engine. **A.2** adds compaction + streaming snapshots:
 //! the leader snapshots its engine image, truncates the Raft log prefix, and
 //! catches a lagging follower up via the chunked `InstallSnapshot` (engine bytes),
-//! which the follower writes into its own engine. Still ahead: reconfiguration C;
-//! tablet split D.
+//! which the follower writes into its own engine. **C** adds single-server
+//! **membership change** ([`RaftKvNode::change_membership`]) — config-in-log in the
+//! shared `RaftCore` — so the group can grow or reconfigure a replica off a failed
+//! node. Still ahead: tablet split D.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
@@ -149,6 +151,20 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// Propose a delete (tombstone) to this group.
     pub fn delete(&self, key: Vec<u8>) -> ProposeResult {
         self.lock().propose(KvCommand::Delete { key })
+    }
+
+    /// Propose a **single-server** membership change (ADR 0017 C): `voters` becomes
+    /// this group's Raft configuration. Leader-only; rejected for a multi-server
+    /// delta, an in-flight change, or removing the leader. This is the primitive
+    /// the control plane drives to move a replica off a failed node onto a spare,
+    /// or to grow the group as the cluster grows.
+    pub fn change_membership(&self, voters: BTreeSet<NodeId>) -> ProposeResult {
+        self.lock().change_membership(voters)
+    }
+
+    /// The group's active Raft voter configuration.
+    pub fn config(&self) -> BTreeSet<NodeId> {
+        self.lock().config()
     }
 
     /// Read `key` from this replica's **local engine**. NOTE: this is a local read

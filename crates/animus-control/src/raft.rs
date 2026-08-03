@@ -79,6 +79,14 @@ pub struct LogEntry<C = MetaCommand> {
     pub index: u64,
     /// The state-machine command.
     pub command: C,
+    /// For a **membership-change** entry (ADR 0017 C), the new voter set this
+    /// entry installs; `None` for an ordinary command entry. Membership lives in
+    /// the log so every replica agrees on the configuration history; a node uses
+    /// the latest log config (committed or not) for all quorum/election decisions.
+    /// `#[serde(default)]` so ordinary entries (and the control plane) are
+    /// unchanged on the wire.
+    #[serde(default)]
+    pub config: Option<BTreeSet<NodeId>>,
 }
 
 /// Wire messages exchanged between Raft peers, generic over the command type `C`
@@ -132,6 +140,11 @@ pub enum RaftMsg<C = MetaCommand> {
         total: u64,
         /// Whether this is the final chunk.
         done: bool,
+        /// The voter configuration at the snapshot (ADR 0017 C): the image bytes
+        /// don't carry Raft membership, so the leader ships it here and the
+        /// follower adopts it on install. `None` (default) ⇒ the initial config.
+        #[serde(default)]
+        config: Option<BTreeSet<NodeId>>,
     },
     /// Response to [`RaftMsg::InstallSnapshot`]. `next_offset` is the number of
     /// contiguous snapshot bytes the follower now holds — the offset the leader
@@ -210,8 +223,24 @@ struct IncomingSnapshot {
 /// a per-tablet data plane (ADR 0016) instantiates it with a key-value store.
 pub struct RaftCore<C = MetaCommand, S = Metadata> {
     id: NodeId,
+    // `peers` + `cluster_size` are **derived from `config`** (the active voter set)
+    // and kept in sync by `apply_config`, so existing quorum/replication call
+    // sites are unchanged as membership evolves (ADR 0017 C).
     peers: Vec<NodeId>,
     cluster_size: usize,
+    // The active Raft voter configuration: the voter set from the latest log entry
+    // carrying a config (committed or not), else the snapshot's config, else
+    // `initial_config`. Single-server changes (Raft §4.3) — never two disjoint
+    // majorities — so a leader appends one `AddServer`/`RemoveServer` config entry
+    // and adopts it immediately.
+    config: BTreeSet<NodeId>,
+    // The configuration the node booted with (the fallback when no config entry or
+    // snapshot config is present). Never the control plane's concern — it never
+    // reconfigures, so `config == initial_config` always there.
+    initial_config: BTreeSet<NodeId>,
+    // The voter config recorded by the latest local snapshot (so compaction does
+    // not lose membership); restored on recovery.
+    snapshot_config: Option<BTreeSet<NodeId>>,
 
     role: Role,
     current_term: u64,
@@ -290,10 +319,14 @@ where
     pub fn new(id: NodeId, all_nodes: &[NodeId], now: Nanos, entropy: u64) -> Self {
         let peers: Vec<NodeId> = all_nodes.iter().copied().filter(|n| *n != id).collect();
         let cluster_size = all_nodes.len();
+        let initial_config: BTreeSet<NodeId> = all_nodes.iter().copied().collect();
         let mut core = Self {
             id,
             peers,
             cluster_size,
+            config: initial_config.clone(),
+            initial_config,
+            snapshot_config: None,
             role: Role::Follower,
             current_term: 0,
             voted_for: None,
@@ -351,6 +384,11 @@ where
             core.last_applied = last_index;
             core.commit_index = last_index;
         }
+        // Restore the voter configuration: the snapshot's recorded config (if any)
+        // is the base, and the recovered log tail's latest config entry (if any)
+        // overrides it — `recompute_config` applies that precedence (ADR 0017 C).
+        core.snapshot_config = persisted.snapshot_config;
+        core.recompute_config();
         // Everything restored from the WAL/snapshot is by definition durable, so
         // the durable watermark covers the whole recovered log. The tail re-applies
         // (durable-gated, a no-op gate) once commit re-advances post-recovery.
@@ -386,6 +424,7 @@ where
                 metadata: self.metadata.clone(),
                 last_index: self.snapshot_index,
                 last_term: self.snapshot_term,
+                config: self.snapshot_config.clone(),
             });
         }
         image.push(WalRecord::Hard {
@@ -407,6 +446,9 @@ where
         }
         let new_index = self.last_applied;
         let new_term = self.term_at(new_index);
+        // Capture the config effective at the snapshot base *before* truncating
+        // (the config entry may be in the prefix we are about to drop).
+        self.snapshot_config = Some(self.config_at(new_index));
         self.log.retain(|e| e.index > new_index);
         self.snapshot_index = new_index;
         self.snapshot_term = new_term;
@@ -562,6 +604,87 @@ where
         self.cluster_size / 2 + 1
     }
 
+    // ---- membership / configuration (ADR 0017 C) ------------------------
+
+    /// Whether this node is a voter in the active configuration.
+    fn is_voter(&self) -> bool {
+        self.config.contains(&self.id)
+    }
+
+    /// The active voter configuration.
+    #[must_use]
+    pub fn config(&self) -> BTreeSet<NodeId> {
+        self.config.clone()
+    }
+
+    /// Adopt `voters` as the active config and keep `peers`/`cluster_size` in sync,
+    /// so every quorum/replication/election decision reflects it immediately.
+    fn apply_config(&mut self, voters: BTreeSet<NodeId>) {
+        self.peers = voters.iter().copied().filter(|n| *n != self.id).collect();
+        self.cluster_size = voters.len();
+        self.config = voters;
+    }
+
+    /// The voter config effective at log `index`: the latest config-bearing entry
+    /// with `entry.index <= index`, else the snapshot's config, else the initial.
+    fn config_at(&self, index: u64) -> BTreeSet<NodeId> {
+        self.log
+            .iter()
+            .rev()
+            .find(|e| e.index <= index && e.config.is_some())
+            .and_then(|e| e.config.clone())
+            .or_else(|| self.snapshot_config.clone())
+            .unwrap_or_else(|| self.initial_config.clone())
+    }
+
+    /// Recompute the active config from the current log tail (used after a
+    /// truncation, which may have removed a config entry, or on recovery).
+    fn recompute_config(&mut self) {
+        let voters = self.config_at(self.last_log_index());
+        self.apply_config(voters);
+    }
+
+    /// Whether a membership change is in flight: an uncommitted config entry.
+    fn config_change_in_flight(&self) -> bool {
+        self.log
+            .iter()
+            .any(|e| e.config.is_some() && e.index > self.commit_index)
+    }
+
+    /// Propose a **single-server** membership change (ADR 0017 C): `voters` becomes
+    /// the new configuration. Leader-only; the change is adopted immediately (Raft
+    /// uses the latest log config) and durable once committed. Rejected if a change
+    /// is already in flight, if `voters` differs from the current config by more
+    /// than one server (single-server changes never create two disjoint
+    /// majorities — multi-server needs joint consensus, deferred), or if it would
+    /// remove the current leader (transfer leadership first).
+    pub fn change_membership(&mut self, voters: BTreeSet<NodeId>) -> ProposeResult {
+        if self.role != Role::Leader {
+            return ProposeResult::NotLeader {
+                leader: self.leader_id,
+            };
+        }
+        let delta = self.config.symmetric_difference(&voters).count();
+        if delta != 1 || self.config_change_in_flight() || !voters.contains(&self.id) {
+            // No-op rejection (a self-removal / multi-server / in-flight change):
+            // report not-accepted by returning the leader hint. (`delta == 0` is
+            // also rejected — nothing to change.)
+            return ProposeResult::NotLeader {
+                leader: Some(self.id),
+            };
+        }
+        let index = self.last_log_index() + 1;
+        self.log_append(LogEntry {
+            term: self.current_term,
+            index,
+            command: S::noop(),
+            config: Some(voters),
+        });
+        self.maybe_advance_commit();
+        self.apply();
+        ProposeResult::Accepted { index }
+    }
+
     fn reset_election_timer(&mut self, now: Nanos, entropy: u64) {
         let base = self.election_base.as_nanos() as u64;
         let extra = if base == 0 { 0 } else { entropy % base };
@@ -570,16 +693,23 @@ where
 
     // ---- durable-state helpers ------------------------------------------
 
-    /// Append a log entry and record it for persistence.
+    /// Append a log entry and record it for persistence. A config-bearing entry is
+    /// adopted immediately (Raft single-server change: latest log config wins).
     fn log_append(&mut self, entry: LogEntry<C>) {
+        if let Some(voters) = &entry.config {
+            self.apply_config(voters.clone());
+        }
         self.pending.push(WalRecord::Append(entry.clone()));
         self.log.push(entry);
     }
 
-    /// Truncate the log to `keep` entries and record it for persistence.
+    /// Truncate the log to `keep` entries and record it for persistence. If a
+    /// truncated entry carried a config, the active config reverts to the latest
+    /// surviving one.
     fn log_truncate(&mut self, keep: usize) {
         self.log.truncate(keep);
         self.pending.push(WalRecord::Truncate { keep });
+        self.recompute_config();
     }
 
     /// Emit a hard-state record if the term or vote changed since last persisted.
@@ -679,8 +809,10 @@ where
                 data,
                 total,
                 done,
+                config,
             } => self.handle_install_snapshot(
-                term, leader, last_index, last_term, offset, data, total, done, now, entropy,
+                term, leader, last_index, last_term, offset, data, total, done, config, now,
+                entropy,
             ),
             RaftMsg::InstallSnapshotResp {
                 term,
@@ -707,6 +839,7 @@ where
             term: self.current_term,
             index,
             command,
+            config: None,
         });
         // Lets a single-node group make progress; safe for larger groups
         // because commit still requires a majority of matchIndex.
@@ -903,6 +1036,7 @@ where
         data: Vec<u8>,
         total: u64,
         done: bool,
+        config: Option<BTreeSet<NodeId>>,
         now: Nanos,
         entropy: u64,
     ) -> Vec<Out<C>> {
@@ -983,6 +1117,11 @@ where
                 core.log.clear();
                 core.applied.clear();
                 core.snapshot_dirty = true;
+                // Adopt the snapshot's voter configuration (ADR 0017 C): the image
+                // bytes carry no Raft membership. With the log now empty,
+                // `recompute_config` resolves to this snapshot config (or initial).
+                core.snapshot_config = config.clone();
+                core.recompute_config();
             };
             if S::DRIVER_APPLIED {
                 // The bytes are the leader's engine image; the driver writes them
@@ -1072,6 +1211,13 @@ where
     // ---- role transitions & replication ---------------------------------
 
     fn start_election(&mut self, now: Nanos, entropy: u64) -> Vec<Out<C>> {
+        // A node removed from the configuration must not campaign (it cannot win
+        // and would only disrupt the surviving voters). It stays a quiet follower
+        // until it learns it is gone, then idles (ADR 0017 C).
+        if !self.is_voter() {
+            self.reset_election_timer(now, entropy);
+            return Vec::new();
+        }
         self.role = Role::Candidate;
         self.current_term += 1;
         self.voted_for = Some(self.id);
@@ -1115,6 +1261,7 @@ where
             term: self.current_term,
             index: last + 1,
             command: S::noop(),
+            config: None,
         });
         self.heartbeat_deadline = Nanos(now.0.saturating_add(self.heartbeat_nanos()));
         self.broadcast_append()
@@ -1190,6 +1337,7 @@ where
                 data,
                 total,
                 done,
+                config: self.snapshot_config.clone(),
             },
         )
     }

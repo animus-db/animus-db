@@ -69,8 +69,15 @@ the engine — the `AccordCore` sync-core/async-driver split.
   `DRIVER_APPLIED` (engine blob vs. in-core `metadata`), so the control plane is
   unchanged. `tests/snapshot_catchup.rs` (crash a follower, write past the
   threshold so the leader compacts, restart → it catches up via snapshot).
-- **C** — per-tablet hosting + single-server Raft membership change (reconfigure on
-  node failure, driven by the control plane).
+- **C (done)** — single-server Raft **membership change** (`change_membership`):
+  config lives in the log (`RaftCore`, branched so the control plane is unchanged);
+  a node uses the latest log config for quorum/election, the config rides snapshots
+  + `InstallSnapshot`, a removed node stops campaigning, and changes are restricted
+  to a single-server delta + one-in-flight + no leader self-removal.
+  `tests/membership.rs` (remove a follower, add + catch up a node, reconfigure off
+  a crashed node, reject multi-server/self-removal, reproducibility). The
+  control-plane-automatic trigger (failure detector + placement reconciler calling
+  `change_membership`) is the remaining integration plumbing.
 - **D** — tablet split on cluster growth.
 
 ## Tests

@@ -48,6 +48,7 @@ fn follower_applies_on_commit_without_its_own_fsync() {
         term: 1,
         index: 1,
         command: upsert(42),
+        config: None,
     };
     follower.handle(
         1,
@@ -137,6 +138,7 @@ fn follower_to_leader_keeps_applied_then_gates_new_proposals() {
                 term: 1,
                 index: 1,
                 command: upsert(42),
+                config: None,
             }],
             leader_commit: 1,
         },
