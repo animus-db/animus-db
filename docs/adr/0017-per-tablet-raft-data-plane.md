@@ -244,6 +244,18 @@ control plane unchanged. **Not yet:** dynamic membership (Stage C), tablet split
   for now).
 - A **`RaftPerTablet` topology in the Elle corpus** (ADR 0014/0016 step 4) checks
   linearizability of this plane as each stage lands.
+- **Production assembly — Stage 3a (`animusd`).** ✅ Done. The leaderful CP plane
+  now runs in the assembled node over `ProdEnv`: per-table replication mode lives
+  in the replicated schema catalog (`ReplicationMode` + `MetaCommand::SetTableMode`,
+  `animus-control`), and `animusd` hosts a statically-placed per-tablet Raft group
+  on a 4th internal `raftkv` role (id `300+i`, its own listener/dir), routing a
+  CP-mode table's client reads/writes to the group leader (`ClientCtx::cp_put`/
+  `cp_get` via the per-cluster `ClusterEdgeState` group registry). `tests/cp_plane.rs`
+  drives it over real TCP (CP write/read round-trip across nodes; AP plane
+  untouched). **Stage 3b** (remaining integration plumbing): dynamic CP
+  placement/split/reconfigure over `ProdEnv` (the `ProdEnv` side of `Coresident`
+  via a pre-bound listener pool + control-plane address distribution), cross-process
+  CP client routing, and per-CP-group failure detection.
 - **Next ADR — cross-tablet transactions** (2PC over the groups + HLC; or Accord
   atop them).
 

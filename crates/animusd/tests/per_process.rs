@@ -48,15 +48,16 @@ fn free_addrs(count: usize) -> Vec<SocketAddr> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn per_process_nodes_form_a_cluster_from_shared_config() {
     let n = 3;
-    let addrs = free_addrs(n * 6);
+    let addrs = free_addrs(n * 7);
     let nodes_cfg: Vec<RoleAddrs> = (0..n)
         .map(|i| RoleAddrs {
-            control: addrs[6 * i],
-            data: addrs[6 * i + 1],
-            coord: addrs[6 * i + 2],
-            client: addrs[6 * i + 3],
-            dynamo: addrs[6 * i + 4],
-            cql: addrs[6 * i + 5],
+            control: addrs[7 * i],
+            data: addrs[7 * i + 1],
+            coord: addrs[7 * i + 2],
+            client: addrs[7 * i + 3],
+            dynamo: addrs[7 * i + 4],
+            cql: addrs[7 * i + 5],
+            raftkv: addrs[7 * i + 6],
         })
         .collect();
     let config = ClusterConfig {
@@ -99,6 +100,7 @@ async fn per_process_nodes_form_a_cluster_from_shared_config() {
         ClientRequest::Put {
             key: b"k".to_vec(),
             value: b"v1".to_vec(),
+            table: None,
         },
     )
     .await;
@@ -106,7 +108,14 @@ async fn per_process_nodes_form_a_cluster_from_shared_config() {
 
     // Read back and cross-node overwrite, just like the in-process cluster test.
     assert_eq!(
-        call(client1, ClientRequest::Get { key: b"k".to_vec() }).await,
+        call(
+            client1,
+            ClientRequest::Get {
+                key: b"k".to_vec(),
+                table: None
+            }
+        )
+        .await,
         ClientResponse::Value(Some(b"v1".to_vec()))
     );
     let put2 = call(
@@ -114,6 +123,7 @@ async fn per_process_nodes_form_a_cluster_from_shared_config() {
         ClientRequest::Put {
             key: b"k".to_vec(),
             value: b"v2".to_vec(),
+            table: None,
         },
     )
     .await;
@@ -122,7 +132,14 @@ async fn per_process_nodes_form_a_cluster_from_shared_config() {
         "overwrite failed: {put2:?}"
     );
     assert_eq!(
-        call(client0, ClientRequest::Get { key: b"k".to_vec() }).await,
+        call(
+            client0,
+            ClientRequest::Get {
+                key: b"k".to_vec(),
+                table: None
+            }
+        )
+        .await,
         ClientResponse::Value(Some(b"v2".to_vec()))
     );
 }

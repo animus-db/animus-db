@@ -8,8 +8,10 @@
 //! own `recv` gets a **distinct node id and `ProdEnv`** (a distinct listener):
 //!
 //! - **control** — the Raft `RaftNode`,
-//! - **data** — the storage replica (`serve_replica`),
-//! - **coord** — the quorum coordinator (`DataClient`) used to serve clients.
+//! - **data** — the AP storage replica (`serve_replica`),
+//! - **coord** — the quorum coordinator (`DataClient`) used to serve clients,
+//! - **raftkv** — the leaderful **CP** per-tablet Raft group (`RaftKvNode`,
+//!   ADR 0017 #3a), hosting CP-mode tables' tablets.
 //!
 //! The **client API is a plain request/reply TCP server** (length-prefixed
 //! JSON), *not* part of the `Network` abstraction. Coordination is therefore
@@ -34,24 +36,32 @@ pub use config::ClusterConfig;
 // Re-exported so callers (CLI, tests, operators) can inspect a node's cached
 // cluster metadata — membership status and the tablet map — without depending on
 // `animus-control` directly.
-pub use animus_control::{Metadata, NodeStatus};
+pub use animus_control::{
+    ColumnType, MetaCommand, Metadata, NodeStatus, ReplicationMode, TableSchema,
+};
 
 mod cql;
 mod dynamo;
 
 use animus_control::node::heartbeat_loop;
-use animus_control::{MetaCommand, PlacementPolicy, RaftNode, TableSchema};
+use animus_control::{PlacementPolicy, ProposeResult, RaftNode};
 use animus_data::{
     DataClient, HintStore, ReadResult, TabletView, serve_anti_entropy, serve_hint_replay,
     serve_replica,
 };
 use animus_env::{Env, EnvExt, Metric, MetricsHandle, NodeId, ProdEnv};
+use animus_raftdata::RaftKvNode;
 use animus_storage::{LsmEngine, MemoryEngine, StorageEngine};
 use animus_tablet::{Epoch, KeyRange, TabletId};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+
+/// A hosted leaderful CP per-tablet Raft group on this node (ADR 0017 #3a): a
+/// `RaftKvNode` over the production env + durable LSM. Aliased to keep the
+/// edge-state container readable.
+type CpGroup = RaftKvNode<ProdEnv, LsmEngine<ProdEnv>>;
 
 /// The single bootstrap tablet covering the whole keyspace.
 const TABLET: TabletId = TabletId(1);
@@ -101,10 +111,25 @@ pub enum StorageBackend {
 pub enum ClientRequest {
     /// Read the node's cached cluster metadata.
     Status,
-    /// Store `value` at `key` (quorum write).
-    Put { key: Vec<u8>, value: Vec<u8> },
-    /// Read the latest value at `key` (quorum read).
-    Get { key: Vec<u8> },
+    /// Store `value` at `key`. `table` (optional) selects the replication plane:
+    /// a table whose replicated schema is `ReplicationMode::Cp` (ADR 0017 #3a)
+    /// routes to the leaderful per-tablet Raft group; otherwise (or `None`) the
+    /// leaderless AP quorum write. `#[serde(default)]` keeps older clients
+    /// (no `table`) byte-compatible.
+    Put {
+        key: Vec<u8>,
+        value: Vec<u8>,
+        #[serde(default)]
+        table: Option<String>,
+    },
+    /// Read the latest value at `key`. `table` selects the plane as for
+    /// [`Put`](ClientRequest::Put): a `Cp` table reads linearizably from the Raft
+    /// group leader (ReadIndex), else an AP quorum read.
+    Get {
+        key: Vec<u8>,
+        #[serde(default)]
+        table: Option<String>,
+    },
 }
 
 /// A node's reply to a [`ClientRequest`].
@@ -120,7 +145,9 @@ pub enum ClientResponse {
     Error(String),
 }
 
-/// Listen addresses for a node's six endpoints (use port 0 for ephemeral).
+/// Listen addresses for a node's seven endpoints (use port 0 for ephemeral):
+/// the control/data/coord/raftkv internal `ProdEnv` roles + the client API + the
+/// DynamoDB HTTP and CQL endpoints.
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct RoleAddrs {
     pub control: SocketAddr,
@@ -135,6 +162,12 @@ pub struct RoleAddrs {
     /// older configs) to an ephemeral loopback port.
     #[serde(default = "default_ephemeral_addr")]
     pub cql: SocketAddr,
+    /// The **leaderful CP** per-tablet Raft role's internal `ProdEnv` listen
+    /// address (ADR 0017 #3a) — distinct from the AP `data` role's, since the
+    /// inbox is single-consumer. Defaults (when absent in older configs) to an
+    /// ephemeral loopback port.
+    #[serde(default = "default_ephemeral_addr")]
+    pub raftkv: SocketAddr,
 }
 
 /// Fallback endpoint for configs written before a field existed: an ephemeral
@@ -150,12 +183,15 @@ pub struct BoundNode {
     control_id: NodeId,
     data_id: NodeId,
     coord_id: NodeId,
+    raftkv_id: NodeId,
     control_env: ProdEnv,
     data_env: ProdEnv,
     coord_env: ProdEnv,
+    raftkv_env: ProdEnv,
     control_addr: SocketAddr,
     data_addr: SocketAddr,
     coord_addr: SocketAddr,
+    raftkv_addr: SocketAddr,
     client_listener: TcpListener,
     client_addr: SocketAddr,
     dynamo_listener: TcpListener,
@@ -165,13 +201,14 @@ pub struct BoundNode {
 }
 
 impl BoundNode {
-    /// `(control_id, addr)`, `(data_id, addr)`, `(coord_id, addr)` — the entries
-    /// this node contributes to the cluster peer book.
-    pub fn peer_entries(&self) -> [(NodeId, SocketAddr); 3] {
+    /// `(control_id, addr)`, `(data_id, addr)`, `(coord_id, addr)`, `(raftkv_id,
+    /// addr)` — the entries this node contributes to the cluster peer book.
+    pub fn peer_entries(&self) -> [(NodeId, SocketAddr); 4] {
         [
             (self.control_id, self.control_addr),
             (self.data_id, self.data_addr),
             (self.coord_id, self.coord_addr),
+            (self.raftkv_id, self.raftkv_addr),
         ]
     }
 
@@ -237,15 +274,17 @@ impl BoundNode {
     ) -> std::io::Result<Node> {
         self.control_env.set_peers(peers.clone());
         self.data_env.set_peers(peers.clone());
-        self.coord_env.set_peers(peers);
+        self.coord_env.set_peers(peers.clone());
+        self.raftkv_env.set_peers(peers);
 
-        // Keep clones of the three internal envs so [`Node::shutdown`] can abort
-        // every task they own (Raft driver, replica serve loop, accept loops),
+        // Keep clones of the four internal envs so [`Node::shutdown`] can abort
+        // every task they own (Raft drivers, replica serve loop, accept loops),
         // freeing their listener ports for a restart.
         let envs = [
             self.control_env.clone(),
             self.data_env.clone(),
             self.coord_env.clone(),
+            self.raftkv_env.clone(),
         ];
 
         // Capture the data- and coord-role metrics sinks before their envs are
@@ -265,6 +304,29 @@ impl BoundNode {
         // owned by the `ClusterEdgeState` (one per cluster), not a process global,
         // so two in-process clusters in one test do not share handles.
         edge.register_control(raft.clone());
+
+        // **Leaderful CP per-tablet Raft group** (ADR 0017 #3a). Stage 3a hosts a
+        // single, statically-placed CP group spanning the first
+        // `min(N, MAX_REPLICATION_FACTOR)` nodes' `raftkv` ids (the same RF cap as
+        // the bootstrap AP tablet). A node in that set runs a `RaftKvNode` on its
+        // `raftkv_env` (own id/port/dir — the single-consumer inbox rule), backed
+        // by its own durable `LsmEngine`; the handle is registered in the
+        // per-cluster edge state so a CP-mode table's reads/writes route to the
+        // group leader. Dynamic placement / split / reconfigure of CP groups over
+        // `ProdEnv` and address distribution are Stage 3b. CP client routing works
+        // within a `--cluster N` process (shared edge state); cross-process routing
+        // is 3b.
+        let n = control_ids.len();
+        let cp_group: Vec<NodeId> = (0..n.min(MAX_REPLICATION_FACTOR))
+            .map(config::raftkv_id)
+            .collect();
+        if cp_group.contains(&self.raftkv_id) {
+            let cp_lsm = LsmEngine::open(self.raftkv_env.clone(), LSM_PREFIX)
+                .await
+                .map_err(|e| std::io::Error::other(format!("opening CP group LSM: {e}")))?;
+            let cp = RaftKvNode::start(self.raftkv_env, cp_group, cp_lsm);
+            edge.register_raftkv(cp);
+        }
 
         // The data replica's durable store, plus the autonomous data-plane loops.
         // The on-disk LSM does its disk I/O through a *clone* of the data env's
@@ -376,10 +438,10 @@ pub struct Node {
     /// (`LsmEngine` or `MemoryEngine`) is chosen at runtime. Kept alive so the
     /// replica's serve loop keeps running for the life of the node.
     _replica: Box<dyn std::any::Any + Send + Sync>,
-    /// The node's three internal `ProdEnv` roles (control/data/coord), kept so
-    /// [`shutdown`](Node::shutdown) can abort every task they own and free their
+    /// The node's four internal `ProdEnv` roles (control/data/coord/raftkv), kept
+    /// so [`shutdown`](Node::shutdown) can abort every task they own and free their
     /// listener ports.
-    envs: [ProdEnv; 3],
+    envs: [ProdEnv; 4],
     /// The client-facing listener tasks (client TCP / dynamo HTTP / cql), which
     /// run on plain `tokio::spawn` off the `Env` network; aborted on shutdown.
     tasks: Vec<tokio::task::JoinHandle<()>>,
@@ -399,6 +461,7 @@ impl Node {
         control_id: NodeId,
         data_id: NodeId,
         coord_id: NodeId,
+        raftkv_id: NodeId,
         addrs: RoleAddrs,
         data_dir: impl Into<PathBuf>,
     ) -> std::io::Result<BoundNode> {
@@ -408,6 +471,10 @@ impl Node {
         let (data_env, data_addr) = ProdEnv::bind(data_id, addrs.data, dir.join("data")).await?;
         let (coord_env, coord_addr) =
             ProdEnv::bind(coord_id, addrs.coord, dir.join("coord")).await?;
+        // The leaderful CP per-tablet Raft role's internal env (ADR 0017 #3a),
+        // distinct id/port/dir from the AP data role (single-consumer inbox).
+        let (raftkv_env, raftkv_addr) =
+            ProdEnv::bind(raftkv_id, addrs.raftkv, dir.join("raftkv")).await?;
         let client_listener = TcpListener::bind(addrs.client).await?;
         let client_addr = client_listener.local_addr()?;
         let dynamo_listener = TcpListener::bind(addrs.dynamo).await?;
@@ -418,12 +485,15 @@ impl Node {
             control_id,
             data_id,
             coord_id,
+            raftkv_id,
             control_env,
             data_env,
             coord_env,
+            raftkv_env,
             control_addr,
             data_addr,
             coord_addr,
+            raftkv_addr,
             client_listener,
             client_addr,
             dynamo_listener,
@@ -456,6 +526,17 @@ impl Node {
     /// This node's cached cluster metadata.
     pub fn metadata(&self) -> Metadata {
         self.raft.metadata()
+    }
+
+    /// Propose a control-plane [`MetaCommand`] on this node's control replica,
+    /// returning whether it was accepted (i.e. this node is the leader). The
+    /// interim admin hook for cluster metadata operations the wire edges do not
+    /// yet expose — notably marking a table **CP** (ADR 0017 #3a) via
+    /// `MetaCommand::SetTableMode`. A non-leader proposal is dropped (`false`); the
+    /// caller retries on the current leader. Replication + durability are the
+    /// control plane's (the command commits through Raft).
+    pub fn propose_meta(&self, command: MetaCommand) -> bool {
+        matches!(self.raft.propose(command), ProposeResult::Accepted { .. })
     }
 
     /// Gracefully stop the node: abort its client-facing listeners (client /
@@ -522,6 +603,13 @@ pub struct ClusterEdgeState {
     /// The CQL edge's keyspaces + prepared-statement store (ADR 0013). Not
     /// durable / not replicated; per-cluster.
     cql_state: Arc<tokio::sync::Mutex<cql::CqlState>>,
+    /// This cluster's **leaderful CP** per-tablet Raft group handles (ADR 0017 #3a),
+    /// so a wire edge can route a CP-mode table's reads/writes to the group
+    /// **leader**. In `--cluster N` mode every hosting node registers here, so the
+    /// leader is always present; one-process-per-node registers only the local
+    /// handle (cross-process CP routing is Stage 3b). Stage 3a hosts a single CP
+    /// group, so this holds at most one handle per node.
+    raftkv: Arc<Mutex<Vec<CpGroup>>>,
 }
 
 impl Default for ClusterEdgeState {
@@ -537,6 +625,7 @@ impl ClusterEdgeState {
             control: Arc::new(Mutex::new(Vec::new())),
             dynamo_registry: Arc::new(Mutex::new(animus_dynamo::SchemaRegistry::new())),
             cql_state: Arc::new(tokio::sync::Mutex::new(cql::CqlState::default())),
+            raftkv: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -547,6 +636,29 @@ impl ClusterEdgeState {
             .lock()
             .expect("control handles poisoned")
             .push(raft);
+    }
+
+    /// Register a node's CP per-tablet Raft group handle (ADR 0017 #3a). Called in
+    /// [`BoundNode::start_with`] on each node that hosts the CP group.
+    fn register_raftkv(&self, cp: CpGroup) {
+        self.raftkv
+            .lock()
+            .expect("raftkv handles poisoned")
+            .push(cp);
+    }
+
+    /// The CP group handle that currently believes it is leader, if any (ADR 0017
+    /// #3a). The route target for a CP-mode table's reads/writes. Normally exactly
+    /// one registered handle leads; a deposed leader's `linearizable_get` returns
+    /// `None` (never stale) and its `put` returns `NotLeader`, so picking the first
+    /// self-styled leader is safe.
+    fn cp_leader(&self) -> Option<CpGroup> {
+        self.raftkv
+            .lock()
+            .expect("raftkv handles poisoned")
+            .iter()
+            .find(|n| n.is_leader())
+            .cloned()
     }
 
     /// Propose `command` on **every** registered control handle that currently
@@ -608,6 +720,50 @@ pub(crate) struct ClientCtx {
 }
 
 impl ClientCtx {
+    /// Whether `table`'s replicated schema selects the **CP** (leaderful) plane
+    /// (ADR 0017 #3a). Read from this node's own replicated `Metadata`.
+    fn is_cp(&self, table: &str) -> bool {
+        self.raft.metadata().table_mode(table) == ReplicationMode::Cp
+    }
+
+    /// Route a CP-mode **write** to the per-tablet Raft group leader (ADR 0017 #3a):
+    /// propose on the leader, then wait until the value is committed + applied +
+    /// durable — a linearizable read reflects it — before acking. Durable-before-ack,
+    /// matching the AP path's quorum-durability contract. (Stage 3a confirms commit
+    /// by reading the value back; a dedicated applied-index await is a 3b refinement,
+    /// as is forwarding when this process holds no group leader.)
+    async fn cp_put(&self, key: Vec<u8>, value: Vec<u8>) -> ClientResponse {
+        let Some(leader) = self.edge.cp_leader() else {
+            return ClientResponse::Error("no CP group leader available".into());
+        };
+        match leader.put(key.clone(), value.clone()) {
+            ProposeResult::Accepted { .. } => {
+                let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
+                loop {
+                    if leader.linearizable_get(&key).await.as_deref() == Some(value.as_slice()) {
+                        return ClientResponse::PutOk;
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        return ClientResponse::Error("CP write did not commit in time".into());
+                    }
+                    tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+                }
+            }
+            ProposeResult::NotLeader { .. } => {
+                ClientResponse::Error("CP group leader moved; retry".into())
+            }
+        }
+    }
+
+    /// Route a CP-mode **read** to the per-tablet Raft group leader: a linearizable
+    /// ReadIndex read (no stale value — a deposed leader returns `None`).
+    async fn cp_get(&self, key: Vec<u8>) -> ClientResponse {
+        let Some(leader) = self.edge.cp_leader() else {
+            return ClientResponse::Error("no CP group leader available".into());
+        };
+        ClientResponse::Value(leader.linearizable_get(&key).await)
+    }
+
     /// Render this node's **live** metrics as the ADR 0015 text export
     /// (`name value` lines), aggregated across the node's three role sinks.
     ///
@@ -758,7 +914,18 @@ async fn handle_client(mut stream: TcpStream, ctx: ClientCtx) -> std::io::Result
     while let Some(request) = read_frame::<ClientRequest>(&mut stream).await? {
         let response = match request {
             ClientRequest::Status => ClientResponse::Status(ctx.raft.metadata()),
-            ClientRequest::Put { key, value } => match ctx.view_for(&key) {
+            // CP-mode table: route to the leaderful per-tablet Raft group leader
+            // (ADR 0017 #3a) instead of the AP quorum coordinator.
+            ClientRequest::Put {
+                key,
+                value,
+                table: Some(t),
+            } if ctx.is_cp(&t) => ctx.cp_put(key, value).await,
+            ClientRequest::Get {
+                key,
+                table: Some(t),
+            } if ctx.is_cp(&t) => ctx.cp_get(key).await,
+            ClientRequest::Put { key, value, .. } => match ctx.view_for(&key) {
                 None => ClientResponse::Error("no tablet covers this key yet".into()),
                 Some(view) => {
                     let _guard = ctx.coord_lock.lock().await;
@@ -786,7 +953,7 @@ async fn handle_client(mut stream: TcpStream, ctx: ClientCtx) -> std::io::Result
                     }
                 }
             },
-            ClientRequest::Get { key } => match ctx.view_for(&key) {
+            ClientRequest::Get { key, .. } => match ctx.view_for(&key) {
                 None => ClientResponse::Error("no tablet covers this key yet".into()),
                 Some(view) => {
                     let _guard = ctx.coord_lock.lock().await;
@@ -975,11 +1142,13 @@ pub async fn bind_cluster(
             client: addr(),
             dynamo: addr(),
             cql: addr(),
+            raftkv: addr(),
         };
         let node = Node::bind(
             config::control_id(i),
             config::data_id(i),
             config::coord_id(i),
+            config::raftkv_id(i),
             addrs,
             dir.join(format!("node-{i}")),
         )
@@ -1070,7 +1239,15 @@ pub async fn run_node_with(
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "node index out of range")
     })?;
     let (control_id, data_id, coord_id) = config.role_ids(index);
-    let bound = Node::bind(control_id, data_id, coord_id, addrs, dir).await?;
+    let bound = Node::bind(
+        control_id,
+        data_id,
+        coord_id,
+        config::raftkv_id(index),
+        addrs,
+        dir,
+    )
+    .await?;
     // One node per process: a fresh per-process edge-state set (it registers only
     // this node's control handle — cross-process proposal forwarding is future
     // work, ADR 0013).

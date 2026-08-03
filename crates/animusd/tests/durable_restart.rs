@@ -62,7 +62,7 @@ fn fixed_addrs(count: usize) -> Vec<SocketAddr> {
 /// A single-node config (R = W = 1) pinned to fixed addresses, so the same
 /// config can start, stop, and restart the same node.
 fn single_node_config() -> ClusterConfig {
-    let a = fixed_addrs(6);
+    let a = fixed_addrs(7);
     ClusterConfig {
         nodes: vec![RoleAddrs {
             control: a[0],
@@ -71,6 +71,7 @@ fn single_node_config() -> ClusterConfig {
             client: a[3],
             dynamo: a[4],
             cql: a[5],
+            raftkv: a[6],
         }],
         r: 1,
         w: 1,
@@ -123,6 +124,7 @@ async fn data_survives_node_restart_on_disk() {
         ClientRequest::Put {
             key: b"durable".to_vec(),
             value: b"survives".to_vec(),
+            table: None,
         },
     )
     .await;
@@ -134,7 +136,8 @@ async fn data_survives_node_restart_on_disk() {
         call(
             client,
             ClientRequest::Get {
-                key: b"durable".to_vec()
+                key: b"durable".to_vec(),
+                table: None,
             }
         )
         .await,
@@ -156,6 +159,7 @@ async fn data_survives_node_restart_on_disk() {
         client,
         ClientRequest::Get {
             key: b"durable".to_vec(),
+            table: None,
         },
     )
     .await;
@@ -171,6 +175,7 @@ async fn data_survives_node_restart_on_disk() {
         client,
         ClientRequest::Get {
             key: b"never".to_vec(),
+            table: None,
         },
     )
     .await;
@@ -201,6 +206,7 @@ async fn data_is_lost_on_restart_with_memory_backend() {
         ClientRequest::Put {
             key: b"volatile".to_vec(),
             value: b"gone".to_vec(),
+            table: None,
         },
     )
     .await;
@@ -218,6 +224,7 @@ async fn data_is_lost_on_restart_with_memory_backend() {
         client,
         ClientRequest::Get {
             key: b"volatile".to_vec(),
+            table: None,
         },
     )
     .await;

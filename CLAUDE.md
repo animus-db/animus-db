@@ -302,6 +302,28 @@ cross-cutting ones. Prune/merge entries that become obsolete.
   CI job, not per-push. (ADR 0014 coverage-expansion increment.)
 
 ### Code patterns
+- **To store a generic type behind one registry/handle field, fix the concrete
+  type parameter when the variation isn't needed at the call site — don't reach for
+  a trait object.** Routing a CP-mode table to a hosted `RaftKvNode<E, S>` (ADR 0017
+  #3a) needed the `animusd` edge state to hold the group handle and call
+  `put`/`linearizable_get`/`is_leader` on it. `RaftKvNode` is generic over its
+  engine `S`, so a `Vec<RaftKvNode<ProdEnv, _>>` field would need an
+  `async_trait` object (the methods are async) — extra machinery for variation that
+  doesn't exist here: the CP plane is *always* durable, so `S = LsmEngine<ProdEnv>`
+  is the only instantiation. Fixing it (a `type CpGroup = RaftKvNode<ProdEnv,
+  LsmEngine<ProdEnv>>` alias — also silences `clippy::type_complexity`) kept the
+  edge registry a plain `Vec<CpGroup>`, no trait object, no async-trait dep. The
+  AP data replica *is* type-erased (`Box<dyn Any>`) because its backend genuinely
+  varies (LSM vs Memory); the CP group's does not.
+- **Adding an Nth internal role to a fixed-stride multi-role node is a wide but
+  mechanical ripple — change the stride, every literal, and the arity together.**
+  `animusd` packs each node's roles into consecutive ports (`base + stride*i`); the
+  CP `raftkv` role bumped the stride 6→7 and touched every `RoleAddrs` literal
+  (config gen + 5 test sites), `peer_book`, `Node::bind`'s arity, the `[ProdEnv; N]`
+  shutdown array, and the conventional id base (`300+i`). A `#[serde(default)]` on
+  the new addr field keeps *older configs* loading, but struct **literals** still
+  need the field — so the compiler walks you through the sites; expect it and do
+  them in one pass.
 - **Generalizing a type over a state machine: prefer *two plain type params*
   (`<C, S>`) over *one param with an associated type* (`<SM: Trait<Command=C>>`) —
   `#[derive]` can't see through associated types.** Making `RaftCore` generic over

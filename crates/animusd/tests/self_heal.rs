@@ -97,6 +97,7 @@ async fn cluster_detects_a_dead_node_and_self_heals_placement() {
         ClientRequest::Put {
             key: b"k".to_vec(),
             value: b"v".to_vec(),
+            table: None,
         },
     )
     .await;
@@ -156,7 +157,14 @@ async fn cluster_detects_a_dead_node_and_self_heals_placement() {
     );
 
     // Reads of the previously-written key still succeed via the survivors.
-    let got = call(observer_client, ClientRequest::Get { key: b"k".to_vec() }).await;
+    let got = call(
+        observer_client,
+        ClientRequest::Get {
+            key: b"k".to_vec(),
+            table: None,
+        },
+    )
+    .await;
     assert_eq!(
         got,
         ClientResponse::Value(Some(b"v".to_vec())),
@@ -195,11 +203,12 @@ async fn assembled_node_handles_concurrent_client_load_without_deadlock() {
                     ClientRequest::Put {
                         key: key.clone(),
                         value: value.clone(),
+                        table: None,
                     },
                 )
                 .await;
                 assert!(matches!(put, ClientResponse::PutOk), "put failed: {put:?}");
-                let got = call(addr, ClientRequest::Get { key }).await;
+                let got = call(addr, ClientRequest::Get { key, table: None }).await;
                 assert_eq!(got, ClientResponse::Value(Some(value)));
             }
         }));

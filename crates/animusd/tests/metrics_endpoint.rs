@@ -102,6 +102,7 @@ async fn metrics_endpoint_surfaces_control_plane_counters() {
             &ClientRequest::Put {
                 key: b"k".to_vec(),
                 value: b"v".to_vec(),
+                table: None,
             },
         )
         .await
