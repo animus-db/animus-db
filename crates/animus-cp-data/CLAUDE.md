@@ -23,11 +23,18 @@ the engine — the `AccordCore` sync-core/async-driver split.
 
 ## Entry points
 
-- `KvCommand` (`Put`/`Delete`/`NoOp`), `KvState` (the `DRIVER_APPLIED` SM).
+- `KvCommand` (`Put`/`Delete`/`Cas`/`Split`/`NoOp`), `KvState` (the `DRIVER_APPLIED` SM).
 - `RaftKvNode<E, S>` — a running tablet-group node: `start(env, all_nodes,
   storage)`, `put`/`delete` (proposed via Raft, honored on the leader), `is_leader`,
   `linearizable_get` (ReadIndex), `local_get` (a replica's raw engine read — *not*
   linearizable; a test/observability aid).
+- **Linearizable CAS** — `cas(key, expected, value) -> ProposeResult` proposes a
+  `KvCommand::Cas` (set iff the committed value `== expected`; `expected: None` ==
+  "only if absent"); `cas_result(index) -> Option<bool>` reads the outcome recorded
+  at the `Accepted { index }` once that entry applies; `compare_and_swap(key,
+  expected, value) -> Option<bool>` is the all-in-one (propose on the leader, wait
+  for the entry to apply, return the recorded outcome — `None` if not leader / times
+  out). All public-additively; existing signatures unchanged.
 - `KvWire` — the data-plane wire enum wrapping `RaftMsg` plus the ReadIndex
   read-barrier probes (`ReadProbe`/`ReadProbeAck`). The probes are driver-only, so
   ReadIndex lives entirely in this crate and the shared `RaftCore`/`RaftMsg` are
@@ -44,6 +51,23 @@ the engine — the `AccordCore` sync-core/async-driver split.
 - **The Raft log index is the MVCC version.** Apply uses `index` as the engine
   `version`, so per-key LWW reproduces the agreed Raft total order, and re-applying
   on recovery is idempotent.
+- **CAS is decided at *apply* time, not propose time — that is what makes it
+  linearizable + contention-correct.** The `RaftCore` agrees only the command
+  *order*; `Cas` rides through it as opaque data (sync core untouched, like every
+  other effect). `flush_and_apply` evaluates it in commit order: it `storage.get`s
+  the key's *current committed* value (every earlier entry in the same batch has
+  already merged, so this is the post-predecessor state) and compares to `expected`;
+  equal → `merge` at `index` (same write path as `Put`), else no-op. Because every
+  replica applies the same order against the same committed state with no clock/RNG,
+  every replica makes the **identical** accept/reject decision. Two CAS racing from
+  the same `expected` therefore have **exactly one winner** — whichever Raft ordered
+  first: its swap moves the committed value, so the second's compare then fails.
+- **CAS outcome plumbing: keyed by the Raft log index.** `propose` returns
+  `Accepted { index }`; apply records `CasResults.outcomes[index] = swapped` (a
+  `BTreeMap<u64,bool>` in driver state, mirroring `animus-consensus`'s `ReadResults`
+  stash). The proposer waits until the entry applies (`last_applied >= index`, or
+  just polls `cas_result`) and reads it. No wall clock in the wait — `compare_and_swap`
+  uses only `env.now()`/`env.sleep()`, so it stays a pure function of the seed.
 - **Durable-before-visible holds** (ADR 0009): effects are only drained for fsynced
   entries, and the engine write follows the WAL `fsync`.
 - Distinct WAL file (`raftkv.wal`) from the control plane's `raft.wal`, so a node
@@ -59,6 +83,13 @@ the engine — the `AccordCore` sync-core/async-driver split.
   leader still leads its term, then it serves locally once applied. No log entry,
   no wall clock. `tests/read_index.rs` (reads reflect committed writes + RYW; a
   deposed/partitioned leader returns `None`, never a stale value).
+- **CAS (done)** — linearizable **compare-and-swap** (`cas`/`cas_result`/
+  `compare_and_swap`, `KvCommand::Cas`). Decided at apply time in commit order
+  against the committed engine state (deterministic; sync `RaftCore` untouched —
+  CAS is opaque command data); outcome stashed in driver `CasResults` keyed by the
+  log index. `tests/cas.rs` (concurrent same-`expected` race → exactly one winner,
+  agreed on every replica; CAS-if-absent; a successful CAS survives `stop`+restart
+  via WAL replay re-apply; seed sweep + trace reproducibility).
 - **A.2 (done)** — compaction + streaming `InstallSnapshot`. The driver compacts
   once `COMPACT_THRESHOLD` entries apply: it snapshots the **engine image**
   (`set_snapshot_blob`), the core truncates the log prefix, and the WAL is

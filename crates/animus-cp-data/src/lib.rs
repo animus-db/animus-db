@@ -15,7 +15,13 @@
 //! per-key LWW reproduces the agreed total order). Linearizable reads use
 //! **ReadIndex** ([`RaftKvNode::linearizable_get`]): a read-barrier quorum probe
 //! confirms current leadership (no log entry, no wall clock) before the leader
-//! serves from its local engine. **A.2** adds compaction + streaming snapshots:
+//! serves from its local engine. A **linearizable compare-and-swap**
+//! ([`RaftKvNode::cas`] / [`RaftKvNode::compare_and_swap`], `KvCommand::Cas`) is
+//! decided at *apply* time in commit order against the committed engine state, so
+//! every replica makes the identical accept/reject choice and concurrent CAS from
+//! the same `expected` have exactly one winner; the outcome is recorded keyed by
+//! the entry's log index for the proposer to read. **A.2** adds compaction +
+//! streaming snapshots:
 //! the leader snapshots its engine image, truncates the Raft log prefix, and
 //! catches a lagging follower up via the chunked `InstallSnapshot` (engine bytes),
 //! which the follower writes into its own engine. **C** adds single-server
@@ -45,6 +51,18 @@ pub enum KvCommand {
     Put { key: Vec<u8>, value: Vec<u8> },
     /// Remove `key` (a tombstone in the engine).
     Delete { key: Vec<u8> },
+    /// **Linearizable compare-and-swap**: set `key` to `value` iff the key's
+    /// current committed value equals `expected` (`None` == "only if absent").
+    /// Evaluated at *apply* time against the engine's committed state, in commit
+    /// order, so every replica makes the identical accept/reject decision (no
+    /// clock/RNG) — and two CAS racing from the same `expected` have exactly one
+    /// winner (whichever Raft ordered first). The outcome is recorded in driver
+    /// state keyed by the entry's log index for the proposer to read.
+    Cas {
+        key: Vec<u8>,
+        expected: Option<Vec<u8>>,
+        value: Vec<u8>,
+    },
     /// **Split** this tablet at `at` (ADR 0017 D): keys `>= at` move to a new
     /// tablet group. Agreed through the Raft log so every replica splits at the
     /// same point in the command order; on apply each replica tombstones the
@@ -97,6 +115,12 @@ const READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// Poll granularity while a linearizable read waits for confirmation.
 const READ_POLL: Duration = Duration::from_millis(20);
 
+/// How long [`compare_and_swap`](RaftKvNode::compare_and_swap) waits for its
+/// proposed entry to commit + apply (so its outcome is recorded) before giving up.
+const CAS_TIMEOUT: Duration = Duration::from_secs(5);
+/// Poll granularity while a CAS waits for its committed outcome.
+const CAS_POLL: Duration = Duration::from_millis(20);
+
 /// Compact (snapshot the engine + truncate the Raft log prefix) once this many
 /// entries have been applied past the current snapshot base, bounding the WAL.
 const COMPACT_THRESHOLD: u64 = 64;
@@ -108,6 +132,18 @@ struct ReadState {
     next_epoch: u64,
     /// `epoch -> (term, acking nodes)`.
     pending: BTreeMap<u64, (u64, BTreeSet<NodeId>)>,
+}
+
+/// Per-CAS outcomes recorded at apply time, keyed by the entry's **Raft log
+/// index** (the value [`ProposeResult::Accepted`] hands the proposer): `true` if
+/// the swap happened, `false` if `expected` did not match. Every replica records
+/// the identical value because the CAS is decided deterministically in commit
+/// order against the same committed engine state. The proposer polls until the
+/// entry is applied, then reads its index here (see [`RaftKvNode::cas_result`] /
+/// [`RaftKvNode::compare_and_swap`]).
+#[derive(Default)]
+struct CasResults {
+    outcomes: BTreeMap<u64, bool>,
 }
 
 /// WAL file for a tablet group's Raft log (distinct from the control plane's
@@ -123,6 +159,7 @@ pub struct RaftKvNode<E: Env, S: StorageEngine> {
     storage: S,
     all_nodes: Vec<NodeId>,
     reads: Arc<Mutex<ReadState>>,
+    cas: Arc<Mutex<CasResults>>,
 }
 
 /// Invoked on a replica when it **applies** a committed `Split` (ADR 0017 D), with
@@ -168,12 +205,14 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             env.next_u64(),
         )));
         let reads = Arc::new(Mutex::new(ReadState::default()));
+        let cas = Arc::new(Mutex::new(CasResults::default()));
         let node = Self {
             env: env.clone(),
             core: Arc::clone(&core),
             storage: storage.clone(),
             all_nodes: all_nodes.clone(),
             reads: Arc::clone(&reads),
+            cas: Arc::clone(&cas),
         };
         env.spawn_task(drive(
             env.clone(),
@@ -181,6 +220,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             all_nodes,
             storage,
             reads,
+            cas,
             on_split,
         ));
         node
@@ -199,6 +239,68 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// Propose a delete (tombstone) to this group.
     pub fn delete(&self, key: Vec<u8>) -> ProposeResult {
         self.lock().propose(KvCommand::Delete { key })
+    }
+
+    /// Propose a **linearizable compare-and-swap**: set `key` to `value` iff the
+    /// key's current committed value equals `expected` (`None` == "only if the
+    /// key is absent"). Leader-only (else a leader hint). The accept/reject
+    /// decision is made deterministically at *apply* time in commit order, so two
+    /// CAS racing from the same `expected` have exactly one winner. To learn the
+    /// outcome, take the [`ProposeResult::Accepted`] `index` and read
+    /// [`cas_result`](Self::cas_result) once that index applies — or use the
+    /// all-in-one [`compare_and_swap`](Self::compare_and_swap).
+    pub fn cas(&self, key: Vec<u8>, expected: Option<Vec<u8>>, value: Vec<u8>) -> ProposeResult {
+        self.lock().propose(KvCommand::Cas {
+            key,
+            expected,
+            value,
+        })
+    }
+
+    /// The recorded outcome of the CAS committed at Raft log `index` (the value
+    /// [`cas`](Self::cas) returned in [`ProposeResult::Accepted`]): `Some(true)`
+    /// if the swap happened, `Some(false)` if `expected` did not match, or `None`
+    /// if that index has not applied on this replica yet. Every replica records
+    /// the identical outcome (the decision is deterministic in commit order).
+    pub fn cas_result(&self, index: u64) -> Option<bool> {
+        self.cas
+            .lock()
+            .expect("cas results poisoned")
+            .outcomes
+            .get(&index)
+            .copied()
+    }
+
+    /// Propose a CAS on the leader and **wait for its committed outcome**: returns
+    /// `Some(true)` if the swap happened, `Some(false)` if `expected` did not
+    /// match the committed value, or `None` if this node is not the leader or the
+    /// outcome does not become available within [`CAS_TIMEOUT`]. Correct under
+    /// contention: of two CAS racing from the same `expected`, exactly one returns
+    /// `true`. Uses only the `Env` clock/sleep (no wall clock), so it stays a pure
+    /// function of the seed under `SimEnv`.
+    pub async fn compare_and_swap(
+        &self,
+        key: Vec<u8>,
+        expected: Option<Vec<u8>>,
+        value: Vec<u8>,
+    ) -> Option<bool> {
+        let index = match self.cas(key, expected, value) {
+            ProposeResult::Accepted { index } => index,
+            ProposeResult::NotLeader { .. } => return None,
+        };
+        let deadline = self.env.now().0 + CAS_TIMEOUT.as_nanos() as u64;
+        loop {
+            if let Some(outcome) = self.cas_result(index) {
+                return Some(outcome);
+            }
+            // A step-down before this entry applies means it may never apply on
+            // this node — give up rather than wait out the full timeout uselessly,
+            // but still bound by the deadline for the in-flight case.
+            if self.env.now().0 >= deadline {
+                return None;
+            }
+            self.env.sleep(CAS_POLL).await;
+        }
     }
 
     /// Propose a **single-server** membership change (ADR 0017 C): `voters` becomes
@@ -518,6 +620,7 @@ async fn flush_and_apply<E: Env, S: StorageEngine>(
     env: &E,
     core: &Arc<Mutex<KvCore>>,
     storage: &S,
+    cas: &Arc<Mutex<CasResults>>,
     on_split: &Option<SplitHook>,
 ) {
     // Drain WAL records + the log high-water under one lock.
@@ -564,6 +667,38 @@ async fn flush_and_apply<E: Env, S: StorageEngine>(
                     .merge_tombstone(&key, index)
                     .await
                     .expect("raftkv apply delete");
+            }
+            KvCommand::Cas {
+                key,
+                expected,
+                value,
+            } => {
+                // Read the key's *current committed* value (the latest applied,
+                // since we apply in commit order and earlier entries in this batch
+                // already merged above) and compare to `expected`. Equal → swap;
+                // else no-op. Deterministic on every replica (same order, same
+                // committed state, no clock/RNG), so concurrent CAS from the same
+                // `expected` resolve to exactly one winner — whichever Raft put
+                // first, since the first swap moves the committed value and the
+                // second's compare then fails.
+                let current = storage
+                    .get(&key)
+                    .await
+                    .expect("raftkv cas read")
+                    .map(|vv| vv.value);
+                let swapped = current == expected;
+                if swapped {
+                    // Same write path as `Put`: index is the MVCC version, so
+                    // re-applying on recovery is idempotent (per-key LWW).
+                    storage
+                        .merge(&key, &value, index)
+                        .await
+                        .expect("raftkv apply cas");
+                }
+                cas.lock()
+                    .expect("cas results poisoned")
+                    .outcomes
+                    .insert(index, swapped);
             }
             KvCommand::Split { at } => {
                 // Capture the handed-off range `[at, ∞)` from this replica's
@@ -685,6 +820,7 @@ async fn drive<E: Env, S: StorageEngine>(
     all_nodes: Vec<NodeId>,
     storage: S,
     reads: Arc<Mutex<ReadState>>,
+    cas: Arc<Mutex<CasResults>>,
     on_split: Option<SplitHook>,
 ) {
     let bytes = env.read(WAL).await.unwrap_or_default();
@@ -696,7 +832,7 @@ async fn drive<E: Env, S: StorageEngine>(
     }
 
     loop {
-        flush_and_apply(&env, &core, &storage, &on_split).await;
+        flush_and_apply(&env, &core, &storage, &cas, &on_split).await;
 
         let now = env.now();
         let deadline = core.lock().expect("raftkv core poisoned").next_deadline();
@@ -758,7 +894,7 @@ async fn drive<E: Env, S: StorageEngine>(
         };
 
         // Durability before action: persist + apply before shipping responses.
-        flush_and_apply(&env, &core, &storage, &on_split).await;
+        flush_and_apply(&env, &core, &storage, &cas, &on_split).await;
 
         for (to, wire) in outs {
             let bytes = serde_json::to_vec(&wire).expect("raftkv message serializes");
