@@ -32,6 +32,7 @@ the relevant one before working in a crate:
 | `animus-tablet` | [crates/animus-tablet/CLAUDE.md](crates/animus-tablet/CLAUDE.md) |
 | `animus-control` | [crates/animus-control/CLAUDE.md](crates/animus-control/CLAUDE.md) |
 | `animus-data` | [crates/animus-data/CLAUDE.md](crates/animus-data/CLAUDE.md) |
+| `animus-raftdata` | [crates/animus-raftdata/CLAUDE.md](crates/animus-raftdata/CLAUDE.md) |
 | `animus-test` | [crates/animus-test/CLAUDE.md](crates/animus-test/CLAUDE.md) |
 | `animus-dynamo` | [crates/animus-dynamo/CLAUDE.md](crates/animus-dynamo/CLAUDE.md) |
 | `animus-placement` | [crates/animus-placement/CLAUDE.md](crates/animus-placement/CLAUDE.md) |
