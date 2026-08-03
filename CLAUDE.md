@@ -302,6 +302,19 @@ cross-cutting ones. Prune/merge entries that become obsolete.
   CI job, not per-push. (ADR 0014 coverage-expansion increment.)
 
 ### Code patterns
+- **Extend the `Env` seam with a *sub-trait* bound only where used, not by widening
+  the supertrait — capabilities not every env has stay opt-in.** In-band tablet
+  split (ADR 0017 D) needs a node to mint a second inbox at runtime
+  (`sibling(id) -> Self`). Adding that to the `Env` supertrait would force *every*
+  env — `ProdEnv` included — to implement runtime inbox-minting (an unsolved
+  production-network problem) just to compile. Instead it's a separate
+  `Coresident: Env` trait that only the split path bounds on (`impl<E: Coresident,
+  S> RaftKvNode<E, S>`), so `SimEnv` implements it, `ProdEnv` doesn't yet, and
+  nothing else changes. Same shape as the metrics seam (additive, default-off) but
+  via a trait bound rather than a defaulted method, because it returns `Self`. Keep
+  the consumer generic over `Env` and inject the capability where needed (here, a
+  `SplitHook` closure built with a `Coresident` env), so the driver stays
+  `<E: Env>` and existing call paths (`split.rs`, hook = `None`) are byte-identical.
 - **Generalizing a type over a state machine: prefer *two plain type params*
   (`<C, S>`) over *one param with an associated type* (`<SM: Trait<Command=C>>`) —
   `#[derive]` can't see through associated types.** Making `RaftCore` generic over

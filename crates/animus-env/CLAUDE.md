@@ -34,6 +34,17 @@ the production implementation; the deterministic implementation lives in
   warning).
 - `Network::send` is fire-and-forget (no delivery result); `recv` is
   **single-consumer per node** — never run two receive loops on one `NodeId`.
+- **`Coresident` (ADR 0017 D) is a *sub-trait*, not part of `Env`.** It adds one
+  method — `sibling(&self, id) -> Self`, a fresh handle on the same physical node
+  bound to a different `NodeId` (its own inbox) — so a node can host a *second*
+  protocol instance (the new tablet's Raft group after a split) by minting its id
+  **in band**, instead of the harness/bootstrap pre-allocating every id. It is
+  deliberately separate from the `Env` supertrait: only the co-residency-aware
+  split path bounds on it, so every other `E: Env` is unaffected and an env that
+  can't multiplex inboxes (a transport keyed by one address) simply isn't
+  `Coresident`. `SimEnv` implements it (trivially — `Simulator::env` already mints
+  inboxes lazily); `ProdEnv` does **not** (yet) — runtime sibling addressing is the
+  production-assembly piece ADR 0017 defers.
 - `Disk` is append + explicit `sync`; bytes are not durable until `sync`
   returns. This models real crash semantics and is what `animus-sim` exploits.
   `Disk::replace` atomically swaps a file's whole contents (temp-file + rename
