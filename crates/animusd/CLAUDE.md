@@ -164,6 +164,11 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   through the cluster's set of registered control handles (held in
   `ClusterEdgeState`, threaded via `ClientCtx::edge` — see below). A
   never-`CreateTable`d table falls back to the legacy `pk`/`sk` convention.
+  `CreateTable` now decodes `AttributeDefinitions` into `key_types` (carried on
+  `Operation::CreateTable`) and passes them to `schema_bridge::to_control`, so the
+  replicated catalog records each key column's declared **type** (`S`/`N`/`B` →
+  `String`/`Number`/`Binary`) — previously the edge passed `&[]`, defaulting every
+  key to `String`. The dashboard's key prefill reads these types.
   **`CreateTable`'s GSI/LSI *definitions* are also replicated now** (ADR 0013):
   after the schema commits, `create_table` proposes one
   `MetaCommand::CreateTableIndex` per declared index (built via
@@ -264,7 +269,10 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
       you can't act on a non-existent table. Form and JSON share one request model
       (`dynModel`) with a Form/JSON **toggle** that syncs both ways (the JSON view is
       the full request; the form edits TableName + Item/Key, preserving extra fields
-      like `UpdateExpression`). `tests/admin_endpoint.rs::admin_table_management_create_and_drop`.
+      like `UpdateExpression`). Selecting a table (or op) **prefills the request with
+      that table's key attributes** — partition key + sort key, typed from the catalog
+      (S/N/B) — into both views. `tests/admin_endpoint.rs::admin_table_management_create_and_drop`
+      (also asserts a numeric sort key's type reaches the catalog).
   - **Gotcha — `/admin/raftkv` is node-local, but in a single `--cluster N` process
     the shared `ClusterEdgeState` registers *every* node's CP group handle, so one
     node's view lists all replicas; a one-process-per-node deployment (separate edge

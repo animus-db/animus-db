@@ -270,7 +270,9 @@ The dashboard is a debug/operability tool, not a correctness surface; its bar is
    **table management** (list from the replicated catalog, create, drop) and
    restricts ops to a **dropdown of existing tables** (can't act on a non-existent
    table), with a **Form/JSON toggle** over one shared request model that syncs both
-   ways — Dynamo by reusing the edge in-process, CQL by driving the node's own CQL port as a
+   ways and **prefills a selected table's key attributes** (partition + sort key,
+   typed from the catalog — which now records declared key types, closing a gap where
+   `CreateTable` dropped them) — Dynamo by reusing the edge in-process, CQL by driving the node's own CQL port as a
    loopback client (the browser can't speak the CQL binary protocol). This
    **extends the admin port into a data-write + DDL surface** — see the added
    consequence below. Operator actions (split/flush/compact/reconfigure/drain) wired

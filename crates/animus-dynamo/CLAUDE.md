@@ -54,7 +54,11 @@ adapter wedge. The transport (HTTP, sockets) and the distributed routing live in
   (partition key + optional sort key) and the control plane's `TableSchema`
   (`animus_control`: partition key + ordered clustering keys + typed columns):
   `to_control(schema, key_types)` (DynamoDB simple/composite → control schema,
-  recording key columns with their `AttributeType`) and `to_dynamo(control)` (back,
+  recording key columns with their `AttributeType` — `key_types` come from the
+  `CreateTable` request's `AttributeDefinitions`, decoded into
+  `Operation::CreateTable.key_types`; the `animusd` edge now passes them, so a
+  numeric/binary key is recorded as `Number`/`Binary` rather than defaulting to
+  `String`) and `to_dynamo(control)` (back,
   taking the first clustering key as the DynamoDB sort key, ignoring extra CQL
   clustering columns). It also bridges **secondary-index definitions**:
   `index_to_control(&SecondaryIndex, base_pk)` ↔ `index_to_dynamo(&IndexDef)` /

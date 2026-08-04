@@ -228,6 +228,10 @@ pub enum Operation {
         table: String,
         /// The key schema (partition key + optional sort key).
         schema: TableSchema,
+        /// The declared `AttributeType` (`S`/`N`/`B`) for each key attribute, from
+        /// `AttributeDefinitions` (name → type). Used to record the key columns'
+        /// types in the replicated catalog; a missing entry defaults to `S`.
+        key_types: Vec<(String, String)>,
         /// Declared secondary indexes (global and local).
         indexes: Vec<SecondaryIndex>,
     },
@@ -426,10 +430,12 @@ pub fn decode_request(target: &str, body: &[u8]) -> Result<Operation, WireError>
         "CreateTable" => {
             let table = table_name(obj)?;
             let schema = decode_key_schema(obj)?;
+            let key_types = decode_attribute_types(obj);
             let indexes = decode_indexes(obj)?;
             Ok(Operation::CreateTable {
                 table,
                 schema,
+                key_types,
                 indexes,
             })
         }
@@ -738,6 +744,25 @@ fn decode_key_schema(obj: &Map<String, Value>) -> Result<TableSchema, WireError>
         partition_key,
         sort_key,
     })
+}
+
+/// Decode `AttributeDefinitions` into `(AttributeName, AttributeType)` pairs (the
+/// declared `S`/`N`/`B` for each key attribute). Absent or malformed entries are
+/// skipped — the schema bridge defaults a missing type to `String`.
+fn decode_attribute_types(obj: &Map<String, Value>) -> Vec<(String, String)> {
+    obj.get("AttributeDefinitions")
+        .and_then(Value::as_array)
+        .map(|defs| {
+            defs.iter()
+                .filter_map(|d| {
+                    let d = d.as_object()?;
+                    let name = d.get("AttributeName").and_then(Value::as_str)?;
+                    let ty = d.get("AttributeType").and_then(Value::as_str)?;
+                    Some((name.to_owned(), ty.to_owned()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Decode the optional `GlobalSecondaryIndexes` + `LocalSecondaryIndexes` of a
@@ -1907,10 +1932,18 @@ mod tests {
             Operation::CreateTable {
                 table,
                 schema,
+                key_types,
                 indexes,
             } => {
                 assert_eq!(table, "t");
                 assert_eq!(schema, TableSchema::composite("pk", "sk"));
+                assert_eq!(
+                    key_types,
+                    vec![
+                        ("pk".to_owned(), "S".to_owned()),
+                        ("sk".to_owned(), "S".to_owned())
+                    ]
+                );
                 assert!(indexes.is_empty());
             }
             other => panic!("expected CreateTable, got {other:?}"),

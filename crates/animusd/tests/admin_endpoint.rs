@@ -373,13 +373,13 @@ async fn admin_table_management_create_and_drop() {
                 .is_some_and(|v| !v.is_null())
         };
 
-        // Create.
+        // Create a composite table (string partition key + **numeric** sort key).
         let (s, body) = admin(
             a,
             "POST",
             "/admin/data/dynamo",
             Some(
-                r#"{"op":"CreateTable","payload":{"TableName":"widgets","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}]}}"#,
+                r#"{"op":"CreateTable","payload":{"TableName":"widgets","KeySchema":[{"AttributeName":"id","KeyType":"HASH"},{"AttributeName":"seq","KeyType":"RANGE"}],"AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"},{"AttributeName":"seq","AttributeType":"N"}]}}"#,
             ),
         )
         .await;
@@ -391,6 +391,22 @@ async fn admin_table_management_create_and_drop() {
         })
         .await
         .expect("created table did not appear in the catalog");
+
+        // The catalog records the key columns with their declared types — this is the
+        // contract the dashboard's key prefill reads (partition key + sort key, typed).
+        let (_, status) = admin_get(a, "/admin/status").await;
+        let schema = &status["schemas"]["tables"]["widgets"];
+        assert_eq!(schema["partition_key"], "id", "partition key recorded: {schema}");
+        assert_eq!(schema["clustering_keys"][0], "seq", "sort key recorded: {schema}");
+        let seq_ty = schema["columns"]
+            .as_array()
+            .and_then(|cols| cols.iter().find(|c| c["name"] == "seq"))
+            .map(|c| c["ty"].clone());
+        assert_eq!(
+            seq_ty,
+            Some(serde_json::json!("Number")),
+            "the numeric sort key's type reaches the catalog (not defaulted to String): {schema}"
+        );
 
         // Drop.
         let (s, body) =

@@ -292,8 +292,9 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
         Operation::CreateTable {
             table,
             schema,
+            key_types,
             indexes,
-        } => create_table(ctx, &table, &schema, &indexes).await,
+        } => create_table(ctx, &table, &schema, &key_types, &indexes).await,
         Operation::PutItem {
             table,
             item,
@@ -443,6 +444,7 @@ async fn create_table(
     ctx: &ClientCtx,
     table: &str,
     schema: &TableSchema,
+    key_types: &[(String, String)],
     indexes: &[animus_dynamo::SecondaryIndex],
 ) -> Result<String, WireError> {
     // Reject a duplicate up front, matching DynamoDB's `ResourceInUseException`,
@@ -457,7 +459,8 @@ async fn create_table(
     // so it is created in `ReplicationMode::Cp`. The edge routes its reads/writes
     // through the CP primitives regardless, but recording the mode keeps the
     // replicated catalog truthful (and the plain-client `is_cp` gate consistent).
-    let control_schema = schema_bridge::to_control(schema, &[]).with_mode(ReplicationMode::Cp);
+    let control_schema =
+        schema_bridge::to_control(schema, key_types).with_mode(ReplicationMode::Cp);
     let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
     loop {
         // Propose against this cluster's current leader (idempotent: the create is

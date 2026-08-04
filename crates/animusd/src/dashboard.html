@@ -520,6 +520,7 @@ function addAttrRow(name = "", type = "S", value = "") {
   tr.innerHTML = `<td><input type="text" class="dy-n" value="${esc(name)}"></td>
     <td><select class="dy-t"><option ${type==="S"?"selected":""}>S</option>
       <option ${type==="N"?"selected":""}>N</option>
+      <option ${type==="B"?"selected":""}>B</option>
       <option ${type==="BOOL"?"selected":""}>BOOL</option></select></td>
     <td><input type="text" class="dy-v" value="${esc(value)}"></td>
     <td><a href="#" class="dy-del">✕</a></td>`;
@@ -535,6 +536,7 @@ function dyAttrs() {
 }
 function attrValue(a) {
   if (a.type === "N") return { N: a.value };
+  if (a.type === "B") return { B: a.value };
   if (a.type === "BOOL") return { BOOL: a.value === "true" || a.value === "1" };
   return { S: a.value };
 }
@@ -544,22 +546,52 @@ function currentAv() {
 function avToAttrs(av) {
   if (!av || typeof av !== "object") return [];
   return Object.entries(av).map(([name, val]) => {
-    const type = val.N != null ? "N" : (val.BOOL != null ? "BOOL" : "S");
-    const value = val.N != null ? val.N : (val.BOOL != null ? String(val.BOOL) : (val.S != null ? val.S : ""));
+    const type = val.N != null ? "N" : (val.B != null ? "B" : (val.BOOL != null ? "BOOL" : "S"));
+    const value = val.N != null ? val.N
+      : (val.B != null ? val.B : (val.BOOL != null ? String(val.BOOL) : (val.S != null ? val.S : "")));
     return { name, type, value };
   });
 }
 
-// A fresh request skeleton for `op` against `table`.
+// The DynamoDB attribute type (S/N/B) for a key column, from the table's schema.
+function dynColType(schema, name) {
+  const col = (schema.columns || []).find((c) => c.name === name);
+  const ty = col && col.ty;
+  return ty === "Number" ? "N" : (ty === "Binary" ? "B" : "S");
+}
+// The table's key attributes as an AttributeValue map with empty values, ready to
+// prefill an Item/Key — partition key, then sort key (first clustering key) if any.
+function dynKeyAv(table) {
+  const s = dynamoTables()[table];
+  const av = {};
+  if (!s) return av;
+  const put = (name) => { av[name] = attrValue({ type: dynColType(s, name), value: "" }); };
+  if (s.partition_key) put(s.partition_key);
+  const sk = s.clustering_keys && s.clustering_keys[0];
+  if (sk) put(sk);
+  return av;
+}
+// The partition key name (for prefilling a Query's KeyConditionExpression).
+function dynPartitionKey(table) {
+  const s = dynamoTables()[table];
+  return (s && s.partition_key) || "pk";
+}
+
+// A fresh request skeleton for `op` against `table`, with the table's known key
+// attributes prefilled (the partition key, and sort key if any).
 function dynSkeleton(op, table) {
+  const keyAv = dynKeyAv(table);
   switch (op) {
-    case "PutItem": return { TableName: table, Item: {} };
-    case "GetItem": return { TableName: table, Key: {} };
-    case "DeleteItem": return { TableName: table, Key: {} };
-    case "UpdateItem": return { TableName: table, Key: {},
+    case "PutItem": return { TableName: table, Item: { ...keyAv } };
+    case "GetItem": return { TableName: table, Key: { ...keyAv } };
+    case "DeleteItem": return { TableName: table, Key: { ...keyAv } };
+    case "UpdateItem": return { TableName: table, Key: { ...keyAv },
       UpdateExpression: "SET v = :v", ExpressionAttributeValues: { ":v": { S: "new" } } };
-    case "Query": return { TableName: table, KeyConditionExpression: "pk = :pk",
-      ExpressionAttributeValues: { ":pk": { S: "..." } } };
+    case "Query": {
+      const pk = dynPartitionKey(table);
+      return { TableName: table, KeyConditionExpression: `${pk} = :${pk}`,
+        ExpressionAttributeValues: { [":" + pk]: { S: "..." } } };
+    }
     case "Scan": return { TableName: table, Limit: 25 };
     default: return { TableName: table };
   }
@@ -627,8 +659,9 @@ function dynOnOp() {
   dynRender();
 }
 function dynOnTable() {
-  if (dynView === "json") { try { dynSyncFromJson(); } catch { /* keep model */ } }
-  dynModel.TableName = $("dy-table").value;
+  // Switching table rebuilds the skeleton so the new table's key attributes are
+  // prefilled (in both form and JSON views).
+  dynModel = dynSkeleton($("dy-op").value, $("dy-table").value);
   dynRender();
 }
 
@@ -655,11 +688,17 @@ function renderDynamoTables() {
   const sel = $("dy-table");
   const prev = sel.value;
   sel.innerHTML = names.map((n) => `<option>${esc(n)}</option>`).join("");
+  // When the effective table changes (first load, or the current table was
+  // dropped), rebuild the skeleton so the new table's keys are prefilled — but on a
+  // routine refresh where the selection is preserved, leave the editor untouched
+  // (don't clobber in-progress edits).
+  let tableChanged = false;
   if (names.includes(prev)) sel.value = prev;
-  else if (names.length) { sel.value = names[0]; dynModel.TableName = names[0]; }
+  else if (names.length) { sel.value = names[0]; tableChanged = true; }
   const none = names.length === 0;
   $("dy-no-tables").style.display = none ? "" : "none";
   ["dy-op", "dy-table", "dy-send", "dy-add-attr"].forEach((id) => { $(id).disabled = none; });
+  if (tableChanged) { dynModel = dynSkeleton($("dy-op").value, sel.value); dynRender(); }
 }
 
 async function createTable() {
@@ -681,7 +720,12 @@ async function createTable() {
     $("dy-ct-msg").textContent = "created " + name;
     $("dy-ct-name").value = "";
     await loadAll();
-    $("dy-table").value = name; dynModel.TableName = name; dynRender();
+    // Select the new table and prefill its key attributes into the editor.
+    if ([...$("dy-table").options].some((o) => o.value === name)) {
+      $("dy-table").value = name;
+      dynModel = dynSkeleton($("dy-op").value, name);
+      dynRender();
+    }
   } catch (e) { $("dy-ct-msg").textContent = String(e); }
 }
 async function dropTable(name) {
