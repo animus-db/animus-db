@@ -22,8 +22,8 @@ relevant ADR (or supersede it) in the same PR as the code change.
 | [0013](0013-replicated-schemas.md) | Replicated table-schema catalog in the control plane | Accepted |
 | [0014](0014-elle-accord-scenario-corpus.md) | Elle consistency testing against Accord + a frozen scenario corpus | Accepted |
 | [0015](0015-observability.md) | Deterministic-safe observability seam (metrics) | Accepted |
-| [0016](0016-pluggable-replication-per-tablet-raft.md) | Pluggable replication: per-tablet Raft (CP) alongside the AP data plane | Proposed |
-| [0017](0017-per-tablet-raft-data-plane.md) | Per-tablet Raft data plane (leaderful, linearizable KV) | Proposed |
+| [0016](0016-pluggable-replication-per-tablet-raft.md) | Pluggable replication: per-tablet Raft (CP) alongside the AP data plane | Accepted |
+| [0017](0017-per-tablet-raft-data-plane.md) | Per-tablet Raft data plane (leaderful, linearizable KV) | Accepted |
 | [0018](0018-cross-tablet-transactions.md) | Cross-tablet transactions on the CP plane (2PC over per-tablet Raft + HLC + MVCC) | Proposed |
 | [0019](0019-cp-only-v1-defer-ap.md) | v1 ships the CP plane only; the leaderless AP data plane is deferred | Accepted |
 | [0020](0020-admin-interface.md) | Admin / debug interface on a dedicated port (config, status, Raft + storage introspection, operator actions) | Accepted |

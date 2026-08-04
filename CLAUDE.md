@@ -165,6 +165,19 @@ gotchas also belong in that crate's `CLAUDE.md`; entries here are the
 cross-cutting ones. Prune/merge entries that become obsolete.
 
 ### Testing
+- **The in-process `--cluster N` shared edge state masks cross-process leader-routing
+  gaps — test cross-process paths *per-process*.** In `--cluster N` every node shares
+  one `ClusterEdgeState`, so an operation that needs to reach *both* the control
+  leader **and** a per-tablet CP-group leader (e.g. the tablet-split trigger:
+  `SplitTablet` metadata on the control leader + `propose_split` on the CP leader)
+  works from any node, because the shared edge reaches both in-process. **Per-process**
+  (one `ClusterEdgeState` each) those two leaderships can sit on *different* nodes, so
+  the same call silently fails on every node unless the trigger is forwarded
+  cross-process. The split-over-`ProdEnv` and re-host tests therefore drive the split
+  *in-process* (`cp_rehost.rs`) and the reconfigure/failure tests run *per-process*
+  (`cp_reconfigure.rs`) to exercise the node-local admin views + real failure
+  detection. When a path resolves a leader, ask "which leader, and is it the same node
+  as the other leader this path needs?" — and add a per-process test if not.
 - **Match a consistency-checker harness to what the layer *offers*; don't shoehorn
   a transactional workload onto a non-transactional layer — build a sibling harness
   that reuses the *checkers*, not the workload.** Adding an Elle corpus for the
@@ -325,6 +338,28 @@ cross-cutting ones. Prune/merge entries that become obsolete.
   CI job, not per-push. (ADR 0014 coverage-expansion increment.)
 
 ### Code patterns
+- **Which physical engines a node hosts is *local* durable state — a marker file,
+  not derivable from replicated `Metadata`.** Re-hosting a node's per-tablet CP
+  groups after a restart (ADR 0017 #2) can't be driven purely off the replicated
+  tablet map: that map records placement in **stable base node ids**, not which
+  co-resident `sib-<id>/db-t{id}-` engines actually exist on *this* node. So
+  `animusd` writes a small durable `cp-hosted` marker (per `raftkv` env) when it
+  stands up a split tablet's group, and reads it at start to re-host (recover the
+  engine + WAL). Bonus: pre-populating the per-node mint-guard (`minted`) from that
+  marker *before* starting the parent group gives **split crash-idempotency** — the
+  parent re-applying its committed `Split` on WAL recovery finds the tablet already
+  hosted and won't mint the sibling twice. (A genuinely-local durable record is fine;
+  the "prefer a live read of the durable layer" caution is about *stale derived
+  caches*, which this is not.)
+- **Keep the replicated tablet map in stable base node ids; translate to per-tablet
+  group member ids at the edge.** A tablet's Raft *group member ids* differ from the
+  node's base id (a split tablet uses `base + tablet*STRIDE` so co-resident groups
+  get distinct inboxes), but failure-detection and placement speak **base ids**. So
+  `Metadata.tablets[t].replicas` stays base ids, and the data-plane reconfigure loop
+  translates with one function (`cp_members_for`) so its `desired` set matches the
+  running group's `config()` exactly — no spurious reconfigure churn, and no need to
+  reconcile the map to derived ids. The bootstrap tablet is the identity case
+  (member == base); only split tablets derive.
 - **Drive cross-plane reconfiguration by *pull from replicated state*, not a new
   push command — it keeps the dependency edge one-way and the seam testable.**
   Wiring the control plane to reconfigure a per-tablet Raft KV group on a node

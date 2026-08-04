@@ -2,17 +2,21 @@
 
 - **Status:** Accepted — **Stages A–D implemented** in `animus-cp-data`
   (linearizable single-tablet KV, compaction + streaming snapshots, single-server
-  membership change, tablet split), all sim-tested; the plane's linearizability is
-  verified by a dedicated **Elle corpus** (`animus-test/tests/raftkv_linearizable.rs`);
-  the **automatic membership-change trigger** and **in-band split group creation**
-  are wired under `SimEnv`; and **Stage 3a** of the production assembly runs the CP
-  plane in `animusd` over `ProdEnv` with per-table AP/CP routing; and **Stage 3b**
-  has begun — `ProdEnv` now implements `Coresident` (a pre-bound listener pool, so a
-  node mints co-resident CP-group inboxes at runtime). The remaining **3b** work is
-  control-plane **address distribution** (carry group-replica addresses in
-  `Metadata` + a per-node `set_peers` sync loop), then dynamic CP
-  placement/split/reconfigure over `ProdEnv` and cross-process CP routing — not new
-  mechanism.
+  membership change, tablet split) plus linearizable **CAS**, all sim-tested; the
+  plane's linearizability is verified by a dedicated **Elle corpus**
+  (`animus-test/tests/raftkv_linearizable.rs`); the **automatic membership-change
+  trigger** and **in-band split group creation** are wired under `SimEnv`. The
+  **production assembly over `ProdEnv`** is built through **Phase 2.4**: the CP plane
+  runs in `animusd` (Stage 3a), with cross-process CP client routing (3b A1),
+  cross-process schema DDL relay (A2), `Coresident` over `ProdEnv` (a pre-bound
+  listener pool, 3b.1), tablet-keyed routing (2.1), **CP tablet split over `ProdEnv`**
+  (2.2), replicated **CP member-address distribution + per-node peer-sync** (2.3a),
+  and an **automatic size-telemetry split trigger** (2.4). The remaining work is
+  **tablet-map-driven hosting** (a node re-hosts every tablet placed on it, incl.
+  post-split tablets, on restart), **dynamic CP reconfigure / failure-detection over
+  `ProdEnv`** (Stage C is wired under `SimEnv` only — over `ProdEnv` `reconfigure_step`
+  is reachable only via the admin endpoint today), and **split crash-idempotency +
+  replica-set reconciliation** hardening — see the "Production assembly" notes below.
 - **Date:** 2026-08-03
 
 ## Context
@@ -293,14 +297,48 @@ control plane unchanged. **Not yet:** dynamic membership (Stage C), tablet split
   CP-mode table's client reads/writes to the group leader (`ClientCtx::cp_put`/
   `cp_get` via the per-cluster `ClusterEdgeState` group registry). `tests/cp_plane.rs`
   drives it over real TCP (CP write/read round-trip across nodes; AP plane
-  untouched). **Stage 3b** (in progress): the `ProdEnv` side of `Coresident` is
-  **done** — `ProdEnv::bind_with_pool` pre-binds a listener pool and `sibling(id)`
-  hands one out, so a node mints co-resident CP-group inboxes at runtime
-  (`prod.rs`, with a sibling-messaging unit test). Remaining: control-plane
-  **address distribution** (group-replica addresses in `Metadata` + a per-node
-  `set_peers` sync loop — the next 3b step), then dynamic CP
-  placement/split/reconfigure over `ProdEnv`, cross-process CP client routing, and
-  per-CP-group failure detection.
+  untouched).
+- **Production assembly — Stage 3b + Phase 2 (`animusd`).** ✅ Done through Phase 2.4.
+  `Coresident` over `ProdEnv` (`bind_with_pool` pre-binds a listener pool, `sibling(id)`
+  hands one out, 3b.1); **cross-process CP client routing** (a non-leader node
+  forwards the op to the leader's node over a fresh client connection, `Forwarded`,
+  A1) and **cross-process schema DDL relay** to the control leader (A2);
+  **tablet-keyed routing** (`cp_route` resolves key→tablet→leader, the edge's CP
+  handles keyed by `TabletId`, 2.1); **CP tablet split over `ProdEnv`** (a committed
+  `Split{at}` fires a per-node split hook that mints the sibling group from the
+  listener pool, seeds it from the handoff, registers + publishes it; manual trigger
+  `ClientRequest::SplitTablet`, 2.2); replicated **CP member-address distribution**
+  (`Metadata.cp_member_addrs` + `MetaCommand::RegisterCpAddr`) and a per-node
+  **peer-sync loop** (`set_peers` = static ∪ replicated addrs, 2.3a); and an
+  **automatic size-telemetry split trigger** (a leader splits a tablet it leads at
+  the median once it exceeds a key-count threshold, 2.4).
+- **Production assembly — this round (#2/#3/#4).** ✅ Mostly landed:
+  - ✅ **Tablet-map-driven re-hosting on restart (#2).** A node durably records the
+    split tablets it hosts (the `cp-hosted` marker, `animusd`), and on start re-hosts
+    each one (`cp_rehost`) by recovering its `db-t{id}-` engine + `raftkv.wal` — so a
+    post-split tablet survives a restart instead of being silently lost.
+    `animusd/tests/cp_rehost.rs`.
+  - ✅ **Dynamic CP failure-detection + reconfigure loop over `ProdEnv` (#3).** Each
+    node heartbeats the control group as its `raftkv` member id, so the control
+    leader's `detect_loop` marks a crashed CP node `Down`; and each CP-hosting node
+    runs `cp_reconfigure_loop`, pulling `tablets[t].replicas` and stepping each group
+    it leads toward it (the production counterpart of the SimEnv
+    `spawn_reconfigure_loop`). `animusd/tests/cp_reconfigure.rs`.
+  - ✅ **Split crash-idempotency + cross-process address relay (#4, partial).** The
+    split hook's `minted` guard is pre-populated from the durable `cp-hosted` marker,
+    so a `Split` re-applied on WAL replay does not mint the sibling twice; address
+    publish now relays to the control leader cross-process
+    (`ClientCtx::register_cp_addr`).
+  - **Remaining.** (a) Closing the failure→placement→reconfigure *cascade* over
+    `ProdEnv`: auto-attach a `PlacementPolicy` so the reconciler picks a replacement,
+    and **join-hosting** so the spare node hosts an empty co-resident group that
+    catches up via `InstallSnapshot` (removing a dead replica already works; adding a
+    fresh one needs this). (b) Cross-process split *trigger* routing (today the split
+    must be driven on a node that is both the control leader and the CP leader — the
+    in-process shared edge reaches both; cross-process needs the trigger forwarded).
+    (c) Control-plane-driven new-group id allocation (the `base + new_tablet*STRIDE`
+    derivation risks collision on deep/repeated splits); `Metadata.tablets[new].replicas`
+    stays in base ids and the data plane translates per tablet (`cp_members_for`).
 - **Next ADR — cross-tablet transactions** (2PC over the groups + HLC; or Accord
   atop them).
 

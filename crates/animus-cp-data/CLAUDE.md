@@ -147,11 +147,16 @@ the engine — the `AccordCore` sync-core/async-driver split.
   apply the new group forms with no external handoff. `tests/split_in_band.rs`.
   Decided seam (per maintainer): SimEnv first; `Coresident` is a *separate* trait
   bound only on the split path, so `ProdEnv`/other envs and the external-handoff
-  `split.rs` (hook = `None`) are untouched. **Limitations (production-hardening,
-  deferred to the `animusd` assembly):** the hook fires on every apply, so a
-  `Split` re-applied after a crash recovery would mint the sibling twice
-  (recovery-idempotency); and the new group's ids are wired per-replica here rather
-  than allocated by the control plane's `SplitTablet`.
+  `split.rs` (hook = `None`) are untouched. **The hook fires on every apply**, so a
+  `Split` re-applied after a crash recovery would mint the sibling twice — but
+  **recovery-idempotency is now handled at the `animusd` assembly layer** (#2/#4):
+  the ProdEnv hook gates on a per-node `minted` set that is pre-populated at start
+  from a durable `cp-hosted` marker, so a re-applied `Split` finds the tablet already
+  hosted and does not re-mint (and the tablet is instead re-hosted from its on-disk
+  engine). **Remaining limitation:** the new group's ids are wired per-replica
+  (`base + tablet * STRIDE` in `animusd`) rather than allocated by the control
+  plane's `SplitTablet`, and `Metadata.tablets[new].replicas` records the parent's
+  base ids, not the derived member ids (the data plane translates per tablet).
 
 ## Tests
 

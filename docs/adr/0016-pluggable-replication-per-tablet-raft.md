@@ -1,6 +1,14 @@
 # ADR 0016 — Pluggable replication mode: per-tablet Raft (CP) alongside the AP data plane
 
-- **Status:** Proposed
+- **Status:** Accepted — **all four follow-ups landed.** `RaftCore` is generic
+  (`RaftCore<C, S>`, follow-up 2); the per-tablet Raft KV backend is built and runs
+  in `animusd` over `ProdEnv` (follow-up 3, the build design in ADR 0017); per-table
+  mode lives in the replicated schema catalog and a `RaftPerTablet` Elle corpus
+  checks it (follow-up 4). **Note (ADR 0019):** v1 ships the CP plane *only* — the
+  leaderless AP data plane this ADR framed CP as living "alongside" was deferred and
+  its crate deleted, so the pluggable-backend *seam* collapsed to a single (CP)
+  backend in v1. The decision here stands; both-planes is the long-shot future this
+  seam keeps possible.
 - **Date:** 2026-08-03
 
 ## Context
@@ -174,11 +182,16 @@ either inapplicable, retrofittable onto Raft, or already covered elsewhere:
    driver is step 3. A `tests/generic_state_machine.rs` drives the same core with a
    toy KV state machine through propose → durable-apply → snapshot → recovery,
    proving the generalization is real.
-3. The per-tablet Raft KV backend + the replication-backend seam + the Raft-routing
-   coordinator (its own build ADR, with the leadership-ownership and cross-tablet
-   transaction decisions).
-4. Per-table mode selection via the schema catalog; a `RaftPerTablet` topology in
-   the Elle corpus.
+3. ✅ The per-tablet Raft KV backend + the Raft-routing coordinator — built as
+   `animus-cp-data` and assembled into `animusd` over `ProdEnv` (its own build ADR,
+   ADR 0017, with the leadership-ownership decision; cross-tablet transactions
+   deferred to ADR 0018). The replication-backend *seam* itself was not built: ADR
+   0019 made v1 CP-only, so there is one backend, not two behind a seam.
+4. ✅ Per-table mode selection via the schema catalog (`ReplicationMode` +
+   `MetaCommand::SetTableMode`); a self-contained `RaftPerTablet` linearizability
+   corpus in `animus-test` (`tests/raftkv_linearizable.rs`) — not a `Topology`
+   variant of the Accord corpus, since the leaderful plane is single-tablet
+   non-transactional KV.
 
 **Future escape hatches (explicitly out of scope now):** flexible quorums on Raft
 (geo-distributed small write quorums) and ParallelRaft-style out-of-order commit —

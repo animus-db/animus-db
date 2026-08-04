@@ -78,26 +78,61 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   routing no longer depends on it). A just-proposed write is confirmed via a **local**
   read on the leader (not a quorum barrier — the leader applies only after a quorum
   commit + WAL fsync, so a local read reflecting the value means it's durable; a
-  per-write barrier would not scale under concurrent load). Stage 3a hosts **one
-  statically-placed CP group** spanning the first `min(N, MAX_REPLICATION_FACTOR)`
-  nodes' `raftkv` ids, each backed by its own `LsmEngine` or `MemoryEngine` per
-  [`StorageBackend`] (an enum-wrapped `CpGroup`). `tests/cp_plane.rs` (in-process
+  per-write barrier would not scale under concurrent load). At node start a node
+  hosts the **bootstrap CP group** spanning the first `min(N, MAX_REPLICATION_FACTOR)`
+  nodes' `raftkv` ids; a **tablet split** (Phase 2.2/2.4) then stands up additional
+  co-resident groups, each backed by its own `LsmEngine` or `MemoryEngine` per
+  [`StorageBackend`] (an enum-wrapped `CpGroup`), keyed by `TabletId` in the edge
+  registry (Phase 2.1 tablet-keyed routing). `tests/cp_plane.rs` (in-process
   round-trip) + `tests/cp_cross_process.rs` (forwarding) + the dynamo/cql wire +
-  schema tests all exercise the CP path; dynamic CP placement/split/reconfigure over
-  `ProdEnv` is later v1 work.
+  schema tests all exercise the CP path. **Split tablets are re-hosted on restart**
+  (#2): each node durably records the split tablets it hosts in a **`cp-hosted`
+  marker** (`load_hosted_cp`/`save_hosted_cp` on the `raftkv` env disk — genuinely
+  *local* state: which co-resident `db-t{id}-` engines physically exist here, not
+  derivable from the tablet map, which records placement in stable base ids). At
+  start `start_with` reads the marker, pre-populates the per-node `minted` set from
+  it (so the bootstrap group re-applying a committed `Split` on WAL recovery does
+  **not** mint the sibling twice — split crash-idempotency), and spawns `cp_rehost`
+  for each recorded tablet: mint its sibling, recover its `db-t{id}-` engine +
+  `raftkv.wal` via `start_seeded` with an **empty** seed (the data is already on
+  disk — the seed only ever carries a *fresh* split's handoff), register it, and
+  re-publish the sibling's new address. `tests/cp_rehost.rs` (split a tablet, restart
+  the cluster, the upper-range key survives on the re-hosted group). **Address
+  publish is cross-process** now: the split-seed + re-host paths publish via
+  `ClientCtx::register_cp_addr`, which relays the registration to the control leader
+  through `client_route` (a follower can't propose directly) — so the `ctx` is built
+  before the CP hosting block and threaded into the hook + re-host. **Still resolved
+  at start, not from a live tablet-map watch**: hosting a tablet newly *placed* on
+  this node (a join via reconfigure) and dynamic failure-driven CP reconfigure over
+  `ProdEnv` are the remaining v1 increments; the cross-process split *trigger*
+  (control leader + CP leader on different nodes) also remains — `tests/cp_rehost.rs`
+  drives the split in-process where the shared edge reaches both leaders.
 - **The cluster's members are the CP `raftkv` nodes, not the control ids.** The
   control ids `0..N` are only the Raft *consensus group* for metadata; `bootstrap`
   (leader-only, idempotent) registers the **raftkv ids** (`300+i`) as `Active`
   `Metadata` members and records the single bootstrap **CP tablet** (whole keyspace)
   placed on the first `min(N, MAX_REPLICATION_FACTOR)` of them — the same set the CP
   group spans in `start_with`. This keeps `metadata().tablets`/`status` meaningful
-  and gives dynamic CP reconfigure a hook (`tablets[t].replicas`). No
-  `PlacementPolicy` is attached: the CP group is statically formed at node start,
-  and automatic CP failure-detection / reconfigure over `ProdEnv` is later v1 work
-  (so the v0 heartbeat/anti-entropy/hinted-handoff loops and the `serve_replica`
-  data role are gone). The control-plane `detect_loop`/`reconcile_loop` still run on
-  every control node but no-op without heartbeats/policy. The control-plane
-  mechanisms (failure detection, placement) remain sim-proven in `animus-control`.
+  and gives dynamic CP reconfigure a hook (`tablets[t].replicas`). **Data-node
+  failure detection is now wired over `ProdEnv`** (#3): every node spawns
+  `heartbeat_loop` on its `raftkv` env, heartbeating the control group *as its
+  `raftkv` member id*, so the control leader's `detect_loop` marks a crashed CP node
+  `Down` (`tests/cp_reconfigure.rs::data_node_failure_is_detected`). And **each
+  CP-hosting node runs `cp_reconfigure_loop`** (#3 / ADR 0017 Stage C): for every
+  tablet whose group it leads, it pulls `tablets[t].replicas`, translates base ids to
+  the group's member ids via `cp_members_for` (bootstrap tablet = base ids; a split
+  tablet = `base + tablet * CP_SPLIT_ID_STRIDE`, matching `cp_split_seed` — so the
+  replicated map can stay in base ids without reconciling to derived ids, #4), and
+  takes one single-server `reconfigure_step` toward it
+  (`tests/cp_reconfigure.rs::cp_group_follows_tablet_replica_set`: dropping a follower
+  from the replica set reconfigures the group's voters down). **Still v0/v1 gaps:**
+  no `PlacementPolicy` is auto-attached, so the failure→placement→reconfigure
+  *cascade* isn't closed end-to-end over `ProdEnv` — removing a dead replica works,
+  but adding a *replacement* needs both a placement policy and the spare node to host
+  an (empty) co-resident group for the tablet so it can catch up via `InstallSnapshot`
+  (join-hosting). The v0 heartbeat/anti-entropy/hinted-handoff loops and the
+  `serve_replica` data role are gone; the control-plane mechanisms (failure detection,
+  placement) remain sim-proven in `animus-control`.
 - **The CP group is durable by default**: each hosting node's `RaftKvNode` is
   backed by the on-disk `LsmEngine` opened over its **raftkv** `ProdEnv`
   (`StorageBackend::Lsm`), so a value acked to a client (Raft-committed + WAL-fsynced
