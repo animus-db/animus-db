@@ -153,10 +153,15 @@ the engine — the `AccordCore` sync-core/async-driver split.
   the ProdEnv hook gates on a per-node `minted` set that is pre-populated at start
   from a durable `cp-hosted` marker, so a re-applied `Split` finds the tablet already
   hosted and does not re-mint (and the tablet is instead re-hosted from its on-disk
-  engine). **Remaining limitation:** the new group's ids are wired per-replica
-  (`base + tablet * STRIDE` in `animusd`) rather than allocated by the control
-  plane's `SplitTablet`, and `Metadata.tablets[new].replicas` records the parent's
-  base ids, not the derived member ids (the data plane translates per tablet).
+  engine). **Deep splits (D3):** a split-created group can be split again — `animusd`
+  starts *every* group with a hook (`start_seeded_with_split_hook` /
+  `start_with_split_hook`) and derives member ids **flatly** from the node's base id
+  (`base + tablet * STRIDE`, matching the reconfigure loop at any depth), so
+  auto-sharding keeps working as a shard grows. **Remaining limitation:** the new
+  group's ids are derived in `animusd` rather than allocated by the control plane's
+  `SplitTablet`, and `Metadata.tablets[new].replicas` records the parent's base ids,
+  not the derived member ids (the data plane translates per tablet) — fine for
+  realistic clusters.
 
 ## Tests
 

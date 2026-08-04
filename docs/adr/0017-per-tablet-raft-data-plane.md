@@ -11,12 +11,14 @@
   cross-process schema DDL relay (A2), `Coresident` over `ProdEnv` (a pre-bound
   listener pool, 3b.1), tablet-keyed routing (2.1), **CP tablet split over `ProdEnv`**
   (2.2), replicated **CP member-address distribution + per-node peer-sync** (2.3a),
-  and an **automatic size-telemetry split trigger** (2.4). The remaining work is
-  **tablet-map-driven hosting** (a node re-hosts every tablet placed on it, incl.
-  post-split tablets, on restart), **dynamic CP reconfigure / failure-detection over
-  `ProdEnv`** (Stage C is wired under `SimEnv` only — over `ProdEnv` `reconfigure_step`
-  is reachable only via the admin endpoint today), and **split crash-idempotency +
-  replica-set reconciliation** hardening — see the "Production assembly" notes below.
+  and an **automatic size-telemetry split trigger** (2.4); plus **re-hosting on
+  restart** (#2), **failure-detection + reconfigure over `ProdEnv`** (#3),
+  **cross-process split-address relay + crash-idempotency** (#4), the **full
+  failure→placement→reconfigure cascade with join-hosting** (D1), **cross-process
+  split-trigger routing** (D2), and **deep splits** (a split tablet can be split
+  again, D3). The per-tablet CP data plane is now **functionally complete over
+  `ProdEnv`** — see the "Production assembly" notes below for what each piece does
+  and the (small) remainder.
 - **Date:** 2026-08-03
 
 ## Context
@@ -324,21 +326,35 @@ control plane unchanged. **Not yet:** dynamic membership (Stage C), tablet split
     runs `cp_reconfigure_loop`, pulling `tablets[t].replicas` and stepping each group
     it leads toward it (the production counterpart of the SimEnv
     `spawn_reconfigure_loop`). `animusd/tests/cp_reconfigure.rs`.
-  - ✅ **Split crash-idempotency + cross-process address relay (#4, partial).** The
-    split hook's `minted` guard is pre-populated from the durable `cp-hosted` marker,
-    so a `Split` re-applied on WAL replay does not mint the sibling twice; address
-    publish now relays to the control leader cross-process
-    (`ClientCtx::register_cp_addr`).
-  - **Remaining.** (a) Closing the failure→placement→reconfigure *cascade* over
-    `ProdEnv`: auto-attach a `PlacementPolicy` so the reconciler picks a replacement,
-    and **join-hosting** so the spare node hosts an empty co-resident group that
-    catches up via `InstallSnapshot` (removing a dead replica already works; adding a
-    fresh one needs this). (b) Cross-process split *trigger* routing (today the split
-    must be driven on a node that is both the control leader and the CP leader — the
-    in-process shared edge reaches both; cross-process needs the trigger forwarded).
-    (c) Control-plane-driven new-group id allocation (the `base + new_tablet*STRIDE`
-    derivation risks collision on deep/repeated splits); `Metadata.tablets[new].replicas`
-    stays in base ids and the data plane translates per tablet (`cp_members_for`).
+  - ✅ **Split crash-idempotency + cross-process address relay (#4).** The split
+    hook's `minted` guard is pre-populated from the durable `cp-hosted` marker, so a
+    `Split` re-applied on WAL replay does not mint the sibling twice; address publish
+    relays to the control leader cross-process (`ClientCtx::register_cp_addr`).
+- **Production assembly — the deferred increments (D1/D2/D3).** ✅ Done — the plane is
+  now functionally complete over `ProdEnv`:
+  - ✅ **Full failure→placement→reconfigure cascade with join-hosting (D1).**
+    `bootstrap` attaches a label-free RF `PlacementPolicy`, so the reconciler replaces
+    a `Down` replica with an Active spare; a per-node **join-host loop** stands up an
+    empty co-resident group on a node newly placed in `tablets[t].replicas`
+    (gated on `epoch > INITIAL` so it never starts a fresh *split* child empty) and the
+    leader catches it up via `InstallSnapshot`. So a killed replica is auto-replaced
+    end to end. `animusd/tests/cp_reconfigure.rs::failure_auto_replaces_replica_onto_spare`.
+  - ✅ **Cross-process split-trigger routing (D2).** The split works from any node:
+    `SplitTablet` metadata relays to the control leader (it is now relayable), and the
+    data-plane `propose_split` routes by **tablet id** to the CP leader's node,
+    forwarding a one-hop `CpSplit` if they differ.
+    `animusd/tests/cp_split.rs::split_triggered_from_a_non_leader_node`.
+  - ✅ **Deep splits (D3).** Every group (bootstrap, split child, re-hosted, joined)
+    carries a split hook of its own, and member ids derive **flatly** from the base id
+    (`cp_member_id`, matching `cp_members_for` at any depth), so a split-created tablet
+    can be split again — auto-sharding keeps working as a shard grows.
+    `animusd/tests/cp_deep_split.rs::a_split_tablet_can_be_split_again`.
+  - **Small remainder:** new-group ids are still derived (`base + tablet*STRIDE`)
+    rather than control-plane-allocated — fine for realistic clusters (distinct tablet
+    ids + a wide stride don't collide), a flat allocator is a later refinement;
+    `Metadata.tablets[new].replicas` stays in stable base ids and the data plane
+    translates per tablet (`cp_members_for`) rather than the map being reconciled to
+    derived ids.
 - **Next ADR — cross-tablet transactions** (2PC over the groups + HLC; or Accord
   atop them).
 

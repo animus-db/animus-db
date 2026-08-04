@@ -338,6 +338,25 @@ cross-cutting ones. Prune/merge entries that become obsolete.
   CI job, not per-push. (ADR 0014 coverage-expansion increment.)
 
 ### Code patterns
+- **A recursive operation that "works" once may be relying on a depth-1 coincidence —
+  prove it at depth ≥ 2.** Tablet *split* worked the first time for two accidental
+  reasons that both break at depth 2: (a) only the *bootstrap* group was started with
+  a split hook, so a split-created child had no machinery to split *itself*; and (b)
+  the member-id derivation `base + tablet*STRIDE` (flat, from the node's base id)
+  equals the compounding `parent_member + tablet*STRIDE` *only* because the bootstrap
+  parent's member id == its base id — for a grandchild they diverge, and the
+  reconfigure loop (which translates the replicated base-id replica set flatly) then
+  churns forever on the mismatch. Fix recursive invariants to hold at any depth: give
+  **every** spawned instance the same machinery (a hook), and derive ids from a
+  **fixed root** (the base id), never the immediate parent. (ADR 0017 deep splits.)
+- **Distinguish "seed a fresh child" from "join an existing group empty" by a durable
+  monotonic signal, not a race.** A node *added* to a tablet's replica set by the
+  reconciler must host an **empty** group and catch up via `InstallSnapshot`; an
+  *original* replica of a fresh split must **seed** from its local handed-off data —
+  starting empty there loses data. Don't let a polling host-loop race the split hook
+  to decide which; gate on the tablet **epoch** (`INITIAL` = fresh split → leave it to
+  the hook; bumped by a reconfigure → a join → host empty). A deterministic signal
+  turns a data-loss race into a clean branch. (ADR 0017 D1 join-hosting.)
 - **Which physical engines a node hosts is *local* durable state — a marker file,
   not derivable from replicated `Metadata`.** Re-hosting a node's per-tablet CP
   groups after a restart (ADR 0017 #2) can't be driven purely off the replicated

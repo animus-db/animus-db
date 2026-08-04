@@ -101,12 +101,15 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   publish is cross-process** now: the split-seed + re-host paths publish via
   `ClientCtx::register_cp_addr`, which relays the registration to the control leader
   through `client_route` (a follower can't propose directly) — so the `ctx` is built
-  before the CP hosting block and threaded into the hook + re-host. **Still resolved
-  at start, not from a live tablet-map watch**: hosting a tablet newly *placed* on
-  this node (a join via reconfigure) and dynamic failure-driven CP reconfigure over
-  `ProdEnv` are the remaining v1 increments; the cross-process split *trigger*
-  (control leader + CP leader on different nodes) also remains — `tests/cp_rehost.rs`
-  drives the split in-process where the shared edge reaches both leaders.
+  before the CP hosting block and threaded into the hook + re-host. **Hosting is
+  driven by the tablet map too** (D1): a per-node **join-host loop** stands up an
+  *empty* co-resident group for any tablet newly *placed* on this node by the
+  reconciler (`epoch > INITIAL`, so it never starts a fresh split child empty), which
+  the leader then catches up via `InstallSnapshot` — closing the auto-replace cascade.
+  All hosting state is bundled in a **`CpHostCtx`** so every group (bootstrap, split
+  child, re-hosted, joined) carries a split hook, enabling **deep splits** (D3: a
+  split tablet can be split again); member ids derive **flatly** from the base id
+  (`cp_member_id`) at any depth.
 - **The cluster's members are the CP `raftkv` nodes, not the control ids.** The
   control ids `0..N` are only the Raft *consensus group* for metadata; `bootstrap`
   (leader-only, idempotent) registers the **raftkv ids** (`300+i`) as `Active`
@@ -125,14 +128,15 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   replicated map can stay in base ids without reconciling to derived ids, #4), and
   takes one single-server `reconfigure_step` toward it
   (`tests/cp_reconfigure.rs::cp_group_follows_tablet_replica_set`: dropping a follower
-  from the replica set reconfigures the group's voters down). **Still v0/v1 gaps:**
-  no `PlacementPolicy` is auto-attached, so the failure→placement→reconfigure
-  *cascade* isn't closed end-to-end over `ProdEnv` — removing a dead replica works,
-  but adding a *replacement* needs both a placement policy and the spare node to host
-  an (empty) co-resident group for the tablet so it can catch up via `InstallSnapshot`
-  (join-hosting). The v0 heartbeat/anti-entropy/hinted-handoff loops and the
-  `serve_replica` data role are gone; the control-plane mechanisms (failure detection,
-  placement) remain sim-proven in `animus-control`.
+  from the replica set reconfigures the group's voters down). **The full cascade is
+  closed** (D1): `bootstrap` attaches a label-free RF `PlacementPolicy`, so on a `Down`
+  replica the reconciler picks an Active spare, the spare's join-host loop stands up an
+  empty group, and the leader adds + catches it up — auto-replacing the dead replica
+  end to end (`tests/cp_reconfigure.rs::failure_auto_replaces_replica_onto_spare`). The
+  v0 heartbeat/anti-entropy/hinted-handoff loops and the `serve_replica` data role are
+  gone; the control-plane mechanisms (failure detection, placement) remain sim-proven
+  in `animus-control`. **Small remainder:** new-group ids are derived, not
+  control-plane-allocated (fine for realistic clusters).
 - **The CP group is durable by default**: each hosting node's `RaftKvNode` is
   backed by the on-disk `LsmEngine` opened over its **raftkv** `ProdEnv`
   (`StorageBackend::Lsm`), so a value acked to a client (Raft-committed + WAL-fsynced
