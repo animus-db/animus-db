@@ -4,8 +4,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working in this
 
 ## Purpose
 
-The operator/client CLI (`animus`): a thin plain-TCP client over a node's
-request/reply API. Subcommands: `status`, `put`, `get`.
+The operator/client CLI (`animus`): a thin client over a node's APIs.
+Subcommands: `status`, `put`, `get` (plain-TCP request/reply), and the `admin`
+subcommand group (ADR 0020), which speaks the node's HTTP-JSON **admin** endpoint
+on its admin address and prints the JSON response.
 
 ## What's non-obvious
 
@@ -15,9 +17,15 @@ request/reply API. Subcommands: `status`, `put`, `get`.
   a node's client address, sends one framed request, and reads one framed reply.
 - `<node-addr>` is any node's client address (as printed by `animusd --cluster`).
   Server-side coordination means any node can serve any key.
-- Operator commands beyond status/put/get (membership changes, explicit
-  split/merge) are future work; the node would expose them as new
-  `ClientRequest` variants.
+- The `admin` subcommand group (`animus admin <sub> <admin-addr> [args]`) is a
+  separate transport: a minimal hand-rolled HTTP/1.0 client (`http_call`) against
+  the node's **admin** address, not the plain-TCP `ClientRequest` API. Subcommands:
+  `config|status|raft|raftkv|metrics|health`, `lsm|wal [tablet]`,
+  `wal-segment <seg> [tablet]`, `key <key> [tablet]`, and the actions
+  `split|flush|compact|reconfigure|drain`. It prints the server's JSON verbatim
+  (the server pretty-prints) and exits non-zero on a non-2xx status. Metrics/storage
+  views are **per node** (a follower's leader-only counters are 0) — point them at
+  the relevant node.
 
 ## Tests
 

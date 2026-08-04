@@ -71,14 +71,15 @@ async fn propose_on_leader(nodes: &[Node], command: MetaCommand) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn cp_op_on_a_non_leader_node_is_forwarded_to_the_leader() {
     let n = 3;
-    let addrs = free_addrs(n * 5);
+    let addrs = free_addrs(n * 6);
     let nodes_cfg: Vec<animusd::RoleAddrs> = (0..n)
         .map(|i| animusd::RoleAddrs {
-            control: addrs[5 * i],
-            client: addrs[5 * i + 1],
-            dynamo: addrs[5 * i + 2],
-            cql: addrs[5 * i + 3],
-            raftkv: addrs[5 * i + 4],
+            control: addrs[6 * i],
+            client: addrs[6 * i + 1],
+            dynamo: addrs[6 * i + 2],
+            cql: addrs[6 * i + 3],
+            raftkv: addrs[6 * i + 4],
+            admin: addrs[6 * i + 5],
         })
         .collect();
     let config = animusd::ClusterConfig { nodes: nodes_cfg };

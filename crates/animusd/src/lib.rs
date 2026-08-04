@@ -39,13 +39,15 @@ pub use animus_control::{
     ColumnType, MetaCommand, Metadata, NodeStatus, ReplicationMode, TableSchema,
 };
 
+mod admin;
 mod cql;
 mod dynamo;
+mod http;
 
 use animus_control::{ProposeResult, RaftNode};
 use animus_cp_data::{RaftKvNode, SplitHook};
 use animus_env::{Coresident, Env, Metric, MetricsHandle, NodeId, ProdEnv};
-use animus_storage::{LsmEngine, MemoryEngine};
+use animus_storage::{LsmEngine, MemoryEngine, SsTableView, WalRecordView};
 use animus_tablet::{KeyRange, TabletId};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -153,6 +155,120 @@ impl CpGroup {
         match self {
             CpGroup::Lsm(n) => n.range_snapshot(&[]).await,
             CpGroup::Mem(n) => n.range_snapshot(&[]).await,
+        }
+    }
+
+    // ---- admin / debug introspection (ADR 0020) -------------------------
+
+    /// Which storage engine backs this group (`"lsm"` durable / `"memory"`).
+    fn backend_name(&self) -> &'static str {
+        match self {
+            CpGroup::Lsm(_) => "lsm",
+            CpGroup::Mem(_) => "memory",
+        }
+    }
+
+    /// This group's Raft state for the `/admin/raftkv` view. The two engine arms
+    /// call the identical `RaftKvNode` accessors, so a local macro keeps it DRY.
+    fn raft_view(&self, tablet: TabletId) -> admin::CpRaftView {
+        macro_rules! view {
+            ($n:expr) => {
+                admin::CpRaftView {
+                    tablet: tablet.0,
+                    backend: self.backend_name(),
+                    role: format!("{:?}", $n.role()),
+                    is_leader: $n.is_leader(),
+                    leader: $n.leader(),
+                    term: $n.term(),
+                    commit_index: $n.commit_index(),
+                    last_applied: $n.last_applied(),
+                    durable_index: $n.durable_index(),
+                    snapshot_index: $n.snapshot_index(),
+                    log_len: $n.log_len(),
+                    voters: $n.config().into_iter().collect(),
+                }
+            };
+        }
+        match self {
+            CpGroup::Lsm(n) => view!(n),
+            CpGroup::Mem(n) => view!(n),
+        }
+    }
+
+    /// Live SSTable views, or `None` on the volatile memory backend (no SSTables).
+    fn lsm_sstables(&self) -> Option<Vec<SsTableView>> {
+        match self {
+            CpGroup::Lsm(n) => Some(n.storage().sstable_views()),
+            CpGroup::Mem(_) => None,
+        }
+    }
+
+    /// `(memtable key count, approx bytes)`, or `None` on the memory backend.
+    fn lsm_memtable(&self) -> Option<(usize, usize)> {
+        match self {
+            CpGroup::Lsm(n) => Some((n.storage().memtable_len(), n.storage().memtable_bytes())),
+            CpGroup::Mem(_) => None,
+        }
+    }
+
+    /// Live WAL segments + byte sizes, or `None` on the memory backend.
+    async fn wal_segment_sizes(&self) -> Option<Vec<(u64, u64)>> {
+        match self {
+            CpGroup::Lsm(n) => Some(n.storage().wal_segment_sizes().await),
+            CpGroup::Mem(_) => None,
+        }
+    }
+
+    /// `(durable_seq, rotation_count)`, or `None` on the memory backend.
+    fn wal_stats(&self) -> Option<(u64, u64)> {
+        match self {
+            CpGroup::Lsm(n) => Some((
+                n.storage().wal_durable_seq(),
+                n.storage().wal_rotation_count(),
+            )),
+            CpGroup::Mem(_) => None,
+        }
+    }
+
+    /// Decoded records of WAL segment `seg`, or `None` on the memory backend.
+    async fn wal_records(&self, seg: u64) -> Option<Vec<WalRecordView>> {
+        match self {
+            CpGroup::Lsm(n) => Some(n.storage().wal_segment_records(seg).await),
+            CpGroup::Mem(_) => None,
+        }
+    }
+
+    /// Every on-disk `(version, is_tombstone)` for `key`, or `None` on memory.
+    async fn disk_versions(&self, key: &[u8]) -> Option<Vec<(u64, bool)>> {
+        match self {
+            CpGroup::Lsm(n) => Some(n.storage().test_disk_versions_of(key).await),
+            CpGroup::Mem(_) => None,
+        }
+    }
+
+    /// **Admin action:** force a flush+compaction (LSM only); `None` on memory.
+    async fn flush_now(&self) -> Option<Result<(), String>> {
+        match self {
+            CpGroup::Lsm(n) => Some(n.storage().flush_now().await.map_err(|e| e.to_string())),
+            CpGroup::Mem(_) => None,
+        }
+    }
+
+    /// **Admin action:** force a compaction pass (LSM only); `None` on memory.
+    async fn compact_now(&self) -> Option<Result<(), String>> {
+        match self {
+            CpGroup::Lsm(n) => Some(n.storage().compact_now().await.map_err(|e| e.to_string())),
+            CpGroup::Mem(_) => None,
+        }
+    }
+
+    /// **Admin action:** take one single-server reconfigure step toward `desired`
+    /// (the `change_membership` contract), returning the voter set it proposed, or
+    /// `None` if no step is needed / this node isn't the leader.
+    fn reconfigure_step(&self, desired: &BTreeSet<NodeId>) -> Option<BTreeSet<NodeId>> {
+        match self {
+            CpGroup::Lsm(n) => n.reconfigure_step(desired),
+            CpGroup::Mem(n) => n.reconfigure_step(desired),
         }
     }
 }
@@ -340,6 +456,12 @@ pub struct RoleAddrs {
     /// configs) to an ephemeral loopback port.
     #[serde(default = "default_ephemeral_addr")]
     pub raftkv: SocketAddr,
+    /// The **admin / debug** HTTP-JSON endpoint (ADR 0020) — a read-only
+    /// introspection + operator-action surface on its own port, isolated from the
+    /// client/dynamo/cql data edges. Defaults (when absent in older configs) to an
+    /// ephemeral loopback port.
+    #[serde(default = "default_ephemeral_addr")]
+    pub admin: SocketAddr,
 }
 
 /// Fallback endpoint for configs written before a field existed: an ephemeral
@@ -364,6 +486,27 @@ pub struct BoundNode {
     dynamo_addr: SocketAddr,
     cql_listener: TcpListener,
     cql_addr: SocketAddr,
+    admin_listener: TcpListener,
+    admin_addr: SocketAddr,
+}
+
+/// A node's identity + bound addresses, captured for the admin `/admin/config`
+/// view (ADR 0020). Held behind an `Arc` in [`ClientCtx`] so it is cheap to clone
+/// onto every connection. The live CP-member address map is read from replicated
+/// `Metadata` at request time, not cached here.
+pub(crate) struct AdminInfo {
+    pub(crate) control_id: NodeId,
+    pub(crate) raftkv_id: NodeId,
+    pub(crate) control_addr: SocketAddr,
+    pub(crate) raftkv_addr: SocketAddr,
+    pub(crate) client_addr: SocketAddr,
+    pub(crate) dynamo_addr: SocketAddr,
+    pub(crate) cql_addr: SocketAddr,
+    pub(crate) admin_addr: SocketAddr,
+    /// The control-plane Raft group (all control ids).
+    pub(crate) control_ids: Vec<NodeId>,
+    /// The static peer address book this node was started with.
+    pub(crate) peers: BTreeMap<NodeId, SocketAddr>,
 }
 
 impl BoundNode {
@@ -389,6 +532,11 @@ impl BoundNode {
     /// The address the CQL binary-protocol endpoint listens on.
     pub fn cql_addr(&self) -> SocketAddr {
         self.cql_addr
+    }
+
+    /// The address the admin / debug HTTP endpoint listens on (ADR 0020).
+    pub fn admin_addr(&self) -> SocketAddr {
+        self.admin_addr
     }
 
     /// Wire the peer address book into every env and start all protocols, with
@@ -448,6 +596,21 @@ impl BoundNode {
         let raftkv_hook_env = self.raftkv_env.clone();
         let my_raftkv_id = self.raftkv_id;
         let my_raftkv_addr = self.raftkv_addr;
+
+        // The node's identity + bound addresses for the admin `/admin/config`
+        // view (ADR 0020), captured before the envs are consumed below.
+        let admin_info = Arc::new(AdminInfo {
+            control_id: self.control_id,
+            raftkv_id: self.raftkv_id,
+            control_addr: self.control_addr,
+            raftkv_addr: self.raftkv_addr,
+            client_addr: self.client_addr,
+            dynamo_addr: self.dynamo_addr,
+            cql_addr: self.cql_addr,
+            admin_addr: self.admin_addr,
+            control_ids: control_ids.clone(),
+            peers: static_peers.clone(),
+        });
 
         // Keep clones of the two internal envs so [`Node::shutdown`] can abort
         // every task they own (the two Raft drivers + accept loops), freeing their
@@ -547,6 +710,7 @@ impl BoundNode {
                 edge: edge.clone(),
                 raftkv_metrics,
                 client_route: client_route.clone(),
+                admin: admin_info,
             };
             // A CP-hosting node registers its `raftkv` address in the replicated
             // Metadata (Phase 2.3a), so peer-sync on every node can reach it. The
@@ -574,6 +738,8 @@ impl BoundNode {
                 self.dynamo_listener,
                 ctx.clone(),
             )));
+            // The admin / debug HTTP-JSON endpoint on its own port (ADR 0020).
+            tasks.push(tokio::spawn(admin::serve(self.admin_listener, ctx.clone())));
             tasks.push(tokio::spawn(cql::serve(self.cql_listener, ctx)));
         }
 
@@ -584,6 +750,7 @@ impl BoundNode {
             client_addr: self.client_addr,
             dynamo_addr: self.dynamo_addr,
             cql_addr: self.cql_addr,
+            admin_addr: self.admin_addr,
         })
     }
 }
@@ -601,6 +768,7 @@ pub struct Node {
     client_addr: SocketAddr,
     dynamo_addr: SocketAddr,
     cql_addr: SocketAddr,
+    admin_addr: SocketAddr,
 }
 
 impl Node {
@@ -635,6 +803,8 @@ impl Node {
         let dynamo_addr = dynamo_listener.local_addr()?;
         let cql_listener = TcpListener::bind(addrs.cql).await?;
         let cql_addr = cql_listener.local_addr()?;
+        let admin_listener = TcpListener::bind(addrs.admin).await?;
+        let admin_addr = admin_listener.local_addr()?;
         Ok(BoundNode {
             control_id,
             raftkv_id,
@@ -648,6 +818,8 @@ impl Node {
             dynamo_addr,
             cql_listener,
             cql_addr,
+            admin_listener,
+            admin_addr,
         })
     }
 
@@ -664,6 +836,11 @@ impl Node {
     /// The address the CQL binary-protocol endpoint listens on.
     pub fn cql_addr(&self) -> SocketAddr {
         self.cql_addr
+    }
+
+    /// The address the admin / debug HTTP endpoint listens on (ADR 0020).
+    pub fn admin_addr(&self) -> SocketAddr {
+        self.admin_addr
     }
 
     /// Whether this node's control replica currently believes it is leader.
@@ -828,6 +1005,17 @@ impl ClusterEdgeState {
             .cloned()
     }
 
+    /// Every CP group this node hosts, as `(tablet, group)` pairs in tablet order
+    /// — for the admin `/admin/raftkv` view (ADR 0020). Clones the cheap handles.
+    fn hosted_groups(&self) -> Vec<(TabletId, CpGroup)> {
+        self.raftkv
+            .lock()
+            .expect("raftkv handles poisoned")
+            .iter()
+            .flat_map(|(t, groups)| groups.iter().map(move |g| (*t, g.clone())))
+            .collect()
+    }
+
     /// The control handle that currently believes it is leader, if any.
     pub(crate) fn leader_handle(&self) -> Option<RaftNode<ProdEnv>> {
         self.control
@@ -871,6 +1059,9 @@ pub(crate) struct ClientCtx {
     /// single-process `--cluster N` run (where the shared edge state already reaches
     /// every group handle in-process, so no forwarding is needed).
     client_route: BTreeMap<NodeId, SocketAddr>,
+    /// This node's identity + bound addresses for the admin `/admin/config` view
+    /// (ADR 0020). `Arc` so cloning the ctx onto each connection is cheap.
+    admin: Arc<AdminInfo>,
 }
 
 impl ClientCtx {
@@ -1239,6 +1430,56 @@ impl ClientCtx {
         out.push_str(&is_leader.to_string());
         out.push('\n');
         out
+    }
+
+    /// The same aggregated metrics as [`metrics_text`](Self::metrics_text), but as
+    /// a `(name -> value, is_leader)` pair for the admin `/admin/metrics` JSON view
+    /// (ADR 0020). Read live at call time and summed across the node's two role
+    /// sinks, exactly as the text export.
+    pub(crate) fn metrics_json(&self) -> (BTreeMap<String, u64>, i64) {
+        let snaps = [
+            self.raft.metrics().snapshot(),
+            self.raftkv_metrics.snapshot(),
+        ];
+        let mut counters: BTreeMap<String, u64> = BTreeMap::new();
+        let mut is_leader: i64 = 0;
+        for m in Metric::ALL {
+            counters.insert(m.name().to_string(), 0);
+        }
+        for snap in &snaps {
+            for (&metric, &value) in &snap.counters {
+                *counters.entry(metric.name().to_string()).or_insert(0) += value;
+            }
+            is_leader = is_leader.max(snap.is_leader);
+        }
+        (counters, is_leader)
+    }
+
+    /// **Admin action (ADR 0020):** mark `node` `Leaving` so the placement
+    /// reconciler moves its replicas off. Proposed on the **local** control leader
+    /// handle (membership commands are control-plane-internal and not relayable, so
+    /// this requires the receiving node to be the control leader; a follower
+    /// returns an error and the operator retries on the leader). Preserves the
+    /// member's existing labels. Returns the accepted state or an error.
+    pub(crate) fn admin_drain(&self, node: NodeId) -> Result<(), String> {
+        let meta = self.raft.metadata();
+        let Some(member) = meta.members.get(&node) else {
+            return Err(format!("node {node} is not a cluster member"));
+        };
+        let labels = member.labels.clone();
+        let Some(leader) = self.edge.leader_handle() else {
+            return Err("this node is not the control-plane leader; retry on the leader".into());
+        };
+        match leader.propose(MetaCommand::UpsertMember {
+            node,
+            labels,
+            status: NodeStatus::Leaving,
+        }) {
+            ProposeResult::Accepted { .. } => Ok(()),
+            ProposeResult::NotLeader { .. } => {
+                Err("control leadership moved; retry on the leader".into())
+            }
+        }
     }
 }
 
@@ -1841,6 +2082,7 @@ pub async fn bind_cluster(
             dynamo: addr(),
             cql: addr(),
             raftkv: addr(),
+            admin: addr(),
         };
         let node = Node::bind(
             config::control_id(i),

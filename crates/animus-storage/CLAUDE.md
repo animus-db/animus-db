@@ -170,7 +170,15 @@ SSTables + live WAL segments), and a crash mid-rotation recovering correctly
 `reset_block_reads`/`level_table_counts`/`levels_non_overlapping`/
 `wal_segment_count`/`wal_segments`/`wal_batch_sync_count`/
 `test_write_orphan_sstable`/`test_write_orphan_wal_segment`/`test_disk_versions_of`
-introspection helpers for these tests. `lsm_gc.rs` covers tombstone GC: an aged
+introspection helpers for these tests. It also exposes a **documented** read-only
+introspection API for the admin/debug interface (ADR 0020, consumed by `animusd`):
+`sstable_views()` (a lean `SsTableView` per live table — key/version range, size,
+level, bloom), `memtable_len`/`memtable_bytes`, `wal_segment_sizes`/
+`wal_durable_seq`/`wal_rotation_count`, and `wal_segment_records(seg)` (decoded
+`WalRecordView`s via the existing `decode_wal`); plus the **admin actions**
+`flush_now`/`compact_now` (force a flush+compaction / a compaction pass — `flush_now`
+keeps the `applies_in_flight == 0` WAL-GC invariant). Pure reads or explicit
+actions; they record nothing and change no engine behavior. `lsm_gc.rs` covers tombstone GC: an aged
 tombstone (and its shadowed value) is physically reclaimed while a within-grace
 tombstone is preserved, and GC never resurrects a key with a deeper old value.
 

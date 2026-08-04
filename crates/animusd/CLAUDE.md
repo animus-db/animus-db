@@ -13,7 +13,7 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
 - `Node::bind` → `BoundNode::start` — two-phase construction (bind listeners,
   then install the peer address book and start protocols), so a cluster can use
   ephemeral ports and exchange addresses afterward.
-- `config::ClusterConfig` — the per-process deployment config (every node's five
+- `config::ClusterConfig` — the per-process deployment config (every node's six
   addresses). Node ids follow a fixed convention from the index (control `i`,
   raftkv `300+i`) so processes agree without listing ids. `run_node(config, index,
   dir)` binds *this* node and starts it.
@@ -26,7 +26,13 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   AttributeValue-JSON via `animus_dynamo::wire`, then routes through the **same
   `ClientCtx`** as the plain-TCP API. v1 (ADR 0019): reads/writes/scans go to the
   **CP plane** (`ClientCtx::cp_read`/`cp_write`/`cp_scan`), not the AP coordinator.
-- `cql` module — the **CQL (Cassandra) v4 binary-protocol endpoint** (a sixth
+- `admin` module — the **admin / debug HTTP-JSON endpoint** (ADR 0020), a dedicated
+  sixth listener (`RoleAddrs.admin`). Read-only introspection (config, status, both
+  Raft layers, LSM/WAL debug, metrics, health) + gated operator actions
+  (split/flush/compact/reconfigure/drain). `http` module — the shared hand-rolled
+  HTTP/1.1 helpers (request parser + response writers) used by both `dynamo` and
+  `admin`.
+- `cql` module — the **CQL (Cassandra) v4 binary-protocol endpoint** (a
   listener per node). A hand-rolled framed server does the `STARTUP → READY` /
   `OPTIONS → SUPPORTED` handshake and runs `QUERY`/`PREPARE`/`EXECUTE` via the
   pure `animus_cql` crate (a typed `CREATE KEYSPACE`/`USE`/`CREATE TABLE` schema
@@ -48,8 +54,8 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
 - A node runs **two internal `ProdEnv` roles on distinct ids/ports** — control
   (Raft metadata, id `i`) and **raftkv** (the leaderful **CP** per-tablet Raft
   group, `300+i`, ADR 0017 #3a — the v1 data plane) — because one inbox is
-  single-consumer. `ClusterConfig` assigns five consecutive ports per node (the two
-  internal roles + client/dynamo/cql). v1 (ADR 0019) is **CP-only**: the leaderless
+  single-consumer. `ClusterConfig` assigns **six** consecutive ports per node (the two
+  internal roles + client/dynamo/cql/**admin**, the admin port being ADR 0020). v1 (ADR 0019) is **CP-only**: the leaderless
   AP `data`/`coord` roles, `serve_replica`, anti-entropy, and hinted handoff are
   gone. The **client API is a plain request/reply TCP server**, *not* on the
   `Network`: a node that does not host the CP group leader **forwards** a data op to
@@ -167,8 +173,33 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   - The **prepared-statement id is content-addressed** — a stable hash of the
     statement text (FNV-1a, no RNG so the edge stays deterministic) — so `PREPARE`
     on one connection and `EXECUTE` on another resolve to the same statement.
+- **A dedicated admin / debug HTTP-JSON endpoint** (`RoleAddrs.admin`,
+  `Node::admin_addr`, ADR 0020) — a **sixth** per-node listener, isolated from the
+  client/dynamo/cql data edges. A production-only I/O edge in `admin.rs` (real
+  tokio sockets + the shared hand-rolled HTTP helpers extracted to `http.rs`, now
+  shared with `dynamo.rs`). Read-only `GET` views — `/admin/{config,status,raft,
+  raftkv,storage/lsm,storage/wal,storage/wal/segment,storage/key,metrics,health}`
+  — plus gated `POST` actions — `/admin/{tablet/split,storage/flush,storage/compact,
+  raftkv/reconfigure,drain}`. Below the edge it only **reads** node state
+  (control + CP Raft accessors, `LsmEngine` introspection: `sstable_views`/
+  `wal_segment_*`/`memtable_*`, the `CpGroup` introspection passthroughs) aggregated
+  live at request time, or drives an explicit action; node identity for `/admin/config`
+  is captured into `ClientCtx.admin` (an `AdminInfo`). **No auth yet** — bind it to a
+  trusted interface. The `animus admin <subcommand>` CLI consumes it.
+  - **Gotcha — `/admin/raftkv` is node-local, but in a single `--cluster N` process
+    the shared `ClusterEdgeState` registers *every* node's CP group handle, so one
+    node's view lists all replicas; a one-process-per-node deployment (separate edge
+    each) shows just the local group.** A storage route resolves the tablet's *local*
+    handle (`edge.local_cp`), so `--cluster` mode targets the first-registered
+    replica's engine, not necessarily this node's — scrape per-process for true
+    node-local storage debug (`tests/admin_endpoint.rs` uses `run_node` per node).
+  - **Metrics are per-node sinks**: a follower's leader-only counters
+    (`elections_won`, `append_entries_sent`) are legitimately 0, so `/admin/metrics`
+    (and `/metrics`) is meaningful **per node** — scrape the control leader for the
+    leader-only counters (the test asserts election counters only on the leader).
 - **A `GET /metrics` admin route shares the DynamoDB HTTP listener** (ADR 0015) —
-  no seventh port or `RoleAddrs` field. The DynamoDB edge's request parser now
+  the line-oriented metrics export stays on the dynamo port (the dedicated admin
+  port above serves the richer JSON surface, incl. `/admin/metrics`). The DynamoDB edge's request parser now
   captures the request method + path; a `GET /metrics` is answered with the
   text-format snapshot as `text/plain` (everything else is the existing
   `POST /` + `X-Amz-Target` DynamoDB protocol). The body is **aggregated across the
@@ -206,10 +237,10 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   `ClusterEdgeState::{leader_handle, propose_on_leaders}`; reads/writes resolve
   the table schema from this node's own replicated `Metadata`.
 - **`Node::shutdown()` is a graceful teardown**: it aborts the node's
-  client-facing listener tasks (client/dynamo/cql, on plain `tokio::spawn`) and
+  client-facing listener tasks (client/dynamo/cql/admin, on plain `tokio::spawn`) and
   calls `ProdEnv::shutdown()` on each of the two internal role envs (control +
   raftkv), which aborts every task they own (the two Raft drivers + internal accept
-  loops). This frees all five listener ports so a replacement node can rebind the
+  loops). This frees all six listener ports so a replacement node can rebind the
   same addresses on the same data dir — the clean teardown a stopped OS process
   would provide. On-disk state is untouched (a value acked to a client was Raft-
   committed + WAL-fsynced before the ack, so it survives). Wired to the Ctrl-C path
@@ -234,7 +265,12 @@ backend), `tests/metrics_endpoint.rs` (the admin `GET /metrics` HTTP route, ADR 
 export with `control_elections_won >= 1` and `control_is_leader 1` on the leader /
 `0` on a follower), `tests/cp_plane.rs` (CP round-trip: write via one node, read via
 another — the CP group is the single source of truth), `tests/cp_cross_process.rs`
-(cross-process CP forwarding to the leader's node), and `tests/self_heal.rs` (a
+(cross-process CP forwarding to the leader's node), `tests/admin_endpoint.rs` (the
+admin / debug interface, ADR 0020: a per-process 3-node cluster, then the read-only
+views config/status/raft/raftkv/storage·wal/metrics/health over the dedicated admin
+port + the `storage/flush` action observed via `storage/lsm`; metrics asserted on
+the control leader since sinks are per-node; bring-up wrapped in the port-TOCTOU
+retry), and `tests/self_heal.rs` (a
 concurrent-client smoke test that the assembled node does not deadlock under load).
 All use real TCP/time, so they poll with timeouts, not deterministic assertions. The restart test runs both incarnations in the **same** runtime,
 calling `Node::shutdown()` between them to abort the node's detached tasks and
@@ -252,4 +288,9 @@ animus status <node-0 client addr>
 curl -s <dynamo addr>/ \
   -H 'X-Amz-Target: DynamoDB_20120810.PutItem' \
   -d '{"TableName":"t","Item":{"pk":{"S":"a"},"v":{"N":"1"}}}'
+# and an admin / debug endpoint (ADR 0020) — read-only introspection + actions:
+curl -s <admin addr>/admin/status        # full cluster metadata
+curl -s <admin addr>/admin/raftkv        # per-tablet CP group Raft state
+curl -s '<admin addr>/admin/storage/wal/segment?tablet=1&seg=0'  # decoded WAL
+animus admin status <admin addr>         # same, via the CLI
 ```

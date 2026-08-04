@@ -44,20 +44,22 @@ pub struct ClusterConfig {
 }
 
 impl ClusterConfig {
-    /// Generate a config for `n` nodes on `host`, assigning each node five
+    /// Generate a config for `n` nodes on `host`, assigning each node six
     /// consecutive ports starting at `base_port` (node `i` uses
-    /// `base_port + 5*i .. +5`): control, client, dynamo, cql, raftkv.
+    /// `base_port + 6*i .. +6`): control, client, dynamo, cql, raftkv, admin
+    /// (the admin/debug interface, ADR 0020).
     #[must_use]
     pub fn generate(n: usize, host: IpAddr, base_port: u16) -> Self {
         let nodes = (0..n)
             .map(|i| {
-                let p = |role: u16| SocketAddr::new(host, base_port + (i as u16) * 5 + role);
+                let p = |role: u16| SocketAddr::new(host, base_port + (i as u16) * 6 + role);
                 RoleAddrs {
                     control: p(0),
                     client: p(1),
                     dynamo: p(2),
                     cql: p(3),
                     raftkv: p(4),
+                    admin: p(5),
                 }
             })
             .collect();
@@ -133,8 +135,9 @@ mod tests {
         assert_eq!(cfg.nodes[0].dynamo.port(), 7002);
         assert_eq!(cfg.nodes[0].cql.port(), 7003);
         assert_eq!(cfg.nodes[0].raftkv.port(), 7004);
-        assert_eq!(cfg.nodes[1].control.port(), 7005);
-        assert_eq!(cfg.nodes[2].raftkv.port(), 7014);
+        assert_eq!(cfg.nodes[0].admin.port(), 7005);
+        assert_eq!(cfg.nodes[1].control.port(), 7006);
+        assert_eq!(cfg.nodes[2].raftkv.port(), 7016);
     }
 
     #[test]
@@ -147,14 +150,15 @@ mod tests {
             "3 nodes x 2 internal roles (control + raftkv)"
         );
         // Conventional ids resolve to the right ports.
-        assert_eq!(book[&control_id(1)].port(), 7005);
+        assert_eq!(book[&control_id(1)].port(), 7006);
         assert_eq!(book[&raftkv_id(0)].port(), 7004);
-        assert_eq!(book[&raftkv_id(2)].port(), 7014);
-        // Client / dynamo / cql addresses are intentionally absent from the
-        // internal book (they are external client channels, not the network).
+        assert_eq!(book[&raftkv_id(2)].port(), 7016);
+        // Client / dynamo / cql / admin addresses are intentionally absent from
+        // the internal book (they are external client channels, not the network).
         assert!(!book.values().any(|a| a.port() == 7001)); // client (node 0)
         assert!(!book.values().any(|a| a.port() == 7002)); // dynamo (node 0)
         assert!(!book.values().any(|a| a.port() == 7003)); // cql (node 0)
+        assert!(!book.values().any(|a| a.port() == 7005)); // admin (node 0)
     }
 
     #[test]

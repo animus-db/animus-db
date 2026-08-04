@@ -23,7 +23,7 @@
 mod lsm;
 mod memory;
 
-pub use lsm::{LsmEngine, LsmOptions, LsmSnapshot};
+pub use lsm::{LsmEngine, LsmOptions, LsmSnapshot, SsTableView, WalRecordView};
 pub use memory::{MemoryEngine, MemorySnapshot};
 
 /// A storage key.

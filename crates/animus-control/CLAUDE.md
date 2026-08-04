@@ -65,7 +65,10 @@ epoch compare-and-swap transactions.
   control group. The driver records control-plane **metrics** (ADR 0015) via
   `record_outbound`/`record_transition` and the `detect_loop` propose path;
   `RaftNode::metrics()` exposes the handle and `start_with_metrics` lets a caller
-  supply the sink.
+  supply the sink. `RaftNode` also has read-only state accessors used by the
+  `animusd` admin interface (ADR 0020): `role`/`term`/`leader`/`is_leader`/
+  `commit_index`/`last_applied`/`durable_index`/`snapshot_index`/`log_len`/
+  `last_log_index`/`config` (thin locks over the same-named `RaftCore` reads).
 - `detector.rs` — `FailureDetector` (ADR 0012): a **pure**, unit-tested
   interval+timeout liveness detector — last-heartbeat instants + `now` + a
   `timeout` decide alive/dead. No clock, no RNG.

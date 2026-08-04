@@ -62,7 +62,7 @@ fn fixed_addrs(count: usize) -> Vec<SocketAddr> {
 /// A single-node config pinned to fixed addresses, so the same config can start,
 /// stop, and restart the same node.
 fn single_node_config() -> ClusterConfig {
-    let a = fixed_addrs(5);
+    let a = fixed_addrs(6);
     ClusterConfig {
         nodes: vec![RoleAddrs {
             control: a[0],
@@ -70,6 +70,7 @@ fn single_node_config() -> ClusterConfig {
             dynamo: a[2],
             cql: a[3],
             raftkv: a[4],
+            admin: a[5],
         }],
     }
 }

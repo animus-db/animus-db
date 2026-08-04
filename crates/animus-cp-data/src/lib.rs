@@ -558,6 +558,54 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         &self.env
     }
 
+    /// This node's backing storage engine — for admin/debug introspection of the
+    /// CP group's on-disk state (ADR 0020). Read-only access to the concrete
+    /// engine (e.g. `LsmEngine`) so the assembly layer can surface SSTable/WAL
+    /// debug views without the engine state leaking into the consensus core.
+    pub fn storage(&self) -> &S {
+        &self.storage
+    }
+
+    // ---- admin / debug introspection (ADR 0020) -------------------------
+    // Read-only projections of this group's Raft state, mirroring the control
+    // plane's `RaftNode` accessors. Each takes the core lock briefly and returns
+    // a copy; no mutation.
+
+    /// This node's current Raft role in the group.
+    pub fn role(&self) -> animus_control::Role {
+        self.lock().role()
+    }
+
+    /// The group's current Raft term.
+    pub fn term(&self) -> u64 {
+        self.lock().term()
+    }
+
+    /// Highest committed log index.
+    pub fn commit_index(&self) -> u64 {
+        self.lock().commit_index()
+    }
+
+    /// Highest applied log index (the MVCC version high-water mark).
+    pub fn last_applied(&self) -> u64 {
+        self.lock().last_applied()
+    }
+
+    /// Highest log index known durable on disk (durable-before-visible frontier).
+    pub fn durable_index(&self) -> u64 {
+        self.lock().durable_index()
+    }
+
+    /// The current snapshot base index (0 if none taken).
+    pub fn snapshot_index(&self) -> u64 {
+        self.lock().snapshot_index()
+    }
+
+    /// Number of log entries currently retained (the tail after the snapshot).
+    pub fn log_len(&self) -> usize {
+        self.lock().log_len()
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, KvCore> {
         self.core.lock().expect("raftkv core poisoned")
     }

@@ -35,6 +35,11 @@ the engine — the `AccordCore` sync-core/async-driver split.
   expected, value) -> Option<bool>` is the all-in-one (propose on the leader, wait
   for the entry to apply, return the recorded outcome — `None` if not leader / times
   out). All public-additively; existing signatures unchanged.
+- **Admin/debug accessors** (ADR 0020, consumed by `animusd`): read-only
+  `role`/`term`/`commit_index`/`last_applied`/`durable_index`/`snapshot_index`/
+  `log_len` (thin locks over `RaftCore`), and `storage()` (a `&S` borrow so the
+  assembly layer can surface the engine's SSTable/WAL debug views without engine
+  state leaking into the consensus core).
 - `KvWire` — the data-plane wire enum wrapping `RaftMsg` plus the ReadIndex
   read-barrier probes (`ReadProbe`/`ReadProbeAck`). The probes are driver-only, so
   ReadIndex lives entirely in this crate and the shared `RaftCore`/`RaftMsg` are

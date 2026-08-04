@@ -201,6 +201,33 @@ impl<E: Env> RaftNode<E> {
         self.lock().snapshot_index()
     }
 
+    /// Highest applied log index. With the leader's role-aware apply gate this is
+    /// `min(commit_index, durable_index)` on the leader (ADR 0009).
+    pub fn last_applied(&self) -> u64 {
+        self.lock().last_applied()
+    }
+
+    /// Highest log index known durable on disk (the durable-before-visible
+    /// frontier, ADR 0009).
+    pub fn durable_index(&self) -> u64 {
+        self.lock().durable_index()
+    }
+
+    /// Number of log entries currently retained (the tail after the snapshot).
+    pub fn log_len(&self) -> usize {
+        self.lock().log_len()
+    }
+
+    /// Index of the last log entry (the snapshot base if the tail is empty).
+    pub fn last_log_index(&self) -> u64 {
+        self.lock().last_log_index()
+    }
+
+    /// The active voter configuration (the control group's membership).
+    pub fn config(&self) -> std::collections::BTreeSet<NodeId> {
+        self.lock().config()
+    }
+
     /// Whether this node's failure detector currently judges `member` alive
     /// (a heartbeat seen within the timeout). Observability for tests; the
     /// authoritative liveness lives in the replicated `Metadata` status, which

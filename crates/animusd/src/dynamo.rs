@@ -109,10 +109,10 @@ use animus_dynamo::{
     AttributeValue, ConditionExpression, Item, SortKeyCondition, TableSchema,
     schema as schema_bridge, storage_key,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::ClientCtx;
+use crate::http;
 
 /// How long `CreateTable` waits for its `CreateTableSchema` proposal to commit in
 /// the replicated catalog before giving up.
@@ -205,8 +205,6 @@ fn resolve_key(
         .expect("registry poisoned");
     reg.extract_key(table, item).map_err(registry_error)
 }
-/// Cap on a request body, so a malformed `Content-Length` can't exhaust memory.
-const MAX_BODY: usize = 1 << 20;
 
 /// Accept loop for the DynamoDB HTTP endpoint. Each connection is handled on its
 /// own task; HTTP/1.1 keep-alive lets a client reuse the connection.
@@ -232,24 +230,24 @@ pub(crate) async fn serve(listener: TcpListener, ctx: ClientCtx) {
 async fn handle_conn(mut stream: TcpStream, ctx: ClientCtx) -> std::io::Result<()> {
     let mut buf = Vec::new();
     loop {
-        let Some(request) = read_http_request(&mut stream, &mut buf).await? else {
+        let Some(request) = http::read_http_request(&mut stream, &mut buf).await? else {
             return Ok(()); // clean EOF
         };
         let keep_alive = request.keep_alive;
-        // The admin `/metrics` route (ADR 0015) shares this HTTP listener — the
-        // node's only HTTP edge — rather than opening a seventh port. It is a
-        // plain `GET` returning the text-format snapshot, distinct from the
-        // DynamoDB `POST /` + `X-Amz-Target` protocol.
+        // The `/metrics` route (ADR 0015) shares this listener — a plain `GET`
+        // returning the text-format snapshot, distinct from the DynamoDB
+        // `POST /` + `X-Amz-Target` protocol. (The richer admin interface lives
+        // on its own dedicated port, ADR 0020.)
         if request.method.eq_ignore_ascii_case("GET") && request.path == "/metrics" {
             let body = ctx.metrics_text();
-            write_text_response(&mut stream, 200, &body, keep_alive).await?;
+            http::write_text_response(&mut stream, 200, &body, keep_alive).await?;
             if !keep_alive {
                 return Ok(());
             }
             continue;
         }
         let (status, body) = dispatch(&ctx, &request).await;
-        write_http_response(&mut stream, status, &body, keep_alive).await?;
+        http::write_amz_json_response(&mut stream, status, &body, keep_alive).await?;
         if !keep_alive {
             // The client asked us to close (HTTP/1.0 default, or an explicit
             // `Connection: close`). Returning drops the stream, closing the
@@ -259,116 +257,8 @@ async fn handle_conn(mut stream: TcpStream, ctx: ClientCtx) -> std::io::Result<(
     }
 }
 
-/// A parsed HTTP request: the method and path (request line), the
-/// `X-Amz-Target` header value, the body bytes, and whether the client wants the
-/// connection kept alive.
-struct HttpRequest {
-    method: String,
-    path: String,
-    target: String,
-    body: Vec<u8>,
-    keep_alive: bool,
-}
-
-/// Read one HTTP/1.1 request from `stream`, buffering into `buf` (which may
-/// already hold bytes of the next pipelined request). Returns `None` at clean
-/// EOF before any bytes of a new request.
-async fn read_http_request(
-    stream: &mut TcpStream,
-    buf: &mut Vec<u8>,
-) -> std::io::Result<Option<HttpRequest>> {
-    // Read until we have the full header block (terminated by CRLFCRLF).
-    let header_end = loop {
-        if let Some(pos) = find_subslice(buf, b"\r\n\r\n") {
-            break pos + 4;
-        }
-        let mut chunk = [0u8; 4096];
-        let n = stream.read(&mut chunk).await?;
-        if n == 0 {
-            return if buf.is_empty() {
-                Ok(None)
-            } else {
-                Err(eof("connection closed mid-request"))
-            };
-        }
-        buf.extend_from_slice(&chunk[..n]);
-        if buf.len() > MAX_BODY {
-            return Err(eof("request headers too large"));
-        }
-    };
-
-    let header_text = String::from_utf8_lossy(&buf[..header_end]).into_owned();
-    let mut lines = header_text.split("\r\n");
-    // HTTP/1.1 defaults to keep-alive; HTTP/1.0 defaults to close. An explicit
-    // `Connection` header overrides either way.
-    let request_line = lines.next().unwrap_or("");
-    // Request line: `METHOD SP request-target SP HTTP-version`.
-    let mut request_parts = request_line.split_whitespace();
-    let method = request_parts.next().unwrap_or("").to_owned();
-    let path = request_parts.next().unwrap_or("").to_owned();
-    let mut keep_alive = request_line.contains("HTTP/1.1");
-    let mut target = String::new();
-    let mut content_length = 0usize;
-    for line in lines {
-        if let Some((name, value)) = line.split_once(':') {
-            let name = name.trim().to_ascii_lowercase();
-            let value = value.trim();
-            match name.as_str() {
-                "x-amz-target" => target = value.to_owned(),
-                "content-length" => {
-                    content_length = value.parse().map_err(|_| eof("invalid Content-Length"))?;
-                }
-                "connection" => {
-                    let v = value.to_ascii_lowercase();
-                    if v.contains("close") {
-                        keep_alive = false;
-                    } else if v.contains("keep-alive") {
-                        keep_alive = true;
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    if content_length > MAX_BODY {
-        return Err(eof("request body too large"));
-    }
-
-    // Read the body (some of which may already be buffered).
-    let mut body_buf = buf.split_off(header_end);
-    while body_buf.len() < content_length {
-        let mut chunk = [0u8; 4096];
-        let n = stream.read(&mut chunk).await?;
-        if n == 0 {
-            return Err(eof("connection closed mid-body"));
-        }
-        body_buf.extend_from_slice(&chunk[..n]);
-    }
-    // Any surplus belongs to the next pipelined request.
-    let leftover = body_buf.split_off(content_length);
-    *buf = leftover;
-
-    Ok(Some(HttpRequest {
-        method,
-        path,
-        target,
-        body: body_buf,
-        keep_alive,
-    }))
-}
-
-fn eof(msg: &str) -> std::io::Error {
-    std::io::Error::new(std::io::ErrorKind::InvalidData, msg.to_string())
-}
-
-fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
-}
-
 /// Dispatch a decoded request, returning the HTTP status code and JSON body.
-async fn dispatch(ctx: &ClientCtx, request: &HttpRequest) -> (u16, String) {
+async fn dispatch(ctx: &ClientCtx, request: &http::HttpRequest) -> (u16, String) {
     match wire::decode_request(&request.target, &request.body) {
         Ok(op) => match run_operation(ctx, op).await {
             Ok(body) => (200, body),
@@ -1146,55 +1036,4 @@ fn internal(message: &str) -> WireError {
         code: "InternalServerError",
         message: message.to_owned(),
     }
-}
-
-/// Write a minimal HTTP/1.1 response with a JSON body. The `Connection` header
-/// echoes the client's keep-alive choice so a `Connection: close` client (which
-/// then reads to EOF) is unblocked by the socket closing.
-async fn write_http_response(
-    stream: &mut TcpStream,
-    status: u16,
-    body: &str,
-    keep_alive: bool,
-) -> std::io::Result<()> {
-    let reason = match status {
-        200 => "OK",
-        400 => "Bad Request",
-        500 => "Internal Server Error",
-        _ => "Status",
-    };
-    let connection = if keep_alive { "keep-alive" } else { "close" };
-    let response = format!(
-        "HTTP/1.1 {status} {reason}\r\n\
-         Content-Type: application/x-amz-json-1.0\r\n\
-         Content-Length: {}\r\n\
-         Connection: {connection}\r\n\
-         \r\n\
-         {body}",
-        body.len(),
-    );
-    stream.write_all(response.as_bytes()).await?;
-    stream.flush().await
-}
-
-/// Write a `text/plain` response — used by the admin `/metrics` route (ADR 0015),
-/// whose body is the line-oriented metrics export, not DynamoDB JSON.
-async fn write_text_response(
-    stream: &mut TcpStream,
-    status: u16,
-    body: &str,
-    keep_alive: bool,
-) -> std::io::Result<()> {
-    let connection = if keep_alive { "keep-alive" } else { "close" };
-    let response = format!(
-        "HTTP/1.1 {status} OK\r\n\
-         Content-Type: text/plain; charset=utf-8\r\n\
-         Content-Length: {}\r\n\
-         Connection: {connection}\r\n\
-         \r\n\
-         {body}",
-        body.len(),
-    );
-    stream.write_all(response.as_bytes()).await?;
-    stream.flush().await
 }

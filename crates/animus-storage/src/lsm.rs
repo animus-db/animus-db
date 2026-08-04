@@ -1243,6 +1243,210 @@ impl<E: Env> LsmEngine<E> {
         let _ = self.env.append(&file, bytes).await;
         let _ = self.env.sync(&file).await;
     }
+
+    // ---- admin / debug introspection (ADR 0020) -------------------------
+    // Read-only projections of LSM + WAL state for the admin interface. Pure
+    // reads — a brief lock taken and dropped, or a file size/read through the
+    // `Env` disk seam; they never mutate engine state (the observe-only rule,
+    // ADR 0015). The `flush_now`/`compact_now` admin *actions* below do mutate,
+    // and say so.
+
+    /// A lean, read-only view of every live SSTable's metadata (ascending by
+    /// sequence) for the `/admin/storage/lsm` debug view — omits the per-table
+    /// bloom bit vector.
+    #[must_use]
+    pub fn sstable_views(&self) -> Vec<SsTableView> {
+        let inner = self.lock();
+        let mut views: Vec<SsTableView> = inner
+            .manifest
+            .tables
+            .iter()
+            .map(|t| SsTableView {
+                seq: t.seq,
+                level: t.level,
+                min_key: t.min_key.clone(),
+                max_key: t.max_key.clone(),
+                min_version: t.min_version,
+                max_version: t.max_version,
+                file_size: t.file_size,
+                has_bloom: t.has_bloom,
+                format: t.format,
+            })
+            .collect();
+        views.sort_by_key(|v| v.seq);
+        views
+    }
+
+    /// The number of distinct keys currently buffered in the memtable.
+    #[must_use]
+    pub fn memtable_len(&self) -> usize {
+        self.lock().memtable.len()
+    }
+
+    /// The memtable's approximate live byte size (the flush-threshold counter).
+    #[must_use]
+    pub fn memtable_bytes(&self) -> usize {
+        self.lock().memtable_bytes
+    }
+
+    /// Live WAL segments with their on-disk byte sizes (ascending). Reads each
+    /// segment file's size through the `Env` disk seam.
+    pub async fn wal_segment_sizes(&self) -> Vec<(u64, u64)> {
+        let segs = self.wal.live_segments();
+        let mut out = Vec::with_capacity(segs.len());
+        for seg in segs {
+            let size = self
+                .env
+                .size(&self.wal.segment_file(seg))
+                .await
+                .unwrap_or(0);
+            out.push((seg, size));
+        }
+        out
+    }
+
+    /// The highest WAL sequence currently durable (fsynced).
+    #[must_use]
+    pub fn wal_durable_seq(&self) -> u64 {
+        self.wal.durable_seq()
+    }
+
+    /// Cumulative WAL segment rotations since open.
+    #[must_use]
+    pub fn wal_rotation_count(&self) -> u64 {
+        self.wal.rotation_count()
+    }
+
+    /// Decode the records of WAL segment `seg` into read-only views (in file
+    /// order), reading the segment file through the `Env` disk seam. An absent or
+    /// unreadable segment yields an empty vec.
+    pub async fn wal_segment_records(&self, seg: u64) -> Vec<WalRecordView> {
+        let bytes = self
+            .env
+            .read(&self.wal.segment_file(seg))
+            .await
+            .unwrap_or_default();
+        decode_wal(&bytes)
+            .into_iter()
+            .map(WalRecordView::from)
+            .collect()
+    }
+
+    /// **Admin action (ADR 0020):** force-flush the memtable to an SSTable now,
+    /// then run any compactions that become due. A no-op flush if the memtable is
+    /// empty or a concurrent write is still durable-but-unapplied (the same
+    /// `applies_in_flight == 0` invariant `maybe_flush_and_compact` enforces, so a
+    /// forced flush never GCs a WAL segment whose records aren't yet in the
+    /// snapshot); compactions still run. Idempotent.
+    ///
+    /// # Errors
+    /// Propagates a flush/compaction I/O failure.
+    pub async fn flush_now(&self) -> Result<()> {
+        let should_flush = {
+            let inner = self.lock();
+            !inner.memtable.is_empty() && inner.applies_in_flight == 0
+        };
+        if should_flush {
+            self.flush().await?;
+        }
+        while let Some(plan) = self.next_compaction() {
+            self.run_compaction(plan).await?;
+        }
+        Ok(())
+    }
+
+    /// **Admin action (ADR 0020):** run all currently-due compactions to
+    /// quiescence (L0→L1→L2…). Idempotent — a no-op when nothing is due.
+    ///
+    /// # Errors
+    /// Propagates a compaction I/O failure.
+    pub async fn compact_now(&self) -> Result<()> {
+        while let Some(plan) = self.next_compaction() {
+            self.run_compaction(plan).await?;
+        }
+        Ok(())
+    }
+}
+
+/// A lean, read-only view of one live SSTable's metadata for the admin/debug
+/// interface (ADR 0020) — a projection of `SsTableMeta` that omits the bloom bit
+/// vector. All fields are plain data so a consumer can render them as it likes.
+#[derive(Clone, Debug)]
+pub struct SsTableView {
+    /// SSTable sequence number (its file is `sst-{seq:06}`).
+    pub seq: u64,
+    /// LSM level (0 = flush tier; 1+ = non-overlapping runs).
+    pub level: u32,
+    /// Smallest key in the table (`None` only for an empty table).
+    pub min_key: Option<Key>,
+    /// Largest key in the table.
+    pub max_key: Option<Key>,
+    /// Smallest MVCC version stored.
+    pub min_version: Version,
+    /// Largest MVCC version stored.
+    pub max_version: Version,
+    /// Total file size in bytes.
+    pub file_size: u64,
+    /// Whether a bloom filter was built for the table.
+    pub has_bloom: bool,
+    /// Block format version (1 = uncompressed legacy, 2 = compression-capable).
+    pub format: u32,
+}
+
+/// A read-only, serialization-light view of one WAL record for the admin
+/// `/admin/storage/wal/segment` debug view (ADR 0020). Values are summarized by
+/// length rather than echoed, so a dump of a large segment stays small.
+#[derive(Clone, Debug)]
+pub enum WalRecordView {
+    /// A single-key put; `value_len` is the value's byte length.
+    Put {
+        key: Key,
+        version: Version,
+        value_len: usize,
+    },
+    /// A single-key delete (tombstone).
+    Delete { key: Key, version: Version },
+    /// A range delete; `keys` is the count of keys it tombstoned.
+    DeleteRange {
+        start: Key,
+        end: Key,
+        keys: usize,
+        version: Version,
+    },
+    /// A write batch; `ops` is the operation count.
+    Batch { version: Version, ops: usize },
+}
+
+impl From<WalRecord> for WalRecordView {
+    fn from(r: WalRecord) -> Self {
+        match r {
+            WalRecord::Put {
+                key,
+                value,
+                version,
+            } => WalRecordView::Put {
+                key,
+                version,
+                value_len: value.len(),
+            },
+            WalRecord::Delete { key, version } => WalRecordView::Delete { key, version },
+            WalRecord::DeleteRange {
+                start,
+                end,
+                keys,
+                version,
+            } => WalRecordView::DeleteRange {
+                start,
+                end,
+                keys: keys.len(),
+                version,
+            },
+            WalRecord::Batch { version, ops } => WalRecordView::Batch {
+                version,
+                ops: ops.len(),
+            },
+        }
+    }
 }
 
 #[async_trait::async_trait]
