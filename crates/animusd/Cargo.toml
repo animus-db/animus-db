@@ -35,3 +35,6 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+# For the reconfigure-loop test (#3), which drives the replicated tablet map
+# directly: `CasTabletReplicas` needs `TabletId` + `Epoch`.
+animus-tablet.workspace = true
