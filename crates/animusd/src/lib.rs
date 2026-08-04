@@ -451,14 +451,26 @@ pub enum ClientRequest {
     /// on commit hands the upper range `[split_key, ∞)` to a new co-resident group.
     /// The interim manual trigger; an automatic size-telemetry trigger is later work.
     SplitTablet { tablet: u64, split_key: Vec<u8> },
+    /// The **data-plane half** of a split, forwarded to the CP leader's node (D2
+    /// cross-process split trigger). After [`SplitTablet`](ClientRequest::SplitTablet)
+    /// records the split in the control plane, the data-plane `propose_split` must run
+    /// on the node hosting the tablet's CP-group leader, which may differ from the
+    /// control leader. A node that recorded the metadata but doesn't host the CP
+    /// leader forwards this; the receiver proposes the split **iff** it is the CP
+    /// leader (one hop, no re-forward, no metadata) — else errors and the client
+    /// retries with fresh routing.
+    CpSplit { tablet: u64, split_key: Vec<u8> },
 }
 
 /// Whether `command` may be **relayed to the control leader** via
 /// [`ClientRequest::ProposeSchema`]: the schema-catalog mutations (ADR 0013) that a
 /// wire client drives, plus [`MetaCommand::RegisterCpAddr`] (Phase 2.3a) — a node's
-/// own CP-address self-registration, relayed to the leader when this node isn't it.
-/// Membership / placement / tablet commands are control-plane-internal and are
-/// **not** accepted over this path.
+/// own CP-address self-registration — plus [`MetaCommand::SplitTablet`] (D2), the
+/// metadata half of the admin split trigger (already client-exposed via
+/// [`ClientRequest::SplitTablet`], so relaying it adds no new authority — it lets the
+/// trigger reach the control leader cross-process when the split is driven from a
+/// follower). Other membership / placement / tablet commands are control-plane-
+/// internal and are **not** accepted over this path.
 fn is_relayable_command(command: &MetaCommand) -> bool {
     matches!(
         command,
@@ -470,6 +482,7 @@ fn is_relayable_command(command: &MetaCommand) -> bool {
             | MetaCommand::CreateKeyspace { .. }
             | MetaCommand::DropKeyspace { .. }
             | MetaCommand::RegisterCpAddr { .. }
+            | MetaCommand::SplitTablet { .. }
     )
 }
 
@@ -1234,22 +1247,51 @@ impl ClientCtx {
         let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
         loop {
             if let Some(tablet) = self.tablet_for(key) {
-                if let Some(leader) = self.edge.cp_leader(tablet) {
-                    return CpRoute::Local(leader);
+                if let Some(route) = self.resolve_cp_route(tablet) {
+                    return route;
                 }
-                // Forward only to a concrete leader *hint* a local replica gives us.
-                if let Some(addr) = self.cp_forward_target(tablet) {
-                    return CpRoute::Forward(addr);
-                }
-                // No local leader and no leader hint. A node hosting no replica of
-                // this tablet can never serve locally, so forward to any known route
-                // immediately; a node that *does* host a replica waits for its own
-                // election/hint.
-                if self.edge.local_cp(tablet).is_none() {
-                    if let Some(addr) = self.client_route.values().next().copied() {
-                        return CpRoute::Forward(addr);
-                    }
-                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return CpRoute::None;
+            }
+            tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+        }
+    }
+
+    /// One attempt at resolving a *known* tablet's group leader to a [`CpRoute`], or
+    /// `None` if it isn't settled yet (caller should wait + retry). The leader-
+    /// resolution policy shared by [`cp_route`](Self::cp_route) (key→tablet→leader)
+    /// and [`cp_route_tablet`](Self::cp_route_tablet) (tablet→leader, for the split
+    /// trigger, where the key maps to a *different* tablet after the metadata split).
+    fn resolve_cp_route(&self, tablet: TabletId) -> Option<CpRoute> {
+        if let Some(leader) = self.edge.cp_leader(tablet) {
+            return Some(CpRoute::Local(leader));
+        }
+        // Forward only to a concrete leader *hint* a local replica gives us.
+        if let Some(addr) = self.cp_forward_target(tablet) {
+            return Some(CpRoute::Forward(addr));
+        }
+        // No local leader and no leader hint. A node hosting no replica of this
+        // tablet can never serve locally, so forward to any known route immediately;
+        // a node that *does* host a replica waits for its own election/hint.
+        if self.edge.local_cp(tablet).is_none() {
+            if let Some(addr) = self.client_route.values().next().copied() {
+                return Some(CpRoute::Forward(addr));
+            }
+        }
+        None
+    }
+
+    /// Resolve a CP op to a leader by **tablet id** (not key), waiting up to
+    /// [`CLIENT_TIMEOUT`] for the group to settle. Used by the split trigger: after
+    /// the metadata split commits, the split *key* maps to the new (right-hand)
+    /// tablet, so routing the data-plane split by key would target the wrong group —
+    /// it must route to the tablet being split by id.
+    async fn cp_route_tablet(&self, tablet: TabletId) -> CpRoute {
+        let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
+        loop {
+            if let Some(route) = self.resolve_cp_route(tablet) {
+                return route;
             }
             if tokio::time::Instant::now() >= deadline {
                 return CpRoute::None;
@@ -2146,9 +2188,14 @@ async fn handle_client(mut stream: TcpStream, ctx: ClientCtx) -> std::io::Result
                 Ok(()) => ClientResponse::PutOk,
                 Err(e) => ClientResponse::Error(e),
             },
-            // Admin: split a CP tablet (Phase 2.2).
+            // Admin: split a CP tablet (Phase 2.2 / D2 cross-process).
             ClientRequest::SplitTablet { tablet, split_key } => {
                 ctx.trigger_split(TabletId(tablet), split_key).await
+            }
+            // The data-plane half of a split, forwarded to the CP leader's node (D2):
+            // propose the split locally iff we lead the tablet; never re-forward.
+            ClientRequest::CpSplit { tablet, split_key } => {
+                ctx.cp_split_here(TabletId(tablet), split_key).await
             }
             // A CP op forwarded from another node (cross-process routing, ADR 0017
             // #3b): serve locally iff we are the leader; never re-forward.
@@ -2233,12 +2280,19 @@ impl ClientCtx {
             .await;
     }
 
-    /// Split CP `tablet` at `split_key` (Phase 2.2): record the split in the control
-    /// plane (a new tablet id covering `[split_key, ∞)`), then trigger the
+    /// Split CP `tablet` at `split_key` (Phase 2.2 / D2): record the split in the
+    /// control plane (a new tablet id covering `[split_key, ∞)`), then trigger the
     /// data-plane split on the tablet's CP group leader — on commit each replica's
     /// split hook mints the new tablet's co-resident group. Returns once the
     /// data-plane split is *accepted* (the new group forms + becomes routable
     /// asynchronously; the caller polls a read of an upper-range key to observe it).
+    ///
+    /// **Cross-process (D2):** both halves are routed to their respective leaders, so
+    /// the trigger works from any node — the metadata `SplitTablet` relays to the
+    /// control leader (it is [relayable](is_relayable_command)), and the data-plane
+    /// `propose_split` routes by **tablet id** to the CP-group leader's node (the two
+    /// leaders may differ), forwarding a one-hop [`CpSplit`](ClientRequest::CpSplit)
+    /// there if this node doesn't host it.
     async fn trigger_split(&self, tablet: TabletId, split_key: Vec<u8>) -> ClientResponse {
         // The new tablet id: one past the current max (deterministic on the leader
         // that proposes it; replicated to all via `SplitTablet`).
@@ -2274,8 +2328,41 @@ impl ClientCtx {
             return ClientResponse::Error("split metadata did not commit in time".into());
         }
         // 2. Trigger the data-plane split on the tablet's CP group leader (it fires
-        //    every replica's split hook on commit). Forwarding a split to a remote
-        //    leader is later work; in-process the shared edge reaches the leader.
+        //    every replica's split hook on commit). Routed by **tablet id** — after
+        //    step 1 the split *key* maps to the new right-hand tablet, so a key route
+        //    would target the wrong group. Forward a one-hop `CpSplit` if the CP
+        //    leader is on another node (D2).
+        match self.cp_route_tablet(tablet).await {
+            CpRoute::Local(leader) => match leader.propose_split(split_key) {
+                ProposeResult::Accepted { .. } => ClientResponse::PutOk,
+                ProposeResult::NotLeader { .. } => {
+                    ClientResponse::Error("CP group leader moved; retry the split".into())
+                }
+            },
+            // `CpSplit` is already a one-hop "serve-or-error, never re-forward"
+            // request, so relay it directly (its own top-level handler) — not via
+            // `cp_forward`, which wraps in `Forwarded` (the Put/Get/Delete/Scan path).
+            CpRoute::Forward(addr) => {
+                self.relay(
+                    addr,
+                    ClientRequest::CpSplit {
+                        tablet: tablet.0,
+                        split_key,
+                    },
+                )
+                .await
+            }
+            CpRoute::None => {
+                ClientResponse::Error("no CP group leader for the tablet reachable".into())
+            }
+        }
+    }
+
+    /// Serve the **data-plane half** of a split forwarded from another node (D2): this
+    /// node must host `tablet`'s CP-group leader (one hop, no metadata, no re-forward).
+    /// Proposes `propose_split` iff it leads, else errors so the client retries with
+    /// fresh routing.
+    async fn cp_split_here(&self, tablet: TabletId, split_key: Vec<u8>) -> ClientResponse {
         match self.edge.cp_leader(tablet) {
             Some(leader) => match leader.propose_split(split_key) {
                 ProposeResult::Accepted { .. } => ClientResponse::PutOk,
@@ -2283,7 +2370,7 @@ impl ClientCtx {
                     ClientResponse::Error("CP group leader moved; retry the split".into())
                 }
             },
-            None => ClientResponse::Error("no CP group leader for the tablet here".into()),
+            None => ClientResponse::Error("forwarded CP split: not the leader here".into()),
         }
     }
 
