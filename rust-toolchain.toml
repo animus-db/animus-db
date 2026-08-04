@@ -1,0 +1,8 @@
+# Pin the dev toolchain to the workspace MSRV (Cargo.toml `rust-version`), which
+# is also what CI gates on — so local `cargo fmt/clippy/build/test` match CI
+# exactly and a newer local clippy can't pass a lint CI's older clippy rejects
+# (the `clippy::precedence` drift that once landed a red `main`). Bump this and
+# the workspace `rust-version` together.
+[toolchain]
+channel = "1.85"
+components = ["clippy", "rustfmt"]

@@ -762,8 +762,8 @@ impl AccordCore {
             // Mix the monotone facts into one increasing-on-progress number:
             // phase dominates, then execute_at, then dep count, then promised
             // ballot round. Each only ever advances, so the sum only grows.
-            (t.phase as u64) << 56
-                | (t.execute_at.logical & 0x000F_FFFF_FFFF_FFFF) << 8
+            ((t.phase as u64) << 56)
+                | ((t.execute_at.logical & 0x000F_FFFF_FFFF_FFFF) << 8)
                 | ((t.deps.len() as u64 + t.promised.round).min(0xFF))
         })
     }
