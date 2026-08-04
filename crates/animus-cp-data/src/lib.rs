@@ -414,6 +414,23 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         Self::start(env, all_nodes, storage)
     }
 
+    /// Like [`start_seeded`](Self::start_seeded) but the new group carries a
+    /// [`SplitHook`] of its own, so a tablet created by a split can itself be split
+    /// again (deep splits / continued auto-sharding). Seeds, then starts with the
+    /// hook.
+    pub async fn start_seeded_with_split_hook(
+        env: E,
+        all_nodes: Vec<NodeId>,
+        storage: S,
+        seed: Vec<(Vec<u8>, Vec<u8>)>,
+        on_split: SplitHook,
+    ) -> Self {
+        for (key, value) in &seed {
+            storage.merge(key, value, 0).await.expect("raftkv seed");
+        }
+        Self::start_with_split_hook(env, all_nodes, storage, on_split)
+    }
+
     /// Read `key` from this replica's **local engine**. NOTE: this is a local read
     /// — it is *not* yet linearizable (that is ReadIndex, Stage B.2). It is used by
     /// tests to observe a replica's applied state and to confirm convergence.

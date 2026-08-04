@@ -658,23 +658,16 @@ impl BoundNode {
         // reaches every co-resident group.
         let static_peers = peers;
         let raftkv_sync_env = self.raftkv_env.clone();
-        // A second `raftkv`-env clone for the split hook to mint co-resident sibling
-        // inboxes from (Phase 2.2); shares the pool + peer book with the group's env.
+        // A `raftkv`-env clone for the shared **CP hosting context** (`CpHostCtx`):
+        // the split hook, re-host, and join-host paths all mint their sibling inboxes
+        // from it (and host the bootstrap tablet on it directly when this node joins
+        // that tablet). Shares the pool + peer book with the group's env.
         let raftkv_hook_env = self.raftkv_env.clone();
-        // A third `raftkv`-env clone for **re-hosting** split tablets from disk at
-        // start (#2): each re-host mints its tablet's sibling from the shared pool.
-        let raftkv_rehost_env = self.raftkv_env.clone();
-        // A fourth `raftkv`-env clone for the **failure-detection heartbeat loop**
-        // (#3): each node heartbeats the control group *as its `raftkv` member id*
-        // (the cluster members are the `raftkv` ids), so the control plane's
-        // `detect_loop` marks a crashed CP node `Down`.
+        // A `raftkv`-env clone for the **failure-detection heartbeat loop** (#3): each
+        // node heartbeats the control group *as its `raftkv` member id* (the cluster
+        // members are the `raftkv` ids), so the control plane's `detect_loop` marks a
+        // crashed CP node `Down`.
         let raftkv_hb_env = self.raftkv_env.clone();
-        // A fifth `raftkv`-env clone for the **join-host loop** (D1): a node added to
-        // a tablet's replica set by the placement reconciler hosts an empty group for
-        // it and catches up via `InstallSnapshot`. The bootstrap tablet's member id is
-        // the node's base `raftkv` id, so it hosts on this (main) env; a split tablet's
-        // is derived, so it mints a sibling from the shared pool.
-        let raftkv_join_env = self.raftkv_env.clone();
         let my_raftkv_id = self.raftkv_id;
         let my_raftkv_addr = self.raftkv_addr;
 
@@ -743,47 +736,38 @@ impl BoundNode {
             .map(config::raftkv_id)
             .collect();
         let hosts_cp = cp_group.contains(&my_raftkv_id);
-        // The per-node CP-group **hosting claim set**: one `TabletId` per group this
-        // node hosts (or is about to), shared across the split hook, the re-host pass
-        // (#2), and the join-host loop (D1) so they never double-mint a group. Created
-        // unconditionally — the join-host loop runs on every node (a spare that is not
-        // in the bootstrap set still hosts a tablet later placed on it).
-        let minted: Arc<Mutex<BTreeSet<TabletId>>> = Arc::new(Mutex::new(BTreeSet::new()));
+
+        // The shared **CP hosting context** (D3): bundles the env to mint siblings,
+        // the client context, backend, this node's base id, and the per-node `minted`
+        // (claim) + `hosted` (durable-marker mirror) sets — so every group started on
+        // this node (bootstrap, split child, re-hosted, joined) carries a split hook
+        // of its own, which is what lets a split tablet be split again. Built
+        // unconditionally: the join-host + re-host paths run on **every** node (a
+        // spare not in the bootstrap set still hosts a tablet later placed on it).
+        //
+        // Load the durable marker first and pre-populate `minted`, so the bootstrap
+        // group re-applying a committed `Split` on WAL recovery finds the tablet
+        // already hosted and does not mint the sibling twice (#4 crash-idempotency).
+        let recorded = load_hosted_cp(&self.raftkv_env).await;
+        let minted: Arc<Mutex<BTreeSet<TabletId>>> = Arc::new(Mutex::new(
+            recorded.iter().map(|h| TabletId(h.tablet)).collect(),
+        ));
+        let hosted = Arc::new(Mutex::new(recorded.clone()));
+        let host = CpHostCtx {
+            raftkv_env: raftkv_hook_env,
+            ctx: ctx.clone(),
+            backend,
+            base_id: my_raftkv_id,
+            minted: minted.clone(),
+            hosted,
+        };
+        // Re-host each previously-split tablet from its on-disk engine (#2). Spawned so
+        // a slow control plane (the address publish) does not block node start.
+        for h in recorded {
+            tokio::spawn(cp_rehost(host.clone(), h));
+        }
         if hosts_cp {
-            // Pre-populate `minted` from the durable marker so the bootstrap group
-            // re-applying a committed `Split` on WAL recovery finds the tablet already
-            // hosted and does not mint the sibling twice (#4 crash-idempotency), and
-            // re-host each previously-split tablet from disk (#2).
-            let recorded = load_hosted_cp(&self.raftkv_env).await;
-            {
-                let mut m = minted.lock().expect("minted set poisoned");
-                for h in &recorded {
-                    m.insert(TabletId(h.tablet));
-                }
-            }
-            let hosted = Arc::new(Mutex::new(recorded.clone()));
-            // Re-host each previously-split tablet from its on-disk engine (#2): the
-            // `db-t{id}-` engine + `raftkv.wal` under the sibling dir recover its
-            // data + Raft log; the sibling claims a fresh pool listener whose address
-            // is re-published for peer-sync. Spawned so a slow control plane (the
-            // address publish) does not block node start.
-            for h in recorded {
-                tokio::spawn(cp_rehost(
-                    raftkv_rehost_env.clone(),
-                    ctx.clone(),
-                    backend,
-                    h,
-                ));
-            }
-            let hook = cp_split_hook(
-                raftkv_hook_env,
-                ctx.clone(),
-                cp_group.clone(),
-                my_raftkv_id,
-                backend,
-                minted.clone(),
-                hosted,
-            );
+            // The statically-placed bootstrap group, with a split hook of its own.
             let cp = match backend {
                 StorageBackend::Lsm => {
                     let lsm = LsmEngine::open(self.raftkv_env.clone(), LSM_PREFIX)
@@ -793,14 +777,14 @@ impl BoundNode {
                         self.raftkv_env,
                         cp_group,
                         lsm,
-                        hook,
+                        cp_split_hook(host.clone()),
                     ))
                 }
                 StorageBackend::Memory => CpGroup::Mem(RaftKvNode::start_with_split_hook(
                     self.raftkv_env,
                     cp_group,
                     MemoryEngine::new(),
-                    hook,
+                    cp_split_hook(host.clone()),
                 )),
             };
             // The statically-placed group serves the bootstrap tablet (the whole
@@ -851,13 +835,7 @@ impl BoundNode {
         // spare picked to replace a `Down` replica) stands up an empty co-resident
         // group for it and catches up via `InstallSnapshot`. Runs on **every** node
         // (a spare is not in the bootstrap CP set, yet must host when later placed).
-        tasks.push(tokio::spawn(cp_join_host_loop(
-            raftkv_join_env,
-            ctx.clone(),
-            backend,
-            my_raftkv_id,
-            minted,
-        )));
+        tasks.push(tokio::spawn(cp_join_host_loop(host)));
 
         // Client request server + DynamoDB HTTP + CQL endpoints share the same
         // context built above (the same raft view, RMW lock, and CP edge state).
@@ -1739,78 +1717,74 @@ async fn peer_sync_loop(
     }
 }
 
-/// Build the **CP split hook** (Phase 2.2) for this node's bootstrap CP group. When
-/// the group commits a `Split { at }`, every replica applies it and invokes this
-/// hook with the handed-off `[at, ∞)` data; the hook spawns [`cp_split_seed`] to
-/// stand up this node's co-resident member of the new tablet's group. The original
-/// group separately tombstones `[at, ∞)` (in `animus-cp-data`), so the keyspace
-/// partitions cleanly.
-///
-/// `parent_members` are the splitting group's member ids (the bootstrap group's =
-/// the node base `raftkv` ids); `my_id` is this node's member id in it. `hosted` is
-/// the shared in-memory mirror of the durable [`CP_HOSTED_FILE`] marker, updated +
-/// persisted when the new tablet's group is stood up so a restart re-hosts it (#2).
-#[allow(clippy::too_many_arguments)] // split context: env + ctx + ids + backend + state
-fn cp_split_hook(
+/// Everything the CP **hosting** paths share (D3): the env to mint sibling inboxes
+/// from, the client context (routing + address publish), the storage backend, this
+/// node's **base** `raftkv` id, and the per-node `minted` (hosting-claim) + `hosted`
+/// (durable-marker mirror) sets. Bundled so **every** group this node stands up —
+/// bootstrap, split child, re-hosted, or joined — can carry a `SplitHook` of its own
+/// ([`cp_split_hook`]), which is what lets a split-created tablet be split *again*
+/// (deep splits / continued auto-sharding).
+#[derive(Clone)]
+struct CpHostCtx {
     raftkv_env: ProdEnv,
     ctx: ClientCtx,
-    parent_members: Vec<NodeId>,
-    my_id: NodeId,
     backend: StorageBackend,
+    base_id: NodeId,
     minted: Arc<Mutex<BTreeSet<TabletId>>>,
     hosted: Arc<Mutex<Vec<HostedCpTablet>>>,
-) -> SplitHook {
+}
+
+/// This node's CP group **member id** for `tablet`, derived **flatly** from its base
+/// `raftkv` id: the bootstrap tablet uses the base id; any split-created tablet uses
+/// `base + tablet * CP_SPLIT_ID_STRIDE`. Flat (always from the base id, not the
+/// parent's member id) so the derivation is identical at any split depth and matches
+/// [`cp_members_for`] — a grandchild's member is `base + grandchild * STRIDE`, not a
+/// compounding `base + parent*STRIDE + grandchild*STRIDE`, so the reconfigure loop's
+/// translated `desired` set always matches the running group's `config()`.
+fn cp_member_id(base: NodeId, tablet: TabletId) -> NodeId {
+    if tablet == TABLET {
+        base
+    } else {
+        base + tablet.0 * CP_SPLIT_ID_STRIDE
+    }
+}
+
+/// Build a **CP split hook** for a group on this node (Phase 2.2 / D3). When the
+/// group commits a `Split { at }`, every replica invokes this hook with the handed-off
+/// `[at, ∞)` data; the hook spawns [`cp_split_seed`] to stand up this node's member of
+/// the new tablet's group — itself carrying a hook (so the child can split again).
+fn cp_split_hook(host: CpHostCtx) -> SplitHook {
     Arc::new(move |at, handoff| {
-        tokio::spawn(cp_split_seed(
-            raftkv_env.clone(),
-            ctx.clone(),
-            parent_members.clone(),
-            my_id,
-            backend,
-            Arc::clone(&minted),
-            Arc::clone(&hosted),
-            at,
-            handoff,
-        ));
+        tokio::spawn(cp_split_seed(host.clone(), at, handoff));
     })
 }
 
 /// Stand up this node's co-resident member of a split-created tablet's CP group
-/// (Phase 2.2), seeded with the handed-off `[at, ∞)` `handoff` data.
+/// (Phase 2.2 / D3), seeded with the handed-off `[at, ∞)` `handoff` data.
 ///
 /// Resolves the new tablet from replicated `Metadata` (the trigger's `SplitTablet`
 /// created a tablet whose range starts at `at`), derives the new group's member ids
-/// deterministically (`base + new_tablet * CP_SPLIT_ID_STRIDE`, identical on every
-/// replica), mints a `Coresident::sibling` inbox for its own member, opens a
-/// per-tablet engine, `start_seeded`s the group, registers it for routing, and
-/// publishes its address (peer-sync distributes it). **Idempotent** within a
-/// process: if this node already hosts the new tablet's group it returns (the hook
-/// fires on every apply, incl. WAL re-apply on recovery).
-#[allow(clippy::too_many_arguments)] // split context: env + ctx + ids + backend + state + payload
-async fn cp_split_seed(
-    raftkv_env: ProdEnv,
-    ctx: ClientCtx,
-    parent_members: Vec<NodeId>,
-    my_id: NodeId,
-    backend: StorageBackend,
-    minted: Arc<Mutex<BTreeSet<TabletId>>>,
-    hosted: Arc<Mutex<Vec<HostedCpTablet>>>,
-    at: Vec<u8>,
-    handoff: Vec<(Vec<u8>, Vec<u8>)>,
-) {
+/// flatly from base ids ([`cp_members_for`] / [`cp_member_id`], identical on every
+/// replica + at any depth), mints a `Coresident::sibling` inbox for its own member,
+/// opens a per-tablet engine, starts the group **with its own split hook**, registers
+/// it for routing, records the durable marker, and publishes its address. **Idempotent
+/// per node** (the shared `minted` claim set), so the hook firing on every apply
+/// (incl. WAL re-apply on recovery) mints at most once.
+async fn cp_split_seed(host: CpHostCtx, at: Vec<u8>, handoff: Vec<(Vec<u8>, Vec<u8>)>) {
     // The new tablet is the one the trigger's `SplitTablet` created with range
     // starting exactly at the split key. Poll briefly for it to replicate here.
     let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
-    let new_tablet = loop {
-        let found = ctx
+    let (new_tablet, replicas) = loop {
+        let found = host
+            .ctx
             .raft
             .metadata()
             .tablets
             .iter()
             .find(|(_, t)| t.range.start == at)
-            .map(|(id, _)| *id);
-        if let Some(t) = found {
-            break t;
+            .map(|(id, t)| (*id, t.replicas.clone()));
+        if let Some(found) = found {
+            break found;
         }
         if tokio::time::Instant::now() >= deadline {
             tracing::warn!("CP split: new tablet for the split key never appeared");
@@ -1820,35 +1794,38 @@ async fn cp_split_seed(
     };
 
     // Idempotent **per node**: mint this node's member of the new tablet only once
-    // per process. (The per-node `minted` set, not the edge state — in a
-    // `--cluster N` process the edge is *shared* across nodes, so gating on
-    // `edge.local_cp(new_tablet)` would let the first node's mint suppress every
-    // other node's, leaving the new group without a quorum.)
+    // per process. (The per-node `minted` set, not the edge state — in a `--cluster N`
+    // process the edge is *shared* across nodes, so gating on `edge.local_cp` would
+    // let the first node's mint suppress every other node's, leaving no quorum.)
     {
-        let mut minted = minted.lock().expect("minted set poisoned");
+        let mut minted = host.minted.lock().expect("minted set poisoned");
         if !minted.insert(new_tablet) {
             return;
         }
     }
 
-    // Deterministic member ids for the new group: every replica derives the same set
-    // from the parent members + the new tablet id.
-    let new_members: Vec<NodeId> = parent_members
-        .iter()
-        .map(|m| m + new_tablet.0 * CP_SPLIT_ID_STRIDE)
-        .collect();
-    let my_new_id = my_id + new_tablet.0 * CP_SPLIT_ID_STRIDE;
+    let new_members: Vec<NodeId> = cp_members_for(new_tablet, &replicas).into_iter().collect();
+    let my_new_id = cp_member_id(host.base_id, new_tablet);
 
     // A co-resident inbox for this node's member of the new group, drawn from the
-    // pre-bound listener pool; its address is published for peer-sync.
-    let sibling = raftkv_env.sibling(my_new_id);
+    // pre-bound listener pool; its address is published for peer-sync. The new group
+    // carries its own split hook so it can be split again (D3).
+    let sibling = host.raftkv_env.sibling(my_new_id);
     let sibling_addr = sibling.local_addr();
-    let cp = match backend {
+    let hook = cp_split_hook(host.clone());
+    let cp = match host.backend {
         StorageBackend::Lsm => {
             let prefix = format!("db-t{}-", new_tablet.0);
             match LsmEngine::open(sibling.clone(), &prefix).await {
                 Ok(lsm) => CpGroup::Lsm(
-                    RaftKvNode::start_seeded(sibling, new_members.clone(), lsm, handoff).await,
+                    RaftKvNode::start_seeded_with_split_hook(
+                        sibling,
+                        new_members.clone(),
+                        lsm,
+                        handoff,
+                        hook,
+                    )
+                    .await,
                 ),
                 Err(e) => {
                     tracing::error!(?e, "CP split: opening new tablet LSM");
@@ -1857,19 +1834,25 @@ async fn cp_split_seed(
             }
         }
         StorageBackend::Memory => CpGroup::Mem(
-            RaftKvNode::start_seeded(sibling, new_members.clone(), MemoryEngine::new(), handoff)
-                .await,
+            RaftKvNode::start_seeded_with_split_hook(
+                sibling,
+                new_members.clone(),
+                MemoryEngine::new(),
+                handoff,
+                hook,
+            )
+            .await,
         ),
     };
-    ctx.edge.register_raftkv(new_tablet, cp);
+    host.ctx.edge.register_raftkv(new_tablet, cp);
 
     // Durably record that this node now hosts the new tablet's group on disk, so a
-    // restart re-hosts it from its `db-t{id}-` engine (#2). Persist before the
-    // address publish so a crash mid-publish still re-hosts on recovery. Snapshot the
-    // list under the lock, then drop the guard before the async persist (never hold a
-    // `std::sync::Mutex` guard across `.await`).
+    // restart re-hosts it from its `db-t{id}-` engine (#2). Persist before the address
+    // publish so a crash mid-publish still re-hosts on recovery. Snapshot under the
+    // lock, then drop the guard before the async persist (never hold a `std::sync::Mutex`
+    // guard across `.await`).
     let snapshot = {
-        let mut h = hosted.lock().expect("hosted set poisoned");
+        let mut h = host.hosted.lock().expect("hosted set poisoned");
         if !h.iter().any(|e| e.tablet == new_tablet.0) {
             h.push(HostedCpTablet {
                 tablet: new_tablet.0,
@@ -1879,38 +1862,39 @@ async fn cp_split_seed(
         }
         h.clone()
     };
-    save_hosted_cp(&raftkv_env, &snapshot).await;
+    save_hosted_cp(&host.raftkv_env, &snapshot).await;
 
-    // Publish this member's address so every node's peer-sync loop can reach it —
-    // the new group's internal Raft traffic (election, replication) cannot make
-    // progress until every member's address is in the peer books. Via `ctx`, which
-    // relays the registration to the control leader cross-process (#4).
-    ctx.register_cp_addr(my_new_id, sibling_addr.to_string())
+    // Publish this member's address (relayed to the control leader cross-process, #4)
+    // so every node's peer-sync loop can reach it.
+    host.ctx
+        .register_cp_addr(my_new_id, sibling_addr.to_string())
         .await;
 }
 
 /// Re-host a split-created CP tablet from its on-disk engine at node start (#2):
-/// mint the tablet's `Coresident::sibling` (a fresh pool listener), recover its
-/// `db-t{id}-` engine + `raftkv.wal` via `start_seeded` with an **empty** seed (the
-/// data is already durable on disk — the seed only ever carries a *fresh* split's
-/// handoff), register it for routing, and re-publish the sibling's new address for
-/// peer-sync (the pool port is fresh each incarnation). The new group re-forms once
-/// a quorum of members have re-published + peer-sync has distributed the addresses.
-async fn cp_rehost(
-    raftkv_env: ProdEnv,
-    ctx: ClientCtx,
-    backend: StorageBackend,
-    h: HostedCpTablet,
-) {
-    let sibling = raftkv_env.sibling(h.member);
+/// mint the tablet's `Coresident::sibling`, recover its `db-t{id}-` engine +
+/// `raftkv.wal` via an **empty** seed (the data is already durable on disk — the seed
+/// only ever carries a *fresh* split's handoff), start it **with its own split hook**
+/// (so a re-hosted split tablet can still be re-split, D3), register it, and re-publish
+/// the sibling's new address (the pool port is fresh each incarnation).
+async fn cp_rehost(host: CpHostCtx, h: HostedCpTablet) {
+    let sibling = host.raftkv_env.sibling(h.member);
     let sibling_addr = sibling.local_addr();
     let tablet = TabletId(h.tablet);
-    let cp = match backend {
+    let hook = cp_split_hook(host.clone());
+    let cp = match host.backend {
         StorageBackend::Lsm => {
             let prefix = format!("db-t{}-", h.tablet);
             match LsmEngine::open(sibling.clone(), &prefix).await {
                 Ok(lsm) => CpGroup::Lsm(
-                    RaftKvNode::start_seeded(sibling, h.members, lsm, Vec::new()).await,
+                    RaftKvNode::start_seeded_with_split_hook(
+                        sibling,
+                        h.members,
+                        lsm,
+                        Vec::new(),
+                        hook,
+                    )
+                    .await,
                 ),
                 Err(e) => {
                     tracing::error!(?e, tablet = h.tablet, "CP re-host: opening tablet LSM");
@@ -1919,11 +1903,19 @@ async fn cp_rehost(
             }
         }
         StorageBackend::Memory => CpGroup::Mem(
-            RaftKvNode::start_seeded(sibling, h.members, MemoryEngine::new(), Vec::new()).await,
+            RaftKvNode::start_seeded_with_split_hook(
+                sibling,
+                h.members,
+                MemoryEngine::new(),
+                Vec::new(),
+                hook,
+            )
+            .await,
         ),
     };
-    ctx.edge.register_raftkv(tablet, cp);
-    ctx.register_cp_addr(h.member, sibling_addr.to_string())
+    host.ctx.edge.register_raftkv(tablet, cp);
+    host.ctx
+        .register_cp_addr(h.member, sibling_addr.to_string())
         .await;
 }
 
@@ -1945,13 +1937,7 @@ const CP_RECONFIGURE_INTERVAL: Duration = Duration::from_millis(500);
 fn cp_members_for(tablet: TabletId, replicas: &[NodeId]) -> BTreeSet<NodeId> {
     replicas
         .iter()
-        .map(|&base| {
-            if tablet == TABLET {
-                base
-            } else {
-                base + tablet.0 * CP_SPLIT_ID_STRIDE
-            }
-        })
+        .map(|&base| cp_member_id(base, tablet))
         .collect()
 }
 
@@ -2005,40 +1991,25 @@ const CP_JOIN_HOST_INTERVAL: Duration = Duration::from_millis(500);
 /// so it is a quiet non-voter until the leader's `change_membership` adds it (a node
 /// inside its own initial config could campaign — see the `animus-cp-data` membership
 /// gotcha). On restart it instead recovers its config from its own WAL.
-async fn cp_join_host_loop(
-    raftkv_env: ProdEnv,
-    ctx: ClientCtx,
-    backend: StorageBackend,
-    my_raftkv_id: NodeId,
-    hosting: Arc<Mutex<BTreeSet<TabletId>>>,
-) {
+async fn cp_join_host_loop(host: CpHostCtx) {
     loop {
         tokio::time::sleep(CP_JOIN_HOST_INTERVAL).await;
-        let tablets = ctx.raft.metadata().tablets;
+        let tablets = host.ctx.raft.metadata().tablets;
         for (tablet, t) in tablets {
-            if t.epoch <= Epoch::INITIAL || !t.replicas.contains(&my_raftkv_id) {
+            if t.epoch <= Epoch::INITIAL || !t.replicas.contains(&host.base_id) {
                 continue;
             }
-            if ctx.edge.local_cp(tablet).is_some() {
+            if host.ctx.edge.local_cp(tablet).is_some() {
                 continue; // already hosting (bootstrap tablet, or a prior iteration)
             }
             // Claim once (shared with the split hook / re-host).
             {
-                let mut h = hosting.lock().expect("hosting set poisoned");
+                let mut h = host.minted.lock().expect("hosting set poisoned");
                 if !h.insert(tablet) {
                     continue;
                 }
             }
-            cp_join_host(
-                &raftkv_env,
-                &ctx,
-                backend,
-                my_raftkv_id,
-                tablet,
-                &t.replicas,
-                &hosting,
-            )
-            .await;
+            cp_join_host(&host, tablet, &t.replicas).await;
         }
     }
 }
@@ -2046,23 +2017,10 @@ async fn cp_join_host_loop(
 /// Stand up this node's empty member of `tablet`'s group (the body of
 /// [`cp_join_host_loop`]). The bootstrap tablet's member id is this node's base
 /// `raftkv` id, hosted on the **main** `raftkv` env; a split tablet's is derived, so
-/// it mints a co-resident **sibling**. On a transient engine-open failure the tablet
-/// is un-claimed so a later tick retries.
-#[allow(clippy::too_many_arguments)] // join context: env + ctx + backend + ids + replicas + claim
-async fn cp_join_host(
-    raftkv_env: &ProdEnv,
-    ctx: &ClientCtx,
-    backend: StorageBackend,
-    my_raftkv_id: NodeId,
-    tablet: TabletId,
-    replicas: &[NodeId],
-    hosting: &Arc<Mutex<BTreeSet<TabletId>>>,
-) {
-    let member = if tablet == TABLET {
-        my_raftkv_id
-    } else {
-        my_raftkv_id + tablet.0 * CP_SPLIT_ID_STRIDE
-    };
+/// it mints a co-resident **sibling**. The group carries its own split hook (D3). On
+/// a transient engine-open failure the tablet is un-claimed so a later tick retries.
+async fn cp_join_host(host: &CpHostCtx, tablet: TabletId, replicas: &[NodeId]) {
+    let member = cp_member_id(host.base_id, tablet);
     // Quiet non-voter: start knowing the *other* members, not itself.
     let others: Vec<NodeId> = cp_members_for(tablet, replicas)
         .into_iter()
@@ -2071,27 +2029,36 @@ async fn cp_join_host(
     // Bootstrap tablet -> the main env (member id == base id); split tablet -> a
     // sibling minted for the derived member id.
     let (env, prefix) = if tablet == TABLET {
-        (raftkv_env.clone(), LSM_PREFIX.to_string())
+        (host.raftkv_env.clone(), LSM_PREFIX.to_string())
     } else {
-        (raftkv_env.sibling(member), format!("db-t{}-", tablet.0))
+        (
+            host.raftkv_env.sibling(member),
+            format!("db-t{}-", tablet.0),
+        )
     };
     let addr = env.local_addr();
-    let cp = match backend {
+    let hook = cp_split_hook(host.clone());
+    let cp = match host.backend {
         StorageBackend::Lsm => match LsmEngine::open(env.clone(), &prefix).await {
-            Ok(lsm) => CpGroup::Lsm(RaftKvNode::start(env, others, lsm)),
+            Ok(lsm) => CpGroup::Lsm(RaftKvNode::start_with_split_hook(env, others, lsm, hook)),
             Err(e) => {
                 tracing::error!(?e, tablet = tablet.0, "CP join-host: opening tablet LSM");
-                hosting
+                host.minted
                     .lock()
                     .expect("hosting set poisoned")
                     .remove(&tablet);
                 return;
             }
         },
-        StorageBackend::Memory => CpGroup::Mem(RaftKvNode::start(env, others, MemoryEngine::new())),
+        StorageBackend::Memory => CpGroup::Mem(RaftKvNode::start_with_split_hook(
+            env,
+            others,
+            MemoryEngine::new(),
+            hook,
+        )),
     };
-    ctx.edge.register_raftkv(tablet, cp);
-    ctx.register_cp_addr(member, addr.to_string()).await;
+    host.ctx.edge.register_raftkv(tablet, cp);
+    host.ctx.register_cp_addr(member, addr.to_string()).await;
 }
 
 /// How often the auto-split loop samples tablet sizes (Phase 2.4). A slow
