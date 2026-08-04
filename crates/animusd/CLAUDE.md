@@ -217,7 +217,7 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   client/dynamo/cql data edges. A production-only I/O edge in `admin.rs` (real
   tokio sockets + the shared hand-rolled HTTP helpers extracted to `http.rs`, now
   shared with `dynamo.rs`). Read-only `GET` views — `/admin/{config,status,raft,
-  raftkv,storage/lsm,storage/wal,storage/wal/segment,storage/key,metrics,health}`
+  raftkv,storage/lsm,storage/wal,storage/wal/segment,storage/key,storage/scan,metrics,health}`
   — plus gated `POST` actions — `/admin/{tablet/split,storage/flush,storage/compact,
   raftkv/reconfigure,drain}`. Below the edge it only **reads** node state
   (control + CP Raft accessors, `LsmEngine` introspection: `sstable_views`/
@@ -237,6 +237,9 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
     so they are threaded into `AdminInfo.admin_addrs` (via a new `start_with`
     param) rather than the browser guessing ports. Read-only for now (nodes/tablets/
     WAL/data panels); operator-action UI + the ADR 0018 transaction view are next.
+    The data panel has both a single-key inspector (`/admin/storage/key`) and a
+    **browse-keys** list (`/admin/storage/scan` → `CpGroup::local_scan`, first N live
+    pairs `>= start`; click a key to send it to the inspector).
     `tests/dashboard_endpoint.rs` proves serve + CORS + preflight + peers.
   - **Gotcha — `/admin/raftkv` is node-local, but in a single `--cluster N` process
     the shared `ClusterEdgeState` registers *every* node's CP group handle, so one

@@ -29,6 +29,7 @@
 //! - `GET  /admin/storage/wal`         — WAL segments + sizes (`?tablet=`)
 //! - `GET  /admin/storage/wal/segment` — decoded WAL records (`?tablet=&seg=`)
 //! - `GET  /admin/storage/key`         — on-disk versions of a key (`?tablet=&key=`)
+//! - `GET  /admin/storage/scan`        — first N live pairs (`?tablet=&start=&limit=`)
 //! - `GET  /admin/metrics`             — the metrics snapshot as JSON
 //! - `GET  /admin/health`              — liveness/readiness
 //! - `POST /admin/tablet/split`        — `{tablet, split_key}`
@@ -170,6 +171,7 @@ async fn dispatch(ctx: &ClientCtx, request: &http::HttpRequest) -> (u16, String)
         ("GET", "/admin/storage/wal") => storage_wal(ctx, q).await,
         ("GET", "/admin/storage/wal/segment") => storage_wal_segment(ctx, q).await,
         ("GET", "/admin/storage/key") => storage_key(ctx, q).await,
+        ("GET", "/admin/storage/scan") => storage_scan(ctx, q).await,
         ("GET", "/admin/metrics") => (200, metrics_view(ctx)),
         ("GET", "/admin/health") => health(ctx),
         ("POST", "/admin/tablet/split") => action_split(ctx, &request.body).await,
@@ -399,6 +401,48 @@ async fn storage_key(ctx: &ClientCtx, q: &str) -> (u16, Value) {
             "key": key_str(&key),
             "live": live.as_deref().map(key_str),
             "disk_versions": disk,
+        }),
+    )
+}
+
+/// `GET /admin/storage/scan?tablet=&start=&limit=` — the first `limit` live
+/// `(key, value)` pairs with `key >= start`, in key order, from this node's local
+/// engine (the dashboard "browse keys" view, ADR 0021). `start` defaults to the
+/// beginning, `limit` to 50 (capped at 1000). Node-local, like the other storage
+/// routes — scrape the leader for its committed state.
+async fn storage_scan(ctx: &ClientCtx, q: &str) -> (u16, Value) {
+    let tablet = tablet_param(q);
+    let start = http::query_param(q, "start")
+        .unwrap_or_default()
+        .into_bytes();
+    let limit = http::query_param(q, "limit")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(50)
+        .clamp(1, 1000);
+    let Some(g) = ctx.edge.local_cp(tablet) else {
+        return not_hosted(tablet);
+    };
+    let pairs = g.local_scan(&start, limit).await;
+    let truncated = pairs.len() == limit;
+    let items: Vec<Value> = pairs
+        .iter()
+        .map(|(key, value)| {
+            json!({
+                "key": key_str(key),
+                "value": key_str(value),
+                "value_len": value.len(),
+            })
+        })
+        .collect();
+    (
+        200,
+        json!({
+            "tablet": tablet.0,
+            "backend": g.backend_name(),
+            "count": items.len(),
+            "limit": limit,
+            "truncated": truncated,
+            "items": items,
         }),
     )
 }

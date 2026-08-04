@@ -160,6 +160,21 @@ impl CpGroup {
         }
     }
 
+    /// The first `limit` live `(key, value)` pairs with `key >= start`, in key
+    /// order, from the **local** engine — the admin "browse keys" view (ADR 0021).
+    /// Node-local introspection like the other `/admin/storage/*` routes, so it
+    /// reads this replica's engine directly rather than via a quorum scan. Reuses
+    /// `range_snapshot` and truncates — fine for a debug surface on dev-sized
+    /// tablets (it materializes the live range from `start` before truncating).
+    async fn local_scan(&self, start: &[u8], limit: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut pairs = match self {
+            CpGroup::Lsm(n) => n.range_snapshot(start).await,
+            CpGroup::Mem(n) => n.range_snapshot(start).await,
+        };
+        pairs.truncate(limit);
+        pairs
+    }
+
     // ---- admin / debug introspection (ADR 0020) -------------------------
 
     /// Which storage engine backs this group (`"lsm"` durable / `"memory"`).

@@ -273,6 +273,17 @@ async fn admin_interface_surfaces_state_and_actions() {
             "the forced flush produced at least one SSTable: {lsm}"
         );
 
+        // ---- /admin/storage/scan (browse keys) — the written key is listed -----
+        let (s, scan) = admin_get(leader_admin, "/admin/storage/scan?tablet=1&limit=10").await;
+        assert_eq!(s, 200, "scan returns 200: {scan}");
+        let items = scan["items"].as_array().expect("scan items array");
+        assert!(
+            items
+                .iter()
+                .any(|it| { it["key"] == "admin-key" && it["value"] == "admin-val" }),
+            "browse-keys lists the written pair: {scan}"
+        );
+
         for node in &nodes {
             node.shutdown_graceful().await;
         }

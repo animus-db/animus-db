@@ -115,6 +115,15 @@
       <h2>LSM shape</h2>
       <div id="lsm-body"><div class="empty">pick a tablet + node and Load</div></div>
     </div>
+    <div class="card scroll">
+      <h2>Browse keys</h2>
+      <div class="row">
+        <label>start ≥</label><input type="text" id="scan-start" placeholder="(beginning)">
+        <label>limit</label><input type="text" id="scan-limit" value="50" style="width:5em">
+        <button id="scan-load">Browse</button>
+      </div>
+      <div id="scan-body"><div class="empty">pick a tablet + node and Browse</div></div>
+    </div>
     <div class="card">
       <h2>Key inspector</h2>
       <div class="row">
@@ -377,6 +386,40 @@ async function inspectKey() {
   } catch (e) { $("key-body").innerHTML = `<div class="err-line">${esc(e)}</div>`; }
 }
 
+async function browseKeys() {
+  const tablet = $("st-tablet").value;
+  const base = $("st-node").value;
+  if (!base) { $("scan-body").innerHTML = `<div class="empty">pick a node</div>`; return; }
+  const start = $("scan-start").value;
+  const limit = $("scan-limit").value || "50";
+  const qs = "/admin/storage/scan?tablet=" + tablet
+    + "&start=" + encodeURIComponent(start) + "&limit=" + encodeURIComponent(limit);
+  try {
+    const r = await getJSON(base, qs);
+    if (r.backend === "memory" && r.count === 0) {
+      $("scan-body").innerHTML = `<div class="empty">no live keys (memory backend starts empty)</div>`;
+      return;
+    }
+    const rows = (r.items || []).map((it) =>
+      `<tr><td class="mono"><a href="#" class="keylink" data-key="${esc(it.key)}">${esc(it.key)}</a></td>
+        <td class="mono">${esc(it.value)}</td><td class="mono">${esc(it.value_len)}</td></tr>`).join("");
+    const more = r.truncated
+      ? `<div class="muted">showing first ${esc(r.count)} (truncated at limit ${esc(r.limit)}); set “start ≥” past the last key to page on</div>`
+      : `<div class="muted">${esc(r.count)} live key(s)</div>`;
+    $("scan-body").innerHTML = rows
+      ? more + `<table><thead><tr><th>key</th><th>value</th><th>bytes</th></tr></thead><tbody>${rows}</tbody></table>`
+      : `<div class="empty">no live keys from “${esc(start) || "the beginning"}”</div>`;
+    // Click a key to send it to the inspector below.
+    document.querySelectorAll(".keylink").forEach((a) =>
+      a.addEventListener("click", (e) => {
+        e.preventDefault();
+        $("key-input").value = a.dataset.key;
+        inspectKey();
+        $("key-input").scrollIntoView({ block: "nearest" });
+      }));
+  } catch (e) { $("scan-body").innerHTML = `<div class="err-line">${esc(e)}</div>`; }
+}
+
 // ---- wiring ----
 document.querySelectorAll("nav button").forEach((b) =>
   b.addEventListener("click", () => {
@@ -387,6 +430,7 @@ document.querySelectorAll("nav button").forEach((b) =>
   }));
 $("refresh").addEventListener("click", loadAll);
 $("st-load").addEventListener("click", loadStorage);
+$("scan-load").addEventListener("click", browseKeys);
 $("key-load").addEventListener("click", inspectKey);
 
 let timer = null;
