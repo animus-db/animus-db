@@ -219,8 +219,8 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   shared with `dynamo.rs`). Read-only `GET` views — `/admin/{config,status,raft,
   raftkv,storage/lsm,storage/wal,storage/wal/segment,storage/key,storage/scan,metrics,health}`
   — plus gated `POST` actions — `/admin/{tablet/split,storage/flush,storage/compact,
-  raftkv/reconfigure,drain}` and **data writes** — `/admin/data/{dynamo,cql}` (ADR
-  0021, the dashboard's write surface). Below the edge it only **reads** node state
+  raftkv/reconfigure,drain}` and **data writes** — `/admin/data/{dynamo,cql,drop-table}`
+  (ADR 0021, the dashboard's write surface). Below the edge it only **reads** node state
   (control + CP Raft accessors, `LsmEngine` introspection: `sstable_views`/
   `wal_segment_*`/`memtable_*`, the `CpGroup` introspection passthroughs) aggregated
   live at request time, or drives an explicit action; node identity for `/admin/config`
@@ -255,6 +255,16 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
     surface (still no auth)** — sharpening the bind-to-trusted-interface /
     auth-before-exposure follow-up. `tests/admin_endpoint.rs::admin_data_write_dynamo_and_cql`
     proves a Dynamo Put→Get round-trip + a CREATE/INSERT/SELECT CQL script.
+    - **Dynamo table management + form/JSON sync.** The Dynamo panel lists tables
+      from the replicated catalog (`/admin/status` `schemas.tables`, filtered to
+      plain-named = Dynamo, vs CQL `ks.table`), creates via `CreateTable`, and drops
+      via `POST /admin/data/drop-table` (`ctx.drop_table_schema`; the Dynamo wire has
+      no `DeleteTable`, so this reuses the control-plane drop, schema-only). The op
+      **table is a dropdown of existing tables** — ops are disabled when none exist, so
+      you can't act on a non-existent table. Form and JSON share one request model
+      (`dynModel`) with a Form/JSON **toggle** that syncs both ways (the JSON view is
+      the full request; the form edits TableName + Item/Key, preserving extra fields
+      like `UpdateExpression`). `tests/admin_endpoint.rs::admin_table_management_create_and_drop`.
   - **Gotcha — `/admin/raftkv` is node-local, but in a single `--cluster N` process
     the shared `ClusterEdgeState` registers *every* node's CP group handle, so one
     node's view lists all replicas; a one-process-per-node deployment (separate edge

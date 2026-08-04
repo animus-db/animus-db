@@ -354,3 +354,60 @@ async fn admin_data_write_dynamo_and_cql() {
     .await
     .expect("test timed out");
 }
+
+/// Table management (ADR 0021): a DynamoDB `CreateTable` via the write proxy shows
+/// up in the replicated catalog (`/admin/status`), then `/admin/data/drop-table`
+/// removes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn admin_table_management_create_and_drop() {
+    timeout(Duration::from_secs(60), async {
+        let dir = tempfile::tempdir().unwrap();
+        let (nodes, _config) = bring_up(3, dir.path()).await;
+        await_bootstrap(&nodes).await;
+        let a = nodes[0].admin_addr();
+
+        let has_widgets = || async {
+            let (_, status) = admin_get(a, "/admin/status").await;
+            status["schemas"]["tables"]
+                .get("widgets")
+                .is_some_and(|v| !v.is_null())
+        };
+
+        // Create.
+        let (s, body) = admin(
+            a,
+            "POST",
+            "/admin/data/dynamo",
+            Some(
+                r#"{"op":"CreateTable","payload":{"TableName":"widgets","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}]}}"#,
+            ),
+        )
+        .await;
+        assert_eq!(s, 200, "CreateTable via admin proxy: {body}");
+        timeout(Duration::from_secs(10), async {
+            while !has_widgets().await {
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("created table did not appear in the catalog");
+
+        // Drop.
+        let (s, body) =
+            admin(a, "POST", "/admin/data/drop-table", Some(r#"{"table":"widgets"}"#)).await;
+        assert_eq!(s, 200, "drop-table: {body}");
+        timeout(Duration::from_secs(10), async {
+            while has_widgets().await {
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("dropped table still in the catalog");
+
+        for node in &nodes {
+            node.shutdown_graceful().await;
+        }
+    })
+    .await
+    .expect("test timed out");
+}

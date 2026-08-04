@@ -265,9 +265,12 @@ The dashboard is a debug/operability tool, not a correctness surface; its bar is
 3. ✅ Read panels: WAL (segments + decoded records) and storage (LSM shape + key
    inspector + a browse-keys list, `/admin/storage/scan`).
 4. ✅ **Data writes — a Write tab** (built ahead of the ADR-0018 sequencing, on
-   request): DynamoDB CRUD (form + raw JSON) and a full DDL+DML CQL editor,
-   **proxied through the admin port** (`POST /admin/data/{dynamo,cql}`) — Dynamo by
-   reusing the edge in-process, CQL by driving the node's own CQL port as a
+   request): DynamoDB CRUD and a full DDL+DML CQL editor, **proxied through the
+   admin port** (`POST /admin/data/{dynamo,cql,drop-table}`). The Dynamo panel adds
+   **table management** (list from the replicated catalog, create, drop) and
+   restricts ops to a **dropdown of existing tables** (can't act on a non-existent
+   table), with a **Form/JSON toggle** over one shared request model that syncs both
+   ways — Dynamo by reusing the edge in-process, CQL by driving the node's own CQL port as a
    loopback client (the browser can't speak the CQL binary protocol). This
    **extends the admin port into a data-write + DDL surface** — see the added
    consequence below. Operator actions (split/flush/compact/reconfigure/drain) wired

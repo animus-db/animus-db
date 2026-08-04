@@ -57,6 +57,9 @@
   .empty { color: var(--dim); padding: 10px; font-style: italic; }
   code { font-family: var(--mono); background: var(--panel2); padding: 1px 5px; border-radius: 4px; }
   .err-line { color: var(--bad); }
+  .seg { padding: 4px 12px; }
+  .seg.active { border-color: var(--accent); color: var(--fg); background: var(--panel2); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
 </style>
 </head>
 <body>
@@ -140,15 +143,32 @@
       <span class="banner">⚠ these write to the live cluster (no auth — trusted interface only)</span>
     </div>
     <div class="card scroll">
-      <h2>DynamoDB</h2>
+      <h2>DynamoDB tables</h2>
+      <div class="row">
+        <label>name</label><input type="text" id="dy-ct-name" placeholder="table name">
+        <label>partition key</label><input type="text" id="dy-ct-pk" value="pk" style="width:7em">
+        <select id="dy-ct-pkt"><option>S</option><option>N</option></select>
+        <label>sort key</label><input type="text" id="dy-ct-sk" placeholder="(none)" style="width:7em">
+        <select id="dy-ct-skt"><option>S</option><option>N</option></select>
+        <button id="dy-ct-create">Create table</button>
+        <span class="muted" id="dy-ct-msg"></span>
+      </div>
+      <div id="dy-tables"><div class="empty">loading…</div></div>
+    </div>
+    <div class="card scroll">
+      <h2>DynamoDB operation</h2>
       <div class="row">
         <label>op</label>
         <select id="dy-op">
           <option>PutItem</option><option>GetItem</option><option>UpdateItem</option>
           <option>DeleteItem</option><option>Query</option><option>Scan</option>
         </select>
-        <label>table</label><input type="text" id="dy-table" value="t">
-        <button id="dy-build">Build JSON ▾</button>
+        <label>table</label><select id="dy-table"></select>
+        <span class="muted" id="dy-no-tables" style="display:none">create a table first</span>
+        <span class="spacer"></span>
+        <span class="muted">view</span>
+        <button id="dy-view-form" class="seg active">Form</button>
+        <button id="dy-view-json" class="seg">JSON</button>
       </div>
       <div id="dy-form">
         <table id="dy-attrs"><thead><tr><th>attribute</th><th>type</th><th>value</th><th></th></tr></thead>
@@ -156,8 +176,8 @@
         <button id="dy-add-attr">+ attribute</button>
         <span class="muted" id="dy-form-hint"></span>
       </div>
-      <div class="row" style="align-items:flex-start">
-        <textarea id="dy-raw" rows="8" style="width:100%; font-family:var(--mono); background:var(--panel2); color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:8px"></textarea>
+      <div id="dy-json" style="display:none">
+        <textarea id="dy-raw" rows="10" style="width:100%; font-family:var(--mono); background:var(--panel2); color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:8px"></textarea>
       </div>
       <div class="row"><button id="dy-send">Send to cluster</button></div>
       <div id="dy-result"></div>
@@ -277,6 +297,7 @@ function render() {
   renderNodes();
   renderTablets();
   renderStorageSelectors();
+  renderDynamoTables();
 }
 
 function renderNodes() {
@@ -476,6 +497,24 @@ async function browseKeys() {
 }
 
 // ---- Write tab: DynamoDB ----
+// A single request model (`dynModel`) is the source of truth; the Form and JSON
+// views read/write it and the toggle syncs between them. The op + table row is
+// shared by both views; the table is a dropdown of *existing* tables only.
+let dynModel = { TableName: "", Item: {} };
+let dynView = "form";
+const DY_ATTR_OPS = ["PutItem", "GetItem", "DeleteItem", "UpdateItem"];
+
+// The Dynamo tables known to the cluster (from the replicated catalog in
+// /admin/status), keyed by name. Dynamo tables are plain-named; CQL tables are
+// `ks.table`, so we filter those out.
+function dynamoTables() {
+  const t = STATE.status && STATE.status.schemas && STATE.status.schemas.tables;
+  if (!t) return {};
+  const out = {};
+  for (const k of Object.keys(t)) if (!k.includes(".")) out[k] = t[k];
+  return out;
+}
+
 function addAttrRow(name = "", type = "S", value = "") {
   const tr = document.createElement("tr");
   tr.innerHTML = `<td><input type="text" class="dy-n" value="${esc(name)}"></td>
@@ -499,32 +538,169 @@ function attrValue(a) {
   if (a.type === "BOOL") return { BOOL: a.value === "true" || a.value === "1" };
   return { S: a.value };
 }
-function buildDynamoJson() {
-  const op = $("dy-op").value, table = $("dy-table").value.trim();
-  const av = {}; dyAttrs().forEach((a) => { av[a.name] = attrValue(a); });
-  let payload, hint;
-  switch (op) {
-    case "PutItem": payload = { TableName: table, Item: av }; hint = "attributes = the full Item"; break;
-    case "GetItem": payload = { TableName: table, Key: av }; hint = "attributes = the Key"; break;
-    case "DeleteItem": payload = { TableName: table, Key: av }; hint = "attributes = the Key"; break;
-    case "UpdateItem": payload = { TableName: table, Key: av,
-      UpdateExpression: "SET v = :v", ExpressionAttributeValues: { ":v": { S: "new" } } };
-      hint = "attributes = the Key; edit the raw JSON for the update expression"; break;
-    case "Query": payload = { TableName: table, KeyConditionExpression: "pk = :pk",
-      ExpressionAttributeValues: { ":pk": { S: "..." } } }; hint = "edit the raw JSON for the key condition"; break;
-    case "Scan": payload = { TableName: table, Limit: 25 }; hint = "edit the raw JSON to add a filter"; break;
-    default: payload = { TableName: table }; hint = "";
-  }
-  $("dy-raw").value = JSON.stringify(payload, null, 2);
-  $("dy-form-hint").textContent = hint;
+function currentAv() {
+  const av = {}; dyAttrs().forEach((a) => { av[a.name] = attrValue(a); }); return av;
 }
+function avToAttrs(av) {
+  if (!av || typeof av !== "object") return [];
+  return Object.entries(av).map(([name, val]) => {
+    const type = val.N != null ? "N" : (val.BOOL != null ? "BOOL" : "S");
+    const value = val.N != null ? val.N : (val.BOOL != null ? String(val.BOOL) : (val.S != null ? val.S : ""));
+    return { name, type, value };
+  });
+}
+
+// A fresh request skeleton for `op` against `table`.
+function dynSkeleton(op, table) {
+  switch (op) {
+    case "PutItem": return { TableName: table, Item: {} };
+    case "GetItem": return { TableName: table, Key: {} };
+    case "DeleteItem": return { TableName: table, Key: {} };
+    case "UpdateItem": return { TableName: table, Key: {},
+      UpdateExpression: "SET v = :v", ExpressionAttributeValues: { ":v": { S: "new" } } };
+    case "Query": return { TableName: table, KeyConditionExpression: "pk = :pk",
+      ExpressionAttributeValues: { ":pk": { S: "..." } } };
+    case "Scan": return { TableName: table, Limit: 25 };
+    default: return { TableName: table };
+  }
+}
+
+// Capture the active view's edits into dynModel.
+function dynSyncFromForm() {
+  dynModel.TableName = $("dy-table").value;
+  const op = $("dy-op").value;
+  if (op === "PutItem") dynModel.Item = currentAv();
+  else if (DY_ATTR_OPS.includes(op)) dynModel.Key = currentAv();
+  // Query/Scan have no attr form — their fields live only in the JSON view.
+}
+function dynSyncFromJson() { dynModel = JSON.parse($("dy-raw").value); }
+
+// Render the active view from dynModel.
+function dynRender() {
+  const op = $("dy-op").value;
+  const usesAttrs = DY_ATTR_OPS.includes(op);
+  $("dy-view-form").classList.toggle("active", dynView === "form");
+  $("dy-view-json").classList.toggle("active", dynView === "json");
+  if (dynView === "json") {
+    $("dy-form").style.display = "none";
+    $("dy-json").style.display = "";
+    $("dy-raw").value = JSON.stringify(dynModel, null, 2);
+    return;
+  }
+  $("dy-form").style.display = "";
+  $("dy-json").style.display = "none";
+  if (dynModel.TableName && [...$("dy-table").options].some((o) => o.value === dynModel.TableName)) {
+    $("dy-table").value = dynModel.TableName;
+  }
+  const show = usesAttrs ? "" : "none";
+  $("dy-attrs").style.display = show;
+  $("dy-add-attr").style.display = show;
+  $("dy-attrs").querySelector("tbody").innerHTML = "";
+  if (usesAttrs) {
+    const rows = avToAttrs(op === "PutItem" ? dynModel.Item : dynModel.Key);
+    if (rows.length) rows.forEach((a) => addAttrRow(a.name, a.type, a.value));
+    else addAttrRow();
+    $("dy-form-hint").textContent = op === "PutItem" ? "attributes = the full Item" : "attributes = the Key";
+  } else {
+    $("dy-form-hint").textContent = "switch to JSON to edit this operation's request";
+  }
+}
+
+function dynSetView(view) {
+  if (view === dynView) return;
+  if (view === "json") { dynSyncFromForm(); }
+  else {
+    try { dynSyncFromJson(); }
+    catch (e) { $("dy-result").innerHTML = `<div class="err-line">invalid JSON — fix it before switching: ${esc(e)}</div>`; return; }
+  }
+  dynView = view;
+  dynRender();
+}
+function dynOnOp() {
+  const prevAv = currentAv();
+  dynModel = dynSkeleton($("dy-op").value, $("dy-table").value);
+  const op = $("dy-op").value;
+  if (Object.keys(prevAv).length) {
+    if (op === "PutItem") dynModel.Item = prevAv;
+    else if (DY_ATTR_OPS.includes(op)) dynModel.Key = prevAv;
+  }
+  dynRender();
+}
+function dynOnTable() {
+  if (dynView === "json") { try { dynSyncFromJson(); } catch { /* keep model */ } }
+  dynModel.TableName = $("dy-table").value;
+  dynRender();
+}
+
+// Render the tables card + (re)populate the op table dropdown; disable ops when
+// there are no tables (you can't act on a table that doesn't exist).
+function renderDynamoTables() {
+  const tables = dynamoTables();
+  const names = Object.keys(tables).sort();
+  // Management list.
+  $("dy-tables").innerHTML = names.length
+    ? `<table><thead><tr><th>table</th><th>partition key</th><th>sort key</th><th></th></tr></thead><tbody>`
+      + names.map((n) => {
+          const s = tables[n];
+          const sk = (s.clustering_keys && s.clustering_keys[0]) || "";
+          return `<tr><td class="mono">${esc(n)}</td><td class="mono">${esc(s.partition_key || "")}</td>
+            <td class="mono">${sk ? esc(sk) : "<span class='muted'>—</span>"}</td>
+            <td><a href="#" class="dy-drop" data-t="${esc(n)}">drop</a></td></tr>`;
+        }).join("")
+      + `</tbody></table>`
+    : `<div class="empty">no DynamoDB tables — create one above</div>`;
+  $("dy-tables").querySelectorAll(".dy-drop").forEach((a) =>
+    a.addEventListener("click", (e) => { e.preventDefault(); dropTable(a.dataset.t); }));
+  // Op table dropdown (preserve selection).
+  const sel = $("dy-table");
+  const prev = sel.value;
+  sel.innerHTML = names.map((n) => `<option>${esc(n)}</option>`).join("");
+  if (names.includes(prev)) sel.value = prev;
+  else if (names.length) { sel.value = names[0]; dynModel.TableName = names[0]; }
+  const none = names.length === 0;
+  $("dy-no-tables").style.display = none ? "" : "none";
+  ["dy-op", "dy-table", "dy-send", "dy-add-attr"].forEach((id) => { $(id).disabled = none; });
+}
+
+async function createTable() {
+  const name = $("dy-ct-name").value.trim();
+  const pk = $("dy-ct-pk").value.trim();
+  const sk = $("dy-ct-sk").value.trim();
+  if (!name || !pk) { $("dy-ct-msg").textContent = "name and partition key are required"; return; }
+  const keySchema = [{ AttributeName: pk, KeyType: "HASH" }];
+  const attrDefs = [{ AttributeName: pk, AttributeType: $("dy-ct-pkt").value }];
+  if (sk) {
+    keySchema.push({ AttributeName: sk, KeyType: "RANGE" });
+    attrDefs.push({ AttributeName: sk, AttributeType: $("dy-ct-skt").value });
+  }
+  const payload = { TableName: name, KeySchema: keySchema, AttributeDefinitions: attrDefs };
+  $("dy-ct-msg").textContent = "creating…";
+  try {
+    const { status, body } = await postJSON(SEED, "/admin/data/dynamo", { op: "CreateTable", payload });
+    if (status >= 300) { $("dy-ct-msg").textContent = (body && body.message) || ("HTTP " + status); return; }
+    $("dy-ct-msg").textContent = "created " + name;
+    $("dy-ct-name").value = "";
+    await loadAll();
+    $("dy-table").value = name; dynModel.TableName = name; dynRender();
+  } catch (e) { $("dy-ct-msg").textContent = String(e); }
+}
+async function dropTable(name) {
+  if (!window.confirm(`Drop table “${name}”? Its schema is removed (existing rows are not garbage-collected).`)) return;
+  $("dy-ct-msg").textContent = "dropping…";
+  try {
+    const { status, body } = await postJSON(SEED, "/admin/data/drop-table", { table: name });
+    $("dy-ct-msg").textContent = status < 300 ? "dropped " + name : ((body && body.error) || ("HTTP " + status));
+    await loadAll();
+  } catch (e) { $("dy-ct-msg").textContent = String(e); }
+}
+
 async function sendDynamo() {
-  let payload;
-  try { payload = JSON.parse($("dy-raw").value); }
+  try { if (dynView === "form") dynSyncFromForm(); else dynSyncFromJson(); }
   catch (e) { $("dy-result").innerHTML = `<div class="err-line">invalid JSON: ${esc(e)}</div>`; return; }
+  if (!dynModel.TableName) { $("dy-result").innerHTML = `<div class="err-line">no table selected</div>`; return; }
   const op = $("dy-op").value;
   try {
-    const { status, body } = await postJSON(SEED, "/admin/data/dynamo", { op, payload });
+    const { status, body } = await postJSON(SEED, "/admin/data/dynamo", { op, payload: dynModel });
     const cls = status < 300 ? "ok" : "err";
     $("dy-result").innerHTML = `<div class="muted">${pill(cls, "HTTP " + status)}</div>`
       + `<pre class="mono" style="white-space:pre-wrap">${esc(JSON.stringify(body, null, 2))}</pre>`;
@@ -573,13 +749,17 @@ $("st-load").addEventListener("click", loadStorage);
 $("scan-load").addEventListener("click", browseKeys);
 $("key-load").addEventListener("click", inspectKey);
 $("dy-add-attr").addEventListener("click", () => addAttrRow());
-$("dy-build").addEventListener("click", buildDynamoJson);
-$("dy-op").addEventListener("change", buildDynamoJson);
+$("dy-op").addEventListener("change", dynOnOp);
+$("dy-table").addEventListener("change", dynOnTable);
+$("dy-view-form").addEventListener("click", () => dynSetView("form"));
+$("dy-view-json").addEventListener("click", () => dynSetView("json"));
 $("dy-send").addEventListener("click", sendDynamo);
+$("dy-ct-create").addEventListener("click", createTable);
 $("cql-run").addEventListener("click", runCql);
-// Seed the Dynamo form with one attribute row + an initial built payload.
-addAttrRow("pk", "S", "alice");
-buildDynamoJson();
+// Initialize the Dynamo editor (table dropdown is filled by renderDynamoTables
+// once /admin/status loads).
+dynModel = dynSkeleton("PutItem", "");
+dynRender();
 
 let timer = null;
 function arm() {

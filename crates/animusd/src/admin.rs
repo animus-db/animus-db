@@ -39,6 +39,7 @@
 //! - `POST /admin/drain`               — `{node}`
 //! - `POST /admin/data/dynamo`         — run a DynamoDB op `{op, payload}` (ADR 0021)
 //! - `POST /admin/data/cql`            — run CQL `{query, keyspace?}` (ADR 0021)
+//! - `POST /admin/data/drop-table`     — drop a table's schema `{table}` (ADR 0021)
 
 use animus_env::NodeId;
 use animus_storage::WalRecordView;
@@ -183,6 +184,7 @@ async fn dispatch(ctx: &ClientCtx, request: &http::HttpRequest) -> (u16, String)
         ("POST", "/admin/drain") => action_drain(ctx, &request.body),
         ("POST", "/admin/data/dynamo") => action_data_dynamo(ctx, &request.body).await,
         ("POST", "/admin/data/cql") => action_data_cql(ctx, &request.body).await,
+        ("POST", "/admin/data/drop-table") => action_drop_table(ctx, &request.body).await,
         // A known admin path with the wrong verb vs an unknown path.
         ("GET" | "POST", p) if p.starts_with("/admin/") => {
             (404, json!({"error": format!("unknown admin route {p}")}))
@@ -646,6 +648,28 @@ async fn action_data_cql(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
     match crate::cql_client::run(ctx.admin.cql_addr, req.keyspace.as_deref(), &req.query).await {
         Ok(results) => (200, json!({ "results": results })),
         Err(e) => (502, json!({ "error": e })),
+    }
+}
+
+#[derive(Deserialize)]
+struct DropTableReq {
+    table: String,
+}
+
+/// `POST /admin/data/drop-table {table}` — remove a table's schema from the
+/// replicated catalog (ADR 0021 table management). Reuses the control-plane
+/// `DropTableSchema` path (as CQL `DROP TABLE` does); idempotent. The DynamoDB
+/// wire has no `DeleteTable`, so this is the dashboard's delete primitive. Note it
+/// drops the *schema* (so the table no longer "exists"); any already-written rows
+/// are not garbage-collected here.
+async fn action_drop_table(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
+    let req: DropTableReq = match parse_body(body) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    match ctx.drop_table_schema(req.table.clone()).await {
+        Ok(()) => (200, json!({ "ok": true, "table": req.table })),
+        Err(e) => (409, json!({ "error": e })),
     }
 }
 
