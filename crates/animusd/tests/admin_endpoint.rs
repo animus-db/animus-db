@@ -427,3 +427,57 @@ async fn admin_table_management_create_and_drop() {
     .await
     .expect("test timed out");
 }
+
+/// The bulk-seed endpoint (ADR 0021) writes the requested number of synthetic keys
+/// to the CP plane, and they land durably (visible in the CP leader's storage).
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn admin_seed_writes_synthetic_keys() {
+    timeout(Duration::from_secs(60), async {
+        let dir = tempfile::tempdir().unwrap();
+        let (nodes, _config) = bring_up(3, dir.path()).await;
+        await_bootstrap(&nodes).await;
+        let a = nodes[0].admin_addr();
+
+        let (s, body) = admin(
+            a,
+            "POST",
+            "/admin/data/seed",
+            Some(r#"{"count":60,"key_prefix":"seed:","value_bytes":8}"#),
+        )
+        .await;
+        assert_eq!(s, 200, "seed returns 200: {body}");
+        assert_eq!(body["written"], 60, "seed wrote all requested keys: {body}");
+
+        // The seeded keys are durably in the CP leader's local storage.
+        let mut leader_admin = None;
+        for node in &nodes {
+            let (_, rk) = admin_get(node.admin_addr(), "/admin/raftkv").await;
+            if rk["groups"][0]["is_leader"].as_bool() == Some(true) {
+                leader_admin = Some(node.admin_addr());
+                break;
+            }
+        }
+        let leader_admin = leader_admin.expect("a CP group leader exists");
+        let (s, scan) = admin_get(leader_admin, "/admin/storage/scan?tablet=1&limit=200").await;
+        assert_eq!(s, 200);
+        let seeded = scan["items"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter(|it| it["key"].as_str().is_some_and(|k| k.starts_with("seed:")))
+                    .count()
+            })
+            .unwrap_or(0);
+        assert!(
+            seeded >= 60,
+            "all seeded keys are in the leader's storage: {scan}"
+        );
+
+        for node in &nodes {
+            node.shutdown_graceful().await;
+        }
+    })
+    .await
+    .expect("test timed out");
+}

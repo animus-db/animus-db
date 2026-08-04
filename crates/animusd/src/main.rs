@@ -5,7 +5,7 @@
 //! ```text
 //! animusd gen-config --nodes N [--host H] [--base-port P]   # print a cluster config (JSON)
 //! animusd --config FILE --node I [--dir DIR] [--ephemeral] # run node I of a cluster (one process)
-//! animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral]# run an N-node cluster in one process
+//! animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] # run an N-node cluster in one process
 //! ```
 //!
 //! The data replica is durable by default (an on-disk LSM under the node's data
@@ -45,7 +45,7 @@ async fn main() -> ExitCode {
 const USAGE: &str = "usage:\n  \
     animusd gen-config --nodes N [--host H] [--base-port P]\n  \
     animusd --config FILE --node I [--dir DIR] [--ephemeral]\n  \
-    animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral]";
+    animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K]";
 
 /// `gen-config`: print a generated cluster config as JSON.
 fn gen_config(args: &[String]) -> Result<(), String> {
@@ -82,6 +82,10 @@ async fn run(args: &[String]) -> Result<(), String> {
     // Data replica engine: durable on-disk LSM by default; `--ephemeral` selects
     // the volatile in-memory engine (data does not survive restart).
     let mut backend = animusd::StorageBackend::default();
+    // `--auto-split K`: in `--cluster` mode, a CP-hosting node auto-splits a tablet
+    // it leads once it exceeds K keys (Phase 2.4). Handy for testing sharding by
+    // bulk-seeding past the threshold.
+    let mut auto_split: Option<usize> = None;
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -92,6 +96,7 @@ async fn run(args: &[String]) -> Result<(), String> {
             "--dir" => dir = Some(parse_next::<String>(&mut it, "--dir")?.into()),
             "--ip" => ip = parse_next(&mut it, "--ip")?,
             "--ephemeral" => backend = animusd::StorageBackend::Memory,
+            "--auto-split" => auto_split = Some(parse_next(&mut it, "--auto-split")?),
             other => return Err(format!("unknown argument `{other}`")),
         }
     }
@@ -102,7 +107,7 @@ async fn run(args: &[String]) -> Result<(), String> {
             let index = node.ok_or("--config requires --node I")?;
             run_single(&path, index, dir, backend).await
         }
-        (None, Some(n)) => run_in_process_cluster(n, ip, dir, backend).await,
+        (None, Some(n)) => run_in_process_cluster(n, ip, dir, backend, auto_split).await,
         (None, None) => Err("nothing to do".into()),
     }
 }
@@ -141,6 +146,7 @@ async fn run_in_process_cluster(
     ip: IpAddr,
     dir: Option<std::path::PathBuf>,
     backend: animusd::StorageBackend,
+    auto_split: Option<usize>,
 ) -> Result<(), String> {
     if n == 0 {
         return Err("--cluster must be at least 1".into());
@@ -149,11 +155,16 @@ async fn run_in_process_cluster(
     let bound = animusd::bind_cluster(n, ip, &dir)
         .await
         .map_err(|e| format!("failed to bind cluster: {e}"))?;
-    let nodes = animusd::start_cluster_with(bound, backend)
+    let nodes = animusd::start_cluster_with_auto_split(bound, backend, auto_split)
         .await
         .map_err(|e| format!("failed to start cluster: {e}"))?;
 
-    println!("animusd: started {n}-node cluster (CP)");
+    match auto_split {
+        Some(k) => {
+            println!("animusd: started {n}-node cluster (CP) — auto-split at {k} keys/tablet")
+        }
+        None => println!("animusd: started {n}-node cluster (CP)"),
+    }
     for (i, node) in nodes.iter().enumerate() {
         println!(
             "  node {i}: client {} — dynamo http {} — cql {} — admin {}",

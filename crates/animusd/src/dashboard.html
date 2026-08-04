@@ -196,6 +196,20 @@ SELECT * FROM t WHERE id = 1;"></textarea>
       <div class="row"><button id="cql-run">Run</button> <span class="muted">statements split on “;” and run in order on one connection</span></div>
       <div id="cql-result"></div>
     </div>
+
+    <div class="card scroll">
+      <h2>Bulk seed (sharding test)</h2>
+      <div class="muted" style="margin-bottom:8px">Writes synthetic keys to the CP plane to grow a tablet. Run the cluster with <code>--auto-split K</code> to watch tablets split in the Tablets tab as the count crosses K.</div>
+      <div class="row">
+        <label>key prefix</label><input type="text" id="seed-prefix" value="seed:" style="width:7em">
+        <label>value bytes</label><input type="text" id="seed-vbytes" value="64" style="width:5em">
+        <label>total</label><input type="text" id="seed-total" value="10000" style="width:7em">
+        <label>chunk</label><input type="text" id="seed-chunk" value="2000" style="width:6em">
+        <button id="seed-go">Seed</button>
+        <button id="seed-stop" disabled>Stop</button>
+      </div>
+      <div id="seed-status"></div>
+    </div>
   </section>
 </main>
 
@@ -780,6 +794,50 @@ function renderCqlResult(r) {
   return head + `<div class="muted">${pill("ok", "ok")}</div>`;
 }
 
+// ---- Write tab: bulk seed ----
+let seeding = false;
+async function seedRun() {
+  if (seeding) return;
+  const prefix = $("seed-prefix").value;
+  const vbytes = Math.max(0, parseInt($("seed-vbytes").value, 10) || 0);
+  const total = Math.max(0, parseInt($("seed-total").value, 10) || 0);
+  const chunk = Math.max(1, parseInt($("seed-chunk").value, 10) || 1000);
+  if (!total) { $("seed-status").innerHTML = `<div class="empty">set a total</div>`; return; }
+  seeding = true;
+  $("seed-go").disabled = true;
+  $("seed-stop").disabled = false;
+  let done = 0;
+  const t0 = Date.now();
+  try {
+    while (done < total && seeding) {
+      const count = Math.min(chunk, total - done);
+      const { status, body } = await postJSON(SEED, "/admin/data/seed",
+        { count, start: done, key_prefix: prefix, value_bytes: vbytes });
+      if (status >= 300) {
+        $("seed-status").innerHTML = `<div class="err-line">${esc((body && body.error) || ("HTTP " + status))}</div>`;
+        break;
+      }
+      const wrote = body.written || 0;
+      done += wrote;
+      const secs = Math.max(0.001, (Date.now() - t0) / 1000);
+      const rate = Math.round(done / secs);
+      $("seed-status").innerHTML =
+        `<div class="muted">seeded ${done.toLocaleString()} / ${total.toLocaleString()} keys · ${rate.toLocaleString()}/s`
+        + (body.error ? ` · <span class="err-line">last error: ${esc(body.error)}</span>` : "") + `</div>`;
+      if (wrote === 0) break; // persistent failure — don't spin
+      await loadAll(); // refresh Nodes/Tablets so splits show live
+    }
+    if (done >= total) $("seed-status").innerHTML += `<div>${pill("ok", "done — " + done.toLocaleString() + " keys")}</div>`;
+    else if (!seeding) $("seed-status").innerHTML += `<div class="muted">stopped at ${done.toLocaleString()}</div>`;
+  } catch (e) {
+    $("seed-status").innerHTML = `<div class="err-line">${esc(e)}</div>`;
+  } finally {
+    seeding = false;
+    $("seed-go").disabled = false;
+    $("seed-stop").disabled = true;
+  }
+}
+
 // ---- wiring ----
 document.querySelectorAll("nav button").forEach((b) =>
   b.addEventListener("click", () => {
@@ -800,6 +858,8 @@ $("dy-view-json").addEventListener("click", () => dynSetView("json"));
 $("dy-send").addEventListener("click", sendDynamo);
 $("dy-ct-create").addEventListener("click", createTable);
 $("cql-run").addEventListener("click", runCql);
+$("seed-go").addEventListener("click", seedRun);
+$("seed-stop").addEventListener("click", () => { seeding = false; });
 // Initialize the Dynamo editor (table dropdown is filled by renderDynamoTables
 // once /admin/status loads).
 dynModel = dynSkeleton("PutItem", "");

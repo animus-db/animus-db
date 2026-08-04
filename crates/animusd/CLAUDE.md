@@ -224,7 +224,7 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   shared with `dynamo.rs`). Read-only `GET` views — `/admin/{config,status,raft,
   raftkv,storage/lsm,storage/wal,storage/wal/segment,storage/key,storage/scan,metrics,health}`
   — plus gated `POST` actions — `/admin/{tablet/split,storage/flush,storage/compact,
-  raftkv/reconfigure,drain}` and **data writes** — `/admin/data/{dynamo,cql,drop-table}`
+  raftkv/reconfigure,drain}` and **data writes** — `/admin/data/{dynamo,cql,drop-table,seed}`
   (ADR 0021, the dashboard's write surface). Below the edge it only **reads** node state
   (control + CP Raft accessors, `LsmEngine` introspection: `sstable_views`/
   `wal_segment_*`/`memtable_*`, the `CpGroup` introspection passthroughs) aggregated
@@ -273,6 +273,17 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
       that table's key attributes** — partition key + sort key, typed from the catalog
       (S/N/B) — into both views. `tests/admin_endpoint.rs::admin_table_management_create_and_drop`
       (also asserts a numeric sort key's type reaches the catalog).
+    - **Bulk seed for sharding tests.** `POST /admin/data/seed {count, start?,
+      key_prefix?, value_bytes?}` writes synthetic keys (`key_prefix` + zero-padded
+      index) to the CP plane via the normal durable `cp_write`, with bounded
+      concurrency (`SEED_CONCURRENCY`) to amortize WAL group-commit; capped at
+      `SEED_MAX_PER_REQUEST` per call. The dashboard's **Bulk seed** card chunks a
+      larger total into requests, showing progress + refreshing the Tablets view so
+      splits appear live. Combined with the binary's **`--cluster N --auto-split K`**
+      flag (a CP-hosting node splits a tablet it leads once it exceeds K keys, Phase
+      2.4, via `start_cluster_with_auto_split`), seeding past K auto-shards the
+      keyspace — verified end to end (seed 12k keys, `--auto-split 4000` → 5 tablets).
+      `tests/admin_endpoint.rs::admin_seed_writes_synthetic_keys`.
   - **Gotcha — `/admin/raftkv` is node-local, but in a single `--cluster N` process
     the shared `ClusterEdgeState` registers *every* node's CP group handle, so one
     node's view lists all replicas; a one-process-per-node deployment (separate edge

@@ -2573,6 +2573,20 @@ pub async fn start_cluster_auto_split(
     start_cluster_inner(bound, StorageBackend::default(), Some(threshold)).await
 }
 
+/// Like [`start_cluster_with`], but also enables the **automatic split trigger**
+/// (Phase 2.4) when `auto_split` is `Some(threshold)` — so the chosen `backend`
+/// and the trigger can be combined (e.g. `--cluster N --ephemeral --auto-split K`).
+///
+/// # Errors
+/// Propagates a failure to open any node's CP group engine.
+pub async fn start_cluster_with_auto_split(
+    bound: Vec<BoundNode>,
+    backend: StorageBackend,
+    auto_split: Option<usize>,
+) -> std::io::Result<Vec<Node>> {
+    start_cluster_inner(bound, backend, auto_split).await
+}
+
 async fn start_cluster_inner(
     bound: Vec<BoundNode>,
     backend: StorageBackend,

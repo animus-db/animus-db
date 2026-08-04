@@ -40,6 +40,7 @@
 //! - `POST /admin/data/dynamo`         — run a DynamoDB op `{op, payload}` (ADR 0021)
 //! - `POST /admin/data/cql`            — run CQL `{query, keyspace?}` (ADR 0021)
 //! - `POST /admin/data/drop-table`     — drop a table's schema `{table}` (ADR 0021)
+//! - `POST /admin/data/seed`           — bulk-write synthetic keys `{count, …}` (ADR 0021)
 
 use animus_env::NodeId;
 use animus_storage::WalRecordView;
@@ -185,6 +186,7 @@ async fn dispatch(ctx: &ClientCtx, request: &http::HttpRequest) -> (u16, String)
         ("POST", "/admin/data/dynamo") => action_data_dynamo(ctx, &request.body).await,
         ("POST", "/admin/data/cql") => action_data_cql(ctx, &request.body).await,
         ("POST", "/admin/data/drop-table") => action_drop_table(ctx, &request.body).await,
+        ("POST", "/admin/data/seed") => action_data_seed(ctx, &request.body).await,
         // A known admin path with the wrong verb vs an unknown path.
         ("GET" | "POST", p) if p.starts_with("/admin/") => {
             (404, json!({"error": format!("unknown admin route {p}")}))
@@ -671,6 +673,96 @@ async fn action_drop_table(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
         Ok(()) => (200, json!({ "ok": true, "table": req.table })),
         Err(e) => (409, json!({ "error": e })),
     }
+}
+
+/// Most keys a single `/admin/data/seed` request will write (the dashboard chunks
+/// a larger seed into several requests so it can show progress + let tablets split
+/// between chunks).
+const SEED_MAX_PER_REQUEST: u64 = 200_000;
+/// Cap on a synthetic value's size.
+const SEED_MAX_VALUE_BYTES: usize = 1 << 20;
+/// In-flight `cp_write`s per seed request — enough to amortize WAL group-commit
+/// without overwhelming the leader.
+const SEED_CONCURRENCY: u64 = 64;
+
+#[derive(Deserialize)]
+struct SeedReq {
+    /// How many keys to write this request.
+    count: u64,
+    /// First index (keys are `key_prefix + zero-padded index`); the dashboard
+    /// advances this per chunk.
+    #[serde(default)]
+    start: u64,
+    /// Key prefix (default `seed:`); all seeded keys share it, so they form a
+    /// contiguous range a tablet split can bisect.
+    #[serde(default)]
+    key_prefix: Option<String>,
+    /// Synthetic value size in bytes (default 64).
+    #[serde(default)]
+    value_bytes: Option<usize>,
+}
+
+/// `POST /admin/data/seed {count, start?, key_prefix?, value_bytes?}` — bulk-write
+/// synthetic keys to the CP plane to drive sharding tests (ADR 0021). Keys are
+/// `key_prefix + zero-padded (start..start+count)` with a filler value; they go
+/// through the normal durable `cp_write` path (routed to the leader), written with
+/// bounded concurrency to amortize WAL group-commit. With `--auto-split` enabled,
+/// crossing the key-count threshold splits the tablet — visible live in the
+/// Tablets view.
+async fn action_data_seed(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
+    let req: SeedReq = match parse_body(body) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    let count = req.count.min(SEED_MAX_PER_REQUEST);
+    let prefix = req.key_prefix.unwrap_or_else(|| "seed:".to_string());
+    let value_bytes = req.value_bytes.unwrap_or(64).min(SEED_MAX_VALUE_BYTES);
+    let value = vec![b'x'; value_bytes];
+
+    let mut written = 0u64;
+    let mut first_err: Option<String> = None;
+    let mut i = 0u64;
+    while i < count {
+        let batch = (count - i).min(SEED_CONCURRENCY);
+        let mut set = tokio::task::JoinSet::new();
+        for j in 0..batch {
+            let key = format!("{prefix}{:012}", req.start + i + j).into_bytes();
+            let val = value.clone();
+            let c = ctx.clone();
+            set.spawn(async move { c.cp_write(key, val).await });
+        }
+        while let Some(res) = set.join_next().await {
+            match res {
+                Ok(Ok(())) => written += 1,
+                Ok(Err(e)) => {
+                    first_err.get_or_insert(e);
+                }
+                Err(_) => {
+                    first_err.get_or_insert_with(|| "seed write task failed".to_string());
+                }
+            }
+        }
+        i += batch;
+    }
+
+    // All writes failing is a server error; a partial failure still reports what
+    // landed (so the dashboard can surface it without losing the count).
+    let status = if written == 0 && first_err.is_some() {
+        500
+    } else {
+        200
+    };
+    (
+        status,
+        json!({
+            "written": written,
+            "requested": count,
+            "start": req.start,
+            "key_prefix": prefix,
+            "value_bytes": value_bytes,
+            "error": first_err,
+        }),
+    )
 }
 
 // ---- helpers ------------------------------------------------------------
