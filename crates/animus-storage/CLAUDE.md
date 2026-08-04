@@ -64,9 +64,19 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
   manifest; point reads fetch one block with `read_at`, never the whole file).
   Each data block is **LZ4-compressed** (`lz4_flex`, pure-Rust/MIT, safe-only
   build) when that is smaller, else stored verbatim — framed `tag(u8) || payload
-  || crc`, the CRC covering `tag || payload`. The table **format version** (v2 =
-  compression-capable; v1 = legacy uncompressed) lives in `SsTableMeta::format`,
-  and `read_block` decodes either, so old tables still read.
+  || crc`, the CRC covering `tag || payload`. Records inside a block use
+  **shared-prefix key encoding** (v3): each record stores `shared(u32)` (leading
+  bytes its key shares with the previous record's key in the block) + only its
+  differing suffix; the block's first record stores its full key. Since records
+  are sorted by key, adjacent keys share long prefixes (every key in a table
+  shares the `escape(table) || …` prefix), so this shrinks the key bytes *before*
+  LZ4 and shrinks the decoded footprint. The table **format version** (`1` = legacy
+  uncompressed full-key, `2` = LZ4 full-key, `3` = LZ4 + shared-prefix keys) lives
+  in `SsTableMeta::format`, and `read_block` decodes any of them, so old tables
+  still read; the writer stamps the current version (`3`). (Restart-point in-block
+  binary-search seek — the other half of LevelDB's block format — is a deliberate
+  follow-up: the reader decodes whole blocks, gated by the block index + Bloom, so
+  restart points would be unused machinery today.)
   Writes go to the WAL then the in-memory memtable (`BTreeMap` MVCC, same shape as
   `MemoryEngine`); a size threshold flushes the memtable to an SSTable, then swaps
   the manifest (recording the surviving WAL segments) and `remove`s the WAL
@@ -150,10 +160,14 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
 ## Tests & benchmark
 
 `cargo test -p animus-storage` (proptest semantics + units). Library unit tests
-also cover the new perf formats: `sstable::tests` round-trips a compressible and
+also cover the perf formats: `sstable::tests` round-trips a compressible and
 an incompressible block (asserting LZ4 shrinks the former and never inflates the
-latter), and `manifest_tests` round-trips the binary manifest codec, checks it is
-smaller than JSON, and confirms a legacy JSON manifest still decodes.
+latter), round-trips the **v3 shared-prefix codec** across every prefix relation +
+rejects a malformed `shared` length, asserts shared-prefix encoding is far smaller
+than full-key encoding (isolated from LZ4 by comparing raw buffers), and reads a
+hand-built **legacy v2 full-key table** back (the reader picks the decoder from
+`SsTableMeta::format`); and `manifest_tests` round-trips the binary manifest codec,
+checks it is smaller than JSON, and confirms a legacy JSON manifest still decodes.
 
 `LsmEngine` tests run under `SimEnv` via `Simulator` (a dev-dep): `lsm_semantics.rs`
 mirrors the `MemoryEngine` units + a differential proptest, plus a Bloom test
