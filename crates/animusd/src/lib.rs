@@ -41,6 +41,7 @@ pub use animus_control::{
 
 mod admin;
 mod cql;
+mod cql_client;
 mod dashboard;
 mod dynamo;
 mod http;

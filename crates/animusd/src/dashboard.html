@@ -81,6 +81,7 @@
   <button data-tab="nodes" class="active">Nodes</button>
   <button data-tab="tablets">Tablets</button>
   <button data-tab="storage">Storage</button>
+  <button data-tab="write">Write</button>
 </nav>
 <main>
   <section id="nodes" class="active">
@@ -133,6 +134,49 @@
       <div id="key-body"></div>
     </div>
   </section>
+
+  <section id="write">
+    <div class="card">
+      <span class="banner">⚠ these write to the live cluster (no auth — trusted interface only)</span>
+    </div>
+    <div class="card scroll">
+      <h2>DynamoDB</h2>
+      <div class="row">
+        <label>op</label>
+        <select id="dy-op">
+          <option>PutItem</option><option>GetItem</option><option>UpdateItem</option>
+          <option>DeleteItem</option><option>Query</option><option>Scan</option>
+        </select>
+        <label>table</label><input type="text" id="dy-table" value="t">
+        <button id="dy-build">Build JSON ▾</button>
+      </div>
+      <div id="dy-form">
+        <table id="dy-attrs"><thead><tr><th>attribute</th><th>type</th><th>value</th><th></th></tr></thead>
+          <tbody></tbody></table>
+        <button id="dy-add-attr">+ attribute</button>
+        <span class="muted" id="dy-form-hint"></span>
+      </div>
+      <div class="row" style="align-items:flex-start">
+        <textarea id="dy-raw" rows="8" style="width:100%; font-family:var(--mono); background:var(--panel2); color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:8px"></textarea>
+      </div>
+      <div class="row"><button id="dy-send">Send to cluster</button></div>
+      <div id="dy-result"></div>
+    </div>
+    <div class="card scroll">
+      <h2>CQL editor</h2>
+      <div class="row">
+        <label>keyspace (optional USE)</label><input type="text" id="cql-ks" placeholder="(none)">
+      </div>
+      <textarea id="cql-query" rows="7" style="width:100%; font-family:var(--mono); background:var(--panel2); color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:8px"
+        placeholder="CREATE KEYSPACE ks;
+USE ks;
+CREATE TABLE t (id int PRIMARY KEY, v text);
+INSERT INTO t (id, v) VALUES (1, 'x');
+SELECT * FROM t WHERE id = 1;"></textarea>
+      <div class="row"><button id="cql-run">Run</button> <span class="muted">statements split on “;” and run in order on one connection</span></div>
+      <div id="cql-result"></div>
+    </div>
+  </section>
 </main>
 
 <script>
@@ -150,6 +194,17 @@ async function getJSON(base, path) {
   const r = await fetch(base + path, { headers: { "accept": "application/json" } });
   if (!r.ok) throw new Error(r.status + " " + r.statusText);
   return r.json();
+}
+
+// POST JSON; returns {status, body} (body parsed as JSON when possible).
+async function postJSON(base, path, obj) {
+  const r = await fetch(base + path, {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify(obj),
+  });
+  const text = await r.text();
+  let body; try { body = JSON.parse(text); } catch { body = text; }
+  return { status: r.status, body };
 }
 
 // Turn a "host:port" admin address into a fetchable origin. A wildcard bind host
@@ -420,6 +475,91 @@ async function browseKeys() {
   } catch (e) { $("scan-body").innerHTML = `<div class="err-line">${esc(e)}</div>`; }
 }
 
+// ---- Write tab: DynamoDB ----
+function addAttrRow(name = "", type = "S", value = "") {
+  const tr = document.createElement("tr");
+  tr.innerHTML = `<td><input type="text" class="dy-n" value="${esc(name)}"></td>
+    <td><select class="dy-t"><option ${type==="S"?"selected":""}>S</option>
+      <option ${type==="N"?"selected":""}>N</option>
+      <option ${type==="BOOL"?"selected":""}>BOOL</option></select></td>
+    <td><input type="text" class="dy-v" value="${esc(value)}"></td>
+    <td><a href="#" class="dy-del">✕</a></td>`;
+  tr.querySelector(".dy-del").addEventListener("click", (e) => { e.preventDefault(); tr.remove(); });
+  $("dy-attrs").querySelector("tbody").appendChild(tr);
+}
+function dyAttrs() {
+  return [...$("dy-attrs").querySelectorAll("tbody tr")].map((tr) => ({
+    name: tr.querySelector(".dy-n").value.trim(),
+    type: tr.querySelector(".dy-t").value,
+    value: tr.querySelector(".dy-v").value,
+  })).filter((a) => a.name);
+}
+function attrValue(a) {
+  if (a.type === "N") return { N: a.value };
+  if (a.type === "BOOL") return { BOOL: a.value === "true" || a.value === "1" };
+  return { S: a.value };
+}
+function buildDynamoJson() {
+  const op = $("dy-op").value, table = $("dy-table").value.trim();
+  const av = {}; dyAttrs().forEach((a) => { av[a.name] = attrValue(a); });
+  let payload, hint;
+  switch (op) {
+    case "PutItem": payload = { TableName: table, Item: av }; hint = "attributes = the full Item"; break;
+    case "GetItem": payload = { TableName: table, Key: av }; hint = "attributes = the Key"; break;
+    case "DeleteItem": payload = { TableName: table, Key: av }; hint = "attributes = the Key"; break;
+    case "UpdateItem": payload = { TableName: table, Key: av,
+      UpdateExpression: "SET v = :v", ExpressionAttributeValues: { ":v": { S: "new" } } };
+      hint = "attributes = the Key; edit the raw JSON for the update expression"; break;
+    case "Query": payload = { TableName: table, KeyConditionExpression: "pk = :pk",
+      ExpressionAttributeValues: { ":pk": { S: "..." } } }; hint = "edit the raw JSON for the key condition"; break;
+    case "Scan": payload = { TableName: table, Limit: 25 }; hint = "edit the raw JSON to add a filter"; break;
+    default: payload = { TableName: table }; hint = "";
+  }
+  $("dy-raw").value = JSON.stringify(payload, null, 2);
+  $("dy-form-hint").textContent = hint;
+}
+async function sendDynamo() {
+  let payload;
+  try { payload = JSON.parse($("dy-raw").value); }
+  catch (e) { $("dy-result").innerHTML = `<div class="err-line">invalid JSON: ${esc(e)}</div>`; return; }
+  const op = $("dy-op").value;
+  try {
+    const { status, body } = await postJSON(SEED, "/admin/data/dynamo", { op, payload });
+    const cls = status < 300 ? "ok" : "err";
+    $("dy-result").innerHTML = `<div class="muted">${pill(cls, "HTTP " + status)}</div>`
+      + `<pre class="mono" style="white-space:pre-wrap">${esc(JSON.stringify(body, null, 2))}</pre>`;
+  } catch (e) { $("dy-result").innerHTML = `<div class="err-line">${esc(e)}</div>`; }
+}
+
+// ---- Write tab: CQL ----
+async function runCql() {
+  const query = $("cql-query").value;
+  const ks = $("cql-ks").value.trim();
+  if (!query.trim()) { $("cql-result").innerHTML = `<div class="empty">enter a statement</div>`; return; }
+  try {
+    const { status, body } = await postJSON(SEED, "/admin/data/cql", { query, keyspace: ks || null });
+    if (status !== 200 || !body.results) {
+      $("cql-result").innerHTML = `<div class="err-line">${esc((body && body.error) || ("HTTP " + status))}</div>`;
+      return;
+    }
+    $("cql-result").innerHTML = body.results.map(renderCqlResult).join("");
+  } catch (e) { $("cql-result").innerHTML = `<div class="err-line">${esc(e)}</div>`; }
+}
+function renderCqlResult(r) {
+  const head = `<div class="muted" style="margin-top:8px"><code>${esc(r.statement)}</code></div>`;
+  if (r.kind === "error") return head + `<div class="err-line">${esc(r.error)}</div>`;
+  if (r.kind === "rows") {
+    const cols = (r.columns || []).map((c) => `<th>${esc(c)}</th>`).join("");
+    const rows = (r.rows || []).map((row) =>
+      `<tr>${row.map((c) => `<td class="mono">${c === null ? "<span class='muted'>null</span>" : esc(c)}</td>`).join("")}</tr>`).join("");
+    return head + `<table><thead><tr>${cols}</tr></thead><tbody>${rows}</tbody></table>`
+      + `<div class="muted">${esc(r.row_count)} row(s)</div>`;
+  }
+  if (r.kind === "set_keyspace") return head + `<div class="muted">${pill("ok", "USE " + esc(r.keyspace))}</div>`;
+  if (r.kind === "schema_change") return head + `<div class="muted">${pill("ok", esc(r.change) + " " + esc(r.target))}</div>`;
+  return head + `<div class="muted">${pill("ok", "ok")}</div>`;
+}
+
 // ---- wiring ----
 document.querySelectorAll("nav button").forEach((b) =>
   b.addEventListener("click", () => {
@@ -432,6 +572,14 @@ $("refresh").addEventListener("click", loadAll);
 $("st-load").addEventListener("click", loadStorage);
 $("scan-load").addEventListener("click", browseKeys);
 $("key-load").addEventListener("click", inspectKey);
+$("dy-add-attr").addEventListener("click", () => addAttrRow());
+$("dy-build").addEventListener("click", buildDynamoJson);
+$("dy-op").addEventListener("change", buildDynamoJson);
+$("dy-send").addEventListener("click", sendDynamo);
+$("cql-run").addEventListener("click", runCql);
+// Seed the Dynamo form with one attribute row + an initial built payload.
+addAttrRow("pk", "S", "alice");
+buildDynamoJson();
 
 let timer = null;
 function arm() {

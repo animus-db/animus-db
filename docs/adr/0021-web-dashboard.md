@@ -246,18 +246,32 @@ The dashboard is a debug/operability tool, not a correctness surface; its bar is
 - **An embedded asset to keep current.** The dashboard tracks the `/admin/*`
   shape; an endpoint change must update the page. Mitigated by the page being a
   thin client of documented routes and by the serve/CORS integration test.
+- **The admin port is now a data-write + DDL surface** (the Write tab, follow-up
+  4): `POST /admin/data/{dynamo,cql}` run arbitrary DynamoDB ops and arbitrary CQL
+  (including `CREATE`/`DROP`) against the live cluster, still with **no auth**. This
+  is the consistent choice — one origin, one CORS surface, one future-auth boundary,
+  and CQL *must* be server-proxied (no browser binary protocol) — but it makes
+  auth-before-non-localhost-exposure a hard requirement, not a nicety, and is the
+  strongest reason yet to land the deferred admin-auth follow-up. The proxies reuse
+  the existing edges (Dynamo in-process; CQL via a loopback client to the node's own
+  CQL port), so they introduce no new data path, only a new *entrance* to it.
 
-**Follow-up (sequenced after ADR 0018; each a green-keeping increment):**
+**Follow-up (each a green-keeping increment):**
 
-1. Serve the static asset (`GET /` on the admin port, `include_str!`) + CORS on
-   `GET /admin/*` + the serve/CORS integration test — the skeleton, buildable
-   independently.
-2. Read panels: nodes/cluster, tablets (map × raftkv with lag), built on
+1. ✅ Serve the static asset (`GET /` on the admin port, `include_str!`) + CORS on
+   `GET /admin/*` + the serve/CORS integration test — the skeleton.
+2. ✅ Read panels: nodes/cluster, tablets (map × raftkv with lag), built on
    client-side fan-out with graceful per-node degradation.
-3. Read panels: WAL (segments + decoded records) and storage (LSM shape + key
-   inspector).
-4. Operator actions wired to the `POST` routes with confirmation UX + inline
-   result rendering.
+3. ✅ Read panels: WAL (segments + decoded records) and storage (LSM shape + key
+   inspector + a browse-keys list, `/admin/storage/scan`).
+4. ✅ **Data writes — a Write tab** (built ahead of the ADR-0018 sequencing, on
+   request): DynamoDB CRUD (form + raw JSON) and a full DDL+DML CQL editor,
+   **proxied through the admin port** (`POST /admin/data/{dynamo,cql}`) — Dynamo by
+   reusing the edge in-process, CQL by driving the node's own CQL port as a
+   loopback client (the browser can't speak the CQL binary protocol). This
+   **extends the admin port into a data-write + DDL surface** — see the added
+   consequence below. Operator actions (split/flush/compact/reconfigure/drain) wired
+   to the UI with confirmation is still to do.
 5. Transaction view over ADR 0018's state (intents, txn-status record, MVCC
    versions) — co-developed with, or immediately after, ADR 0018's admin-JSON
    extensions.

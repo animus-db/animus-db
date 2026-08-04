@@ -291,3 +291,66 @@ async fn admin_interface_surfaces_state_and_actions() {
     .await
     .expect("test timed out");
 }
+
+/// The dashboard's write proxies (ADR 0021): run a DynamoDB CRUD round-trip and a
+/// multi-statement CQL script through the admin port, asserting data flows back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn admin_data_write_dynamo_and_cql() {
+    timeout(Duration::from_secs(60), async {
+        let dir = tempfile::tempdir().unwrap();
+        let (nodes, _config) = bring_up(3, dir.path()).await;
+        await_bootstrap(&nodes).await;
+        let a = nodes[0].admin_addr();
+
+        // ---- DynamoDB: PutItem then GetItem via /admin/data/dynamo ----------
+        let (s, put) = admin(
+            a,
+            "POST",
+            "/admin/data/dynamo",
+            Some(r#"{"op":"PutItem","payload":{"TableName":"t","Item":{"pk":{"S":"alice"},"v":{"N":"7"}}}}"#),
+        )
+        .await;
+        assert_eq!(s, 200, "PutItem via admin proxy: {put}");
+
+        let (s, got) = admin(
+            a,
+            "POST",
+            "/admin/data/dynamo",
+            Some(r#"{"op":"GetItem","payload":{"TableName":"t","Key":{"pk":{"S":"alice"}}}}"#),
+        )
+        .await;
+        assert_eq!(s, 200, "GetItem via admin proxy: {got}");
+        assert_eq!(
+            got["Item"]["v"]["N"].as_str(),
+            Some("7"),
+            "GetItem reads back the written value: {got}"
+        );
+
+        // ---- CQL: CREATE/INSERT/SELECT script via /admin/data/cql -----------
+        let (s, cql) = admin(
+            a,
+            "POST",
+            "/admin/data/cql",
+            Some(
+                r#"{"query":"CREATE KEYSPACE ks; USE ks; CREATE TABLE t2 (id int PRIMARY KEY, v text); INSERT INTO t2 (id, v) VALUES (1, 'hi'); SELECT * FROM t2 WHERE id = 1;"}"#,
+            ),
+        )
+        .await;
+        assert_eq!(s, 200, "CQL script ran: {cql}");
+        let results = cql["results"].as_array().expect("results array");
+        let select = results.last().expect("a final SELECT result");
+        assert_eq!(select["kind"], "rows", "last statement is a row result: {cql}");
+        assert_eq!(select["row_count"], 1, "one row inserted: {cql}");
+        let row = &select["rows"][0];
+        assert!(
+            row.as_array().is_some_and(|cells| cells.iter().any(|c| c == "hi")),
+            "SELECT returns the inserted value: {cql}"
+        );
+
+        for node in &nodes {
+            node.shutdown_graceful().await;
+        }
+    })
+    .await
+    .expect("test timed out");
+}

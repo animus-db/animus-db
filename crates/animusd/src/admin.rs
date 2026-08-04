@@ -37,6 +37,8 @@
 //! - `POST /admin/storage/compact`     — `{tablet}`
 //! - `POST /admin/raftkv/reconfigure`  — `{tablet, voters}`
 //! - `POST /admin/drain`               — `{node}`
+//! - `POST /admin/data/dynamo`         — run a DynamoDB op `{op, payload}` (ADR 0021)
+//! - `POST /admin/data/cql`            — run CQL `{query, keyspace?}` (ADR 0021)
 
 use animus_env::NodeId;
 use animus_storage::WalRecordView;
@@ -179,6 +181,8 @@ async fn dispatch(ctx: &ClientCtx, request: &http::HttpRequest) -> (u16, String)
         ("POST", "/admin/storage/compact") => action_compact(ctx, &request.body).await,
         ("POST", "/admin/raftkv/reconfigure") => action_reconfigure(ctx, &request.body),
         ("POST", "/admin/drain") => action_drain(ctx, &request.body),
+        ("POST", "/admin/data/dynamo") => action_data_dynamo(ctx, &request.body).await,
+        ("POST", "/admin/data/cql") => action_data_cql(ctx, &request.body).await,
         // A known admin path with the wrong verb vs an unknown path.
         ("GET" | "POST", p) if p.starts_with("/admin/") => {
             (404, json!({"error": format!("unknown admin route {p}")}))
@@ -587,6 +591,61 @@ fn action_drain(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
             json!({"ok": true, "node": req.node, "status": "Leaving"}),
         ),
         Err(e) => (409, json!({"error": e})),
+    }
+}
+
+// ---- data write proxies (ADR 0021 dashboard) ----------------------------
+
+#[derive(Deserialize)]
+struct DynamoDataReq {
+    /// The DynamoDB operation, e.g. `PutItem` (or the full `DynamoDB_20120810.PutItem`).
+    op: String,
+    /// The operation's JSON payload (the DynamoDB request body).
+    #[serde(default)]
+    payload: Value,
+}
+
+#[derive(Deserialize)]
+struct CqlDataReq {
+    /// One or more `;`-separated CQL statements.
+    query: String,
+    /// Optional keyspace to `USE` before running the statements.
+    #[serde(default)]
+    keyspace: Option<String>,
+}
+
+/// `POST /admin/data/dynamo` — run a DynamoDB operation from the dashboard, by
+/// reusing the DynamoDB edge's decode + execute path in-process (ADR 0021). The
+/// response is the operation's own JSON (or a DynamoDB error object), with the
+/// edge's status code.
+async fn action_data_dynamo(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
+    let req: DynamoDataReq = match parse_body(body) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    let target = if req.op.contains('.') {
+        req.op.clone()
+    } else {
+        format!("DynamoDB_20120810.{}", req.op)
+    };
+    let payload = serde_json::to_vec(&req.payload).unwrap_or_default();
+    let (status, json_body) = crate::dynamo::execute(ctx, &target, &payload).await;
+    let value = serde_json::from_str::<Value>(&json_body).unwrap_or(Value::String(json_body));
+    (status, value)
+}
+
+/// `POST /admin/data/cql` — run CQL statements from the dashboard's editor by
+/// driving this node's own CQL port as a loopback client (ADR 0021,
+/// [`crate::cql_client`]); returns one JSON result per statement. A connection or
+/// handshake failure is a `502` (the node's CQL edge is unreachable).
+async fn action_data_cql(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
+    let req: CqlDataReq = match parse_body(body) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    match crate::cql_client::run(ctx.admin.cql_addr, req.keyspace.as_deref(), &req.query).await {
+        Ok(results) => (200, json!({ "results": results })),
+        Err(e) => (502, json!({ "error": e })),
     }
 }
 

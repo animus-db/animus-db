@@ -219,7 +219,8 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   shared with `dynamo.rs`). Read-only `GET` views — `/admin/{config,status,raft,
   raftkv,storage/lsm,storage/wal,storage/wal/segment,storage/key,storage/scan,metrics,health}`
   — plus gated `POST` actions — `/admin/{tablet/split,storage/flush,storage/compact,
-  raftkv/reconfigure,drain}`. Below the edge it only **reads** node state
+  raftkv/reconfigure,drain}` and **data writes** — `/admin/data/{dynamo,cql}` (ADR
+  0021, the dashboard's write surface). Below the edge it only **reads** node state
   (control + CP Raft accessors, `LsmEngine` introspection: `sstable_views`/
   `wal_segment_*`/`memtable_*`, the `CpGroup` introspection passthroughs) aggregated
   live at request time, or drives an explicit action; node identity for `/admin/config`
@@ -241,6 +242,19 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
     **browse-keys** list (`/admin/storage/scan` → `CpGroup::local_scan`, first N live
     pairs `>= start`; click a key to send it to the inspector).
     `tests/dashboard_endpoint.rs` proves serve + CORS + preflight + peers.
+  - **The Write tab (ADR 0021) writes through the admin port.** `POST
+    /admin/data/dynamo {op, payload}` reuses the DynamoDB edge in-process
+    (`dynamo::execute` — the factored decode+`run_operation`), returning the op's
+    JSON. `POST /admin/data/cql {query, keyspace?}` runs CQL by driving **this
+    node's own CQL port as a loopback client** (`cql_client` — STARTUP→QUERY per
+    `;`-split statement, decoding the binary RESULT frame to JSON via
+    `animus_cql::types`), so the 1000-line CQL edge is reused untouched rather than
+    refactored to emit JSON. The browser can't speak the CQL binary protocol, so a
+    server-side proxy is mandatory; Dynamo is proxied too for one origin / one CORS
+    / one future-auth boundary. **This makes the admin port a data-write *and* DDL
+    surface (still no auth)** — sharpening the bind-to-trusted-interface /
+    auth-before-exposure follow-up. `tests/admin_endpoint.rs::admin_data_write_dynamo_and_cql`
+    proves a Dynamo Put→Get round-trip + a CREATE/INSERT/SELECT CQL script.
   - **Gotcha — `/admin/raftkv` is node-local, but in a single `--cluster N` process
     the shared `ClusterEdgeState` registers *every* node's CP group handle, so one
     node's view lists all replicas; a one-process-per-node deployment (separate edge

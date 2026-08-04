@@ -259,7 +259,15 @@ async fn handle_conn(mut stream: TcpStream, ctx: ClientCtx) -> std::io::Result<(
 
 /// Dispatch a decoded request, returning the HTTP status code and JSON body.
 async fn dispatch(ctx: &ClientCtx, request: &http::HttpRequest) -> (u16, String) {
-    match wire::decode_request(&request.target, &request.body) {
+    execute(ctx, &request.target, &request.body).await
+}
+
+/// Decode + run a DynamoDB operation from its `X-Amz-Target` value and JSON body,
+/// returning `(http status, json body)`. Shared by the DynamoDB HTTP edge (above)
+/// and the admin dashboard's write proxy (`POST /admin/data/dynamo`, ADR 0021), so
+/// both go through the identical decode + `run_operation` path.
+pub(crate) async fn execute(ctx: &ClientCtx, target: &str, body: &[u8]) -> (u16, String) {
+    match wire::decode_request(target, body) {
         Ok(op) => match run_operation(ctx, op).await {
             Ok(body) => (200, body),
             Err(err) => (error_status(&err), err.to_json()),
