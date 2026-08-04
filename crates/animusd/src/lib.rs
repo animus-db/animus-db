@@ -41,6 +41,7 @@ pub use animus_control::{
 
 mod admin;
 mod cql;
+mod dashboard;
 mod dynamo;
 mod http;
 
@@ -574,6 +575,12 @@ pub(crate) struct AdminInfo {
     pub(crate) control_ids: Vec<NodeId>,
     /// The static peer address book this node was started with.
     pub(crate) peers: BTreeMap<NodeId, SocketAddr>,
+    /// Every node's **admin** address — the seed list the web dashboard (ADR 0021)
+    /// fans out to. Each process knows the whole cluster's addresses (its
+    /// `ClusterConfig` per-process, or the in-process bring-up). Falls back to just
+    /// this node's admin address when the full set is unknown (the simple
+    /// [`BoundNode::start`] path / hand-built nodes).
+    pub(crate) admin_addrs: Vec<SocketAddr>,
 }
 
 impl BoundNode {
@@ -617,6 +624,7 @@ impl BoundNode {
         peers: BTreeMap<NodeId, SocketAddr>,
         control_ids: Vec<NodeId>,
     ) -> std::io::Result<Node> {
+        let admin_addr = self.admin_addr;
         self.start_with(
             peers,
             control_ids,
@@ -624,6 +632,7 @@ impl BoundNode {
             ClusterEdgeState::new(),
             BTreeMap::new(),
             None,
+            vec![admin_addr],
         )
         .await
     }
@@ -647,6 +656,7 @@ impl BoundNode {
         edge: ClusterEdgeState,
         client_route: BTreeMap<NodeId, SocketAddr>,
         auto_split_threshold: Option<usize>,
+        cluster_admin_addrs: Vec<SocketAddr>,
     ) -> std::io::Result<Node> {
         self.control_env.set_peers(peers.clone());
         self.raftkv_env.set_peers(peers.clone());
@@ -684,6 +694,11 @@ impl BoundNode {
             admin_addr: self.admin_addr,
             control_ids: control_ids.clone(),
             peers: static_peers.clone(),
+            admin_addrs: if cluster_admin_addrs.is_empty() {
+                vec![self.admin_addr]
+            } else {
+                cluster_admin_addrs
+            },
         });
 
         // Keep clones of the two internal envs so [`Node::shutdown`] can abort
@@ -2555,6 +2570,9 @@ async fn start_cluster_inner(
     // edge can reach the cluster's leader and they agree on CP/keyspace state),
     // but distinct from any other cluster in the same process.
     let edge = ClusterEdgeState::new();
+    // Every node's admin address, so each node's dashboard (ADR 0021) can fan out
+    // to the whole in-process cluster.
+    let admin_addrs: Vec<SocketAddr> = bound.iter().map(BoundNode::admin_addr).collect();
     let mut nodes = Vec::with_capacity(n);
     for b in bound {
         let node = b
@@ -2567,6 +2585,7 @@ async fn start_cluster_inner(
                 // handle in-process, so no cross-process forwarding route is needed.
                 BTreeMap::new(),
                 auto_split_threshold,
+                admin_addrs.clone(),
             )
             .await?;
         nodes.push(node);
@@ -2623,6 +2642,9 @@ pub async fn run_node_with(
         client_route.insert(config::raftkv_id(i), addrs.client);
         client_route.insert(config::control_id(i), addrs.client);
     }
+    // Every node's admin address from the shared config, so this node's dashboard
+    // (ADR 0021) can fan out to the whole cluster.
+    let admin_addrs: Vec<SocketAddr> = config.nodes.iter().map(|n| n.admin).collect();
     bound
         .start_with(
             config.peer_book(),
@@ -2631,6 +2653,7 @@ pub async fn run_node_with(
             ClusterEdgeState::new(),
             client_route,
             None,
+            admin_addrs,
         )
         .await
 }

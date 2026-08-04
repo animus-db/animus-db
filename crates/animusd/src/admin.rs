@@ -11,9 +11,17 @@
 //! dedicated-port choice is what makes adding it later clean (assume the port is
 //! bound to a trusted interface for now).
 //!
+//! It also serves the static **web dashboard** (ADR 0021) on `GET /` (and the
+//! `/admin`, `/admin/ui` aliases): a self-contained single-page app that renders
+//! the JSON below across the whole cluster via client-side fan-out, with CORS
+//! enabled on every `/admin/*` response so the page (loaded from one node) can
+//! read the others.
+//!
 //! Routes (`GET` read-only, `POST` actions):
 //!
+//! - `GET  /`                          — the web dashboard SPA (also `/admin/ui`)
 //! - `GET  /admin/config`              — this node's ids, addresses, peers
+//! - `GET  /admin/peers`              — every node's admin address (fan-out seed)
 //! - `GET  /admin/status`              — the full replicated `Metadata`
 //! - `GET  /admin/raft`                — control-plane Raft state
 //! - `GET  /admin/raftkv`              — per hosted CP group Raft state
@@ -85,12 +93,63 @@ async fn handle_conn(mut stream: TcpStream, ctx: ClientCtx) -> std::io::Result<(
             return Ok(()); // clean EOF
         };
         let keep_alive = request.keep_alive;
+        // CORS preflight: the dashboard's cross-node fan-out (ADR 0021) may send an
+        // `OPTIONS` before a `POST` action. Answer it with the CORS headers + no body.
+        if request.method == "OPTIONS" {
+            http::write_response_with(
+                &mut stream,
+                204,
+                "text/plain",
+                "",
+                keep_alive,
+                http::CORS_HEADERS,
+            )
+            .await?;
+            if !keep_alive {
+                return Ok(());
+            }
+            continue;
+        }
+        // The static web dashboard asset (ADR 0021), served self-contained from the
+        // admin port. A pure client of the `/admin/*` JSON below.
+        if request.method == "GET" && is_ui_path(&request.path) {
+            http::write_response_with(
+                &mut stream,
+                200,
+                "text/html; charset=utf-8",
+                crate::dashboard::HTML,
+                keep_alive,
+                http::CORS_HEADERS,
+            )
+            .await?;
+            if !keep_alive {
+                return Ok(());
+            }
+            continue;
+        }
         let (status, body) = dispatch(&ctx, &request).await;
-        http::write_json_response(&mut stream, status, &body, keep_alive).await?;
+        http::write_response_with(
+            &mut stream,
+            status,
+            "application/json",
+            &body,
+            keep_alive,
+            http::CORS_HEADERS,
+        )
+        .await?;
         if !keep_alive {
             return Ok(());
         }
     }
+}
+
+/// Whether `path` should serve the dashboard SPA (ADR 0021). The root and a couple
+/// of `/admin` aliases all return the single-page app.
+fn is_ui_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/" | "/admin" | "/admin/" | "/admin/ui" | "/index.html"
+    )
 }
 
 /// Route a request to its handler, returning `(http status, json body)`.
@@ -100,6 +159,7 @@ async fn dispatch(ctx: &ClientCtx, request: &http::HttpRequest) -> (u16, String)
     let q = request.query.as_str();
     let (status, value): (u16, Value) = match (method, path) {
         ("GET", "/admin/config") => (200, config_view(ctx)),
+        ("GET", "/admin/peers") => (200, peers_view(ctx)),
         ("GET", "/admin/status") => (
             200,
             serde_json::to_value(ctx.raft.metadata()).unwrap_or(Value::Null),
@@ -156,6 +216,20 @@ fn config_view(ctx: &ClientCtx) -> Value {
         },
         "peers": peers,
         "cp_member_addrs": meta.cp_member_addrs,
+    })
+}
+
+/// The admin addresses of every node in the cluster (ADR 0021) — the seed list
+/// the web dashboard fans out to. Each `animusd` process knows the whole cluster's
+/// addresses (from its `ClusterConfig` in per-process mode, or the in-process
+/// bring-up), so the dashboard need not guess ports. `this` marks the node serving
+/// the page. Degrades to just this node's address when the full set is unknown.
+fn peers_view(ctx: &ClientCtx) -> Value {
+    let a = &ctx.admin;
+    let admin_addrs: Vec<String> = a.admin_addrs.iter().map(ToString::to_string).collect();
+    json!({
+        "this": a.admin_addr.to_string(),
+        "admin_addrs": admin_addrs,
     })
 }
 

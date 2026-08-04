@@ -1,0 +1,404 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AnimusDB — cluster dashboard</title>
+<style>
+  :root {
+    --bg: #0f1117; --panel: #171a23; --panel2: #1d212c; --line: #2a2f3c;
+    --fg: #d7dce5; --dim: #8b93a7; --accent: #6ea8fe; --good: #4ec9a3;
+    --warn: #e0b450; --bad: #e06c75; --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+    font: 14px/1.5 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+  header { padding: 12px 18px; border-bottom: 1px solid var(--line);
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  header h1 .v { color: var(--dim); font-weight: 400; }
+  .spacer { flex: 1; }
+  .banner { background: #2a1f12; color: var(--warn); border: 1px solid #4a3a1c;
+    padding: 4px 10px; border-radius: 6px; font-size: 12px; }
+  .controls { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+  button, select { background: var(--panel2); color: var(--fg); border: 1px solid var(--line);
+    border-radius: 6px; padding: 5px 10px; font-size: 13px; cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  input[type=text] { background: var(--panel2); color: var(--fg); border: 1px solid var(--line);
+    border-radius: 6px; padding: 5px 8px; font-family: var(--mono); }
+  .updated { color: var(--dim); font-size: 12px; }
+  nav { display: flex; gap: 4px; padding: 10px 18px 0; border-bottom: 1px solid var(--line); }
+  nav button { border-radius: 6px 6px 0 0; border-bottom: none; color: var(--dim); }
+  nav button.active { color: var(--fg); background: var(--panel); border-color: var(--line); }
+  main { padding: 18px; }
+  section { display: none; }
+  section.active { display: block; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    padding: 14px 16px; margin-bottom: 16px; }
+  .card h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em;
+    color: var(--dim); margin: 0 0 10px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--line);
+    white-space: nowrap; }
+  th { color: var(--dim); font-weight: 600; font-size: 11px; text-transform: uppercase;
+    letter-spacing: .04em; }
+  td.mono, .mono { font-family: var(--mono); }
+  .scroll { overflow-x: auto; }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11px;
+    font-weight: 600; }
+  .Active, .ok   { background: #133029; color: var(--good); }
+  .Down, .err    { background: #331a1c; color: var(--bad); }
+  .Leaving, .Joining { background: #2e2713; color: var(--warn); }
+  .leader { color: var(--good); font-weight: 600; }
+  .muted { color: var(--dim); }
+  .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+  .row label { color: var(--dim); font-size: 12px; }
+  .lag { color: var(--warn); }
+  .empty { color: var(--dim); padding: 10px; font-style: italic; }
+  code { font-family: var(--mono); background: var(--panel2); padding: 1px 5px; border-radius: 4px; }
+  .err-line { color: var(--bad); }
+</style>
+</head>
+<body>
+<header>
+  <h1>AnimusDB <span class="v">cluster dashboard</span></h1>
+  <span class="banner" id="banner">⚠ admin port — no auth; bind to a trusted interface only</span>
+  <span class="spacer"></span>
+  <div class="controls">
+    <span class="updated" id="updated"></span>
+    <label>auto
+      <select id="auto">
+        <option value="0">off</option>
+        <option value="2000">2s</option>
+        <option value="5000" selected>5s</option>
+        <option value="10000">10s</option>
+      </select>
+    </label>
+    <button id="refresh">Refresh</button>
+  </div>
+</header>
+<nav>
+  <button data-tab="nodes" class="active">Nodes</button>
+  <button data-tab="tablets">Tablets</button>
+  <button data-tab="storage">Storage</button>
+</nav>
+<main>
+  <section id="nodes" class="active">
+    <div class="card scroll">
+      <h2>Cluster members</h2>
+      <div id="nodes-body"><div class="empty">loading…</div></div>
+    </div>
+  </section>
+
+  <section id="tablets">
+    <div class="card scroll">
+      <h2>Tablet map</h2>
+      <div id="tablets-body"><div class="empty">loading…</div></div>
+    </div>
+  </section>
+
+  <section id="storage">
+    <div class="row">
+      <label>tablet</label><select id="st-tablet"></select>
+      <label>node</label><select id="st-node"></select>
+      <button id="st-load">Load</button>
+    </div>
+    <div class="card scroll">
+      <h2>WAL segments</h2>
+      <div id="wal-body"><div class="empty">pick a tablet + node and Load</div></div>
+    </div>
+    <div class="card scroll" id="wal-records-card" style="display:none">
+      <h2>WAL records — segment <span id="wal-seg"></span></h2>
+      <div id="wal-records"></div>
+    </div>
+    <div class="card scroll">
+      <h2>LSM shape</h2>
+      <div id="lsm-body"><div class="empty">pick a tablet + node and Load</div></div>
+    </div>
+    <div class="card">
+      <h2>Key inspector</h2>
+      <div class="row">
+        <label>key</label><input type="text" id="key-input" placeholder="key bytes (utf-8)">
+        <button id="key-load">Inspect</button>
+      </div>
+      <div id="key-body"></div>
+    </div>
+  </section>
+</main>
+
+<script>
+"use strict";
+const SEED = window.location.origin;
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) =>
+  ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+// State assembled each refresh.
+let STATE = { status: null, nodes: [], peersErr: null };
+
+// Fetch JSON from `base + path`; throws on network/HTTP error.
+async function getJSON(base, path) {
+  const r = await fetch(base + path, { headers: { "accept": "application/json" } });
+  if (!r.ok) throw new Error(r.status + " " + r.statusText);
+  return r.json();
+}
+
+// Turn a "host:port" admin address into a fetchable origin. A wildcard bind host
+// (0.0.0.0 / ::) isn't dialable from the browser — fall back to the page's host.
+function baseFor(addr) {
+  let host = addr, port = "";
+  const i = addr.lastIndexOf(":");
+  if (i >= 0) { host = addr.slice(0, i); port = addr.slice(i + 1); }
+  host = host.replace(/^\[|\]$/g, "");
+  if (host === "0.0.0.0" || host === "::" || host === "") host = window.location.hostname;
+  const h = host.includes(":") ? "[" + host + "]" : host;
+  return "http://" + h + (port ? ":" + port : "");
+}
+
+// Render a byte sequence (JSON array of u8, or a string) for humans.
+function bytes(v) {
+  if (v == null) return "∞";
+  if (typeof v === "string") return v === "" ? "«start»" : v;
+  if (Array.isArray(v)) {
+    if (v.length === 0) return "«start»";
+    const printable = v.every((b) => b >= 32 && b < 127);
+    return printable ? v.map((b) => String.fromCharCode(b)).join("")
+                     : v.map((b) => b.toString(16).padStart(2, "0")).join("");
+  }
+  return String(v);
+}
+
+function pill(cls, text) { return `<span class="pill ${esc(cls)}">${esc(text)}</span>`; }
+
+async function loadAll() {
+  let peers;
+  try {
+    peers = await getJSON(SEED, "/admin/peers");
+  } catch (e) {
+    peers = { admin_addrs: [SEED.replace(/^https?:\/\//, "")] };
+    STATE.peersErr = String(e);
+  }
+  let status = null;
+  try { status = await getJSON(SEED, "/admin/status"); } catch (e) { /* shown per-panel */ }
+
+  const addrs = (peers.admin_addrs && peers.admin_addrs.length) ? peers.admin_addrs
+    : [SEED.replace(/^https?:\/\//, "")];
+  const nodes = await Promise.all(addrs.map(async (addr) => {
+    const base = baseFor(addr);
+    const node = { addr, base, ok: false };
+    try {
+      const [config, raft, raftkv, health] = await Promise.all([
+        getJSON(base, "/admin/config"),
+        getJSON(base, "/admin/raft").catch(() => null),
+        getJSON(base, "/admin/raftkv").catch(() => null),
+        getJSON(base, "/admin/health").catch(() => null),
+      ]);
+      Object.assign(node, { config, raft, raftkv, health, ok: true });
+    } catch (e) {
+      node.error = String(e);
+    }
+    return node;
+  }));
+
+  STATE = { status, nodes, peersErr: STATE.peersErr };
+  render();
+  $("updated").textContent = "updated " + new Date().toLocaleTimeString();
+}
+
+function nodeByRaftkv(id) {
+  return STATE.nodes.find((n) => n.ok && n.config && n.config.raftkv_id === id);
+}
+
+function render() {
+  renderNodes();
+  renderTablets();
+  renderStorageSelectors();
+}
+
+function renderNodes() {
+  const status = STATE.status;
+  const members = (status && status.members) || {};
+  const ids = Object.keys(members).map(Number).sort((a, b) => a - b);
+  const fallback = STATE.nodes.filter((n) => n.ok).map((n) => n.config.raftkv_id);
+  const rows = (ids.length ? ids : fallback).map((id) => {
+    const m = members[id];
+    const node = nodeByRaftkv(id);
+    const reach = node ? (node.ok ? pill("ok", "reachable") : pill("err", "unreachable")) : pill("Leaving", "no admin");
+    const r = node && node.raft;
+    const kv = node && node.raftkv;
+    const leader = r && r.is_leader ? `<span class="leader">leader</span>` : (r ? "follower" : "—");
+    return `<tr>
+      <td class="mono">${esc(id)}</td>
+      <td>${m ? pill(m.status, m.status) : "—"}</td>
+      <td>${reach}</td>
+      <td>${r ? esc(r.role) : "—"} ${leader === "—" ? "" : "· " + leader}</td>
+      <td class="mono">${r ? esc(r.term) : "—"}</td>
+      <td class="mono">${r ? `${r.commit_index}/${r.last_applied}/${r.durable_index}` : "—"}</td>
+      <td>${kv ? (kv.hosts_cp ? `${kv.groups.length} group(s)` : "no") : "—"}</td>
+      <td class="mono muted">${node ? esc(node.addr) : "—"}</td>
+    </tr>`;
+  }).join("");
+  $("nodes-body").innerHTML = rows ? `<table>
+    <thead><tr><th>node</th><th>status</th><th>admin</th><th>control raft</th>
+      <th>term</th><th>commit/applied/durable</th><th>hosts CP</th><th>admin addr</th></tr></thead>
+    <tbody>${rows}</tbody></table>`
+    + (STATE.peersErr ? `<div class="err-line">peers fan-out fell back to this node only: ${esc(STATE.peersErr)}</div>` : "")
+    : `<div class="empty">no members (control plane not ready?)</div>`;
+}
+
+// Collect every hosted CP group across reachable nodes, indexed by tablet id.
+function cpGroupsByTablet() {
+  const map = {};
+  for (const n of STATE.nodes) {
+    if (!n.ok || !n.raftkv || !n.raftkv.groups) continue;
+    for (const g of n.raftkv.groups) {
+      (map[g.tablet] = map[g.tablet] || []).push({ node: n, g });
+    }
+  }
+  return map;
+}
+
+function renderTablets() {
+  const status = STATE.status;
+  const tablets = (status && status.tablets) || {};
+  const ids = Object.keys(tablets).map(Number).sort((a, b) => a - b);
+  const groups = cpGroupsByTablet();
+  const rows = ids.map((id) => {
+    const t = tablets[id];
+    const gs = groups[id] || [];
+    const lead = gs.find((x) => x.g.is_leader);
+    const lg = lead && lead.g;
+    const leaderCell = lead
+      ? `<span class="leader">node ${esc(nodeRaftkvId(lead.node))}</span>`
+      : `<span class="muted">unknown</span>`;
+    const idx = lg ? `${lg.commit_index}/${lg.last_applied}/${lg.durable_index}` : "—";
+    const voters = lg ? lg.voters.join(", ") : (t.replicas || []).join(", ");
+    return `<tr>
+      <td class="mono">${esc(id)}</td>
+      <td class="mono">${esc(bytes(t.range && t.range.start))} → ${esc(bytes(t.range && t.range.end))}</td>
+      <td class="mono">${esc(t.epoch)}</td>
+      <td class="mono">${esc((t.replicas || []).join(", "))}</td>
+      <td>${leaderCell}</td>
+      <td class="mono">${lg ? esc(lg.term) : "—"}</td>
+      <td class="mono">${esc(idx)}</td>
+      <td class="mono">${esc(voters)}</td>
+    </tr>`;
+  }).join("");
+  $("tablets-body").innerHTML = rows ? `<table>
+    <thead><tr><th>tablet</th><th>range</th><th>epoch</th><th>replicas (base)</th>
+      <th>leader</th><th>term</th><th>commit/applied/durable</th><th>voters (group)</th></tr></thead>
+    <tbody>${rows}</tbody></table>`
+    : `<div class="empty">no tablets</div>`;
+}
+
+function nodeRaftkvId(n) { return n.config ? n.config.raftkv_id : "?"; }
+
+function renderStorageSelectors() {
+  const status = STATE.status;
+  const tablets = status && status.tablets ? Object.keys(status.tablets).map(Number).sort((a, b) => a - b) : [1];
+  const tsel = $("st-tablet");
+  const prevT = tsel.value;
+  tsel.innerHTML = tablets.map((id) => `<option value="${id}">tablet ${id}</option>`).join("");
+  if (prevT) tsel.value = prevT;
+  const nsel = $("st-node");
+  const prevN = nsel.value;
+  nsel.innerHTML = STATE.nodes.filter((n) => n.ok)
+    .map((n) => `<option value="${esc(n.base)}">node ${esc(nodeRaftkvId(n))} (${esc(n.addr)})</option>`).join("");
+  if (prevN) nsel.value = prevN;
+}
+
+async function loadStorage() {
+  const tablet = $("st-tablet").value;
+  const base = $("st-node").value;
+  if (!base) return;
+  $("wal-records-card").style.display = "none";
+  // WAL
+  try {
+    const w = await getJSON(base, "/admin/storage/wal?tablet=" + tablet);
+    if (w.backend === "memory" || w.segments == null) {
+      $("wal-body").innerHTML = `<div class="empty">memory backend — no WAL</div>`;
+    } else {
+      const segs = w.segments.map((s) => `<tr>
+        <td class="mono"><a href="#" data-seg="${esc(s.segment)}" class="seglink">${esc(s.segment)}</a></td>
+        <td class="mono">${esc(s.bytes)}</td></tr>`).join("");
+      $("wal-body").innerHTML = `<div class="muted">durable_seq ${esc(w.durable_seq)} · rotations ${esc(w.rotations)}</div>
+        <table><thead><tr><th>segment</th><th>bytes</th></tr></thead><tbody>${segs}</tbody></table>`;
+      document.querySelectorAll(".seglink").forEach((a) =>
+        a.addEventListener("click", (e) => { e.preventDefault(); loadWalSegment(base, tablet, a.dataset.seg); }));
+    }
+  } catch (e) { $("wal-body").innerHTML = `<div class="err-line">${esc(e)}</div>`; }
+  // LSM
+  try {
+    const l = await getJSON(base, "/admin/storage/lsm?tablet=" + tablet);
+    if (l.backend === "memory" || l.sstables == null) {
+      $("lsm-body").innerHTML = `<div class="empty">memory backend — no SSTables</div>`;
+    } else {
+      const levels = (l.levels || []).map((x) => `L${x.level}:${x.tables}`).join("  ") || "—";
+      const tbl = l.sstables.map((s) => `<tr>
+        <td class="mono">${esc(s.seq)}</td><td class="mono">${esc(s.level)}</td>
+        <td class="mono">${esc(bytes(s.min_key))} → ${esc(bytes(s.max_key))}</td>
+        <td class="mono">${esc(s.min_version)}–${esc(s.max_version)}</td>
+        <td class="mono">${esc(s.file_size)}</td><td>${s.has_bloom ? "✓" : ""}</td></tr>`).join("");
+      $("lsm-body").innerHTML = `<div class="muted">levels ${esc(levels)} · memtable ${esc(l.memtable.keys)} keys / ${esc(l.memtable.approx_bytes)} B</div>`
+        + (tbl ? `<table><thead><tr><th>seq</th><th>level</th><th>key range</th><th>versions</th><th>bytes</th><th>bloom</th></tr></thead><tbody>${tbl}</tbody></table>`
+               : `<div class="empty">no sstables (all in memtable)</div>`);
+    }
+  } catch (e) { $("lsm-body").innerHTML = `<div class="err-line">${esc(e)}</div>`; }
+}
+
+async function loadWalSegment(base, tablet, seg) {
+  $("wal-seg").textContent = seg;
+  $("wal-records-card").style.display = "";
+  $("wal-records").innerHTML = `<div class="empty">loading…</div>`;
+  try {
+    const r = await getJSON(base, "/admin/storage/wal/segment?tablet=" + tablet + "&seg=" + seg);
+    const recs = (r.records || []).map((x) => `<tr>
+      <td>${esc(x.type)}</td><td class="mono">${esc(x.key ?? "")}</td>
+      <td class="mono">${esc(x.version ?? "")}</td>
+      <td class="mono">${esc(x.value_len ?? x.keys ?? x.ops ?? "")}</td></tr>`).join("");
+    $("wal-records").innerHTML = recs
+      ? `<table><thead><tr><th>type</th><th>key</th><th>version</th><th>len/keys/ops</th></tr></thead><tbody>${recs}</tbody></table>`
+      : `<div class="empty">empty segment</div>`;
+  } catch (e) { $("wal-records").innerHTML = `<div class="err-line">${esc(e)}</div>`; }
+}
+
+async function inspectKey() {
+  const tablet = $("st-tablet").value;
+  const base = $("st-node").value;
+  const key = $("key-input").value;
+  if (!base || !key) { $("key-body").innerHTML = `<div class="empty">enter a key</div>`; return; }
+  try {
+    const k = await getJSON(base, "/admin/storage/key?tablet=" + tablet + "&key=" + encodeURIComponent(key));
+    const disk = (k.disk_versions || []).map((d) =>
+      `<tr><td class="mono">${esc(d.version)}</td><td>${d.tombstone ? pill("err", "tombstone") : pill("ok", "value")}</td></tr>`).join("");
+    $("key-body").innerHTML = `<div class="muted">key <code>${esc(k.key)}</code> · live: ${k.live == null ? "<span class='muted'>absent</span>" : `<code>${esc(k.live)}</code>`}</div>`
+      + (disk ? `<table><thead><tr><th>version</th><th>kind</th></tr></thead><tbody>${disk}</tbody></table>`
+              : `<div class="empty">no on-disk versions</div>`);
+  } catch (e) { $("key-body").innerHTML = `<div class="err-line">${esc(e)}</div>`; }
+}
+
+// ---- wiring ----
+document.querySelectorAll("nav button").forEach((b) =>
+  b.addEventListener("click", () => {
+    document.querySelectorAll("nav button").forEach((x) => x.classList.remove("active"));
+    document.querySelectorAll("main section").forEach((x) => x.classList.remove("active"));
+    b.classList.add("active");
+    $(b.dataset.tab).classList.add("active");
+  }));
+$("refresh").addEventListener("click", loadAll);
+$("st-load").addEventListener("click", loadStorage);
+$("key-load").addEventListener("click", inspectKey);
+
+let timer = null;
+function arm() {
+  if (timer) clearInterval(timer);
+  const ms = Number($("auto").value);
+  if (ms > 0) timer = setInterval(loadAll, ms);
+}
+$("auto").addEventListener("change", arm);
+
+loadAll();
+arm();
+</script>
+</body>
+</html>

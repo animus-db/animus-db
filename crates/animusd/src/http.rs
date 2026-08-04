@@ -169,14 +169,27 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
+/// CORS header lines for the admin edge (ADR 0021). The web dashboard is served
+/// from one node's admin port but fans out to *every* node's `/admin/*` JSON, so
+/// those cross-origin reads need a permissive `Access-Control-Allow-Origin`.
+/// Scoped to the admin listener only — the data edges (dynamo/cql) never send it;
+/// the admin port is assumed bound to a trusted interface (ADR 0020, no auth yet).
+/// Each line ends with CRLF so it can be spliced straight into the header block.
+pub(crate) const CORS_HEADERS: &str = "Access-Control-Allow-Origin: *\r\n\
+     Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
+     Access-Control-Allow-Headers: Content-Type\r\n";
+
 /// The reason phrase for a status code (the small set our edges emit).
 fn reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
+        204 => "No Content",
         400 => "Bad Request",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        409 => "Conflict",
         500 => "Internal Server Error",
+        503 => "Service Unavailable",
         _ => "Status",
     }
 }
@@ -192,12 +205,27 @@ pub(crate) async fn write_response(
     body: &str,
     keep_alive: bool,
 ) -> std::io::Result<()> {
+    write_response_with(stream, status, content_type, body, keep_alive, "").await
+}
+
+/// Like [`write_response`], but splices `extra_headers` (a block of complete
+/// CRLF-terminated header lines, e.g. [`CORS_HEADERS`]) into the response before
+/// the blank line. Pass `""` for none.
+pub(crate) async fn write_response_with(
+    stream: &mut TcpStream,
+    status: u16,
+    content_type: &str,
+    body: &str,
+    keep_alive: bool,
+    extra_headers: &str,
+) -> std::io::Result<()> {
     let connection = if keep_alive { "keep-alive" } else { "close" };
     let response = format!(
         "HTTP/1.1 {status} {reason}\r\n\
          Content-Type: {content_type}\r\n\
          Content-Length: {len}\r\n\
          Connection: {connection}\r\n\
+         {extra_headers}\
          \r\n\
          {body}",
         reason = reason(status),
@@ -222,16 +250,6 @@ pub(crate) async fn write_amz_json_response(
         keep_alive,
     )
     .await
-}
-
-/// Write a plain JSON response (`application/json`) — the admin interface.
-pub(crate) async fn write_json_response(
-    stream: &mut TcpStream,
-    status: u16,
-    body: &str,
-    keep_alive: bool,
-) -> std::io::Result<()> {
-    write_response(stream, status, "application/json", body, keep_alive).await
 }
 
 /// Write a `text/plain` response — used by the `/metrics` route, whose body is the

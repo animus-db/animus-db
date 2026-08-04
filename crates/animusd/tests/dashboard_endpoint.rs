@@ -1,0 +1,189 @@
+//! End-to-end test of the web dashboard surface (ADR 0021) over real TCP
+//! (`ProdEnv`): the static SPA is served from the admin port, `/admin/*` responses
+//! carry the CORS header the browser's cross-node fan-out needs, `OPTIONS`
+//! preflight is answered, and `GET /admin/peers` returns every node's admin
+//! address (the fan-out seed). The panels themselves are pure clients of the
+//! ADR 0020 JSON already covered by `admin_endpoint.rs`; here we prove the
+//! plumbing the dashboard relies on.
+//!
+//! Brings the cluster up one process per node (each its own `ClusterEdgeState`),
+//! so `/admin/peers` is exercised against a real per-process config. Real time +
+//! sockets, so it polls with generous timeouts and uses the documented
+//! port-TOCTOU bring-up retry.
+
+use std::net::SocketAddr;
+use std::time::Duration;
+
+use animusd::Node;
+use serde_json::Value;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio::time::{sleep, timeout};
+
+/// Reserve `count` free loopback ports (bind :0, read addr, release).
+fn free_addrs(count: usize) -> Vec<SocketAddr> {
+    let ls: Vec<std::net::TcpListener> = (0..count)
+        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+        .collect();
+    ls.iter().map(|l| l.local_addr().unwrap()).collect()
+}
+
+/// Bring up an `n`-node cluster, one process per node, retrying the
+/// (allocate-fresh-ports + start-all) as a unit (the documented port-TOCTOU
+/// mitigation, see the crate guide).
+async fn bring_up(n: usize, dir: &std::path::Path) -> (Vec<Node>, animusd::ClusterConfig) {
+    for attempt in 0..16 {
+        let addrs = free_addrs(n * 6);
+        let nodes_cfg: Vec<animusd::RoleAddrs> = (0..n)
+            .map(|i| animusd::RoleAddrs {
+                control: addrs[6 * i],
+                client: addrs[6 * i + 1],
+                dynamo: addrs[6 * i + 2],
+                cql: addrs[6 * i + 3],
+                raftkv: addrs[6 * i + 4],
+                admin: addrs[6 * i + 5],
+            })
+            .collect();
+        let config = animusd::ClusterConfig { nodes: nodes_cfg };
+        let mut nodes = Vec::new();
+        let mut failed = false;
+        for i in 0..n {
+            match animusd::run_node(&config, i, dir.join(format!("node-{attempt}-{i}"))).await {
+                Ok(node) => nodes.push(node),
+                Err(_) => {
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        if !failed {
+            return (nodes, config);
+        }
+        for node in &nodes {
+            node.shutdown_graceful().await;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    panic!("could not bring up cluster after retries (ports kept getting stolen)");
+}
+
+async fn await_bootstrap(nodes: &[Node]) {
+    timeout(Duration::from_secs(20), async {
+        loop {
+            if nodes.iter().any(Node::is_control_leader)
+                && nodes.iter().all(|n| !n.metadata().tablets.is_empty())
+            {
+                return;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("cluster did not bootstrap in 20s");
+}
+
+/// One HTTP/1.0 request; returns `(status, raw header block, body)`.
+async fn raw(addr: SocketAddr, method: &str, path: &str) -> (u16, String, String) {
+    let mut stream = TcpStream::connect(addr).await.expect("connect to admin");
+    let request = format!("{method} {path} HTTP/1.0\r\nHost: animus\r\nConnection: close\r\n\r\n",);
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("send request");
+    stream.flush().await.expect("flush");
+    let mut bytes = Vec::new();
+    stream.read_to_end(&mut bytes).await.expect("read response");
+    let text = String::from_utf8(bytes).expect("utf8 response");
+    let (head, body) = text.split_once("\r\n\r\n").expect("response has a body");
+    let status: u16 = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse().ok())
+        .expect("status line");
+    (status, head.to_string(), body.to_string())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn dashboard_serves_spa_with_cors_and_peers() {
+    timeout(Duration::from_secs(60), async {
+        let dir = tempfile::tempdir().unwrap();
+        let (nodes, config) = bring_up(3, dir.path()).await;
+        await_bootstrap(&nodes).await;
+
+        let admin_addr = nodes[0].admin_addr();
+
+        // ---- GET / serves the SPA as text/html, with CORS ------------------
+        let (s, head, body) = raw(admin_addr, "GET", "/").await;
+        let head_lc = head.to_ascii_lowercase();
+        assert_eq!(s, 200, "root serves the dashboard");
+        assert!(
+            head_lc.contains("content-type: text/html"),
+            "dashboard is text/html, headers:\n{head}"
+        );
+        assert!(
+            head_lc.contains("access-control-allow-origin: *"),
+            "dashboard response carries CORS, headers:\n{head}"
+        );
+        assert!(
+            body.contains("AnimusDB") && body.contains("/admin/peers"),
+            "served the embedded SPA asset"
+        );
+        // The /admin/ui alias serves the same asset.
+        let (s, _, body2) = raw(admin_addr, "GET", "/admin/ui").await;
+        assert_eq!(s, 200);
+        assert_eq!(body2.len(), body.len(), "/admin/ui is the same asset");
+
+        // ---- CORS on the JSON surface (the fan-out prerequisite) -----------
+        let (s, head, _) = raw(admin_addr, "GET", "/admin/status").await;
+        assert_eq!(s, 200);
+        assert!(
+            head.to_ascii_lowercase()
+                .contains("access-control-allow-origin: *"),
+            "JSON responses carry CORS for cross-node fan-out, headers:\n{head}"
+        );
+
+        // ---- OPTIONS preflight is answered with CORS + 204 -----------------
+        let (s, head, _) = raw(admin_addr, "OPTIONS", "/admin/status").await;
+        assert_eq!(s, 204, "preflight is 204 No Content");
+        assert!(
+            head.to_ascii_lowercase()
+                .contains("access-control-allow-methods"),
+            "preflight advertises allowed methods, headers:\n{head}"
+        );
+
+        // ---- /admin/peers lists every node's admin address -----------------
+        let (s, head, body) = raw(admin_addr, "GET", "/admin/peers").await;
+        assert_eq!(s, 200);
+        assert!(
+            head.to_ascii_lowercase()
+                .contains("content-type: application/json"),
+            "peers is JSON, headers:\n{head}"
+        );
+        let peers: Value = serde_json::from_str(&body).expect("peers is JSON");
+        let addrs = peers["admin_addrs"].as_array().expect("admin_addrs array");
+        assert_eq!(
+            addrs.len(),
+            3,
+            "the fan-out seed lists all 3 nodes: {peers}"
+        );
+        for node_cfg in &config.nodes {
+            let want = node_cfg.admin.to_string();
+            assert!(
+                addrs.iter().any(|a| a.as_str() == Some(want.as_str())),
+                "peers includes {want}: {peers}"
+            );
+        }
+        assert_eq!(
+            peers["this"].as_str(),
+            Some(admin_addr.to_string().as_str()),
+            "peers marks the serving node: {peers}"
+        );
+
+        for node in &nodes {
+            node.shutdown_graceful().await;
+        }
+    })
+    .await
+    .expect("test timed out");
+}

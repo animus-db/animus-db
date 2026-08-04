@@ -225,6 +225,19 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   live at request time, or drives an explicit action; node identity for `/admin/config`
   is captured into `ClientCtx.admin` (an `AdminInfo`). **No auth yet** — bind it to a
   trusted interface. The `animus admin <subcommand>` CLI consumes it.
+  - **The web dashboard (ADR 0021)** is served from the same port: `GET /` (and the
+    `/admin`, `/admin/ui` aliases) returns a self-contained vanilla-JS SPA embedded
+    via `include_str!` (`dashboard.rs` → `dashboard.html`) — no bundler/npm, the
+    build stays `cargo`-only. It is a pure **client** of the `/admin/*` JSON, so
+    every `/admin/*` response now carries **CORS** (`http::CORS_HEADERS`, spliced via
+    the new `http::write_response_with`; an `OPTIONS` preflight returns 204) because
+    the page loaded from one node fans out in the browser to **every** node. The
+    fan-out seed is **`GET /admin/peers`** → all nodes' admin addresses: each process
+    already knows them (its `ClusterConfig` per-process, or the in-process bring-up),
+    so they are threaded into `AdminInfo.admin_addrs` (via a new `start_with`
+    param) rather than the browser guessing ports. Read-only for now (nodes/tablets/
+    WAL/data panels); operator-action UI + the ADR 0018 transaction view are next.
+    `tests/dashboard_endpoint.rs` proves serve + CORS + preflight + peers.
   - **Gotcha — `/admin/raftkv` is node-local, but in a single `--cluster N` process
     the shared `ClusterEdgeState` registers *every* node's CP group handle, so one
     node's view lists all replicas; a one-process-per-node deployment (separate edge
@@ -309,7 +322,10 @@ admin / debug interface, ADR 0020: a per-process 3-node cluster, then the read-o
 views config/status/raft/raftkv/storage·wal/metrics/health over the dedicated admin
 port + the `storage/flush` action observed via `storage/lsm`; metrics asserted on
 the control leader since sinks are per-node; bring-up wrapped in the port-TOCTOU
-retry), and `tests/self_heal.rs` (a
+retry), `tests/dashboard_endpoint.rs` (the web dashboard, ADR 0021: `GET /` serves
+the embedded SPA as `text/html`, `/admin/*` responses carry the CORS header, an
+`OPTIONS` preflight returns 204, and `/admin/peers` lists all 3 nodes' admin
+addresses — the fan-out seed), and `tests/self_heal.rs` (a
 concurrent-client smoke test that the assembled node does not deadlock under load).
 All use real TCP/time, so they poll with timeouts, not deterministic assertions. The restart test runs both incarnations in the **same** runtime,
 calling `Node::shutdown()` between them to abort the node's detached tasks and
