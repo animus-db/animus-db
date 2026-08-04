@@ -10,50 +10,39 @@
 //! ```
 //!
 //! - A **block** holds a contiguous run of records (sorted by `(key asc,
-//!   version asc)` across the whole table). Its on-disk shape depends on the
-//!   table **format version** (carried by the footer magic):
-//!   - **v1** (legacy, [`MAGIC_V1`]): `record_bytes || crc32(record_bytes)`,
-//!     records full-key encoded.
-//!   - **v2** (legacy, [`MAGIC_V2`]): `tag(u8) || payload || crc32(tag ||
-//!     payload)`, where `tag` is [`BLOCK_STORED`] (payload is the raw record
-//!     bytes) or [`BLOCK_LZ4`] (payload is the record bytes LZ4-compressed with a
-//!     length prefix, via `lz4_flex`). The writer emits `LZ4` only when it is
-//!     actually smaller, so an incompressible block is never inflated. The CRC
-//!     covers `tag || payload`, so it guards the tag too. Records are full-key
-//!     encoded.
-//!   - **v3** ([`MAGIC_V3`], the current writer): identical block framing to v2
-//!     (`tag || payload || crc`, payload optionally LZ4), but the records inside a
-//!     block use **shared-prefix key encoding**: each record stores `shared(u32)`
-//!     (the count of leading bytes its key shares with the previous record's key
-//!     in the same block) and only its differing suffix. The block's first record
-//!     stores its full key (`shared == 0`). Because SSTable records are sorted by
-//!     key, adjacent keys share long prefixes (e.g. the `escape(table) || …`
-//!     prefix every key in a table shares), so this shrinks the key bytes before
-//!     LZ4 even sees them, and shrinks the decoded footprint. Reading is: fetch
-//!     the block, verify the CRC, read the tag, decompress if `LZ4`, then decode
-//!     the records, reconstructing each full key from the previous one.
+//!   version asc)` across the whole table), framed `tag(u8) || payload ||
+//!   crc32(tag || payload)`:
+//!   - `tag` is [`BLOCK_STORED`] (payload is the raw record bytes) or
+//!     [`BLOCK_LZ4`] (payload is the record bytes LZ4-compressed with a length
+//!     prefix, via `lz4_flex`). The writer emits `LZ4` only when it is actually
+//!     smaller, so an incompressible block is never inflated. The CRC covers
+//!     `tag || payload`, so it guards the tag too.
+//!   - The records inside the payload use **shared-prefix key encoding**: each
+//!     record stores `shared(u32)` (the count of leading bytes its key shares with
+//!     the previous record's key in the same block) and only its differing suffix.
+//!     The block's first record stores its full key (`shared == 0`). Because
+//!     records are sorted by key, adjacent keys share long prefixes (e.g. the
+//!     `escape(table) || …` prefix every key in a table shares), so this shrinks
+//!     the key bytes before LZ4 even sees them, and shrinks the decoded footprint.
+//!   - Reading is: fetch the block, verify the CRC, read the tag, decompress if
+//!     `LZ4`, then decode the records, reconstructing each full key from the
+//!     previous one.
 //! - The **index region** is `serde_json` of `Vec<BlockIndex>` — one entry per
 //!   block giving its first key + byte offset + byte length. The reader loads it
 //!   once on open and keeps it in memory (it is small: one entry per ~block).
 //! - The **footer** is a fixed 24 bytes at end of file: `index_offset: u64`,
-//!   `index_len: u64`, `magic: u64` (the format version — [`MAGIC_V1`] or
-//!   [`MAGIC_V2`]). The reader reads it with one `read_at` at `size - 24`, then
-//!   reads the index region, then individual blocks on demand.
+//!   `index_len: u64`, `magic: u64` ([`MAGIC`]). The reader reads it with one
+//!   `read_at` at `size - 24`, then reads the index region, then individual blocks
+//!   on demand.
 //!
 //! A record's value slot is `Some(value)` or `None` (tombstone). The CRC lets a
 //! read detect a corrupt/torn block; but note the manifest only references a
 //! table whose bytes were `sync`ed before the (atomic) manifest swap, so a torn
 //! block is never reachable in practice — the CRC is defence in depth.
 //!
-//! ## Format compatibility
-//!
-//! The block index + footer geometry is identical across v1/v2/v3; only the
-//! per-block payload framing and the record key encoding differ. A reader takes
-//! the format from [`SsTableMeta::format`] (defaulted to v1 for pre-format
-//! manifests; the writer always stamps the current version) and decodes a legacy
-//! v1 (no tag, full keys) or v2 (tag/LZ4, full keys) block accordingly, so tables
-//! written by an older engine still read after an upgrade. New tables are always
-//! v3 (compression + shared-prefix keys).
+//! There is a **single on-disk format** (pre-alpha; no older tables exist —
+//! ADR 0008). [`SsTableMeta::format`] is retained as a per-table version tag for
+//! operator introspection and as a hook should the format ever evolve again.
 //!
 //! [`Disk::read_at`]: animus_env::Disk::read_at
 
@@ -66,23 +55,14 @@ use serde::{Deserialize, Serialize};
 use super::bloom::BloomFilter;
 use crate::{Key, Result, StorageError, Value, Version};
 
-/// Magic in the footer, identifying a AnimusDB SSTable **v1**: uncompressed
-/// blocks (`record_bytes || crc`). The reader takes the format from the manifest
-/// ([`SsTableMeta::format`]), not by re-reading the footer, so this is retained
-/// for documentation and external tooling.
-#[allow(dead_code)]
-const MAGIC_V1: u64 = 0x4355_5354_4F53_5331; // "ANIMUS S1"
-/// Magic in the footer, identifying a AnimusDB SSTable **v2**: compression-capable
-/// blocks (`tag || payload || crc`, payload optionally LZ4) with **full-key**
-/// records. Retained for legacy reads + external tooling.
-#[allow(dead_code)]
-const MAGIC_V2: u64 = 0x4355_5354_4F53_5332; // "ANIMUS S2"
-/// Magic in the footer, identifying a AnimusDB SSTable **v3**: same block framing
-/// as v2, but records inside a block use **shared-prefix key encoding** (each key
-/// stores the count of leading bytes it shares with the previous key in the block,
-/// then only its differing suffix). The current writer always stamps this.
-const MAGIC_V3: u64 = 0x4355_5354_4F53_5333; // "ANIMUS S3"
-/// The SSTable format version a fresh table is written in.
+/// Magic in the footer, identifying an AnimusDB SSTable. Used for file
+/// identification / external tooling (the reader takes the format from the
+/// manifest's [`SsTableMeta::format`], not by re-reading the footer).
+const MAGIC: u64 = 0x4355_5354_4F53_5333; // "ANIMUS S3"
+/// The SSTable format version a fresh table is written in. There is a **single**
+/// on-disk format (compression-capable framing + shared-prefix key encoding);
+/// this is retained as a per-table tag for operator introspection
+/// (`/admin/storage/lsm`) and as a hook should the format ever evolve again.
 const FORMAT_CURRENT: u32 = 3;
 /// Fixed footer size: `index_offset(8) + index_len(8) + magic(8)`.
 const FOOTER_LEN: u64 = 24;
@@ -93,9 +73,9 @@ const TARGET_BLOCK_BYTES: usize = 4 * 1024;
 const TAG_VALUE: u8 = 0;
 const TAG_TOMBSTONE: u8 = 1;
 
-/// v2 block tag: the payload is the raw (uncompressed) record bytes.
+/// Block tag: the payload is the raw (uncompressed) record bytes.
 const BLOCK_STORED: u8 = 0;
-/// v2 block tag: the payload is the record bytes LZ4-compressed with a length
+/// Block tag: the payload is the record bytes LZ4-compressed with a length
 /// prefix (`lz4_flex::compress_prepend_size`).
 const BLOCK_LZ4: u8 = 1;
 
@@ -117,8 +97,8 @@ struct BlockIndex {
     first_key: Key,
     /// Byte offset of the block in the file.
     offset: u64,
-    /// Byte length of the on-disk block, including its framing and the 4-byte
-    /// trailing CRC (v1: `record_bytes || crc`; v2: `tag || payload || crc`).
+    /// Byte length of the on-disk block, including its framing (`tag || payload`)
+    /// and the 4-byte trailing CRC.
     len: u64,
 }
 
@@ -158,19 +138,17 @@ pub struct SsTableMeta {
     /// recovered from a pre-Bloom manifest, where the Bloom must not be trusted).
     #[serde(default)]
     pub has_bloom: bool,
-    /// On-disk block format version: `1` = legacy uncompressed blocks (full keys),
-    /// `2` = compression-capable (`tag || payload || crc`, full keys), `3` =
-    /// compression-capable + **shared-prefix key encoding**. Defaults to `1` so a
-    /// table recovered from a pre-format manifest is decoded with the legacy reader;
-    /// the writer stamps the current version (`3`).
+    /// On-disk block format version. There is a **single** format today
+    /// (compression-capable framing + shared-prefix keys); this is a per-table tag
+    /// for operator introspection (`/admin/storage/lsm`) and a future-evolution
+    /// hook. The writer stamps [`FORMAT_CURRENT`].
     #[serde(default = "default_format")]
     pub format: u32,
 }
 
-/// serde default for [`SsTableMeta::format`]: a pre-format manifest predates
-/// compression, so its tables are legacy v1.
+/// serde default for [`SsTableMeta::format`]: the single current format.
 fn default_format() -> u32 {
-    1
+    FORMAT_CURRENT
 }
 
 impl SsTableMeta {
@@ -197,12 +175,12 @@ fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
     a.iter().zip(b).take_while(|(x, y)| x == y).count()
 }
 
-/// Encode one record with **shared-prefix key encoding** (v3): `shared(u32) |
+/// Encode one record with **shared-prefix key encoding**: `shared(u32) |
 /// unshared_len(u32) | unshared_key | version(u64) | tag(u8) | value_len(u32) |
 /// value`, where `key = prev_key[..shared] ++ unshared_key`. The first record in a
 /// block passes `prev_key = &[]` (so `shared == 0`, the full key). All integers
 /// little-endian.
-fn encode_record_prefixed(rec: &Record, prev_key: &[u8], out: &mut Vec<u8>) {
+fn encode_record(rec: &Record, prev_key: &[u8], out: &mut Vec<u8>) {
     let shared = common_prefix_len(prev_key, &rec.key);
     let unshared = &rec.key[shared..];
     out.extend_from_slice(&(shared as u32).to_le_bytes());
@@ -222,10 +200,10 @@ fn encode_record_prefixed(rec: &Record, prev_key: &[u8], out: &mut Vec<u8>) {
     }
 }
 
-/// Decode the records in one **v3** (shared-prefix) block's record bytes,
-/// reconstructing each full key from the previous one. Returns a backend error on
-/// a malformed block (incl. a `shared` length exceeding the previous key).
-fn decode_block_prefixed(bytes: &[u8]) -> Result<Vec<Record>> {
+/// Decode the records in one block's (shared-prefix) record bytes, reconstructing
+/// each full key from the previous one. Returns a backend error on a malformed
+/// block (incl. a `shared` length exceeding the previous key).
+fn decode_block(bytes: &[u8]) -> Result<Vec<Record>> {
     let mut out = Vec::new();
     let mut i = 0usize;
     let mut prev_key: Vec<u8> = Vec::new();
@@ -270,70 +248,6 @@ fn decode_block_prefixed(bytes: &[u8]) -> Result<Vec<Record>> {
         };
         i += vlen;
         prev_key.clone_from(&key);
-        out.push(Record {
-            key,
-            version,
-            value,
-        });
-    }
-    Ok(out)
-}
-
-/// Encode one record: `key_len(u32) | key | version(u64) | tag(u8) |
-/// value_len(u32) | value`. All integers little-endian.
-#[allow(dead_code)] // retained for symmetry with the v1/v2 decode path (legacy reads)
-fn encode_record(rec: &Record, out: &mut Vec<u8>) {
-    out.extend_from_slice(&(rec.key.len() as u32).to_le_bytes());
-    out.extend_from_slice(&rec.key);
-    out.extend_from_slice(&rec.version.to_le_bytes());
-    match &rec.value {
-        Some(v) => {
-            out.push(TAG_VALUE);
-            out.extend_from_slice(&(v.len() as u32).to_le_bytes());
-            out.extend_from_slice(v);
-        }
-        None => {
-            out.push(TAG_TOMBSTONE);
-            out.extend_from_slice(&0u32.to_le_bytes());
-        }
-    }
-}
-
-/// Decode the records in one block's record bytes (the block minus its trailing
-/// CRC). Returns a backend error on a malformed block.
-fn decode_block(bytes: &[u8]) -> Result<Vec<Record>> {
-    let mut out = Vec::new();
-    let mut i = 0usize;
-    let need = |i: usize, n: usize, len: usize| -> Result<()> {
-        if i + n <= len {
-            Ok(())
-        } else {
-            Err(StorageError::Backend("truncated sstable block".into()))
-        }
-    };
-    while i < bytes.len() {
-        need(i, 4, bytes.len())?;
-        let klen = u32::from_le_bytes(bytes[i..i + 4].try_into().unwrap()) as usize;
-        i += 4;
-        need(i, klen, bytes.len())?;
-        let key = bytes[i..i + klen].to_vec();
-        i += klen;
-        need(i, 8, bytes.len())?;
-        let version = u64::from_le_bytes(bytes[i..i + 8].try_into().unwrap());
-        i += 8;
-        need(i, 1, bytes.len())?;
-        let tag = bytes[i];
-        i += 1;
-        need(i, 4, bytes.len())?;
-        let vlen = u32::from_le_bytes(bytes[i..i + 4].try_into().unwrap()) as usize;
-        i += 4;
-        need(i, vlen, bytes.len())?;
-        let value = match tag {
-            TAG_VALUE => Some(bytes[i..i + vlen].to_vec()),
-            TAG_TOMBSTONE => None,
-            _ => return Err(StorageError::Backend("bad sstable record tag".into())),
-        };
-        i += vlen;
         out.push(Record {
             key,
             version,
@@ -436,7 +350,7 @@ impl SsTableWriter {
                 block_first_key = Some(rec.key.clone());
                 prev_key.clear(); // new block: first record stores its full key
             }
-            encode_record_prefixed(rec, &prev_key, &mut block_buf);
+            encode_record(rec, &prev_key, &mut block_buf);
             prev_key.clone_from(&rec.key);
 
             if block_buf.len() >= TARGET_BLOCK_BYTES {
@@ -472,7 +386,7 @@ impl SsTableWriter {
         let mut footer = Vec::with_capacity(FOOTER_LEN as usize);
         footer.extend_from_slice(&index_offset.to_le_bytes());
         footer.extend_from_slice(&index_len.to_le_bytes());
-        footer.extend_from_slice(&MAGIC_V3.to_le_bytes());
+        footer.extend_from_slice(&MAGIC.to_le_bytes());
         env.append(file, &footer).await.map_err(io)?;
 
         let file_size = index_offset + index_len + FOOTER_LEN;
@@ -560,9 +474,8 @@ impl SsTableReader {
     }
 
     /// Read and verify the block at index entry `bi`, returning its records.
-    /// Handles legacy v1 framing (`record_bytes || crc`, full keys), v2 framing
-    /// (`tag || payload || crc`, full keys), and v3 (same framing, shared-prefix
-    /// keys) per the table's [`SsTableMeta::format`].
+    /// A block is `tag(u8) || payload || crc`, where `payload` is the record bytes
+    /// (optionally LZ4-compressed) and the records use shared-prefix key encoding.
     async fn read_block<E: Env>(&self, env: &E, bi: &BlockIndex) -> Result<Vec<Record>> {
         if let Some(counter) = &self.block_reads {
             counter.fetch_add(1, Ordering::Relaxed);
@@ -583,30 +496,17 @@ impl SsTableReader {
         if crc32fast::hash(framed) != want {
             return Err(StorageError::Backend("sstable block crc mismatch".into()));
         }
-        if self.meta.format <= 1 {
-            // v1: the CRC'd bytes *are* the record bytes (no tag, no compression),
-            // full-key encoded.
-            return decode_block(framed);
-        }
-        // v2/v3: first byte is the block tag; the rest is the (maybe-compressed)
-        // record payload. The record encoding then depends on the format: v2 stores
-        // full keys, v3 stores shared-prefix keys.
+        // First byte is the block tag; the rest is the (maybe-compressed) record
+        // payload.
         let (&tag, payload) = framed
             .split_first()
             .ok_or_else(|| StorageError::Backend("empty sstable block".into()))?;
-        let decode = |bytes: &[u8]| -> Result<Vec<Record>> {
-            if self.meta.format >= 3 {
-                decode_block_prefixed(bytes)
-            } else {
-                decode_block(bytes)
-            }
-        };
         match tag {
-            BLOCK_STORED => decode(payload),
+            BLOCK_STORED => decode_block(payload),
             BLOCK_LZ4 => {
                 let rec_bytes = lz4_flex::decompress_size_prepended(payload)
                     .map_err(|e| StorageError::Backend(format!("sstable block decompress: {e}")))?;
-                decode(&rec_bytes)
+                decode_block(&rec_bytes)
             }
             other => Err(StorageError::Backend(format!(
                 "bad sstable block tag {other}"
@@ -847,7 +747,7 @@ mod tests {
         });
     }
 
-    /// The v3 shared-prefix codec round-trips records with every prefix relation
+    /// The shared-prefix codec round-trips records with every prefix relation
     /// (identical key, shared prefix, zero shared, empty value), and rejects a
     /// `shared` length that exceeds the previous key.
     #[test]
@@ -882,125 +782,47 @@ mod tests {
         let mut buf = Vec::new();
         let mut prev: Vec<u8> = Vec::new();
         for r in &records {
-            encode_record_prefixed(r, &prev, &mut buf);
+            encode_record(r, &prev, &mut buf);
             prev.clone_from(&r.key);
         }
-        assert_eq!(decode_block_prefixed(&buf).unwrap(), records);
+        assert_eq!(decode_block(&buf).unwrap(), records);
         // shared=5 against an empty previous key (the first record) is malformed.
         let bad = [5u8, 0, 0, 0, 0, 0, 0, 0];
-        assert!(decode_block_prefixed(&bad).is_err());
+        assert!(decode_block(&bad).is_err());
     }
 
-    /// Shared-prefix encoding is much smaller than full-key encoding when adjacent
-    /// keys share a long prefix — isolated from LZ4 by comparing the raw encoded
-    /// buffers directly.
+    /// Shared-prefix encoding is much smaller than naive full-key encoding when
+    /// adjacent keys share a long prefix — isolated from LZ4 by measuring the raw
+    /// encoded buffer against the full-key byte cost computed arithmetically.
     #[test]
     fn prefix_encoding_is_smaller_than_full_keys() {
         let prefix = vec![b'p'; 60];
         let mut records = Vec::new();
+        let mut full_key_cost = 0usize;
         for i in 0u32..1000 {
             let mut key = prefix.clone();
             key.extend_from_slice(format!("{i:06}").as_bytes());
+            // A naive full-key record would store: klen(4) + key + version(8) +
+            // tag(1) + vlen(4) + value.
+            full_key_cost += 4 + key.len() + 8 + 1 + 4 + 1;
             records.push(Record {
                 key,
                 version: u64::from(i) + 1,
                 value: Some(b"v".to_vec()),
             });
         }
-        let mut full = Vec::new();
-        for r in &records {
-            encode_record(r, &mut full);
-        }
         let mut pfx = Vec::new();
         let mut prev: Vec<u8> = Vec::new();
         for r in &records {
-            encode_record_prefixed(r, &prev, &mut pfx);
+            encode_record(r, &prev, &mut pfx);
             prev.clone_from(&r.key);
         }
         assert!(
-            pfx.len() * 2 < full.len(),
-            "prefixed {} not far below full-key {}",
+            pfx.len() * 2 < full_key_cost,
+            "prefixed {} not far below full-key cost {}",
             pfx.len(),
-            full.len()
+            full_key_cost
         );
-        assert_eq!(decode_block_prefixed(&pfx).unwrap(), records);
-    }
-
-    /// A hand-built **legacy v2** (full-key, `BLOCK_STORED`) table still reads after
-    /// the upgrade to v3 — the reader picks the decoder from `SsTableMeta::format`.
-    #[test]
-    fn legacy_v2_full_key_table_still_reads() {
-        let sim = Simulator::new(3);
-        let env = sim.env(0);
-        block_on(async {
-            let records = vec![
-                Record {
-                    key: b"aaa".to_vec(),
-                    version: 1,
-                    value: Some(b"1".to_vec()),
-                },
-                Record {
-                    key: b"aab".to_vec(),
-                    version: 2,
-                    value: Some(b"2".to_vec()),
-                },
-                Record {
-                    key: b"abc".to_vec(),
-                    version: 3,
-                    value: None,
-                },
-            ];
-            // One v2 block: full-key records, framed STORED (`tag || payload || crc`).
-            let mut payload = Vec::new();
-            for r in &records {
-                encode_record(r, &mut payload);
-            }
-            let mut on_disk = vec![BLOCK_STORED];
-            on_disk.extend_from_slice(&payload);
-            let crc = crc32fast::hash(&on_disk);
-            on_disk.extend_from_slice(&crc.to_le_bytes());
-            let block_len = on_disk.len() as u64;
-            env.replace("v2t", &on_disk).await.unwrap();
-            let index = vec![BlockIndex {
-                first_key: b"aaa".to_vec(),
-                offset: 0,
-                len: block_len,
-            }];
-            let index_bytes = serde_json::to_vec(&index).unwrap();
-            let index_offset = block_len;
-            let index_len = index_bytes.len() as u64;
-            env.append("v2t", &index_bytes).await.unwrap();
-            let mut footer = Vec::new();
-            footer.extend_from_slice(&index_offset.to_le_bytes());
-            footer.extend_from_slice(&index_len.to_le_bytes());
-            footer.extend_from_slice(&MAGIC_V2.to_le_bytes());
-            env.append("v2t", &footer).await.unwrap();
-            env.sync("v2t").await.unwrap();
-
-            let meta = SsTableMeta {
-                seq: 1,
-                level: 0,
-                min_key: Some(b"aaa".to_vec()),
-                max_key: Some(b"abc".to_vec()),
-                min_version: 1,
-                max_version: 3,
-                index_offset,
-                index_len,
-                file_size: index_offset + index_len + FOOTER_LEN,
-                bloom: BloomFilter::default(),
-                has_bloom: false,
-                format: 2, // legacy full-key format
-            };
-            let reader = SsTableReader::open(&env, "v2t".into(), meta).await.unwrap();
-            let got = reader.full_scan(&env).await.unwrap();
-            assert_eq!(got.len(), 3);
-            assert_eq!(got[0], (b"aaa".to_vec(), 1, Some(b"1".to_vec())));
-            assert_eq!(got[2], (b"abc".to_vec(), 3, None));
-            // Point read through the format<=2 branch.
-            assert_eq!(
-                reader.latest(&env, b"aab").await.unwrap(),
-                Some((2, Some(b"2".to_vec())))
-            );
-        });
+        assert_eq!(decode_block(&pfx).unwrap(), records);
     }
 }

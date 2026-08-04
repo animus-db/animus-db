@@ -70,10 +70,10 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
   differing suffix; the block's first record stores its full key. Since records
   are sorted by key, adjacent keys share long prefixes (every key in a table
   shares the `escape(table) || …` prefix), so this shrinks the key bytes *before*
-  LZ4 and shrinks the decoded footprint. The table **format version** (`1` = legacy
-  uncompressed full-key, `2` = LZ4 full-key, `3` = LZ4 + shared-prefix keys) lives
-  in `SsTableMeta::format`, and `read_block` decodes any of them, so old tables
-  still read; the writer stamps the current version (`3`). (Restart-point in-block
+  LZ4 and shrinks the decoded footprint. There is a **single on-disk format**
+  (pre-alpha, no older tables exist — ADR 0008); `SsTableMeta::format` is kept as a
+  per-table version tag for operator introspection (`/admin/storage/lsm`) and a
+  future-evolution hook, not a read-time switch. (Restart-point in-block
   binary-search seek — the other half of LevelDB's block format — is a deliberate
   follow-up: the reader decodes whole blocks, gated by the block index + Bloom, so
   restart points would be unused machinery today.)
@@ -162,11 +162,10 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
 `cargo test -p animus-storage` (proptest semantics + units). Library unit tests
 also cover the perf formats: `sstable::tests` round-trips a compressible and
 an incompressible block (asserting LZ4 shrinks the former and never inflates the
-latter), round-trips the **v3 shared-prefix codec** across every prefix relation +
-rejects a malformed `shared` length, asserts shared-prefix encoding is far smaller
-than full-key encoding (isolated from LZ4 by comparing raw buffers), and reads a
-hand-built **legacy v2 full-key table** back (the reader picks the decoder from
-`SsTableMeta::format`); and `manifest_tests` round-trips the binary manifest codec,
+latter), round-trips the **shared-prefix codec** across every prefix relation +
+rejects a malformed `shared` length, and asserts shared-prefix encoding is far
+smaller than naive full-key encoding (isolated from LZ4 by comparing the raw
+buffer against the arithmetic full-key cost); and `manifest_tests` round-trips the binary manifest codec,
 checks it is smaller than JSON, and confirms a legacy JSON manifest still decodes.
 
 `LsmEngine` tests run under `SimEnv` via `Simulator` (a dev-dep): `lsm_semantics.rs`

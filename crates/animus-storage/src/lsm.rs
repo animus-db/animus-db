@@ -1389,7 +1389,8 @@ pub struct SsTableView {
     pub file_size: u64,
     /// Whether a bloom filter was built for the table.
     pub has_bloom: bool,
-    /// Block format version (1 = uncompressed legacy, 2 = compression-capable).
+    /// On-disk block format version (single format today: compression-capable
+    /// framing + shared-prefix keys; a per-table tag for introspection).
     pub format: u32,
 }
 
@@ -2304,7 +2305,10 @@ mod manifest_tests {
         );
         let t = &m.tables[0];
         assert_eq!(t.seq, 1);
-        assert_eq!(t.format, 1, "legacy table defaults to format v1");
+        assert_eq!(
+            t.format, 3,
+            "a format-less manifest entry defaults to the current format"
+        );
         assert!(!t.has_bloom, "legacy table has no bloom");
         assert_eq!(t.level, 0, "legacy table defaults to L0");
     }
