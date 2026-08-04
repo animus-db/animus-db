@@ -45,11 +45,11 @@ mod dynamo;
 mod http;
 
 use animus_control::node::heartbeat_loop;
-use animus_control::{ProposeResult, RaftNode};
+use animus_control::{PlacementPolicy, ProposeResult, RaftNode};
 use animus_cp_data::{RaftKvNode, SplitHook};
 use animus_env::{Coresident, Env, Metric, MetricsHandle, NodeId, ProdEnv};
 use animus_storage::{LsmEngine, MemoryEngine, SsTableView, WalRecordView};
-use animus_tablet::{KeyRange, TabletId};
+use animus_tablet::{Epoch, KeyRange, TabletId};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -656,6 +656,12 @@ impl BoundNode {
         // (the cluster members are the `raftkv` ids), so the control plane's
         // `detect_loop` marks a crashed CP node `Down`.
         let raftkv_hb_env = self.raftkv_env.clone();
+        // A fifth `raftkv`-env clone for the **join-host loop** (D1): a node added to
+        // a tablet's replica set by the placement reconciler hosts an empty group for
+        // it and catches up via `InstallSnapshot`. The bootstrap tablet's member id is
+        // the node's base `raftkv` id, so it hosts on this (main) env; a split tablet's
+        // is derived, so it mints a sibling from the shared pool.
+        let raftkv_join_env = self.raftkv_env.clone();
         let my_raftkv_id = self.raftkv_id;
         let my_raftkv_addr = self.raftkv_addr;
 
@@ -724,14 +730,17 @@ impl BoundNode {
             .map(config::raftkv_id)
             .collect();
         let hosts_cp = cp_group.contains(&my_raftkv_id);
+        // The per-node CP-group **hosting claim set**: one `TabletId` per group this
+        // node hosts (or is about to), shared across the split hook, the re-host pass
+        // (#2), and the join-host loop (D1) so they never double-mint a group. Created
+        // unconditionally — the join-host loop runs on every node (a spare that is not
+        // in the bootstrap set still hosts a tablet later placed on it).
+        let minted: Arc<Mutex<BTreeSet<TabletId>>> = Arc::new(Mutex::new(BTreeSet::new()));
         if hosts_cp {
-            // Per-node guard against double-minting a split-created tablet's group
-            // (Phase 2.2), and the durable record of which split tablets this node
-            // hosts on disk (#2). Pre-populate `minted` from the marker so the
-            // bootstrap group re-applying a committed `Split` on WAL recovery finds
-            // the tablet already hosted and does not mint the sibling twice (#4
-            // crash-idempotency).
-            let minted = Arc::new(Mutex::new(BTreeSet::new()));
+            // Pre-populate `minted` from the durable marker so the bootstrap group
+            // re-applying a committed `Split` on WAL recovery finds the tablet already
+            // hosted and does not mint the sibling twice (#4 crash-idempotency), and
+            // re-host each previously-split tablet from disk (#2).
             let recorded = load_hosted_cp(&self.raftkv_env).await;
             {
                 let mut m = minted.lock().expect("minted set poisoned");
@@ -759,7 +768,7 @@ impl BoundNode {
                 cp_group.clone(),
                 my_raftkv_id,
                 backend,
-                minted,
+                minted.clone(),
                 hosted,
             );
             let cp = match backend {
@@ -823,6 +832,19 @@ impl BoundNode {
         if hosts_cp {
             tasks.push(tokio::spawn(cp_reconfigure_loop(ctx.clone())));
         }
+
+        // **CP join-host loop** (D1 — closes the failure->placement->reconfigure
+        // cascade): a node placed in a tablet's replica set by the reconciler (e.g. a
+        // spare picked to replace a `Down` replica) stands up an empty co-resident
+        // group for it and catches up via `InstallSnapshot`. Runs on **every** node
+        // (a spare is not in the bootstrap CP set, yet must host when later placed).
+        tasks.push(tokio::spawn(cp_join_host_loop(
+            raftkv_join_env,
+            ctx.clone(),
+            backend,
+            my_raftkv_id,
+            minted,
+        )));
 
         // Client request server + DynamoDB HTTP + CQL endpoints share the same
         // context built above (the same raft view, RMW lock, and CP edge state).
@@ -1614,22 +1636,34 @@ async fn bootstrap(raft: RaftNode<ProdEnv>, raftkv_ids: Vec<NodeId>) {
     let rf = raftkv_ids.len().min(MAX_REPLICATION_FACTOR);
     let replicas: Vec<NodeId> = raftkv_ids.iter().copied().take(rf).collect();
     loop {
-        if raft.is_leader() && !raft.metadata().tablets.contains_key(&TABLET) {
-            // Members + tablet replicas are the CP `raftkv` ids — the nodes that
-            // actually hold data; the control-group ids are only the Raft
-            // consensus group.
-            for &node in &raftkv_ids {
-                raft.propose(MetaCommand::UpsertMember {
-                    node,
-                    labels: BTreeMap::new(),
-                    status: NodeStatus::Active,
+        if raft.is_leader() {
+            let meta = raft.metadata();
+            if !meta.tablets.contains_key(&TABLET) {
+                // Members + tablet replicas are the CP `raftkv` ids — the nodes that
+                // actually hold data; the control-group ids are only the Raft
+                // consensus group.
+                for &node in &raftkv_ids {
+                    raft.propose(MetaCommand::UpsertMember {
+                        node,
+                        labels: BTreeMap::new(),
+                        status: NodeStatus::Active,
+                    });
+                }
+                raft.propose(MetaCommand::CreateTablet {
+                    tablet: TABLET,
+                    range: KeyRange::whole(),
+                    replicas: replicas.clone(),
+                });
+            } else if !meta.policies.contains_key(&TABLET) {
+                // The tablet exists but has no policy yet — a separate idempotent step
+                // (the create above is async, so the policy lands a tick later). The
+                // RF policy lets the reconciler replace a `Down` replica with a spare
+                // (D1); it requires no labels, so any Active member is eligible.
+                raft.propose(MetaCommand::SetTabletPolicy {
+                    tablet: TABLET,
+                    policy: Some(PlacementPolicy::simple("cp-rf", rf)),
                 });
             }
-            raft.propose(MetaCommand::CreateTablet {
-                tablet: TABLET,
-                range: KeyRange::whole(),
-                replicas: replicas.clone(),
-            });
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
@@ -1904,6 +1938,118 @@ async fn cp_reconfigure_loop(ctx: ClientCtx) {
             leader.reconfigure_step(&desired);
         }
     }
+}
+
+/// How often the join-host loop polls the tablet map for a tablet newly placed on
+/// this node. Same cadence as the reconfigure loop — they converge a replica move
+/// together (this node stands the group up; the leader adds it as a voter).
+const CP_JOIN_HOST_INTERVAL: Duration = Duration::from_millis(500);
+
+/// The per-node **CP join-host loop** (D1): when the placement reconciler adds this
+/// node to a tablet's replica set (e.g. picking it as the spare for a `Down`
+/// replica), stand up an **empty** co-resident group for that tablet so the group's
+/// leader can add it as a voter and catch it up via `InstallSnapshot`.
+///
+/// Gated on **`epoch > INITIAL`**: a freshly *split* tablet is at `Epoch::INITIAL`
+/// and is seeded with its handed-off data by the split hook on its original replicas
+/// — starting it *empty* here would lose that data, so the loop never touches an
+/// INITIAL-epoch tablet (the bootstrap tablet is also hosted at start, not here). A
+/// reconfigure bumps the epoch past INITIAL, which is exactly the "this node was
+/// added as a fresh replica" signal. The shared `hosting` claim set (with the split
+/// hook + re-host) prevents double-hosting; `edge.local_cp` skips a tablet already
+/// hosted (e.g. the bootstrap tablet on an original replica).
+///
+/// The new member starts with `all_nodes` = the other members **excluding itself**,
+/// so it is a quiet non-voter until the leader's `change_membership` adds it (a node
+/// inside its own initial config could campaign — see the `animus-cp-data` membership
+/// gotcha). On restart it instead recovers its config from its own WAL.
+async fn cp_join_host_loop(
+    raftkv_env: ProdEnv,
+    ctx: ClientCtx,
+    backend: StorageBackend,
+    my_raftkv_id: NodeId,
+    hosting: Arc<Mutex<BTreeSet<TabletId>>>,
+) {
+    loop {
+        tokio::time::sleep(CP_JOIN_HOST_INTERVAL).await;
+        let tablets = ctx.raft.metadata().tablets;
+        for (tablet, t) in tablets {
+            if t.epoch <= Epoch::INITIAL || !t.replicas.contains(&my_raftkv_id) {
+                continue;
+            }
+            if ctx.edge.local_cp(tablet).is_some() {
+                continue; // already hosting (bootstrap tablet, or a prior iteration)
+            }
+            // Claim once (shared with the split hook / re-host).
+            {
+                let mut h = hosting.lock().expect("hosting set poisoned");
+                if !h.insert(tablet) {
+                    continue;
+                }
+            }
+            cp_join_host(
+                &raftkv_env,
+                &ctx,
+                backend,
+                my_raftkv_id,
+                tablet,
+                &t.replicas,
+                &hosting,
+            )
+            .await;
+        }
+    }
+}
+
+/// Stand up this node's empty member of `tablet`'s group (the body of
+/// [`cp_join_host_loop`]). The bootstrap tablet's member id is this node's base
+/// `raftkv` id, hosted on the **main** `raftkv` env; a split tablet's is derived, so
+/// it mints a co-resident **sibling**. On a transient engine-open failure the tablet
+/// is un-claimed so a later tick retries.
+#[allow(clippy::too_many_arguments)] // join context: env + ctx + backend + ids + replicas + claim
+async fn cp_join_host(
+    raftkv_env: &ProdEnv,
+    ctx: &ClientCtx,
+    backend: StorageBackend,
+    my_raftkv_id: NodeId,
+    tablet: TabletId,
+    replicas: &[NodeId],
+    hosting: &Arc<Mutex<BTreeSet<TabletId>>>,
+) {
+    let member = if tablet == TABLET {
+        my_raftkv_id
+    } else {
+        my_raftkv_id + tablet.0 * CP_SPLIT_ID_STRIDE
+    };
+    // Quiet non-voter: start knowing the *other* members, not itself.
+    let others: Vec<NodeId> = cp_members_for(tablet, replicas)
+        .into_iter()
+        .filter(|&id| id != member)
+        .collect();
+    // Bootstrap tablet -> the main env (member id == base id); split tablet -> a
+    // sibling minted for the derived member id.
+    let (env, prefix) = if tablet == TABLET {
+        (raftkv_env.clone(), LSM_PREFIX.to_string())
+    } else {
+        (raftkv_env.sibling(member), format!("db-t{}-", tablet.0))
+    };
+    let addr = env.local_addr();
+    let cp = match backend {
+        StorageBackend::Lsm => match LsmEngine::open(env.clone(), &prefix).await {
+            Ok(lsm) => CpGroup::Lsm(RaftKvNode::start(env, others, lsm)),
+            Err(e) => {
+                tracing::error!(?e, tablet = tablet.0, "CP join-host: opening tablet LSM");
+                hosting
+                    .lock()
+                    .expect("hosting set poisoned")
+                    .remove(&tablet);
+                return;
+            }
+        },
+        StorageBackend::Memory => CpGroup::Mem(RaftKvNode::start(env, others, MemoryEngine::new())),
+    };
+    ctx.edge.register_raftkv(tablet, cp);
+    ctx.register_cp_addr(member, addr.to_string()).await;
 }
 
 /// How often the auto-split loop samples tablet sizes (Phase 2.4). A slow

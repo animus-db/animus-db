@@ -12,6 +12,10 @@
 //!    group it leads toward the tablet's replicated replica set: dropping a follower
 //!    from `Metadata.tablets[t].replicas` makes the group reconfigure its Raft voters
 //!    down to the new set (observed via the admin `/admin/raftkv` view).
+//! 3. `failure_auto_replaces_replica_onto_spare` — the full cascade (D1): a 4-node
+//!    cluster (RF 3 + a spare) auto-heals a killed replica — detector marks it Down,
+//!    the RF policy's reconciler swaps in the spare, the spare join-hosts an empty
+//!    group and is added as a voter, and the group keeps serving.
 //!
 //! Real TCP/time — polls with generous timeouts, not deterministic assertions.
 
@@ -20,7 +24,8 @@ use std::time::Duration;
 
 use animus_tablet::{Epoch, TabletId};
 use animusd::{
-    ClusterConfig, MetaCommand, Node, NodeStatus, RoleAddrs, bind_cluster, start_cluster,
+    ClientRequest, ClientResponse, ClusterConfig, MetaCommand, Node, NodeStatus, RoleAddrs,
+    bind_cluster, read_frame, start_cluster,
 };
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -274,5 +279,165 @@ async fn cp_group_follows_tablet_replica_set() {
 
     for node in nodes {
         node.shutdown();
+    }
+}
+
+// ---- Test 3: full failure->placement->reconfigure cascade with a spare (D1) --
+
+/// `group_view` that returns `None` instead of panicking when the admin endpoint is
+/// unreachable (a killed node), so the cascade test can poll only the survivors.
+async fn group_view_opt(addr: SocketAddr) -> Option<(bool, Vec<u64>)> {
+    if TcpStream::connect(addr).await.is_err() {
+        return None;
+    }
+    group_view(addr).await
+}
+
+async fn call(addr: SocketAddr, req: ClientRequest) -> Option<ClientResponse> {
+    let mut stream = TcpStream::connect(addr).await.ok()?;
+    animusd::write_frame(&mut stream, &req).await.ok()?;
+    read_frame(&mut stream).await.ok()?
+}
+
+async fn put(clients: &[SocketAddr], key: &[u8], value: &[u8], secs: u64) {
+    let w = async {
+        loop {
+            for &c in clients {
+                if let Some(ClientResponse::PutOk) = call(
+                    c,
+                    ClientRequest::Put {
+                        key: key.to_vec(),
+                        value: value.to_vec(),
+                        table: None,
+                    },
+                )
+                .await
+                {
+                    return;
+                }
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    };
+    timeout(Duration::from_secs(secs), w)
+        .await
+        .unwrap_or_else(|_| panic!("write of {key:?} never committed"));
+}
+
+async fn await_value(clients: &[SocketAddr], key: &[u8], want: &[u8], secs: u64) {
+    let p = async {
+        loop {
+            for &c in clients {
+                if let Some(ClientResponse::Value(Some(v))) = call(
+                    c,
+                    ClientRequest::Get {
+                        key: key.to_vec(),
+                        table: None,
+                    },
+                )
+                .await
+                {
+                    if v == want {
+                        return;
+                    }
+                }
+            }
+            sleep(Duration::from_millis(150)).await;
+        }
+    };
+    timeout(Duration::from_secs(secs), p)
+        .await
+        .unwrap_or_else(|_| panic!("key {key:?} never read back as {want:?}"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn failure_auto_replaces_replica_onto_spare() {
+    // 4 nodes: RF=3, so the bootstrap tablet is placed on nodes 0..3 (raftkv
+    // 300..302) and node 3 (raftkv 303) is an idle spare. Killing a replica should
+    // cascade: detector marks it Down -> reconciler swaps in the spare -> the group
+    // reconfigures onto it and keeps serving.
+    let dir = tempfile::tempdir().unwrap();
+    let (nodes, config) = bring_up(4, dir.path()).await;
+    await_bootstrap(&nodes).await;
+    let raftkv_ids = config.raftkv_ids(); // [300, 301, 302, 303]
+    let spare = raftkv_ids[3];
+    let clients: Vec<SocketAddr> = config.nodes.iter().map(|a| a.client).collect();
+
+    // Wait for the group to form with 3 voters + a leader; write a key.
+    let leader_idx = {
+        let formed = async {
+            loop {
+                for (i, node) in nodes.iter().enumerate() {
+                    if let Some((true, voters)) = group_view(node.admin_addr()).await {
+                        if voters.len() == 3 {
+                            return i;
+                        }
+                    }
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        };
+        timeout(Duration::from_secs(30), formed)
+            .await
+            .expect("CP group did not form with 3 voters + a leader within 30s")
+    };
+    put(&clients, b"k1", b"v1", 20).await;
+
+    // Kill a **follower** replica (the leader can't remove itself, and killing a
+    // follower keeps the test's leader stable). A replica node hosts tablet 1
+    // (group_view Some); the spare (node 3) does not.
+    let kill_idx = (0..3)
+        .find(|&i| i != leader_idx)
+        .expect("a follower replica exists");
+    let killed_id = raftkv_ids[kill_idx];
+    nodes[kill_idx].shutdown();
+    let survivors: Vec<usize> = (0..4).filter(|&i| i != kill_idx).collect();
+    let survivor_clients: Vec<SocketAddr> =
+        survivors.iter().map(|&i| config.nodes[i].client).collect();
+
+    // The cascade: the tablet map drops the dead replica and adds the spare.
+    let replaced = async {
+        loop {
+            for &i in &survivors {
+                if let Some(t) = nodes[i].metadata().tablets.get(&BOOTSTRAP_TABLET) {
+                    if t.replicas.contains(&spare) && !t.replicas.contains(&killed_id) {
+                        return;
+                    }
+                }
+            }
+            sleep(Duration::from_millis(150)).await;
+        }
+    };
+    timeout(Duration::from_secs(60), replaced)
+        .await
+        .expect("the dead replica was not auto-replaced by the spare within 60s");
+
+    // The group reconfigured onto the spare: some survivor leads with 3 voters that
+    // include the spare and exclude the dead node (i.e. the spare join-hosted an
+    // empty group and was added as a voter).
+    let reconfigured = async {
+        loop {
+            for &i in &survivors {
+                if let Some((true, voters)) = group_view_opt(config.nodes[i].admin).await {
+                    if voters.len() == 3 && voters.contains(&spare) && !voters.contains(&killed_id)
+                    {
+                        return;
+                    }
+                }
+            }
+            sleep(Duration::from_millis(150)).await;
+        }
+    };
+    timeout(Duration::from_secs(60), reconfigured)
+        .await
+        .expect("the CP group did not reconfigure onto the spare within 60s");
+
+    // The healed group still serves: the old key survives and a new write commits.
+    await_value(&survivor_clients, b"k1", b"v1", 30).await;
+    put(&survivor_clients, b"k2", b"v2", 30).await;
+    await_value(&survivor_clients, b"k2", b"v2", 30).await;
+
+    for &i in &survivors {
+        nodes[i].shutdown();
     }
 }
