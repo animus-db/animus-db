@@ -182,6 +182,7 @@ fn run(seed: u64) {
     assert!(matches!(
         control[cl].propose(MetaCommand::CreateTablet {
             tablet: TABLET,
+            table: None,
             range: KeyRange::whole(),
             replicas: INITIAL_VOTERS.to_vec(),
         }),
@@ -327,6 +328,7 @@ fn auto_reconfigure_is_reproducible_from_seed() {
         }
         control[cl].propose(MetaCommand::CreateTablet {
             tablet: TABLET,
+            table: None,
             range: KeyRange::whole(),
             replicas: INITIAL_VOTERS.to_vec(),
         });

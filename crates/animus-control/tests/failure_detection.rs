@@ -118,6 +118,7 @@ fn run(seed: u64) {
     assert!(matches!(
         nodes[leader].propose(MetaCommand::CreateTablet {
             tablet: TABLET,
+            table: None,
             range: KeyRange::whole(),
             replicas: initial.clone(),
         }),
@@ -246,6 +247,7 @@ fn detection_is_reproducible_from_seed() {
         }
         nodes[leader].propose(MetaCommand::CreateTablet {
             tablet: TABLET,
+            table: None,
             range: KeyRange::whole(),
             replicas: vec![10, 12, 14],
         });

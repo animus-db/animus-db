@@ -120,6 +120,7 @@ fn run(seed: u64) {
     assert!(matches!(
         nodes[leader].propose(MetaCommand::CreateTablet {
             tablet: TABLET,
+            table: None,
             range: KeyRange::whole(),
             replicas: replicas.clone(),
         }),

@@ -6,9 +6,159 @@
 //! primitives behind control-plane tablet split/merge); the epoch is the
 //! fencing token used by the data plane (ADR 0001). Automatic split-point
 //! selection and replica rebalancing on split/merge remain future work.
+//!
+//! Each table is its own **hash ring** (ADR 0022): a data-plane key is
+//! `escape(table) || partition_token(pk) || escape(pk) || rk`, so a table's rows
+//! form one contiguous block, and *within* that block partitions are spread by
+//! the [`partition_token`] (a Murmur3 hash of the partition key). A tablet is
+//! **scoped to one table** (`Tablet::table`) and owns a contiguous `[start, end)`
+//! sub-range of that table's keyspace — a token sub-range — so the whole
+//! range/epoch/split-merge machinery is reused unchanged while load spreads
+//! evenly and one partition's rows stay contiguous + sort-ordered (the token is
+//! over the partition key only, so all of a partition's keys share a prefix). A
+//! table starts as one tablet and **splits on demand** as it grows.
 
 use animus_env::NodeId;
 use serde::{Deserialize, Serialize};
+
+/// Width, in bytes, of a [`partition_token`] — a big-endian `u64`.
+pub const TOKEN_BYTES: usize = 8;
+
+/// The 64-bit **partition token** for a partition key: the top 64 bits of
+/// MurmurHash3 (x64, 128-bit, seed 0) — the same hash Cassandra's
+/// `Murmur3Partitioner` uses — returned big-endian so byte order equals numeric
+/// order (a [`KeyRange`] byte comparison over the token prefix then *is* a token
+/// comparison). It sits between the table prefix and the partition key in every
+/// data-plane key (`escape(table) || token || escape(pk) || rk`, ADR 0022),
+/// spreading a table's partitions evenly across that table's ring.
+///
+/// **Every node and every restart must agree**: the same partition key always
+/// routes to the same tablet, so this is a fixed, seedless algorithm with no
+/// RNG or process/host state. Do not change the hash without a data migration —
+/// the bytes are baked into stored keys.
+#[must_use]
+pub fn partition_token(partition_key: &[u8]) -> [u8; TOKEN_BYTES] {
+    // Cassandra reduces the 128-bit hash to a token via its first 64-bit half.
+    murmur3_x64_128(partition_key, 0).0.to_be_bytes()
+}
+
+/// MurmurHash3 128-bit, x64 variant (the algorithm behind Cassandra's
+/// `Murmur3Partitioner`). Deterministic and allocation-free; returns both 64-bit
+/// halves `(h1, h2)`. Reference: Austin Appleby's `MurmurHash3.cpp`.
+fn murmur3_x64_128(data: &[u8], seed: u32) -> (u64, u64) {
+    const C1: u64 = 0x87c3_7b91_1142_53d5;
+    const C2: u64 = 0x4cf5_ad43_2745_937f;
+
+    let mut h1 = u64::from(seed);
+    let mut h2 = u64::from(seed);
+
+    let mut blocks = data.chunks_exact(16);
+    for block in &mut blocks {
+        let mut k1 = u64::from_le_bytes(block[0..8].try_into().unwrap());
+        let mut k2 = u64::from_le_bytes(block[8..16].try_into().unwrap());
+
+        k1 = k1.wrapping_mul(C1);
+        k1 = k1.rotate_left(31);
+        k1 = k1.wrapping_mul(C2);
+        h1 ^= k1;
+        h1 = h1.rotate_left(27);
+        h1 = h1.wrapping_add(h2);
+        h1 = h1.wrapping_mul(5).wrapping_add(0x52dc_e729);
+
+        k2 = k2.wrapping_mul(C2);
+        k2 = k2.rotate_left(33);
+        k2 = k2.wrapping_mul(C1);
+        h2 ^= k2;
+        h2 = h2.rotate_left(31);
+        h2 = h2.wrapping_add(h1);
+        h2 = h2.wrapping_mul(5).wrapping_add(0x3849_5ab5);
+    }
+
+    let tail = blocks.remainder();
+    let mut k1 = 0u64;
+    let mut k2 = 0u64;
+    // Tail bytes, little-endian: bytes 8.. feed k2, bytes 0..8 feed k1.
+    if tail.len() > 8 {
+        for (i, &b) in tail.iter().enumerate().skip(8) {
+            k2 ^= u64::from(b) << (8 * (i - 8));
+        }
+        k2 = k2.wrapping_mul(C2);
+        k2 = k2.rotate_left(33);
+        k2 = k2.wrapping_mul(C1);
+        h2 ^= k2;
+    }
+    if !tail.is_empty() {
+        for (i, &b) in tail.iter().enumerate().take(8) {
+            k1 ^= u64::from(b) << (8 * i);
+        }
+        k1 = k1.wrapping_mul(C1);
+        k1 = k1.rotate_left(31);
+        k1 = k1.wrapping_mul(C2);
+        h1 ^= k1;
+    }
+
+    h1 ^= data.len() as u64;
+    h2 ^= data.len() as u64;
+    h1 = h1.wrapping_add(h2);
+    h2 = h2.wrapping_add(h1);
+    h1 = fmix64(h1);
+    h2 = fmix64(h2);
+    h1 = h1.wrapping_add(h2);
+    h2 = h2.wrapping_add(h1);
+    (h1, h2)
+}
+
+/// Murmur3's 64-bit finalization mix.
+fn fmix64(mut k: u64) -> u64 {
+    k ^= k >> 33;
+    k = k.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    k ^= k >> 33;
+    k = k.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+    k ^= k >> 33;
+    k
+}
+
+/// The order-preserving, **prefix-free** escape of `bytes`: a byte stream whose
+/// encoding never prefixes another's (each `0x00` is doubled to `0x00 0x01`, and
+/// the whole is terminated by `0x00 0x00`). This must match the wire adapters'
+/// `escape` byte-for-byte, because a table-scoped tablet's [`KeyRange`] is computed
+/// from `escape(table)` here and must line up with the `escape(table)`-prefixed
+/// data keys the adapters write (ADR 0023). It is duplicated here (rather than
+/// shared from `animus-dynamo`) so the keyspace crate stays dependency-light and
+/// the control plane can compute a table's block without an adapter dependency.
+#[must_use]
+pub fn escape(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len() + 2);
+    for &b in bytes {
+        out.push(b);
+        if b == 0x00 {
+            out.push(0x01);
+        }
+    }
+    out.extend_from_slice(&[0x00, 0x00]);
+    out
+}
+
+/// The half-open [`KeyRange`] of `table`'s **whole key block** (ADR 0023): every
+/// data key of `table` starts with `escape(table_name)` (the wire adapters encode
+/// `escape(table) || …`), and because the escape is prefix-free no other table's
+/// keys fall in it. So the block is `[escape(table), block_end)` where `block_end`
+/// is the escaped prefix with its trailing `0x00` bumped to `0x01` — the first key
+/// past the table. This is exactly the range a full-table `Scan` walks; a
+/// table-scoped tablet covers this block (or, once table-scoped rings exist, a
+/// sub-range of it).
+#[must_use]
+pub fn table_key_block(table_name: &str) -> KeyRange {
+    let start = escape(table_name.as_bytes());
+    let mut end = start.clone();
+    // The escape always ends `0x00 0x00`; bump the final byte to `0x01` for the
+    // first key strictly past this table's block.
+    *end.last_mut().expect("an escaped prefix is non-empty") = 0x01;
+    KeyRange {
+        start,
+        end: Some(end),
+    }
+}
 
 /// Stable identifier for a tablet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -96,12 +246,33 @@ impl KeyRange {
     }
 }
 
-/// A tablet: a key range, its replica set, and its placement epoch.
+/// A table name — the catalog identifier a tablet is scoped to. A bare string;
+/// the control plane treats it as opaque (the wire adapters own namespacing). A
+/// duplicate of `animus_control::TableName` kept here so the tablet model has no
+/// dependency on the control crate (`animus-control` depends on `animus-tablet`,
+/// not the reverse).
+pub type TableName = String;
+
+/// A tablet: a **table-scoped** key range, its replica set, and its placement
+/// epoch.
+///
+/// A tablet belongs to exactly one table (`table`): every key it owns is data of
+/// that table, so a tablet never mixes two tables' rows. The `range` is then a
+/// sub-range *within that table's* keyspace. The special `table: None` tablet is
+/// the legacy/bootstrap **whole-keyspace** tablet that serves *any* table (it
+/// predates table scoping); routing prefers a table-scoped tablet over it. A fresh
+/// cluster bootstraps a table-scoped tablet per table, so `None` only appears in
+/// snapshots written before scoping existed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Tablet {
     /// The tablet's identity.
     pub id: TabletId,
-    /// The key range this tablet owns.
+    /// The table this tablet is scoped to (`None` = the legacy whole-keyspace
+    /// tablet that serves every table). `#[serde(default)]` keeps pre-scoping
+    /// snapshots loading as `None`.
+    #[serde(default)]
+    pub table: Option<TableName>,
+    /// The key range this tablet owns (within `table`'s keyspace).
     pub range: KeyRange,
     /// The nodes replicating this tablet, sorted and deduplicated.
     pub replicas: Vec<NodeId>,
@@ -110,17 +281,53 @@ pub struct Tablet {
 }
 
 impl Tablet {
-    /// Create a tablet at [`Epoch::INITIAL`] with a normalized replica set.
+    /// Create a **legacy whole-keyspace** tablet (`table: None`) at
+    /// [`Epoch::INITIAL`] with a normalized replica set. Prefer
+    /// [`Tablet::new_for_table`] for a table-scoped tablet.
     #[must_use]
     pub fn new(id: TabletId, range: KeyRange, replicas: Vec<NodeId>) -> Self {
+        Self::with_table(id, None, range, replicas)
+    }
+
+    /// Create a **table-scoped** tablet at [`Epoch::INITIAL`] with a normalized
+    /// replica set.
+    #[must_use]
+    pub fn new_for_table(
+        id: TabletId,
+        table: impl Into<TableName>,
+        range: KeyRange,
+        replicas: Vec<NodeId>,
+    ) -> Self {
+        Self::with_table(id, Some(table.into()), range, replicas)
+    }
+
+    /// Create a tablet with an explicit (optional) table scope.
+    #[must_use]
+    pub fn with_table(
+        id: TabletId,
+        table: Option<TableName>,
+        range: KeyRange,
+        replicas: Vec<NodeId>,
+    ) -> Self {
         let mut replicas = replicas;
         replicas.sort_unstable();
         replicas.dedup();
         Self {
             id,
+            table,
             range,
             replicas,
             epoch: Epoch::INITIAL,
+        }
+    }
+
+    /// Whether this tablet can serve keys of `table`: a table-scoped tablet serves
+    /// only its own table; the legacy `None` tablet serves any table.
+    #[must_use]
+    pub fn serves_table(&self, table: &str) -> bool {
+        match &self.table {
+            Some(t) => t == table,
+            None => true,
         }
     }
 
@@ -197,5 +404,65 @@ mod tests {
             !KeyRange::whole().abuts(&b),
             "unbounded-above range abuts nothing"
         );
+    }
+
+    #[test]
+    fn token_is_deterministic_and_fixed_width() {
+        // Same input -> same token, every call (all nodes must agree).
+        assert_eq!(partition_token(b"alice"), partition_token(b"alice"));
+        assert_eq!(partition_token(b"alice").len(), TOKEN_BYTES);
+        // Distinct partitions almost certainly land on distinct tokens.
+        assert_ne!(partition_token(b"alice"), partition_token(b"bob"));
+    }
+
+    #[test]
+    fn murmur3_empty_input_is_zero() {
+        // Spec anchor: Murmur3 x64_128 of the empty input (seed 0) is (0, 0).
+        assert_eq!(murmur3_x64_128(b"", 0), (0, 0));
+        assert_eq!(partition_token(b""), [0u8; TOKEN_BYTES]);
+    }
+
+    #[test]
+    fn tokens_spread_across_the_token_space() {
+        // Murmur3 avalanches: 64 single-byte keys cover most octants of the
+        // 64-bit token space (a low-entropy prefix hash would clump).
+        let mut octants = std::collections::BTreeSet::new();
+        for i in 0..64u8 {
+            let token = u64::from_be_bytes(partition_token(&[i]));
+            octants.insert(token >> 61); // top 3 bits = one of 8 octants.
+        }
+        assert!(octants.len() >= 6, "tokens should cover most octants");
+    }
+
+    #[test]
+    fn table_scoped_tablet_serves_only_its_table() {
+        let t = Tablet::new_for_table(TabletId(1), "users", table_key_block("users"), vec![1]);
+        assert_eq!(t.table.as_deref(), Some("users"));
+        assert!(t.serves_table("users"));
+        assert!(!t.serves_table("orders"));
+        // The legacy whole-keyspace tablet serves any table.
+        let legacy = Tablet::new(TabletId(2), KeyRange::whole(), vec![1]);
+        assert_eq!(legacy.table, None);
+        assert!(legacy.serves_table("users") && legacy.serves_table("orders"));
+    }
+
+    #[test]
+    fn table_block_contains_that_tables_keys_only() {
+        let users = table_key_block("users");
+        // A `users` data key is `escape("users") || within`.
+        let mut k = escape(b"users");
+        k.extend_from_slice(b"alice");
+        assert!(users.contains(&k));
+        // A different table's key (escape is prefix-free) is outside the block.
+        let mut other = escape(b"user"); // a prefix-like neighbour
+        other.extend_from_slice(b"x");
+        assert!(!users.contains(&other));
+        let mut orders = escape(b"orders");
+        orders.extend_from_slice(b"1");
+        assert!(!users.contains(&orders));
+        // Two distinct tables' blocks never overlap.
+        let orders_block = table_key_block("orders");
+        assert!(!users.contains(&orders_block.start));
+        assert!(!orders_block.contains(&users.start));
     }
 }

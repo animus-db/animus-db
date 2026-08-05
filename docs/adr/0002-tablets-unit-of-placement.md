@@ -1,7 +1,16 @@
 # ADR 0002 — Tablets as the unit of placement and migration
 
-- **Status:** Accepted
+- **Status:** Accepted (partition function **amended by [ADR 0022](0022-hash-ring-partitioning.md) + [ADR 0023](0023-table-scoped-tablets.md)**)
 - **Date:** 2026-08-01
+
+> **Amendment (ADR 0022 + 0023):** the tablet/epoch/split-merge model below is
+> retained, but tablets now partition a **hashed token space**, scoped **per
+> table**, not the raw keyspace. Every key is `escape(table) ||
+> partition_token(pk) || escape(pk) || rk`, and each tablet is scoped to one table
+> (ADR 0023). The "consistent hashing is awkward for range scans" trade-off
+> recorded here is resolved by hashing the *partition key only*, so range scans
+> still hold *within a partition* (just not across partitions). See ADR 0022
+> (the Murmur3 token) and ADR 0023 (per-table scoping).
 
 ## Context
 

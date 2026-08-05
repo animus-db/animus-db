@@ -32,6 +32,7 @@ fn run_single_node() -> (RaftCore, Vec<WalRecord>) {
 
     core.propose(MetaCommand::CreateTablet {
         tablet: TabletId(1),
+        table: None,
         range: KeyRange::whole(),
         replicas: vec![0],
     });
@@ -125,6 +126,7 @@ fn a_command_is_visible_only_after_it_is_durable() {
     // is agreed), but it is NOT yet fsynced...
     core.propose(MetaCommand::CreateTablet {
         tablet: TabletId(1),
+        table: None,
         range: KeyRange::whole(),
         replicas: vec![0],
     });

@@ -52,6 +52,7 @@ fn split_then_merge_round_trips_through_raft() {
 
     nodes[l].propose(MetaCommand::CreateTablet {
         tablet: TabletId(1),
+        table: None,
         range: KeyRange::whole(),
         replicas: NODES.to_vec(),
     });
@@ -115,11 +116,13 @@ fn invalid_split_and_merge_are_rejected_deterministically() {
     let mut meta = Metadata::default();
     meta.apply(&MetaCommand::CreateTablet {
         tablet: TabletId(1),
+        table: None,
         range: KeyRange::new(b"a".to_vec(), Some(b"c".to_vec())),
         replicas: vec![0, 1],
     });
     meta.apply(&MetaCommand::CreateTablet {
         tablet: TabletId(9),
+        table: None,
         range: KeyRange::new(b"x".to_vec(), Some(b"z".to_vec())),
         replicas: vec![0, 1],
     });

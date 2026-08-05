@@ -1233,13 +1233,34 @@ impl ClientCtx {
     /// The id of the tablet whose key range covers `key`, from this node's cached
     /// `Metadata` tablet map (the control plane's placement authority). `None` if no
     /// tablet covers it yet (the cluster is still bootstrapping its first tablet).
+    ///
+    /// **Table-scoped routing (ADR 0023).** Every table owns its own tablet(s):
+    /// a key of table `T` is encoded `escape(T) || …` and routes to the
+    /// **table-scoped tablet** (`table: Some(T)`) whose range contains it. There is
+    /// no whole-keyspace fallback for table data — a table that has not yet had its
+    /// tablet provisioned returns `None` (the caller waits), so a write is never
+    /// silently absorbed by a catch-all tablet. A legacy `table: None` tablet may
+    /// still exist in a snapshot written before scoping; it is the last-resort owner
+    /// only for a **raw, non-table-prefixed** key (e.g. the plain test client),
+    /// never for a table whose own tablet exists. Iteration is over a `BTreeMap`, so
+    /// the choice is deterministic on every node.
     fn tablet_for(&self, key: &[u8]) -> Option<TabletId> {
-        self.raft
-            .metadata()
-            .tablets
-            .iter()
-            .find(|(_, t)| t.range.contains(key))
-            .map(|(id, _)| *id)
+        let meta = self.raft.metadata();
+        let mut legacy: Option<TabletId> = None;
+        for (id, t) in &meta.tablets {
+            if !t.range.contains(key) {
+                continue;
+            }
+            if t.table.is_some() {
+                // A table-scoped tablet is the most specific (and only) owner of its
+                // table's keys — return it.
+                return Some(*id);
+            }
+            // A legacy whole-keyspace tablet is the last resort for a raw key only;
+            // remember it but keep looking for a scoped owner.
+            legacy.get_or_insert(*id);
+        }
+        legacy
     }
 
     /// Resolve how to reach the CP group leader for an op on `key` (shared by every
@@ -1708,6 +1729,12 @@ async fn bootstrap(raft: RaftNode<ProdEnv>, raftkv_ids: Vec<NodeId>) {
                 }
                 raft.propose(MetaCommand::CreateTablet {
                     tablet: TABLET,
+                    // The bootstrap tablet is the legacy whole-keyspace fallback
+                    // (`table: None`): it serves any table whose key block has not
+                    // been carved into its own table-scoped tablet (ADR 0023). A
+                    // `CreateTable` provisions a table-scoped tablet by splitting
+                    // this group at the table's block boundary.
+                    table: None,
                     range: KeyRange::whole(),
                     replicas: replicas.clone(),
                 });

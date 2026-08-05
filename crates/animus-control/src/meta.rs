@@ -92,8 +92,14 @@ pub enum MetaCommand {
         status: NodeStatus,
     },
     /// Create a tablet (starting at [`Epoch::INITIAL`]). No-op if it exists.
+    /// `table` scopes the tablet to a single table (ADR 0023): every key it owns
+    /// is data of that table. `None` is the legacy whole-keyspace tablet that
+    /// serves every table. `#[serde(default)]` keeps commands/snapshots written
+    /// before scoping loading as `None`.
     CreateTablet {
         tablet: TabletId,
+        #[serde(default)]
+        table: Option<TableName>,
         range: KeyRange,
         replicas: Vec<NodeId>,
     },
@@ -258,6 +264,7 @@ impl Metadata {
             }
             MetaCommand::CreateTablet {
                 tablet,
+                table,
                 range,
                 replicas,
             } => {
@@ -266,7 +273,12 @@ impl Metadata {
                 } else {
                     self.tablets.insert(
                         *tablet,
-                        Tablet::new(*tablet, range.clone(), replicas.clone()),
+                        Tablet::with_table(
+                            *tablet,
+                            table.clone(),
+                            range.clone(),
+                            replicas.clone(),
+                        ),
                     );
                     ApplyOutcome::Applied
                 }
@@ -301,7 +313,11 @@ impl Metadata {
                 let Some((left, right)) = source.range.split_at(split_key) else {
                     return ApplyOutcome::Rejected("split key not strictly inside range");
                 };
-                let new_tablet = Tablet::new(*new_id, right, source.replicas.clone());
+                // The split child inherits the parent's table scope (ADR 0023): a
+                // split never crosses a table boundary, so both halves stay scoped
+                // to the same table.
+                let new_tablet =
+                    Tablet::with_table(*new_id, source.table.clone(), right, source.replicas.clone());
                 let source = self.tablets.get_mut(tablet).expect("tablet present");
                 source.range = left;
                 source.epoch = source.epoch.next();
@@ -461,6 +477,27 @@ impl Metadata {
     #[must_use]
     pub fn table_indexes(&self, table: &str) -> &[IndexDef] {
         self.schemas.get(table).map_or(&[], |s| &s.indexes)
+    }
+
+    /// The tablets scoped to `table` (ADR 0023), in ascending tablet-id order.
+    /// Empty if no table-scoped tablet exists for it yet (a freshly created table
+    /// whose tablet has not committed, or a legacy cluster whose only tablet is the
+    /// whole-keyspace `None` one). The legacy whole-keyspace tablet is **not**
+    /// returned here — it is the routing fallback, not a tablet *of* the table.
+    pub fn tablets_for_table<'a>(
+        &'a self,
+        table: &'a str,
+    ) -> impl Iterator<Item = (&'a TabletId, &'a Tablet)> {
+        self.tablets
+            .iter()
+            .filter(move |(_, t)| t.table.as_deref() == Some(table))
+    }
+
+    /// Whether at least one tablet is scoped to `table` (ADR 0023). When false, a
+    /// key of `table` routes to the legacy whole-keyspace tablet if present.
+    #[must_use]
+    pub fn has_table_tablet(&self, table: &str) -> bool {
+        self.tablets_for_table(table).next().is_some()
     }
 }
 

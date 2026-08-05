@@ -84,6 +84,7 @@ fn replicates_metadata_in_total_order() {
     assert!(matches!(
         nodes[leader].propose(MetaCommand::CreateTablet {
             tablet: TabletId(1),
+            table: None,
             range: KeyRange::whole(),
             replicas: NODES.to_vec(),
         }),
@@ -189,6 +190,7 @@ fn cas_epoch_transactions_are_enforced() {
 
     nodes[leader].propose(MetaCommand::CreateTablet {
         tablet: TabletId(1),
+        table: None,
         range: KeyRange::whole(),
         replicas: vec![0, 1, 2],
     });
