@@ -284,7 +284,11 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
       key_prefix?, value_bytes?}` writes synthetic keys (`key_prefix` + zero-padded
       index) to the CP plane via the normal durable `cp_write`, with bounded
       concurrency (`SEED_CONCURRENCY`) to amortize WAL group-commit; capped at
-      `SEED_MAX_PER_REQUEST` per call. The dashboard's **Bulk seed** card chunks a
+      `SEED_MAX_PER_REQUEST` per call. Each key is **retried** (`SEED_WRITE_ATTEMPTS`)
+      so writes racing a tablet **split** — routed to the parent and truncated as
+      the upper range moves to the new child — re-route to the elected child and
+      land (idempotent per-key LWW), instead of surfacing "CP write did not commit
+      in time". The dashboard's **Bulk seed** card chunks a
       larger total into requests, showing progress + refreshing the Tablets view so
       splits appear live. Combined with the binary's **`--cluster N --auto-split K`**
       flag (a CP-hosting node splits a tablet it leads once it exceeds K keys, Phase

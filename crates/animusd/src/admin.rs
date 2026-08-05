@@ -42,6 +42,8 @@
 //! - `POST /admin/data/drop-table`     — drop a table's schema `{table}` (ADR 0021)
 //! - `POST /admin/data/seed`           — bulk-write synthetic keys `{count, …}` (ADR 0021)
 
+use std::time::Duration;
+
 use animus_env::NodeId;
 use animus_storage::WalRecordView;
 use animus_tablet::TabletId;
@@ -684,6 +686,14 @@ const SEED_MAX_VALUE_BYTES: usize = 1 << 20;
 /// In-flight `cp_write`s per seed request — enough to amortize WAL group-commit
 /// without overwhelming the leader.
 const SEED_CONCURRENCY: u64 = 64;
+/// Attempts per seeded key, to absorb transient failures while a tablet is
+/// **splitting** (writes racing the split point are truncated/tombstoned and
+/// re-route to the new child on retry). Each attempt is bounded by the data path's
+/// own `CLIENT_TIMEOUT`.
+const SEED_WRITE_ATTEMPTS: usize = 4;
+/// Backoff between seed write attempts — long enough for a freshly-split child
+/// group to elect a leader / the tablet map to settle.
+const SEED_RETRY_BACKOFF: Duration = Duration::from_millis(150);
 
 #[derive(Deserialize)]
 struct SeedReq {
@@ -729,7 +739,26 @@ async fn action_data_seed(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
             let key = format!("{prefix}{:012}", req.start + i + j).into_bytes();
             let val = value.clone();
             let c = ctx.clone();
-            set.spawn(async move { c.cp_write(key, val).await });
+            // Retry transient write failures. A write racing a tablet **split** is
+            // routed to the parent and truncated/tombstoned (the upper range moved
+            // to the new child), so `cp_write` times out / reports "leader moved";
+            // a retry re-routes to the now-elected child and lands. Idempotent
+            // (same key+value, per-key LWW), so retrying is safe.
+            set.spawn(async move {
+                let mut last = Ok(());
+                for attempt in 0..SEED_WRITE_ATTEMPTS {
+                    match c.cp_write(key.clone(), val.clone()).await {
+                        Ok(()) => return Ok(()),
+                        Err(e) => {
+                            last = Err(e);
+                            if attempt + 1 < SEED_WRITE_ATTEMPTS {
+                                tokio::time::sleep(SEED_RETRY_BACKOFF).await;
+                            }
+                        }
+                    }
+                }
+                last
+            });
         }
         while let Some(res) = set.join_next().await {
             match res {
