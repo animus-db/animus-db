@@ -50,8 +50,12 @@ the production implementation; the deterministic implementation lives in
   binding a socket is `async`/fallible but the trait method is sync/infallible, so
   the listeners are pre-bound. A sibling shares the parent's **peer book** (`Arc`,
   so a later `set_peers` reaches it) and the pool, but gets its own inbox, id, and
-  data dir (`<dir>/sib-<id>`); the pool size **bounds** co-resident groups
-  (exhaustion panics). The caller publishes the sibling's `local_addr()` for
+  data dir (`<dir>/sib-<id>`); the pool size **bounds** co-resident groups —
+  exhausting it **panics** the (background) split-hook task, so the over-cap
+  tablet's group is never minted and that tablet ends up **leaderless** (writes to
+  its range then hang). Size the pool generously for the workload (`animusd` uses
+  `CP_SIBLING_POOL = 64`); a truly unbounded fix needs an `async`/fallible
+  `sibling` that binds on demand. The caller publishes the sibling's `local_addr()` for
   address distribution — which (carrying group-replica addrs in replicated
   `Metadata` + a per-node `set_peers` sync loop) is the remaining 3b plumbing.
 - `Disk` is append + explicit `sync`; bytes are not durable until `sync`

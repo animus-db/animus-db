@@ -109,7 +109,14 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   All hosting state is bundled in a **`CpHostCtx`** so every group (bootstrap, split
   child, re-hosted, joined) carries a split hook, enabling **deep splits** (D3: a
   split tablet can be split again); member ids derive **flatly** from the base id
-  (`cp_member_id`) at any depth.
+  (`cp_member_id`) at any depth. **Each node can host at most `CP_SIBLING_POOL + 1`
+  co-resident tablets** (the bootstrap group + one pre-bound listener-pool slot per
+  split child); the pool is **64**, sized for bulk-seed→auto-split sharding tests.
+  Exceeding it panics the split-hook task (`Coresident::sibling`), leaving the
+  over-cap tablet **leaderless** (writes to its range hang) — so keep the pool ahead
+  of the tablet count. (Found via bulk-seed: a pool of 4 left a 6th tablet leaderless;
+  the `ProdEnv` "send to unknown peer" log of the missing split member is the
+  downstream symptom, now at `debug`.)
 - **The cluster's members are the CP `raftkv` nodes, not the control ids.** The
   control ids `0..N` are only the Raft *consensus group* for metadata; `bootstrap`
   (leader-only, idempotent) registers the **raftkv ids** (`300+i`) as `Active`

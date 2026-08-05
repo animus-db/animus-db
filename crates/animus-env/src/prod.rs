@@ -252,7 +252,16 @@ impl Network for ProdEnv {
             match peers.get(&to) {
                 Some(&addr) => addr,
                 None => {
-                    tracing::warn!(to, "send to unknown peer");
+                    // Fire-and-forget: an unknown peer is just another way the
+                    // message is dropped (the caller gets no delivery result). It
+                    // is an *expected transient* during membership changes — e.g. a
+                    // tablet leader replicating to a freshly-minted CP split sibling
+                    // before that member's address has propagated (control plane →
+                    // per-node peer-sync); Raft retries on the next heartbeat once
+                    // the address lands. A *genuinely* missing peer surfaces as the
+                    // higher-level symptom (no leader / no progress) with its own
+                    // logging, so this stays at debug to avoid alarming noise.
+                    tracing::debug!(to, "send to peer with no known address (dropped)");
                     return;
                 }
             }
@@ -286,13 +295,11 @@ impl Coresident for ProdEnv {
     /// **Panics** if the pool is exhausted — the pool size bounds how many
     /// co-resident groups a node hosts; size it accordingly at `bind_with_pool`.
     fn sibling(&self, id: NodeId) -> Self {
-        let slot = self
-            .inner
-            .pool
-            .lock()
-            .expect("pool poisoned")
-            .pop()
-            .expect("Coresident::sibling: ProdEnv listener pool exhausted");
+        let slot = self.inner.pool.lock().expect("pool poisoned").pop().expect(
+            "Coresident::sibling: ProdEnv listener pool exhausted — too many \
+                 co-resident groups for the pre-bound pool; increase the pool size \
+                 (animusd's CP_SIBLING_POOL / bind_with_pool's pool_listens)",
+        );
         Self {
             inner: Arc::new(Inner {
                 node_id: id,

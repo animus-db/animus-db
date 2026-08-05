@@ -322,9 +322,15 @@ const MAX_REPLICATION_FACTOR: usize = 3;
 const LSM_PREFIX: &str = "db-";
 
 /// Size of each `raftkv` env's pre-bound **sibling listener pool** (Phase 2.2): the
-/// number of co-resident CP groups a node can host beyond its bootstrap group, i.e.
-/// the split depth a node can take part in before the pool is exhausted.
-const CP_SIBLING_POOL: usize = 4;
+/// number of co-resident CP groups a node can host **beyond** its bootstrap group —
+/// i.e. the max split children per node. A node hosting tablets `1..=T` needs `T-1`
+/// slots, so this caps a node at `CP_SIBLING_POOL + 1` tablets; exceeding it panics
+/// the split-hook task (`Coresident::sibling`), leaving the over-cap tablet
+/// leaderless. Sized generously so realistic sharding tests (bulk-seed → auto-split)
+/// don't hit it; each slot is a cheap pre-bound loopback listener + accept loop.
+/// (A truly unbounded fix needs on-demand sibling binding — an `async`/fallible
+/// `Coresident::sibling` — which is a larger ADR-0017 change; deferred.)
+const CP_SIBLING_POOL: usize = 64;
 
 /// Stride for deriving a split-created tablet's CP **member ids** from the parent
 /// group's, deterministically + identically on every replica (Phase 2.2): a new
