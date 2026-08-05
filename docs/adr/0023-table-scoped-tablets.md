@@ -43,11 +43,16 @@ name in every key would re-state what the engine already implies.
   **token sub-range** `[tok_lo, tok_hi)` of one table's ring; the table is the
   `table` field, not key bytes. Two tables' tablets may share a token range — they
   are distinguished by `table`, never by a global range scan.
-- **Routing is `tablet_for(table, key)`**: the table is passed explicitly (the
-  wire protocol already carries a `table` field; the Dynamo/CQL edges always know
-  it, the plain client uses `__system`), then the key's leading token selects the
-  tablet within `tablets_for_table(table)`. Routing never compares ranges across
-  tables. A split inherits the parent's table scope (it never crosses a table
+- **Routing is `tablet_for(table, key)`**: the table is passed explicitly, then
+  the key's leading token selects the tablet within `tablets_for_table(table)`.
+  Routing never compares ranges across tables. **The table is enforced everywhere,
+  not defaulted**: the data-plane primitives (`cp_read`/`cp_write`/`cp_delete`/
+  `cp_scan`, `cp_route`, `tablet_for`) take a non-optional `&str`, and the entry
+  types make it a **required field** — `ClientRequest::{Put,Get,Delete,Scan}` and
+  the admin bulk-seed request all carry a required `table` (a table-less frame fails
+  to decode), the CLI takes it as a positional arg, and the Dynamo/CQL edges read it
+  from their own protocols. No path invents or defaults a table (there is no
+  `__system` fallback) — so an unscoped key is unconstructable, not merely rejected. A split inherits the parent's table scope (it never crosses a table
   boundary). The replicated map stays in stable base node ids (ADR 0017).
 - **One tablet per table at `CreateTable`, split on demand.** A table is
   provisioned with a single tablet covering its whole block and splits at the

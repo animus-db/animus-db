@@ -67,7 +67,7 @@ async fn cluster_serves_put_get_and_status_over_tcp() {
         ClientRequest::Put {
             key: b"hello".to_vec(),
             value: b"world".to_vec(),
-            table: Some("kv".to_string()),
+            table: "kv".to_string(),
         },
     )
     .await;
@@ -78,7 +78,7 @@ async fn cluster_serves_put_get_and_status_over_tcp() {
         addr1,
         ClientRequest::Get {
             key: b"hello".to_vec(),
-            table: Some("kv".to_string()),
+            table: "kv".to_string(),
         },
     )
     .await;
@@ -89,7 +89,7 @@ async fn cluster_serves_put_get_and_status_over_tcp() {
         addr1,
         ClientRequest::Get {
             key: b"nope".to_vec(),
-            table: Some("kv".to_string()),
+            table: "kv".to_string(),
         },
     )
     .await;
@@ -103,7 +103,7 @@ async fn cluster_serves_put_get_and_status_over_tcp() {
         ClientRequest::Put {
             key: b"hello".to_vec(),
             value: b"again".to_vec(),
-            table: Some("kv".to_string()),
+            table: "kv".to_string(),
         },
     )
     .await;
@@ -116,7 +116,7 @@ async fn cluster_serves_put_get_and_status_over_tcp() {
         addr2,
         ClientRequest::Get {
             key: b"hello".to_vec(),
-            table: Some("kv".to_string()),
+            table: "kv".to_string(),
         },
     )
     .await;

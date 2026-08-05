@@ -96,7 +96,7 @@ async fn per_process_nodes_form_a_cluster_from_shared_config() {
         ClientRequest::Put {
             key: b"k".to_vec(),
             value: b"v1".to_vec(),
-            table: Some("kv".to_string()),
+            table: "kv".to_string(),
         },
     )
     .await;
@@ -108,7 +108,7 @@ async fn per_process_nodes_form_a_cluster_from_shared_config() {
             client1,
             ClientRequest::Get {
                 key: b"k".to_vec(),
-                table: Some("kv".to_string())
+                table: "kv".to_string()
             }
         )
         .await,
@@ -119,7 +119,7 @@ async fn per_process_nodes_form_a_cluster_from_shared_config() {
         ClientRequest::Put {
             key: b"k".to_vec(),
             value: b"v2".to_vec(),
-            table: Some("kv".to_string()),
+            table: "kv".to_string(),
         },
     )
     .await;
@@ -132,7 +132,7 @@ async fn per_process_nodes_form_a_cluster_from_shared_config() {
             client0,
             ClientRequest::Get {
                 key: b"k".to_vec(),
-                table: Some("kv".to_string())
+                table: "kv".to_string()
             }
         )
         .await,

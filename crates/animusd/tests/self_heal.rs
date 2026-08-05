@@ -68,7 +68,7 @@ async fn assembled_node_handles_concurrent_client_load_without_deadlock() {
                     ClientRequest::Put {
                         key: key.clone(),
                         value: value.clone(),
-                        table: Some("kv".to_string()),
+                        table: "kv".to_string(),
                     },
                 )
                 .await;
@@ -77,7 +77,7 @@ async fn assembled_node_handles_concurrent_client_load_without_deadlock() {
                     addr,
                     ClientRequest::Get {
                         key,
-                        table: Some("kv".to_string()),
+                        table: "kv".to_string(),
                     },
                 )
                 .await;

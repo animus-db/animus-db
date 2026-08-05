@@ -117,7 +117,7 @@ async fn put(clients: &[SocketAddr], key: &[u8], value: &[u8]) {
                     ClientRequest::Put {
                         key: key.to_vec(),
                         value: value.to_vec(),
-                        table: Some("kv".to_string()),
+                        table: "kv".to_string(),
                     },
                 )
                 .await
@@ -141,7 +141,7 @@ async fn await_value(clients: &[SocketAddr], key: &[u8], want: &[u8], secs: u64)
                     c,
                     ClientRequest::Get {
                         key: key.to_vec(),
-                        table: Some("kv".to_string()),
+                        table: "kv".to_string(),
                     },
                 )
                 .await

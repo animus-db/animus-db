@@ -280,7 +280,7 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
       that table's key attributes** — partition key + sort key, typed from the catalog
       (S/N/B) — into both views. `tests/admin_endpoint.rs::admin_table_management_create_and_drop`
       (also asserts a numeric sort key's type reaches the catalog).
-    - **Bulk seed for sharding tests.** `POST /admin/data/seed {count, start?,
+    - **Bulk seed for sharding tests.** `POST /admin/data/seed {table, count, start?,
       key_prefix?, value_bytes?}` writes synthetic keys (`key_prefix` + zero-padded
       index) to the CP plane via the normal durable `cp_write`, with bounded
       concurrency (`SEED_CONCURRENCY`) to amortize WAL group-commit; capped at

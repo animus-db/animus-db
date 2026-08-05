@@ -710,14 +710,15 @@ struct SeedReq {
     /// Synthetic value size in bytes (default 64).
     #[serde(default)]
     value_bytes: Option<usize>,
-    /// The table to seed into (ADR 0023: every key names a table). Default `seed`;
-    /// its tablet is provisioned up front if it does not exist yet.
-    #[serde(default)]
-    table: Option<String>,
+    /// The table to seed into. **Required** (ADR 0023: every key names a table — no
+    /// default, so a seed request without `table` fails to decode). Its tablet is
+    /// provisioned up front if it does not exist yet.
+    table: String,
 }
 
-/// `POST /admin/data/seed {count, start?, key_prefix?, value_bytes?}` — bulk-write
-/// synthetic keys to the CP plane to drive sharding tests (ADR 0021). Keys are
+/// `POST /admin/data/seed {table, count, start?, key_prefix?, value_bytes?}` —
+/// bulk-write synthetic keys to the CP plane to drive sharding tests (ADR 0021).
+/// `table` is **required** (ADR 0023: every key names a table). Keys are
 /// `key_prefix + zero-padded (start..start+count)` with a filler value; they go
 /// through the normal durable `cp_write` path (routed to the leader), written with
 /// bounded concurrency to amortize WAL group-commit. With `--auto-split` enabled,
@@ -731,8 +732,10 @@ async fn action_data_seed(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
     let count = req.count.min(SEED_MAX_PER_REQUEST);
     let prefix = req.key_prefix.unwrap_or_else(|| "seed:".to_string());
     let value_bytes = req.value_bytes.unwrap_or(64).min(SEED_MAX_VALUE_BYTES);
-    let table = req.table.unwrap_or_else(|| "seed".to_string());
-    // Every key names a table (ADR 0023); make sure the seed table has a tablet.
+    // Every key names a table (ADR 0023): `table` is a required field on the request
+    // (no default, decode fails without it), so we never invent a table the caller
+    // didn't ask for. Provision its tablet up front if it does not exist yet.
+    let table = req.table;
     if let Err(e) = ctx.provision_tablet(&table).await {
         return (500, serde_json::json!({ "error": e }));
     }

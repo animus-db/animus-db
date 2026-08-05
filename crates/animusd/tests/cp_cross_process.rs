@@ -139,7 +139,7 @@ async fn cp_op_on_a_non_leader_node_is_forwarded_to_the_leader() {
                 ClientRequest::Put {
                     key: b"k".to_vec(),
                     value: b"v-cross".to_vec(),
-                    table: Some(CP_TABLE.into()),
+                    table: CP_TABLE.into(),
                 },
             )
             .await
@@ -160,7 +160,7 @@ async fn cp_op_on_a_non_leader_node_is_forwarded_to_the_leader() {
             client(i),
             ClientRequest::Get {
                 key: b"k".to_vec(),
-                table: Some(CP_TABLE.into()),
+                table: CP_TABLE.into(),
             },
         )
         .await;

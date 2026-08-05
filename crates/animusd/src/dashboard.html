@@ -201,6 +201,7 @@ SELECT * FROM t WHERE id = 1;"></textarea>
       <h2>Bulk seed (sharding test)</h2>
       <div class="muted" style="margin-bottom:8px">Writes synthetic keys to the CP plane to grow a tablet. Run the cluster with <code>--auto-split K</code> to watch tablets split in the Tablets tab as the count crosses K.</div>
       <div class="row">
+        <label>table</label><input type="text" id="seed-table" value="seed" style="width:7em">
         <label>key prefix</label><input type="text" id="seed-prefix" value="seed:" style="width:7em">
         <label>value bytes</label><input type="text" id="seed-vbytes" value="64" style="width:5em">
         <label>total</label><input type="text" id="seed-total" value="10000" style="width:7em">
@@ -798,10 +799,12 @@ function renderCqlResult(r) {
 let seeding = false;
 async function seedRun() {
   if (seeding) return;
+  const table = $("seed-table").value.trim();
   const prefix = $("seed-prefix").value;
   const vbytes = Math.max(0, parseInt($("seed-vbytes").value, 10) || 0);
   const total = Math.max(0, parseInt($("seed-total").value, 10) || 0);
   const chunk = Math.max(1, parseInt($("seed-chunk").value, 10) || 1000);
+  if (!table) { $("seed-status").innerHTML = `<div class="empty">set a table (every key names a table)</div>`; return; }
   if (!total) { $("seed-status").innerHTML = `<div class="empty">set a total</div>`; return; }
   seeding = true;
   $("seed-go").disabled = true;
@@ -812,7 +815,7 @@ async function seedRun() {
     while (done < total && seeding) {
       const count = Math.min(chunk, total - done);
       const { status, body } = await postJSON(SEED, "/admin/data/seed",
-        { count, start: done, key_prefix: prefix, value_bytes: vbytes });
+        { table, count, start: done, key_prefix: prefix, value_bytes: vbytes });
       if (status >= 300) {
         $("seed-status").innerHTML = `<div class="err-line">${esc((body && body.error) || ("HTTP " + status))}</div>`;
         break;

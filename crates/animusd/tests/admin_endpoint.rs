@@ -142,7 +142,7 @@ async fn admin_interface_surfaces_state_and_actions() {
             &ClientRequest::Put {
                 key: b"admin-key".to_vec(),
                 value: b"admin-val".to_vec(),
-                table: Some("kv".to_string()),
+                table: "kv".to_string(),
             },
         )
         .await
@@ -442,7 +442,7 @@ async fn admin_seed_writes_synthetic_keys() {
             a,
             "POST",
             "/admin/data/seed",
-            Some(r#"{"count":60,"key_prefix":"seed:","value_bytes":8}"#),
+            Some(r#"{"table":"seedt","count":60,"key_prefix":"seed:","value_bytes":8}"#),
         )
         .await;
         assert_eq!(s, 200, "seed returns 200: {body}");

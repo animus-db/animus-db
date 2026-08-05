@@ -316,9 +316,6 @@ const TABLET: TabletId = TabletId(1);
 /// longer than a steady-state op. No happy-path cost: `cp_route` returns as soon as
 /// a leader is reachable; the cap only bounds the wait when the group is forming.
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
-/// Error returned for a data op that names no table — every key must be scoped to a
-/// table (ADR 0023): there is no unscoped/whole-keyspace tablet.
-const NO_TABLE: &str = "every key must name a table (no unscoped keyspace)";
 /// The bootstrap CP group's replication factor (ADR 0017 #3a): the group spans the
 /// first `min(N, MAX_REPLICATION_FACTOR)` nodes' `raftkv` ids. Dynamic CP placement
 /// over more nodes is later v1 work.
@@ -426,38 +423,27 @@ pub enum StorageBackend {
 pub enum ClientRequest {
     /// Read the node's cached cluster metadata.
     Status,
-    /// Store `value` at `key`. `table` (optional) selects the replication plane:
-    /// a table whose replicated schema is `ReplicationMode::Cp` (ADR 0017 #3a)
-    /// routes to the leaderful per-tablet Raft group; otherwise (or `None`) the
-    /// leaderless AP quorum write. `#[serde(default)]` keeps older clients
-    /// (no `table`) byte-compatible.
+    /// Store `value` at `key` of `table`. **Every key names a table** (ADR 0023):
+    /// `table` is a **required** field — there is no unscoped keyspace, so a
+    /// table-less frame fails to decode (the type cannot express one). The write
+    /// routes to `table`'s tablet group leader (CP, linearizable; forwarded
+    /// cross-process if this node isn't it).
     Put {
         key: Vec<u8>,
         value: Vec<u8>,
-        #[serde(default)]
-        table: Option<String>,
+        table: String,
     },
-    /// Read the latest value at `key`. `table` selects the plane as for
-    /// [`Put`](ClientRequest::Put): a `Cp` table reads linearizably from the Raft
-    /// group leader (ReadIndex), else an AP quorum read.
-    Get {
-        key: Vec<u8>,
-        #[serde(default)]
-        table: Option<String>,
-    },
-    /// Delete `key` from the **CP** plane (a Raft-committed tombstone). The CP
-    /// counterpart of [`Put`](ClientRequest::Put) for an explicit delete — used
-    /// by the CQL edge's whole-partition delete. Routed to the CP group leader
-    /// (forwarded if this node isn't it, like `Put`/`Get`).
-    Delete {
-        key: Vec<u8>,
-        #[serde(default)]
-        table: Option<String>,
-    },
-    /// A **linearizable range scan** over the half-open CP range `[start, end)`,
-    /// up to `limit` keys, served from the CP group leader (ReadIndex). The CP
-    /// read primitive behind the DynamoDB `Query`/`Scan` and CQL `SELECT` edges;
-    /// also the cross-process forwarding payload for a scan (ADR 0017 #3b).
+    /// Read the latest value at `key` of `table` (linearizable CP ReadIndex on the
+    /// group leader). `table` is **required** (ADR 0023).
+    Get { key: Vec<u8>, table: String },
+    /// Delete `key` of `table` from the **CP** plane (a Raft-committed tombstone) —
+    /// the CQL edge's whole-partition delete. `table` is **required** (ADR 0023).
+    Delete { key: Vec<u8>, table: String },
+    /// A **linearizable range scan** of `table` over `[start, end)`, up to `limit`
+    /// keys, served from the group leader (ReadIndex). The CP read primitive behind
+    /// the DynamoDB `Query`/`Scan` and CQL `SELECT` edges; also the cross-process
+    /// forwarding payload for a scan (ADR 0017 #3b). `table` is **required** (ADR
+    /// 0023) — scans are per-table fan-outs.
     Scan {
         start: Vec<u8>,
         /// Exclusive upper bound, or `None` for **unbounded above** — a whole-table
@@ -465,11 +451,7 @@ pub enum ClientRequest {
         end: Option<Vec<u8>>,
         #[serde(default)]
         limit: Option<usize>,
-        /// The table whose ring to scan (ADR 0023): scans are per-table fan-outs, so
-        /// the table is required at routing (a `None` here errors). `#[serde(default)]`
-        /// keeps the frame decodable from older peers.
-        #[serde(default)]
-        table: Option<String>,
+        table: String,
     },
     /// A CP op **forwarded** from a node that received it but does not host the CP
     /// group leader, to the leader's node (ADR 0017 #3b cross-process routing). The
@@ -1378,7 +1360,7 @@ impl ClientCtx {
                         addr,
                         ClientRequest::Get {
                             key,
-                            table: Some(table.to_owned()),
+                            table: table.to_owned(),
                         },
                     )
                     .await
@@ -1410,7 +1392,7 @@ impl ClientCtx {
                     ClientRequest::Put {
                         key,
                         value,
-                        table: Some(table.to_owned()),
+                        table: table.to_owned(),
                     },
                 )
                 .await,
@@ -1433,7 +1415,7 @@ impl ClientCtx {
                     addr,
                     ClientRequest::Delete {
                         key,
-                        table: Some(table.to_owned()),
+                        table: table.to_owned(),
                     },
                 )
                 .await,
@@ -1527,7 +1509,7 @@ impl ClientCtx {
                             start,
                             end,
                             limit,
-                            table: Some(table.to_owned()),
+                            table: table.to_owned(),
                         },
                     )
                     .await
@@ -1748,9 +1730,6 @@ impl ClientCtx {
     async fn cp_serve_forwarded(&self, inner: ClientRequest) -> ClientResponse {
         match inner {
             ClientRequest::Put { key, value, table } => {
-                let Some(table) = table else {
-                    return ClientResponse::Error(NO_TABLE.into());
-                };
                 let Some(leader) = self.cp_leader_for(&table, &key) else {
                     return ClientResponse::Error("forwarded CP op: not the leader here".into());
                 };
@@ -1759,19 +1738,11 @@ impl ClientCtx {
                     Err(e) => ClientResponse::Error(e),
                 }
             }
-            ClientRequest::Get { key, table } => {
-                let Some(table) = table else {
-                    return ClientResponse::Error(NO_TABLE.into());
-                };
-                match self.cp_leader_for(&table, &key) {
-                    Some(leader) => ClientResponse::Value(leader.linearizable_get(&key).await),
-                    None => ClientResponse::Error("forwarded CP op: not the leader here".into()),
-                }
-            }
+            ClientRequest::Get { key, table } => match self.cp_leader_for(&table, &key) {
+                Some(leader) => ClientResponse::Value(leader.linearizable_get(&key).await),
+                None => ClientResponse::Error("forwarded CP op: not the leader here".into()),
+            },
             ClientRequest::Delete { key, table } => {
-                let Some(table) = table else {
-                    return ClientResponse::Error(NO_TABLE.into());
-                };
                 let Some(leader) = self.cp_leader_for(&table, &key) else {
                     return ClientResponse::Error("forwarded CP op: not the leader here".into());
                 };
@@ -1786,9 +1757,6 @@ impl ClientCtx {
                 limit,
                 table,
             } => {
-                let Some(table) = table else {
-                    return ClientResponse::Error(NO_TABLE.into());
-                };
                 let Some(leader) = self.cp_leader_for(&table, &start) else {
                     return ClientResponse::Error("forwarded CP op: not the leader here".into());
                 };
@@ -2423,34 +2391,22 @@ async fn handle_client(mut stream: TcpStream, ctx: ClientCtx) -> std::io::Result
         let response = match request {
             ClientRequest::Status => ClientResponse::Status(ctx.raft.metadata()),
             // All data ops route to the leaderful CP per-tablet Raft group (ADR 0017
-            // #3a), scoped to the named table (ADR 0023). Every key must name a table
-            // — there is no unscoped/whole-keyspace tablet — so a `None` table errors.
-            ClientRequest::Put { key, value, table } => match table {
-                Some(table) => ctx.cp_put(&table, key, value).await,
-                None => ClientResponse::Error(NO_TABLE.into()),
-            },
-            ClientRequest::Get { key, table } => match table {
-                Some(table) => ctx.cp_get(&table, key).await,
-                None => ClientResponse::Error(NO_TABLE.into()),
-            },
+            // #3a), scoped to the named table (ADR 0023). `table` is a required field
+            // on the request type, so there is no unscoped data op to reject here.
+            ClientRequest::Put { key, value, table } => ctx.cp_put(&table, key, value).await,
+            ClientRequest::Get { key, table } => ctx.cp_get(&table, key).await,
             ClientRequest::Scan {
                 start,
                 end,
                 limit,
                 table,
-            } => match table {
-                Some(table) => match ctx.cp_scan(&table, start, end, limit).await {
-                    Ok(pairs) => ClientResponse::Pairs(pairs),
-                    Err(e) => ClientResponse::Error(e),
-                },
-                None => ClientResponse::Error(NO_TABLE.into()),
+            } => match ctx.cp_scan(&table, start, end, limit).await {
+                Ok(pairs) => ClientResponse::Pairs(pairs),
+                Err(e) => ClientResponse::Error(e),
             },
-            ClientRequest::Delete { key, table } => match table {
-                Some(table) => match ctx.cp_delete(&table, key).await {
-                    Ok(()) => ClientResponse::PutOk,
-                    Err(e) => ClientResponse::Error(e),
-                },
-                None => ClientResponse::Error(NO_TABLE.into()),
+            ClientRequest::Delete { key, table } => match ctx.cp_delete(&table, key).await {
+                Ok(()) => ClientResponse::PutOk,
+                Err(e) => ClientResponse::Error(e),
             },
             // Admin: split a CP tablet (Phase 2.2 / D2 cross-process).
             ClientRequest::SplitTablet { tablet, split_key } => {
