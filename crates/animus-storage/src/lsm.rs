@@ -143,6 +143,16 @@ const DEFAULT_WAL_SEGMENT_BYTES: u64 = 64 * 1024;
 /// `this`-versions window is unaffected. Sized generously by default so GC is a
 /// no-op under ordinary use; the data plane / tests lower it to reclaim sooner.
 const DEFAULT_TOMBSTONE_GRACE_VERSIONS: Version = 1 << 20;
+/// Max times a read re-snapshots + retries when a **concurrent compaction**
+/// removed an SSTable file mid-read. Reads snapshot the reader set under a brief
+/// lock then fetch blocks lock-free; a compaction swaps the readers and then
+/// `remove`s the superseded files, so a lock-free read of a just-removed file gets
+/// an empty (short) read. Retrying against the fresh post-compaction readers — the
+/// merged tables hold the same data — makes the read consistent instead of a
+/// spurious "short sstable block read". Reads are sub-second and compactions are
+/// paced, so a couple of retries always suffice; the bound only guards against a
+/// genuine, persistent read error (which is then surfaced, not retried forever).
+const READ_COMPACTION_RETRIES: u32 = 32;
 
 /// Tuning knobs for an [`LsmEngine`]. Defaults are sized for tests; production
 /// wiring can raise them.
@@ -629,23 +639,60 @@ impl<E: Env> LsmEngine<E> {
     /// The highest version recorded for `key` anywhere (memtable + SSTables),
     /// tombstones included. Reads SSTable blocks (async) for tables whose key
     /// range contains `key`, then folds in the memtable under a brief lock.
+    /// Decide whether a read that snapshotted compaction generation `generation` should
+    /// retry after a block-read error: a compaction has since run (so it may have
+    /// `remove`d a file the read referenced — see [`READ_COMPACTION_RETRIES`]) and
+    /// retries remain. Bumps `attempt`. If `false`, the error is genuine (no
+    /// compaction raced, or retries exhausted) and the caller propagates it.
+    fn raced_compaction(&self, generation: u64, attempt: &mut u32) -> bool {
+        let raced = self.lock().compactions != generation;
+        if raced && *attempt < READ_COMPACTION_RETRIES {
+            *attempt += 1;
+            true
+        } else {
+            false
+        }
+    }
+
     async fn latest_version_of(&self, key: &[u8]) -> Result<Option<Version>> {
-        // Snapshot the SSTable readers (cheap clones of metadata + index) under
-        // the lock, plus the memtable's own latest, then read blocks lock-free.
-        let (readers, memtable_latest) = {
-            let inner = self.lock();
-            (inner.readers.clone(), inner.memtable_latest_version_of(key))
-        };
-        let mut best = memtable_latest;
-        for reader in readers.iter().rev() {
-            if !self.may_contain_observed(reader.meta(), key) {
-                continue;
+        let mut attempt = 0;
+        loop {
+            // Snapshot the SSTable readers (cheap clones of metadata + index) +
+            // the compaction generation under the lock, plus the memtable's own
+            // latest, then read blocks lock-free.
+            let (readers, generation, memtable_latest) = {
+                let inner = self.lock();
+                (
+                    inner.readers.clone(),
+                    inner.compactions,
+                    inner.memtable_latest_version_of(key),
+                )
+            };
+            let mut best = memtable_latest;
+            let mut read_err = None;
+            for reader in readers.iter().rev() {
+                if !self.may_contain_observed(reader.meta(), key) {
+                    continue;
+                }
+                match reader.latest(&self.env, key).await {
+                    Ok(Some((v, _))) => best = Some(best.map_or(v, |b| b.max(v))),
+                    Ok(None) => {}
+                    Err(e) => {
+                        read_err = Some(e);
+                        break;
+                    }
+                }
             }
-            if let Some((v, _)) = reader.latest(&self.env, key).await? {
-                best = Some(best.map_or(v, |b| b.max(v)));
+            match read_err {
+                None => return Ok(best),
+                Some(e) => {
+                    if self.raced_compaction(generation, &mut attempt) {
+                        continue;
+                    }
+                    return Err(e);
+                }
             }
         }
-        Ok(best)
     }
 
     /// Read `key` as of `version`: the greatest `(version', slot)` with
@@ -654,31 +701,50 @@ impl<E: Env> LsmEngine<E> {
     ///
     /// [`MemoryEngine`]: crate::MemoryEngine
     async fn read_at(&self, key: &[u8], version: Version) -> Result<Option<VersionedValue>> {
-        let (readers, memtable_hit) = {
-            let inner = self.lock();
-            let hit = inner
-                .memtable
-                .get(key)
-                .and_then(|h| h.range(..=version).next_back())
-                .map(|(&v, slot)| (v, slot.clone()));
-            (inner.readers.clone(), hit)
-        };
-        // Track the best (highest-version) hit seen so far. The memtable is the
-        // newest source.
-        let mut best: Option<(Version, Option<Value>)> = memtable_hit;
-        for reader in readers.iter().rev() {
-            // Take the max-version hit across all sources; a key range that can't
-            // contain `key` is skipped cheaply.
-            if !self.may_contain_observed(reader.meta(), key) {
-                continue;
-            }
-            if let Some((v, slot)) = reader.get_at(&self.env, key, version).await? {
-                if best.as_ref().is_none_or(|(bv, _)| v > *bv) {
-                    best = Some((v, slot));
+        let mut attempt = 0;
+        loop {
+            let (readers, generation, memtable_hit) = {
+                let inner = self.lock();
+                let hit = inner
+                    .memtable
+                    .get(key)
+                    .and_then(|h| h.range(..=version).next_back())
+                    .map(|(&v, slot)| (v, slot.clone()));
+                (inner.readers.clone(), inner.compactions, hit)
+            };
+            // Track the best (highest-version) hit seen so far. The memtable is the
+            // newest source.
+            let mut best: Option<(Version, Option<Value>)> = memtable_hit;
+            let mut read_err = None;
+            for reader in readers.iter().rev() {
+                // Take the max-version hit across all sources; a key range that
+                // can't contain `key` is skipped cheaply.
+                if !self.may_contain_observed(reader.meta(), key) {
+                    continue;
+                }
+                match reader.get_at(&self.env, key, version).await {
+                    Ok(Some((v, slot))) => {
+                        if best.as_ref().is_none_or(|(bv, _)| v > *bv) {
+                            best = Some((v, slot));
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        read_err = Some(e);
+                        break;
+                    }
                 }
             }
+            if let Some(e) = read_err {
+                if self.raced_compaction(generation, &mut attempt) {
+                    continue;
+                }
+                return Err(e);
+            }
+            return Ok(
+                best.and_then(|(v, slot)| slot.map(|value| VersionedValue { version: v, value }))
+            );
         }
-        Ok(best.and_then(|(v, slot)| slot.map(|value| VersionedValue { version: v, value })))
     }
 
     /// Scan `[start, end)` as of `version`, merging all sources, ordered by key.
@@ -706,34 +772,63 @@ impl<E: Env> LsmEngine<E> {
         end: Option<&[u8]>,
         version: Version,
     ) -> Result<BTreeMap<Key, (Version, Option<Value>)>> {
-        let readers = {
-            let inner = self.lock();
-            inner.readers.clone()
-        };
-        // Oldest first, so newer overwrites older; the memtable is applied last.
-        let mut merged: BTreeMap<Key, (Version, Option<Value>)> = BTreeMap::new();
-        for reader in &readers {
-            for (k, v, slot) in reader.scan_at(&self.env, start, end, version).await? {
-                merge_winner(&mut merged, k, v, slot);
-            }
-        }
-        // Memtable last (newest).
         let upper = match end {
             Some(e) => Bound::Excluded(e),
             None => Bound::Unbounded,
         };
-        {
-            let inner = self.lock();
-            for (k, history) in inner
-                .memtable
-                .range::<[u8], _>((Bound::Included(start), upper))
-            {
-                if let Some((&v, slot)) = history.range(..=version).next_back() {
-                    merge_winner(&mut merged, k.clone(), v, slot.clone());
+        let mut attempt = 0;
+        loop {
+            // Snapshot the readers, the compaction generation, **and** the memtable
+            // range under a single lock, so the view is point-in-time consistent: a
+            // concurrent **flush** (which moves keys from the memtable into a new
+            // SSTable and clears them from the memtable) cannot drop those keys from
+            // the result by landing between a readers snapshot and a separate,
+            // later memtable read. The memtable range is small (bounded by the
+            // flush threshold), so collecting it up front is cheap.
+            let (readers, generation, mem_entries) = {
+                let inner = self.lock();
+                let mem: Vec<(Key, Version, Option<Value>)> = inner
+                    .memtable
+                    .range::<[u8], _>((Bound::Included(start), upper))
+                    .filter_map(|(k, history)| {
+                        history
+                            .range(..=version)
+                            .next_back()
+                            .map(|(&v, slot)| (k.clone(), v, slot.clone()))
+                    })
+                    .collect();
+                (inner.readers.clone(), inner.compactions, mem)
+            };
+            // Oldest first, so newer overwrites older; the memtable is applied last.
+            let mut merged: BTreeMap<Key, (Version, Option<Value>)> = BTreeMap::new();
+            let mut read_err = None;
+            for reader in &readers {
+                match reader.scan_at(&self.env, start, end, version).await {
+                    Ok(rows) => {
+                        for (k, v, slot) in rows {
+                            merge_winner(&mut merged, k, v, slot);
+                        }
+                    }
+                    Err(e) => {
+                        read_err = Some(e);
+                        break;
+                    }
                 }
             }
+            if let Some(e) = read_err {
+                if self.raced_compaction(generation, &mut attempt) {
+                    continue;
+                }
+                return Err(e);
+            }
+            // Memtable last (newest), from the atomic snapshot taken above.
+            {
+                for (k, v, slot) in mem_entries {
+                    merge_winner(&mut merged, k, v, slot);
+                }
+            }
+            return Ok(merged);
         }
-        Ok(merged)
     }
 
     /// Every key's latest record across all sources (whole keyspace), tombstones

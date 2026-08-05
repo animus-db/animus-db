@@ -110,6 +110,21 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
   brief lock first — then takes the lock again only to mutate in-memory state.
   This keeps futures `Send` and ordering deterministic (ADR 0003). Block bytes
   are read from disk outside any lock.
+  - **Reads must be consistent against concurrent flush/compaction** (the lock-free
+    window has two races, both fixed; surfaced by bulk-seed → auto-split). (1)
+    **Compaction removes files**: it swaps `inner.readers` under the lock then
+    `remove`s the superseded files, so a lock-free read of a just-removed file gets
+    an empty/short read (`read_at` maps a `NotFound` file to `Ok(empty)`). Reads now
+    capture the **compaction generation** (`inner.compactions`) with the readers
+    snapshot and **retry** (`raced_compaction` / `READ_COMPACTION_RETRIES`) when a
+    compaction raced — re-reading the merged tables (same data) instead of erroring.
+    (2) **Flush moves keys memtable→SSTable**: `merged_at` used to read the memtable
+    *after* the readers under a separate lock, so a flush in between dropped the
+    just-flushed keys from the result (silent loss — a split handoff could seed the
+    child short). It now snapshots the memtable range **atomically with the readers**
+    (one lock). `read_at`/`latest_version_of` already snapshot the memtable
+    atomically; only `merged_at` (scan/`entries`) had the flush gap.
+    `tests/lsm_concurrent.rs::scans_survive_concurrent_compaction` is the regression.
 - **WAL segment rotation** (`lsm/wal.rs`): the WAL is a sequence of numbered
   segment files `wal-NNNNNN`, not one growing file. The `GroupCommit` leader
   appends each batch to the **active** segment and rolls to a fresh one past
@@ -208,7 +223,11 @@ threaded `SimEnv` cannot exercise a preemptive interleaving, so the WAL group-
 commit's liveness under genuine parallelism is covered here. (A writer that
 enqueued its record while the leader was mid-`fsync` once parked forever; the
 `DurableUpTo` future now resolves as soon as `!flushing` so it re-leads — see
-`wal.rs`.) **Lesson:** concurrency primitives need a `ProdEnv` multi-thread test;
+`wal.rs`.) It also has `scans_survive_concurrent_compaction`: a writer storm with
+tiny flush/compaction thresholds while scanners loop `entries()`, asserting every
+scan succeeds (the compaction-removal short-read race) **and** never loses a
+previously-seen key (the flush race). **Lesson:** concurrency primitives — and
+lock-free reads racing flush/compaction — need a `ProdEnv` multi-thread test;
 the sim proves logic/order, not real-thread races.
 
 `cargo bench -p animus-storage` runs `benches/engine_bench.rs`: a hand-rolled
