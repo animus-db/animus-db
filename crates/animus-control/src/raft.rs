@@ -303,7 +303,10 @@ pub struct RaftCore<C = MetaCommand, S = Metadata> {
     // --- DRIVER_APPLIED snapshot streaming (ADR 0017 A.2). Unused by the in-core
     // control plane (whose `InstallSnapshot` serializes `metadata` directly). ---
     // The leader's current engine-image bytes to ship to a lagging follower; the
-    // driver refreshes this from the engine when it compacts (`set_snapshot_blob`).
+    // driver refreshes this from the engine when it compacts (`set_snapshot_blob`),
+    // and the core also sets it on *install* completion (a follower keeps the image
+    // it just received so it can re-ship it later — see `handle_install_snapshot`)
+    // so it is `Some` whenever `snapshot_index > 0`, never an empty 0-byte ship.
     snapshot_blob: Option<Vec<u8>>,
     // A fully-received snapshot's `(last_index, bytes)` awaiting the driver writing
     // it into the engine (`drain_pending_install`); set on install completion.
@@ -1129,6 +1132,19 @@ where
                 // `metadata` stays the unit placeholder.
                 let bytes = inc.buf;
                 install(self);
+                // Retain the installed image as our own snapshot blob. A
+                // `DRIVER_APPLIED` state machine's image lives in the engine, not in
+                // `metadata`, so `snapshot_chunk_for` ships `snapshot_blob` — which is
+                // only set by the driver when it *compacts* (`set_snapshot_blob`). A
+                // node that caught up via this install has `snapshot_index > 0` but,
+                // until its first compaction, no blob; if it then becomes leader (or
+                // must re-ship to a third follower below its compacted prefix) it would
+                // ship `unwrap_or_default()` = 0 bytes, the receiver would decode an
+                // empty image (`EOF while parsing a value`) and could never catch up.
+                // The just-installed bytes are exactly a valid image at
+                // `snapshot_index`, so keep them; the driver overwrites this on its
+                // next compaction with the fresh engine image.
+                self.snapshot_blob = Some(bytes.clone());
                 self.pending_install = Some((inc.last_index, bytes));
                 return vec![(
                     leader,

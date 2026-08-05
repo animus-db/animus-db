@@ -101,6 +101,17 @@ epoch compare-and-swap transactions.
   the final chunk completes the buffer. `InstallSnapshotResp.next_offset` drives
   the next chunk; its `last_index` is non-zero only on completion. Chunking is
   all in the sync core (no I/O), so it stays deterministic. See `docs/wal.md`.
+  **For a `DRIVER_APPLIED` (data-plane KV) state machine the shipped image is
+  `snapshot_blob`, not serialized `metadata`** — and the core sets `snapshot_blob`
+  on **two** events, not one: the driver sets it from the engine when it *compacts*
+  (`set_snapshot_blob`), **and the core sets it on install completion** (a follower
+  retains the image it just received). The second is load-bearing: without it a
+  node that caught up via an `InstallSnapshot` has `snapshot_index > 0` but no blob
+  until its first compaction, so if it then becomes leader (or must re-ship to a
+  third lagging follower) it ships `unwrap_or_default()` = **0 bytes**, the receiver
+  decodes an empty image (`EOF while parsing a value`) and can never catch up. The
+  invariant is `DRIVER_APPLIED && snapshot_index > 0 ⟹ snapshot_blob.is_some()`
+  (regression: `driver_applied_sm.rs::caught_up_node_reships_non_empty_snapshot`).
 - `CasTabletReplicas` applies only if the tablet's epoch matches, then bumps it
   — evaluated identically on every replica, so accept/reject is consistent.
 - **Automatic placement (ADR 0005).** Policies are replicated in `Metadata`
