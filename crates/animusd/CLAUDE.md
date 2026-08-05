@@ -282,7 +282,9 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
       (also asserts a numeric sort key's type reaches the catalog).
     - **Bulk seed for sharding tests.** `POST /admin/data/seed {table, count, start?,
       key_prefix?, value_bytes?}` writes synthetic keys (`key_prefix` + zero-padded
-      index) to the CP plane via the normal durable `cp_write`, with bounded
+      index) into an **existing** `table` (ADR 0023: seeding writes into a table, it
+      does not create one — a non-existent table is a `404`, looked up in the
+      replicated tablet map) via the normal durable `cp_write`, with bounded
       concurrency (`SEED_CONCURRENCY`) to amortize WAL group-commit; capped at
       `SEED_MAX_PER_REQUEST` per call. Each key is **retried** (`SEED_WRITE_ATTEMPTS`)
       so writes racing a tablet **split** — routed to the parent and truncated as

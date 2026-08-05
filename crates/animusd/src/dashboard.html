@@ -199,7 +199,7 @@ SELECT * FROM t WHERE id = 1;"></textarea>
 
     <div class="card scroll">
       <h2>Bulk seed (sharding test)</h2>
-      <div class="muted" style="margin-bottom:8px">Writes synthetic keys to the CP plane to grow a tablet. Run the cluster with <code>--auto-split K</code> to watch tablets split in the Tablets tab as the count crosses K.</div>
+      <div class="muted" style="margin-bottom:8px">Writes synthetic keys into an <b>existing</b> table to grow its tablet (create the table first in the Dynamo or CQL panel). Run the cluster with <code>--auto-split K</code> to watch tablets split in the Tablets tab as the count crosses K.</div>
       <div class="row">
         <label>table</label><input type="text" id="seed-table" value="seed" style="width:7em">
         <label>key prefix</label><input type="text" id="seed-prefix" value="seed:" style="width:7em">
@@ -373,8 +373,12 @@ function renderTablets() {
       : `<span class="muted">unknown</span>`;
     const idx = lg ? `${lg.commit_index}/${lg.last_applied}/${lg.durable_index}` : "—";
     const voters = lg ? lg.voters.join(", ") : (t.replicas || []).join(", ");
+    const tableCell = t.table
+      ? `<span class="mono">${esc(t.table)}</span>`
+      : `<span class="muted">—</span>`;
     return `<tr>
       <td class="mono">${esc(id)}</td>
+      <td>${tableCell}</td>
       <td class="mono">${esc(bytes(t.range && t.range.start))} → ${esc(bytes(t.range && t.range.end))}</td>
       <td class="mono">${esc(t.epoch)}</td>
       <td class="mono">${esc((t.replicas || []).join(", "))}</td>
@@ -385,7 +389,7 @@ function renderTablets() {
     </tr>`;
   }).join("");
   $("tablets-body").innerHTML = rows ? `<table>
-    <thead><tr><th>tablet</th><th>range</th><th>epoch</th><th>replicas (base)</th>
+    <thead><tr><th>tablet</th><th>table</th><th>range</th><th>epoch</th><th>replicas (base)</th>
       <th>leader</th><th>term</th><th>commit/applied/durable</th><th>voters (group)</th></tr></thead>
     <tbody>${rows}</tbody></table>`
     : `<div class="empty">no tablets</div>`;

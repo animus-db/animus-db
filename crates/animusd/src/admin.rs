@@ -718,7 +718,8 @@ struct SeedReq {
 
 /// `POST /admin/data/seed {table, count, start?, key_prefix?, value_bytes?}` —
 /// bulk-write synthetic keys to the CP plane to drive sharding tests (ADR 0021).
-/// `table` is **required** (ADR 0023: every key names a table). Keys are
+/// `table` is **required** and must **already exist** (ADR 0023: seeding writes into
+/// a table, it does not create one — a non-existent table is a `404`). Keys are
 /// `key_prefix + zero-padded (start..start+count)` with a filler value; they go
 /// through the normal durable `cp_write` path (routed to the leader), written with
 /// bounded concurrency to amortize WAL group-commit. With `--auto-split` enabled,
@@ -732,12 +733,17 @@ async fn action_data_seed(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
     let count = req.count.min(SEED_MAX_PER_REQUEST);
     let prefix = req.key_prefix.unwrap_or_else(|| "seed:".to_string());
     let value_bytes = req.value_bytes.unwrap_or(64).min(SEED_MAX_VALUE_BYTES);
-    // Every key names a table (ADR 0023): `table` is a required field on the request
-    // (no default, decode fails without it), so we never invent a table the caller
-    // didn't ask for. Provision its tablet up front if it does not exist yet.
+    // Every key names a table (ADR 0023), and seeding **writes into an existing
+    // table** — it never creates one. Look the table up (a read of the replicated
+    // tablet map); reject if it doesn't exist — the caller must create it first.
     let table = req.table;
-    if let Err(e) = ctx.provision_tablet(&table).await {
-        return (500, serde_json::json!({ "error": e }));
+    if !ctx.raft.metadata().has_table_tablet(&table) {
+        return (
+            404,
+            serde_json::json!({
+                "error": format!("table `{table}` does not exist — create it first")
+            }),
+        );
     }
     let value = vec![b'x'; value_bytes];
 

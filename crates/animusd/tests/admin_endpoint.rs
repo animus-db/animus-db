@@ -438,6 +438,33 @@ async fn admin_seed_writes_synthetic_keys() {
         await_bootstrap(&nodes).await;
         let a = nodes[0].admin_addr();
 
+        // Seeding writes into an **existing** table (ADR 0023) — create it first.
+        let (s, ct) = admin(
+            a,
+            "POST",
+            "/admin/data/dynamo",
+            Some(
+                r#"{"op":"CreateTable","payload":{"TableName":"seedt",
+                    "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
+                    "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}]}}"#,
+            ),
+        )
+        .await;
+        assert_eq!(s, 200, "CreateTable seedt: {ct}");
+
+        // Seeding a table that does not exist is a 404 (no implicit create).
+        let (s, missing) = admin(
+            a,
+            "POST",
+            "/admin/data/seed",
+            Some(r#"{"table":"nope","count":1}"#),
+        )
+        .await;
+        assert_eq!(
+            s, 404,
+            "seeding a non-existent table is rejected: {missing}"
+        );
+
         let (s, body) = admin(
             a,
             "POST",
