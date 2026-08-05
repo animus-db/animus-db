@@ -38,7 +38,7 @@ async fn await_bootstrap(nodes: &[Node]) {
     let ready = async {
         loop {
             if nodes.iter().any(Node::is_control_leader)
-                && nodes.iter().all(|node| !node.metadata().tablets.is_empty())
+                && nodes.iter().all(|node| !node.metadata().members.is_empty())
             {
                 return;
             }
@@ -59,7 +59,7 @@ async fn put(clients: &[SocketAddr], key: &[u8], value: &[u8]) {
                     ClientRequest::Put {
                         key: key.to_vec(),
                         value: value.to_vec(),
-                        table: None,
+                        table: Some("kv".to_string()),
                     },
                 )
                 .await
@@ -80,12 +80,16 @@ async fn get(client: SocketAddr, key: &[u8]) -> Option<Vec<u8>> {
         client,
         ClientRequest::Get {
             key: key.to_vec(),
-            table: None,
+            table: Some("kv".to_string()),
         },
     )
     .await
     {
         ClientResponse::Value(v) => v,
+        // A transient "no CP group leader reachable" is expected while a tablet's
+        // group is still re-forming after a restart (ADR 0023) — treat it as
+        // not-yet-available so `await_value` keeps polling.
+        ClientResponse::Error(_) => None,
         other => panic!("unexpected get reply: {other:?}"),
     }
 }

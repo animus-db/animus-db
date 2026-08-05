@@ -162,7 +162,7 @@ fn single_node_config() -> ClusterConfig {
 async fn await_bootstrap(node: &Node) {
     let ready = async {
         loop {
-            if node.is_control_leader() && !node.metadata().tablets.is_empty() {
+            if node.is_control_leader() && !node.metadata().members.is_empty() {
                 return;
             }
             sleep(Duration::from_millis(50)).await;

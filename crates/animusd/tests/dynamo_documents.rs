@@ -16,7 +16,7 @@ async fn await_bootstrap(nodes: &[Node]) {
     let ready = async {
         loop {
             let leader = nodes.iter().any(Node::is_control_leader);
-            let everyone_has_tablet = nodes.iter().all(|n| !n.metadata().tablets.is_empty());
+            let everyone_has_tablet = nodes.iter().all(|n| !n.metadata().members.is_empty());
             if leader && everyone_has_tablet {
                 return;
             }

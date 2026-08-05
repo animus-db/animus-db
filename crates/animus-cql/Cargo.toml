@@ -12,3 +12,4 @@ description = "AnimusDB CQL (Cassandra) wire-protocol adapter (later)."
 workspace = true
 
 [dependencies]
+animus-tablet.workspace = true

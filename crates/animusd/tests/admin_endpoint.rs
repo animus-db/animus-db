@@ -72,7 +72,7 @@ async fn await_bootstrap(nodes: &[Node]) {
     timeout(Duration::from_secs(20), async {
         loop {
             if nodes.iter().any(Node::is_control_leader)
-                && nodes.iter().all(|n| !n.metadata().tablets.is_empty())
+                && nodes.iter().all(|n| !n.metadata().members.is_empty())
             {
                 return;
             }
@@ -142,7 +142,7 @@ async fn admin_interface_surfaces_state_and_actions() {
             &ClientRequest::Put {
                 key: b"admin-key".to_vec(),
                 value: b"admin-val".to_vec(),
-                table: None,
+                table: Some("kv".to_string()),
             },
         )
         .await

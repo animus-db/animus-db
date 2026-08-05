@@ -84,7 +84,7 @@ fn lin_scan(
     let s = Arc::clone(&slot);
     let (lo, hi) = (start.to_vec(), end.to_vec());
     node.env().clone().spawn_task(async move {
-        *s.lock().unwrap() = Some(n.linearizable_scan(&lo, &hi, None).await);
+        *s.lock().unwrap() = Some(n.linearizable_scan(&lo, Some(&hi), None).await);
     });
     sim.run_for(budget);
     slot.lock().unwrap().clone().expect("scan did not complete")

@@ -54,7 +54,7 @@ async fn await_bootstrap(nodes: &[Node]) {
     let ready = async {
         loop {
             if nodes.iter().any(Node::is_control_leader)
-                && nodes.iter().all(|n| !n.metadata().tablets.is_empty())
+                && nodes.iter().all(|n| !n.metadata().members.is_empty())
             {
                 return;
             }
@@ -117,7 +117,7 @@ async fn put(clients: &[SocketAddr], key: &[u8], value: &[u8]) {
                     ClientRequest::Put {
                         key: key.to_vec(),
                         value: value.to_vec(),
-                        table: None,
+                        table: Some("kv".to_string()),
                     },
                 )
                 .await
@@ -141,7 +141,7 @@ async fn await_value(clients: &[SocketAddr], key: &[u8], want: &[u8], secs: u64)
                     c,
                     ClientRequest::Get {
                         key: key.to_vec(),
-                        table: None,
+                        table: Some("kv".to_string()),
                     },
                 )
                 .await
@@ -166,7 +166,11 @@ async fn split_triggered_from_a_non_leader_node() {
     await_bootstrap(&nodes).await;
     let clients: Vec<SocketAddr> = config.nodes.iter().map(|a| a.client).collect();
 
-    // Wait for the CP group to elect a leader, then write a lower + an upper key.
+    // ADR 0023: no bootstrap tablet — write first to provision the `kv` tablet (the
+    // writes auto-provision + wait), then confirm the group elected a leader (the
+    // split below needs one). A lower + an upper key span the split point.
+    put(&clients, b"k1", b"lower").await;
+    put(&clients, b"k9", b"upper").await;
     let cp_up = async {
         loop {
             for n in &nodes {
@@ -180,8 +184,6 @@ async fn split_triggered_from_a_non_leader_node() {
     timeout(Duration::from_secs(30), cp_up)
         .await
         .expect("CP group did not elect a leader within 30s");
-    put(&clients, b"k1", b"lower").await;
-    put(&clients, b"k9", b"upper").await;
 
     // Pick a node that is **neither** the control leader nor the CP-group leader, so
     // both halves of the split must cross process boundaries. With 3 nodes and ≤2

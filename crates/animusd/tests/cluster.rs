@@ -27,7 +27,7 @@ async fn await_bootstrap(nodes: &[Node]) {
     let ready = async {
         loop {
             let leader = nodes.iter().any(Node::is_control_leader);
-            let everyone_has_tablet = nodes.iter().all(|n| !n.metadata().tablets.is_empty());
+            let everyone_has_tablet = nodes.iter().all(|n| !n.metadata().members.is_empty());
             if leader && everyone_has_tablet {
                 return;
             }
@@ -53,7 +53,9 @@ async fn cluster_serves_put_get_and_status_over_tcp() {
     let addr0 = nodes[0].client_addr();
     match call(addr0, ClientRequest::Status).await {
         ClientResponse::Status(meta) => {
-            assert_eq!(meta.tablets.len(), 1, "expected the bootstrap tablet");
+            // ADR 0023: a fresh cluster has **no** data tablet until the first write
+            // provisions one (the put below auto-provisions the `kv` table's tablet).
+            assert_eq!(meta.tablets.len(), 0, "no data tablet until first write");
             assert_eq!(meta.members.len(), 3, "expected three members");
         }
         other => panic!("unexpected status response: {other:?}"),
@@ -65,7 +67,7 @@ async fn cluster_serves_put_get_and_status_over_tcp() {
         ClientRequest::Put {
             key: b"hello".to_vec(),
             value: b"world".to_vec(),
-            table: None,
+            table: Some("kv".to_string()),
         },
     )
     .await;
@@ -76,7 +78,7 @@ async fn cluster_serves_put_get_and_status_over_tcp() {
         addr1,
         ClientRequest::Get {
             key: b"hello".to_vec(),
-            table: None,
+            table: Some("kv".to_string()),
         },
     )
     .await;
@@ -87,7 +89,7 @@ async fn cluster_serves_put_get_and_status_over_tcp() {
         addr1,
         ClientRequest::Get {
             key: b"nope".to_vec(),
-            table: None,
+            table: Some("kv".to_string()),
         },
     )
     .await;
@@ -101,7 +103,7 @@ async fn cluster_serves_put_get_and_status_over_tcp() {
         ClientRequest::Put {
             key: b"hello".to_vec(),
             value: b"again".to_vec(),
-            table: None,
+            table: Some("kv".to_string()),
         },
     )
     .await;
@@ -114,7 +116,7 @@ async fn cluster_serves_put_get_and_status_over_tcp() {
         addr2,
         ClientRequest::Get {
             key: b"hello".to_vec(),
-            table: None,
+            table: Some("kv".to_string()),
         },
     )
     .await;

@@ -847,19 +847,18 @@ fn tokenize(input: &str) -> Vec<String> {
     tokens
 }
 
-/// Build the data-plane key for a row: `escape(table) || pk_bytes`.
+/// Build the data-plane (engine) key for a partition (ADR 0023):
+/// `partition_token(pk_bytes) || pk_bytes`.
 ///
-/// The table name is length-escaped (its UTF-8 bytes prefixed with a big-endian
-/// `u32` length) so two tables never produce overlapping keys even when one
-/// partition key is a prefix of another table+key concatenation. This mirrors
-/// the framing `animus-dynamo` uses for the same reason. `pk_bytes` is the
-/// type-canonical key encoding (see [`crate::types::CqlValue::to_key_bytes`]).
+/// **No table prefix** — a CQL partition is one CP value whose tablet is scoped to
+/// one table (its own engine), so the table is the routing argument, not key bytes.
+/// The Murmur3 token (fixed 8 bytes) spreads partitions across the table's ring;
+/// `pk_bytes` is the type-canonical partition-key encoding (see
+/// [`crate::types::CqlValue::to_key_bytes`]) and follows the token so two partition
+/// keys that hash alike stay distinct.
 #[must_use]
-pub fn data_key(table: &str, pk_bytes: &[u8]) -> Vec<u8> {
-    let table_bytes = table.as_bytes();
-    let mut key = Vec::with_capacity(4 + table_bytes.len() + pk_bytes.len());
-    key.extend_from_slice(&(table_bytes.len() as u32).to_be_bytes());
-    key.extend_from_slice(table_bytes);
+pub fn data_key(pk_bytes: &[u8]) -> Vec<u8> {
+    let mut key = animus_tablet::partition_token(pk_bytes).to_vec();
     key.extend_from_slice(pk_bytes);
     key
 }
@@ -1115,7 +1114,10 @@ mod tests {
     }
 
     #[test]
-    fn data_key_disambiguates_tables() {
-        assert_ne!(data_key("ab", b"c"), data_key("a", b"bc"));
+    fn data_key_disambiguates_partition_keys() {
+        // Distinct partition keys yield distinct data keys (the table is no longer
+        // in the key — tables are separated by per-table tablets, ADR 0023).
+        assert_ne!(data_key(b"c"), data_key(b"bc"));
+        assert_eq!(data_key(b"c"), data_key(b"c"));
     }
 }

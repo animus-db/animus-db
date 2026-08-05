@@ -109,6 +109,7 @@ use animus_dynamo::{
     AttributeValue, ConditionExpression, Item, SortKeyCondition, TableSchema,
     schema as schema_bridge, storage_key,
 };
+use animus_tablet::partition_token;
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::ClientCtx;
@@ -302,12 +303,11 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             return_values,
         } => {
             let (pk, sk) = resolve_key(ctx, &table, &item)?;
-            let within = storage_key(&pk, sk.as_ref());
-            let key = data_key(&table, &within);
+            let key = item_key(&pk, sk.as_ref());
             // For ALL_OLD (or a condition) we need the prior item; read it once.
             let needs_old = condition.is_some() || return_values == ReturnValues::AllOld;
             let old = if needs_old {
-                quorum_read(ctx, &key).await?
+                quorum_read(ctx, &table, &key).await?
             } else {
                 None
             };
@@ -319,8 +319,8 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
                 }
             }
             let value = wire::encode_stored_item(&item);
-            quorum_write(ctx, &key, &value).await?;
-            note_put(ctx, &table, &within, &item);
+            quorum_write(ctx, &table, &key, &value).await?;
+            note_put(ctx, &table, &key, &item);
             Ok(wire::write_response(return_values, old.as_ref()))
         }
         Operation::DeleteItem {
@@ -330,11 +330,10 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             return_values,
         } => {
             let (pk, sk) = resolve_key(ctx, &table, &key)?;
-            let within = storage_key(&pk, sk.as_ref());
-            let data_key = data_key(&table, &within);
+            let data_key = item_key(&pk, sk.as_ref());
             let needs_old = condition.is_some() || return_values == ReturnValues::AllOld;
             let old = if needs_old {
-                quorum_read(ctx, &data_key).await?
+                quorum_read(ctx, &table, &data_key).await?
             } else {
                 None
             };
@@ -346,8 +345,8 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
                 }
             }
             let value = wire::encode_tombstone();
-            quorum_write(ctx, &data_key, &value).await?;
-            note_delete(ctx, &table, &within);
+            quorum_write(ctx, &table, &data_key, &value).await?;
+            note_delete(ctx, &table, &data_key);
             Ok(wire::write_response(return_values, old.as_ref()))
         }
         // (The `put_item` / `delete_item` helpers above serve the batch/transact
@@ -358,8 +357,8 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             projection,
         } => {
             let (pk, sk) = resolve_key(ctx, &table, &key)?;
-            let data_key = data_key(&table, &storage_key(&pk, sk.as_ref()));
-            let item = quorum_read(ctx, &data_key).await?;
+            let data_key = item_key(&pk, sk.as_ref());
+            let item = quorum_read(ctx, &table, &data_key).await?;
             let item = item.map(|i| wire::project(projection.as_ref(), &i));
             Ok(wire::get_item_response(item.as_ref()))
         }
@@ -515,6 +514,12 @@ async fn create_table(
             tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
         }
     }
+    // Provision the table's CP tablet (ADR 0023): one tablet over the whole token
+    // ring, scoped to this table, which the per-node join-host loop stands up. Until
+    // this commits, the table has no tablet and its data ops would wait.
+    ctx.provision_tablet(table)
+        .await
+        .map_err(|e| internal(&e))?;
     // Reconcile the cluster's registry to the **replicated** index set (rebuilding
     // the edge-local Query/Scan key index + GSI machinery from the catalog, not from
     // the request's declarations — so the source of truth is the committed catalog).
@@ -532,10 +537,9 @@ async fn put_item(
     condition: Option<&ConditionExpression>,
 ) -> Result<Option<Item>, WireError> {
     let (pk, sk) = resolve_key(ctx, table, item)?;
-    let within = storage_key(&pk, sk.as_ref());
-    let key = data_key(table, &within);
+    let key = item_key(&pk, sk.as_ref());
     let old = if condition.is_some() {
-        quorum_read(ctx, &key).await?
+        quorum_read(ctx, table, &key).await?
     } else {
         None
     };
@@ -547,8 +551,8 @@ async fn put_item(
         }
     }
     let value = wire::encode_stored_item(item);
-    quorum_write(ctx, &key, &value).await?;
-    note_put(ctx, table, &within, item);
+    quorum_write(ctx, table, &key, &value).await?;
+    note_put(ctx, table, &key, item);
     Ok(old)
 }
 
@@ -562,10 +566,9 @@ async fn delete_item(
     condition: Option<&ConditionExpression>,
 ) -> Result<Option<Item>, WireError> {
     let (pk, sk) = resolve_key(ctx, table, key_item)?;
-    let within = storage_key(&pk, sk.as_ref());
-    let key = data_key(table, &within);
+    let key = item_key(&pk, sk.as_ref());
     let old = if condition.is_some() {
-        quorum_read(ctx, &key).await?
+        quorum_read(ctx, table, &key).await?
     } else {
         None
     };
@@ -576,8 +579,8 @@ async fn delete_item(
             ));
         }
     }
-    quorum_write(ctx, &key, &wire::encode_tombstone()).await?;
-    note_delete(ctx, table, &within);
+    quorum_write(ctx, table, &key, &wire::encode_tombstone()).await?;
+    note_delete(ctx, table, &key);
     Ok(old)
 }
 
@@ -594,9 +597,8 @@ async fn run_update_item(
     return_values: UpdateReturnValues,
 ) -> Result<String, WireError> {
     let (pk, sk) = resolve_key(ctx, table, key_item)?;
-    let within = storage_key(&pk, sk.as_ref());
-    let key = data_key(table, &within);
-    let old = quorum_read(ctx, &key).await?;
+    let key = item_key(&pk, sk.as_ref());
+    let old = quorum_read(ctx, table, &key).await?;
     if let Some(cond) = condition {
         if !cond.evaluate(old.as_ref()) {
             return Err(WireError::conditional_check_failed(
@@ -608,8 +610,8 @@ async fn run_update_item(
     let base = old.clone().unwrap_or_else(|| key_item.clone());
     let new = wire::apply_update(base, actions);
     let value = wire::encode_stored_item(&new);
-    quorum_write(ctx, &key, &value).await?;
-    note_put(ctx, table, &within, &new);
+    quorum_write(ctx, table, &key, &value).await?;
+    note_put(ctx, table, &key, &new);
     Ok(wire::update_response(
         return_values,
         old.as_ref(),
@@ -663,8 +665,8 @@ async fn run_transact(ctx: &ClientCtx, actions: &[TransactAction]) -> Result<Str
                 condition,
             } => {
                 let (pk, sk) = resolve_key(ctx, table, key)?;
-                let data_key = data_key(table, &storage_key(&pk, sk.as_ref()));
-                let current = quorum_read(ctx, &data_key).await?;
+                let data_key = item_key(&pk, sk.as_ref());
+                let current = quorum_read(ctx, table, &data_key).await?;
                 if !condition.evaluate(current.as_ref()) {
                     return Err(WireError::conditional_check_failed(
                         "a transaction condition check failed",
@@ -731,9 +733,9 @@ async fn run_base_query(
     // The partition's data-plane keys are exactly those prefixed by
     // `escape(table) || escape(pk)` (each escape is prefix-free, ending `00 00`),
     // so the contiguous range is `[prefix, prefix-with-last-byte-bumped)`.
-    let prefix = partition_prefix(table, partition_value);
+    let prefix = partition_prefix(partition_value);
     let end = range_end(&prefix);
-    let pairs = native_scan(ctx, &prefix, &end, None).await?;
+    let pairs = native_scan(ctx, table, &prefix, Some(&end), None).await?;
     let mut items = Vec::new();
     for (key, value) in pairs {
         // A DynamoDB delete stores a tombstone *value* (not a data-plane
@@ -793,9 +795,10 @@ async fn run_index_query(
             .map_err(registry_error)?
     };
     let mut items = Vec::with_capacity(within_keys.len());
-    for within in &within_keys {
-        let data_key = data_key(table, within);
-        if let Some(item) = quorum_read(ctx, &data_key).await? {
+    for base_key in &within_keys {
+        // The index stores the full engine key (`item_key`) as its base key, so it
+        // reads back directly — no table prefix to reattach (ADR 0023).
+        if let Some(item) = quorum_read(ctx, table, base_key).await? {
             items.push(wire::project(effective, &item));
         }
     }
@@ -831,24 +834,23 @@ async fn run_scan(
             table.to_owned(),
         )));
     }
-    // Scan the whole table's contiguous data-plane range `[escape(table), …)`.
-    let start = data_key(table, &[]);
-    let end = range_end(&start);
-    // `ExclusiveStartKey`: resume strictly after the cursor item's data key.
+    // Scan the table's whole ring (ADR 0023): the tablet engines hold only this
+    // table's rows, so the range is `[from, ∞)` — unbounded above (`end = None`),
+    // fanned out across the table's tablets in token order by `cp_scan`.
     let from = match &exclusive_start_key {
         Some(key_item) => {
             let (pk, sk) = resolve_key(ctx, table, key_item)?;
-            let mut after = data_key(table, &storage_key(&pk, sk.as_ref()));
+            let mut after = item_key(&pk, sk.as_ref());
             after.push(0x00); // first key strictly past the cursor (keys are unique)
             after
         }
-        None => start,
+        None => Vec::new(),
     };
     // The native scan returns live data-plane pairs in key order. A DynamoDB
     // `DeleteItem` stores a *tombstone value* (a live pair to the data plane), so
     // decode each and drop the ones that decode to a tombstone — those items are
     // logically absent and are neither examined nor counted.
-    let pairs = native_scan(ctx, &from, &end, None).await?;
+    let pairs = native_scan(ctx, table, &from, None, None).await?;
     let mut examined: Vec<(Vec<u8>, Item)> = Vec::new();
     for (key, value) in pairs {
         if let Some(item) = wire::decode_stored_item(&value)? {
@@ -961,24 +963,25 @@ fn registry_error(err: animus_dynamo::RegistryError) -> WireError {
     }
 }
 
-/// The data-plane key for an item: `escape(table) || within_key`, where
-/// `within_key` is `storage_key(pk, sk)`. Sharing one keyspace, tables don't
-/// collide because the escaped table name is prefix-free.
-fn data_key(table: &str, within_key: &[u8]) -> Vec<u8> {
-    let mut key = storage_key(&AttributeValue::S(table.to_owned()), None);
-    key.extend_from_slice(within_key);
+/// The data-plane (engine) key for an item (ADR 0023): `partition_token(pk) ||
+/// escape(pk) || sk`. **No table prefix** — the item's tablet is its own engine
+/// holding only this table's rows, so the table is the routing argument, not key
+/// bytes. The token (Murmur3, fixed 8 bytes) spreads partitions across the table's
+/// ring; it is over the partition key only, so a partition's rows share the
+/// `token || escape(pk)` prefix and stay contiguous + sort-ordered.
+fn item_key(pk: &AttributeValue, sk: Option<&AttributeValue>) -> Vec<u8> {
+    let pk_escaped = storage_key(pk, None); // == escape(pk)
+    let mut key = partition_token(&pk_escaped).to_vec();
+    key.extend_from_slice(&storage_key(pk, sk)); // escape(pk) || sk
     key
 }
 
-/// The contiguous data-plane key prefix of a `Query` partition:
-/// `escape(table) || escape(partition_value)`. Every item in that partition has a
-/// data key starting with this prefix, and (the escape being prefix-free, ending
-/// `0x00 0x00`) no other partition's key does — so the partition is one
-/// half-open range `[prefix, range_end(prefix))`.
-fn partition_prefix(table: &str, partition_value: &AttributeValue) -> Vec<u8> {
-    // `storage_key(pk, None) == escape(pk)`, so `data_key(table, escape(pk))`
-    // is `escape(table) || escape(pk)`.
-    data_key(table, &storage_key(partition_value, None))
+/// The contiguous key prefix of a `Query` partition (ADR 0023): `token(pk) ||
+/// escape(pk)`. Every item in that partition starts with it, and (the escape being
+/// prefix-free, ending `0x00 0x00`) no other partition's key does — so the
+/// partition is the one half-open range `[prefix, range_end(prefix))`.
+fn partition_prefix(partition_value: &AttributeValue) -> Vec<u8> {
+    item_key(partition_value, None)
 }
 
 /// The exclusive upper bound of the half-open range that covers exactly the keys
@@ -999,11 +1002,12 @@ fn range_end(prefix: &[u8]) -> Vec<u8> {
 /// cannot serve is an internal error (the scan analog of a failed read).
 async fn native_scan(
     ctx: &ClientCtx,
+    table: &str,
     start: &[u8],
-    end: &[u8],
+    end: Option<&[u8]>,
     limit: Option<usize>,
 ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, WireError> {
-    ctx.cp_scan(start.to_vec(), end.to_vec(), limit)
+    ctx.cp_scan(table, start.to_vec(), end.map(<[u8]>::to_vec), limit)
         .await
         .map_err(|e| internal(&e))
 }
@@ -1027,16 +1031,39 @@ fn table_known(ctx: &ClientCtx, table: &str) -> bool {
 /// leader and waited to durable+applied before returning (durable-before-ack). The
 /// Raft index is the MVCC version, so no client-assigned version is needed (the
 /// AP path's `read_version`+1 dance is gone).
-async fn quorum_write(ctx: &ClientCtx, key: &[u8], value: &[u8]) -> Result<(), WireError> {
-    ctx.cp_write(key.to_vec(), value.to_vec())
+async fn quorum_write(
+    ctx: &ClientCtx,
+    table: &str,
+    key: &[u8],
+    value: &[u8],
+) -> Result<(), WireError> {
+    // Auto-provision the table's tablet on first write (ADR 0023). A `CreateTable`
+    // provisions up front, but a legacy `pk`/`sk` client that never `CreateTable`d
+    // still needs a tablet to route to — stand one up on demand here. Idempotent and
+    // fast (a metadata check) once the tablet exists.
+    if !metadata(ctx).has_table_tablet(table) {
+        ctx.provision_tablet(table)
+            .await
+            .map_err(|e| internal(&e))?;
+    }
+    ctx.cp_write(table, key.to_vec(), value.to_vec())
         .await
         .map_err(|e| internal(&e))
 }
 
 /// Linearizable CP read of `key`, decoding the stored DynamoDB item (an absent
 /// key — including one tombstoned by a `DeleteItem` sentinel — reads as `None`).
-async fn quorum_read(ctx: &ClientCtx, key: &[u8]) -> Result<Option<Item>, WireError> {
-    match ctx.cp_read(key.to_vec()).await.map_err(|e| internal(&e))? {
+async fn quorum_read(ctx: &ClientCtx, table: &str, key: &[u8]) -> Result<Option<Item>, WireError> {
+    // A table with no tablet has no data (ADR 0023) — read as absent without waiting
+    // on routing for a tablet that does not exist.
+    if !metadata(ctx).has_table_tablet(table) {
+        return Ok(None);
+    }
+    match ctx
+        .cp_read(table, key.to_vec())
+        .await
+        .map_err(|e| internal(&e))?
+    {
         Some(bytes) => wire::decode_stored_item(&bytes),
         None => Ok(None),
     }

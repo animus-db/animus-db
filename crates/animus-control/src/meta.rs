@@ -78,6 +78,15 @@ pub struct Metadata {
     /// keeps pre-Phase-2 snapshots loading (empty map).
     #[serde(default)]
     pub cp_member_addrs: BTreeMap<NodeId, String>,
+    /// The next tablet id to hand out — a **monotonic** allocator (ADR 0023): bumped
+    /// past every tablet created (via `CreateTablet` or `SplitTablet`) so two
+    /// concurrent `CreateTable`s can't derive the same id, and a dropped id is never
+    /// reused (split member ids derive from the tablet id, so reuse could alias a
+    /// stale sibling). `#[serde(default)]` keeps pre-counter snapshots loading as `0`;
+    /// [`Metadata::next_free_tablet_id`] folds in the highest existing id so a loaded
+    /// snapshot still allocates above its tablets.
+    #[serde(default)]
+    pub next_tablet_id: u64,
 }
 
 /// A mutation of [`Metadata`], replicated through Raft and applied in log order.
@@ -270,16 +279,22 @@ impl Metadata {
             } => {
                 if self.tablets.contains_key(tablet) {
                     ApplyOutcome::Rejected("tablet already exists")
+                } else if table
+                    .as_deref()
+                    .is_some_and(|t| self.tablets_for_table(t).next().is_some())
+                {
+                    // One `CreateTablet` per table (ADR 0023): the *first* tablet is
+                    // provisioned at `CreateTable`; further tablets of a table come
+                    // only from `SplitTablet`. This makes provision-at-create
+                    // race-safe — two nodes racing with different allocated ids both
+                    // propose `CreateTablet` for the table, but only the first applies.
+                    ApplyOutcome::Rejected("table already has a tablet")
                 } else {
                     self.tablets.insert(
                         *tablet,
-                        Tablet::with_table(
-                            *tablet,
-                            table.clone(),
-                            range.clone(),
-                            replicas.clone(),
-                        ),
+                        Tablet::with_table(*tablet, table.clone(), range.clone(), replicas.clone()),
                     );
+                    self.next_tablet_id = self.next_tablet_id.max(tablet.0 + 1);
                     ApplyOutcome::Applied
                 }
             }
@@ -316,12 +331,17 @@ impl Metadata {
                 // The split child inherits the parent's table scope (ADR 0023): a
                 // split never crosses a table boundary, so both halves stay scoped
                 // to the same table.
-                let new_tablet =
-                    Tablet::with_table(*new_id, source.table.clone(), right, source.replicas.clone());
+                let new_tablet = Tablet::with_table(
+                    *new_id,
+                    source.table.clone(),
+                    right,
+                    source.replicas.clone(),
+                );
                 let source = self.tablets.get_mut(tablet).expect("tablet present");
                 source.range = left;
                 source.epoch = source.epoch.next();
                 self.tablets.insert(*new_id, new_tablet);
+                self.next_tablet_id = self.next_tablet_id.max(new_id.0 + 1);
                 ApplyOutcome::Applied
             }
             MetaCommand::MergeTablets { left, right } => {
@@ -499,6 +519,18 @@ impl Metadata {
     pub fn has_table_tablet(&self, table: &str) -> bool {
         self.tablets_for_table(table).next().is_some()
     }
+
+    /// The next tablet id a proposer should request when creating a tablet (ADR
+    /// 0023). Folds the monotonic `next_tablet_id` counter together with the highest
+    /// existing id (so a pre-counter snapshot still allocates above its tablets) and
+    /// a floor of `1` (id `0` is reserved/unused). Race-safe with retry: if two
+    /// proposers pick the same id, the second's `CreateTablet` is rejected as a
+    /// duplicate and it re-reads this for a fresh id.
+    #[must_use]
+    pub fn next_free_tablet_id(&self) -> TabletId {
+        let highest = self.tablets.keys().map(|t| t.0).max().unwrap_or(0);
+        TabletId(self.next_tablet_id.max(highest + 1).max(1))
+    }
 }
 
 /// `Metadata` is the control plane's replicated state machine: the [`RaftCore`]
@@ -554,5 +586,51 @@ mod tests {
         // A distinct member coexists.
         assert_eq!(m.apply(&reg(401, "127.0.0.1:9101")), ApplyOutcome::Applied);
         assert_eq!(m.cp_member_addrs.len(), 2);
+    }
+
+    /// The monotonic tablet-id allocator (ADR 0023): every created tablet bumps the
+    /// counter past its id, so the next allocation is unique; it never goes backward,
+    /// and a pre-counter snapshot (counter `0`) still allocates above its tablets.
+    #[test]
+    fn next_tablet_id_is_monotonic_across_create_and_split() {
+        let mut m = Metadata::default();
+        let create = |id: u64, table: &str| MetaCommand::CreateTablet {
+            tablet: TabletId(id),
+            table: Some(table.to_owned()),
+            range: KeyRange::whole(),
+            replicas: vec![1, 2, 3],
+        };
+
+        // Fresh metadata allocates id 1 (id 0 is reserved).
+        assert_eq!(m.next_free_tablet_id(), TabletId(1));
+
+        // Creating the allocated tablet advances the counter.
+        assert_eq!(m.apply(&create(1, "users")), ApplyOutcome::Applied);
+        assert_eq!(m.next_free_tablet_id(), TabletId(2));
+        assert_eq!(m.apply(&create(2, "orders")), ApplyOutcome::Applied);
+        assert_eq!(m.next_free_tablet_id(), TabletId(3));
+
+        // A split advances the counter past the new child too.
+        let split = MetaCommand::SplitTablet {
+            tablet: TabletId(1),
+            split_key: 0x8000_0000_0000_0000u64.to_be_bytes().to_vec(),
+            new_id: TabletId(3),
+        };
+        assert_eq!(m.apply(&split), ApplyOutcome::Applied);
+        assert_eq!(m.next_free_tablet_id(), TabletId(4));
+
+        // A pre-counter snapshot (counter field 0) still allocates above its
+        // highest existing tablet, never colliding.
+        let legacy = Metadata {
+            tablets: [(
+                TabletId(7),
+                Tablet::new(TabletId(7), KeyRange::whole(), vec![1]),
+            )]
+            .into_iter()
+            .collect(),
+            next_tablet_id: 0,
+            ..Metadata::default()
+        };
+        assert_eq!(legacy.next_free_tablet_id(), TabletId(8));
     }
 }

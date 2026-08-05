@@ -50,7 +50,7 @@ use animus_control::node::heartbeat_loop;
 use animus_control::{PlacementPolicy, ProposeResult, RaftNode};
 use animus_cp_data::{RaftKvNode, SplitHook};
 use animus_env::{Coresident, Env, Metric, MetricsHandle, NodeId, ProdEnv};
-use animus_storage::{LsmEngine, MemoryEngine, SsTableView, WalRecordView};
+use animus_storage::{LsmEngine, MemoryEngine, SsTableView, StorageEngine, WalRecordView};
 use animus_tablet::{Epoch, KeyRange, TabletId};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -113,7 +113,7 @@ impl CpGroup {
     async fn linearizable_scan(
         &self,
         start: &[u8],
-        end: &[u8],
+        end: Option<&[u8]>,
         limit: Option<usize>,
     ) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
         match self {
@@ -302,10 +302,23 @@ enum CpRoute {
     None,
 }
 
-/// The single bootstrap tablet covering the whole keyspace — the CP group's
-/// tablet in the replicated metadata (ADR 0017 / ADR 0019).
+/// The tablet id of the **first table provisioned** (ADR 0023): the tablet-id
+/// allocator hands out `1` first, and `cp_member_id`/`cp_join_host` host tablet `1`
+/// on the node's **main** `raftkv` env (member id == base id) while later tablets
+/// use minted siblings. So the first `CreateTable` lands on the main env at no extra
+/// cost, and there is no separate always-on "bootstrap" data tablet (a fresh cluster
+/// has zero data tablets until the first `CreateTable`).
 const TABLET: TabletId = TabletId(1);
-const CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a CP op (`cp_route` + forward) waits for the tablet's group to be
+/// reachable before giving up. Generous because a table's group now forms **in
+/// band** on the first access (ADR 0023) — the first op after a `CreateTable`/
+/// first-write waits out the join-host + election, which under heavy load takes
+/// longer than a steady-state op. No happy-path cost: `cp_route` returns as soon as
+/// a leader is reachable; the cap only bounds the wait when the group is forming.
+const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Error returned for a data op that names no table — every key must be scoped to a
+/// table (ADR 0023): there is no unscoped/whole-keyspace tablet.
+const NO_TABLE: &str = "every key must name a table (no unscoped keyspace)";
 /// The bootstrap CP group's replication factor (ADR 0017 #3a): the group spans the
 /// first `min(N, MAX_REPLICATION_FACTOR)` nodes' `raftkv` ids. Dynamic CP placement
 /// over more nodes is later v1 work.
@@ -447,9 +460,16 @@ pub enum ClientRequest {
     /// also the cross-process forwarding payload for a scan (ADR 0017 #3b).
     Scan {
         start: Vec<u8>,
-        end: Vec<u8>,
+        /// Exclusive upper bound, or `None` for **unbounded above** — a whole-table
+        /// scan (ADR 0023), since a per-table tablet's engine has no finite max key.
+        end: Option<Vec<u8>>,
         #[serde(default)]
         limit: Option<usize>,
+        /// The table whose ring to scan (ADR 0023): scans are per-table fan-outs, so
+        /// the table is required at routing (a `None` here errors). `#[serde(default)]`
+        /// keeps the frame decodable from older peers.
+        #[serde(default)]
+        table: Option<String>,
     },
     /// A CP op **forwarded** from a node that received it but does not host the CP
     /// group leader, to the leader's node (ADR 0017 #3b cross-process routing). The
@@ -506,6 +526,11 @@ fn is_relayable_command(command: &MetaCommand) -> bool {
             | MetaCommand::DropKeyspace { .. }
             | MetaCommand::RegisterCpAddr { .. }
             | MetaCommand::SplitTablet { .. }
+            // Provision-at-create (ADR 0023): a `CreateTable` on a follower-connected
+            // client relays the table's tablet creation + RF policy to the control
+            // leader. Scoped to one tablet per table by the state machine's guard.
+            | MetaCommand::CreateTablet { .. }
+            | MetaCommand::SetTabletPolicy { .. }
     )
 }
 
@@ -766,13 +791,10 @@ impl BoundNode {
             edge: edge.clone(),
             raftkv_metrics,
             client_route,
+            base_id: my_raftkv_id,
             admin: admin_info,
         };
         let n = control_ids.len();
-        let cp_group: Vec<NodeId> = (0..n.min(MAX_REPLICATION_FACTOR))
-            .map(config::raftkv_id)
-            .collect();
-        let hosts_cp = cp_group.contains(&my_raftkv_id);
 
         // The shared **CP hosting context** (D3): bundles the env to mint siblings,
         // the client context, backend, this node's base id, and the per-node `minted`
@@ -803,34 +825,15 @@ impl BoundNode {
         for h in recorded {
             tokio::spawn(cp_rehost(host.clone(), h));
         }
-        if hosts_cp {
-            // The statically-placed bootstrap group, with a split hook of its own.
-            let cp = match backend {
-                StorageBackend::Lsm => {
-                    let lsm = LsmEngine::open(self.raftkv_env.clone(), LSM_PREFIX)
-                        .await
-                        .map_err(|e| std::io::Error::other(format!("opening CP group LSM: {e}")))?;
-                    CpGroup::Lsm(RaftKvNode::start_with_split_hook(
-                        self.raftkv_env,
-                        cp_group,
-                        lsm,
-                        cp_split_hook(host.clone()),
-                    ))
-                }
-                StorageBackend::Memory => CpGroup::Mem(RaftKvNode::start_with_split_hook(
-                    self.raftkv_env,
-                    cp_group,
-                    MemoryEngine::new(),
-                    cp_split_hook(host.clone()),
-                )),
-            };
-            // The statically-placed group serves the bootstrap tablet (the whole
-            // keyspace). A tablet split registers the new tablet's group alongside
-            // it; routing is keyed by tablet (`cp_route`).
-            edge.register_raftkv(TABLET, cp);
-        }
+        // No CP group is stood up at node start (ADR 0023): a fresh cluster has zero
+        // data tablets. The per-node join-host loop (below) stands up each table's
+        // group when `CreateTable` provisions its tablet — the first table's tablet
+        // (`TABLET` = id 1) lands on this node's **main** `raftkv` env via
+        // `cp_member_id`/`cp_join_host`, later tablets on minted siblings. On restart
+        // the same loop re-hosts a provisioned tablet from its on-disk engine
+        // (`LsmEngine::open` recovers), and `cp_rehost` re-hosts split children.
 
-        // Bootstrap: whichever node is leader registers membership + the CP tablet
+        // Bootstrap: whichever node is leader registers membership (no data tablet)
         // (idempotent). Track the client-facing task handles so `shutdown` can
         // abort them and release the client/dynamo/cql listener ports (these run
         // on plain `tokio::spawn`, off the `Env` network).
@@ -862,10 +865,10 @@ impl BoundNode {
         // **CP reconfigure loop** (#3 / ADR 0017 Stage C): a CP-hosting node steps
         // each group it leads toward the tablet's replicated desired replica set —
         // the production counterpart of `spawn_reconfigure_loop` (decision in the
-        // replicated placement, timing here).
-        if hosts_cp {
-            tasks.push(tokio::spawn(cp_reconfigure_loop(ctx.clone())));
-        }
+        // replicated placement, timing here). Runs on **every** node now (hosting is
+        // dynamic — a node hosts a tablet's group once `CreateTable`/the reconciler
+        // places it here); it only acts on tablets this node currently leads.
+        tasks.push(tokio::spawn(cp_reconfigure_loop(ctx.clone())));
 
         // **CP join-host loop** (D1 — closes the failure->placement->reconfigure
         // cascade): a node placed in a tablet's replica set by the reconciler (e.g. a
@@ -881,19 +884,23 @@ impl BoundNode {
             // Metadata (Phase 2.3a), so peer-sync on every node can reach it. The
             // bootstrap members' addrs are already in the static peer book, so this
             // is the path a *new* member (split sibling / join) reuses.
-            if hosts_cp {
+            // Every node registers its base `raftkv` address so peer-sync on every
+            // node can reach it (hosting is dynamic now — a node may host the first
+            // table's tablet on this base env, and a node beyond the bootstrap set is
+            // not in the static peer book). The per-tablet `cp_join_host` path also
+            // registers a minted sibling's address when it stands a group up.
+            {
                 let ctx = ctx.clone();
                 tasks.push(tokio::spawn(async move {
                     ctx.register_cp_addr(my_raftkv_id, my_raftkv_addr.to_string())
                         .await;
                 }));
             }
-            // Auto-split loop (Phase 2.4), opt-in: a CP-hosting node splits a tablet
-            // it leads once it exceeds the key-count threshold.
+            // Auto-split loop (Phase 2.4), opt-in: a node splits a tablet it leads
+            // once it exceeds the key-count threshold (it checks leadership per tablet,
+            // so running it on every node is harmless).
             if let Some(threshold) = auto_split_threshold {
-                if hosts_cp {
-                    tasks.push(tokio::spawn(auto_split_loop(ctx.clone(), threshold)));
-                }
+                tasks.push(tokio::spawn(auto_split_loop(ctx.clone(), threshold)));
             }
             tasks.push(tokio::spawn(serve_clients(
                 self.client_listener,
@@ -1224,6 +1231,11 @@ pub(crate) struct ClientCtx {
     /// single-process `--cluster N` run (where the shared edge state already reaches
     /// every group handle in-process, so no forwarding is needed).
     client_route: BTreeMap<NodeId, SocketAddr>,
+    /// This node's **base `raftkv` id** — its identity in a tablet's replica set
+    /// (ADR 0023). Used by routing to tell "this node is a replica of the tablet, so
+    /// wait for its own group to form" from "this node hosts nothing for the tablet,
+    /// so forward."
+    base_id: NodeId,
     /// This node's identity + bound addresses for the admin `/admin/config` view
     /// (ADR 0020). `Arc` so cloning the ctx onto each connection is cheap.
     admin: Arc<AdminInfo>,
@@ -1244,23 +1256,18 @@ impl ClientCtx {
     /// only for a **raw, non-table-prefixed** key (e.g. the plain test client),
     /// never for a table whose own tablet exists. Iteration is over a `BTreeMap`, so
     /// the choice is deterministic on every node.
-    fn tablet_for(&self, key: &[u8]) -> Option<TabletId> {
-        let meta = self.raft.metadata();
-        let mut legacy: Option<TabletId> = None;
-        for (id, t) in &meta.tablets {
-            if !t.range.contains(key) {
-                continue;
-            }
-            if t.table.is_some() {
-                // A table-scoped tablet is the most specific (and only) owner of its
-                // table's keys — return it.
-                return Some(*id);
-            }
-            // A legacy whole-keyspace tablet is the last resort for a raw key only;
-            // remember it but keep looking for a scoped owner.
-            legacy.get_or_insert(*id);
-        }
-        legacy
+    fn tablet_for(&self, table: &str, key: &[u8]) -> Option<TabletId> {
+        // Table-scoped routing (ADR 0023): the table is the routing dimension and the
+        // key is `token(pk) || escape(pk) || rk` (no table prefix). We look only at
+        // `table`'s tablets and match the key's leading token against their token
+        // sub-ranges. Two tables' tablets may share a token range, so we never scan
+        // the global tablet map. No catch-all: a key of an unprovisioned table yields
+        // `None` and the caller waits.
+        self.raft
+            .metadata()
+            .tablets_for_table(table)
+            .find(|(_, t)| t.range.contains(key))
+            .map(|(id, _)| *id)
     }
 
     /// Resolve how to reach the CP group leader for an op on `key` (shared by every
@@ -1279,10 +1286,10 @@ impl ClientCtx {
     ///   so forward to any known route (the receiver serves iff it is the leader,
     ///   else the client retries with fresh routing);
     /// - the tablet itself is not in the map yet (bootstrap) → **wait** for it.
-    async fn cp_route(&self, key: &[u8]) -> CpRoute {
+    async fn cp_route(&self, table: &str, key: &[u8]) -> CpRoute {
         let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
         loop {
-            if let Some(tablet) = self.tablet_for(key) {
+            if let Some(tablet) = self.tablet_for(table, key) {
                 if let Some(route) = self.resolve_cp_route(tablet) {
                     return route;
                 }
@@ -1307,11 +1314,28 @@ impl ClientCtx {
         if let Some(addr) = self.cp_forward_target(tablet) {
             return Some(CpRoute::Forward(addr));
         }
-        // No local leader and no leader hint. A node hosting no replica of this
-        // tablet can never serve locally, so forward to any known route immediately;
-        // a node that *does* host a replica waits for its own election/hint.
+        // No local leader and no leader hint. Decide between waiting and forwarding
+        // by whether this node is a **replica** of the tablet (ADR 0023): a replica
+        // that does not yet host the group is mid-stand-up (its join-host loop will
+        // form/elect it) — **wait**, don't forward to a node that may not host the
+        // leader yet (the dynamic-provisioning window, fixes "forwarded CP op: not
+        // the leader here"). A node that is *not* a replica can never serve locally,
+        // so forward toward an actual replica of the tablet (it leads, or the client
+        // retries with fresh routing).
         if self.edge.local_cp(tablet).is_none() {
-            if let Some(addr) = self.client_route.values().next().copied() {
+            let meta = self.raft.metadata();
+            let replicas = meta.tablets.get(&tablet).map(|t| &t.replicas);
+            let is_replica = replicas.is_some_and(|r| r.contains(&self.base_id));
+            if is_replica {
+                return None; // wait for our own group to form
+            }
+            // Forward toward a replica's client route (prefer over a random node).
+            if let Some(addr) = replicas
+                .into_iter()
+                .flatten()
+                .find_map(|id| self.client_route.get(id).copied())
+                .or_else(|| self.client_route.values().next().copied())
+            {
                 return Some(CpRoute::Forward(addr));
             }
         }
@@ -1341,12 +1365,22 @@ impl ClientCtx {
     /// absent key; `Err` is "no leader reachable" (never a stale value — a deposed
     /// leader's ReadIndex returns `None`, treated as absent). The CP read primitive
     /// the wire edges call directly.
-    pub(crate) async fn cp_read(&self, key: Vec<u8>) -> Result<Option<Vec<u8>>, String> {
-        match self.cp_route(&key).await {
+    pub(crate) async fn cp_read(
+        &self,
+        table: &str,
+        key: Vec<u8>,
+    ) -> Result<Option<Vec<u8>>, String> {
+        match self.cp_route(table, &key).await {
             CpRoute::Local(leader) => Ok(leader.linearizable_get(&key).await),
             CpRoute::Forward(addr) => {
                 match self
-                    .cp_forward(addr, ClientRequest::Get { key, table: None })
+                    .cp_forward(
+                        addr,
+                        ClientRequest::Get {
+                            key,
+                            table: Some(table.to_owned()),
+                        },
+                    )
                     .await
                 {
                     ClientResponse::Value(v) => Ok(v),
@@ -1362,8 +1396,13 @@ impl ClientCtx {
     /// wait until the value is committed + durable + applied — a linearizable read
     /// reflects it — before returning `Ok` (durable-before-ack). Forwarded if this
     /// node isn't the leader. The CP write primitive the wire edges call directly.
-    pub(crate) async fn cp_write(&self, key: Vec<u8>, value: Vec<u8>) -> Result<(), String> {
-        match self.cp_route(&key).await {
+    pub(crate) async fn cp_write(
+        &self,
+        table: &str,
+        key: Vec<u8>,
+        value: Vec<u8>,
+    ) -> Result<(), String> {
+        match self.cp_route(table, &key).await {
             CpRoute::Local(leader) => Self::cp_put_local(&leader, key, value).await,
             CpRoute::Forward(addr) => Self::ok_or_err(
                 self.cp_forward(
@@ -1371,7 +1410,7 @@ impl ClientCtx {
                     ClientRequest::Put {
                         key,
                         value,
-                        table: None,
+                        table: Some(table.to_owned()),
                     },
                 )
                 .await,
@@ -1386,40 +1425,111 @@ impl ClientCtx {
     /// Forwarded if this node isn't the leader. Used by the CQL whole-partition
     /// delete; the DynamoDB edge instead writes a sentinel tombstone *value* via
     /// [`cp_write`](Self::cp_write).
-    pub(crate) async fn cp_delete(&self, key: Vec<u8>) -> Result<(), String> {
-        match self.cp_route(&key).await {
+    pub(crate) async fn cp_delete(&self, table: &str, key: Vec<u8>) -> Result<(), String> {
+        match self.cp_route(table, &key).await {
             CpRoute::Local(leader) => Self::cp_delete_local(&leader, key).await,
             CpRoute::Forward(addr) => Self::ok_or_err(
-                self.cp_forward(addr, ClientRequest::Delete { key, table: None })
-                    .await,
+                self.cp_forward(
+                    addr,
+                    ClientRequest::Delete {
+                        key,
+                        table: Some(table.to_owned()),
+                    },
+                )
+                .await,
                 "forwarded CP delete",
             ),
             CpRoute::None => Err("no CP group leader reachable".into()),
         }
     }
 
-    /// Linearizable CP range **scan** over `[start, end)` up to `limit` keys (ADR
-    /// 0017): ReadIndex on the group leader, forwarded if this node isn't it. The
-    /// CP read primitive behind the DynamoDB `Query`/`Scan` + CQL multi-row reads.
-    ///
-    /// Routes to the tablet owning `start`. Today the cluster has one whole-keyspace
-    /// tablet, so a scan always stays within it; once a tablet split makes a range
-    /// span tablets, this fans out across the overlapping tablets and merges (a
-    /// Phase 2 follow-on with multi-tablet hosting).
+    /// Linearizable CP range **scan** of `table` over `[start, end)` up to `limit`
+    /// keys (ADR 0017/0023): a **per-table fan-out**. The scan is split across the
+    /// `table`'s tablets whose token sub-range overlaps `[start, end)` (token order),
+    /// each scanned on its own group leader (ReadIndex, forwarded if this node isn't
+    /// it) and merged — so the result is in token order, the only order a hash ring
+    /// offers. A freshly created table has a single whole-ring tablet, so the loop
+    /// runs once; a split table fans out across its halves.
     pub(crate) async fn cp_scan(
         &self,
+        table: &str,
         start: Vec<u8>,
-        end: Vec<u8>,
+        end: Option<Vec<u8>>,
         limit: Option<usize>,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
-        match self.cp_route(&start).await {
+        // The table's tablets overlapping [start, end), in token (range.start) order.
+        // `end == None` is unbounded above (a whole-table scan).
+        let mut ranges: Vec<KeyRange> = self
+            .raft
+            .metadata()
+            .tablets_for_table(table)
+            .map(|(_, t)| t.range.clone())
+            .filter(|r| {
+                // [r.start, r.end) overlaps [start, end), each upper bound optional.
+                end.as_deref().is_none_or(|e| r.start.as_slice() < e)
+                    && r.end.as_deref().is_none_or(|re| start.as_slice() < re)
+            })
+            .collect();
+        ranges.sort();
+        let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for r in ranges {
+            if let Some(l) = limit {
+                if out.len() >= l {
+                    break;
+                }
+            }
+            // Clip the scan window to this tablet's sub-range; the exclusive upper
+            // bound is the lesser of the tablet's end and the scan's end (None = ∞).
+            let sub_start = start.clone().max(r.start);
+            let sub_end: Option<Vec<u8>> = match (r.end, &end) {
+                (None, e) => e.clone(),
+                (Some(re), None) => Some(re),
+                (Some(re), Some(e)) => Some(re.min(e.clone())),
+            };
+            if let Some(se) = &sub_end {
+                if sub_start.as_slice() >= se.as_slice() {
+                    continue;
+                }
+            }
+            let remaining = limit.map(|l| l - out.len());
+            out.extend(
+                self.cp_scan_one(table, sub_start, sub_end, remaining)
+                    .await?,
+            );
+        }
+        if let Some(l) = limit {
+            out.truncate(l);
+        }
+        Ok(out)
+    }
+
+    /// Scan a single tablet's sub-range on its group leader (the body the fan-out
+    /// [`cp_scan`](Self::cp_scan) calls per overlapping tablet). `start` resolves to
+    /// exactly one tablet of `table`, so it routes/forwards like any other CP op.
+    /// `end == None` is unbounded above (the last tablet of a whole-table scan).
+    async fn cp_scan_one(
+        &self,
+        table: &str,
+        start: Vec<u8>,
+        end: Option<Vec<u8>>,
+        limit: Option<usize>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
+        match self.cp_route(table, &start).await {
             CpRoute::Local(leader) => leader
-                .linearizable_scan(&start, &end, limit)
+                .linearizable_scan(&start, end.as_deref(), limit)
                 .await
                 .ok_or_else(|| "CP group leader moved; retry".into()),
             CpRoute::Forward(addr) => {
                 match self
-                    .cp_forward(addr, ClientRequest::Scan { start, end, limit })
+                    .cp_forward(
+                        addr,
+                        ClientRequest::Scan {
+                            start,
+                            end,
+                            limit,
+                            table: Some(table.to_owned()),
+                        },
+                    )
                     .await
                 {
                     ClientResponse::Pairs(p) => Ok(p),
@@ -1492,8 +1602,15 @@ impl ClientCtx {
 
     /// Route a CP-mode **write** for the plain client API (returns a wire
     /// [`ClientResponse`]). Thin adapter over [`cp_write`](Self::cp_write).
-    async fn cp_put(&self, key: Vec<u8>, value: Vec<u8>) -> ClientResponse {
-        match self.cp_write(key, value).await {
+    async fn cp_put(&self, table: &str, key: Vec<u8>, value: Vec<u8>) -> ClientResponse {
+        // Auto-provision the table's tablet on first write (ADR 0023): the raw KV
+        // client names a table but issues no DDL, so stand one up on demand.
+        if !self.raft.metadata().has_table_tablet(table) {
+            if let Err(e) = self.provision_tablet(table).await {
+                return ClientResponse::Error(e);
+            }
+        }
+        match self.cp_write(table, key, value).await {
             Ok(()) => ClientResponse::PutOk,
             Err(e) => ClientResponse::Error(e),
         }
@@ -1501,8 +1618,12 @@ impl ClientCtx {
 
     /// Route a CP-mode **read** for the plain client API (returns a wire
     /// [`ClientResponse`]). Thin adapter over [`cp_read`](Self::cp_read).
-    async fn cp_get(&self, key: Vec<u8>) -> ClientResponse {
-        match self.cp_read(key).await {
+    async fn cp_get(&self, table: &str, key: Vec<u8>) -> ClientResponse {
+        // A table with no tablet has no data (ADR 0023) — absent, no routing wait.
+        if !self.raft.metadata().has_table_tablet(table) {
+            return ClientResponse::Value(None);
+        }
+        match self.cp_read(table, key).await {
             Ok(v) => ClientResponse::Value(v),
             Err(e) => ClientResponse::Error(e),
         }
@@ -1562,19 +1683,75 @@ impl ClientCtx {
         }
     }
 
-    /// This node's leader handle for the tablet owning `key`, if it hosts it and
-    /// leads — the local serve target for a forwarded op.
-    fn cp_leader_for(&self, key: &[u8]) -> Option<CpGroup> {
-        self.tablet_for(key).and_then(|t| self.edge.cp_leader(t))
+    /// This node's leader handle for the tablet of `table` owning `key`, if it hosts
+    /// it and leads — the local serve target for a forwarded op.
+    fn cp_leader_for(&self, table: &str, key: &[u8]) -> Option<CpGroup> {
+        self.tablet_for(table, key)
+            .and_then(|t| self.edge.cp_leader(t))
+    }
+
+    /// Provision the **first tablet** of `table` (ADR 0023): a fresh cluster has no
+    /// data tablet, so `CreateTable` stands one up — a single tablet covering the
+    /// whole token ring, scoped to `table`, which splits on demand as it grows. The
+    /// replica set is the first `min(N, RF)` `Active` CP members. Relays
+    /// `CreateTablet` to the control leader and waits until it appears, then attaches
+    /// an RF `SetTabletPolicy` (so the reconciler auto-replaces a `Down` replica) on
+    /// the committed tablet id. Idempotent + race-safe: the state machine admits only
+    /// one `CreateTablet` per table, so concurrent callers converge on one tablet.
+    pub(crate) async fn provision_tablet(&self, table: &str) -> Result<(), String> {
+        let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
+        loop {
+            let meta = self.raft.metadata();
+            if let Some((&tablet, t)) = meta.tablets_for_table(table).next() {
+                // The tablet exists; ensure its RF policy is set, then we're done. The
+                // caller's op routes through `cp_route`, which itself waits for the
+                // group to form/elect (`CLIENT_TIMEOUT`), so provisioning need not
+                // block on serveability here.
+                if meta.policies.contains_key(&tablet) {
+                    return Ok(());
+                }
+                self.propose_schema(&MetaCommand::SetTabletPolicy {
+                    tablet,
+                    policy: Some(PlacementPolicy::simple("cp-rf", t.replicas.len())),
+                })
+                .await;
+            } else {
+                // No tablet yet: pick the first min(N, RF) Active CP members and
+                // propose its creation toward the control leader.
+                let mut replicas: Vec<NodeId> = meta
+                    .members
+                    .iter()
+                    .filter(|(_, m)| m.status == NodeStatus::Active)
+                    .map(|(id, _)| *id)
+                    .collect();
+                replicas.truncate(MAX_REPLICATION_FACTOR);
+                if !replicas.is_empty() {
+                    self.propose_schema(&MetaCommand::CreateTablet {
+                        tablet: meta.next_free_tablet_id(),
+                        table: Some(table.to_owned()),
+                        range: KeyRange::whole(),
+                        replicas,
+                    })
+                    .await;
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err("table tablet did not provision in time".into());
+            }
+            tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+        }
     }
 
     /// Serve a **forwarded** CP op locally: this node must lead the op's tablet (it
-    /// does not re-forward — bounding routing to one hop). The op's key resolves to
-    /// its owning tablet, then to that tablet's leader on this node.
+    /// does not re-forward — bounding routing to one hop). The op's `(table, key)`
+    /// resolves to its owning tablet, then to that tablet's leader on this node.
     async fn cp_serve_forwarded(&self, inner: ClientRequest) -> ClientResponse {
         match inner {
-            ClientRequest::Put { key, value, .. } => {
-                let Some(leader) = self.cp_leader_for(&key) else {
+            ClientRequest::Put { key, value, table } => {
+                let Some(table) = table else {
+                    return ClientResponse::Error(NO_TABLE.into());
+                };
+                let Some(leader) = self.cp_leader_for(&table, &key) else {
                     return ClientResponse::Error("forwarded CP op: not the leader here".into());
                 };
                 match Self::cp_put_local(&leader, key, value).await {
@@ -1582,12 +1759,20 @@ impl ClientCtx {
                     Err(e) => ClientResponse::Error(e),
                 }
             }
-            ClientRequest::Get { key, .. } => match self.cp_leader_for(&key) {
-                Some(leader) => ClientResponse::Value(leader.linearizable_get(&key).await),
-                None => ClientResponse::Error("forwarded CP op: not the leader here".into()),
-            },
-            ClientRequest::Delete { key, .. } => {
-                let Some(leader) = self.cp_leader_for(&key) else {
+            ClientRequest::Get { key, table } => {
+                let Some(table) = table else {
+                    return ClientResponse::Error(NO_TABLE.into());
+                };
+                match self.cp_leader_for(&table, &key) {
+                    Some(leader) => ClientResponse::Value(leader.linearizable_get(&key).await),
+                    None => ClientResponse::Error("forwarded CP op: not the leader here".into()),
+                }
+            }
+            ClientRequest::Delete { key, table } => {
+                let Some(table) = table else {
+                    return ClientResponse::Error(NO_TABLE.into());
+                };
+                let Some(leader) = self.cp_leader_for(&table, &key) else {
                     return ClientResponse::Error("forwarded CP op: not the leader here".into());
                 };
                 match Self::cp_delete_local(&leader, key).await {
@@ -1595,11 +1780,22 @@ impl ClientCtx {
                     Err(e) => ClientResponse::Error(e),
                 }
             }
-            ClientRequest::Scan { start, end, limit } => {
-                let Some(leader) = self.cp_leader_for(&start) else {
+            ClientRequest::Scan {
+                start,
+                end,
+                limit,
+                table,
+            } => {
+                let Some(table) = table else {
+                    return ClientResponse::Error(NO_TABLE.into());
+                };
+                let Some(leader) = self.cp_leader_for(&table, &start) else {
                     return ClientResponse::Error("forwarded CP op: not the leader here".into());
                 };
-                match leader.linearizable_scan(&start, &end, limit).await {
+                match leader
+                    .linearizable_scan(&start, end.as_deref(), limit)
+                    .await
+                {
                     Some(p) => ClientResponse::Pairs(p),
                     None => ClientResponse::Error("CP group leader moved; retry".into()),
                 }
@@ -1711,42 +1907,23 @@ impl ClientCtx {
 /// node start; automatic CP failure-detection / reconfigure is later v1 work, so no
 /// `PlacementPolicy` is attached.
 async fn bootstrap(raft: RaftNode<ProdEnv>, raftkv_ids: Vec<NodeId>) {
-    let rf = raftkv_ids.len().min(MAX_REPLICATION_FACTOR);
-    let replicas: Vec<NodeId> = raftkv_ids.iter().copied().take(rf).collect();
     loop {
         if raft.is_leader() {
+            // Register the CP `raftkv` ids as `Active` members — the cluster's data
+            // nodes (the control-group ids are only the metadata consensus group).
+            // No data tablet is created here (ADR 0023): a fresh cluster has zero
+            // data tablets; the first `CreateTable` provisions a table-scoped tablet
+            // (`ClientCtx::provision_tablet`), and the per-node join-host loop stands
+            // its group up. Idempotent: only members not yet present are proposed.
             let meta = raft.metadata();
-            if !meta.tablets.contains_key(&TABLET) {
-                // Members + tablet replicas are the CP `raftkv` ids — the nodes that
-                // actually hold data; the control-group ids are only the Raft
-                // consensus group.
-                for &node in &raftkv_ids {
+            for &node in &raftkv_ids {
+                if !meta.members.contains_key(&node) {
                     raft.propose(MetaCommand::UpsertMember {
                         node,
                         labels: BTreeMap::new(),
                         status: NodeStatus::Active,
                     });
                 }
-                raft.propose(MetaCommand::CreateTablet {
-                    tablet: TABLET,
-                    // The bootstrap tablet is the legacy whole-keyspace fallback
-                    // (`table: None`): it serves any table whose key block has not
-                    // been carved into its own table-scoped tablet (ADR 0023). A
-                    // `CreateTable` provisions a table-scoped tablet by splitting
-                    // this group at the table's block boundary.
-                    table: None,
-                    range: KeyRange::whole(),
-                    replicas: replicas.clone(),
-                });
-            } else if !meta.policies.contains_key(&TABLET) {
-                // The tablet exists but has no policy yet — a separate idempotent step
-                // (the create above is async, so the policy lands a tick later). The
-                // RF policy lets the reconciler replace a `Down` replica with a spare
-                // (D1); it requires no labels, so any Active member is eligible.
-                raft.propose(MetaCommand::SetTabletPolicy {
-                    tablet: TABLET,
-                    policy: Some(PlacementPolicy::simple("cp-rf", rf)),
-                });
             }
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -2033,47 +2210,63 @@ async fn cp_reconfigure_loop(ctx: ClientCtx) {
 }
 
 /// How often the join-host loop polls the tablet map for a tablet newly placed on
-/// this node. Same cadence as the reconfigure loop — they converge a replica move
-/// together (this node stands the group up; the leader adds it as a voter).
-const CP_JOIN_HOST_INTERVAL: Duration = Duration::from_millis(500);
+/// this node. Snappy enough (ADR 0023) that a freshly provisioned table tablet is
+/// hosted + elects promptly so the `CreateTable`/first-write that provisioned it can
+/// serve, but not so tight that polling (a `Metadata` clone per tick on every node)
+/// adds contention under heavy parallel load.
+const CP_JOIN_HOST_INTERVAL: Duration = Duration::from_millis(250);
 
 /// The per-node **CP join-host loop** (D1): when the placement reconciler adds this
 /// node to a tablet's replica set (e.g. picking it as the spare for a `Down`
 /// replica), stand up an **empty** co-resident group for that tablet so the group's
 /// leader can add it as a voter and catch it up via `InstallSnapshot`.
 ///
-/// Gated on **`epoch > INITIAL`**: a freshly *split* tablet is at `Epoch::INITIAL`
-/// and is seeded with its handed-off data by the split hook on its original replicas
-/// — starting it *empty* here would lose that data, so the loop never touches an
-/// INITIAL-epoch tablet (the bootstrap tablet is also hosted at start, not here). A
-/// reconfigure bumps the epoch past INITIAL, which is exactly the "this node was
-/// added as a fresh replica" signal. The shared `hosting` claim set (with the split
-/// hook + re-host) prevents double-hosting; `edge.local_cp` skips a tablet already
-/// hosted (e.g. the bootstrap tablet on an original replica).
-///
-/// The new member starts with `all_nodes` = the other members **excluding itself**,
-/// so it is a quiet non-voter until the leader's `change_membership` adds it (a node
-/// inside its own initial config could campaign — see the `animus-cp-data` membership
-/// gotcha). On restart it instead recovers its config from its own WAL.
+/// Hosts (ADR 0023): a freshly **provisioned** table tablet (`INITIAL`, whole-ring
+/// range — `cp_join_host` forms it with the full voter config so it elects), or a
+/// **joined** replica (`epoch > INITIAL` — the reconciler placed this node into an
+/// existing group; it starts as a quiet non-voter until the leader adds it). It
+/// **skips** a fresh *split* child (`INITIAL` + non-whole range): that is seeded with
+/// its handed-off data by the split hook on its original replicas, so starting it
+/// empty here would lose data. On a restart `cp_join_host` re-forms from the on-disk
+/// engine (full config when it has data). Double-hosting is prevented **per node** by
+/// the `minted` claim set (shared with the split hook + re-host), not `edge.local_cp`
+/// (which is shared across nodes in an in-process `--cluster N` run).
 async fn cp_join_host_loop(host: CpHostCtx) {
     loop {
         tokio::time::sleep(CP_JOIN_HOST_INTERVAL).await;
         let tablets = host.ctx.raft.metadata().tablets;
         for (tablet, t) in tablets {
-            if t.epoch <= Epoch::INITIAL || !t.replicas.contains(&host.base_id) {
+            if !t.replicas.contains(&host.base_id) {
                 continue;
             }
-            if host.ctx.edge.local_cp(tablet).is_some() {
-                continue; // already hosting (bootstrap tablet, or a prior iteration)
+            // Host an **empty** group for a freshly *provisioned* table tablet (ADR
+            // 0023: a `CreateTable` tablet starts at `INITIAL` with the whole token
+            // ring) or a *joined* replica (`epoch > INITIAL` — the reconciler placed
+            // this node into an existing tablet's set). **Skip a fresh split child**
+            // (`INITIAL` + a non-whole range): its data is seeded by the split hook on
+            // its original replicas, so starting it empty here would lose it. On a
+            // restart `LsmEngine::open` in `cp_join_host` recovers the on-disk engine,
+            // so re-hosting a provisioned tablet here does not start it truly empty.
+            if t.epoch <= Epoch::INITIAL && t.range != KeyRange::whole() {
+                continue;
             }
-            // Claim once (shared with the split hook / re-host).
+            // Dedup **per node** via the `minted` claim set (shared with the split
+            // hook + re-host on *this* node) — NOT via `edge.local_cp`, which in an
+            // in-process `--cluster N` run is a **shared** `ClusterEdgeState`: it
+            // would report *another* node's just-hosted group and make this node skip,
+            // leaving a freshly provisioned tablet hosted on only one replica (no
+            // majority → no election → "no CP group leader reachable"). The minted set
+            // is genuinely per-node, so it dedups correctly in both deployment modes.
             {
                 let mut h = host.minted.lock().expect("hosting set poisoned");
                 if !h.insert(tablet) {
                     continue;
                 }
             }
-            cp_join_host(&host, tablet, &t.replicas).await;
+            // A fresh table tablet (still at INITIAL) is forming for the first time →
+            // start voting with the full config; a bumped epoch means this node is
+            // *joining* an existing group → start as a quiet non-voter.
+            cp_join_host(&host, tablet, &t.replicas, t.epoch <= Epoch::INITIAL).await;
         }
     }
 }
@@ -2083,13 +2276,18 @@ async fn cp_join_host_loop(host: CpHostCtx) {
 /// `raftkv` id, hosted on the **main** `raftkv` env; a split tablet's is derived, so
 /// it mints a co-resident **sibling**. The group carries its own split hook (D3). On
 /// a transient engine-open failure the tablet is un-claimed so a later tick retries.
-async fn cp_join_host(host: &CpHostCtx, tablet: TabletId, replicas: &[NodeId]) {
+async fn cp_join_host(
+    host: &CpHostCtx,
+    tablet: TabletId,
+    replicas: &[NodeId],
+    initial_formation: bool,
+) {
     let member = cp_member_id(host.base_id, tablet);
-    // Quiet non-voter: start knowing the *other* members, not itself.
-    let others: Vec<NodeId> = cp_members_for(tablet, replicas)
-        .into_iter()
-        .filter(|&id| id != member)
-        .collect();
+    let all_members = cp_members_for(tablet, replicas);
+    // The **full** member config (every replica, including self) vs the quiet
+    // **non-voter** config (the others, excluding self):
+    let full: Vec<NodeId> = all_members.iter().copied().collect();
+    let others: Vec<NodeId> = full.iter().copied().filter(|&id| id != member).collect();
     // Bootstrap tablet -> the main env (member id == base id); split tablet -> a
     // sibling minted for the derived member id.
     let (env, prefix) = if tablet == TABLET {
@@ -2102,9 +2300,23 @@ async fn cp_join_host(host: &CpHostCtx, tablet: TabletId, replicas: &[NodeId]) {
     };
     let addr = env.local_addr();
     let hook = cp_split_hook(host.clone());
+    // Choosing the start config (ADR 0023):
+    // - **Re-form with the full config** when this node is *forming* the group — a
+    //   freshly provisioned table tablet (`initial_formation`, at `INITIAL`), or a
+    //   **restart** of a tablet this node already hosts (its on-disk engine has data:
+    //   `latest_version() > 0`) — so a replica can campaign and the group elects with
+    //   no live leader. WAL recovery alone does **not** restore voter status from a
+    //   non-voter start, so the restart case must pass the full config explicitly.
+    // - **Join as a quiet non-voter** otherwise — a brand-new (empty) spare the
+    //   reconciler placed into an existing, already-led group, which must not campaign
+    //   until the leader adds it (`animus-cp-data` membership gotcha).
     let cp = match host.backend {
         StorageBackend::Lsm => match LsmEngine::open(env.clone(), &prefix).await {
-            Ok(lsm) => CpGroup::Lsm(RaftKvNode::start_with_split_hook(env, others, lsm, hook)),
+            Ok(lsm) => {
+                let reforming = initial_formation || lsm.latest_version() > 0;
+                let config = if reforming { full } else { others };
+                CpGroup::Lsm(RaftKvNode::start_with_split_hook(env, config, lsm, hook))
+            }
             Err(e) => {
                 tracing::error!(?e, tablet = tablet.0, "CP join-host: opening tablet LSM");
                 host.minted
@@ -2114,12 +2326,17 @@ async fn cp_join_host(host: &CpHostCtx, tablet: TabletId, replicas: &[NodeId]) {
                 return;
             }
         },
-        StorageBackend::Memory => CpGroup::Mem(RaftKvNode::start_with_split_hook(
-            env,
-            others,
-            MemoryEngine::new(),
-            hook,
-        )),
+        // Memory backend keeps nothing across a restart, so "has data" never applies;
+        // the epoch-based `initial_formation` decides.
+        StorageBackend::Memory => {
+            let config = if initial_formation { full } else { others };
+            CpGroup::Mem(RaftKvNode::start_with_split_hook(
+                env,
+                config,
+                MemoryEngine::new(),
+                hook,
+            ))
+        }
     };
     host.ctx.edge.register_raftkv(tablet, cp);
     host.ctx.register_cp_addr(member, addr.to_string()).await;
@@ -2205,19 +2422,35 @@ async fn handle_client(mut stream: TcpStream, ctx: ClientCtx) -> std::io::Result
     while let Some(request) = read_frame::<ClientRequest>(&mut stream).await? {
         let response = match request {
             ClientRequest::Status => ClientResponse::Status(ctx.raft.metadata()),
-            // v1 (ADR 0019): all data ops route to the leaderful CP per-tablet Raft
-            // group (ADR 0017 #3a). The optional `table` no longer selects a plane
-            // (there is only the CP plane); the single CP group covers the keyspace.
-            ClientRequest::Put { key, value, .. } => ctx.cp_put(key, value).await,
-            ClientRequest::Get { key, .. } => ctx.cp_get(key).await,
-            ClientRequest::Scan { start, end, limit } => match ctx.cp_scan(start, end, limit).await
-            {
-                Ok(pairs) => ClientResponse::Pairs(pairs),
-                Err(e) => ClientResponse::Error(e),
+            // All data ops route to the leaderful CP per-tablet Raft group (ADR 0017
+            // #3a), scoped to the named table (ADR 0023). Every key must name a table
+            // — there is no unscoped/whole-keyspace tablet — so a `None` table errors.
+            ClientRequest::Put { key, value, table } => match table {
+                Some(table) => ctx.cp_put(&table, key, value).await,
+                None => ClientResponse::Error(NO_TABLE.into()),
             },
-            ClientRequest::Delete { key, .. } => match ctx.cp_delete(key).await {
-                Ok(()) => ClientResponse::PutOk,
-                Err(e) => ClientResponse::Error(e),
+            ClientRequest::Get { key, table } => match table {
+                Some(table) => ctx.cp_get(&table, key).await,
+                None => ClientResponse::Error(NO_TABLE.into()),
+            },
+            ClientRequest::Scan {
+                start,
+                end,
+                limit,
+                table,
+            } => match table {
+                Some(table) => match ctx.cp_scan(&table, start, end, limit).await {
+                    Ok(pairs) => ClientResponse::Pairs(pairs),
+                    Err(e) => ClientResponse::Error(e),
+                },
+                None => ClientResponse::Error(NO_TABLE.into()),
+            },
+            ClientRequest::Delete { key, table } => match table {
+                Some(table) => match ctx.cp_delete(&table, key).await {
+                    Ok(()) => ClientResponse::PutOk,
+                    Err(e) => ClientResponse::Error(e),
+                },
+                None => ClientResponse::Error(NO_TABLE.into()),
             },
             // Admin: split a CP tablet (Phase 2.2 / D2 cross-process).
             ClientRequest::SplitTablet { tablet, split_key } => {

@@ -31,7 +31,7 @@ async fn await_bootstrap(nodes: &[Node]) {
     let ready = async {
         loop {
             let leader = nodes.iter().any(Node::is_control_leader);
-            let everyone_has_tablet = nodes.iter().all(|n| !n.metadata().tablets.is_empty());
+            let everyone_has_tablet = nodes.iter().all(|n| !n.metadata().members.is_empty());
             if leader && everyone_has_tablet {
                 return;
             }
@@ -68,12 +68,19 @@ async fn assembled_node_handles_concurrent_client_load_without_deadlock() {
                     ClientRequest::Put {
                         key: key.clone(),
                         value: value.clone(),
-                        table: None,
+                        table: Some("kv".to_string()),
                     },
                 )
                 .await;
                 assert!(matches!(put, ClientResponse::PutOk), "put failed: {put:?}");
-                let got = call(addr, ClientRequest::Get { key, table: None }).await;
+                let got = call(
+                    addr,
+                    ClientRequest::Get {
+                        key,
+                        table: Some("kv".to_string()),
+                    },
+                )
+                .await;
                 assert_eq!(got, ClientResponse::Value(Some(value)));
             }
         }));

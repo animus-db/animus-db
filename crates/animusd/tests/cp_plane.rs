@@ -46,7 +46,7 @@ async fn await_bootstrap(nodes: &[Node]) {
     let ready = async {
         loop {
             if nodes.iter().any(Node::is_control_leader)
-                && nodes.iter().all(|n| !n.metadata().tablets.is_empty())
+                && nodes.iter().all(|n| !n.metadata().members.is_empty())
             {
                 return;
             }
@@ -130,7 +130,7 @@ async fn reads_and_writes_route_through_the_raft_group() {
         ClientRequest::Put {
             key: b"u".to_vec(),
             value: b"u-value".to_vec(),
-            table: None,
+            table: Some("kv".to_string()),
         },
     )
     .await;
@@ -142,7 +142,7 @@ async fn reads_and_writes_route_through_the_raft_group() {
         addr2,
         ClientRequest::Get {
             key: b"u".to_vec(),
-            table: None,
+            table: Some("kv".to_string()),
         },
     )
     .await;
@@ -228,7 +228,7 @@ async fn cp_tablet_splits_and_both_halves_serve() {
                     ClientRequest::Put {
                         key: key.to_vec(),
                         value: value.to_vec(),
-                        table: None,
+                        table: Some("kv".to_string()),
                     },
                 )
                 .await
@@ -284,7 +284,7 @@ async fn cp_tablet_splits_and_both_halves_serve() {
                 nodes[2].client_addr(),
                 ClientRequest::Get {
                     key: b"k9".to_vec(),
-                    table: None,
+                    table: Some("kv".to_string()),
                 },
             )
             .await;
@@ -303,7 +303,7 @@ async fn cp_tablet_splits_and_both_halves_serve() {
         addr0,
         ClientRequest::Get {
             key: b"k1".to_vec(),
-            table: None,
+            table: Some("kv".to_string()),
         },
     )
     .await;
@@ -315,7 +315,7 @@ async fn cp_tablet_splits_and_both_halves_serve() {
         nodes[1].client_addr(),
         ClientRequest::Get {
             key: b"k7".to_vec(),
-            table: None,
+            table: Some("kv".to_string()),
         },
     )
     .await;
@@ -353,7 +353,7 @@ async fn tablet_auto_splits_when_it_grows() {
                     ClientRequest::Put {
                         key: key.clone(),
                         value: value.clone(),
-                        table: None,
+                        table: Some("kv".to_string()),
                     },
                 )
                 .await
@@ -394,7 +394,7 @@ async fn tablet_auto_splits_when_it_grows() {
                     nodes[2].client_addr(),
                     ClientRequest::Get {
                         key: k.clone(),
-                        table: None,
+                        table: Some("kv".to_string()),
                     },
                 )
                 .await;

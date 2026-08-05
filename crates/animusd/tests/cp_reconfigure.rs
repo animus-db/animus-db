@@ -38,7 +38,7 @@ async fn await_bootstrap(nodes: &[Node]) {
     let ready = async {
         loop {
             if nodes.iter().any(Node::is_control_leader)
-                && nodes.iter().all(|node| !node.metadata().tablets.is_empty())
+                && nodes.iter().all(|node| !node.metadata().members.is_empty())
             {
                 return;
             }
@@ -193,6 +193,11 @@ async fn cp_group_follows_tablet_replica_set() {
     await_bootstrap(&nodes).await;
     let raftkv_ids = config.raftkv_ids(); // [300, 301, 302]
 
+    // ADR 0023: a fresh cluster has no data tablet — provision the `kv` tablet by
+    // writing first, so the CP group forms (auto-provisioned on the first write).
+    let clients: Vec<SocketAddr> = config.nodes.iter().map(|a| a.client).collect();
+    put(&clients, b"k0", b"v0", 30).await;
+
     // Wait until the CP group has formed with all three voters and elected a leader
     // on some node.
     let leader_idx = {
@@ -308,7 +313,7 @@ async fn put(clients: &[SocketAddr], key: &[u8], value: &[u8], secs: u64) {
                     ClientRequest::Put {
                         key: key.to_vec(),
                         value: value.to_vec(),
-                        table: None,
+                        table: Some("kv".to_string()),
                     },
                 )
                 .await
@@ -332,7 +337,7 @@ async fn await_value(clients: &[SocketAddr], key: &[u8], want: &[u8], secs: u64)
                     c,
                     ClientRequest::Get {
                         key: key.to_vec(),
-                        table: None,
+                        table: Some("kv".to_string()),
                     },
                 )
                 .await
@@ -362,6 +367,10 @@ async fn failure_auto_replaces_replica_onto_spare() {
     let raftkv_ids = config.raftkv_ids(); // [300, 301, 302, 303]
     let spare = raftkv_ids[3];
     let clients: Vec<SocketAddr> = config.nodes.iter().map(|a| a.client).collect();
+
+    // ADR 0023: provision the `kv` tablet by writing first (no bootstrap tablet); it
+    // lands on the first RF=3 members (300..302), leaving 303 as the idle spare.
+    put(&clients, b"k0", b"v0", 30).await;
 
     // Wait for the group to form with 3 voters + a leader; write a key.
     let leader_idx = {

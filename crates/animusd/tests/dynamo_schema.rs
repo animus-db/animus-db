@@ -75,7 +75,7 @@ async fn await_cluster_bootstrap(nodes: &[Node]) {
     let ready = async {
         loop {
             let leader = nodes.iter().any(Node::is_control_leader);
-            let everyone_has_tablet = nodes.iter().all(|n| !n.metadata().tablets.is_empty());
+            let everyone_has_tablet = nodes.iter().all(|n| !n.metadata().members.is_empty());
             if leader && everyone_has_tablet {
                 return;
             }
@@ -90,7 +90,7 @@ async fn await_cluster_bootstrap(nodes: &[Node]) {
 async fn await_node_bootstrap(node: &Node) {
     let ready = async {
         loop {
-            if node.is_control_leader() && !node.metadata().tablets.is_empty() {
+            if node.is_control_leader() && !node.metadata().members.is_empty() {
                 return;
             }
             sleep(Duration::from_millis(50)).await;

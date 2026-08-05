@@ -28,7 +28,7 @@ async fn await_bootstrap(nodes: &[Node]) {
     let ready = async {
         loop {
             if nodes.iter().any(Node::is_control_leader)
-                && nodes.iter().all(|n| !n.metadata().tablets.is_empty())
+                && nodes.iter().all(|n| !n.metadata().members.is_empty())
             {
                 return;
             }
@@ -49,7 +49,7 @@ async fn put(clients: &[SocketAddr], key: &[u8], value: &[u8]) {
                     ClientRequest::Put {
                         key: key.to_vec(),
                         value: value.to_vec(),
-                        table: None,
+                        table: Some("kv".to_string()),
                     },
                 )
                 .await
@@ -73,7 +73,7 @@ async fn await_value(clients: &[SocketAddr], key: &[u8], want: &[u8], secs: u64)
                     c,
                     ClientRequest::Get {
                         key: key.to_vec(),
-                        table: None,
+                        table: Some("kv".to_string()),
                     },
                 )
                 .await

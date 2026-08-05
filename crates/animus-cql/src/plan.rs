@@ -464,7 +464,7 @@ pub fn plan_insert(
     let pk_value = by_index
         .get(&pk_idx)
         .ok_or_else(|| PlanError::MissingPartitionKey(schema.pk_column().name.clone()))?;
-    let key = crate::query::data_key(&schema.name, &pk_value.to_key_bytes());
+    let key = crate::query::data_key(&pk_value.to_key_bytes());
 
     // Every clustering key must be present (a full primary key on INSERT).
     let mut clustering_values = Vec::new();
@@ -538,7 +538,7 @@ pub fn plan_update(
         });
     }
 
-    let key = crate::query::data_key(&schema.name, &pk_value.to_key_bytes());
+    let key = crate::query::data_key(&pk_value.to_key_bytes());
     Ok(UpdatePlan {
         table: schema.name.clone(),
         key,
@@ -568,7 +568,7 @@ pub fn plan_delete(
             got: binds.len(),
         });
     }
-    let key = crate::query::data_key(&schema.name, &pk_value.to_key_bytes());
+    let key = crate::query::data_key(&pk_value.to_key_bytes());
     // A full clustering key targets one row; anything shorter targets the whole
     // partition (CQL allows `DELETE FROM t WHERE pk = ?` to drop a partition).
     let clustering = if clustering_values.len() == schema.clustering_keys.len()
@@ -606,7 +606,7 @@ pub fn plan_select(
             got: binds.len(),
         });
     }
-    let key = crate::query::data_key(&schema.name, &pk_value.to_key_bytes());
+    let key = crate::query::data_key(&pk_value.to_key_bytes());
 
     let projection: Vec<ColumnSpec> = if sel.projection.is_empty() {
         (0..schema.columns.len())

@@ -568,8 +568,17 @@ async fn run_statement(
                     stream, "CREATED", "TABLE", &keyspace, &ct.table,
                 );
             }
-            match ctx.create_table_schema(control_name, control_schema).await {
+            match ctx
+                .create_table_schema(control_name.clone(), control_schema)
+                .await
+            {
                 Ok(()) => {
+                    // Provision the table's CP tablet (ADR 0023): one tablet over the
+                    // whole token ring, scoped to this table, stood up by the join-host
+                    // loop. Without it the table's data ops would have nowhere to route.
+                    if let Err(msg) = ctx.provision_tablet(&control_name).await {
+                        return response::error(stream, response::ERR_SERVER, &msg);
+                    }
                     response::schema_change_result(stream, "CREATED", "TABLE", &keyspace, &ct.table)
                 }
                 Err(msg) => response::error(stream, response::ERR_INVALID, &msg),
@@ -629,7 +638,7 @@ async fn run_statement(
             response::void_result(stream)
         }
         Statement::Insert(ins) => {
-            let (ks, _name, schema) = match resolve_table(
+            let (ks, name, schema) = match resolve_table(
                 ctx,
                 ins.keyspace.as_deref(),
                 session.keyspace.as_deref(),
@@ -642,12 +651,12 @@ async fn run_statement(
                 return response::error(stream, response::ERR_SERVER, "corrupt schema");
             };
             match animus_cql::plan_insert(&cat, Some(&ks), &ins, binds) {
-                Ok(plan) => run_insert(ctx, stream, plan).await,
+                Ok(plan) => run_insert(ctx, stream, plan, &name).await,
                 Err(e) => response::error(stream, response::ERR_INVALID, &e.to_string()),
             }
         }
         Statement::Update(upd) => {
-            let (ks, _name, schema) = match resolve_table(
+            let (ks, name, schema) = match resolve_table(
                 ctx,
                 upd.keyspace.as_deref(),
                 session.keyspace.as_deref(),
@@ -664,12 +673,12 @@ async fn run_statement(
                 None => return response::error(stream, response::ERR_SERVER, "corrupt schema"),
             };
             match animus_cql::plan_update(&cat, Some(&ks), &upd, binds) {
-                Ok(plan) => run_update(ctx, stream, plan, &cql_schema).await,
+                Ok(plan) => run_update(ctx, stream, plan, &cql_schema, &name).await,
                 Err(e) => response::error(stream, response::ERR_INVALID, &e.to_string()),
             }
         }
         Statement::Delete(del) => {
-            let (ks, _name, schema) = match resolve_table(
+            let (ks, name, schema) = match resolve_table(
                 ctx,
                 del.keyspace.as_deref(),
                 session.keyspace.as_deref(),
@@ -686,12 +695,12 @@ async fn run_statement(
                 None => return response::error(stream, response::ERR_SERVER, "corrupt schema"),
             };
             match animus_cql::plan_delete(&cat, Some(&ks), &del, binds) {
-                Ok(plan) => run_delete(ctx, stream, plan, &cql_schema).await,
+                Ok(plan) => run_delete(ctx, stream, plan, &cql_schema, &name).await,
                 Err(e) => response::error(stream, response::ERR_INVALID, &e.to_string()),
             }
         }
         Statement::Select(sel) => {
-            let (ks, _name, schema) = match resolve_table(
+            let (ks, name, schema) = match resolve_table(
                 ctx,
                 sel.keyspace.as_deref(),
                 session.keyspace.as_deref(),
@@ -708,7 +717,7 @@ async fn run_statement(
                 None => return response::error(stream, response::ERR_SERVER, "corrupt schema"),
             };
             match animus_cql::plan_select(&cat, Some(&ks), &sel, binds) {
-                Ok(plan) => run_select(ctx, stream, plan, &cql_schema).await,
+                Ok(plan) => run_select(ctx, stream, plan, &cql_schema, &name).await,
                 Err(e) => response::error(stream, response::ERR_INVALID, &e.to_string()),
             }
         }
@@ -782,12 +791,12 @@ fn is_error_frame(reply: &[u8]) -> bool {
 /// Execute a planned `INSERT` as a partition read-modify-write: read the current
 /// partition, upsert this row by its clustering key, and write the partition
 /// back. Reply `RESULT/Void`.
-async fn run_insert(ctx: &ClientCtx, stream: i16, plan: InsertPlan) -> Vec<u8> {
+async fn run_insert(ctx: &ClientCtx, stream: i16, plan: InsertPlan, table: &str) -> Vec<u8> {
     // The partition format stores each row's clustering blob verbatim, so the
     // read-modify-write does not need the schema: existing rows round-trip
     // untyped (their blob is the map key) and this new row is merged by its
     // clustering bytes.
-    let result = mutate_partition(ctx, &plan.key, |part| {
+    let result = mutate_partition(ctx, table, &plan.key, |part| {
         part.rows.insert(plan.clustering.clone(), plan.row.clone());
     })
     .await;
@@ -799,8 +808,14 @@ async fn run_insert(ctx: &ClientCtx, stream: i16, plan: InsertPlan) -> Vec<u8> {
 
 /// Execute a planned `UPDATE`: read-modify-write the partition, applying the cell
 /// assignments over the addressed row (creating it if absent — CQL upsert).
-async fn run_update(ctx: &ClientCtx, stream: i16, plan: UpdatePlan, schema: &CqlSchema) -> Vec<u8> {
-    let result = mutate_partition_with_schema(ctx, &plan.key, schema, |part| {
+async fn run_update(
+    ctx: &ClientCtx,
+    stream: i16,
+    plan: UpdatePlan,
+    schema: &CqlSchema,
+    table: &str,
+) -> Vec<u8> {
+    let result = mutate_partition_with_schema(ctx, table, &plan.key, schema, |part| {
         let clustering_values = decode_clustering_for(&plan.clustering, schema);
         let row = part
             .rows
@@ -824,12 +839,18 @@ async fn run_update(ctx: &ClientCtx, stream: i16, plan: UpdatePlan, schema: &Cql
 /// partition; a partition-key-only delete removes the whole partition. When the
 /// partition becomes empty, the data-plane key is tombstoned (a data-plane
 /// `delete`); otherwise the remaining partition is written back.
-async fn run_delete(ctx: &ClientCtx, stream: i16, plan: DeletePlan, schema: &CqlSchema) -> Vec<u8> {
+async fn run_delete(
+    ctx: &ClientCtx,
+    stream: i16,
+    plan: DeletePlan,
+    schema: &CqlSchema,
+    table: &str,
+) -> Vec<u8> {
     // Read-modify-write the partition on the CP plane under the coord lock (which
     // serializes this node's RMWs so the read+write is atomic per node). The Raft
     // index is the MVCC version, so no client-assigned version is needed.
     let _guard = ctx.rmw_lock.lock().await;
-    let bytes = match ctx.cp_read(plan.key.clone()).await {
+    let bytes = match ctx.cp_read(table, plan.key.clone()).await {
         Ok(b) => b,
         Err(msg) => return response::error(stream, response::ERR_SERVER, &msg),
     };
@@ -845,9 +866,9 @@ async fn run_delete(ctx: &ClientCtx, stream: i16, plan: DeletePlan, schema: &Cql
     }
     let result = if part.is_empty() {
         // Whole partition gone → commit a CP tombstone so the key reads absent.
-        ctx.cp_delete(plan.key.clone()).await
+        ctx.cp_delete(table, plan.key.clone()).await
     } else {
-        ctx.cp_write(plan.key.clone(), part.encode()).await
+        ctx.cp_write(table, plan.key.clone(), part.encode()).await
     };
     match result {
         Ok(()) => response::void_result(stream),
@@ -858,8 +879,14 @@ async fn run_delete(ctx: &ClientCtx, stream: i16, plan: DeletePlan, schema: &Cql
 /// Execute a planned `SELECT`: quorum-read the partition, return every matching
 /// row (the clustering prefix filters; an empty prefix returns the whole
 /// partition) in clustering order as a typed `RESULT/Rows`.
-async fn run_select(ctx: &ClientCtx, stream: i16, plan: ReadPlan, schema: &CqlSchema) -> Vec<u8> {
-    let bytes = match ctx.cp_read(plan.key.clone()).await {
+async fn run_select(
+    ctx: &ClientCtx,
+    stream: i16,
+    plan: ReadPlan,
+    schema: &CqlSchema,
+    table: &str,
+) -> Vec<u8> {
+    let bytes = match ctx.cp_read(table, plan.key.clone()).await {
         Ok(v) => v,
         Err(msg) => return response::error(stream, response::ERR_SERVER, &msg),
     };
@@ -941,6 +968,7 @@ fn encode_typed(ty: CqlType, value: &CqlValue) -> Result<Vec<u8>, String> {
 /// partition (schema-agnostic on the write path), apply `mutate`, write it back.
 async fn mutate_partition(
     ctx: &ClientCtx,
+    table: &str,
     key: &[u8],
     mutate: impl FnOnce(&mut Partition),
 ) -> Result<(), String> {
@@ -950,7 +978,7 @@ async fn mutate_partition(
         partition_key: 0,
         clustering_keys: Vec::new(),
     };
-    mutate_partition_with_schema(ctx, key, &schema_agnostic, mutate).await
+    mutate_partition_with_schema(ctx, table, key, &schema_agnostic, mutate).await
 }
 
 /// As [`mutate_partition`] but decodes the partition against `schema` (so existing
@@ -961,14 +989,15 @@ async fn mutate_partition(
 /// node, and the Raft index is the MVCC version (no client-assigned version).
 async fn mutate_partition_with_schema(
     ctx: &ClientCtx,
+    table: &str,
     key: &[u8],
     schema: &CqlSchema,
     mutate: impl FnOnce(&mut Partition),
 ) -> Result<(), String> {
     let _guard = ctx.rmw_lock.lock().await;
-    let bytes = ctx.cp_read(key.to_vec()).await?;
+    let bytes = ctx.cp_read(table, key.to_vec()).await?;
     let mut part =
         Partition::decode(&bytes.unwrap_or_default(), schema).map_err(|e| e.to_string())?;
     mutate(&mut part);
-    ctx.cp_write(key.to_vec(), part.encode()).await
+    ctx.cp_write(table, key.to_vec(), part.encode()).await
 }

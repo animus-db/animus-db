@@ -461,14 +461,17 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
 
     /// A **linearizable range scan** via ReadIndex (ADR 0017 / v1): the live
     /// `(key, value)` pairs with `start <= key < end`, sorted by key, up to
-    /// `limit`. Same barrier as [`linearizable_get`](Self::linearizable_get) — only
-    /// the confirmed leader serves it, so a deposed leader returns `None` rather
-    /// than a stale/partial range. This is the CP read primitive the DynamoDB
-    /// `Query`/`Scan` and CQL `SELECT` edges use in place of the AP quorum scan.
+    /// `limit`. `end == None` is **unbounded above** — scan to the end of the
+    /// keyspace (ADR 0023: a per-table tablet's engine holds the whole table, so a
+    /// full-table scan has no finite upper bound). Same barrier as
+    /// [`linearizable_get`](Self::linearizable_get) — only the confirmed leader
+    /// serves it, so a deposed leader returns `None` rather than a stale/partial
+    /// range. This is the CP read primitive the DynamoDB `Query`/`Scan` and CQL
+    /// `SELECT` edges use in place of the AP quorum scan.
     pub async fn linearizable_scan(
         &self,
         start: &[u8],
-        end: &[u8],
+        end: Option<&[u8]>,
         limit: Option<usize>,
     ) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
         if !self.read_barrier().await {
@@ -480,7 +483,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             .await
             .ok()?
             .into_iter()
-            .filter(|(k, _)| k.as_slice() >= start && k.as_slice() < end)
+            .filter(|(k, _)| k.as_slice() >= start && end.is_none_or(|e| k.as_slice() < e))
             .map(|(k, vv)| (k, vv.value))
             .collect();
         pairs.sort_by(|a, b| a.0.cmp(&b.0));

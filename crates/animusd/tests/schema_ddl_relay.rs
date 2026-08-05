@@ -59,7 +59,7 @@ async fn bring_up(n: usize, dir: &std::path::Path) -> (Vec<Node>, animusd::Clust
     timeout(Duration::from_secs(20), async {
         loop {
             if nodes.iter().any(Node::is_control_leader)
-                && nodes.iter().all(|n| !n.metadata().tablets.is_empty())
+                && nodes.iter().all(|n| !n.metadata().members.is_empty())
             {
                 return;
             }

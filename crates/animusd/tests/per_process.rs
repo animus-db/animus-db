@@ -23,7 +23,7 @@ async fn await_bootstrap(nodes: &[Node]) {
     let ready = async {
         loop {
             if nodes.iter().any(Node::is_control_leader)
-                && nodes.iter().all(|n| !n.metadata().tablets.is_empty())
+                && nodes.iter().all(|n| !n.metadata().members.is_empty())
             {
                 return;
             }
@@ -85,7 +85,8 @@ async fn per_process_nodes_form_a_cluster_from_shared_config() {
     match call(client0, ClientRequest::Status).await {
         ClientResponse::Status(meta) => {
             assert_eq!(meta.members.len(), 3);
-            assert_eq!(meta.tablets.len(), 1);
+            // ADR 0023: no data tablet until the first write provisions one.
+            assert_eq!(meta.tablets.len(), 0);
         }
         other => panic!("unexpected status: {other:?}"),
     }
@@ -95,7 +96,7 @@ async fn per_process_nodes_form_a_cluster_from_shared_config() {
         ClientRequest::Put {
             key: b"k".to_vec(),
             value: b"v1".to_vec(),
-            table: None,
+            table: Some("kv".to_string()),
         },
     )
     .await;
@@ -107,7 +108,7 @@ async fn per_process_nodes_form_a_cluster_from_shared_config() {
             client1,
             ClientRequest::Get {
                 key: b"k".to_vec(),
-                table: None
+                table: Some("kv".to_string())
             }
         )
         .await,
@@ -118,7 +119,7 @@ async fn per_process_nodes_form_a_cluster_from_shared_config() {
         ClientRequest::Put {
             key: b"k".to_vec(),
             value: b"v2".to_vec(),
-            table: None,
+            table: Some("kv".to_string()),
         },
     )
     .await;
@@ -131,7 +132,7 @@ async fn per_process_nodes_form_a_cluster_from_shared_config() {
             client0,
             ClientRequest::Get {
                 key: b"k".to_vec(),
-                table: None
+                table: Some("kv".to_string())
             }
         )
         .await,

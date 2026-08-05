@@ -710,6 +710,10 @@ struct SeedReq {
     /// Synthetic value size in bytes (default 64).
     #[serde(default)]
     value_bytes: Option<usize>,
+    /// The table to seed into (ADR 0023: every key names a table). Default `seed`;
+    /// its tablet is provisioned up front if it does not exist yet.
+    #[serde(default)]
+    table: Option<String>,
 }
 
 /// `POST /admin/data/seed {count, start?, key_prefix?, value_bytes?}` — bulk-write
@@ -727,6 +731,11 @@ async fn action_data_seed(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
     let count = req.count.min(SEED_MAX_PER_REQUEST);
     let prefix = req.key_prefix.unwrap_or_else(|| "seed:".to_string());
     let value_bytes = req.value_bytes.unwrap_or(64).min(SEED_MAX_VALUE_BYTES);
+    let table = req.table.unwrap_or_else(|| "seed".to_string());
+    // Every key names a table (ADR 0023); make sure the seed table has a tablet.
+    if let Err(e) = ctx.provision_tablet(&table).await {
+        return (500, serde_json::json!({ "error": e }));
+    }
     let value = vec![b'x'; value_bytes];
 
     let mut written = 0u64;
@@ -739,6 +748,7 @@ async fn action_data_seed(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
             let key = format!("{prefix}{:012}", req.start + i + j).into_bytes();
             let val = value.clone();
             let c = ctx.clone();
+            let t = table.clone();
             // Retry transient write failures. A write racing a tablet **split** is
             // routed to the parent and truncated/tombstoned (the upper range moved
             // to the new child), so `cp_write` times out / reports "leader moved";
@@ -747,7 +757,7 @@ async fn action_data_seed(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
             set.spawn(async move {
                 let mut last = Ok(());
                 for attempt in 0..SEED_WRITE_ATTEMPTS {
-                    match c.cp_write(key.clone(), val.clone()).await {
+                    match c.cp_write(&t, key.clone(), val.clone()).await {
                         Ok(()) => return Ok(()),
                         Err(e) => {
                             last = Err(e);

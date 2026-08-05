@@ -2,8 +2,8 @@
 //!
 //! Usage:
 //!   animus status <node-addr>
-//!   animus put    <node-addr> <key> <value>
-//!   animus get    <node-addr> <key>
+//!   animus put    <node-addr> <table> <key> <value>
+//!   animus get    <node-addr> <table> <key>
 //!   animus admin  <subcommand> <admin-addr> [args...]
 //!
 //! `status`/`put`/`get` are a thin plain-TCP client over a node's request/reply
@@ -25,7 +25,7 @@ async fn main() -> ExitCode {
         Err(msg) => {
             eprintln!("animus: {msg}");
             eprintln!(
-                "\nusage:\n  animus status <node-addr>\n  animus put <node-addr> <key> <value>\n  animus get <node-addr> <key>\n{ADMIN_USAGE}"
+                "\nusage:\n  animus status <node-addr>\n  animus put <node-addr> <table> <key> <value>\n  animus get <node-addr> <table> <key>\n{ADMIN_USAGE}"
             );
             ExitCode::FAILURE
         }
@@ -52,19 +52,23 @@ async fn run(args: &[String]) -> Result<(), String> {
     let request = match cmd {
         "status" => ClientRequest::Status,
         "put" => {
-            let key = args.get(2).ok_or("put needs <key>")?;
-            let value = args.get(3).ok_or("put needs <value>")?;
+            // Every key names a table (ADR 0023): `put <addr> <table> <key> <value>`.
+            let table = args.get(2).ok_or("put needs <table>")?;
+            let key = args.get(3).ok_or("put needs <key>")?;
+            let value = args.get(4).ok_or("put needs <value>")?;
             ClientRequest::Put {
                 key: key.clone().into_bytes(),
                 value: value.clone().into_bytes(),
-                table: None,
+                table: Some(table.clone()),
             }
         }
         "get" => {
-            let key = args.get(2).ok_or("get needs <key>")?;
+            // `get <addr> <table> <key>`.
+            let table = args.get(2).ok_or("get needs <table>")?;
+            let key = args.get(3).ok_or("get needs <key>")?;
             ClientRequest::Get {
                 key: key.clone().into_bytes(),
-                table: None,
+                table: Some(table.clone()),
             }
         }
         other => return Err(format!("unknown command `{other}`")),

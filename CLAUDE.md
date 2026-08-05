@@ -571,6 +571,38 @@ cross-cutting ones. Prune/merge entries that become obsolete.
   hosting several protocol instances needs one `Env`/inbox/WAL *per instance*** (the
   inbox is single-consumer) — allocate a distinct id per (node, instance) and let
   the caller own that allocation policy. (`animus-consensus` `shard.rs`.)
+- **A *per-node* decision must dedup on *per-node* state, never on the shared
+  `ClusterEdgeState` — in `--cluster N` that edge is shared across nodes and silently
+  reports another node's state.** The CP join-host loop (ADR 0023 provisioning) gated
+  "already hosting this tablet?" on `edge.local_cp(tablet)`. In one-process-per-node
+  that is this node's view; in an in-process `--cluster N` run the edge is **shared**,
+  so as soon as *one* replica hosted a freshly provisioned tablet and registered it,
+  every other replica's loop saw it via `edge.local_cp` and **skipped** — leaving the
+  tablet hosted on a single replica, no majority, no election, "no CP group leader
+  reachable". The signature was **bimodal flakiness** (race: all replicas host iff
+  they poll before the first registers, ≈1.5 s; else one hosts and it stalls to the
+  timeout). Dedup on the genuinely per-node `minted` claim set instead. This is the
+  *hosting-path* instance of the documented "shared `--cluster` edge masks per-node"
+  gotcha — assume any `edge.*` read is cluster-wide in `--cluster N`. (`animusd`
+  `cp_join_host_loop`.)
+- **A Raft group *forming or re-forming* (no live leader) needs the full voter config;
+  only a *new spare joining a led group* starts as a non-voter — and the restart
+  signal is on-disk data, not the epoch.** WAL recovery does **not** restore voter
+  status from a non-voter `all_nodes` start, so a node re-hosting a tablet it already
+  has data for must pass the **full** config explicitly. Gating on epoch misfired: a
+  split bumps the original replicas' epoch, so a post-restart re-host of a split
+  parent looked like a "join" → non-voter → no election. Use `latest_version() > 0`
+  (engine has data ⟹ re-forming) as the signal. (ADR 0023, `animusd` `cp_join_host`.)
+- **With provisioning in band (a tablet's group forms on first access, not at
+  startup), a node that *is* a replica of a not-yet-hosted tablet must WAIT, not
+  forward.** Routing's "I host no replica → forward to any route" fallback misfires
+  during the formation window when a replica-to-be hasn't stood its group up yet — it
+  forwards to a node that doesn't host the leader → "forwarded CP op: not the leader
+  here". Gate the forward on "this node is **not** in the tablet's replica set"; a
+  replica waits for its own election. And **don't paper over formation latency with a
+  synchronous serve-wait on the provisioning path** — it made the first write block on
+  full formation (regressing a restart test); `cp_route` already waits, so provisioning
+  returns once the tablet is in `Metadata`. (ADR 0023, `animusd` `resolve_cp_route`.)
 
 ### Merge / integration workflow
 - **Run `cargo test --workspace` after *each* merge, not just at the end of a

@@ -37,7 +37,7 @@ async fn call(addr: SocketAddr, req: ClientRequest) -> ClientResponse {
 async fn await_bootstrap(node: &Node) {
     let ready = async {
         loop {
-            if node.is_control_leader() && !node.metadata().tablets.is_empty() {
+            if node.is_control_leader() && !node.metadata().members.is_empty() {
                 return;
             }
             sleep(Duration::from_millis(50)).await;
@@ -121,7 +121,7 @@ async fn data_survives_node_restart_on_disk() {
         ClientRequest::Put {
             key: b"durable".to_vec(),
             value: b"survives".to_vec(),
-            table: None,
+            table: Some("kv".to_string()),
         },
     )
     .await;
@@ -134,7 +134,7 @@ async fn data_survives_node_restart_on_disk() {
             client,
             ClientRequest::Get {
                 key: b"durable".to_vec(),
-                table: None,
+                table: Some("kv".to_string()),
             }
         )
         .await,
@@ -156,7 +156,7 @@ async fn data_survives_node_restart_on_disk() {
         client,
         ClientRequest::Get {
             key: b"durable".to_vec(),
-            table: None,
+            table: Some("kv".to_string()),
         },
     )
     .await;
@@ -172,7 +172,7 @@ async fn data_survives_node_restart_on_disk() {
         client,
         ClientRequest::Get {
             key: b"never".to_vec(),
-            table: None,
+            table: Some("kv".to_string()),
         },
     )
     .await;
@@ -203,7 +203,7 @@ async fn data_is_lost_on_restart_with_memory_backend() {
         ClientRequest::Put {
             key: b"volatile".to_vec(),
             value: b"gone".to_vec(),
-            table: None,
+            table: Some("kv".to_string()),
         },
     )
     .await;
@@ -221,7 +221,7 @@ async fn data_is_lost_on_restart_with_memory_backend() {
         client,
         ClientRequest::Get {
             key: b"volatile".to_vec(),
-            table: None,
+            table: Some("kv".to_string()),
         },
     )
     .await;
