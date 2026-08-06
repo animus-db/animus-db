@@ -1,7 +1,7 @@
 # ADR 0021 — Web dashboard over the admin JSON surface (observe + operator actions)
 
-- **Status:** Proposed
-- **Date:** 2026-08-04
+- **Status:** Accepted (implemented — follow-ups 1–4 shipped; 5 awaits ADR 0018, 6 on demand)
+- **Date:** 2026-08-04 (status updated 2026-08-06)
 
 ## Context
 

@@ -26,6 +26,30 @@ so the same code runs in production and under simulation with no branches.
   that distinguishes synced from un-synced bytes (a "crash" drops un-synced
   bytes), and a cooperative single-threaded run-queue.
 
+### Known fidelity limits (audit, 2026-08-06)
+
+The seam is honoured throughout, but both envs are weaker than the paragraph
+above reads, and the gaps are exactly where prod-only bugs have already hidden:
+
+- **`ProdEnv` durability:** `sync` is a file-fd `sync_all` only — neither
+  `append`'s file *creation* nor `replace`'s *rename* fsyncs the parent
+  **directory**, so a just-created WAL segment or a completed manifest swap can
+  be lost by a power crash even after `sync`/`replace` returned. Closing this
+  (directory fsync after create/rename) is a known follow-up.
+- **`SimEnv` disk faults:** the sim disk never returns an error, never leaves a
+  *partial* (torn) tail on crash — it drops the whole un-synced buffer
+  atomically — and cannot corrupt a byte. Storage error-handling, torn-record
+  recovery, and checksum-mismatch paths are therefore unreachable under
+  simulation; opt-in, seed-driven disk fault injection is the known follow-up.
+- **Network:** reordering is emergent from per-message jitter (there is no
+  explicit reorder/duplication knob), and all nodes share **one** virtual
+  clock — per-node skew/drift, listed in the Context as a target bug class, is
+  not yet modeled.
+- **Threading:** the sim is single-threaded and cooperative, so it proves logic
+  and ordering, never real-thread liveness — any concurrency primitive needs a
+  timeout-guarded `multi_thread` test over `ProdEnv` (see the root `CLAUDE.md`
+  practice entry; found via the WAL group-commit deadlock).
+
 System code must never call `std::time::*`, spawn raw tasks, touch real
 sockets/disk, use unseeded RNG, or iterate a `HashMap`/`HashSet` (use
 `BTreeMap`/`BTreeSet`). This is enforced in review and by `clippy.toml`. A

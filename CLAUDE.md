@@ -364,8 +364,48 @@ cross-cutting ones. Prune/merge entries that become obsolete.
   moves) and `_sNN`-suffix the rest; gate the cost so default `cargo test` stays at
   the frozen base while the deep tier (`ANIMUS_CORPUS_FULL=1` too) runs in a nightly
   CI job, not per-push. (ADR 0014 coverage-expansion increment.)
+- **A harness's client poll granularity bounds which timing windows it can catch —
+  a "passing" corpus proves nothing about sub-poll windows.** The 2026-08-06 audit
+  confirmed a ReadIndex linearizability hole (a new leader serves reads before its
+  current-term no-op commits, ADR 0017 §3) that `raftkv_linearizable.rs` structurally
+  cannot fire: the stale window is ~one message round-trip after an election, but the
+  client polls at 100ms, so it never samples the sliver — and the single-writer
+  re-propose model heals the evidence. When a protocol has a known
+  narrow-window rule (ReadIndex no-op, lease expiry, config overlap), write a
+  targeted sim test that *drives into the window* (sub-poll granularity, read
+  immediately on the new leader), don't rely on corpus luck.
+- **An adversarial-verify pass is worth it before acting on audit/review findings —
+  and re-verify against the branch you'll edit.** Of the audit's 6 highest-stakes
+  claims all 6 confirmed, but two materially changed shape under verification (the
+  storage flush bug's trigger is admin flush/compact, not client writes; the
+  ~15/s seed throughput was primarily the 50ms confirm-poll cap, not the election
+  storm) — and several perf findings were already fixed on `main`, which had moved
+  past the audited checkout (pre-vote, single-write-latency, cp-batch-put). A
+  finding is (claim × trigger path × branch); verify all three.
 
 ### Code patterns
+- **An operator/admin action that calls straight into an engine bypasses the
+  single-writer contract the normal path establishes — audit every admin surface
+  against the layer's concurrency assumptions.** `LsmEngine` is safe on the client
+  path because the per-tablet Raft apply loop is its sole writer, but
+  `POST /admin/storage/flush|compact` call `flush_now`/`compact_now` from the admin
+  connection's task, racing that loop — and `flush()` (snapshot → unlocked build →
+  unconditional `memtable.clear()`, no flush-in-progress flag) then erases an acked
+  concurrent write, whose WAL segment a *later* flush GCs: permanent loss. The
+  concurrency tests miss the quadrant (the concurrent-writer test never flushes;
+  the flushing test has one writer) — test "forced maintenance under live load"
+  explicitly. (2026-08-06 audit; ADR 0008/0020 notes; fix = serialize
+  flush-vs-apply and flush-vs-flush.)
+- **One id space must have one allocator — a second allocation path silently breaks
+  the invariant the first one carries.** Tablet ids are never-reused *because*
+  provisioning allocates via `next_free_tablet_id()` (folds in the monotonic
+  `next_tablet_id`); `trigger_split` allocated `max(live ids)+1` instead, so
+  drop-highest-table-then-split re-mints the freed id — and a replica still holding
+  the dropped tablet's files re-hosts them as the new tablet (ADR 0024 violation;
+  GC can never reclaim them since the id is live again). The apply-side validation
+  only rejected collisions with *present* tablets, so nothing self-healed. Route
+  every mint through the one allocator, and make the replicated apply reject ids
+  below the monotonic counter so a divergent client can't reintroduce it.
 - **To wake a `select`-parked `<E: Env>` driver loop from another task, race a
   `futures::task::AtomicWaker` + `AtomicBool` future — never a tokio-only primitive
   (`Notify`/`watch`), which SimEnv can't drive.** The CP data-plane driver used to

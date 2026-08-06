@@ -1,7 +1,17 @@
 # ADR 0014 — Elle consistency testing against Accord + a frozen scenario corpus
 
 - **Status:** Accepted (the register-recovery limitation **closed** 2026-08-02:
-  reads are now genuinely observed from stored state, see the increment below)
+  reads are now genuinely observed from stored state, see the increment below).
+  **Amended for v1 (ADR 0019, noted 2026-08-06):** the **`Frontier` topology and
+  `frontier_corpus_converges_and_is_durable` were deleted** with the AP data
+  plane (`animus-data`). The corpus now runs the `Authoritative` (pure-Accord)
+  topology only, asserting serializability cycles; the frontier
+  convergence/durability increments below are retained as design record (the
+  converged-or-timeout pattern they established is reused elsewhere, e.g. the
+  drop-table-GC restart tests). The CP plane that v1 actually ships has its own,
+  separate corpus (`raftkv_linearizable.rs`) — currently much shallower than
+  this one (no stop/restart, no split-brain, no compound faults, `MemoryEngine`
+  only); closing that coverage inversion is the standing follow-up.
 - **Date:** 2026-08-02 (genuine-black-box increment: 2026-08-02)
 
 ## Context

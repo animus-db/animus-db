@@ -160,6 +160,11 @@ inputs (still named + intact). These are tested under fault injection in
   framing (`record_bytes || crc`, no tag/compression) per `format`, so SSTables
   written by an older engine still read after an upgrade. Round-trips (including
   an incompressible block) are unit-tested in `sstable.rs`.
+  *(Update 2026-08-06: the on-disk format is now a single version `3` — one
+  `MAGIC`, `FORMAT_CURRENT = 3`, adding **shared-prefix key encoding** inside
+  blocks — and `read_block` no longer carries the v1/v2 fallbacks; pre-alpha, no
+  deployed tables to migrate. `SsTableMeta::format` remains the per-table
+  version tag / future-migration hook.)*
 - **Compact binary MANIFEST** (`lsm.rs`): the manifest is now encoded with a
   hand-rolled, dependency-free binary codec (a `CMF1` magic + 1-byte version,
   then big-endian fixed ints and `u32`-length-prefixed byte strings for each
@@ -208,3 +213,44 @@ inputs (still named + intact). These are tested under fault injection in
   manifest swap; no trait change, no new dependency.
 - **Still deferred within `LsmEngine`** (correctness-first, performance later):
   none of the remaining ideas affect the trait or correctness.
+
+## Audit findings (2026-08-06)
+
+An architecture audit (correctness/performance-weighted, findings adversarially
+verified against the code) recorded these open items; fix in code, then prune
+here:
+
+- **Flush is not serialized against concurrent appliers or other flushes
+  (confirmed acked-write-loss hazard).** `flush()` snapshots the memtable under
+  the lock, builds the SSTable with the lock *released*, then re-locks and
+  unconditionally `memtable.clear()`s; `Inner` has no flush-in-progress flag
+  and the `applies_in_flight == 0` gate is checked only at decision time. A
+  write applied (acked, WAL-durable) during the build window is cleared from
+  visibility — and a *later* flush advances the watermark past its seq and GCs
+  its WAL segment: permanent loss. Two overlapping flushes can also allocate
+  the same `sst-` seq (manifest corruption). Unreachable from the client write
+  path (the per-tablet Raft apply loop is the engine's single writer) but
+  **reachable today via `POST /admin/storage/flush`/`compact` under live load**
+  (see ADR 0020's warning), and load-bearing for any future concurrent-writer
+  use — which the WAL group commit exists to serve. The concurrency tests miss
+  this quadrant (the concurrent-writer test never flushes; the flushing test
+  has one writer). Fix: a flush/compaction-in-progress guard serializing
+  flush-vs-apply and flush-vs-flush.
+- **The WAL encodes records as JSON with `Vec<u8>` values as decimal number
+  arrays** (~3-6x inflation) on the fsync-critical path — the biggest
+  write-amplification lever; a binary record codec (the manifest already has
+  one) or `serde_bytes` cuts fsync bytes several-fold. Same JSON-byte-array
+  issue applies to the CP plane's wire + snapshot encoding (ADR 0017 note).
+- **Flush + cascading compaction run inline on the writer** with no
+  backpressure — a write's tail latency includes a possibly multi-level
+  compaction (matches the observed >150ms apply stalls). Move compaction off
+  the ack path.
+- **Snapshot reads are not pinned against tombstone GC**: `snapshot()` pins
+  `max_version` but nothing floors the GC at held snapshot versions — a
+  long-held snapshot below `max_version - tombstone_grace_versions` can read
+  reclaimed history. Held-version watermark wanted.
+- Minor: the apply path pays a cross-SSTable `latest_version_of` point read per
+  merge for an LWW check that is structurally always-true under monotonic Raft
+  indices (offer a skip-check fast path); `remove_orphan_wal_segments` probes
+  `0..lowest_live` segment numbers on every open (O(lifetime rotations); bound
+  with a watermark or `Disk::list`).
