@@ -905,6 +905,22 @@ async function seedRun() {
   $("seed-stop").disabled = false;
   let done = 0;
   const t0 = Date.now();
+  // Refresh the Nodes/Tablets view live so splits appear during a large seed —
+  // but NEVER block a seed chunk on it. loadAll() serializes a full cluster-wide
+  // admin fan-out; awaiting it every chunk would fold that latency into the
+  // displayed keys/s rate and throttle throughput. Instead fire it non-blocking
+  // and at most once per REFRESH_MS of wall-clock, and drop overlapping refreshes.
+  const REFRESH_MS = 1000;
+  let lastRefresh = 0;
+  let refreshInFlight = false;
+  const liveRefresh = () => {
+    if (refreshInFlight) return;
+    const now = Date.now();
+    if (now - lastRefresh < REFRESH_MS) return;
+    lastRefresh = now;
+    refreshInFlight = true;
+    loadAll().finally(() => { refreshInFlight = false; });
+  };
   try {
     while (done < total && seeding) {
       const count = Math.min(chunk, total - done);
@@ -922,8 +938,9 @@ async function seedRun() {
         `<div class="muted">seeded ${done.toLocaleString()} / ${total.toLocaleString()} keys · ${rate.toLocaleString()}/s`
         + (body.error ? ` · <span class="err-line">last error: ${esc(body.error)}</span>` : "") + `</div>`;
       if (wrote === 0) break; // persistent failure — don't spin
-      await loadAll(); // refresh Nodes/Tablets so splits show live
+      liveRefresh(); // non-blocking, throttled — splits show live without gating throughput
     }
+    await loadAll(); // final authoritative refresh once seeding settles
     if (done >= total) $("seed-status").innerHTML += `<div>${pill("ok", "done — " + done.toLocaleString() + " keys")}</div>`;
     else if (!seeding) $("seed-status").innerHTML += `<div class="muted">stopped at ${done.toLocaleString()}</div>`;
   } catch (e) {
