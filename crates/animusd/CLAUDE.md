@@ -260,17 +260,24 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
     reachable node hosts the tablet yet (group still forming) the dropdown is empty
     with a hint (the Load/Browse/inspect handlers no-op on an empty node).
     `tests/dashboard_endpoint.rs` proves serve + CORS + preflight + peers.
-    - **Displayed keys show the partition token as hex** (`admin.rs::key_display`):
-      a wire-edge/seeder key is `token || escape(pk) || rk` (ADR 0022), and the
-      leading `TOKEN_BYTES` are a **binary** Murmur3 token that lossy UTF-8 would
-      mangle — so a key with a non-printable prefix renders as
-      `<16-hex-token>:<readable pk/rk>` (e.g. `0825fb3df691fdc3:seed:0000…`); a
-      *plain-client* `Put` stores its key verbatim (no token), so a fully-printable
-      key is shown as text unchanged. **Values** keep lossy UTF-8 (`key_str`).
-      `parse_key_display` is the inverse, so a browsed key round-trips back through
-      the inspector (`/admin/storage/key`) and the scan `start` (paging). Unit tests
-      live in `admin.rs`; the `admin_endpoint` plain-`Put` `admin-key` guards the
-      not-every-key-is-token-prefixed case.
+    - **Displayed keys show the partition token as URL-safe base64**
+      (`admin.rs::key_display`): a wire-edge/seeder key is `token || escape(pk) ||
+      rk` (ADR 0022), and the leading `TOKEN_BYTES` are a **binary** Murmur3 token
+      that lossy UTF-8 would mangle — so a key with a non-printable prefix renders
+      as `<12-char-base64-token>:<readable pk/rk>` (e.g. `CCX7PfaR_cM=:seed:0000…`).
+      The alphabet is URL-safe (`-`/`_`, padding kept) because displayed keys are
+      pasted back into `?key=`/`?start=` query params, where a raw `+` decodes as a
+      space; the codec core is `animus_dynamo::wire::{base64_encode,base64_decode}`
+      (now `pub`). A *plain-client* `Put` stores its key verbatim (no token), so a
+      fully-printable key is shown as text unchanged. **Values** keep lossy UTF-8
+      (`key_str`). `parse_key_display` is the inverse (the exactly-`TOKEN_BYTES`
+      decode + `=` padding keeps a plain `:`-bearing key from being mistaken for a
+      token), so a browsed key round-trips back through the inspector
+      (`/admin/storage/key`) and the scan `start` (paging). The dashboard's JS
+      helpers (`b64url`/`bytes`/`tokenBound`) mirror the same encoding, so tablet
+      range boundaries and SSTable key ranges are eyeball-comparable with browsed
+      keys. Unit tests live in `admin.rs`; the `admin_endpoint` plain-`Put`
+      `admin-key` guards the not-every-key-is-token-prefixed case.
   - **The Write tab (ADR 0021) writes through the admin port.** `POST
     /admin/data/dynamo {op, payload}` reuses the DynamoDB edge in-process
     (`dynamo::execute` — the factored decode+`run_operation`), returning the op's

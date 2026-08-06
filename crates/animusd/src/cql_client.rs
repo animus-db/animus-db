@@ -181,27 +181,16 @@ fn render_cell(ty: Option<CqlType>, raw: &[u8]) -> Value {
     }
 }
 
-/// A human-readable rendering of a decoded cell value (`CqlValue` has no
-/// `Display`).
+/// A human-readable rendering of a decoded cell value. Blobs render as base64
+/// (matching the DynamoDB `B` JSON convention — this is a JSON proxy response,
+/// not CQL text, where a blob would be a `0x` literal); everything else uses the
+/// value's canonical CQL text form ([`CqlValue::display`] — UUIDs keep the
+/// standard hyphenated form).
 fn render_value(v: &CqlValue) -> String {
     match v {
-        CqlValue::Text(s) => s.clone(),
-        CqlValue::Int(n) => n.to_string(),
-        CqlValue::BigInt(n) => n.to_string(),
-        CqlValue::Boolean(b) => b.to_string(),
-        CqlValue::Blob(b) => hex(b),
-        CqlValue::Uuid(u) => hex(u),
+        CqlValue::Blob(b) => animus_dynamo::wire::base64_encode(b),
+        other => other.display(),
     }
-}
-
-/// Lowercase hex of `bytes` (for `blob`/`uuid` cells).
-fn hex(bytes: &[u8]) -> String {
-    use std::fmt::Write;
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        let _ = write!(s, "{b:02x}");
-    }
-    s
 }
 
 /// Map a CQL type id to the scalar [`CqlType`]s the server emits (`animus_cql`).

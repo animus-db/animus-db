@@ -126,6 +126,20 @@ async fn admin_get(addr: SocketAddr, path: &str) -> (u16, Value) {
     admin(addr, "GET", path, None).await
 }
 
+/// Encode a query-param value the way the browser's `encodeURIComponent` does
+/// (everything but unreserved characters becomes `%NN`), so a test drives the
+/// same bytes the dashboard would.
+fn percent_encode(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn admin_interface_surfaces_state_and_actions() {
     timeout(Duration::from_secs(60), async {
@@ -501,6 +515,30 @@ async fn admin_seed_writes_synthetic_keys() {
         assert!(
             seeded >= 60,
             "all seeded keys are in the leader's storage: {scan}"
+        );
+
+        // A displayed key (`<token-base64>:<pk>`) round-trips through the
+        // inspector URL exactly as the dashboard sends it (percent-encoded):
+        // the server must reverse the display back to the raw token-prefixed
+        // key, or `live` comes back null.
+        let shown = scan["items"]
+            .as_array()
+            .and_then(|items| {
+                items
+                    .iter()
+                    .find_map(|it| it["key"].as_str().filter(|k| k.contains("seed:")))
+            })
+            .expect("a seeded key is listed")
+            .to_owned();
+        let (s, inspect) = admin_get(
+            leader_admin,
+            &format!("/admin/storage/key?tablet=1&key={}", percent_encode(&shown)),
+        )
+        .await;
+        assert_eq!(s, 200);
+        assert!(
+            inspect["live"].is_string(),
+            "displayed key `{shown}` resolves to its live value: {inspect}"
         );
 
         for node in &nodes {

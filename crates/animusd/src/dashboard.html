@@ -256,30 +256,43 @@ function baseFor(addr) {
   return "http://" + h + (port ? ":" + port : "");
 }
 
-// Render a byte sequence (JSON array of u8, or a string) for humans.
+// URL-safe, '='-padded base64 of a byte array — the same encoding the server
+// uses for binary partition tokens (admin.rs::token_base64).
+function b64url(arr) {
+  return btoa(arr.map((b) => String.fromCharCode(b)).join(""))
+    .replace(/\+/g, "-").replace(/\//g, "_");
+}
+
+// Render a byte sequence (JSON array of u8, or a string) for humans. Mirrors the
+// server's key_display (admin.rs): a key with a binary 8-byte token prefix shows
+// as <token-base64>:<remainder as text>; any other binary sequence shows whole as
+// URL-safe base64.
 function bytes(v) {
   if (v == null) return "∞";
   if (typeof v === "string") return v === "" ? "«start»" : v;
   if (Array.isArray(v)) {
     if (v.length === 0) return "«start»";
-    const printable = v.every((b) => b >= 32 && b < 127);
-    return printable ? v.map((b) => String.fromCharCode(b)).join("")
-                     : v.map((b) => b.toString(16).padStart(2, "0")).join("");
+    const printable = (b) => b >= 32 && b < 127;
+    if (v.every(printable)) return v.map((b) => String.fromCharCode(b)).join("");
+    if (v.length >= 8 && !v.slice(0, 8).every(printable)) {
+      return b64url(v.slice(0, 8)) + ":" + v.slice(8).map((b) => String.fromCharCode(b)).join("");
+    }
+    return b64url(v);
   }
   return String(v);
 }
 
 // A tablet range boundary on the hash ring (ADR 0022): the first 8 key bytes are
-// the big-endian Murmur3 partition token. The top 4 bytes (8 hex digits) locate a
-// boundary on the ring precisely enough for the tablets view, so show just those;
-// "…" marks elided bytes. An empty start / null end is the ring's edge — the
-// caller passes 00000000 / ffffffff.
+// the big-endian Murmur3 partition token, shown as URL-safe base64 — matching the
+// token prefix in the key views, so a boundary can be eyeballed against browsed
+// keys; "…" marks elided bytes past the token. An empty start / null end is the
+// ring's edge — the caller passes the all-00 / all-ff token.
 function tokenBound(v, fill) {
   if (v == null || v === "") return fill;
   const arr = Array.isArray(v) ? v : Array.from(String(v), (c) => c.charCodeAt(0) & 0xff);
   if (arr.length === 0) return fill;
-  const tok = arr.slice(0, 4).map((b) => b.toString(16).padStart(2, "0")).join("");
-  return arr.length > 4 ? `${tok}…` : tok;
+  const tok = b64url(arr.slice(0, 8));
+  return arr.length > 8 ? `${tok}…` : tok;
 }
 
 function pill(cls, text) { return `<span class="pill ${esc(cls)}">${esc(text)}</span>`; }
@@ -395,7 +408,7 @@ function renderTablets() {
     return `<tr>
       <td class="mono">${esc(id)}</td>
       <td>${tableCell}</td>
-      <td class="mono">${esc(tokenBound(t.range && t.range.start, "00000000"))} → ${esc(tokenBound(t.range && t.range.end, "ffffffff"))}</td>
+      <td class="mono">${esc(tokenBound(t.range && t.range.start, "AAAAAAAAAAA="))} → ${esc(tokenBound(t.range && t.range.end, "__________8="))}</td>
       <td class="mono">${esc(t.epoch)}</td>
       <td class="mono">${esc((t.replicas || []).join(", "))}</td>
       <td>${leaderCell}</td>
