@@ -24,11 +24,11 @@
 //! [`BoundNode::start`]. [`bind_cluster`] / [`start_cluster`] do this for an
 //! in-process cluster (used by the binary's `--cluster` mode and the tests).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub mod config;
 pub mod otel;
@@ -883,6 +883,7 @@ impl BoundNode {
             client_route,
             base_id: my_raftkv_id,
             admin: admin_info,
+            metrics_history: Arc::new(Mutex::new(VecDeque::with_capacity(METRICS_HISTORY_CAP))),
         };
         let n = control_ids.len();
 
@@ -972,6 +973,11 @@ impl BoundNode {
         // (`DROP TABLE`), stop its group and delete its engine + WAL files, so a
         // dropped table's disk is actually reclaimed on every replica.
         tasks.push(tokio::spawn(cp_gc_loop(host)));
+
+        // Metrics-history sampler (ADR 0020 dashboard sparklines): periodic
+        // snapshots of this node's own aggregated counters. Runs on every node,
+        // same as the loops above — each keeps only its own node-local history.
+        tasks.push(tokio::spawn(metrics_sample_loop(ctx.clone())));
 
         // Client request server + DynamoDB HTTP + CQL endpoints share the same
         // context built above (the same raft view, RMW lock, and CP edge state).
@@ -1449,6 +1455,11 @@ pub(crate) struct ClientCtx {
     /// This node's identity + bound addresses for the admin `/admin/config` view
     /// (ADR 0020). `Arc` so cloning the ctx onto each connection is cheap.
     admin: Arc<AdminInfo>,
+    /// Ring buffer of periodic `metrics_json()` snapshots, filled by
+    /// [`metrics_sample_loop`] — backs `/admin/metrics/history`'s sparklines.
+    /// A plain `std::sync::Mutex` is fine: every access is a quick lock/mutate/
+    /// drop with no `.await` held across it.
+    metrics_history: Arc<Mutex<VecDeque<MetricsSample>>>,
 }
 
 impl ClientCtx {
@@ -2405,6 +2416,19 @@ impl ClientCtx {
         (counters, is_leader)
     }
 
+    /// A snapshot of this node's metrics-history ring buffer (oldest first),
+    /// for the admin `/admin/metrics/history` view (ADR 0020) backing the
+    /// dashboard's sparklines. Cloned out from under the lock so the caller
+    /// never holds it across serialization.
+    pub(crate) fn metrics_history(&self) -> Vec<MetricsSample> {
+        self.metrics_history
+            .lock()
+            .expect("metrics history poisoned")
+            .iter()
+            .cloned()
+            .collect()
+    }
+
     /// **Admin action (ADR 0020):** mark `node` `Leaving` so the placement
     /// reconciler moves its replicas off. Proposed on the **local** control leader
     /// handle (membership commands are control-plane-internal and not relayable, so
@@ -3018,6 +3042,55 @@ async fn cp_gc_tablet(host: &CpHostCtx, tablet: TabletId) {
         .expect("hosting set poisoned")
         .remove(&tablet);
     tracing::info!(tablet = tablet.0, "CP GC: reclaimed dropped tablet");
+}
+
+/// How often [`metrics_sample_loop`] takes a metrics snapshot for the
+/// dashboard's history sparklines. Not the determinism-critical `Metric`/
+/// `MetricSink` seam itself (that stays timestamp-free) — this loop only
+/// *reads* it, on a real wall clock, from `animusd`'s already-`ProdEnv`-only
+/// code, matching the `PEER_SYNC_INTERVAL`-style loops above.
+const METRICS_SAMPLE_INTERVAL: Duration = Duration::from_secs(10);
+/// How many samples the in-memory ring buffer keeps — at the interval above,
+/// ~2 hours. Not persisted (ADR 0020 admin surfaces are live introspection,
+/// not a time-series database); enough to see a recent trend, not a history.
+const METRICS_HISTORY_CAP: usize = 720;
+
+/// One sample in the metrics-history ring buffer: a snapshot of
+/// [`ClientCtx::metrics_json`] plus a wall-clock timestamp (Unix millis).
+#[derive(Serialize, Clone)]
+pub(crate) struct MetricsSample {
+    ts_ms: u64,
+    counters: BTreeMap<String, u64>,
+    is_leader: i64,
+}
+
+/// Appends a [`MetricsSample`] to `ctx`'s ring buffer every
+/// [`METRICS_SAMPLE_INTERVAL`], capped at [`METRICS_HISTORY_CAP`] entries —
+/// backing the dashboard's metrics-history sparklines (`/admin/metrics/history`).
+/// Real wall-clock sleep/timestamp: `animusd` is outside the `Env` determinism
+/// boundary (ADR 0003 only binds sim-tested core crates), so this is exactly
+/// as legitimate as the other `tokio::time`-driven loops in this file.
+async fn metrics_sample_loop(ctx: ClientCtx) {
+    loop {
+        tokio::time::sleep(METRICS_SAMPLE_INTERVAL).await;
+        let (counters, is_leader) = ctx.metrics_json();
+        let ts_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let mut history = ctx
+            .metrics_history
+            .lock()
+            .expect("metrics history poisoned");
+        if history.len() >= METRICS_HISTORY_CAP {
+            history.pop_front();
+        }
+        history.push_back(MetricsSample {
+            ts_ms,
+            counters,
+            is_leader,
+        });
+    }
 }
 
 /// How often the auto-split loop samples tablet sizes (Phase 2.4). A slow

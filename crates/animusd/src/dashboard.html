@@ -44,6 +44,16 @@
       <h2>Cluster members</h2>
       <div id="nodes-body"><div class="empty">loading…</div></div>
     </div>
+    <div class="card">
+      <h2>Metrics history</h2>
+      <div class="muted" style="margin-bottom:10px">A per-node counter trend, sampled every 10s (~2h ring buffer) — like <code>/admin/metrics</code> itself, this is this node's own view, not a cluster aggregate.</div>
+      <div class="row">
+        <label>node</label><select id="mh-node"></select>
+        <button id="mh-load">Load</button>
+        <span id="mh-hint" class="muted"></span>
+      </div>
+      <div id="mh-body"><div class="empty">pick a node and Load</div></div>
+    </div>
   </section>
 
   <section id="tablets">
@@ -198,6 +208,7 @@ window.addEventListener("popstate", () => {
 pendingStorageParams = paramsFromLocation();
 activateTab(tabFromPath(window.location.pathname));
 $("refresh").addEventListener("click", loadAll);
+$("mh-load").addEventListener("click", loadMetricsHistory);
 $("global-table").addEventListener("change", onGlobalTableChange);
 $("st-tablet").addEventListener("change", () => { updateStorageNodeOptions(); syncStorageUrl(); });
 $("st-node").addEventListener("change", syncStorageUrl);

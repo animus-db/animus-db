@@ -246,6 +246,32 @@ async fn admin_interface_surfaces_state_and_actions() {
             "control leader won an election: {lmetrics}"
         );
 
+        // ---- /admin/metrics/history -----------------------------------------
+        // The sampler ticks every 10s (METRICS_SAMPLE_INTERVAL); poll rather than
+        // sleep a fixed amount, matching this suite's real-time convention.
+        let (s, history) = admin_get(admin_addr, "/admin/metrics/history").await;
+        assert_eq!(s, 200);
+        assert!(
+            history["samples"].as_array().is_some(),
+            "history is a samples array even before the first tick: {history}"
+        );
+        let sample = timeout(Duration::from_secs(15), async {
+            loop {
+                let (_, h) = admin_get(admin_addr, "/admin/metrics/history").await;
+                if let Some(first) = h["samples"].as_array().and_then(|a| a.first()) {
+                    return first.clone();
+                }
+                sleep(Duration::from_millis(200)).await;
+            }
+        })
+        .await
+        .expect("a metrics-history sample appears within one sample interval");
+        assert!(sample["ts_ms"].as_u64().is_some_and(|t| t > 0), "{sample}");
+        assert!(
+            sample["counters"]["control_elections_started"].is_u64(),
+            "a sample carries the same counter set as /admin/metrics: {sample}"
+        );
+
         // ---- /admin/health -------------------------------------------------
         let (s, health) = admin_get(admin_addr, "/admin/health").await;
         assert_eq!(s, 200, "health 200 once a leader is known");

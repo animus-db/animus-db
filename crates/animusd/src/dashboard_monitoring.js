@@ -91,6 +91,50 @@ function renderNodes() {
     }));
 }
 
+// Metrics-history counters worth a sparkline: one write-throughput proxy and
+// one leadership-churn proxy, plus the raw leader gauge. `/admin/metrics`
+// (and its history) is a per-node sink like every other admin metrics view —
+// picking a node here is "this node's own recent trend", not cluster-wide.
+const METRICS_HISTORY_SERIES = [
+  { key: "cp_commits", label: "CP commits (writes)" },
+  { key: "control_elections_started", label: "Elections started" },
+];
+
+function renderMetricsHistorySelector() {
+  const sel = $("mh-node");
+  const prev = sel.value;
+  const reachable = STATE.nodes.filter((n) => n.ok);
+  sel.innerHTML = reachable.map((n) =>
+    `<option value="${esc(n.base)}">node ${esc(nodeRaftkvId(n))} (${esc(n.addr)})</option>`).join("");
+  if (prev && [...sel.options].some((o) => o.value === prev)) sel.value = prev;
+  $("mh-hint").textContent = reachable.length ? "" : "no reachable node yet";
+}
+
+async function loadMetricsHistory() {
+  const base = $("mh-node").value;
+  if (!base) { $("mh-body").innerHTML = `<div class="empty">pick a node</div>`; return; }
+  try {
+    const r = await getJSON(base, "/admin/metrics/history");
+    const samples = r.samples || [];
+    if (!samples.length) {
+      $("mh-body").innerHTML = `<div class="empty">no samples yet — the sampler ticks every 10s, check back shortly</div>`;
+      return;
+    }
+    const rows = METRICS_HISTORY_SERIES.map((s) => ({ ...s, values: samples.map((x) => x.counters[s.key] || 0) }));
+    rows.push({ key: "is_leader", label: "Leader (1/0)", values: samples.map((x) => x.is_leader) });
+    const spanMin = Math.max(1, Math.round((samples[samples.length - 1].ts_ms - samples[0].ts_ms) / 60000));
+    $("mh-body").innerHTML = rows.map((row) => {
+      const last = row.values[row.values.length - 1];
+      return `<div class="mh-row">
+        <div class="mh-label">${esc(row.label)} <span class="mono">${esc(last)}</span></div>
+        ${sparklineSvg(row.values)}
+      </div>`;
+    }).join("") + `<div class="muted" style="margin-top:6px">${samples.length} sample(s) over ~${spanMin} min</div>`;
+  } catch (e) {
+    $("mh-body").innerHTML = `<div class="err-line">${esc(e)}</div>`;
+  }
+}
+
 // The first tablet id (by sort order) whose CP group this node hosts a
 // replica of, or `null` if it hosts none — used to seed a sensible default
 // tablet selection when jumping from a node row into Storage.

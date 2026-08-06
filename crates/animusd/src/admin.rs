@@ -31,6 +31,7 @@
 //! - `GET  /admin/storage/key`         — on-disk versions of a key (`?tablet=&key=`)
 //! - `GET  /admin/storage/scan`        — first N live pairs (`?tablet=&start=&limit=`)
 //! - `GET  /admin/metrics`             — the metrics snapshot as JSON
+//! - `GET  /admin/metrics/history`     — periodic snapshots, ~2h ring buffer (ADR 0021 sparklines)
 //! - `GET  /admin/health`              — liveness/readiness
 //! - `POST /admin/tablet/split`        — `{tablet, split_key}`
 //! - `POST /admin/storage/flush`       — `{tablet}`
@@ -226,6 +227,7 @@ async fn dispatch(ctx: &ClientCtx, request: &http::HttpRequest) -> (u16, String)
         ("GET", "/admin/storage/key") => storage_key(ctx, q).await,
         ("GET", "/admin/storage/scan") => storage_scan(ctx, q).await,
         ("GET", "/admin/metrics") => (200, metrics_view(ctx)),
+        ("GET", "/admin/metrics/history") => (200, metrics_history_view(ctx)),
         ("GET", "/admin/health") => health(ctx),
         ("POST", "/admin/tablet/split") => action_split(ctx, &request.body).await,
         ("POST", "/admin/storage/flush") => action_flush(ctx, &request.body).await,
@@ -509,6 +511,14 @@ async fn storage_scan(ctx: &ClientCtx, q: &str) -> (u16, Value) {
 fn metrics_view(ctx: &ClientCtx) -> Value {
     let (counters, is_leader) = ctx.metrics_json();
     json!({ "counters": counters, "is_leader": is_leader })
+}
+
+/// This node's metrics-history ring buffer (ADR 0020), backing the
+/// dashboard's sparklines — a real live snapshot each `/admin/metrics` sample,
+/// not a cluster-wide aggregate (the same "per-node sink" caveat `/admin/
+/// metrics` itself carries).
+fn metrics_history_view(ctx: &ClientCtx) -> Value {
+    json!({ "samples": ctx.metrics_history() })
 }
 
 fn health(ctx: &ClientCtx) -> (u16, Value) {
