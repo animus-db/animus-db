@@ -464,8 +464,26 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
     (`dashboard.html`'s `tabFromPath`/`activateTab`) and uses
     `history.pushState`/`popstate` so a nav click adds a history entry, a
     refresh/bookmark reopens the same tab, and the browser back/forward buttons
-    work. Sub-tab state (storage's selected tablet/node, the Write panel's
-    op/table) is **not** in the URL yet.
+    work. Sub-tab state (storage's selected tablet/node) is **not** in the URL yet.
+    **The nav is presented as two groups** (`GROUPS` in `dashboard.html`) —
+    Monitoring (`nodes`/`tablets`/`storage`, shown as a secondary sub-nav row)
+    and Actions (`write`, a single leaf so no sub-nav) — purely a client-side
+    grouping of the primary nav pills; the leaf tab ids and `/admin/ui/<tab>`
+    paths are unchanged, so this needed no server change and no test update.
+    Clicking a group pill re-activates whichever leaf was last active in that
+    group (`lastTabInGroup`, seeded to `nodes`/`write`).
+    **A single global table selector lives in the header** (`#global-table`,
+    `dashboard.html`'s `selectedTable`/`renderTableSelector`), populated from
+    the union of the replicated schema catalog and the tablet map. The Dynamo
+    operation panel and the Bulk seed panel read this one selection instead of
+    keeping their own per-panel dropdowns (each disables itself with a hint if
+    the globally selected table isn't valid for that panel — e.g. a CQL-only
+    table for the Dynamo op form, or a table with no tablet yet for seed); the
+    CQL panel is untouched, since a CQL script names its own table(s) in the
+    statement text. `lastRenderedTable` gates when the Dynamo editor's skeleton
+    is rebuilt (table actually changed) vs. left alone (a routine poll refresh
+    with the same selection), preserving in-progress edits — the same
+    discipline the old per-panel dropdown used.
     The data panel has both a single-key inspector (`/admin/storage/key`) and a
     **browse-keys** list (`/admin/storage/scan` → `CpGroup::local_scan`, first N live
     pairs `>= start`; click a key to send it to the inspector). The Storage tab's
@@ -515,8 +533,9 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
       plain-named = Dynamo, vs CQL `ks.table`), creates via `CreateTable`, and drops
       via `POST /admin/data/drop-table` (`ctx.drop_table_schema`; the Dynamo wire has
       no `DeleteTable`, so this reuses the control-plane drop, schema-only). The op
-      **table is a dropdown of existing tables** — ops are disabled when none exist, so
-      you can't act on a non-existent table. Form and JSON share one request model
+      **targets the header's global table selector** (see above) — disabled unless
+      it names an existing Dynamo table, so you can't act on a non-existent or
+      CQL-only table. Form and JSON share one request model
       (`dynModel`) with a Form/JSON **toggle** that syncs both ways (the JSON view is
       the full request; the form edits TableName + Item/Key, preserving extra fields
       like `UpdateExpression`). Selecting a table (or op) **prefills the request with
@@ -555,10 +574,11 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
       failure (leader moved, e.g. a split) triggers a real resubmission. The
       dashboard's **Bulk seed** card chunks a
       larger total into requests, showing progress + refreshing the Tablets view so
-      splits appear live; its **table is a dropdown of provisioned tables** (from
+      splits appear live; it also **targets the header's global table selector**,
+      disabled with a hint unless the selected table already has a tablet (from
       the tablet map in `/admin/status` — the exact set the endpoint's
       `has_table_tablet` check accepts, so Dynamo *and* CQL `ks.table` tables both
-      appear), disabled with a hint while no table exists. Combined with the binary's **`--cluster N --auto-split K`**
+      qualify). Combined with the binary's **`--cluster N --auto-split K`**
       flag (a CP-hosting node splits a tablet it leads once it exceeds K keys, Phase
       2.4, via `start_cluster_with_auto_split`), seeding past K auto-shards the
       keyspace — verified end to end (seed 12k keys, `--auto-split 4000` → 5 tablets).

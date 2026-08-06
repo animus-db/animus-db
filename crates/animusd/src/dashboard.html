@@ -30,6 +30,8 @@
   nav { display: flex; gap: 4px; padding: 10px 18px 0; border-bottom: 1px solid var(--line); }
   nav button { border-radius: 6px 6px 0 0; border-bottom: none; color: var(--dim); }
   nav button.active { color: var(--fg); background: var(--panel); border-color: var(--line); }
+  nav.secondary { padding: 8px 18px 0; border-bottom: 1px solid var(--line); }
+  nav.secondary button { font-size: 12px; padding: 4px 10px; }
   main { padding: 18px; }
   section { display: none; }
   section.active { display: block; }
@@ -68,6 +70,9 @@
   <span class="banner" id="banner">⚠ admin port — no auth; bind to a trusted interface only</span>
   <span class="spacer"></span>
   <div class="controls">
+    <label>table
+      <select id="global-table"><option value="">(select a table)</option></select>
+    </label>
     <span class="updated" id="updated"></span>
     <label>auto
       <select id="auto">
@@ -80,11 +85,14 @@
     <button id="refresh">Refresh</button>
   </div>
 </header>
-<nav>
+<nav class="primary">
+  <button data-group="monitoring" class="active">Monitoring</button>
+  <button data-group="actions">Actions</button>
+</nav>
+<nav class="secondary" data-group="monitoring">
   <button data-tab="nodes" class="active">Nodes</button>
   <button data-tab="tablets">Tablets</button>
   <button data-tab="storage">Storage</button>
-  <button data-tab="write">Write</button>
 </nav>
 <main>
   <section id="nodes" class="active">
@@ -164,8 +172,8 @@
           <option>PutItem</option><option>GetItem</option><option>UpdateItem</option>
           <option>DeleteItem</option><option>Query</option><option>Scan</option>
         </select>
-        <label>table</label><select id="dy-table"></select>
-        <span class="muted" id="dy-no-tables" style="display:none">create a table first</span>
+        <label>table</label><span class="mono" id="dy-table-name">—</span>
+        <span class="muted" id="dy-no-tables" style="display:none">select a table above</span>
         <span class="spacer"></span>
         <span class="muted">view</span>
         <button id="dy-view-form" class="seg active">Form</button>
@@ -200,10 +208,10 @@ SELECT * FROM t WHERE id = 1;"></textarea>
 
     <div class="card scroll">
       <h2>Bulk seed (sharding test)</h2>
-      <div class="muted" style="margin-bottom:8px">Writes synthetic keys into an <b>existing</b> table to grow its tablet (create the table first in the Dynamo or CQL panel). Run the cluster with <code>--auto-split K</code> to watch tablets split in the Tablets tab as the count crosses K.</div>
+      <div class="muted" style="margin-bottom:8px">Writes synthetic keys into the table selected above to grow its tablet (it must already exist — create it first in the Dynamo or CQL panel, and write to it once so it has a tablet). Run the cluster with <code>--auto-split K</code> to watch tablets split in the Tablets tab as the count crosses K.</div>
       <div class="row">
-        <label>table</label><select id="seed-table"></select>
-        <span class="muted" id="seed-no-tables" style="display:none">create a table first</span>
+        <label>table</label><span class="mono" id="seed-table-name">—</span>
+        <span class="muted" id="seed-no-tables" style="display:none">select a table above</span>
         <label>key prefix</label><input type="text" id="seed-prefix" value="seed:" style="width:7em">
         <label>value bytes</label><input type="text" id="seed-vbytes" value="64" style="width:5em">
         <label>total</label><input type="text" id="seed-total" value="10000" style="width:7em">
@@ -225,6 +233,41 @@ const esc = (s) => String(s).replace(/[&<>"]/g, (c) =>
 
 // State assembled each refresh.
 let STATE = { status: null, nodes: [], peersErr: null };
+
+// The globally-selected table (header dropdown) — every operation panel that
+// targets one table (Dynamo op, bulk seed) reads this instead of keeping its
+// own dropdown. CQL keeps typing table names into its statements (a script
+// can target any table, or several) and stays out of this. `lastRenderedTable`
+// tracks the value the Dynamo editor was last built for, so a routine refresh
+// that leaves the selection unchanged doesn't clobber in-progress edits.
+let selectedTable = "";
+let lastRenderedTable;
+
+// Every table name known anywhere: the replicated schema catalog (Dynamo +
+// CQL) union the tablet map (a table can appear in one before the other —
+// created but not yet written to, or vice versa via direct seeding).
+function allTableNames() {
+  const fromSchemas = Object.keys((STATE.status && STATE.status.schemas && STATE.status.schemas.tables) || {});
+  const fromTablets = Object.values((STATE.status && STATE.status.tablets) || {}).map((t) => t.table).filter(Boolean);
+  return [...new Set([...fromSchemas, ...fromTablets])].sort();
+}
+
+// Populate the header dropdown; drop the selection if it no longer exists.
+function renderTableSelector() {
+  const names = allTableNames();
+  if (!names.includes(selectedTable)) selectedTable = "";
+  const sel = $("global-table");
+  sel.innerHTML = `<option value="">(select a table)</option>`
+    + names.map((n) => `<option${n === selectedTable ? " selected" : ""}>${esc(n)}</option>`).join("");
+  sel.value = selectedTable;
+}
+function onGlobalTableChange() {
+  selectedTable = $("global-table").value;
+  lastRenderedTable = selectedTable;
+  dynOnTable();
+  renderDynamoTables();
+  renderSeedTables();
+}
 
 // Fetch JSON from `base + path`; throws on network/HTTP error.
 async function getJSON(base, path) {
@@ -340,8 +383,16 @@ function render() {
   renderNodes();
   renderTablets();
   renderStorageSelectors();
+  renderTableSelector();
   renderDynamoTables();
   renderSeedTables();
+  // Rebuild the Dynamo editor's skeleton only when the effective table
+  // changed (first load, table created/dropped, or a manual switch) — never
+  // on a routine refresh with the same selection, so in-progress edits survive.
+  if (selectedTable !== lastRenderedTable) {
+    lastRenderedTable = selectedTable;
+    dynOnTable();
+  }
 }
 
 function renderNodes() {
@@ -678,7 +729,7 @@ function dynSkeleton(op, table) {
 
 // Capture the active view's edits into dynModel.
 function dynSyncFromForm() {
-  dynModel.TableName = $("dy-table").value;
+  dynModel.TableName = selectedTable;
   const op = $("dy-op").value;
   if (op === "PutItem") dynModel.Item = currentAv();
   else if (DY_ATTR_OPS.includes(op)) dynModel.Key = currentAv();
@@ -690,6 +741,9 @@ function dynSyncFromJson() { dynModel = JSON.parse($("dy-raw").value); }
 function dynRender() {
   const op = $("dy-op").value;
   const usesAttrs = DY_ATTR_OPS.includes(op);
+  const table = selectedTable;
+  const validTable = !!(table && dynamoTables()[table]);
+  $("dy-table-name").textContent = table || "—";
   $("dy-view-form").classList.toggle("active", dynView === "form");
   $("dy-view-json").classList.toggle("active", dynView === "json");
   if (dynView === "json") {
@@ -700,19 +754,15 @@ function dynRender() {
   }
   $("dy-form").style.display = "";
   $("dy-json").style.display = "none";
-  if (dynModel.TableName && [...$("dy-table").options].some((o) => o.value === dynModel.TableName)) {
-    $("dy-table").value = dynModel.TableName;
-  }
-  const show = usesAttrs ? "" : "none";
+  const show = usesAttrs && validTable ? "" : "none";
   $("dy-attrs").style.display = show;
   $("dy-add-attr").style.display = show;
   $("dy-attrs").querySelector("tbody").innerHTML = "";
-  if (usesAttrs) {
+  if (usesAttrs && validTable) {
     const rows = avToAttrs(op === "PutItem" ? dynModel.Item : dynModel.Key);
     // Key attributes render first as locked rows (name/type fixed, no delete):
     // the Item/Key must carry them. Re-added with an empty value if missing
     // from the model (e.g. pruned in the JSON view).
-    const table = $("dy-table").value;
     const keyNames = dynKeyNames(table);
     const schema = dynamoTables()[table];
     keyNames.forEach((name) => {
@@ -723,6 +773,8 @@ function dynRender() {
     rest.forEach((a) => addAttrRow(a.name, a.type, a.value));
     if (!keyNames.length && !rest.length) addAttrRow();
     $("dy-form-hint").textContent = op === "PutItem" ? "attributes = the full Item" : "attributes = the Key";
+  } else if (!validTable) {
+    $("dy-form-hint").textContent = "select a DynamoDB table above";
   } else {
     $("dy-form-hint").textContent = "switch to JSON to edit this operation's request";
   }
@@ -740,7 +792,7 @@ function dynSetView(view) {
 }
 function dynOnOp() {
   const prevAv = currentAv();
-  dynModel = dynSkeleton($("dy-op").value, $("dy-table").value);
+  dynModel = dynSkeleton($("dy-op").value, selectedTable);
   const op = $("dy-op").value;
   if (Object.keys(prevAv).length) {
     if (op === "PutItem") dynModel.Item = prevAv;
@@ -751,16 +803,16 @@ function dynOnOp() {
 function dynOnTable() {
   // Switching table rebuilds the skeleton so the new table's key attributes are
   // prefilled (in both form and JSON views).
-  dynModel = dynSkeleton($("dy-op").value, $("dy-table").value);
+  dynModel = dynSkeleton($("dy-op").value, selectedTable);
   dynRender();
 }
 
-// Render the tables card + (re)populate the op table dropdown; disable ops when
-// there are no tables (you can't act on a table that doesn't exist).
+// Render the tables management list; disable the op form unless the globally
+// selected table is one of these (you can't act on a table that doesn't exist,
+// or edit a DynamoDB request against a CQL-only table).
 function renderDynamoTables() {
   const tables = dynamoTables();
   const names = Object.keys(tables).sort();
-  // Management list.
   $("dy-tables").innerHTML = names.length
     ? `<table><thead><tr><th>table</th><th>partition key</th><th>sort key</th><th></th></tr></thead><tbody>`
       + names.map((n) => {
@@ -774,21 +826,10 @@ function renderDynamoTables() {
     : `<div class="empty">no DynamoDB tables — create one above</div>`;
   $("dy-tables").querySelectorAll(".dy-drop").forEach((a) =>
     a.addEventListener("click", (e) => { e.preventDefault(); dropTable(a.dataset.t); }));
-  // Op table dropdown (preserve selection).
-  const sel = $("dy-table");
-  const prev = sel.value;
-  sel.innerHTML = names.map((n) => `<option>${esc(n)}</option>`).join("");
-  // When the effective table changes (first load, or the current table was
-  // dropped), rebuild the skeleton so the new table's keys are prefilled — but on a
-  // routine refresh where the selection is preserved, leave the editor untouched
-  // (don't clobber in-progress edits).
-  let tableChanged = false;
-  if (names.includes(prev)) sel.value = prev;
-  else if (names.length) { sel.value = names[0]; tableChanged = true; }
-  const none = names.length === 0;
-  $("dy-no-tables").style.display = none ? "" : "none";
-  ["dy-op", "dy-table", "dy-send", "dy-add-attr"].forEach((id) => { $(id).disabled = none; });
-  if (tableChanged) { dynModel = dynSkeleton($("dy-op").value, sel.value); dynRender(); }
+  const validTable = selectedTable && names.includes(selectedTable);
+  $("dy-no-tables").style.display = validTable ? "none" : "";
+  $("dy-no-tables").textContent = names.length ? "select a DynamoDB table above" : "create a table first";
+  ["dy-op", "dy-send", "dy-add-attr"].forEach((id) => { $(id).disabled = !validTable; });
 }
 
 async function createTable() {
@@ -809,13 +850,8 @@ async function createTable() {
     if (status >= 300) { $("dy-ct-msg").textContent = (body && body.message) || ("HTTP " + status); return; }
     $("dy-ct-msg").textContent = "created " + name;
     $("dy-ct-name").value = "";
+    selectedTable = name; // render() picks this up once /admin/status reflects it, prefilling key attrs
     await loadAll();
-    // Select the new table and prefill its key attributes into the editor.
-    if ([...$("dy-table").options].some((o) => o.value === name)) {
-      $("dy-table").value = name;
-      dynModel = dynSkeleton($("dy-op").value, name);
-      dynRender();
-    }
   } catch (e) { $("dy-ct-msg").textContent = String(e); }
 }
 async function dropTable(name) {
@@ -873,32 +909,31 @@ function renderCqlResult(r) {
 // ---- Write tab: bulk seed ----
 let seeding = false;
 
-// The seed target is a dropdown of tables that *have a tablet* — the exact set
+// The seed target must be a table that *has a tablet* — the exact set
 // `/admin/data/seed` accepts (it validates against the replicated tablet map),
-// so both Dynamo and CQL `ks.table` tables appear once provisioned. Refreshed by
-// render() (which also runs mid-seed via loadAll), so preserve the selection and
-// keep the Seed button's disabled state in sync with the `seeding` flag.
+// so both Dynamo and CQL `ks.table` tables qualify once provisioned. Refreshed
+// by render() (which also runs mid-seed via loadAll), so keep the Seed
+// button's disabled state in sync with both table validity and `seeding`.
 function renderSeedTables() {
   const tablets = (STATE.status && STATE.status.tablets) || {};
-  const names = [...new Set(Object.values(tablets).map((t) => t.table).filter(Boolean))].sort();
-  const sel = $("seed-table");
-  const prev = sel.value;
-  sel.innerHTML = names.map((n) => `<option>${esc(n)}</option>`).join("");
-  if (names.includes(prev)) sel.value = prev;
-  const none = names.length === 0;
-  $("seed-no-tables").style.display = none ? "" : "none";
-  sel.disabled = none;
-  $("seed-go").disabled = none || seeding;
+  const seedable = new Set(Object.values(tablets).map((t) => t.table).filter(Boolean));
+  const validTable = selectedTable && seedable.has(selectedTable);
+  $("seed-table-name").textContent = selectedTable || "—";
+  $("seed-no-tables").style.display = validTable ? "none" : "";
+  $("seed-no-tables").textContent = selectedTable
+    ? "table has no tablet yet — write to it once (Dynamo/CQL panel), then it can be seeded"
+    : "select a table above";
+  $("seed-go").disabled = !validTable || seeding;
 }
 
 async function seedRun() {
   if (seeding) return;
-  const table = $("seed-table").value.trim();
+  const table = selectedTable;
   const prefix = $("seed-prefix").value;
   const vbytes = Math.max(0, parseInt($("seed-vbytes").value, 10) || 0);
   const total = Math.max(0, parseInt($("seed-total").value, 10) || 0);
   const chunk = Math.max(1, parseInt($("seed-chunk").value, 10) || 1000);
-  if (!table) { $("seed-status").innerHTML = `<div class="empty">create a table first (Dynamo or CQL panel) — every key names a table</div>`; return; }
+  if (!table) { $("seed-status").innerHTML = `<div class="empty">select a table above — every key names a table</div>`; return; }
   if (!total) { $("seed-status").innerHTML = `<div class="empty">set a total</div>`; return; }
   seeding = true;
   $("seed-go").disabled = true;
@@ -953,10 +988,15 @@ async function seedRun() {
 }
 
 // ---- tab routing (ADR 0021 follow-up 7: real URLs, refresh/back/forward preserve the tab) ----
-// Each top-level tab gets a real path, `/admin/ui/<tab>` — the server (admin.rs
-// `is_ui_path`) serves the same SPA for any such path, so a refresh or a bookmark
-// lands back on this tab instead of always resetting to Nodes.
-const TABS = [...document.querySelectorAll("nav button")].map((b) => b.dataset.tab);
+// Two top-level parts (Monitoring / Actions), each a "group" of one or more
+// leaf tabs. Leaf tabs keep their existing ids and `/admin/ui/<tab>` paths
+// unchanged (the server's `is_ui_path` just prefix-matches, and existing
+// bookmarks/tests target these exact leaves), so only the nav's presentation
+// is grouped — routing is untouched.
+const GROUPS = { monitoring: ["nodes", "tablets", "storage"], actions: ["write"] };
+const TABS = Object.values(GROUPS).flat();
+const lastTabInGroup = { monitoring: "nodes", actions: "write" };
+function groupOf(tab) { return Object.keys(GROUPS).find((g) => GROUPS[g].includes(tab)); }
 
 function tabFromPath(path) {
   const m = /^\/admin\/ui\/([^/?#]+)/.exec(path);
@@ -968,7 +1008,11 @@ function tabFromPath(path) {
 // entry (nav click), otherwise the URL is normalized in place (initial load).
 function activateTab(tab, opts = {}) {
   if (!TABS.includes(tab)) tab = TABS[0];
-  document.querySelectorAll("nav button").forEach((x) => x.classList.toggle("active", x.dataset.tab === tab));
+  const group = groupOf(tab);
+  lastTabInGroup[group] = tab;
+  document.querySelectorAll(".primary button").forEach((x) => x.classList.toggle("active", x.dataset.group === group));
+  document.querySelectorAll(".secondary").forEach((x) => { x.style.display = x.dataset.group === group ? "" : "none"; });
+  document.querySelectorAll(".secondary button").forEach((x) => x.classList.toggle("active", x.dataset.tab === tab));
   document.querySelectorAll("main section").forEach((x) => x.classList.toggle("active", x.id === tab));
   if (!opts.silent) {
     const url = "/admin/ui/" + tab;
@@ -978,18 +1022,20 @@ function activateTab(tab, opts = {}) {
 }
 
 // ---- wiring ----
-document.querySelectorAll("nav button").forEach((b) =>
+document.querySelectorAll(".primary button").forEach((b) =>
+  b.addEventListener("click", () => activateTab(lastTabInGroup[b.dataset.group], { push: true })));
+document.querySelectorAll(".secondary button").forEach((b) =>
   b.addEventListener("click", () => activateTab(b.dataset.tab, { push: true })));
 window.addEventListener("popstate", () => activateTab(tabFromPath(window.location.pathname), { silent: true }));
 activateTab(tabFromPath(window.location.pathname));
 $("refresh").addEventListener("click", loadAll);
+$("global-table").addEventListener("change", onGlobalTableChange);
 $("st-tablet").addEventListener("change", updateStorageNodeOptions);
 $("st-load").addEventListener("click", loadStorage);
 $("scan-load").addEventListener("click", browseKeys);
 $("key-load").addEventListener("click", inspectKey);
 $("dy-add-attr").addEventListener("click", () => addAttrRow());
 $("dy-op").addEventListener("change", dynOnOp);
-$("dy-table").addEventListener("change", dynOnTable);
 $("dy-view-form").addEventListener("click", () => dynSetView("form"));
 $("dy-view-json").addEventListener("click", () => dynSetView("json"));
 $("dy-send").addEventListener("click", sendDynamo);
@@ -997,8 +1043,8 @@ $("dy-ct-create").addEventListener("click", createTable);
 $("cql-run").addEventListener("click", runCql);
 $("seed-go").addEventListener("click", seedRun);
 $("seed-stop").addEventListener("click", () => { seeding = false; });
-// Initialize the Dynamo editor (table dropdown is filled by renderDynamoTables
-// once /admin/status loads).
+// Initialize the Dynamo editor (the header's global table selector is filled
+// by renderTableSelector once /admin/status loads).
 dynModel = dynSkeleton("PutItem", "");
 dynRender();
 

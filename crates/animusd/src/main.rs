@@ -149,7 +149,7 @@ async fn run_single(
         .await
         .map_err(|e| format!("failed to start node {index}: {e}"))?;
     println!(
-        "animusd: node {index}/{} up (CP) — client {} — dynamo http {} — cql {} — admin {}",
+        "animusd: node {index}/{} up (CP) — client {} — dynamo http {} — cql {} — admin http://{}",
         config.len(),
         node.client_addr(),
         node.dynamo_addr(),
@@ -189,7 +189,7 @@ async fn run_in_process_cluster(
     }
     for (i, node) in nodes.iter().enumerate() {
         println!(
-            "  node {i}: client {} — dynamo http {} — cql {} — admin {}",
+            "  node {i}: client {} — dynamo http {} — cql {} — admin http://{}",
             node.client_addr(),
             node.dynamo_addr(),
             node.cql_addr(),
