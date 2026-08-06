@@ -565,16 +565,19 @@ function dynamoTables() {
   return out;
 }
 
-function addAttrRow(name = "", type = "S", value = "") {
+function addAttrRow(name = "", type = "S", value = "", locked = false) {
   const tr = document.createElement("tr");
-  tr.innerHTML = `<td><input type="text" class="dy-n" value="${esc(name)}"></td>
-    <td><select class="dy-t"><option ${type==="S"?"selected":""}>S</option>
+  tr.innerHTML = `<td><input type="text" class="dy-n" value="${esc(name)}"${locked ? " readonly" : ""}></td>
+    <td><select class="dy-t"${locked ? " disabled" : ""}><option ${type==="S"?"selected":""}>S</option>
       <option ${type==="N"?"selected":""}>N</option>
       <option ${type==="B"?"selected":""}>B</option>
       <option ${type==="BOOL"?"selected":""}>BOOL</option></select></td>
     <td><input type="text" class="dy-v" value="${esc(value)}"></td>
-    <td><a href="#" class="dy-del">✕</a></td>`;
-  tr.querySelector(".dy-del").addEventListener("click", (e) => { e.preventDefault(); tr.remove(); });
+    <td>${locked
+      ? `<span class="muted dy-key-lock" title="key attribute — required by the table's schema">key</span>`
+      : `<a href="#" class="dy-del">✕</a>`}</td>`;
+  const del = tr.querySelector(".dy-del");
+  if (del) del.addEventListener("click", (e) => { e.preventDefault(); tr.remove(); });
   $("dy-attrs").querySelector("tbody").appendChild(tr);
 }
 function dyAttrs() {
@@ -620,6 +623,17 @@ function dynKeyAv(table) {
   const sk = s.clustering_keys && s.clustering_keys[0];
   if (sk) put(sk);
   return av;
+}
+// The table's key attribute names (partition key, then sort key if any). These
+// rows are locked in the form — a valid Item/Key must carry them.
+function dynKeyNames(table) {
+  const s = dynamoTables()[table];
+  if (!s) return [];
+  const names = [];
+  if (s.partition_key) names.push(s.partition_key);
+  const sk = s.clustering_keys && s.clustering_keys[0];
+  if (sk) names.push(sk);
+  return names;
 }
 // The partition key name (for prefilling a Query's KeyConditionExpression).
 function dynPartitionKey(table) {
@@ -680,8 +694,19 @@ function dynRender() {
   $("dy-attrs").querySelector("tbody").innerHTML = "";
   if (usesAttrs) {
     const rows = avToAttrs(op === "PutItem" ? dynModel.Item : dynModel.Key);
-    if (rows.length) rows.forEach((a) => addAttrRow(a.name, a.type, a.value));
-    else addAttrRow();
+    // Key attributes render first as locked rows (name/type fixed, no delete):
+    // the Item/Key must carry them. Re-added with an empty value if missing
+    // from the model (e.g. pruned in the JSON view).
+    const table = $("dy-table").value;
+    const keyNames = dynKeyNames(table);
+    const schema = dynamoTables()[table];
+    keyNames.forEach((name) => {
+      const a = rows.find((r) => r.name === name);
+      addAttrRow(name, a ? a.type : dynColType(schema, name), a ? a.value : "", true);
+    });
+    const rest = rows.filter((r) => !keyNames.includes(r.name));
+    rest.forEach((a) => addAttrRow(a.name, a.type, a.value));
+    if (!keyNames.length && !rest.length) addAttrRow();
     $("dy-form-hint").textContent = op === "PutItem" ? "attributes = the full Item" : "attributes = the Key";
   } else {
     $("dy-form-hint").textContent = "switch to JSON to edit this operation's request";
