@@ -106,6 +106,7 @@
       <label>tablet</label><select id="st-tablet"></select>
       <label>node</label><select id="st-node"></select>
       <button id="st-load">Load</button>
+      <span id="st-hint" class="muted"></span>
     </div>
     <div class="card scroll">
       <h2>WAL segments</h2>
@@ -416,12 +417,32 @@ function renderStorageSelectors() {
   const tsel = $("st-tablet");
   const prevT = tsel.value;
   tsel.innerHTML = tablets.map((id) => `<option value="${id}">tablet ${id}</option>`).join("");
-  if (prevT) tsel.value = prevT;
+  if (prevT && [...tsel.options].some((o) => o.value === prevT)) tsel.value = prevT;
+  updateStorageNodeOptions();
+}
+
+// The storage endpoints (WAL/LSM/scan/key) are node-local — a node that hosts no
+// replica of the tablet answers 404 — so offer only nodes whose /admin/raftkv view
+// lists the selected tablet: the same registry the storage routes resolve
+// (`local_cp`), so an offered node cannot 404. If none is reachable yet (a freshly
+// provisioned or split tablet whose group is still forming), fall back to every
+// node, annotated, with a hint — so the panels stay usable rather than empty.
+function updateStorageNodeOptions() {
+  const tablet = Number($("st-tablet").value);
   const nsel = $("st-node");
   const prevN = nsel.value;
-  nsel.innerHTML = STATE.nodes.filter((n) => n.ok)
-    .map((n) => `<option value="${esc(n.base)}">node ${esc(nodeRaftkvId(n))} (${esc(n.addr)})</option>`).join("");
-  if (prevN) nsel.value = prevN;
+  const up = STATE.nodes.filter((n) => n.ok);
+  const hostGroup = (n) => n.raftkv && (n.raftkv.groups || []).find((g) => g.tablet === tablet);
+  const hosting = up.filter(hostGroup);
+  const nodes = hosting.length ? hosting : up;
+  nsel.innerHTML = nodes.map((n) => {
+    const g = hostGroup(n);
+    const tag = g ? (g.is_leader ? " · leader" : "") : " · no replica";
+    return `<option value="${esc(n.base)}">node ${esc(nodeRaftkvId(n))} (${esc(n.addr)})${tag}</option>`;
+  }).join("");
+  if (prevN && [...nsel.options].some((o) => o.value === prevN)) nsel.value = prevN;
+  $("st-hint").textContent = hosting.length ? ""
+    : "no reachable node hosts this tablet yet (group still forming?)";
 }
 
 async function loadStorage() {
@@ -867,6 +888,7 @@ document.querySelectorAll("nav button").forEach((b) =>
     $(b.dataset.tab).classList.add("active");
   }));
 $("refresh").addEventListener("click", loadAll);
+$("st-tablet").addEventListener("change", updateStorageNodeOptions);
 $("st-load").addEventListener("click", loadStorage);
 $("scan-load").addEventListener("click", browseKeys);
 $("key-load").addEventListener("click", inspectKey);
