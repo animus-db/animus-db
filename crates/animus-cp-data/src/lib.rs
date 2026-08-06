@@ -818,11 +818,16 @@ impl<E: Coresident, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// replica spawns its co-resident new-group member and the new group forms with
     /// no external handoff.
     ///
-    /// **Limitation (production-hardening, deferred to the `animusd` assembly):**
-    /// the hook is invoked on *every* apply of the `Split`, so re-applying it after
-    /// a crash recovery would mint the sibling twice. Idempotency across recovery
-    /// (and the control-plane-driven id allocation) is the remaining integration
-    /// plumbing, like Stage C/D's other deferred pieces.
+    /// The hook fires **at most once** per group, regardless of how many `Split`
+    /// commands are proposed or committed: `apply_and_compact`'s `already_split`
+    /// flag makes every application after the first a no-op (it never recomputes
+    /// the handoff, never re-invokes the hook), so a WAL replay after a crash
+    /// recovery — or a genuinely duplicate `Split` commit, e.g. from a caller that
+    /// proposes a split more than once — cannot mint the sibling twice or hand it an
+    /// already-tombstoned (empty) range. See
+    /// `split_in_band.rs::duplicate_split_proposal_does_not_lose_data` for the
+    /// regression: without that guard, a second application's *empty* handoff can
+    /// race the first's *real* one for a mint, silently losing the split's data.
     pub fn in_band_split_hook<MkEngine>(
         env: E,
         my_new_id: NodeId,
@@ -896,6 +901,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
     engine_applied: &AtomicU64,
     wal_lock: &AsyncMutex<()>,
     halted: &AtomicBool,
+    already_split: &mut bool,
 ) -> bool {
     let mut did_work = false;
 
@@ -989,31 +995,59 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                     .insert(index, swapped);
             }
             KvCommand::Split { at } => {
-                // Drain the pending run so the handoff capture below sees every
-                // earlier committed write in this apply pass.
-                flush_pending(storage, &mut pending).await;
-                // Capture the handed-off range `[at, ∞)` from this replica's
-                // committed state. Every replica applies the same `Split` at the
-                // same point in the command order, so the captured handoff is
-                // consistent across replicas (ADR 0017 D).
-                let handoff = keys_from(storage, &at).await;
-                // In-band new-group creation: hand the range to the split hook,
-                // which (when wired) mints a co-resident sibling and seeds the new
-                // tablet's group from it. With no hook, the new group is created
-                // externally from a leader handoff (the prior behavior).
-                if let Some(hook) = on_split {
-                    hook(at.clone(), handoff.clone());
+                // A group splits **at most once** in its lifetime — once applied, its
+                // valid range is permanently bounded to `[lo, at)` (splitting the
+                // resulting range again must come from a *new* instance: the child
+                // tablet's own group with its own hook). A second `Split` entry is
+                // possible in practice, not just theory: `animusd`'s auto-split loop
+                // reads `Metadata`/calls `local_pairs()`/`propose_split()` per node, and
+                // in an in-process `--cluster N` run every node's loop shares one
+                // `ClusterEdgeState` — so several nodes can independently observe the
+                // same over-threshold leader on the same tick and all call
+                // `propose_split`, landing more than one `Split` command in the
+                // committed log for the same group. Without this guard, re-applying a
+                // second `Split` recomputes the handoff from storage — now **empty**,
+                // since the first application already tombstoned `[at, ∞)` — and fires
+                // the hook again with that empty handoff. The hook spawns one async task
+                // per replica to mint the new tablet's group, gated only by a per-node
+                // "mint once" set keyed on the *tablet id* (not on which `Split`
+                // application triggered it); if the empty-handoff task wins that mint
+                // race, the new group is seeded with no data and the real rows are lost
+                // for good — the root cause of `tablet_auto_splits_when_it_grows`
+                // flaking on "key not served after auto-split". Treat every `Split`
+                // after the first as a no-op, exactly like `NoOp`: harmless regardless
+                // of *why* a duplicate landed (an in-process trigger race today; a stale
+                // retry after a leader failover would hit the same guard, since WAL
+                // replay applies through this identical path and sets the flag before
+                // any duplicate already in the log is ever reached).
+                if !*already_split {
+                    // Drain the pending run so the handoff capture below sees every
+                    // earlier committed write in this apply pass.
+                    flush_pending(storage, &mut pending).await;
+                    // Capture the handed-off range `[at, ∞)` from this replica's
+                    // committed state. Every replica applies the same `Split` at the
+                    // same point in the command order, so the captured handoff is
+                    // consistent across replicas (ADR 0017 D).
+                    let handoff = keys_from(storage, &at).await;
+                    // In-band new-group creation: hand the range to the split hook,
+                    // which (when wired) mints a co-resident sibling and seeds the new
+                    // tablet's group from it. With no hook, the new group is created
+                    // externally from a leader handoff (the prior behavior).
+                    if let Some(hook) = on_split {
+                        hook(at.clone(), handoff.clone());
+                    }
+                    // The handed-off range now belongs to the new tablet, so tombstone
+                    // it here — consistently on every replica — under a single sync.
+                    let tombstones: Vec<MergeOp> = handoff
+                        .iter()
+                        .map(|(key, _)| MergeOp::tombstone(key.clone(), index))
+                        .collect();
+                    storage
+                        .merge_batch(tombstones)
+                        .await
+                        .expect("raftkv apply split tombstones");
+                    *already_split = true;
                 }
-                // The handed-off range now belongs to the new tablet, so tombstone
-                // it here — consistently on every replica — under a single sync.
-                let tombstones: Vec<MergeOp> = handoff
-                    .iter()
-                    .map(|(key, _)| MergeOp::tombstone(key.clone(), index))
-                    .collect();
-                storage
-                    .merge_batch(tombstones)
-                    .await
-                    .expect("raftkv apply split tombstones");
             }
             KvCommand::NoOp => {}
         }
@@ -1356,6 +1390,13 @@ async fn apply_loop<E: Env, S: StorageEngine>(
     halted: Arc<AtomicBool>,
     apply_stopped: Arc<AtomicBool>,
 ) {
+    // Owned by this task alone (the sole apply-loop instance for the group), so a
+    // plain `bool` — set true the first time this task applies a `Split` — suffices;
+    // no `Arc`/atomic needed. It persists across loop iterations (declared outside
+    // the `loop`), including a full WAL replay after restart: the recovered log
+    // applies through this same loop before any live command, so a replayed `Split`
+    // sets the flag exactly as a live one would.
+    let mut already_split = false;
     loop {
         if halted.load(Ordering::SeqCst) {
             apply_stopped.store(true, Ordering::SeqCst);
@@ -1370,6 +1411,7 @@ async fn apply_loop<E: Env, S: StorageEngine>(
             &engine_applied,
             &wal_lock,
             &halted,
+            &mut already_split,
         )
         .await;
         if !did_work {

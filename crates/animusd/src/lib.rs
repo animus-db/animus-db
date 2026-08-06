@@ -2726,9 +2726,24 @@ const AUTO_SPLIT_EST_ENTRY_BYTES: u64 = 32;
 /// Only the node hosting a tablet's leader reads `local_pairs`/triggers, so in a
 /// one-process-per-node deployment exactly one node triggers. (In a single
 /// `--cluster N` process the edge state is shared, so every node's loop sees the
-/// same leader handle and may trigger redundantly — harmless: the control plane
-/// rejects a re-split of an already-split range, and the per-node mint gate dedups
-/// the hook, so it converges to one split.)
+/// same leader handle and may trigger redundantly — the control plane rejects a
+/// re-split of an already-split *metadata* range, but that alone does not stop a
+/// second `propose_split` from reaching the CP group: metadata rejection only dedups
+/// which `SplitTablet` command wins, not who then calls `propose_split` on the data
+/// plane, so more than one `Split` command really can land in the committed log.
+/// **Genuinely harmless only because `animus-cp-data`'s apply of `KvCommand::Split`
+/// is itself idempotent** — a group splits once in its lifetime, and every
+/// application after the first is a no-op (`apply_and_compact`'s `already_split`
+/// flag). Without that guard a second, redundant `Split` re-fires the split hook
+/// with an *empty* handoff (the range was already tombstoned by the first
+/// application), and that empty-handoff task can win the per-node mint race against
+/// the real one — silently seeding the new tablet's group with no data. That was a
+/// real, intermittent bug (`tablet_auto_splits_when_it_grows` flaking on "key not
+/// served after auto-split" on unmodified `main`, no manual trigger needed), not a
+/// hypothetical one — fixed at the data-plane apply layer, not here, so it is safe
+/// regardless of *why* a duplicate `propose_split` happens (this redundant-trigger
+/// path today; a stale retry after a data-plane leader failover would hit the same
+/// guard).
 ///
 /// `threshold` is a **key count** here — a placeholder size signal; a real
 /// byte/size-based threshold is future tuning. Disabled unless a threshold is wired
