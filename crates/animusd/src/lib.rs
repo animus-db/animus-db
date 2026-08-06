@@ -3218,6 +3218,29 @@ async fn auto_split_loop(ctx: ClientCtx, threshold: usize) {
         tokio::time::sleep(AUTO_SPLIT_INTERVAL).await;
 
         for (tablet, split_key) in std::mem::take(&mut pending) {
+            // The source tablet can vanish out from under a pending split — most
+            // concretely, a `DROP TABLE` while step 2 is still outstanding:
+            // `DropTableTablets` removes every tablet scoped to the table in one
+            // apply, the source *and* any child it had already minted (a split
+            // child inherits the parent's table scope), so there is nothing left
+            // to retry or clean up. Without this check the loop retries a tablet
+            // id that can never have a leader again, forever — every tick paying
+            // a full routing-timeout round trip for nothing (`propose_split_data`
+            // resolves "no CP group leader reachable" for a tablet absent from
+            // `Metadata`, which is not the same failure the "abandoned" check
+            // below is built to detect: no local replica handle exists to compare
+            // an applied key against, so `abandoned` would stay `false` and this
+            // would loop forever). Checked before proposing, and before spanning,
+            // so a vanished tablet doesn't even cost a network round trip.
+            if !ctx.raft.metadata().tablets.contains_key(&tablet) {
+                tracing::info!(
+                    tablet = tablet.0,
+                    "auto_split: pending split's source tablet no longer exists \
+                     (table dropped?); giving up on it"
+                );
+                ctx.edge.release_auto_split(tablet);
+                continue;
+            }
             let span = tracing::info_span!("auto_split", tablet = tablet.0, kind = "retry");
             // Patient (2-round) confirm: this loop calls back every tick until the
             // split lands, so a bare confirm-timeout here must not re-propose

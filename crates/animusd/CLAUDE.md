@@ -303,6 +303,31 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   `animus-control`, per this file's "extract the invariant into a pure
   function" convention — reproducing the *exact* live timing on demand isn't
   tractable, but the sequential-mint precondition it depends on is.
+- **`auto_split_loop`'s `pending` retry map has no way to notice its target
+  tablet vanished out from under it — a `DROP TABLE` mid-retry left a `tablet=N
+  kind="retry"` entry retrying forever against a tablet id that will never
+  have a leader again.** `DropTableTablets` removes every tablet scoped to a
+  table in one apply, including a source tablet whose split was still pending
+  (and any child it had already minted, since a split child inherits the
+  parent's table scope — so there's no orphan left to GC here, unlike the
+  entry above). But nothing told the *retry loop* the entry it's holding is
+  now pointless: the retry call resolves "no CP group leader reachable" (a
+  routing failure over a tablet id absent from `Metadata`, not the "different
+  key won" case the abandon check above is built to detect — `local_cp(tablet)`
+  returns `None` for an unregistered id, so `abandoned` stays `false`), which
+  the loop treats as "still committing, retry next tick" — forever, one
+  routing-timeout round trip per tick, live-observed continuing for minutes
+  after the table was dropped. Fixed with the obvious guard: before retrying,
+  check whether `tablet` is still in `ctx.raft.metadata().tablets` at all; if
+  not, give up (no GC needed, no cooldown bookkeeping needed — a dropped id
+  never reappears as a fresh-split candidate, since the fresh-scan iterates
+  `Metadata.tablets.keys()`). **No dedicated regression test**: unlike the
+  entries above, there's no black-box-observable difference between "gave up"
+  and "kept quietly retrying forever" other than wasted CPU/network and log
+  noise — no counter is exposed to assert against, and the fix itself is a
+  one-line existence check with no branching to get subtly wrong. Verified by
+  code review + the full existing `cp_plane.rs`/`drop_table_gc.rs` suites
+  staying green, not by a new test.
 - **A `RaftKvNode` group applies at most one `Split`, *ever* — `auto_split_loop`
   didn't know that, and kept re-triggering an already-split tablet forever.**
   `KvCommand::Split`'s apply-time guard (`animus-cp-data`) makes every `Split`
