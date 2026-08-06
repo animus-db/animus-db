@@ -62,10 +62,18 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   the leader's node over a fresh client connection (ADR 0017 #3b), so dynamic client
   addresses never touch the internal network.
 - **CP routing (ADR 0017 #3a / v1 ADR 0019).** The data path is the **leaderful
-  per-tablet Raft group** (`animus-cp-data`), reached through four `ClientCtx`
+  per-tablet Raft group** (`animus-cp-data`), reached through five `ClientCtx`
   primitives that all resolve the leader the same way (`cp_route`): `cp_read`
   (linearizable ReadIndex), `cp_write` / `cp_delete` (Raft-committed, waited to
-  durable+applied — durable-before-ack), and `cp_scan` (linearizable range read).
+  durable+applied — durable-before-ack), `cp_scan` (linearizable range read), and
+  **`cp_batch_write`** (bulk-write batching, ADR 0017): it **groups keys by tablet**
+  and commits each group as **one `KvCommand::Batch` Raft entry** on that tablet's
+  group leader (one consensus round for the whole group; forwarded via
+  `ClientRequest::PutBatch` if this node isn't the leader), waited to durable+applied.
+  Atomic **within** a tablet (one entry), non-atomic **across** tablets — matching
+  DynamoDB `BatchWriteItem` semantics. The DynamoDB `BatchWriteItem` edge (a
+  `Delete` is a tombstone-*value* write, so puts + deletes ride the same batch) and
+  the admin bulk seeder (`SEED_BATCH_SIZE` keys per entry) both route through it.
   `cp_route` serves **locally** if this node hosts the leader, **forwards** to the
   leader's node if a local replica gives a leader hint + a `client_route` exists
   (ADR 0017 #3b cross-process, wrapped in `ClientRequest::Forwarded`, one hop), and

@@ -57,6 +57,11 @@ use serde::de::DeserializeOwned;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
+/// A list of `(key, value)` pairs — the payload of a batch write (one Raft
+/// `KvCommand::Batch` entry per tablet). Named to keep the batch grouping map
+/// (`BTreeMap<TabletId, KvPairs>`) under clippy's `type_complexity` bar.
+type KvPairs = Vec<(Vec<u8>, Vec<u8>)>;
+
 /// A hosted leaderful CP per-tablet Raft group on this node (ADR 0017 #3a) — the
 /// v1 data plane (ADR 0019). It is backed by either the durable on-disk
 /// [`LsmEngine`] or the volatile [`MemoryEngine`], chosen by [`StorageBackend`] at
@@ -77,6 +82,15 @@ impl CpGroup {
         match self {
             CpGroup::Lsm(n) => n.put(key, value),
             CpGroup::Mem(n) => n.put(key, value),
+        }
+    }
+
+    /// Propose a **batch put** — commit every `(key, value)` as one Raft entry. See
+    /// [`RaftKvNode::put_batch`].
+    fn put_batch(&self, puts: Vec<(Vec<u8>, Vec<u8>)>) -> ProposeResult {
+        match self {
+            CpGroup::Lsm(n) => n.put_batch(puts),
+            CpGroup::Mem(n) => n.put_batch(puts),
         }
     }
 
@@ -460,6 +474,17 @@ pub enum ClientRequest {
     Put {
         key: Vec<u8>,
         value: Vec<u8>,
+        table: String,
+    },
+    /// Store many `(key, value)` pairs of `table` as **one Raft log entry** on the
+    /// tablet group leader (one propose → one commit round → one apply) — the
+    /// bulk-write throughput primitive behind DynamoDB `BatchWriteItem` and the bulk
+    /// seeder. Every entry here belongs to the **same tablet** (the caller groups by
+    /// tablet before proposing, so within one tablet the batch is atomic); it is
+    /// also the cross-process forwarding payload for a batch (ADR 0017 #3b). `table`
+    /// is **required** (ADR 0023).
+    PutBatch {
+        entries: Vec<(Vec<u8>, Vec<u8>)>,
         table: String,
     },
     /// Read the latest value at `key` of `table` (linearizable CP ReadIndex on the
@@ -1459,6 +1484,105 @@ impl ClientCtx {
         }
     }
 
+    /// CP **batch write** of many `(key, value)` pairs of `table` (ADR 0017 —
+    /// bulk-write batching): the keys are grouped by their owning **tablet**, and
+    /// each group is committed as **one** `Batch` Raft entry on that tablet's group
+    /// leader (one propose → one commit round → one apply; forwarded cross-process
+    /// if this node isn't the leader), waited to durable+applied before returning.
+    /// **Within a tablet the batch is atomic** (one entry — it commits whole or not
+    /// at all); **across tablets it is not** (each tablet commits independently),
+    /// which matches real DynamoDB `BatchWriteItem` (non-atomic) semantics. Takes an
+    /// arbitrary `N` (the wire edge caps its own surface). Provisions `table`'s first
+    /// tablet on demand, like [`cp_write`](Self::cp_write). The bulk-write throughput
+    /// primitive behind DynamoDB `BatchWriteItem` and the admin bulk seeder.
+    pub(crate) async fn cp_batch_write(
+        &self,
+        table: &str,
+        entries: Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> Result<(), String> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        // Auto-provision the table's tablet on first write (ADR 0023), as `cp_write`.
+        if !self.raft.metadata().has_table_tablet(table) {
+            self.provision_tablet(table).await?;
+        }
+        // Group by owning tablet: every key of a `Batch` entry must belong to the
+        // one tablet whose leader commits it (a tablet's engine holds only its
+        // range). A freshly created table has a single whole-ring tablet (one
+        // group); a split table fans the batch across its halves.
+        let mut groups: BTreeMap<TabletId, KvPairs> = BTreeMap::new();
+        for (key, value) in entries {
+            let tablet = self
+                .tablet_for(table, &key)
+                .ok_or_else(|| format!("no tablet owns a batch key of table `{table}`"))?;
+            groups.entry(tablet).or_default().push((key, value));
+        }
+        for (_tablet, group) in groups {
+            self.cp_batch_write_group(table, group).await?;
+        }
+        Ok(())
+    }
+
+    /// Write one tablet's group of a batch as a single `Batch` entry: all keys share
+    /// the tablet, so route by the group's first key, then serve locally or forward
+    /// one hop (the batch analog of [`cp_write`](Self::cp_write)'s route).
+    async fn cp_batch_write_group(
+        &self,
+        table: &str,
+        group: Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> Result<(), String> {
+        let Some(first) = group.first().map(|(k, _)| k.clone()) else {
+            return Ok(());
+        };
+        match self.cp_route(table, &first).await {
+            CpRoute::Local(leader) => Self::cp_batch_local(&leader, group).await,
+            CpRoute::Forward(addr) => Self::ok_or_err(
+                self.cp_forward(
+                    addr,
+                    ClientRequest::PutBatch {
+                        entries: group,
+                        table: table.to_owned(),
+                    },
+                )
+                .await,
+                "forwarded CP batch write",
+            ),
+            CpRoute::None => Err("no CP group leader reachable".into()),
+        }
+    }
+
+    /// Propose a `Batch` on a **known-leader** local handle and wait until it is
+    /// committed + durable + applied — durable-before-ack. The whole batch is one
+    /// Raft entry, so confirming the **last** key reflects our value on the leader's
+    /// local engine means the entry committed + applied and the whole batch is
+    /// durable (the leader applies only after a quorum commit + WAL fsync, as in
+    /// [`cp_put_local`](Self::cp_put_local); a per-batch quorum barrier would not
+    /// scale under load).
+    async fn cp_batch_local(
+        leader: &CpGroup,
+        group: Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> Result<(), String> {
+        let Some((probe_key, probe_val)) = group.last().cloned() else {
+            return Ok(());
+        };
+        match leader.put_batch(group) {
+            ProposeResult::Accepted { .. } => {
+                let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
+                loop {
+                    if leader.local_get(&probe_key).await.as_deref() == Some(probe_val.as_slice()) {
+                        return Ok(());
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err("CP batch write did not commit in time".into());
+                    }
+                    tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+                }
+            }
+            ProposeResult::NotLeader { .. } => Err("CP group leader moved; retry".into()),
+        }
+    }
+
     /// CP **delete** of `key` (ADR 0017): a Raft-committed tombstone, waited to
     /// durable+applied (a linearizable read then reads `None`) before returning.
     /// Forwarded if this node isn't the leader. Used by the CQL whole-partition
@@ -1804,6 +1928,20 @@ impl ClientCtx {
                     return ClientResponse::Error("forwarded CP op: not the leader here".into());
                 };
                 match Self::cp_put_local(&leader, key, value).await {
+                    Ok(()) => ClientResponse::PutOk,
+                    Err(e) => ClientResponse::Error(e),
+                }
+            }
+            ClientRequest::PutBatch { entries, table } => {
+                // All entries share one tablet (the forwarder grouped by tablet), so
+                // resolve the leader by the first key and serve the whole batch here.
+                let Some(first) = entries.first().map(|(k, _)| k.clone()) else {
+                    return ClientResponse::PutOk; // empty batch is a no-op
+                };
+                let Some(leader) = self.cp_leader_for(&table, &first) else {
+                    return ClientResponse::Error("forwarded CP op: not the leader here".into());
+                };
+                match Self::cp_batch_local(&leader, entries).await {
                     Ok(()) => ClientResponse::PutOk,
                     Err(e) => ClientResponse::Error(e),
                 }
@@ -2619,6 +2757,12 @@ async fn handle_client(mut stream: TcpStream, ctx: ClientCtx) -> std::io::Result
             // #3a), scoped to the named table (ADR 0023). `table` is a required field
             // on the request type, so there is no unscoped data op to reject here.
             ClientRequest::Put { key, value, table } => ctx.cp_put(&table, key, value).await,
+            ClientRequest::PutBatch { entries, table } => {
+                match ctx.cp_batch_write(&table, entries).await {
+                    Ok(()) => ClientResponse::PutOk,
+                    Err(e) => ClientResponse::Error(e),
+                }
+            }
             ClientRequest::Get { key, table } => ctx.cp_get(&table, key).await,
             ClientRequest::Scan {
                 start,
