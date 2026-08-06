@@ -138,6 +138,28 @@ async fn dashboard_serves_spa_with_cors_and_peers() {
         assert_eq!(s, 200);
         assert_eq!(body2.len(), body.len(), "/admin/ui is the same asset");
 
+        // ---- per-tab deep links (ADR 0021 follow-up 7) also serve the SPA --
+        // The client reads location.pathname to pick the active tab, so the
+        // server just needs to serve the same asset for any /admin/ui/<tab>
+        // path — including one it doesn't recognize (the client falls back to
+        // the default tab rather than 404ing).
+        for path in [
+            "/admin/ui/nodes",
+            "/admin/ui/tablets",
+            "/admin/ui/storage",
+            "/admin/ui/write",
+            "/admin/ui/not-a-real-tab",
+        ] {
+            let (s, head, body3) = raw(admin_addr, "GET", path).await;
+            assert_eq!(s, 200, "{path} serves the dashboard");
+            assert!(
+                head.to_ascii_lowercase()
+                    .contains("content-type: text/html"),
+                "{path} is text/html, headers:\n{head}"
+            );
+            assert_eq!(body3.len(), body.len(), "{path} is the same asset");
+        }
+
         // ---- CORS on the JSON surface (the fan-out prerequisite) -----------
         let (s, head, _) = raw(admin_addr, "GET", "/admin/status").await;
         assert_eq!(s, 200);
