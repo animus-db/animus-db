@@ -3050,6 +3050,16 @@ async fn auto_split_loop(ctx: ClientCtx, threshold: usize) {
                     "auto_split: pending split lost a same-tick race to a different key; \
                      abandoning (the tablet's data already moved under the winning split)"
                 );
+                // Refresh the cooldown here, same as a fresh trigger does: without
+                // this, an abandoned tablet is immediately eligible again on the
+                // very next tick (`is_fresh_split_candidate` only excludes
+                // `pending`/recently-`last_triggered`, and this entry is leaving
+                // `pending` right now). Under repeated contention (this node's own
+                // key kept losing races) that let a tablet churn through a fresh
+                // split id every tick indefinitely — each new attempt abandoned in
+                // turn — instead of backing off to let the winning split's data
+                // move actually shrink the tablet below `threshold`.
+                last_triggered.insert(tablet, tokio::time::Instant::now());
                 continue;
             }
             tracing::warn!(
