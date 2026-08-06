@@ -407,7 +407,13 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
       flag (a CP-hosting node splits a tablet it leads once it exceeds K keys, Phase
       2.4, via `start_cluster_with_auto_split`), seeding past K auto-shards the
       keyspace — verified end to end (seed 12k keys, `--auto-split 4000` → 5 tablets).
-      `tests/admin_endpoint.rs::admin_seed_writes_synthetic_keys`.
+      `tests/admin_endpoint.rs::admin_seed_writes_synthetic_keys`. **Wrapped in an
+      `admin_seed` span** (per-chunk `admin_seed_batch` children, ADR 0027): the
+      seeder calls `cp_batch_write` directly rather than going through
+      `handle_client`, so without its own span a batch forward's
+      `otel::current_traceparent()` would have no active context to inject — the
+      seed would write real data but be invisible in a trace backend no matter how
+      much it wrote.
   - **Gotcha — `/admin/raftkv` is node-local, but in a single `--cluster N` process
     the shared `ClusterEdgeState` registers *every* node's CP group handle, so one
     node's view lists all replicas; a one-process-per-node deployment (separate edge
