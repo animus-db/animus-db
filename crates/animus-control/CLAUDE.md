@@ -50,7 +50,19 @@ epoch compare-and-swap transactions.
   config rides snapshots + `InstallSnapshot`), and `change_membership` appends a
   single-server config entry (one-in-flight, no leader self-removal). The control
   plane never reconfigures, so its config stays `= initial_config` and its
-  behavior is unchanged. **Two apply models
+  behavior is unchanged. **Pre-vote (ADR 0009):** an election-timeout no longer
+  campaigns directly — the node becomes a `Role::PreCandidate` and runs a
+  `RaftMsg::PreVote`/`PreVoteResp` round **without bumping its term**; only a
+  pre-vote majority triggers the real, term-incrementing `start_election`. Peers
+  grant a pre-vote only with **no live leader** (leader lease =
+  `leader_id.is_some() && now < election_deadline`, or `role == Leader`), so a
+  briefly-stalled/partitioned node can't inflate the cluster term and disrupt a
+  healthy leader. Pre-vote messages **bypass** the higher-term step-down (the one
+  exception: a *rejecting* `PreVoteResp` with a higher real term reverts the
+  pre-candidate to a follower at that term). `set_election_timeout(base, now,
+  entropy)` makes the (default-150ms) timeout base configurable so the assembly
+  layer can widen it for a node doing real disk I/O. Both are additive on the
+  shared wire, so `animus-cp-data` reuses them unchanged. **Two apply models
   (ADR 0017):** the control plane's `Metadata` applies **in-core, synchronously**
   (`StateMachine::DRIVER_APPLIED = false`, the default); a data-plane KV store sets
   `DRIVER_APPLIED = true`, so the core does *not* apply in-core — it buffers each
@@ -242,5 +254,10 @@ from a seed), and **control-plane metrics** moving
 under known events (`metrics.rs`, ADR 0015 — a forced election bumps the election
 counters + the leadership gauge; a crashed heartbeating member bumps
 `failure_detector_down`, its recovery bumps `failure_detector_up`; plus a
-same-seed byte-identical-snapshot reproducibility check). Use `run_for`, never
-`run()` (perpetual heartbeats).
+same-seed byte-identical-snapshot reproducibility check), and **pre-vote**
+(`pre_vote.rs`, ADR 0009 — core-level: a live-leader lease rejects a pre-vote and
+never changes the term, an expired lease grants, a timeout makes a `PreCandidate`
+without bumping the term; end-to-end under `SimEnv`: an isolated follower's
+pre-vote rounds don't move the stable leader's term and it rejoins on heal with no
+election, and a genuine leader crash still elects a new leader at a higher term).
+Use `run_for`, never `run()` (perpetual heartbeats).

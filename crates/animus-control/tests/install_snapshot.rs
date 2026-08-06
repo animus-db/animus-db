@@ -108,7 +108,17 @@ fn follower_catches_up_via_multi_chunk_snapshot() {
     // Elect node 0 leader of a two-node group: time out into a candidacy, then
     // feed it node 1's granted vote.
     let mut leader = RaftCore::new(0, &PAIR, Nanos(0), 7);
-    let _ = leader.tick(now, 7); // election timeout -> Candidate, RequestVote
+    let _ = leader.tick(now, 7); // election timeout -> pre-candidate, PreVote
+    // A pre-vote grant tips the pre-candidacy into a real, term-bumping election.
+    let _ = leader.handle(
+        1,
+        RaftMsg::PreVoteResp {
+            term: leader.term() + 1,
+            granted: true,
+        },
+        now,
+        7,
+    );
     let _ = leader.handle(
         1,
         RaftMsg::RequestVoteResp {

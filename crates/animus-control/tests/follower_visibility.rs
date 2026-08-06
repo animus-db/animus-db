@@ -148,9 +148,25 @@ fn follower_to_leader_keeps_applied_then_gates_new_proposals() {
     assert_eq!(node.last_applied(), 1, "applied on commit as a follower");
     assert_eq!(node.durable_index(), 0, "no local fsync");
 
-    // Win an election (the other two nodes grant their votes).
-    node.tick(Nanos(1_000_000_000), 7); // -> candidate, term 2, RequestVote out
-    assert_eq!(node.role(), Role::Candidate);
+    // Win an election (the other two nodes grant their votes). With pre-vote the
+    // timeout first makes the node a *pre-candidate* (no term bump); a pre-vote
+    // grant then tips it into the real, term-incrementing election.
+    node.tick(Nanos(1_000_000_000), 7); // -> pre-candidate, PreVote out (term still 1)
+    assert_eq!(node.role(), Role::PreCandidate);
+    node.handle(
+        1,
+        RaftMsg::PreVoteResp {
+            term: node.term() + 1, // the prospective term the pre-vote is for
+            granted: true,
+        },
+        Nanos(1_000_000_001),
+        7,
+    );
+    assert_eq!(
+        node.role(),
+        Role::Candidate,
+        "pre-vote quorum -> real election"
+    );
     for granter in [1u64, 2u64] {
         node.handle(
             granter,

@@ -93,7 +93,17 @@ fn driver_applied_core_buffers_effects_instead_of_applying_in_core() {
 fn elect_sole_leader(group: &[NodeId]) -> KvCore {
     let now = Nanos(1_000_000_000);
     let mut leader: KvCore = RaftCore::new(group[0], group, Nanos(0), 7);
-    let _ = leader.tick(now, 7); // election timeout -> Candidate, RequestVote
+    let _ = leader.tick(now, 7); // election timeout -> pre-candidate, PreVote
+    // A pre-vote grant tips the pre-candidacy into a real, term-bumping election.
+    let _ = leader.handle(
+        group[1],
+        RaftMsg::PreVoteResp {
+            term: leader.term() + 1,
+            granted: true,
+        },
+        now,
+        7,
+    );
     let _ = leader.handle(
         group[1],
         RaftMsg::RequestVoteResp {
@@ -209,7 +219,17 @@ fn caught_up_node_reships_non_empty_snapshot() {
 
     // --- Node 1 becomes leader (higher term) and must re-ship to a fresh node 2.
     let later = Nanos(hb.0 + 1_000_000_000);
-    let _ = mid.tick(later, 7); // -> Candidate, term bumps above node 0's
+    let _ = mid.tick(later, 7); // -> pre-candidate (term unchanged)
+    // A pre-vote grant tips it into the real election, bumping the term above node 0's.
+    let _ = mid.handle(
+        2,
+        RaftMsg::PreVoteResp {
+            term: mid.term() + 1,
+            granted: true,
+        },
+        later,
+        7,
+    );
     let _ = mid.handle(
         2,
         RaftMsg::RequestVoteResp {
