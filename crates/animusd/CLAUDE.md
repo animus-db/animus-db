@@ -223,6 +223,26 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   1s). See the root `CLAUDE.md` engineering-practices entry for the general
   lesson (sweep the *shared primitive*, not just the two call sites a bug
   report named).
+- **`auto_split_loop`'s "only the leader's host triggers" gate
+  (`ctx.edge.cp_leader(tablet)`) is not node-scoped under `--cluster N`**:
+  `ClusterEdgeState::cp_leader` returns the first registered handle for a
+  tablet that `is_leader()` across the *whole* shared `raftkv` map, with no
+  notion of which node is asking — so every node's `auto_split_loop` task sees
+  `Some(leader)` simultaneously, and all of them can independently propose a
+  fresh (possibly differently-keyed) `SplitTablet` for the same source tablet
+  in the same tick. Since a source tablet's underlying CP group can only win
+  its one-time data-plane split for a single key, every losing proposer's
+  metadata-only tablet is permanently orphaned — live-observed as 3
+  near-simultaneous step-1 commit failures for one tablet, and as a tablet's
+  split id churning upward forever (an endless fresh-attempt/abandon cycle).
+  Fixed with a **cluster-wide** (not per-node) claim,
+  `ClusterEdgeState::claim_auto_split`/`release_auto_split`, that a loop must
+  win before proposing a fresh split for a tablet — held through step 1, step
+  2, and any pending retry, released only on a terminal outcome (success,
+  step-1 failure, or abandonment). See the root `CLAUDE.md` engineering-
+  practices entry for the general lesson (a shared-registry "does anyone
+  satisfy this" query is not the same as a per-node gate, and the two only
+  diverge under `--cluster N`).
 - **The cluster's members are the CP `raftkv` nodes, not the control ids.** The
   control ids `0..N` are only the Raft *consensus group* for metadata; `bootstrap`
   (leader-only, idempotent) registers the **raftkv ids** (`300+i`) as `Active`
