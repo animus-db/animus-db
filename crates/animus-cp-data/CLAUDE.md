@@ -76,7 +76,16 @@ the engine — the `AccordCore` sync-core/async-driver split.
 - **Durable-before-visible holds** (ADR 0009): effects are only drained for fsynced
   entries, and the engine write follows the WAL `fsync`.
 - Distinct WAL file (`raftkv.wal`) from the control plane's `raft.wal`, so a node
-  can host both planes.
+  can host both planes. The name is exported (`animus_cp_data::WAL`) so the
+  drop-table GC (ADR 0024) can delete a stopped group's WAL.
+- **`shutdown()` is a graceful driver halt, not a kill** (ADR 0024): it latches a
+  flag the driver observes at the top of its loop — i.e. *between* full
+  persist+apply passes and within one wake (message or pending timer), so the WAL
+  and engine are never left mid-write. Poll `is_stopped()` before touching the
+  group's files. A halted node's accessors still answer from the **frozen** core
+  (a halted leader keeps reporting `is_leader() == true`), so never route to a
+  handle after unregistering it; a halted node must not be reused — restarting
+  the tablet means a fresh `start` (the sim tests: `tests/shutdown.rs`).
 
 ## Stage status (ADR 0017)
 

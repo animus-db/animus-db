@@ -155,6 +155,14 @@ pub enum MetaCommand {
     /// Remove a table's schema from the catalog (ADR 0013). Idempotent: a no-op
     /// if no schema is registered for `table`.
     DropTableSchema { table: TableName },
+    /// Remove **every tablet scoped to `table`** from the tablet map, with their
+    /// placement policies (ADR 0024 drop-table GC — the metadata half; each
+    /// hosting node's GC loop reclaims its local group + engine files once the
+    /// tablet leaves the map). Removes the whole set in one apply so no replica
+    /// ever observes a table half-dropped. Idempotent: a no-op if the table has
+    /// no tablets. The legacy whole-keyspace tablet (`table: None`) is never
+    /// scoped to a table, so it is never touched.
+    DropTableTablets { table: TableName },
     /// Add (or replace, by name) a **secondary index** definition on an existing
     /// table's schema (ADR 0013). Rejected if the table has no schema or if the
     /// resulting schema is malformed (duplicate index name reuse aside — an
@@ -394,6 +402,20 @@ impl Metadata {
                     ApplyOutcome::NoOp
                 }
             }
+            MetaCommand::DropTableTablets { table } => {
+                let dropped: Vec<TabletId> =
+                    self.tablets_for_table(table).map(|(&id, _)| id).collect();
+                if dropped.is_empty() {
+                    return ApplyOutcome::NoOp;
+                }
+                for id in dropped {
+                    self.tablets.remove(&id);
+                    // A dropped tablet can no longer be reconciled (mirrors the
+                    // `MergeTablets` cleanup).
+                    self.policies.remove(&id);
+                }
+                ApplyOutcome::Applied
+            }
             MetaCommand::CreateTableIndex { table, index } => {
                 let Some(schema) = self.schemas.get_mut(table) else {
                     return ApplyOutcome::Rejected("no such table schema");
@@ -586,6 +608,62 @@ mod tests {
         // A distinct member coexists.
         assert_eq!(m.apply(&reg(401, "127.0.0.1:9101")), ApplyOutcome::Applied);
         assert_eq!(m.cp_member_addrs.len(), 2);
+    }
+
+    /// `DropTableTablets` (ADR 0024): removes every tablet scoped to the table —
+    /// split children included — with their policies, in one apply; leaves other
+    /// tables' and the legacy unscoped tablet alone; no-op when the table has no
+    /// tablets (so a re-proposed drop does not churn the Raft log).
+    #[test]
+    fn drop_table_tablets_removes_the_tables_tablets_and_policies() {
+        let mut m = Metadata::default();
+        let create = |id: u64, table: Option<&str>| MetaCommand::CreateTablet {
+            tablet: TabletId(id),
+            table: table.map(str::to_owned),
+            range: KeyRange::whole(),
+            replicas: vec![1, 2, 3],
+        };
+        assert_eq!(m.apply(&create(1, Some("users"))), ApplyOutcome::Applied);
+        assert_eq!(m.apply(&create(2, Some("orders"))), ApplyOutcome::Applied);
+        assert_eq!(m.apply(&create(3, None)), ApplyOutcome::Applied); // legacy
+        // Split `users` so the table owns two tablets (the child inherits scope).
+        let split = MetaCommand::SplitTablet {
+            tablet: TabletId(1),
+            split_key: 0x8000_0000_0000_0000u64.to_be_bytes().to_vec(),
+            new_id: TabletId(4),
+        };
+        assert_eq!(m.apply(&split), ApplyOutcome::Applied);
+        for id in [1u64, 2, 4] {
+            assert_eq!(
+                m.apply(&MetaCommand::SetTabletPolicy {
+                    tablet: TabletId(id),
+                    policy: Some(PlacementPolicy::simple("cp-rf", 3)),
+                }),
+                ApplyOutcome::Applied
+            );
+        }
+
+        let drop = MetaCommand::DropTableTablets {
+            table: "users".to_owned(),
+        };
+        assert_eq!(m.apply(&drop), ApplyOutcome::Applied);
+        // Both `users` tablets are gone, with their policies…
+        assert!(m.tablets_for_table("users").next().is_none());
+        assert!(!m.tablets.contains_key(&TabletId(1)));
+        assert!(!m.tablets.contains_key(&TabletId(4)));
+        assert!(!m.policies.contains_key(&TabletId(1)));
+        assert!(!m.policies.contains_key(&TabletId(4)));
+        // …while the other table's tablet + policy and the legacy tablet remain.
+        assert!(m.tablets.contains_key(&TabletId(2)));
+        assert!(m.policies.contains_key(&TabletId(2)));
+        assert!(m.tablets.contains_key(&TabletId(3)));
+
+        // Idempotent: dropping again is a no-op.
+        assert_eq!(m.apply(&drop), ApplyOutcome::NoOp);
+
+        // The allocator never rewinds: a later table gets a fresh id, above the
+        // dropped ones.
+        assert_eq!(m.next_free_tablet_id(), TabletId(5));
     }
 
     /// The monotonic tablet-id allocator (ADR 0023): every created tablet bumps the

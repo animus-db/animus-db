@@ -91,6 +91,19 @@ the production implementation; the deterministic implementation lives in
   variants (the originals forward `env.metrics()`). The storage engine follows it
   too: `LsmEngine::open`/`open_with` forward `env.metrics()`, and the additive
   `LsmEngine::open_with_metrics` threads a recording handle in for a sim test.
+- **`Disk::list` is per-env and non-recursive** (ADR 0024): it enumerates only the
+  files this handle's own `Disk` methods could open — production reads the env's
+  data dir without descending into a sibling's `sib-<id>/` (that is the sibling's
+  disk). It exists so a teardown path (drop-table GC) can find every file of a
+  prefix-named component; deletion stays on the seam (`remove`), so teardown is
+  sim-testable.
+- **Tearing down a single sibling: `ProdEnv::shutdown_tasks()`, never
+  `shutdown()`.** A sibling shares its parent's listener **pool** (`Arc`), and
+  `shutdown()` drains the pool and aborts the unclaimed slots' accept loops —
+  killing the spare inboxes every *future* split on that node needs.
+  `shutdown_tasks()` aborts only the env's own tasks (its accept loop + everything
+  it spawned) and leaves the pool alone. The claimed slot is not returned to the
+  pool (slots are single-use by design); `CP_SIBLING_POOL` sizing accounts for it.
 
 ## Tests
 

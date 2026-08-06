@@ -171,6 +171,15 @@ pub trait Disk: Send + Sync {
     /// whole new contents, never a mix (production does this with a temp file +
     /// rename). Used for log/WAL compaction.
     async fn replace(&self, file: &str, bytes: &[u8]) -> std::io::Result<()>;
+
+    /// The names of every file on this env's disk, in lexicographic order (empty
+    /// if none exist yet). Only files this handle's `Disk` methods could open —
+    /// production lists the env's own data directory, non-recursively (a
+    /// co-resident sibling's `sib-<id>/` subdirectory is that sibling's disk, not
+    /// this one's). The enumeration primitive teardown paths need to find every
+    /// artifact of a prefix-named component (e.g. a dropped tablet's
+    /// `db-t{id}-*` LSM files) without knowing the exact set.
+    async fn list(&self) -> std::io::Result<Vec<String>>;
 }
 
 /// Task spawning. Under production this is `tokio::spawn`; under simulation it

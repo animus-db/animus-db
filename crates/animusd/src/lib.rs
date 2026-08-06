@@ -49,7 +49,7 @@ mod http;
 use animus_control::node::heartbeat_loop;
 use animus_control::{PlacementPolicy, ProposeResult, RaftNode};
 use animus_cp_data::{RaftKvNode, SplitHook};
-use animus_env::{Coresident, Env, Metric, MetricsHandle, NodeId, ProdEnv};
+use animus_env::{Coresident, Disk, Env, Metric, MetricsHandle, NodeId, ProdEnv};
 use animus_storage::{LsmEngine, MemoryEngine, SsTableView, StorageEngine, WalRecordView};
 use animus_tablet::{Epoch, KeyRange, TabletId};
 use serde::Serialize;
@@ -136,6 +136,35 @@ impl CpGroup {
         match self {
             CpGroup::Lsm(n) => n.leader(),
             CpGroup::Mem(n) => n.leader(),
+        }
+    }
+
+    /// Ask the group's driver loop to exit (drop-table GC, ADR 0024). See
+    /// [`RaftKvNode::shutdown`]; poll [`is_stopped`](Self::is_stopped) for the
+    /// actual exit before touching the group's on-disk artifacts.
+    fn shutdown(&self) {
+        match self {
+            CpGroup::Lsm(n) => n.shutdown(),
+            CpGroup::Mem(n) => n.shutdown(),
+        }
+    }
+
+    /// Whether the driver loop has exited after [`shutdown`](Self::shutdown).
+    fn is_stopped(&self) -> bool {
+        match self {
+            CpGroup::Lsm(n) => n.is_stopped(),
+            CpGroup::Mem(n) => n.is_stopped(),
+        }
+    }
+
+    /// The env this group member runs on: its node id is the member's **derived
+    /// group id** (`cp_member_id`), and its disk holds the member's engine +
+    /// `raftkv.wal` files — which is what lets the GC both identify *this node's*
+    /// handle in the shared edge registry and delete the right files.
+    fn env(&self) -> &ProdEnv {
+        match self {
+            CpGroup::Lsm(n) => n.env(),
+            CpGroup::Mem(n) => n.env(),
         }
     }
 
@@ -513,6 +542,9 @@ fn is_relayable_command(command: &MetaCommand) -> bool {
             // leader. Scoped to one tablet per table by the state machine's guard.
             | MetaCommand::CreateTablet { .. }
             | MetaCommand::SetTabletPolicy { .. }
+            // Drop-table GC (ADR 0024): a `DROP TABLE` on a follower-connected
+            // client relays the table's tablet removal to the control leader.
+            | MetaCommand::DropTableTablets { .. }
     )
 }
 
@@ -857,7 +889,13 @@ impl BoundNode {
         // spare picked to replace a `Down` replica) stands up an empty co-resident
         // group for it and catches up via `InstallSnapshot`. Runs on **every** node
         // (a spare is not in the bootstrap CP set, yet must host when later placed).
-        tasks.push(tokio::spawn(cp_join_host_loop(host)));
+        tasks.push(tokio::spawn(cp_join_host_loop(host.clone())));
+
+        // **CP GC loop** (ADR 0024 — drop-table teardown): the join-host loop's
+        // dual. When a tablet this node hosts is dropped from the replicated map
+        // (`DROP TABLE`), stop its group and delete its engine + WAL files, so a
+        // dropped table's disk is actually reclaimed on every replica.
+        tasks.push(tokio::spawn(cp_gc_loop(host)));
 
         // Client request server + DynamoDB HTTP + CQL endpoints share the same
         // context built above (the same raft view, RMW lock, and CP edge state).
@@ -1129,6 +1167,25 @@ impl ClusterEdgeState {
             .entry(tablet)
             .or_default()
             .push(cp);
+    }
+
+    /// Remove and return **one node's** registered handle for `tablet` — the one
+    /// whose env runs as group member `member` — dropping the tablet's entry once
+    /// the last handle is gone (drop-table GC, ADR 0024). Matched per member id
+    /// because in an in-process `--cluster N` run this edge is **shared** across
+    /// nodes: every replica's GC loop must reclaim its *own* group, not whichever
+    /// handle happens to be first. `None` if no such handle is registered (e.g.
+    /// the stand-up path claimed the tablet but has not registered yet — the
+    /// caller retries on a later tick rather than GC-ing a group mid-standup).
+    fn unregister_raftkv(&self, tablet: TabletId, member: NodeId) -> Option<CpGroup> {
+        let mut map = self.raftkv.lock().expect("raftkv handles poisoned");
+        let groups = map.get_mut(&tablet)?;
+        let at = groups.iter().position(|g| g.env().node_id() == member)?;
+        let group = groups.remove(at);
+        if groups.is_empty() {
+            map.remove(&tablet);
+        }
+        Some(group)
     }
 
     /// The CP group handle for `tablet` that currently believes it is leader, if
@@ -2334,6 +2391,146 @@ async fn cp_join_host(
     host.ctx.register_cp_addr(member, addr.to_string()).await;
 }
 
+/// How often the GC loop checks whether a tablet this node hosts has been
+/// dropped from the replicated tablet map (ADR 0024). Teardown is off every
+/// request path, so a slow-ish tick is fine; brisk enough that a dropped
+/// table's disk is reclaimed promptly.
+const CP_GC_INTERVAL: Duration = Duration::from_millis(500);
+/// How long the GC waits for a halted group's driver to actually exit before
+/// giving up for this tick. The driver observes the halt on its next wake (one
+/// Raft timer tick at most), so this is generous; on timeout the handle is
+/// re-registered and the teardown retries on a later tick — files are never
+/// touched while the driver might still write.
+const CP_GC_STOP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The per-node **CP GC loop** (ADR 0024 drop-table teardown): when a tablet
+/// this node hosts disappears from the replicated tablet map (a committed
+/// `DropTableTablets`), reclaim everything local to it — unregister the group
+/// handle, stop its driver, delete its engine + WAL files, and prune the
+/// durable `cp-hosted` marker + `minted` claim. The exact dual of
+/// [`cp_join_host_loop`]: same pull-from-replicated-state shape, same per-node
+/// `minted` state for the decision (never the shared `--cluster N` edge).
+///
+/// Deciding "dropped" from *absence* in the map is sound only over recovered,
+/// durable metadata: this node minted a tablet only after **applying** its
+/// `CreateTablet` (and `metadata()` exposes durable state only), so its
+/// recovered control replica always contains every tablet it hosts — absence
+/// therefore means a committed drop, never not-yet-recovered state. The
+/// `last_applied() == 0` guard skips the pre-recovery window where the default
+/// (empty) `Metadata` would read as "everything dropped".
+///
+/// The converse transient is fine too: while a restarted control replica
+/// re-applies its log it passes through **historical** map states, so the
+/// join-host loop can briefly re-host a *dropped* tablet (an empty group — its
+/// files were already reclaimed, and routing consults the current map, so it
+/// serves nothing). Once replay reaches the committed drop, this loop reclaims
+/// it again; drop + GC are convergent, not one-shot.
+async fn cp_gc_loop(host: CpHostCtx) {
+    loop {
+        tokio::time::sleep(CP_GC_INTERVAL).await;
+        if host.ctx.raft.last_applied() == 0 {
+            continue;
+        }
+        let tablets = host.ctx.raft.metadata().tablets;
+        let mine: Vec<TabletId> = host
+            .minted
+            .lock()
+            .expect("hosting set poisoned")
+            .iter()
+            .copied()
+            .collect();
+        for tablet in mine {
+            if !tablets.contains_key(&tablet) {
+                cp_gc_tablet(&host, tablet).await;
+            }
+        }
+    }
+}
+
+/// Reclaim this node's local artifacts of a dropped `tablet` (the body of
+/// [`cp_gc_loop`]). Every step is idempotent and ordered so a crash anywhere
+/// mid-teardown converges on a later tick or the next restart: unregister the
+/// handle (routing/admin stop seeing the group), stop the driver and wait for
+/// its exit (files quiesce), delete the engine + WAL files, prune the durable
+/// marker (so a restart no longer re-hosts), then release the `minted` claim.
+async fn cp_gc_tablet(host: &CpHostCtx, tablet: TabletId) {
+    let member = cp_member_id(host.base_id, tablet);
+    // No registered handle means the stand-up path claimed `minted` but has not
+    // finished (engine open / start in flight) — retry on a later tick rather
+    // than deleting files under a group mid-standup.
+    let Some(group) = host.ctx.edge.unregister_raftkv(tablet, member) else {
+        return;
+    };
+    group.shutdown();
+    let deadline = tokio::time::Instant::now() + CP_GC_STOP_TIMEOUT;
+    while !group.is_stopped() {
+        if tokio::time::Instant::now() >= deadline {
+            // Never touch files while the driver might still write. Put the
+            // handle back so a later tick retries the whole teardown.
+            tracing::warn!(
+                tablet = tablet.0,
+                "CP GC: group driver did not stop in time"
+            );
+            host.ctx.edge.register_raftkv(tablet, group);
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Delete the group's on-disk artifacts through its own env's disk: the
+    // engine's prefix-named LSM files and the group's Raft WAL (plus any
+    // `replace` temp leftovers, which share those prefixes). The bootstrap/first
+    // tablet lives on the main `raftkv` env under the flat `db-` prefix — its
+    // dir holds nothing else db-prefixed, and the `cp-hosted` marker does not
+    // match; a split/derived tablet lives on its own sibling env dir.
+    let env = group.env().clone();
+    let prefix = if tablet == TABLET {
+        LSM_PREFIX.to_string()
+    } else {
+        format!("db-t{}-", tablet.0)
+    };
+    match env.list().await {
+        Ok(files) => {
+            for file in files {
+                if file.starts_with(&prefix) || file.starts_with(animus_cp_data::WAL) {
+                    if let Err(e) = env.remove(&file).await {
+                        tracing::warn!(?e, file, "CP GC: removing a dropped tablet's file");
+                    }
+                }
+            }
+        }
+        Err(e) => tracing::warn!(?e, tablet = tablet.0, "CP GC: listing tablet files"),
+    }
+    // A derived tablet's sibling env owns its accept loop + any tasks spawned on
+    // it — reap them now the group is gone. `shutdown_tasks` leaves the shared
+    // sibling listener pool alone (a full `shutdown` would drain it and break
+    // future splits). The bootstrap tablet's main env is shared node
+    // infrastructure (heartbeats, peer-sync) and stays up.
+    if tablet != TABLET {
+        env.shutdown_tasks();
+    }
+
+    // Prune the durable marker so a restart no longer re-hosts the tablet
+    // (split-created tablets only; join-hosted ones are not recorded).
+    let pruned = {
+        let mut h = host.hosted.lock().expect("hosted set poisoned");
+        let before = h.len();
+        h.retain(|e| e.tablet != tablet.0);
+        (h.len() != before).then(|| h.clone())
+    };
+    if let Some(snapshot) = pruned {
+        save_hosted_cp(&host.raftkv_env, &snapshot).await;
+    }
+    // Release the claim last, once nothing is left to reclaim. (Tablet ids are
+    // never reused, so nothing can legitimately re-mint this id; a re-created
+    // table gets a fresh tablet.)
+    host.minted
+        .lock()
+        .expect("hosting set poisoned")
+        .remove(&tablet);
+    tracing::info!(tablet = tablet.0, "CP GC: reclaimed dropped tablet");
+}
+
 /// How often the auto-split loop samples tablet sizes (Phase 2.4). A slow
 /// background activity, well off any request path; spaced so a triggered split
 /// settles (metadata + the new group) before the next sample re-reads sizes.
@@ -2700,10 +2897,54 @@ impl ClientCtx {
             })
     }
 
+    /// Drop `table` **and garbage-collect its data** (ADR 0024): remove the
+    /// schema from the replicated catalog, then remove the table's tablets from
+    /// the replicated tablet map — the trigger each hosting node's
+    /// [`cp_gc_loop`] converges on by stopping its local group and deleting its
+    /// engine + WAL files. This is the real `DROP TABLE` sink (CQL + the admin
+    /// dashboard); [`drop_table_schema`](Self::drop_table_schema) alone remains
+    /// the schema-only primitive `ALTER TABLE` uses for its drop-then-recreate —
+    /// an ALTER must never GC the table's data. Returns once both the schema and
+    /// the tablets have left this node's replicated metadata; the per-node file
+    /// reclamation continues asynchronously on every replica.
+    pub(crate) async fn drop_table(&self, table: String) -> Result<(), String> {
+        self.drop_table_schema(table.clone()).await?;
+        let command = MetaCommand::DropTableTablets {
+            table: table.clone(),
+        };
+        // Always propose at least once — never gate on "no tablets in *this*
+        // node's metadata": a lagging replica may not have applied the tablet's
+        // creation yet, so local absence cannot prove there is nothing to drop
+        // (and `propose_and_await` returns on its first poll in that state).
+        // The command is idempotent (`NoOp`) on the leader when there truly is
+        // nothing. (A *schema'd* table is safe either way — the schema-drop
+        // wait above already forced this replica past the tablet's creation in
+        // the log — but a plain-client table skips that wait.)
+        self.propose_schema(&command).await;
+        self.propose_and_await(command, SCHEMA_COMMIT_TIMEOUT, || {
+            self.raft
+                .metadata()
+                .tablets_for_table(&table)
+                .next()
+                .is_none()
+                .then_some(())
+        })
+        .await
+        .map_err(|()| {
+            format!(
+                "DROP TABLE `{table}`: tablet GC did not commit within {}s (no control-plane leader reachable?)",
+                SCHEMA_COMMIT_TIMEOUT.as_secs()
+            )
+        })
+    }
+
     /// Propose `MetaCommand::DropTableSchema` and wait for the table to disappear
     /// from the replicated catalog (ADR 0013). Idempotent: dropping an absent
     /// table returns `Ok(())` immediately. Routes to the leader exactly as
-    /// [`create_table_schema`](Self::create_table_schema).
+    /// [`create_table_schema`](Self::create_table_schema). Schema-only: does
+    /// **not** touch the table's tablets/data — `ALTER TABLE` relies on that for
+    /// its drop-then-recreate; a real drop goes through
+    /// [`drop_table`](Self::drop_table).
     pub(crate) async fn drop_table_schema(&self, table: String) -> Result<(), String> {
         if !self.has_table_schema(&table) {
             return Ok(());

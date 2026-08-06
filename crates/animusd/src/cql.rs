@@ -608,7 +608,11 @@ async fn run_statement(
                     &format!("table `{keyspace}.{}` does not exist", dt.table),
                 );
             }
-            match ctx.drop_table_schema(control_name).await {
+            // The full drop (ADR 0024): schema out of the catalog *and* the
+            // table's tablets out of the map, so every replica's GC loop
+            // reclaims the table's on-disk data. (`ALTER TABLE`'s
+            // drop-then-recreate keeps using the schema-only primitive.)
+            match ctx.drop_table(control_name).await {
                 Ok(()) => {
                     response::schema_change_result(stream, "DROPPED", "TABLE", &keyspace, &dt.table)
                 }

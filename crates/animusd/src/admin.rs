@@ -662,18 +662,18 @@ struct DropTableReq {
     table: String,
 }
 
-/// `POST /admin/data/drop-table {table}` — remove a table's schema from the
-/// replicated catalog (ADR 0021 table management). Reuses the control-plane
-/// `DropTableSchema` path (as CQL `DROP TABLE` does); idempotent. The DynamoDB
-/// wire has no `DeleteTable`, so this is the dashboard's delete primitive. Note it
-/// drops the *schema* (so the table no longer "exists"); any already-written rows
-/// are not garbage-collected here.
+/// `POST /admin/data/drop-table {table}` — drop a table: remove its schema from
+/// the replicated catalog (ADR 0021 table management) **and** its tablets from
+/// the replicated map, which triggers every replica's GC loop to reclaim the
+/// table's data on disk (ADR 0024). Same sink as CQL `DROP TABLE`; idempotent.
+/// The DynamoDB wire has no `DeleteTable`, so this is the dashboard's delete
+/// primitive.
 async fn action_drop_table(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
     let req: DropTableReq = match parse_body(body) {
         Ok(r) => r,
         Err(e) => return e,
     };
-    match ctx.drop_table_schema(req.table.clone()).await {
+    match ctx.drop_table(req.table.clone()).await {
         Ok(()) => (200, json!({ "ok": true, "table": req.table })),
         Err(e) => (409, json!({ "error": e })),
     }

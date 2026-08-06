@@ -97,4 +97,6 @@ Staged (one logical change per PR), on top of ADR 0022's token:
    (`tablet_for(table, key)`), and update the `Query`/`Scan` range math.
 4. **Provision-at-create** — `CreateTable` stands up the table's own hosted Raft
    group (one tablet, splits on demand); `__system` scope for raw keys.
-5. **Per-table scan fan-out** and **drop-table teardown**.
+5. **Per-table scan fan-out**; **drop-table teardown** *(done — ADR 0024:
+   `DropTableTablets` + the per-node GC loop reclaim the table's groups and
+   on-disk data)*.

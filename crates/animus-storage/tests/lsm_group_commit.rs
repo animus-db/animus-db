@@ -199,6 +199,9 @@ impl Disk for CrashEnv {
     async fn replace(&self, file: &str, bytes: &[u8]) -> std::io::Result<()> {
         self.inner.replace(file, bytes).await
     }
+    async fn list(&self) -> std::io::Result<Vec<String>> {
+        self.inner.list().await
+    }
 }
 
 #[async_trait::async_trait]

@@ -714,6 +714,18 @@ impl Disk for SimEnv {
         f.buffered.clear();
         Ok(())
     }
+
+    async fn list(&self) -> std::io::Result<Vec<String>> {
+        let st = self.shared.lock();
+        // `disks` is a BTreeMap keyed `(node, name)`, so a range from this node's
+        // first possible key yields its file names already in lexicographic order.
+        Ok(st
+            .disks
+            .range((self.node_id, String::new())..)
+            .take_while(|((node, _), _)| *node == self.node_id)
+            .map(|((_, name), _)| name.clone())
+            .collect())
+    }
 }
 
 impl Spawner for SimEnv {

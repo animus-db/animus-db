@@ -257,6 +257,43 @@ fn restart_resumes_a_parked_recv() {
     );
 }
 
+/// `Disk::list` enumerates only the calling node's files, sorted, and reflects
+/// `remove` — the primitive a teardown path uses to find every file of a
+/// prefix-named component without knowing the exact set.
+#[test]
+fn disk_list_is_per_node_and_sorted() {
+    let seed = seed_from_env(13);
+    let mut sim = Simulator::new(seed);
+
+    let out = Arc::new(Mutex::new((Vec::new(), Vec::new())));
+    {
+        let env = sim.env(0);
+        let other = sim.env(1);
+        let snap = Arc::clone(&out);
+        env.clone().spawn_task(async move {
+            env.append("db-wal", b"w").await.unwrap();
+            env.append("db-MANIFEST", b"m").await.unwrap();
+            other.append("db-other", b"o").await.unwrap();
+            let before = env.list().await.unwrap();
+            env.remove("db-wal").await.unwrap();
+            let after = env.list().await.unwrap();
+            *snap.lock().unwrap() = (before, after);
+        });
+        sim.run();
+    }
+    let (before, after) = out.lock().unwrap().clone();
+    assert_eq!(
+        before,
+        vec!["db-MANIFEST".to_string(), "db-wal".to_string()],
+        "list must be this node's files only, sorted (seed={seed})"
+    );
+    assert_eq!(
+        after,
+        vec!["db-MANIFEST".to_string()],
+        "list must reflect remove (seed={seed})"
+    );
+}
+
 /// Read a seed from `ANIMUS_SEED` for replay, falling back to `default`. A
 /// failing run prints its seed (see the assertion messages) so it can be
 /// replayed with `ANIMUS_SEED=<seed> cargo test`.

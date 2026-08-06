@@ -646,6 +646,30 @@ cross-cutting ones. Prune/merge entries that become obsolete.
   render correctly. Same "keys aren't uniform below the edge" root as the seed-key
   entry above. (`animusd` `admin.rs::key_display`/`parse_key_display`; the
   `admin_endpoint` test writes a *plain-client* `admin-key` — it caught exactly this.)
+- **A restarted Raft replica re-applies its recovered log from the start, so any
+  consumer keyed on replicated state passes through *historical* states — a loop
+  acting on *absence* (a GC/teardown) must be convergent, and its post-restart
+  assertions must poll.** The drop-table GC (ADR 0024) keys on "tablet no longer in
+  the map"; during post-restart replay the map transiently *contains* the dropped
+  tablet again, so the join-host loop briefly re-hosts an empty zombie group — then
+  replay reaches the drop and the GC reclaims it. That round-trip is correct
+  (convergent, ids never reused), but a test that one-shot-asserts "files still
+  gone" after a fixed post-restart sleep flakes bimodally: it catches the zombie
+  mid-flight. Wait for replay to complete (`last_applied == commit_index` ≥ the
+  full log via `/admin/raft`), then poll to the converged state — the restart
+  instance of the standing "eventual properties get a converged-or-timeout poll"
+  rule. (`animusd` `tests/drop_table_gc.rs`.)
+- **A new variant in a replicated command enum must be added to every *gating*
+  match, not just `apply` — a missed relay allowlist is a bimodal per-process
+  flake.** `animusd`'s cross-process proposal path gates on `is_relayable_command`;
+  a `MetaCommand` variant missing there **works whenever the connected node happens
+  to be the control leader** (proposed locally) and silently times out ("did not
+  commit") when it must relay to another node's leader. The compiler can't catch a
+  `matches!` allowlist, and single-node tests never exercise the relay. When adding
+  a variant, grep the enum's name for gating `matches!`/match sites (allowlists,
+  admin filters) and update them in the same change; regression-test the new
+  command through a **follower-connected** node in a per-process cluster.
+  (`DropTableTablets`; caught by `drop_table_gc.rs`'s 3-node test going bimodal.)
 
 ### Merge / integration workflow
 - **Run `cargo test --workspace` after *each* merge, not just at the end of a

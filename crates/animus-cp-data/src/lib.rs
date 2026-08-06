@@ -33,6 +33,7 @@
 //! ([`RaftKvNode::start_seeded`]).
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -147,8 +148,10 @@ struct CasResults {
 }
 
 /// WAL file for a tablet group's Raft log (distinct from the control plane's
-/// `raft.wal`, so a node can host both without collision).
-const WAL: &str = "raftkv.wal";
+/// `raft.wal`, so a node can host both without collision). Public so a teardown
+/// path (drop-table GC, ADR 0024) can delete a stopped group's WAL alongside its
+/// engine files.
+pub const WAL: &str = "raftkv.wal";
 
 /// A running data-plane Raft node for one tablet group. Cheap to clone; clones
 /// share the one [`RaftCore`] + engine. The driver loop runs on `env`.
@@ -160,6 +163,13 @@ pub struct RaftKvNode<E: Env, S: StorageEngine> {
     all_nodes: Vec<NodeId>,
     reads: Arc<Mutex<ReadState>>,
     cas: Arc<Mutex<CasResults>>,
+    /// Set by [`shutdown`](Self::shutdown); the driver loop observes it on its
+    /// next wake (message or timer tick) and exits.
+    halted: Arc<AtomicBool>,
+    /// Set by the driver loop just before it returns, so a teardown path can
+    /// wait for the last in-flight persist/apply to finish before touching the
+    /// group's durable artifacts ([`is_stopped`](Self::is_stopped)).
+    stopped: Arc<AtomicBool>,
 }
 
 /// Invoked on a replica when it **applies** a committed `Split` (ADR 0017 D), with
@@ -206,6 +216,8 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         )));
         let reads = Arc::new(Mutex::new(ReadState::default()));
         let cas = Arc::new(Mutex::new(CasResults::default()));
+        let halted = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::new(AtomicBool::new(false));
         let node = Self {
             env: env.clone(),
             core: Arc::clone(&core),
@@ -213,6 +225,8 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             all_nodes: all_nodes.clone(),
             reads: Arc::clone(&reads),
             cas: Arc::clone(&cas),
+            halted: Arc::clone(&halted),
+            stopped: Arc::clone(&stopped),
         };
         env.spawn_task(drive(
             env.clone(),
@@ -222,8 +236,37 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             reads,
             cas,
             on_split,
+            halted,
+            stopped,
         ));
         node
+    }
+
+    /// Ask the driver loop to exit: the node stops participating in its group
+    /// (no more persists, applies, ticks, or outbound traffic) as of its next
+    /// wake — a message arrival or the pending timer deadline, so within one
+    /// election-timeout tick. The teardown seam a tablet GC needs (a dropped
+    /// table's group must quiesce before its on-disk artifacts are deleted);
+    /// poll [`is_stopped`](Self::is_stopped) for the actual exit. Idempotent.
+    /// A halted node must not be used again — restarting the tablet means a
+    /// fresh `start`.
+    pub fn shutdown(&self) {
+        self.halted.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether [`shutdown`](Self::shutdown) has been requested.
+    #[must_use]
+    pub fn is_halted(&self) -> bool {
+        self.halted.load(Ordering::SeqCst)
+    }
+
+    /// Whether the driver loop has actually exited after a
+    /// [`shutdown`](Self::shutdown) — once true, no further WAL append/fsync or
+    /// engine apply is in flight, so the group's durable artifacts are safe to
+    /// delete.
+    #[must_use]
+    pub fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::SeqCst)
     }
 
     fn majority(&self) -> usize {
@@ -375,6 +418,9 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         env.clone().spawn_task(async move {
             loop {
                 env.sleep(interval).await;
+                if node.is_halted() {
+                    return;
+                }
                 if let Some(target) = desired() {
                     node.reconfigure_step(&target);
                 }
@@ -882,6 +928,7 @@ async fn install_engine_image<S: StorageEngine>(storage: &S, bytes: &[u8]) {
 /// wait for the next message or timer, step the core, persist+apply again, and
 /// ship outbound. Mirrors the control-plane `RaftNode` driver, minus the
 /// reconcile/failure-detector loops (control-plane only), plus engine apply.
+#[allow(clippy::too_many_arguments)] // the driver's shared-state bundle, built in one place
 async fn drive<E: Env, S: StorageEngine>(
     env: E,
     core: Arc<Mutex<KvCore>>,
@@ -890,6 +937,8 @@ async fn drive<E: Env, S: StorageEngine>(
     reads: Arc<Mutex<ReadState>>,
     cas: Arc<Mutex<CasResults>>,
     on_split: Option<SplitHook>,
+    halted: Arc<AtomicBool>,
+    stopped: Arc<AtomicBool>,
 ) {
     let bytes = env.read(WAL).await.unwrap_or_default();
     let state = PersistedState::replay(PersistedState::decode(&bytes));
@@ -900,6 +949,13 @@ async fn drive<E: Env, S: StorageEngine>(
     }
 
     loop {
+        // A requested shutdown exits *between* full persist+apply passes, so the
+        // WAL and engine are never left mid-write; `stopped` then tells the
+        // teardown path the artifacts are quiescent.
+        if halted.load(Ordering::SeqCst) {
+            stopped.store(true, Ordering::SeqCst);
+            return;
+        }
         flush_and_apply(&env, &core, &storage, &cas, &on_split).await;
 
         let now = env.now();

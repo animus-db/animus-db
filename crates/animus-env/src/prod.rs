@@ -173,6 +173,19 @@ impl ProdEnv {
         }
     }
 
+    /// Abort only the tasks **this env itself** owns — its accept loop and
+    /// everything spawned through [`Spawner::spawn`] on this handle — leaving the
+    /// **shared** sibling listener pool untouched. The per-sibling teardown a
+    /// tablet GC needs: [`shutdown`](Self::shutdown) on a sibling would drain the
+    /// pool it shares with its parent and every other sibling, killing the
+    /// unclaimed slots future co-resident groups (splits) still need. Idempotent.
+    pub fn shutdown_tasks(&self) {
+        let handles = std::mem::take(&mut *self.inner.tasks.lock().expect("tasks poisoned"));
+        for h in handles {
+            h.abort();
+        }
+    }
+
     fn path(&self, file: &str) -> PathBuf {
         self.inner.data_dir.join(file)
     }
@@ -434,6 +447,27 @@ impl Disk for ProdEnv {
         }
         tokio::fs::rename(&tmp, &target).await
     }
+
+    async fn list(&self) -> std::io::Result<Vec<String>> {
+        // Non-recursive: a subdirectory (e.g. a sibling's `sib-<id>/`) is another
+        // env's disk. A data dir that does not exist yet reads as empty — the env
+        // creates it lazily on first write.
+        let mut dir = match tokio::fs::read_dir(&self.inner.data_dir).await {
+            Ok(dir) => dir,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+        let mut names = Vec::new();
+        while let Some(entry) = dir.next_entry().await? {
+            if entry.file_type().await?.is_file() {
+                if let Ok(name) = entry.file_name().into_string() {
+                    names.push(name);
+                }
+            }
+        }
+        names.sort_unstable();
+        Ok(names)
+    }
 }
 
 impl Spawner for ProdEnv {
@@ -495,6 +529,38 @@ mod tests {
 
         // The nested directories really exist on disk.
         assert!(dir.join("sub/dir/file").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `Disk::list` returns this env's own files, sorted, non-recursively — a
+    /// subdirectory (a sibling's dir) is not this env's disk — and reads a
+    /// not-yet-created data dir as empty.
+    #[tokio::test]
+    async fn disk_list_is_own_files_sorted_nonrecursive() {
+        let dir = unique_tmp_dir();
+        let missing = ProdEnv::bind(0, "127.0.0.1:0".parse().unwrap(), dir.join("never-written"))
+            .await
+            .expect("bind")
+            .0;
+        assert_eq!(
+            missing.list().await.expect("list missing"),
+            Vec::<String>::new()
+        );
+
+        let (env, _addr) = ProdEnv::bind(1, "127.0.0.1:0".parse().unwrap(), &dir)
+            .await
+            .expect("bind");
+        env.append("db-wal", b"w").await.expect("append");
+        env.append("db-MANIFEST", b"m").await.expect("append");
+        env.append("sib-300/db-t2-wal", b"s").await.expect("append");
+
+        let got = env.list().await.expect("list");
+        assert_eq!(
+            got,
+            vec!["db-MANIFEST".to_string(), "db-wal".to_string()],
+            "own files sorted; the sibling subdirectory's files are not listed"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

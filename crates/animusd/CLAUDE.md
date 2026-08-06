@@ -144,6 +144,30 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   gone; the control-plane mechanisms (failure detection, placement) remain sim-proven
   in `animus-control`. **Small remainder:** new-group ids are derived, not
   control-plane-allocated (fine for realistic clusters).
+- **Drop-table GC (ADR 0024) is the join-host loop's dual.** The real drop sink is
+  `ClientCtx::drop_table` (CQL `DROP TABLE` + admin `/admin/data/drop-table`):
+  `DropTableSchema` then `DropTableTablets`. **`drop_table_schema` stays
+  schema-only** — CQL `ALTER TABLE` uses it for drop-then-recreate, and an ALTER
+  must never GC data. The per-node `cp_gc_loop` then reclaims any tablet in this
+  node's `minted` set that is absent from `Metadata.tablets`: unregister *this
+  node's* handle (`unregister_raftkv(tablet, member)` — the shared `--cluster N`
+  edge holds every node's handles, so match by the handle env's member id),
+  `CpGroup::shutdown()` + wait `is_stopped()` (never delete under a live driver;
+  on timeout re-register and retry a later tick), delete `db-`/`db-t{id}-*` +
+  `raftkv.wal*` via the group env's `Disk::list`/`remove`, `shutdown_tasks()` a
+  sibling env (never `shutdown()` — that drains the shared pool), prune the
+  `cp-hosted` marker, release `minted` last. Guards worth keeping: skip while
+  `last_applied() == 0` (pre-recovery metadata is empty ⇒ reads as
+  "everything dropped"), and skip a minted-but-unregistered tablet (stand-up in
+  flight). **Drop + GC are convergent, not one-shot**: a restarted control
+  replica re-applies its log through *historical* map states, so join-host may
+  briefly re-host a dropped tablet's empty group — the GC reclaims it once
+  replay passes the drop (test the post-restart state with a poll, never a
+  fixed sleep). **A new `MetaCommand` that must commit from a follower-connected
+  node has to be added to `is_relayable_command`** — missing there is a
+  *bimodal* failure: works when the connected node happens to be the control
+  leader, silently times out ("did not commit") when it must relay
+  (`tests/drop_table_gc.rs` caught exactly this for `DropTableTablets`).
 - **The CP group is durable by default**: each hosting node's `RaftKvNode` is
   backed by the on-disk `LsmEngine` opened over its **raftkv** `ProdEnv`
   (`StorageBackend::Lsm`), so a value acked to a client (Raft-committed + WAL-fsynced

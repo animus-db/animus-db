@@ -14,7 +14,10 @@ epoch compare-and-swap transactions.
   table-schema catalog + keyspaces + **`cp_member_addrs`**: CP group member id →
   `raftkv` address, Phase 2 address distribution) and `MetaCommand` (`UpsertMember`,
   `CreateTablet`, `CasTabletReplicas`, `SplitTablet`, `MergeTablets`,
-  `SetTabletPolicy`, `CreateTableSchema`, `DropTableSchema`, `CreateTableIndex`,
+  `SetTabletPolicy`, `CreateTableSchema`, `DropTableSchema`,
+  **`DropTableTablets`** (ADR 0024: removes *every* tablet scoped to a table +
+  its policies in one apply — the metadata half of drop-table GC, mirroring the
+  `MergeTablets` cleanup; `NoOp` when the table has none), `CreateTableIndex`,
   `DropTableIndex`, `SetTableMode`, `CreateKeyspace`, `DropKeyspace`,
   **`RegisterCpAddr`**). `Metadata::apply` is the deterministic state machine;
   `Metadata::reconcile` is
