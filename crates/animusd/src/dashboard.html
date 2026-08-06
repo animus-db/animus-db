@@ -3,194 +3,270 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>AnimusDB — cluster dashboard</title>
+<title>AnimusDB Console</title>
 <link rel="stylesheet" href="/admin/ui/dashboard.css">
 </head>
 <body>
-<header>
-  <h1>AnimusDB <span class="v">cluster dashboard</span></h1>
-  <span class="banner" id="banner">⚠ admin port — no auth; bind to a trusted interface only</span>
+<header class="topbar">
+  <div class="brand"><span class="name">animusd</span><span class="env">console</span></div>
+  <span class="banner">⚠ admin port — no auth; bind to a trusted interface only</span>
+  <div class="health-pill healthy" id="health-pill"></div>
   <span class="spacer"></span>
-  <div class="controls">
-    <span class="updated" id="updated"></span>
-    <label>auto
-      <select id="auto">
-        <option value="0">off</option>
-        <option value="2000">2s</option>
-        <option value="5000" selected>5s</option>
-        <option value="10000">10s</option>
-      </select>
-    </label>
-    <button id="refresh">Refresh</button>
-  </div>
+  <span class="updated" id="updated"></span>
+  <select id="auto">
+    <option value="0">off</option>
+    <option value="2000">2s</option>
+    <option value="5000" selected>5s</option>
+    <option value="10000">10s</option>
+  </select>
+  <button id="refresh">Refresh</button>
+  <button id="theme-toggle">Dark</button>
 </header>
-<div class="health" id="health"></div>
-<nav class="primary">
-  <button data-tab="nodes" class="active">Nodes</button>
-  <button data-tab="tablets">Tablets</button>
-  <button data-tab="storage">Storage</button>
-  <button data-tab="write">Write</button>
-</nav>
-<main>
-  <section id="nodes" class="active">
-    <div class="card scroll">
-      <h2>Cluster members</h2>
-      <div id="nodes-body"><div class="empty">loading…</div></div>
-    </div>
-    <div class="card">
-      <h2>Metrics history</h2>
-      <div class="muted" style="margin-bottom:10px">A per-node counter trend, sampled every 10s (~2h ring buffer) — like <code>/admin/metrics</code> itself, this is this node's own view, not a cluster aggregate.</div>
-      <div class="row">
-        <label>node</label><select id="mh-node"></select>
-        <button id="mh-load">Load</button>
-        <span id="mh-hint" class="muted"></span>
-      </div>
-      <div id="mh-body"><div class="empty">pick a node and Load</div></div>
-    </div>
-  </section>
 
-  <section id="tablets">
-    <div class="row">
-      <label>filter</label><input type="text" id="topo-filter" placeholder="table or tablet id">
-      <span class="spacer"></span>
-      <span class="muted">view</span>
-      <button id="tablets-view-lanes" class="seg active">Lanes</button>
-      <button id="tablets-view-table" class="seg">Table</button>
-    </div>
-    <div class="card" id="tablets-lanes-card">
-      <h2>Tablets by leader</h2>
-      <div class="muted" style="margin-bottom:10px">Grouped by which node currently leads each tablet's CP group — a leaderless tablet can't serve reads or writes, so it gets its own lane. Click a tablet to jump to its Storage detail.</div>
-      <div id="topology-body"><div class="empty">loading…</div></div>
-    </div>
-    <div class="card scroll" id="tablets-table-card" style="display:none">
-      <h2>Tablet map</h2>
-      <div id="tablets-body"><div class="empty">loading…</div></div>
-    </div>
-  </section>
+<div class="shell">
+  <div class="sidebar">
+    <button class="navlink active" data-tab="overview">Overview</button>
+    <button class="navlink" data-tab="placement">Placement</button>
+    <button class="navlink" data-tab="tablets">Tablets</button>
+    <button class="navlink" data-tab="browser">Data Browser</button>
+    <button class="navlink" data-tab="storage">Storage</button>
+    <span class="spacer"></span>
+    <div class="sidebar-foot" id="sidebar-foot"></div>
+  </div>
 
-  <section id="storage">
-    <div class="row">
-      <label>tablet</label><select id="st-tablet"></select>
-      <label>node</label><select id="st-node"></select>
-      <button id="st-load">Load</button>
-      <span id="st-hint" class="muted"></span>
-    </div>
-    <div class="card scroll">
-      <h2>WAL segments</h2>
-      <div id="wal-body"><div class="empty">pick a tablet + node and Load</div></div>
-    </div>
-    <div class="card scroll" id="wal-records-card" style="display:none">
-      <h2>WAL records — segment <span id="wal-seg"></span></h2>
-      <div id="wal-records"></div>
-    </div>
-    <div class="card scroll">
-      <h2>LSM shape</h2>
-      <div id="lsm-body"><div class="empty">pick a tablet + node and Load</div></div>
-    </div>
-    <div class="card scroll">
-      <h2>Browse keys</h2>
-      <div class="row">
-        <label>start ≥</label><input type="text" id="scan-start" placeholder="(beginning)">
-        <label>limit</label><input type="text" id="scan-limit" value="50" style="width:5em">
-        <button id="scan-load">Browse</button>
+  <main>
+    <section id="overview" class="active view-max">
+      <div class="view-head">
+        <h1>Overview</h1>
+        <span class="muted" id="ov-summary"></span>
       </div>
-      <div id="scan-body"><div class="empty">pick a tablet + node and Browse</div></div>
-    </div>
-    <div class="card">
-      <h2>Key inspector</h2>
-      <div class="row">
-        <label>key</label><input type="text" id="key-input" placeholder="key bytes (utf-8)">
-        <button id="key-load">Inspect</button>
+      <div class="card" id="ov-banner"></div>
+      <div class="card"><div class="stat-tiles" id="ov-tiles"></div></div>
+      <div class="grid-2">
+        <div>
+          <div class="section-head"><span class="title">Nodes</span>
+            <button class="link-text" id="ov-go-placement">View placement →</button></div>
+          <div id="ov-nodes"></div>
+        </div>
+        <div>
+          <div class="section-head"><span class="title">Tables</span>
+            <button class="link-text" id="ov-go-tablets">View tablets →</button></div>
+          <div id="ov-tables"></div>
+        </div>
       </div>
-      <div id="key-body"></div>
-    </div>
-  </section>
+      <div class="card">
+        <div class="section-head" style="margin-bottom:12px">
+          <span class="title">Balance — tablets per node</span>
+          <span class="muted" id="ov-balance-legend"></span>
+        </div>
+        <div class="balance-bars" id="ov-balance"></div>
+      </div>
+    </section>
 
-  <section id="write">
-    <div class="card">
-      <span class="banner">⚠ these write to the live cluster (no auth — trusted interface only)</span>
-    </div>
-    <div class="card scroll">
-      <h2>DynamoDB tables</h2>
-      <div class="row">
-        <label>name</label><input type="text" id="dy-ct-name" placeholder="table name">
-        <label>partition key</label><input type="text" id="dy-ct-pk" value="pk" style="width:7em">
-        <select id="dy-ct-pkt"><option>S</option><option>N</option></select>
-        <label>sort key</label><input type="text" id="dy-ct-sk" placeholder="(none)" style="width:7em">
-        <select id="dy-ct-skt"><option>S</option><option>N</option></select>
-        <button id="dy-ct-create">Create table</button>
-        <span class="muted" id="dy-ct-msg"></span>
+    <section id="placement" class="view-max">
+      <div class="view-head">
+        <h1>Placement</h1>
+        <span class="muted" id="pl-summary"></span>
       </div>
-      <div id="dy-tables"><div class="empty">loading…</div></div>
-    </div>
-    <div class="card scroll">
-      <h2>DynamoDB operation</h2>
-      <div class="row">
-        <label>op</label>
-        <select id="dy-op">
-          <option>PutItem</option><option>GetItem</option><option>UpdateItem</option>
-          <option>DeleteItem</option><option>Query</option><option>Scan</option>
-        </select>
-        <label>table</label><select id="dy-table"></select>
-        <span class="muted" id="dy-no-tables" style="display:none">create a table first</span>
-        <span class="spacer"></span>
-        <span class="muted">view</span>
-        <button id="dy-view-form" class="seg active">Form</button>
-        <button id="dy-view-json" class="seg">JSON</button>
+      <div class="placement-grid" id="pl-grid"><div class="empty">loading…</div></div>
+      <div class="card" id="pl-node-detail" style="display:none">
+        <div class="section-head">
+          <span class="title" id="pl-node-title"></span>
+        </div>
+        <div id="pl-node-tablets"></div>
       </div>
-      <div id="dy-form">
-        <table id="dy-attrs"><thead><tr><th>attribute</th><th>type</th><th>value</th><th></th></tr></thead>
-          <tbody></tbody></table>
-        <button id="dy-add-attr">+ attribute</button>
-        <span class="muted" id="dy-form-hint"></span>
-      </div>
-      <div id="dy-json" style="display:none">
-        <textarea id="dy-raw" rows="10" style="width:100%; font-family:var(--mono); background:var(--panel2); color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:8px"></textarea>
-      </div>
-      <div class="row"><button id="dy-send">Send to cluster</button></div>
-      <div id="dy-result"></div>
-    </div>
-    <div class="card scroll">
-      <h2>CQL editor</h2>
-      <div class="row">
-        <label>keyspace (optional USE)</label><input type="text" id="cql-ks" placeholder="(none)">
-      </div>
-      <textarea id="cql-query" rows="7" style="width:100%; font-family:var(--mono); background:var(--panel2); color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:8px"
-        placeholder="CREATE KEYSPACE ks;
-USE ks;
-CREATE TABLE t (id int PRIMARY KEY, v text);
-INSERT INTO t (id, v) VALUES (1, 'x');
-SELECT * FROM t WHERE id = 1;"></textarea>
-      <div class="row"><button id="cql-run">Run</button> <span class="muted">statements split on “;” and run in order on one connection</span></div>
-      <div id="cql-result"></div>
-    </div>
+    </section>
 
-    <div class="card scroll">
-      <h2>Bulk seed (sharding test)</h2>
-      <div class="muted" style="margin-bottom:8px">Writes synthetic keys into the table selected below to grow its tablet (it must already exist — create it first in the Dynamo or CQL panel, and write to it once so it has a tablet). Run the cluster with <code>--auto-split K</code> to watch tablets split in the Tablets tab as the count crosses K.</div>
-      <div class="row">
-        <label>table</label><select id="seed-table"></select>
-        <span class="muted" id="seed-no-tables" style="display:none"></span>
-        <label>key prefix</label><input type="text" id="seed-prefix" value="seed:" style="width:7em">
-        <label>value bytes</label><input type="text" id="seed-vbytes" value="64" style="width:5em">
-        <label>total</label><input type="text" id="seed-total" value="10000" style="width:7em">
-        <label>chunk</label><input type="text" id="seed-chunk" value="2000" style="width:6em">
-        <button id="seed-go">Seed</button>
-        <button id="seed-stop" disabled>Stop</button>
+    <section id="tablets">
+      <div class="tablets-layout">
+        <div class="tablets-list">
+          <div class="view-head">
+            <h1>Tablets</h1>
+            <span class="muted" id="tb-count"></span>
+          </div>
+          <div class="row">
+            <select id="tb-table-filter"><option value="all">All tables</option></select>
+            <select id="tb-status-filter">
+              <option value="all">All statuses</option>
+              <option value="healthy">Healthy</option>
+              <option value="under-replicated">Under-replicated</option>
+              <option value="electing">Electing</option>
+            </select>
+          </div>
+          <div class="card scroll" style="max-height:640px;overflow-y:auto">
+            <div id="tb-body"><div class="empty">loading…</div></div>
+          </div>
+        </div>
+        <div class="tablet-detail" id="tb-detail" style="display:none"></div>
       </div>
-      <div id="seed-status"></div>
-    </div>
-  </section>
-</main>
+    </section>
+
+    <section id="browser" class="view-max">
+      <div class="view-head">
+        <h1>Data Browser</h1>
+        <div class="seg-group">
+          <button id="br-proto-cql" class="active">CQL</button>
+          <button id="br-proto-dynamo">DynamoDB</button>
+        </div>
+      </div>
+
+      <div id="br-cql-panel">
+        <div class="row" style="margin-bottom:10px">
+          <label>keyspace (optional USE)</label><input type="text" id="br-cql-ks" placeholder="(none)">
+        </div>
+        <textarea id="br-cql-query" rows="4" spellcheck="false" placeholder="SELECT * FROM t LIMIT 20;"></textarea>
+        <div class="row" style="justify-content:flex-end;margin:10px 0">
+          <button class="primary" id="br-cql-run">Run query</button>
+        </div>
+        <div id="br-cql-result"></div>
+      </div>
+
+      <div id="br-dynamo-panel" style="display:none">
+        <div class="row" style="margin-bottom:14px">
+          <label>table</label><select id="br-dy-table"></select>
+          <span class="muted" id="br-dy-no-tables" style="display:none">create a table first</span>
+          <span class="spacer"></span>
+          <button id="br-dy-new-table">+ Create table</button>
+          <button class="danger-text" id="br-dy-drop-table">Delete table</button>
+        </div>
+
+        <div class="card" id="br-dy-table-form" style="display:none;margin-bottom:14px">
+          <h2>Create table</h2>
+          <div class="form-grid">
+            <div class="form-field"><label>Table name</label><input type="text" id="br-dy-ct-name" placeholder="table_name"></div>
+            <div class="form-field"><label>Partition key</label><input type="text" id="br-dy-ct-pk" value="id"></div>
+            <div class="form-field"><label>Type</label><select id="br-dy-ct-pkt"><option value="S">String</option><option value="N">Number</option></select></div>
+            <label class="row" style="font-size:11.5px;color:var(--text2)"><input type="checkbox" id="br-dy-ct-has-sk"> Add sort key</label>
+            <div class="form-field" id="br-dy-ct-sk-wrap" style="display:none"><label>Sort key</label><input type="text" id="br-dy-ct-sk" placeholder="sort_key"></div>
+            <div class="form-field" id="br-dy-ct-skt-wrap" style="display:none"><label>Type</label><select id="br-dy-ct-skt"><option value="S">String</option><option value="N">Number</option></select></div>
+          </div>
+          <div class="row" style="justify-content:flex-end;margin-top:12px">
+            <span class="muted" id="br-dy-ct-msg"></span>
+            <button id="br-dy-ct-cancel">Cancel</button>
+            <button class="primary" id="br-dy-ct-submit">Create table</button>
+          </div>
+        </div>
+
+        <div class="browser-panel" style="margin-bottom:14px">
+          <div class="browser-fields" id="br-dy-fields"></div>
+          <div class="seg-group">
+            <button id="br-dy-op-scan" class="active">Scan</button>
+            <button id="br-dy-op-query">Query</button>
+          </div>
+          <div class="form-grid" id="br-dy-query-form" style="display:none">
+            <div class="form-field"><label>Partition key value</label><input type="text" id="br-dy-pk-value"></div>
+            <span id="br-dy-query-sk-group" style="display:none;gap:12px">
+              <div class="form-field"><label>Sort key condition</label>
+                <select id="br-dy-sk-op">
+                  <option value="=">equals</option>
+                  <option value="begins_with">begins with</option>
+                  <option value="between">between</option>
+                </select>
+              </div>
+              <div class="form-field"><label>Sort key value</label><input type="text" id="br-dy-sk-value" placeholder="value (or lo,hi for between)"></div>
+            </span>
+            <button class="primary" id="br-dy-run-query">Run query</button>
+          </div>
+          <div class="form-grid" id="br-dy-scan-form">
+            <div class="form-field"><label>Filter attribute (this page only)</label><select id="br-dy-filter-attr"><option value="">none</option></select></div>
+            <div class="form-field"><label>Value</label><input type="text" id="br-dy-filter-value" placeholder="contains…"></div>
+            <button class="primary" id="br-dy-run-scan">Run scan</button>
+          </div>
+        </div>
+
+        <div class="card" id="br-dy-item-form" style="display:none;margin-bottom:14px">
+          <h2 id="br-dy-item-form-title">Create item</h2>
+          <table id="br-dy-item-attrs"><thead><tr><th>attribute</th><th>type</th><th>value</th><th></th></tr></thead><tbody></tbody></table>
+          <button id="br-dy-item-add-attr" style="margin-top:8px">+ attribute</button>
+          <div class="row" style="justify-content:flex-end;margin-top:12px">
+            <button id="br-dy-item-cancel">Cancel</button>
+            <button class="primary" id="br-dy-item-submit">Save item</button>
+          </div>
+        </div>
+
+        <div style="display:flex;gap:18px;align-items:flex-start">
+          <div style="flex:1;min-width:0;display:flex;flex-direction:column;gap:10px">
+            <div class="row" style="justify-content:space-between">
+              <span class="muted" id="br-dy-summary"></span>
+              <button id="br-dy-new-item">+ Create item</button>
+            </div>
+            <div class="scroll"><table id="br-dy-items-table"></table></div>
+          </div>
+          <div class="item-detail" id="br-dy-item-detail" style="display:none"></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="storage">
+      <div class="view-head"><h1>Storage</h1></div>
+      <div class="row" style="margin-bottom:14px">
+        <label>tablet</label><select id="st-tablet"></select>
+        <label>node</label><select id="st-node"></select>
+        <button id="st-load">Load</button>
+        <span id="st-hint" class="muted"></span>
+      </div>
+      <div class="card scroll" style="margin-bottom:14px">
+        <h2>WAL segments</h2>
+        <div id="wal-body"><div class="empty">pick a tablet + node and Load</div></div>
+      </div>
+      <div class="card scroll" id="wal-records-card" style="display:none;margin-bottom:14px">
+        <h2>WAL records — segment <span id="wal-seg"></span></h2>
+        <div id="wal-records"></div>
+      </div>
+      <div class="card scroll" style="margin-bottom:14px">
+        <h2>LSM shape</h2>
+        <div id="lsm-body"><div class="empty">pick a tablet + node and Load</div></div>
+      </div>
+      <div class="card scroll" style="margin-bottom:14px">
+        <h2>Browse keys</h2>
+        <div class="row" style="margin-bottom:10px">
+          <label>start ≥</label><input type="text" id="scan-start" placeholder="(beginning)">
+          <label>limit</label><input type="text" id="scan-limit" value="50" style="width:5em">
+          <button id="scan-load">Browse</button>
+        </div>
+        <div id="scan-body"><div class="empty">pick a tablet + node and Browse</div></div>
+      </div>
+      <div class="card" style="margin-bottom:14px">
+        <h2>Key inspector</h2>
+        <div class="row" style="margin-bottom:10px">
+          <label>key</label><input type="text" id="key-input" placeholder="key bytes (utf-8)">
+          <button id="key-load">Inspect</button>
+        </div>
+        <div id="key-body"></div>
+      </div>
+      <div class="card scroll">
+        <h2>Bulk seed (sharding test)</h2>
+        <div class="muted" style="margin-bottom:10px">Writes synthetic keys into the table selected below to grow its tablet (it must already exist — create it first in the Data Browser, and write to it once so it has a tablet). Run the cluster with <code>--auto-split K</code> to watch tablets split in the Tablets view as the count crosses K.</div>
+        <div class="row" style="margin-bottom:10px">
+          <label>table</label><select id="seed-table"></select>
+          <span class="muted" id="seed-no-tables" style="display:none"></span>
+          <label>key prefix</label><input type="text" id="seed-prefix" value="seed:" style="width:7em">
+          <label>value bytes</label><input type="text" id="seed-vbytes" value="64" style="width:5em">
+          <label>total</label><input type="text" id="seed-total" value="10000" style="width:7em">
+          <label>chunk</label><input type="text" id="seed-chunk" value="2000" style="width:6em">
+          <button id="seed-go">Seed</button>
+          <button id="seed-stop" disabled>Stop</button>
+        </div>
+        <div id="seed-status"></div>
+      </div>
+    </section>
+  </main>
+</div>
 
 <script src="/admin/ui/dashboard_core.js"></script>
-<script src="/admin/ui/dashboard_monitoring.js"></script>
-<script src="/admin/ui/dashboard_write.js"></script>
+<script src="/admin/ui/dashboard_overview.js"></script>
+<script src="/admin/ui/dashboard_placement.js"></script>
+<script src="/admin/ui/dashboard_tablets.js"></script>
+<script src="/admin/ui/dashboard_browser.js"></script>
+<script src="/admin/ui/dashboard_storage.js"></script>
 <script>
 "use strict";
-// Wiring: event listeners + initial render. Runs after the three modules above
-// have defined every function it references.
-document.querySelectorAll(".primary button").forEach((b) =>
+// Wiring: event listeners + initial render. Runs after every module above has
+// defined the functions it references.
+initTheme();
+$("theme-toggle").addEventListener("click", toggleTheme);
+
+document.querySelectorAll(".sidebar button.navlink").forEach((b) =>
   b.addEventListener("click", () => activateTab(b.dataset.tab, { push: true })));
 window.addEventListener("popstate", () => {
   pendingStorageParams = paramsFromLocation();
@@ -199,32 +275,54 @@ window.addEventListener("popstate", () => {
 });
 pendingStorageParams = paramsFromLocation();
 activateTab(tabFromPath(window.location.pathname));
+
 $("refresh").addEventListener("click", loadAll);
-$("mh-load").addEventListener("click", loadMetricsHistory);
+
+// Overview
+$("ov-go-placement").addEventListener("click", () => activateTab("placement", { push: true }));
+$("ov-go-tablets").addEventListener("click", () => activateTab("tablets", { push: true }));
+
+// Tablets
+$("tb-table-filter").addEventListener("change", () => { tbTableFilter = $("tb-table-filter").value; renderTablets(); });
+$("tb-status-filter").addEventListener("change", () => { tbStatusFilter = $("tb-status-filter").value; renderTablets(); });
+
+// Data Browser
+$("br-proto-cql").addEventListener("click", () => setProtocol("cql"));
+$("br-proto-dynamo").addEventListener("click", () => setProtocol("dynamo"));
+$("br-cql-run").addEventListener("click", runCql);
+$("br-dy-table").addEventListener("change", onDyTableChange);
+$("br-dy-new-table").addEventListener("click", openTableForm);
+$("br-dy-drop-table").addEventListener("click", dropCurrentTable);
+$("br-dy-ct-has-sk").addEventListener("change", () => {
+  const show = $("br-dy-ct-has-sk").checked;
+  $("br-dy-ct-sk-wrap").style.display = show ? "" : "none";
+  $("br-dy-ct-skt-wrap").style.display = show ? "" : "none";
+});
+$("br-dy-ct-cancel").addEventListener("click", closeTableForm);
+$("br-dy-ct-submit").addEventListener("click", submitTableForm);
+$("br-dy-op-scan").addEventListener("click", () => setDynamoOp("scan"));
+$("br-dy-op-query").addEventListener("click", () => setDynamoOp("query"));
+$("br-dy-pk-value").addEventListener("input", () => { dyPkValue = $("br-dy-pk-value").value; });
+$("br-dy-sk-op").addEventListener("change", () => { dySkOp = $("br-dy-sk-op").value; });
+$("br-dy-sk-value").addEventListener("input", () => { dySkValue = $("br-dy-sk-value").value; });
+$("br-dy-run-query").addEventListener("click", runDynamoOp);
+$("br-dy-filter-attr").addEventListener("change", () => { dyFilterAttr = $("br-dy-filter-attr").value; });
+$("br-dy-filter-value").addEventListener("input", () => { dyFilterValue = $("br-dy-filter-value").value; });
+$("br-dy-run-scan").addEventListener("click", runDynamoOp);
+$("br-dy-new-item").addEventListener("click", openCreateItemForm);
+$("br-dy-item-add-attr").addEventListener("click", () => addItemAttrRow());
+$("br-dy-item-cancel").addEventListener("click", closeItemForm);
+$("br-dy-item-submit").addEventListener("click", submitItemForm);
+
+// Storage
 $("st-tablet").addEventListener("change", () => { updateStorageNodeOptions(); syncStorageUrl(); });
 $("st-node").addEventListener("change", syncStorageUrl);
 $("st-load").addEventListener("click", () => { loadStorage(); syncStorageUrl(); });
-$("topo-filter").addEventListener("input", () => { topoFilter = $("topo-filter").value; renderTopology(); });
-$("tablets-view-lanes").addEventListener("click", () => setTabletsView("lanes"));
-$("tablets-view-table").addEventListener("click", () => setTabletsView("table"));
-setTabletsView("lanes");
 $("scan-load").addEventListener("click", browseKeys);
 $("key-load").addEventListener("click", inspectKey);
-$("dy-add-attr").addEventListener("click", () => addAttrRow());
-$("dy-op").addEventListener("change", dynOnOp);
-$("dy-table").addEventListener("change", onDyTableChange);
-$("dy-view-form").addEventListener("click", () => dynSetView("form"));
-$("dy-view-json").addEventListener("click", () => dynSetView("json"));
-$("dy-send").addEventListener("click", sendDynamo);
-$("dy-ct-create").addEventListener("click", createTable);
-$("cql-run").addEventListener("click", runCql);
 $("seed-table").addEventListener("change", () => { seedTable = $("seed-table").value; renderSeedTables(); });
 $("seed-go").addEventListener("click", seedRun);
 $("seed-stop").addEventListener("click", () => { seeding = false; });
-// Initialize the Dynamo editor (dy-table is filled by renderDynamoTables once
-// /admin/status loads).
-dynModel = dynSkeleton("PutItem", "");
-dynRender();
 
 let timer = null;
 function arm() {

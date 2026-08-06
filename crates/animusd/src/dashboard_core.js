@@ -1,9 +1,12 @@
 "use strict";
-// Shared state, fetch helpers, formatting utilities, and tab routing.
-// `dashboard_monitoring.js` and `dashboard_write.js` load after this file and
-// call into it (STATE, $, esc, getJSON, postJSON, pill, bytes, tokenBound,
-// b64url); nothing here calls into them except `render()`, which is the
-// single per-refresh entry point every tab's render function hangs off of.
+// Shared state, fetch helpers, formatting utilities, theme, and tab routing
+// for the AnimusDB Console. `dashboard_overview.js`, `dashboard_placement.js`,
+// `dashboard_tablets.js`, `dashboard_browser.js`, and `dashboard_storage.js`
+// load after this file and call into it (STATE, $, esc, getJSON, postJSON,
+// pill, bytes, tokenBound, b64url, nodeRaftkvId, cpGroupsByTablet,
+// autoSplitThreshold, tabletStatus, computeHealth, activateTab, gotoStorage);
+// nothing here calls into them except `render()`, the single per-refresh
+// entry point every view's render function hangs off of.
 const SEED = window.location.origin;
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s).replace(/[&<>"]/g, (c) =>
@@ -11,6 +14,25 @@ const esc = (s) => String(s).replace(/[&<>"]/g, (c) =>
 
 // State assembled each refresh.
 let STATE = { status: null, nodes: [], peersErr: null };
+
+// ---- theme ----
+// A UI preference, not data — persisted client-side only. Both palettes are
+// fully defined in dashboard.css; this just toggles which one applies.
+const THEME_KEY = "animusdb-console-theme";
+function applyTheme(theme) {
+  document.documentElement.dataset.theme = theme;
+  const btn = $("theme-toggle");
+  if (btn) btn.textContent = theme === "light" ? "Light" : "Dark";
+}
+function initTheme() {
+  const saved = localStorage.getItem(THEME_KEY);
+  applyTheme(saved === "light" ? "light" : "dark");
+}
+function toggleTheme() {
+  const next = document.documentElement.dataset.theme === "light" ? "dark" : "light";
+  localStorage.setItem(THEME_KEY, next);
+  applyTheme(next);
+}
 
 // Fetch JSON from `base + path`; throws on network/HTTP error.
 async function getJSON(base, path) {
@@ -82,24 +104,94 @@ function tokenBound(v, fill) {
 }
 
 function pill(cls, text) { return `<span class="pill ${esc(cls)}">${esc(text)}</span>`; }
+function dot(cls) { return `<span class="dot ${esc(cls)}"></span>`; }
 
-// A minimal inline SVG sparkline over `values` (oldest first) — no charting
-// library, matching the no-build-step constraint. Flat/empty series render as
-// a flat midline rather than a division-by-zero NaN path. `style="stroke:…"`
-// (not a bare `stroke=` attribute) so CSS custom properties resolve reliably.
-function sparklineSvg(values, opts = {}) {
-  const width = opts.width || 220;
-  const height = opts.height || 32;
-  if (!values.length) return `<span class="muted">no samples yet</span>`;
-  const min = Math.min(...values);
-  const max = Math.max(...values);
-  const span = max - min || 1;
-  const stepX = values.length > 1 ? width / (values.length - 1) : 0;
-  const points = values.map((v, i) =>
-    `${(i * stepX).toFixed(1)},${(height - ((v - min) / span) * height).toFixed(1)}`).join(" ");
-  return `<svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" class="spark">
-    <polyline points="${points}" fill="none" style="stroke:var(--accent)" stroke-width="1.5" />
-  </svg>`;
+// ---- shared data-derivation helpers (used by more than one view) ----
+
+function nodeByRaftkv(id) {
+  return STATE.nodes.find((n) => n.ok && n.config && n.config.raftkv_id === id);
+}
+function nodeRaftkvId(n) { return n.config ? n.config.raftkv_id : "?"; }
+
+// Collect every hosted CP group across reachable nodes, indexed by tablet id.
+function cpGroupsByTablet() {
+  const map = {};
+  for (const n of STATE.nodes) {
+    if (!n.ok || !n.raftkv || !n.raftkv.groups) continue;
+    for (const g of n.raftkv.groups) {
+      (map[g.tablet] = map[g.tablet] || []).push({ node: n, g });
+    }
+  }
+  return map;
+}
+
+// The `--auto-split K` threshold (from any reachable node's `/admin/config` —
+// a single `--cluster N --auto-split K` flag, so every node agrees), or
+// `null` if auto-split isn't enabled for this run.
+function autoSplitThreshold() {
+  const n = STATE.nodes.find((x) => x.ok && x.config && x.config.auto_split_threshold != null);
+  return n ? n.config.auto_split_threshold : null;
+}
+
+// A tablet's derived status: `electing` if no elected leader among its
+// hosting groups, `under-replicated` if fewer nodes are currently reachable
+// and hosting than the tablet's configured replica count, else `healthy`.
+// `gs` is `cpGroupsByTablet()[id] || []`.
+function tabletStatus(t, gs) {
+  if (!gs.some((x) => x.g.is_leader)) return "electing";
+  const configured = (t.replicas || []).length;
+  if (configured > 0 && gs.length < configured) return "under-replicated";
+  return "healthy";
+}
+function statusDotClass(status) {
+  if (status === "healthy" || status === "Active") return "ok-dot";
+  if (status === "under-replicated" || status === "Leaving" || status === "Joining") return "warn-dot";
+  if (status === "electing" || status === "Down") return "bad-dot";
+  return "dim-dot";
+}
+
+// Derive an at-a-glance health rollup from data `loadAll()` already fetched —
+// no new requests. A cluster with no control leader can't accept writes, so
+// that alone is "critical"; a leaderless tablet or a down node is "degraded"
+// (something needs attention, but the cluster is otherwise serving).
+function computeHealth() {
+  const members = (STATE.status && STATE.status.members) || {};
+  const memberIds = Object.keys(members);
+  const downCount = Object.values(members).filter((m) => m.status === "Down").length;
+
+  const tablets = (STATE.status && STATE.status.tablets) || {};
+  const tabletIds = Object.keys(tablets);
+  const groups = cpGroupsByTablet();
+  const leaderlessCount = tabletIds.filter((id) => !(groups[id] || []).some((x) => x.g.is_leader)).length;
+
+  const controlLeader = STATE.nodes.find((n) => n.ok && n.raft && n.raft.is_leader);
+
+  let status = "healthy";
+  if (leaderlessCount > 0 || downCount > 0) status = "degraded";
+  if (!controlLeader) status = "critical";
+
+  return {
+    status, controlLeader,
+    downCount, totalNodes: memberIds.length || STATE.nodes.length,
+    leaderlessCount, totalTablets: tabletIds.length,
+  };
+}
+
+function renderHealthPill() {
+  const h = computeHealth();
+  const label = h.status === "healthy" ? "Healthy"
+    : h.status === "critical" ? "No control leader"
+    : `Degraded · ${h.leaderlessCount + h.downCount} issue${(h.leaderlessCount + h.downCount) === 1 ? "" : "s"}`;
+  $("health-pill").className = "health-pill " + h.status;
+  $("health-pill").innerHTML = `<span class="dot"></span><span class="label">${esc(label)}</span>`;
+}
+
+function renderSidebarFoot() {
+  const tablets = (STATE.status && STATE.status.tablets) || {};
+  const members = (STATE.status && STATE.status.members) || {};
+  const nodeCount = Object.keys(members).length || STATE.nodes.length;
+  $("sidebar-foot").innerHTML =
+    `<div>${esc(nodeCount)} node(s)</div><div>${esc(Object.keys(tablets).length)} tablet(s)</div>`;
 }
 
 async function loadAll() {
@@ -137,18 +229,14 @@ async function loadAll() {
   $("updated").textContent = "updated " + new Date().toLocaleTimeString();
 }
 
-function nodeByRaftkv(id) {
-  return STATE.nodes.find((n) => n.ok && n.config && n.config.raftkv_id === id);
-}
-
 function render() {
-  renderHealthStrip();
-  renderNodes();
-  renderMetricsHistorySelector();
+  renderHealthPill();
+  renderSidebarFoot();
+  renderOverview();
+  renderPlacement();
   renderTablets();
-  renderTopology();
   renderStorageSelectors();
-  renderDynamoTables();
+  renderBrowserTables();
   renderSeedTables();
   // Rebuild the Dynamo editor's skeleton only when the effective table
   // changed (first load, table created/dropped, or a manual switch) — never
@@ -160,10 +248,11 @@ function render() {
 }
 
 // ---- tab routing (ADR 0021 follow-up 7: real URLs, refresh/back/forward preserve the tab) ----
-// One flat row of leaf tabs; each keeps its existing id and `/admin/ui/<tab>`
+// One flat set of views, presented as a sidebar (not a top nav row — the
+// AnimusDB Console design's shell). Each keeps its own id and `/admin/ui/<tab>`
 // path (the server's `is_ui_path` just prefix-matches, and existing
 // bookmarks/tests target these exact leaves).
-const TABS = ["nodes", "tablets", "storage", "write"];
+const TABS = ["overview", "placement", "tablets", "browser", "storage"];
 
 function tabFromPath(path) {
   const m = /^\/admin\/ui\/([^/?#]+)/.exec(path);
@@ -175,10 +264,10 @@ let activeTab = TABS[0];
 // Storage-tab deep-linking: the selected tablet + node ride along as
 // `?tablet=&node=` on the `/admin/ui/storage` URL, so a refresh or a
 // back/forward navigation lands back on the same detail instead of just the
-// bare tab (the one gap the pre-existing `/admin/ui/<tab>` scheme left,
-// noted in ADR 0021 follow-up 7). The node identifier is its stable admin
-// `base` origin — the same value already used as the `<option value>` in
-// `updateStorageNodeOptions` — so no separate id scheme is needed.
+// bare tab. The node identifier is its stable admin `base` origin — the same
+// value already used as the `<option value>` in `updateStorageNodeOptions` —
+// so no separate id scheme is needed. This is also what the Tablets detail
+// panel's "Open in Storage →" link targets.
 let pendingStorageParams = null;
 
 function paramsFromLocation() {
@@ -209,7 +298,7 @@ function syncStorageUrl() {
   history.replaceState({ tab: "storage" }, "", "/admin/ui/storage" + storageQuery());
 }
 
-// Apply a pending `{tablet, node}` (from a deep-link URL or a cross-tab jump)
+// Apply a pending `{tablet, node}` (from a deep-link URL or a cross-view jump)
 // to the Storage selects and load its detail. Consumed once — a routine
 // refresh afterward must not keep re-forcing the selection over a manual
 // change, the same discipline `lastRenderedDyTable` uses for the Dynamo editor.
@@ -230,9 +319,9 @@ function applyPendingStorageParams() {
 }
 
 // Jump to the Storage tab pre-selecting `tablet` and/or `node` (either may be
-// `null` to leave that selector as-is) — used by cross-links from the Tablets
-// and Nodes tables so "which tablet/node is this" never means re-picking the
-// same ids in two dropdowns by hand.
+// `null` to leave that selector as-is) — used by cross-links from the
+// Tablets/Placement/Overview views so "which tablet/node is this" never means
+// re-picking the same ids in two dropdowns by hand.
 function gotoStorage(tablet, node) {
   const params = { tablet: tablet != null ? String(tablet) : null, node: node || null };
   activateTab("storage", { push: true, storage: params });
@@ -248,7 +337,7 @@ function gotoStorage(tablet, node) {
 function activateTab(tab, opts = {}) {
   if (!TABS.includes(tab)) tab = TABS[0];
   activeTab = tab;
-  document.querySelectorAll(".primary button").forEach((x) => x.classList.toggle("active", x.dataset.tab === tab));
+  document.querySelectorAll(".sidebar button.navlink").forEach((x) => x.classList.toggle("active", x.dataset.tab === tab));
   document.querySelectorAll("main section").forEach((x) => x.classList.toggle("active", x.id === tab));
   if (!opts.silent) {
     const query = tab === "storage" ? storageQuery(opts.storage) : "";

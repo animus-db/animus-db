@@ -1,7 +1,7 @@
 # ADR 0021 — Web dashboard over the admin JSON surface (observe + operator actions)
 
-- **Status:** Accepted (implemented — follow-ups 1–4, 7 shipped; 5 awaits ADR 0018, 6 on demand)
-- **Date:** 2026-08-04 (status updated 2026-08-06)
+- **Status:** Accepted (implemented — follow-ups 1–4, 7–8 shipped; 5 awaits ADR 0018, 6 on demand)
+- **Date:** 2026-08-04 (status updated 2026-08-06 — follow-up 8, the "AnimusDB Console" IA redesign)
 
 ## Context
 
@@ -293,6 +293,31 @@ The dashboard is a debug/operability tool, not a correctness surface; its bar is
    panel's op/table) is intentionally **not** encoded in the URL yet — scoped out
    to keep this increment small; a future pass could promote it to query params
    the same way.
+
+8. ✅ **The "AnimusDB Console" redesign.** The flat-tab debug dashboard (follow-ups
+   1–4, 7 above) was replaced with a from-scratch visual/IA redesign implemented
+   from a Claude Design mockup the user provided (project
+   `f2b4c368-4267-4fd7-b4c6-e2775eb4ad0e`, file `AnimusDB Console.dc.html`) —
+   still self-contained/no-toolchain (§1 unchanged), a **sidebar** of five views
+   (Overview, Placement, Tablets, Data Browser, Storage) instead of a top tab
+   row, and both a dark and a light theme (the mockup's `oklch()` palette,
+   toggled and persisted client-side). Overview adds a health banner + stat
+   tiles + a tablets-per-node balance chart; Placement is new (node cards +
+   per-node tablet list, no resource gauges — see below); Tablets gets a
+   filter + a detail panel with on-demand storage stats instead of the
+   lanes/table toggle it superseded; Data Browser replaces the old Write tab's
+   attribute-row form with a real Scan/Query/item-CRUD list+detail interaction;
+   Storage folds in the old dashboard's WAL/LSM/key-inspector/browse-keys/
+   bulk-seed tools unchanged, since the new design doesn't cover manual storage
+   debugging at all. **Three things the source design showed are deliberately
+   omitted, not faked**, because nothing in this codebase backs them: per-node
+   CPU/mem/disk %, an activity/event log (distinct from OTel tracing and the
+   `/admin/metrics/history` counter-snapshot ring buffer — see
+   `animusd/CLAUDE.md`), and per-tablet election history (only current Raft
+   state is tracked). This reaffirms §1's "no external assets" axis in a new
+   way — the mockup's Google Fonts (`Inter`/`IBM Plex Mono`) links are not
+   used; the console approximates them with system font stacks instead. No
+   `/admin/*` JSON route changed; this remains a frontend-only follow-up.
 
 This ADR builds directly on ADR 0020 (the admin JSON surface it renders and the
 follow-up it fulfils), ADR 0018 (the transaction state it will visualize), ADR

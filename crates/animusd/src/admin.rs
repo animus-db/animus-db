@@ -196,18 +196,15 @@ fn is_ui_path(path: &str) -> bool {
 /// prefix match (which would otherwise serve the HTML shell for these paths
 /// too). Returns `(content_type, body)`.
 fn static_asset(path: &str) -> Option<(&'static str, &'static str)> {
+    const JS: &str = "text/javascript; charset=utf-8";
     match path {
         "/admin/ui/dashboard.css" => Some(("text/css; charset=utf-8", crate::dashboard::CSS)),
-        "/admin/ui/dashboard_core.js" => {
-            Some(("text/javascript; charset=utf-8", crate::dashboard::CORE_JS))
-        }
-        "/admin/ui/dashboard_monitoring.js" => Some((
-            "text/javascript; charset=utf-8",
-            crate::dashboard::MONITORING_JS,
-        )),
-        "/admin/ui/dashboard_write.js" => {
-            Some(("text/javascript; charset=utf-8", crate::dashboard::WRITE_JS))
-        }
+        "/admin/ui/dashboard_core.js" => Some((JS, crate::dashboard::CORE_JS)),
+        "/admin/ui/dashboard_overview.js" => Some((JS, crate::dashboard::OVERVIEW_JS)),
+        "/admin/ui/dashboard_placement.js" => Some((JS, crate::dashboard::PLACEMENT_JS)),
+        "/admin/ui/dashboard_tablets.js" => Some((JS, crate::dashboard::TABLETS_JS)),
+        "/admin/ui/dashboard_browser.js" => Some((JS, crate::dashboard::BROWSER_JS)),
+        "/admin/ui/dashboard_storage.js" => Some((JS, crate::dashboard::STORAGE_JS)),
         _ => None,
     }
 }

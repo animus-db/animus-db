@@ -1,33 +1,47 @@
-//! The static web dashboard (ADR 0021): a self-contained single-page app served
-//! from the admin port for manual cluster testing — nodes, tablets, WALs, data.
+//! The AnimusDB Console (ADR 0021): a self-contained single-page app served
+//! from the admin port for manual cluster testing and operation — Overview,
+//! Placement, Tablets, Data Browser, and Storage.
 //!
 //! It is embedded in the binary (`include_str!`) and served verbatim as
 //! `text/html`/`text/css`/`text/javascript` by [`crate::admin`]; it is a pure
 //! **client** of the `/admin/*` JSON surface (ADR 0020), assembling a
 //! cluster-wide view by fanning out from the browser to every node's admin
 //! port (seeded by `GET /admin/peers`). No build toolchain, no bundler, no
-//! external assets — vanilla HTML/CSS/JS, so the asset ships with the binary
-//! and the build stays `cargo`-only (ADR 0021 §1; a vendored single-file
-//! library is allowed later but not used here).
+//! external assets (including fonts — ADR 0021 §1 is firm on this, so the
+//! console approximates the source design's Inter/IBM Plex Mono choice with
+//! system font stacks instead of a CDN fetch) — vanilla HTML/CSS/JS, so the
+//! asset ships with the binary and the build stays `cargo`-only.
 //!
 //! The shell (`HTML`) and its CSS/JS are split into separate files — still all
 //! `include_str!`'d at compile time, just served as distinct static assets
-//! (`admin.rs::static_asset`) instead of inlined in one document — so the UI
-//! can grow without every change touching one 1000+ line file. `CORE_JS` is
-//! shared state/fetch/routing utilities; `MONITORING_JS` and `WRITE_JS` are the
-//! two nav groups' tab logic, loaded in that order (each may call functions
-//! defined earlier, since plain `<script src>` tags share one global scope).
+//! (`admin.rs::static_asset`) instead of inlined in one document. `CORE_JS`
+//! holds shared state/fetch/routing/theme/data-derivation utilities every
+//! other module depends on; `OVERVIEW_JS`/`PLACEMENT_JS`/`TABLETS_JS`/
+//! `BROWSER_JS`/`STORAGE_JS` are the five views' own render logic, loaded in
+//! that order (each may call functions defined earlier, since plain
+//! `<script src>` tags share one global scope).
 //!
-//! Read-only for now — the gated operator actions (split/flush/compact/
-//! reconfigure/drain) and the ADR 0018 transaction view are the next increments.
+//! Read-only mostly — Data Browser and Storage's bulk-seed carry real
+//! mutations; the ADR 0020 gated operator actions (split/flush/compact/
+//! reconfigure/drain) and the ADR 0018 transaction view are not yet surfaced.
 
-/// The dashboard single-page app shell, embedded at compile time.
+/// The console's page shell, embedded at compile time.
 pub(crate) const HTML: &str = include_str!("dashboard.html");
-/// The dashboard's stylesheet.
+/// The console's stylesheet (dark + light themes).
 pub(crate) const CSS: &str = include_str!("dashboard.css");
-/// Shared state, fetch helpers, formatting utilities, and tab routing.
+/// Shared state, fetch helpers, formatting/data-derivation utilities, theme,
+/// and tab routing.
 pub(crate) const CORE_JS: &str = include_str!("dashboard_core.js");
-/// The Monitoring group: cluster-health strip, Nodes, Tablets, Storage.
-pub(crate) const MONITORING_JS: &str = include_str!("dashboard_monitoring.js");
-/// The Actions group: DynamoDB/CQL write forms and bulk seed.
-pub(crate) const WRITE_JS: &str = include_str!("dashboard_write.js");
+/// The Overview view: health banner, stat tiles, nodes list, tables summary,
+/// tablet-balance chart.
+pub(crate) const OVERVIEW_JS: &str = include_str!("dashboard_overview.js");
+/// The Placement view: node cards, per-node tablet list.
+pub(crate) const PLACEMENT_JS: &str = include_str!("dashboard_placement.js");
+/// The Tablets view: filterable list + raft-group/storage detail panel.
+pub(crate) const TABLETS_JS: &str = include_str!("dashboard_tablets.js");
+/// The Data Browser view: CQL + real DynamoDB Scan/Query/item CRUD/table DDL.
+pub(crate) const BROWSER_JS: &str = include_str!("dashboard_browser.js");
+/// The Storage view: folded-in WAL/LSM/key-inspector/browse-keys/bulk-seed
+/// debug tools (not part of the source design, preserved from the
+/// pre-redesign dashboard so no capability is lost).
+pub(crate) const STORAGE_JS: &str = include_str!("dashboard_storage.js");
