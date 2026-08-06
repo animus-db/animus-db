@@ -34,6 +34,17 @@ the production implementation; the deterministic implementation lives in
   warning).
 - `Network::send` is fire-and-forget (no delivery result); `recv` is
   **single-consumer per node** — never run two receive loops on one `NodeId`.
+- **`ProdEnv` pools one outbound TCP connection per destination *address***
+  (`TCP_NODELAY` set) instead of dialing per message — a Raft heartbeat no
+  longer pays a handshake. Frames (`[from: u64][len: u32][payload]`) are
+  unchanged and carry `from` per message, so one stream per addr is correct
+  even with co-resident ids; the per-address `tokio::sync::Mutex` is held
+  across the whole frame write (frame integrity) without head-of-line blocking
+  across peers. On a write error (peer restarted) the stale stream is dropped
+  and the send reconnects **once**, then surfaces the error — still
+  fire-and-forget, and the frame in flight when a peer dies can be lost
+  (higher layers retry, as before). The cache is shared with siblings like the
+  peer book.
 - **`Coresident` (ADR 0017 D) is a *sub-trait*, not part of `Env`.** It adds one
   method — `sibling(&self, id) -> Self`, a fresh handle on the same physical node
   bound to a different `NodeId` (its own inbox) — so a node can host a *second*
@@ -62,9 +73,25 @@ the production implementation; the deterministic implementation lives in
   returns. This models real crash semantics and is what `animus-sim` exploits.
   `Disk::replace` atomically swaps a file's whole contents (temp-file + rename
   in `ProdEnv`) — used for WAL compaction. In `ProdEnv`, the file-creating paths
-  (`append`/`replace`) `create_dir_all` the file's parent first, so a filename
+  (`append`/`replace`) create missing parent directories, so a filename
   carrying a subdirectory prefix (e.g. `"db/wal"`) works instead of silently
-  failing on a missing parent. `read_at(file, offset, len)` /
+  failing on a missing parent (`append` does it lazily — retry-on-`NotFound`,
+  not a `create_dir_all` per call). **Namespace changes are fsynced**: `sync`
+  and `replace` fsync the containing directory chain after the file
+  `sync_all`/rename (POSIX requires it — without it a just-created WAL segment
+  or completed manifest swap can vanish on power loss); `remove` deliberately
+  does not (a resurrected orphan is harmless and cleanup handles it). The dir
+  fsync runs only on the **first** `sync` of a file — creation is a one-time
+  namespace change; a per-env `dir_synced` memo (invalidated by `remove`,
+  refreshed by `replace`) keeps the WAL group-commit hot path at one fsync per
+  commit. **`append` must `flush` before returning**: `tokio::fs::File`
+  buffers, `write_all` can return with the write still in flight on the
+  blocking pool, and dropping the handle completes it in the *background* — so
+  without the flush two sequential `append`s (separate handles) can land in
+  the file in **inverted order** (observed: an SSTable whose index preceded
+  its data block, the long-standing `lsm_concurrent` flake), and a following
+  `sync()` (a different fd) can fsync before the buffered write reaches the
+  page cache. `read_at(file, offset, len)` /
   `size(file)` / `remove(file)` are the random-access + delete primitives an
   on-disk LSM needs (SSTable block reads, file sizing, compaction cleanup); they
   view the same durable + buffered bytes as `read`, so a crash drops an un-synced
