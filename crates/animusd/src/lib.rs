@@ -3141,6 +3141,27 @@ async fn auto_split_loop(ctx: ClientCtx, threshold: usize) {
             let Some(leader) = ctx.edge.cp_leader(tablet) else {
                 continue;
             };
+            // A `RaftKvNode` group applies at most one `Split`, ever (see
+            // `KvCommand::Split`'s apply-time guard in animus-cp-data) — once
+            // *this* tablet's own group has split, its range is permanently
+            // frozen at that boundary and no key can ever apply a second
+            // `Split` to it, no matter how much more data lands in its
+            // (still-growing) range. Without this check, a bootstrap or
+            // once-split tablet that keeps absorbing writes re-trips the
+            // `threshold` every cooldown window forever: `propose_split_data`
+            // can never confirm at a new key against an already-split group, so
+            // every fresh attempt (1) burns a full `CLIENT_TIMEOUT` before
+            // abandoning and (2) has already minted a brand-new `SplitTablet`
+            // metadata entry in step 1 that can now never get a CP group —
+            // an unbounded pileup of leaderless orphan tablets, and a
+            // live-forever mint/retry/abandon churn that competes for the
+            // same group's Raft proposals as ordinary client writes (observed
+            // hanging a bulk seed indefinitely under `--cluster 3
+            // --auto-split`). Once split, permanently excluded — not just
+            // cooled down.
+            if leader.applied_split_key().is_some() {
+                continue;
+            }
             // Cheap per-tick gate: materializing every led tablet's live pairs
             // every tick is O(total data) per 2s — instead, take the free
             // (over-)estimate and only materialize when it says the tablet might

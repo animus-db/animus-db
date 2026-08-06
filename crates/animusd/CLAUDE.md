@@ -253,6 +253,42 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   engineering-practices entry for the general lesson (a "give up" exit from a
   retry loop must leave the same rate-limit state a normal successful cycle
   would).
+- **A `RaftKvNode` group applies at most one `Split`, *ever* — `auto_split_loop`
+  didn't know that, and kept re-triggering an already-split tablet forever.**
+  `KvCommand::Split`'s apply-time guard (`animus-cp-data`) makes every `Split`
+  after a group's first a permanent no-op — the tablet's range is frozen at that
+  boundary for the rest of that `RaftKvNode`'s life, even though it can keep
+  absorbing writes and growing past `threshold` again. The scan loop's
+  `hot`/`local_pairs` gate only asks "is this tablet over threshold right now" —
+  it never asked "has this tablet's own group already spent its one-time
+  split" — so a bootstrap (or any once-split) tablet that kept growing re-tripped
+  the threshold every cooldown window: step 1 (`SplitTablet` metadata) commits
+  and mints a *brand-new* tablet id every time, step 2 (`propose_split`) can
+  never confirm at a new key against an already-split group, so every attempt
+  burns a full `CLIENT_TIMEOUT`, abandons, and repeats — an unbounded pileup of
+  leaderless orphan tablets (live-reproduced with `--cluster 3 --auto-split
+  2000` under a sustained bulk seed: 13 tablets in metadata, only 3 with a real
+  CP group, and the seed request itself hung indefinitely competing with the
+  churn for the same group's Raft proposals). Fixed with a permanent guard —
+  `leader.applied_split_key().is_some()` — checked *before* the `hot`/
+  `local_pairs` work, right after resolving the tablet's leader: once a
+  tablet's own group has split, it is excluded from fresh-split candidacy for
+  good, not just cooled down. **This is a live read of the group's own state,
+  not derived/cached** — no bookkeeping map needed, matching the "prefer a live
+  read of the durable/authoritative layer" pattern elsewhere in this file.
+  Regression: `tests/cp_plane.rs::already_split_tablet_is_not_retried_forever`
+  (split once at a low threshold, then write more keys that sort into the
+  *original* tablet's still-open lower range specifically — not just any new
+  key, since the sibling legitimately splitting for its own first time is
+  correct behavior and must not be confused with the bug — then assert the
+  tablet count never grows again even after a full cooldown window elapses).
+  **Residual limitation, not fixed here:** because only a *never-yet-split*
+  group can ever split, sustained growth concentrated on one lineage will
+  eventually exhaust every splittable descendant with no way to shard further
+  at that tablet id — lifting the "at most once, ever" invariant in
+  `animus-cp-data` (e.g. re-deriving the tombstone/handoff computation so a
+  group can split more than once) is a separate, larger change to the core
+  consensus state machine, not a quick guard.
 - **The cluster's members are the CP `raftkv` nodes, not the control ids.** The
   control ids `0..N` are only the Raft *consensus group* for metadata; `bootstrap`
   (leader-only, idempotent) registers the **raftkv ids** (`300+i`) as `Active`
