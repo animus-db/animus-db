@@ -200,18 +200,20 @@ impl CpGroup {
         }
     }
 
-    /// The `at` key of this group's applied `Split` (at most once, ever), or
-    /// `None` — the confirm-by-key primitive a
+    /// This group's current split boundary (`[lo, bound)`), or `None` if it has
+    /// never split — the confirm-by-key primitive a
     /// [`propose_split`](Self::propose_split) caller must poll:
     /// `ProposeResult::Accepted` only means the entry was appended to the leader's
     /// local log, not that it committed, and comparing against the *specific* key
     /// proposed (not just "has it split at all") is what catches a same-tick
-    /// same-tablet race where a *different* median won. See
-    /// [`RaftKvNode::applied_split_key`]'s doc.
-    fn applied_split_key(&self) -> Option<Vec<u8>> {
+    /// same-tablet race where a *different* median won. A group can split more
+    /// than once, so this is a *moving target* — see
+    /// [`RaftKvNode::current_split_bound`]'s doc for what that does and doesn't
+    /// tell a caller, and why comparing against it is still safe here.
+    fn current_split_bound(&self) -> Option<Vec<u8>> {
         match self {
-            CpGroup::Lsm(n) => n.applied_split_key(),
-            CpGroup::Mem(n) => n.applied_split_key(),
+            CpGroup::Lsm(n) => n.current_split_bound(),
+            CpGroup::Mem(n) => n.current_split_bound(),
         }
     }
 
@@ -2087,26 +2089,34 @@ impl ClientCtx {
     /// committed **at that key** before trusting it — the split-path counterpart of
     /// [`cp_put_local`](Self::cp_put_local)'s local-read confirm. `Accepted` only
     /// means the `Split` entry was appended to the leader's local log, never that
-    /// it committed (see [`RaftKvNode::applied_split_key`]'s doc): under leader
+    /// it committed (see [`RaftKvNode::current_split_bound`]'s doc): under leader
     /// churn the entry can be silently truncated before it commits. Comparing the
     /// *exact* key (not just "has this group split at all") also catches a
     /// narrower same-tick race: under `--cluster N`'s shared edge state, more than
     /// one node can independently read this tablet's live pairs and compute a
     /// *different* median in the same tick, then both propose a split on the same
-    /// group — the group splits once, so the loser's own key never applies even
-    /// though *a* split did. Skipping this check (or checking only a bare
-    /// split-happened flag) is exactly the bug that let `propose_split_data`
-    /// report success for a split that never actually happened at the caller's
-    /// key — the control-plane `SplitTablet` metadata was already committed by
-    /// that point (`propose_split_metadata`), so an unconfirmed "success"
-    /// permanently strands that tablet (`leader: unknown` forever, nothing left to
-    /// retry it). On timeout, return an error so the caller's retry path
-    /// (`auto_split_loop`'s `pending` map) engages instead.
+    /// group — only one key ever actually wins a given round, so the loser's own
+    /// key never applies even though *a* split did. Skipping this check (or
+    /// checking only a bare split-happened flag) is exactly the bug that let
+    /// `propose_split_data` report success for a split that never actually
+    /// happened at the caller's key — the control-plane `SplitTablet` metadata was
+    /// already committed by that point (`propose_split_metadata`), so an
+    /// unconfirmed "success" permanently strands that tablet (`leader: unknown`
+    /// forever, nothing left to retry it). On timeout, return an error so the
+    /// caller's retry path (`auto_split_loop`'s `pending` map) engages instead.
+    ///
+    /// **A `false` here does not mean "definitely lost"** once a group can split
+    /// more than once: a *later* split could narrow past `split_key` after it
+    /// already applied, and this alone can't tell the two apart (see
+    /// `current_split_bound`'s doc). Callers that give up and clean something up
+    /// on a confirm failure must independently verify it's actually safe first
+    /// (never delete a tablet that's still genuinely, locally hosted) — see
+    /// `drop_orphan_tablet`.
     async fn confirm_split(leader: &CpGroup, split_key: &[u8]) -> ClientResponse {
         let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
         let mut poll = CP_CONFIRM_POLL_INIT;
         loop {
-            if leader.applied_split_key().as_deref() == Some(split_key) {
+            if leader.current_split_bound().as_deref() == Some(split_key) {
                 return ClientResponse::PutOk;
             }
             if tokio::time::Instant::now() >= deadline {
@@ -3253,25 +3263,32 @@ async fn auto_split_loop(ctx: ClientCtx, threshold: usize) {
                 ctx.edge.release_auto_split(tablet);
                 continue;
             }
-            // A different proposer's key may have already won this group's
-            // one-time split — the same-tick, same-tablet redundant-median race
+            // A different proposer's key may have already won this group's split
+            // — the same-tick, same-tablet redundant-median race
             // `propose_split_data`'s confirm-by-key check exists to catch (see its
-            // doc). Retrying *our* key forever would never succeed once that's
-            // happened (the group cannot split twice), and would wrongly keep
-            // this tablet excluded from `is_fresh_split_candidate` forever too,
-            // even though its data already moved under the winning split. Detect
-            // it via any local replica's applied key (set on every replica, not
-            // just the leader) and abandon rather than loop forever.
-            let abandoned = ctx
+            // doc) — or a *later* split may have narrowed past `split_key` after
+            // it actually applied (a group can now split more than once).
+            // `current_split_bound` can't tell those two apart (see its doc): a
+            // bound that no longer equals `split_key` means "give up retrying
+            // this exact key," full stop, but does **not** by itself mean
+            // `split_key`'s own attempt never landed — retrying it forever would
+            // never succeed either way (the boundary only moves toward smaller
+            // keys), and would wrongly keep this tablet excluded from
+            // `is_fresh_split_candidate` forever too. `drop_orphan_tablet` is
+            // what actually resolves the ambiguity safely (see its doc) — this
+            // check only decides whether to *stop retrying*, not whether
+            // anything gets deleted.
+            let superseded = ctx
                 .edge
                 .local_cp(tablet)
-                .and_then(|g| g.applied_split_key())
-                .is_some_and(|applied| applied != split_key);
-            if abandoned {
+                .and_then(|g| g.current_split_bound())
+                .is_some_and(|bound| bound != split_key);
+            if superseded {
                 tracing::info!(
                     tablet = tablet.0,
-                    "auto_split: pending split lost a same-tick race to a different key; \
-                     abandoning (the tablet's data already moved under the winning split)"
+                    "auto_split: pending split's key is no longer the group's boundary; \
+                     abandoning this retry (GC will check separately whether it minted \
+                     an orphan)"
                 );
                 // Refresh the cooldown here, same as a fresh trigger does: without
                 // this, an abandoned tablet is immediately eligible again on the
@@ -3284,15 +3301,15 @@ async fn auto_split_loop(ctx: ClientCtx, threshold: usize) {
                 // move actually shrink the tablet below `threshold`.
                 last_triggered.insert(tablet, tokio::time::Instant::now());
                 ctx.edge.release_auto_split(tablet);
-                // GC the orphan: our own step 1 already minted a tablet id at
-                // `split_key` that can now never be seeded (only the winning
-                // key's `cp_split_seed` ever fires), so left alone it sits in
-                // `Metadata.tablets` forever — `leader: unknown`, unreachable,
-                // and cluttering every admin/status view. Resolve its *current*
-                // id the same way `cp_split_seed` resolves a fresh mint (by
-                // `range.start == split_key` — our own mint is the only tablet
-                // that can have started exactly there) and drop it in the
-                // background so this tick doesn't block on the proposal.
+                // Maybe GC an orphan: if our own step 1 minted a tablet id at
+                // `split_key` that never actually got seeded, left alone it sits in
+                // `Metadata.tablets` forever — `leader: unknown`, unreachable, and
+                // cluttering every admin/status view. Resolve its *current* id the
+                // same way `cp_split_seed` resolves a fresh mint (by `range.start
+                // == split_key` — our own mint is the only tablet that can have
+                // started exactly there) and let `drop_orphan_tablet` verify it's
+                // actually safe before touching anything (it independently checks
+                // local hosting — this method's ambiguity is not trusted alone).
                 if let Some(orphan) = ctx
                     .raft
                     .metadata()
@@ -3324,27 +3341,18 @@ async fn auto_split_loop(ctx: ClientCtx, threshold: usize) {
             let Some(leader) = ctx.edge.cp_leader(tablet) else {
                 continue;
             };
-            // A `RaftKvNode` group applies at most one `Split`, ever (see
-            // `KvCommand::Split`'s apply-time guard in animus-cp-data) — once
-            // *this* tablet's own group has split, its range is permanently
-            // frozen at that boundary and no key can ever apply a second
-            // `Split` to it, no matter how much more data lands in its
-            // (still-growing) range. Without this check, a bootstrap or
-            // once-split tablet that keeps absorbing writes re-trips the
-            // `threshold` every cooldown window forever: `propose_split_data`
-            // can never confirm at a new key against an already-split group, so
-            // every fresh attempt (1) burns a full `CLIENT_TIMEOUT` before
-            // abandoning and (2) has already minted a brand-new `SplitTablet`
-            // metadata entry in step 1 that can now never get a CP group —
-            // an unbounded pileup of leaderless orphan tablets, and a
-            // live-forever mint/retry/abandon churn that competes for the
-            // same group's Raft proposals as ordinary client writes (observed
-            // hanging a bulk seed indefinitely under `--cluster 3
-            // --auto-split`). Once split, permanently excluded — not just
-            // cooled down.
-            if leader.applied_split_key().is_some() {
-                continue;
-            }
+            // A `RaftKvNode` group can now split more than once over its life
+            // (see `KvCommand::Split`'s apply-time CAS in animus-cp-data): each
+            // split just needs to propose a key strictly less than the group's
+            // *current* boundary, so a tablet that already split once and has
+            // since regrown past `threshold` is a perfectly legitimate fresh
+            // candidate again — there is deliberately no "once split, excluded
+            // forever" guard here anymore. `is_fresh_split_candidate` above
+            // already covers the correctness-critical exclusion (don't retrigger
+            // while a split for this tablet is still `pending` or within
+            // `AUTO_SPLIT_COOLDOWN`); nothing else needs to gate on split
+            // history.
+            //
             // Cheap per-tick gate: materializing every led tablet's live pairs
             // every tick is O(total data) per 2s — instead, take the free
             // (over-)estimate and only materialize when it says the tablet might
@@ -3641,12 +3649,15 @@ impl ClientCtx {
     /// *same* `split_key` until it succeeds, rather than calling this combined
     /// one-shot helper. See [`propose_split_metadata`]'s doc for why.
     ///
-    /// A step-2 failure caused by a **different** key having already won the
-    /// group's one-time split (e.g. a prior `trigger_split`/`CpSplit` call, or
-    /// `auto_split_loop`, already split `tablet` for real) can never be fixed by
-    /// retrying `split_key` — so unlike a transient timeout, this GCs its own
-    /// now-permanently-orphaned mint before returning, instead of leaving a
+    /// A step-2 failure where the group's boundary no longer equals `split_key`
+    /// (e.g. a prior `trigger_split`/`CpSplit` call, or `auto_split_loop`,
+    /// already split `tablet` for real at a different key) can never be fixed by
+    /// retrying `split_key` — so unlike a transient timeout, this attempts to GC
+    /// its own possibly-orphaned mint before returning, instead of leaving a
     /// dead `Metadata` entry for the caller to notice and clean up by hand.
+    /// "Possibly" matters: see [`drop_orphan_tablet`](Self::drop_orphan_tablet)'s
+    /// doc for why this signal alone is never trusted to actually delete
+    /// anything.
     ///
     /// [`propose_split_metadata`]: Self::propose_split_metadata
     /// [`propose_split_data`]: Self::propose_split_data
@@ -3659,12 +3670,12 @@ impl ClientCtx {
         if matches!(response, ClientResponse::PutOk) {
             return response;
         }
-        let lost_to_a_different_key = self
+        let boundary_moved_past_us = self
             .edge
             .local_cp(tablet)
-            .and_then(|g| g.applied_split_key())
-            .is_some_and(|applied| applied != split_key);
-        if lost_to_a_different_key {
+            .and_then(|g| g.current_split_bound())
+            .is_some_and(|bound| bound != split_key);
+        if boundary_moved_past_us {
             self.drop_orphan_tablet(new_id).await;
         }
         response
@@ -3741,18 +3752,32 @@ impl ClientCtx {
         .map_err(|()| ClientResponse::Error("split metadata did not commit in time".into()))
     }
 
-    /// Best-effort GC for a metadata-only **orphan** tablet: `tablet`'s
-    /// `SplitTablet` (step 1) committed, but the source group's one-time
-    /// data-plane split was won by a different key, so `tablet` can never be
-    /// seeded (`cp_split_seed` only fires for the winning key) and will sit in
-    /// `Metadata.tablets` forever — `leader: unknown`, unreachable — unless
-    /// something removes it. Called from `auto_split_loop`'s abandon branch and
-    /// from [`trigger_split`](Self::trigger_split)'s step-2 failure path, both
-    /// once they've already confirmed (via `applied_split_key()`) that `tablet`
-    /// lost the race, so it never held real data and dropping it is always
-    /// safe (`MetaCommand::DropOrphanTablet`'s doc).
+    /// Best-effort GC for a **suspected** metadata-only orphan tablet: `tablet`'s
+    /// `SplitTablet` (step 1) committed, and the caller's `current_split_bound`
+    /// check suggests the source group's data-plane split may have been won by a
+    /// different key — but that signal is only ever a *moving-boundary*
+    /// heuristic once a group can split more than once (see
+    /// `RaftKvNode::current_split_bound`'s doc): it can't distinguish "this key
+    /// really lost" from "this key won, then something else split again later."
+    /// Getting that wrong in the deletion direction would drop a tablet that is
+    /// actually alive and serving real data — so this method, not the caller,
+    /// is what actually decides whether it's safe to touch anything.
     ///
-    /// Reads `tablet`'s epoch fresh rather than threading one through from the
+    /// **The hard safety gate: never drop a tablet this node is still locally
+    /// hosting a live CP group for.** The split hook mints a member on *every*
+    /// original replica when a split genuinely applies (`cp_split_seed`), so if
+    /// `tablet` really did get seeded, this node (one of the original replicas)
+    /// has a registered handle for it — checked via `ctx.edge.local_cp`, the
+    /// same per-replica signal the abandon checks above already trust. If nothing
+    /// is registered, `tablet` never got a real handoff and dropping it is safe
+    /// regardless of how the caller's heuristic reached this call
+    /// (`MetaCommand::DropOrphanTablet`'s doc). Worst case on a wrong call here
+    /// is a skipped GC — the orphan lingers a little longer, exactly the
+    /// tolerated pre-GC behavior — never a deleted-while-alive tablet.
+    ///
+    /// Called from `auto_split_loop`'s abandon branch and from
+    /// [`trigger_split`](Self::trigger_split)'s step-2 failure path. Reads
+    /// `tablet`'s epoch fresh rather than threading one through from the
     /// caller: nothing else ever touches an unhosted orphan, so it's stable,
     /// and reading it here means the CAS reflects exactly what this call sees
     /// (same discipline as `propose_split_metadata`). Logs and gives up on
@@ -3762,6 +3787,14 @@ impl ClientCtx {
     /// any) will try again with its own orphan.
     #[tracing::instrument(name = "drop_orphan_tablet", skip(self), fields(tablet = tablet.0))]
     async fn drop_orphan_tablet(&self, tablet: TabletId) {
+        if self.edge.local_cp(tablet).is_some() {
+            tracing::info!(
+                tablet = tablet.0,
+                "auto_split: tablet is still locally hosted — not actually an orphan, \
+                 skipping the drop"
+            );
+            return;
+        }
         let Some(expected_epoch) = self.raft.metadata().tablets.get(&tablet).map(|t| t.epoch)
         else {
             // Already gone — a prior attempt succeeded, or it was never really
