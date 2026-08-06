@@ -487,12 +487,14 @@ async fn admin_seed_writes_synthetic_keys() {
         let leader_admin = leader_admin.expect("a CP group leader exists");
         let (s, scan) = admin_get(leader_admin, "/admin/storage/scan?tablet=1&limit=200").await;
         assert_eq!(s, 200);
+        // A seeded key is token-prefixed (ADR 0022: `partition_token || escape(pk)`),
+        // so the readable pk follows 8 hash bytes — `contains`, not `starts_with`.
         let seeded = scan["items"]
             .as_array()
             .map(|items| {
                 items
                     .iter()
-                    .filter(|it| it["key"].as_str().is_some_and(|k| k.starts_with("seed:")))
+                    .filter(|it| it["key"].as_str().is_some_and(|k| k.contains("seed:")))
                     .count()
             })
             .unwrap_or(0);
