@@ -517,64 +517,94 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   live at request time, or drives an explicit action; node identity for `/admin/config`
   is captured into `ClientCtx.admin` (an `AdminInfo`). **No auth yet** — bind it to a
   trusted interface. The `animus admin <subcommand>` CLI consumes it.
-  - **The web dashboard (ADR 0021)** is served from the same port: `GET /` (and the
-    `/admin`, `/admin/ui` aliases, plus any `/admin/ui/<tab>` — see real-URL
-    routing below) returns a self-contained vanilla-JS SPA embedded
-    via `include_str!` (`dashboard.rs` → `dashboard.html`) — no bundler/npm, the
-    build stays `cargo`-only. It is a pure **client** of the `/admin/*` JSON, so
-    every `/admin/*` response now carries **CORS** (`http::CORS_HEADERS`, spliced via
-    the new `http::write_response_with`; an `OPTIONS` preflight returns 204) because
-    the page loaded from one node fans out in the browser to **every** node. The
-    fan-out seed is **`GET /admin/peers`** → all nodes' admin addresses: each process
-    already knows them (its `ClusterConfig` per-process, or the in-process bring-up),
-    so they are threaded into `AdminInfo.admin_addrs` (via a new `start_with`
-    param) rather than the browser guessing ports. Read-only for now (nodes/tablets/
-    WAL/data panels); operator-action UI + the ADR 0018 transaction view are next.
-    **Each top-level tab has a real URL** (ADR 0021 follow-up 7): `/admin/ui/<tab>`
-    for `nodes`/`tablets`/`storage`/`write`. `admin.rs::is_ui_path` serves the SPA
-    for any path under that prefix (a `starts_with`, not an exact match — an
-    unrecognized tab name still 200s and falls back to the default tab
-    client-side, so a stale/typo'd bookmark degrades gracefully instead of
-    404ing); the page itself reads `location.pathname` on load
-    (`dashboard.html`'s `tabFromPath`/`activateTab`) and uses
-    `history.pushState`/`popstate` so a nav click adds a history entry, a
-    refresh/bookmark reopens the same tab, and the browser back/forward buttons
-    work. Sub-tab state (storage's selected tablet/node) is **not** in the URL yet.
-    **The nav is one flat row of leaf tabs** — `nodes`/`tablets`/`storage`/`write`
-    (`TABS` in `dashboard_core.js`) — clicking a pill activates it directly, no
-    grouping/sub-nav. (An earlier revision grouped these into "Monitoring"/
-    "Actions" primary+secondary rows with a `Topology` tab split out from
-    `Tablets`; both were removed as redundant navigation — the leaf tab ids
-    and `/admin/ui/<tab>` paths are unchanged either way, so neither change
-    needed a server change or a test update.) The **Tablets tab merges what
-    used to be two tabs**: a lanes-by-leader-node view (default; a tablet with
-    no elected leader gets its own "Leaderless" lane, a filter narrows by
-    table/tablet id) and a flat sortable table, toggled via a `Lanes`/`Table`
-    segmented control (`dashboard_monitoring.js`'s `setTabletsView`) — both
-    bodies stay up to date every refresh regardless of which is visible, so
-    switching views never shows stale data.
-    **Each write-tab panel owns its own table selector** (`#dy-table` on the
-    Dynamo operation panel, `#seed-table` on Bulk seed — `dashboard_write.js`'s
-    `dyTable`/`seedTable`), populated from the tables valid for *that* panel
-    (Dynamo tables from the replicated catalog; seedable tables = anything with
-    a tablet already) and auto-picking the first one, rather than sharing one
-    global header dropdown gated per-panel by validity. (An earlier revision
-    had a single `#global-table` selector in the header for this; removed as
-    redundant with per-panel selection.) The CQL panel is untouched either way,
-    since a CQL script names its own table(s) in the statement text.
-    `lastRenderedDyTable` gates when the Dynamo editor's skeleton is rebuilt
-    (table actually changed) vs. left alone (a routine poll refresh with the
-    same selection), preserving in-progress edits.
-    The data panel has both a single-key inspector (`/admin/storage/key`) and a
-    **browse-keys** list (`/admin/storage/scan` → `CpGroup::local_scan`, first N live
-    pairs `>= start`; click a key to send it to the inspector). The Storage tab's
-    **node dropdown is filtered to nodes whose `/admin/raftkv` view lists the
-    selected tablet** (the storage endpoints are node-local — `local_cp` — and 404
-    on a non-hosting node; the tablet list is cluster-wide metadata, so the raw
-    cross-product invited valid-looking 404 combos), annotating the leader; if no
-    reachable node hosts the tablet yet (group still forming) the dropdown is empty
-    with a hint (the Load/Browse/inspect handlers no-op on an empty node).
-    `tests/dashboard_endpoint.rs` proves serve + CORS + preflight + peers.
+  - **The web dashboard (ADR 0021) is the "AnimusDB Console"** — a from-scratch
+    visual/IA redesign (2026-08-06, implemented from a Claude Design mockup the
+    user provided) replacing the earlier flat-tab debug dashboard. Still served
+    from the same port: `GET /` (and the `/admin`, `/admin/ui` aliases, plus any
+    `/admin/ui/<tab>`) returns a self-contained vanilla-JS SPA embedded via
+    `include_str!` (`dashboard.rs` → `dashboard.html`) — no bundler/npm, the
+    build stays `cargo`-only, and **no external fonts/CDN either** (ADR 0021 §1
+    is firm on this; the console approximates the source design's Inter/IBM
+    Plex Mono with system font stacks instead of a Google Fonts fetch). It is a
+    pure **client** of the `/admin/*` JSON, so every `/admin/*` response
+    carries **CORS** (`http::CORS_HEADERS`; an `OPTIONS` preflight returns 204)
+    because the page loaded from one node fans out in the browser to **every**
+    node. The fan-out seed is **`GET /admin/peers`**.
+    **Shell: a sidebar, not a top tab row** (`dashboard.html`) — five views,
+    `overview`/`placement`/`tablets`/`browser`/`storage` (`TABS` in
+    `dashboard_core.js`), each with its own JS module
+    (`dashboard_overview.js`/`dashboard_placement.js`/`dashboard_tablets.js`/
+    `dashboard_browser.js`/`dashboard_storage.js`, loaded after `dashboard_core.js`
+    in that order — plain `<script src>` tags sharing one global scope, so later
+    files call earlier ones' functions freely). **Each view keeps a real URL**
+    (ADR 0021 follow-up 7): `/admin/ui/<tab>`, `admin.rs::is_ui_path` prefix-serving
+    the SPA for any path under it (an unrecognized tab 200s and falls back to
+    the default client-side, so a stale bookmark degrades gracefully); the page
+    reads `location.pathname` on load (`tabFromPath`/`activateTab`) and uses
+    `history.pushState`/`popstate`. The Storage tab's selected tablet/node ride
+    along as `?tablet=&node=` (`gotoStorage`/`syncStorageUrl`/
+    `applyPendingStorageParams` in `dashboard_core.js`) — the one piece of
+    sub-tab URL state, reused by the Tablets view's "Open in Storage →" link and
+    by Placement's per-node tablet rows.
+    **Both a dark and a light theme** (`dashboard.css` CSS custom properties,
+    the mockup's `oklch()` palette verbatim), toggled by a button in the top bar
+    and persisted to `localStorage` (a UI preference, not data — no server
+    round-trip). **Three things the design showed have zero backend support and
+    are deliberately omitted, not faked**: per-node CPU/mem/disk % (nothing
+    samples host resources anywhere in this workspace), an activity/event feed
+    (no persisted/queryable event log exists — distinct from OTel tracing and
+    the counter-snapshot `/admin/metrics/history` ring buffer), and a per-tablet
+    election-history log (only current Raft state is tracked). Fabricating these
+    would violate this admin tool's ground-truth-data ethos. The **Overview**
+    view's "Tables" panel (a per-table tablet-count + status breakdown) is a
+    real, honest substitute for the design's dropped "Recent activity" panel.
+    **Tablets is one view with a `Lanes`/`Table`-shaped predecessor collapsed
+    into a single filterable list + detail panel** (not the earlier
+    lanes-vs-table toggle, which is superseded) — clicking a row opens a
+    right-side panel with the raft group (from data already fetched) plus
+    storage-engine stats fetched **on demand**, only for the selected tablet's
+    leader, from `/admin/storage/lsm?tablet=` (`dashboard_tablets.js`'s
+    `loadTabletDetailStorage`) — not for every row.
+    **The Data Browser view replaces the old Write tab's Dynamo attribute-row
+    form with a real item list + detail panel** (`dashboard_browser.js`):
+    Scan/Query build real requests against `/admin/data/dynamo` (Query supports
+    the exact sort-key grammar `animus_dynamo::wire` parses — `=`, `BETWEEN`,
+    `begins_with` — see `buildQueryPayload`), decode the returned
+    AttributeValue-map `Items` for display, and per-row Edit/Delete/Create use
+    a dynamic attribute-row editor (key columns locked, arbitrary extra
+    attributes addable/removable) because DynamoDB items are schemaless beyond
+    their declared keys — a fixed-column form (as the source mockup's fake
+    table had) can't represent that. **Each browser/write panel owns its own
+    table selector** (`#br-dy-table` here, `#seed-table` on the folded-in Bulk
+    seed tool — `dyTable`/`seedTable`), auto-picking the first valid table
+    rather than requiring an explicit pick, and rather than one shared global
+    header dropdown (an earlier revision had that; removed as redundant).
+    `lastRenderedDyTable` gates when the Dynamo op panel's state is rebuilt
+    (table actually changed) vs. left alone on a routine poll refresh,
+    preserving in-progress edits.
+    **The Storage view folds in the pre-redesign dashboard's debug tools**
+    (`dashboard_storage.js`) — WAL segment/record inspection, LSM shape, a
+    single-key inspector (`/admin/storage/key`), a **browse-keys** list
+    (`/admin/storage/scan` → `CpGroup::local_scan`), and the Bulk seed tool —
+    ported essentially unchanged, since the console design doesn't include this
+    level of manual storage debugging at all and it would otherwise be lost.
+    Its **node dropdown is filtered to nodes whose `/admin/raftkv` view lists the
+    selected tablet** (the storage endpoints are node-local — `local_cp` — and
+    404 on a non-hosting node); if no reachable node hosts the tablet yet (group
+    still forming) the dropdown is empty with a hint (the Load/Browse/inspect
+    handlers no-op on an empty node).
+    `tests/dashboard_endpoint.rs` proves serve + CORS + preflight + peers; its
+    "the shell contains X" assertions target the shell (`dashboard.html`) or the
+    specific JS asset that actually carries the behavior being checked (e.g.
+    the item form's key-lock indicator lives in `dashboard_browser.js`, not the
+    shell) — a lesson from a **latent bug this redesign caught**: the pre-split
+    single-file dashboard (before PR #48) had its whole JS inline, so asserting
+    on `GET /`'s body for a JS-source string worked by accident; after the
+    file split it silently stopped proving anything (the string had moved to a
+    separately-served file `GET /` never returns), and nothing caught it until
+    this rewrite touched the same test. When splitting a previously-inline asset
+    into files, re-audit every test assertion that greps the *original*
+    response body for content that may have moved.
     - **Displayed keys show the partition token as unpadded base64url**
       (`admin.rs::key_display`): a wire-edge/seeder key is `token || escape(pk) ||
       rk` (ADR 0022), and the leading `TOKEN_BYTES` are a **binary** Murmur3 token
@@ -596,7 +626,7 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
       eyeball-comparable with browsed keys. Unit tests live in `admin.rs`; the
       `admin_endpoint` plain-`Put` `admin-key` guards the
       not-every-key-is-token-prefixed case.
-  - **The Write tab (ADR 0021) writes through the admin port.** `POST
+  - **The Data Browser view (ADR 0021) writes through the admin port.** `POST
     /admin/data/dynamo {op, payload}` reuses the DynamoDB edge in-process
     (`dynamo::execute` — the factored decode+`run_operation`), returning the op's
     JSON. `POST /admin/data/cql {query, keyspace?}` runs CQL by driving **this
@@ -609,20 +639,24 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
     surface (still no auth)** — sharpening the bind-to-trusted-interface /
     auth-before-exposure follow-up. `tests/admin_endpoint.rs::admin_data_write_dynamo_and_cql`
     proves a Dynamo Put→Get round-trip + a CREATE/INSERT/SELECT CQL script.
-    - **Dynamo table management + form/JSON sync.** The Dynamo panel lists tables
+    - **Dynamo table management + Scan/Query/item CRUD.** The panel lists tables
       from the replicated catalog (`/admin/status` `schemas.tables`, filtered to
       plain-named = Dynamo, vs CQL `ks.table`), creates via `CreateTable`, and drops
       via `POST /admin/data/drop-table` (`ctx.drop_table_schema`; the Dynamo wire has
       no `DeleteTable`, so this reuses the control-plane drop, schema-only). The op
-      **targets its own `#dy-table` selector** (see above) — disabled unless a
-      Dynamo table exists, so you can't act on a non-existent or CQL-only
-      table. Form and JSON share one request model
-      (`dynModel`) with a Form/JSON **toggle** that syncs both ways (the JSON view is
-      the full request; the form edits TableName + Item/Key, preserving extra fields
-      like `UpdateExpression`). Selecting a table (or op) **prefills the request with
-      that table's key attributes** — partition key + sort key, typed from the catalog
-      (S/N/B) — into both views. `tests/admin_endpoint.rs::admin_table_management_create_and_drop`
-      (also asserts a numeric sort key's type reaches the catalog).
+      **targets its own `#br-dy-table` selector** (see above) — disabled unless a
+      Dynamo table exists, so you can't act on a non-existent or CQL-only table.
+      Scan and Query build **real** requests (`dashboard_browser.js`'s
+      `runDynamoOp`/`buildQueryPayload`) rather than the pre-redesign Write tab's
+      Form/JSON editor over one fixed op; results decode the returned
+      AttributeValue-map `Items` for a real item list, and per-row Edit/Delete
+      plus "+ Create item" open a dynamic attribute-row editor (key columns
+      locked, rows addable/removable) — not a fixed-column form, since items are
+      schemaless beyond their declared keys. `tests/admin_endpoint.rs::admin_table_management_create_and_drop`
+      (also asserts a numeric sort key's type reaches the catalog) still covers
+      the underlying create/drop; the Scan/Query/CRUD paths reuse the same
+      `/admin/data/dynamo` operations the old Write tab used, just orchestrated
+      differently client-side, so no new server-side test was needed for them.
     - **Bulk seed for sharding tests.** `POST /admin/data/seed {table, count, start?,
       key_prefix?, value_bytes?}` writes synthetic rows whose partition key is
       `key_prefix` + zero-padded index, stored under the edges' token-prefixed

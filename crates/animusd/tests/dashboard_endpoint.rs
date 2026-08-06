@@ -126,12 +126,19 @@ async fn dashboard_serves_spa_with_cors_and_peers() {
             "dashboard response carries CORS, headers:\n{head}"
         );
         assert!(
-            body.contains("AnimusDB") && body.contains("/admin/peers"),
-            "served the embedded SPA asset"
+            body.contains("AnimusDB Console") && body.contains("dashboard_core.js"),
+            "served the console shell, referencing its script assets"
         );
+        // The/admin/data/dynamo item form locks key attribute rows (no delete
+        // on pk/sk) — that logic lives in dashboard_browser.js now (the shell
+        // only references it by `<script src>`, ADR 0021 §1's split-file
+        // architecture), so check the asset that actually carries it rather
+        // than the shell's own body.
+        let (s, _, browser_js) = raw(admin_addr, "GET", "/admin/ui/dashboard_browser.js").await;
+        assert_eq!(s, 200, "dashboard_browser.js is served");
         assert!(
-            body.contains("dy-key-lock"),
-            "the Dynamo form locks key attribute rows (no delete on pk/sk)"
+            browser_js.contains("key-badge"),
+            "the item form locks key attribute rows (no delete on pk/sk)"
         );
         // The /admin/ui alias serves the same asset.
         let (s, _, body2) = raw(admin_addr, "GET", "/admin/ui").await;
@@ -144,10 +151,11 @@ async fn dashboard_serves_spa_with_cors_and_peers() {
         // path — including one it doesn't recognize (the client falls back to
         // the default tab rather than 404ing).
         for path in [
-            "/admin/ui/nodes",
+            "/admin/ui/overview",
+            "/admin/ui/placement",
             "/admin/ui/tablets",
+            "/admin/ui/browser",
             "/admin/ui/storage",
-            "/admin/ui/write",
             "/admin/ui/not-a-real-tab",
         ] {
             let (s, head, body3) = raw(admin_addr, "GET", path).await;
