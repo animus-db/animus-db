@@ -191,6 +191,21 @@ epoch compare-and-swap transactions.
   smoke test `tests/prod_liveness.rs`.
 - `CasTabletReplicas` applies only if the tablet's epoch matches, then bumps it
   — evaluated identically on every replica, so accept/reject is consistent.
+  **`SplitTablet` is the same CAS shape**, on an `expected_epoch` field: two
+  proposers racing to split the same tablet at the same epoch with different
+  keys (e.g. two independent `animusd` auto-split loops, or an auto-trigger
+  racing a manual one) must not both commit — the tablet's own per-tablet
+  CP-data Raft group can only ever apply one real `Split`, ever, so a second
+  metadata-level split of the same epoch would mint a `new_id` that can never
+  get a CP group: a permanent, leaderless orphan tablet (observed live under
+  sustained `animusd --auto-split` bulk-seed load, tracked down via
+  `/admin/status` showing a tablet with a real range/replicas but no entry
+  anywhere in `/admin/raftkv`). The apply rejects with `"epoch mismatch"`
+  before recomputing the range split, exactly mirroring `CasTabletReplicas`;
+  see `meta.rs::split_rejects_a_stale_epoch_racing_a_concurrent_split` and
+  `tablet_split_merge.rs::racing_splits_at_the_same_epoch_only_one_applies`
+  (the latter drives the actual race through Raft: two `SplitTablet`s
+  proposed back-to-back at the same epoch, only the first applies).
 - **Automatic placement (ADR 0005).** Policies are replicated in `Metadata`
   (`SetTabletPolicy` → `policies` map). The decision lives in the pure
   `Metadata::reconcile` (runs `animus_placement::replan` over `Active` members,
