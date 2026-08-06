@@ -238,22 +238,30 @@ here:
   this quadrant (the concurrent-writer test never flushes; the flushing test
   has one writer). Fix: a flush/compaction-in-progress guard serializing
   flush-vs-apply and flush-vs-flush.
-- **Two further WAL data-loss bugs, found by PR #24's fault injection**
-  (its `#[ignore]`d regressions in `tests/lsm_disk_faults.rs` pin them; fix
-  in flight on the storage batch-2 branch): (a) **torn-tail recovery reuses
-  the un-truncated active segment** — the torn garbage stays, the next acked
-  record is appended after it with no framing boundary, and a *second*
-  restart silently drops that acked record; recovery must seal/truncate the
-  recovered segment first. (b) **No per-record WAL checksum** — `decode_wal`
-  silently skips any malformed line, so at-rest corruption of an fsynced
-  record is silent data loss (the SSTable path fails loudly by contrast).
-- **The WAL encodes records as JSON with `Vec<u8>` values as decimal number
-  arrays** (~3-6x inflation) on the fsync-critical path — the biggest
-  write-amplification lever; a binary record codec (the manifest already has
-  one) or `serde_bytes` cuts fsync bytes several-fold — and length+CRC
-  framing solves the checksum bug above by construction (in flight, storage
-  batch 2). Same JSON-byte-array issue applies to the CP plane's wire +
-  snapshot encoding (ADR 0017 note).
+- **Two further WAL data-loss bugs, found by PR #24's fault injection —
+  both fixed in PR #32.** (a) **Torn-tail recovery reused the un-truncated
+  active segment** — the torn garbage stayed, the next acked record was
+  appended after it with no framing boundary, and a *second* restart
+  silently dropped that acked record; recovery now truncates the recovered
+  segment via `Disk::replace` before further appends ride it. (b) **No
+  per-record WAL checksum** — `decode_wal` silently skipped any malformed
+  line; the WAL is now a `len(u32)|crc32(u32)|payload` binary frame per
+  record, and a parse failure is tolerated as a crash-torn tail only if no
+  valid checksummed frame exists *later* in the buffer (`wal_resync_point` —
+  positional proof, not a length-magnitude heuristic, since a torn+corrupted
+  tail and real mid-file corruption can look identical by magnitude alone).
+- **The WAL encoded records as JSON with `Vec<u8>` values as decimal number
+  arrays** (~3-6x inflation) on the fsync-critical path — **fixed in PR #32**
+  by the binary frame above (~3-6x fewer fsync bytes; also solves the
+  checksum bug by construction). PR #32 also added (all additive, default-off):
+  `LsmOptions::trust_monotonic_versions` (skips the LWW point-read under the
+  CP plane's monotonic versions), `LsmOptions::background_maintenance`
+  (flush/compaction off the write path via `env.spawn_task` — kept opt-in
+  because this crate's tests use bare `block_on`, which can't observe a
+  spawned task without a broader test-harness rewrite), a `Disk::list`-based
+  bound on orphan-segment cleanup, and a refcounted snapshot-hold that floors
+  compaction's tombstone-GC window. Same JSON-byte-array issue applies to the
+  CP plane's wire + snapshot encoding — already fixed there in PR #29.
 - **Flush + cascading compaction run inline on the writer** with no
   backpressure — a write's tail latency includes a possibly multi-level
   compaction (matches the observed >150ms apply stalls). Move compaction off

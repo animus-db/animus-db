@@ -400,6 +400,24 @@ cross-cutting ones. Prune/merge entries that become obsolete.
   directly under `block_on` hangs forever with no panic, burning wall-clock
   silently. Spawn it as a task and drive it via `sim.run_for` instead (the
   `lin_read`-style helper pattern in `tests/read_index.rs`). (PR #31.)
+- **Distinguishing "crash-torn tail" from "mid-file corruption" needs a
+  positional proof, not a magnitude heuristic — scan forward for the next
+  valid checksummed frame; if one exists, the failure is real corruption.**
+  A torn-and-happens-to-look-corrupted tail and genuine mid-file corruption
+  can produce equally implausible declared lengths, so "does the length look
+  sane" can't tell them apart. The WAL's binary frame decoder resolves a
+  parse failure by resyncing forward: tolerate it as a crash-torn tail only
+  if NO later valid frame is found in the buffer; otherwise it's a hard
+  error. (`wal_resync_point`, PR #32.)
+- **A test suite built entirely on bare `block_on` cannot observe a
+  `env.spawn_task`-backed background feature — check the harness before
+  defaulting a new async-offload feature on.** Storage's tests never drive
+  `Simulator::run_for`/`run_until`, so a new "move maintenance to a spawned
+  task" feature would silently never run under the existing suite. Shipped
+  correctly as additive and default-OFF rather than rewriting the test
+  harness to flip it on. Corollary of "SimEnv proves logic, not real-thread
+  liveness" — but also a warning to CHECK the harness shape before assuming a
+  feature can default on. (PR #32.)
 - **A fault-schedule runner that heals immediately after the last fault gives
   single-fault scenarios a zero-length outage — give scenarios an explicit fault
   window.** The raftkv corpus healed partitions the instant the last fault landed,
