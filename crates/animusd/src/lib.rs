@@ -3020,8 +3020,11 @@ async fn auto_split_loop(ctx: ClientCtx, threshold: usize) {
 
         for (tablet, split_key) in std::mem::take(&mut pending) {
             let span = tracing::info_span!("auto_split", tablet = tablet.0, kind = "retry");
+            // Patient (2-round) confirm: this loop calls back every tick until the
+            // split lands, so a bare confirm-timeout here must not re-propose
+            // immediately — see `propose_and_confirm_split`'s doc.
             let response = ctx
-                .propose_split_data(tablet, split_key.clone())
+                .propose_split_data_with_patience(tablet, split_key.clone(), 2)
                 .instrument(span)
                 .await;
             if matches!(response, ClientResponse::PutOk) {
@@ -3421,6 +3424,20 @@ impl ClientCtx {
         fields(tablet = tablet.0, route = tracing::field::Empty)
     )]
     async fn propose_split_data(&self, tablet: TabletId, split_key: Vec<u8>) -> ClientResponse {
+        self.propose_split_data_with_patience(tablet, split_key, 1)
+            .await
+    }
+
+    /// Like [`propose_split_data`](Self::propose_split_data), but takes
+    /// `confirm_rounds` — see [`propose_and_confirm_split`](Self::propose_and_confirm_split)'s
+    /// doc for why a caller that will otherwise retry by proposing again (namely
+    /// `auto_split_loop`'s pending-retry) should pass more than 1.
+    async fn propose_split_data_with_patience(
+        &self,
+        tablet: TabletId,
+        split_key: Vec<u8>,
+        confirm_rounds: u32,
+    ) -> ClientResponse {
         let route = self.cp_route_tablet(tablet).await;
         tracing::Span::current().record(
             "route",
@@ -3431,22 +3448,17 @@ impl ClientCtx {
             },
         );
         match route {
-            CpRoute::Local(leader) => match leader.propose_split(split_key.clone()) {
-                ProposeResult::Accepted { .. } => {
-                    let confirmed = Self::confirm_split(&leader, &split_key).await;
-                    if !matches!(confirmed, ClientResponse::PutOk) {
-                        tracing::warn!(
-                            ?confirmed,
-                            "accepted propose_split never committed (leader churn?)"
-                        );
-                    }
-                    confirmed
+            CpRoute::Local(leader) => {
+                let confirmed =
+                    Self::propose_and_confirm_split(&leader, split_key, confirm_rounds).await;
+                if !matches!(confirmed, ClientResponse::PutOk) {
+                    tracing::warn!(
+                        ?confirmed,
+                        "accepted propose_split never committed (leader churn?)"
+                    );
                 }
-                ProposeResult::NotLeader { .. } => {
-                    tracing::warn!("local route was stale: leader stepped down before propose");
-                    ClientResponse::Error("CP group leader moved; retry the split".into())
-                }
-            },
+                confirmed
+            }
             // `CpSplit` is already a one-hop "serve-or-error, never re-forward"
             // request, so relay it directly (its own top-level handler) — not via
             // `cp_forward`, which wraps in `Forwarded` (the Put/Get/Delete/Scan path).
@@ -3474,19 +3486,60 @@ impl ClientCtx {
         }
     }
 
+    /// Propose `split_key` on `leader` and confirm it, trying up to
+    /// `confirm_rounds` confirm windows before giving up. `confirm_rounds > 1` is
+    /// for a caller that would otherwise retry by proposing again
+    /// (`auto_split_loop`'s pending-retry, `cp_split_here`): `ProposeResult::Accepted`
+    /// only means the `Split` entry reached the leader's local log, not that it
+    /// committed (see [`confirm_split`](Self::confirm_split)'s doc), so a bare
+    /// confirm-timeout does not mean it is lost. Proposing a fresh, fully
+    /// redundant `Split` entry on top of one still probably committing wastes a
+    /// full WAL append + replication round-trip under exactly the
+    /// slow/contended conditions that caused the timeout — safe (a group can
+    /// only split once; re-application is a no-op) but wasteful, the same
+    /// amplification shape [`ClientCtx::cp_batch_write_patient`] fixes for
+    /// bulk-seed batch writes, applied here to the split-propose path. Polling
+    /// the same accepted entry again first (instead of re-proposing) is
+    /// strictly cheaper and just as correct: either it lands, or a caller with
+    /// its own retry loop (`auto_split_loop`'s tick cadence) still gets another
+    /// attempt later.
+    async fn propose_and_confirm_split(
+        leader: &CpGroup,
+        split_key: Vec<u8>,
+        confirm_rounds: u32,
+    ) -> ClientResponse {
+        match leader.propose_split(split_key.clone()) {
+            ProposeResult::Accepted { .. } => {
+                let mut confirmed = Self::confirm_split(leader, &split_key).await;
+                for _ in 1..confirm_rounds.max(1) {
+                    if matches!(confirmed, ClientResponse::PutOk) {
+                        break;
+                    }
+                    confirmed = Self::confirm_split(leader, &split_key).await;
+                }
+                confirmed
+            }
+            ProposeResult::NotLeader { .. } => {
+                tracing::warn!("local route was stale: leader stepped down before propose");
+                ClientResponse::Error("CP group leader moved; retry the split".into())
+            }
+        }
+    }
+
     /// Serve the **data-plane half** of a split forwarded from another node (D2): this
     /// node must host `tablet`'s CP-group leader (one hop, no metadata, no re-forward).
     /// Proposes `propose_split` iff it leads, else errors so the client retries with
     /// fresh routing. Confirms the propose actually committed before reporting
-    /// success — see [`confirm_split`](Self::confirm_split)'s doc.
+    /// success — see [`confirm_split`](Self::confirm_split)'s doc. Always uses the
+    /// patient (2-round) confirm via [`propose_and_confirm_split`]: this handler
+    /// can't tell whether its caller (a remote node's `auto_split_loop`) is about
+    /// to retry on a bare timeout, so it assumes it might and avoids proposing a
+    /// redundant duplicate on its own next invocation.
+    ///
+    /// [`propose_and_confirm_split`]: Self::propose_and_confirm_split
     async fn cp_split_here(&self, tablet: TabletId, split_key: Vec<u8>) -> ClientResponse {
         match self.edge.cp_leader(tablet) {
-            Some(leader) => match leader.propose_split(split_key.clone()) {
-                ProposeResult::Accepted { .. } => Self::confirm_split(&leader, &split_key).await,
-                ProposeResult::NotLeader { .. } => {
-                    ClientResponse::Error("CP group leader moved; retry the split".into())
-                }
-            },
+            Some(leader) => Self::propose_and_confirm_split(&leader, split_key, 2).await,
             None => ClientResponse::Error("forwarded CP split: not the leader here".into()),
         }
     }

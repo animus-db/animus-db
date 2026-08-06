@@ -1114,6 +1114,25 @@ cross-cutting ones. Prune/merge entries that become obsolete.
   any retry loop wrapping a Raft write: does a bare timeout distinguish
   "definitely not accepted anywhere" from "accepted, just slow"? If not, a
   slow/contended commit path gets a retry storm instead of patience.
+  **This recurred immediately in a sibling code path** — worth treating as a
+  *pattern* to sweep for, not a one-off: `auto_split_loop`'s `pending` map
+  (the step-2 `propose_split` retry) has the identical shape, just already
+  half-fixed — `confirm_split` was already a poll-only primitive (propose and
+  confirm were never fused there the way `cp_batch_local` fused them), but the
+  retry loop still called `propose_split_data` (propose **and** confirm)
+  fresh on every ~2s tick regardless of whether the prior attempt reached
+  `Accepted`. `Split` apply is idempotent (a group splits once; re-application
+  is a no-op) so this was never a correctness bug, purely a wasted-work one —
+  same fsync/replication doubling, same live-repro signature (flat Raft terms,
+  `commit_index` still climbing). Fixed the same way: `propose_and_confirm_split`
+  takes a `confirm_rounds` count, and the pending-retry call (plus
+  `cp_split_here`, the cross-process counterpart, which can't tell if its
+  caller is about to retry) passes 2 instead of 1 — poll the already-accepted
+  entry a second time before the *next* tick would otherwise re-propose.
+  Lesson beyond the original one: when a retry-amplification bug is found and
+  fixed in one place, grep for the same *shape* (propose-then-poll, called
+  again from a loop on bare timeout) elsewhere in the same subsystem — it is
+  rarely truly a one-off.
 
 ### Parallel-agent orchestration
 - **Partition work by disjoint crate ownership — exactly one owner per shared
