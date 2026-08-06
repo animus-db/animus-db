@@ -380,7 +380,11 @@ backend), `tests/metrics_endpoint.rs` (the admin `GET /metrics` HTTP route, ADR 
 export with `control_elections_won >= 1` and `control_is_leader 1` on the leader /
 `0` on a follower), `tests/cp_plane.rs` (CP round-trip: write via one node, read via
 another — the CP group is the single source of truth), `tests/cp_cross_process.rs`
-(cross-process CP forwarding to the leader's node), `tests/admin_endpoint.rs` (the
+(cross-process CP forwarding to the leader's node — including the **derived-member-id**
+regression: a *second* provisioned table's group speaks `cp_member_id`-derived ids, so
+`cp_forward_target` must translate its leader hint back to a base id via `cp_base_id`
+before the `client_route` lookup; the first table rides the bootstrap group where
+member == base and can't catch this), `tests/admin_endpoint.rs` (the
 admin / debug interface, ADR 0020: a per-process 3-node cluster, then the read-only
 views config/status/raft/raftkv/storage·wal/metrics/health over the dedicated admin
 port + the `storage/flush` action observed via `storage/lsm`; metrics asserted on

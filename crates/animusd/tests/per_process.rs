@@ -48,32 +48,50 @@ fn free_addrs(count: usize) -> Vec<SocketAddr> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn per_process_nodes_form_a_cluster_from_shared_config() {
     let n = 3;
-    let addrs = free_addrs(n * 6);
-    let nodes_cfg: Vec<RoleAddrs> = (0..n)
-        .map(|i| RoleAddrs {
-            control: addrs[6 * i],
-            client: addrs[6 * i + 1],
-            dynamo: addrs[6 * i + 2],
-            cql: addrs[6 * i + 3],
-            raftkv: addrs[6 * i + 4],
-            admin: addrs[6 * i + 5],
-        })
-        .collect();
-    let config = ClusterConfig { nodes: nodes_cfg };
-
-    // The config round-trips through JSON exactly as it would on disk between
-    // processes.
-    let config = ClusterConfig::from_json(&config.to_json()).unwrap();
-
-    // Start each node independently, as separate processes would.
+    // Start each node independently, as separate processes would — wrapped in the
+    // documented **port-TOCTOU retry** (`free_addrs` releases the probed ports
+    // before `run_node` rebinds them, so a concurrent test binary can steal one;
+    // re-allocate fresh ports and retry the bring-up as a unit).
     let dir = tempfile::tempdir().unwrap();
-    let mut nodes = Vec::new();
-    for i in 0..n {
-        let node = animusd::run_node(&config, i, dir.path().join(format!("node-{i}")))
-            .await
-            .unwrap_or_else(|e| panic!("node {i} failed to start: {e}"));
-        nodes.push(node);
+    let mut brought_up = None;
+    'attempts: for attempt in 0..16 {
+        let addrs = free_addrs(n * 6);
+        let nodes_cfg: Vec<RoleAddrs> = (0..n)
+            .map(|i| RoleAddrs {
+                control: addrs[6 * i],
+                client: addrs[6 * i + 1],
+                dynamo: addrs[6 * i + 2],
+                cql: addrs[6 * i + 3],
+                raftkv: addrs[6 * i + 4],
+                admin: addrs[6 * i + 5],
+            })
+            .collect();
+        let config = ClusterConfig { nodes: nodes_cfg };
+
+        // The config round-trips through JSON exactly as it would on disk between
+        // processes.
+        let config = ClusterConfig::from_json(&config.to_json()).unwrap();
+
+        let mut nodes = Vec::new();
+        for i in 0..n {
+            match animusd::run_node(&config, i, dir.path().join(format!("node-{attempt}-{i}")))
+                .await
+            {
+                Ok(node) => nodes.push(node),
+                Err(_) => {
+                    for node in &nodes {
+                        node.shutdown_graceful().await;
+                    }
+                    sleep(Duration::from_millis(50)).await;
+                    continue 'attempts;
+                }
+            }
+        }
+        brought_up = Some((nodes, config));
+        break;
     }
+    let (nodes, config) =
+        brought_up.expect("could not bring up cluster after retries (ports kept getting stolen)");
 
     await_bootstrap(&nodes).await;
 
