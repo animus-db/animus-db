@@ -10,7 +10,7 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
 ## Entry points
 
 - `lib.rs` — `StorageEngine` and `Snapshot` traits; `WriteBatch`, `WriteOp`,
-  `VersionedValue`, `StorageError`.
+  `MergeOp`, `VersionedValue`, `StorageError`.
 - `memory.rs` — `MemoryEngine`: `BTreeMap` MVCC store, deterministic; the engine
   used under simulation.
 - `lsm.rs` (+ `lsm/sstable.rs`) — `LsmEngine<E: Env>`: a **real on-disk LSM**
@@ -46,6 +46,19 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
   returns each key's latest record including tombstones (`(key, Option<value>,
   version)`), which anti-entropy uses so deletes propagate too. `put` keeps its
   global contract for single-writer callers (control plane, dynamo adapter).
+- **`merge_batch(Vec<MergeOp>)` coalesces a *sequential* run of merges into one WAL
+  `fsync`.** Each `MergeOp` carries its **own** version (unlike `write_batch`, which
+  stamps one version and uses `put`/monotonic-floor semantics) and applies with the
+  same per-key LWW rule as `merge`/`merge_tombstone` — the decision considers both
+  engine state **and** earlier winners for the same key in the batch, and only the
+  winners are logged, so WAL replay reconstructs the memtable byte-identically to a
+  run of individual merges (idempotent, crash-safe at the same `fsync` boundary).
+  This exists because WAL group commit only amortizes the `fsync` across
+  *concurrent* writers; the CP-data Raft apply loop is a single sequential task, so
+  it needs an explicit batch API to avoid one `fsync` per applied command (ADR 0008;
+  ~9.7x on the apply-path bench). The trait method is **defaulted** (per-op loop) so
+  `MemoryEngine` and any other backend need no change; `LsmEngine` overrides it
+  (`WalRecord::MergeBatch`). Regression: `lsm_group_commit.rs::merge_batch_coalesces_one_fsync_and_is_durable`.
 - Per key, history is `version -> Some(value) | None`; `None` is a tombstone, so
   `delete`/`delete_range` preserve older versions for `get_at`.
 - **`LsmEngine` is the simulation-testable on-disk engine.**
@@ -235,5 +248,9 @@ the sim proves logic/order, not real-thread races.
 `MemoryEngine` on put/get/scan throughput + latency and reporting flush/
 compaction counts. Workload is tunable via `ANIMUS_BENCH_KEYS` /
 `ANIMUS_BENCH_GETS` / `ANIMUS_BENCH_VALUE_BYTES` / `ANIMUS_BENCH_SCAN`. The
-default run shows the per-put WAL `fsync` is the dominant write cost (group-commit
-batching is the next deferred win).
+default run shows the per-put WAL `fsync` is the dominant sequential write cost;
+the **concurrent** section shows group commit coalescing it across writers, and the
+**sequential apply-path** section (`ANIMUS_BENCH_APPLY_BATCH`, default 30) compares
+per-op `merge` against `merge_batch` — the CP-data Raft apply pattern — where a
+single task cannot rely on group commit and `merge_batch` gives ~9.7x (fsyncs 30x
+fewer).

@@ -107,8 +107,8 @@ use animus_env::{Env, Metric, MetricsHandle};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Key, Result, Snapshot, StorageEngine, StorageError, Value, Version, VersionedValue, WriteBatch,
-    WriteOp,
+    Key, MergeOp, Result, Snapshot, StorageEngine, StorageError, Value, Version, VersionedValue,
+    WriteBatch, WriteOp,
 };
 
 mod bloom;
@@ -225,6 +225,23 @@ enum WalRecord {
         version: Version,
         ops: Vec<BatchOp>,
     },
+    /// A group of per-key LWW merges, each carrying its **own** version (unlike
+    /// `Batch`, which stamps one version on every op). Logged by `merge_batch`
+    /// after the LWW decision, so replay is a pure per-op re-insert of each
+    /// `(key, version)` slot — idempotent and order-independent, exactly as a
+    /// run of individual `merge`/`merge_tombstone` records would replay.
+    MergeBatch {
+        ops: Vec<MergeRec>,
+    },
+}
+
+/// One decided merge as logged in a [`WalRecord::MergeBatch`]: `value` `Some` is a
+/// value slot, `None` a tombstone slot, at this op's own `version`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct MergeRec {
+    key: Key,
+    value: Option<Value>,
+    version: Version,
 }
 
 /// A batch op as logged: range deletes are pre-expanded to the affected keys so
@@ -1511,6 +1528,9 @@ pub enum WalRecordView {
     },
     /// A write batch; `ops` is the operation count.
     Batch { version: Version, ops: usize },
+    /// A per-key LWW merge batch; `ops` is the operation count and `max_version`
+    /// the highest per-op version it carries.
+    MergeBatch { ops: usize, max_version: Version },
 }
 
 impl From<WalRecord> for WalRecordView {
@@ -1539,6 +1559,10 @@ impl From<WalRecord> for WalRecordView {
             },
             WalRecord::Batch { version, ops } => WalRecordView::Batch {
                 version,
+                ops: ops.len(),
+            },
+            WalRecord::MergeBatch { ops } => WalRecordView::MergeBatch {
+                max_version: ops.iter().map(|o| o.version).max().unwrap_or(0),
                 ops: ops.len(),
             },
         }
@@ -1621,6 +1645,60 @@ impl<E: Env> StorageEngine for LsmEngine<E> {
         .await?;
         self.maybe_flush_and_compact().await?;
         Ok(true)
+    }
+
+    async fn merge_batch(&self, ops: Vec<MergeOp>) -> Result<()> {
+        if ops.is_empty() {
+            return Ok(());
+        }
+        // Decide per-op LWW winners *before* logging, matching `merge`: an op
+        // takes effect only if its version is strictly greater than the key's
+        // current latest — considering both the engine's state AND earlier
+        // winners for the same key in this same batch (which aren't in the
+        // memtable yet, since we apply only after the single sync). Logging just
+        // the winners keeps WAL replay a pure re-insert, so a crash-recovered
+        // memtable is byte-identical to applying the ops via individual `merge`s.
+        let mut in_batch: BTreeMap<Key, Version> = BTreeMap::new();
+        let mut winners: Vec<MergeRec> = Vec::with_capacity(ops.len());
+        for op in ops {
+            let engine_latest = self.latest_version_of(&op.key).await?;
+            let prior = in_batch.get(&op.key).copied();
+            let current = match (engine_latest, prior) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (Some(a), None) | (None, Some(a)) => Some(a),
+                (None, None) => None,
+            };
+            if current.is_some_and(|c| op.version <= c) {
+                continue; // LWW loser: a newer version already holds this key.
+            }
+            in_batch.insert(op.key.clone(), op.version);
+            winners.push(MergeRec {
+                key: op.key,
+                value: op.value,
+                version: op.version,
+            });
+        }
+        if winners.is_empty() {
+            return Ok(());
+        }
+        // One WAL record, one `fsync`, one memtable-apply pass under the lock —
+        // the whole point: N merges pay a single group-commit sync, not N.
+        self.log_and_apply(
+            &WalRecord::MergeBatch {
+                ops: winners.clone(),
+            },
+            |inner| {
+                for w in &winners {
+                    match &w.value {
+                        Some(value) => inner.apply_put(&w.key, value, w.version),
+                        None => inner.apply_delete(&w.key, w.version),
+                    }
+                    inner.manifest.max_version = inner.manifest.max_version.max(w.version);
+                }
+            },
+        )
+        .await?;
+        self.maybe_flush_and_compact().await
     }
 
     async fn delete(&self, key: &[u8], version: Version) -> Result<()> {
@@ -2005,6 +2083,7 @@ fn record_max_version(record: &WalRecord) -> Version {
         | WalRecord::Delete { version, .. }
         | WalRecord::DeleteRange { version, .. }
         | WalRecord::Batch { version, .. } => *version,
+        WalRecord::MergeBatch { ops } => ops.iter().map(|o| o.version).max().unwrap_or(0),
     }
 }
 
@@ -2037,6 +2116,11 @@ fn apply_wal_record(memtable: &mut BTreeMap<Key, History>, bytes: &mut usize, re
                         }
                     }
                 }
+            }
+        }
+        WalRecord::MergeBatch { ops } => {
+            for op in ops {
+                put(memtable, op.key, op.value, op.version);
             }
         }
     }

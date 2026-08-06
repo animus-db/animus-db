@@ -19,7 +19,7 @@ use animus_env::{
     BoxFuture, Clock, Disk, Env, EnvExt, Envelope, Nanos, Network, NodeId, Rng, Spawner,
 };
 use animus_sim::{SimEnv, Simulator};
-use animus_storage::{LsmEngine, LsmOptions, StorageEngine};
+use animus_storage::{LsmEngine, LsmOptions, MergeOp, StorageEngine};
 use futures::executor::block_on;
 
 const PREFIX: &str = "db/";
@@ -98,6 +98,65 @@ fn concurrent_writes_share_one_fsync() {
                 "seed={seed}: acked write {i} lost across crash",
             );
         }
+    });
+}
+
+/// `merge_batch` collapses a whole run of per-key LWW merges into **one** WAL
+/// `fsync` (the leaderful-Raft apply-path win), preserves per-key LWW semantics
+/// (including a loser that a newer version already holds, and same-key ordering
+/// within the batch), and every applied op is durable across a crash.
+#[test]
+fn merge_batch_coalesces_one_fsync_and_is_durable() {
+    let seed = 0x8A7C41;
+    let sim = Simulator::new(seed);
+    {
+        let engine = block_on(LsmEngine::open_with(sim.env(0), PREFIX, opts())).expect("open");
+        block_on(async {
+            // Seed one key at version 5 so a later batch op at version 3 loses LWW.
+            engine.merge(b"loser", b"old", 5).await.expect("seed");
+            let syncs_before = engine.wal_batch_sync_count();
+
+            let ops = vec![
+                MergeOp::put(b"a".to_vec(), b"1".to_vec(), 10),
+                MergeOp::put(b"b".to_vec(), b"2".to_vec(), 11),
+                MergeOp::tombstone(b"a".to_vec(), 12), // same-key: newer wins → a deleted
+                MergeOp::put(b"loser".to_vec(), b"stale".to_vec(), 3), // < 5 → dropped
+                MergeOp::put(b"c".to_vec(), b"3".to_vec(), 13),
+            ];
+            engine.merge_batch(ops).await.expect("merge_batch");
+
+            // The whole batch shared a single fsync (vs one per op).
+            let syncs = engine.wal_batch_sync_count() - syncs_before;
+            assert_eq!(
+                syncs, 1,
+                "seed={seed}: merge_batch must coalesce to one fsync, got {syncs}"
+            );
+
+            // Semantics: b/c applied, a tombstoned by the newer same-key op, loser
+            // unchanged (its version-3 op lost to the existing version 5).
+            assert_eq!(engine.get(b"b").await.unwrap().unwrap().value, b"2");
+            assert_eq!(engine.get(b"c").await.unwrap().unwrap().value, b"3");
+            assert_eq!(
+                engine.get(b"a").await.unwrap(),
+                None,
+                "same-key LWW: newer tombstone wins"
+            );
+            assert_eq!(
+                engine.get(b"loser").await.unwrap().unwrap().value,
+                b"old",
+                "below-latest version must not overwrite",
+            );
+        });
+    }
+
+    // Crash + reopen: every applied op is durable (an ack means durable).
+    sim.crash(0);
+    let engine = block_on(LsmEngine::open_with(sim.env(0), PREFIX, opts())).expect("reopen");
+    block_on(async {
+        assert_eq!(engine.get(b"b").await.unwrap().unwrap().value, b"2");
+        assert_eq!(engine.get(b"c").await.unwrap().unwrap().value, b"3");
+        assert_eq!(engine.get(b"a").await.unwrap(), None);
+        assert_eq!(engine.get(b"loser").await.unwrap().unwrap().value, b"old");
     });
 }
 
