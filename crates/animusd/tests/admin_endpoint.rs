@@ -442,6 +442,95 @@ async fn admin_table_management_create_and_drop() {
     .expect("test timed out");
 }
 
+/// The CP data plane's per-tablet Raft group must hold **stable leadership under
+/// sustained write load** — the driver-liveness guarantee (ADR 0017). Before engine
+/// apply + compaction were moved off the consensus loop, a bulk seed blocked the
+/// single driver task for ~180-300ms per batch (LSM merges + compaction), past the
+/// 150ms election timeout, so followers repeatedly timed out and campaigned: the CP
+/// term climbed ~8-18 per 2000-key seed (a leader-election storm that truncated
+/// in-flight writes and collapsed throughput to ~15/s). With apply/compaction on a
+/// separate task, the leader keeps heartbeating and the term stays flat.
+///
+/// This is a **real-time `ProdEnv` liveness assertion** — the class `SimEnv` cannot
+/// catch (virtual time never trips the wall-clock election timeout). We seed 2000
+/// keys through the CP leader and require the group's term to barely move.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn seed_load_does_not_storm_cp_elections() {
+    // The CP term may legitimately advance a little (an initial election retry, a
+    // stray heartbeat miss under CI load); the storm this guards against moved it by
+    // 8-18 in a single seed. A generous bound stays non-flaky while still failing
+    // loudly if the storm returns.
+    const MAX_TERM_DELTA: u64 = 3;
+
+    timeout(Duration::from_secs(90), async {
+        let dir = tempfile::tempdir().unwrap();
+        let (nodes, _config) = bring_up(3, dir.path()).await;
+        await_bootstrap(&nodes).await;
+        let (s, _ct) = admin(
+            nodes[0].admin_addr(),
+            "POST",
+            "/admin/data/dynamo",
+            Some(
+                r#"{"op":"CreateTable","payload":{"TableName":"seedt",
+                    "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
+                    "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}]}}"#,
+            ),
+        )
+        .await;
+        assert_eq!(s, 200, "CreateTable seedt");
+
+        // Poll until the bootstrap CP group has a leader; return (node index, term).
+        async fn cp_leader(nodes: &[Node]) -> (usize, u64) {
+            for _ in 0..100 {
+                for (i, node) in nodes.iter().enumerate() {
+                    let (_, rk) = admin_get(node.admin_addr(), "/admin/raftkv").await;
+                    if let Some(groups) = rk["groups"].as_array() {
+                        for g in groups {
+                            if g["is_leader"].as_bool() == Some(true) {
+                                return (i, g["term"].as_u64().unwrap_or(0));
+                            }
+                        }
+                    }
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+            panic!("CP group never elected a leader");
+        }
+
+        let (leader_idx, term_before) = cp_leader(&nodes).await;
+        let started = std::time::Instant::now();
+        let (s, body) = admin(
+            nodes[leader_idx].admin_addr(),
+            "POST",
+            "/admin/data/seed",
+            Some(r#"{"table":"seedt","count":2000,"key_prefix":"seed:","value_bytes":64}"#),
+        )
+        .await;
+        assert_eq!(s, 200, "seed returns 200: {body}");
+        assert_eq!(
+            body["written"], 2000,
+            "seed wrote all requested keys: {body}"
+        );
+
+        let (_, term_after) = cp_leader(&nodes).await;
+        let delta = term_after.saturating_sub(term_before);
+        let rate = 2000.0 / started.elapsed().as_secs_f64();
+        eprintln!("seed 2000 keys: {rate:.0}/s, CP term {term_before} -> {term_after} (Δ{delta})");
+        assert!(
+            delta <= MAX_TERM_DELTA,
+            "CP leadership stormed under seed load: term moved {term_before} -> {term_after} \
+             (Δ{delta} > {MAX_TERM_DELTA}) — apply/compaction is likely blocking the driver \
+             loop past the election timeout again"
+        );
+
+        for node in &nodes {
+            node.shutdown_graceful().await;
+        }
+    })
+    .await
+    .expect("seed-load election-stability test timed out");
+}
+
 /// The bulk-seed endpoint (ADR 0021) writes the requested number of synthetic keys
 /// to the CP plane, and they land durably (visible in the CP leader's storage).
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]

@@ -33,7 +33,7 @@
 //! ([`RaftKvNode::start_seeded`]).
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -42,6 +42,7 @@ use animus_control::{PersistedState, ProposeResult};
 use animus_env::{Coresident, Env, EnvExt, NodeId};
 use animus_storage::StorageEngine;
 use futures::future::{Either, select};
+use futures::lock::Mutex as AsyncMutex;
 use serde::{Deserialize, Serialize};
 
 /// The data plane's Raft log command: a key-value mutation (or the election
@@ -163,13 +164,22 @@ pub struct RaftKvNode<E: Env, S: StorageEngine> {
     all_nodes: Vec<NodeId>,
     reads: Arc<Mutex<ReadState>>,
     cas: Arc<Mutex<CasResults>>,
-    /// Set by [`shutdown`](Self::shutdown); the driver loop observes it on its
-    /// next wake (message or timer tick) and exits.
+    /// Highest Raft log index the **apply task** has merged into the engine. The
+    /// consensus loop advances the core's `last_applied` (its buffer cursor) as soon
+    /// as entries are committed+durable, but the async apply task lags behind
+    /// merging them into the engine — so linearizable reads gate on *this* (engine
+    /// progress), never `last_applied`, or they could read past the engine's state.
+    engine_applied: Arc<AtomicU64>,
+    /// Set by [`shutdown`](Self::shutdown); both the consensus loop and the apply
+    /// task observe it and exit.
     halted: Arc<AtomicBool>,
-    /// Set by the driver loop just before it returns, so a teardown path can
-    /// wait for the last in-flight persist/apply to finish before touching the
-    /// group's durable artifacts ([`is_stopped`](Self::is_stopped)).
+    /// Set by the **consensus loop** just before it returns.
     stopped: Arc<AtomicBool>,
+    /// Set by the **apply task** just before it returns. The group's durable
+    /// artifacts are quiescent only once *both* tasks have stopped
+    /// ([`is_stopped`](Self::is_stopped)) — the teardown path (drop-table GC) waits
+    /// on that before deleting the engine/WAL.
+    apply_stopped: Arc<AtomicBool>,
 }
 
 /// Invoked on a replica when it **applies** a committed `Split` (ADR 0017 D), with
@@ -218,6 +228,9 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         let cas = Arc::new(Mutex::new(CasResults::default()));
         let halted = Arc::new(AtomicBool::new(false));
         let stopped = Arc::new(AtomicBool::new(false));
+        let apply_stopped = Arc::new(AtomicBool::new(false));
+        let engine_applied = Arc::new(AtomicU64::new(0));
+        let wal_lock = Arc::new(AsyncMutex::new(()));
         let node = Self {
             env: env.clone(),
             core: Arc::clone(&core),
@@ -225,20 +238,28 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             all_nodes: all_nodes.clone(),
             reads: Arc::clone(&reads),
             cas: Arc::clone(&cas),
+            engine_applied: Arc::clone(&engine_applied),
             halted: Arc::clone(&halted),
             stopped: Arc::clone(&stopped),
+            apply_stopped: Arc::clone(&apply_stopped),
         };
-        env.spawn_task(drive(
-            env.clone(),
+        // The consensus loop recovers from the WAL, then spawns the apply task
+        // (so the apply task sees the recovered core + the correct
+        // `engine_applied` base before it merges anything), then runs.
+        env.spawn_task(drive(DriveState {
+            env: env.clone(),
             core,
             all_nodes,
             storage,
             reads,
             cas,
+            engine_applied,
+            wal_lock,
             on_split,
             halted,
             stopped,
-        ));
+            apply_stopped,
+        }));
         node
     }
 
@@ -260,13 +281,13 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         self.halted.load(Ordering::SeqCst)
     }
 
-    /// Whether the driver loop has actually exited after a
-    /// [`shutdown`](Self::shutdown) — once true, no further WAL append/fsync or
-    /// engine apply is in flight, so the group's durable artifacts are safe to
-    /// delete.
+    /// Whether **both** driver tasks (the consensus loop and the apply task) have
+    /// actually exited after a [`shutdown`](Self::shutdown) — once true, no further
+    /// WAL append/fsync or engine apply is in flight, so the group's durable
+    /// artifacts are safe to delete.
     #[must_use]
     pub fn is_stopped(&self) -> bool {
-        self.stopped.load(Ordering::SeqCst)
+        self.stopped.load(Ordering::SeqCst) && self.apply_stopped.load(Ordering::SeqCst)
     }
 
     fn majority(&self) -> usize {
@@ -590,7 +611,11 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
                     .get(&epoch)
                     .is_some_and(|(_, acks)| acks.len() >= majority)
             };
-            let applied = self.lock().last_applied() >= read_index;
+            // Gate on **engine-applied** progress, not the core's `last_applied`:
+            // the async apply task merges into the engine behind the core's apply
+            // cursor, and this read serves from the engine — so waiting on
+            // `last_applied` could read a key the engine has not yet merged.
+            let applied = self.engine_applied.load(Ordering::SeqCst) >= read_index;
             if !still_leader || self.env.now().0 >= deadline {
                 break false;
             }
@@ -726,33 +751,53 @@ impl<E: Coresident, S: StorageEngine + 'static> RaftKvNode<E, S> {
     }
 }
 
-/// Persist the core's pending WAL records (append + `fsync`), then advance the
-/// durable watermark so committed entries become applicable, then **apply** the
-/// now-durable commands to the engine in commit order. Durability precedes both
-/// visibility and the engine write (ADR 0009 / ADR 0017).
-async fn flush_and_apply<E: Env, S: StorageEngine>(
+/// Persist the core's pending WAL records (append + `fsync`) and advance the
+/// durable watermark so committed entries become applicable. **Runs on the
+/// consensus loop only** and is deliberately cheap — engine apply and compaction
+/// (the slow work that used to share this pass) now run on the separate apply task,
+/// so this loop stays responsive to Raft messages / heartbeats within the election
+/// timeout (ADR 0017 — the driver-liveness fix). Holds `wal_lock` so the append
+/// cannot interleave with the apply task's compaction rewrite of the same file.
+/// Durability precedes visibility: `mark_durable_through` follows the `fsync`.
+async fn persist_wal<E: Env>(env: &E, core: &Arc<Mutex<KvCore>>, wal_lock: &AsyncMutex<()>) {
+    let _wal = wal_lock.lock().await;
+    let (records, through) = {
+        let mut c = core.lock().expect("raftkv core poisoned");
+        (c.drain_persist(), c.last_log_index())
+    };
+    if records.is_empty() {
+        return;
+    }
+    for record in &records {
+        env.append(WAL, &PersistedState::encode_record(record))
+            .await
+            .expect("raftkv wal append");
+    }
+    env.sync(WAL).await.expect("raftkv wal sync");
+    core.lock()
+        .expect("raftkv core poisoned")
+        .mark_durable_through(through);
+}
+
+/// Install any received snapshot, apply committed-and-durable commands to the
+/// engine in commit order, and compact when the engine has merged enough past the
+/// snapshot base. **Runs on the apply task only** — off the consensus loop, so a
+/// slow batch of engine merges or a compaction rewrite never stalls heartbeats /
+/// append processing (the driver-liveness fix). Returns whether it did any work, so
+/// the caller can back off when idle. `engine_applied` publishes engine progress
+/// (linearizable reads gate on it), and `wal_lock` guards the compaction rewrite.
+#[allow(clippy::too_many_arguments)] // the apply task's shared-state bundle
+async fn apply_and_compact<E: Env, S: StorageEngine>(
     env: &E,
     core: &Arc<Mutex<KvCore>>,
     storage: &S,
     cas: &Arc<Mutex<CasResults>>,
     on_split: &Option<SplitHook>,
-) {
-    // Drain WAL records + the log high-water under one lock.
-    let (records, through) = {
-        let mut c = core.lock().expect("raftkv core poisoned");
-        (c.drain_persist(), c.last_log_index())
-    };
-    if !records.is_empty() {
-        for record in &records {
-            env.append(WAL, &PersistedState::encode_record(record))
-                .await
-                .expect("raftkv wal append");
-        }
-        env.sync(WAL).await.expect("raftkv wal sync");
-        core.lock()
-            .expect("raftkv core poisoned")
-            .mark_durable_through(through);
-    }
+    engine_applied: &AtomicU64,
+    wal_lock: &AsyncMutex<()>,
+    halted: &AtomicBool,
+) -> bool {
+    let mut did_work = false;
 
     // Install a fully-received snapshot (a follower catching up) into the engine
     // *before* applying log-tail effects, so the tail merges on top of the base.
@@ -760,14 +805,17 @@ async fn flush_and_apply<E: Env, S: StorageEngine>(
         .lock()
         .expect("raftkv core poisoned")
         .drain_pending_install();
-    if let Some((_last_index, bytes)) = pending_install {
+    if let Some((last_index, bytes)) = pending_install {
         install_engine_image(storage, &bytes).await;
+        engine_applied.fetch_max(last_index, Ordering::SeqCst);
+        did_work = true;
     }
 
     // Apply the now-durable committed commands to the engine, in commit order.
     // The Raft index is the MVCC version: per-key LWW then reproduces the agreed
     // total order, and re-applying on recovery is idempotent.
     let effects = core.lock().expect("raftkv core poisoned").drain_apply();
+    did_work |= !effects.is_empty();
     for (index, command) in effects {
         match command {
             KvCommand::Put { key, value } => {
@@ -838,39 +886,71 @@ async fn flush_and_apply<E: Env, S: StorageEngine>(
             }
             KvCommand::NoOp => {}
         }
+        // The engine now reflects `index`; publish it *after* the merge so
+        // linearizable reads (which gate on `engine_applied`) never observe past
+        // the engine, and compaction snapshots only up to a merged index.
+        engine_applied.fetch_max(index, Ordering::SeqCst);
     }
 
-    // Compact once enough has been applied: snapshot the engine image (so a
-    // lagging follower can be caught up via `InstallSnapshot`), truncate the Raft
-    // log prefix, and rewrite the WAL to its bounded image (ADR 0017 A.2). The
-    // engine itself is the durable snapshot for local recovery; the image bytes
-    // are only for shipping to a behind follower.
-    let behind = core
-        .lock()
-        .expect("raftkv core poisoned")
-        .applied_since_snapshot();
-    if behind >= COMPACT_THRESHOLD {
-        let image = engine_image(storage).await;
-        {
+    // Compact once the *engine* has merged enough past the snapshot base: snapshot
+    // the engine image (so a lagging follower can be caught up via
+    // `InstallSnapshot`), truncate the Raft log prefix, and rewrite the WAL to its
+    // bounded image (ADR 0017 A.2). We snapshot only up to `engine_applied`, not the
+    // core's `last_applied` (which the async apply lags) — else the truncated log
+    // prefix would run past what the engine image contains. This task is the only
+    // engine writer, so nothing merges between reading `ea` and the snapshot below,
+    // making the image reflect exactly `ea`.
+    let ea = engine_applied.load(Ordering::SeqCst);
+    let behind = ea.saturating_sub(core.lock().expect("raftkv core poisoned").snapshot_index());
+    // Skip compaction once a shutdown is requested: it is only a WAL-bounding
+    // optimization (the engine + un-truncated WAL stay consistent without it), and
+    // starting a full WAL rewrite while the env is being torn down races the task
+    // abort — the `replace` can then fail on a half-gone data dir.
+    if behind >= COMPACT_THRESHOLD && !halted.load(Ordering::SeqCst) {
+        let image = engine_image(storage).await; // slow scan, no locks held
+        // Serialize the WAL rewrite against the consensus loop's appends.
+        let _wal = wal_lock.lock().await;
+        let (bytes, lli) = {
             let mut c = core.lock().expect("raftkv core poisoned");
             c.set_snapshot_blob(image);
-            c.snapshot();
-        }
-        let bytes = {
-            let c = core.lock().expect("raftkv core poisoned");
+            c.snapshot_upto(ea);
+            let lli = c.last_log_index();
             let mut buf = Vec::new();
             for record in c.wal_image() {
                 buf.extend(PersistedState::encode_record(&record));
             }
-            buf
+            c.take_snapshot_dirty();
+            // The rewrite (below) makes the whole current log durable, so the
+            // consensus loop's accumulated pending append records are now redundant
+            // — drop them (`replay` is push-based, so re-appending them would
+            // duplicate entries). `wal_image` already captures the net durable state
+            // (snapshot + hard + log tail). Under this one lock hold, so no
+            // propose/append interleaves.
+            let _ = c.drain_persist();
+            (buf, lli)
         };
-        env.replace(WAL, &bytes)
-            .await
-            .expect("raftkv wal compaction");
-        core.lock()
-            .expect("raftkv core poisoned")
-            .take_snapshot_dirty();
+        match env.replace(WAL, &bytes).await {
+            Ok(()) => {
+                // Physically durable now — advance the watermark.
+                core.lock()
+                    .expect("raftkv core poisoned")
+                    .mark_durable_through(lli);
+            }
+            // A shutdown that landed mid-rewrite (aborting tasks + dropping the data
+            // dir) can fail the `replace`; tolerate it only while halted — the
+            // pre-compaction WAL is still intact, so recovery is unaffected. A
+            // failure while *not* halted is a real durability fault → surface it.
+            Err(e) => {
+                assert!(
+                    halted.load(Ordering::SeqCst),
+                    "raftkv wal compaction failed while running: {e}"
+                );
+            }
+        }
+        did_work = true;
     }
+
+    did_work
 }
 
 /// The engine's live `(key, value)` pairs with `key >= at` — the data handed off
@@ -924,22 +1004,54 @@ async fn install_engine_image<S: StorageEngine>(storage: &S, bytes: &[u8]) {
     }
 }
 
-/// The per-node driver loop: recover from the WAL, then repeatedly persist+apply,
-/// wait for the next message or timer, step the core, persist+apply again, and
-/// ship outbound. Mirrors the control-plane `RaftNode` driver, minus the
-/// reconcile/failure-detector loops (control-plane only), plus engine apply.
-#[allow(clippy::too_many_arguments)] // the driver's shared-state bundle, built in one place
-async fn drive<E: Env, S: StorageEngine>(
+/// The shared-state bundle handed to the driver tasks, built once in
+/// [`RaftKvNode::start_inner`]. Bundled into a struct so the split into a consensus
+/// loop + an apply task doesn't spread a dozen positional args across two spawns.
+struct DriveState<E: Env, S: StorageEngine> {
     env: E,
     core: Arc<Mutex<KvCore>>,
     all_nodes: Vec<NodeId>,
     storage: S,
     reads: Arc<Mutex<ReadState>>,
     cas: Arc<Mutex<CasResults>>,
+    engine_applied: Arc<AtomicU64>,
+    wal_lock: Arc<AsyncMutex<()>>,
     on_split: Option<SplitHook>,
     halted: Arc<AtomicBool>,
     stopped: Arc<AtomicBool>,
-) {
+    apply_stopped: Arc<AtomicBool>,
+}
+
+/// Idle back-off for the apply task: when there is nothing committed-and-durable to
+/// merge it sleeps this long before re-checking. Under load `apply_and_compact`
+/// keeps returning `true`, so the task never sleeps and apply stays close behind
+/// commit — this only bounds latency (and CPU) while idle.
+const APPLY_IDLE_POLL: Duration = Duration::from_millis(5);
+
+/// The per-node **consensus loop**: recover from the WAL, spawn the apply task, then
+/// repeatedly persist the WAL, wait for the next message or timer, step the core,
+/// persist again, and ship outbound. Engine apply + compaction run on the *separate*
+/// apply task (see [`apply_loop`]), so this loop never blocks on a slow batch of
+/// merges or a compaction rewrite and can always service heartbeats / append
+/// processing within the election timeout (the driver-liveness fix, ADR 0017).
+/// Mirrors the control-plane `RaftNode` driver, minus its reconcile/failure-detector
+/// loops.
+async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
+    let DriveState {
+        env,
+        core,
+        all_nodes,
+        storage,
+        reads,
+        cas,
+        engine_applied,
+        wal_lock,
+        on_split,
+        halted,
+        stopped,
+        apply_stopped,
+    } = st;
+
     let bytes = env.read(WAL).await.unwrap_or_default();
     let state = PersistedState::replay(PersistedState::decode(&bytes));
     if !state.is_empty() {
@@ -947,16 +1059,39 @@ async fn drive<E: Env, S: StorageEngine>(
             RaftCore::recovered(env.node_id(), &all_nodes, state, env.now(), env.next_u64());
         *core.lock().expect("raftkv core poisoned") = recovered;
     }
+    // The durable engine already reflects the applied state up to the recovered
+    // apply cursor (its writes preceded the WAL fsync that recorded them), and the
+    // log tail re-applies idempotently as commit re-advances. Seed `engine_applied`
+    // at that cursor so a read right after restart doesn't wait for the base to be
+    // re-merged (it never is — only the tail is).
+    engine_applied.store(
+        core.lock().expect("raftkv core poisoned").last_applied(),
+        Ordering::SeqCst,
+    );
+
+    // Spawn the apply task now — after recovery seeded the core + `engine_applied`,
+    // so it never merges against pre-recovery state.
+    env.spawn_task(apply_loop(
+        env.clone(),
+        Arc::clone(&core),
+        storage,
+        cas,
+        on_split,
+        Arc::clone(&engine_applied),
+        Arc::clone(&wal_lock),
+        Arc::clone(&halted),
+        apply_stopped,
+    ));
 
     loop {
-        // A requested shutdown exits *between* full persist+apply passes, so the
-        // WAL and engine are never left mid-write; `stopped` then tells the
-        // teardown path the artifacts are quiescent.
+        // A requested shutdown exits *between* persist passes so the WAL is never
+        // left mid-write; `stopped` (paired with the apply task's `apply_stopped`)
+        // tells the teardown path the artifacts are quiescent.
         if halted.load(Ordering::SeqCst) {
             stopped.store(true, Ordering::SeqCst);
             return;
         }
-        flush_and_apply(&env, &core, &storage, &cas, &on_split).await;
+        persist_wal(&env, &core, &wal_lock).await;
 
         let now = env.now();
         let deadline = core.lock().expect("raftkv core poisoned").next_deadline();
@@ -1017,12 +1152,55 @@ async fn drive<E: Env, S: StorageEngine>(
             }
         };
 
-        // Durability before action: persist + apply before shipping responses.
-        flush_and_apply(&env, &core, &storage, &cas, &on_split).await;
+        // Durability before action: persist (fsync) before shipping responses, so a
+        // granted vote / appended entry is on disk before its message goes out.
+        // Engine apply happens independently on the apply task.
+        persist_wal(&env, &core, &wal_lock).await;
 
         for (to, wire) in outs {
             let bytes = serde_json::to_vec(&wire).expect("raftkv message serializes");
             env.send(to, bytes).await;
+        }
+    }
+}
+
+/// The per-node **apply task**: repeatedly install any received snapshot, apply
+/// committed-and-durable commands to the engine, and compact — all off the consensus
+/// loop, so this slow work never delays Raft message/heartbeat processing (the
+/// driver-liveness fix, ADR 0017). Backs off by [`APPLY_IDLE_POLL`] only when idle;
+/// under load it stays in lockstep behind commit. Exits after
+/// [`shutdown`](RaftKvNode::shutdown) between full apply passes (so the engine/WAL
+/// are never left mid-write), setting `apply_stopped` for the teardown path.
+#[allow(clippy::too_many_arguments)] // the apply task's shared-state bundle
+async fn apply_loop<E: Env, S: StorageEngine>(
+    env: E,
+    core: Arc<Mutex<KvCore>>,
+    storage: S,
+    cas: Arc<Mutex<CasResults>>,
+    on_split: Option<SplitHook>,
+    engine_applied: Arc<AtomicU64>,
+    wal_lock: Arc<AsyncMutex<()>>,
+    halted: Arc<AtomicBool>,
+    apply_stopped: Arc<AtomicBool>,
+) {
+    loop {
+        if halted.load(Ordering::SeqCst) {
+            apply_stopped.store(true, Ordering::SeqCst);
+            return;
+        }
+        let did_work = apply_and_compact(
+            &env,
+            &core,
+            &storage,
+            &cas,
+            &on_split,
+            &engine_applied,
+            &wal_lock,
+            &halted,
+        )
+        .await;
+        if !did_work {
+            env.sleep(APPLY_IDLE_POLL).await;
         }
     }
 }

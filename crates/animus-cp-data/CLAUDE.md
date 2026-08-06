@@ -47,12 +47,34 @@ the engine — the `AccordCore` sync-core/async-driver split.
 
 ## What's non-obvious
 
-- **The driver mirrors the control-plane `RaftNode` driver, minus reconcile +
-  failure-detection (control-plane only), plus engine apply.** Each loop:
-  `flush_and_apply` (drain WAL records → append + `fsync` → `mark_durable_through`
-  → `drain_apply` → `merge`/`merge_tombstone` into the engine, in commit order),
-  then `select(recv, timer)`, step the core, `flush_and_apply` again (durability
-  before shipping), then send. Heartbeat ticks re-replicate (no separate retry).
+- **The driver is split into two tasks: a consensus loop + an apply task.** This is
+  the **driver-liveness fix** (ADR 0017): engine apply and compaction are slow
+  (~180–300ms for a batch of LSM merges + a compaction rewrite on a real disk) and
+  used to run *inline* on the same loop that services Raft messages, so under write
+  load the driver blocked past the 150ms election timeout → followers campaigned → a
+  **leader-election storm** (term climbed continuously) that truncated in-flight
+  writes and collapsed throughput to ~15/s. Now:
+  - **Consensus loop** (`drive`): recover from WAL, spawn the apply task, then loop
+    `persist_wal` (drain WAL records → append + `fsync` → `mark_durable_through`,
+    under `wal_lock`) → `select(recv, timer)` → step the core → `persist_wal` again
+    (durability before shipping) → send. It does **no** engine apply, so it always
+    heartbeats/acks within the election timeout. Heartbeat ticks re-replicate.
+  - **Apply task** (`apply_loop` → `apply_and_compact`): install received snapshots,
+    `drain_apply` → `merge`/`merge_tombstone` into the engine in commit order, and
+    compact — all off the consensus loop. Backs off (`APPLY_IDLE_POLL`) only when
+    idle; under load it stays in lockstep behind commit.
+  - **Two invariants the split introduces:** (1) the core's `last_applied` (a buffer
+    cursor advanced by the consensus loop) now *leads* the engine, so linearizable
+    reads gate on a separate **`engine_applied`** atomic the apply task advances
+    after each merge — never `last_applied` (else a read could observe past the
+    engine). (2) The WAL file is written by both tasks (append vs. compaction
+    rewrite), serialized by an async `wal_lock`; compaction snapshots only up to
+    `engine_applied` via `RaftCore::snapshot_upto` (not `last_applied`, which the
+    engine hasn't merged yet) and **discards the consensus loop's pending records**
+    in the same locked block (`replay` is push-based → re-appending would duplicate).
+    Compaction is skipped while `halted` (it's a WAL-bounding optimization; a rewrite
+    racing teardown can fail the `replace`). `is_stopped()` requires *both* tasks
+    stopped (`stopped` && `apply_stopped`) before the GC deletes artifacts.
 - **The Raft log index is the MVCC version.** Apply uses `index` as the engine
   `version`, so per-key LWW reproduces the agreed Raft total order, and re-applying
   on recovery is idempotent.

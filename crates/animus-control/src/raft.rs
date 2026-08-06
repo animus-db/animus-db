@@ -444,10 +444,22 @@ where
     /// driver rewrites the WAL (the truncation is materialized as a full rewrite,
     /// never incremental records).
     pub fn snapshot(&mut self) {
-        if self.last_applied <= self.snapshot_index {
+        self.snapshot_upto(self.last_applied);
+    }
+
+    /// Snapshot only up to `index` (clamped to `last_applied`), rather than all the
+    /// way to `last_applied`. A `DRIVER_APPLIED` data plane whose async apply task
+    /// lags the core's `last_applied` must snapshot only to the index its engine has
+    /// actually merged (`snapshot_blob` is captured from that engine), so the shipped
+    /// image and the truncated log prefix agree — snapshotting to `last_applied`
+    /// would truncate entries the engine image does not yet contain. The in-core
+    /// control plane applies synchronously, so it uses `snapshot()` (index ==
+    /// `last_applied`). No-op if nothing new is covered.
+    pub fn snapshot_upto(&mut self, index: u64) {
+        let new_index = index.min(self.last_applied);
+        if new_index <= self.snapshot_index {
             return;
         }
-        let new_index = self.last_applied;
         let new_term = self.term_at(new_index);
         // Capture the config effective at the snapshot base *before* truncating
         // (the config entry may be in the prefix we are about to drop).
