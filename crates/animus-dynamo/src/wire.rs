@@ -1562,8 +1562,8 @@ fn key_schema_entry(name: &str, role: &str) -> Value {
 //
 // A tiny self-contained codec so the crate takes no new dependency for the `B`
 // type. Standard alphabet (`A-Za-z0-9+/`) with `=` padding, matching the
-// DynamoDB wire encoding for binary attributes. Public: the `animusd`
-// admin/dashboard display surfaces reuse it for opaque bytes.
+// DynamoDB wire encoding for binary attributes. The `animusd` admin/dashboard
+// display surfaces use the unpadded base64url variant below instead.
 
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
@@ -1629,6 +1629,83 @@ pub fn base64_decode(s: &str) -> Option<Vec<u8>> {
         }
         if pad < 1 {
             out.push(n as u8);
+        }
+    }
+    Some(out)
+}
+
+// --- base64url (URL-safe alphabet, no padding) ------------------------------
+//
+// RFC 4648 §5 with padding omitted — the display encoding for opaque bytes in
+// `animusd`'s admin/dashboard surfaces, where a rendered value is pasted back
+// into `?key=`/`?start=` query strings (the standard alphabet's `+` decodes as
+// a space there, and `=` padding percent-encodes noisily). The decoder is
+// strict (canonical): it rejects anything no byte string encodes to, which
+// keeps "does it decode?" a meaningful discriminator for the key display.
+
+const B64URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+/// Encode `bytes` as unpadded base64url (`A-Za-z0-9-_`, RFC 4648 §5).
+#[must_use]
+pub fn base64url_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as usize;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as usize;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as usize;
+        out.push(B64URL[b0 >> 2] as char);
+        out.push(B64URL[((b0 & 0x03) << 4) | (b1 >> 4)] as char);
+        if chunk.len() > 1 {
+            out.push(B64URL[((b1 & 0x0f) << 2) | (b2 >> 6)] as char);
+        }
+        if chunk.len() > 2 {
+            out.push(B64URL[b2 & 0x3f] as char);
+        }
+    }
+    out
+}
+
+/// Decode unpadded base64url: `None` on a character outside the URL-safe
+/// alphabet, an impossible length (`len % 4 == 1`), or non-canonical trailing
+/// bits (a final quantum whose unused low bits are nonzero — no byte string
+/// encodes to such a form).
+#[must_use]
+pub fn base64url_decode(s: &str) -> Option<Vec<u8>> {
+    fn val(c: u8) -> Option<u32> {
+        match c {
+            b'A'..=b'Z' => Some(u32::from(c - b'A')),
+            b'a'..=b'z' => Some(u32::from(c - b'a') + 26),
+            b'0'..=b'9' => Some(u32::from(c - b'0') + 52),
+            b'-' => Some(62),
+            b'_' => Some(63),
+            _ => None,
+        }
+    }
+    let bytes = s.as_bytes();
+    if bytes.len() % 4 == 1 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3 + 2);
+    for chunk in bytes.chunks(4) {
+        let mut acc: u32 = 0;
+        for &c in chunk {
+            acc = (acc << 6) | val(c)?;
+        }
+        match chunk.len() {
+            4 => out.extend_from_slice(&[(acc >> 16) as u8, (acc >> 8) as u8, acc as u8]),
+            3 => {
+                if acc & 0x03 != 0 {
+                    return None;
+                }
+                out.extend_from_slice(&[(acc >> 10) as u8, (acc >> 2) as u8]);
+            }
+            2 => {
+                if acc & 0x0f != 0 {
+                    return None;
+                }
+                out.push((acc >> 4) as u8);
+            }
+            _ => unreachable!("len % 4 == 1 was rejected above"),
         }
     }
     Some(out)
@@ -1905,6 +1982,39 @@ mod tests {
             let encoded = base64_encode(&bytes);
             assert_eq!(base64_decode(&encoded), Some(bytes), "len {len}");
         }
+    }
+
+    #[test]
+    fn base64url_round_trips_all_lengths_unpadded() {
+        for len in 0..20usize {
+            let bytes: Vec<u8> = (0..len).map(|i| (i * 37 % 256) as u8).collect();
+            let encoded = base64url_encode(&bytes);
+            assert!(
+                !encoded.contains('=') && !encoded.contains('+') && !encoded.contains('/'),
+                "unpadded URL-safe alphabet only: {encoded}"
+            );
+            assert_eq!(base64url_decode(&encoded), Some(bytes), "len {len}");
+        }
+        // The URL-safe substitutions: 0xfb 0xff 0xfe is "+//+" in the standard
+        // alphabet.
+        assert_eq!(base64url_encode(&[0xfb, 0xff, 0xfe]), "-__-");
+    }
+
+    #[test]
+    fn base64url_decode_is_strict() {
+        // Padding is not accepted (the encoding is unpadded).
+        assert_eq!(base64url_decode("ij8cAHfStuE="), None);
+        // Standard-alphabet characters are outside the URL-safe alphabet.
+        assert_eq!(base64url_decode("+A"), None);
+        assert_eq!(base64url_decode("/A"), None);
+        // len % 4 == 1 is impossible for any byte string.
+        assert_eq!(base64url_decode("AAAAA"), None);
+        // Non-canonical trailing bits: "AB" has nonzero unused low bits ("AA"
+        // is the canonical encoding of the single byte 0x00).
+        assert_eq!(base64url_decode("AB"), None);
+        assert_eq!(base64url_decode("AA"), Some(vec![0x00]));
+        assert_eq!(base64url_decode("AAB"), None);
+        assert_eq!(base64url_decode("AAA"), Some(vec![0x00, 0x00]));
     }
 
     #[test]

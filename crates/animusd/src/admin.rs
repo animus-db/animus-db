@@ -44,7 +44,7 @@
 
 use std::time::Duration;
 
-use animus_dynamo::wire::{base64_decode, base64_encode};
+use animus_dynamo::wire::{base64url_decode, base64url_encode};
 use animus_env::NodeId;
 use animus_storage::WalRecordView;
 use animus_tablet::{TOKEN_BYTES, TabletId, escape, partition_token};
@@ -851,22 +851,22 @@ fn key_str(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
-/// The display width of a base64-rendered partition token: `=`-padded base64 of
-/// `n` bytes is `ceil(n/3)*4` chars (12 for the 8-byte token).
-const TOKEN_B64_LEN: usize = TOKEN_BYTES.div_ceil(3) * 4;
+/// The display width of a base64url-rendered partition token: unpadded base64
+/// of `n` bytes is `ceil(4n/3)` chars (11 for the 8-byte token).
+const TOKEN_B64_LEN: usize = (TOKEN_BYTES * 4).div_ceil(3);
 
-/// URL-safe base64 (`-`/`_` instead of `+`/`/`, `=` padding kept) of the binary
-/// partition token. URL-safe because a displayed key is pasted back into
+/// Unpadded base64url (RFC 4648 §5, `-`/`_` instead of `+`/`/`, no `=`) of the
+/// binary partition token. URL-safe because a displayed key is pasted back into
 /// `?key=`/`?start=` query strings, where the standard alphabet's `+` decodes as
-/// a space; the trailing `=` doubles as a discriminator so a plain printable key
-/// is very unlikely to look like a token prefix (see [`parse_key_display`]).
+/// a space (and `=` padding would percent-encode noisily).
 fn token_base64(token: &[u8]) -> String {
-    base64_encode(token).replace('+', "-").replace('/', "_")
+    base64url_encode(token)
 }
 
-/// Inverse of [`token_base64`] (also tolerates the standard `+`/`/` alphabet).
+/// Inverse of [`token_base64`]. Strict: the canonical unpadded base64url form
+/// only (see [`parse_key_display`], which leans on that strictness).
 fn parse_token_base64(s: &str) -> Option<Vec<u8>> {
-    base64_decode(&s.replace('-', "+").replace('_', "/"))
+    base64url_decode(s)
 }
 
 /// Render a data-plane **key** for the dashboard's key views. A key written
@@ -874,8 +874,8 @@ fn parse_token_base64(s: &str) -> Option<Vec<u8>> {
 /// `token || escape(pk) || rk` (ADR 0022/0023): the leading [`TOKEN_BYTES`] bytes
 /// are the big-endian Murmur3 **partition token** — binary, not text — so lossy
 /// UTF-8 would mangle them into replacement characters. Show that token as
-/// URL-safe base64, a `:` separator, then the human-readable `escape(pk) || rk`
-/// remainder as a lossy UTF-8 string.
+/// unpadded base64url, a `:` separator, then the human-readable
+/// `escape(pk) || rk` remainder as a lossy UTF-8 string.
 ///
 /// But a plain-client `Put` stores its key **verbatim**, un-prefixed, so not every
 /// key has a token. Distinguish by *content*: only a leading `TOKEN_BYTES`-run that
@@ -900,8 +900,9 @@ fn key_display(bytes: &[u8]) -> String {
 /// shown in the dashboard's key views) back into the raw key bytes, so clicking
 /// a browsed key sends the *real* key to the inspector. A string not in that
 /// form — no [`TOKEN_B64_LEN`]-char, `:`-terminated prefix decoding to exactly
-/// [`TOKEN_BYTES`] bytes (e.g. a hand-typed plain key: the required `=` padding
-/// makes an accidental match rare) — is taken verbatim as raw bytes. The
+/// [`TOKEN_BYTES`] bytes (e.g. a hand-typed plain key: the decode is strict —
+/// URL-safe alphabet only, canonical trailing bits — so an accidental match is
+/// rare) — is taken verbatim as raw bytes. The
 /// remainder round-trips exactly when the original was valid UTF-8 (the common
 /// printable-pk case); bytes that lossy UTF-8 already replaced cannot be
 /// recovered, same as before this formatting.
@@ -982,8 +983,8 @@ fn client_response_to_json(resp: ClientResponse, ok: Value) -> (u16, Value) {
 mod tests {
     use super::*;
 
-    /// A token-prefixed key: the binary 8-byte token renders as 12 chars of
-    /// URL-safe base64, the printable `escape(pk)` remainder as text, and it
+    /// A token-prefixed key: the binary 8-byte token renders as 11 chars of
+    /// unpadded base64url, the printable `escape(pk)` remainder as text, and it
     /// round-trips exactly.
     #[test]
     fn key_display_shows_binary_token_as_base64_and_round_trips() {
@@ -993,14 +994,15 @@ mod tests {
         key.extend_from_slice(b"user#42");
         let shown = key_display(&key);
         let (tok_b64, sep_rest) = shown.split_at(TOKEN_B64_LEN);
-        assert_eq!(tok_b64, "ij8cAHfStuE=");
+        assert_eq!(tok_b64, "ij8cAHfStuE");
         assert_eq!(sep_rest, ":user#42");
         assert_eq!(parse_key_display(&shown), key);
     }
 
     /// A token whose standard-base64 form contains `+`/`/` renders with the
     /// URL-safe `-`/`_` instead (a displayed key is pasted into `?key=` query
-    /// strings, where a raw `+` decodes as a space), and still round-trips.
+    /// strings, where a raw `+` decodes as a space), with no `=` padding, and
+    /// still round-trips.
     #[test]
     fn key_display_token_base64_is_url_safe() {
         // 0xfb 0xff... encodes to base64 starting "+/" in the standard alphabet.
@@ -1008,8 +1010,8 @@ mod tests {
         key.extend_from_slice(b"user#42");
         let shown = key_display(&key);
         assert!(
-            !shown.contains('+') && !shown.contains('/'),
-            "token must be URL-safe: {shown}"
+            !shown.contains('+') && !shown.contains('/') && !shown.contains('='),
+            "token must be unpadded URL-safe base64: {shown}"
         );
         assert_eq!(parse_key_display(&shown), key);
     }
@@ -1031,8 +1033,16 @@ mod tests {
         assert_eq!(key_display(b"ab"), "ab");
         assert_eq!(parse_key_display("admin-key"), b"admin-key".to_vec());
         assert_eq!(parse_key_display("seed:"), b"seed:".to_vec());
-        // 12 printable chars then ':' — but not valid padded base64 of 8 bytes,
-        // so it is NOT mistaken for a token prefix.
+        // 11 printable chars then ':' — every char is in the URL-safe alphabet,
+        // but the trailing bits are non-canonical (no byte string encodes to
+        // "seed-000042"), so the strict decode rejects it and it is NOT
+        // mistaken for a token prefix.
+        assert_eq!(
+            parse_key_display("seed-000042:x"),
+            b"seed-000042:x".to_vec()
+        );
+        // A 12-char prefix (the old padded width) has no ':' at index 11, so it
+        // never enters the token path at all.
         assert_eq!(
             parse_key_display("seed-0000042:x"),
             b"seed-0000042:x".to_vec()

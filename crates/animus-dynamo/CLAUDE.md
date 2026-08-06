@@ -139,8 +139,11 @@ adapter wedge. The transport (HTTP, sockets) and the distributed routing live in
 - The `Table` item API uses a monotonic version counter seeded from
   `engine.latest_version()`; the wire path instead lets the data-plane
   coordinator assign quorum-derived versions (see `animusd`).
-- `B` (binary) and `BS` elements are base64 on the wire; the codec is
-  self-contained (no new dep).
+- `B` (binary) and `BS` elements are standard padded base64 on the wire; the
+  codec is self-contained (no new dep). `wire` also exposes an **unpadded
+  base64url** pair (`base64url_encode`/`base64url_decode`, strict/canonical
+  decode) — the display encoding for `animusd`'s admin/dashboard surfaces, not
+  used by the DynamoDB wire itself.
 - **Projection** supports **dotted document paths**: `ProjectionExpression` is a
   comma-separated list of paths `a.b.c` (with `#alias` placeholders per segment via
   `ExpressionAttributeNames`), or the legacy `AttributesToGet` array (top-level
