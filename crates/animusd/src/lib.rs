@@ -1008,13 +1008,14 @@ impl BoundNode {
             )));
             // The admin / debug HTTP-JSON endpoint on its own port (ADR 0020).
             tasks.push(tokio::spawn(admin::serve(self.admin_listener, ctx.clone())));
-            tasks.push(tokio::spawn(cql::serve(self.cql_listener, ctx)));
+            tasks.push(tokio::spawn(cql::serve(self.cql_listener, ctx.clone())));
         }
 
         Ok(Node {
             raft,
             envs,
             tasks,
+            edge: ctx.edge.clone(),
             client_addr: self.client_addr,
             dynamo_addr: self.dynamo_addr,
             cql_addr: self.cql_addr,
@@ -1033,6 +1034,11 @@ pub struct Node {
     /// The client-facing listener tasks (client TCP / dynamo HTTP / cql), which
     /// run on plain `tokio::spawn` off the `Env` network; aborted on shutdown.
     tasks: Vec<tokio::task::JoinHandle<()>>,
+    /// This cluster's shared CP-group registry (cheap to clone — `Arc`-wrapped
+    /// internally), kept so [`shutdown_graceful`](Self::shutdown_graceful) can
+    /// gracefully halt every hosted CP group before the hard abort in
+    /// [`shutdown`](Self::shutdown).
+    edge: ClusterEdgeState,
     client_addr: SocketAddr,
     dynamo_addr: SocketAddr,
     cql_addr: SocketAddr,
@@ -1151,8 +1157,8 @@ impl Node {
         }
     }
 
-    /// Graceful teardown: durably flush the control-plane WAL **before** aborting
-    /// the node's tasks, then [`shutdown`](Self::shutdown).
+    /// Graceful teardown: durably flush the control-plane WAL, then gracefully
+    /// halt every hosted CP group, **before** the hard-abort [`shutdown`](Self::shutdown).
     ///
     /// `shutdown` alone aborts the Raft driver, but a `MetaCommand` (e.g. a
     /// `CreateTable` schema proposal) is applied + acked **synchronously** in
@@ -1162,10 +1168,21 @@ impl Node {
     /// flaky `tests/dynamo_schema.rs::create_table_survives_node_restart`).
     /// `RaftNode::flush` syncs that pending tail first, so a clean teardown is
     /// actually durable — which is what a restart test (a clean teardown standing
-    /// in for an OS process restart) needs. (A `kill -9` is still exposed; the
-    /// durable-before-ack control-plane fix is a tracked follow-up.)
+    /// in for an OS process restart) needs.
+    ///
+    /// A raw `shutdown()` also hard-`abort()`s the CP-data apply task via
+    /// `ProdEnv::shutdown()`, which can land mid-`storage.merge(..).await` and
+    /// surface as a `tokio::fs` background-task panic when the runtime's blocking
+    /// pool is torn down underneath it (harmless to durability — an un-acked
+    /// write just isn't durable yet — but a noisy, uncontrolled panic on every
+    /// real shutdown). [`ClusterEdgeState::shutdown_all_cp_groups`] stops each CP
+    /// group's driver cleanly (mirroring `cp_gc_tablet`'s shutdown-then-wait
+    /// pattern) first, so `shutdown`'s abort has nothing in flight to race. (A
+    /// `kill -9` is still exposed; the durable-before-ack control-plane fix is a
+    /// tracked follow-up.)
     pub async fn shutdown_graceful(&self) {
         self.raft.flush().await;
+        self.edge.shutdown_all_cp_groups().await;
         self.shutdown();
     }
 }
@@ -1271,6 +1288,44 @@ impl ClusterEdgeState {
             map.remove(&tablet);
         }
         Some(group)
+    }
+
+    /// Gracefully halt every CP group registered here (process shutdown, not
+    /// drop-table GC — see [`shutdown_graceful`](Node::shutdown_graceful)). A raw
+    /// `ProdEnv::shutdown()` hard-`abort()`s the CP-data driver/apply tasks, which
+    /// can land mid-`storage.merge(..).await` inside `apply_and_compact` and
+    /// surface as a `tokio::fs` background-task panic
+    /// (`Backend("background task failed")`/`Backend("task was cancelled")`) when
+    /// the runtime's blocking pool is torn down underneath it. `CpGroup::shutdown`
+    /// only latches a flag the driver observes *between* full apply passes, so we
+    /// must poll [`is_stopped`](CpGroup::is_stopped) before the caller proceeds to
+    /// abort anything else — the same shutdown-then-wait shape `cp_gc_tablet` uses
+    /// before deleting a dropped tablet's files. Snapshots the handles out of the
+    /// lock first (never hold a `std::sync::Mutex` guard across `.await`). Bounded
+    /// by `CP_GC_STOP_TIMEOUT`; a group that doesn't stop in time is logged and
+    /// left for the subsequent hard abort (the process is exiting either way).
+    async fn shutdown_all_cp_groups(&self) {
+        let groups: Vec<CpGroup> = self
+            .raftkv
+            .lock()
+            .expect("raftkv handles poisoned")
+            .values()
+            .flatten()
+            .cloned()
+            .collect();
+        for group in &groups {
+            group.shutdown();
+        }
+        let deadline = tokio::time::Instant::now() + CP_GC_STOP_TIMEOUT;
+        for group in &groups {
+            while !group.is_stopped() {
+                if tokio::time::Instant::now() >= deadline {
+                    tracing::warn!("shutdown: a CP group driver did not stop in time");
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
     }
 
     /// The CP group handle for `tablet` that currently believes it is leader, if
