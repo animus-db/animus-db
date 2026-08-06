@@ -46,7 +46,7 @@ use std::time::Duration;
 
 use animus_env::NodeId;
 use animus_storage::WalRecordView;
-use animus_tablet::{TabletId, escape, partition_token};
+use animus_tablet::{TOKEN_BYTES, TabletId, escape, partition_token};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::net::{TcpListener, TcpStream};
@@ -303,8 +303,8 @@ async fn storage_lsm(ctx: &ClientCtx, q: &str) -> (u16, Value) {
             json!({
                 "seq": s.seq,
                 "level": s.level,
-                "min_key": s.min_key.as_deref().map(key_str),
-                "max_key": s.max_key.as_deref().map(key_str),
+                "min_key": s.min_key.as_deref().map(key_display),
+                "max_key": s.max_key.as_deref().map(key_display),
                 "min_version": s.min_version,
                 "max_version": s.max_version,
                 "file_size": s.file_size,
@@ -383,7 +383,9 @@ async fn storage_key(ctx: &ClientCtx, q: &str) -> (u16, Value) {
     let Some(key) = http::query_param(q, "key") else {
         return (400, json!({"error": "missing `key` query parameter"}));
     };
-    let key = key.into_bytes();
+    // Accept the dashboard's `<token-hex>:<remainder>` display form (so clicking a
+    // browsed key looks it up faithfully) as well as a raw plain key.
+    let key = parse_key_display(&key);
     let Some(g) = ctx.edge.local_cp(tablet) else {
         return not_hosted(tablet);
     };
@@ -394,7 +396,7 @@ async fn storage_key(ctx: &ClientCtx, q: &str) -> (u16, Value) {
             json!({
                 "tablet": tablet.0,
                 "backend": g.backend_name(),
-                "key": key_str(&key),
+                "key": key_display(&key),
                 "live": live.as_deref().map(key_str),
             }),
         );
@@ -408,7 +410,7 @@ async fn storage_key(ctx: &ClientCtx, q: &str) -> (u16, Value) {
         json!({
             "tablet": tablet.0,
             "backend": g.backend_name(),
-            "key": key_str(&key),
+            "key": key_display(&key),
             "live": live.as_deref().map(key_str),
             "disk_versions": disk,
         }),
@@ -422,9 +424,9 @@ async fn storage_key(ctx: &ClientCtx, q: &str) -> (u16, Value) {
 /// routes — scrape the leader for its committed state.
 async fn storage_scan(ctx: &ClientCtx, q: &str) -> (u16, Value) {
     let tablet = tablet_param(q);
-    let start = http::query_param(q, "start")
-        .unwrap_or_default()
-        .into_bytes();
+    // Decode the dashboard's `<token-hex>:<remainder>` display form (so paging by
+    // pasting the last displayed key works), falling back to a raw plain prefix.
+    let start = parse_key_display(&http::query_param(q, "start").unwrap_or_default());
     let limit = http::query_param(q, "limit")
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(50)
@@ -438,7 +440,7 @@ async fn storage_scan(ctx: &ClientCtx, q: &str) -> (u16, Value) {
         .iter()
         .map(|(key, value)| {
             json!({
-                "key": key_str(key),
+                "key": key_display(key),
                 "value": key_str(value),
                 "value_len": value.len(),
             })
@@ -841,9 +843,66 @@ fn tablet_param(q: &str) -> TabletId {
     )
 }
 
-/// Render bytes as a lossy UTF-8 string for human-readable debug output.
+/// Render a *value* (or any opaque byte string) as a lossy UTF-8 string for
+/// human-readable debug output. For a data-plane **key**, use [`key_display`]
+/// instead — its leading bytes are a binary partition token.
 fn key_str(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// Render a data-plane **key** for the dashboard's key views. A key written
+/// through a wire edge (DynamoDB/CQL) or the bulk seeder is
+/// `token || escape(pk) || rk` (ADR 0022/0023): the leading [`TOKEN_BYTES`] bytes
+/// are the big-endian Murmur3 **partition token** — binary, not text — so lossy
+/// UTF-8 would mangle them into replacement characters. Show that token as hex,
+/// a `:` separator, then the human-readable `escape(pk) || rk` remainder as a
+/// lossy UTF-8 string.
+///
+/// But a plain-client `Put` stores its key **verbatim**, un-prefixed, so not every
+/// key has a token. Distinguish by *content*: only a leading `TOKEN_BYTES`-run that
+/// isn't all printable ASCII is a real binary token (a Murmur3 token is
+/// overwhelmingly likely to contain a non-printable byte). A fully-printable key —
+/// or one shorter than the token width — is shown as text unchanged. Inverse of
+/// [`parse_key_display`], so a token-prefixed key shown in the browse view
+/// round-trips back through the key inspector.
+fn key_display(bytes: &[u8]) -> String {
+    let printable = |b: &u8| (0x20..0x7f).contains(b);
+    if bytes.len() < TOKEN_BYTES || bytes[..TOKEN_BYTES].iter().all(printable) {
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+    use std::fmt::Write;
+    let (token, rest) = bytes.split_at(TOKEN_BYTES);
+    let mut s = String::with_capacity(TOKEN_BYTES * 2 + 1 + rest.len());
+    for b in token {
+        let _ = write!(s, "{b:02x}");
+    }
+    s.push(':');
+    s.push_str(&String::from_utf8_lossy(rest));
+    s
+}
+
+/// Inverse of [`key_display`]: turn a `<token-hex>:<remainder>` string (as shown
+/// in the dashboard's key views) back into the raw key bytes, so clicking a
+/// browsed key sends the *real* key to the inspector. A string not in that form —
+/// no `TOKEN_BYTES*2`-hex-digit, `:`-terminated prefix (e.g. a hand-typed plain
+/// key) — is taken verbatim as raw bytes. The remainder round-trips exactly when
+/// the original was valid UTF-8 (the common printable-pk case); bytes that lossy
+/// UTF-8 already replaced cannot be recovered, same as before this formatting.
+fn parse_key_display(s: &str) -> Vec<u8> {
+    let b = s.as_bytes();
+    let hex_len = TOKEN_BYTES * 2;
+    if b.len() > hex_len && b[hex_len] == b':' && b[..hex_len].iter().all(u8::is_ascii_hexdigit) {
+        let mut key = Vec::with_capacity(TOKEN_BYTES + (b.len() - hex_len - 1));
+        for pair in b[..hex_len].chunks_exact(2) {
+            let hi = (pair[0] as char).to_digit(16).unwrap() as u8;
+            let lo = (pair[1] as char).to_digit(16).unwrap() as u8;
+            key.push((hi << 4) | lo);
+        }
+        key.extend_from_slice(&b[hex_len + 1..]);
+        key
+    } else {
+        b.to_vec()
+    }
 }
 
 fn wal_record_json(r: &WalRecordView) -> Value {
@@ -853,10 +912,10 @@ fn wal_record_json(r: &WalRecordView) -> Value {
             version,
             value_len,
         } => {
-            json!({"type": "put", "key": key_str(key), "version": version, "value_len": value_len})
+            json!({"type": "put", "key": key_display(key), "version": version, "value_len": value_len})
         }
         WalRecordView::Delete { key, version } => {
-            json!({"type": "delete", "key": key_str(key), "version": version})
+            json!({"type": "delete", "key": key_display(key), "version": version})
         }
         WalRecordView::DeleteRange {
             start,
@@ -865,8 +924,8 @@ fn wal_record_json(r: &WalRecordView) -> Value {
             version,
         } => json!({
             "type": "delete_range",
-            "start": key_str(start),
-            "end": key_str(end),
+            "start": key_display(start),
+            "end": key_display(end),
             "keys": keys,
             "version": version,
         }),
@@ -901,5 +960,44 @@ fn client_response_to_json(resp: ClientResponse, ok: Value) -> (u16, Value) {
             500,
             json!({"error": format!("unexpected response: {other:?}")}),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A token-prefixed key: the binary 8-byte token renders as 16 hex digits, the
+    /// printable `escape(pk)` remainder as text, and it round-trips exactly.
+    #[test]
+    fn key_display_shows_binary_token_as_hex_and_round_trips() {
+        // A token with a guaranteed non-printable byte (0x00), so the heuristic
+        // classifies it as binary regardless of the hash — then the readable pk.
+        let mut key = vec![0x8a, 0x3f, 0x1c, 0x00, 0x77, 0xd2, 0xb6, 0xe1];
+        key.extend_from_slice(b"user#42");
+        let shown = key_display(&key);
+        let (tok_hex, sep_rest) = shown.split_at(TOKEN_BYTES * 2);
+        assert_eq!(tok_hex, "8a3f1c0077d2b6e1");
+        assert_eq!(sep_rest, ":user#42");
+        assert_eq!(parse_key_display(&shown), key);
+    }
+
+    /// A key whose real token happens to be all binary also hexes, exercising the
+    /// production `seed_key` layout end to end (the display always reverses).
+    #[test]
+    fn key_display_round_trips_a_seed_key() {
+        let key = seed_key(b"user#42");
+        assert_eq!(parse_key_display(&key_display(&key)), key);
+    }
+
+    /// A plain-client `Put` stores its key verbatim (no token). A fully-printable
+    /// key — or one shorter than the token width — is shown as text unchanged, and
+    /// a plain string with no hex-token prefix is taken raw by the inverse.
+    #[test]
+    fn key_display_leaves_printable_keys_as_text() {
+        assert_eq!(key_display(b"admin-key"), "admin-key");
+        assert_eq!(key_display(b"ab"), "ab");
+        assert_eq!(parse_key_display("admin-key"), b"admin-key".to_vec());
+        assert_eq!(parse_key_display("seed:"), b"seed:".to_vec());
     }
 }

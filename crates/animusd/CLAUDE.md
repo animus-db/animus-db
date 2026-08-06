@@ -254,6 +254,17 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
     **browse-keys** list (`/admin/storage/scan` → `CpGroup::local_scan`, first N live
     pairs `>= start`; click a key to send it to the inspector).
     `tests/dashboard_endpoint.rs` proves serve + CORS + preflight + peers.
+    - **Displayed keys show the partition token as hex** (`admin.rs::key_display`):
+      a wire-edge/seeder key is `token || escape(pk) || rk` (ADR 0022), and the
+      leading `TOKEN_BYTES` are a **binary** Murmur3 token that lossy UTF-8 would
+      mangle — so a key with a non-printable prefix renders as
+      `<16-hex-token>:<readable pk/rk>` (e.g. `0825fb3df691fdc3:seed:0000…`); a
+      *plain-client* `Put` stores its key verbatim (no token), so a fully-printable
+      key is shown as text unchanged. **Values** keep lossy UTF-8 (`key_str`).
+      `parse_key_display` is the inverse, so a browsed key round-trips back through
+      the inspector (`/admin/storage/key`) and the scan `start` (paging). Unit tests
+      live in `admin.rs`; the `admin_endpoint` plain-`Put` `admin-key` guards the
+      not-every-key-is-token-prefixed case.
   - **The Write tab (ADR 0021) writes through the admin port.** `POST
     /admin/data/dynamo {op, payload}` reuses the DynamoDB edge in-process
     (`dynamo::execute` — the factored decode+`run_operation`), returning the op's
