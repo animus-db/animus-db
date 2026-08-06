@@ -14,7 +14,12 @@ function of one seed. This is the substrate every distributed test runs on.
 - Driving: `run()` (to quiescence), `run_for(dur)` / `run_until(deadline)`
   (bounded virtual time), `run_until_quiescent(max_steps)`.
 - Faults: `partition`/`partition_pair`/`heal`, `crash`/`restart`, `stop`
-  (process exit), `set_net_config(NetConfig)` (delay/jitter/drop).
+  (process exit), `set_net_config(NetConfig)` (delay/jitter/drop),
+  `set_disk_config(DiskConfig)` / `set_disk_config_for(node, ..)` (disk faults:
+  per-op injected `io::Error`s on `append`/`sync`/`read`/`read_at`/`replace`,
+  torn un-synced tails on crash, byte corruption of the torn region), and
+  `corrupt_durable(node, file, offset)` (flip one durable byte — at-rest
+  corruption of synced data, e.g. to hit an SSTable's per-block CRC).
 - Observability: `trace()` / `trace_lines()`, `now()`, `seed()`.
 
 ## What's non-obvious
@@ -54,9 +59,24 @@ function of one seed. This is the substrate every distributed test runs on.
   same simulated node without the test pre-allocating its id.
 - Determinism invariants to preserve when editing: only `BTreeMap`/`BTreeSet`,
   RNG drawn only in deterministic order, no wall clock. Disk ops add no timeline
-  events and draw no RNG, so they don't perturb traces.
+  events and — under the **default** `DiskConfig` — draw no RNG, so they don't
+  perturb traces; every existing test is byte-identical with the fault model
+  present. With a non-default `DiskConfig` the disk *does* draw RNG (error
+  sampling per op; tear point + corrupted byte on crash, files in `BTreeMap`
+  name order), which is deterministic but seed-shifting — so a fault config is
+  strictly **opt-in per test**. `error_rate` never fires on `size`/`remove`/
+  `list` (metadata ops stay reliable so discovery/GC paths don't need fault
+  handling to be testable). A `crash` tear keeps a seed-chosen **strict**
+  prefix of each file's buffered bytes and makes it durable (it reached the
+  platter); `corrupt_on_crash` flips one byte only inside that retained
+  region, never in previously-durable bytes. Tests: `tests/disk_faults.rs`
+  (default-off byte-identity is asserted against a run with no config at all).
 
 ## Tests
 
 `cargo test -p animus-sim` — `tests/determinism.rs` asserts byte-identical
-traces across runs, reproducible partitions, and the crash/disk model.
+traces across runs, reproducible partitions, and the crash/disk model;
+`tests/disk_faults.rs` asserts the opt-in disk fault model is default-off
+byte-identical and seed-reproducible when enabled. The storage-facing fault
+corpus (LSM torn-tail recovery, injected-error write paths, CRC on corrupted
+blocks) lives in `animus-storage/tests/lsm_disk_faults.rs`.
