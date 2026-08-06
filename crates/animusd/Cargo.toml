@@ -32,9 +32,18 @@ serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+tracing-opentelemetry.workspace = true
+opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
+opentelemetry-otlp.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
 # For the reconfigure-loop test (#3), which drives the replicated tablet map
 # directly: `CasTabletReplicas` needs `TabletId` + `Epoch`.
 animus-tablet.workspace = true
+opentelemetry-proto = { version = "0.32.0", default-features = false, features = [
+    "gen-tonic-messages",
+    "trace",
+] }
+prost = "0.14.4"

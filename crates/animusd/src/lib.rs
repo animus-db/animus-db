@@ -31,6 +31,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub mod config;
+pub mod otel;
 pub use config::ClusterConfig;
 // Re-exported so callers (CLI, tests, operators) can inspect a node's cached
 // cluster metadata — membership status and the tablet map — without depending on
@@ -57,6 +58,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tracing::Instrument;
 // Pure CP-topology decision logic (id translation, routing, join-host/GC
 // predicates), extracted into `topology` for unit-test coverage.
 use topology::{cp_base_id, cp_member_id, cp_members_for};
@@ -534,7 +536,15 @@ pub enum ClientRequest {
     /// receiving node serves it locally **iff** it is the leader; it never
     /// re-forwards, so routing is bounded to one hop (a stale hint errors and the
     /// client retries with fresh routing). Carries the original [`Put`]/[`Get`].
-    Forwarded(Box<ClientRequest>),
+    Forwarded {
+        request: Box<ClientRequest>,
+        /// The W3C `traceparent` of the span that initiated this forward, if
+        /// distributed tracing export is active (ADR 0027) — `None` is the
+        /// default/no-op case. Lets the receiving node's span join the same
+        /// trace instead of starting one disconnected from the origin.
+        #[serde(default)]
+        traceparent: Option<String>,
+    },
     /// Relay a **schema-catalog** `MetaCommand` to be proposed on the control-plane
     /// leader (v1 Phase 1 / A2, ADR 0013): a node that received a `CreateTable` /
     /// `CREATE TABLE` / `SetTableMode` but isn't the control leader sends this to
@@ -1849,10 +1859,18 @@ impl ClientCtx {
     }
 
     /// Forward a CP op to another node's client API (wrapped so the receiver
-    /// serves-or-errors, never re-forwards) and relay its reply.
+    /// serves-or-errors, never re-forwards) and relay its reply. Carries the
+    /// current span's trace context (ADR 0027) so the receiving node's
+    /// handling of the forwarded op joins the same distributed trace.
     async fn cp_forward(&self, addr: SocketAddr, request: ClientRequest) -> ClientResponse {
-        self.relay(addr, ClientRequest::Forwarded(Box::new(request)))
-            .await
+        self.relay(
+            addr,
+            ClientRequest::Forwarded {
+                request: Box::new(request),
+                traceparent: crate::otel::current_traceparent(),
+            },
+        )
+        .await
     }
 
     /// Send `request` to a peer node's client API over a fresh connection and
@@ -2859,63 +2877,100 @@ async fn serve_clients(listener: TcpListener, ctx: ClientCtx) {
 
 async fn handle_client(mut stream: TcpStream, ctx: ClientCtx) -> std::io::Result<()> {
     while let Some(request) = read_frame::<ClientRequest>(&mut stream).await? {
-        let response = match request {
-            ClientRequest::Status => ClientResponse::Status(ctx.raft.metadata()),
-            // All data ops route to the leaderful CP per-tablet Raft group (ADR 0017
-            // #3a), scoped to the named table (ADR 0023). `table` is a required field
-            // on the request type, so there is no unscoped data op to reject here.
-            ClientRequest::Put { key, value, table } => ctx.cp_put(&table, key, value).await,
-            ClientRequest::PutBatch { entries, table } => {
-                match ctx.cp_batch_write(&table, entries).await {
-                    Ok(()) => ClientResponse::PutOk,
-                    Err(e) => ClientResponse::Error(e),
-                }
-            }
-            ClientRequest::Get { key, table } => ctx.cp_get(&table, key).await,
-            ClientRequest::Scan {
-                start,
-                end,
-                limit,
-                table,
-            } => match ctx.cp_scan(&table, start, end, limit).await {
-                Ok(pairs) => ClientResponse::Pairs(pairs),
-                Err(e) => ClientResponse::Error(e),
-            },
-            ClientRequest::Delete { key, table } => match ctx.cp_delete(&table, key).await {
-                Ok(()) => ClientResponse::PutOk,
-                Err(e) => ClientResponse::Error(e),
-            },
-            // Admin: split a CP tablet (Phase 2.2 / D2 cross-process).
-            ClientRequest::SplitTablet { tablet, split_key } => {
-                ctx.trigger_split(TabletId(tablet), split_key).await
-            }
-            // The data-plane half of a split, forwarded to the CP leader's node (D2):
-            // propose the split locally iff we lead the tablet; never re-forward.
-            ClientRequest::CpSplit { tablet, split_key } => {
-                ctx.cp_split_here(TabletId(tablet), split_key).await
-            }
-            // A CP op forwarded from another node (cross-process routing, ADR 0017
-            // #3b): serve locally iff we are the leader; never re-forward.
-            ClientRequest::Forwarded(inner) => ctx.cp_serve_forwarded(*inner).await,
-            // A metadata command relayed to the control leader (A2 schema DDL, or a
-            // Phase 2.3a CP-address registration). Gate to the relayable set, then
-            // propose iff we are the leader (no re-relay — bounded one hop; the
-            // relayer retries with fresh routing).
-            ClientRequest::ProposeSchema(command) => {
-                if !is_relayable_command(&command) {
-                    ClientResponse::Error("command not allowed over the relay path".into())
-                } else {
-                    // Propose on the control leader (locally if we are it, else relay
-                    // toward it). The caller confirms the commit via replicated
-                    // `Metadata`. Cannot loop: a relay only targets a known leader.
-                    ctx.propose_schema(&command).await;
-                    ClientResponse::PutOk
-                }
-            }
-        };
+        // Every accepted request is a root span (ADR 0027): this is what gives
+        // `otel::current_traceparent()` something to inject if the request's
+        // handling ends up forwarding to another node (`cp_forward`), and what
+        // a `Forwarded` request's own span below joins as a child of the
+        // originating node's trace.
+        let span = tracing::info_span!("client_request", request = request_kind(&request));
+        if let ClientRequest::Forwarded {
+            traceparent: Some(tp),
+            ..
+        } = &request
+        {
+            otel::set_parent_traceparent(&span, tp);
+        }
+        let response = handle_request(&ctx, request).instrument(span).await;
         write_frame(&mut stream, &response).await?;
     }
     Ok(())
+}
+
+/// A short, closed label for `ClientRequest`'s variant — the `client_request`
+/// span's `request` field (ADR 0027 field vocabulary).
+fn request_kind(request: &ClientRequest) -> &'static str {
+    match request {
+        ClientRequest::Status => "status",
+        ClientRequest::Put { .. } => "put",
+        ClientRequest::PutBatch { .. } => "put_batch",
+        ClientRequest::Get { .. } => "get",
+        ClientRequest::Scan { .. } => "scan",
+        ClientRequest::Delete { .. } => "delete",
+        ClientRequest::Forwarded { .. } => "forwarded",
+        ClientRequest::ProposeSchema(_) => "propose_schema",
+        ClientRequest::SplitTablet { .. } => "split_tablet",
+        ClientRequest::CpSplit { .. } => "cp_split",
+    }
+}
+
+async fn handle_request(ctx: &ClientCtx, request: ClientRequest) -> ClientResponse {
+    match request {
+        ClientRequest::Status => ClientResponse::Status(ctx.raft.metadata()),
+        // All data ops route to the leaderful CP per-tablet Raft group (ADR 0017
+        // #3a), scoped to the named table (ADR 0023). `table` is a required field
+        // on the request type, so there is no unscoped data op to reject here.
+        ClientRequest::Put { key, value, table } => ctx.cp_put(&table, key, value).await,
+        ClientRequest::PutBatch { entries, table } => {
+            match ctx.cp_batch_write(&table, entries).await {
+                Ok(()) => ClientResponse::PutOk,
+                Err(e) => ClientResponse::Error(e),
+            }
+        }
+        ClientRequest::Get { key, table } => ctx.cp_get(&table, key).await,
+        ClientRequest::Scan {
+            start,
+            end,
+            limit,
+            table,
+        } => match ctx.cp_scan(&table, start, end, limit).await {
+            Ok(pairs) => ClientResponse::Pairs(pairs),
+            Err(e) => ClientResponse::Error(e),
+        },
+        ClientRequest::Delete { key, table } => match ctx.cp_delete(&table, key).await {
+            Ok(()) => ClientResponse::PutOk,
+            Err(e) => ClientResponse::Error(e),
+        },
+        // Admin: split a CP tablet (Phase 2.2 / D2 cross-process).
+        ClientRequest::SplitTablet { tablet, split_key } => {
+            ctx.trigger_split(TabletId(tablet), split_key).await
+        }
+        // The data-plane half of a split, forwarded to the CP leader's node (D2):
+        // propose the split locally iff we lead the tablet; never re-forward.
+        ClientRequest::CpSplit { tablet, split_key } => {
+            ctx.cp_split_here(TabletId(tablet), split_key).await
+        }
+        // A CP op forwarded from another node (cross-process routing, ADR 0017
+        // #3b): serve locally iff we are the leader; never re-forward. The
+        // enclosing `client_request` span (in `handle_client`) was already
+        // re-parented onto the originating node's trace (ADR 0027) before this
+        // request reached here.
+        ClientRequest::Forwarded { request, .. } => ctx.cp_serve_forwarded(*request).await,
+        // A metadata command relayed to the control leader (A2 schema DDL, or a
+        // Phase 2.3a CP-address registration). Gate to the relayable set, then
+        // propose iff we are the leader (no re-relay — bounded one hop; the
+        // relayer retries with fresh routing).
+        ClientRequest::ProposeSchema(command) => {
+            if !is_relayable_command(&command) {
+                ClientResponse::Error("command not allowed over the relay path".into())
+            } else {
+                // Propose on the control leader (locally if we are it, else relay
+                // toward it). The caller confirms the commit via replicated
+                // `Metadata`. Cannot loop: a relay only targets a known leader.
+                ctx.propose_schema(&command).await;
+                ClientResponse::PutOk
+            }
+        }
+    }
 }
 
 /// How long the CQL/DynamoDB edges wait for a proposed schema `MetaCommand`

@@ -32,3 +32,4 @@ relevant ADR (or supersede it) in the same PR as the code change.
 | [0023](0023-table-scoped-tablets.md) | Table-scoped tablets on a per-table hash ring | Accepted |
 | [0024](0024-drop-table-data-gc.md) | Drop-table data GC: `DropTableTablets` + a per-node reclaim loop (group stop, engine/WAL file deletion, marker prune) | Accepted |
 | [0026](0026-multiplexed-node-stream-addressing.md) | Multiplexed `(node, stream)` addressing on the `Network` seam (retires the `Coresident` sibling-pool liveness cliff) | Proposed |
+| [0027](0027-tracing-observability.md) | OpenTelemetry-compatible distributed tracing: `animusd`-only OTLP export, W3C trace-context propagation across a forwarded hop | Accepted |

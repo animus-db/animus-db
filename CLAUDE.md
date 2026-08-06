@@ -995,6 +995,33 @@ cross-cutting ones. Prune/merge entries that become obsolete.
   the real leader-churn race isn't reproducible on demand over real network/time —
   when an integration-level repro of a race is impractical, extract the invariant
   it depends on into a pure function and unit-test *that*.
+- **An `opentelemetry-otlp` exporter's `.with_endpoint(url)` takes `url` as the
+  exact, final request URL — it does *not* append the OTLP signal path
+  (`/v1/traces`) the way the SDK's own env-var resolution does for the generic
+  `OTEL_EXPORTER_OTLP_ENDPOINT`.** Reading that env var by hand and forwarding it
+  straight into `.with_endpoint(..)` (ADR 0027's `animusd::otel` seam) silently
+  posted every span export to the endpoint's bare root (`POST /`) instead of
+  `POST /v1/traces` — a real collector would 404 this with zero indication it was
+  a config bug, not a network one, since the exporter reports one generic
+  `HttpClient.NetworkError` regardless of cause. Either let the builder resolve
+  the endpoint itself (don't call `.with_endpoint(..)` at all — it then reads
+  `OTEL_EXPORTER_OTLP_ENDPOINT`/`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` and appends
+  the signal path correctly), or reproduce the append by hand if the endpoint must
+  be threaded explicitly for testability (`animus_db` did the latter, so a test
+  seam could pass an arbitrary receiver address without `unsafe`-mutating process
+  env). Caught by decoding the exporter's actual protobuf payload in
+  `animusd/tests/otel_tracing.rs`, not by the exporter reporting success.
+- **`SdkTracerProvider::force_flush`/`shutdown` block the calling OS thread until
+  the exporter's HTTP call completes — call them via `spawn_blocking`, never
+  directly inside an async fn on a `#[tokio::test]`'s default current-thread
+  runtime.** The default runtime has exactly one worker thread; blocking it
+  synchronously starves every other task scheduled on it, including a test's own
+  in-process receiver task waiting to `accept()`/`read()` the very HTTP request
+  the flush is trying to send — a same-process instance of the "don't hold a lock
+  across `.await`" deadlock family, just with a blocking call standing in for the
+  lock. The symptom is a flush that hangs for its full timeout and then reports a
+  generic network error, which reads exactly like a broken exporter rather than a
+  starved runtime. (`animusd/tests/otel_tracing.rs`.)
 
 ### Merge / integration workflow
 - **Run `cargo test --workspace` after *each* merge, not just at the end of a
