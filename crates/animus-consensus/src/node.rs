@@ -26,9 +26,9 @@
 //! writes into the engine, stamped with the transaction's execution timestamp as
 //! the MVCC version. `merge` (per-key last-writer-wins) makes the apply
 //! idempotent and commutative, so a re-apply after a crash/restart converges to
-//! the same store. The engine defaults to the in-memory [`MemoryEngine`] used
-//! under simulation; a recovered node repopulates a *fresh* engine in the
-//! original execution order from the WAL.
+//! the same store. The engine is the in-memory [`MemoryEngine`] (this crate is a
+//! `SimEnv` testbed — see the crate docs); a recovered node repopulates a
+//! *fresh* engine in the original execution order from the WAL.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
@@ -118,17 +118,18 @@ type ReadResults = Arc<Mutex<BTreeMap<TxnId, BTreeMap<Key, Option<Vec<u8>>>>>>;
 /// A running consensus replica. Cheap to clone; clones share one [`AccordCore`]
 /// and one storage engine.
 ///
-/// Generic over the [`StorageEngine`] backing execution; defaults to the
-/// in-memory [`MemoryEngine`] used under simulation.
-pub struct AccordNode<E: Env, S: StorageEngine = MemoryEngine> {
+/// Execution is backed by a fresh in-memory [`MemoryEngine`] — this crate is the
+/// Elle corpus's known-serializable testbed (see the crate docs), so there is no
+/// production storage backend to inject.
+pub struct AccordNode<E: Env> {
     env: E,
     core: Arc<Mutex<AccordCore>>,
-    storage: S,
+    storage: MemoryEngine,
     /// Results of executed read-only transactions (see [`ReadResults`]).
     reads: ReadResults,
 }
 
-impl<E: Env, S: StorageEngine> Clone for AccordNode<E, S> {
+impl<E: Env> Clone for AccordNode<E> {
     fn clone(&self) -> Self {
         AccordNode {
             env: self.env.clone(),
@@ -139,21 +140,13 @@ impl<E: Env, S: StorageEngine> Clone for AccordNode<E, S> {
     }
 }
 
-impl<E: Env> AccordNode<E, MemoryEngine> {
+impl<E: Env> AccordNode<E> {
     /// Start a node backed by a fresh in-memory [`MemoryEngine`]. `all_nodes` is
     /// the full replica set (including this node). The driver recovers durable
-    /// state from the WAL before serving anything.
-    pub fn start(env: E, all_nodes: Vec<NodeId>) -> AccordNode<E, MemoryEngine> {
-        AccordNode::start_with_storage(env, all_nodes, MemoryEngine::new())
-    }
-}
-
-impl<E: Env, S: StorageEngine + 'static> AccordNode<E, S> {
-    /// Start a node backed by an explicit [`StorageEngine`]. `all_nodes` is the
-    /// full replica set (including this node). The driver recovers durable state
-    /// from the WAL before serving anything, replaying its execution order into
-    /// `storage`.
-    pub fn start_with_storage(env: E, all_nodes: Vec<NodeId>, storage: S) -> AccordNode<E, S> {
+    /// state from the WAL before serving anything, replaying its execution order
+    /// into the fresh engine.
+    pub fn start(env: E, all_nodes: Vec<NodeId>) -> AccordNode<E> {
+        let storage = MemoryEngine::new();
         let core = Arc::new(Mutex::new(AccordCore::new(env.node_id(), &all_nodes)));
         let reads: ReadResults = Arc::new(Mutex::new(BTreeMap::new()));
         let node = AccordNode {
@@ -304,11 +297,6 @@ impl<E: Env, S: StorageEngine + 'static> AccordNode<E, S> {
         &self.env
     }
 
-    /// This node's storage engine (the executed store).
-    pub fn storage(&self) -> &S {
-        &self.storage
-    }
-
     /// The agreed execution timestamp this replica recorded for `txn`, if it has
     /// reached the committed phase (committed or applied).
     pub fn committed_execute_at(&self, txn: TxnId) -> Option<Timestamp> {
@@ -377,7 +365,7 @@ impl<E: Env, S: StorageEngine + 'static> AccordNode<E, S> {
     /// sync + I/O-free: the handle is pure driver state and reaches the core only
     /// through `submit_rw` at commit time.
     #[must_use]
-    pub fn begin(&self) -> InteractiveTxn<E, S> {
+    pub fn begin(&self) -> InteractiveTxn<E> {
         InteractiveTxn {
             node: self.clone(),
             reads: BTreeSet::new(),
@@ -431,8 +419,8 @@ impl<E: Env, S: StorageEngine + 'static> AccordNode<E, S> {
 /// to a key this session read is ordered relative to this transaction (ADR 0011,
 /// the read-then-write hazard). Only the write set carries the write effect. A
 /// `commit` with an empty write set is a no-op that returns `None`.
-pub struct InteractiveTxn<E: Env, S: StorageEngine = MemoryEngine> {
-    node: AccordNode<E, S>,
+pub struct InteractiveTxn<E: Env> {
+    node: AccordNode<E>,
     /// Keys read during the session; folded into the committed transaction's
     /// conflict set at `commit()` (so they carry dependencies).
     reads: BTreeSet<Key>,
@@ -446,7 +434,7 @@ pub struct InteractiveTxn<E: Env, S: StorageEngine = MemoryEngine> {
     values: BTreeMap<Key, Vec<u8>>,
 }
 
-impl<E: Env, S: StorageEngine + 'static> InteractiveTxn<E, S> {
+impl<E: Env> InteractiveTxn<E> {
     /// Read the current committed value of `key` and record it in the read set,
     /// from the local execution store. Returns the observed value writer (`None` if
     /// the key has no committed write), so the caller can decide what to write next.
@@ -558,19 +546,32 @@ const MVCC_NODE_BITS: u32 = 16;
 /// increasing in `(logical, node)`, so per-key LWW keeps exactly the agreed winner
 /// on every replica. A read uses the same encoding, so `get_at` still observes
 /// every write ordered before the read and none after.
+///
+/// # Contract (hard-checked)
+///
+/// The encoding is injective only for `ts.node < 2^16` and `ts.logical < 2^48`.
+/// Outside those bounds two distinct timestamps would silently collapse to one
+/// version and per-key LWW would keep an arbitrary winner — a silent-corruption
+/// failure a consistency testbed must never mask — so the guards are hard
+/// `assert!`s (they do **not** vanish in release builds, unlike the
+/// `debug_assert!`s they replaced). The bounds are unreachable in practice here:
+/// the testbed uses small node ids and logical clocks advance by small
+/// per-transaction increments.
 fn mvcc_version(ts: Timestamp) -> u64 {
-    debug_assert!(
+    assert!(
         ts.node < (1 << MVCC_NODE_BITS),
-        "node id {} exceeds the {MVCC_NODE_BITS}-bit MVCC tiebreak field",
+        "node id {} exceeds the {MVCC_NODE_BITS}-bit MVCC tiebreak field; \
+         the (logical, node) -> u64 version encoding would collide",
         ts.node
     );
-    debug_assert!(
+    assert!(
         ts.logical < (1 << (64 - MVCC_NODE_BITS)),
-        "logical clock {} exceeds the {}-bit MVCC version field",
+        "logical clock {} exceeds the {}-bit MVCC version field; \
+         the (logical, node) -> u64 version encoding would collide",
         ts.logical,
         64 - MVCC_NODE_BITS
     );
-    (ts.logical << MVCC_NODE_BITS) | (ts.node & ((1 << MVCC_NODE_BITS) - 1))
+    (ts.logical << MVCC_NODE_BITS) | ts.node
 }
 
 /// Encode a transaction id as the stored value (the executed effect is "write
@@ -600,10 +601,10 @@ fn decode_txn(bytes: &[u8]) -> Option<TxnId> {
 /// `handle` in the recv loop) stay synchronous; the simulator runs it promptly,
 /// and within the task the fsync precedes the storage apply which precedes the
 /// sends, preserving "durable before action".
-fn persist_then_ship<E: Env, S: StorageEngine + 'static>(
+fn persist_then_ship<E: Env>(
     env: &E,
     core: &Arc<Mutex<AccordCore>>,
-    storage: &S,
+    storage: &MemoryEngine,
     reads: &ReadResults,
     outs: Vec<Out>,
 ) {
@@ -683,7 +684,7 @@ async fn maybe_compact<E: Env>(env: &E, core: &Arc<Mutex<AccordCore>>) {
 /// The write lands in the local `storage` engine via `merge` (per-key LWW —
 /// idempotent and commutative, so a re-apply on recovery converges, and
 /// `store_writer`/`store_value` read it back).
-async fn apply_all<S: StorageEngine>(storage: &S, applies: &[ApplyEffect]) {
+async fn apply_all(storage: &MemoryEngine, applies: &[ApplyEffect]) {
     for effect in applies {
         // The default value (no caller-supplied bytes) is the txn's own id — the
         // classic register effect, which `store_writer` decodes back. A caller who
@@ -716,11 +717,7 @@ async fn apply_all<S: StorageEngine>(storage: &S, applies: &[ApplyEffect]) {
 /// it (lower MVCC version) and none after. This is sound because the core only
 /// emits a read's [`ReadEffect`] once every earlier-ordered conflicting write has
 /// `Applied`.
-async fn satisfy_reads<S: StorageEngine>(
-    storage: &S,
-    reads: &ReadResults,
-    read_effects: &[ReadEffect],
-) {
+async fn satisfy_reads(storage: &MemoryEngine, reads: &ReadResults, read_effects: &[ReadEffect]) {
     for effect in read_effects {
         // Read as of the read's full `(execute_at, txn)` order (same encoding as
         // the write version, [`mvcc_version`]): `get_at` returns the greatest write
@@ -748,10 +745,10 @@ async fn satisfy_reads<S: StorageEngine>(
 /// The per-node driver loop: recover durable state, then repeatedly wait for the
 /// next message, hand it to the core, persist the resulting durable changes,
 /// apply execution effects, and ship whatever the core wants sent.
-async fn drive<E: Env, S: StorageEngine + 'static>(
+async fn drive<E: Env>(
     env: E,
     core: Arc<Mutex<AccordCore>>,
-    storage: S,
+    storage: MemoryEngine,
     reads: ReadResults,
     all_nodes: Vec<NodeId>,
 ) {
@@ -812,10 +809,10 @@ async fn drive<E: Env, S: StorageEngine + 'static>(
 /// round emits nothing, so retries stop on their own. We route through
 /// `persist_then_ship` so any incidental durable records/effects drain too (in
 /// steady state there are none on a pure retry).
-async fn retry_loop<E: Env, S: StorageEngine + 'static>(
+async fn retry_loop<E: Env>(
     env: E,
     core: Arc<Mutex<AccordCore>>,
-    storage: S,
+    storage: MemoryEngine,
     reads: ReadResults,
 ) {
     let mut interval = RETRY_BASE_INTERVAL;
@@ -894,10 +891,10 @@ struct Liveness {
 /// the core decides *what* is stalled and *who* recovers (no time, no I/O); the
 /// driver only times the sampling, drops the lock, then ships via
 /// `persist_then_ship` (no lock held across an `.await`).
-async fn liveness_loop<E: Env, S: StorageEngine + 'static>(
+async fn liveness_loop<E: Env>(
     env: E,
     core: Arc<Mutex<AccordCore>>,
-    storage: S,
+    storage: MemoryEngine,
     reads: ReadResults,
 ) {
     // Per-txn stall tracking. A txn drops out once it commits (no longer in
