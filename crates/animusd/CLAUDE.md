@@ -48,6 +48,17 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   version), and a `DELETE` that empties the partition issues a CP tombstone
   (`cp_delete`). The keyspace set + prepared-statement store are **per-cluster edge
   state** (see below).
+- `otel` module — OpenTelemetry-compatible distributed tracing (ADR 0027).
+  `init_tracing(instance_id)` (called once, from `main.rs`) installs the process
+  subscriber: the existing stdout `fmt` layer plus, when `OTEL_EXPORTER_OTLP_ENDPOINT`
+  is set, an OTLP/HTTP span exporter — opt-in, no-op by default, same doctrine as
+  the ADR 0015 metrics seam. `current_traceparent`/`set_parent_traceparent` are the
+  inject/extract primitives `cp_forward`/`handle_client` use to carry trace context
+  across a forwarded cross-process hop (see below). `init_tracing_with_endpoint` is
+  the test-facing seam (explicit endpoint, no process-env mutation — `set_var` is
+  `unsafe` and this workspace forbids `unsafe_code`); see
+  `tests/otel_tracing.rs`. **Scoped to this crate only** — no other crate depends on
+  `opentelemetry*`.
 
 ## What's non-obvious
 
@@ -76,7 +87,14 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   the admin bulk seeder (`SEED_BATCH_SIZE` keys per entry) both route through it.
   `cp_route` serves **locally** if this node hosts the leader, **forwards** to the
   leader's node if a local replica gives a leader hint + a `client_route` exists
-  (ADR 0017 #3b cross-process, wrapped in `ClientRequest::Forwarded`, one hop), and
+  (ADR 0017 #3b cross-process, wrapped in `ClientRequest::Forwarded { request,
+  traceparent }`, one hop — the `traceparent` field is ADR 0027: `handle_client`
+  wraps every accepted request in a `client_request` span, `cp_forward` injects
+  that span's W3C trace context onto the wire via `otel::current_traceparent`, and
+  the receiving node's `handle_client` re-parents its own `client_request` span
+  from it via `otel::set_parent_traceparent` *before* dispatching to
+  `cp_serve_forwarded` — so a forwarded write is one joined distributed trace
+  across both nodes when OTLP export is enabled, `None`/no-op otherwise), and
   otherwise **waits** for the local group to elect (it never forwards a CP op to a
   non-leader — including itself — during election). **Every data op — the wire edges
   (DynamoDB, CQL) and the plain-client `Put`/`Get`/`Scan`/`Delete` — routes through

@@ -45,6 +45,12 @@ tokio = { version = "1", features = [
 ] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# OpenTelemetry-compatible distributed tracing export (ADR 0027). Scoped to
+# `animusd` only — every other crate stays on the plain `tracing` facade.
+opentelemetry = "0.32"
+opentelemetry_sdk = "0.32"
+opentelemetry-otlp = "0.32"
+tracing-opentelemetry = "0.33"
 async-trait = "0.1"
 futures = "0.3"
 crc32fast = "1"

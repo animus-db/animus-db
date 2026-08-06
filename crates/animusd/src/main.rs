@@ -22,17 +22,22 @@ use animusd::ClusterConfig;
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .init();
-
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let tracer_provider = animusd::otel::init_tracing(&otel_instance_label(&args));
+
     let result = match args.first().map(String::as_str) {
         Some("gen-config") => gen_config(&args[1..]),
         _ => run(&args).await,
     };
+
+    // Flush any spans still buffered in the OTLP batch exporter (ADR 0027)
+    // before the process exits; a no-op if export isn't configured.
+    if let Some(provider) = tracer_provider {
+        if let Err(err) = provider.shutdown() {
+            tracing::warn!(%err, "failed to flush OpenTelemetry tracer provider on exit");
+        }
+    }
+
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(msg) => {
@@ -40,6 +45,23 @@ async fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// A short `service.instance.id` label for the OTLP `Resource` (ADR 0027):
+/// this process's node index for a `--config/--node` run, or a cluster-level
+/// label for a `--cluster N` run (which hosts several logical nodes in one
+/// process, so no single node id applies at the process/resource level —
+/// per-span `node_id` fields still distinguish them within a trace).
+fn otel_instance_label(args: &[String]) -> String {
+    if let Some(pos) = args.iter().position(|a| a == "--node") {
+        if let Some(index) = args.get(pos + 1) {
+            return format!("node-{index}");
+        }
+    }
+    if args.iter().any(|a| a == "--cluster") {
+        return "cluster".to_owned();
+    }
+    "animusd".to_owned()
 }
 
 const USAGE: &str = "usage:\n  \
