@@ -397,6 +397,11 @@ fn lsm_opts() -> LsmOptions {
         wal_segment_bytes: 256,
         // Large grace: this corpus asserts consistency/durability, not GC.
         tombstone_grace_versions: 1 << 20,
+        // Keep both opt-in perf features off: this corpus asserts correctness
+        // under faults, not the fast paths they trade for (an LWW-check skip
+        // and off-loop maintenance) — exercise the default, always-safe path.
+        trust_monotonic_versions: false,
+        background_maintenance: false,
     }
 }
 
