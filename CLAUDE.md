@@ -793,6 +793,22 @@ cross-cutting ones. Prune/merge entries that become obsolete.
   follower's repeated pre-vote rounds leave the stable leader's term unchanged
   (without pre-vote it would ratchet the term every timeout and disrupt on heal).
 
+- **Extending a shared trait's addressing with a new axis: make the primitive
+  methods the ones every implementor must write, and re-derive the old surface
+  as *default* methods over a well-known constant.** Adding multiplexed
+  `(node, stream)` addressing to `Network` (ADR 0026, replacing the
+  `Coresident` sibling-pool escape hatch's rationale) needed every existing
+  call site (`env.send(to, payload)` / `env.recv()`, nearly the whole
+  codebase) to keep compiling and behaving identically. Making `send_stream`/
+  `recv_stream` the trait's required methods and `send`/`recv` **default**
+  methods that forward to them with a `PRIMARY_STREAM` constant meant the only
+  code that had to change was the *three* concrete `Network` implementors
+  (`SimEnv`, `ProdEnv`, and one test double) — every caller was untouched,
+  because a default method is in scope exactly like a required one once the
+  trait is in scope. Grep every `impl <Trait> for` site *before* estimating
+  blast radius; it is often far smaller than "everywhere the trait's methods
+  are called."
+
 ### Merge / integration workflow
 - **Run `cargo test --workspace` after *each* merge, not just at the end of a
   batch.** Batching the gate run let a regression onto main via an earlier
@@ -823,3 +839,24 @@ cross-cutting ones. Prune/merge entries that become obsolete.
 - **Tell agents to keep public signatures stable** when a sibling depends on them
   (additive changes only), and to **stop-and-report rather than loop** on a
   transient API error.
+- **In a worktree session, an absolute-path tool call (Read/Edit/Write) is not
+  scoped by the shell's `cd` — pin every path under the worktree root
+  explicitly, every time.** A `Bash` `cd /path/to/main/repo && ...` changes the
+  *shell's* cwd for subsequent Bash calls, but Read/Edit/Write take literal
+  absolute paths and don't care what the shell's cwd is — so it is easy to
+  `cd` into the main checkout for one command (e.g. to run cargo from a
+  familiar path) and then keep handing Read/Edit/Write paths that *look*
+  worktree-rooted but are actually bare `/repo/...` paths resolving into the
+  main checkout, silently editing a different working tree than intended (here:
+  overwriting a colleague's unrelated in-progress uncommitted work in the main
+  repo, twice, while believing the isolated worktree was being edited). The
+  tell was a `git status` on what should have been the worktree suddenly
+  reporting the *main repo's* branch name, and a test binary not picking up an
+  edit that Read/Edit had just reported succeeding — both mean the tool and the
+  build are looking at two different files. Recovery: `git diff` the
+  suspect-wrong checkout, confirm which hunks are genuinely new (not
+  pre-existing unrelated dirty state) before touching anything, revert only
+  those, and re-apply them (a filtered `git apply --include=<path>` off a saved
+  patch is faster and safer than re-doing every edit by hand) in the correct
+  location. Never `git checkout --`/reset a dirty file without first diffing
+  it to confirm every hunk is yours.

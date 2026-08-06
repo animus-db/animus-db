@@ -56,6 +56,19 @@ function of one seed. This is the substrate every distributed test runs on.
   RNG drawn only in deterministic order, no wall clock. Disk ops add no timeline
   events and draw no RNG, so they don't perturb traces.
 
+- **Multiplexed `(node, stream)` addressing (ADR 0026).** The inbox/waker maps
+  are keyed `(NodeId, u64)` instead of `NodeId`, so a node can be addressed on
+  more than one stream; `crash`/`stop` now node-prefix-scan both maps (the same
+  pattern `Disk::list`'s node-prefix scan already used) to clear *every* stream
+  of a crashed/stopped node, not just its primary one. `Simulator::env` still
+  only pre-registers `PRIMARY_STREAM`'s inbox entry — any other stream is
+  created lazily on first send/recv, exactly like `Coresident::sibling` lazily
+  registers a whole new node id today. No new RNG draw or timeline event shape,
+  so the determinism argument (trace = pure function of the seed) is unchanged;
+  `tests/determinism.rs::multiplexed_streams_are_isolated_and_deterministic`
+  proves it directly (two streams to one node don't cross-talk, and the run —
+  trace included — reproduces byte-for-byte from the seed).
+
 ## Tests
 
 `cargo test -p animus-sim` — `tests/determinism.rs` asserts byte-identical

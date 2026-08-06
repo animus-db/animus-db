@@ -28,8 +28,8 @@ use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use animus_env::{
-    BoxFuture, Clock, Coresident, Disk, Env, Envelope, Nanos, Network, NodeId, Rng as RngTrait,
-    Spawner,
+    BoxFuture, Clock, Coresident, Disk, Env, Envelope, Nanos, Network, NodeId, PRIMARY_STREAM,
+    Rng as RngTrait, Spawner,
 };
 use futures::task::ArcWake;
 use rand::{RngCore, SeedableRng};
@@ -51,7 +51,7 @@ struct FileState {
 enum Event {
     /// A `sleep` timer fires.
     Timer(TimerId),
-    /// A message is delivered to a node's inbox.
+    /// A message is delivered to a node's inbox (on `env.stream`, ADR 0026).
     Deliver { to: NodeId, env: Envelope },
 }
 
@@ -95,6 +95,7 @@ pub enum TraceEvent {
         t: u64,
         from: NodeId,
         to: NodeId,
+        stream: u64,
         len: usize,
     },
     /// A message was delivered to a node's inbox.
@@ -102,6 +103,7 @@ pub enum TraceEvent {
         t: u64,
         from: NodeId,
         to: NodeId,
+        stream: u64,
         len: usize,
     },
     /// A message was dropped (lossy link, partition, or crashed target).
@@ -109,6 +111,7 @@ pub enum TraceEvent {
         t: u64,
         from: NodeId,
         to: NodeId,
+        stream: u64,
         reason: &'static str,
     },
     /// A sleep timer fired.
@@ -119,19 +122,32 @@ impl std::fmt::Display for TraceEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             TraceEvent::Spawn { task } => write!(f, "SPAWN task={task}"),
-            TraceEvent::Send { t, from, to, len } => {
-                write!(f, "t={t} SEND {from}->{to} len={len}")
+            TraceEvent::Send {
+                t,
+                from,
+                to,
+                stream,
+                len,
+            } => {
+                write!(f, "t={t} SEND {from}->{to} stream={stream} len={len}")
             }
-            TraceEvent::Deliver { t, from, to, len } => {
-                write!(f, "t={t} DELIVER {from}->{to} len={len}")
+            TraceEvent::Deliver {
+                t,
+                from,
+                to,
+                stream,
+                len,
+            } => {
+                write!(f, "t={t} DELIVER {from}->{to} stream={stream} len={len}")
             }
             TraceEvent::Drop {
                 t,
                 from,
                 to,
+                stream,
                 reason,
             } => {
-                write!(f, "t={t} DROP {from}->{to} ({reason})")
+                write!(f, "t={t} DROP {from}->{to} stream={stream} ({reason})")
             }
             TraceEvent::Timer { t, id } => write!(f, "t={t} TIMER id={id}"),
         }
@@ -157,8 +173,13 @@ struct SimState {
     timer_wakers: BTreeMap<TimerId, Waker>,
 
     nodes: BTreeSet<NodeId>,
-    inboxes: BTreeMap<NodeId, VecDeque<Envelope>>,
-    recv_wakers: BTreeMap<NodeId, Waker>,
+    // Keyed by `(node, stream)` (ADR 0026): a node's inbox is now multiple
+    // independently-addressable streams, each still single-consumer. Every
+    // pre-multiplexing caller uses `PRIMARY_STREAM` via the `Network::send`/
+    // `recv` defaults, so this is a transparent generalization of the old
+    // single-stream-per-node inbox.
+    inboxes: BTreeMap<(NodeId, u64), VecDeque<Envelope>>,
+    recv_wakers: BTreeMap<(NodeId, u64), Waker>,
 
     disks: BTreeMap<(NodeId, String), FileState>,
 
@@ -253,7 +274,7 @@ impl Simulator {
     pub fn env(&self, node: NodeId) -> SimEnv {
         let mut st = self.shared.lock();
         st.nodes.insert(node);
-        st.inboxes.entry(node).or_default();
+        st.inboxes.entry((node, PRIMARY_STREAM)).or_default();
         SimEnv {
             shared: Arc::clone(&self.shared),
             node_id: node,
@@ -291,10 +312,28 @@ impl Simulator {
     pub fn crash(&self, node: NodeId) {
         let mut st = self.shared.lock();
         st.crashed.insert(node);
-        if let Some(inbox) = st.inboxes.get_mut(&node) {
-            inbox.clear();
+        // Clear every stream's inbox for this node (ADR 0026): a crashed node's
+        // whole inbox is volatile, not just its primary stream's.
+        let inbox_keys: Vec<_> = st
+            .inboxes
+            .keys()
+            .filter(|(n, _)| *n == node)
+            .cloned()
+            .collect();
+        for k in inbox_keys {
+            if let Some(inbox) = st.inboxes.get_mut(&k) {
+                inbox.clear();
+            }
         }
-        st.recv_wakers.remove(&node);
+        let waker_keys: Vec<_> = st
+            .recv_wakers
+            .keys()
+            .filter(|(n, _)| *n == node)
+            .cloned()
+            .collect();
+        for k in waker_keys {
+            st.recv_wakers.remove(&k);
+        }
         let keys: Vec<_> = st
             .disks
             .keys()
@@ -356,10 +395,27 @@ impl Simulator {
             st.task_owner.remove(&task);
         }
         // Volatile state dies with the process; durable disk is kept.
-        if let Some(inbox) = st.inboxes.get_mut(&node) {
-            inbox.clear();
+        // Clear every stream's inbox for this node (ADR 0026), mirroring `crash`.
+        let inbox_keys: Vec<_> = st
+            .inboxes
+            .keys()
+            .filter(|(n, _)| *n == node)
+            .cloned()
+            .collect();
+        for k in inbox_keys {
+            if let Some(inbox) = st.inboxes.get_mut(&k) {
+                inbox.clear();
+            }
         }
-        st.recv_wakers.remove(&node);
+        let waker_keys: Vec<_> = st
+            .recv_wakers
+            .keys()
+            .filter(|(n, _)| *n == node)
+            .cloned()
+            .collect();
+        for k in waker_keys {
+            st.recv_wakers.remove(&k);
+        }
         let keys: Vec<_> = st
             .disks
             .keys()
@@ -509,11 +565,13 @@ impl Simulator {
                 }
                 Event::Deliver { to, env } => {
                     let from = env.from;
+                    let stream = env.stream;
                     if st.crashed.contains(&to) {
                         st.trace.push(TraceEvent::Drop {
                             t,
                             from,
                             to,
+                            stream,
                             reason: "crashed",
                         });
                         None
@@ -522,14 +580,21 @@ impl Simulator {
                             t,
                             from,
                             to,
+                            stream,
                             reason: "partition",
                         });
                         None
                     } else {
                         let len = env.payload.len();
-                        st.trace.push(TraceEvent::Deliver { t, from, to, len });
-                        st.inboxes.entry(to).or_default().push_back(env);
-                        st.recv_wakers.remove(&to)
+                        st.trace.push(TraceEvent::Deliver {
+                            t,
+                            from,
+                            to,
+                            stream,
+                            len,
+                        });
+                        st.inboxes.entry((to, stream)).or_default().push_back(env);
+                        st.recv_wakers.remove(&(to, stream))
                     }
                 }
             }
@@ -577,12 +642,18 @@ impl RngTrait for SimEnv {
 
 #[async_trait::async_trait]
 impl Network for SimEnv {
-    async fn send(&self, to: NodeId, payload: Vec<u8>) {
+    async fn send_stream(&self, to: NodeId, stream: u64, payload: Vec<u8>) {
         let mut st = self.shared.lock();
         let from = self.node_id;
         let t = st.clock;
         let len = payload.len();
-        st.trace.push(TraceEvent::Send { t, from, to, len });
+        st.trace.push(TraceEvent::Send {
+            t,
+            from,
+            to,
+            stream,
+            len,
+        });
 
         // A crashed node produces no output: it is dead, not merely unreachable.
         if st.crashed.contains(&from) {
@@ -590,6 +661,7 @@ impl Network for SimEnv {
                 t,
                 from,
                 to,
+                stream,
                 reason: "sender-crashed",
             });
             return;
@@ -601,6 +673,7 @@ impl Network for SimEnv {
                 t,
                 from,
                 to,
+                stream,
                 reason: "lossy",
             });
             return;
@@ -620,15 +693,20 @@ impl Network for SimEnv {
             (deliver_at, seq),
             Event::Deliver {
                 to,
-                env: Envelope { from, payload },
+                env: Envelope {
+                    from,
+                    stream,
+                    payload,
+                },
             },
         );
     }
 
-    async fn recv(&self) -> Envelope {
+    async fn recv_stream(&self, stream: u64) -> Envelope {
         Recv {
             shared: Arc::clone(&self.shared),
             node: self.node_id,
+            stream,
         }
         .await
     }
@@ -758,7 +836,7 @@ impl Coresident for SimEnv {
         {
             let mut st = self.shared.lock();
             st.nodes.insert(id);
-            st.inboxes.entry(id).or_default();
+            st.inboxes.entry((id, PRIMARY_STREAM)).or_default();
         }
         SimEnv {
             shared: Arc::clone(&self.shared),
@@ -802,10 +880,12 @@ impl Future for Sleep {
     }
 }
 
-/// Future that yields the next message addressed to a node.
+/// Future that yields the next message addressed to a node on a given stream
+/// (ADR 0026).
 struct Recv {
     shared: Arc<Shared>,
     node: NodeId,
+    stream: u64,
 }
 
 impl Future for Recv {
@@ -813,10 +893,11 @@ impl Future for Recv {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Envelope> {
         let mut st = self.shared.lock();
-        if let Some(env) = st.inboxes.get_mut(&self.node).and_then(VecDeque::pop_front) {
+        let key = (self.node, self.stream);
+        if let Some(env) = st.inboxes.get_mut(&key).and_then(VecDeque::pop_front) {
             Poll::Ready(env)
         } else {
-            st.recv_wakers.insert(self.node, cx.waker().clone());
+            st.recv_wakers.insert(key, cx.waker().clone());
             Poll::Pending
         }
     }

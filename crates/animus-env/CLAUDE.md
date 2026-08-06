@@ -105,6 +105,27 @@ the production implementation; the deterministic implementation lives in
   it spawned) and leaves the pool alone. The claimed slot is not returned to the
   pool (slots are single-use by design); `CP_SIBLING_POOL` sizing accounts for it.
 
+- **Multiplexed `(node, stream)` addressing (ADR 0026).** `Network` gained a
+  second addressing axis so a node can host more than one protocol instance
+  without minting a whole new `NodeId`: `send_stream`/`recv_stream` are the
+  primitive methods every implementor provides; `send`/`recv` are **default**
+  methods over `PRIMARY_STREAM` (`= 0`), so every call site that predates this
+  axis — which is nearly everything — needs no change and behaves identically.
+  `SimEnv` re-keys its inbox `BTreeMap` from `NodeId` to `(NodeId, u64)` (no new
+  RNG draw or timeline event, so determinism is unaffected). `ProdEnv` demuxes
+  by a `Demux` (`BTreeMap<u64, VecDeque<Envelope>>` + per-stream `Waker`s)
+  behind one `Arc<StdMutex<_>>` per env, fed by a background pump task that
+  drains the accept loop's raw frames (now `[from][stream][len][payload]`,
+  the `stream` field ADR 0026 added) and routes each into its stream's queue,
+  waking a parked `recv_stream(stream)`. A `Coresident::sibling` gets its own
+  `Demux` + pump (its inbox is genuinely separate); this is orthogonal to (and
+  does not yet replace) `Coresident` — see the ADR for the staged plan to
+  eventually retire the sibling pool once a real consumer (the per-tablet CP
+  Raft group after a split) migrates onto a stream instead of a minted `NodeId`.
+  This is the same "additive default over a well-known constant" shape the
+  metrics seam (`Env::metrics()`) uses — extend the trait so nothing existing
+  has to change, not by widening every implementor's required surface.
+
 ## Tests
 
 The seam is exercised end-to-end through `animus-sim` (`cargo test -p
