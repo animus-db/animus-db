@@ -243,6 +243,16 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   practices entry for the general lesson (a shared-registry "does anyone
   satisfy this" query is not the same as a per-node gate, and the two only
   diverge under `--cluster N`).
+- **The `pending` map's abandon path (see above) didn't refresh
+  `last_triggered`, so an abandoned tablet was immediately re-eligible for a
+  brand-new fresh split on the very next tick** instead of backing off for
+  `AUTO_SPLIT_COOLDOWN` like a normal fresh trigger does. Under repeated
+  contention on a tablet this let its split id climb every tick indefinitely
+  (8→10→12…), each attempt abandoned in turn. Fixed by inserting into
+  `last_triggered` on abandon too — see the root `CLAUDE.md`
+  engineering-practices entry for the general lesson (a "give up" exit from a
+  retry loop must leave the same rate-limit state a normal successful cycle
+  would).
 - **The cluster's members are the CP `raftkv` nodes, not the control ids.** The
   control ids `0..N` are only the Raft *consensus group* for metadata; `bootstrap`
   (leader-only, idempotent) registers the **raftkv ids** (`300+i`) as `Active`
