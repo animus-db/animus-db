@@ -45,17 +45,21 @@ mod cql_client;
 mod dashboard;
 mod dynamo;
 mod http;
+mod topology;
 
 use animus_control::node::heartbeat_loop;
 use animus_control::{PlacementPolicy, ProposeResult, RaftNode};
 use animus_cp_data::{RaftKvNode, SplitHook};
 use animus_env::{Coresident, Disk, Env, Metric, MetricsHandle, NodeId, ProdEnv};
 use animus_storage::{LsmEngine, MemoryEngine, SsTableView, StorageEngine, WalRecordView};
-use animus_tablet::{Epoch, KeyRange, TabletId};
+use animus_tablet::{KeyRange, TabletId};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+// Pure CP-topology decision logic (id translation, routing, join-host/GC
+// predicates), extracted into `topology` for unit-test coverage.
+use topology::{cp_base_id, cp_member_id, cp_members_for};
 
 /// A list of `(key, value)` pairs — the payload of a batch write (one Raft
 /// `KvCommand::Batch` entry per tablet). Named to keep the batch grouping map
@@ -1347,12 +1351,9 @@ impl ClientCtx {
         // `table`'s tablets and match the key's leading token against their token
         // sub-ranges. Two tables' tablets may share a token range, so we never scan
         // the global tablet map. No catch-all: a key of an unprovisioned table yields
-        // `None` and the caller waits.
-        self.raft
-            .metadata()
-            .tablets_for_table(table)
-            .find(|(_, t)| t.range.contains(key))
-            .map(|(id, _)| *id)
+        // `None` and the caller waits. The range-match lookup itself is pure — see
+        // `topology::tablet_for_key`.
+        topology::tablet_for_key(self.raft.metadata().tablets_for_table(table), key)
     }
 
     /// Resolve how to reach the CP group leader for an op on `key` (shared by every
@@ -1391,38 +1392,48 @@ impl ClientCtx {
     /// resolution policy shared by [`cp_route`](Self::cp_route) (key→tablet→leader)
     /// and [`cp_route_tablet`](Self::cp_route_tablet) (tablet→leader, for the split
     /// trigger, where the key maps to a *different* tablet after the metadata split).
+    ///
+    /// The branching itself — serve locally / forward-to-hint / forward-anywhere
+    /// / wait — is the pure [`topology::decide_cp_route`]; this method's job is
+    /// only to gather its inputs (cheaply, and lazily where a fact needs a
+    /// `Metadata` deep clone) and execute the resulting decision.
     fn resolve_cp_route(&self, tablet: TabletId) -> Option<CpRoute> {
-        if let Some(leader) = self.edge.cp_leader(tablet) {
+        let leader = self.edge.cp_leader(tablet);
+        if let Some(leader) = leader {
             return Some(CpRoute::Local(leader));
         }
         // Forward only to a concrete leader *hint* a local replica gives us.
-        if let Some(addr) = self.cp_forward_target(tablet) {
+        let forward_hint = self.cp_forward_target(tablet);
+        if let Some(addr) = forward_hint {
             return Some(CpRoute::Forward(addr));
         }
-        // No local leader and no leader hint. Decide between waiting and forwarding
-        // by whether this node is a **replica** of the tablet (ADR 0023): a replica
-        // that does not yet host the group is mid-stand-up (its join-host loop will
-        // form/elect it) — **wait**, don't forward to a node that may not host the
-        // leader yet (the dynamic-provisioning window, fixes "forwarded CP op: not
-        // the leader here"). A node that is *not* a replica can never serve locally,
-        // so forward toward an actual replica of the tablet (it leads, or the client
-        // retries with fresh routing).
-        if self.edge.local_cp(tablet).is_none() {
+        // No local leader and no leader hint. Whether this node hosts *any* local
+        // handle for the group is cheap (no `Metadata` clone); only fetch the
+        // metadata-derived facts (`is_replica`, a fallback forward address) in the
+        // one case that needs them, matching `decide_cp_route`'s own short-circuit
+        // order (avoids the "re-clone `Metadata` per request" cost the wire edges
+        // already learned to snapshot around).
+        let has_local_replica = self.edge.local_cp(tablet).is_some();
+        let (is_replica, fallback_forward) = if has_local_replica {
+            (false, None)
+        } else {
             let meta = self.raft.metadata();
             let replicas = meta.tablets.get(&tablet).map(|t| &t.replicas);
             let is_replica = replicas.is_some_and(|r| r.contains(&self.base_id));
-            if is_replica {
-                return None; // wait for our own group to form
-            }
-            // Forward toward a replica's client route (prefer over a random node).
-            if let Some(addr) = replicas
+            let fallback = replicas
                 .into_iter()
                 .flatten()
                 .find_map(|id| self.client_route.get(id).copied())
-                .or_else(|| self.client_route.values().next().copied())
-            {
-                return Some(CpRoute::Forward(addr));
-            }
+                .or_else(|| self.client_route.values().next().copied());
+            (is_replica, fallback)
+        };
+        // `has_local_leader: false` and `forward_hint: None` here are exactly the
+        // facts already established by the two early returns above — `Local` is
+        // therefore unreachable from this call by construction.
+        if let topology::RouteDecision::Forward(addr) =
+            topology::decide_cp_route(false, None, has_local_replica, is_replica, fallback_forward)
+        {
+            return Some(CpRoute::Forward(addr));
         }
         None
     }
@@ -2172,35 +2183,9 @@ struct CpHostCtx {
     hosted: Arc<Mutex<Vec<HostedCpTablet>>>,
 }
 
-/// This node's CP group **member id** for `tablet`, derived **flatly** from its base
-/// `raftkv` id: the bootstrap tablet uses the base id; any split-created tablet uses
-/// `base + tablet * CP_SPLIT_ID_STRIDE`. Flat (always from the base id, not the
-/// parent's member id) so the derivation is identical at any split depth and matches
-/// [`cp_members_for`] — a grandchild's member is `base + grandchild * STRIDE`, not a
-/// compounding `base + parent*STRIDE + grandchild*STRIDE`, so the reconfigure loop's
-/// translated `desired` set always matches the running group's `config()`.
-fn cp_member_id(base: NodeId, tablet: TabletId) -> NodeId {
-    if tablet == TABLET {
-        base
-    } else {
-        base + tablet.0 * CP_SPLIT_ID_STRIDE
-    }
-}
-
-/// The inverse of [`cp_member_id`]: recover the stable **base** `raftkv` id from a
-/// tablet group **member id**. Needed wherever a group-internal id (e.g. the leader
-/// hint a local replica reports) must be resolved against state keyed by base ids
-/// (`client_route`, `Metadata.members`, `tablets[t].replicas`). For the bootstrap
-/// tablet member == base, which is why a missing reverse translation *works* there
-/// and only breaks for derived-id tablets (every provisioned table tablet and split
-/// child) — the bug class behind "no CP group leader reachable" on a healthy group.
-fn cp_base_id(member: NodeId, tablet: TabletId) -> NodeId {
-    if tablet == TABLET {
-        member
-    } else {
-        member - tablet.0 * CP_SPLIT_ID_STRIDE
-    }
-}
+// `cp_member_id` / `cp_base_id` (base <-> derived CP group member id translation)
+// now live in `topology` as pure, unit-tested functions; imported via
+// `use topology::{cp_base_id, cp_member_id, cp_members_for};` below.
 
 /// Build a **CP split hook** for a group on this node (Phase 2.2 / D3). When the
 /// group commits a `Split { at }`, every replica invokes this hook with the handed-off
@@ -2378,21 +2363,9 @@ async fn cp_rehost(host: CpHostCtx, h: HostedCpTablet) {
 /// cluster produces no churn.
 const CP_RECONFIGURE_INTERVAL: Duration = Duration::from_millis(500);
 
-/// Translate a tablet's replica set — recorded in `Metadata.tablets[t].replicas` as
-/// stable **base** `raftkv` ids (the node identities placement + failure-detection
-/// speak) — into that tablet's CP **group member ids**. The bootstrap tablet's group
-/// uses the base ids directly; a split-created tablet's group uses the derived
-/// `base + tablet * CP_SPLIT_ID_STRIDE` (Phase 2.2 / [`cp_split_seed`]). This is the
-/// single source of the base↔member mapping, so the reconfigure loop's `desired`
-/// matches the running group's `config()` exactly (no spurious churn) — which is why
-/// the replicated map can stay in base ids rather than being reconciled to the
-/// derived member ids (#4).
-fn cp_members_for(tablet: TabletId, replicas: &[NodeId]) -> BTreeSet<NodeId> {
-    replicas
-        .iter()
-        .map(|&base| cp_member_id(base, tablet))
-        .collect()
-}
+// `cp_members_for` (translate a tablet's base-id replica set to its CP group's
+// member ids) now lives in `topology` as a pure, unit-tested function — see the
+// `use` import above [`cp_member_id`]/[`cp_base_id`].
 
 /// The per-node **CP reconfigure loop** over `ProdEnv` (#3 / ADR 0017 Stage C): on
 /// each tick, for every tablet whose CP group this node currently **leads**, pull the
@@ -2448,20 +2421,18 @@ async fn cp_join_host_loop(host: CpHostCtx) {
         tokio::time::sleep(CP_JOIN_HOST_INTERVAL).await;
         let tablets = host.ctx.raft.metadata().tablets;
         for (tablet, t) in tablets {
-            if !t.replicas.contains(&host.base_id) {
+            // The pure decision — is this tablet this node's concern, and if so
+            // forming fresh or joining an existing group — is
+            // `topology::plan_join_host` (host a freshly *provisioned* table
+            // tablet at `INITIAL` with the whole range, or a *joined* replica at a
+            // bumped epoch; skip a fresh split child, `INITIAL` + non-whole range,
+            // whose data is seeded by the split hook instead). On a restart
+            // `LsmEngine::open` in `cp_join_host` recovers the on-disk engine, so
+            // re-hosting a provisioned tablet here does not start it truly empty.
+            let Some(plan) = topology::plan_join_host(host.base_id, &t.replicas, t.epoch, &t.range)
+            else {
                 continue;
-            }
-            // Host an **empty** group for a freshly *provisioned* table tablet (ADR
-            // 0023: a `CreateTable` tablet starts at `INITIAL` with the whole token
-            // ring) or a *joined* replica (`epoch > INITIAL` — the reconciler placed
-            // this node into an existing tablet's set). **Skip a fresh split child**
-            // (`INITIAL` + a non-whole range): its data is seeded by the split hook on
-            // its original replicas, so starting it empty here would lose it. On a
-            // restart `LsmEngine::open` in `cp_join_host` recovers the on-disk engine,
-            // so re-hosting a provisioned tablet here does not start it truly empty.
-            if t.epoch <= Epoch::INITIAL && t.range != KeyRange::whole() {
-                continue;
-            }
+            };
             // Dedup **per node** via the `minted` claim set (shared with the split
             // hook + re-host on *this* node) — NOT via `edge.local_cp`, which in an
             // in-process `--cluster N` run is a **shared** `ClusterEdgeState`: it
@@ -2469,16 +2440,14 @@ async fn cp_join_host_loop(host: CpHostCtx) {
             // leaving a freshly provisioned tablet hosted on only one replica (no
             // majority → no election → "no CP group leader reachable"). The minted set
             // is genuinely per-node, so it dedups correctly in both deployment modes.
+            // This stateful claim stays here — it is not part of the pure decision.
             {
                 let mut h = host.minted.lock().expect("hosting set poisoned");
                 if !h.insert(tablet) {
                     continue;
                 }
             }
-            // A fresh table tablet (still at INITIAL) is forming for the first time →
-            // start voting with the full config; a bumped epoch means this node is
-            // *joining* an existing group → start as a quiet non-voter.
-            cp_join_host(&host, tablet, &t.replicas, t.epoch <= Epoch::INITIAL).await;
+            cp_join_host(&host, tablet, &t.replicas, plan.initial_formation).await;
         }
     }
 }
@@ -2591,6 +2560,9 @@ const CP_GC_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 async fn cp_gc_loop(host: CpHostCtx) {
     loop {
         tokio::time::sleep(CP_GC_INTERVAL).await;
+        // Recovery guard stays here (a live `RaftNode` read, not part of the pure
+        // predicate): skip entirely before replicated `Metadata` has recovered, or
+        // an empty default `Metadata` reads as "everything dropped".
         if host.ctx.raft.last_applied() == 0 {
             continue;
         }
@@ -2602,10 +2574,8 @@ async fn cp_gc_loop(host: CpHostCtx) {
             .iter()
             .copied()
             .collect();
-        for tablet in mine {
-            if !tablets.contains_key(&tablet) {
-                cp_gc_tablet(&host, tablet).await;
-            }
+        for tablet in topology::tablets_to_reclaim(&mine, &tablets) {
+            cp_gc_tablet(&host, tablet).await;
         }
     }
 }
