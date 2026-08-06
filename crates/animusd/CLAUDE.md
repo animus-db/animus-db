@@ -313,7 +313,10 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
       land (idempotent per-key LWW), instead of surfacing "CP write did not commit
       in time". The dashboard's **Bulk seed** card chunks a
       larger total into requests, showing progress + refreshing the Tablets view so
-      splits appear live. Combined with the binary's **`--cluster N --auto-split K`**
+      splits appear live; its **table is a dropdown of provisioned tables** (from
+      the tablet map in `/admin/status` — the exact set the endpoint's
+      `has_table_tablet` check accepts, so Dynamo *and* CQL `ks.table` tables both
+      appear), disabled with a hint while no table exists. Combined with the binary's **`--cluster N --auto-split K`**
       flag (a CP-hosting node splits a tablet it leads once it exceeds K keys, Phase
       2.4, via `start_cluster_with_auto_split`), seeding past K auto-shards the
       keyspace — verified end to end (seed 12k keys, `--auto-split 4000` → 5 tablets).

@@ -202,7 +202,8 @@ SELECT * FROM t WHERE id = 1;"></textarea>
       <h2>Bulk seed (sharding test)</h2>
       <div class="muted" style="margin-bottom:8px">Writes synthetic keys into an <b>existing</b> table to grow its tablet (create the table first in the Dynamo or CQL panel). Run the cluster with <code>--auto-split K</code> to watch tablets split in the Tablets tab as the count crosses K.</div>
       <div class="row">
-        <label>table</label><input type="text" id="seed-table" value="seed" style="width:7em">
+        <label>table</label><select id="seed-table"></select>
+        <span class="muted" id="seed-no-tables" style="display:none">create a table first</span>
         <label>key prefix</label><input type="text" id="seed-prefix" value="seed:" style="width:7em">
         <label>value bytes</label><input type="text" id="seed-vbytes" value="64" style="width:5em">
         <label>total</label><input type="text" id="seed-total" value="10000" style="width:7em">
@@ -327,6 +328,7 @@ function render() {
   renderTablets();
   renderStorageSelectors();
   renderDynamoTables();
+  renderSeedTables();
 }
 
 function renderNodes() {
@@ -832,6 +834,25 @@ function renderCqlResult(r) {
 
 // ---- Write tab: bulk seed ----
 let seeding = false;
+
+// The seed target is a dropdown of tables that *have a tablet* — the exact set
+// `/admin/data/seed` accepts (it validates against the replicated tablet map),
+// so both Dynamo and CQL `ks.table` tables appear once provisioned. Refreshed by
+// render() (which also runs mid-seed via loadAll), so preserve the selection and
+// keep the Seed button's disabled state in sync with the `seeding` flag.
+function renderSeedTables() {
+  const tablets = (STATE.status && STATE.status.tablets) || {};
+  const names = [...new Set(Object.values(tablets).map((t) => t.table).filter(Boolean))].sort();
+  const sel = $("seed-table");
+  const prev = sel.value;
+  sel.innerHTML = names.map((n) => `<option>${esc(n)}</option>`).join("");
+  if (names.includes(prev)) sel.value = prev;
+  const none = names.length === 0;
+  $("seed-no-tables").style.display = none ? "" : "none";
+  sel.disabled = none;
+  $("seed-go").disabled = none || seeding;
+}
+
 async function seedRun() {
   if (seeding) return;
   const table = $("seed-table").value.trim();
@@ -839,7 +860,7 @@ async function seedRun() {
   const vbytes = Math.max(0, parseInt($("seed-vbytes").value, 10) || 0);
   const total = Math.max(0, parseInt($("seed-total").value, 10) || 0);
   const chunk = Math.max(1, parseInt($("seed-chunk").value, 10) || 1000);
-  if (!table) { $("seed-status").innerHTML = `<div class="empty">set a table (every key names a table)</div>`; return; }
+  if (!table) { $("seed-status").innerHTML = `<div class="empty">create a table first (Dynamo or CQL panel) — every key names a table</div>`; return; }
   if (!total) { $("seed-status").innerHTML = `<div class="empty">set a total</div>`; return; }
   seeding = true;
   $("seed-go").disabled = true;
@@ -871,7 +892,7 @@ async function seedRun() {
     $("seed-status").innerHTML = `<div class="err-line">${esc(e)}</div>`;
   } finally {
     seeding = false;
-    $("seed-go").disabled = false;
+    renderSeedTables(); // recompute seed-go (stays disabled if no tables remain)
     $("seed-stop").disabled = true;
   }
 }
