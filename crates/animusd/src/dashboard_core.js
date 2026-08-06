@@ -119,6 +119,25 @@ function tokenBound(v, fill) {
 
 function pill(cls, text) { return `<span class="pill ${esc(cls)}">${esc(text)}</span>`; }
 
+// A minimal inline SVG sparkline over `values` (oldest first) — no charting
+// library, matching the no-build-step constraint. Flat/empty series render as
+// a flat midline rather than a division-by-zero NaN path. `style="stroke:…"`
+// (not a bare `stroke=` attribute) so CSS custom properties resolve reliably.
+function sparklineSvg(values, opts = {}) {
+  const width = opts.width || 220;
+  const height = opts.height || 32;
+  if (!values.length) return `<span class="muted">no samples yet</span>`;
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const span = max - min || 1;
+  const stepX = values.length > 1 ? width / (values.length - 1) : 0;
+  const points = values.map((v, i) =>
+    `${(i * stepX).toFixed(1)},${(height - ((v - min) / span) * height).toFixed(1)}`).join(" ");
+  return `<svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" class="spark">
+    <polyline points="${points}" fill="none" style="stroke:var(--accent)" stroke-width="1.5" />
+  </svg>`;
+}
+
 async function loadAll() {
   let peers;
   try {
@@ -161,6 +180,7 @@ function nodeByRaftkv(id) {
 function render() {
   renderHealthStrip();
   renderNodes();
+  renderMetricsHistorySelector();
   renderTablets();
   renderTopology();
   renderStorageSelectors();
