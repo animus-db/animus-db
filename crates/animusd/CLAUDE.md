@@ -416,13 +416,29 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
       across the ring instead of piling into one tablet's tail)
       into an **existing** `table` (ADR 0023: seeding writes into a table, it
       does not create one — a non-existent table is a `404`, looked up in the
-      replicated tablet map) via the normal durable `cp_write`, with bounded
-      concurrency (`SEED_CONCURRENCY`) to amortize WAL group-commit; capped at
-      `SEED_MAX_PER_REQUEST` per call. Each key is **retried** (`SEED_WRITE_ATTEMPTS`)
-      so writes racing a tablet **split** — routed to the parent and truncated as
-      the upper range moves to the new child — re-route to the elected child and
-      land (idempotent per-key LWW), instead of surfacing "CP write did not commit
-      in time". The dashboard's **Bulk seed** card chunks a
+      replicated tablet map), committed sequentially as `SEED_BATCH_SIZE`-key
+      `cp_batch_write_patient` batches; capped at `SEED_MAX_PER_REQUEST` per
+      call. Each batch is **retried** (`SEED_WRITE_ATTEMPTS`) so writes racing
+      a tablet **split** — routed to the parent and truncated as the upper
+      range moves to the new child — re-route to the elected child and land
+      (idempotent per-key LWW), instead of surfacing "CP batch write did not
+      commit in time". **The retry uses `ClientCtx::cp_batch_write_patient`,
+      not a plain loop over `cp_batch_write`**: a bare confirm-timeout means
+      the batch's `Batch` Raft entry was accepted onto the leader's log but
+      not yet confirmed durable+applied — not that it's lost — so blindly
+      resubmitting would append a second, fully duplicate entry for the same
+      keys on top of one probably still committing, doubling replication/fsync
+      load under exactly the slow/contended conditions that caused the
+      timeout (root-caused via a live repro: `--auto-split 2000` under
+      sustained bulk-seed looked like a leader-election storm but every Raft
+      term, control plane and every CP group, stayed flat the whole time —
+      `commit_index` kept climbing well past individual attempts already
+      reported failed; the actual bottleneck was disk fsync latency, ~12-27ms
+      measured on a WSL2 host vs. sub-ms on real NVMe). `cp_batch_write_patient`
+      polls the *same* already-accepted entry for a second confirm window
+      before falling back to a fresh propose, so only a genuine routing
+      failure (leader moved, e.g. a split) triggers a real resubmission. The
+      dashboard's **Bulk seed** card chunks a
       larger total into requests, showing progress + refreshing the Tablets view so
       splits appear live; its **table is a dropdown of provisioned tables** (from
       the tablet map in `/admin/status` — the exact set the endpoint's
