@@ -178,12 +178,18 @@ document.querySelectorAll(".primary button").forEach((b) =>
   b.addEventListener("click", () => activateTab(lastTabInGroup[b.dataset.group], { push: true })));
 document.querySelectorAll(".secondary button").forEach((b) =>
   b.addEventListener("click", () => activateTab(b.dataset.tab, { push: true })));
-window.addEventListener("popstate", () => activateTab(tabFromPath(window.location.pathname), { silent: true }));
+window.addEventListener("popstate", () => {
+  pendingStorageParams = paramsFromLocation();
+  activateTab(tabFromPath(window.location.pathname), { silent: true });
+  if (activeTab === "storage") applyPendingStorageParams();
+});
+pendingStorageParams = paramsFromLocation();
 activateTab(tabFromPath(window.location.pathname));
 $("refresh").addEventListener("click", loadAll);
 $("global-table").addEventListener("change", onGlobalTableChange);
-$("st-tablet").addEventListener("change", updateStorageNodeOptions);
-$("st-load").addEventListener("click", loadStorage);
+$("st-tablet").addEventListener("change", () => { updateStorageNodeOptions(); syncStorageUrl(); });
+$("st-node").addEventListener("change", syncStorageUrl);
+$("st-load").addEventListener("click", () => { loadStorage(); syncStorageUrl(); });
 $("scan-load").addEventListener("click", browseKeys);
 $("key-load").addEventListener("click", inspectKey);
 $("dy-add-attr").addEventListener("click", () => addAttrRow());

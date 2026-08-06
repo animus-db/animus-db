@@ -665,6 +665,25 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
 - Two run modes: `--cluster N` (whole cluster in one process, dev convenience)
   and `--config FILE --node I` (one node per process — real deployment). Both
   share `Node::bind`/`start`; only address/peer assembly differs.
+- **`--cluster N` without an explicit `--dir` defaults to ONE fixed path,
+  `$TMPDIR/animusd` (`main.rs`), reused across every invocation on the
+  machine — and `--ephemeral` does NOT make a run ephemeral with respect to
+  that default dir.** `--ephemeral` only selects the CP-data group's
+  `StorageBackend` (`Memory` vs `LsmEngine`, consumed later in
+  `start_cluster_with`); `Node::bind` unconditionally opens the **control**
+  role's `ProdEnv` at `dir/node-{i}/control` and the **raftkv** role's at
+  `dir/node-{i}/raftkv` *before* that backend choice is ever consulted — so
+  the replicated `Metadata` (tablet map, membership, schema catalog) and the
+  raftkv role's own Raft WAL persist to disk across `--ephemeral` runs, and a
+  "fresh" cluster silently inherits a previous run's tablet/split state
+  (live-observed: a brand-new `--cluster 3 --ephemeral` already had a
+  multiply-split tablet with a real range from an unrelated earlier run).
+  Worse, **two `--cluster N` processes running concurrently without distinct
+  `--dir`s will contend on the same on-disk control/raftkv WAL files** — a
+  real correctness hazard for local dev (two agents/terminals each running
+  `animusd --cluster 3` for a quick manual check), not just stale-state
+  confusion. Always pass an explicit, freshly-created `--dir` for a
+  throwaway manual run; don't rely on `--ephemeral` alone for a clean slate.
 - **The wire edges' mutable state is `ClusterEdgeState`, scoped to one cluster**
   (not the whole process). It holds the set of control `RaftNode` handles a schema
   DDL proposal fans out to (so a follower-connected `CreateTable`/`CREATE TABLE`
