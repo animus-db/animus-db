@@ -382,6 +382,24 @@ cross-cutting ones. Prune/merge entries that become obsolete.
   storm) — and several perf findings were already fixed on `main`, which had moved
   past the audited checkout (pre-vote, single-write-latency, cp-batch-put). A
   finding is (claim × trigger path × branch); verify all three.
+- **File reads taken shortly after a branch checkout can transiently disagree
+  across tool families (Read/Edit vs Bash) — verify you're actually at HEAD
+  before trusting either.** An agent building against `origin/perf/cp-data-
+  snapshots-codec` initially saw a stale 1053-line `animus-cp-data/src/lib.rs`
+  via `Read` while the true tip was 1482 lines with a materially different
+  architecture (split consensus-loop/apply-task, wake-on-propose, a binary wire
+  codec) — caught only because a test file referenced methods the "current"
+  file didn't have. `git show HEAD:path` gave a third answer on repeated calls.
+  Recovery: `git status --short` + `git diff --stat HEAD -- path` both empty is
+  the only trustworthy "am I at HEAD" check; for a file where Bash-side
+  build/test is the actual gate, `git checkout -- path` + direct Bash
+  edits (sed/perl) are safer than Read/Edit if this is suspected. (PR #31.)
+- **A `SimEnv` test must never `block_on` an operation that internally polls
+  `env.sleep()` (e.g. `linearizable_get`/`linearizable_scan`)** — those only
+  resolve while `Simulator::run_for` is advancing virtual time; calling one
+  directly under `block_on` hangs forever with no panic, burning wall-clock
+  silently. Spawn it as a task and drive it via `sim.run_for` instead (the
+  `lin_read`-style helper pattern in `tests/read_index.rs`). (PR #31.)
 - **A fault-schedule runner that heals immediately after the last fault gives
   single-fault scenarios a zero-length outage — give scenarios an explicit fault
   window.** The raftkv corpus healed partitions the instant the last fault landed,
