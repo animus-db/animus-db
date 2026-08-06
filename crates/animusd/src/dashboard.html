@@ -267,6 +267,19 @@ function bytes(v) {
   return String(v);
 }
 
+// A tablet range boundary on the hash ring (ADR 0022): the first 8 key bytes are
+// the big-endian Murmur3 partition token. The top 4 bytes (8 hex digits) locate a
+// boundary on the ring precisely enough for the tablets view, so show just those;
+// "…" marks elided bytes. An empty start / null end is the ring's edge — the
+// caller passes 00000000 / ffffffff.
+function tokenBound(v, fill) {
+  if (v == null || v === "") return fill;
+  const arr = Array.isArray(v) ? v : Array.from(String(v), (c) => c.charCodeAt(0) & 0xff);
+  if (arr.length === 0) return fill;
+  const tok = arr.slice(0, 4).map((b) => b.toString(16).padStart(2, "0")).join("");
+  return arr.length > 4 ? `${tok}…` : tok;
+}
+
 function pill(cls, text) { return `<span class="pill ${esc(cls)}">${esc(text)}</span>`; }
 
 async function loadAll() {
@@ -379,7 +392,7 @@ function renderTablets() {
     return `<tr>
       <td class="mono">${esc(id)}</td>
       <td>${tableCell}</td>
-      <td class="mono">${esc(bytes(t.range && t.range.start))} → ${esc(bytes(t.range && t.range.end))}</td>
+      <td class="mono">${esc(tokenBound(t.range && t.range.start, "00000000"))} → ${esc(tokenBound(t.range && t.range.end, "ffffffff"))}</td>
       <td class="mono">${esc(t.epoch)}</td>
       <td class="mono">${esc((t.replicas || []).join(", "))}</td>
       <td>${leaderCell}</td>

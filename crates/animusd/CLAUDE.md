@@ -281,8 +281,12 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
       (S/N/B) — into both views. `tests/admin_endpoint.rs::admin_table_management_create_and_drop`
       (also asserts a numeric sort key's type reaches the catalog).
     - **Bulk seed for sharding tests.** `POST /admin/data/seed {table, count, start?,
-      key_prefix?, value_bytes?}` writes synthetic keys (`key_prefix` + zero-padded
-      index) into an **existing** `table` (ADR 0023: seeding writes into a table, it
+      key_prefix?, value_bytes?}` writes synthetic rows whose partition key is
+      `key_prefix` + zero-padded index, stored under the edges' token-prefixed
+      layout (`partition_token(escape(pk)) || escape(pk)`, `admin.rs::seed_key` —
+      ADR 0022: seeding must hash like a real write, so sequential indices spread
+      across the ring instead of piling into one tablet's tail)
+      into an **existing** `table` (ADR 0023: seeding writes into a table, it
       does not create one — a non-existent table is a `404`, looked up in the
       replicated tablet map) via the normal durable `cp_write`, with bounded
       concurrency (`SEED_CONCURRENCY`) to amortize WAL group-commit; capped at

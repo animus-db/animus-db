@@ -7,10 +7,11 @@
 //! fencing token used by the data plane (ADR 0001). Automatic split-point
 //! selection and replica rebalancing on split/merge remain future work.
 //!
-//! Each table is its own **hash ring** (ADR 0022): a data-plane key is
-//! `escape(table) || partition_token(pk) || escape(pk) || rk`, so a table's rows
-//! form one contiguous block, and *within* that block partitions are spread by
-//! the [`partition_token`] (a Murmur3 hash of the partition key). A tablet is
+//! Each table is its own **hash ring** (ADR 0022/0023): a data-plane key is
+//! `partition_token(pk) || escape(pk) || rk` — **no table prefix**; the table is
+//! tablet metadata ([`Tablet::table`]) and an explicit routing argument, and
+//! partitions are spread by the [`partition_token`] (a Murmur3 hash of the
+//! partition key). A tablet is
 //! **scoped to one table** (`Tablet::table`) and owns a contiguous `[start, end)`
 //! sub-range of that table's keyspace — a token sub-range — so the whole
 //! range/epoch/split-merge machinery is reused unchanged while load spreads
@@ -28,9 +29,9 @@ pub const TOKEN_BYTES: usize = 8;
 /// MurmurHash3 (x64, 128-bit, seed 0) — the same hash Cassandra's
 /// `Murmur3Partitioner` uses — returned big-endian so byte order equals numeric
 /// order (a [`KeyRange`] byte comparison over the token prefix then *is* a token
-/// comparison). It sits between the table prefix and the partition key in every
-/// data-plane key (`escape(table) || token || escape(pk) || rk`, ADR 0022),
-/// spreading a table's partitions evenly across that table's ring.
+/// comparison). It leads every data-plane key (`token || escape(pk) || rk`,
+/// ADR 0022/0023 — no table prefix; the table is a routing argument), spreading
+/// a table's partitions evenly across that table's ring.
 ///
 /// **Every node and every restart must agree**: the same partition key always
 /// routes to the same tablet, so this is a fixed, seedless algorithm with no

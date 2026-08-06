@@ -46,7 +46,7 @@ use std::time::Duration;
 
 use animus_env::NodeId;
 use animus_storage::WalRecordView;
-use animus_tablet::TabletId;
+use animus_tablet::{TabletId, escape, partition_token};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::net::{TcpListener, TcpStream};
@@ -699,12 +699,13 @@ const SEED_RETRY_BACKOFF: Duration = Duration::from_millis(150);
 struct SeedReq {
     /// How many keys to write this request.
     count: u64,
-    /// First index (keys are `key_prefix + zero-padded index`); the dashboard
-    /// advances this per chunk.
+    /// First index (partition keys are `key_prefix + zero-padded index`); the
+    /// dashboard advances this per chunk.
     #[serde(default)]
     start: u64,
-    /// Key prefix (default `seed:`); all seeded keys share it, so they form a
-    /// contiguous range a tablet split can bisect.
+    /// Partition-key prefix (default `seed:`). Each seeded row is token-prefixed
+    /// like any edge write (ADR 0022), so sequential indices still spread evenly
+    /// across the table's hash ring.
     #[serde(default)]
     key_prefix: Option<String>,
     /// Synthetic value size in bytes (default 64).
@@ -716,15 +717,29 @@ struct SeedReq {
     table: String,
 }
 
+/// The data-plane key for a synthetic seed row: `partition_token(escape(pk)) ||
+/// escape(pk)`, the edges' ADR 0022/0023 layout with no sort key (the DynamoDB
+/// `item_key` shape). Seeding must hash like a real write — a raw `pk` key would
+/// partition the *raw* keyspace, so sequential seed indices would all land in one
+/// tablet's tail (the exact hot-prefix skew the token exists to remove) and split
+/// boundaries would sit in raw-key space while edge writes route by token.
+fn seed_key(pk: &[u8]) -> Vec<u8> {
+    let escaped = escape(pk);
+    let mut key = partition_token(&escaped).to_vec();
+    key.extend_from_slice(&escaped);
+    key
+}
+
 /// `POST /admin/data/seed {table, count, start?, key_prefix?, value_bytes?}` —
 /// bulk-write synthetic keys to the CP plane to drive sharding tests (ADR 0021).
 /// `table` is **required** and must **already exist** (ADR 0023: seeding writes into
-/// a table, it does not create one — a non-existent table is a `404`). Keys are
-/// `key_prefix + zero-padded (start..start+count)` with a filler value; they go
-/// through the normal durable `cp_write` path (routed to the leader), written with
-/// bounded concurrency to amortize WAL group-commit. With `--auto-split` enabled,
-/// crossing the key-count threshold splits the tablet — visible live in the
-/// Tablets view.
+/// a table, it does not create one — a non-existent table is a `404`). Each row's
+/// partition key is `key_prefix + zero-padded (start..start+count)`, stored under
+/// the same token-prefixed layout the wire edges write ([`seed_key`]) with a filler
+/// value; writes go through the normal durable `cp_write` path (routed to the
+/// leader), with bounded concurrency to amortize WAL group-commit. With
+/// `--auto-split` enabled, crossing the key-count threshold splits the tablet —
+/// visible live in the Tablets view.
 async fn action_data_seed(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
     let req: SeedReq = match parse_body(body) {
         Ok(r) => r,
@@ -754,7 +769,8 @@ async fn action_data_seed(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
         let batch = (count - i).min(SEED_CONCURRENCY);
         let mut set = tokio::task::JoinSet::new();
         for j in 0..batch {
-            let key = format!("{prefix}{:012}", req.start + i + j).into_bytes();
+            let pk = format!("{prefix}{:012}", req.start + i + j);
+            let key = seed_key(pk.as_bytes());
             let val = value.clone();
             let c = ctx.clone();
             let t = table.clone();
