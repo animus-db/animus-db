@@ -78,7 +78,11 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   routing no longer depends on it). A just-proposed write is confirmed via a **local**
   read on the leader (not a quorum barrier — the leader applies only after a quorum
   commit + WAL fsync, so a local read reflecting the value means it's durable; a
-  per-write barrier would not scale under concurrent load). At node start a node
+  per-write barrier would not scale under concurrent load). The confirm loop polls
+  at a **fine adaptive interval** (`CP_CONFIRM_POLL_INIT` ~200µs, doubling to a
+  `CP_CONFIRM_POLL_MAX` 5ms ceiling), *not* the coarse 50ms `SCHEMA_POLL_INTERVAL` —
+  paired with cp-data's wake-on-propose, a lone write returns in ~1ms instead of
+  eating a fixed 50ms floor (`cp_plane.rs::single_write_latency_is_low`). At node start a node
   hosts the **bootstrap CP group** spanning the first `min(N, MAX_REPLICATION_FACTOR)`
   nodes' `raftkv` ids; a **tablet split** (Phase 2.2/2.4) then stands up additional
   co-resident groups, each backed by its own `LsmEngine` or `MemoryEngine` per

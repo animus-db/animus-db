@@ -33,8 +33,11 @@
 //! ([`RaftKvNode::start_seeded`]).
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use animus_control::raft::{Out, RaftCore, RaftMsg, StateMachine};
@@ -43,7 +46,58 @@ use animus_env::{Coresident, Env, EnvExt, NodeId};
 use animus_storage::StorageEngine;
 use futures::future::{Either, select};
 use futures::lock::Mutex as AsyncMutex;
+use futures::task::AtomicWaker;
 use serde::{Deserialize, Serialize};
+
+/// The **wake-on-propose** signal (ADR 0017 single-write-latency fix): a shared
+/// flag + executor-agnostic waker that lets a proposer (`put`/`delete`/`cas`/
+/// `propose_split`/`change_membership`) nudge the consensus loop to replicate the
+/// freshly appended entry *immediately*, instead of leaving it parked in its
+/// `select(recv, timer)` until the next ~50ms heartbeat tick.
+///
+/// [`AtomicWaker`] is deliberately executor-agnostic: it works under both
+/// `SimEnv`'s custom `ArcWake`-based executor (where the wake, running
+/// synchronously on the single thread, marks the driver task ready for the next
+/// run-loop poll — fully deterministic) and tokio's multi-threaded `ProdEnv`
+/// (where it resolves the register/wake race). No tokio-only primitive is used, so
+/// determinism under `SimEnv` is preserved.
+#[derive(Default)]
+struct ProposeSignal {
+    /// Set by a proposer, consumed (swapped false) by the consensus loop.
+    pending: AtomicBool,
+    /// The consensus loop's waker, registered each time it parks.
+    waker: AtomicWaker,
+}
+
+impl ProposeSignal {
+    /// A proposer nudges the consensus loop: raise the flag, then wake it. Order
+    /// matters — the flag is visible before the wake, so the loop's poll (which
+    /// registers *then* checks the flag) can never miss it.
+    fn notify(&self) {
+        self.pending.store(true, Ordering::Release);
+        self.waker.wake();
+    }
+}
+
+/// A future that resolves once a propose is pending, for the consensus loop's
+/// `select`. Registers the loop's waker *before* checking the flag (the
+/// [`AtomicWaker`] discipline that avoids a lost wakeup), and consumes the flag on
+/// resolve so the next park doesn't spuriously fire.
+struct ProposePending<'a> {
+    signal: &'a ProposeSignal,
+}
+
+impl Future for ProposePending<'_> {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        self.signal.waker.register(cx.waker());
+        if self.signal.pending.swap(false, Ordering::AcqRel) {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
+}
 
 /// The data plane's Raft log command: a key-value mutation (or the election
 /// no-op). Keys/values are opaque bytes; ordering + durability come from Raft.
@@ -180,6 +234,10 @@ pub struct RaftKvNode<E: Env, S: StorageEngine> {
     /// ([`is_stopped`](Self::is_stopped)) — the teardown path (drop-table GC) waits
     /// on that before deleting the engine/WAL.
     apply_stopped: Arc<AtomicBool>,
+    /// **Wake-on-propose** signal: a proposer raises it to make the consensus loop
+    /// replicate a freshly appended entry immediately, cutting single-write latency
+    /// (ADR 0017) — no waiting on the next heartbeat tick.
+    propose_signal: Arc<ProposeSignal>,
 }
 
 /// Invoked on a replica when it **applies** a committed `Split` (ADR 0017 D), with
@@ -231,6 +289,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         let apply_stopped = Arc::new(AtomicBool::new(false));
         let engine_applied = Arc::new(AtomicU64::new(0));
         let wal_lock = Arc::new(AsyncMutex::new(()));
+        let propose_signal = Arc::new(ProposeSignal::default());
         let node = Self {
             env: env.clone(),
             core: Arc::clone(&core),
@@ -242,6 +301,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             halted: Arc::clone(&halted),
             stopped: Arc::clone(&stopped),
             apply_stopped: Arc::clone(&apply_stopped),
+            propose_signal: Arc::clone(&propose_signal),
         };
         // The consensus loop recovers from the WAL, then spawns the apply task
         // (so the apply task sees the recovered core + the correct
@@ -259,6 +319,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             halted,
             stopped,
             apply_stopped,
+            propose_signal,
         }));
         node
     }
@@ -294,15 +355,28 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         self.all_nodes.len() / 2 + 1
     }
 
+    /// Propose `command` through the core and, if it was appended (leader), **wake
+    /// the consensus loop** so it replicates the new entry at once rather than
+    /// waiting for the next heartbeat tick (wake-on-propose, ADR 0017). A
+    /// `NotLeader` result appends nothing, so there is nothing to replicate — no
+    /// wake. The core lock is dropped before the notify.
+    fn propose_and_wake(&self, command: KvCommand) -> ProposeResult {
+        let result = self.lock().propose(command);
+        if matches!(result, ProposeResult::Accepted { .. }) {
+            self.propose_signal.notify();
+        }
+        result
+    }
+
     /// Propose a write to this group. Honored only on the leader (otherwise
     /// returns the leader hint); the value is durable + applied once committed.
     pub fn put(&self, key: Vec<u8>, value: Vec<u8>) -> ProposeResult {
-        self.lock().propose(KvCommand::Put { key, value })
+        self.propose_and_wake(KvCommand::Put { key, value })
     }
 
     /// Propose a delete (tombstone) to this group.
     pub fn delete(&self, key: Vec<u8>) -> ProposeResult {
-        self.lock().propose(KvCommand::Delete { key })
+        self.propose_and_wake(KvCommand::Delete { key })
     }
 
     /// Propose a **linearizable compare-and-swap**: set `key` to `value` iff the
@@ -314,7 +388,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// [`cas_result`](Self::cas_result) once that index applies — or use the
     /// all-in-one [`compare_and_swap`](Self::compare_and_swap).
     pub fn cas(&self, key: Vec<u8>, expected: Option<Vec<u8>>, value: Vec<u8>) -> ProposeResult {
-        self.lock().propose(KvCommand::Cas {
+        self.propose_and_wake(KvCommand::Cas {
             key,
             expected,
             value,
@@ -373,7 +447,11 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// the control plane drives to move a replica off a failed node onto a spare,
     /// or to grow the group as the cluster grows.
     pub fn change_membership(&self, voters: BTreeSet<NodeId>) -> ProposeResult {
-        self.lock().change_membership(voters)
+        let result = self.lock().change_membership(voters);
+        if matches!(result, ProposeResult::Accepted { .. }) {
+            self.propose_signal.notify();
+        }
+        result
     }
 
     /// The group's active Raft voter configuration.
@@ -455,7 +533,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// with [`range_snapshot`](Self::range_snapshot) data (captured before the
     /// split) and start it via [`start_seeded`](Self::start_seeded).
     pub fn propose_split(&self, at: Vec<u8>) -> ProposeResult {
-        self.lock().propose(KvCommand::Split { at })
+        self.propose_and_wake(KvCommand::Split { at })
     }
 
     /// The live `(key, value)` pairs with `key >= at` in this replica's engine —
@@ -1020,6 +1098,7 @@ struct DriveState<E: Env, S: StorageEngine> {
     halted: Arc<AtomicBool>,
     stopped: Arc<AtomicBool>,
     apply_stopped: Arc<AtomicBool>,
+    propose_signal: Arc<ProposeSignal>,
 }
 
 /// Idle back-off for the apply task: when there is nothing committed-and-durable to
@@ -1050,6 +1129,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         halted,
         stopped,
         apply_stopped,
+        propose_signal,
     } = st;
 
     let bytes = env.read(WAL).await.unwrap_or_default();
@@ -1098,9 +1178,32 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         let wait = Duration::from_nanos(deadline.0.saturating_sub(now.0));
 
         // Each step yields outbound `KvWire` messages (Raft traffic and/or a read
-        // probe ack).
-        let outs: Vec<(NodeId, KvWire)> = match select(env.recv(), env.sleep(wait)).await {
-            Either::Left((envelope, _)) => {
+        // probe ack). Three wakeup sources race: an inbound message, the Raft timer
+        // deadline, and a **wake-on-propose** signal — a proposer raising the flag so
+        // a freshly appended entry replicates at once (ADR 0017 single-write latency),
+        // treated like an immediate heartbeat (`replicate_now`) rather than waiting
+        // for the ~50ms tick.
+        let recv_or_timer = select(env.recv(), env.sleep(wait));
+        let outs: Vec<(NodeId, KvWire)> = match select(
+            ProposePending {
+                signal: &propose_signal,
+            },
+            recv_or_timer,
+        )
+        .await
+        {
+            // Wake-on-propose: ship the new entry now (leader-only; empty otherwise).
+            Either::Left(((), _)) => {
+                let raft_outs = core
+                    .lock()
+                    .expect("raftkv core poisoned")
+                    .replicate_now(env.now());
+                raft_outs
+                    .into_iter()
+                    .map(|(to, m)| (to, KvWire::Raft(m)))
+                    .collect()
+            }
+            Either::Right((Either::Left((envelope, _)), _)) => {
                 let entropy = env.next_u64();
                 match serde_json::from_slice::<KvWire>(&envelope.payload) {
                     Ok(KvWire::Raft(msg)) => {
@@ -1139,7 +1242,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
                     }
                 }
             }
-            Either::Right(((), _)) => {
+            Either::Right((Either::Right(((), _)), _)) => {
                 let entropy = env.next_u64();
                 let raft_outs = core
                     .lock()

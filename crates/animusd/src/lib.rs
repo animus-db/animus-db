@@ -1594,6 +1594,7 @@ impl ClientCtx {
         match leader.put(key.clone(), value.clone()) {
             ProposeResult::Accepted { .. } => {
                 let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
+                let mut poll = CP_CONFIRM_POLL_INIT;
                 loop {
                     if leader.local_get(&key).await.as_deref() == Some(value.as_slice()) {
                         return Ok(());
@@ -1601,7 +1602,8 @@ impl ClientCtx {
                     if tokio::time::Instant::now() >= deadline {
                         return Err("CP write did not commit in time".into());
                     }
-                    tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+                    tokio::time::sleep(poll).await;
+                    poll = (poll * 2).min(CP_CONFIRM_POLL_MAX);
                 }
             }
             ProposeResult::NotLeader { .. } => Err("CP group leader moved; retry".into()),
@@ -1616,6 +1618,7 @@ impl ClientCtx {
         match leader.delete(key.clone()) {
             ProposeResult::Accepted { .. } => {
                 let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
+                let mut poll = CP_CONFIRM_POLL_INIT;
                 loop {
                     if leader.local_get(&key).await.is_none() {
                         return Ok(());
@@ -1623,7 +1626,8 @@ impl ClientCtx {
                     if tokio::time::Instant::now() >= deadline {
                         return Err("CP delete did not commit in time".into());
                     }
-                    tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+                    tokio::time::sleep(poll).await;
+                    poll = (poll * 2).min(CP_CONFIRM_POLL_MAX);
                 }
             }
             ProposeResult::NotLeader { .. } => Err("CP group leader moved; retry".into()),
@@ -2669,6 +2673,18 @@ const SCHEMA_COMMIT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Poll interval while waiting for a proposed schema command to commit / for a
 /// leader to settle so the proposal can be (re)submitted.
 const SCHEMA_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Initial poll granularity while a CP **write/delete** waits for its value to
+/// become locally durable+applied on the leader (the durable-before-ack confirm in
+/// [`ClientCtx::cp_put_local`]/[`cp_delete_local`](ClientCtx::cp_delete_local)).
+/// Far finer than [`SCHEMA_POLL_INTERVAL`]: paired with the cp-data
+/// wake-on-propose, a write that commits+applies in a few ms now returns in ~1ms
+/// instead of eating a fixed 50ms poll floor.
+const CP_CONFIRM_POLL_INIT: Duration = Duration::from_micros(200);
+/// Cap for the CP-confirm poll's exponential back-off: a fast write returns after a
+/// sub-ms poll, but a slow/contended write backs off to this ceiling rather than
+/// busy-spinning the CPU while it waits.
+const CP_CONFIRM_POLL_MAX: Duration = Duration::from_millis(5);
 
 impl ClientCtx {
     /// The replicated schema for `table` (the control plane's `ks.table`-keyed
