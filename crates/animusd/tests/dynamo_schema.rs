@@ -20,7 +20,9 @@
 //!   machinery from the replicated definition).
 //! - `create_table_index_survives_node_restart` proves the GSI definition survives a
 //!   restart (Raft WAL): after the registry is wiped, a GSI `Query` still works,
-//!   recovered from the replicated catalog, not process-local memory.
+//!   recovered from the replicated catalog, not process-local memory — and returns
+//!   the **pre-restart item without re-writing it** (the first index query lazily
+//!   backfills the edge-local entry data from a base-table scan).
 //! - `extended_surface` mirrors `dynamo_extended.rs`: a 3-node in-process cluster
 //!   exercises UpdateItem, BatchWriteItem, TransactWriteItems, a document-path
 //!   projection, and a `KEYS_ONLY` GSI projection.
@@ -541,18 +543,13 @@ async fn create_table_index_survives_node_restart() {
         "expected ResourceInUseException, got: {body}"
     );
 
-    // A GSI Query must work after the restart. The in-memory index entries are
-    // rebuilt from observed writes, so re-put the item, then query the index — the
-    // edge knew the index from the recovered catalog (mirror_catalog_schema →
-    // sync_indexes), not from any process-local CreateTable state.
-    let (status, _) = dynamo(
-        dynamo_addr,
-        "DynamoDB_20120810.PutItem",
-        r#"{"TableName":"users","Item":{"id":{"S":"u1"},"email":{"S":"a@x"},"v":{"N":"7"}}}"#,
-    )
-    .await;
-    assert_eq!(status, 200);
-
+    // A GSI Query must work after the restart — **without re-writing anything**:
+    // the edge rebuilds the index *machinery* from the recovered catalog
+    // (mirror_catalog_schema → sync_indexes), and the first index query lazily
+    // **backfills** the entry data from a base-table scan of the durably stored
+    // items (previously the entries were rebuilt only from writes observed by
+    // this process, so a post-restart index query silently returned nothing
+    // until the item was re-put).
     let (status, body) = dynamo(
         dynamo_addr,
         "DynamoDB_20120810.Query",

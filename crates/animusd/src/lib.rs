@@ -36,7 +36,7 @@ pub use config::ClusterConfig;
 // cluster metadata — membership status and the tablet map — without depending on
 // `animus-control` directly.
 pub use animus_control::{
-    ColumnType, MetaCommand, Metadata, NodeStatus, ReplicationMode, TableSchema,
+    ColumnDef, ColumnType, MetaCommand, Metadata, NodeStatus, ReplicationMode, TableSchema,
 };
 
 mod admin;
@@ -195,13 +195,31 @@ impl CpGroup {
 
     /// This node's live `(key, value)` pairs for the group, in key order, from the
     /// **local** engine (no quorum barrier). Meaningful on the leader (its committed
-    /// state); the auto-split loop uses it as a cheap size signal + to pick a median
-    /// split key (Phase 2.4). See [`RaftKvNode::range_snapshot`].
+    /// state); the auto-split loop materializes it to confirm an over-threshold
+    /// tablet + pick a median split key (Phase 2.4) — gated behind
+    /// [`approx_key_count`](Self::approx_key_count), since this reads the whole
+    /// tablet. See [`RaftKvNode::range_snapshot`].
     async fn local_pairs(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
         match self {
             CpGroup::Lsm(n) => n.range_snapshot(&[]).await,
             CpGroup::Mem(n) => n.range_snapshot(&[]).await,
         }
+    }
+
+    /// A cheap, non-materializing key-count **(over-)estimate** for the auto-split
+    /// gate (Phase 2.4): the memtable's key count (exact for data still in the
+    /// memtable — the common case for a not-yet-split tablet) plus the SSTable
+    /// bytes over a deliberately small assumed entry size, so the estimate errs
+    /// toward *over*-counting — a tablet that might need splitting gets confirmed
+    /// by a real count rather than silently missed. `None` on the memory backend
+    /// (no cheap counter); the caller falls back to its slow confirm cadence.
+    fn approx_key_count(&self) -> Option<usize> {
+        let (memtable_keys, _bytes) = self.lsm_memtable()?;
+        let sst_bytes: u64 = self.lsm_sstables()?.iter().map(|v| v.file_size).sum();
+        Some(
+            memtable_keys
+                + usize::try_from(sst_bytes / AUTO_SPLIT_EST_ENTRY_BYTES).unwrap_or(usize::MAX),
+        )
     }
 
     /// The first `limit` live `(key, value)` pairs with `key >= start`, in key
@@ -555,6 +573,9 @@ fn is_relayable_command(command: &MetaCommand) -> bool {
         command,
         MetaCommand::CreateTableSchema { .. }
             | MetaCommand::DropTableSchema { .. }
+            // Atomic `ALTER TABLE` (in-place schema replacement): a follower-
+            // connected ALTER must relay like the create/drop it replaces.
+            | MetaCommand::ReplaceTableSchema { .. }
             | MetaCommand::CreateTableIndex { .. }
             | MetaCommand::DropTableIndex { .. }
             | MetaCommand::SetTableMode { .. }
@@ -2682,13 +2703,25 @@ const AUTO_SPLIT_INTERVAL: Duration = Duration::from_secs(2);
 /// then halves below the threshold, so it won't re-trigger anyway, but this guards
 /// the in-flight window against a duplicate trigger).
 const AUTO_SPLIT_COOLDOWN: Duration = Duration::from_secs(15);
+/// Assumed bytes per SSTable entry when converting on-disk bytes into the
+/// auto-split gate's key-count **estimate** ([`CpGroup::approx_key_count`]).
+/// Deliberately small (real entries are larger), so bytes ÷ this *over*-estimates
+/// the key count — the gate then errs toward confirming with a real count rather
+/// than missing a split. The periodic confirm (one full count per tablet per
+/// [`AUTO_SPLIT_COOLDOWN`]) bounds the miss window even if compression pushes a
+/// table's real bytes-per-entry below this.
+const AUTO_SPLIT_EST_ENTRY_BYTES: u64 = 32;
 
 /// The leader-driven **automatic split trigger** (Phase 2.4): on each tick, for
-/// every tablet whose CP group this node currently **leads**, read the leader's
-/// local key count (a cheap size signal) and, if it exceeds `threshold`, propose a
-/// split at the **median** key — bisecting the tablet so each half holds roughly
-/// half the keys. Per-tablet cooldown avoids a duplicate trigger while a split is
-/// in flight; once it applies, the parent's key count halves below the threshold.
+/// every tablet whose CP group this node currently **leads**, take the leader's
+/// **cheap key-count estimate** ([`CpGroup::approx_key_count`] — memtable count +
+/// SSTable bytes, no materialization) and only when it says the tablet might
+/// exceed `threshold` (or on a slow per-tablet confirm cadence) materialize the
+/// live pairs once — the authoritative count *and*, if over threshold, the
+/// **median** split key come from that one snapshot. A split bisects the tablet so
+/// each half holds roughly half the keys. Per-tablet cooldown avoids a duplicate
+/// trigger while a split is in flight; once it applies, the parent's key count
+/// halves below the threshold.
 ///
 /// Only the node hosting a tablet's leader reads `local_pairs`/triggers, so in a
 /// one-process-per-node deployment exactly one node triggers. (In a single
@@ -2702,6 +2735,9 @@ const AUTO_SPLIT_COOLDOWN: Duration = Duration::from_secs(15);
 /// (so it never perturbs clusters that don't opt in).
 async fn auto_split_loop(ctx: ClientCtx, threshold: usize) {
     let mut last_triggered: BTreeMap<TabletId, tokio::time::Instant> = BTreeMap::new();
+    // When each tablet last had a *full* (materializing) count — the expensive
+    // confirm is rate-limited per tablet, not run every tick.
+    let mut last_counted: BTreeMap<TabletId, tokio::time::Instant> = BTreeMap::new();
     loop {
         tokio::time::sleep(AUTO_SPLIT_INTERVAL).await;
         let tablets: Vec<TabletId> = ctx.raft.metadata().tablets.keys().copied().collect();
@@ -2716,7 +2752,26 @@ async fn auto_split_loop(ctx: ClientCtx, threshold: usize) {
             let Some(leader) = ctx.edge.cp_leader(tablet) else {
                 continue;
             };
+            // Cheap per-tick gate: materializing every led tablet's live pairs
+            // every tick is O(total data) per 2s — instead, take the free
+            // (over-)estimate and only materialize when it says the tablet might
+            // exceed the threshold, or on a slow per-tablet confirm cadence
+            // (bounded by `AUTO_SPLIT_COOLDOWN`) that corrects estimate error
+            // (compression can push real bytes-per-entry below the assumed size;
+            // the memory backend has no estimate at all).
+            let due_confirm = last_counted
+                .get(&tablet)
+                .is_none_or(|at| at.elapsed() >= AUTO_SPLIT_COOLDOWN);
+            let hot = leader
+                .approx_key_count()
+                .is_some_and(|estimate| estimate > threshold);
+            if !hot && !due_confirm {
+                continue;
+            }
+            // Materialize once: the authoritative count and, if over threshold,
+            // the median split key come from the same snapshot.
             let pairs = leader.local_pairs().await;
+            last_counted.insert(tablet, tokio::time::Instant::now());
             if pairs.len() <= threshold {
                 continue;
             }
@@ -2842,17 +2897,6 @@ impl ClientCtx {
     /// Whether `table` has a replicated schema (cached `Metadata`, ADR 0013).
     pub(crate) fn has_table_schema(&self, table: &str) -> bool {
         self.raft.metadata().has_table_schema(table)
-    }
-
-    /// Whether any replicated table name starts with `prefix`. Used by the CQL
-    /// edge to recognize a keyspace (keyed `ks.table`) as existing because it has
-    /// at least one table, even across a restart (keyspaces are not separately
-    /// replicated — ADR 0013).
-    pub(crate) fn has_table_schema_with_prefix(&self, prefix: &str) -> bool {
-        self.raft
-            .metadata()
-            .table_schemas()
-            .any(|(name, _)| name.starts_with(prefix))
     }
 
     /// Whether `keyspace` is registered in the replicated catalog (v1 A3) — the
@@ -3054,14 +3098,48 @@ impl ClientCtx {
             })
     }
 
+    /// **Atomically replace** `table`'s schema in the replicated catalog
+    /// (`MetaCommand::ReplaceTableSchema`) and wait until the replacement is
+    /// visible here — the CQL `ALTER TABLE … ADD` sink. One command, one apply:
+    /// unlike the former drop-then-recreate, there is no window in which the
+    /// table is schema-less (a crash between the two commands stranded it).
+    /// Routes to the leader exactly as
+    /// [`create_table_schema`](Self::create_table_schema); idempotent (replacing
+    /// with an identical schema is a state-machine no-op that still satisfies the
+    /// visibility check). Errors if the table has no schema (the state machine
+    /// rejects — an ALTER cannot create a table) or on commit timeout.
+    pub(crate) async fn replace_table_schema(
+        &self,
+        table: String,
+        schema: TableSchema,
+    ) -> Result<(), String> {
+        let command = MetaCommand::ReplaceTableSchema {
+            table: table.clone(),
+            schema: schema.clone(),
+        };
+        self.propose_and_await(command, SCHEMA_COMMIT_TIMEOUT, || {
+            (self.table_schema(&table).as_ref() == Some(&schema)).then_some(())
+        })
+        .await
+        .map_err(|()| {
+            format!(
+                "ALTER TABLE `{table}` did not commit within {}s \
+                 (no control-plane leader reachable, or the table has no schema?)",
+                SCHEMA_COMMIT_TIMEOUT.as_secs()
+            )
+        })
+    }
+
     /// Drop `table` **and garbage-collect its data** (ADR 0024): remove the
     /// schema from the replicated catalog, then remove the table's tablets from
     /// the replicated tablet map — the trigger each hosting node's
     /// [`cp_gc_loop`] converges on by stopping its local group and deleting its
     /// engine + WAL files. This is the real `DROP TABLE` sink (CQL + the admin
     /// dashboard); [`drop_table_schema`](Self::drop_table_schema) alone remains
-    /// the schema-only primitive `ALTER TABLE` uses for its drop-then-recreate —
-    /// an ALTER must never GC the table's data. Returns once both the schema and
+    /// the schema-only primitive (the admin panel's schema-only drop) — an
+    /// `ALTER TABLE` now mutates the schema in place via
+    /// [`replace_table_schema`](Self::replace_table_schema) and never GCs data.
+    /// Returns once both the schema and
     /// the tablets have left this node's replicated metadata; the per-node file
     /// reclamation continues asynchronously on every replica.
     pub(crate) async fn drop_table(&self, table: String) -> Result<(), String> {
@@ -3099,9 +3177,10 @@ impl ClientCtx {
     /// from the replicated catalog (ADR 0013). Idempotent: dropping an absent
     /// table returns `Ok(())` immediately. Routes to the leader exactly as
     /// [`create_table_schema`](Self::create_table_schema). Schema-only: does
-    /// **not** touch the table's tablets/data — `ALTER TABLE` relies on that for
-    /// its drop-then-recreate; a real drop goes through
-    /// [`drop_table`](Self::drop_table).
+    /// **not** touch the table's tablets/data (the admin panel's schema-only
+    /// drop uses this); a real drop goes through [`drop_table`](Self::drop_table)
+    /// and an `ALTER TABLE` replaces in place via
+    /// [`replace_table_schema`](Self::replace_table_schema).
     pub(crate) async fn drop_table_schema(&self, table: String) -> Result<(), String> {
         if !self.has_table_schema(&table) {
             return Ok(());

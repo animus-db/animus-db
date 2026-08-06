@@ -159,8 +159,11 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
 - **Drop-table GC (ADR 0024) is the join-host loop's dual.** The real drop sink is
   `ClientCtx::drop_table` (CQL `DROP TABLE` + admin `/admin/data/drop-table`):
   `DropTableSchema` then `DropTableTablets`. **`drop_table_schema` stays
-  schema-only** — CQL `ALTER TABLE` uses it for drop-then-recreate, and an ALTER
-  must never GC data. The per-node `cp_gc_loop` then reclaims any tablet in this
+  schema-only** (the admin panel's schema-only drop). CQL `ALTER TABLE … ADD` no
+  longer drops at all: it mutates the schema **in place, atomically** via
+  `MetaCommand::ReplaceTableSchema` (`ClientCtx::replace_table_schema`) — the old
+  drop-then-recreate could strand the table schema-less if a crash landed between
+  the two commands — and an ALTER must never GC data. The per-node `cp_gc_loop` then reclaims any tablet in this
   node's `minted` set that is absent from `Metadata.tablets`: unregister *this
   node's* handle (`unregister_raftkv(tablet, member)` — the shared `--cluster N`
   edge holds every node's handles, so match by the handle env's member id),
@@ -221,9 +224,14 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   (called on the read/write paths too), so a freshly restarted node — or a follower
   that never saw the `CreateTable` — rebuilds its index machinery from
   `Metadata::table_indexes`, not process-local memory. Only the index *entry data*
-  (the `escape(hash)||…||base_key` index) stays in-memory, rebuilt from observed
-  `note_put`/`note_delete` writes (proven in `tests/dynamo_schema.rs`'s
-  `create_table_index_replicates_to_second_node` / `…_survives_node_restart`).
+  (the `escape(hash)||…||base_key` index) stays in-memory, maintained from observed
+  `note_put`/`note_delete` writes (O(log n) per write via a base-key→entry reverse
+  map) and **lazily backfilled on the first index query** against freshly-created
+  index machinery (`dynamo.rs::backfill_index_if_needed`: one base-table scan
+  replayed through `note_put`, then `mark_table_backfilled`) — so a GSI query
+  returns pre-restart items without re-writing them (proven in
+  `tests/dynamo_schema.rs`'s `create_table_index_replicates_to_second_node` /
+  `…_survives_node_restart`).
   **Base-table `Query`/`Scan` use the CP plane's linearizable range scan**
   (`ClientCtx::cp_scan` → `RaftKvNode::linearizable_scan`) over a contiguous key
   range (a partition prefix for `Query`, the whole-table prefix for `Scan`),
@@ -404,6 +412,20 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   `attribute_not_exists` puts on one node could both pass; regression in
   `tests/dynamo_extended.rs::concurrent_conditional_puts_one_wins`.) Cross-node
   atomicity (a CAS on the CP group) is later v1 work.
+- **The wire edges snapshot the replicated `Metadata` once per request**
+  (`dynamo.rs::run_operation` takes `let meta = &metadata(ctx)` and threads
+  `&Metadata` through the helpers) — `RaftNode::metadata()` deep-clones under a
+  lock, and a single request used to re-clone it 2+ times. Two rules keep the
+  snapshot sound: (1) a path that must observe *fresh* state (the `CreateTable`
+  commit-wait polls, the post-commit `mirror_catalog_schema`) reads live; and
+  (2) **an existence gate that short-circuits a linearizable read must not
+  conclude "absent" from the request-entry snapshot** — `quorum_read`'s
+  "no tablet ⇒ no data" gate re-checks *live* on the snapshot-miss path, because
+  a concurrent first write can provision the tablet after the request began, and
+  under the `rmw_lock` a conditional writer's read must see it (two racing
+  `attribute_not_exists` puts both succeeded when the gate trusted the snapshot —
+  caught by `dynamo_extended.rs::concurrent_conditional_puts_one_wins`). Trust
+  the snapshot on the hit path; re-verify on the miss path.
 - Two run modes: `--cluster N` (whole cluster in one process, dev convenience)
   and `--config FILE --node I` (one node per process — real deployment). Both
   share `Node::bind`/`start`; only address/peer assembly differs.

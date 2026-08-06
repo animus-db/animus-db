@@ -155,6 +155,18 @@ pub enum MetaCommand {
     /// Remove a table's schema from the catalog (ADR 0013). Idempotent: a no-op
     /// if no schema is registered for `table`.
     DropTableSchema { table: TableName },
+    /// **Atomically replace** an existing table's schema (ADR 0013) — the in-place
+    /// schema mutation behind CQL `ALTER TABLE … ADD` (which appends columns to
+    /// the current schema and replaces it wholesale). One command, one apply: no
+    /// drop-then-recreate window in which a crash — or any reader of a replica
+    /// that applied the drop but not yet the recreate — sees the table
+    /// schema-less. Rejected if `table` has no schema (an ALTER cannot create a
+    /// table) or if the replacement is malformed; a no-op if the schema is already
+    /// identical (so a re-proposed ALTER does not churn the log).
+    ReplaceTableSchema {
+        table: TableName,
+        schema: TableSchema,
+    },
     /// Remove **every tablet scoped to `table`** from the tablet map, with their
     /// placement policies (ADR 0024 drop-table GC — the metadata half; each
     /// hosting node's GC loop reclaims its local group + engine files once the
@@ -413,6 +425,19 @@ impl Metadata {
                     ApplyOutcome::NoOp
                 }
             }
+            MetaCommand::ReplaceTableSchema { table, schema } => {
+                let Some(existing) = self.schemas.get(table) else {
+                    return ApplyOutcome::Rejected("no schema to replace for table");
+                };
+                if schema.validate().is_err() {
+                    return ApplyOutcome::Rejected("malformed table schema");
+                }
+                if existing == schema {
+                    return ApplyOutcome::NoOp;
+                }
+                self.schemas.insert(table.clone(), schema.clone());
+                ApplyOutcome::Applied
+            }
             MetaCommand::DropTableTablets { table } => {
                 let dropped: Vec<TabletId> =
                     self.tablets_for_table(table).map(|(&id, _)| id).collect();
@@ -585,6 +610,71 @@ impl crate::raft::StateMachine<MetaCommand> for Metadata {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schema::{ColumnDef, ColumnType};
+
+    /// `ReplaceTableSchema` (the atomic `ALTER TABLE` primitive): replaces an
+    /// existing table's schema in **one apply** — rejected when there is no schema
+    /// to replace (an ALTER cannot create a table) or when the replacement is
+    /// malformed; a no-op when identical (a re-proposed ALTER does not churn the
+    /// log). At no point between commands can a reader see the table schema-less
+    /// (the failure mode of the old drop-then-recreate).
+    #[test]
+    fn replace_table_schema_is_atomic_and_validated() {
+        let mut m = Metadata::default();
+        let base = TableSchema::simple("pk", ColumnType::String);
+
+        // No schema yet: replace is rejected (not an upsert).
+        assert_eq!(
+            m.apply(&MetaCommand::ReplaceTableSchema {
+                table: "ks.users".to_owned(),
+                schema: base.clone(),
+            }),
+            ApplyOutcome::Rejected("no schema to replace for table")
+        );
+
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTableSchema {
+                table: "ks.users".to_owned(),
+                schema: base.clone(),
+            }),
+            ApplyOutcome::Applied
+        );
+
+        // Replacing with an identical schema is a no-op.
+        assert_eq!(
+            m.apply(&MetaCommand::ReplaceTableSchema {
+                table: "ks.users".to_owned(),
+                schema: base.clone(),
+            }),
+            ApplyOutcome::NoOp
+        );
+
+        // The ALTER shape: the current schema with a column appended, in one apply.
+        let mut extended = base.clone();
+        extended
+            .columns
+            .push(ColumnDef::new("age", ColumnType::Number));
+        assert_eq!(
+            m.apply(&MetaCommand::ReplaceTableSchema {
+                table: "ks.users".to_owned(),
+                schema: extended.clone(),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(m.schemas.get("ks.users"), Some(&extended));
+
+        // A malformed replacement is rejected and the schema is untouched.
+        let malformed = TableSchema::with_columns("pk", Vec::new(), Vec::new());
+        assert!(malformed.validate().is_err(), "test premise");
+        assert_eq!(
+            m.apply(&MetaCommand::ReplaceTableSchema {
+                table: "ks.users".to_owned(),
+                schema: malformed,
+            }),
+            ApplyOutcome::Rejected("malformed table schema")
+        );
+        assert_eq!(m.schemas.get("ks.users"), Some(&extended));
+    }
 
     /// `RegisterCpAddr` records a CP member's address, updates on change, and is a
     /// no-op when re-registering the same address (Phase 2 address distribution).
