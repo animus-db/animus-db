@@ -256,11 +256,11 @@ function baseFor(addr) {
   return "http://" + h + (port ? ":" + port : "");
 }
 
-// URL-safe, '='-padded base64 of a byte array — the same encoding the server
-// uses for binary partition tokens (admin.rs::token_base64).
+// Unpadded base64url of a byte array — the same encoding the server uses for
+// binary partition tokens (admin.rs::token_base64).
 function b64url(arr) {
   return btoa(arr.map((b) => String.fromCharCode(b)).join(""))
-    .replace(/\+/g, "-").replace(/\//g, "_");
+    .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
 // Render a byte sequence (JSON array of u8, or a string) for humans. Mirrors the
@@ -408,7 +408,7 @@ function renderTablets() {
     return `<tr>
       <td class="mono">${esc(id)}</td>
       <td>${tableCell}</td>
-      <td class="mono">${esc(tokenBound(t.range && t.range.start, "AAAAAAAAAAA="))} → ${esc(tokenBound(t.range && t.range.end, "__________8="))}</td>
+      <td class="mono">${esc(tokenBound(t.range && t.range.start, "AAAAAAAAAAA"))} → ${esc(tokenBound(t.range && t.range.end, "__________8"))}</td>
       <td class="mono">${esc(t.epoch)}</td>
       <td class="mono">${esc((t.replicas || []).join(", "))}</td>
       <td>${leaderCell}</td>

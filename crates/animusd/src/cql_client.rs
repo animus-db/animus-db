@@ -181,14 +181,14 @@ fn render_cell(ty: Option<CqlType>, raw: &[u8]) -> Value {
     }
 }
 
-/// A human-readable rendering of a decoded cell value. Blobs render as base64
-/// (matching the DynamoDB `B` JSON convention — this is a JSON proxy response,
-/// not CQL text, where a blob would be a `0x` literal); everything else uses the
-/// value's canonical CQL text form ([`CqlValue::display`] — UUIDs keep the
-/// standard hyphenated form).
+/// A human-readable rendering of a decoded cell value. Blobs render as unpadded
+/// base64url (the display convention across the admin/dashboard surfaces — this
+/// is a JSON proxy response, not CQL text, where a blob would be a `0x`
+/// literal); everything else uses the value's canonical CQL text form
+/// ([`CqlValue::display`] — UUIDs keep the standard hyphenated form).
 fn render_value(v: &CqlValue) -> String {
     match v {
-        CqlValue::Blob(b) => animus_dynamo::wire::base64_encode(b),
+        CqlValue::Blob(b) => animus_dynamo::wire::base64url_encode(b),
         other => other.display(),
     }
 }
