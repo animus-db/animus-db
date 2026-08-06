@@ -51,6 +51,7 @@ use animus_tablet::{TOKEN_BYTES, TabletId, escape, partition_token};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::net::{TcpListener, TcpStream};
+use tracing::Instrument;
 
 use crate::http;
 use crate::{ClientCtx, ClientResponse};
@@ -776,53 +777,77 @@ async fn action_data_seed(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
     }
     let value = vec![b'x'; value_bytes];
 
-    let mut written = 0u64;
-    let mut first_err: Option<String> = None;
-    let mut i = 0u64;
-    // Bound each batch by entry count *and* raw bytes (see `SEED_BATCH_MAX_BYTES`:
-    // the forwarded `PutBatch` frame must stay under `MAX_FRAME_LEN`). ~64 B of
-    // key overhead per entry (token + escaped pk); at least one entry per batch.
-    let per_entry = value_bytes + 64;
-    let max_by_bytes = (SEED_BATCH_MAX_BYTES / per_entry).max(1) as u64;
-    while i < count {
-        let chunk = (count - i).min(SEED_BATCH_SIZE).min(max_by_bytes);
-        // Build the chunk's `(key, value)` pairs and commit them as **one Batch
-        // entry per tablet** (`cp_batch_write` groups by tablet) — one consensus
-        // round for the whole chunk instead of one per key.
-        let entries: Vec<(Vec<u8>, Vec<u8>)> = (0..chunk)
-            .map(|j| {
-                let pk = format!("{prefix}{:012}", req.start + i + j);
-                (seed_key(pk.as_bytes()), value.clone())
-            })
-            .collect();
-        // Retry transient failures. A batch racing a tablet **split** may route to
-        // the parent and be truncated/tombstoned (the upper range moved to the new
-        // child); a retry re-groups against the settled tablet map and re-routes to
-        // the elected child. Idempotent (same keys+value, per-key LWW at the entry's
-        // index), so retrying is safe.
-        let mut last: Result<(), String> = Ok(());
-        for attempt in 0..SEED_WRITE_ATTEMPTS {
-            match ctx.cp_batch_write(&table, entries.clone()).await {
-                Ok(()) => {
-                    last = Ok(());
-                    break;
-                }
-                Err(e) => {
-                    last = Err(e);
-                    if attempt + 1 < SEED_WRITE_ATTEMPTS {
-                        tokio::time::sleep(SEED_RETRY_BACKOFF).await;
+    // ADR 0027: the seeder emulates a client issuing many `PutBatch` requests,
+    // but calls `cp_batch_write` directly rather than going through
+    // `handle_client` — so without a span here, `cp_forward`'s
+    // `otel::current_traceparent()` has no active context to inject when a
+    // batch forwards to another node, and the seed is invisible in a trace
+    // backend no matter how much data it writes. One root span per request
+    // (not per batch) mirrors a `client_request` span's granularity.
+    let span = tracing::info_span!("admin_seed", table = %table, count, start = req.start);
+    let seed_result: (u64, Option<String>) = async {
+        let mut written = 0u64;
+        let mut first_err: Option<String> = None;
+        let mut i = 0u64;
+        // Bound each batch by entry count *and* raw bytes (see `SEED_BATCH_MAX_BYTES`:
+        // the forwarded `PutBatch` frame must stay under `MAX_FRAME_LEN`). ~64 B of
+        // key overhead per entry (token + escaped pk); at least one entry per batch.
+        let per_entry = value_bytes + 64;
+        let max_by_bytes = (SEED_BATCH_MAX_BYTES / per_entry).max(1) as u64;
+        while i < count {
+            let chunk = (count - i).min(SEED_BATCH_SIZE).min(max_by_bytes);
+            // Build the chunk's `(key, value)` pairs and commit them as **one Batch
+            // entry per tablet** (`cp_batch_write` groups by tablet) — one consensus
+            // round for the whole chunk instead of one per key.
+            let entries: Vec<(Vec<u8>, Vec<u8>)> = (0..chunk)
+                .map(|j| {
+                    let pk = format!("{prefix}{:012}", req.start + i + j);
+                    (seed_key(pk.as_bytes()), value.clone())
+                })
+                .collect();
+            // One child span per chunk (covering all its retry attempts) — gives a
+            // trace backend per-batch visibility into forwarding/retries, the same
+            // way a real client's individual `PutBatch` requests would.
+            let batch_span =
+                tracing::info_span!("admin_seed_batch", start_index = req.start + i, len = chunk);
+            let last: Result<(), String> = async {
+                // Retry transient failures. A batch racing a tablet **split** may
+                // route to the parent and be truncated/tombstoned (the upper range
+                // moved to the new child); a retry re-groups against the settled
+                // tablet map and re-routes to the elected child. Idempotent (same
+                // keys+value, per-key LWW at the entry's index), so retrying is safe.
+                let mut last: Result<(), String> = Ok(());
+                for attempt in 0..SEED_WRITE_ATTEMPTS {
+                    match ctx.cp_batch_write(&table, entries.clone()).await {
+                        Ok(()) => {
+                            last = Ok(());
+                            break;
+                        }
+                        Err(e) => {
+                            last = Err(e);
+                            if attempt + 1 < SEED_WRITE_ATTEMPTS {
+                                tokio::time::sleep(SEED_RETRY_BACKOFF).await;
+                            }
+                        }
                     }
                 }
+                last
             }
-        }
-        match last {
-            Ok(()) => written += chunk,
-            Err(e) => {
-                first_err.get_or_insert(e);
+            .instrument(batch_span)
+            .await;
+            match last {
+                Ok(()) => written += chunk,
+                Err(e) => {
+                    first_err.get_or_insert(e);
+                }
             }
+            i += chunk;
         }
-        i += chunk;
+        (written, first_err)
     }
+    .instrument(span)
+    .await;
+    let (written, first_err) = seed_result;
 
     // All writes failing is a server error; a partial failure still reports what
     // landed (so the dashboard can surface it without losing the count).
