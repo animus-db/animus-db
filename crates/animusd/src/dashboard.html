@@ -202,7 +202,8 @@ SELECT * FROM t WHERE id = 1;"></textarea>
       <h2>Bulk seed (sharding test)</h2>
       <div class="muted" style="margin-bottom:8px">Writes synthetic keys into an <b>existing</b> table to grow its tablet (create the table first in the Dynamo or CQL panel). Run the cluster with <code>--auto-split K</code> to watch tablets split in the Tablets tab as the count crosses K.</div>
       <div class="row">
-        <label>table</label><input type="text" id="seed-table" value="seed" style="width:7em">
+        <label>table</label><select id="seed-table"></select>
+        <span class="muted" id="seed-no-tables" style="display:none">create a table first</span>
         <label>key prefix</label><input type="text" id="seed-prefix" value="seed:" style="width:7em">
         <label>value bytes</label><input type="text" id="seed-vbytes" value="64" style="width:5em">
         <label>total</label><input type="text" id="seed-total" value="10000" style="width:7em">
@@ -255,30 +256,43 @@ function baseFor(addr) {
   return "http://" + h + (port ? ":" + port : "");
 }
 
-// Render a byte sequence (JSON array of u8, or a string) for humans.
+// Unpadded base64url of a byte array — the same encoding the server uses for
+// binary partition tokens (admin.rs::token_base64).
+function b64url(arr) {
+  return btoa(arr.map((b) => String.fromCharCode(b)).join(""))
+    .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+// Render a byte sequence (JSON array of u8, or a string) for humans. Mirrors the
+// server's key_display (admin.rs): a key with a binary 8-byte token prefix shows
+// as <token-base64>:<remainder as text>; any other binary sequence shows whole as
+// URL-safe base64.
 function bytes(v) {
   if (v == null) return "∞";
   if (typeof v === "string") return v === "" ? "«start»" : v;
   if (Array.isArray(v)) {
     if (v.length === 0) return "«start»";
-    const printable = v.every((b) => b >= 32 && b < 127);
-    return printable ? v.map((b) => String.fromCharCode(b)).join("")
-                     : v.map((b) => b.toString(16).padStart(2, "0")).join("");
+    const printable = (b) => b >= 32 && b < 127;
+    if (v.every(printable)) return v.map((b) => String.fromCharCode(b)).join("");
+    if (v.length >= 8 && !v.slice(0, 8).every(printable)) {
+      return b64url(v.slice(0, 8)) + ":" + v.slice(8).map((b) => String.fromCharCode(b)).join("");
+    }
+    return b64url(v);
   }
   return String(v);
 }
 
 // A tablet range boundary on the hash ring (ADR 0022): the first 8 key bytes are
-// the big-endian Murmur3 partition token. The top 4 bytes (8 hex digits) locate a
-// boundary on the ring precisely enough for the tablets view, so show just those;
-// "…" marks elided bytes. An empty start / null end is the ring's edge — the
-// caller passes 00000000 / ffffffff.
+// the big-endian Murmur3 partition token, shown as URL-safe base64 — matching the
+// token prefix in the key views, so a boundary can be eyeballed against browsed
+// keys; "…" marks elided bytes past the token. An empty start / null end is the
+// ring's edge — the caller passes the all-00 / all-ff token.
 function tokenBound(v, fill) {
   if (v == null || v === "") return fill;
   const arr = Array.isArray(v) ? v : Array.from(String(v), (c) => c.charCodeAt(0) & 0xff);
   if (arr.length === 0) return fill;
-  const tok = arr.slice(0, 4).map((b) => b.toString(16).padStart(2, "0")).join("");
-  return arr.length > 4 ? `${tok}…` : tok;
+  const tok = b64url(arr.slice(0, 8));
+  return arr.length > 8 ? `${tok}…` : tok;
 }
 
 function pill(cls, text) { return `<span class="pill ${esc(cls)}">${esc(text)}</span>`; }
@@ -327,6 +341,7 @@ function render() {
   renderTablets();
   renderStorageSelectors();
   renderDynamoTables();
+  renderSeedTables();
 }
 
 function renderNodes() {
@@ -393,7 +408,7 @@ function renderTablets() {
     return `<tr>
       <td class="mono">${esc(id)}</td>
       <td>${tableCell}</td>
-      <td class="mono">${esc(tokenBound(t.range && t.range.start, "00000000"))} → ${esc(tokenBound(t.range && t.range.end, "ffffffff"))}</td>
+      <td class="mono">${esc(tokenBound(t.range && t.range.start, "AAAAAAAAAAA"))} → ${esc(tokenBound(t.range && t.range.end, "__________8"))}</td>
       <td class="mono">${esc(t.epoch)}</td>
       <td class="mono">${esc((t.replicas || []).join(", "))}</td>
       <td>${leaderCell}</td>
@@ -565,16 +580,19 @@ function dynamoTables() {
   return out;
 }
 
-function addAttrRow(name = "", type = "S", value = "") {
+function addAttrRow(name = "", type = "S", value = "", locked = false) {
   const tr = document.createElement("tr");
-  tr.innerHTML = `<td><input type="text" class="dy-n" value="${esc(name)}"></td>
-    <td><select class="dy-t"><option ${type==="S"?"selected":""}>S</option>
+  tr.innerHTML = `<td><input type="text" class="dy-n" value="${esc(name)}"${locked ? " readonly" : ""}></td>
+    <td><select class="dy-t"${locked ? " disabled" : ""}><option ${type==="S"?"selected":""}>S</option>
       <option ${type==="N"?"selected":""}>N</option>
       <option ${type==="B"?"selected":""}>B</option>
       <option ${type==="BOOL"?"selected":""}>BOOL</option></select></td>
     <td><input type="text" class="dy-v" value="${esc(value)}"></td>
-    <td><a href="#" class="dy-del">✕</a></td>`;
-  tr.querySelector(".dy-del").addEventListener("click", (e) => { e.preventDefault(); tr.remove(); });
+    <td>${locked
+      ? `<span class="muted dy-key-lock" title="key attribute — required by the table's schema">key</span>`
+      : `<a href="#" class="dy-del">✕</a>`}</td>`;
+  const del = tr.querySelector(".dy-del");
+  if (del) del.addEventListener("click", (e) => { e.preventDefault(); tr.remove(); });
   $("dy-attrs").querySelector("tbody").appendChild(tr);
 }
 function dyAttrs() {
@@ -620,6 +638,17 @@ function dynKeyAv(table) {
   const sk = s.clustering_keys && s.clustering_keys[0];
   if (sk) put(sk);
   return av;
+}
+// The table's key attribute names (partition key, then sort key if any). These
+// rows are locked in the form — a valid Item/Key must carry them.
+function dynKeyNames(table) {
+  const s = dynamoTables()[table];
+  if (!s) return [];
+  const names = [];
+  if (s.partition_key) names.push(s.partition_key);
+  const sk = s.clustering_keys && s.clustering_keys[0];
+  if (sk) names.push(sk);
+  return names;
 }
 // The partition key name (for prefilling a Query's KeyConditionExpression).
 function dynPartitionKey(table) {
@@ -680,8 +709,19 @@ function dynRender() {
   $("dy-attrs").querySelector("tbody").innerHTML = "";
   if (usesAttrs) {
     const rows = avToAttrs(op === "PutItem" ? dynModel.Item : dynModel.Key);
-    if (rows.length) rows.forEach((a) => addAttrRow(a.name, a.type, a.value));
-    else addAttrRow();
+    // Key attributes render first as locked rows (name/type fixed, no delete):
+    // the Item/Key must carry them. Re-added with an empty value if missing
+    // from the model (e.g. pruned in the JSON view).
+    const table = $("dy-table").value;
+    const keyNames = dynKeyNames(table);
+    const schema = dynamoTables()[table];
+    keyNames.forEach((name) => {
+      const a = rows.find((r) => r.name === name);
+      addAttrRow(name, a ? a.type : dynColType(schema, name), a ? a.value : "", true);
+    });
+    const rest = rows.filter((r) => !keyNames.includes(r.name));
+    rest.forEach((a) => addAttrRow(a.name, a.type, a.value));
+    if (!keyNames.length && !rest.length) addAttrRow();
     $("dy-form-hint").textContent = op === "PutItem" ? "attributes = the full Item" : "attributes = the Key";
   } else {
     $("dy-form-hint").textContent = "switch to JSON to edit this operation's request";
@@ -832,6 +872,25 @@ function renderCqlResult(r) {
 
 // ---- Write tab: bulk seed ----
 let seeding = false;
+
+// The seed target is a dropdown of tables that *have a tablet* — the exact set
+// `/admin/data/seed` accepts (it validates against the replicated tablet map),
+// so both Dynamo and CQL `ks.table` tables appear once provisioned. Refreshed by
+// render() (which also runs mid-seed via loadAll), so preserve the selection and
+// keep the Seed button's disabled state in sync with the `seeding` flag.
+function renderSeedTables() {
+  const tablets = (STATE.status && STATE.status.tablets) || {};
+  const names = [...new Set(Object.values(tablets).map((t) => t.table).filter(Boolean))].sort();
+  const sel = $("seed-table");
+  const prev = sel.value;
+  sel.innerHTML = names.map((n) => `<option>${esc(n)}</option>`).join("");
+  if (names.includes(prev)) sel.value = prev;
+  const none = names.length === 0;
+  $("seed-no-tables").style.display = none ? "" : "none";
+  sel.disabled = none;
+  $("seed-go").disabled = none || seeding;
+}
+
 async function seedRun() {
   if (seeding) return;
   const table = $("seed-table").value.trim();
@@ -839,7 +898,7 @@ async function seedRun() {
   const vbytes = Math.max(0, parseInt($("seed-vbytes").value, 10) || 0);
   const total = Math.max(0, parseInt($("seed-total").value, 10) || 0);
   const chunk = Math.max(1, parseInt($("seed-chunk").value, 10) || 1000);
-  if (!table) { $("seed-status").innerHTML = `<div class="empty">set a table (every key names a table)</div>`; return; }
+  if (!table) { $("seed-status").innerHTML = `<div class="empty">create a table first (Dynamo or CQL panel) — every key names a table</div>`; return; }
   if (!total) { $("seed-status").innerHTML = `<div class="empty">set a total</div>`; return; }
   seeding = true;
   $("seed-go").disabled = true;
@@ -871,7 +930,7 @@ async function seedRun() {
     $("seed-status").innerHTML = `<div class="err-line">${esc(e)}</div>`;
   } finally {
     seeding = false;
-    $("seed-go").disabled = false;
+    renderSeedTables(); // recompute seed-go (stays disabled if no tables remain)
     $("seed-stop").disabled = true;
   }
 }

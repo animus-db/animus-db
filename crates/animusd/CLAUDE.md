@@ -284,16 +284,26 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
     reachable node hosts the tablet yet (group still forming) the dropdown is empty
     with a hint (the Load/Browse/inspect handlers no-op on an empty node).
     `tests/dashboard_endpoint.rs` proves serve + CORS + preflight + peers.
-    - **Displayed keys show the partition token as hex** (`admin.rs::key_display`):
-      a wire-edge/seeder key is `token || escape(pk) || rk` (ADR 0022), and the
-      leading `TOKEN_BYTES` are a **binary** Murmur3 token that lossy UTF-8 would
-      mangle — so a key with a non-printable prefix renders as
-      `<16-hex-token>:<readable pk/rk>` (e.g. `0825fb3df691fdc3:seed:0000…`); a
-      *plain-client* `Put` stores its key verbatim (no token), so a fully-printable
-      key is shown as text unchanged. **Values** keep lossy UTF-8 (`key_str`).
-      `parse_key_display` is the inverse, so a browsed key round-trips back through
-      the inspector (`/admin/storage/key`) and the scan `start` (paging). Unit tests
-      live in `admin.rs`; the `admin_endpoint` plain-`Put` `admin-key` guards the
+    - **Displayed keys show the partition token as unpadded base64url**
+      (`admin.rs::key_display`): a wire-edge/seeder key is `token || escape(pk) ||
+      rk` (ADR 0022), and the leading `TOKEN_BYTES` are a **binary** Murmur3 token
+      that lossy UTF-8 would mangle — so a key with a non-printable prefix renders
+      as `<11-char-base64url-token>:<readable pk/rk>` (e.g. `CCX7PfaR_cM:seed:0000…`).
+      The encoding is base64url with no padding (RFC 4648 §5) because displayed
+      keys are pasted back into `?key=`/`?start=` query params, where the standard
+      alphabet's `+` decodes as a space (and `=` padding percent-encodes noisily);
+      the codec is `animus_dynamo::wire::{base64url_encode,base64url_decode}` (the
+      standard padded pair stays on the DynamoDB `B` wire). A *plain-client* `Put`
+      stores its key verbatim (no token), so a fully-printable key is shown as text
+      unchanged. **Values** keep lossy UTF-8 (`key_str`). `parse_key_display` is
+      the inverse (the exactly-`TOKEN_BYTES` decode is strict — URL-safe alphabet
+      only, canonical trailing bits — which keeps a plain `:`-bearing key from
+      being mistaken for a token), so a browsed key round-trips back through the
+      inspector (`/admin/storage/key`) and the scan `start` (paging). The
+      dashboard's JS helpers (`b64url`/`bytes`/`tokenBound`) mirror the same
+      encoding, so tablet range boundaries and SSTable key ranges are
+      eyeball-comparable with browsed keys. Unit tests live in `admin.rs`; the
+      `admin_endpoint` plain-`Put` `admin-key` guards the
       not-every-key-is-token-prefixed case.
   - **The Write tab (ADR 0021) writes through the admin port.** `POST
     /admin/data/dynamo {op, payload}` reuses the DynamoDB edge in-process
@@ -337,7 +347,10 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
       land (idempotent per-key LWW), instead of surfacing "CP write did not commit
       in time". The dashboard's **Bulk seed** card chunks a
       larger total into requests, showing progress + refreshing the Tablets view so
-      splits appear live. Combined with the binary's **`--cluster N --auto-split K`**
+      splits appear live; its **table is a dropdown of provisioned tables** (from
+      the tablet map in `/admin/status` — the exact set the endpoint's
+      `has_table_tablet` check accepts, so Dynamo *and* CQL `ks.table` tables both
+      appear), disabled with a hint while no table exists. Combined with the binary's **`--cluster N --auto-split K`**
       flag (a CP-hosting node splits a tablet it leads once it exceeds K keys, Phase
       2.4, via `start_cluster_with_auto_split`), seeding past K auto-shards the
       keyspace — verified end to end (seed 12k keys, `--auto-split 4000` → 5 tablets).

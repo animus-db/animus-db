@@ -129,6 +129,10 @@ async fn dashboard_serves_spa_with_cors_and_peers() {
             body.contains("AnimusDB") && body.contains("/admin/peers"),
             "served the embedded SPA asset"
         );
+        assert!(
+            body.contains("dy-key-lock"),
+            "the Dynamo form locks key attribute rows (no delete on pk/sk)"
+        );
         // The /admin/ui alias serves the same asset.
         let (s, _, body2) = raw(admin_addr, "GET", "/admin/ui").await;
         assert_eq!(s, 200);
