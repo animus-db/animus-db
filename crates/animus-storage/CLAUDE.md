@@ -123,6 +123,26 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
   brief lock first — then takes the lock again only to mutate in-memory state.
   This keeps futures `Send` and ordering deterministic (ADR 0003). Block bytes
   are read from disk outside any lock.
+- **Flushes and compactions (maintenance) are mutually exclusive** via a
+  hand-rolled async `MaintenanceLock` (`lsm.rs`) whose guard *is* held across the
+  whole operation's awaits (it's a waker-based async mutex, not a `std` guard, so
+  the futures stay `Send`). Both allocate SSTable seqs from `manifest.next_seq`
+  (only advanced at the final swap) and both swap the manifest + readers, so an
+  overlap — the admin `flush_now`/`compact_now` racing the write path's
+  `maybe_flush_and_compact` from another task — used to allocate **duplicate
+  seqs** and clobber manifests/double-GC WAL segments. Writers never take this
+  lock (group-commit liveness untouched). Two companion invariants in `flush`:
+  the memtable clear is **surgical** (only the exact `(key, version)` slots the
+  snapshot folded into the SSTable — a blanket `clear()` erased any write applied
+  during the lock-free SSTable build, an acked-write loss once a later flush GC'd
+  its WAL segment); and the `applies_in_flight == 0` gate + WAL watermark are
+  (re-)checked/sampled **atomically with the snapshot** inside `flush` (the
+  callers' decision-time check is only a hint), so a WAL segment is GC'd only
+  when every durable record it holds is provably in the new SSTable.
+  Regressions: `lsm_concurrent.rs` (`concurrent_writers_with_flushes_…`,
+  `forced_flush_under_live_load_…`, `overlapping_flush_now_…` — real
+  multi-thread; `SimEnv` disk ops complete without yielding, so a flush runs in
+  one poll under sim and this race is *only* reachable under `ProdEnv`).
   - **Reads must be consistent against concurrent flush/compaction** (the lock-free
     window has two races, both fixed; surfaced by bulk-seed → auto-split). (1)
     **Compaction removes files**: it swaps `inner.readers` under the lock then
@@ -239,9 +259,18 @@ enqueued its record while the leader was mid-`fsync` once parked forever; the
 `wal.rs`.) It also has `scans_survive_concurrent_compaction`: a writer storm with
 tiny flush/compaction thresholds while scanners loop `entries()`, asserting every
 scan succeeds (the compaction-removal short-read race) **and** never loses a
-previously-seen key (the flush race). **Lesson:** concurrency primitives — and
-lock-free reads racing flush/compaction — need a `ProdEnv` multi-thread test;
-the sim proves logic/order, not real-thread races.
+previously-seen key (the flush race); and the flush-concurrency regressions
+(maintenance exclusion + surgical clear, see above): concurrent writers *with
+flushes actually occurring* (the original deadlock test never crossed the flush
+threshold — which is exactly how the flush-vs-apply loss went unseen), forced
+`flush_now`/`compact_now` from a second task under live writes, and overlapping
+`flush_now` bursts — each asserting every acked write reads back **live and
+after a restart**, and that SSTable seqs stay unique. **Lesson:** concurrency
+primitives — and lock-free reads racing flush/compaction — need a `ProdEnv`
+multi-thread test; the sim proves logic/order, not real-thread races. **Second
+lesson:** a concurrency test only has teeth against the code paths its workload
+actually reaches — drive the *maintenance* machinery (cross the flush
+threshold), not just the write path.
 
 `cargo bench -p animus-storage` runs `benches/engine_bench.rs`: a hand-rolled
 (no criterion) macro-benchmark over **`ProdEnv`** comparing `LsmEngine` vs
