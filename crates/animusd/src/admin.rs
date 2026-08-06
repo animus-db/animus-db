@@ -152,13 +152,16 @@ async fn handle_conn(mut stream: TcpStream, ctx: ClientCtx) -> std::io::Result<(
     }
 }
 
-/// Whether `path` should serve the dashboard SPA (ADR 0021). The root and a couple
-/// of `/admin` aliases all return the single-page app.
+/// Whether `path` should serve the dashboard SPA (ADR 0021). The root, a
+/// couple of `/admin` aliases, and any `/admin/ui/<tab>` deep link all return the
+/// single-page app — the client reads `location.pathname` to pick the active tab,
+/// so a refresh or a bookmark of e.g. `/admin/ui/tablets` lands back on that tab
+/// instead of always resetting to the default.
 fn is_ui_path(path: &str) -> bool {
     matches!(
         path,
         "/" | "/admin" | "/admin/" | "/admin/ui" | "/index.html"
-    )
+    ) || path.starts_with("/admin/ui/")
 }
 
 /// Route a request to its handler, returning `(http status, json body)`.

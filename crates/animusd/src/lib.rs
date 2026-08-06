@@ -2094,18 +2094,37 @@ impl ClientCtx {
     /// call — the caller polls its replicated `Metadata` for the commit and
     /// re-invokes, so a transient relay failure is retried with a re-resolved
     /// leader. The result replicates to every node via Raft.
-    pub(crate) async fn propose_schema(&self, command: &MetaCommand) {
+    ///
+    /// Returns whether this call has reason to believe `command` reached *some*
+    /// leader's Raft log (a local `Accepted`, or a relay that didn't visibly
+    /// fail) — `false` only when nothing was sent anywhere (no leader
+    /// known/reachable, or a local propose lost a leadership race).
+    /// [`propose_and_await`](Self::propose_and_await) uses this to decide
+    /// whether to back off before resubmitting: re-proposing an
+    /// already-in-flight command on every poll tick just appends a duplicate
+    /// log entry (harmless to apply for an idempotent command like
+    /// `SplitTablet` — its `new_id` guard rejects the duplicate — but still
+    /// wasted WAL/replication work, worse under exactly the load/latency that
+    /// caused the wait in the first place). Same shape as the already-fixed
+    /// `cp_batch_write_patient`/`propose_and_confirm_split` retry-amplification
+    /// bugs, applied to the schema-proposal path.
+    pub(crate) async fn propose_schema(&self, command: &MetaCommand) -> bool {
         if let Some(leader) = self.edge.leader_handle() {
-            let _ = leader.propose(command.clone());
-            return;
+            return matches!(
+                leader.propose(command.clone()),
+                ProposeResult::Accepted { .. }
+            );
         }
         if let Some(leader_id) = self.raft.leader() {
             if let Some(&addr) = self.client_route.get(&leader_id) {
-                let _ = self
-                    .relay(addr, ClientRequest::ProposeSchema(command.clone()))
-                    .await;
+                return !matches!(
+                    self.relay(addr, ClientRequest::ProposeSchema(command.clone()))
+                        .await,
+                    ClientResponse::Error(_)
+                );
             }
         }
+        false
     }
 
     /// This node's leader handle for the tablet of `table` owning `key`, if it hosts
@@ -3272,6 +3291,13 @@ const SCHEMA_COMMIT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Poll interval while waiting for a proposed schema command to commit / for a
 /// leader to settle so the proposal can be (re)submitted.
 const SCHEMA_POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// How long [`ClientCtx::propose_and_await`] waits, after a proposal it
+/// believes reached a leader's log, before resubmitting it — see
+/// [`ClientCtx::propose_schema`]'s doc for why blindly resubmitting every
+/// [`SCHEMA_POLL_INTERVAL`] tick is a retry-amplification bug. A proposal
+/// known *not* to have been sent anywhere (no leader reachable) is retried
+/// every tick regardless, since that costs nothing.
+const SCHEMA_PROPOSE_PATIENCE: Duration = Duration::from_secs(1);
 
 /// Initial poll granularity while a CP **write/delete** waits for its value to
 /// become locally durable+applied on the leader (the durable-before-ack confirm in
@@ -3726,26 +3752,27 @@ impl ClientCtx {
         let command = MetaCommand::DropTableSchema {
             table: table.clone(),
         };
-        let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
-        loop {
-            if !self.has_table_schema(&table) {
-                return Ok(());
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return Err(format!(
-                    "DROP TABLE `{table}` did not commit within {}s (no control-plane leader reachable?)",
-                    SCHEMA_COMMIT_TIMEOUT.as_secs()
-                ));
-            }
-            self.propose_schema(&command).await;
-            tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
-        }
+        self.propose_and_await(command, SCHEMA_COMMIT_TIMEOUT, || {
+            (!self.has_table_schema(&table)).then_some(())
+        })
+        .await
+        .map_err(|()| {
+            format!(
+                "DROP TABLE `{table}` did not commit within {}s (no control-plane leader reachable?)",
+                SCHEMA_COMMIT_TIMEOUT.as_secs()
+            )
+        })
     }
 
     /// Propose `command` on the current leader and poll `committed` until it
     /// reports the change visible in this node's replicated metadata (or time
-    /// out). Re-proposes each tick so a leader change does not strand it.
-    /// Returns the committed value `committed` observed, or `Err(())` on timeout.
+    /// out). Resubmits the proposal on a leader change or transient failure, but
+    /// **not** on every poll tick while a prior attempt is still believed
+    /// in-flight — see [`propose_schema`](Self::propose_schema)'s doc; that
+    /// backs off for [`SCHEMA_PROPOSE_PATIENCE`] after a proposal we believe
+    /// reached a leader's log, only resubmitting immediately when we know it
+    /// wasn't sent anywhere. Returns the committed value `committed` observed,
+    /// or `Err(())` on timeout.
     async fn propose_and_await<T>(
         &self,
         command: MetaCommand,
@@ -3753,14 +3780,24 @@ impl ClientCtx {
         committed: impl Fn() -> Option<T>,
     ) -> Result<T, ()> {
         let deadline = tokio::time::Instant::now() + timeout;
+        let mut next_propose_at = tokio::time::Instant::now();
         loop {
             if let Some(value) = committed() {
                 return Ok(value);
             }
-            if tokio::time::Instant::now() >= deadline {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
                 return Err(());
             }
-            self.propose_schema(&command).await;
+            if now >= next_propose_at {
+                let sent = self.propose_schema(&command).await;
+                next_propose_at = now
+                    + if sent {
+                        SCHEMA_PROPOSE_PATIENCE
+                    } else {
+                        Duration::ZERO
+                    };
+            }
             tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
         }
     }
