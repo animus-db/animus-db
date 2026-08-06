@@ -4,6 +4,21 @@ This file provides guidance to Claude Code (claude.ai/code) when working in this
 
 ## Purpose
 
+**Testbed-only status (ADR 0018/0019).** This crate has **no production
+consumer**: `animusd` does not depend on it, and ADR 0018 chose 2PC-over-Raft
+for CP transactions, so Accord is off the roadmap (a long-shot future
+improvement, ADR 0019). Its sole workspace consumer is `animus-test`'s Elle
+consistency corpus (ADR 0014), which uses it as the **known-serializable
+testbed** the checkers are proven against — via `AccordNode::start` (pure
+in-memory Accord over `SimEnv`) plus the submit/read/observe API
+(`submit_writes`, `submit_read`, `read_value_result`, `is_applied`,
+`store_value`). Everything the corpus exercises (the sync core, timestamps/
+ballots, recovery + failure detector, retry, WAL + snapshotting/recovery) must
+stay green; surfaces nothing used — the per-shard driver (`shard.rs`:
+`ShardedOwner`/`ShardRouter`) and the pluggable-engine constructor
+(`start_with_storage`; execution is now always the in-memory `MemoryEngine`) —
+were trimmed and are retrievable from git history.
+
 Accord-style **leaderless transaction consensus** (ADR 0011). Each transaction
 gets a unique, totally-ordered timestamp; a coordinator agrees with the replicas
 on an *execution* timestamp and a *dependency* set via PreAccept → (fast path)
@@ -25,8 +40,7 @@ a committed write could also land in the leaderless `animus-data` quorum
 path) and a wired read could read it back — giving the AP plane multi-key
 atomicity. With `animus-data` deleted, those constructors + the `DataSink`/
 `DataRouting` machinery + data-plane reads are gone; only the local consensus store
-remains. **Per-shard consensus** (`shard.rs`, below) is unaffected — it routes by
-the tablet map (`animus-tablet`), not the AP data plane.
+remains.
 
 ## Entry points
 
@@ -81,9 +95,9 @@ the tablet map (`animus-tablet`), not the AP data plane.
   `Committed`), and `Promised { txn, ballot }` records a durable recovery-ballot
   promise (`PersistedTxn.promised` / `.accepted_ballot`) so a restarted replica
   does not renege.
-- `node.rs` — `AccordNode<E, S = MemoryEngine>`: the thin `Env` driver, generic
-  over the `StorageEngine` backing execution (defaults to the in-memory
-  `MemoryEngine`; `start_with_storage` injects another). `persist_then_ship`
+- `node.rs` — `AccordNode<E>`: the thin `Env` driver. Execution is backed by an
+  in-memory `MemoryEngine` (testbed-only crate — the former pluggable-engine
+  `start_with_storage` was trimmed). `persist_then_ship`
   drains the core's `WalRecord`s + `ApplyEffect`s + `ReadEffect`s, appends +
   `fsync`s the records to `accord.wal`, **then** `merge`s the write effects into
   the engine (`apply_all`) and `get_at`s the read effects (`satisfy_reads`),
@@ -111,23 +125,16 @@ the tablet map (`animus-tablet`), not the AP data plane.
   driver state — the core stays sync + I/O-free, reached only at commit.
   `current_writer`/`current_value` are the ad-hoc reads it uses. (The former AP
   data-plane frontier constructors `start_with_data_plane`/`start_with_router` +
-  `DataSink`/`DataRouting` + data-plane reads were removed in v1, ADR 0019.)
-
-- `shard.rs` — **per-shard consensus**: one Accord group *per tablet* (ADR 0011).
-  `ShardRouter` maps a `Key` → owning `Tablet` (id + replica set) from the
-  **existing tablet map** (the `Vec<Tablet>` the control plane's `Metadata` holds —
-  no new control-plane state) and splits a key set into per-tablet **slices**
-  (`slices`/`value_slices`). `ShardedOwner` is what a *physical* node runs: it
-  hosts **one `AccordNode` per local shard** (one per tablet whose replica set
-  includes this node), each on its **own** `Env` node-id (distinct inbox + WAL,
-  single-consumer). `submit`/`submit_writes`/`submit_read` route a transaction to
-  the owning group (single-shard) or split it across groups (cross-shard),
-  returning a `ShardedTxn` naming the per-group sub-txn ids; `is_applied(&txn)` is
-  the all-or-nothing cross-shard visibility point. `start_with(node, router,
-  make_group)` lets the caller wire each group's `AccordNode` (plain or
-  storage-backed) and own the env-id allocation. **The sync `AccordCore` and `AccordNode`
-  are untouched** — this is pure driver-level composition of existing per-group
-  nodes.
+  `DataSink`/`DataRouting` + data-plane reads were removed in v1, ADR 0019; the
+  per-shard driver `shard.rs` (`ShardedOwner`/`ShardRouter`) and the
+  pluggable-engine `start_with_storage` were trimmed with the testbed-only
+  scope, ADR 0018 — all retrievable from git history.)
+  **`mvcc_version(ts)` hard-asserts its encoding contract** (`node < 2^16`,
+  `logical < 2^48`): a violation would silently collapse two distinct
+  `(logical, node)` timestamps into one storage version and per-key LWW would
+  keep an arbitrary winner — unacceptable silent corruption in a consistency
+  testbed, so the guards are `assert!`, not `debug_assert!` (which vanish in
+  release).
 
 ## What's non-obvious
 
@@ -273,18 +280,6 @@ the tablet map (`animus-tablet`), not the AP data plane.
   + failover (recovery unions both across the quorum). `read_only` is now exactly
   `write_keys.is_empty()` — a read-modify-write (non-empty `write_keys`) is never
   treated as read-only.
-- **Sharding = per-shard consensus** (`shard.rs`, `ShardedOwner` / `ShardRouter`):
-  a tablet's replica set **is** its own Accord group — the keyspace partitions into
-  *independent* consensus groups, and a transaction is routed to the group(s)
-  owning its keys (single-shard → one group; cross-shard → one slice per group).
-  It is built *on top of* `AccordNode` (driver-level composition); the sync core
-  never learns about tablets. A cross-shard transaction is **independent per-shard
-  agreement** (each shard agrees its slice; conflicting cross-shard txns serialize
-  via the shared group; atomicity is the all-slices-applied read point) — a unified
-  global cross-shard timestamp + 2PC atomic commit is still deferred (ADR 0011).
-  (The other, now-removed, "axis" was *effect-sharding* — one global Accord round
-  with the AP data-plane write *effect* routed per tablet via `start_with_router`;
-  it went with the frontier in v1, ADR 0019.)
 - **Recovery sets phase to `Applied` when `PersistedTxn.applied`** even though
   the phase-bearing records stop at `Committed` — the separate `Applied` WAL
   record carries the executed bit. On recovery the core **re-emits the apply
@@ -362,22 +357,20 @@ the tablet map (`animus-tablet`), not the AP data plane.
 
 ## Deferred (see ADR 0011)
 
-A **richer (heartbeat/liveness-oracle) failure detector** (the
+Accord as a whole is off the roadmap (ADR 0018 chose 2PC-over-Raft; ADR 0019
+keeps Accord only as a long-shot) — nothing below is planned work; it documents
+where the testbed's fidelity to real Accord stops. Deferred: a **richer
+(heartbeat/liveness-oracle) failure detector** (the
 driver now *does* auto-trigger recovery via a per-txn stall timer — see below —
 but a real detector would not need a bound large enough to absorb a
 partition-and-heal window, nor assume the whole replica set is alive), the
 **optimized** fast-path quorum `f+⌊(f+1)/2⌋` and the precise `PreAcceptOk`-witness
 *fast-path*-recovery decision it needs (we now use the precise *simplified* bound
 `N-1` and always force the slow path on re-proposal; the duel converges by an id
-tiebreak rather than Accord's full randomized-backoff rules), and the **unified
-global cross-shard timestamp + 2PC atomic commit** (per-
-shard consensus now exists — see below — but a cross-shard txn is *independent
-per-shard agreement*, not one global Accord round: each shard agrees its slice and
-the cross-shard atomicity is the all-slices-applied read point, not a unified
-commit/abort). **Now implemented:** **per-shard consensus** (one Accord group per
-tablet — `shard.rs`'s `ShardedOwner`/`ShardRouter`: single-shard txns route to the
-owning group only; cross-shard txns split into per-tablet slices that serialize via
-the shared group; `tests/accord_per_shard.rs`), read-only transactions,
+tiebreak rather than Accord's full randomized-backoff rules), and **sharding /
+cross-shard atomic commit** (the former per-shard driver `shard.rs` was trimmed
+with the testbed-only scope; the sync core never learned about tablets).
+**Implemented:** read-only transactions,
 **recovery ballots + duelling recovery coordinators** (a replica promises the
 highest ballot seen and fences lower `Recover`/`Accept`; superseded recoverers
 converge via an id tiebreak; `RecoverOk` adopts the highest-ballot accepted
@@ -404,8 +397,9 @@ boundary is where each remaining piece slots in.
 
 ## Tests
 
-`cargo test -p animus-consensus` — unit tests on the timestamp/clock, plus three
-`SimEnv` test files:
+`cargo test -p animus-consensus` — unit tests on the timestamp/clock and the
+white-box core gates, plus twelve `SimEnv` test files and one real-multi-threaded
+`ProdEnv` test:
 
 - `tests/accord_commit.rs`: single-transaction fast-path commit on all replicas,
   two conflicting transactions committing in a consistent timestamp order
@@ -455,17 +449,6 @@ boundary is where each remaining piece slots in.
   single transaction, two conflicting transactions, and a seed sweep all still
   commit and execute in a consistent order — the retry tick re-drives dropped
   messages. Plus retry-path trace reproducibility.
-- `tests/accord_per_shard.rs` (**per-shard consensus** — one Accord group per
-  tablet): two tablets on overlapping replica sets (group A
-  {0,1,2}, group B {2,3,4}, so node 2 coordinates cross-shard), each
-  `(physical, tablet)` group on its own env-id via `ShardedOwner::start_with`. A
-  single-shard txn executes on its owning group only (the other group wholly
-  untouched); distinct-tablet single-shard txns are independent; a non-local key is
-  rejected (`ShardError::NotLocal`); a cross-shard txn commits atomically on both
-  groups (each key carries its slice on every replica of its shard); two conflicting
-  cross-shard txns serialize via the shared group (no torn private key); arbitrary
-  write values route per shard; a fault confined to one shard (partition its group's
-  replicas) does not stall an unrelated shard; trace reproducibility.
 - `tests/accord_rw_conflict.rs` (**read-set folded into deps**): a
   read-then-write transaction (`submit_rw(reads, writes)`) is ordered consistently
   against a conflicting write to the key it *read* (and the conflict is recorded as

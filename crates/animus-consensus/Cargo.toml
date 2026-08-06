@@ -14,16 +14,11 @@ workspace = true
 [dependencies]
 animus-env.workspace = true
 animus-storage.workspace = true
-# Per-shard consensus routes by the tablet map (ids + replica sets).
-animus-tablet.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-async-trait.workspace = true
-futures.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
 animus-sim.workspace = true
-animus-control.workspace = true
-animus-tablet.workspace = true
+futures.workspace = true
 tokio = { workspace = true }

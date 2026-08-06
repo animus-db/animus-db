@@ -66,24 +66,21 @@
 //! - **WAL snapshotting / log truncation**: the WAL holds the full
 //!   per-transaction history (no compaction yet — contrast `RaftCore`).
 //! - **Contention / livelock handling, timeouts/retries, the precise fast-path
-//!   quorum bound.** Per-shard consensus now exists ([`ShardedOwner`] /
-//!   [`ShardRouter`], ADR 0011): a tablet's replica set is its own Accord group, a
-//!   single-shard transaction routes to the owning group only, and a cross-shard
-//!   transaction splits into per-tablet slices coordinated across the involved
-//!   groups. A *unified global execution timestamp / 2PC-style atomic commit*
-//!   across shards remains deferred (each shard agrees its own slice; conflicting
-//!   cross-shard transactions serialize via the shared group). See ADR 0011.
+//!   quorum bound.** Per-shard consensus and sharding are out of scope: ADR 0018
+//!   chose 2PC-over-Raft for CP transactions, so this crate is retained only as
+//!   the known-serializable **testbed** for the Elle consistency corpus
+//!   (`animus-test`, ADR 0014); Accord itself is a long-shot future improvement
+//!   (ADR 0019). The former per-shard driver (`ShardedOwner`/`ShardRouter`) was
+//!   removed with that scope change — retrievable from git history.
 
 mod core;
 mod message;
 mod node;
 mod persist;
-mod shard;
 mod timestamp;
 
 pub use crate::core::{AccordCore, ApplyEffect, Decision, Key, Phase, ReadEffect, TxnId};
 pub use crate::message::{AccordMsg, Out};
 pub use crate::node::{AccordNode, InteractiveTxn};
 pub use crate::persist::{PersistedState, PersistedTxn, WalRecord};
-pub use crate::shard::{ShardError, ShardRouter, ShardedOwner, ShardedTxn};
 pub use crate::timestamp::{Ballot, LogicalClock, Timestamp};
