@@ -1,6 +1,6 @@
 # ADR 0021 — Web dashboard over the admin JSON surface (observe + operator actions)
 
-- **Status:** Accepted (implemented — follow-ups 1–4 shipped; 5 awaits ADR 0018, 6 on demand)
+- **Status:** Accepted (implemented — follow-ups 1–4, 7 shipped; 5 awaits ADR 0018, 6 on demand)
 - **Date:** 2026-08-04 (status updated 2026-08-06)
 
 ## Context
@@ -282,6 +282,17 @@ The dashboard is a debug/operability tool, not a correctness surface; its bar is
    extensions.
 6. (Deferred, on demand) server-side `GET /admin/cluster/*` aggregator if
    client-side fan-out reachability proves impractical.
+7. ✅ **Real per-tab URLs.** Each top-level tab (Nodes/Tablets/Storage/Write) now
+   has its own path, `/admin/ui/<tab>`; the admin server serves the same embedded
+   SPA for any such path (`admin.rs::is_ui_path`, a prefix match — an unrecognized
+   tab name falls back client-side to the default rather than 404ing), and the
+   page uses `history.pushState`/`popstate` to keep the address bar in sync with
+   the active tab. This closes the "refresh always resets to Nodes" gap: a
+   refresh, a bookmark, or the browser back/forward buttons now land back on the
+   tab that was open. Sub-tab state (the selected storage tablet/node, the Write
+   panel's op/table) is intentionally **not** encoded in the URL yet — scoped out
+   to keep this increment small; a future pass could promote it to query params
+   the same way.
 
 This ADR builds directly on ADR 0020 (the admin JSON surface it renders and the
 follow-up it fulfils), ADR 0018 (the transaction state it will visualize), ADR
