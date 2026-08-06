@@ -23,8 +23,6 @@ input[type=text] { background: var(--panel2); color: var(--fg); border: 1px soli
 nav { display: flex; gap: 4px; padding: 10px 18px 0; border-bottom: 1px solid var(--line); }
 nav button { border-radius: 6px 6px 0 0; border-bottom: none; color: var(--dim); }
 nav button.active { color: var(--fg); background: var(--panel); border-color: var(--line); }
-nav.secondary { padding: 8px 18px 0; border-bottom: 1px solid var(--line); }
-nav.secondary button { font-size: 12px; padding: 4px 10px; }
 main { padding: 18px; }
 section { display: none; }
 section.active { display: block; }
@@ -94,6 +92,8 @@ button:disabled { opacity: .45; cursor: not-allowed; }
   color: var(--dim); }
 .topo-chip.leaderless { background: #2a1418; border-color: #4a232a; color: var(--bad); }
 .topo-chip.leaderless .tlabel { color: var(--bad); opacity: .8; }
+.topo-chip.hot { border-color: var(--warn); }
+.topo-chip .hot-mark { color: var(--warn); }
 
 /* Metrics-history sparklines (Nodes tab). */
 .mh-row { margin-bottom: 14px; }

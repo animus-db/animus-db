@@ -73,6 +73,11 @@ pub(crate) struct CpRaftView {
     pub(crate) snapshot_index: u64,
     pub(crate) log_len: usize,
     pub(crate) voters: Vec<NodeId>,
+    /// This tablet's estimated live key count (`CpGroup::approx_key_count`) —
+    /// the same estimate `auto_split_loop` checks against `--auto-split K`.
+    /// `None` on the memory backend (no on-disk memtable/SSTable stats to
+    /// estimate from).
+    pub(crate) key_count: Option<usize>,
 }
 
 /// Accept loop for the admin HTTP endpoint. One task per connection; HTTP/1.1
@@ -277,6 +282,7 @@ fn config_view(ctx: &ClientCtx) -> Value {
         },
         "peers": peers,
         "cp_member_addrs": meta.cp_member_addrs,
+        "auto_split_threshold": a.auto_split_threshold,
     })
 }
 

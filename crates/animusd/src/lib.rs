@@ -287,6 +287,7 @@ impl CpGroup {
                     snapshot_index: $n.snapshot_index(),
                     log_len: $n.log_len(),
                     voters: $n.config().into_iter().collect(),
+                    key_count: self.approx_key_count(),
                 }
             };
         }
@@ -718,6 +719,12 @@ pub(crate) struct AdminInfo {
     /// this node's admin address when the full set is unknown (the simple
     /// [`BoundNode::start`] path / hand-built nodes).
     pub(crate) admin_addrs: Vec<SocketAddr>,
+    /// The `--auto-split K` key-count threshold this node was started with, if
+    /// any (`--cluster N --auto-split K`; the per-process `--config`/`--node`
+    /// path has no auto-split support yet, so this is always `None` there).
+    /// Surfaced on `/admin/config` so the dashboard can flag a tablet as
+    /// "over threshold, about to split" without hardcoding the value.
+    pub(crate) auto_split_threshold: Option<usize>,
 }
 
 impl BoundNode {
@@ -836,6 +843,7 @@ impl BoundNode {
             } else {
                 cluster_admin_addrs
             },
+            auto_split_threshold,
         });
 
         // Keep clones of the two internal envs so [`Node::shutdown`] can abort
