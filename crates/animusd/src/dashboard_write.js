@@ -1,7 +1,7 @@
 "use strict";
 // The Write tab: DynamoDB table management + operation form/JSON editor, the
 // CQL script runner, and bulk seed. Depends on `dashboard_core.js` having
-// loaded first (STATE, $, esc, pill, getJSON, postJSON, selectedTable, loadAll).
+// loaded first (STATE, $, esc, pill, getJSON, postJSON, loadAll).
 
 // ---- Write tab: DynamoDB ----
 // A single request model (`dynModel`) is the source of truth; the Form and JSON
@@ -10,6 +10,14 @@
 let dynModel = { TableName: "", Item: {} };
 let dynView = "form";
 const DY_ATTR_OPS = ["PutItem", "GetItem", "DeleteItem", "UpdateItem"];
+
+// The operation panel's own table selection (its `#dy-table` dropdown) —
+// each write-tab panel keeps its own local selection now rather than sharing
+// one global header dropdown. `lastRenderedDyTable` tracks the value the
+// editor was last built for, so a routine refresh that leaves the selection
+// unchanged doesn't clobber in-progress edits (checked in core.js's `render`).
+let dyTable = "";
+let lastRenderedDyTable;
 
 // The Dynamo tables known to the cluster (from the replicated catalog in
 // /admin/status), keyed by name. Dynamo tables are plain-named; CQL tables are
@@ -120,7 +128,7 @@ function dynSkeleton(op, table) {
 
 // Capture the active view's edits into dynModel.
 function dynSyncFromForm() {
-  dynModel.TableName = selectedTable;
+  dynModel.TableName = dyTable;
   const op = $("dy-op").value;
   if (op === "PutItem") dynModel.Item = currentAv();
   else if (DY_ATTR_OPS.includes(op)) dynModel.Key = currentAv();
@@ -132,9 +140,8 @@ function dynSyncFromJson() { dynModel = JSON.parse($("dy-raw").value); }
 function dynRender() {
   const op = $("dy-op").value;
   const usesAttrs = DY_ATTR_OPS.includes(op);
-  const table = selectedTable;
+  const table = dyTable;
   const validTable = !!(table && dynamoTables()[table]);
-  $("dy-table-name").textContent = table || "—";
   $("dy-view-form").classList.toggle("active", dynView === "form");
   $("dy-view-json").classList.toggle("active", dynView === "json");
   if (dynView === "json") {
@@ -165,7 +172,7 @@ function dynRender() {
     if (!keyNames.length && !rest.length) addAttrRow();
     $("dy-form-hint").textContent = op === "PutItem" ? "attributes = the full Item" : "attributes = the Key";
   } else if (!validTable) {
-    $("dy-form-hint").textContent = "select a DynamoDB table above";
+    $("dy-form-hint").textContent = "pick a DynamoDB table above";
   } else {
     $("dy-form-hint").textContent = "switch to JSON to edit this operation's request";
   }
@@ -183,7 +190,7 @@ function dynSetView(view) {
 }
 function dynOnOp() {
   const prevAv = currentAv();
-  dynModel = dynSkeleton($("dy-op").value, selectedTable);
+  dynModel = dynSkeleton($("dy-op").value, dyTable);
   const op = $("dy-op").value;
   if (Object.keys(prevAv).length) {
     if (op === "PutItem") dynModel.Item = prevAv;
@@ -194,13 +201,15 @@ function dynOnOp() {
 function dynOnTable() {
   // Switching table rebuilds the skeleton so the new table's key attributes are
   // prefilled (in both form and JSON views).
-  dynModel = dynSkeleton($("dy-op").value, selectedTable);
+  dynModel = dynSkeleton($("dy-op").value, dyTable);
   dynRender();
 }
 
-// Render the tables management list; disable the op form unless the globally
-// selected table is one of these (you can't act on a table that doesn't exist,
-// or edit a DynamoDB request against a CQL-only table).
+// Render the tables management list, and this panel's own `#dy-table`
+// selector (replacing the old shared header dropdown — each write-tab panel
+// now owns its selection). Auto-picks the first table when none is selected
+// yet or the current selection no longer exists, so there's no separate
+// "now go pick a table" step in the common single-table case.
 function renderDynamoTables() {
   const tables = dynamoTables();
   const names = Object.keys(tables).sort();
@@ -217,10 +226,27 @@ function renderDynamoTables() {
     : `<div class="empty">no DynamoDB tables — create one above</div>`;
   $("dy-tables").querySelectorAll(".dy-drop").forEach((a) =>
     a.addEventListener("click", (e) => { e.preventDefault(); dropTable(a.dataset.t); }));
-  const validTable = selectedTable && names.includes(selectedTable);
+
+  if (!names.includes(dyTable)) dyTable = names[0] || "";
+  const sel = $("dy-table");
+  sel.innerHTML = names.length
+    ? names.map((n) => `<option${n === dyTable ? " selected" : ""}>${esc(n)}</option>`).join("")
+    : `<option value="">(none)</option>`;
+  sel.value = dyTable;
+  const validTable = !!dyTable;
   $("dy-no-tables").style.display = validTable ? "none" : "";
-  $("dy-no-tables").textContent = names.length ? "select a DynamoDB table above" : "create a table first";
-  ["dy-op", "dy-send", "dy-add-attr"].forEach((id) => { $(id).disabled = !validTable; });
+  $("dy-no-tables").textContent = names.length ? "" : "create a table first";
+  ["dy-op", "dy-table", "dy-send", "dy-add-attr"].forEach((id) => { $(id).disabled = !validTable; });
+}
+
+// The `#dy-table` selector's own change handler — updates immediately (not
+// waiting for the next poll refresh) and marks the change as already handled
+// so `render()`'s `dyTable !== lastRenderedDyTable` check doesn't redundantly
+// rebuild the skeleton a second time.
+function onDyTableChange() {
+  dyTable = $("dy-table").value;
+  lastRenderedDyTable = dyTable;
+  dynOnTable();
 }
 
 async function createTable() {
@@ -241,7 +267,7 @@ async function createTable() {
     if (status >= 300) { $("dy-ct-msg").textContent = (body && body.message) || ("HTTP " + status); return; }
     $("dy-ct-msg").textContent = "created " + name;
     $("dy-ct-name").value = "";
-    selectedTable = name; // render() picks this up once /admin/status reflects it, prefilling key attrs
+    dyTable = name; // render() picks this up once /admin/status reflects it, prefilling key attrs
     await loadAll();
   } catch (e) { $("dy-ct-msg").textContent = String(e); }
 }
@@ -299,27 +325,38 @@ function renderCqlResult(r) {
 
 // ---- Write tab: bulk seed ----
 let seeding = false;
+// This panel's own table selection (its `#seed-table` dropdown), independent
+// of the Dynamo op panel's `dyTable` — each write-tab panel owns its own now.
+let seedTable = "";
 
 // The seed target must be a table that *has a tablet* — the exact set
 // `/admin/data/seed` accepts (it validates against the replicated tablet map),
 // so both Dynamo and CQL `ks.table` tables qualify once provisioned. Refreshed
 // by render() (which also runs mid-seed via loadAll), so keep the Seed
 // button's disabled state in sync with both table validity and `seeding`.
+// Auto-picks the first seedable table when none is selected yet or the
+// current selection no longer qualifies.
 function renderSeedTables() {
   const tablets = (STATE.status && STATE.status.tablets) || {};
-  const seedable = new Set(Object.values(tablets).map((t) => t.table).filter(Boolean));
-  const validTable = selectedTable && seedable.has(selectedTable);
-  $("seed-table-name").textContent = selectedTable || "—";
+  const seedable = [...new Set(Object.values(tablets).map((t) => t.table).filter(Boolean))].sort();
+  if (!seedable.includes(seedTable)) seedTable = seedable[0] || "";
+  const sel = $("seed-table");
+  sel.innerHTML = seedable.length
+    ? seedable.map((n) => `<option${n === seedTable ? " selected" : ""}>${esc(n)}</option>`).join("")
+    : `<option value="">(none)</option>`;
+  sel.value = seedTable;
+  const validTable = !!seedTable;
   $("seed-no-tables").style.display = validTable ? "none" : "";
-  $("seed-no-tables").textContent = selectedTable
-    ? "table has no tablet yet — write to it once (Dynamo/CQL panel), then it can be seeded"
-    : "select a table above";
+  $("seed-no-tables").textContent = seedable.length
+    ? ""
+    : "no table has a tablet yet — write to one once (Dynamo/CQL panel), then it can be seeded";
+  $("seed-table").disabled = !seedable.length;
   $("seed-go").disabled = !validTable || seeding;
 }
 
 async function seedRun() {
   if (seeding) return;
-  const table = selectedTable;
+  const table = seedTable;
   const prefix = $("seed-prefix").value;
   const vbytes = Math.max(0, parseInt($("seed-vbytes").value, 10) || 0);
   const total = Math.max(0, parseInt($("seed-total").value, 10) || 0);

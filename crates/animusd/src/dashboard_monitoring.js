@@ -44,7 +44,10 @@ function renderHealthStrip() {
   $("health").innerHTML =
     `<span class="status ${h.status}">${h.status}</span>${leaderFact}${tabletsFact}${nodesFact}`;
   const tabletsBtn = $("health-tablets");
-  if (tabletsBtn) tabletsBtn.addEventListener("click", () => activateTab("tablets", { push: true }));
+  if (tabletsBtn) tabletsBtn.addEventListener("click", () => {
+    activateTab("tablets", { push: true });
+    setTabletsView("lanes"); // the lanes view is what actually highlights "leaderless"
+  });
   const nodesBtn = $("health-nodes");
   if (nodesBtn) nodesBtn.addEventListener("click", () => activateTab("nodes", { push: true }));
 }
@@ -162,6 +165,7 @@ function renderTablets() {
   const tablets = (status && status.tablets) || {};
   const ids = Object.keys(tablets).map(Number).sort((a, b) => a - b);
   const groups = cpGroupsByTablet();
+  const threshold = autoSplitThreshold();
   const rows = ids.map((id) => {
     const t = tablets[id];
     const gs = groups[id] || [];
@@ -175,6 +179,15 @@ function renderTablets() {
     const tableCell = t.table
       ? `<span class="mono">${esc(t.table)}</span>`
       : `<span class="muted">—</span>`;
+    // The same estimate auto_split_loop checks against --auto-split K — null
+    // on the memory backend (no cheap on-disk stats to estimate from) or
+    // while leaderless (no group to ask).
+    const keyCount = lg && lg.key_count != null ? lg.key_count : null;
+    const overThreshold = keyCount != null && threshold != null && keyCount > threshold;
+    const keysCell = keyCount == null
+      ? `<span class="muted">—</span>`
+      : `${esc(keyCount.toLocaleString())}`
+        + (overThreshold ? " " + pill("Leaving", "over " + threshold.toLocaleString()) : "");
     // Jump straight to this tablet's Storage detail (preferring its leader,
     // which cannot 404 on the storage endpoints) instead of re-picking the
     // same tablet id in a dropdown by hand.
@@ -182,6 +195,7 @@ function renderTablets() {
     return `<tr>
       <td class="mono"><a href="#" class="tablet-jump" data-tablet="${esc(id)}" data-node="${esc(jumpNode)}">${esc(id)}</a></td>
       <td>${tableCell}</td>
+      <td class="mono">${keysCell}</td>
       <td class="mono">${esc(tokenBound(t.range && t.range.start, "AAAAAAAAAAA"))} → ${esc(tokenBound(t.range && t.range.end, "__________8"))}</td>
       <td class="mono">${esc(t.epoch)}</td>
       <td class="mono">${esc((t.replicas || []).join(", "))}</td>
@@ -192,7 +206,7 @@ function renderTablets() {
     </tr>`;
   }).join("");
   $("tablets-body").innerHTML = rows ? `<table>
-    <thead><tr><th>tablet</th><th>table</th><th>range</th><th>epoch</th><th>replicas (base)</th>
+    <thead><tr><th>tablet</th><th>table</th><th>keys</th><th>range</th><th>epoch</th><th>replicas (base)</th>
       <th>leader</th><th>term</th><th>commit/applied/durable</th><th>voters (group)</th></tr></thead>
     <tbody>${rows}</tbody></table>`
     : `<div class="empty">no tablets</div>`;
@@ -205,9 +219,30 @@ function renderTablets() {
 
 function nodeRaftkvId(n) { return n.config ? n.config.raftkv_id : "?"; }
 
-// The Topology tab's filter text (by table name or tablet id), kept across
-// refreshes like `selectedTable` — read by `renderTopology`, written by the
-// filter input's own `input` handler (wired in dashboard.html).
+// The `--auto-split K` threshold (from any reachable node's `/admin/config` —
+// a single `--cluster N --auto-split K` flag, so every node agrees), or
+// `null` if auto-split isn't enabled for this run.
+function autoSplitThreshold() {
+  const n = STATE.nodes.find((x) => x.ok && x.config && x.config.auto_split_threshold != null);
+  return n ? n.config.auto_split_threshold : null;
+}
+
+// The Tablets tab has two views onto the same data — a lanes-by-leader
+// grouping (the default) and a flat sortable table — toggled like the
+// Dynamo Form/JSON views. Both bodies are kept up to date every refresh
+// regardless of which is visible, so switching views never shows stale data.
+let tabletsView = "lanes";
+function setTabletsView(view) {
+  tabletsView = view;
+  $("tablets-view-lanes").classList.toggle("active", view === "lanes");
+  $("tablets-view-table").classList.toggle("active", view === "table");
+  $("tablets-lanes-card").style.display = view === "lanes" ? "" : "none";
+  $("tablets-table-card").style.display = view === "table" ? "" : "none";
+}
+
+// The lanes view's filter text (by table name or tablet id), kept across
+// refreshes — read by `renderTopology`, written by the filter input's own
+// `input` handler (wired in dashboard.html).
 let topoFilter = "";
 
 // Group every tablet into a lane by which node currently leads its CP group;
@@ -252,6 +287,7 @@ function renderTopology() {
   const laneKeys = [...lanes.keys()].filter((k) => k !== "leaderless").sort((a, b) => a - b);
   if (lanes.has("leaderless")) laneKeys.push("leaderless");
 
+  const threshold = autoSplitThreshold();
   $("topology-body").innerHTML = laneKeys.map((key) => {
     const items = lanes.get(key);
     const leaderless = key === "leaderless";
@@ -259,8 +295,13 @@ function renderTopology() {
     const chips = items.map(({ id, t, lead, gs }) => {
       const node = lead ? lead.node.base : (gs[0] ? gs[0].node.base : "");
       const tableLabel = t.table ? `<span class="tlabel">${esc(t.table)}</span>` : "";
-      return `<a href="#" class="topo-chip${leaderless ? " leaderless" : ""}"
-        data-tablet="${esc(id)}" data-node="${esc(node)}">#${esc(id)} ${tableLabel}</a>`;
+      const keyCount = lead && lead.g.key_count != null ? lead.g.key_count : null;
+      const overThreshold = keyCount != null && threshold != null && keyCount > threshold;
+      const hotMark = overThreshold
+        ? `<span class="hot-mark" title="${esc(keyCount)} keys — over the ${esc(threshold)}-key auto-split threshold">▲</span>`
+        : "";
+      return `<a href="#" class="topo-chip${leaderless ? " leaderless" : ""}${overThreshold ? " hot" : ""}"
+        data-tablet="${esc(id)}" data-node="${esc(node)}">#${esc(id)} ${tableLabel}${hotMark}</a>`;
     }).join("");
     return `<div class="topo-lane${leaderless ? " leaderless" : ""}">
       <h3>${esc(title)} <span class="count">${items.length} tablet(s)</span></h3>

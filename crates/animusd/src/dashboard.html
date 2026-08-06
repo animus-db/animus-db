@@ -12,9 +12,6 @@
   <span class="banner" id="banner">⚠ admin port — no auth; bind to a trusted interface only</span>
   <span class="spacer"></span>
   <div class="controls">
-    <label>table
-      <select id="global-table"><option value="">(select a table)</option></select>
-    </label>
     <span class="updated" id="updated"></span>
     <label>auto
       <select id="auto">
@@ -29,14 +26,10 @@
 </header>
 <div class="health" id="health"></div>
 <nav class="primary">
-  <button data-group="monitoring" class="active">Monitoring</button>
-  <button data-group="actions">Actions</button>
-</nav>
-<nav class="secondary" data-group="monitoring">
   <button data-tab="nodes" class="active">Nodes</button>
   <button data-tab="tablets">Tablets</button>
-  <button data-tab="topology">Topology</button>
   <button data-tab="storage">Storage</button>
+  <button data-tab="write">Write</button>
 </nav>
 <main>
   <section id="nodes" class="active">
@@ -57,20 +50,21 @@
   </section>
 
   <section id="tablets">
-    <div class="card scroll">
-      <h2>Tablet map</h2>
-      <div id="tablets-body"><div class="empty">loading…</div></div>
-    </div>
-  </section>
-
-  <section id="topology">
     <div class="row">
       <label>filter</label><input type="text" id="topo-filter" placeholder="table or tablet id">
+      <span class="spacer"></span>
+      <span class="muted">view</span>
+      <button id="tablets-view-lanes" class="seg active">Lanes</button>
+      <button id="tablets-view-table" class="seg">Table</button>
     </div>
-    <div class="card">
+    <div class="card" id="tablets-lanes-card">
       <h2>Tablets by leader</h2>
       <div class="muted" style="margin-bottom:10px">Grouped by which node currently leads each tablet's CP group — a leaderless tablet can't serve reads or writes, so it gets its own lane. Click a tablet to jump to its Storage detail.</div>
       <div id="topology-body"><div class="empty">loading…</div></div>
+    </div>
+    <div class="card scroll" id="tablets-table-card" style="display:none">
+      <h2>Tablet map</h2>
+      <div id="tablets-body"><div class="empty">loading…</div></div>
     </div>
   </section>
 
@@ -137,8 +131,8 @@
           <option>PutItem</option><option>GetItem</option><option>UpdateItem</option>
           <option>DeleteItem</option><option>Query</option><option>Scan</option>
         </select>
-        <label>table</label><span class="mono" id="dy-table-name">—</span>
-        <span class="muted" id="dy-no-tables" style="display:none">select a table above</span>
+        <label>table</label><select id="dy-table"></select>
+        <span class="muted" id="dy-no-tables" style="display:none">create a table first</span>
         <span class="spacer"></span>
         <span class="muted">view</span>
         <button id="dy-view-form" class="seg active">Form</button>
@@ -173,10 +167,10 @@ SELECT * FROM t WHERE id = 1;"></textarea>
 
     <div class="card scroll">
       <h2>Bulk seed (sharding test)</h2>
-      <div class="muted" style="margin-bottom:8px">Writes synthetic keys into the table selected above to grow its tablet (it must already exist — create it first in the Dynamo or CQL panel, and write to it once so it has a tablet). Run the cluster with <code>--auto-split K</code> to watch tablets split in the Tablets tab as the count crosses K.</div>
+      <div class="muted" style="margin-bottom:8px">Writes synthetic keys into the table selected below to grow its tablet (it must already exist — create it first in the Dynamo or CQL panel, and write to it once so it has a tablet). Run the cluster with <code>--auto-split K</code> to watch tablets split in the Tablets tab as the count crosses K.</div>
       <div class="row">
-        <label>table</label><span class="mono" id="seed-table-name">—</span>
-        <span class="muted" id="seed-no-tables" style="display:none">select a table above</span>
+        <label>table</label><select id="seed-table"></select>
+        <span class="muted" id="seed-no-tables" style="display:none"></span>
         <label>key prefix</label><input type="text" id="seed-prefix" value="seed:" style="width:7em">
         <label>value bytes</label><input type="text" id="seed-vbytes" value="64" style="width:5em">
         <label>total</label><input type="text" id="seed-total" value="10000" style="width:7em">
@@ -197,8 +191,6 @@ SELECT * FROM t WHERE id = 1;"></textarea>
 // Wiring: event listeners + initial render. Runs after the three modules above
 // have defined every function it references.
 document.querySelectorAll(".primary button").forEach((b) =>
-  b.addEventListener("click", () => activateTab(lastTabInGroup[b.dataset.group], { push: true })));
-document.querySelectorAll(".secondary button").forEach((b) =>
   b.addEventListener("click", () => activateTab(b.dataset.tab, { push: true })));
 window.addEventListener("popstate", () => {
   pendingStorageParams = paramsFromLocation();
@@ -209,24 +201,28 @@ pendingStorageParams = paramsFromLocation();
 activateTab(tabFromPath(window.location.pathname));
 $("refresh").addEventListener("click", loadAll);
 $("mh-load").addEventListener("click", loadMetricsHistory);
-$("global-table").addEventListener("change", onGlobalTableChange);
 $("st-tablet").addEventListener("change", () => { updateStorageNodeOptions(); syncStorageUrl(); });
 $("st-node").addEventListener("change", syncStorageUrl);
 $("st-load").addEventListener("click", () => { loadStorage(); syncStorageUrl(); });
 $("topo-filter").addEventListener("input", () => { topoFilter = $("topo-filter").value; renderTopology(); });
+$("tablets-view-lanes").addEventListener("click", () => setTabletsView("lanes"));
+$("tablets-view-table").addEventListener("click", () => setTabletsView("table"));
+setTabletsView("lanes");
 $("scan-load").addEventListener("click", browseKeys);
 $("key-load").addEventListener("click", inspectKey);
 $("dy-add-attr").addEventListener("click", () => addAttrRow());
 $("dy-op").addEventListener("change", dynOnOp);
+$("dy-table").addEventListener("change", onDyTableChange);
 $("dy-view-form").addEventListener("click", () => dynSetView("form"));
 $("dy-view-json").addEventListener("click", () => dynSetView("json"));
 $("dy-send").addEventListener("click", sendDynamo);
 $("dy-ct-create").addEventListener("click", createTable);
 $("cql-run").addEventListener("click", runCql);
+$("seed-table").addEventListener("change", () => { seedTable = $("seed-table").value; renderSeedTables(); });
 $("seed-go").addEventListener("click", seedRun);
 $("seed-stop").addEventListener("click", () => { seeding = false; });
-// Initialize the Dynamo editor (the header's global table selector is filled
-// by renderTableSelector once /admin/status loads).
+// Initialize the Dynamo editor (dy-table is filled by renderDynamoTables once
+// /admin/status loads).
 dynModel = dynSkeleton("PutItem", "");
 dynRender();
 

@@ -1,10 +1,9 @@
 "use strict";
-// Shared state, fetch helpers, formatting utilities, the global table
-// selector, and tab routing. `dashboard_monitoring.js` and `dashboard_write.js`
-// load after this file and call into it (STATE, $, esc, getJSON, postJSON,
-// pill, bytes, tokenBound, b64url); nothing here calls into them except
-// `render()`, which is the single per-refresh entry point every tab's
-// render function hangs off of.
+// Shared state, fetch helpers, formatting utilities, and tab routing.
+// `dashboard_monitoring.js` and `dashboard_write.js` load after this file and
+// call into it (STATE, $, esc, getJSON, postJSON, pill, bytes, tokenBound,
+// b64url); nothing here calls into them except `render()`, which is the
+// single per-refresh entry point every tab's render function hangs off of.
 const SEED = window.location.origin;
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s).replace(/[&<>"]/g, (c) =>
@@ -12,41 +11,6 @@ const esc = (s) => String(s).replace(/[&<>"]/g, (c) =>
 
 // State assembled each refresh.
 let STATE = { status: null, nodes: [], peersErr: null };
-
-// The globally-selected table (header dropdown) — every operation panel that
-// targets one table (Dynamo op, bulk seed) reads this instead of keeping its
-// own dropdown. CQL keeps typing table names into its statements (a script
-// can target any table, or several) and stays out of this. `lastRenderedTable`
-// tracks the value the Dynamo editor was last built for, so a routine refresh
-// that leaves the selection unchanged doesn't clobber in-progress edits.
-let selectedTable = "";
-let lastRenderedTable;
-
-// Every table name known anywhere: the replicated schema catalog (Dynamo +
-// CQL) union the tablet map (a table can appear in one before the other —
-// created but not yet written to, or vice versa via direct seeding).
-function allTableNames() {
-  const fromSchemas = Object.keys((STATE.status && STATE.status.schemas && STATE.status.schemas.tables) || {});
-  const fromTablets = Object.values((STATE.status && STATE.status.tablets) || {}).map((t) => t.table).filter(Boolean);
-  return [...new Set([...fromSchemas, ...fromTablets])].sort();
-}
-
-// Populate the header dropdown; drop the selection if it no longer exists.
-function renderTableSelector() {
-  const names = allTableNames();
-  if (!names.includes(selectedTable)) selectedTable = "";
-  const sel = $("global-table");
-  sel.innerHTML = `<option value="">(select a table)</option>`
-    + names.map((n) => `<option${n === selectedTable ? " selected" : ""}>${esc(n)}</option>`).join("");
-  sel.value = selectedTable;
-}
-function onGlobalTableChange() {
-  selectedTable = $("global-table").value;
-  lastRenderedTable = selectedTable;
-  dynOnTable();
-  renderDynamoTables();
-  renderSeedTables();
-}
 
 // Fetch JSON from `base + path`; throws on network/HTTP error.
 async function getJSON(base, path) {
@@ -184,28 +148,22 @@ function render() {
   renderTablets();
   renderTopology();
   renderStorageSelectors();
-  renderTableSelector();
   renderDynamoTables();
   renderSeedTables();
   // Rebuild the Dynamo editor's skeleton only when the effective table
   // changed (first load, table created/dropped, or a manual switch) — never
   // on a routine refresh with the same selection, so in-progress edits survive.
-  if (selectedTable !== lastRenderedTable) {
-    lastRenderedTable = selectedTable;
+  if (dyTable !== lastRenderedDyTable) {
+    lastRenderedDyTable = dyTable;
     dynOnTable();
   }
 }
 
 // ---- tab routing (ADR 0021 follow-up 7: real URLs, refresh/back/forward preserve the tab) ----
-// Two top-level parts (Monitoring / Actions), each a "group" of one or more
-// leaf tabs. Leaf tabs keep their existing ids and `/admin/ui/<tab>` paths
-// unchanged (the server's `is_ui_path` just prefix-matches, and existing
-// bookmarks/tests target these exact leaves), so only the nav's presentation
-// is grouped — routing is untouched.
-const GROUPS = { monitoring: ["nodes", "tablets", "topology", "storage"], actions: ["write"] };
-const TABS = Object.values(GROUPS).flat();
-const lastTabInGroup = { monitoring: "nodes", actions: "write" };
-function groupOf(tab) { return Object.keys(GROUPS).find((g) => GROUPS[g].includes(tab)); }
+// One flat row of leaf tabs; each keeps its existing id and `/admin/ui/<tab>`
+// path (the server's `is_ui_path` just prefix-matches, and existing
+// bookmarks/tests target these exact leaves).
+const TABS = ["nodes", "tablets", "storage", "write"];
 
 function tabFromPath(path) {
   const m = /^\/admin\/ui\/([^/?#]+)/.exec(path);
@@ -254,7 +212,7 @@ function syncStorageUrl() {
 // Apply a pending `{tablet, node}` (from a deep-link URL or a cross-tab jump)
 // to the Storage selects and load its detail. Consumed once — a routine
 // refresh afterward must not keep re-forcing the selection over a manual
-// change, the same discipline `lastRenderedTable` uses for the Dynamo editor.
+// change, the same discipline `lastRenderedDyTable` uses for the Dynamo editor.
 function applyPendingStorageParams() {
   if (!pendingStorageParams) return;
   const { tablet, node } = pendingStorageParams;
@@ -289,12 +247,8 @@ function gotoStorage(tablet, node) {
 // otherwise they're read from the selects' current values.
 function activateTab(tab, opts = {}) {
   if (!TABS.includes(tab)) tab = TABS[0];
-  const group = groupOf(tab);
   activeTab = tab;
-  lastTabInGroup[group] = tab;
-  document.querySelectorAll(".primary button").forEach((x) => x.classList.toggle("active", x.dataset.group === group));
-  document.querySelectorAll(".secondary").forEach((x) => { x.style.display = x.dataset.group === group ? "" : "none"; });
-  document.querySelectorAll(".secondary button").forEach((x) => x.classList.toggle("active", x.dataset.tab === tab));
+  document.querySelectorAll(".primary button").forEach((x) => x.classList.toggle("active", x.dataset.tab === tab));
   document.querySelectorAll("main section").forEach((x) => x.classList.toggle("active", x.id === tab));
   if (!opts.silent) {
     const query = tab === "storage" ? storageQuery(opts.storage) : "";
