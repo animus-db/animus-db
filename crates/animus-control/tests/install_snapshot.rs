@@ -248,9 +248,19 @@ fn large_snapshot_ships_in_o_chunk_time_not_o_state() {
     const PAIR: [NodeId; 2] = [0, 1];
     let now = Nanos(1_000_000_000);
 
-    // Elect node 0 leader of a two-node group.
+    // Elect node 0 leader of a two-node group: time out into a pre-candidacy, take a
+    // pre-vote grant to tip into a real (term-bumping) election, then the vote.
     let mut leader = RaftCore::new(0, &PAIR, Nanos(0), 7);
-    let _ = leader.tick(now, 7);
+    let _ = leader.tick(now, 7); // election timeout -> pre-candidate, PreVote
+    let _ = leader.handle(
+        1,
+        RaftMsg::PreVoteResp {
+            term: leader.term() + 1,
+            granted: true,
+        },
+        now,
+        7,
+    );
     let _ = leader.handle(
         1,
         RaftMsg::RequestVoteResp {
@@ -385,7 +395,17 @@ fn caught_up_control_node_reships_non_empty() {
 
     // --- Source leader (node 0): commit enough members to compact a real snapshot.
     let mut src = RaftCore::new(0, &NODES, Nanos(0), 7);
-    let _ = src.tick(now, 7);
+    let _ = src.tick(now, 7); // election timeout -> pre-candidate, PreVote
+    // A pre-vote grant (self + node 1 = majority) tips into a real election.
+    let _ = src.handle(
+        1,
+        RaftMsg::PreVoteResp {
+            term: src.term() + 1,
+            granted: true,
+        },
+        now,
+        7,
+    );
     let _ = src.handle(
         1,
         RaftMsg::RequestVoteResp {
@@ -432,7 +452,17 @@ fn caught_up_control_node_reships_non_empty() {
 
     // --- Node 1 becomes leader (higher term) and must re-ship to a fresh node 2.
     let later = Nanos(hb.0 + 1_000_000_000);
-    let _ = mid.tick(later, 7); // -> Candidate, term bumps above node 0's
+    let _ = mid.tick(later, 7); // election timeout -> pre-candidate, PreVote
+    // A pre-vote grant (self + node 2 = majority) tips into a real, term-bumping election.
+    let _ = mid.handle(
+        2,
+        RaftMsg::PreVoteResp {
+            term: mid.term() + 1,
+            granted: true,
+        },
+        later,
+        7,
+    );
     let _ = mid.handle(
         2,
         RaftMsg::RequestVoteResp {
