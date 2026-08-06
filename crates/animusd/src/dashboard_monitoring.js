@@ -161,6 +161,75 @@ function renderTablets() {
 
 function nodeRaftkvId(n) { return n.config ? n.config.raftkv_id : "?"; }
 
+// The Topology tab's filter text (by table name or tablet id), kept across
+// refreshes like `selectedTable` — read by `renderTopology`, written by the
+// filter input's own `input` handler (wired in dashboard.html).
+let topoFilter = "";
+
+// Group every tablet into a lane by which node currently leads its CP group;
+// a tablet with no elected leader goes in a dedicated "Leaderless" lane
+// (styled as an incident, not just another bucket) rather than an
+// all-to-all node/tablet diagram, which stops being readable past a
+// handful of tablets. Lanes wrap and scroll via CSS at higher tablet counts;
+// the filter input narrows by table name or tablet id for exact lookup.
+function renderTopology() {
+  const status = STATE.status;
+  const tablets = (status && status.tablets) || {};
+  const ids = Object.keys(tablets).map(Number).sort((a, b) => a - b);
+  if (!ids.length) {
+    $("topology-body").innerHTML = `<div class="empty">no tablets</div>`;
+    return;
+  }
+  const groups = cpGroupsByTablet();
+  const filter = topoFilter.trim().toLowerCase();
+  const matches = (id, t) => !filter
+    || String(id).includes(filter)
+    || (t.table && t.table.toLowerCase().includes(filter));
+
+  const lanes = new Map(); // key: raftkv id (number) or "leaderless" -> entries
+  for (const id of ids) {
+    const t = tablets[id];
+    if (!matches(id, t)) continue;
+    const gs = groups[id] || [];
+    const lead = gs.find((x) => x.g.is_leader);
+    const key = lead ? nodeRaftkvId(lead.node) : "leaderless";
+    if (!lanes.has(key)) lanes.set(key, []);
+    lanes.get(key).push({ id, t, lead, gs });
+  }
+
+  if (!lanes.size) {
+    $("topology-body").innerHTML = `<div class="empty">no tablets match “${esc(topoFilter)}”</div>`;
+    return;
+  }
+
+  // Real leader lanes first (sorted by node id, so the layout is stable
+  // refresh to refresh), "Leaderless" last — it reads as an exception to
+  // investigate, not just another lane.
+  const laneKeys = [...lanes.keys()].filter((k) => k !== "leaderless").sort((a, b) => a - b);
+  if (lanes.has("leaderless")) laneKeys.push("leaderless");
+
+  $("topology-body").innerHTML = laneKeys.map((key) => {
+    const items = lanes.get(key);
+    const leaderless = key === "leaderless";
+    const title = leaderless ? "Leaderless" : `Node ${esc(key)}`;
+    const chips = items.map(({ id, t, lead, gs }) => {
+      const node = lead ? lead.node.base : (gs[0] ? gs[0].node.base : "");
+      const tableLabel = t.table ? `<span class="tlabel">${esc(t.table)}</span>` : "";
+      return `<a href="#" class="topo-chip${leaderless ? " leaderless" : ""}"
+        data-tablet="${esc(id)}" data-node="${esc(node)}">#${esc(id)} ${tableLabel}</a>`;
+    }).join("");
+    return `<div class="topo-lane${leaderless ? " leaderless" : ""}">
+      <h3>${esc(title)} <span class="count">${items.length} tablet(s)</span></h3>
+      <div class="topo-chips">${chips}</div>
+    </div>`;
+  }).join("");
+  document.querySelectorAll("#topology-body .topo-chip").forEach((a) =>
+    a.addEventListener("click", (e) => {
+      e.preventDefault();
+      gotoStorage(a.dataset.tablet, a.dataset.node || null);
+    }));
+}
+
 function renderStorageSelectors() {
   const status = STATE.status;
   const tablets = status && status.tablets ? Object.keys(status.tablets).map(Number).sort((a, b) => a - b) : [1];
