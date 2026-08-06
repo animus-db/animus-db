@@ -119,6 +119,26 @@ async fn handle_conn(mut stream: TcpStream, ctx: ClientCtx) -> std::io::Result<(
             }
             continue;
         }
+        // The dashboard's CSS/JS assets (ADR 0021), served self-contained from the
+        // admin port under exact paths. Checked before `is_ui_path` below, since
+        // that function's `/admin/ui/` prefix match would otherwise swallow these.
+        if request.method == "GET" {
+            if let Some((content_type, body)) = static_asset(&request.path) {
+                http::write_response_with(
+                    &mut stream,
+                    200,
+                    content_type,
+                    body,
+                    keep_alive,
+                    http::CORS_HEADERS,
+                )
+                .await?;
+                if !keep_alive {
+                    return Ok(());
+                }
+                continue;
+            }
+        }
         // The static web dashboard asset (ADR 0021), served self-contained from the
         // admin port. A pure client of the `/admin/*` JSON below.
         if request.method == "GET" && is_ui_path(&request.path) {
@@ -162,6 +182,28 @@ fn is_ui_path(path: &str) -> bool {
         path,
         "/" | "/admin" | "/admin/" | "/admin/ui" | "/index.html"
     ) || path.starts_with("/admin/ui/")
+}
+
+/// The dashboard's non-HTML static assets — CSS/JS files that live under the
+/// same `/admin/ui/` prefix as the tab deep links, but name a real file rather
+/// than a tab, so they need an exact match checked *before* [`is_ui_path`]'s
+/// prefix match (which would otherwise serve the HTML shell for these paths
+/// too). Returns `(content_type, body)`.
+fn static_asset(path: &str) -> Option<(&'static str, &'static str)> {
+    match path {
+        "/admin/ui/dashboard.css" => Some(("text/css; charset=utf-8", crate::dashboard::CSS)),
+        "/admin/ui/dashboard_core.js" => {
+            Some(("text/javascript; charset=utf-8", crate::dashboard::CORE_JS))
+        }
+        "/admin/ui/dashboard_monitoring.js" => Some((
+            "text/javascript; charset=utf-8",
+            crate::dashboard::MONITORING_JS,
+        )),
+        "/admin/ui/dashboard_write.js" => {
+            Some(("text/javascript; charset=utf-8", crate::dashboard::WRITE_JS))
+        }
+        _ => None,
+    }
 }
 
 /// Route a request to its handler, returning `(http status, json body)`.
