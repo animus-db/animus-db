@@ -186,6 +186,22 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   race must be dropped from `pending` (not retried forever — the group will never
   apply that key), detected via any local replica's `applied_split_key()` differing
   from the pending key.
+  **The `pending` map's retry also had a retry-amplification bug, the split-path
+  sibling of the bulk-seeder's (see the root `CLAUDE.md` engineering-practices
+  entry):** it called `propose_split_data` (propose **and** confirm) fresh on
+  every ~2s tick regardless of whether the previous attempt reached `Accepted`.
+  `ProposeResult::Accepted` only means the `Split` entry reached the leader's
+  log, not that it committed, so a bare confirm-timeout usually means "still
+  committing" — proposing again appends a redundant `Split` entry, safe (splits
+  are idempotent at apply time) but wasteful, doubling WAL/replication load
+  under exactly the slow/contended conditions that caused the timeout in the
+  first place. Fixed by `propose_and_confirm_split(leader, split_key,
+  confirm_rounds)`: the pending-retry call (and `cp_split_here`, the
+  cross-process forwarded-split handler, which can't tell whether its caller
+  is about to retry) pass `confirm_rounds: 2`, polling the already-accepted
+  entry a second time before the next tick would otherwise re-propose. The
+  one-shot `trigger_split`/fresh-trigger call sites keep `confirm_rounds: 1`
+  (`propose_split_data`'s default) — byte-identical behavior there.
 - **The cluster's members are the CP `raftkv` nodes, not the control ids.** The
   control ids `0..N` are only the Raft *consensus group* for metadata; `bootstrap`
   (leader-only, idempotent) registers the **raftkv ids** (`300+i`) as `Active`
