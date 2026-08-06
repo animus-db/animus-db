@@ -162,6 +162,7 @@ function render() {
   renderHealthStrip();
   renderNodes();
   renderTablets();
+  renderTopology();
   renderStorageSelectors();
   renderTableSelector();
   renderDynamoTables();
@@ -181,7 +182,7 @@ function render() {
 // unchanged (the server's `is_ui_path` just prefix-matches, and existing
 // bookmarks/tests target these exact leaves), so only the nav's presentation
 // is grouped — routing is untouched.
-const GROUPS = { monitoring: ["nodes", "tablets", "storage"], actions: ["write"] };
+const GROUPS = { monitoring: ["nodes", "tablets", "topology", "storage"], actions: ["write"] };
 const TABS = Object.values(GROUPS).flat();
 const lastTabInGroup = { monitoring: "nodes", actions: "write" };
 function groupOf(tab) { return Object.keys(GROUPS).find((g) => GROUPS[g].includes(tab)); }
