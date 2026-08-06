@@ -42,7 +42,7 @@ use std::time::Duration;
 
 use animus_control::raft::{Out, RaftCore, RaftMsg, StateMachine};
 use animus_control::{PersistedState, ProposeResult};
-use animus_env::{Coresident, Env, EnvExt, NodeId};
+use animus_env::{Coresident, Env, EnvExt, Metric, MetricsHandle, NodeId};
 use animus_storage::{MergeOp, StorageEngine};
 use futures::future::{Either, select};
 use futures::lock::Mutex as AsyncMutex;
@@ -252,6 +252,13 @@ pub struct RaftKvNode<E: Env, S: StorageEngine> {
     /// replicate a freshly appended entry immediately, cutting single-write latency
     /// (ADR 0017) — no waiting on the next heartbeat tick.
     propose_signal: Arc<ProposeSignal>,
+    /// Observability sink (ADR 0015). The public propose API records the real
+    /// accept/reject outcome into it, and the consensus loop + apply task each hold
+    /// a clone for the commit/apply/read-barrier/snapshot recording sites. Cheap to
+    /// clone; defaults to `env.metrics()` (a no-op under `SimEnv`, a real sink under
+    /// `ProdEnv`) — see [`start_with_metrics`](Self::start_with_metrics) to observe
+    /// it under simulation.
+    metrics: MetricsHandle,
 }
 
 /// Invoked on a replica when it **applies** a committed `Split` (ADR 0017 D), with
@@ -266,8 +273,29 @@ pub type SplitHook = Arc<dyn Fn(Vec<u8>, Vec<(Vec<u8>, Vec<u8>)>) + Send + Sync>
 impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// Start a tablet group node over `env`, backed by `storage`. `all_nodes` is
     /// the group's full replica set (including this node). Spawns the driver loop.
+    ///
+    /// Metrics (ADR 0015) are recorded into the env's own sink (`env.metrics()`) —
+    /// for `ProdEnv` a real recording handle, so an assembled production node
+    /// accumulates CP-plane counters with no extra wiring. To observe the counters
+    /// under deterministic simulation (where `SimEnv::metrics()` is the no-op
+    /// default), construct with [`start_with_metrics`](Self::start_with_metrics)
+    /// and pass a recording [`MetricsHandle`] the test keeps.
     pub fn start(env: E, all_nodes: Vec<NodeId>, storage: S) -> Self {
-        Self::start_inner(env, all_nodes, storage, None)
+        let metrics = env.metrics();
+        Self::start_inner(env, all_nodes, storage, None, metrics)
+    }
+
+    /// Like [`start`](Self::start), but records into the supplied `metrics` handle
+    /// instead of `env.metrics()`. Additive (existing callers use `start`); a sim
+    /// test threads a recording handle in here to read counters back without
+    /// editing `animus-sim`.
+    pub fn start_with_metrics(
+        env: E,
+        all_nodes: Vec<NodeId>,
+        storage: S,
+        metrics: MetricsHandle,
+    ) -> Self {
+        Self::start_inner(env, all_nodes, storage, None, metrics)
     }
 
     /// Like [`start`](Self::start) but with a [`SplitHook`] invoked on apply of a
@@ -281,7 +309,8 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         storage: S,
         on_split: SplitHook,
     ) -> Self {
-        Self::start_inner(env, all_nodes, storage, Some(on_split))
+        let metrics = env.metrics();
+        Self::start_inner(env, all_nodes, storage, Some(on_split), metrics)
     }
 
     fn start_inner(
@@ -289,6 +318,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         all_nodes: Vec<NodeId>,
         storage: S,
         on_split: Option<SplitHook>,
+        metrics: MetricsHandle,
     ) -> Self {
         let core = Arc::new(Mutex::new(RaftCore::new(
             env.node_id(),
@@ -316,6 +346,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             stopped: Arc::clone(&stopped),
             apply_stopped: Arc::clone(&apply_stopped),
             propose_signal: Arc::clone(&propose_signal),
+            metrics: metrics.clone(),
         };
         // The consensus loop recovers from the WAL, then spawns the apply task
         // (so the apply task sees the recovered core + the correct
@@ -334,6 +365,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             stopped,
             apply_stopped,
             propose_signal,
+            metrics,
         }));
         node
     }
@@ -375,7 +407,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// `NotLeader` result appends nothing, so there is nothing to replicate — no
     /// wake. The core lock is dropped before the notify.
     fn propose_and_wake(&self, command: KvCommand) -> ProposeResult {
-        let result = self.lock().propose(command);
+        let result = record_propose(&self.metrics, self.lock().propose(command));
         if matches!(result, ProposeResult::Accepted { .. }) {
             self.propose_signal.notify();
         }
@@ -397,7 +429,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// it committed + applied, take the [`ProposeResult::Accepted`] `index` and wait
     /// until `last_applied >= index` (the whole batch has merged by then).
     pub fn put_batch(&self, puts: Vec<(Vec<u8>, Vec<u8>)>) -> ProposeResult {
-        self.lock().propose(KvCommand::Batch(puts))
+        record_propose(&self.metrics, self.lock().propose(KvCommand::Batch(puts)))
     }
 
     /// Propose a delete (tombstone) to this group.
@@ -473,7 +505,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// the control plane drives to move a replica off a failed node onto a spare,
     /// or to grow the group as the cluster grows.
     pub fn change_membership(&self, voters: BTreeSet<NodeId>) -> ProposeResult {
-        let result = self.lock().change_membership(voters);
+        let result = record_reconfigure(&self.metrics, self.lock().change_membership(voters));
         if matches!(result, ProposeResult::Accepted { .. }) {
             self.propose_signal.notify();
         }
@@ -725,6 +757,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             // commits within one replication round on a healthy quorum) rather
             // than risk a read below a previously acked write.
             if self.env.now().0 >= deadline {
+                self.metrics.incr(Metric::CpReadBarriersTimedOut);
                 return false;
             }
             self.env.sleep(READ_POLL).await;
@@ -783,6 +816,16 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             .expect("read state poisoned")
             .pending
             .remove(&epoch);
+        // Record the real outcome of this barrier attempt (not the immediate
+        // not-leader short-circuit above, which never registered one, nor the gate
+        // timeout above, already recorded there): served iff it confirmed
+        // leadership by quorum before its deadline, else it either stepped
+        // down/changed term or genuinely timed out.
+        if ok {
+            self.metrics.incr(Metric::CpReadBarriersServed);
+        } else {
+            self.metrics.incr(Metric::CpReadBarriersTimedOut);
+        }
         ok
     }
 
@@ -919,6 +962,49 @@ impl<E: Coresident, S: StorageEngine + 'static> RaftKvNode<E, S> {
     }
 }
 
+/// Record the real outcome of a data propose (`put`/`put_batch`/`delete`/`cas`/
+/// `propose_split`) — accepted, or rejected because this node is not the leader —
+/// and pass the result through unchanged. ADR 0015: count the outcome, never the
+/// attempt.
+fn record_propose(metrics: &MetricsHandle, result: ProposeResult) -> ProposeResult {
+    match result {
+        ProposeResult::Accepted { .. } => metrics.incr(Metric::CpProposalsAccepted),
+        ProposeResult::NotLeader { .. } => metrics.incr(Metric::CpProposalsRejectedNotLeader),
+    }
+    result
+}
+
+/// Like [`record_propose`] but for a `change_membership` step (direct call or the
+/// automatic [`RaftKvNode::reconfigure_step`]) — kept as its own counter family so
+/// reconfiguration churn is distinguishable from data-write contention.
+fn record_reconfigure(metrics: &MetricsHandle, result: ProposeResult) -> ProposeResult {
+    match result {
+        ProposeResult::Accepted { .. } => metrics.incr(Metric::CpReconfigureAccepted),
+        ProposeResult::NotLeader { .. } => metrics.incr(Metric::CpReconfigureRejected),
+    }
+    result
+}
+
+/// Record the snapshot-shipping metrics implied by the messages the consensus loop
+/// just emitted (ADR 0015), mirroring the control plane's `record_outbound`: every
+/// outbound `InstallSnapshot` is one chunk actually *shipped*; an outbound
+/// `InstallSnapshotResp` whose `last_index > 0` marks a completed *install* on the
+/// follower that just finished (observed here since the follower is what emits the
+/// ack). A pure read of `outs`.
+fn record_kv_outbound(metrics: &MetricsHandle, outs: &[(NodeId, KvWire)]) {
+    for (_, wire) in outs {
+        if let KvWire::Raft(msg) = wire {
+            match msg {
+                RaftMsg::InstallSnapshot { .. } => metrics.incr(Metric::CpSnapshotShips),
+                RaftMsg::InstallSnapshotResp { last_index, .. } if *last_index > 0 => {
+                    metrics.incr(Metric::CpSnapshotInstalls);
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
 /// Persist the core's pending WAL records (append + `fsync`) and advance the
 /// durable watermark so committed entries become applicable. **Runs on the
 /// consensus loop only** and is deliberately cheap — engine apply and compaction
@@ -964,6 +1050,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
     engine_applied: &AtomicU64,
     wal_lock: &AsyncMutex<()>,
     halted: &AtomicBool,
+    metrics: &MetricsHandle,
 ) -> bool {
     let mut did_work = false;
 
@@ -983,6 +1070,9 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
     // The Raft index is the MVCC version: per-key LWW then reproduces the agreed
     // total order, and re-applying on recovery is idempotent.
     let effects = core.lock().expect("raftkv core poisoned").drain_apply();
+    if !effects.is_empty() {
+        metrics.incr_by(Metric::CpApplies, effects.len() as u64);
+    }
     did_work |= !effects.is_empty();
     // Coalesce the WAL `fsync` for a run of plain Put/Delete commands: the apply
     // loop is a single sequential task, so applying each command with its own
@@ -1028,7 +1118,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
             } => {
                 // Drain the pending run so the CAS read observes every earlier
                 // committed write in this apply pass.
-                flush_pending(storage, &mut pending).await;
+                flush_pending(storage, &mut pending, metrics).await;
                 // Read the key's *current committed* value (the latest applied,
                 // since we apply in commit order and earlier entries in this batch
                 // already merged above) and compare to `expected`. Equal → swap;
@@ -1059,7 +1149,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
             KvCommand::Split { at } => {
                 // Drain the pending run so the handoff capture below sees every
                 // earlier committed write in this apply pass.
-                flush_pending(storage, &mut pending).await;
+                flush_pending(storage, &mut pending, metrics).await;
                 // Capture the handed-off range `[at, ∞)` from this replica's
                 // committed state. Every replica applies the same `Split` at the
                 // same point in the command order, so the captured handoff is
@@ -1089,7 +1179,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
     }
     // Apply any trailing Put/Delete run under one final sync. Only now does the
     // engine reflect every index in this pass.
-    flush_pending(storage, &mut pending).await;
+    flush_pending(storage, &mut pending, metrics).await;
     // Publish the watermark: the engine now holds all effects through `max_index`,
     // so linearizable reads may serve up to it and compaction may snapshot up to it.
     if max_index > 0 {
@@ -1130,6 +1220,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
         // The on-demand image: a slow whole-engine scan, done with no locks held,
         // and only when a follower is actually waiting on a snapshot.
         let image = if image_needed {
+            metrics.incr(Metric::CpSnapshotImageBuilds);
             Some(engine_image(storage).await)
         } else {
             None
@@ -1152,6 +1243,11 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 // pending transfer progress on the next heartbeat.
                 (None, 0)
             } else {
+                // The snapshot base actually advanced (a real truncation), whether
+                // driven by the size threshold or by servicing an on-demand image
+                // build above — distinct from `CpSnapshotImageBuilds` (PR #29's
+                // lazy-image design decouples the two).
+                metrics.incr(Metric::CpSnapshotTriggers);
                 let lli = c.last_log_index();
                 let mut buf = Vec::new();
                 for record in c.wal_image() {
@@ -1195,10 +1291,16 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
 
 /// Apply and clear an accumulated run of per-key LWW merges under a single WAL
 /// `fsync` (see the apply loop). A no-op when the run is empty.
-async fn flush_pending<S: StorageEngine>(storage: &S, pending: &mut Vec<MergeOp>) {
+async fn flush_pending<S: StorageEngine>(
+    storage: &S,
+    pending: &mut Vec<MergeOp>,
+    metrics: &MetricsHandle,
+) {
     if pending.is_empty() {
         return;
     }
+    metrics.incr(Metric::CpApplyBatchRuns);
+    metrics.incr_by(Metric::CpApplyBatchSizeSum, pending.len() as u64);
     storage
         .merge_batch(std::mem::take(pending))
         .await
@@ -1273,6 +1375,7 @@ struct DriveState<E: Env, S: StorageEngine> {
     stopped: Arc<AtomicBool>,
     apply_stopped: Arc<AtomicBool>,
     propose_signal: Arc<ProposeSignal>,
+    metrics: MetricsHandle,
 }
 
 /// Idle back-off for the apply task: when there is nothing committed-and-durable to
@@ -1304,6 +1407,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         stopped,
         apply_stopped,
         propose_signal,
+        metrics,
     } = st;
 
     let bytes = env.read(WAL).await.unwrap_or_default();
@@ -1335,6 +1439,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         Arc::clone(&wal_lock),
         Arc::clone(&halted),
         apply_stopped,
+        metrics.clone(),
     ));
 
     loop {
@@ -1350,6 +1455,10 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         let now = env.now();
         let deadline = core.lock().expect("raftkv core poisoned").next_deadline();
         let wait = Duration::from_nanos(deadline.0.saturating_sub(now.0));
+
+        // Snapshot the commit index before stepping the core so a real advance
+        // (ADR 0015: record the outcome, not the attempt) can be attributed below.
+        let before_commit = core.lock().expect("raftkv core poisoned").commit_index();
 
         // Each step yields outbound `KvWire` messages (Raft traffic and/or a read
         // probe ack). Three wakeup sources race: an inbound message, the Raft timer
@@ -1429,6 +1538,12 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
             }
         };
 
+        let after_commit = core.lock().expect("raftkv core poisoned").commit_index();
+        if after_commit > before_commit {
+            metrics.incr_by(Metric::CpCommits, after_commit - before_commit);
+        }
+        record_kv_outbound(&metrics, &outs);
+
         // Durability before action: persist (fsync) before shipping responses, so a
         // granted vote / appended entry is on disk before its message goes out.
         // Engine apply happens independently on the apply task.
@@ -1458,6 +1573,7 @@ async fn apply_loop<E: Env, S: StorageEngine>(
     wal_lock: Arc<AsyncMutex<()>>,
     halted: Arc<AtomicBool>,
     apply_stopped: Arc<AtomicBool>,
+    metrics: MetricsHandle,
 ) {
     loop {
         if halted.load(Ordering::SeqCst) {
@@ -1473,6 +1589,7 @@ async fn apply_loop<E: Env, S: StorageEngine>(
             &engine_applied,
             &wal_lock,
             &halted,
+            &metrics,
         )
         .await;
         if !did_work {
