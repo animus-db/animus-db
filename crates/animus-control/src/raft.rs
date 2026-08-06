@@ -298,6 +298,16 @@ pub struct RaftCore<C = MetaCommand, S = Metadata> {
     // Leader state.
     next_index: BTreeMap<NodeId, u64>,
     match_index: BTreeMap<NodeId, u64>,
+    // The index of the first entry this node appended in its current leadership
+    // term — the election no-op from `become_leader`. Raft §6.4 / the
+    // reconfiguration erratum: a fresh leader's `commit_index` is guaranteed to
+    // cover every entry acked by prior leaders only once an entry of its *own*
+    // term commits (the commit rule never counts old-term replicas toward a
+    // majority), so ReadIndex barriers and membership changes must first wait for
+    // `commit_index >= first_term_index`. Only meaningful while `role == Leader`
+    // (see [`first_term_index`](Self::first_term_index)); re-set on every
+    // election win.
+    first_term_index: u64,
     // Per-follower byte offset reached in the in-flight snapshot transfer, so the
     // leader resumes shipping the next chunk on each heartbeat / ack. Cleared for
     // a peer once it has fully installed the snapshot.
@@ -316,8 +326,11 @@ pub struct RaftCore<C = MetaCommand, S = Metadata> {
     heartbeat_deadline: Nanos,
 
     // Applied state machine and the order commands were applied (for tests /
-    // divergence checks). For a `DRIVER_APPLIED` state machine `metadata` is an
-    // unused unit placeholder and `applied` stays empty — committed commands ride
+    // divergence checks). `applied` holds only the window since the last
+    // snapshot: `snapshot_upto` drops the covered prefix alongside the log
+    // truncation (and install clears it), so it stays bounded in production.
+    // For a `DRIVER_APPLIED` state machine `metadata` is an unused unit
+    // placeholder and `applied` stays empty — committed commands ride
     // `pending_apply` to the driver instead.
     metadata: S,
     applied: Vec<C>,
@@ -378,6 +391,7 @@ where
             votes: BTreeSet::new(),
             next_index: BTreeMap::new(),
             match_index: BTreeMap::new(),
+            first_term_index: 0,
             snapshot_offset: BTreeMap::new(),
             incoming_snapshot: None,
             election_base: Duration::from_millis(150),
@@ -558,6 +572,18 @@ where
         // (the config entry may be in the prefix we are about to drop).
         self.snapshot_config = Some(self.config_at(new_index));
         self.log.retain(|e| e.index > new_index);
+        // Drop the retained applied-command history the snapshot now covers,
+        // mirroring the log truncation (and the clear `InstallSnapshot` already
+        // does). `applied` exists for tests / divergence checks over the
+        // *uncompacted* window; without this it grows unboundedly in production —
+        // one command per commit, forever (the commit-path memory leak). The tail
+        // beyond `new_index` (the last `last_applied - new_index` commands) is
+        // kept so the retention window matches the retained log.
+        let covered = self
+            .applied
+            .len()
+            .saturating_sub((self.last_applied - new_index) as usize);
+        self.applied.drain(..covered);
         self.snapshot_index = new_index;
         self.snapshot_term = new_term;
         self.snapshot_dirty = true;
@@ -630,6 +656,20 @@ where
         self.commit_index
     }
 
+    /// While leader, the log index of the **first entry this node appended in its
+    /// current term** — the election no-op from `become_leader`; `None` off-leader.
+    ///
+    /// Raft §6.4 (and the membership-change erratum): a freshly elected leader's
+    /// log contains every committed entry (leader completeness), but its
+    /// `commit_index` may still lag entries the *previous* leader committed and
+    /// acked, because the commit rule never counts old-term entries toward a
+    /// majority. Only once `commit_index() >= first_term_index()` is the leader's
+    /// commit index guaranteed to cover everything previously acked — the gate a
+    /// ReadIndex barrier and a membership change must clear before acting.
+    pub fn first_term_index(&self) -> Option<u64> {
+        (self.role == Role::Leader).then_some(self.first_term_index)
+    }
+
     /// Highest log index known durable on disk (the **durable-before-visible**
     /// frontier; see [`RaftCore::mark_durable_through`]).
     pub fn durable_index(&self) -> u64 {
@@ -659,7 +699,11 @@ where
         self.metadata.clone()
     }
 
-    /// The sequence of commands applied so far, in order.
+    /// The commands applied **since the last snapshot**, in order — a bounded
+    /// window for tests / divergence checks, not the full history. The prefix a
+    /// snapshot covers is dropped alongside the log truncation
+    /// ([`snapshot_upto`](Self::snapshot_upto)) and on `InstallSnapshot`, so this
+    /// does not grow unboundedly in production.
     pub fn applied(&self) -> Vec<C> {
         self.applied.clone()
     }
@@ -788,6 +832,22 @@ where
         if self.role != Role::Leader {
             return ProposeResult::NotLeader {
                 leader: self.leader_id,
+            };
+        }
+        // The membership-change erratum guard (Raft §4 / Ongaro's bug report):
+        // append no config entry until this leader has **committed an entry in
+        // its current term** (its election no-op). Before that point the leader's
+        // `commit_index` may lag entries a prior leader committed — in particular
+        // an earlier *config* entry could still be uncommitted from this leader's
+        // view, so `config_change_in_flight` (which compares against the honest
+        // `commit_index`) would already hold it off; this explicit gate replaces
+        // that subtle composed argument with the standard, self-evident rule.
+        // Rejected NotLeader-style (self hint) like the other no-op rejections; a
+        // caller (e.g. the reconfigure loop) simply retries after the no-op
+        // commits — one round trip after election.
+        if self.commit_index < self.first_term_index {
+            return ProposeResult::NotLeader {
+                leader: Some(self.id),
             };
         }
         let delta = self.config.symmetric_difference(&voters).count();
@@ -1581,12 +1641,22 @@ where
         // A fresh term restarts any snapshot transfer from offset 0.
         self.snapshot_offset.clear();
         // No-op entry so prior-term entries can be committed under our term.
+        // Record its index: it is this leader's first current-term entry, the
+        // watermark ReadIndex barriers and membership changes gate on
+        // (`first_term_index`, Raft §6.4).
+        self.first_term_index = last + 1;
         self.log_append(LogEntry {
             term: self.current_term,
             index: last + 1,
             command: S::noop(),
             config: None,
         });
+        // Let a single-node group commit its no-op immediately (majority == 1);
+        // in a larger group commit still waits on follower `matchIndex`. Without
+        // this a sole leader's `first_term_index` gate would hold reads and
+        // membership changes until its next propose.
+        self.maybe_advance_commit();
+        self.apply();
         self.heartbeat_deadline = Nanos(now.0.saturating_add(self.heartbeat_nanos()));
         self.broadcast_append()
     }

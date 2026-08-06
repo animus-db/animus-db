@@ -48,9 +48,19 @@ epoch compare-and-swap transactions.
   config-in-log (ADR 0017 C):** `LogEntry` may carry a `config: Option<voters>`;
   `RaftCore` keeps `peers`/`cluster_size` in sync with the latest log config (the
   config rides snapshots + `InstallSnapshot`), and `change_membership` appends a
-  single-server config entry (one-in-flight, no leader self-removal). The control
-  plane never reconfigures, so its config stays `= initial_config` and its
-  behavior is unchanged. **Pre-vote (ADR 0009):** an election-timeout no longer
+  single-server config entry (one-in-flight, no leader self-removal, **and gated
+  on the leader having committed a current-term entry** — the reconfiguration
+  erratum guard: rejected until `commit_index >= first_term_index()`, the index
+  of the election no-op recorded in `become_leader`; that accessor is also what
+  the data plane's ReadIndex barrier gates on, Raft §6.4). `become_leader` also
+  advances commit after appending its no-op, so a **single-node** group commits
+  it immediately — which is what makes a restarted sole voter re-apply its
+  recovered WAL tail (per `recovered`'s contract) instead of waiting for the
+  next propose. The control plane never reconfigures, so its config stays
+  `= initial_config` and its behavior is unchanged. `applied()` is a **bounded
+  window** (commands since the last snapshot — `snapshot_upto` drops the covered
+  prefix, so it can't grow unboundedly in production); compare divergence before
+  the snapshot threshold. **Pre-vote (ADR 0009):** an election-timeout no longer
   campaigns directly — the node becomes a `Role::PreCandidate` and runs a
   `RaftMsg::PreVote`/`PreVoteResp` round **without bumping its term**; only a
   pre-vote majority triggers the real, term-incrementing `start_election`. Peers

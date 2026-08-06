@@ -184,7 +184,9 @@ impl<E: Env> RaftNode<E> {
         self.lock().metadata()
     }
 
-    /// The sequence of commands applied so far, in order.
+    /// The commands applied **since the last snapshot**, in order (a bounded
+    /// window for tests / divergence checks — compaction drops the covered
+    /// prefix, so compare it before the snapshot threshold is crossed).
     pub fn applied(&self) -> Vec<MetaCommand> {
         self.lock().applied()
     }

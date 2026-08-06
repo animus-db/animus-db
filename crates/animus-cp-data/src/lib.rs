@@ -660,21 +660,52 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         Some(pairs)
     }
 
-    /// The **ReadIndex read barrier** (ADR 0017 B.2): record `read_index =
-    /// commit_index` for the current term, confirm via a quorum of read-probe acks
-    /// that we are still the leader for that term (no log entry, no wall clock),
-    /// and wait until applied state reaches `read_index`. Returns `true` when it is
-    /// safe to serve a local read linearizably; `false` if this node is not (or
-    /// stops being) the leader, or confirmation times out — so a deposed leader
-    /// never serves a stale read (a newer leader needs a quorum at a higher term,
-    /// which rejects the probe). Shared by `linearizable_get` + `linearizable_scan`.
+    /// The **ReadIndex read barrier** (ADR 0017 B.2): wait until this leader has
+    /// committed an entry of its **own term** (Raft §6.4 — see below), record
+    /// `read_index = commit_index` for the current term, confirm via a quorum of
+    /// read-probe acks that we are still the leader for that term (no log entry,
+    /// no wall clock), and wait until applied state reaches `read_index`. Returns
+    /// `true` when it is safe to serve a local read linearizably; `false` if this
+    /// node is not (or stops being) the leader, or confirmation times out — so a
+    /// deposed leader never serves a stale read (a newer leader needs a quorum at
+    /// a higher term, which rejects the probe). Shared by `linearizable_get` +
+    /// `linearizable_scan`.
+    ///
+    /// **The current-term-commit gate is mandatory for linearizability** (the
+    /// dissertation's second ReadIndex requirement): a freshly elected leader's
+    /// log contains every committed entry (leader completeness), but its
+    /// `commit_index` may still lag an entry the *previous* leader committed and
+    /// acked — the commit rule never counts old-term entries toward a majority.
+    /// Capturing `read_index = commit_index` in that window (with only the term
+    /// probe, which involves no log state) would serve a read *below* an acked
+    /// write: a stale read. So the barrier first waits (bounded by the same
+    /// [`READ_TIMEOUT`]) for `commit_index` to reach the leader's first
+    /// current-term entry (its election no-op, [`RaftCore::first_term_index`]);
+    /// committing that no-op also commits every prior-term entry beneath it. An
+    /// established leader passes the gate immediately (no extra latency).
     async fn read_barrier(&self) -> bool {
-        let (term, read_index) = {
-            let c = self.lock();
-            if !c.is_leader() {
+        let deadline = self.env.now().0 + READ_TIMEOUT.as_nanos() as u64;
+        let (term, read_index) = loop {
+            let captured = {
+                let c = self.lock();
+                if !c.is_leader() {
+                    return false;
+                }
+                let first = c
+                    .first_term_index()
+                    .expect("a leader has a first-term index");
+                (c.commit_index() >= first).then(|| (c.term(), c.commit_index()))
+            };
+            if let Some(state) = captured {
+                break state;
+            }
+            // Fresh leader whose no-op has not committed yet: wait for it (it
+            // commits within one replication round on a healthy quorum) rather
+            // than risk a read below a previously acked write.
+            if self.env.now().0 >= deadline {
                 return false;
             }
-            (c.term(), c.commit_index())
+            self.env.sleep(READ_POLL).await;
         };
         // Register the read barrier (self trivially confirms its own term).
         let epoch = {
@@ -696,8 +727,10 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             }
         }
 
+        // The confirmation wait shares the barrier's one deadline (set above), so
+        // the whole barrier — gate + probe + applied wait — is bounded by a single
+        // READ_TIMEOUT.
         let majority = self.majority();
-        let deadline = self.env.now().0 + READ_TIMEOUT.as_nanos() as u64;
         let ok = loop {
             // Still the leader for this term? A step-down/term change invalidates
             // the barrier — fail rather than risk a stale read.

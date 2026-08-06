@@ -139,11 +139,22 @@ the engine — the `AccordCore` sync-core/async-driver split.
 - **B.1 (done)** — single-group driver + write path; `tests/single_tablet.rs`
   (writes replicate + apply on every replica; survive a leader kill + rejoin
   catch-up; trace reproducibility).
-- **B.2 (done)** — linearizable **ReadIndex** reads (`linearizable_get`): a
-  read-barrier quorum probe (`KvWire::ReadProbe`/`Ack`, driver-only) confirms the
-  leader still leads its term, then it serves locally once applied. No log entry,
-  no wall clock. `tests/read_index.rs` (reads reflect committed writes + RYW; a
-  deposed/partitioned leader returns `None`, never a stale value).
+- **B.2 (done)** — linearizable **ReadIndex** reads (`linearizable_get`): the
+  barrier first waits for the leader to have **committed an entry of its own
+  term** (Raft §6.4's mandatory half — `commit_index >=
+  RaftCore::first_term_index()`, the election no-op; a fresh leader's log holds
+  every acked entry but its `commit_index` may not cover one the old leader
+  committed, and the term-only probe can't see that), then a read-barrier quorum
+  probe (`KvWire::ReadProbe`/`Ack`, driver-only) confirms the leader still leads
+  its term, then it serves locally once applied (gated on `engine_applied`). No
+  log entry, no wall clock; the whole barrier shares one `READ_TIMEOUT`.
+  `tests/read_index.rs` (reads reflect committed writes + RYW; a
+  deposed/partitioned leader returns `None`, never a stale value) and
+  `tests/read_index_fresh_leader.rs` (drives *into* the fresh-leader window at
+  1ms sim granularity — uncommitted acked entry on the heir + a ~40-entries-
+  behind third replica so the no-op commit needs ~40 backtrack round-trips while
+  the probe needs one; the read must wait and serve the acked value, never the
+  stale one).
 - **CAS (done)** — linearizable **compare-and-swap** (`cas`/`cas_result`/
   `compare_and_swap`, `KvCommand::Cas`). Decided at apply time in commit order
   against the committed engine state (deterministic; sync `RaftCore` untouched —
