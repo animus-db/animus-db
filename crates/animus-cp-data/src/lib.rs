@@ -49,6 +49,8 @@ use futures::lock::Mutex as AsyncMutex;
 use futures::task::AtomicWaker;
 use serde::{Deserialize, Serialize};
 
+mod codec;
+
 /// The **wake-on-propose** signal (ADR 0017 single-write-latency fix): a shared
 /// flag + executor-agnostic waker that lets a proposer (`put`/`delete`/`cas`/
 /// `propose_split`/`change_membership`) nudge the consensus loop to replicate the
@@ -161,9 +163,11 @@ type KvCore = RaftCore<KvCommand, KvState>;
 /// The data-plane wire: Raft consensus traffic plus the **ReadIndex** read-barrier
 /// probes (ADR 0017). The probes are *not* consensus traffic — they never touch
 /// `RaftCore`; the driver handles them — so ReadIndex lives entirely in this crate
-/// and the shared `RaftCore`/`RaftMsg` are untouched.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-enum KvWire {
+/// and the shared `RaftCore`/`RaftMsg` are untouched. Framed with the crate's
+/// compact **binary codec** ([`codec`], audit P2) — not serde_json, whose
+/// decimal-array rendering of `Vec<u8>` payloads cost ~3–4x on the wire.
+#[derive(Clone, Debug)]
+pub(crate) enum KvWire {
     /// A control-plane-shaped Raft message for this group.
     Raft(RaftMsg<KvCommand>),
     /// Leader → peers: "are you still in term `term`?" (a ReadIndex barrier,
@@ -644,16 +648,34 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         if !self.read_barrier().await {
             return None;
         }
-        let mut pairs: Vec<(Vec<u8>, Vec<u8>)> = self
-            .storage
-            .entries()
-            .await
-            .ok()?
-            .into_iter()
-            .filter(|(k, _)| k.as_slice() >= start && end.is_none_or(|e| k.as_slice() < e))
-            .map(|(k, vv)| (k, vv.value))
-            .collect();
-        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        // Push the range down into the engine (audit P4): a bounded scan reads
+        // only `[start, end)` instead of materializing the whole tablet and
+        // filtering; both `scan` and `entries` return key-ordered results by the
+        // `StorageEngine` contract, so the old re-sort was redundant — drop it
+        // and apply the limit to the already-ordered rows. An unbounded-above
+        // scan (`end == None`, e.g. a full-table `Scan`) still goes through
+        // `entries()` — the trait's `scan` takes a finite exclusive bound and
+        // arbitrary byte keys have no max sentinel; pushing a limit *into* the
+        // engine is a `StorageEngine` API change, out of scope here.
+        let mut pairs: Vec<(Vec<u8>, Vec<u8>)> = match end {
+            Some(e) => self
+                .storage
+                .scan(start, e)
+                .await
+                .ok()?
+                .into_iter()
+                .map(|(k, vv)| (k, vv.value))
+                .collect(),
+            None => self
+                .storage
+                .entries()
+                .await
+                .ok()?
+                .into_iter()
+                .filter(|(k, _)| k.as_slice() >= start)
+                .map(|(k, vv)| (k, vv.value))
+                .collect(),
+        };
         if let Some(n) = limit {
             pairs.truncate(n);
         }
@@ -719,8 +741,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         };
         // Probe peers immediately (periodic heartbeats would also carry it, but an
         // explicit probe confirms promptly).
-        let probe =
-            serde_json::to_vec(&KvWire::ReadProbe { term, epoch }).expect("probe serializes");
+        let probe = codec::encode_wire(&KvWire::ReadProbe { term, epoch });
         for &p in &self.all_nodes {
             if p != self.env.node_id() {
                 self.env.send(p, probe.clone()).await;
@@ -813,6 +834,20 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// Highest applied log index (the MVCC version high-water mark).
     pub fn last_applied(&self) -> u64 {
         self.lock().last_applied()
+    }
+
+    /// Highest Raft log index whose effects the **engine** has merged — the same
+    /// watermark linearizable reads gate on (the async apply task advances it
+    /// after each merge; the core's `last_applied` is only the buffer cursor and
+    /// *leads* the engine). This is the **confirm-by-index** primitive (audit
+    /// A4): a proposer holding a [`ProposeResult::Accepted`] `index` confirms its
+    /// write is committed *and applied* by checking `engine_applied_index() >=
+    /// index` while this node is still the leader **in the proposal's term** —
+    /// exact under concurrency, unlike polling for value equality, which
+    /// false-negatives when a concurrent later write to the same key overwrites
+    /// the proposed value before the poll observes it.
+    pub fn engine_applied_index(&self) -> u64 {
+        self.engine_applied.load(Ordering::SeqCst)
     }
 
     /// Highest log index known durable on disk (durable-before-visible frontier).
@@ -1061,59 +1096,95 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
         engine_applied.fetch_max(max_index, Ordering::SeqCst);
     }
 
-    // Compact once the *engine* has merged enough past the snapshot base: snapshot
-    // the engine image (so a lagging follower can be caught up via
-    // `InstallSnapshot`), truncate the Raft log prefix, and rewrite the WAL to its
-    // bounded image (ADR 0017 A.2). We snapshot only up to `engine_applied`, not the
-    // core's `last_applied` (which the async apply lags) — else the truncated log
-    // prefix would run past what the engine image contains. This task is the only
-    // engine writer, so nothing merges between reading `ea` and the snapshot below,
-    // making the image reflect exactly `ea`.
+    // Compact once the *engine* has merged enough past the snapshot base: truncate
+    // the Raft log prefix and rewrite the WAL to its bounded image (ADR 0017 A.2).
+    // We snapshot only up to `engine_applied`, not the core's `last_applied`
+    // (which the async apply lags) — else the truncated log prefix would run past
+    // what the engine state contains. This task is the only engine writer, so
+    // nothing merges between reading `ea` and the snapshot below.
+    //
+    // **The engine image is built lazily, on demand** (audit P1/P5): threshold
+    // compaction alone no longer scans + serializes the whole tablet — that cost
+    // was paid every `COMPACT_THRESHOLD` applies on every replica, and the image
+    // then sat resident in the core forever, whether or not any follower ever
+    // needed a snapshot. Instead, when the core's replication path actually needs
+    // to ship an `InstallSnapshot` and has no image (`take_snapshot_needed`), this
+    // pass scans the engine once, re-bases the snapshot to exactly what that image
+    // reflects (`snapshot_upto(ea)` *before* `set_snapshot_blob`, so base and
+    // image agree), and installs it; the core drops the image again once no
+    // transfer is in flight. A `KvState` WAL snapshot record carries only the unit
+    // placeholder, so the threshold rewrite never needed the image bytes.
     let ea = engine_applied.load(Ordering::SeqCst);
-    let behind = ea.saturating_sub(core.lock().expect("raftkv core poisoned").snapshot_index());
+    let (behind, image_needed) = {
+        let mut c = core.lock().expect("raftkv core poisoned");
+        (
+            ea.saturating_sub(c.snapshot_index()),
+            c.take_snapshot_needed(),
+        )
+    };
     // Skip compaction once a shutdown is requested: it is only a WAL-bounding
     // optimization (the engine + un-truncated WAL stay consistent without it), and
     // starting a full WAL rewrite while the env is being torn down races the task
     // abort — the `replace` can then fail on a half-gone data dir.
-    if behind >= COMPACT_THRESHOLD && !halted.load(Ordering::SeqCst) {
-        let image = engine_image(storage).await; // slow scan, no locks held
+    if (behind >= COMPACT_THRESHOLD || image_needed) && !halted.load(Ordering::SeqCst) {
+        // The on-demand image: a slow whole-engine scan, done with no locks held,
+        // and only when a follower is actually waiting on a snapshot.
+        let image = if image_needed {
+            Some(engine_image(storage).await)
+        } else {
+            None
+        };
         // Serialize the WAL rewrite against the consensus loop's appends.
         let _wal = wal_lock.lock().await;
         let (bytes, lli) = {
             let mut c = core.lock().expect("raftkv core poisoned");
-            c.set_snapshot_blob(image);
+            // Advance the base to exactly the engine state (`snapshot_upto` drops
+            // any stale image + in-flight transfer offsets), THEN install the
+            // fresh image built from that same state — order matters, or the
+            // base-move would drop the image we just built.
             c.snapshot_upto(ea);
-            let lli = c.last_log_index();
-            let mut buf = Vec::new();
-            for record in c.wal_image() {
-                buf.extend(PersistedState::encode_record(&record));
+            if let Some(image) = image {
+                c.set_snapshot_blob(image);
             }
-            c.take_snapshot_dirty();
-            // The rewrite (below) makes the whole current log durable, so the
-            // consensus loop's accumulated pending append records are now redundant
-            // — drop them (`replay` is push-based, so re-appending them would
-            // duplicate entries). `wal_image` already captures the net durable state
-            // (snapshot + hard + log tail). Under this one lock hold, so no
-            // propose/append interleaves.
-            let _ = c.drain_persist();
-            (buf, lli)
+            if !c.take_snapshot_dirty() {
+                // The base did not move (e.g. an image rebuild at an unchanged
+                // base): nothing to rewrite. The installed image alone makes the
+                // pending transfer progress on the next heartbeat.
+                (None, 0)
+            } else {
+                let lli = c.last_log_index();
+                let mut buf = Vec::new();
+                for record in c.wal_image() {
+                    buf.extend(PersistedState::encode_record(&record));
+                }
+                // The rewrite (below) makes the whole current log durable, so the
+                // consensus loop's accumulated pending append records are now
+                // redundant — drop them (`replay` is push-based, so re-appending
+                // them would duplicate entries). `wal_image` already captures the
+                // net durable state (snapshot + hard + log tail). Under this one
+                // lock hold, so no propose/append interleaves.
+                let _ = c.drain_persist();
+                (Some(buf), lli)
+            }
         };
-        match env.replace(WAL, &bytes).await {
-            Ok(()) => {
-                // Physically durable now — advance the watermark.
-                core.lock()
-                    .expect("raftkv core poisoned")
-                    .mark_durable_through(lli);
-            }
-            // A shutdown that landed mid-rewrite (aborting tasks + dropping the data
-            // dir) can fail the `replace`; tolerate it only while halted — the
-            // pre-compaction WAL is still intact, so recovery is unaffected. A
-            // failure while *not* halted is a real durability fault → surface it.
-            Err(e) => {
-                assert!(
-                    halted.load(Ordering::SeqCst),
-                    "raftkv wal compaction failed while running: {e}"
-                );
+        if let Some(bytes) = bytes {
+            match env.replace(WAL, &bytes).await {
+                Ok(()) => {
+                    // Physically durable now — advance the watermark.
+                    core.lock()
+                        .expect("raftkv core poisoned")
+                        .mark_durable_through(lli);
+                }
+                // A shutdown that landed mid-rewrite (aborting tasks + dropping the
+                // data dir) can fail the `replace`; tolerate it only while halted —
+                // the pre-compaction WAL is still intact, so recovery is unaffected.
+                // A failure while *not* halted is a real durability fault → surface.
+                Err(e) => {
+                    assert!(
+                        halted.load(Ordering::SeqCst),
+                        "raftkv wal compaction failed while running: {e}"
+                    );
+                }
             }
         }
         did_work = true;
@@ -1148,7 +1219,7 @@ async fn keys_from<S: StorageEngine>(storage: &S, at: &[u8]) -> Vec<(Vec<u8>, Ve
 }
 
 /// One key's snapshot entry: `(key, value-or-tombstone, version)`.
-type ImageEntry = (Vec<u8>, Option<Vec<u8>>, u64);
+pub(crate) type ImageEntry = (Vec<u8>, Option<Vec<u8>>, u64);
 
 /// Serialize the engine's full contents (including tombstones) as the snapshot
 /// image shipped to a lagging follower.
@@ -1157,13 +1228,13 @@ async fn engine_image<S: StorageEngine>(storage: &S) -> Vec<u8> {
         .entries_with_tombstones()
         .await
         .expect("raftkv engine scan");
-    serde_json::to_vec(&entries).expect("engine image serializes")
+    codec::encode_image(&entries)
 }
 
 /// Write a received snapshot image into the engine (a follower catching up),
 /// versioned so per-key LWW keeps it consistent with the log tail merged on top.
 async fn install_engine_image<S: StorageEngine>(storage: &S, bytes: &[u8]) {
-    let entries: Vec<ImageEntry> = match serde_json::from_slice(bytes) {
+    let entries: Vec<ImageEntry> = match codec::decode_image(bytes) {
         Ok(e) => e,
         Err(err) => {
             tracing::warn!(?err, "undecodable raftkv snapshot image dropped");
@@ -1308,7 +1379,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
             }
             Either::Right((Either::Left((envelope, _)), _)) => {
                 let entropy = env.next_u64();
-                match serde_json::from_slice::<KvWire>(&envelope.payload) {
+                match codec::decode_wire(&envelope.payload) {
                     Ok(KvWire::Raft(msg)) => {
                         let raft_outs: Vec<Out<KvCommand>> = core
                             .lock()
@@ -1364,8 +1435,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         persist_wal(&env, &core, &wal_lock).await;
 
         for (to, wire) in outs {
-            let bytes = serde_json::to_vec(&wire).expect("raftkv message serializes");
-            env.send(to, bytes).await;
+            env.send(to, codec::encode_wire(&wire)).await;
         }
     }
 }

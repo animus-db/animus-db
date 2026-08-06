@@ -130,3 +130,49 @@ fn run_is_deterministic_from_seed() {
         "same seed must reproduce the trace"
     );
 }
+
+/// The **confirm-by-index** accessor (audit A4): `engine_applied_index()` is the
+/// watermark the assembly layer checks against a `ProposeResult::Accepted`
+/// index to confirm "my write is committed and merged into the engine", instead
+/// of polling value equality (which false-negatives when a concurrent later
+/// write to the same key overwrites the proposed value before the poll sees it).
+#[test]
+fn engine_applied_index_confirms_a_specific_proposal() {
+    let seed = 0xA4C0;
+    let (mut sim, nodes) = group(seed);
+    sim.run_for(Duration::from_secs(2));
+    let l = leader(&nodes, &[0, 1, 2], seed);
+
+    // Before any client write, the watermark sits below any future index.
+    let base = nodes[l].engine_applied_index();
+
+    let index = match nodes[l].put(b"confirm".to_vec(), b"v1".to_vec()) {
+        animus_control::ProposeResult::Accepted { index } => index,
+        other => panic!("put not accepted: {other:?} (seed={seed})"),
+    };
+    assert!(
+        index > base,
+        "a fresh proposal's index is above the watermark"
+    );
+    // Immediately overwrite the same key — the value-equality poll this
+    // accessor replaces would now never observe `v1`.
+    assert!(matches!(
+        nodes[l].put(b"confirm".to_vec(), b"v2".to_vec()),
+        animus_control::ProposeResult::Accepted { .. }
+    ));
+    sim.run_for(Duration::from_secs(2));
+
+    // The watermark confirms the *first* proposal applied even though its value
+    // was long since overwritten.
+    assert!(
+        nodes[l].engine_applied_index() >= index,
+        "engine watermark must cover the accepted index (seed={seed})"
+    );
+    assert!(nodes[l].is_leader(), "still leader in the proposal's term");
+    // And the engine indeed serves the later value — equality-polling for v1
+    // would have hung.
+    assert_eq!(
+        block_on(nodes[l].local_get(b"confirm")),
+        Some(b"v2".to_vec())
+    );
+}

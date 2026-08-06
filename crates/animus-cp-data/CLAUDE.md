@@ -47,7 +47,15 @@ the engine — the `AccordCore` sync-core/async-driver split.
   `role`/`term`/`commit_index`/`last_applied`/`durable_index`/`snapshot_index`/
   `log_len` (thin locks over `RaftCore`), and `storage()` (a `&S` borrow so the
   assembly layer can surface the engine's SSTable/WAL debug views without engine
-  state leaking into the consensus core).
+  state leaking into the consensus core). **`engine_applied_index()`** is the
+  confirm-by-index primitive (audit A4): the engine-merge watermark linearizable
+  reads gate on, so a proposer confirms a specific `Accepted { index }` applied
+  (`engine_applied_index() >= index` while still leader in the proposal's term)
+  instead of polling value equality, which false-negatives under a concurrent
+  same-key overwrite. `linearizable_scan` pushes a bounded range into
+  `storage.scan(start, end)` (key-ordered by contract — no re-sort, no
+  whole-tablet materialization); only the unbounded-above case still reads
+  `entries()` (the trait's `scan` has no open upper bound).
 - `KvWire` — the data-plane wire enum wrapping `RaftMsg` plus the ReadIndex
   read-barrier probes (`ReadProbe`/`ReadProbeAck`). The probes are driver-only, so
   ReadIndex lives entirely in this crate and the shared `RaftCore`/`RaftMsg` are
@@ -162,15 +170,26 @@ the engine — the `AccordCore` sync-core/async-driver split.
   log index. `tests/cas.rs` (concurrent same-`expected` race → exactly one winner,
   agreed on every replica; CAS-if-absent; a successful CAS survives `stop`+restart
   via WAL replay re-apply; seed sweep + trace reproducibility).
-- **A.2 (done)** — compaction + streaming `InstallSnapshot`. The driver compacts
-  once `COMPACT_THRESHOLD` entries apply: it snapshots the **engine image**
-  (`set_snapshot_blob`), the core truncates the log prefix, and the WAL is
-  rewritten to its bounded image. A lagging follower (behind the compacted prefix)
-  is caught up by the chunked `InstallSnapshot` carrying the engine bytes, which
-  the driver writes into its engine (`drain_pending_install` → `merge`), then
-  replays the log tail on top. The `RaftCore` snapshot path branches on
-  `DRIVER_APPLIED` (engine blob vs. in-core `metadata`), so the control plane is
-  unchanged. `tests/snapshot_catchup.rs` (crash a follower, write past the
+- **A.2 (done)** — compaction + streaming `InstallSnapshot`, with **lazy
+  on-demand engine images** (audit P1/P5). The driver compacts once
+  `COMPACT_THRESHOLD` entries apply: the core truncates the log prefix and the
+  WAL is rewritten to its bounded image — **no whole-tablet scan/serialize on
+  the threshold path**, and no image retained in the core at rest. Only when a
+  replication attempt actually needs to ship a snapshot does the core raise
+  `RaftCore::take_snapshot_needed`; the apply task then scans the engine
+  (`engine_image`), re-bases (`snapshot_upto(engine_applied)` *before*
+  `set_snapshot_blob`, so base and image agree), and the next heartbeat ships
+  the chunks. The receiving follower writes the bytes into its engine
+  (`drain_pending_install` → `merge`) and replays the log tail on top; it does
+  *not* retain the bytes — a later re-ship regenerates from its engine (the
+  second-hop invariant, and it now also covers a **recovered** leader, which
+  used to ship 0 bytes until its next compaction). Wire + image ride the
+  crate's compact **binary codec** (`codec.rs`, audit P2 — length-prefixed
+  framing like the storage manifest codec; serde_json's decimal-array `Vec<u8>`
+  rendering cost ~3–4x; decode failures are loud: magic/version-checked `Err`s
+  logged before the message is dropped; the Raft WAL keeps the shared
+  control-plane serde_json `PersistedState` format).
+  `tests/snapshot_catchup.rs` (crash a follower, write past the
   threshold so the leader compacts, restart → it catches up via snapshot).
 - **C (done)** — single-server Raft **membership change** (`change_membership`):
   config lives in the log (`RaftCore`, branched so the control plane is unchanged);

@@ -78,6 +78,17 @@ pub struct Metadata {
     /// keeps pre-Phase-2 snapshots loading (empty map).
     #[serde(default)]
     pub cp_member_addrs: BTreeMap<NodeId, String>,
+    /// Which **tablet** each registered CP member id belongs to (ADR 0024 GC):
+    /// recorded when [`MetaCommand::RegisterCpAddr`] carries its `tablet`, and the
+    /// key the address GC prunes on — when a tablet leaves the map (drop-table,
+    /// merge), every member-addr entry recorded against it is removed from both
+    /// maps, closing the designed leak. Keyed on **current absence** (mirroring
+    /// the file GC's discipline), so a replayed historical map state cannot
+    /// permanently resurrect an entry: the replayed removal prunes it again. A
+    /// member registered without a tablet (legacy) is never pruned.
+    /// `#[serde(default)]` keeps older snapshots loading (empty map).
+    #[serde(default)]
+    pub cp_member_tablets: BTreeMap<NodeId, TabletId>,
     /// The next tablet id to hand out — a **monotonic** allocator (ADR 0023): bumped
     /// past every tablet created (via `CreateTablet` or `SplitTablet`) so two
     /// concurrent `CreateTable`s can't derive the same id, and a dropped id is never
@@ -194,8 +205,22 @@ pub enum MetaCommand {
     /// `raftkv`-role listen address of member `id`, stored opaquely in
     /// [`Metadata::cp_member_addrs`] and replicated so every node's peer-sync loop
     /// can reach a runtime-created group member (a split sibling or a joined data
-    /// node). Idempotent: a no-op if `id` already maps to `addr`.
-    RegisterCpAddr { id: NodeId, addr: String },
+    /// node). Idempotent: a no-op if `id` already maps to `addr` (with the same
+    /// tablet association).
+    ///
+    /// `tablet` (ADR 0024 GC, `#[serde(default)]` for older commands) associates
+    /// the member with the tablet whose group it serves, so the address is
+    /// **garbage-collected when that tablet leaves the map** (drop-table, merge)
+    /// instead of leaking forever. `Some(tablet)` is rejected while the tablet is
+    /// not in the map (the registrar's propose-and-await loop simply retries once
+    /// it lands — the same convergent discipline as the file GC); `None` (legacy)
+    /// registers an address that is never pruned.
+    RegisterCpAddr {
+        id: NodeId,
+        addr: String,
+        #[serde(default)]
+        tablet: Option<TabletId>,
+    },
 }
 
 /// The deterministic result of applying a [`MetaCommand`].
@@ -209,17 +234,84 @@ pub enum ApplyOutcome {
     Rejected(&'static str),
 }
 
+/// The subset of [`Metadata`] the placement reconciler actually reads (ADR 0005):
+/// members (for liveness/labels), the tablet map, and the per-tablet policies —
+/// **not** the schema catalog or the CP address book, which dominate a grown
+/// `Metadata`'s size. The leader's `reconcile_loop` clones this narrow view under
+/// the `RaftCore` lock (via `RaftCore::placement_view`) and evaluates
+/// [`reconcile`](PlacementView::reconcile) **off the lock**, instead of cloning
+/// the whole blob every tick (the clone-churn fix).
+#[derive(Clone, Debug)]
+pub struct PlacementView {
+    /// Cluster membership (liveness + topology labels).
+    pub members: BTreeMap<NodeId, Member>,
+    /// The tablet map.
+    pub tablets: BTreeMap<TabletId, Tablet>,
+    /// Per-tablet placement policies.
+    pub policies: BTreeMap<TabletId, PlacementPolicy>,
+}
+
+impl PlacementView {
+    /// The pure placement decision over this view — identical to
+    /// [`Metadata::reconcile`] (both delegate to the same body).
+    #[must_use]
+    pub fn reconcile(&self) -> Vec<MetaCommand> {
+        reconcile_placement(&self.members, &self.tablets, &self.policies)
+    }
+}
+
+/// Build placement candidates from the `Active` members and their labels.
+/// Liveness is the control plane's job (ADR 0005): only `Active` members are
+/// offered to the placement engine, which then enforces *policy* (residency
+/// + spread). Iteration is over a `BTreeMap`, so the order is deterministic.
+fn active_candidates(members: &BTreeMap<NodeId, Member>) -> Vec<Candidate> {
+    members
+        .iter()
+        .filter(|(_, m)| m.status == NodeStatus::Active)
+        .map(|(id, m)| Candidate::new(*id, m.labels.clone()))
+        .collect()
+}
+
+/// The shared body of [`Metadata::reconcile`] / [`PlacementView::reconcile`]: a
+/// pure, deterministic function of exactly the placement-relevant maps, so the
+/// caller can evaluate it on a narrow clone off the `RaftCore` lock.
+fn reconcile_placement(
+    members: &BTreeMap<NodeId, Member>,
+    tablets: &BTreeMap<TabletId, Tablet>,
+    policies: &BTreeMap<TabletId, PlacementPolicy>,
+) -> Vec<MetaCommand> {
+    let candidates = active_candidates(members);
+    policies
+        .iter()
+        .filter_map(|(tablet, policy)| {
+            let t = tablets.get(tablet)?;
+            let desired = replan(&t.replicas, &candidates, policy).ok()?;
+            // `replan` returns a sorted set; `t.replicas` is normalized
+            // (sorted + deduped) by `Tablet::new` / `CasTabletReplicas`, so a
+            // direct comparison is a faithful "already satisfied" check.
+            if desired == t.replicas {
+                None
+            } else {
+                Some(MetaCommand::CasTabletReplicas {
+                    tablet: *tablet,
+                    expected_epoch: t.epoch,
+                    replicas: desired,
+                })
+            }
+        })
+        .collect()
+}
+
 impl Metadata {
-    /// Build placement candidates from the `Active` members and their labels.
-    /// Liveness is the control plane's job (ADR 0005): only `Active` members are
-    /// offered to the placement engine, which then enforces *policy* (residency
-    /// + spread). Iteration is over a `BTreeMap`, so the order is deterministic.
-    fn active_candidates(&self) -> Vec<Candidate> {
-        self.members
-            .iter()
-            .filter(|(_, m)| m.status == NodeStatus::Active)
-            .map(|(id, m)| Candidate::new(*id, m.labels.clone()))
-            .collect()
+    /// The narrow placement view ([`PlacementView`]) — clones only the
+    /// placement-relevant maps, never the schema catalog / CP address book.
+    #[must_use]
+    pub fn placement_view(&self) -> PlacementView {
+        PlacementView {
+            members: self.members.clone(),
+            tablets: self.tablets.clone(),
+            policies: self.policies.clone(),
+        }
     }
 
     /// Recompute placement for every tablet that has a policy and return the
@@ -239,26 +331,7 @@ impl Metadata {
     /// set.
     #[must_use]
     pub fn reconcile(&self) -> Vec<MetaCommand> {
-        let candidates = self.active_candidates();
-        self.policies
-            .iter()
-            .filter_map(|(tablet, policy)| {
-                let t = self.tablets.get(tablet)?;
-                let desired = replan(&t.replicas, &candidates, policy).ok()?;
-                // `replan` returns a sorted set; `t.replicas` is normalized
-                // (sorted + deduped) by `Tablet::new` / `CasTabletReplicas`, so a
-                // direct comparison is a faithful "already satisfied" check.
-                if desired == t.replicas {
-                    None
-                } else {
-                    Some(MetaCommand::CasTabletReplicas {
-                        tablet: *tablet,
-                        expected_epoch: t.epoch,
-                        replicas: desired,
-                    })
-                }
-            })
-            .collect()
+        reconcile_placement(&self.members, &self.tablets, &self.policies)
     }
 
     /// Apply a command, returning the (deterministic) outcome.
@@ -369,6 +442,8 @@ impl Metadata {
                 self.tablets.remove(right);
                 // The merged-away tablet can no longer be reconciled.
                 self.policies.remove(right);
+                // …and its CP members' addresses are dead (ADR 0024 GC).
+                self.prune_cp_member_addrs();
                 ApplyOutcome::Applied
             }
             MetaCommand::SetTabletPolicy { tablet, policy } => {
@@ -414,6 +489,9 @@ impl Metadata {
                     // `MergeTablets` cleanup).
                     self.policies.remove(&id);
                 }
+                // Reclaim the dropped tablets' CP member addresses (ADR 0024 GC —
+                // the address-book counterpart of the hosting nodes' file GC).
+                self.prune_cp_member_addrs();
                 ApplyOutcome::Applied
             }
             MetaCommand::CreateTableIndex { table, index } => {
@@ -466,14 +544,57 @@ impl Metadata {
                     ApplyOutcome::NoOp
                 }
             }
-            MetaCommand::RegisterCpAddr { id, addr } => {
-                if self.cp_member_addrs.get(id) == Some(addr) {
+            MetaCommand::RegisterCpAddr { id, addr, tablet } => {
+                // A tablet-scoped registration for a tablet not (yet or anymore)
+                // in the map is rejected: accepting it would either leak (the GC
+                // prunes on the recorded tablet's *current absence*, so it would
+                // be swept at the next removal anyway) or resurrect a dropped
+                // tablet's entry. The registrar's propose-and-await loop retries
+                // until its tablet lands, so a benign register-before-create race
+                // converges.
+                if let Some(t) = tablet {
+                    if !self.tablets.contains_key(t) {
+                        return ApplyOutcome::Rejected("no such tablet for cp addr");
+                    }
+                }
+                if self.cp_member_addrs.get(id) == Some(addr)
+                    && self.cp_member_tablets.get(id) == tablet.as_ref()
+                {
                     ApplyOutcome::NoOp
                 } else {
                     self.cp_member_addrs.insert(*id, addr.clone());
+                    match tablet {
+                        Some(t) => {
+                            self.cp_member_tablets.insert(*id, *t);
+                        }
+                        None => {
+                            self.cp_member_tablets.remove(id);
+                        }
+                    }
                     ApplyOutcome::Applied
                 }
             }
+        }
+    }
+
+    /// Drop every CP member-addr entry recorded against a tablet that is **no
+    /// longer in the map** (ADR 0024 — the address-book half of drop-table GC,
+    /// closing the designed `cp_member_addrs` leak). Called from the apply arms
+    /// that remove tablets (`DropTableTablets`, `MergeTablets`); keyed purely on
+    /// current absence, so it is deterministic on every replica and **convergent
+    /// under replay**: a re-applied historical sequence re-registers and then
+    /// re-prunes in the same order, never leaving a resurrected entry. Members
+    /// registered without a tablet association (legacy) are untouched.
+    fn prune_cp_member_addrs(&mut self) {
+        let dead: Vec<NodeId> = self
+            .cp_member_tablets
+            .iter()
+            .filter(|(_, t)| !self.tablets.contains_key(t))
+            .map(|(&id, _)| id)
+            .collect();
+        for id in dead {
+            self.cp_member_tablets.remove(&id);
+            self.cp_member_addrs.remove(&id);
         }
     }
 
@@ -586,6 +707,7 @@ mod tests {
         let reg = |id, addr: &str| MetaCommand::RegisterCpAddr {
             id,
             addr: addr.to_owned(),
+            tablet: None,
         };
 
         // First registration applies and is readable.
@@ -609,6 +731,129 @@ mod tests {
         // A distinct member coexists.
         assert_eq!(m.apply(&reg(401, "127.0.0.1:9101")), ApplyOutcome::Applied);
         assert_eq!(m.cp_member_addrs.len(), 2);
+    }
+
+    /// ADR 0024 address GC: a tablet-scoped `RegisterCpAddr` entry is pruned from
+    /// both maps when its tablet leaves the map (`DropTableTablets` /
+    /// `MergeTablets`); a registration for an absent tablet is rejected (the
+    /// registrar retries); legacy tablet-less entries are never pruned; and the
+    /// whole thing is **convergent under replay** — re-applying the same command
+    /// sequence to a fresh state machine reaches the identical pruned state, so a
+    /// replayed historical map state cannot permanently resurrect an entry.
+    #[test]
+    fn cp_member_addrs_are_pruned_when_their_tablet_leaves_the_map() {
+        let commands = vec![
+            MetaCommand::CreateTablet {
+                tablet: TabletId(1),
+                table: Some("users".to_owned()),
+                range: KeyRange::whole(),
+                replicas: vec![1, 2, 3],
+            },
+            // Tablet-scoped members of tablet 1.
+            MetaCommand::RegisterCpAddr {
+                id: 1301,
+                addr: "127.0.0.1:9301".to_owned(),
+                tablet: Some(TabletId(1)),
+            },
+            MetaCommand::RegisterCpAddr {
+                id: 1302,
+                addr: "127.0.0.1:9302".to_owned(),
+                tablet: Some(TabletId(1)),
+            },
+            // A legacy (tablet-less) member: never pruned.
+            MetaCommand::RegisterCpAddr {
+                id: 301,
+                addr: "127.0.0.1:9001".to_owned(),
+                tablet: None,
+            },
+            MetaCommand::DropTableTablets {
+                table: "users".to_owned(),
+            },
+        ];
+        let replay = |cmds: &[MetaCommand]| {
+            let mut m = Metadata::default();
+            for c in cmds {
+                m.apply(c);
+            }
+            m
+        };
+
+        let m = replay(&commands);
+        // The dropped tablet's members were reclaimed from BOTH maps…
+        assert!(!m.cp_member_addrs.contains_key(&1301));
+        assert!(!m.cp_member_addrs.contains_key(&1302));
+        assert!(m.cp_member_tablets.is_empty());
+        // …the legacy entry survives.
+        assert_eq!(
+            m.cp_member_addrs.get(&301).map(String::as_str),
+            Some("127.0.0.1:9001")
+        );
+
+        // Convergent under replay: a fresh replica applying the same log reaches
+        // the identical state (no resurrected entries).
+        assert_eq!(replay(&commands), m);
+
+        // A registration against the now-absent tablet is rejected, so it cannot
+        // resurrect the pruned entry after the drop replays.
+        let mut m = m;
+        assert_eq!(
+            m.apply(&MetaCommand::RegisterCpAddr {
+                id: 1301,
+                addr: "127.0.0.1:9301".to_owned(),
+                tablet: Some(TabletId(1)),
+            }),
+            ApplyOutcome::Rejected("no such tablet for cp addr")
+        );
+        assert!(!m.cp_member_addrs.contains_key(&1301));
+    }
+
+    /// The `MergeTablets` removal path prunes the merged-away tablet's CP member
+    /// addresses exactly like a drop (ADR 0024 GC).
+    #[test]
+    fn merge_prunes_the_removed_tablets_cp_addrs() {
+        let mut m = Metadata::default();
+        let mid = 0x8000_0000_0000_0000u64.to_be_bytes().to_vec();
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTablet {
+                tablet: TabletId(1),
+                table: None,
+                range: KeyRange::new(Vec::new(), Some(mid.clone())),
+                replicas: vec![1, 2, 3],
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTablet {
+                tablet: TabletId(2),
+                table: None,
+                range: KeyRange::new(mid, None),
+                replicas: vec![1, 2, 3],
+            }),
+            ApplyOutcome::Applied
+        );
+        for (id, tablet) in [(1301, 1u64), (2301, 2u64)] {
+            assert_eq!(
+                m.apply(&MetaCommand::RegisterCpAddr {
+                    id,
+                    addr: format!("127.0.0.1:{id}"),
+                    tablet: Some(TabletId(tablet)),
+                }),
+                ApplyOutcome::Applied
+            );
+        }
+
+        assert_eq!(
+            m.apply(&MetaCommand::MergeTablets {
+                left: TabletId(1),
+                right: TabletId(2),
+            }),
+            ApplyOutcome::Applied
+        );
+        // The merged-away right tablet's member is reclaimed; the survivor's stays.
+        assert!(!m.cp_member_addrs.contains_key(&2301));
+        assert!(!m.cp_member_tablets.contains_key(&2301));
+        assert!(m.cp_member_addrs.contains_key(&1301));
+        assert_eq!(m.cp_member_tablets.get(&1301), Some(&TabletId(1)));
     }
 
     /// `DropTableTablets` (ADR 0024): removes every tablet scoped to the table —
