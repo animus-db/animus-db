@@ -155,6 +155,48 @@ async fn schema_ddl_on_a_follower_is_relayed_to_the_leader() {
     .await
     .expect("follower-issued SetTableMode did not replicate in 20s");
 
+    // The atomic `ALTER TABLE` primitive (`ReplaceTableSchema`) relays too — the
+    // gating allowlist (`is_relayable_command`) must include it, or a
+    // follower-connected ALTER silently times out (works only when the connected
+    // node happens to be the control leader — the documented bimodal relay flake).
+    let mut extended = TableSchema::simple("id", ColumnType::String);
+    extended
+        .columns
+        .push(animusd::ColumnDef::new("age", ColumnType::Number));
+    extended.mode = ReplicationMode::Cp; // preserve the mode set above
+    let replace = MetaCommand::ReplaceTableSchema {
+        table: "ddl_t".into(),
+        schema: extended.clone(),
+    };
+    timeout(Duration::from_secs(20), async {
+        loop {
+            let _ = call(
+                follower_client,
+                ClientRequest::ProposeSchema(replace.clone()),
+            )
+            .await;
+            if nodes.iter().all(|n| {
+                n.metadata()
+                    .table_schema("ddl_t")
+                    .is_some_and(|s| s == &extended)
+            }) {
+                return;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("follower-issued ReplaceTableSchema (atomic ALTER) did not replicate in 20s");
+    // The replacement was in place: the table kept a schema throughout (spot-check
+    // the final state on every node — no drop-then-recreate window exists at all
+    // with a single command).
+    for (i, n) in nodes.iter().enumerate() {
+        assert!(
+            n.metadata().has_table_schema("ddl_t"),
+            "table schema missing on node {i} after atomic ALTER"
+        );
+    }
+
     // Gate: a non-schema (membership/placement) command must be rejected by the
     // relay, on any node — this is not a general "propose anything" surface.
     let bad = call(

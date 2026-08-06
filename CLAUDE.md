@@ -364,8 +364,186 @@ cross-cutting ones. Prune/merge entries that become obsolete.
   moves) and `_sNN`-suffix the rest; gate the cost so default `cargo test` stays at
   the frozen base while the deep tier (`ANIMUS_CORPUS_FULL=1` too) runs in a nightly
   CI job, not per-push. (ADR 0014 coverage-expansion increment.)
+- **A harness's client poll granularity bounds which timing windows it can catch —
+  a "passing" corpus proves nothing about sub-poll windows.** The 2026-08-06 audit
+  confirmed a ReadIndex linearizability hole (a new leader serves reads before its
+  current-term no-op commits, ADR 0017 §3) that `raftkv_linearizable.rs` structurally
+  cannot fire: the stale window is ~one message round-trip after an election, but the
+  client polls at 100ms, so it never samples the sliver — and the single-writer
+  re-propose model heals the evidence. When a protocol has a known
+  narrow-window rule (ReadIndex no-op, lease expiry, config overlap), write a
+  targeted sim test that *drives into the window* (sub-poll granularity, read
+  immediately on the new leader), don't rely on corpus luck.
+- **An adversarial-verify pass is worth it before acting on audit/review findings —
+  and re-verify against the branch you'll edit.** Of the audit's 6 highest-stakes
+  claims all 6 confirmed, but two materially changed shape under verification (the
+  storage flush bug's trigger is admin flush/compact, not client writes; the
+  ~15/s seed throughput was primarily the 50ms confirm-poll cap, not the election
+  storm) — and several perf findings were already fixed on `main`, which had moved
+  past the audited checkout (pre-vote, single-write-latency, cp-batch-put). A
+  finding is (claim × trigger path × branch); verify all three.
+- **File reads taken shortly after a branch checkout can transiently disagree
+  across tool families (Read/Edit vs Bash) — verify you're actually at HEAD
+  before trusting either.** An agent building against `origin/perf/cp-data-
+  snapshots-codec` initially saw a stale 1053-line `animus-cp-data/src/lib.rs`
+  via `Read` while the true tip was 1482 lines with a materially different
+  architecture (split consensus-loop/apply-task, wake-on-propose, a binary wire
+  codec) — caught only because a test file referenced methods the "current"
+  file didn't have. `git show HEAD:path` gave a third answer on repeated calls.
+  Recovery: `git status --short` + `git diff --stat HEAD -- path` both empty is
+  the only trustworthy "am I at HEAD" check; for a file where Bash-side
+  build/test is the actual gate, `git checkout -- path` + direct Bash
+  edits (sed/perl) are safer than Read/Edit if this is suspected. (PR #31.)
+- **A `SimEnv` test must never `block_on` an operation that internally polls
+  `env.sleep()` (e.g. `linearizable_get`/`linearizable_scan`)** — those only
+  resolve while `Simulator::run_for` is advancing virtual time; calling one
+  directly under `block_on` hangs forever with no panic, burning wall-clock
+  silently. Spawn it as a task and drive it via `sim.run_for` instead (the
+  `lin_read`-style helper pattern in `tests/read_index.rs`). (PR #31.)
+- **Distinguishing "crash-torn tail" from "mid-file corruption" needs a
+  positional proof, not a magnitude heuristic — scan forward for the next
+  valid checksummed frame; if one exists, the failure is real corruption.**
+  A torn-and-happens-to-look-corrupted tail and genuine mid-file corruption
+  can produce equally implausible declared lengths, so "does the length look
+  sane" can't tell them apart. The WAL's binary frame decoder resolves a
+  parse failure by resyncing forward: tolerate it as a crash-torn tail only
+  if NO later valid frame is found in the buffer; otherwise it's a hard
+  error. (`wal_resync_point`, PR #32.)
+- **A test suite built entirely on bare `block_on` cannot observe a
+  `env.spawn_task`-backed background feature — check the harness before
+  defaulting a new async-offload feature on.** Storage's tests never drive
+  `Simulator::run_for`/`run_until`, so a new "move maintenance to a spawned
+  task" feature would silently never run under the existing suite. Shipped
+  correctly as additive and default-OFF rather than rewriting the test
+  harness to flip it on. Corollary of "SimEnv proves logic, not real-thread
+  liveness" — but also a warning to CHECK the harness shape before assuming a
+  feature can default on. (PR #32.)
+- **Extracting a "pure decision" from a method that intentionally short-circuits
+  an expensive call must preserve that laziness explicitly, or the refactor
+  silently becomes a hot-path perf regression.** `resolve_cp_route` avoided
+  `RaftNode::metadata()`'s full deep-clone on the common "local leader" /
+  "known hint" paths by checking cheap facts first; pulling the branching out
+  as a pure `decide_cp_route` function required the wrapper to keep gathering
+  metadata-derived facts lazily (only in the one branch that needs them)
+  rather than eagerly computing everything before calling the pure function.
+  When extracting logic mechanically, check what expensive input the original
+  short-circuited around, not just what it decided. (PR #33.)
+- **Before extracting a flagged "untested pure function," check whether it's
+  already a thin call-through to a pure/tested implementation elsewhere.**
+  `next_free_tablet_id` looked like animusd's problem (the audit flagged the
+  *caller*, `trigger_split`) but the allocator itself was already pure and
+  unit-tested in `animus-control::Metadata` — nothing to extract, just a
+  caller that wasn't using it (fixed separately in PR #21). (PR #33.)
+- **Extending a shared trait's addressing with a new axis: make the primitive
+  methods the ones every implementor must write, and re-derive the old surface
+  as *default* methods over a well-known constant.** Adding multiplexed
+  `(node, stream)` addressing to `Network` (ADR 0026, replacing the
+  `Coresident` sibling-pool escape hatch's rationale) needed every existing
+  call site (`env.send(to, payload)` / `env.recv()`, nearly the whole
+  codebase) to keep compiling and behaving identically. Making `send_stream`/
+  `recv_stream` the trait's required methods and `send`/`recv` **default**
+  methods that forward to them with a `PRIMARY_STREAM` constant meant the only
+  code that had to change was the *three* concrete `Network` implementors
+  (`SimEnv`, `ProdEnv`, and one test double) — every caller was untouched,
+  because a default method is in scope exactly like a required one once the
+  trait is in scope. Grep every `impl <Trait> for` site *before* estimating
+  blast radius; it is often far smaller than "everywhere the trait's methods
+  are called." (PR #34.)
+- **In a worktree session, an absolute-path tool call (Read/Edit/Write) is not
+  scoped by the shell's `cd` — pin every path under the worktree root
+  explicitly, every time.** A `Bash` `cd /path/to/main/repo && ...` changes the
+  *shell's* cwd for subsequent Bash calls, but Read/Edit/Write take literal
+  absolute paths and don't care what the shell's cwd is — so it is easy to
+  `cd` into the main checkout for one command (e.g. to run cargo from a
+  familiar path) and then keep handing Read/Edit/Write paths that *look*
+  worktree-rooted but are actually bare `/repo/...` paths resolving into the
+  main checkout, silently editing a different working tree than intended.
+  The tell was a `git status` on what should have been the worktree suddenly
+  reporting the *main repo's* branch name, and a test binary not picking up an
+  edit that Read/Edit had just reported succeeding — both mean the tool and the
+  build are looking at two different files. Recovery: `git diff` the
+  suspect-wrong checkout, confirm which hunks are genuinely new (not
+  pre-existing unrelated dirty state) before touching anything, revert only
+  those, and re-apply them (a filtered `git apply --include=<path>` off a saved
+  patch is faster and safer than re-doing every edit by hand) in the correct
+  location. Never `git checkout --`/reset a dirty file without first diffing
+  it to confirm every hunk is yours. (PR #34.)
+- **A fault-schedule runner that heals immediately after the last fault gives
+  single-fault scenarios a zero-length outage — give scenarios an explicit fault
+  window.** The raftkv corpus healed partitions the instant the last fault landed,
+  so its partition cells were near-vacuous (nothing was ever asked of the cluster
+  *while* partitioned). New cells carry `Scenario::window` (outage duration with
+  traffic spanning it); old cells keep window 0 for byte-identity. Check any new
+  fault harness for this: "did traffic actually run during the fault?" (PR #23.)
+- **A "recovery tolerates X" claim must be tested through the NEXT write cycle,
+  not just one reopen.** The LSM tolerated a torn WAL tail on replay (skipped the
+  torn line) but reused the un-truncated active segment, so the next acked record
+  was appended after garbage and a SECOND restart silently dropped it — the
+  crash-recovery instance of the "prove recursive ops at depth ≥ 2" rule: recover,
+  write, recover again, then assert. (PR #24's fault injection; fix = seal the
+  recovered segment.)
+- **A test asserting data LOSS can be load-bearing on a consensus bug — when a
+  correctness fix flips it, invert the test, don't weaken the fix.** A restart
+  test asserted acked data on the memory backend is lost across restart; that
+  "expected loss" actually depended on a sole recovered voter never re-advancing
+  commit over its WAL tail (a real bug). The ReadIndex-gate fix surfaced it; the
+  test now asserts survival via Raft-WAL replay. (PR #25.)
 
 ### Code patterns
+- **`tokio::fs::File` writes are not ordered or durable until `flush().await` —
+  a dropped handle completes its write in the background, so two sequential
+  appends via separate handles can land INVERTED on disk, and a later `sync` on a
+  fresh fd can fsync before the buffered write reaches the page cache.** This
+  broke "ack means durable" under ProdEnv and was the long-standing
+  `lsm_concurrent::scans_survive_concurrent_compaction` flake (an SSTable
+  recovered with its index at offset 0). Always `flush().await` before dropping a
+  write handle; found independently twice (PRs #26, #27). Corollary of the
+  documented "a flaky ProdEnv test is a real bug" rule.
+- **Commit the election no-op in `become_leader` itself (`maybe_advance_commit`
+  after the append)** — a leader that only advances commit on propose/ack strands
+  a sole voter's recovered WAL tail (nothing re-drives commit until the next
+  propose), and any gate on "current-term entry committed" (ReadIndex §6.4, the
+  membership-change gate) would deadlock a single-node group. (PR #25.)
+- **Metadata-level dedup of a proposal only picks one *winner* — it does not stop
+  other legitimate callers from still invoking a side-effecting state-machine
+  command, which must therefore be idempotent at APPLY time, not just deduped at
+  the propose layer.** In `--cluster N`, every node's auto-split loop shares one
+  `ClusterEdgeState`, so multiple nodes could independently observe the same
+  over-threshold tablet and each call `propose_split`; the control plane's
+  `SplitTablet` metadata command dedups which proposal wins the *metadata*
+  race, but nothing stopped a second `Split` command from also landing in the
+  committed CP-group Raft log. Re-applying it recomputed the handoff from
+  storage — now empty, since the first application had already tombstoned the
+  range — and re-fired the split hook with an empty handoff, which could win
+  the mint race and silently seed the new tablet with **no data** (a silent
+  flake with zero logged errors, `tablet_auto_splits_when_it_grows`, ~1-in-3 to
+  1-in-10 standalone). Fix: make `Split` apply idempotent (a persistent
+  `already_split` flag; every application after the first is a no-op) —
+  replay-safe and failover-safe by construction, not a patch for one race. Any
+  command carrying a hook/side-effect (not a plain value write) that more than
+  one caller can legitimately propose needs this. (PR #30.)
+- **An operator/admin action that calls straight into an engine bypasses the
+  single-writer contract the normal path establishes — audit every admin surface
+  against the layer's concurrency assumptions.** `LsmEngine` is safe on the client
+  path because the per-tablet Raft apply loop is its sole writer, but
+  `POST /admin/storage/flush|compact` call `flush_now`/`compact_now` from the admin
+  connection's task, racing that loop — and `flush()` (snapshot → unlocked build →
+  unconditional `memtable.clear()`, no flush-in-progress flag) then erases an acked
+  concurrent write, whose WAL segment a *later* flush GCs: permanent loss. The
+  concurrency tests miss the quadrant (the concurrent-writer test never flushes;
+  the flushing test has one writer) — test "forced maintenance under live load"
+  explicitly. (2026-08-06 audit; ADR 0008/0020 notes; fix = serialize
+  flush-vs-apply and flush-vs-flush.)
+- **One id space must have one allocator — a second allocation path silently breaks
+  the invariant the first one carries.** Tablet ids are never-reused *because*
+  provisioning allocates via `next_free_tablet_id()` (folds in the monotonic
+  `next_tablet_id`); `trigger_split` allocated `max(live ids)+1` instead, so
+  drop-highest-table-then-split re-mints the freed id — and a replica still holding
+  the dropped tablet's files re-hosts them as the new tablet (ADR 0024 violation;
+  GC can never reclaim them since the id is live again). The apply-side validation
+  only rejected collisions with *present* tablets, so nothing self-healed. Route
+  every mint through the one allocator, and make the replicated apply reject ids
+  below the monotonic counter so a divergent client can't reintroduce it.
 - **To wake a `select`-parked `<E: Env>` driver loop from another task, race a
   `futures::task::AtomicWaker` + `AtomicBool` future — never a tokio-only primitive
   (`Notify`/`watch`), which SimEnv can't drive.** The CP data-plane driver used to

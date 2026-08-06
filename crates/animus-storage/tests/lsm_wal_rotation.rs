@@ -27,6 +27,8 @@ fn opts() -> LsmOptions {
         level_fanout: 8,
         wal_segment_bytes: 64,
         tombstone_grace_versions: 1 << 20,
+        trust_monotonic_versions: false,
+        background_maintenance: false,
     }
 }
 

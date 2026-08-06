@@ -155,6 +155,98 @@ fn split_creates_the_new_group_in_band() {
     assert_eq!(block_on(orig[l].local_get(b"k17")), None);
 }
 
+/// Regression for a real, intermittent data-loss bug found via `animusd`'s
+/// `tablet_auto_splits_when_it_grows` flaking with "key not served after
+/// auto-split" on unmodified `main` — no manual trigger needed, just the ordinary
+/// auto-split loop. Root cause: `animusd`'s auto-split trigger can call
+/// `propose_split` **more than once** for the same group (in a `--cluster N`
+/// process, every node's auto-split loop shares one `ClusterEdgeState`, so several
+/// nodes independently see the same over-threshold leader on the same tick and all
+/// propose a split — the control plane's metadata-level dedup only picks one
+/// `SplitTablet` winner, it does not stop the *other* callers from still calling
+/// `propose_split` on the data-plane group). Before the fix, `apply_and_compact`
+/// re-applied every committed `Split` unconditionally: the **second** application
+/// recomputed the handoff from storage, which was already **empty** (the first
+/// application had tombstoned `[at, ∞)`), and fired the split hook again with that
+/// empty handoff — racing the first (real-data) hook invocation to mint the new
+/// tablet's group. If the empty one won, the new group came up with no data at all.
+///
+/// This test proves the fix directly and deterministically (no network/real-time
+/// flake surface): propose the **same** split twice back-to-back on the leader
+/// before running the simulator, so both `Split` commands land in the committed
+/// log, then assert the hook fired **exactly once** (one new replica minted per
+/// original, not a redundant/racing second one) and the new group holds the
+/// **full** handed-off range — no data lost to an empty second application.
+#[test]
+fn duplicate_split_proposal_does_not_lose_data() {
+    let seed = 0x5B2;
+    let mut sim = Simulator::new(seed);
+    let (orig, created) = group_with_in_band_split(&sim);
+    sim.run_for(Duration::from_secs(2));
+    let l = leader(&orig, seed);
+
+    for i in 0..20u32 {
+        put(
+            &orig[l],
+            format!("k{i:02}").as_bytes(),
+            format!("v{i}").as_bytes(),
+            seed,
+        );
+    }
+    sim.run_for(Duration::from_secs(2));
+
+    // Two independent callers proposing the identical split, exactly as two racing
+    // `animusd` nodes would in a shared-edge `--cluster N` process: both proposals
+    // are accepted onto the leader's log (nothing at the propose layer rejects a
+    // duplicate — the fix is at apply time), so two `Split { at: "k10" }` commands
+    // commit.
+    assert!(
+        matches!(
+            orig[l].propose_split(b"k10".to_vec()),
+            ProposeResult::Accepted { .. }
+        ),
+        "first split proposal should be accepted (seed={seed})"
+    );
+    assert!(
+        matches!(
+            orig[l].propose_split(b"k10".to_vec()),
+            ProposeResult::Accepted { .. }
+        ),
+        "a second, redundant split proposal is still accepted onto the log — the \
+         guard is at apply time, not propose time (seed={seed})"
+    );
+    sim.run_for(Duration::from_secs(5));
+
+    // The hook fired exactly once per original replica — the second commit's apply
+    // was a no-op, so no redundant/racing mint happened.
+    let new = created.lock().unwrap().clone();
+    assert_eq!(
+        new.len(),
+        ORIG.len(),
+        "the redundant Split must not mint a second co-resident replica per node \
+         (seed={seed})"
+    );
+
+    // Every new replica holds the *full* handed-off range: had the empty second
+    // application's hook invocation won a mint race, this would come up empty.
+    for n in &new {
+        for i in 10..20u32 {
+            assert_eq!(
+                block_on(n.local_get(format!("k{i:02}").as_bytes())),
+                Some(format!("v{i}").into_bytes()),
+                "new group must hold every handed-off key, none lost to a \
+                 redundant empty split application (seed={seed})"
+            );
+        }
+    }
+
+    // The original group still only serves the lower half.
+    for n in &orig {
+        assert_eq!(block_on(n.local_get(b"k05")), Some(b"v5".to_vec()));
+        assert_eq!(block_on(n.local_get(b"k15")), None);
+    }
+}
+
 #[test]
 fn in_band_split_is_deterministic_from_seed() {
     let observe = |seed: u64| {

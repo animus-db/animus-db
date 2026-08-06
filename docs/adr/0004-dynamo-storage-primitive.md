@@ -26,6 +26,12 @@ We will adopt the Dynamo-lineage primitive shared by Cassandra and DynamoDB: a
 The `StorageEngine` trait (ADR 0008) exposes exactly the operations the
 distributed layer needs over this primitive: point `put`/`get`, ordered range
 scan, atomic batch write, consistent snapshot, MVCC versions, and range delete.
+It has since grown the replicated-apply surface the CP data plane (ADR 0017)
+drives: version-gated LWW `merge`/`merge_tombstone`, the single-fsync
+`merge_batch`, and the full-image digests `entries`/`entries_with_tombstones`
+(the `InstallSnapshot` source). Originally added for the AP plane's
+repair/anti-entropy (ADR 0010, deferred with ADR 0019), these are now consumed
+by the per-tablet Raft apply loop.
 
 ## Consequences
 

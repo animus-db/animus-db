@@ -111,6 +111,16 @@ driver does the *I/O*):
   in offset-addressed chunks; only the *source* of those bytes generalizes from
   `serde_json::to_vec(state)` to "read the engine checkpoint." Install ingests the
   stream into a fresh engine.
+  *(Audit note 2026-08-06: the implementation has **not** reached this design —
+  `engine_image` builds the whole-tablet image in memory
+  (`entries_with_tombstones()` → one `serde_json::to_vec`, byte values as JSON
+  number arrays), eagerly on **every replica** each `COMPACT_THRESHOLD = 64`
+  applies, and retains it in the core as `snapshot_blob`; only the transport is
+  chunked. Known consequences: O(tablet-size) scan+serialize every 64 writes
+  RF×-cluster-wide, a resident full-image copy per group, and ~3-4x JSON byte
+  inflation. The stated design — truncate the log on threshold, build the image
+  lazily on a follower's `InstallSnapshot` request, from an engine
+  checkpoint/scan in a byte-transparent codec — remains the target.)*
 
 ### 3. Linearizable reads: ReadIndex
 
@@ -124,6 +134,27 @@ appends one) gives the leader a committed current-term entry so `readIndex` is
 sound. Follower reads (a follower asks the leader for `readIndex`, waits for its
 own applied state) are a natural later extension, enabled by this design and by
 the follower-applies-on-commit behavior from the durable-before-visible work.
+
+**Audit correction (2026-08-06 — fixed in PR #25): the no-op sentence above
+assumed a gate the implementation didn't have.** `become_leader` appends the no-op, but
+`read_barrier` captures `readIndex = commit_index` gated only on `is_leader()` —
+nothing on the read path waits for the no-op (any current-term entry) to
+*commit* first, which is the load-bearing half of the ReadIndex recipe
+(dissertation §6.4). A freshly elected leader whose log holds an entry the old
+leader committed and acked — but whose own `commit_index` hasn't reached it
+(the commit rule rightly refuses to count old-term entries) — passes the probe
+quorum (a pure term check, lighter than replication) and serves a read that
+misses the acked write. Window: from election until the no-op commits;
+self-healing but real. The `raftkv_linearizable` corpus misses it because its
+100ms client poll never samples the post-election sliver. Fix: `read_barrier`
+must additionally require `commit_index >= <the leader's first current-term
+entry index>` before computing `readIndex`, plus a regression that reads on the
+new leader inside the window. PR #25 ships exactly this
+(`RaftCore::first_term_index()` + the gate in `read_barrier` + a
+1ms-granularity fresh-leader regression that fails without the fix), and the
+gate work exposed a latent bonus bug it also fixes: a restarted **sole voter**
+never re-advanced `commit_index` over its recovered WAL tail until the next
+propose — `become_leader` now commits its election no-op immediately.
 
 **Leader leases are explicitly NOT adopted, and are a cautionary path, not a
 recommended optimization.** They are recorded here only so a future reader
@@ -261,6 +292,21 @@ control plane unchanged. **Not yet:** dynamic membership (Stage C), tablet split
   *Remaining:* the `ProdEnv`/`animusd` production assembly (hosting per-tablet
   groups + leader-reporting for client routing) — see Stage-D-style integration
   plumbing below.
+  *Audit note (2026-08-06):* `change_membership` does **not** implement the
+  standard erratum guard ("the leader may not append a config entry until it
+  has committed an entry from its current term", Ongaro 2015). Adversarial
+  analysis concluded the existing guards likely **compose** to close the hole
+  anyway — `config_change_in_flight` is judged against an honest
+  `commit_index` (so a prior-term config entry can only clear it via a
+  current-term commit at a higher index), leader completeness covers committed
+  config entries, and no-self-removal blocks the remaining fork routes — and
+  no counterexample could be constructed. But safety currently rests on that
+  subtle four-guard interaction, hand-analyzed rather than model-checked.
+  Defense-in-depth follow-up: add the explicit current-term-commit gate (the
+  `become_leader` no-op index is the natural marker) + a core-level
+  `change_membership` test in `animus-control` (today the primitive is
+  exercised only from `animus-cp-data`). **Done in PR #25** (gate on
+  `first_term_index` + `membership_commit_gate.rs`).
 - **Stage D — tablet split.** ✅ Done. A committed `Split { at }` agrees the point;
   each replica tombstones the handed-off range `[at, ∞)`; that range seeds a new
   independent group (`range_snapshot` → `start_seeded`). `tests/split.rs`.

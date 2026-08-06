@@ -36,6 +36,8 @@ fn opts() -> LsmOptions {
         // group-commit path on one segment, not rotation.
         wal_segment_bytes: 1 << 20,
         tombstone_grace_versions: 1 << 20,
+        trust_monotonic_versions: false,
+        background_maintenance: false,
     }
 }
 
@@ -284,11 +286,11 @@ impl Rng for CrashEnv {
 
 #[async_trait::async_trait]
 impl Network for CrashEnv {
-    async fn send(&self, to: NodeId, payload: Vec<u8>) {
-        self.inner.send(to, payload).await;
+    async fn send_stream(&self, to: NodeId, stream: u64, payload: Vec<u8>) {
+        self.inner.send_stream(to, stream, payload).await;
     }
-    async fn recv(&self) -> Envelope {
-        self.inner.recv().await
+    async fn recv_stream(&self, stream: u64) -> Envelope {
+        self.inner.recv_stream(stream).await
     }
 }
 

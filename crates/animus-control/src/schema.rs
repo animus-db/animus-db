@@ -142,18 +142,22 @@ impl ColumnDef {
     }
 }
 
-/// How a table's data is replicated (ADR 0016 / ADR 0017). The default is the
-/// leaderless **AP** data plane (`animus-data`); **CP** selects the leaderful
-/// per-tablet Raft plane (`animus-cp-data`) for linearizable single-tablet
-/// reads/writes. Replicated in the schema catalog so the choice is durable,
-/// cluster-agreed, and recovered from Raft like the rest of the schema; the wire
-/// edges read it to route a table's reads/writes to the right plane.
+/// How a table's data is replicated (ADR 0016 / ADR 0017). The default is **CP**
+/// — the leaderful per-tablet Raft plane (`animus-cp-data`) with linearizable
+/// single-tablet reads/writes, the only data plane in v1 (ADR 0019). **AP** is
+/// retained as a forward-compat hook for the deferred leaderless plane (its crate
+/// was deleted; ADR 0019); nothing routes to it in v1. Replicated in the schema
+/// catalog so the choice is durable, cluster-agreed, and recovered from Raft like
+/// the rest of the schema; the wire edges read it to route a table's
+/// reads/writes to the right plane.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReplicationMode {
-    /// Leaderless AP data plane (tunable quorum). The default.
-    #[default]
+    /// Leaderless AP data plane (tunable quorum). Deferred in v1 (ADR 0019) —
+    /// kept only as a forward-compat hook; no v1 table uses it.
     Ap,
-    /// Leaderful per-tablet Raft (linearizable single-tablet KV).
+    /// Leaderful per-tablet Raft (linearizable single-tablet KV). The default,
+    /// and the only v1 plane (ADR 0019).
+    #[default]
     Cp,
 }
 
@@ -187,8 +191,10 @@ pub struct TableSchema {
     #[serde(default)]
     pub indexes: Vec<IndexDef>,
     /// The table's replication mode (ADR 0016 / ADR 0017). `#[serde(default)]` →
-    /// [`ReplicationMode::Ap`], so a schema written before this field existed
-    /// deserializes as AP (the prior, only behavior) — additive like `indexes`.
+    /// [`ReplicationMode::Cp`] (the only v1 plane, ADR 0019), so a schema
+    /// persisted before this field existed deserializes as CP — the correct v1
+    /// semantic, since the AP plane it predated no longer exists. Additive like
+    /// `indexes`.
     #[serde(default)]
     pub mode: ReplicationMode,
 }
@@ -225,7 +231,7 @@ impl TableSchema {
             partition_key: pk,
             clustering_keys: Vec::new(),
             indexes: Vec::new(),
-            mode: ReplicationMode::Ap,
+            mode: ReplicationMode::default(),
         }
     }
 
@@ -248,7 +254,7 @@ impl TableSchema {
             partition_key: pk,
             clustering_keys: vec![sk],
             indexes: Vec::new(),
-            mode: ReplicationMode::Ap,
+            mode: ReplicationMode::default(),
         }
     }
 
@@ -267,11 +273,11 @@ impl TableSchema {
             clustering_keys,
             columns,
             indexes: Vec::new(),
-            mode: ReplicationMode::Ap,
+            mode: ReplicationMode::default(),
         }
     }
 
-    /// Set the replication mode (builder; default [`ReplicationMode::Ap`]).
+    /// Set the replication mode (builder; default [`ReplicationMode::Cp`]).
     #[must_use]
     pub fn with_mode(mut self, mode: ReplicationMode) -> Self {
         self.mode = mode;

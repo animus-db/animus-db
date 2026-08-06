@@ -103,7 +103,7 @@
 
 use std::time::Duration;
 
-use animus_control::{MetaCommand, ReplicationMode};
+use animus_control::{MetaCommand, Metadata, ReplicationMode};
 use animus_dynamo::wire::{
     self, Operation, Projection, ReturnValues, TransactAction, UpdateAction, UpdateReturnValues,
     WireError, WriteRequest,
@@ -129,15 +129,23 @@ const SCHEMA_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// The schema catalog is Raft-replicated, so this node's committed view is sound
 /// to read (every node applies committed metadata). Per-cluster — no process
 /// globals — so two in-process clusters do not share a view.
-fn metadata(ctx: &ClientCtx) -> animus_control::Metadata {
+///
+/// **Snapshot once per request**: this is a full deep clone of the metadata under
+/// the Raft handle's lock, so [`run_operation`] takes it once at request entry
+/// and threads `&Metadata` through the helpers — the schema lookups, table/tablet
+/// existence checks, and index mirroring of one request all read the same
+/// consistent snapshot instead of re-cloning 2+ times per request. Paths that
+/// must observe *fresh* state (the `CreateTable` commit-wait polls) still call
+/// this directly.
+fn metadata(ctx: &ClientCtx) -> Metadata {
     ctx.raft.metadata()
 }
 
 /// The DynamoDB key schema for `table`, resolved from the **replicated catalog**
 /// (ADR 0013) when present, else the legacy `pk`/`sk` convention so a
 /// pre-`CreateTable` client keeps working.
-fn schema_for(ctx: &ClientCtx, table: &str) -> TableSchema {
-    match metadata(ctx).table_schema(table) {
+fn schema_for(meta: &Metadata, table: &str) -> TableSchema {
+    match meta.table_schema(table) {
         Some(control) => schema_bridge::to_dynamo(control),
         None => TableSchema::composite("pk", "sk"),
     }
@@ -154,10 +162,9 @@ fn schema_for(ctx: &ClientCtx, table: &str) -> TableSchema {
 /// process-local memory. A table absent from the catalog is left untouched here
 /// (the read path then reports it unknown; the write path legacy-registers it via
 /// [`legacy_register`]).
-fn mirror_catalog_schema(ctx: &ClientCtx, table: &str) {
-    let meta = metadata(ctx);
+fn mirror_catalog_schema(ctx: &ClientCtx, meta: &Metadata, table: &str) {
     if meta.has_table_schema(table) {
-        let schema = schema_for(ctx, table);
+        let schema = schema_for(meta, table);
         let indexes = schema_bridge::indexes_to_dynamo(meta.table_indexes(table));
         let mut reg = ctx
             .edge
@@ -176,8 +183,8 @@ fn mirror_catalog_schema(ctx: &ClientCtx, table: &str) {
 /// optional) if it is in neither the catalog nor the registry — so a
 /// pre-`CreateTable` client's writes keep working unchanged and their keys get
 /// tracked for `Query`/`Scan`.
-fn legacy_register(ctx: &ClientCtx, table: &str) {
-    if metadata(ctx).has_table_schema(table) {
+fn legacy_register(ctx: &ClientCtx, meta: &Metadata, table: &str) {
+    if meta.has_table_schema(table) {
         return; // a real CreateTable'd table; mirror it instead
     }
     let mut reg = ctx
@@ -197,11 +204,12 @@ fn legacy_register(ctx: &ClientCtx, table: &str) {
 /// matching the prior behavior.
 fn resolve_key(
     ctx: &ClientCtx,
+    meta: &Metadata,
     table: &str,
     item: &Item,
 ) -> Result<(AttributeValue, Option<AttributeValue>), WireError> {
-    mirror_catalog_schema(ctx, table);
-    legacy_register(ctx, table);
+    mirror_catalog_schema(ctx, meta, table);
+    legacy_register(ctx, meta, table);
     let reg = ctx
         .edge
         .dynamo_registry()
@@ -292,6 +300,11 @@ fn error_status(err: &WireError) -> u16 {
 
 /// Execute a decoded operation against the data plane via the shared coordinator.
 async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireError> {
+    // One metadata snapshot per request (see [`metadata`]): every schema lookup /
+    // table-existence check below reads this consistent view instead of deep-
+    // cloning the replicated metadata again. `CreateTable` is the exception — its
+    // commit-wait must poll *fresh* views, so it reads live inside `create_table`.
+    let meta = &metadata(ctx);
     match op {
         Operation::CreateTable {
             table,
@@ -305,12 +318,23 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             condition,
             return_values,
         } => {
-            let (pk, sk) = resolve_key(ctx, &table, &item)?;
+            let (pk, sk) = resolve_key(ctx, meta, &table, &item)?;
             let key = item_key(&pk, sk.as_ref());
             // For ALL_OLD (or a condition) we need the prior item; read it once.
             let needs_old = condition.is_some() || return_values == ReturnValues::AllOld;
+            // A conditional (or old-echoing) put is a read-modify-write: hold the
+            // per-node RMW lock across the read → evaluate → write span, as the CQL
+            // edge does, so two concurrent conditional puts on one node can't both
+            // read the same "old" and both pass (a lost update / double create). An
+            // unconditional put does no read and takes no lock. The guard drops at
+            // the end of this arm — never held across the response write.
+            let _rmw = if needs_old {
+                Some(ctx.rmw_lock.lock().await)
+            } else {
+                None
+            };
             let old = if needs_old {
-                quorum_read(ctx, &table, &key).await?
+                quorum_read(ctx, meta, &table, &key).await?
             } else {
                 None
             };
@@ -322,7 +346,7 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
                 }
             }
             let value = wire::encode_stored_item(&item);
-            quorum_write(ctx, &table, &key, &value).await?;
+            quorum_write(ctx, meta, &table, &key, &value).await?;
             note_put(ctx, &table, &key, &item);
             Ok(wire::write_response(return_values, old.as_ref()))
         }
@@ -332,11 +356,19 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             condition,
             return_values,
         } => {
-            let (pk, sk) = resolve_key(ctx, &table, &key)?;
+            let (pk, sk) = resolve_key(ctx, meta, &table, &key)?;
             let data_key = item_key(&pk, sk.as_ref());
             let needs_old = condition.is_some() || return_values == ReturnValues::AllOld;
+            // Same RMW serialization as the conditional `PutItem` above: a
+            // conditional delete must not interleave with another RMW between its
+            // read and its write.
+            let _rmw = if needs_old {
+                Some(ctx.rmw_lock.lock().await)
+            } else {
+                None
+            };
             let old = if needs_old {
-                quorum_read(ctx, &table, &data_key).await?
+                quorum_read(ctx, meta, &table, &data_key).await?
             } else {
                 None
             };
@@ -348,7 +380,7 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
                 }
             }
             let value = wire::encode_tombstone();
-            quorum_write(ctx, &table, &data_key, &value).await?;
+            quorum_write(ctx, meta, &table, &data_key, &value).await?;
             note_delete(ctx, &table, &data_key);
             Ok(wire::write_response(return_values, old.as_ref()))
         }
@@ -359,9 +391,9 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             key,
             projection,
         } => {
-            let (pk, sk) = resolve_key(ctx, &table, &key)?;
+            let (pk, sk) = resolve_key(ctx, meta, &table, &key)?;
             let data_key = item_key(&pk, sk.as_ref());
-            let item = quorum_read(ctx, &table, &data_key).await?;
+            let item = quorum_read(ctx, meta, &table, &data_key).await?;
             let item = item.map(|i| wire::project(projection.as_ref(), &i));
             Ok(wire::get_item_response(item.as_ref()))
         }
@@ -374,6 +406,7 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
         } => {
             run_query(
                 ctx,
+                meta,
                 &table,
                 index.as_deref(),
                 &partition_value,
@@ -391,6 +424,7 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
         } => {
             run_scan(
                 ctx,
+                meta,
                 &table,
                 limit,
                 exclusive_start_key,
@@ -406,8 +440,14 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             condition,
             return_values,
         } => {
+            // `UpdateItem` is always a read-modify-write: hold the per-node RMW
+            // lock across it (taken here, not inside `run_update_item`, which is
+            // also called from `run_transact` under the same lock — a tokio Mutex
+            // is not reentrant).
+            let _rmw = ctx.rmw_lock.lock().await;
             run_update_item(
                 ctx,
+                meta,
                 &table,
                 &key,
                 &actions,
@@ -429,12 +469,12 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
                 for req in reqs {
                     match req {
                         WriteRequest::Put(item) => {
-                            let (pk, sk) = resolve_key(ctx, table, item)?;
+                            let (pk, sk) = resolve_key(ctx, meta, table, item)?;
                             batch
                                 .push((item_key(&pk, sk.as_ref()), wire::encode_stored_item(item)));
                         }
                         WriteRequest::Delete(key_item) => {
-                            let (pk, sk) = resolve_key(ctx, table, key_item)?;
+                            let (pk, sk) = resolve_key(ctx, meta, table, key_item)?;
                             batch.push((item_key(&pk, sk.as_ref()), wire::encode_tombstone()));
                         }
                     }
@@ -447,11 +487,11 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
                 for req in reqs {
                     match req {
                         WriteRequest::Put(item) => {
-                            let (pk, sk) = resolve_key(ctx, table, item)?;
+                            let (pk, sk) = resolve_key(ctx, meta, table, item)?;
                             note_put(ctx, table, &item_key(&pk, sk.as_ref()), item);
                         }
                         WriteRequest::Delete(key_item) => {
-                            let (pk, sk) = resolve_key(ctx, table, key_item)?;
+                            let (pk, sk) = resolve_key(ctx, meta, table, key_item)?;
                             note_delete(ctx, table, &item_key(&pk, sk.as_ref()));
                         }
                     }
@@ -459,7 +499,15 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             }
             Ok(wire::batch_write_response())
         }
-        Operation::TransactWriteItems { actions } => run_transact(ctx, &actions).await,
+        Operation::TransactWriteItems { actions } => {
+            // Hold the per-node RMW lock across the whole transaction so its
+            // condition checks + writes can't interleave with another RMW on this
+            // node. The per-action helpers (`put_item`/`delete_item`/
+            // `run_update_item`) deliberately take no lock — they run under this
+            // guard, and a tokio Mutex is not reentrant.
+            let _rmw = ctx.rmw_lock.lock().await;
+            run_transact(ctx, meta, &actions).await
+        }
     }
 }
 
@@ -554,23 +602,27 @@ async fn create_table(
     // Reconcile the cluster's registry to the **replicated** index set (rebuilding
     // the edge-local Query/Scan key index + GSI machinery from the catalog, not from
     // the request's declarations — so the source of truth is the committed catalog).
-    mirror_catalog_schema(ctx, table);
+    // A *fresh* snapshot on purpose: the request-entry snapshot predates the schema
+    // this very request just committed.
+    mirror_catalog_schema(ctx, &metadata(ctx), table);
     Ok(wire::create_table_response(table, schema, indexes))
 }
 
-/// `PutItem` core (shared by the wire op and `BatchWriteItem`): resolve the key,
+/// `PutItem` core (the `TransactWriteItems` per-action path): resolve the key,
 /// optionally gate on `condition`, quorum-write, and update the key index.
-/// Returns the prior item (for `ReturnValues`).
+/// Returns the prior item (for `ReturnValues`). Takes no RMW lock itself — the
+/// transact caller already holds `ctx.rmw_lock` across the whole transaction.
 async fn put_item(
     ctx: &ClientCtx,
+    meta: &Metadata,
     table: &str,
     item: &Item,
     condition: Option<&ConditionExpression>,
 ) -> Result<Option<Item>, WireError> {
-    let (pk, sk) = resolve_key(ctx, table, item)?;
+    let (pk, sk) = resolve_key(ctx, meta, table, item)?;
     let key = item_key(&pk, sk.as_ref());
     let old = if condition.is_some() {
-        quorum_read(ctx, table, &key).await?
+        quorum_read(ctx, meta, table, &key).await?
     } else {
         None
     };
@@ -582,24 +634,26 @@ async fn put_item(
         }
     }
     let value = wire::encode_stored_item(item);
-    quorum_write(ctx, table, &key, &value).await?;
+    quorum_write(ctx, meta, table, &key, &value).await?;
     note_put(ctx, table, &key, item);
     Ok(old)
 }
 
-/// `DeleteItem` core (shared by the wire op and `BatchWriteItem`): resolve the
+/// `DeleteItem` core (the `TransactWriteItems` per-action path): resolve the
 /// key, optionally gate on `condition`, quorum-write a tombstone, and drop the
-/// key from the index. Returns the prior item (for `ReturnValues`).
+/// key from the index. Returns the prior item (for `ReturnValues`). Takes no RMW
+/// lock itself — the transact caller already holds `ctx.rmw_lock`.
 async fn delete_item(
     ctx: &ClientCtx,
+    meta: &Metadata,
     table: &str,
     key_item: &Item,
     condition: Option<&ConditionExpression>,
 ) -> Result<Option<Item>, WireError> {
-    let (pk, sk) = resolve_key(ctx, table, key_item)?;
+    let (pk, sk) = resolve_key(ctx, meta, table, key_item)?;
     let key = item_key(&pk, sk.as_ref());
     let old = if condition.is_some() {
-        quorum_read(ctx, table, &key).await?
+        quorum_read(ctx, meta, table, &key).await?
     } else {
         None
     };
@@ -610,7 +664,7 @@ async fn delete_item(
             ));
         }
     }
-    quorum_write(ctx, table, &key, &wire::encode_tombstone()).await?;
+    quorum_write(ctx, meta, table, &key, &wire::encode_tombstone()).await?;
     note_delete(ctx, table, &key);
     Ok(old)
 }
@@ -618,18 +672,20 @@ async fn delete_item(
 /// `UpdateItem`: read-modify-write. Reads the current item, applies the SET/REMOVE
 /// actions (starting from the key attributes when the item is absent — an upsert,
 /// as in DynamoDB), gating on an optional `condition`, then quorum-writes the new
-/// item and echoes `ReturnValues`.
+/// item and echoes `ReturnValues`. Takes no RMW lock itself — both callers (the
+/// `UpdateItem` arm and `run_transact`) hold `ctx.rmw_lock` around the call.
 async fn run_update_item(
     ctx: &ClientCtx,
+    meta: &Metadata,
     table: &str,
     key_item: &Item,
     actions: &[UpdateAction],
     condition: Option<&ConditionExpression>,
     return_values: UpdateReturnValues,
 ) -> Result<String, WireError> {
-    let (pk, sk) = resolve_key(ctx, table, key_item)?;
+    let (pk, sk) = resolve_key(ctx, meta, table, key_item)?;
     let key = item_key(&pk, sk.as_ref());
-    let old = quorum_read(ctx, table, &key).await?;
+    let old = quorum_read(ctx, meta, table, &key).await?;
     if let Some(cond) = condition {
         if !cond.evaluate(old.as_ref()) {
             return Err(WireError::conditional_check_failed(
@@ -641,7 +697,7 @@ async fn run_update_item(
     let base = old.clone().unwrap_or_else(|| key_item.clone());
     let new = wire::apply_update(base, actions);
     let value = wire::encode_stored_item(&new);
-    quorum_write(ctx, table, &key, &value).await?;
+    quorum_write(ctx, meta, table, &key, &value).await?;
     note_put(ctx, table, &key, &new);
     Ok(wire::update_response(
         return_values,
@@ -656,8 +712,13 @@ async fn run_update_item(
 /// before it have already been applied. We *do* honor each action's condition (so
 /// a failed `ConditionCheck`/conditional write rejects the request), giving the
 /// common "assert-then-write" use the right answer; the documented gap is the
-/// all-or-nothing guarantee.
-async fn run_transact(ctx: &ClientCtx, actions: &[TransactAction]) -> Result<String, WireError> {
+/// all-or-nothing guarantee. The caller holds `ctx.rmw_lock` across the call, so
+/// the whole transaction is serialized against this node's other RMWs.
+async fn run_transact(
+    ctx: &ClientCtx,
+    meta: &Metadata,
+    actions: &[TransactAction],
+) -> Result<String, WireError> {
     for action in actions {
         match action {
             TransactAction::Put {
@@ -665,14 +726,14 @@ async fn run_transact(ctx: &ClientCtx, actions: &[TransactAction]) -> Result<Str
                 item,
                 condition,
             } => {
-                put_item(ctx, table, item, condition.as_ref()).await?;
+                put_item(ctx, meta, table, item, condition.as_ref()).await?;
             }
             TransactAction::Delete {
                 table,
                 key,
                 condition,
             } => {
-                delete_item(ctx, table, key, condition.as_ref()).await?;
+                delete_item(ctx, meta, table, key, condition.as_ref()).await?;
             }
             TransactAction::Update {
                 table,
@@ -682,6 +743,7 @@ async fn run_transact(ctx: &ClientCtx, actions: &[TransactAction]) -> Result<Str
             } => {
                 run_update_item(
                     ctx,
+                    meta,
                     table,
                     key,
                     actions,
@@ -695,9 +757,9 @@ async fn run_transact(ctx: &ClientCtx, actions: &[TransactAction]) -> Result<Str
                 key,
                 condition,
             } => {
-                let (pk, sk) = resolve_key(ctx, table, key)?;
+                let (pk, sk) = resolve_key(ctx, meta, table, key)?;
                 let data_key = item_key(&pk, sk.as_ref());
-                let current = quorum_read(ctx, table, &data_key).await?;
+                let current = quorum_read(ctx, meta, table, &data_key).await?;
                 if !condition.evaluate(current.as_ref()) {
                     return Err(WireError::conditional_check_failed(
                         "a transaction condition check failed",
@@ -719,6 +781,7 @@ async fn run_transact(ctx: &ClientCtx, actions: &[TransactAction]) -> Result<Str
 /// keeps only the requested attributes of each returned item.
 async fn run_query(
     ctx: &ClientCtx,
+    meta: &Metadata,
     table: &str,
     index: Option<&str>,
     partition_value: &AttributeValue,
@@ -728,11 +791,12 @@ async fn run_query(
     // Mirror a catalog table's schema (so its GSI index exists after a restart or
     // on a follower that has not seen a write). A table absent from the catalog is
     // reported unknown below (ResourceNotFoundException) — matching DynamoDB.
-    mirror_catalog_schema(ctx, table);
+    mirror_catalog_schema(ctx, meta, table);
     match index {
         Some(index) => {
             run_index_query(
                 ctx,
+                meta,
                 table,
                 index,
                 partition_value,
@@ -741,13 +805,24 @@ async fn run_query(
             )
             .await
         }
-        None => run_base_query(ctx, table, partition_value, sort_condition, projection).await,
+        None => {
+            run_base_query(
+                ctx,
+                meta,
+                table,
+                partition_value,
+                sort_condition,
+                projection,
+            )
+            .await
+        }
     }
 }
 
 /// A base-table `Query`: native range scan over the partition's key prefix.
 async fn run_base_query(
     ctx: &ClientCtx,
+    meta: &Metadata,
     table: &str,
     partition_value: &AttributeValue,
     sort_condition: Option<&SortKeyCondition>,
@@ -756,7 +831,7 @@ async fn run_base_query(
     // A base-table query must reject an unknown table the way the registry path
     // did (ResourceNotFoundException). A table is known iff it is in the
     // replicated catalog or auto-registered locally (legacy clients).
-    if !table_known(ctx, table) {
+    if !table_known(ctx, meta, table) {
         return Err(registry_error(animus_dynamo::RegistryError::NoSuchTable(
             table.to_owned(),
         )));
@@ -790,15 +865,18 @@ async fn run_base_query(
 
 /// A secondary-index `Query`: resolve the index's base storage keys from the
 /// in-memory GSI/LSI index and quorum-read each (the native scan covers the base
-/// keyspace, not an index's alternate ordering).
+/// keyspace, not an index's alternate ordering). Backfills the index's entry data
+/// lazily first (see [`backfill_index_if_needed`]).
 async fn run_index_query(
     ctx: &ClientCtx,
+    meta: &Metadata,
     table: &str,
     index: &str,
     partition_value: &AttributeValue,
     sort_condition: Option<&SortKeyCondition>,
     projection: Option<&Projection>,
 ) -> Result<String, WireError> {
+    backfill_index_if_needed(ctx, table, index).await?;
     // An index query with no explicit `ProjectionExpression` falls back to the
     // index's *declared* projection (`ALL` / `KEYS_ONLY` / `INCLUDE`), applied at
     // the edge after the base item is read (the index stores only base keys).
@@ -829,11 +907,64 @@ async fn run_index_query(
     for base_key in &within_keys {
         // The index stores the full engine key (`item_key`) as its base key, so it
         // reads back directly — no table prefix to reattach (ADR 0023).
-        if let Some(item) = quorum_read(ctx, table, base_key).await? {
+        if let Some(item) = quorum_read(ctx, meta, table, base_key).await? {
             items.push(wire::project(effective, &item));
         }
     }
     Ok(wire::query_response(&items))
+}
+
+/// **Lazy restart backfill** for a GSI/LSI's entry data (ADR 0013): the index
+/// *definitions* are replicated (and rebuilt via `sync_indexes`), but the entry
+/// data is edge-local, populated only from writes *this process* observed — so
+/// after a restart (or on a node that never saw the writes) an index query would
+/// silently return nothing. Rather than scanning the base table inline on every
+/// `sync_indexes` (which runs on read/write paths), the rebuild happens **here,
+/// on the first index query** against a freshly-created index: one linearizable
+/// base-table scan, replayed through `note_put` (which populates *every* index of
+/// the table, so the whole table is then marked backfilled).
+///
+/// The scan runs without the registry lock (it is a network read); a write that
+/// lands between the scan and the replay may be replayed with its pre-scan
+/// attributes — the same last-writer-wins imprecision any observed-write index
+/// has, acceptable for this best-effort edge structure (the base item, quorum-read
+/// afterwards, is always the source of truth for the returned data).
+async fn backfill_index_if_needed(
+    ctx: &ClientCtx,
+    table: &str,
+    index: &str,
+) -> Result<(), WireError> {
+    let needs = {
+        let reg = ctx
+            .edge
+            .dynamo_registry()
+            .lock()
+            .expect("registry poisoned");
+        reg.index_needs_backfill(table, index)
+    };
+    if !needs {
+        return Ok(());
+    }
+    // Full base-table scan — the same live source a base `Scan` reads.
+    let pairs = native_scan(ctx, table, &[], None, None).await?;
+    let mut reg = ctx
+        .edge
+        .dynamo_registry()
+        .lock()
+        .expect("registry poisoned");
+    // Re-check under the lock: a concurrent index query may have backfilled while
+    // we scanned (the replay is idempotent, but skipping repeats the work less).
+    if !reg.index_needs_backfill(table, index) {
+        return Ok(());
+    }
+    for (key, value) in &pairs {
+        // DynamoDB tombstone values decode to `None` — logically absent, skipped.
+        if let Some(item) = wire::decode_stored_item(value)? {
+            let _ = reg.note_put(table, key, &item);
+        }
+    }
+    reg.mark_table_backfilled(table);
+    Ok(())
 }
 
 /// Serve a `Scan` via a **native quorum range scan** ([`DataClient::scan`]) over
@@ -844,23 +975,26 @@ async fn run_index_query(
 /// `filter`, then `projection`.
 ///
 /// DynamoDB pagination is layered on top: `exclusive_start_key` resolves to the
-/// storage key to scan strictly *after*; `limit` caps the **examined** (decoded,
-/// live) items, applied at the edge so a DynamoDB tombstone value never consumes a
-/// slot and the page boundary always lands on a live, decodable item; and when the
-/// page is truncated the `LastEvaluatedKey` is that boundary item's key attributes.
-/// The cursor thus advances over the **live data-plane keys** the scan returned —
-/// not a tracked set — so it is correct after a restart or on a follower that never
-/// saw a write.
+/// storage key to scan strictly *after* (so each page's range starts at the
+/// cursor); `limit` caps the **examined** (decoded, live) items and is **pushed
+/// down** to the native scan (fetching windows of the remaining count, continuing
+/// past DynamoDB tombstone values so they never consume a slot) — a small page on
+/// a large table reads ~limit rows, not the whole table. The page boundary always
+/// lands on a live, decodable item; when the page is truncated the
+/// `LastEvaluatedKey` is that boundary item's key attributes. The cursor thus
+/// advances over the **live data-plane keys** the scan returned — not a tracked
+/// set — so it is correct after a restart or on a follower that never saw a write.
 async fn run_scan(
     ctx: &ClientCtx,
+    meta: &Metadata,
     table: &str,
     limit: Option<usize>,
     exclusive_start_key: Option<Item>,
     filter: Option<&ConditionExpression>,
     projection: Option<&Projection>,
 ) -> Result<String, WireError> {
-    mirror_catalog_schema(ctx, table);
-    if !table_known(ctx, table) {
+    mirror_catalog_schema(ctx, meta, table);
+    if !table_known(ctx, meta, table) {
         return Err(registry_error(animus_dynamo::RegistryError::NoSuchTable(
             table.to_owned(),
         )));
@@ -870,7 +1004,7 @@ async fn run_scan(
     // fanned out across the table's tablets in token order by `cp_scan`.
     let from = match &exclusive_start_key {
         Some(key_item) => {
-            let (pk, sk) = resolve_key(ctx, table, key_item)?;
+            let (pk, sk) = resolve_key(ctx, meta, table, key_item)?;
             let mut after = item_key(&pk, sk.as_ref());
             after.push(0x00); // first key strictly past the cursor (keys are unique)
             after
@@ -881,17 +1015,41 @@ async fn run_scan(
     // `DeleteItem` stores a *tombstone value* (a live pair to the data plane), so
     // decode each and drop the ones that decode to a tombstone — those items are
     // logically absent and are neither examined nor counted.
-    let pairs = native_scan(ctx, table, &from, None, None).await?;
+    //
+    // `Limit` is **pushed down** to the native scan (which pushes it per tablet —
+    // `cp_scan` passes each tablet's leader only the remaining count and stops
+    // fanning out once filled), so a `Limit=10` page on a large table ships ~10
+    // rows instead of the whole table, and pagination stays O(page) per page (the
+    // cursor becomes the next page's range start). We fetch `limit + 1` live items
+    // to know whether the page is truncated. A DynamoDB tombstone *value* is live
+    // to the data plane but must not consume a `Limit` slot, so when a fetched
+    // window decodes short (tombstones in range), continue the scan from just past
+    // the last raw key until the window is filled or the range is exhausted —
+    // the page boundary then always lands on a live, decodable item, so its key
+    // attributes are recoverable for `LastEvaluatedKey`.
+    let want = limit.map(|n| n.saturating_add(1));
     let mut examined: Vec<(Vec<u8>, Item)> = Vec::new();
-    for (key, value) in pairs {
-        if let Some(item) = wire::decode_stored_item(&value)? {
-            examined.push((key, item));
+    let mut cursor = from;
+    loop {
+        let fetch = want.map(|w| w - examined.len());
+        let pairs = native_scan(ctx, table, &cursor, None, fetch).await?;
+        // Fewer raw pairs than asked (or an unbounded fetch) ⇒ the range is done.
+        let exhausted = fetch.is_none_or(|f| pairs.len() < f);
+        let last_raw_key = pairs.last().map(|(k, _)| k.clone());
+        for (key, value) in pairs {
+            if let Some(item) = wire::decode_stored_item(&value)? {
+                examined.push((key, item));
+            }
         }
+        if exhausted || want.is_some_and(|w| examined.len() >= w) {
+            break;
+        }
+        // Tombstone values consumed part of the window: resume strictly past the
+        // last raw key scanned (keys are unique, so append a 0x00).
+        let mut next = last_raw_key.expect("non-exhausted fetch returned pairs");
+        next.push(0x00);
+        cursor = next;
     }
-    // `Limit` caps the **examined** items; we apply it at the edge (over decoded
-    // live items) rather than passing it to the native scan, so a tombstone value
-    // never consumes a slot and the page boundary always falls on a live, decodable
-    // item — its key attributes are recoverable for `LastEvaluatedKey`.
     let truncated = limit.is_some_and(|n| examined.len() > n);
     if let Some(n) = limit {
         examined.truncate(n);
@@ -1047,8 +1205,8 @@ async fn native_scan(
 /// already auto-registered locally (a legacy `pk`/`sk` client). A base-table
 /// `Query`/`Scan` rejects an unknown table (`ResourceNotFoundException`), matching
 /// what the former written-key path did via the registry.
-fn table_known(ctx: &ClientCtx, table: &str) -> bool {
-    if metadata(ctx).has_table_schema(table) {
+fn table_known(ctx: &ClientCtx, meta: &Metadata, table: &str) -> bool {
+    if meta.has_table_schema(table) {
         return true;
     }
     ctx.edge
@@ -1064,15 +1222,17 @@ fn table_known(ctx: &ClientCtx, table: &str) -> bool {
 /// AP path's `read_version`+1 dance is gone).
 async fn quorum_write(
     ctx: &ClientCtx,
+    meta: &Metadata,
     table: &str,
     key: &[u8],
     value: &[u8],
 ) -> Result<(), WireError> {
     // Auto-provision the table's tablet on first write (ADR 0023). A `CreateTable`
     // provisions up front, but a legacy `pk`/`sk` client that never `CreateTable`d
-    // still needs a tablet to route to — stand one up on demand here. Idempotent and
-    // fast (a metadata check) once the tablet exists.
-    if !metadata(ctx).has_table_tablet(table) {
+    // still needs a tablet to route to — stand one up on demand here. Idempotent
+    // (a request-start snapshot is sound: a stale "absent" just re-proposes the
+    // idempotent provisioning) and fast once the tablet exists.
+    if !meta.has_table_tablet(table) {
         ctx.provision_tablet(table)
             .await
             .map_err(|e| internal(&e))?;
@@ -1084,10 +1244,21 @@ async fn quorum_write(
 
 /// Linearizable CP read of `key`, decoding the stored DynamoDB item (an absent
 /// key — including one tombstoned by a `DeleteItem` sentinel — reads as `None`).
-async fn quorum_read(ctx: &ClientCtx, table: &str, key: &[u8]) -> Result<Option<Item>, WireError> {
+async fn quorum_read(
+    ctx: &ClientCtx,
+    meta: &Metadata,
+    table: &str,
+    key: &[u8],
+) -> Result<Option<Item>, WireError> {
     // A table with no tablet has no data (ADR 0023) — read as absent without waiting
-    // on routing for a tablet that does not exist.
-    if !metadata(ctx).has_table_tablet(table) {
+    // on routing for a tablet that does not exist. The gate short-circuits a
+    // **linearizable** read, so it must not conclude "absent" from the (possibly
+    // stale) request-entry snapshot: a concurrent first write may have provisioned
+    // the tablet after this request began — under the RMW lock a conditional
+    // writer's read *must* see it (two racing `attribute_not_exists` puts both
+    // "succeeding" was the failure mode). Trust the snapshot on the hit path
+    // (tablets are only removed by drop-table); re-check **live** on the miss.
+    if !meta.has_table_tablet(table) && !metadata(ctx).has_table_tablet(table) {
         return Ok(None);
     }
     match ctx

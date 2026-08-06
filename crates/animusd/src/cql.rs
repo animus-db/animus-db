@@ -610,8 +610,8 @@ async fn run_statement(
             }
             // The full drop (ADR 0024): schema out of the catalog *and* the
             // table's tablets out of the map, so every replica's GC loop
-            // reclaims the table's on-disk data. (`ALTER TABLE`'s
-            // drop-then-recreate keeps using the schema-only primitive.)
+            // reclaims the table's on-disk data. (`ALTER TABLE` mutates the
+            // schema in place via `ReplaceTableSchema` and never drops.)
             match ctx.drop_table(control_name).await {
                 Ok(()) => {
                     response::schema_change_result(stream, "DROPPED", "TABLE", &keyspace, &dt.table)
@@ -733,16 +733,23 @@ async fn run_statement(
 /// recognized even if its `CREATE KEYSPACE` predates replicated keyspaces).
 async fn keyspace_exists(ctx: &ClientCtx, keyspace: &str) -> bool {
     let ks = keyspace.to_ascii_lowercase();
-    ctx.has_keyspace(&ks) || ctx.has_table_schema_with_prefix(&format!("{ks}."))
+    // One metadata snapshot for both checks — `ctx.has_keyspace` +
+    // `ctx.has_table_schema_with_prefix` would each deep-clone the replicated
+    // metadata under the Raft handle's lock.
+    let meta = ctx.raft.metadata();
+    meta.has_keyspace(&ks)
+        || meta
+            .table_schemas()
+            .any(|(name, _)| name.starts_with(&format!("{ks}.")))
 }
 
-/// `ALTER TABLE ... ADD`: append the new columns to the replicated schema. The
-/// control plane has no in-place schema update, so this **drops and recreates**
-/// the schema with the extended column list. Appending columns preserves every
-/// existing column's index, and the partition-storage format keys cells by index,
-/// so stored rows still decode correctly under the new schema. NOTE: drop +
-/// recreate is **not atomic** — a crash between them could leave the table
-/// dropped; an in-place schema-mutation `MetaCommand` is future work (ADR 0013).
+/// `ALTER TABLE ... ADD`: append the new columns to the replicated schema via the
+/// **atomic in-place replacement** (`MetaCommand::ReplaceTableSchema`, one command
+/// / one apply — the former drop-then-recreate could strand the table schema-less
+/// if a crash landed between the two commands, and let a concurrent reader on a
+/// replica between the two applies see the table missing). Appending columns
+/// preserves every existing column's index, and the partition-storage format keys
+/// cells by index, so stored rows still decode correctly under the new schema.
 async fn alter_table(ctx: &ClientCtx, session: &Session, stream: i16, at: AlterTable) -> Vec<u8> {
     let keyspace = match at.keyspace.clone().or_else(|| session.keyspace.clone()) {
         Some(k) => k,
@@ -777,11 +784,8 @@ async fn alter_table(ctx: &ClientCtx, session: &Session, stream: i16, at: AlterT
             .columns
             .push(ColumnDef::new(name.clone(), cql_to_column_type(*ty)));
     }
-    // Drop then recreate with the extended schema (see the doc comment).
-    if let Err(msg) = ctx.drop_table_schema(control_name.clone()).await {
-        return response::error(stream, response::ERR_SERVER, &msg);
-    }
-    match ctx.create_table_schema(control_name, schema).await {
+    // One atomic replacement (see the doc comment) — never a schema-less window.
+    match ctx.replace_table_schema(control_name, schema).await {
         Ok(()) => response::schema_change_result(stream, "UPDATED", "TABLE", &keyspace, &at.table),
         Err(msg) => response::error(stream, response::ERR_SERVER, &msg),
     }

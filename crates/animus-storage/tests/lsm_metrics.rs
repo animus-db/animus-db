@@ -28,6 +28,8 @@ fn opts() -> LsmOptions {
         wal_segment_bytes: 128,
         // Large grace: this run asserts flush/compaction/read counters, not GC.
         tombstone_grace_versions: 1 << 20,
+        trust_monotonic_versions: false,
+        background_maintenance: false,
     }
 }
 
@@ -200,6 +202,8 @@ fn tombstone_gc_is_recorded() {
             level_fanout: 2,
             wal_segment_bytes: 128,
             tombstone_grace_versions: grace,
+            trust_monotonic_versions: false,
+            background_maintenance: false,
         },
         metrics.clone(),
     ))

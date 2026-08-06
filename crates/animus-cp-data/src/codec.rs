@@ -1,0 +1,738 @@
+//! Compact, self-describing **binary codec** for the CP data plane's wire
+//! messages and snapshot image (audit P2).
+//!
+//! `KvWire` / `RaftMsg<KvCommand>` and the engine snapshot image used to ride
+//! `serde_json`, which renders every `Vec<u8>` key/value as a decimal byte array
+//! (`[107,49,...]`) — roughly 3–4x the payload size on the hot replication path
+//! and in every 1KB `InstallSnapshot` chunk's source image. This module is a
+//! hand-rolled length-prefixed framing in the same style as `animus-storage`'s
+//! manifest codec (no new dependency — the tree has no byte-transparent serde
+//! format): a magic byte + version, `u8` enum tags, big-endian fixed-width
+//! integers, and `u32`-length-prefixed byte strings.
+//!
+//! Scope: **wire + snapshot image only.** The Raft WAL keeps the shared
+//! `PersistedState` (serde_json) encoding — it is `animus-control`'s format,
+//! common to both planes.
+//!
+//! Pre-alpha: no cross-version wire/disk compatibility is required (mixed-codec
+//! clusters are not supported), but decode failures stay **loud**: every
+//! malformed input yields a descriptive `Err` that the driver logs
+//! (`tracing::warn!`) before dropping the message — never a silent
+//! misinterpretation (the magic/version check rejects a stray JSON payload
+//! outright).
+
+use std::collections::BTreeSet;
+
+use animus_control::raft::{LogEntry, RaftMsg};
+use animus_env::NodeId;
+
+use crate::{ImageEntry, KvCommand, KvWire};
+
+/// First byte of every encoded frame — rejects foreign payloads (e.g. a JSON
+/// message from a mixed-version peer) with a clear error instead of a confusing
+/// tag mismatch deeper in.
+const MAGIC: u8 = 0xCB;
+/// Codec version, bumped on any incompatible layout change.
+const VERSION: u8 = 1;
+
+/// A decode failure: a description of what was malformed, surfaced loudly by
+/// the caller (logged + dropped; never silently misread).
+pub(crate) type DecodeError = String;
+
+// ---- primitive writers -----------------------------------------------------
+
+fn put_u8(out: &mut Vec<u8>, v: u8) {
+    out.push(v);
+}
+
+fn put_u64(out: &mut Vec<u8>, v: u64) {
+    out.extend_from_slice(&v.to_be_bytes());
+}
+
+fn put_bool(out: &mut Vec<u8>, v: bool) {
+    out.push(u8::from(v));
+}
+
+fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
+    out.extend_from_slice(&(b.len() as u32).to_be_bytes());
+    out.extend_from_slice(b);
+}
+
+fn put_opt_bytes(out: &mut Vec<u8>, b: &Option<Vec<u8>>) {
+    match b {
+        None => put_u8(out, 0),
+        Some(b) => {
+            put_u8(out, 1);
+            put_bytes(out, b);
+        }
+    }
+}
+
+fn put_node_set(out: &mut Vec<u8>, s: &BTreeSet<NodeId>) {
+    out.extend_from_slice(&(s.len() as u32).to_be_bytes());
+    for &n in s {
+        put_u64(out, n);
+    }
+}
+
+fn put_opt_node_set(out: &mut Vec<u8>, s: &Option<BTreeSet<NodeId>>) {
+    match s {
+        None => put_u8(out, 0),
+        Some(s) => {
+            put_u8(out, 1);
+            put_node_set(out, s);
+        }
+    }
+}
+
+// ---- primitive reader ------------------------------------------------------
+
+/// A forward-only cursor over frame bytes; any short read is a loud decode
+/// error (mirrors the storage manifest codec's `Cursor`).
+struct Cursor<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Cursor<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, pos: 0 }
+    }
+
+    fn take(&mut self, n: usize) -> Result<&'a [u8], DecodeError> {
+        if self.pos + n > self.bytes.len() {
+            return Err(format!(
+                "truncated frame: wanted {n} bytes at offset {}, have {}",
+                self.pos,
+                self.bytes.len()
+            ));
+        }
+        let s = &self.bytes[self.pos..self.pos + n];
+        self.pos += n;
+        Ok(s)
+    }
+
+    fn u8(&mut self) -> Result<u8, DecodeError> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn u32(&mut self) -> Result<u32, DecodeError> {
+        Ok(u32::from_be_bytes(self.take(4)?.try_into().expect("4B")))
+    }
+
+    fn u64(&mut self) -> Result<u64, DecodeError> {
+        Ok(u64::from_be_bytes(self.take(8)?.try_into().expect("8B")))
+    }
+
+    fn bool(&mut self) -> Result<bool, DecodeError> {
+        match self.u8()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            other => Err(format!("invalid bool byte {other}")),
+        }
+    }
+
+    fn bytes(&mut self) -> Result<Vec<u8>, DecodeError> {
+        let len = self.u32()? as usize;
+        Ok(self.take(len)?.to_vec())
+    }
+
+    fn opt_bytes(&mut self) -> Result<Option<Vec<u8>>, DecodeError> {
+        match self.u8()? {
+            0 => Ok(None),
+            1 => Ok(Some(self.bytes()?)),
+            other => Err(format!("invalid option tag {other}")),
+        }
+    }
+
+    fn node_set(&mut self) -> Result<BTreeSet<NodeId>, DecodeError> {
+        let len = self.u32()?;
+        let mut s = BTreeSet::new();
+        for _ in 0..len {
+            s.insert(self.u64()?);
+        }
+        Ok(s)
+    }
+
+    fn opt_node_set(&mut self) -> Result<Option<BTreeSet<NodeId>>, DecodeError> {
+        match self.u8()? {
+            0 => Ok(None),
+            1 => Ok(Some(self.node_set()?)),
+            other => Err(format!("invalid option tag {other}")),
+        }
+    }
+
+    fn finish(self) -> Result<(), DecodeError> {
+        if self.pos == self.bytes.len() {
+            Ok(())
+        } else {
+            Err(format!(
+                "trailing garbage: {} bytes after frame end",
+                self.bytes.len() - self.pos
+            ))
+        }
+    }
+}
+
+// ---- KvCommand ---------------------------------------------------------------
+
+fn put_command(out: &mut Vec<u8>, c: &KvCommand) {
+    match c {
+        KvCommand::Put { key, value } => {
+            put_u8(out, 0);
+            put_bytes(out, key);
+            put_bytes(out, value);
+        }
+        KvCommand::Batch(puts) => {
+            put_u8(out, 1);
+            out.extend_from_slice(&(puts.len() as u32).to_be_bytes());
+            for (k, v) in puts {
+                put_bytes(out, k);
+                put_bytes(out, v);
+            }
+        }
+        KvCommand::Delete { key } => {
+            put_u8(out, 2);
+            put_bytes(out, key);
+        }
+        KvCommand::Cas {
+            key,
+            expected,
+            value,
+        } => {
+            put_u8(out, 3);
+            put_bytes(out, key);
+            put_opt_bytes(out, expected);
+            put_bytes(out, value);
+        }
+        KvCommand::Split { at } => {
+            put_u8(out, 4);
+            put_bytes(out, at);
+        }
+        KvCommand::NoOp => put_u8(out, 5),
+    }
+}
+
+fn read_command(c: &mut Cursor<'_>) -> Result<KvCommand, DecodeError> {
+    Ok(match c.u8()? {
+        0 => KvCommand::Put {
+            key: c.bytes()?,
+            value: c.bytes()?,
+        },
+        1 => {
+            let n = c.u32()?;
+            let mut puts = Vec::with_capacity(n as usize);
+            for _ in 0..n {
+                puts.push((c.bytes()?, c.bytes()?));
+            }
+            KvCommand::Batch(puts)
+        }
+        2 => KvCommand::Delete { key: c.bytes()? },
+        3 => KvCommand::Cas {
+            key: c.bytes()?,
+            expected: c.opt_bytes()?,
+            value: c.bytes()?,
+        },
+        4 => KvCommand::Split { at: c.bytes()? },
+        5 => KvCommand::NoOp,
+        other => return Err(format!("unknown KvCommand tag {other}")),
+    })
+}
+
+// ---- LogEntry<KvCommand> -----------------------------------------------------
+
+fn put_entry(out: &mut Vec<u8>, e: &LogEntry<KvCommand>) {
+    put_u64(out, e.term);
+    put_u64(out, e.index);
+    put_command(out, &e.command);
+    put_opt_node_set(out, &e.config);
+}
+
+fn read_entry(c: &mut Cursor<'_>) -> Result<LogEntry<KvCommand>, DecodeError> {
+    Ok(LogEntry {
+        term: c.u64()?,
+        index: c.u64()?,
+        command: read_command(c)?,
+        config: c.opt_node_set()?,
+    })
+}
+
+// ---- RaftMsg<KvCommand> ------------------------------------------------------
+
+#[allow(clippy::enum_glob_use)]
+fn put_raft(out: &mut Vec<u8>, m: &RaftMsg<KvCommand>) {
+    match m {
+        RaftMsg::PreVote {
+            term,
+            candidate,
+            last_log_index,
+            last_log_term,
+        } => {
+            put_u8(out, 0);
+            put_u64(out, *term);
+            put_u64(out, *candidate);
+            put_u64(out, *last_log_index);
+            put_u64(out, *last_log_term);
+        }
+        RaftMsg::PreVoteResp { term, granted } => {
+            put_u8(out, 1);
+            put_u64(out, *term);
+            put_bool(out, *granted);
+        }
+        RaftMsg::RequestVote {
+            term,
+            candidate,
+            last_log_index,
+            last_log_term,
+        } => {
+            put_u8(out, 2);
+            put_u64(out, *term);
+            put_u64(out, *candidate);
+            put_u64(out, *last_log_index);
+            put_u64(out, *last_log_term);
+        }
+        RaftMsg::RequestVoteResp { term, granted } => {
+            put_u8(out, 3);
+            put_u64(out, *term);
+            put_bool(out, *granted);
+        }
+        RaftMsg::AppendEntries {
+            term,
+            leader,
+            prev_log_index,
+            prev_log_term,
+            entries,
+            leader_commit,
+        } => {
+            put_u8(out, 4);
+            put_u64(out, *term);
+            put_u64(out, *leader);
+            put_u64(out, *prev_log_index);
+            put_u64(out, *prev_log_term);
+            out.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+            for e in entries {
+                put_entry(out, e);
+            }
+            put_u64(out, *leader_commit);
+        }
+        RaftMsg::AppendEntriesResp {
+            term,
+            success,
+            match_index,
+        } => {
+            put_u8(out, 5);
+            put_u64(out, *term);
+            put_bool(out, *success);
+            put_u64(out, *match_index);
+        }
+        RaftMsg::InstallSnapshot {
+            term,
+            leader,
+            last_index,
+            last_term,
+            offset,
+            data,
+            total,
+            done,
+            config,
+        } => {
+            put_u8(out, 6);
+            put_u64(out, *term);
+            put_u64(out, *leader);
+            put_u64(out, *last_index);
+            put_u64(out, *last_term);
+            put_u64(out, *offset);
+            put_bytes(out, data);
+            put_u64(out, *total);
+            put_bool(out, *done);
+            put_opt_node_set(out, config);
+        }
+        RaftMsg::InstallSnapshotResp {
+            term,
+            last_index,
+            next_offset,
+        } => {
+            put_u8(out, 7);
+            put_u64(out, *term);
+            put_u64(out, *last_index);
+            put_u64(out, *next_offset);
+        }
+        RaftMsg::Heartbeat { node } => {
+            put_u8(out, 8);
+            put_u64(out, *node);
+        }
+    }
+}
+
+fn read_raft(c: &mut Cursor<'_>) -> Result<RaftMsg<KvCommand>, DecodeError> {
+    Ok(match c.u8()? {
+        0 => RaftMsg::PreVote {
+            term: c.u64()?,
+            candidate: c.u64()?,
+            last_log_index: c.u64()?,
+            last_log_term: c.u64()?,
+        },
+        1 => RaftMsg::PreVoteResp {
+            term: c.u64()?,
+            granted: c.bool()?,
+        },
+        2 => RaftMsg::RequestVote {
+            term: c.u64()?,
+            candidate: c.u64()?,
+            last_log_index: c.u64()?,
+            last_log_term: c.u64()?,
+        },
+        3 => RaftMsg::RequestVoteResp {
+            term: c.u64()?,
+            granted: c.bool()?,
+        },
+        4 => {
+            let term = c.u64()?;
+            let leader = c.u64()?;
+            let prev_log_index = c.u64()?;
+            let prev_log_term = c.u64()?;
+            let n = c.u32()?;
+            let mut entries = Vec::with_capacity(n as usize);
+            for _ in 0..n {
+                entries.push(read_entry(c)?);
+            }
+            RaftMsg::AppendEntries {
+                term,
+                leader,
+                prev_log_index,
+                prev_log_term,
+                entries,
+                leader_commit: c.u64()?,
+            }
+        }
+        5 => RaftMsg::AppendEntriesResp {
+            term: c.u64()?,
+            success: c.bool()?,
+            match_index: c.u64()?,
+        },
+        6 => RaftMsg::InstallSnapshot {
+            term: c.u64()?,
+            leader: c.u64()?,
+            last_index: c.u64()?,
+            last_term: c.u64()?,
+            offset: c.u64()?,
+            data: c.bytes()?,
+            total: c.u64()?,
+            done: c.bool()?,
+            config: c.opt_node_set()?,
+        },
+        7 => RaftMsg::InstallSnapshotResp {
+            term: c.u64()?,
+            last_index: c.u64()?,
+            next_offset: c.u64()?,
+        },
+        8 => RaftMsg::Heartbeat { node: c.u64()? },
+        other => return Err(format!("unknown RaftMsg tag {other}")),
+    })
+}
+
+// ---- KvWire --------------------------------------------------------------
+
+/// Encode a [`KvWire`] message to its binary frame.
+pub(crate) fn encode_wire(w: &KvWire) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_u8(&mut out, MAGIC);
+    put_u8(&mut out, VERSION);
+    match w {
+        KvWire::Raft(m) => {
+            put_u8(&mut out, 0);
+            put_raft(&mut out, m);
+        }
+        KvWire::ReadProbe { term, epoch } => {
+            put_u8(&mut out, 1);
+            put_u64(&mut out, *term);
+            put_u64(&mut out, *epoch);
+        }
+        KvWire::ReadProbeAck { term, epoch } => {
+            put_u8(&mut out, 2);
+            put_u64(&mut out, *term);
+            put_u64(&mut out, *epoch);
+        }
+    }
+    out
+}
+
+/// Decode a binary frame into a [`KvWire`] message. Errors are descriptive and
+/// the caller logs them loudly before dropping the message.
+pub(crate) fn decode_wire(bytes: &[u8]) -> Result<KvWire, DecodeError> {
+    let mut c = Cursor::new(bytes);
+    let magic = c.u8()?;
+    if magic != MAGIC {
+        return Err(format!("bad magic byte {magic:#04x} (want {MAGIC:#04x})"));
+    }
+    let version = c.u8()?;
+    if version != VERSION {
+        return Err(format!("unsupported codec version {version}"));
+    }
+    let wire = match c.u8()? {
+        0 => KvWire::Raft(read_raft(&mut c)?),
+        1 => KvWire::ReadProbe {
+            term: c.u64()?,
+            epoch: c.u64()?,
+        },
+        2 => KvWire::ReadProbeAck {
+            term: c.u64()?,
+            epoch: c.u64()?,
+        },
+        other => return Err(format!("unknown KvWire tag {other}")),
+    };
+    c.finish()?;
+    Ok(wire)
+}
+
+// ---- snapshot image --------------------------------------------------------
+
+/// Encode the engine snapshot image (`(key, value-or-tombstone, version)`
+/// entries) shipped in `InstallSnapshot` chunks.
+pub(crate) fn encode_image(entries: &[ImageEntry]) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_u8(&mut out, MAGIC);
+    put_u8(&mut out, VERSION);
+    out.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+    for (key, value, version) in entries {
+        put_bytes(&mut out, key);
+        put_opt_bytes(&mut out, value);
+        put_u64(&mut out, *version);
+    }
+    out
+}
+
+/// Decode an engine snapshot image. Loud on any malformation (a partial
+/// transfer never reaches this — chunks are reassembled to `total` first).
+pub(crate) fn decode_image(bytes: &[u8]) -> Result<Vec<ImageEntry>, DecodeError> {
+    let mut c = Cursor::new(bytes);
+    let magic = c.u8()?;
+    if magic != MAGIC {
+        return Err(format!("bad magic byte {magic:#04x} (want {MAGIC:#04x})"));
+    }
+    let version = c.u8()?;
+    if version != VERSION {
+        return Err(format!("unsupported codec version {version}"));
+    }
+    let n = c.u32()?;
+    let mut entries = Vec::with_capacity(n as usize);
+    for _ in 0..n {
+        entries.push((c.bytes()?, c.opt_bytes()?, c.u64()?));
+    }
+    c.finish()?;
+    Ok(entries)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn roundtrip(w: &KvWire) {
+        let bytes = encode_wire(w);
+        let back = decode_wire(&bytes).expect("decodes");
+        // KvWire has no PartialEq (RaftMsg doesn't derive it); compare via the
+        // debug form, which covers every field.
+        assert_eq!(format!("{w:?}"), format!("{back:?}"));
+    }
+
+    #[test]
+    fn every_wire_variant_round_trips() {
+        let entries = vec![
+            LogEntry {
+                term: 3,
+                index: 17,
+                command: KvCommand::Put {
+                    key: b"k".to_vec(),
+                    value: vec![0, 255, 128],
+                },
+                config: None,
+            },
+            LogEntry {
+                term: 3,
+                index: 18,
+                command: KvCommand::Batch(vec![
+                    (b"a".to_vec(), b"1".to_vec()),
+                    (Vec::new(), Vec::new()), // empty key/value survive
+                ]),
+                config: Some([1, 2, 3].into_iter().collect()),
+            },
+            LogEntry {
+                term: 4,
+                index: 19,
+                command: KvCommand::Cas {
+                    key: b"c".to_vec(),
+                    expected: None,
+                    value: b"v".to_vec(),
+                },
+                config: None,
+            },
+            LogEntry {
+                term: 4,
+                index: 20,
+                command: KvCommand::Cas {
+                    key: b"c".to_vec(),
+                    expected: Some(b"old".to_vec()),
+                    value: b"new".to_vec(),
+                },
+                config: None,
+            },
+            LogEntry {
+                term: 4,
+                index: 21,
+                command: KvCommand::Delete { key: b"d".to_vec() },
+                config: None,
+            },
+            LogEntry {
+                term: 4,
+                index: 22,
+                command: KvCommand::Split { at: b"m".to_vec() },
+                config: None,
+            },
+            LogEntry {
+                term: 5,
+                index: 23,
+                command: KvCommand::NoOp,
+                config: None,
+            },
+        ];
+        let msgs: Vec<RaftMsg<KvCommand>> = vec![
+            RaftMsg::PreVote {
+                term: 7,
+                candidate: 2,
+                last_log_index: 9,
+                last_log_term: 6,
+            },
+            RaftMsg::PreVoteResp {
+                term: 7,
+                granted: true,
+            },
+            RaftMsg::RequestVote {
+                term: 7,
+                candidate: 2,
+                last_log_index: 9,
+                last_log_term: 6,
+            },
+            RaftMsg::RequestVoteResp {
+                term: 7,
+                granted: false,
+            },
+            RaftMsg::AppendEntries {
+                term: 7,
+                leader: 2,
+                prev_log_index: 16,
+                prev_log_term: 3,
+                entries,
+                leader_commit: 15,
+            },
+            RaftMsg::AppendEntriesResp {
+                term: 7,
+                success: true,
+                match_index: 23,
+            },
+            RaftMsg::InstallSnapshot {
+                term: 7,
+                leader: 2,
+                last_index: 16,
+                last_term: 3,
+                offset: 1024,
+                data: vec![9; 300],
+                total: 4096,
+                done: false,
+                config: Some([2, 4].into_iter().collect()),
+            },
+            RaftMsg::InstallSnapshotResp {
+                term: 7,
+                last_index: 0,
+                next_offset: 2048,
+            },
+            RaftMsg::Heartbeat { node: 11 },
+        ];
+        for m in msgs {
+            roundtrip(&KvWire::Raft(m));
+        }
+        roundtrip(&KvWire::ReadProbe { term: 7, epoch: 42 });
+        roundtrip(&KvWire::ReadProbeAck { term: 7, epoch: 42 });
+    }
+
+    #[test]
+    fn image_round_trips_including_tombstones() {
+        let entries: Vec<ImageEntry> = vec![
+            (b"a".to_vec(), Some(vec![0, 1, 255]), 3),
+            (b"b".to_vec(), None, 9), // tombstone
+            (Vec::new(), Some(Vec::new()), 0),
+        ];
+        let bytes = encode_image(&entries);
+        assert_eq!(decode_image(&bytes).expect("decodes"), entries);
+    }
+
+    #[test]
+    fn decode_failures_are_loud_and_descriptive() {
+        // A JSON payload (the old encoding / a foreign message) fails the magic
+        // check, not some confusing tag error deep inside.
+        let err = decode_wire(b"{\"Raft\":{}}").unwrap_err();
+        assert!(err.contains("bad magic"), "got: {err}");
+
+        // Unknown version.
+        let err = decode_wire(&[MAGIC, 99, 0]).unwrap_err();
+        assert!(err.contains("version"), "got: {err}");
+
+        // Truncated frame.
+        let good = encode_wire(&KvWire::ReadProbe { term: 1, epoch: 2 });
+        let err = decode_wire(&good[..good.len() - 1]).unwrap_err();
+        assert!(err.contains("truncated"), "got: {err}");
+
+        // Trailing garbage is rejected (a frame must be exactly one message).
+        let mut padded = good.clone();
+        padded.push(0);
+        let err = decode_wire(&padded).unwrap_err();
+        assert!(err.contains("trailing"), "got: {err}");
+
+        // Unknown enum tag.
+        let err = decode_wire(&[MAGIC, VERSION, 9]).unwrap_err();
+        assert!(err.contains("unknown KvWire tag"), "got: {err}");
+
+        // Image: same loud contract.
+        let err = decode_image(b"[]").unwrap_err();
+        assert!(err.contains("bad magic"), "got: {err}");
+    }
+
+    #[test]
+    fn binary_framing_is_much_smaller_than_json_for_byte_payloads() {
+        // The motivating case (audit P2): serde_json renders Vec<u8> as a
+        // decimal array (~3-4x). Guard the win so a codec regression is caught.
+        let value = vec![200u8; 1024];
+        let wire = KvWire::Raft(RaftMsg::AppendEntries {
+            term: 1,
+            leader: 0,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: vec![LogEntry {
+                term: 1,
+                index: 1,
+                command: KvCommand::Put {
+                    key: b"key".to_vec(),
+                    value: value.clone(),
+                },
+                config: None,
+            }],
+            leader_commit: 0,
+        });
+        let binary = encode_wire(&wire).len();
+        // What the old encoding paid for the same message.
+        let json = serde_json::to_vec(&serde_json::json!({
+            "Raft": {"AppendEntries": {
+                "term": 1, "leader": 0, "prev_log_index": 0, "prev_log_term": 0,
+                "entries": [{"term": 1, "index": 1,
+                             "command": {"Put": {"key": b"key".to_vec(), "value": value}},
+                             "config": null}],
+                "leader_commit": 0,
+            }}
+        }))
+        .expect("json")
+        .len();
+        assert!(
+            binary * 3 < json,
+            "binary frame ({binary}B) should be well under a third of JSON ({json}B)"
+        );
+    }
+}

@@ -42,12 +42,14 @@ use std::time::Duration;
 
 use animus_control::raft::{Out, RaftCore, RaftMsg, StateMachine};
 use animus_control::{PersistedState, ProposeResult};
-use animus_env::{Coresident, Env, EnvExt, NodeId};
+use animus_env::{Coresident, Env, EnvExt, Metric, MetricsHandle, NodeId};
 use animus_storage::{MergeOp, StorageEngine};
 use futures::future::{Either, select};
 use futures::lock::Mutex as AsyncMutex;
 use futures::task::AtomicWaker;
 use serde::{Deserialize, Serialize};
+
+mod codec;
 
 /// The **wake-on-propose** signal (ADR 0017 single-write-latency fix): a shared
 /// flag + executor-agnostic waker that lets a proposer (`put`/`delete`/`cas`/
@@ -161,9 +163,11 @@ type KvCore = RaftCore<KvCommand, KvState>;
 /// The data-plane wire: Raft consensus traffic plus the **ReadIndex** read-barrier
 /// probes (ADR 0017). The probes are *not* consensus traffic — they never touch
 /// `RaftCore`; the driver handles them — so ReadIndex lives entirely in this crate
-/// and the shared `RaftCore`/`RaftMsg` are untouched.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-enum KvWire {
+/// and the shared `RaftCore`/`RaftMsg` are untouched. Framed with the crate's
+/// compact **binary codec** ([`codec`], audit P2) — not serde_json, whose
+/// decimal-array rendering of `Vec<u8>` payloads cost ~3–4x on the wire.
+#[derive(Clone, Debug)]
+pub(crate) enum KvWire {
     /// A control-plane-shaped Raft message for this group.
     Raft(RaftMsg<KvCommand>),
     /// Leader → peers: "are you still in term `term`?" (a ReadIndex barrier,
@@ -248,6 +252,13 @@ pub struct RaftKvNode<E: Env, S: StorageEngine> {
     /// replicate a freshly appended entry immediately, cutting single-write latency
     /// (ADR 0017) — no waiting on the next heartbeat tick.
     propose_signal: Arc<ProposeSignal>,
+    /// Observability sink (ADR 0015). The public propose API records the real
+    /// accept/reject outcome into it, and the consensus loop + apply task each hold
+    /// a clone for the commit/apply/read-barrier/snapshot recording sites. Cheap to
+    /// clone; defaults to `env.metrics()` (a no-op under `SimEnv`, a real sink under
+    /// `ProdEnv`) — see [`start_with_metrics`](Self::start_with_metrics) to observe
+    /// it under simulation.
+    metrics: MetricsHandle,
 }
 
 /// Invoked on a replica when it **applies** a committed `Split` (ADR 0017 D), with
@@ -262,8 +273,29 @@ pub type SplitHook = Arc<dyn Fn(Vec<u8>, Vec<(Vec<u8>, Vec<u8>)>) + Send + Sync>
 impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// Start a tablet group node over `env`, backed by `storage`. `all_nodes` is
     /// the group's full replica set (including this node). Spawns the driver loop.
+    ///
+    /// Metrics (ADR 0015) are recorded into the env's own sink (`env.metrics()`) —
+    /// for `ProdEnv` a real recording handle, so an assembled production node
+    /// accumulates CP-plane counters with no extra wiring. To observe the counters
+    /// under deterministic simulation (where `SimEnv::metrics()` is the no-op
+    /// default), construct with [`start_with_metrics`](Self::start_with_metrics)
+    /// and pass a recording [`MetricsHandle`] the test keeps.
     pub fn start(env: E, all_nodes: Vec<NodeId>, storage: S) -> Self {
-        Self::start_inner(env, all_nodes, storage, None)
+        let metrics = env.metrics();
+        Self::start_inner(env, all_nodes, storage, None, metrics)
+    }
+
+    /// Like [`start`](Self::start), but records into the supplied `metrics` handle
+    /// instead of `env.metrics()`. Additive (existing callers use `start`); a sim
+    /// test threads a recording handle in here to read counters back without
+    /// editing `animus-sim`.
+    pub fn start_with_metrics(
+        env: E,
+        all_nodes: Vec<NodeId>,
+        storage: S,
+        metrics: MetricsHandle,
+    ) -> Self {
+        Self::start_inner(env, all_nodes, storage, None, metrics)
     }
 
     /// Like [`start`](Self::start) but with a [`SplitHook`] invoked on apply of a
@@ -277,7 +309,8 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         storage: S,
         on_split: SplitHook,
     ) -> Self {
-        Self::start_inner(env, all_nodes, storage, Some(on_split))
+        let metrics = env.metrics();
+        Self::start_inner(env, all_nodes, storage, Some(on_split), metrics)
     }
 
     fn start_inner(
@@ -285,6 +318,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         all_nodes: Vec<NodeId>,
         storage: S,
         on_split: Option<SplitHook>,
+        metrics: MetricsHandle,
     ) -> Self {
         let core = Arc::new(Mutex::new(RaftCore::new(
             env.node_id(),
@@ -312,6 +346,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             stopped: Arc::clone(&stopped),
             apply_stopped: Arc::clone(&apply_stopped),
             propose_signal: Arc::clone(&propose_signal),
+            metrics: metrics.clone(),
         };
         // The consensus loop recovers from the WAL, then spawns the apply task
         // (so the apply task sees the recovered core + the correct
@@ -330,6 +365,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             stopped,
             apply_stopped,
             propose_signal,
+            metrics,
         }));
         node
     }
@@ -371,7 +407,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// `NotLeader` result appends nothing, so there is nothing to replicate — no
     /// wake. The core lock is dropped before the notify.
     fn propose_and_wake(&self, command: KvCommand) -> ProposeResult {
-        let result = self.lock().propose(command);
+        let result = record_propose(&self.metrics, self.lock().propose(command));
         if matches!(result, ProposeResult::Accepted { .. }) {
             self.propose_signal.notify();
         }
@@ -393,7 +429,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// it committed + applied, take the [`ProposeResult::Accepted`] `index` and wait
     /// until `last_applied >= index` (the whole batch has merged by then).
     pub fn put_batch(&self, puts: Vec<(Vec<u8>, Vec<u8>)>) -> ProposeResult {
-        self.lock().propose(KvCommand::Batch(puts))
+        record_propose(&self.metrics, self.lock().propose(KvCommand::Batch(puts)))
     }
 
     /// Propose a delete (tombstone) to this group.
@@ -469,7 +505,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// the control plane drives to move a replica off a failed node onto a spare,
     /// or to grow the group as the cluster grows.
     pub fn change_membership(&self, voters: BTreeSet<NodeId>) -> ProposeResult {
-        let result = self.lock().change_membership(voters);
+        let result = record_reconfigure(&self.metrics, self.lock().change_membership(voters));
         if matches!(result, ProposeResult::Accepted { .. }) {
             self.propose_signal.notify();
         }
@@ -644,37 +680,87 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         if !self.read_barrier().await {
             return None;
         }
-        let mut pairs: Vec<(Vec<u8>, Vec<u8>)> = self
-            .storage
-            .entries()
-            .await
-            .ok()?
-            .into_iter()
-            .filter(|(k, _)| k.as_slice() >= start && end.is_none_or(|e| k.as_slice() < e))
-            .map(|(k, vv)| (k, vv.value))
-            .collect();
-        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        // Push the range down into the engine (audit P4): a bounded scan reads
+        // only `[start, end)` instead of materializing the whole tablet and
+        // filtering; both `scan` and `entries` return key-ordered results by the
+        // `StorageEngine` contract, so the old re-sort was redundant — drop it
+        // and apply the limit to the already-ordered rows. An unbounded-above
+        // scan (`end == None`, e.g. a full-table `Scan`) still goes through
+        // `entries()` — the trait's `scan` takes a finite exclusive bound and
+        // arbitrary byte keys have no max sentinel; pushing a limit *into* the
+        // engine is a `StorageEngine` API change, out of scope here.
+        let mut pairs: Vec<(Vec<u8>, Vec<u8>)> = match end {
+            Some(e) => self
+                .storage
+                .scan(start, e)
+                .await
+                .ok()?
+                .into_iter()
+                .map(|(k, vv)| (k, vv.value))
+                .collect(),
+            None => self
+                .storage
+                .entries()
+                .await
+                .ok()?
+                .into_iter()
+                .filter(|(k, _)| k.as_slice() >= start)
+                .map(|(k, vv)| (k, vv.value))
+                .collect(),
+        };
         if let Some(n) = limit {
             pairs.truncate(n);
         }
         Some(pairs)
     }
 
-    /// The **ReadIndex read barrier** (ADR 0017 B.2): record `read_index =
-    /// commit_index` for the current term, confirm via a quorum of read-probe acks
-    /// that we are still the leader for that term (no log entry, no wall clock),
-    /// and wait until applied state reaches `read_index`. Returns `true` when it is
-    /// safe to serve a local read linearizably; `false` if this node is not (or
-    /// stops being) the leader, or confirmation times out — so a deposed leader
-    /// never serves a stale read (a newer leader needs a quorum at a higher term,
-    /// which rejects the probe). Shared by `linearizable_get` + `linearizable_scan`.
+    /// The **ReadIndex read barrier** (ADR 0017 B.2): wait until this leader has
+    /// committed an entry of its **own term** (Raft §6.4 — see below), record
+    /// `read_index = commit_index` for the current term, confirm via a quorum of
+    /// read-probe acks that we are still the leader for that term (no log entry,
+    /// no wall clock), and wait until applied state reaches `read_index`. Returns
+    /// `true` when it is safe to serve a local read linearizably; `false` if this
+    /// node is not (or stops being) the leader, or confirmation times out — so a
+    /// deposed leader never serves a stale read (a newer leader needs a quorum at
+    /// a higher term, which rejects the probe). Shared by `linearizable_get` +
+    /// `linearizable_scan`.
+    ///
+    /// **The current-term-commit gate is mandatory for linearizability** (the
+    /// dissertation's second ReadIndex requirement): a freshly elected leader's
+    /// log contains every committed entry (leader completeness), but its
+    /// `commit_index` may still lag an entry the *previous* leader committed and
+    /// acked — the commit rule never counts old-term entries toward a majority.
+    /// Capturing `read_index = commit_index` in that window (with only the term
+    /// probe, which involves no log state) would serve a read *below* an acked
+    /// write: a stale read. So the barrier first waits (bounded by the same
+    /// [`READ_TIMEOUT`]) for `commit_index` to reach the leader's first
+    /// current-term entry (its election no-op, [`RaftCore::first_term_index`]);
+    /// committing that no-op also commits every prior-term entry beneath it. An
+    /// established leader passes the gate immediately (no extra latency).
     async fn read_barrier(&self) -> bool {
-        let (term, read_index) = {
-            let c = self.lock();
-            if !c.is_leader() {
+        let deadline = self.env.now().0 + READ_TIMEOUT.as_nanos() as u64;
+        let (term, read_index) = loop {
+            let captured = {
+                let c = self.lock();
+                if !c.is_leader() {
+                    return false;
+                }
+                let first = c
+                    .first_term_index()
+                    .expect("a leader has a first-term index");
+                (c.commit_index() >= first).then(|| (c.term(), c.commit_index()))
+            };
+            if let Some(state) = captured {
+                break state;
+            }
+            // Fresh leader whose no-op has not committed yet: wait for it (it
+            // commits within one replication round on a healthy quorum) rather
+            // than risk a read below a previously acked write.
+            if self.env.now().0 >= deadline {
+                self.metrics.incr(Metric::CpReadBarriersTimedOut);
                 return false;
             }
-            (c.term(), c.commit_index())
+            self.env.sleep(READ_POLL).await;
         };
         // Register the read barrier (self trivially confirms its own term).
         let epoch = {
@@ -688,16 +774,17 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         };
         // Probe peers immediately (periodic heartbeats would also carry it, but an
         // explicit probe confirms promptly).
-        let probe =
-            serde_json::to_vec(&KvWire::ReadProbe { term, epoch }).expect("probe serializes");
+        let probe = codec::encode_wire(&KvWire::ReadProbe { term, epoch });
         for &p in &self.all_nodes {
             if p != self.env.node_id() {
                 self.env.send(p, probe.clone()).await;
             }
         }
 
+        // The confirmation wait shares the barrier's one deadline (set above), so
+        // the whole barrier — gate + probe + applied wait — is bounded by a single
+        // READ_TIMEOUT.
         let majority = self.majority();
-        let deadline = self.env.now().0 + READ_TIMEOUT.as_nanos() as u64;
         let ok = loop {
             // Still the leader for this term? A step-down/term change invalidates
             // the barrier — fail rather than risk a stale read.
@@ -729,6 +816,16 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             .expect("read state poisoned")
             .pending
             .remove(&epoch);
+        // Record the real outcome of this barrier attempt (not the immediate
+        // not-leader short-circuit above, which never registered one, nor the gate
+        // timeout above, already recorded there): served iff it confirmed
+        // leadership by quorum before its deadline, else it either stepped
+        // down/changed term or genuinely timed out.
+        if ok {
+            self.metrics.incr(Metric::CpReadBarriersServed);
+        } else {
+            self.metrics.incr(Metric::CpReadBarriersTimedOut);
+        }
         ok
     }
 
@@ -782,6 +879,20 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         self.lock().last_applied()
     }
 
+    /// Highest Raft log index whose effects the **engine** has merged — the same
+    /// watermark linearizable reads gate on (the async apply task advances it
+    /// after each merge; the core's `last_applied` is only the buffer cursor and
+    /// *leads* the engine). This is the **confirm-by-index** primitive (audit
+    /// A4): a proposer holding a [`ProposeResult::Accepted`] `index` confirms its
+    /// write is committed *and applied* by checking `engine_applied_index() >=
+    /// index` while this node is still the leader **in the proposal's term** —
+    /// exact under concurrency, unlike polling for value equality, which
+    /// false-negatives when a concurrent later write to the same key overwrites
+    /// the proposed value before the poll observes it.
+    pub fn engine_applied_index(&self) -> u64 {
+        self.engine_applied.load(Ordering::SeqCst)
+    }
+
     /// Highest log index known durable on disk (durable-before-visible frontier).
     pub fn durable_index(&self) -> u64 {
         self.lock().durable_index()
@@ -818,11 +929,16 @@ impl<E: Coresident, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// replica spawns its co-resident new-group member and the new group forms with
     /// no external handoff.
     ///
-    /// **Limitation (production-hardening, deferred to the `animusd` assembly):**
-    /// the hook is invoked on *every* apply of the `Split`, so re-applying it after
-    /// a crash recovery would mint the sibling twice. Idempotency across recovery
-    /// (and the control-plane-driven id allocation) is the remaining integration
-    /// plumbing, like Stage C/D's other deferred pieces.
+    /// The hook fires **at most once** per group, regardless of how many `Split`
+    /// commands are proposed or committed: `apply_and_compact`'s `already_split`
+    /// flag makes every application after the first a no-op (it never recomputes
+    /// the handoff, never re-invokes the hook), so a WAL replay after a crash
+    /// recovery — or a genuinely duplicate `Split` commit, e.g. from a caller that
+    /// proposes a split more than once — cannot mint the sibling twice or hand it an
+    /// already-tombstoned (empty) range. See
+    /// `split_in_band.rs::duplicate_split_proposal_does_not_lose_data` for the
+    /// regression: without that guard, a second application's *empty* handoff can
+    /// race the first's *real* one for a mint, silently losing the split's data.
     pub fn in_band_split_hook<MkEngine>(
         env: E,
         my_new_id: NodeId,
@@ -848,6 +964,49 @@ impl<E: Coresident, S: StorageEngine + 'static> RaftKvNode<E, S> {
                 created.lock().expect("split sink poisoned").push(node);
             });
         })
+    }
+}
+
+/// Record the real outcome of a data propose (`put`/`put_batch`/`delete`/`cas`/
+/// `propose_split`) — accepted, or rejected because this node is not the leader —
+/// and pass the result through unchanged. ADR 0015: count the outcome, never the
+/// attempt.
+fn record_propose(metrics: &MetricsHandle, result: ProposeResult) -> ProposeResult {
+    match result {
+        ProposeResult::Accepted { .. } => metrics.incr(Metric::CpProposalsAccepted),
+        ProposeResult::NotLeader { .. } => metrics.incr(Metric::CpProposalsRejectedNotLeader),
+    }
+    result
+}
+
+/// Like [`record_propose`] but for a `change_membership` step (direct call or the
+/// automatic [`RaftKvNode::reconfigure_step`]) — kept as its own counter family so
+/// reconfiguration churn is distinguishable from data-write contention.
+fn record_reconfigure(metrics: &MetricsHandle, result: ProposeResult) -> ProposeResult {
+    match result {
+        ProposeResult::Accepted { .. } => metrics.incr(Metric::CpReconfigureAccepted),
+        ProposeResult::NotLeader { .. } => metrics.incr(Metric::CpReconfigureRejected),
+    }
+    result
+}
+
+/// Record the snapshot-shipping metrics implied by the messages the consensus loop
+/// just emitted (ADR 0015), mirroring the control plane's `record_outbound`: every
+/// outbound `InstallSnapshot` is one chunk actually *shipped*; an outbound
+/// `InstallSnapshotResp` whose `last_index > 0` marks a completed *install* on the
+/// follower that just finished (observed here since the follower is what emits the
+/// ack). A pure read of `outs`.
+fn record_kv_outbound(metrics: &MetricsHandle, outs: &[(NodeId, KvWire)]) {
+    for (_, wire) in outs {
+        if let KvWire::Raft(msg) = wire {
+            match msg {
+                RaftMsg::InstallSnapshot { .. } => metrics.incr(Metric::CpSnapshotShips),
+                RaftMsg::InstallSnapshotResp { last_index, .. } if *last_index > 0 => {
+                    metrics.incr(Metric::CpSnapshotInstalls);
+                }
+                _ => {}
+            }
+        }
     }
 }
 
@@ -896,6 +1055,8 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
     engine_applied: &AtomicU64,
     wal_lock: &AsyncMutex<()>,
     halted: &AtomicBool,
+    metrics: &MetricsHandle,
+    already_split: &mut bool,
 ) -> bool {
     let mut did_work = false;
 
@@ -915,6 +1076,9 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
     // The Raft index is the MVCC version: per-key LWW then reproduces the agreed
     // total order, and re-applying on recovery is idempotent.
     let effects = core.lock().expect("raftkv core poisoned").drain_apply();
+    if !effects.is_empty() {
+        metrics.incr_by(Metric::CpApplies, effects.len() as u64);
+    }
     did_work |= !effects.is_empty();
     // Coalesce the WAL `fsync` for a run of plain Put/Delete commands: the apply
     // loop is a single sequential task, so applying each command with its own
@@ -960,7 +1124,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
             } => {
                 // Drain the pending run so the CAS read observes every earlier
                 // committed write in this apply pass.
-                flush_pending(storage, &mut pending).await;
+                flush_pending(storage, &mut pending, metrics).await;
                 // Read the key's *current committed* value (the latest applied,
                 // since we apply in commit order and earlier entries in this batch
                 // already merged above) and compare to `expected`. Equal → swap;
@@ -989,31 +1153,59 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                     .insert(index, swapped);
             }
             KvCommand::Split { at } => {
-                // Drain the pending run so the handoff capture below sees every
-                // earlier committed write in this apply pass.
-                flush_pending(storage, &mut pending).await;
-                // Capture the handed-off range `[at, ∞)` from this replica's
-                // committed state. Every replica applies the same `Split` at the
-                // same point in the command order, so the captured handoff is
-                // consistent across replicas (ADR 0017 D).
-                let handoff = keys_from(storage, &at).await;
-                // In-band new-group creation: hand the range to the split hook,
-                // which (when wired) mints a co-resident sibling and seeds the new
-                // tablet's group from it. With no hook, the new group is created
-                // externally from a leader handoff (the prior behavior).
-                if let Some(hook) = on_split {
-                    hook(at.clone(), handoff.clone());
+                // A group splits **at most once** in its lifetime — once applied, its
+                // valid range is permanently bounded to `[lo, at)` (splitting the
+                // resulting range again must come from a *new* instance: the child
+                // tablet's own group with its own hook). A second `Split` entry is
+                // possible in practice, not just theory: `animusd`'s auto-split loop
+                // reads `Metadata`/calls `local_pairs()`/`propose_split()` per node, and
+                // in an in-process `--cluster N` run every node's loop shares one
+                // `ClusterEdgeState` — so several nodes can independently observe the
+                // same over-threshold leader on the same tick and all call
+                // `propose_split`, landing more than one `Split` command in the
+                // committed log for the same group. Without this guard, re-applying a
+                // second `Split` recomputes the handoff from storage — now **empty**,
+                // since the first application already tombstoned `[at, ∞)` — and fires
+                // the hook again with that empty handoff. The hook spawns one async task
+                // per replica to mint the new tablet's group, gated only by a per-node
+                // "mint once" set keyed on the *tablet id* (not on which `Split`
+                // application triggered it); if the empty-handoff task wins that mint
+                // race, the new group is seeded with no data and the real rows are lost
+                // for good — the root cause of `tablet_auto_splits_when_it_grows`
+                // flaking on "key not served after auto-split". Treat every `Split`
+                // after the first as a no-op, exactly like `NoOp`: harmless regardless
+                // of *why* a duplicate landed (an in-process trigger race today; a stale
+                // retry after a leader failover would hit the same guard, since WAL
+                // replay applies through this identical path and sets the flag before
+                // any duplicate already in the log is ever reached).
+                if !*already_split {
+                    // Drain the pending run so the handoff capture below sees every
+                    // earlier committed write in this apply pass.
+                    flush_pending(storage, &mut pending, metrics).await;
+                    // Capture the handed-off range `[at, ∞)` from this replica's
+                    // committed state. Every replica applies the same `Split` at the
+                    // same point in the command order, so the captured handoff is
+                    // consistent across replicas (ADR 0017 D).
+                    let handoff = keys_from(storage, &at).await;
+                    // In-band new-group creation: hand the range to the split hook,
+                    // which (when wired) mints a co-resident sibling and seeds the new
+                    // tablet's group from it. With no hook, the new group is created
+                    // externally from a leader handoff (the prior behavior).
+                    if let Some(hook) = on_split {
+                        hook(at.clone(), handoff.clone());
+                    }
+                    // The handed-off range now belongs to the new tablet, so tombstone
+                    // it here — consistently on every replica — under a single sync.
+                    let tombstones: Vec<MergeOp> = handoff
+                        .iter()
+                        .map(|(key, _)| MergeOp::tombstone(key.clone(), index))
+                        .collect();
+                    storage
+                        .merge_batch(tombstones)
+                        .await
+                        .expect("raftkv apply split tombstones");
+                    *already_split = true;
                 }
-                // The handed-off range now belongs to the new tablet, so tombstone
-                // it here — consistently on every replica — under a single sync.
-                let tombstones: Vec<MergeOp> = handoff
-                    .iter()
-                    .map(|(key, _)| MergeOp::tombstone(key.clone(), index))
-                    .collect();
-                storage
-                    .merge_batch(tombstones)
-                    .await
-                    .expect("raftkv apply split tombstones");
             }
             KvCommand::NoOp => {}
         }
@@ -1021,66 +1213,108 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
     }
     // Apply any trailing Put/Delete run under one final sync. Only now does the
     // engine reflect every index in this pass.
-    flush_pending(storage, &mut pending).await;
+    flush_pending(storage, &mut pending, metrics).await;
     // Publish the watermark: the engine now holds all effects through `max_index`,
     // so linearizable reads may serve up to it and compaction may snapshot up to it.
     if max_index > 0 {
         engine_applied.fetch_max(max_index, Ordering::SeqCst);
     }
 
-    // Compact once the *engine* has merged enough past the snapshot base: snapshot
-    // the engine image (so a lagging follower can be caught up via
-    // `InstallSnapshot`), truncate the Raft log prefix, and rewrite the WAL to its
-    // bounded image (ADR 0017 A.2). We snapshot only up to `engine_applied`, not the
-    // core's `last_applied` (which the async apply lags) — else the truncated log
-    // prefix would run past what the engine image contains. This task is the only
-    // engine writer, so nothing merges between reading `ea` and the snapshot below,
-    // making the image reflect exactly `ea`.
+    // Compact once the *engine* has merged enough past the snapshot base: truncate
+    // the Raft log prefix and rewrite the WAL to its bounded image (ADR 0017 A.2).
+    // We snapshot only up to `engine_applied`, not the core's `last_applied`
+    // (which the async apply lags) — else the truncated log prefix would run past
+    // what the engine state contains. This task is the only engine writer, so
+    // nothing merges between reading `ea` and the snapshot below.
+    //
+    // **The engine image is built lazily, on demand** (audit P1/P5): threshold
+    // compaction alone no longer scans + serializes the whole tablet — that cost
+    // was paid every `COMPACT_THRESHOLD` applies on every replica, and the image
+    // then sat resident in the core forever, whether or not any follower ever
+    // needed a snapshot. Instead, when the core's replication path actually needs
+    // to ship an `InstallSnapshot` and has no image (`take_snapshot_needed`), this
+    // pass scans the engine once, re-bases the snapshot to exactly what that image
+    // reflects (`snapshot_upto(ea)` *before* `set_snapshot_blob`, so base and
+    // image agree), and installs it; the core drops the image again once no
+    // transfer is in flight. A `KvState` WAL snapshot record carries only the unit
+    // placeholder, so the threshold rewrite never needed the image bytes.
     let ea = engine_applied.load(Ordering::SeqCst);
-    let behind = ea.saturating_sub(core.lock().expect("raftkv core poisoned").snapshot_index());
+    let (behind, image_needed) = {
+        let mut c = core.lock().expect("raftkv core poisoned");
+        (
+            ea.saturating_sub(c.snapshot_index()),
+            c.take_snapshot_needed(),
+        )
+    };
     // Skip compaction once a shutdown is requested: it is only a WAL-bounding
     // optimization (the engine + un-truncated WAL stay consistent without it), and
     // starting a full WAL rewrite while the env is being torn down races the task
     // abort — the `replace` can then fail on a half-gone data dir.
-    if behind >= COMPACT_THRESHOLD && !halted.load(Ordering::SeqCst) {
-        let image = engine_image(storage).await; // slow scan, no locks held
+    if (behind >= COMPACT_THRESHOLD || image_needed) && !halted.load(Ordering::SeqCst) {
+        // The on-demand image: a slow whole-engine scan, done with no locks held,
+        // and only when a follower is actually waiting on a snapshot.
+        let image = if image_needed {
+            metrics.incr(Metric::CpSnapshotImageBuilds);
+            Some(engine_image(storage).await)
+        } else {
+            None
+        };
         // Serialize the WAL rewrite against the consensus loop's appends.
         let _wal = wal_lock.lock().await;
         let (bytes, lli) = {
             let mut c = core.lock().expect("raftkv core poisoned");
-            c.set_snapshot_blob(image);
+            // Advance the base to exactly the engine state (`snapshot_upto` drops
+            // any stale image + in-flight transfer offsets), THEN install the
+            // fresh image built from that same state — order matters, or the
+            // base-move would drop the image we just built.
             c.snapshot_upto(ea);
-            let lli = c.last_log_index();
-            let mut buf = Vec::new();
-            for record in c.wal_image() {
-                buf.extend(PersistedState::encode_record(&record));
+            if let Some(image) = image {
+                c.set_snapshot_blob(image);
             }
-            c.take_snapshot_dirty();
-            // The rewrite (below) makes the whole current log durable, so the
-            // consensus loop's accumulated pending append records are now redundant
-            // — drop them (`replay` is push-based, so re-appending them would
-            // duplicate entries). `wal_image` already captures the net durable state
-            // (snapshot + hard + log tail). Under this one lock hold, so no
-            // propose/append interleaves.
-            let _ = c.drain_persist();
-            (buf, lli)
+            if !c.take_snapshot_dirty() {
+                // The base did not move (e.g. an image rebuild at an unchanged
+                // base): nothing to rewrite. The installed image alone makes the
+                // pending transfer progress on the next heartbeat.
+                (None, 0)
+            } else {
+                // The snapshot base actually advanced (a real truncation), whether
+                // driven by the size threshold or by servicing an on-demand image
+                // build above — distinct from `CpSnapshotImageBuilds` (PR #29's
+                // lazy-image design decouples the two).
+                metrics.incr(Metric::CpSnapshotTriggers);
+                let lli = c.last_log_index();
+                let mut buf = Vec::new();
+                for record in c.wal_image() {
+                    buf.extend(PersistedState::encode_record(&record));
+                }
+                // The rewrite (below) makes the whole current log durable, so the
+                // consensus loop's accumulated pending append records are now
+                // redundant — drop them (`replay` is push-based, so re-appending
+                // them would duplicate entries). `wal_image` already captures the
+                // net durable state (snapshot + hard + log tail). Under this one
+                // lock hold, so no propose/append interleaves.
+                let _ = c.drain_persist();
+                (Some(buf), lli)
+            }
         };
-        match env.replace(WAL, &bytes).await {
-            Ok(()) => {
-                // Physically durable now — advance the watermark.
-                core.lock()
-                    .expect("raftkv core poisoned")
-                    .mark_durable_through(lli);
-            }
-            // A shutdown that landed mid-rewrite (aborting tasks + dropping the data
-            // dir) can fail the `replace`; tolerate it only while halted — the
-            // pre-compaction WAL is still intact, so recovery is unaffected. A
-            // failure while *not* halted is a real durability fault → surface it.
-            Err(e) => {
-                assert!(
-                    halted.load(Ordering::SeqCst),
-                    "raftkv wal compaction failed while running: {e}"
-                );
+        if let Some(bytes) = bytes {
+            match env.replace(WAL, &bytes).await {
+                Ok(()) => {
+                    // Physically durable now — advance the watermark.
+                    core.lock()
+                        .expect("raftkv core poisoned")
+                        .mark_durable_through(lli);
+                }
+                // A shutdown that landed mid-rewrite (aborting tasks + dropping the
+                // data dir) can fail the `replace`; tolerate it only while halted —
+                // the pre-compaction WAL is still intact, so recovery is unaffected.
+                // A failure while *not* halted is a real durability fault → surface.
+                Err(e) => {
+                    assert!(
+                        halted.load(Ordering::SeqCst),
+                        "raftkv wal compaction failed while running: {e}"
+                    );
+                }
             }
         }
         did_work = true;
@@ -1091,10 +1325,16 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
 
 /// Apply and clear an accumulated run of per-key LWW merges under a single WAL
 /// `fsync` (see the apply loop). A no-op when the run is empty.
-async fn flush_pending<S: StorageEngine>(storage: &S, pending: &mut Vec<MergeOp>) {
+async fn flush_pending<S: StorageEngine>(
+    storage: &S,
+    pending: &mut Vec<MergeOp>,
+    metrics: &MetricsHandle,
+) {
     if pending.is_empty() {
         return;
     }
+    metrics.incr(Metric::CpApplyBatchRuns);
+    metrics.incr_by(Metric::CpApplyBatchSizeSum, pending.len() as u64);
     storage
         .merge_batch(std::mem::take(pending))
         .await
@@ -1115,7 +1355,7 @@ async fn keys_from<S: StorageEngine>(storage: &S, at: &[u8]) -> Vec<(Vec<u8>, Ve
 }
 
 /// One key's snapshot entry: `(key, value-or-tombstone, version)`.
-type ImageEntry = (Vec<u8>, Option<Vec<u8>>, u64);
+pub(crate) type ImageEntry = (Vec<u8>, Option<Vec<u8>>, u64);
 
 /// Serialize the engine's full contents (including tombstones) as the snapshot
 /// image shipped to a lagging follower.
@@ -1124,13 +1364,13 @@ async fn engine_image<S: StorageEngine>(storage: &S) -> Vec<u8> {
         .entries_with_tombstones()
         .await
         .expect("raftkv engine scan");
-    serde_json::to_vec(&entries).expect("engine image serializes")
+    codec::encode_image(&entries)
 }
 
 /// Write a received snapshot image into the engine (a follower catching up),
 /// versioned so per-key LWW keeps it consistent with the log tail merged on top.
 async fn install_engine_image<S: StorageEngine>(storage: &S, bytes: &[u8]) {
-    let entries: Vec<ImageEntry> = match serde_json::from_slice(bytes) {
+    let entries: Vec<ImageEntry> = match codec::decode_image(bytes) {
         Ok(e) => e,
         Err(err) => {
             tracing::warn!(?err, "undecodable raftkv snapshot image dropped");
@@ -1169,6 +1409,7 @@ struct DriveState<E: Env, S: StorageEngine> {
     stopped: Arc<AtomicBool>,
     apply_stopped: Arc<AtomicBool>,
     propose_signal: Arc<ProposeSignal>,
+    metrics: MetricsHandle,
 }
 
 /// Idle back-off for the apply task: when there is nothing committed-and-durable to
@@ -1200,6 +1441,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         stopped,
         apply_stopped,
         propose_signal,
+        metrics,
     } = st;
 
     let bytes = env.read(WAL).await.unwrap_or_default();
@@ -1231,6 +1473,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         Arc::clone(&wal_lock),
         Arc::clone(&halted),
         apply_stopped,
+        metrics.clone(),
     ));
 
     loop {
@@ -1246,6 +1489,10 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         let now = env.now();
         let deadline = core.lock().expect("raftkv core poisoned").next_deadline();
         let wait = Duration::from_nanos(deadline.0.saturating_sub(now.0));
+
+        // Snapshot the commit index before stepping the core so a real advance
+        // (ADR 0015: record the outcome, not the attempt) can be attributed below.
+        let before_commit = core.lock().expect("raftkv core poisoned").commit_index();
 
         // Each step yields outbound `KvWire` messages (Raft traffic and/or a read
         // probe ack). Three wakeup sources race: an inbound message, the Raft timer
@@ -1275,7 +1522,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
             }
             Either::Right((Either::Left((envelope, _)), _)) => {
                 let entropy = env.next_u64();
-                match serde_json::from_slice::<KvWire>(&envelope.payload) {
+                match codec::decode_wire(&envelope.payload) {
                     Ok(KvWire::Raft(msg)) => {
                         let raft_outs: Vec<Out<KvCommand>> = core
                             .lock()
@@ -1325,14 +1572,19 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
             }
         };
 
+        let after_commit = core.lock().expect("raftkv core poisoned").commit_index();
+        if after_commit > before_commit {
+            metrics.incr_by(Metric::CpCommits, after_commit - before_commit);
+        }
+        record_kv_outbound(&metrics, &outs);
+
         // Durability before action: persist (fsync) before shipping responses, so a
         // granted vote / appended entry is on disk before its message goes out.
         // Engine apply happens independently on the apply task.
         persist_wal(&env, &core, &wal_lock).await;
 
         for (to, wire) in outs {
-            let bytes = serde_json::to_vec(&wire).expect("raftkv message serializes");
-            env.send(to, bytes).await;
+            env.send(to, codec::encode_wire(&wire)).await;
         }
     }
 }
@@ -1355,7 +1607,15 @@ async fn apply_loop<E: Env, S: StorageEngine>(
     wal_lock: Arc<AsyncMutex<()>>,
     halted: Arc<AtomicBool>,
     apply_stopped: Arc<AtomicBool>,
+    metrics: MetricsHandle,
 ) {
+    // Owned by this task alone (the sole apply-loop instance for the group), so a
+    // plain `bool` — set true the first time this task applies a `Split` — suffices;
+    // no `Arc`/atomic needed. It persists across loop iterations (declared outside
+    // the `loop`), including a full WAL replay after restart: the recovered log
+    // applies through this same loop before any live command, so a replayed `Split`
+    // sets the flag exactly as a live one would.
+    let mut already_split = false;
     loop {
         if halted.load(Ordering::SeqCst) {
             apply_stopped.store(true, Ordering::SeqCst);
@@ -1370,6 +1630,8 @@ async fn apply_loop<E: Env, S: StorageEngine>(
             &engine_applied,
             &wal_lock,
             &halted,
+            &metrics,
+            &mut already_split,
         )
         .await;
         if !did_work {

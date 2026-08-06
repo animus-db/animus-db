@@ -197,3 +197,51 @@ async fn create_table_query_and_conditional_writes() {
     assert_eq!(status, 400);
     assert!(body.contains("ResourceNotFoundException"), "got: {body}");
 }
+
+/// Regression: **concurrent** conditional puts are serialized by the per-node
+/// `rmw_lock` (which the DynamoDB edge once never took): two simultaneous
+/// `attribute_not_exists(pk)` `PutItem`s on the same key through the same node
+/// must yield exactly one success and one `ConditionalCheckFailedException` —
+/// without the lock both read "absent" and both succeed (a lost update / double
+/// create). Runs several rounds on distinct keys so a lucky interleaving can't
+/// mask the race, timeout-guarded like every real-time `animusd` test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_conditional_puts_one_wins() {
+    let dir = tempfile::tempdir().unwrap();
+    let bound = bind_cluster(1, "127.0.0.1".parse().unwrap(), dir.path())
+        .await
+        .unwrap();
+    let nodes = start_cluster(bound).await.unwrap();
+    await_bootstrap(&nodes).await;
+    let addr = nodes[0].dynamo_addr();
+
+    let rounds = async {
+        for round in 0..10 {
+            let body = format!(
+                r#"{{"TableName":"claims","Item":{{"pk":{{"S":"claim-{round}"}},"owner":{{"S":"me"}}}},
+                    "ConditionExpression":"attribute_not_exists(pk)"}}"#
+            );
+            // Two clients race the same key through the same node.
+            let (a, b) = tokio::join!(
+                dynamo(addr, "DynamoDB_20120810.PutItem", &body),
+                dynamo(addr, "DynamoDB_20120810.PutItem", &body),
+            );
+            let outcomes = [&a, &b];
+            let wins = outcomes.iter().filter(|(s, _)| *s == 200).count();
+            assert_eq!(
+                wins, 1,
+                "round {round}: exactly one conditional put must win, got {a:?} / {b:?}"
+            );
+            let loser = outcomes.iter().find(|(s, _)| *s != 200).unwrap();
+            assert_eq!(loser.0, 400, "round {round}: loser status: {loser:?}");
+            assert!(
+                loser.1.contains("ConditionalCheckFailedException"),
+                "round {round}: loser must fail the condition, got: {}",
+                loser.1
+            );
+        }
+    };
+    timeout(Duration::from_secs(60), rounds)
+        .await
+        .expect("concurrent conditional puts did not settle within 60s");
+}

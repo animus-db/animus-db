@@ -19,9 +19,18 @@ epoch compare-and-swap transactions.
   its policies in one apply — the metadata half of drop-table GC, mirroring the
   `MergeTablets` cleanup; `NoOp` when the table has none), `CreateTableIndex`,
   `DropTableIndex`, `SetTableMode`, `CreateKeyspace`, `DropKeyspace`,
-  **`RegisterCpAddr`**). `Metadata::apply` is the deterministic state machine;
-  `Metadata::reconcile` is
-  the pure placement decision (see below);
+  **`RegisterCpAddr`** — now carrying an optional `tablet` association (ADR 0024
+  GC): a tablet-scoped registration is rejected while the tablet is absent, and
+  when a tablet leaves the map (`DropTableTablets`/`MergeTablets`) its members'
+  addresses are pruned from `cp_member_addrs` + `cp_member_tablets`, keyed on
+  *current absence* so a replayed historical state cannot resurrect them;
+  legacy tablet-less entries are never pruned). `Metadata::apply` is the
+  deterministic state machine; `Metadata::reconcile` is
+  the pure placement decision (see below), whose shared body also backs
+  **`PlacementView::reconcile`** — the narrow (members + tablets + policies,
+  no schema catalog) clone `RaftCore::placement_view()`/`RaftCore::members()`
+  hand the driver loops so they evaluate **off the core lock** instead of
+  cloning the whole `Metadata` every tick (clone-churn fix);
   `table_schema`/`has_table_schema`/`table_schemas`/`table_indexes` read the
   catalog.
 - `schema.rs` — the replicated **table-schema catalog** (ADR 0013): `TableSchema`
@@ -48,9 +57,19 @@ epoch compare-and-swap transactions.
   config-in-log (ADR 0017 C):** `LogEntry` may carry a `config: Option<voters>`;
   `RaftCore` keeps `peers`/`cluster_size` in sync with the latest log config (the
   config rides snapshots + `InstallSnapshot`), and `change_membership` appends a
-  single-server config entry (one-in-flight, no leader self-removal). The control
-  plane never reconfigures, so its config stays `= initial_config` and its
-  behavior is unchanged. **Pre-vote (ADR 0009):** an election-timeout no longer
+  single-server config entry (one-in-flight, no leader self-removal, **and gated
+  on the leader having committed a current-term entry** — the reconfiguration
+  erratum guard: rejected until `commit_index >= first_term_index()`, the index
+  of the election no-op recorded in `become_leader`; that accessor is also what
+  the data plane's ReadIndex barrier gates on, Raft §6.4). `become_leader` also
+  advances commit after appending its no-op, so a **single-node** group commits
+  it immediately — which is what makes a restarted sole voter re-apply its
+  recovered WAL tail (per `recovered`'s contract) instead of waiting for the
+  next propose. The control plane never reconfigures, so its config stays
+  `= initial_config` and its behavior is unchanged. `applied()` is a **bounded
+  window** (commands since the last snapshot — `snapshot_upto` drops the covered
+  prefix, so it can't grow unboundedly in production); compare divergence before
+  the snapshot threshold. **Pre-vote (ADR 0009):** an election-timeout no longer
   campaigns directly — the node becomes a `Role::PreCandidate` and runs a
   `RaftMsg::PreVote`/`PreVoteResp` round **without bumping its term**; only a
   pre-vote majority triggers the real, term-incrementing `start_election`. Peers
@@ -122,19 +141,30 @@ epoch compare-and-swap transactions.
   the final chunk completes the buffer. `InstallSnapshotResp.next_offset` drives
   the next chunk; its `last_index` is non-zero only on completion. Chunking is
   all in the sync core (no I/O), so it stays deterministic. See `docs/wal.md`.
-  **`snapshot_chunk_for` slices the cached `snapshot_blob` — it does NOT
-  re-serialize per chunk** (the driver-liveness fix, see below). The blob is set
-  wherever `snapshot_index` advances, for **both** state-machine kinds, so the
-  invariant `snapshot_index > 0 ⟹ snapshot_blob.is_some()` holds and no ship is ever
-  0 bytes: a `DRIVER_APPLIED` (data-plane KV) image is the *engine* bytes, set by the
-  driver on *compaction* (`set_snapshot_blob`) **and** by the core on *install*
-  completion; an **in-core** (`Metadata`) image is `serialize(metadata)`, set by the
-  core in `snapshot_upto` (local snapshot), on *install* completion (retain the
-  received bytes), and in `recovered` (a recovered leader may ship before it
-  re-compacts). Missing any of these ships `unwrap_or_default()` = **0 bytes**, the
-  receiver decodes an empty image (`EOF while parsing a value`) and can never catch up
-  (regressions: `driver_applied_sm.rs::caught_up_node_reships_non_empty_snapshot`,
-  `install_snapshot.rs::caught_up_control_node_reships_non_empty`).
+  **`snapshot_chunk_for` slices the `snapshot_blob` by reference — it does NOT
+  re-serialize (or clone) per chunk** (the driver-liveness fix, see below). The
+  two state-machine kinds manage the blob differently:
+  - An **in-core** (`Metadata`) image is `serialize(metadata)`, kept **eagerly**:
+    set by the core in `snapshot_upto` (local snapshot), on *install* completion
+    (retain the received bytes), and in `recovered` (a recovered leader may ship
+    before it re-compacts) — so the in-core invariant
+    `snapshot_index > 0 ⟹ snapshot_blob.is_some()` holds and a chunk is never a
+    0-byte ship (regression:
+    `install_snapshot.rs::caught_up_control_node_reships_non_empty`).
+  - A **`DRIVER_APPLIED`** (data-plane KV) image is the *engine* bytes, built
+    **lazily on demand**: when replication needs a chunk and no image is
+    materialized, the core sends nothing and raises `take_snapshot_needed`; the
+    async driver scans the engine, calls `snapshot_upto(engine_applied)` *then*
+    `set_snapshot_blob` (base and image must agree), and the next heartbeat
+    ships. The core **drops** the blob whenever it would go stale or idle (base
+    move in `snapshot_upto` — which also clears `snapshot_offset` so in-flight
+    transfers restart at 0 against the new image — install completion on the
+    receiver, and last-transfer completion on the sender), so no whole-tablet
+    image is retained at rest and threshold compaction never builds one. The
+    second-hop invariant is now *"any node with `snapshot_index > 0` can
+    regenerate the image from its engine"* (regression:
+    `driver_applied_sm.rs::caught_up_node_reships_non_empty_snapshot`, which
+    drives both hops through the request→build→ship cycle).
 - **Driver-liveness (deferred fix #5, the control-plane counterpart of the CP-data
   fix in ADR 0017).** The control driver applies `Metadata` **in-core,
   synchronously**, so — unlike CP-data — there is no slow async engine apply to move

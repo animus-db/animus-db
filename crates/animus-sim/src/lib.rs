@@ -14,9 +14,11 @@
 //! Fault injection — [`partition`](Simulator::partition),
 //! [`heal`](Simulator::heal), [`crash`](Simulator::crash),
 //! [`restart`](Simulator::restart), [`stop`](Simulator::stop) (process exit),
-//! and the [`NetConfig`] delay/drop model — is all reproducible from the seed. A
-//! recorded [`trace`](Simulator::trace) is byte-identical across repeated runs
-//! of the same scenario and seed.
+//! the [`NetConfig`] delay/drop model, and the [`DiskConfig`] disk fault model
+//! (injected I/O errors, torn crash tails, corruption —
+//! [`corrupt_durable`](Simulator::corrupt_durable) for at-rest corruption) —
+//! is all reproducible from the seed. A recorded [`trace`](Simulator::trace)
+//! is byte-identical across repeated runs of the same scenario and seed.
 //!
 //! See `docs/adr/0003-deterministic-simulation.md`.
 
@@ -28,8 +30,8 @@ use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use animus_env::{
-    BoxFuture, Clock, Coresident, Disk, Env, Envelope, Nanos, Network, NodeId, Rng as RngTrait,
-    Spawner,
+    BoxFuture, Clock, Coresident, Disk, Env, Envelope, Nanos, Network, NodeId, PRIMARY_STREAM,
+    Rng as RngTrait, Spawner,
 };
 use futures::task::ArcWake;
 use rand::{RngCore, SeedableRng};
@@ -51,7 +53,7 @@ struct FileState {
 enum Event {
     /// A `sleep` timer fires.
     Timer(TimerId),
-    /// A message is delivered to a node's inbox.
+    /// A message is delivered to a node's inbox (on `env.stream`, ADR 0026).
     Deliver { to: NodeId, env: Envelope },
 }
 
@@ -84,6 +86,40 @@ impl NetConfig {
     }
 }
 
+/// Disk fault-injection model. **All knobs default off**: with the default
+/// config the disk draws no RNG and emits no trace event, so every run is
+/// byte-identical to one on a simulator without a disk model at all. When a
+/// knob is on, every sample (error draw, tear point, corrupted byte) comes
+/// from the simulation RNG, so fault schedules are a pure function of the
+/// seed. Set globally with [`Simulator::set_disk_config`] or per node with
+/// [`Simulator::set_disk_config_for`] (mirrors the [`NetConfig`] pattern).
+#[derive(Clone, Default)]
+pub struct DiskConfig {
+    /// An `append`/`sync`/`read`/`read_at`/`replace` fails (with an injected
+    /// `io::Error`, and no state change) when `rng.next_u64() < error_threshold`.
+    /// Metadata ops (`size`/`remove`/`list`) are never injected.
+    error_threshold: u64,
+    /// On [`Simulator::crash`], keep a seed-chosen **strict prefix** of each
+    /// file's un-synced buffered bytes (instead of dropping the whole buffer
+    /// atomically), moving it into the durable image — modelling a write torn
+    /// mid-record by a power loss. At least one buffered byte is always lost
+    /// (it is a tear, not a completed write); the previously durable prefix is
+    /// untouched.
+    pub torn_tail_on_crash: bool,
+    /// With [`torn_tail_on_crash`](Self::torn_tail_on_crash): additionally
+    /// flip one seed-chosen byte inside the retained (torn) region — modelling
+    /// a garbled, not merely truncated, final record. No effect on files whose
+    /// tear kept zero bytes, and never touches previously durable bytes.
+    pub corrupt_on_crash: bool,
+}
+
+impl DiskConfig {
+    /// Set the independent per-op disk error probability in `[0.0, 1.0]`.
+    pub fn set_error_prob(&mut self, p: f64) {
+        self.error_threshold = (p.clamp(0.0, 1.0) * (u64::MAX as f64)) as u64;
+    }
+}
+
 /// One recorded line of the simulation history. The `Display` form is stable and
 /// is what the byte-identical-trace guarantee is about.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -95,6 +131,7 @@ pub enum TraceEvent {
         t: u64,
         from: NodeId,
         to: NodeId,
+        stream: u64,
         len: usize,
     },
     /// A message was delivered to a node's inbox.
@@ -102,6 +139,7 @@ pub enum TraceEvent {
         t: u64,
         from: NodeId,
         to: NodeId,
+        stream: u64,
         len: usize,
     },
     /// A message was dropped (lossy link, partition, or crashed target).
@@ -109,31 +147,95 @@ pub enum TraceEvent {
         t: u64,
         from: NodeId,
         to: NodeId,
+        stream: u64,
         reason: &'static str,
     },
     /// A sleep timer fired.
     Timer { t: u64, id: TimerId },
+    /// A disk op failed with an injected error ([`DiskConfig`] error rate).
+    DiskFault {
+        t: u64,
+        node: NodeId,
+        op: &'static str,
+        file: String,
+    },
+    /// A crash tore a file's un-synced tail: `kept` buffered bytes were
+    /// retained (now durable), `dropped` were lost ([`DiskConfig::torn_tail_on_crash`]).
+    DiskTear {
+        t: u64,
+        node: NodeId,
+        file: String,
+        kept: usize,
+        dropped: usize,
+    },
+    /// One durable byte of a file was corrupted (bit-flipped), either by
+    /// [`DiskConfig::corrupt_on_crash`] or [`Simulator::corrupt_durable`].
+    DiskCorrupt {
+        t: u64,
+        node: NodeId,
+        file: String,
+        offset: u64,
+    },
 }
 
 impl std::fmt::Display for TraceEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             TraceEvent::Spawn { task } => write!(f, "SPAWN task={task}"),
-            TraceEvent::Send { t, from, to, len } => {
-                write!(f, "t={t} SEND {from}->{to} len={len}")
+            TraceEvent::Send {
+                t,
+                from,
+                to,
+                stream,
+                len,
+            } => {
+                write!(f, "t={t} SEND {from}->{to} stream={stream} len={len}")
             }
-            TraceEvent::Deliver { t, from, to, len } => {
-                write!(f, "t={t} DELIVER {from}->{to} len={len}")
+            TraceEvent::Deliver {
+                t,
+                from,
+                to,
+                stream,
+                len,
+            } => {
+                write!(f, "t={t} DELIVER {from}->{to} stream={stream} len={len}")
             }
             TraceEvent::Drop {
                 t,
                 from,
                 to,
+                stream,
                 reason,
             } => {
-                write!(f, "t={t} DROP {from}->{to} ({reason})")
+                write!(f, "t={t} DROP {from}->{to} stream={stream} ({reason})")
             }
             TraceEvent::Timer { t, id } => write!(f, "t={t} TIMER id={id}"),
+            TraceEvent::DiskFault { t, node, op, file } => {
+                write!(f, "t={t} DISKFAULT node={node} op={op} file={file}")
+            }
+            TraceEvent::DiskTear {
+                t,
+                node,
+                file,
+                kept,
+                dropped,
+            } => {
+                write!(
+                    f,
+                    "t={t} DISKTEAR node={node} file={file} kept={kept} dropped={dropped}"
+                )
+            }
+            TraceEvent::DiskCorrupt {
+                t,
+                node,
+                file,
+                offset,
+            } => {
+                write!(
+                    f,
+                    "t={t} DISKCORRUPT node={node} file={file} offset={offset}"
+                )
+            }
         }
     }
 }
@@ -143,6 +245,9 @@ struct SimState {
     clock: u64,
     rng: ChaCha8Rng,
     net: NetConfig,
+    disk_cfg: DiskConfig,
+    // Per-node overrides of the global disk fault model.
+    node_disk_cfg: BTreeMap<NodeId, DiskConfig>,
 
     next_task_id: TaskId,
     // `None` while a task's future is checked out for polling.
@@ -157,8 +262,13 @@ struct SimState {
     timer_wakers: BTreeMap<TimerId, Waker>,
 
     nodes: BTreeSet<NodeId>,
-    inboxes: BTreeMap<NodeId, VecDeque<Envelope>>,
-    recv_wakers: BTreeMap<NodeId, Waker>,
+    // Keyed by `(node, stream)` (ADR 0026): a node's inbox is now multiple
+    // independently-addressable streams, each still single-consumer. Every
+    // pre-multiplexing caller uses `PRIMARY_STREAM` via the `Network::send`/
+    // `recv` defaults, so this is a transparent generalization of the old
+    // single-stream-per-node inbox.
+    inboxes: BTreeMap<(NodeId, u64), VecDeque<Envelope>>,
+    recv_wakers: BTreeMap<(NodeId, u64), Waker>,
 
     disks: BTreeMap<(NodeId, String), FileState>,
 
@@ -167,6 +277,40 @@ struct SimState {
     crashed: BTreeSet<NodeId>,
 
     trace: Vec<TraceEvent>,
+}
+
+impl SimState {
+    /// The effective disk fault model for `node`: its override, else the global.
+    fn disk_cfg_for(&self, node: NodeId) -> &DiskConfig {
+        self.node_disk_cfg.get(&node).unwrap_or(&self.disk_cfg)
+    }
+
+    /// Sample error injection for one disk op on `node`. Draws RNG **only**
+    /// when the effective error rate is non-zero, so the default (off) config
+    /// perturbs neither the RNG stream nor the trace. On a hit, records a
+    /// trace event and returns the `io::Error` the op must surface; the op
+    /// must make **no** state change (a cleanly failed I/O call).
+    fn inject_disk_fault(
+        &mut self,
+        node: NodeId,
+        op: &'static str,
+        file: &str,
+    ) -> Option<std::io::Error> {
+        let threshold = self.disk_cfg_for(node).error_threshold;
+        if threshold == 0 || self.rng.next_u64() >= threshold {
+            return None;
+        }
+        let t = self.clock;
+        self.trace.push(TraceEvent::DiskFault {
+            t,
+            node,
+            op,
+            file: file.to_owned(),
+        });
+        Some(std::io::Error::other(format!(
+            "sim injected disk fault: {op} {file} (node {node})"
+        )))
+    }
 }
 
 /// State shared between the simulator and every task waker / env handle.
@@ -218,6 +362,8 @@ impl Simulator {
             clock: 0,
             rng: ChaCha8Rng::seed_from_u64(seed),
             net: NetConfig::default(),
+            disk_cfg: DiskConfig::default(),
+            node_disk_cfg: BTreeMap::new(),
             next_task_id: 0,
             tasks: BTreeMap::new(),
             task_owner: BTreeMap::new(),
@@ -253,7 +399,7 @@ impl Simulator {
     pub fn env(&self, node: NodeId) -> SimEnv {
         let mut st = self.shared.lock();
         st.nodes.insert(node);
-        st.inboxes.entry(node).or_default();
+        st.inboxes.entry((node, PRIMARY_STREAM)).or_default();
         SimEnv {
             shared: Arc::clone(&self.shared),
             node_id: node,
@@ -263,6 +409,45 @@ impl Simulator {
     /// Replace the network delay/drop model.
     pub fn set_net_config(&self, cfg: NetConfig) {
         self.shared.lock().net = cfg;
+    }
+
+    /// Replace the **global** disk fault model ([`DiskConfig`]; default: no
+    /// faults). A per-node override set via
+    /// [`set_disk_config_for`](Self::set_disk_config_for) takes precedence.
+    pub fn set_disk_config(&self, cfg: DiskConfig) {
+        self.shared.lock().disk_cfg = cfg;
+    }
+
+    /// Set a **per-node** disk fault model, overriding the global one for
+    /// `node` (so a test can make one replica's disk flaky while the rest stay
+    /// healthy).
+    pub fn set_disk_config_for(&self, node: NodeId, cfg: DiskConfig) {
+        self.shared.lock().node_disk_cfg.insert(node, cfg);
+    }
+
+    /// Flip (bit-invert) one **durable** byte of `file` on `node`'s disk at
+    /// `offset`, modelling at-rest media corruption of already-synced data —
+    /// the fault class per-block checksums exist to catch. Returns whether a
+    /// durable byte existed at `offset` (`false` means nothing was changed).
+    /// Deterministic: draws no RNG; records a [`TraceEvent::DiskCorrupt`].
+    pub fn corrupt_durable(&self, node: NodeId, file: &str, offset: u64) -> bool {
+        let mut guard = self.shared.lock();
+        let st = &mut *guard;
+        let t = st.clock;
+        let Some(f) = st.disks.get_mut(&(node, file.to_owned())) else {
+            return false;
+        };
+        let Some(b) = f.durable.get_mut(offset as usize) else {
+            return false;
+        };
+        *b ^= 0xFF;
+        st.trace.push(TraceEvent::DiskCorrupt {
+            t,
+            node,
+            file: file.to_owned(),
+            offset,
+        });
+        true
     }
 
     /// Block delivery in the direction `from -> to`. Use
@@ -288,22 +473,88 @@ impl Simulator {
     /// Crash `node`: drop its un-synced disk bytes and its volatile in-memory
     /// inbox. Messages later delivered to a crashed node are dropped until it
     /// [`restart`](Self::restart)s.
+    ///
+    /// With the default [`DiskConfig`] the whole un-synced buffer of every file
+    /// is dropped atomically (and no RNG is drawn). With
+    /// [`DiskConfig::torn_tail_on_crash`] each file with buffered bytes instead
+    /// retains a seed-chosen **strict prefix** of them (now durable — those
+    /// bytes did reach the platter before the power cut), modelling a torn
+    /// final record; [`DiskConfig::corrupt_on_crash`] additionally flips one
+    /// seed-chosen byte inside that retained region. Files are processed in
+    /// `BTreeMap` (name) order, so the RNG draws — and therefore the whole
+    /// fault outcome — are a pure function of the seed.
     pub fn crash(&self, node: NodeId) {
-        let mut st = self.shared.lock();
+        let mut guard = self.shared.lock();
+        let st = &mut *guard;
         st.crashed.insert(node);
-        if let Some(inbox) = st.inboxes.get_mut(&node) {
-            inbox.clear();
+        // Clear every stream's inbox for this node (ADR 0026): a crashed node's
+        // whole inbox is volatile, not just its primary stream's.
+        let inbox_keys: Vec<_> = st
+            .inboxes
+            .keys()
+            .filter(|(n, _)| *n == node)
+            .cloned()
+            .collect();
+        for k in inbox_keys {
+            if let Some(inbox) = st.inboxes.get_mut(&k) {
+                inbox.clear();
+            }
         }
-        st.recv_wakers.remove(&node);
+        let waker_keys: Vec<_> = st
+            .recv_wakers
+            .keys()
+            .filter(|(n, _)| *n == node)
+            .cloned()
+            .collect();
+        for k in waker_keys {
+            st.recv_wakers.remove(&k);
+        }
+        let (torn, corrupt) = {
+            let cfg = st.disk_cfg_for(node);
+            (cfg.torn_tail_on_crash, cfg.corrupt_on_crash)
+        };
         let keys: Vec<_> = st
             .disks
             .keys()
             .filter(|(n, _)| *n == node)
             .cloned()
             .collect();
+        let t = st.clock;
         for k in keys {
-            if let Some(f) = st.disks.get_mut(&k) {
+            let Some(f) = st.disks.get_mut(&k) else {
+                continue;
+            };
+            if f.buffered.is_empty() {
+                continue;
+            }
+            if !torn {
                 f.buffered.clear();
+                continue;
+            }
+            // Tear: keep a strict prefix (at least one buffered byte is always
+            // lost — this models an interrupted write, not a completed one).
+            // The retained prefix becomes durable: it survives the restart.
+            let kept = gen_below(&mut st.rng, f.buffered.len() as u64) as usize;
+            let dropped = f.buffered.len() - kept;
+            f.durable.extend_from_slice(&f.buffered[..kept]);
+            f.buffered.clear();
+            st.trace.push(TraceEvent::DiskTear {
+                t,
+                node,
+                file: k.1.clone(),
+                kept,
+                dropped,
+            });
+            if corrupt && kept > 0 {
+                let region_start = f.durable.len() - kept;
+                let offset = region_start + gen_below(&mut st.rng, kept as u64) as usize;
+                f.durable[offset] ^= 0xFF;
+                st.trace.push(TraceEvent::DiskCorrupt {
+                    t,
+                    node,
+                    file: k.1,
+                    offset: offset as u64,
+                });
             }
         }
     }
@@ -356,10 +607,27 @@ impl Simulator {
             st.task_owner.remove(&task);
         }
         // Volatile state dies with the process; durable disk is kept.
-        if let Some(inbox) = st.inboxes.get_mut(&node) {
-            inbox.clear();
+        // Clear every stream's inbox for this node (ADR 0026), mirroring `crash`.
+        let inbox_keys: Vec<_> = st
+            .inboxes
+            .keys()
+            .filter(|(n, _)| *n == node)
+            .cloned()
+            .collect();
+        for k in inbox_keys {
+            if let Some(inbox) = st.inboxes.get_mut(&k) {
+                inbox.clear();
+            }
         }
-        st.recv_wakers.remove(&node);
+        let waker_keys: Vec<_> = st
+            .recv_wakers
+            .keys()
+            .filter(|(n, _)| *n == node)
+            .cloned()
+            .collect();
+        for k in waker_keys {
+            st.recv_wakers.remove(&k);
+        }
         let keys: Vec<_> = st
             .disks
             .keys()
@@ -509,11 +777,13 @@ impl Simulator {
                 }
                 Event::Deliver { to, env } => {
                     let from = env.from;
+                    let stream = env.stream;
                     if st.crashed.contains(&to) {
                         st.trace.push(TraceEvent::Drop {
                             t,
                             from,
                             to,
+                            stream,
                             reason: "crashed",
                         });
                         None
@@ -522,14 +792,21 @@ impl Simulator {
                             t,
                             from,
                             to,
+                            stream,
                             reason: "partition",
                         });
                         None
                     } else {
                         let len = env.payload.len();
-                        st.trace.push(TraceEvent::Deliver { t, from, to, len });
-                        st.inboxes.entry(to).or_default().push_back(env);
-                        st.recv_wakers.remove(&to)
+                        st.trace.push(TraceEvent::Deliver {
+                            t,
+                            from,
+                            to,
+                            stream,
+                            len,
+                        });
+                        st.inboxes.entry((to, stream)).or_default().push_back(env);
+                        st.recv_wakers.remove(&(to, stream))
                     }
                 }
             }
@@ -577,12 +854,18 @@ impl RngTrait for SimEnv {
 
 #[async_trait::async_trait]
 impl Network for SimEnv {
-    async fn send(&self, to: NodeId, payload: Vec<u8>) {
+    async fn send_stream(&self, to: NodeId, stream: u64, payload: Vec<u8>) {
         let mut st = self.shared.lock();
         let from = self.node_id;
         let t = st.clock;
         let len = payload.len();
-        st.trace.push(TraceEvent::Send { t, from, to, len });
+        st.trace.push(TraceEvent::Send {
+            t,
+            from,
+            to,
+            stream,
+            len,
+        });
 
         // A crashed node produces no output: it is dead, not merely unreachable.
         if st.crashed.contains(&from) {
@@ -590,6 +873,7 @@ impl Network for SimEnv {
                 t,
                 from,
                 to,
+                stream,
                 reason: "sender-crashed",
             });
             return;
@@ -601,6 +885,7 @@ impl Network for SimEnv {
                 t,
                 from,
                 to,
+                stream,
                 reason: "lossy",
             });
             return;
@@ -620,15 +905,20 @@ impl Network for SimEnv {
             (deliver_at, seq),
             Event::Deliver {
                 to,
-                env: Envelope { from, payload },
+                env: Envelope {
+                    from,
+                    stream,
+                    payload,
+                },
             },
         );
     }
 
-    async fn recv(&self) -> Envelope {
+    async fn recv_stream(&self, stream: u64) -> Envelope {
         Recv {
             shared: Arc::clone(&self.shared),
             node: self.node_id,
+            stream,
         }
         .await
     }
@@ -638,6 +928,9 @@ impl Network for SimEnv {
 impl Disk for SimEnv {
     async fn append(&self, file: &str, bytes: &[u8]) -> std::io::Result<()> {
         let mut st = self.shared.lock();
+        if let Some(e) = st.inject_disk_fault(self.node_id, "append", file) {
+            return Err(e);
+        }
         let key = (self.node_id, file.to_owned());
         st.disks
             .entry(key)
@@ -649,6 +942,9 @@ impl Disk for SimEnv {
 
     async fn sync(&self, file: &str) -> std::io::Result<()> {
         let mut st = self.shared.lock();
+        if let Some(e) = st.inject_disk_fault(self.node_id, "sync", file) {
+            return Err(e);
+        }
         let key = (self.node_id, file.to_owned());
         if let Some(f) = st.disks.get_mut(&key) {
             let mut buffered = std::mem::take(&mut f.buffered);
@@ -658,7 +954,10 @@ impl Disk for SimEnv {
     }
 
     async fn read(&self, file: &str) -> std::io::Result<Vec<u8>> {
-        let st = self.shared.lock();
+        let mut st = self.shared.lock();
+        if let Some(e) = st.inject_disk_fault(self.node_id, "read", file) {
+            return Err(e);
+        }
         let key = (self.node_id, file.to_owned());
         Ok(st.disks.get(&key).map_or_else(Vec::new, |f| {
             let mut out = f.durable.clone();
@@ -668,7 +967,10 @@ impl Disk for SimEnv {
     }
 
     async fn read_at(&self, file: &str, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
-        let st = self.shared.lock();
+        let mut st = self.shared.lock();
+        if let Some(e) = st.inject_disk_fault(self.node_id, "read_at", file) {
+            return Err(e);
+        }
         let key = (self.node_id, file.to_owned());
         Ok(st.disks.get(&key).map_or_else(Vec::new, |f| {
             // The durable + buffered view, sliced — mirrors `read`. A crash clears
@@ -706,8 +1008,13 @@ impl Disk for SimEnv {
 
     async fn replace(&self, file: &str, bytes: &[u8]) -> std::io::Result<()> {
         // Atomic under the state lock: durable jumps straight to `bytes`, with no
-        // un-synced remainder. A crash keeps exactly the new contents.
+        // un-synced remainder. A crash keeps exactly the new contents. An injected
+        // fault fails the swap cleanly (temp-file + rename semantics: the old
+        // contents remain fully intact).
         let mut st = self.shared.lock();
+        if let Some(e) = st.inject_disk_fault(self.node_id, "replace", file) {
+            return Err(e);
+        }
         let key = (self.node_id, file.to_owned());
         let f = st.disks.entry(key).or_default();
         f.durable = bytes.to_vec();
@@ -758,7 +1065,7 @@ impl Coresident for SimEnv {
         {
             let mut st = self.shared.lock();
             st.nodes.insert(id);
-            st.inboxes.entry(id).or_default();
+            st.inboxes.entry((id, PRIMARY_STREAM)).or_default();
         }
         SimEnv {
             shared: Arc::clone(&self.shared),
@@ -802,10 +1109,12 @@ impl Future for Sleep {
     }
 }
 
-/// Future that yields the next message addressed to a node.
+/// Future that yields the next message addressed to a node on a given stream
+/// (ADR 0026).
 struct Recv {
     shared: Arc<Shared>,
     node: NodeId,
+    stream: u64,
 }
 
 impl Future for Recv {
@@ -813,10 +1122,11 @@ impl Future for Recv {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Envelope> {
         let mut st = self.shared.lock();
-        if let Some(env) = st.inboxes.get_mut(&self.node).and_then(VecDeque::pop_front) {
+        let key = (self.node, self.stream);
+        if let Some(env) = st.inboxes.get_mut(&key).and_then(VecDeque::pop_front) {
             Poll::Ready(env)
         } else {
-            st.recv_wakers.insert(self.node, cx.waker().clone());
+            st.recv_wakers.insert(key, cx.waker().clone());
             Poll::Pending
         }
     }

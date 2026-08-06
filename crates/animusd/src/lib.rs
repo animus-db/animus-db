@@ -36,7 +36,7 @@ pub use config::ClusterConfig;
 // cluster metadata — membership status and the tablet map — without depending on
 // `animus-control` directly.
 pub use animus_control::{
-    ColumnType, MetaCommand, Metadata, NodeStatus, ReplicationMode, TableSchema,
+    ColumnDef, ColumnType, MetaCommand, Metadata, NodeStatus, ReplicationMode, TableSchema,
 };
 
 mod admin;
@@ -45,17 +45,21 @@ mod cql_client;
 mod dashboard;
 mod dynamo;
 mod http;
+mod topology;
 
 use animus_control::node::heartbeat_loop;
 use animus_control::{PlacementPolicy, ProposeResult, RaftNode};
 use animus_cp_data::{RaftKvNode, SplitHook};
 use animus_env::{Coresident, Disk, Env, Metric, MetricsHandle, NodeId, ProdEnv};
 use animus_storage::{LsmEngine, MemoryEngine, SsTableView, StorageEngine, WalRecordView};
-use animus_tablet::{Epoch, KeyRange, TabletId};
+use animus_tablet::{KeyRange, TabletId};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+// Pure CP-topology decision logic (id translation, routing, join-host/GC
+// predicates), extracted into `topology` for unit-test coverage.
+use topology::{cp_base_id, cp_member_id, cp_members_for};
 
 /// A list of `(key, value)` pairs — the payload of a batch write (one Raft
 /// `KvCommand::Batch` entry per tablet). Named to keep the batch grouping map
@@ -195,13 +199,31 @@ impl CpGroup {
 
     /// This node's live `(key, value)` pairs for the group, in key order, from the
     /// **local** engine (no quorum barrier). Meaningful on the leader (its committed
-    /// state); the auto-split loop uses it as a cheap size signal + to pick a median
-    /// split key (Phase 2.4). See [`RaftKvNode::range_snapshot`].
+    /// state); the auto-split loop materializes it to confirm an over-threshold
+    /// tablet + pick a median split key (Phase 2.4) — gated behind
+    /// [`approx_key_count`](Self::approx_key_count), since this reads the whole
+    /// tablet. See [`RaftKvNode::range_snapshot`].
     async fn local_pairs(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
         match self {
             CpGroup::Lsm(n) => n.range_snapshot(&[]).await,
             CpGroup::Mem(n) => n.range_snapshot(&[]).await,
         }
+    }
+
+    /// A cheap, non-materializing key-count **(over-)estimate** for the auto-split
+    /// gate (Phase 2.4): the memtable's key count (exact for data still in the
+    /// memtable — the common case for a not-yet-split tablet) plus the SSTable
+    /// bytes over a deliberately small assumed entry size, so the estimate errs
+    /// toward *over*-counting — a tablet that might need splitting gets confirmed
+    /// by a real count rather than silently missed. `None` on the memory backend
+    /// (no cheap counter); the caller falls back to its slow confirm cadence.
+    fn approx_key_count(&self) -> Option<usize> {
+        let (memtable_keys, _bytes) = self.lsm_memtable()?;
+        let sst_bytes: u64 = self.lsm_sstables()?.iter().map(|v| v.file_size).sum();
+        Some(
+            memtable_keys
+                + usize::try_from(sst_bytes / AUTO_SPLIT_EST_ENTRY_BYTES).unwrap_or(usize::MAX),
+        )
     }
 
     /// The first `limit` live `(key, value)` pairs with `key >= start`, in key
@@ -555,6 +577,9 @@ fn is_relayable_command(command: &MetaCommand) -> bool {
         command,
         MetaCommand::CreateTableSchema { .. }
             | MetaCommand::DropTableSchema { .. }
+            // Atomic `ALTER TABLE` (in-place schema replacement): a follower-
+            // connected ALTER must relay like the create/drop it replaces.
+            | MetaCommand::ReplaceTableSchema { .. }
             | MetaCommand::CreateTableIndex { .. }
             | MetaCommand::DropTableIndex { .. }
             | MetaCommand::SetTableMode { .. }
@@ -1326,12 +1351,9 @@ impl ClientCtx {
         // `table`'s tablets and match the key's leading token against their token
         // sub-ranges. Two tables' tablets may share a token range, so we never scan
         // the global tablet map. No catch-all: a key of an unprovisioned table yields
-        // `None` and the caller waits.
-        self.raft
-            .metadata()
-            .tablets_for_table(table)
-            .find(|(_, t)| t.range.contains(key))
-            .map(|(id, _)| *id)
+        // `None` and the caller waits. The range-match lookup itself is pure — see
+        // `topology::tablet_for_key`.
+        topology::tablet_for_key(self.raft.metadata().tablets_for_table(table), key)
     }
 
     /// Resolve how to reach the CP group leader for an op on `key` (shared by every
@@ -1370,38 +1392,48 @@ impl ClientCtx {
     /// resolution policy shared by [`cp_route`](Self::cp_route) (key→tablet→leader)
     /// and [`cp_route_tablet`](Self::cp_route_tablet) (tablet→leader, for the split
     /// trigger, where the key maps to a *different* tablet after the metadata split).
+    ///
+    /// The branching itself — serve locally / forward-to-hint / forward-anywhere
+    /// / wait — is the pure [`topology::decide_cp_route`]; this method's job is
+    /// only to gather its inputs (cheaply, and lazily where a fact needs a
+    /// `Metadata` deep clone) and execute the resulting decision.
     fn resolve_cp_route(&self, tablet: TabletId) -> Option<CpRoute> {
-        if let Some(leader) = self.edge.cp_leader(tablet) {
+        let leader = self.edge.cp_leader(tablet);
+        if let Some(leader) = leader {
             return Some(CpRoute::Local(leader));
         }
         // Forward only to a concrete leader *hint* a local replica gives us.
-        if let Some(addr) = self.cp_forward_target(tablet) {
+        let forward_hint = self.cp_forward_target(tablet);
+        if let Some(addr) = forward_hint {
             return Some(CpRoute::Forward(addr));
         }
-        // No local leader and no leader hint. Decide between waiting and forwarding
-        // by whether this node is a **replica** of the tablet (ADR 0023): a replica
-        // that does not yet host the group is mid-stand-up (its join-host loop will
-        // form/elect it) — **wait**, don't forward to a node that may not host the
-        // leader yet (the dynamic-provisioning window, fixes "forwarded CP op: not
-        // the leader here"). A node that is *not* a replica can never serve locally,
-        // so forward toward an actual replica of the tablet (it leads, or the client
-        // retries with fresh routing).
-        if self.edge.local_cp(tablet).is_none() {
+        // No local leader and no leader hint. Whether this node hosts *any* local
+        // handle for the group is cheap (no `Metadata` clone); only fetch the
+        // metadata-derived facts (`is_replica`, a fallback forward address) in the
+        // one case that needs them, matching `decide_cp_route`'s own short-circuit
+        // order (avoids the "re-clone `Metadata` per request" cost the wire edges
+        // already learned to snapshot around).
+        let has_local_replica = self.edge.local_cp(tablet).is_some();
+        let (is_replica, fallback_forward) = if has_local_replica {
+            (false, None)
+        } else {
             let meta = self.raft.metadata();
             let replicas = meta.tablets.get(&tablet).map(|t| &t.replicas);
             let is_replica = replicas.is_some_and(|r| r.contains(&self.base_id));
-            if is_replica {
-                return None; // wait for our own group to form
-            }
-            // Forward toward a replica's client route (prefer over a random node).
-            if let Some(addr) = replicas
+            let fallback = replicas
                 .into_iter()
                 .flatten()
                 .find_map(|id| self.client_route.get(id).copied())
-                .or_else(|| self.client_route.values().next().copied())
-            {
-                return Some(CpRoute::Forward(addr));
-            }
+                .or_else(|| self.client_route.values().next().copied());
+            (is_replica, fallback)
+        };
+        // `has_local_leader: false` and `forward_hint: None` here are exactly the
+        // facts already established by the two early returns above — `Local` is
+        // therefore unreachable from this call by construction.
+        if let topology::RouteDecision::Forward(addr) =
+            topology::decide_cp_route(false, None, has_local_replica, is_replica, fallback_forward)
+        {
+            return Some(CpRoute::Forward(addr));
         }
         None
     }
@@ -2151,35 +2183,9 @@ struct CpHostCtx {
     hosted: Arc<Mutex<Vec<HostedCpTablet>>>,
 }
 
-/// This node's CP group **member id** for `tablet`, derived **flatly** from its base
-/// `raftkv` id: the bootstrap tablet uses the base id; any split-created tablet uses
-/// `base + tablet * CP_SPLIT_ID_STRIDE`. Flat (always from the base id, not the
-/// parent's member id) so the derivation is identical at any split depth and matches
-/// [`cp_members_for`] — a grandchild's member is `base + grandchild * STRIDE`, not a
-/// compounding `base + parent*STRIDE + grandchild*STRIDE`, so the reconfigure loop's
-/// translated `desired` set always matches the running group's `config()`.
-fn cp_member_id(base: NodeId, tablet: TabletId) -> NodeId {
-    if tablet == TABLET {
-        base
-    } else {
-        base + tablet.0 * CP_SPLIT_ID_STRIDE
-    }
-}
-
-/// The inverse of [`cp_member_id`]: recover the stable **base** `raftkv` id from a
-/// tablet group **member id**. Needed wherever a group-internal id (e.g. the leader
-/// hint a local replica reports) must be resolved against state keyed by base ids
-/// (`client_route`, `Metadata.members`, `tablets[t].replicas`). For the bootstrap
-/// tablet member == base, which is why a missing reverse translation *works* there
-/// and only breaks for derived-id tablets (every provisioned table tablet and split
-/// child) — the bug class behind "no CP group leader reachable" on a healthy group.
-fn cp_base_id(member: NodeId, tablet: TabletId) -> NodeId {
-    if tablet == TABLET {
-        member
-    } else {
-        member - tablet.0 * CP_SPLIT_ID_STRIDE
-    }
-}
+// `cp_member_id` / `cp_base_id` (base <-> derived CP group member id translation)
+// now live in `topology` as pure, unit-tested functions; imported via
+// `use topology::{cp_base_id, cp_member_id, cp_members_for};` below.
 
 /// Build a **CP split hook** for a group on this node (Phase 2.2 / D3). When the
 /// group commits a `Split { at }`, every replica invokes this hook with the handed-off
@@ -2357,21 +2363,9 @@ async fn cp_rehost(host: CpHostCtx, h: HostedCpTablet) {
 /// cluster produces no churn.
 const CP_RECONFIGURE_INTERVAL: Duration = Duration::from_millis(500);
 
-/// Translate a tablet's replica set — recorded in `Metadata.tablets[t].replicas` as
-/// stable **base** `raftkv` ids (the node identities placement + failure-detection
-/// speak) — into that tablet's CP **group member ids**. The bootstrap tablet's group
-/// uses the base ids directly; a split-created tablet's group uses the derived
-/// `base + tablet * CP_SPLIT_ID_STRIDE` (Phase 2.2 / [`cp_split_seed`]). This is the
-/// single source of the base↔member mapping, so the reconfigure loop's `desired`
-/// matches the running group's `config()` exactly (no spurious churn) — which is why
-/// the replicated map can stay in base ids rather than being reconciled to the
-/// derived member ids (#4).
-fn cp_members_for(tablet: TabletId, replicas: &[NodeId]) -> BTreeSet<NodeId> {
-    replicas
-        .iter()
-        .map(|&base| cp_member_id(base, tablet))
-        .collect()
-}
+// `cp_members_for` (translate a tablet's base-id replica set to its CP group's
+// member ids) now lives in `topology` as a pure, unit-tested function — see the
+// `use` import above [`cp_member_id`]/[`cp_base_id`].
 
 /// The per-node **CP reconfigure loop** over `ProdEnv` (#3 / ADR 0017 Stage C): on
 /// each tick, for every tablet whose CP group this node currently **leads**, pull the
@@ -2427,20 +2421,18 @@ async fn cp_join_host_loop(host: CpHostCtx) {
         tokio::time::sleep(CP_JOIN_HOST_INTERVAL).await;
         let tablets = host.ctx.raft.metadata().tablets;
         for (tablet, t) in tablets {
-            if !t.replicas.contains(&host.base_id) {
+            // The pure decision — is this tablet this node's concern, and if so
+            // forming fresh or joining an existing group — is
+            // `topology::plan_join_host` (host a freshly *provisioned* table
+            // tablet at `INITIAL` with the whole range, or a *joined* replica at a
+            // bumped epoch; skip a fresh split child, `INITIAL` + non-whole range,
+            // whose data is seeded by the split hook instead). On a restart
+            // `LsmEngine::open` in `cp_join_host` recovers the on-disk engine, so
+            // re-hosting a provisioned tablet here does not start it truly empty.
+            let Some(plan) = topology::plan_join_host(host.base_id, &t.replicas, t.epoch, &t.range)
+            else {
                 continue;
-            }
-            // Host an **empty** group for a freshly *provisioned* table tablet (ADR
-            // 0023: a `CreateTable` tablet starts at `INITIAL` with the whole token
-            // ring) or a *joined* replica (`epoch > INITIAL` — the reconciler placed
-            // this node into an existing tablet's set). **Skip a fresh split child**
-            // (`INITIAL` + a non-whole range): its data is seeded by the split hook on
-            // its original replicas, so starting it empty here would lose it. On a
-            // restart `LsmEngine::open` in `cp_join_host` recovers the on-disk engine,
-            // so re-hosting a provisioned tablet here does not start it truly empty.
-            if t.epoch <= Epoch::INITIAL && t.range != KeyRange::whole() {
-                continue;
-            }
+            };
             // Dedup **per node** via the `minted` claim set (shared with the split
             // hook + re-host on *this* node) — NOT via `edge.local_cp`, which in an
             // in-process `--cluster N` run is a **shared** `ClusterEdgeState`: it
@@ -2448,16 +2440,14 @@ async fn cp_join_host_loop(host: CpHostCtx) {
             // leaving a freshly provisioned tablet hosted on only one replica (no
             // majority → no election → "no CP group leader reachable"). The minted set
             // is genuinely per-node, so it dedups correctly in both deployment modes.
+            // This stateful claim stays here — it is not part of the pure decision.
             {
                 let mut h = host.minted.lock().expect("hosting set poisoned");
                 if !h.insert(tablet) {
                     continue;
                 }
             }
-            // A fresh table tablet (still at INITIAL) is forming for the first time →
-            // start voting with the full config; a bumped epoch means this node is
-            // *joining* an existing group → start as a quiet non-voter.
-            cp_join_host(&host, tablet, &t.replicas, t.epoch <= Epoch::INITIAL).await;
+            cp_join_host(&host, tablet, &t.replicas, plan.initial_formation).await;
         }
     }
 }
@@ -2570,6 +2560,9 @@ const CP_GC_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 async fn cp_gc_loop(host: CpHostCtx) {
     loop {
         tokio::time::sleep(CP_GC_INTERVAL).await;
+        // Recovery guard stays here (a live `RaftNode` read, not part of the pure
+        // predicate): skip entirely before replicated `Metadata` has recovered, or
+        // an empty default `Metadata` reads as "everything dropped".
         if host.ctx.raft.last_applied() == 0 {
             continue;
         }
@@ -2581,10 +2574,8 @@ async fn cp_gc_loop(host: CpHostCtx) {
             .iter()
             .copied()
             .collect();
-        for tablet in mine {
-            if !tablets.contains_key(&tablet) {
-                cp_gc_tablet(&host, tablet).await;
-            }
+        for tablet in topology::tablets_to_reclaim(&mine, &tablets) {
+            cp_gc_tablet(&host, tablet).await;
         }
     }
 }
@@ -2682,26 +2673,56 @@ const AUTO_SPLIT_INTERVAL: Duration = Duration::from_secs(2);
 /// then halves below the threshold, so it won't re-trigger anyway, but this guards
 /// the in-flight window against a duplicate trigger).
 const AUTO_SPLIT_COOLDOWN: Duration = Duration::from_secs(15);
+/// Assumed bytes per SSTable entry when converting on-disk bytes into the
+/// auto-split gate's key-count **estimate** ([`CpGroup::approx_key_count`]).
+/// Deliberately small (real entries are larger), so bytes ÷ this *over*-estimates
+/// the key count — the gate then errs toward confirming with a real count rather
+/// than missing a split. The periodic confirm (one full count per tablet per
+/// [`AUTO_SPLIT_COOLDOWN`]) bounds the miss window even if compression pushes a
+/// table's real bytes-per-entry below this.
+const AUTO_SPLIT_EST_ENTRY_BYTES: u64 = 32;
 
 /// The leader-driven **automatic split trigger** (Phase 2.4): on each tick, for
-/// every tablet whose CP group this node currently **leads**, read the leader's
-/// local key count (a cheap size signal) and, if it exceeds `threshold`, propose a
-/// split at the **median** key — bisecting the tablet so each half holds roughly
-/// half the keys. Per-tablet cooldown avoids a duplicate trigger while a split is
-/// in flight; once it applies, the parent's key count halves below the threshold.
+/// every tablet whose CP group this node currently **leads**, take the leader's
+/// **cheap key-count estimate** ([`CpGroup::approx_key_count`] — memtable count +
+/// SSTable bytes, no materialization) and only when it says the tablet might
+/// exceed `threshold` (or on a slow per-tablet confirm cadence) materialize the
+/// live pairs once — the authoritative count *and*, if over threshold, the
+/// **median** split key come from that one snapshot. A split bisects the tablet so
+/// each half holds roughly half the keys. Per-tablet cooldown avoids a duplicate
+/// trigger while a split is in flight; once it applies, the parent's key count
+/// halves below the threshold.
 ///
 /// Only the node hosting a tablet's leader reads `local_pairs`/triggers, so in a
 /// one-process-per-node deployment exactly one node triggers. (In a single
 /// `--cluster N` process the edge state is shared, so every node's loop sees the
-/// same leader handle and may trigger redundantly — harmless: the control plane
-/// rejects a re-split of an already-split range, and the per-node mint gate dedups
-/// the hook, so it converges to one split.)
+/// same leader handle and may trigger redundantly — the control plane rejects a
+/// re-split of an already-split *metadata* range, but that alone does not stop a
+/// second `propose_split` from reaching the CP group: metadata rejection only dedups
+/// which `SplitTablet` command wins, not who then calls `propose_split` on the data
+/// plane, so more than one `Split` command really can land in the committed log.
+/// **Genuinely harmless only because `animus-cp-data`'s apply of `KvCommand::Split`
+/// is itself idempotent** — a group splits once in its lifetime, and every
+/// application after the first is a no-op (`apply_and_compact`'s `already_split`
+/// flag). Without that guard a second, redundant `Split` re-fires the split hook
+/// with an *empty* handoff (the range was already tombstoned by the first
+/// application), and that empty-handoff task can win the per-node mint race against
+/// the real one — silently seeding the new tablet's group with no data. That was a
+/// real, intermittent bug (`tablet_auto_splits_when_it_grows` flaking on "key not
+/// served after auto-split" on unmodified `main`, no manual trigger needed), not a
+/// hypothetical one — fixed at the data-plane apply layer, not here, so it is safe
+/// regardless of *why* a duplicate `propose_split` happens (this redundant-trigger
+/// path today; a stale retry after a data-plane leader failover would hit the same
+/// guard).
 ///
 /// `threshold` is a **key count** here — a placeholder size signal; a real
 /// byte/size-based threshold is future tuning. Disabled unless a threshold is wired
 /// (so it never perturbs clusters that don't opt in).
 async fn auto_split_loop(ctx: ClientCtx, threshold: usize) {
     let mut last_triggered: BTreeMap<TabletId, tokio::time::Instant> = BTreeMap::new();
+    // When each tablet last had a *full* (materializing) count — the expensive
+    // confirm is rate-limited per tablet, not run every tick.
+    let mut last_counted: BTreeMap<TabletId, tokio::time::Instant> = BTreeMap::new();
     loop {
         tokio::time::sleep(AUTO_SPLIT_INTERVAL).await;
         let tablets: Vec<TabletId> = ctx.raft.metadata().tablets.keys().copied().collect();
@@ -2716,7 +2737,26 @@ async fn auto_split_loop(ctx: ClientCtx, threshold: usize) {
             let Some(leader) = ctx.edge.cp_leader(tablet) else {
                 continue;
             };
+            // Cheap per-tick gate: materializing every led tablet's live pairs
+            // every tick is O(total data) per 2s — instead, take the free
+            // (over-)estimate and only materialize when it says the tablet might
+            // exceed the threshold, or on a slow per-tablet confirm cadence
+            // (bounded by `AUTO_SPLIT_COOLDOWN`) that corrects estimate error
+            // (compression can push real bytes-per-entry below the assumed size;
+            // the memory backend has no estimate at all).
+            let due_confirm = last_counted
+                .get(&tablet)
+                .is_none_or(|at| at.elapsed() >= AUTO_SPLIT_COOLDOWN);
+            let hot = leader
+                .approx_key_count()
+                .is_some_and(|estimate| estimate > threshold);
+            if !hot && !due_confirm {
+                continue;
+            }
+            // Materialize once: the authoritative count and, if over threshold,
+            // the median split key come from the same snapshot.
             let pairs = leader.local_pairs().await;
+            last_counted.insert(tablet, tokio::time::Instant::now());
             if pairs.len() <= threshold {
                 continue;
             }
@@ -2844,17 +2884,6 @@ impl ClientCtx {
         self.raft.metadata().has_table_schema(table)
     }
 
-    /// Whether any replicated table name starts with `prefix`. Used by the CQL
-    /// edge to recognize a keyspace (keyed `ks.table`) as existing because it has
-    /// at least one table, even across a restart (keyspaces are not separately
-    /// replicated — ADR 0013).
-    pub(crate) fn has_table_schema_with_prefix(&self, prefix: &str) -> bool {
-        self.raft
-            .metadata()
-            .table_schemas()
-            .any(|(name, _)| name.starts_with(prefix))
-    }
-
     /// Whether `keyspace` is registered in the replicated catalog (v1 A3) — the
     /// CQL edge's `USE` / qualifier check, replacing per-process edge state.
     pub(crate) fn has_keyspace(&self, keyspace: &str) -> bool {
@@ -2874,7 +2903,15 @@ impl ClientCtx {
         let want = addr.clone();
         let _ = self
             .propose_and_await(
-                MetaCommand::RegisterCpAddr { id, addr },
+                // `tablet: None` = legacy, never GC'd (ADR 0024). Passing the
+                // owning tablet here (so a dropped tablet's addresses are
+                // reclaimed) is the animusd wiring of the address GC — a
+                // follow-up PR; this only tracks the enum's new field.
+                MetaCommand::RegisterCpAddr {
+                    id,
+                    addr,
+                    tablet: None,
+                },
                 SCHEMA_COMMIT_TIMEOUT,
                 || (self.raft.metadata().cp_member_addrs.get(&id) == Some(&want)).then_some(()),
             )
@@ -2895,18 +2932,15 @@ impl ClientCtx {
     /// leaders may differ), forwarding a one-hop [`CpSplit`](ClientRequest::CpSplit)
     /// there if this node doesn't host it.
     async fn trigger_split(&self, tablet: TabletId, split_key: Vec<u8>) -> ClientResponse {
-        // The new tablet id: one past the current max (deterministic on the leader
-        // that proposes it; replicated to all via `SplitTablet`).
-        let new_id = TabletId(
-            self.raft
-                .metadata()
-                .tablets
-                .keys()
-                .map(|t| t.0)
-                .max()
-                .unwrap_or(0)
-                + 1,
-        );
+        // The new tablet id comes from the **monotonic allocator**
+        // (`next_free_tablet_id`, ADR 0023 — the same allocator provisioning uses),
+        // *not* `max(existing ids) + 1`: `DropTableTablets` removes tablets without
+        // lowering `next_tablet_id`, so max+1 could re-mint a freed id — and a
+        // replica still holding the dropped tablet's `db-t{id}-*` files would
+        // re-host them AS the new tablet (data resurrection the absence-keyed GC
+        // can never reclaim). The apply also rejects a below-allocator id, so a
+        // stale proposer cannot reintroduce reuse.
+        let new_id = self.raft.metadata().next_free_tablet_id();
         // 1. Record the split in the control plane and wait until the new tablet is
         //    visible here, so the split hook can resolve `new_id` from `Metadata`
         //    when the data-plane `Split` applies. Routed to the control leader.
@@ -3057,14 +3091,48 @@ impl ClientCtx {
             })
     }
 
+    /// **Atomically replace** `table`'s schema in the replicated catalog
+    /// (`MetaCommand::ReplaceTableSchema`) and wait until the replacement is
+    /// visible here — the CQL `ALTER TABLE … ADD` sink. One command, one apply:
+    /// unlike the former drop-then-recreate, there is no window in which the
+    /// table is schema-less (a crash between the two commands stranded it).
+    /// Routes to the leader exactly as
+    /// [`create_table_schema`](Self::create_table_schema); idempotent (replacing
+    /// with an identical schema is a state-machine no-op that still satisfies the
+    /// visibility check). Errors if the table has no schema (the state machine
+    /// rejects — an ALTER cannot create a table) or on commit timeout.
+    pub(crate) async fn replace_table_schema(
+        &self,
+        table: String,
+        schema: TableSchema,
+    ) -> Result<(), String> {
+        let command = MetaCommand::ReplaceTableSchema {
+            table: table.clone(),
+            schema: schema.clone(),
+        };
+        self.propose_and_await(command, SCHEMA_COMMIT_TIMEOUT, || {
+            (self.table_schema(&table).as_ref() == Some(&schema)).then_some(())
+        })
+        .await
+        .map_err(|()| {
+            format!(
+                "ALTER TABLE `{table}` did not commit within {}s \
+                 (no control-plane leader reachable, or the table has no schema?)",
+                SCHEMA_COMMIT_TIMEOUT.as_secs()
+            )
+        })
+    }
+
     /// Drop `table` **and garbage-collect its data** (ADR 0024): remove the
     /// schema from the replicated catalog, then remove the table's tablets from
     /// the replicated tablet map — the trigger each hosting node's
     /// [`cp_gc_loop`] converges on by stopping its local group and deleting its
     /// engine + WAL files. This is the real `DROP TABLE` sink (CQL + the admin
     /// dashboard); [`drop_table_schema`](Self::drop_table_schema) alone remains
-    /// the schema-only primitive `ALTER TABLE` uses for its drop-then-recreate —
-    /// an ALTER must never GC the table's data. Returns once both the schema and
+    /// the schema-only primitive (the admin panel's schema-only drop) — an
+    /// `ALTER TABLE` now mutates the schema in place via
+    /// [`replace_table_schema`](Self::replace_table_schema) and never GCs data.
+    /// Returns once both the schema and
     /// the tablets have left this node's replicated metadata; the per-node file
     /// reclamation continues asynchronously on every replica.
     pub(crate) async fn drop_table(&self, table: String) -> Result<(), String> {
@@ -3102,9 +3170,10 @@ impl ClientCtx {
     /// from the replicated catalog (ADR 0013). Idempotent: dropping an absent
     /// table returns `Ok(())` immediately. Routes to the leader exactly as
     /// [`create_table_schema`](Self::create_table_schema). Schema-only: does
-    /// **not** touch the table's tablets/data — `ALTER TABLE` relies on that for
-    /// its drop-then-recreate; a real drop goes through
-    /// [`drop_table`](Self::drop_table).
+    /// **not** touch the table's tablets/data (the admin panel's schema-only
+    /// drop uses this); a real drop goes through [`drop_table`](Self::drop_table)
+    /// and an `ALTER TABLE` replaces in place via
+    /// [`replace_table_schema`](Self::replace_table_schema).
     pub(crate) async fn drop_table_schema(&self, table: String) -> Result<(), String> {
         if !self.has_table_schema(&table) {
             return Ok(());
@@ -3335,12 +3404,39 @@ pub async fn run_node_with(
         .await
 }
 
+/// Upper bound on a client-protocol frame (the `u32` length prefix is
+/// **untrusted** input on the client + cross-node relay ports — without a cap,
+/// four bytes from any dialer forces up to a 4 GiB allocation in [`read_frame`]).
+///
+/// Sized comfortably above the largest legitimate frames this protocol carries:
+/// - a single client/forwarded `Put` — its value enters via the HTTP edges,
+///   whose bodies cap at 1 MiB (`http::MAX_BODY`), and JSON-encodes a `Vec<u8>`
+///   at ≤ 4 chars per byte → ~4 MiB;
+/// - a forwarded `PutBatch` from the admin bulk seeder — bounded to
+///   `SEED_BATCH_MAX_BYTES` (4 MiB) of raw entry bytes per batch → ~17 MiB JSON;
+/// - everything else (`Get`/`Scan`/`ProposeSchema`/split triggers) is tiny.
+///
+/// An over-cap length prefix is rejected with a clean `InvalidData` error (the
+/// connection closes) before any allocation, never a panic or an OOM.
+pub const MAX_FRAME_LEN: usize = 64 << 20;
+
 /// Write a length-prefixed (`u32` big-endian) JSON frame.
 ///
 /// # Errors
-/// Propagates write failures.
+/// Propagates write failures; rejects a frame over [`MAX_FRAME_LEN`] (the
+/// receiver would drop the connection anyway — failing at the sender names the
+/// culprit instead of surfacing as a mysterious peer hang-up).
 pub async fn write_frame<T: Serialize>(stream: &mut TcpStream, msg: &T) -> std::io::Result<()> {
     let bytes = serde_json::to_vec(msg).expect("client message serializes");
+    if bytes.len() > MAX_FRAME_LEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "frame of {} bytes exceeds MAX_FRAME_LEN ({MAX_FRAME_LEN})",
+                bytes.len()
+            ),
+        ));
+    }
     stream.write_u32(bytes.len() as u32).await?;
     stream.write_all(&bytes).await?;
     stream.flush().await?;
@@ -3350,13 +3446,21 @@ pub async fn write_frame<T: Serialize>(stream: &mut TcpStream, msg: &T) -> std::
 /// Read a length-prefixed JSON frame, or `None` at clean EOF.
 ///
 /// # Errors
-/// Propagates read failures and decode errors.
+/// Propagates read failures and decode errors; a declared length over
+/// [`MAX_FRAME_LEN`] is an `InvalidData` error **before any allocation** (the
+/// length prefix is untrusted — see [`MAX_FRAME_LEN`]).
 pub async fn read_frame<T: DeserializeOwned>(stream: &mut TcpStream) -> std::io::Result<Option<T>> {
     let len = match stream.read_u32().await {
         Ok(len) => len as usize,
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(e) => return Err(e),
     };
+    if len > MAX_FRAME_LEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("declared frame length {len} exceeds MAX_FRAME_LEN ({MAX_FRAME_LEN})"),
+        ));
+    }
     let mut buf = vec![0u8; len];
     stream.read_exact(&mut buf).await?;
     let msg = serde_json::from_slice(&buf)
