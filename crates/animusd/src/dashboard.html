@@ -425,19 +425,16 @@ function renderStorageSelectors() {
 // replica of the tablet answers 404 — so offer only nodes whose /admin/raftkv view
 // lists the selected tablet: the same registry the storage routes resolve
 // (`local_cp`), so an offered node cannot 404. If none is reachable yet (a freshly
-// provisioned or split tablet whose group is still forming), fall back to every
-// node, annotated, with a hint — so the panels stay usable rather than empty.
+// provisioned or split tablet whose group is still forming), the dropdown is empty
+// with a hint; the Load/Browse/inspect handlers already no-op on an empty node.
 function updateStorageNodeOptions() {
   const tablet = Number($("st-tablet").value);
   const nsel = $("st-node");
   const prevN = nsel.value;
-  const up = STATE.nodes.filter((n) => n.ok);
   const hostGroup = (n) => n.raftkv && (n.raftkv.groups || []).find((g) => g.tablet === tablet);
-  const hosting = up.filter(hostGroup);
-  const nodes = hosting.length ? hosting : up;
-  nsel.innerHTML = nodes.map((n) => {
-    const g = hostGroup(n);
-    const tag = g ? (g.is_leader ? " · leader" : "") : " · no replica";
+  const hosting = STATE.nodes.filter((n) => n.ok).filter(hostGroup);
+  nsel.innerHTML = hosting.map((n) => {
+    const tag = hostGroup(n).is_leader ? " · leader" : "";
     return `<option value="${esc(n.base)}">node ${esc(nodeRaftkvId(n))} (${esc(n.addr)})${tag}</option>`;
   }).join("");
   if (prevN && [...nsel.options].some((o) => o.value === prevN)) nsel.value = prevN;

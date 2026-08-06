@@ -257,8 +257,8 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
     selected tablet** (the storage endpoints are node-local — `local_cp` — and 404
     on a non-hosting node; the tablet list is cluster-wide metadata, so the raw
     cross-product invited valid-looking 404 combos), annotating the leader; if no
-    reachable node hosts the tablet yet (group still forming) it falls back to all
-    nodes with a hint.
+    reachable node hosts the tablet yet (group still forming) the dropdown is empty
+    with a hint (the Load/Browse/inspect handlers no-op on an empty node).
     `tests/dashboard_endpoint.rs` proves serve + CORS + preflight + peers.
   - **The Write tab (ADR 0021) writes through the admin port.** `POST
     /admin/data/dynamo {op, payload}` reuses the DynamoDB edge in-process
