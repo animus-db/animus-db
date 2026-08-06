@@ -162,6 +162,30 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   or script driving it can decide to retry on error — the factored
   `propose_split_metadata`/`propose_split_data` steps exist so `auto_split_loop` can
   drive the retry itself instead of going through the combined one-shot helper.
+  **`propose_split_data` also confirms the split before reporting success** —
+  `leader.propose_split(split_key)` returning `ProposeResult::Accepted` only means
+  the entry was appended to the leader's local log, not that it committed (the same
+  caveat as every other CP-data write; see `cp_put_local`'s doc), and under leader
+  churn an accepted-but-uncommitted `Split` is silently truncated. Trusting
+  `Accepted` alone was a second, independent bug behind the same "tablet exists in
+  metadata but never gets a CP group" symptom the `pending` map above was built to
+  fix — a step-2 "success" that wasn't real never got queued for retry either. Fixed
+  by polling `RaftKvNode::applied_split_key()` (a confirm-by-key primitive, mirroring
+  `engine_applied_index`) via the new `confirm_split` helper, comparing the *exact*
+  key — not just "has this group split at all" — because under `--cluster N`'s
+  shared edge state two nodes' auto-split loops can independently compute a
+  *different* median for the same tablet in the same tick, and the group can only
+  split once: a bare boolean would let the loser's confirm wrongly pass. `cp_split_here`
+  (the forwarded-split handler) gets the same confirmation. Diagnosed with OpenTelemetry
+  tracing added specifically for this (spans on `auto_split`/`split_metadata`/
+  `split_data`/`cp_split_seed`/`cp_split_hook`) — the "accepted" log line looked
+  identical whether the split was real or not; only correlating it against
+  `/admin/raftkv` (no group ever appeared for several "accepted" splits) and the
+  split-hook trace (it never fired for those) surfaced the gap. The `pending` map's
+  retry also needed a matching update: a tablet whose own key lost the same-tick
+  race must be dropped from `pending` (not retried forever — the group will never
+  apply that key), detected via any local replica's `applied_split_key()` differing
+  from the pending key.
 - **The cluster's members are the CP `raftkv` nodes, not the control ids.** The
   control ids `0..N` are only the Raft *consensus group* for metadata; `bootstrap`
   (leader-only, idempotent) registers the **raftkv ids** (`300+i`) as `Active`

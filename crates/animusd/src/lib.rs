@@ -199,6 +199,21 @@ impl CpGroup {
         }
     }
 
+    /// The `at` key of this group's applied `Split` (at most once, ever), or
+    /// `None` — the confirm-by-key primitive a
+    /// [`propose_split`](Self::propose_split) caller must poll:
+    /// `ProposeResult::Accepted` only means the entry was appended to the leader's
+    /// local log, not that it committed, and comparing against the *specific* key
+    /// proposed (not just "has it split at all") is what catches a same-tick
+    /// same-tablet race where a *different* median won. See
+    /// [`RaftKvNode::applied_split_key`]'s doc.
+    fn applied_split_key(&self) -> Option<Vec<u8>> {
+        match self {
+            CpGroup::Lsm(n) => n.applied_split_key(),
+            CpGroup::Mem(n) => n.applied_split_key(),
+        }
+    }
+
     /// This node's live `(key, value)` pairs for the group, in key order, from the
     /// **local** engine (no quorum barrier). Meaningful on the leader (its committed
     /// state); the auto-split loop materializes it to confirm an over-threshold
@@ -1800,6 +1815,40 @@ impl ClientCtx {
         }
     }
 
+    /// Confirm a `propose_split(split_key)` that returned `Accepted` actually
+    /// committed **at that key** before trusting it — the split-path counterpart of
+    /// [`cp_put_local`](Self::cp_put_local)'s local-read confirm. `Accepted` only
+    /// means the `Split` entry was appended to the leader's local log, never that
+    /// it committed (see [`RaftKvNode::applied_split_key`]'s doc): under leader
+    /// churn the entry can be silently truncated before it commits. Comparing the
+    /// *exact* key (not just "has this group split at all") also catches a
+    /// narrower same-tick race: under `--cluster N`'s shared edge state, more than
+    /// one node can independently read this tablet's live pairs and compute a
+    /// *different* median in the same tick, then both propose a split on the same
+    /// group — the group splits once, so the loser's own key never applies even
+    /// though *a* split did. Skipping this check (or checking only a bare
+    /// split-happened flag) is exactly the bug that let `propose_split_data`
+    /// report success for a split that never actually happened at the caller's
+    /// key — the control-plane `SplitTablet` metadata was already committed by
+    /// that point (`propose_split_metadata`), so an unconfirmed "success"
+    /// permanently strands that tablet (`leader: unknown` forever, nothing left to
+    /// retry it). On timeout, return an error so the caller's retry path
+    /// (`auto_split_loop`'s `pending` map) engages instead.
+    async fn confirm_split(leader: &CpGroup, split_key: &[u8]) -> ClientResponse {
+        let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
+        let mut poll = CP_CONFIRM_POLL_INIT;
+        loop {
+            if leader.applied_split_key().as_deref() == Some(split_key) {
+                return ClientResponse::PutOk;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return ClientResponse::Error("CP split did not commit in time".into());
+            }
+            tokio::time::sleep(poll).await;
+            poll = (poll * 2).min(CP_CONFIRM_POLL_MAX);
+        }
+    }
+
     /// Map a forwarded-op reply that should be a bare ack into `Result<(), String>`.
     fn ok_or_err(resp: ClientResponse, what: &str) -> Result<(), String> {
         match resp {
@@ -2211,6 +2260,11 @@ struct CpHostCtx {
 /// the new tablet's group — itself carrying a hook (so the child can split again).
 fn cp_split_hook(host: CpHostCtx) -> SplitHook {
     Arc::new(move |at, handoff| {
+        tracing::info!(
+            base_id = host.base_id,
+            handoff_len = handoff.len(),
+            "cp_split_hook: apply fired the split hook, spawning cp_split_seed"
+        );
         tokio::spawn(cp_split_seed(host.clone(), at, handoff));
     })
 }
@@ -2226,7 +2280,13 @@ fn cp_split_hook(host: CpHostCtx) -> SplitHook {
 /// it for routing, records the durable marker, and publishes its address. **Idempotent
 /// per node** (the shared `minted` claim set), so the hook firing on every apply
 /// (incl. WAL re-apply on recovery) mints at most once.
+#[tracing::instrument(
+    name = "cp_split_seed",
+    skip(host, at, handoff),
+    fields(base_id = host.base_id, handoff_len = handoff.len(), new_tablet = tracing::field::Empty)
+)]
 async fn cp_split_seed(host: CpHostCtx, at: Vec<u8>, handoff: Vec<(Vec<u8>, Vec<u8>)>) {
+    tracing::info!("cp_split_seed: hook fired, resolving new tablet from metadata");
     // The new tablet is the one the trigger's `SplitTablet` created with range
     // starting exactly at the split key. Poll briefly for it to replicate here.
     let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
@@ -2248,6 +2308,12 @@ async fn cp_split_seed(host: CpHostCtx, at: Vec<u8>, handoff: Vec<(Vec<u8>, Vec<
         }
         tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
     };
+    tracing::Span::current().record("new_tablet", new_tablet.0);
+    tracing::info!(
+        new_tablet = new_tablet.0,
+        ?replicas,
+        "cp_split_seed: resolved new tablet"
+    );
 
     // Idempotent **per node**: mint this node's member of the new tablet only once
     // per process. (The per-node `minted` set, not the edge state — in a `--cluster N`
@@ -2256,12 +2322,18 @@ async fn cp_split_seed(host: CpHostCtx, at: Vec<u8>, handoff: Vec<(Vec<u8>, Vec<
     {
         let mut minted = host.minted.lock().expect("minted set poisoned");
         if !minted.insert(new_tablet) {
+            tracing::info!("cp_split_seed: already minted on this node, skipping");
             return;
         }
     }
 
     let new_members: Vec<NodeId> = cp_members_for(new_tablet, &replicas).into_iter().collect();
     let my_new_id = cp_member_id(host.base_id, new_tablet);
+    tracing::info!(
+        my_new_id,
+        ?new_members,
+        "cp_split_seed: minted claim taken, starting group"
+    );
 
     // A co-resident inbox for this node's member of the new group, drawn from the
     // pre-bound listener pool; its address is published for peer-sync. The new group
@@ -2301,6 +2373,7 @@ async fn cp_split_seed(host: CpHostCtx, at: Vec<u8>, handoff: Vec<(Vec<u8>, Vec<
         ),
     };
     host.ctx.edge.register_raftkv(new_tablet, cp);
+    tracing::info!("cp_split_seed: raftkv group registered in edge state");
 
     // Durably record that this node now hosts the new tablet's group on disk, so a
     // restart re-hosts it from its `db-t{id}-` engine (#2). Persist before the address
@@ -2325,6 +2398,7 @@ async fn cp_split_seed(host: CpHostCtx, at: Vec<u8>, handoff: Vec<(Vec<u8>, Vec<
     host.ctx
         .register_cp_addr(my_new_id, sibling_addr.to_string())
         .await;
+    tracing::info!("cp_split_seed: address published, split-seed complete");
 }
 
 /// Re-host a split-created CP tablet from its on-disk engine at node start (#2):
@@ -2753,10 +2827,15 @@ const AUTO_SPLIT_EST_ENTRY_BYTES: u64 = 32;
 ///
 /// The `pending` map closes this: a tablet whose step 1 committed but whose step 2
 /// hasn't yet succeeded is retried **every tick** with the *same* `split_key`
-/// (`propose_split_data` is idempotent, so replaying it is always safe) instead of
-/// being abandoned, and is skipped when scanning for *new* candidates below — so a
-/// still-unmoved source tablet can't mint a second orphan while the first split is
-/// still in flight.
+/// (`propose_split_data` is idempotent, so replaying it is always safe), and is
+/// skipped when scanning for *new* candidates below — so a still-unmoved source
+/// tablet can't mint a second orphan while the first split is still in flight. The
+/// one case a pending entry does *not* keep retrying forever: another proposer's
+/// key already won the group's one-time split (a same-tick redundant-median race —
+/// see `propose_split_data`'s confirm-by-key doc). That's detected and the entry is
+/// dropped rather than retried, since retrying a key that lost is guaranteed to
+/// never succeed and would otherwise wrongly exclude the tablet from
+/// `is_fresh_split_candidate` forever even after its data already moved.
 ///
 /// Whether `tablet` is a *fresh* auto-split candidate this tick — the pure decision
 /// half of the scan loop below, split out so the "don't start a second split while
@@ -2790,12 +2869,41 @@ async fn auto_split_loop(ctx: ClientCtx, threshold: usize) {
         tokio::time::sleep(AUTO_SPLIT_INTERVAL).await;
 
         for (tablet, split_key) in std::mem::take(&mut pending) {
-            if matches!(
-                ctx.propose_split_data(tablet, split_key.clone()).await,
-                ClientResponse::PutOk
-            ) {
+            let span = tracing::info_span!("auto_split", tablet = tablet.0, kind = "retry");
+            let response = ctx
+                .propose_split_data(tablet, split_key.clone())
+                .instrument(span)
+                .await;
+            if matches!(response, ClientResponse::PutOk) {
                 continue;
             }
+            // A different proposer's key may have already won this group's
+            // one-time split — the same-tick, same-tablet redundant-median race
+            // `propose_split_data`'s confirm-by-key check exists to catch (see its
+            // doc). Retrying *our* key forever would never succeed once that's
+            // happened (the group cannot split twice), and would wrongly keep
+            // this tablet excluded from `is_fresh_split_candidate` forever too,
+            // even though its data already moved under the winning split. Detect
+            // it via any local replica's applied key (set on every replica, not
+            // just the leader) and abandon rather than loop forever.
+            let abandoned = ctx
+                .edge
+                .local_cp(tablet)
+                .and_then(|g| g.applied_split_key())
+                .is_some_and(|applied| applied != split_key);
+            if abandoned {
+                tracing::info!(
+                    tablet = tablet.0,
+                    "auto_split: pending split lost a same-tick race to a different key; \
+                     abandoning (the tablet's data already moved under the winning split)"
+                );
+                continue;
+            }
+            tracing::warn!(
+                tablet = tablet.0,
+                ?response,
+                "auto_split: pending retry failed again, will retry next tick"
+            );
             pending.insert(tablet, split_key);
         }
 
@@ -2837,21 +2945,42 @@ async fn auto_split_loop(ctx: ClientCtx, threshold: usize) {
             // accepts it.
             let median = pairs[pairs.len() / 2].0.clone();
             last_triggered.insert(tablet, tokio::time::Instant::now());
-            match ctx.propose_split_metadata(tablet, median.clone()).await {
-                Ok(_new_id) => {
-                    if !matches!(
-                        ctx.propose_split_data(tablet, median.clone()).await,
-                        ClientResponse::PutOk
-                    ) {
-                        pending.insert(tablet, median);
+            let span = tracing::info_span!("auto_split", tablet = tablet.0, kind = "fresh");
+            async {
+                match ctx.propose_split_metadata(tablet, median.clone()).await {
+                    Ok(new_id) => {
+                        let response = ctx.propose_split_data(tablet, median.clone()).await;
+                        if matches!(response, ClientResponse::PutOk) {
+                            tracing::info!(
+                                tablet = tablet.0,
+                                new_id = new_id.0,
+                                "auto_split: split accepted"
+                            );
+                        } else {
+                            tracing::warn!(
+                                tablet = tablet.0,
+                                new_id = new_id.0,
+                                ?response,
+                                "auto_split: step 2 (propose_split) failed — new_id is now \
+                                 committed in metadata but leaderless; queued for retry"
+                            );
+                            pending.insert(tablet, median);
+                        }
+                    }
+                    Err(response) => {
+                        // Step 1 itself didn't commit — nothing was allocated, so
+                        // there's no orphan to track; the next tick's `hot` check
+                        // will naturally retry from scratch.
+                        tracing::warn!(
+                            tablet = tablet.0,
+                            ?response,
+                            "auto_split: step 1 (split metadata) did not commit"
+                        );
                     }
                 }
-                Err(_) => {
-                    // Step 1 itself didn't commit — nothing was allocated, so
-                    // there's no orphan to track; the next tick's `hot` check
-                    // will naturally retry from scratch.
-                }
             }
+            .instrument(span)
+            .await;
         }
     }
 }
@@ -3088,6 +3217,11 @@ impl ClientCtx {
     /// which drops step-2 errors on the floor and orphans the tablet for good).
     ///
     /// [`propose_split_data`]: Self::propose_split_data
+    #[tracing::instrument(
+        name = "split_metadata",
+        skip(self, split_key),
+        fields(tablet = tablet.0, new_id = tracing::field::Empty)
+    )]
     async fn propose_split_metadata(
         &self,
         tablet: TabletId,
@@ -3102,6 +3236,7 @@ impl ClientCtx {
         // can never reclaim). The apply also rejects a below-allocator id, so a
         // stale proposer cannot reintroduce reuse.
         let new_id = self.raft.metadata().next_free_tablet_id();
+        tracing::Span::current().record("new_id", new_id.0);
         let cmd = MetaCommand::SplitTablet {
             tablet,
             split_key,
@@ -3130,11 +3265,35 @@ impl ClientCtx {
     /// replaying this with the same `split_key` after a `NotLeader` / no-route /
     /// relay failure is safe — those failures mean the leader moved or was briefly
     /// unreachable, never that the split itself is invalid.
+    #[tracing::instrument(
+        name = "split_data",
+        skip(self, split_key),
+        fields(tablet = tablet.0, route = tracing::field::Empty)
+    )]
     async fn propose_split_data(&self, tablet: TabletId, split_key: Vec<u8>) -> ClientResponse {
-        match self.cp_route_tablet(tablet).await {
-            CpRoute::Local(leader) => match leader.propose_split(split_key) {
-                ProposeResult::Accepted { .. } => ClientResponse::PutOk,
+        let route = self.cp_route_tablet(tablet).await;
+        tracing::Span::current().record(
+            "route",
+            match route {
+                CpRoute::Local(_) => "local",
+                CpRoute::Forward(_) => "forward",
+                CpRoute::None => "none",
+            },
+        );
+        match route {
+            CpRoute::Local(leader) => match leader.propose_split(split_key.clone()) {
+                ProposeResult::Accepted { .. } => {
+                    let confirmed = Self::confirm_split(&leader, &split_key).await;
+                    if !matches!(confirmed, ClientResponse::PutOk) {
+                        tracing::warn!(
+                            ?confirmed,
+                            "accepted propose_split never committed (leader churn?)"
+                        );
+                    }
+                    confirmed
+                }
                 ProposeResult::NotLeader { .. } => {
+                    tracing::warn!("local route was stale: leader stepped down before propose");
                     ClientResponse::Error("CP group leader moved; retry the split".into())
                 }
             },
@@ -3142,16 +3301,24 @@ impl ClientCtx {
             // request, so relay it directly (its own top-level handler) — not via
             // `cp_forward`, which wraps in `Forwarded` (the Put/Get/Delete/Scan path).
             CpRoute::Forward(addr) => {
-                self.relay(
-                    addr,
-                    ClientRequest::CpSplit {
-                        tablet: tablet.0,
-                        split_key,
-                    },
-                )
-                .await
+                let response = self
+                    .relay(
+                        addr,
+                        ClientRequest::CpSplit {
+                            tablet: tablet.0,
+                            split_key,
+                        },
+                    )
+                    .await;
+                if !matches!(response, ClientResponse::PutOk) {
+                    tracing::warn!(%addr, ?response, "one-hop CpSplit relay did not succeed");
+                }
+                response
             }
             CpRoute::None => {
+                tracing::warn!(
+                    "no CP group leader reachable within cp_route_tablet's timeout budget"
+                );
                 ClientResponse::Error("no CP group leader for the tablet reachable".into())
             }
         }
@@ -3160,11 +3327,12 @@ impl ClientCtx {
     /// Serve the **data-plane half** of a split forwarded from another node (D2): this
     /// node must host `tablet`'s CP-group leader (one hop, no metadata, no re-forward).
     /// Proposes `propose_split` iff it leads, else errors so the client retries with
-    /// fresh routing.
+    /// fresh routing. Confirms the propose actually committed before reporting
+    /// success — see [`confirm_split`](Self::confirm_split)'s doc.
     async fn cp_split_here(&self, tablet: TabletId, split_key: Vec<u8>) -> ClientResponse {
         match self.edge.cp_leader(tablet) {
-            Some(leader) => match leader.propose_split(split_key) {
-                ProposeResult::Accepted { .. } => ClientResponse::PutOk,
+            Some(leader) => match leader.propose_split(split_key.clone()) {
+                ProposeResult::Accepted { .. } => Self::confirm_split(&leader, &split_key).await,
                 ProposeResult::NotLeader { .. } => {
                     ClientResponse::Error("CP group leader moved; retry the split".into())
                 }

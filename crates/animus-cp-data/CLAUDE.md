@@ -247,7 +247,21 @@ the engine — the `AccordCore` sync-core/async-driver split.
   group's ids are derived in `animusd` rather than allocated by the control plane's
   `SplitTablet`, and `Metadata.tablets[new].replicas` records the parent's base ids,
   not the derived member ids (the data plane translates per tablet) — fine for
-  realistic clusters.
+  realistic clusters. **`propose_split`'s `ProposeResult::Accepted` is not
+  confirmation** — like every proposal here, it only means the entry was appended
+  to the leader's local log; a caller must poll
+  [`applied_split_key`](RaftKvNode::applied_split_key) (an `Arc<Mutex<Option<Vec<u8>>>>`
+  set once by the apply task, alongside `engine_applied`) before trusting it, the
+  same way `engine_applied_index` is polled to confirm a write. `animusd`'s
+  `propose_split_data`/`cp_split_here` learned this the hard way: trusting
+  `Accepted` let an accepted-but-never-committed `Split` (truncated by leader churn)
+  report false success, permanently stranding the tablet its metadata layer had
+  already created. **The confirmation must compare the *exact* key, not just "has
+  this group split"**: a group splits at most once, so if two callers race with
+  *different* keys on the same tablet (a real scenario under `animusd`'s
+  `--cluster N` shared-edge redundant triggering — see its `CLAUDE.md`), the loser's
+  bare "did *a* split happen" check would pass even though its own key never
+  applied.
 
 ## Tests
 

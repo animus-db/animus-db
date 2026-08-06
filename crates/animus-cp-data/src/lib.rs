@@ -238,6 +238,35 @@ pub struct RaftKvNode<E: Env, S: StorageEngine> {
     /// merging them into the engine — so linearizable reads gate on *this* (engine
     /// progress), never `last_applied`, or they could read past the engine's state.
     engine_applied: Arc<AtomicU64>,
+    /// The `at` key of this group's applied `Split` command (it applies **at most
+    /// once, ever**), or `None` before that — set by the apply task, mirroring
+    /// `engine_applied`'s "publish async apply progress for a sync accessor" shape.
+    /// This is the **confirm-by-key** primitive
+    /// [`propose_split`](RaftKvNode::propose_split)'s callers must use: like every
+    /// other proposal here, `Accepted` only means "appended to the leader's local
+    /// log," not committed — an accepted-but-not-yet-committed `Split` entry is
+    /// silently truncated if leadership moves before it commits, exactly like a
+    /// `put`/`delete` (see `engine_applied_index`'s doc). A caller that trusts
+    /// `Accepted` alone for a split never notices the truncation, and (since the
+    /// split trigger already committed a *control-plane* metadata command
+    /// describing the would-be new tablet before ever calling this) permanently
+    /// strands that tablet — `leader: unknown` forever.
+    ///
+    /// **The key, not just a flag, matters**: under `--cluster N`'s shared edge
+    /// state, more than one node's auto-split loop can independently read this
+    /// group's live pairs and compute a *different* median for the *same* tablet
+    /// in the same tick (the pairs can shift between two racing reads if writes are
+    /// still landing), then both propose a `Split` at their own key. Only the first
+    /// to commit actually mutates state; the group can split **at most once**, so
+    /// the loser's `Split` applies as a no-op. A loser polling a bare "did *a*
+    /// split happen" boolean would see it flip true and wrongly report success for
+    /// a key that was never applied. Comparing against the *specific* key this
+    /// field records is what catches that.
+    ///
+    /// Poll [`applied_split_key`](RaftKvNode::applied_split_key) (bounded, backing
+    /// off) for equality with the proposed key after an `Accepted` propose, the
+    /// same way `engine_applied_index` is polled to confirm a write.
+    applied_split_key: Arc<Mutex<Option<Vec<u8>>>>,
     /// Set by [`shutdown`](Self::shutdown); both the consensus loop and the apply
     /// task observe it and exit.
     halted: Arc<AtomicBool>,
@@ -332,6 +361,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         let stopped = Arc::new(AtomicBool::new(false));
         let apply_stopped = Arc::new(AtomicBool::new(false));
         let engine_applied = Arc::new(AtomicU64::new(0));
+        let applied_split_key: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
         let wal_lock = Arc::new(AsyncMutex::new(()));
         let propose_signal = Arc::new(ProposeSignal::default());
         let node = Self {
@@ -342,6 +372,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             reads: Arc::clone(&reads),
             cas: Arc::clone(&cas),
             engine_applied: Arc::clone(&engine_applied),
+            applied_split_key: Arc::clone(&applied_split_key),
             halted: Arc::clone(&halted),
             stopped: Arc::clone(&stopped),
             apply_stopped: Arc::clone(&apply_stopped),
@@ -359,6 +390,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             reads,
             cas,
             engine_applied,
+            applied_split_key,
             wal_lock,
             on_split,
             halted,
@@ -893,6 +925,20 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         self.engine_applied.load(Ordering::SeqCst)
     }
 
+    /// The `at` key of this group's applied `Split` (it applies at most once,
+    /// ever), or `None` if it hasn't split yet. The **confirm-by-key** primitive
+    /// [`propose_split`](Self::propose_split)'s callers must poll — comparing
+    /// against the *specific* key proposed, not just checking "has it split at
+    /// all" — after an `Accepted` propose; see `applied_split_key`'s doc for why
+    /// trusting `Accepted` (or a bare split-happened flag) alone silently strands
+    /// a split whose key lost a same-tick race to a different proposer's.
+    pub fn applied_split_key(&self) -> Option<Vec<u8>> {
+        self.applied_split_key
+            .lock()
+            .expect("raftkv applied_split_key poisoned")
+            .clone()
+    }
+
     /// Highest log index known durable on disk (durable-before-visible frontier).
     pub fn durable_index(&self) -> u64 {
         self.lock().durable_index()
@@ -930,9 +976,11 @@ impl<E: Coresident, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// no external handoff.
     ///
     /// The hook fires **at most once** per group, regardless of how many `Split`
-    /// commands are proposed or committed: `apply_and_compact`'s `already_split`
-    /// flag makes every application after the first a no-op (it never recomputes
-    /// the handoff, never re-invokes the hook), so a WAL replay after a crash
+    /// commands are proposed or committed: `apply_and_compact`'s `applied_split_key`
+    /// (also the [`applied_split_key`](Self::applied_split_key) confirm-by-key
+    /// primitive, gated on it already being `Some`) makes every application after
+    /// the first a no-op (it never recomputes the handoff, never re-invokes the
+    /// hook), so a WAL replay after a crash
     /// recovery — or a genuinely duplicate `Split` commit, e.g. from a caller that
     /// proposes a split more than once — cannot mint the sibling twice or hand it an
     /// already-tombstoned (empty) range. See
@@ -1053,10 +1101,10 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
     cas: &Arc<Mutex<CasResults>>,
     on_split: &Option<SplitHook>,
     engine_applied: &AtomicU64,
+    applied_split_key: &Mutex<Option<Vec<u8>>>,
     wal_lock: &AsyncMutex<()>,
     halted: &AtomicBool,
     metrics: &MetricsHandle,
-    already_split: &mut bool,
 ) -> bool {
     let mut did_work = false;
 
@@ -1178,7 +1226,11 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 // retry after a leader failover would hit the same guard, since WAL
                 // replay applies through this identical path and sets the flag before
                 // any duplicate already in the log is ever reached).
-                if !*already_split {
+                if applied_split_key
+                    .lock()
+                    .expect("raftkv applied_split_key poisoned")
+                    .is_none()
+                {
                     // Drain the pending run so the handoff capture below sees every
                     // earlier committed write in this apply pass.
                     flush_pending(storage, &mut pending, metrics).await;
@@ -1204,7 +1256,9 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                         .merge_batch(tombstones)
                         .await
                         .expect("raftkv apply split tombstones");
-                    *already_split = true;
+                    *applied_split_key
+                        .lock()
+                        .expect("raftkv applied_split_key poisoned") = Some(at.clone());
                 }
             }
             KvCommand::NoOp => {}
@@ -1403,6 +1457,7 @@ struct DriveState<E: Env, S: StorageEngine> {
     reads: Arc<Mutex<ReadState>>,
     cas: Arc<Mutex<CasResults>>,
     engine_applied: Arc<AtomicU64>,
+    applied_split_key: Arc<Mutex<Option<Vec<u8>>>>,
     wal_lock: Arc<AsyncMutex<()>>,
     on_split: Option<SplitHook>,
     halted: Arc<AtomicBool>,
@@ -1435,6 +1490,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         reads,
         cas,
         engine_applied,
+        applied_split_key,
         wal_lock,
         on_split,
         halted,
@@ -1470,6 +1526,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         cas,
         on_split,
         Arc::clone(&engine_applied),
+        applied_split_key,
         Arc::clone(&wal_lock),
         Arc::clone(&halted),
         apply_stopped,
@@ -1604,18 +1661,19 @@ async fn apply_loop<E: Env, S: StorageEngine>(
     cas: Arc<Mutex<CasResults>>,
     on_split: Option<SplitHook>,
     engine_applied: Arc<AtomicU64>,
+    applied_split_key: Arc<Mutex<Option<Vec<u8>>>>,
     wal_lock: Arc<AsyncMutex<()>>,
     halted: Arc<AtomicBool>,
     apply_stopped: Arc<AtomicBool>,
     metrics: MetricsHandle,
 ) {
-    // Owned by this task alone (the sole apply-loop instance for the group), so a
-    // plain `bool` — set true the first time this task applies a `Split` — suffices;
-    // no `Arc`/atomic needed. It persists across loop iterations (declared outside
-    // the `loop`), including a full WAL replay after restart: the recovered log
-    // applies through this same loop before any live command, so a replayed `Split`
-    // sets the flag exactly as a live one would.
-    let mut already_split = false;
+    // `applied_split_key` is shared (not a task-local `Option<Vec<u8>>`) so
+    // `RaftKvNode::applied_split_key` can observe it — the confirm-by-key primitive
+    // `propose_split`'s callers must poll (see its doc). It persists across loop
+    // iterations by construction (an `Arc` handed in once), including a full WAL
+    // replay after restart: the recovered log applies through this same loop
+    // before any live command, so a replayed `Split` sets the key exactly as a
+    // live one would.
     loop {
         if halted.load(Ordering::SeqCst) {
             apply_stopped.store(true, Ordering::SeqCst);
@@ -1628,10 +1686,10 @@ async fn apply_loop<E: Env, S: StorageEngine>(
             &cas,
             &on_split,
             &engine_applied,
+            &applied_split_key,
             &wal_lock,
             &halted,
             &metrics,
-            &mut already_split,
         )
         .await;
         if !did_work {
