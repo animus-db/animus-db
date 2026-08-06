@@ -35,6 +35,7 @@
 <nav class="secondary" data-group="monitoring">
   <button data-tab="nodes" class="active">Nodes</button>
   <button data-tab="tablets">Tablets</button>
+  <button data-tab="topology">Topology</button>
   <button data-tab="storage">Storage</button>
 </nav>
 <main>
@@ -49,6 +50,17 @@
     <div class="card scroll">
       <h2>Tablet map</h2>
       <div id="tablets-body"><div class="empty">loading…</div></div>
+    </div>
+  </section>
+
+  <section id="topology">
+    <div class="row">
+      <label>filter</label><input type="text" id="topo-filter" placeholder="table or tablet id">
+    </div>
+    <div class="card">
+      <h2>Tablets by leader</h2>
+      <div class="muted" style="margin-bottom:10px">Grouped by which node currently leads each tablet's CP group — a leaderless tablet can't serve reads or writes, so it gets its own lane. Click a tablet to jump to its Storage detail.</div>
+      <div id="topology-body"><div class="empty">loading…</div></div>
     </div>
   </section>
 
@@ -190,6 +202,7 @@ $("global-table").addEventListener("change", onGlobalTableChange);
 $("st-tablet").addEventListener("change", () => { updateStorageNodeOptions(); syncStorageUrl(); });
 $("st-node").addEventListener("change", syncStorageUrl);
 $("st-load").addEventListener("click", () => { loadStorage(); syncStorageUrl(); });
+$("topo-filter").addEventListener("input", () => { topoFilter = $("topo-filter").value; renderTopology(); });
 $("scan-load").addEventListener("click", browseKeys);
 $("key-load").addEventListener("click", inspectKey);
 $("dy-add-attr").addEventListener("click", () => addAttrRow());
