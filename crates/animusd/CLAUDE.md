@@ -356,7 +356,8 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   is captured into `ClientCtx.admin` (an `AdminInfo`). **No auth yet** — bind it to a
   trusted interface. The `animus admin <subcommand>` CLI consumes it.
   - **The web dashboard (ADR 0021)** is served from the same port: `GET /` (and the
-    `/admin`, `/admin/ui` aliases) returns a self-contained vanilla-JS SPA embedded
+    `/admin`, `/admin/ui` aliases, plus any `/admin/ui/<tab>` — see real-URL
+    routing below) returns a self-contained vanilla-JS SPA embedded
     via `include_str!` (`dashboard.rs` → `dashboard.html`) — no bundler/npm, the
     build stays `cargo`-only. It is a pure **client** of the `/admin/*` JSON, so
     every `/admin/*` response now carries **CORS** (`http::CORS_HEADERS`, spliced via
@@ -367,6 +368,17 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
     so they are threaded into `AdminInfo.admin_addrs` (via a new `start_with`
     param) rather than the browser guessing ports. Read-only for now (nodes/tablets/
     WAL/data panels); operator-action UI + the ADR 0018 transaction view are next.
+    **Each top-level tab has a real URL** (ADR 0021 follow-up 7): `/admin/ui/<tab>`
+    for `nodes`/`tablets`/`storage`/`write`. `admin.rs::is_ui_path` serves the SPA
+    for any path under that prefix (a `starts_with`, not an exact match — an
+    unrecognized tab name still 200s and falls back to the default tab
+    client-side, so a stale/typo'd bookmark degrades gracefully instead of
+    404ing); the page itself reads `location.pathname` on load
+    (`dashboard.html`'s `tabFromPath`/`activateTab`) and uses
+    `history.pushState`/`popstate` so a nav click adds a history entry, a
+    refresh/bookmark reopens the same tab, and the browser back/forward buttons
+    work. Sub-tab state (storage's selected tablet/node, the Write panel's
+    op/table) is **not** in the URL yet.
     The data panel has both a single-key inspector (`/admin/storage/key`) and a
     **browse-keys** list (`/admin/storage/scan` → `CpGroup::local_scan`, first N live
     pairs `>= start`; click a key to send it to the inspector). The Storage tab's
@@ -581,7 +593,8 @@ views config/status/raft/raftkv/storage·wal/metrics/health over the dedicated a
 port + the `storage/flush` action observed via `storage/lsm`; metrics asserted on
 the control leader since sinks are per-node; bring-up wrapped in the port-TOCTOU
 retry), `tests/dashboard_endpoint.rs` (the web dashboard, ADR 0021: `GET /` serves
-the embedded SPA as `text/html`, `/admin/*` responses carry the CORS header, an
+the embedded SPA as `text/html`, every `/admin/ui/<tab>` deep link (incl. an
+unrecognized tab name) also serves it, `/admin/*` responses carry the CORS header, an
 `OPTIONS` preflight returns 204, and `/admin/peers` lists all 3 nodes' admin
 addresses — the fan-out seed), and `tests/self_heal.rs` (a
 concurrent-client smoke test that the assembled node does not deadlock under load).
