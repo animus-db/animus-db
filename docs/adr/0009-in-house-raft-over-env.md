@@ -135,3 +135,57 @@ replication to that follower (the entry has to *arrive* and commit there first).
 The cure is the same everywhere: wait for the replicated definition on the target
 node before reading it (`await_table_schema`/`await_table_index` in the `animusd`
 tests), exactly as the restart tests already do.
+
+## Pre-vote + a configurable election timeout (spurious-election hardening — done)
+
+**The problem.** Under write load a per-tablet CP Raft group (which reuses this
+same `RaftCore`, ADR 0016) suffered a **leader-election storm**: the term climbed
+continuously (1 → 37 in a few seconds) because a replica whose async driver was
+briefly busy (real disk I/O) missed a heartbeat window, timed out, and **campaigned
+— incrementing the term** — disrupting a perfectly healthy leader and truncating
+in-flight writes. A single stalled/partitioned node repeatedly bumping the cluster
+term is the exact failure mode standard Raft's **pre-vote** extension exists to
+prevent.
+
+**The fix (shipped): pre-vote.** Before a node increments its term to start a real
+election it runs a **pre-vote round** as a new `Role::PreCandidate`. It solicits
+`RaftMsg::PreVote { term = current_term + 1, .. }` from its peers **without**
+bumping its term or casting a real vote. A peer grants a pre-vote only if it would
+actually vote: it has **no live leader** (not a leader itself, and not a follower
+still within its election timeout of the last heartbeat — the leader lease), the
+candidate's prospective term is not behind, and the candidate's log is at least as
+up to date. Only on a **pre-vote majority** does the node call the existing
+`start_election` (which increments the term, becomes `Candidate`, and sends real
+`RequestVote`s). Key invariants that make it safe and deterministic:
+
+- **A pre-vote never changes any node's term.** Both `PreVote` and `PreVoteResp`
+  bypass the "step down on a higher term" rule in `handle`; the *only* place a
+  pre-candidate adopts a newer term is a **rejecting** `PreVoteResp` carrying a
+  higher real term (it learns it is behind and reverts to a plain follower at that
+  term — never beyond it). So a partitioned node loops through harmless pre-vote
+  rounds and can neither inflate its own term nor a healthy peer's.
+- **The leader lease is `leader_id.is_some() && now < election_deadline`** (plus
+  `role == Leader` for the leader itself) — data the core already tracks, evaluated
+  at the injected `now`, so the whole decision stays a pure function of
+  `(state, message, now, entropy)`. No clock, no `HashMap`, no I/O.
+- **Single-node / trivial-majority groups still elect immediately:** `start_pre_vote`
+  short-circuits to `start_election` when self alone is already a pre-vote majority.
+
+Pre-vote rides the shared `RaftMsg` enum additively, so **both** planes (control +
+`animus-cp-data`) keep their wire formats; the cp-data driver forwards the new
+variants through `KvWire::Raft` unchanged.
+
+**Configurable election timeout.** `RaftCore::set_election_timeout(base, now,
+entropy)` sets the election-timeout base (still randomized in `[base, 2*base)`,
+default 150ms) and re-arms the timer, so the assembly layer can **widen** it for a
+node doing real disk I/O — cutting the rate of spurious timeouts at the source,
+complementary to pre-vote (which makes any timeout that does slip through
+non-disruptive).
+
+Coverage: `tests/pre_vote.rs` — core-level (a live-leader lease rejects a pre-vote
+and the term is untouched; an expired lease grants; a timeout makes a pre-candidate
+without bumping the term) and end-to-end under `SimEnv` (an isolated follower's
+pre-vote rounds do not move the stable leader's term, and it rejoins on heal with
+no election; a genuine leader crash still elects a new leader at a higher term).
+The pre-existing hand-driven election tests (`follower_visibility`,
+`install_snapshot`, `driver_applied_sm`) now drive the pre-vote round explicitly.

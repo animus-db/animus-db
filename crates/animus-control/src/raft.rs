@@ -94,6 +94,25 @@ pub struct LogEntry<C = MetaCommand> {
 /// carries commands; `InstallSnapshot` ships the snapshot as opaque bytes.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum RaftMsg<C = MetaCommand> {
+    /// A **pre-candidate** solicits a *pre-vote* (the standard Raft pre-vote
+    /// extension). `term` is the candidate's **prospective** term (its
+    /// `current_term + 1`); crucially, neither sending nor receiving a pre-vote
+    /// changes any node's term, so a partitioned/stalled node running pre-vote
+    /// rounds can never inflate the cluster's term or disrupt a healthy leader. A
+    /// peer grants only if it would actually vote (no live leader within its
+    /// election timeout and the candidate's log is at least as up to date). Rides
+    /// the same `RaftMsg` wire enum additively, so both planes keep working.
+    PreVote {
+        term: u64,
+        candidate: NodeId,
+        last_log_index: u64,
+        last_log_term: u64,
+    },
+    /// Response to [`RaftMsg::PreVote`]. On a grant, `term` echoes the requested
+    /// prospective term; on a reject it is the responder's own (real) term, so a
+    /// stale pre-candidate learns it is behind. Never advances the recipient's term
+    /// beyond a *rejecting* responder's real term.
+    PreVoteResp { term: u64, granted: bool },
     /// Candidate solicits a vote.
     RequestVote {
         term: u64,
@@ -171,7 +190,9 @@ impl<C> RaftMsg<C> {
     /// step-down); the driver intercepts heartbeats before the core sees one.
     fn term(&self) -> u64 {
         match self {
-            RaftMsg::RequestVote { term, .. }
+            RaftMsg::PreVote { term, .. }
+            | RaftMsg::PreVoteResp { term, .. }
+            | RaftMsg::RequestVote { term, .. }
             | RaftMsg::RequestVoteResp { term, .. }
             | RaftMsg::AppendEntries { term, .. }
             | RaftMsg::AppendEntriesResp { term, .. }
@@ -186,6 +207,13 @@ impl<C> RaftMsg<C> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
     Follower,
+    /// Running a **pre-vote** round (the standard Raft extension): the node has
+    /// timed out on its leader but has **not** incremented its term. It solicits
+    /// [`PreVote`](RaftMsg::PreVote)s and only advances to [`Candidate`](Role::Candidate)
+    /// — bumping the term — once a majority would actually vote for it. This keeps
+    /// a briefly-partitioned/stalled node from repeatedly bumping the cluster's
+    /// term and disrupting a healthy leader.
+    PreCandidate,
     Candidate,
     Leader,
 }
@@ -262,6 +290,9 @@ pub struct RaftCore<C = MetaCommand, S = Metadata> {
     durable_index: u64,
     leader_id: Option<NodeId>,
 
+    // Pre-candidate state: nodes that have granted the current pre-vote round.
+    // Rebuilt each `start_pre_vote`; only read while `role == PreCandidate`.
+    pre_votes: BTreeSet<NodeId>,
     // Candidate state.
     votes: BTreeSet<NodeId>,
     // Leader state.
@@ -276,6 +307,9 @@ pub struct RaftCore<C = MetaCommand, S = Metadata> {
     incoming_snapshot: Option<IncomingSnapshot>,
 
     // Timing (virtual). Election timeout is randomized in `[base, 2*base)`.
+    // `election_base` is configurable via [`set_election_timeout`](RaftCore::set_election_timeout)
+    // so the assembly layer can widen it for a node doing real disk I/O (whose
+    // driver may briefly stall past the default 150ms); defaults to 150ms.
     election_base: Duration,
     heartbeat_interval: Duration,
     election_deadline: Nanos,
@@ -340,6 +374,7 @@ where
             last_applied: 0,
             durable_index: 0,
             leader_id: None,
+            pre_votes: BTreeSet::new(),
             votes: BTreeSet::new(),
             next_index: BTreeMap::new(),
             match_index: BTreeMap::new(),
@@ -776,6 +811,25 @@ where
         ProposeResult::Accepted { index }
     }
 
+    /// Set the **election-timeout base** and re-arm the election timer from `now`.
+    /// The randomized timeout is drawn from `[base, 2*base)` (as always); widening
+    /// `base` makes this node slower to campaign, which the assembly layer wants
+    /// for a node whose driver does real disk I/O and may briefly stall past the
+    /// 150ms default (that stall would otherwise trigger a spurious election and,
+    /// with pre-vote, at least a spurious pre-vote round). Additive: existing
+    /// callers keep the 150ms default. Deterministic — timing comes from the
+    /// injected `now`/`entropy`, never a wall clock.
+    pub fn set_election_timeout(&mut self, base: Duration, now: Nanos, entropy: u64) {
+        self.election_base = base;
+        self.reset_election_timer(now, entropy);
+    }
+
+    /// The current election-timeout base (the low end of the randomized range).
+    #[must_use]
+    pub fn election_timeout(&self) -> Duration {
+        self.election_base
+    }
+
     fn reset_election_timer(&mut self, now: Nanos, entropy: u64) {
         let base = self.election_base.as_nanos() as u64;
         let extra = if base == 0 { 0 } else { entropy % base };
@@ -828,9 +882,15 @@ where
                 }
                 Vec::new()
             }
-            Role::Follower | Role::Candidate => {
+            Role::Follower | Role::PreCandidate | Role::Candidate => {
                 if now.0 >= self.election_deadline.0 {
-                    return self.start_election(now, entropy);
+                    // Run a **pre-vote** round first (ADR 0009): a node whose driver
+                    // briefly stalled past the timeout probes whether it *could* win
+                    // before incrementing the term, so it can't disrupt a healthy
+                    // leader. A pre-candidate whose round timed out simply restarts
+                    // it; a candidate that failed a real election falls back to a
+                    // fresh pre-vote (never straight to another term bump).
+                    return self.start_pre_vote(now, entropy);
                 }
                 Vec::new()
             }
@@ -859,14 +919,30 @@ where
         now: Nanos,
         entropy: u64,
     ) -> Vec<Out<C>> {
-        // Any message from a higher term forces us to step down first.
-        if msg.term() > self.current_term {
+        // Any message from a higher term forces us to step down first — **except**
+        // pre-vote traffic, which by design never changes a node's term (a pre-vote
+        // carries only a *prospective* term). Bypassing the step-down here is what
+        // makes pre-vote safe: a partitioned node's pre-vote round can never bump a
+        // healthy peer's term. A rejecting `PreVoteResp` with a higher term is the
+        // one place a pre-candidate adopts a newer term (handled in
+        // `handle_pre_vote_resp`), and never beyond the responder's real term.
+        let is_pre_vote = matches!(msg, RaftMsg::PreVote { .. } | RaftMsg::PreVoteResp { .. });
+        if !is_pre_vote && msg.term() > self.current_term {
             self.current_term = msg.term();
             self.voted_for = None;
             self.role = Role::Follower;
             self.leader_id = None;
         }
         match msg {
+            RaftMsg::PreVote {
+                term,
+                candidate,
+                last_log_index,
+                last_log_term,
+            } => self.handle_pre_vote(candidate, term, last_log_index, last_log_term, now),
+            RaftMsg::PreVoteResp { term, granted } => {
+                self.handle_pre_vote_resp(from, term, granted, now, entropy)
+            }
             RaftMsg::RequestVote {
                 term,
                 candidate,
@@ -954,6 +1030,79 @@ where
     }
 
     // ---- message handlers ------------------------------------------------
+
+    /// Answer a [`PreVote`](RaftMsg::PreVote). This is a **read-only** decision: it
+    /// never mutates term/vote/role/timer, so a pre-vote round can never disrupt
+    /// this node. Grant only if we would actually vote for the candidate:
+    ///
+    /// - we do **not** currently have a live leader (a leader ourselves, or a
+    ///   follower still within its election timeout of the last heartbeat, is
+    ///   protected — this is the leader-lease that stops a partitioned node from
+    ///   winning a pre-vote and forcing an election);
+    /// - the candidate's prospective `term` is not behind ours; and
+    /// - the candidate's log is at least as up to date as ours.
+    fn handle_pre_vote(
+        &mut self,
+        candidate: NodeId,
+        term: u64,
+        last_log_index: u64,
+        last_log_term: u64,
+        now: Nanos,
+    ) -> Vec<Out<C>> {
+        let has_live_leader = self.role == Role::Leader
+            || (self.leader_id.is_some() && now.0 < self.election_deadline.0);
+        let log_ok = last_log_term > self.last_log_term()
+            || (last_log_term == self.last_log_term() && last_log_index >= self.last_log_index());
+        let granted = !has_live_leader && term >= self.current_term && log_ok;
+        vec![(
+            candidate,
+            RaftMsg::PreVoteResp {
+                // Grant echoes the prospective term (so the pre-candidate correlates
+                // it to its round); a reject reports our real term (so a stale
+                // pre-candidate learns it is behind).
+                term: if granted { term } else { self.current_term },
+                granted,
+            },
+        )]
+    }
+
+    /// Tally a [`PreVoteResp`](RaftMsg::PreVoteResp). Only meaningful while we are a
+    /// pre-candidate for this exact round (`term == current_term + 1`). On reaching
+    /// a pre-vote majority we start the **real**, term-incrementing election. A
+    /// rejecting response carrying a higher term tells us we are behind, so we step
+    /// down to a plain follower at that term (never beyond it) and let normal
+    /// replication catch us up.
+    fn handle_pre_vote_resp(
+        &mut self,
+        from: NodeId,
+        term: u64,
+        granted: bool,
+        now: Nanos,
+        entropy: u64,
+    ) -> Vec<Out<C>> {
+        if self.role != Role::PreCandidate {
+            return Vec::new();
+        }
+        if granted {
+            if term == self.current_term + 1 {
+                self.pre_votes.insert(from);
+                if self.pre_votes.len() >= self.majority() {
+                    return self.start_election(now, entropy);
+                }
+            }
+        } else if term > self.current_term {
+            // We are behind the responder; adopt its term as a follower and stop
+            // pre-campaigning (a higher-term *reject* is the only pre-vote message
+            // that moves our term — and only up to the responder's real term).
+            self.current_term = term;
+            self.voted_for = None;
+            self.role = Role::Follower;
+            self.leader_id = None;
+            self.pre_votes.clear();
+            self.reset_election_timer(now, entropy);
+        }
+        Vec::new()
+    }
 
     fn handle_request_vote(
         &mut self,
@@ -1338,6 +1487,52 @@ where
     }
 
     // ---- role transitions & replication ---------------------------------
+
+    /// Begin a **pre-vote** round (ADR 0009): become a [`PreCandidate`](Role::PreCandidate)
+    /// **without** touching the term or casting a real vote, and solicit
+    /// [`PreVote`](RaftMsg::PreVote)s for the prospective term (`current_term + 1`).
+    /// The real, term-incrementing election starts only once a majority pre-votes
+    /// (see [`handle_pre_vote_resp`](Self::handle_pre_vote_resp)); a lone
+    /// partitioned/stalled node thus loops through harmless pre-vote rounds instead
+    /// of ratcheting the cluster's term.
+    fn start_pre_vote(&mut self, now: Nanos, entropy: u64) -> Vec<Out<C>> {
+        // A node removed from the configuration must not campaign (mirrors
+        // `start_election`): it can't win and would only disrupt the survivors.
+        if !self.is_voter() {
+            self.reset_election_timer(now, entropy);
+            return Vec::new();
+        }
+        self.role = Role::PreCandidate;
+        // The election timer expired ⇒ we no longer believe in a live leader; drop
+        // the hint so we will grant *others'* pre-votes this round too. Term and
+        // vote are deliberately untouched.
+        self.leader_id = None;
+        self.pre_votes.clear();
+        self.pre_votes.insert(self.id);
+        self.reset_election_timer(now, entropy);
+
+        // Single-node (or otherwise already a majority): skip straight to the real
+        // election, which becomes leader immediately.
+        if self.pre_votes.len() >= self.majority() {
+            return self.start_election(now, entropy);
+        }
+        let (lli, llt) = (self.last_log_index(), self.last_log_term());
+        let prospective = self.current_term + 1;
+        self.peers
+            .iter()
+            .map(|&p| {
+                (
+                    p,
+                    RaftMsg::PreVote {
+                        term: prospective,
+                        candidate: self.id,
+                        last_log_index: lli,
+                        last_log_term: llt,
+                    },
+                )
+            })
+            .collect()
+    }
 
     fn start_election(&mut self, now: Nanos, entropy: u64) -> Vec<Out<C>> {
         // A node removed from the configuration must not campaign (it cannot win
