@@ -511,3 +511,103 @@ async fn tablet_auto_splits_when_it_grows() {
         n.shutdown();
     }
 }
+
+/// Regression: a `RaftKvNode` group applies **at most one** `Split`, ever (see
+/// `KvCommand::Split`'s apply-time guard in `animus-cp-data`) — once a tablet's
+/// own group has split, its remaining range is permanently frozen at that
+/// boundary even though it can keep absorbing writes. Before this test's fix,
+/// `auto_split_loop` didn't account for that: a still-growing already-split
+/// tablet re-tripped the size threshold every cooldown window, and each
+/// attempt minted a brand-new `SplitTablet` metadata entry (step 1) that could
+/// never get a CP group (step 2 can never confirm a second split against an
+/// already-split group) — an unbounded pileup of leaderless orphan tablets,
+/// live-observed hanging a bulk seed indefinitely. This proves the tablet
+/// count stops growing once the one split that *can* succeed has happened,
+/// even after more auto-split ticks elapse with the original tablet still
+/// over threshold.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn already_split_tablet_is_not_retried_forever() {
+    let dir = tempfile::tempdir().unwrap();
+    let bound = bind_cluster(3, "127.0.0.1".parse().unwrap(), dir.path())
+        .await
+        .unwrap();
+    let nodes = start_cluster_auto_split(bound, 16).await.unwrap();
+    await_bootstrap(&nodes).await;
+    let addr0 = nodes[0].client_addr();
+
+    async fn put(addr0: std::net::SocketAddr, key: Vec<u8>, value: Vec<u8>) {
+        loop {
+            match call(
+                addr0,
+                ClientRequest::Put {
+                    key: key.clone(),
+                    value: value.clone(),
+                    table: "kv".to_string(),
+                },
+            )
+            .await
+            {
+                ClientResponse::PutOk => return,
+                ClientResponse::Error(_) => sleep(Duration::from_millis(100)).await,
+                other => panic!("unexpected put: {other:?}"),
+            }
+        }
+    }
+
+    // First 24 keys trip the threshold and the tablet auto-splits once.
+    for i in 0..24u32 {
+        let key = format!("key{i:02}").into_bytes();
+        let value = format!("v{i}").into_bytes();
+        timeout(Duration::from_secs(20), put(addr0, key, value))
+            .await
+            .unwrap_or_else(|_| panic!("write key{i:02} timed out"));
+    }
+
+    let auto_split = async {
+        loop {
+            if nodes.iter().all(|n| n.metadata().tablets.len() >= 2) {
+                return;
+            }
+            sleep(Duration::from_millis(200)).await;
+        }
+    };
+    timeout(Duration::from_secs(30), auto_split)
+        .await
+        .expect("tablet did not auto-split within 30s");
+    let tablet_count_after_first_split = nodes[0].metadata().tablets.len();
+
+    // Keep writing keys that sort *below* every `key##` key already written —
+    // the split's median falls somewhere inside `key00..key23`, so every
+    // `aaa##` key lands below it, in the original tablet's lower range (the
+    // one whose group already spent its one-time split). Deliberately
+    // avoiding new keys in the *upper* range keeps this test isolated to the
+    // already-split tablet: the sibling tablet legitimately splitting for its
+    // own first time would be correct behavior, not a regression.
+    for i in 0..40u32 {
+        let key = format!("aaa{i:02}").into_bytes();
+        let value = format!("v{i}").into_bytes();
+        timeout(Duration::from_secs(20), put(addr0, key, value))
+            .await
+            .unwrap_or_else(|_| panic!("write aaa{i:02} timed out"));
+    }
+
+    // Give the auto-split loop several ticks and a full cooldown window (15s)
+    // to (wrongly, pre-fix) mint fresh split attempts against the
+    // already-split tablet.
+    sleep(Duration::from_secs(35)).await;
+
+    // No tablet count growth: every tablet that exists has a real CP group —
+    // an already-split tablet must never trigger another `SplitTablet`
+    // metadata entry, no matter how far over threshold it grows.
+    for n in &nodes {
+        assert_eq!(
+            n.metadata().tablets.len(),
+            tablet_count_after_first_split,
+            "an already-split tablet must never be retried as a fresh split candidate"
+        );
+    }
+
+    for n in &nodes {
+        n.shutdown();
+    }
+}
