@@ -36,6 +36,8 @@ fn opts() -> LsmOptions {
         // group-commit path on one segment, not rotation.
         wal_segment_bytes: 1 << 20,
         tombstone_grace_versions: 1 << 20,
+        trust_monotonic_versions: false,
+        background_maintenance: false,
     }
 }
 

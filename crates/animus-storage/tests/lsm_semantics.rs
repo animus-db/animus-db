@@ -34,6 +34,8 @@ fn open(seed: u64) -> LsmEngine<animus_sim::SimEnv> {
         // Small grace so tombstone GC actually fires during the differential test:
         // reads in the retained window must still match `MemoryEngine` exactly.
         tombstone_grace_versions: GRACE,
+        trust_monotonic_versions: false,
+        background_maintenance: false,
     };
     block_on(LsmEngine::open_with(sim.env(0), "db/", opts)).expect("open")
 }
