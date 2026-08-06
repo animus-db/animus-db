@@ -298,6 +298,16 @@ pub struct RaftCore<C = MetaCommand, S = Metadata> {
     // Leader state.
     next_index: BTreeMap<NodeId, u64>,
     match_index: BTreeMap<NodeId, u64>,
+    // The index of the first entry this node appended in its current leadership
+    // term — the election no-op from `become_leader`. Raft §6.4 / the
+    // reconfiguration erratum: a fresh leader's `commit_index` is guaranteed to
+    // cover every entry acked by prior leaders only once an entry of its *own*
+    // term commits (the commit rule never counts old-term replicas toward a
+    // majority), so ReadIndex barriers and membership changes must first wait for
+    // `commit_index >= first_term_index`. Only meaningful while `role == Leader`
+    // (see [`first_term_index`](Self::first_term_index)); re-set on every
+    // election win.
+    first_term_index: u64,
     // Per-follower byte offset reached in the in-flight snapshot transfer, so the
     // leader resumes shipping the next chunk on each heartbeat / ack. Cleared for
     // a peer once it has fully installed the snapshot.
@@ -316,8 +326,11 @@ pub struct RaftCore<C = MetaCommand, S = Metadata> {
     heartbeat_deadline: Nanos,
 
     // Applied state machine and the order commands were applied (for tests /
-    // divergence checks). For a `DRIVER_APPLIED` state machine `metadata` is an
-    // unused unit placeholder and `applied` stays empty — committed commands ride
+    // divergence checks). `applied` holds only the window since the last
+    // snapshot: `snapshot_upto` drops the covered prefix alongside the log
+    // truncation (and install clears it), so it stays bounded in production.
+    // For a `DRIVER_APPLIED` state machine `metadata` is an unused unit
+    // placeholder and `applied` stays empty — committed commands ride
     // `pending_apply` to the driver instead.
     metadata: S,
     applied: Vec<C>,
@@ -345,6 +358,12 @@ pub struct RaftCore<C = MetaCommand, S = Metadata> {
     // A fully-received snapshot's `(last_index, bytes)` awaiting the driver writing
     // it into the engine (`drain_pending_install`); set on install completion.
     pending_install: Option<(u64, Vec<u8>)>,
+    // Lazy-image request (`DRIVER_APPLIED` only): a replication attempt needed an
+    // `InstallSnapshot` chunk but `snapshot_blob` was not materialized; the driver
+    // polls `take_snapshot_needed`, builds the engine image, and installs it via
+    // `set_snapshot_blob`. Never raised by an in-core state machine (its blob is
+    // kept eagerly).
+    snapshot_needed: bool,
 }
 
 impl<C, S> RaftCore<C, S>
@@ -378,6 +397,7 @@ where
             votes: BTreeSet::new(),
             next_index: BTreeMap::new(),
             match_index: BTreeMap::new(),
+            first_term_index: 0,
             snapshot_offset: BTreeMap::new(),
             incoming_snapshot: None,
             election_base: Duration::from_millis(150),
@@ -389,6 +409,7 @@ where
             pending_apply: Vec::new(),
             snapshot_blob: None,
             pending_install: None,
+            snapshot_needed: false,
             pending: Vec::new(),
             persisted_hard: (0, None),
             snapshot_dirty: false,
@@ -427,8 +448,8 @@ where
             // before it ever re-compacts. The recovered `metadata` *is* the in-core
             // image, so serialize it once here — identical to what the old
             // re-serialize-per-chunk path produced, just cached. (A `DRIVER_APPLIED`
-            // core's image lives in the engine, not `metadata`; its driver repopulates
-            // `snapshot_blob` from the engine, so leave it None here.)
+            // core's image lives in the engine, not `metadata`; its driver builds it
+            // lazily on demand — `take_snapshot_needed` — so leave it None here.)
             if !S::DRIVER_APPLIED {
                 core.snapshot_blob =
                     Some(serde_json::to_vec(&core.metadata).expect("metadata serializes"));
@@ -558,6 +579,18 @@ where
         // (the config entry may be in the prefix we are about to drop).
         self.snapshot_config = Some(self.config_at(new_index));
         self.log.retain(|e| e.index > new_index);
+        // Drop the retained applied-command history the snapshot now covers,
+        // mirroring the log truncation (and the clear `InstallSnapshot` already
+        // does). `applied` exists for tests / divergence checks over the
+        // *uncompacted* window; without this it grows unboundedly in production —
+        // one command per commit, forever (the commit-path memory leak). The tail
+        // beyond `new_index` (the last `last_applied - new_index` commands) is
+        // kept so the retention window matches the retained log.
+        let covered = self
+            .applied
+            .len()
+            .saturating_sub((self.last_applied - new_index) as usize);
+        self.applied.drain(..covered);
         self.snapshot_index = new_index;
         self.snapshot_term = new_term;
         self.snapshot_dirty = true;
@@ -566,18 +599,28 @@ where
         // O(state)-per-`InstallSnapshot`-message cost that pins the consensus loop and
         // storms elections while catching a follower up on a large state (the
         // control-plane counterpart of the CP-data driver-liveness fix, ADR 0017). An
-        // in-core SM's image *is* its `metadata`; a `DRIVER_APPLIED` SM's image lives
-        // in the engine and the driver supplies it via [`set_snapshot_blob`] *before*
-        // snapshotting (`snapshot_upto(engine_applied)`), so don't clobber it. For the
-        // in-core plane `metadata` reflects `last_applied`, and `new_index <=
-        // last_applied`, so this serializes state **at least as fresh** as the base —
-        // and the control plane only ever snapshots to `last_applied` (via
-        // [`snapshot`]), so it matches the base exactly. Keeps the invariant
-        // `snapshot_index > 0 ⟹ snapshot_blob.is_some()` for both SM kinds, so a chunk
-        // is never a 0-byte ship.
+        // in-core SM's image *is* its `metadata`, which reflects `last_applied`
+        // (`new_index <= last_applied`), so this serializes state at least as fresh
+        // as the base — and the control plane only ever snapshots to `last_applied`
+        // (via [`snapshot`]), so it matches the base exactly, keeping the in-core
+        // invariant `snapshot_index > 0 ⟹ snapshot_blob.is_some()`.
         if !S::DRIVER_APPLIED {
             self.snapshot_blob =
                 Some(serde_json::to_vec(&self.metadata).expect("metadata serializes"));
+        } else {
+            // `DRIVER_APPLIED` images are built **lazily, on demand** (see
+            // [`snapshot_chunk_for`]): the base just moved, so any previously
+            // materialized image is stale — shipping state-at-the-old-base
+            // labeled with the new `snapshot_index` would corrupt a receiver.
+            // Drop it (regenerated from the engine only if a follower actually
+            // needs one) and restart any in-flight transfer from offset 0
+            // against the next image (the receiver's `fresh && offset == 0`
+            // reassembly guard requires a restart — resuming a differently-based
+            // transfer mid-offset would never complete). The on-demand build
+            // path calls `set_snapshot_blob` *after* this, in the same driver
+            // pass, so a deliberately fresh image is never dropped.
+            self.snapshot_blob = None;
+            self.snapshot_offset.clear();
         }
     }
 
@@ -630,6 +673,20 @@ where
         self.commit_index
     }
 
+    /// While leader, the log index of the **first entry this node appended in its
+    /// current term** — the election no-op from `become_leader`; `None` off-leader.
+    ///
+    /// Raft §6.4 (and the membership-change erratum): a freshly elected leader's
+    /// log contains every committed entry (leader completeness), but its
+    /// `commit_index` may still lag entries the *previous* leader committed and
+    /// acked, because the commit rule never counts old-term entries toward a
+    /// majority. Only once `commit_index() >= first_term_index()` is the leader's
+    /// commit index guaranteed to cover everything previously acked — the gate a
+    /// ReadIndex barrier and a membership change must clear before acting.
+    pub fn first_term_index(&self) -> Option<u64> {
+        (self.role == Role::Leader).then_some(self.first_term_index)
+    }
+
     /// Highest log index known durable on disk (the **durable-before-visible**
     /// frontier; see [`RaftCore::mark_durable_through`]).
     pub fn durable_index(&self) -> u64 {
@@ -659,7 +716,11 @@ where
         self.metadata.clone()
     }
 
-    /// The sequence of commands applied so far, in order.
+    /// The commands applied **since the last snapshot**, in order — a bounded
+    /// window for tests / divergence checks, not the full history. The prefix a
+    /// snapshot covers is dropped alongside the log truncation
+    /// ([`snapshot_upto`](Self::snapshot_upto)) and on `InstallSnapshot`, so this
+    /// does not grow unboundedly in production.
     pub fn applied(&self) -> Vec<C> {
         self.applied.clone()
     }
@@ -674,10 +735,14 @@ where
     }
 
     /// Provide the engine-image bytes a `DRIVER_APPLIED` leader ships to a lagging
-    /// follower via `InstallSnapshot` (ADR 0017 A.2). The driver refreshes this
-    /// from the `StorageEngine` when it compacts, so the shipped snapshot matches
-    /// the (now-truncated) log prefix. No effect for an in-core state machine
-    /// (which serializes `metadata` directly).
+    /// follower via `InstallSnapshot` (ADR 0017 A.2). Built **lazily**: the driver
+    /// supplies this only when a replication attempt raised
+    /// [`take_snapshot_needed`](Self::take_snapshot_needed) (a follower actually
+    /// needs a snapshot), scanning the `StorageEngine` at that moment and calling
+    /// `snapshot_upto(engine_applied)` *first* so the image and the base agree.
+    /// The core drops it again once no transfer is in flight (or the base moves),
+    /// so no whole-tablet image is retained at rest. No effect for an in-core
+    /// state machine (which caches `serialize(metadata)` eagerly).
     pub fn set_snapshot_blob(&mut self, bytes: Vec<u8>) {
         self.snapshot_blob = Some(bytes);
     }
@@ -788,6 +853,22 @@ where
         if self.role != Role::Leader {
             return ProposeResult::NotLeader {
                 leader: self.leader_id,
+            };
+        }
+        // The membership-change erratum guard (Raft §4 / Ongaro's bug report):
+        // append no config entry until this leader has **committed an entry in
+        // its current term** (its election no-op). Before that point the leader's
+        // `commit_index` may lag entries a prior leader committed — in particular
+        // an earlier *config* entry could still be uncommitted from this leader's
+        // view, so `config_change_in_flight` (which compares against the honest
+        // `commit_index`) would already hold it off; this explicit gate replaces
+        // that subtle composed argument with the standard, self-evident rule.
+        // Rejected NotLeader-style (self hint) like the other no-op rejections; a
+        // caller (e.g. the reconfigure loop) simply retries after the no-op
+        // commits — one round trip after election.
+        if self.commit_index < self.first_term_index {
+            return ProposeResult::NotLeader {
+                leader: Some(self.id),
             };
         }
         let delta = self.config.symmetric_difference(&voters).count();
@@ -1261,7 +1342,7 @@ where
             self.maybe_advance_commit();
             self.apply();
             if self.next_index.get(&from).copied().unwrap_or(1) <= self.last_log_index() {
-                return vec![self.replicate_to(from)];
+                return self.replicate_to(from).into_iter().collect();
             }
             Vec::new()
         } else {
@@ -1269,7 +1350,7 @@ where
             if *ni > 1 {
                 *ni -= 1;
             }
-            vec![self.replicate_to(from)]
+            self.replicate_to(from).into_iter().collect()
         }
     }
 
@@ -1383,19 +1464,19 @@ where
                 // `metadata` stays the unit placeholder.
                 let bytes = inc.buf;
                 install(self);
-                // Retain the installed image as our own snapshot blob. A
-                // `DRIVER_APPLIED` state machine's image lives in the engine, not in
-                // `metadata`, so `snapshot_chunk_for` ships `snapshot_blob` — which is
-                // only set by the driver when it *compacts* (`set_snapshot_blob`). A
-                // node that caught up via this install has `snapshot_index > 0` but,
-                // until its first compaction, no blob; if it then becomes leader (or
-                // must re-ship to a third follower below its compacted prefix) it would
-                // ship `unwrap_or_default()` = 0 bytes, the receiver would decode an
-                // empty image (`EOF while parsing a value`) and could never catch up.
-                // The just-installed bytes are exactly a valid image at
-                // `snapshot_index`, so keep them; the driver overwrites this on its
-                // next compaction with the fresh engine image.
-                self.snapshot_blob = Some(bytes.clone());
+                // Do NOT retain the installed image as our own snapshot blob:
+                // `DRIVER_APPLIED` images are built lazily from the engine (see
+                // [`snapshot_chunk_for`]). Once the driver writes these bytes into
+                // the engine (`drain_pending_install`, which its apply task does
+                // *before* servicing any lazy-build request in the same pass), this
+                // node can regenerate an image at (or past) `snapshot_index` on
+                // demand — so the second-hop re-ship invariant that used to require
+                // retaining the bytes forever (the
+                // `caught_up_node_reships_non_empty_snapshot` regression) now holds
+                // by regeneration, at any hop depth, with no O(state) resident copy.
+                // Any *own* stale blob from an earlier leadership is dead now that
+                // the base moved.
+                self.snapshot_blob = None;
                 self.pending_install = Some((inc.last_index, bytes));
                 return vec![(
                     leader,
@@ -1471,19 +1552,28 @@ where
         if last_index > 0 {
             // Transfer complete: the follower installed the snapshot.
             self.snapshot_offset.remove(&from);
+            // Lazy-image discipline (`DRIVER_APPLIED`): once no transfer is in
+            // flight, drop the materialized image instead of retaining a
+            // whole-tablet copy in the core indefinitely — a later straggler
+            // triggers an on-demand rebuild from the engine. Kept while any
+            // other peer's transfer is mid-flight so its chunks stay
+            // byte-identical. In-core state machines keep their eager blob.
+            if S::DRIVER_APPLIED && self.snapshot_offset.is_empty() {
+                self.snapshot_blob = None;
+            }
             let m = self.match_index.entry(from).or_insert(0);
             *m = (*m).max(last_index);
             self.next_index.insert(from, last_index + 1);
             self.maybe_advance_commit();
             self.apply();
             if self.next_index.get(&from).copied().unwrap_or(1) <= self.last_log_index() {
-                return vec![self.replicate_to(from)];
+                return self.replicate_to(from).into_iter().collect();
             }
             return Vec::new();
         }
         // Still mid-transfer: record progress and ship the next chunk.
         self.snapshot_offset.insert(from, next_offset);
-        vec![self.replicate_to(from)]
+        self.replicate_to(from).into_iter().collect()
     }
 
     // ---- role transitions & replication ---------------------------------
@@ -1581,23 +1671,38 @@ where
         // A fresh term restarts any snapshot transfer from offset 0.
         self.snapshot_offset.clear();
         // No-op entry so prior-term entries can be committed under our term.
+        // Record its index: it is this leader's first current-term entry, the
+        // watermark ReadIndex barriers and membership changes gate on
+        // (`first_term_index`, Raft §6.4).
+        self.first_term_index = last + 1;
         self.log_append(LogEntry {
             term: self.current_term,
             index: last + 1,
             command: S::noop(),
             config: None,
         });
+        // Let a single-node group commit its no-op immediately (majority == 1);
+        // in a larger group commit still waits on follower `matchIndex`. Without
+        // this a sole leader's `first_term_index` gate would hold reads and
+        // membership changes until its next propose.
+        self.maybe_advance_commit();
+        self.apply();
         self.heartbeat_deadline = Nanos(now.0.saturating_add(self.heartbeat_nanos()));
         self.broadcast_append()
     }
 
-    fn broadcast_append(&self) -> Vec<Out<C>> {
-        self.peers.iter().map(|&p| self.replicate_to(p)).collect()
+    fn broadcast_append(&mut self) -> Vec<Out<C>> {
+        let peers = self.peers.clone();
+        peers.iter().filter_map(|&p| self.replicate_to(p)).collect()
     }
 
-    /// Build the right replication message for `peer`: an `InstallSnapshot` if
-    /// the entries it needs have been compacted away, otherwise `AppendEntries`.
-    fn replicate_to(&self, peer: NodeId) -> Out<C> {
+    /// Build the right replication message for `peer`: an `InstallSnapshot` chunk
+    /// if the entries it needs have been compacted away, otherwise
+    /// `AppendEntries`. `None` when a needed snapshot image is not materialized
+    /// yet (a `DRIVER_APPLIED` plane builds it lazily — see
+    /// [`snapshot_chunk_for`](Self::snapshot_chunk_for)); the peer is simply
+    /// retried on the next heartbeat once the driver supplies the image.
+    fn replicate_to(&mut self, peer: NodeId) -> Option<Out<C>> {
         let next = self.next_index.get(&peer).copied().unwrap_or(1).max(1);
         // The entry before `next` is in our snapshot (or earlier) — we can't form
         // a valid `prev_log_term`, so ship the snapshot instead, as the next
@@ -1613,7 +1718,7 @@ where
             .filter(|e| e.index >= next)
             .cloned()
             .collect();
-        (
+        Some((
             peer,
             RaftMsg::AppendEntries {
                 term: self.current_term,
@@ -1623,23 +1728,38 @@ where
                 entries,
                 leader_commit: self.commit_index,
             },
-        )
+        ))
     }
 
     /// Build the next `InstallSnapshot` chunk for `peer`, starting at the byte
     /// offset recorded in `snapshot_offset` (0 if no transfer is in flight).
-    /// Pure and **cheap**: it slices the pre-serialized [`snapshot_blob`] rather than
-    /// re-serializing the state, so repeated calls at the same offset are
-    /// byte-identical, deterministic, and O(chunk) — not O(state) per chunk.
-    fn snapshot_chunk_for(&self, peer: NodeId) -> Out<C> {
-        // Both SM kinds ship the **cached** serialized image, never a fresh
-        // per-chunk serialize: a `DRIVER_APPLIED` engine image (set by the driver on
-        // compaction / retained on install) or an in-core `metadata` image (cached by
-        // [`snapshot_upto`] when the base advances / retained on install). The
-        // invariant `snapshot_index > 0 ⟹ snapshot_blob.is_some()` holds for both, and
-        // this is only reached when `next <= snapshot_index` (so `snapshot_index > 0`),
-        // so the `unwrap_or_default` fallback is never taken in practice.
-        let serialized = self.snapshot_blob.clone().unwrap_or_default();
+    /// Cheap: it slices the serialized [`snapshot_blob`] **by reference** rather
+    /// than (re-)serializing or cloning the state, so repeated calls at the same
+    /// offset are byte-identical, deterministic, and O(chunk) — not O(state) per
+    /// chunk.
+    ///
+    /// **Lazy image build (`DRIVER_APPLIED`)**: the engine image is *not* kept
+    /// materialized between transfers — that would rebuild + retain a
+    /// whole-tablet image on every compaction whether or not any follower ever
+    /// needs it. When the blob is absent this raises `snapshot_needed` and sends
+    /// nothing; the async driver observes the flag
+    /// ([`take_snapshot_needed`](Self::take_snapshot_needed)), scans the engine
+    /// into an image, and installs it via [`set_snapshot_blob`], after which the
+    /// next heartbeat retry actually ships chunk 0. The working invariant is
+    /// therefore *"any node with `snapshot_index > 0` can regenerate the image
+    /// from its engine on demand"* — strictly stronger than the old *"a received
+    /// image is retained forever"*, and it holds at any hop depth (a node that
+    /// itself caught up via `InstallSnapshot` regenerates from the engine its
+    /// driver populated) **and across recovery** (a restarted leader used to have
+    /// no blob until its next compaction and shipped 0 bytes; now it regenerates).
+    /// An **in-core** state machine keeps the eager cached image (`snapshot_upto`
+    /// / install / recovery all set it — the control-plane driver-liveness fix),
+    /// so its blob is always present here and the flag never fires.
+    fn snapshot_chunk_for(&mut self, peer: NodeId) -> Option<Out<C>> {
+        let Some(serialized) = self.snapshot_blob.as_deref() else {
+            self.snapshot_needed = true;
+            return None;
+        };
         let total = serialized.len() as u64;
         let offset = self
             .snapshot_offset
@@ -1651,7 +1771,7 @@ where
         let end = (start + SNAPSHOT_CHUNK_BYTES).min(serialized.len());
         let data = serialized[start..end].to_vec();
         let done = end as u64 == total;
-        (
+        Some((
             peer,
             RaftMsg::InstallSnapshot {
                 term: self.current_term,
@@ -1664,7 +1784,17 @@ where
                 done,
                 config: self.snapshot_config.clone(),
             },
-        )
+        ))
+    }
+
+    /// Take-and-clear the **lazy snapshot-image request** flag: `true` when a
+    /// replication attempt needed to ship an `InstallSnapshot` chunk but no image
+    /// was materialized (see [`snapshot_chunk_for`](Self::snapshot_chunk_for)).
+    /// The `DRIVER_APPLIED` driver polls this from its apply task, builds the
+    /// engine image, and installs it with [`set_snapshot_blob`]; the in-core
+    /// control plane never raises it.
+    pub fn take_snapshot_needed(&mut self) -> bool {
+        std::mem::replace(&mut self.snapshot_needed, false)
     }
 
     fn maybe_advance_commit(&mut self) {
@@ -1745,5 +1875,23 @@ impl RaftCore<MetaCommand, Metadata> {
     /// A clone of the applied metadata state machine.
     pub fn metadata(&self) -> Metadata {
         self.state()
+    }
+
+    /// A clone of just the **membership map** — the failure detector's input.
+    /// Narrow on purpose (clone-churn fix): the `detect_loop` ticks every 100ms
+    /// and used to clone the *whole* `Metadata` (schema catalog, tablet map, CP
+    /// address book included) under the core mutex each tick; this clones only
+    /// what the liveness decision reads, and the caller evaluates off the lock.
+    pub fn members(&self) -> BTreeMap<NodeId, crate::meta::Member> {
+        self.metadata.members.clone()
+    }
+
+    /// A clone of the **placement-relevant subset** of the metadata
+    /// ([`PlacementView`](crate::meta::PlacementView): members + tablets +
+    /// policies — never the schema catalog). Same rationale as
+    /// [`members`](Self::members): the `reconcile_loop` clones this narrow view
+    /// under the lock and runs the pure placement decision outside it.
+    pub fn placement_view(&self) -> crate::meta::PlacementView {
+        self.metadata.placement_view()
     }
 }

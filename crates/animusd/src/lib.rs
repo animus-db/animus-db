@@ -2874,7 +2874,15 @@ impl ClientCtx {
         let want = addr.clone();
         let _ = self
             .propose_and_await(
-                MetaCommand::RegisterCpAddr { id, addr },
+                // `tablet: None` = legacy, never GC'd (ADR 0024). Passing the
+                // owning tablet here (so a dropped tablet's addresses are
+                // reclaimed) is the animusd wiring of the address GC — a
+                // follow-up PR; this only tracks the enum's new field.
+                MetaCommand::RegisterCpAddr {
+                    id,
+                    addr,
+                    tablet: None,
+                },
                 SCHEMA_COMMIT_TIMEOUT,
                 || (self.raft.metadata().cp_member_addrs.get(&id) == Some(&want)).then_some(()),
             )

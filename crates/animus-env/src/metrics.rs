@@ -129,12 +129,67 @@ pub enum Metric {
     /// Tombstone-GC records reclaimed during compaction (a tombstone or a version it
     /// shadowed, physically dropped below the GC floor). Summed across compactions.
     StorageTombstonesReclaimed,
+
+    // --- CP data plane (ADR 0016/0017, ADR 0015 CP-plane extension) ---
+    // Appended after the storage-engine variants; every earlier variant's slot and
+    // the text-export order stay stable, so the snapshot remains byte-reproducible.
+    // Recorded by `animus-cp-data`'s `RaftKvNode` (the per-tablet Raft-group driver
+    // + its public propose API) at the sites that know the real *outcome* — an
+    // actually-accepted/rejected propose, an actual commit advance, an effect
+    // actually drained and applied to the engine, a barrier that actually
+    // confirmed/didn't — never on every attempt or every driver-loop tick.
+    /// A client propose (`put`/`delete`/`cas`/`propose_split`) was accepted by this
+    /// group's leader (appended to its log).
+    CpProposalsAccepted,
+    /// A client propose was rejected because this node is not the group's leader.
+    CpProposalsRejectedNotLeader,
+    /// Log entries newly committed (an actual `maybe_advance_commit` advance,
+    /// summed by how far the commit index moved — not incremented on every timer
+    /// tick or message that leaves it unchanged).
+    CpCommits,
+    /// Committed-and-durable commands actually drained (`RaftCore::drain_apply`)
+    /// and applied to the engine, summed across apply passes.
+    CpApplies,
+    /// A run of accumulated `Put`/`Delete` effects was flushed as one
+    /// `StorageEngine::merge_batch` call (one WAL `fsync` for the whole run). Pair
+    /// with [`CpApplyBatchSizeSum`] to derive the average batch size.
+    CpApplyBatchRuns,
+    /// Effects included in a [`CpApplyBatchRuns`] batch, summed across batches.
+    CpApplyBatchSizeSum,
+    /// A ReadIndex read barrier (linearizable `get`/`scan`) confirmed leadership by
+    /// quorum and was served.
+    CpReadBarriersServed,
+    /// A ReadIndex read barrier did not confirm before its deadline (a step-down,
+    /// term change, or the wait timed out) and returned no value.
+    CpReadBarriersTimedOut,
+    /// The threshold-triggered compaction step advanced the snapshot base and
+    /// truncated the Raft log prefix. Decoupled from
+    /// [`CpSnapshotImageBuilds`] (PR #29's lazy-image design): a trigger does not
+    /// by itself build a shippable image.
+    CpSnapshotTriggers,
+    /// The engine was actually scanned into a snapshot image and installed
+    /// (`RaftCore::set_snapshot_blob`) because a replication attempt needed to ship
+    /// one and found none materialized (`RaftCore::take_snapshot_needed`) — the
+    /// on-demand half of the lazy-image design.
+    CpSnapshotImageBuilds,
+    /// One `InstallSnapshot` chunk was actually sent to a peer.
+    CpSnapshotShips,
+    /// A peer's `InstallSnapshot` transfer completed and it installed the snapshot
+    /// (an outbound `InstallSnapshotResp` with a non-zero `last_index`, observed on
+    /// the follower that just finished).
+    CpSnapshotInstalls,
+    /// A single-server `change_membership` step (direct call or the automatic
+    /// `reconfigure_step`) was accepted by this group's leader.
+    CpReconfigureAccepted,
+    /// A single-server `change_membership` step was rejected (not leader, an
+    /// in-flight change, a multi-server delta, or a leader self-removal).
+    CpReconfigureRejected,
 }
 
 impl Metric {
     /// Every metric, in a fixed order. The array index of a metric in `ALL` is
     /// its slot in the [`MetricSink`]; keep this in sync with the enum.
-    pub const ALL: [Metric; 27] = [
+    pub const ALL: [Metric; 41] = [
         Metric::ElectionsStarted,
         Metric::ElectionsWon,
         Metric::AppendEntriesSent,
@@ -162,6 +217,20 @@ impl Metric {
         Metric::StorageBloomMisses,
         Metric::StorageWalSegmentRotations,
         Metric::StorageTombstonesReclaimed,
+        Metric::CpProposalsAccepted,
+        Metric::CpProposalsRejectedNotLeader,
+        Metric::CpCommits,
+        Metric::CpApplies,
+        Metric::CpApplyBatchRuns,
+        Metric::CpApplyBatchSizeSum,
+        Metric::CpReadBarriersServed,
+        Metric::CpReadBarriersTimedOut,
+        Metric::CpSnapshotTriggers,
+        Metric::CpSnapshotImageBuilds,
+        Metric::CpSnapshotShips,
+        Metric::CpSnapshotInstalls,
+        Metric::CpReconfigureAccepted,
+        Metric::CpReconfigureRejected,
     ];
 
     /// The stable exported name of this metric (snake_case, used as the text
@@ -196,6 +265,20 @@ impl Metric {
             Metric::StorageBloomMisses => "storage_bloom_misses",
             Metric::StorageWalSegmentRotations => "storage_wal_segment_rotations",
             Metric::StorageTombstonesReclaimed => "storage_tombstones_reclaimed",
+            Metric::CpProposalsAccepted => "cp_proposals_accepted",
+            Metric::CpProposalsRejectedNotLeader => "cp_proposals_rejected_not_leader",
+            Metric::CpCommits => "cp_commits",
+            Metric::CpApplies => "cp_applies",
+            Metric::CpApplyBatchRuns => "cp_apply_batch_runs",
+            Metric::CpApplyBatchSizeSum => "cp_apply_batch_size_sum",
+            Metric::CpReadBarriersServed => "cp_read_barriers_served",
+            Metric::CpReadBarriersTimedOut => "cp_read_barriers_timed_out",
+            Metric::CpSnapshotTriggers => "cp_snapshot_triggers",
+            Metric::CpSnapshotImageBuilds => "cp_snapshot_image_builds",
+            Metric::CpSnapshotShips => "cp_snapshot_ships",
+            Metric::CpSnapshotInstalls => "cp_snapshot_installs",
+            Metric::CpReconfigureAccepted => "cp_reconfigure_accepted",
+            Metric::CpReconfigureRejected => "cp_reconfigure_rejected",
         }
     }
 

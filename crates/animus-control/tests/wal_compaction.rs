@@ -75,6 +75,45 @@ fn snapshot_truncates_the_log_prefix_and_recovers() {
     );
 }
 
+#[test]
+fn snapshot_truncates_the_applied_command_log() {
+    // `applied` (the retained applied-command history, for tests / divergence
+    // checks) must be truncated by a snapshot alongside the log — without that it
+    // grows one command per commit forever (a commit-path memory leak in
+    // production). After a snapshot only the post-snapshot window remains.
+    let mut core = RaftCore::new(0, &[0], Nanos(0), 7);
+    core.tick(Nanos(1_000_000_000), 7); // election timeout -> sole leader
+    for i in 0..50 {
+        core.propose(upsert(i));
+    }
+    core.mark_durable_through(core.last_log_index());
+    assert_eq!(
+        core.applied().len(),
+        51, // the election no-op + 50 commands
+        "pre-snapshot: the full applied window is retained"
+    );
+
+    core.snapshot();
+    assert!(
+        core.applied().is_empty(),
+        "the snapshot covers every applied command, so the window empties"
+    );
+    // The applied *state* is unaffected — only the command history is dropped.
+    assert_eq!(core.metadata().members.len(), 50);
+
+    // Post-snapshot commands accumulate again, bounded to the new window.
+    for i in 50..53 {
+        core.propose(upsert(i));
+    }
+    core.mark_durable_through(core.last_log_index());
+    assert_eq!(
+        core.applied().len(),
+        3,
+        "post-snapshot: only the new window is retained"
+    );
+    assert_eq!(core.metadata().members.len(), 53);
+}
+
 /// Read a node's on-disk WAL bytes via its env.
 fn read_wal(sim: &mut Simulator, env: &SimEnv) -> Vec<u8> {
     let out = Arc::new(Mutex::new(Vec::new()));

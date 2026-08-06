@@ -152,10 +152,16 @@ fn pump_to_follower(
     snapshot_totals
 }
 
-/// Regression: a node that itself caught up via a received `InstallSnapshot`
-/// must be able to **re-ship** a *non-empty* snapshot. A `DRIVER_APPLIED`
-/// snapshot image lives in the engine, so `snapshot_chunk_for` ships
-/// `snapshot_blob` — historically set only by the driver on *compaction*. The
+/// Regression (second-hop invariant): a node that itself caught up via a
+/// received `InstallSnapshot` must be able to **re-ship** a *non-empty*
+/// snapshot. With **lazy on-demand images** the invariant is *"any node with
+/// `snapshot_index > 0` regenerates the image from its engine when a
+/// replication attempt raises `take_snapshot_needed`"* — strictly stronger
+/// than the old blob-retention fix, and this test drives both hops through the
+/// request→build→ship cycle, asserting a 0-byte image never ships. Original
+/// bug shape: a `DRIVER_APPLIED` snapshot image lives in the engine, so
+/// `snapshot_chunk_for` ships `snapshot_blob` — historically set only by the
+/// driver on *compaction*. The
 /// install path advances `snapshot_index` but (before the fix) left
 /// `snapshot_blob = None`, so when the just-caught-up node later became the
 /// source it shipped 0 bytes, the receiver decoded an empty image
@@ -186,19 +192,42 @@ fn caught_up_node_reships_non_empty_snapshot() {
         }
     }
     src.mark_durable_through(src.last_log_index());
-    // The driver supplies the engine image before compacting (a DRIVER_APPLIED
-    // image is not derivable from in-core `metadata`). Use a non-empty,
-    // round-trippable blob standing in for the engine's serialized contents.
-    let image: Vec<u8> = serde_json::to_vec(&[("k", 1u64), ("k2", 2u64)]).unwrap();
-    assert!(!image.is_empty());
-    src.set_snapshot_blob(image.clone());
+    // Threshold compaction truncates the log WITHOUT materializing an image —
+    // `DRIVER_APPLIED` images are built lazily, only when a follower actually
+    // needs an `InstallSnapshot` (audit P1/P5).
     src.snapshot();
     assert!(src.snapshot_index() > 0, "source should have a snapshot");
+    assert!(
+        !src.take_snapshot_needed(),
+        "no follower needs a snapshot yet — compaction alone must not request an image"
+    );
+
+    // A non-empty, round-trippable blob standing in for the engine's serialized
+    // contents (what the driver's on-demand `engine_image` scan would produce).
+    let image: Vec<u8> = serde_json::to_vec(&[("k", 1u64), ("k2", 2u64)]).unwrap();
+    assert!(!image.is_empty());
 
     // --- Node 1 catches up from node 0 via InstallSnapshot.
     let mut mid: KvCore = RaftCore::new(1, &GROUP, Nanos(0), 7);
     let hb = Nanos(now.0 + 1_000_000_000); // past the heartbeat deadline
+    // First exchange: node 0 backtracks to the compacted prefix, finds no
+    // materialized image, sends nothing, and raises the lazy-build request.
     let pending = src.tick(hb, 7);
+    let totals = pump_to_follower(&mut src, &mut mid, 0, 1, pending);
+    assert!(
+        totals.iter().all(|&t| t == 0),
+        "nothing (and certainly no 0-byte chunk labeled as an image) ships before \
+         the driver materializes one, totals={totals:?}"
+    );
+    assert!(
+        src.take_snapshot_needed(),
+        "the blocked replication must request an on-demand image build"
+    );
+    // Simulate the driver: scan the engine into an image and install it.
+    src.set_snapshot_blob(image.clone());
+    // The next heartbeat retry actually ships the chunks.
+    let hb1b = Nanos(hb.0 + 1_000_000_000);
+    let pending = src.tick(hb1b, 7);
     let totals = pump_to_follower(&mut src, &mut mid, 0, 1, pending);
     assert!(
         totals.iter().any(|&t| t > 0),
@@ -242,12 +271,28 @@ fn caught_up_node_reships_non_empty_snapshot() {
     assert!(mid.is_leader(), "node 1 should have won the re-election");
 
     let mut fresh: KvCore = RaftCore::new(2, &GROUP, Nanos(0), 7);
+    // The crux (the second-hop invariant, now in its **lazy** form): node 1 only
+    // ever obtained its state via an install and retains no image bytes in the
+    // core — it must *request a regeneration* rather than ship a 0-byte image
+    // (the original bug's failure mode: the receiver decoded an empty image and
+    // never caught up).
     let hb2 = Nanos(later.0 + 1_000_000_000);
     let pending2 = mid.tick(hb2, 7);
     let totals2 = pump_to_follower(&mut mid, &mut fresh, 1, 2, pending2);
-
-    // The crux: node 1 — which only ever obtained its state via an install —
-    // ships a NON-EMPTY image, so the fresh node installs the real bytes.
+    assert!(
+        totals2.iter().all(|&t| t == 0),
+        "no 0-byte image may ship while unmaterialized, totals={totals2:?}"
+    );
+    assert!(
+        mid.take_snapshot_needed(),
+        "the second hop must raise the on-demand image request"
+    );
+    // Node 1's driver regenerates the image from its engine — which holds
+    // exactly the bytes it installed (`drain_pending_install` wrote them there).
+    mid.set_snapshot_blob(mid_installed.1.clone());
+    let hb2b = Nanos(hb2.0 + 1_000_000_000);
+    let pending2 = mid.tick(hb2b, 7);
+    let totals2 = pump_to_follower(&mut mid, &mut fresh, 1, 2, pending2);
     assert!(
         totals2.iter().any(|&t| t > 0),
         "re-shipped snapshot was EMPTY (the bug): a node that caught up via install \

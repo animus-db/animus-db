@@ -184,7 +184,9 @@ impl<E: Env> RaftNode<E> {
         self.lock().metadata()
     }
 
-    /// The sequence of commands applied so far, in order.
+    /// The commands applied **since the last snapshot**, in order (a bounded
+    /// window for tests / divergence checks — compaction drops the covered
+    /// prefix, so compare it before the snapshot threshold is crossed).
     pub fn applied(&self) -> Vec<MetaCommand> {
         self.lock().applied()
     }
@@ -434,13 +436,19 @@ fn record_transition(
 async fn reconcile_loop<E: Env>(env: E, core: Arc<Mutex<RaftCore>>) {
     loop {
         env.sleep(RECONCILE_INTERVAL).await;
-        let proposals = {
+        // Clone only the placement-relevant view under the lock (members +
+        // tablets + policies — not the schema catalog or the CP address book,
+        // which dominate a grown `Metadata`), and run the pure decision *off*
+        // the lock, so a big catalog never turns this background tick into a
+        // full-blob clone on the consensus mutex every 500ms (clone-churn fix).
+        let view = {
             let core = core.lock().expect("raft core poisoned");
             if !core.is_leader() {
                 continue;
             }
-            core.metadata().reconcile()
+            core.placement_view()
         };
+        let proposals = view.reconcile();
         for command in proposals {
             // Off-leader transitions between the check and here are harmless:
             // a stale `CasTabletReplicas` is rejected by the epoch guard, and a
@@ -487,7 +495,13 @@ async fn detect_loop<E: Env>(
     loop {
         env.sleep(DETECT_INTERVAL).await;
         let now = env.now();
-        let proposals = {
+        // Under the core lock take only what the decision needs: leadership +
+        // term and a clone of the **membership map** — never the whole
+        // `Metadata` (this loop ticks every 100ms; cloning the full blob,
+        // schema catalog included, under the consensus mutex was the
+        // clone-churn hot spot).
+        let allow_down;
+        let members = {
             let core = core.lock().expect("raft core poisoned");
             if !core.is_leader() {
                 leader_since = None;
@@ -503,15 +517,16 @@ async fn detect_loop<E: Env>(
                 }
             };
             // Suppress `Down` until the cold detector has had a heartbeat round.
-            let allow_down = now.duration_since(since) >= LEADER_GRACE;
-            let meta = core.metadata();
-            liveness_transitions(
-                &meta,
-                &detector.lock().expect("detector poisoned"),
-                now,
-                allow_down,
-            )
+            allow_down = now.duration_since(since) >= LEADER_GRACE;
+            core.members()
         };
+        // Evaluate off the core lock (the detector has its own mutex).
+        let proposals = liveness_transitions(
+            &members,
+            &detector.lock().expect("detector poisoned"),
+            now,
+            allow_down,
+        );
         for command in proposals {
             // Attribute each liveness transition to its failure-detector metric
             // (ADR 0012/0015) before proposing it. `liveness_transitions` only
@@ -535,16 +550,19 @@ async fn detect_loop<E: Env>(
 
 /// Pure helper: the `UpsertMember` transitions needed to bring each tracked
 /// member's replicated status in line with the detector's liveness verdict at
-/// `now`. Returns commands only for members whose status would actually change
+/// `now`. Takes just the **membership map** (not the whole `Metadata`), so the
+/// caller can hand it a narrow clone taken off the core lock (clone-churn fix).
+/// Returns commands only for members whose status would actually change
 /// (idempotent), in ascending node-id order (the detector iterates a `BTreeMap`),
-/// so the result is a deterministic function of `(meta, detector, now, allow_down)`.
+/// so the result is a deterministic function of `(members, detector, now,
+/// allow_down)`.
 ///
 /// `allow_down` gates the `Active`→`Down` transition: a freshly elected leader
 /// passes `false` during its post-election grace period so a cold detector does
 /// not falsely mark live members `Down` before their heartbeats arrive
 /// (ADR 0012). Recoveries (`Down`→`Active`) are always allowed.
 fn liveness_transitions(
-    meta: &Metadata,
+    members: &std::collections::BTreeMap<NodeId, Member>,
     detector: &FailureDetector,
     now: animus_env::Nanos,
     allow_down: bool,
@@ -553,7 +571,7 @@ fn liveness_transitions(
         .evaluate(now)
         .into_iter()
         .filter_map(|l| {
-            let member = meta.members.get(&l.node)?;
+            let member = members.get(&l.node)?;
             let desired = match (member.status, l.alive) {
                 // A live member believed dead recovers to `Active`.
                 (NodeStatus::Down, true) => NodeStatus::Active,
@@ -683,10 +701,10 @@ mod tests {
         let now = Nanos(DETECT_TIMEOUT.as_nanos() as u64 + 1);
 
         // Inside the grace period (allow_down = false): no Down proposed.
-        assert!(liveness_transitions(&meta, &det, now, false).is_empty());
+        assert!(liveness_transitions(&meta.members, &det, now, false).is_empty());
 
         // Grace elapsed (allow_down = true): the Down transition is proposed.
-        let outs = liveness_transitions(&meta, &det, now, true);
+        let outs = liveness_transitions(&meta.members, &det, now, true);
         assert_eq!(outs.len(), 1);
         assert!(matches!(
             &outs[0],
@@ -705,7 +723,7 @@ mod tests {
         let meta = meta_with(7, NodeStatus::Down);
         let det = detector_silent_since(7, Nanos(1_000));
         let now = Nanos(1_000); // fresh heartbeat → alive
-        let outs = liveness_transitions(&meta, &det, now, false);
+        let outs = liveness_transitions(&meta.members, &det, now, false);
         assert_eq!(outs.len(), 1);
         assert!(matches!(
             &outs[0],

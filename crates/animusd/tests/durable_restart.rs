@@ -187,12 +187,25 @@ async fn data_survives_node_restart_on_disk() {
     stop(node).await;
 }
 
-/// The contrast: with the `--ephemeral` in-memory backend, a restart on the same
-/// dir/addresses starts empty — proving the durability above comes from the
-/// on-disk engine, not from anything else in the stack (the control plane's own
-/// WAL recovers metadata either way).
+/// Even with the `--ephemeral` in-memory **engine**, an acked write survives a
+/// clean restart on the same data dir: the CP group's Raft WAL (`raftkv.wal`) is
+/// fsynced on the real disk *before* the ack, and the restarted sole leader
+/// re-advances commit over its recovered log tail on re-election (its election
+/// no-op commits immediately in a single-node group), re-applying the tail into
+/// the fresh engine. The engine backend only decides whether the *engine image*
+/// is durable — durability of acked writes comes from the Raft WAL either way.
+///
+/// (Historically this test asserted the opposite — that the memory backend loses
+/// the value — but that relied on a consensus gap: a restarted single-voter
+/// group never re-advanced commit over its recovered WAL tail until the *next*
+/// propose, silently violating `RaftCore::recovered`'s re-apply contract and
+/// leaving acked-but-unre-applied state invisible. The ReadIndex §6.4
+/// current-term-commit gate fix closed that gap.)
+///
+/// Recovery → election → re-apply is asynchronous after the restart, so the
+/// read is a converged-or-timeout poll, not a one-shot assert.
 #[tokio::test(flavor = "multi_thread")]
-async fn data_is_lost_on_restart_with_memory_backend() {
+async fn acked_write_survives_memory_backend_restart_via_raft_wal() {
     let dir = TempDir::new().unwrap();
     let node_dir = dir.path().join("node-0");
 
@@ -203,8 +216,8 @@ async fn data_is_lost_on_restart_with_memory_backend() {
     let put = call(
         client,
         ClientRequest::Put {
-            key: b"volatile".to_vec(),
-            value: b"gone".to_vec(),
+            key: b"acked".to_vec(),
+            value: b"survives".to_vec(),
             table: "kv".to_string(),
         },
     )
@@ -216,20 +229,26 @@ async fn data_is_lost_on_restart_with_memory_backend() {
     let node = support::restart_same_addrs(&config, 0, &node_dir, StorageBackend::Memory).await;
     await_bootstrap(&node).await;
 
-    // The in-memory replica started empty, so the value is gone.
-    let got = call(
-        client,
-        ClientRequest::Get {
-            key: b"volatile".to_vec(),
-            table: "kv".to_string(),
-        },
-    )
-    .await;
-    assert_eq!(
-        got,
-        ClientResponse::Value(None),
-        "in-memory backend should lose data across a restart (got {got:?})",
-    );
+    // Poll until the recovered group has re-applied its WAL tail (bounded).
+    let recovered = async {
+        loop {
+            let got = call(
+                client,
+                ClientRequest::Get {
+                    key: b"acked".to_vec(),
+                    table: "kv".to_string(),
+                },
+            )
+            .await;
+            if got == ClientResponse::Value(Some(b"survives".to_vec())) {
+                return;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    };
+    timeout(Duration::from_secs(20), recovered)
+        .await
+        .expect("acked write did not survive the memory-backend restart via the raftkv WAL");
 
     stop(node).await;
 }
