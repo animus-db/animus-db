@@ -366,6 +366,18 @@ cross-cutting ones. Prune/merge entries that become obsolete.
   CI job, not per-push. (ADR 0014 coverage-expansion increment.)
 
 ### Code patterns
+- **A new `ClientRequest` variant that can be *forwarded* must be handled in BOTH
+  the main serve loop AND `cp_serve_forwarded` — a single-node test can't catch the
+  missing half.** `animusd` CP ops route locally or **forward one hop** to the
+  leader's node wrapped in `ClientRequest::Forwarded`; the receiver dispatches the
+  inner request through `cp_serve_forwarded`, a *separate* match from the top-level
+  serve loop. A batch (`PutBatch`) added only to the serve loop works whenever the
+  connected node happens to host the tablet leader and silently errors ("unexpected
+  forwarded request") when it must forward — the same bimodal per-process failure
+  shape as the `is_relayable_command` allowlist gap. When adding a forwardable
+  variant, grep for the request enum's name across *both* match sites and add the
+  arm to each; regression-test it through a **follower/non-leader-connected** node
+  in a per-process cluster. (`animusd` `cp_serve_forwarded`; batch put, ADR 0017.)
 - **A "send X" path that falls back to a *default* when X is absent can ship a
   silently-corrupt value — make the absent case impossible (set X at every state
   transition that needs it), not `unwrap_or_default()`.** The per-tablet CP Raft

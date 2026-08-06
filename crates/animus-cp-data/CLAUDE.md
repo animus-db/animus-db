@@ -23,9 +23,17 @@ the engine — the `AccordCore` sync-core/async-driver split.
 
 ## Entry points
 
-- `KvCommand` (`Put`/`Delete`/`Cas`/`Split`/`NoOp`), `KvState` (the `DRIVER_APPLIED` SM).
+- `KvCommand` (`Put`/`Batch`/`Delete`/`Cas`/`Split`/`NoOp`), `KvState` (the `DRIVER_APPLIED` SM).
+- **Batch put** — `KvCommand::Batch(Vec<(k, v)>)` + `RaftKvNode::put_batch` commit
+  **N keys as one Raft log entry** (one propose → one commit round → one apply), the
+  bulk-write throughput primitive. Applied as one arm in `apply_and_compact`: every
+  key merges at the entry's shared Raft `index` (the MVCC version — keys are
+  distinct, so per-key LWW is well-defined; `engine_applied` advances once past the
+  whole batch at end of the loop iteration). Re-applies idempotently on recovery
+  exactly as a single `Put`. Uses the normal per-key `merge` path, so it composes
+  with a coalesced-fsync `merge_batch` optimization. `tests/batch.rs`.
 - `RaftKvNode<E, S>` — a running tablet-group node: `start(env, all_nodes,
-  storage)`, `put`/`delete` (proposed via Raft, honored on the leader), `is_leader`,
+  storage)`, `put`/`put_batch`/`delete` (proposed via Raft, honored on the leader), `is_leader`,
   `linearizable_get` (ReadIndex), `local_get` (a replica's raw engine read — *not*
   linearizable; a test/observability aid).
 - **Linearizable CAS** — `cas(key, expected, value) -> ProposeResult` proposes a

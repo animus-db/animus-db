@@ -196,6 +196,78 @@ async fn cp_op_on_a_non_leader_node_is_forwarded_to_the_leader() {
     }
 }
 
+/// A **batch write** (`ClientRequest::PutBatch`, ADR 0017 bulk-write batching) must
+/// route/forward exactly like a single write: issued from **every** node in turn,
+/// so at least two of the three land on a non-leader and must be **forwarded** to
+/// the CP leader's node (the `cp_serve_forwarded` `PutBatch` arm). A missing
+/// forwarded arm is the classic bimodal per-process failure (works only when the
+/// connected node happens to lead) — this fails it deterministically wherever the
+/// leader lands. Each batch's keys are then read back to confirm they committed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn batch_write_on_a_non_leader_node_is_forwarded() {
+    let n = 3;
+    let dir = tempfile::tempdir().unwrap();
+    let (nodes, config) = bring_up(n, dir.path()).await;
+    await_bootstrap(&nodes).await;
+    let client = |i: usize| config.nodes[i].client;
+
+    // A batch issued from each node: node `i` writes keys `bwN-i`. Whether or not
+    // node `i` leads the tablet, the batch must succeed — locally or forwarded.
+    for i in 0..n {
+        let entries: Vec<(Vec<u8>, Vec<u8>)> = (0..5)
+            .map(|k| {
+                (
+                    format!("bw{k}-{i}").into_bytes(),
+                    format!("val{k}-{i}").into_bytes(),
+                )
+            })
+            .collect();
+        timeout(Duration::from_secs(25), async {
+            loop {
+                match call(
+                    client(i),
+                    ClientRequest::PutBatch {
+                        entries: entries.clone(),
+                        table: CP_TABLE.into(),
+                    },
+                )
+                .await
+                {
+                    ClientResponse::PutOk => return,
+                    ClientResponse::Error(_) => sleep(Duration::from_millis(150)).await,
+                    other => panic!("unexpected CP batch response: {other:?}"),
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("CP batch via node {i} did not succeed in 25s"));
+    }
+
+    // Every key of every batch reads back (via node 0 — forwarded if it's not the
+    // leader), so the whole batch committed on the tablet.
+    for i in 0..n {
+        for k in 0..5 {
+            let got = call(
+                client(0),
+                ClientRequest::Get {
+                    key: format!("bw{k}-{i}").into_bytes(),
+                    table: CP_TABLE.into(),
+                },
+            )
+            .await;
+            assert_eq!(
+                got,
+                ClientResponse::Value(Some(format!("val{k}-{i}").into_bytes())),
+                "batch key bw{k}-{i} must be present after a (possibly forwarded) batch"
+            );
+        }
+    }
+
+    for node in &nodes {
+        node.shutdown();
+    }
+}
+
 /// ADR 0017 #4 regression — **derived member ids must translate back to base ids on
 /// the forward path**. The *first* provisioned table wins the tablet-id race with
 /// bootstrap and rides the bootstrap group, whose member ids **are** the base

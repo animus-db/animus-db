@@ -686,9 +686,12 @@ async fn action_drop_table(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
 const SEED_MAX_PER_REQUEST: u64 = 200_000;
 /// Cap on a synthetic value's size.
 const SEED_MAX_VALUE_BYTES: usize = 1 << 20;
-/// In-flight `cp_write`s per seed request — enough to amortize WAL group-commit
-/// without overwhelming the leader.
-const SEED_CONCURRENCY: u64 = 64;
+/// Keys committed as **one `Batch` Raft entry** (ADR 0017 — bulk-write batching):
+/// a seed chunk of this many keys is proposed as a single consensus round instead
+/// of one round per key, the bulk-seed throughput win. `cp_batch_write` further
+/// groups a chunk by tablet, so a chunk that straddles a split boundary commits one
+/// atomic entry per tablet.
+const SEED_BATCH_SIZE: u64 = 500;
 /// Attempts per seeded key, to absorb transient failures while a tablet is
 /// **splitting** (writes racing the split point are truncated/tombstoned and
 /// re-route to the new child on retry). Each attempt is bounded by the data path's
@@ -769,47 +772,43 @@ async fn action_data_seed(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
     let mut first_err: Option<String> = None;
     let mut i = 0u64;
     while i < count {
-        let batch = (count - i).min(SEED_CONCURRENCY);
-        let mut set = tokio::task::JoinSet::new();
-        for j in 0..batch {
-            let pk = format!("{prefix}{:012}", req.start + i + j);
-            let key = seed_key(pk.as_bytes());
-            let val = value.clone();
-            let c = ctx.clone();
-            let t = table.clone();
-            // Retry transient write failures. A write racing a tablet **split** is
-            // routed to the parent and truncated/tombstoned (the upper range moved
-            // to the new child), so `cp_write` times out / reports "leader moved";
-            // a retry re-routes to the now-elected child and lands. Idempotent
-            // (same key+value, per-key LWW), so retrying is safe.
-            set.spawn(async move {
-                let mut last = Ok(());
-                for attempt in 0..SEED_WRITE_ATTEMPTS {
-                    match c.cp_write(&t, key.clone(), val.clone()).await {
-                        Ok(()) => return Ok(()),
-                        Err(e) => {
-                            last = Err(e);
-                            if attempt + 1 < SEED_WRITE_ATTEMPTS {
-                                tokio::time::sleep(SEED_RETRY_BACKOFF).await;
-                            }
-                        }
+        let chunk = (count - i).min(SEED_BATCH_SIZE);
+        // Build the chunk's `(key, value)` pairs and commit them as **one Batch
+        // entry per tablet** (`cp_batch_write` groups by tablet) — one consensus
+        // round for the whole chunk instead of one per key.
+        let entries: Vec<(Vec<u8>, Vec<u8>)> = (0..chunk)
+            .map(|j| {
+                let pk = format!("{prefix}{:012}", req.start + i + j);
+                (seed_key(pk.as_bytes()), value.clone())
+            })
+            .collect();
+        // Retry transient failures. A batch racing a tablet **split** may route to
+        // the parent and be truncated/tombstoned (the upper range moved to the new
+        // child); a retry re-groups against the settled tablet map and re-routes to
+        // the elected child. Idempotent (same keys+value, per-key LWW at the entry's
+        // index), so retrying is safe.
+        let mut last: Result<(), String> = Ok(());
+        for attempt in 0..SEED_WRITE_ATTEMPTS {
+            match ctx.cp_batch_write(&table, entries.clone()).await {
+                Ok(()) => {
+                    last = Ok(());
+                    break;
+                }
+                Err(e) => {
+                    last = Err(e);
+                    if attempt + 1 < SEED_WRITE_ATTEMPTS {
+                        tokio::time::sleep(SEED_RETRY_BACKOFF).await;
                     }
-                }
-                last
-            });
-        }
-        while let Some(res) = set.join_next().await {
-            match res {
-                Ok(Ok(())) => written += 1,
-                Ok(Err(e)) => {
-                    first_err.get_or_insert(e);
-                }
-                Err(_) => {
-                    first_err.get_or_insert_with(|| "seed write task failed".to_string());
                 }
             }
         }
-        i += batch;
+        match last {
+            Ok(()) => written += chunk,
+            Err(e) => {
+                first_err.get_or_insert(e);
+            }
+        }
+        i += chunk;
     }
 
     // All writes failing is a server error; a partial failure still reports what

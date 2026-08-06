@@ -24,10 +24,13 @@
 //! key for an item is `escape(table) || escape(pk) || sk` (so tables share one
 //! keyspace without colliding). The data plane has no native delete, so
 //! `DeleteItem` writes a tombstone value that `GetItem` reads back as absent.
-//! `UpdateItem` is a read-modify-write (`SET`/`REMOVE`); `BatchWriteItem` applies
-//! put/delete requests one by one; `TransactWriteItems` applies condition-gated
-//! actions in order but **without cross-action atomicity** (true ACID via Accord,
-//! ADR 0011, is deferred — see [`run_transact`]).
+//! `UpdateItem` is a read-modify-write (`SET`/`REMOVE`); `BatchWriteItem` commits
+//! each table's put/delete requests as **one Raft entry per tablet** (the CP
+//! batch-put primitive, ADR 0017 — one consensus round for the batch instead of
+//! one per key), atomic within a tablet and non-atomic across tablets (DynamoDB
+//! semantics); `TransactWriteItems` applies condition-gated actions in order but
+//! **without cross-action atomicity** (true ACID via Accord, ADR 0011, is deferred
+//! — see [`run_transact`]).
 //!
 //! ## Per-table schemas: the replicated catalog (ADR 0013)
 //!
@@ -414,14 +417,42 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             .await
         }
         Operation::BatchWriteItem { requests } => {
+            // Commit each table's items as **one Raft entry per tablet** (ADR 0017 —
+            // batch put) instead of a serial loop of individual `cp_write`s. A
+            // `BatchWriteItem` has no per-item condition and echoes no `ReturnValues`,
+            // so neither a `Put` nor a `Delete` needs a pre-read: a `Delete` is a
+            // write of the tombstone *sentinel value* (as in `delete_item`), so both
+            // ride the same batch. Within a table `cp_batch_write` groups by tablet
+            // (atomic per tablet, non-atomic across tablets — DynamoDB semantics).
             for (table, reqs) in &requests {
+                let mut batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(reqs.len());
                 for req in reqs {
                     match req {
                         WriteRequest::Put(item) => {
-                            put_item(ctx, table, item, None).await?;
+                            let (pk, sk) = resolve_key(ctx, table, item)?;
+                            batch
+                                .push((item_key(&pk, sk.as_ref()), wire::encode_stored_item(item)));
                         }
-                        WriteRequest::Delete(key) => {
-                            delete_item(ctx, table, key, None).await?;
+                        WriteRequest::Delete(key_item) => {
+                            let (pk, sk) = resolve_key(ctx, table, key_item)?;
+                            batch.push((item_key(&pk, sk.as_ref()), wire::encode_tombstone()));
+                        }
+                    }
+                }
+                ctx.cp_batch_write(table, batch)
+                    .await
+                    .map_err(|e| internal(&e))?;
+                // Update the edge-local GSI/LSI index after the durable commit (as
+                // the single-item helpers do), re-resolving each item's key.
+                for req in reqs {
+                    match req {
+                        WriteRequest::Put(item) => {
+                            let (pk, sk) = resolve_key(ctx, table, item)?;
+                            note_put(ctx, table, &item_key(&pk, sk.as_ref()), item);
+                        }
+                        WriteRequest::Delete(key_item) => {
+                            let (pk, sk) = resolve_key(ctx, table, key_item)?;
+                            note_delete(ctx, table, &item_key(&pk, sk.as_ref()));
                         }
                     }
                 }

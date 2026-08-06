@@ -51,6 +51,16 @@ use serde::{Deserialize, Serialize};
 pub enum KvCommand {
     /// Set `key` to `value`.
     Put { key: Vec<u8>, value: Vec<u8> },
+    /// **Batch put**: set every `(key, value)` in one Raft log entry — one propose,
+    /// one commit round, one apply. All keys are merged at the entry's Raft `index`
+    /// (the shared MVCC version): the keys are distinct, so per-key LWW is
+    /// well-defined, and re-applying on recovery is idempotent exactly as a single
+    /// `Put` is. The throughput win over N individual `Put`s is one consensus round
+    /// for the whole batch instead of one per key (ADR 0017 — bulk-write batching).
+    /// Within one tablet the batch is atomic (it either commits whole or not at all);
+    /// a cross-tablet batch is split into one `Batch` per tablet by the caller and is
+    /// not atomic across tablets (matching DynamoDB `BatchWriteItem` semantics).
+    Batch(Vec<(Vec<u8>, Vec<u8>)>),
     /// Remove `key` (a tombstone in the engine).
     Delete { key: Vec<u8> },
     /// **Linearizable compare-and-swap**: set `key` to `value` iff the key's
@@ -298,6 +308,18 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// returns the leader hint); the value is durable + applied once committed.
     pub fn put(&self, key: Vec<u8>, value: Vec<u8>) -> ProposeResult {
         self.lock().propose(KvCommand::Put { key, value })
+    }
+
+    /// Propose a **batch put**: commit every `(key, value)` as **one** Raft log
+    /// entry (one propose → one commit round → one apply), for a bulk-write
+    /// throughput win over N individual [`put`](Self::put)s. Honored only on the
+    /// leader (else a leader hint). All keys share the entry's Raft index as their
+    /// MVCC version — the keys are distinct so per-key LWW is well-defined, and the
+    /// batch is atomic within this tablet (it commits whole or not at all). To learn
+    /// it committed + applied, take the [`ProposeResult::Accepted`] `index` and wait
+    /// until `last_applied >= index` (the whole batch has merged by then).
+    pub fn put_batch(&self, puts: Vec<(Vec<u8>, Vec<u8>)>) -> ProposeResult {
+        self.lock().propose(KvCommand::Batch(puts))
     }
 
     /// Propose a delete (tombstone) to this group.
@@ -823,6 +845,20 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                     .merge(&key, &value, index)
                     .await
                     .expect("raftkv apply put");
+            }
+            KvCommand::Batch(puts) => {
+                // Every key in the batch merges at this one entry's `index` (the
+                // shared MVCC version). The keys are distinct, so per-key LWW is
+                // well-defined; `engine_applied` advances once past the whole batch
+                // at the end of the loop iteration (the batch is one entry). Composes
+                // with a future coalesced-fsync merge_batch (perf/lsm) — this is the
+                // normal per-key `merge` path that batching optimization refines.
+                for (key, value) in &puts {
+                    storage
+                        .merge(key, value, index)
+                        .await
+                        .expect("raftkv apply batch put");
+                }
             }
             KvCommand::Delete { key } => {
                 storage
