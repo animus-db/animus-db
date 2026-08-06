@@ -133,9 +133,16 @@ pub enum MetaCommand {
     /// Split `tablet` at `split_key` into `[start, split_key)` (the original,
     /// with a bumped epoch) and `[split_key, end)` (a new tablet `new_id`,
     /// inheriting the replica set at [`Epoch::INITIAL`]). The split key must lie
-    /// strictly inside the tablet's range.
+    /// strictly inside the tablet's range. **Compare-and-swap on `expected_epoch`**
+    /// (mirroring `CasTabletReplicas`): rejected if `tablet`'s epoch has moved
+    /// since the caller read it, so two proposers racing to split the same
+    /// tablet at the same epoch with different keys can't both commit — only the
+    /// first lands, the second is cleanly rejected instead of minting a second
+    /// child tablet id that the per-tablet CP-data Raft group (which applies at
+    /// most one real `Split`, ever) can never actually host.
     SplitTablet {
         tablet: TabletId,
+        expected_epoch: Epoch,
         split_key: Vec<u8>,
         new_id: TabletId,
     },
@@ -409,6 +416,7 @@ impl Metadata {
             },
             MetaCommand::SplitTablet {
                 tablet,
+                expected_epoch,
                 split_key,
                 new_id,
             } => {
@@ -429,6 +437,19 @@ impl Metadata {
                 let Some(source) = self.tablets.get(tablet) else {
                     return ApplyOutcome::Rejected("no such tablet");
                 };
+                // CAS on the source's epoch (mirroring `CasTabletReplicas`): a second
+                // proposer racing to split the same tablet at the same epoch — with a
+                // different `split_key`, computed from an equally-stale view of the
+                // pre-split range — must not also commit. The tablet's own per-group
+                // CP-data Raft can only ever apply one real `Split` (an at-most-once
+                // apply-time guard there), so a second metadata-level split of the
+                // same epoch would mint a `new_id` that can never get a CP group: a
+                // permanent, leaderless, unreachable orphan tablet. Checking epoch
+                // equality here — before recomputing the range split below — rejects
+                // the loser's proposal outright instead of silently accepting it.
+                if source.epoch != *expected_epoch {
+                    return ApplyOutcome::Rejected("epoch mismatch");
+                }
                 let Some((left, right)) = source.range.split_at(split_key) else {
                     return ApplyOutcome::Rejected("split key not strictly inside range");
                 };
@@ -976,6 +997,7 @@ mod tests {
         // Split `users` so the table owns two tablets (the child inherits scope).
         let split = MetaCommand::SplitTablet {
             tablet: TabletId(1),
+            expected_epoch: Epoch::INITIAL,
             split_key: 0x8000_0000_0000_0000u64.to_be_bytes().to_vec(),
             new_id: TabletId(4),
         };
@@ -1038,6 +1060,7 @@ mod tests {
         // A split advances the counter past the new child too.
         let split = MetaCommand::SplitTablet {
             tablet: TabletId(1),
+            expected_epoch: Epoch::INITIAL,
             split_key: 0x8000_0000_0000_0000u64.to_be_bytes().to_vec(),
             new_id: TabletId(3),
         };
@@ -1092,6 +1115,7 @@ mod tests {
         // allocator floor catches it.
         let split_at = |new_id: u64| MetaCommand::SplitTablet {
             tablet: TabletId(1),
+            expected_epoch: Epoch::INITIAL,
             split_key: b"m".to_vec(),
             new_id: TabletId(new_id),
         };
@@ -1107,5 +1131,71 @@ mod tests {
         assert_eq!(m.apply(&split_at(3)), ApplyOutcome::Applied);
         assert!(m.tablets.contains_key(&TabletId(3)));
         assert_eq!(m.next_free_tablet_id(), TabletId(4));
+    }
+
+    /// `SplitTablet` is a compare-and-swap on the source tablet's epoch, exactly
+    /// like `CasTabletReplicas`: two proposers racing to split the same tablet at
+    /// the same epoch — each computing a different median from an equally-stale
+    /// view of the pre-split range — must not both commit. Without this guard the
+    /// second, losing proposal would still apply (its `split_key` is strictly
+    /// inside the *original* range), minting a second child tablet id that the
+    /// per-tablet CP-data Raft group (which applies at most one real `Split`,
+    /// ever) can never actually host — a permanent, leaderless orphan tablet
+    /// (observed live under sustained `--auto-split` bulk-seed load).
+    #[test]
+    fn split_rejects_a_stale_epoch_racing_a_concurrent_split() {
+        let mut m = Metadata::default();
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTablet {
+                tablet: TabletId(1),
+                table: Some("users".to_owned()),
+                range: KeyRange::whole(),
+                replicas: vec![1, 2, 3],
+            }),
+            ApplyOutcome::Applied
+        );
+
+        // The winner: split at "m", still at the tablet's original epoch.
+        assert_eq!(
+            m.apply(&MetaCommand::SplitTablet {
+                tablet: TabletId(1),
+                expected_epoch: Epoch::INITIAL,
+                split_key: b"m".to_vec(),
+                new_id: TabletId(2),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(m.tablets[&TabletId(1)].epoch, Epoch::INITIAL.next());
+
+        // The loser: a different median, proposed against the *same* stale
+        // epoch (it read the tablet before the winner's split committed) — even
+        // though "q" is still strictly inside the tablet's original range, this
+        // must be rejected now that the epoch has moved, not silently accepted
+        // into a second, never-hostable child tablet.
+        assert_eq!(
+            m.apply(&MetaCommand::SplitTablet {
+                tablet: TabletId(1),
+                expected_epoch: Epoch::INITIAL,
+                split_key: b"q".to_vec(),
+                new_id: TabletId(3),
+            }),
+            ApplyOutcome::Rejected("epoch mismatch")
+        );
+        // No orphan was minted, and the winning split is untouched.
+        assert!(!m.tablets.contains_key(&TabletId(3)));
+        assert_eq!(m.tablets.len(), 2);
+        assert_eq!(m.tablets[&TabletId(1)].epoch, Epoch::INITIAL.next());
+
+        // A retry against the *current* epoch succeeds normally.
+        assert_eq!(
+            m.apply(&MetaCommand::SplitTablet {
+                tablet: TabletId(1),
+                expected_epoch: Epoch::INITIAL.next(),
+                split_key: b"c".to_vec(),
+                new_id: TabletId(3),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert!(m.tablets.contains_key(&TabletId(3)));
     }
 }

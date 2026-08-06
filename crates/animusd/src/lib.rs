@@ -3483,6 +3483,16 @@ impl ClientCtx {
     /// `pending` map exists to close: it used to do `let _ = trigger_split(..).await`,
     /// which drops step-2 errors on the floor and orphans the tablet for good).
     ///
+    /// `MetaCommand::SplitTablet` is a compare-and-swap on the source tablet's
+    /// epoch (read from the same snapshot as `new_id`): if a *different* proposer
+    /// already split `tablet` since this call read it, the commit is rejected
+    /// outright here — cleanly, via the existing `Err` path below — instead of
+    /// also succeeding and minting a second child id that can never get a CP
+    /// group (the tablet's own per-group Raft can only ever apply one real
+    /// `Split`, ever). Without the CAS this raced two independent
+    /// `auto_split_loop` instances (or an auto-trigger racing a manual one) into
+    /// permanently orphaning the loser's `new_id`.
+    ///
     /// [`propose_split_data`]: Self::propose_split_data
     #[tracing::instrument(
         name = "split_metadata",
@@ -3501,11 +3511,18 @@ impl ClientCtx {
         // replica still holding the dropped tablet's `db-t{id}-*` files would
         // re-host them AS the new tablet (data resurrection the absence-keyed GC
         // can never reclaim). The apply also rejects a below-allocator id, so a
-        // stale proposer cannot reintroduce reuse.
-        let new_id = self.raft.metadata().next_free_tablet_id();
+        // stale proposer cannot reintroduce reuse. `new_id` and `expected_epoch`
+        // come from the **same** metadata snapshot so the CAS reflects exactly
+        // what this call saw.
+        let meta = self.raft.metadata();
+        let new_id = meta.next_free_tablet_id();
+        let Some(expected_epoch) = meta.tablets.get(&tablet).map(|t| t.epoch) else {
+            return Err(ClientResponse::Error("no such tablet".into()));
+        };
         tracing::Span::current().record("new_id", new_id.0);
         let cmd = MetaCommand::SplitTablet {
             tablet,
+            expected_epoch,
             split_key,
             new_id,
         };

@@ -253,6 +253,28 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   engineering-practices entry for the general lesson (a "give up" exit from a
   retry loop must leave the same rate-limit state a normal successful cycle
   would).
+- **The "abandon" branch above stopped a losing proposer from retrying forever,
+  but never cleaned up the metadata-only tablet id its own step 1 had already
+  minted — that id was a *permanent* orphan, not just a transient one.** The
+  root cause was one layer down, in `animus-control`: `MetaCommand::SplitTablet`
+  applied unconditionally as long as `split_key` fell inside the source
+  tablet's *current* range, with no CAS on its epoch (unlike its sibling
+  `CasTabletReplicas`) — so two proposers racing to split the same tablet at
+  the same epoch (two `auto_split_loop` instances despite `claim_auto_split`
+  serializing *auto-triggered* attempts against each other, or any other racing
+  caller) could both have their `SplitTablet` commit, each minting a `new_id`.
+  Only one can ever get a real CP group (the tablet's own per-group Raft
+  applies at most one `Split`, ever), so the loser's `new_id` was permanently
+  `leader: unknown` — present in `Metadata.tablets`, invisible in
+  `/admin/raftkv`, unreachable, forever (live-observed: two such tablets under
+  `--cluster 3 --auto-split 2000` bulk-seed). Fixed at the source: `SplitTablet`
+  now takes `expected_epoch` and is rejected on mismatch, exactly like
+  `CasTabletReplicas` — so the loser's `propose_split_metadata` (step 1) itself
+  now fails cleanly, hitting the *existing* "nothing was allocated, no orphan to
+  track" path, and no second `new_id` is ever minted. See the root `CLAUDE.md`
+  engineering-practices entry (a new command mutating a resource another
+  command already CASes needs the same guard) and
+  `animus-control/CLAUDE.md`'s `SplitTablet` note.
 - **A `RaftKvNode` group applies at most one `Split`, *ever* — `auto_split_loop`
   didn't know that, and kept re-triggering an already-split tablet forever.**
   `KvCommand::Split`'s apply-time guard (`animus-cp-data`) makes every `Split`

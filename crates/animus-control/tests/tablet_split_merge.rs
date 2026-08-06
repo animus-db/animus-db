@@ -58,6 +58,7 @@ fn split_then_merge_round_trips_through_raft() {
     });
     nodes[l].propose(MetaCommand::SplitTablet {
         tablet: TabletId(1),
+        expected_epoch: Epoch::INITIAL,
         split_key: b"m".to_vec(),
         new_id: TabletId(2),
     });
@@ -111,6 +112,70 @@ fn split_then_merge_round_trips_through_raft() {
     }
 }
 
+/// Two proposers racing to split the same tablet at the same epoch — each
+/// computing a different median from an equally-stale view of the pre-split
+/// range, exactly what two independent `auto_split_loop` instances (or an
+/// auto-split racing a manual admin trigger) can do — must not both commit.
+/// Before the `expected_epoch` CAS, both would apply (each split key is
+/// strictly inside the tablet's *original* range), minting two child tablet
+/// ids when the tablet's own per-group CP-data Raft can only ever host one
+/// real split, ever — leaving the loser permanently orphaned (observed live
+/// under sustained `--auto-split` bulk-seed load). With the CAS, only the
+/// first proposal to land in the log applies; the second is cleanly rejected
+/// once the epoch has moved, so no orphan tablet id is ever minted.
+#[test]
+fn racing_splits_at_the_same_epoch_only_one_applies() {
+    let seed = 0x59_18;
+    let (mut sim, nodes) = cluster(seed);
+    sim.run_for(Duration::from_secs(2));
+    let l = leader(&nodes);
+
+    nodes[l].propose(MetaCommand::CreateTablet {
+        tablet: TabletId(1),
+        table: None,
+        range: KeyRange::whole(),
+        replicas: NODES.to_vec(),
+    });
+    sim.run_for(Duration::from_secs(2));
+
+    nodes[l].propose(MetaCommand::SplitTablet {
+        tablet: TabletId(1),
+        expected_epoch: Epoch::INITIAL,
+        split_key: b"m".to_vec(),
+        new_id: TabletId(2),
+    });
+    nodes[l].propose(MetaCommand::SplitTablet {
+        tablet: TabletId(1),
+        expected_epoch: Epoch::INITIAL,
+        split_key: b"q".to_vec(),
+        new_id: TabletId(3),
+    });
+    sim.run_for(Duration::from_secs(2));
+
+    let meta = nodes[l].metadata();
+    for n in &nodes {
+        assert_eq!(n.metadata(), meta, "metadata diverged across nodes");
+    }
+    assert_eq!(
+        meta.tablets.len(),
+        2,
+        "the losing split must not create an orphan tablet"
+    );
+    assert_eq!(
+        meta.tablets[&TabletId(1)].epoch,
+        Epoch(2),
+        "the source tablet split exactly once"
+    );
+    assert!(
+        meta.tablets.contains_key(&TabletId(2)) ^ meta.tablets.contains_key(&TabletId(3)),
+        "exactly one of the two racing splits should have won"
+    );
+    assert!(
+        partitions_keyspace(&meta),
+        "keyspace not cleanly partitioned after the race"
+    );
+}
+
 #[test]
 fn invalid_split_and_merge_are_rejected_deterministically() {
     let mut meta = Metadata::default();
@@ -132,6 +197,7 @@ fn invalid_split_and_merge_are_rejected_deterministically() {
     assert!(matches!(
         meta.apply(&MetaCommand::SplitTablet {
             tablet: TabletId(1),
+            expected_epoch: Epoch::INITIAL,
             split_key: b"q".to_vec(),
             new_id: TabletId(2),
         }),
