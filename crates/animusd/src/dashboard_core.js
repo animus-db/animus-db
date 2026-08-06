@@ -191,19 +191,93 @@ function tabFromPath(path) {
   return m && TABS.includes(m[1]) ? m[1] : TABS[0];
 }
 
+let activeTab = TABS[0];
+
+// Storage-tab deep-linking: the selected tablet + node ride along as
+// `?tablet=&node=` on the `/admin/ui/storage` URL, so a refresh or a
+// back/forward navigation lands back on the same detail instead of just the
+// bare tab (the one gap the pre-existing `/admin/ui/<tab>` scheme left,
+// noted in ADR 0021 follow-up 7). The node identifier is its stable admin
+// `base` origin — the same value already used as the `<option value>` in
+// `updateStorageNodeOptions` — so no separate id scheme is needed.
+let pendingStorageParams = null;
+
+function paramsFromLocation() {
+  const p = new URLSearchParams(window.location.search);
+  const tablet = p.get("tablet");
+  const node = p.get("node");
+  return (tablet || node) ? { tablet, node } : null;
+}
+
+// The storage tab's query string, from `override` if given, otherwise from
+// the selects' current values (so a plain tab switch preserves whatever was
+// already picked).
+function storageQuery(override) {
+  const tablet = (override && override.tablet != null) ? override.tablet : $("st-tablet").value;
+  const node = (override && override.node != null) ? override.node : $("st-node").value;
+  if (!tablet && !node) return "";
+  const p = new URLSearchParams();
+  if (tablet) p.set("tablet", tablet);
+  if (node) p.set("node", node);
+  return "?" + p.toString();
+}
+
+// Re-sync the address bar with the Storage tab's current selection. Called
+// whenever the tablet/node dropdowns change while that tab is active, so
+// manual browsing (not just a cross-link jump) is also bookmarkable.
+function syncStorageUrl() {
+  if (activeTab !== "storage") return;
+  history.replaceState({ tab: "storage" }, "", "/admin/ui/storage" + storageQuery());
+}
+
+// Apply a pending `{tablet, node}` (from a deep-link URL or a cross-tab jump)
+// to the Storage selects and load its detail. Consumed once — a routine
+// refresh afterward must not keep re-forcing the selection over a manual
+// change, the same discipline `lastRenderedTable` uses for the Dynamo editor.
+function applyPendingStorageParams() {
+  if (!pendingStorageParams) return;
+  const { tablet, node } = pendingStorageParams;
+  pendingStorageParams = null;
+  if (tablet != null) {
+    const tsel = $("st-tablet");
+    if ([...tsel.options].some((o) => o.value === String(tablet))) tsel.value = String(tablet);
+  }
+  updateStorageNodeOptions();
+  if (node != null) {
+    const nsel = $("st-node");
+    if ([...nsel.options].some((o) => o.value === node)) nsel.value = node;
+  }
+  loadStorage();
+}
+
+// Jump to the Storage tab pre-selecting `tablet` and/or `node` (either may be
+// `null` to leave that selector as-is) — used by cross-links from the Tablets
+// and Nodes tables so "which tablet/node is this" never means re-picking the
+// same ids in two dropdowns by hand.
+function gotoStorage(tablet, node) {
+  const params = { tablet: tablet != null ? String(tablet) : null, node: node || null };
+  activateTab("storage", { push: true, storage: params });
+  pendingStorageParams = params;
+  applyPendingStorageParams();
+}
+
 // Show `tab` and, unless `opts.silent` (used from the popstate handler, where the
 // browser already changed the URL), sync the address bar: `push` adds a history
 // entry (nav click), otherwise the URL is normalized in place (initial load).
+// `opts.storage` overrides the Storage tab's query params (a cross-link jump);
+// otherwise they're read from the selects' current values.
 function activateTab(tab, opts = {}) {
   if (!TABS.includes(tab)) tab = TABS[0];
   const group = groupOf(tab);
+  activeTab = tab;
   lastTabInGroup[group] = tab;
   document.querySelectorAll(".primary button").forEach((x) => x.classList.toggle("active", x.dataset.group === group));
   document.querySelectorAll(".secondary").forEach((x) => { x.style.display = x.dataset.group === group ? "" : "none"; });
   document.querySelectorAll(".secondary button").forEach((x) => x.classList.toggle("active", x.dataset.tab === tab));
   document.querySelectorAll("main section").forEach((x) => x.classList.toggle("active", x.id === tab));
   if (!opts.silent) {
-    const url = "/admin/ui/" + tab;
+    const query = tab === "storage" ? storageQuery(opts.storage) : "";
+    const url = "/admin/ui/" + tab + query;
     if (opts.push) history.pushState({ tab }, "", url);
     else history.replaceState({ tab }, "", url);
   }

@@ -61,8 +61,14 @@ function renderNodes() {
     const r = node && node.raft;
     const kv = node && node.raftkv;
     const leader = r && r.is_leader ? `<span class="leader">leader</span>` : (r ? "follower" : "—");
+    // Jump straight to this node's Storage detail (its first hosted tablet, if
+    // any) instead of re-picking the same node in a dropdown by hand.
+    const firstTablet = node ? firstHostedTablet(node) : null;
+    const idCell = node
+      ? `<a href="#" class="node-jump mono" data-node="${esc(node.base)}" data-tablet="${firstTablet == null ? "" : esc(firstTablet)}">${esc(id)}</a>`
+      : esc(id);
     return `<tr>
-      <td class="mono">${esc(id)}</td>
+      <td class="mono">${idCell}</td>
       <td>${m ? pill(m.status, m.status) : "—"}</td>
       <td>${reach}</td>
       <td>${r ? esc(r.role) : "—"} ${leader === "—" ? "" : "· " + leader}</td>
@@ -78,6 +84,21 @@ function renderNodes() {
     <tbody>${rows}</tbody></table>`
     + (STATE.peersErr ? `<div class="err-line">peers fan-out fell back to this node only: ${esc(STATE.peersErr)}</div>` : "")
     : `<div class="empty">no members (control plane not ready?)</div>`;
+  document.querySelectorAll(".node-jump").forEach((a) =>
+    a.addEventListener("click", (e) => {
+      e.preventDefault();
+      gotoStorage(a.dataset.tablet || null, a.dataset.node);
+    }));
+}
+
+// The first tablet id (by sort order) whose CP group this node hosts a
+// replica of, or `null` if it hosts none — used to seed a sensible default
+// tablet selection when jumping from a node row into Storage.
+function firstHostedTablet(node) {
+  const groups = cpGroupsByTablet();
+  const ids = Object.keys(groups).map(Number).sort((a, b) => a - b);
+  const hit = ids.find((id) => groups[id].some((x) => x.node === node));
+  return hit == null ? null : hit;
 }
 
 // Collect every hosted CP group across reachable nodes, indexed by tablet id.
@@ -110,8 +131,12 @@ function renderTablets() {
     const tableCell = t.table
       ? `<span class="mono">${esc(t.table)}</span>`
       : `<span class="muted">—</span>`;
+    // Jump straight to this tablet's Storage detail (preferring its leader,
+    // which cannot 404 on the storage endpoints) instead of re-picking the
+    // same tablet id in a dropdown by hand.
+    const jumpNode = lead ? lead.node.base : (gs[0] ? gs[0].node.base : "");
     return `<tr>
-      <td class="mono">${esc(id)}</td>
+      <td class="mono"><a href="#" class="tablet-jump" data-tablet="${esc(id)}" data-node="${esc(jumpNode)}">${esc(id)}</a></td>
       <td>${tableCell}</td>
       <td class="mono">${esc(tokenBound(t.range && t.range.start, "AAAAAAAAAAA"))} → ${esc(tokenBound(t.range && t.range.end, "__________8"))}</td>
       <td class="mono">${esc(t.epoch)}</td>
@@ -127,6 +152,11 @@ function renderTablets() {
       <th>leader</th><th>term</th><th>commit/applied/durable</th><th>voters (group)</th></tr></thead>
     <tbody>${rows}</tbody></table>`
     : `<div class="empty">no tablets</div>`;
+  document.querySelectorAll(".tablet-jump").forEach((a) =>
+    a.addEventListener("click", (e) => {
+      e.preventDefault();
+      gotoStorage(a.dataset.tablet, a.dataset.node || null);
+    }));
 }
 
 function nodeRaftkvId(n) { return n.config ? n.config.raftkv_id : "?"; }
@@ -139,6 +169,9 @@ function renderStorageSelectors() {
   tsel.innerHTML = tablets.map((id) => `<option value="${id}">tablet ${id}</option>`).join("");
   if (prevT && [...tsel.options].some((o) => o.value === prevT)) tsel.value = prevT;
   updateStorageNodeOptions();
+  // A deep-linked tablet/node (from the URL on load, or a browser back/forward
+  // into the Storage tab) is applied once the options it needs actually exist.
+  if (pendingStorageParams) applyPendingStorageParams();
 }
 
 // The storage endpoints (WAL/LSM/scan/key) are node-local — a node that hosts no
