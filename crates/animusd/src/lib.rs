@@ -1206,6 +1206,14 @@ pub struct ClusterEdgeState {
     /// cluster has one whole-keyspace tablet, so there is one entry; a tablet split
     /// adds another.
     raftkv: Arc<Mutex<BTreeMap<TabletId, Vec<CpGroup>>>>,
+    /// Tablets with a **fresh** auto-split attempt currently in flight (`auto_split_loop`
+    /// claim/release, see [`ClusterEdgeState::claim_auto_split`]) — cluster-wide, not
+    /// per-node, because `cp_leader`'s "only the leader's host triggers" gate is not
+    /// actually node-scoped under `--cluster N`'s shared `raftkv` map above (every
+    /// hosting node's handle for a tablet is registered on this *same* struct, so
+    /// `cp_leader` returns `Some` to every node's loop, not just the tablet's true
+    /// host).
+    auto_split_claims: Arc<Mutex<BTreeSet<TabletId>>>,
 }
 
 impl Default for ClusterEdgeState {
@@ -1222,6 +1230,7 @@ impl ClusterEdgeState {
             dynamo_registry: Arc::new(Mutex::new(animus_dynamo::SchemaRegistry::new())),
             cql_state: Arc::new(tokio::sync::Mutex::new(cql::CqlState::default())),
             raftkv: Arc::new(Mutex::new(BTreeMap::new())),
+            auto_split_claims: Arc::new(Mutex::new(BTreeSet::new())),
         }
     }
 
@@ -1290,6 +1299,37 @@ impl ClusterEdgeState {
             .get(&tablet)?
             .first()
             .cloned()
+    }
+
+    /// Claim the right to drive a **fresh** auto-split trigger for `tablet` —
+    /// cluster-wide, not per-node. `auto_split_loop`'s "only the leader's host
+    /// triggers" gate (`ctx.edge.cp_leader(tablet)`) is not actually node-scoped
+    /// under `--cluster N`'s shared edge state: every hosting node's handle for
+    /// `tablet` is registered on this *same* `ClusterEdgeState`, so `cp_leader`
+    /// returns `Some` to every node's loop, not just the tablet's true host —
+    /// without this claim, all of them could independently propose a fresh,
+    /// possibly differently-keyed `SplitTablet` for the same source tablet in
+    /// the same tick (only one can ever win the tablet's one-time data-plane
+    /// split; the losers are permanently orphaned metadata-only tablets, and the
+    /// duplicate proposals themselves flood the control-plane Raft log). Held
+    /// for the lifetime of the whole split attempt (step 1, step 2, and any
+    /// pending retry), released via
+    /// [`release_auto_split`](Self::release_auto_split) once it resolves
+    /// (success, a step-1 failure, or abandonment). Returns `true` if the claim
+    /// was newly taken (i.e. the caller should proceed).
+    fn claim_auto_split(&self, tablet: TabletId) -> bool {
+        self.auto_split_claims
+            .lock()
+            .expect("auto-split claim set poisoned")
+            .insert(tablet)
+    }
+
+    /// Release a claim taken by [`claim_auto_split`](Self::claim_auto_split).
+    fn release_auto_split(&self, tablet: TabletId) {
+        self.auto_split_claims
+            .lock()
+            .expect("auto-split claim set poisoned")
+            .remove(&tablet);
     }
 
     /// Every CP group this node hosts, as `(tablet, group)` pairs in tablet order
@@ -3047,6 +3087,7 @@ async fn auto_split_loop(ctx: ClientCtx, threshold: usize) {
                 .instrument(span)
                 .await;
             if matches!(response, ClientResponse::PutOk) {
+                ctx.edge.release_auto_split(tablet);
                 continue;
             }
             // A different proposer's key may have already won this group's
@@ -3079,6 +3120,7 @@ async fn auto_split_loop(ctx: ClientCtx, threshold: usize) {
                 // turn — instead of backing off to let the winning split's data
                 // move actually shrink the tablet below `threshold`.
                 last_triggered.insert(tablet, tokio::time::Instant::now());
+                ctx.edge.release_auto_split(tablet);
                 continue;
             }
             tracing::warn!(
@@ -3126,6 +3168,17 @@ async fn auto_split_loop(ctx: ClientCtx, threshold: usize) {
             // interior key of > threshold >= 2 distinct keys), so `SplitTablet`
             // accepts it.
             let median = pairs[pairs.len() / 2].0.clone();
+            // Claim this tablet cluster-wide before proposing: under `--cluster N`'s
+            // shared edge state, the `cp_leader` gate above is `Some` on *every*
+            // node's loop, not just the tablet's true host, so without this claim
+            // multiple nodes could independently propose a fresh, possibly
+            // differently-keyed `SplitTablet` for the same source tablet this same
+            // tick (see `ClusterEdgeState::claim_auto_split`'s doc). Held through
+            // step 1, step 2, and any pending retry; released on every terminal
+            // outcome below and in the pending-retry loop above.
+            if !ctx.edge.claim_auto_split(tablet) {
+                continue;
+            }
             last_triggered.insert(tablet, tokio::time::Instant::now());
             let span = tracing::info_span!("auto_split", tablet = tablet.0, kind = "fresh");
             async {
@@ -3138,6 +3191,7 @@ async fn auto_split_loop(ctx: ClientCtx, threshold: usize) {
                                 new_id = new_id.0,
                                 "auto_split: split accepted"
                             );
+                            ctx.edge.release_auto_split(tablet);
                         } else {
                             tracing::warn!(
                                 tablet = tablet.0,
@@ -3147,6 +3201,8 @@ async fn auto_split_loop(ctx: ClientCtx, threshold: usize) {
                                  committed in metadata but leaderless; queued for retry"
                             );
                             pending.insert(tablet, median);
+                            // claim stays held — released when the pending retry
+                            // above resolves (success or abandonment).
                         }
                     }
                     Err(response) => {
@@ -3158,6 +3214,7 @@ async fn auto_split_loop(ctx: ClientCtx, threshold: usize) {
                             ?response,
                             "auto_split: step 1 (split metadata) did not commit"
                         );
+                        ctx.edge.release_auto_split(tablet);
                     }
                 }
             }
