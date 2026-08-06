@@ -2718,19 +2718,73 @@ const AUTO_SPLIT_EST_ENTRY_BYTES: u64 = 32;
 /// `threshold` is a **key count** here — a placeholder size signal; a real
 /// byte/size-based threshold is future tuning. Disabled unless a threshold is wired
 /// (so it never perturbs clusters that don't opt in).
+///
+/// **Step 2 of a split (the data-plane `propose_split`) can fail independently of
+/// step 1 (the control-plane `SplitTablet` metadata, which by itself already makes
+/// the new tablet visible with a real range/replica set — see
+/// [`ClientCtx::propose_split_metadata`])** — e.g. the tablet's CP leader moved or
+/// was briefly unreachable during bulk-write load. This loop used to call the
+/// combined [`ClientCtx::trigger_split`] and discard the result
+/// (`let _ = ctx.trigger_split(..).await`), which on a step-2 failure left the new
+/// tablet **permanently orphaned**: present in `Metadata.tablets` with a valid
+/// range, but with no CP Raft group ever minted on any node — `leader: unknown`
+/// forever, and any read/write routed to its range hangs. Worse, since the
+/// underlying data never actually moved (the data-plane split never ran), the
+/// source tablet kept re-triggering on later ticks and minting *more* orphans from
+/// the same unshrunk dataset.
+///
+/// The `pending` map closes this: a tablet whose step 1 committed but whose step 2
+/// hasn't yet succeeded is retried **every tick** with the *same* `split_key`
+/// (`propose_split_data` is idempotent, so replaying it is always safe) instead of
+/// being abandoned, and is skipped when scanning for *new* candidates below — so a
+/// still-unmoved source tablet can't mint a second orphan while the first split is
+/// still in flight.
+///
+/// Whether `tablet` is a *fresh* auto-split candidate this tick — the pure decision
+/// half of the scan loop below, split out so the "don't start a second split while
+/// one is pending" invariant is unit-testable without a live cluster (the race it
+/// guards against — a tablet's `propose_split` failing right after its
+/// `SplitTablet` metadata commits — needs real leader churn under load to occur
+/// naturally, which isn't reproducible on demand; mirrors why
+/// `topology::decide_cp_route` is factored out the same way).
+fn is_fresh_split_candidate(
+    tablet: TabletId,
+    pending: &BTreeMap<TabletId, Vec<u8>>,
+    last_triggered: &BTreeMap<TabletId, tokio::time::Instant>,
+    cooldown: Duration,
+) -> bool {
+    if pending.contains_key(&tablet) {
+        return false;
+    }
+    !matches!(last_triggered.get(&tablet), Some(at) if at.elapsed() < cooldown)
+}
+
 async fn auto_split_loop(ctx: ClientCtx, threshold: usize) {
     let mut last_triggered: BTreeMap<TabletId, tokio::time::Instant> = BTreeMap::new();
     // When each tablet last had a *full* (materializing) count — the expensive
     // confirm is rate-limited per tablet, not run every tick.
     let mut last_counted: BTreeMap<TabletId, tokio::time::Instant> = BTreeMap::new();
+    // Tablets whose `SplitTablet` metadata committed but whose data-plane
+    // `propose_split` hasn't succeeded yet, keyed by the *source* tablet being
+    // split (see the function doc above).
+    let mut pending: BTreeMap<TabletId, Vec<u8>> = BTreeMap::new();
     loop {
         tokio::time::sleep(AUTO_SPLIT_INTERVAL).await;
+
+        for (tablet, split_key) in std::mem::take(&mut pending) {
+            if matches!(
+                ctx.propose_split_data(tablet, split_key.clone()).await,
+                ClientResponse::PutOk
+            ) {
+                continue;
+            }
+            pending.insert(tablet, split_key);
+        }
+
         let tablets: Vec<TabletId> = ctx.raft.metadata().tablets.keys().copied().collect();
         for tablet in tablets {
-            if let Some(at) = last_triggered.get(&tablet) {
-                if at.elapsed() < AUTO_SPLIT_COOLDOWN {
-                    continue;
-                }
+            if !is_fresh_split_candidate(tablet, &pending, &last_triggered, AUTO_SPLIT_COOLDOWN) {
+                continue;
             }
             // Only the leader's host reads + triggers (else this node doesn't have
             // the leader handle).
@@ -2765,7 +2819,21 @@ async fn auto_split_loop(ctx: ClientCtx, threshold: usize) {
             // accepts it.
             let median = pairs[pairs.len() / 2].0.clone();
             last_triggered.insert(tablet, tokio::time::Instant::now());
-            let _ = ctx.trigger_split(tablet, median).await;
+            match ctx.propose_split_metadata(tablet, median.clone()).await {
+                Ok(_new_id) => {
+                    if !matches!(
+                        ctx.propose_split_data(tablet, median.clone()).await,
+                        ClientResponse::PutOk
+                    ) {
+                        pending.insert(tablet, median);
+                    }
+                }
+                Err(_) => {
+                    // Step 1 itself didn't commit — nothing was allocated, so
+                    // there's no orphan to track; the next tick's `hot` check
+                    // will naturally retry from scratch.
+                }
+            }
         }
     }
 }
@@ -2931,7 +2999,45 @@ impl ClientCtx {
     /// `propose_split` routes by **tablet id** to the CP-group leader's node (the two
     /// leaders may differ), forwarding a one-hop [`CpSplit`](ClientRequest::CpSplit)
     /// there if this node doesn't host it.
+    ///
+    /// The two steps below ([`propose_split_metadata`], [`propose_split_data`]) are
+    /// **not atomic** — a caller that cannot tolerate leaving an orphaned,
+    /// permanently leaderless tablet behind on a step-2 failure (namely
+    /// [`auto_split_loop`]) must drive the two steps itself and retry step 2 with the
+    /// *same* `split_key` until it succeeds, rather than calling this combined
+    /// one-shot helper. See [`propose_split_metadata`]'s doc for why.
+    ///
+    /// [`propose_split_metadata`]: Self::propose_split_metadata
+    /// [`propose_split_data`]: Self::propose_split_data
     async fn trigger_split(&self, tablet: TabletId, split_key: Vec<u8>) -> ClientResponse {
+        match self.propose_split_metadata(tablet, split_key.clone()).await {
+            Ok(_new_id) => self.propose_split_data(tablet, split_key).await,
+            Err(resp) => resp,
+        }
+    }
+
+    /// Step 1 of a split: record it in the control plane (a new tablet id covering
+    /// `[split_key, ∞)`) and wait until the new tablet is visible here, so the split
+    /// hook can resolve `new_id` from `Metadata` once the data-plane `Split` applies.
+    /// Routed to the control leader. Returns the newly allocated id on success.
+    ///
+    /// **This step alone makes the new tablet appear in `Metadata.tablets`** with a
+    /// real range and replica set — before its CP Raft group exists anywhere. A
+    /// caller that commits this and then never gets [`propose_split_data`] to
+    /// succeed leaves that tablet permanently `leader: unknown`: its key range
+    /// becomes unroutable, and reads/writes there wait forever for a group that will
+    /// never form. **Every caller of this method must eventually retry
+    /// [`propose_split_data`] with the same `split_key` until it succeeds — never
+    /// silently discard a step-2 failure** (this is exactly the bug `auto_split_loop`'s
+    /// `pending` map exists to close: it used to do `let _ = trigger_split(..).await`,
+    /// which drops step-2 errors on the floor and orphans the tablet for good).
+    ///
+    /// [`propose_split_data`]: Self::propose_split_data
+    async fn propose_split_metadata(
+        &self,
+        tablet: TabletId,
+        split_key: Vec<u8>,
+    ) -> Result<TabletId, ClientResponse> {
         // The new tablet id comes from the **monotonic allocator**
         // (`next_free_tablet_id`, ADR 0023 — the same allocator provisioning uses),
         // *not* `max(existing ids) + 1`: `DropTableTablets` removes tablets without
@@ -2941,32 +3047,35 @@ impl ClientCtx {
         // can never reclaim). The apply also rejects a below-allocator id, so a
         // stale proposer cannot reintroduce reuse.
         let new_id = self.raft.metadata().next_free_tablet_id();
-        // 1. Record the split in the control plane and wait until the new tablet is
-        //    visible here, so the split hook can resolve `new_id` from `Metadata`
-        //    when the data-plane `Split` applies. Routed to the control leader.
         let cmd = MetaCommand::SplitTablet {
             tablet,
-            split_key: split_key.clone(),
+            split_key,
             new_id,
         };
-        if self
-            .propose_and_await(cmd, SCHEMA_COMMIT_TIMEOUT, || {
-                self.raft
-                    .metadata()
-                    .tablets
-                    .contains_key(&new_id)
-                    .then_some(())
-            })
-            .await
-            .is_err()
-        {
-            return ClientResponse::Error("split metadata did not commit in time".into());
-        }
-        // 2. Trigger the data-plane split on the tablet's CP group leader (it fires
-        //    every replica's split hook on commit). Routed by **tablet id** — after
-        //    step 1 the split *key* maps to the new right-hand tablet, so a key route
-        //    would target the wrong group. Forward a one-hop `CpSplit` if the CP
-        //    leader is on another node (D2).
+        self.propose_and_await(cmd, SCHEMA_COMMIT_TIMEOUT, || {
+            self.raft
+                .metadata()
+                .tablets
+                .contains_key(&new_id)
+                .then_some(())
+        })
+        .await
+        .map(|()| new_id)
+        .map_err(|()| ClientResponse::Error("split metadata did not commit in time".into()))
+    }
+
+    /// Step 2 of a split: trigger the data-plane split on `tablet`'s CP group leader
+    /// (it fires every replica's split hook on commit). Routed by **tablet id** —
+    /// after step 1 commits, the split *key* maps to the new right-hand tablet, so a
+    /// key route would target the wrong group. Forwards a one-hop `CpSplit` if the CP
+    /// leader is on another node (D2).
+    ///
+    /// **Safe to retry**: `propose_split` is idempotent per group (a group splits
+    /// once in its lifetime; a redundant `Split` entry applies as a no-op), so
+    /// replaying this with the same `split_key` after a `NotLeader` / no-route /
+    /// relay failure is safe — those failures mean the leader moved or was briefly
+    /// unreachable, never that the split itself is invalid.
+    async fn propose_split_data(&self, tablet: TabletId, split_key: Vec<u8>) -> ClientResponse {
         match self.cp_route_tablet(tablet).await {
             CpRoute::Local(leader) => match leader.propose_split(split_key) {
                 ProposeResult::Accepted { .. } => ClientResponse::PutOk,
@@ -3466,4 +3575,63 @@ pub async fn read_frame<T: DeserializeOwned>(stream: &mut TcpStream) -> std::io:
     let msg = serde_json::from_slice(&buf)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     Ok(Some(msg))
+}
+
+#[cfg(test)]
+mod auto_split_candidate_tests {
+    use super::*;
+
+    #[test]
+    fn pending_tablet_is_never_a_fresh_candidate_regardless_of_cooldown() {
+        let mut pending = BTreeMap::new();
+        pending.insert(TabletId(1), b"k".to_vec());
+        let last_triggered = BTreeMap::new();
+        assert!(!is_fresh_split_candidate(
+            TabletId(1),
+            &pending,
+            &last_triggered,
+            Duration::from_secs(0),
+        ));
+    }
+
+    #[test]
+    fn untriggered_tablet_not_in_pending_is_a_fresh_candidate() {
+        let pending = BTreeMap::new();
+        let last_triggered = BTreeMap::new();
+        assert!(is_fresh_split_candidate(
+            TabletId(1),
+            &pending,
+            &last_triggered,
+            Duration::from_secs(15),
+        ));
+    }
+
+    #[test]
+    fn recently_triggered_tablet_is_not_a_fresh_candidate_within_cooldown() {
+        let pending = BTreeMap::new();
+        let mut last_triggered = BTreeMap::new();
+        last_triggered.insert(TabletId(1), tokio::time::Instant::now());
+        assert!(!is_fresh_split_candidate(
+            TabletId(1),
+            &pending,
+            &last_triggered,
+            Duration::from_secs(15),
+        ));
+    }
+
+    #[test]
+    fn tablet_triggered_past_cooldown_is_a_fresh_candidate_again() {
+        let pending = BTreeMap::new();
+        let mut last_triggered = BTreeMap::new();
+        last_triggered.insert(
+            TabletId(1),
+            tokio::time::Instant::now() - Duration::from_millis(50),
+        );
+        assert!(is_fresh_split_candidate(
+            TabletId(1),
+            &pending,
+            &last_triggered,
+            Duration::from_millis(10),
+        ));
+    }
 }

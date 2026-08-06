@@ -129,6 +129,21 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   of the tablet count. (Found via bulk-seed: a pool of 4 left a 6th tablet leaderless;
   the `ProdEnv` "send to unknown peer" log of the missing split member is the
   downstream symptom, now at `debug`.)
+  **A split's two steps (control-plane `SplitTablet` metadata, then the data-plane
+  `propose_split`) are not atomic, and `auto_split_loop` now accounts for that**: a
+  step-2 failure (leader moved, no route — real under bulk-write-induced leader
+  churn) used to be silently discarded, orphaning the tablet forever (visible in
+  `Metadata.tablets` with a real range/replicas, but `leader: unknown` — no CP Raft
+  group anywhere, so any read/write to its range hangs) and, since the source
+  tablet's data never actually shrank, causing the loop to mint *more* orphans on
+  later ticks. The loop now tracks step-1-committed/step-2-pending tablets in a
+  `pending` map, retries step 2 with the same split key every tick until it
+  succeeds (`propose_split` is idempotent per group, so this is always safe), and
+  skips a tablet for a *fresh* split while it's already pending. `ClientCtx::trigger_split`
+  (used by the one-shot admin/manual `SplitTablet` request) is unchanged — a human
+  or script driving it can decide to retry on error — the factored
+  `propose_split_metadata`/`propose_split_data` steps exist so `auto_split_loop` can
+  drive the retry itself instead of going through the combined one-shot helper.
 - **The cluster's members are the CP `raftkv` nodes, not the control ids.** The
   control ids `0..N` are only the Raft *consensus group* for metadata; `bootstrap`
   (leader-only, idempotent) registers the **raftkv ids** (`300+i`) as `Active`
