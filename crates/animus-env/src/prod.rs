@@ -6,10 +6,13 @@
 //! simulation tests, which run against `animus-sim`'s `SimEnv`. Keep production
 //! behavior here so the rest of the codebase stays environment-agnostic.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex};
+use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -43,6 +46,22 @@ struct PoolSlot {
     accept_abort: tokio::task::AbortHandle,
 }
 
+/// Per-stream inbound queues + parked-receiver wakers for one env's inbox
+/// (ADR 0026), demultiplexed from every accepted connection's frames by the
+/// frame's `stream` field. `(node, stream)` stays single-consumer — this
+/// generalizes the pre-multiplexing single inbox rather than changing that
+/// invariant: two different streams' queues/wakers never contend with each
+/// other's *data*, only briefly on the `StdMutex` guarding the map structure
+/// itself (the same micro-contention every `BTreeMap`-behind-a-`Mutex` design
+/// in this codebase already accepts) — nothing is held across an `.await`
+/// while holding this lock, so one stream's consumer being asleep never blocks
+/// another stream's delivery or consumer.
+#[derive(Default)]
+struct Demux {
+    queues: BTreeMap<u64, VecDeque<Envelope>>,
+    wakers: BTreeMap<u64, Waker>,
+}
+
 struct Inner {
     node_id: NodeId,
     start: Instant,
@@ -56,17 +75,18 @@ struct Inner {
     /// Unclaimed pre-bound listeners for [`Coresident::sibling`], shared so any
     /// clone of this env can mint a sibling. Empty for an env bound without a pool.
     pool: Arc<StdMutex<Vec<PoolSlot>>>,
-    /// Cached outbound connections, one per destination address, so `send` does
-    /// not pay a TCP handshake per message (Raft heartbeats/AppendEntries/votes
-    /// are the hot path). Keyed by `SocketAddr`, not `NodeId`: the frame header
-    /// carries `from` per message and the receiver demuxes per *listener*, so
-    /// one stream per address is correct even when several ids map to it, and a
-    /// re-mapped peer id naturally picks up a fresh stream. The outer `StdMutex`
-    /// only guards map lookup/insert (never held across `.await`); the
-    /// per-address `tokio::sync::Mutex` serializes whole-frame writes so
-    /// concurrent senders to one peer never interleave frames, without
-    /// head-of-line blocking *across* peers. Shared (via `Arc`) with siblings,
-    /// like the peer book, so co-resident groups reuse the node's streams.
+    /// Cached outbound connections, one per destination address, so `send`/
+    /// `send_stream` do not pay a TCP handshake per message (Raft heartbeats/
+    /// AppendEntries/votes are the hot path). Keyed by `SocketAddr`, not
+    /// `NodeId`: the frame header carries `from` per message and the receiver
+    /// demuxes per *listener*, so one connection per address is correct even
+    /// when several ids map to it, and a re-mapped peer id naturally picks up
+    /// a fresh connection. The outer `StdMutex` only guards map lookup/insert
+    /// (never held across `.await`); the per-address `tokio::sync::Mutex`
+    /// serializes whole-frame writes so concurrent senders to one peer never
+    /// interleave frames, without head-of-line blocking *across* peers.
+    /// Shared (via `Arc`) with siblings, like the peer book, so co-resident
+    /// groups reuse the node's connections.
     #[allow(clippy::type_complexity)]
     conns: Arc<StdMutex<BTreeMap<SocketAddr, Arc<Mutex<Option<TcpStream>>>>>>,
     data_dir: PathBuf,
@@ -78,12 +98,15 @@ struct Inner {
     /// `replace` re-memoizes (its rename just got the chain fsynced). Per-env
     /// (not shared with siblings): the memo is about *this* env's data dir.
     dir_synced: StdMutex<BTreeSet<String>>,
-    inbox: Mutex<mpsc::UnboundedReceiver<Envelope>>,
+    /// This env's multiplexed inbox (ADR 0026): a background pump task (spawned
+    /// alongside the accept loop, see `spawn_pump`) drains the accept loop's raw
+    /// per-connection frames and files each into `demux.queues[frame.stream]`.
+    demux: Arc<StdMutex<Demux>>,
     /// Abort handles for every task this env owns — the inbound-connection
-    /// accept loop and everything spawned through [`Spawner::spawn`] (the Raft
-    /// driver, the replica serve loop, etc.). [`shutdown`](ProdEnv::shutdown)
-    /// aborts them all so the node can be torn down and its listener port
-    /// freed.
+    /// accept loop, its demux pump, and everything spawned through
+    /// [`Spawner::spawn`] (the Raft driver, the replica serve loop, etc.).
+    /// [`shutdown`](ProdEnv::shutdown) aborts them all so the node can be torn
+    /// down and its listener port freed.
     tasks: StdMutex<Vec<tokio::task::AbortHandle>>,
     /// This node's recording metrics sink (ADR 0015). A real recording handle
     /// (unlike the no-op an arbitrary `Env` returns by default), so the assembled
@@ -131,7 +154,9 @@ impl ProdEnv {
         tokio::fs::create_dir_all(&data_dir).await?;
         let listener = TcpListener::bind(listen).await?;
         let local_addr = listener.local_addr()?;
-        let (rx, accept_abort) = spawn_accept(listener);
+        let (raw_rx, accept_abort) = spawn_accept(listener);
+        let demux = Arc::new(StdMutex::new(Demux::default()));
+        let pump_abort = spawn_pump(raw_rx, Arc::clone(&demux));
 
         // Pre-bind the sibling pool: each slot is a bound listener + its accept
         // loop's inbox, held until `sibling` claims it.
@@ -157,8 +182,8 @@ impl ProdEnv {
                 conns: Arc::new(StdMutex::new(BTreeMap::new())),
                 data_dir,
                 dir_synced: StdMutex::new(BTreeSet::new()),
-                inbox: Mutex::new(rx),
-                tasks: StdMutex::new(vec![accept_abort]),
+                demux,
+                tasks: StdMutex::new(vec![accept_abort, pump_abort]),
                 metrics: MetricsHandle::recording(),
             }),
         };
@@ -275,7 +300,11 @@ async fn open_append(path: &std::path::Path) -> std::io::Result<tokio::fs::File>
         .await
 }
 
-/// Read length-prefixed `[from: u64][len: u32][payload]` frames until EOF.
+/// Read length-prefixed `[from: u64][stream: u64][len: u32][payload]` frames
+/// until EOF (ADR 0026 added the `stream` field; the rest of the frame is
+/// unchanged). These are the *raw*, not-yet-demultiplexed frames off one
+/// accepted connection — `spawn_pump` fans them out by `stream` into an env's
+/// [`Demux`].
 async fn read_frames(
     mut stream: TcpStream,
     tx: mpsc::UnboundedSender<Envelope>,
@@ -286,11 +315,65 @@ async fn read_frames(
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(e) => return Err(e),
         };
+        let msg_stream = stream.read_u64().await?;
         let len = stream.read_u32().await? as usize;
         let mut payload = vec![0u8; len];
         stream.read_exact(&mut payload).await?;
-        if tx.send(Envelope { from, payload }).is_err() {
+        if tx
+            .send(Envelope {
+                from,
+                stream: msg_stream,
+                payload,
+            })
+            .is_err()
+        {
             return Ok(()); // receiver gone; node shutting down
+        }
+    }
+}
+
+/// Drain `raw_rx` (one accept loop's raw, not-yet-demultiplexed frames) and file
+/// each into `demux`, keyed by the frame's `stream` (ADR 0026). Waking a parked
+/// `recv_stream` is done with the demux lock dropped first (never wake while
+/// holding a lock another poll might need). Runs until the accept loop's sender
+/// side is dropped (env shutdown).
+fn spawn_pump(
+    mut raw_rx: mpsc::UnboundedReceiver<Envelope>,
+    demux: Arc<StdMutex<Demux>>,
+) -> tokio::task::AbortHandle {
+    let handle = tokio::spawn(async move {
+        while let Some(env) = raw_rx.recv().await {
+            let stream = env.stream;
+            let waker = {
+                let mut d = demux.lock().expect("demux poisoned");
+                d.queues.entry(stream).or_default().push_back(env);
+                d.wakers.remove(&stream)
+            };
+            if let Some(w) = waker {
+                w.wake();
+            }
+        }
+    });
+    handle.abort_handle()
+}
+
+/// Future that yields the next message addressed to a node on a given stream
+/// (ADR 0026), mirroring `animus-sim`'s `Recv`.
+struct RecvStream {
+    demux: Arc<StdMutex<Demux>>,
+    stream: u64,
+}
+
+impl Future for RecvStream {
+    type Output = Envelope;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Envelope> {
+        let mut d = self.demux.lock().expect("demux poisoned");
+        if let Some(env) = d.queues.get_mut(&self.stream).and_then(VecDeque::pop_front) {
+            Poll::Ready(env)
+        } else {
+            d.wakers.insert(self.stream, cx.waker().clone());
+            Poll::Pending
         }
     }
 }
@@ -324,7 +407,7 @@ impl Rng for ProdEnv {
 
 #[async_trait::async_trait]
 impl Network for ProdEnv {
-    async fn send(&self, to: NodeId, payload: Vec<u8>) {
+    async fn send_stream(&self, to: NodeId, stream: u64, payload: Vec<u8>) {
         let addr = {
             let peers = self.inner.peers.lock().expect("peers poisoned");
             match peers.get(&to) {
@@ -354,16 +437,17 @@ impl Network for ProdEnv {
             let mut conns = self.inner.conns.lock().expect("conns poisoned");
             Arc::clone(conns.entry(addr).or_default())
         };
-        if let Err(err) = send_frame_pooled(&slot, addr, from, &payload).await {
+        if let Err(err) = send_frame_pooled(&slot, addr, from, stream, &payload).await {
             tracing::debug!(?err, to, "send failed (dropped)");
         }
     }
 
-    async fn recv(&self) -> Envelope {
-        let mut rx = self.inner.inbox.lock().await;
-        rx.recv()
-            .await
-            .expect("inbox sender dropped while env is alive")
+    async fn recv_stream(&self, stream: u64) -> Envelope {
+        RecvStream {
+            demux: Arc::clone(&self.inner.demux),
+            stream,
+        }
+        .await
     }
 }
 
@@ -385,6 +469,8 @@ impl Coresident for ProdEnv {
                  co-resident groups for the pre-bound pool; increase the pool size \
                  (animusd's CP_SIBLING_POOL / bind_with_pool's pool_listens)",
         );
+        let demux = Arc::new(StdMutex::new(Demux::default()));
+        let pump_abort = spawn_pump(slot.inbox, Arc::clone(&demux));
         Self {
             inner: Arc::new(Inner {
                 node_id: id,
@@ -395,8 +481,8 @@ impl Coresident for ProdEnv {
                 conns: Arc::clone(&self.inner.conns),
                 data_dir: self.inner.data_dir.join(format!("sib-{id}")),
                 dir_synced: StdMutex::new(BTreeSet::new()),
-                inbox: Mutex::new(slot.inbox),
-                tasks: StdMutex::new(vec![slot.accept_abort]),
+                demux,
+                tasks: StdMutex::new(vec![slot.accept_abort, pump_abort]),
                 metrics: self.inner.metrics.clone(),
             }),
         }
@@ -443,18 +529,19 @@ async fn send_frame_pooled(
     slot: &Mutex<Option<TcpStream>>,
     addr: SocketAddr,
     from: NodeId,
+    msg_stream: u64,
     payload: &[u8],
 ) -> std::io::Result<()> {
     let mut guard = slot.lock().await;
     if guard.is_none() {
         *guard = Some(connect_nodelay(addr).await?);
     }
-    let stream = guard.as_mut().expect("connection just ensured");
-    if let Err(err) = write_frame(stream, from, payload).await {
+    let conn = guard.as_mut().expect("connection just ensured");
+    if let Err(err) = write_frame(conn, from, msg_stream, payload).await {
         tracing::debug!(?err, %addr, "cached connection failed; reconnecting once");
         *guard = None; // drop the stale stream before dialing afresh
         let mut fresh = connect_nodelay(addr).await?;
-        write_frame(&mut fresh, from, payload).await?;
+        write_frame(&mut fresh, from, msg_stream, payload).await?;
         *guard = Some(fresh); // cache only a stream that just carried a frame
     }
     Ok(())
@@ -468,14 +555,21 @@ async fn connect_nodelay(addr: SocketAddr) -> std::io::Result<TcpStream> {
     Ok(stream)
 }
 
-/// Write one length-prefixed `[from: u64][len: u32][payload]` frame — the wire
-/// format is unchanged from the connect-per-message transport, so the receive
-/// side (`read_frames`, which already loops until EOF) needs no change.
-async fn write_frame(stream: &mut TcpStream, from: NodeId, payload: &[u8]) -> std::io::Result<()> {
-    stream.write_u64(from).await?;
-    stream.write_u32(payload.len() as u32).await?;
-    stream.write_all(payload).await?;
-    stream.flush().await?;
+/// Write one length-prefixed `[from: u64][stream: u64][len: u32][payload]`
+/// frame (ADR 0026 added the `stream` field) over a pooled connection — the
+/// receive side (`read_frames`, which already loops until EOF) needs no
+/// further change.
+async fn write_frame(
+    conn: &mut TcpStream,
+    from: NodeId,
+    msg_stream: u64,
+    payload: &[u8],
+) -> std::io::Result<()> {
+    conn.write_u64(from).await?;
+    conn.write_u64(msg_stream).await?;
+    conn.write_u32(payload.len() as u32).await?;
+    conn.write_all(payload).await?;
+    conn.flush().await?;
     Ok(())
 }
 
@@ -808,6 +902,100 @@ mod tests {
         b.shutdown();
         a_sib.shutdown();
         b_sib.shutdown();
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+    }
+
+    /// Multiplexed `(node, stream)` addressing (ADR 0026): two streams from one
+    /// sender to one receiver, driven concurrently on a real multi-threaded
+    /// `tokio` runtime, must never cross-talk — each stream's consumer sees
+    /// exactly its own frames, regardless of how the underlying frames
+    /// interleave on the wire. This is the `ProdEnv` counterpart to
+    /// `animus-sim`'s `multiplexed_streams_are_isolated_and_deterministic`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn prod_env_multiplexed_streams_do_not_cross_talk() {
+        use crate::Network;
+
+        const STREAM_X: u64 = 11;
+        const STREAM_Y: u64 = 22;
+        const N: u8 = 50;
+
+        let dir_a = unique_tmp_dir();
+        let dir_b = unique_tmp_dir();
+        let loop0 = || "127.0.0.1:0".parse::<SocketAddr>().unwrap();
+        let (a, a_addr) = ProdEnv::bind(0, loop0(), &dir_a).await.expect("bind a");
+        let (b, _) = ProdEnv::bind(1, loop0(), &dir_b).await.expect("bind b");
+        b.set_peers([(0, a_addr)].into_iter().collect());
+
+        // Two receive loops on `a`, one per stream, each collecting its frames'
+        // first payload byte (the sequence number) into its own vector.
+        let recv_x = {
+            let a = a.clone();
+            tokio::spawn(async move {
+                let mut got = Vec::new();
+                for _ in 0..N {
+                    got.push(a.recv_stream(STREAM_X).await.payload[0]);
+                }
+                got
+            })
+        };
+        let recv_y = {
+            let a = a.clone();
+            tokio::spawn(async move {
+                let mut got = Vec::new();
+                for _ in 0..N {
+                    got.push(a.recv_stream(STREAM_Y).await.payload[0]);
+                }
+                got
+            })
+        };
+
+        // Two concurrent senders on `b`, each hammering its own stream.
+        let send_x = {
+            let b = b.clone();
+            tokio::spawn(async move {
+                for i in 0..N {
+                    b.send_stream(0, STREAM_X, vec![i]).await;
+                }
+            })
+        };
+        let send_y = {
+            let b = b.clone();
+            tokio::spawn(async move {
+                for i in 0..N {
+                    b.send_stream(0, STREAM_Y, vec![i]).await;
+                }
+            })
+        };
+        send_x.await.expect("send_x task");
+        send_y.await.expect("send_y task");
+
+        let mut got_x = tokio::time::timeout(Duration::from_secs(10), recv_x)
+            .await
+            .expect("stream X recv timed out")
+            .expect("recv_x task");
+        let mut got_y = tokio::time::timeout(Duration::from_secs(10), recv_y)
+            .await
+            .expect("stream Y recv timed out")
+            .expect("recv_y task");
+        got_x.sort_unstable();
+        got_y.sort_unstable();
+
+        let expected: Vec<u8> = (0..N).collect();
+        assert_eq!(
+            got_x, expected,
+            "stream X must receive exactly its own N frames, no more, no less \
+             (a dropped/duplicated/cross-talked frame would show up as a wrong \
+             multiset here)"
+        );
+        assert_eq!(
+            got_y, expected,
+            "stream Y must receive exactly its own N frames — isolated from \
+             stream X's concurrent traffic to the same (from, to) pair"
+        );
+
+        a.shutdown();
+        b.shutdown();
         let _ = std::fs::remove_dir_all(&dir_a);
         let _ = std::fs::remove_dir_all(&dir_b);
     }

@@ -170,6 +170,19 @@ struct IndexState {
     projection: IndexProjection,
     /// `escape(hash) [|| escape(sort)] || base_storage_key` per indexed live item.
     entries: BTreeSet<Vec<u8>>,
+    /// Reverse map: base storage key → its current entry in `entries` (one live
+    /// entry per base key). Lets `note_put`/`note_delete` drop a stale entry with
+    /// two O(log n) map operations instead of a `retain` scan over *every* entry
+    /// on *every* write (which made each write O(index size)).
+    entry_by_base: BTreeMap<Vec<u8>, Vec<u8>>,
+    /// Whether this index's entry data has been (re)built from a base-table scan
+    /// since the index machinery was created. A freshly created [`IndexState`]
+    /// (table registration, or a shape change in `sync_indexes`) starts `false`:
+    /// its entries only reflect writes observed *by this process*, so after a
+    /// restart an index query would silently return nothing. The edge backfills
+    /// lazily on the first index query (see `animusd`'s `dynamo` module) and then
+    /// [`SchemaRegistry::mark_table_backfilled`]s it.
+    backfilled: bool,
 }
 
 impl IndexState {
@@ -196,6 +209,8 @@ fn index_state(index: &SecondaryIndex, base_partition_key: &str) -> (String, Ind
                 sort_attribute: g.sort_attribute.clone(),
                 projection: g.projection.clone(),
                 entries: BTreeSet::new(),
+                entry_by_base: BTreeMap::new(),
+                backfilled: false,
             },
         ),
         // An LSI hashes by the base table's partition key and sorts by its
@@ -207,6 +222,8 @@ fn index_state(index: &SecondaryIndex, base_partition_key: &str) -> (String, Ind
                 sort_attribute: Some(l.sort_attribute.clone()),
                 projection: l.projection.clone(),
                 entries: BTreeSet::new(),
+                entry_by_base: BTreeMap::new(),
+                backfilled: false,
             },
         ),
     }
@@ -400,11 +417,13 @@ impl SchemaRegistry {
             .ok_or_else(|| RegistryError::NoSuchTable(table.to_owned()))?;
         for index in state.indexes.values_mut() {
             // Drop any stale entry for this base key first (an indexed attribute
-            // may have changed on an overwrite), then re-index if the item still
+            // may have changed on an overwrite) — an O(log n) reverse-map lookup,
+            // not a scan over every entry — then re-index if the item still
             // carries the index's hash attribute (and, for a composite index, its
             // sort attribute).
-            let segments = if index.sort_attribute.is_some() { 2 } else { 1 };
-            index.entries.retain(|e| base_key_of(e, segments) != key);
+            if let Some(stale) = index.entry_by_base.remove(key) {
+                index.entries.remove(&stale);
+            }
             let Some(hash) = item.get(&index.hash_attribute) else {
                 continue;
             };
@@ -417,7 +436,9 @@ impl SchemaRegistry {
                 },
                 None => None,
             };
-            index.entries.insert(index_entry(hash, sort, key));
+            let entry = index_entry(hash, sort, key);
+            index.entries.insert(entry.clone());
+            index.entry_by_base.insert(key.to_vec(), entry);
         }
         Ok(())
     }
@@ -433,10 +454,37 @@ impl SchemaRegistry {
             .get_mut(table)
             .ok_or_else(|| RegistryError::NoSuchTable(table.to_owned()))?;
         for index in state.indexes.values_mut() {
-            let segments = if index.sort_attribute.is_some() { 2 } else { 1 };
-            index.entries.retain(|e| base_key_of(e, segments) != key);
+            // O(log n) reverse-map removal (see `note_put`).
+            if let Some(stale) = index.entry_by_base.remove(key) {
+                index.entries.remove(&stale);
+            }
         }
         Ok(())
+    }
+
+    /// Whether `index` on `table` still needs its entry data **backfilled** from a
+    /// base-table scan: a freshly created index machinery (a restart re-created it
+    /// from the replicated definitions via [`sync_indexes`](Self::sync_indexes), or
+    /// its shape changed) holds only the writes this process observed, so an index
+    /// query against it would silently miss pre-existing items. `false` for an
+    /// unknown table/index (the query path will surface the real error).
+    #[must_use]
+    pub fn index_needs_backfill(&self, table: &str, index: &str) -> bool {
+        self.tables
+            .get(table)
+            .and_then(|t| t.indexes.get(index))
+            .is_some_and(|idx| !idx.backfilled)
+    }
+
+    /// Mark **every** index of `table` as backfilled. Called by the edge after it
+    /// replays a full base-table scan through [`note_put`](Self::note_put) — one
+    /// scan populates all of the table's indexes, so they are all caught up.
+    pub fn mark_table_backfilled(&mut self, table: &str) {
+        if let Some(state) = self.tables.get_mut(table) {
+            for index in state.indexes.values_mut() {
+                index.backfilled = true;
+            }
+        }
     }
 
     /// The base storage keys of items whose secondary `index` hash value equals
@@ -601,38 +649,6 @@ fn split_escaped_prefix(buf: &[u8]) -> (Vec<u8>, &[u8]) {
         }
     }
     (raw, &[])
-}
-
-/// Recover the base storage key from an index entry by skipping `segments`
-/// prefix-free `escape(..)` segments (each terminated by `0x00 0x00`). A
-/// hash-only entry has one segment; a composite entry has two (hash, then sort).
-fn base_key_of(entry: &[u8], segments: usize) -> &[u8] {
-    // Find each `0x00 0x00` terminator that is not part of an escaped `0x00`
-    // (escaped as `0x00 0x01`). Scan for `0x00` and look at the next byte.
-    let mut rest = entry;
-    for _ in 0..segments {
-        let mut i = 0;
-        let mut found = false;
-        while i + 1 < rest.len() {
-            if rest[i] == 0x00 {
-                match rest[i + 1] {
-                    0x00 => {
-                        rest = &rest[i + 2..]; // past this terminator
-                        found = true;
-                        break;
-                    }
-                    0x01 => i += 2, // escaped zero byte
-                    _ => i += 1,
-                }
-            } else {
-                i += 1;
-            }
-        }
-        if !found {
-            return &[];
-        }
-    }
-    rest
 }
 
 #[cfg(test)]
@@ -968,6 +984,49 @@ mod tests {
             reg.index_query_keys("users", "by-org", &s("acme"), None),
             Err(RegistryError::NoSuchIndex("by-org".into()))
         );
+    }
+
+    /// The lazy-backfill flag lifecycle: a freshly created index needs a backfill
+    /// (its entries only reflect writes this process observed — after a restart
+    /// that is nothing); `mark_table_backfilled` clears the need for every index;
+    /// a `sync_indexes` with an *unchanged* shape preserves the flag (and the
+    /// entries), while a *changed* shape re-creates the machinery and needs a
+    /// fresh backfill. Unknown table/index reads as `false` (the query path
+    /// surfaces the real error).
+    #[test]
+    fn backfill_flag_lifecycle() {
+        let mut reg = SchemaRegistry::new();
+        let email = SecondaryIndex::Global(GlobalSecondaryIndex {
+            name: "by-email".into(),
+            key_attribute: "email".into(),
+            sort_attribute: None,
+            projection: IndexProjection::All,
+        });
+        assert!(!reg.index_needs_backfill("users", "by-email")); // unknown table
+
+        reg.create_table_with_indexes("users", TableSchema::simple("id"), vec![email.clone()])
+            .unwrap();
+        assert!(reg.index_needs_backfill("users", "by-email"));
+        assert!(!reg.index_needs_backfill("users", "no-such-index"));
+
+        reg.mark_table_backfilled("users");
+        assert!(!reg.index_needs_backfill("users", "by-email"));
+
+        // Unchanged shape: the flag (like the entries) is preserved.
+        reg.sync_indexes("users", TableSchema::simple("id"), &[email])
+            .unwrap();
+        assert!(!reg.index_needs_backfill("users", "by-email"));
+
+        // Changed shape: fresh machinery, fresh backfill needed.
+        let email_composite = SecondaryIndex::Global(GlobalSecondaryIndex {
+            name: "by-email".into(),
+            key_attribute: "email".into(),
+            sort_attribute: Some("id".into()),
+            projection: IndexProjection::All,
+        });
+        reg.sync_indexes("users", TableSchema::simple("id"), &[email_composite])
+            .unwrap();
+        assert!(reg.index_needs_backfill("users", "by-email"));
     }
 
     #[test]

@@ -54,11 +54,23 @@ impl Nanos {
 /// A boxed, `Send` future — the unit of work accepted by [`Spawner`].
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+/// The well-known stream every pre-multiplexing call site is implicitly on
+/// (ADR 0026). Every protocol that predates multiplexed addressing — the
+/// control plane, a non-split tablet's CP group, everything that only ever
+/// calls [`Network::send`]/[`Network::recv`] — sends and receives on this
+/// stream, so it needs zero call-site changes when a node gains a second
+/// stream for some other protocol instance.
+pub const PRIMARY_STREAM: u64 = 0;
+
 /// A message delivered to a node over the [`Network`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Envelope {
     /// The node that sent this message.
     pub from: NodeId,
+    /// Which logical stream on the destination node this message is for
+    /// (ADR 0026). `(node, stream)` is single-consumer, generalizing the
+    /// pre-multiplexing single-consumer-per-node invariant.
+    pub stream: u64,
     /// The opaque payload. Higher layers define and (de)serialize their own
     /// message types; the network moves bytes.
     pub payload: Vec<u8>,
@@ -120,17 +132,41 @@ pub trait Rng: Send + Sync {
 
 /// Point-to-point message passing between nodes, scoped to *this* node.
 ///
-/// `send` is fire-and-forget: it never reports delivery (the network may delay,
-/// reorder, or drop, and under partition it silently discards), matching the
-/// reality that a successful local send guarantees nothing. `recv` yields the
-/// next message addressed to this node.
+/// `send`/`send_stream` are fire-and-forget: they never report delivery (the
+/// network may delay, reorder, or drop, and under partition it silently
+/// discards), matching the reality that a successful local send guarantees
+/// nothing. `recv`/`recv_stream` yield the next message addressed to this node
+/// (on a given stream).
+///
+/// **Multiplexed addressing (ADR 0026).** [`send_stream`](Network::send_stream)
+/// and [`recv_stream`](Network::recv_stream) are the primitive methods a
+/// `Network` implementation provides; `send`/`recv` are convenience defaults
+/// over [`PRIMARY_STREAM`] so every call site written before this axis
+/// existed — which is nearly all of them — needs no change and behaves
+/// identically. A component that wants a *second* protocol instance
+/// addressable on the same node (e.g. a per-tablet Raft group after a split,
+/// ADR 0017 D) can now open a second stream on the existing env instead of
+/// minting a whole new `NodeId` (the `Coresident` escape hatch this ADR aims to
+/// eventually retire).
 #[async_trait::async_trait]
 pub trait Network: Send + Sync {
-    /// Hand a payload to the network for delivery to `to`.
-    async fn send(&self, to: NodeId, payload: Vec<u8>);
+    /// Hand a payload to the network for delivery to `to` on `stream`.
+    async fn send_stream(&self, to: NodeId, stream: u64, payload: Vec<u8>);
 
-    /// Await the next message addressed to this node.
-    async fn recv(&self) -> Envelope;
+    /// Await the next message addressed to this node on `stream`. `(node,
+    /// stream)` is single-consumer — never run two receive loops on the same
+    /// node id and stream.
+    async fn recv_stream(&self, stream: u64) -> Envelope;
+
+    /// Send on [`PRIMARY_STREAM`] — the whole pre-multiplexing API surface.
+    async fn send(&self, to: NodeId, payload: Vec<u8>) {
+        self.send_stream(to, PRIMARY_STREAM, payload).await;
+    }
+
+    /// Receive on [`PRIMARY_STREAM`] — the whole pre-multiplexing API surface.
+    async fn recv(&self) -> Envelope {
+        self.recv_stream(PRIMARY_STREAM).await
+    }
 }
 
 /// Append-structured durable storage, scoped to *this* node.

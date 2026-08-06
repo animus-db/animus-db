@@ -166,6 +166,18 @@ pub enum MetaCommand {
     /// Remove a table's schema from the catalog (ADR 0013). Idempotent: a no-op
     /// if no schema is registered for `table`.
     DropTableSchema { table: TableName },
+    /// **Atomically replace** an existing table's schema (ADR 0013) — the in-place
+    /// schema mutation behind CQL `ALTER TABLE … ADD` (which appends columns to
+    /// the current schema and replaces it wholesale). One command, one apply: no
+    /// drop-then-recreate window in which a crash — or any reader of a replica
+    /// that applied the drop but not yet the recreate — sees the table
+    /// schema-less. Rejected if `table` has no schema (an ALTER cannot create a
+    /// table) or if the replacement is malformed; a no-op if the schema is already
+    /// identical (so a re-proposed ALTER does not churn the log).
+    ReplaceTableSchema {
+        table: TableName,
+        schema: TableSchema,
+    },
     /// Remove **every tablet scoped to `table`** from the tablet map, with their
     /// placement policies (ADR 0024 drop-table GC — the metadata half; each
     /// hosting node's GC loop reclaims its local group + engine files once the
@@ -403,6 +415,17 @@ impl Metadata {
                 if self.tablets.contains_key(new_id) {
                     return ApplyOutcome::Rejected("new tablet id already exists");
                 }
+                // Enforce the monotonic allocator (ADR 0023) at apply time, not just
+                // at the proposer: a `new_id` below [`Metadata::next_free_tablet_id`]
+                // could *reuse* an id freed by `DropTableTablets` — and a replica
+                // still holding the dropped tablet's `db-t{id}-*` files (GC
+                // incomplete, or down during the drop) would re-host them AS the new
+                // tablet, resurrecting dropped data the absence-keyed GC can then
+                // never reclaim. The present-tablet check above cannot catch a
+                // *freed* id, so reject anything below the allocator floor.
+                if new_id.0 < self.next_free_tablet_id().0 {
+                    return ApplyOutcome::Rejected("new tablet id below the monotonic allocator");
+                }
                 let Some(source) = self.tablets.get(tablet) else {
                     return ApplyOutcome::Rejected("no such tablet");
                 };
@@ -476,6 +499,19 @@ impl Metadata {
                 } else {
                     ApplyOutcome::NoOp
                 }
+            }
+            MetaCommand::ReplaceTableSchema { table, schema } => {
+                let Some(existing) = self.schemas.get(table) else {
+                    return ApplyOutcome::Rejected("no schema to replace for table");
+                };
+                if schema.validate().is_err() {
+                    return ApplyOutcome::Rejected("malformed table schema");
+                }
+                if existing == schema {
+                    return ApplyOutcome::NoOp;
+                }
+                self.schemas.insert(table.clone(), schema.clone());
+                ApplyOutcome::Applied
             }
             MetaCommand::DropTableTablets { table } => {
                 let dropped: Vec<TabletId> =
@@ -696,6 +732,71 @@ impl crate::raft::StateMachine<MetaCommand> for Metadata {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schema::{ColumnDef, ColumnType};
+
+    /// `ReplaceTableSchema` (the atomic `ALTER TABLE` primitive): replaces an
+    /// existing table's schema in **one apply** — rejected when there is no schema
+    /// to replace (an ALTER cannot create a table) or when the replacement is
+    /// malformed; a no-op when identical (a re-proposed ALTER does not churn the
+    /// log). At no point between commands can a reader see the table schema-less
+    /// (the failure mode of the old drop-then-recreate).
+    #[test]
+    fn replace_table_schema_is_atomic_and_validated() {
+        let mut m = Metadata::default();
+        let base = TableSchema::simple("pk", ColumnType::String);
+
+        // No schema yet: replace is rejected (not an upsert).
+        assert_eq!(
+            m.apply(&MetaCommand::ReplaceTableSchema {
+                table: "ks.users".to_owned(),
+                schema: base.clone(),
+            }),
+            ApplyOutcome::Rejected("no schema to replace for table")
+        );
+
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTableSchema {
+                table: "ks.users".to_owned(),
+                schema: base.clone(),
+            }),
+            ApplyOutcome::Applied
+        );
+
+        // Replacing with an identical schema is a no-op.
+        assert_eq!(
+            m.apply(&MetaCommand::ReplaceTableSchema {
+                table: "ks.users".to_owned(),
+                schema: base.clone(),
+            }),
+            ApplyOutcome::NoOp
+        );
+
+        // The ALTER shape: the current schema with a column appended, in one apply.
+        let mut extended = base.clone();
+        extended
+            .columns
+            .push(ColumnDef::new("age", ColumnType::Number));
+        assert_eq!(
+            m.apply(&MetaCommand::ReplaceTableSchema {
+                table: "ks.users".to_owned(),
+                schema: extended.clone(),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(m.schemas.get("ks.users"), Some(&extended));
+
+        // A malformed replacement is rejected and the schema is untouched.
+        let malformed = TableSchema::with_columns("pk", Vec::new(), Vec::new());
+        assert!(malformed.validate().is_err(), "test premise");
+        assert_eq!(
+            m.apply(&MetaCommand::ReplaceTableSchema {
+                table: "ks.users".to_owned(),
+                schema: malformed,
+            }),
+            ApplyOutcome::Rejected("malformed table schema")
+        );
+        assert_eq!(m.schemas.get("ks.users"), Some(&extended));
+    }
 
     /// `RegisterCpAddr` records a CP member's address, updates on change, and is a
     /// no-op when re-registering the same address (Phase 2 address distribution).
@@ -956,5 +1057,55 @@ mod tests {
             ..Metadata::default()
         };
         assert_eq!(legacy.next_free_tablet_id(), TabletId(8));
+    }
+
+    /// `SplitTablet` enforces the monotonic allocator at **apply** time: an id
+    /// freed by `DropTableTablets` is never reused (a replica still holding the
+    /// dropped tablet's on-disk files would re-host them as the new tablet), so a
+    /// split carrying a below-allocator `new_id` — e.g. from a stale or divergent
+    /// proposer computing `max(ids) + 1` — is rejected; the allocator's own id is
+    /// accepted and the counter stays monotonic.
+    #[test]
+    fn split_rejects_a_reused_tablet_id_below_the_allocator() {
+        let mut m = Metadata::default();
+        let create = |id: u64, table: &str| MetaCommand::CreateTablet {
+            tablet: TabletId(id),
+            table: Some(table.to_owned()),
+            range: KeyRange::whole(),
+            replicas: vec![1, 2, 3],
+        };
+        assert_eq!(m.apply(&create(1, "users")), ApplyOutcome::Applied);
+        assert_eq!(m.apply(&create(2, "orders")), ApplyOutcome::Applied);
+
+        // Drop the table owning the **highest** id; the freed id must not come back.
+        assert_eq!(
+            m.apply(&MetaCommand::DropTableTablets {
+                table: "orders".to_owned(),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert!(!m.tablets.contains_key(&TabletId(2)));
+        assert_eq!(m.next_free_tablet_id(), TabletId(3));
+
+        // A split re-minting the freed id (what `max(ids) + 1` would derive here)
+        // is rejected — it does not collide with a *present* tablet, so only the
+        // allocator floor catches it.
+        let split_at = |new_id: u64| MetaCommand::SplitTablet {
+            tablet: TabletId(1),
+            split_key: b"m".to_vec(),
+            new_id: TabletId(new_id),
+        };
+        assert_eq!(
+            m.apply(&split_at(2)),
+            ApplyOutcome::Rejected("new tablet id below the monotonic allocator")
+        );
+        // The rejected split changed nothing.
+        assert_eq!(m.tablets.len(), 1);
+        assert_eq!(m.tablets[&TabletId(1)].epoch, Epoch::INITIAL);
+
+        // The allocator's own id is accepted, and the counter stays monotonic.
+        assert_eq!(m.apply(&split_at(3)), ApplyOutcome::Applied);
+        assert!(m.tablets.contains_key(&TabletId(3)));
+        assert_eq!(m.next_free_tablet_id(), TabletId(4));
     }
 }

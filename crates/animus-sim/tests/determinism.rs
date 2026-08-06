@@ -294,6 +294,110 @@ fn disk_list_is_per_node_and_sorted() {
     );
 }
 
+/// Multiplexed `(node, stream)` addressing (ADR 0026): two streams to the same
+/// node are isolated from each other (no cross-talk) and the whole run
+/// (including the `stream=` field now carried in the trace) stays a byte-
+/// identical function of the seed — the same determinism guarantee every prior
+/// seam addition (metrics, disk `list`) was held to.
+fn run_multiplexed_streams(seed: u64) -> (Vec<u8>, Vec<u8>, Vec<String>) {
+    let mut sim = Simulator::new(seed);
+    const STREAM_A: u64 = 7;
+    const STREAM_B: u64 = 42;
+
+    let seen_a = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let seen_b = Arc::new(Mutex::new(Vec::<u8>::new()));
+    {
+        let env = sim.env(1);
+        let out = Arc::clone(&seen_a);
+        env.clone().spawn_task(async move {
+            for _ in 0..5 {
+                let msg = env.recv_stream(STREAM_A).await;
+                out.lock().unwrap().push(msg.payload[0]);
+            }
+        });
+    }
+    {
+        let env = sim.env(1);
+        let out = Arc::clone(&seen_b);
+        env.clone().spawn_task(async move {
+            for _ in 0..5 {
+                let msg = env.recv_stream(STREAM_B).await;
+                out.lock().unwrap().push(msg.payload[0]);
+            }
+        });
+    }
+    // Interleave sends on both streams from the same sender node.
+    {
+        let sender = sim.env(0);
+        sender.clone().spawn_task(async move {
+            for i in 0..5u8 {
+                sender.send_stream(1, STREAM_A, vec![i]).await;
+                sender.send_stream(1, STREAM_B, vec![100 + i]).await;
+            }
+        });
+    }
+    assert!(
+        sim.run_until_quiescent(100_000),
+        "multiplexed-stream scenario did not settle (seed={seed})"
+    );
+
+    let a = seen_a.lock().unwrap().clone();
+    let b = seen_b.lock().unwrap().clone();
+    (a, b, sim.trace_lines())
+}
+
+#[test]
+fn multiplexed_streams_are_isolated_and_deterministic() {
+    let seed = seed_from_env(0x57EA_11ED);
+    let (a1, b1, trace1) = run_multiplexed_streams(seed);
+    let (a2, b2, trace2) = run_multiplexed_streams(seed);
+
+    // The default `NetConfig` applies random per-message jitter, so delivery
+    // order within one stream is not guaranteed — only *membership* is: each
+    // stream must see exactly its own payloads, never the other stream's
+    // (cross-talk would show up as a wrong value or a wrong count here).
+    let mut sorted_a1 = a1.clone();
+    sorted_a1.sort_unstable();
+    let mut sorted_b1 = b1.clone();
+    sorted_b1.sort_unstable();
+    assert_eq!(
+        sorted_a1,
+        vec![0, 1, 2, 3, 4],
+        "stream A must see exactly its own payloads — no cross-talk from stream \
+         B on the same (from, to) pair (seed={seed})"
+    );
+    assert_eq!(
+        sorted_b1,
+        vec![100, 101, 102, 103, 104],
+        "stream B must see exactly its own payloads — no cross-talk from stream \
+         A on the same (from, to) pair (seed={seed})"
+    );
+    assert_eq!(
+        a1, a2,
+        "stream A's observed sequence (order included) must be a pure function \
+         of the seed (seed={seed})"
+    );
+    assert_eq!(
+        b1, b2,
+        "stream B's observed sequence (order included) must be a pure function \
+         of the seed (seed={seed})"
+    );
+    assert_eq!(
+        trace1, trace2,
+        "trace (now carrying the stream field) must stay byte-identical across \
+         runs of the same seed — multiplexing must not leak nondeterminism \
+         (seed={seed})"
+    );
+    assert!(
+        trace1.iter().any(|l| l.contains("stream=7")),
+        "trace must record stream A's id (seed={seed})"
+    );
+    assert!(
+        trace1.iter().any(|l| l.contains("stream=42")),
+        "trace must record stream B's id (seed={seed})"
+    );
+}
+
 /// Read a seed from `ANIMUS_SEED` for replay, falling back to `default`. A
 /// failing run prints its seed (see the assertion messages) so it can be
 /// replayed with `ANIMUS_SEED=<seed> cargo test`.

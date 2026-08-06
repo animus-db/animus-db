@@ -692,6 +692,14 @@ const SEED_MAX_VALUE_BYTES: usize = 1 << 20;
 /// groups a chunk by tablet, so a chunk that straddles a split boundary commits one
 /// atomic entry per tablet.
 const SEED_BATCH_SIZE: u64 = 500;
+/// Cap on a seed batch's **raw entry bytes** (keys + values). `SEED_BATCH_SIZE`
+/// alone lets a large-`value_bytes` seed build a 500 × 1 MiB batch, whose
+/// cross-process forwarding frame (`ClientRequest::PutBatch`, JSON at ≤ 4 chars
+/// per byte) would blow past the client protocol's [`crate::MAX_FRAME_LEN`].
+/// Bounding the batch by bytes keeps the largest legitimate frame well under the
+/// cap (~4 MiB raw → ~17 MiB JSON); default-sized (64 B) seeds still batch the
+/// full 500 keys.
+const SEED_BATCH_MAX_BYTES: usize = 4 << 20;
 /// Attempts per seeded key, to absorb transient failures while a tablet is
 /// **splitting** (writes racing the split point are truncated/tombstoned and
 /// re-route to the new child on retry). Each attempt is bounded by the data path's
@@ -771,8 +779,13 @@ async fn action_data_seed(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
     let mut written = 0u64;
     let mut first_err: Option<String> = None;
     let mut i = 0u64;
+    // Bound each batch by entry count *and* raw bytes (see `SEED_BATCH_MAX_BYTES`:
+    // the forwarded `PutBatch` frame must stay under `MAX_FRAME_LEN`). ~64 B of
+    // key overhead per entry (token + escaped pk); at least one entry per batch.
+    let per_entry = value_bytes + 64;
+    let max_by_bytes = (SEED_BATCH_MAX_BYTES / per_entry).max(1) as u64;
     while i < count {
-        let chunk = (count - i).min(SEED_BATCH_SIZE);
+        let chunk = (count - i).min(SEED_BATCH_SIZE).min(max_by_bytes);
         // Build the chunk's `(key, value)` pairs and commit them as **one Batch
         // entry per tablet** (`cp_batch_write` groups by tablet) — one consensus
         // round for the whole chunk instead of one per key.
