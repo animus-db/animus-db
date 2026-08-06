@@ -292,10 +292,14 @@ cross-cutting ones. Prune/merge entries that become obsolete.
   so the subsequent `run_node` rebind fails `AddrInUse` intermittently under
   `cargo test --workspace` (it flaked the `animusd` restart tests' *first* bring-up).
   Wrap the bring-up in a bounded retry that re-allocates fresh ports each attempt
-  (`start_single_node` → `(Node, ClusterConfig)`). Only the *first* bring-up can do
-  this — a same-address **restart** must reuse the captured config (it's testing
-  same-address recovery), so it keeps a tiny irreducible window; that's acceptable
-  because the first bring-up is the dominant contention. (`animusd` tests.)
+  (`start_single_node` → `(Node, ClusterConfig)`). A same-address **restart** must
+  reuse the captured config (it's testing same-address recovery), so it can't
+  re-allocate — retry the *rebind in time* instead (the thief is another binary's
+  momentary `free_addrs` probe): `tests/support/mod.rs::restart_same_addrs`. The
+  window was once "acceptably tiny", but every retried bring-up added to the suite
+  raises probe pressure on everyone else — under `--workspace` load the restart
+  tests flaked ~2 in 5 full runs until retried. Both retries are bounded, so a
+  genuinely occupied port still fails. (`animusd` tests.)
 - **Never `let _ = storage.merge(...)` on the write path** — an ack must mean the
   write durably applied; surface storage errors so a non-durable write isn't
   counted toward the quorum (`animus-data` `ack_durability.rs`).

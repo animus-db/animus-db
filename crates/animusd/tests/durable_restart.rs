@@ -25,6 +25,8 @@ use tempfile::TempDir;
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
+mod support;
+
 async fn call(addr: SocketAddr, req: ClientRequest) -> ClientResponse {
     let mut stream = TcpStream::connect(addr).await.expect("connect to node");
     animusd::write_frame(&mut stream, &req).await.expect("send");
@@ -82,7 +84,8 @@ fn single_node_config() -> ClusterConfig {
 /// rebind intermittently fails with `AddrInUse`. Retrying with a brand-new config
 /// makes the first bring-up robust. Returns the started `Node` **and** the
 /// `ClusterConfig` it actually bound, so the restart can reuse the same addresses
-/// (its reuse window is tiny and acceptable).
+/// (the restart's own rebind window is ridden out by
+/// `support::restart_same_addrs`).
 async fn start_single_node(dir: &Path, backend: StorageBackend) -> (Node, ClusterConfig) {
     let mut last_err = None;
     for attempt in 0..10 {
@@ -144,10 +147,9 @@ async fn data_survives_node_restart_on_disk() {
     stop(node).await;
 
     // --- Second incarnation: SAME runtime, SAME data dir + SAME addresses. ---
-    // The clean shutdown above freed the ports, so the replacement rebinds them.
-    let node = animusd::run_node(&config, 0, &node_dir)
-        .await
-        .expect("restart on the same dir/addresses after a clean shutdown");
+    // The clean shutdown above freed the ports; the retried rebind rides out a
+    // concurrent test binary's momentary port probe (see `support`).
+    let node = support::restart_same_addrs(&config, 0, &node_dir, StorageBackend::default()).await;
     await_bootstrap(&node).await;
 
     // The previously-written value survived because the LSM recovered it from
@@ -211,9 +213,7 @@ async fn data_is_lost_on_restart_with_memory_backend() {
 
     stop(node).await;
 
-    let node = animusd::run_node_with(&config, 0, &node_dir, StorageBackend::Memory)
-        .await
-        .expect("restart (memory)");
+    let node = support::restart_same_addrs(&config, 0, &node_dir, StorageBackend::Memory).await;
     await_bootstrap(&node).await;
 
     // The in-memory replica started empty, so the value is gone.
