@@ -837,6 +837,20 @@ where
         }
     }
 
+    /// Immediately (re)replicate to all peers if leader — the **wake-on-propose**
+    /// primitive (ADR 0017 single-write-latency fix): a freshly appended entry can
+    /// be shipped at once instead of waiting for the next heartbeat tick. Resets the
+    /// heartbeat deadline (this send counts as the period's heartbeat, so the timer
+    /// tick won't immediately re-broadcast). Empty on a non-leader.
+    pub fn replicate_now(&mut self, now: Nanos) -> Vec<Out<C>> {
+        if self.role == Role::Leader {
+            self.heartbeat_deadline = Nanos(now.0.saturating_add(self.heartbeat_nanos()));
+            self.broadcast_append()
+        } else {
+            Vec::new()
+        }
+    }
+
     /// Handle an inbound message from `from` at `now`.
     pub fn handle(
         &mut self,

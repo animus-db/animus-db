@@ -75,6 +75,23 @@ the engine — the `AccordCore` sync-core/async-driver split.
     Compaction is skipped while `halted` (it's a WAL-bounding optimization; a rewrite
     racing teardown can fail the `replace`). `is_stopped()` requires *both* tasks
     stopped (`stopped` && `apply_stopped`) before the GC deletes artifacts.
+- **Wake-on-propose cuts single-write latency.** `put`/`delete`/`cas`/
+  `propose_split`/`change_membership` route through `propose_and_wake`: after the
+  core appends the entry, the proposer raises a `ProposeSignal` (`AtomicBool` +
+  `futures::task::AtomicWaker`) that the consensus loop races as a third arm of its
+  `select(recv, timer)`. On that wake the loop calls `RaftCore::replicate_now`
+  (broadcast `AppendEntries` immediately, resetting the heartbeat deadline) instead
+  of leaving the entry parked until the next ~50ms heartbeat tick. **`AtomicWaker` is
+  deliberately executor-agnostic** — it works under both `SimEnv`'s `ArcWake`
+  executor (the wake runs synchronously on the single thread, marking the driver task
+  ready for the next run-loop poll — fully deterministic, no wall clock) and tokio's
+  multi-threaded `ProdEnv` (it resolves the register/wake race); **no tokio-only
+  primitive** is used, so determinism holds. The `ProposePending` future *registers
+  the waker before checking the flag* (the AtomicWaker discipline against a lost
+  wakeup) and consumes the flag (`swap(false)`) on resolve, so it never busy-spins.
+  A `NotLeader` propose appends nothing, so it doesn't wake. Latency-verified over
+  `ProdEnv` in `animusd/tests/cp_plane.rs::single_write_latency_is_low` (median
+  ~52ms → ~11ms).
 - **The Raft log index is the MVCC version.** Apply uses `index` as the engine
   `version`, so per-key LWW reproduces the agreed Raft total order, and re-applying
   on recovery is idempotent.

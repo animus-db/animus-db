@@ -326,6 +326,104 @@ async fn cp_tablet_splits_and_both_halves_serve() {
     }
 }
 
+/// **Single-write latency (deferred fix #2).** A lone CP write used to eat two
+/// ~50ms floors: the cp-data driver waited for the next heartbeat tick before
+/// replicating a freshly proposed entry, and `cp_put_local` confirmed with a fixed
+/// 50ms poll. With **wake-on-propose** (the proposer nudges the consensus loop to
+/// replicate immediately) + a **fine adaptive confirm poll**, a warmed lone write
+/// round-trips in a few ms. Real TCP/time, so we assert a **median well under the
+/// old ~100ms floor** (a generous bound that still fails loudly if either floor
+/// regresses) and that the loop neither deadlocks nor busy-spins (the whole thing
+/// completes far inside the timeout). The `multi_thread` `ProdEnv` run is the
+/// liveness check the deterministic sim cannot give (root CLAUDE.md rule).
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn single_write_latency_is_low() {
+    let dir = tempfile::tempdir().unwrap();
+    let bound = bind_cluster(3, "127.0.0.1".parse().unwrap(), dir.path())
+        .await
+        .unwrap();
+    let nodes = start_cluster(bound).await.unwrap();
+    await_bootstrap(&nodes).await;
+    let addr0 = nodes[0].client_addr();
+
+    // Warm up: provision the tablet + elect the CP leader with a first write
+    // (retried while the group settles). Latency of this cold path is not measured.
+    let warm = async {
+        loop {
+            match call(
+                addr0,
+                ClientRequest::Put {
+                    key: b"warm".to_vec(),
+                    value: b"warm".to_vec(),
+                    table: CP_TABLE.into(),
+                },
+            )
+            .await
+            {
+                ClientResponse::PutOk => return,
+                ClientResponse::Error(_) => sleep(Duration::from_millis(100)).await,
+                other => panic!("unexpected warm-up put: {other:?}"),
+            }
+        }
+    };
+    timeout(Duration::from_secs(20), warm)
+        .await
+        .expect("warm-up write did not succeed within 20s");
+
+    // Measure a batch of lone, sequential writes (each returns only once durably
+    // applied on the leader — durable-before-ack).
+    const N: usize = 20;
+    let mut samples: Vec<Duration> = Vec::with_capacity(N);
+    let measure = async {
+        for i in 0..N {
+            let key = format!("lat{i:03}").into_bytes();
+            let start = tokio::time::Instant::now();
+            let resp = call(
+                addr0,
+                ClientRequest::Put {
+                    key,
+                    value: b"v".to_vec(),
+                    table: CP_TABLE.into(),
+                },
+            )
+            .await;
+            let elapsed = start.elapsed();
+            assert!(
+                matches!(resp, ClientResponse::PutOk),
+                "write {i} failed: {resp:?}"
+            );
+            samples.push(elapsed);
+        }
+    };
+    // If the consensus loop deadlocked (never woke to replicate) or busy-spun into
+    // starvation, the batch would blow this budget; a healthy warm write is a few ms.
+    timeout(Duration::from_secs(15), measure)
+        .await
+        .expect("write batch did not complete — driver deadlock/starvation?");
+
+    samples.sort();
+    let median = samples[N / 2];
+    let max = *samples.last().unwrap();
+    let min = *samples.first().unwrap();
+    println!(
+        "single-write latency over {N} warm writes: min={min:?} median={median:?} max={max:?}"
+    );
+
+    // The old floor was up to ~100ms (heartbeat-tick wait + fixed 50ms confirm
+    // poll). Wake-on-propose + the fine confirm poll put the median far below it.
+    // Threshold is generous for CI jitter while still catching a regression of
+    // either floor (each of which alone would push the median to ~50ms+).
+    assert!(
+        median < Duration::from_millis(40),
+        "median single-write latency {median:?} is not below the 40ms bound \
+         (old ~100ms floor); wake-on-propose / fine confirm poll may have regressed"
+    );
+
+    for n in &nodes {
+        n.shutdown();
+    }
+}
+
 /// Phase 2.4 — **automatic size-telemetry split trigger.** With the auto-split
 /// loop enabled at a low key-count threshold, writing past it causes the tablet's
 /// leader to split it at the median **with no manual trigger**; afterwards both
