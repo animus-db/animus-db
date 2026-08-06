@@ -27,11 +27,12 @@ The forces and prior decisions that shape it:
   the per-range substrate a range-partitioned transactional store builds on.
 - **We already have a leaderless transaction layer: Accord (ADR 0011).** Accord
   does multi-key, **cross-shard** transactions today — execution timestamps,
-  dependency sets, recovery, per-shard consensus, MVCC snapshot reads — over the
-  AP lineage (local execution or the data-plane frontier). So "cross-shard atomic
-  transactions" is not unsolved in the codebase; the open question is specifically
-  how the **CP (Raft) plane** gets them, and whether it should reuse Accord or get
-  its own mechanism.
+  dependency sets, recovery, per-shard consensus, MVCC snapshot reads — via
+  local execution (the data-plane frontier was deleted with the AP plane, ADR
+  0019; `animus-consensus` is a testbed, not wired into `animusd`). So
+  "cross-shard atomic transactions" is not unsolved in the codebase; the open
+  question is specifically how the **CP (Raft) plane** gets them, and whether it
+  should reuse Accord or get its own mechanism.
 - **Pluggable replication is the frame (ADR 0016).** AnimusDB deliberately offers
   both a leaderless-AP plane and a leaderful-CP plane as modular choices. Each
   plane having its *native* transaction story (rather than one bolted onto the

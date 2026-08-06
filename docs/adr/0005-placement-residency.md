@@ -65,6 +65,13 @@ on control). `animus-control/tests/placement_auto_reconcile.rs` proves a marked
 preserving residency + spread and moving only the dead replica, reproducible
 from a seed.
 
+*(The next two increments — repair-path and hinted-handoff residency — were
+**removed with the AP data plane** (ADR 0019): `serve_replica_with_residency`,
+`AllowedTargets`, and the cited `animus-data` tests no longer exist. They are
+retained below as design record for the AP long shot; in v1 residency is
+enforced by placement alone — the CP plane's replicas are exactly the placed
+set, and there is no repair/hint path that could leak past it.)*
+
 **Residency now extends to the repair paths.** The data plane's read-repair and
 background anti-entropy (ADR 0010) are bound to a tablet's residency-eligible
 placement on **both** sides, closing the leak where repair could push data to a

@@ -18,6 +18,20 @@
   authority), per-shard consensus, recovery, retry, and the interactive API are
   unchanged. "Effect-sharding" (one global Accord round, AP-routed effect) is gone;
   "per-shard consensus" (one group per tablet) stays.
+- **Current status in v1 (noted 2026-08-06):** `animus-consensus` is **not wired
+  into any runnable node** — `animusd` does not depend on it, and its only
+  workspace consumer is the Elle corpus in `animus-test`, which uses it (pure
+  `AccordNode` over `SimEnv`) as a known-serializable **testbed** that gives
+  `check_cycles` teeth against the negative control. It is not on the v1 serving
+  path and not on the planned CP transaction path either — ADR 0018 chose
+  2PC-over-per-tablet-Raft, not Accord, for cross-tablet transactions. Accord's
+  only forward role is the ADR 0019 AP "long shot". The increment history below
+  is a design record; the sections describing the AP data-plane frontier
+  document machinery ADR 0019 deleted. **PR #22 executed the testbed-only
+  trim**: `shard.rs` (per-shard consensus) and the storage-backed execution
+  path are deleted (net −1,080 lines; retrievable from git history), the
+  `mvcc_version` collision guard is now a hard assert, and the crate is
+  scoped to exactly what the Elle corpus exercises.
 - **Date:** 2026-08-01 (execution + durability increment: 2026-08-01;
   storage-backed execution + coordinator-failover increment: 2026-08-01;
   read-transactions + multi-thread-liveness increment: 2026-08-02;

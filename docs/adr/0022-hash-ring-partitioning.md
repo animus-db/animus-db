@@ -53,6 +53,18 @@ an ordinary byte range. The token sits ahead of the partition key:
 `partition_token` lives in `animus-tablet`; the wire adapters compute it when
 assembling a key.
 
+*(Audit note 2026-08-06 — two caveats on the paragraph above. (1) "Cassandra
+parity" is the **algorithm**, not ring parity: the CQL edge hashes its own
+`to_key_bytes(pk)` encoding (sign-bit-xored), not Cassandra's native
+partition-key serialization, so tokens will not match a real
+`Murmur3Partitioner` ring. (2) The hash **input** differs per edge — the
+DynamoDB edge and the admin seeder token over `escape(pk)`, the CQL edge over
+raw `to_key_bytes(pk)` — and there is no single shared key-builder; each edge
+assembles the layout itself. Harmless while tablets are table-scoped (ADR 0023,
+one edge owns each table's keyspace), but both facts are frozen on-disk formats
+now, and any shared-keyspace future needs the shared builder first — see the
+ADR 0006 audit note.)*
+
 ## Consequences
 
 - **Even load by construction.** A skewed key distribution is spread across the

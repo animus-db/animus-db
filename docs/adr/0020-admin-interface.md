@@ -129,6 +129,22 @@ without a follow-up read. They route to the right node/leader using the same
 resolution the data path uses (`cp_route` / the control-leader handle set),
 forwarding when this node isn't the authority — the operator hits any node.
 
+**Audit warning (2026-08-06 — both since fixed: (1) in PR #26, (2) in PR #21;
+retained for the record).** (1) The "Safety"
+column above overstates `flush`/`compact`: `flush_now`/`compact_now` run on the
+admin connection's task, **concurrent** with the tablet's single Raft apply
+loop, and `LsmEngine` has no flush-in-progress guard — `flush()` snapshots the
+memtable, builds the SSTable with the lock released, then unconditionally
+`clear()`s the memtable, so a write applied (and acked) during the build window
+is erased from visibility, and a *later* flush can GC its WAL segment, making
+the loss permanent; two overlapping flushes can also double-allocate an SSTable
+seq. Until the engine serializes flush-vs-apply and flush-vs-flush, forcing a
+flush/compact on a tablet **under live write load** is an acked-write-loss
+hazard (the normal write path is unaffected — it is single-task). (2)
+`POST /admin/tablet/split` (and the auto-split loop) allocates the child tablet
+id as `max(live ids)+1` instead of `next_free_tablet_id()`, which can **reuse a
+dropped tablet's id** — see the ADR 0024 known-violation note.
+
 Phase 2 is explicitly *separated*: it lands after Phase 1 is proven, behind the
 same port, and each action ships with its own safety check + a `ProdEnv`
 integration test (these are real-thread liveness paths — see the crate guide's

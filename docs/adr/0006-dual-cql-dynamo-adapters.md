@@ -1,6 +1,24 @@
 # ADR 0006 — Dual CQL + DynamoDB adapters over a common core
 
 - **Status:** Accepted
+- **Amended for v1 (ADR 0019):** the adapters route through the **CP data
+  plane** — `DataClient` and the quorum coordinator are deleted with the AP
+  plane; the "native quorum range scan" below is now the CP `cp_scan`
+  (linearizable, leader-served), and per-request **consistency levels are
+  currently inert** (the CQL edge decodes but ignores `[consistency]`; CP reads
+  are always linearizable — `consistency_quorum` survives only as the mapping
+  for AP's eventual return).
+- **Audit note (2026-08-06):** "common core" holds at the *storage/data-plane*
+  layer (one `StorageEngine`, one replicated schema catalog, one routing path),
+  but **not at the adapter layer**: `animus-cql` and `animus-dynamo` share no
+  code (no cross-dependency), and the load-bearing key conventions are
+  re-implemented per edge — the ADR 0022 token+key layout is built independently
+  by the DynamoDB edge (token over *escaped* pk bytes), the CQL edge (token over
+  *raw* pk bytes, unescaped), and the admin seeder, and `escape()` itself exists
+  twice (`animus-dynamo` and `animus-tablet`) with no equality test. Safe today
+  only because tablets are table-scoped (ADR 0023) so the layouts never share a
+  keyspace. A shared key-layout/RMW helper crate consumed by both edges is the
+  standing follow-up before any cross-adapter keyspace exists.
 - **Date:** 2026-08-01
 
 ## Context
@@ -253,3 +271,14 @@ later carry CQL range/`LIMIT` predicates.)
 - Semantic gaps between CQL and DynamoDB (consistency knobs, type systems,
   conditional writes) will surface as adapter complexity; building the core
   first lets us discover the right shared abstractions before committing.
+- **Audit finding (2026-08-06, confirmed — the per-node lock is fixed in
+  PR #21; the cross-node CAS remains future work): the DynamoDB edge's
+  read-modify-write paths were not atomic even per node.** Conditional
+  `PutItem`/`DeleteItem`, `UpdateItem`, and `TransactWriteItems` each do
+  read → evaluate → write **without taking the per-node `rmw_lock`** (the CQL
+  edge holds it for every RMW), and the CP write below is a blind Raft put (no
+  CAS), so nothing compensates: two concurrent `attribute_not_exists` puts on
+  one key both succeed. Minimum fix is taking `rmw_lock` on every DynamoDB RMW
+  path (per-node atomicity, like CQL); the real fix — needed for cross-node
+  atomicity on both edges — is a CP-group CAS/conditional-write primitive
+  (`Cas` exists in the CP command set; route conditional writes through it).

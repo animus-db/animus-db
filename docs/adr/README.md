@@ -27,7 +27,7 @@ relevant ADR (or supersede it) in the same PR as the code change.
 | [0018](0018-cross-tablet-transactions.md) | Cross-tablet transactions on the CP plane (2PC over per-tablet Raft + HLC + MVCC) | Proposed |
 | [0019](0019-cp-only-v1-defer-ap.md) | v1 ships the CP plane only; the leaderless AP data plane is deferred | Accepted |
 | [0020](0020-admin-interface.md) | Admin / debug interface on a dedicated port (config, status, Raft + storage introspection, operator actions) | Accepted |
-| [0021](0021-web-dashboard.md) | Web dashboard over the admin JSON surface (observe + operator actions, static + self-contained) | Proposed |
+| [0021](0021-web-dashboard.md) | Web dashboard over the admin JSON surface (observe + operator actions, static + self-contained) | Accepted |
 | [0022](0022-hash-ring-partitioning.md) | Murmur3 partition token: hash the partition key (amends 0002) | Accepted |
 | [0023](0023-table-scoped-tablets.md) | Table-scoped tablets on a per-table hash ring | Accepted |
 | [0024](0024-drop-table-data-gc.md) | Drop-table data GC: `DropTableTablets` + a per-node reclaim loop (group stop, engine/WAL file deletion, marker prune) | Accepted |

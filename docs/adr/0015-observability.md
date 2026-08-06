@@ -65,7 +65,16 @@ integration; the seam itself does **no** HTTP.
   observes metrics **without changing `animus-sim` at all**. `RaftNode::start`
   forwards `env.metrics()`, so production keeps recording into the env's sink.
 
-- **What the data plane records (ADR 0001/0010/0005).** The leaderless-AP data
+- **What the data plane records (ADR 0001/0010/0005).** *(Audit note
+  2026-08-06: the `data_*` counters below are **dead in v1** — their recording
+  sites left with the deleted AP plane (ADR 0019); the enum keeps the variants
+  by the append-only rule, so they render as permanent zeros. Meanwhile the
+  **CP data plane that v1 actually ships records no metrics at all** — no
+  `cp_*`/raftkv variants exist. Adding per-tablet-group counters
+  (proposals/applies/read-barriers/compactions, apply-batch sizes, snapshot
+  ships) via the same additive pattern is the standing observability follow-up;
+  the v1 serving path is currently observable only through the ADR 0020 admin
+  snapshots.)* The leaderless-AP data
   plane records, all from `Env`-supplied inputs so recording stays a deterministic
   function of the run, at the real coordinator/replica sites:
   `data_quorum_writes_attempted`/`_succeeded`/`_failed` and
