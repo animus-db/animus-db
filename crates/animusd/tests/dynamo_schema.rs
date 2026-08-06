@@ -36,6 +36,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
+mod support;
+
 /// One DynamoDB request over a fresh HTTP/1.1 connection → `(status, body)`.
 async fn dynamo(addr: SocketAddr, target: &str, body: &str) -> (u16, String) {
     let mut stream = TcpStream::connect(addr).await.expect("connect to dynamo");
@@ -216,9 +218,9 @@ async fn create_table_survives_node_restart() {
     // bare PutItem (no re-CreateTable) resolves the composite key correctly and
     // a re-CreateTable is rejected as already existing. The restart reuses the
     // exact config that bound on the first bring-up (same addresses). ---
-    let node = animusd::run_node(&config, 0, &node_dir)
-        .await
-        .expect("restart");
+    let node =
+        support::restart_same_addrs(&config, 0, &node_dir, animusd::StorageBackend::default())
+            .await;
     await_node_bootstrap(&node).await;
     // Wait for the catalog to recover the table from the Raft WAL before probing —
     // otherwise the re-CreateTable below races recovery and spuriously succeeds.
@@ -301,9 +303,9 @@ async fn scan_and_query_read_live_storage_after_restart() {
     // and the rows survive (durable LSM), but the registry's written-key set does
     // NOT — it was never tracked and is never replayed. A Scan/Query must still
     // find the rows, proving they are read from live storage. ---
-    let node = animusd::run_node(&config, 0, &node_dir)
-        .await
-        .expect("restart");
+    let node =
+        support::restart_same_addrs(&config, 0, &node_dir, animusd::StorageBackend::default())
+            .await;
     await_node_bootstrap(&node).await;
     // The Query below resolves the composite key from the recovered schema; wait
     // for the catalog to replay it before probing (it races bootstrap otherwise).
@@ -498,9 +500,9 @@ async fn create_table_index_survives_node_restart() {
 
     // --- Second incarnation: SAME dir + addresses. The registry is empty, but the
     // GSI definition rode the Raft WAL and is recovered into `Metadata`. ---
-    let node = animusd::run_node(&config, 0, &node_dir)
-        .await
-        .expect("restart");
+    let node =
+        support::restart_same_addrs(&config, 0, &node_dir, animusd::StorageBackend::default())
+            .await;
     await_node_bootstrap(&node).await;
 
     // The definition survived the restart (recovered from the replicated catalog).

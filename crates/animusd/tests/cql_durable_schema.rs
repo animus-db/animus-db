@@ -26,6 +26,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
+mod support;
+
 // --- CQL framing helpers (shared shape with cql_wire.rs) --------------------
 
 fn request(stream: i16, opcode: Opcode, body: &[u8]) -> Vec<u8> {
@@ -246,9 +248,9 @@ async fn cql_schema_and_row_survive_node_restart() {
     // --- Second incarnation: SAME data dir + addresses. The CREATE TABLE schema
     // was committed to the control-plane Raft WAL, so it is recovered on restart
     // — a SELECT resolves the table (no re-CREATE) and reads the durable row. ---
-    let node = animusd::run_node(&config, 0, &node_dir)
-        .await
-        .expect("restart on same dir/addresses");
+    let node =
+        support::restart_same_addrs(&config, 0, &node_dir, animusd::StorageBackend::default())
+            .await;
     await_bootstrap(&node).await;
 
     {
