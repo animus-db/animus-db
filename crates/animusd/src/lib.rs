@@ -66,7 +66,8 @@ use topology::{cp_base_id, cp_member_id, cp_members_for};
 /// A list of `(key, value)` pairs — the payload of a batch write (one Raft
 /// `KvCommand::Batch` entry per tablet). Named to keep the batch grouping map
 /// (`BTreeMap<TabletId, KvPairs>`) under clippy's `type_complexity` bar.
-type KvPairs = Vec<(Vec<u8>, Vec<u8>)>;
+type KvPair = (Vec<u8>, Vec<u8>);
+type KvPairs = Vec<KvPair>;
 
 /// A hosted leaderful CP per-tablet Raft group on this node (ADR 0017 #3a) — the
 /// v1 data plane (ADR 0019). It is backed by either the durable on-disk
@@ -1609,6 +1610,47 @@ impl ClientCtx {
         }
     }
 
+    /// Propose a `Batch` on a **known-leader** local handle, returning the probe
+    /// `(key, value)` to confirm on success — the batch analog of `put`, split out
+    /// from confirmation so a caller can poll for confirmation more than once
+    /// without proposing more than once. `Err` means the batch was **never**
+    /// accepted anywhere (the leader moved) — a fresh retry is free. `Ok` means it
+    /// was appended to the leader's log; the caller must still confirm via
+    /// [`poll_probe`] before treating it as durable, and must not call this again
+    /// for the same data while a poll is still pending (see
+    /// [`ClientCtx::cp_batch_write_patient`]'s doc for why re-proposing an
+    /// already-accepted-but-unconfirmed batch is actively harmful).
+    fn cp_batch_propose(
+        leader: &CpGroup,
+        group: Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> Result<Option<KvPair>, String> {
+        let probe = group.last().cloned();
+        match leader.put_batch(group) {
+            ProposeResult::Accepted { .. } => Ok(probe),
+            ProposeResult::NotLeader { .. } => Err("CP group leader moved; retry".into()),
+        }
+    }
+
+    /// Poll `leader`'s local engine for `probe_key` to reflect `probe_val` until
+    /// `deadline` — the durable-before-ack confirm wait shared by every CP write
+    /// path (mirrors [`cp_put_local`](Self::cp_put_local)).
+    async fn poll_probe(
+        leader: &CpGroup,
+        probe_key: &[u8],
+        probe_val: &[u8],
+        deadline: tokio::time::Instant,
+    ) -> bool {
+        loop {
+            if leader.local_get(probe_key).await.as_deref() == Some(probe_val) {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+        }
+    }
+
     /// Propose a `Batch` on a **known-leader** local handle and wait until it is
     /// committed + durable + applied — durable-before-ack. The whole batch is one
     /// Raft entry, so confirming the **last** key reflects our value on the leader's
@@ -1620,24 +1662,132 @@ impl ClientCtx {
         leader: &CpGroup,
         group: Vec<(Vec<u8>, Vec<u8>)>,
     ) -> Result<(), String> {
-        let Some((probe_key, probe_val)) = group.last().cloned() else {
+        let Some((probe_key, probe_val)) = Self::cp_batch_propose(leader, group)? else {
             return Ok(());
         };
-        match leader.put_batch(group) {
-            ProposeResult::Accepted { .. } => {
-                let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
-                loop {
-                    if leader.local_get(&probe_key).await.as_deref() == Some(probe_val.as_slice()) {
-                        return Ok(());
-                    }
-                    if tokio::time::Instant::now() >= deadline {
-                        return Err("CP batch write did not commit in time".into());
-                    }
-                    tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
-                }
-            }
-            ProposeResult::NotLeader { .. } => Err("CP group leader moved; retry".into()),
+        let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
+        if Self::poll_probe(leader, &probe_key, &probe_val, deadline).await {
+            Ok(())
+        } else {
+            Err("CP batch write did not commit in time".into())
         }
+    }
+
+    /// Like [`cp_batch_write`](Self::cp_batch_write), but for a caller that
+    /// itself retries on failure (the admin bulk seeder,
+    /// [`admin::action_data_seed`](crate::admin::action_data_seed)) — up to
+    /// `attempts` tries per tablet group, backing off `retry_backoff` between
+    /// them.
+    ///
+    /// **Why this exists rather than just looping `cp_batch_write`:** a bare
+    /// confirm-timeout from [`cp_batch_local`](Self::cp_batch_local) does not mean
+    /// the batch is lost — `ProposeResult::Accepted` only means it reached the
+    /// leader's local log; under a slow or contended commit path (a slow disk, a
+    /// growing number of concurrent per-tablet Raft groups) it can still be
+    /// committing well after [`CLIENT_TIMEOUT`] has elapsed. A caller that
+    /// retries by calling `cp_batch_write` again unconditionally proposes a
+    /// **second, fully duplicate** `Batch` entry for the same keys — safe by
+    /// per-key LWW, but it doubles the outstanding replication/fsync work for no
+    /// benefit, compounding under exactly the conditions that caused the
+    /// timeout (observed turning a slow bulk-seed into an apparent pile of
+    /// "did not commit in time" failures with `commit_index` still climbing the
+    /// whole time — no leader ever actually changed).
+    ///
+    /// So per tablet group, this proposes **at most once per attempt** and only
+    /// when the previous attempt didn't get as far as `Accepted`: on a plain
+    /// confirm-timeout it polls the *same* already-proposed entry for a second
+    /// full [`CLIENT_TIMEOUT`] window before considering the attempt to have
+    /// failed, rather than proposing again. A genuinely stale route (the classic
+    /// case: a tablet split moved the target range mid-seed, so the old leader's
+    /// copy is truncated/tombstoned) is still retried with a fresh propose, since
+    /// `cp_route` re-resolves the current tablet map on every attempt.
+    pub(crate) async fn cp_batch_write_patient(
+        &self,
+        table: &str,
+        entries: Vec<(Vec<u8>, Vec<u8>)>,
+        attempts: usize,
+        retry_backoff: Duration,
+    ) -> Result<(), String> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        if !self.raft.metadata().has_table_tablet(table) {
+            self.provision_tablet(table).await?;
+        }
+        let mut groups: BTreeMap<TabletId, KvPairs> = BTreeMap::new();
+        for (key, value) in entries {
+            let tablet = self
+                .tablet_for(table, &key)
+                .ok_or_else(|| format!("no tablet owns a batch key of table `{table}`"))?;
+            groups.entry(tablet).or_default().push((key, value));
+        }
+        for (_tablet, group) in groups {
+            self.cp_batch_write_group_patient(table, group, attempts, retry_backoff)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// One tablet group's share of [`cp_batch_write_patient`] — see its doc for
+    /// why a plain confirm-timeout polls the existing entry instead of proposing
+    /// a fresh one.
+    async fn cp_batch_write_group_patient(
+        &self,
+        table: &str,
+        group: KvPairs,
+        attempts: usize,
+        retry_backoff: Duration,
+    ) -> Result<(), String> {
+        let Some(first) = group.first().map(|(k, _)| k.clone()) else {
+            return Ok(());
+        };
+        let mut last_err = String::new();
+        for attempt in 0..attempts.max(1) {
+            match self.cp_route(table, &first).await {
+                CpRoute::Local(leader) => match Self::cp_batch_propose(&leader, group.clone()) {
+                    Ok(None) => return Ok(()),
+                    Ok(Some((probe_key, probe_val))) => {
+                        let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
+                        if Self::poll_probe(&leader, &probe_key, &probe_val, deadline).await {
+                            return Ok(());
+                        }
+                        // Accepted but not yet confirmed — keep polling the same
+                        // entry for a second full window instead of proposing a
+                        // duplicate (see the module doc above).
+                        let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
+                        if Self::poll_probe(&leader, &probe_key, &probe_val, deadline).await {
+                            return Ok(());
+                        }
+                        last_err = "CP batch write did not commit in time".into();
+                    }
+                    Err(e) => last_err = e,
+                },
+                CpRoute::Forward(addr) => {
+                    match self
+                        .cp_forward(
+                            addr,
+                            ClientRequest::PutBatch {
+                                entries: group.clone(),
+                                table: table.to_owned(),
+                            },
+                        )
+                        .await
+                    {
+                        ClientResponse::PutOk => return Ok(()),
+                        ClientResponse::Error(e) => last_err = e,
+                        other => {
+                            last_err =
+                                format!("unexpected reply to forwarded CP batch write: {other:?}")
+                        }
+                    }
+                }
+                CpRoute::None => last_err = "no CP group leader reachable".into(),
+            }
+            if attempt + 1 < attempts {
+                tokio::time::sleep(retry_backoff).await;
+            }
+        }
+        Err(last_err)
     }
 
     /// CP **delete** of `key` (ADR 0017): a Raft-committed tombstone, waited to

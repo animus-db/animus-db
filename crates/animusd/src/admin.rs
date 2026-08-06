@@ -810,31 +810,26 @@ async fn action_data_seed(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
             // way a real client's individual `PutBatch` requests would.
             let batch_span =
                 tracing::info_span!("admin_seed_batch", start_index = req.start + i, len = chunk);
-            let last: Result<(), String> = async {
-                // Retry transient failures. A batch racing a tablet **split** may
-                // route to the parent and be truncated/tombstoned (the upper range
-                // moved to the new child); a retry re-groups against the settled
-                // tablet map and re-routes to the elected child. Idempotent (same
-                // keys+value, per-key LWW at the entry's index), so retrying is safe.
-                let mut last: Result<(), String> = Ok(());
-                for attempt in 0..SEED_WRITE_ATTEMPTS {
-                    match ctx.cp_batch_write(&table, entries.clone()).await {
-                        Ok(()) => {
-                            last = Ok(());
-                            break;
-                        }
-                        Err(e) => {
-                            last = Err(e);
-                            if attempt + 1 < SEED_WRITE_ATTEMPTS {
-                                tokio::time::sleep(SEED_RETRY_BACKOFF).await;
-                            }
-                        }
-                    }
-                }
-                last
-            }
-            .instrument(batch_span)
-            .await;
+            // Retry transient failures via `cp_batch_write_patient` rather than a
+            // plain retry loop over `cp_batch_write`: a batch racing a tablet
+            // **split** may route to the parent and be truncated/tombstoned (the
+            // upper range moved to the new child), and a fresh propose against the
+            // now-settled tablet map correctly re-routes to the elected child
+            // (idempotent — same keys+value, per-key LWW). But a *plain*
+            // confirm-timeout on the correct leader does not mean the batch is
+            // lost, just slow — `cp_batch_write_patient` polls the
+            // already-accepted entry instead of proposing a duplicate one, so a
+            // slow/contended commit path doesn't get retry-amplified into
+            // something worse (see its doc).
+            let last = ctx
+                .cp_batch_write_patient(
+                    &table,
+                    entries.clone(),
+                    SEED_WRITE_ATTEMPTS,
+                    SEED_RETRY_BACKOFF,
+                )
+                .instrument(batch_span)
+                .await;
             match last {
                 Ok(()) => written += chunk,
                 Err(e) => {
