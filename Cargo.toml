@@ -23,6 +23,7 @@ animus-control = { path = "crates/animus-control" }
 animus-tablet = { path = "crates/animus-tablet" }
 animus-placement = { path = "crates/animus-placement" }
 animus-consensus = { path = "crates/animus-consensus" }
+animus-epaxos = { path = "crates/animus-epaxos" }
 animus-cp-data = { path = "crates/animus-cp-data" }
 animus-cql = { path = "crates/animus-cql" }
 animus-dynamo = { path = "crates/animus-dynamo" }

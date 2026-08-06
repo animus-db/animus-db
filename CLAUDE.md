@@ -41,6 +41,7 @@ the relevant one before working in a crate:
 | `animus-dynamo` | [crates/animus-dynamo/CLAUDE.md](crates/animus-dynamo/CLAUDE.md) |
 | `animus-placement` | [crates/animus-placement/CLAUDE.md](crates/animus-placement/CLAUDE.md) |
 | `animus-consensus` | [crates/animus-consensus/CLAUDE.md](crates/animus-consensus/CLAUDE.md) |
+| `animus-epaxos` | [crates/animus-epaxos/CLAUDE.md](crates/animus-epaxos/CLAUDE.md) |
 | `animus-cql` | [crates/animus-cql/CLAUDE.md](crates/animus-cql/CLAUDE.md) |
 | `animusd` | [crates/animusd/CLAUDE.md](crates/animusd/CLAUDE.md) |
 | `animus-cli` | [crates/animus-cli/CLAUDE.md](crates/animus-cli/CLAUDE.md) |
@@ -125,6 +126,11 @@ truth; this map is just for navigation.
   the same shape as the Raft core: sync `AccordCore` + `AccordNode<E>`; durable
   local execution, coordinator failover, message retry, read / interactive
   transactions, and per-shard consensus (one group per tablet).
+- **EPaxos exploration** — `animus-epaxos` (ADR 0025). A from-scratch EPaxos in
+  the same sync-core/`Env`-driver shape (`EPaxosCore` + `EPaxosNode<E>`),
+  instance-space native (no timestamp), **not wired into any data path** — built
+  to evaluate EPaxos vs Accord on the deterministic harness. Steady-state
+  agreement only so far; SCC execution + `Prepare` recovery deferred.
 - **Storage** — `animus-storage` (ADR 0004, 0008). The **async** `StorageEngine`
   trait; `MemoryEngine` (deterministic, for sim) and a custom on-disk
   `LsmEngine<E>` (WAL/SSTable/leveled compaction, all I/O via the `Env` disk seam

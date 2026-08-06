@@ -31,3 +31,4 @@ relevant ADR (or supersede it) in the same PR as the code change.
 | [0022](0022-hash-ring-partitioning.md) | Murmur3 partition token: hash the partition key (amends 0002) | Accepted |
 | [0023](0023-table-scoped-tablets.md) | Table-scoped tablets on a per-table hash ring | Accepted |
 | [0024](0024-drop-table-data-gc.md) | Drop-table data GC: `DropTableTablets` + a per-node reclaim loop (group stop, engine/WAL file deletion, marker prune) | Accepted |
+| [0025](0025-epaxos-exploration.md) | EPaxos leaderless consensus: an isolated exploration core (`animus-epaxos`), not on any data path | Accepted |
