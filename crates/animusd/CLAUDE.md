@@ -202,6 +202,27 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   entry a second time before the next tick would otherwise re-propose. The
   one-shot `trigger_split`/fresh-trigger call sites keep `confirm_rounds: 1`
   (`propose_split_data`'s default) — byte-identical behavior there.
+- **`ClientCtx::propose_and_await` — the generic schema-proposal helper
+  `propose_split_metadata` (step 1 of a split), `register_cp_addr`,
+  `create_table_schema`, `replace_table_schema`, and `drop_table`/
+  `drop_table_schema` all sit on top of — had the same retry-amplification
+  shape as the step-2 `propose_split_data` bug above, just one layer further
+  down.** It called `propose_schema` fresh on every 50ms poll tick regardless
+  of whether the prior call had already reached a leader's log, for up to the
+  full 10s `SCHEMA_COMMIT_TIMEOUT` — up to ~200 duplicate proposals per call
+  (harmless to apply for an idempotent command like `SplitTablet`, but wasted
+  WAL/replication work). Under `--auto-split`'s per-node trigger loop running
+  concurrently on every node in `--cluster N` (see the topology-map entry on
+  `auto_split_loop`), this is what turned a transient slow commit into a
+  live-observed 10-minute-long stall of `SplitTablet` metadata never
+  committing at all — three nodes' retry storms flooding the control-plane
+  Raft log faster than one 10s window could drain. Fixed by having
+  `propose_schema` return whether it believes the command reached a leader's
+  log, and `propose_and_await` only resubmitting immediately when it knows the
+  prior attempt went nowhere (otherwise backing off `SCHEMA_PROPOSE_PATIENCE`,
+  1s). See the root `CLAUDE.md` engineering-practices entry for the general
+  lesson (sweep the *shared primitive*, not just the two call sites a bug
+  report named).
 - **The cluster's members are the CP `raftkv` nodes, not the control ids.** The
   control ids `0..N` are only the Raft *consensus group* for metadata; `bootstrap`
   (leader-only, idempotent) registers the **raftkv ids** (`300+i`) as `Active`
