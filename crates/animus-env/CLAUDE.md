@@ -69,6 +69,15 @@ the production implementation; the deterministic implementation lives in
   on-disk LSM needs (SSTable block reads, file sizing, compaction cleanup); they
   view the same durable + buffered bytes as `read`, so a crash drops an un-synced
   tail consistently across all of them.
+- **`ProdEnv::append` must `flush().await` before returning** — a `tokio::fs::File`
+  buffers writes in user space and submits them to the blocking pool *in the
+  background*; dropping the handle after `write_all` does not wait. Without the
+  flush, a subsequent `sync` (a **different** handle) can fsync a file that doesn't
+  yet contain the appended bytes ("ack means durable" silently broken), and a
+  subsequent `read`/`read_at` can see a truncated file — surfaced as an
+  intermittent `corrupt sstable index` when the LSM read back an SSTable it had
+  just written+synced. Cross-handle write-then-read through `tokio::fs` is only
+  sequentially consistent if every write is flushed on its own handle first.
 - `ProdEnv` is *not* covered by the simulation tests (it's the nondeterministic
   side). Don't add logic here that the deterministic path needs to share.
 - `ProdEnv::shutdown()` aborts every task the env owns — its inbound-connection

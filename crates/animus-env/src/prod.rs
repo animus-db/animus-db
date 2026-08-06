@@ -377,6 +377,18 @@ impl Disk for ProdEnv {
             .open(&path)
             .await?;
         f.write_all(bytes).await?;
+        // Load-bearing: a `tokio::fs::File` buffers writes in user space and
+        // submits them to the blocking pool *in the background*; dropping the
+        // handle after `write_all` does NOT wait for that submission. Without
+        // this `flush`, `append` can return before the bytes reach the kernel,
+        // so (a) a subsequent `sync` — which opens a *different* handle — may
+        // fsync a file that does not yet contain them (breaking "ack means
+        // durable"), and (b) a subsequent `read`/`read_at` can see a truncated
+        // file (observed as `corrupt sstable index` when the LSM read back an
+        // SSTable it had just written and synced). `flush` completes the
+        // in-flight write, restoring the sequential-consistency contract the
+        // `Disk` seam promises (and `SimEnv` models).
+        f.flush().await?;
         Ok(())
     }
 
