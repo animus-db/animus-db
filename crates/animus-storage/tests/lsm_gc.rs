@@ -11,7 +11,7 @@
 //! from the seed in the assertion messages.
 
 use animus_sim::{SimEnv, Simulator};
-use animus_storage::{LsmEngine, LsmOptions, StorageEngine};
+use animus_storage::{LsmEngine, LsmOptions, Snapshot, StorageEngine};
 use futures::executor::block_on;
 
 const PREFIX: &str = "db/";
@@ -26,6 +26,8 @@ fn opts(grace: u64) -> LsmOptions {
         level_fanout: 2,
         wal_segment_bytes: 96,
         tombstone_grace_versions: grace,
+        trust_monotonic_versions: false,
+        background_maintenance: false,
     }
 }
 
@@ -166,5 +168,79 @@ fn gc_does_not_resurrect_across_a_deeper_level() {
                 "seed={seed}: key {k} corrupted by GC"
             );
         }
+    });
+}
+
+/// A live [`Snapshot`] pins the tombstone-GC floor **below its own version**, so
+/// compaction must never reclaim a record the snapshot still needs — even long
+/// past `tombstone_grace_versions`, and even though the *same* history would be
+/// (correctly) reclaimed without the pin, per
+/// `aged_tombstone_is_reclaimed_recent_one_is_preserved` above.
+#[test]
+fn held_snapshot_survives_compaction_gc() {
+    let seed = 0x5A0_u64;
+    let sim = Simulator::new(seed);
+    // Tiny grace: absent the snapshot pin, ordinary churn reclaims this quickly
+    // (as the sibling test above demonstrates) — the pin is the only thing
+    // protecting it here.
+    let e = open(&sim, 1);
+    block_on(async {
+        // Write the victim, then snapshot immediately: pinned at version 1, so
+        // it observes the value *before* the delete below.
+        e.put(b"victim", b"hello", 1).await.unwrap();
+        let snap = e.snapshot();
+        assert_eq!(
+            snap.version(),
+            1,
+            "seed={seed}: snapshot pinned before the delete"
+        );
+        assert_eq!(
+            snap.get(b"victim").await.map(|v| v.value),
+            Some(b"hello".to_vec()),
+            "seed={seed}: snapshot must see the pre-delete value"
+        );
+
+        // Delete it, then churn far past the grace window, forcing compactions
+        // that would otherwise reclaim the victim's tombstone *and* the value
+        // it shadows (version 1 — exactly what the snapshot is pinned to).
+        e.delete(b"victim", 2).await.unwrap();
+        for i in 0u64..300 {
+            let k = format!("k{i:04}");
+            e.put(k.as_bytes(), format!("v{i}").as_bytes(), 100 + i)
+                .await
+                .unwrap();
+        }
+        assert!(
+            e.compaction_count() >= 1,
+            "seed={seed}: expected compactions to run GC"
+        );
+
+        // While the snapshot is alive, it must still see the pre-delete value —
+        // GC must not have reclaimed version 1 out from under it.
+        assert_eq!(
+            snap.get(b"victim").await.map(|v| v.value),
+            Some(b"hello".to_vec()),
+            "seed={seed}: held snapshot's data was reclaimed by GC"
+        );
+        // A fresh (unpinned) read sees the delete, as expected — the pin
+        // protects the *snapshot's* view, not the engine's live state.
+        assert_eq!(
+            e.get(b"victim").await.unwrap(),
+            None,
+            "seed={seed}: live read must see the delete"
+        );
+
+        // Dropping the snapshot releases its hold on the GC floor — checked
+        // directly against the refcount rather than forcing another compaction
+        // pass (whether GC actually *revisits* the victim's table next depends
+        // on unrelated compaction scheduling; what this test is about is that
+        // the pin itself is released, not permanent).
+        assert_eq!(e.held_snapshot_count(), 1, "seed={seed}: one snapshot held");
+        drop(snap);
+        assert_eq!(
+            e.held_snapshot_count(),
+            0,
+            "seed={seed}: dropping the snapshot must release its GC-floor pin"
+        );
     });
 }

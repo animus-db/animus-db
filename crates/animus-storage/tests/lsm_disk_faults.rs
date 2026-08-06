@@ -9,20 +9,25 @@
 //! Every scenario is a pure function of its seed (`ANIMUS_SEED` replays; the
 //! seed is in every assertion message).
 //!
-//! Two tests are `#[ignore]`d because they demonstrate **real gaps found by
-//! this fault model** (do not un-ignore until the engine is fixed; see each
-//! test's comment for the diagnosis):
+//! Two tests pin **regressions for real gaps this fault model found and the
+//! engine now fixes** (see each test's comment for the original diagnosis and
+//! the fix):
 //!
-//! 1. [`acked_writes_after_torn_tail_recovery_survive_second_restart`] — a
-//!    torn (garbage) WAL tail is correctly *skipped* by recovery, but it is
-//!    left in place in the reopened active segment, and post-recovery appends
-//!    concatenate onto it with no separating newline; the next recovery then
-//!    drops the first **acked** post-recovery record along with the garbage.
-//! 2. [`corrupted_durable_wal_record_surfaces_loudly`] — WAL records carry no
-//!    per-record checksum and `decode_wal` silently skips *any* malformed
+//! 1. [`acked_writes_after_torn_tail_recovery_survive_second_restart`] — a torn
+//!    (garbage) WAL tail was correctly *skipped* by recovery, but was left in
+//!    place in the reopened active segment, and post-recovery appends
+//!    concatenated onto it with no separating frame boundary; the next
+//!    recovery then dropped the first **acked** post-recovery record along
+//!    with the garbage. Fixed by truncating a recovered active segment's torn
+//!    tail (`Disk::replace`) before further appends ride it.
+//! 2. [`corrupted_durable_wal_record_surfaces_loudly`] — WAL records carried no
+//!    per-record checksum and `decode_wal` silently skipped *any* malformed
 //!    line (not just a trailing torn one), so at-rest corruption of an acked,
-//!    fsynced record is **silent data loss** instead of a loud error (the
-//!    SSTable path, by contrast, has per-block CRCs and fails cleanly).
+//!    fsynced record was **silent data loss** instead of a loud error. Fixed by
+//!    a length-prefixed + CRC32 binary frame per record (replacing the old
+//!    newline-JSON encoding), with a hard error for any parse failure that
+//!    isn't provably a trailing tear (a valid record still parses later in the
+//!    file — see `decode_wal`'s doc comment in `lsm.rs`).
 
 use animus_env::Disk;
 use animus_sim::{DiskConfig, SimEnv, Simulator};
@@ -41,6 +46,8 @@ fn wal_only_opts() -> LsmOptions {
         level_fanout: 4,
         wal_segment_bytes: 1 << 20,
         tombstone_grace_versions: 1 << 20,
+        trust_monotonic_versions: false,
+        background_maintenance: false,
     }
 }
 
@@ -53,6 +60,8 @@ fn churn_opts() -> LsmOptions {
         level_fanout: 2,
         wal_segment_bytes: 192,
         tombstone_grace_versions: 1 << 20,
+        trust_monotonic_versions: false,
+        background_maintenance: false,
     }
 }
 
@@ -74,22 +83,27 @@ fn active_wal_file(e: &LsmEngine<SimEnv>) -> String {
     format!("{PREFIX}wal-{seg:06}")
 }
 
+/// The byte length of the first complete WAL frame in `bytes`. The on-disk
+/// framing is `len(u32 BE) | crc32(u32 BE) | payload` (see `lsm.rs`'s
+/// `encode_wal`); this reads just the length header to find the frame boundary.
+fn first_frame_len(bytes: &[u8]) -> usize {
+    let len = u32::from_be_bytes(bytes[0..4].try_into().expect("frame header present")) as usize;
+    8 + len
+}
+
 /// Simulate a crash **mid group-commit append**: buffer (without syncing) one
 /// more record's bytes onto the active WAL segment — exactly what the disk
 /// holds when the power cuts between `append` and `sync` — then crash with a
 /// torn-tail model, so a seed-chosen strict prefix of that record survives.
 /// The buffered bytes are a copy of the segment's first (durable, complete)
-/// record line, so if the tear happens to retain a parseable line the replay
-/// is an idempotent duplicate — the interesting cases are the partial ones.
+/// frame, so if the tear happens to retain the whole frame the replay is an
+/// idempotent duplicate — the interesting cases are the partial ones.
 async fn buffer_unsynced_wal_record(sim: &Simulator, e: &LsmEngine<SimEnv>) {
     let env = sim.env(0);
     let file = active_wal_file(e);
     let bytes = env.read(&file).await.expect("read wal segment");
-    let line_end = bytes
-        .iter()
-        .position(|&b| b == b'\n')
-        .expect("segment has at least one complete record");
-    env.append(&file, &bytes[..=line_end])
+    let frame_len = first_frame_len(&bytes);
+    env.append(&file, &bytes[..frame_len])
         .await
         .expect("append un-synced record");
 }
@@ -343,28 +357,23 @@ fn corrupted_manifest_fails_open_cleanly() {
     }
 }
 
-/// REAL BUG (found by this fault model — see the module docs; do not
-/// un-ignore until fixed): after a torn-tail crash, recovery correctly skips
-/// the torn trailing bytes but leaves them in the reopened **active** WAL
-/// segment. The next write's record is appended directly after the garbage
-/// with no newline in between, so on a *second* recovery that acked record
-/// shares a "line" with the garbage and `decode_wal` silently drops it —
-/// losing an acked, fsynced write.
+/// REGRESSION for a real bug this fault model found: after a torn-tail crash,
+/// recovery correctly skipped the torn trailing bytes but left them in the
+/// reopened **active** WAL segment. The next write's record was appended
+/// directly after the garbage with no frame boundary in between, so on a
+/// *second* recovery that acked record was glued to the garbage and
+/// `decode_wal` silently dropped it — losing an acked, fsynced write.
 ///
-/// Diagnosis: `LsmEngine::open_with` replays the live segments through
-/// `decode_wal` (which tolerates a torn trailing line) but never truncates or
-/// seals the torn tail; `GroupCommit::new` reopens the highest live segment
-/// as the active one and appends ride the raw end of file. Fix options: seal
-/// a recovered non-empty active segment and start a fresh one, or truncate
-/// the segment to its last well-formed record boundary on open (via
-/// `Disk::replace`).
+/// Diagnosis: `LsmEngine::open_with_metrics` replayed the live segments
+/// through `decode_wal` (which tolerates a torn trailing record) but never
+/// truncated or sealed the torn tail; `GroupCommit::new` reopens the highest
+/// live segment as the active one and appends ride the raw end of file. Fixed
+/// by truncating the segment to its last well-formed frame boundary on open
+/// (via `Disk::replace`) whenever a torn tail was detected.
 ///
 /// Deterministic repro: seed 0xA1 (any seed whose tear keeps > 0 bytes, which
-/// is nearly all of them — the tear point is uniform over the ~40-byte
-/// record). Run:
-/// `cargo test -p animus-storage --test lsm_disk_faults -- --ignored second_restart`
+/// is nearly all of them — the tear point is uniform over the whole record).
 #[test]
-#[ignore = "real bug: torn WAL tail left in active segment corrupts the next acked record's framing (see doc comment)"]
 fn acked_writes_after_torn_tail_recovery_survive_second_restart() {
     // Sweep seeds: the bug fires whenever the tear retains at least one byte.
     for seed in [0xA1u64, 0xB2, 0xC3, 7, 42, 1337] {
@@ -424,22 +433,21 @@ fn acked_writes_after_torn_tail_recovery_survive_second_restart() {
     }
 }
 
-/// REAL GAP (found by this fault model — see the module docs; do not
-/// un-ignore until fixed): the WAL has **no per-record checksum**, and
-/// `decode_wal` silently skips *any* line that fails to parse — not just a
-/// trailing torn one. So at-rest corruption of a durable, acked, fsynced WAL
-/// record is silent data loss: the engine opens cleanly and simply forgets
-/// the write. (Contrast: an SSTable block has a CRC and the same corruption
-/// fails the read loudly — `corrupted_sstable_block_read_is_a_clean_error`.)
+/// REGRESSION for a real gap this fault model found: the WAL used to carry
+/// **no per-record checksum**, and `decode_wal` silently skipped *any* line
+/// that failed to parse — not just a trailing torn one. So at-rest corruption
+/// of a durable, acked, fsynced WAL record was silent data loss: the engine
+/// opened cleanly and simply forgot the write. (Contrast: an SSTable block has
+/// a CRC and the same corruption fails the read loudly —
+/// `corrupted_sstable_block_read_is_a_clean_error`.)
 ///
-/// Fix direction: frame WAL records with a length + CRC (as SSTable blocks
-/// are), and treat a mid-file malformed record as a hard recovery error
-/// (only a *trailing* torn record is a legitimate crash artifact).
+/// Fixed by framing WAL records with a length + CRC32 (as SSTable blocks are),
+/// with a hard error for a malformed record that is *not* provably a trailing
+/// tear (a valid record still parses later in the file — see `decode_wal`'s
+/// doc comment in `lsm.rs`).
 ///
-/// Deterministic repro (no RNG involved): any seed. Run:
-/// `cargo test -p animus-storage --test lsm_disk_faults -- --ignored corrupted_durable_wal`
+/// Deterministic repro (no RNG involved): any seed.
 #[test]
-#[ignore = "real gap: WAL records have no checksum; corruption of an acked record is silent data loss (see doc comment)"]
 fn corrupted_durable_wal_record_surfaces_loudly() {
     let seed = 0xBADu64;
     let sim = Simulator::new(seed);

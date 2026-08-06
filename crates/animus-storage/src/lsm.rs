@@ -23,11 +23,17 @@
 //!   segment numbers**. Written **atomically** via [`Disk::replace`], so a crash
 //!   sees either the whole old or whole new manifest, never a mix.
 //! - `<prefix>wal-NNNNNN` — the write-ahead log, split into **numbered segments**
-//!   of [`WalRecord`]s, each one newline-framed JSON, `append`ed then `sync`ed
-//!   **before** a write is acknowledged (an ack means durable). The group-commit
-//!   coordinator appends to the active segment and rolls to a fresh one once it
-//!   passes a byte threshold; a flush removes whole segments it has folded into an
-//!   SSTable (see [`wal`]). Holds the writes not yet folded into an SSTable.
+//!   of [`WalRecord`]s, each one framed `len(u32) | crc32(u32) | payload` (a
+//!   compact hand-rolled binary encoding, not JSON — see the codec docs above
+//!   `encode_wal`), `append`ed then `sync`ed **before** a write is acknowledged
+//!   (an ack means durable). The group-commit coordinator appends to the active
+//!   segment and rolls to a fresh one once it passes a byte threshold; a flush
+//!   removes whole segments it has folded into an SSTable (see [`wal`]). Holds
+//!   the writes not yet folded into an SSTable. Recovery tolerates a torn
+//!   trailing frame (an un-synced write cut short by a crash) but treats any
+//!   other malformed/corrupt frame as a hard error (see `decode_wal`), and
+//!   truncates a recovered active segment's torn tail before further appends
+//!   ride it (see `LsmEngine::open_with_metrics`).
 //! - `<prefix>sst-NNNNNN` — immutable, sorted SSTables (see [`sstable`]).
 //!
 //! ## Write path
@@ -117,11 +123,12 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::ops::Bound;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
+use std::time::Duration;
 
-use animus_env::{Env, Metric, MetricsHandle};
+use animus_env::{Env, EnvExt, Metric, MetricsHandle};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -171,6 +178,20 @@ const DEFAULT_TOMBSTONE_GRACE_VERSIONS: Version = 1 << 20;
 /// paced, so a couple of retries always suffice; the bound only guards against a
 /// genuine, persistent read error (which is then surfaced, not retried forever).
 const READ_COMPACTION_RETRIES: u32 = 32;
+/// `LsmOptions::background_maintenance` write backpressure: how far the
+/// memtable may grow past `flush_threshold_bytes` before a writer must wait
+/// for the background flush/compaction to catch up. Sized generously so a
+/// normal write burst never blocks; it exists only to bound worst-case memory
+/// growth if maintenance falls behind (a slow disk, a burst far exceeding
+/// flush throughput, or repeated injected faults).
+const BACKPRESSURE_OVERSHOOT_FACTOR: usize = 4;
+/// How long a backpressured writer waits between polls of the memtable size.
+/// `env.sleep` keeps this deterministic under `SimEnv`.
+const BACKPRESSURE_POLL: Duration = Duration::from_millis(1);
+/// Bound on backpressure poll iterations, in case maintenance is persistently
+/// failing (e.g. a disk that never recovers) — turns what would otherwise be
+/// an unbounded retry loop into a clean, loud error.
+const BACKPRESSURE_MAX_POLLS: u32 = 10_000;
 
 /// Tuning knobs for an [`LsmEngine`]. Defaults are sized for tests; production
 /// wiring can raise them.
@@ -200,6 +221,35 @@ pub struct LsmOptions {
     /// above the maximum anti-entropy lag so a long-offline replica is still
     /// repaired with the delete before the tombstone is reclaimed; ADR 0010).
     pub tombstone_grace_versions: Version,
+    /// **Opt-in fast path** (default `false`, safe): skip the cross-SSTable
+    /// `latest_version_of` point read that `merge`/`merge_batch` normally do to
+    /// decide their per-key LWW winner. Setting this is a contract from the
+    /// caller: every `merge`/`merge_tombstone`/`merge_batch` version passed to
+    /// this engine is already known to be monotonically increasing per key (true
+    /// under the CP plane's monotonic Raft-log-index versions), so the LWW
+    /// read-before-write is structurally always a winner and can be skipped.
+    /// `merge_batch` still dedupes multiple ops for the same key *within one
+    /// batch* (cheap, in-memory) — only the read against already-durable engine
+    /// state is skipped. Leaderless/AP callers (ADR 0010), where two replicas can
+    /// legitimately race with non-monotonic versions, must leave this `false`.
+    pub trust_monotonic_versions: bool,
+    /// **Opt-in** (default `false`, matches all prior behavior): move memtable
+    /// flush + compaction off the write path's ack. When `false` (default), a
+    /// write that crosses the flush threshold runs `flush`/compaction inline
+    /// before its `put`/`merge`/etc. call returns — simple and fully synchronous,
+    /// what every existing caller and test expects. When `true`, a write instead
+    /// **triggers** a background task (`env.spawn_task`) to do that work and
+    /// returns as soon as it is durable + applied; a
+    /// **bounded-memtable-overshoot backpressure gate** (`await_backpressure`)
+    /// makes writers wait (via `env.sleep`, deterministic under `SimEnv`) if the
+    /// memtable grows far past the flush threshold, instead of growing without
+    /// limit while maintenance catches up. This needs a driver that actually
+    /// polls spawned tasks (e.g. `Simulator::run_for`/`run_until_quiescent`, or
+    /// any real multi-threaded `ProdEnv` runtime) — a bare
+    /// `futures::executor::block_on` of a single write never runs anything else,
+    /// so backpressure would never resolve; every test in this crate that opts
+    /// in drives the simulator explicitly (see `lsm_maintenance.rs`).
+    pub background_maintenance: bool,
 }
 
 impl Default for LsmOptions {
@@ -211,6 +261,8 @@ impl Default for LsmOptions {
             level_fanout: DEFAULT_LEVEL_FANOUT,
             wal_segment_bytes: DEFAULT_WAL_SEGMENT_BYTES,
             tombstone_grace_versions: DEFAULT_TOMBSTONE_GRACE_VERSIONS,
+            trust_monotonic_versions: false,
+            background_maintenance: false,
         }
     }
 }
@@ -327,6 +379,14 @@ struct Inner {
     /// SSTable. With WAL group commit a writer yields between log and apply, so this
     /// window is now observable; the gate closes it (see [`LsmEngine::flush`]).
     applies_in_flight: u64,
+    /// Refcount of currently-held [`LsmSnapshot`]s, keyed by their pinned
+    /// version (several snapshots can share a version if taken with no writes
+    /// in between). Registered by [`LsmEngine::snapshot`], released when the
+    /// last `LsmSnapshot` at that version drops. Compaction's tombstone GC
+    /// floor (`run_compaction`) is capped below the lowest held version so a
+    /// long-held snapshot's reads are never affected by GC reclaiming history
+    /// it still needs — see the module docs' tombstone-GC section.
+    held_snapshots: BTreeMap<Version, u64>,
 }
 
 impl Inner {
@@ -477,6 +537,14 @@ pub struct LsmEngine<E: Env> {
     /// to read storage counters back. Recording is observe-only — a relaxed atomic
     /// add at the real LSM site — and changes no engine behavior.
     metrics: MetricsHandle,
+    /// Set while a background maintenance task (`LsmOptions::background_maintenance`)
+    /// is in flight, so at most one runs at a time. See `trigger_background_maintenance`.
+    maintenance_scheduled: Arc<AtomicBool>,
+    /// The most recent background maintenance failure, if any (introspection —
+    /// `background_maintenance` is fire-and-forget from the writer's point of
+    /// view, so an error has nowhere else to surface; the next write that
+    /// crosses the threshold retriggers maintenance regardless).
+    background_error: Arc<Mutex<Option<String>>>,
 }
 
 impl<E: Env> LsmEngine<E> {
@@ -525,14 +593,27 @@ impl<E: Env> LsmEngine<E> {
     /// returned; every segment numbered below its minimum is a covered orphan whose
     /// records are already in an SSTable, so removing it is data-safe. No-op when
     /// the live set is empty (legacy single-file WAL) or starts at 0.
+    ///
+    /// Uses [`Disk::list`] (one directory listing) rather than probing segment
+    /// numbers `0..lowest_live` one `env.size` call at a time: the probe loop
+    /// costs one I/O call per *ever-rotated* segment number on **every** engine
+    /// open (unbounded over the engine's lifetime — a long-lived engine that has
+    /// rotated thousands of segments pays thousands of calls just to find
+    /// nothing), where a listing costs one call regardless of history.
     async fn remove_orphan_wal_segments(env: &E, prefix: &str, live: &[u64]) -> Result<()> {
         let Some(&lowest_live) = live.iter().min() else {
             return Ok(());
         };
-        for seg in 0..lowest_live {
-            let file = format!("{prefix}wal-{seg:06}");
-            if env.size(&file).await.map_err(io)? > 0 {
-                env.remove(&file).await.map_err(io)?;
+        let wal_prefix = format!("{prefix}wal-");
+        for name in env.list().await.map_err(io)? {
+            let Some(seg_str) = name.strip_prefix(&wal_prefix) else {
+                continue;
+            };
+            let Ok(seg) = seg_str.parse::<u64>() else {
+                continue; // not a `wal-NNNNNN` segment file (e.g. another engine's file)
+            };
+            if seg < lowest_live {
+                env.remove(&name).await.map_err(io)?;
             }
         }
         Ok(())
@@ -638,20 +719,46 @@ impl<E: Env> LsmEngine<E> {
             // Legacy migration: a directory written by the single-file-WAL era has
             // no recorded segments. Replay the old `<prefix>wal` file (if any) so
             // an upgrade loses nothing; the first new flush rewrites the layout to
-            // segments and this file is left as a harmless orphan.
+            // segments and this file is left as a harmless orphan. (Pre-alpha: this
+            // predates even the binary WAL codec, so an old JSON-encoded file no
+            // longer decodes — no real deployment depends on it; a brand-new engine
+            // with no legacy file just reads zero bytes here and replays nothing.)
             let legacy = format!("{prefix}wal");
             let wal_bytes = env.read(&legacy).await.map_err(io)?;
-            for record in decode_wal(&wal_bytes) {
+            let (records, _consumed) = decode_wal(&wal_bytes)?;
+            for record in records {
                 max_version = max_version.max(record_max_version(&record));
                 apply_wal_record(&mut memtable, &mut memtable_bytes, record);
             }
         } else {
+            // The highest-numbered segment is the one `GroupCommit` reopens as
+            // *active* (see its constructor below): further appends ride it. Only
+            // this segment can ever carry a crash-torn tail — older segments are
+            // sealed and never appended to again once rotated past (see the module
+            // docs' crash-safety argument) — so it's the only one that may need
+            // resealing before new writes land after its recovered content.
+            let active_seg = *segments.last().expect("segments is non-empty here");
             for &seg in &segments {
                 let file = format!("{prefix}wal-{seg:06}");
                 let wal_bytes = env.read(&file).await.map_err(io)?;
-                for record in decode_wal(&wal_bytes) {
+                let (records, consumed) = decode_wal(&wal_bytes)?;
+                for record in records {
                     max_version = max_version.max(record_max_version(&record));
                     apply_wal_record(&mut memtable, &mut memtable_bytes, record);
+                }
+                // Seal a torn trailing tail on the segment that becomes active:
+                // future appends must ride a clean boundary, never concatenate
+                // onto leftover garbage from an unsynced write a crash
+                // interrupted. Left in place, a second recovery would see the
+                // next (acked, synced) record's bytes glued onto that garbage
+                // with no frame boundary between them and lose it — exactly the
+                // bug `acked_writes_after_torn_tail_recovery_survive_second_restart`
+                // pins. `replace` is the same atomic primitive the manifest swap
+                // uses, so this truncation is itself crash-safe.
+                if seg == active_seg && consumed < wal_bytes.len() {
+                    env.replace(&file, &wal_bytes[..consumed])
+                        .await
+                        .map_err(io)?;
                 }
             }
         }
@@ -668,6 +775,7 @@ impl<E: Env> LsmEngine<E> {
             compactions: 0,
             block_reads,
             applies_in_flight: 0,
+            held_snapshots: BTreeMap::new(),
         };
 
         // The WAL has been fully replayed into the memtable, so every recovered
@@ -690,6 +798,8 @@ impl<E: Env> LsmEngine<E> {
             wal,
             maintenance: Arc::new(MaintenanceLock::default()),
             metrics,
+            maintenance_scheduled: Arc::new(AtomicBool::new(false)),
+            background_error: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -987,6 +1097,93 @@ impl<E: Env> LsmEngine<E> {
         Ok(())
     }
 
+    /// After a write is durable + applied: run flush/compaction **inline**
+    /// (default — every existing caller and test expects a write that crosses
+    /// the flush threshold to have flushed by the time it returns), or, when
+    /// [`LsmOptions::background_maintenance`] opts in, trigger it in the
+    /// background and apply write backpressure instead — see the field's docs
+    /// for the tradeoff and what's needed to drive it (a real scheduler, not a
+    /// bare `futures::executor::block_on`).
+    async fn after_write_maintenance(&self) -> Result<()> {
+        if self.opts.background_maintenance {
+            self.trigger_background_maintenance();
+            self.await_backpressure().await
+        } else {
+            self.maybe_flush_and_compact().await
+        }
+    }
+
+    /// If the memtable is over the flush threshold, or a compaction is due, and
+    /// no maintenance task is already running, spawn one (`env.spawn_task`) to
+    /// do that work off the write path. At most one maintenance task runs at a
+    /// time (`maintenance_scheduled`); a writer that finds one already in
+    /// flight just leaves it — `maybe_flush_and_compact` re-reads memtable /
+    /// compaction state itself when it runs, so nothing is missed, and the next
+    /// write that still finds work due will trigger another task once this one
+    /// finishes.
+    fn trigger_background_maintenance(&self) {
+        let should_flush = {
+            let inner = self.lock();
+            !inner.memtable.is_empty() && inner.memtable_bytes >= self.opts.flush_threshold_bytes
+        };
+        let due = should_flush || self.next_compaction().is_some();
+        if !due {
+            return;
+        }
+        if self
+            .maintenance_scheduled
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return; // a maintenance task is already in flight
+        }
+        let engine = self.clone();
+        self.env.spawn_task(async move {
+            if let Err(e) = engine.maybe_flush_and_compact().await {
+                *engine.background_error.lock().expect("poisoned") = Some(e.to_string());
+            }
+            engine.maintenance_scheduled.store(false, Ordering::Release);
+        });
+    }
+
+    /// Slow a writer down if the memtable has grown well past the flush
+    /// threshold — maintenance may be falling behind a burst of writes, or
+    /// stuck behind a slow/faulty disk. This is what bounds memtable growth
+    /// once flush/compaction move off the write path (without it, writers
+    /// could keep applying to the memtable indefinitely fast while a single
+    /// background task tries to keep up). A writer only waits
+    /// (`env.sleep`, deterministic under `SimEnv`); it never does the
+    /// flush/compaction work itself.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Backend`] if the memtable is still over the cap
+    /// after [`BACKPRESSURE_MAX_POLLS`] polls — maintenance is not making
+    /// progress (e.g. a persistently failing disk; see `background_error`),
+    /// so this turns what would otherwise be an unbounded stall into a loud,
+    /// clean error.
+    async fn await_backpressure(&self) -> Result<()> {
+        let cap = self
+            .opts
+            .flush_threshold_bytes
+            .saturating_mul(BACKPRESSURE_OVERSHOOT_FACTOR);
+        for _ in 0..BACKPRESSURE_MAX_POLLS {
+            if self.lock().memtable_bytes <= cap {
+                return Ok(());
+            }
+            // Make sure maintenance is actually working the backlog — normally
+            // the write that pushed the memtable over threshold already
+            // triggered it, but this is cheap insurance against any gap.
+            self.trigger_background_maintenance();
+            self.env.sleep(BACKPRESSURE_POLL).await;
+        }
+        let last_error = self.background_error.lock().expect("poisoned").clone();
+        Err(StorageError::Backend(format!(
+            "write backpressure: memtable stayed over the hard cap ({cap} bytes) \
+             after {BACKPRESSURE_MAX_POLLS} polls — background maintenance is not \
+             keeping up (last error: {last_error:?})"
+        )))
+    }
+
     /// Open a reader for `file`/`meta` with the engine's shared block-read
     /// counter wired in.
     async fn open_reader(&self, file: String, meta: SsTableMeta) -> Result<SsTableReader> {
@@ -1172,11 +1369,15 @@ impl<E: Env> LsmEngine<E> {
         // Pick inputs under the lock: all readers at the source level, plus the
         // target-level readers overlapping the source's combined key range. Also
         // capture (a) the engine's monotonic floor (`max_version`), which fixes the
-        // tombstone GC floor, and (b) the key ranges of every table at a level
+        // tombstone GC floor, (b) the lowest currently-held snapshot version (if
+        // any), which further *caps* that floor so a live snapshot's reads are
+        // never affected by GC, and (c) the key ranges of every table at a level
         // **deeper** than the target — a tombstone may only be fully reclaimed when
         // no such deeper table could still hold an older value for the key (which
-        // would otherwise resurface once the tombstone is gone).
-        let (input_readers, input_seqs, base_seq, max_version, deeper_ranges) = {
+        // would otherwise resurface once the tombstone is gone). Sampled together
+        // under one lock so a snapshot registered concurrently with this read is
+        // either fully accounted for or not yet started — never a torn view.
+        let (input_readers, input_seqs, base_seq, max_version, held_floor, deeper_ranges) = {
             let inner = self.lock();
             let mut input_readers: Vec<SsTableReader> = Vec::new();
             let mut source_bounds: Option<(Key, Key)> = None;
@@ -1212,11 +1413,20 @@ impl<E: Env> LsmEngine<E> {
                     _ => None,
                 })
                 .collect();
+            // The GC floor must stay *strictly below* every held snapshot version
+            // (a snapshot at version V reads with `get_at(key, V)`, which the
+            // module docs guarantee unaffected by GC only for versions `> floor`).
+            let held_floor = inner
+                .held_snapshots
+                .keys()
+                .next()
+                .map(|v| v.saturating_sub(1));
             (
                 input_readers,
                 input_seqs,
                 inner.manifest.next_seq,
                 inner.manifest.max_version,
+                held_floor,
                 deeper_ranges,
             )
         };
@@ -1243,7 +1453,12 @@ impl<E: Env> LsmEngine<E> {
         // Tombstone GC: reclaim obsolete tombstones (and the versions they shadow)
         // that have aged below the GC floor, without changing any read above it.
         // The drop in record count is exactly what GC reclaimed (observability).
-        let gc_floor = max_version.saturating_sub(self.opts.tombstone_grace_versions);
+        // Capped by `held_floor` so a live snapshot is never affected by GC (see
+        // `LsmEngine::snapshot` / `Inner::held_snapshots`).
+        let mut gc_floor = max_version.saturating_sub(self.opts.tombstone_grace_versions);
+        if let Some(held_floor) = held_floor {
+            gc_floor = gc_floor.min(held_floor);
+        }
         let before_gc = merged.len();
         gc_obsolete_records(&mut merged, gc_floor, &deeper_ranges);
         let reclaimed = (before_gc - merged.len()) as u64;
@@ -1376,6 +1591,34 @@ impl<E: Env> LsmEngine<E> {
     #[must_use]
     pub fn compaction_count(&self) -> u64 {
         self.lock().compactions
+    }
+
+    /// Number of currently-held [`LsmSnapshot`]s (summed across all pinned
+    /// versions). Test/introspection — used to check the tombstone-GC pin
+    /// (`Inner::held_snapshots`) is released when a snapshot drops.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn held_snapshot_count(&self) -> u64 {
+        self.lock().held_snapshots.values().sum()
+    }
+
+    /// The most recent [`LsmOptions::background_maintenance`] task failure, if
+    /// any. Test/introspection — background maintenance is fire-and-forget, so
+    /// this is how a test observes a failure that couldn't propagate to any
+    /// writer directly (`await_backpressure` does surface it once the memtable
+    /// is stuck over the hard cap).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn background_maintenance_error(&self) -> Option<String> {
+        self.background_error.lock().expect("poisoned").clone()
+    }
+
+    /// Whether a background maintenance task is currently in flight.
+    /// Test/introspection.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn background_maintenance_in_flight(&self) -> bool {
+        self.maintenance_scheduled.load(Ordering::Acquire)
     }
 
     /// Number of WAL **group-commit batch `fsync`s** performed since open. With
@@ -1584,7 +1827,10 @@ impl<E: Env> LsmEngine<E> {
 
     /// Decode the records of WAL segment `seg` into read-only views (in file
     /// order), reading the segment file through the `Env` disk seam. An absent or
-    /// unreadable segment yields an empty vec.
+    /// unreadable segment, or one that fails to decode (e.g. corruption), yields
+    /// an empty vec — this is a best-effort admin/debug view (ADR 0020), not the
+    /// load-bearing recovery path (`LsmEngine::open_with_metrics`), which does
+    /// surface a decode failure as a hard error.
     pub async fn wal_segment_records(&self, seg: u64) -> Vec<WalRecordView> {
         let bytes = self
             .env
@@ -1592,9 +1838,8 @@ impl<E: Env> LsmEngine<E> {
             .await
             .unwrap_or_default();
         decode_wal(&bytes)
-            .into_iter()
-            .map(WalRecordView::from)
-            .collect()
+            .map(|(records, _consumed)| records.into_iter().map(WalRecordView::from).collect())
+            .unwrap_or_default()
     }
 
     /// **Admin action (ADR 0020):** force-flush the memtable to an SSTable now,
@@ -1746,16 +1991,19 @@ impl<E: Env> StorageEngine for LsmEngine<E> {
             },
         )
         .await?;
-        self.maybe_flush_and_compact().await
+        self.after_write_maintenance().await
     }
 
     async fn merge(&self, key: &[u8], value: &[u8], version: Version) -> Result<bool> {
         // Per-key LWW: apply only if strictly newer than this key's own latest
-        // anywhere in the engine.
-        if self
-            .latest_version_of(key)
-            .await?
-            .is_some_and(|cur| version <= cur)
+        // anywhere in the engine. Skipped under `trust_monotonic_versions` (see
+        // `LsmOptions`): the caller guarantees `version` is already newer than
+        // anything this key holds, so the read is structurally always a winner.
+        if !self.opts.trust_monotonic_versions
+            && self
+                .latest_version_of(key)
+                .await?
+                .is_some_and(|cur| version <= cur)
         {
             return Ok(false);
         }
@@ -1771,15 +2019,17 @@ impl<E: Env> StorageEngine for LsmEngine<E> {
             },
         )
         .await?;
-        self.maybe_flush_and_compact().await?;
+        self.after_write_maintenance().await?;
         Ok(true)
     }
 
     async fn merge_tombstone(&self, key: &[u8], version: Version) -> Result<bool> {
-        if self
-            .latest_version_of(key)
-            .await?
-            .is_some_and(|cur| version <= cur)
+        // See `merge`: the read is skipped under `trust_monotonic_versions`.
+        if !self.opts.trust_monotonic_versions
+            && self
+                .latest_version_of(key)
+                .await?
+                .is_some_and(|cur| version <= cur)
         {
             return Ok(false);
         }
@@ -1794,7 +2044,7 @@ impl<E: Env> StorageEngine for LsmEngine<E> {
             },
         )
         .await?;
-        self.maybe_flush_and_compact().await?;
+        self.after_write_maintenance().await?;
         Ok(true)
     }
 
@@ -1809,10 +2059,22 @@ impl<E: Env> StorageEngine for LsmEngine<E> {
         // memtable yet, since we apply only after the single sync). Logging just
         // the winners keeps WAL replay a pure re-insert, so a crash-recovered
         // memtable is byte-identical to applying the ops via individual `merge`s.
+        //
+        // Under `trust_monotonic_versions` (see `LsmOptions`), the per-op read
+        // against *already-durable engine state* (`latest_version_of`) is
+        // skipped — the caller guarantees every op's version is already newer
+        // than anything the engine holds for that key. Multiple ops for the
+        // *same* key within one batch are still deduped against each other
+        // (cheap, in-memory, no read): the contract is about the engine's
+        // durable state, not about a caller never repeating a key mid-batch.
         let mut in_batch: BTreeMap<Key, Version> = BTreeMap::new();
         let mut winners: Vec<MergeRec> = Vec::with_capacity(ops.len());
         for op in ops {
-            let engine_latest = self.latest_version_of(&op.key).await?;
+            let engine_latest = if self.opts.trust_monotonic_versions {
+                None
+            } else {
+                self.latest_version_of(&op.key).await?
+            };
             let prior = in_batch.get(&op.key).copied();
             let current = match (engine_latest, prior) {
                 (Some(a), Some(b)) => Some(a.max(b)),
@@ -1849,7 +2111,7 @@ impl<E: Env> StorageEngine for LsmEngine<E> {
             },
         )
         .await?;
-        self.maybe_flush_and_compact().await
+        self.after_write_maintenance().await
     }
 
     async fn delete(&self, key: &[u8], version: Version) -> Result<()> {
@@ -1873,7 +2135,7 @@ impl<E: Env> StorageEngine for LsmEngine<E> {
             },
         )
         .await?;
-        self.maybe_flush_and_compact().await
+        self.after_write_maintenance().await
     }
 
     async fn delete_range(&self, start: &[u8], end: &[u8], version: Version) -> Result<()> {
@@ -1907,7 +2169,7 @@ impl<E: Env> StorageEngine for LsmEngine<E> {
             },
         )
         .await?;
-        self.maybe_flush_and_compact().await
+        self.after_write_maintenance().await
     }
 
     async fn write_batch(&self, batch: WriteBatch) -> Result<()> {
@@ -1966,7 +2228,7 @@ impl<E: Env> StorageEngine for LsmEngine<E> {
             },
         )
         .await?;
-        self.maybe_flush_and_compact().await
+        self.after_write_maintenance().await
     }
 
     async fn get(&self, key: &[u8]) -> Result<Option<VersionedValue>> {
@@ -2004,6 +2266,7 @@ impl<E: Env> StorageEngine for LsmEngine<E> {
 
     fn snapshot(&self) -> LsmSnapshot<E> {
         let version = self.lock().manifest.max_version;
+        self.hold_snapshot(version);
         LsmSnapshot {
             engine: self.clone(),
             version,
@@ -2030,14 +2293,52 @@ impl<E: Env> LsmEngine<E> {
             .filter_map(|(k, (_, slot))| slot.map(|_| k))
             .collect())
     }
+
+    /// Register a hold on `version` (an [`LsmSnapshot`] pinned there is now
+    /// live). Refcounted so several snapshots at the same version (taken with
+    /// no writes in between) release independently.
+    fn hold_snapshot(&self, version: Version) {
+        *self.lock().held_snapshots.entry(version).or_insert(0) += 1;
+    }
+
+    /// Release one hold on `version`, taken by [`Self::hold_snapshot`].
+    fn release_snapshot(&self, version: Version) {
+        let mut inner = self.lock();
+        if let Some(count) = inner.held_snapshots.get_mut(&version) {
+            *count -= 1;
+            if *count == 0 {
+                inner.held_snapshots.remove(&version);
+            }
+        }
+    }
 }
 
 /// A snapshot of an [`LsmEngine`] pinned at a version. Reads filter to records at
 /// or below that version, so later (higher-version) writes are invisible.
-#[derive(Clone)]
+///
+/// Holding a snapshot **pins the tombstone-GC floor** below its version (see
+/// [`LsmEngine::snapshot`] / the module docs' tombstone-GC section), so a
+/// long-held snapshot's reads stay correct even if compaction runs while it is
+/// alive; the pin is released when the last clone of this snapshot drops.
 pub struct LsmSnapshot<E: Env> {
     engine: LsmEngine<E>,
     version: Version,
+}
+
+impl<E: Env> Clone for LsmSnapshot<E> {
+    fn clone(&self) -> Self {
+        self.engine.hold_snapshot(self.version);
+        Self {
+            engine: self.engine.clone(),
+            version: self.version,
+        }
+    }
+}
+
+impl<E: Env> Drop for LsmSnapshot<E> {
+    fn drop(&mut self) {
+        self.engine.release_snapshot(self.version);
+    }
 }
 
 #[async_trait::async_trait]
@@ -2294,23 +2595,306 @@ fn apply_wal_record(memtable: &mut BTreeMap<Key, History>, bytes: &mut usize, re
     }
 }
 
-/// Encode one WAL record as a newline-terminated JSON line (`serde_json` never
-/// emits raw newlines, so framing is unambiguous; a torn trailing line is
-/// dropped on replay).
+// ---------------------------------------------------------------------------
+// Binary WAL record codec: length-prefixed + CRC32 framing
+// ---------------------------------------------------------------------------
+//
+// Each record is framed as:
+//   len(u32 BE) | crc32(u32 BE, of the `len`-byte payload only) | payload
+//
+// replacing the old newline-delimited `serde_json` encoding (a `Vec<u8>` value
+// serializes as a decimal-number JSON array — 3-6x bigger than the raw bytes on
+// the durability-critical fsync path). The payload itself is a compact,
+// hand-rolled binary encoding of `WalRecord` (mirrors the MANIFEST codec's
+// style: a tag byte, big-endian ints, length-prefixed byte strings — see
+// `put_bytes`/`put_opt_bytes`/`Cursor` below, shared with the manifest codec).
+//
+// The CRC turns at-rest corruption of a durable record into a loud decode
+// error instead of `decode_wal`'s old behavior of silently skipping *any*
+// malformed line. Distinguishing a legitimate crash-torn trailing record (never
+// synced, so never acked — tolerated) from real corruption (a durable record's
+// bytes flipped at rest — must be loud) is not always possible from a single
+// frame in isolation: a crash can leave a torn, possibly bit-flipped fragment
+// at the tail that happens to *look* like a short or corrupt frame, and that
+// must open cleanly. The rule `decode_wal` applies: a frame that fails to parse
+// (not enough bytes, or a CRC mismatch) is tolerated **only if it is provably
+// the last recoverable thing in the buffer** — i.e. no valid, checksummed frame
+// exists anywhere after it (`wal_resync_point`). A crash can only ever tear the
+// physical *end* of a file (the durable prefix from prior syncs is untouched —
+// see the module docs' crash-safety argument), so any bad frame that is
+// *followed* by more valid frames cannot be a torn tail; it can only be
+// corruption of previously-durable data, and is reported as a hard error rather
+// than silently dropping the (still-present, still-valid) records after it.
+
+/// Bytes in one frame's header (`len: u32` + `crc32: u32`).
+const WAL_FRAME_HEADER_BYTES: usize = 8;
+
+/// Frame + encode one [`WalRecord`] for the WAL.
 fn encode_wal(record: &WalRecord) -> Vec<u8> {
-    let mut bytes = serde_json::to_vec(record).expect("wal record serializes");
-    bytes.push(b'\n');
-    bytes
+    let payload = encode_wal_record(record);
+    let crc = crc32fast::hash(&payload);
+    let mut out = Vec::with_capacity(WAL_FRAME_HEADER_BYTES + payload.len());
+    out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    out.extend_from_slice(&crc.to_be_bytes());
+    out.extend_from_slice(&payload);
+    out
 }
 
-/// Decode WAL bytes into records, ignoring a trailing partial line (a write torn
-/// by a crash — it was never `sync`ed, so it was never acked).
-fn decode_wal(bytes: &[u8]) -> Vec<WalRecord> {
-    bytes
-        .split(|&b| b == b'\n')
-        .filter(|line| !line.is_empty())
-        .filter_map(|line| serde_json::from_slice(line).ok())
-        .collect()
+/// Attempt to parse one complete, checksum-valid, structurally well-formed WAL
+/// frame starting at `bytes[pos..]`. `None` on any failure — not enough bytes
+/// for the header/payload, a CRC mismatch, or a malformed payload — with no
+/// judgment about *why* (the caller, [`decode_wal`], decides whether that is a
+/// tolerable trailing tear or real corruption).
+fn try_parse_wal_frame(bytes: &[u8], pos: usize) -> Option<(WalRecord, usize)> {
+    if pos + WAL_FRAME_HEADER_BYTES > bytes.len() {
+        return None;
+    }
+    let len = u32::from_be_bytes(bytes[pos..pos + 4].try_into().ok()?) as usize;
+    let crc = u32::from_be_bytes(
+        bytes[pos + 4..pos + WAL_FRAME_HEADER_BYTES]
+            .try_into()
+            .ok()?,
+    );
+    let payload_start = pos + WAL_FRAME_HEADER_BYTES;
+    let payload_end = payload_start.checked_add(len)?;
+    if payload_end > bytes.len() {
+        return None;
+    }
+    let payload = &bytes[payload_start..payload_end];
+    if crc32fast::hash(payload) != crc {
+        return None;
+    }
+    let record = decode_wal_record(payload).ok()?;
+    Some((record, payload_end))
+}
+
+/// Scan forward from `start` for the first offset where a complete,
+/// checksum-valid WAL frame parses. Used only to prove a parse failure earlier
+/// in the buffer is *not* a legitimate torn tail (nothing recoverable can
+/// follow a genuine tear, since a crash only ever tears the physical end of a
+/// file).
+fn wal_resync_point(bytes: &[u8], start: usize) -> Option<usize> {
+    (start..bytes.len()).find(|&p| try_parse_wal_frame(bytes, p).is_some())
+}
+
+/// Decode a WAL segment's raw bytes into records plus how many leading bytes
+/// formed complete, valid frames (the recovery point the segment should be
+/// truncated to before further appends ride it — see
+/// `LsmEngine::open_with_metrics`).
+///
+/// Tolerates **only** a genuinely torn trailing frame: an un-synced write cut
+/// short by a crash, which was never acked and so is safe to drop silently. A
+/// parse failure that is *not* the tail — i.e. a valid frame still exists
+/// somewhere after it — can only be at-rest corruption of previously durable
+/// data (a crash cannot touch anything but the physical end of the file), and
+/// is surfaced loudly instead of silently truncating history.
+///
+/// # Errors
+/// Returns [`StorageError::Backend`] when a frame fails to parse and a valid
+/// frame is still found later in `bytes` (proof this was not a torn tail).
+fn decode_wal(bytes: &[u8]) -> Result<(Vec<WalRecord>, usize)> {
+    let mut records = Vec::new();
+    let mut pos = 0usize;
+    while pos < bytes.len() {
+        match try_parse_wal_frame(bytes, pos) {
+            Some((record, next)) => {
+                records.push(record);
+                pos = next;
+            }
+            None => {
+                if wal_resync_point(bytes, pos + 1).is_some() {
+                    return Err(StorageError::Backend(format!(
+                        "corrupt WAL record at byte offset {pos}: a valid record \
+                         still parses later in the file, so this is not a torn \
+                         tail — refusing to silently drop history"
+                    )));
+                }
+                break;
+            }
+        }
+    }
+    Ok((records, pos))
+}
+
+/// Encode a [`WalRecord`]'s payload (tag byte + fields; see the codec-level
+/// docs above `try_parse_wal_frame`). Reuses `put_bytes`/`put_opt_bytes` from
+/// the manifest codec below (plain free functions, not manifest-specific).
+fn encode_wal_record(record: &WalRecord) -> Vec<u8> {
+    let mut out = Vec::new();
+    match record {
+        WalRecord::Put {
+            key,
+            value,
+            version,
+        } => {
+            out.push(0);
+            put_bytes(&mut out, key);
+            put_bytes(&mut out, value);
+            out.extend_from_slice(&version.to_be_bytes());
+        }
+        WalRecord::Delete { key, version } => {
+            out.push(1);
+            put_bytes(&mut out, key);
+            out.extend_from_slice(&version.to_be_bytes());
+        }
+        WalRecord::DeleteRange {
+            start,
+            end,
+            keys,
+            version,
+        } => {
+            out.push(2);
+            put_bytes(&mut out, start);
+            put_bytes(&mut out, end);
+            out.extend_from_slice(&(keys.len() as u32).to_be_bytes());
+            for k in keys {
+                put_bytes(&mut out, k);
+            }
+            out.extend_from_slice(&version.to_be_bytes());
+        }
+        WalRecord::Batch { version, ops } => {
+            out.push(3);
+            out.extend_from_slice(&version.to_be_bytes());
+            out.extend_from_slice(&(ops.len() as u32).to_be_bytes());
+            for op in ops {
+                encode_batch_op(&mut out, op);
+            }
+        }
+        WalRecord::MergeBatch { ops } => {
+            out.push(4);
+            out.extend_from_slice(&(ops.len() as u32).to_be_bytes());
+            for op in ops {
+                encode_merge_rec(&mut out, op);
+            }
+        }
+    }
+    out
+}
+
+fn encode_batch_op(out: &mut Vec<u8>, op: &BatchOp) {
+    match op {
+        BatchOp::Put { key, value } => {
+            out.push(0);
+            put_bytes(out, key);
+            put_bytes(out, value);
+        }
+        BatchOp::Delete { key } => {
+            out.push(1);
+            put_bytes(out, key);
+        }
+        BatchOp::DeleteKeys { keys } => {
+            out.push(2);
+            out.extend_from_slice(&(keys.len() as u32).to_be_bytes());
+            for k in keys {
+                put_bytes(out, k);
+            }
+        }
+    }
+}
+
+fn encode_merge_rec(out: &mut Vec<u8>, rec: &MergeRec) {
+    put_bytes(out, &rec.key);
+    put_opt_bytes(out, &rec.value);
+    out.extend_from_slice(&rec.version.to_be_bytes());
+}
+
+/// Decode one [`WalRecord`] from an already length-framed + CRC-verified
+/// payload. Bounds-checked throughout via [`Cursor`] (shared with the manifest
+/// codec), so a malformed payload is a clean error, never a panic; any trailing
+/// bytes left after decoding are also rejected (the payload must be exactly
+/// consumed — leftover bytes mean the length didn't match the content, which a
+/// passing CRC makes vanishingly unlikely but is still checked).
+fn decode_wal_record(bytes: &[u8]) -> Result<WalRecord> {
+    let mut c = Cursor::new(bytes);
+    let tag = c.u8()?;
+    let record = match tag {
+        0 => {
+            let key = c.bytes()?;
+            let value = c.bytes()?;
+            let version = c.u64()?;
+            WalRecord::Put {
+                key,
+                value,
+                version,
+            }
+        }
+        1 => {
+            let key = c.bytes()?;
+            let version = c.u64()?;
+            WalRecord::Delete { key, version }
+        }
+        2 => {
+            let start = c.bytes()?;
+            let end = c.bytes()?;
+            let n = c.u32()? as usize;
+            let mut keys = Vec::with_capacity(n);
+            for _ in 0..n {
+                keys.push(c.bytes()?);
+            }
+            let version = c.u64()?;
+            WalRecord::DeleteRange {
+                start,
+                end,
+                keys,
+                version,
+            }
+        }
+        3 => {
+            let version = c.u64()?;
+            let n = c.u32()? as usize;
+            let mut ops = Vec::with_capacity(n);
+            for _ in 0..n {
+                ops.push(decode_batch_op(&mut c)?);
+            }
+            WalRecord::Batch { version, ops }
+        }
+        4 => {
+            let n = c.u32()? as usize;
+            let mut ops = Vec::with_capacity(n);
+            for _ in 0..n {
+                ops.push(decode_merge_rec(&mut c)?);
+            }
+            WalRecord::MergeBatch { ops }
+        }
+        other => return Err(StorageError::Backend(format!("bad WAL record tag {other}"))),
+    };
+    if c.pos != bytes.len() {
+        return Err(StorageError::Backend(
+            "trailing bytes after WAL record".into(),
+        ));
+    }
+    Ok(record)
+}
+
+fn decode_batch_op(c: &mut Cursor<'_>) -> Result<BatchOp> {
+    let tag = c.u8()?;
+    Ok(match tag {
+        0 => BatchOp::Put {
+            key: c.bytes()?,
+            value: c.bytes()?,
+        },
+        1 => BatchOp::Delete { key: c.bytes()? },
+        2 => {
+            let n = c.u32()? as usize;
+            let mut keys = Vec::with_capacity(n);
+            for _ in 0..n {
+                keys.push(c.bytes()?);
+            }
+            BatchOp::DeleteKeys { keys }
+        }
+        other => return Err(StorageError::Backend(format!("bad batch op tag {other}"))),
+    })
+}
+
+fn decode_merge_rec(c: &mut Cursor<'_>) -> Result<MergeRec> {
+    let key = c.bytes()?;
+    let value = c.opt_bytes()?;
+    let version = c.u64()?;
+    Ok(MergeRec {
+        key,
+        value,
+        version,
+    })
 }
 
 // ---------------------------------------------------------------------------

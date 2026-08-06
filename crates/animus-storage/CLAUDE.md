@@ -59,6 +59,25 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
   ~9.7x on the apply-path bench). The trait method is **defaulted** (per-op loop) so
   `MemoryEngine` and any other backend need no change; `LsmEngine` overrides it
   (`WalRecord::MergeBatch`). Regression: `lsm_group_commit.rs::merge_batch_coalesces_one_fsync_and_is_durable`.
+- **`LsmOptions::trust_monotonic_versions`** (opt-in, default `false`) skips
+  `merge`/`merge_tombstone`/`merge_batch`'s cross-SSTable `latest_version_of`
+  point read — under the CP plane's monotonic Raft-log-index versions that read
+  is structurally always a winner, so it's pure overhead. `merge_batch` still
+  dedupes multiple ops for the *same* key within one batch (cheap, in-memory —
+  the skipped read is only against already-durable engine state). Proven by
+  asserting **zero** SSTable block reads for a merge whose key already lives in
+  a flushed table (`lsm_merge_fast_path.rs`), not just that the result is
+  correct — a correct result alone wouldn't prove the read was skipped.
+- **Adding a field to `LsmOptions` is a wide mechanical edit, not a local
+  one:** every test/bench constructs it via a full struct literal (no
+  `..Default::default()`), so a new field means touching every call site in
+  the crate (~20+, across `tests/*.rs` and `benches/*.rs`) — nothing outside
+  `animus-storage` uses it yet, so the blast radius stays crate-local. A
+  `sed -E 's/^(\s*)tombstone_grace_versions: (.*),$/&\n\1new_field: default,/'`
+  over every site (matching indentation via a backreference) is faster and
+  less error-prone than hand-editing each one; verify with a build immediately
+  after (a missed site is a compile error, not a silent bug — Rust won't let a
+  struct literal omit a field).
 - Per key, history is `version -> Some(value) | None`; `None` is a tombstone, so
   `delete`/`delete_range` preserve older versions for `get_at`.
 - **`LsmEngine` is the simulation-testable on-disk engine.**
@@ -175,7 +194,75 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
   (rotation/GC never reset it). **Orphan WAL segments below the live set** (covered
   files a crash-after-manifest-swap-before-`remove` leaked) are deleted on open by
   `remove_orphan_wal_segments` — recovery already ignored them (it only probes
-  *forward*), this also reclaims them so they don't leak.
+  *forward*), this also reclaims them so they don't leak. Uses **`Disk::list`**
+  (one directory listing, filtered by filename) rather than probing segment
+  numbers `0..lowest_live` one `env.size` call at a time — the probe loop cost
+  one I/O call per *ever-rotated* segment number on every open, unbounded over
+  the engine's lifetime; a listing is one call regardless of history.
+- **Each WAL record is framed `len(u32 BE) | crc32(u32 BE) | payload`** (a
+  compact hand-rolled binary encoding, replacing an older newline-delimited
+  `serde_json` line — a `Vec<u8>` value serialized as a decimal-number JSON
+  array is 3-6x bigger than the raw bytes on the fsync-critical path). The CRC
+  turns at-rest corruption of a durable record into a loud error instead of
+  silently dropping it. **Distinguishing a legitimate crash-torn trailing
+  record from real corruption is not a magnitude check on the frame — it's
+  positional.** A crash can only ever tear the physical *end* of a file (prior
+  synced content is untouched), so `decode_wal`'s rule is: a frame that fails
+  to parse (short read *or* CRC mismatch) is tolerated **only if no valid,
+  checksummed frame exists anywhere later in the buffer**
+  (`wal_resync_point`) — proof nothing recoverable follows, i.e. this really is
+  the tail. A bad frame *followed* by more valid frames can only be corruption
+  of previously-durable data (a crash cannot reach past the tear point), so
+  that's a hard error, never a silent truncation of everything after it. Magnitude-based
+  heuristics ("declared length looks implausible") don't work here: both a
+  genuinely torn-and-then-bit-flipped tail *and* real mid-file corruption can
+  produce an equally implausible declared length — the position (is there
+  provably-valid data after the bad frame?) is the only sound signal. On open,
+  a torn tail found on the segment that becomes **active** is truncated via
+  `Disk::replace` before further appends ride it — left in place, the next
+  acked write would concatenate onto the garbage with no frame boundary, and a
+  *second* recovery would then lose it (regression:
+  `lsm_disk_faults.rs::acked_writes_after_torn_tail_recovery_survive_second_restart`).
+  Corruption regression: `lsm_disk_faults.rs::corrupted_durable_wal_record_surfaces_loudly`.
+- **A `snapshot()`'s pinned version must floor compaction's tombstone-GC
+  window, not just its own read path.** `LsmSnapshot` used to be a bare
+  `(engine, version)` pair with no registration anywhere — a long-held snapshot
+  could read torn/reclaimed history once a background compaction aged past
+  `tombstone_grace_versions`. Fixed with a refcounted watermark
+  (`Inner::held_snapshots`, registered on `snapshot()`/every `Clone`, released
+  on `Drop`) that caps compaction's `gc_floor` at `min_held_version - 1`,
+  sampled under the *same* lock as `max_version` so a concurrently-registered
+  snapshot can't be missed. `LsmSnapshot` therefore couldn't stay
+  `#[derive(Clone)]` — a hand-written `Clone` re-registers the hold so a clone
+  and the original release independently. Regression: `lsm_gc.rs::held_snapshot_survives_compaction_gc`.
+- **`env.spawn_task` + this crate's `block_on`-only `SimEnv` test convention
+  don't mix — gate genuine backgrounding behind an opt-in flag, don't retrofit
+  every test.** Moving `maybe_flush_and_compact` off the write-path ack
+  (`LsmOptions::background_maintenance`) needs a task that outlives the
+  triggering `put`/`merge` call. But `SimEnv`'s `Spawner::spawn` only
+  *registers* a task on the `Simulator`'s ready queue — polling it needs
+  `Simulator::run_for`/`run_until_quiescent`, which none of this crate's
+  `LsmEngine` tests call (they drive everything with a bare
+  `futures::executor::block_on`, deliberately, per the module docs). A
+  `block_on`'d write that spawns a background flush would leave that task
+  *permanently unpolled* in every such test — not flaky, structurally dead —
+  and dozens of tests assert `sstable_count()`/`compaction_count()` right after
+  a write loop with no driving step. Retrofitting all of them (or their
+  `Simulator` handle, which several helpers discard) to drive the simulator
+  would be a sprawling, high-risk rewrite for a change whose only real
+  consumer is a different crate's async, already-`Simulator`-driven apply
+  loop. Instead the feature is fully implemented and tested, but **opt-in**
+  (`LsmOptions::background_maintenance: bool`, default `false` = the old
+  fully-synchronous behavior, byte-for-byte what every existing test expects).
+  Its own tests (`lsm_maintenance.rs`) follow the pattern real consumers need:
+  spawn the *write workload itself* as a task, then
+  `Simulator::run_until_quiescent` to drive both the writer and the
+  maintenance task it triggers — the same shape `animus-control`'s Raft tests
+  already use for spawned protocol loops. **Generalizable check before adding
+  `env.spawn_task` to any component this crate's style of test exercises:** does
+  the test suite already drive `Simulator::run_for`/`run_until_quiescent`, or
+  only `block_on`? A bare `block_on` harness makes newly-spawned background
+  work invisible, not merely hard to observe.
 - **Crash safety** holds at the manifest swap: a crash mid-flush or
   mid-compaction recovers the last durable manifest + the intact WAL segments — the
   orphan SSTable (un-synced, never manifest-referenced, at a seq beyond the
@@ -241,7 +328,35 @@ level, bloom), `memtable_len`/`memtable_bytes`, `wal_segment_sizes`/
 keeps the `applies_in_flight == 0` WAL-GC invariant). Pure reads or explicit
 actions; they record nothing and change no engine behavior. `lsm_gc.rs` covers tombstone GC: an aged
 tombstone (and its shadowed value) is physically reclaimed while a within-grace
-tombstone is preserved, and GC never resurrects a key with a deeper old value.
+tombstone is preserved, and GC never resurrects a key with a deeper old value;
+and a held `Snapshot` pins the GC floor below its own version, surviving
+compactions that would otherwise reclaim the very history it needs (and
+releases the pin on drop).
+
+`lsm_disk_faults.rs` drives `LsmEngine` under `SimEnv`'s opt-in disk fault
+model (`DiskConfig`: injected I/O errors, torn WAL tails on crash, at-rest
+corruption) — seed-swept and reproducible. Covers a torn-tail crash recovering
+every acked write (with and without an additional bit-flip in the torn
+region), injected write-path errors losing no acked write, faulty
+flush/compaction losing no acked write, a corrupted SSTable block failing
+cleanly (per-block CRC), a corrupted MANIFEST never panicking, a torn WAL tail
+surviving a *second* restart (the sealing fix), and at-rest WAL corruption
+surfacing loudly instead of silently dropping history (the CRC-framing fix).
+
+`lsm_merge_fast_path.rs` covers `LsmOptions::trust_monotonic_versions`:
+default behavior still reads the SSTable for the LWW check; the opt-in fast
+path reads **zero** blocks for `merge`/`merge_tombstone`/`merge_batch` on a
+key that already lives on disk, while still applying correctly (including
+in-batch dedup for a repeated key).
+
+`lsm_maintenance.rs` covers `LsmOptions::background_maintenance`: a write's ack
+returns before the flush it triggers has run (no simulator driving yet); once
+driven with `Simulator::run_until_quiescent`, the background task completes
+and data is correct; a large burst of writes converges under backpressure with
+no lost/corrupted keys; and the default (`false`) path stays fully synchronous
+with no driving needed, unaffected. See the "What's non-obvious" entry above
+on why these tests spawn the write workload as a task rather than using this
+crate's usual bare `block_on`.
 
 `lsm_metrics.rs` covers the ADR 0015 storage counters: a write workload forces
 several flushes, an L0→L1 compaction (asserting tables/bytes merged), WAL segment
