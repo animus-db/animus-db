@@ -271,10 +271,38 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   now takes `expected_epoch` and is rejected on mismatch, exactly like
   `CasTabletReplicas` — so the loser's `propose_split_metadata` (step 1) itself
   now fails cleanly, hitting the *existing* "nothing was allocated, no orphan to
-  track" path, and no second `new_id` is ever minted. See the root `CLAUDE.md`
-  engineering-practices entry (a new command mutating a resource another
-  command already CASes needs the same guard) and
-  `animus-control/CLAUDE.md`'s `SplitTablet` note.
+  track" path, and no second `new_id` is ever minted **for a same-epoch,
+  concurrent race**. See the root `CLAUDE.md` engineering-practices entry (a new
+  command mutating a resource another command already CASes needs the same
+  guard) and `animus-control/CLAUDE.md`'s `SplitTablet` note.
+  **This did not close the *sequential* case, and permanent orphans kept
+  accumulating live under sustained `--auto-split` bulk-seed + leader churn.**
+  The epoch CAS only rejects a second mint at the *same* epoch; nothing stops
+  a *later* fresh trigger from minting a second child once the first mint's
+  own epoch bump has already advanced the source's epoch — legitimate at
+  propose time, but still fatal, since the underlying CP-data group can only
+  ever apply one real `Split`. Whichever key doesn't win hits the abandon
+  branch above, which correctly stops retrying but (as originally written)
+  never removed the dead mint — so under real leader churn, `Metadata.tablets`
+  accumulated permanent, unreachable orphans one abandonment at a time
+  (live-observed: two orphans within ~10 minutes of one `--cluster 3
+  --auto-split 2000` run, growing without bound). Fixed with
+  `MetaCommand::DropOrphanTablet` (CAS-gated like its siblings; always safe,
+  since a mint that never got `cp_split_seed`'d never held data) — both the
+  abandon branch here and `trigger_split`'s own step-2 failure path (the
+  one-shot manual/admin trigger, which can hit the identical "a different key
+  already won" outcome) call `ClientCtx::drop_orphan_tablet` once they've
+  confirmed via `applied_split_key()` that their own key lost. Deterministic
+  regression (no timing race needed): `tests/cp_plane.rs::
+  a_lost_split_race_does_not_leave_a_permanent_orphan` drives two *sequential*
+  manual splits of the same tablet — the second's `split_key` is chosen
+  strictly inside the source's already-narrowed post-first-split range, so its
+  step 2 can never confirm — and asserts the resulting orphan is GC'd, not left
+  dangling. The genuine live race (via `auto_split_loop`, needing real leader
+  churn) is exercised only by the unit-tested pure CAS/apply logic in
+  `animus-control`, per this file's "extract the invariant into a pure
+  function" convention — reproducing the *exact* live timing on demand isn't
+  tractable, but the sequential-mint precondition it depends on is.
 - **A `RaftKvNode` group applies at most one `Split`, *ever* — `auto_split_loop`
   didn't know that, and kept re-triggering an already-split tablet forever.**
   `KvCommand::Split`'s apply-time guard (`animus-cp-data`) makes every `Split`

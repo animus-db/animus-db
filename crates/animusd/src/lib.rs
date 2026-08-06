@@ -621,6 +621,10 @@ fn is_relayable_command(command: &MetaCommand) -> bool {
             // Drop-table GC (ADR 0024): a `DROP TABLE` on a follower-connected
             // client relays the table's tablet removal to the control leader.
             | MetaCommand::DropTableTablets { .. }
+            // Orphan-tablet GC (the auto-split abandon path below): the loop
+            // driving the abandon runs on whichever node currently hosts the
+            // source tablet's leader, which may not be the control leader.
+            | MetaCommand::DropOrphanTablet { .. }
     )
 }
 
@@ -3249,6 +3253,26 @@ async fn auto_split_loop(ctx: ClientCtx, threshold: usize) {
                 // move actually shrink the tablet below `threshold`.
                 last_triggered.insert(tablet, tokio::time::Instant::now());
                 ctx.edge.release_auto_split(tablet);
+                // GC the orphan: our own step 1 already minted a tablet id at
+                // `split_key` that can now never be seeded (only the winning
+                // key's `cp_split_seed` ever fires), so left alone it sits in
+                // `Metadata.tablets` forever — `leader: unknown`, unreachable,
+                // and cluttering every admin/status view. Resolve its *current*
+                // id the same way `cp_split_seed` resolves a fresh mint (by
+                // `range.start == split_key` — our own mint is the only tablet
+                // that can have started exactly there) and drop it in the
+                // background so this tick doesn't block on the proposal.
+                if let Some(orphan) = ctx
+                    .raft
+                    .metadata()
+                    .tablets
+                    .iter()
+                    .find(|(_, t)| t.range.start == split_key)
+                    .map(|(id, _)| *id)
+                {
+                    let ctx = ctx.clone();
+                    tokio::spawn(async move { ctx.drop_orphan_tablet(orphan).await });
+                }
                 continue;
             }
             tracing::warn!(
@@ -3586,13 +3610,33 @@ impl ClientCtx {
     /// *same* `split_key` until it succeeds, rather than calling this combined
     /// one-shot helper. See [`propose_split_metadata`]'s doc for why.
     ///
+    /// A step-2 failure caused by a **different** key having already won the
+    /// group's one-time split (e.g. a prior `trigger_split`/`CpSplit` call, or
+    /// `auto_split_loop`, already split `tablet` for real) can never be fixed by
+    /// retrying `split_key` — so unlike a transient timeout, this GCs its own
+    /// now-permanently-orphaned mint before returning, instead of leaving a
+    /// dead `Metadata` entry for the caller to notice and clean up by hand.
+    ///
     /// [`propose_split_metadata`]: Self::propose_split_metadata
     /// [`propose_split_data`]: Self::propose_split_data
     async fn trigger_split(&self, tablet: TabletId, split_key: Vec<u8>) -> ClientResponse {
-        match self.propose_split_metadata(tablet, split_key.clone()).await {
-            Ok(_new_id) => self.propose_split_data(tablet, split_key).await,
-            Err(resp) => resp,
+        let new_id = match self.propose_split_metadata(tablet, split_key.clone()).await {
+            Ok(new_id) => new_id,
+            Err(resp) => return resp,
+        };
+        let response = self.propose_split_data(tablet, split_key.clone()).await;
+        if matches!(response, ClientResponse::PutOk) {
+            return response;
         }
+        let lost_to_a_different_key = self
+            .edge
+            .local_cp(tablet)
+            .and_then(|g| g.applied_split_key())
+            .is_some_and(|applied| applied != split_key);
+        if lost_to_a_different_key {
+            self.drop_orphan_tablet(new_id).await;
+        }
+        response
     }
 
     /// Step 1 of a split: record it in the control plane (a new tablet id covering
@@ -3664,6 +3708,50 @@ impl ClientCtx {
         .await
         .map(|()| new_id)
         .map_err(|()| ClientResponse::Error("split metadata did not commit in time".into()))
+    }
+
+    /// Best-effort GC for a metadata-only **orphan** tablet: `tablet`'s
+    /// `SplitTablet` (step 1) committed, but the source group's one-time
+    /// data-plane split was won by a different key, so `tablet` can never be
+    /// seeded (`cp_split_seed` only fires for the winning key) and will sit in
+    /// `Metadata.tablets` forever — `leader: unknown`, unreachable — unless
+    /// something removes it. Called from `auto_split_loop`'s abandon branch and
+    /// from [`trigger_split`](Self::trigger_split)'s step-2 failure path, both
+    /// once they've already confirmed (via `applied_split_key()`) that `tablet`
+    /// lost the race, so it never held real data and dropping it is always
+    /// safe (`MetaCommand::DropOrphanTablet`'s doc).
+    ///
+    /// Reads `tablet`'s epoch fresh rather than threading one through from the
+    /// caller: nothing else ever touches an unhosted orphan, so it's stable,
+    /// and reading it here means the CAS reflects exactly what this call sees
+    /// (same discipline as `propose_split_metadata`). Logs and gives up on
+    /// failure instead of retrying forever — a lingering orphan is metadata
+    /// clutter, not a correctness hazard on its own, so it isn't worth a
+    /// second retry queue; the next abandonment of the same source tablet (if
+    /// any) will try again with its own orphan.
+    #[tracing::instrument(name = "drop_orphan_tablet", skip(self), fields(tablet = tablet.0))]
+    async fn drop_orphan_tablet(&self, tablet: TabletId) {
+        let Some(expected_epoch) = self.raft.metadata().tablets.get(&tablet).map(|t| t.epoch)
+        else {
+            // Already gone — a prior attempt succeeded, or it was never really
+            // minted (both fine; nothing to do).
+            return;
+        };
+        let cmd = MetaCommand::DropOrphanTablet {
+            tablet,
+            expected_epoch,
+        };
+        let dropped = self
+            .propose_and_await(cmd, SCHEMA_COMMIT_TIMEOUT, || {
+                (!self.raft.metadata().tablets.contains_key(&tablet)).then_some(())
+            })
+            .await;
+        if dropped.is_err() {
+            tracing::warn!(
+                tablet = tablet.0,
+                "auto_split: failed to GC an abandoned orphan tablet; it will linger"
+            );
+        }
     }
 
     /// Step 2 of a split: trigger the data-plane split on `tablet`'s CP group leader

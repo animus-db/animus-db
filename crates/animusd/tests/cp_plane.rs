@@ -611,3 +611,118 @@ async fn already_split_tablet_is_not_retried_forever() {
         n.shutdown();
     }
 }
+
+/// Regression: `trigger_split`'s data-plane step can fail *permanently*, not
+/// just transiently — a different key can already have won the source
+/// group's one-time split (the same "abandoned pending split" shape
+/// `auto_split_loop` can hit under leader churn, see its doc). Before this
+/// fix, nothing ever removed the resulting metadata-only mint: it sat in
+/// `Metadata.tablets` forever with a real range/replicas but no CP group —
+/// `leader: unknown`, unreachable, permanently cluttering every admin view
+/// and burning a tablet id.
+///
+/// This reproduces the permanent (not transient) failure **deterministically**,
+/// with no timing race: two sequential manual splits of the same source
+/// tablet. The first split ("m") wins for real. The second ("c") is proposed
+/// against the source's now-narrowed range (`[start, "m")`, so "c" is still
+/// strictly inside it) — step 1 mints a second child, but step 2 can never
+/// confirm, because the source's real CP group already spent its one-time
+/// split on "m". Asserts the second mint is cleaned up rather than left
+/// dangling.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_lost_split_race_does_not_leave_a_permanent_orphan() {
+    let dir = tempfile::tempdir().unwrap();
+    let bound = bind_cluster(3, "127.0.0.1".parse().unwrap(), dir.path())
+        .await
+        .unwrap();
+    let nodes = start_cluster(bound).await.unwrap();
+    await_bootstrap(&nodes).await;
+    let addr0 = nodes[0].client_addr();
+
+    // A fresh cluster has zero data tablets (ADR 0023 provision-at-create) — a
+    // write provisions this table's tablet, retrying while its CP group elects.
+    let put_ok = async {
+        loop {
+            match call(
+                addr0,
+                ClientRequest::Put {
+                    key: b"seed".to_vec(),
+                    value: b"v".to_vec(),
+                    table: "orphan_test".to_string(),
+                },
+            )
+            .await
+            {
+                ClientResponse::PutOk => return,
+                ClientResponse::Error(_) => sleep(Duration::from_millis(100)).await,
+                other => panic!("unexpected put: {other:?}"),
+            }
+        }
+    };
+    timeout(Duration::from_secs(20), put_ok)
+        .await
+        .expect("provisioning write did not succeed within 20s");
+    let source = *nodes[0]
+        .metadata()
+        .tablets
+        .keys()
+        .next()
+        .expect("the write provisioned a tablet");
+
+    // First split: wins for real.
+    let first = timeout(
+        Duration::from_secs(20),
+        call(
+            addr0,
+            ClientRequest::SplitTablet {
+                tablet: source.0,
+                split_key: b"m".to_vec(),
+            },
+        ),
+    )
+    .await
+    .expect("first split timed out");
+    assert_eq!(first, ClientResponse::PutOk, "first split should confirm");
+    assert_eq!(nodes[0].metadata().tablets.len(), 2);
+
+    // Second split: step 1 mints a second child at "c" (still strictly inside
+    // the source's narrowed range), but step 2 can never confirm.
+    let second = timeout(
+        Duration::from_secs(20),
+        call(
+            addr0,
+            ClientRequest::SplitTablet {
+                tablet: source.0,
+                split_key: b"c".to_vec(),
+            },
+        ),
+    )
+    .await
+    .expect("second split timed out");
+    assert!(
+        matches!(second, ClientResponse::Error(_)),
+        "second split's data-plane half can never confirm: {second:?}"
+    );
+
+    // The lost split's orphan mint must not linger.
+    let poll_gc = async {
+        loop {
+            if nodes[0].metadata().tablets.len() == 2 {
+                return;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    };
+    timeout(Duration::from_secs(5), poll_gc)
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "orphan tablet was not GC'd: {} tablets remain",
+                nodes[0].metadata().tablets.len()
+            )
+        });
+
+    for n in &nodes {
+        n.shutdown();
+    }
+}
