@@ -330,6 +330,17 @@ impl Metadata {
                 if self.tablets.contains_key(new_id) {
                     return ApplyOutcome::Rejected("new tablet id already exists");
                 }
+                // Enforce the monotonic allocator (ADR 0023) at apply time, not just
+                // at the proposer: a `new_id` below [`Metadata::next_free_tablet_id`]
+                // could *reuse* an id freed by `DropTableTablets` — and a replica
+                // still holding the dropped tablet's `db-t{id}-*` files (GC
+                // incomplete, or down during the drop) would re-host them AS the new
+                // tablet, resurrecting dropped data the absence-keyed GC can then
+                // never reclaim. The present-tablet check above cannot catch a
+                // *freed* id, so reject anything below the allocator floor.
+                if new_id.0 < self.next_free_tablet_id().0 {
+                    return ApplyOutcome::Rejected("new tablet id below the monotonic allocator");
+                }
                 let Some(source) = self.tablets.get(tablet) else {
                     return ApplyOutcome::Rejected("no such tablet");
                 };
@@ -710,5 +721,55 @@ mod tests {
             ..Metadata::default()
         };
         assert_eq!(legacy.next_free_tablet_id(), TabletId(8));
+    }
+
+    /// `SplitTablet` enforces the monotonic allocator at **apply** time: an id
+    /// freed by `DropTableTablets` is never reused (a replica still holding the
+    /// dropped tablet's on-disk files would re-host them as the new tablet), so a
+    /// split carrying a below-allocator `new_id` — e.g. from a stale or divergent
+    /// proposer computing `max(ids) + 1` — is rejected; the allocator's own id is
+    /// accepted and the counter stays monotonic.
+    #[test]
+    fn split_rejects_a_reused_tablet_id_below_the_allocator() {
+        let mut m = Metadata::default();
+        let create = |id: u64, table: &str| MetaCommand::CreateTablet {
+            tablet: TabletId(id),
+            table: Some(table.to_owned()),
+            range: KeyRange::whole(),
+            replicas: vec![1, 2, 3],
+        };
+        assert_eq!(m.apply(&create(1, "users")), ApplyOutcome::Applied);
+        assert_eq!(m.apply(&create(2, "orders")), ApplyOutcome::Applied);
+
+        // Drop the table owning the **highest** id; the freed id must not come back.
+        assert_eq!(
+            m.apply(&MetaCommand::DropTableTablets {
+                table: "orders".to_owned(),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert!(!m.tablets.contains_key(&TabletId(2)));
+        assert_eq!(m.next_free_tablet_id(), TabletId(3));
+
+        // A split re-minting the freed id (what `max(ids) + 1` would derive here)
+        // is rejected — it does not collide with a *present* tablet, so only the
+        // allocator floor catches it.
+        let split_at = |new_id: u64| MetaCommand::SplitTablet {
+            tablet: TabletId(1),
+            split_key: b"m".to_vec(),
+            new_id: TabletId(new_id),
+        };
+        assert_eq!(
+            m.apply(&split_at(2)),
+            ApplyOutcome::Rejected("new tablet id below the monotonic allocator")
+        );
+        // The rejected split changed nothing.
+        assert_eq!(m.tablets.len(), 1);
+        assert_eq!(m.tablets[&TabletId(1)].epoch, Epoch::INITIAL);
+
+        // The allocator's own id is accepted, and the counter stays monotonic.
+        assert_eq!(m.apply(&split_at(3)), ApplyOutcome::Applied);
+        assert!(m.tablets.contains_key(&TabletId(3)));
+        assert_eq!(m.next_free_tablet_id(), TabletId(4));
     }
 }

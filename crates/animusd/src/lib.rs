@@ -2895,18 +2895,15 @@ impl ClientCtx {
     /// leaders may differ), forwarding a one-hop [`CpSplit`](ClientRequest::CpSplit)
     /// there if this node doesn't host it.
     async fn trigger_split(&self, tablet: TabletId, split_key: Vec<u8>) -> ClientResponse {
-        // The new tablet id: one past the current max (deterministic on the leader
-        // that proposes it; replicated to all via `SplitTablet`).
-        let new_id = TabletId(
-            self.raft
-                .metadata()
-                .tablets
-                .keys()
-                .map(|t| t.0)
-                .max()
-                .unwrap_or(0)
-                + 1,
-        );
+        // The new tablet id comes from the **monotonic allocator**
+        // (`next_free_tablet_id`, ADR 0023 — the same allocator provisioning uses),
+        // *not* `max(existing ids) + 1`: `DropTableTablets` removes tablets without
+        // lowering `next_tablet_id`, so max+1 could re-mint a freed id — and a
+        // replica still holding the dropped tablet's `db-t{id}-*` files would
+        // re-host them AS the new tablet (data resurrection the absence-keyed GC
+        // can never reclaim). The apply also rejects a below-allocator id, so a
+        // stale proposer cannot reintroduce reuse.
+        let new_id = self.raft.metadata().next_free_tablet_id();
         // 1. Record the split in the control plane and wait until the new tablet is
         //    visible here, so the split hook can resolve `new_id` from `Metadata`
         //    when the data-plane `Split` applies. Routed to the control leader.
@@ -3335,12 +3332,39 @@ pub async fn run_node_with(
         .await
 }
 
+/// Upper bound on a client-protocol frame (the `u32` length prefix is
+/// **untrusted** input on the client + cross-node relay ports — without a cap,
+/// four bytes from any dialer forces up to a 4 GiB allocation in [`read_frame`]).
+///
+/// Sized comfortably above the largest legitimate frames this protocol carries:
+/// - a single client/forwarded `Put` — its value enters via the HTTP edges,
+///   whose bodies cap at 1 MiB (`http::MAX_BODY`), and JSON-encodes a `Vec<u8>`
+///   at ≤ 4 chars per byte → ~4 MiB;
+/// - a forwarded `PutBatch` from the admin bulk seeder — bounded to
+///   `SEED_BATCH_MAX_BYTES` (4 MiB) of raw entry bytes per batch → ~17 MiB JSON;
+/// - everything else (`Get`/`Scan`/`ProposeSchema`/split triggers) is tiny.
+///
+/// An over-cap length prefix is rejected with a clean `InvalidData` error (the
+/// connection closes) before any allocation, never a panic or an OOM.
+pub const MAX_FRAME_LEN: usize = 64 << 20;
+
 /// Write a length-prefixed (`u32` big-endian) JSON frame.
 ///
 /// # Errors
-/// Propagates write failures.
+/// Propagates write failures; rejects a frame over [`MAX_FRAME_LEN`] (the
+/// receiver would drop the connection anyway — failing at the sender names the
+/// culprit instead of surfacing as a mysterious peer hang-up).
 pub async fn write_frame<T: Serialize>(stream: &mut TcpStream, msg: &T) -> std::io::Result<()> {
     let bytes = serde_json::to_vec(msg).expect("client message serializes");
+    if bytes.len() > MAX_FRAME_LEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "frame of {} bytes exceeds MAX_FRAME_LEN ({MAX_FRAME_LEN})",
+                bytes.len()
+            ),
+        ));
+    }
     stream.write_u32(bytes.len() as u32).await?;
     stream.write_all(&bytes).await?;
     stream.flush().await?;
@@ -3350,13 +3374,21 @@ pub async fn write_frame<T: Serialize>(stream: &mut TcpStream, msg: &T) -> std::
 /// Read a length-prefixed JSON frame, or `None` at clean EOF.
 ///
 /// # Errors
-/// Propagates read failures and decode errors.
+/// Propagates read failures and decode errors; a declared length over
+/// [`MAX_FRAME_LEN`] is an `InvalidData` error **before any allocation** (the
+/// length prefix is untrusted — see [`MAX_FRAME_LEN`]).
 pub async fn read_frame<T: DeserializeOwned>(stream: &mut TcpStream) -> std::io::Result<Option<T>> {
     let len = match stream.read_u32().await {
         Ok(len) => len as usize,
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(e) => return Err(e),
     };
+    if len > MAX_FRAME_LEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("declared frame length {len} exceeds MAX_FRAME_LEN ({MAX_FRAME_LEN})"),
+        ));
+    }
     let mut buf = vec![0u8; len];
     stream.read_exact(&mut buf).await?;
     let msg = serde_json::from_slice(&buf)

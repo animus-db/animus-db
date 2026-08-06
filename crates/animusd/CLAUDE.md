@@ -394,8 +394,16 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   version, so per-key LWW reproduces the agreed Raft order. (The v0 AP path derived
   a quorum version via `read_version`+1; that is gone with the AP plane.)
 - A CQL/DynamoDB read-modify-write is serialized per node behind `rmw_lock` so the
-  linearizable CP read + CP write are **atomic per node**. Cross-node atomicity (a
-  CAS on the CP group) is later v1 work.
+  linearizable CP read + CP write are **atomic per node**. On the CQL edge that is
+  every `INSERT`/`UPDATE`/`DELETE` (a partition RMW); on the DynamoDB edge it is
+  the RMW ops only — conditional `PutItem`/`DeleteItem` (or `ReturnValues:
+  ALL_OLD`), `UpdateItem`, and the whole of `TransactWriteItems` (one guard across
+  all actions; the per-action helpers deliberately take no lock — the tokio Mutex
+  is not reentrant). Unconditional puts/deletes and batch writes do no pre-read
+  and take no lock. (The DynamoDB edge once took no lock at all — two concurrent
+  `attribute_not_exists` puts on one node could both pass; regression in
+  `tests/dynamo_extended.rs::concurrent_conditional_puts_one_wins`.) Cross-node
+  atomicity (a CAS on the CP group) is later v1 work.
 - Two run modes: `--cluster N` (whole cluster in one process, dev convenience)
   and `--config FILE --node I` (one node per process — real deployment). Both
   share `Node::bind`/`start`; only address/peer assembly differs.

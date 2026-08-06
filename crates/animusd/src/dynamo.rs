@@ -309,6 +309,17 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             let key = item_key(&pk, sk.as_ref());
             // For ALL_OLD (or a condition) we need the prior item; read it once.
             let needs_old = condition.is_some() || return_values == ReturnValues::AllOld;
+            // A conditional (or old-echoing) put is a read-modify-write: hold the
+            // per-node RMW lock across the read → evaluate → write span, as the CQL
+            // edge does, so two concurrent conditional puts on one node can't both
+            // read the same "old" and both pass (a lost update / double create). An
+            // unconditional put does no read and takes no lock. The guard drops at
+            // the end of this arm — never held across the response write.
+            let _rmw = if needs_old {
+                Some(ctx.rmw_lock.lock().await)
+            } else {
+                None
+            };
             let old = if needs_old {
                 quorum_read(ctx, &table, &key).await?
             } else {
@@ -335,6 +346,14 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             let (pk, sk) = resolve_key(ctx, &table, &key)?;
             let data_key = item_key(&pk, sk.as_ref());
             let needs_old = condition.is_some() || return_values == ReturnValues::AllOld;
+            // Same RMW serialization as the conditional `PutItem` above: a
+            // conditional delete must not interleave with another RMW between its
+            // read and its write.
+            let _rmw = if needs_old {
+                Some(ctx.rmw_lock.lock().await)
+            } else {
+                None
+            };
             let old = if needs_old {
                 quorum_read(ctx, &table, &data_key).await?
             } else {
@@ -406,6 +425,11 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             condition,
             return_values,
         } => {
+            // `UpdateItem` is always a read-modify-write: hold the per-node RMW
+            // lock across it (taken here, not inside `run_update_item`, which is
+            // also called from `run_transact` under the same lock — a tokio Mutex
+            // is not reentrant).
+            let _rmw = ctx.rmw_lock.lock().await;
             run_update_item(
                 ctx,
                 &table,
@@ -459,7 +483,15 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             }
             Ok(wire::batch_write_response())
         }
-        Operation::TransactWriteItems { actions } => run_transact(ctx, &actions).await,
+        Operation::TransactWriteItems { actions } => {
+            // Hold the per-node RMW lock across the whole transaction so its
+            // condition checks + writes can't interleave with another RMW on this
+            // node. The per-action helpers (`put_item`/`delete_item`/
+            // `run_update_item`) deliberately take no lock — they run under this
+            // guard, and a tokio Mutex is not reentrant.
+            let _rmw = ctx.rmw_lock.lock().await;
+            run_transact(ctx, &actions).await
+        }
     }
 }
 
@@ -558,9 +590,10 @@ async fn create_table(
     Ok(wire::create_table_response(table, schema, indexes))
 }
 
-/// `PutItem` core (shared by the wire op and `BatchWriteItem`): resolve the key,
+/// `PutItem` core (the `TransactWriteItems` per-action path): resolve the key,
 /// optionally gate on `condition`, quorum-write, and update the key index.
-/// Returns the prior item (for `ReturnValues`).
+/// Returns the prior item (for `ReturnValues`). Takes no RMW lock itself — the
+/// transact caller already holds `ctx.rmw_lock` across the whole transaction.
 async fn put_item(
     ctx: &ClientCtx,
     table: &str,
@@ -587,9 +620,10 @@ async fn put_item(
     Ok(old)
 }
 
-/// `DeleteItem` core (shared by the wire op and `BatchWriteItem`): resolve the
+/// `DeleteItem` core (the `TransactWriteItems` per-action path): resolve the
 /// key, optionally gate on `condition`, quorum-write a tombstone, and drop the
-/// key from the index. Returns the prior item (for `ReturnValues`).
+/// key from the index. Returns the prior item (for `ReturnValues`). Takes no RMW
+/// lock itself — the transact caller already holds `ctx.rmw_lock`.
 async fn delete_item(
     ctx: &ClientCtx,
     table: &str,
@@ -618,7 +652,8 @@ async fn delete_item(
 /// `UpdateItem`: read-modify-write. Reads the current item, applies the SET/REMOVE
 /// actions (starting from the key attributes when the item is absent — an upsert,
 /// as in DynamoDB), gating on an optional `condition`, then quorum-writes the new
-/// item and echoes `ReturnValues`.
+/// item and echoes `ReturnValues`. Takes no RMW lock itself — both callers (the
+/// `UpdateItem` arm and `run_transact`) hold `ctx.rmw_lock` around the call.
 async fn run_update_item(
     ctx: &ClientCtx,
     table: &str,
@@ -656,7 +691,8 @@ async fn run_update_item(
 /// before it have already been applied. We *do* honor each action's condition (so
 /// a failed `ConditionCheck`/conditional write rejects the request), giving the
 /// common "assert-then-write" use the right answer; the documented gap is the
-/// all-or-nothing guarantee.
+/// all-or-nothing guarantee. The caller holds `ctx.rmw_lock` across the call, so
+/// the whole transaction is serialized against this node's other RMWs.
 async fn run_transact(ctx: &ClientCtx, actions: &[TransactAction]) -> Result<String, WireError> {
     for action in actions {
         match action {
