@@ -14,7 +14,10 @@ epoch compare-and-swap transactions.
   table-schema catalog + keyspaces + **`cp_member_addrs`**: CP group member id →
   `raftkv` address, Phase 2 address distribution) and `MetaCommand` (`UpsertMember`,
   `CreateTablet`, `CasTabletReplicas`, `SplitTablet`, `MergeTablets`,
-  `SetTabletPolicy`, `CreateTableSchema`, `DropTableSchema`,
+  **`DropOrphanTablet`** (a metadata-only `SplitTablet` mint whose data-plane
+  half lost the source group's one-time split to a different key and can now
+  never confirm — CAS on `expected_epoch` like its siblings; always safe since
+  such a mint never held real data), `SetTabletPolicy`, `CreateTableSchema`, `DropTableSchema`,
   **`DropTableTablets`** (ADR 0024: removes *every* tablet scoped to a table +
   its policies in one apply — the metadata half of drop-table GC, mirroring the
   `MergeTablets` cleanup; `NoOp` when the table has none), `CreateTableIndex`,
@@ -206,6 +209,19 @@ epoch compare-and-swap transactions.
   `tablet_split_merge.rs::racing_splits_at_the_same_epoch_only_one_applies`
   (the latter drives the actual race through Raft: two `SplitTablet`s
   proposed back-to-back at the same epoch, only the first applies).
+  **The epoch CAS only rejects a *concurrent* (same-epoch) second mint — it
+  does nothing for a *sequential* one**, where the first mint's own epoch bump
+  already lets a later `SplitTablet` at the *current* epoch through cleanly,
+  and only the underlying CP-data group's one-time apply guard later decides
+  which of the two keys actually wins (observed live: under `animusd
+  --auto-split` bulk-seed + leader churn, a source tablet's own retry loop can
+  mint a *second* child after the first is abandoned, since abandoning only
+  drops local retry bookkeeping — the still-orphaned first mint sits in
+  `Metadata.tablets` forever with no cleanup). `DropOrphanTablet` (CAS-gated,
+  same shape) is the fix: once a caller has confirmed via `applied_split_key()`
+  that its own mint's key lost, it removes that specific mint. See
+  `animusd/CLAUDE.md`'s `trigger_split`/`auto_split_loop` notes for the calling
+  side.
 - **Automatic placement (ADR 0005).** Policies are replicated in `Metadata`
   (`SetTabletPolicy` → `policies` map). The decision lives in the pure
   `Metadata::reconcile` (runs `animus_placement::replan` over `Active` members,
