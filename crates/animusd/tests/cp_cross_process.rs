@@ -40,6 +40,46 @@ fn free_addrs(count: usize) -> Vec<SocketAddr> {
     ls.iter().map(|l| l.local_addr().unwrap()).collect()
 }
 
+/// Bring up `n` per-process nodes (each via `run_node`, so each has its own edge
+/// state), wrapped in the documented **port-TOCTOU retry**: `free_addrs` releases
+/// the probed ports before `run_node` rebinds them, so a concurrent test binary can
+/// steal one — re-allocate fresh ports and retry the whole bring-up as a unit.
+async fn bring_up(n: usize, dir: &std::path::Path) -> (Vec<Node>, animusd::ClusterConfig) {
+    for attempt in 0..16 {
+        let addrs = free_addrs(n * 6);
+        let nodes_cfg: Vec<animusd::RoleAddrs> = (0..n)
+            .map(|i| animusd::RoleAddrs {
+                control: addrs[6 * i],
+                client: addrs[6 * i + 1],
+                dynamo: addrs[6 * i + 2],
+                cql: addrs[6 * i + 3],
+                raftkv: addrs[6 * i + 4],
+                admin: addrs[6 * i + 5],
+            })
+            .collect();
+        let config = animusd::ClusterConfig { nodes: nodes_cfg };
+        let mut nodes = Vec::new();
+        let mut failed = false;
+        for i in 0..n {
+            match animusd::run_node(&config, i, dir.join(format!("node-{attempt}-{i}"))).await {
+                Ok(node) => nodes.push(node),
+                Err(_) => {
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        if !failed {
+            return (nodes, config);
+        }
+        for node in &nodes {
+            node.shutdown_graceful().await;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    panic!("could not bring up cluster after retries (ports kept getting stolen)");
+}
+
 async fn await_bootstrap(nodes: &[Node]) {
     timeout(Duration::from_secs(20), async {
         loop {
@@ -71,29 +111,9 @@ async fn propose_on_leader(nodes: &[Node], command: MetaCommand) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn cp_op_on_a_non_leader_node_is_forwarded_to_the_leader() {
     let n = 3;
-    let addrs = free_addrs(n * 6);
-    let nodes_cfg: Vec<animusd::RoleAddrs> = (0..n)
-        .map(|i| animusd::RoleAddrs {
-            control: addrs[6 * i],
-            client: addrs[6 * i + 1],
-            dynamo: addrs[6 * i + 2],
-            cql: addrs[6 * i + 3],
-            raftkv: addrs[6 * i + 4],
-            admin: addrs[6 * i + 5],
-        })
-        .collect();
-    let config = animusd::ClusterConfig { nodes: nodes_cfg };
-
     // One node per process — each gets its own edge state via `run_node`.
     let dir = tempfile::tempdir().unwrap();
-    let mut nodes = Vec::new();
-    for i in 0..n {
-        nodes.push(
-            animusd::run_node(&config, i, dir.path().join(format!("node-{i}")))
-                .await
-                .unwrap_or_else(|e| panic!("node {i} start: {e}")),
-        );
-    }
+    let (nodes, config) = bring_up(n, dir.path()).await;
     await_bootstrap(&nodes).await;
 
     // Mark a table CP and wait for it to replicate to every node.
@@ -168,6 +188,78 @@ async fn cp_op_on_a_non_leader_node_is_forwarded_to_the_leader() {
             got,
             ClientResponse::Value(Some(b"v-cross".to_vec())),
             "CP read via node {i} (forwarded if non-leader) must see the write"
+        );
+    }
+
+    for node in &nodes {
+        node.shutdown();
+    }
+}
+
+/// ADR 0017 #4 regression — **derived member ids must translate back to base ids on
+/// the forward path**. The *first* provisioned table wins the tablet-id race with
+/// bootstrap and rides the bootstrap group, whose member ids **are** the base
+/// `raftkv` ids — so a missing member→base translation in `cp_forward_target` is
+/// invisible on it (the test above). The **second** table's tablet gets *derived*
+/// member ids (`base + tablet * STRIDE`); its leader hint must be translated back to
+/// a base id before the `client_route` lookup, or a follower node waits out
+/// `CLIENT_TIMEOUT` on a healthy group ("no CP group leader reachable" — the
+/// admin_data_write flake). Reading via **every** node guarantees at least two
+/// forwarded reads, so a broken translation fails deterministically, wherever the
+/// leader landed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn second_table_with_derived_member_ids_forwards_across_processes() {
+    let n = 3;
+    let dir = tempfile::tempdir().unwrap();
+    let (nodes, config) = bring_up(n, dir.path()).await;
+    await_bootstrap(&nodes).await;
+    let client = |i: usize| config.nodes[i].client;
+
+    // Provision two tables via node 0 (the plain client auto-provisions on first
+    // write, retrying while each group forms/elects). The first rides the bootstrap
+    // group (base ids); the SECOND gets a derived-id group — the one under test.
+    for (table, key, value) in [
+        ("cp_first", b"a".to_vec(), b"v1".to_vec()),
+        ("cp_second", b"b".to_vec(), b"v2".to_vec()),
+    ] {
+        timeout(Duration::from_secs(25), async {
+            loop {
+                match call(
+                    client(0),
+                    ClientRequest::Put {
+                        key: key.clone(),
+                        value: value.clone(),
+                        table: table.into(),
+                    },
+                )
+                .await
+                {
+                    ClientResponse::PutOk => return,
+                    ClientResponse::Error(_) => sleep(Duration::from_millis(150)).await,
+                    other => panic!("unexpected CP put response: {other:?}"),
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("CP write to {table} did not succeed in 25s"));
+    }
+
+    // Read the second table's key via *every* node: at least two reads land on a
+    // non-leader and must forward via the translated leader hint. No retry — the
+    // write above proved the group is led, so a miss here is the routing bug.
+    for i in 0..n {
+        let got = call(
+            client(i),
+            ClientRequest::Get {
+                key: b"b".to_vec(),
+                table: "cp_second".into(),
+            },
+        )
+        .await;
+        assert_eq!(
+            got,
+            ClientResponse::Value(Some(b"v2".to_vec())),
+            "derived-id CP read via node {i} (forwarded if non-leader) must see the write"
         );
     }
 

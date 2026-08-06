@@ -36,26 +36,41 @@ fn free_addrs(count: usize) -> Vec<SocketAddr> {
 
 /// Bring up an `n`-node per-process cluster (each node its own edge state).
 async fn bring_up(n: usize, dir: &std::path::Path) -> (Vec<Node>, animusd::ClusterConfig) {
-    let addrs = free_addrs(n * 6);
-    let nodes_cfg: Vec<animusd::RoleAddrs> = (0..n)
-        .map(|i| animusd::RoleAddrs {
-            control: addrs[6 * i],
-            client: addrs[6 * i + 1],
-            dynamo: addrs[6 * i + 2],
-            cql: addrs[6 * i + 3],
-            raftkv: addrs[6 * i + 4],
-            admin: addrs[6 * i + 5],
-        })
-        .collect();
-    let config = animusd::ClusterConfig { nodes: nodes_cfg };
-    let mut nodes = Vec::new();
-    for i in 0..n {
-        nodes.push(
-            animusd::run_node(&config, i, dir.join(format!("node-{i}")))
-                .await
-                .unwrap_or_else(|e| panic!("node {i} start: {e}")),
-        );
+    // Documented port-TOCTOU retry: `free_addrs` releases the probed ports before
+    // `run_node` rebinds them, so a concurrent test binary can steal one —
+    // re-allocate fresh ports and retry the whole bring-up as a unit.
+    let mut brought_up = None;
+    'attempts: for attempt in 0..16 {
+        let addrs = free_addrs(n * 6);
+        let nodes_cfg: Vec<animusd::RoleAddrs> = (0..n)
+            .map(|i| animusd::RoleAddrs {
+                control: addrs[6 * i],
+                client: addrs[6 * i + 1],
+                dynamo: addrs[6 * i + 2],
+                cql: addrs[6 * i + 3],
+                raftkv: addrs[6 * i + 4],
+                admin: addrs[6 * i + 5],
+            })
+            .collect();
+        let config = animusd::ClusterConfig { nodes: nodes_cfg };
+        let mut nodes = Vec::new();
+        for i in 0..n {
+            match animusd::run_node(&config, i, dir.join(format!("node-{attempt}-{i}"))).await {
+                Ok(node) => nodes.push(node),
+                Err(_) => {
+                    for node in &nodes {
+                        node.shutdown_graceful().await;
+                    }
+                    sleep(Duration::from_millis(50)).await;
+                    continue 'attempts;
+                }
+            }
+        }
+        brought_up = Some((nodes, config));
+        break;
     }
+    let (nodes, config) =
+        brought_up.expect("could not bring up cluster after retries (ports kept getting stolen)");
     timeout(Duration::from_secs(20), async {
         loop {
             if nodes.iter().any(Node::is_control_leader)

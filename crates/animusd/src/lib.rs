@@ -1618,8 +1618,17 @@ impl ClientCtx {
     /// so it never forwards a CP op to a non-leader, including itself), or the hinted
     /// id has no known route.
     fn cp_forward_target(&self, tablet: TabletId) -> Option<SocketAddr> {
-        let leader_id = self.edge.local_cp(tablet).and_then(|n| n.leader())?;
-        self.client_route.get(&leader_id).copied()
+        // The local replica's leader hint is a group **member id** (derived for a
+        // non-bootstrap tablet); `client_route` is keyed by stable **base** node
+        // ids, so translate back (ADR 0017 #4 — the reverse of `cp_members_for`).
+        // Without this, a healthy remote leader of a provisioned/split tablet is
+        // unroutable from a follower node: the lookup misses, and because a local
+        // replica exists, `resolve_cp_route` waits out CLIENT_TIMEOUT instead of
+        // forwarding — "no CP group leader reachable" on a led group.
+        let leader_member = self.edge.local_cp(tablet).and_then(|n| n.leader())?;
+        self.client_route
+            .get(&cp_base_id(leader_member, tablet))
+            .copied()
     }
 
     /// Forward a CP op to another node's client API (wrapped so the receiver
@@ -1955,6 +1964,21 @@ fn cp_member_id(base: NodeId, tablet: TabletId) -> NodeId {
         base
     } else {
         base + tablet.0 * CP_SPLIT_ID_STRIDE
+    }
+}
+
+/// The inverse of [`cp_member_id`]: recover the stable **base** `raftkv` id from a
+/// tablet group **member id**. Needed wherever a group-internal id (e.g. the leader
+/// hint a local replica reports) must be resolved against state keyed by base ids
+/// (`client_route`, `Metadata.members`, `tablets[t].replicas`). For the bootstrap
+/// tablet member == base, which is why a missing reverse translation *works* there
+/// and only breaks for derived-id tablets (every provisioned table tablet and split
+/// child) — the bug class behind "no CP group leader reachable" on a healthy group.
+fn cp_base_id(member: NodeId, tablet: TabletId) -> NodeId {
+    if tablet == TABLET {
+        member
+    } else {
+        member - tablet.0 * CP_SPLIT_ID_STRIDE
     }
 }
 
