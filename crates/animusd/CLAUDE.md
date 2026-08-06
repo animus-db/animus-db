@@ -252,7 +252,13 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
     WAL/data panels); operator-action UI + the ADR 0018 transaction view are next.
     The data panel has both a single-key inspector (`/admin/storage/key`) and a
     **browse-keys** list (`/admin/storage/scan` → `CpGroup::local_scan`, first N live
-    pairs `>= start`; click a key to send it to the inspector).
+    pairs `>= start`; click a key to send it to the inspector). The Storage tab's
+    **node dropdown is filtered to nodes whose `/admin/raftkv` view lists the
+    selected tablet** (the storage endpoints are node-local — `local_cp` — and 404
+    on a non-hosting node; the tablet list is cluster-wide metadata, so the raw
+    cross-product invited valid-looking 404 combos), annotating the leader; if no
+    reachable node hosts the tablet yet (group still forming) it falls back to all
+    nodes with a hint.
     `tests/dashboard_endpoint.rs` proves serve + CORS + preflight + peers.
   - **The Write tab (ADR 0021) writes through the admin port.** `POST
     /admin/data/dynamo {op, payload}` reuses the DynamoDB edge in-process
