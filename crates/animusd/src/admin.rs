@@ -44,6 +44,7 @@
 
 use std::time::Duration;
 
+use animus_dynamo::wire::{base64_decode, base64_encode};
 use animus_env::NodeId;
 use animus_storage::WalRecordView;
 use animus_tablet::{TOKEN_BYTES, TabletId, escape, partition_token};
@@ -383,7 +384,7 @@ async fn storage_key(ctx: &ClientCtx, q: &str) -> (u16, Value) {
     let Some(key) = http::query_param(q, "key") else {
         return (400, json!({"error": "missing `key` query parameter"}));
     };
-    // Accept the dashboard's `<token-hex>:<remainder>` display form (so clicking a
+    // Accept the dashboard's `<token-base64>:<remainder>` display form (so clicking a
     // browsed key looks it up faithfully) as well as a raw plain key.
     let key = parse_key_display(&key);
     let Some(g) = ctx.edge.local_cp(tablet) else {
@@ -424,7 +425,7 @@ async fn storage_key(ctx: &ClientCtx, q: &str) -> (u16, Value) {
 /// routes — scrape the leader for its committed state.
 async fn storage_scan(ctx: &ClientCtx, q: &str) -> (u16, Value) {
     let tablet = tablet_param(q);
-    // Decode the dashboard's `<token-hex>:<remainder>` display form (so paging by
+    // Decode the dashboard's `<token-base64>:<remainder>` display form (so paging by
     // pasting the last displayed key works), falling back to a raw plain prefix.
     let start = parse_key_display(&http::query_param(q, "start").unwrap_or_default());
     let limit = http::query_param(q, "limit")
@@ -850,13 +851,31 @@ fn key_str(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
+/// The display width of a base64-rendered partition token: `=`-padded base64 of
+/// `n` bytes is `ceil(n/3)*4` chars (12 for the 8-byte token).
+const TOKEN_B64_LEN: usize = TOKEN_BYTES.div_ceil(3) * 4;
+
+/// URL-safe base64 (`-`/`_` instead of `+`/`/`, `=` padding kept) of the binary
+/// partition token. URL-safe because a displayed key is pasted back into
+/// `?key=`/`?start=` query strings, where the standard alphabet's `+` decodes as
+/// a space; the trailing `=` doubles as a discriminator so a plain printable key
+/// is very unlikely to look like a token prefix (see [`parse_key_display`]).
+fn token_base64(token: &[u8]) -> String {
+    base64_encode(token).replace('+', "-").replace('/', "_")
+}
+
+/// Inverse of [`token_base64`] (also tolerates the standard `+`/`/` alphabet).
+fn parse_token_base64(s: &str) -> Option<Vec<u8>> {
+    base64_decode(&s.replace('-', "+").replace('_', "/"))
+}
+
 /// Render a data-plane **key** for the dashboard's key views. A key written
 /// through a wire edge (DynamoDB/CQL) or the bulk seeder is
 /// `token || escape(pk) || rk` (ADR 0022/0023): the leading [`TOKEN_BYTES`] bytes
 /// are the big-endian Murmur3 **partition token** — binary, not text — so lossy
-/// UTF-8 would mangle them into replacement characters. Show that token as hex,
-/// a `:` separator, then the human-readable `escape(pk) || rk` remainder as a
-/// lossy UTF-8 string.
+/// UTF-8 would mangle them into replacement characters. Show that token as
+/// URL-safe base64, a `:` separator, then the human-readable `escape(pk) || rk`
+/// remainder as a lossy UTF-8 string.
 ///
 /// But a plain-client `Put` stores its key **verbatim**, un-prefixed, so not every
 /// key has a token. Distinguish by *content*: only a leading `TOKEN_BYTES`-run that
@@ -870,39 +889,35 @@ fn key_display(bytes: &[u8]) -> String {
     if bytes.len() < TOKEN_BYTES || bytes[..TOKEN_BYTES].iter().all(printable) {
         return String::from_utf8_lossy(bytes).into_owned();
     }
-    use std::fmt::Write;
     let (token, rest) = bytes.split_at(TOKEN_BYTES);
-    let mut s = String::with_capacity(TOKEN_BYTES * 2 + 1 + rest.len());
-    for b in token {
-        let _ = write!(s, "{b:02x}");
-    }
+    let mut s = token_base64(token);
     s.push(':');
     s.push_str(&String::from_utf8_lossy(rest));
     s
 }
 
-/// Inverse of [`key_display`]: turn a `<token-hex>:<remainder>` string (as shown
-/// in the dashboard's key views) back into the raw key bytes, so clicking a
-/// browsed key sends the *real* key to the inspector. A string not in that form —
-/// no `TOKEN_BYTES*2`-hex-digit, `:`-terminated prefix (e.g. a hand-typed plain
-/// key) — is taken verbatim as raw bytes. The remainder round-trips exactly when
-/// the original was valid UTF-8 (the common printable-pk case); bytes that lossy
-/// UTF-8 already replaced cannot be recovered, same as before this formatting.
+/// Inverse of [`key_display`]: turn a `<token-base64>:<remainder>` string (as
+/// shown in the dashboard's key views) back into the raw key bytes, so clicking
+/// a browsed key sends the *real* key to the inspector. A string not in that
+/// form — no [`TOKEN_B64_LEN`]-char, `:`-terminated prefix decoding to exactly
+/// [`TOKEN_BYTES`] bytes (e.g. a hand-typed plain key: the required `=` padding
+/// makes an accidental match rare) — is taken verbatim as raw bytes. The
+/// remainder round-trips exactly when the original was valid UTF-8 (the common
+/// printable-pk case); bytes that lossy UTF-8 already replaced cannot be
+/// recovered, same as before this formatting.
 fn parse_key_display(s: &str) -> Vec<u8> {
     let b = s.as_bytes();
-    let hex_len = TOKEN_BYTES * 2;
-    if b.len() > hex_len && b[hex_len] == b':' && b[..hex_len].iter().all(u8::is_ascii_hexdigit) {
-        let mut key = Vec::with_capacity(TOKEN_BYTES + (b.len() - hex_len - 1));
-        for pair in b[..hex_len].chunks_exact(2) {
-            let hi = (pair[0] as char).to_digit(16).unwrap() as u8;
-            let lo = (pair[1] as char).to_digit(16).unwrap() as u8;
-            key.push((hi << 4) | lo);
+    if b.len() > TOKEN_B64_LEN && b[TOKEN_B64_LEN] == b':' {
+        let token = std::str::from_utf8(&b[..TOKEN_B64_LEN])
+            .ok()
+            .and_then(parse_token_base64)
+            .filter(|t| t.len() == TOKEN_BYTES);
+        if let Some(mut key) = token {
+            key.extend_from_slice(&b[TOKEN_B64_LEN + 1..]);
+            return key;
         }
-        key.extend_from_slice(&b[hex_len + 1..]);
-        key
-    } else {
-        b.to_vec()
     }
+    b.to_vec()
 }
 
 fn wal_record_json(r: &WalRecordView) -> Value {
@@ -967,23 +982,40 @@ fn client_response_to_json(resp: ClientResponse, ok: Value) -> (u16, Value) {
 mod tests {
     use super::*;
 
-    /// A token-prefixed key: the binary 8-byte token renders as 16 hex digits, the
-    /// printable `escape(pk)` remainder as text, and it round-trips exactly.
+    /// A token-prefixed key: the binary 8-byte token renders as 12 chars of
+    /// URL-safe base64, the printable `escape(pk)` remainder as text, and it
+    /// round-trips exactly.
     #[test]
-    fn key_display_shows_binary_token_as_hex_and_round_trips() {
+    fn key_display_shows_binary_token_as_base64_and_round_trips() {
         // A token with a guaranteed non-printable byte (0x00), so the heuristic
         // classifies it as binary regardless of the hash — then the readable pk.
         let mut key = vec![0x8a, 0x3f, 0x1c, 0x00, 0x77, 0xd2, 0xb6, 0xe1];
         key.extend_from_slice(b"user#42");
         let shown = key_display(&key);
-        let (tok_hex, sep_rest) = shown.split_at(TOKEN_BYTES * 2);
-        assert_eq!(tok_hex, "8a3f1c0077d2b6e1");
+        let (tok_b64, sep_rest) = shown.split_at(TOKEN_B64_LEN);
+        assert_eq!(tok_b64, "ij8cAHfStuE=");
         assert_eq!(sep_rest, ":user#42");
         assert_eq!(parse_key_display(&shown), key);
     }
 
-    /// A key whose real token happens to be all binary also hexes, exercising the
-    /// production `seed_key` layout end to end (the display always reverses).
+    /// A token whose standard-base64 form contains `+`/`/` renders with the
+    /// URL-safe `-`/`_` instead (a displayed key is pasted into `?key=` query
+    /// strings, where a raw `+` decodes as a space), and still round-trips.
+    #[test]
+    fn key_display_token_base64_is_url_safe() {
+        // 0xfb 0xff... encodes to base64 starting "+/" in the standard alphabet.
+        let mut key = vec![0xfb, 0xff, 0xfe, 0x00, 0x77, 0xd2, 0xb6, 0xe1];
+        key.extend_from_slice(b"user#42");
+        let shown = key_display(&key);
+        assert!(
+            !shown.contains('+') && !shown.contains('/'),
+            "token must be URL-safe: {shown}"
+        );
+        assert_eq!(parse_key_display(&shown), key);
+    }
+
+    /// A key whose real token happens to be all binary also encodes, exercising
+    /// the production `seed_key` layout end to end (the display always reverses).
     #[test]
     fn key_display_round_trips_a_seed_key() {
         let key = seed_key(b"user#42");
@@ -992,12 +1024,18 @@ mod tests {
 
     /// A plain-client `Put` stores its key verbatim (no token). A fully-printable
     /// key — or one shorter than the token width — is shown as text unchanged, and
-    /// a plain string with no hex-token prefix is taken raw by the inverse.
+    /// a plain string with no base64-token prefix is taken raw by the inverse.
     #[test]
     fn key_display_leaves_printable_keys_as_text() {
         assert_eq!(key_display(b"admin-key"), "admin-key");
         assert_eq!(key_display(b"ab"), "ab");
         assert_eq!(parse_key_display("admin-key"), b"admin-key".to_vec());
         assert_eq!(parse_key_display("seed:"), b"seed:".to_vec());
+        // 12 printable chars then ':' — but not valid padded base64 of 8 bytes,
+        // so it is NOT mistaken for a token prefix.
+        assert_eq!(
+            parse_key_display("seed-0000042:x"),
+            b"seed-0000042:x".to_vec()
+        );
     }
 }

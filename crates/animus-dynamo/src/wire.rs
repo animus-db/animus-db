@@ -1562,11 +1562,14 @@ fn key_schema_entry(name: &str, role: &str) -> Value {
 //
 // A tiny self-contained codec so the crate takes no new dependency for the `B`
 // type. Standard alphabet (`A-Za-z0-9+/`) with `=` padding, matching the
-// DynamoDB wire encoding for binary attributes.
+// DynamoDB wire encoding for binary attributes. Public: the `animusd`
+// admin/dashboard display surfaces reuse it for opaque bytes.
 
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-fn base64_encode(bytes: &[u8]) -> String {
+/// Encode `bytes` as standard base64 (`A-Za-z0-9+/`, `=`-padded).
+#[must_use]
+pub fn base64_encode(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
         let b0 = chunk[0] as usize;
@@ -1588,7 +1591,10 @@ fn base64_encode(bytes: &[u8]) -> String {
     out
 }
 
-fn base64_decode(s: &str) -> Option<Vec<u8>> {
+/// Decode standard `=`-padded base64: `None` on a length not a multiple of 4,
+/// a character outside the alphabet, or over-padding.
+#[must_use]
+pub fn base64_decode(s: &str) -> Option<Vec<u8>> {
     fn val(c: u8) -> Option<u8> {
         match c {
             b'A'..=b'Z' => Some(c - b'A'),
