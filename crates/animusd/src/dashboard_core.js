@@ -114,12 +114,27 @@ function nodeByRaftkv(id) {
 function nodeRaftkvId(n) { return n.config ? n.config.raftkv_id : "?"; }
 
 // Collect every hosted CP group across reachable nodes, indexed by tablet id.
+// Each group carries its own owning node's raftkv id (`g.node`, from
+// `CpRaftView`) — resolve that to the real node, never the admin node that
+// happened to answer the request. Under `--cluster N` dev mode every node's
+// `/admin/raftkv` response lists *every* replica cluster-wide (the shared
+// `ClusterEdgeState`), so tagging a group with whichever node's fetch
+// returned it — rather than the group's real owner — mis-associates it: a
+// `.find()` matching on that tag then lands on the wrong group's state,
+// which is what made every replica dot in a tablet's row echo the same
+// (first) group's leader/follower status. Dedupe by (tablet, owning node) so
+// a group is counted once regardless of how many admin ports reported it.
 function cpGroupsByTablet() {
   const map = {};
+  const seen = new Set();
   for (const n of STATE.nodes) {
     if (!n.ok || !n.raftkv || !n.raftkv.groups) continue;
     for (const g of n.raftkv.groups) {
-      (map[g.tablet] = map[g.tablet] || []).push({ node: n, g });
+      const key = g.tablet + ":" + g.node;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const node = nodeByRaftkv(g.node) || { config: { raftkv_id: g.node }, ok: false };
+      (map[g.tablet] = map[g.tablet] || []).push({ node, g });
     }
   }
   return map;

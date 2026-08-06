@@ -711,6 +711,29 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
     handle (`edge.local_cp`), so `--cluster` mode targets the first-registered
     replica's engine, not necessarily this node's — scrape per-process for true
     node-local storage debug (`tests/admin_endpoint.rs` uses `run_node` per node).
+    **The dashboard's Tablets/Placement/Overview views were themselves a victim of
+    this gotcha** — `dashboard_core.js::cpGroupsByTablet()` tagged every group in a
+    node's `/admin/raftkv` response with *that fetching node's identity*, correct
+    only in one-process-per-node mode. Under `--cluster N` every node's response
+    lists the same full cluster-wide group set, so this produced duplicate
+    `{node, group}` entries mis-tagged with whichever admin port happened to answer
+    — and since every replica dot's role lookup (`gs.find(x => nodeRaftkvId(x.node)
+    === rid)`) matched on that wrong tag, it deterministically resolved to the
+    *same* (first) group's `is_leader` for every replica in a tablet's row: every
+    dot showed identical status ("nodes are either all followers or all leaders"),
+    and the Overview balance chart / per-node hosted-count and the Placement
+    per-node tablet list were equally wrong for the same reason. `CpRaftView` had
+    no field identifying which physical node a group belongs to at all — only the
+    fetching admin port's identity, which is not the same thing under a shared
+    edge. Fixed by adding `CpRaftView::node` (`lib.rs::raft_view`, the group's
+    member id translated back to a **base** raftkv id via `topology::cp_base_id` —
+    needed because a split tablet's member id is derived, `base + tablet *
+    CP_SPLIT_ID_STRIDE`, not the base id itself) and having `cpGroupsByTablet()`
+    resolve/dedupe by that real id (`nodeByRaftkv(g.node)`, keyed on `tablet:node`)
+    instead of the fetching node. **General lesson: a debug/admin view whose
+    response can legitimately be a cluster-wide aggregate (not just this node's own
+    state) must carry each item's own identity in the payload — a client cannot
+    infer "whose state is this" from which server answered.**
   - **Metrics are per-node sinks**: a follower's leader-only counters
     (`elections_won`, `append_entries_sent`) are legitimately 0, so `/admin/metrics`
     (and `/metrics`) is meaningful **per node** — scrape the control leader for the
