@@ -129,7 +129,8 @@ without a follow-up read. They route to the right node/leader using the same
 resolution the data path uses (`cp_route` / the control-leader handle set),
 forwarding when this node isn't the authority — the operator hits any node.
 
-**Audit warning (2026-08-06 — open bugs behind two actions).** (1) The "Safety"
+**Audit warning (2026-08-06 — both since fixed: (1) in PR #26, (2) in PR #21;
+retained for the record).** (1) The "Safety"
 column above overstates `flush`/`compact`: `flush_now`/`compact_now` run on the
 admin connection's task, **concurrent** with the tablet's single Raft apply
 loop, and `LsmEngine` has no flush-in-progress guard — `flush()` snapshots the

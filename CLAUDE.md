@@ -382,8 +382,42 @@ cross-cutting ones. Prune/merge entries that become obsolete.
   storm) — and several perf findings were already fixed on `main`, which had moved
   past the audited checkout (pre-vote, single-write-latency, cp-batch-put). A
   finding is (claim × trigger path × branch); verify all three.
+- **A fault-schedule runner that heals immediately after the last fault gives
+  single-fault scenarios a zero-length outage — give scenarios an explicit fault
+  window.** The raftkv corpus healed partitions the instant the last fault landed,
+  so its partition cells were near-vacuous (nothing was ever asked of the cluster
+  *while* partitioned). New cells carry `Scenario::window` (outage duration with
+  traffic spanning it); old cells keep window 0 for byte-identity. Check any new
+  fault harness for this: "did traffic actually run during the fault?" (PR #23.)
+- **A "recovery tolerates X" claim must be tested through the NEXT write cycle,
+  not just one reopen.** The LSM tolerated a torn WAL tail on replay (skipped the
+  torn line) but reused the un-truncated active segment, so the next acked record
+  was appended after garbage and a SECOND restart silently dropped it — the
+  crash-recovery instance of the "prove recursive ops at depth ≥ 2" rule: recover,
+  write, recover again, then assert. (PR #24's fault injection; fix = seal the
+  recovered segment.)
+- **A test asserting data LOSS can be load-bearing on a consensus bug — when a
+  correctness fix flips it, invert the test, don't weaken the fix.** A restart
+  test asserted acked data on the memory backend is lost across restart; that
+  "expected loss" actually depended on a sole recovered voter never re-advancing
+  commit over its WAL tail (a real bug). The ReadIndex-gate fix surfaced it; the
+  test now asserts survival via Raft-WAL replay. (PR #25.)
 
 ### Code patterns
+- **`tokio::fs::File` writes are not ordered or durable until `flush().await` —
+  a dropped handle completes its write in the background, so two sequential
+  appends via separate handles can land INVERTED on disk, and a later `sync` on a
+  fresh fd can fsync before the buffered write reaches the page cache.** This
+  broke "ack means durable" under ProdEnv and was the long-standing
+  `lsm_concurrent::scans_survive_concurrent_compaction` flake (an SSTable
+  recovered with its index at offset 0). Always `flush().await` before dropping a
+  write handle; found independently twice (PRs #26, #27). Corollary of the
+  documented "a flaky ProdEnv test is a real bug" rule.
+- **Commit the election no-op in `become_leader` itself (`maybe_advance_commit`
+  after the append)** — a leader that only advances commit on propose/ack strands
+  a sole voter's recovered WAL tail (nothing re-drives commit until the next
+  propose), and any gate on "current-term entry committed" (ReadIndex §6.4, the
+  membership-change gate) would deadlock a single-node group. (PR #25.)
 - **An operator/admin action that calls straight into an engine bypasses the
   single-writer contract the normal path establishes — audit every admin surface
   against the layer's concurrency assumptions.** `LsmEngine` is safe on the client

@@ -9,9 +9,14 @@
   convergence/durability increments below are retained as design record (the
   converged-or-timeout pattern they established is reused elsewhere, e.g. the
   drop-table-GC restart tests). The CP plane that v1 actually ships has its own,
-  separate corpus (`raftkv_linearizable.rs`) — currently much shallower than
+  separate corpus (`raftkv_linearizable.rs`) — at audit time much shallower than
   this one (no stop/restart, no split-brain, no compound faults, `MemoryEngine`
-  only); closing that coverage inversion is the standing follow-up.
+  only). **PR #23 closed most of the inversion**: 29 frozen cells including
+  StopRestart (true WAL recovery + rejoin), split-brain, leader-with-minority,
+  and compound lossy+restart, plus an `LsmEngine` tier
+  (`ANIMUS_RAFTKV_LSM=1`) — and it found the old runner healed faults
+  immediately (a zero-length outage window), so new cells carry an explicit
+  fault window while old cells stay byte-identical.
 - **Date:** 2026-08-02 (genuine-black-box increment: 2026-08-02)
 
 ## Context

@@ -27,7 +27,11 @@
   2PC-over-per-tablet-Raft, not Accord, for cross-tablet transactions. Accord's
   only forward role is the ADR 0019 AP "long shot". The increment history below
   is a design record; the sections describing the AP data-plane frontier
-  document machinery ADR 0019 deleted.
+  document machinery ADR 0019 deleted. **PR #22 executed the testbed-only
+  trim**: `shard.rs` (per-shard consensus) and the storage-backed execution
+  path are deleted (net −1,080 lines; retrievable from git history), the
+  `mvcc_version` collision guard is now a hard assert, and the crate is
+  scoped to exactly what the Elle corpus exercises.
 - **Date:** 2026-08-01 (execution + durability increment: 2026-08-01;
   storage-backed execution + coordinator-failover increment: 2026-08-01;
   read-transactions + multi-thread-liveness increment: 2026-08-02;

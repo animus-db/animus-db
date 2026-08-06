@@ -34,13 +34,22 @@ above reads, and the gaps are exactly where prod-only bugs have already hidden:
 - **`ProdEnv` durability:** `sync` is a file-fd `sync_all` only — neither
   `append`'s file *creation* nor `replace`'s *rename* fsyncs the parent
   **directory**, so a just-created WAL segment or a completed manifest swap can
-  be lost by a power crash even after `sync`/`replace` returned. Closing this
-  (directory fsync after create/rename) is a known follow-up.
+  be lost by a power crash even after `sync`/`replace` returned. **Fixed in
+  PR #27** (directory-fsync chain on first sync / after rename), which also
+  root-caused a worse latent bug the audit missed: `append` dropped its
+  `tokio::fs::File` without `flush().await`, so a write could still sit in
+  tokio's user-space buffer when a later `sync` (a different fd) fsynced —
+  and two sequential appends via separate handles could land **inverted** on
+  disk (the long-standing `lsm_concurrent` flake; independently found and
+  fixed in PRs #26 and #27).
 - **`SimEnv` disk faults:** the sim disk never returns an error, never leaves a
   *partial* (torn) tail on crash — it drops the whole un-synced buffer
   atomically — and cannot corrupt a byte. Storage error-handling, torn-record
   recovery, and checksum-mismatch paths are therefore unreachable under
-  simulation; opt-in, seed-driven disk fault injection is the known follow-up.
+  simulation. **Closed in PR #24**: opt-in, seed-driven `DiskConfig`
+  (error injection, torn-tail-on-crash, corruption; default-off,
+  byte-identical traces) — whose first run found two real WAL data-loss bugs
+  (see ADR 0008), proving the gap was load-bearing.
 - **Network:** reordering is emergent from per-message jitter (there is no
   explicit reorder/duplication knob), and all nodes share **one** virtual
   clock — per-node skew/drift, listed in the Context as a target bug class, is

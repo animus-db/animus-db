@@ -91,7 +91,10 @@ later ticks / the next restart:
   reused (`next_tablet_id` is monotonic), so a late reclaim can never collide
   with a re-created table — a new same-named table gets a fresh tablet id.
 
-  **Known violation (audit, 2026-08-06 — open bug).** The never-reuse invariant
+  **Known violation (audit, 2026-08-06 — fixed in PR #21, both ends:
+  `trigger_split` allocates via `next_free_tablet_id()` and the `SplitTablet`
+  apply rejects ids below the allocator, with a drop-highest-then-split
+  regression).** The never-reuse invariant
   holds on the provisioning path (`next_free_tablet_id()` folds in
   `next_tablet_id`) but **not on the split path**: `animusd::trigger_split`
   derives the child id as `max(current tablet ids) + 1` from the live map, the

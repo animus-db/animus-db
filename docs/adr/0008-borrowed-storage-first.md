@@ -220,8 +220,10 @@ An architecture audit (correctness/performance-weighted, findings adversarially
 verified against the code) recorded these open items; fix in code, then prune
 here:
 
-- **Flush is not serialized against concurrent appliers or other flushes
-  (confirmed acked-write-loss hazard).** `flush()` snapshots the memtable under
+- **Flush was not serialized against concurrent appliers or other flushes
+  (confirmed acked-write-loss hazard — fixed in PR #26** via a maintenance
+  lock across flush+compaction, a surgical memtable clear, and an atomic
+  gate re-check**).** `flush()` snapshots the memtable under
   the lock, builds the SSTable with the lock *released*, then re-locks and
   unconditionally `memtable.clear()`s; `Inner` has no flush-in-progress flag
   and the `applies_in_flight == 0` gate is checked only at decision time. A
@@ -236,11 +238,22 @@ here:
   this quadrant (the concurrent-writer test never flushes; the flushing test
   has one writer). Fix: a flush/compaction-in-progress guard serializing
   flush-vs-apply and flush-vs-flush.
+- **Two further WAL data-loss bugs, found by PR #24's fault injection**
+  (its `#[ignore]`d regressions in `tests/lsm_disk_faults.rs` pin them; fix
+  in flight on the storage batch-2 branch): (a) **torn-tail recovery reuses
+  the un-truncated active segment** — the torn garbage stays, the next acked
+  record is appended after it with no framing boundary, and a *second*
+  restart silently drops that acked record; recovery must seal/truncate the
+  recovered segment first. (b) **No per-record WAL checksum** — `decode_wal`
+  silently skips any malformed line, so at-rest corruption of an fsynced
+  record is silent data loss (the SSTable path fails loudly by contrast).
 - **The WAL encodes records as JSON with `Vec<u8>` values as decimal number
   arrays** (~3-6x inflation) on the fsync-critical path — the biggest
   write-amplification lever; a binary record codec (the manifest already has
-  one) or `serde_bytes` cuts fsync bytes several-fold. Same JSON-byte-array
-  issue applies to the CP plane's wire + snapshot encoding (ADR 0017 note).
+  one) or `serde_bytes` cuts fsync bytes several-fold — and length+CRC
+  framing solves the checksum bug above by construction (in flight, storage
+  batch 2). Same JSON-byte-array issue applies to the CP plane's wire +
+  snapshot encoding (ADR 0017 note).
 - **Flush + cascading compaction run inline on the writer** with no
   backpressure — a write's tail latency includes a possibly multi-level
   compaction (matches the observed >150ms apply stalls). Move compaction off

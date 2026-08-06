@@ -271,8 +271,9 @@ later carry CQL range/`LIMIT` predicates.)
 - Semantic gaps between CQL and DynamoDB (consistency knobs, type systems,
   conditional writes) will surface as adapter complexity; building the core
   first lets us discover the right shared abstractions before committing.
-- **Audit finding (2026-08-06, confirmed — open bug): the DynamoDB edge's
-  read-modify-write paths are not atomic even per node.** Conditional
+- **Audit finding (2026-08-06, confirmed — the per-node lock is fixed in
+  PR #21; the cross-node CAS remains future work): the DynamoDB edge's
+  read-modify-write paths were not atomic even per node.** Conditional
   `PutItem`/`DeleteItem`, `UpdateItem`, and `TransactWriteItems` each do
   read → evaluate → write **without taking the per-node `rmw_lock`** (the CQL
   edge holds it for every RMW), and the CP write below is a blind Raft put (no

@@ -135,8 +135,8 @@ sound. Follower reads (a follower asks the leader for `readIndex`, waits for its
 own applied state) are a natural later extension, enabled by this design and by
 the follower-applies-on-commit behavior from the durable-before-visible work.
 
-**Audit correction (2026-08-06 — open bug): the no-op sentence above assumed a
-gate the implementation doesn't have.** `become_leader` appends the no-op, but
+**Audit correction (2026-08-06 — fixed in PR #25): the no-op sentence above
+assumed a gate the implementation didn't have.** `become_leader` appends the no-op, but
 `read_barrier` captures `readIndex = commit_index` gated only on `is_leader()` —
 nothing on the read path waits for the no-op (any current-term entry) to
 *commit* first, which is the load-bearing half of the ReadIndex recipe
@@ -149,7 +149,12 @@ self-healing but real. The `raftkv_linearizable` corpus misses it because its
 100ms client poll never samples the post-election sliver. Fix: `read_barrier`
 must additionally require `commit_index >= <the leader's first current-term
 entry index>` before computing `readIndex`, plus a regression that reads on the
-new leader inside the window.
+new leader inside the window. PR #25 ships exactly this
+(`RaftCore::first_term_index()` + the gate in `read_barrier` + a
+1ms-granularity fresh-leader regression that fails without the fix), and the
+gate work exposed a latent bonus bug it also fixes: a restarted **sole voter**
+never re-advanced `commit_index` over its recovered WAL tail until the next
+propose — `become_leader` now commits its election no-op immediately.
 
 **Leader leases are explicitly NOT adopted, and are a cautionary path, not a
 recommended optimization.** They are recorded here only so a future reader
@@ -300,7 +305,8 @@ control plane unchanged. **Not yet:** dynamic membership (Stage C), tablet split
   Defense-in-depth follow-up: add the explicit current-term-commit gate (the
   `become_leader` no-op index is the natural marker) + a core-level
   `change_membership` test in `animus-control` (today the primitive is
-  exercised only from `animus-cp-data`).
+  exercised only from `animus-cp-data`). **Done in PR #25** (gate on
+  `first_term_index` + `membership_commit_gate.rs`).
 - **Stage D — tablet split.** ✅ Done. A committed `Split { at }` agrees the point;
   each replica tombstones the handed-off range `[at, ∞)`; that range seeds a new
   independent group (`range_snapshot` → `start_seeded`). `tests/split.rs`.
