@@ -238,35 +238,33 @@ pub struct RaftKvNode<E: Env, S: StorageEngine> {
     /// merging them into the engine — so linearizable reads gate on *this* (engine
     /// progress), never `last_applied`, or they could read past the engine's state.
     engine_applied: Arc<AtomicU64>,
-    /// The `at` key of this group's applied `Split` command (it applies **at most
-    /// once, ever**), or `None` before that — set by the apply task, mirroring
-    /// `engine_applied`'s "publish async apply progress for a sync accessor" shape.
-    /// This is the **confirm-by-key** primitive
-    /// [`propose_split`](RaftKvNode::propose_split)'s callers must use: like every
-    /// other proposal here, `Accepted` only means "appended to the leader's local
-    /// log," not committed — an accepted-but-not-yet-committed `Split` entry is
-    /// silently truncated if leadership moves before it commits, exactly like a
-    /// `put`/`delete` (see `engine_applied_index`'s doc). A caller that trusts
-    /// `Accepted` alone for a split never notices the truncation, and (since the
-    /// split trigger already committed a *control-plane* metadata command
-    /// describing the would-be new tablet before ever calling this) permanently
-    /// strands that tablet — `leader: unknown` forever.
+    /// This group's current split boundary — `Some(k)` means every split so far
+    /// has narrowed its valid range to `[lo, k)`; `None` before it has ever
+    /// split. An in-memory cache of the durable [`SPLIT_BOUND_KEY`] entry,
+    /// refreshed by the apply task at recovery and after each successful split
+    /// (see [`current_split_bound`](Self::current_split_bound)'s doc for why it
+    /// lives in the engine rather than in-core Raft state). A group can be
+    /// split **more than once** over its life: each split narrows this further,
+    /// and a new `Split { at }` is only accepted if `at` is strictly less than
+    /// the current value (`None` ⇒ always accepted) — see the `KvCommand::Split`
+    /// apply arm. This still rejects the same race it always has (two proposers
+    /// racing to split the *same* still-unbounded or equally-bounded group at
+    /// the same moment: whichever commits second finds `at` no longer strictly
+    /// less than the boundary the first just set) while allowing a *later*,
+    /// genuinely new split once the boundary has moved.
     ///
-    /// **The key, not just a flag, matters**: under `--cluster N`'s shared edge
-    /// state, more than one node's auto-split loop can independently read this
-    /// group's live pairs and compute a *different* median for the *same* tablet
-    /// in the same tick (the pairs can shift between two racing reads if writes are
-    /// still landing), then both propose a `Split` at their own key. Only the first
-    /// to commit actually mutates state; the group can split **at most once**, so
-    /// the loser's `Split` applies as a no-op. A loser polling a bare "did *a*
-    /// split happen" boolean would see it flip true and wrongly report success for
-    /// a key that was never applied. Comparing against the *specific* key this
-    /// field records is what catches that.
-    ///
-    /// Poll [`applied_split_key`](RaftKvNode::applied_split_key) (bounded, backing
-    /// off) for equality with the proposed key after an `Accepted` propose, the
-    /// same way `engine_applied_index` is polled to confirm a write.
-    applied_split_key: Arc<Mutex<Option<Vec<u8>>>>,
+    /// **Deliberately just the current value, not a history of every key ever
+    /// applied**: a caller confirming "did my specific key `K` ever apply" can
+    /// get an ambiguous answer once more than one split has happened (`K`
+    /// applied, then a *later* split narrowed past it — this field no longer
+    /// equals `K`, even though `K` did apply). That ambiguity is intentional
+    /// and safe here: this is O(1) state forever (not O(number of splits this
+    /// lineage has ever done), which an ever-growing per-split history would
+    /// be — see `animusd`'s `trigger_split`/`auto_split_loop` notes on the GC
+    /// safety net that makes tolerating the ambiguity sound: never delete a
+    /// tablet whose group is still locally, actually hosted, regardless of
+    /// what this field says.
+    current_split_bound_state: Arc<Mutex<Option<Vec<u8>>>>,
     /// Set by [`shutdown`](Self::shutdown); both the consensus loop and the apply
     /// task observe it and exit.
     halted: Arc<AtomicBool>,
@@ -361,7 +359,9 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         let stopped = Arc::new(AtomicBool::new(false));
         let apply_stopped = Arc::new(AtomicBool::new(false));
         let engine_applied = Arc::new(AtomicU64::new(0));
-        let applied_split_key: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
+        // Populated for real by the apply task's recovery read of
+        // `SPLIT_BOUND_KEY` once `drive` starts — see its doc.
+        let current_split_bound_state: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
         let wal_lock = Arc::new(AsyncMutex::new(()));
         let propose_signal = Arc::new(ProposeSignal::default());
         let node = Self {
@@ -372,7 +372,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             reads: Arc::clone(&reads),
             cas: Arc::clone(&cas),
             engine_applied: Arc::clone(&engine_applied),
-            applied_split_key: Arc::clone(&applied_split_key),
+            current_split_bound_state: Arc::clone(&current_split_bound_state),
             halted: Arc::clone(&halted),
             stopped: Arc::clone(&stopped),
             apply_stopped: Arc::clone(&apply_stopped),
@@ -390,7 +390,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             reads,
             cas,
             engine_applied,
-            applied_split_key,
+            current_split_bound_state,
             wal_lock,
             on_split,
             halted,
@@ -721,6 +721,10 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         // `entries()` — the trait's `scan` takes a finite exclusive bound and
         // arbitrary byte keys have no max sentinel; pushing a limit *into* the
         // engine is a `StorageEngine` API change, out of scope here.
+        // Excludes `SPLIT_BOUND_KEY` in both branches — its doc explains why
+        // this reserved entry must never reach a client, and its position in
+        // the keyspace isn't guaranteed to sort outside any particular range
+        // (it's not derived from any real key's hash/format).
         let mut pairs: Vec<(Vec<u8>, Vec<u8>)> = match end {
             Some(e) => self
                 .storage
@@ -728,6 +732,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
                 .await
                 .ok()?
                 .into_iter()
+                .filter(|(k, _)| k.as_slice() != SPLIT_BOUND_KEY)
                 .map(|(k, vv)| (k, vv.value))
                 .collect(),
             None => self
@@ -736,7 +741,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
                 .await
                 .ok()?
                 .into_iter()
-                .filter(|(k, _)| k.as_slice() >= start)
+                .filter(|(k, _)| k.as_slice() >= start && k.as_slice() != SPLIT_BOUND_KEY)
                 .map(|(k, vv)| (k, vv.value))
                 .collect(),
         };
@@ -925,17 +930,37 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         self.engine_applied.load(Ordering::SeqCst)
     }
 
-    /// The `at` key of this group's applied `Split` (it applies at most once,
-    /// ever), or `None` if it hasn't split yet. The **confirm-by-key** primitive
-    /// [`propose_split`](Self::propose_split)'s callers must poll — comparing
-    /// against the *specific* key proposed, not just checking "has it split at
-    /// all" — after an `Accepted` propose; see `applied_split_key`'s doc for why
-    /// trusting `Accepted` (or a bare split-happened flag) alone silently strands
-    /// a split whose key lost a same-tick race to a different proposer's.
-    pub fn applied_split_key(&self) -> Option<Vec<u8>> {
-        self.applied_split_key
+    /// This group's current split boundary: `Some(k)` means every split so far
+    /// has narrowed its valid range to `[lo, k)`; `None` if it has never split.
+    /// Serves two purposes: (1) the "is `at` still a legal new split point"
+    /// question for [`propose_split`](Self::propose_split) (`at` must be
+    /// strictly less than this, or this must be `None`), and (2) the
+    /// **confirm-by-key** primitive its callers poll after an `Accepted`
+    /// propose — `Accepted` only means the entry reached the leader's local
+    /// log, not that it committed (an accepted-but-uncommitted `Split` is
+    /// silently truncated if leadership moves before it commits, exactly like
+    /// a `put`/`delete` — see `engine_applied_index`'s doc), and under
+    /// `--cluster N`'s shared edge state more than one node's auto-split loop
+    /// can independently compute a *different* median for the same tablet in
+    /// the same tick, propose a `Split` at their own key, and only one of
+    /// those keys ever actually applies.
+    ///
+    /// **A moving target once more than one split has happened**: comparing
+    /// this against a specific proposed key `K` can go from `Some(K)` to
+    /// `Some(k')` (`k' < K`) if a *later* split narrows past `K` — even though
+    /// `K` genuinely did apply earlier. This method deliberately does *not*
+    /// disambiguate that (it holds only the current value, not a full
+    /// per-split history — see this field's doc for why: bounded O(1) state
+    /// forever, not O(splits this lineage has ever done)). A caller that acts
+    /// on "this no longer matches my key" by *deleting* something must not
+    /// trust that alone — see `animusd`'s `trigger_split`/`auto_split_loop`
+    /// notes on the local-hosting check that makes tolerating this ambiguity
+    /// safe (worst case: skip a cleanup that was actually safe to do, never
+    /// delete something still genuinely alive).
+    pub fn current_split_bound(&self) -> Option<Vec<u8>> {
+        self.current_split_bound_state
             .lock()
-            .expect("raftkv applied_split_key poisoned")
+            .expect("raftkv current_split_bound_state poisoned")
             .clone()
     }
 
@@ -975,14 +1000,14 @@ impl<E: Coresident, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// replica spawns its co-resident new-group member and the new group forms with
     /// no external handoff.
     ///
-    /// The hook fires **at most once** per group, regardless of how many `Split`
-    /// commands are proposed or committed: `apply_and_compact`'s `applied_split_key`
-    /// (also the [`applied_split_key`](Self::applied_split_key) confirm-by-key
-    /// primitive, gated on it already being `Some`) makes every application after
-    /// the first a no-op (it never recomputes the handoff, never re-invokes the
-    /// hook), so a WAL replay after a crash
-    /// recovery — or a genuinely duplicate `Split` commit, e.g. from a caller that
-    /// proposes a split more than once — cannot mint the sibling twice or hand it an
+    /// The hook fires once **per distinct split point** this group ever applies
+    /// (a group can now split more than once — see `current_split_bound_state`'s doc): a
+    /// `Split { at }` whose `at` is no longer strictly less than the group's
+    /// current boundary is rejected as a no-op at apply time (it never
+    /// recomputes the handoff, never re-invokes the hook for that entry), so a
+    /// WAL replay after a crash recovery — or a genuinely duplicate `Split`
+    /// commit for an `at` that already applied, e.g. from a caller that
+    /// proposes the same split more than once — cannot mint the sibling twice or hand it an
     /// already-tombstoned (empty) range. See
     /// `split_in_band.rs::duplicate_split_proposal_does_not_lose_data` for the
     /// regression: without that guard, a second application's *empty* handoff can
@@ -1101,7 +1126,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
     cas: &Arc<Mutex<CasResults>>,
     on_split: &Option<SplitHook>,
     engine_applied: &AtomicU64,
-    applied_split_key: &Mutex<Option<Vec<u8>>>,
+    current_split_bound_state: &Mutex<Option<Vec<u8>>>,
     wal_lock: &AsyncMutex<()>,
     halted: &AtomicBool,
     metrics: &MetricsHandle,
@@ -1117,6 +1142,18 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
     if let Some((last_index, bytes)) = pending_install {
         install_engine_image(storage, &bytes).await;
         engine_applied.fetch_max(last_index, Ordering::SeqCst);
+        // Re-sync the in-memory split-boundary cache from the just-installed
+        // image: the sender's `snapshot_index`/engine state is authoritative
+        // for this follower now (`RaftCore::handle_install_snapshot` already
+        // cleared its log), so whatever this replica's own cache held before
+        // is stale — overwrite, don't merge.
+        *current_split_bound_state
+            .lock()
+            .expect("raftkv current_split_bound_state poisoned") =
+            match storage.get(SPLIT_BOUND_KEY).await {
+                Ok(Some(vv)) => decode_split_bound(&vv.value),
+                _ => None,
+            };
         did_work = true;
     }
 
@@ -1201,64 +1238,77 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                     .insert(index, swapped);
             }
             KvCommand::Split { at } => {
-                // A group splits **at most once** in its lifetime — once applied, its
-                // valid range is permanently bounded to `[lo, at)` (splitting the
-                // resulting range again must come from a *new* instance: the child
-                // tablet's own group with its own hook). A second `Split` entry is
-                // possible in practice, not just theory: `animusd`'s auto-split loop
-                // reads `Metadata`/calls `local_pairs()`/`propose_split()` per node, and
-                // in an in-process `--cluster N` run every node's loop shares one
-                // `ClusterEdgeState` — so several nodes can independently observe the
-                // same over-threshold leader on the same tick and all call
-                // `propose_split`, landing more than one `Split` command in the
-                // committed log for the same group. Without this guard, re-applying a
-                // second `Split` recomputes the handoff from storage — now **empty**,
-                // since the first application already tombstoned `[at, ∞)` — and fires
-                // the hook again with that empty handoff. The hook spawns one async task
-                // per replica to mint the new tablet's group, gated only by a per-node
-                // "mint once" set keyed on the *tablet id* (not on which `Split`
-                // application triggered it); if the empty-handoff task wins that mint
-                // race, the new group is seeded with no data and the real rows are lost
-                // for good — the root cause of `tablet_auto_splits_when_it_grows`
-                // flaking on "key not served after auto-split". Treat every `Split`
-                // after the first as a no-op, exactly like `NoOp`: harmless regardless
-                // of *why* a duplicate landed (an in-process trigger race today; a stale
-                // retry after a leader failover would hit the same guard, since WAL
-                // replay applies through this identical path and sets the flag before
-                // any duplicate already in the log is ever reached).
-                if applied_split_key
+                // A `Split` is only valid if `at` is strictly less than the group's
+                // *current* boundary (`None` / never split ⇒ always valid) — a CAS
+                // on the group's own split history, not a one-shot latch. This group
+                // can be split more than once over its life (each split narrows
+                // `[lo, boundary)` further), but a *duplicate or superseded* `Split`
+                // entry is still possible, not just in theory: `animusd`'s auto-split
+                // loop reads `Metadata`/calls `local_pairs()`/`propose_split()` per
+                // node, and in an in-process `--cluster N` run every node's loop
+                // shares one `ClusterEdgeState` — so several nodes can independently
+                // observe the same over-threshold leader in the same tick and all
+                // call `propose_split`, landing more than one `Split` command in the
+                // committed log. Applying a `Split` whose `at` is no longer strictly
+                // inside the *current* boundary would recompute the handoff from
+                // storage — now **empty** or overlapping data already handed off by
+                // an earlier split — and fire the hook again with that bad handoff:
+                // an empty-handoff task can win the per-node "mint once" race (keyed
+                // on the *tablet id*, not on which `Split` triggered it) and seed the
+                // new group with no data, losing real rows for good (the root cause
+                // of `tablet_auto_splits_when_it_grows` flaking on "key not served
+                // after auto-split"). Rejecting anything not strictly less than the
+                // current boundary is what closes that, whether the duplicate is a
+                // same-tick race today or a stale retry after a leader failover (WAL
+                // replay applies through this identical path against the *replayed*
+                // boundary at each point, so it makes the same accept/reject decision
+                // it made live).
+                let current_bound = current_split_bound_state
                     .lock()
-                    .expect("raftkv applied_split_key poisoned")
-                    .is_none()
-                {
+                    .expect("raftkv current_split_bound_state poisoned")
+                    .clone();
+                let valid = current_bound.as_ref().is_none_or(|bound| &at < bound);
+                if valid {
                     // Drain the pending run so the handoff capture below sees every
                     // earlier committed write in this apply pass.
                     flush_pending(storage, &mut pending, metrics).await;
                     // Capture the handed-off range `[at, ∞)` from this replica's
-                    // committed state. Every replica applies the same `Split` at the
-                    // same point in the command order, so the captured handoff is
-                    // consistent across replicas (ADR 0017 D).
+                    // committed state (excluding `SPLIT_BOUND_KEY` — see its doc).
+                    // Every replica applies the same `Split` at the same point in the
+                    // command order, so the captured handoff is consistent across
+                    // replicas (ADR 0017 D).
                     let handoff = keys_from(storage, &at).await;
                     // In-band new-group creation: hand the range to the split hook,
                     // which (when wired) mints a co-resident sibling and seeds the new
                     // tablet's group from it. With no hook, the new group is created
-                    // externally from a leader handoff (the prior behavior).
+                    // externally from a leader handoff (the prior behavior). The new
+                    // group starts with its *own* `None` split boundary — it never
+                    // inherits this group's.
                     if let Some(hook) = on_split {
                         hook(at.clone(), handoff.clone());
                     }
                     // The handed-off range now belongs to the new tablet, so tombstone
-                    // it here — consistently on every replica — under a single sync.
-                    let tombstones: Vec<MergeOp> = handoff
+                    // it here — consistently on every replica — and persist the new
+                    // boundary (**overwriting**, not appending — see `SPLIT_BOUND_KEY`'s
+                    // doc for why one value is enough), all under a single sync
+                    // (extending the same batch, not a second `merge_batch` call).
+                    let new_bound = Some(at.clone());
+                    let mut ops: Vec<MergeOp> = handoff
                         .iter()
                         .map(|(key, _)| MergeOp::tombstone(key.clone(), index))
                         .collect();
+                    ops.push(MergeOp::put(
+                        SPLIT_BOUND_KEY.to_vec(),
+                        encode_split_bound(&new_bound),
+                        index,
+                    ));
                     storage
-                        .merge_batch(tombstones)
+                        .merge_batch(ops)
                         .await
-                        .expect("raftkv apply split tombstones");
-                    *applied_split_key
+                        .expect("raftkv apply split tombstones + boundary");
+                    *current_split_bound_state
                         .lock()
-                        .expect("raftkv applied_split_key poisoned") = Some(at.clone());
+                        .expect("raftkv current_split_bound_state poisoned") = new_bound;
                 }
             }
             KvCommand::NoOp => {}
@@ -1395,15 +1445,71 @@ async fn flush_pending<S: StorageEngine>(
         .expect("raftkv apply merge batch");
 }
 
-/// The engine's live `(key, value)` pairs with `key >= at` — the data handed off
-/// to the new tablet on a split.
+/// Reserved key holding this group's **current split boundary** (ADR 0017
+/// successive splits): a normal engine entry, written via the *same*
+/// `merge_batch` call as a `Split`'s tombstones, so it durably survives
+/// everything real data already survives — WAL compaction, process restart,
+/// and cross-replica `InstallSnapshot` catch-up — via the exact same
+/// mechanism, with no new persistence path to get wrong. `RaftCore`'s
+/// `DRIVER_APPLIED` snapshot contract keeps `core.metadata` a permanent unit
+/// placeholder for this state machine (real state lives in the engine, never
+/// in-core) — see `apply_and_compact`'s recovery call site — so this
+/// durability has to come from the engine's own storage, not from Raft-log
+/// replay: once a `Split` entry's index falls below `snapshot_index`,
+/// compaction discards it from the log forever, and nothing else would
+/// re-derive that this group had already split.
+///
+/// **Overwritten, not appended, on each split** — one key's worth of state
+/// forever, not a per-split history. See
+/// [`current_split_bound`](RaftKvNode::current_split_bound)'s doc for why a
+/// full history isn't kept (it would be unbounded and O(n²) to maintain) and
+/// why overwriting is still safe.
+///
+/// **Never returned to a client or handed off to a split child** — every
+/// application-facing read (`keys_from`, `linearizable_scan`) filters it out
+/// explicitly; `entries_with_tombstones` (only used to build the snapshot
+/// image) does *not* filter it, since the image is exactly what should carry
+/// it to a lagging follower or a restart. Chosen to be implausible as a real
+/// application key (long, NUL-delimited, namespaced) — not collision-proof (a
+/// plain-client key is unconstrained raw bytes, ADR 0022), a documented
+/// pre-alpha tradeoff rather than a new reserved keyspace across every wire
+/// edge.
+const SPLIT_BOUND_KEY: &[u8] = b"\0__animus_cp_split_bound__\0";
+
+/// Serialize a group's current split boundary for storage under
+/// [`SPLIT_BOUND_KEY`]. Plain `serde_json` (not the binary snapshot-image
+/// codec) — this rides as one small value inside the engine, not over the
+/// wire in bulk, so the throughput case `codec.rs` exists for doesn't apply.
+fn encode_split_bound(bound: &Option<Vec<u8>>) -> Vec<u8> {
+    serde_json::to_vec(bound).expect("split bound serializes")
+}
+
+/// Inverse of [`encode_split_bound`]. A decode failure only ever means data
+/// this group itself wrote is corrupt — loud (logged), not a panic, since a
+/// missing/corrupt value is recoverable by treating it as "never split"
+/// rather than taking the whole apply task down.
+fn decode_split_bound(bytes: &[u8]) -> Option<Vec<u8>> {
+    match serde_json::from_slice(bytes) {
+        Ok(bound) => bound,
+        Err(err) => {
+            tracing::warn!(?err, "undecodable raftkv split bound dropped");
+            None
+        }
+    }
+}
+
+/// The engine's live `(key, value)` pairs with `key >= at`, **excluding**
+/// [`SPLIT_BOUND_KEY`] — the data handed off to the new tablet on a split,
+/// or (via [`RaftKvNode::range_snapshot`]) surfaced to a client/the auto-split
+/// loop. The history entry must never ride along: a split child inherits it
+/// from a whole-history *value*, not from a stale copy of the parent's.
 async fn keys_from<S: StorageEngine>(storage: &S, at: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
     storage
         .entries()
         .await
         .expect("raftkv engine scan")
         .into_iter()
-        .filter(|(k, _)| k.as_slice() >= at)
+        .filter(|(k, _)| k.as_slice() >= at && k.as_slice() != SPLIT_BOUND_KEY)
         .map(|(k, vv)| (k, vv.value))
         .collect()
 }
@@ -1457,7 +1563,7 @@ struct DriveState<E: Env, S: StorageEngine> {
     reads: Arc<Mutex<ReadState>>,
     cas: Arc<Mutex<CasResults>>,
     engine_applied: Arc<AtomicU64>,
-    applied_split_key: Arc<Mutex<Option<Vec<u8>>>>,
+    current_split_bound_state: Arc<Mutex<Option<Vec<u8>>>>,
     wal_lock: Arc<AsyncMutex<()>>,
     on_split: Option<SplitHook>,
     halted: Arc<AtomicBool>,
@@ -1490,7 +1596,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         reads,
         cas,
         engine_applied,
-        applied_split_key,
+        current_split_bound_state,
         wal_lock,
         on_split,
         halted,
@@ -1516,9 +1622,20 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         core.lock().expect("raftkv core poisoned").last_applied(),
         Ordering::SeqCst,
     );
+    // Restore the group's split history from durable storage — never from WAL
+    // replay (see `SPLIT_BOUND_KEY`'s doc): once a `Split` entry's Raft index
+    // falls below `snapshot_index`, compaction discards it from the log for
+    // good, and replaying the (now-shorter) tail would never re-derive that
+    // this group had already split. The engine itself is the durable source of
+    // truth here, exactly like the rest of the applied state above.
+    if let Ok(Some(vv)) = storage.get(SPLIT_BOUND_KEY).await {
+        *current_split_bound_state
+            .lock()
+            .expect("raftkv current_split_bound_state poisoned") = decode_split_bound(&vv.value);
+    }
 
-    // Spawn the apply task now — after recovery seeded the core + `engine_applied`,
-    // so it never merges against pre-recovery state.
+    // Spawn the apply task now — after recovery seeded the core + `engine_applied`
+    // + `current_split_bound_state`, so it never merges against pre-recovery state.
     env.spawn_task(apply_loop(
         env.clone(),
         Arc::clone(&core),
@@ -1526,7 +1643,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         cas,
         on_split,
         Arc::clone(&engine_applied),
-        applied_split_key,
+        current_split_bound_state,
         Arc::clone(&wal_lock),
         Arc::clone(&halted),
         apply_stopped,
@@ -1661,14 +1778,14 @@ async fn apply_loop<E: Env, S: StorageEngine>(
     cas: Arc<Mutex<CasResults>>,
     on_split: Option<SplitHook>,
     engine_applied: Arc<AtomicU64>,
-    applied_split_key: Arc<Mutex<Option<Vec<u8>>>>,
+    current_split_bound_state: Arc<Mutex<Option<Vec<u8>>>>,
     wal_lock: Arc<AsyncMutex<()>>,
     halted: Arc<AtomicBool>,
     apply_stopped: Arc<AtomicBool>,
     metrics: MetricsHandle,
 ) {
-    // `applied_split_key` is shared (not a task-local `Option<Vec<u8>>`) so
-    // `RaftKvNode::applied_split_key` can observe it — the confirm-by-key primitive
+    // `current_split_bound_state` is shared (not a task-local `Option<Vec<u8>>`) so
+    // `RaftKvNode::current_split_bound_state` can observe it — the confirm-by-key primitive
     // `propose_split`'s callers must poll (see its doc). It persists across loop
     // iterations by construction (an `Arc` handed in once), including a full WAL
     // replay after restart: the recovered log applies through this same loop
@@ -1686,7 +1803,7 @@ async fn apply_loop<E: Env, S: StorageEngine>(
             &cas,
             &on_split,
             &engine_applied,
-            &applied_split_key,
+            &current_split_bound_state,
             &wal_lock,
             &halted,
             &metrics,

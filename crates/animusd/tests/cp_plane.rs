@@ -512,21 +512,16 @@ async fn tablet_auto_splits_when_it_grows() {
     }
 }
 
-/// Regression: a `RaftKvNode` group applies **at most one** `Split`, ever (see
-/// `KvCommand::Split`'s apply-time guard in `animus-cp-data`) — once a tablet's
-/// own group has split, its remaining range is permanently frozen at that
-/// boundary even though it can keep absorbing writes. Before this test's fix,
-/// `auto_split_loop` didn't account for that: a still-growing already-split
-/// tablet re-tripped the size threshold every cooldown window, and each
-/// attempt minted a brand-new `SplitTablet` metadata entry (step 1) that could
-/// never get a CP group (step 2 can never confirm a second split against an
-/// already-split group) — an unbounded pileup of leaderless orphan tablets,
-/// live-observed hanging a bulk seed indefinitely. This proves the tablet
-/// count stops growing once the one split that *can* succeed has happened,
-/// even after more auto-split ticks elapse with the original tablet still
-/// over threshold.
+/// Regression: a `RaftKvNode` group can be split **more than once** over its
+/// life (`KvCommand::Split`'s apply-time check in `animus-cp-data` validates
+/// each new split against the group's *current* boundary, not a one-shot
+/// latch) — a tablet that already split once and keeps absorbing writes must
+/// split *again* once it regrows past `threshold`, not sit frozen forever.
+/// This proves the tablet count keeps growing as the same lineage repeatedly
+/// crosses the threshold, and that every resulting tablet ends up with a real
+/// CP group (no orphans left behind along the way).
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
-async fn already_split_tablet_is_not_retried_forever() {
+async fn already_split_tablet_splits_again_once_it_regrows() {
     let dir = tempfile::tempdir().unwrap();
     let bound = bind_cluster(3, "127.0.0.1".parse().unwrap(), dir.path())
         .await
@@ -579,10 +574,10 @@ async fn already_split_tablet_is_not_retried_forever() {
     // Keep writing keys that sort *below* every `key##` key already written —
     // the split's median falls somewhere inside `key00..key23`, so every
     // `aaa##` key lands below it, in the original tablet's lower range (the
-    // one whose group already spent its one-time split). Deliberately
-    // avoiding new keys in the *upper* range keeps this test isolated to the
-    // already-split tablet: the sibling tablet legitimately splitting for its
-    // own first time would be correct behavior, not a regression.
+    // one whose group already split once). Deliberately avoiding new keys in
+    // the *upper* range keeps this test isolated to the already-split
+    // tablet's own lineage re-splitting, not the sibling splitting for its
+    // own first time.
     for i in 0..40u32 {
         let key = format!("aaa{i:02}").into_bytes();
         let value = format!("v{i}").into_bytes();
@@ -591,20 +586,50 @@ async fn already_split_tablet_is_not_retried_forever() {
             .unwrap_or_else(|_| panic!("write aaa{i:02} timed out"));
     }
 
-    // Give the auto-split loop several ticks and a full cooldown window (15s)
-    // to (wrongly, pre-fix) mint fresh split attempts against the
-    // already-split tablet.
-    sleep(Duration::from_secs(35)).await;
+    // The already-split lineage must split *again* — tablet count grows past
+    // where it stopped after the first split.
+    let second_split = async {
+        loop {
+            if nodes
+                .iter()
+                .all(|n| n.metadata().tablets.len() > tablet_count_after_first_split)
+            {
+                return;
+            }
+            sleep(Duration::from_millis(200)).await;
+        }
+    };
+    timeout(Duration::from_secs(30), second_split)
+        .await
+        .expect("already-split tablet did not split again after regrowing");
 
-    // No tablet count growth: every tablet that exists has a real CP group —
-    // an already-split tablet must never trigger another `SplitTablet`
-    // metadata entry, no matter how far over threshold it grows.
-    for n in &nodes {
-        assert_eq!(
-            n.metadata().tablets.len(),
-            tablet_count_after_first_split,
-            "an already-split tablet must never be retried as a fresh split candidate"
-        );
+    // Every key written across both split rounds is still reachable — no
+    // orphans/lost routing left behind by splitting the same lineage twice.
+    for (k, want) in [
+        (b"aaa00".to_vec(), b"v0".to_vec()),
+        (b"aaa39".to_vec(), b"v39".to_vec()),
+        (b"key00".to_vec(), b"v0".to_vec()),
+        (b"key23".to_vec(), b"v23".to_vec()),
+    ] {
+        let read = async {
+            loop {
+                let got = call(
+                    addr0,
+                    ClientRequest::Get {
+                        key: k.clone(),
+                        table: "kv".to_string(),
+                    },
+                )
+                .await;
+                if got == ClientResponse::Value(Some(want.clone())) {
+                    return;
+                }
+                sleep(Duration::from_millis(150)).await;
+            }
+        };
+        timeout(Duration::from_secs(20), read)
+            .await
+            .unwrap_or_else(|_| panic!("key {k:?} not served after repeated auto-split"));
     }
 
     for n in &nodes {
@@ -613,22 +638,25 @@ async fn already_split_tablet_is_not_retried_forever() {
 }
 
 /// Regression: `trigger_split`'s data-plane step can fail *permanently*, not
-/// just transiently — a different key can already have won the source
-/// group's one-time split (the same "abandoned pending split" shape
-/// `auto_split_loop` can hit under leader churn, see its doc). Before this
-/// fix, nothing ever removed the resulting metadata-only mint: it sat in
-/// `Metadata.tablets` forever with a real range/replicas but no CP group —
-/// `leader: unknown`, unreachable, permanently cluttering every admin view
-/// and burning a tablet id.
+/// just transiently — a *smaller* (more aggressive) split can already have
+/// narrowed the source group's boundary past a *larger* key's proposal before
+/// that proposal's own data-plane step ever lands (the group can now split
+/// more than once, but only ever toward smaller boundaries — see
+/// `RaftKvNode::current_split_bound`'s doc). Before this fix, nothing ever
+/// removed the resulting metadata-only mint: it sat in `Metadata.tablets`
+/// forever with a real range/replicas but no CP group — `leader: unknown`,
+/// unreachable, permanently cluttering every admin view and burning a tablet
+/// id.
 ///
 /// This reproduces the permanent (not transient) failure **deterministically**,
-/// with no timing race: two sequential manual splits of the same source
-/// tablet. The first split ("m") wins for real. The second ("c") is proposed
-/// against the source's now-narrowed range (`[start, "m")`, so "c" is still
-/// strictly inside it) — step 1 mints a second child, but step 2 can never
-/// confirm, because the source's real CP group already spent its one-time
-/// split on "m". Asserts the second mint is cleaned up rather than left
-/// dangling.
+/// with no timing race: first, a **data-plane-only** split at "c" (via
+/// `CpSplit`, bypassing metadata entirely) directly narrows the source
+/// group's real boundary to "c". Then a **normal** manual split at "m" (`"m" >
+/// "c"`) mints a metadata child fine (metadata never heard about the "c"
+/// split, so "m" is still inside its view of the source's range) — but its
+/// data-plane step can never confirm, because "m" is not strictly less than
+/// the source's actual current boundary, "c". Asserts the resulting mint is
+/// cleaned up rather than left dangling.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn a_lost_split_race_does_not_leave_a_permanent_orphan() {
     let dir = tempfile::tempdir().unwrap();
@@ -646,7 +674,7 @@ async fn a_lost_split_race_does_not_leave_a_permanent_orphan() {
             match call(
                 addr0,
                 ClientRequest::Put {
-                    key: b"seed".to_vec(),
+                    key: b"aaa".to_vec(),
                     value: b"v".to_vec(),
                     table: "orphan_test".to_string(),
                 },
@@ -669,31 +697,42 @@ async fn a_lost_split_race_does_not_leave_a_permanent_orphan() {
         .next()
         .expect("the write provisioned a tablet");
 
-    // First split: wins for real.
-    let first = timeout(
+    // Data-plane-only split at "c": moves the group's *real* boundary without
+    // metadata ever finding out.
+    let cp_split = timeout(
         Duration::from_secs(20),
         call(
             addr0,
-            ClientRequest::SplitTablet {
+            ClientRequest::CpSplit {
                 tablet: source.0,
-                split_key: b"m".to_vec(),
+                split_key: b"c".to_vec(),
             },
         ),
     )
     .await
-    .expect("first split timed out");
-    assert_eq!(first, ClientResponse::PutOk, "first split should confirm");
-    assert_eq!(nodes[0].metadata().tablets.len(), 2);
+    .expect("data-plane split timed out");
+    assert_eq!(
+        cp_split,
+        ClientResponse::PutOk,
+        "data-plane-only split should confirm"
+    );
+    assert_eq!(
+        nodes[0].metadata().tablets.len(),
+        1,
+        "metadata is untouched by a data-plane-only split"
+    );
 
-    // Second split: step 1 mints a second child at "c" (still strictly inside
-    // the source's narrowed range), but step 2 can never confirm.
+    // Manual split at "m": step 1 mints a child fine (metadata's view of the
+    // source's range is still the original, full one), but step 2 can never
+    // confirm — "m" is not strictly less than the source's actual boundary,
+    // "c".
     let second = timeout(
         Duration::from_secs(20),
         call(
             addr0,
             ClientRequest::SplitTablet {
                 tablet: source.0,
-                split_key: b"c".to_vec(),
+                split_key: b"m".to_vec(),
             },
         ),
     )
@@ -707,7 +746,7 @@ async fn a_lost_split_race_does_not_leave_a_permanent_orphan() {
     // The lost split's orphan mint must not linger.
     let poll_gc = async {
         loop {
-            if nodes[0].metadata().tablets.len() == 2 {
+            if nodes[0].metadata().tablets.len() == 1 {
                 return;
             }
             sleep(Duration::from_millis(100)).await;

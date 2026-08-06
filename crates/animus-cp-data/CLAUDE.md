@@ -250,18 +250,74 @@ the engine — the `AccordCore` sync-core/async-driver split.
   realistic clusters. **`propose_split`'s `ProposeResult::Accepted` is not
   confirmation** — like every proposal here, it only means the entry was appended
   to the leader's local log; a caller must poll
-  [`applied_split_key`](RaftKvNode::applied_split_key) (an `Arc<Mutex<Option<Vec<u8>>>>`
-  set once by the apply task, alongside `engine_applied`) before trusting it, the
+  [`current_split_bound`](RaftKvNode::current_split_bound) before trusting it, the
   same way `engine_applied_index` is polled to confirm a write. `animusd`'s
   `propose_split_data`/`cp_split_here` learned this the hard way: trusting
   `Accepted` let an accepted-but-never-committed `Split` (truncated by leader churn)
   report false success, permanently stranding the tablet its metadata layer had
   already created. **The confirmation must compare the *exact* key, not just "has
-  this group split"**: a group splits at most once, so if two callers race with
-  *different* keys on the same tablet (a real scenario under `animusd`'s
-  `--cluster N` shared-edge redundant triggering — see its `CLAUDE.md`), the loser's
-  bare "did *a* split happen" check would pass even though its own key never
-  applied.
+  this group split"**: if two callers race with *different* keys on the same
+  tablet (a real scenario under `animusd`'s `--cluster N` shared-edge redundant
+  triggering — see its `CLAUDE.md`), the loser's bare "did *a* split happen" check
+  would pass even though its own key never applied.
+- **A group can be split more than once over its life** — `KvCommand::Split`'s
+  apply-time check is a CAS against the group's *current* boundary
+  (`current_split_bound`), not the one-shot "has it split at all" latch this
+  started as. `Split { at }` is accepted iff `at` is strictly less than the
+  current boundary (`None` — never split — always accepts); each accepted split
+  narrows the boundary further, so the sequence only ever moves toward smaller
+  keys. This still rejects the race the original one-shot guard was built for —
+  two proposers racing to split the *same* still-equally-bounded group at the
+  same moment, whichever commits second finds `at` no longer strictly less than
+  the boundary the first just set — while allowing a tablet that regrows past a
+  threshold to shard again, any number of times, instead of being permanently
+  frozen after its first split (the original design's actual limitation, not a
+  deliberate choice — lifting it needed `animusd`'s `auto_split_loop` to stop
+  treating "already split once" as permanent exclusion too; see its `CLAUDE.md`).
+  `tests/cp_deep_split.rs` (a split-created tablet can be split again, via
+  `animusd`), `animusd/tests/cp_plane.rs::already_split_tablet_splits_again_once_it_regrows`.
+  - **The boundary is `current_split_bound`, deliberately just the current
+    value — not a per-split history.** A history would let a caller confirm
+    "did my exact key ever apply" unambiguously forever, but that's O(n) state
+    that grows for the life of a heavily-resplit lineage, and costs O(n²) total
+    to maintain (each split re-persists the whole history). Instead
+    `current_split_bound` only answers "is `K` still a legal *new* split point"
+    reliably; "did key `K` apply" is answered *reliably only while `K` is still
+    the current value* — once a *later* split narrows past `K`, this can no
+    longer distinguish "`K` applied, then something else narrowed further" from
+    "`K` never applied, something else did instead." That ambiguity is
+    intentional: `animusd` never trusts it alone to *delete* anything (see its
+    `CLAUDE.md`'s `drop_orphan_tablet` note) — a caller confirming success
+    treats "still equal" as certain success and anything else as "stop retrying
+    this key," and a *second*, independent check (local hosting) is what
+    decides whether the ambiguous case is actually safe to clean up. Bounded
+    O(1) state forever is worth a caller-side ambiguity that has a cheap,
+    independent safety net.
+  - **Durability: stored *inside the engine*, not in Raft-log/WAL-snapshot
+    state.** `RaftCore`'s `DRIVER_APPLIED` contract keeps `core.metadata`
+    (`KvState`) a permanent unit placeholder for this state machine — real state
+    lives only in the engine, never in-core (see the driver-liveness /
+    `DRIVER_APPLIED` snapshot notes above). So `current_split_bound` rides as a
+    normal entry under a reserved key (`SPLIT_BOUND_KEY`), written via the
+    *same* `merge_batch` call as a `Split`'s tombstones (one fsync, not two).
+    This is what makes it survive WAL compaction and process restart correctly:
+    a bare in-memory flag (the original `applied_split_key`) is *not*
+    recoverable once a `Split` entry's Raft index falls below
+    `snapshot_index` — compaction discards it from the log for good, and
+    nothing else re-derives that the group had already split (a real, latent
+    bug in the original one-shot design, never triggered because nothing
+    combined enough writes-after-a-split with a restart to hit it). Recovered
+    at driver startup (`drive`) via a direct `storage.get(SPLIT_BOUND_KEY)` —
+    never from WAL replay — and re-synced the same way after installing a
+    received snapshot (`apply_and_compact`'s `pending_install` branch), since
+    `RaftCore::handle_install_snapshot` clears this follower's log on
+    completion. **Excluded from every application-facing read** (`keys_from`
+    — also the split handoff, so a child never inherits the parent's boundary
+    — and both branches of `linearizable_scan`); *not* excluded from
+    `entries_with_tombstones` (`engine_image`'s source), since the snapshot
+    image is exactly what should carry it to a lagging follower or a restart.
+    `tests/cp_rehost.rs::split_tablet_survives_cluster_restart` exercises the
+    restart path end to end (via `animusd`).
 
 ## Tests
 
