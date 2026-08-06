@@ -386,6 +386,18 @@ where
             core.snapshot_term = last_term;
             core.last_applied = last_index;
             core.commit_index = last_index;
+            // Preserve the invariant `snapshot_index > 0 ⟹ snapshot_blob.is_some()`
+            // through recovery: [`snapshot_chunk_for`] slices the cached blob, and a
+            // recovered leader may have to ship this snapshot to a lagging follower
+            // before it ever re-compacts. The recovered `metadata` *is* the in-core
+            // image, so serialize it once here — identical to what the old
+            // re-serialize-per-chunk path produced, just cached. (A `DRIVER_APPLIED`
+            // core's image lives in the engine, not `metadata`; its driver repopulates
+            // `snapshot_blob` from the engine, so leave it None here.)
+            if !S::DRIVER_APPLIED {
+                core.snapshot_blob =
+                    Some(serde_json::to_vec(&core.metadata).expect("metadata serializes"));
+            }
         }
         // Restore the voter configuration: the snapshot's recorded config (if any)
         // is the base, and the recovered log tail's latest config entry (if any)
@@ -438,6 +450,52 @@ where
         image
     }
 
+    /// The compact WAL image **already encoded to bytes**, identical to encoding
+    /// [`wal_image`](Self::wal_image) record-by-record — but the (dominant) snapshot
+    /// record reuses the cached `snapshot_blob` (via
+    /// [`PersistedState::encode_snapshot_record_from_blob`]) so the state is
+    /// serialized **once** per compaction, not twice (once into the blob for
+    /// `InstallSnapshot`, once for the WAL). The control-plane driver's `compact_wal`
+    /// calls this; the byte-equality with `wal_image` encoding is guarded by
+    /// `wal_compaction.rs::encoded_image_matches_wal_image_encoding`.
+    ///
+    /// **In-core only:** for an in-core state machine `snapshot_blob ==
+    /// serialize(metadata@snapshot_index)`, so reusing it for the WAL `metadata`
+    /// field is exact. A `DRIVER_APPLIED` plane's blob is its *engine* image (not
+    /// `serialize(state)`), and it has its own driver/compaction, so it must not use
+    /// this — asserted below.
+    #[must_use]
+    pub fn encoded_wal_image(&self) -> Vec<u8> {
+        assert!(
+            !S::DRIVER_APPLIED,
+            "encoded_wal_image reuses snapshot_blob as the serialized state image, \
+             which only holds for an in-core state machine"
+        );
+        let mut bytes = Vec::new();
+        if self.snapshot_index > 0 {
+            let blob = self
+                .snapshot_blob
+                .as_deref()
+                .expect("snapshot_blob is Some when snapshot_index > 0 (in-core invariant)");
+            bytes.extend(PersistedState::<C, S>::encode_snapshot_record_from_blob(
+                blob,
+                self.snapshot_index,
+                self.snapshot_term,
+                &self.snapshot_config,
+            ));
+        }
+        bytes.extend(PersistedState::<C, S>::encode_record(&WalRecord::Hard {
+            term: self.current_term,
+            voted_for: self.voted_for,
+        }));
+        for entry in &self.log {
+            bytes.extend(PersistedState::<C, S>::encode_record(&WalRecord::Append(
+                entry.clone(),
+            )));
+        }
+        bytes
+    }
+
     /// Snapshot the applied state and **truncate** the log prefix it covers:
     /// advance the snapshot base to `last_applied` and drop entries through it.
     /// No-op if nothing new has been applied. Sets the snapshot-dirty flag so the
@@ -468,6 +526,24 @@ where
         self.snapshot_index = new_index;
         self.snapshot_term = new_term;
         self.snapshot_dirty = true;
+        // Cache the serialized snapshot image so [`snapshot_chunk_for`] slices cached
+        // bytes instead of re-serializing the whole `metadata` **per 1KB chunk** — an
+        // O(state)-per-`InstallSnapshot`-message cost that pins the consensus loop and
+        // storms elections while catching a follower up on a large state (the
+        // control-plane counterpart of the CP-data driver-liveness fix, ADR 0017). An
+        // in-core SM's image *is* its `metadata`; a `DRIVER_APPLIED` SM's image lives
+        // in the engine and the driver supplies it via [`set_snapshot_blob`] *before*
+        // snapshotting (`snapshot_upto(engine_applied)`), so don't clobber it. For the
+        // in-core plane `metadata` reflects `last_applied`, and `new_index <=
+        // last_applied`, so this serializes state **at least as fresh** as the base —
+        // and the control plane only ever snapshots to `last_applied` (via
+        // [`snapshot`]), so it matches the base exactly. Keeps the invariant
+        // `snapshot_index > 0 ⟹ snapshot_blob.is_some()` for both SM kinds, so a chunk
+        // is never a 0-byte ship.
+        if !S::DRIVER_APPLIED {
+            self.snapshot_blob =
+                Some(serde_json::to_vec(&self.metadata).expect("metadata serializes"));
+        }
     }
 
     /// Take and clear the snapshot-dirty flag (the driver uses this to decide
@@ -1174,6 +1250,17 @@ where
                 Ok(state) => {
                     self.metadata = state;
                     install(self);
+                    // Retain the received image as our own `snapshot_blob` so this
+                    // node can **re-ship** a non-empty image if it later leads a
+                    // catch-up of a third follower below its compacted prefix — the
+                    // same invariant the `DRIVER_APPLIED` branch keeps above
+                    // (`snapshot_index > 0 ⟹ snapshot_blob.is_some()`). The bytes are
+                    // exactly a valid serialized image at `snapshot_index`; without
+                    // this, a node that only ever caught up via install would ship
+                    // `unwrap_or_default()` = 0 bytes and the receiver would decode an
+                    // empty state (`EOF while parsing a value`). See the regression
+                    // `install_snapshot.rs::caught_up_control_node_reships_non_empty`.
+                    self.snapshot_blob = Some(inc.buf);
                     return vec![(
                         leader,
                         RaftMsg::InstallSnapshotResp {
@@ -1332,17 +1419,18 @@ where
 
     /// Build the next `InstallSnapshot` chunk for `peer`, starting at the byte
     /// offset recorded in `snapshot_offset` (0 if no transfer is in flight).
-    /// Pure: it serializes the current `metadata` and slices out one chunk, so
-    /// repeated calls at the same offset are byte-identical and deterministic.
+    /// Pure and **cheap**: it slices the pre-serialized [`snapshot_blob`] rather than
+    /// re-serializing the state, so repeated calls at the same offset are
+    /// byte-identical, deterministic, and O(chunk) — not O(state) per chunk.
     fn snapshot_chunk_for(&self, peer: NodeId) -> Out<C> {
-        // A `DRIVER_APPLIED` state machine's image lives in the engine, not in
-        // `metadata`; the driver supplies it via `set_snapshot_blob`. An in-core
-        // state machine serializes its `metadata` directly.
-        let serialized = if S::DRIVER_APPLIED {
-            self.snapshot_blob.clone().unwrap_or_default()
-        } else {
-            serde_json::to_vec(&self.metadata).expect("metadata serializes")
-        };
+        // Both SM kinds ship the **cached** serialized image, never a fresh
+        // per-chunk serialize: a `DRIVER_APPLIED` engine image (set by the driver on
+        // compaction / retained on install) or an in-core `metadata` image (cached by
+        // [`snapshot_upto`] when the base advances / retained on install). The
+        // invariant `snapshot_index > 0 ⟹ snapshot_blob.is_some()` holds for both, and
+        // this is only reached when `next <= snapshot_index` (so `snapshot_index > 0`),
+        // so the `unwrap_or_default` fallback is never taken in practice.
+        let serialized = self.snapshot_blob.clone().unwrap_or_default();
         let total = serialized.len() as u64;
         let offset = self
             .snapshot_offset

@@ -16,9 +16,17 @@ animus-env.workspace = true
 animus-tablet.workspace = true
 animus-placement.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+# `raw_value`: compaction embeds the cached, already-serialized snapshot image
+# (`snapshot_blob`) into the WAL `Snapshot` record via `RawValue` so the (large)
+# `Metadata` is serialized **once** per compaction, not twice (once to ship, once
+# for the WAL) — see `persist.rs::encode_snapshot_record_from_blob`.
+serde_json = { workspace = true, features = ["raw_value"] }
 futures.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
 animus-sim.workspace = true
+# Real-time `ProdEnv` liveness tests (the driver-liveness guarantee, ADR 0009/0017):
+# `SimEnv`'s virtual time can't trip the wall-clock election timeout, so the
+# no-election-storm property is only observable over `ProdEnv` on real threads.
+tokio.workspace = true

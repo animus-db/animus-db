@@ -639,11 +639,11 @@ async fn flush_wal<E: Env>(env: &E, core: &Arc<Mutex<RaftCore>>) -> usize {
 /// hard state + current log). Safe because [`flush_wal`] has already persisted
 /// everything the image is built from.
 async fn compact_wal<E: Env>(env: &E, core: &Arc<Mutex<RaftCore>>) {
-    let image = core.lock().expect("raft core poisoned").wal_image();
-    let mut bytes = Vec::new();
-    for record in &image {
-        bytes.extend(PersistedState::encode_record(record));
-    }
+    // `encoded_wal_image` reuses the cached `snapshot_blob` for the snapshot record,
+    // so the (potentially large) `Metadata` is serialized once per compaction (into
+    // the blob, by `snapshot()`), not a second time here — keeping the compaction's
+    // inline serialize on the driver loop bounded to a single pass.
+    let bytes = core.lock().expect("raft core poisoned").encoded_wal_image();
     env.replace(WAL, &bytes).await.expect("wal compaction");
 }
 

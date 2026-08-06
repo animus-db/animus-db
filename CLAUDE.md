@@ -384,6 +384,42 @@ cross-cutting ones. Prune/merge entries that become obsolete.
   re-ship (`A→B`, then `B`-as-leader→`C`).
   (`animus-control` `raft.rs::handle_install_snapshot`; regression
   `driver_applied_sm.rs::caught_up_node_reships_non_empty_snapshot`.)
+- **A per-message O(state) serialize on a Raft consensus loop is a latent
+  election-storm hazard, and a *cache* to fix it must not double the work it replaces
+  — reuse the one serialization everywhere the state is needed.** The control-plane
+  `snapshot_chunk_for` re-serialized the whole `Metadata` **per 1KB InstallSnapshot
+  chunk**; on a multi-MB metadata a follower catch-up shipped ~thousands of chunks
+  (~50ms serialize each), pinning the loop far past the 150ms election timeout — a
+  self-sustaining storm during any large-state catch-up (the control-plane twin of
+  PR #16's CP-data apply/compaction storm). Fix: **cache the serialized image once
+  when `snapshot_index` advances and slice it per chunk** (O(chunk)). But the naive
+  cache *doubled* compaction cost — the blob serialize **plus** the WAL `Snapshot`
+  record's own metadata serialize — so reuse the cached bytes for the WAL too
+  (`serde_json` `RawValue` embeds the pre-serialized image verbatim; byte-identical,
+  guarded by a round-trip test). Two morals: (1) the cache must be pinned to
+  `snapshot_index`'s state, serialized **eagerly at snapshot time** (in-core
+  `metadata` advances past the base between compactions, so lazy-at-ship would ship
+  a state *ahead of* its claimed index → the follower double-applies its log tail);
+  (2) **this hazard is invisible to `SimEnv`** (virtual time never trips the
+  wall-clock election timeout) — the teeth is a wall-clock-timed transfer
+  (`install_snapshot.rs::large_snapshot_ships_in_o_chunk_time_not_o_state`: fix ~ms
+  vs regression ~46s), because a *live* `ProdEnv` cluster catch-up races
+  leadership/AppendEntries and won't reliably traverse a long chunk-stream.
+  (`animus-control` `raft.rs::snapshot_chunk_for`/`snapshot_upto`/`encoded_wal_image`,
+  `persist.rs::encode_snapshot_record_from_blob`.)
+- **When mirroring a fix onto a *sibling* subsystem, assess honestly — the sibling
+  may have a *different-shaped* version of the hazard, or a bounded one not worth the
+  same risky refactor.** PR #16 moved CP-data's async **engine apply + compaction**
+  off its Raft loop (a >150ms self-sustaining stall). The control plane applies its
+  state machine **in-core, synchronously** — no async apply to move — so its only
+  loop-blocking O(state) work is snapshot-shipping (fixed above, cheaply) and the
+  compaction WAL-rewrite serialize. The latter is a *single* stall (~50ms at ~1MB,
+  ~120ms at ~3MB), under the election timeout at realistic scale and **not**
+  self-sustaining (once per 64 applied entries). Moving it fully off the loop would
+  couple the install→WAL-rewrite ordering into a second task on the most
+  safety-critical Raft (real risk) for a bounded, rare, extreme-scale stall — so it
+  was **measured, documented, and deferred**, not force-fit. A well-reasoned "the
+  sibling's hazard is smaller; here's the measurement" is a valid outcome.
 - **A recursive operation that "works" once may be relying on a depth-1 coincidence —
   prove it at depth ≥ 2.** Tablet *split* worked the first time for two accidental
   reasons that both break at depth 2: (a) only the *bootstrap* group was started with

@@ -61,6 +61,12 @@ epoch compare-and-swap transactions.
   engine-as-snapshot + streaming `InstallSnapshot` for the data plane is A.2.)
 - `persist.rs` — `WalRecord`, `PersistedState` (durability/recovery). The WAL
   write/compact/recover flow is diagrammed in `docs/wal.md`.
+  `PersistedState::encode_snapshot_record_from_blob` encodes the WAL `Snapshot`
+  line **reusing the core's cached serialized image** (`snapshot_blob`) for the
+  large `metadata` field (via `serde_json` `RawValue`), so compaction serializes
+  `Metadata` **once**, not twice (once to ship, once for the WAL) — see the
+  driver-liveness note below. Byte-identical to the plain encode; guarded by
+  `snapshot_record_blob_reuse_round_trips`.
 - `node.rs` — `RaftNode<E>`: the `Env` driver wrapping the core, plus
   `reconcile_loop` (the leader's automatic placement reconciler) and
   `detect_loop` (the leader's failure detector, ADR 0012). Also the
@@ -104,17 +110,43 @@ epoch compare-and-swap transactions.
   the final chunk completes the buffer. `InstallSnapshotResp.next_offset` drives
   the next chunk; its `last_index` is non-zero only on completion. Chunking is
   all in the sync core (no I/O), so it stays deterministic. See `docs/wal.md`.
-  **For a `DRIVER_APPLIED` (data-plane KV) state machine the shipped image is
-  `snapshot_blob`, not serialized `metadata`** — and the core sets `snapshot_blob`
-  on **two** events, not one: the driver sets it from the engine when it *compacts*
-  (`set_snapshot_blob`), **and the core sets it on install completion** (a follower
-  retains the image it just received). The second is load-bearing: without it a
-  node that caught up via an `InstallSnapshot` has `snapshot_index > 0` but no blob
-  until its first compaction, so if it then becomes leader (or must re-ship to a
-  third lagging follower) it ships `unwrap_or_default()` = **0 bytes**, the receiver
-  decodes an empty image (`EOF while parsing a value`) and can never catch up. The
-  invariant is `DRIVER_APPLIED && snapshot_index > 0 ⟹ snapshot_blob.is_some()`
-  (regression: `driver_applied_sm.rs::caught_up_node_reships_non_empty_snapshot`).
+  **`snapshot_chunk_for` slices the cached `snapshot_blob` — it does NOT
+  re-serialize per chunk** (the driver-liveness fix, see below). The blob is set
+  wherever `snapshot_index` advances, for **both** state-machine kinds, so the
+  invariant `snapshot_index > 0 ⟹ snapshot_blob.is_some()` holds and no ship is ever
+  0 bytes: a `DRIVER_APPLIED` (data-plane KV) image is the *engine* bytes, set by the
+  driver on *compaction* (`set_snapshot_blob`) **and** by the core on *install*
+  completion; an **in-core** (`Metadata`) image is `serialize(metadata)`, set by the
+  core in `snapshot_upto` (local snapshot), on *install* completion (retain the
+  received bytes), and in `recovered` (a recovered leader may ship before it
+  re-compacts). Missing any of these ships `unwrap_or_default()` = **0 bytes**, the
+  receiver decodes an empty image (`EOF while parsing a value`) and can never catch up
+  (regressions: `driver_applied_sm.rs::caught_up_node_reships_non_empty_snapshot`,
+  `install_snapshot.rs::caught_up_control_node_reships_non_empty`).
+- **Driver-liveness (deferred fix #5, the control-plane counterpart of the CP-data
+  fix in ADR 0017).** The control driver applies `Metadata` **in-core,
+  synchronously**, so — unlike CP-data — there is no slow async engine apply to move
+  off the loop. The one O(state) hazard was `snapshot_chunk_for`
+  **re-serializing the whole `Metadata` per 1KB chunk**: on a multi-MB metadata a
+  follower catch-up shipped ~thousands of chunks, each an O(state) serialize (~50ms
+  at ~1MB), pinning the consensus loop far past the 150ms election timeout — a
+  self-sustaining election storm during any large-state catch-up. Fixed by
+  **caching the serialized image in `snapshot_blob` and slicing it** (above), so
+  chunk-serving is O(chunk). To avoid *doubling* the compaction serialize (the blob
+  in `snapshot_upto` **plus** the WAL `Snapshot` record), `compact_wal` reuses the
+  blob for the WAL via `RaftCore::encoded_wal_image` /
+  `PersistedState::encode_snapshot_record_from_blob` (`RawValue`), so compaction
+  still serializes `Metadata` exactly **once**. The remaining inline cost — a single
+  compaction serialize on the loop — is a *bounded* stall (~50ms at ~1MB, ~120ms at
+  ~3MB) that stays under the election timeout at realistic scale and is **not**
+  self-sustaining (one stall per 64 applied entries, then the loop resumes and
+  heartbeats); moving it fully off the loop was **assessed and deferred** (mirroring
+  CP-data's apply-task split would couple the install→WAL-rewrite ordering into a
+  second task on the most safety-critical Raft — real risk for a bounded, rare,
+  extreme-scale stall). Liveness teeth: the wall-clock-timed
+  `install_snapshot.rs::large_snapshot_ships_in_o_chunk_time_not_o_state` (fix: ~ms;
+  regression: ~46s for a 1MB/1066-chunk snapshot) plus the real-thread `ProdEnv`
+  smoke test `tests/prod_liveness.rs`.
 - `CasTabletReplicas` applies only if the tablet's epoch matches, then bumps it
   — evaluated identically on every replica, so accept/reject is consistent.
 - **Automatic placement (ADR 0005).** Policies are replicated in `Metadata`
