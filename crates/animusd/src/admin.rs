@@ -947,6 +947,9 @@ fn wal_record_json(r: &WalRecordView) -> Value {
         WalRecordView::Batch { version, ops } => {
             json!({"type": "batch", "version": version, "ops": ops})
         }
+        WalRecordView::MergeBatch { ops, max_version } => {
+            json!({"type": "merge_batch", "ops": ops, "max_version": max_version})
+        }
     }
 }
 

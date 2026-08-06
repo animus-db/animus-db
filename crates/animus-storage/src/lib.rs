@@ -53,6 +53,45 @@ pub enum WriteOp {
     DeleteRange { start: Key, end: Key },
 }
 
+/// One per-key last-writer-wins merge, for [`StorageEngine::merge_batch`].
+///
+/// Unlike a [`WriteOp`] (which shares the batch's single version and enforces the
+/// engine-wide monotonic floor), each `MergeOp` carries its **own** version and
+/// applies with the same per-key LWW rule as [`merge`](StorageEngine::merge) /
+/// [`merge_tombstone`](StorageEngine::merge_tombstone): it takes effect iff its
+/// `version` is strictly greater than the key's current latest.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MergeOp {
+    /// The key to merge.
+    pub key: Key,
+    /// `Some(value)` merges a value; `None` merges a tombstone (delete).
+    pub value: Option<Value>,
+    /// The per-key LWW version this op carries.
+    pub version: Version,
+}
+
+impl MergeOp {
+    /// A value merge at `key` / `version`.
+    #[must_use]
+    pub fn put(key: impl Into<Key>, value: impl Into<Value>, version: Version) -> Self {
+        Self {
+            key: key.into(),
+            value: Some(value.into()),
+            version,
+        }
+    }
+
+    /// A tombstone merge at `key` / `version`.
+    #[must_use]
+    pub fn tombstone(key: impl Into<Key>, version: Version) -> Self {
+        Self {
+            key: key.into(),
+            value: None,
+            version,
+        }
+    }
+}
+
 /// A set of mutations applied atomically at a single `version`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct WriteBatch {
@@ -162,6 +201,34 @@ pub trait StorageEngine: Clone + Send + Sync {
     /// LWW alongside `merge`, so a value and a later tombstone (or vice versa)
     /// converge regardless of delivery order.
     async fn merge_tombstone(&self, key: &[u8], version: Version) -> Result<bool>;
+
+    /// Apply many per-key LWW merges (and tombstone-merges) under a **single
+    /// durable sync**, in order.
+    ///
+    /// Semantically identical to calling [`merge`](StorageEngine::merge) /
+    /// [`merge_tombstone`](StorageEngine::merge_tombstone) for each op in `ops`
+    /// order — each op takes effect iff its own `version` is strictly greater
+    /// than the key's current latest (accounting for earlier ops in the same
+    /// batch) — but a durable engine coalesces the whole batch into one WAL
+    /// `fsync` instead of one per op. This is the write primitive for the
+    /// leaderful-Raft apply path, which applies a run of committed commands
+    /// sequentially and would otherwise pay a full `fsync` per command.
+    ///
+    /// The default implementation simply applies each op via `merge` /
+    /// `merge_tombstone`; [`LsmEngine`] overrides it to batch the WAL sync.
+    async fn merge_batch(&self, ops: Vec<MergeOp>) -> Result<()> {
+        for op in ops {
+            match op.value {
+                Some(value) => {
+                    self.merge(&op.key, &value, op.version).await?;
+                }
+                None => {
+                    self.merge_tombstone(&op.key, op.version).await?;
+                }
+            }
+        }
+        Ok(())
+    }
 
     /// Tombstone `key` as of `version`.
     async fn delete(&self, key: &[u8], version: Version) -> Result<()>;

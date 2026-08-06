@@ -28,7 +28,7 @@
 use std::time::{Duration, Instant};
 
 use animus_env::ProdEnv;
-use animus_storage::{LsmEngine, LsmOptions, MemoryEngine, StorageEngine};
+use animus_storage::{LsmEngine, LsmOptions, MemoryEngine, MergeOp, StorageEngine};
 
 /// Workload parameters, read from the environment with defaults.
 struct Config {
@@ -230,6 +230,59 @@ where
     (tput, elapsed)
 }
 
+/// The leaderful-Raft **apply-path** write pattern: a single task applies a run of
+/// committed commands sequentially. Two variants, on fresh engines:
+///
+/// - `per_op`: one `merge` per command (one WAL `fsync` each — the old behavior);
+/// - `batched`: coalesce each run of `batch` commands into one `merge_batch` (one
+///   `fsync` per run — the fix).
+///
+/// Reports puts/s and the batch-fsync count so the coalescing is visible.
+async fn apply_path_throughput(
+    dir_tag: &str,
+    addr: std::net::SocketAddr,
+    opts: LsmOptions,
+    total: u64,
+    value_bytes: usize,
+    batch: u64,
+    batched: bool,
+) -> (f64, Duration, u64) {
+    let dir = std::env::temp_dir().join(format!(
+        "animus-bench-apply-{}-{dir_tag}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (env, _b) = ProdEnv::bind(0, addr, &dir).await.expect("bind ProdEnv");
+    let lsm = LsmEngine::open_with(env, "db-", opts).await.expect("open");
+    let start = Instant::now();
+    if batched {
+        let mut i = 0u64;
+        while i < total {
+            let n = batch.min(total - i);
+            let ops: Vec<MergeOp> = (i..i + n)
+                .map(|j| MergeOp::put(key_for(j), value_for(j, value_bytes), j + 1))
+                .collect();
+            lsm.merge_batch(ops).await.expect("merge_batch");
+            i += n;
+        }
+    } else {
+        for j in 0..total {
+            lsm.merge(&key_for(j), &value_for(j, value_bytes), j + 1)
+                .await
+                .expect("merge");
+        }
+    }
+    let elapsed = start.elapsed();
+    let tput = if elapsed.is_zero() {
+        0.0
+    } else {
+        total as f64 / elapsed.as_secs_f64()
+    };
+    let syncs = lsm.wal_batch_sync_count();
+    let _ = std::fs::remove_dir_all(&dir);
+    (tput, elapsed, syncs)
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
     let cfg = Config::from_env();
@@ -309,6 +362,49 @@ async fn main() {
         );
         let _ = std::fs::remove_dir_all(&cdir);
     }
+
+    // ---- Sequential apply-path throughput (merge vs merge_batch) ----
+    // The CP-data Raft apply loop applies a run of committed commands from ONE
+    // task. Per-op `merge` pays a full fsync each; `merge_batch` coalesces a run
+    // into a single fsync. This is the write-stall fix's target.
+    let batch = std::env::var("ANIMUS_BENCH_APPLY_BATCH")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30u64);
+    let apply_total = cfg.keys;
+    println!("\nLsmEngine sequential apply-path (batch={batch}):");
+    let (t0, e0, s0) = apply_path_throughput(
+        "perop",
+        addr,
+        opts,
+        apply_total,
+        cfg.value_bytes,
+        batch,
+        false,
+    )
+    .await;
+    println!(
+        "  per-op merge      {t0:>10.0} puts/s   batch_fsyncs={s0:<6} ({:.2}s for {apply_total})",
+        e0.as_secs_f64()
+    );
+    let (t1, e1, s1) = apply_path_throughput(
+        "batched",
+        addr,
+        opts,
+        apply_total,
+        cfg.value_bytes,
+        batch,
+        true,
+    )
+    .await;
+    println!(
+        "  merge_batch       {t1:>10.0} puts/s   batch_fsyncs={s1:<6} ({:.2}s for {apply_total})",
+        e1.as_secs_f64()
+    );
+    println!(
+        "  speedup           {:.1}x",
+        if t0 > 0.0 { t1 / t0 } else { 0.0 }
+    );
 
     // Best-effort cleanup of the temp data dir.
     let _ = std::fs::remove_dir_all(&dir);

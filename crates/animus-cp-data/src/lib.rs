@@ -43,7 +43,7 @@ use std::time::Duration;
 use animus_control::raft::{Out, RaftCore, RaftMsg, StateMachine};
 use animus_control::{PersistedState, ProposeResult};
 use animus_env::{Coresident, Env, EnvExt, NodeId};
-use animus_storage::StorageEngine;
+use animus_storage::{MergeOp, StorageEngine};
 use futures::future::{Either, select};
 use futures::lock::Mutex as AsyncMutex;
 use futures::task::AtomicWaker;
@@ -916,13 +916,25 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
     // total order, and re-applying on recovery is idempotent.
     let effects = core.lock().expect("raftkv core poisoned").drain_apply();
     did_work |= !effects.is_empty();
+    // Coalesce the WAL `fsync` for a run of plain Put/Delete commands: the apply
+    // loop is a single sequential task, so applying each command with its own
+    // `merge`/`merge_tombstone` pays one `fsync` per command (the WAL group commit
+    // only coalesces *concurrent* writers — there are none here). Accumulating the
+    // run into one `merge_batch` collapses it to a single sync. A command that must
+    // *read* committed state (`Cas`, `Split`) first drains the pending run so its
+    // read sees those writes; `NoOp` needs no drain but we keep ordering simple by
+    // leaving the run intact across it (it mutates nothing).
+    let mut pending: Vec<MergeOp> = Vec::new();
+    // Highest index processed this pass. `engine_applied` (the watermark
+    // linearizable reads gate on) advances to it ONLY after the trailing
+    // `flush_pending` below — never per-command: a Put/Delete sits un-flushed in
+    // `pending`, so advancing mid-loop would claim the engine holds an index it has
+    // not merged yet, letting a read gate open and observe past the engine.
+    let mut max_index = 0u64;
     for (index, command) in effects {
         match command {
             KvCommand::Put { key, value } => {
-                storage
-                    .merge(&key, &value, index)
-                    .await
-                    .expect("raftkv apply put");
+                pending.push(MergeOp::put(key, value, index));
             }
             KvCommand::Batch(puts) => {
                 // Every key in the batch merges at this one entry's `index` (the
@@ -939,16 +951,16 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 }
             }
             KvCommand::Delete { key } => {
-                storage
-                    .merge_tombstone(&key, index)
-                    .await
-                    .expect("raftkv apply delete");
+                pending.push(MergeOp::tombstone(key, index));
             }
             KvCommand::Cas {
                 key,
                 expected,
                 value,
             } => {
+                // Drain the pending run so the CAS read observes every earlier
+                // committed write in this apply pass.
+                flush_pending(storage, &mut pending).await;
                 // Read the key's *current committed* value (the latest applied,
                 // since we apply in commit order and earlier entries in this batch
                 // already merged above) and compare to `expected`. Equal → swap;
@@ -977,6 +989,9 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                     .insert(index, swapped);
             }
             KvCommand::Split { at } => {
+                // Drain the pending run so the handoff capture below sees every
+                // earlier committed write in this apply pass.
+                flush_pending(storage, &mut pending).await;
                 // Capture the handed-off range `[at, ∞)` from this replica's
                 // committed state. Every replica applies the same `Split` at the
                 // same point in the command order, so the captured handoff is
@@ -990,20 +1005,27 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                     hook(at.clone(), handoff.clone());
                 }
                 // The handed-off range now belongs to the new tablet, so tombstone
-                // it here — consistently on every replica.
-                for (key, _) in &handoff {
-                    storage
-                        .merge_tombstone(key, index)
-                        .await
-                        .expect("raftkv apply split tombstone");
-                }
+                // it here — consistently on every replica — under a single sync.
+                let tombstones: Vec<MergeOp> = handoff
+                    .iter()
+                    .map(|(key, _)| MergeOp::tombstone(key.clone(), index))
+                    .collect();
+                storage
+                    .merge_batch(tombstones)
+                    .await
+                    .expect("raftkv apply split tombstones");
             }
             KvCommand::NoOp => {}
         }
-        // The engine now reflects `index`; publish it *after* the merge so
-        // linearizable reads (which gate on `engine_applied`) never observe past
-        // the engine, and compaction snapshots only up to a merged index.
-        engine_applied.fetch_max(index, Ordering::SeqCst);
+        max_index = index; // ascending; watermark advances after the final flush
+    }
+    // Apply any trailing Put/Delete run under one final sync. Only now does the
+    // engine reflect every index in this pass.
+    flush_pending(storage, &mut pending).await;
+    // Publish the watermark: the engine now holds all effects through `max_index`,
+    // so linearizable reads may serve up to it and compaction may snapshot up to it.
+    if max_index > 0 {
+        engine_applied.fetch_max(max_index, Ordering::SeqCst);
     }
 
     // Compact once the *engine* has merged enough past the snapshot base: snapshot
@@ -1065,6 +1087,18 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
     }
 
     did_work
+}
+
+/// Apply and clear an accumulated run of per-key LWW merges under a single WAL
+/// `fsync` (see the apply loop). A no-op when the run is empty.
+async fn flush_pending<S: StorageEngine>(storage: &S, pending: &mut Vec<MergeOp>) {
+    if pending.is_empty() {
+        return;
+    }
+    storage
+        .merge_batch(std::mem::take(pending))
+        .await
+        .expect("raftkv apply merge batch");
 }
 
 /// The engine's live `(key, value)` pairs with `key >= at` — the data handed off
