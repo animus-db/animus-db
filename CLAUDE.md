@@ -418,6 +418,22 @@ cross-cutting ones. Prune/merge entries that become obsolete.
   harness to flip it on. Corollary of "SimEnv proves logic, not real-thread
   liveness" — but also a warning to CHECK the harness shape before assuming a
   feature can default on. (PR #32.)
+- **Extracting a "pure decision" from a method that intentionally short-circuits
+  an expensive call must preserve that laziness explicitly, or the refactor
+  silently becomes a hot-path perf regression.** `resolve_cp_route` avoided
+  `RaftNode::metadata()`'s full deep-clone on the common "local leader" /
+  "known hint" paths by checking cheap facts first; pulling the branching out
+  as a pure `decide_cp_route` function required the wrapper to keep gathering
+  metadata-derived facts lazily (only in the one branch that needs them)
+  rather than eagerly computing everything before calling the pure function.
+  When extracting logic mechanically, check what expensive input the original
+  short-circuited around, not just what it decided. (PR #33.)
+- **Before extracting a flagged "untested pure function," check whether it's
+  already a thin call-through to a pure/tested implementation elsewhere.**
+  `next_free_tablet_id` looked like animusd's problem (the audit flagged the
+  *caller*, `trigger_split`) but the allocator itself was already pure and
+  unit-tested in `animus-control::Metadata` — nothing to extract, just a
+  caller that wasn't using it (fixed separately in PR #21). (PR #33.)
 - **A fault-schedule runner that heals immediately after the last fault gives
   single-fault scenarios a zero-length outage — give scenarios an explicit fault
   window.** The raftkv corpus healed partitions the instant the last fault landed,
