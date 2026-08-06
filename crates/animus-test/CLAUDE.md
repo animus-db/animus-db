@@ -88,11 +88,32 @@ The Accord-targeted suite exercises `check_cycles` under contention:
   so all three checks run on this one layer. Convergence + durability are still
   *eventual* (a lagging follower catches up via log/snapshot), so they use the same
   **converged-or-timeout** poll as the Accord runner.
-- Frozen, name-seeded scenario set (baselines + leader-kill / follower-kill /
-  partition-leader / lossy × early/mid/late × 3- and 5-replica) with a single depth
-  knob **`ANIMUS_RAFTKV_SEEDS`** (default 1 = byte-identical frozen set; held green
-  at depth 20 / 360 scenarios). The teeth-proof is the shared `negative_control.rs`
-  (same `check_cycles`).
+- Frozen, name-seeded scenario set (29 cells): baselines + leader-kill /
+  follower-kill / partition-leader / lossy × early/mid/late × 3- and 5-replica,
+  **plus the deepened tier** mirroring the Accord fault matrix — `stop_restart`
+  (a true process restart: `sim.stop` + a fresh `RaftKvNode::start` on the same
+  id, recovering from the durable WAL — the CP recovery path), `split_brain`
+  (full-mesh partition, no majority anywhere), `leader_minority` (5-replica:
+  leader isolated *with* a minority — the stale-read window), and compound
+  `lossy`+`stop_restart`. Deepened cells carry a non-zero `Scenario::window`
+  (the runner holds the fault open before healing, so the group rides out a real
+  outage); the original cells keep `window == 0` and their runs are
+  **byte-identical** to the pre-deepening corpus (verified against captured
+  histories when the tier landed). Depth knob **`ANIMUS_RAFTKV_SEEDS`** (default
+  1 = byte-identical frozen set; held green at depth 20 / 580 scenarios). A
+  structural `raftkv_corpus_covers_the_fault_matrix` guard keeps the matrix
+  honest. The teeth-proof is the shared `negative_control.rs` (same
+  `check_cycles`).
+- **Engine tiers:** the corpus runs on `MemoryEngine` (always-on) and on
+  **`LsmEngine<SimEnv>`** — the durable path (real WAL/SSTable recovery through
+  the deterministic disk seam) that production actually runs; no corpus drove it
+  under faults before. A 4-scenario representative LSM subset (baseline, a kill,
+  the WAL-recovering `stop_restart`, the compound) runs by default;
+  **`ANIMUS_RAFTKV_LSM=1`** runs the *whole* corpus over the LSM engine
+  (composable with `ANIMUS_RAFTKV_SEEDS`; held green at ×10 / 290 scenarios).
+  A `StopRestart` on this tier re-opens the engine via `LsmEngine::open_with`
+  on the same per-node prefix — engine recovery *plus* Raft-WAL re-apply
+  (idempotent).
 
 ### Scaling coverage: the two env knobs + the topology split (ADR 0014)
 
