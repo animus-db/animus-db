@@ -443,6 +443,60 @@ async fn cluster_grows_from_three_to_five_and_rebalances() {
         await_value(&all_clients, table, b"k1", b"v1", 30).await;
     }
 
+    // 9. ADR 0032 PR1: a client connected only to an ORIGINAL node can read/write
+    // a key whose tablet leader now lives on a GROWN node. Before this PR,
+    // `client_route` on the original 3 was a static, process-start-only
+    // snapshot that never learned a grown node's address (the ADR 0030
+    // documented residual gap) — a write landing on an original node for a
+    // tablet whose leader rebalancing just moved onto node 303/304 would have
+    // no forward target at all. Now every node's `route_sync_loop` overlays
+    // `Metadata.node_addrs[*].client` (populated by each node's own
+    // `RegisterNodeAddrs` self-registration) onto its `client_route`, so this
+    // must work with **`base_clients` only** — no grown node's own address in
+    // the client list. By this point in the test (post-rebalance, step 7) at
+    // least one table's tablet leader has migrated onto a grown node, so this
+    // exercises the forward path, not just the local-serve path. A generous
+    // timeout tolerates `route_sync_loop`'s `PEER_SYNC_INTERVAL` (200ms) cadence
+    // plus the write's own propose/commit + relay hops.
+    for table in TABLES {
+        put(&base_clients, table, b"k2", b"v2", 30).await;
+        await_value(&base_clients, table, b"k2", b"v2", 30).await;
+    }
+
+    // 10. `/admin/peers` on an original node eventually lists the grown nodes'
+    // admin addresses too (ADR 0032 PR1 closes the same gap for the dashboard's
+    // fan-out seed, `admin.rs::peers_view`'s union of the static `admin_addrs`
+    // with the replicated `Metadata.node_addrs[*].admin`).
+    let peers_include_grown = async {
+        loop {
+            let (status, body) = admin(base_admin[0], "GET", "/admin/peers", None).await;
+            if status == 200 {
+                let listed: Vec<String> = body["admin_addrs"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_owned)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let all_present = expanded_config
+                    .nodes
+                    .iter()
+                    .all(|n| listed.contains(&n.admin.to_string()));
+                if all_present {
+                    return;
+                }
+            }
+            sleep(Duration::from_millis(200)).await;
+        }
+    };
+    timeout(Duration::from_secs(20), peers_include_grown)
+        .await
+        .unwrap_or_else(|_| {
+            panic!("an original node's /admin/peers never listed the grown nodes' admin addrs")
+        });
+
     for node in nodes {
         node.shutdown();
     }

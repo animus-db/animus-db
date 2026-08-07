@@ -38,6 +38,22 @@ pub struct Member {
     pub status: NodeStatus,
 }
 
+/// A member's full address book (ADR 0032 PR1): every listen address a node
+/// exposes, replicated so any node can forward/relay to any other regardless
+/// of when it joined. Keyed by the member's **raftkv** id in
+/// [`Metadata::node_addrs`] — the same id space as [`Metadata::cp_member_addrs`]
+/// (which this supersedes for the client/admin axes; `cp_member_addrs` is kept
+/// for WAL back-compat and the internal raftkv peer book).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeAddrs {
+    /// The internal `raftkv` (per-tablet CP Raft) listen address.
+    pub raftkv: String,
+    /// The plain client-protocol listen address.
+    pub client: String,
+    /// The admin/debug HTTP listen address.
+    pub admin: String,
+}
+
 /// The replicated control-plane state: membership and the (single-table) tablet
 /// map.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,6 +114,17 @@ pub struct Metadata {
     /// snapshot still allocates above its tablets.
     #[serde(default)]
     pub next_tablet_id: u64,
+    /// Replicated **node address book** (ADR 0032 PR1): every member's full
+    /// address set (raftkv/client/admin), keyed by its raftkv id. Mutated only
+    /// through [`MetaCommand::RegisterNodeAddrs`]. Unlike [`Metadata::cp_member_addrs`]
+    /// (internal raftkv addresses only, including transient split-sibling/CP-group
+    /// member ids that are never full cluster members), this is populated once per
+    /// **node** at startup, closing the ADR 0030 gap where a pre-growth node's
+    /// `client_route`/admin peer list was a static, process-start-only snapshot
+    /// that could never learn about a node grown in afterward. `#[serde(default)]`
+    /// keeps pre-ADR-0032 snapshots loading (empty map).
+    #[serde(default)]
+    pub node_addrs: BTreeMap<NodeId, NodeAddrs>,
 }
 
 /// A mutation of [`Metadata`], replicated through Raft and applied in log order.
@@ -240,6 +267,14 @@ pub enum MetaCommand {
         #[serde(default)]
         tablet: Option<TabletId>,
     },
+    /// Register (or update) a **node's full address book** (ADR 0032 PR1): the
+    /// client/admin/raftkv listen addresses of member `id`, stored in
+    /// [`Metadata::node_addrs`]. Idempotent: a no-op if `id` already maps to an
+    /// identical [`NodeAddrs`]. Superset of [`MetaCommand::RegisterCpAddr`] for
+    /// the client/admin axes — every node proposes this once at startup so any
+    /// other node (including one that joined earlier and never restarted) can
+    /// resolve it as a forward/relay target.
+    RegisterNodeAddrs { node: NodeId, addrs: NodeAddrs },
 }
 
 /// The deterministic result of applying a [`MetaCommand`].
@@ -693,6 +728,14 @@ impl Metadata {
                     ApplyOutcome::Applied
                 }
             }
+            MetaCommand::RegisterNodeAddrs { node, addrs } => {
+                if self.node_addrs.get(node) == Some(addrs) {
+                    ApplyOutcome::NoOp
+                } else {
+                    self.node_addrs.insert(*node, addrs.clone());
+                    ApplyOutcome::Applied
+                }
+            }
         }
     }
 
@@ -915,6 +958,75 @@ mod tests {
         // A distinct member coexists.
         assert_eq!(m.apply(&reg(401, "127.0.0.1:9101")), ApplyOutcome::Applied);
         assert_eq!(m.cp_member_addrs.len(), 2);
+    }
+
+    /// `RegisterNodeAddrs` (ADR 0032 PR1) records a node's full address book,
+    /// is idempotent on an identical re-register, and overwrites on a real
+    /// change — mirroring `RegisterCpAddr`'s own contract.
+    #[test]
+    fn register_node_addrs_records_updates_and_is_idempotent() {
+        let mut m = Metadata::default();
+        let addrs = |suffix: u16| NodeAddrs {
+            raftkv: format!("127.0.0.1:{}", 9300 + suffix),
+            client: format!("127.0.0.1:{}", 9000 + suffix),
+            admin: format!("127.0.0.1:{}", 9500 + suffix),
+        };
+
+        // First registration applies and is readable.
+        assert_eq!(
+            m.apply(&MetaCommand::RegisterNodeAddrs {
+                node: 300,
+                addrs: addrs(0),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(m.node_addrs.get(&300), Some(&addrs(0)));
+
+        // Re-registering an identical address book is a no-op.
+        assert_eq!(
+            m.apply(&MetaCommand::RegisterNodeAddrs {
+                node: 300,
+                addrs: addrs(0),
+            }),
+            ApplyOutcome::NoOp
+        );
+
+        // A changed address book overwrites the entry.
+        assert_eq!(
+            m.apply(&MetaCommand::RegisterNodeAddrs {
+                node: 300,
+                addrs: addrs(1),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(m.node_addrs.get(&300), Some(&addrs(1)));
+
+        // A distinct member coexists.
+        assert_eq!(
+            m.apply(&MetaCommand::RegisterNodeAddrs {
+                node: 301,
+                addrs: addrs(2),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(m.node_addrs.len(), 2);
+    }
+
+    /// A `Metadata` snapshot serialized before ADR 0032 (no `node_addrs` field
+    /// in the JSON) still decodes, defaulting to an empty map — the same
+    /// `#[serde(default)]` back-compat contract every other additive field on
+    /// `Metadata` already carries.
+    #[test]
+    fn metadata_without_node_addrs_field_still_decodes() {
+        let m = Metadata::default();
+        let mut value = serde_json::to_value(&m).expect("metadata serializes");
+        value
+            .as_object_mut()
+            .expect("metadata is a JSON object")
+            .remove("node_addrs");
+        let decoded: Metadata =
+            serde_json::from_value(value).expect("metadata without node_addrs still decodes");
+        assert!(decoded.node_addrs.is_empty());
     }
 
     /// ADR 0024 address GC: a tablet-scoped `RegisterCpAddr` entry is pruned from
