@@ -197,6 +197,33 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   **Automatic (size-based) merge triggering is explicitly out of scope** —
   operator-driven only, matching `auto_split_loop`'s absence of a symmetric
   auto-merge counterpart for this increment.
+- **Every client-facing CP read runs the read-side scope pre-check +
+  served/absent disambiguation (`cp_get_local`/`cp_scan_local`, ADR 0033) —
+  the read dual of the ADR 0028 write fence bullet below.** Found by
+  `tests/tablet_merge.rs` flaking ~1-in-5 in isolation (a flaky `ProdEnv`
+  test is a real bug): a linearizable get through the merge survivor
+  answered a definitive `Value(None)` for an acked pre-merge write. Two
+  distinct false-"absent" channels were closed on the read path (the third,
+  primary fix — the absorb drain — lives in `animus-cp-data`, see its
+  `CLAUDE.md`): (1) a get/scan resolving to a group whose live
+  `scope_range()` does not contain the requested key/window (routing raced a
+  merge's widen or a split's narrow) now errors retryably instead of
+  serving — for scans this also closes a **silent truncation**, since
+  `linearizable_scan` filters rows through the live scope and an un-widened
+  survivor would return partial results with no error at all; (2) a
+  ReadIndex barrier failure (deposed/mid-election leader) is no longer
+  collapsed into "absent" — the forwarded `Get` arm used to do exactly that
+  (`ClientResponse::Value(leader.linearizable_get(..))`) while the `Scan`
+  arm already errored; both now go through the shared helpers, and the
+  collapsed `linearizable_get` has **no `CpGroup` wrapper at all** so the
+  unsafe shape can't be reached in this crate
+  (`RaftKvNode::linearizable_get_served` is the disambiguated primitive).
+  `cp_read`/`cp_scan_one` retry the `"; retry"`-class errors internally with
+  re-resolved routing (bounded by `CLIENT_TIMEOUT`), so the client-visible
+  contract is unchanged — a read during a split/merge crossover waits
+  instead of erroring or lying. The in-crate `split_fence_tests` regression
+  drives both duals (get + scan) directly against a narrowed parent's
+  handle, mirroring the write-side test in the same module.
 - **Every CP write path stamps + pre-checks the ADR 0028 write fence** (fixed
   2026-08-07 — the fences existed and were unit-tested in `animus-cp-data`
   since the split redesign, but had zero real callers here: `cp_put_local`/

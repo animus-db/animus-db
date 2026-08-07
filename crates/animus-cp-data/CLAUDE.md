@@ -457,6 +457,37 @@ lifecycle's invariants and is directly `SimEnv`-testable:
   call and the `erase_scope()` call `Release`/`Reclaim` perform — only the
   driver stops and its own WAL file is removed; the tablet's physical keys are
   untouched, now served through the survivor's widened scope.
+- **An `Absorb` teardown DRAINS the group before halting, and `plan` defers
+  every `WidenScope` while an absorb is pending — both load-bearing (ADR
+  0033 post-merge hardening; the 1-in-5 `ProdEnv` flake in `animusd`'s
+  `tablet_merge.rs` was a real, permanent false-"absent").** The apply task
+  exits on `shutdown()` at its next loop-top check **without draining
+  committed-but-unapplied entries**, and the teardown then deletes the
+  group's Raft WAL — the only local copy — which is harmless for
+  `Release`/`Reclaim` (they erase the data anyway) but fatal for `Absorb`:
+  the absorbed range is about to be *served* from this very engine through
+  the survivor's widened scope, so an acked write still in the commit
+  pipeline on this replica (commit-index propagation is up to one heartbeat
+  behind; the reconciler's watch fires on the merge commit within ms)
+  silently never reaches the engine, permanently. The drain
+  (`ABSORB_DRAIN_TIMEOUT`) waits — while the driver is still live — for the
+  replica's own commit to cover its full local log and the engine-applied
+  watermark to cover that commit; on timeout with engine ≥ local-commit it
+  proceeds with a loud warning (documented residual: a tail whose
+  commit-propagation lost the race to the leader's own teardown — retained
+  by the replicas that drained), else re-registers and retries next tick.
+  The widen deferral (`plan`'s `absorbing` gate: any `state.hosted ∩
+  view.merged` tablet defers every `WidenScope`) is what sequences
+  drain-before-widen across the two otherwise-independent actions.
+  Deterministic regression: the `merge_widens_survivor_and_absorbs_sibling_
+  unerased` corpus scenario writes through the absorbed group and ticks the
+  merge view with zero intervening sim time (the apply task provably hasn't
+  run), then asserts the write survives — fails deterministically without
+  the drain. Unit: `widen_is_deferred_while_the_absorbed_sibling_is_still_
+  hosted`. The read-side halves of the same fix (`linearizable_get_served`'s
+  served/absent disambiguation; `animusd`'s `cp_get_local`/`cp_scan_local`
+  scope pre-checks) live in this crate's `RaftKvNode` + `animusd` — see
+  `animusd/CLAUDE.md` and ADR 0033.
 - **`plan` never removes a tablet from `LocalState::hosted` on its own** when
   emitting `Reclaim`/`Release` — real teardown is async and can time out
   (mirroring the pre-PR4 `animusd::cp_gc_tablet`'s conditional
@@ -533,7 +564,11 @@ guards.
      premise — a wider metadata range is always erroneous — stopped being
      true once merge became a real feature; this cell now drives the
      positive case, asserting the widen actually happens and the
-     absorbed sibling's data survives unerased)
+     absorbed sibling's data survives unerased — **including a write
+     proposed through the absorbed group with ZERO sim time before the
+     merge view ticks**, the deterministic absorb-drain regression: the
+     apply task provably hasn't merged it yet when the teardown begins, so
+     pre-drain-fix the acked write was permanently lost)
   10. `idempotent_tick_on_converged_multi_tablet_state`
   11. `reconfigure_transfers_leadership_before_removing_the_leader`
   12. `crash_restart_single_replica_upgrades_via_has_data`

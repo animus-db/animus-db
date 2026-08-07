@@ -244,16 +244,12 @@ pub fn tablets_to_release(
 
 /// Whether `inner` is fully contained within `outer` (`inner ⊆ outer`) —
 /// the narrow-only precondition [`HostAction::NarrowScope`] must satisfy
-/// (never a widen).
+/// (never a widen), and — with the operands swapped — the widen-only
+/// precondition of [`HostAction::WidenScope`]. Delegates to
+/// [`KeyRange::contains_range`] (the shared primitive `animusd`'s read-path
+/// scope pre-check uses too, ADR 0033).
 fn is_subrange(inner: &KeyRange, outer: &KeyRange) -> bool {
-    if inner.start < outer.start {
-        return false;
-    }
-    match (&inner.end, &outer.end) {
-        (_, None) => true,
-        (None, Some(_)) => false,
-        (Some(inner_end), Some(outer_end)) => inner_end <= outer_end,
-    }
+    outer.contains_range(inner)
 }
 
 /// One reconciling action [`plan`] can emit for a single tablet. A caller
@@ -406,6 +402,20 @@ pub fn plan(
     let mut next = state.clone();
     let mut actions = Vec::new();
 
+    // ADR 0033: defer every `WidenScope` while this node still hosts a
+    // merged-away tablet (present in `state.hosted` ∩ `view.merged`) — i.e.
+    // while an `Absorb` teardown has not yet confirmed. The absorb's teardown
+    // is what *drains* the absorbed group's committed writes into this node's
+    // shared engine (see `Reconciler::teardown`'s Absorb arm); widening the
+    // survivor's scope before that drain completes would let the survivor's
+    // leader serve reads for the absorbed range from an engine that may not
+    // yet hold all of its acked data. Coarse (any pending absorb defers every
+    // widen, not just the one absorbing into this survivor — the planner has
+    // no reliable absorbed→survivor association once the absorbed tablet is
+    // gone from `view.tablets`) but sound, deterministic, and merges are rare
+    // operator actions: the deferral costs one reconcile tick.
+    let absorbing = state.hosted.iter().any(|t| view.merged.contains(t));
+
     // --- Phase 1: narrow an already-hosted tablet's scope, or host a
     // newly-placed one. `to_host` batches the Host actions so every
     // NarrowScope precedes every Host in the returned order, even though
@@ -425,11 +435,13 @@ pub fn plan(
                                     tablet,
                                     range: t.range.clone(),
                                 });
-                            } else if is_subrange(current, &t.range) {
+                            } else if !absorbing && is_subrange(current, &t.range) {
                                 // ADR 0033: this tablet was the surviving
                                 // (`left`) side of a merge — its metadata
                                 // range grew to cover the absorbed sibling's
                                 // range, already present on the shared engine.
+                                // Only once no absorb is pending locally (see
+                                // `absorbing` above): drain before widen.
                                 actions.push(HostAction::WidenScope {
                                     tablet,
                                     range: t.range.clone(),
@@ -584,6 +596,20 @@ pub const RECLAIM_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often [`Reconciler::tick`] polls [`RaftKvNode::is_stopped`] while
 /// waiting out [`RECLAIM_STOP_TIMEOUT`].
 const RECLAIM_STOP_POLL: Duration = Duration::from_millis(50);
+
+/// How long an [`HostAction::Absorb`] teardown waits for the absorbed group's
+/// **local drain** — its own commit index covering its full local log, and its
+/// engine-applied watermark covering that commit — before the fallback path
+/// (ADR 0033). Generous enough to span a leader loss + re-election inside the
+/// dissolving group (which is what re-advances a follower's commit over its
+/// tail if the old leader's own teardown won the race). See
+/// [`Reconciler::teardown`]'s Absorb arm for the exact contract and the
+/// documented residual on timeout.
+pub const ABSORB_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How often the Absorb drain re-checks its condition while waiting out
+/// [`ABSORB_DRAIN_TIMEOUT`].
+const ABSORB_DRAIN_POLL: Duration = Duration::from_millis(20);
 
 /// The execute half of the per-node tablet-host reconciler (ADR 0031 PR4):
 /// owns every [`RaftKvNode`] this node hosts and drives it through [`plan`] on
@@ -831,10 +857,64 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
     /// driver to stop re-registers the handle (so routing keeps working) and
     /// leaves `state`/`hosted` untouched — `plan` re-emits the identical
     /// action next tick.
+    ///
+    /// **An `Absorb` teardown first DRAINS the group while its driver is still
+    /// live** (ADR 0033): waits, bounded by [`ABSORB_DRAIN_TIMEOUT`], for this
+    /// replica's own commit index to cover its full local log and for the
+    /// engine-applied watermark to cover that commit — because unlike
+    /// `Release`/`Reclaim` (whose teardowns erase the data anyway), an
+    /// absorbed tablet's data is about to be **served** through the merge
+    /// survivor's widened scope from this very engine. The apply task exits on
+    /// `shutdown()` *without* draining committed-but-unapplied entries, and
+    /// this teardown then deletes the group's Raft WAL — the only local copy
+    /// of those entries — so skipping the drain silently and permanently loses
+    /// acked writes on this node (the observed ADR 0033 regression: a write
+    /// acked by the absorbed group's leader right before the merge, not yet
+    /// engine-applied on the follower that hosts the survivor's leader, read
+    /// back as a definitive "absent"). On a drain timeout: if the engine has
+    /// at least caught up to the *locally known* commit, proceed with a loud
+    /// warning (the residual — entries this replica never learned were
+    /// committed because the leader's own teardown won the race — is bounded
+    /// and documented in ADR 0033; the data still lives in the engines of the
+    /// replicas that did drain); if even that hasn't caught up (apply stuck),
+    /// re-register and retry next tick like every other teardown failure.
     async fn teardown(&mut self, tablet: TabletId, kind: TeardownKind) {
         let Some(node) = self.hosted.remove(&tablet) else {
             return;
         };
+        if matches!(kind, TeardownKind::Absorb) {
+            let deadline = self.env.now().saturating_add(ABSORB_DRAIN_TIMEOUT);
+            let fully_drained = |node: &RaftKvNode<E, S>| {
+                let commit = node.commit_index();
+                let log_end = node.snapshot_index() + node.log_len() as u64;
+                commit >= log_end && node.engine_applied_index() >= commit
+            };
+            loop {
+                if fully_drained(&node) {
+                    break;
+                }
+                if self.env.now() >= deadline {
+                    if node.engine_applied_index() >= node.commit_index() {
+                        // Residual accepted with a loud signal — see doc above.
+                        tracing::warn!(
+                            tablet = tablet.0,
+                            "reconciler: absorb drain timed out with an uncommitted local \
+                             log tail; proceeding (entries committed elsewhere are retained \
+                             by the replicas that drained)"
+                        );
+                        break;
+                    }
+                    tracing::warn!(
+                        tablet = tablet.0,
+                        "reconciler: absorb drain did not catch the engine up to the \
+                         local commit in time; retrying next tick"
+                    );
+                    self.hosted.insert(tablet, node);
+                    return;
+                }
+                self.env.sleep(ABSORB_DRAIN_POLL).await;
+            }
+        }
         (self.on_teardown)(tablet);
         node.shutdown();
         let deadline = self.env.now().saturating_add(RECLAIM_STOP_TIMEOUT);
@@ -1201,6 +1281,59 @@ mod tests {
         let (actions, _next) = plan(&v, &facts, &state, BASE);
         assert_eq!(
             actions,
+            vec![HostAction::WidenScope {
+                tablet: TabletId(1),
+                range: KeyRange::new(b"a".to_vec(), Some(b"z".to_vec())),
+            }]
+        );
+    }
+
+    #[test]
+    fn widen_is_deferred_while_the_absorbed_sibling_is_still_hosted() {
+        // ADR 0033 drain-before-widen: this node still hosts the merged-away
+        // tablet 2 (its Absorb teardown has not yet confirmed), so the
+        // survivor's widen must be deferred — the absorb's local drain is what
+        // guarantees the absorbed range's acked data is actually in this
+        // node's engine before the survivor starts serving it.
+        let v = view_with_merged(
+            [(1, tablet_for_table(1, "t", b"a", Some(b"z"), vec![BASE]))],
+            [2],
+        );
+        let mut state = LocalState::default();
+        state.hosted.insert(TabletId(1));
+        state.hosted.insert(TabletId(2)); // absorb pending
+        let facts: BTreeMap<TabletId, TabletFacts> = [(
+            TabletId(1),
+            TabletFacts {
+                hosted: true,
+                scope_range: Some(KeyRange::new(b"a".to_vec(), Some(b"m".to_vec()))),
+                ..Default::default()
+            },
+        )]
+        .into_iter()
+        .collect();
+
+        let (actions, next) = plan(&v, &facts, &state, BASE);
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, HostAction::WidenScope { .. })),
+            "widen must be deferred while the absorb is pending: {actions:?}"
+        );
+        assert!(
+            actions.contains(&HostAction::Absorb {
+                tablet: TabletId(2)
+            }),
+            "the pending absorb itself is still planned: {actions:?}"
+        );
+
+        // Once the absorb confirms (tablet 2 leaves `hosted`), the very next
+        // plan call emits the widen.
+        let mut confirmed = next;
+        confirmed.confirm_torn_down(TabletId(2));
+        let (actions2, _next2) = plan(&v, &facts, &confirmed, BASE);
+        assert_eq!(
+            actions2,
             vec![HostAction::WidenScope {
                 tablet: TabletId(1),
                 range: KeyRange::new(b"a".to_vec(), Some(b"z".to_vec())),

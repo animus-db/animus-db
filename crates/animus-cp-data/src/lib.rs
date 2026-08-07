@@ -1057,8 +1057,25 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// stale value: a deposed leader cannot collect a quorum ack (a newer leader
     /// requires a quorum at a higher term, which would reject the probe).
     pub async fn linearizable_get(&self, key: &[u8]) -> Option<Vec<u8>> {
+        self.linearizable_get_served(key).await.flatten()
+    }
+
+    /// [`linearizable_get`](Self::linearizable_get) with the two `None` causes
+    /// **disambiguated**: the outer `Option` is "was this read actually served"
+    /// (`None` = the read barrier failed — not/no-longer the leader, or the
+    /// quorum probe timed out — so nothing can be concluded about the key at
+    /// all); the inner `Option` is the served answer (`Some(None)` = the key is
+    /// genuinely absent). A caller that reports "absent" to a client **must**
+    /// use this variant and treat the outer `None` as a retryable
+    /// routing/leadership error, never as absence — collapsing the two (as the
+    /// plain `linearizable_get` does for callers that only ever poll for a
+    /// known-written value) turns a transient barrier failure into a false
+    /// "key absent," indistinguishable from data loss from the outside (ADR
+    /// 0033 read-path fix; the exact failure shape the root `CLAUDE.md`'s ADR
+    /// 0029 read-barrier entry describes).
+    pub async fn linearizable_get_served(&self, key: &[u8]) -> Option<Option<Vec<u8>>> {
         if self.read_barrier().await {
-            self.local_get(key).await
+            Some(self.local_get(key).await)
         } else {
             None
         }

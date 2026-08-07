@@ -1063,11 +1063,27 @@ fn scenario_merge_widens_and_absorbs(seed: u64) {
         }
         env.sleep(Duration::from_secs(1)).await;
 
+        // One more write through the absorbed group, followed by the merge
+        // view with ZERO intervening sim time — the deterministic ADR 0033
+        // drain regression: the entry is proposed (and, for a sole voter,
+        // committed) but the async apply task has NOT yet merged it into the
+        // shared engine when the Absorb teardown begins. Pre-fix, `shutdown()`
+        // killed the apply task at its next loop-top check without draining,
+        // then deleted the group's Raft WAL — the only local copy — so the
+        // acked write silently never reached the engine and read back as a
+        // definitive "absent" through the widened survivor (the exact 1-in-5
+        // `ProdEnv` flake `animusd/tests/tablet_merge.rs` caught, reproduced
+        // here deterministically). The fix drains the group (commit covers the
+        // local log, engine-applied covers commit) before halting.
+        h2.put(b"zlast".to_vec(), b"hi-last".to_vec());
+
         // The merge commits: tablet 1 (`left`) widens to cover the whole
         // range, tablet 2 (`right`) vanishes from the map and is recorded as
         // merged-away — the exact `Metadata` shape `MergeTablets`'s apply
-        // produces.
+        // produces. The widen is deferred one tick behind the absorb
+        // (drain-before-widen, ADR 0033), so tick twice.
         let v2 = view_with_merged([tablet(1, b"", None, vec![A])], [2]);
+        c.tick(A, &v2).await;
         c.tick(A, &v2).await;
         env.sleep(Duration::from_secs(1)).await;
 
@@ -1075,6 +1091,12 @@ fn scenario_merge_widens_and_absorbs(seed: u64) {
             h1.scope_range(),
             KeyRange::whole(),
             "the survivor must widen to cover the absorbed sibling's range"
+        );
+        assert_eq!(
+            h1.local_get(b"zlast").await,
+            Some(b"hi-last".to_vec()),
+            "a write acked by the absorbed group right before the merge must be \
+             drained into the engine before its group (and Raft WAL) are torn down"
         );
         for i in 0..5u64 {
             assert_eq!(

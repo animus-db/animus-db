@@ -10,8 +10,11 @@ used by both planes; no behavior of its own beyond range/epoch helpers.
 ## Entry points
 
 - `TabletId`, `Epoch` (`INITIAL`, `next()`), `KeyRange`, `Tablet`.
-- `KeyRange`: `whole()`, `contains`, `split_at` (strictly-inside split into two
-  half-open ranges), `abuts` (contiguity test — the primitives behind split/merge).
+- `KeyRange`: `whole()`, `contains`, `contains_range` (subset containment —
+  the shared primitive behind the reconciler's narrow-only/widen-only checks
+  and `animusd`'s read-path scope pre-checks, ADR 0031/0033), `split_at`
+  (strictly-inside split into two half-open ranges), `abuts` (contiguity test
+  — the primitives behind split/merge).
 - `Tablet::new` normalizes (sorts/dedups) the replica set.
 
 ## What's non-obvious

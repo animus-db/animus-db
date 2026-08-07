@@ -216,6 +216,23 @@ impl KeyRange {
         key >= self.start.as_slice() && self.end.as_deref().is_none_or(|e| key < e)
     }
 
+    /// Whether `other` is fully contained within this range (`other ⊆ self`).
+    /// The range-level counterpart of [`contains`](Self::contains) — used by
+    /// the tablet-host reconciler's narrow-only/widen-only checks (ADR 0031/
+    /// 0033) and by read-path scope pre-checks (a scan whose requested bounds
+    /// exceed a group's live scope must be retried, not silently truncated).
+    #[must_use]
+    pub fn contains_range(&self, other: &KeyRange) -> bool {
+        if other.start < self.start {
+            return false;
+        }
+        match (&other.end, &self.end) {
+            (_, None) => true,
+            (None, Some(_)) => false,
+            (Some(inner_end), Some(outer_end)) => inner_end <= outer_end,
+        }
+    }
+
     /// Split into `[start, at)` and `[at, end)`. Returns `None` unless `at` lies
     /// strictly inside the range (`start < at < end`), so neither side is empty.
     #[must_use]
@@ -357,6 +374,26 @@ mod tests {
         assert!(r.contains(b"b"));
         assert!(r.contains(b"c"));
         assert!(!r.contains(b"d"));
+    }
+
+    #[test]
+    fn contains_range_is_subset_containment() {
+        let whole = KeyRange::whole();
+        let bd = KeyRange::new(b"b".to_vec(), Some(b"d".to_vec()));
+        let bc = KeyRange::new(b"b".to_vec(), Some(b"c".to_vec()));
+        let cz = KeyRange::new(b"c".to_vec(), None);
+        assert!(whole.contains_range(&bd));
+        assert!(whole.contains_range(&whole));
+        assert!(bd.contains_range(&bc));
+        assert!(bd.contains_range(&bd));
+        assert!(!bd.contains_range(&whole));
+        assert!(
+            !bd.contains_range(&cz),
+            "unbounded end exceeds a bounded one"
+        );
+        assert!(!bc.contains_range(&bd), "longer end is not contained");
+        assert!(cz.contains_range(&KeyRange::new(b"d".to_vec(), None)));
+        assert!(!cz.contains_range(&KeyRange::new(b"a".to_vec(), Some(b"d".to_vec()))));
     }
 
     #[test]

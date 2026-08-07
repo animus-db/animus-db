@@ -104,6 +104,63 @@ We will:
    "widen the scope before anything else notices the tablet" and "absorb
    without erasing" are structural properties of one planner's output order,
    not a convention two independently-timed loops would have to agree on.
+
+   **Post-merge hardening (2026-08-07), found by the very `ProdEnv`
+   integration test this ADR shipped with flaking ~1-in-5 in isolation (a
+   flaky `ProdEnv` test is a real bug — root `CLAUDE.md`): a linearizable
+   read through the merged survivor returned a definitive "key absent" for
+   an acked pre-merge write.** Root cause: the `Absorb` teardown raced the
+   absorbed group's **async apply task**. A write acked by the absorbed
+   group's leader is applied to *that leader's* engine before the ack, but a
+   follower's engine apply lags (commit-index propagation is up to one
+   heartbeat behind, and the apply task is a separate task) — and the
+   reconciler's event-driven watch fires the `Absorb` on the very commit
+   that made the merge visible. `RaftKvNode::shutdown()` halts the apply
+   task at its next loop-top check *without draining committed-but-unapplied
+   entries*, and the teardown then deletes the group's Raft WAL — the only
+   local copy — so the acked write silently never reached that node's
+   engine, permanently. If that node hosts the survivor's leader, reads of
+   the key answer "absent" forever — indistinguishable from data loss. Three
+   fixes, each load-bearing:
+   - **`Absorb` drains before halting** (`ABSORB_DRAIN_TIMEOUT`): the
+     teardown waits, while the driver is still live, for the replica's own
+     commit index to cover its full local log and for the engine-applied
+     watermark to cover that commit — only then shutdown + WAL delete.
+     Unlike `Release`/`Reclaim` (whose teardowns erase the data anyway, so a
+     lost tail is moot), an absorbed tablet's data is about to be *served*
+     from this very engine. On timeout with the engine at least caught up to
+     the locally-known commit, it proceeds with a loud warning (the residual:
+     entries committed elsewhere whose commit-index propagation lost the
+     race to the leader's own teardown — retained by the replicas that did
+     drain, and re-winnable while the dissolving group can still elect); an
+     engine that can't even reach the local commit re-registers and retries
+     next tick. Deterministic regression: the
+     `merge_widens_survivor_and_absorbs_sibling_unerased` corpus scenario
+     proposes a write through the absorbed group and ticks the merge view
+     with **zero intervening sim time** — pre-fix the write is provably lost,
+     post-fix drained.
+   - **Drain-before-widen ordering**: `plan` defers every `WidenScope` while
+     this node still hosts a merged-away tablet (`state.hosted ∩
+     view.merged` non-empty — an `Absorb` not yet confirmed), so the
+     survivor's scope never covers a range whose local drain hasn't
+     completed. Coarse (any pending absorb defers every widen — the planner
+     has no absorbed→survivor association once the absorbed tablet left the
+     map) but sound; costs one reconcile tick.
+   - **A read-side scope pre-check + served/absent disambiguation**
+     (`animusd::cp_get_local`/`cp_scan_local`, the read dual of ADR 0028's
+     pre-propose range check): a get/scan resolving to a group whose live
+     `scope_range()` does not contain the requested key/window (routing
+     raced a merge's widen or a split's narrow) surfaces as a **retryable
+     error** — never served; and a ReadIndex barrier failure (deposed /
+     mid-election leader) is likewise a retryable error, never collapsed
+     into `Value(None)` = "absent" (the forwarded `Get` arm used to do
+     exactly that, while the `Scan` arm already errored — the asymmetry was
+     the tell). `cp_read`/`cp_scan_one` retry these `"; retry"`-class
+     errors internally with re-resolved routing, bounded by
+     `CLIENT_TIMEOUT`, so the client-visible contract is unchanged. For
+     scans the pre-check also closes a *silent truncation*:
+     `linearizable_scan` filters rows through the live scope, so an
+     un-widened survivor would return partial results with no error at all.
 4. **Add an operator trigger**: `ClientCtx::trigger_merge` (mirroring
    `trigger_split` exactly) resolves both tablets' current epochs from one
    `Metadata` snapshot, proposes `MergeTablets`, and confirms by polling for
