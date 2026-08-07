@@ -2,7 +2,11 @@
 
 - **Status:** Accepted — implemented in `animus-control`, `animus-cp-data`,
   `animusd`. Supersedes ADR 0017 §4's tablet-split design and the "D" stage
-  (D1–D3) described in ADR 0017's implementation log.
+  (D1–D3) described in ADR 0017's implementation log. **§3's write fences are
+  now wired into every real CP write path** (`animusd`'s
+  `cp_put_local`/`cp_delete_local`/`cp_batch_propose`, 2026-08-07) — see the
+  note at the end of §3 below; they were merged additively but had zero
+  production callers until this fix.
 - **Date:** 2026-08-07
 
 ## Context
@@ -69,6 +73,34 @@ We will:
    accept/reject decision for the same committed entry, because the decision
    travels with the entry rather than depending on when each replica happens
    to notice the split.
+
+   **2026-08-07 update: wired into every real write path, plus a pre-propose
+   check the original design under-specified.** The `*_fenced` proposers and
+   `KeyRange`-embedded fence above landed additively (unit-tested in
+   `animus-cp-data/tests/fenced_commands.rs`) but `animusd`'s actual CP write
+   helpers (`cp_put_local`/`cp_delete_local`/`cp_batch_propose` — reached by
+   every client write, including every `cp_serve_forwarded` counterpart) kept
+   calling the *unfenced* `put`/`delete`/`put_batch` (`fence =
+   KeyRange::whole()`), so the fence was a no-op in production: a
+   stale-routed write during the crossover window could still land on and
+   corrupt/shadow a split child's data. Fixed by adding an additive
+   `RaftKvNode::scope_range()` accessor (and a `StorageScope::range()`
+   getter) and stamping it as the fence on every real proposal. But the fence
+   alone is not sufficient: those write helpers confirm success by reading
+   back the proposed value (or its absence, for a delete) from **local**
+   storage — a fenced-out entry still commits and applies as a no-op, so a
+   confirm mechanism keyed on a coarser signal than exact value equality
+   (e.g. a bare "has this index applied" watermark, which a no-op still
+   advances) would **falsely ack** a write that never happened. The actual
+   fix is a **pre-propose range check**: before proposing at all, the key(s)
+   are checked against the group's own live `scope_range()`; a miss returns
+   an ordinary routing-failure error (no propose), so the caller's retry
+   re-resolves `cp_route` and reaches the correct child once this node's own
+   view has caught up. The embedded fence still rides the entry regardless,
+   covering the residual race between the pre-check and the entry's actual
+   apply (the scope can narrow further in between) — a write landing in that
+   sliver is dropped as a safe no-op, never mis-applied. See the root
+   `CLAUDE.md` Engineering Practices entry for the general lesson.
 4. **Adopt ADR 0026 Stage B**: migrate `RaftKvNode` fully onto `(node, stream)`
    addressing, `stream = tablet_id`, on the node's one `raftkv` env. A tablet's
    CP group member id is therefore simply the base `raftkv` id — not a derived

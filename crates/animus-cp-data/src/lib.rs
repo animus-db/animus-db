@@ -168,6 +168,22 @@ impl StorageScope {
         *self.range.lock().expect("storage scope range poisoned") = new_range;
     }
 
+    /// A snapshot of this scope's current live range (see the type doc). The
+    /// range can narrow again the instant after this call returns — this is
+    /// a point-in-time read, not a held lock — so a caller using it as a
+    /// pre-propose fence-check (ADR 0028 write-fence wiring, `animusd`'s
+    /// `cp_put_local`/`cp_delete_local`/`cp_batch_propose`) still needs the
+    /// *proposed* command's own embedded `fence` (stamped from this same
+    /// read) to cover the residual race between this read and the entry's
+    /// actual apply.
+    #[must_use]
+    pub fn range(&self) -> KeyRange {
+        self.range
+            .lock()
+            .expect("storage scope range poisoned")
+            .clone()
+    }
+
     /// The physical storage key for logical `key`.
     fn physical(&self, key: &[u8]) -> Vec<u8> {
         let mut out = self.prefix.clone();
@@ -930,6 +946,23 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// there.
     pub fn narrow_scope(&self, new_range: KeyRange) {
         self.scope.narrow(new_range);
+    }
+
+    /// This group's own current [`StorageScope`] range (see its doc) — a
+    /// point-in-time snapshot, additive accessor (ADR 0028 write-fence
+    /// wiring). Lets a caller (e.g. `animusd`'s `cp_put_local`/
+    /// `cp_delete_local`/`cp_batch_propose`) both **pre-check** a key against
+    /// this group's live scope *before* proposing (so a stale-routed,
+    /// out-of-range write errors instead of being silently accepted as a
+    /// fenced-out no-op — see those callers' doc for why the pre-check
+    /// matters even though the fence itself also protects apply) and stamp
+    /// the *same* range as the proposed command's own `fence` (`put_fenced`/
+    /// `delete_fenced`/`put_batch_fenced`), so every replica's apply makes
+    /// the identical accept/reject decision regardless of how far it has
+    /// independently progressed observing a concurrent split.
+    #[must_use]
+    pub fn scope_range(&self) -> KeyRange {
+        self.scope.range()
     }
 
     /// Read `key` from this replica's **local engine**. NOTE: this is a local read

@@ -5,9 +5,11 @@
 //! the fence **embedded in the entry itself** — never a locally-polled value
 //! — so every replica reaches the identical accept/reject decision for a
 //! given log entry regardless of how far each has independently progressed
-//! learning the tablet's range has changed. Not yet wired to any real
-//! split trigger (that lands with the single-command-split integration); this
-//! suite exercises the mechanism directly via the `*_fenced` proposers.
+//! learning the tablet's range has changed. Wired to `animusd`'s real CP
+//! write paths (`cp_put_local`/`cp_delete_local`/`cp_batch_propose`, which
+//! stamp [`RaftKvNode::scope_range`] as the fence — see
+//! `animusd/tests/split_fence.rs`); this suite exercises the mechanism
+//! directly via the `*_fenced` proposers and the `scope_range` accessor.
 //!
 //! Deterministic and seed-reproducible (ADR 0003): drive with `run_for`, never
 //! `run()` (the driver has perpetual heartbeat/election timers).
@@ -15,7 +17,7 @@
 use std::time::Duration;
 
 use animus_control::ProposeResult;
-use animus_cp_data::RaftKvNode;
+use animus_cp_data::{RaftKvNode, StorageScope};
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::MemoryEngine;
 use animus_tablet::KeyRange;
@@ -30,6 +32,26 @@ fn group(seed: u64) -> (Simulator, Vec<KvNode>) {
     let nodes = NODES
         .iter()
         .map(|&id| RaftKvNode::start(sim.env(id), NODES.to_vec(), MemoryEngine::new()))
+        .collect();
+    (sim, nodes)
+}
+
+/// Like [`group`], but every node starts with a real (non-`whole`) scoped
+/// `StorageScope` — the shape `animusd`'s `cp_join_host` constructs a tablet's
+/// `RaftKvNode` with — so [`RaftKvNode::narrow_scope`]/[`RaftKvNode::scope_range`]
+/// exercise the same live-narrowable range a real split narrows.
+fn scoped_group(seed: u64) -> (Simulator, Vec<KvNode>) {
+    let sim = Simulator::new(seed);
+    let nodes = NODES
+        .iter()
+        .map(|&id| {
+            RaftKvNode::start_scoped(
+                sim.env(id),
+                NODES.to_vec(),
+                MemoryEngine::new(),
+                StorageScope::new(b"T:".to_vec(), KeyRange::whole()),
+            )
+        })
         .collect();
     (sim, nodes)
 }
@@ -289,6 +311,67 @@ fn fence_decision_is_per_entry_not_retroactively_reconsidered() {
             Some(b"applied".to_vec()),
             "node {i}: the second entry's own (unconstrained) fence must apply, \
              independent of the first entry's fenced-out decision (seed={seed})"
+        );
+    }
+}
+
+/// `RaftKvNode::scope_range` (ADR 0028 write-fence wiring, PR2's additive
+/// accessor): a caller reads the group's own **live** `StorageScope` range and
+/// stamps it as a proposed command's fence — the exact pattern `animusd`'s
+/// `cp_put_local`/`cp_delete_local`/`cp_batch_propose` use before proposing a
+/// real CP write. Narrow the scope after start (as a real single-command
+/// split would on the source tablet's already-hosted `RaftKvNode`, via
+/// `narrow_scope`), confirm `scope_range()` reflects it, then confirm a
+/// `put_fenced` stamped from that reading applies as a no-op on every replica
+/// for a since-handed-off key while a still-owned key applies normally — the
+/// narrowed-scope leader's fenced put for an out-of-range key is a no-op
+/// everywhere.
+#[test]
+fn scope_range_reflects_narrowing_and_a_fence_stamped_from_it_gates_apply() {
+    let seed = 0xFE9;
+    let (mut sim, nodes) = scoped_group(seed);
+    sim.run_for(Duration::from_secs(2));
+    let l = leader(&nodes, &[0, 1, 2], seed);
+
+    // Every replica narrows its own scope, as the join-host loop's
+    // `narrow_scope` call does on a real split's source tablet.
+    for n in &nodes {
+        n.narrow_scope(lower_half());
+    }
+    assert_eq!(
+        nodes[l].scope_range(),
+        lower_half(),
+        "scope_range() must reflect the narrowed range (seed={seed})"
+    );
+
+    // Stamp the group's own live scope_range() as the fence, exactly as
+    // animusd's write helpers do — an out-of-range key is a deterministic
+    // no-op everywhere.
+    let fence = nodes[l].scope_range();
+    match nodes[l].put_fenced(b"z".to_vec(), b"v".to_vec(), fence.clone()) {
+        ProposeResult::Accepted { .. } => {}
+        other => panic!("fenced put rejected at propose time: {other:?} (seed={seed})"),
+    }
+    sim.run_for(Duration::from_secs(2));
+    for (i, n) in nodes.iter().enumerate() {
+        assert_eq!(
+            block_on(n.local_get(b"z")),
+            None,
+            "node {i} applied a write outside the narrowed scope_range() (seed={seed})"
+        );
+    }
+
+    // A key still inside the narrowed scope applies normally.
+    match nodes[l].put_fenced(b"a".to_vec(), b"v".to_vec(), fence) {
+        ProposeResult::Accepted { .. } => {}
+        other => panic!("fenced put rejected: {other:?} (seed={seed})"),
+    }
+    sim.run_for(Duration::from_secs(2));
+    for (i, n) in nodes.iter().enumerate() {
+        assert_eq!(
+            block_on(n.local_get(b"a")),
+            Some(b"v".to_vec()),
+            "node {i} dropped a write inside the narrowed scope_range() (seed={seed})"
         );
     }
 }
