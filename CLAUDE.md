@@ -260,7 +260,13 @@ cross-cutting ones. Prune/merge entries that become obsolete.
   follower right after a create on the leader must wait for the definition to
   replicate to that node (`await_table_*`), not assume the leader's ack made it
   visible everywhere.
-- **Two independent, un-jittered fixed-period polling loops that can each "win"
+- **Superseded by ADR 0031 PR4 for this specific pair**: `cp_reconfigure_loop`
+  and its `jitter`/150ms-cadence mitigation are deleted — the tablet-host
+  reconciler reacts to a `metadata_watch` wake (event-driven), so it observes a
+  replica-set change on the commit that made it and there is no cadence ratio
+  left to tune against `reconcile_loop`. Retained for historical record; the
+  *general* lesson (two independent fixed-period pollers racing a one-shot
+  outcome) still applies to any future pair of loops. **Two independent, un-jittered fixed-period polling loops that can each "win"
   a one-shot outcome are a real, silent flake source — not just theoretical.**
   Rewiring tablet split to a single control-plane command surfaced this in
   `animusd::cp_reconfigure_loop` (steps a CP group's Raft voters toward a
@@ -1198,7 +1204,11 @@ cross-cutting ones. Prune/merge entries that become obsolete.
   timeout). Dedup on the genuinely per-node `minted` claim set instead. This is the
   *hosting-path* instance of the documented "shared `--cluster` edge masks per-node"
   gotcha — assume any `edge.*` read is cluster-wide in `--cluster N`. (`animusd`
-  `cp_join_host_loop`.)
+  `cp_join_host_loop`. Both halves of this entry are historical now: ADR 0031
+  PR2 made the edge genuinely per-node, and PR4 replaced
+  `cp_join_host_loop`/`minted` with the tablet-host reconciler's own
+  `LocalState::hosted` — which is per-node *by construction*, since the
+  reconciler owns the hosted map outright.)
 - **A Raft group *forming or re-forming* (no live leader) needs the full voter config;
   only a *new spare joining a led group* starts as a non-voter — and the restart
   signal is on-disk data, not the epoch.** WAL recovery does **not** restore voter
@@ -1206,7 +1216,11 @@ cross-cutting ones. Prune/merge entries that become obsolete.
   has data for must pass the **full** config explicitly. Gating on epoch misfired: a
   split bumps the original replicas' epoch, so a post-restart re-host of a split
   parent looked like a "join" → non-voter → no election. Use `latest_version() > 0`
-  (engine has data ⟹ re-forming) as the signal. (ADR 0023, `animusd` `cp_join_host`.)
+  (engine has data ⟹ re-forming) as the signal. (ADR 0023, originally `animusd`
+  `cp_join_host`; since ADR 0031 PR4 the decision lives on unchanged as
+  `TabletFacts::has_data` in `animus_cp_data::host` — gathered by
+  `Reconciler::gather_facts` via `StorageScope::has_data`, the shared-engine
+  successor to `latest_version()`.)
 - **With provisioning in band (a tablet's group forms on first access, not at
   startup), a node that *is* a replica of a not-yet-hosted tablet must WAIT, not
   forward.** Routing's "I host no replica → forward to any route" fallback misfires
@@ -1586,7 +1600,14 @@ cross-cutting ones. Prune/merge entries that become obsolete.
   the one call site the contract was originally written for — actually uses
   it**, especially a process-exit path that looks unconditionally safe because
   "the process is exiting anyway."
-- **A cached per-node handle derived from replicated state (here, a
+- **Mechanism superseded by ADR 0031 PR4**: `cp_join_host_loop` (and its
+  per-tick unconditional re-narrow) is deleted — the tablet-host reconciler's
+  planner emits an explicit `NarrowScope` action whenever a hosted tablet's
+  metadata range shrank, so the re-sync is now a planned, ordered action
+  rather than a per-tick patch-up. The *lesson* (a cached per-node handle
+  derived from replicated state needs an explicit re-sync for every way that
+  state can change) is exactly what the reconciler design institutionalizes;
+  retained for the record. **A cached per-node handle derived from replicated state (here, a
   `StorageScope`'s range) needs an explicit re-sync step for every way that
   state can change in place — "it was correct when constructed" is not "it
   stays correct."** The single-command split redesign (ADR 0028) gave a split
@@ -1651,7 +1672,14 @@ cross-cutting ones. Prune/merge entries that become obsolete.
   `animus-control::node::detect_loop`; `animusd/tests/cluster_growth.rs`;
   `animus-control/tests/{placement_auto_reconcile,placement_rebalance,
   placement_reconcile,prod_liveness}.rs`.)
-- **A teardown that erases "my own scope" must re-derive the scope from
+- **Mechanism superseded by ADR 0031 PR4**: `cp_gc_tablet`'s `current_range`
+  parameter (the by-convention fix this entry describes) is deleted — the
+  planner's `HostAction::Release` now *carries* the erase bound
+  (`erase_bound`, always the tablet's current replicated range, never a
+  scope fact), and the executor narrows to it immediately before erasing, so
+  the narrow-before-erase ordering is a structural property of one function's
+  output rather than a convention between two unrelated loops. Lesson
+  retained for the record. **A teardown that erases "my own scope" must re-derive the scope from
   replicated state at the point of irreversible action — not trust an
   in-memory cache that a *different* code path is responsible for keeping
   current.** The fix directly above (`cp_join_host_loop` re-narrowing an
@@ -1814,6 +1842,32 @@ cross-cutting ones. Prune/merge entries that become obsolete.
   the identical action re-appears, then confirms and asserts it stops.
   (`animus-cp-data::host::{LocalState::confirm_torn_down, plan}`;
   `host::tests::a_pending_reclaim_is_replanned_until_confirmed_torn_down`.)
+- **When replacing N polling loops with one event-driven watch, inventory the
+  consumers whose watch source structurally never fires before deleting the
+  polls — the periodic fallback arm is load-bearing for them, not a safety
+  net; and any guard that gates the new unified loop must be keyed on *every*
+  node-type's own signal, or it permanently blocks the type it wasn't written
+  for.** Wiring the ADR 0031 PR4 reconciler trigger
+  (`select!(metadata_watch.changed(..), sleep(500ms))`), two growth-node (ADR
+  0030) hazards were only visible by asking "for which consumer does the
+  watch never fire": (1) a growth node's own control raft never advances (a
+  permanent non-voter of a group it never replicates), so `metadata_watch`
+  never wakes it — only the fallback tick ever drives its reconciler, reading
+  the `remote_metadata_sync_loop` mirror via `effective_metadata()`; deleting
+  the old fixed-period loops without the fallback would have silently frozen
+  every grown node's tablet hosting forever, with zero errors. (2) The
+  pre-recovery guard the old GC loop used (`raft.last_applied() == 0` → skip,
+  so a default-empty pre-recovery `Metadata` doesn't read as "everything
+  dropped") is keyed on exactly the signal a growth node never raises — so
+  the unified loop's guard had to become `last_applied() == 0 && remote
+  mirror is empty`, or the same guard that protects a normal node's restart
+  would have blocked a growth node's reconciler from ever ticking at all.
+  Also: after any watch-arm wake, coalesce to the source's freshest value
+  (`watch.latest()`) rather than the value the future resolved with — a
+  burst of commits under bulk load must collapse into one reconcile tick,
+  not one per applied entry. (`animusd::tablet_host_reconciler_loop`,
+  `RECONCILE_FALLBACK_INTERVAL`; `tests/cluster_growth.rs` is the regression
+  that proves the growth node still functions.)
 
 ### Parallel-agent orchestration
 - **Partition work by disjoint crate ownership — exactly one owner per shared

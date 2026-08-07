@@ -30,9 +30,13 @@
 //! this module has no excuse either way — it's pure logic).
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
 
-use animus_env::NodeId;
+use animus_env::{Env, NodeId};
+use animus_storage::StorageEngine;
 use animus_tablet::{Epoch, KeyRange, Tablet, TabletId};
+
+use crate::{RaftKvNode, StorageScope, wal_file};
 
 /// How many consecutive [`plan`] calls the release condition (this node
 /// dropped from a still-existing tablet's replica set, **and** its own durable
@@ -494,6 +498,300 @@ fn tablets_to_release_set(
                 .is_some_and(|tab| !tab.replicas.contains(&base_id))
         })
         .collect()
+}
+
+// === The execute half (ADR 0031 PR4) ========================================
+
+/// How long [`Reconciler::tick`] waits for a group's driver to actually stop
+/// after a [`HostAction::Release`]/[`HostAction::Reclaim`] calls
+/// [`RaftKvNode::shutdown`], before giving up for this tick — mirrors
+/// `animusd`'s old `CP_GC_STOP_TIMEOUT`. On timeout the handle is
+/// re-registered via `on_host` and the teardown is **not** confirmed: `plan`
+/// simply re-emits the identical action on the next tick (see
+/// [`LocalState::confirm_torn_down`]'s doc), so nothing is ever erased while
+/// the driver might still be writing.
+pub const RECLAIM_STOP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How often [`Reconciler::tick`] polls [`RaftKvNode::is_stopped`] while
+/// waiting out [`RECLAIM_STOP_TIMEOUT`].
+const RECLAIM_STOP_POLL: Duration = Duration::from_millis(50);
+
+/// The execute half of the per-node tablet-host reconciler (ADR 0031 PR4):
+/// owns every [`RaftKvNode`] this node hosts and drives it through [`plan`] on
+/// each [`tick`](Self::tick) — the sync-core/async-driver split this crate
+/// already uses elsewhere (`plan` decides, `Reconciler` does the I/O), applied
+/// one level up to the whole tablet lifecycle instead of one Raft group.
+/// Generic over `E`/`S` like the rest of this crate: no tokio-only primitive,
+/// no wall clock beyond `env.now()`/`env.sleep()`, no `HashMap`/`HashSet` — ADR
+/// 0003's determinism rules apply here exactly as everywhere else, even though
+/// this is real per-node lifecycle logic rather than a `SimEnv`-only helper
+/// (it is `SimEnv`-testable for exactly that reason, see this module's tests).
+///
+/// `Reconciler` is the **single writer** of "does this node host tablet T" —
+/// `animusd` mirrors every hosting change into its own routing registry
+/// (`ClusterEdgeState`) purely as a read-only reaction, via the
+/// `on_host`/`on_teardown` hooks passed to [`new`](Self::new).
+pub struct Reconciler<E: Env, S: StorageEngine> {
+    env: E,
+    storage: S,
+    base_id: NodeId,
+    /// Every tablet this node currently hosts a live `RaftKvNode` for — the
+    /// authoritative hosting state (kept in lockstep with
+    /// [`LocalState::hosted`], but holding the live handle, not just the id).
+    hosted: BTreeMap<TabletId, RaftKvNode<E, S>>,
+    state: LocalState,
+    /// `table name -> StorageScope` prefix (`animusd`'s `escape(table)`) —
+    /// supplied by the caller so this crate never duplicates the wire-edge
+    /// key-escaping convention (see `StorageScope`'s own doc).
+    prefix_for: PrefixFn,
+    /// Mirror a fresh (or re-registered-after-a-timed-out-teardown) hosting
+    /// into the caller's own routing registry. Called once per successful
+    /// [`HostAction::Host`], and again if a `Release`/`Reclaim` teardown times
+    /// out waiting for the driver to stop (the handle must stay reachable for
+    /// routing while a later tick retries the teardown).
+    on_host: OnHostFn<E, S>,
+    /// Unregister a tablet from the caller's routing registry — called
+    /// **before** shutting the group's driver down, mirroring
+    /// `animusd::cp_gc_tablet`'s unregister-then-shutdown order (routing must
+    /// stop seeing a group before its driver starts winding down).
+    on_teardown: OnTeardownFn,
+}
+
+/// `table name -> StorageScope` prefix hook — see [`Reconciler`]'s
+/// `prefix_for` field doc.
+type PrefixFn = Box<dyn Fn(&str) -> Vec<u8> + Send + Sync>;
+/// Fresh/re-registered-hosting mirror hook — see [`Reconciler`]'s `on_host`
+/// field doc.
+type OnHostFn<E, S> = Box<dyn Fn(TabletId, &RaftKvNode<E, S>) + Send + Sync>;
+/// Teardown-unregister mirror hook — see [`Reconciler`]'s `on_teardown` field
+/// doc.
+type OnTeardownFn = Box<dyn Fn(TabletId) + Send + Sync>;
+
+impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
+    /// A fresh reconciler for one node. `env`/`storage` are this node's
+    /// `raftkv` env and shared storage engine — every tablet's `RaftKvNode`
+    /// this reconciler ever hosts runs on `env.clone()` (stream-addressed by
+    /// the tablet id, ADR 0026 Stage B) and shares `storage.clone()` (ADR
+    /// 0028); `base_id` is this node's identity in a tablet's replica set.
+    /// `prefix_for` maps a table name to its `StorageScope` prefix (the
+    /// caller's own escaping convention — this crate never invents one);
+    /// `on_host`/`on_teardown` mirror hosting changes into the caller's own
+    /// routing registry, letting `Reconciler` stay the single writer of
+    /// hosting state while the caller's registry becomes a read-only mirror.
+    pub fn new(
+        env: E,
+        storage: S,
+        base_id: NodeId,
+        prefix_for: impl Fn(&str) -> Vec<u8> + Send + Sync + 'static,
+        on_host: impl Fn(TabletId, &RaftKvNode<E, S>) + Send + Sync + 'static,
+        on_teardown: impl Fn(TabletId) + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            env,
+            storage,
+            base_id,
+            hosted: BTreeMap::new(),
+            state: LocalState::default(),
+            prefix_for: Box::new(prefix_for),
+            on_host: Box::new(on_host),
+            on_teardown: Box::new(on_teardown),
+        }
+    }
+
+    /// This node's current [`LocalState`] — read-only, for a caller (or a
+    /// test) that wants to observe convergence without reaching into the
+    /// private `hosted` map.
+    pub fn local_state(&self) -> &LocalState {
+        &self.state
+    }
+
+    /// The live `RaftKvNode` this reconciler hosts for `tablet`, if any.
+    pub fn hosted_node(&self, tablet: TabletId) -> Option<&RaftKvNode<E, S>> {
+        self.hosted.get(&tablet)
+    }
+
+    /// One reconcile tick (ADR 0031): snapshot the impure facts this node's
+    /// own hosted groups + engine can answer, call [`plan`] exactly once, then
+    /// execute the returned actions **in the fixed order `plan` emits them**
+    /// (`NarrowScope` → `Host` → `Reconfigure` → `Release`/`Reclaim`).
+    ///
+    /// The caller is responsible for the `last_applied() == 0` pre-recovery
+    /// guard (a live control-plane `RaftNode` read this crate has no business
+    /// taking, per [`plan`]'s own doc) — skip calling `tick` at all before
+    /// replicated `Metadata` has recovered.
+    pub async fn tick(&mut self, view: &MetadataView) {
+        let facts = self.gather_facts(view).await;
+        let (actions, next) = plan(view, &facts, &self.state, self.base_id);
+        self.state = next;
+
+        for action in actions {
+            match action {
+                HostAction::NarrowScope { tablet, range } => {
+                    if let Some(node) = self.hosted.get(&tablet) {
+                        node.narrow_scope(range);
+                    }
+                }
+                HostAction::Host {
+                    tablet,
+                    table,
+                    range,
+                    initial_formation,
+                } => {
+                    self.host(view, tablet, &table, range, initial_formation)
+                        .await;
+                }
+                HostAction::Reconfigure {
+                    tablet,
+                    desired,
+                    down,
+                } => {
+                    if let Some(node) = self.hosted.get(&tablet) {
+                        node.reconfigure_step(&desired, &down);
+                    }
+                }
+                HostAction::Release {
+                    tablet,
+                    erase_bound,
+                } => {
+                    self.teardown(tablet, Some(erase_bound)).await;
+                }
+                HostAction::Reclaim { tablet } => {
+                    self.teardown(tablet, None).await;
+                }
+            }
+        }
+    }
+
+    /// Gather the [`TabletFacts`] [`plan`] needs: every currently-hosted
+    /// tablet's live state (`is_leader`/`config_excludes_me`/`scope_range`),
+    /// plus a `has_data` presence check for every not-yet-hosted candidate
+    /// [`plan_join_host`] would place on this node — the one input `plan`
+    /// can't gather itself (an async engine read).
+    async fn gather_facts(&self, view: &MetadataView) -> BTreeMap<TabletId, TabletFacts> {
+        let mut facts = BTreeMap::new();
+        for (&tablet, node) in &self.hosted {
+            facts.insert(
+                tablet,
+                TabletFacts {
+                    hosted: true,
+                    is_leader: node.is_leader(),
+                    config_excludes_me: !node.config().contains(&self.base_id),
+                    scope_range: Some(node.scope_range()),
+                    has_data: false,
+                },
+            );
+        }
+        for (&tablet, t) in &view.tablets {
+            if self.state.hosted.contains(&tablet) {
+                continue;
+            }
+            if plan_join_host(self.base_id, &t.replicas, t.epoch).is_none() {
+                continue;
+            }
+            let scope = StorageScope::new(
+                (self.prefix_for)(t.table.as_deref().unwrap_or_default()),
+                t.range.clone(),
+            );
+            let has_data = scope.has_data(&self.storage).await;
+            facts.insert(
+                tablet,
+                TabletFacts {
+                    has_data,
+                    ..Default::default()
+                },
+            );
+        }
+        facts
+    }
+
+    /// Execute a [`HostAction::Host`]: stand up this node's member of
+    /// `tablet`'s group, choosing the full voter config (`initial_formation`
+    /// — a fresh tablet, or a restart with data already on disk) vs. a quiet
+    /// non-voter joining an existing, already-led group (the others) —
+    /// exactly `animusd::cp_join_host`'s decision. Synchronous within one
+    /// tick (`start_hosted` only spawns the driver task and returns), so
+    /// there is no in-flight "claimed but not yet registered" window to dedup
+    /// against — unlike the old `minted`-claim-set loop, `self.hosted` is
+    /// authoritative the instant this returns.
+    async fn host(
+        &mut self,
+        view: &MetadataView,
+        tablet: TabletId,
+        table: &str,
+        range: KeyRange,
+        initial_formation: bool,
+    ) {
+        let Some(t) = view.tablets.get(&tablet) else {
+            return;
+        };
+        let scope = StorageScope::new((self.prefix_for)(table), range);
+        let full: Vec<NodeId> = t.replicas.clone();
+        let others: Vec<NodeId> = full
+            .iter()
+            .copied()
+            .filter(|&id| id != self.base_id)
+            .collect();
+        let config = if initial_formation { full } else { others };
+        let node = RaftKvNode::start_hosted(
+            self.env.clone(),
+            config,
+            self.storage.clone(),
+            scope,
+            tablet.0,
+        );
+        (self.on_host)(tablet, &node);
+        self.hosted.insert(tablet, node);
+    }
+
+    /// Execute a [`HostAction::Release`] (`erase_bound: Some`) or
+    /// [`HostAction::Reclaim`] (`erase_bound: None`) — `animusd::cp_gc_tablet`'s
+    /// exact teardown shape: unregister from the caller's routing registry
+    /// first, shut the driver down and wait for it to actually stop (never
+    /// touch data under a live driver), narrow to `erase_bound` if given
+    /// (**the sibling-sparing invariant this whole design exists to make
+    /// structural** — see [`HostAction::Release`]'s doc) then erase the
+    /// scope, delete the tablet's WAL file, and only then confirm the
+    /// teardown to [`LocalState`] and drop the local handle. A timeout
+    /// waiting for the driver to stop re-registers the handle (so routing
+    /// keeps working) and leaves `state`/`hosted` untouched — `plan`
+    /// re-emits the identical action next tick.
+    async fn teardown(&mut self, tablet: TabletId, erase_bound: Option<KeyRange>) {
+        let Some(node) = self.hosted.remove(&tablet) else {
+            return;
+        };
+        (self.on_teardown)(tablet);
+        node.shutdown();
+        let deadline = self.env.now().saturating_add(RECLAIM_STOP_TIMEOUT);
+        while !node.is_stopped() {
+            if self.env.now() >= deadline {
+                tracing::warn!(
+                    tablet = tablet.0,
+                    "reconciler: group driver did not stop in time"
+                );
+                (self.on_host)(tablet, &node);
+                self.hosted.insert(tablet, node);
+                return;
+            }
+            self.env.sleep(RECLAIM_STOP_POLL).await;
+        }
+
+        // Bound the erase to the tablet's current replicated range (Release
+        // only) — see `HostAction::Release`'s doc for why the group's own
+        // `StorageScope` cannot be trusted for this instead.
+        if let Some(range) = erase_bound {
+            node.narrow_scope(range);
+        }
+        node.erase_scope().await;
+        if let Err(e) = self.env.remove(&wal_file(tablet.0)).await {
+            tracing::warn!(
+                ?e,
+                tablet = tablet.0,
+                "reconciler: removing the tablet's WAL"
+            );
+        }
+
+        self.state.confirm_torn_down(tablet);
+    }
 }
 
 #[cfg(test)]

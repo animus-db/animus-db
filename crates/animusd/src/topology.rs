@@ -1,25 +1,31 @@
-//! Pure, side-effect-free decision logic for the CP data-plane's routing and
-//! hosting/GC predicates (extracted from `lib.rs`).
+//! Pure, side-effect-free decision logic for the CP data-plane's client
+//! request **routing** (extracted from `lib.rs`).
 //!
 //! `animusd` is the one crate that runs real distributed-system decision logic
-//! (routing, provisioning, join-hosting, GC) exclusively over `ProdEnv`, with no
-//! sim/unit coverage — every `animusd` test is a real-socket integration test.
-//! This module pulls the pure *decisions* (no network/lock/disk access) out of
-//! that machinery so they can be unit-tested directly, leaving the surrounding
-//! `lib.rs` functions as thin `ProdEnv` wiring that gathers inputs and executes
-//! the decision. Since ADR 0026 Stage B (stream-per-tablet addressing) a
-//! tablet's CP group member id **is** simply the base `raftkv` id — the tablet
-//! axis lives in the network `stream` and the `StorageScope` prefix/range, not
-//! in a derived `NodeId` — so there is no more base↔member translation to keep
+//! (routing, provisioning, hosting, GC) exclusively over `ProdEnv`, with no
+//! sim/unit coverage of its own — every `animusd` test is a real-socket
+//! integration test. This module pulls the pure *routing* decision (no
+//! network/lock/disk access) out of that machinery so it can be unit-tested
+//! directly, leaving `ClientCtx::resolve_cp_route` as thin `ProdEnv` wiring
+//! that gathers inputs and executes the decision.
+//!
+//! **The per-node tablet hosting/GC decisions this module used to hold**
+//! (`plan_join_host`, `tablets_to_reclaim`, `tablets_to_release`) **moved to
+//! `animus_cp_data::host`** (ADR 0031 PR3/PR4): that crate's `plan` is now
+//! the single pure decision behind the per-node tablet-host reconciler, and
+//! its `Reconciler` executes the result — see `animus-cp-data/CLAUDE.md`'s
+//! `host` module doc and `animusd/CLAUDE.md`'s tablet-host-reconciler entry.
+//! Since ADR 0026 Stage B (stream-per-tablet addressing) a tablet's CP group
+//! member id **is** simply the base `raftkv` id — the tablet axis lives in
+//! the network `stream` and the `StorageScope` prefix/range, not in a
+//! derived `NodeId` — so there is no more base↔member translation to keep
 //! flat across split depth; see the root `CLAUDE.md` engineering-practices
 //! entries for why that used to matter. The CP-route resolution below still
 //! must never forward to a non-leader while a local replica is still forming.
 
-use std::collections::BTreeMap;
 use std::net::SocketAddr;
 
-use animus_env::NodeId;
-use animus_tablet::{Epoch, Tablet, TabletId};
+use animus_tablet::{Tablet, TabletId};
 
 /// The tablet whose range contains `key`, chosen from `tablets` (already
 /// filtered to one table, ADR 0023 table-scoped routing). Iteration order
@@ -76,7 +82,7 @@ pub(crate) enum RouteDecision {
 /// or mid-formation** — it must **wait**, never forward, because the only
 /// "route" might be this very node and forwarding elsewhere just errors. Only a
 /// node with **no** local handle at all considers forwarding, and even then, if
-/// *it* is a replica (`is_replica`, e.g. its own join-host loop just hasn't
+/// *it* is a replica (`is_replica`, e.g. its own tablet-host reconciler hasn't
 /// stood the group up yet), it must also wait rather than guess at another
 /// node's address.
 pub(crate) fn decide_cp_route(
@@ -103,113 +109,12 @@ pub(crate) fn decide_cp_route(
     RouteDecision::Wait
 }
 
-/// This node's plan for join-hosting `tablet` (the pure decision behind
-/// `cp_join_host_loop`), given its base `raftkv` id and the tablet's current
-/// replica set / epoch from replicated `Metadata`. `None` means "not this
-/// node's concern right now" — its base id is not in `replicas` at all.
-///
-/// Since a single-command (control-plane-only) split moves no data — a split
-/// child's range is confined by its own `StorageScope` against the *same*
-/// already-populated shared engine, not seeded from a handoff — a fresh split
-/// child is formed exactly like a fresh whole-keyspace tablet: both get
-/// `initial_formation: true`. (Contrast the old two-phase split, where a fresh
-/// split child had to be *skipped* here and formed only via the data-plane
-/// split hook's handoff, or an empty join-host start would have lost its data.)
-///
-/// This does **not** perform the per-node `minted` dedup claim (stateful, kept
-/// in the caller), nor the `StorageScope::has_data` check the caller layers on
-/// top to upgrade a *reforming-after-restart* join (this node already held
-/// this tablet's data before the process restarted, so it needs the full
-/// voter config to be able to re-elect immediately, even though `epoch` alone
-/// would suggest "joining fresh") to `initial_formation: true` — that check
-/// needs an async engine read, impure by construction, so it stays in
-/// `cp_join_host`, not here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct JoinHostPlan {
-    /// `true` — a fresh tablet forming for the first time (whole-keyspace or a
-    /// split child — both start from data already present in the shared
-    /// engine, if any): start with the **full** voting config so a replica can
-    /// campaign with no live leader. `false` — this node is *joining* an
-    /// existing, already-led group (the reconciler placed it as a spare):
-    /// start as a quiet **non-voter** until the leader adds it.
-    pub(crate) initial_formation: bool,
-}
-
-pub(crate) fn plan_join_host(
-    base_id: NodeId,
-    replicas: &[NodeId],
-    epoch: Epoch,
-) -> Option<JoinHostPlan> {
-    if !replicas.contains(&base_id) {
-        return None;
-    }
-    Some(JoinHostPlan {
-        initial_formation: epoch <= Epoch::INITIAL,
-    })
-}
-
-/// Which of this node's `minted` tablets have been dropped from the replicated
-/// tablet map and should be reclaimed (the pure predicate behind `cp_gc_loop`,
-/// ADR 0024). A tablet is reclaimed iff it is in `minted` but absent from
-/// `tablets`. The caller is responsible for the `last_applied == 0` recovery
-/// guard (skip entirely before replicated `Metadata` has recovered, when an
-/// empty default `Metadata` would otherwise read as "everything dropped") —
-/// that gate gets a live `RaftNode` read the pure function has no business
-/// taking, so it stays in `cp_gc_loop`.
-pub(crate) fn tablets_to_reclaim(
-    minted: &[TabletId],
-    tablets: &BTreeMap<TabletId, Tablet>,
-) -> Vec<TabletId> {
-    minted
-        .iter()
-        .copied()
-        .filter(|t| !tablets.contains_key(t))
-        .collect()
-}
-
-/// Which of this node's `minted` tablets have had **this node** dropped from
-/// their replica set while the tablet itself **still exists** — and so should be
-/// *released* (stopped + its scope erased) on this node (the pure predicate
-/// behind `cp_gc_loop`'s release phase, ADR 0029). The dual of
-/// [`tablets_to_reclaim`]: reclaim fires on the tablet being **absent** (the
-/// whole table was dropped, ADR 0024); release fires on the tablet being
-/// **present** but no longer placing a replica on `base_id` (a drain, a
-/// failure-repair swap, or an automatic rebalance moved it elsewhere).
-///
-/// A tablet is released iff it is in `minted` (this node hosts/hosted it) AND
-/// present in `tablets` (still exists) AND `base_id` is **not** in that tablet's
-/// `replicas` (this node is no longer supposed to be a replica).
-///
-/// The two predicates are **mutually exclusive** on the same input: reclaim
-/// requires absence, release requires presence, so no tablet is ever both. The
-/// caller layers the same `last_applied == 0` recovery guard on top (skip while
-/// replicated `Metadata` hasn't recovered) and — critically — an independent
-/// per-tablet check that this node's *own durable Raft log* config already
-/// excludes `base_id` before acting, so a replay transient in `tablets` can't
-/// erase live data (that check reads a live handle the pure function has no
-/// business taking, so it stays in `cp_gc_loop`).
-pub(crate) fn tablets_to_release(
-    minted: &[TabletId],
-    tablets: &BTreeMap<TabletId, Tablet>,
-    base_id: NodeId,
-) -> Vec<TabletId> {
-    minted
-        .iter()
-        .copied()
-        .filter(|t| {
-            tablets
-                .get(t)
-                .is_some_and(|tab| !tab.replicas.contains(&base_id))
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
     use animus_tablet::KeyRange;
-
-    const BASE: NodeId = 300;
 
     // --- tablet_for_key ------------------------------------------------------
 
@@ -324,8 +229,8 @@ mod tests {
     }
 
     /// A node that is itself a replica but hosts no local handle at all (its own
-    /// join-host loop hasn't stood the group up yet) must also wait — it must not
-    /// guess at another node's address just because one is available.
+    /// tablet-host reconciler hasn't stood the group up yet) must also wait — it
+    /// must not guess at another node's address just because one is available.
     #[test]
     fn route_waits_when_unhosted_but_a_replica_of_the_tablet() {
         assert_eq!(
@@ -347,159 +252,6 @@ mod tests {
         assert_eq!(
             decide_cp_route(false, None, false, false, None),
             RouteDecision::Wait
-        );
-    }
-
-    // --- plan_join_host --------------------------------------------------------
-
-    #[test]
-    fn join_host_skips_a_non_replica() {
-        assert_eq!(plan_join_host(BASE, &[301, 302], Epoch::INITIAL), None);
-    }
-
-    /// A tablet at `Epoch::INITIAL` always forms fresh with the full voter
-    /// config — whether it's a genuinely new whole-keyspace tablet or a
-    /// single-command split's child. Unlike the old two-phase split (where a
-    /// fresh split child had to be *skipped* here and formed only via the
-    /// data-plane split hook's handoff), a single-command split moves no
-    /// data — a split child's `StorageScope` is simply confined to its own
-    /// range against the same already-populated shared engine — so there is
-    /// no `range` parameter left to distinguish the two cases by; both are
-    /// the same decision.
-    #[test]
-    fn join_host_forms_a_fresh_tablet_whole_or_split_child_the_same_way() {
-        assert_eq!(
-            plan_join_host(BASE, &[BASE], Epoch::INITIAL),
-            Some(JoinHostPlan {
-                initial_formation: true
-            })
-        );
-    }
-
-    #[test]
-    fn join_host_joins_an_existing_group_as_non_voter() {
-        // A bumped epoch means the reconciler placed this node into an
-        // existing, already-led group.
-        assert_eq!(
-            plan_join_host(BASE, &[BASE], Epoch::INITIAL.next()),
-            Some(JoinHostPlan {
-                initial_formation: false
-            })
-        );
-    }
-
-    // --- tablets_to_reclaim ------------------------------------------------------
-
-    #[test]
-    fn reclaims_a_minted_tablet_absent_from_the_map() {
-        let tablets: BTreeMap<TabletId, Tablet> =
-            [(TabletId(1), tablet(1, b"", None))].into_iter().collect();
-        let minted = [TabletId(1), TabletId(2)];
-        assert_eq!(tablets_to_reclaim(&minted, &tablets), vec![TabletId(2)]);
-    }
-
-    #[test]
-    fn does_not_reclaim_a_still_present_tablet() {
-        let tablets: BTreeMap<TabletId, Tablet> = [
-            (TabletId(1), tablet(1, b"", None)),
-            (TabletId(2), tablet(2, b"", None)),
-        ]
-        .into_iter()
-        .collect();
-        let minted = [TabletId(1), TabletId(2)];
-        assert_eq!(
-            tablets_to_reclaim(&minted, &tablets),
-            Vec::<TabletId>::new()
-        );
-    }
-
-    #[test]
-    fn reclaim_over_empty_minted_set_is_empty() {
-        let tablets: BTreeMap<TabletId, Tablet> = BTreeMap::new();
-        assert_eq!(tablets_to_reclaim(&[], &tablets), Vec::<TabletId>::new());
-    }
-
-    // --- tablets_to_release ------------------------------------------------------
-
-    /// A tablet built with an explicit replica set (rather than the default
-    /// `vec![300]` of the `tablet` helper above).
-    fn tablet_with_replicas(id: u64, replicas: Vec<NodeId>) -> Tablet {
-        Tablet::new(TabletId(id), KeyRange::new(b"".to_vec(), None), replicas)
-    }
-
-    #[test]
-    fn release_over_empty_minted_set_is_empty() {
-        let tablets: BTreeMap<TabletId, Tablet> =
-            [(TabletId(1), tablet_with_replicas(1, vec![BASE]))]
-                .into_iter()
-                .collect();
-        assert_eq!(
-            tablets_to_release(&[], &tablets, BASE),
-            Vec::<TabletId>::new()
-        );
-    }
-
-    #[test]
-    fn does_not_release_a_tablet_this_node_is_still_a_replica_of() {
-        let tablets: BTreeMap<TabletId, Tablet> =
-            [(TabletId(1), tablet_with_replicas(1, vec![BASE, 301, 302]))]
-                .into_iter()
-                .collect();
-        assert_eq!(
-            tablets_to_release(&[TabletId(1)], &tablets, BASE),
-            Vec::<TabletId>::new()
-        );
-    }
-
-    #[test]
-    fn releases_a_minted_present_tablet_this_node_is_no_longer_a_replica_of() {
-        // The tablet still exists, but its replica set has moved off this node.
-        let tablets: BTreeMap<TabletId, Tablet> =
-            [(TabletId(1), tablet_with_replicas(1, vec![301, 302, 303]))]
-                .into_iter()
-                .collect();
-        assert_eq!(
-            tablets_to_release(&[TabletId(1)], &tablets, BASE),
-            vec![TabletId(1)]
-        );
-    }
-
-    #[test]
-    fn does_not_release_a_minted_tablet_that_is_absent() {
-        // Absence is `tablets_to_reclaim`'s job, not release's — a tablet dropped
-        // from the map entirely must NOT be released by this predicate.
-        let tablets: BTreeMap<TabletId, Tablet> = BTreeMap::new();
-        assert_eq!(
-            tablets_to_release(&[TabletId(1)], &tablets, BASE),
-            Vec::<TabletId>::new()
-        );
-    }
-
-    /// The two GC predicates partition this node's `minted` set: on the same
-    /// input, no tablet is ever both reclaimed and released (reclaim requires
-    /// absence, release requires presence + not-a-replica).
-    #[test]
-    fn reclaim_and_release_are_mutually_exclusive() {
-        // Tablet 1: present, still a replica  -> neither.
-        // Tablet 2: present, no longer a replica -> release only.
-        // Tablet 3: absent -> reclaim only.
-        let tablets: BTreeMap<TabletId, Tablet> = [
-            (TabletId(1), tablet_with_replicas(1, vec![BASE, 301])),
-            (TabletId(2), tablet_with_replicas(2, vec![301, 302])),
-        ]
-        .into_iter()
-        .collect();
-        let minted = [TabletId(1), TabletId(2), TabletId(3)];
-
-        let reclaim = tablets_to_reclaim(&minted, &tablets);
-        let release = tablets_to_release(&minted, &tablets, BASE);
-
-        assert_eq!(reclaim, vec![TabletId(3)]);
-        assert_eq!(release, vec![TabletId(2)]);
-        // Disjoint: nothing appears in both.
-        assert!(
-            reclaim.iter().all(|t| !release.contains(t)),
-            "reclaim {reclaim:?} and release {release:?} must be disjoint"
         );
     }
 }
