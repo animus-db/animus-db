@@ -5,7 +5,7 @@
 //! ```text
 //! animusd gen-config --nodes N [--host H] [--base-port P]   # print a cluster config (JSON)
 //! animusd --config FILE --node I [--dir DIR] [--ephemeral] # run node I of a cluster (one process)
-//! animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] # run an N-node cluster in one process
+//! animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B] # run an N-node cluster in one process
 //! animusd join --seed ADDR[,ADDR...] --node I [--ip A] [--base-port P] [--dir D] [--ephemeral] # seed/join startup (ADR 0032 PR2)
 //! ```
 //!
@@ -75,7 +75,7 @@ fn otel_instance_label(args: &[String]) -> String {
 const USAGE: &str = "usage:\n  \
     animusd gen-config --nodes N [--host H] [--base-port P]\n  \
     animusd --config FILE --node I [--dir DIR] [--ephemeral]\n  \
-    animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K]\n  \
+    animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B]\n  \
     animusd join --seed ADDR[,ADDR...] --node I [--ip A] [--base-port P] [--dir D] [--ephemeral]";
 
 /// `gen-config`: print a generated cluster config as JSON.
@@ -117,6 +117,12 @@ async fn run(args: &[String]) -> Result<(), String> {
     // it leads once it exceeds K keys (Phase 2.4). Handy for testing sharding by
     // bulk-seeding past the threshold.
     let mut auto_split: Option<usize> = None;
+    // `--auto-split-bytes B` (ADR 0034): same, but on an (approximate) scoped
+    // bytes threshold instead of a key count — the metric splitting is meant
+    // to bound in production (snapshot/compaction/replica-move/recovery cost
+    // scales with bytes, not key count). Either, both, or neither may be set;
+    // when both are set, whichever threshold is hit first triggers.
+    let mut auto_split_bytes: Option<u64> = None;
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -128,6 +134,9 @@ async fn run(args: &[String]) -> Result<(), String> {
             "--ip" => ip = parse_next(&mut it, "--ip")?,
             "--ephemeral" => backend = animusd::StorageBackend::Memory,
             "--auto-split" => auto_split = Some(parse_next(&mut it, "--auto-split")?),
+            "--auto-split-bytes" => {
+                auto_split_bytes = Some(parse_next(&mut it, "--auto-split-bytes")?);
+            }
             other => return Err(format!("unknown argument `{other}`")),
         }
     }
@@ -138,7 +147,9 @@ async fn run(args: &[String]) -> Result<(), String> {
             let index = node.ok_or("--config requires --node I")?;
             run_single(&path, index, dir, backend).await
         }
-        (None, Some(n)) => run_in_process_cluster(n, ip, dir, backend, auto_split).await,
+        (None, Some(n)) => {
+            run_in_process_cluster(n, ip, dir, backend, auto_split, auto_split_bytes).await
+        }
         (None, None) => Err("nothing to do".into()),
     }
 }
@@ -255,6 +266,7 @@ async fn run_in_process_cluster(
     dir: Option<std::path::PathBuf>,
     backend: animusd::StorageBackend,
     auto_split: Option<usize>,
+    auto_split_bytes: Option<u64>,
 ) -> Result<(), String> {
     if n == 0 {
         return Err("--cluster must be at least 1".into());
@@ -263,15 +275,22 @@ async fn run_in_process_cluster(
     let bound = animusd::bind_cluster(n, ip, &dir)
         .await
         .map_err(|e| format!("failed to bind cluster: {e}"))?;
-    let nodes = animusd::start_cluster_with_auto_split(bound, backend, auto_split)
-        .await
-        .map_err(|e| format!("failed to start cluster: {e}"))?;
+    let nodes =
+        animusd::start_cluster_with_auto_split_bytes(bound, backend, auto_split, auto_split_bytes)
+            .await
+            .map_err(|e| format!("failed to start cluster: {e}"))?;
 
-    match auto_split {
-        Some(k) => {
+    match (auto_split, auto_split_bytes) {
+        (Some(k), Some(b)) => println!(
+            "animusd: started {n}-node cluster (CP) — auto-split at {k} keys or {b} bytes/tablet"
+        ),
+        (Some(k), None) => {
             println!("animusd: started {n}-node cluster (CP) — auto-split at {k} keys/tablet")
         }
-        None => println!("animusd: started {n}-node cluster (CP)"),
+        (None, Some(b)) => {
+            println!("animusd: started {n}-node cluster (CP) — auto-split at {b} bytes/tablet")
+        }
+        (None, None) => println!("animusd: started {n}-node cluster (CP)"),
     }
     for (i, node) in nodes.iter().enumerate() {
         println!(

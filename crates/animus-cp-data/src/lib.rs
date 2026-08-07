@@ -241,6 +241,53 @@ impl StorageScope {
                 .unwrap_or(false),
         }
     }
+
+    /// This scope's own physical `(start, end)` bounds, for a caller that
+    /// needs a **bounded** physical range even when the logical range is
+    /// unbounded above (ADR 0034 — [`RaftKvNode::approx_bytes`]'s periodic
+    /// hot-path gate, which must stay cheap and must never fall back to a
+    /// whole-engine scan the way [`has_data`](Self::has_data) tolerates as a
+    /// one-time hosting-decision cost).
+    ///
+    /// `start` is always `physical(range.start)`. `end` is `physical(end)`
+    /// when the logical range has one; when it doesn't (the common
+    /// "one big not-yet-split tablet" case — a fresh table's first tablet
+    /// covers its own whole prefix), it is instead the **prefix upper
+    /// bound**: the smallest physical key strictly greater than every key
+    /// under this scope's `prefix` (increment the last byte below `0xFF`,
+    /// dropping every trailing `0xFF` byte first — the standard
+    /// range-scan-over-a-prefix idiom). This keeps the physical range
+    /// confined to this scope's own prefix — never a sibling tenant sharing
+    /// the same engine (ADR 0026/0028) — instead of degrading to "the rest of
+    /// the keyspace." Only `StorageScope::whole()` (no prefix at all) or an
+    /// astronomically unlikely all-`0xFF` prefix yields `end: None`, i.e.
+    /// genuinely unbounded.
+    #[must_use]
+    pub(crate) fn physical_bounds(&self) -> (Vec<u8>, Option<Vec<u8>>) {
+        let range = self.range();
+        let start = self.physical(&range.start);
+        let end = match range.end {
+            Some(e) => Some(self.physical(&e)),
+            None => prefix_upper_bound(&self.prefix),
+        };
+        (start, end)
+    }
+}
+
+/// The smallest byte string strictly greater than every string with this
+/// `prefix` — `None` if `prefix` is empty or entirely `0xFF` bytes (no finite
+/// upper bound exists). See [`StorageScope::physical_bounds`]'s doc.
+fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut out = prefix.to_vec();
+    while let Some(&last) = out.last() {
+        if last == 0xFF {
+            out.pop();
+        } else {
+            *out.last_mut().expect("just checked non-empty") = last + 1;
+            return Some(out);
+        }
+    }
+    None
 }
 
 impl Default for StorageScope {
@@ -1119,6 +1166,29 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             pairs.truncate(n);
         }
         pairs
+    }
+
+    /// A **cheap, range-scoped byte estimate** for this tablet (ADR 0034: the
+    /// auto-split trigger is byte-based, not key-count-based). Delegates to
+    /// [`StorageEngine::approx_bytes_in_range`] over this group's own live
+    /// [`StorageScope::physical_bounds`] — `LsmEngine` answers from its own
+    /// in-memory SSTable/memtable metadata (no disk read, no materialization,
+    /// matching `animusd`'s LSM-only `approx_key_count`'s cost — but, unlike
+    /// that key-count sibling, this stays **scoped** to this tablet even for
+    /// a not-yet-split, unbounded-above tablet, via `physical_bounds`'s
+    /// prefix-upper-bound trick); any other backend (e.g. `MemoryEngine`)
+    /// answers exactly via the trait's default. A storage
+    /// error reads as `0` — the same "never block the periodic gate on an
+    /// estimate" spirit as `approx_key_count`'s `Option`-returning LSM-only
+    /// accessors — since the auto-split loop's materializing confirm step
+    /// (`local_pairs`) is the authoritative check regardless of what this
+    /// estimate says.
+    pub async fn approx_bytes(&self) -> u64 {
+        let (start, end) = self.scope.physical_bounds();
+        self.storage
+            .approx_bytes_in_range(&start, end.as_deref())
+            .await
+            .unwrap_or(0)
     }
 
     /// Erase every key in this group's own `StorageScope` from the (possibly

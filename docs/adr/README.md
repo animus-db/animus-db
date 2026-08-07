@@ -38,3 +38,4 @@ relevant ADR (or supersede it) in the same PR as the code change.
 | [0030](0030-online-cluster-growth.md) | Online cluster growth: admin add-member + heartbeat-driven activation (data-plane only; the control group stays static) | Accepted |
 | [0031](0031-tablet-host-reconciler.md) | Per-node tablet-host reconciler + a metadata-applied watch primitive (consolidates 4 polling loops into one event-driven reconciler; amends 0028, 0029) | Accepted — implemented incrementally across PRs 1–6 |
 | [0032](0032-seed-join-membership.md) | Seed/join membership: a replicated node address book, `animusd join`, and decommission (closes 0030's `client_route` gap; amends 0024, 0030) | Accepted — implemented incrementally (PR1: address book; PR2: `animusd join`) |
+| [0034](0034-byte-based-auto-split.md) | Byte-based auto-split trigger: scoped byte estimate + byte-weighted median (amends 0002, 0028's auto-split loop) | Accepted |

@@ -232,6 +232,21 @@ impl CpGroup {
         )
     }
 
+    /// A cheap, non-materializing **byte** estimate for the byte-based
+    /// auto-split gate (ADR 0034) — this tablet's own scoped bytes
+    /// (`RaftKvNode::approx_bytes`, over its live `StorageScope`), on
+    /// **either** backend (unlike [`approx_key_count`](Self::approx_key_count),
+    /// which is LSM-only and returns `None` on the memory backend). See
+    /// `RaftKvNode::approx_bytes`'s doc for the estimator + its bias
+    /// direction; the auto-split loop's materializing confirm step
+    /// (`local_pairs`) corrects it before a split actually commits.
+    async fn approx_bytes(&self) -> u64 {
+        match self {
+            CpGroup::Lsm(n) => n.approx_bytes().await,
+            CpGroup::Mem(n) => n.approx_bytes().await,
+        }
+    }
+
     /// The first `limit` live `(key, value)` pairs with `key >= start`, in key
     /// order, from the **local** engine — the admin "browse keys" view (ADR 0021).
     /// Node-local introspection like the other `/admin/storage/*` routes, so it
@@ -730,6 +745,11 @@ pub(crate) struct AdminInfo {
     /// Surfaced on `/admin/config` so the dashboard can flag a tablet as
     /// "over threshold, about to split" without hardcoding the value.
     pub(crate) auto_split_threshold: Option<usize>,
+    /// The `--auto-split-bytes B` threshold (ADR 0034), if any — same
+    /// `--cluster N`-only scoping as `auto_split_threshold` above. A
+    /// CP-hosting node splits a tablet it leads once **either** configured
+    /// threshold is exceeded.
+    pub(crate) auto_split_bytes_threshold: Option<u64>,
 }
 
 impl BoundNode {
@@ -781,6 +801,7 @@ impl BoundNode {
             ClusterEdgeState::new(),
             BTreeMap::new(),
             None,
+            None,
             vec![admin_addr],
         )
         .await
@@ -789,14 +810,16 @@ impl BoundNode {
     /// Like [`start`](Self::start), but selects the CP group's storage engine and
     /// options. [`StorageBackend::Lsm`] is durable (survives restart);
     /// [`StorageBackend::Memory`] is volatile (ephemeral runs). `auto_split_threshold`
-    /// opts a CP-hosting node into the automatic size-telemetry split trigger (Phase
-    /// 2.4): when a tablet it leads exceeds that many keys, it splits at the median;
-    /// `None` (the default) disables it.
+    /// opts a CP-hosting node into the automatic key-count split trigger (Phase
+    /// 2.4): when a tablet it leads exceeds that many keys, it splits. Sibling
+    /// `auto_split_bytes_threshold` (ADR 0034) does the same for an
+    /// (approximate) scoped-bytes trigger. Either, both, or neither may be
+    /// `Some`; `(None, None)` (the default) disables auto-split entirely.
     ///
     /// # Errors
     /// Propagates a failure to open the CP group's on-disk engine (LSM backend
     /// only).
-    #[allow(clippy::too_many_arguments)] // node assembly: ids + backend + edge + route + split opt
+    #[allow(clippy::too_many_arguments)] // node assembly: ids + backend + edge + route + split opts
     pub async fn start_with(
         self,
         peers: BTreeMap<NodeId, SocketAddr>,
@@ -805,6 +828,7 @@ impl BoundNode {
         edge: ClusterEdgeState,
         client_route: BTreeMap<NodeId, SocketAddr>,
         auto_split_threshold: Option<usize>,
+        auto_split_bytes_threshold: Option<u64>,
         cluster_admin_addrs: Vec<SocketAddr>,
     ) -> std::io::Result<Node> {
         self.control_env.set_peers(peers.clone());
@@ -853,6 +877,7 @@ impl BoundNode {
                 cluster_admin_addrs
             },
             auto_split_threshold,
+            auto_split_bytes_threshold,
         });
 
         // Keep clones of the two internal envs so [`Node::shutdown`] can abort
@@ -1112,11 +1137,17 @@ impl BoundNode {
                     .await;
                 }));
             }
-            // Auto-split loop (Phase 2.4), opt-in: a node splits a tablet it leads
-            // once it exceeds the key-count threshold (it checks leadership per tablet,
-            // so running it on every node is harmless).
-            if let Some(threshold) = auto_split_threshold {
-                tasks.push(tokio::spawn(auto_split_loop(ctx.clone(), threshold)));
+            // Auto-split loop (Phase 2.4 / ADR 0034), opt-in: a node splits a tablet
+            // it leads once it exceeds **either** configured threshold (it checks
+            // leadership per tablet, so running it on every node is harmless).
+            if auto_split_threshold.is_some() || auto_split_bytes_threshold.is_some() {
+                tasks.push(tokio::spawn(auto_split_loop(
+                    ctx.clone(),
+                    AutoSplitThresholds {
+                        keys: auto_split_threshold,
+                        bytes: auto_split_bytes_threshold,
+                    },
+                )));
             }
             tasks.push(tokio::spawn(serve_clients(
                 self.client_listener,
@@ -3209,16 +3240,41 @@ const AUTO_SPLIT_COOLDOWN: Duration = Duration::from_secs(15);
 /// table's real bytes-per-entry below this.
 const AUTO_SPLIT_EST_ENTRY_BYTES: u64 = 32;
 
+/// The auto-split trigger's configured thresholds (ADR 0034). Either, both, or
+/// neither field may be `Some`; `auto_split_loop` is only spawned when at
+/// least one is (see [`BoundNode::start_with`]'s doc). When both are set,
+/// **either** exceeding its threshold fires a split — a byte-heavy tablet of
+/// few huge values and a key-heavy tablet of many tiny ones are different
+/// failure modes (snapshot/compaction/replica-move/recovery cost scales with
+/// bytes; some operational costs still scale with key count, e.g. bulk scan
+/// iteration overhead), so neither trigger alone dominates the other.
+#[derive(Clone, Copy, Debug)]
+struct AutoSplitThresholds {
+    /// `--auto-split K`: split once a led tablet holds more than `K` keys.
+    keys: Option<usize>,
+    /// `--auto-split-bytes B` (ADR 0034): split once a led tablet's
+    /// (approximate) scoped bytes exceed `B`.
+    bytes: Option<u64>,
+}
+
 /// The leader-driven **automatic split trigger**: on each tick, for every tablet
 /// whose CP group this node currently **leads**, take the leader's **cheap
-/// key-count estimate** ([`CpGroup::approx_key_count`] — memtable count + SSTable
-/// bytes, no materialization) and only when it says the tablet might exceed
-/// `threshold` (or on a slow per-tablet confirm cadence) materialize the live
-/// pairs once — the authoritative count *and*, if over threshold, the **median**
-/// split key come from that one snapshot. A split bisects the tablet so each half
-/// holds roughly half the keys. Per-tablet cooldown avoids a duplicate trigger
-/// while a split is in flight; once it applies, the parent's key count halves
-/// below the threshold.
+/// estimates** ([`CpGroup::approx_key_count`]/[`CpGroup::approx_bytes`] —
+/// memtable + SSTable metadata, no materialization) and only when one says the
+/// tablet might exceed its configured threshold (or on a slow per-tablet confirm
+/// cadence) materialize the live pairs once — the authoritative key count, byte
+/// total, and (if over threshold) **split key** all come from that one snapshot.
+/// Per-tablet cooldown avoids a duplicate trigger while a split is in flight;
+/// once it applies, the parent's counts halve below both thresholds.
+///
+/// **The split point is byte-weighted whenever a byte threshold is configured**
+/// (ADR 0034 — [`byte_weighted_median`], the key that roughly bisects the
+/// tablet's *bytes*, not just its key count): with skewed value sizes a plain
+/// positional median can leave one huge half and one tiny half, which
+/// immediately re-triggers on the huge side. A key-count-only configuration
+/// (`bytes: None`) keeps the plain positional median byte-for-byte unchanged
+/// from before this ADR, so existing key-count auto-split behavior/tests are
+/// untouched.
 ///
 /// Since a split is now a **single, atomic, epoch-CAS-gated** control-plane
 /// command (`ClientCtx::trigger_split`, mirroring `CasTabletReplicas`), there is
@@ -3236,11 +3292,7 @@ const AUTO_SPLIT_EST_ENTRY_BYTES: u64 = 32;
 /// sources such as a manual split racing this loop) — harmless: the epoch CAS
 /// lets exactly one win, and the loser just tries again (or backs off) next
 /// tick.
-///
-/// `threshold` is a **key count** here — a placeholder size signal; a real
-/// byte/size-based threshold is future tuning. Disabled unless a threshold is
-/// wired (so it never perturbs clusters that don't opt in).
-async fn auto_split_loop(ctx: ClientCtx, threshold: usize) {
+async fn auto_split_loop(ctx: ClientCtx, thresholds: AutoSplitThresholds) {
     let mut last_triggered: BTreeMap<TabletId, tokio::time::Instant> = BTreeMap::new();
     // When each tablet last had a *full* (materializing) count — the expensive
     // confirm is rate-limited per tablet, not run every tick.
@@ -3261,34 +3313,56 @@ async fn auto_split_loop(ctx: ClientCtx, threshold: usize) {
             };
             // Cheap per-tick gate: materializing every led tablet's live pairs
             // every tick is O(total data) per 2s — instead, take the free
-            // (over-)estimate and only materialize when it says the tablet might
-            // exceed the threshold, or on a slow per-tablet confirm cadence
+            // (over-)estimate(s) and only materialize when one says the tablet
+            // might exceed its threshold, or on a slow per-tablet confirm cadence
             // (bounded by `AUTO_SPLIT_COOLDOWN`) that corrects estimate error
             // (compression can push real bytes-per-entry below the assumed size;
-            // the memory backend has no estimate at all).
+            // the memory backend has no key-count estimate at all, though it does
+            // have a byte estimate — `approx_bytes` works on any backend).
             let due_confirm = last_counted
                 .get(&tablet)
                 .is_none_or(|at| at.elapsed() >= AUTO_SPLIT_COOLDOWN);
-            let hot = leader
-                .approx_key_count()
-                .is_some_and(|estimate| estimate > threshold);
-            if !hot && !due_confirm {
+            let key_hot = thresholds.keys.is_some_and(|t| {
+                leader
+                    .approx_key_count()
+                    .is_some_and(|estimate| estimate > t)
+            });
+            let byte_hot = match thresholds.bytes {
+                Some(t) => leader.approx_bytes().await > t,
+                None => false,
+            };
+            if !key_hot && !byte_hot && !due_confirm {
                 continue;
             }
-            // Materialize once: the authoritative count and, if over threshold,
-            // the median split key come from the same snapshot.
+            // Materialize once: the authoritative count, byte total, and (if over
+            // threshold) the split key all come from the same snapshot.
             let pairs = leader.local_pairs().await;
             last_counted.insert(tablet, tokio::time::Instant::now());
-            if pairs.len() <= threshold {
+            let key_count = pairs.len();
+            let over_key_threshold = thresholds.keys.is_some_and(|t| key_count > t);
+            let over_byte_threshold = thresholds.bytes.is_some_and(|t| {
+                let total_bytes: u64 = pairs.iter().map(|(k, v)| (k.len() + v.len()) as u64).sum();
+                total_bytes > t
+            });
+            // Need at least 2 distinct keys for any split to have an interior
+            // point (`SplitTablet` requires `start < at < end`).
+            if key_count < 2 || (!over_key_threshold && !over_byte_threshold) {
                 continue;
             }
-            // Median key bisects the tablet; it is strictly inside the range (an
-            // interior key of > threshold >= 2 distinct keys), so `SplitTablet`
-            // accepts it.
-            let median = pairs[pairs.len() / 2].0.clone();
+            // A byte-configured cluster uses the byte-weighted median (ADR
+            // 0034) so a skewed value-size distribution still bisects the
+            // tablet's *bytes* roughly evenly; a key-count-only cluster keeps
+            // the plain positional median unchanged from before this ADR (the
+            // interior key of `> threshold >= 2` distinct keys `SplitTablet`
+            // accepts).
+            let split_key = if thresholds.bytes.is_some() {
+                byte_weighted_median(&pairs)
+            } else {
+                pairs[pairs.len() / 2].0.clone()
+            };
             last_triggered.insert(tablet, tokio::time::Instant::now());
             let span = tracing::info_span!("auto_split", tablet = tablet.0);
-            let response = ctx.trigger_split(tablet, median).instrument(span).await;
+            let response = ctx.trigger_split(tablet, split_key).instrument(span).await;
             if !matches!(response, ClientResponse::PutOk) {
                 tracing::warn!(
                     tablet = tablet.0,
@@ -3298,6 +3372,48 @@ async fn auto_split_loop(ctx: ClientCtx, threshold: usize) {
             }
         }
     }
+}
+
+/// The key that most closely bisects `pairs`' **total bytes** (`key.len() +
+/// value.len()` per pair), not just its key count (ADR 0034): among every
+/// interior split point `i` (`1 <= i <= pairs.len() - 1`, splitting into
+/// `pairs[..i]` / `pairs[i..]`), returns `pairs[i].0` for the `i` whose left
+/// side's byte total is closest to half the whole. A key's bytes can never be
+/// divided across the split (a split point is always a whole key boundary),
+/// so when one key's own bytes are a large fraction of the total, the
+/// closest achievable split may still be lopsided — this picks the least
+/// lopsided **achievable** boundary, which is the best any key-boundary split
+/// can do. With skewed value sizes this avoids the plain positional median's
+/// failure mode: a few huge values among many tiny ones would otherwise put
+/// almost all the bytes on one side regardless of how many *keys* end up on
+/// each side, which immediately re-triggers a split on the huge side instead
+/// of settling below threshold.
+///
+/// Always returns an **interior** key (`i >= 1`, so never `pairs[0].0`,
+/// matching the positional median's own "index > 0" guarantee). Requires
+/// `pairs.len() >= 2` (the same precondition `auto_split_loop` already checks
+/// before calling this — there is no meaningful split point for 0 or 1 keys).
+fn byte_weighted_median(pairs: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
+    debug_assert!(
+        pairs.len() >= 2,
+        "need >= 2 keys for an interior split point"
+    );
+    let total: u64 = pairs.iter().map(|(k, v)| (k.len() + v.len()) as u64).sum();
+    let half = total / 2;
+    let mut best_idx = 1;
+    let mut best_diff = u64::MAX;
+    let mut prefix: u64 = 0; // bytes of pairs[0..i], updated *before* considering split `i`.
+    for (i, (key, value)) in pairs.iter().enumerate() {
+        if i >= 1 {
+            let diff = prefix.abs_diff(half);
+            if diff < best_diff {
+                best_diff = diff;
+                best_idx = i;
+            }
+        }
+        prefix += (key.len() + value.len()) as u64;
+    }
+    pairs[best_idx].0.clone()
 }
 
 async fn serve_clients(listener: TcpListener, ctx: ClientCtx) {
@@ -3837,7 +3953,7 @@ pub async fn start_cluster_with(
     bound: Vec<BoundNode>,
     backend: StorageBackend,
 ) -> std::io::Result<Vec<Node>> {
-    start_cluster_inner(bound, backend, None).await
+    start_cluster_inner(bound, backend, None, None).await
 }
 
 /// Like [`start_cluster`], but enables the **automatic split trigger** (Phase 2.4)
@@ -3851,7 +3967,7 @@ pub async fn start_cluster_auto_split(
     bound: Vec<BoundNode>,
     threshold: usize,
 ) -> std::io::Result<Vec<Node>> {
-    start_cluster_inner(bound, StorageBackend::default(), Some(threshold)).await
+    start_cluster_inner(bound, StorageBackend::default(), Some(threshold), None).await
 }
 
 /// Like [`start_cluster_with`], but also enables the **automatic split trigger**
@@ -3865,13 +3981,31 @@ pub async fn start_cluster_with_auto_split(
     backend: StorageBackend,
     auto_split: Option<usize>,
 ) -> std::io::Result<Vec<Node>> {
-    start_cluster_inner(bound, backend, auto_split).await
+    start_cluster_inner(bound, backend, auto_split, None).await
+}
+
+/// Like [`start_cluster_with_auto_split`], but also configures the **byte**
+/// auto-split threshold (ADR 0034): a CP-hosting node splits a tablet it
+/// leads once **either** `auto_split_keys` or `auto_split_bytes` is exceeded
+/// (each independently optional). The plain key-count-only entry points
+/// above are kept as thin wrappers over this one for back-compat.
+///
+/// # Errors
+/// Propagates a failure to open any node's CP group engine.
+pub async fn start_cluster_with_auto_split_bytes(
+    bound: Vec<BoundNode>,
+    backend: StorageBackend,
+    auto_split_keys: Option<usize>,
+    auto_split_bytes: Option<u64>,
+) -> std::io::Result<Vec<Node>> {
+    start_cluster_inner(bound, backend, auto_split_keys, auto_split_bytes).await
 }
 
 async fn start_cluster_inner(
     bound: Vec<BoundNode>,
     backend: StorageBackend,
     auto_split_threshold: Option<usize>,
+    auto_split_bytes_threshold: Option<u64>,
 ) -> std::io::Result<Vec<Node>> {
     let n = bound.len();
     let control_ids: Vec<NodeId> = (0..n).map(config::control_id).collect();
@@ -3910,6 +4044,7 @@ async fn start_cluster_inner(
                 ClusterEdgeState::new(),
                 client_route.clone(),
                 auto_split_threshold,
+                auto_split_bytes_threshold,
                 admin_addrs.clone(),
             )
             .await?;
@@ -3977,6 +4112,7 @@ pub async fn run_node_with(
             backend,
             ClusterEdgeState::new(),
             client_route,
+            None,
             None,
             admin_addrs,
         )
@@ -4047,6 +4183,7 @@ pub async fn run_node_growth(
             backend,
             ClusterEdgeState::new(),
             client_route,
+            None,
             None,
             admin_addrs,
         )
@@ -4234,6 +4371,7 @@ pub async fn run_node_join(
             backend,
             ClusterEdgeState::new(),
             client_route,
+            None,
             None,
             admin_addrs,
         )
@@ -4541,5 +4679,100 @@ mod split_fence_tests {
         })
         .await
         .expect("test timed out");
+    }
+}
+
+/// Unit tests for [`byte_weighted_median`] (ADR 0034) — a private free
+/// function, so this lives as an in-crate `#[cfg(test)]` module (like
+/// `split_fence_tests` above) rather than under `tests/`, which can't reach
+/// it.
+#[cfg(test)]
+mod auto_split_median_tests {
+    use super::byte_weighted_median;
+
+    fn pair(key: &str, value_len: usize) -> (Vec<u8>, Vec<u8>) {
+        (key.as_bytes().to_vec(), vec![b'x'; value_len])
+    }
+
+    /// Many tiny rows plus a **few huge** ones: the byte-weighted median must
+    /// land near where the *bytes* are roughly halved, which — because the
+    /// huge values dominate the total — is a very different key than the
+    /// plain positional median (`pairs.len() / 2`, dead center by count).
+    #[test]
+    fn skewed_value_sizes_bisect_by_bytes_not_position() {
+        // 20 tiny rows (~1 byte value each) then 2 huge rows (~10,000 bytes
+        // each) at the end: positionally the median sits deep in the tiny
+        // run (index 11 of 22), but two rows alone hold the vast majority of
+        // the bytes.
+        let mut pairs: Vec<(Vec<u8>, Vec<u8>)> =
+            (0..20).map(|i| pair(&format!("k{i:03}"), 1)).collect();
+        pairs.push(pair("y0", 10_000));
+        pairs.push(pair("y1", 10_000));
+
+        let total: u64 = pairs.iter().map(|(k, v)| (k.len() + v.len()) as u64).sum();
+        let positional_median = pairs[pairs.len() / 2].0.clone();
+        // The positional median is one of the tiny keys, deep in the small
+        // run — nowhere near where the bytes actually split.
+        assert!(
+            positional_median.starts_with(b"k"),
+            "sanity: the plain positional median is a tiny-row key, not a \
+             huge-row one, proving the two metrics genuinely disagree here"
+        );
+
+        let split = byte_weighted_median(&pairs);
+        let split_idx = pairs
+            .iter()
+            .position(|(k, _)| k == &split)
+            .expect("split key is one of the pairs");
+
+        // Sum of bytes strictly before the split point vs. at/after it — both
+        // halves should be within a small tolerance of `total / 2`, unlike
+        // the positional median which would leave ~20KB on one side and a
+        // few dozen bytes on the other.
+        let left_bytes: u64 = pairs[..split_idx]
+            .iter()
+            .map(|(k, v)| (k.len() + v.len()) as u64)
+            .sum();
+        let right_bytes: u64 = total - left_bytes;
+        let half = total / 2;
+        // Since the two huge rows dominate, the byte-weighted cut must fall
+        // at or after the first huge row (index 20) — i.e. not inside the
+        // tiny-row run at all.
+        assert!(
+            split_idx >= 20,
+            "byte-weighted median (index {split_idx}) must fall at/after the \
+             first huge value, not inside the tiny-row run — total={total}"
+        );
+        // And it must actually roughly bisect the bytes: neither side should
+        // hold less than a third of the total (a loose bound — this is a
+        // heuristic estimator, not an exact bisection).
+        assert!(
+            left_bytes >= half / 3 && right_bytes >= half / 3,
+            "split should roughly halve bytes: left={left_bytes} right={right_bytes} half={half}"
+        );
+    }
+
+    /// Uniform value sizes: the byte-weighted median should land at (or very
+    /// near) the plain positional median, since bytes-per-row is constant.
+    #[test]
+    fn uniform_value_sizes_agree_with_positional_median() {
+        let pairs: Vec<(Vec<u8>, Vec<u8>)> =
+            (0..10).map(|i| pair(&format!("k{i:03}"), 8)).collect();
+        let positional = pairs[pairs.len() / 2].0.clone();
+        let weighted = byte_weighted_median(&pairs);
+        assert_eq!(
+            weighted, positional,
+            "uniform row sizes: byte-weighted and positional medians should coincide"
+        );
+    }
+
+    /// Always returns an interior key (never the very first key), matching
+    /// the positional median's own "index > 0" guarantee — required so
+    /// `SplitTablet` always sees a valid `start < at` split point.
+    #[test]
+    fn never_returns_the_first_key() {
+        let pairs = vec![pair("a", 100_000), pair("b", 1), pair("c", 1)];
+        let split = byte_weighted_median(&pairs);
+        assert_ne!(split, b"a".to_vec(), "must not return the first key");
     }
 }
