@@ -74,11 +74,16 @@ registries) was a **deliberate follow-up** — and is now done. Both the CQL
 (`animusd::cql`) and DynamoDB (`animusd::dynamo`) edges propose
 `CreateTableSchema`/`DropTableSchema` on `CREATE TABLE`/`DROP TABLE` and wait for
 commit, and resolve reads/writes against the replicated `Metadata` rather than a
-per-process catalog. The CQL edge maps its `CqlType` onto `ColumnType` (and back),
-keys tables `keyspace.table`, and reaches the leader through a process-global set
-of registered control handles (the same mechanism the DynamoDB edge uses); it also
-adds `ALTER TABLE ... ADD` on top (a non-atomic drop+recreate of the schema, since
-in-place schema evolution is still future work — see Consequences).
+per-process catalog. The CQL edge maps its `CqlType` onto `ColumnType` (and back)
+and keys tables `keyspace.table`. Proposing the command is routed through
+`ClientCtx::propose_schema`: propose locally when the connected node is the
+control-plane leader, otherwise **relay** `ClientRequest::ProposeSchema` one hop
+to the leader's node (falling back to a broadcast across every known client
+address when no leader is locally known at all — the only path an ADR 0030
+growth node, whose own control Raft never elects, has to reach the real
+cluster) — see Consequences for the cross-process detail. `ALTER TABLE ... ADD`
+is an **atomic in-place** schema replacement (`MetaCommand::ReplaceTableSchema`,
+one command/one apply — see Consequences), not a drop+recreate.
 
 ## Consequences
 
@@ -95,10 +100,28 @@ in-place schema evolution is still future work — see Consequences).
   through these `MetaCommand`s and resolve against `Metadata`, so a created table
   is durable and cluster-agreed across the wire — proven over real TCP with a node
   restart in `animusd/tests/cql_durable_schema.rs` (CQL) and the DynamoDB edge's
-  schema test. DDL proposals route to the control-plane leader via a
-  process-global set of registered control handles (working for the in-process
-  `--cluster N` mode; cross-process proposal forwarding over the network is still
-  future work — DDL otherwise commits when the connected node is the leader).
+  schema test.
+- **Cross-process DDL proposal forwarding is implemented, closing what this ADR
+  originally left as future work.** A schema-catalog `MetaCommand` issued to a
+  node that is *not* the control-plane leader no longer just times out: `animusd`
+  gates a fixed allowlist of relayable commands (`is_relayable_command` —
+  `Create`/`Drop`/`ReplaceTableSchema`, `Create`/`DropTableIndex`, `SetTableMode`,
+  `Create`/`DropKeyspace`, plus the tablet-provisioning/registration commands DDL
+  depends on) and `ClientCtx::propose_schema` relays a non-local proposal one hop
+  to the leader's node over `ClientRequest::ProposeSchema`, retrying with a
+  patient backoff rather than resubmitting a possibly-already-accepted entry on
+  every poll tick. A non-allowlisted command (e.g. a membership/placement change)
+  is rejected by the relay — this is a narrow DDL-forwarding surface, not a
+  general "propose anything remotely" endpoint. Every real DDL entry point (CQL
+  `CREATE`/`ALTER`/`DROP TABLE`, `CREATE`/`DROP KEYSPACE`, and the DynamoDB
+  `CreateTable` + its GSI/LSI `CreateTableIndex` proposals) goes through this
+  path, so DDL commits regardless of which node in the cluster the client
+  happens to be connected to. Proven in a genuine one-process-per-node cluster
+  (not just in-process `--cluster N`) in
+  `animusd/tests/schema_ddl_relay.rs::schema_ddl_on_a_follower_is_relayed_to_the_leader`
+  — a follower-connected `CreateTableSchema`, `SetTableMode`, and the atomic
+  `ReplaceTableSchema` (ALTER) all commit + replicate cluster-wide, while a
+  follower-connected non-schema command is rejected.
 - **Secondary-index *definitions* now replicate.** A table's `TableSchema` carries
   an ordered `indexes: Vec<IndexDef>` (GSI/LSI: name, kind, hash/sort attributes,
   projection), mutated by two new deterministic `MetaCommand`s —
@@ -170,9 +193,18 @@ in-place schema evolution is still future work — see Consequences).
   Same-table, same-node correctness (a write immediately followed by a query on
   the *same* connection with no restart in between) was already correct before
   this ADR — nothing here changes that path.
-- **Costs / follow-up:** CQL keyspace objects are still **not** modelled here —
-  the schema captures key structure + typed columns + index definitions; keyspace
-  metadata can extend `SchemaCatalog` later without changing the replication
-  mechanism. In-place schema *evolution* is still future work: the CQL edge's
-  `ALTER TABLE ADD` is a non-atomic drop+recreate, and there is no
-  `AlterTableSchema` `MetaCommand` yet.
+- **CQL keyspace objects are now modelled here too (v1 A3, no longer future
+  work):** `Metadata` gained a `keyspaces: BTreeSet<String>` field alongside
+  `schemas`, mutated by `MetaCommand::CreateKeyspace`/`DropKeyspace` (idempotent,
+  same shape as the table-schema commands) and read via `Metadata::has_keyspace`
+  — replicated, durable, and relayable exactly like a table schema.
+- **In-place schema *evolution* is also done:** `MetaCommand::ReplaceTableSchema`
+  atomically replaces a table's schema in one command/one apply (rejected if the
+  table has no schema — an ALTER cannot create a table). The CQL edge's `ALTER
+  TABLE ... ADD` uses it, so there is no window where a crash between a
+  drop-then-recreate could leave the table schema-less, unlike the earlier
+  two-command approach this ADR originally anticipated.
+- **Costs / follow-up:** none of substance remain for the catalog shape itself.
+  Index *data* (as opposed to *definitions*) staying edge-local — now with the
+  lazy backfill + race hardening described above — and drop+GC semantics for a
+  whole table, are covered by later ADRs (0024, 0028).
