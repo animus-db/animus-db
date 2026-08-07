@@ -33,6 +33,16 @@ fn unique_tmp_dir() -> std::path::PathBuf {
 
 /// An `UpsertMember` carrying a labels map with `n_keys` entries, so a handful of
 /// these build a many-thousand-entry (multi-MB) `Metadata`.
+///
+/// `Joining`, not `Active`: these ids are pure bulk payload (no envs, no
+/// heartbeats — the test only cares about `Metadata`'s serialized *size*), and
+/// `Joining`/`Leaving` are the two statuses the failure detector deliberately
+/// never judges (ADR 0012). Registering 130 fake nodes `Active` (ADR 0030
+/// phantom-member hardening: an `Active` member the detector never hears a
+/// heartbeat from is now demoted after one `DETECT_TIMEOUT`) turned every one of
+/// them into a "phantom" at once, and `detect_loop` proposing ~130 `Down`
+/// transitions in a single tick flooded the leader's WAL right as node 2 was
+/// trying to catch up — a real regression this test caught, not a flake.
 fn fat_member(node: u64, n_keys: usize) -> MetaCommand {
     let mut labels = BTreeMap::new();
     for k in 0..n_keys {
@@ -41,7 +51,7 @@ fn fat_member(node: u64, n_keys: usize) -> MetaCommand {
     MetaCommand::UpsertMember {
         node,
         labels,
-        status: NodeStatus::Active,
+        status: NodeStatus::Joining,
     }
 }
 
@@ -107,7 +117,8 @@ async fn large_metadata_catch_up_stays_live() {
             leader.propose(MetaCommand::UpsertMember {
                 node: 999,
                 labels: BTreeMap::new(),
-                status: NodeStatus::Active,
+                // `Joining`, not `Active` — see `fat_member`'s doc.
+                status: NodeStatus::Joining,
             });
         }
 

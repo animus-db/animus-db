@@ -560,8 +560,22 @@ pub enum ClientRequest {
 /// metadata half of the admin split trigger (already client-exposed via
 /// [`ClientRequest::SplitTablet`], so relaying it adds no new authority — it lets the
 /// trigger reach the control leader cross-process when the split is driven from a
-/// follower). Other membership / placement / tablet commands are control-plane-
-/// internal and are **not** accepted over this path.
+/// follower). Other placement / tablet commands are control-plane-internal and are
+/// **not** accepted over this path.
+///
+/// A `Down`-registering [`MetaCommand::UpsertMember`] is relayable too (ADR
+/// 0030's admin add-member action, `ClientCtx::admin_add_member`): unlike
+/// `admin_drain`'s `Leaving` transition (an operator action on an *existing,
+/// already-Active* member, deliberately kept local-leader-only so it can't be
+/// triggered accidentally through a relay chain), registering a **new** member
+/// as `Down` carries no comparable risk — it grants no placement eligibility by
+/// itself (the detector promotes it to `Active` only on a real heartbeat, ADR
+/// 0012), and the whole point of online growth is that the admin caller may not
+/// be connected to the control leader (e.g. a growth node's own control role is
+/// never a real voter, ADR 0030, so relaying is its *only* way to reach the real
+/// leader at all). Deliberately scoped to the `Down` status only — an
+/// `Active`/`Leaving` transition on an *existing* member stays off this path,
+/// same as before.
 fn is_relayable_command(command: &MetaCommand) -> bool {
     matches!(
         command,
@@ -585,6 +599,13 @@ fn is_relayable_command(command: &MetaCommand) -> bool {
             // Drop-table GC (ADR 0024): a `DROP TABLE` on a follower-connected
             // client relays the table's tablet removal to the control leader.
             | MetaCommand::DropTableTablets { .. }
+            // Online growth (ADR 0030): admin add-member registers a new raftkv
+            // id as `Down` — see the doc above for why this is safe to relay
+            // unlike drain (which stays local-leader-only).
+            | MetaCommand::UpsertMember {
+                status: NodeStatus::Down,
+                ..
+            }
     )
 }
 
@@ -882,6 +903,7 @@ impl BoundNode {
             base_id: my_raftkv_id,
             admin: admin_info,
             metrics_history: Arc::new(Mutex::new(VecDeque::with_capacity(METRICS_HISTORY_CAP))),
+            remote_metadata: Arc::new(Mutex::new(None)),
         };
         let n = control_ids.len();
 
@@ -920,10 +942,36 @@ impl BoundNode {
         // (split sibling / joined node) becomes reachable for the group's internal
         // Raft traffic. Runs on every node (harmless where no CP group is hosted).
         tasks.push(tokio::spawn(peer_sync_loop(
-            raft.clone(),
+            ctx.clone(),
             raftkv_sync_env,
-            static_peers,
+            static_peers.clone(),
         )));
+
+        // **Control-plane-follower-less growth node mirror** (ADR 0030): this
+        // node's own control role is a genuine voter of `control_ids` iff its own
+        // control id is *in* that set — the common case for every node started
+        // the normal way (`start`/`run_node_with`/`start_cluster_*`, which always
+        // pass a `control_ids` that includes `self.control_id`). A node started
+        // via `run_node_growth` deliberately passes the **pre-growth** control
+        // group instead (it "needs no control-voter slot" — see that fn's doc),
+        // so its own `RaftCore` permanently sits outside `control_ids`: it can
+        // never become a voter, campaign, or receive real AppendEntries from the
+        // real leader (whose own peer set is derived from *its* config, which
+        // never learned of this node — the control group stays static, ADR
+        // 0030's documented v1 limitation). Such a node instead mirrors real
+        // cluster state by polling `ClientRequest::Status` from one of the
+        // pre-growth control nodes' client addresses (derived from
+        // `client_route`, which growth's expanded config populates for every
+        // node it lists) into `ctx.remote_metadata`, read via
+        // `effective_metadata()`. A no-op (empty seed list, loop returns
+        // immediately) for every other node.
+        if !control_ids.contains(&self.control_id) {
+            let seeds: Vec<SocketAddr> = control_ids
+                .iter()
+                .filter_map(|id| ctx.client_route.get(id).copied())
+                .collect();
+            tasks.push(tokio::spawn(remote_metadata_sync_loop(ctx.clone(), seeds)));
+        }
 
         // **Failure-detection heartbeat loop** (#3 / ADR 0012): every node heartbeats
         // the control group *as its `raftkv` member id* (the cluster members are the
@@ -1418,9 +1466,49 @@ pub(crate) struct ClientCtx {
     /// A plain `std::sync::Mutex` is fine: every access is a quick lock/mutate/
     /// drop with no `.await` held across it.
     metrics_history: Arc<Mutex<VecDeque<MetricsSample>>>,
+    /// A **control-plane-follower-less growth node's** (ADR 0030) mirror of the
+    /// real cluster's replicated `Metadata`, refreshed by
+    /// [`remote_metadata_sync_loop`] polling `ClientRequest::Status` against one
+    /// of the pre-growth control nodes. `None` for every node that is a genuine
+    /// voter of `self.raft`'s own control group (the overwhelming common case —
+    /// the control group is static, ADR 0030's documented v1 limitation, so this
+    /// is only ever populated on a node started via [`run_node_growth`]). Read
+    /// through [`effective_metadata`](Self::effective_metadata), never directly —
+    /// see that method's doc for which call sites must use it.
+    remote_metadata: Arc<Mutex<Option<Metadata>>>,
 }
 
 impl ClientCtx {
+    /// This node's best available view of the cluster's replicated `Metadata`:
+    /// this node's own live `RaftNode` for a genuine control-group voter (the
+    /// common case — reflects committed state via real Raft replication), or the
+    /// **mirrored** snapshot [`remote_metadata_sync_loop`] maintains for a
+    /// control-plane-follower-less growth node (ADR 0030) whose own control
+    /// `RaftCore` never receives real Raft traffic for a group it was never a
+    /// voter of (`self.remote_metadata` stays `None` for every other node, so
+    /// this is a plain passthrough to `self.raft.metadata()` everywhere else —
+    /// zero behavior change).
+    ///
+    /// **Use this, not `self.raft.metadata()` directly, for anything that must
+    /// work on a growth node**: CP routing (`tablet_for`/`resolve_cp_route`),
+    /// the per-node join-host/reconfigure loops, this node's own
+    /// address-registration commit check, and the raftkv peer-sync loop. Plain
+    /// schema-catalog reads (`table_schema`/`has_keyspace`, used by the
+    /// CQL/DynamoDB wire edges) are **not** switched — a growth node is not
+    /// expected to serve DDL locally in this v1 slice (ADR 0030); route schema
+    /// operations through an original control node.
+    fn effective_metadata(&self) -> Metadata {
+        if let Some(meta) = self
+            .remote_metadata
+            .lock()
+            .expect("remote metadata poisoned")
+            .clone()
+        {
+            return meta;
+        }
+        self.raft.metadata()
+    }
+
     /// The id of the tablet whose key range covers `key`, from this node's cached
     /// `Metadata` tablet map (the control plane's placement authority). `None` if no
     /// tablet covers it yet (the cluster is still bootstrapping its first tablet).
@@ -1443,7 +1531,7 @@ impl ClientCtx {
         // the global tablet map. No catch-all: a key of an unprovisioned table yields
         // `None` and the caller waits. The range-match lookup itself is pure — see
         // `topology::tablet_for_key`.
-        topology::tablet_for_key(self.raft.metadata().tablets_for_table(table), key)
+        topology::tablet_for_key(self.effective_metadata().tablets_for_table(table), key)
     }
 
     /// Resolve how to reach the CP group leader for an op on `key` (shared by every
@@ -1519,7 +1607,7 @@ impl ClientCtx {
         let (is_replica, fallback_forward) = if has_local_replica {
             (false, None)
         } else {
-            let meta = self.raft.metadata();
+            let meta = self.effective_metadata();
             let replicas = meta.tablets.get(&tablet).map(|t| &t.replicas);
             let is_replica = replicas.is_some_and(|r| r.contains(&self.base_id));
             let fallback = replicas
@@ -2117,7 +2205,11 @@ impl ClientCtx {
     async fn cp_put(&self, table: &str, key: Vec<u8>, value: Vec<u8>) -> ClientResponse {
         // Auto-provision the table's tablet on first write (ADR 0023): the raw KV
         // client names a table but issues no DDL, so stand one up on demand.
-        if !self.raft.metadata().has_table_tablet(table) {
+        // `effective_metadata` (not `self.raft.metadata()` directly): on a growth
+        // node (ADR 0030) the local raft never reflects a table created before it
+        // existed, which would otherwise misread every write as needing a brand
+        // new (duplicate, rejected) tablet.
+        if !self.effective_metadata().has_table_tablet(table) {
             if let Err(e) = self.provision_tablet(table).await {
                 return ClientResponse::Error(e);
             }
@@ -2132,7 +2224,8 @@ impl ClientCtx {
     /// [`ClientResponse`]). Thin adapter over [`cp_read`](Self::cp_read).
     async fn cp_get(&self, table: &str, key: Vec<u8>) -> ClientResponse {
         // A table with no tablet has no data (ADR 0023) — absent, no routing wait.
-        if !self.raft.metadata().has_table_tablet(table) {
+        // `effective_metadata`: see `cp_put`'s identical comment (ADR 0030).
+        if !self.effective_metadata().has_table_tablet(table) {
             return ClientResponse::Value(None);
         }
         match self.cp_read(table, key).await {
@@ -2220,6 +2313,32 @@ impl ClientCtx {
                         .await,
                     ClientResponse::Error(_)
                 );
+            }
+        }
+        // No locally-known leader. The common cause is a real control-group
+        // voter mid-election (rare, brief); the other is a **control-plane-
+        // follower-less growth node** (ADR 0030) whose own control `RaftCore`
+        // never learns a leader at all, since it never receives real Raft
+        // traffic for a group it was never a voter of — for it, this is the
+        // *only* path that can ever reach the real cluster (its own local
+        // `propose` always fails, and it has no leader hint to relay a single
+        // hop to). Broadcast to every other known client-API address instead:
+        // a real control-group member among them resolves the actual leader
+        // itself (one more hop — `ProposeSchema`'s handler is a single,
+        // bounded relay, never a chain). Returns true on the first address that
+        // connects, regardless of what its own `propose_schema` achieves
+        // (best-effort, same as every other branch here — the caller confirms
+        // via replicated `Metadata`, not this return value).
+        for &addr in self.client_route.values() {
+            if addr == self.admin.client_addr {
+                continue;
+            }
+            if !matches!(
+                self.relay(addr, ClientRequest::ProposeSchema(command.clone()))
+                    .await,
+                ClientResponse::Error(_)
+            ) {
+                return true;
             }
         }
         false
@@ -2447,6 +2566,56 @@ impl ClientCtx {
             }
         }
     }
+
+    /// **Admin action (ADR 0030): register a new node for online cluster growth.**
+    /// Proposes `UpsertMember{node, labels, status: Down}` for `node` (the new
+    /// node's **raftkv** id) — deliberately `Down`, not `Active`: the failure
+    /// detector promotes `Down` → `Active` on the node's *first real heartbeat*
+    /// (ADR 0012's existing, unmodified promotion chain — `FailureDetector::
+    /// observe` starts tracking a member on its first heartbeat and reports it
+    /// alive from that same instant, so `detect_loop`'s very next tick proposes
+    /// the promotion), so a declared-but-never-booted node never becomes placement-
+    /// eligible — see [`is_relayable_command`]'s doc for why `Down` specifically is
+    /// safe to relay. Unlike [`admin_drain`](Self::admin_drain) (an operator action
+    /// on an *existing* member, local-leader-only by design), this **relays**
+    /// through [`propose_and_await`](Self::propose_and_await), so it works from
+    /// any node reachable from an operator's shell — including the new node's own
+    /// admin port, whose control role is never a real control-group voter (a
+    /// control-plane-follower-less growth node relays every proposal, ADR 0030).
+    /// Idempotent: re-adding an already-registered member (any status) is a no-op
+    /// success — this action's job is only "make sure it's registered at all",
+    /// not to force it back to `Down`.
+    pub(crate) async fn admin_add_member(
+        &self,
+        node: NodeId,
+        labels: BTreeMap<String, String>,
+    ) -> Result<(), String> {
+        if self.effective_metadata().members.contains_key(&node) {
+            return Ok(());
+        }
+        self.propose_and_await(
+            MetaCommand::UpsertMember {
+                node,
+                labels,
+                status: NodeStatus::Down,
+            },
+            SCHEMA_COMMIT_TIMEOUT,
+            || {
+                self.effective_metadata()
+                    .members
+                    .contains_key(&node)
+                    .then_some(())
+            },
+        )
+        .await
+        .map_err(|()| {
+            format!(
+                "add-member for node {node} did not commit within {}s \
+                 (no control-plane leader reachable?)",
+                SCHEMA_COMMIT_TIMEOUT.as_secs()
+            )
+        })
+    }
 }
 
 /// The leader's one-time cluster bootstrap, retried on a timer until it lands.
@@ -2461,6 +2630,30 @@ impl ClientCtx {
 /// re-election does not duplicate it. The CP group itself is statically formed at
 /// node start; automatic CP failure-detection / reconfigure is later v1 work, so no
 /// `PlacementPolicy` is attached.
+///
+/// **Registers `Active` (ADR 0030 phantom-member hardening — option (a), not
+/// (b)).** Registering `Down` instead (promoted only by a real heartbeat, the
+/// same mechanism [`ClientCtx::admin_add_member`] relies on for online growth)
+/// was tried first and reverted: bootstrap's *every* declared node is expected
+/// to already be booting in the same process-start window, so a still-electing
+/// leader or a slow first heartbeat can commit `CreateTable`'s provisioning
+/// (`ClientCtx::provision_tablet`, which seeds a tablet's replica set from
+/// whichever members are `Active` *right now*) against a **transiently
+/// under-replicated** membership — `tests/cp_cross_process.rs` caught this
+/// exactly (a table provisioned with a 2-of-3 replica set because the third
+/// bootstrap member hadn't yet heartbeated its way to `Active`), a real,
+/// non-trivial regression the spec's own contingency called for. Registering
+/// `Active` immediately (as before ADR 0030) restores that guarantee. The
+/// phantom hole this used to leave open — a *declared-but-never-booted* node
+/// staying placement-eligible forever, since nothing ever judges an `Active`
+/// member the detector has never heard from — is closed instead in
+/// `animus-control`'s `detect_loop` (see its doc): a member the detector
+/// doesn't yet track is now given a synthetic first observation the moment the
+/// leader notices it declared `Active`, which starts the same silence clock a
+/// real heartbeat would — so a node that never actually heartbeats is demoted
+/// to `Down` after one ordinary `DETECT_TIMEOUT`, same as any other failure,
+/// while a node whose real heartbeat arrives promptly (the overwhelmingly
+/// common case) is unaffected.
 async fn bootstrap(raft: RaftNode<ProdEnv>, raftkv_ids: Vec<NodeId>) {
     loop {
         if raft.is_leader() {
@@ -2496,20 +2689,63 @@ const PEER_SYNC_INTERVAL: Duration = Duration::from_millis(200);
 /// `raftkv` env reaches every co-resident CP group. Idempotent each tick; runs for
 /// the life of the node (a perpetual loop, aborted on `shutdown`). A peer entry
 /// whose address fails to parse is skipped (the control plane stores it opaquely).
+///
+/// Takes the whole [`ClientCtx`] (not a bare `RaftNode`) so a control-plane-
+/// follower-less growth node (ADR 0030) reads `effective_metadata` — its mirror
+/// of the real cluster's `cp_member_addrs` — instead of its own never-replicated
+/// local raft; every other node is unaffected (`effective_metadata` passes
+/// through to `raft.metadata()` there).
 async fn peer_sync_loop(
-    raft: RaftNode<ProdEnv>,
+    ctx: ClientCtx,
     raftkv_env: ProdEnv,
     static_peers: BTreeMap<NodeId, SocketAddr>,
 ) {
     loop {
         let mut book = static_peers.clone();
-        for (id, addr) in raft.metadata().cp_member_addrs {
+        for (id, addr) in ctx.effective_metadata().cp_member_addrs {
             if let Ok(sa) = addr.parse::<SocketAddr>() {
                 book.insert(id, sa);
             }
         }
         raftkv_env.set_peers(book);
         tokio::time::sleep(PEER_SYNC_INTERVAL).await;
+    }
+}
+
+/// How often a control-plane-follower-less growth node (ADR 0030) refreshes its
+/// mirror of the real cluster's `Metadata` — see [`remote_metadata_sync_loop`].
+/// Brisk, matching [`PEER_SYNC_INTERVAL`]'s cadence: the mirror gates the same
+/// kind of "did my own registration land yet" / "was I placed on a tablet yet"
+/// polling loops that read it.
+const REMOTE_METADATA_SYNC_INTERVAL: Duration = Duration::from_millis(200);
+
+/// Mirror the real cluster's replicated `Metadata` into `ctx.remote_metadata` by
+/// periodically polling `ClientRequest::Status` against one of `seeds` (the
+/// pre-growth control nodes' client addresses) — the fallback for a **control-
+/// plane-follower-less growth node** (ADR 0030) whose own control `RaftCore` can
+/// never receive real Raft replication for a group it was never a voter of (see
+/// `run_node_growth`'s doc). Tries every seed in order each tick, keeping
+/// whichever answers first; a no-op (returns immediately) when `seeds` is empty
+/// — the case for every node that *is* a real control-group voter, since
+/// `effective_metadata` then passes straight through to `self.raft.metadata()`
+/// and nothing needs mirroring. Best-effort: a tick where every seed is
+/// unreachable just leaves the previous snapshot in place (stale, not wrong —
+/// every consumer of `effective_metadata` already tolerates a few hundred
+/// milliseconds of staleness from its own polling cadence).
+async fn remote_metadata_sync_loop(ctx: ClientCtx, seeds: Vec<SocketAddr>) {
+    if seeds.is_empty() {
+        return;
+    }
+    loop {
+        for &addr in &seeds {
+            if let ClientResponse::Status(meta) = ctx.relay(addr, ClientRequest::Status).await {
+                *ctx.remote_metadata
+                    .lock()
+                    .expect("remote metadata poisoned") = Some(meta);
+                break;
+            }
+        }
+        tokio::time::sleep(REMOTE_METADATA_SYNC_INTERVAL).await;
     }
 }
 
@@ -2611,7 +2847,10 @@ const CP_RECONFIGURE_INTERVAL: Duration = Duration::from_millis(150);
 async fn cp_reconfigure_loop(ctx: ClientCtx) {
     loop {
         tokio::time::sleep(CP_RECONFIGURE_INTERVAL + jitter(CP_RECONFIGURE_INTERVAL)).await;
-        let meta = ctx.raft.metadata();
+        // `effective_metadata`: a growth node (ADR 0030) that has since earned
+        // leadership of a tablet's CP-data group still needs a live view of its
+        // desired replica set to reconfigure toward.
+        let meta = ctx.effective_metadata();
         // The same read this loop already takes; the down-set is the priority
         // input `reconfigure_step` (ADR 0029) uses to tell a genuine failure
         // repair (remove first) from a healthy rebalance move (add first, then
@@ -2688,7 +2927,10 @@ const CP_JOIN_HOST_INTERVAL: Duration = Duration::from_millis(250);
 async fn cp_join_host_loop(host: CpHostCtx) {
     loop {
         tokio::time::sleep(CP_JOIN_HOST_INTERVAL).await;
-        let tablets = host.ctx.raft.metadata().tablets;
+        // `effective_metadata`: this is the load-bearing read for a growth node
+        // (ADR 0030) — it is how it ever learns it was placed in a tablet's
+        // replica set at all, since its own local raft never replicates.
+        let tablets = host.ctx.effective_metadata().tablets;
         for (tablet, t) in tablets {
             let Some(plan) = topology::plan_join_host(host.base_id, &t.replicas, t.epoch) else {
                 continue;
@@ -3352,7 +3594,13 @@ impl ClientCtx {
     /// (bounded by [`SCHEMA_COMMIT_TIMEOUT`]); idempotent (re-registering the same
     /// address is a state-machine no-op).
     pub(crate) async fn register_cp_addr(&self, id: NodeId, addr: String) {
-        if self.raft.metadata().cp_member_addrs.get(&id) == Some(&addr) {
+        // `effective_metadata`, not `self.raft.metadata()` directly: on a growth
+        // node (ADR 0030) this is the *only* signal that its own self-registration
+        // actually landed on the real cluster, since its local raft never
+        // replicates — see `effective_metadata`'s doc. `propose_and_await`'s
+        // relay reaches a real leader via `propose_schema`'s no-known-leader
+        // broadcast fallback, but confirmation must poll the mirror.
+        if self.effective_metadata().cp_member_addrs.get(&id) == Some(&addr) {
             return;
         }
         let want = addr.clone();
@@ -3368,7 +3616,10 @@ impl ClientCtx {
                     tablet: None,
                 },
                 SCHEMA_COMMIT_TIMEOUT,
-                || (self.raft.metadata().cp_member_addrs.get(&id) == Some(&want)).then_some(()),
+                || {
+                    (self.effective_metadata().cp_member_addrs.get(&id) == Some(&want))
+                        .then_some(())
+                },
             )
             .await;
     }
@@ -3824,6 +4075,76 @@ pub async fn run_node_with(
         .start_with(
             config.peer_book(),
             config.control_ids(),
+            backend,
+            ClusterEdgeState::new(),
+            client_route,
+            None,
+            admin_addrs,
+        )
+        .await
+}
+
+/// Start node `index` from `config` as a **control-plane-follower-less growth
+/// member** (ADR 0030): online cluster growth, data-plane only. `config` is an
+/// **expanded** config — it lists every pre-growth node plus every node added so
+/// far, `index` among them — so this node's peer book / `client_route` / admin
+/// fan-out are all complete from the moment it starts (same as
+/// [`run_node_with`]). The one deliberate difference is `original_control_ids`:
+/// the control group that existed **before** this node did, passed to
+/// [`BoundNode::start_with`] in place of `config.control_ids()`.
+///
+/// This node's own control role therefore starts genuinely **outside** that
+/// group's voter config (it "needs no control-voter slot" — verified: a Raft
+/// node whose id was never in `all_nodes` at construction is a permanent,
+/// harmless non-voter — `is_voter()` gates campaigning cleanly and it never
+/// disrupts the real cluster, the same safety property an already-removed
+/// voter relies on). The control group genuinely **never grows** — restarting
+/// the pre-growth nodes with a wider `all_nodes` was considered and rejected:
+/// it would work (a control-plane WAL with no prior config-changing entry
+/// falls back to whatever `all_nodes` a restart supplies), but requires a
+/// coordinated restart of the *existing* cluster, which is not "online" growth
+/// and would violate the "control group stays static" scope decision (ADR
+/// 0030) for a capability this slice does not need.
+///
+/// Consequently this node's own `RaftCore` never receives real Raft
+/// replication for that group — the real leader's own peer set is derived from
+/// *its* `all_nodes`, which never learned of this id — so `start_with` spawns
+/// [`remote_metadata_sync_loop`] for it instead, mirroring the real cluster's
+/// `Metadata` via `ClientRequest::Status` polls against `original_control_ids`'s
+/// client addresses (resolved through the now-complete `client_route`).
+/// Everything that must work on a growth node (CP routing, join-host, its own
+/// address self-registration) reads through `ClientCtx::effective_metadata`,
+/// which transparently prefers the mirror when populated.
+///
+/// # Errors
+/// As [`run_node_with`].
+pub async fn run_node_growth(
+    config: &ClusterConfig,
+    index: usize,
+    original_control_ids: Vec<NodeId>,
+    dir: impl Into<PathBuf>,
+    backend: StorageBackend,
+) -> std::io::Result<Node> {
+    let addrs = *config.nodes.get(index).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "node index out of range")
+    })?;
+    let bound = Node::bind(
+        config::control_id(index),
+        config::raftkv_id(index),
+        addrs,
+        dir,
+    )
+    .await?;
+    let mut client_route: BTreeMap<NodeId, SocketAddr> = BTreeMap::new();
+    for (i, addrs) in config.nodes.iter().enumerate() {
+        client_route.insert(config::raftkv_id(i), addrs.client);
+        client_route.insert(config::control_id(i), addrs.client);
+    }
+    let admin_addrs: Vec<SocketAddr> = config.nodes.iter().map(|n| n.admin).collect();
+    bound
+        .start_with(
+            config.peer_book(),
+            original_control_ids,
             backend,
             ClusterEdgeState::new(),
             client_route,

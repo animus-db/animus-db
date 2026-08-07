@@ -9,12 +9,25 @@
 //! `CasTabletReplicas` — converging the cluster to a policy-satisfying set
 //! (residency + spread preserved, only the dead replica moved). The whole run is
 //! a pure function of its seed.
+//!
+//! **Every data node heartbeats** (ADR 0030 phantom-member hardening): the
+//! detector now also demotes an `Active` member it has never heard a heartbeat
+//! from (see `animus_control::node::detect_loop`'s doc) — a real deployment's
+//! members always heartbeat, but a *test's* `Active` member only stays `Active`
+//! under this stricter rule if it does too, same as `failure_detection.rs`
+//! already does. The one member the test itself marks `Down` has its heartbeat
+//! task stopped (`sim.crash`) at that exact moment — the manual `Down` would
+//! otherwise be immediately reverted by the (pre-existing, unchanged) `Down` →
+//! `Active` recovery rule, since a still-heartbeating member is live evidence
+//! the detector never suppresses.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use animus_control::node::heartbeat_loop;
 use animus_control::raft::ProposeResult;
 use animus_control::{MetaCommand, Metadata, NodeStatus, RaftNode};
+use animus_env::EnvExt;
 use animus_placement::PlacementPolicy;
 use animus_sim::{SimEnv, Simulator};
 use animus_tablet::{KeyRange, TabletId};
@@ -40,6 +53,11 @@ fn cluster(seed: u64) -> (Simulator, Vec<RaftNode<SimEnv>>) {
         .iter()
         .map(|&id| RaftNode::start(sim.env(id), CONTROL.to_vec()))
         .collect();
+    // Every data node heartbeats the control group — see this file's doc.
+    for (id, _, _) in DATA_NODES {
+        let env = sim.env(id);
+        env.spawn_task(heartbeat_loop(env.clone(), CONTROL.to_vec()));
+    }
     (sim, nodes)
 }
 
@@ -134,6 +152,10 @@ fn run(seed: u64) {
     // --- Fault: a placed replica's member dies. ---
     let dead = after_fresh[0];
     let dead_zone = zone_of(&meta, dead);
+    // Stop its heartbeat too: otherwise the (pre-existing, unchanged) `Down` →
+    // `Active` recovery rule would immediately revert this manual `Down` the
+    // moment `detect_loop` next sees a heartbeat still arriving from it.
+    sim.crash(dead);
     assert!(matches!(
         nodes[leader].propose(MetaCommand::UpsertMember {
             node: dead,
@@ -227,6 +249,7 @@ fn reconcile_is_reproducible_from_seed() {
         sim.run_for(Duration::from_secs(3));
         let dead = nodes[leader].metadata().tablets[&TABLET].replicas[0];
         let dead_labels = nodes[leader].metadata().members[&dead].labels.clone();
+        sim.crash(dead);
         nodes[leader].propose(MetaCommand::UpsertMember {
             node: dead,
             labels: dead_labels,

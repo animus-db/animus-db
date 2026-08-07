@@ -501,10 +501,31 @@ async fn reconcile_loop<E: Env>(env: E, core: Arc<Mutex<RaftCore>>) {
 /// committed, a `Down` transition is exactly what the placement reconciler reacts
 /// to (ADR 0005), so a detected failure cascades into tablet re-placement.
 ///
-/// Only members the detector *tracks* (have heartbeated at least once) are
-/// judged, so a freshly-registered member is never marked `Down` before its
-/// first heartbeat. `Joining`/`Leaving` members are left alone — their lifecycle
-/// is operator-driven, not liveness-driven.
+/// Only members the detector *tracks* are judged; `Joining`/`Leaving` are left
+/// alone — their lifecycle is operator-driven, not liveness-driven.
+///
+/// **A member becomes tracked either by a real heartbeat, or — for an `Active`
+/// member — by this loop simply noticing it exists (ADR 0030 phantom-member
+/// hardening).** A brand-new member is registered `Down` and stays untracked
+/// (and thus unjudged) until its own real first heartbeat promotes it — the
+/// online-growth admin-add path relies on exactly this to keep a
+/// declared-but-never-booted growth node from ever reaching `Active` at all.
+/// But `bootstrap` (`animusd`) registers its nodes `Active` immediately, before
+/// any of them may have heartbeated yet (provisioning a table's replica set
+/// needs a stable, immediately-complete `Active` set — see `bootstrap`'s own
+/// doc for the regression this avoids), which reopens a **different** hole: an
+/// `Active` member the detector has never heard from is never judged at all by
+/// the "only tracked members are judged" rule above, so a declared-but-
+/// never-booted `Active` member would stay placement-eligible forever. Closed
+/// by giving any `Active`-but-untracked member a **synthetic first observation**
+/// at the instant this loop first notices it (`declare_active_members`, pure):
+/// this starts exactly the same silence clock a real heartbeat would, so a node
+/// whose real heartbeat arrives promptly (the overwhelmingly common case) is
+/// unaffected, while one that never heartbeats at all is judged dead — and, once
+/// the post-election grace below elapses, demoted to `Down` — after one ordinary
+/// [`DETECT_TIMEOUT`], the same as any other failure. A member already tracked
+/// (has genuinely heartbeated) is left untouched, so a real heartbeat's instant
+/// is never overwritten by a later, coarser synthetic one.
 ///
 /// A freshly elected leader observes a **grace period** ([`LEADER_GRACE`]) before
 /// proposing any `Down`: its detector is cold (per-node volatile state), so it
@@ -549,6 +570,17 @@ async fn detect_loop<E: Env>(
             allow_down = now.duration_since(since) >= LEADER_GRACE;
             core.members()
         };
+        // Phantom-member hardening (ADR 0030): give any `Active`-but-untracked
+        // member a synthetic first observation before evaluating (see this fn's
+        // doc). A no-op for every member the detector already tracks.
+        {
+            let mut d = detector.lock().expect("detector poisoned");
+            for (&id, m) in &members {
+                if m.status == NodeStatus::Active && !d.tracks(id) {
+                    d.observe(id, now);
+                }
+            }
+        }
         // Evaluate off the core lock (the detector has its own mutex).
         let proposals = liveness_transitions(
             &members,

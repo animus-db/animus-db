@@ -7,12 +7,21 @@
 //! replica while preserving residency and spread. A control follower is crashed
 //! mid-reconcile to prove the placement transaction still commits on a quorum,
 //! and the whole run is reproducible from its seed.
+//!
+//! Every data node heartbeats (ADR 0030 phantom-member hardening): the detector
+//! now also demotes an `Active` member it has never heard a heartbeat from (see
+//! `animus_control::node::detect_loop`'s doc) — see
+//! `placement_auto_reconcile.rs`'s identical note for why `cluster` spawns one
+//! per data node and why the member the test itself marks `Down` has its
+//! heartbeat stopped (`sim.crash`) at that exact moment.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use animus_control::node::heartbeat_loop;
 use animus_control::raft::ProposeResult;
 use animus_control::{MetaCommand, Metadata, NodeStatus, RaftNode};
+use animus_env::EnvExt;
 use animus_placement::{Candidate, PlacementPolicy, replan, select_replicas};
 use animus_sim::{SimEnv, Simulator};
 use animus_tablet::{KeyRange, TabletId};
@@ -38,6 +47,11 @@ fn cluster(seed: u64) -> (Simulator, Vec<RaftNode<SimEnv>>) {
         .iter()
         .map(|&id| RaftNode::start(sim.env(id), CONTROL.to_vec()))
         .collect();
+    // Every data node heartbeats the control group — see this file's doc.
+    for (id, _, _) in DATA_NODES {
+        let env = sim.env(id);
+        env.spawn_task(heartbeat_loop(env.clone(), CONTROL.to_vec()));
+    }
     (sim, nodes)
 }
 
@@ -133,6 +147,9 @@ fn run(seed: u64) {
     let dead = current[0];
     let dead_zone = zone_of(&nodes[leader].metadata(), dead);
 
+    // Stop its heartbeat too — otherwise the (pre-existing, unchanged) `Down` ->
+    // `Active` recovery rule would immediately revert this manual `Down`.
+    sim.crash(dead);
     assert!(matches!(
         nodes[leader].propose(MetaCommand::UpsertMember {
             node: dead,
