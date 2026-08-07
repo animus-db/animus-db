@@ -109,10 +109,18 @@ the engine — the `AccordCore` sync-core/async-driver split.
   reads gate on, so a proposer confirms a specific `Accepted { index }` applied
   (`engine_applied_index() >= index` while still leader in the proposal's term)
   instead of polling value equality, which false-negatives under a concurrent
-  same-key overwrite. `linearizable_scan` pushes a bounded range into
+  same-key overwrite. `linearizable_scan`/`local_scan` push a bounded range into
   `storage.scan(start, end)` (key-ordered by contract — no re-sort, no
-  whole-tablet materialization); only the unbounded-above case still reads
-  `entries()` (the trait's `scan` has no open upper bound).
+  whole-tablet materialization); the unbounded-above case (`end: None`) derives
+  a genuinely bounded physical upper bound from `StorageScope::physical_bounds`
+  (ADR 0034's prefix-upper-bound trick) instead of falling through to
+  `entries()` — a real cost bug found via `/admin/raftkv` effectively hanging
+  under load: `entries()` scans the **whole shared engine** (ADR 0028), so on a
+  node hosting several tablets, every unbounded scan (every `/admin/raftkv`
+  request's `raft_view`, and every `erase_scope()` teardown on `Release`/
+  `Reclaim`) cost O(hosted tablets × whole node engine) instead of O(this
+  tablet's own data). `entries()` remains the fallback only for
+  `StorageScope::whole()` (no prefix at all), which has no finite bound.
 - `KvWire` — the data-plane wire enum wrapping `RaftMsg` plus the ReadIndex
   read-barrier probes (`ReadProbe`/`ReadProbeAck`). The probes are driver-only, so
   ReadIndex lives entirely in this crate and the shared `RaftCore`/`RaftMsg` are
