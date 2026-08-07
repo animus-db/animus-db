@@ -111,7 +111,7 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   floor (`cp_plane.rs::single_write_latency_is_low`). Every table's tablet(s) are
   keyed by `TabletId` in the edge registry (`ClusterEdgeState`); a fresh table's
   first tablet, a split-minted sibling, and a reconciler-placed replacement all
-  reach it the same way — the per-node **join-host loop** (below). `tests/cp_plane.rs`
+  reach it the same way — the per-node **tablet-host reconciler** (ADR 0031 PR4, below). `tests/cp_plane.rs`
   (in-process round-trip) + `tests/cp_cross_process.rs` (forwarding) + the
   dynamo/cql wire + schema tests all exercise the CP path.
 - **Tablet split (ADR 0028) is a single, atomic control-plane command — there
@@ -131,7 +131,7 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   any mechanism left to apply to. That history is preserved in the root
   `CLAUDE.md` Engineering Practices section and ADR 0017's original text for
   archaeology. `animus-cp-data/CLAUDE.md` covers `StorageScope`/fencing/stream
-  addressing; the per-node hosting mechanics are the join-host loop entry
+  addressing; the per-node hosting mechanics are the tablet-host-reconciler entry
   below; `auto_split_loop`'s current (single-step) shape is documented at its
   definition in `lib.rs`.
 - **Every CP write path stamps + pre-checks the ADR 0028 write fence** (fixed
@@ -171,21 +171,25 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   `heartbeat_loop` on its `raftkv` env, heartbeating the control group *as its
   `raftkv` member id*, so the control leader's `detect_loop` marks a crashed CP node
   `Down` (`tests/cp_reconfigure.rs::data_node_failure_is_detected`). And **each
-  CP-hosting node runs `cp_reconfigure_loop`**: for every tablet whose group it
-  leads, it pulls `tablets[t].replicas` — since ADR 0026 Stage B a tablet's group
-  member id *is* simply the base `raftkv` id, so the replica set needs no
-  translation — and takes one single-server `reconfigure_step` toward it
+  node's tablet-host reconciler (ADR 0031 PR4, below) reconfigures every tablet
+  whose group this node leads**: each tick's `HostAction::Reconfigure` carries
+  `tablets[t].replicas` — since ADR 0026 Stage B a tablet's group member id *is*
+  simply the base `raftkv` id, so the replica set needs no translation — and
+  takes one single-server `reconfigure_step` toward it
   (`tests/cp_reconfigure.rs::cp_group_follows_tablet_replica_set`: dropping a follower
-  from the replica set reconfigures the group's voters down). **This loop
-  deliberately polls faster than the control plane's own policy `reconcile_loop`**
-  (`CP_RECONFIGURE_INTERVAL` = 150ms vs. `RECONCILE_INTERVAL` = 500ms, plus jitter)
-  — a manual/operator replica-set change is a one-shot race between the two, and
-  without the faster cadence the reconciler could win every time and silently
-  revert the change (see the root `CLAUDE.md` engineering-practices entry). **The
-  full failure→placement→reconfigure cascade is closed**: `bootstrap` attaches a
-  label-free RF `PlacementPolicy`, so on a `Down` replica the reconciler picks an
-  Active spare, the spare's join-host loop stands up an empty group, and the leader
-  adds + catches it up — auto-replacing the dead replica end to end
+  from the replica set reconfigures the group's voters down). **The reaction is
+  event-driven now** (`RaftNode::metadata_watch()` + a 500ms fallback tick),
+  so the old cadence race against the control plane's policy `reconcile_loop`
+  — which the pre-ADR-0031 `cp_reconfigure_loop` mitigated by polling at 150ms,
+  a third of `RECONCILE_INTERVAL`, plus jitter (see the root `CLAUDE.md`
+  engineering-practices entry, now historical for this pair of loops) — is
+  closed structurally: the reconciler observes a replica-set change on the
+  commit that made it, not on the next arbitrarily-phased tick. **The full
+  failure→placement→reconfigure cascade is closed**: `bootstrap` attaches a
+  label-free RF `PlacementPolicy`, so on a `Down` replica the placement
+  reconciler picks an Active spare, the spare's tablet-host reconciler stands
+  up an empty group, and the leader adds + catches it up — auto-replacing the
+  dead replica end to end
   (`tests/cp_reconfigure.rs::failure_auto_replaces_replica_onto_spare`).
 - **Online cluster growth (ADR 0030) is data-plane only — the control group
   stays static.** `POST /admin/member/add {node, labels?}`
@@ -209,8 +213,10 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   prefers this mirror when populated (a no-op passthrough to
   `self.raft.metadata()` on every other node) — **every call site a growth
   node needs to actually function reads through it**: `tablet_for`,
-  `resolve_cp_route`, `cp_join_host_loop` (the load-bearing one — how a growth
-  node ever learns it was placed on a tablet at all), `cp_reconfigure_loop`,
+  `resolve_cp_route`, `tablet_host_reconciler_loop` (the load-bearing one — how
+  a growth node ever learns it was placed on a tablet at all; its 500ms
+  fallback tick is what fires there, since a growth node's own control raft
+  never advances and so never wakes `metadata_watch`),
   `peer_sync_loop`, `register_cp_addr`'s own commit confirmation, `cp_put`/
   `cp_get`'s `has_table_tablet` gate, and `/admin/status`. `propose_schema`
   (the shared "propose locally if leader, else relay to a *known* leader"
@@ -228,136 +234,151 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   follow-up). `tests/cluster_growth.rs`: 3→5 growth, no restart of the
   original 3, admin-add + promotion + rebalancing onto the new nodes +
   reads/writes throughout + a never-booted phantom staying `Down`.
-- **The per-node CP join-host loop** (`cp_join_host_loop`/`cp_join_host`) is the
-  single unified formation path for every tablet a node ever hosts — a fresh
-  table's first tablet, a split-minted sibling, and a reconciler-placed
-  replacement all go through it the same way: `topology::plan_join_host`
-  decides whether this node is forming fresh (`Epoch::INITIAL` — full voter
-  config, so a replica can campaign with no live leader) or joining an
-  existing, already-led group (a bumped epoch — quiet non-voter until the
-  leader adds it); `cp_join_host` layers on the one thing the pure decision
-  can't do (an async engine read): `StorageScope::has_data` upgrades a
-  *restart* of a tablet this node already hosts to `initial_formation` too
-  (WAL recovery alone doesn't restore voter status from a non-voter start).
-  Dedup is a per-node in-memory `minted` claim set (reset on restart, which
-  is fine — the loop just re-discovers every tablet to host from replicated
-  `Metadata` and re-forms each from the shared engine's durable data), not
-  `edge.local_cp` — `ClusterEdgeState` is per-node too (ADR 0031 PR2), but
-  `minted` is claimed synchronously *before* the async join-host actually
-  registers a handle, so it can't race this same loop's own next tick the way
-  a registration-based check could. **The loop also re-narrows an
-  already-`minted` tablet's `StorageScope` every tick** (via
-  `ClusterEdgeState::local_cp_member` + `CpGroup::narrow_scope`) — the source
-  side of a single-command split (ADR 0028) has a `RaftKvNode` that predates
-  the split and whose `StorageScope` is otherwise never touched again once
-  constructed; only a brand-new split child gets a correctly-narrowed scope
-  for free (it's new to `minted`, so it goes through the normal fresh-formation
-  path instead). `narrow_scope` is a cheap, idempotent mutex set, so doing it
-  unconditionally every tick (not just when the range actually changed — this
-  loop has no cheap way to tell) is safe. Left unfixed, this showed up as
-  `/admin/raftkv`'s `key_count` for a just-split parent tablet reporting its
-  stale, pre-split (larger) count forever.
-- **Drop-table GC (ADR 0024) is the join-host loop's dual.** The real drop sink is
-  `ClientCtx::drop_table` (CQL `DROP TABLE` + admin `/admin/data/drop-table`):
-  `DropTableSchema` then `DropTableTablets`. **`drop_table_schema` stays
-  schema-only** (the admin panel's schema-only drop). CQL `ALTER TABLE … ADD` no
-  longer drops at all: it mutates the schema **in place, atomically** via
-  `MetaCommand::ReplaceTableSchema` (`ClientCtx::replace_table_schema`) — the old
-  drop-then-recreate could strand the table schema-less if a crash landed between
-  the two commands — and an ALTER must never GC data. The per-node `cp_gc_loop` then reclaims any tablet in this
-  node's `minted` set that is absent from `Metadata.tablets`: unregister *this
-  node's* handle (`unregister_raftkv(tablet, base_id)` — the shared `--cluster N`
-  edge holds every node's handles, so match by the handle env's node id),
-  `CpGroup::shutdown()` + wait `is_stopped()` (never touch data under a live
-  driver; on timeout re-register and retry a later tick), then
+- **The per-node tablet-host reconciler (ADR 0031 PR4) is the single owner of
+  this node's tablet lifecycle** — it replaced the three loops this file used
+  to document separately (`cp_join_host_loop`, `cp_gc_loop` +
+  `cp_gc_release_phase`, `cp_reconfigure_loop`) and their per-node state
+  (`minted`, `pending_release`, `CpHostCtx`). The machinery lives in
+  `animus_cp_data::host` (read that crate's `CLAUDE.md` section first): the
+  pure `plan` decides every action from **one** `MetadataView` snapshot per
+  tick, and the `Reconciler` executor owns the hosted `RaftKvNode` map and
+  executes the actions in `plan`'s fixed order (`NarrowScope` → `Host` →
+  `Reconfigure` → `Release`/`Reclaim`). What stays in `animusd`
+  (`tablet_host_reconciler_loop` + the `CpReconciler` backend enum in
+  `lib.rs`):
+  - **The trigger**: one spawned task per node racing
+    `ctx.raft.metadata_watch().changed(last_seen)` (ADR 0031 §trigger —
+    event-driven, so a replica-set change is observed on the commit that made
+    it, not on the next arbitrarily-phased poll tick) against a
+    `RECONCILE_FALLBACK_INTERVAL` (500ms) sleep. The fallback is
+    **load-bearing for ADR 0030 growth nodes** — their local control raft
+    never advances, so `metadata_watch` never fires and only the fallback
+    ticks them, reading `effective_metadata()`'s remote mirror. After either
+    wake, coalesce to `watch.latest()` (a burst of commits under bulk load
+    collapses into one tick, not one per entry).
+  - **The pre-recovery guard**: skip a tick while `raft.last_applied() == 0`
+    **and** the growth-node remote mirror is empty — pre-recovery `Metadata`
+    is default-empty and would read as "everything dropped" to the
+    reclaim/release phases. Gated on both signals so a growth node (whose
+    local raft never leaves 0) still ticks off its mirror.
+  - **The edge mirror**: `ClusterEdgeState`'s `raftkv` registry is now a
+    **read-only mirror with exactly one writer** — the reconciler's
+    `on_host`/`on_teardown` hooks call
+    `register_raftkv`/`unregister_raftkv`; nothing else writes it. Routing
+    (`resolve_cp_route`/`local_cp`/`cp_leader`) keeps reading it unchanged.
+  - **Formation semantics are unchanged** (they moved, verbatim, into
+    `host::plan`/`Reconciler::host`): a fresh table's first tablet, a
+    split-minted sibling, and a placement-reconciler-placed replacement all
+    form the same way — `Epoch::INITIAL` (or `StorageScope::has_data` on a
+    restart, since WAL recovery alone doesn't restore voter status from a
+    non-voter start) ⇒ full voter config; a bumped epoch ⇒ quiet non-voter
+    until the leader adds it. Dedup is `LocalState::hosted` (the `minted`
+    claim set's successor — reset on restart, which is fine: the reconciler
+    re-discovers every tablet to host from replicated `Metadata` and re-forms
+    each from the shared engine's durable data). A hosted tablet's
+    `StorageScope` is re-narrowed via a planned `NarrowScope` action whenever
+    its metadata range shrank (the split-source case — provably narrow-only),
+    replacing the old per-tick unconditional re-narrow.
+- **Drop-table GC (ADR 0024) is the reconciler's `Reclaim` action.** The real
+  drop sink is `ClientCtx::drop_table` (CQL `DROP TABLE` + admin
+  `/admin/data/drop-table`): `DropTableSchema` then `DropTableTablets`.
+  **`drop_table_schema` stays schema-only** (the admin panel's schema-only
+  drop). CQL `ALTER TABLE … ADD` no longer drops at all: it mutates the schema
+  **in place, atomically** via `MetaCommand::ReplaceTableSchema`
+  (`ClientCtx::replace_table_schema`) — the old drop-then-recreate could
+  strand the table schema-less if a crash landed between the two commands —
+  and an ALTER must never GC data. A tablet in `LocalState::hosted` that is
+  absent from `Metadata.tablets` plans a `Reclaim`; the executor's teardown
+  (in `animus-cp-data`, `Reconciler::teardown` — the old `cp_gc_tablet`'s
+  exact shape) unregisters this node's handle via `on_teardown`, does
+  `shutdown()` + wait `is_stopped()` (never touch data under a live driver;
+  on timeout re-register via `on_host` and retry next tick — the planner
+  re-emits the action until `confirm_torn_down`), then
   **`RaftKvNode::erase_scope()`** — tombstone every key in the tablet's own
-  `StorageScope` out of the node's *shared* engine (never a file delete, since
-  ADR 0026/0028 means the engine isn't this tablet's alone) — and delete its
-  own per-tablet WAL file (`animus_cp_data::wal_file(tablet)`). Release
-  `minted` last. Guards worth keeping: skip while
-  `last_applied() == 0` (pre-recovery metadata is empty ⇒ reads as
-  "everything dropped"), and skip a minted-but-unregistered tablet (stand-up in
-  flight). **Drop + GC are convergent, not one-shot**: a restarted control
-  replica re-applies its log through *historical* map states, so join-host may
-  briefly re-host a dropped tablet's empty group — the GC reclaims it once
-  replay passes the drop (test the post-restart state with a poll, never a
-  fixed sleep). **A new `MetaCommand` that must commit from a follower-connected
-  node has to be added to `is_relayable_command`** — missing there is a
-  *bimodal* failure: works when the connected node happens to be the control
-  leader, silently times out ("did not commit") when it must relay
-  (`tests/drop_table_gc.rs` caught exactly this for `DropTableTablets`).
-- **Removed-replica GC (ADR 0029) is `cp_gc_loop`'s *second phase* — the release
-  dual of the reclaim (drop-table) phase above.** When a tablet's replica set
-  moves *off* this node while the tablet still **exists** (a manual `drain`, an
-  automatic failure-repair swap, or a rebalance move — not the whole table being
-  dropped), the same loop stops the now-idle group and erases its data via the
-  **identical** `cp_gc_tablet` teardown; the only difference from reclaim is the
-  predicate: `topology::tablets_to_release` (present **and** `base_id ∉ replicas`)
-  vs. `tablets_to_reclaim` (absent). The two partition this node's `minted` set —
-  a tablet is never both. **Two live guards make release safe where reclaim needs
-  none:** (1) the **local-config gate** — `cp_gc_release_phase` acts only once
-  this node's *own durable Raft log* voter config (`CpGroup::config`) already
-  excludes `base_id`. That is the replay-independent anchor PR1's `departing`
-  mechanism guarantees a removed node reliably adopts — unlike replicated
-  `Metadata.tablets`, which a restarting control replica replays through
-  *historical* states, so the metadata signal alone can flicker; and (2) an
-  **epoch-stability dampener** (`pending_release`, `tablet → (epoch, consecutive
-  ticks)`): the release condition must hold for `RELEASE_CONFIRM_TICKS` (3)
-  consecutive ticks *at an unchanged tablet epoch* before acting — any epoch
-  change (a re-add's CAS bumps it) or condition flip resets the counter, so a
-  replay transient can't trigger a release and a re-add cancels one in flight.
-  A **joining spare is structurally never released**: it *is* in `replicas`, so
-  `tablets_to_release` excludes it even during its brief non-voter formation
-  window. **One accepted residual gap** (same shape the pre-ADR-0029 drain/repair
-  paths already had — not a new risk): a node that crashes *before* it ever
-  receives the removal config entry recovers a log whose config still lists
-  itself, so the local-config gate never passes and that node leaks the group
-  forever. Documented at the loop; before ADR 0029 *nothing* released such a
-  tablet on any node. `tests/cp_rebalance_gc.rs` (a `CasTabletReplicas` move-off →
-  stop + erase; release converges across a restart-replay without resurrecting,
-  while an unrelated still-hosted tablet is untouched; a repair-onto-spare join is
-  never prematurely erased; a split immediately followed by a release does not
-  corrupt the new sibling — see below), plus the pure `tablets_to_release` unit
-  tests in `src/topology.rs`.
-- **The release path must bound its erase by the tablet's CURRENT replicated
-  range, never the group's in-memory `StorageScope` — the latter can be
-  stale-wide for a just-split tablet.** The only place a source tablet's
-  already-hosted `RaftKvNode` scope is ever re-narrowed after a split is
-  `cp_join_host_loop`'s per-tick `narrow_scope` call (above) — and that call is
-  **permanently** skipped for a tablet the instant this node leaves its
-  replica set (`plan_join_host` returns `None` → the loop's `continue`, never
-  touching that tablet's scope again). So: split T at M (T keeps `[start,M)`,
-  new sibling C gets `[M,end)`, both on node X's one shared engine); if a
-  rebalance/repair/drain drops X from **T's** replica set before X's own
-  join-host tick has re-narrowed T's scope to the post-split range, that
-  scope is frozen stale-wide *forever* on X — and when the release GC later
-  erases T on X, an unbounded `erase_scope()` would tombstone every key under
-  T's *pre-split* wide range, including C's live keys (X is typically still a
+  `StorageScope` out of the node's *shared* engine (never a file delete,
+  since ADR 0026/0028 means the engine isn't this tablet's alone) — and
+  deletes its own per-tablet WAL file (`animus_cp_data::wal_file(tablet)`).
+  Confirm (`LocalState::confirm_torn_down`) last. **Drop + GC are convergent,
+  not one-shot**: a restarted control replica re-applies its log through
+  *historical* map states, so the reconciler may briefly re-host a dropped
+  tablet's empty group — it reclaims it again once replay passes the drop
+  (test the post-restart state with a poll, never a fixed sleep). **A new
+  `MetaCommand` that must commit from a follower-connected node has to be
+  added to `is_relayable_command`** — missing there is a *bimodal* failure:
+  works when the connected node happens to be the control leader, silently
+  times out ("did not commit") when it must relay (`tests/drop_table_gc.rs`
+  caught exactly this for `DropTableTablets`).
+- **Removed-replica GC (ADR 0029) is the reconciler's `Release` action — the
+  release dual of `Reclaim` above.** When a tablet's replica set moves *off*
+  this node while the tablet still **exists** (a manual `drain`, an automatic
+  failure-repair swap, or a rebalance move — not the whole table being
+  dropped), the same teardown runs; the only difference from reclaim is the
+  predicate (`host::tablets_to_release`: present **and** `base_id ∉ replicas`
+  vs. `tablets_to_reclaim`: absent — the two partition `LocalState::hosted`;
+  a tablet is never both) plus **two guards, now enforced structurally inside
+  `host::plan`** where the old loop enforced them by hand: (1) the
+  **local-config gate** — release is only planned once this node's *own
+  durable Raft log* voter config (`TabletFacts::config_excludes_me`, read
+  from the hosted group's `config()`) already excludes `base_id`. That is the
+  replay-independent anchor ADR 0029 PR1's `departing` mechanism guarantees a
+  removed node reliably adopts — unlike replicated `Metadata.tablets`, which
+  a restarting control replica replays through *historical* states, so the
+  metadata signal alone can flicker; and (2) an **epoch-stability dampener**
+  (`LocalState::pending_release`, `tablet → (epoch, consecutive ticks)`): the
+  release condition must hold for `host::RELEASE_CONFIRM_TICKS` (3)
+  consecutive plan calls *at an unchanged tablet epoch* before acting — any
+  epoch change (a re-add's CAS bumps it) or condition flip resets the
+  counter, so a replay transient can't trigger a release and a re-add cancels
+  one in flight. A **joining spare is structurally never released**: it *is*
+  in `replicas`, so `tablets_to_release` excludes it even during its brief
+  non-voter formation window. **One accepted residual gap** (same shape the
+  pre-ADR-0029 drain/repair paths already had — not a new risk): a node that
+  crashes *before* it ever receives the removal config entry recovers a log
+  whose config still lists itself, so the local-config gate never passes and
+  that node leaks the group forever. `tests/cp_rebalance_gc.rs` (a
+  `CasTabletReplicas` move-off → stop + erase; release converges across a
+  restart-replay without resurrecting, while an unrelated still-hosted tablet
+  is untouched; a repair-onto-spare join is never prematurely erased; a split
+  immediately followed by a release does not corrupt the new sibling — see
+  below), plus the `host::plan` unit tests in `animus-cp-data`.
+- **The release erase is bounded by the tablet's CURRENT replicated range,
+  never the group's in-memory `StorageScope` — the latter can be stale-wide
+  for a just-split tablet.** This is *the* invariant ADR 0031 exists to make
+  structural: `HostAction::Release` carries `erase_bound` — always the
+  tablet's current `Metadata.tablets[t].range`, stamped by `plan` (which
+  documents that it must never come from a `TabletFacts::scope_range` fact) —
+  and `Reconciler::teardown` calls `narrow_scope(erase_bound)` immediately
+  before `erase_scope()`. Pre-ADR-0031 history (why this matters): split T at
+  M (T keeps `[start,M)`, new sibling C gets `[M,end)`, both on node X's one
+  shared engine); if a rebalance/repair/drain dropped X from **T's** replica
+  set before X's own join-host tick had re-narrowed T's scope to the
+  post-split range, that scope froze stale-wide on X — and an unbounded
+  `erase_scope()` at release would have tombstoned every key under T's
+  *pre-split* wide range, including C's live keys (X is typically still a
   replica of C, since the split only touched T's replica set) — permanent,
   silent corruption of a tablet X was never even asked to release, at a
-  version high enough to beat C's own fresh writes under per-key LWW. Fixed by
-  having `cp_gc_tablet` take an optional `current_range: Option<KeyRange>` —
-  the release phase passes the tablet's *current* `Metadata.tablets[t].range`
-  (always available: `tablets_to_release` only returns present tablets) and
-  `cp_gc_tablet` calls `group.narrow_scope(range)` immediately before
-  `erase_scope()`; the reclaim phase (whole table dropped, tablet absent from
-  `Metadata`) passes `None` since there is no current range to narrow to and
-  every same-prefix sibling still resident is dying in the same pass anyway.
-  `narrow_scope` is documented narrow-only, and the current replicated range
-  is always a subset of (or equal to) whatever the group's own scope already
-  covers, so this is always a narrowing, never a widening. Regression tests:
-  a deterministic primitive-level proof at `animus-cp-data/tests/
+  version high enough to beat C's own fresh writes under per-key LWW. The old
+  loops fixed this by *convention* (a `current_range` parameter threaded into
+  `cp_gc_tablet`); the planner's fixed emission order + the `erase_bound`
+  contract make the narrow-before-erase ordering a property of the one
+  place that decides it. `narrow_scope` is documented narrow-only, and the
+  current replicated range is always a subset of (or equal to) whatever the
+  group's own scope already covers, so this is always a narrowing, never a
+  widening. Regression tests: a deterministic primitive-level proof at
+  `animus-cp-data/tests/
   narrow_scope.rs::narrow_then_erase_scope_spares_a_co_hosted_siblings_data`
   (build both halves of a whole-scope group, narrow, erase, assert the
-  untouched half's value **and version** survive — no timing needed), and an
+  untouched half's value **and version** survive — no timing needed), the
+  reconciler-level `animus-cp-data/tests/reconciler.rs` (the same invariant
+  through `Reconciler::tick`'s own host → narrow → release flow), and an
   end-to-end `tests/cp_rebalance_gc.rs::
   split_then_immediate_release_spares_the_new_siblings_data` that proposes the
   split and the parent's replica-set CAS back-to-back on the control leader's
   own log (round-tripping the split through the wire protocol first gives the
-  ~250ms join-host tick time to self-heal the scope before the drop lands,
-  hiding the bug — empirically this made the difference between the E2E test
-  catching the pre-fix bug 0/5 times vs. ~3/5 times) and confirms the child's
-  data survives both cluster-wide and in the dropped node's own local storage.
+  reconciler time to self-heal the scope before the drop lands, hiding the
+  bug — empirically this made the difference between the E2E test catching
+  the pre-fix bug 0/5 times vs. ~3/5 times) and confirms the child's data
+  survives both cluster-wide and in the dropped node's own local storage.
   See the root `CLAUDE.md` engineering-practices entry for the general lesson.
 - **`resolve_cp_route`'s `has_local_replica` gate must re-verify against this
   node's own current Raft config, not just "do I have a registered handle at

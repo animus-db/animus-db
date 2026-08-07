@@ -50,18 +50,23 @@ mod topology;
 
 use animus_control::node::heartbeat_loop;
 use animus_control::{PlacementPolicy, ProposeResult, RaftNode};
-use animus_cp_data::{RaftKvNode, StorageScope};
-use animus_env::{Disk, Env, Metric, MetricsHandle, NodeId, ProdEnv};
+use animus_cp_data::RaftKvNode;
+use animus_cp_data::host::{MetadataView, Reconciler};
+use animus_env::{Env, Metric, MetricsHandle, NodeId, ProdEnv};
 use animus_storage::{LsmEngine, MemoryEngine, SsTableView, WalRecordView};
-use animus_tablet::{Epoch, KeyRange, Tablet, TabletId, escape};
+use animus_tablet::{KeyRange, TabletId, escape};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::Instrument;
-// Pure CP-topology decision logic (routing/join-host predicates), extracted
-// into `topology` for unit-test coverage — called fully-qualified
-// (`topology::plan_join_host` etc.) at each call site.
+// Pure CP-topology decision logic (routing predicates), extracted into
+// `topology` for unit-test coverage — called fully-qualified
+// (`topology::decide_cp_route` etc.) at each call site. The per-node
+// hosting/GC decisions this module used to hold (`plan_join_host`,
+// `tablets_to_reclaim`, `tablets_to_release`) moved to
+// `animus_cp_data::host` (ADR 0031 PR3/PR4), which now owns both the
+// decision and its execution.
 
 /// A list of `(key, value)` pairs — the payload of a batch write (one Raft
 /// `KvCommand::Batch` entry per tablet). Named to keep the batch grouping map
@@ -374,29 +379,6 @@ impl CpGroup {
         match self {
             CpGroup::Lsm(n) => n.reconfigure_step(desired, down),
             CpGroup::Mem(n) => n.reconfigure_step(desired, down),
-        }
-    }
-
-    /// **Admin action (drop-table GC, ADR 0024):** tombstone every key in this
-    /// group's own `StorageScope` out of the shared engine. See
-    /// [`RaftKvNode::erase_scope`].
-    async fn erase_scope(&self) {
-        match self {
-            CpGroup::Lsm(n) => n.erase_scope().await,
-            CpGroup::Mem(n) => n.erase_scope().await,
-        }
-    }
-
-    /// Narrow this group's own `StorageScope` range to `new_range` — the
-    /// per-node reaction a single-command split (ADR 0028) needs on the
-    /// **source** tablet's already-hosted replicas (the new sibling's scope is
-    /// simply constructed correctly at mint time via [`cp_join_host`]; the
-    /// source's pre-existing `RaftKvNode` scope is never touched otherwise).
-    /// See [`RaftKvNode::narrow_scope`].
-    fn narrow_scope(&self, new_range: KeyRange) {
-        match self {
-            CpGroup::Lsm(n) => n.narrow_scope(new_range),
-            CpGroup::Mem(n) => n.narrow_scope(new_range),
         }
     }
 
@@ -794,9 +776,9 @@ impl BoundNode {
         // becomes reachable.
         let static_peers = peers;
         let raftkv_sync_env = self.raftkv_env.clone();
-        // A `raftkv`-env clone for the shared **CP hosting context** (`CpHostCtx`):
-        // every tablet's group this node stands up (via the join-host loop) runs on
-        // it, stream-addressed by tablet id (ADR 0026 Stage B) rather than a
+        // A `raftkv`-env clone for the per-node **tablet-host reconciler** (ADR
+        // 0031 PR4): every tablet's group this node stands up runs on it,
+        // stream-addressed by tablet id (ADR 0026 Stage B) rather than a
         // distinct per-tablet env/id.
         let raftkv_hook_env = self.raftkv_env.clone();
         // A `raftkv`-env clone for the **failure-detection heartbeat loop** (#3): each
@@ -844,18 +826,18 @@ impl BoundNode {
         // this node ever hosts — across every table — merges into it, confined by
         // its own `StorageScope` (a table-id prefix + the tablet's own key range).
         // Opened once, here, and cloned into each tablet's `RaftKvNode` as the
-        // per-node join-host loop stands groups up. A restart just re-opens the
-        // same engine (`LsmEngine::open` recovers its durable state) and the
-        // join-host loop re-discovers every tablet to host from replicated
-        // `Metadata` — there is no more per-tablet durable marker to load.
+        // per-node tablet-host reconciler (ADR 0031 PR4) stands groups up. A
+        // restart just re-opens the same engine (`LsmEngine::open` recovers its
+        // durable state) and the reconciler re-discovers every tablet to host
+        // from replicated `Metadata` — there is no more per-tablet durable
+        // marker to load.
         //
-        // Opened **before** `RaftNode::start` (below): both do real disk I/O at
-        // startup, and `RaftNode::start` spawns the control plane's `reconcile_loop`
-        // (500ms poll, same period as this node's own `cp_reconfigure_loop`) —
-        // opening this engine afterward would give `reconcile_loop` a head start on
-        // that fixed-period race for the life of the process (neither loop
-        // resynchronizes), letting the placement reconciler win every tablet-replica
-        // change race against the CP-side reconfigure loop instead of an even race.
+        // Opened **before** `RaftNode::start` (below), a hangover from when this
+        // node's own CP-side reconfigure loop polled on a fixed period racing the
+        // control plane's own `reconcile_loop` (ADR 0031 amended this out: the
+        // reconciler now reacts to a `metadata_watch` wake, not a fixed cadence,
+        // so it no longer needs a head start to win that race — see
+        // `tablet_host_reconciler_loop`'s doc). No harm in keeping the order.
         let storage = match backend {
             StorageBackend::Lsm => match LsmEngine::open(self.raftkv_env.clone(), LSM_PREFIX).await
             {
@@ -911,27 +893,49 @@ impl BoundNode {
         };
         let n = control_ids.len();
 
-        // The shared **CP hosting context**: the client context, this node's one
-        // shared engine, the `raftkv` env every tablet's group runs on
-        // (stream-addressed), this node's base id, and the per-node `minted` claim
-        // set (dedups concurrent join-host ticks within this process — reset on
-        // restart, which is fine, since a restarted node just re-discovers every
-        // tablet it should host from replicated `Metadata`). Built unconditionally:
-        // the join-host loop runs on **every** node (a spare not yet placed on any
-        // tablet still hosts one later, once the reconciler places it there).
-        let minted: Arc<Mutex<BTreeSet<TabletId>>> = Arc::new(Mutex::new(BTreeSet::new()));
-        let host = CpHostCtx {
-            raftkv_env: raftkv_hook_env,
-            ctx: ctx.clone(),
-            storage,
-            base_id: my_raftkv_id,
-            minted: minted.clone(),
-            pending_release: Arc::new(Mutex::new(BTreeMap::new())),
+        // The per-node **tablet-host reconciler** (ADR 0031 PR4): the single
+        // writer of "does this node host tablet T" — see
+        // `tablet_host_reconciler_loop`'s doc for the event-driven trigger.
+        // `on_host`/`on_teardown` mirror every hosting change into this node's
+        // own `ClusterEdgeState` (routing), which becomes a read-only mirror of
+        // the reconciler's own bookkeeping — never a second writer. Built
+        // unconditionally: the reconciler runs on **every** node (a spare not
+        // yet placed on any tablet still hosts one later, once the placement
+        // reconciler places it there). No CP group is stood up at node start
+        // (ADR 0023): a fresh cluster has zero data tablets; the reconciler
+        // stands each table's group up once `CreateTable` provisions its
+        // tablet, and re-forms it from the shared engine's already-durable
+        // data on restart.
+        let reconciler = {
+            let host_edge = edge.clone();
+            let teardown_edge = edge.clone();
+            let base_id = my_raftkv_id;
+            let on_teardown = move |tablet: TabletId| {
+                teardown_edge.unregister_raftkv(tablet, base_id);
+            };
+            match storage {
+                SharedEngine::Lsm(lsm) => CpReconciler::Lsm(Reconciler::new(
+                    raftkv_hook_env,
+                    lsm,
+                    my_raftkv_id,
+                    table_scope_prefix,
+                    move |tablet, node: &RaftKvNode<ProdEnv, LsmEngine<ProdEnv>>| {
+                        host_edge.register_raftkv(tablet, CpGroup::Lsm(node.clone()));
+                    },
+                    on_teardown,
+                )),
+                SharedEngine::Mem(mem) => CpReconciler::Mem(Reconciler::new(
+                    raftkv_hook_env,
+                    mem,
+                    my_raftkv_id,
+                    table_scope_prefix,
+                    move |tablet, node: &RaftKvNode<ProdEnv, MemoryEngine>| {
+                        host_edge.register_raftkv(tablet, CpGroup::Mem(node.clone()));
+                    },
+                    on_teardown,
+                )),
+            }
         };
-        // No CP group is stood up at node start (ADR 0023): a fresh cluster has zero
-        // data tablets. The per-node join-host loop (below) stands up each table's
-        // group when `CreateTable` provisions its tablet, and re-forms it from the
-        // shared engine's already-durable data on restart.
 
         // Bootstrap: whichever node is leader registers membership (no data tablet)
         // (idempotent). Track the client-facing task handles so `shutdown` can
@@ -988,26 +992,17 @@ impl BoundNode {
             control_ids.clone(),
         )));
 
-        // **CP reconfigure loop** (#3 / ADR 0017 Stage C): a CP-hosting node steps
-        // each group it leads toward the tablet's replicated desired replica set —
-        // the production counterpart of `spawn_reconfigure_loop` (decision in the
-        // replicated placement, timing here). Runs on **every** node now (hosting is
-        // dynamic — a node hosts a tablet's group once `CreateTable`/the reconciler
-        // places it here); it only acts on tablets this node currently leads.
-        tasks.push(tokio::spawn(cp_reconfigure_loop(ctx.clone())));
-
-        // **CP join-host loop** (D1 — closes the failure->placement->reconfigure
-        // cascade): a node placed in a tablet's replica set by the reconciler (e.g. a
-        // spare picked to replace a `Down` replica) stands up an empty co-resident
-        // group for it and catches up via `InstallSnapshot`. Runs on **every** node
-        // (a spare is not in the bootstrap CP set, yet must host when later placed).
-        tasks.push(tokio::spawn(cp_join_host_loop(host.clone())));
-
-        // **CP GC loop** (ADR 0024 — drop-table teardown): the join-host loop's
-        // dual. When a tablet this node hosts is dropped from the replicated map
-        // (`DROP TABLE`), stop its group and delete its engine + WAL files, so a
-        // dropped table's disk is actually reclaimed on every replica.
-        tasks.push(tokio::spawn(cp_gc_loop(host)));
+        // **Tablet-host reconciler trigger** (ADR 0031 PR4): replaces the three
+        // loops above (`cp_reconfigure_loop`, `cp_join_host_loop`, `cp_gc_loop`)
+        // with one per-node reaction to `Metadata` changes — narrow/host/
+        // reconfigure/release/reclaim, in that fixed order, driven by
+        // `animus_cp_data::host::Reconciler`. Runs on **every** node (hosting is
+        // dynamic — a node hosts a tablet's group once `CreateTable`/the
+        // placement reconciler places it here).
+        tasks.push(tokio::spawn(tablet_host_reconciler_loop(
+            ctx.clone(),
+            reconciler,
+        )));
 
         // Metrics-history sampler (ADR 0020 dashboard sparklines): periodic
         // snapshots of this node's own aggregated counters. Runs on every node,
@@ -1214,8 +1209,9 @@ impl Node {
     /// pool is torn down underneath it (harmless to durability — an un-acked
     /// write just isn't durable yet — but a noisy, uncontrolled panic on every
     /// real shutdown). [`ClusterEdgeState::shutdown_all_cp_groups`] stops each CP
-    /// group's driver cleanly (mirroring `cp_gc_tablet`'s shutdown-then-wait
-    /// pattern) first, so `shutdown`'s abort has nothing in flight to race. (A
+    /// group's driver cleanly (the same shutdown-then-wait pattern the per-node
+    /// tablet-host reconciler's own teardown uses, ADR 0031 PR4) first, so
+    /// `shutdown`'s abort has nothing in flight to race. (A
     /// `kill -9` is still exposed; the durable-before-ack control-plane fix is a
     /// tracked follow-up.)
     pub async fn shutdown_graceful(&self) {
@@ -1224,6 +1220,16 @@ impl Node {
         self.shutdown();
     }
 }
+
+/// How long a graceful process teardown ([`Node::shutdown_graceful`], via
+/// [`ClusterEdgeState::shutdown_all_cp_groups`]) waits for each hosted CP
+/// group's driver to actually stop before giving up and proceeding to the
+/// hard `abort()` anyway (the process is exiting either way). Also the bound
+/// the per-node tablet-host reconciler's own teardown uses for the identical
+/// shutdown-then-wait wait (`animus_cp_data::host::RECLAIM_STOP_TIMEOUT` —
+/// kept as a separate constant here since this one guards an unrelated,
+/// whole-process concern, not a single tablet's release/reclaim).
+const CP_GC_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The wire edges' mutable state, scoped to **one node** (ADR 0013; made
 /// genuinely per-node by ADR 0031 PR2 — see the historical note below) rather
@@ -1349,8 +1355,9 @@ impl ClusterEdgeState {
     /// the runtime's blocking pool is torn down underneath it. `CpGroup::shutdown`
     /// only latches a flag the driver observes *between* full apply passes, so we
     /// must poll [`is_stopped`](CpGroup::is_stopped) before the caller proceeds to
-    /// abort anything else — the same shutdown-then-wait shape `cp_gc_tablet` uses
-    /// before deleting a dropped tablet's files. Snapshots the handles out of the
+    /// abort anything else — the same shutdown-then-wait shape the per-node
+    /// tablet-host reconciler's own teardown uses (ADR 0031 PR4) before deleting a
+    /// dropped tablet's files. Snapshots the handles out of the
     /// lock first (never hold a `std::sync::Mutex` guard across `.await`). Bounded
     /// by `CP_GC_STOP_TIMEOUT`; a group that doesn't stop in time is logged and
     /// left for the subsequent hard abort (the process is exiting either way).
@@ -1403,22 +1410,6 @@ impl ClusterEdgeState {
             .expect("raftkv handles poisoned")
             .get(&tablet)?
             .first()
-            .cloned()
-    }
-
-    /// This node's own registered handle for `tablet` — the one whose env runs
-    /// as group member `member` — without removing it (contrast
-    /// [`unregister_raftkv`](Self::unregister_raftkv)). Matched per member id
-    /// for the same reason as `unregister_raftkv`. Used by `cp_join_host_loop`
-    /// to re-narrow an already-hosted tablet's own `StorageScope` after a
-    /// split.
-    fn local_cp_member(&self, tablet: TabletId, member: NodeId) -> Option<CpGroup> {
-        self.raftkv
-            .lock()
-            .expect("raftkv handles poisoned")
-            .get(&tablet)?
-            .iter()
-            .find(|g| g.env().node_id() == member)
             .cloned()
     }
 
@@ -2777,8 +2768,8 @@ async fn remote_metadata_sync_loop(ctx: ClientCtx, seeds: Vec<SocketAddr>) {
 /// A node's **one shared** storage engine (ADR 0026/0028): every tablet the node
 /// hosts, across every table, merges into it — confined by its own
 /// [`StorageScope`], not by separate files. Mirrors [`CpGroup`]'s two-backend
-/// shape; cheap to clone (clones share state), so `CpHostCtx` can hand every
-/// tablet's group its own clone.
+/// shape; cheap to clone (clones share state), so the per-node [`CpReconciler`]
+/// (ADR 0031 PR4) can hand every tablet's group its own clone.
 #[derive(Clone)]
 enum SharedEngine {
     /// Durable on-disk LSM (default; survives a restart).
@@ -2796,507 +2787,127 @@ fn table_scope_prefix(table: &str) -> Vec<u8> {
     escape(table.as_bytes())
 }
 
-/// Everything the CP **hosting** paths share: the client context (routing +
-/// address publish), this node's one shared storage engine, the `raftkv` env
-/// every tablet's group runs on (stream-addressed by tablet id, ADR 0026 Stage
-/// B), this node's base `raftkv` id, and the per-node `minted` claim set —
-/// dedups concurrent join-host ticks for the same tablet within this process.
-/// `minted` is **not** persisted: a restarted node just re-discovers every
-/// tablet it should host by polling replicated `Metadata` fresh and re-forms
-/// each group from the shared engine's already-durable data (no more durable
-/// `cp-hosted` marker to load).
-#[derive(Clone)]
-struct CpHostCtx {
-    raftkv_env: ProdEnv,
-    ctx: ClientCtx,
-    storage: SharedEngine,
-    base_id: NodeId,
-    minted: Arc<Mutex<BTreeSet<TabletId>>>,
-    /// Per-node epoch-stability dampener for the release-GC phase (ADR 0029):
-    /// `tablet -> (epoch observed, consecutive confirming ticks)`. A tablet must
-    /// satisfy the release condition (dropped from its replica set **and** this
-    /// node's own Raft config already excludes it) for [`RELEASE_CONFIRM_TICKS`]
-    /// consecutive ticks *at an unchanged epoch* before it is actually released —
-    /// so a replay transient in the replicated map can't trigger a release, and a
-    /// re-add (which bumps the epoch via the CAS) cancels one in flight. Not
-    /// persisted (like `minted`): a restart re-derives it from replicated state.
-    pending_release: Arc<Mutex<BTreeMap<TabletId, (Epoch, u8)>>>,
+/// This node's own tablet-host reconciler (ADR 0031 PR4) — wraps whichever
+/// backend [`SharedEngine`] chose at start, mirroring [`CpGroup`]'s own
+/// two-backend shape: the reconciler (`animus_cp_data::host::Reconciler`) is
+/// generic over the concrete storage engine type, but a node's backend choice
+/// is a runtime value (`StorageBackend`), so this enum picks the
+/// instantiation exactly like `CpGroup` does for `RaftKvNode` itself.
+enum CpReconciler {
+    Lsm(Reconciler<ProdEnv, LsmEngine<ProdEnv>>),
+    Mem(Reconciler<ProdEnv, MemoryEngine>),
 }
 
-/// How often the CP reconfigure loop pulls the tablet map and steps a group it
-/// leads toward its desired voter set (#3). Brisk enough to converge a replica move
-/// promptly, but a no-op once a group's config matches the placement, so a steady
-/// cluster produces no churn.
-///
-/// **Deliberately shorter than the control plane's `RECONCILE_INTERVAL`** (500ms,
-/// `animus-control`): a replica-set change to a tablet whose placement *policy*
-/// still calls for the old count is a genuine one-shot race between this loop
-/// (which should shrink/grow the group's actual Raft voters to match) and the
-/// policy reconciler (which will otherwise CAS the replica set right back to
-/// satisfy the policy) — whichever observes the change first decides the
-/// outcome, since once either side "wins" the system reaches a stable
-/// equilibrium with nothing left to retry. Polling at a third of the
-/// reconciler's period makes this loop overwhelmingly likely to observe and
-/// act on a fresh replica-set change first.
-const CP_RECONFIGURE_INTERVAL: Duration = Duration::from_millis(150);
+impl CpReconciler {
+    /// One reconcile tick — see [`Reconciler::tick`]'s doc for the pure
+    /// `plan` decision plus its own execution of the returned actions.
+    async fn tick(&mut self, view: &MetadataView) {
+        match self {
+            CpReconciler::Lsm(r) => r.tick(view).await,
+            CpReconciler::Mem(r) => r.tick(view).await,
+        }
+    }
+}
 
-/// The per-node **CP reconfigure loop** over `ProdEnv` (#3 / ADR 0017 Stage C): on
-/// each tick, for every tablet whose CP group this node currently **leads**, pull the
-/// tablet's desired replica set from replicated `Metadata` and take one single-server
-/// [`reconfigure_step`](CpGroup::reconfigure_step) toward it. The production
-/// counterpart of `animus-cp-data`'s `spawn_reconfigure_loop` — the decision is the
-/// replicated placement (the reconciler's epoch-CAS), the timing is here. Leader- and
-/// convergence-gated, so a steady cluster proposes nothing; a multi-server move
-/// converges one server per tick.
+/// How often [`tablet_host_reconciler_loop`] falls back to a plain poll when
+/// no `metadata_watch` wake arrives before this elapses. The trigger is
+/// event-driven now (ADR 0031 PR4), so this is **not** the primary cadence —
+/// it exists so a node whose own control-plane raft never advances (a
+/// control-plane-follower-less growth node, ADR 0030, which reads
+/// `effective_metadata()` from the `remote_metadata_sync_loop` mirror
+/// instead of real Raft replication) still reconciles periodically. Matches
+/// the old `CP_JOIN_HOST_INTERVAL`'s cadence, which served the same
+/// "responsive enough, cheap enough" role for every node before this PR.
+const RECONCILE_FALLBACK_INTERVAL: Duration = Duration::from_millis(500);
+
+/// The single per-node **tablet-host reconciler trigger** (ADR 0031 PR4):
+/// replaces the three loops this file used to run independently
+/// (`cp_reconfigure_loop`, `cp_join_host_loop`, `cp_gc_loop`'s reclaim +
+/// release phases) with one reaction to `Metadata` changes, driving
+/// `animus_cp_data::host::Reconciler` — the pure `plan` decision plus its own
+/// execution of the returned actions (`animus-cp-data`'s `host` module doc
+/// covers the full lifecycle: narrow an already-hosted tablet's scope, host a
+/// newly-placed one, reconfigure a group this node leads toward its
+/// replicated replica set, then release/reclaim a tablet moved off or
+/// dropped — always in that fixed order, so "narrow before erase" and
+/// "reconfigure only a hosted tablet" are structural properties of the
+/// planner's output, not properties some ordering of independent loop ticks
+/// happened to provide).
 ///
-/// Since ADR 0026 Stage B a tablet's CP group member id **is** simply the base
-/// `raftkv` id — no more translation to a derived member id — so the desired voter
-/// set is just the tablet's replica set, verbatim.
+/// Each firing takes exactly **one** `Metadata` snapshot
+/// (`ctx.effective_metadata()`, so a control-plane-follower-less growth node
+/// reads the same mirror the old loops did) and calls
+/// [`CpReconciler::tick`] once.
 ///
-/// Removing a dead replica needs no new member, so it converges immediately. Adding a
-/// *fresh* replica also requires that node to host an (empty) group for the tablet so
-/// it can catch up via `InstallSnapshot` — that's [`cp_join_host_loop`].
+/// **Event-driven, with a periodic fallback**: races
+/// `ctx.raft.metadata_watch().changed(last_seen)` (an executor-agnostic
+/// "applied index advanced" notification, ADR 0031 §trigger) against a
+/// [`RECONCILE_FALLBACK_INTERVAL`] sleep. The fallback is load-bearing, not
+/// just a safety net: a control-plane-follower-less growth node's own
+/// `RaftCore` never receives real Raft replication for a group it was never a
+/// voter of (ADR 0030's documented v1 limitation), so its `metadata_watch`
+/// never fires — such a node's reconciler only ever ticks off the fallback,
+/// reading `effective_metadata()`'s `remote_metadata_sync_loop` mirror
+/// instead. Whichever branch wakes the loop, **coalesce to the freshest
+/// observed index** (`watch.latest()`) before the next wait — a burst of
+/// several commits under bulk load collapses into one tick, not one per
+/// entry.
 ///
-/// **Jittered, not a bare fixed-period sleep**: the control plane's own
-/// `reconcile_loop` (ADR 0005, `animus-control`) also polls on a fixed 500ms
-/// period to enforce a tablet's placement *policy* — and a manual (or
-/// higher-level) replica-set change competes with it: if the policy still wants
-/// the old replica count, the reconciler will CAS the tablet right back. Two
-/// un-jittered fixed-period loops can fall into a stable relative phase for the
-/// life of the process (neither resynchronizes), which can let one loop win a
-/// given race *every* time rather than a fair contest — observed as this loop
-/// losing to the reconciler on every tick after a manual replica-set drop.
-/// Re-rolling a small random jitter each iteration makes the phase drift
-/// tick-to-tick, so across the many ticks in any real observation window this
-/// loop gets a fair shot instead of a fixed, possibly permanently-losing one.
-async fn cp_reconfigure_loop(ctx: ClientCtx) {
+/// The `last_applied() == 0` pre-recovery guard (see
+/// `animus_cp_data::host::plan`'s own doc: deciding "dropped" from *absence*
+/// is sound only over recovered, durable metadata — an empty pre-recovery
+/// `Metadata` would otherwise read as "everything dropped" and spuriously
+/// reclaim/release real, still-hosted tablets) stays here, as a live
+/// `RaftNode` read the pure planner has no business taking. It is gated on
+/// **this node's own local control raft specifically**, not on
+/// `effective_metadata()`'s availability — a control-plane-follower-less
+/// growth node's local raft never leaves `last_applied() == 0` (it is a
+/// permanent non-voter of a group it never replicates), so the guard also
+/// requires its remote mirror to still be empty before skipping a tick, or a
+/// growth node's reconciler would never tick at all.
+async fn tablet_host_reconciler_loop(ctx: ClientCtx, mut reconciler: CpReconciler) {
+    let watch = ctx.raft.metadata_watch();
+    let mut last_seen = watch.latest();
     loop {
-        tokio::time::sleep(CP_RECONFIGURE_INTERVAL + jitter(CP_RECONFIGURE_INTERVAL)).await;
-        // `effective_metadata`: a growth node (ADR 0030) that has since earned
-        // leadership of a tablet's CP-data group still needs a live view of its
-        // desired replica set to reconfigure toward.
+        tokio::select! {
+            _ = watch.changed(last_seen) => {}
+            _ = tokio::time::sleep(RECONCILE_FALLBACK_INTERVAL) => {}
+        }
+        // Coalesce: take the freshest observed index regardless of which arm
+        // woke the loop (the `changed()` future's own resolved value is not
+        // enough — `latest()` may have advanced further still), so a burst of
+        // commits under load collapses into one tick instead of one per entry.
+        last_seen = watch.latest();
+
+        // Recovery guard (see doc above): skip entirely before this node has
+        // *some* trustworthy view of `Metadata` — either its own recovered
+        // local control raft, or (for a growth node) a populated remote
+        // mirror. Before either exists, `effective_metadata()` reads as a
+        // default, empty `Metadata`, which would otherwise look like
+        // "everything dropped" to the reclaim/release phases.
+        if ctx.raft.last_applied() == 0
+            && ctx
+                .remote_metadata
+                .lock()
+                .expect("remote metadata poisoned")
+                .is_none()
+        {
+            continue;
+        }
+
         let meta = ctx.effective_metadata();
-        // The same read this loop already takes; the down-set is the priority
-        // input `reconfigure_step` (ADR 0029) uses to tell a genuine failure
-        // repair (remove first) from a healthy rebalance move (add first, then
-        // gate the removal on the newcomer catching up).
         let down: BTreeSet<NodeId> = meta
             .members
             .iter()
             .filter(|(_, m)| m.status == NodeStatus::Down)
             .map(|(id, _)| *id)
             .collect();
-        for (tablet, t) in meta.tablets {
-            let Some(leader) = ctx.edge.cp_leader(tablet) else {
-                continue;
-            };
-            let desired: BTreeSet<NodeId> = t.replicas.iter().copied().collect();
-            leader.reconfigure_step(&desired, &down);
-        }
-    }
-}
-
-/// A small pseudo-random jitter in `[0, max)`, seeded from the wall clock —
-/// deliberately non-deterministic (this file is `ProdEnv`-only, outside the
-/// `Env`-seam determinism boundary, ADR 0003) and dependency-free. Used to keep
-/// fixed-period background loops from settling into a permanent unlucky phase
-/// relative to another independent fixed-period loop (see
-/// [`cp_reconfigure_loop`]'s doc).
-fn jitter(max: Duration) -> Duration {
-    if max.is_zero() {
-        return Duration::ZERO;
-    }
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-    Duration::from_nanos(u64::from(nanos) % max.as_nanos().max(1) as u64)
-}
-
-/// How often the join-host loop polls the tablet map for a tablet newly placed on
-/// this node. Snappy enough (ADR 0023) that a freshly provisioned table tablet is
-/// hosted + elects promptly so the `CreateTable`/first-write that provisioned it can
-/// serve, but not so tight that polling (a `Metadata` clone per tick on every node)
-/// adds contention under heavy parallel load.
-const CP_JOIN_HOST_INTERVAL: Duration = Duration::from_millis(250);
-
-/// The per-node **CP join-host loop**: when the placement reconciler adds this node
-/// to a tablet's replica set (e.g. picking it as the spare for a `Down` replica), or
-/// a table's tablet is freshly provisioned or split, stand up this node's member of
-/// that tablet's group.
-///
-/// Since a single-command split moves no data (ADR 0026/0028: a split child's
-/// `StorageScope` is simply confined to its own range against the same
-/// already-populated shared engine), a fresh split child forms **exactly like** a
-/// fresh whole-keyspace tablet — both get the full voter config
-/// ([`topology::plan_join_host`]'s `initial_formation`). A **restart** of a tablet
-/// this node already hosts also needs the full config (WAL recovery alone does not
-/// restore voter status from a non-voter start) — detected by
-/// `StorageScope::has_data`, an async engine read the pure decision can't do, so
-/// `cp_join_host` layers it on top. Double-hosting is prevented **per node** by the
-/// `minted` claim set, not `edge.local_cp` — even though `edge` is itself
-/// per-node now (ADR 0031 PR2), `minted` is claimed synchronously at decision
-/// time, before the (async) join-host actually registers a handle, so it can't
-/// race a later tick in this same loop the way a registration-based check
-/// could.
-///
-/// **Also re-narrows an already-hosted tablet's `StorageScope` every tick.** A
-/// single-command split (ADR 0028) narrows the *source* tablet's range in
-/// replicated `Metadata`, but the source's `RaftKvNode` predates the split — its
-/// `StorageScope` was constructed once, at this loop's original join-host call,
-/// and nothing else in `animusd` ever updates it in place (only the new sibling
-/// gets a freshly-constructed, correctly-narrowed scope, via the normal
-/// join-host path below). Left alone, the source's already-hosted replica keeps
-/// serving/counting its pre-split range forever — visible e.g. as `/admin/raftkv`
-/// reporting the *pre-split* key count for the parent tablet after a split.
-/// `narrow_scope` is a cheap, idempotent mutex set, so calling it unconditionally
-/// on every tick (not just when the range actually changed — this loop has no
-/// cheap way to tell) is safe.
-async fn cp_join_host_loop(host: CpHostCtx) {
-    loop {
-        tokio::time::sleep(CP_JOIN_HOST_INTERVAL).await;
-        // `effective_metadata`: this is the load-bearing read for a growth node
-        // (ADR 0030) — it is how it ever learns it was placed in a tablet's
-        // replica set at all, since its own local raft never replicates.
-        let tablets = host.ctx.effective_metadata().tablets;
-        for (tablet, t) in tablets {
-            let Some(plan) = topology::plan_join_host(host.base_id, &t.replicas, t.epoch) else {
-                continue;
-            };
-            // Dedup **per node** via the `minted` claim set — NOT via `edge.local_cp`.
-            // `edge` is per-node (ADR 0031 PR2), so this is no longer about avoiding
-            // another node's state; it's that `minted` is claimed *before* the async
-            // join-host registers a handle, so it can't race this same loop's next
-            // tick the way checking for a registered handle could. This stateful
-            // claim stays here — it is not part of the pure decision.
-            let already_hosted = {
-                let mut h = host.minted.lock().expect("hosting set poisoned");
-                !h.insert(tablet)
-            };
-            if already_hosted {
-                if let Some(group) = host.ctx.edge.local_cp_member(tablet, host.base_id) {
-                    group.narrow_scope(t.range.clone());
-                }
-                continue;
-            }
-            cp_join_host(&host, tablet, &t, plan.initial_formation).await;
-        }
-    }
-}
-
-/// Stand up this node's member of `tablet`'s group (the body of
-/// [`cp_join_host_loop`]) on the node's one shared engine, scoped to `t`'s table +
-/// range. The group's member id is simply this node's base `raftkv` id (ADR 0026
-/// Stage B), stream-addressed by `tablet.0` on the shared `raftkv` env — no more
-/// per-tablet inbox to mint.
-async fn cp_join_host(host: &CpHostCtx, tablet: TabletId, t: &Tablet, initial_formation: bool) {
-    let table = t.table.as_deref().unwrap_or_default();
-    let scope = StorageScope::new(table_scope_prefix(table), t.range.clone());
-    let full: Vec<NodeId> = t.replicas.clone();
-    // The **full** member config (every replica, including self) vs the quiet
-    // **non-voter** config (the others, excluding self):
-    let others: Vec<NodeId> = full
-        .iter()
-        .copied()
-        .filter(|&id| id != host.base_id)
-        .collect();
-    let env = host.raftkv_env.clone();
-    let stream = tablet.0;
-    // Choosing the start config (ADR 0023):
-    // - **Re-form with the full config** when this node is *forming* the group — a
-    //   freshly provisioned table tablet or split child (`initial_formation`), or a
-    //   **restart** of a tablet this node already hosts (its scoped range already
-    //   holds data in the shared engine) — so a replica can campaign and the group
-    //   elects with no live leader.
-    // - **Join as a quiet non-voter** otherwise — a brand-new (empty) spare the
-    //   reconciler placed into an existing, already-led group, which must not
-    //   campaign until the leader adds it (`animus-cp-data` membership gotcha).
-    let cp = match &host.storage {
-        SharedEngine::Lsm(lsm) => {
-            let reforming = initial_formation || scope.has_data(lsm).await;
-            let config = if reforming { full } else { others };
-            CpGroup::Lsm(RaftKvNode::start_hosted(
-                env,
-                config,
-                lsm.clone(),
-                scope,
-                stream,
-            ))
-        }
-        SharedEngine::Mem(mem) => {
-            let reforming = initial_formation || scope.has_data(mem).await;
-            let config = if reforming { full } else { others };
-            CpGroup::Mem(RaftKvNode::start_hosted(
-                env,
-                config,
-                mem.clone(),
-                scope,
-                stream,
-            ))
-        }
-    };
-    host.ctx.edge.register_raftkv(tablet, cp);
-}
-
-/// How often the GC loop checks whether a tablet this node hosts has been
-/// dropped from the replicated tablet map (ADR 0024). Teardown is off every
-/// request path, so a slow-ish tick is fine; brisk enough that a dropped
-/// table's disk is reclaimed promptly.
-const CP_GC_INTERVAL: Duration = Duration::from_millis(500);
-/// How long the GC waits for a halted group's driver to actually exit before
-/// giving up for this tick. The driver observes the halt on its next wake (one
-/// Raft timer tick at most), so this is generous; on timeout the handle is
-/// re-registered and the teardown retries on a later tick — nothing is erased
-/// while the driver might still write.
-const CP_GC_STOP_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// How many consecutive GC ticks — **at an unchanged tablet epoch** — the
-/// release condition (dropped from the replica set **and** this node's own Raft
-/// config excludes it) must hold before the release phase actually stops+erases
-/// a moved-off tablet (ADR 0029). A small dampener so a restarting control
-/// replica's replay transients (which pass `tablets` through historical states)
-/// can't trigger a spurious release, and a metadata re-add (which bumps the
-/// tablet's epoch via the placement CAS) cancels a release part-way confirmed.
-const RELEASE_CONFIRM_TICKS: u8 = 3;
-
-/// The per-node **CP GC loop** (ADR 0024 drop-table teardown): when a tablet
-/// this node hosts disappears from the replicated tablet map (a committed
-/// `DropTableTablets`), reclaim everything local to it — unregister the group
-/// handle, stop its driver, erase its range from the shared engine, delete its
-/// WAL file, and release the `minted` claim. The exact dual of
-/// [`cp_join_host_loop`]: same pull-from-replicated-state shape, same per-node
-/// `minted` state for the decision.
-///
-/// Deciding "dropped" from *absence* in the map is sound only over recovered,
-/// durable metadata: this node minted a tablet only after **applying** its
-/// `CreateTablet` (and `metadata()` exposes durable state only), so its
-/// recovered control replica always contains every tablet it hosts — absence
-/// therefore means a committed drop, never not-yet-recovered state. The
-/// `last_applied() == 0` guard skips the pre-recovery window where the default
-/// (empty) `Metadata` would read as "everything dropped".
-///
-/// The converse transient is fine too: while a restarted control replica
-/// re-applies its log it passes through **historical** map states, so the
-/// join-host loop can briefly re-host a *dropped* tablet (an empty group — its
-/// range was already erased, and routing consults the current map, so it
-/// serves nothing). Once replay reaches the committed drop, this loop reclaims
-/// it again; drop + GC are convergent, not one-shot.
-///
-/// **Second phase — release a tablet moved *off* this node (ADR 0029).** A
-/// tablet that still exists but whose replica set no longer places a replica on
-/// this node (an operator `drain`, an automatic failure-repair swap, or a
-/// rebalance move) must also be stopped + erased here — otherwise a node dropped
-/// from a still-existing tablet's replica set keeps an idle group running and
-/// its data lingering in the shared engine forever. This is the exact dual of
-/// the reclaim phase, differing only in the predicate
-/// ([`topology::tablets_to_release`] vs. `tablets_to_reclaim`); once decided,
-/// both run the identical [`cp_gc_tablet`] teardown. Two guards make it safe:
-/// (1) the **local-config gate** — only act once this node's *own durable Raft
-/// log* config (`CpGroup::config`) already excludes `base_id`, the
-/// replay-independent signal PR1's `departing` mechanism guarantees a removed
-/// node reliably adopts; and (2) an **epoch-stability dampener**
-/// ([`RELEASE_CONFIRM_TICKS`] consecutive ticks at an unchanged epoch) that
-/// absorbs replay flicker and lets a re-add cancel a release in flight.
-///
-/// **Residual gap (accepted, matches the pre-existing drain/repair behavior):**
-/// a node that crashes *before* it ever receives the removal config entry (i.e.
-/// before the leader's `departing` bookkeeping relays it) recovers a Raft log
-/// whose config still includes itself, so the local-config gate never passes and
-/// the group leaks (stays hosted + un-erased) forever on that node. This is not
-/// a regression — before ADR 0029 *nothing* released such a tablet on any node,
-/// under any removal path — just an accepted incompleteness of the durable
-/// release signal.
-async fn cp_gc_loop(host: CpHostCtx) {
-    loop {
-        tokio::time::sleep(CP_GC_INTERVAL).await;
-        // Recovery guard stays here (a live `RaftNode` read, not part of the pure
-        // predicate): skip entirely before replicated `Metadata` has recovered, or
-        // an empty default `Metadata` reads as "everything dropped".
-        if host.ctx.raft.last_applied() == 0 {
-            continue;
-        }
-        let tablets = host.ctx.raft.metadata().tablets;
-        let mine: Vec<TabletId> = host
-            .minted
-            .lock()
-            .expect("hosting set poisoned")
-            .iter()
-            .copied()
-            .collect();
-
-        // Phase 1 (ADR 0024): reclaim tablets whose whole table was dropped
-        // (absent from the map). The tablet is gone from `Metadata` entirely, so
-        // there is no current range to narrow to — every same-prefix sibling still
-        // present is dying in this same pass too (the whole table was dropped), so
-        // erasing this group's full (possibly stale-wide) scope is correct here.
-        for tablet in topology::tablets_to_reclaim(&mine, &tablets) {
-            cp_gc_tablet(&host, tablet, None).await;
-        }
-
-        // Phase 2 (ADR 0029): release tablets still present but moved off this
-        // node's replica set. `mine` may now be stale for anything phase 1 just
-        // reclaimed, but a reclaimed tablet is absent from `tablets`, so
-        // `tablets_to_release` (present-only) never returns it — the two phases
-        // partition `mine`.
-        cp_gc_release_phase(&host, &mine, &tablets).await;
-    }
-}
-
-/// The release phase of [`cp_gc_loop`] (ADR 0029): stop + erase every tablet in
-/// `mine` that is still present in `tablets` but no longer places a replica on
-/// this node, once the local-config gate and epoch-stability dampener both
-/// confirm it. Kept as a helper so the confirm-state bookkeeping doesn't clutter
-/// the loop body.
-async fn cp_gc_release_phase(
-    host: &CpHostCtx,
-    mine: &[TabletId],
-    tablets: &BTreeMap<TabletId, Tablet>,
-) {
-    let candidates = topology::tablets_to_release(mine, tablets, host.base_id);
-    let candidate_set: BTreeSet<TabletId> = candidates.iter().copied().collect();
-    // Drop confirm state for anything no longer a candidate (condition flipped —
-    // re-added to the replica set, or reclaimed): its counter must restart.
-    host.pending_release
-        .lock()
-        .expect("pending_release poisoned")
-        .retain(|t, _| candidate_set.contains(t));
-
-    for tablet in candidates {
-        // Safety anchor: only trust the metadata-based signal once this node's
-        // **own durable Raft log** independently confirms it's no longer a voter.
-        // If the local handle is gone (already released / stand-up in flight) or
-        // its config still lists us, reset this tablet's confirm counter and wait.
-        let excluded = match host.ctx.edge.local_cp_member(tablet, host.base_id) {
-            Some(group) => !group.config().contains(&host.base_id),
-            None => false,
+        let view = MetadataView {
+            tablets: meta.tablets,
+            down,
         };
-        if !excluded {
-            host.pending_release
-                .lock()
-                .expect("pending_release poisoned")
-                .remove(&tablet);
-            continue;
-        }
-
-        // `tablets_to_release` only returns present tablets, so the epoch is here.
-        let epoch = match tablets.get(&tablet) {
-            Some(t) => t.epoch,
-            None => continue,
-        };
-        let confirmed = {
-            let mut pending = host
-                .pending_release
-                .lock()
-                .expect("pending_release poisoned");
-            match pending.get_mut(&tablet) {
-                // Same epoch, still confirming: advance the tick count.
-                Some((seen, ticks)) if *seen == epoch => {
-                    *ticks = ticks.saturating_add(1);
-                    *ticks >= RELEASE_CONFIRM_TICKS
-                }
-                // First observation, or the epoch changed (a re-add/CAS bumped it):
-                // (re)start the counter at this epoch.
-                _ => {
-                    pending.insert(tablet, (epoch, 1));
-                    RELEASE_CONFIRM_TICKS <= 1
-                }
-            }
-        };
-        if confirmed {
-            host.pending_release
-                .lock()
-                .expect("pending_release poisoned")
-                .remove(&tablet);
-            // Bound the erase by the tablet's CURRENT replicated range (see
-            // `cp_gc_tablet`'s doc) — never the group's in-memory `StorageScope`,
-            // which can still be stale-wide if this node was dropped from the
-            // replica set before its own `cp_join_host_loop` narrow tick ran.
-            // `tablets_to_release` only returns present tablets, so this is
-            // always `Some` in practice.
-            let current_range = tablets.get(&tablet).map(|t| t.range.clone());
-            cp_gc_tablet(host, tablet, current_range).await;
-        }
+        reconciler.tick(&view).await;
     }
-}
-
-/// Reclaim this node's local artifacts of a dropped-or-released `tablet` (the
-/// body of [`cp_gc_loop`]). Every step is idempotent and ordered so a crash
-/// anywhere mid-teardown converges on a later tick or the next restart:
-/// unregister the handle (routing/admin stop seeing the group), stop the driver
-/// and wait for its exit (the engine/WAL quiesce), tombstone the tablet's own
-/// range out of the **shared** engine (never touching a sibling tablet's data),
-/// delete its WAL file, then release the `minted` claim.
-///
-/// **`current_range`, and why the erase must be bounded by it, not the group's
-/// own `StorageScope` (root `CLAUDE.md` engineering-practices entry: a teardown
-/// that erases "my own scope" must re-derive the scope from replicated state at
-/// the point of irreversible action).** The **release** path (ADR 0029 phase 2 —
-/// the tablet still exists in `Metadata`, just no longer on this node) must pass
-/// the tablet's **current replicated range** (`Metadata.tablets[tablet].range`)
-/// here, so this function narrows the group's `StorageScope` to it (via
-/// [`CpGroup::narrow_scope`]) *before* calling
-/// [`erase_scope`](CpGroup::erase_scope). Without this, a node whose
-/// `cp_join_host_loop` narrow tick hasn't yet run since a split can carry a
-/// **stale-wide** `StorageScope` — a split narrows the source tablet's range in
-/// `Metadata` immediately, but the source's already-hosted `RaftKvNode`'s own
-/// scope object is only re-narrowed on that loop's next ~250ms tick
-/// (`CP_JOIN_HOST_INTERVAL`) — and if a rebalance/repair/drain drops this node
-/// from the source's replica set inside that window, the release GC would erase
-/// the group's still-wide scope, which (since ADR 0026/0028 puts every tablet a
-/// node hosts on one shared engine) tombstones the split's new sibling's live
-/// keys too, at a version high enough to beat the sibling's own fresh writes
-/// under per-key LWW — silent, permanent corruption of a tablet this node was
-/// never even asked to release. `narrow_scope` is documented narrow-only
-/// (`StorageScope::narrow`'s caller contract), and the current replicated range
-/// is always a subset of (or equal to) whatever the group's own scope already
-/// covers, so this is always a narrowing, never a widening. The **reclaim** path
-/// (phase 1 — the tablet is absent from `Metadata` because its whole table was
-/// dropped) passes `None`: there is no current range to narrow to, and every
-/// same-prefix sibling still resident is dying in the same GC pass, so erasing
-/// the group's full existing scope is correct there.
-async fn cp_gc_tablet(host: &CpHostCtx, tablet: TabletId, current_range: Option<KeyRange>) {
-    // No registered handle means the stand-up path claimed `minted` but has not
-    // finished (start in flight) — retry on a later tick rather than erasing data
-    // under a group mid-standup.
-    let Some(group) = host.ctx.edge.unregister_raftkv(tablet, host.base_id) else {
-        return;
-    };
-    group.shutdown();
-    let deadline = tokio::time::Instant::now() + CP_GC_STOP_TIMEOUT;
-    while !group.is_stopped() {
-        if tokio::time::Instant::now() >= deadline {
-            // Never touch data while the driver might still write. Put the
-            // handle back so a later tick retries the whole teardown.
-            tracing::warn!(
-                tablet = tablet.0,
-                "CP GC: group driver did not stop in time"
-            );
-            host.ctx.edge.register_raftkv(tablet, group);
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-
-    // Bound the erase to the tablet's current replicated range (release path
-    // only) — see the doc comment above for why the group's own `StorageScope`
-    // cannot be trusted here.
-    if let Some(range) = current_range {
-        group.narrow_scope(range);
-    }
-    group.erase_scope().await;
-    let env = group.env().clone();
-    if let Err(e) = env.remove(&animus_cp_data::wal_file(tablet.0)).await {
-        tracing::warn!(?e, tablet = tablet.0, "CP GC: removing the tablet's WAL");
-    }
-
-    // Release the claim last, once nothing is left to reclaim. (Tablet ids are
-    // never reused, so nothing can legitimately re-mint this id; a re-created
-    // table gets a fresh tablet.)
-    host.minted
-        .lock()
-        .expect("hosting set poisoned")
-        .remove(&tablet);
-    tracing::info!(tablet = tablet.0, "CP GC: reclaimed dropped tablet");
 }
 
 /// How often [`metrics_sample_loop`] takes a metrics snapshot for the
@@ -3659,11 +3270,11 @@ impl ClientCtx {
     /// — both served by the **same** replicas' existing per-node shared engine
     /// (ADR 0026/0028: one LSM tree per node, confined by [`StorageScope`]), so
     /// no data moves and there is no second, data-plane step that can fail
-    /// independently. `cp_join_host_loop` then forms the new sibling's Raft
-    /// group on every replica (a fresh whole-voter formation, identical to a
-    /// brand-new table's tablet) — orphaned, leaderless metadata-only tablets
-    /// are structurally impossible now, since commit of this one command is
-    /// the whole operation.
+    /// independently. The per-node tablet-host reconciler (ADR 0031 PR4) then
+    /// forms the new sibling's Raft group on every replica (a fresh
+    /// whole-voter formation, identical to a brand-new table's tablet) —
+    /// orphaned, leaderless metadata-only tablets are structurally impossible
+    /// now, since commit of this one command is the whole operation.
     ///
     /// Routed to the control leader (relayable, [`is_relayable_command`]), so
     /// this works from any node the client happens to be connected to.
@@ -3822,9 +3433,10 @@ impl ClientCtx {
 
     /// Drop `table` **and garbage-collect its data** (ADR 0024): remove the
     /// schema from the replicated catalog, then remove the table's tablets from
-    /// the replicated tablet map — the trigger each hosting node's
-    /// [`cp_gc_loop`] converges on by stopping its local group and deleting its
-    /// engine + WAL files. This is the real `DROP TABLE` sink (CQL + the admin
+    /// the replicated tablet map — the trigger each hosting node's per-node
+    /// tablet-host reconciler (ADR 0031 PR4) converges on by stopping its
+    /// local group and deleting its engine + WAL files. This is the real
+    /// `DROP TABLE` sink (CQL + the admin
     /// dashboard); [`drop_table_schema`](Self::drop_table_schema) alone remains
     /// the schema-only primitive (the admin panel's schema-only drop) — an
     /// `ALTER TABLE` now mutates the schema in place via
@@ -4445,9 +4057,9 @@ mod split_fence_tests {
 
             // Sanity: the parent's own live scope really has narrowed past the
             // child key, so the pre-check below is exercising the real thing.
-            // `narrow_scope` is applied by the per-node join-host loop's
-            // periodic re-narrow (`CP_JOIN_HOST_INTERVAL`), not synchronously
-            // with the split's commit, so poll for it.
+            // `narrow_scope` is applied by the per-node tablet-host
+            // reconciler's `NarrowScope` action (ADR 0031 PR4), triggered by
+            // the split's commit but not synchronous with it, so poll for it.
             timeout(Duration::from_secs(10), async {
                 loop {
                     if !parent.scope_range().contains(&child_key) {

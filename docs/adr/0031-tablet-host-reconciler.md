@@ -1,7 +1,14 @@
 # ADR 0031 — Per-node tablet-host reconciler + a metadata-applied watch primitive
 
-- **Status:** Accepted — implemented incrementally across PRs 1–6; this PR
-  delivers the metadata-watch primitive (§trigger).
+- **Status:** Accepted — implemented incrementally across PRs 1–6. PR1
+  delivered the metadata-watch primitive (§trigger); PR2 made
+  `ClusterEdgeState` genuinely per-node; PR3 delivered the pure planner
+  (`animus_cp_data::host::plan`); **PR4 (this PR) delivers the executor
+  (`animus_cp_data::host::Reconciler`) and wires it into `animusd`, retiring
+  `cp_join_host_loop`, `cp_gc_loop`/`cp_gc_release_phase`, and
+  `cp_reconfigure_loop`.** PR5 (a dedicated `SimEnv` lifecycle fault-injection
+  corpus for the reconciler beyond PR4's own focused test) and PR6 (further
+  docs cleanup) remain.
 - **Date:** 2026-08-07
 
 ## Context
@@ -63,7 +70,7 @@ instead of once, in one place, in a fixed order.**
 
 ## Decision
 
-We will consolidate the four loops into **one per-node `TabletHostReconciler`**
+We will consolidate the four loops into **one per-node tablet-host `Reconciler` (`animus_cp_data::host::Reconciler`)**
 living in `animus-cp-data` (generic over `E: Env`, so it is `SimEnv`-testable
 like everything else in this codebase), delivered across six PRs:
 
@@ -82,14 +89,34 @@ like everything else in this codebase), delivered across six PRs:
    "narrow the scope before erasing anything" and "reconfigure only a tablet
    already hosted" are structural properties of the planner's output, not
    properties some ordering of loop ticks happens to have provided.
-4. **PR4:** the reconciler itself — each tick takes **one** `Metadata`
-   snapshot, gathers the impure facts the plan needs (this group's live
-   `config()`, `is_leader()`, `has_data()`, `scope_range()`), calls the pure
-   planner once, then executes the returned actions in order.
+4. **PR4 (delivered):** the reconciler itself —
+   `animus_cp_data::host::Reconciler<E: Env, S: StorageEngine>`. Each tick
+   takes **one** `Metadata` snapshot (as a `MetadataView`), gathers the
+   impure facts the plan needs from its *own* hosted `RaftKvNode` map and
+   engine (`is_leader()`, `config()`, `scope_range()`, an async
+   `StorageScope::has_data` check for join candidates), calls `plan` once,
+   then executes the returned actions in the fixed order `plan` emits them.
+   The reconciler owns the hosted-group map directly (the single writer of
+   "does this node host tablet T"); `animusd` mirrors every change into its
+   own `ClusterEdgeState` (routing) via `on_host`/`on_teardown` hooks passed
+   at construction, making that registry a read-only mirror with exactly one
+   writer. `animusd::BoundNode::start_with` replaced its three separate
+   loops (`cp_reconfigure_loop`, `cp_join_host_loop`, `cp_gc_loop`) with one
+   `tablet_host_reconciler_loop` task that races
+   `RaftNode::metadata_watch().changed(last_seen)` against a 500ms fallback
+   sleep (load-bearing for an ADR 0030 growth node, whose own control raft
+   never advances) and coalesces to the freshest observed index before each
+   tick. The `last_applied() == 0` pre-recovery guard stays in `animusd`
+   (a live `RaftNode` read the pure planner has no business taking), gated on
+   *both* the local raft and the growth-node remote-metadata mirror being
+   unavailable, so it never permanently blocks a growth node's reconciler.
 5. **PR5:** a `SimEnv` lifecycle corpus exercising the reconciler across the
    full host → reconfigure → split-narrow → release → reclaim sequence under
-   fault injection.
-6. **PR6:** retire the four old loops and their doc references; docs cleanup.
+   fault injection, beyond PR4's own focused
+   `reconciler_hosts_narrows_releases_and_confirms_sparing_a_sibling` test
+   (`animus-cp-data/tests/reconciler.rs`).
+6. **PR6:** retire remaining doc references to the old loop names; further
+   docs cleanup.
 
 ### The trigger (this PR)
 
@@ -126,7 +153,7 @@ the (common) "nothing changed this iteration" case.
 `MetadataWatch` is deliberately single-waiter, mirroring `ProposeSignal`: an
 `AtomicWaker` only remembers the most recently registered waker, so two
 concurrent callers of `changed()` would starve one of them. This matches the
-intended consumer exactly — one `TabletHostReconciler` task per node — and is
+intended consumer exactly — one `Reconciler` task per node — and is
 documented on the type rather than hidden.
 
 ## Consequences
@@ -189,7 +216,7 @@ primitive):
   ADR 0005/0029) and `detect_loop` (failure detection, ADR 0012) remain
   separate loops — they decide the *replicated* replica set, which is a
   cluster-wide policy question the control-plane leader alone can answer.
-  The `TabletHostReconciler` this ADR introduces is downstream of that
+  The `Reconciler` this ADR introduces is downstream of that
   decision: it reacts, per node, to whatever replica set `Metadata` already
   says. `animusd`'s `auto_split_loop`, `bootstrap`, `peer_sync`, and the
   heartbeat loop also stay separate — none of them owns "does this node's

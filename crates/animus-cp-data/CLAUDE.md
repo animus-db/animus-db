@@ -346,21 +346,65 @@ the engine — the `AccordCore` sync-core/async-driver split.
 
 ## Per-node tablet-host reconciler (ADR 0031, `host` module)
 
-**Purely additive, PR3 of the ADR 0031 consolidation — nothing in this crate
-calls it yet.** `animusd` currently scatters "which tablets does this node
-host, and what should it do about each one" across four independent `ProdEnv`
-loops (`cp_join_host_loop`/`cp_join_host`, `cp_gc_loop`/`cp_gc_release_phase`,
-`cp_reconfigure_loop`), each re-deriving its own slice of replicated
-`Metadata` and its own per-node bookkeeping (`minted`, `pending_release`).
-`host::plan` unifies the *decision* those four loops make into one pure,
-synchronous function — mirroring this crate's own sync-core/async-driver
-split (`RaftCore` decides, the driver does I/O): **the decision lives here and
-is unit-tested directly; the timing, locking, and actual `ProdEnv` I/O stay in
-`animusd`.** A sibling PR (PR4) wires `animusd`'s four loops to call `plan`
-instead of re-deriving the logic inline; until then this module has zero
-production callers (like `RaftKvNode::scope_range` before its own wiring
-landed — see the root `CLAUDE.md`'s "safety mechanism with zero production
-callers" entry, though here it's *intentional* per the PR split, not a gap).
+**Wired into production as of PR4.** `animusd` used to scatter "which tablets
+does this node host, and what should it do about each one" across four
+independent `ProdEnv` loops (`cp_join_host_loop`/`cp_join_host`,
+`cp_gc_loop`/`cp_gc_release_phase`, `cp_reconfigure_loop`), each re-deriving
+its own slice of replicated `Metadata` and its own per-node bookkeeping
+(`minted`, `pending_release`). `host::plan` (PR3) unifies the *decision* those
+four loops used to make into one pure, synchronous function — mirroring this
+crate's own sync-core/async-driver split (`RaftCore` decides, the driver does
+I/O): **the decision lives here and is unit-tested directly.**
+`host::Reconciler<E: Env, S: StorageEngine>` (PR4) is the **execute** half,
+also living in this crate (not `animusd`) so the crate owns the whole
+lifecycle's invariants and is directly `SimEnv`-testable:
+
+- **It owns the hosted `RaftKvNode` map** — `hosted: BTreeMap<TabletId,
+  RaftKvNode<E, S>>` — making it the **single writer** of "does this node
+  host tablet T." `Reconciler::new(env, storage, base_id, prefix_for,
+  on_host, on_teardown)` takes this node's `raftkv` env + shared storage
+  engine + base id, a `prefix_for: Fn(&str) -> Vec<u8>` hook (the caller's
+  own table→`StorageScope`-prefix convention — `animusd`'s
+  `escape(table)` — this crate never duplicates it), and two hooks,
+  `on_host: Fn(TabletId, &RaftKvNode<E, S>)` / `on_teardown: Fn(TabletId)`,
+  that let a caller (`animusd`) mirror every hosting change into its own
+  routing registry (`ClusterEdgeState`) as a **read-only reaction** — never a
+  second writer.
+- **`Reconciler::tick(&mut self, view: &MetadataView)` is the whole per-tick
+  contract**: gather `TabletFacts` from its *own* hosted nodes
+  (`is_leader()`, `config()`, `scope_range()`) plus an async
+  `StorageScope::has_data` check for any not-yet-hosted join candidate, call
+  `plan` exactly once, then execute the returned actions **in the order
+  `plan` emits them** (`NarrowScope` → `Host` → `Reconfigure` →
+  `Release`/`Reclaim`). `Host` constructs the `StorageScope` from
+  `prefix_for` + the action's range and calls `RaftKvNode::start_hosted`
+  with the full or others-only config (`animusd::cp_join_host`'s exact
+  decision, now ported here); `Release`/`Reclaim` mirror
+  `animusd::cp_gc_tablet`'s teardown exactly: call `on_teardown` (unregister
+  from the caller's routing *before* touching the driver), `shutdown()`,
+  poll `is_stopped()` bounded by `RECLAIM_STOP_TIMEOUT` (10s, via
+  `env.sleep` — no tokio-only primitive, so this stays `SimEnv`-testable),
+  re-register via `on_host` and leave `LocalState` untouched on a timeout (so
+  `plan` re-emits the identical action next tick), else narrow to
+  `erase_bound` (Release only — **the sibling-sparing invariant this whole
+  redesign exists to make structural**) then `erase_scope()`, delete the
+  tablet's WAL file, and only then `LocalState::confirm_torn_down`.
+- **The caller still owns the trigger and the pre-recovery guard.**
+  `Reconciler::tick` takes no clock/RNG of its own beyond `env.sleep`/
+  `env.now()` inside the Release/Reclaim teardown wait; deciding *when* to
+  call `tick` (an event-driven `metadata_watch` wake + a periodic fallback,
+  ADR 0031 §trigger) and the `last_applied() == 0` pre-recovery guard (a live
+  control-plane `RaftNode` read this crate has no business taking) both stay
+  in `animusd::tablet_host_reconciler_loop`.
+- `tests/reconciler.rs::reconciler_hosts_narrows_releases_and_confirms_sparing_a_sibling`
+  drives a `Reconciler<SimEnv, MemoryEngine>` through a full host → narrow →
+  (a **real** 2-voter Raft membership change excluding this node) → release
+  → confirm sequence and asserts the sibling-sparing erase bound end to end
+  through the reconciler's own `tick`, mirroring
+  `narrow_scope.rs::narrow_then_erase_scope_spares_a_co_hosted_siblings_data`'s
+  invariant at the execute-loop level instead of the bare-primitive level. A
+  dedicated `SimEnv` fault-injection corpus for the full lifecycle across more
+  scenarios remains PR5.
 
 - **Contract**: `plan(view: &MetadataView, facts: &BTreeMap<TabletId,
   TabletFacts>, state: &LocalState, base_id: NodeId) -> (Vec<HostAction>,
@@ -391,28 +435,32 @@ callers" entry, though here it's *intentional* per the PR split, not a gap).
   instead of only via a timing-dependent end-to-end reproduction.
 - **`plan` never removes a tablet from `LocalState::hosted` on its own** when
   emitting `Reclaim`/`Release` — real teardown is async and can time out
-  (mirroring `cp_gc_tablet`'s conditional `minted.remove`, which only fires
-  once shutdown + erase + WAL removal actually succeed). The caller calls
-  `LocalState::confirm_torn_down` once its own teardown has actually
+  (mirroring the pre-PR4 `animusd::cp_gc_tablet`'s conditional
+  `minted.remove`, which only fired once shutdown + erase + WAL removal
+  actually succeeded — that function is deleted now that `Reconciler::
+  teardown` does the same job directly). The caller (`Reconciler::tick`)
+  calls `LocalState::confirm_torn_down` once its own teardown has actually
   completed; until then, the next `plan` call keeps re-planning the same
-  action, exactly like the real loop retrying on a later tick
+  action, exactly like the pre-PR4 loop retrying on a later tick
   (`a_pending_reclaim_is_replanned_until_confirmed_torn_down`).
 - `plan_join_host`, `tablets_to_reclaim`, `tablets_to_release` are also
   exported standalone (not just as `plan` internals) — direct semantic ports
-  of `animusd::topology`'s functions of the same name, parity-tested against
-  the same cases. `plan_join_host`'s `initial_formation` decision (fresh
-  formation vs. non-voter join, keyed on `epoch <= Epoch::INITIAL`) is
-  unchanged from `animusd::topology`; the async `StorageScope::has_data`
-  restart-upgrade this crate can't do stays a caller-gathered fact
-  (`TabletFacts::has_data`), exactly as it does in `animusd::cp_join_host`
-  today.
+  of `animusd::topology`'s functions of the same name **before ADR 0031**
+  (that module now holds only the routing decision, `tablet_for_key`/
+  `decide_cp_route` — the hosting/GC predicates moved here for good),
+  parity-tested against the same cases. `plan_join_host`'s `initial_formation`
+  decision (fresh formation vs. non-voter join, keyed on `epoch <=
+  Epoch::INITIAL`) is unchanged from the original; the async
+  `StorageScope::has_data` restart-upgrade this pure function can't do stays a
+  caller-gathered fact (`TabletFacts::has_data`), gathered by
+  `Reconciler::tick` itself now (`gather_facts`).
 - 29 unit tests in `src/host.rs` (`cargo test -p animus-cp-data --lib host::`):
-  parity ports of every `animusd::topology` test case, idempotence on a
-  converged state, reclaim/release mutual exclusion on arbitrary input, the
-  release dampener's exact-N-ticks/epoch-reset/re-add-cancels semantics, the
-  narrow-only invariant (never widens), reconfigure's leader-gating, the
-  has-data restart upgrade, and the reclaim/release replan-until-confirmed
-  behavior.
+  parity ports of every pre-ADR-0031 `animusd::topology` hosting/GC test case,
+  idempotence on a converged state, reclaim/release mutual exclusion on
+  arbitrary input, the release dampener's exact-N-ticks/epoch-reset/
+  re-add-cancels semantics, the narrow-only invariant (never widens),
+  reconfigure's leader-gating, the has-data restart upgrade, and the
+  reclaim/release replan-until-confirmed behavior.
 
 ## Tests
 
@@ -426,3 +474,9 @@ source) and `tests/reconfigure_down_extra_priority.rs` (defect C in
 isolation: a `Down` extra sorting after a healthy one is still removed first,
 with no catch-up gate) round out the reconfigure/transfer coverage alongside
 `tests/reconfigure_trigger.rs` and `tests/membership.rs`.
+`tests/reconciler.rs` (ADR 0031 PR4) drives the `host::Reconciler` executor
+end to end under `SimEnv` — see the host-module section above. Note its
+documented `SimEnv` gotcha: a `tick()` whose planned action tears a group
+down internally polls `env.sleep()` (waiting out `is_stopped()`), so the
+whole scenario runs as a spawned task driven by `Simulator::run_for`, never a
+bare `block_on`.
