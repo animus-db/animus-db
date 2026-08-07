@@ -162,9 +162,15 @@ impl StorageScope {
     }
 
     /// Update this scope's live range (see the type doc) — every clone of
-    /// this `StorageScope` observes the change immediately. The caller (which
-    /// watches `Metadata` for this tablet's current range) is trusted to only
-    /// ever narrow it.
+    /// this `StorageScope` observes the change immediately. A raw setter: the
+    /// caller (which watches `Metadata` for this tablet's current range) is
+    /// trusted to only call this when the new range is actually correct for
+    /// this tablet right now — which is *usually* a narrowing (a split
+    /// source, `RaftKvNode::narrow_scope`) but is a legitimate **widening**
+    /// when this tablet just absorbed a merged-away sibling's range (ADR
+    /// 0033, `RaftKvNode::widen_scope`). Both call through this one setter;
+    /// the direction is enforced (or intentionally not enforced) by the
+    /// caller, not here.
     pub fn narrow(&self, new_range: KeyRange) {
         *self.range.lock().expect("storage scope range poisoned") = new_range;
     }
@@ -993,6 +999,23 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// default [`StorageScope::whole()`] scope, since nothing needs bounding
     /// there.
     pub fn narrow_scope(&self, new_range: KeyRange) {
+        self.scope.narrow(new_range);
+    }
+
+    /// Update this group's live [`StorageScope`] range to a **wider** range
+    /// (ADR 0033 tablet merge — the dual of [`narrow_scope`](Self::narrow_scope)):
+    /// called when this tablet was the **surviving (`left`) side** of a
+    /// `MetaCommand::MergeTablets` commit, whose replicated range now covers
+    /// what used to be the merged-away sibling's range too. Safe precisely
+    /// because `MergeTablets` only merges two tablets that already shared a
+    /// replica set on the same node's shared engine (ADR 0026/0028) — the
+    /// absorbed range's data was always physically present under the same
+    /// table prefix, nothing needs to move. The mechanism underneath is the
+    /// same raw setter `narrow_scope` uses; this is a distinctly-named,
+    /// distinctly-documented entry point so a reader auditing every
+    /// `StorageScope` mutation site doesn't have to re-derive "is this
+    /// specific call safe to widen" from context each time.
+    pub fn widen_scope(&self, new_range: KeyRange) {
         self.scope.narrow(new_range);
     }
 

@@ -173,7 +173,12 @@ used.
   the current leader's own in-flight `departing` set.
 - `MergeTablets` requires two tablets' replica sets to already coincide;
   rebalancing can diverge adjacent siblings' sets and block a later merge
-  until they re-converge. Left unaddressed — merge is deferred/operator-driven.
+  until they re-converge. **Merge itself is now implemented (ADR 0033,
+  2026-08-07)** — an operator-driven, control-plane-only dual of split, with
+  a full data-plane reaction (scope widening + non-erasing teardown) in the
+  per-node reconciler (ADR 0031) — but this rebalance/merge interaction is
+  unchanged: an operator (or a future automatic merge trigger) simply retries
+  the merge once placement has re-converged.
 - No new wire-visible `MetaCommand`; the new `RaftMsg::TimeoutNow` variant is
   additive on the shared Raft wire (and on `animus-cp-data`'s binary codec,
   version-bumped) exactly as `PreVote` was.

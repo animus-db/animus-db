@@ -107,6 +107,7 @@ fn view(tablets: impl IntoIterator<Item = Tablet>) -> MetadataView {
     MetadataView {
         tablets: tablets.into_iter().map(|t| (t.id, t)).collect(),
         down: BTreeSet::new(),
+        merged: BTreeSet::new(),
     }
 }
 
@@ -117,6 +118,20 @@ fn view_with_down(
     MetadataView {
         tablets: tablets.into_iter().map(|t| (t.id, t)).collect(),
         down: down.into_iter().collect(),
+        merged: BTreeSet::new(),
+    }
+}
+
+/// [`view`], but also marks `merged` tablet ids as merged-away (ADR 0033) —
+/// standing in for a `MetaCommand::MergeTablets` commit's effect on
+/// `Metadata::merged_tablets`.
+fn view_with_merged(
+    tablets: impl IntoIterator<Item = Tablet>,
+    merged: impl IntoIterator<Item = u64>,
+) -> MetadataView {
+    MetadataView {
+        merged: merged.into_iter().map(TabletId).collect(),
+        ..view(tablets)
     }
 }
 
@@ -558,8 +573,8 @@ fn scenario_cells() -> Vec<Scenario> {
             scenario_reconfigure_down_replica
         ),
         scenario!(
-            "narrow_scope_never_widens_defensively",
-            scenario_narrow_never_widens
+            "merge_widens_survivor_and_absorbs_sibling_unerased",
+            scenario_merge_widens_and_absorbs
         ),
         scenario!(
             "idempotent_tick_on_converged_multi_tablet_state",
@@ -1009,31 +1024,78 @@ fn scenario_reconfigure_down_replica(seed: u64) {
 }
 
 // ---------------------------------------------------------------------------
-// Scenario 9: narrow never widens (a defensive, should-never-happen input).
+// Scenario 9: a merge widens the survivor's scope and absorbs the merged-away
+// sibling WITHOUT erasing its data (ADR 0033).
 // ---------------------------------------------------------------------------
 
-fn scenario_narrow_never_widens(seed: u64) {
+fn scenario_merge_widens_and_absorbs(seed: u64) {
     run(seed, |sim| async move {
         let env = sim.env(A);
         let mut c = Cluster::new(sim);
         c.add_node(A);
 
-        let v1 = view([tablet(1, b"a", Some(b"m"), vec![A])]);
+        // Two adjacent tablets — `MergeTablets` requires an identical
+        // replica set, trivially true here (both on the sole node A), and
+        // both share one node-shared `MemoryEngine` (`Cluster::add_node`),
+        // exactly like `animusd`'s one-LSM-per-node design (ADR 0026/0028).
+        let v1 = view([
+            tablet(1, b"", Some(BOUNDARY), vec![A]),
+            tablet(2, BOUNDARY, None, vec![A]),
+        ]);
         c.tick(A, &v1).await;
         env.sleep(Duration::from_secs(2)).await;
-        let h1 = c.node(A).hosted_node(TabletId(1)).unwrap().clone();
-        let before = h1.scope_range();
-        assert_eq!(before, KeyRange::new(b"a".to_vec(), Some(b"m".to_vec())));
 
-        // Metadata (erroneously) shows a WIDER range than the live scope.
-        let v2 = view([tablet(1, b"a", Some(b"z"), vec![A])]);
+        let h1 = c.node(A).hosted_node(TabletId(1)).unwrap().clone();
+        let h2 = c.node(A).hosted_node(TabletId(2)).unwrap().clone();
+        assert!(
+            h1.is_leader() && h2.is_leader(),
+            "both lone voters self-elect"
+        );
+        for i in 0..5u64 {
+            h1.put(
+                format!("a{i:02}").into_bytes(),
+                format!("lo{i}").into_bytes(),
+            );
+            h2.put(
+                format!("z{i:02}").into_bytes(),
+                format!("hi{i}").into_bytes(),
+            );
+        }
+        env.sleep(Duration::from_secs(1)).await;
+
+        // The merge commits: tablet 1 (`left`) widens to cover the whole
+        // range, tablet 2 (`right`) vanishes from the map and is recorded as
+        // merged-away — the exact `Metadata` shape `MergeTablets`'s apply
+        // produces.
+        let v2 = view_with_merged([tablet(1, b"", None, vec![A])], [2]);
         c.tick(A, &v2).await;
+        env.sleep(Duration::from_secs(1)).await;
+
         assert_eq!(
             h1.scope_range(),
-            before,
-            "the planner must never widen a live scope"
+            KeyRange::whole(),
+            "the survivor must widen to cover the absorbed sibling's range"
         );
+        for i in 0..5u64 {
+            assert_eq!(
+                h1.local_get(format!("a{i:02}").as_bytes()).await,
+                Some(format!("lo{i}").into_bytes()),
+                "survivor must still see its own pre-merge data"
+            );
+            assert_eq!(
+                h1.local_get(format!("z{i:02}").as_bytes()).await,
+                Some(format!("hi{i}").into_bytes()),
+                "survivor must now serve the absorbed sibling's data — never erased"
+            );
+        }
 
+        // The absorbed sibling's own group is torn down…
+        assert_all_stopped(&[h2]);
+        // …but its data was never erased: a raw physical-key read against the
+        // shared engine (independent of any group's scope) still finds it.
+        assert_present(c.storage(A), &physical(b"z00"), b"hi0").await;
+
+        assert_hosted_converged(&c, A, [TabletId(1)]);
         assert_idempotent(&mut c, A, &v2).await;
     });
 }

@@ -534,6 +534,16 @@ pub enum ClientRequest {
     /// gone; see the root `CLAUDE.md`). The interim manual trigger; an automatic
     /// size-telemetry trigger is `auto_split_loop`.
     SplitTablet { tablet: u64, split_key: Vec<u8> },
+    /// **Admin: merge two adjacent CP tablets** (ADR 0033). A single, atomic
+    /// control-plane command (`MetaCommand::MergeTablets`, epoch-CAS gated on
+    /// both tablets): `left`'s range widens to absorb `right`'s (which is
+    /// removed from the tablet map), both served by the *same* replicas'
+    /// existing per-node shared engine — no data moves, and there is no
+    /// second, data-plane step that can fail independently (the dual of
+    /// `SplitTablet` above). The interim manual trigger; an automatic
+    /// size-based merge trigger is out of scope for this increment (see ADR
+    /// 0033's "Future work").
+    MergeTablets { left: u64, right: u64 },
     /// **Join discovery** (ADR 0032 PR2, `animusd join`): a node that knows only
     /// a *seed* address (any already-running node's client address — old or
     /// newly grown, PR1 made every node's address book equally current) asks
@@ -599,6 +609,12 @@ fn is_relayable_command(command: &MetaCommand) -> bool {
             // reach the control leader).
             | MetaCommand::RegisterNodeAddrs { .. }
             | MetaCommand::SplitTablet { .. }
+            // Tablet merge (ADR 0033): the same relay reason as `SplitTablet` —
+            // already client-exposed via `ClientRequest::MergeTablets`, so
+            // relaying it adds no new authority, it just lets the trigger
+            // reach the control leader cross-process when driven from a
+            // follower.
+            | MetaCommand::MergeTablets { .. }
             // Provision-at-create (ADR 0023): a `CreateTable` on a follower-connected
             // client relays the table's tablet creation + RF policy to the control
             // leader. Scoped to one tablet per table by the state machine's guard.
@@ -3137,6 +3153,7 @@ async fn tablet_host_reconciler_loop(ctx: ClientCtx, mut reconciler: CpReconcile
         let view = MetadataView {
             tablets: meta.tablets,
             down,
+            merged: meta.merged_tablets,
         };
         reconciler.tick(&view).await;
     }
@@ -3353,6 +3370,7 @@ fn request_kind(request: &ClientRequest) -> &'static str {
         ClientRequest::Forwarded { .. } => "forwarded",
         ClientRequest::ProposeSchema(_) => "propose_schema",
         ClientRequest::SplitTablet { .. } => "split_tablet",
+        ClientRequest::MergeTablets { .. } => "merge_tablets",
         ClientRequest::JoinInfo => "join_info",
     }
 }
@@ -3396,6 +3414,11 @@ async fn handle_request(ctx: &ClientCtx, request: ClientRequest) -> ClientRespon
         // Admin: split a CP tablet — a single atomic control-plane command.
         ClientRequest::SplitTablet { tablet, split_key } => {
             ctx.trigger_split(TabletId(tablet), split_key).await
+        }
+        // Admin: merge two adjacent CP tablets (ADR 0033) — a single atomic
+        // control-plane command, the dual of split above.
+        ClientRequest::MergeTablets { left, right } => {
+            ctx.trigger_merge(TabletId(left), TabletId(right)).await
         }
         // A CP op forwarded from another node (cross-process routing, ADR 0017
         // #3b): serve locally iff we are the leader; never re-forward. The
@@ -3559,6 +3582,60 @@ impl ClientCtx {
         {
             Ok(()) => ClientResponse::PutOk,
             Err(()) => ClientResponse::Error("split did not commit in time".into()),
+        }
+    }
+
+    /// Merge adjacent CP tablets `left` and `right` (ADR 0033): a **single,
+    /// atomic** control-plane command (`MetaCommand::MergeTablets`,
+    /// epoch-CAS gated on both tablets — the dual of `trigger_split` above).
+    /// `left`'s range widens to `[left.start, right.end)` and `right` is
+    /// removed from the tablet map — both served by the **same** replicas'
+    /// existing per-node shared engine (ADR 0026/0028: one LSM tree per node,
+    /// confined by `StorageScope`), so no data moves and there is no second,
+    /// data-plane step that can fail independently. The per-node tablet-host
+    /// reconciler (ADR 0031 PR4, extended by ADR 0033) then widens `left`'s
+    /// live scope and tears down `right`'s group on every replica **without
+    /// erasing its data** — a sibling now owns that range on the same shared
+    /// engine.
+    ///
+    /// Routed to the control leader (relayable, [`is_relayable_command`]), so
+    /// this works from any node the client happens to be connected to.
+    #[tracing::instrument(name = "merge_tablets", skip(self), fields(left = left.0, right = right.0))]
+    async fn trigger_merge(&self, left: TabletId, right: TabletId) -> ClientResponse {
+        // Both epochs come from the **same** metadata snapshot, so the CAS
+        // reflects exactly what this call saw (mirroring `trigger_split`'s
+        // `new_id`/`expected_epoch` pairing).
+        let meta = self.raft.metadata();
+        let Some(expected_left_epoch) = meta.tablets.get(&left).map(|t| t.epoch) else {
+            return ClientResponse::Error("no such tablet".into());
+        };
+        let Some(expected_right_epoch) = meta.tablets.get(&right).map(|t| t.epoch) else {
+            return ClientResponse::Error("no such tablet".into());
+        };
+        let cmd = MetaCommand::MergeTablets {
+            left,
+            expected_left_epoch,
+            right,
+            expected_right_epoch,
+        };
+        // Confirm by a signal robust against `right` vanishing for an
+        // unrelated reason (e.g. a concurrent table drop): `left`'s epoch
+        // must have advanced past what this call read AND `right` must be
+        // gone — the exact pair `MergeTablets`'s apply produces together,
+        // atomically, and nothing else in this state machine produces.
+        match self
+            .propose_and_await(cmd, SCHEMA_COMMIT_TIMEOUT, || {
+                let m = self.raft.metadata();
+                let left_bumped = m
+                    .tablets
+                    .get(&left)
+                    .is_some_and(|t| t.epoch > expected_left_epoch);
+                (left_bumped && !m.tablets.contains_key(&right)).then_some(())
+            })
+            .await
+        {
+            Ok(()) => ClientResponse::PutOk,
+            Err(()) => ClientResponse::Error("merge did not commit in time".into()),
         }
     }
 

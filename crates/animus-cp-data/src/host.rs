@@ -63,6 +63,15 @@ pub struct MetadataView {
     /// executing `reconfigure_step` can tell a failure repair from a healthy
     /// rebalance move (ADR 0029).
     pub down: BTreeSet<NodeId>,
+    /// Tablet ids merged away by a `MetaCommand::MergeTablets` commit (ADR
+    /// 0033) — mirrors `animus_control::Metadata::merged_tablets` verbatim.
+    /// A tablet in [`LocalState::hosted`] but absent from `tablets` is
+    /// **reclaimed** (erased — its whole table was dropped) unless it also
+    /// appears here, in which case it is **absorbed** (torn down, data left
+    /// untouched — a sibling now owns its range on the same shared engine).
+    /// See [`HostAction::Absorb`]'s doc for why this can't be inferred from
+    /// `tablets` alone.
+    pub merged: BTreeSet<TabletId>,
 }
 
 /// Per-tablet facts the caller gathers from live, impure state (a registered
@@ -251,15 +260,15 @@ fn is_subrange(inner: &KeyRange, outer: &KeyRange) -> bool {
 /// (`animusd`, PR4) executes these against its own live `ProdEnv` state;
 /// `plan` itself performs no I/O.
 ///
-/// Emitted in a fixed overall order — every [`NarrowScope`](Self::NarrowScope)
-/// action, then every [`Host`](Self::Host), then every
-/// [`Reconfigure`](Self::Reconfigure), then every
-/// [`Release`](Self::Release)/[`Reclaim`](Self::Reclaim) — mirroring the
-/// existing loops' relative priority (narrow a still-hosted tablet's scope
-/// before deciding anything else about it; stand up a newly-placed tablet
-/// before reconfiguring anyone; reconcile membership before tearing anything
-/// down). Within each group, tablets are emitted in `TabletId` order (a
-/// `BTreeMap` iteration is deterministic on every node).
+/// Emitted in a fixed overall order — every [`NarrowScope`](Self::NarrowScope)/
+/// [`WidenScope`](Self::WidenScope) action, then every [`Host`](Self::Host),
+/// then every [`Reconfigure`](Self::Reconfigure), then every
+/// [`Release`](Self::Release)/[`Reclaim`](Self::Reclaim)/[`Absorb`](Self::Absorb)
+/// — mirroring the existing loops' relative priority (adjust a still-hosted
+/// tablet's scope before deciding anything else about it; stand up a
+/// newly-placed tablet before reconfiguring anyone; reconcile membership
+/// before tearing anything down). Within each group, tablets are emitted in
+/// `TabletId` order (a `BTreeMap` iteration is deterministic on every node).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostAction {
     /// Narrow this already-hosted tablet's live `StorageScope` range to match
@@ -272,6 +281,22 @@ pub enum HostAction {
         tablet: TabletId,
         /// The new (narrower-or-equal) range to narrow to — the tablet's
         /// current metadata range.
+        range: KeyRange,
+    },
+    /// Widen this already-hosted tablet's live `StorageScope` range to match
+    /// its current (now-wider) metadata range — the dual of
+    /// [`NarrowScope`](Self::NarrowScope) (ADR 0033 tablet merge): this
+    /// tablet was the surviving (`left`) side of a `MetaCommand::MergeTablets`
+    /// commit, so its replicated range now also covers what used to be the
+    /// merged-away sibling's range, already physically present on the same
+    /// node-shared engine under the same table prefix. Always a proper
+    /// widening — [`plan`] never emits this for a range that would narrow the
+    /// scope (that's [`NarrowScope`](Self::NarrowScope)'s job).
+    WidenScope {
+        /// The tablet whose local scope should widen.
+        tablet: TabletId,
+        /// The new (wider-or-equal) range to widen to — the tablet's current
+        /// metadata range.
         range: KeyRange,
     },
     /// Stand up this node's member of `tablet`'s group for the first time —
@@ -335,6 +360,27 @@ pub enum HostAction {
         /// The tablet to reclaim.
         tablet: TabletId,
     },
+    /// Tear down this node's now-idle group for a tablet that **vanished
+    /// from the tablet map because it was merged into a sibling** (ADR 0033
+    /// `MetaCommand::MergeTablets`), rather than because its whole table was
+    /// dropped ([`Reclaim`](Self::Reclaim)) — distinguished via
+    /// [`MetadataView::merged`]. **Never erases any data**: the merge
+    /// survivor (the tablet's former `left` neighbor) now owns this range on
+    /// the very same node-shared engine, so this only stops the group's Raft
+    /// driver and removes its own WAL file — the physical keys stay exactly
+    /// where they are, now served through the survivor's widened
+    /// [`WidenScope`](Self::WidenScope). Distinguishing this from `Reclaim`
+    /// is not optional: erasing here would tombstone live data the merge
+    /// survivor is about to (or already does) serve. Inferring "was this a
+    /// merge" from `tablets` alone (e.g. "does some other tablet's range now
+    /// cover mine") is unsound — two different tables' still-unsplit tablets
+    /// can have byte-identical default ranges, so a range-only check could
+    /// misattribute an unrelated table's tablet as the merge survivor and
+    /// silently skip a real drop's erase instead.
+    Absorb {
+        /// The tablet to absorb (tear down without erasing).
+        tablet: TabletId,
+    },
 }
 
 /// The single pure decision behind every per-node tablet-host reconcile tick
@@ -373,11 +419,26 @@ pub fn plan(
             if let Some(f) = facts.get(&tablet) {
                 if f.hosted {
                     if let Some(current) = &f.scope_range {
-                        if t.range != *current && is_subrange(&t.range, current) {
-                            actions.push(HostAction::NarrowScope {
-                                tablet,
-                                range: t.range.clone(),
-                            });
+                        if t.range != *current {
+                            if is_subrange(&t.range, current) {
+                                actions.push(HostAction::NarrowScope {
+                                    tablet,
+                                    range: t.range.clone(),
+                                });
+                            } else if is_subrange(current, &t.range) {
+                                // ADR 0033: this tablet was the surviving
+                                // (`left`) side of a merge — its metadata
+                                // range grew to cover the absorbed sibling's
+                                // range, already present on the shared engine.
+                                actions.push(HostAction::WidenScope {
+                                    tablet,
+                                    range: t.range.clone(),
+                                });
+                            }
+                            // Neither a subset nor a superset of the current
+                            // scope: an incomparable range mismatch that
+                            // should never happen in practice — deliberately
+                            // no-op rather than guess a direction.
                         }
                     }
                 }
@@ -414,7 +475,15 @@ pub fn plan(
     let mine: BTreeSet<TabletId> = next.hosted.clone();
 
     for tablet in tablets_to_reclaim_set(&mine, &view.tablets) {
-        actions.push(HostAction::Reclaim { tablet });
+        // ADR 0033: a tablet absent from the map because it was merged into
+        // a sibling (recorded in `view.merged`) is absorbed — torn down with
+        // no erase, since a sibling now owns its range on the same shared
+        // engine — never reclaimed (which would erase it).
+        if view.merged.contains(&tablet) {
+            actions.push(HostAction::Absorb { tablet });
+        } else {
+            actions.push(HostAction::Reclaim { tablet });
+        }
         next.pending_release.remove(&tablet);
     }
 
@@ -631,6 +700,11 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
                         node.narrow_scope(range);
                     }
                 }
+                HostAction::WidenScope { tablet, range } => {
+                    if let Some(node) = self.hosted.get(&tablet) {
+                        node.widen_scope(range);
+                    }
+                }
                 HostAction::Host {
                     tablet,
                     table,
@@ -653,10 +727,14 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
                     tablet,
                     erase_bound,
                 } => {
-                    self.teardown(tablet, Some(erase_bound)).await;
+                    self.teardown(tablet, TeardownKind::Release(erase_bound))
+                        .await;
                 }
                 HostAction::Reclaim { tablet } => {
-                    self.teardown(tablet, None).await;
+                    self.teardown(tablet, TeardownKind::Reclaim).await;
+                }
+                HostAction::Absorb { tablet } => {
+                    self.teardown(tablet, TeardownKind::Absorb).await;
                 }
             }
         }
@@ -743,19 +821,17 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
         self.hosted.insert(tablet, node);
     }
 
-    /// Execute a [`HostAction::Release`] (`erase_bound: Some`) or
-    /// [`HostAction::Reclaim`] (`erase_bound: None`) — `animusd::cp_gc_tablet`'s
-    /// exact teardown shape: unregister from the caller's routing registry
-    /// first, shut the driver down and wait for it to actually stop (never
-    /// touch data under a live driver), narrow to `erase_bound` if given
-    /// (**the sibling-sparing invariant this whole design exists to make
-    /// structural** — see [`HostAction::Release`]'s doc) then erase the
-    /// scope, delete the tablet's WAL file, and only then confirm the
-    /// teardown to [`LocalState`] and drop the local handle. A timeout
-    /// waiting for the driver to stop re-registers the handle (so routing
-    /// keeps working) and leaves `state`/`hosted` untouched — `plan`
-    /// re-emits the identical action next tick.
-    async fn teardown(&mut self, tablet: TabletId, erase_bound: Option<KeyRange>) {
+    /// Execute a [`HostAction::Release`]/[`HostAction::Reclaim`]/
+    /// [`HostAction::Absorb`] — `animusd::cp_gc_tablet`'s exact teardown
+    /// shape: unregister from the caller's routing registry first, shut the
+    /// driver down and wait for it to actually stop (never touch data under a
+    /// live driver), then handle data per `kind` (see [`TeardownKind`]) and
+    /// delete the tablet's WAL file, and only then confirm the teardown to
+    /// [`LocalState`] and drop the local handle. A timeout waiting for the
+    /// driver to stop re-registers the handle (so routing keeps working) and
+    /// leaves `state`/`hosted` untouched — `plan` re-emits the identical
+    /// action next tick.
+    async fn teardown(&mut self, tablet: TabletId, kind: TeardownKind) {
         let Some(node) = self.hosted.remove(&tablet) else {
             return;
         };
@@ -775,13 +851,23 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
             self.env.sleep(RECLAIM_STOP_POLL).await;
         }
 
-        // Bound the erase to the tablet's current replicated range (Release
-        // only) — see `HostAction::Release`'s doc for why the group's own
-        // `StorageScope` cannot be trusted for this instead.
-        if let Some(range) = erase_bound {
-            node.narrow_scope(range);
+        match kind {
+            TeardownKind::Release(erase_bound) => {
+                // Bound the erase to the tablet's current replicated range —
+                // see `HostAction::Release`'s doc for why the group's own
+                // `StorageScope` cannot be trusted for this instead.
+                node.narrow_scope(erase_bound);
+                node.erase_scope().await;
+            }
+            TeardownKind::Reclaim => {
+                node.erase_scope().await;
+            }
+            TeardownKind::Absorb => {
+                // ADR 0033: never touch data — a merge survivor now owns
+                // this range on the same shared engine. Only the driver and
+                // its own WAL file go away.
+            }
         }
-        node.erase_scope().await;
         if let Err(e) = self.env.remove(&wal_file(tablet.0)).await {
             tracing::warn!(
                 ?e,
@@ -792,6 +878,20 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
 
         self.state.confirm_torn_down(tablet);
     }
+}
+
+/// How [`Reconciler::teardown`] should treat a group's data once its driver
+/// has stopped — the three ways a hosted tablet's lifecycle can end.
+enum TeardownKind {
+    /// [`HostAction::Release`]: narrow to the given bound, then erase —
+    /// moved off this node while the tablet still exists elsewhere.
+    Release(KeyRange),
+    /// [`HostAction::Reclaim`]: erase the group's full existing scope — the
+    /// tablet's whole table was dropped.
+    Reclaim,
+    /// [`HostAction::Absorb`] (ADR 0033): never erase — a merge survivor now
+    /// owns this range on the same shared engine.
+    Absorb,
 }
 
 #[cfg(test)]
@@ -830,6 +930,19 @@ mod tests {
                 .map(|(id, t)| (TabletId(id), t))
                 .collect(),
             down: BTreeSet::new(),
+            merged: BTreeSet::new(),
+        }
+    }
+
+    /// Like [`view`], but also marks `merged` tablet ids as merged-away (ADR
+    /// 0033) — for tests exercising `HostAction::Absorb` instead of `Reclaim`.
+    fn view_with_merged(
+        tablets: impl IntoIterator<Item = (u64, Tablet)>,
+        merged: impl IntoIterator<Item = u64>,
+    ) -> MetadataView {
+        MetadataView {
+            merged: merged.into_iter().map(TabletId).collect(),
+            ..view(tablets)
         }
     }
 
@@ -1068,9 +1181,9 @@ mod tests {
     }
 
     #[test]
-    fn plan_never_emits_a_widening_narrow_scope() {
-        // Metadata range is WIDER than the group's current live scope (should
-        // never happen in practice, but the planner must never widen).
+    fn plan_widens_scope_when_metadata_range_grew_via_merge() {
+        // ADR 0033: metadata range is WIDER than the group's current live
+        // scope — this tablet was the surviving (`left`) side of a merge.
         let v = view([(1, tablet_for_table(1, "t", b"a", Some(b"z"), vec![BASE]))]);
         let mut state = LocalState::default();
         state.hosted.insert(TabletId(1));
@@ -1079,6 +1192,35 @@ mod tests {
             TabletFacts {
                 hosted: true,
                 scope_range: Some(KeyRange::new(b"a".to_vec(), Some(b"m".to_vec()))),
+                ..Default::default()
+            },
+        )]
+        .into_iter()
+        .collect();
+
+        let (actions, _next) = plan(&v, &facts, &state, BASE);
+        assert_eq!(
+            actions,
+            vec![HostAction::WidenScope {
+                tablet: TabletId(1),
+                range: KeyRange::new(b"a".to_vec(), Some(b"z".to_vec())),
+            }]
+        );
+    }
+
+    #[test]
+    fn plan_does_not_touch_scope_for_an_incomparable_range_mismatch() {
+        // Neither a subset nor a superset of the current live scope — should
+        // never happen in practice, but the planner must not guess a
+        // direction (defensive: no NarrowScope, no WidenScope).
+        let v = view([(1, tablet_for_table(1, "t", b"a", Some(b"k"), vec![BASE]))]);
+        let mut state = LocalState::default();
+        state.hosted.insert(TabletId(1));
+        let facts: BTreeMap<TabletId, TabletFacts> = [(
+            TabletId(1),
+            TabletFacts {
+                hosted: true,
+                scope_range: Some(KeyRange::new(b"b".to_vec(), Some(b"m".to_vec()))),
                 ..Default::default()
             },
         )]
@@ -1484,5 +1626,93 @@ mod tests {
         confirmed.confirm_torn_down(TabletId(1));
         let (actions3, _next3) = plan(&v, &BTreeMap::new(), &confirmed, BASE);
         assert_eq!(actions3, Vec::new());
+    }
+
+    // === plan(): Absorb vs Reclaim (ADR 0033 tablet merge) ==================
+
+    #[test]
+    fn a_merged_away_tablet_is_absorbed_not_reclaimed() {
+        // Tablet 2 vanished from the map (merged into 1), recorded in `merged`.
+        let v = view_with_merged([], [2]);
+        let mut state = LocalState::default();
+        state.hosted.insert(TabletId(2));
+
+        let (actions, next) = plan(&v, &BTreeMap::new(), &state, BASE);
+        assert_eq!(
+            actions,
+            vec![HostAction::Absorb {
+                tablet: TabletId(2)
+            }]
+        );
+        // Not removed automatically — mirrors Reclaim/Release: the caller's
+        // teardown may still fail, so `plan` re-emits until confirmed.
+        assert!(next.hosted.contains(&TabletId(2)));
+
+        let (actions2, _next2) = plan(&v, &BTreeMap::new(), &next, BASE);
+        assert_eq!(
+            actions2,
+            vec![HostAction::Absorb {
+                tablet: TabletId(2)
+            }],
+            "an unconfirmed absorb must be replanned identically"
+        );
+
+        let mut confirmed = next;
+        confirmed.confirm_torn_down(TabletId(2));
+        let (actions3, _next3) = plan(&v, &BTreeMap::new(), &confirmed, BASE);
+        assert_eq!(actions3, Vec::new());
+    }
+
+    #[test]
+    fn a_dropped_tablet_absent_from_merged_is_reclaimed_not_absorbed() {
+        // Same "vanished from the map" shape as the absorb case above, but
+        // NOT recorded in `merged` — a genuine table drop.
+        let v = view([]);
+        let mut state = LocalState::default();
+        state.hosted.insert(TabletId(2));
+
+        let (actions, _next) = plan(&v, &BTreeMap::new(), &state, BASE);
+        assert_eq!(
+            actions,
+            vec![HostAction::Reclaim {
+                tablet: TabletId(2)
+            }]
+        );
+    }
+
+    #[test]
+    fn absorb_and_reclaim_partition_vanished_tablets_by_the_merged_set() {
+        // Three hosted tablets, all vanished from the map: one merged-away,
+        // one genuinely dropped, one still present (untouched).
+        let v = view_with_merged([(3, tablet(3, b"", None, vec![BASE]))], [1]);
+        let state = LocalState {
+            hosted: [TabletId(1), TabletId(2), TabletId(3)]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+
+        let (actions, _next) = plan(&v, &BTreeMap::new(), &state, BASE);
+        let absorbed: Vec<TabletId> = actions
+            .iter()
+            .filter_map(|a| match a {
+                HostAction::Absorb { tablet } => Some(*tablet),
+                _ => None,
+            })
+            .collect();
+        let reclaimed: Vec<TabletId> = actions
+            .iter()
+            .filter_map(|a| match a {
+                HostAction::Reclaim { tablet } => Some(*tablet),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(absorbed, vec![TabletId(1)]);
+        assert_eq!(reclaimed, vec![TabletId(2)]);
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, HostAction::Release { .. } | HostAction::Host { .. }))
+        );
     }
 }

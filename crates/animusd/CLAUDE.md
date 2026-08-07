@@ -54,7 +54,7 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
 - `admin` module — the **admin / debug HTTP-JSON endpoint** (ADR 0020), a dedicated
   sixth listener (`RoleAddrs.admin`). Read-only introspection (config, status, both
   Raft layers, LSM/WAL debug, metrics, health) + gated operator actions
-  (split/flush/compact/reconfigure/drain). `http` module — the shared hand-rolled
+  (split/merge/flush/compact/reconfigure/drain). `http` module — the shared hand-rolled
   HTTP/1.1 helpers (request parser + response writers) used by both `dynamo` and
   `admin`.
 - `cql` module — the **CQL (Cassandra) v4 binary-protocol endpoint** (a
@@ -159,6 +159,44 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   addressing; the per-node hosting mechanics are the tablet-host-reconciler entry
   below; `auto_split_loop`'s current (single-step) shape is documented at its
   definition in `lib.rs`.
+- **Tablet merge (ADR 0033) is split's dual — also a single, atomic
+  control-plane command, wired all the way through the reconciler.**
+  `ClientCtx::trigger_merge` resolves both tablets' current epochs from one
+  `Metadata` snapshot and proposes `MetaCommand::MergeTablets` (epoch-CAS
+  gated on **both** tablets, and rejecting a cross-table merge — a hardening
+  this feature added over the original, long-unwired command); commit widens
+  `left`'s range to absorb `right`'s and removes `right`, recording it in the
+  new `Metadata::merged_tablets` (a tiny, never-pruned marker — tablet ids are
+  never reused, so an entry can never resurrect a wrong decision). Confirmed
+  by polling for the exact pair of effects only this merge produces (`left`'s
+  epoch advanced past what was read, **and** `right` is gone), robust against
+  `right` vanishing for an unrelated reason mid-poll. Exposed as `POST
+  /admin/tablet/merge {left, right}` and `ClientRequest::MergeTablets`
+  (relayable, `is_relayable_command`, mirroring `SplitTablet`), plus `animus
+  admin merge <admin-addr> <left> <right>` on the CLI. **The data-plane
+  reaction is two new `animus_cp_data::host` planner actions** (ADR 0031's
+  `plan`, extended): `HostAction::WidenScope` (the dual of `NarrowScope` — an
+  already-hosted tablet whose metadata range *grew* widens its live
+  `StorageScope` to match, via the new `RaftKvNode::widen_scope`) and
+  `HostAction::Absorb` (the dual of `Reclaim` — a hosted-but-now-vanished
+  tablet recorded in `Metadata::merged_tablets` is torn down **without
+  erasing its data**, unlike `Reclaim`, since a sibling now serves that range
+  on the very same node-shared engine). **Why a new replicated marker was
+  needed instead of just inferring "merge" from the tablet map**: a
+  hosted-but-absent tablet looks identical whether its whole table was
+  dropped or it was merged into a neighbor, and a naive "does some other
+  tablet's range now cover mine" check is unsound — two different tables'
+  still-unsplit tablets can have byte-identical default
+  `KeyRange::whole()` ranges, with no table identity left in scope to
+  disambiguate once the tablet itself is gone from the map. See ADR 0033 for
+  the full design and `tests/tablet_merge.rs` for the end-to-end proof (split
+  → write both sides → merge → all data readable through the survivor,
+  including via a *different* replica than the one the merge was triggered
+  on → the absorbed tablet's WAL reclaimed and gone from `/admin/raftkv` on
+  every replica → survives a restart with no resurrection).
+  **Automatic (size-based) merge triggering is explicitly out of scope** —
+  operator-driven only, matching `auto_split_loop`'s absence of a symmetric
+  auto-merge counterpart for this increment.
 - **Every CP write path stamps + pre-checks the ADR 0028 write fence** (fixed
   2026-08-07 — the fences existed and were unit-tested in `animus-cp-data`
   since the split redesign, but had zero real callers here: `cp_put_local`/
@@ -630,7 +668,7 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   tokio sockets + the shared hand-rolled HTTP helpers extracted to `http.rs`, now
   shared with `dynamo.rs`). Read-only `GET` views — `/admin/{config,status,raft,
   raftkv,storage/lsm,storage/wal,storage/wal/segment,storage/key,storage/scan,metrics,health}`
-  — plus gated `POST` actions — `/admin/{tablet/split,storage/flush,storage/compact,
+  — plus gated `POST` actions — `/admin/{tablet/split,tablet/merge,storage/flush,storage/compact,
   raftkv/reconfigure,drain}` and **data writes** — `/admin/data/{dynamo,cql,drop-table,seed}`
   (ADR 0021, the dashboard's write surface). Below the edge it only **reads** node state
   (control + CP Raft accessors, `LsmEngine` introspection: `sstable_views`/

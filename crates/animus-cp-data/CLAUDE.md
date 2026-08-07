@@ -410,29 +410,53 @@ lifecycle's invariants and is directly `SimEnv`-testable:
   TabletFacts>, state: &LocalState, base_id: NodeId) -> (Vec<HostAction>,
   LocalState)`. Pure and synchronous — no `Env`, clock, RNG, or I/O.
   `MetadataView` is a small owned projection (`tablets: BTreeMap<TabletId,
-  Tablet>`, `down: BTreeSet<NodeId>`) — deliberately *not* the whole
-  `animus_control::Metadata`, keeping this crate decoupled from the control
-  plane's full state shape. `TabletFacts` bundles the impure per-tablet inputs
-  the caller must gather before calling (`hosted`, `is_leader`,
-  `config_excludes_me`, `scope_range`, `has_data` — see each field's doc for
-  exactly which live read backs it). `LocalState` is the pure-state mirror of
-  `animusd`'s `minted` claim set + `pending_release` epoch-stability
-  dampener, threaded from one `plan` call to the next.
-- **Actions, in a fixed emission order** (`NarrowScope` → `Host` →
-  `Reconfigure` → `Release`/`Reclaim`): `HostAction::NarrowScope` (narrow an
-  already-hosted tablet's scope to its current metadata range — provably
-  narrow-only, `is_subrange`), `Host` (stand up a fresh/joining/restarting
+  Tablet>`, `down: BTreeSet<NodeId>`, **`merged: BTreeSet<TabletId>`** — ADR
+  0033, mirroring `animus_control::Metadata::merged_tablets` verbatim) —
+  deliberately *not* the whole `animus_control::Metadata`, keeping this crate
+  decoupled from the control plane's full state shape. `TabletFacts` bundles
+  the impure per-tablet inputs the caller must gather before calling
+  (`hosted`, `is_leader`, `config_excludes_me`, `scope_range`, `has_data` —
+  see each field's doc for exactly which live read backs it). `LocalState` is
+  the pure-state mirror of `animusd`'s `minted` claim set + `pending_release`
+  epoch-stability dampener, threaded from one `plan` call to the next.
+- **Actions, in a fixed emission order** (`NarrowScope`/`WidenScope` → `Host` →
+  `Reconfigure` → `Release`/`Reclaim`/`Absorb`): `HostAction::NarrowScope`
+  (narrow an already-hosted tablet's scope to its current metadata range —
+  provably narrow-only, `is_subrange`), `WidenScope` (ADR 0033, the dual: widen
+  an already-hosted tablet's scope when its metadata range *grew* — the
+  surviving `left` side of a `MergeTablets` commit — provably widen-only, same
+  `is_subrange` check with the operands swapped; a metadata range that is
+  neither a subset nor a superset of the current live scope is a defensive
+  no-op either way, never guessed), `Host` (stand up a fresh/joining/restarting
   tablet), `Reconfigure` (one `reconfigure_step` toward the desired replica
   set for every tablet this node leads, carrying the down-set), `Release`
   (tear down a tablet moved off this node, gated by
   `RELEASE_CONFIRM_TICKS` consecutive confirming calls at an unchanged
-  epoch — the ADR 0029 dampener, ported verbatim) and `Reclaim` (tear down a
-  tablet whose whole table was dropped). `Release`'s `erase_bound` is always
-  the tablet's **current** metadata range, never a `TabletFacts::scope_range`
-  fact — the sibling-corruption regression (root `CLAUDE.md`) is now provable
-  directly in a unit test
+  epoch — the ADR 0029 dampener, ported verbatim), `Reclaim` (tear down a
+  tablet whose whole table was dropped), and `Absorb` (ADR 0033: tear down a
+  tablet that vanished from the map because it was **merged into a sibling**
+  — `tablet ∈ view.merged` — rather than because its whole table was dropped;
+  unlike `Reclaim`, this **never erases**, since the merge survivor now owns
+  the range on the same node-shared engine). `Release`'s `erase_bound` is
+  always the tablet's **current** metadata range, never a
+  `TabletFacts::scope_range` fact — the sibling-corruption regression (root
+  `CLAUDE.md`) is now provable directly in a unit test
   (`release_erase_bound_is_always_the_current_metadata_range_never_the_stale_scope_fact`)
   instead of only via a timing-dependent end-to-end reproduction.
+- **`Reclaim` vs `Absorb` cannot be told apart from `tablets` alone — that's
+  what `MetadataView::merged` is for.** A hosted tablet vanishing from the map
+  looks identical whether its whole table was dropped or it was just merged
+  into a sibling; inferring "merge" from "some other tablet's range now covers
+  mine" is unsound (two different tables' still-unsplit tablets can have
+  byte-identical default `KeyRange::whole()` ranges, with no table identity in
+  scope to disambiguate — a hosted-but-torn-down tablet no longer appears in
+  `view.tablets` at all, so there is nothing left to compare against by the
+  time `plan` decides). `Metadata::merged_tablets` (a tiny, never-pruned
+  marker set — see its own doc) is the explicit signal instead. `Reconciler`'s
+  teardown for `Absorb` (`TeardownKind::Absorb`) skips both the `narrow_scope`
+  call and the `erase_scope()` call `Release`/`Reclaim` perform — only the
+  driver stops and its own WAL file is removed; the tablet's physical keys are
+  untouched, now served through the survivor's widened scope.
 - **`plan` never removes a tablet from `LocalState::hosted` on its own** when
   emitting `Reclaim`/`Release` — real teardown is async and can time out
   (mirroring the pre-PR4 `animusd::cp_gc_tablet`'s conditional
@@ -504,7 +528,12 @@ guards.
   6. `spare_join_as_non_voter_then_promoted_by_leader`
   7. `growth_node_first_view_arrives_late_still_converges`
   8. `reconfigure_removes_a_down_replica_first`
-  9. `narrow_scope_never_widens_defensively`
+  9. `merge_widens_survivor_and_absorbs_sibling_unerased` (ADR 0033: renamed
+     from the pre-merge `narrow_scope_never_widens_defensively` cell, whose
+     premise — a wider metadata range is always erroneous — stopped being
+     true once merge became a real feature; this cell now drives the
+     positive case, asserting the widen actually happens and the
+     absorbed sibling's data survives unerased)
   10. `idempotent_tick_on_converged_multi_tablet_state`
   11. `reconfigure_transfers_leadership_before_removing_the_leader`
   12. `crash_restart_single_replica_upgrades_via_has_data`
