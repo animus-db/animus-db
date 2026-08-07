@@ -13,9 +13,10 @@
 //! to the snapshot base (no double-applied compare-and-swap), while the log
 //! prefix the snapshot covers is discarded.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use animus_env::NodeId;
+use animus_tablet::TabletId;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -189,6 +190,81 @@ where
             .filter_map(|line| serde_json::from_slice(line).ok())
             .collect()
     }
+
+    /// Encode one record tagged with the tablet it belongs to, for a **shared**,
+    /// multi-tenant WAL file holding several tablets' `RaftCore` records
+    /// interleaved (the single-command-split redesign, `docs/adr/0028-*.md`).
+    /// One newline-terminated JSON line, same framing discipline as
+    /// [`encode_record`](Self::encode_record).
+    #[must_use]
+    pub fn encode_tagged_record(tablet: TabletId, record: &WalRecord<C, S>) -> Vec<u8> {
+        #[derive(Serialize)]
+        struct Line<'a, C, S> {
+            tablet: TabletId,
+            record: &'a WalRecord<C, S>,
+        }
+        let mut bytes =
+            serde_json::to_vec(&Line { tablet, record }).expect("tagged wal record serializes");
+        bytes.push(b'\n');
+        bytes
+    }
+
+    /// Decode a shared WAL's bytes into `(tablet, record)` pairs, in file order,
+    /// ignoring a trailing partial line (a crash-torn write, per [`decode`](Self::decode)).
+    pub fn decode_tagged(bytes: &[u8]) -> Vec<(TabletId, WalRecord<C, S>)> {
+        #[derive(Deserialize)]
+        struct Line<C, S> {
+            tablet: TabletId,
+            record: WalRecord<C, S>,
+        }
+        bytes
+            .split(|&b| b == b'\n')
+            .filter(|line| !line.is_empty())
+            .filter_map(|line| serde_json::from_slice::<Line<C, S>>(line).ok())
+            .map(|line| (line.tablet, line.record))
+            .collect()
+    }
+
+    /// Demultiplex a shared WAL's bytes into one [`PersistedState`] per tablet —
+    /// each tablet's records are folded **in the order they appear in the
+    /// file**, independently of every other tablet's, exactly as
+    /// [`replay`](Self::replay) folds a single tablet's own dedicated file
+    /// today. A tablet with no records in the file is simply absent from the
+    /// result (never a spurious empty entry).
+    pub fn replay_multiplexed(bytes: &[u8]) -> BTreeMap<TabletId, Self> {
+        let mut grouped: BTreeMap<TabletId, Vec<WalRecord<C, S>>> = BTreeMap::new();
+        for (tablet, record) in Self::decode_tagged(bytes) {
+            grouped.entry(tablet).or_default().push(record);
+        }
+        grouped
+            .into_iter()
+            .map(|(tablet, records)| (tablet, Self::replay(records)))
+            .collect()
+    }
+
+    /// Build a shared WAL's full compaction image by concatenating each
+    /// locally-hosted tablet's own minimal record set (its `wal_image()` —
+    /// snapshot + hard state + log tail), tagged with that tablet's id.
+    /// Iteration order of `per_tablet` becomes the file's tablet ordering (it
+    /// doesn't matter for correctness — [`replay_multiplexed`](Self::replay_multiplexed)
+    /// demuxes by tag — but a stable caller-supplied order, e.g. a `BTreeMap`
+    /// iterator, keeps the image byte-reproducible for a given state).
+    #[must_use]
+    pub fn encode_multiplexed_image<'a>(
+        per_tablet: impl IntoIterator<Item = (TabletId, &'a [WalRecord<C, S>])>,
+    ) -> Vec<u8>
+    where
+        C: 'a,
+        S: 'a,
+    {
+        let mut bytes = Vec::new();
+        for (tablet, records) in per_tablet {
+            for record in records {
+                bytes.extend_from_slice(&Self::encode_tagged_record(tablet, record));
+            }
+        }
+        bytes
+    }
 }
 
 #[cfg(test)]
@@ -245,5 +321,151 @@ mod tests {
         assert_eq!(state, meta);
         assert_eq!((idx, term), (last_index, last_term));
         assert_eq!(replayed.snapshot_config, config);
+    }
+
+    // --- tagged / multiplexed WAL (PR1 of the single-command-split redesign) ---
+
+    fn upsert(node: NodeId) -> MetaCommand {
+        MetaCommand::UpsertMember {
+            node,
+            labels: std::collections::BTreeMap::new(),
+            status: NodeStatus::Active,
+        }
+    }
+
+    fn entry(index: u64, term: u64, command: MetaCommand) -> LogEntry<MetaCommand> {
+        LogEntry {
+            index,
+            term,
+            command,
+            config: None,
+        }
+    }
+
+    /// Two tablets' records interleaved in one shared file demux back into two
+    /// independent, correctly-ordered `PersistedState`s — the core correctness
+    /// property a multi-tenant WAL needs: one tablet's records must never leak
+    /// into another's replay, and each tablet's own order must survive
+    /// interleaving with everyone else's.
+    #[test]
+    fn tagged_records_demux_by_tablet_independent_of_interleaving() {
+        let t1 = TabletId(1);
+        let t2 = TabletId(2);
+
+        let mut bytes = Vec::new();
+        bytes.extend(
+            PersistedState::<MetaCommand, Metadata>::encode_tagged_record(
+                t1,
+                &WalRecord::Hard {
+                    term: 1,
+                    voted_for: Some(300),
+                },
+            ),
+        );
+        bytes.extend(
+            PersistedState::<MetaCommand, Metadata>::encode_tagged_record(
+                t2,
+                &WalRecord::Hard {
+                    term: 5,
+                    voted_for: Some(301),
+                },
+            ),
+        );
+        bytes.extend(
+            PersistedState::<MetaCommand, Metadata>::encode_tagged_record(
+                t1,
+                &WalRecord::Append(entry(1, 1, upsert(300))),
+            ),
+        );
+        bytes.extend(
+            PersistedState::<MetaCommand, Metadata>::encode_tagged_record(
+                t2,
+                &WalRecord::Append(entry(1, 5, upsert(301))),
+            ),
+        );
+        bytes.extend(
+            PersistedState::<MetaCommand, Metadata>::encode_tagged_record(
+                t1,
+                &WalRecord::Append(entry(2, 1, upsert(302))),
+            ),
+        );
+
+        let demuxed = PersistedState::<MetaCommand, Metadata>::replay_multiplexed(&bytes);
+
+        assert_eq!(demuxed.len(), 2);
+        let s1 = &demuxed[&t1];
+        assert_eq!(s1.term, 1);
+        assert_eq!(s1.voted_for, Some(300));
+        assert_eq!(s1.log.len(), 2);
+        assert_eq!(s1.log[0].index, 1);
+        assert_eq!(s1.log[1].index, 2);
+
+        let s2 = &demuxed[&t2];
+        assert_eq!(s2.term, 5);
+        assert_eq!(s2.voted_for, Some(301));
+        assert_eq!(s2.log.len(), 1);
+    }
+
+    /// A trailing torn line (crash mid-append) is dropped, exactly like the
+    /// single-tablet `decode`'s existing contract — and it must not corrupt any
+    /// *other* tablet's already-complete records earlier in the same file.
+    #[test]
+    fn tagged_replay_tolerates_a_torn_trailing_line() {
+        let t1 = TabletId(7);
+        let mut bytes = PersistedState::<MetaCommand, Metadata>::encode_tagged_record(
+            t1,
+            &WalRecord::Hard {
+                term: 2,
+                voted_for: None,
+            },
+        );
+        bytes.extend(
+            PersistedState::<MetaCommand, Metadata>::encode_tagged_record(
+                t1,
+                &WalRecord::Append(entry(1, 2, upsert(300))),
+            ),
+        );
+        // Simulate a crash mid-write of a second tablet's record: a truncated
+        // trailing line with no newline.
+        bytes.extend_from_slice(br#"{"tablet":8,"record":{"Hard":{"term":9"#);
+
+        let demuxed = PersistedState::<MetaCommand, Metadata>::replay_multiplexed(&bytes);
+        assert_eq!(demuxed.len(), 1, "the torn record must not appear at all");
+        let s1 = &demuxed[&t1];
+        assert_eq!(s1.term, 2);
+        assert_eq!(s1.log.len(), 1);
+    }
+
+    /// [`PersistedState::encode_multiplexed_image`] round-trips through
+    /// [`PersistedState::replay_multiplexed`] back to each tablet's original
+    /// `PersistedState` — the shape a shared-WAL compaction rewrite will use
+    /// (concatenate every locally-hosted tablet's own minimal record set).
+    #[test]
+    fn multiplexed_image_round_trips_per_tablet() {
+        let t1 = TabletId(3);
+        let t2 = TabletId(4);
+        let t1_records = vec![
+            WalRecord::Hard {
+                term: 4,
+                voted_for: Some(300),
+            },
+            WalRecord::Append(entry(10, 4, upsert(300))),
+        ];
+        let t2_records = vec![WalRecord::Hard {
+            term: 1,
+            voted_for: None,
+        }];
+
+        let image = PersistedState::<MetaCommand, Metadata>::encode_multiplexed_image([
+            (t1, t1_records.as_slice()),
+            (t2, t2_records.as_slice()),
+        ]);
+
+        let demuxed = PersistedState::<MetaCommand, Metadata>::replay_multiplexed(&image);
+        assert_eq!(demuxed.len(), 2);
+        assert_eq!(demuxed[&t1].term, 4);
+        assert_eq!(demuxed[&t1].log.len(), 1);
+        assert_eq!(demuxed[&t2].term, 1);
+        assert!(demuxed[&t2].log.is_empty());
     }
 }

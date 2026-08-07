@@ -44,6 +44,7 @@ use animus_control::raft::{Out, RaftCore, RaftMsg, StateMachine};
 use animus_control::{PersistedState, ProposeResult};
 use animus_env::{Coresident, Env, EnvExt, Metric, MetricsHandle, NodeId};
 use animus_storage::{MergeOp, StorageEngine};
+use animus_tablet::KeyRange;
 use futures::future::{Either, select};
 use futures::lock::Mutex as AsyncMutex;
 use futures::task::AtomicWaker;
@@ -103,10 +104,34 @@ impl Future for ProposePending<'_> {
 
 /// The data plane's Raft log command: a key-value mutation (or the election
 /// no-op). Keys/values are opaque bytes; ordering + durability come from Raft.
+///
+/// **`fence`** (every mutating variant except `Split`) is the leader's own
+/// belief, stamped in **at propose time**, of this tablet's current key range.
+/// It rides inside the command like `Cas`'s `expected` — opaque to `RaftCore`,
+/// interpreted only by `apply_and_compact` — so every replica makes the
+/// *identical* accept/reject decision for a given log entry, regardless of how
+/// far each replica has independently progressed through learning the tablet's
+/// range has changed (e.g. a metadata-driven split, ADR 0028). This is
+/// deliberately **not** a locally-polled check: two replicas polling their own
+/// view of "the current range" could disagree about the very same entry (one
+/// has observed a split, one hasn't) and silently apply it differently — a
+/// real safety violation, not just staleness. A command whose key(s) fall
+/// outside its own embedded `fence` is a deterministic no-op at apply time
+/// (see each apply arm's doc for the exact per-variant behavior). Every
+/// existing proposer stamps `KeyRange::whole()` (unconstrained, i.e. today's
+/// behavior is unchanged); a narrower fence is set only by a `*_fenced`
+/// proposer, not yet used by any real caller (that lands with the
+/// single-command-split integration).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum KvCommand {
-    /// Set `key` to `value`.
-    Put { key: Vec<u8>, value: Vec<u8> },
+    /// Set `key` to `value`, iff `key` falls inside `fence` (see the type-level
+    /// doc below for what `fence` means and why every replica checks it at
+    /// *apply* time rather than the proposer checking it once).
+    Put {
+        key: Vec<u8>,
+        value: Vec<u8>,
+        fence: KeyRange,
+    },
     /// **Batch put**: set every `(key, value)` in one Raft log entry — one propose,
     /// one commit round, one apply. All keys are merged at the entry's Raft `index`
     /// (the shared MVCC version): the keys are distinct, so per-key LWW is
@@ -116,20 +141,28 @@ pub enum KvCommand {
     /// Within one tablet the batch is atomic (it either commits whole or not at all);
     /// a cross-tablet batch is split into one `Batch` per tablet by the caller and is
     /// not atomic across tablets (matching DynamoDB `BatchWriteItem` semantics).
-    Batch(Vec<(Vec<u8>, Vec<u8>)>),
-    /// Remove `key` (a tombstone in the engine).
-    Delete { key: Vec<u8> },
+    /// `fence` gates the *whole* batch: if any key falls outside it, none of the
+    /// batch applies (preserves the batch's atomicity — see the type-level doc).
+    Batch {
+        puts: Vec<(Vec<u8>, Vec<u8>)>,
+        fence: KeyRange,
+    },
+    /// Remove `key` (a tombstone in the engine), iff `key` falls inside `fence`.
+    Delete { key: Vec<u8>, fence: KeyRange },
     /// **Linearizable compare-and-swap**: set `key` to `value` iff the key's
-    /// current committed value equals `expected` (`None` == "only if absent").
-    /// Evaluated at *apply* time against the engine's committed state, in commit
-    /// order, so every replica makes the identical accept/reject decision (no
-    /// clock/RNG) — and two CAS racing from the same `expected` have exactly one
-    /// winner (whichever Raft ordered first). The outcome is recorded in driver
-    /// state keyed by the entry's log index for the proposer to read.
+    /// current committed value equals `expected` (`None` == "only if absent")
+    /// *and* `key` falls inside `fence`. Evaluated at *apply* time against the
+    /// engine's committed state, in commit order, so every replica makes the
+    /// identical accept/reject decision (no clock/RNG) — and two CAS racing
+    /// from the same `expected` have exactly one winner (whichever Raft
+    /// ordered first). The outcome is recorded in driver state keyed by the
+    /// entry's log index for the proposer to read; a fenced-out CAS records
+    /// `false` (see the apply-time fence check's doc for why).
     Cas {
         key: Vec<u8>,
         expected: Option<Vec<u8>>,
         value: Vec<u8>,
+        fence: KeyRange,
     },
     /// **Split** this tablet at `at` (ADR 0017 D): keys `>= at` move to a new
     /// tablet group. Agreed through the Raft log so every replica splits at the
@@ -448,8 +481,17 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
 
     /// Propose a write to this group. Honored only on the leader (otherwise
     /// returns the leader hint); the value is durable + applied once committed.
+    /// Stamps `fence = KeyRange::whole()` (unconstrained — see
+    /// [`KvCommand`]'s doc); use [`put_fenced`](Self::put_fenced) to stamp a
+    /// narrower one.
     pub fn put(&self, key: Vec<u8>, value: Vec<u8>) -> ProposeResult {
-        self.propose_and_wake(KvCommand::Put { key, value })
+        self.put_fenced(key, value, KeyRange::whole())
+    }
+
+    /// As [`put`](Self::put), but the leader stamps its own `fence` into the
+    /// entry instead of the unconstrained default (see [`KvCommand`]'s doc).
+    pub fn put_fenced(&self, key: Vec<u8>, value: Vec<u8>, fence: KeyRange) -> ProposeResult {
+        self.propose_and_wake(KvCommand::Put { key, value, fence })
     }
 
     /// Propose a **batch put**: commit every `(key, value)` as **one** Raft log
@@ -459,14 +501,39 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// MVCC version — the keys are distinct so per-key LWW is well-defined, and the
     /// batch is atomic within this tablet (it commits whole or not at all). To learn
     /// it committed + applied, take the [`ProposeResult::Accepted`] `index` and wait
-    /// until `last_applied >= index` (the whole batch has merged by then).
+    /// until `last_applied >= index` (the whole batch has merged by then). Stamps
+    /// `fence = KeyRange::whole()`; use [`put_batch_fenced`](Self::put_batch_fenced)
+    /// to stamp a narrower one.
     pub fn put_batch(&self, puts: Vec<(Vec<u8>, Vec<u8>)>) -> ProposeResult {
-        record_propose(&self.metrics, self.lock().propose(KvCommand::Batch(puts)))
+        self.put_batch_fenced(puts, KeyRange::whole())
     }
 
-    /// Propose a delete (tombstone) to this group.
+    /// As [`put_batch`](Self::put_batch), but the leader stamps its own `fence`
+    /// into the entry (see [`KvCommand`]'s doc). If any key in `puts` falls
+    /// outside `fence`, **none** of the batch applies (the fence gates the
+    /// whole atomic entry, not individual keys).
+    pub fn put_batch_fenced(
+        &self,
+        puts: Vec<(Vec<u8>, Vec<u8>)>,
+        fence: KeyRange,
+    ) -> ProposeResult {
+        record_propose(
+            &self.metrics,
+            self.lock().propose(KvCommand::Batch { puts, fence }),
+        )
+    }
+
+    /// Propose a delete (tombstone) to this group. Stamps `fence =
+    /// KeyRange::whole()`; use [`delete_fenced`](Self::delete_fenced) to stamp
+    /// a narrower one.
     pub fn delete(&self, key: Vec<u8>) -> ProposeResult {
-        self.propose_and_wake(KvCommand::Delete { key })
+        self.delete_fenced(key, KeyRange::whole())
+    }
+
+    /// As [`delete`](Self::delete), but the leader stamps its own `fence` into
+    /// the entry instead of the unconstrained default (see [`KvCommand`]'s doc).
+    pub fn delete_fenced(&self, key: Vec<u8>, fence: KeyRange) -> ProposeResult {
+        self.propose_and_wake(KvCommand::Delete { key, fence })
     }
 
     /// Propose a **linearizable compare-and-swap**: set `key` to `value` iff the
@@ -476,12 +543,29 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// CAS racing from the same `expected` have exactly one winner. To learn the
     /// outcome, take the [`ProposeResult::Accepted`] `index` and read
     /// [`cas_result`](Self::cas_result) once that index applies — or use the
-    /// all-in-one [`compare_and_swap`](Self::compare_and_swap).
+    /// all-in-one [`compare_and_swap`](Self::compare_and_swap). Stamps `fence =
+    /// KeyRange::whole()`; use [`cas_fenced`](Self::cas_fenced) to stamp a
+    /// narrower one.
     pub fn cas(&self, key: Vec<u8>, expected: Option<Vec<u8>>, value: Vec<u8>) -> ProposeResult {
+        self.cas_fenced(key, expected, value, KeyRange::whole())
+    }
+
+    /// As [`cas`](Self::cas), but the leader stamps its own `fence` into the
+    /// entry instead of the unconstrained default (see [`KvCommand`]'s doc). A
+    /// fenced-out CAS records outcome `false` (see the apply-time fence
+    /// check's doc for why).
+    pub fn cas_fenced(
+        &self,
+        key: Vec<u8>,
+        expected: Option<Vec<u8>>,
+        value: Vec<u8>,
+        fence: KeyRange,
+    ) -> ProposeResult {
         self.propose_and_wake(KvCommand::Cas {
             key,
             expected,
             value,
+            fence,
         })
     }
 
@@ -1182,56 +1266,81 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
     let mut max_index = 0u64;
     for (index, command) in effects {
         match command {
-            KvCommand::Put { key, value } => {
-                pending.push(MergeOp::put(key, value, index));
+            KvCommand::Put { key, value, fence } => {
+                // Out-of-fence is a deterministic no-op: the fence rides in the
+                // entry itself (stamped by the leader at propose time), so every
+                // replica reaches this same accept/reject decision regardless of
+                // its own progress learning the tablet's range has changed (see
+                // `KvCommand`'s doc).
+                if fence.contains(&key) {
+                    pending.push(MergeOp::put(key, value, index));
+                }
             }
-            KvCommand::Batch(puts) => {
+            KvCommand::Batch { puts, fence } => {
+                // The fence gates the *whole* batch, not per-key: a batch is one
+                // atomic Raft entry (see `KvCommand::Batch`'s doc), so partially
+                // applying it on a fence miss would silently break that guarantee.
                 // Every key in the batch merges at this one entry's `index` (the
                 // shared MVCC version). The keys are distinct, so per-key LWW is
                 // well-defined; `engine_applied` advances once past the whole batch
                 // at the end of the loop iteration (the batch is one entry). Composes
                 // with a future coalesced-fsync merge_batch (perf/lsm) — this is the
                 // normal per-key `merge` path that batching optimization refines.
-                for (key, value) in &puts {
-                    storage
-                        .merge(key, value, index)
-                        .await
-                        .expect("raftkv apply batch put");
+                if puts.iter().all(|(key, _)| fence.contains(key)) {
+                    for (key, value) in &puts {
+                        storage
+                            .merge(key, value, index)
+                            .await
+                            .expect("raftkv apply batch put");
+                    }
                 }
             }
-            KvCommand::Delete { key } => {
-                pending.push(MergeOp::tombstone(key, index));
+            KvCommand::Delete { key, fence } => {
+                if fence.contains(&key) {
+                    pending.push(MergeOp::tombstone(key, index));
+                }
             }
             KvCommand::Cas {
                 key,
                 expected,
                 value,
+                fence,
             } => {
                 // Drain the pending run so the CAS read observes every earlier
                 // committed write in this apply pass.
                 flush_pending(storage, &mut pending, metrics).await;
-                // Read the key's *current committed* value (the latest applied,
-                // since we apply in commit order and earlier entries in this batch
-                // already merged above) and compare to `expected`. Equal → swap;
-                // else no-op. Deterministic on every replica (same order, same
-                // committed state, no clock/RNG), so concurrent CAS from the same
-                // `expected` resolve to exactly one winner — whichever Raft put
-                // first, since the first swap moves the committed value and the
-                // second's compare then fails.
-                let current = storage
-                    .get(&key)
-                    .await
-                    .expect("raftkv cas read")
-                    .map(|vv| vv.value);
-                let swapped = current == expected;
-                if swapped {
-                    // Same write path as `Put`: index is the MVCC version, so
-                    // re-applying on recovery is idempotent (per-key LWW).
-                    storage
-                        .merge(&key, &value, index)
+                // A fenced-out CAS never reads/writes storage — it is recorded as
+                // `false` ("did not swap"), the same outcome shape a proposer
+                // already handles for an ordinary `expected` mismatch, so a
+                // confirm-poll on this index never hangs waiting for an outcome
+                // that will never come.
+                let swapped = if fence.contains(&key) {
+                    // Read the key's *current committed* value (the latest applied,
+                    // since we apply in commit order and earlier entries in this
+                    // batch already merged above) and compare to `expected`. Equal
+                    // → swap; else no-op. Deterministic on every replica (same
+                    // order, same committed state, no clock/RNG), so concurrent CAS
+                    // from the same `expected` resolve to exactly one winner —
+                    // whichever Raft put first, since the first swap moves the
+                    // committed value and the second's compare then fails.
+                    let current = storage
+                        .get(&key)
                         .await
-                        .expect("raftkv apply cas");
-                }
+                        .expect("raftkv cas read")
+                        .map(|vv| vv.value);
+                    let swapped = current == expected;
+                    if swapped {
+                        // Same write path as `Put`: index is the MVCC version, so
+                        // re-applying on recovery is idempotent (per-key LWW).
+                        storage
+                            .merge(&key, &value, index)
+                            .await
+                            .expect("raftkv apply cas");
+                    }
+                    swapped
+                } else {
+                    false
+                };
                 cas.lock()
                     .expect("cas results poisoned")
                     .outcomes
