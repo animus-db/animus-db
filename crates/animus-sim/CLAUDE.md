@@ -24,6 +24,14 @@ function of one seed. This is the substrate every distributed test runs on.
 
 ## What's non-obvious
 
+- **`Simulator` is `Clone`** (added for ADR 0031 PR5's reconciler corpus): it
+  hands out another handle to the SAME shared world (clones the inner `Arc`),
+  exactly like `SimEnv`'s own `Clone`, not a fork. This is what lets a test's
+  spawned "driver" task carry its own `Simulator` handle to call the `&self`
+  fault-injection methods (`stop`/`crash`/`partition_pair`/`heal`/`env`) from
+  *inside* an async scenario script, while the outer synchronous test code
+  keeps its own handle to drive `run_for`/`run_until` (the only `&mut self`
+  methods — no field either handle touches is exclusive to one of them).
 - **`run()` never returns for protocols with perpetual timers** (Raft
   heartbeats). Use `run_for`/`run_until` whenever the control plane is involved.
 - The core is a single shared `SimState` behind a `Mutex`, plus a custom

@@ -3,12 +3,20 @@
 - **Status:** Accepted — implemented incrementally across PRs 1–6. PR1
   delivered the metadata-watch primitive (§trigger); PR2 made
   `ClusterEdgeState` genuinely per-node; PR3 delivered the pure planner
-  (`animus_cp_data::host::plan`); **PR4 (this PR) delivers the executor
-  (`animus_cp_data::host::Reconciler`) and wires it into `animusd`, retiring
+  (`animus_cp_data::host::plan`); PR4 delivered the executor
+  (`animus_cp_data::host::Reconciler`) and wired it into `animusd`, retiring
   `cp_join_host_loop`, `cp_gc_loop`/`cp_gc_release_phase`, and
-  `cp_reconfigure_loop`.** PR5 (a dedicated `SimEnv` lifecycle fault-injection
-  corpus for the reconciler beyond PR4's own focused test) and PR6 (further
-  docs cleanup) remain.
+  `cp_reconfigure_loop`. **PR5 (this PR) delivers a dedicated `SimEnv`
+  lifecycle fault-injection corpus for the reconciler**
+  (`animus-cp-data/tests/reconciler_corpus.rs` — 18 frozen, name-seeded
+  scenarios spanning host/split-narrow/reconfigure/release/reclaim, crash+
+  restart, a network partition blocking a release, a control-plane replay
+  epoch flicker, and the split-then-immediate-release sibling-corruption
+  regression driven at zero ticks; depth knob `ANIMUS_RECONCILER_SEEDS`, held
+  green at ×300 / 5,400 scenario runs) beyond PR4's own focused
+  `reconciler_hosts_narrows_releases_and_confirms_sparing_a_sibling` test —
+  see `animus-cp-data/CLAUDE.md`'s "Reconciler lifecycle corpus" section.
+  PR6 (further docs cleanup) remains.
 - **Date:** 2026-08-07
 
 ## Context
@@ -110,11 +118,25 @@ like everything else in this codebase), delivered across six PRs:
    (a live `RaftNode` read the pure planner has no business taking), gated on
    *both* the local raft and the growth-node remote-metadata mirror being
    unavailable, so it never permanently blocks a growth node's reconciler.
-5. **PR5:** a `SimEnv` lifecycle corpus exercising the reconciler across the
-   full host → reconfigure → split-narrow → release → reclaim sequence under
-   fault injection, beyond PR4's own focused
+5. **PR5 (delivered):** a `SimEnv` lifecycle corpus exercising the reconciler
+   across the full host → reconfigure → split-narrow → release → reclaim
+   sequence under fault injection, beyond PR4's own focused
    `reconciler_hosts_narrows_releases_and_confirms_sparing_a_sibling` test
-   (`animus-cp-data/tests/reconciler.rs`).
+   (`animus-cp-data/tests/reconciler.rs`) —
+   `animus-cp-data/tests/reconciler_corpus.rs`, 18 frozen name-seeded
+   scenarios (host/elect/serve; split-narrow-sibling; rebalance-off release;
+   drop-table reclaim; spare-join promotion; a growth node's late first view;
+   reconfigure repairing a `Down` replica and transferring leadership off
+   itself; crash+restart of a sole replica and of a follower, each relying on
+   the `has_data` restart-upgrade; a control-plane replay epoch flicker
+   around the release dampener; the documented Reclaim-has-no-dampener
+   contract boundary; a network partition blocking a release until healed;
+   the split-then-immediate-release sibling-corruption regression driven
+   deterministically at zero ticks; a re-add cancelling a pending release;
+   narrow-never-widens; and multi-tablet idempotence) plus depth
+   (`ANIMUS_RECONCILER_SEEDS`) and coverage-guard tests, held green at ×300 /
+   5,400 scenario runs. See `animus-cp-data/CLAUDE.md`'s "Reconciler
+   lifecycle corpus" section for the full list and how to run/extend it.
 6. **PR6:** retire remaining doc references to the old loop names; further
    docs cleanup.
 

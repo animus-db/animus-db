@@ -349,6 +349,18 @@ impl ArcWake for TaskWaker {
 
 /// The deterministic simulator. Construct with a seed, register nodes via
 /// [`env`](Simulator::env), spawn work, then drive with [`run`](Simulator::run).
+///
+/// **`Clone`** hands out another handle to the SAME shared simulated world
+/// (it clones the inner `Arc`, exactly like [`SimEnv`]'s own `Clone` already
+/// does) — not a fork. This is what lets a test's spawned "driver" task carry
+/// its own `Simulator` handle to call fault-injection methods (`stop`,
+/// `crash`, `partition_pair`, `heal`, `env`; all `&self`) from *inside* an
+/// async scenario script, while the outer, synchronous test code keeps its
+/// own handle to drive [`run_for`](Simulator::run_for)/
+/// [`run_until`](Simulator::run_until) (the only `&mut self` methods — no
+/// field they touch is exclusive to one handle, so nothing is lost by having
+/// more than one).
+#[derive(Clone)]
 pub struct Simulator {
     shared: Arc<Shared>,
     seed: u64,
