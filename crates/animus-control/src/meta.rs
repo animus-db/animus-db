@@ -150,23 +150,6 @@ pub enum MetaCommand {
     /// and they share a replica set) into `left`, extended to cover both ranges
     /// with a bumped epoch; `right` is removed.
     MergeTablets { left: TabletId, right: TabletId },
-    /// Remove a **metadata-only orphan tablet**: one whose `SplitTablet` (step 1)
-    /// committed but whose data-plane `propose_split` (step 2) lost the source
-    /// group's one-time split to a different key and can now never confirm (see
-    /// `animusd`'s `auto_split_loop` abandon path). Such a tablet never received a
-    /// `cp_split_seed` handoff — the data-plane split hook only fires for the key
-    /// that actually won — so it never held any real data; dropping it is always
-    /// safe. **Compare-and-swap on `expected_epoch`**, mirroring `SplitTablet`
-    /// /`CasTabletReplicas`: rejects a stale caller instead of dropping a tablet
-    /// that has since been touched (e.g. reused via `next_free_tablet_id`'s
-    /// monotonic floor — it can't be reused, but the CAS costs nothing and keeps
-    /// the same discipline as every other tablet-mutating command). Idempotent
-    /// in spirit but not in effect: a second drop of an already-gone tablet is
-    /// rejected (`"no such tablet"`), which callers treat as "already handled."
-    DropOrphanTablet {
-        tablet: TabletId,
-        expected_epoch: Epoch,
-    },
     /// Set (or clear) a tablet's placement policy (ADR 0005). Once a tablet has
     /// a policy, the leader's reconciler keeps its replica set satisfying it;
     /// `policy: None` removes the policy and stops automatic reconciliation. The
@@ -507,19 +490,6 @@ impl Metadata {
                 self.prune_cp_member_addrs();
                 ApplyOutcome::Applied
             }
-            MetaCommand::DropOrphanTablet {
-                tablet,
-                expected_epoch,
-            } => match self.tablets.get(tablet) {
-                None => ApplyOutcome::Rejected("no such tablet"),
-                Some(t) if t.epoch != *expected_epoch => ApplyOutcome::Rejected("epoch mismatch"),
-                Some(_) => {
-                    self.tablets.remove(tablet);
-                    self.policies.remove(tablet);
-                    self.prune_cp_member_addrs();
-                    ApplyOutcome::Applied
-                }
-            },
             MetaCommand::SetTabletPolicy { tablet, policy } => {
                 if !self.tablets.contains_key(tablet) {
                     return ApplyOutcome::Rejected("no such tablet");
@@ -1227,80 +1197,5 @@ mod tests {
             ApplyOutcome::Applied
         );
         assert!(m.tablets.contains_key(&TabletId(3)));
-    }
-
-    /// `DropOrphanTablet` removes a metadata-only tablet whose data-plane split
-    /// never confirmed (the "abandoned" case `animusd`'s `auto_split_loop`
-    /// detects when its own key loses the source group's one-time split to a
-    /// different key). It never held real data — the split hook only fires for
-    /// the winning key — so removing it is always safe.
-    #[test]
-    fn drop_orphan_tablet_removes_a_never_seeded_split_child() {
-        let mut m = Metadata::default();
-        assert_eq!(
-            m.apply(&MetaCommand::CreateTablet {
-                tablet: TabletId(1),
-                table: Some("users".to_owned()),
-                range: KeyRange::whole(),
-                replicas: vec![1, 2, 3],
-            }),
-            ApplyOutcome::Applied
-        );
-        // The abandoned mint: minted at "q" and never seeded.
-        assert_eq!(
-            m.apply(&MetaCommand::SplitTablet {
-                tablet: TabletId(1),
-                expected_epoch: Epoch::INITIAL,
-                split_key: b"q".to_vec(),
-                new_id: TabletId(2),
-            }),
-            ApplyOutcome::Applied
-        );
-        assert!(m.tablets.contains_key(&TabletId(2)));
-
-        assert_eq!(
-            m.apply(&MetaCommand::DropOrphanTablet {
-                tablet: TabletId(2),
-                expected_epoch: Epoch::INITIAL,
-            }),
-            ApplyOutcome::Applied
-        );
-        assert!(!m.tablets.contains_key(&TabletId(2)));
-        // The source tablet (the real, unaffected owner of the keyspace) is
-        // untouched.
-        assert_eq!(m.tablets[&TabletId(1)].epoch, Epoch::INITIAL.next());
-    }
-
-    #[test]
-    fn drop_orphan_tablet_rejects_a_missing_tablet_or_stale_epoch() {
-        let mut m = Metadata::default();
-        assert_eq!(
-            m.apply(&MetaCommand::DropOrphanTablet {
-                tablet: TabletId(9),
-                expected_epoch: Epoch::INITIAL,
-            }),
-            ApplyOutcome::Rejected("no such tablet")
-        );
-
-        assert_eq!(
-            m.apply(&MetaCommand::CreateTablet {
-                tablet: TabletId(1),
-                table: Some("users".to_owned()),
-                range: KeyRange::whole(),
-                replicas: vec![1, 2, 3],
-            }),
-            ApplyOutcome::Applied
-        );
-        // A stale epoch (the tablet has moved since the caller last read it) is
-        // rejected rather than dropping state out from under a since-touched
-        // tablet.
-        assert_eq!(
-            m.apply(&MetaCommand::DropOrphanTablet {
-                tablet: TabletId(1),
-                expected_epoch: Epoch::INITIAL.next(),
-            }),
-            ApplyOutcome::Rejected("epoch mismatch")
-        );
-        assert!(m.tablets.contains_key(&TabletId(1)));
     }
 }

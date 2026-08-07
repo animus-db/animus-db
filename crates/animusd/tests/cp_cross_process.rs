@@ -268,19 +268,15 @@ async fn batch_write_on_a_non_leader_node_is_forwarded() {
     }
 }
 
-/// ADR 0017 #4 regression — **derived member ids must translate back to base ids on
-/// the forward path**. The *first* provisioned table wins the tablet-id race with
-/// bootstrap and rides the bootstrap group, whose member ids **are** the base
-/// `raftkv` ids — so a missing member→base translation in `cp_forward_target` is
-/// invisible on it (the test above). The **second** table's tablet gets *derived*
-/// member ids (`base + tablet * STRIDE`); its leader hint must be translated back to
-/// a base id before the `client_route` lookup, or a follower node waits out
-/// `CLIENT_TIMEOUT` on a healthy group ("no CP group leader reachable" — the
-/// admin_data_write flake). Reading via **every** node guarantees at least two
-/// forwarded reads, so a broken translation fails deterministically, wherever the
-/// leader landed.
+/// Regression: a table's tablet is not necessarily the bootstrap tablet — a
+/// **second** provisioned table's group must forward across processes exactly
+/// like the first. Since ADR 0026 Stage B a tablet's CP group member id is
+/// simply the base `raftkv` id for every tablet (no per-tablet derived id to
+/// translate), so this now mostly guards against a future regression
+/// reintroducing per-tablet id derivation. Reading via **every** node
+/// guarantees at least two forwarded reads, wherever the leader landed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
-async fn second_table_with_derived_member_ids_forwards_across_processes() {
+async fn second_table_forwards_across_processes() {
     let n = 3;
     let dir = tempfile::tempdir().unwrap();
     let (nodes, config) = bring_up(n, dir.path()).await;

@@ -220,6 +220,35 @@ cross-cutting ones. Prune/merge entries that become obsolete.
   follower right after a create on the leader must wait for the definition to
   replicate to that node (`await_table_*`), not assume the leader's ack made it
   visible everywhere.
+- **Two independent, un-jittered fixed-period polling loops that can each "win"
+  a one-shot outcome are a real, silent flake source — not just theoretical.**
+  Rewiring tablet split to a single control-plane command surfaced this in
+  `animusd::cp_reconfigure_loop` (steps a CP group's Raft voters toward a
+  tablet's replicated replica set) racing `animus-control`'s `reconcile_loop`
+  (re-CASes a replica set back to satisfy its placement *policy*): a manual
+  replica-set drop is a **one-shot** race — whichever loop observes it first
+  decides the outcome, because the loser's own next tick sees an
+  already-equal-to-desired state and never retries. Both loops polled a fixed
+  500ms, so once one loop happened to start ticking with an unlucky phase
+  offset relative to the other (here: an eager, synchronous, awaited
+  `LsmEngine::open` inserted before the loop's spawn point, versus the
+  other side's non-blocking, self-spawning `RaftNode::start`), it lost *every*
+  time, deterministically, for the life of the process — reproduced as
+  `animusd::tests::cp_reconfigure::cp_group_follows_tablet_replica_set` timing
+  out 100% of runs in isolation. Re-rolling a random jitter each tick only
+  turned "always loses" into "wins about half the time across separate test
+  runs" (a one-shot race stays a coin flip no matter how much you jitter one
+  side — jitter decorrelates *repeated* ticks, but there's only one tick that
+  matters here). What actually fixed it: making the loop that must react to an
+  operator-driven change poll **meaningfully faster** than the policy
+  loop it's racing (`CP_RECONFIGURE_INTERVAL` cut from 500ms to 150ms, a third
+  of `RECONCILE_INTERVAL`), so it overwhelmingly observes the change first.
+  When two independent pollers can produce a stable-but-wrong equilibrium by
+  one of them winning a single race, check not just "is each one individually
+  correct" but "does either one systematically have first-mover advantage,
+  and does that matter" — and if a manual/operator action must reliably beat
+  an automatic policy-enforcement loop, poll for it faster, don't just add
+  jitter. (`animusd` `cp_reconfigure_loop`/`jitter`.)
 - **Determinism (ADR 0003) proves logic and ordering, not real-thread liveness.**
   `SimEnv` is single-threaded + cooperative, so a `Mutex` guard held across an
   `.await`, a lost waker, or a leader-election/group-commit deadlock can pass
@@ -504,7 +533,10 @@ cross-cutting ones. Prune/merge entries that become obsolete.
   a sole voter's recovered WAL tail (nothing re-drives commit until the next
   propose), and any gate on "current-term entry committed" (ReadIndex §6.4, the
   membership-change gate) would deadlock a single-node group. (PR #25.)
-- **Metadata-level dedup of a proposal only picks one *winner* — it does not stop
+- **Superseded by ADR 0028** (single-command, control-plane-only split — the
+  data-plane `KvCommand::Split`/`propose_split` this entry describes is deleted;
+  a metadata-level `SplitTablet` is now the *entire* operation). Retained for
+  historical record. **Metadata-level dedup of a proposal only picks one *winner* — it does not stop
   other legitimate callers from still invoking a side-effecting state-machine
   command, which must therefore be idempotent at APPLY time, not just deduped at
   the propose layer.** In `--cluster N`, every node's auto-split loop shares one
@@ -574,7 +606,9 @@ cross-cutting ones. Prune/merge entries that become obsolete.
   hold" is not the same as "no one else committed a conflicting change since I
   read this."** (`animus-control` `meta.rs::split_rejects_a_stale_epoch_racing_a_concurrent_split`,
   `tablet_split_merge.rs::racing_splits_at_the_same_epoch_only_one_applies`.)
-- **A CAS guard closes the *concurrent* instance of a race; a *sequential*
+- **Superseded by ADR 0028**: `DropOrphanTablet` (and the orphan it exists to
+  clean up) no longer exist — a split's single atomic command makes an orphan
+  structurally impossible. Retained for historical record. **A CAS guard closes the *concurrent* instance of a race; a *sequential*
   instance of the same race needs its own answer — usually cleanup, not
   another precondition.** The `SplitTablet` epoch CAS above stops two
   proposers from *both* committing at the same epoch, but does nothing when
@@ -605,7 +639,9 @@ cross-cutting ones. Prune/merge entries that become obsolete.
   reproduces the *sequential* shape deterministically via two manual splits —
   no timing race needed, since the precondition is just "propose against an
   already-narrowed range.")
-- **A retry loop keyed on a resource id must recheck the resource still
+- **Superseded by ADR 0028**: `auto_split_loop`'s `pending` retry map (and step 2
+  it was retrying) no longer exist — split is a single-step command. Retained
+  for historical record. **A retry loop keyed on a resource id must recheck the resource still
   exists — a precondition that only checks its own transient state ("did *my*
   attempt fail in a way I recognize") silently assumes the resource itself is
   immortal.** `auto_split_loop`'s pending-retry map has one such gap left even
@@ -624,7 +660,10 @@ cross-cutting ones. Prune/merge entries that become obsolete.
   there's nothing external to assert against. (`animusd` `auto_split_loop`'s
   retry phase, the tablet-existence guard added right before the confirm
   call.)
-- **Before reaching for "remember everything" to disambiguate an edge case,
+- **Superseded by ADR 0028**: `current_split_bound`/`SPLIT_BOUND_KEY` and the
+  "a group can be split more than once" data-plane mechanism this entry
+  discusses are deleted — split no longer has a data-plane half at all.
+  Retained for historical record. **Before reaching for "remember everything" to disambiguate an edge case,
   check whether a cheap, independent check at the point of irreversible action
   can bound the state to O(1) instead.** Lifting the CP-data "a group can only
   ever apply one `Split`" limit (letting a tablet reshard repeatedly as it
@@ -751,7 +790,11 @@ cross-cutting ones. Prune/merge entries that become obsolete.
   safety-critical Raft (real risk) for a bounded, rare, extreme-scale stall — so it
   was **measured, documented, and deferred**, not force-fit. A well-reasoned "the
   sibling's hazard is smaller; here's the measurement" is a valid outcome.
-- **A recursive operation that "works" once may be relying on a depth-1 coincidence —
+- **Superseded by ADR 0028**: the split hook + `base + tablet*STRIDE` member-id
+  derivation this entry discusses are deleted (ADR 0026 Stage B made a
+  tablet's CP group member id simply the base `raftkv` id, at any split
+  depth, so there is no derivation left to get wrong). Retained for
+  historical record. **A recursive operation that "works" once may be relying on a depth-1 coincidence —
   prove it at depth ≥ 2.** Tablet *split* worked the first time for two accidental
   reasons that both break at depth 2: (a) only the *bootstrap* group was started with
   a split hook, so a split-created child had no machinery to split *itself*; and (b)
@@ -762,7 +805,11 @@ cross-cutting ones. Prune/merge entries that become obsolete.
   churns forever on the mismatch. Fix recursive invariants to hold at any depth: give
   **every** spawned instance the same machinery (a hook), and derive ids from a
   **fixed root** (the base id), never the immediate parent. (ADR 0017 deep splits.)
-- **Distinguish "seed a fresh child" from "join an existing group empty" by a durable
+- **Superseded by ADR 0028**: a fresh split child no longer needs handoff
+  seeding at all (it's a `StorageScope` over already-present shared-engine
+  data), so it forms exactly like a fresh whole-keyspace tablet — there is no
+  more "fresh split child vs. join" distinction to make. Retained for
+  historical record. **Distinguish "seed a fresh child" from "join an existing group empty" by a durable
   monotonic signal, not a race.** A node *added* to a tablet's replica set by the
   reconciler must host an **empty** group and catch up via `InstallSnapshot`; an
   *original* replica of a fresh split must **seed** from its local handed-off data —
@@ -770,7 +817,11 @@ cross-cutting ones. Prune/merge entries that become obsolete.
   to decide which; gate on the tablet **epoch** (`INITIAL` = fresh split → leave it to
   the hook; bumped by a reconfigure → a join → host empty). A deterministic signal
   turns a data-loss race into a clean branch. (ADR 0017 D1 join-hosting.)
-- **Which physical engines a node hosts is *local* durable state — a marker file,
+- **Superseded by ADR 0028**: the `cp-hosted` durable marker this entry
+  describes is deleted — every tablet on a node now shares one `LsmEngine`,
+  opened once at node start, so there is no per-tablet "which engines exist
+  here" question left to answer; a restart just re-discovers every tablet to
+  host from replicated `Metadata`. Retained for historical record. **Which physical engines a node hosts is *local* durable state — a marker file,
   not derivable from replicated `Metadata`.** Re-hosting a node's per-tablet CP
   groups after a restart (ADR 0017 #2) can't be driven purely off the replicated
   tablet map: that map records placement in **stable base node ids**, not which
@@ -783,7 +834,10 @@ cross-cutting ones. Prune/merge entries that become obsolete.
   hosted and won't mint the sibling twice. (A genuinely-local durable record is fine;
   the "prefer a live read of the durable layer" caution is about *stale derived
   caches*, which this is not.)
-- **Keep the replicated tablet map in stable base node ids; translate to per-tablet
+- **Superseded by ADR 0026 Stage B / ADR 0028**: a tablet's CP group member id
+  is now simply its base `raftkv` id (stream-addressed, not a derived
+  `NodeId`), so the base↔member translation this entry describes no longer
+  exists. Retained for historical record. **Keep the replicated tablet map in stable base node ids; translate to per-tablet
   group member ids at the edge.** A tablet's Raft *group member ids* differ from the
   node's base id (a split tablet uses `base + tablet*STRIDE` so co-resident groups
   get distinct inboxes), but failure-detection and placement speak **base ids**. So
@@ -807,7 +861,12 @@ cross-cutting ones. Prune/merge entries that become obsolete.
   split: decision pure + elsewhere, timing in the loop. Reconfigure toward a target
   **one single-server step per tick** (the `change_membership` contract), letting a
   multi-server move converge over successive ticks rather than failing.
-- **Extend the `Env` seam with a *sub-trait* bound only where used, not by widening
+- **Superseded by ADR 0026/0028 for this use**: `animus-cp-data` no longer uses
+  `Coresident`/`sibling()` at all — every tablet a node hosts shares one env,
+  addressed by `stream` (ADR 0026 Stage B). The `Coresident` trait itself still
+  exists in `animus-env`/`animus-sim` (unused by cp-data now); the pattern
+  below (sub-trait, not supertrait) is still the right one if a future
+  capability needs it. Retained for historical record. **Extend the `Env` seam with a *sub-trait* bound only where used, not by widening
   the supertrait — capabilities not every env has stay opt-in.** In-band tablet
   split (ADR 0017 D) needs a node to mint a second inbox at runtime
   (`sibling(id) -> Self`). Adding that to the `Env` supertrait would force *every*
@@ -998,7 +1057,9 @@ cross-cutting ones. Prune/merge entries that become obsolete.
   synchronous serve-wait on the provisioning path** — it made the first write block on
   full formation (regressing a restart test); `cp_route` already waits, so provisioning
   returns once the tablet is in `Metadata`. (ADR 0023, `animusd` `resolve_cp_route`.)
-- **An id-translation seam must be applied in *both* directions — and the identity
+- **Superseded by ADR 0026 Stage B / ADR 0028**: `cp_member_id`/`cp_base_id`
+  are deleted; `cp_forward_target` no longer translates at all, since a
+  tablet's member id is always its base id. Retained for historical record. **An id-translation seam must be applied in *both* directions — and the identity
   case masks the missing one.** The tablet map speaks stable **base** node ids and a
   tablet group speaks **derived member** ids (`cp_member_id`); `cp_forward_target`
   consumed a group's leader *hint* (a member id) as a `client_route` key (base ids) —
@@ -1077,7 +1138,11 @@ cross-cutting ones. Prune/merge entries that become obsolete.
   the term is untouched); the multi-node `SimEnv` teeth is that an *isolated*
   follower's repeated pre-vote rounds leave the stable leader's term unchanged
   (without pre-vote it would ratchet the term every timeout and disrupt on heal).
-- **A two-step operation where step 1 is a cheap, always-visible metadata write and
+- **Superseded by ADR 0028**: split has no step 2 anymore — `SplitTablet` is
+  the whole operation, so this entry's specific scenario (a step-2
+  `propose_split` failure stranding step 1's mint) can no longer occur.
+  Retained for historical record; the *general* two-step-operation lesson
+  still applies elsewhere. **A two-step operation where step 1 is a cheap, always-visible metadata write and
   step 2 is the expensive, failure-prone "make it real" step must never let a
   background loop discard a step-2 failure — that silently strands step 1's
   effect forever.** `animusd`'s tablet auto-split (`auto_split_loop`) commits
@@ -1160,7 +1225,11 @@ cross-cutting ones. Prune/merge entries that become obsolete.
 - **Doc files (`CLAUDE.md`, ADRs) conflict predictably** when parallel changes
   each edit the "what remains" lists — resolve by *unioning the done-states*
   (each side is usually stale only for the *other* change's feature).
-- **`ProposeResult::Accepted` means "appended to the leader's local log," never
+- **Superseded by ADR 0028**: `propose_split_data`/`applied_split_key`/the
+  `pending`-retry map this entry discusses are all deleted along with the
+  data-plane half of split. Retained for historical record; the general
+  "`Accepted` isn't `committed`" lesson still applies (see `cp_put_local`'s
+  own confirm-by-index). **`ProposeResult::Accepted` means "appended to the leader's local log," never
   "committed" — every proposer must confirm, and a bare boolean flag isn't always
   enough to confirm the caller's *specific* request.** Fixing the auto-split
   orphan bug (the entry above) closed the case where step 2 (`propose_split`)
@@ -1221,7 +1290,10 @@ cross-cutting ones. Prune/merge entries that become obsolete.
   any retry loop wrapping a Raft write: does a bare timeout distinguish
   "definitely not accepted anywhere" from "accepted, just slow"? If not, a
   slow/contended commit path gets a retry storm instead of patience.
-  **This recurred immediately in a sibling code path** — worth treating as a
+  **This recurred immediately in a sibling code path** (superseded by ADR
+  0028 — `auto_split_loop`'s `pending` map and `propose_split_data`/
+  `propose_and_confirm_split`/`cp_split_here` no longer exist; retained for
+  historical record) — worth treating as a
   *pattern* to sweep for, not a one-off: `auto_split_loop`'s `pending` map
   (the step-2 `propose_split` retry) has the identical shape, just already
   half-fixed — `confirm_split` was already a poll-only primitive (propose and
@@ -1267,7 +1339,11 @@ cross-cutting ones. Prune/merge entries that become obsolete.
   primitives a retry loop calls into, not just the two sites a bug report
   named** — the pattern's most common instance was hiding one layer below
   where it had already been fixed twice.
-- **`auto_split_loop`'s "only the leader's host triggers" gate
+- **Superseded by ADR 0028**: `claim_auto_split`/`release_auto_split` and the
+  cluster-wide contention guard this entry describes are deleted — a
+  same-tick redundant `SplitTablet` from multiple nodes is now just a normal
+  epoch-CAS race with one clean winner, no orphan risk to guard against.
+  Retained for historical record. **`auto_split_loop`'s "only the leader's host triggers" gate
   (`ctx.edge.cp_leader(tablet)`) is *not* actually node-scoped — it is scoped
   to the shared registry, and under `--cluster N` that registry is shared by
   every node.** `ClusterEdgeState::cp_leader` scans **every** registered CP
@@ -1297,7 +1373,9 @@ cross-cutting ones. Prune/merge entries that become obsolete.
   callers by node, or does it just answer "does *anyone* in the cluster
   satisfy this" — those are silently identical in `--cluster N` and only
   diverge (bimodally) in a real one-process-per-node deployment.**
-- **An "abandon and forget" exit from a retry loop must still leave the
+- **Superseded by ADR 0028**: the abandon path + `pending` map this entry
+  describes are deleted along with the rest of the two-phase split retry
+  machinery. Retained for historical record. **An "abandon and forget" exit from a retry loop must still leave the
   cooldown state a *fresh* attempt would have set — otherwise the tablet is
   eligible again on the very next tick, not after backing off.**
   `auto_split_loop`'s pending-retry loop drops a tablet from `pending` when it

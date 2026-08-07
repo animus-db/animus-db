@@ -1,76 +1,25 @@
-//! Pure, side-effect-free decision logic for the CP data-plane's routing, id
-//! translation, and hosting/GC predicates (extracted from `lib.rs`).
+//! Pure, side-effect-free decision logic for the CP data-plane's routing and
+//! hosting/GC predicates (extracted from `lib.rs`).
 //!
 //! `animusd` is the one crate that runs real distributed-system decision logic
-//! (routing, provisioning, join-hosting, GC, id translation, split
-//! orchestration) exclusively over `ProdEnv`, with no sim/unit coverage — every
-//! `animusd` test is a real-socket integration test. This module pulls the pure
-//! *decisions* (no network/lock/disk access) out of that machinery so they can be
-//! unit-tested directly, leaving the surrounding `lib.rs` functions as thin
-//! `ProdEnv` wiring that gathers inputs and executes the decision. See the root
-//! `CLAUDE.md` engineering-practices entries this module's tests specifically
-//! guard against: the base↔member id derivation must be **flat** (stable at any
-//! split depth, not compounding through a parent), and the CP-route resolution
+//! (routing, provisioning, join-hosting, GC) exclusively over `ProdEnv`, with no
+//! sim/unit coverage — every `animusd` test is a real-socket integration test.
+//! This module pulls the pure *decisions* (no network/lock/disk access) out of
+//! that machinery so they can be unit-tested directly, leaving the surrounding
+//! `lib.rs` functions as thin `ProdEnv` wiring that gathers inputs and executes
+//! the decision. Since ADR 0026 Stage B (stream-per-tablet addressing) a
+//! tablet's CP group member id **is** simply the base `raftkv` id — the tablet
+//! axis lives in the network `stream` and the `StorageScope` prefix/range, not
+//! in a derived `NodeId` — so there is no more base↔member translation to keep
+//! flat across split depth; see the root `CLAUDE.md` engineering-practices
+//! entries for why that used to matter. The CP-route resolution below still
 //! must never forward to a non-leader while a local replica is still forming.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 
 use animus_env::NodeId;
-use animus_tablet::{Epoch, KeyRange, Tablet, TabletId};
-
-use crate::{CP_SPLIT_ID_STRIDE, TABLET};
-
-/// This node's CP group **member id** for `tablet`, derived **flatly** from its
-/// base `raftkv` id: the bootstrap tablet uses the base id; any split-created
-/// tablet uses `base + tablet * CP_SPLIT_ID_STRIDE`. Flat (always from the base
-/// id, not the parent's member id) so the derivation is identical at any split
-/// depth and matches [`cp_members_for`] — a grandchild's member is
-/// `base + grandchild * STRIDE`, not a compounding
-/// `base + parent*STRIDE + grandchild*STRIDE`, so the reconfigure loop's
-/// translated `desired` set always matches the running group's `config()`.
-pub(crate) fn cp_member_id(base: NodeId, tablet: TabletId) -> NodeId {
-    if tablet == TABLET {
-        base
-    } else {
-        base + tablet.0 * CP_SPLIT_ID_STRIDE
-    }
-}
-
-/// The inverse of [`cp_member_id`]: recover the stable **base** `raftkv` id from a
-/// tablet group **member id**. Needed wherever a group-internal id (e.g. the
-/// leader hint a local replica reports) must be resolved against state keyed by
-/// base ids (`client_route`, `Metadata.members`, `tablets[t].replicas`). For the
-/// bootstrap tablet member == base, which is why a missing reverse translation
-/// *works* there and only breaks for derived-id tablets (every provisioned table
-/// tablet and split child) — the bug class behind "no CP group leader reachable"
-/// on a healthy group.
-pub(crate) fn cp_base_id(member: NodeId, tablet: TabletId) -> NodeId {
-    if tablet == TABLET {
-        member
-    } else {
-        member - tablet.0 * CP_SPLIT_ID_STRIDE
-    }
-}
-
-/// Translate a tablet's replica set — recorded in `Metadata.tablets[t].replicas`
-/// as stable **base** `raftkv` ids (the node identities placement + failure
-/// detection speak) — into that tablet's CP **group member ids**. The bootstrap
-/// tablet's group uses the base ids directly; a split-created tablet's group uses
-/// the derived `base + tablet * CP_SPLIT_ID_STRIDE`. This is the single source of
-/// the base↔member mapping, so the reconfigure loop's `desired` matches the
-/// running group's `config()` exactly (no spurious churn) — which is why the
-/// replicated map can stay in base ids rather than being reconciled to the
-/// derived member ids.
-pub(crate) fn cp_members_for(
-    tablet: TabletId,
-    replicas: &[NodeId],
-) -> std::collections::BTreeSet<NodeId> {
-    replicas
-        .iter()
-        .map(|&base| cp_member_id(base, tablet))
-        .collect()
-}
+use animus_tablet::{Epoch, Tablet, TabletId};
 
 /// The tablet whose range contains `key`, chosen from `tablets` (already
 /// filtered to one table, ADR 0023 table-scoped routing). Iteration order
@@ -156,26 +105,33 @@ pub(crate) fn decide_cp_route(
 
 /// This node's plan for join-hosting `tablet` (the pure decision behind
 /// `cp_join_host_loop`), given its base `raftkv` id and the tablet's current
-/// replica set / epoch / range from replicated `Metadata`. `None` means "not
-/// this node's concern right now":
+/// replica set / epoch from replicated `Metadata`. `None` means "not this
+/// node's concern right now" — its base id is not in `replicas` at all.
 ///
-/// - this node's base id is not in `replicas` at all, or
-/// - the tablet is a **fresh split child** (`epoch <= Epoch::INITIAL` and a
-///   non-whole range) — its data arrives via the split hook's handoff, so
-///   starting an empty group here would lose it (ADR 0017 D1's join-vs-seed
-///   distinction).
+/// Since a single-command (control-plane-only) split moves no data — a split
+/// child's range is confined by its own `StorageScope` against the *same*
+/// already-populated shared engine, not seeded from a handoff — a fresh split
+/// child is formed exactly like a fresh whole-keyspace tablet: both get
+/// `initial_formation: true`. (Contrast the old two-phase split, where a fresh
+/// split child had to be *skipped* here and formed only via the data-plane
+/// split hook's handoff, or an empty join-host start would have lost its data.)
 ///
-/// This does **not** perform the per-node `minted` dedup claim — that is
-/// stateful (a mutable claim set) and stays in the caller, applied only to
-/// tablets this returns `Some` for.
+/// This does **not** perform the per-node `minted` dedup claim (stateful, kept
+/// in the caller), nor the `StorageScope::has_data` check the caller layers on
+/// top to upgrade a *reforming-after-restart* join (this node already held
+/// this tablet's data before the process restarted, so it needs the full
+/// voter config to be able to re-elect immediately, even though `epoch` alone
+/// would suggest "joining fresh") to `initial_formation: true` — that check
+/// needs an async engine read, impure by construction, so it stays in
+/// `cp_join_host`, not here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct JoinHostPlan {
-    /// `true` — a fresh tablet forming for the first time (a `CreateTable`
-    /// tablet at `INITIAL` with the whole range, or a restart of a tablet this
-    /// node already hosts): start with the **full** voting config so a replica
-    /// can campaign with no live leader. `false` — this node is *joining* an
-    /// existing, already-led group (the reconciler placed it as a spare): start
-    /// as a quiet **non-voter** until the leader adds it.
+    /// `true` — a fresh tablet forming for the first time (whole-keyspace or a
+    /// split child — both start from data already present in the shared
+    /// engine, if any): start with the **full** voting config so a replica can
+    /// campaign with no live leader. `false` — this node is *joining* an
+    /// existing, already-led group (the reconciler placed it as a spare):
+    /// start as a quiet **non-voter** until the leader adds it.
     pub(crate) initial_formation: bool,
 }
 
@@ -183,12 +139,8 @@ pub(crate) fn plan_join_host(
     base_id: NodeId,
     replicas: &[NodeId],
     epoch: Epoch,
-    range: &KeyRange,
 ) -> Option<JoinHostPlan> {
     if !replicas.contains(&base_id) {
-        return None;
-    }
-    if epoch <= Epoch::INITIAL && *range != KeyRange::whole() {
         return None;
     }
     Some(JoinHostPlan {
@@ -218,73 +170,9 @@ pub(crate) fn tablets_to_reclaim(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use animus_tablet::KeyRange;
 
     const BASE: NodeId = 300;
-
-    // --- cp_member_id / cp_base_id -----------------------------------------
-
-    #[test]
-    fn member_id_identity_for_bootstrap_tablet() {
-        // The bootstrap tablet (id 1) hosts on the node's main env: member == base.
-        assert_eq!(cp_member_id(BASE, TABLET), BASE);
-        assert_eq!(cp_base_id(BASE, TABLET), BASE);
-    }
-
-    #[test]
-    fn member_id_derives_for_a_first_level_split() {
-        let child = TabletId(2);
-        let member = cp_member_id(BASE, child);
-        assert_eq!(member, BASE + 2 * CP_SPLIT_ID_STRIDE);
-        // Round-trips back to the base id.
-        assert_eq!(cp_base_id(member, child), BASE);
-    }
-
-    /// Depth >= 2 (root CLAUDE.md: prove a recursive derivation at depth >= 2, not
-    /// just once). A grandchild's member id must be derived **flatly** from the
-    /// base id — `base + grandchild*STRIDE` — never compounding through the
-    /// parent's already-derived member id (`parent_member + grandchild*STRIDE`),
-    /// which would diverge from `cp_members_for`'s flat translation and make the
-    /// reconfigure loop churn forever on a mismatch (the exact bug class recorded
-    /// in the root CLAUDE.md's "prove recursive invariants at depth >= 2" entry).
-    #[test]
-    fn member_id_is_flat_at_split_depth_two() {
-        let parent = TabletId(2);
-        let grandchild = TabletId(5);
-
-        let parent_member = cp_member_id(BASE, parent);
-        let grandchild_member = cp_member_id(BASE, grandchild);
-
-        // Flat: derived straight from the base id.
-        assert_eq!(grandchild_member, BASE + 5 * CP_SPLIT_ID_STRIDE);
-        // NOT compounding through the parent's member id.
-        assert_ne!(
-            grandchild_member,
-            parent_member + grandchild.0 * CP_SPLIT_ID_STRIDE
-        );
-        // Both still invert correctly back to the same base id.
-        assert_eq!(cp_base_id(parent_member, parent), BASE);
-        assert_eq!(cp_base_id(grandchild_member, grandchild), BASE);
-    }
-
-    #[test]
-    fn members_for_translates_a_whole_replica_set() {
-        let replicas = [300, 301, 302];
-        let bootstrap = cp_members_for(TABLET, &replicas);
-        assert_eq!(
-            bootstrap,
-            [300, 301, 302]
-                .into_iter()
-                .collect::<std::collections::BTreeSet<_>>()
-        );
-
-        let split_child = TabletId(2);
-        let derived = cp_members_for(split_child, &replicas);
-        let expected: std::collections::BTreeSet<NodeId> = replicas
-            .iter()
-            .map(|&b| b + 2 * CP_SPLIT_ID_STRIDE)
-            .collect();
-        assert_eq!(derived, expected);
-    }
 
     // --- tablet_for_key ------------------------------------------------------
 
@@ -429,24 +317,22 @@ mod tests {
 
     #[test]
     fn join_host_skips_a_non_replica() {
-        assert_eq!(
-            plan_join_host(BASE, &[301, 302], Epoch::INITIAL, &KeyRange::whole()),
-            None
-        );
+        assert_eq!(plan_join_host(BASE, &[301, 302], Epoch::INITIAL), None);
     }
 
+    /// A tablet at `Epoch::INITIAL` always forms fresh with the full voter
+    /// config — whether it's a genuinely new whole-keyspace tablet or a
+    /// single-command split's child. Unlike the old two-phase split (where a
+    /// fresh split child had to be *skipped* here and formed only via the
+    /// data-plane split hook's handoff), a single-command split moves no
+    /// data — a split child's `StorageScope` is simply confined to its own
+    /// range against the same already-populated shared engine — so there is
+    /// no `range` parameter left to distinguish the two cases by; both are
+    /// the same decision.
     #[test]
-    fn join_host_skips_a_fresh_split_child() {
-        // INITIAL epoch + a non-whole range: this node's data arrives via the
-        // split hook's handoff, not an empty join-host start.
-        let range = KeyRange::new(b"m".to_vec(), None);
-        assert_eq!(plan_join_host(BASE, &[BASE], Epoch::INITIAL, &range), None);
-    }
-
-    #[test]
-    fn join_host_forms_a_fresh_whole_keyspace_tablet() {
+    fn join_host_forms_a_fresh_tablet_whole_or_split_child_the_same_way() {
         assert_eq!(
-            plan_join_host(BASE, &[BASE], Epoch::INITIAL, &KeyRange::whole()),
+            plan_join_host(BASE, &[BASE], Epoch::INITIAL),
             Some(JoinHostPlan {
                 initial_formation: true
             })
@@ -455,12 +341,10 @@ mod tests {
 
     #[test]
     fn join_host_joins_an_existing_group_as_non_voter() {
-        // A bumped epoch means the reconciler placed this node into an existing,
-        // already-led group — even a non-whole range is fine here (unlike the
-        // INITIAL case, this is not a fresh split child).
-        let range = KeyRange::new(b"m".to_vec(), None);
+        // A bumped epoch means the reconciler placed this node into an
+        // existing, already-led group.
         assert_eq!(
-            plan_join_host(BASE, &[BASE], Epoch::INITIAL.next(), &range),
+            plan_join_host(BASE, &[BASE], Epoch::INITIAL.next()),
             Some(JoinHostPlan {
                 initial_formation: false
             })

@@ -99,338 +99,82 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   non-leader — including itself — during election). **Every data op — the wire edges
   (DynamoDB, CQL) and the plain-client `Put`/`Get`/`Scan`/`Delete` — routes through
   these.** The optional `table` no longer selects a plane (there is only the CP
-  plane); the single CP group covers the whole keyspace. The edges create their
-  tables in `ReplicationMode::Cp` (the mode is recorded for truthfulness, but
-  routing no longer depends on it). A just-proposed write is confirmed via a **local**
-  read on the leader (not a quorum barrier — the leader applies only after a quorum
-  commit + WAL fsync, so a local read reflecting the value means it's durable; a
-  per-write barrier would not scale under concurrent load). The confirm loop polls
-  at a **fine adaptive interval** (`CP_CONFIRM_POLL_INIT` ~200µs, doubling to a
-  `CP_CONFIRM_POLL_MAX` 5ms ceiling), *not* the coarse 50ms `SCHEMA_POLL_INTERVAL` —
-  paired with cp-data's wake-on-propose, a lone write returns in ~1ms instead of
-  eating a fixed 50ms floor (`cp_plane.rs::single_write_latency_is_low`). At node start a node
-  hosts the **bootstrap CP group** spanning the first `min(N, MAX_REPLICATION_FACTOR)`
-  nodes' `raftkv` ids; a **tablet split** (Phase 2.2/2.4) then stands up additional
-  co-resident groups, each backed by its own `LsmEngine` or `MemoryEngine` per
-  [`StorageBackend`] (an enum-wrapped `CpGroup`), keyed by `TabletId` in the edge
-  registry (Phase 2.1 tablet-keyed routing). `tests/cp_plane.rs` (in-process
-  round-trip) + `tests/cp_cross_process.rs` (forwarding) + the dynamo/cql wire +
-  schema tests all exercise the CP path. **Split tablets are re-hosted on restart**
-  (#2): each node durably records the split tablets it hosts in a **`cp-hosted`
-  marker** (`load_hosted_cp`/`save_hosted_cp` on the `raftkv` env disk — genuinely
-  *local* state: which co-resident `db-t{id}-` engines physically exist here, not
-  derivable from the tablet map, which records placement in stable base ids). At
-  start `start_with` reads the marker, pre-populates the per-node `minted` set from
-  it (so the bootstrap group re-applying a committed `Split` on WAL recovery does
-  **not** mint the sibling twice — split crash-idempotency), and spawns `cp_rehost`
-  for each recorded tablet: mint its sibling, recover its `db-t{id}-` engine +
-  `raftkv.wal` via `start_seeded` with an **empty** seed (the data is already on
-  disk — the seed only ever carries a *fresh* split's handoff), register it, and
-  re-publish the sibling's new address. `tests/cp_rehost.rs` (split a tablet, restart
-  the cluster, the upper-range key survives on the re-hosted group). **Address
-  publish is cross-process** now: the split-seed + re-host paths publish via
-  `ClientCtx::register_cp_addr`, which relays the registration to the control leader
-  through `client_route` (a follower can't propose directly) — so the `ctx` is built
-  before the CP hosting block and threaded into the hook + re-host. **Hosting is
-  driven by the tablet map too** (D1): a per-node **join-host loop** stands up an
-  *empty* co-resident group for any tablet newly *placed* on this node by the
-  reconciler (`epoch > INITIAL`, so it never starts a fresh split child empty), which
-  the leader then catches up via `InstallSnapshot` — closing the auto-replace cascade.
-  All hosting state is bundled in a **`CpHostCtx`** so every group (bootstrap, split
-  child, re-hosted, joined) carries a split hook, enabling **deep splits** (D3: a
-  split tablet can be split again); member ids derive **flatly** from the base id
-  (`cp_member_id`) at any depth. **Each node can host at most `CP_SIBLING_POOL + 1`
-  co-resident tablets** (the bootstrap group + one pre-bound listener-pool slot per
-  split child); the pool is **64**, sized for bulk-seed→auto-split sharding tests.
-  Exceeding it panics the split-hook task (`Coresident::sibling`), leaving the
-  over-cap tablet **leaderless** (writes to its range hang) — so keep the pool ahead
-  of the tablet count. (Found via bulk-seed: a pool of 4 left a 6th tablet leaderless;
-  the `ProdEnv` "send to unknown peer" log of the missing split member is the
-  downstream symptom, now at `debug`.)
-  **A split's two steps (control-plane `SplitTablet` metadata, then the data-plane
-  `propose_split`) are not atomic, and `auto_split_loop` now accounts for that**: a
-  step-2 failure (leader moved, no route — real under bulk-write-induced leader
-  churn) used to be silently discarded, orphaning the tablet forever (visible in
-  `Metadata.tablets` with a real range/replicas, but `leader: unknown` — no CP Raft
-  group anywhere, so any read/write to its range hangs) and, since the source
-  tablet's data never actually shrank, causing the loop to mint *more* orphans on
-  later ticks. The loop now tracks step-1-committed/step-2-pending tablets in a
-  `pending` map, retries step 2 with the same split key every tick until it
-  succeeds (`propose_split` is idempotent per group, so this is always safe), and
-  skips a tablet for a *fresh* split while it's already pending. `ClientCtx::trigger_split`
-  (used by the one-shot admin/manual `SplitTablet` request) is unchanged — a human
-  or script driving it can decide to retry on error — the factored
-  `propose_split_metadata`/`propose_split_data` steps exist so `auto_split_loop` can
-  drive the retry itself instead of going through the combined one-shot helper.
-  **`propose_split_data` also confirms the split before reporting success** —
-  `leader.propose_split(split_key)` returning `ProposeResult::Accepted` only means
-  the entry was appended to the leader's local log, not that it committed (the same
-  caveat as every other CP-data write; see `cp_put_local`'s doc), and under leader
-  churn an accepted-but-uncommitted `Split` is silently truncated. Trusting
-  `Accepted` alone was a second, independent bug behind the same "tablet exists in
-  metadata but never gets a CP group" symptom the `pending` map above was built to
-  fix — a step-2 "success" that wasn't real never got queued for retry either. Fixed
-  by polling `RaftKvNode::applied_split_key()` (a confirm-by-key primitive, mirroring
-  `engine_applied_index`) via the new `confirm_split` helper, comparing the *exact*
-  key — not just "has this group split at all" — because under `--cluster N`'s
-  shared edge state two nodes' auto-split loops can independently compute a
-  *different* median for the same tablet in the same tick, and the group can only
-  split once: a bare boolean would let the loser's confirm wrongly pass. `cp_split_here`
-  (the forwarded-split handler) gets the same confirmation. Diagnosed with OpenTelemetry
-  tracing added specifically for this (spans on `auto_split`/`split_metadata`/
-  `split_data`/`cp_split_seed`/`cp_split_hook`) — the "accepted" log line looked
-  identical whether the split was real or not; only correlating it against
-  `/admin/raftkv` (no group ever appeared for several "accepted" splits) and the
-  split-hook trace (it never fired for those) surfaced the gap. The `pending` map's
-  retry also needed a matching update: a tablet whose own key lost the same-tick
-  race must be dropped from `pending` (not retried forever — the group will never
-  apply that key), detected via any local replica's `applied_split_key()` differing
-  from the pending key.
-  **The `pending` map's retry also had a retry-amplification bug, the split-path
-  sibling of the bulk-seeder's (see the root `CLAUDE.md` engineering-practices
-  entry):** it called `propose_split_data` (propose **and** confirm) fresh on
-  every ~2s tick regardless of whether the previous attempt reached `Accepted`.
-  `ProposeResult::Accepted` only means the `Split` entry reached the leader's
-  log, not that it committed, so a bare confirm-timeout usually means "still
-  committing" — proposing again appends a redundant `Split` entry, safe (splits
-  are idempotent at apply time) but wasteful, doubling WAL/replication load
-  under exactly the slow/contended conditions that caused the timeout in the
-  first place. Fixed by `propose_and_confirm_split(leader, split_key,
-  confirm_rounds)`: the pending-retry call (and `cp_split_here`, the
-  cross-process forwarded-split handler, which can't tell whether its caller
-  is about to retry) pass `confirm_rounds: 2`, polling the already-accepted
-  entry a second time before the next tick would otherwise re-propose. The
-  one-shot `trigger_split`/fresh-trigger call sites keep `confirm_rounds: 1`
-  (`propose_split_data`'s default) — byte-identical behavior there.
-- **`ClientCtx::propose_and_await` — the generic schema-proposal helper
-  `propose_split_metadata` (step 1 of a split), `register_cp_addr`,
-  `create_table_schema`, `replace_table_schema`, and `drop_table`/
-  `drop_table_schema` all sit on top of — had the same retry-amplification
-  shape as the step-2 `propose_split_data` bug above, just one layer further
-  down.** It called `propose_schema` fresh on every 50ms poll tick regardless
-  of whether the prior call had already reached a leader's log, for up to the
-  full 10s `SCHEMA_COMMIT_TIMEOUT` — up to ~200 duplicate proposals per call
-  (harmless to apply for an idempotent command like `SplitTablet`, but wasted
-  WAL/replication work). Under `--auto-split`'s per-node trigger loop running
-  concurrently on every node in `--cluster N` (see the topology-map entry on
-  `auto_split_loop`), this is what turned a transient slow commit into a
-  live-observed 10-minute-long stall of `SplitTablet` metadata never
-  committing at all — three nodes' retry storms flooding the control-plane
-  Raft log faster than one 10s window could drain. Fixed by having
-  `propose_schema` return whether it believes the command reached a leader's
-  log, and `propose_and_await` only resubmitting immediately when it knows the
-  prior attempt went nowhere (otherwise backing off `SCHEMA_PROPOSE_PATIENCE`,
-  1s). See the root `CLAUDE.md` engineering-practices entry for the general
-  lesson (sweep the *shared primitive*, not just the two call sites a bug
-  report named).
-- **`auto_split_loop`'s "only the leader's host triggers" gate
-  (`ctx.edge.cp_leader(tablet)`) is not node-scoped under `--cluster N`**:
-  `ClusterEdgeState::cp_leader` returns the first registered handle for a
-  tablet that `is_leader()` across the *whole* shared `raftkv` map, with no
-  notion of which node is asking — so every node's `auto_split_loop` task sees
-  `Some(leader)` simultaneously, and all of them can independently propose a
-  fresh (possibly differently-keyed) `SplitTablet` for the same source tablet
-  in the same tick. Since a source tablet's underlying CP group can only win
-  its one-time data-plane split for a single key, every losing proposer's
-  metadata-only tablet is permanently orphaned — live-observed as 3
-  near-simultaneous step-1 commit failures for one tablet, and as a tablet's
-  split id churning upward forever (an endless fresh-attempt/abandon cycle).
-  Fixed with a **cluster-wide** (not per-node) claim,
-  `ClusterEdgeState::claim_auto_split`/`release_auto_split`, that a loop must
-  win before proposing a fresh split for a tablet — held through step 1, step
-  2, and any pending retry, released only on a terminal outcome (success,
-  step-1 failure, or abandonment). See the root `CLAUDE.md` engineering-
-  practices entry for the general lesson (a shared-registry "does anyone
-  satisfy this" query is not the same as a per-node gate, and the two only
-  diverge under `--cluster N`).
-- **The `pending` map's abandon path (see above) didn't refresh
-  `last_triggered`, so an abandoned tablet was immediately re-eligible for a
-  brand-new fresh split on the very next tick** instead of backing off for
-  `AUTO_SPLIT_COOLDOWN` like a normal fresh trigger does. Under repeated
-  contention on a tablet this let its split id climb every tick indefinitely
-  (8→10→12…), each attempt abandoned in turn. Fixed by inserting into
-  `last_triggered` on abandon too — see the root `CLAUDE.md`
-  engineering-practices entry for the general lesson (a "give up" exit from a
-  retry loop must leave the same rate-limit state a normal successful cycle
-  would).
-- **The "abandon" branch above stopped a losing proposer from retrying forever,
-  but never cleaned up the metadata-only tablet id its own step 1 had already
-  minted — that id was a *permanent* orphan, not just a transient one.** The
-  root cause was one layer down, in `animus-control`: `MetaCommand::SplitTablet`
-  applied unconditionally as long as `split_key` fell inside the source
-  tablet's *current* range, with no CAS on its epoch (unlike its sibling
-  `CasTabletReplicas`) — so two proposers racing to split the same tablet at
-  the same epoch (two `auto_split_loop` instances despite `claim_auto_split`
-  serializing *auto-triggered* attempts against each other, or any other racing
-  caller) could both have their `SplitTablet` commit, each minting a `new_id`.
-  Only one can ever get a real CP group (the tablet's own per-group Raft
-  applies at most one `Split`, ever), so the loser's `new_id` was permanently
-  `leader: unknown` — present in `Metadata.tablets`, invisible in
-  `/admin/raftkv`, unreachable, forever (live-observed: two such tablets under
-  `--cluster 3 --auto-split 2000` bulk-seed). Fixed at the source: `SplitTablet`
-  now takes `expected_epoch` and is rejected on mismatch, exactly like
-  `CasTabletReplicas` — so the loser's `propose_split_metadata` (step 1) itself
-  now fails cleanly, hitting the *existing* "nothing was allocated, no orphan to
-  track" path, and no second `new_id` is ever minted **for a same-epoch,
-  concurrent race**. See the root `CLAUDE.md` engineering-practices entry (a new
-  command mutating a resource another command already CASes needs the same
-  guard) and `animus-control/CLAUDE.md`'s `SplitTablet` note.
-  **This did not close the *sequential* case, and permanent orphans kept
-  accumulating live under sustained `--auto-split` bulk-seed + leader churn.**
-  The epoch CAS only rejects a second mint at the *same* epoch; nothing stops
-  a *later* fresh trigger from minting a second child once the first mint's
-  own epoch bump has already advanced the source's epoch — legitimate at
-  propose time, but still fatal, since the underlying CP-data group can only
-  ever apply one real `Split`. Whichever key doesn't win hits the abandon
-  branch above, which correctly stops retrying but (as originally written)
-  never removed the dead mint — so under real leader churn, `Metadata.tablets`
-  accumulated permanent, unreachable orphans one abandonment at a time
-  (live-observed: two orphans within ~10 minutes of one `--cluster 3
-  --auto-split 2000` run, growing without bound). Fixed with
-  `MetaCommand::DropOrphanTablet` (CAS-gated like its siblings; always safe,
-  since a mint that never got `cp_split_seed`'d never held data) — both the
-  abandon branch here and `trigger_split`'s own step-2 failure path (the
-  one-shot manual/admin trigger, which can hit the identical "a different key
-  already won" outcome) call `ClientCtx::drop_orphan_tablet` once they've
-  confirmed via `applied_split_key()` that their own key lost. Deterministic
-  regression (no timing race needed): `tests/cp_plane.rs::
-  a_lost_split_race_does_not_leave_a_permanent_orphan` drives two *sequential*
-  manual splits of the same tablet — the second's `split_key` is chosen
-  strictly inside the source's already-narrowed post-first-split range, so its
-  step 2 can never confirm — and asserts the resulting orphan is GC'd, not left
-  dangling. The genuine live race (via `auto_split_loop`, needing real leader
-  churn) is exercised only by the unit-tested pure CAS/apply logic in
-  `animus-control`, per this file's "extract the invariant into a pure
-  function" convention — reproducing the *exact* live timing on demand isn't
-  tractable, but the sequential-mint precondition it depends on is.
-  **Superseded by "a group can be split more than once" below**: a group no
-  longer "can only ever apply one real `Split`," so two *sequential* manual
-  splits of the same tablet (this entry's original repro) now both succeed
-  instead of the second permanently failing — that specific reproduction
-  stopped demonstrating a bug. The underlying hazard (a proposal's key no
-  longer matching the group's current boundary, by the time step 2 is
-  attempted) is still real and still needs the same GC, just via a different
-  precondition: `applied_split_key()` was renamed `current_split_bound()` (see
-  `animus-cp-data/CLAUDE.md`), and the test was rewritten to a mechanism that's
-  still permanently unconfirmable under the new rules — a **data-plane-only**
-  `CpSplit` at a *small* key first (bypassing metadata, so it can't be
-  confirmed the normal way), then a **normal** manual split at a *larger* key:
-  metadata mints a child fine (it never heard about the first split), but the
-  data-plane boundary has already moved *below* the second key, which the
-  monotonically-narrowing CAS can never re-widen past. `drop_orphan_tablet`
-  also gained a hard safety gate on top of this (see its doc) once the
-  confirm-by-key signal became ambiguous rather than certain by construction —
-  worth reading alongside this entry.
-- **`auto_split_loop`'s `pending` retry map has no way to notice its target
-  tablet vanished out from under it — a `DROP TABLE` mid-retry left a `tablet=N
-  kind="retry"` entry retrying forever against a tablet id that will never
-  have a leader again.** `DropTableTablets` removes every tablet scoped to a
-  table in one apply, including a source tablet whose split was still pending
-  (and any child it had already minted, since a split child inherits the
-  parent's table scope — so there's no orphan left to GC here, unlike the
-  entry above). But nothing told the *retry loop* the entry it's holding is
-  now pointless: the retry call resolves "no CP group leader reachable" (a
-  routing failure over a tablet id absent from `Metadata`, not the "different
-  key won" case the abandon check above is built to detect — `local_cp(tablet)`
-  returns `None` for an unregistered id, so `abandoned` stays `false`), which
-  the loop treats as "still committing, retry next tick" — forever, one
-  routing-timeout round trip per tick, live-observed continuing for minutes
-  after the table was dropped. Fixed with the obvious guard: before retrying,
-  check whether `tablet` is still in `ctx.raft.metadata().tablets` at all; if
-  not, give up (no GC needed, no cooldown bookkeeping needed — a dropped id
-  never reappears as a fresh-split candidate, since the fresh-scan iterates
-  `Metadata.tablets.keys()`). **No dedicated regression test**: unlike the
-  entries above, there's no black-box-observable difference between "gave up"
-  and "kept quietly retrying forever" other than wasted CPU/network and log
-  noise — no counter is exposed to assert against, and the fix itself is a
-  one-line existence check with no branching to get subtly wrong. Verified by
-  code review + the full existing `cp_plane.rs`/`drop_table_gc.rs` suites
-  staying green, not by a new test.
-- **Once a group can split more than once, `drop_orphan_tablet`'s caller-side
-  signal is a heuristic, not a certainty — so `drop_orphan_tablet` itself
-  gained a hard, independent safety gate, and no longer trusts the caller
-  alone.** Before successive splits, "the group's applied key no longer equals
-  mine" meant "mine definitely lost" — a group could only ever apply one real
-  `Split`, so there was nothing else it could mean. Once a group can split
-  again, `current_split_bound` no longer equals a key `K` either because `K`
-  genuinely lost, *or* because `K` won earlier and a **later** split has since
-  narrowed past it (see `animus-cp-data/CLAUDE.md`'s note on why that
-  ambiguity is an intentional, accepted tradeoff for keeping this O(1) state
-  instead of an ever-growing history). Both `auto_split_loop`'s abandon branch
-  and `trigger_split`'s step-2 failure path only ever produce that ambiguous
-  signal now — calling `drop_orphan_tablet` on a tablet that's ambiguous-but-
-  actually-alive would delete a live tablet's metadata while it's still
-  serving real data, which is a categorically worse outcome than the orphan
-  pileup this mechanism exists to fix. `drop_orphan_tablet` therefore checks,
-  before touching anything: does *this node* still have a locally registered,
-  live CP group for the tablet (`ctx.edge.local_cp(tablet).is_some()`)? The
-  split hook mints a member on **every** original replica when a split
-  genuinely applies (`cp_split_seed`), so if the tablet really was seeded, this
-  node — one of the original replicas — has a handle for it, regardless of
-  what the ambiguous signal said. If it does, skip the drop entirely (log and
-  return) — the worst case of a wrong call *into* `drop_orphan_tablet` is now
-  "skip a cleanup that would've been safe," the same tolerated "orphan lingers
-  a bit longer" behavior from before any GC existed, never a deleted-while-
-  alive tablet. No dedicated regression test for the gate itself (same
-  reasoning as the "no way to notice its target tablet vanished" entry above —
-  no clean black-box signal to assert a *skipped* drop against without
-  engineering the exact live-hosting race, which needs real leader-churn
-  timing); `a_lost_split_race_does_not_leave_a_permanent_orphan` exercises the
-  gate's *other* branch (nothing hosted → the drop proceeds).
-- **A `RaftKvNode` group used to apply at most one `Split`, *ever* —
-  `auto_split_loop` had to permanently exclude an already-split tablet from
-  fresh-split candidacy, which just moved the real problem (a heavily-loaded
-  lineage eventually running out of room to shard) one step later instead of
-  fixing it.** The original guard (`leader.applied_split_key().is_some()`
-  before the `hot`/`local_pairs` work) was a necessary stopgap at the time — a
-  bootstrap or once-split tablet that kept growing re-tripped the threshold
-  every cooldown window, and since step 2 (`propose_split`) could never confirm
-  a second split against an already-split group, every attempt burned a full
-  `CLIENT_TIMEOUT` before abandoning, mint-ing a brand-new orphan tablet id
-  each time (live-reproduced with `--cluster 3 --auto-split 2000` under a
-  sustained bulk seed: 13 tablets in metadata, only 3 with a real CP group).
-  Excluding an already-split tablet forever fixed the immediate symptom, but
-  the underlying "at most once, ever" invariant was always the actual bug — as
-  this file used to note as a residual limitation. It's since been lifted (see
-  `animus-cp-data/CLAUDE.md`'s "a group can be split more than once" entry): a
-  `Split` is now valid whenever its key is strictly less than the group's
-  *current* boundary, which a growing, already-once-split tablet can always
-  satisfy again as it keeps regrowing. **The permanent-exclusion guard is
-  therefore gone** — `is_fresh_split_candidate`'s existing `pending`/cooldown
-  exclusion is the only gate needed now (don't retrigger while a split for this
-  tablet is already in flight or within `AUTO_SPLIT_COOLDOWN`); nothing gates
-  on split history anymore. Regression:
-  `tests/cp_plane.rs::already_split_tablet_splits_again_once_it_regrows`
-  (split once at a low threshold, regrow the *original* tablet's still-open
-  lower range specifically, assert it splits *again* rather than staying
-  frozen, then assert every key across both rounds is still reachable).
+  plane). The edges create their tables in `ReplicationMode::Cp` (the mode is
+  recorded for truthfulness, but routing no longer depends on it). A just-proposed
+  write is confirmed via a **local** read on the leader (not a quorum barrier —
+  the leader applies only after a quorum commit + WAL fsync, so a local read
+  reflecting the value means it's durable; a per-write barrier would not scale
+  under concurrent load). The confirm loop polls at a **fine adaptive interval**
+  (`CP_CONFIRM_POLL_INIT` ~200µs, doubling to a `CP_CONFIRM_POLL_MAX` 5ms
+  ceiling), *not* the coarse 50ms `SCHEMA_POLL_INTERVAL` — paired with cp-data's
+  wake-on-propose, a lone write returns in ~1ms instead of eating a fixed 50ms
+  floor (`cp_plane.rs::single_write_latency_is_low`). Every table's tablet(s) are
+  keyed by `TabletId` in the edge registry (`ClusterEdgeState`); a fresh table's
+  first tablet, a split-minted sibling, and a reconciler-placed replacement all
+  reach it the same way — the per-node **join-host loop** (below). `tests/cp_plane.rs`
+  (in-process round-trip) + `tests/cp_cross_process.rs` (forwarding) + the
+  dynamo/cql wire + schema tests all exercise the CP path.
+- **Tablet split (ADR 0028) is a single, atomic control-plane command — there
+  is no data-plane half.** Since every tablet a node hosts shares one
+  `raftkv` env (ADR 0026 Stage B, stream-addressed) and one shared storage
+  engine confined per-tablet by `StorageScope` (ADR 0026/0028), `ClientCtx::
+  trigger_split` just proposes `MetaCommand::SplitTablet` (epoch-CAS gated
+  exactly like `CasTabletReplicas`) and waits for it to commit — the source
+  tablet's range narrows and a new sibling tablet is minted covering the
+  upper range, both immediately servable from the same already-populated
+  engine. Commit of this one command *is* the whole operation: there is no
+  second step to fail independently, so a metadata-only, leaderless orphan
+  tablet is now **structurally impossible** — an entire class of bugs this
+  file used to document at length (two-phase split failure, `Coresident`
+  sibling-pool exhaustion, derived member ids, a `pending`-retry map, a
+  cluster-wide auto-split claim, `DropOrphanTablet` cleanup) no longer has
+  any mechanism left to apply to. That history is preserved in the root
+  `CLAUDE.md` Engineering Practices section and ADR 0017's original text for
+  archaeology. `animus-cp-data/CLAUDE.md` covers `StorageScope`/fencing/stream
+  addressing; the per-node hosting mechanics are the join-host loop entry
+  below; `auto_split_loop`'s current (single-step) shape is documented at its
+  definition in `lib.rs`.
 - **The cluster's members are the CP `raftkv` nodes, not the control ids.** The
   control ids `0..N` are only the Raft *consensus group* for metadata; `bootstrap`
   (leader-only, idempotent) registers the **raftkv ids** (`300+i`) as `Active`
-  `Metadata` members and records the single bootstrap **CP tablet** (whole keyspace)
-  placed on the first `min(N, MAX_REPLICATION_FACTOR)` of them — the same set the CP
-  group spans in `start_with`. This keeps `metadata().tablets`/`status` meaningful
-  and gives dynamic CP reconfigure a hook (`tablets[t].replicas`). **Data-node
-  failure detection is now wired over `ProdEnv`** (#3): every node spawns
+  `Metadata` members. This keeps `metadata().members`/`status` meaningful and
+  gives dynamic CP reconfigure a hook (`tablets[t].replicas`). **Data-node
+  failure detection is wired over `ProdEnv`**: every node spawns
   `heartbeat_loop` on its `raftkv` env, heartbeating the control group *as its
   `raftkv` member id*, so the control leader's `detect_loop` marks a crashed CP node
   `Down` (`tests/cp_reconfigure.rs::data_node_failure_is_detected`). And **each
-  CP-hosting node runs `cp_reconfigure_loop`** (#3 / ADR 0017 Stage C): for every
-  tablet whose group it leads, it pulls `tablets[t].replicas`, translates base ids to
-  the group's member ids via `cp_members_for` (bootstrap tablet = base ids; a split
-  tablet = `base + tablet * CP_SPLIT_ID_STRIDE`, matching `cp_split_seed` — so the
-  replicated map can stay in base ids without reconciling to derived ids, #4), and
-  takes one single-server `reconfigure_step` toward it
+  CP-hosting node runs `cp_reconfigure_loop`**: for every tablet whose group it
+  leads, it pulls `tablets[t].replicas` — since ADR 0026 Stage B a tablet's group
+  member id *is* simply the base `raftkv` id, so the replica set needs no
+  translation — and takes one single-server `reconfigure_step` toward it
   (`tests/cp_reconfigure.rs::cp_group_follows_tablet_replica_set`: dropping a follower
-  from the replica set reconfigures the group's voters down). **The full cascade is
-  closed** (D1): `bootstrap` attaches a label-free RF `PlacementPolicy`, so on a `Down`
-  replica the reconciler picks an Active spare, the spare's join-host loop stands up an
-  empty group, and the leader adds + catches it up — auto-replacing the dead replica
-  end to end (`tests/cp_reconfigure.rs::failure_auto_replaces_replica_onto_spare`). The
-  v0 heartbeat/anti-entropy/hinted-handoff loops and the `serve_replica` data role are
-  gone; the control-plane mechanisms (failure detection, placement) remain sim-proven
-  in `animus-control`. **Small remainder:** new-group ids are derived, not
-  control-plane-allocated (fine for realistic clusters).
+  from the replica set reconfigures the group's voters down). **This loop
+  deliberately polls faster than the control plane's own policy `reconcile_loop`**
+  (`CP_RECONFIGURE_INTERVAL` = 150ms vs. `RECONCILE_INTERVAL` = 500ms, plus jitter)
+  — a manual/operator replica-set change is a one-shot race between the two, and
+  without the faster cadence the reconciler could win every time and silently
+  revert the change (see the root `CLAUDE.md` engineering-practices entry). **The
+  full failure→placement→reconfigure cascade is closed**: `bootstrap` attaches a
+  label-free RF `PlacementPolicy`, so on a `Down` replica the reconciler picks an
+  Active spare, the spare's join-host loop stands up an empty group, and the leader
+  adds + catches it up — auto-replacing the dead replica end to end
+  (`tests/cp_reconfigure.rs::failure_auto_replaces_replica_onto_spare`).
+- **The per-node CP join-host loop** (`cp_join_host_loop`/`cp_join_host`) is the
+  single unified formation path for every tablet a node ever hosts — a fresh
+  table's first tablet, a split-minted sibling, and a reconciler-placed
+  replacement all go through it the same way: `topology::plan_join_host`
+  decides whether this node is forming fresh (`Epoch::INITIAL` — full voter
+  config, so a replica can campaign with no live leader) or joining an
+  existing, already-led group (a bumped epoch — quiet non-voter until the
+  leader adds it); `cp_join_host` layers on the one thing the pure decision
+  can't do (an async engine read): `StorageScope::has_data` upgrades a
+  *restart* of a tablet this node already hosts to `initial_formation` too
+  (WAL recovery alone doesn't restore voter status from a non-voter start).
+  Dedup is a per-node in-memory `minted` claim set (reset on restart, which
+  is fine — the loop just re-discovers every tablet to host from replicated
+  `Metadata` and re-forms each from the shared engine's durable data), never
+  the shared `--cluster N` edge (which would report another node's just-hosted
+  group and starve this node's own).
 - **Drop-table GC (ADR 0024) is the join-host loop's dual.** The real drop sink is
   `ClientCtx::drop_table` (CQL `DROP TABLE` + admin `/admin/data/drop-table`):
   `DropTableSchema` then `DropTableTablets`. **`drop_table_schema` stays
@@ -440,13 +184,15 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   drop-then-recreate could strand the table schema-less if a crash landed between
   the two commands — and an ALTER must never GC data. The per-node `cp_gc_loop` then reclaims any tablet in this
   node's `minted` set that is absent from `Metadata.tablets`: unregister *this
-  node's* handle (`unregister_raftkv(tablet, member)` — the shared `--cluster N`
-  edge holds every node's handles, so match by the handle env's member id),
-  `CpGroup::shutdown()` + wait `is_stopped()` (never delete under a live driver;
-  on timeout re-register and retry a later tick), delete `db-`/`db-t{id}-*` +
-  `raftkv.wal*` via the group env's `Disk::list`/`remove`, `shutdown_tasks()` a
-  sibling env (never `shutdown()` — that drains the shared pool), prune the
-  `cp-hosted` marker, release `minted` last. Guards worth keeping: skip while
+  node's* handle (`unregister_raftkv(tablet, base_id)` — the shared `--cluster N`
+  edge holds every node's handles, so match by the handle env's node id),
+  `CpGroup::shutdown()` + wait `is_stopped()` (never touch data under a live
+  driver; on timeout re-register and retry a later tick), then
+  **`RaftKvNode::erase_scope()`** — tombstone every key in the tablet's own
+  `StorageScope` out of the node's *shared* engine (never a file delete, since
+  ADR 0026/0028 means the engine isn't this tablet's alone) — and delete its
+  own per-tablet WAL file (`animus_cp_data::wal_file(tablet)`). Release
+  `minted` last. Guards worth keeping: skip while
   `last_applied() == 0` (pre-recovery metadata is empty ⇒ reads as
   "everything dropped"), and skip a minted-but-unregistered tablet (stand-up in
   flight). **Drop + GC are convergent, not one-shot**: a restarted control
@@ -458,21 +204,23 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   *bimodal* failure: works when the connected node happens to be the control
   leader, silently times out ("did not commit") when it must relay
   (`tests/drop_table_gc.rs` caught exactly this for `DropTableTablets`).
-- **The CP group is durable by default**: each hosting node's `RaftKvNode` is
-  backed by the on-disk `LsmEngine` opened over its **raftkv** `ProdEnv`
-  (`StorageBackend::Lsm`), so a value acked to a client (Raft-committed + WAL-fsynced
-  before the ack) survives a process restart (the LSM + Raft WAL recover on reopen).
+- **The CP group is durable by default**: a node opens **one shared** `LsmEngine`
+  over its **raftkv** `ProdEnv` at start (`StorageBackend::Lsm`), cloned into every
+  tablet's `RaftKvNode` (ADR 0026/0028) — so a value acked to a client
+  (Raft-committed + WAL-fsynced before the ack) survives a process restart (the
+  engine + each tablet's own Raft WAL, `raftkv.wal.<tablet>`, recover on reopen).
   The engine's files use a **flat filename prefix** (`LSM_PREFIX = "db-"`), *not* a
   subdirectory — `ProdEnv`'s disk opens files directly under the role's data dir and
   does not create intermediate directories, so a slash-bearing prefix (e.g. `"db/"`)
   would fail to create the files. `--ephemeral` (or `StorageBackend::Memory`) selects
-  the volatile `MemoryEngine` instead (the `CpGroup` enum wraps either), for dev runs
-  that intentionally start empty. `start`/`start_cluster`/`run_node` default to the
-  durable backend; `start_with`/`start_cluster_with`/`run_node_with` take an explicit
-  `StorageBackend`. These are **async + fallible** (opening the LSM is async and can
-  fail), so the node-start entry points return `io::Result`. (`tests/durable_restart.rs`
-  proves a client write survives a restart on the LSM backend and is lost on the
-  memory backend; `tests/self_heal.rs` is now just a concurrent-load smoke test.)
+  the volatile `MemoryEngine` instead (the `SharedEngine`/`CpGroup` enums wrap
+  either), for dev runs that intentionally start empty. `start`/`start_cluster`/
+  `run_node` default to the durable backend; `start_with`/`start_cluster_with`/
+  `run_node_with` take an explicit `StorageBackend`. These are **async + fallible**
+  (opening the LSM is async and can fail), so the node-start entry points return
+  `io::Result`. (`tests/durable_restart.rs` proves a client write survives a restart
+  on the LSM backend and is lost on the memory backend; `tests/self_heal.rs` is now
+  just a concurrent-load smoke test.)
 - Each node also serves a **fifth listener, the DynamoDB JSON/HTTP endpoint**
   (`RoleAddrs.dynamo`, `Node::dynamo_addr`). It is a *production-only I/O edge*
   (real tokio sockets + hand-rolled HTTP/1.1, like `ProdEnv`); below the edge it
@@ -887,11 +635,8 @@ backend), `tests/metrics_endpoint.rs` (the admin `GET /metrics` HTTP route, ADR 
 export with `control_elections_won >= 1` and `control_is_leader 1` on the leader /
 `0` on a follower), `tests/cp_plane.rs` (CP round-trip: write via one node, read via
 another — the CP group is the single source of truth), `tests/cp_cross_process.rs`
-(cross-process CP forwarding to the leader's node — including the **derived-member-id**
-regression: a *second* provisioned table's group speaks `cp_member_id`-derived ids, so
-`cp_forward_target` must translate its leader hint back to a base id via `cp_base_id`
-before the `client_route` lookup; the first table rides the bootstrap group where
-member == base and can't catch this), `tests/admin_endpoint.rs` (the
+(cross-process CP forwarding to the leader's node, incl. a second provisioned
+table's group — not just the first — forwarding correctly), `tests/admin_endpoint.rs` (the
 admin / debug interface, ADR 0020: a per-process 3-node cluster, then the read-only
 views config/status/raft/raftkv/storage·wal/metrics/health over the dedicated admin
 port + the `storage/flush` action observed via `storage/lsm`; metrics asserted on

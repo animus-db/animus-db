@@ -1,15 +1,19 @@
-//! Drop-table **data GC** end-to-end over `ProdEnv` (ADR 0024): dropping a
-//! table removes its tablets from the replicated map, and every hosting node's
-//! GC loop stops the tablet's Raft group and deletes its on-disk artifacts —
-//! the LSM `db-`/`db-t{id}-` files and the group's `raftkv.wal` — including a
-//! split child's sibling engine and its durable `cp-hosted` marker entry.
+//! Drop-table **data GC** end-to-end over `ProdEnv` (ADR 0024, updated for the
+//! shared-storage/single-command-split redesign): dropping a table removes its
+//! tablets from the replicated map, and every hosting node's GC loop stops the
+//! tablet's Raft group, tombstones its range out of the node's one shared
+//! storage engine (`RaftKvNode::erase_scope`), and deletes its own per-tablet
+//! WAL file (`raftkv.wal.<tablet>`) — there is no more per-tablet LSM engine or
+//! sibling env to delete (every tablet on a node shares one `LsmEngine`,
+//! confined by its `StorageScope`), and no more durable `cp-hosted` marker (a
+//! restart just re-discovers every tablet to host from replicated `Metadata`).
 //!
 //! Real time + sockets, so it polls with generous timeouts. The single-node
 //! test drives a **split** first (the split trigger needs the control leader
 //! and the CP leader on the same node — the documented `--cluster`/per-process
 //! routing gotcha), then asserts reclamation survives a restart (no
-//! resurrection from the marker) and that the node keeps serving fresh tables.
-//! The 3-node per-process test asserts **every replica** reclaims its files.
+//! resurrection) and that the node keeps serving fresh tables. The 3-node
+//! per-process test asserts **every replica** reclaims its own WAL file.
 
 mod support;
 
@@ -173,14 +177,13 @@ fn files_in(dir: &Path) -> Vec<String> {
     }
 }
 
-/// The tablet-group artifacts (`db-*` LSM files and the `raftkv.wal*` Raft log)
-/// present in `dir` — what the GC must delete; the `cp-hosted` marker and any
-/// other node files do not count.
-fn tablet_artifacts(dir: &Path) -> Vec<String> {
-    files_in(dir)
-        .into_iter()
-        .filter(|f| f.starts_with("db-") || f.starts_with("raftkv.wal"))
-        .collect()
+/// Whether `tablet`'s own per-tablet Raft WAL file (`raftkv.wal.<tablet>`)
+/// exists in `dir` — the node-local artifact the GC loop must delete for a
+/// dropped tablet. The LSM engine's own files are now **shared** across every
+/// tablet a node hosts (ADR 0026/0028), so their presence/absence is no
+/// longer a per-tablet signal; the WAL file is.
+fn tablet_wal_present(dir: &Path, tablet: u64) -> bool {
+    files_in(dir).contains(&animus_cp_data::wal_file(tablet))
 }
 
 /// Whether the replicated metadata (as node `n` sees it) has any tablet scoped
@@ -202,11 +205,11 @@ async fn await_true<F: Fn() -> bool>(secs: u64, what: &str, cond: F) {
 }
 
 /// Single node, LSM backend: write a table (auto-provisions its tablet on the
-/// main `raftkv` env), split it (the child lands on a sibling env with a
-/// durable `cp-hosted` marker entry), then DROP the table and watch **all** of
-/// it get reclaimed: tablets out of the map, both groups' files deleted, the
-/// marker pruned. A restart must not resurrect anything, and the node must
-/// keep serving a freshly created table afterwards.
+/// node's one shared engine), split it (the child shares the *same* engine,
+/// scoped to its own narrower range, but gets its own WAL file), then DROP the
+/// table and watch it get reclaimed: both tablets out of the map, both WAL
+/// files deleted, no hosted CP groups left. A restart must not resurrect
+/// anything, and the node must keep serving a freshly created table afterwards.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn dropped_table_data_is_reclaimed_including_split_child() {
     timeout(Duration::from_secs(120), async {
@@ -218,7 +221,7 @@ async fn dropped_table_data_is_reclaimed_including_split_child() {
         let raftkv_dir = dirs[0].join("raftkv");
 
         // Write keys across the ring; the first write auto-provisions tablet 1
-        // for table `kv` on the node's main raftkv env.
+        // for table `kv`.
         for k in [b"a".as_slice(), b"g", b"m", b"s", b"z"] {
             client_put(client, "kv", k, b"v").await;
         }
@@ -226,13 +229,14 @@ async fn dropped_table_data_is_reclaimed_including_split_child() {
             has_table_tablet(&nodes[0], "kv")
         })
         .await;
-        assert!(
-            !tablet_artifacts(&raftkv_dir).is_empty(),
-            "tablet 1's engine/WAL files exist under {raftkv_dir:?}"
-        );
+        await_true(10, "tablet 1's WAL file exists", || {
+            tablet_wal_present(&raftkv_dir, 1)
+        })
+        .await;
 
-        // Split tablet 1 at "m": the child (tablet 2) is seeded on a sibling env
-        // (`sib-2300/db-t2-*`) and recorded in the durable cp-hosted marker.
+        // Split tablet 1 at "m": a single atomic control-plane command mints
+        // tablet 2 covering the upper range, served by the *same* shared
+        // engine, with its own WAL file.
         let (s, body) = admin(
             admin_addr,
             "POST",
@@ -241,14 +245,8 @@ async fn dropped_table_data_is_reclaimed_including_split_child() {
         )
         .await;
         assert_eq!(s, 200, "split trigger: {body}");
-        let sib_dir = raftkv_dir.join("sib-2300");
-        await_true(20, "split child hosted with on-disk artifacts", || {
-            nodes[0].metadata().tablets.len() >= 2 && !tablet_artifacts(&sib_dir).is_empty()
-        })
-        .await;
-        await_true(10, "cp-hosted marker records the split child", || {
-            std::fs::read(raftkv_dir.join("cp-hosted"))
-                .is_ok_and(|bytes| !bytes.is_empty() && bytes != b"[]")
+        await_true(20, "split child hosted with its own WAL file", || {
+            nodes[0].metadata().tablets.len() >= 2 && tablet_wal_present(&raftkv_dir, 2)
         })
         .await;
 
@@ -263,27 +261,17 @@ async fn dropped_table_data_is_reclaimed_including_split_child() {
         assert_eq!(s, 200, "drop-table: {body}");
 
         // Tablets leave the replicated map, and the GC loop reclaims both
-        // groups' on-disk artifacts — the main env's `db-*` + `raftkv.wal` and
-        // the sibling's `db-t2-*` + `raftkv.wal`.
+        // groups' WAL files.
         await_true(30, "tablets dropped from the map", || {
             !has_table_tablet(&nodes[0], "kv") && nodes[0].metadata().tablets.is_empty()
         })
         .await;
-        await_true(30, "tablet 1's files reclaimed", || {
-            tablet_artifacts(&raftkv_dir).is_empty()
+        await_true(30, "tablet 1's WAL file reclaimed", || {
+            !tablet_wal_present(&raftkv_dir, 1)
         })
         .await;
-        await_true(30, "split child's files reclaimed", || {
-            tablet_artifacts(&sib_dir).is_empty()
-        })
-        .await;
-        // The durable marker no longer records the child (so a restart cannot
-        // resurrect it). Pruned just after the file deletion, so poll briefly.
-        await_true(10, "cp-hosted marker pruned", || {
-            let marker = std::fs::read(raftkv_dir.join("cp-hosted")).unwrap_or_default();
-            serde_json::from_slice::<Vec<Value>>(&marker)
-                .unwrap_or_default()
-                .is_empty()
+        await_true(30, "split child's WAL file reclaimed", || {
+            !tablet_wal_present(&raftkv_dir, 2)
         })
         .await;
         // The admin view lists no hosted groups anymore (poll: the per-tablet
@@ -337,8 +325,8 @@ async fn dropped_table_data_is_reclaimed_including_split_child() {
             !has_table_tablet(&node, "kv")
         })
         .await;
-        await_true(20, "files stay reclaimed after restart", || {
-            tablet_artifacts(&raftkv_dir).is_empty() && tablet_artifacts(&sib_dir).is_empty()
+        await_true(20, "WAL files stay reclaimed after restart", || {
+            !tablet_wal_present(&raftkv_dir, 1) && !tablet_wal_present(&raftkv_dir, 2)
         })
         .await;
 
@@ -360,7 +348,7 @@ async fn dropped_table_data_is_reclaimed_including_split_child() {
 
 /// Three nodes, one process each (separate edge states — the real deployment
 /// shape): the dropped table's tablet is replicated on all three, and **every
-/// replica's** GC loop must delete its own files, driven purely off the
+/// replica's** GC loop must delete its own WAL file, driven purely off the
 /// replicated map (no cross-node teardown message exists).
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn every_replica_reclaims_a_dropped_tables_files() {
@@ -374,13 +362,19 @@ async fn every_replica_reclaims_a_dropped_tables_files() {
             has_table_tablet(&nodes[0], "orders")
         })
         .await;
-        // Every replica hosts the tablet's group on its main raftkv env.
-        for (i, dir) in dirs.iter().enumerate() {
-            await_true(20, "replica hosts tablet files", || {
-                !tablet_artifacts(&dir.join("raftkv")).is_empty()
+        let tablet = nodes[0]
+            .metadata()
+            .tablets
+            .iter()
+            .find(|(_, t)| t.table.as_deref() == Some("orders"))
+            .map(|(id, _)| id.0)
+            .expect("orders tablet exists");
+        // Every replica hosts the tablet's group, with its own WAL file.
+        for dir in &dirs {
+            await_true(20, "replica hosts the tablet's WAL file", || {
+                tablet_wal_present(&dir.join("raftkv"), tablet)
             })
             .await;
-            let _ = i;
         }
 
         let (s, body) = admin(
@@ -392,7 +386,7 @@ async fn every_replica_reclaims_a_dropped_tables_files() {
         .await;
         assert_eq!(s, 200, "drop-table: {body}");
 
-        // The drop replicates; each node's own GC loop deletes its local files.
+        // The drop replicates; each node's own GC loop deletes its local WAL file.
         for node in &nodes {
             await_true(30, "drop visible on every replica", || {
                 !has_table_tablet(node, "orders")
@@ -400,8 +394,8 @@ async fn every_replica_reclaims_a_dropped_tables_files() {
             .await;
         }
         for dir in &dirs {
-            await_true(30, "every replica reclaims its files", || {
-                tablet_artifacts(&dir.join("raftkv")).is_empty()
+            await_true(30, "every replica reclaims its WAL file", || {
+                !tablet_wal_present(&dir.join("raftkv"), tablet)
             })
             .await;
         }

@@ -1,6 +1,18 @@
 # ADR 0024 — Drop-table data GC
 
-- **Status:** Accepted
+- **Status:** Accepted. **Updated by ADR 0028** (shared per-node storage):
+  since a node's tablets now share one `StorageEngine` (not one engine per
+  tablet), step 3 below ("delete the artifacts") no longer deletes engine
+  files by prefix — it tombstones the tablet's own `StorageScope` range out of
+  the shared engine (`RaftKvNode::erase_scope`) and deletes only that tablet's
+  own Raft WAL file. There is also no more `cp-hosted` durable marker to prune
+  (ADR 0028 removes it entirely) and no sibling env to `shutdown_tasks()`
+  (ADR 0026 Stage B — every tablet uses a stream on the node's one `raftkv`
+  env, not a per-tablet env). The *decision* this ADR makes — GC is triggered
+  by absence from the replicated tablet map, driven by a per-node loop, and
+  convergent rather than one-shot — is unchanged; only the on-disk mechanics
+  in "the local half" below are superseded. See ADR 0028 and
+  `animusd/CLAUDE.md`'s drop-table-GC entry for the current mechanism.
 - **Date:** 2026-08-06
 - **Builds on:** [ADR 0023](0023-table-scoped-tablets.md) (table-scoped tablets),
   [ADR 0017](0017-per-tablet-raft-data-plane.md) (per-tablet Raft groups),
