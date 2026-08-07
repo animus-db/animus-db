@@ -36,3 +36,4 @@ relevant ADR (or supersede it) in the same PR as the code change.
 | [0028](0028-shared-storage-single-command-split.md) | Shared per-node storage, control-plane-only tablet split (supersedes 0017 §4/split) | Accepted |
 | [0029](0029-replica-rebalancing.md) | Automatic tablet-replica rebalancing (amends 0005's reconciler, 0017's membership-change primitive) | Accepted |
 | [0030](0030-online-cluster-growth.md) | Online cluster growth: admin add-member + heartbeat-driven activation (data-plane only; the control group stays static) | Accepted |
+| [0031](0031-tablet-host-reconciler.md) | Per-node tablet-host reconciler + a metadata-applied watch primitive (consolidates 4 polling loops into one event-driven reconciler; amends 0028, 0029) | Accepted — implemented incrementally across PRs 1–6 |
