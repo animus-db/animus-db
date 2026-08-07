@@ -793,7 +793,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// heartbeat — mirrors `change_membership`'s wake-on-propose. Returns
     /// whether the transfer was armed.
     pub fn transfer_leadership(&self, target: NodeId) -> bool {
-        let armed = self.lock().transfer_leadership(target);
+        let armed = self.lock().transfer_leadership(target, self.env.now());
         if armed {
             self.propose_signal.notify();
         }
@@ -846,11 +846,23 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             return None;
         }
         let me = self.env.node_id();
+        // Any extra (non-self) voter, regardless of liveness — used by step 3
+        // (a *healthy* extra). Step 1 below searches independently for a *down*
+        // extra: `extra().filter(down.contains)` would only ever look at the
+        // lowest-id extra (bug fixed under ADR 0029's follow-up — see the root
+        // CLAUDE.md engineering-practices entry), silently skipping a Down extra
+        // that happens to sort after a healthy one.
         let extra = || current.difference(desired).find(|&&n| n != me).copied();
+        let down_extra = || {
+            current
+                .difference(desired)
+                .find(|&&n| n != me && down.contains(&n))
+                .copied()
+        };
 
-        if let Some(down_extra) = extra().filter(|n| down.contains(n)) {
+        if let Some(target) = down_extra() {
             let mut c = current.clone();
-            c.remove(&down_extra);
+            c.remove(&target);
             return self.propose_config(c);
         }
         if let Some(&missing) = desired.difference(&current).next() {
@@ -871,14 +883,49 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             c.remove(&healthy_extra);
             return self.propose_config(c);
         }
-        // The only delta left is removing the leader itself.
+        // The only delta left is removing the leader itself. Select the
+        // lowest-id member of `desired` reasonably close to caught up
+        // (`>= commit_index`, matching `RaftCore::transfer_leadership`'s arm
+        // gate) and try to arm a transfer to it — idempotent, and retried every
+        // tick via `spawn_reconfigure_loop` as long as this delta persists, so a
+        // one-time arming failure (e.g. every candidate momentarily fell behind
+        // `commit_index`) self-heals on the next tick rather than needing a
+        // caller-visible retry. Log (don't silently drop) both outcomes: a
+        // stalled rebalance move that never finds an eligible target is
+        // otherwise invisible until an operator notices a tablet's leader never
+        // migrates off a node it should have left.
         let commit = self.commit_index();
-        if let Some(&target) = desired
+        match desired
             .iter()
             .filter(|&&n| n != me && self.peer_match(n) >= commit)
             .min()
         {
-            self.transfer_leadership(target);
+            Some(&target) => {
+                let armed = self.transfer_leadership(target);
+                // NOTE: the field is named `xfer_target`, not `target` —
+                // `tracing`'s macros reserve the bare `target` identifier for
+                // overriding the event's own target module path.
+                if armed {
+                    tracing::debug!(
+                        xfer_target = target,
+                        commit,
+                        "reconfigure_step: armed leadership transfer to remove self"
+                    );
+                } else {
+                    tracing::warn!(
+                        xfer_target = target,
+                        commit,
+                        "reconfigure_step: transfer_leadership rejected an apparently-eligible target"
+                    );
+                }
+            }
+            None => {
+                tracing::warn!(
+                    ?desired,
+                    commit,
+                    "reconfigure_step: must remove self but no member of `desired` is caught up to commit_index yet"
+                );
+            }
         }
         None
     }

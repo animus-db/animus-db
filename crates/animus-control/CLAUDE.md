@@ -237,6 +237,39 @@ epoch compare-and-swap transactions.
   so any value yields a correct cluster, just a different rebalancing speed. A
   split child now **inherits the source tablet's policy** in `SplitTablet`'s apply
   (else it would be invisible to both repair and rebalance).
+- **Leadership transfer (`RaftCore::transfer_leadership`, ADR 0029; the control
+  plane itself never calls it — it's a per-tablet CP-data primitive that lives
+  here because the sync core is shared).** `change_membership` always rejects
+  removing the current leader, so relocating a leader's own replica (a healthy
+  rebalance move, or a drain, landing on the leader) needs a real Raft §3.10
+  handoff: arm a transfer to a voter reasonably close to caught up
+  (`peer_match(target) >= commit_index()`, no config change in flight; a fresh
+  arm also records a one-election-timeout deadline), then **freeze**
+  `propose`/`change_membership` (`NotLeader`, hinting the target) so the log
+  stops growing, and send `RaftMsg::TimeoutNow` only once the target actually
+  **reaches `last_log_index()`** (re-sent every heartbeat after that until this
+  node steps down). A transfer whose target never steps down by the deadline
+  **aborts**, clearing the arm and resuming proposals. Re-arming the
+  already-armed target (a caller like `RaftKvNode::reconfigure_step` retries
+  every tick) is idempotent and does **not** push the deadline out — only a
+  fresh arm (first time, or a different target) starts a new one, else a
+  perpetual retry could starve the abort check. **This replaced an earlier,
+  narrower design** whose arm gate (`peer_match(target) == last_log_index()`)
+  and the selector that fed it (`peer_match(n) >= commit_index()`) used
+  *different* thresholds — under sustained writes on a write-hot tablet,
+  `propose` is fire-and-forget (returns before any replication round trip), so
+  `last_log_index` moves the instant a write is accepted while every peer's
+  `peer_match` still reflects the previous entry; the arm therefore failed at
+  essentially every sampling instant, forever, and the discarded `bool` result
+  meant nothing surfaced the stall. **Lesson (recorded in the root CLAUDE.md
+  too): when a value gates two different call sites (a selector picking a
+  candidate, and an actuator arming it), both must read the *same* threshold —
+  and a primitive's return value that encodes "did this actually work" must
+  never be silently discarded, however statement-shaped the call looks.** See
+  `animus-control/tests/leadership_transfer.rs` (core-level: freeze,
+  catch-up-then-`TimeoutNow`, deadline-abort, idempotent re-arm) and
+  `animus-cp-data/tests/leader_transfer_reconfigure.rs` (a sim-level
+  reproduction that fails against the pre-fix source).
 - **Automatic failure detection (ADR 0012).** Members heartbeat the control group
   (`heartbeat_loop` → `RaftMsg::Heartbeat`, a term-less message the driver
   **intercepts** in its `recv` arm and feeds to the shared `FailureDetector` —
@@ -344,7 +377,14 @@ cluster spreads existing tablets onto new members to max−min ≤ 1 and then go
 quiet, repair defers to rebalance correctly, residency + strict spread hold at
 every intermediate state while excluded nodes never gain a replica, and
 rebalancing still converges after the control leader is killed mid-flight;
-seed-swept), and
+seed-swept), **leadership transfer** (`leadership_transfer.rs`, ADR 0029 — arms
+only a caught-up-to-commit, current voter and retries `TimeoutNow` every
+heartbeat once the target reaches `last_log_index`; freezes `propose`/
+`change_membership` while armed; aborts and resumes proposing if the target
+never catches up by the deadline; a re-arm of the same target doesn't extend
+the deadline; a stale transfer never survives a fresh election win;
+`TimeoutNow` bypasses pre-vote; a departing peer keeps receiving the removal
+entry until it acks past it), and
 **heartbeat-based failure detection** end to end (`failure_detection.rs`, ADR
 0012 — a member crashes, the leader auto-commits `Down`, placement reconciles off
 it, then the member restarts and returns to `Active`; plus detector unit tests in
