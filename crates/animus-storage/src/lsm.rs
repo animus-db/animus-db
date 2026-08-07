@@ -2264,6 +2264,54 @@ impl<E: Env> StorageEngine for LsmEngine<E> {
             .collect())
     }
 
+    /// **Cheap, non-materializing** override (ADR 0034): reads only in-memory
+    /// metadata already held for other purposes — the memtable (a real,
+    /// range-scoped byte sum, since a `BTreeMap` range query costs nothing
+    /// extra) plus every SSTable whose own `[min_key, max_key]` overlaps
+    /// `[start, end)` at all (`sstable_overlaps`). No disk read, no block
+    /// fetch, mirroring `sstable_views`/`memtable_len`'s introspection cost.
+    ///
+    /// **Bias: over-estimates, deliberately, like [`CpGroup::approx_key_count`]'s
+    /// sibling key-count estimate** (`animusd`), for two reasons: (1) an
+    /// SSTable that merely *overlaps* the range — rather than being wholly
+    /// contained in it — counts its **entire** `file_size`, since no
+    /// per-block byte breakdown is available without reading blocks; since
+    /// ADR 0028 one physical engine can host several tablets' data on the
+    /// same file (particularly at L0, the unpartitioned flush tier), so a
+    /// table spanning a sibling tablet's keys inflates this estimate by that
+    /// sibling's share. (2) the overlap check itself uses each table's own
+    /// `[min_key, max_key]`, a superset of its actual on-disk key set. Both
+    /// biases only ever over-count, never under-count, so a tablet that
+    /// might need splitting is never silently missed — the auto-split loop's
+    /// materializing confirm step (which reads real scoped bytes) corrects
+    /// the estimate before a split actually commits. In practice this stays
+    /// tight once data is compacted into range-partitioned, non-overlapping
+    /// L1+ runs (leveled compaction's whole point); it is loosest for
+    /// still-unflushed/L0 data on a heavily shared engine.
+    async fn approx_bytes_in_range(&self, start: &[u8], end: Option<&[u8]>) -> Result<u64> {
+        let inner = self.lock();
+        let memtable_bytes: u64 = match end {
+            Some(e) => inner
+                .memtable
+                .range(start.to_vec()..e.to_vec())
+                .map(|(k, h)| history_bytes(k, h))
+                .sum(),
+            None => inner
+                .memtable
+                .range(start.to_vec()..)
+                .map(|(k, h)| history_bytes(k, h))
+                .sum(),
+        };
+        let sstable_bytes: u64 = inner
+            .manifest
+            .tables
+            .iter()
+            .filter(|t| sstable_overlaps(t, start, end))
+            .map(|t| t.file_size)
+            .sum();
+        Ok(memtable_bytes + sstable_bytes)
+    }
+
     fn snapshot(&self) -> LsmSnapshot<E> {
         let version = self.lock().manifest.max_version;
         self.hold_snapshot(version);
@@ -2521,13 +2569,34 @@ fn merge_winner(
 fn memtable_bytes_of(memtable: &BTreeMap<Key, History>) -> usize {
     memtable
         .iter()
-        .map(|(key, history)| {
-            history
-                .values()
-                .map(|slot| key.len() + slot.as_ref().map_or(0, Vec::len) + 16)
-                .sum::<usize>()
-        })
+        .map(|(key, history)| history_bytes(key, history))
+        .sum::<u64>() as usize
+}
+
+/// One key's full-history byte accounting: `key + value + 16` per
+/// `(key, version)` slot — the same formula `apply_put`/`apply_delete`
+/// accumulate into `memtable_bytes`, factored out so
+/// [`approx_bytes_in_range`](StorageEngine::approx_bytes_in_range)'s
+/// range-scoped sum uses the identical accounting as the whole-memtable one.
+fn history_bytes(key: &Key, history: &History) -> u64 {
+    history
+        .values()
+        .map(|slot| (key.len() + slot.as_ref().map_or(0, Vec::len) + 16) as u64)
         .sum()
+}
+
+/// Whether SSTable `t`'s own `[min_key, max_key]` range overlaps the
+/// half-open range `[start, end)` (`end == None` unbounded above) at all — an
+/// empty table (`min_key`/`max_key` both `None`) never overlaps. Used by
+/// [`approx_bytes_in_range`](StorageEngine::approx_bytes_in_range)'s `LsmEngine`
+/// override to decide which tables' `file_size` to count; see that override's
+/// doc for why "overlaps at all" (rather than "fully contained") is the
+/// deliberately over-counting choice.
+fn sstable_overlaps(t: &SsTableMeta, start: &[u8], end: Option<&[u8]>) -> bool {
+    let (Some(min_key), Some(max_key)) = (&t.min_key, &t.max_key) else {
+        return false;
+    };
+    max_key.as_slice() >= start && end.is_none_or(|e| min_key.as_slice() < e)
 }
 
 /// Flatten a memtable into sorted SSTable records (`(key asc, version asc)`),
