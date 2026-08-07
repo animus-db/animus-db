@@ -280,21 +280,30 @@ impl CpGroup {
 
     /// This group's Raft state for the `/admin/raftkv` view. The two engine arms
     /// call the identical `RaftKvNode` accessors, so a local macro keeps it DRY.
-    /// `key_count` is this tablet's own **exact, `StorageScope`-scoped** count
-    /// ([`local_pairs`](Self::local_pairs)) — *not* the cheap, unscoped
-    /// [`approx_key_count`](Self::approx_key_count) estimate `auto_split_loop`
-    /// uses as a fast gate, which reads the whole shared engine and so reports
-    /// every co-resident tablet's combined count. A node hosts more than one
-    /// tablet on the same engine as soon as it hosts a split's parent + child
-    /// (ADR 0028), which is why the unscoped estimate showed a mid-split
-    /// tablet's row as the *node's* total rather than its own subset. This is a
-    /// debug surface, so the materialize-then-count cost is acceptable (mirrors
-    /// `local_scan`'s browse-keys view).
+    /// `key_count`/`byte_size` are this tablet's own **exact,
+    /// `StorageScope`-scoped** count/total ([`local_pairs`](Self::local_pairs))
+    /// — *not* the cheap, unscoped [`approx_key_count`](Self::approx_key_count)
+    /// / scoped-but-approximate [`approx_bytes`](Self::approx_bytes) estimates
+    /// `auto_split_loop` uses as a fast gate. `approx_key_count` reads the whole
+    /// shared engine and so reports every co-resident tablet's combined count —
+    /// a node hosts more than one tablet on the same engine as soon as it hosts
+    /// a split's parent + child (ADR 0028), which is why the unscoped estimate
+    /// showed a mid-split tablet's row as the *node's* total rather than its own
+    /// subset. This is a debug surface, so the materialize-then-count cost is
+    /// acceptable (mirrors `local_scan`'s browse-keys view); `byte_size` is
+    /// summed from the same materialized pairs, no second engine call needed.
     async fn raft_view(&self, tablet: TabletId) -> admin::CpRaftView {
         // Since ADR 0026 Stage B / ADR 0028 a tablet's CP group member id **is**
         // simply the base `raftkv` id — no more derived-id translation needed.
         let node = self.env().node_id();
-        let key_count = Some(self.local_pairs().await.len());
+        let pairs = self.local_pairs().await;
+        let key_count = Some(pairs.len());
+        let byte_size = Some(
+            pairs
+                .iter()
+                .map(|(k, v)| (k.len() + v.len()) as u64)
+                .sum::<u64>(),
+        );
         macro_rules! view {
             ($n:expr) => {
                 admin::CpRaftView {
@@ -312,6 +321,7 @@ impl CpGroup {
                     log_len: $n.log_len(),
                     voters: $n.config().into_iter().collect(),
                     key_count,
+                    byte_size,
                 }
             };
         }

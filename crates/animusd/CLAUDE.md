@@ -257,7 +257,15 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   a single accumulate-and-threshold pass" is only correct when no single
   item can dominate half the total; once one can, compare the two
   candidate cuts *around* it (before vs. after) rather than committing to
-  whichever side the accumulator happens to cross the threshold on.
+  whichever side the accumulator happens to cross the threshold on. **The
+  dashboard's Tablets view surfaces both dimensions** (`admin::CpRaftView`
+  gained `byte_size` — the exact, `StorageScope`-scoped total summed from the
+  same `local_pairs` scan `key_count` already reads, no extra engine call —
+  alongside the pre-existing `key_count`): a "Size" column sits next to
+  "Keys", each with its **own** over-threshold pill, since a byte threshold
+  and a key threshold are independent OR-gated triggers on the backend (either
+  exceeding its threshold fires a split, `auto_split_loop`) — one dimension
+  being under its threshold must never hide the other being over.
 - **Every CP write path stamps + pre-checks the ADR 0028 write fence** (fixed
   2026-08-07 — the fences existed and were unit-tested in `animus-cp-data`
   since the split redesign, but had zero real callers here: `cp_put_local`/

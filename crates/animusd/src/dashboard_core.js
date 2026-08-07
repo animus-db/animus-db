@@ -3,8 +3,8 @@
 // for the AnimusDB Console. `dashboard_overview.js`, `dashboard_placement.js`,
 // `dashboard_tablets.js`, `dashboard_browser.js`, and `dashboard_storage.js`
 // load after this file and call into it (STATE, $, esc, getJSON, postJSON,
-// pill, bytes, tokenBound, b64url, nodeRaftkvId, cpGroupsByTablet,
-// autoSplitThreshold, tabletStatus, computeHealth, activateTab, gotoStorage);
+// pill, bytes, humanBytes, tokenBound, b64url, nodeRaftkvId, cpGroupsByTablet,
+// autoSplitThresholds, tabletStatus, computeHealth, activateTab, gotoStorage);
 // nothing here calls into them except `render()`, the single per-refresh
 // entry point every view's render function hangs off of.
 const SEED = window.location.origin;
@@ -90,6 +90,23 @@ function bytes(v) {
   return String(v);
 }
 
+// A byte *count* (e.g. a tablet's total size) as a human-readable string
+// ("842 B" / "1.2 KB" / "3.4 MB") — distinct from `bytes()` above, which
+// renders a byte *array* (a key/value's raw content) for display. `null`
+// passes through as `null` so callers can render their own placeholder.
+function humanBytes(n) {
+  if (n == null) return null;
+  if (n < 1024) return `${n} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let v = n;
+  let i = -1;
+  do {
+    v /= 1024;
+    i++;
+  } while (v >= 1024 && i < units.length - 1);
+  return `${v.toFixed(v < 10 ? 2 : 1)} ${units[i]}`;
+}
+
 // A tablet range boundary on the hash ring (ADR 0022): the first 8 key bytes are
 // the big-endian Murmur3 partition token, shown as URL-safe base64 — matching the
 // token prefix in the key views, so a boundary can be eyeballed against browsed
@@ -140,12 +157,16 @@ function cpGroupsByTablet() {
   return map;
 }
 
-// The `--auto-split K` threshold (from any reachable node's `/admin/config` —
-// a single `--cluster N --auto-split K` flag, so every node agrees), or
-// `null` if auto-split isn't enabled for this run.
-function autoSplitThreshold() {
-  const n = STATE.nodes.find((x) => x.ok && x.config && x.config.auto_split_threshold != null);
-  return n ? n.config.auto_split_threshold : null;
+// The `--auto-split K` (keys) and `--auto-split-bytes B` (bytes, ADR 0034)
+// thresholds, from any reachable node's `/admin/config` — a single flag set,
+// so every node agrees. Either field is `null` if that trigger isn't enabled
+// for this run (both, either, or neither may be set).
+function autoSplitThresholds() {
+  const n = STATE.nodes.find((x) => x.ok && x.config);
+  return {
+    keys: n ? n.config.auto_split_threshold : null,
+    bytes: n ? n.config.auto_split_bytes_threshold : null,
+  };
 }
 
 // A tablet's derived status: `electing` if no elected leader among its
