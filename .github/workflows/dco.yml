@@ -4,9 +4,25 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
 
+permissions:
+  contents: read
+  # get-pr-commits lists the PR's commits via the REST API; without this the
+  # restricted default token gets "Resource not accessible by integration".
+  pull-requests: read
+
 jobs:
   dco:
     name: DCO sign-off check
     runs-on: ubuntu-latest
     steps:
+      # tim-actions/dco does not fetch the PR's commits itself: its `commits`
+      # input is required, and without it the action JSON-parses an empty
+      # string and fails every PR with "Unexpected end of JSON input".
+      - name: Get PR commits
+        id: get-pr-commits
+        uses: tim-actions/get-pr-commits@v1.3.1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
       - uses: tim-actions/dco@v1.1.0
+        with:
+          commits: ${{ steps.get-pr-commits.outputs.commits }}
