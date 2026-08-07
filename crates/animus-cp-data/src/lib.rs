@@ -125,14 +125,29 @@ impl Future for ProposePending<'_> {
 /// reserved marker key and `keys_from`'s handoff capture are only
 /// prefix-scoped, not range-scoped (see their call sites), so two sibling
 /// tablets of the same table sharing a prefix could in principle collide on
-/// the marker, and a snapshot image built under a narrowed `range` would not
-/// carry it to a catching-up follower. Harmless in practice: nothing combines
-/// a non-default scope with `propose_split` today, and the mechanism is
-/// deleted before that combination could arise for real.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// the marker. Harmless in practice: nothing combines a non-default scope
+/// with `propose_split` today, and the mechanism is deleted before that
+/// combination could arise for real.
+///
+/// **`range` is live-narrowable** ([`narrow`](Self::narrow)), not fixed at
+/// construction: when this tablet is later the *source* of a (control-plane,
+/// single-command) split, its own range shrinks while its physical data does
+/// **not** move — the handed-off portion stays physically resident under the
+/// same `prefix` until the new sibling tablet's own writes/GC reclaim it. A
+/// stale, too-wide `range` is harmless for a caller-bounded read (the
+/// physical scan is already bounded by the caller's own up-to-date
+/// `Metadata`-derived bounds), but it is **not** harmless for
+/// [`engine_image`] — an unbounded, self-contained snapshot capture with no
+/// caller-supplied bounds — which would otherwise ship the already-handed-off
+/// portion to a new replica joining this (shrunk) tablet's group, duplicating
+/// data a *different* Raft group is now the sole authority for. All clones of
+/// a `StorageScope` share the same live `range` (an `Arc`), so narrowing the
+/// copy held by the driver task also narrows the one `RaftKvNode` itself
+/// holds.
+#[derive(Clone, Debug)]
 pub struct StorageScope {
     prefix: Vec<u8>,
-    range: KeyRange,
+    range: Arc<Mutex<KeyRange>>,
 }
 
 impl StorageScope {
@@ -142,14 +157,26 @@ impl StorageScope {
     pub fn whole() -> Self {
         Self {
             prefix: Vec::new(),
-            range: KeyRange::whole(),
+            range: Arc::new(Mutex::new(KeyRange::whole())),
         }
     }
 
     /// A scope confined to `prefix || range` within a shared engine.
     #[must_use]
     pub fn new(prefix: Vec<u8>, range: KeyRange) -> Self {
-        Self { prefix, range }
+        Self {
+            prefix,
+            range: Arc::new(Mutex::new(range)),
+        }
+    }
+
+    /// Update this scope's live range (see the type doc) — every clone of
+    /// this `StorageScope` observes the change immediately. The caller (which
+    /// watches `Metadata` for this tablet's current range) is trusted to only
+    /// ever narrow it, mirroring the legacy `current_split_bound`'s
+    /// monotonic-narrowing discipline.
+    pub fn narrow(&self, new_range: KeyRange) {
+        *self.range.lock().expect("storage scope range poisoned") = new_range;
     }
 
     /// The physical storage key for logical `key`.
@@ -160,13 +187,14 @@ impl StorageScope {
     }
 
     /// If `physical_key` belongs to this scope — starts with `prefix`, and
-    /// the stripped suffix falls inside `range` — the stripped logical key,
-    /// else `None`. The read-side counterpart of [`physical`](Self::physical),
-    /// used wherever a shared-engine scan/snapshot must not leak another
-    /// tenant's keys.
+    /// the stripped suffix falls inside the *current* `range` — the stripped
+    /// logical key, else `None`. The read-side counterpart of
+    /// [`physical`](Self::physical), used wherever a shared-engine
+    /// scan/snapshot must not leak another tenant's keys.
     fn strip_in_range<'a>(&self, physical_key: &'a [u8]) -> Option<&'a [u8]> {
         let logical = physical_key.strip_prefix(self.prefix.as_slice())?;
-        self.range.contains(logical).then_some(logical)
+        let range = self.range.lock().expect("storage scope range poisoned");
+        range.contains(logical).then_some(logical)
     }
 
     /// If `physical_key` starts with this scope's `prefix` (regardless of
@@ -875,6 +903,16 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// (its committed state is authoritative) before proposing the split.
     pub async fn range_snapshot(&self, at: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
         keys_from(&self.storage, &self.scope, at).await
+    }
+
+    /// Update this group's live [`StorageScope`] range (see its doc) —
+    /// typically called by a caller watching the control plane's replicated
+    /// `Metadata` for this tablet's current range, whenever it narrows (e.g.
+    /// this tablet was the source of a single-command split). A no-op for the
+    /// default [`StorageScope::whole()`] scope, since nothing needs bounding
+    /// there.
+    pub fn narrow_scope(&self, new_range: KeyRange) {
+        self.scope.narrow(new_range);
     }
 
     /// Start a group whose engine is **pre-seeded** with `seed` `(key, value)`
