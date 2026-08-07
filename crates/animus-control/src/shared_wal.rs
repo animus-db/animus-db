@@ -1,6 +1,13 @@
 //! A shared, multi-tenant write-ahead-log I/O coordinator (PR1 of the
 //! single-command-split redesign, see `docs/adr/0028-*.md`).
 //!
+//! **Status: built and unit-tested, but not wired into any node.** ADR 0028
+//! deferred actually routing per-tablet `RaftCore` WAL I/O through this
+//! coordinator (every tablet on a node still writes its own WAL file); no
+//! `animusd`/`animus-cp-data` code constructs a `SharedWal` today. Whether to
+//! wire it in or delete it is an open decision — see ADR 0028 for the
+//! deferral rationale.
+//!
 //! Once several tablets' `RaftCore` instances on one node persist into the
 //! SAME physical WAL file (each record tagged with its tablet, see
 //! [`crate::persist::PersistedState::encode_tagged_record`]), those tablets'
