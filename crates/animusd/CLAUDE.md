@@ -174,7 +174,18 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   is fine — the loop just re-discovers every tablet to host from replicated
   `Metadata` and re-forms each from the shared engine's durable data), never
   the shared `--cluster N` edge (which would report another node's just-hosted
-  group and starve this node's own).
+  group and starve this node's own). **The loop also re-narrows an
+  already-`minted` tablet's `StorageScope` every tick** (via
+  `ClusterEdgeState::local_cp_member` + `CpGroup::narrow_scope`) — the source
+  side of a single-command split (ADR 0028) has a `RaftKvNode` that predates
+  the split and whose `StorageScope` is otherwise never touched again once
+  constructed; only a brand-new split child gets a correctly-narrowed scope
+  for free (it's new to `minted`, so it goes through the normal fresh-formation
+  path instead). `narrow_scope` is a cheap, idempotent mutex set, so doing it
+  unconditionally every tick (not just when the range actually changed — this
+  loop has no cheap way to tell) is safe. Left unfixed, this showed up as
+  `/admin/raftkv`'s `key_count` for a just-split parent tablet reporting its
+  stale, pre-split (larger) count forever.
 - **Drop-table GC (ADR 0024) is the join-host loop's dual.** The real drop sink is
   `ClientCtx::drop_table` (CQL `DROP TABLE` + admin `/admin/data/drop-table`):
   `DropTableSchema` then `DropTableTablets`. **`drop_table_schema` stays

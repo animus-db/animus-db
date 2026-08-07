@@ -81,10 +81,12 @@ pub(crate) struct CpRaftView {
     pub(crate) snapshot_index: u64,
     pub(crate) log_len: usize,
     pub(crate) voters: Vec<NodeId>,
-    /// This tablet's estimated live key count (`CpGroup::approx_key_count`) —
-    /// the same estimate `auto_split_loop` checks against `--auto-split K`.
-    /// `None` on the memory backend (no on-disk memtable/SSTable stats to
-    /// estimate from).
+    /// This tablet's exact, `StorageScope`-scoped live key count
+    /// (`CpGroup::raft_view`, via `local_pairs`) — distinct from the cheap,
+    /// unscoped estimate `auto_split_loop` checks against `--auto-split K`
+    /// (`CpGroup::approx_key_count`), which reads the whole shared engine and
+    /// so double-counts a co-resident sibling tablet (e.g. right after a
+    /// split). Always `Some` — both backends can be scanned.
     pub(crate) key_count: Option<usize>,
 }
 
@@ -230,7 +232,7 @@ async fn dispatch(ctx: &ClientCtx, request: &http::HttpRequest) -> (u16, String)
             serde_json::to_value(ctx.raft.metadata()).unwrap_or(Value::Null),
         ),
         ("GET", "/admin/raft") => (200, raft_view(ctx)),
-        ("GET", "/admin/raftkv") => (200, raftkv_view(ctx)),
+        ("GET", "/admin/raftkv") => (200, raftkv_view(ctx).await),
         ("GET", "/admin/storage/lsm") => storage_lsm(ctx, q).await,
         ("GET", "/admin/storage/wal") => storage_wal(ctx, q).await,
         ("GET", "/admin/storage/wal/segment") => storage_wal_segment(ctx, q).await,
@@ -328,13 +330,11 @@ fn raft_view(ctx: &ClientCtx) -> Value {
     })
 }
 
-fn raftkv_view(ctx: &ClientCtx) -> Value {
-    let groups: Vec<CpRaftView> = ctx
-        .edge
-        .hosted_groups()
-        .iter()
-        .map(|(t, g)| g.raft_view(*t))
-        .collect();
+async fn raftkv_view(ctx: &ClientCtx) -> Value {
+    let mut groups: Vec<CpRaftView> = Vec::new();
+    for (t, g) in ctx.edge.hosted_groups() {
+        groups.push(g.raft_view(t).await);
+    }
     json!({ "hosts_cp": !groups.is_empty(), "groups": groups })
 }
 
