@@ -637,6 +637,113 @@ async fn already_split_tablet_splits_again_once_it_regrows() {
     }
 }
 
+/// Debug repro: does the *same* lineage split a **third** time? Live testing
+/// (`--cluster 3 --auto-split 2000` under sustained bulk-seed) showed a tablet
+/// split a second time after regrowing, then sat frozen well over threshold
+/// indefinitely on a third regrowth — this extends
+/// `already_split_tablet_splits_again_once_it_regrows` by one more round to
+/// see if it reproduces under a controlled, deterministic test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn already_split_tablet_splits_a_third_time_after_regrowing_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let bound = bind_cluster(3, "127.0.0.1".parse().unwrap(), dir.path())
+        .await
+        .unwrap();
+    let nodes = start_cluster_auto_split(bound, 16).await.unwrap();
+    await_bootstrap(&nodes).await;
+    let addr0 = nodes[0].client_addr();
+
+    async fn put(addr0: std::net::SocketAddr, key: Vec<u8>, value: Vec<u8>) {
+        loop {
+            match call(
+                addr0,
+                ClientRequest::Put {
+                    key: key.clone(),
+                    value: value.clone(),
+                    table: "kv".to_string(),
+                },
+            )
+            .await
+            {
+                ClientResponse::PutOk => return,
+                ClientResponse::Error(_) => sleep(Duration::from_millis(100)).await,
+                other => panic!("unexpected put: {other:?}"),
+            }
+        }
+    }
+
+    for i in 0..24u32 {
+        let key = format!("key{i:02}").into_bytes();
+        let value = format!("v{i}").into_bytes();
+        timeout(Duration::from_secs(20), put(addr0, key, value))
+            .await
+            .unwrap_or_else(|_| panic!("write key{i:02} timed out"));
+    }
+    let after_first = async {
+        loop {
+            if nodes.iter().all(|n| n.metadata().tablets.len() >= 2) {
+                return;
+            }
+            sleep(Duration::from_millis(200)).await;
+        }
+    };
+    timeout(Duration::from_secs(30), after_first)
+        .await
+        .expect("tablet did not auto-split within 30s");
+    let count_after_1 = nodes[0].metadata().tablets.len();
+
+    // Sorts below every `key##`, landing in the lower (already-split) range.
+    for i in 0..40u32 {
+        let key = format!("aaa{i:02}").into_bytes();
+        let value = format!("v{i}").into_bytes();
+        timeout(Duration::from_secs(20), put(addr0, key, value))
+            .await
+            .unwrap_or_else(|_| panic!("write aaa{i:02} timed out"));
+    }
+    let after_second = async {
+        loop {
+            if nodes
+                .iter()
+                .all(|n| n.metadata().tablets.len() > count_after_1)
+            {
+                return;
+            }
+            sleep(Duration::from_millis(200)).await;
+        }
+    };
+    timeout(Duration::from_secs(30), after_second)
+        .await
+        .expect("already-split tablet did not split again after regrowing (2nd)");
+    let count_after_2 = nodes[0].metadata().tablets.len();
+
+    // Sorts below every `aaa##` and `key##`, landing in the lowest range again.
+    for i in 0..60u32 {
+        let key = format!("000{i:02}").into_bytes();
+        let value = format!("v{i}").into_bytes();
+        timeout(Duration::from_secs(20), put(addr0, key, value))
+            .await
+            .unwrap_or_else(|_| panic!("write 000{i:02} timed out"));
+    }
+    let after_third = async {
+        loop {
+            if nodes
+                .iter()
+                .all(|n| n.metadata().tablets.len() > count_after_2)
+            {
+                return;
+            }
+            sleep(Duration::from_millis(200)).await;
+        }
+    };
+    timeout(Duration::from_secs(30), after_third)
+        .await
+        .expect("already-twice-split tablet did not split a third time after regrowing again");
+
+    for n in &nodes {
+        n.shutdown();
+    }
+}
+
 /// Regression: `trigger_split`'s data-plane step can fail *permanently*, not
 /// just transiently — a *smaller* (more aggressive) split can already have
 /// narrowed the source group's boundary past a *larger* key's proposal before
