@@ -74,11 +74,16 @@ registries) was a **deliberate follow-up** — and is now done. Both the CQL
 (`animusd::cql`) and DynamoDB (`animusd::dynamo`) edges propose
 `CreateTableSchema`/`DropTableSchema` on `CREATE TABLE`/`DROP TABLE` and wait for
 commit, and resolve reads/writes against the replicated `Metadata` rather than a
-per-process catalog. The CQL edge maps its `CqlType` onto `ColumnType` (and back),
-keys tables `keyspace.table`, and reaches the leader through a process-global set
-of registered control handles (the same mechanism the DynamoDB edge uses); it also
-adds `ALTER TABLE ... ADD` on top (a non-atomic drop+recreate of the schema, since
-in-place schema evolution is still future work — see Consequences).
+per-process catalog. The CQL edge maps its `CqlType` onto `ColumnType` (and back)
+and keys tables `keyspace.table`. Proposing the command is routed through
+`ClientCtx::propose_schema`: propose locally when the connected node is the
+control-plane leader, otherwise **relay** `ClientRequest::ProposeSchema` one hop
+to the leader's node (falling back to a broadcast across every known client
+address when no leader is locally known at all — the only path an ADR 0030
+growth node, whose own control Raft never elects, has to reach the real
+cluster) — see Consequences for the cross-process detail. `ALTER TABLE ... ADD`
+is an **atomic in-place** schema replacement (`MetaCommand::ReplaceTableSchema`,
+one command/one apply — see Consequences), not a drop+recreate.
 
 ## Consequences
 
@@ -95,10 +100,28 @@ in-place schema evolution is still future work — see Consequences).
   through these `MetaCommand`s and resolve against `Metadata`, so a created table
   is durable and cluster-agreed across the wire — proven over real TCP with a node
   restart in `animusd/tests/cql_durable_schema.rs` (CQL) and the DynamoDB edge's
-  schema test. DDL proposals route to the control-plane leader via a
-  process-global set of registered control handles (working for the in-process
-  `--cluster N` mode; cross-process proposal forwarding over the network is still
-  future work — DDL otherwise commits when the connected node is the leader).
+  schema test.
+- **Cross-process DDL proposal forwarding is implemented, closing what this ADR
+  originally left as future work.** A schema-catalog `MetaCommand` issued to a
+  node that is *not* the control-plane leader no longer just times out: `animusd`
+  gates a fixed allowlist of relayable commands (`is_relayable_command` —
+  `Create`/`Drop`/`ReplaceTableSchema`, `Create`/`DropTableIndex`, `SetTableMode`,
+  `Create`/`DropKeyspace`, plus the tablet-provisioning/registration commands DDL
+  depends on) and `ClientCtx::propose_schema` relays a non-local proposal one hop
+  to the leader's node over `ClientRequest::ProposeSchema`, retrying with a
+  patient backoff rather than resubmitting a possibly-already-accepted entry on
+  every poll tick. A non-allowlisted command (e.g. a membership/placement change)
+  is rejected by the relay — this is a narrow DDL-forwarding surface, not a
+  general "propose anything remotely" endpoint. Every real DDL entry point (CQL
+  `CREATE`/`ALTER`/`DROP TABLE`, `CREATE`/`DROP KEYSPACE`, and the DynamoDB
+  `CreateTable` + its GSI/LSI `CreateTableIndex` proposals) goes through this
+  path, so DDL commits regardless of which node in the cluster the client
+  happens to be connected to. Proven in a genuine one-process-per-node cluster
+  (not just in-process `--cluster N`) in
+  `animusd/tests/schema_ddl_relay.rs::schema_ddl_on_a_follower_is_relayed_to_the_leader`
+  — a follower-connected `CreateTableSchema`, `SetTableMode`, and the atomic
+  `ReplaceTableSchema` (ALTER) all commit + replicate cluster-wide, while a
+  follower-connected non-schema command is rejected.
 - **Secondary-index *definitions* now replicate.** A table's `TableSchema` carries
   an ordered `indexes: Vec<IndexDef>` (GSI/LSI: name, kind, hash/sort attributes,
   projection), mutated by two new deterministic `MetaCommand`s —
@@ -126,15 +149,62 @@ in-place schema evolution is still future work — see Consequences).
   index machinery from the catalog, not process memory. Proven over the real
   DynamoDB JSON/HTTP wire in `animusd/tests/dynamo_schema.rs`
   (`create_table_index_replicates_to_second_node`, `..._survives_node_restart`).
-- **Still deferred (index *data*):** the index *entry data* — the actual indexed
-  rows — is **not** replicated; it stays maintained at the wire edge by observed
-  `note_put`/`note_delete` writes (rebuilt from writes, so a freshly restarted
-  node's index is empty until it observes writes or back-fills). Only the index
-  *definition* is now cluster-wide and durable. Replicating index data (or
-  back-filling it from a base-table scan on restart) is future work.
-- **Costs / follow-up:** CQL keyspace objects are still **not** modelled here —
-  the schema captures key structure + typed columns + index definitions; keyspace
-  metadata can extend `SchemaCatalog` later without changing the replication
-  mechanism. In-place schema *evolution* is still future work: the CQL edge's
-  `ALTER TABLE ADD` is a non-atomic drop+recreate, and there is no
-  `AlterTableSchema` `MetaCommand` yet.
+- **Index *data* is not replicated — it is lazily backfilled from a live
+  base-table scan, not left to silently return incomplete results.** The index
+  *entry data* — the actual indexed rows — still lives only at the wire edge,
+  maintained by observed `note_put`/`note_delete` writes (the same
+  cluster-agreed-definition-but-edge-local-data split ADR 0013 always intended:
+  replicate the small, must-agree *shape*; keep the large, easily-rederived
+  *data* at the edge). What closes the gap this section used to flag as future
+  work: a freshly restarted node (or a follower/second node that never observed
+  the writes) does **not** silently serve an empty/incomplete index forever.
+  `SchemaRegistry` tracks a per-index `backfilled` flag (`false` for a newly
+  created or shape-changed index — including one just rebuilt from the
+  replicated catalog by `sync_indexes`), and the DynamoDB edge's
+  `backfill_index_if_needed` runs **once, lazily, on the first query** against
+  such an index: a single linearizable base-table scan (the same
+  `DataClient::scan` a base `Query`/`Scan` already uses), replayed through
+  `note_put` to populate every index of the table in one pass, then
+  `mark_table_backfilled`. This is chosen over the alternative of *deriving*
+  every index query from a live base-table scan (no edge-local index at all):
+  a GSI/LSI's whole purpose is an *alternate* key ordering, which a range scan
+  over the base table's own key order cannot serve without scanning (and
+  filtering) the entire table per query — the one-time backfill keeps the
+  steady-state query O(index size), pays the base-table-scan cost exactly once
+  per (re)creation of an index's machinery, and needs no new control-plane
+  state or replicated index tablets. Correctness is proven end to end over the
+  real DynamoDB wire in `animusd/tests/dynamo_schema.rs`:
+  `create_table_index_survives_node_restart` (a restart wipes the registry; the
+  first post-restart GSI query still returns the pre-restart item, **without
+  re-writing it**) and `create_table_index_replicates_to_second_node` (a write
+  via node 0, queried via node 1, whose registry never observed that write —
+  the GSI query on node 1 rebuilds the index from the replicated *definition*
+  and backfills its *data* from a live scan). **A write racing the backfill's
+  scan is not lost or duplicated**: the scan runs without the registry lock (it
+  is a network read), so a concurrent write's own `note_put` can land — and
+  correctly index the item's *current* value — before the backfill's replay of
+  its (older) scanned value would otherwise apply. `SchemaRegistry` tracks
+  which keys were touched by a real `note_put`/`note_delete` since the backfill
+  became pending (`touched_since_backfill`) and the replay skips any such key,
+  so it can only ever *seed* a key nobody has independently already indexed
+  correctly — never revert one. Unit-proven in
+  `animus-dynamo/src/registry.rs::racing_write_during_backfill_is_not_reverted_by_the_stale_replay`
+  (plus a sibling test that an untouched key is still seeded normally).
+  Same-table, same-node correctness (a write immediately followed by a query on
+  the *same* connection with no restart in between) was already correct before
+  this ADR — nothing here changes that path.
+- **CQL keyspace objects are now modelled here too (v1 A3, no longer future
+  work):** `Metadata` gained a `keyspaces: BTreeSet<String>` field alongside
+  `schemas`, mutated by `MetaCommand::CreateKeyspace`/`DropKeyspace` (idempotent,
+  same shape as the table-schema commands) and read via `Metadata::has_keyspace`
+  — replicated, durable, and relayable exactly like a table schema.
+- **In-place schema *evolution* is also done:** `MetaCommand::ReplaceTableSchema`
+  atomically replaces a table's schema in one command/one apply (rejected if the
+  table has no schema — an ALTER cannot create a table). The CQL edge's `ALTER
+  TABLE ... ADD` uses it, so there is no window where a crash between a
+  drop-then-recreate could leave the table schema-less, unlike the earlier
+  two-command approach this ADR originally anticipated.
+- **Costs / follow-up:** none of substance remain for the catalog shape itself.
+  Index *data* (as opposed to *definitions*) staying edge-local — now with the
+  lazy backfill + race hardening described above — and drop+GC semantics for a
+  whole table, are covered by later ADRs (0024, 0028).
