@@ -513,15 +513,25 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
     per-node tablet list were equally wrong for the same reason. `CpRaftView` had
     no field identifying which physical node a group belongs to at all — only the
     fetching admin port's identity, which is not the same thing under a shared
-    edge. Fixed by adding `CpRaftView::node` (`lib.rs::raft_view`, the group's
-    member id translated back to a **base** raftkv id via `topology::cp_base_id` —
-    needed because a split tablet's member id is derived, `base + tablet *
-    CP_SPLIT_ID_STRIDE`, not the base id itself) and having `cpGroupsByTablet()`
-    resolve/dedupe by that real id (`nodeByRaftkv(g.node)`, keyed on `tablet:node`)
-    instead of the fetching node. **General lesson: a debug/admin view whose
-    response can legitimately be a cluster-wide aggregate (not just this node's own
-    state) must carry each item's own identity in the payload — a client cannot
-    infer "whose state is this" from which server answered.**
+    edge. Fixed by adding `CpRaftView::node` (`lib.rs::raft_view`) and having
+    `cpGroupsByTablet()` resolve/dedupe by that real id (`nodeByRaftkv(g.node)`,
+    keyed on `tablet:node`) instead of the fetching node. **General lesson: a
+    debug/admin view whose response can legitimately be a cluster-wide
+    aggregate (not just this node's own state) must carry each item's own
+    identity in the payload — a client cannot infer "whose state is this" from
+    which server answered.** (Originally `node` was the group's member id
+    translated back to a base raftkv id via a since-deleted `topology::
+    cp_base_id`, from when a split tablet's member id was derived,
+    `base + tablet * CP_SPLIT_ID_STRIDE` — ADR 0026 Stage B/ADR 0028 made a
+    tablet's member id simply the base id, so `node` is now just
+    `self.env().node_id()` directly, no translation. This *was* the exact bug
+    this file's "verify against the branch you'll edit" lesson warns about in
+    miniature: this fix and the split redesign landed on two branches that
+    never saw each other until they both merged into `main`, and git's
+    line-based merge combined them without a textual conflict — but the
+    result didn't compile, because the redesign deleted the function this fix
+    depended on. No amount of testing *either branch alone* would have caught
+    it; only building the actual post-merge `main` does.)
   - **Metrics are per-node sinks**: a follower's leader-only counters
     (`elections_won`, `append_entries_sent`) are legitimately 0, so `/admin/metrics`
     (and `/metrics`) is meaningful **per node** — scrape the control leader for the

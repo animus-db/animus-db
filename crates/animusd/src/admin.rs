@@ -62,14 +62,13 @@ use crate::{ClientCtx, ClientResponse};
 #[derive(serde::Serialize)]
 pub(crate) struct CpRaftView {
     pub(crate) tablet: u64,
-    /// The **base** `raftkv` id of the node hosting this replica (translated
-    /// from the group's internal member id via `topology::cp_base_id` — a
-    /// split tablet's member id is `base + tablet * CP_SPLIT_ID_STRIDE`, not
-    /// the base id itself). Needed because under `--cluster N` every node's
-    /// `/admin/raftkv` response lists **every** hosted replica across the
-    /// whole cluster (the shared `ClusterEdgeState`, see its doc), so a
-    /// client cannot infer which physical node a group belongs to from which
-    /// admin port answered the request.
+    /// The `raftkv` id of the node hosting this replica (since ADR 0026 Stage
+    /// B / ADR 0028 a tablet's CP group member id **is** simply this base id —
+    /// no derived-id translation needed). Needed because under `--cluster N`
+    /// every node's `/admin/raftkv` response lists **every** hosted replica
+    /// across the whole cluster (the shared `ClusterEdgeState`, see its doc),
+    /// so a client cannot infer which physical node a group belongs to from
+    /// which admin port answered the request.
     pub(crate) node: NodeId,
     pub(crate) backend: &'static str,
     pub(crate) role: String,

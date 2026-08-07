@@ -247,7 +247,9 @@ impl CpGroup {
     /// This group's Raft state for the `/admin/raftkv` view. The two engine arms
     /// call the identical `RaftKvNode` accessors, so a local macro keeps it DRY.
     fn raft_view(&self, tablet: TabletId) -> admin::CpRaftView {
-        let node = topology::cp_base_id(self.env().node_id(), tablet);
+        // Since ADR 0026 Stage B / ADR 0028 a tablet's CP group member id **is**
+        // simply the base `raftkv` id — no more derived-id translation needed.
+        let node = self.env().node_id();
         macro_rules! view {
             ($n:expr) => {
                 admin::CpRaftView {
