@@ -462,6 +462,120 @@ lifecycle's invariants and is directly `SimEnv`-testable:
   reconfigure's leader-gating, the has-data restart upgrade, and the
   reclaim/release replan-until-confirmed behavior.
 
+### Reconciler lifecycle corpus (ADR 0031 PR5, `tests/reconciler_corpus.rs`)
+
+The unit tests above prove `plan` correct as a pure function; `tests/
+reconciler.rs` proves ONE realistic end-to-end sequence through the executor;
+this corpus is the first **seed-reproducible fault-injection** suite for the
+whole tablet lifecycle (host → narrow-on-split → reconfigure → release →
+reclaim) — previously that layer was only exercised by the flaky-by-nature
+wall-clock `animusd` `ProdEnv` integration tests. It follows the house corpus
+doctrine (ADR 0014): a **frozen, name-seeded** scenario list
+(`scenario_cells()`), a depth knob, and structural coverage/seed-expansion
+guards.
+
+- **Harness**: each scenario builds its own small `Cluster` — a
+  `BTreeMap<NodeId, ClusterNode>` where each `ClusterNode` owns a real
+  `Reconciler<SimEnv, MemoryEngine>` + its own `MemoryEngine` — and drives it
+  by calling `tick(node, &view)` with hand-scripted `MetadataView`s standing
+  in for the control plane's actual output (no live control-plane `RaftNode`
+  needed; the reconciler's whole contract is "given views, converge
+  hosting"). Real `RaftKvNode` Raft groups form/elect/replicate under
+  `SimEnv` underneath each reconciler exactly as in production. Every
+  scenario runs as a **spawned task** driven by `Simulator::run_for` (the
+  house rule: never `block_on` a `tick()` whose planned action tears a group
+  down — `Reconciler::teardown` polls `env.sleep()` internally).
+- **`Simulator` gained `#[derive(Clone)]`** (this PR, `animus-sim`) to make
+  this possible: a scenario's own spawned "driver" task needs a `Simulator`
+  handle to call the `&self` fault-injection methods (`stop`, `crash`,
+  `partition_pair`, `heal`, `env`) from *inside* the async script, while the
+  outer synchronous test code keeps its own handle to drive `run_for`/
+  `run_until` (the only `&mut self` methods) — cloning just hands out another
+  reference to the same shared `Arc`-backed world, exactly like `SimEnv`'s
+  own `Clone` already does.
+- **The 18 frozen scenarios** (`ANIMUS_RECONCILER_SEEDS`, default 1 =
+  byte-identical to this list; variant 0 keeps every cell's canonical
+  name-derived seed):
+  1. `fresh_whole_keyspace_host_elect_serve`
+  2. `fresh_two_replica_group_hosts_on_both_nodes`
+  3. `split_narrows_source_hosts_sibling_no_double_count`
+  4. `rebalance_off_releases_with_bounded_erase_sparing_sibling`
+  5. `drop_table_reclaims_a_hosted_tablet`
+  6. `spare_join_as_non_voter_then_promoted_by_leader`
+  7. `growth_node_first_view_arrives_late_still_converges`
+  8. `reconfigure_removes_a_down_replica_first`
+  9. `narrow_scope_never_widens_defensively`
+  10. `idempotent_tick_on_converged_multi_tablet_state`
+  11. `reconfigure_transfers_leadership_before_removing_the_leader`
+  12. `crash_restart_single_replica_upgrades_via_has_data`
+  13. `crash_restart_follower_in_two_replica_group_rejoins_no_loss`
+  14. `replay_epoch_flicker_mid_release_count_resets_then_releases`
+  15. `replay_absent_then_present_reclaims_then_rehosts_empty`
+  16. `partition_during_removal_blocks_release_until_healed`
+  17. `split_then_immediate_release_zero_ticks_spares_sibling`
+  18. `re_add_after_exclusion_cancels_pending_release`
+
+  Scenario 15 is a deliberate **contract-boundary** test, not a bug
+  reproduction: `HostAction::Reclaim` has no dampener (unlike `Release`'s
+  `RELEASE_CONFIRM_TICKS`), by design — `plan`'s own doc says the caller
+  (`animusd`) is responsible for the `last_applied == 0` recovery guard that
+  keeps a control-plane WAL replay's transient historical states from ever
+  reaching `tick` in the first place. Feeding a present→absent→present
+  sequence directly (bypassing that guard) genuinely erases-then-rehosts
+  empty — proving *why* the guard is load-bearing, not a defect in this
+  crate. Scenario 17 is the sim-reproducible version of the real
+  split-then-immediate-release sibling-corruption regression (root
+  `CLAUDE.md`): it drives a real membership removal to completion **while**
+  a tablet's live `StorageScope` is still stale-wide (pre-narrow), then feeds
+  the excluded+already-narrowed view in one leap — zero ticks in which this
+  node ever observed "narrowed but still included" — and asserts the
+  co-hosted sibling's data survives the release's erase. The `ProdEnv`
+  version of this race only reproduced ~3/5 runs; this scenario reproduces it
+  deterministically every run.
+- **Depth found a real test-robustness gap, not a reconciler bug**: at
+  `ANIMUS_RECONCILER_SEEDS=60` and `=150`, two of this file's own
+  hand-rolled "force a real Raft membership removal" helpers occasionally hit
+  a `NotLeader` from `change_membership`/`transfer_leadership` immediately
+  after confirming `is_leader()` — a real, already-documented core behavior
+  (`change_membership`/`propose` **freeze** while a leadership transfer is
+  armed, reusing the `NotLeader` variant with the transfer target as the
+  "leader" hint, root `CLAUDE.md`'s leadership-transfer entry) that a
+  single-shot assert can't tell apart from a genuine failure. Fixed by making
+  `remove_replica_for_real` (and the equivalent inline dance in the
+  partition scenario) **retry the whole arm/transfer/propose sequence** on
+  every poll tick until the victim's own durable config excludes it, instead
+  of asserting success on the first attempt — the same "retry until
+  confirmed, don't single-shot a Raft propose" discipline used throughout
+  `animusd`'s own retry loops. Held green at `ANIMUS_RECONCILER_SEEDS=300`
+  (5,400 scenario runs) afterward.
+- **Invariant checks, generic across every scenario**: (a) hosting
+  convergence (`LocalState::hosted` equals the expected final placement,
+  `assert_hosted_converged`); (b) data safety (`assert_present`/
+  `assert_absent`, raw physical-key engine reads — every surviving tablet's
+  data readable, every released/reclaimed tablet's data erased, and a
+  co-hosted sibling's data never touched); (c) no zombie groups
+  (`assert_all_stopped` — a handle captured right before an expected teardown
+  must report `is_stopped()`); (d) idempotence (`assert_idempotent` — a
+  repeat `tick()` on an already-converged view changes no observable state:
+  hosted set, `on_host`/`on_teardown` call counts, every hosted tablet's live
+  scope range and Raft voter config). Note (d) is **not** "the second tick
+  emits zero actions" — `plan`'s own doc states `Reconfigure` is replanned
+  every tick a node leads a tablet's group, converged or not (itself a no-op
+  once the group matches `desired`) — "idempotent" here means the observable
+  *state* doesn't drift, which is the property that actually matters to a
+  caller.
+- **To add a scenario**: write a `fn scenario_my_thing(seed: u64)` following
+  the existing ones' shape (`run(seed, |sim| async move { .. })`), add a
+  `scenario!("my_thing_name", scenario_my_thing)` line to `scenario_cells()`,
+  and run it under `ANIMUS_RECONCILER_SEEDS=100` (or higher) before trusting
+  it — a hand-scripted lifecycle sequence can still hide a seed-dependent
+  timing assumption, as the two fixes above show. Run any *new* scenario
+  under `timeout` the first time (a hang means the same-instant
+  unbounded-work-loop class of bug, not slowness — see the root `CLAUDE.md`).
+- **Run at depth**: `ANIMUS_RECONCILER_SEEDS=K cargo test -p animus-cp-data
+  --test reconciler_corpus reconciler_corpus_runs_every_scenario` (default
+  `K=1`; held green through `K=300`, i.e. 5,400 scenario runs, in ~52s).
+
 ## Tests
 
 `cargo test -p animus-cp-data` — `tests/single_tablet.rs` (SimEnv; drive with
@@ -479,4 +593,7 @@ end to end under `SimEnv` — see the host-module section above. Note its
 documented `SimEnv` gotcha: a `tick()` whose planned action tears a group
 down internally polls `env.sleep()` (waiting out `is_stopped()`), so the
 whole scenario runs as a spawned task driven by `Simulator::run_for`, never a
-bare `block_on`.
+bare `block_on`. `tests/reconciler_corpus.rs` (ADR 0031 PR5) is the frozen,
+name-seeded `SimEnv` lifecycle fault-injection corpus (18 scenarios) built on
+top of that same discipline — see the "Reconciler lifecycle corpus" section
+above for the scenario list, the depth knob, and how to add a scenario.

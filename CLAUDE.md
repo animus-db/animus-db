@@ -563,6 +563,63 @@ to the archive stays in place below.
   drive cross-process-style forwarding in-process for the first time instead
   of resolving everything locally through the shared registry. (`animusd`
   `tests/cql_wire.rs::cql_wire_prepare_execute_typed_round_trip`.)
+- **A test that hand-drives a real Raft transfer/membership change must retry
+  the whole arm/propose sequence on a poll tick, never assert success on one
+  attempt — even when the immediately-preceding `is_leader()` check was
+  synchronous and just returned true.** Building the ADR 0031 PR5 reconciler
+  lifecycle corpus, two hand-rolled "force a real membership removal" test
+  helpers passed every run at low seed depth and then hit
+  `NotLeader{leader: Some(<the exact node just confirmed as leader>)}` from
+  `change_membership`/`transfer_leadership` at `ANIMUS_RECONCILER_SEEDS=60`
+  and `=150` — a real, already-documented core behavior (`propose`/
+  `change_membership` **freeze**, returning `NotLeader` with the *transfer
+  target* as the "leader" hint, while a leadership transfer is armed
+  elsewhere in the group; see this file's "two-layer gate" entry) that a
+  single-shot assert cannot distinguish from a genuine failure. No amount of
+  sleeping between the `is_leader()` check and the propose call closes this,
+  because the freeze can arm *after* the check — the fix is to fold the
+  whole "check → act" sequence into the body of a bounded retry poll (`check
+  condition; if not met, attempt the action; return false; poll again`) and
+  only fail once the bound is exhausted, exactly like every production retry
+  loop in this codebase already must (`ProposeResult::Accepted` isn't
+  `committed`, and `NotLeader` isn't necessarily permanent). This is the same
+  discipline as the standing "a retry loop over a Raft write must distinguish
+  never-accepted from accepted-unconfirmed" entry, just showing up inside a
+  *test's* orchestration code instead of production code — seed depth is what
+  surfaced it, at low depth every run happened to avoid the race window.
+  (`animus-cp-data/tests/reconciler_corpus.rs::remove_replica_for_real`,
+  `scenario_partition_blocks_release`.)
+- **`RaftKvNode::linearizable_get`/`linearizable_scan` only ever serve on the
+  confirmed leader — calling them on a follower returns `None` unconditionally
+  (the ReadIndex ban unconditionally fails for a non-leader), not a slow or
+  stale read.** A test that wants to confirm a write *replicated* to a
+  follower (as opposed to confirming linearizability) must read that
+  follower with `local_get` (a raw, non-linearizable engine read), not
+  `linearizable_get` — calling the latter on whichever handle isn't currently
+  leading is not "testing the follower," it's testing a guaranteed `None`,
+  and asserting `Some(value)` against it fails deterministically regardless
+  of how long you wait. Caught immediately (first run) by the ADR 0031 PR5
+  reconciler corpus's 2-replica scenarios asserting both replicas' handles
+  via `linearizable_get` — fixed by reading the leader linearizably and
+  polling the follower with `local_get`.
+- **Making a simulator/executor handle `Clone`-able (when its fields are
+  already `Arc`-backed shared state) is a small, safe, additive change worth
+  making the moment a test needs to carry fault-injection capability *into* a
+  spawned async task** — don't route around the missing `Clone` with an
+  awkward workaround (a channel back to the outer synchronous scope, a
+  second parallel handle type, restructuring every scenario to interleave
+  fault injection from the outside). `animus-sim::Simulator` held only an
+  `Arc<Shared>` + a `u64` seed, had no `Drop`, and its per-node handle
+  (`SimEnv`) was already `Clone` for exactly this reason — so adding
+  `#[derive(Clone)]` to `Simulator` itself cost nothing and immediately
+  unblocked a harness where each scenario's own spawned "driver" task needs
+  to call `&self` fault methods (`stop`/`crash`/`partition_pair`/`heal`/
+  `env`) while the outer test thread keeps a separate handle for the `&mut
+  self` `run_for`/`run_until` driving loop. Check for a `Drop` impl and
+  whether every field is itself cheaply `Clone`-able before assuming a type
+  wasn't made `Clone` for a real reason — here it clearly wasn't, it just
+  hadn't been needed yet. (`animus-sim::Simulator`;
+  `animus-cp-data/tests/reconciler_corpus.rs`.)
 
 ### Code patterns
 - **A quorum primitive's "who do I need acks from" and "how many acks do I
