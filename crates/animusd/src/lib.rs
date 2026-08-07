@@ -2759,9 +2759,12 @@ async fn cp_gc_loop(host: CpHostCtx) {
             .collect();
 
         // Phase 1 (ADR 0024): reclaim tablets whose whole table was dropped
-        // (absent from the map).
+        // (absent from the map). The tablet is gone from `Metadata` entirely, so
+        // there is no current range to narrow to — every same-prefix sibling still
+        // present is dying in this same pass too (the whole table was dropped), so
+        // erasing this group's full (possibly stale-wide) scope is correct here.
         for tablet in topology::tablets_to_reclaim(&mine, &tablets) {
-            cp_gc_tablet(&host, tablet).await;
+            cp_gc_tablet(&host, tablet, None).await;
         }
 
         // Phase 2 (ADR 0029): release tablets still present but moved off this
@@ -2838,20 +2841,54 @@ async fn cp_gc_release_phase(
                 .lock()
                 .expect("pending_release poisoned")
                 .remove(&tablet);
-            cp_gc_tablet(host, tablet).await;
+            // Bound the erase by the tablet's CURRENT replicated range (see
+            // `cp_gc_tablet`'s doc) — never the group's in-memory `StorageScope`,
+            // which can still be stale-wide if this node was dropped from the
+            // replica set before its own `cp_join_host_loop` narrow tick ran.
+            // `tablets_to_release` only returns present tablets, so this is
+            // always `Some` in practice.
+            let current_range = tablets.get(&tablet).map(|t| t.range.clone());
+            cp_gc_tablet(host, tablet, current_range).await;
         }
     }
 }
 
-/// Reclaim this node's local artifacts of a dropped `tablet` (the body of
-/// [`cp_gc_loop`]). Every step is idempotent and ordered so a crash anywhere
-/// mid-teardown converges on a later tick or the next restart: unregister the
-/// handle (routing/admin stop seeing the group), stop the driver and wait for
-/// its exit (the engine/WAL quiesce), tombstone the tablet's own range out of the
-/// **shared** engine (never touching a sibling tablet's data — bounded by the
-/// group's own `StorageScope`), delete its WAL file, then release the `minted`
-/// claim.
-async fn cp_gc_tablet(host: &CpHostCtx, tablet: TabletId) {
+/// Reclaim this node's local artifacts of a dropped-or-released `tablet` (the
+/// body of [`cp_gc_loop`]). Every step is idempotent and ordered so a crash
+/// anywhere mid-teardown converges on a later tick or the next restart:
+/// unregister the handle (routing/admin stop seeing the group), stop the driver
+/// and wait for its exit (the engine/WAL quiesce), tombstone the tablet's own
+/// range out of the **shared** engine (never touching a sibling tablet's data),
+/// delete its WAL file, then release the `minted` claim.
+///
+/// **`current_range`, and why the erase must be bounded by it, not the group's
+/// own `StorageScope` (root `CLAUDE.md` engineering-practices entry: a teardown
+/// that erases "my own scope" must re-derive the scope from replicated state at
+/// the point of irreversible action).** The **release** path (ADR 0029 phase 2 —
+/// the tablet still exists in `Metadata`, just no longer on this node) must pass
+/// the tablet's **current replicated range** (`Metadata.tablets[tablet].range`)
+/// here, so this function narrows the group's `StorageScope` to it (via
+/// [`CpGroup::narrow_scope`]) *before* calling
+/// [`erase_scope`](CpGroup::erase_scope). Without this, a node whose
+/// `cp_join_host_loop` narrow tick hasn't yet run since a split can carry a
+/// **stale-wide** `StorageScope` — a split narrows the source tablet's range in
+/// `Metadata` immediately, but the source's already-hosted `RaftKvNode`'s own
+/// scope object is only re-narrowed on that loop's next ~250ms tick
+/// (`CP_JOIN_HOST_INTERVAL`) — and if a rebalance/repair/drain drops this node
+/// from the source's replica set inside that window, the release GC would erase
+/// the group's still-wide scope, which (since ADR 0026/0028 puts every tablet a
+/// node hosts on one shared engine) tombstones the split's new sibling's live
+/// keys too, at a version high enough to beat the sibling's own fresh writes
+/// under per-key LWW — silent, permanent corruption of a tablet this node was
+/// never even asked to release. `narrow_scope` is documented narrow-only
+/// (`StorageScope::narrow`'s caller contract), and the current replicated range
+/// is always a subset of (or equal to) whatever the group's own scope already
+/// covers, so this is always a narrowing, never a widening. The **reclaim** path
+/// (phase 1 — the tablet is absent from `Metadata` because its whole table was
+/// dropped) passes `None`: there is no current range to narrow to, and every
+/// same-prefix sibling still resident is dying in the same GC pass, so erasing
+/// the group's full existing scope is correct there.
+async fn cp_gc_tablet(host: &CpHostCtx, tablet: TabletId, current_range: Option<KeyRange>) {
     // No registered handle means the stand-up path claimed `minted` but has not
     // finished (start in flight) — retry on a later tick rather than erasing data
     // under a group mid-standup.
@@ -2874,6 +2911,12 @@ async fn cp_gc_tablet(host: &CpHostCtx, tablet: TabletId) {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
+    // Bound the erase to the tablet's current replicated range (release path
+    // only) — see the doc comment above for why the group's own `StorageScope`
+    // cannot be trusted here.
+    if let Some(range) = current_range {
+        group.narrow_scope(range);
+    }
     group.erase_scope().await;
     let env = group.env().clone();
     if let Err(e) = env.remove(&animus_cp_data::wal_file(tablet.0)).await {

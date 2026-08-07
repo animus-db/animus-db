@@ -245,8 +245,49 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   tablet on any node. `tests/cp_rebalance_gc.rs` (a `CasTabletReplicas` move-off →
   stop + erase; release converges across a restart-replay without resurrecting,
   while an unrelated still-hosted tablet is untouched; a repair-onto-spare join is
-  never prematurely erased), plus the pure `tablets_to_release` unit tests in
-  `src/topology.rs`.
+  never prematurely erased; a split immediately followed by a release does not
+  corrupt the new sibling — see below), plus the pure `tablets_to_release` unit
+  tests in `src/topology.rs`.
+- **The release path must bound its erase by the tablet's CURRENT replicated
+  range, never the group's in-memory `StorageScope` — the latter can be
+  stale-wide for a just-split tablet.** The only place a source tablet's
+  already-hosted `RaftKvNode` scope is ever re-narrowed after a split is
+  `cp_join_host_loop`'s per-tick `narrow_scope` call (above) — and that call is
+  **permanently** skipped for a tablet the instant this node leaves its
+  replica set (`plan_join_host` returns `None` → the loop's `continue`, never
+  touching that tablet's scope again). So: split T at M (T keeps `[start,M)`,
+  new sibling C gets `[M,end)`, both on node X's one shared engine); if a
+  rebalance/repair/drain drops X from **T's** replica set before X's own
+  join-host tick has re-narrowed T's scope to the post-split range, that
+  scope is frozen stale-wide *forever* on X — and when the release GC later
+  erases T on X, an unbounded `erase_scope()` would tombstone every key under
+  T's *pre-split* wide range, including C's live keys (X is typically still a
+  replica of C, since the split only touched T's replica set) — permanent,
+  silent corruption of a tablet X was never even asked to release, at a
+  version high enough to beat C's own fresh writes under per-key LWW. Fixed by
+  having `cp_gc_tablet` take an optional `current_range: Option<KeyRange>` —
+  the release phase passes the tablet's *current* `Metadata.tablets[t].range`
+  (always available: `tablets_to_release` only returns present tablets) and
+  `cp_gc_tablet` calls `group.narrow_scope(range)` immediately before
+  `erase_scope()`; the reclaim phase (whole table dropped, tablet absent from
+  `Metadata`) passes `None` since there is no current range to narrow to and
+  every same-prefix sibling still resident is dying in the same pass anyway.
+  `narrow_scope` is documented narrow-only, and the current replicated range
+  is always a subset of (or equal to) whatever the group's own scope already
+  covers, so this is always a narrowing, never a widening. Regression tests:
+  a deterministic primitive-level proof at `animus-cp-data/tests/
+  narrow_scope.rs::narrow_then_erase_scope_spares_a_co_hosted_siblings_data`
+  (build both halves of a whole-scope group, narrow, erase, assert the
+  untouched half's value **and version** survive — no timing needed), and an
+  end-to-end `tests/cp_rebalance_gc.rs::
+  split_then_immediate_release_spares_the_new_siblings_data` that proposes the
+  split and the parent's replica-set CAS back-to-back on the control leader's
+  own log (round-tripping the split through the wire protocol first gives the
+  ~250ms join-host tick time to self-heal the scope before the drop lands,
+  hiding the bug — empirically this made the difference between the E2E test
+  catching the pre-fix bug 0/5 times vs. ~3/5 times) and confirms the child's
+  data survives both cluster-wide and in the dropped node's own local storage.
+  See the root `CLAUDE.md` engineering-practices entry for the general lesson.
 - **`resolve_cp_route`'s `has_local_replica` gate must re-verify against this
   node's own current Raft config, not just "do I have a registered handle at
   all" — a lesson the release-GC's own grace window (above) creates.** Before
