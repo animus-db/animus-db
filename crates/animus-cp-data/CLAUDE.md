@@ -344,6 +344,76 @@ the engine — the `AccordCore` sync-core/async-driver split.
   section and ADR 0017's original text for archaeology — it no longer
   describes any code in this crate.
 
+## Per-node tablet-host reconciler (ADR 0031, `host` module)
+
+**Purely additive, PR3 of the ADR 0031 consolidation — nothing in this crate
+calls it yet.** `animusd` currently scatters "which tablets does this node
+host, and what should it do about each one" across four independent `ProdEnv`
+loops (`cp_join_host_loop`/`cp_join_host`, `cp_gc_loop`/`cp_gc_release_phase`,
+`cp_reconfigure_loop`), each re-deriving its own slice of replicated
+`Metadata` and its own per-node bookkeeping (`minted`, `pending_release`).
+`host::plan` unifies the *decision* those four loops make into one pure,
+synchronous function — mirroring this crate's own sync-core/async-driver
+split (`RaftCore` decides, the driver does I/O): **the decision lives here and
+is unit-tested directly; the timing, locking, and actual `ProdEnv` I/O stay in
+`animusd`.** A sibling PR (PR4) wires `animusd`'s four loops to call `plan`
+instead of re-deriving the logic inline; until then this module has zero
+production callers (like `RaftKvNode::scope_range` before its own wiring
+landed — see the root `CLAUDE.md`'s "safety mechanism with zero production
+callers" entry, though here it's *intentional* per the PR split, not a gap).
+
+- **Contract**: `plan(view: &MetadataView, facts: &BTreeMap<TabletId,
+  TabletFacts>, state: &LocalState, base_id: NodeId) -> (Vec<HostAction>,
+  LocalState)`. Pure and synchronous — no `Env`, clock, RNG, or I/O.
+  `MetadataView` is a small owned projection (`tablets: BTreeMap<TabletId,
+  Tablet>`, `down: BTreeSet<NodeId>`) — deliberately *not* the whole
+  `animus_control::Metadata`, keeping this crate decoupled from the control
+  plane's full state shape. `TabletFacts` bundles the impure per-tablet inputs
+  the caller must gather before calling (`hosted`, `is_leader`,
+  `config_excludes_me`, `scope_range`, `has_data` — see each field's doc for
+  exactly which live read backs it). `LocalState` is the pure-state mirror of
+  `animusd`'s `minted` claim set + `pending_release` epoch-stability
+  dampener, threaded from one `plan` call to the next.
+- **Actions, in a fixed emission order** (`NarrowScope` → `Host` →
+  `Reconfigure` → `Release`/`Reclaim`): `HostAction::NarrowScope` (narrow an
+  already-hosted tablet's scope to its current metadata range — provably
+  narrow-only, `is_subrange`), `Host` (stand up a fresh/joining/restarting
+  tablet), `Reconfigure` (one `reconfigure_step` toward the desired replica
+  set for every tablet this node leads, carrying the down-set), `Release`
+  (tear down a tablet moved off this node, gated by
+  `RELEASE_CONFIRM_TICKS` consecutive confirming calls at an unchanged
+  epoch — the ADR 0029 dampener, ported verbatim) and `Reclaim` (tear down a
+  tablet whose whole table was dropped). `Release`'s `erase_bound` is always
+  the tablet's **current** metadata range, never a `TabletFacts::scope_range`
+  fact — the sibling-corruption regression (root `CLAUDE.md`) is now provable
+  directly in a unit test
+  (`release_erase_bound_is_always_the_current_metadata_range_never_the_stale_scope_fact`)
+  instead of only via a timing-dependent end-to-end reproduction.
+- **`plan` never removes a tablet from `LocalState::hosted` on its own** when
+  emitting `Reclaim`/`Release` — real teardown is async and can time out
+  (mirroring `cp_gc_tablet`'s conditional `minted.remove`, which only fires
+  once shutdown + erase + WAL removal actually succeed). The caller calls
+  `LocalState::confirm_torn_down` once its own teardown has actually
+  completed; until then, the next `plan` call keeps re-planning the same
+  action, exactly like the real loop retrying on a later tick
+  (`a_pending_reclaim_is_replanned_until_confirmed_torn_down`).
+- `plan_join_host`, `tablets_to_reclaim`, `tablets_to_release` are also
+  exported standalone (not just as `plan` internals) — direct semantic ports
+  of `animusd::topology`'s functions of the same name, parity-tested against
+  the same cases. `plan_join_host`'s `initial_formation` decision (fresh
+  formation vs. non-voter join, keyed on `epoch <= Epoch::INITIAL`) is
+  unchanged from `animusd::topology`; the async `StorageScope::has_data`
+  restart-upgrade this crate can't do stays a caller-gathered fact
+  (`TabletFacts::has_data`), exactly as it does in `animusd::cp_join_host`
+  today.
+- 29 unit tests in `src/host.rs` (`cargo test -p animus-cp-data --lib host::`):
+  parity ports of every `animusd::topology` test case, idempotence on a
+  converged state, reclaim/release mutual exclusion on arbitrary input, the
+  release dampener's exact-N-ticks/epoch-reset/re-add-cancels semantics, the
+  narrow-only invariant (never widens), reconfigure's leader-gating, the
+  has-data restart upgrade, and the reclaim/release replan-until-confirmed
+  behavior.
+
 ## Tests
 
 `cargo test -p animus-cp-data` — `tests/single_tablet.rs` (SimEnv; drive with
