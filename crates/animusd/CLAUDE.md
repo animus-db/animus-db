@@ -19,8 +19,33 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   dir)` binds *this* node and starts it.
 - `bind_cluster` / `start_cluster` — spin up an in-process cluster (the binary's
   `--cluster N` mode and `tests/cluster.rs`).
+- `run_node_growth` — start a node as an ADR 0030 **growth member** from an
+  operator-assembled *expanded* config (its control role is a permanent
+  non-voter of the pre-growth control group; `start_with` detects this and
+  spawns `remote_metadata_sync_loop`). **`run_node_join`** — the ADR 0032 PR2
+  **seed/join** variant: the node starts knowing only its own `RoleAddrs` +
+  a seed list (any existing nodes' **client** addresses), fetches
+  `ClientRequest::JoinInfo` from a seed (the pre-growth `control_ids` + the
+  answering node's peer book + its live `client_route` + admin addrs — any
+  node answers from its own knowledge, no forwarding), runs a **collision
+  guard** against a `Status` reply's `node_addrs` (an identical entry at my
+  raftkv id = a rejoin, proceed; a different one = fail `AlreadyExists`
+  before binding anything), then calls the exact same `start_with` shape
+  `run_node_growth` does. **Every growth node self-registers its membership
+  automatically**: `start_with`'s growth-node block (the
+  `!control_ids.contains(&control_id)` branch) spawns a one-shot
+  `admin_add_member` (idempotent `UpsertMember{Down}`, relayable) alongside
+  `remote_metadata_sync_loop` — so neither growth entry point needs a
+  separate `POST /admin/member/add` (still supported; now an idempotent
+  no-op confirmation, which `tests/cluster_growth.rs` keeps exercising).
+  CLI: `animusd join --seed ADDR[,ADDR...] --node I [--ip A] [--base-port P]
+  [--dir D] [--ephemeral]` binds six consecutive ports from `--base-port`
+  (default `7100 + 6*I`, mirroring `gen-config`'s stride/role order).
+  `tests/seed_join.rs` covers happy path / collision / rejoin.
 - `ClientRequest` / `ClientResponse` + `read_frame` / `write_frame` — the
   length-prefixed JSON client protocol (reused by `animus-cli`).
+  `ClientRequest::JoinInfo` → `ClientResponse::JoinInfo` is the join
+  discovery pair (ADR 0032 PR2, above).
 - `dynamo` module — the **DynamoDB JSON-over-HTTP endpoint** (a fifth listener
   per node). A hand-rolled HTTP/1.1 server decodes `X-Amz-Target` +
   AttributeValue-JSON via `animus_dynamo::wire`, then routes through the **same

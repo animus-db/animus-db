@@ -1,11 +1,12 @@
 //! AnimusDB node server (`animusd`).
 //!
-//! Three modes:
+//! Four modes:
 //!
 //! ```text
 //! animusd gen-config --nodes N [--host H] [--base-port P]   # print a cluster config (JSON)
 //! animusd --config FILE --node I [--dir DIR] [--ephemeral] # run node I of a cluster (one process)
 //! animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] # run an N-node cluster in one process
+//! animusd join --seed ADDR[,ADDR...] --node I [--ip A] [--base-port P] [--dir D] [--ephemeral] # seed/join startup (ADR 0032 PR2)
 //! ```
 //!
 //! The data replica is durable by default (an on-disk LSM under the node's data
@@ -13,12 +14,16 @@
 //! in-memory engine instead.
 //!
 //! Per-process deployment: generate a config once, copy it to each host, and run
-//! `animusd --config cluster.json --node I` with a distinct `I` per process.
+//! `animusd --config cluster.json --node I` with a distinct `I` per process. A
+//! node that has no expanded config at all — just the client address of any
+//! already-running node — can instead `animusd join --seed <that address>
+//! --node I`, learning everything else it needs from the cluster itself (ADR
+//! 0032 PR2: a real data-plane member, control group unchanged, ADR 0030).
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::process::ExitCode;
 
-use animusd::ClusterConfig;
+use animusd::{ClusterConfig, RoleAddrs};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -27,6 +32,7 @@ async fn main() -> ExitCode {
 
     let result = match args.first().map(String::as_str) {
         Some("gen-config") => gen_config(&args[1..]),
+        Some("join") => run_join(&args[1..]).await,
         _ => run(&args).await,
     };
 
@@ -48,10 +54,12 @@ async fn main() -> ExitCode {
 }
 
 /// A short `service.instance.id` label for the OTLP `Resource` (ADR 0027):
-/// this process's node index for a `--config/--node` run, or a cluster-level
-/// label for a `--cluster N` run (which hosts several logical nodes in one
-/// process, so no single node id applies at the process/resource level —
-/// per-span `node_id` fields still distinguish them within a trace).
+/// this process's node index for a `--config/--node` run — the `--node` scan
+/// also covers `join --node I` (ADR 0032 PR2), which runs one node per
+/// process just like `--config` mode — or a cluster-level label for a
+/// `--cluster N` run (which hosts several logical nodes in one process, so
+/// no single node id applies at the process/resource level — per-span
+/// `node_id` fields still distinguish them within a trace).
 fn otel_instance_label(args: &[String]) -> String {
     if let Some(pos) = args.iter().position(|a| a == "--node") {
         if let Some(index) = args.get(pos + 1) {
@@ -67,7 +75,8 @@ fn otel_instance_label(args: &[String]) -> String {
 const USAGE: &str = "usage:\n  \
     animusd gen-config --nodes N [--host H] [--base-port P]\n  \
     animusd --config FILE --node I [--dir DIR] [--ephemeral]\n  \
-    animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K]";
+    animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K]\n  \
+    animusd join --seed ADDR[,ADDR...] --node I [--ip A] [--base-port P] [--dir D] [--ephemeral]";
 
 /// `gen-config`: print a generated cluster config as JSON.
 fn gen_config(args: &[String]) -> Result<(), String> {
@@ -151,6 +160,83 @@ async fn run_single(
     println!(
         "animusd: node {index}/{} up (CP) — client {} — dynamo http {} — cql {} — admin http://{}",
         config.len(),
+        node.client_addr(),
+        node.dynamo_addr(),
+        node.cql_addr(),
+        node.admin_addr(),
+    );
+    println!("animusd: ready — Ctrl-C to stop");
+    wait_for_ctrl_c().await;
+    node.shutdown_graceful().await;
+    Ok(())
+}
+
+/// `join`: seed/join startup (ADR 0032 PR2) — a new node starts knowing only
+/// its own addresses + a seed list (client addresses of any existing nodes),
+/// learning the pre-growth control group + peer/route/admin address books
+/// from the cluster itself instead of an operator-assembled expanded
+/// `ClusterConfig`. See [`animusd::run_node_join`]'s doc for the collision
+/// guard + growth semantics this drives.
+async fn run_join(args: &[String]) -> Result<(), String> {
+    let mut seed_arg: Option<String> = None;
+    let mut index: Option<usize> = None;
+    let mut ip: IpAddr = "127.0.0.1".parse().unwrap();
+    let mut base_port: Option<u16> = None;
+    let mut dir: Option<std::path::PathBuf> = None;
+    let mut backend = animusd::StorageBackend::default();
+
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--seed" => seed_arg = Some(parse_next::<String>(&mut it, "--seed")?),
+            "--node" => index = Some(parse_next(&mut it, "--node")?),
+            "--ip" => ip = parse_next(&mut it, "--ip")?,
+            "--base-port" => base_port = Some(parse_next(&mut it, "--base-port")?),
+            "--dir" => dir = Some(parse_next::<String>(&mut it, "--dir")?.into()),
+            "--ephemeral" => backend = animusd::StorageBackend::Memory,
+            other => return Err(format!("unknown join argument `{other}`")),
+        }
+    }
+
+    let seed_arg = seed_arg.ok_or("join requires --seed ADDR[,ADDR...]")?;
+    let index = index.ok_or("join requires --node I")?;
+    let seeds: Vec<SocketAddr> = seed_arg
+        .split(',')
+        .map(|s| {
+            s.trim()
+                .parse::<SocketAddr>()
+                .map_err(|e| format!("invalid --seed address `{s}`: {e}"))
+        })
+        .collect::<Result<_, _>>()?;
+    if seeds.is_empty() {
+        return Err("join requires at least one --seed address".into());
+    }
+
+    // Six consecutive ports, same stride/role order as `ClusterConfig::generate`
+    // (control/client/dynamo/cql/raftkv/admin) — defaults to `7100 + 6*index`,
+    // mirroring `gen-config`'s own per-node base port so a joined node's
+    // default addresses land in the same conventional range as a
+    // `gen-config`-generated cluster's node `index`, without colliding with
+    // it (each index's 6-port block is disjoint). Pass `--base-port`
+    // explicitly for anything less conventional (a different host, a
+    // manually-chosen port range).
+    let base_port = base_port.unwrap_or(7100_u16.wrapping_add((index as u16).wrapping_mul(6)));
+    let p = |role: u16| SocketAddr::new(ip, base_port.wrapping_add(role));
+    let addrs = RoleAddrs {
+        control: p(0),
+        client: p(1),
+        dynamo: p(2),
+        cql: p(3),
+        raftkv: p(4),
+        admin: p(5),
+    };
+    let dir = dir.unwrap_or_else(|| std::env::temp_dir().join(format!("animusd-join-{index}")));
+
+    let node = animusd::run_node_join(seeds, index, addrs, &dir, backend)
+        .await
+        .map_err(|e| format!("failed to join as node {index}: {e}"))?;
+    println!(
+        "animusd: node {index} joined (CP) — client {} — dynamo http {} — cql {} — admin http://{}",
         node.client_addr(),
         node.dynamo_addr(),
         node.cql_addr(),

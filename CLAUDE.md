@@ -620,6 +620,37 @@ to the archive stays in place below.
   wasn't made `Clone` for a real reason — here it clearly wasn't, it just
   hadn't been needed yet. (`animus-sim::Simulator`;
   `animus-cp-data/tests/reconciler_corpus.rs`.)
+- **The rebalancer converges the *global* imbalance to `max − min ≤ 1` and
+  stops — it makes no per-table promise, so a test must not route an op
+  through ONLY a just-grown node for an *arbitrary* table.** Building the ADR
+  0032 PR2 seed/join test, "the joined node hosts a replica of *some* tablet"
+  is the stable rebalancing signal, but writing through only that node's
+  client address for a table it does *not* replicate flakes bimodally
+  (~40%): `resolve_cp_route`'s no-local-replica branch forwards blindly to
+  *some known replica* of the tablet — not its leader — and the receiving
+  `cp_serve_forwarded` never re-forwards (routing is bounded to one hop), so
+  a forward that lands on a follower errors "not the leader here" on every
+  retry with the same first-listed replica. Two sound test shapes: gate on
+  the *specific table* the node actually replicates (poll `/admin/status`'s
+  per-tablet `table` + `replicas` and pick that table for the
+  through-only-this-node ops), or give the client every node's address
+  (`cluster_growth.rs`'s round-robin `put`). The one-hop-blind-forward
+  behavior itself is a known production shape (the client is expected to
+  retry with fresh routing), not a bug this test should have papered over
+  with a longer timeout. (`animusd` `tests/seed_join.rs::table_with_replica`.)
+- **Adding an automatic background registration/bring-up step makes any
+  test's "not yet registered" pre-assertion a race, not an invariant — sweep
+  for assertions on the *absence* of state the new automation now
+  establishes.** Folding growth-node membership self-registration into
+  `start_with` (ADR 0032 PR2) broke `cluster_growth.rs`'s sanity check that
+  a freshly-started growth node "should not be a member before admin-add" —
+  intermittently (the self-registration + heartbeat promotion can complete
+  before the test's first poll, or not), the worst kind of breakage. The
+  dual of the documented "removed shortcut → grep for tests that relied on
+  it" lesson: an *added* automation invalidates assertions about the
+  pre-automation quiescent state. The honest fix is to delete the stale
+  pre-assertion and let the convergent post-state assertion (it *does*
+  become `Active`) carry the proof. (`animusd` `tests/cluster_growth.rs`.)
 
 ### Code patterns
 - **A quorum primitive's "who do I need acks from" and "how many acks do I

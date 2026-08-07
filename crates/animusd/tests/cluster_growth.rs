@@ -1,11 +1,15 @@
 //! **Online cluster growth** (ADR 0030): a 3-node cluster (declaring only 3 in
 //! its config) is created, has tables provisioned + written to, and is then
 //! grown to 5 nodes with an **expanded config** — no restart of the original 3.
-//! The two new nodes are `POST /admin/member/add`-ed (registered `Down`), their
-//! own `heartbeat_loop` promotes them to `Active` on first contact (ADR 0012's
-//! unmodified detector), and automatic rebalancing (ADR 0029) then spreads the
-//! pre-existing tablets' replicas onto them with no further operator action.
-//! Reads/writes keep working throughout.
+//! The two new nodes self-register `Down` automatically as part of
+//! `start_with` (ADR 0032 PR2 folded `ClientCtx::admin_add_member` into every
+//! growth node's own bring-up); this test also still calls
+//! `POST /admin/member/add` explicitly for each, now exercising that
+//! primitive's idempotent no-op path rather than the only way in. Either way,
+//! each new node's own `heartbeat_loop` promotes it to `Active` on first
+//! contact (ADR 0012's unmodified detector), and automatic rebalancing (ADR
+//! 0029) then spreads the pre-existing tablets' replicas onto them with no
+//! further operator action. Reads/writes keep working throughout.
 //!
 //! The control group genuinely never grows (ADR 0030's documented v1
 //! limitation): the two new nodes run a **control-plane-follower-less** control
@@ -349,19 +353,25 @@ async fn cluster_grows_from_three_to_five_and_rebalances() {
     // serving" once a tablet's leader can have moved onto a new node.
     let all_clients: Vec<SocketAddr> = expanded_config.nodes.iter().map(|a| a.client).collect();
 
-    // A freshly-started, never-declared node must not be a member at all yet
-    // (sanity: rules out a vacuous "already Active from somewhere else" pass).
-    let pre_add = member_statuses(all_admin[0]).await;
-    for &id in new_ids {
-        assert!(
-            !pre_add.contains_key(&id),
-            "node {id} should not be a member before admin-add: {pre_add:?}"
-        );
-    }
+    // Note: this test used to assert here that a freshly-started growth node
+    // is not yet a member (sanity: rules out a vacuous "already Active from
+    // somewhere else" pass). ADR 0032 PR2 made every growth node
+    // self-register itself `Down` as part of `start_with` (the same
+    // `admin_add_member` primitive `POST /admin/member/add` calls below) and
+    // its own `heartbeat_loop`/detector promotion chain starts just as
+    // immediately, so neither "not a member yet" nor even "not yet Active"
+    // is a stable window to assert on any more — by the time `grow()`
+    // returns and this test can poll, `303`/`304` may already be fully
+    // `Active` (observed live: a real race, not a hypothetical). The
+    // meaningful invariant — every new node reaches `Active` promptly with
+    // no operator action beyond starting it — is what step 5 already proves.
 
     // 4. Admin-add each new node (registers `Down`) — called on one of the
     // *original* nodes' admin ports, the simplest reliable operator path (the
-    // relay reaches whichever control node currently leads).
+    // relay reaches whichever control node currently leads). Now redundant
+    // with each node's own automatic self-registration (ADR 0032 PR2), but
+    // kept as the regression proving `admin_add_member`'s idempotent-no-op
+    // path still works when a member is already registered.
     for &id in new_ids {
         let (status, body) = admin(
             base_admin[0],

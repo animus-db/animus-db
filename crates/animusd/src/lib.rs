@@ -26,7 +26,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -534,6 +534,17 @@ pub enum ClientRequest {
     /// gone; see the root `CLAUDE.md`). The interim manual trigger; an automatic
     /// size-telemetry trigger is `auto_split_loop`.
     SplitTablet { tablet: u64, split_key: Vec<u8> },
+    /// **Join discovery** (ADR 0032 PR2, `animusd join`): a node that knows only
+    /// a *seed* address (any already-running node's client address — old or
+    /// newly grown, PR1 made every node's address book equally current) asks
+    /// for enough information to start as a growth member without an
+    /// operator-assembled expanded `ClusterConfig`. Any node can answer — the
+    /// reply is built entirely from the receiving node's own knowledge (its
+    /// captured `AdminInfo` + its live `client_route`), no forwarding needed.
+    /// An additive variant: both sides of a cluster are the same build in
+    /// this repo's pre-alpha stance, so no version negotiation is needed for
+    /// an older peer that predates it.
+    JoinInfo,
 }
 
 /// Whether `command` may be **relayed to the control leader** via
@@ -612,6 +623,19 @@ pub enum ClientResponse {
     Pairs(Vec<(Vec<u8>, Vec<u8>)>),
     /// The operation could not be served (no quorum, no tablet, etc.).
     Error(String),
+    /// Reply to [`JoinInfo`](ClientRequest::JoinInfo) (ADR 0032 PR2): everything
+    /// a joining node (`animusd join`) needs to start as a growth member —
+    /// this cluster's **pre-growth** control group (`original_control_ids` for
+    /// [`run_node_growth`]/[`run_node_join`]), the answering node's internal
+    /// peer book (`AdminInfo.peers`), its live client-op routing table
+    /// (`ClientCtx::route_snapshot`, kept fresh by `route_sync_loop`, ADR
+    /// 0032 PR1), and every known admin address (the dashboard fan-out seed).
+    JoinInfo {
+        control_ids: Vec<NodeId>,
+        peers: BTreeMap<NodeId, SocketAddr>,
+        client_route: BTreeMap<NodeId, SocketAddr>,
+        admin_addrs: Vec<SocketAddr>,
+    },
 }
 
 /// Listen addresses for a node's endpoints (use port 0 for ephemeral): the
@@ -1007,6 +1031,27 @@ impl BoundNode {
                 .filter_map(|id| ctx.route_addr(*id))
                 .collect();
             tasks.push(tokio::spawn(remote_metadata_sync_loop(ctx.clone(), seeds)));
+
+            // Self-registration (ADR 0032 PR2): every growth node — whether
+            // started via `run_node_growth`'s "operator calls `POST
+            // /admin/member/add` first" flow or the newer seed/join
+            // `run_node_join` (no operator hand-holding at all) — must become
+            // a real `Metadata` member before the placement reconciler can
+            // ever place a tablet on it. `admin_add_member` is idempotent (a
+            // no-op success if already registered, ADR 0030's own doc), so
+            // folding it in here simplifies `run_node_growth` too: an
+            // operator's own explicit add-member call (still supported —
+            // `tests/cluster_growth.rs` keeps its explicit
+            // `POST /admin/member/add` as a regression for exactly that
+            // idempotent path) becomes a redundant, harmless confirmation
+            // rather than the only path a growth node has in.
+            {
+                let ctx = ctx.clone();
+                let node = my_raftkv_id;
+                tasks.push(tokio::spawn(async move {
+                    let _ = ctx.admin_add_member(node, BTreeMap::new()).await;
+                }));
+            }
         }
 
         // **Failure-detection heartbeat loop** (#3 / ADR 0012): every node heartbeats
@@ -3217,12 +3262,22 @@ fn request_kind(request: &ClientRequest) -> &'static str {
         ClientRequest::Forwarded { .. } => "forwarded",
         ClientRequest::ProposeSchema(_) => "propose_schema",
         ClientRequest::SplitTablet { .. } => "split_tablet",
+        ClientRequest::JoinInfo => "join_info",
     }
 }
 
 async fn handle_request(ctx: &ClientCtx, request: ClientRequest) -> ClientResponse {
     match request {
-        ClientRequest::Status => ClientResponse::Status(ctx.raft.metadata()),
+        // `effective_metadata`, not `ctx.raft.metadata()` directly (mirroring
+        // `/admin/status`, ADR 0030): on a control-plane-follower-less growth
+        // node the local raft never replicates, so a bare `raft.metadata()`
+        // would answer with a permanently-empty cluster — misleading for an
+        // `animus status` CLI call, and a vacuous collision guard for an ADR
+        // 0032 PR2 joiner that picked this (grown) node as its seed. Safe for
+        // `remote_metadata_sync_loop`'s own polling: its seeds are always the
+        // pre-growth control nodes (genuine voters, where this is a plain
+        // passthrough), so no mirror ever feeds another mirror.
+        ClientRequest::Status => ClientResponse::Status(ctx.effective_metadata()),
         // All data ops route to the leaderful CP per-tablet Raft group (ADR 0017
         // #3a), scoped to the named table (ADR 0023). `table` is a required field
         // on the request type, so there is no unscoped data op to reject here.
@@ -3272,6 +3327,14 @@ async fn handle_request(ctx: &ClientCtx, request: ClientRequest) -> ClientRespon
                 ClientResponse::PutOk
             }
         }
+        // Join discovery (ADR 0032 PR2): any node answers from its own
+        // knowledge — no forwarding, no leader resolution needed.
+        ClientRequest::JoinInfo => ClientResponse::JoinInfo {
+            control_ids: ctx.admin.control_ids.clone(),
+            peers: ctx.admin.peers.clone(),
+            client_route: ctx.route_snapshot(),
+            admin_addrs: ctx.admin.admin_addrs.clone(),
+        },
     }
 }
 
@@ -3889,6 +3952,193 @@ pub async fn run_node_growth(
     bound
         .start_with(
             config.peer_book(),
+            original_control_ids,
+            backend,
+            ClusterEdgeState::new(),
+            client_route,
+            None,
+            admin_addrs,
+        )
+        .await
+}
+
+/// How long a single connection attempt to a join seed may take before giving
+/// up on it and trying the next one in the list (mirrors [`ClientCtx::relay`]'s
+/// per-hop timeout — see [`CLIENT_TIMEOUT`]).
+const JOIN_ATTEMPT_TIMEOUT: Duration = CLIENT_TIMEOUT;
+/// How long [`poll_seeds_for`] waits between passes over the whole seed list
+/// while none has answered (a fresh seed cluster may still be electing).
+const JOIN_RETRY_INTERVAL: Duration = Duration::from_millis(200);
+/// Total budget [`run_node_join`] gives [`poll_seeds_for`] to reach *any* seed
+/// for a [`ClientRequest::JoinInfo`] / [`ClientRequest::Status`] reply before
+/// giving up and failing startup — generous, matching [`SCHEMA_COMMIT_TIMEOUT`],
+/// since a seed may itself still be electing a leader or mid-restart.
+const JOIN_DISCOVERY_BUDGET: Duration = SCHEMA_COMMIT_TIMEOUT;
+
+/// One pass over `seeds`, trying each in order for `request`; returns the
+/// first non-[`Error`](ClientResponse::Error) reply. Standalone (not a
+/// [`ClientCtx`] method) because a joining node has no context yet — this is
+/// exactly what it's discovering.
+async fn join_request(seeds: &[SocketAddr], request: &ClientRequest) -> Option<ClientResponse> {
+    for &addr in seeds {
+        let reply = tokio::time::timeout(JOIN_ATTEMPT_TIMEOUT, async {
+            let mut stream = TcpStream::connect(addr).await.ok()?;
+            write_frame(&mut stream, request).await.ok()?;
+            read_frame::<ClientResponse>(&mut stream).await.ok()?
+        })
+        .await;
+        if let Ok(Some(resp)) = reply {
+            if !matches!(resp, ClientResponse::Error(_)) {
+                return Some(resp);
+            }
+        }
+    }
+    None
+}
+
+/// Poll `seeds` for `request` (one [`join_request`] pass per [`JOIN_RETRY_INTERVAL`])
+/// until one answers or `budget` elapses.
+///
+/// # Errors
+/// A `TimedOut` error if no seed answers within `budget`.
+async fn poll_seeds_for(
+    seeds: &[SocketAddr],
+    request: &ClientRequest,
+    budget: Duration,
+) -> std::io::Result<ClientResponse> {
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        if let Some(resp) = join_request(seeds, request).await {
+            return Ok(resp);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("no seed in {seeds:?} answered within {budget:?}"),
+            ));
+        }
+        tokio::time::sleep(JOIN_RETRY_INTERVAL).await;
+    }
+}
+
+/// Start node `index` as a **seed/join growth member** (ADR 0032 PR2,
+/// `animusd join`): unlike [`run_node_growth`], which needs an
+/// operator-assembled *expanded* `ClusterConfig` listing every node's
+/// addresses up front, this entry point needs only `addrs` (this node's own
+/// six addresses) and `seeds` (any already-running node's **client**
+/// address — old or newly grown, it no longer matters which, since ADR 0032
+/// PR1 made every node's address book equally current).
+///
+/// It contacts a seed for a [`ClientRequest::JoinInfo`] reply (the
+/// pre-growth control group + the answering node's internal peer book + its
+/// live client-op route + every known admin address), runs a **collision
+/// guard** against a [`ClientRequest::Status`] reply's `node_addrs` (below),
+/// then hands the discovered `original_control_ids` + merged peer/route/admin
+/// sets straight into [`BoundNode::start_with`] exactly like
+/// [`run_node_growth`] does — the ADR 0030 growth machinery
+/// (`!control_ids.contains(&self.control_id)` detection,
+/// `remote_metadata_sync_loop`, `effective_metadata`) engages automatically,
+/// including this node's own ADR 0032 PR1 address self-registration and its
+/// own [`ClientCtx::admin_add_member`] self-registration (see `start_with`'s
+/// growth-node block) — no separate step is needed here for either.
+///
+/// **Collision guard.** Before binding, this checks the `Status` reply's
+/// `node_addrs` for an existing entry at `config::raftkv_id(index)`: an
+/// **identical** entry (the same three addresses) is a *rejoin* of this
+/// exact node (a restart with the same index/addresses/dir) and this
+/// proceeds normally; a **different** entry means `index` is already
+/// claimed by a live member with different addresses, and startup fails
+/// loudly with an `AlreadyExists` error instead of silently colliding with
+/// it. This narrows, but does not fully eliminate, the race between two
+/// simultaneous joiners choosing the same index — `RegisterNodeAddrs` is
+/// idempotent at apply time (ADR 0032 PR1), so a genuine simultaneous
+/// collision is caught by the replicated state machine rather than
+/// corrupting anything, but this pre-bind check is a best-effort convenience,
+/// not a distributed lock.
+///
+/// # Errors
+/// An `io::Error` (`TimedOut`) if no seed answers within
+/// [`JOIN_DISCOVERY_BUDGET`], `AlreadyExists` if the collision guard rejects
+/// a conflicting address book at this index, or (as [`run_node_growth`]) a
+/// bind / engine-open failure.
+pub async fn run_node_join(
+    seeds: Vec<SocketAddr>,
+    index: usize,
+    addrs: RoleAddrs,
+    dir: &Path,
+    backend: StorageBackend,
+) -> std::io::Result<Node> {
+    if seeds.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "join needs at least one --seed address",
+        ));
+    }
+    let my_control_id = config::control_id(index);
+    let my_raftkv_id = config::raftkv_id(index);
+
+    let (original_control_ids, mut peers, mut client_route, mut admin_addrs) =
+        match poll_seeds_for(&seeds, &ClientRequest::JoinInfo, JOIN_DISCOVERY_BUDGET).await? {
+            ClientResponse::JoinInfo {
+                control_ids,
+                peers,
+                client_route,
+                admin_addrs,
+            } => (control_ids, peers, client_route, admin_addrs),
+            other => {
+                return Err(std::io::Error::other(format!(
+                    "seed returned an unexpected reply to JoinInfo: {other:?}"
+                )));
+            }
+        };
+
+    // Collision guard (see doc above): reject a conflicting pre-existing
+    // registration at this index before binding anything.
+    match poll_seeds_for(&seeds, &ClientRequest::Status, JOIN_DISCOVERY_BUDGET).await? {
+        ClientResponse::Status(meta) => {
+            let mine = NodeAddrs {
+                raftkv: addrs.raftkv.to_string(),
+                client: addrs.client.to_string(),
+                admin: addrs.admin.to_string(),
+            };
+            if let Some(existing) = meta.node_addrs.get(&my_raftkv_id) {
+                if existing != &mine {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        format!(
+                            "join index {index} (raftkv id {my_raftkv_id}) is already \
+                             registered with different addresses ({existing:?} != {mine:?}) \
+                             — pick a different --node index"
+                        ),
+                    ));
+                }
+            }
+        }
+        other => {
+            return Err(std::io::Error::other(format!(
+                "seed returned an unexpected reply to Status: {other:?}"
+            )));
+        }
+    }
+
+    let bound = Node::bind(my_control_id, my_raftkv_id, addrs, dir).await?;
+
+    // Merge this node's own entries into the discovered peer/route/admin sets
+    // — the same union `run_node_growth`'s expanded-config construction
+    // already produces, just built from a discovery reply instead of a
+    // pre-assembled config.
+    for (id, addr) in bound.peer_entries() {
+        peers.insert(id, addr);
+    }
+    client_route.insert(my_raftkv_id, addrs.client);
+    client_route.insert(my_control_id, addrs.client);
+    if !admin_addrs.contains(&addrs.admin) {
+        admin_addrs.push(addrs.admin);
+    }
+
+    bound
+        .start_with(
+            peers,
             original_control_ids,
             backend,
             ClusterEdgeState::new(),
