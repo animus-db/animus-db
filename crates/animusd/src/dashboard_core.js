@@ -167,8 +167,17 @@ function statusDotClass(status) {
 
 // Derive an at-a-glance health rollup from data `loadAll()` already fetched —
 // no new requests. A cluster with no control leader can't accept writes, so
-// that alone is "critical"; a leaderless tablet or a down node is "degraded"
-// (something needs attention, but the cluster is otherwise serving).
+// that alone is "critical". Degraded means an actual tablet needs attention
+// (leaderless, or under-replicated per `tabletStatus` — fewer hosting groups
+// than its configured replica count). A `Down` member is NOT by itself
+// degrading: once the placement reconciler has repaired every tablet that
+// member used to replicate onto a spare (every tablet back at its configured
+// replication, none leaderless), the cluster is healthy again even though the
+// dead node is still lingering in the roster undecommissioned — the failure
+// detector/reconciler can keep trying to reach it for a while after data is
+// already fully replicated, and that lingering `Down` member shouldn't hold
+// the whole cluster at "degraded" once its data-loss risk is gone.
+// `downCount` is still surfaced (nodes tile, banner text) for visibility.
 function computeHealth() {
   const members = (STATE.status && STATE.status.members) || {};
   const memberIds = Object.keys(members);
@@ -178,25 +187,27 @@ function computeHealth() {
   const tabletIds = Object.keys(tablets);
   const groups = cpGroupsByTablet();
   const leaderlessCount = tabletIds.filter((id) => !(groups[id] || []).some((x) => x.g.is_leader)).length;
+  const underReplicatedCount = tabletIds.filter((id) => tabletStatus(tablets[id], groups[id] || []) === "under-replicated").length;
 
   const controlLeader = STATE.nodes.find((n) => n.ok && n.raft && n.raft.is_leader);
 
   let status = "healthy";
-  if (leaderlessCount > 0 || downCount > 0) status = "degraded";
+  if (leaderlessCount > 0 || underReplicatedCount > 0) status = "degraded";
   if (!controlLeader) status = "critical";
 
   return {
     status, controlLeader,
     downCount, totalNodes: memberIds.length || STATE.nodes.length,
-    leaderlessCount, totalTablets: tabletIds.length,
+    leaderlessCount, underReplicatedCount, totalTablets: tabletIds.length,
   };
 }
 
 function renderHealthPill() {
   const h = computeHealth();
+  const issues = h.leaderlessCount + h.underReplicatedCount;
   const label = h.status === "healthy" ? "Healthy"
     : h.status === "critical" ? "No control leader"
-    : `Degraded · ${h.leaderlessCount + h.downCount} issue${(h.leaderlessCount + h.downCount) === 1 ? "" : "s"}`;
+    : `Degraded · ${issues} issue${issues === 1 ? "" : "s"}`;
   $("health-pill").className = "health-pill " + h.status;
   $("health-pill").innerHTML = `<span class="dot"></span><span class="label">${esc(label)}</span>`;
 }

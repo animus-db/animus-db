@@ -19,11 +19,18 @@ function renderOverview() {
   $("ov-summary").textContent = `${nodeCount} node(s) · ${tabletIds.length} tablet(s)`;
 
   // ---- health banner ----
+  // Degraded is driven by tablet health (leaderless/under-replicated), not by
+  // a lingering `Down` member — a dead node whose tablets have already been
+  // repaired onto spares no longer degrades the cluster, even though it may
+  // still be tracked (and re-contacted for a while) as a `Down` member until
+  // it's decommissioned. `downCount` is still called out for context.
   const bannerSummary = h.status === "critical"
     ? "No control-plane leader known — the cluster cannot accept metadata changes right now."
     : h.status === "degraded"
-      ? `${h.downCount} node(s) down · ${h.leaderlessCount} tablet(s) leaderless.`
-      : `All ${nodeCount} node(s) reachable · ${tabletIds.length} tablet(s) replicated · control leader ${h.controlLeader ? "node " + esc(nodeRaftkvId(h.controlLeader)) : "—"}.`;
+      ? `${h.leaderlessCount} tablet(s) leaderless · ${h.underReplicatedCount} under-replicated${h.downCount ? ` · ${h.downCount} node(s) down` : ""}.`
+      : h.downCount
+        ? `${h.downCount} node(s) down, but all ${tabletIds.length} tablet(s) are fully replicated · control leader ${h.controlLeader ? "node " + esc(nodeRaftkvId(h.controlLeader)) : "—"}.`
+        : `All ${nodeCount} node(s) reachable · ${tabletIds.length} tablet(s) replicated · control leader ${h.controlLeader ? "node " + esc(nodeRaftkvId(h.controlLeader)) : "—"}.`;
   $("ov-banner").className = "card health-banner " + h.status;
   $("ov-banner").innerHTML = `
     <div class="row" style="gap:10px">${dot((h.status === "healthy" ? "ok" : "bad") + "-dot")}
@@ -31,13 +38,11 @@ function renderOverview() {
     <div class="muted" style="margin-top:6px">${esc(bannerSummary)}</div>`;
 
   // ---- stat tiles ----
-  let underRep = 0;
-  tabletIds.forEach((id) => { if (tabletStatus(tablets[id], groups[id] || []) !== "healthy") underRep++; });
   const controlTermText = h.controlLeader && h.controlLeader.raft ? `term ${h.controlLeader.raft.term}` : "—";
   const tiles = [
     { label: "Nodes", value: `${nodeCount - h.downCount}/${nodeCount}`, sub: h.downCount ? `${h.downCount} down` : "all up" },
     { label: "Tablets", value: `${tabletIds.length}`, sub: `across ${Object.keys((status && status.schemas && status.schemas.tables) || {}).length} table(s)` },
-    { label: "Under-replicated", value: `${underRep}`, sub: underRep ? "needs attention" : "none" },
+    { label: "Under-replicated", value: `${h.underReplicatedCount}`, sub: h.underReplicatedCount ? "needs attention" : "none" },
     { label: "Control plane", value: h.controlLeader ? `node ${esc(nodeRaftkvId(h.controlLeader))}` : "—", sub: controlTermText },
   ];
   $("ov-tiles").innerHTML = tiles.map((t) =>
