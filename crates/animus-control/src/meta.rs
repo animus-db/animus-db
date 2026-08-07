@@ -771,7 +771,7 @@ impl Metadata {
                 let Some(member) = self.members.get(node) else {
                     // Already absent: an idempotent retry (e.g. a proposer whose
                     // confirm timed out after the command actually committed).
-                    return ApplyOutcome::Applied;
+                    return ApplyOutcome::NoOp;
                 };
                 if matches!(member.status, NodeStatus::Active | NodeStatus::Joining) {
                     return ApplyOutcome::Rejected("not drained: member is Active or Joining");
@@ -1524,10 +1524,11 @@ mod tests {
             assert!(!m.cp_member_addrs.contains_key(&301));
             assert!(!m.cp_member_tablets.contains_key(&301));
 
-            // Idempotent retry: already absent, still `Applied`, not `Rejected`.
+            // Idempotent retry: already absent — `NoOp` (the file's convention
+            // for nothing-changed applies), never `Rejected`.
             assert_eq!(
                 m.apply(&MetaCommand::RemoveMember { node: 301 }),
-                ApplyOutcome::Applied
+                ApplyOutcome::NoOp
             );
         }
     }
