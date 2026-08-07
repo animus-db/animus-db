@@ -159,6 +159,47 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   Active spare, the spare's join-host loop stands up an empty group, and the leader
   adds + catches it up — auto-replacing the dead replica end to end
   (`tests/cp_reconfigure.rs::failure_auto_replaces_replica_onto_spare`).
+- **Online cluster growth (ADR 0030) is data-plane only — the control group
+  stays static.** `POST /admin/member/add {node, labels?}`
+  (`ClientCtx::admin_add_member`) registers a new **raftkv** id `Down` via the
+  existing relayable-proposal path (`UpsertMember{status: Down}` was added to
+  `is_relayable_command`'s allowlist, scoped to `Down` only); its own
+  `heartbeat_loop` promotes it to `Active` on first contact (ADR 0012's
+  unmodified detector — verified, not changed). A grown node starts via the new
+  `run_node_growth` (alongside `run_node`/`run_node_with`): it binds from an
+  **expanded** `ClusterConfig` (lists every pre-growth node plus every node
+  added so far) but passes the **pre-growth** control group as `control_ids` —
+  making its own control role a permanent, structurally-safe **non-voter**
+  (the same safety property an already-removed voter relies on: `is_voter()`
+  gates campaigning cleanly) that can never receive real Raft replication for
+  a group it was never added to. `BoundNode::start_with` detects this itself
+  (`!control_ids.contains(&self.control_id)` — no new parameter) and spawns
+  `remote_metadata_sync_loop`, mirroring the real cluster's `Metadata` via
+  `ClientRequest::Status` polls against the pre-growth nodes' client addresses
+  (resolvable through the now-complete `client_route`) into
+  `ClientCtx::remote_metadata`. `ClientCtx::effective_metadata()` transparently
+  prefers this mirror when populated (a no-op passthrough to
+  `self.raft.metadata()` on every other node) — **every call site a growth
+  node needs to actually function reads through it**: `tablet_for`,
+  `resolve_cp_route`, `cp_join_host_loop` (the load-bearing one — how a growth
+  node ever learns it was placed on a tablet at all), `cp_reconfigure_loop`,
+  `peer_sync_loop`, `register_cp_addr`'s own commit confirmation, `cp_put`/
+  `cp_get`'s `has_table_tablet` gate, and `/admin/status`. `propose_schema`
+  (the shared "propose locally if leader, else relay to a *known* leader"
+  primitive) also gained a last-resort fallback — broadcast to every other
+  `client_route` address when there is **no** locally-known leader at all
+  (true forever for a non-participating growth node, since it never receives
+  a heartbeat/AppendEntries telling it who leads) — without this, a growth
+  node's own address self-registration could never reach the real cluster.
+  **Known residual gap**: a *pre-growth* node's `client_route` is a static map
+  built once at its own process start, so it cannot forward a client op to a
+  tablet leader that has since moved onto a newly grown node — only a growth
+  node's own `client_route` (built from the expanded config) is always
+  complete. Route new client traffic through the grown nodes' own addresses
+  until a replicated client-address map closes this (ADR 0030's documented
+  follow-up). `tests/cluster_growth.rs`: 3→5 growth, no restart of the
+  original 3, admin-add + promotion + rebalancing onto the new nodes +
+  reads/writes throughout + a never-booted phantom staying `Down`.
 - **The per-node CP join-host loop** (`cp_join_host_loop`/`cp_join_host`) is the
   single unified formation path for every tablet a node ever hosts — a fresh
   table's first tablet, a split-minted sibling, and a reconciler-placed

@@ -10,12 +10,21 @@
 //! per-node replica counts to max−min ≤ 1 while preserving residency + spread, and
 //! then going quiet (no churn once balanced). Every run is a pure function of its
 //! seed.
+//!
+//! Every registered data member heartbeats (ADR 0030 phantom-member hardening):
+//! the detector now also demotes an `Active` member it has never heard a
+//! heartbeat from (see `animus_control::node::detect_loop`'s doc) -- see
+//! `placement_auto_reconcile.rs`'s identical note for why `register` spawns one
+//! and why a member the test itself marks `Down` has its heartbeat stopped
+//! (`sim.crash`) at that exact moment.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use animus_control::node::heartbeat_loop;
 use animus_control::raft::ProposeResult;
 use animus_control::{MetaCommand, Metadata, NodeStatus, RaftNode};
+use animus_env::EnvExt;
 use animus_placement::PlacementPolicy;
 use animus_sim::{SimEnv, Simulator};
 use animus_tablet::{KeyRange, TabletId};
@@ -55,8 +64,9 @@ fn labels(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
         .collect()
 }
 
-/// Register a data member as `Active` with the given labels.
-fn register(node: &RaftNode<SimEnv>, id: u64, lbls: BTreeMap<String, String>) {
+/// Register a data member as `Active` with the given labels, and start it
+/// heartbeating (ADR 0030 phantom-member hardening — see this file's doc).
+fn register(sim: &Simulator, node: &RaftNode<SimEnv>, id: u64, lbls: BTreeMap<String, String>) {
     assert!(matches!(
         node.propose(MetaCommand::UpsertMember {
             node: id,
@@ -65,6 +75,8 @@ fn register(node: &RaftNode<SimEnv>, id: u64, lbls: BTreeMap<String, String>) {
         }),
         ProposeResult::Accepted { .. }
     ));
+    let env = sim.env(id);
+    env.spawn_task(heartbeat_loop(env.clone(), CONTROL.to_vec()));
 }
 
 /// Per-node replica counts over `ids`, seeded 0.
@@ -127,7 +139,7 @@ fn rebalances_onto_new_members(seed: u64) {
 
     // Three data members, all six tablets placed on them.
     for id in [10, 11, 12] {
-        register(&nodes[leader], id, labels(&[("region", "eu")]));
+        register(&sim, &nodes[leader], id, labels(&[("region", "eu")]));
     }
     sim.run_for(Duration::from_secs(1));
     provision(&nodes[leader], &[10, 11, 12], &policy);
@@ -136,7 +148,7 @@ fn rebalances_onto_new_members(seed: u64) {
     // The cluster grows: two more members. Nothing else — the leader must spread
     // existing tablets onto them on its own.
     for id in [13, 14] {
-        register(&nodes[leader], id, labels(&[("region", "eu")]));
+        register(&sim, &nodes[leader], id, labels(&[("region", "eu")]));
     }
 
     let all = [10, 11, 12, 13, 14];
@@ -184,7 +196,7 @@ fn rebalance_defers_to_violation_repair() {
     let policy = PlacementPolicy::simple("rf3", 3);
 
     for id in [10, 11, 12] {
-        register(&nodes[leader], id, labels(&[("region", "eu")]));
+        register(&sim, &nodes[leader], id, labels(&[("region", "eu")]));
     }
     sim.run_for(Duration::from_secs(1));
     provision(&nodes[leader], &[10, 11, 12], &policy);
@@ -192,10 +204,13 @@ fn rebalance_defers_to_violation_repair() {
 
     // Grow the cluster, then — mid-imbalance — kill one of the ORIGINAL members.
     for id in [13, 14] {
-        register(&nodes[leader], id, labels(&[("region", "eu")]));
+        register(&sim, &nodes[leader], id, labels(&[("region", "eu")]));
     }
     sim.run_for(Duration::from_secs(5));
     let dead = 10;
+    // Stop its heartbeat too — otherwise the (pre-existing, unchanged) `Down` ->
+    // `Active` recovery rule would immediately revert this manual `Down`.
+    sim.crash(dead);
     assert!(matches!(
         nodes[leader].propose(MetaCommand::UpsertMember {
             node: dead,
@@ -241,16 +256,19 @@ fn rebalance_preserves_residency_and_spread() {
 
     // Original three: one per zone.
     register(
+        &sim,
         &nodes[leader],
         10,
         labels(&[("region", "eu"), ("zone", "a")]),
     );
     register(
+        &sim,
         &nodes[leader],
         11,
         labels(&[("region", "eu"), ("zone", "b")]),
     );
     register(
+        &sim,
         &nodes[leader],
         12,
         labels(&[("region", "eu"), ("zone", "c")]),
@@ -262,21 +280,25 @@ fn rebalance_preserves_residency_and_spread() {
     // Grow 3 → 7: two new EU nodes (giving zones a and b a second host so those
     // zones can rebalance) and two new US nodes that residency must always exclude.
     register(
+        &sim,
         &nodes[leader],
         13,
         labels(&[("region", "eu"), ("zone", "a")]),
     );
     register(
+        &sim,
         &nodes[leader],
         14,
         labels(&[("region", "eu"), ("zone", "b")]),
     );
     register(
+        &sim,
         &nodes[leader],
         15,
         labels(&[("region", "us"), ("zone", "a")]),
     );
     register(
+        &sim,
         &nodes[leader],
         16,
         labels(&[("region", "us"), ("zone", "b")]),
@@ -346,13 +368,13 @@ fn survives_leader_kill(seed: u64) {
     let policy = PlacementPolicy::simple("rf3", 3);
 
     for id in [10, 11, 12] {
-        register(&nodes[leader], id, labels(&[("region", "eu")]));
+        register(&sim, &nodes[leader], id, labels(&[("region", "eu")]));
     }
     sim.run_for(Duration::from_secs(1));
     provision(&nodes[leader], &[10, 11, 12], &policy);
     sim.run_for(Duration::from_secs(1));
     for id in [13, 14] {
-        register(&nodes[leader], id, labels(&[("region", "eu")]));
+        register(&sim, &nodes[leader], id, labels(&[("region", "eu")]));
     }
     // Let rebalancing get underway, then kill the control leader mid-flight.
     sim.run_for(Duration::from_secs(5));

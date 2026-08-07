@@ -38,11 +38,13 @@
 //! - `POST /admin/storage/compact`     — `{tablet}`
 //! - `POST /admin/raftkv/reconfigure`  — `{tablet, voters}`
 //! - `POST /admin/drain`               — `{node}`
+//! - `POST /admin/member/add`          — `{node, labels?}` — online growth (ADR 0030)
 //! - `POST /admin/data/dynamo`         — run a DynamoDB op `{op, payload}` (ADR 0021)
 //! - `POST /admin/data/cql`            — run CQL `{query, keyspace?}` (ADR 0021)
 //! - `POST /admin/data/drop-table`     — drop a table's schema `{table}` (ADR 0021)
 //! - `POST /admin/data/seed`           — bulk-write synthetic keys `{count, …}` (ADR 0021)
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use animus_dynamo::wire::{base64url_decode, base64url_encode};
@@ -227,9 +229,13 @@ async fn dispatch(ctx: &ClientCtx, request: &http::HttpRequest) -> (u16, String)
     let (status, value): (u16, Value) = match (method, path) {
         ("GET", "/admin/config") => (200, config_view(ctx)),
         ("GET", "/admin/peers") => (200, peers_view(ctx)),
+        // `effective_metadata`, not `ctx.raft.metadata()` directly: on a
+        // control-plane-follower-less growth node (ADR 0030) the local raft
+        // never replicates, so this view would otherwise show an empty cluster
+        // forever on exactly the node an operator most wants to inspect.
         ("GET", "/admin/status") => (
             200,
-            serde_json::to_value(ctx.raft.metadata()).unwrap_or(Value::Null),
+            serde_json::to_value(ctx.effective_metadata()).unwrap_or(Value::Null),
         ),
         ("GET", "/admin/raft") => (200, raft_view(ctx)),
         ("GET", "/admin/raftkv") => (200, raftkv_view(ctx).await),
@@ -246,6 +252,7 @@ async fn dispatch(ctx: &ClientCtx, request: &http::HttpRequest) -> (u16, String)
         ("POST", "/admin/storage/compact") => action_compact(ctx, &request.body).await,
         ("POST", "/admin/raftkv/reconfigure") => action_reconfigure(ctx, &request.body),
         ("POST", "/admin/drain") => action_drain(ctx, &request.body),
+        ("POST", "/admin/member/add") => action_add_member(ctx, &request.body).await,
         ("POST", "/admin/data/dynamo") => action_data_dynamo(ctx, &request.body).await,
         ("POST", "/admin/data/cql") => action_data_cql(ctx, &request.body).await,
         ("POST", "/admin/data/drop-table") => action_drop_table(ctx, &request.body).await,
@@ -571,6 +578,18 @@ struct DrainReq {
     node: NodeId,
 }
 
+/// `POST /admin/member/add` request body (ADR 0030 online growth): `node` is
+/// the new node's **raftkv** id (the id every other admin/status view already
+/// speaks — `/admin/status`'s `members`, `/admin/config`'s `raftkv_id`), and
+/// `labels` are optional residency/failure-domain labels (ADR 0005), same shape
+/// as an existing member's.
+#[derive(Deserialize)]
+struct AddMemberReq {
+    node: NodeId,
+    #[serde(default)]
+    labels: BTreeMap<String, String>,
+}
+
 async fn action_split(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
     let req: SplitReq = match parse_body(body) {
         Ok(r) => r,
@@ -671,6 +690,22 @@ fn action_drain(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
             json!({"ok": true, "node": req.node, "status": "Leaving"}),
         ),
         Err(e) => (409, json!({"error": e})),
+    }
+}
+
+/// `POST /admin/member/add {node, labels?}` — online cluster growth (ADR 0030):
+/// register `node` (a new raftkv id) as `Down`, promoted to `Active` by its own
+/// first heartbeat. Relayed (unlike `/admin/drain`), so it works from any
+/// reachable admin port — including the new node's own, whose control role is
+/// never a real control-group voter (see `ClientCtx::admin_add_member`'s doc).
+async fn action_add_member(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
+    let req: AddMemberReq = match parse_body(body) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    match ctx.admin_add_member(req.node, req.labels).await {
+        Ok(()) => (200, json!({"ok": true, "node": req.node})),
+        Err(e) => (504, json!({"error": e})),
     }
 }
 
