@@ -34,10 +34,11 @@ use crate::{ImageEntry, KvCommand, KvWire};
 /// tag mismatch deeper in.
 const MAGIC: u8 = 0xCB;
 /// Codec version, bumped on any incompatible layout change. `2`: `KvCommand`'s
-/// `Put`/`Batch`/`Delete`/`Cas` variants gained a `fence: KeyRange` field
-/// (single-command-split redesign, ADR 0028) — pre-alpha, no cross-version
+/// `Put`/`Batch`/`Delete`/`Cas` variants gained a `fence: KeyRange` field. `3`:
+/// `KvCommand::Split` (tag 4) is gone — split is now a single control-plane
+/// command, never a data-plane one (ADR 0028) — pre-alpha, no cross-version
 /// compatibility is required.
-const VERSION: u8 = 2;
+const VERSION: u8 = 3;
 
 /// A decode failure: a description of what was malformed, surfaced loudly by
 /// the caller (logged + dropped; never silently misread).
@@ -226,10 +227,6 @@ fn put_command(out: &mut Vec<u8>, c: &KvCommand) {
             put_bytes(out, value);
             put_key_range(out, fence);
         }
-        KvCommand::Split { at } => {
-            put_u8(out, 4);
-            put_bytes(out, at);
-        }
         KvCommand::NoOp => put_u8(out, 5),
     }
 }
@@ -262,7 +259,6 @@ fn read_command(c: &mut Cursor<'_>) -> Result<KvCommand, DecodeError> {
             value: c.bytes()?,
             fence: read_key_range(c)?,
         },
-        4 => KvCommand::Split { at: c.bytes()? },
         5 => KvCommand::NoOp,
         other => return Err(format!("unknown KvCommand tag {other}")),
     })
@@ -618,12 +614,6 @@ mod tests {
                     key: b"d".to_vec(),
                     fence: KeyRange::whole(),
                 },
-                config: None,
-            },
-            LogEntry {
-                term: 4,
-                index: 22,
-                command: KvCommand::Split { at: b"m".to_vec() },
                 config: None,
             },
             LogEntry {

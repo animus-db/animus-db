@@ -200,15 +200,17 @@ async fn cp_member_addresses_register_and_replicate() {
     }
 }
 
-/// Phase 2.2 — **CP tablet split over `ProdEnv`.** A running CP tablet splits at a
-/// key into two groups: keys below stay on the original group, keys at/above move
-/// to a new co-resident group (minted via `Coresident::sibling`, its address
-/// distributed by 2.3a). Both halves keep serving, and a value written before the
-/// split rides the handoff to the new group.
+/// **CP tablet split over `ProdEnv`.** A single, atomic control-plane command
+/// (`SplitTablet`) narrows the source tablet's range and mints a new sibling
+/// tablet covering the upper range — both served from the same replicas' one
+/// shared per-node storage engine (ADR 0026/0028), so no data moves. The
+/// per-node join-host loop then forms the new tablet's Raft group on each
+/// replica. Both halves keep serving, and a value written before the split
+/// (into what becomes the upper range) is still there after.
 ///
 /// Real TCP/time: bring up a 3-node cluster, write a lower + an upper key, trigger
 /// the split, then poll until the new tablet is in the map and the upper key is
-/// served by the new group (its election + address propagation take a moment).
+/// served by the new group (its election takes a moment).
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn cp_tablet_splits_and_both_halves_serve() {
     let dir = tempfile::tempdir().unwrap();
@@ -512,14 +514,14 @@ async fn tablet_auto_splits_when_it_grows() {
     }
 }
 
-/// Regression: a `RaftKvNode` group can be split **more than once** over its
-/// life (`KvCommand::Split`'s apply-time check in `animus-cp-data` validates
-/// each new split against the group's *current* boundary, not a one-shot
-/// latch) — a tablet that already split once and keeps absorbing writes must
-/// split *again* once it regrows past `threshold`, not sit frozen forever.
-/// This proves the tablet count keeps growing as the same lineage repeatedly
-/// crosses the threshold, and that every resulting tablet ends up with a real
-/// CP group (no orphans left behind along the way).
+/// Regression: a tablet can be split **more than once** over its life — since
+/// split is just a metadata range-narrowing command (epoch-CAS gated, no
+/// one-shot latch anywhere), a tablet that already split once and keeps
+/// absorbing writes must split *again* once it regrows past `threshold`, not
+/// sit frozen forever. This proves the tablet count keeps growing as the same
+/// lineage repeatedly crosses the threshold, and that every resulting tablet
+/// ends up with a real CP group (structurally guaranteed now — see the root
+/// `CLAUDE.md`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn already_split_tablet_splits_again_once_it_regrows() {
     let dir = tempfile::tempdir().unwrap();
@@ -631,135 +633,6 @@ async fn already_split_tablet_splits_again_once_it_regrows() {
             .await
             .unwrap_or_else(|_| panic!("key {k:?} not served after repeated auto-split"));
     }
-
-    for n in &nodes {
-        n.shutdown();
-    }
-}
-
-/// Regression: `trigger_split`'s data-plane step can fail *permanently*, not
-/// just transiently — a *smaller* (more aggressive) split can already have
-/// narrowed the source group's boundary past a *larger* key's proposal before
-/// that proposal's own data-plane step ever lands (the group can now split
-/// more than once, but only ever toward smaller boundaries — see
-/// `RaftKvNode::current_split_bound`'s doc). Before this fix, nothing ever
-/// removed the resulting metadata-only mint: it sat in `Metadata.tablets`
-/// forever with a real range/replicas but no CP group — `leader: unknown`,
-/// unreachable, permanently cluttering every admin view and burning a tablet
-/// id.
-///
-/// This reproduces the permanent (not transient) failure **deterministically**,
-/// with no timing race: first, a **data-plane-only** split at "c" (via
-/// `CpSplit`, bypassing metadata entirely) directly narrows the source
-/// group's real boundary to "c". Then a **normal** manual split at "m" (`"m" >
-/// "c"`) mints a metadata child fine (metadata never heard about the "c"
-/// split, so "m" is still inside its view of the source's range) — but its
-/// data-plane step can never confirm, because "m" is not strictly less than
-/// the source's actual current boundary, "c". Asserts the resulting mint is
-/// cleaned up rather than left dangling.
-#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
-async fn a_lost_split_race_does_not_leave_a_permanent_orphan() {
-    let dir = tempfile::tempdir().unwrap();
-    let bound = bind_cluster(3, "127.0.0.1".parse().unwrap(), dir.path())
-        .await
-        .unwrap();
-    let nodes = start_cluster(bound).await.unwrap();
-    await_bootstrap(&nodes).await;
-    let addr0 = nodes[0].client_addr();
-
-    // A fresh cluster has zero data tablets (ADR 0023 provision-at-create) — a
-    // write provisions this table's tablet, retrying while its CP group elects.
-    let put_ok = async {
-        loop {
-            match call(
-                addr0,
-                ClientRequest::Put {
-                    key: b"aaa".to_vec(),
-                    value: b"v".to_vec(),
-                    table: "orphan_test".to_string(),
-                },
-            )
-            .await
-            {
-                ClientResponse::PutOk => return,
-                ClientResponse::Error(_) => sleep(Duration::from_millis(100)).await,
-                other => panic!("unexpected put: {other:?}"),
-            }
-        }
-    };
-    timeout(Duration::from_secs(20), put_ok)
-        .await
-        .expect("provisioning write did not succeed within 20s");
-    let source = *nodes[0]
-        .metadata()
-        .tablets
-        .keys()
-        .next()
-        .expect("the write provisioned a tablet");
-
-    // Data-plane-only split at "c": moves the group's *real* boundary without
-    // metadata ever finding out.
-    let cp_split = timeout(
-        Duration::from_secs(20),
-        call(
-            addr0,
-            ClientRequest::CpSplit {
-                tablet: source.0,
-                split_key: b"c".to_vec(),
-            },
-        ),
-    )
-    .await
-    .expect("data-plane split timed out");
-    assert_eq!(
-        cp_split,
-        ClientResponse::PutOk,
-        "data-plane-only split should confirm"
-    );
-    assert_eq!(
-        nodes[0].metadata().tablets.len(),
-        1,
-        "metadata is untouched by a data-plane-only split"
-    );
-
-    // Manual split at "m": step 1 mints a child fine (metadata's view of the
-    // source's range is still the original, full one), but step 2 can never
-    // confirm — "m" is not strictly less than the source's actual boundary,
-    // "c".
-    let second = timeout(
-        Duration::from_secs(20),
-        call(
-            addr0,
-            ClientRequest::SplitTablet {
-                tablet: source.0,
-                split_key: b"m".to_vec(),
-            },
-        ),
-    )
-    .await
-    .expect("second split timed out");
-    assert!(
-        matches!(second, ClientResponse::Error(_)),
-        "second split's data-plane half can never confirm: {second:?}"
-    );
-
-    // The lost split's orphan mint must not linger.
-    let poll_gc = async {
-        loop {
-            if nodes[0].metadata().tablets.len() == 1 {
-                return;
-            }
-            sleep(Duration::from_millis(100)).await;
-        }
-    };
-    timeout(Duration::from_secs(5), poll_gc)
-        .await
-        .unwrap_or_else(|_| {
-            panic!(
-                "orphan tablet was not GC'd: {} tablets remain",
-                nodes[0].metadata().tablets.len()
-            )
-        });
 
     for n in &nodes {
         n.shutdown();

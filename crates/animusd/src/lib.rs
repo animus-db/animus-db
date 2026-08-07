@@ -50,18 +50,18 @@ mod topology;
 
 use animus_control::node::heartbeat_loop;
 use animus_control::{PlacementPolicy, ProposeResult, RaftNode};
-use animus_cp_data::{RaftKvNode, SplitHook};
-use animus_env::{Coresident, Disk, Env, Metric, MetricsHandle, NodeId, ProdEnv};
-use animus_storage::{LsmEngine, MemoryEngine, SsTableView, StorageEngine, WalRecordView};
-use animus_tablet::{KeyRange, TabletId};
+use animus_cp_data::{RaftKvNode, StorageScope};
+use animus_env::{Disk, Env, Metric, MetricsHandle, NodeId, ProdEnv};
+use animus_storage::{LsmEngine, MemoryEngine, SsTableView, WalRecordView};
+use animus_tablet::{KeyRange, Tablet, TabletId, escape};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::Instrument;
-// Pure CP-topology decision logic (id translation, routing, join-host/GC
-// predicates), extracted into `topology` for unit-test coverage.
-use topology::{cp_base_id, cp_member_id, cp_members_for};
+// Pure CP-topology decision logic (routing/join-host predicates), extracted
+// into `topology` for unit-test coverage — called fully-qualified
+// (`topology::plan_join_host` etc.) at each call site.
 
 /// A list of `(key, value)` pairs — the payload of a batch write (one Raft
 /// `KvCommand::Batch` entry per tablet). Named to keep the batch grouping map
@@ -178,42 +178,15 @@ impl CpGroup {
         }
     }
 
-    /// The env this group member runs on: its node id is the member's **derived
-    /// group id** (`cp_member_id`), and its disk holds the member's engine +
-    /// `raftkv.wal` files — which is what lets the GC both identify *this node's*
-    /// handle in the shared edge registry and delete the right files.
+    /// The node's `raftkv` env this group runs on. Since ADR 0026 Stage B every
+    /// tablet a node hosts shares this **same** env (stream-addressed, not a
+    /// distinct per-tablet id/env) — used to identify *this node's* handle in the
+    /// shared edge registry (`node_id()`), not to locate per-tablet files (the
+    /// engine is shared too; see [`LSM_PREFIX`]).
     fn env(&self) -> &ProdEnv {
         match self {
             CpGroup::Lsm(n) => n.env(),
             CpGroup::Mem(n) => n.env(),
-        }
-    }
-
-    /// Propose a **tablet split** at `at` (Phase 2.2): keys `>= at` move to a new
-    /// tablet. Leader-only. On commit every replica tombstones `[at, ∞)` and the
-    /// node's split hook mints the new tablet's co-resident group. See
-    /// [`RaftKvNode::propose_split`].
-    fn propose_split(&self, at: Vec<u8>) -> ProposeResult {
-        match self {
-            CpGroup::Lsm(n) => n.propose_split(at),
-            CpGroup::Mem(n) => n.propose_split(at),
-        }
-    }
-
-    /// This group's current split boundary (`[lo, bound)`), or `None` if it has
-    /// never split — the confirm-by-key primitive a
-    /// [`propose_split`](Self::propose_split) caller must poll:
-    /// `ProposeResult::Accepted` only means the entry was appended to the leader's
-    /// local log, not that it committed, and comparing against the *specific* key
-    /// proposed (not just "has it split at all") is what catches a same-tick
-    /// same-tablet race where a *different* median won. A group can split more
-    /// than once, so this is a *moving target* — see
-    /// [`RaftKvNode::current_split_bound`]'s doc for what that does and doesn't
-    /// tell a caller, and why comparing against it is still safe here.
-    fn current_split_bound(&self) -> Option<Vec<u8>> {
-        match self {
-            CpGroup::Lsm(n) => n.current_split_bound(),
-            CpGroup::Mem(n) => n.current_split_bound(),
         }
     }
 
@@ -225,8 +198,8 @@ impl CpGroup {
     /// tablet. See [`RaftKvNode::range_snapshot`].
     async fn local_pairs(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
         match self {
-            CpGroup::Lsm(n) => n.range_snapshot(&[]).await,
-            CpGroup::Mem(n) => n.range_snapshot(&[]).await,
+            CpGroup::Lsm(n) => n.local_scan(&[], None, None).await,
+            CpGroup::Mem(n) => n.local_scan(&[], None, None).await,
         }
     }
 
@@ -254,8 +227,8 @@ impl CpGroup {
     /// tablets (it materializes the live range from `start` before truncating).
     async fn local_scan(&self, start: &[u8], limit: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
         let mut pairs = match self {
-            CpGroup::Lsm(n) => n.range_snapshot(start).await,
-            CpGroup::Mem(n) => n.range_snapshot(start).await,
+            CpGroup::Lsm(n) => n.local_scan(start, None, None).await,
+            CpGroup::Mem(n) => n.local_scan(start, None, None).await,
         };
         pairs.truncate(limit);
         pairs
@@ -375,6 +348,16 @@ impl CpGroup {
             CpGroup::Mem(n) => n.reconfigure_step(desired),
         }
     }
+
+    /// **Admin action (drop-table GC, ADR 0024):** tombstone every key in this
+    /// group's own `StorageScope` out of the shared engine. See
+    /// [`RaftKvNode::erase_scope`].
+    async fn erase_scope(&self) {
+        match self {
+            CpGroup::Lsm(n) => n.erase_scope().await,
+            CpGroup::Mem(n) => n.erase_scope().await,
+        }
+    }
 }
 
 /// How a CP op originating on this node reaches the group leader
@@ -388,13 +371,6 @@ enum CpRoute {
     None,
 }
 
-/// The tablet id of the **first table provisioned** (ADR 0023): the tablet-id
-/// allocator hands out `1` first, and `cp_member_id`/`cp_join_host` host tablet `1`
-/// on the node's **main** `raftkv` env (member id == base id) while later tablets
-/// use minted siblings. So the first `CreateTable` lands on the main env at no extra
-/// cost, and there is no separate always-on "bootstrap" data tablet (a fresh cluster
-/// has zero data tablets until the first `CreateTable`).
-const TABLET: TabletId = TabletId(1);
 /// How long a CP op (`cp_route` + forward) waits for the tablet's group to be
 /// reachable before giving up. Generous because a table's group now forms **in
 /// band** on the first access (ADR 0023) — the first op after a `CreateTable`/
@@ -406,88 +382,15 @@ const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
 /// first `min(N, MAX_REPLICATION_FACTOR)` nodes' `raftkv` ids. Dynamic CP placement
 /// over more nodes is later v1 work.
 const MAX_REPLICATION_FACTOR: usize = 3;
-/// Filename prefix namespacing the CP group's on-disk LSM under the node's `raftkv`
-/// `ProdEnv` directory (its files become `db-MANIFEST`/`db-wal`/`db-sst-*`).
-///
-/// The prefix is a flat filename prefix, **not** a subdirectory (no `/`):
-/// `ProdEnv`'s disk opens files directly under the role's data dir and does not
-/// create intermediate directories, so a slash-bearing prefix would fail to
-/// create the engine's files. The role's dir is dedicated to this group, so a flat
-/// prefix already isolates it. A split-created tablet's group uses a per-tablet
-/// prefix `db-t{id}-` so co-resident groups' LSM files never collide.
+/// Filename prefix namespacing the node's **one shared** on-disk LSM under its
+/// `raftkv` `ProdEnv` directory (its files become `db-MANIFEST`/`db-wal`/
+/// `db-sst-*`). Every tablet this node hosts shares this **same** engine —
+/// opened once, cloned into every tablet group's [`RaftKvNode`] — confined
+/// from each other by a [`StorageScope`] (table-id key prefix + tablet range),
+/// not by separate files. The prefix is a flat filename prefix, **not** a
+/// subdirectory (no `/`): `ProdEnv`'s disk opens files directly under the
+/// role's data dir and does not create intermediate directories.
 const LSM_PREFIX: &str = "db-";
-
-/// Size of each `raftkv` env's pre-bound **sibling listener pool** (Phase 2.2): the
-/// number of co-resident CP groups a node can host **beyond** its bootstrap group —
-/// i.e. the max split children per node. A node hosting tablets `1..=T` needs `T-1`
-/// slots, so this caps a node at `CP_SIBLING_POOL + 1` tablets; exceeding it panics
-/// the split-hook task (`Coresident::sibling`), leaving the over-cap tablet
-/// leaderless. Sized generously so realistic sharding tests (bulk-seed → auto-split)
-/// don't hit it; each slot is a cheap pre-bound loopback listener + accept loop.
-/// (A truly unbounded fix needs on-demand sibling binding — an `async`/fallible
-/// `Coresident::sibling` — which is a larger ADR-0017 change; deferred.)
-const CP_SIBLING_POOL: usize = 64;
-
-/// Stride for deriving a split-created tablet's CP **member ids** from the parent
-/// group's, deterministically + identically on every replica (Phase 2.2): a new
-/// member is `parent_member + new_tablet_id * CP_SPLIT_ID_STRIDE`. Wide enough that
-/// `300 + i` bootstrap ids and per-tablet bands never overlap for small clusters /
-/// tablet counts. (Deep-split id allocation — a flat allocator that survives many
-/// generations — is a later refinement.)
-const CP_SPLIT_ID_STRIDE: NodeId = 1000;
-
-/// Durable per-node record of the **split-created CP tablets this node hosts on
-/// disk** (#2 tablet-map-driven hosting). Written under the node's `raftkv`
-/// `ProdEnv` directory by the split-seed path once a new tablet's group is stood
-/// up + seeded durably; read at node start to **re-host** those tablets after a
-/// restart (their `db-t{id}-` engines are on disk, recovered via `start_seeded`
-/// with an empty seed). This is genuinely *local* state — which co-resident engines
-/// physically exist on this node — not derivable from the replicated tablet map
-/// (which records the placement in stable base ids, not the per-tablet sibling
-/// engines), so it is a durable marker rather than a cache of replicated state.
-///
-/// It also gives **split crash-idempotency** (#4): pre-populating the per-node
-/// `minted` set from this marker at start means the parent group re-applying its
-/// committed `Split` on WAL recovery finds the tablet already hosted and does not
-/// mint the sibling a second time.
-const CP_HOSTED_FILE: &str = "cp-hosted";
-
-/// One entry in the [`CP_HOSTED_FILE`] marker: a split-created tablet this node
-/// hosts, with this node's **member id** in that tablet's group and the group's
-/// full member-id set, both already in the derived id space
-/// (`base + tablet * CP_SPLIT_ID_STRIDE`) so re-hosting needs no re-derivation.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-struct HostedCpTablet {
-    tablet: u64,
-    member: NodeId,
-    members: Vec<NodeId>,
-}
-
-/// Read this node's durable [`HostedCpTablet`] set from the `raftkv` env disk
-/// (empty if the marker does not exist or is unreadable/corrupt — a missing or
-/// damaged marker degrades to "host nothing extra", never a hard failure at
-/// start). Generic over `E: Env` so the `Disk` supertrait methods are in scope.
-async fn load_hosted_cp<E: Env>(env: &E) -> Vec<HostedCpTablet> {
-    let bytes = env.read(CP_HOSTED_FILE).await.unwrap_or_default();
-    if bytes.is_empty() {
-        return Vec::new();
-    }
-    serde_json::from_slice(&bytes).unwrap_or_else(|e| {
-        tracing::warn!(?e, "CP hosted marker is corrupt; ignoring");
-        Vec::new()
-    })
-}
-
-/// Atomically persist this node's [`HostedCpTablet`] set to the `raftkv` env disk
-/// (durable on return — `Disk::replace` is temp-file + rename, so a crash sees the
-/// whole old or whole new marker, never a mix). Called when the split-seed path
-/// stands up a new tablet's group, so a subsequent restart re-hosts it.
-async fn save_hosted_cp<E: Env>(env: &E, hosted: &[HostedCpTablet]) {
-    let bytes = serde_json::to_vec(hosted).expect("hosted CP marker serializes");
-    if let Err(e) = env.replace(CP_HOSTED_FILE, &bytes).await {
-        tracing::error!(?e, "persisting the CP hosted marker");
-    }
-}
 
 /// Which storage engine backs a node's CP group.
 ///
@@ -575,21 +478,14 @@ pub enum ClientRequest {
     /// leader). The result replicates back to every node's `Metadata` as usual; the
     /// caller confirms by polling its own replicated view.
     ProposeSchema(MetaCommand),
-    /// **Admin: split a CP tablet** at `split_key` (Phase 2.2). The receiving node
-    /// records the split in the control plane (`SplitTablet`, minting a new tablet
-    /// id) and proposes the data-plane split on the tablet's CP group leader, which
-    /// on commit hands the upper range `[split_key, ∞)` to a new co-resident group.
-    /// The interim manual trigger; an automatic size-telemetry trigger is later work.
+    /// **Admin: split a CP tablet** at `split_key`. A single, atomic control-plane
+    /// command (`MetaCommand::SplitTablet`, epoch-CAS gated): the source tablet's
+    /// range narrows and a new sibling tablet is minted covering `[split_key, ∞)`,
+    /// both served by this node's *existing* per-node shared engine — no data
+    /// moves, and no second, data-plane step is needed (the old two-phase split is
+    /// gone; see the root `CLAUDE.md`). The interim manual trigger; an automatic
+    /// size-telemetry trigger is `auto_split_loop`.
     SplitTablet { tablet: u64, split_key: Vec<u8> },
-    /// The **data-plane half** of a split, forwarded to the CP leader's node (D2
-    /// cross-process split trigger). After [`SplitTablet`](ClientRequest::SplitTablet)
-    /// records the split in the control plane, the data-plane `propose_split` must run
-    /// on the node hosting the tablet's CP-group leader, which may differ from the
-    /// control leader. A node that recorded the metadata but doesn't host the CP
-    /// leader forwards this; the receiver proposes the split **iff** it is the CP
-    /// leader (one hop, no re-forward, no metadata) — else errors and the client
-    /// retries with fresh routing.
-    CpSplit { tablet: u64, split_key: Vec<u8> },
 }
 
 /// Whether `command` may be **relayed to the control leader** via
@@ -624,10 +520,6 @@ fn is_relayable_command(command: &MetaCommand) -> bool {
             // Drop-table GC (ADR 0024): a `DROP TABLE` on a follower-connected
             // client relays the table's tablet removal to the control leader.
             | MetaCommand::DropTableTablets { .. }
-            // Orphan-tablet GC (the auto-split abandon path below): the loop
-            // driving the abandon runs on whichever node currently hosts the
-            // source tablet's leader, which may not be the control leader.
-            | MetaCommand::DropOrphanTablet { .. }
     )
 }
 
@@ -812,16 +704,14 @@ impl BoundNode {
         self.raftkv_env.set_peers(peers.clone());
         // The initial (static) peer book + a `raftkv`-env clone, kept for the
         // **peer-sync loop** (Phase 2.3a): it rebuilds the raftkv family's peer book
-        // as `static ∪ Metadata.cp_member_addrs` so a runtime-created CP member (a
-        // split sibling, a joined node) becomes reachable. `set_peers` replaces the
-        // book and a sibling env shares the same book Arc, so syncing the raftkv env
-        // reaches every co-resident group.
+        // as `static ∪ Metadata.cp_member_addrs` so a runtime-joined CP member
+        // becomes reachable.
         let static_peers = peers;
         let raftkv_sync_env = self.raftkv_env.clone();
         // A `raftkv`-env clone for the shared **CP hosting context** (`CpHostCtx`):
-        // the split hook, re-host, and join-host paths all mint their sibling inboxes
-        // from it (and host the bootstrap tablet on it directly when this node joins
-        // that tablet). Shares the pool + peer book with the group's env.
+        // every tablet's group this node stands up (via the join-host loop) runs on
+        // it, stream-addressed by tablet id (ADR 0026 Stage B) rather than a
+        // distinct per-tablet env/id.
         let raftkv_hook_env = self.raftkv_env.clone();
         // A `raftkv`-env clone for the **failure-detection heartbeat loop** (#3): each
         // node heartbeats the control group *as its `raftkv` member id* (the cluster
@@ -864,6 +754,35 @@ impl BoundNode {
         // both (ADR 0015).
         let raftkv_metrics = self.raftkv_env.metrics();
 
+        // This node's **one shared storage engine** (ADR 0026/0028): every tablet
+        // this node ever hosts — across every table — merges into it, confined by
+        // its own `StorageScope` (a table-id prefix + the tablet's own key range).
+        // Opened once, here, and cloned into each tablet's `RaftKvNode` as the
+        // per-node join-host loop stands groups up. A restart just re-opens the
+        // same engine (`LsmEngine::open` recovers its durable state) and the
+        // join-host loop re-discovers every tablet to host from replicated
+        // `Metadata` — there is no more per-tablet durable marker to load.
+        //
+        // Opened **before** `RaftNode::start` (below): both do real disk I/O at
+        // startup, and `RaftNode::start` spawns the control plane's `reconcile_loop`
+        // (500ms poll, same period as this node's own `cp_reconfigure_loop`) —
+        // opening this engine afterward would give `reconcile_loop` a head start on
+        // that fixed-period race for the life of the process (neither loop
+        // resynchronizes), letting the placement reconciler win every tablet-replica
+        // change race against the CP-side reconfigure loop instead of an even race.
+        let storage = match backend {
+            StorageBackend::Lsm => match LsmEngine::open(self.raftkv_env.clone(), LSM_PREFIX).await
+            {
+                Ok(lsm) => SharedEngine::Lsm(lsm),
+                Err(e) => {
+                    return Err(std::io::Error::other(format!(
+                        "opening the node's shared CP storage engine: {e}"
+                    )));
+                }
+            },
+            StorageBackend::Memory => SharedEngine::Mem(MemoryEngine::new()),
+        };
+
         let raft = RaftNode::start(self.control_env, control_ids.clone());
         // Register this node's control handle in the **per-cluster** set the wire
         // edges use to reach the control-plane leader for schema proposals
@@ -901,42 +820,26 @@ impl BoundNode {
         };
         let n = control_ids.len();
 
-        // The shared **CP hosting context** (D3): bundles the env to mint siblings,
-        // the client context, backend, this node's base id, and the per-node `minted`
-        // (claim) + `hosted` (durable-marker mirror) sets — so every group started on
-        // this node (bootstrap, split child, re-hosted, joined) carries a split hook
-        // of its own, which is what lets a split tablet be split again. Built
-        // unconditionally: the join-host + re-host paths run on **every** node (a
-        // spare not in the bootstrap set still hosts a tablet later placed on it).
-        //
-        // Load the durable marker first and pre-populate `minted`, so the bootstrap
-        // group re-applying a committed `Split` on WAL recovery finds the tablet
-        // already hosted and does not mint the sibling twice (#4 crash-idempotency).
-        let recorded = load_hosted_cp(&self.raftkv_env).await;
-        let minted: Arc<Mutex<BTreeSet<TabletId>>> = Arc::new(Mutex::new(
-            recorded.iter().map(|h| TabletId(h.tablet)).collect(),
-        ));
-        let hosted = Arc::new(Mutex::new(recorded.clone()));
+        // The shared **CP hosting context**: the client context, this node's one
+        // shared engine, the `raftkv` env every tablet's group runs on
+        // (stream-addressed), this node's base id, and the per-node `minted` claim
+        // set (dedups concurrent join-host ticks within this process — reset on
+        // restart, which is fine, since a restarted node just re-discovers every
+        // tablet it should host from replicated `Metadata`). Built unconditionally:
+        // the join-host loop runs on **every** node (a spare not yet placed on any
+        // tablet still hosts one later, once the reconciler places it there).
+        let minted: Arc<Mutex<BTreeSet<TabletId>>> = Arc::new(Mutex::new(BTreeSet::new()));
         let host = CpHostCtx {
             raftkv_env: raftkv_hook_env,
             ctx: ctx.clone(),
-            backend,
+            storage,
             base_id: my_raftkv_id,
             minted: minted.clone(),
-            hosted,
         };
-        // Re-host each previously-split tablet from its on-disk engine (#2). Spawned so
-        // a slow control plane (the address publish) does not block node start.
-        for h in recorded {
-            tokio::spawn(cp_rehost(host.clone(), h));
-        }
         // No CP group is stood up at node start (ADR 0023): a fresh cluster has zero
         // data tablets. The per-node join-host loop (below) stands up each table's
-        // group when `CreateTable` provisions its tablet — the first table's tablet
-        // (`TABLET` = id 1) lands on this node's **main** `raftkv` env via
-        // `cp_member_id`/`cp_join_host`, later tablets on minted siblings. On restart
-        // the same loop re-hosts a provisioned tablet from its on-disk engine
-        // (`LsmEngine::open` recovers), and `cp_rehost` re-hosts split children.
+        // group when `CreateTable` provisions its tablet, and re-forms it from the
+        // shared engine's already-durable data on restart.
 
         // Bootstrap: whichever node is leader registers membership (no data tablet)
         // (idempotent). Track the client-facing task handles so `shutdown` can
@@ -1083,14 +986,11 @@ impl Node {
             ProdEnv::bind(control_id, addrs.control, dir.join("control")).await?;
         // The leaderful CP per-tablet Raft role's internal env (ADR 0017 #3a) — the
         // v1 data plane; distinct id/port/dir from the control role (single-consumer
-        // inbox). Bound with a **sibling listener pool** (Phase 2.2) so a tablet
-        // split can mint a co-resident group member at runtime; the pool size bounds
-        // how many co-resident CP groups this node can host.
-        let pool: Vec<SocketAddr> = (0..CP_SIBLING_POOL)
-            .map(|_| SocketAddr::new(addrs.raftkv.ip(), 0))
-            .collect();
+        // inbox). Since ADR 0026 Stage B every tablet this node hosts shares this
+        // **one** env, addressed by `stream` (the tablet id) — no more per-tablet
+        // sibling inbox to pre-bind (`Coresident`/`CP_SIBLING_POOL` are gone).
         let (raftkv_env, raftkv_addr) =
-            ProdEnv::bind_with_pool(raftkv_id, addrs.raftkv, &pool, dir.join("raftkv")).await?;
+            ProdEnv::bind(raftkv_id, addrs.raftkv, dir.join("raftkv")).await?;
         let client_listener = TcpListener::bind(addrs.client).await?;
         let client_addr = client_listener.local_addr()?;
         let dynamo_listener = TcpListener::bind(addrs.dynamo).await?;
@@ -1243,14 +1143,6 @@ pub struct ClusterEdgeState {
     /// cluster has one whole-keyspace tablet, so there is one entry; a tablet split
     /// adds another.
     raftkv: Arc<Mutex<BTreeMap<TabletId, Vec<CpGroup>>>>,
-    /// Tablets with a **fresh** auto-split attempt currently in flight (`auto_split_loop`
-    /// claim/release, see [`ClusterEdgeState::claim_auto_split`]) — cluster-wide, not
-    /// per-node, because `cp_leader`'s "only the leader's host triggers" gate is not
-    /// actually node-scoped under `--cluster N`'s shared `raftkv` map above (every
-    /// hosting node's handle for a tablet is registered on this *same* struct, so
-    /// `cp_leader` returns `Some` to every node's loop, not just the tablet's true
-    /// host).
-    auto_split_claims: Arc<Mutex<BTreeSet<TabletId>>>,
 }
 
 impl Default for ClusterEdgeState {
@@ -1267,7 +1159,6 @@ impl ClusterEdgeState {
             dynamo_registry: Arc::new(Mutex::new(animus_dynamo::SchemaRegistry::new())),
             cql_state: Arc::new(tokio::sync::Mutex::new(cql::CqlState::default())),
             raftkv: Arc::new(Mutex::new(BTreeMap::new())),
-            auto_split_claims: Arc::new(Mutex::new(BTreeSet::new())),
         }
     }
 
@@ -1374,37 +1265,6 @@ impl ClusterEdgeState {
             .get(&tablet)?
             .first()
             .cloned()
-    }
-
-    /// Claim the right to drive a **fresh** auto-split trigger for `tablet` —
-    /// cluster-wide, not per-node. `auto_split_loop`'s "only the leader's host
-    /// triggers" gate (`ctx.edge.cp_leader(tablet)`) is not actually node-scoped
-    /// under `--cluster N`'s shared edge state: every hosting node's handle for
-    /// `tablet` is registered on this *same* `ClusterEdgeState`, so `cp_leader`
-    /// returns `Some` to every node's loop, not just the tablet's true host —
-    /// without this claim, all of them could independently propose a fresh,
-    /// possibly differently-keyed `SplitTablet` for the same source tablet in
-    /// the same tick (only one can ever win the tablet's one-time data-plane
-    /// split; the losers are permanently orphaned metadata-only tablets, and the
-    /// duplicate proposals themselves flood the control-plane Raft log). Held
-    /// for the lifetime of the whole split attempt (step 1, step 2, and any
-    /// pending retry), released via
-    /// [`release_auto_split`](Self::release_auto_split) once it resolves
-    /// (success, a step-1 failure, or abandonment). Returns `true` if the claim
-    /// was newly taken (i.e. the caller should proceed).
-    fn claim_auto_split(&self, tablet: TabletId) -> bool {
-        self.auto_split_claims
-            .lock()
-            .expect("auto-split claim set poisoned")
-            .insert(tablet)
-    }
-
-    /// Release a claim taken by [`claim_auto_split`](Self::claim_auto_split).
-    fn release_auto_split(&self, tablet: TabletId) {
-        self.auto_split_claims
-            .lock()
-            .expect("auto-split claim set poisoned")
-            .remove(&tablet);
     }
 
     /// Every CP group this node hosts, as `(tablet, group)` pairs in tablet order
@@ -1535,9 +1395,7 @@ impl ClientCtx {
 
     /// One attempt at resolving a *known* tablet's group leader to a [`CpRoute`], or
     /// `None` if it isn't settled yet (caller should wait + retry). The leader-
-    /// resolution policy shared by [`cp_route`](Self::cp_route) (key→tablet→leader)
-    /// and [`cp_route_tablet`](Self::cp_route_tablet) (tablet→leader, for the split
-    /// trigger, where the key maps to a *different* tablet after the metadata split).
+    /// resolution policy behind [`cp_route`](Self::cp_route) (key→tablet→leader).
     ///
     /// The branching itself — serve locally / forward-to-hint / forward-anywhere
     /// / wait — is the pure [`topology::decide_cp_route`]; this method's job is
@@ -1582,24 +1440,6 @@ impl ClientCtx {
             return Some(CpRoute::Forward(addr));
         }
         None
-    }
-
-    /// Resolve a CP op to a leader by **tablet id** (not key), waiting up to
-    /// [`CLIENT_TIMEOUT`] for the group to settle. Used by the split trigger: after
-    /// the metadata split commits, the split *key* maps to the new (right-hand)
-    /// tablet, so routing the data-plane split by key would target the wrong group —
-    /// it must route to the tablet being split by id.
-    async fn cp_route_tablet(&self, tablet: TabletId) -> CpRoute {
-        let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
-        loop {
-            if let Some(route) = self.resolve_cp_route(tablet) {
-                return route;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return CpRoute::None;
-            }
-            tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
-        }
     }
 
     /// Linearizable CP **read** of `key` (ADR 0017): ReadIndex on the group leader,
@@ -2085,48 +1925,6 @@ impl ClientCtx {
         }
     }
 
-    /// Confirm a `propose_split(split_key)` that returned `Accepted` actually
-    /// committed **at that key** before trusting it — the split-path counterpart of
-    /// [`cp_put_local`](Self::cp_put_local)'s local-read confirm. `Accepted` only
-    /// means the `Split` entry was appended to the leader's local log, never that
-    /// it committed (see [`RaftKvNode::current_split_bound`]'s doc): under leader
-    /// churn the entry can be silently truncated before it commits. Comparing the
-    /// *exact* key (not just "has this group split at all") also catches a
-    /// narrower same-tick race: under `--cluster N`'s shared edge state, more than
-    /// one node can independently read this tablet's live pairs and compute a
-    /// *different* median in the same tick, then both propose a split on the same
-    /// group — only one key ever actually wins a given round, so the loser's own
-    /// key never applies even though *a* split did. Skipping this check (or
-    /// checking only a bare split-happened flag) is exactly the bug that let
-    /// `propose_split_data` report success for a split that never actually
-    /// happened at the caller's key — the control-plane `SplitTablet` metadata was
-    /// already committed by that point (`propose_split_metadata`), so an
-    /// unconfirmed "success" permanently strands that tablet (`leader: unknown`
-    /// forever, nothing left to retry it). On timeout, return an error so the
-    /// caller's retry path (`auto_split_loop`'s `pending` map) engages instead.
-    ///
-    /// **A `false` here does not mean "definitely lost"** once a group can split
-    /// more than once: a *later* split could narrow past `split_key` after it
-    /// already applied, and this alone can't tell the two apart (see
-    /// `current_split_bound`'s doc). Callers that give up and clean something up
-    /// on a confirm failure must independently verify it's actually safe first
-    /// (never delete a tablet that's still genuinely, locally hosted) — see
-    /// `drop_orphan_tablet`.
-    async fn confirm_split(leader: &CpGroup, split_key: &[u8]) -> ClientResponse {
-        let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
-        let mut poll = CP_CONFIRM_POLL_INIT;
-        loop {
-            if leader.current_split_bound().as_deref() == Some(split_key) {
-                return ClientResponse::PutOk;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return ClientResponse::Error("CP split did not commit in time".into());
-            }
-            tokio::time::sleep(poll).await;
-            poll = (poll * 2).min(CP_CONFIRM_POLL_MAX);
-        }
-    }
-
     /// Map a forwarded-op reply that should be a bare ack into `Result<(), String>`.
     fn ok_or_err(resp: ClientResponse, what: &str) -> Result<(), String> {
         match resp {
@@ -2172,17 +1970,11 @@ impl ClientCtx {
     /// so it never forwards a CP op to a non-leader, including itself), or the hinted
     /// id has no known route.
     fn cp_forward_target(&self, tablet: TabletId) -> Option<SocketAddr> {
-        // The local replica's leader hint is a group **member id** (derived for a
-        // non-bootstrap tablet); `client_route` is keyed by stable **base** node
-        // ids, so translate back (ADR 0017 #4 — the reverse of `cp_members_for`).
-        // Without this, a healthy remote leader of a provisioned/split tablet is
-        // unroutable from a follower node: the lookup misses, and because a local
-        // replica exists, `resolve_cp_route` waits out CLIENT_TIMEOUT instead of
-        // forwarding — "no CP group leader reachable" on a led group.
-        let leader_member = self.edge.local_cp(tablet).and_then(|n| n.leader())?;
-        self.client_route
-            .get(&cp_base_id(leader_member, tablet))
-            .copied()
+        // Since ADR 0026 Stage B a tablet's CP group member id **is** simply the
+        // base `raftkv` id, so the local replica's leader hint is already a
+        // `client_route` key — no more base<->member translation needed.
+        let leader = self.edge.local_cp(tablet).and_then(|n| n.leader())?;
+        self.client_route.get(&leader).copied()
     }
 
     /// Forward a CP op to another node's client API (wrapped so the receiver
@@ -2543,257 +2335,121 @@ async fn peer_sync_loop(
     }
 }
 
-/// Everything the CP **hosting** paths share (D3): the env to mint sibling inboxes
-/// from, the client context (routing + address publish), the storage backend, this
-/// node's **base** `raftkv` id, and the per-node `minted` (hosting-claim) + `hosted`
-/// (durable-marker mirror) sets. Bundled so **every** group this node stands up —
-/// bootstrap, split child, re-hosted, or joined — can carry a `SplitHook` of its own
-/// ([`cp_split_hook`]), which is what lets a split-created tablet be split *again*
-/// (deep splits / continued auto-sharding).
+/// A node's **one shared** storage engine (ADR 0026/0028): every tablet the node
+/// hosts, across every table, merges into it — confined by its own
+/// [`StorageScope`], not by separate files. Mirrors [`CpGroup`]'s two-backend
+/// shape; cheap to clone (clones share state), so `CpHostCtx` can hand every
+/// tablet's group its own clone.
+#[derive(Clone)]
+enum SharedEngine {
+    /// Durable on-disk LSM (default; survives a restart).
+    Lsm(LsmEngine<ProdEnv>),
+    /// Volatile in-memory engine (ephemeral runs).
+    Mem(MemoryEngine),
+}
+
+/// The `StorageScope` prefix confining `table`'s tablets on a node's shared
+/// engine: `escape(table)`. Order-preserving and prefix-free
+/// (`animus_tablet::escape`), so one table's keys can never collide with
+/// another's even though every table's tablets share one physical
+/// `LsmEngine`/`MemoryEngine` (ADR 0026/0028).
+fn table_scope_prefix(table: &str) -> Vec<u8> {
+    escape(table.as_bytes())
+}
+
+/// Everything the CP **hosting** paths share: the client context (routing +
+/// address publish), this node's one shared storage engine, the `raftkv` env
+/// every tablet's group runs on (stream-addressed by tablet id, ADR 0026 Stage
+/// B), this node's base `raftkv` id, and the per-node `minted` claim set —
+/// dedups concurrent join-host ticks for the same tablet within this process.
+/// `minted` is **not** persisted: a restarted node just re-discovers every
+/// tablet it should host by polling replicated `Metadata` fresh and re-forms
+/// each group from the shared engine's already-durable data (no more durable
+/// `cp-hosted` marker to load).
 #[derive(Clone)]
 struct CpHostCtx {
     raftkv_env: ProdEnv,
     ctx: ClientCtx,
-    backend: StorageBackend,
+    storage: SharedEngine,
     base_id: NodeId,
     minted: Arc<Mutex<BTreeSet<TabletId>>>,
-    hosted: Arc<Mutex<Vec<HostedCpTablet>>>,
-}
-
-// `cp_member_id` / `cp_base_id` (base <-> derived CP group member id translation)
-// now live in `topology` as pure, unit-tested functions; imported via
-// `use topology::{cp_base_id, cp_member_id, cp_members_for};` below.
-
-/// Build a **CP split hook** for a group on this node (Phase 2.2 / D3). When the
-/// group commits a `Split { at }`, every replica invokes this hook with the handed-off
-/// `[at, ∞)` data; the hook spawns [`cp_split_seed`] to stand up this node's member of
-/// the new tablet's group — itself carrying a hook (so the child can split again).
-fn cp_split_hook(host: CpHostCtx) -> SplitHook {
-    Arc::new(move |at, handoff| {
-        tracing::info!(
-            base_id = host.base_id,
-            handoff_len = handoff.len(),
-            "cp_split_hook: apply fired the split hook, spawning cp_split_seed"
-        );
-        tokio::spawn(cp_split_seed(host.clone(), at, handoff));
-    })
-}
-
-/// Stand up this node's co-resident member of a split-created tablet's CP group
-/// (Phase 2.2 / D3), seeded with the handed-off `[at, ∞)` `handoff` data.
-///
-/// Resolves the new tablet from replicated `Metadata` (the trigger's `SplitTablet`
-/// created a tablet whose range starts at `at`), derives the new group's member ids
-/// flatly from base ids ([`cp_members_for`] / [`cp_member_id`], identical on every
-/// replica + at any depth), mints a `Coresident::sibling` inbox for its own member,
-/// opens a per-tablet engine, starts the group **with its own split hook**, registers
-/// it for routing, records the durable marker, and publishes its address. **Idempotent
-/// per node** (the shared `minted` claim set), so the hook firing on every apply
-/// (incl. WAL re-apply on recovery) mints at most once.
-#[tracing::instrument(
-    name = "cp_split_seed",
-    skip(host, at, handoff),
-    fields(base_id = host.base_id, handoff_len = handoff.len(), new_tablet = tracing::field::Empty)
-)]
-async fn cp_split_seed(host: CpHostCtx, at: Vec<u8>, handoff: Vec<(Vec<u8>, Vec<u8>)>) {
-    tracing::info!("cp_split_seed: hook fired, resolving new tablet from metadata");
-    // The new tablet is the one the trigger's `SplitTablet` created with range
-    // starting exactly at the split key. Poll briefly for it to replicate here.
-    let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
-    let (new_tablet, replicas) = loop {
-        let found = host
-            .ctx
-            .raft
-            .metadata()
-            .tablets
-            .iter()
-            .find(|(_, t)| t.range.start == at)
-            .map(|(id, t)| (*id, t.replicas.clone()));
-        if let Some(found) = found {
-            break found;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            tracing::warn!("CP split: new tablet for the split key never appeared");
-            return;
-        }
-        tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
-    };
-    tracing::Span::current().record("new_tablet", new_tablet.0);
-    tracing::info!(
-        new_tablet = new_tablet.0,
-        ?replicas,
-        "cp_split_seed: resolved new tablet"
-    );
-
-    // Idempotent **per node**: mint this node's member of the new tablet only once
-    // per process. (The per-node `minted` set, not the edge state — in a `--cluster N`
-    // process the edge is *shared* across nodes, so gating on `edge.local_cp` would
-    // let the first node's mint suppress every other node's, leaving no quorum.)
-    {
-        let mut minted = host.minted.lock().expect("minted set poisoned");
-        if !minted.insert(new_tablet) {
-            tracing::info!("cp_split_seed: already minted on this node, skipping");
-            return;
-        }
-    }
-
-    let new_members: Vec<NodeId> = cp_members_for(new_tablet, &replicas).into_iter().collect();
-    let my_new_id = cp_member_id(host.base_id, new_tablet);
-    tracing::info!(
-        my_new_id,
-        ?new_members,
-        "cp_split_seed: minted claim taken, starting group"
-    );
-
-    // A co-resident inbox for this node's member of the new group, drawn from the
-    // pre-bound listener pool; its address is published for peer-sync. The new group
-    // carries its own split hook so it can be split again (D3).
-    let sibling = host.raftkv_env.sibling(my_new_id);
-    let sibling_addr = sibling.local_addr();
-    let hook = cp_split_hook(host.clone());
-    let cp = match host.backend {
-        StorageBackend::Lsm => {
-            let prefix = format!("db-t{}-", new_tablet.0);
-            match LsmEngine::open(sibling.clone(), &prefix).await {
-                Ok(lsm) => CpGroup::Lsm(
-                    RaftKvNode::start_seeded_with_split_hook(
-                        sibling,
-                        new_members.clone(),
-                        lsm,
-                        handoff,
-                        hook,
-                    )
-                    .await,
-                ),
-                Err(e) => {
-                    tracing::error!(?e, "CP split: opening new tablet LSM");
-                    return;
-                }
-            }
-        }
-        StorageBackend::Memory => CpGroup::Mem(
-            RaftKvNode::start_seeded_with_split_hook(
-                sibling,
-                new_members.clone(),
-                MemoryEngine::new(),
-                handoff,
-                hook,
-            )
-            .await,
-        ),
-    };
-    host.ctx.edge.register_raftkv(new_tablet, cp);
-    tracing::info!("cp_split_seed: raftkv group registered in edge state");
-
-    // Durably record that this node now hosts the new tablet's group on disk, so a
-    // restart re-hosts it from its `db-t{id}-` engine (#2). Persist before the address
-    // publish so a crash mid-publish still re-hosts on recovery. Snapshot under the
-    // lock, then drop the guard before the async persist (never hold a `std::sync::Mutex`
-    // guard across `.await`).
-    let snapshot = {
-        let mut h = host.hosted.lock().expect("hosted set poisoned");
-        if !h.iter().any(|e| e.tablet == new_tablet.0) {
-            h.push(HostedCpTablet {
-                tablet: new_tablet.0,
-                member: my_new_id,
-                members: new_members,
-            });
-        }
-        h.clone()
-    };
-    save_hosted_cp(&host.raftkv_env, &snapshot).await;
-
-    // Publish this member's address (relayed to the control leader cross-process, #4)
-    // so every node's peer-sync loop can reach it.
-    host.ctx
-        .register_cp_addr(my_new_id, sibling_addr.to_string())
-        .await;
-    tracing::info!("cp_split_seed: address published, split-seed complete");
-}
-
-/// Re-host a split-created CP tablet from its on-disk engine at node start (#2):
-/// mint the tablet's `Coresident::sibling`, recover its `db-t{id}-` engine +
-/// `raftkv.wal` via an **empty** seed (the data is already durable on disk — the seed
-/// only ever carries a *fresh* split's handoff), start it **with its own split hook**
-/// (so a re-hosted split tablet can still be re-split, D3), register it, and re-publish
-/// the sibling's new address (the pool port is fresh each incarnation).
-async fn cp_rehost(host: CpHostCtx, h: HostedCpTablet) {
-    let sibling = host.raftkv_env.sibling(h.member);
-    let sibling_addr = sibling.local_addr();
-    let tablet = TabletId(h.tablet);
-    let hook = cp_split_hook(host.clone());
-    let cp = match host.backend {
-        StorageBackend::Lsm => {
-            let prefix = format!("db-t{}-", h.tablet);
-            match LsmEngine::open(sibling.clone(), &prefix).await {
-                Ok(lsm) => CpGroup::Lsm(
-                    RaftKvNode::start_seeded_with_split_hook(
-                        sibling,
-                        h.members,
-                        lsm,
-                        Vec::new(),
-                        hook,
-                    )
-                    .await,
-                ),
-                Err(e) => {
-                    tracing::error!(?e, tablet = h.tablet, "CP re-host: opening tablet LSM");
-                    return;
-                }
-            }
-        }
-        StorageBackend::Memory => CpGroup::Mem(
-            RaftKvNode::start_seeded_with_split_hook(
-                sibling,
-                h.members,
-                MemoryEngine::new(),
-                Vec::new(),
-                hook,
-            )
-            .await,
-        ),
-    };
-    host.ctx.edge.register_raftkv(tablet, cp);
-    host.ctx
-        .register_cp_addr(h.member, sibling_addr.to_string())
-        .await;
 }
 
 /// How often the CP reconfigure loop pulls the tablet map and steps a group it
 /// leads toward its desired voter set (#3). Brisk enough to converge a replica move
 /// promptly, but a no-op once a group's config matches the placement, so a steady
 /// cluster produces no churn.
-const CP_RECONFIGURE_INTERVAL: Duration = Duration::from_millis(500);
-
-// `cp_members_for` (translate a tablet's base-id replica set to its CP group's
-// member ids) now lives in `topology` as a pure, unit-tested function — see the
-// `use` import above [`cp_member_id`]/[`cp_base_id`].
+///
+/// **Deliberately shorter than the control plane's `RECONCILE_INTERVAL`** (500ms,
+/// `animus-control`): a replica-set change to a tablet whose placement *policy*
+/// still calls for the old count is a genuine one-shot race between this loop
+/// (which should shrink/grow the group's actual Raft voters to match) and the
+/// policy reconciler (which will otherwise CAS the replica set right back to
+/// satisfy the policy) — whichever observes the change first decides the
+/// outcome, since once either side "wins" the system reaches a stable
+/// equilibrium with nothing left to retry. Polling at a third of the
+/// reconciler's period makes this loop overwhelmingly likely to observe and
+/// act on a fresh replica-set change first.
+const CP_RECONFIGURE_INTERVAL: Duration = Duration::from_millis(150);
 
 /// The per-node **CP reconfigure loop** over `ProdEnv` (#3 / ADR 0017 Stage C): on
 /// each tick, for every tablet whose CP group this node currently **leads**, pull the
-/// tablet's desired replica set from replicated `Metadata` (translated to group
-/// member ids) and take one single-server [`reconfigure_step`](CpGroup::reconfigure_step)
-/// toward it. The production counterpart of `animus-cp-data`'s `spawn_reconfigure_loop`
-/// — the decision is the replicated placement (the reconciler's epoch-CAS), the timing
-/// is here. Leader- and convergence-gated, so a steady cluster proposes nothing; a
-/// multi-server move converges one server per tick.
+/// tablet's desired replica set from replicated `Metadata` and take one single-server
+/// [`reconfigure_step`](CpGroup::reconfigure_step) toward it. The production
+/// counterpart of `animus-cp-data`'s `spawn_reconfigure_loop` — the decision is the
+/// replicated placement (the reconciler's epoch-CAS), the timing is here. Leader- and
+/// convergence-gated, so a steady cluster proposes nothing; a multi-server move
+/// converges one server per tick.
+///
+/// Since ADR 0026 Stage B a tablet's CP group member id **is** simply the base
+/// `raftkv` id — no more translation to a derived member id — so the desired voter
+/// set is just the tablet's replica set, verbatim.
 ///
 /// Removing a dead replica needs no new member, so it converges immediately. Adding a
-/// *fresh* replica also requires that node to host an (empty) co-resident group for
-/// the tablet so it can catch up via `InstallSnapshot` — the join-hosting piece is the
-/// remaining v1 increment (this loop drives the membership change either way).
+/// *fresh* replica also requires that node to host an (empty) group for the tablet so
+/// it can catch up via `InstallSnapshot` — that's [`cp_join_host_loop`].
+///
+/// **Jittered, not a bare fixed-period sleep**: the control plane's own
+/// `reconcile_loop` (ADR 0005, `animus-control`) also polls on a fixed 500ms
+/// period to enforce a tablet's placement *policy* — and a manual (or
+/// higher-level) replica-set change competes with it: if the policy still wants
+/// the old replica count, the reconciler will CAS the tablet right back. Two
+/// un-jittered fixed-period loops can fall into a stable relative phase for the
+/// life of the process (neither resynchronizes), which can let one loop win a
+/// given race *every* time rather than a fair contest — observed as this loop
+/// losing to the reconciler on every tick after a manual replica-set drop.
+/// Re-rolling a small random jitter each iteration makes the phase drift
+/// tick-to-tick, so across the many ticks in any real observation window this
+/// loop gets a fair shot instead of a fixed, possibly permanently-losing one.
 async fn cp_reconfigure_loop(ctx: ClientCtx) {
     loop {
-        tokio::time::sleep(CP_RECONFIGURE_INTERVAL).await;
+        tokio::time::sleep(CP_RECONFIGURE_INTERVAL + jitter(CP_RECONFIGURE_INTERVAL)).await;
         let tablets = ctx.raft.metadata().tablets;
         for (tablet, t) in tablets {
             let Some(leader) = ctx.edge.cp_leader(tablet) else {
                 continue;
             };
-            let desired = cp_members_for(tablet, &t.replicas);
+            let desired: BTreeSet<NodeId> = t.replicas.iter().copied().collect();
             leader.reconfigure_step(&desired);
         }
     }
+}
+
+/// A small pseudo-random jitter in `[0, max)`, seeded from the wall clock —
+/// deliberately non-deterministic (this file is `ProdEnv`-only, outside the
+/// `Env`-seam determinism boundary, ADR 0003) and dependency-free. Used to keep
+/// fixed-period background loops from settling into a permanent unlucky phase
+/// relative to another independent fixed-period loop (see
+/// [`cp_reconfigure_loop`]'s doc).
+fn jitter(max: Duration) -> Duration {
+    if max.is_zero() {
+        return Duration::ZERO;
+    }
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    Duration::from_nanos(u64::from(nanos) % max.as_nanos().max(1) as u64)
 }
 
 /// How often the join-host loop polls the tablet map for a tablet newly placed on
@@ -2803,126 +2459,101 @@ async fn cp_reconfigure_loop(ctx: ClientCtx) {
 /// adds contention under heavy parallel load.
 const CP_JOIN_HOST_INTERVAL: Duration = Duration::from_millis(250);
 
-/// The per-node **CP join-host loop** (D1): when the placement reconciler adds this
-/// node to a tablet's replica set (e.g. picking it as the spare for a `Down`
-/// replica), stand up an **empty** co-resident group for that tablet so the group's
-/// leader can add it as a voter and catch it up via `InstallSnapshot`.
+/// The per-node **CP join-host loop**: when the placement reconciler adds this node
+/// to a tablet's replica set (e.g. picking it as the spare for a `Down` replica), or
+/// a table's tablet is freshly provisioned or split, stand up this node's member of
+/// that tablet's group.
 ///
-/// Hosts (ADR 0023): a freshly **provisioned** table tablet (`INITIAL`, whole-ring
-/// range — `cp_join_host` forms it with the full voter config so it elects), or a
-/// **joined** replica (`epoch > INITIAL` — the reconciler placed this node into an
-/// existing group; it starts as a quiet non-voter until the leader adds it). It
-/// **skips** a fresh *split* child (`INITIAL` + non-whole range): that is seeded with
-/// its handed-off data by the split hook on its original replicas, so starting it
-/// empty here would lose data. On a restart `cp_join_host` re-forms from the on-disk
-/// engine (full config when it has data). Double-hosting is prevented **per node** by
-/// the `minted` claim set (shared with the split hook + re-host), not `edge.local_cp`
-/// (which is shared across nodes in an in-process `--cluster N` run).
+/// Since a single-command split moves no data (ADR 0026/0028: a split child's
+/// `StorageScope` is simply confined to its own range against the same
+/// already-populated shared engine), a fresh split child forms **exactly like** a
+/// fresh whole-keyspace tablet — both get the full voter config
+/// ([`topology::plan_join_host`]'s `initial_formation`). A **restart** of a tablet
+/// this node already hosts also needs the full config (WAL recovery alone does not
+/// restore voter status from a non-voter start) — detected by
+/// `StorageScope::has_data`, an async engine read the pure decision can't do, so
+/// `cp_join_host` layers it on top. Double-hosting is prevented **per node** by the
+/// `minted` claim set, not `edge.local_cp` (which is shared across nodes in an
+/// in-process `--cluster N` run).
 async fn cp_join_host_loop(host: CpHostCtx) {
     loop {
         tokio::time::sleep(CP_JOIN_HOST_INTERVAL).await;
         let tablets = host.ctx.raft.metadata().tablets;
         for (tablet, t) in tablets {
-            // The pure decision — is this tablet this node's concern, and if so
-            // forming fresh or joining an existing group — is
-            // `topology::plan_join_host` (host a freshly *provisioned* table
-            // tablet at `INITIAL` with the whole range, or a *joined* replica at a
-            // bumped epoch; skip a fresh split child, `INITIAL` + non-whole range,
-            // whose data is seeded by the split hook instead). On a restart
-            // `LsmEngine::open` in `cp_join_host` recovers the on-disk engine, so
-            // re-hosting a provisioned tablet here does not start it truly empty.
-            let Some(plan) = topology::plan_join_host(host.base_id, &t.replicas, t.epoch, &t.range)
-            else {
+            let Some(plan) = topology::plan_join_host(host.base_id, &t.replicas, t.epoch) else {
                 continue;
             };
-            // Dedup **per node** via the `minted` claim set (shared with the split
-            // hook + re-host on *this* node) — NOT via `edge.local_cp`, which in an
-            // in-process `--cluster N` run is a **shared** `ClusterEdgeState`: it
-            // would report *another* node's just-hosted group and make this node skip,
-            // leaving a freshly provisioned tablet hosted on only one replica (no
-            // majority → no election → "no CP group leader reachable"). The minted set
-            // is genuinely per-node, so it dedups correctly in both deployment modes.
-            // This stateful claim stays here — it is not part of the pure decision.
+            // Dedup **per node** via the `minted` claim set — NOT via `edge.local_cp`,
+            // which in an in-process `--cluster N` run is a **shared**
+            // `ClusterEdgeState`: it would report *another* node's just-hosted group
+            // and make this node skip, leaving a freshly provisioned tablet hosted on
+            // only one replica (no majority → no election → "no CP group leader
+            // reachable"). The minted set is genuinely per-node, so it dedups
+            // correctly in both deployment modes. This stateful claim stays here — it
+            // is not part of the pure decision.
             {
                 let mut h = host.minted.lock().expect("hosting set poisoned");
                 if !h.insert(tablet) {
                     continue;
                 }
             }
-            cp_join_host(&host, tablet, &t.replicas, plan.initial_formation).await;
+            cp_join_host(&host, tablet, &t, plan.initial_formation).await;
         }
     }
 }
 
-/// Stand up this node's empty member of `tablet`'s group (the body of
-/// [`cp_join_host_loop`]). The bootstrap tablet's member id is this node's base
-/// `raftkv` id, hosted on the **main** `raftkv` env; a split tablet's is derived, so
-/// it mints a co-resident **sibling**. The group carries its own split hook (D3). On
-/// a transient engine-open failure the tablet is un-claimed so a later tick retries.
-async fn cp_join_host(
-    host: &CpHostCtx,
-    tablet: TabletId,
-    replicas: &[NodeId],
-    initial_formation: bool,
-) {
-    let member = cp_member_id(host.base_id, tablet);
-    let all_members = cp_members_for(tablet, replicas);
+/// Stand up this node's member of `tablet`'s group (the body of
+/// [`cp_join_host_loop`]) on the node's one shared engine, scoped to `t`'s table +
+/// range. The group's member id is simply this node's base `raftkv` id (ADR 0026
+/// Stage B), stream-addressed by `tablet.0` on the shared `raftkv` env — no more
+/// per-tablet inbox to mint.
+async fn cp_join_host(host: &CpHostCtx, tablet: TabletId, t: &Tablet, initial_formation: bool) {
+    let table = t.table.as_deref().unwrap_or_default();
+    let scope = StorageScope::new(table_scope_prefix(table), t.range.clone());
+    let full: Vec<NodeId> = t.replicas.clone();
     // The **full** member config (every replica, including self) vs the quiet
     // **non-voter** config (the others, excluding self):
-    let full: Vec<NodeId> = all_members.iter().copied().collect();
-    let others: Vec<NodeId> = full.iter().copied().filter(|&id| id != member).collect();
-    // Bootstrap tablet -> the main env (member id == base id); split tablet -> a
-    // sibling minted for the derived member id.
-    let (env, prefix) = if tablet == TABLET {
-        (host.raftkv_env.clone(), LSM_PREFIX.to_string())
-    } else {
-        (
-            host.raftkv_env.sibling(member),
-            format!("db-t{}-", tablet.0),
-        )
-    };
-    let addr = env.local_addr();
-    let hook = cp_split_hook(host.clone());
+    let others: Vec<NodeId> = full
+        .iter()
+        .copied()
+        .filter(|&id| id != host.base_id)
+        .collect();
+    let env = host.raftkv_env.clone();
+    let stream = tablet.0;
     // Choosing the start config (ADR 0023):
     // - **Re-form with the full config** when this node is *forming* the group — a
-    //   freshly provisioned table tablet (`initial_formation`, at `INITIAL`), or a
-    //   **restart** of a tablet this node already hosts (its on-disk engine has data:
-    //   `latest_version() > 0`) — so a replica can campaign and the group elects with
-    //   no live leader. WAL recovery alone does **not** restore voter status from a
-    //   non-voter start, so the restart case must pass the full config explicitly.
+    //   freshly provisioned table tablet or split child (`initial_formation`), or a
+    //   **restart** of a tablet this node already hosts (its scoped range already
+    //   holds data in the shared engine) — so a replica can campaign and the group
+    //   elects with no live leader.
     // - **Join as a quiet non-voter** otherwise — a brand-new (empty) spare the
-    //   reconciler placed into an existing, already-led group, which must not campaign
-    //   until the leader adds it (`animus-cp-data` membership gotcha).
-    let cp = match host.backend {
-        StorageBackend::Lsm => match LsmEngine::open(env.clone(), &prefix).await {
-            Ok(lsm) => {
-                let reforming = initial_formation || lsm.latest_version() > 0;
-                let config = if reforming { full } else { others };
-                CpGroup::Lsm(RaftKvNode::start_with_split_hook(env, config, lsm, hook))
-            }
-            Err(e) => {
-                tracing::error!(?e, tablet = tablet.0, "CP join-host: opening tablet LSM");
-                host.minted
-                    .lock()
-                    .expect("hosting set poisoned")
-                    .remove(&tablet);
-                return;
-            }
-        },
-        // Memory backend keeps nothing across a restart, so "has data" never applies;
-        // the epoch-based `initial_formation` decides.
-        StorageBackend::Memory => {
-            let config = if initial_formation { full } else { others };
-            CpGroup::Mem(RaftKvNode::start_with_split_hook(
+    //   reconciler placed into an existing, already-led group, which must not
+    //   campaign until the leader adds it (`animus-cp-data` membership gotcha).
+    let cp = match &host.storage {
+        SharedEngine::Lsm(lsm) => {
+            let reforming = initial_formation || scope.has_data(lsm).await;
+            let config = if reforming { full } else { others };
+            CpGroup::Lsm(RaftKvNode::start_hosted(
                 env,
                 config,
-                MemoryEngine::new(),
-                hook,
+                lsm.clone(),
+                scope,
+                stream,
+            ))
+        }
+        SharedEngine::Mem(mem) => {
+            let reforming = initial_formation || scope.has_data(mem).await;
+            let config = if reforming { full } else { others };
+            CpGroup::Mem(RaftKvNode::start_hosted(
+                env,
+                config,
+                mem.clone(),
+                scope,
+                stream,
             ))
         }
     };
     host.ctx.edge.register_raftkv(tablet, cp);
-    host.ctx.register_cp_addr(member, addr.to_string()).await;
 }
 
 /// How often the GC loop checks whether a tablet this node hosts has been
@@ -2933,15 +2564,15 @@ const CP_GC_INTERVAL: Duration = Duration::from_millis(500);
 /// How long the GC waits for a halted group's driver to actually exit before
 /// giving up for this tick. The driver observes the halt on its next wake (one
 /// Raft timer tick at most), so this is generous; on timeout the handle is
-/// re-registered and the teardown retries on a later tick — files are never
-/// touched while the driver might still write.
+/// re-registered and the teardown retries on a later tick — nothing is erased
+/// while the driver might still write.
 const CP_GC_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The per-node **CP GC loop** (ADR 0024 drop-table teardown): when a tablet
 /// this node hosts disappears from the replicated tablet map (a committed
 /// `DropTableTablets`), reclaim everything local to it — unregister the group
-/// handle, stop its driver, delete its engine + WAL files, and prune the
-/// durable `cp-hosted` marker + `minted` claim. The exact dual of
+/// handle, stop its driver, erase its range from the shared engine, delete its
+/// WAL file, and release the `minted` claim. The exact dual of
 /// [`cp_join_host_loop`]: same pull-from-replicated-state shape, same per-node
 /// `minted` state for the decision (never the shared `--cluster N` edge).
 ///
@@ -2956,7 +2587,7 @@ const CP_GC_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 /// The converse transient is fine too: while a restarted control replica
 /// re-applies its log it passes through **historical** map states, so the
 /// join-host loop can briefly re-host a *dropped* tablet (an empty group — its
-/// files were already reclaimed, and routing consults the current map, so it
+/// range was already erased, and routing consults the current map, so it
 /// serves nothing). Once replay reaches the committed drop, this loop reclaims
 /// it again; drop + GC are convergent, not one-shot.
 async fn cp_gc_loop(host: CpHostCtx) {
@@ -2986,21 +2617,22 @@ async fn cp_gc_loop(host: CpHostCtx) {
 /// [`cp_gc_loop`]). Every step is idempotent and ordered so a crash anywhere
 /// mid-teardown converges on a later tick or the next restart: unregister the
 /// handle (routing/admin stop seeing the group), stop the driver and wait for
-/// its exit (files quiesce), delete the engine + WAL files, prune the durable
-/// marker (so a restart no longer re-hosts), then release the `minted` claim.
+/// its exit (the engine/WAL quiesce), tombstone the tablet's own range out of the
+/// **shared** engine (never touching a sibling tablet's data — bounded by the
+/// group's own `StorageScope`), delete its WAL file, then release the `minted`
+/// claim.
 async fn cp_gc_tablet(host: &CpHostCtx, tablet: TabletId) {
-    let member = cp_member_id(host.base_id, tablet);
     // No registered handle means the stand-up path claimed `minted` but has not
-    // finished (engine open / start in flight) — retry on a later tick rather
-    // than deleting files under a group mid-standup.
-    let Some(group) = host.ctx.edge.unregister_raftkv(tablet, member) else {
+    // finished (start in flight) — retry on a later tick rather than erasing data
+    // under a group mid-standup.
+    let Some(group) = host.ctx.edge.unregister_raftkv(tablet, host.base_id) else {
         return;
     };
     group.shutdown();
     let deadline = tokio::time::Instant::now() + CP_GC_STOP_TIMEOUT;
     while !group.is_stopped() {
         if tokio::time::Instant::now() >= deadline {
-            // Never touch files while the driver might still write. Put the
+            // Never touch data while the driver might still write. Put the
             // handle back so a later tick retries the whole teardown.
             tracing::warn!(
                 tablet = tablet.0,
@@ -3012,50 +2644,12 @@ async fn cp_gc_tablet(host: &CpHostCtx, tablet: TabletId) {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    // Delete the group's on-disk artifacts through its own env's disk: the
-    // engine's prefix-named LSM files and the group's Raft WAL (plus any
-    // `replace` temp leftovers, which share those prefixes). The bootstrap/first
-    // tablet lives on the main `raftkv` env under the flat `db-` prefix — its
-    // dir holds nothing else db-prefixed, and the `cp-hosted` marker does not
-    // match; a split/derived tablet lives on its own sibling env dir.
+    group.erase_scope().await;
     let env = group.env().clone();
-    let prefix = if tablet == TABLET {
-        LSM_PREFIX.to_string()
-    } else {
-        format!("db-t{}-", tablet.0)
-    };
-    match env.list().await {
-        Ok(files) => {
-            for file in files {
-                if file.starts_with(&prefix) || file.starts_with(animus_cp_data::WAL) {
-                    if let Err(e) = env.remove(&file).await {
-                        tracing::warn!(?e, file, "CP GC: removing a dropped tablet's file");
-                    }
-                }
-            }
-        }
-        Err(e) => tracing::warn!(?e, tablet = tablet.0, "CP GC: listing tablet files"),
-    }
-    // A derived tablet's sibling env owns its accept loop + any tasks spawned on
-    // it — reap them now the group is gone. `shutdown_tasks` leaves the shared
-    // sibling listener pool alone (a full `shutdown` would drain it and break
-    // future splits). The bootstrap tablet's main env is shared node
-    // infrastructure (heartbeats, peer-sync) and stays up.
-    if tablet != TABLET {
-        env.shutdown_tasks();
+    if let Err(e) = env.remove(&animus_cp_data::wal_file(tablet.0)).await {
+        tracing::warn!(?e, tablet = tablet.0, "CP GC: removing the tablet's WAL");
     }
 
-    // Prune the durable marker so a restart no longer re-hosts the tablet
-    // (split-created tablets only; join-hosted ones are not recorded).
-    let pruned = {
-        let mut h = host.hosted.lock().expect("hosted set poisoned");
-        let before = h.len();
-        h.retain(|e| e.tablet != tablet.0);
-        (h.len() != before).then(|| h.clone())
-    };
-    if let Some(snapshot) = pruned {
-        save_hosted_cp(&host.raftkv_env, &snapshot).await;
-    }
     // Release the claim last, once nothing is left to reclaim. (Tablet ids are
     // never reused, so nothing can legitimately re-mint this id; a re-created
     // table gets a fresh tablet.)
@@ -3133,207 +2727,47 @@ const AUTO_SPLIT_COOLDOWN: Duration = Duration::from_secs(15);
 /// table's real bytes-per-entry below this.
 const AUTO_SPLIT_EST_ENTRY_BYTES: u64 = 32;
 
-/// The leader-driven **automatic split trigger** (Phase 2.4): on each tick, for
-/// every tablet whose CP group this node currently **leads**, take the leader's
-/// **cheap key-count estimate** ([`CpGroup::approx_key_count`] — memtable count +
-/// SSTable bytes, no materialization) and only when it says the tablet might
-/// exceed `threshold` (or on a slow per-tablet confirm cadence) materialize the
-/// live pairs once — the authoritative count *and*, if over threshold, the
-/// **median** split key come from that one snapshot. A split bisects the tablet so
-/// each half holds roughly half the keys. Per-tablet cooldown avoids a duplicate
-/// trigger while a split is in flight; once it applies, the parent's key count
-/// halves below the threshold.
+/// The leader-driven **automatic split trigger**: on each tick, for every tablet
+/// whose CP group this node currently **leads**, take the leader's **cheap
+/// key-count estimate** ([`CpGroup::approx_key_count`] — memtable count + SSTable
+/// bytes, no materialization) and only when it says the tablet might exceed
+/// `threshold` (or on a slow per-tablet confirm cadence) materialize the live
+/// pairs once — the authoritative count *and*, if over threshold, the **median**
+/// split key come from that one snapshot. A split bisects the tablet so each half
+/// holds roughly half the keys. Per-tablet cooldown avoids a duplicate trigger
+/// while a split is in flight; once it applies, the parent's key count halves
+/// below the threshold.
+///
+/// Since a split is now a **single, atomic, epoch-CAS-gated** control-plane
+/// command (`ClientCtx::trigger_split`, mirroring `CasTabletReplicas`), there is
+/// no second, independently-failable data-plane step and therefore no orphan
+/// tablet it could leave behind — the whole two-phase `pending`/`claim_auto_split`
+/// retry-and-cleanup machinery this loop used to need is gone. A losing proposer's
+/// `SplitTablet` is rejected cleanly at propose time (stale epoch); the winner's
+/// commit is the entire operation.
 ///
 /// Only the node hosting a tablet's leader reads `local_pairs`/triggers, so in a
-/// one-process-per-node deployment exactly one node triggers. (In a single
-/// `--cluster N` process the edge state is shared, so every node's loop sees the
-/// same leader handle and may trigger redundantly — the control plane rejects a
-/// re-split of an already-split *metadata* range, but that alone does not stop a
-/// second `propose_split` from reaching the CP group: metadata rejection only dedups
-/// which `SplitTablet` command wins, not who then calls `propose_split` on the data
-/// plane, so more than one `Split` command really can land in the committed log.
-/// **Genuinely harmless only because `animus-cp-data`'s apply of `KvCommand::Split`
-/// is itself idempotent** — a group splits once in its lifetime, and every
-/// application after the first is a no-op (`apply_and_compact`'s `already_split`
-/// flag). Without that guard a second, redundant `Split` re-fires the split hook
-/// with an *empty* handoff (the range was already tombstoned by the first
-/// application), and that empty-handoff task can win the per-node mint race against
-/// the real one — silently seeding the new tablet's group with no data. That was a
-/// real, intermittent bug (`tablet_auto_splits_when_it_grows` flaking on "key not
-/// served after auto-split" on unmodified `main`, no manual trigger needed), not a
-/// hypothetical one — fixed at the data-plane apply layer, not here, so it is safe
-/// regardless of *why* a duplicate `propose_split` happens (this redundant-trigger
-/// path today; a stale retry after a data-plane leader failover would hit the same
-/// guard).
+/// one-process-per-node deployment exactly one node triggers. In a single
+/// `--cluster N` process the edge state is shared, so more than one node's loop
+/// can see the same leader handle and race a `trigger_split` for the same tablet
+/// in the same tick — harmless: the epoch CAS lets exactly one win, and the loser
+/// just tries again (or backs off) next tick.
 ///
 /// `threshold` is a **key count** here — a placeholder size signal; a real
-/// byte/size-based threshold is future tuning. Disabled unless a threshold is wired
-/// (so it never perturbs clusters that don't opt in).
-///
-/// **Step 2 of a split (the data-plane `propose_split`) can fail independently of
-/// step 1 (the control-plane `SplitTablet` metadata, which by itself already makes
-/// the new tablet visible with a real range/replica set — see
-/// [`ClientCtx::propose_split_metadata`])** — e.g. the tablet's CP leader moved or
-/// was briefly unreachable during bulk-write load. This loop used to call the
-/// combined [`ClientCtx::trigger_split`] and discard the result
-/// (`let _ = ctx.trigger_split(..).await`), which on a step-2 failure left the new
-/// tablet **permanently orphaned**: present in `Metadata.tablets` with a valid
-/// range, but with no CP Raft group ever minted on any node — `leader: unknown`
-/// forever, and any read/write routed to its range hangs. Worse, since the
-/// underlying data never actually moved (the data-plane split never ran), the
-/// source tablet kept re-triggering on later ticks and minting *more* orphans from
-/// the same unshrunk dataset.
-///
-/// The `pending` map closes this: a tablet whose step 1 committed but whose step 2
-/// hasn't yet succeeded is retried **every tick** with the *same* `split_key`
-/// (`propose_split_data` is idempotent, so replaying it is always safe), and is
-/// skipped when scanning for *new* candidates below — so a still-unmoved source
-/// tablet can't mint a second orphan while the first split is still in flight. The
-/// one case a pending entry does *not* keep retrying forever: another proposer's
-/// key already won the group's one-time split (a same-tick redundant-median race —
-/// see `propose_split_data`'s confirm-by-key doc). That's detected and the entry is
-/// dropped rather than retried, since retrying a key that lost is guaranteed to
-/// never succeed and would otherwise wrongly exclude the tablet from
-/// `is_fresh_split_candidate` forever even after its data already moved.
-///
-/// Whether `tablet` is a *fresh* auto-split candidate this tick — the pure decision
-/// half of the scan loop below, split out so the "don't start a second split while
-/// one is pending" invariant is unit-testable without a live cluster (the race it
-/// guards against — a tablet's `propose_split` failing right after its
-/// `SplitTablet` metadata commits — needs real leader churn under load to occur
-/// naturally, which isn't reproducible on demand; mirrors why
-/// `topology::decide_cp_route` is factored out the same way).
-fn is_fresh_split_candidate(
-    tablet: TabletId,
-    pending: &BTreeMap<TabletId, Vec<u8>>,
-    last_triggered: &BTreeMap<TabletId, tokio::time::Instant>,
-    cooldown: Duration,
-) -> bool {
-    if pending.contains_key(&tablet) {
-        return false;
-    }
-    !matches!(last_triggered.get(&tablet), Some(at) if at.elapsed() < cooldown)
-}
-
+/// byte/size-based threshold is future tuning. Disabled unless a threshold is
+/// wired (so it never perturbs clusters that don't opt in).
 async fn auto_split_loop(ctx: ClientCtx, threshold: usize) {
     let mut last_triggered: BTreeMap<TabletId, tokio::time::Instant> = BTreeMap::new();
     // When each tablet last had a *full* (materializing) count — the expensive
     // confirm is rate-limited per tablet, not run every tick.
     let mut last_counted: BTreeMap<TabletId, tokio::time::Instant> = BTreeMap::new();
-    // Tablets whose `SplitTablet` metadata committed but whose data-plane
-    // `propose_split` hasn't succeeded yet, keyed by the *source* tablet being
-    // split (see the function doc above).
-    let mut pending: BTreeMap<TabletId, Vec<u8>> = BTreeMap::new();
     loop {
         tokio::time::sleep(AUTO_SPLIT_INTERVAL).await;
 
-        for (tablet, split_key) in std::mem::take(&mut pending) {
-            // The source tablet can vanish out from under a pending split — most
-            // concretely, a `DROP TABLE` while step 2 is still outstanding:
-            // `DropTableTablets` removes every tablet scoped to the table in one
-            // apply, the source *and* any child it had already minted (a split
-            // child inherits the parent's table scope), so there is nothing left
-            // to retry or clean up. Without this check the loop retries a tablet
-            // id that can never have a leader again, forever — every tick paying
-            // a full routing-timeout round trip for nothing (`propose_split_data`
-            // resolves "no CP group leader reachable" for a tablet absent from
-            // `Metadata`, which is not the same failure the "abandoned" check
-            // below is built to detect: no local replica handle exists to compare
-            // an applied key against, so `abandoned` would stay `false` and this
-            // would loop forever). Checked before proposing, and before spanning,
-            // so a vanished tablet doesn't even cost a network round trip.
-            if !ctx.raft.metadata().tablets.contains_key(&tablet) {
-                tracing::info!(
-                    tablet = tablet.0,
-                    "auto_split: pending split's source tablet no longer exists \
-                     (table dropped?); giving up on it"
-                );
-                ctx.edge.release_auto_split(tablet);
-                continue;
-            }
-            let span = tracing::info_span!("auto_split", tablet = tablet.0, kind = "retry");
-            // Patient (2-round) confirm: this loop calls back every tick until the
-            // split lands, so a bare confirm-timeout here must not re-propose
-            // immediately — see `propose_and_confirm_split`'s doc.
-            let response = ctx
-                .propose_split_data_with_patience(tablet, split_key.clone(), 2)
-                .instrument(span)
-                .await;
-            if matches!(response, ClientResponse::PutOk) {
-                ctx.edge.release_auto_split(tablet);
-                continue;
-            }
-            // A different proposer's key may have already won this group's split
-            // — the same-tick, same-tablet redundant-median race
-            // `propose_split_data`'s confirm-by-key check exists to catch (see its
-            // doc) — or a *later* split may have narrowed past `split_key` after
-            // it actually applied (a group can now split more than once).
-            // `current_split_bound` can't tell those two apart (see its doc): a
-            // bound that no longer equals `split_key` means "give up retrying
-            // this exact key," full stop, but does **not** by itself mean
-            // `split_key`'s own attempt never landed — retrying it forever would
-            // never succeed either way (the boundary only moves toward smaller
-            // keys), and would wrongly keep this tablet excluded from
-            // `is_fresh_split_candidate` forever too. `drop_orphan_tablet` is
-            // what actually resolves the ambiguity safely (see its doc) — this
-            // check only decides whether to *stop retrying*, not whether
-            // anything gets deleted.
-            let superseded = ctx
-                .edge
-                .local_cp(tablet)
-                .and_then(|g| g.current_split_bound())
-                .is_some_and(|bound| bound != split_key);
-            if superseded {
-                tracing::info!(
-                    tablet = tablet.0,
-                    "auto_split: pending split's key is no longer the group's boundary; \
-                     abandoning this retry (GC will check separately whether it minted \
-                     an orphan)"
-                );
-                // Refresh the cooldown here, same as a fresh trigger does: without
-                // this, an abandoned tablet is immediately eligible again on the
-                // very next tick (`is_fresh_split_candidate` only excludes
-                // `pending`/recently-`last_triggered`, and this entry is leaving
-                // `pending` right now). Under repeated contention (this node's own
-                // key kept losing races) that let a tablet churn through a fresh
-                // split id every tick indefinitely — each new attempt abandoned in
-                // turn — instead of backing off to let the winning split's data
-                // move actually shrink the tablet below `threshold`.
-                last_triggered.insert(tablet, tokio::time::Instant::now());
-                ctx.edge.release_auto_split(tablet);
-                // Maybe GC an orphan: if our own step 1 minted a tablet id at
-                // `split_key` that never actually got seeded, left alone it sits in
-                // `Metadata.tablets` forever — `leader: unknown`, unreachable, and
-                // cluttering every admin/status view. Resolve its *current* id the
-                // same way `cp_split_seed` resolves a fresh mint (by `range.start
-                // == split_key` — our own mint is the only tablet that can have
-                // started exactly there) and let `drop_orphan_tablet` verify it's
-                // actually safe before touching anything (it independently checks
-                // local hosting — this method's ambiguity is not trusted alone).
-                if let Some(orphan) = ctx
-                    .raft
-                    .metadata()
-                    .tablets
-                    .iter()
-                    .find(|(_, t)| t.range.start == split_key)
-                    .map(|(id, _)| *id)
-                {
-                    let ctx = ctx.clone();
-                    tokio::spawn(async move { ctx.drop_orphan_tablet(orphan).await });
-                }
-                continue;
-            }
-            tracing::warn!(
-                tablet = tablet.0,
-                ?response,
-                "auto_split: pending retry failed again, will retry next tick"
-            );
-            pending.insert(tablet, split_key);
-        }
-
         let tablets: Vec<TabletId> = ctx.raft.metadata().tablets.keys().copied().collect();
         for tablet in tablets {
-            if !is_fresh_split_candidate(tablet, &pending, &last_triggered, AUTO_SPLIT_COOLDOWN) {
+            if matches!(last_triggered.get(&tablet), Some(at) if at.elapsed() < AUTO_SPLIT_COOLDOWN)
+            {
                 continue;
             }
             // Only the leader's host reads + triggers (else this node doesn't have
@@ -3341,18 +2775,6 @@ async fn auto_split_loop(ctx: ClientCtx, threshold: usize) {
             let Some(leader) = ctx.edge.cp_leader(tablet) else {
                 continue;
             };
-            // A `RaftKvNode` group can now split more than once over its life
-            // (see `KvCommand::Split`'s apply-time CAS in animus-cp-data): each
-            // split just needs to propose a key strictly less than the group's
-            // *current* boundary, so a tablet that already split once and has
-            // since regrown past `threshold` is a perfectly legitimate fresh
-            // candidate again — there is deliberately no "once split, excluded
-            // forever" guard here anymore. `is_fresh_split_candidate` above
-            // already covers the correctness-critical exclusion (don't retrigger
-            // while a split for this tablet is still `pending` or within
-            // `AUTO_SPLIT_COOLDOWN`); nothing else needs to gate on split
-            // history.
-            //
             // Cheap per-tick gate: materializing every led tablet's live pairs
             // every tick is O(total data) per 2s — instead, take the free
             // (over-)estimate and only materialize when it says the tablet might
@@ -3380,58 +2802,16 @@ async fn auto_split_loop(ctx: ClientCtx, threshold: usize) {
             // interior key of > threshold >= 2 distinct keys), so `SplitTablet`
             // accepts it.
             let median = pairs[pairs.len() / 2].0.clone();
-            // Claim this tablet cluster-wide before proposing: under `--cluster N`'s
-            // shared edge state, the `cp_leader` gate above is `Some` on *every*
-            // node's loop, not just the tablet's true host, so without this claim
-            // multiple nodes could independently propose a fresh, possibly
-            // differently-keyed `SplitTablet` for the same source tablet this same
-            // tick (see `ClusterEdgeState::claim_auto_split`'s doc). Held through
-            // step 1, step 2, and any pending retry; released on every terminal
-            // outcome below and in the pending-retry loop above.
-            if !ctx.edge.claim_auto_split(tablet) {
-                continue;
-            }
             last_triggered.insert(tablet, tokio::time::Instant::now());
-            let span = tracing::info_span!("auto_split", tablet = tablet.0, kind = "fresh");
-            async {
-                match ctx.propose_split_metadata(tablet, median.clone()).await {
-                    Ok(new_id) => {
-                        let response = ctx.propose_split_data(tablet, median.clone()).await;
-                        if matches!(response, ClientResponse::PutOk) {
-                            tracing::info!(
-                                tablet = tablet.0,
-                                new_id = new_id.0,
-                                "auto_split: split accepted"
-                            );
-                            ctx.edge.release_auto_split(tablet);
-                        } else {
-                            tracing::warn!(
-                                tablet = tablet.0,
-                                new_id = new_id.0,
-                                ?response,
-                                "auto_split: step 2 (propose_split) failed — new_id is now \
-                                 committed in metadata but leaderless; queued for retry"
-                            );
-                            pending.insert(tablet, median);
-                            // claim stays held — released when the pending retry
-                            // above resolves (success or abandonment).
-                        }
-                    }
-                    Err(response) => {
-                        // Step 1 itself didn't commit — nothing was allocated, so
-                        // there's no orphan to track; the next tick's `hot` check
-                        // will naturally retry from scratch.
-                        tracing::warn!(
-                            tablet = tablet.0,
-                            ?response,
-                            "auto_split: step 1 (split metadata) did not commit"
-                        );
-                        ctx.edge.release_auto_split(tablet);
-                    }
-                }
+            let span = tracing::info_span!("auto_split", tablet = tablet.0);
+            let response = ctx.trigger_split(tablet, median).instrument(span).await;
+            if !matches!(response, ClientResponse::PutOk) {
+                tracing::warn!(
+                    tablet = tablet.0,
+                    ?response,
+                    "auto_split: split did not commit"
+                );
             }
-            .instrument(span)
-            .await;
         }
     }
 }
@@ -3489,7 +2869,6 @@ fn request_kind(request: &ClientRequest) -> &'static str {
         ClientRequest::Forwarded { .. } => "forwarded",
         ClientRequest::ProposeSchema(_) => "propose_schema",
         ClientRequest::SplitTablet { .. } => "split_tablet",
-        ClientRequest::CpSplit { .. } => "cp_split",
     }
 }
 
@@ -3520,14 +2899,9 @@ async fn handle_request(ctx: &ClientCtx, request: ClientRequest) -> ClientRespon
             Ok(()) => ClientResponse::PutOk,
             Err(e) => ClientResponse::Error(e),
         },
-        // Admin: split a CP tablet (Phase 2.2 / D2 cross-process).
+        // Admin: split a CP tablet — a single atomic control-plane command.
         ClientRequest::SplitTablet { tablet, split_key } => {
             ctx.trigger_split(TabletId(tablet), split_key).await
-        }
-        // The data-plane half of a split, forwarded to the CP leader's node (D2):
-        // propose the split locally iff we lead the tablet; never re-forward.
-        ClientRequest::CpSplit { tablet, split_key } => {
-            ctx.cp_split_here(TabletId(tablet), split_key).await
         }
         // A CP op forwarded from another node (cross-process routing, ADR 0017
         // #3b): serve locally iff we are the leader; never re-forward. The
@@ -3628,110 +3002,37 @@ impl ClientCtx {
             .await;
     }
 
-    /// Split CP `tablet` at `split_key` (Phase 2.2 / D2): record the split in the
-    /// control plane (a new tablet id covering `[split_key, ∞)`), then trigger the
-    /// data-plane split on the tablet's CP group leader — on commit each replica's
-    /// split hook mints the new tablet's co-resident group. Returns once the
-    /// data-plane split is *accepted* (the new group forms + becomes routable
-    /// asynchronously; the caller polls a read of an upper-range key to observe it).
+    /// Split CP `tablet` at `split_key`: a **single, atomic** control-plane
+    /// command (`MetaCommand::SplitTablet`, epoch-CAS gated exactly like
+    /// `CasTabletReplicas`). The source tablet's range narrows to `[lo,
+    /// split_key)` and a new sibling tablet is minted covering `[split_key, ∞)`
+    /// — both served by the **same** replicas' existing per-node shared engine
+    /// (ADR 0026/0028: one LSM tree per node, confined by [`StorageScope`]), so
+    /// no data moves and there is no second, data-plane step that can fail
+    /// independently. `cp_join_host_loop` then forms the new sibling's Raft
+    /// group on every replica (a fresh whole-voter formation, identical to a
+    /// brand-new table's tablet) — orphaned, leaderless metadata-only tablets
+    /// are structurally impossible now, since commit of this one command is
+    /// the whole operation.
     ///
-    /// **Cross-process (D2):** both halves are routed to their respective leaders, so
-    /// the trigger works from any node — the metadata `SplitTablet` relays to the
-    /// control leader (it is [relayable](is_relayable_command)), and the data-plane
-    /// `propose_split` routes by **tablet id** to the CP-group leader's node (the two
-    /// leaders may differ), forwarding a one-hop [`CpSplit`](ClientRequest::CpSplit)
-    /// there if this node doesn't host it.
-    ///
-    /// The two steps below ([`propose_split_metadata`], [`propose_split_data`]) are
-    /// **not atomic** — a caller that cannot tolerate leaving an orphaned,
-    /// permanently leaderless tablet behind on a step-2 failure (namely
-    /// [`auto_split_loop`]) must drive the two steps itself and retry step 2 with the
-    /// *same* `split_key` until it succeeds, rather than calling this combined
-    /// one-shot helper. See [`propose_split_metadata`]'s doc for why.
-    ///
-    /// A step-2 failure where the group's boundary no longer equals `split_key`
-    /// (e.g. a prior `trigger_split`/`CpSplit` call, or `auto_split_loop`,
-    /// already split `tablet` for real at a different key) can never be fixed by
-    /// retrying `split_key` — so unlike a transient timeout, this attempts to GC
-    /// its own possibly-orphaned mint before returning, instead of leaving a
-    /// dead `Metadata` entry for the caller to notice and clean up by hand.
-    /// "Possibly" matters: see [`drop_orphan_tablet`](Self::drop_orphan_tablet)'s
-    /// doc for why this signal alone is never trusted to actually delete
-    /// anything.
-    ///
-    /// [`propose_split_metadata`]: Self::propose_split_metadata
-    /// [`propose_split_data`]: Self::propose_split_data
-    async fn trigger_split(&self, tablet: TabletId, split_key: Vec<u8>) -> ClientResponse {
-        let new_id = match self.propose_split_metadata(tablet, split_key.clone()).await {
-            Ok(new_id) => new_id,
-            Err(resp) => return resp,
-        };
-        let response = self.propose_split_data(tablet, split_key.clone()).await;
-        if matches!(response, ClientResponse::PutOk) {
-            return response;
-        }
-        let boundary_moved_past_us = self
-            .edge
-            .local_cp(tablet)
-            .and_then(|g| g.current_split_bound())
-            .is_some_and(|bound| bound != split_key);
-        if boundary_moved_past_us {
-            self.drop_orphan_tablet(new_id).await;
-        }
-        response
-    }
-
-    /// Step 1 of a split: record it in the control plane (a new tablet id covering
-    /// `[split_key, ∞)`) and wait until the new tablet is visible here, so the split
-    /// hook can resolve `new_id` from `Metadata` once the data-plane `Split` applies.
-    /// Routed to the control leader. Returns the newly allocated id on success.
-    ///
-    /// **This step alone makes the new tablet appear in `Metadata.tablets`** with a
-    /// real range and replica set — before its CP Raft group exists anywhere. A
-    /// caller that commits this and then never gets [`propose_split_data`] to
-    /// succeed leaves that tablet permanently `leader: unknown`: its key range
-    /// becomes unroutable, and reads/writes there wait forever for a group that will
-    /// never form. **Every caller of this method must eventually retry
-    /// [`propose_split_data`] with the same `split_key` until it succeeds — never
-    /// silently discard a step-2 failure** (this is exactly the bug `auto_split_loop`'s
-    /// `pending` map exists to close: it used to do `let _ = trigger_split(..).await`,
-    /// which drops step-2 errors on the floor and orphans the tablet for good).
-    ///
-    /// `MetaCommand::SplitTablet` is a compare-and-swap on the source tablet's
-    /// epoch (read from the same snapshot as `new_id`): if a *different* proposer
-    /// already split `tablet` since this call read it, the commit is rejected
-    /// outright here — cleanly, via the existing `Err` path below — instead of
-    /// also succeeding and minting a second child id that can never get a CP
-    /// group (the tablet's own per-group Raft can only ever apply one real
-    /// `Split`, ever). Without the CAS this raced two independent
-    /// `auto_split_loop` instances (or an auto-trigger racing a manual one) into
-    /// permanently orphaning the loser's `new_id`.
-    ///
-    /// [`propose_split_data`]: Self::propose_split_data
+    /// Routed to the control leader (relayable, [`is_relayable_command`]), so
+    /// this works from any node the client happens to be connected to.
     #[tracing::instrument(
-        name = "split_metadata",
+        name = "split_tablet",
         skip(self, split_key),
         fields(tablet = tablet.0, new_id = tracing::field::Empty)
     )]
-    async fn propose_split_metadata(
-        &self,
-        tablet: TabletId,
-        split_key: Vec<u8>,
-    ) -> Result<TabletId, ClientResponse> {
+    async fn trigger_split(&self, tablet: TabletId, split_key: Vec<u8>) -> ClientResponse {
         // The new tablet id comes from the **monotonic allocator**
-        // (`next_free_tablet_id`, ADR 0023 — the same allocator provisioning uses),
-        // *not* `max(existing ids) + 1`: `DropTableTablets` removes tablets without
-        // lowering `next_tablet_id`, so max+1 could re-mint a freed id — and a
-        // replica still holding the dropped tablet's `db-t{id}-*` files would
-        // re-host them AS the new tablet (data resurrection the absence-keyed GC
-        // can never reclaim). The apply also rejects a below-allocator id, so a
-        // stale proposer cannot reintroduce reuse. `new_id` and `expected_epoch`
-        // come from the **same** metadata snapshot so the CAS reflects exactly
-        // what this call saw.
+        // (`next_free_tablet_id`, ADR 0023 — the same allocator provisioning
+        // uses), *not* `max(existing ids) + 1`, which could re-mint a freed id
+        // after a `DropTableTablets`. `new_id` and `expected_epoch` come from
+        // the **same** metadata snapshot so the CAS reflects exactly what this
+        // call saw.
         let meta = self.raft.metadata();
         let new_id = meta.next_free_tablet_id();
         let Some(expected_epoch) = meta.tablets.get(&tablet).map(|t| t.epoch) else {
-            return Err(ClientResponse::Error("no such tablet".into()));
+            return ClientResponse::Error("no such tablet".into());
         };
         tracing::Span::current().record("new_id", new_id.0);
         let cmd = MetaCommand::SplitTablet {
@@ -3740,218 +3041,18 @@ impl ClientCtx {
             split_key,
             new_id,
         };
-        self.propose_and_await(cmd, SCHEMA_COMMIT_TIMEOUT, || {
-            self.raft
-                .metadata()
-                .tablets
-                .contains_key(&new_id)
-                .then_some(())
-        })
-        .await
-        .map(|()| new_id)
-        .map_err(|()| ClientResponse::Error("split metadata did not commit in time".into()))
-    }
-
-    /// Best-effort GC for a **suspected** metadata-only orphan tablet: `tablet`'s
-    /// `SplitTablet` (step 1) committed, and the caller's `current_split_bound`
-    /// check suggests the source group's data-plane split may have been won by a
-    /// different key — but that signal is only ever a *moving-boundary*
-    /// heuristic once a group can split more than once (see
-    /// `RaftKvNode::current_split_bound`'s doc): it can't distinguish "this key
-    /// really lost" from "this key won, then something else split again later."
-    /// Getting that wrong in the deletion direction would drop a tablet that is
-    /// actually alive and serving real data — so this method, not the caller,
-    /// is what actually decides whether it's safe to touch anything.
-    ///
-    /// **The hard safety gate: never drop a tablet this node is still locally
-    /// hosting a live CP group for.** The split hook mints a member on *every*
-    /// original replica when a split genuinely applies (`cp_split_seed`), so if
-    /// `tablet` really did get seeded, this node (one of the original replicas)
-    /// has a registered handle for it — checked via `ctx.edge.local_cp`, the
-    /// same per-replica signal the abandon checks above already trust. If nothing
-    /// is registered, `tablet` never got a real handoff and dropping it is safe
-    /// regardless of how the caller's heuristic reached this call
-    /// (`MetaCommand::DropOrphanTablet`'s doc). Worst case on a wrong call here
-    /// is a skipped GC — the orphan lingers a little longer, exactly the
-    /// tolerated pre-GC behavior — never a deleted-while-alive tablet.
-    ///
-    /// Called from `auto_split_loop`'s abandon branch and from
-    /// [`trigger_split`](Self::trigger_split)'s step-2 failure path. Reads
-    /// `tablet`'s epoch fresh rather than threading one through from the
-    /// caller: nothing else ever touches an unhosted orphan, so it's stable,
-    /// and reading it here means the CAS reflects exactly what this call sees
-    /// (same discipline as `propose_split_metadata`). Logs and gives up on
-    /// failure instead of retrying forever — a lingering orphan is metadata
-    /// clutter, not a correctness hazard on its own, so it isn't worth a
-    /// second retry queue; the next abandonment of the same source tablet (if
-    /// any) will try again with its own orphan.
-    #[tracing::instrument(name = "drop_orphan_tablet", skip(self), fields(tablet = tablet.0))]
-    async fn drop_orphan_tablet(&self, tablet: TabletId) {
-        if self.edge.local_cp(tablet).is_some() {
-            tracing::info!(
-                tablet = tablet.0,
-                "auto_split: tablet is still locally hosted — not actually an orphan, \
-                 skipping the drop"
-            );
-            return;
-        }
-        let Some(expected_epoch) = self.raft.metadata().tablets.get(&tablet).map(|t| t.epoch)
-        else {
-            // Already gone — a prior attempt succeeded, or it was never really
-            // minted (both fine; nothing to do).
-            return;
-        };
-        let cmd = MetaCommand::DropOrphanTablet {
-            tablet,
-            expected_epoch,
-        };
-        let dropped = self
+        match self
             .propose_and_await(cmd, SCHEMA_COMMIT_TIMEOUT, || {
-                (!self.raft.metadata().tablets.contains_key(&tablet)).then_some(())
+                self.raft
+                    .metadata()
+                    .tablets
+                    .contains_key(&new_id)
+                    .then_some(())
             })
-            .await;
-        if dropped.is_err() {
-            tracing::warn!(
-                tablet = tablet.0,
-                "auto_split: failed to GC an abandoned orphan tablet; it will linger"
-            );
-        }
-    }
-
-    /// Step 2 of a split: trigger the data-plane split on `tablet`'s CP group leader
-    /// (it fires every replica's split hook on commit). Routed by **tablet id** —
-    /// after step 1 commits, the split *key* maps to the new right-hand tablet, so a
-    /// key route would target the wrong group. Forwards a one-hop `CpSplit` if the CP
-    /// leader is on another node (D2).
-    ///
-    /// **Safe to retry**: `propose_split` is idempotent per group (a group splits
-    /// once in its lifetime; a redundant `Split` entry applies as a no-op), so
-    /// replaying this with the same `split_key` after a `NotLeader` / no-route /
-    /// relay failure is safe — those failures mean the leader moved or was briefly
-    /// unreachable, never that the split itself is invalid.
-    #[tracing::instrument(
-        name = "split_data",
-        skip(self, split_key),
-        fields(tablet = tablet.0, route = tracing::field::Empty)
-    )]
-    async fn propose_split_data(&self, tablet: TabletId, split_key: Vec<u8>) -> ClientResponse {
-        self.propose_split_data_with_patience(tablet, split_key, 1)
             .await
-    }
-
-    /// Like [`propose_split_data`](Self::propose_split_data), but takes
-    /// `confirm_rounds` — see [`propose_and_confirm_split`](Self::propose_and_confirm_split)'s
-    /// doc for why a caller that will otherwise retry by proposing again (namely
-    /// `auto_split_loop`'s pending-retry) should pass more than 1.
-    async fn propose_split_data_with_patience(
-        &self,
-        tablet: TabletId,
-        split_key: Vec<u8>,
-        confirm_rounds: u32,
-    ) -> ClientResponse {
-        let route = self.cp_route_tablet(tablet).await;
-        tracing::Span::current().record(
-            "route",
-            match route {
-                CpRoute::Local(_) => "local",
-                CpRoute::Forward(_) => "forward",
-                CpRoute::None => "none",
-            },
-        );
-        match route {
-            CpRoute::Local(leader) => {
-                let confirmed =
-                    Self::propose_and_confirm_split(&leader, split_key, confirm_rounds).await;
-                if !matches!(confirmed, ClientResponse::PutOk) {
-                    tracing::warn!(
-                        ?confirmed,
-                        "accepted propose_split never committed (leader churn?)"
-                    );
-                }
-                confirmed
-            }
-            // `CpSplit` is already a one-hop "serve-or-error, never re-forward"
-            // request, so relay it directly (its own top-level handler) — not via
-            // `cp_forward`, which wraps in `Forwarded` (the Put/Get/Delete/Scan path).
-            CpRoute::Forward(addr) => {
-                let response = self
-                    .relay(
-                        addr,
-                        ClientRequest::CpSplit {
-                            tablet: tablet.0,
-                            split_key,
-                        },
-                    )
-                    .await;
-                if !matches!(response, ClientResponse::PutOk) {
-                    tracing::warn!(%addr, ?response, "one-hop CpSplit relay did not succeed");
-                }
-                response
-            }
-            CpRoute::None => {
-                tracing::warn!(
-                    "no CP group leader reachable within cp_route_tablet's timeout budget"
-                );
-                ClientResponse::Error("no CP group leader for the tablet reachable".into())
-            }
-        }
-    }
-
-    /// Propose `split_key` on `leader` and confirm it, trying up to
-    /// `confirm_rounds` confirm windows before giving up. `confirm_rounds > 1` is
-    /// for a caller that would otherwise retry by proposing again
-    /// (`auto_split_loop`'s pending-retry, `cp_split_here`): `ProposeResult::Accepted`
-    /// only means the `Split` entry reached the leader's local log, not that it
-    /// committed (see [`confirm_split`](Self::confirm_split)'s doc), so a bare
-    /// confirm-timeout does not mean it is lost. Proposing a fresh, fully
-    /// redundant `Split` entry on top of one still probably committing wastes a
-    /// full WAL append + replication round-trip under exactly the
-    /// slow/contended conditions that caused the timeout — safe (a group can
-    /// only split once; re-application is a no-op) but wasteful, the same
-    /// amplification shape [`ClientCtx::cp_batch_write_patient`] fixes for
-    /// bulk-seed batch writes, applied here to the split-propose path. Polling
-    /// the same accepted entry again first (instead of re-proposing) is
-    /// strictly cheaper and just as correct: either it lands, or a caller with
-    /// its own retry loop (`auto_split_loop`'s tick cadence) still gets another
-    /// attempt later.
-    async fn propose_and_confirm_split(
-        leader: &CpGroup,
-        split_key: Vec<u8>,
-        confirm_rounds: u32,
-    ) -> ClientResponse {
-        match leader.propose_split(split_key.clone()) {
-            ProposeResult::Accepted { .. } => {
-                let mut confirmed = Self::confirm_split(leader, &split_key).await;
-                for _ in 1..confirm_rounds.max(1) {
-                    if matches!(confirmed, ClientResponse::PutOk) {
-                        break;
-                    }
-                    confirmed = Self::confirm_split(leader, &split_key).await;
-                }
-                confirmed
-            }
-            ProposeResult::NotLeader { .. } => {
-                tracing::warn!("local route was stale: leader stepped down before propose");
-                ClientResponse::Error("CP group leader moved; retry the split".into())
-            }
-        }
-    }
-
-    /// Serve the **data-plane half** of a split forwarded from another node (D2): this
-    /// node must host `tablet`'s CP-group leader (one hop, no metadata, no re-forward).
-    /// Proposes `propose_split` iff it leads, else errors so the client retries with
-    /// fresh routing. Confirms the propose actually committed before reporting
-    /// success — see [`confirm_split`](Self::confirm_split)'s doc. Always uses the
-    /// patient (2-round) confirm via [`propose_and_confirm_split`]: this handler
-    /// can't tell whether its caller (a remote node's `auto_split_loop`) is about
-    /// to retry on a bare timeout, so it assumes it might and avoids proposing a
-    /// redundant duplicate on its own next invocation.
-    ///
-    /// [`propose_and_confirm_split`]: Self::propose_and_confirm_split
-    async fn cp_split_here(&self, tablet: TabletId, split_key: Vec<u8>) -> ClientResponse {
-        match self.edge.cp_leader(tablet) {
-            Some(leader) => Self::propose_and_confirm_split(&leader, split_key, 2).await,
-            None => ClientResponse::Error("forwarded CP split: not the leader here".into()),
+        {
+            Ok(()) => ClientResponse::PutOk,
+            Err(()) => ClientResponse::Error("split did not commit in time".into()),
         }
     }
 
@@ -4423,63 +3524,4 @@ pub async fn read_frame<T: DeserializeOwned>(stream: &mut TcpStream) -> std::io:
     let msg = serde_json::from_slice(&buf)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     Ok(Some(msg))
-}
-
-#[cfg(test)]
-mod auto_split_candidate_tests {
-    use super::*;
-
-    #[test]
-    fn pending_tablet_is_never_a_fresh_candidate_regardless_of_cooldown() {
-        let mut pending = BTreeMap::new();
-        pending.insert(TabletId(1), b"k".to_vec());
-        let last_triggered = BTreeMap::new();
-        assert!(!is_fresh_split_candidate(
-            TabletId(1),
-            &pending,
-            &last_triggered,
-            Duration::from_secs(0),
-        ));
-    }
-
-    #[test]
-    fn untriggered_tablet_not_in_pending_is_a_fresh_candidate() {
-        let pending = BTreeMap::new();
-        let last_triggered = BTreeMap::new();
-        assert!(is_fresh_split_candidate(
-            TabletId(1),
-            &pending,
-            &last_triggered,
-            Duration::from_secs(15),
-        ));
-    }
-
-    #[test]
-    fn recently_triggered_tablet_is_not_a_fresh_candidate_within_cooldown() {
-        let pending = BTreeMap::new();
-        let mut last_triggered = BTreeMap::new();
-        last_triggered.insert(TabletId(1), tokio::time::Instant::now());
-        assert!(!is_fresh_split_candidate(
-            TabletId(1),
-            &pending,
-            &last_triggered,
-            Duration::from_secs(15),
-        ));
-    }
-
-    #[test]
-    fn tablet_triggered_past_cooldown_is_a_fresh_candidate_again() {
-        let pending = BTreeMap::new();
-        let mut last_triggered = BTreeMap::new();
-        last_triggered.insert(
-            TabletId(1),
-            tokio::time::Instant::now() - Duration::from_millis(50),
-        );
-        assert!(is_fresh_split_candidate(
-            TabletId(1),
-            &pending,
-            &last_triggered,
-            Duration::from_millis(10),
-        ));
-    }
 }
