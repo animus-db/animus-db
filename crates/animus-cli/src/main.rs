@@ -260,6 +260,20 @@ fn print_response(response: &ClientResponse) {
             }
         }
         ClientResponse::Error(e) => println!("error: {e}"),
+        // Join discovery (ADR 0032 PR2): consumed programmatically by
+        // `animusd join`'s startup, not requested by any CLI subcommand —
+        // printed raw if one ever surfaces here.
+        ClientResponse::JoinInfo {
+            control_ids,
+            peers,
+            client_route,
+            admin_addrs,
+        } => {
+            println!("control ids: {control_ids:?}");
+            println!("peers: {peers:?}");
+            println!("client route: {client_route:?}");
+            println!("admin addrs: {admin_addrs:?}");
+        }
     }
 }
 

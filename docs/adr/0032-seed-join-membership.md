@@ -2,7 +2,8 @@
 
 - **Status:** Accepted — implemented incrementally (PR1: replicated node
   address book; PR2: `animusd join`; PR3: decommission). **This document
-  covers the full 3-PR lifecycle design; PR1 is the only part landed so far.**
+  covers the full 3-PR lifecycle design; PR1 and PR2 are landed. PR3
+  (decommission) is not yet implemented.**
 - **Date:** 2026-08-07
 
 ## Context
@@ -144,24 +145,68 @@ codebase already applies elsewhere (see the root `CLAUDE.md`'s "one id space
 must have one allocator" entry for the same shape of reasoning applied to
 tablet ids).
 
-## Decision — PR2 (not yet implemented): `animusd join`
+## Decision — PR2 (implemented): `animusd join`
 
-A new `animusd join --seed <addr> [--index N]` CLI path and a
-`ClientRequest::JoinInfo` request: the joining node connects to `--seed`
-(any already-running node's client address — old or newly grown, it no
-longer matters which, since PR1 makes every node's address book equally
-current), which replies with enough information to start:
-`original_control_ids` (this cluster's static control group, unchanged from
-ADR 0030), the full current `node_addrs` book (so the joining node's own
-`client_route`/peer book start warm instead of empty), and either an
-operator-supplied or auto-derived next `raftkv`/control-adjacent node index.
-The joining node then runs `run_node_growth`'s existing mechanics
-unmodified — self-registers via `RegisterNodeAddrs` (PR1) and
-`admin_add_member` (ADR 0030) — the only new thing PR2 adds is *how it
-learns what to pass into machinery that already exists*, not a new
-data-plane mechanism. A collision guard (rejecting a `--index` already
-claimed by a live member) prevents two simultaneous `join`s from racing onto
-the same id.
+A new `animusd join --seed ADDR[,ADDR...] --node I [--ip A] [--base-port P]
+[--dir D] [--ephemeral]` CLI path and a `ClientRequest::JoinInfo` request:
+the joining node connects to one of `--seed` (any already-running node's
+client address — old or newly grown, it no longer matters which, since PR1
+makes every node's address book equally current), which replies with
+`ClientResponse::JoinInfo { control_ids, peers, client_route, admin_addrs }`
+— this cluster's **pre-growth** control group, the answering node's internal
+peer book (`AdminInfo.peers`), its live client-op routing table
+(`ClientCtx::route_snapshot`, ADR 0032 PR1's `route_sync_loop`), and every
+known admin address. Any node answers `JoinInfo` from its own knowledge, no
+forwarding needed. `run_node_join` then runs the exact same
+[`BoundNode::start_with`] call [`run_node_growth`] does, passing the
+discovered `control_ids` as `original_control_ids` — the ADR 0030 growth
+machinery (`!control_ids.contains(&self.control_id)` detection,
+`remote_metadata_sync_loop`, `effective_metadata`) engages automatically,
+exactly as it does for a `run_node_growth` node started from an
+operator-assembled expanded config.
+
+Two deliberate shape differences from this ADR's original sketch, decided
+during implementation:
+
+- **`--node I` is a required, operator-supplied index**, not an
+  "auto-derived" one — mirroring the existing `--node`/`--cluster` CLI
+  convention everywhere else in `animusd`, rather than inventing a new
+  auto-numbering scheme this PR doesn't need. A **collision guard** covers
+  the case an auto-derived index would have tried to avoid entirely: before
+  binding anything, `run_node_join` fetches a `ClientRequest::Status` reply
+  and checks `Metadata.node_addrs` for an existing entry at
+  `config::raftkv_id(index)` — an **identical** address book is a *rejoin*
+  (a restart at the same index/addresses/dir) and proceeds; a **different**
+  one fails startup loudly (`io::ErrorKind::AlreadyExists`) instead of
+  silently colliding. This narrows, but does not eliminate, the race between
+  two simultaneous joiners choosing the same index — `RegisterNodeAddrs`
+  apply-time idempotence (PR1) is the actual backstop for that residual
+  window, not this pre-bind check.
+- **Member self-registration was folded into `BoundNode::start_with`'s
+  existing growth-node block**, not added as a separate step inside
+  `run_node_join`. `start_with` already detects "my own control id is not in
+  the `control_ids` I was started with" to decide whether to run
+  `remote_metadata_sync_loop`; that same block now also spawns a one-shot
+  task calling `ClientCtx::admin_add_member` (idempotent — a no-op if
+  already registered). This means **every** growth node self-registers
+  automatically the moment it starts, whether reached via `run_node_growth`
+  (an operator-assembled expanded config) or `run_node_join` (seed
+  discovery) — so `run_node_growth`'s own callers no longer strictly need
+  their own separate `POST /admin/member/add` call either, though it remains
+  supported as an idempotent confirmation (`tests/cluster_growth.rs` keeps
+  its explicit call, now proving that no-op path rather than the only path
+  in).
+
+One supporting change: the client-protocol `Status` handler now serves
+`ClientCtx::effective_metadata()` instead of the bare local
+`raft.metadata()`, exactly as `/admin/status` already did (ADR 0030) — a
+growth node's local control raft never replicates, so without this a joiner
+that picked a *grown* node as its seed would have received a
+permanently-empty `Metadata` (a vacuous collision guard), and `animus
+status` against a grown node would have shown an empty cluster. Safe for
+`remote_metadata_sync_loop`'s own polling, whose seeds are always the
+pre-growth control nodes (genuine voters, where `effective_metadata` is a
+plain passthrough) — no mirror ever feeds another mirror.
 
 ## Decision — PR3 (not yet implemented): decommission
 
@@ -200,3 +245,21 @@ replayed historical state can't resurrect a removed member).
   a join reaches every existing node's address book the same way growth
   already does, and a decommission's address-pruning reuses the exact GC
   shape ADR 0024 already established for `cp_member_addrs`.
+- **PR2 landed** (2026-08-07): `animusd join`, `ClientRequest::JoinInfo` /
+  `ClientResponse::JoinInfo`, `run_node_join`, and the collision guard — see
+  its own decision section above for the two shape deviations from this
+  ADR's original sketch (a required `--node` index instead of
+  auto-derivation; member self-registration folded into
+  `BoundNode::start_with`'s existing growth-node block rather than a
+  separate step in `run_node_join`, which also means `run_node_growth`
+  self-registers automatically now). `tests/seed_join.rs` covers the happy
+  path (a 4th node joins off only the 3-node core's client addresses, no
+  expanded config anywhere in the test, becomes `Active`, gains a real
+  tablet replica via rebalancing, serves reads/writes through its own
+  address and through a core node, and appears in an original node's
+  `/admin/peers`), the collision guard (a second join at the same index with
+  different addresses fails with `AlreadyExists`, cluster unharmed), and
+  rejoin (shut the joined node down, join again at the same
+  index/addresses/dir, recovers and serves — no collision-guard error, since
+  an identical address book is a rejoin). PR3 (decommission) remains not yet
+  implemented.
