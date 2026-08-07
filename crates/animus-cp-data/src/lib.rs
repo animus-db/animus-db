@@ -102,6 +102,87 @@ impl Future for ProposePending<'_> {
     }
 }
 
+/// The physical key-space a `RaftKvNode`'s group is confined to within a
+/// possibly-**shared** `StorageEngine` (PR3 of the single-command-split
+/// redesign, ADR 0028): every physical key this group ever writes is
+/// `prefix || key`, and a read is bounded to physical keys whose stripped
+/// (post-prefix) suffix falls inside `range`. `prefix` is meant to identify
+/// the *table* (stable across splits — many sibling tablets of one table can
+/// share a prefix), `range` the *tablet's own sub-portion* within it (the
+/// same range already recorded in the control plane's `Metadata`).
+///
+/// [`whole`](Self::whole) — empty prefix, the whole keyspace — makes every
+/// physical-key operation an identity transform, so a `RaftKvNode` with a
+/// dedicated (non-shared) engine (every existing caller today) behaves
+/// byte-for-byte as before. **Not yet wired into any real caller** —
+/// `animusd` still opens one dedicated engine per tablet; a later PR threads
+/// a real per-table prefix through here so multiple tablets can safely share
+/// one node-wide engine.
+///
+/// The legacy `KvCommand::Split`/`SPLIT_BOUND_KEY` mechanism (superseded by a
+/// single-command, control-plane-driven split, and deleted once that lands)
+/// is deliberately **not** hardened against a non-default scope: its
+/// reserved marker key and `keys_from`'s handoff capture are only
+/// prefix-scoped, not range-scoped (see their call sites), so two sibling
+/// tablets of the same table sharing a prefix could in principle collide on
+/// the marker, and a snapshot image built under a narrowed `range` would not
+/// carry it to a catching-up follower. Harmless in practice: nothing combines
+/// a non-default scope with `propose_split` today, and the mechanism is
+/// deleted before that combination could arise for real.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StorageScope {
+    prefix: Vec<u8>,
+    range: KeyRange,
+}
+
+impl StorageScope {
+    /// No prefix, the whole keyspace — every physical-key operation is an
+    /// identity transform (today's dedicated-engine behavior).
+    #[must_use]
+    pub fn whole() -> Self {
+        Self {
+            prefix: Vec::new(),
+            range: KeyRange::whole(),
+        }
+    }
+
+    /// A scope confined to `prefix || range` within a shared engine.
+    #[must_use]
+    pub fn new(prefix: Vec<u8>, range: KeyRange) -> Self {
+        Self { prefix, range }
+    }
+
+    /// The physical storage key for logical `key`.
+    fn physical(&self, key: &[u8]) -> Vec<u8> {
+        let mut out = self.prefix.clone();
+        out.extend_from_slice(key);
+        out
+    }
+
+    /// If `physical_key` belongs to this scope — starts with `prefix`, and
+    /// the stripped suffix falls inside `range` — the stripped logical key,
+    /// else `None`. The read-side counterpart of [`physical`](Self::physical),
+    /// used wherever a shared-engine scan/snapshot must not leak another
+    /// tenant's keys.
+    fn strip_in_range<'a>(&self, physical_key: &'a [u8]) -> Option<&'a [u8]> {
+        let logical = physical_key.strip_prefix(self.prefix.as_slice())?;
+        self.range.contains(logical).then_some(logical)
+    }
+
+    /// If `physical_key` starts with this scope's `prefix` (regardless of
+    /// `range`), the stripped logical key. Used only by the legacy
+    /// Split/`SPLIT_BOUND_KEY` path (see the type doc's caveat).
+    fn strip_prefix_only<'a>(&self, physical_key: &'a [u8]) -> Option<&'a [u8]> {
+        physical_key.strip_prefix(self.prefix.as_slice())
+    }
+}
+
+impl Default for StorageScope {
+    fn default() -> Self {
+        Self::whole()
+    }
+}
+
 /// The data plane's Raft log command: a key-value mutation (or the election
 /// no-op). Keys/values are opaque bytes; ordering + durability come from Raft.
 ///
@@ -319,6 +400,10 @@ pub struct RaftKvNode<E: Env, S: StorageEngine> {
     /// `ProdEnv`) — see [`start_with_metrics`](Self::start_with_metrics) to observe
     /// it under simulation.
     metrics: MetricsHandle,
+    /// This group's confinement within `storage` — see [`StorageScope`]'s doc.
+    /// `StorageScope::whole()` (the default for every existing constructor)
+    /// makes every physical-key operation an identity transform.
+    scope: StorageScope,
 }
 
 /// Invoked on a replica when it **applies** a committed `Split` (ADR 0017 D), with
@@ -342,7 +427,24 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// and pass a recording [`MetricsHandle`] the test keeps.
     pub fn start(env: E, all_nodes: Vec<NodeId>, storage: S) -> Self {
         let metrics = env.metrics();
-        Self::start_inner(env, all_nodes, storage, None, metrics)
+        Self::start_inner(
+            env,
+            all_nodes,
+            storage,
+            None,
+            metrics,
+            StorageScope::whole(),
+        )
+    }
+
+    /// Like [`start`](Self::start), but the group is confined to `scope` within
+    /// `storage` (see [`StorageScope`]'s doc) — the seam a future caller uses to
+    /// share one physical engine across several tablets. `storage.clone()` must
+    /// be the SAME shared engine handle every co-resident group on this node
+    /// was started with; `scope` is what keeps them from colliding.
+    pub fn start_scoped(env: E, all_nodes: Vec<NodeId>, storage: S, scope: StorageScope) -> Self {
+        let metrics = env.metrics();
+        Self::start_inner(env, all_nodes, storage, None, metrics, scope)
     }
 
     /// Like [`start`](Self::start), but records into the supplied `metrics` handle
@@ -355,7 +457,14 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         storage: S,
         metrics: MetricsHandle,
     ) -> Self {
-        Self::start_inner(env, all_nodes, storage, None, metrics)
+        Self::start_inner(
+            env,
+            all_nodes,
+            storage,
+            None,
+            metrics,
+            StorageScope::whole(),
+        )
     }
 
     /// Like [`start`](Self::start) but with a [`SplitHook`] invoked on apply of a
@@ -370,7 +479,14 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         on_split: SplitHook,
     ) -> Self {
         let metrics = env.metrics();
-        Self::start_inner(env, all_nodes, storage, Some(on_split), metrics)
+        Self::start_inner(
+            env,
+            all_nodes,
+            storage,
+            Some(on_split),
+            metrics,
+            StorageScope::whole(),
+        )
     }
 
     fn start_inner(
@@ -379,6 +495,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         storage: S,
         on_split: Option<SplitHook>,
         metrics: MetricsHandle,
+        scope: StorageScope,
     ) -> Self {
         let core = Arc::new(Mutex::new(RaftCore::new(
             env.node_id(),
@@ -411,6 +528,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             apply_stopped: Arc::clone(&apply_stopped),
             propose_signal: Arc::clone(&propose_signal),
             metrics: metrics.clone(),
+            scope: scope.clone(),
         };
         // The consensus loop recovers from the WAL, then spawns the apply task
         // (so the apply task sees the recovered core + the correct
@@ -431,6 +549,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             apply_stopped,
             propose_signal,
             metrics,
+            scope,
         }));
         node
     }
@@ -714,7 +833,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// the data to seed the new tablet's group on a split. Read on the leader
     /// (its committed state is authoritative) before proposing the split.
     pub async fn range_snapshot(&self, at: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
-        keys_from(&self.storage, at).await
+        keys_from(&self.storage, &self.scope, at).await
     }
 
     /// Start a group whose engine is **pre-seeded** with `seed` `(key, value)`
@@ -727,10 +846,26 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         storage: S,
         seed: Vec<(Vec<u8>, Vec<u8>)>,
     ) -> Self {
+        Self::start_seeded_scoped(env, all_nodes, storage, seed, StorageScope::whole()).await
+    }
+
+    /// Like [`start_seeded`](Self::start_seeded), but the new group is confined
+    /// to `scope` within `storage` (see [`StorageScope`]'s doc) — the seed is
+    /// written at each key's *physical* address under `scope`.
+    pub async fn start_seeded_scoped(
+        env: E,
+        all_nodes: Vec<NodeId>,
+        storage: S,
+        seed: Vec<(Vec<u8>, Vec<u8>)>,
+        scope: StorageScope,
+    ) -> Self {
         for (key, value) in &seed {
-            storage.merge(key, value, 0).await.expect("raftkv seed");
+            storage
+                .merge(&scope.physical(key), value, 0)
+                .await
+                .expect("raftkv seed");
         }
-        Self::start(env, all_nodes, storage)
+        Self::start_scoped(env, all_nodes, storage, scope)
     }
 
     /// Like [`start_seeded`](Self::start_seeded) but the new group carries a
@@ -755,7 +890,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// tests to observe a replica's applied state and to confirm convergence.
     pub async fn local_get(&self, key: &[u8]) -> Option<Vec<u8>> {
         self.storage
-            .get(key)
+            .get(&self.scope.physical(key))
             .await
             .ok()
             .flatten()
@@ -805,19 +940,26 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         // `entries()` — the trait's `scan` takes a finite exclusive bound and
         // arbitrary byte keys have no max sentinel; pushing a limit *into* the
         // engine is a `StorageEngine` API change, out of scope here.
-        // Excludes `SPLIT_BOUND_KEY` in both branches — its doc explains why
-        // this reserved entry must never reach a client, and its position in
-        // the keyspace isn't guaranteed to sort outside any particular range
-        // (it's not derived from any real key's hash/format).
+        // Both branches physically bound/filter to `self.scope` (PR3: on a
+        // possibly-shared engine, `entries()` in particular would otherwise
+        // return every other tenant's keys too — see `StorageScope`'s doc) and
+        // exclude `SPLIT_BOUND_KEY` — its doc explains why this reserved entry
+        // must never reach a client, and its position in the keyspace isn't
+        // guaranteed to sort outside any particular range (it's not derived
+        // from any real key's hash/format). Under the default (whole) scope
+        // this is byte-for-byte the prior behavior: `physical` is the
+        // identity and `strip_in_range` always succeeds.
         let mut pairs: Vec<(Vec<u8>, Vec<u8>)> = match end {
             Some(e) => self
                 .storage
-                .scan(start, e)
+                .scan(&self.scope.physical(start), &self.scope.physical(e))
                 .await
                 .ok()?
                 .into_iter()
-                .filter(|(k, _)| k.as_slice() != SPLIT_BOUND_KEY)
-                .map(|(k, vv)| (k, vv.value))
+                .filter_map(|(k, vv)| {
+                    let logical = self.scope.strip_in_range(&k)?;
+                    (logical != SPLIT_BOUND_KEY).then(|| (logical.to_vec(), vv.value))
+                })
                 .collect(),
             None => self
                 .storage
@@ -825,8 +967,11 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
                 .await
                 .ok()?
                 .into_iter()
-                .filter(|(k, _)| k.as_slice() >= start && k.as_slice() != SPLIT_BOUND_KEY)
-                .map(|(k, vv)| (k, vv.value))
+                .filter_map(|(k, vv)| {
+                    let logical = self.scope.strip_in_range(&k)?;
+                    (logical >= start && logical != SPLIT_BOUND_KEY)
+                        .then(|| (logical.to_vec(), vv.value))
+                })
                 .collect(),
         };
         if let Some(n) = limit {
@@ -1214,6 +1359,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
     wal_lock: &AsyncMutex<()>,
     halted: &AtomicBool,
     metrics: &MetricsHandle,
+    scope: &StorageScope,
 ) -> bool {
     let mut did_work = false;
 
@@ -1224,7 +1370,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
         .expect("raftkv core poisoned")
         .drain_pending_install();
     if let Some((last_index, bytes)) = pending_install {
-        install_engine_image(storage, &bytes).await;
+        install_engine_image(storage, scope, &bytes).await;
         engine_applied.fetch_max(last_index, Ordering::SeqCst);
         // Re-sync the in-memory split-boundary cache from the just-installed
         // image: the sender's `snapshot_index`/engine state is authoritative
@@ -1234,7 +1380,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
         *current_split_bound_state
             .lock()
             .expect("raftkv current_split_bound_state poisoned") =
-            match storage.get(SPLIT_BOUND_KEY).await {
+            match storage.get(&scope.physical(SPLIT_BOUND_KEY)).await {
                 Ok(Some(vv)) => decode_split_bound(&vv.value),
                 _ => None,
             };
@@ -1271,9 +1417,12 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 // entry itself (stamped by the leader at propose time), so every
                 // replica reaches this same accept/reject decision regardless of
                 // its own progress learning the tablet's range has changed (see
-                // `KvCommand`'s doc).
+                // `KvCommand`'s doc). The fence check is against the *logical*
+                // key; only the storage-bound `MergeOp` gets the physical
+                // address (see `StorageScope`'s doc — under the default scope
+                // this is an identity transform).
                 if fence.contains(&key) {
-                    pending.push(MergeOp::put(key, value, index));
+                    pending.push(MergeOp::put(scope.physical(&key), value, index));
                 }
             }
             KvCommand::Batch { puts, fence } => {
@@ -1289,7 +1438,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 if puts.iter().all(|(key, _)| fence.contains(key)) {
                     for (key, value) in &puts {
                         storage
-                            .merge(key, value, index)
+                            .merge(&scope.physical(key), value, index)
                             .await
                             .expect("raftkv apply batch put");
                     }
@@ -1297,7 +1446,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
             }
             KvCommand::Delete { key, fence } => {
                 if fence.contains(&key) {
-                    pending.push(MergeOp::tombstone(key, index));
+                    pending.push(MergeOp::tombstone(scope.physical(&key), index));
                 }
             }
             KvCommand::Cas {
@@ -1323,8 +1472,9 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                     // from the same `expected` resolve to exactly one winner —
                     // whichever Raft put first, since the first swap moves the
                     // committed value and the second's compare then fails.
+                    let physical_key = scope.physical(&key);
                     let current = storage
-                        .get(&key)
+                        .get(&physical_key)
                         .await
                         .expect("raftkv cas read")
                         .map(|vv| vv.value);
@@ -1333,7 +1483,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                         // Same write path as `Put`: index is the MVCC version, so
                         // re-applying on recovery is idempotent (per-key LWW).
                         storage
-                            .merge(&key, &value, index)
+                            .merge(&physical_key, &value, index)
                             .await
                             .expect("raftkv apply cas");
                     }
@@ -1385,8 +1535,10 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                     // committed state (excluding `SPLIT_BOUND_KEY` — see its doc).
                     // Every replica applies the same `Split` at the same point in the
                     // command order, so the captured handoff is consistent across
-                    // replicas (ADR 0017 D).
-                    let handoff = keys_from(storage, &at).await;
+                    // replicas (ADR 0017 D). `keys_from` returns *logical* keys
+                    // (prefix already stripped — see `StorageScope`'s doc on why
+                    // this legacy path is prefix-scoped only, not range-scoped).
+                    let handoff = keys_from(storage, scope, &at).await;
                     // In-band new-group creation: hand the range to the split hook,
                     // which (when wired) mints a co-resident sibling and seeds the new
                     // tablet's group from it. With no hook, the new group is created
@@ -1401,13 +1553,14 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                     // boundary (**overwriting**, not appending — see `SPLIT_BOUND_KEY`'s
                     // doc for why one value is enough), all under a single sync
                     // (extending the same batch, not a second `merge_batch` call).
+                    // Tombstones/boundary key are written at their *physical* address.
                     let new_bound = Some(at.clone());
                     let mut ops: Vec<MergeOp> = handoff
                         .iter()
-                        .map(|(key, _)| MergeOp::tombstone(key.clone(), index))
+                        .map(|(key, _)| MergeOp::tombstone(scope.physical(key), index))
                         .collect();
                     ops.push(MergeOp::put(
-                        SPLIT_BOUND_KEY.to_vec(),
+                        scope.physical(SPLIT_BOUND_KEY),
                         encode_split_bound(&new_bound),
                         index,
                     ));
@@ -1468,7 +1621,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
         // and only when a follower is actually waiting on a snapshot.
         let image = if image_needed {
             metrics.incr(Metric::CpSnapshotImageBuilds);
-            Some(engine_image(storage).await)
+            Some(engine_image(storage, scope).await)
         } else {
             None
         };
@@ -1607,38 +1760,64 @@ fn decode_split_bound(bytes: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
-/// The engine's live `(key, value)` pairs with `key >= at`, **excluding**
+/// This scope's live `(key, value)` pairs with `key >= at`, **excluding**
 /// [`SPLIT_BOUND_KEY`] — the data handed off to the new tablet on a split,
 /// or (via [`RaftKvNode::range_snapshot`]) surfaced to a client/the auto-split
 /// loop. The history entry must never ride along: a split child inherits it
 /// from a whole-history *value*, not from a stale copy of the parent's.
-async fn keys_from<S: StorageEngine>(storage: &S, at: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+/// Returns *logical* keys (the prefix already stripped). Scans the whole
+/// underlying engine and filters by prefix (see `StorageScope`'s doc: this
+/// legacy path is prefix-scoped only, not range-scoped) — under the default
+/// scope every key belongs to this group, so this is byte-for-byte the prior
+/// behavior.
+async fn keys_from<S: StorageEngine>(
+    storage: &S,
+    scope: &StorageScope,
+    at: &[u8],
+) -> Vec<(Vec<u8>, Vec<u8>)> {
     storage
         .entries()
         .await
         .expect("raftkv engine scan")
         .into_iter()
-        .filter(|(k, _)| k.as_slice() >= at && k.as_slice() != SPLIT_BOUND_KEY)
-        .map(|(k, vv)| (k, vv.value))
+        .filter_map(|(k, vv)| {
+            let logical = scope.strip_prefix_only(&k)?;
+            (logical >= at && logical != SPLIT_BOUND_KEY).then(|| (logical.to_vec(), vv.value))
+        })
         .collect()
 }
 
 /// One key's snapshot entry: `(key, value-or-tombstone, version)`.
 pub(crate) type ImageEntry = (Vec<u8>, Option<Vec<u8>>, u64);
 
-/// Serialize the engine's full contents (including tombstones) as the snapshot
-/// image shipped to a lagging follower.
-async fn engine_image<S: StorageEngine>(storage: &S) -> Vec<u8> {
+/// Serialize this scope's contents (including tombstones) as the snapshot
+/// image shipped to a lagging follower. Bounded to `scope` (prefix **and**
+/// range — see `StorageScope`'s doc): on a shared engine, an unbounded dump
+/// would leak every other tenant's keys into this tablet's snapshot **and**
+/// duplicate them into whichever engine receives it, corrupting a group that
+/// never agreed to those writes through its own Raft log. Under the default
+/// (whole) scope this is byte-for-byte the prior unbounded behavior.
+async fn engine_image<S: StorageEngine>(storage: &S, scope: &StorageScope) -> Vec<u8> {
     let entries: Vec<ImageEntry> = storage
         .entries_with_tombstones()
         .await
-        .expect("raftkv engine scan");
+        .expect("raftkv engine scan")
+        .into_iter()
+        .filter_map(|(k, v, version)| {
+            scope
+                .strip_in_range(&k)
+                .map(|logical| (logical.to_vec(), v, version))
+        })
+        .collect();
     codec::encode_image(&entries)
 }
 
 /// Write a received snapshot image into the engine (a follower catching up),
 /// versioned so per-key LWW keeps it consistent with the log tail merged on top.
-async fn install_engine_image<S: StorageEngine>(storage: &S, bytes: &[u8]) {
+/// The wire image carries *logical* keys (stripped by the sender's
+/// `engine_image`); each is re-prefixed to *this* replica's own `scope`
+/// before writing into the (possibly shared) engine.
+async fn install_engine_image<S: StorageEngine>(storage: &S, scope: &StorageScope, bytes: &[u8]) {
     let entries: Vec<ImageEntry> = match codec::decode_image(bytes) {
         Ok(e) => e,
         Err(err) => {
@@ -1647,13 +1826,17 @@ async fn install_engine_image<S: StorageEngine>(storage: &S, bytes: &[u8]) {
         }
     };
     for (key, value, version) in entries {
+        let physical = scope.physical(&key);
         match value {
             Some(v) => {
-                storage.merge(&key, &v, version).await.expect("install put");
+                storage
+                    .merge(&physical, &v, version)
+                    .await
+                    .expect("install put");
             }
             None => {
                 storage
-                    .merge_tombstone(&key, version)
+                    .merge_tombstone(&physical, version)
                     .await
                     .expect("install tombstone");
             }
@@ -1680,6 +1863,7 @@ struct DriveState<E: Env, S: StorageEngine> {
     apply_stopped: Arc<AtomicBool>,
     propose_signal: Arc<ProposeSignal>,
     metrics: MetricsHandle,
+    scope: StorageScope,
 }
 
 /// Idle back-off for the apply task: when there is nothing committed-and-durable to
@@ -1713,6 +1897,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         apply_stopped,
         propose_signal,
         metrics,
+        scope,
     } = st;
 
     let bytes = env.read(WAL).await.unwrap_or_default();
@@ -1737,7 +1922,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
     // good, and replaying the (now-shorter) tail would never re-derive that
     // this group had already split. The engine itself is the durable source of
     // truth here, exactly like the rest of the applied state above.
-    if let Ok(Some(vv)) = storage.get(SPLIT_BOUND_KEY).await {
+    if let Ok(Some(vv)) = storage.get(&scope.physical(SPLIT_BOUND_KEY)).await {
         *current_split_bound_state
             .lock()
             .expect("raftkv current_split_bound_state poisoned") = decode_split_bound(&vv.value);
@@ -1757,6 +1942,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         Arc::clone(&halted),
         apply_stopped,
         metrics.clone(),
+        scope,
     ));
 
     loop {
@@ -1892,6 +2078,7 @@ async fn apply_loop<E: Env, S: StorageEngine>(
     halted: Arc<AtomicBool>,
     apply_stopped: Arc<AtomicBool>,
     metrics: MetricsHandle,
+    scope: StorageScope,
 ) {
     // `current_split_bound_state` is shared (not a task-local `Option<Vec<u8>>`) so
     // `RaftKvNode::current_split_bound_state` can observe it — the confirm-by-key primitive
@@ -1916,6 +2103,7 @@ async fn apply_loop<E: Env, S: StorageEngine>(
             &wal_lock,
             &halted,
             &metrics,
+            &scope,
         )
         .await;
         if !did_work {
