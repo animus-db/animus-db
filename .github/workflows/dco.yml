@@ -4,6 +4,12 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
 
+permissions:
+  contents: read
+  # get-pr-commits lists the PR's commits via the REST API; without this the
+  # restricted default token gets "Resource not accessible by integration".
+  pull-requests: read
+
 jobs:
   dco:
     name: DCO sign-off check
