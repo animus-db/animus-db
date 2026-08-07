@@ -491,3 +491,219 @@ async fn decommission_drains_removes_and_allows_id_reuse() {
         node.shutdown();
     }
 }
+
+/// `/admin/raftkv`'s `groups`: `(tablet, hosting node, is_leader)`.
+async fn raftkv_groups(admin_addr: SocketAddr) -> Vec<(u64, u64, bool)> {
+    let (status, body) = admin(admin_addr, "GET", "/admin/raftkv", None).await;
+    if status != 200 {
+        return Vec::new();
+    }
+    body["groups"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|g| {
+                    (
+                        g["tablet"].as_u64().expect("tablet"),
+                        g["node"].as_u64().expect("node"),
+                        g["is_leader"].as_bool().expect("is_leader"),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Regression for the dashboard health rollup (`dashboard_core.js`'s
+/// `computeHealth()`): 3 -> join 2 (5) -> drain + remove one joined node (4,
+/// a real decommission-driven shrink, not a crash). Reproduces
+/// `computeHealth()`/`tabletStatus()`'s logic in Rust over the real
+/// `/admin/status` + `/admin/raftkv` fanned out across every remaining node —
+/// the dashboard must read the shrunk cluster as healthy once rebalancing
+/// converges, same as `dashboard_health_recovers_after_grown_cluster_loses_an_original_node`
+/// (`tests/cluster_growth.rs`) proves for a bare-crash shrink.
+#[tokio::test(flavor = "multi_thread", worker_threads = 10)]
+async fn dashboard_health_recovers_after_decommission_shrink() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let (core_nodes, core_config) = bring_up(3, dir.path()).await;
+    await_bootstrap(&core_nodes).await;
+    let core_clients: Vec<SocketAddr> = core_config.nodes.iter().map(|a| a.client).collect();
+    let core_admin: Vec<SocketAddr> = core_config.nodes.iter().map(|a| a.admin).collect();
+    for table in TABLES {
+        put(&core_clients, table, b"k0", b"v0", 30).await;
+    }
+
+    // Join two more nodes (3 -> 5), one at a time.
+    let mut joined_nodes = Vec::new();
+    let mut joined_ids = Vec::new();
+    for i in 0..2 {
+        let join_index = core_config.len() + i;
+        let join_raftkv_id = animusd::config::raftkv_id(join_index);
+        let (node, addrs, _node_dir) = join_fresh(
+            &core_clients,
+            join_index,
+            dir.path(),
+            StorageBackend::default(),
+        )
+        .await;
+        let promoted = async {
+            loop {
+                if member_statuses(core_admin[0])
+                    .await
+                    .get(&join_raftkv_id)
+                    .map(String::as_str)
+                    == Some("Active")
+                {
+                    return;
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        };
+        timeout(Duration::from_secs(20), promoted)
+            .await
+            .unwrap_or_else(|_| panic!("joined node {join_index} never promoted to Active"));
+        joined_nodes.push(node);
+        joined_ids.push((join_raftkv_id, addrs));
+    }
+    println!("joined ids: {joined_ids:?}");
+
+    // Pick the first joined node to drain + remove (5 -> 4).
+    let (target_id, _target_addrs) = joined_ids[0];
+    let leader = leader_index(&core_nodes);
+
+    {
+        let body = serde_json::json!({"node": target_id}).to_string();
+        let (status, resp) = admin(core_admin[leader], "POST", "/admin/drain", Some(&body)).await;
+        assert_eq!(status, 200, "drain failed: {resp}");
+    }
+    let drained = async {
+        loop {
+            let (status, body) = drain_status(core_admin[leader], target_id).await;
+            if status == 200 {
+                let remaining = body["tablets_remaining"].as_u64().unwrap_or(u64::MAX);
+                let node_status = body["status"].as_str().unwrap_or("");
+                if remaining == 0 && node_status != "Active" {
+                    return;
+                }
+            }
+            sleep(Duration::from_millis(200)).await;
+        }
+    };
+    timeout(Duration::from_secs(60), drained)
+        .await
+        .unwrap_or_else(|_| panic!("target node never finished draining"));
+    {
+        let (status, body) = remove_member(core_admin[leader], target_id).await;
+        assert_eq!(status, 200, "remove failed: {body}");
+    }
+    let removed = async {
+        loop {
+            let (status, body) = admin(core_admin[0], "GET", "/admin/status", None).await;
+            if status == 200 {
+                let key = target_id.to_string();
+                let members_gone = !body["members"]
+                    .as_object()
+                    .is_some_and(|m| m.contains_key(&key));
+                if members_gone {
+                    return;
+                }
+            }
+            sleep(Duration::from_millis(150)).await;
+        }
+    };
+    timeout(Duration::from_secs(30), removed)
+        .await
+        .unwrap_or_else(|_| panic!("removed node never disappeared from /admin/status"));
+
+    // Give the survivors' reconcilers a further beat to settle.
+    sleep(Duration::from_secs(3)).await;
+
+    joined_nodes[0].shutdown();
+
+    let mut survivor_admin: Vec<SocketAddr> = core_admin.clone();
+    survivor_admin.push(joined_ids[1].1.admin);
+
+    let (_status, status_body) = admin(survivor_admin[0], "GET", "/admin/status", None).await;
+    let member_statuses: std::collections::BTreeMap<u64, String> = status_body["members"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .map(|(id, m)| {
+            (
+                id.parse().unwrap(),
+                m["status"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    let tablets: std::collections::BTreeMap<u64, Vec<u64>> = status_body["tablets"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .map(|(id, t)| {
+            (
+                id.parse().unwrap(),
+                t["replicas"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(serde_json::Value::as_u64)
+                    .collect(),
+            )
+        })
+        .collect();
+    println!("member_statuses: {member_statuses:?}");
+    println!("tablets: {tablets:?}");
+
+    let mut groups_by_tablet: std::collections::BTreeMap<u64, Vec<(u64, bool)>> =
+        std::collections::BTreeMap::new();
+    for &addr in &survivor_admin {
+        for (tablet, node, is_leader) in raftkv_groups(addr).await {
+            let seen = groups_by_tablet.entry(tablet).or_default();
+            if !seen.iter().any(|(n, _)| *n == node) {
+                seen.push((node, is_leader));
+            }
+        }
+    }
+    println!("groups_by_tablet: {groups_by_tablet:?}");
+
+    let down_count = member_statuses.values().filter(|s| *s == "Down").count();
+    let mut leaderless = 0usize;
+    let mut under_replicated = 0usize;
+    for (tablet, replicas) in &tablets {
+        let gs = groups_by_tablet.get(tablet).cloned().unwrap_or_default();
+        let has_leader = gs.iter().any(|(_, l)| *l);
+        let configured = replicas.len();
+        if !has_leader {
+            leaderless += 1;
+            println!("tablet {tablet} is LEADERLESS: gs={gs:?}");
+        } else if configured > 0 && gs.len() < configured {
+            under_replicated += 1;
+            println!(
+                "tablet {tablet} is UNDER-REPLICATED: configured={configured} gs.len()={} gs={gs:?}",
+                gs.len()
+            );
+        }
+    }
+    println!("down_count={down_count} leaderless={leaderless} under_replicated={under_replicated}");
+
+    // A cleanly-decommissioned node is gone from `members` entirely (not
+    // lingering `Down`), and every tablet should already be repaired.
+    assert_eq!(
+        down_count, 0,
+        "a decommissioned node should be fully removed, not left Down"
+    );
+    assert_eq!(
+        leaderless, 0,
+        "every tablet should have re-elected a leader by now"
+    );
+    assert_eq!(
+        under_replicated, 0,
+        "every tablet should be repaired back to its configured replica count"
+    );
+
+    joined_nodes[1].shutdown();
+    for node in core_nodes {
+        node.shutdown();
+    }
+}

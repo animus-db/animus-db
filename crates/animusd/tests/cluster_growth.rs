@@ -511,3 +511,185 @@ async fn cluster_grows_from_three_to_five_and_rebalances() {
         node.shutdown();
     }
 }
+
+/// `/admin/raftkv`'s `groups`: `(tablet, hosting node, is_leader)`.
+async fn raftkv_groups(admin_addr: SocketAddr) -> Vec<(u64, u64, bool)> {
+    let (status, body) = admin(admin_addr, "GET", "/admin/raftkv", None).await;
+    if status != 200 {
+        return Vec::new();
+    }
+    body["groups"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|g| {
+                    (
+                        g["tablet"].as_u64().expect("tablet"),
+                        g["node"].as_u64().expect("node"),
+                        g["is_leader"].as_bool().expect("is_leader"),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Regression for the dashboard health rollup (`dashboard_core.js`'s
+/// `computeHealth()`): 3 -> 5 (growth) -> kill an ORIGINAL core node (index 0
+/// — a control-core member, which can never be decommissioned via
+/// `/admin/member/remove` and so stays `Down` in the member roster forever
+/// unless restarted). Once the placement reconciler auto-replaces every
+/// tablet the dead node used to replicate onto a live spare (the existing
+/// `failure_auto_replaces_replica_onto_spare` cascade), the dashboard must
+/// read the cluster as healthy — a lingering `Down` member must NOT hold the
+/// whole cluster "degraded" once its data-loss risk is gone. Reproduces
+/// `computeHealth()`/`tabletStatus()`'s logic in Rust over the real
+/// `/admin/status` + `/admin/raftkv` fanned out across every surviving node,
+/// exactly as the browser's cross-node fan-out does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 10)]
+async fn dashboard_health_recovers_after_grown_cluster_loses_an_original_node() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let (mut nodes, base_config) = bring_up(3, dir.path()).await;
+    await_bootstrap(&nodes).await;
+    let base_clients: Vec<SocketAddr> = base_config.nodes.iter().map(|a| a.client).collect();
+    let base_admin: Vec<SocketAddr> = base_config.nodes.iter().map(|a| a.admin).collect();
+    for table in TABLES {
+        put(&base_clients, table, b"k0", b"v0", 30).await;
+    }
+
+    let (growth_nodes, expanded_config) = grow(&base_config, 2, dir.path()).await;
+    nodes.extend(growth_nodes);
+    let all_raftkv_ids = expanded_config.raftkv_ids();
+    let new_ids = &all_raftkv_ids[3..];
+    let all_admin: Vec<SocketAddr> = expanded_config.nodes.iter().map(|a| a.admin).collect();
+
+    for &id in new_ids {
+        let (status, body) = admin(
+            base_admin[0],
+            "POST",
+            "/admin/member/add",
+            Some(&format!("{{\"node\":{id}}}")),
+        )
+        .await;
+        assert_eq!(status, 200, "admin add-member failed for {id}: {body}");
+    }
+
+    let promoted = async {
+        loop {
+            let statuses = member_statuses(all_admin[0]).await;
+            if new_ids
+                .iter()
+                .all(|id| statuses.get(id).map(String::as_str) == Some("Active"))
+            {
+                return;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    };
+    timeout(Duration::from_secs(20), promoted)
+        .await
+        .unwrap_or_else(|_| panic!("added nodes never promoted to Active"));
+
+    let converged = async {
+        loop {
+            let map = tablet_map(base_admin[0]).await;
+            let counts = replica_counts(&map, &all_raftkv_ids);
+            if imbalance(&counts) <= 1 {
+                return counts;
+            }
+            sleep(Duration::from_millis(300)).await;
+        }
+    };
+    let converged_counts = timeout(Duration::from_secs(120), converged)
+        .await
+        .unwrap_or_else(|_| panic!("tablet replicas never spread across all 5 nodes within 120s"));
+    println!("post-growth converged counts: {converged_counts:?}");
+
+    // Kill an ORIGINAL core node (index 0) -- it can never be decommissioned
+    // (control-core member), so it stays `Down` forever unless restarted;
+    // this is a different asymmetry than killing a grown node.
+    let kill_idx = 0;
+    let killed_id = all_raftkv_ids[kill_idx];
+    nodes[kill_idx].shutdown();
+    let survivor_idx: Vec<usize> = (0..5).filter(|&i| i != kill_idx).collect();
+    let survivor_admin: Vec<SocketAddr> = survivor_idx.iter().map(|&i| all_admin[i]).collect();
+    println!("killed node {killed_id} (index {kill_idx})");
+
+    // Wait for every tablet to drop the dead replica and be repaired back to
+    // 3 live replicas (RF=3), polling from a survivor.
+    let repaired = async {
+        loop {
+            let map = tablet_map(survivor_admin[0]).await;
+            let statuses = member_statuses(survivor_admin[0]).await;
+            let all_ok = map
+                .values()
+                .all(|(replicas, _)| replicas.len() == 3 && !replicas.contains(&killed_id));
+            if all_ok {
+                return (map, statuses);
+            }
+            sleep(Duration::from_millis(300)).await;
+        }
+    };
+    let (final_map, final_statuses) = timeout(Duration::from_secs(120), repaired)
+        .await
+        .unwrap_or_else(|_| panic!("tablets never repaired off the dead node within 120s"));
+    println!("post-repair tablet map: {final_map:?}");
+    println!("post-repair member statuses: {final_statuses:?}");
+
+    // Give the CP groups a further beat to actually elect/reconfigure on the
+    // new replica set (metadata can converge slightly before the raft groups
+    // do).
+    sleep(Duration::from_secs(3)).await;
+
+    // Now reproduce the dashboard's aggregation: fan out `/admin/raftkv` to
+    // every survivor and merge by (tablet, node), exactly like
+    // `cpGroupsByTablet()`.
+    let mut groups_by_tablet: BTreeMap<u64, Vec<(u64, bool)>> = BTreeMap::new();
+    for &addr in &survivor_admin {
+        for (tablet, node, is_leader) in raftkv_groups(addr).await {
+            let seen = groups_by_tablet.entry(tablet).or_default();
+            if !seen.iter().any(|(n, _)| *n == node) {
+                seen.push((node, is_leader));
+            }
+        }
+    }
+    println!("groups_by_tablet: {groups_by_tablet:?}");
+
+    let down_count = final_statuses.values().filter(|s| *s == "Down").count();
+    let mut leaderless = 0usize;
+    let mut under_replicated = 0usize;
+    for (tablet, (replicas, _epoch)) in &final_map {
+        let gs = groups_by_tablet.get(tablet).cloned().unwrap_or_default();
+        let has_leader = gs.iter().any(|(_, l)| *l);
+        let configured = replicas.len();
+        if !has_leader {
+            leaderless += 1;
+            println!("tablet {tablet} is LEADERLESS: gs={gs:?}");
+        } else if configured > 0 && gs.len() < configured {
+            under_replicated += 1;
+            println!(
+                "tablet {tablet} is UNDER-REPLICATED: configured={configured} gs.len()={} gs={gs:?}",
+                gs.len()
+            );
+        }
+    }
+    println!("down_count={down_count} leaderless={leaderless} under_replicated={under_replicated}");
+
+    // The killed original node is permanently `Down` (never decommissionable),
+    // so this is exactly the scenario `computeHealth()` must not gate on
+    // `down_count` for.
+    assert_eq!(down_count, 1, "the killed original node should read Down");
+    assert_eq!(
+        leaderless, 0,
+        "every tablet should have re-elected a leader by now"
+    );
+    assert_eq!(
+        under_replicated, 0,
+        "every tablet should be repaired back to its configured replica count"
+    );
+
+    for node in nodes {
+        node.shutdown();
+    }
+}
