@@ -96,6 +96,13 @@ pub(crate) struct CpRaftView {
     /// so double-counts a co-resident sibling tablet (e.g. right after a
     /// split). Always `Some` — both backends can be scanned.
     pub(crate) key_count: Option<usize>,
+    /// This tablet's exact, `StorageScope`-scoped total byte size (sum of
+    /// `key.len() + value.len()` over the same `local_pairs` scan `key_count`
+    /// reads — no extra engine call) — the ADR 0034 dual of `key_count`:
+    /// distinct from the cheap, non-materializing estimate `auto_split_loop`
+    /// gates on (`CpGroup::approx_bytes`), which is scoped but approximate.
+    /// Always `Some` — both backends can be scanned.
+    pub(crate) byte_size: Option<u64>,
 }
 
 /// Accept loop for the admin HTTP endpoint. One task per connection; HTTP/1.1

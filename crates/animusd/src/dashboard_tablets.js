@@ -1,14 +1,16 @@
 "use strict";
 // The Tablets view: a filterable list (by table, by derived status) with
-// replica-role dots, current leader, estimated key count (with the
-// over-auto-split-threshold indicator), and status. Clicking a row opens a
-// right-side detail panel: raft group members (from data already fetched)
-// plus storage-engine stats fetched on demand from a single node
-// (/admin/storage/lsm) only for the selected tablet's leader — not for every
-// row. No election-history section: this codebase tracks only current Raft
-// state, not a history of leadership transitions. Depends on
-// `dashboard_core.js` (STATE, $, esc, pill, dot, getJSON, nodeRaftkvId,
-// cpGroupsByTablet, autoSplitThreshold, tabletStatus, tokenBound, gotoStorage).
+// replica-role dots, current leader, exact live key count and byte size (ADR
+// 0034 — each with its own over-auto-split-threshold indicator, since either
+// `--auto-split K` or `--auto-split-bytes B` independently fires a split), and
+// status. Clicking a row opens a right-side detail panel: raft group members
+// (from data already fetched) plus storage-engine stats fetched on demand
+// from a single node (/admin/storage/lsm) only for the selected tablet's
+// leader — not for every row. No election-history section: this codebase
+// tracks only current Raft state, not a history of leadership transitions.
+// Depends on `dashboard_core.js` (STATE, $, esc, pill, dot, getJSON,
+// humanBytes, nodeRaftkvId, cpGroupsByTablet, autoSplitThresholds,
+// tabletStatus, tokenBound, gotoStorage).
 
 let tbTableFilter = "all";
 let tbStatusFilter = "all";
@@ -20,7 +22,7 @@ function renderTablets() {
   const tablets = (status && status.tablets) || {};
   const ids = Object.keys(tablets).map(Number).sort((a, b) => a - b);
   const groups = cpGroupsByTablet();
-  const threshold = autoSplitThreshold();
+  const thresholds = autoSplitThresholds();
 
   $("tb-count").textContent = `${ids.length} tablet(s)`;
 
@@ -46,10 +48,19 @@ function renderTablets() {
     const lead = gs.find((x) => x.g.is_leader);
     const st = tabletStatus(t, gs);
     const keyCount = lead && lead.g.key_count != null ? lead.g.key_count : null;
-    const overThreshold = keyCount != null && threshold != null && keyCount > threshold;
+    const byteSize = lead && lead.g.byte_size != null ? lead.g.byte_size : null;
+    const keyOver = keyCount != null && thresholds.keys != null && keyCount > thresholds.keys;
+    const byteOver = byteSize != null && thresholds.bytes != null && byteSize > thresholds.bytes;
+    // Both triggers are independent (ADR 0034 — either exceeding its own
+    // threshold fires a split, mirroring `auto_split_loop`'s OR gate), so each
+    // column gets its own over-threshold pill rather than one dimension
+    // silently masking the other.
     const keysCell = keyCount == null
       ? `<span class="muted">—</span>`
-      : `${esc(keyCount.toLocaleString())}` + (overThreshold ? " " + pill("under-replicated", "over " + threshold.toLocaleString()) : "");
+      : `${esc(keyCount.toLocaleString())}` + (keyOver ? " " + pill("under-replicated", "over " + thresholds.keys.toLocaleString()) : "");
+    const sizeCell = byteSize == null
+      ? `<span class="muted">—</span>`
+      : `${esc(humanBytes(byteSize))}` + (byteOver ? " " + pill("under-replicated", "over " + humanBytes(thresholds.bytes)) : "");
     const replicaDots = (t.replicas || []).map((rid) => {
       const g = gs.find((x) => nodeRaftkvId(x.node) === rid);
       const cls = g ? (g.g.is_leader ? "ok-dot" : "dim-dot") : "bad-dot";
@@ -60,13 +71,14 @@ function renderTablets() {
       <td class="mono">${esc(id)}</td>
       <td>${t.table ? esc(t.table) : `<span class="muted">—</span>`}</td>
       <td class="mono">${keysCell}</td>
+      <td class="mono">${sizeCell}</td>
       <td class="mono">${lead ? `node ${esc(nodeRaftkvId(lead.node))}` : `<span class="muted">—</span>`}</td>
       <td><span class="replica-dots">${replicaDots}</span></td>
       <td>${pill(st, st)}</td>
     </tr>`;
   }).join("");
   $("tb-body").innerHTML = bodyRows ? `<table>
-    <thead><tr><th>Tablet</th><th>Table</th><th>Keys</th><th>Leader</th><th>Replicas</th><th>Status</th></tr></thead>
+    <thead><tr><th>Tablet</th><th>Table</th><th>Keys</th><th>Size</th><th>Leader</th><th>Replicas</th><th>Status</th></tr></thead>
     <tbody>${bodyRows}</tbody></table>` : `<div class="empty">no tablets match this filter</div>`;
 
   document.querySelectorAll("#tb-body tr[data-id]").forEach((tr) =>
