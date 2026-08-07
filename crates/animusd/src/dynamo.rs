@@ -66,7 +66,12 @@
 //! (replicated, above) reach every node the same way regardless; a node whose
 //! registry doesn't yet have an index's entry data lazily backfills it on the
 //! first query against that index (`backfill_index_if_needed`), so a
-//! cross-node index query is correct without a shared in-memory registry.
+//! cross-node index query is correct without a shared in-memory registry. A
+//! write racing the backfill's base-table scan is never lost: the backfill
+//! replay consults `SchemaRegistry::touched_since_backfill` and skips any key a
+//! real `note_put`/`note_delete` already handled more recently than the scan
+//! read it, so it never overwrites an already-correct index entry with a stale
+//! scanned one.
 //!
 //! ## Query, Scan, and secondary indexes
 //!
@@ -930,10 +935,15 @@ async fn run_index_query(
 /// the table, so the whole table is then marked backfilled).
 ///
 /// The scan runs without the registry lock (it is a network read); a write that
-/// lands between the scan and the replay may be replayed with its pre-scan
-/// attributes — the same last-writer-wins imprecision any observed-write index
-/// has, acceptable for this best-effort edge structure (the base item, quorum-read
-/// afterwards, is always the source of truth for the returned data).
+/// lands between the scan and the replay would otherwise be replayed with its
+/// pre-scan (stale) attributes, silently reverting the concurrent write's own
+/// already-correct index update. `SchemaRegistry::touched_since_backfill` closes
+/// this: a real `note_put`/`note_delete` for a key marks it, and the replay below
+/// skips any such key rather than overwriting it with the stale scanned value —
+/// so a write racing the backfill is never lost from (or duplicated in) the
+/// index, only a genuinely untouched key is seeded from the scan. (The base item,
+/// quorum-read afterwards, remains the source of truth for the returned data
+/// regardless — this only protects the index's own bookkeeping.)
 async fn backfill_index_if_needed(
     ctx: &ClientCtx,
     table: &str,
@@ -965,7 +975,11 @@ async fn backfill_index_if_needed(
     for (key, value) in &pairs {
         // DynamoDB tombstone values decode to `None` — logically absent, skipped.
         if let Some(item) = wire::decode_stored_item(value)? {
-            let _ = reg.note_put(table, key, &item);
+            // A real write already handled this key more recently than our scan
+            // read it — applying our stale value here would revert it.
+            if !reg.touched_since_backfill(table, key) {
+                let _ = reg.note_put(table, key, &item);
+            }
         }
     }
     reg.mark_table_backfilled(table);

@@ -164,14 +164,33 @@ adapter wedge. The transport (HTTP, sockets) and the distributed routing live in
   per request (no batch atomicity); `TransactWriteItems` applies condition-gated
   `Put`/`Delete`/`Update`/`ConditionCheck` in order — **honoring each condition
   but without cross-action rollback** (true ACID via Accord, ADR 0011, is deferred).
+- **Secondary-index *entry data* is edge-local, not replicated — but is no
+  longer silently incomplete after a restart or on a node that missed the
+  writes.** The GSI/LSI *definitions* live in the control plane's replicated
+  catalog (ADR 0013 — `sync_indexes` rebuilds the edge machinery from them);
+  the index *entries* themselves stay in-memory, maintained by `note_put`/
+  `note_delete` on observed writes, and each index carries a `backfilled` flag
+  (`false` on fresh/shape-changed machinery). `animusd`'s
+  `backfill_index_if_needed` closes the gap lazily, on the first query against
+  such an index: one base-table scan (the same native range scan `Query`/`Scan`
+  use) replayed through `note_put`, then `mark_table_backfilled` — so a
+  restarted node or a node that never observed the writes still returns
+  complete GSI/LSI results (`animusd/tests/dynamo_schema.rs`
+  `create_table_index_survives_node_restart` /
+  `create_table_index_replicates_to_second_node`). A write racing the backfill's
+  scan (which runs without the registry lock) cannot be silently reverted:
+  `SchemaRegistry::touched_since_backfill` tracks keys a real `note_put`/
+  `note_delete` already handled since the backfill became pending, and the
+  replay skips them rather than reapplying its own (possibly stale) scanned
+  value (`registry.rs`
+  `racing_write_during_backfill_is_not_reverted_by_the_stale_replay`). (Base
+  `Query`/`Scan` no longer track keys at all — they use the data plane's native
+  quorum range scan; only an *index* query still needs this edge-local
+  bookkeeping, since a range scan can't serve an index's alternate key
+  ordering.)
 - **Still deferred** (don't represent as a full adapter): truly atomic
   `TransactWriteItems`, `BatchGetItem`, list-index document paths (`a[0]`),
-  `ADD`/`DELETE` `UpdateExpression` arithmetic, and durable/replicated
-  **secondary-index *entry data*** (the GSI/LSI *definitions* now live in the
-  control plane's replicated catalog per ADR 0013 — `sync_indexes` rebuilds the
-  edge machinery from them — but the index *entries* themselves stay in-memory,
-  rebuilt from observed writes). (Base `Query`/`Scan` no longer track keys —
-  they use the data plane's native quorum range scan.) The
+  `ADD`/`DELETE` `UpdateExpression` arithmetic. The
   `Scan`/`Query` `FilterExpression` reuses the `ConditionExpression` predicate
   subset (`attribute_exists`/`attribute_not_exists`/`a = :v`), not the fuller
   filter grammar. `animus-cql` would map onto the same core the same way.

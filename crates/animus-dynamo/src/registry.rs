@@ -4,8 +4,15 @@
 //!
 //! The registry is a **pure, deterministic** in-memory map (`BTreeMap` only — no
 //! `HashMap`, per ADR 0003). `animusd` holds one instance behind a lock at its
-//! HTTP edge; **it is not durable** — schemas (and the key index below) are lost
-//! on restart. Persisting them through the control plane is future work.
+//! HTTP edge; **this in-memory copy is not itself durable** — but the *table
+//! key schema* and each secondary index's *definition* are (ADR 0013): they
+//! live in the control plane's replicated `Metadata` catalog, and `animusd`
+//! rebuilds this registry's schema/index-definition mirror from that catalog
+//! on every read/write path (`sync_indexes`), so a restart or a node that never
+//! saw the `CreateTable` still knows the shape. Only the secondary-index
+//! **entry data** below is genuinely edge-local — see `backfilled`/
+//! `touched_since_backfill`, and `animusd`'s `backfill_index_if_needed`, for
+//! how a restarted/uninformed node still gets complete index results.
 //!
 //! ## What `note_put` / `note_delete` maintain
 //!
@@ -15,9 +22,10 @@
 //! edge), reading live storage in key order. The registry only maintains the
 //! **secondary-index** entries below: `note_put` adds each declared index's entry
 //! for an item and `note_delete` drops it. A table with no secondary indexes makes
-//! both a no-op. The index being in-memory (rebuilt only by observed writes) is
-//! the same non-durability caveat as the schema map; durable/replicated index
-//! state is future work.
+//! both a no-op. This entry data is in-memory and rebuilt from observed writes —
+//! `animusd` backfills it lazily from a base-table scan on the first query
+//! against a freshly (re)created index, rather than leaving it silently
+//! incomplete (see `backfilled` on [`IndexState`]).
 //!
 //! ## Secondary indexes (GSI + LSI)
 //!
@@ -146,6 +154,22 @@ struct TableState {
     sort_key_optional: bool,
     /// Declared secondary indexes, by index name.
     indexes: BTreeMap<String, IndexState>,
+    /// Base storage keys touched by a **real** `note_put`/`note_delete` while any
+    /// index of this table still needs a backfill (ADR 0013). The edge's lazy
+    /// restart backfill (`animusd::dynamo::backfill_index_if_needed`) scans the
+    /// base table **without holding this registry's lock**, so a concurrent write
+    /// can land — and correctly index itself via its own `note_put` — *after* the
+    /// scan already captured that key's pre-write value but *before* the backfill
+    /// replay applies it. Without this guard the replay would overwrite the
+    /// already-correct entry with the stale scanned one (a real write's index
+    /// update silently reverted). The backfill replay consults
+    /// [`SchemaRegistry::touched_since_backfill`] and skips any key found here —
+    /// a real `note_put`/`note_delete` is always more authoritative than a replay
+    /// of a scan taken before it landed. Cleared by
+    /// [`SchemaRegistry::mark_table_backfilled`] (nothing to track once every
+    /// index is caught up), so this stays bounded to the — normally brief —
+    /// window one backfill is in flight, not the table's whole lifetime.
+    touched_since_backfill: BTreeSet<Vec<u8>>,
 }
 
 /// A single secondary index's declaration plus its index entries.
@@ -293,6 +317,7 @@ impl SchemaRegistry {
                 schema,
                 sort_key_optional,
                 indexes,
+                touched_since_backfill: BTreeSet::new(),
             },
         );
         Ok(())
@@ -440,6 +465,12 @@ impl SchemaRegistry {
             index.entries.insert(entry.clone());
             index.entry_by_base.insert(key.to_vec(), entry);
         }
+        // Record this key as authoritatively handled for as long as a backfill is
+        // pending, so a racing backfill replay (see `touched_since_backfill`'s doc)
+        // never clobbers it with stale scanned data.
+        if state.indexes.values().any(|idx| !idx.backfilled) {
+            state.touched_since_backfill.insert(key.to_vec());
+        }
         Ok(())
     }
 
@@ -458,6 +489,11 @@ impl SchemaRegistry {
             if let Some(stale) = index.entry_by_base.remove(key) {
                 index.entries.remove(&stale);
             }
+        }
+        // See `note_put`: a delete is just as authoritative as a put for keeping a
+        // racing backfill replay from resurrecting a stale entry for this key.
+        if state.indexes.values().any(|idx| !idx.backfilled) {
+            state.touched_since_backfill.insert(key.to_vec());
         }
         Ok(())
     }
@@ -479,12 +515,27 @@ impl SchemaRegistry {
     /// Mark **every** index of `table` as backfilled. Called by the edge after it
     /// replays a full base-table scan through [`note_put`](Self::note_put) — one
     /// scan populates all of the table's indexes, so they are all caught up.
+    /// Clears [`touched_since_backfill`](Self::touched_since_backfill)'s tracked
+    /// set: with no backfill left pending there is nothing left to protect against.
     pub fn mark_table_backfilled(&mut self, table: &str) {
         if let Some(state) = self.tables.get_mut(table) {
             for index in state.indexes.values_mut() {
                 index.backfilled = true;
             }
+            state.touched_since_backfill.clear();
         }
+    }
+
+    /// Whether `key` was touched by a **real** `note_put`/`note_delete` while
+    /// `table` had a backfill pending — i.e. whether a backfill replay's own
+    /// (possibly stale) scanned value for `key` must be **skipped** rather than
+    /// applied. See the field doc on `TableState::touched_since_backfill` for the
+    /// race this closes. `false` for an unknown table (nothing to protect).
+    #[must_use]
+    pub fn touched_since_backfill(&self, table: &str, key: &[u8]) -> bool {
+        self.tables
+            .get(table)
+            .is_some_and(|t| t.touched_since_backfill.contains(key))
     }
 
     /// The base storage keys of items whose secondary `index` hash value equals
@@ -1027,6 +1078,117 @@ mod tests {
         reg.sync_indexes("users", TableSchema::simple("id"), &[email_composite])
             .unwrap();
         assert!(reg.index_needs_backfill("users", "by-email"));
+    }
+
+    /// A write racing a lazy backfill's base-table scan must not have its index
+    /// update silently reverted by the backfill's replay of a stale (pre-write)
+    /// scanned value. This reproduces the exact interleaving
+    /// `animusd::dynamo::backfill_index_if_needed` can hit in production: the
+    /// scan runs without the registry lock, so a concurrent write's own
+    /// `note_put` (reflecting the item's NEW value) can land before the backfill
+    /// replay (which only has the OLD, pre-write scanned value) reacquires the
+    /// lock. Without `touched_since_backfill` the replay would call `note_put`
+    /// with the stale value *after* the real write's, so the last write wins and
+    /// it is the stale one — the item would vanish from the GSI under its real,
+    /// current email and spuriously linger under the old one.
+    #[test]
+    fn racing_write_during_backfill_is_not_reverted_by_the_stale_replay() {
+        let mut reg = SchemaRegistry::new();
+        reg.create_table_with_indexes(
+            "users",
+            TableSchema::simple("id"),
+            vec![SecondaryIndex::Global(GlobalSecondaryIndex {
+                name: "by-email".into(),
+                key_attribute: "email".into(),
+                sort_attribute: None,
+                projection: IndexProjection::All,
+            })],
+        )
+        .unwrap();
+        let key = storage_key(&s("u1"), None);
+        // The base-table scan (taken before the race) observed the item with its
+        // OLD email — this is the value the backfill replay will (later) apply.
+        let scanned_old = item(&[("id", s("u1")), ("email", s("old@x"))]);
+
+        // The real write lands first (its own note_put, reflecting the item's
+        // CURRENT value) — e.g. an UpdateItem changed the email after the scan
+        // read its old value but before the backfill replay ran.
+        reg.note_put(
+            "users",
+            &key,
+            &item(&[("id", s("u1")), ("email", s("new@x"))]),
+        )
+        .unwrap();
+        assert_eq!(
+            reg.index_query_keys("users", "by-email", &s("new@x"), None)
+                .unwrap(),
+            vec![key.clone()],
+            "the real write must be indexed under its current email"
+        );
+
+        // The backfill replay now runs (a beat late): for every scanned key it
+        // must consult `touched_since_backfill` and skip re-applying a stale
+        // value for one the real write already handled.
+        assert!(
+            reg.touched_since_backfill("users", &key),
+            "the real write must mark this key as already handled"
+        );
+        if !reg.touched_since_backfill("users", &key) {
+            reg.note_put("users", &key, &scanned_old).unwrap();
+        }
+        reg.mark_table_backfilled("users");
+
+        // The item must still resolve under its real, current email — not the
+        // stale one the (correctly skipped) replay would have applied.
+        assert_eq!(
+            reg.index_query_keys("users", "by-email", &s("new@x"), None)
+                .unwrap(),
+            vec![key.clone()],
+            "a racing backfill replay must not revert a newer real write"
+        );
+        assert!(
+            reg.index_query_keys("users", "by-email", &s("old@x"), None)
+                .unwrap()
+                .is_empty(),
+            "the stale scanned value must never have been applied"
+        );
+
+        // Once backfilled, the tracking set is cleared — a later real write is
+        // unaffected (nothing left to protect against until the next backfill).
+        assert!(!reg.touched_since_backfill("users", &key));
+    }
+
+    /// The normal (non-racing) case: a key nobody wrote to during the backfill
+    /// window is seeded from the scan exactly as before — `touched_since_backfill`
+    /// must not suppress legitimate backfill of untouched keys.
+    #[test]
+    fn backfill_replay_still_seeds_untouched_keys() {
+        let mut reg = SchemaRegistry::new();
+        reg.create_table_with_indexes(
+            "users",
+            TableSchema::simple("id"),
+            vec![SecondaryIndex::Global(GlobalSecondaryIndex {
+                name: "by-email".into(),
+                key_attribute: "email".into(),
+                sort_attribute: None,
+                projection: IndexProjection::All,
+            })],
+        )
+        .unwrap();
+        let key = storage_key(&s("u1"), None);
+        assert!(!reg.touched_since_backfill("users", &key));
+        reg.note_put(
+            "users",
+            &key,
+            &item(&[("id", s("u1")), ("email", s("a@x"))]),
+        )
+        .unwrap();
+        reg.mark_table_backfilled("users");
+        assert_eq!(
+            reg.index_query_keys("users", "by-email", &s("a@x"), None)
+                .unwrap(),
+            vec![key]
+        );
     }
 
     #[test]

@@ -1636,6 +1636,49 @@ to the archive stays in place below.
   independent tables (`tests/decommission.rs` uses three, mirroring
   `tests/seed_join.rs`'s `TABLES`), so the pre-growth distribution is
   imbalanced enough to guarantee at least one move onto the new node.
+- **Before implementing a task framed as "close this documented gap," grep the
+  actual code — an ADR/CLAUDE.md's "still deferred"/"future work" language can
+  lag well behind a fix that already shipped.** Tasked with closing ADR 0013's
+  "index entry data isn't replicated, so a restarted/uninformed node's GSI
+  query silently returns incomplete results" gap, the lazy
+  backfill-from-base-table-scan design the task asked to *evaluate* had
+  already been implemented and end-to-end tested (`animusd`'s
+  `backfill_index_if_needed`/`SchemaRegistry::backfilled`, commit `46e25b5`) —
+  only the ADR's "Still deferred" section and the crate's own `CLAUDE.md` bullet
+  had never been updated to say so. Grepping for the gap's own likely
+  mechanism names (`backfill`, `sync_indexes`, the registry struct) before
+  writing new code turned "implement X" into "harden X's one remaining edge
+  case and fix the stale docs" — a much smaller, correct-scoped change than a
+  reimplementation would have been (and a reimplementation risks silently
+  reverting a previously-fixed bug the existing tests already guard).
+- **A lazy backfill that scans the base table *without holding* the
+  maintenance-state lock (so the scan doesn't stall concurrent writes) must
+  not let its replay blindly overwrite a key a real write already touched more
+  recently — the replay's snapshot is stale by construction.** The DynamoDB
+  GSI/LSI backfill (above) runs a network scan with the registry unlocked,
+  then replays every scanned `(key, value)` through `note_put` under the lock;
+  a concurrent write's own `note_put` (reflecting the item's *current* value)
+  can land in between, and since both calls target the same registry method,
+  whichever runs *last* wins — if that's the replay, it silently reverts the
+  real write's already-correct index entry to the pre-write value, with no
+  error and no signal that the write's index update was ever undone (the base
+  item stays correct; only the *index's* bookkeeping regresses, which is what
+  a later `Query` against the index reads). Fixed with
+  `SchemaRegistry::touched_since_backfill`: every `note_put`/`note_delete`
+  marks its key while a backfill is pending, and the replay skips any key
+  already found there rather than reapplying its own scanned value — so the
+  replay can only ever *seed* a key nobody has independently indexed
+  correctly, never *revert* one. Cleared on `mark_table_backfilled` so the
+  tracking set stays bounded to the (normally brief) in-flight window, not the
+  table's lifetime. General shape to watch for: any "scan without the lock,
+  then replay under the lock" pattern needs an explicit "was this touched
+  more recently than my scan" check before the replay writes anything, or a
+  race that regresses already-correct state passes silently (proven via a
+  deterministic *unit* test replaying the exact call order by hand — no
+  wall-clock timing needed to demonstrate a lock-ordering race like this one).
+  (`animus-dynamo::registry::{SchemaRegistry::touched_since_backfill,
+  TableState::touched_since_backfill}`; `animusd::dynamo::
+  backfill_index_if_needed`; ADR 0013.)
 
 ### Parallel-agent orchestration
 - **Partition work by disjoint crate ownership — exactly one owner per shared
