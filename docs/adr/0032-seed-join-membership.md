@@ -1,9 +1,8 @@
 # ADR 0032 — Seed/join membership: a replicated node address book, `animusd join`, and decommission
 
 - **Status:** Accepted — implemented incrementally (PR1: replicated node
-  address book; PR2: `animusd join`; PR3: decommission). **This document
-  covers the full 3-PR lifecycle design; PR1 and PR2 are landed. PR3
-  (decommission) is not yet implemented.**
+  address book; PR2: `animusd join`; PR3: decommission). **All three PRs are
+  landed.**
 - **Date:** 2026-08-07
 
 ## Context
@@ -208,23 +207,110 @@ status` against a grown node would have shown an empty cluster. Safe for
 pre-growth control nodes (genuine voters, where `effective_metadata` is a
 plain passthrough) — no mirror ever feeds another mirror.
 
-## Decision — PR3 (not yet implemented): decommission
+## Decision — PR3 (implemented): decommission
 
 `drain` (ADR 0020/0029) already marks a member `Leaving` and lets the
 placement reconciler + rebalancer + release-GC relocate every tablet off it
 with no new mechanism. PR3 adds the second half: once draining converges
 (no tablet still lists the member as a replica), an operator (or an
 automated follow-up action) proposes `MetaCommand::RemoveMember`, applied
-under three preconditions — the member exists, its status is
-`Leaving`/`Down` (never mid-service — removing an `Active` member could
-strand a tablet's replication factor with no warning), and no
-`Metadata.tablets[*].replicas` still names it (the same invariant `drain`'s
-own reconciliation is responsible for establishing first). On success the
-member is pruned from `Metadata.members`, and its entries in
+under three preconditions — enforced at **apply** time (`Metadata::apply`),
+not just by whichever caller proposed it, since a second racing proposer's
+propose-time view could be stale:
+
+- member **absent**: idempotent no-op (`ApplyOutcome::Applied`) — a retried
+  removal (e.g. the proposer's confirm timed out but the command actually
+  landed) converges instead of erroring;
+- member present but `status` is `Active`/`Joining`: **rejected** — removing
+  a still-serving member could strand a tablet's replication factor with no
+  warning;
+- `Metadata::tablets_referencing(node) > 0`: **rejected** — the member is
+  still a replica of some tablet, and removing it would drop that tablet
+  below its replication factor with the member gone from the placement
+  candidate pool entirely, with no repair path left (the same invariant
+  `drain`'s own reconciliation is responsible for establishing first).
+
+On success the member is pruned from `Metadata.members`, and its entries in
 `Metadata.node_addrs` and `Metadata.cp_member_addrs`/`cp_member_tablets` are
 pruned in the same apply (mirroring the existing ADR 0024 GC discipline for
 tablet-scoped `cp_member_addrs` entries — keyed on current absence so a
 replayed historical state can't resurrect a removed member).
+
+### The operator surface
+
+- `GET /admin/member/drain-status?node=<id>` — read-only, serves on any node
+  (`ClientCtx::effective_metadata()`, so it works on a growth node too):
+  `{node, status: "<NodeStatus>"|"absent", tablets_remaining: N}`. The poll
+  target for both a human operator and `animus admin decommission`.
+- `POST /admin/member/remove {node}` — `ClientCtx::admin_remove_member`.
+  **Local-control-leader-only, deliberately not relayed** — symmetric with
+  `admin_drain` (drain is also local-leader-only), not with the `Down`
+  add-member case's relay allowlisting: removing a member is a destructive,
+  rare operator action, so it must not silently reach the real leader
+  through a relay chain from a node that may not even know who leads. Two
+  refusals happen in `ClientCtx::admin_remove_member` **before ever
+  proposing** (friendlier than a bare Raft rejection string; `Metadata::
+  apply`'s own guard above remains the actual authority for a race between
+  two admin callers):
+  - `node`'s paired **control** id (`node - RAFTKV_ID_BASE`, guarded against
+    underflow) is one of this cluster's original control-plane ids: an
+    original control-core member must never be decommissioned this way — the
+    control Raft group is static (ADR 0030), this call only ever prunes
+    `Metadata.members` (it cannot remove a real control-group voter), and
+    `bootstrap` (idempotent) re-registers every control-core raftkv id
+    `Active` on its very next tick regardless, so "removing" one would just
+    be a no-op loop, not a real decommission.
+  - the member is not drained (still `Active`/`Joining`, or still referenced
+    by a tablet) — refused with the same drain-status counts, rather than a
+    bare Raft `"Rejected"` string.
+
+  Both refusals read this node's own local `Metadata` — which is only
+  guaranteed fresh (reflects the leader's own just-converged draining) on the
+  leader itself, since a follower's replica can genuinely lag the leader's
+  latest commit under load. So `admin_remove_member` checks **leadership
+  first**, before either refusal: on a non-leader, that returns the "retry on
+  the leader" routing error immediately, rather than risking a stale-replica
+  false "still referenced" refusal that would misdirect the operator instead
+  of pointing them at the leader. (Caught live: `tests/decommission.rs`'s
+  follower-refusal assertion flaked exactly this way under `cargo test
+  --workspace` load — the follower's own metadata hadn't yet replicated the
+  leader's release-GC completion at the instant the test called
+  `POST /admin/member/remove` there.)
+- `animus admin decommission <admin-addr> <node-id>` (the CLI, also `drain`,
+  `drain-status`, and `remove` as standalone subcommands): automates the
+  whole flow — `POST /admin/drain` → poll `drain-status` to convergence →
+  `POST /admin/member/remove` → print "removed; safe to stop the process".
+  `<admin-addr>` must be the control-plane **leader's** admin port, for the
+  same reason `drain`/`remove` alone must be — this command does not hunt
+  for the leader itself.
+
+### Removal is not a fence
+
+A removed node whose *process* keeps running stays removed: self-
+registration (`RegisterNodeAddrs` / `admin_add_member`) is a one-shot at
+process startup, never repeated, so nothing re-asserts the pruned member. But
+if that process — or a fresh one started at the same raftkv id — is
+**restarted**, it re-registers `Down` and rejoins exactly like a fresh join
+would: **removal followed by a restart is, by design, equivalent to a fresh
+rejoin at the same id** (`tests/decommission.rs` proves this — a rejoin at
+the same index with a fresh data dir succeeds and serves normally). This is
+intended join semantics, not a gap to close: the decommission flow's real
+last step is **stopping the process**, not the `RemoveMember` proposal
+itself — an operator (or `animus admin decommission`, which stops at
+"removed; safe to stop the process") must actually kill/not-restart the
+process for the decommission to be permanent.
+
+### Failure-detector cleanup
+
+`animus-control`'s `FailureDetector::forget` existed and was unit-tested
+since ADR 0012 but had no production caller until PR3: `detect_loop` (the
+leader's per-tick liveness driver) now prunes any tracked id no longer
+present in `Metadata.members` after reading membership each tick — bounding
+the detector's `last_seen` map across a cluster's lifetime as members come
+and go via decommission. This is belt-and-braces bounding, not a safety fix:
+`liveness_transitions`'s existing `members.get(&id)?` filter already stopped
+a removed member from ever being *proposed for* again, with or without this
+cleanup.
 
 ## Consequences
 
@@ -261,5 +347,24 @@ replayed historical state can't resurrect a removed member).
   different addresses fails with `AlreadyExists`, cluster unharmed), and
   rejoin (shut the joined node down, join again at the same
   index/addresses/dir, recovers and serves — no collision-guard error, since
-  an identical address book is a rejoin). PR3 (decommission) remains not yet
-  implemented.
+  an identical address book is a rejoin).
+- **PR3 landed** (2026-08-07): `MetaCommand::RemoveMember`,
+  `Metadata::tablets_referencing`, `GET /admin/member/drain-status`,
+  `POST /admin/member/remove`, `ClientCtx::admin_remove_member`, the
+  `FailureDetector::forget` production caller in `detect_loop`, and
+  `animus admin decommission`/`drain-status`/`remove`. One shape refinement
+  from this ADR's original PR3 sketch, found via the flake above:
+  `admin_remove_member` checks control-plane leadership **before** either
+  admin-layer refusal, not after — see the operator-surface bullet above.
+  `animus-control` unit tests
+  (`meta.rs`) cover the three apply-time preconditions + address-book
+  pruning + idempotent re-removal + additive-variant serde round-trip; a sim
+  test (`failure_detection.rs::removed_member_stops_being_tracked_by_the_detector`)
+  proves the detector stops tracking a removed member well inside its
+  natural timeout window (not just "eventually"). `tests/decommission.rs`
+  covers the full end-to-end operator flow (join a 4th node, drain it, poll
+  drain-status to convergence, remove it, confirm membership + address-book
+  pruning while the cluster keeps serving, stop its process, then rejoin at
+  the same index with a fresh dir — id reuse), plus all three refusal shapes
+  (an original control-core member, a still-`Active` member, and
+  `/admin/member/remove` posted to a follower's admin port).

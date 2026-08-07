@@ -1551,6 +1551,48 @@ to the archive stays in place below.
   old-producer's output, not just callers of the old propose function.
   (`animus-control::meta::NodeAddrs`/`RegisterNodeAddrs`; `animusd`
   `route_sync_loop`; `tests/cp_plane.rs::cp_member_addresses_register_and_replicate`.)
+- **In a multi-refusal admin action that is deliberately local-leader-only,
+  check leadership FIRST — every other refusal that reads local `Metadata`
+  is only trustworthy once leadership is confirmed, since a follower's
+  replica can genuinely lag the leader's own just-committed state.**
+  `ClientCtx::admin_remove_member` (ADR 0032 PR3 decommission) originally
+  checked "is the member drained" (via `self.raft.metadata()`) before
+  checking "am I the leader" (`self.edge.leader_handle()`) — reads that
+  happened to agree on the *leader* node (where `self.raft` and the leader
+  handle are the same underlying core), but on a **follower** under load a
+  just-converged release-GC move can still be in flight over Raft
+  replication, so the follower's own stale metadata reported "still
+  referenced by 1 tablet" instead of the intended "not the control-plane
+  leader; retry on the leader" routing error — the wrong refusal reaching the
+  operator, not a wrong *decision* (the follower correctly refused, just for
+  a misleading reason). Invisible in an isolated single-test run (no
+  contention, replication is near-instant); it flaked exactly once under
+  `cargo test --workspace`'s parallel load, the same class of timing hazard
+  the "flaky ProdEnv test is a real bug" rule already covers, just showing up
+  as a wrong error string rather than a wrong outcome. Fix: check leadership
+  before any metadata-dependent refusal, mirroring "resolve the authority
+  first, then ask it questions" — the same shape as checking `is_leader()`
+  before trusting a quorum-derived fact elsewhere in this codebase.
+  (`admin_remove_member`; `tests/decommission.rs`'s follower-refusal
+  assertion.)
+- **A rebalance-dependent test needs enough independent tablets that the
+  pre-growth cluster is *not already balanced* — one table can leave a
+  joined/grown node with zero replicas forever, not just an ambiguous
+  choice of which table to route through.** `rebalance_step` only proposes a
+  move while it improves the *global* `max − min` imbalance; with exactly
+  one table (one tablet, RF = the pre-growth node count) every pre-growth
+  node already holds exactly one replica and the joined node holds zero —
+  `max − min == 1`, already at the stopping condition, so the rebalancer
+  never moves anything and a test polling for "the joined node gained a
+  replica" times out completely (not flakily — every run). This is a
+  sharper version of the already-documented "the rebalancer converges the
+  *global* imbalance and makes no per-table promise" lesson (which is about
+  which table a test must route through once *some* replica has moved) —
+  the additional wrinkle is that with too few tablets, the imbalance can be
+  zero from the start and *no* replica ever moves. Fix: seed several
+  independent tables (`tests/decommission.rs` uses three, mirroring
+  `tests/seed_join.rs`'s `TABLES`), so the pre-growth distribution is
+  imbalanced enough to guarantee at least one move onto the new node.
 
 ### Parallel-agent orchestration
 - **Partition work by disjoint crate ownership — exactly one owner per shared

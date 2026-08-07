@@ -264,3 +264,80 @@ fn detection_is_reproducible_from_seed() {
     }
     assert_eq!(trace(0x5EED_FA11), trace(0x5EED_FA11));
 }
+
+/// ADR 0032 PR3: once a member is pruned from `Metadata.members` via
+/// `RemoveMember`, `detect_loop` stops *tracking* it (`FailureDetector::forget`'s
+/// first production caller) — not just stops proposing for it (the
+/// `members`-presence filter in `liveness_transitions` already guaranteed
+/// that, with or without this fix).
+///
+/// The teeth: `believes_alive`/`is_alive` reads purely off the detector's own
+/// `last_seen` — an *untracked* member reports dead unconditionally, but a
+/// *tracked* one reports alive for the rest of `DETECT_TIMEOUT` after its last
+/// heartbeat, however stale. So a member whose heartbeats stop right as it is
+/// removed would, **without** the fix, still read `believes_alive == true` for
+/// the remainder of that window (stale-but-recent `last_seen`); **with** the
+/// fix, `detect_loop`'s very next tick sees it missing from `members` and
+/// forgets it, so it reads `false` immediately — well before the natural
+/// timeout would have made it look dead anyway. Checking deep inside that
+/// window (not after it) is what makes this a fix-specific regression, not
+/// just "eventually it looks dead".
+#[test]
+fn removed_member_stops_being_tracked_by_the_detector() {
+    let (mut sim, nodes) = cluster(0xDEC0_FF11);
+    sim.run_for(Duration::from_secs(2));
+    let leader = leader_among(&nodes, &[0, 1, 2]);
+
+    // One data member, Active, with no tablet ever placed on it — trivially
+    // "unreferenced" so it's removable the instant it's drained.
+    let (node, region, zone) = DATA_NODES[0];
+    assert!(matches!(
+        nodes[leader].propose(MetaCommand::UpsertMember {
+            node,
+            labels: labels(region, zone),
+            status: NodeStatus::Active,
+        }),
+        ProposeResult::Accepted { .. }
+    ));
+
+    // Let it heartbeat and settle: the leader's detector genuinely tracks it.
+    sim.run_for(Duration::from_secs(1));
+    assert!(
+        nodes[leader].believes_alive(node),
+        "member should be alive after heartbeating"
+    );
+
+    // Decommission: stop its heartbeats (a real decommission's last step is
+    // stopping the process), then drain + remove it. `RemoveMember`'s
+    // apply-time guard requires the member to already be Leaving/Down and
+    // unreferenced by any tablet — both true here.
+    sim.crash(node);
+    assert!(matches!(
+        nodes[leader].propose(MetaCommand::UpsertMember {
+            node,
+            labels: labels(region, zone),
+            status: NodeStatus::Down,
+        }),
+        ProposeResult::Accepted { .. }
+    ));
+    assert!(matches!(
+        nodes[leader].propose(MetaCommand::RemoveMember { node }),
+        ProposeResult::Accepted { .. }
+    ));
+
+    // Advance just enough sim time for both commands to commit/apply and for
+    // `detect_loop` to tick at least once (DETECT_INTERVAL = 100ms) — kept
+    // well under DETECT_TIMEOUT (500ms) from the member's last heartbeat, so
+    // a naturally-expired timeout can't be mistaken for the fix.
+    sim.run_for(Duration::from_millis(300));
+
+    assert!(
+        !nodes[leader].metadata().members.contains_key(&node),
+        "member should be gone from Metadata after RemoveMember"
+    );
+    assert!(
+        !nodes[leader].believes_alive(node),
+        "the detector should have forgotten the removed member immediately, \
+         well before its natural DETECT_TIMEOUT would have elapsed"
+    );
+}
