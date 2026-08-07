@@ -2,11 +2,16 @@
 //! ferries time and messages between the network and the synchronous
 //! [`RaftCore`].
 
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use animus_env::{Env, EnvExt, Metric, MetricsHandle, NodeId};
 use futures::future::{Either, select};
+use futures::task::AtomicWaker;
 
 use crate::detector::FailureDetector;
 use crate::meta::{Member, MetaCommand, Metadata, NodeStatus};
@@ -62,6 +67,92 @@ const DETECT_INTERVAL: Duration = Duration::from_millis(100);
 /// and the gate is purely `Env`-time based, so it stays deterministic.
 const LEADER_GRACE: Duration = DETECT_TIMEOUT;
 
+/// Executor-agnostic "applied index advanced" notification (ADR 0031 §trigger):
+/// lets a caller (the future per-node `TabletHostReconciler`) react to a
+/// `Metadata` change as soon as it becomes visible, instead of polling on a
+/// fixed timer. A cloneable handle — every clone observes the same underlying
+/// cursor — but, mirroring `animus-cp-data`'s `ProposeSignal`, it is built for
+/// a **single** parked waiter at a time: `AtomicWaker` only remembers the most
+/// recently registered waker, so a second concurrent call to
+/// [`changed`](MetadataWatch::changed) would starve the first. That is exactly
+/// the shape ADR 0031 needs (one reconciler task per node).
+///
+/// No tokio-only primitive (`Notify`/`watch`) is used, so this is fully
+/// `SimEnv`-deterministic: a synchronous `wake()` marks the parked task ready
+/// for the next run-loop poll, with no wall clock involved. It works
+/// identically over a real tokio `ProdEnv`.
+#[derive(Clone, Default)]
+pub struct MetadataWatch(Arc<MetadataWatchInner>);
+
+#[derive(Default)]
+struct MetadataWatchInner {
+    /// The highest applied index the driver has observed becoming
+    /// client-visible — i.e. `RaftCore::last_applied()` sampled at exactly the
+    /// points the driver's own durable-before-visible gate
+    /// (`min(commit_index, durable_index)` on the leader, `commit_index` on a
+    /// follower — see `raft.rs::apply`) can move. Monotonic: only ever raised.
+    applied: AtomicU64,
+    /// The most recently parked waiter's waker (if any).
+    waker: AtomicWaker,
+}
+
+impl MetadataWatch {
+    /// The latest applied index this watch has observed, without waiting.
+    #[must_use]
+    pub fn latest(&self) -> u64 {
+        self.0.applied.load(Ordering::Acquire)
+    }
+
+    /// Resolves once the driver's applied index exceeds `last_seen`, yielding
+    /// the new value.
+    ///
+    /// Unlike a one-shot flag (`ProposeSignal`'s shape), this is a plain
+    /// watermark re-checked fresh on every poll — so there is no
+    /// wake-before-park race to lose: if the index already advanced past
+    /// `last_seen` before this future is even created, the very first poll
+    /// resolves immediately.
+    pub fn changed(&self, last_seen: u64) -> MetadataChanged<'_> {
+        MetadataChanged {
+            watch: self,
+            last_seen,
+        }
+    }
+
+    /// Raise the watermark to `index` (a no-op if `index` is not an advance —
+    /// e.g. a stale call from a driver iteration that changed nothing) and
+    /// wake a parked waiter only when it actually moved. Called by the driver
+    /// wherever a flush could have advanced client-visible state.
+    fn bump(&self, index: u64) {
+        let prev = self.0.applied.fetch_max(index, Ordering::AcqRel);
+        if index > prev {
+            self.0.waker.wake();
+        }
+    }
+}
+
+/// The future returned by [`MetadataWatch::changed`].
+pub struct MetadataChanged<'a> {
+    watch: &'a MetadataWatch,
+    last_seen: u64,
+}
+
+impl Future for MetadataChanged<'_> {
+    type Output = u64;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<u64> {
+        // Register before checking — the `AtomicWaker` discipline that avoids
+        // a lost wakeup: if `bump` races in right after our check but before
+        // we park, the freshly registered waker still catches it.
+        self.watch.0.waker.register(cx.waker());
+        let current = self.watch.0.applied.load(Ordering::Acquire);
+        if current > self.last_seen {
+            Poll::Ready(current)
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
 /// A running control-plane node. Cheap to clone; clones share one [`RaftCore`]
 /// and one [`FailureDetector`].
 #[derive(Clone)]
@@ -72,6 +163,10 @@ pub struct RaftNode<E: Env> {
     /// heartbeats; the `detect_loop` reads it and, when leader, proposes liveness
     /// transitions. Shared so both run against one view.
     detector: Arc<Mutex<FailureDetector>>,
+    /// Applied-index change notification (ADR 0031). Shared with the `drive`
+    /// loop, which is the sole writer (`bump`); `metadata_watch()` hands out
+    /// clones to read/wait on it.
+    watch: MetadataWatch,
     /// Observability sink (ADR 0015). The driver loops record control-plane
     /// counters into it (elections, append-entries, snapshot installs, failure
     /// detector transitions) and keep the leadership gauge current. Cheap to
@@ -107,10 +202,12 @@ impl<E: Env> RaftNode<E> {
             env.next_u64(),
         )));
         let detector = Arc::new(Mutex::new(FailureDetector::new(DETECT_TIMEOUT)));
+        let watch = MetadataWatch::default();
         let node = Self {
             env: env.clone(),
             core: Arc::clone(&core),
             detector: Arc::clone(&detector),
+            watch: watch.clone(),
             metrics: metrics.clone(),
         };
         env.spawn_task(drive(
@@ -119,6 +216,7 @@ impl<E: Env> RaftNode<E> {
             Arc::clone(&detector),
             all_nodes,
             metrics.clone(),
+            watch,
         ));
         // The placement reconciler runs alongside the driver; it only ever
         // *proposes* on the core (no I/O of its own), and proposals are honored
@@ -166,6 +264,15 @@ impl<E: Env> RaftNode<E> {
     /// This node's environment handle.
     pub fn env(&self) -> &E {
         &self.env
+    }
+
+    /// A cloneable handle to this node's applied-index watch (ADR 0031): call
+    /// [`MetadataWatch::changed`] to be notified as soon as `metadata()` could
+    /// have changed, instead of polling on a fixed timer. See [`MetadataWatch`]'s
+    /// doc for the single-waiter caveat.
+    #[must_use]
+    pub fn metadata_watch(&self) -> MetadataWatch {
+        self.watch.clone()
     }
 
     /// Whether this node currently believes it is leader.
@@ -292,6 +399,7 @@ async fn drive<E: Env>(
     detector: Arc<Mutex<FailureDetector>>,
     all_nodes: Vec<NodeId>,
     metrics: MetricsHandle,
+    watch: MetadataWatch,
 ) {
     // Recover from the WAL before serving anything.
     let bytes = env.read(WAL).await.unwrap_or_default();
@@ -301,10 +409,14 @@ async fn drive<E: Env>(
             RaftCore::recovered(env.node_id(), &all_nodes, state, env.now(), env.next_u64());
         *core.lock().expect("raft core poisoned") = recovered;
     }
+    // A restart can recover already-applied state (WAL replay); a watcher
+    // parked before the first loop iteration should see it too.
+    signal_metadata_watch(&core, &watch);
 
     loop {
         // Persist anything queued out-of-band (e.g. a client `propose`).
         flush_and_maybe_compact(&env, &core).await;
+        signal_metadata_watch(&core, &watch);
 
         let now = env.now();
         let deadline = core.lock().expect("raft core poisoned").next_deadline();
@@ -376,14 +488,30 @@ async fn drive<E: Env>(
 
         // Durability before action: persist (and fsync) the core's state changes
         // before sending the responses that depend on them (a granted vote, an
-        // acknowledged append).
+        // acknowledged append). This is also where a *leader's* durable-gated
+        // apply actually advances (`mark_durable_through`, inside `flush_wal`);
+        // a follower may have already applied on commit inside `handle` above
+        // (no durability gate there) — either way, `last_applied` here reflects
+        // everything this iteration could have made client-visible.
         flush_and_maybe_compact(&env, &core).await;
+        signal_metadata_watch(&core, &watch);
 
         for (to, msg) in outs {
             let bytes = serde_json::to_vec(&msg).expect("raft message serializes");
             env.send(to, bytes).await;
         }
     }
+}
+
+/// Notify any `metadata_watch()` waiter if the core's applied index has moved
+/// since it last observed one (ADR 0031). Cheap (one lock, one `fetch_max`);
+/// call this every time the driver's own actions could have advanced
+/// client-visible state — `bump` itself is a no-op (no wake) when nothing
+/// actually changed, so calling it defensively at multiple points in the loop
+/// costs nothing extra on the common "nothing changed" iteration.
+fn signal_metadata_watch(core: &Arc<Mutex<RaftCore>>, watch: &MetadataWatch) {
+    let applied = core.lock().expect("raft core poisoned").last_applied();
+    watch.bump(applied);
 }
 
 /// Record the metrics implied by the messages the core just emitted (ADR 0015):

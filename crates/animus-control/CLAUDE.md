@@ -112,6 +112,11 @@ epoch compare-and-swap transactions.
   `animusd` admin interface (ADR 0020): `role`/`term`/`leader`/`is_leader`/
   `commit_index`/`last_applied`/`durable_index`/`snapshot_index`/`log_len`/
   `last_log_index`/`config` (thin locks over the same-named `RaftCore` reads).
+  **`RaftNode::metadata_watch() -> MetadataWatch`** (ADR 0031 §trigger): an
+  executor-agnostic "applied index advanced" notification — the primitive a
+  future per-node reconciler (`animus-cp-data`'s `TabletHostReconciler`, PR4)
+  uses to react to a `Metadata` change immediately instead of polling on a
+  fixed timer. See "What's non-obvious" below for the disciplines.
 - `detector.rs` — `FailureDetector` (ADR 0012): a **pure**, unit-tested
   interval+timeout liveness detector — last-heartbeat instants + `now` + a
   `timeout` decide alive/dead. No clock, no RNG.
@@ -351,6 +356,32 @@ epoch compare-and-swap transactions.
   preserve this ordering — don't apply past `durable_index` *on the leader*.
 - Commit advances only for **current-term** entries via majority `matchIndex`
   (the Raft safety rule). Don't relax this.
+- **`MetadataWatch` (ADR 0031 §trigger)** is the same `AtomicWaker`-based
+  wake-a-parked-driver-task pattern `animus-cp-data`'s `ProposeSignal` uses for
+  wake-on-propose, adapted to notify an *external* caller rather than the
+  driver's own consensus loop. Two differences worth remembering if you touch
+  it or copy the pattern again: (1) it carries a **monotonic watermark**
+  (`AtomicU64`, the observed `last_applied()`), not a one-shot consumed flag —
+  `changed()`'s `poll` re-checks `current > last_seen` fresh every time rather
+  than swapping a bool to false, so there is no wake-before-park race to
+  reason about (a change that already happened before the future is even
+  polled resolves on that first poll, no registered wake required); (2) it is
+  bumped from the **driver loop** (`node.rs`'s `drive`), not from the proposer
+  — `signal_metadata_watch` is called after WAL recovery and after each of the
+  loop's two `flush_and_maybe_compact` calls, i.e. at exactly the points
+  `last_applied` (gated by the same durable-before-visible frontier
+  `metadata()` itself uses — `min(commit_index, durable_index)` on the leader,
+  `commit_index` on a follower) can have moved. `bump` is a `fetch_max` that
+  only wakes if the watermark actually advanced, so calling it defensively at
+  multiple points in the loop is free on the common no-op iteration. Like
+  `ProposeSignal`, it is **single-waiter** (one `AtomicWaker` remembers only
+  the most recently registered waker) — fine for its one intended consumer
+  (one per-node reconciler task), not a general broadcast primitive. Don't add
+  a propose-side wake here the way `animus-cp-data` did for its consensus
+  loop: unlike that case, a metadata-watch caller is only ever waiting to be
+  told when `metadata()` *could* reflect a change, and that visibility is
+  itself bound by the driver's own flush cadence — waking it any earlier
+  wouldn't make anything more visible sooner.
 - Snapshot transfer is **chunked** (see above). Deferred: cross-leader resumption
   (a transfer interrupted by a leader change restarts at offset 0) and chunk-stream
   flow-control.
@@ -405,5 +436,13 @@ same-seed byte-identical-snapshot reproducibility check), and **pre-vote**
 never changes the term, an expired lease grants, a timeout makes a `PreCandidate`
 without bumping the term; end-to-end under `SimEnv`: an isolated follower's
 pre-vote rounds don't move the stable leader's term and it rejoins on heal with no
-election, and a genuine leader crash still elects a new leader at a higher term).
+election, and a genuine leader crash still elects a new leader at a higher term),
+and the **applied-index watch** (`metadata_watch.rs`, ADR 0031 §trigger — a
+watcher parked on `MetadataWatch::changed` wakes with the new index once a
+proposal actually commits and applies; stays parked with no spurious wake
+across steady-state heartbeat/tick traffic when nothing was proposed; and
+resolves on its very first poll when the advance already happened before the
+watcher was even created — the wake-before-park case, safe by construction
+since `changed()` re-checks a monotonic watermark rather than consuming a
+one-shot flag).
 Use `run_for`, never `run()` (perpetual heartbeats).
