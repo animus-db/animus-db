@@ -42,7 +42,7 @@ use std::time::Duration;
 
 use animus_control::raft::{Out, RaftCore, RaftMsg, StateMachine};
 use animus_control::{PersistedState, ProposeResult};
-use animus_env::{Coresident, Env, EnvExt, Metric, MetricsHandle, NodeId};
+use animus_env::{Coresident, Env, EnvExt, Metric, MetricsHandle, NodeId, PRIMARY_STREAM};
 use animus_storage::{MergeOp, StorageEngine};
 use animus_tablet::KeyRange;
 use futures::future::{Either, select};
@@ -404,6 +404,14 @@ pub struct RaftKvNode<E: Env, S: StorageEngine> {
     /// `StorageScope::whole()` (the default for every existing constructor)
     /// makes every physical-key operation an identity transform.
     scope: StorageScope,
+    /// This group's network multiplexing key (ADR 0026 Stage B): every send/recv
+    /// goes out on `(peer, stream)`/`(self, stream)` instead of a peer's default
+    /// inbox. `PRIMARY_STREAM` (the default for every existing constructor) is
+    /// byte-for-byte today's behavior (`Env::send`/`recv` already forward to
+    /// `send_stream`/`recv_stream` with `PRIMARY_STREAM`). The seam a later PR
+    /// uses so several tablet groups can share one node's inbox (stream =
+    /// tablet id) instead of each minting a distinct `Coresident` sibling id.
+    stream: u64,
 }
 
 /// Invoked on a replica when it **applies** a committed `Split` (ADR 0017 D), with
@@ -434,6 +442,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             None,
             metrics,
             StorageScope::whole(),
+            PRIMARY_STREAM,
         )
     }
 
@@ -444,7 +453,33 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// was started with; `scope` is what keeps them from colliding.
     pub fn start_scoped(env: E, all_nodes: Vec<NodeId>, storage: S, scope: StorageScope) -> Self {
         let metrics = env.metrics();
-        Self::start_inner(env, all_nodes, storage, None, metrics, scope)
+        Self::start_inner(
+            env,
+            all_nodes,
+            storage,
+            None,
+            metrics,
+            scope,
+            PRIMARY_STREAM,
+        )
+    }
+
+    /// Like [`start_scoped`](Self::start_scoped), but the group also sends/recvs
+    /// on `stream` (ADR 0026 Stage B) instead of `PRIMARY_STREAM` — the seam that
+    /// lets several tablet groups share one **node id**'s inbox (multiplexed by
+    /// stream, typically the tablet id) instead of each minting a distinct
+    /// `Coresident` sibling id. Combined with a shared `storage` + distinct
+    /// `scope`s, this is the full "several tablets co-resident on one node"
+    /// shape a later PR wires into `animusd`'s real hosting path.
+    pub fn start_hosted(
+        env: E,
+        all_nodes: Vec<NodeId>,
+        storage: S,
+        scope: StorageScope,
+        stream: u64,
+    ) -> Self {
+        let metrics = env.metrics();
+        Self::start_inner(env, all_nodes, storage, None, metrics, scope, stream)
     }
 
     /// Like [`start`](Self::start), but records into the supplied `metrics` handle
@@ -464,6 +499,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             None,
             metrics,
             StorageScope::whole(),
+            PRIMARY_STREAM,
         )
     }
 
@@ -486,9 +522,11 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             Some(on_split),
             metrics,
             StorageScope::whole(),
+            PRIMARY_STREAM,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn start_inner(
         env: E,
         all_nodes: Vec<NodeId>,
@@ -496,6 +534,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         on_split: Option<SplitHook>,
         metrics: MetricsHandle,
         scope: StorageScope,
+        stream: u64,
     ) -> Self {
         let core = Arc::new(Mutex::new(RaftCore::new(
             env.node_id(),
@@ -529,6 +568,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             propose_signal: Arc::clone(&propose_signal),
             metrics: metrics.clone(),
             scope: scope.clone(),
+            stream,
         };
         // The consensus loop recovers from the WAL, then spawns the apply task
         // (so the apply task sees the recovered core + the correct
@@ -550,6 +590,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             propose_signal,
             metrics,
             scope,
+            stream,
         }));
         node
     }
@@ -1043,7 +1084,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         let probe = codec::encode_wire(&KvWire::ReadProbe { term, epoch });
         for &p in &self.all_nodes {
             if p != self.env.node_id() {
-                self.env.send(p, probe.clone()).await;
+                self.env.send_stream(p, self.stream, probe.clone()).await;
             }
         }
 
@@ -1864,6 +1905,7 @@ struct DriveState<E: Env, S: StorageEngine> {
     propose_signal: Arc<ProposeSignal>,
     metrics: MetricsHandle,
     scope: StorageScope,
+    stream: u64,
 }
 
 /// Idle back-off for the apply task: when there is nothing committed-and-durable to
@@ -1898,6 +1940,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         propose_signal,
         metrics,
         scope,
+        stream,
     } = st;
 
     let bytes = env.read(WAL).await.unwrap_or_default();
@@ -1969,7 +2012,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         // a freshly appended entry replicates at once (ADR 0017 single-write latency),
         // treated like an immediate heartbeat (`replicate_now`) rather than waiting
         // for the ~50ms tick.
-        let recv_or_timer = select(env.recv(), env.sleep(wait));
+        let recv_or_timer = select(env.recv_stream(stream), env.sleep(wait));
         let outs: Vec<(NodeId, KvWire)> = match select(
             ProposePending {
                 signal: &propose_signal,
@@ -2053,7 +2096,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         persist_wal(&env, &core, &wal_lock).await;
 
         for (to, wire) in outs {
-            env.send(to, codec::encode_wire(&wire)).await;
+            env.send_stream(to, stream, codec::encode_wire(&wire)).await;
         }
     }
 }
