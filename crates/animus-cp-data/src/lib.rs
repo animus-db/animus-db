@@ -197,6 +197,45 @@ impl StorageScope {
         range.contains(logical).then_some(logical)
     }
 
+    /// Whether `storage` currently holds any live data in this scope.
+    ///
+    /// On a *dedicated* (non-shared) engine, "does this tablet already have
+    /// data" (e.g. a real on-disk `LsmEngine`'s own version counter) is what
+    /// distinguishes a node **reforming** a group it already hosted before a
+    /// restart (start with the full voter config — it may need to elect
+    /// immediately) from one **joining fresh** as a reconciler-placed spare
+    /// (start as a quiet non-voter). On a *shared* engine there is no
+    /// per-tablet dedicated store left to ask, so this scoped presence check
+    /// is the direct replacement: it reads only this scope's own physical
+    /// range, never a sibling tenant's.
+    #[must_use]
+    pub async fn has_data<S: StorageEngine>(&self, storage: &S) -> bool {
+        let range = self
+            .range
+            .lock()
+            .expect("storage scope range poisoned")
+            .clone();
+        match &range.end {
+            Some(end) => {
+                let physical_start = self.physical(&range.start);
+                let physical_end = self.physical(end);
+                storage
+                    .scan(&physical_start, &physical_end)
+                    .await
+                    .map(|rows| !rows.is_empty())
+                    .unwrap_or(false)
+            }
+            // Open-ended range: no finite physical upper bound to scan, so
+            // fall back to the same whole-engine-then-filter shape `keys_from`/
+            // `engine_image` already use for the unbounded case.
+            None => storage
+                .entries()
+                .await
+                .map(|rows| rows.iter().any(|(k, _)| self.strip_in_range(k).is_some()))
+                .unwrap_or(false),
+        }
+    }
+
     /// If `physical_key` starts with this scope's `prefix` (regardless of
     /// `range`), the stripped logical key. Used only by the legacy
     /// Split/`SPLIT_BOUND_KEY` path (see the type doc's caveat).
