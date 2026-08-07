@@ -663,3 +663,117 @@ async fn admin_seed_writes_synthetic_keys() {
     .await
     .expect("test timed out");
 }
+
+/// Regression: `/admin/raftkv`'s `key_count` must be scoped to each tablet's own
+/// `StorageScope` range, not the shared engine's combined total. A node hosts
+/// more than one tablet on the same engine as soon as it hosts a split's parent
+/// + child (ADR 0028); before the fix, `key_count` read the whole shared engine
+/// (`CpGroup::approx_key_count`), so both halves' rows showed the *node's*
+/// combined total rather than their own subset.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn admin_raftkv_key_count_is_scoped_per_tablet_after_split() {
+    timeout(Duration::from_secs(60), async {
+        let dir = tempfile::tempdir().unwrap();
+        let (nodes, _config) = bring_up(3, dir.path()).await;
+        await_bootstrap(&nodes).await;
+
+        // Write 10 distinct keys to the single bootstrap tablet through the
+        // client API (forwarded to the CP leader as needed).
+        let mut stream = TcpStream::connect(nodes[0].client_addr())
+            .await
+            .expect("connect");
+        for i in 0..10u32 {
+            let key = format!("key{i:02}").into_bytes();
+            let value = format!("v{i}").into_bytes();
+            animusd::write_frame(
+                &mut stream,
+                &ClientRequest::Put {
+                    key,
+                    value,
+                    table: "kv".to_string(),
+                },
+            )
+            .await
+            .expect("send put");
+            let put: ClientResponse = read_frame(&mut stream)
+                .await
+                .expect("read reply")
+                .expect("a reply");
+            assert!(matches!(put, ClientResponse::PutOk), "put failed: {put:?}");
+        }
+
+        // Manually split the bootstrap tablet at the midpoint key (ADR 0028: a
+        // single atomic control-plane command, no separate data-plane step).
+        let admin_addr = nodes[0].admin_addr();
+        let (s, split) = admin(
+            admin_addr,
+            "POST",
+            "/admin/tablet/split",
+            Some(r#"{"tablet":1,"split_key":"key05"}"#),
+        )
+        .await;
+        assert_eq!(s, 200, "split committed: {split}");
+
+        // Wait for both halves to appear in the replicated tablet map.
+        timeout(Duration::from_secs(15), async {
+            loop {
+                if nodes.iter().all(|n| n.metadata().tablets.len() >= 2) {
+                    return;
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("split did not produce two tablets");
+
+        // Node 0 hosts both halves (RF == cluster size here). Poll
+        // `/admin/raftkv` until both groups report a `key_count`.
+        let counts: std::collections::BTreeMap<u64, u64> =
+            timeout(Duration::from_secs(15), async {
+                loop {
+                    let (_, raftkv) = admin_get(admin_addr, "/admin/raftkv").await;
+                    let groups = raftkv["groups"].as_array().cloned().unwrap_or_default();
+                    if groups.len() >= 2 && groups.iter().all(|g| g["key_count"].as_u64().is_some())
+                    {
+                        return groups
+                            .into_iter()
+                            .map(|g| {
+                                (
+                                    g["tablet"].as_u64().unwrap(),
+                                    g["key_count"].as_u64().unwrap(),
+                                )
+                            })
+                            .collect();
+                    }
+                    sleep(Duration::from_millis(100)).await;
+                }
+            })
+            .await
+            .expect("node 0 hosts both split halves with a key_count");
+
+        assert_eq!(
+            counts.len(),
+            2,
+            "node 0 hosts two distinct tablets after the split: {counts:?}"
+        );
+        let total: u64 = counts.values().sum();
+        assert_eq!(
+            total, 10,
+            "combined key_count across both tablets equals the 10 written keys: {counts:?}"
+        );
+        for (tablet, count) in &counts {
+            assert!(
+                *count < 10,
+                "tablet {tablet}'s key_count ({count}) must be its own scoped subset, \
+                 not the node's combined total of 10 keys across both co-resident tablets \
+                 (the regression this test guards against)"
+            );
+        }
+
+        for node in &nodes {
+            node.shutdown_graceful().await;
+        }
+    })
+    .await
+    .expect("test timed out");
+}

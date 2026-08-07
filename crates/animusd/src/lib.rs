@@ -246,10 +246,21 @@ impl CpGroup {
 
     /// This group's Raft state for the `/admin/raftkv` view. The two engine arms
     /// call the identical `RaftKvNode` accessors, so a local macro keeps it DRY.
-    fn raft_view(&self, tablet: TabletId) -> admin::CpRaftView {
+    /// `key_count` is this tablet's own **exact, `StorageScope`-scoped** count
+    /// ([`local_pairs`](Self::local_pairs)) — *not* the cheap, unscoped
+    /// [`approx_key_count`](Self::approx_key_count) estimate `auto_split_loop`
+    /// uses as a fast gate, which reads the whole shared engine and so reports
+    /// every co-resident tablet's combined count. A node hosts more than one
+    /// tablet on the same engine as soon as it hosts a split's parent + child
+    /// (ADR 0028), which is why the unscoped estimate showed a mid-split
+    /// tablet's row as the *node's* total rather than its own subset. This is a
+    /// debug surface, so the materialize-then-count cost is acceptable (mirrors
+    /// `local_scan`'s browse-keys view).
+    async fn raft_view(&self, tablet: TabletId) -> admin::CpRaftView {
         // Since ADR 0026 Stage B / ADR 0028 a tablet's CP group member id **is**
         // simply the base `raftkv` id — no more derived-id translation needed.
         let node = self.env().node_id();
+        let key_count = Some(self.local_pairs().await.len());
         macro_rules! view {
             ($n:expr) => {
                 admin::CpRaftView {
@@ -266,7 +277,7 @@ impl CpGroup {
                     snapshot_index: $n.snapshot_index(),
                     log_len: $n.log_len(),
                     voters: $n.config().into_iter().collect(),
-                    key_count: self.approx_key_count(),
+                    key_count,
                 }
             };
         }
@@ -360,6 +371,19 @@ impl CpGroup {
         match self {
             CpGroup::Lsm(n) => n.erase_scope().await,
             CpGroup::Mem(n) => n.erase_scope().await,
+        }
+    }
+
+    /// Narrow this group's own `StorageScope` range to `new_range` — the
+    /// per-node reaction a single-command split (ADR 0028) needs on the
+    /// **source** tablet's already-hosted replicas (the new sibling's scope is
+    /// simply constructed correctly at mint time via [`cp_join_host`]; the
+    /// source's pre-existing `RaftKvNode` scope is never touched otherwise).
+    /// See [`RaftKvNode::narrow_scope`].
+    fn narrow_scope(&self, new_range: KeyRange) {
+        match self {
+            CpGroup::Lsm(n) => n.narrow_scope(new_range),
+            CpGroup::Mem(n) => n.narrow_scope(new_range),
         }
     }
 }
@@ -1268,6 +1292,24 @@ impl ClusterEdgeState {
             .expect("raftkv handles poisoned")
             .get(&tablet)?
             .first()
+            .cloned()
+    }
+
+    /// **This node's own** registered handle for `tablet` — the one whose env
+    /// runs as group member `member` — without removing it (contrast
+    /// [`unregister_raftkv`](Self::unregister_raftkv)). Matched per member id
+    /// for the same reason as `unregister_raftkv`: in an in-process `--cluster
+    /// N` run this edge is **shared** across nodes, so `local_cp`'s "first
+    /// registered handle" can belong to a different node. Used by
+    /// `cp_join_host_loop` to re-narrow an already-hosted tablet's own
+    /// `StorageScope` after a split, without touching a sibling node's handle.
+    fn local_cp_member(&self, tablet: TabletId, member: NodeId) -> Option<CpGroup> {
+        self.raftkv
+            .lock()
+            .expect("raftkv handles poisoned")
+            .get(&tablet)?
+            .iter()
+            .find(|g| g.env().node_id() == member)
             .cloned()
     }
 
@@ -2479,6 +2521,19 @@ const CP_JOIN_HOST_INTERVAL: Duration = Duration::from_millis(250);
 /// `cp_join_host` layers it on top. Double-hosting is prevented **per node** by the
 /// `minted` claim set, not `edge.local_cp` (which is shared across nodes in an
 /// in-process `--cluster N` run).
+///
+/// **Also re-narrows an already-hosted tablet's `StorageScope` every tick.** A
+/// single-command split (ADR 0028) narrows the *source* tablet's range in
+/// replicated `Metadata`, but the source's `RaftKvNode` predates the split — its
+/// `StorageScope` was constructed once, at this loop's original join-host call,
+/// and nothing else in `animusd` ever updates it in place (only the new sibling
+/// gets a freshly-constructed, correctly-narrowed scope, via the normal
+/// join-host path below). Left alone, the source's already-hosted replica keeps
+/// serving/counting its pre-split range forever — visible e.g. as `/admin/raftkv`
+/// reporting the *pre-split* key count for the parent tablet after a split.
+/// `narrow_scope` is a cheap, idempotent mutex set, so calling it unconditionally
+/// on every tick (not just when the range actually changed — this loop has no
+/// cheap way to tell) is safe.
 async fn cp_join_host_loop(host: CpHostCtx) {
     loop {
         tokio::time::sleep(CP_JOIN_HOST_INTERVAL).await;
@@ -2495,11 +2550,15 @@ async fn cp_join_host_loop(host: CpHostCtx) {
             // reachable"). The minted set is genuinely per-node, so it dedups
             // correctly in both deployment modes. This stateful claim stays here — it
             // is not part of the pure decision.
-            {
+            let already_hosted = {
                 let mut h = host.minted.lock().expect("hosting set poisoned");
-                if !h.insert(tablet) {
-                    continue;
+                !h.insert(tablet)
+            };
+            if already_hosted {
+                if let Some(group) = host.ctx.edge.local_cp_member(tablet, host.base_id) {
+                    group.narrow_scope(t.range.clone());
                 }
+                continue;
             }
             cp_join_host(&host, tablet, &t, plan.initial_formation).await;
         }

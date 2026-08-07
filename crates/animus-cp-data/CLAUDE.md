@@ -252,12 +252,17 @@ the engine — the `AccordCore` sync-core/async-driver split.
   hosts one shared env (stream-addressed) and ADR 0028 gave every tablet on a
   node one shared `StorageEngine` (confined by its own `StorageScope`), a split
   needs no data-plane command at all: the control plane's `MetaCommand::
-  SplitTablet` (`animus-control`) narrows the source tablet's `StorageScope`
-  range and the new sibling's range starts already covering live data on the
-  *same* engine — no handoff, no new-group bootstrap message, nothing for this
-  crate to agree on. `animusd`'s per-node join-host loop then simply starts the
-  new tablet's `RaftKvNode` the same way it starts any fresh tablet. See
-  ADR 0028 and `animusd/CLAUDE.md` for the full mechanism and the calling side.
+  SplitTablet` (`animus-control`) narrows the source tablet's range in
+  replicated `Metadata`, and the new sibling's range starts already covering
+  live data on the *same* engine — no handoff, no new-group bootstrap message,
+  nothing for this crate to agree on. `animusd`'s per-node join-host loop then
+  simply starts the new tablet's `RaftKvNode` the same way it starts any fresh
+  tablet — **and, separately, must also call `RaftKvNode::narrow_scope` on the
+  source tablet's already-hosted `RaftKvNode`** (its `StorageScope` predates
+  the split and is otherwise never touched again; this was initially missed —
+  see the root `CLAUDE.md` Engineering Practices "cached per-node handle"
+  entry). See ADR 0028 and `animusd/CLAUDE.md` for the full mechanism and the
+  calling side.
   This history (in-band `Coresident` sibling minting, the split-hook
   recovery-idempotency story, the "a group can be split more than once"
   CAS-against-a-moving-boundary design, `SPLIT_BOUND_KEY`'s in-engine
