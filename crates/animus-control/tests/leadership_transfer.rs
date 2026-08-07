@@ -1,14 +1,24 @@
-//! Core-level tests for the leadership-transfer primitive (ADR 0029): the
-//! mechanism that lets a *healthy* replica move off the current leader of a
-//! Raft group, which `change_membership` alone cannot do (it always rejects
-//! removing the leader).
+//! Core-level tests for the leadership-transfer primitive (ADR 0029, hardened by
+//! the follow-up documented in the root CLAUDE.md engineering-practices
+//! section): the mechanism that lets a *healthy* replica move off the current
+//! leader of a Raft group, which `change_membership` alone cannot do (it
+//! always rejects removing the leader).
 //!
-//! Three pieces, each driven by hand-built `RaftCore`s (no driver, no sim) so
+//! Four pieces, each driven by hand-built `RaftCore`s (no driver, no sim) so
 //! the exact message sequence is deterministic and inspectable, mirroring
 //! `membership_commit_gate.rs`'s style:
-//!  - [`RaftCore::transfer_leadership`] only arms for a caught-up, current
-//!    voter, and `broadcast_append` retries the resulting `TimeoutNow` every
-//!    heartbeat until this node steps down;
+//!  - [`RaftCore::transfer_leadership`] arms for a *reasonably close*
+//!    (`peer_match >= commit_index`, not `== last_log_index` — see below),
+//!    current voter, and `broadcast_append` retries the resulting
+//!    `TimeoutNow` every heartbeat, but only **once the target has actually
+//!    caught up to `last_log_index`**, until this node steps down;
+//!  - while a transfer is armed, `propose`/`change_membership` freeze
+//!    (`NotLeader`) instead of growing the log — this is what lets a target
+//!    that is only "reasonably close" at arm time actually reach
+//!    `last_log_index` under sustained writes, instead of the log tip
+//!    perpetually running away from it;
+//!  - a transfer that is never completed (deadline passes with no step-down —
+//!    e.g. the target crashed after arming) aborts, resuming proposals;
 //!  - receiving [`RaftMsg::TimeoutNow`] makes a voter campaign **immediately**,
 //!    bypassing pre-vote (the live-leader lease would otherwise reject it) —
 //!    exactly one term bump, straight to `RequestVote`;
@@ -19,7 +29,7 @@
 use std::collections::BTreeSet;
 use std::time::Duration;
 
-use animus_control::{ProposeResult, RaftCore, RaftMsg, Role};
+use animus_control::{MetaCommand, ProposeResult, RaftCore, RaftMsg, Role};
 use animus_env::{Nanos, NodeId};
 
 const GROUP: [NodeId; 3] = [0, 1, 2];
@@ -93,13 +103,25 @@ fn ack_all(core: &mut RaftCore, from: NodeId) {
 #[test]
 fn transfer_leadership_rejects_self_a_laggard_and_a_non_member() {
     let mut core = elect_leader();
-    assert!(!core.transfer_leadership(0), "cannot transfer to self");
+    // Advance `commit_index` past 0 via an ack from node 2, while node 1 stays
+    // fully behind (match_index 0) — a genuine laggard under the arm gate
+    // (`peer_match(target) >= commit_index`, relaxed from `== last_log_index`
+    // so a target reasonably close — not necessarily bang up to date — is
+    // eligible; see `transfer_leadership_freezes_proposals_...` below for why
+    // that relaxation is safe).
+    ack_all(&mut core, 2);
     assert!(
-        !core.transfer_leadership(1),
-        "node 1 has not acked anything yet (match_index 0 < last_log_index 1)"
+        core.commit_index() > 0,
+        "sanity: commit should have advanced"
+    );
+
+    assert!(!core.transfer_leadership(0, NOW), "cannot transfer to self");
+    assert!(
+        !core.transfer_leadership(1, NOW),
+        "node 1 has not acked anything yet (match_index 0 < commit_index)"
     );
     assert!(
-        !core.transfer_leadership(99),
+        !core.transfer_leadership(99, NOW),
         "99 is not in the current configuration"
     );
 }
@@ -109,7 +131,7 @@ fn transfer_leadership_arms_a_caught_up_target_and_is_retried_every_heartbeat() 
     let mut core = elect_leader();
     ack_all(&mut core, 1); // commits the no-op + fully catches node 1 up
 
-    assert!(core.transfer_leadership(1));
+    assert!(core.transfer_leadership(1, NOW));
 
     let hb1 = after(NOW, Duration::from_millis(60));
     let outs1 = core.tick(hb1, 7);
@@ -137,11 +159,175 @@ fn transfer_leadership_arms_a_caught_up_target_and_is_retried_every_heartbeat() 
     );
 }
 
+/// The core of the fix (defect B): arming only requires `peer_match >=
+/// commit_index`, which under sustained writes can be well short of
+/// `last_log_index` — so `TimeoutNow` must not fire yet (the target would
+/// campaign on a stale log), and any further growth of the log must be
+/// refused so replication has a fixed target to catch the armed peer up to.
+#[test]
+fn transfer_leadership_freezes_proposals_and_waits_for_last_log_index_before_timeout_now() {
+    let mut core = elect_leader();
+    ack_all(&mut core, 1); // node 1 matches last_log_index (1) == commit_index (1)
+
+    // Grow the log past what node 1 has seen — it is now only caught up to
+    // `commit_index`, not `last_log_index`.
+    assert!(matches!(
+        core.propose(MetaCommand::NoOp),
+        ProposeResult::Accepted { .. }
+    ));
+    assert_eq!(core.last_log_index(), 2);
+    assert_eq!(core.peer_match(1), 1);
+    assert_eq!(core.commit_index(), 1, "the new entry isn't acked yet");
+
+    // Still armable: node 1 is caught up to commit_index (relaxed gate).
+    assert!(core.transfer_leadership(1, NOW));
+
+    // No TimeoutNow yet — node 1 hasn't reached last_log_index.
+    let hb1 = after(NOW, Duration::from_millis(60));
+    let outs1 = core.tick(hb1, 7);
+    assert!(
+        outs1
+            .iter()
+            .all(|(_, m)| !matches!(m, RaftMsg::TimeoutNow { .. })),
+        "must not TimeoutNow a target that hasn't reached last_log_index: {outs1:?}"
+    );
+    // The frozen leader must still replicate normally so node 1 can catch up.
+    let replicated_to_one = outs1.iter().any(|(to, m)| {
+        *to == 1 && matches!(m, RaftMsg::AppendEntries { entries, .. } if !entries.is_empty())
+    });
+    assert!(
+        replicated_to_one,
+        "a frozen leader must keep replicating the existing log tail: {outs1:?}"
+    );
+
+    // While armed, new proposals are rejected — the log must stop growing.
+    let rejected = core.propose(MetaCommand::NoOp);
+    assert!(
+        matches!(rejected, ProposeResult::NotLeader { leader: Some(1) }),
+        "propose must freeze (and hint the transfer target) while armed: {rejected:?}"
+    );
+    let rejected_cm = core.change_membership(set(&[0, 1]));
+    assert!(
+        matches!(rejected_cm, ProposeResult::NotLeader { leader: Some(1) }),
+        "change_membership must freeze while armed: {rejected_cm:?}"
+    );
+    assert_eq!(
+        core.last_log_index(),
+        2,
+        "a rejected propose must not have appended anything"
+    );
+
+    // Node 1 catches up to last_log_index (e.g. via the replication above).
+    ack_all(&mut core, 1);
+    assert_eq!(core.peer_match(1), 2);
+
+    let hb2 = after(hb1, Duration::from_millis(60));
+    let outs2 = core.tick(hb2, 7);
+    let sent = outs2
+        .iter()
+        .filter(|(to, m)| *to == 1 && matches!(m, RaftMsg::TimeoutNow { .. }))
+        .count();
+    assert_eq!(
+        sent, 1,
+        "TimeoutNow must fire once the target reaches last_log_index: {outs2:?}"
+    );
+}
+
+/// Defect fix: if the target never reaches `last_log_index` (so it never gets
+/// (or never acts on) `TimeoutNow` and never wins an election) — e.g. it
+/// crashed right after arming — the transfer must abort once its deadline
+/// passes, resuming proposals rather than stranding the group frozen forever.
+#[test]
+fn transfer_leadership_aborts_and_resumes_proposing_if_the_target_never_catches_up() {
+    let mut core = elect_leader();
+    // Arm before node 1 has acked anything: it is trivially caught up to
+    // `commit_index` (0, nothing committed yet) but not to `last_log_index`
+    // (1, the election no-op) — the "reasonably close but not there yet" case
+    // the relaxed gate is meant to admit, relying on replication (which never
+    // arrives here, as if node 1 crashed) to close the gap.
+    assert_eq!(core.commit_index(), 0);
+    assert!(core.transfer_leadership(1, NOW));
+
+    // Node 1 never acks (as if it crashed / is partitioned) — proposals stay
+    // frozen while ticks advance short of the deadline, and TimeoutNow must
+    // never fire (node 1 never reaches last_log_index).
+    let almost = after(NOW, Duration::from_millis(140));
+    let outs_almost = core.tick(almost, 7);
+    assert!(
+        outs_almost
+            .iter()
+            .all(|(_, m)| !matches!(m, RaftMsg::TimeoutNow { .. })),
+        "must never TimeoutNow a target that never reached last_log_index: {outs_almost:?}"
+    );
+    assert!(
+        matches!(
+            core.propose(MetaCommand::NoOp),
+            ProposeResult::NotLeader { .. }
+        ),
+        "still armed and frozen short of the deadline"
+    );
+
+    // Past one election timeout (150ms default) with no step-down: abort.
+    let past_deadline = after(NOW, Duration::from_millis(200));
+    let _ = core.tick(past_deadline, 7);
+    assert!(
+        core.is_leader(),
+        "aborting a transfer must not itself demote this node"
+    );
+    assert!(
+        matches!(
+            core.propose(MetaCommand::NoOp),
+            ProposeResult::Accepted { .. }
+        ),
+        "proposing must resume once the stalled transfer aborts"
+    );
+
+    // The stale target no longer receives TimeoutNow.
+    let hb = after(past_deadline, Duration::from_millis(60));
+    let outs = core.tick(hb, 7);
+    assert!(
+        outs.iter()
+            .all(|(_, m)| !matches!(m, RaftMsg::TimeoutNow { .. })),
+        "an aborted transfer must not keep sending TimeoutNow: {outs:?}"
+    );
+}
+
+/// Re-arming the same already-armed target (as a caller retrying every tick,
+/// e.g. `RaftKvNode::reconfigure_step`, would do) must not push the deadline
+/// out indefinitely — only a fresh arm starts a new deadline.
+#[test]
+fn re_arming_the_same_target_does_not_extend_the_deadline() {
+    let mut core = elect_leader();
+    ack_all(&mut core, 1);
+    assert!(core.transfer_leadership(1, NOW));
+
+    // Re-arm to the same target repeatedly, as if a caller polled every tick,
+    // right up to (but not past) the original deadline.
+    let mut t = NOW;
+    for _ in 0..4 {
+        t = after(t, Duration::from_millis(30));
+        assert!(core.transfer_leadership(1, t), "idempotent re-arm");
+    }
+    assert!(t.0 < NOW.0 + Duration::from_millis(150).as_nanos() as u64);
+
+    // Past the *original* deadline (one election timeout from the first arm at
+    // NOW), the transfer must still abort despite the repeated re-arms.
+    let past_original_deadline = after(NOW, Duration::from_millis(200));
+    let _ = core.tick(past_original_deadline, 7);
+    assert!(
+        matches!(
+            core.propose(MetaCommand::NoOp),
+            ProposeResult::Accepted { .. }
+        ),
+        "repeated re-arming of the same target must not starve the abort check"
+    );
+}
+
 #[test]
 fn transfer_leadership_does_not_survive_a_fresh_election_win() {
     let mut core = elect_leader();
     ack_all(&mut core, 1);
-    assert!(core.transfer_leadership(1));
+    assert!(core.transfer_leadership(1, NOW));
 
     // Deposed by a higher-term leader (node 2). The generic higher-term
     // step-down at the top of `handle` flips role/term before the message is

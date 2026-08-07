@@ -47,7 +47,16 @@ the engine — the `AccordCore` sync-core/async-driver split.
   right after a split narrows it) deterministic: two replicas at different
   points in observing the split's `Metadata` still make the identical
   accept/reject decision for the same log entry, because the decision travels
-  *with* the entry.
+  *with* the entry. **`RaftKvNode::scope_range()`** (additive accessor,
+  2026-08-07) is the read side: a point-in-time snapshot of the group's own
+  live `StorageScope` range, meant to be both (1) checked against a proposed
+  key **before** proposing (a pre-propose reject, not just relying on the
+  embedded fence — see `animusd/CLAUDE.md`'s CP-routing section for why the
+  pre-check is load-bearing, not redundant, given how `animusd` confirms a
+  write) and (2) stamped as that same proposal's `fence`. It was this
+  accessor's *absence* that had left the fences unwired in `animusd` for as
+  long as they existed — see the root `CLAUDE.md`'s entry on a safety
+  mechanism with zero production callers.
 - **Stream addressing** (ADR 0026 Stage B): `start_hosted(env, all_nodes,
   storage, scope, stream)` addresses a tablet's Raft traffic by `(node,
   stream)` (`env.send_stream`/`recv_stream`, `stream` = the tablet id) instead
@@ -249,6 +258,40 @@ the engine — the `AccordCore` sync-core/async-driver split.
     self-removal — transfer leadership (`RaftCore::transfer_leadership` /
     `RaftMsg::TimeoutNow`, `animus-control`) to a caught-up member of `desired`
     first, so the new leader performs the removal itself as an ordinary step.
+  - **A follow-up fix hardened three related defects in this sequence** (see the
+    root `CLAUDE.md` engineering-practices entry for the full writeup):
+    (A) step 4's selection (`peer_match(n) >= commit_index()`) and
+    `transfer_leadership`'s arm gate (`peer_match(target) == last_log_index()`)
+    used *different* thresholds — under sustained writes on a write-hot tablet
+    (`propose` is fire-and-forget, so `last_log_index` moves before any
+    replication round trip) the target was essentially always one entry short
+    of `last_log_index` at the sampling instant, so the arm silently failed
+    *forever*, and the discarded `bool` meant nothing surfaced it. Fixed by
+    relaxing the arm gate to `>= commit_index` (now consistent with the
+    selector) and having `propose`/`change_membership` **freeze** (`NotLeader`,
+    hinting the target) while a transfer is armed — the freeze is what lets a
+    target that is merely "caught up to commit" actually close the gap to
+    `last_log_index`, since new writes stop landing once armed;
+    `broadcast_append` now sends `TimeoutNow` only once the target *reaches*
+    `last_log_index`, and an unresolved transfer **aborts** (clears the arm,
+    resumes proposing) if a one-election-timeout deadline passes with no
+    step-down. (B) was the missing proposal-freeze itself (folded into the same
+    fix — see `animus-control/CLAUDE.md`'s "Leadership transfer" entry for the
+    core-level mechanics). (C) step 1's down-extra search reused the generic
+    "lowest-id extra" helper and only *then* filtered it on down-ness, so a
+    `Down` extra sorting after a healthy one was invisible to the ungated
+    removal — the step fell through to step 3's catch-up-gated healthy removal
+    instead, which could then stall the *whole* step behind an unrelated
+    `desired` survivor's catch-up state. Fixed by searching directly for an
+    extra that *is* down, independent of id order. `reconfigure_step` now also
+    traces (`tracing`) both a successful step-4 arm and an arming failure, so a
+    stalled transfer is no longer silent. Regressions:
+    `tests/leader_transfer_reconfigure.rs` (a sim-level reproduction — the
+    hand-driven variant demonstrably fails against the pre-fix source) and
+    `tests/reconfigure_down_extra_priority.rs` (defect C in isolation:
+    extras `{healthy lower-id, down higher-id}` with the `desired` survivor
+    deliberately lagging — the down extra must still be removed in one step,
+    with no catch-up gate).
   - **ADR 0029 also fixed a latent bug `reconfigure_step`'s original design
     never triggered: the read barrier's quorum (`majority()` + which peers get
     probed) was keyed on `all_nodes` (this node's hosting-time peer snapshot),
@@ -305,3 +348,11 @@ the engine — the `AccordCore` sync-core/async-driver split.
 
 `cargo test -p animus-cp-data` — `tests/single_tablet.rs` (SimEnv; drive with
 `run_for`, never `run()` — the driver has perpetual heartbeat/election timers).
+`tests/leader_transfer_reconfigure.rs` (ADR 0029 follow-up fix — a 3-voter
+group under sustained writes converges when `reconfigure_step` must relocate
+the leader itself; the hand-driven variant that proposes immediately before
+every `reconfigure_step` call is the one proven to fail against the pre-fix
+source) and `tests/reconfigure_down_extra_priority.rs` (defect C in
+isolation: a `Down` extra sorting after a healthy one is still removed first,
+with no catch-up gate) round out the reconfigure/transfer coverage alongside
+`tests/reconfigure_trigger.rs` and `tests/membership.rs`.

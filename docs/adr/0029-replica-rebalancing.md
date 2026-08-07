@@ -46,14 +46,32 @@ We will add three independent, separately-landable pieces.
 ### 1. Safe membership mechanics for a healthy move (`animus-control`, `animus-cp-data`)
 
 - **`RaftMsg::TimeoutNow`** and **`RaftCore::transfer_leadership`**: the
-  current leader arms a transfer to a caught-up voter
-  (`peer_match(target) == last_log_index()`, no config change in flight); the
-  driver re-sends `TimeoutNow` on every heartbeat until this node steps down
-  (resilient to one dropped message). The receiver, on a matching-term
-  `TimeoutNow`, calls `start_election` **directly** — bypassing pre-vote,
-  since pre-vote's live-leader-lease protection exists to stop a partitioned
-  node from disrupting a healthy leader, which does not apply when the
-  healthy leader itself requested the handoff.
+  current leader arms a transfer to a voter reasonably close to caught up
+  (`peer_match(target) >= commit_index()`, no config change in flight; a
+  fresh arm also records a deadline one election timeout out). **Hardened by
+  a follow-up fix** (see the root `CLAUDE.md` engineering-practices entry):
+  the arm gate was originally `peer_match(target) == last_log_index()`, which
+  under sustained writes on a write-hot tablet is essentially never true at
+  the instant the reconfigure loop samples it — `propose` is fire-and-forget,
+  so `last_log_index` moves the instant a write is accepted, before any
+  replication round trip, while the target's `peer_match` still reflects the
+  *previous* entry. The arm silently failed forever and the discarded `bool`
+  meant nothing surfaced it. Standard Raft §3.10 semantics close this: once
+  armed, **`propose`/`change_membership` freeze** (`NotLeader`, hinting the
+  transfer target) so the log stops growing and replication can close the
+  remaining gap; `broadcast_append` sends `TimeoutNow` only once the target
+  actually **reaches `last_log_index()`** (re-sent every heartbeat after that
+  until this node steps down — resilient to one dropped message); and a
+  transfer whose target never steps down by the deadline **aborts**,
+  resuming proposals rather than stranding the group frozen. A caller may
+  re-arm the same already-armed target every tick (idempotent) without
+  resetting the deadline — only a fresh arm (first time, or a different
+  target) starts a new one, so a caller that retries every tick can't starve
+  the abort check. The receiver, on a matching-term `TimeoutNow`, calls
+  `start_election` **directly** — bypassing pre-vote, since pre-vote's
+  live-leader-lease protection exists to stop a partitioned node from
+  disrupting a healthy leader, which does not apply when the healthy leader
+  itself requested the handoff.
 - **Departing-peer notification**: `broadcast_append` keeps replicating a
   removing config entry to the peer it just dropped from `peers` — via a
   leader-local `departing: BTreeMap<NodeId, u64>` (peer → removal index),
@@ -69,6 +87,19 @@ We will add three independent, separately-landable pieces.
   member of `desired` has caught up to `commit_index` (the new safety gate);
   (4) if the only remaining delta is removing the leader's own replica,
   transfer leadership to the lowest-id caught-up member of `desired` instead
+  (selecting `peer_match(n) >= commit_index()`, now consistent with the arm
+  gate above — the two were originally mismatched, see the follow-up fix
+  note). **Hardened by the same follow-up fix**: step 1's search for a `Down`
+  extra originally reused the generic "lowest-id extra" helper and only then
+  filtered it on down-ness, so a `Down` extra sorting *after* a healthy one
+  was invisible — the ungated removal never fired, and the step fell through
+  to step 3's catch-up-gated healthy removal, which could then block the
+  *entire* step behind an unrelated `desired` survivor's catch-up state. Step
+  1 now searches directly for an extra that *is* down
+  (`current.difference(desired).find(|n| down.contains(n))`, independent of
+  id order) before ever considering a healthy one. `reconfigure_step` also now
+  traces (via `tracing`) both a successful arm and an arming failure at step
+  4, so a stalled transfer is no longer silent.
   — the new leader's next tick performs the removal as an ordinary, non-self
   step.
 

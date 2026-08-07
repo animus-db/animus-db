@@ -311,8 +311,18 @@ pub struct RaftCore<C = MetaCommand, S = Metadata> {
     // Set by `transfer_leadership`: a caught-up voter this leader is handing off
     // to. Re-sent as a `TimeoutNow` on every heartbeat (`broadcast_append`) until
     // this node steps down (the transfer succeeded) — so a single dropped message
-    // doesn't strand the handoff. Cleared fresh on every election win.
+    // doesn't strand the handoff. Cleared fresh on every election win. While
+    // `Some`, `propose`/`change_membership` freeze (return `NotLeader`) instead
+    // of growing the log further, so replication can catch the target up to
+    // `last_log_index` (Raft §3.10) — see `transfer_deadline`.
     transfer_target: Option<NodeId>,
+    // Set alongside `transfer_target` (only on a *new* arm — re-arming the same
+    // target is idempotent and does not push this out, so a caller retrying the
+    // arm every tick can't starve the abort check): one election timeout after
+    // the arm. `tick` aborts (clears `transfer_target`, resuming proposals) if
+    // this passes without the target stepping down — e.g. it crashed, or fell
+    // behind after arming and never re-caught-up to `last_log_index`.
+    transfer_deadline: Nanos,
     // A peer this leader has just voted out of the configuration, mapped to the
     // index of the config entry that removed it. `broadcast_append` keeps
     // replicating to a departing peer (even though `apply_config` has already
@@ -424,6 +434,7 @@ where
             match_index: BTreeMap::new(),
             departing: BTreeMap::new(),
             transfer_target: None,
+            transfer_deadline: Nanos(0),
             first_term_index: 0,
             snapshot_offset: BTreeMap::new(),
             incoming_snapshot: None,
@@ -784,7 +795,15 @@ where
     /// The next virtual instant at which this node wants a timer tick.
     pub fn next_deadline(&self) -> Nanos {
         if self.role == Role::Leader {
-            self.heartbeat_deadline
+            // While a transfer is armed, also wake in time to evaluate its abort
+            // deadline (`tick`) even if that falls before the next heartbeat —
+            // in practice the heartbeat interval is far shorter than one election
+            // timeout, so this rarely changes the wait, but it keeps the bound
+            // exact rather than incidental.
+            match self.transfer_target {
+                Some(_) => Nanos(self.heartbeat_deadline.0.min(self.transfer_deadline.0)),
+                None => self.heartbeat_deadline,
+            }
         } else {
             self.election_deadline
         }
@@ -874,12 +893,20 @@ where
     /// uses the latest log config) and durable once committed. Rejected if a change
     /// is already in flight, if `voters` differs from the current config by more
     /// than one server (single-server changes never create two disjoint
-    /// majorities — multi-server needs joint consensus, deferred), or if it would
-    /// remove the current leader (transfer leadership first).
+    /// majorities — multi-server needs joint consensus, deferred), if it would
+    /// remove the current leader (transfer leadership first), or if a leadership
+    /// transfer is currently armed (see [`transfer_leadership`](Self::transfer_leadership) —
+    /// the log must stop growing while a transfer is in flight so replication can
+    /// catch the target up to `last_log_index`).
     pub fn change_membership(&mut self, voters: BTreeSet<NodeId>) -> ProposeResult {
         if self.role != Role::Leader {
             return ProposeResult::NotLeader {
                 leader: self.leader_id,
+            };
+        }
+        if let Some(target) = self.transfer_target {
+            return ProposeResult::NotLeader {
+                leader: Some(target),
             };
         }
         // The membership-change erratum guard (Raft §4 / Ongaro's bug report):
@@ -930,21 +957,41 @@ where
         self.match_index.get(&node).copied().unwrap_or(0)
     }
 
-    /// Arm a leadership transfer to `target`: once armed, `broadcast_append`
-    /// sends it a [`RaftMsg::TimeoutNow`] on every heartbeat (see the
-    /// `transfer_target` field doc) until this node steps down — resilient to a
-    /// single dropped message, and, like `change_membership`, something a caller
-    /// outside the driver loop can trigger and then wake the loop to send
-    /// promptly (`propose_and_wake`'s pattern) rather than a method that hands
-    /// back messages to deliver itself. Returns whether the transfer was armed.
+    /// Arm a leadership transfer to `target` (Raft §3.10): once armed,
+    /// `propose`/`change_membership` freeze (report `NotLeader`) so the log stops
+    /// growing, and `broadcast_append` sends `target` a [`RaftMsg::TimeoutNow`]
+    /// (see the `transfer_target` field doc) **once it reaches
+    /// `last_log_index()`** — re-sent every heartbeat after that until this node
+    /// steps down, resilient to a single dropped message. Like
+    /// `change_membership`, this is something a caller outside the driver loop
+    /// can trigger and then wake the loop to send promptly
+    /// (`propose_and_wake`'s pattern) rather than a method that hands back
+    /// messages to deliver itself. Returns whether the transfer is armed (true
+    /// both for a fresh arm and for an idempotent re-arm of the same target).
+    ///
     /// Leader-only; rejected (no state change) unless `target` is a
-    /// **different**, current voter whose log is fully caught up
-    /// (`peer_match(target) == last_log_index()`) and no config change is in
-    /// flight — a transfer to a lagging or not-yet-a-voter target could stall the
-    /// group with no leader able to make progress. This node's own
-    /// term/role/leader_id are **not** touched here: the actual handoff happens
-    /// when `target` wins the resulting election and its higher term reaches
-    /// this node through the normal step-down path.
+    /// **different**, current voter reasonably close to caught up
+    /// (`peer_match(target) >= commit_index()`) and no config change is in
+    /// flight — a transfer to a voter that hasn't even seen the committed
+    /// prefix could stall the group with no leader able to make progress. The
+    /// gate is intentionally looser than "`== last_log_index()`": under
+    /// sustained writes `last_log_index` can run ahead of any single sampling
+    /// instant forever, which would make the arm gate itself unsatisfiable — the
+    /// proposal freeze this method also imposes is what lets replication finish
+    /// closing that gap (to equality) *after* arming, before `TimeoutNow` is
+    /// actually sent (see `broadcast_append`). This node's own term/role/
+    /// leader_id are **not** touched here: the actual handoff happens when
+    /// `target` wins the resulting election and its higher term reaches this
+    /// node through the normal step-down path.
+    ///
+    /// A **re-arm of the same already-armed target does not push the deadline
+    /// out** — only a fresh arm (first time, or a different target) starts a
+    /// new one election-timeout window (see `transfer_deadline`). This matters
+    /// because a caller like `RaftKvNode::reconfigure_step` calls this once per
+    /// tick as long as the delta persists (documented as idempotent): if every
+    /// call reset the deadline, a target that never actually catches up could
+    /// keep the transfer armed (and proposals frozen) forever, since the
+    /// deadline would always be "one tick away" from expiring.
     ///
     /// This is what makes it possible to move the *leader's own* replica in a
     /// membership change: [`change_membership`](Self::change_membership) always
@@ -952,16 +999,20 @@ where
     /// rebalance move landing on the current leader) transfers leadership to
     /// another member of the target configuration first; that new leader then
     /// removes the old one itself, which is an ordinary (non-self) removal.
-    pub fn transfer_leadership(&mut self, target: NodeId) -> bool {
+    pub fn transfer_leadership(&mut self, target: NodeId, now: Nanos) -> bool {
         if self.role != Role::Leader
             || target == self.id
             || !self.config.contains(&target)
             || self.config_change_in_flight()
-            || self.peer_match(target) < self.last_log_index()
+            || self.peer_match(target) < self.commit_index
         {
             return false;
         }
-        self.transfer_target = Some(target);
+        if self.transfer_target != Some(target) {
+            self.transfer_target = Some(target);
+            self.transfer_deadline =
+                Nanos(now.0.saturating_add(self.election_base.as_nanos() as u64));
+        }
         true
     }
 
@@ -1041,6 +1092,17 @@ where
     pub fn tick(&mut self, now: Nanos, entropy: u64) -> Vec<Out<C>> {
         match self.role {
             Role::Leader => {
+                // Abort a leadership transfer whose target has not stepped down
+                // by the deadline (Raft §3.10) — e.g. it crashed after arming, or
+                // never re-caught-up to `last_log_index` to receive `TimeoutNow`
+                // (see `broadcast_append`). This resumes proposing immediately
+                // (the very next `propose`/`change_membership` call), rather than
+                // stranding the group frozen forever. Checked on every tick, not
+                // only a heartbeat tick, so the abort isn't delayed by the
+                // (usually much shorter) heartbeat cadence.
+                if self.transfer_target.is_some() && now.0 >= self.transfer_deadline.0 {
+                    self.transfer_target = None;
+                }
                 if now.0 >= self.heartbeat_deadline.0 {
                     self.heartbeat_deadline = Nanos(now.0.saturating_add(self.heartbeat_nanos()));
                     return self.broadcast_append();
@@ -1097,6 +1159,13 @@ where
             self.voted_for = None;
             self.role = Role::Follower;
             self.leader_id = None;
+            // A stale transfer from a leadership stint that just ended has no
+            // meaning as a follower (`propose`/`change_membership`/
+            // `broadcast_append` all gate on `role == Leader` first, so a stale
+            // `Some` here is otherwise inert) — clear it anyway so a future
+            // `is_leader`-independent inspection (e.g. tests, admin views) never
+            // reports a "transfer in flight" for a node that isn't leading.
+            self.transfer_target = None;
         }
         match msg {
             RaftMsg::PreVote {
@@ -1189,11 +1258,23 @@ where
     }
 
     /// Propose a command. If leader, append it (replicated on the next
-    /// heartbeat); otherwise report the leader hint.
+    /// heartbeat); otherwise report the leader hint. While a leadership transfer
+    /// is armed (see [`transfer_leadership`](Self::transfer_leadership)) this
+    /// also reports `NotLeader` — the log must stop growing so replication can
+    /// catch the transfer target up to `last_log_index` and receive
+    /// `TimeoutNow`; the caller re-routes to (or backs off and retries) the
+    /// named hint, and the proposal is safe to retry once the transfer resolves
+    /// (either the target becomes leader, or this node aborts the transfer and
+    /// resumes proposing).
     pub fn propose(&mut self, command: C) -> ProposeResult {
         if self.role != Role::Leader {
             return ProposeResult::NotLeader {
                 leader: self.leader_id,
+            };
+        }
+        if let Some(target) = self.transfer_target {
+            return ProposeResult::NotLeader {
+                leader: Some(target),
             };
         }
         let index = self.last_log_index() + 1;
@@ -1813,15 +1894,23 @@ where
             .iter()
             .filter_map(|&p| self.replicate_to(p))
             .collect();
-        // Re-send an in-flight leadership transfer every heartbeat (see
-        // `transfer_target` field doc) until this node steps down.
+        // Send `TimeoutNow` only once the target has actually caught all the way
+        // up to `last_log_index` — arming (`transfer_leadership`) only requires
+        // `>= commit_index`, which under sustained writes can be well behind the
+        // log tip, and a target that campaigns on a stale log could depose this
+        // (still perfectly healthy) leader and then lose the election, or win it
+        // and truncate entries this leader had already accepted. Once true, keep
+        // re-sending every heartbeat (see the `transfer_target` field doc) until
+        // this node steps down — resilient to a single dropped message.
         if let Some(target) = self.transfer_target {
-            outs.push((
-                target,
-                RaftMsg::TimeoutNow {
-                    term: self.current_term,
-                },
-            ));
+            if self.peer_match(target) == self.last_log_index() {
+                outs.push((
+                    target,
+                    RaftMsg::TimeoutNow {
+                        term: self.current_term,
+                    },
+                ));
+            }
         }
         outs
     }
