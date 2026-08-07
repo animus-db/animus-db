@@ -201,6 +201,23 @@ cross-cutting ones. Prune/merge entries that become obsolete.
   (`cp_reconfigure.rs`) to exercise the node-local admin views + real failure
   detection. When a path resolves a leader, ask "which leader, and is it the same node
   as the other leader this path needs?" — and add a per-process test if not.
+  **Update (ADR 0031 PR2, 2026-08-07): the shared `ClusterEdgeState` root cause
+  this entry describes is gone** — `--cluster N`'s in-process bring-up
+  (`start_cluster_with`) now creates a distinct edge-state set **per node**,
+  exactly like one-process-per-node, and populates `client_route` the same way
+  `run_node_with` does, so an in-process node genuinely forwards/relays to
+  reach a leader hosted elsewhere rather than finding it locally via a shared
+  registry. `--cluster N` and one-process-per-node are now the same code path
+  in every way that matters to this class of bug. (`cp_rehost.rs`, referenced
+  above as the in-process split test, no longer exists — split is now a
+  single control-plane command with no data-plane half to rehost, ADR 0028 —
+  but the general lesson stands as a *pattern to watch for*: any future
+  process-scoped convenience shortcut (a shared registry, a shared cache, a
+  shared claim set) that an in-process multi-node test harness introduces for
+  convenience can silently mask the same class of cross-process gap, so audit
+  new shared state the same way.) The general "which leader, is it the same
+  node" question, and "test cross-process paths per-process," remain sound
+  advice for any *new* multi-leader coordination this repo adds.
 - **Match a consistency-checker harness to what the layer *offers*; don't shoehorn
   a transactional workload onto a non-transactional layer — build a sibling harness
   that reuses the *checkers*, not the workload.** Adding an Elle corpus for the
@@ -540,6 +557,34 @@ cross-cutting ones. Prune/merge entries that become obsolete.
   "expected loss" actually depended on a sole recovered voter never re-advancing
   commit over its WAL tail (a real bug). The ReadIndex-gate fix surfaced it; the
   test now asserts survival via Raft-WAL replay. (PR #25.)
+- **When a process-scoped convenience shortcut is removed, grep for tests that
+  quietly relied on it to *assert something the removed shortcut made trivially
+  true* — not just tests that time out.** Making `--cluster N`'s in-process
+  `ClusterEdgeState` per-node (ADR 0031 PR2, closing the gotcha above) broke
+  exactly one of ~90 `animusd` tests: `cql_wire.rs`'s cross-connection
+  `EXECUTE` assertion, which `PREPARE`d a statement via node 0 then
+  `EXECUTE`d it via a connection to node 1 to "prove the prepared store is
+  shared across connections" — true only because the old shared edge made
+  every node's `CqlState` the same object. Per-node, that's not a bug to fix,
+  it's the **correct, intended new behavior** (a real one-process-per-node
+  deployment never shared this either) — so the honest fix is to change what
+  the test proves: reuse a **second connection to the same node** (`conn0b`)
+  for the cross-connection assertion, and keep the cross-*node* connection
+  for what's actually still cross-node-safe (reading committed CP-plane
+  data). The signature to watch for isn't a hang/timeout (this failed with a
+  clean, immediate `Error` response) — it's an assertion whose comment
+  literally describes the removed shortcut's own guarantee ("shared across
+  connections/nodes/processes"); grep test comments for the word "shared" (or
+  "cluster-wide", "any node") near the specific state you're scoping down,
+  not just the obvious call sites. Every other test that exercised
+  cross-node behavior already did so through a *real* mechanism (replicated
+  `Metadata`, `cp_route` forwarding, `propose_schema` relay), so removing the
+  shortcut made those tests exercise more real code, not less — 100% of the
+  rest of the workspace suite passed unmodified, including several
+  (`cp_plane.rs`, `cp_rebalance.rs`, `cp_reconfigure.rs`) that now genuinely
+  drive cross-process-style forwarding in-process for the first time instead
+  of resolving everything locally through the shared registry. (`animusd`
+  `tests/cql_wire.rs::cql_wire_prepare_execute_typed_round_trip`.)
 
 ### Code patterns
 - **A quorum primitive's "who do I need acks from" and "how many acks do I
