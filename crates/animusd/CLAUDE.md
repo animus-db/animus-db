@@ -46,7 +46,7 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   lock** (which serializes a node's RMWs so the linearizable read + CP write are
   atomic per node; the Raft index is the MVCC version, so no client-assigned
   version), and a `DELETE` that empties the partition issues a CP tombstone
-  (`cp_delete`). The keyspace set + prepared-statement store are **per-cluster edge
+  (`cp_delete`). The keyspace set + prepared-statement store are **per-node edge
   state** (see below).
 - `otel` module — OpenTelemetry-compatible distributed tracing (ADR 0027).
   `init_tracing(instance_id)` (called once, from `main.rs`) installs the process
@@ -241,9 +241,11 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   (WAL recovery alone doesn't restore voter status from a non-voter start).
   Dedup is a per-node in-memory `minted` claim set (reset on restart, which
   is fine — the loop just re-discovers every tablet to host from replicated
-  `Metadata` and re-forms each from the shared engine's durable data), never
-  the shared `--cluster N` edge (which would report another node's just-hosted
-  group and starve this node's own). **The loop also re-narrows an
+  `Metadata` and re-forms each from the shared engine's durable data), not
+  `edge.local_cp` — `ClusterEdgeState` is per-node too (ADR 0031 PR2), but
+  `minted` is claimed synchronously *before* the async join-host actually
+  registers a handle, so it can't race this same loop's own next tick the way
+  a registration-based check could. **The loop also re-narrows an
   already-`minted` tablet's `StorageScope` every tick** (via
   `ClusterEdgeState::local_cp_member` + `CpGroup::narrow_scope`) — the source
   side of a single-command split (ADR 0028) has a `RaftKvNode` that predates
@@ -477,7 +479,9 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   decoding each live pair and dropping DynamoDB tombstone values — **no in-memory
   written-key tracking** (proven across a restart in `tests/dynamo_schema.rs`). The edge keeps only the
   **GSI/LSI index declarations** in-memory (for an *index* `Query`), held
-  **per-cluster** in `ClusterEdgeState` (not a process `OnceLock`). The surface now
+  **per-node** in `ClusterEdgeState` (not a process `OnceLock`; ADR 0031 PR2 —
+  a node backfills its own entry data lazily on first query rather than
+  relying on another node's observations). The surface now
   also covers `UpdateItem`/`BatchWriteItem`/`TransactWriteItems` (the last
   condition-gated but not yet atomic), per-index projections, and document-path
   projections.
@@ -489,24 +493,29 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   control plane's **replicated catalog** (ADR 0013) and `INSERT`/`SELECT` resolve
   columns from it (a typed row is one data-plane value keyed by `escape(table) ||
   pk_key_bytes`; the partition key is not stored in the value). `CREATE KEYSPACE`
-  records the keyspace in the per-cluster `CqlState` (keyspaces are not yet
+  records the keyspace in the per-node `CqlState` (keyspaces are not yet
   replicated).
-  - **The keyspace set + prepared-statement store (`CqlState`) are per-cluster
-    edge state**, held in the cluster's `ClusterEdgeState` (threaded through
-    `ClientCtx::edge`), **not** a process `OnceLock` — like the DynamoDB
-    `SchemaRegistry`. They are shared across the cluster's CQL listeners (so
-    `--cluster N` dev mode sees one node's `CREATE KEYSPACE` from another) but
-    **isolated between two clusters in one process** (so a test harness can run
-    several independent clusters without their edge state leaking — the fix for
-    the former process-global `OnceLock` state-leak). They are still **not durable
-    and not control-plane replicated**: lost on restart, and a one-process-per-node
-    deployment has a per-process catalog (re-create schemas per process). Note
-    table *schemas* are no longer here at all — they live in the control plane's
-    replicated catalog (ADR 0013). Per-connection state (the `USE`d keyspace)
-    lives in `Session`.
+  - **The keyspace set + prepared-statement store (`CqlState`) are per-node
+    edge state** (ADR 0031 PR2), held in the node's own `ClusterEdgeState`
+    (threaded through `ClientCtx::edge`), **not** a process `OnceLock` — like
+    the DynamoDB `SchemaRegistry`. They are shared across **connections to the
+    same node** (so `PREPARE` on one connection and `EXECUTE` on another
+    resolve to the same statement, as long as both connect to the same node)
+    but **isolated between two nodes** — including two nodes of the same
+    `--cluster N` cluster, matching a real one-process-per-node deployment's
+    per-process catalog exactly, and between two clusters in one process (so a
+    test harness can run several independent clusters, or several nodes,
+    without their edge state leaking — the fix for the former process-global
+    `OnceLock` state-leak, extended one level further by ADR 0031 PR2). They
+    are still **not durable and not control-plane replicated**: lost on
+    restart, and each process/node re-creates its own keyspaces/prepares. Note
+    table *schemas* are no longer here at all — they live in the control
+    plane's replicated catalog (ADR 0013), which every node sees the same way
+    regardless. Per-connection state (the `USE`d keyspace) lives in `Session`.
   - The **prepared-statement id is content-addressed** — a stable hash of the
     statement text (FNV-1a, no RNG so the edge stays deterministic) — so `PREPARE`
-    on one connection and `EXECUTE` on another resolve to the same statement.
+    on one connection and `EXECUTE` on another resolve to the same statement,
+    **provided both connections are to the same node** (see above).
 - **A dedicated admin / debug HTTP-JSON endpoint** (`RoleAddrs.admin`,
   `Node::admin_addr`, ADR 0020) — a **sixth** per-node listener, isolated from the
   client/dynamo/cql data edges. A production-only I/O edge in `admin.rs` (real
@@ -708,46 +717,37 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
       `otel::current_traceparent()` would have no active context to inject — the
       seed would write real data but be invisible in a trace backend no matter how
       much it wrote.
-  - **Gotcha — `/admin/raftkv` is node-local, but in a single `--cluster N` process
-    the shared `ClusterEdgeState` registers *every* node's CP group handle, so one
-    node's view lists all replicas; a one-process-per-node deployment (separate edge
-    each) shows just the local group.** A storage route resolves the tablet's *local*
-    handle (`edge.local_cp`), so `--cluster` mode targets the first-registered
-    replica's engine, not necessarily this node's — scrape per-process for true
-    node-local storage debug (`tests/admin_endpoint.rs` uses `run_node` per node).
-    **The dashboard's Tablets/Placement/Overview views were themselves a victim of
-    this gotcha** — `dashboard_core.js::cpGroupsByTablet()` tagged every group in a
-    node's `/admin/raftkv` response with *that fetching node's identity*, correct
-    only in one-process-per-node mode. Under `--cluster N` every node's response
-    lists the same full cluster-wide group set, so this produced duplicate
-    `{node, group}` entries mis-tagged with whichever admin port happened to answer
-    — and since every replica dot's role lookup (`gs.find(x => nodeRaftkvId(x.node)
-    === rid)`) matched on that wrong tag, it deterministically resolved to the
-    *same* (first) group's `is_leader` for every replica in a tablet's row: every
-    dot showed identical status ("nodes are either all followers or all leaders"),
-    and the Overview balance chart / per-node hosted-count and the Placement
-    per-node tablet list were equally wrong for the same reason. `CpRaftView` had
-    no field identifying which physical node a group belongs to at all — only the
-    fetching admin port's identity, which is not the same thing under a shared
-    edge. Fixed by adding `CpRaftView::node` (`lib.rs::raft_view`) and having
-    `cpGroupsByTablet()` resolve/dedupe by that real id (`nodeByRaftkv(g.node)`,
-    keyed on `tablet:node`) instead of the fetching node. **General lesson: a
-    debug/admin view whose response can legitimately be a cluster-wide
-    aggregate (not just this node's own state) must carry each item's own
-    identity in the payload — a client cannot infer "whose state is this" from
-    which server answered.** (Originally `node` was the group's member id
-    translated back to a base raftkv id via a since-deleted `topology::
-    cp_base_id`, from when a split tablet's member id was derived,
-    `base + tablet * CP_SPLIT_ID_STRIDE` — ADR 0026 Stage B/ADR 0028 made a
-    tablet's member id simply the base id, so `node` is now just
-    `self.env().node_id()` directly, no translation. This *was* the exact bug
-    this file's "verify against the branch you'll edit" lesson warns about in
-    miniature: this fix and the split redesign landed on two branches that
-    never saw each other until they both merged into `main`, and git's
-    line-based merge combined them without a textual conflict — but the
-    result didn't compile, because the redesign deleted the function this fix
-    depended on. No amount of testing *either branch alone* would have caught
-    it; only building the actual post-merge `main` does.)
+  - **`/admin/raftkv` (and every `edge.*`-backed admin view) is node-local
+    everywhere, including `--cluster N` (ADR 0031 PR2 — `ClusterEdgeState` is
+    always per-node now; see its doc in `lib.rs` for the historical shared-edge
+    shape this replaced).** A storage route resolves the tablet's *local*
+    handle (`edge.local_cp`), which is genuinely this node's own in both
+    deployment modes — scrape any node for its own node-local storage debug
+    (`tests/admin_endpoint.rs` uses `run_node` per node, matching real
+    deployment; a `--cluster N` node's own admin port now behaves the same).
+    **The dashboard still merges every node's `/admin/raftkv` into one
+    cross-node view** (`dashboard_core.js::cpGroupsByTablet()`, via the
+    `/admin/peers` fan-out, ADR 0021) — that aggregation is deliberate and
+    happens at the HTTP-fan-out layer in the browser, not inside any one
+    node's response. It relies on `CpRaftView::node` (`lib.rs::raft_view`)
+    carrying each entry's real hosting node id explicitly
+    (`self.env().node_id()`), because a merged response's origin server is not
+    a reliable way to attribute a *particular* entry to a physical node once
+    several nodes' responses are combined. **General lesson (still current):
+    a debug/admin view whose response is merged across nodes by its consumer
+    must carry each item's own identity in the payload** — the merging
+    client cannot infer "whose state is this" from which server answered
+    (`dashboard_core.js`'s `nodeByRaftkv(g.node)`, keyed on `tablet:node`).
+    Before this fix, `/admin/raftkv` was *itself* cluster-wide in `--cluster
+    N` (the shared `ClusterEdgeState` registered every node's CP group handle
+    in one registry), which produced duplicate `{node, group}` entries
+    mis-tagged with whichever admin port happened to answer and made every
+    replica dot in a tablet's row resolve to the same (first) group's
+    `is_leader` — a bug this file used to document at length. ADR 0031 PR2
+    removed that root cause entirely (each node's `/admin/raftkv` now only
+    ever lists its own groups), so `CpRaftView::node` is no longer covering
+    for a per-response ambiguity, only for the dashboard's own deliberate
+    cross-node merge.
   - **Metrics are per-node sinks**: a follower's leader-only counters
     (`elections_won`, `append_entries_sent`) are legitimately 0, so `/admin/metrics`
     (and `/metrics`) is meaningful **per node** — scrape the control leader for the
@@ -814,24 +814,33 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   `animusd --cluster 3` for a quick manual check), not just stale-state
   confusion. Always pass an explicit, freshly-created `--dir` for a
   throwaway manual run; don't rely on `--ephemeral` alone for a clean slate.
-- **The wire edges' mutable state is `ClusterEdgeState`, scoped to one cluster**
-  (not the whole process). It holds the set of control `RaftNode` handles a schema
-  DDL proposal fans out to (so a follower-connected `CreateTable`/`CREATE TABLE`
-  still reaches the leader), the DynamoDB `SchemaRegistry` (GSI/LSI index
-  declarations — the base written-key index is gone, replaced by the native range
-  scan), and the CQL `CqlState` (keyspaces + prepared statements). It is created
-  once per cluster — in `start_cluster_with` (shared by every node of that
-  cluster, so `--cluster N` dev mode agrees) and freshly in `run_node_with` (one
-  per process) — and threaded into `start_with` → `ClientCtx::edge`. In
-  `--cluster N` mode one process is one cluster, so this is equivalent to the old
-  process-global; the point is that a **test harness running several independent
-  clusters in one process gets a distinct, isolated edge-state set per cluster**,
-  so two clusters never share a registry or a handle set. (This replaced the
-  former `OnceLock` process statics, which leaked across tests in one binary —
-  a later test's `CreateTable` fanned its proposal across every still-running
-  cluster's leaders and timed out.) Schema DDL routes through
-  `ClusterEdgeState::{leader_handle, propose_on_leaders}`; reads/writes resolve
-  the table schema from this node's own replicated `Metadata`.
+- **The wire edges' mutable state is `ClusterEdgeState`, scoped to one NODE**
+  (ADR 0031 PR2 — not the whole process, and, since this change, not the whole
+  in-process `--cluster N` cluster either). It holds this node's own control
+  `RaftNode` handle (at most one — `propose_schema` proposes locally when this
+  node is the control leader, else relays `ClientRequest::ProposeSchema` one
+  hop to the leader's node via `client_route`, so a follower-connected
+  `CreateTable`/`CREATE TABLE` still reaches the leader), this node's own
+  hosted CP group handles (keyed by tablet), the DynamoDB `SchemaRegistry`
+  (GSI/LSI index declarations — the base written-key index is gone, replaced
+  by the native range scan), and the CQL `CqlState` (keyspaces + prepared
+  statements). It is created **fresh per node** — once per node in
+  `start_cluster_with`'s `--cluster N` bring-up loop (previously one instance
+  shared by every node of the cluster; see the historical note in
+  `ClusterEdgeState`'s own doc in `lib.rs`) and, as before, freshly in
+  `run_node_with` (one per process) — and threaded into `start_with` →
+  `ClientCtx::edge`. A **test harness running several independent clusters, or
+  several nodes of the same cluster, in one process gets a distinct, isolated
+  edge-state set per node**, so neither two clusters nor two nodes of one
+  cluster ever share a registry or a handle set. (The per-*cluster* scoping
+  originally replaced `OnceLock` process statics, which leaked across tests in
+  one binary — a later test's `CreateTable` fanned its proposal across every
+  still-running cluster's leaders and timed out; per-*node* scoping is the
+  same fix taken one level further, closing the class of bugs the root
+  `CLAUDE.md` documents under "the shared `--cluster N` edge masks per-node
+  bugs.") Schema DDL routes through `ClusterEdgeState::leader_handle` +
+  `ClientCtx::propose_schema`'s relay fallback; reads/writes resolve the table
+  schema from this node's own replicated `Metadata`.
 - **`Node::shutdown()` is a graceful teardown**: it aborts the node's
   client-facing listener tasks (client/dynamo/cql/admin, on plain `tokio::spawn`) and
   calls `ProdEnv::shutdown()` on each of the two internal role envs (control +

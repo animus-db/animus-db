@@ -235,8 +235,10 @@ fn resolve_table(
 }
 
 /// Accept loop for the CQL endpoint. Each connection is handled on its own task.
-/// The keyspace set and prepared statements live in the cluster's per-cluster
-/// [`CqlState`](crate::ClusterEdgeState); table schemas live in the control plane.
+/// The keyspace set and prepared statements live in this node's own per-node
+/// [`CqlState`](crate::ClusterEdgeState) (ADR 0031 PR2); table schemas live in
+/// the control plane's replicated catalog, reachable identically from every
+/// node.
 pub(crate) async fn serve(listener: TcpListener, ctx: ClientCtx) {
     let state = ctx.edge.cql_state().clone();
     loop {

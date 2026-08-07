@@ -333,19 +333,39 @@ async fn cql_wire_prepare_execute_typed_round_trip() {
         "missing key → zero rows"
     );
 
-    // EXECUTE on conn1 (a different connection) using the same content-addressed
-    // id proves the prepared store is shared across connections.
+    // EXECUTE on a *second connection to node 0* (`conn0b`) using the same
+    // content-addressed id proves the prepared store is shared across
+    // connections **of the same node**. Since `ClusterEdgeState` is per-node
+    // (ADR 0031 PR2 — it used to be shared cluster-wide in `--cluster N`, which
+    // masked this exact distinction), the prepared-statement store does NOT
+    // reach across nodes: `id` was only ever registered on node 0's `CqlState`,
+    // so EXECUTE-ing it against node 1 (`conn1`) would (correctly) error. That
+    // matches a real one-process-per-node deployment, where each process has its
+    // own catalog.
+    let mut conn0b = TcpStream::connect(addr0)
+        .await
+        .expect("connect cql node 0 (2nd conn)");
+    handshake(&mut conn0b).await;
+    let use0b = round_trip(
+        &mut conn0b,
+        &request(1, Opcode::Query, &query_body("USE app")),
+    )
+    .await;
+    assert_eq!(use0b.opcode, Opcode::Result);
     let values2 = vec![8i32.to_be_bytes().to_vec(), b"Grace".to_vec(), vec![0u8]];
     let exec2 = round_trip(
-        &mut conn1,
+        &mut conn0b,
         &request(5, Opcode::Execute, &execute_body(&id, &values2)),
     )
     .await;
     assert_eq!(
         exec2.opcode,
         Opcode::Result,
-        "cross-connection EXECUTE works"
+        "cross-connection (same-node) EXECUTE works"
     );
+    // Read the row back on node 1 (`conn1`) — a genuine cross-node read, valid
+    // because it resolves the row from the CP plane's replicated data, not from
+    // any per-node `CqlState`.
     let back = round_trip(
         &mut conn1,
         &request(
@@ -367,10 +387,11 @@ async fn cql_wire_prepare_execute_typed_round_trip() {
     .await;
     assert_eq!(bad.opcode, Opcode::Error, "unsupported query should ERROR");
 
-    // A type-mismatched EXECUTE (text where int expected) is a clean ERROR.
+    // A type-mismatched EXECUTE (text where int expected) is a clean ERROR —
+    // driven against `conn0b` (node 0), the connection that actually knows `id`.
     let bad_vals = vec![b"notanint".to_vec(), b"x".to_vec(), vec![1u8]];
     let bad_exec = round_trip(
-        &mut conn1,
+        &mut conn0b,
         &request(8, Opcode::Execute, &execute_body(&id, &bad_vals)),
     )
     .await;
