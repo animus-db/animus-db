@@ -57,6 +57,24 @@ the engine — the `AccordCore` sync-core/async-driver split.
   accessor's *absence* that had left the fences unwired in `animusd` for as
   long as they existed — see the root `CLAUDE.md`'s entry on a safety
   mechanism with zero production callers.
+- **`RaftKvNode::approx_bytes()` / `StorageScope::physical_bounds()`** (ADR
+  0034, byte-based auto-split): `approx_bytes()` is the per-tablet cheap byte
+  estimate `animusd::auto_split_loop` gates on, delegating to
+  `StorageEngine::approx_bytes_in_range` over this group's own live
+  `StorageScope::physical_bounds()`. `physical_bounds()` exists because a
+  scope's logical range is frequently **unbounded above** (a fresh table's
+  first, not-yet-split tablet spans its whole prefix) — unlike `has_data`,
+  which tolerates falling back to a whole-engine `entries()` scan for that
+  case (a one-time hosting-decision cost), a *periodic* byte-estimate gate
+  cannot afford to degrade into an engine-wide scan on every tick. So
+  `physical_bounds()` computes a genuinely bounded physical upper bound via
+  the standard **prefix-upper-bound** trick (increment the scope's own key
+  prefix's last non-`0xFF` byte, dropping trailing `0xFF` bytes first) —
+  `None` only for `StorageScope::whole()` (no prefix at all) or an
+  all-`0xFF` prefix. When adding a new per-tick cheap check over a
+  `StorageScope`, check whether it can hit the unbounded-above case and, if
+  so, whether `has_data`'s whole-engine fallback is actually acceptable for
+  it (it usually isn't, if the check runs on a cadence).
 - **Stream addressing** (ADR 0026 Stage B): `start_hosted(env, all_nodes,
   storage, scope, stream)` addresses a tablet's Raft traffic by `(node,
   stream)` (`env.send_stream`/`recv_stream`, `stream` = the tablet id) instead

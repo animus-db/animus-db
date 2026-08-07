@@ -59,6 +59,21 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
   ~9.7x on the apply-path bench). The trait method is **defaulted** (per-op loop) so
   `MemoryEngine` and any other backend need no change; `LsmEngine` overrides it
   (`WalRecord::MergeBatch`). Regression: `lsm_group_commit.rs::merge_batch_coalesces_one_fsync_and_is_durable`.
+- **`approx_bytes_in_range(start, end)` (ADR 0034: byte-based auto-split)
+  follows the same defaulted-trait-method shape as `merge_batch`**: the
+  default implementation is *exact* (scan `[start, end)`, or filter
+  `entries()` by `start` when `end` is `None`, and sum `key.len() +
+  value.len()`) — correct and cheap enough for `MemoryEngine` (and any
+  future engine) with zero code. `LsmEngine` overrides it with a **cheap,
+  non-materializing** estimate: an exact range-scoped `BTreeMap::range` sum
+  over the memtable, plus every SSTable whose own `[min_key, max_key]`
+  overlaps the query range at all contributing its **whole** `file_size`
+  (deliberately over-estimating — a table's overlap can include a sibling
+  tenant's bytes on a shared engine, ADR 0026/0028, particularly at L0). No
+  disk read. `tests/lsm_approx_bytes.rs`: known SSTables at known ranges
+  give a sane, never-under, tightly-scoped estimate; a partial overlap
+  proves the whole-`file_size` bias directly; the default-trait-impl path is
+  proven exact on `MemoryEngine`.
 - **`LsmOptions::trust_monotonic_versions`** (opt-in, default `false`) skips
   `merge`/`merge_tombstone`/`merge_batch`'s cross-SSTable `latest_version_of`
   point read — under the CP plane's monotonic Raft-log-index versions that read

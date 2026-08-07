@@ -306,6 +306,7 @@ fn config_view(ctx: &ClientCtx) -> Value {
         "peers": peers,
         "cp_member_addrs": meta.cp_member_addrs,
         "auto_split_threshold": a.auto_split_threshold,
+        "auto_split_bytes_threshold": a.auto_split_bytes_threshold,
     })
 }
 

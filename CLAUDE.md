@@ -1712,6 +1712,59 @@ to the archive stays in place below.
   `reconciler_corpus.rs::scenario_merge_widens_and_absorbs`,
   `host::tests::widen_is_deferred_while_the_absorbed_sibling_is_still_hosted`,
   `animusd` `split_fence_tests`' read/scan duals.)
+- **A "weighted median via one accumulate-and-threshold pass" is only correct
+  when no single item can dominate half the total weight — once one can,
+  scan every achievable cut point and pick the closest to half, don't commit
+  to whichever side a running sum happens to cross the threshold on.**
+  Building the byte-weighted split point for ADR 0034's byte-based
+  auto-split (replacing the plain positional median with one that bisects a
+  materialized tablet's *bytes*, not its key count, under skewed value
+  sizes), the obvious-looking first implementation walked pairs in order,
+  accumulated a running byte total, and returned the first key at which the
+  running total reached half the whole. That is subtly wrong whenever one
+  key's own value is a large fraction of the total, because it commits to
+  the *first* crossing instead of comparing it against the *next* candidate
+  cut: 20 tiny keys totaling 100 bytes, then two huge keys y0/y1 of ~10,000
+  bytes each (total 20,104, half 10,052) — the naive walk returns y0 as the
+  split key the instant the running total (100 + y0's ~10,002) first crosses
+  half, giving a 100-byte/20,004-byte split (the 20 tiny keys vs. both huge
+  ones); but the *very next* candidate cut — after y0 instead of before it —
+  gives 10,102/10,002 (the tiny keys + y0, vs. y1 alone), far closer to
+  even. The naive walk can never find this, because once it has returned at
+  the first crossing it never looks at the next candidate to see if it's
+  actually closer. The fix scans every
+  achievable interior cut point (a key boundary, since a key's own bytes can
+  never be split) and keeps whichever prefix sum is closest to half — the
+  best any key-boundary split can do, and a strict improvement discovered
+  only by writing a unit test with a deliberately skewed distribution and
+  checking both sides' actual byte shares, not just "did a split happen."
+  (`animusd::byte_weighted_median`; `auto_split_median_tests`.)
+- **A new `StorageEngine` trait method with a working default (not just a
+  stub) lets every existing/future implementor answer immediately, and only
+  the one backend that needs a cheaper path has to override it — the
+  `merge_batch` precedent, reused.** Adding `approx_bytes_in_range` (ADR
+  0034) for the byte-based auto-split trigger, the default implementation is
+  simply *exact* (scan the range and sum key+value lengths) — correct for
+  `MemoryEngine` (and any future engine) for free, with no `Option`/`None`
+  fallback needed anywhere upstream. Only `LsmEngine` overrides it with a
+  cheap, non-materializing estimate from metadata it already holds
+  (memtable range-query + SSTable-overlap `file_size` sum), which is where
+  the actual "cheap, not exact" tradeoff belongs. This is strictly better
+  than the older sibling pattern (`CpGroup::approx_key_count`, LSM-only,
+  returns `None` on the memory backend) for any *new* per-engine estimate —
+  prefer "default = exact, override = cheap" over "default = absent" when
+  the exact computation is itself cheap enough for a non-hot-path backend.
+  Related: an unbounded-above logical range (`KeyRange.end: None`, the
+  common "one big not-yet-split tablet" case) must not degrade a scoped
+  estimate into an engine-wide scan just because the *logical* range has no
+  upper bound — `StorageScope::physical_bounds` computes a bounded
+  **physical** upper bound via the standard prefix-upper-bound trick
+  (increment the last non-`0xFF` byte of the scope's own key prefix) instead
+  of falling back to `entries()` the way the one-time `has_data` check
+  tolerates. A cheap per-tick gate and a one-time hosting-decision check can
+  reasonably make different cost tradeoffs for the same "unbounded range"
+  shape — check which one you're building before reusing the other's
+  fallback.
 - **Before implementing a task framed as "close this documented gap," grep the
   actual code — an ADR/CLAUDE.md's "still deferred"/"future work" language can
   lag well behind a fix that already shipped.** Tasked with closing ADR 0013's

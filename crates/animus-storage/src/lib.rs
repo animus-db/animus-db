@@ -260,6 +260,42 @@ pub trait StorageEngine: Clone + Send + Sync {
     /// holds the value (ADR 0010).
     async fn entries_with_tombstones(&self) -> Result<Vec<(Key, Option<Value>, Version)>>;
 
+    /// A range-scoped **byte** estimate for `[start, end)` (`end == None` is
+    /// unbounded above, matching the rest of this trait's range methods) — the
+    /// footprint (key bytes + value bytes) of every live key in the range
+    /// (ADR 0034: byte-based auto-split).
+    ///
+    /// The **default implementation is exact**: it scans the range (via
+    /// [`scan`](StorageEngine::scan), or [`entries`](StorageEngine::entries)
+    /// filtered by `start` when `end` is `None`) and sums `key.len() +
+    /// value.len()`. This is correct for any backend — including
+    /// [`MemoryEngine`], where materializing the range costs nothing extra —
+    /// so a new `StorageEngine` implementor gets a working (if not
+    /// necessarily *cheap*) answer for free, exactly like
+    /// [`merge_batch`](StorageEngine::merge_batch)'s per-op default.
+    /// [`LsmEngine`] overrides it with a **cheap, non-materializing
+    /// over-estimate** built from its own SSTable/memtable metadata (no disk
+    /// read) — see its override's doc for the estimator and its bias
+    /// direction. Callers that need a fast periodic gate (the auto-split
+    /// hot-path check) should prefer a backend that overrides this cheaply;
+    /// callers that need an exact count can always materialize the range
+    /// themselves instead.
+    async fn approx_bytes_in_range(&self, start: &[u8], end: Option<&[u8]>) -> Result<u64> {
+        let rows = match end {
+            Some(e) => self.scan(start, e).await?,
+            None => self
+                .entries()
+                .await?
+                .into_iter()
+                .filter(|(k, _)| k.as_slice() >= start)
+                .collect(),
+        };
+        Ok(rows
+            .iter()
+            .map(|(k, v)| (k.len() + v.value.len()) as u64)
+            .sum())
+    }
+
     /// Take a consistent snapshot at the engine's current latest version.
     fn snapshot(&self) -> Self::Snapshot;
 

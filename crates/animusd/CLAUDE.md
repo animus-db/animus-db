@@ -224,6 +224,40 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   instead of erroring or lying. The in-crate `split_fence_tests` regression
   drives both duals (get + scan) directly against a narrowed parent's
   handle, mirroring the write-side test in the same module.
+- **The auto-split trigger is byte-based, not just key-count-based (ADR
+  0034).** `--auto-split K` (keys) still works exactly as before;
+  `--auto-split-bytes B` adds an independent byte threshold
+  (`start_cluster_with_auto_split_bytes`, `BoundNode::start_with`'s new
+  `auto_split_bytes_threshold` parameter) — either, both, or neither may be
+  set, and either exceeding its threshold fires a split. The cheap per-tick
+  gate now checks `CpGroup::approx_key_count` (LSM-only, unchanged) **and**
+  `CpGroup::approx_bytes` (either backend — `animus-cp-data`'s
+  `RaftKvNode::approx_bytes` over `StorageEngine::approx_bytes_in_range`, a
+  new additive trait method with an exact default and a cheap `LsmEngine`
+  override; see that crate's doc). **The split point changes with the
+  metric**: a byte-configured cluster splits at the **byte-weighted median**
+  (`byte_weighted_median`, private to `lib.rs` — unit-tested via an in-crate
+  `#[cfg(test)] mod auto_split_median_tests`, the same "private fn, in-crate
+  test module" shape `split_fence_tests` already established), not the plain
+  positional median a key-count-only cluster keeps using unchanged. Getting
+  this right took a second pass: a naive "walk pairs accumulating a running
+  byte total, cut at the first key where it reaches half" implementation
+  looks plausible and passes a quick sanity check, but is subtly wrong
+  whenever one key's own value is a large fraction of the total — it always
+  cuts *right after* the key that pushes the running total over half, even
+  when cutting *right before* that key would land closer to an even split
+  (e.g. tiny keys summing to 100 bytes, then a first huge key of 10,000
+  bytes with total 20,104 and half 10,052: the naive walk returns the *next*
+  key after that huge one, giving a 100-byte / 20,004-byte split — the huge
+  key's own bytes always land on the larger side no matter which of its two
+  neighboring cut points is actually closer to half). The fix scans every
+  achievable interior cut point (a key boundary — a key's bytes can never be
+  divided) and picks whichever prefix sum is *closest* to half, which is the
+  best any key-boundary split can do. General lesson: a "weighted median via
+  a single accumulate-and-threshold pass" is only correct when no single
+  item can dominate half the total; once one can, compare the two
+  candidate cuts *around* it (before vs. after) rather than committing to
+  whichever side the accumulator happens to cross the threshold on.
 - **Every CP write path stamps + pre-checks the ADR 0028 write fence** (fixed
   2026-08-07 — the fences existed and were unit-tested in `animus-cp-data`
   since the split redesign, but had zero real callers here: `cp_put_local`/
