@@ -217,7 +217,7 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   a growth node ever learns it was placed on a tablet at all; its 500ms
   fallback tick is what fires there, since a growth node's own control raft
   never advances and so never wakes `metadata_watch`),
-  `peer_sync_loop`, `register_cp_addr`'s own commit confirmation, `cp_put`/
+  `peer_sync_loop`, `register_node_addrs`'s own commit confirmation, `cp_put`/
   `cp_get`'s `has_table_tablet` gate, and `/admin/status`. `propose_schema`
   (the shared "propose locally if leader, else relay to a *known* leader"
   primitive) also gained a last-resort fallback — broadcast to every other
@@ -225,15 +225,45 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   (true forever for a non-participating growth node, since it never receives
   a heartbeat/AppendEntries telling it who leads) — without this, a growth
   node's own address self-registration could never reach the real cluster.
-  **Known residual gap**: a *pre-growth* node's `client_route` is a static map
-  built once at its own process start, so it cannot forward a client op to a
-  tablet leader that has since moved onto a newly grown node — only a growth
-  node's own `client_route` (built from the expanded config) is always
-  complete. Route new client traffic through the grown nodes' own addresses
-  until a replicated client-address map closes this (ADR 0030's documented
-  follow-up). `tests/cluster_growth.rs`: 3→5 growth, no restart of the
-  original 3, admin-add + promotion + rebalancing onto the new nodes +
-  reads/writes throughout + a never-booted phantom staying `Down`.
+  **The residual gap this bullet used to document — a pre-growth node's
+  `client_route` being a static, process-start-only snapshot that could never
+  forward to a tablet leader on a node grown in afterward — is closed by ADR
+  0032 PR1** (see its own entry below): every node's `client_route` is now
+  kept live by `route_sync_loop`. `tests/cluster_growth.rs`: 3→5 growth, no
+  restart of the original 3, admin-add + promotion + rebalancing onto the new
+  nodes + reads/writes throughout (including through an **original** node
+  only, to a tablet leader that has since migrated onto a grown node — ADR
+  0032 PR1's own regression) + a never-booted phantom staying `Down` + the
+  admin peer list eventually including the grown nodes' admin addresses.
+- **A replicated node address book (ADR 0032 PR1) closes the `client_route`/
+  `/admin/peers` staleness ADR 0030 above documents, and is the foundation
+  PR2 (`animusd join`) and PR3 (decommission) build on** — see
+  `docs/adr/0032-seed-join-membership.md` for the full 3-PR design; only PR1 is
+  implemented so far. `Metadata.node_addrs: BTreeMap<NodeId, NodeAddrs>`
+  (`animus_control::meta::NodeAddrs { raftkv, client, admin }`) is every
+  member's full address set, mutated by `MetaCommand::RegisterNodeAddrs`
+  (idempotent, mirrors `RegisterCpAddr`'s own apply shape). Every node
+  proposes it once at startup (`ClientCtx::register_node_addrs`, superseding
+  the old `register_cp_addr` self-registration — `RegisterCpAddr`/
+  `cp_member_addrs` are kept only for WAL back-compat and the internal
+  `raftkv` peer book, never proposed by `animusd` anymore).
+  `RegisterNodeAddrs` is in `is_relayable_command`'s allowlist (a
+  follower-connected node must relay its own self-registration to the
+  control leader — the same bimodal-failure shape every prior addition to
+  this allowlist documents). Three consumers gained a **live** overlay on top
+  of their previous static-only or `cp_member_addrs`-only view, all following
+  the same "static seed ∪ replicated overlay, recomputed every tick" shape
+  `peer_sync_loop` already established: (1) `peer_sync_loop` itself now also
+  overlays `node_addrs[*].raftkv`; (2) `ClientCtx.client_route` is now
+  `Arc<Mutex<BTreeMap<NodeId, SocketAddr>>>` (read via
+  `ClientCtx::route_addr`/`route_snapshot`, never locked across an `.await`),
+  kept live by the new **`route_sync_loop`** (a `peer_sync_loop` sibling, same
+  `PEER_SYNC_INTERVAL` cadence) overlaying `node_addrs[*].client`; (3)
+  `/admin/peers` (`admin.rs::peers_view`) now unions the static `admin_addrs`
+  with `node_addrs[*].admin`, deduplicated and sorted. All three read through
+  `ClientCtx::effective_metadata()`, so a control-plane-follower-less growth
+  node (ADR 0030) syncs off its own remote mirror like every other
+  `Metadata`-derived view it depends on.
 - **The per-node tablet-host reconciler (ADR 0031 PR4) is the single owner of
   this node's tablet lifecycle** — it replaced the three loops this file used
   to document separately (`cp_join_host_loop`, `cp_gc_loop` +

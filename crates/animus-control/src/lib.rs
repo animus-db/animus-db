@@ -28,7 +28,7 @@ pub mod schema;
 pub mod shared_wal;
 
 pub use detector::{FailureDetector, Liveness};
-pub use meta::{ApplyOutcome, Member, MetaCommand, Metadata, NodeStatus};
+pub use meta::{ApplyOutcome, Member, MetaCommand, Metadata, NodeAddrs, NodeStatus};
 pub use node::{MetadataChanged, MetadataWatch, RaftNode};
 pub use schema::{
     ColumnDef, ColumnType, IndexDef, IndexKind, IndexProjection, ReplicationMode, SchemaCatalog,

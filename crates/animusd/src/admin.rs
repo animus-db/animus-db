@@ -304,13 +304,22 @@ fn config_view(ctx: &ClientCtx) -> Value {
 }
 
 /// The admin addresses of every node in the cluster (ADR 0021) — the seed list
-/// the web dashboard fans out to. Each `animusd` process knows the whole cluster's
-/// addresses (from its `ClusterConfig` in per-process mode, or the in-process
-/// bring-up), so the dashboard need not guess ports. `this` marks the node serving
-/// the page. Degrades to just this node's address when the full set is unknown.
+/// the web dashboard fans out to. The **union** of this node's static
+/// `admin_addrs` (known from its `ClusterConfig` in per-process mode, or the
+/// in-process bring-up) and every address in the replicated
+/// `Metadata.node_addrs[*].admin` (ADR 0032 PR1) — so a node grown into the
+/// cluster after this node's own startup is still listed, closing the same ADR
+/// 0030 residual gap `route_sync_loop` closes for client-op forwarding.
+/// Deduplicated, stable (sorted) order so the dashboard's fan-out set doesn't
+/// jitter between polls. `this` marks the node serving the page.
 fn peers_view(ctx: &ClientCtx) -> Value {
     let a = &ctx.admin;
-    let admin_addrs: Vec<String> = a.admin_addrs.iter().map(ToString::to_string).collect();
+    let mut admin_addrs: std::collections::BTreeSet<String> =
+        a.admin_addrs.iter().map(ToString::to_string).collect();
+    for addrs in ctx.effective_metadata().node_addrs.into_values() {
+        admin_addrs.insert(addrs.admin);
+    }
+    let admin_addrs: Vec<String> = admin_addrs.into_iter().collect();
     json!({
         "this": a.admin_addr.to_string(),
         "admin_addrs": admin_addrs,

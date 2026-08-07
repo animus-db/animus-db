@@ -37,7 +37,8 @@ pub use config::ClusterConfig;
 // cluster metadata — membership status and the tablet map — without depending on
 // `animus-control` directly.
 pub use animus_control::{
-    ColumnDef, ColumnType, MetaCommand, Metadata, NodeStatus, ReplicationMode, TableSchema,
+    ColumnDef, ColumnType, MetaCommand, Metadata, NodeAddrs, NodeStatus, ReplicationMode,
+    TableSchema,
 };
 
 mod admin;
@@ -572,6 +573,12 @@ fn is_relayable_command(command: &MetaCommand) -> bool {
             | MetaCommand::CreateKeyspace { .. }
             | MetaCommand::DropKeyspace { .. }
             | MetaCommand::RegisterCpAddr { .. }
+            // Node address book (ADR 0032 PR1): every node self-registers its
+            // full address set at startup, from whichever node it happens to
+            // connect to for control-plane proposals — must relay like
+            // `RegisterCpAddr` (a follower-connected node has no other way to
+            // reach the control leader).
+            | MetaCommand::RegisterNodeAddrs { .. }
             | MetaCommand::SplitTablet { .. }
             // Provision-at-create (ADR 0023): a `CreateTable` on a follower-connected
             // client relays the table's tablet creation + RF policy to the control
@@ -788,6 +795,12 @@ impl BoundNode {
         let raftkv_hb_env = self.raftkv_env.clone();
         let my_raftkv_id = self.raftkv_id;
         let my_raftkv_addr = self.raftkv_addr;
+        // Captured here (all `SocketAddr`, `Copy`) for the node-address-book
+        // self-registration below (ADR 0032 PR1) — `self.client_listener`/
+        // `self.admin_listener` (not `Copy`) are moved into their `serve` tasks
+        // further down, but the addresses themselves are needed there too.
+        let my_client_addr = self.client_addr;
+        let my_admin_addr = self.admin_addr;
 
         // The node's identity + bound addresses for the admin `/admin/config`
         // view (ADR 0020), captured before the envs are consumed below.
@@ -877,15 +890,20 @@ impl BoundNode {
         //
         // The shared client context is built **here**, before the CP hosting block,
         // so the split-seed + re-host paths can publish a new member's address
-        // through it (`register_cp_addr` relays to the control leader cross-process
-        // via `client_route` — #4 cross-process split-address relay), not just via a
-        // local control-leader handle.
+        // through it (`register_node_addrs` relays to the control leader
+        // cross-process via `client_route` — #4 cross-process split-address
+        // relay), not just via a local control-leader handle.
+        //
+        // `static_route` is the seed [`route_sync_loop`] (below) re-overlays
+        // `Metadata.node_addrs[*].client` onto every tick (ADR 0032 PR1) — the
+        // same static-base pattern `peer_sync_loop` already uses.
+        let static_route = client_route.clone();
         let ctx = ClientCtx {
             raft: raft.clone(),
             rmw_lock: Arc::new(tokio::sync::Mutex::new(())),
             edge: edge.clone(),
             raftkv_metrics,
-            client_route,
+            client_route: Arc::new(Mutex::new(client_route)),
             base_id: my_raftkv_id,
             admin: admin_info,
             metrics_history: Arc::new(Mutex::new(VecDeque::with_capacity(METRICS_HISTORY_CAP))),
@@ -955,6 +973,16 @@ impl BoundNode {
             static_peers.clone(),
         )));
 
+        // Route-sync loop (ADR 0032 PR1): keep `ctx.client_route` = the static
+        // seed above ∪ `Metadata.node_addrs[*].client`, so a node grown in after
+        // this node's own startup still becomes a valid client-op forward target
+        // and `propose_schema`'s relay/broadcast can reach it too — closing the
+        // ADR 0030 residual gap where this map was a process-start-only
+        // snapshot. Sibling of `peer_sync_loop` (same cadence, same static-base
+        // pattern); runs on every node, including a growth node (reads
+        // `effective_metadata()`, so it syncs off its own remote mirror).
+        tasks.push(tokio::spawn(route_sync_loop(ctx.clone(), static_route)));
+
         // **Control-plane-follower-less growth node mirror** (ADR 0030): this
         // node's own control role is a genuine voter of `control_ids` iff its own
         // control id is *in* that set — the common case for every node started
@@ -976,7 +1004,7 @@ impl BoundNode {
         if !control_ids.contains(&self.control_id) {
             let seeds: Vec<SocketAddr> = control_ids
                 .iter()
-                .filter_map(|id| ctx.client_route.get(id).copied())
+                .filter_map(|id| ctx.route_addr(*id))
                 .collect();
             tasks.push(tokio::spawn(remote_metadata_sync_loop(ctx.clone(), seeds)));
         }
@@ -1012,20 +1040,23 @@ impl BoundNode {
         // Client request server + DynamoDB HTTP + CQL endpoints share the same
         // context built above (the same raft view, RMW lock, and CP edge state).
         {
-            // A CP-hosting node registers its `raftkv` address in the replicated
-            // Metadata (Phase 2.3a), so peer-sync on every node can reach it. The
-            // bootstrap members' addrs are already in the static peer book, so this
-            // is the path a *new* member (split sibling / join) reuses.
-            // Every node registers its base `raftkv` address so peer-sync on every
-            // node can reach it (hosting is dynamic now — a node may host the first
-            // table's tablet on this base env, and a node beyond the bootstrap set is
-            // not in the static peer book). The per-tablet `cp_join_host` path also
-            // registers a minted sibling's address when it stands a group up.
+            // Every node registers its full address book (ADR 0032 PR1 —
+            // raftkv/client/admin) in the replicated `Metadata` once at startup,
+            // so peer-sync (raftkv addresses) and any node's route/peers views
+            // (client/admin addresses) can resolve it regardless of when this
+            // node joined relative to the reader.
             {
                 let ctx = ctx.clone();
                 tasks.push(tokio::spawn(async move {
-                    ctx.register_cp_addr(my_raftkv_id, my_raftkv_addr.to_string())
-                        .await;
+                    ctx.register_node_addrs(
+                        my_raftkv_id,
+                        NodeAddrs {
+                            raftkv: my_raftkv_addr.to_string(),
+                            client: my_client_addr.to_string(),
+                            admin: my_admin_addr.to_string(),
+                        },
+                    )
+                    .await;
                 }));
             }
             // Auto-split loop (Phase 2.4), opt-in: a node splits a tablet it leads
@@ -1463,12 +1494,20 @@ pub(crate) struct ClientCtx {
     /// CP-group routing table: each CP group member id (`raftkv_id`, `300+i`) → the
     /// **client API** address of its hosting node (ADR 0017 #3b). Lets a node that
     /// received a CP op but doesn't host the group leader **forward** the request to
-    /// the leader's node. Built from the cluster config/bound addresses — always
-    /// populated (ADR 0031 PR2: `start_cluster_with`'s in-process `--cluster N`
-    /// bring-up builds this the same way `run_node_with` does, since each node
-    /// now has its own `ClusterEdgeState` and must genuinely forward to reach
-    /// another node's group).
-    client_route: BTreeMap<NodeId, SocketAddr>,
+    /// the leader's node. Seeded from the cluster config/bound addresses at startup
+    /// (ADR 0031 PR2: `start_cluster_with`'s in-process `--cluster N` bring-up
+    /// builds this the same way `run_node_with` does, since each node now has its
+    /// own `ClusterEdgeState` and must genuinely forward to reach another node's
+    /// group) and kept **live** thereafter by [`route_sync_loop`] (ADR 0032 PR1):
+    /// each tick overlays `Metadata.node_addrs[*].client` on top of the static
+    /// seed, so a node grown in *after* this node's own startup still becomes a
+    /// valid forward target — closing the ADR 0030 residual gap where this map
+    /// was a process-start-only snapshot. `Arc<Mutex<_>>` so the sync loop can
+    /// replace it in place while every clone of this `ClientCtx` (one per
+    /// connection) observes the update; read via [`route_addr`](Self::route_addr)
+    /// / [`route_snapshot`](Self::route_snapshot), never locked across an
+    /// `.await`.
+    client_route: Arc<Mutex<BTreeMap<NodeId, SocketAddr>>>,
     /// This node's **base `raftkv` id** — its identity in a tablet's replica set
     /// (ADR 0023). Used by routing to tell "this node is a replica of the tablet, so
     /// wait for its own group to form" from "this node hosts nothing for the tablet,
@@ -1523,6 +1562,29 @@ impl ClientCtx {
             return meta;
         }
         self.raft.metadata()
+    }
+
+    /// The client-API address `id` currently routes to, if known (ADR 0032
+    /// PR1) — a single lookup into the live [`client_route`](Self::client_route)
+    /// map, kept fresh by [`route_sync_loop`]. Never holds the lock across an
+    /// `.await`.
+    fn route_addr(&self, id: NodeId) -> Option<SocketAddr> {
+        self.client_route
+            .lock()
+            .expect("client route poisoned")
+            .get(&id)
+            .copied()
+    }
+
+    /// A clone of the whole live `client_route` map (ADR 0032 PR1), for a
+    /// caller that needs to search/iterate it — cloning out under the lock
+    /// keeps every subsequent lookup lock-free (and safe to hold across an
+    /// `.await`).
+    fn route_snapshot(&self) -> BTreeMap<NodeId, SocketAddr> {
+        self.client_route
+            .lock()
+            .expect("client route poisoned")
+            .clone()
     }
 
     /// The id of the tablet whose key range covers `key`, from this node's cached
@@ -1626,11 +1688,12 @@ impl ClientCtx {
             let meta = self.effective_metadata();
             let replicas = meta.tablets.get(&tablet).map(|t| &t.replicas);
             let is_replica = replicas.is_some_and(|r| r.contains(&self.base_id));
+            let route = self.route_snapshot();
             let fallback = replicas
                 .into_iter()
                 .flatten()
-                .find_map(|id| self.client_route.get(id).copied())
-                .or_else(|| self.client_route.values().next().copied());
+                .find_map(|id| route.get(id).copied())
+                .or_else(|| route.values().next().copied());
             (is_replica, fallback)
         };
         // `has_local_leader: false` and `forward_hint: None` here are exactly the
@@ -2261,7 +2324,7 @@ impl ClientCtx {
         // base `raftkv` id, so the local replica's leader hint is already a
         // `client_route` key — no more base<->member translation needed.
         let leader = self.edge.local_cp(tablet).and_then(|n| n.leader())?;
-        self.client_route.get(&leader).copied()
+        self.route_addr(leader)
     }
 
     /// Forward a CP op to another node's client API (wrapped so the receiver
@@ -2323,7 +2386,7 @@ impl ClientCtx {
             );
         }
         if let Some(leader_id) = self.raft.leader() {
-            if let Some(&addr) = self.client_route.get(&leader_id) {
+            if let Some(addr) = self.route_addr(leader_id) {
                 return !matches!(
                     self.relay(addr, ClientRequest::ProposeSchema(command.clone()))
                         .await,
@@ -2345,7 +2408,7 @@ impl ClientCtx {
         // connects, regardless of what its own `propose_schema` achieves
         // (best-effort, same as every other branch here — the caller confirms
         // via replicated `Metadata`, not this return value).
-        for &addr in self.client_route.values() {
+        for addr in self.route_snapshot().into_values() {
             if addr == self.admin.client_addr {
                 continue;
             }
@@ -2700,7 +2763,10 @@ async fn bootstrap(raft: RaftNode<ProdEnv>, raftkv_ids: Vec<NodeId>) {
 const PEER_SYNC_INTERVAL: Duration = Duration::from_millis(200);
 
 /// Keep the `raftkv` env family's peer book = the **static** book ∪ the replicated
-/// `Metadata.cp_member_addrs` (Phase 2.3a address distribution). `set_peers`
+/// `Metadata.cp_member_addrs` ∪ `Metadata.node_addrs[*].raftkv` (Phase 2.3a address
+/// distribution, extended by ADR 0032 PR1's node address book — a node's own
+/// `raftkv` address is registered there too, so a node that joined via `RegisterNodeAddrs`
+/// alone, without ever going through `RegisterCpAddr`, is still reachable). `set_peers`
 /// replaces the book and a `sibling` env shares the same book `Arc`, so syncing the
 /// `raftkv` env reaches every co-resident CP group. Idempotent each tick; runs for
 /// the life of the node (a perpetual loop, aborted on `shutdown`). A peer entry
@@ -2708,9 +2774,9 @@ const PEER_SYNC_INTERVAL: Duration = Duration::from_millis(200);
 ///
 /// Takes the whole [`ClientCtx`] (not a bare `RaftNode`) so a control-plane-
 /// follower-less growth node (ADR 0030) reads `effective_metadata` — its mirror
-/// of the real cluster's `cp_member_addrs` — instead of its own never-replicated
-/// local raft; every other node is unaffected (`effective_metadata` passes
-/// through to `raft.metadata()` there).
+/// of the real cluster's `cp_member_addrs`/`node_addrs` — instead of its own
+/// never-replicated local raft; every other node is unaffected (`effective_metadata`
+/// passes through to `raft.metadata()` there).
 async fn peer_sync_loop(
     ctx: ClientCtx,
     raftkv_env: ProdEnv,
@@ -2718,12 +2784,42 @@ async fn peer_sync_loop(
 ) {
     loop {
         let mut book = static_peers.clone();
-        for (id, addr) in ctx.effective_metadata().cp_member_addrs {
+        let meta = ctx.effective_metadata();
+        for (id, addr) in meta.cp_member_addrs {
             if let Ok(sa) = addr.parse::<SocketAddr>() {
                 book.insert(id, sa);
             }
         }
+        for (id, addrs) in meta.node_addrs {
+            if let Ok(sa) = addrs.raftkv.parse::<SocketAddr>() {
+                book.insert(id, sa);
+            }
+        }
         raftkv_env.set_peers(book);
+        tokio::time::sleep(PEER_SYNC_INTERVAL).await;
+    }
+}
+
+/// Keep `ctx.client_route` = the **static** seed (this node's own config-time
+/// route table) ∪ the replicated `Metadata.node_addrs[*].client` (ADR 0032 PR1),
+/// so a node grown in after this node's own startup becomes a valid forward
+/// target for a client op / `propose_schema` relay — closing the ADR 0030
+/// residual gap where `client_route` was a process-start-only snapshot. Sibling
+/// of [`peer_sync_loop`] in every respect: same [`PEER_SYNC_INTERVAL`] cadence,
+/// same static-base-∪-replicated-overlay shape, reads
+/// [`ClientCtx::effective_metadata`] so a control-plane-follower-less growth
+/// node (ADR 0030) syncs off its own remote mirror instead of its
+/// never-replicated local raft. A `node_addrs` entry whose `client` address
+/// fails to parse is skipped.
+async fn route_sync_loop(ctx: ClientCtx, static_route: BTreeMap<NodeId, SocketAddr>) {
+    loop {
+        let mut book = static_route.clone();
+        for (id, addrs) in ctx.effective_metadata().node_addrs {
+            if let Ok(sa) = addrs.client.parse::<SocketAddr>() {
+                book.insert(id, sa);
+            }
+        }
+        *ctx.client_route.lock().expect("client route poisoned") = book;
         tokio::time::sleep(PEER_SYNC_INTERVAL).await;
     }
 }
@@ -3226,39 +3322,34 @@ impl ClientCtx {
         self.raft.metadata().has_keyspace(keyspace)
     }
 
-    /// Register this node's CP group member `id` → `addr` in the replicated
-    /// `Metadata` (Phase 2.3a), so every node's peer-sync loop can reach it. Routes
-    /// to the control leader via the A2 relay (now also accepting `RegisterCpAddr`)
-    /// and waits until the entry is visible here, re-proposing each tick. Best-effort
-    /// (bounded by [`SCHEMA_COMMIT_TIMEOUT`]); idempotent (re-registering the same
-    /// address is a state-machine no-op).
-    pub(crate) async fn register_cp_addr(&self, id: NodeId, addr: String) {
+    /// Register this node's **full address book** (ADR 0032 PR1: raftkv +
+    /// client + admin) in the replicated `Metadata`, so any node — including one
+    /// that joined the cluster earlier and never restarted — can resolve where
+    /// to forward/relay a client op or an admin peer-list entry, closing the ADR
+    /// 0030 residual gap where `client_route`/the admin peer list were static
+    /// per-process snapshots taken once at startup. Supersedes the old
+    /// `register_cp_addr` (kept as `MetaCommand::RegisterCpAddr` only for WAL
+    /// back-compat; no longer proposed). Routes to the control leader via the
+    /// relay (`RegisterNodeAddrs` is in [`is_relayable_command`]'s allowlist) and
+    /// waits until the entry is visible here, re-proposing each tick. Best-effort
+    /// (bounded by [`SCHEMA_COMMIT_TIMEOUT`]); idempotent (re-registering an
+    /// identical address book is a state-machine no-op).
+    pub(crate) async fn register_node_addrs(&self, node: NodeId, addrs: NodeAddrs) {
         // `effective_metadata`, not `self.raft.metadata()` directly: on a growth
         // node (ADR 0030) this is the *only* signal that its own self-registration
         // actually landed on the real cluster, since its local raft never
         // replicates — see `effective_metadata`'s doc. `propose_and_await`'s
         // relay reaches a real leader via `propose_schema`'s no-known-leader
         // broadcast fallback, but confirmation must poll the mirror.
-        if self.effective_metadata().cp_member_addrs.get(&id) == Some(&addr) {
+        if self.effective_metadata().node_addrs.get(&node) == Some(&addrs) {
             return;
         }
-        let want = addr.clone();
+        let want = addrs.clone();
         let _ = self
             .propose_and_await(
-                // `tablet: None` = legacy, never GC'd (ADR 0024). Passing the
-                // owning tablet here (so a dropped tablet's addresses are
-                // reclaimed) is the animusd wiring of the address GC — a
-                // follow-up PR; this only tracks the enum's new field.
-                MetaCommand::RegisterCpAddr {
-                    id,
-                    addr,
-                    tablet: None,
-                },
+                MetaCommand::RegisterNodeAddrs { node, addrs },
                 SCHEMA_COMMIT_TIMEOUT,
-                || {
-                    (self.effective_metadata().cp_member_addrs.get(&id) == Some(&want))
-                        .then_some(())
-                },
+                || (self.effective_metadata().node_addrs.get(&node) == Some(&want)).then_some(()),
             )
             .await;
     }
@@ -3641,6 +3732,10 @@ async fn start_cluster_inner(
     // cross-node reach happens only through this real forwarding/relay path,
     // never a shared in-process registry (root `CLAUDE.md`'s documented
     // "shared edge masks per-node bugs" gotcha — this removes the sharing).
+    // This is only the **static seed**: `start_with` hands it to each node's
+    // own `route_sync_loop`, which keeps it live thereafter by overlaying
+    // `Metadata.node_addrs[*].client` (ADR 0032 PR1) — so a node grown into
+    // the cluster later is still reachable from every original node.
     let client_route: BTreeMap<NodeId, SocketAddr> = bound
         .iter()
         .flat_map(|b| [(b.raftkv_id, b.client_addr), (b.control_id, b.client_addr)])

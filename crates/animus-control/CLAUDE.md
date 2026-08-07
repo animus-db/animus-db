@@ -12,7 +12,11 @@ epoch compare-and-swap transactions.
 
 - `meta.rs` — `Metadata` (members + tablet map + placement policies + the
   table-schema catalog + keyspaces + **`cp_member_addrs`**: CP group member id →
-  `raftkv` address, Phase 2 address distribution) and `MetaCommand` (`UpsertMember`,
+  `raftkv` address, Phase 2 address distribution + **`node_addrs`** (ADR 0032
+  PR1): member id → `NodeAddrs { raftkv, client, admin }`, the full node
+  address book — a superset of `cp_member_addrs` for the client/admin axes,
+  keeping `cp_member_addrs` alive only for WAL back-compat and the internal
+  `raftkv` peer book) and `MetaCommand` (`UpsertMember`,
   `CreateTablet`, `CasTabletReplicas`, **`SplitTablet`** (ADR 0028: the *entire*
   split operation — epoch-CAS gated like `CasTabletReplicas`; narrows the source
   tablet's range and mints a new sibling tablet over the same node-shared storage
@@ -27,7 +31,12 @@ epoch compare-and-swap transactions.
   when a tablet leaves the map (`DropTableTablets`/`MergeTablets`) its members'
   addresses are pruned from `cp_member_addrs` + `cp_member_tablets`, keyed on
   *current absence* so a replayed historical state cannot resurrect them;
-  legacy tablet-less entries are never pruned). `Metadata::apply` is the
+  legacy tablet-less entries are never pruned; **kept for WAL back-compat only
+  — no longer proposed by `animusd`'s own startup path, ADR 0032 PR1**),
+  **`RegisterNodeAddrs`** (ADR 0032 PR1: idempotent register/overwrite of a
+  member's full `NodeAddrs`, mirroring `RegisterCpAddr`'s own apply shape —
+  every node proposes this once at startup in place of `RegisterCpAddr`).
+  `Metadata::apply` is the
   deterministic state machine; `Metadata::reconcile` is
   the pure placement decision (see below), whose shared body also backs
   **`PlacementView::reconcile`** — the narrow (members + tablets + policies,
