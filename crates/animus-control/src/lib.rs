@@ -25,6 +25,7 @@ pub mod node;
 pub mod persist;
 pub mod raft;
 pub mod schema;
+pub mod shared_wal;
 
 pub use detector::{FailureDetector, Liveness};
 pub use meta::{ApplyOutcome, Member, MetaCommand, Metadata, NodeStatus};
@@ -40,3 +41,4 @@ pub use schema::{
 pub use animus_placement::PlacementPolicy;
 pub use persist::{PersistedState, WalRecord};
 pub use raft::{LogEntry, ProposeResult, RaftCore, RaftMsg, Role, StateMachine};
+pub use shared_wal::SharedWal;
