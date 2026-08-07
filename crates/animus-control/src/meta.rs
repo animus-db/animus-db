@@ -275,6 +275,37 @@ pub enum MetaCommand {
     /// other node (including one that joined earlier and never restarted) can
     /// resolve it as a forward/relay target.
     RegisterNodeAddrs { node: NodeId, addrs: NodeAddrs },
+    /// **Decommission** a drained member (ADR 0032 PR3): the second half of
+    /// `drain` (which only marks a member `Leaving` and lets the placement
+    /// reconciler + rebalancer + release-GC relocate its tablets off it with no
+    /// new mechanism). Applied under three preconditions, enforced here — at
+    /// APPLY time, not just by whichever caller proposed it — because a racing
+    /// second proposer's propose-time view could be stale:
+    /// - member **absent**: idempotent no-op (`Applied`) — a retried removal
+    ///   (e.g. the proposer's confirm timed out but the command actually
+    ///   landed) converges instead of erroring;
+    /// - member present but `status` is `Active`/`Joining`: **rejected** —
+    ///   removing a still-serving member could strand a tablet's replication
+    ///   factor with no warning;
+    /// - [`Metadata::tablets_referencing`]`(node) > 0`: **rejected** — the
+    ///   member is still a replica of some tablet, and removing it from
+    ///   `members` would drop that tablet below its replication factor with
+    ///   the member gone from the placement candidate pool entirely, with no
+    ///   repair path left (placement can only choose from `Active` members).
+    ///
+    /// On success, `node` is pruned from `members` **and** its entries in
+    /// [`Metadata::node_addrs`]/[`Metadata::cp_member_addrs`]/
+    /// [`Metadata::cp_member_tablets`] are pruned in the same apply — mirroring
+    /// the existing ADR 0024 GC discipline for tablet-scoped `cp_member_addrs`
+    /// entries (keyed on current absence, so a replayed historical state can't
+    /// resurrect a removed member's addresses).
+    ///
+    /// **Removal is not a fence**: it only stops this node's own automatic
+    /// self-registration from ever re-asserting it (that happens once, at
+    /// process startup) — a node whose *process* is restarted at the same
+    /// raftkv id re-registers and rejoins exactly like a fresh join. The
+    /// decommission flow's real last step is stopping the process.
+    RemoveMember { node: NodeId },
 }
 
 /// The deterministic result of applying a [`MetaCommand`].
@@ -736,6 +767,24 @@ impl Metadata {
                     ApplyOutcome::Applied
                 }
             }
+            MetaCommand::RemoveMember { node } => {
+                let Some(member) = self.members.get(node) else {
+                    // Already absent: an idempotent retry (e.g. a proposer whose
+                    // confirm timed out after the command actually committed).
+                    return ApplyOutcome::Applied;
+                };
+                if matches!(member.status, NodeStatus::Active | NodeStatus::Joining) {
+                    return ApplyOutcome::Rejected("not drained: member is Active or Joining");
+                }
+                if self.tablets_referencing(*node) > 0 {
+                    return ApplyOutcome::Rejected("still referenced by a tablet's replica set");
+                }
+                self.members.remove(node);
+                self.node_addrs.remove(node);
+                self.cp_member_addrs.remove(node);
+                self.cp_member_tablets.remove(node);
+                ApplyOutcome::Applied
+            }
         }
     }
 
@@ -824,6 +873,22 @@ impl Metadata {
     #[must_use]
     pub fn has_table_tablet(&self, table: &str) -> bool {
         self.tablets_for_table(table).next().is_some()
+    }
+
+    /// Count of tablets whose **current** replica set still names `node` (ADR
+    /// 0032 PR3): the drain-complete predicate — a member is safe to remove
+    /// only once this is `0` — and the same invariant
+    /// [`MetaCommand::RemoveMember`]'s apply-time guard enforces. Removing a
+    /// member while any tablet still lists it as a replica would silently drop
+    /// that tablet below its replication factor with the member gone from the
+    /// placement candidate pool entirely, and no repair path left (placement
+    /// only ever chooses from `Active` members).
+    #[must_use]
+    pub fn tablets_referencing(&self, node: NodeId) -> usize {
+        self.tablets
+            .values()
+            .filter(|t| t.replicas.contains(&node))
+            .count()
     }
 
     /// The next tablet id a proposer should request when creating a tablet (ADR
@@ -1371,5 +1436,117 @@ mod tests {
             ApplyOutcome::Applied
         );
         assert!(m.tablets.contains_key(&TabletId(3)));
+    }
+
+    /// ADR 0032 PR3: `RemoveMember` is rejected while a tablet still names the
+    /// member as a replica — removing it would silently drop that tablet below
+    /// its replication factor with the member gone from the placement candidate
+    /// pool entirely.
+    #[test]
+    fn remove_member_rejects_while_referenced_by_a_tablet() {
+        let mut m = Metadata::default();
+        m.apply(&MetaCommand::UpsertMember {
+            node: 301,
+            labels: BTreeMap::new(),
+            status: NodeStatus::Leaving,
+        });
+        m.apply(&MetaCommand::CreateTablet {
+            tablet: TabletId(1),
+            table: Some("users".to_owned()),
+            range: KeyRange::whole(),
+            replicas: vec![300, 301, 302],
+        });
+        assert_eq!(m.tablets_referencing(301), 1);
+        assert_eq!(
+            m.apply(&MetaCommand::RemoveMember { node: 301 }),
+            ApplyOutcome::Rejected("still referenced by a tablet's replica set")
+        );
+        assert!(m.members.contains_key(&301));
+    }
+
+    /// `RemoveMember` is rejected while the member is still `Active`/`Joining` —
+    /// removing a still-serving member could strand a tablet's replication
+    /// factor with no warning.
+    #[test]
+    fn remove_member_rejects_while_active_or_joining() {
+        for status in [NodeStatus::Active, NodeStatus::Joining] {
+            let mut m = Metadata::default();
+            m.apply(&MetaCommand::UpsertMember {
+                node: 301,
+                labels: BTreeMap::new(),
+                status,
+            });
+            assert_eq!(
+                m.apply(&MetaCommand::RemoveMember { node: 301 }),
+                ApplyOutcome::Rejected("not drained: member is Active or Joining"),
+                "status {status:?} should block removal"
+            );
+            assert!(m.members.contains_key(&301));
+        }
+    }
+
+    /// A drained (`Leaving`/`Down`), unreferenced member is removed — and its
+    /// address-book entries are pruned in the same apply — and a second removal
+    /// of the same, now-absent id is an idempotent no-op (`Applied`), never a
+    /// `Rejected`, so a proposer that retries after a timed-out confirm
+    /// converges instead of erroring.
+    #[test]
+    fn remove_member_applies_after_drain_and_prunes_addrs_then_is_idempotent() {
+        for status in [NodeStatus::Leaving, NodeStatus::Down] {
+            let mut m = Metadata::default();
+            m.apply(&MetaCommand::UpsertMember {
+                node: 301,
+                labels: BTreeMap::new(),
+                status,
+            });
+            m.apply(&MetaCommand::RegisterNodeAddrs {
+                node: 301,
+                addrs: NodeAddrs {
+                    raftkv: "127.0.0.1:9301".to_owned(),
+                    client: "127.0.0.1:9001".to_owned(),
+                    admin: "127.0.0.1:9501".to_owned(),
+                },
+            });
+            m.apply(&MetaCommand::RegisterCpAddr {
+                id: 301,
+                addr: "127.0.0.1:9301".to_owned(),
+                tablet: None,
+            });
+            assert_eq!(m.tablets_referencing(301), 0);
+
+            assert_eq!(
+                m.apply(&MetaCommand::RemoveMember { node: 301 }),
+                ApplyOutcome::Applied,
+                "status {status:?} should allow removal"
+            );
+            assert!(!m.members.contains_key(&301));
+            assert!(!m.node_addrs.contains_key(&301));
+            assert!(!m.cp_member_addrs.contains_key(&301));
+            assert!(!m.cp_member_tablets.contains_key(&301));
+
+            // Idempotent retry: already absent, still `Applied`, not `Rejected`.
+            assert_eq!(
+                m.apply(&MetaCommand::RemoveMember { node: 301 }),
+                ApplyOutcome::Applied
+            );
+        }
+    }
+
+    /// A `Metadata` snapshot serialized before ADR 0032 PR3 (no `RemoveMember`
+    /// variant in the enum at the time) still round-trips: `MetaCommand` gained
+    /// an additive variant, and every pre-existing field/command already
+    /// decodes unchanged (this doesn't touch any `#[serde(default)]` field, so a
+    /// plain round trip is the whole proof).
+    #[test]
+    fn metadata_round_trips_with_the_remove_member_variant_in_scope() {
+        let mut m = Metadata::default();
+        m.apply(&MetaCommand::UpsertMember {
+            node: 301,
+            labels: BTreeMap::new(),
+            status: NodeStatus::Active,
+        });
+        let value = serde_json::to_value(&m).expect("metadata serializes");
+        let decoded: Metadata = serde_json::from_value(value).expect("metadata round-trips");
+        assert_eq!(decoded, m);
     }
 }

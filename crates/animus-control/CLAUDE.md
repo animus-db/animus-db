@@ -35,7 +35,14 @@ epoch compare-and-swap transactions.
   — no longer proposed by `animusd`'s own startup path, ADR 0032 PR1**),
   **`RegisterNodeAddrs`** (ADR 0032 PR1: idempotent register/overwrite of a
   member's full `NodeAddrs`, mirroring `RegisterCpAddr`'s own apply shape —
-  every node proposes this once at startup in place of `RegisterCpAddr`).
+  every node proposes this once at startup in place of `RegisterCpAddr`),
+  **`RemoveMember`** (ADR 0032 PR3 decommission: the second half of `drain` —
+  prunes a member from `members` plus its `node_addrs`/`cp_member_addrs`/
+  `cp_member_tablets` entries in one apply, gated at apply time on the member
+  being absent already (idempotent no-op), `Leaving`/`Down` — never
+  `Active`/`Joining` — and unreferenced by any tablet
+  (`Metadata::tablets_referencing`, also the drain-complete predicate
+  `animusd`'s `/admin/member/drain-status` reports)).
   `Metadata::apply` is the
   deterministic state machine; `Metadata::reconcile` is
   the pure placement decision (see below), whose shared body also backs

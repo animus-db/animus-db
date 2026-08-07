@@ -37,8 +37,10 @@
 //! - `POST /admin/storage/flush`       — `{tablet}`
 //! - `POST /admin/storage/compact`     — `{tablet}`
 //! - `POST /admin/raftkv/reconfigure`  — `{tablet, voters}`
+//! - `GET  /admin/member/drain-status` — decommission poll `?node=` (ADR 0032 PR3)
 //! - `POST /admin/drain`               — `{node}`
 //! - `POST /admin/member/add`          — `{node, labels?}` — online growth (ADR 0030)
+//! - `POST /admin/member/remove`       — `{node}` — decommission (ADR 0032 PR3)
 //! - `POST /admin/data/dynamo`         — run a DynamoDB op `{op, payload}` (ADR 0021)
 //! - `POST /admin/data/cql`            — run CQL `{query, keyspace?}` (ADR 0021)
 //! - `POST /admin/data/drop-table`     — drop a table's schema `{table}` (ADR 0021)
@@ -249,6 +251,7 @@ async fn dispatch(ctx: &ClientCtx, request: &http::HttpRequest) -> (u16, String)
         ("GET", "/admin/storage/scan") => storage_scan(ctx, q).await,
         ("GET", "/admin/metrics") => (200, metrics_view(ctx)),
         ("GET", "/admin/metrics/history") => (200, metrics_history_view(ctx)),
+        ("GET", "/admin/member/drain-status") => member_drain_status(ctx, q),
         ("GET", "/admin/health") => health(ctx),
         ("POST", "/admin/tablet/split") => action_split(ctx, &request.body).await,
         ("POST", "/admin/storage/flush") => action_flush(ctx, &request.body).await,
@@ -256,6 +259,7 @@ async fn dispatch(ctx: &ClientCtx, request: &http::HttpRequest) -> (u16, String)
         ("POST", "/admin/raftkv/reconfigure") => action_reconfigure(ctx, &request.body),
         ("POST", "/admin/drain") => action_drain(ctx, &request.body),
         ("POST", "/admin/member/add") => action_add_member(ctx, &request.body).await,
+        ("POST", "/admin/member/remove") => action_remove_member(ctx, &request.body),
         ("POST", "/admin/data/dynamo") => action_data_dynamo(ctx, &request.body).await,
         ("POST", "/admin/data/cql") => action_data_cql(ctx, &request.body).await,
         ("POST", "/admin/data/drop-table") => action_drop_table(ctx, &request.body).await,
@@ -590,6 +594,14 @@ struct DrainReq {
     node: NodeId,
 }
 
+/// `POST /admin/member/remove` request body (ADR 0032 PR3 decommission):
+/// `node` is the drained member's **raftkv** id (the same id space every
+/// other membership admin view/action already speaks).
+#[derive(Deserialize)]
+struct RemoveMemberReq {
+    node: NodeId,
+}
+
 /// `POST /admin/member/add` request body (ADR 0030 online growth): `node` is
 /// the new node's **raftkv** id (the id every other admin/status view already
 /// speaks — `/admin/status`'s `members`, `/admin/config`'s `raftkv_id`), and
@@ -701,6 +713,54 @@ fn action_drain(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
             200,
             json!({"ok": true, "node": req.node, "status": "Leaving"}),
         ),
+        Err(e) => (409, json!({"error": e})),
+    }
+}
+
+/// `GET /admin/member/drain-status?node=<id>` (ADR 0032 PR3) — the
+/// decommission poll: whether `node` has finished draining (no tablet still
+/// lists it as a replica) and isn't mid-service. Read-only, serves on any
+/// node (reads `effective_metadata()`, so it works on a growth node too, and
+/// takes no lock a concurrent drain/remove could contend on).
+///
+/// `status` is `"absent"` once the member has actually been removed (the
+/// terminal state a `POST /admin/member/remove` reaches for), otherwise the
+/// member's current status string (`"Active"`/`"Joining"`/`"Leaving"`/
+/// `"Down"`) — the operator (or `animus admin decommission`) polls until
+/// `tablets_remaining == 0` and `status` is not `"Active"`.
+fn member_drain_status(ctx: &ClientCtx, q: &str) -> (u16, Value) {
+    let Some(node) = http::query_param(q, "node").and_then(|s| s.parse::<NodeId>().ok()) else {
+        return (
+            400,
+            json!({"error": "missing or invalid `node` query parameter"}),
+        );
+    };
+    let meta = ctx.effective_metadata();
+    let tablets_remaining = meta.tablets_referencing(node);
+    let status = meta.members.get(&node).map_or(json!("absent"), |m| {
+        serde_json::to_value(m.status).unwrap_or(Value::Null)
+    });
+    (
+        200,
+        json!({"node": node, "status": status, "tablets_remaining": tablets_remaining}),
+    )
+}
+
+/// `POST /admin/member/remove {node}` — decommission (ADR 0032 PR3): remove a
+/// drained member from the replicated `Metadata` (membership + address book).
+/// **Local-control-leader-only**, deliberately **not** relayed — same shape
+/// as `/admin/drain` (see [`crate::is_relayable_command`]'s doc and
+/// `ClientCtx::admin_remove_member`'s doc for why removal specifically stays
+/// off the relay path). An operator drains first (`/admin/drain`), polls
+/// `/admin/member/drain-status` to completion, then calls this — exactly the
+/// sequence `animus admin decommission` automates.
+fn action_remove_member(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
+    let req: RemoveMemberReq = match parse_body(body) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    match ctx.admin_remove_member(req.node) {
+        Ok(()) => (200, json!({"ok": true, "node": req.node, "removed": true})),
         Err(e) => (409, json!({"error": e})),
     }
 }

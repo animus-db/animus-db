@@ -570,6 +570,14 @@ pub enum ClientRequest {
 /// leader at all). Deliberately scoped to the `Down` status only — an
 /// `Active`/`Leaving` transition on an *existing* member stays off this path,
 /// same as before.
+///
+/// [`MetaCommand::RemoveMember`] (ADR 0032 PR3, decommission) is deliberately
+/// **excluded** — symmetric with `admin_drain`'s `Leaving` transition, not
+/// with the `Down` add-member case above: removing a member is a destructive,
+/// rare operator action, and [`ClientCtx::admin_remove_member`] is
+/// local-control-leader-only by design (an operator retries on the leader, the
+/// same UX `admin_drain` already has), so it must never reach the control
+/// leader through a relay chain from a node that may not even know who leads.
 fn is_relayable_command(command: &MetaCommand) -> bool {
     matches!(
         command,
@@ -2739,6 +2747,89 @@ impl ClientCtx {
                 SCHEMA_COMMIT_TIMEOUT.as_secs()
             )
         })
+    }
+
+    /// **Admin action (ADR 0032 PR3): decommission a drained member.**
+    ///
+    /// Proposed on the **local** control leader handle, exactly like
+    /// [`admin_drain`](Self::admin_drain) — deliberately **not** relayed (see
+    /// [`is_relayable_command`]'s doc): a destructive, rare operator action
+    /// should not silently reach the real leader through a relay chain from a
+    /// node that may not even know who leads.
+    ///
+    /// Two refusals happen here, **before ever proposing** — friendlier than a
+    /// bare Raft rejection string, though `Metadata::apply`'s own guard remains
+    /// the actual authority (a race between two admin callers is still
+    /// resolved there, deterministically, same as every other CAS-style
+    /// command in this codebase):
+    /// - `node`'s paired **control** id (`node - RAFTKV_ID_BASE`, guarded
+    ///   against underflow for a `node` below the base) is one of this
+    ///   cluster's original control-plane ids: an original control-core
+    ///   member must never be decommissioned this way. The control Raft group
+    ///   is static (ADR 0030) — this call only ever prunes `Metadata.members`,
+    ///   it cannot remove a real control-group voter — and `bootstrap`
+    ///   (idempotent, `BoundNode::start_with`) re-registers every control-core
+    ///   raftkv id `Active` on its very next tick regardless, so "removing"
+    ///   one would just be a no-op loop, not a real decommission.
+    /// - the member is not drained: still `Active`/`Joining`, or still
+    ///   referenced by any tablet ([`Metadata::tablets_referencing`]) — refused
+    ///   with the same counts `/admin/member/drain-status` reports, rather
+    ///   than a bare Raft `"Rejected"` string.
+    ///
+    /// **Removal is not a fence.** A removed node whose *process* keeps
+    /// running stays removed (self-registration — `RegisterNodeAddrs` /
+    /// `admin_add_member` — is a one-shot at startup, never repeated). But a
+    /// **restart** of that process (or a fresh one at the same raftkv id)
+    /// re-registers `Down` and rejoins exactly as a fresh join would: removal
+    /// followed by a restart is, by design, equivalent to a fresh rejoin at
+    /// the same id (`tests/decommission.rs` proves id reuse). The
+    /// decommission flow's real last step is stopping the process, not this
+    /// call.
+    pub(crate) fn admin_remove_member(&self, node: NodeId) -> Result<(), String> {
+        if let Some(control_id) = node.checked_sub(config::RAFTKV_ID_BASE) {
+            if self.admin.control_ids.contains(&control_id) {
+                return Err(format!(
+                    "node {node} is an original control-plane core member (control id \
+                     {control_id}); the control group is static (ADR 0030) and this member \
+                     must never be decommissioned"
+                ));
+            }
+        }
+        // Check leadership BEFORE reading `self.raft.metadata()` for the
+        // drain-status refusals below: a follower's own replica can lag the
+        // leader's just-committed rebalance/release-GC moves (real replication
+        // lag, not a bug), so evaluating "is it drained" off a follower's stale
+        // view can misfire as "still referenced" even after the operator has
+        // confirmed (on the leader) that draining converged — surfacing the
+        // wrong refusal instead of the intended "retry on the leader" routing
+        // error. The leader's own metadata is what actually gates the apply, so
+        // checking leadership first makes every other refusal here trustworthy.
+        let Some(leader) = self.edge.leader_handle() else {
+            return Err("this node is not the control-plane leader; retry on the leader".into());
+        };
+        let meta = self.raft.metadata();
+        let Some(member) = meta.members.get(&node) else {
+            return Err(format!("node {node} is not a cluster member"));
+        };
+        if matches!(member.status, NodeStatus::Active | NodeStatus::Joining) {
+            return Err(format!(
+                "node {node} is not drained: status is {:?}; drain it first",
+                member.status
+            ));
+        }
+        let referenced = meta.tablets_referencing(node);
+        if referenced > 0 {
+            return Err(format!(
+                "node {node} still referenced by {referenced} tablet(s); wait for draining to \
+                 complete"
+            ));
+        }
+        match leader.propose(MetaCommand::RemoveMember { node }) {
+            ProposeResult::Accepted { .. } => Ok(()),
+            ProposeResult::NotLeader { .. } => {
+                Err("control leadership moved; retry on the leader".into())
+            }
+        }
     }
 }
 

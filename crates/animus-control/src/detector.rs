@@ -77,6 +77,15 @@ impl FailureDetector {
         self.last_seen.remove(&node);
     }
 
+    /// Every node id currently tracked (has heartbeated and not yet been
+    /// [`forget`](Self::forget)ten), in ascending order. Lets a caller (the
+    /// `detect_loop` driver, ADR 0032 PR3) find ids the detector still tracks
+    /// that membership no longer knows about, so it can prune them — keeps
+    /// `last_seen` bounded and stops judging a removed member.
+    pub fn tracked_ids(&self) -> impl Iterator<Item = NodeId> + '_ {
+        self.last_seen.keys().copied()
+    }
+
     /// Whether `node` is currently being tracked (has ever heartbeated).
     #[must_use]
     pub fn tracks(&self, node: NodeId) -> bool {
@@ -168,5 +177,16 @@ mod tests {
         assert!(d.tracks(10));
         d.forget(10);
         assert!(!d.tracks(10));
+    }
+
+    #[test]
+    fn tracked_ids_lists_every_tracked_member_in_order() {
+        let mut d = FailureDetector::new(T);
+        assert_eq!(d.tracked_ids().collect::<Vec<_>>(), Vec::<NodeId>::new());
+        d.observe(12, Nanos(1_000));
+        d.observe(10, Nanos(1_000));
+        assert_eq!(d.tracked_ids().collect::<Vec<_>>(), vec![10, 12]);
+        d.forget(10);
+        assert_eq!(d.tracked_ids().collect::<Vec<_>>(), vec![12]);
     }
 }

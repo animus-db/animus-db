@@ -263,8 +263,8 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
 - **A replicated node address book (ADR 0032 PR1) closes the `client_route`/
   `/admin/peers` staleness ADR 0030 above documents, and is the foundation
   PR2 (`animusd join`) and PR3 (decommission) build on** — see
-  `docs/adr/0032-seed-join-membership.md` for the full 3-PR design; only PR1 is
-  implemented so far. `Metadata.node_addrs: BTreeMap<NodeId, NodeAddrs>`
+  `docs/adr/0032-seed-join-membership.md` for the full 3-PR design; all three
+  PRs are implemented. `Metadata.node_addrs: BTreeMap<NodeId, NodeAddrs>`
   (`animus_control::meta::NodeAddrs { raftkv, client, admin }`) is every
   member's full address set, mutated by `MetaCommand::RegisterNodeAddrs`
   (idempotent, mirrors `RegisterCpAddr`'s own apply shape). Every node
@@ -289,6 +289,38 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   `ClientCtx::effective_metadata()`, so a control-plane-follower-less growth
   node (ADR 0030) syncs off its own remote mirror like every other
   `Metadata`-derived view it depends on.
+- **Decommission (ADR 0032 PR3) is `drain` (existing) plus one new
+  `MetaCommand::RemoveMember` proposal and a poll-to-convergence in between.**
+  `GET /admin/member/drain-status?node=` (read-only, serves on any node via
+  `effective_metadata()`) reports `{node, status, tablets_remaining}` —
+  `Metadata::tablets_referencing(node)` and the member's own status, the
+  drain-complete predicate. `POST /admin/member/remove {node}` →
+  `ClientCtx::admin_remove_member`, **local-control-leader-only, deliberately
+  not relayed** (symmetric with `admin_drain`, not with the `Down`
+  add-member relay case — see `is_relayable_command`'s doc). Two admin-layer
+  refusals before ever proposing (friendlier than a bare Raft rejection; the
+  apply-time guard in `Metadata::apply` remains the actual authority): an
+  original control-core member (`node`'s paired control id, `node -
+  RAFTKV_ID_BASE`, is one of `ctx.admin.control_ids`) can never be
+  decommissioned this way (the control group is static, ADR 0030, and
+  `bootstrap` would just re-register it `Active` on the next tick anyway);
+  and a not-yet-drained member (still `Active`/`Joining`, or still referenced
+  by a tablet) is refused with the same drain-status counts. **Leadership is
+  checked before either refusal**, not after — a follower's own `Metadata`
+  replica can lag the leader's just-converged draining under load, so
+  checking "am I the leader" first avoids a stale-replica false "still
+  referenced" refusal masking the intended "retry on the leader" routing
+  error (found via a `cargo test --workspace`-load flake in
+  `tests/decommission.rs`; see the root `CLAUDE.md` engineering-practices
+  entry). **Removal is not a fence**: a removed node's still-running process
+  stays removed (self-registration is a startup one-shot), but restarting
+  that process — or starting a fresh one at the same raftkv id — re-registers
+  `Down` and rejoins exactly like a fresh join; the decommission flow's real
+  last step is stopping the process. `animus admin decommission <admin-addr>
+  <node-id>` automates drain → poll drain-status → remove as one CLI command
+  (also exposed as separate `drain-status`/`remove` subcommands).
+  `tests/decommission.rs` covers the full flow end to end (including id reuse
+  on rejoin) plus all three refusal shapes.
 - **The per-node tablet-host reconciler (ADR 0031 PR4) is the single owner of
   this node's tablet lifecycle** — it replaced the three loops this file used
   to document separately (`cp_join_host_loop`, `cp_gc_loop` +

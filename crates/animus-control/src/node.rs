@@ -698,6 +698,20 @@ async fn detect_loop<E: Env>(
             allow_down = now.duration_since(since) >= LEADER_GRACE;
             core.members()
         };
+        // Decommission cleanup (ADR 0032 PR3): a member `RemoveMember` already
+        // pruned from `members` should stop being tracked too — otherwise
+        // `last_seen` grows unboundedly across a cluster's lifetime, and a
+        // later `RemoveMember` on some other id currently reused nothing but
+        // memory (the pure `members` filter in `liveness_transitions` already
+        // stops a removed member from ever being *proposed for* again, so
+        // this is belt-and-braces bounding, not a safety fix). Computed as a
+        // pure function of the two maps so it's unit-testable without a driver.
+        {
+            let mut d = detector.lock().expect("detector poisoned");
+            for id in stale_tracked_ids(&members, &d) {
+                d.forget(id);
+            }
+        }
         // Phantom-member hardening (ADR 0030): give any `Active`-but-untracked
         // member a synthetic first observation before evaluating (see this fn's
         // doc). A no-op for every member the detector already tracks.
@@ -735,6 +749,23 @@ async fn detect_loop<E: Env>(
             core.lock().expect("raft core poisoned").propose(command);
         }
     }
+}
+
+/// Pure helper (ADR 0032 PR3): every id the detector currently
+/// [`tracks`](FailureDetector::tracks) that is **no longer** present in
+/// `members` — a member `RemoveMember` has pruned from replicated
+/// `Metadata`. Returned in ascending order (the detector's own iteration
+/// order), so the caller's `forget` loop is deterministic. Takes just the
+/// membership map (not the whole `Metadata`), mirroring
+/// [`liveness_transitions`]'s narrow-clone discipline.
+fn stale_tracked_ids(
+    members: &std::collections::BTreeMap<NodeId, Member>,
+    detector: &FailureDetector,
+) -> Vec<NodeId> {
+    detector
+        .tracked_ids()
+        .filter(|id| !members.contains_key(id))
+        .collect()
 }
 
 /// Pure helper: the `UpsertMember` transitions needed to bring each tracked
@@ -922,5 +953,35 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// ADR 0032 PR3: a member `RemoveMember` has already pruned from
+    /// `Metadata.members` is exactly what `stale_tracked_ids` reports — a
+    /// still-tracked member is left alone.
+    #[test]
+    fn stale_tracked_ids_reports_only_removed_members() {
+        let meta = meta_with(7, NodeStatus::Active);
+        let mut det = detector_silent_since(7, Nanos(1_000));
+        det.observe(99, Nanos(1_000)); // 99 was tracked but is not in `meta.members`
+        assert_eq!(stale_tracked_ids(&meta.members, &det), vec![99]);
+
+        // Once `members` no longer has 7 either (a real removal), it joins the
+        // stale set too.
+        let empty: BTreeMap<NodeId, Member> = BTreeMap::new();
+        assert_eq!(stale_tracked_ids(&empty, &det), vec![7, 99]);
+    }
+
+    /// A `detect_loop` tick calling `forget` for every `stale_tracked_ids`
+    /// result actually stops the detector from tracking the removed member —
+    /// the fix's whole point, proven at the detector level (the loop itself
+    /// is exercised end to end in `tests/failure_detection.rs`).
+    #[test]
+    fn forgetting_stale_tracked_ids_stops_tracking_them() {
+        let mut det = detector_silent_since(99, Nanos(1_000));
+        let empty: BTreeMap<NodeId, Member> = BTreeMap::new();
+        for id in stale_tracked_ids(&empty, &det) {
+            det.forget(id);
+        }
+        assert!(!det.tracks(99));
     }
 }

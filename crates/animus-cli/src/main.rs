@@ -12,10 +12,12 @@
 //! [`ADMIN_USAGE`] for the subcommands.
 
 use std::process::ExitCode;
+use std::time::Duration;
 
 use animusd::{ClientRequest, ClientResponse, read_frame, write_frame};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::time::sleep;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -40,7 +42,10 @@ const ADMIN_USAGE: &str = "  admin <subcommand> <admin-addr> [args]:\n    \
     split <admin-addr> <tablet> <split-key>\n    \
     flush|compact <admin-addr> <tablet>\n    \
     reconfigure <admin-addr> <tablet> <voter,voter,...>\n    \
-    drain <admin-addr> <node-id>";
+    drain <admin-addr> <node-id>\n    \
+    drain-status <admin-addr> <node-id>\n    \
+    remove <admin-addr> <node-id>\n    \
+    decommission <admin-addr> <node-id>";
 
 async fn run(args: &[String]) -> Result<(), String> {
     let cmd = args.first().map(String::as_str).ok_or("missing command")?;
@@ -103,6 +108,14 @@ async fn run_admin(args: &[String]) -> Result<(), String> {
     let arg = |i: usize| args.get(i).map(String::as_str);
     // The optional trailing `tablet` for the storage GET routes.
     let tablet_q = |i: usize| arg(i).map_or(String::new(), |t| format!("?tablet={t}"));
+
+    // `decommission` is a multi-step composite (drain → poll drain-status →
+    // remove), not a single request/response — handled separately from the
+    // generic one-shot dispatch below (ADR 0032 PR3).
+    if sub == "decommission" {
+        let node = arg(2).ok_or("decommission needs <node-id>")?;
+        return run_decommission(addr, node).await;
+    }
 
     let (method, path, body): (&str, String, Option<String>) = match sub {
         "config" => ("GET", "/admin/config".into(), None),
@@ -170,6 +183,22 @@ async fn run_admin(args: &[String]) -> Result<(), String> {
             let body = serde_json::json!({"node": node}).to_string();
             ("POST", "/admin/drain".into(), Some(body))
         }
+        "drain-status" => {
+            let node = arg(2).ok_or("drain-status needs <node-id>")?;
+            (
+                "GET",
+                format!("/admin/member/drain-status?node={node}"),
+                None,
+            )
+        }
+        "remove" => {
+            let node: u64 = arg(2)
+                .ok_or("remove needs <node-id>")?
+                .parse()
+                .map_err(|_| "node id must be a number")?;
+            let body = serde_json::json!({"node": node}).to_string();
+            ("POST", "/admin/member/remove".into(), Some(body))
+        }
         other => return Err(format!("unknown admin subcommand `{other}`")),
     };
 
@@ -178,6 +207,60 @@ async fn run_admin(args: &[String]) -> Result<(), String> {
     if !(200..300).contains(&status) {
         return Err(format!("admin request failed (HTTP {status})"));
     }
+    Ok(())
+}
+
+/// The operator's whole decommission flow (ADR 0032 PR3), as a single
+/// command: `POST /admin/drain` → poll `GET /admin/member/drain-status` until
+/// draining has actually converged (no tablet still references the member,
+/// and it isn't mid-service) → `POST /admin/member/remove`. All three requests
+/// go to `addr`, which must be the **control-plane leader's** admin port —
+/// both `/admin/drain` and `/admin/member/remove` are deliberately
+/// local-leader-only, not relayed (see `is_relayable_command`'s doc in
+/// `animusd`), so this fails loudly with the same "not the control-plane
+/// leader" error a bare `drain`/`remove` call would if pointed at a follower.
+async fn run_decommission(addr: &str, node: &str) -> Result<(), String> {
+    let node: u64 = node.parse().map_err(|_| "node id must be a number")?;
+    let drain_body = serde_json::json!({"node": node}).to_string();
+    let (status, resp) = http_call(addr, "POST", "/admin/drain", Some(drain_body)).await?;
+    if !(200..300).contains(&status) {
+        return Err(format!("drain failed (HTTP {status}): {resp}"));
+    }
+    println!("draining node {node}...");
+
+    let status_path = format!("/admin/member/drain-status?node={node}");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        let (status, resp) = http_call(addr, "GET", &status_path, None).await?;
+        if !(200..300).contains(&status) {
+            return Err(format!("drain-status failed (HTTP {status}): {resp}"));
+        }
+        let v: serde_json::Value = serde_json::from_str(&resp)
+            .map_err(|e| format!("malformed drain-status response: {e}"))?;
+        let tablets_remaining = v.get("tablets_remaining").and_then(|x| x.as_u64());
+        let node_status = v.get("status").and_then(|x| x.as_str()).unwrap_or("?");
+        println!(
+            "  drain-status: status={node_status} tablets_remaining={}",
+            tablets_remaining.map_or_else(|| "?".to_string(), |n| n.to_string())
+        );
+        if tablets_remaining == Some(0) && node_status != "Active" {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "node {node} did not finish draining within 120s \
+                 (status={node_status}, tablets_remaining={tablets_remaining:?})"
+            ));
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
+
+    let remove_body = serde_json::json!({"node": node}).to_string();
+    let (status, resp) = http_call(addr, "POST", "/admin/member/remove", Some(remove_body)).await?;
+    if !(200..300).contains(&status) {
+        return Err(format!("remove failed (HTTP {status}): {resp}"));
+    }
+    println!("node {node} removed; safe to stop the process");
     Ok(())
 }
 
