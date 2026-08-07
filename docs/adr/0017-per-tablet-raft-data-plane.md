@@ -218,7 +218,10 @@ the mechanics.
   command** that atomically divides the key range and hands the right-hand state
   off to a **new group bootstrapped at the split point**. Splitting a *live
   consensus group's data* is the most intricate operation here and is sequenced
-  last. (Merge — the inverse — is deferred with cross-tablet work.)
+  last. (Merge — the inverse — is deferred with cross-tablet work.) **"The
+  rebalancer" here is now `Metadata::rebalance` (ADR 0029)** — it moves
+  *existing* replicas onto newly-added nodes rather than splitting; a size
+  threshold remains the actual split trigger.
 
 ### 5. Cross-tablet transactions: deferred (the explicit next step)
 

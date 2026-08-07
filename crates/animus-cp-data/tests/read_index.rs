@@ -6,6 +6,7 @@
 //! Linearizable reads are async (a read-barrier probe round + applied wait), so
 //! we drive them as spawned tasks and `run_for` to let the sim advance.
 
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -199,5 +200,91 @@ fn deposed_leader_does_not_serve_a_stale_read() {
     assert_eq!(
         lin_read(&mut sim, &nodes[new], b"x", Duration::from_secs(1)),
         Some(b"new".to_vec()),
+    );
+}
+
+fn set(ids: &[u64]) -> BTreeSet<u64> {
+    ids.iter().copied().collect()
+}
+
+/// Regression (ADR 0029): the read-barrier's quorum-of-acks bookkeeping
+/// (`majority`, and which peers get probed) must track the group's **current**
+/// Raft voter config, not `all_nodes` — the peer set a node happened to be
+/// *hosted/started with*. `membership.rs`'s `add_a_node_grows_the_group_and_
+/// catches_it_up` already exercises adding a node, but that test's joiner is
+/// started already knowing the whole eventual `all_nodes` set, and it only
+/// checks `local_get`, never a linearizable read — so it cannot see this bug.
+///
+/// Here nodes 0/1/2 each started knowing only `{0, 1, 2}` and never learn
+/// otherwise (their `all_nodes` is fixed at hosting time). The group is then
+/// rebalanced from `{0, 1, 2}` to `{2, 3, 4}` — **two** of three original
+/// members replaced, leaving only node 2 in common, exactly the shape that
+/// actually broke in production (a tablet fully rotated off its original
+/// hosts) — and nodes 0/1 are stopped outright, as the removed-replica GC
+/// (ADR 0029 §3) eventually does. Node 2's stale `all_nodes = {0, 1, 2}`
+/// intersects the *current* config `{2, 3, 4}` in only itself: before the fix,
+/// its read barrier can only ever self-ack, never reaching the majority of 2
+/// a 3-voter group needs, so a linearizable read on it times out and
+/// incorrectly reports the key absent forever after such a move.
+#[test]
+fn linearizable_read_succeeds_after_a_full_membership_rotation() {
+    let seed = 0xBEAD;
+    let (mut sim, nodes) = group(seed);
+    sim.run_for(Duration::from_secs(2));
+    put(&nodes, &[0, 1, 2], seed, b"k", b"v");
+    sim.run_for(Duration::from_secs(1));
+
+    // Nodes 3 and 4 join as quiet **non-voters** the way a real
+    // reconciler-placed spare does (`cp_join_host`'s "others" shape):
+    // `all_nodes` excludes self, so neither can campaign before a leader's
+    // config entry actually adds it.
+    let node3 = RaftKvNode::start(sim.env(3), vec![1, 2], MemoryEngine::new());
+    let node4 = RaftKvNode::start(sim.env(4), vec![1, 2], MemoryEngine::new());
+    sim.run_for(Duration::from_secs(1));
+
+    // Four single-server steps rotate {0,1,2} -> {2,3,4}: add 3, add 4, remove
+    // 0, remove 1 — the sequence a real `reconfigure_step`-driven series of
+    // healthy moves takes (never dropping below the original 3-voter margin
+    // until each newcomer has caught up).
+    for step in [
+        set(&[0, 1, 2, 3]),
+        set(&[0, 1, 2, 3, 4]),
+        set(&[1, 2, 3, 4]),
+        set(&[2, 3, 4]),
+    ] {
+        let l = leader(&nodes, &[0, 1, 2], seed);
+        assert!(
+            matches!(
+                nodes[l].change_membership(step.clone()),
+                ProposeResult::Accepted { .. }
+            ),
+            "leader {l} rejected the step to {step:?} (seed={seed})"
+        );
+        sim.run_for(Duration::from_secs(2));
+    }
+
+    // Stop the fully-departed nodes outright — mirroring the removed-replica
+    // GC. Without this, a still-live-but-no-longer-voting node would still
+    // ack a `ReadProbe` on term match alone, which could mask this bug.
+    nodes[0].shutdown();
+    nodes[1].shutdown();
+    sim.run_for(Duration::from_secs(1));
+
+    // Find whichever of the surviving nodes {2, 3, 4} currently leads and read
+    // through it.
+    let candidates = [(2usize, &nodes[2]), (3, &node3), (4, &node4)];
+    let (leader_id, leader_node) = candidates
+        .into_iter()
+        .find(|(_, n)| n.is_leader())
+        .expect("exactly one of {2,3,4} should lead after the rotation");
+    assert_eq!(
+        leader_node.config(),
+        set(&[2, 3, 4]),
+        "expected the rotation to have fully converged (leader={leader_id}, seed={seed})"
+    );
+    assert_eq!(
+        lin_read(&mut sim, leader_node, b"k", Duration::from_secs(7)),
+        Some(b"v".to_vec()),
+        "a linearizable read must succeed once the group's read barrier reaches the current quorum, not a stale hosting-time peer set (leader={leader_id}, seed={seed})"
     );
 }

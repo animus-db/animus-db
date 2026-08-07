@@ -398,7 +398,6 @@ pub struct RaftKvNode<E: Env, S: StorageEngine> {
     env: E,
     core: Arc<Mutex<KvCore>>,
     storage: S,
-    all_nodes: Vec<NodeId>,
     reads: Arc<Mutex<ReadState>>,
     cas: Arc<Mutex<CasResults>>,
     /// Highest Raft log index the **apply task** has merged into the engine. The
@@ -538,7 +537,6 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             env: env.clone(),
             core: Arc::clone(&core),
             storage: storage.clone(),
-            all_nodes: all_nodes.clone(),
             reads: Arc::clone(&reads),
             cas: Arc::clone(&cas),
             engine_applied: Arc::clone(&engine_applied),
@@ -600,8 +598,19 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         self.stopped.load(Ordering::SeqCst) && self.apply_stopped.load(Ordering::SeqCst)
     }
 
+    /// A majority of the group's **current** Raft voter config — not
+    /// `all_nodes` (the peer set this node happened to be hosted/started with,
+    /// frozen at that moment). `all_nodes` predates ADR 0029: every prior use of
+    /// membership change was a same-size, pre-known swap (a failure-repair spare
+    /// was already listed in every replica's `all_nodes` from the start), so it
+    /// never actually diverged from the live config. A healthy rebalance move
+    /// can add a node that was never in any existing replica's `all_nodes` at
+    /// all — using the stale set here would make [`read_barrier`](Self::read_barrier)'s
+    /// quorum-of-acks requirement permanently unreachable (probing peers that
+    /// are no longer voters, never reaching the new ones that are), timing out
+    /// every linearizable read on that tablet forever after such a move.
     fn majority(&self) -> usize {
-        self.all_nodes.len() / 2 + 1
+        self.config().len() / 2 + 1
     }
 
     /// Propose `command` through the core and, if it was appended (leader), **wake
@@ -771,58 +780,132 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         self.lock().config()
     }
 
+    /// The leader's last-known replicated log index for `node` (0 if unknown).
+    /// The caught-up primitive a healthy reconfigure step gates on — see
+    /// [`RaftCore::peer_match`].
+    pub fn peer_match(&self, node: NodeId) -> u64 {
+        self.lock().peer_match(node)
+    }
+
+    /// Arm a leadership transfer to `target` (see
+    /// [`RaftCore::transfer_leadership`]) and, if armed, wake the driver loop so
+    /// the resulting `TimeoutNow` ships at once instead of waiting for the next
+    /// heartbeat — mirrors `change_membership`'s wake-on-propose. Returns
+    /// whether the transfer was armed.
+    pub fn transfer_leadership(&self, target: NodeId) -> bool {
+        let armed = self.lock().transfer_leadership(target);
+        if armed {
+            self.propose_signal.notify();
+        }
+        armed
+    }
+
     /// Take **one** single-server step moving this group's Raft configuration
     /// toward `desired` — the control plane's placement decision for this tablet
-    /// (ADR 0017 Stage C: the automatic reconfigure trigger). The shared
-    /// [`RaftCore::change_membership`] only accepts a single-server delta, with no
-    /// in-flight change and no leader self-removal, so this picks one add/remove
-    /// that makes progress and lets the next tick take the following step — a
-    /// multi-server move (e.g. replace a dead replica with a spare) converges one
-    /// server per call. Returns the proposed config if a step was **accepted**,
-    /// else `None`: already converged, not the leader, a change is in flight, or
-    /// the only remaining delta is removing the leader itself (which needs a
-    /// leadership transfer first — out of scope here).
+    /// (ADR 0017 Stage C: the automatic reconfigure trigger; ADR 0029 extends it
+    /// to a *healthy* rebalance move, not just failure repair). `down` is this
+    /// tablet's currently-`Down` members (per the control plane's failure
+    /// detector) — a node can be in `desired` and simultaneously `down` (e.g. a
+    /// flapping replica the reconciler hasn't yet replaced), so this always
+    /// treats "extra and down" specially rather than assuming `down` and
+    /// `desired` are disjoint.
     ///
-    /// Order: drop an extra **non-leader** voter (e.g. a `Down` node) before adding
-    /// a missing one, so quorum margin is restored before a fresh replica — which
-    /// must still catch up via log/`InstallSnapshot` — is brought in.
-    pub fn reconfigure_step(&self, desired: &BTreeSet<NodeId>) -> Option<BTreeSet<NodeId>> {
+    /// The shared [`RaftCore::change_membership`] only accepts a single-server
+    /// delta, with no in-flight change and no leader self-removal, so this picks
+    /// one add/remove that makes progress and lets the next tick take the
+    /// following step — a multi-server move converges one server per call.
+    /// Returns the proposed config if a step was **accepted**; `None` if already
+    /// converged, not the leader, a change is in flight, or a step was armed
+    /// but not itself a config change (the leadership-transfer case below).
+    ///
+    /// Priority order, most urgent first:
+    /// 1. **Remove an extra `Down` voter** (never self) — restores quorum margin
+    ///    immediately; this is failure repair, and the removed node isn't going
+    ///    to ack anything anyway, so there is nothing to wait for.
+    /// 2. **Add a missing voter.** A transient `desired.len() + 1`-voter config
+    ///    is strictly safer than dropping a healthy voter first: quorum keeps
+    ///    its pre-move margin while the newcomer catches up via log/
+    ///    `InstallSnapshot`, instead of briefly running at reduced margin.
+    /// 3. **Remove an extra *healthy* voter** (never self) — but only once every
+    ///    member of `desired` has caught up to this leader's `commit_index`.
+    ///    Skipping this gate would let a healthy move (e.g. a rebalance) drop
+    ///    quorum to a still-catching-up newcomer, an availability regression
+    ///    relative to just leaving the extra replica in place a little longer.
+    /// 4. **The only remaining delta is removing the leader's own replica** —
+    ///    `change_membership` always rejects that, so instead transfer
+    ///    leadership (see [`transfer_leadership`](Self::transfer_leadership)) to
+    ///    the lowest-id caught-up member of `desired`. The new leader's own next
+    ///    tick then removes the old leader, an ordinary (non-self) removal.
+    pub fn reconfigure_step(
+        &self,
+        desired: &BTreeSet<NodeId>,
+        down: &BTreeSet<NodeId>,
+    ) -> Option<BTreeSet<NodeId>> {
         let current = self.config();
         if current == *desired || !self.is_leader() {
             return None;
         }
         let me = self.env.node_id();
-        let next = if let Some(&extra) = current.difference(desired).find(|&&n| n != me) {
+        let extra = || current.difference(desired).find(|&&n| n != me).copied();
+
+        if let Some(down_extra) = extra().filter(|n| down.contains(n)) {
             let mut c = current.clone();
-            c.remove(&extra);
-            c
-        } else if let Some(&missing) = desired.difference(&current).next() {
+            c.remove(&down_extra);
+            return self.propose_config(c);
+        }
+        if let Some(&missing) = desired.difference(&current).next() {
             let mut c = current.clone();
             c.insert(missing);
-            c
-        } else {
-            // The only delta left is removing the leader itself.
-            return None;
-        };
+            return self.propose_config(c);
+        }
+        if let Some(healthy_extra) = extra() {
+            let commit = self.commit_index();
+            let caught_up = desired
+                .iter()
+                .filter(|&&n| n != me)
+                .all(|&n| self.peer_match(n) >= commit);
+            if !caught_up {
+                return None;
+            }
+            let mut c = current.clone();
+            c.remove(&healthy_extra);
+            return self.propose_config(c);
+        }
+        // The only delta left is removing the leader itself.
+        let commit = self.commit_index();
+        if let Some(&target) = desired
+            .iter()
+            .filter(|&&n| n != me && self.peer_match(n) >= commit)
+            .min()
+        {
+            self.transfer_leadership(target);
+        }
+        None
+    }
+
+    fn propose_config(&self, next: BTreeSet<NodeId>) -> Option<BTreeSet<NodeId>> {
         match self.change_membership(next.clone()) {
             ProposeResult::Accepted { .. } => Some(next),
             ProposeResult::NotLeader { .. } => None,
         }
     }
 
-    /// Spawn the **automatic Stage-C reconfigure loop** (ADR 0017): on each
-    /// `interval` tick, poll `desired` for this tablet's target voter set and take
-    /// one [`reconfigure_step`](Self::reconfigure_step) toward it. Idempotent and
+    /// Spawn the **automatic Stage-C reconfigure loop** (ADR 0017, extended by
+    /// ADR 0029): on each `interval` tick, poll `desired` (and `down`) for this
+    /// tablet's target voter set and take one
+    /// [`reconfigure_step`](Self::reconfigure_step) toward it. Idempotent and
     /// leader-gated — a non-leader or a converged group proposes nothing, so a
     /// steady cluster produces no churn; a multi-server move converges one server
-    /// per tick. `desired` is the **seam to the control plane**: in production it
-    /// reads `Metadata.tablets[tablet].replicas` (the placement reconciler's
-    /// epoch-CAS decision) and returns it as a voter set; it is a closure so this
-    /// crate takes no dependency on the control-plane driver type. Mirrors the
-    /// control plane's `reconcile_loop` (decision elsewhere, timing here).
-    pub fn spawn_reconfigure_loop<F>(&self, interval: Duration, desired: F)
+    /// per tick. `desired`/`down` are the **seam to the control plane**: in
+    /// production `desired` reads `Metadata.tablets[tablet].replicas` (the
+    /// placement reconciler's epoch-CAS decision) and `down` reads the
+    /// `Down`-status members, each returned as a closure so this crate takes no
+    /// dependency on the control-plane driver type. Mirrors the control plane's
+    /// `reconcile_loop` (decision elsewhere, timing here).
+    pub fn spawn_reconfigure_loop<F, D>(&self, interval: Duration, desired: F, down: D)
     where
         F: Fn() -> Option<BTreeSet<NodeId>> + Send + 'static,
+        D: Fn() -> BTreeSet<NodeId> + Send + 'static,
     {
         let node = self.clone();
         let env = self.env.clone();
@@ -833,7 +916,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
                     return;
                 }
                 if let Some(target) = desired() {
-                    node.reconfigure_step(&target);
+                    node.reconfigure_step(&target, &down());
                 }
             }
         });
@@ -1040,9 +1123,12 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             epoch
         };
         // Probe peers immediately (periodic heartbeats would also carry it, but an
-        // explicit probe confirms promptly).
+        // explicit probe confirms promptly). Probe the **current** voter config
+        // (see `majority`'s doc), not the static `all_nodes` — else a rebalanced
+        // group's read barrier would probe peers that are no longer voters and
+        // never reach the ones that are.
         let probe = codec::encode_wire(&KvWire::ReadProbe { term, epoch });
-        for &p in &self.all_nodes {
+        for p in self.config() {
             if p != self.env.node_id() {
                 self.env.send_stream(p, self.stream, probe.clone()).await;
             }

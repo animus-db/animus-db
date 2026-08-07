@@ -167,6 +167,43 @@ pub(crate) fn tablets_to_reclaim(
         .collect()
 }
 
+/// Which of this node's `minted` tablets have had **this node** dropped from
+/// their replica set while the tablet itself **still exists** — and so should be
+/// *released* (stopped + its scope erased) on this node (the pure predicate
+/// behind `cp_gc_loop`'s release phase, ADR 0029). The dual of
+/// [`tablets_to_reclaim`]: reclaim fires on the tablet being **absent** (the
+/// whole table was dropped, ADR 0024); release fires on the tablet being
+/// **present** but no longer placing a replica on `base_id` (a drain, a
+/// failure-repair swap, or an automatic rebalance moved it elsewhere).
+///
+/// A tablet is released iff it is in `minted` (this node hosts/hosted it) AND
+/// present in `tablets` (still exists) AND `base_id` is **not** in that tablet's
+/// `replicas` (this node is no longer supposed to be a replica).
+///
+/// The two predicates are **mutually exclusive** on the same input: reclaim
+/// requires absence, release requires presence, so no tablet is ever both. The
+/// caller layers the same `last_applied == 0` recovery guard on top (skip while
+/// replicated `Metadata` hasn't recovered) and — critically — an independent
+/// per-tablet check that this node's *own durable Raft log* config already
+/// excludes `base_id` before acting, so a replay transient in `tablets` can't
+/// erase live data (that check reads a live handle the pure function has no
+/// business taking, so it stays in `cp_gc_loop`).
+pub(crate) fn tablets_to_release(
+    minted: &[TabletId],
+    tablets: &BTreeMap<TabletId, Tablet>,
+    base_id: NodeId,
+) -> Vec<TabletId> {
+    minted
+        .iter()
+        .copied()
+        .filter(|t| {
+            tablets
+                .get(t)
+                .is_some_and(|tab| !tab.replicas.contains(&base_id))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -380,5 +417,89 @@ mod tests {
     fn reclaim_over_empty_minted_set_is_empty() {
         let tablets: BTreeMap<TabletId, Tablet> = BTreeMap::new();
         assert_eq!(tablets_to_reclaim(&[], &tablets), Vec::<TabletId>::new());
+    }
+
+    // --- tablets_to_release ------------------------------------------------------
+
+    /// A tablet built with an explicit replica set (rather than the default
+    /// `vec![300]` of the `tablet` helper above).
+    fn tablet_with_replicas(id: u64, replicas: Vec<NodeId>) -> Tablet {
+        Tablet::new(TabletId(id), KeyRange::new(b"".to_vec(), None), replicas)
+    }
+
+    #[test]
+    fn release_over_empty_minted_set_is_empty() {
+        let tablets: BTreeMap<TabletId, Tablet> =
+            [(TabletId(1), tablet_with_replicas(1, vec![BASE]))]
+                .into_iter()
+                .collect();
+        assert_eq!(
+            tablets_to_release(&[], &tablets, BASE),
+            Vec::<TabletId>::new()
+        );
+    }
+
+    #[test]
+    fn does_not_release_a_tablet_this_node_is_still_a_replica_of() {
+        let tablets: BTreeMap<TabletId, Tablet> =
+            [(TabletId(1), tablet_with_replicas(1, vec![BASE, 301, 302]))]
+                .into_iter()
+                .collect();
+        assert_eq!(
+            tablets_to_release(&[TabletId(1)], &tablets, BASE),
+            Vec::<TabletId>::new()
+        );
+    }
+
+    #[test]
+    fn releases_a_minted_present_tablet_this_node_is_no_longer_a_replica_of() {
+        // The tablet still exists, but its replica set has moved off this node.
+        let tablets: BTreeMap<TabletId, Tablet> =
+            [(TabletId(1), tablet_with_replicas(1, vec![301, 302, 303]))]
+                .into_iter()
+                .collect();
+        assert_eq!(
+            tablets_to_release(&[TabletId(1)], &tablets, BASE),
+            vec![TabletId(1)]
+        );
+    }
+
+    #[test]
+    fn does_not_release_a_minted_tablet_that_is_absent() {
+        // Absence is `tablets_to_reclaim`'s job, not release's — a tablet dropped
+        // from the map entirely must NOT be released by this predicate.
+        let tablets: BTreeMap<TabletId, Tablet> = BTreeMap::new();
+        assert_eq!(
+            tablets_to_release(&[TabletId(1)], &tablets, BASE),
+            Vec::<TabletId>::new()
+        );
+    }
+
+    /// The two GC predicates partition this node's `minted` set: on the same
+    /// input, no tablet is ever both reclaimed and released (reclaim requires
+    /// absence, release requires presence + not-a-replica).
+    #[test]
+    fn reclaim_and_release_are_mutually_exclusive() {
+        // Tablet 1: present, still a replica  -> neither.
+        // Tablet 2: present, no longer a replica -> release only.
+        // Tablet 3: absent -> reclaim only.
+        let tablets: BTreeMap<TabletId, Tablet> = [
+            (TabletId(1), tablet_with_replicas(1, vec![BASE, 301])),
+            (TabletId(2), tablet_with_replicas(2, vec![301, 302])),
+        ]
+        .into_iter()
+        .collect();
+        let minted = [TabletId(1), TabletId(2), TabletId(3)];
+
+        let reclaim = tablets_to_reclaim(&minted, &tablets);
+        let release = tablets_to_release(&minted, &tablets, BASE);
+
+        assert_eq!(reclaim, vec![TabletId(3)]);
+        assert_eq!(release, vec![TabletId(2)]);
+        // Disjoint: nothing appears in both.
+        assert!(
+            reclaim.iter().all(|t| !release.contains(t)),
+            "reclaim {reclaim:?} and release {release:?} must be disjoint"
+        );
     }
 }

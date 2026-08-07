@@ -215,3 +215,70 @@ fn invalid_split_and_merge_are_rejected_deterministically() {
     assert_eq!(meta.tablets.len(), 2);
     assert_eq!(meta.tablets[&TabletId(1)].epoch, Epoch::INITIAL);
 }
+
+/// A split child inherits the source tablet's placement policy (ADR 0029):
+/// without it the new sibling would have no policy and be invisible to both the
+/// repair reconciler and the load rebalancer, so it would never be re-placed or
+/// balanced onto new members.
+#[test]
+fn split_child_inherits_the_source_policy() {
+    use animus_control::ApplyOutcome::Applied;
+    use animus_placement::PlacementPolicy;
+
+    let mut meta = Metadata::default();
+    let policy = PlacementPolicy::simple("cp-rf3", 3).require_label("region", "eu");
+    assert_eq!(
+        meta.apply(&MetaCommand::CreateTablet {
+            tablet: TabletId(1),
+            table: Some("users".to_owned()),
+            range: KeyRange::whole(),
+            replicas: vec![10, 11, 12],
+        }),
+        Applied
+    );
+    assert_eq!(
+        meta.apply(&MetaCommand::SetTabletPolicy {
+            tablet: TabletId(1),
+            policy: Some(policy.clone()),
+        }),
+        Applied
+    );
+
+    // Split the tablet; the new sibling id must carry the same policy.
+    assert_eq!(
+        meta.apply(&MetaCommand::SplitTablet {
+            tablet: TabletId(1),
+            expected_epoch: Epoch::INITIAL,
+            split_key: b"m".to_vec(),
+            new_id: TabletId(2),
+        }),
+        Applied
+    );
+    assert_eq!(meta.policies.get(&TabletId(1)), Some(&policy));
+    assert_eq!(
+        meta.policies.get(&TabletId(2)),
+        Some(&policy),
+        "split child did not inherit the source's placement policy"
+    );
+
+    // A split of a policy-less tablet leaves the child policy-less (no panic).
+    assert_eq!(
+        meta.apply(&MetaCommand::CreateTablet {
+            tablet: TabletId(3),
+            table: None,
+            range: KeyRange::whole(),
+            replicas: vec![10, 11, 12],
+        }),
+        Applied
+    );
+    assert_eq!(
+        meta.apply(&MetaCommand::SplitTablet {
+            tablet: TabletId(3),
+            expected_epoch: Epoch::INITIAL,
+            split_key: b"m".to_vec(),
+            new_id: TabletId(4),
+        }),
+        Applied
+    );
+    assert!(!meta.policies.contains_key(&TabletId(4)));
+}

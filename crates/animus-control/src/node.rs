@@ -26,6 +26,15 @@ const SNAPSHOT_THRESHOLD: u64 = 64;
 /// reconciliation is a slow background activity, not on any request path.
 const RECONCILE_INTERVAL: Duration = Duration::from_millis(500);
 
+/// Evaluate load rebalancing (ADR 0029) once every this many `reconcile_loop`
+/// ticks — roughly every 4 seconds at [`RECONCILE_INTERVAL`]. This is a pure
+/// pacing/churn-control heuristic ONLY: correctness and safety are carried
+/// entirely by the epoch-CAS (a stale move is rejected as an epoch mismatch) and
+/// PR1's data-plane catch-up gate, **not** by this cadence. So it must not be
+/// hardened into a load-bearing invariant — any value produces a correct cluster,
+/// just at a different rebalancing speed.
+const REBALANCE_EVERY_N_TICKS: u64 = 8;
+
 /// How often a member emits a liveness heartbeat to the control group
 /// (ADR 0012). On the order of the Raft heartbeat interval, and short relative to
 /// [`DETECT_TIMEOUT`] so a live member is comfortably seen within the window.
@@ -433,9 +442,17 @@ fn record_transition(
 /// a no-op when nothing drifted (`reconcile` returns no commands) — so it is
 /// idempotent and produces no churn at steady state. The proposed entries are
 /// flushed and replicated by the [`drive`] loop's regular WAL handling.
+///
+/// It also carries **load rebalancing** (ADR 0029, [`Metadata::rebalance`]): once
+/// every [`REBALANCE_EVERY_N_TICKS`] ticks, *and only if repair proposed nothing
+/// this tick* (violation repair always wins), it proposes a single
+/// balance-improving move so a grown cluster spreads its existing tablets onto new
+/// members — something the pin-survivors reconciler never does on its own.
 async fn reconcile_loop<E: Env>(env: E, core: Arc<Mutex<RaftCore>>) {
+    let mut tick: u64 = 0;
     loop {
         env.sleep(RECONCILE_INTERVAL).await;
+        tick = tick.wrapping_add(1);
         // Clone only the placement-relevant view under the lock (members +
         // tablets + policies — not the schema catalog or the CP address book,
         // which dominate a grown `Metadata`), and run the pure decision *off*
@@ -449,11 +466,23 @@ async fn reconcile_loop<E: Env>(env: E, core: Arc<Mutex<RaftCore>>) {
             core.placement_view()
         };
         let proposals = view.reconcile();
+        let repaired = !proposals.is_empty();
         for command in proposals {
             // Off-leader transitions between the check and here are harmless:
             // a stale `CasTabletReplicas` is rejected by the epoch guard, and a
             // non-leader `propose` is dropped.
             core.lock().expect("raft core poisoned").propose(command);
+        }
+        // Load rebalancing (ADR 0029) runs only when repair proposed *nothing*
+        // this tick — violation repair always takes priority over balance — and
+        // only on the rebalance cadence. It proposes a single balance-improving
+        // move (a healthy replica from a most-loaded node onto a least-loaded
+        // one). The cadence is pure churn control (see `REBALANCE_EVERY_N_TICKS`):
+        // safety is the epoch-CAS + data-plane catch-up gate, not this timing.
+        if !repaired && tick % REBALANCE_EVERY_N_TICKS == 0 {
+            if let Some(command) = view.rebalance() {
+                core.lock().expect("raft core poisoned").propose(command);
+            }
         }
     }
 }

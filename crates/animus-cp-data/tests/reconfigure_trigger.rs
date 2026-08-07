@@ -157,12 +157,25 @@ fn run(seed: u64) {
     // (a follower's `metadata()` is committed state). ---
     for (&_id, node) in &group {
         let ctrl = control[0].clone();
-        node.spawn_reconfigure_loop(RECONFIGURE_INTERVAL, move || {
-            ctrl.metadata()
-                .tablets
-                .get(&TABLET)
-                .map(|t| t.replicas.iter().copied().collect())
-        });
+        let ctrl_down = control[0].clone();
+        node.spawn_reconfigure_loop(
+            RECONFIGURE_INTERVAL,
+            move || {
+                ctrl.metadata()
+                    .tablets
+                    .get(&TABLET)
+                    .map(|t| t.replicas.iter().copied().collect())
+            },
+            move || {
+                ctrl_down
+                    .metadata()
+                    .members
+                    .iter()
+                    .filter(|(_, m)| m.status == NodeStatus::Down)
+                    .map(|(id, _)| *id)
+                    .collect()
+            },
+        );
     }
 
     sim.run_for(Duration::from_secs(2));
@@ -309,12 +322,25 @@ fn auto_reconfigure_is_reproducible_from_seed() {
         );
         for (&_id, node) in &group {
             let ctrl = control[0].clone();
-            node.spawn_reconfigure_loop(RECONFIGURE_INTERVAL, move || {
-                ctrl.metadata()
-                    .tablets
-                    .get(&TABLET)
-                    .map(|t| t.replicas.iter().copied().collect())
-            });
+            let ctrl_down = control[0].clone();
+            node.spawn_reconfigure_loop(
+                RECONFIGURE_INTERVAL,
+                move || {
+                    ctrl.metadata()
+                        .tablets
+                        .get(&TABLET)
+                        .map(|t| t.replicas.iter().copied().collect())
+                },
+                move || {
+                    ctrl_down
+                        .metadata()
+                        .members
+                        .iter()
+                        .filter(|(_, m)| m.status == NodeStatus::Down)
+                        .map(|(id, _)| *id)
+                        .collect()
+                },
+            );
         }
         let mut sim = sim;
         sim.run_for(Duration::from_secs(2));

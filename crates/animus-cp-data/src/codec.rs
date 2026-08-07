@@ -36,9 +36,10 @@ const MAGIC: u8 = 0xCB;
 /// Codec version, bumped on any incompatible layout change. `2`: `KvCommand`'s
 /// `Put`/`Batch`/`Delete`/`Cas` variants gained a `fence: KeyRange` field. `3`:
 /// `KvCommand::Split` (tag 4) is gone — split is now a single control-plane
-/// command, never a data-plane one (ADR 0028) — pre-alpha, no cross-version
+/// command, never a data-plane one (ADR 0028). `4`: `RaftMsg::TimeoutNow` (tag
+/// 9, ADR 0029 leadership transfer) added — pre-alpha, no cross-version
 /// compatibility is required.
-const VERSION: u8 = 3;
+const VERSION: u8 = 4;
 
 /// A decode failure: a description of what was malformed, surfaced loudly by
 /// the caller (logged + dropped; never silently misread).
@@ -386,6 +387,10 @@ fn put_raft(out: &mut Vec<u8>, m: &RaftMsg<KvCommand>) {
             put_u8(out, 8);
             put_u64(out, *node);
         }
+        RaftMsg::TimeoutNow { term } => {
+            put_u8(out, 9);
+            put_u64(out, *term);
+        }
     }
 }
 
@@ -452,6 +457,7 @@ fn read_raft(c: &mut Cursor<'_>) -> Result<RaftMsg<KvCommand>, DecodeError> {
             next_offset: c.u64()?,
         },
         8 => RaftMsg::Heartbeat { node: c.u64()? },
+        9 => RaftMsg::TimeoutNow { term: c.u64()? },
         other => return Err(format!("unknown RaftMsg tag {other}")),
     })
 }
@@ -674,6 +680,7 @@ mod tests {
                 next_offset: 2048,
             },
             RaftMsg::Heartbeat { node: 11 },
+            RaftMsg::TimeoutNow { term: 7 },
         ];
         for m in msgs {
             roundtrip(&KvWire::Raft(m));

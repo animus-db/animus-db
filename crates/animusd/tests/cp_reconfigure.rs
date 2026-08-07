@@ -267,6 +267,13 @@ async fn cp_group_follows_tablet_replica_set() {
 
     // The reconfigure loop on the leader's node steps the group's Raft config to the
     // new set: the leader now reports two voters, and the dropped id is gone.
+    //
+    // ADR 0029: removing a *healthy* extra voter (this is a plain drop, not a
+    // failure repair — nothing here is `Down`) is now gated on the surviving
+    // kept replica being caught up to the leader's commit index, so this can
+    // take one extra heartbeat round trip versus the old unconditional removal
+    // — a wider, 60s timeout (matching this file's spare-replacement test
+    // below) absorbs that under real `cargo test --workspace` contention.
     let dropped = raftkv_ids[drop_idx];
     let reconfigured = async {
         loop {
@@ -278,9 +285,9 @@ async fn cp_group_follows_tablet_replica_set() {
             sleep(Duration::from_millis(150)).await;
         }
     };
-    timeout(Duration::from_secs(30), reconfigured)
+    timeout(Duration::from_secs(60), reconfigured)
         .await
-        .expect("CP group did not reconfigure to the new replica set within 30s");
+        .expect("CP group did not reconfigure to the new replica set within 60s");
 
     for node in nodes {
         node.shutdown();
