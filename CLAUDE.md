@@ -165,6 +165,29 @@ gotchas also belong in that crate's `CLAUDE.md`; entries here are the
 cross-cutting ones. Prune/merge entries that become obsolete.
 
 ### Testing
+- **A cluster-bring-up test helper that gates on `any(is_control_leader)` is
+  wrong for a test that restarts a single node of a multi-node cluster** — the
+  restarted node rejoins as a follower (the majority never went down), so it
+  never reports itself leader and the helper times out waiting for a
+  leadership signal that was never the actual readiness condition. A
+  single-node cluster's own restart test hides this (a 1-of-1 group is always
+  its own leader). For a restart-one-node-of-N test, wait for the node to
+  *catch up* instead — poll its admin/Raft view until `last_applied ==
+  commit_index && commit_index >= snapshot_index + log_len` (no leadership
+  requirement) — which is also the correct replay-completion gate before any
+  convergent post-restart assertion. (`animusd` ADR 0029 release-GC restart
+  test.)
+- **Adding a new heavy multi-node `ProdEnv` integration test raises CPU/IO
+  contention on every *other* test binary running in parallel under `cargo
+  test`, and a pre-existing hard latency-bound assertion (e.g. a median write
+  latency under some millisecond ceiling) can flake purely from that added
+  load — no code regression in either test.** Confirm such a failure by
+  re-running the victim *in isolation* before treating it as real; a
+  release/GC-style loop that is a genuine no-op on a steady cluster (its
+  predicate returns empty, then iterates nothing) cannot be the cause. Same
+  family as the documented "a flaky ProdEnv test is a real bug" rule, with the
+  refinement that a *newly-added* heavy test can itself be the load source —
+  so the right move is isolate-and-reconfirm, not loosen the victim's bound.
 - **The in-process `--cluster N` shared edge state masks cross-process leader-routing
   gaps — test cross-process paths *per-process*.** In `--cluster N` every node shares
   one `ClusterEdgeState`, so an operation that needs to reach *both* the control
