@@ -585,6 +585,55 @@ cross-cutting ones. Prune/merge entries that become obsolete.
   accidentally still ack on a bare term match and mask the very bug the test
   exists to catch. (`animus-cp-data::RaftKvNode::majority`/read-barrier probe
   fanout; `animusd::resolve_cp_route`'s `has_local_replica` gate.)
+- **A two-layer gate where the selector and the actuator use different
+  thresholds fails silently — and a primitive's `bool`/`Result` return value
+  that encodes "did this actually take effect" must never be discarded, however
+  statement-shaped the call looks.** ADR 0029's leadership-transfer primitive
+  had exactly this shape: `RaftKvNode::reconfigure_step`'s step 4 *selected* a
+  transfer target with `peer_match(n) >= commit_index()`, but
+  `RaftCore::transfer_leadership` only *armed* at `peer_match(target) ==
+  last_log_index()` — a stricter threshold the selector never checked — and
+  the caller wrote `self.transfer_leadership(target);` with the returned
+  `bool` dropped on the floor. `propose` is fire-and-forget (it appends to the
+  leader's local log and returns before any replication round trip), so on a
+  write-hot tablet `last_log_index` moves the instant a write is accepted
+  while every peer's `peer_match` still reflects the *previous* entry — the
+  two thresholds disagreed at essentially every sampling instant, so the arm
+  failed *forever*, and nothing ever surfaced it: no error, no log, no metric,
+  just a rebalance move that silently never completed for any tablet whose
+  move needed to relocate its leader. The correct fix is standard Raft §3.10
+  semantics, not just threshold alignment: relax the arm gate to match the
+  selector (`>= commit_index`), but that alone reintroduces the original
+  danger (arming to a target that isn't actually at `last_log_index` yet), so
+  **freeze `propose`/`change_membership`** while a transfer is armed (return
+  `NotLeader`, hinting the target) so the log stops growing and replication
+  can close the remaining gap, gate the actual `TimeoutNow` send on the
+  target *reaching* `last_log_index`, and **abort** (clear the arm, resume
+  proposing) if a deadline passes with no step-down — else a target that
+  crashes right after arming strands the group frozen forever. A related,
+  narrower bug in the same function compounded it: the down-extra search
+  reused a generic "lowest non-self extra" helper and only *then* filtered it
+  on down-ness, so a `Down` extra sorting after a healthy one was invisible —
+  the step fell through to a *different*, catch-up-gated removal path, which
+  could stall behind an unrelated survivor's lag. **General checks:** (1) when
+  a value is computed once to pick a candidate and re-derived/re-checked
+  inside the primitive that acts on the candidate, diff the two conditions —
+  "selects X" and "arms X" must agree on what "eligible" means, or the
+  narrower one silently wins every time; (2) grep for every call to a
+  bool/Result-returning mutator where the result is bound to `let _ =` or not
+  bound at all — if the primitive's doc says "returns whether it took effect,"
+  a discarded result is a designed-in blind spot; (3) a "search for the first
+  match of predicate P" helper reused with an *unrelated* predicate applied
+  only to the first result (`extra().filter(down.contains)`) is a common way
+  to accidentally scope a search to "the first element of the base sequence,"
+  not "the first element satisfying the actual predicate" — write the combined
+  predicate into the search itself. (`animus-control` `RaftCore::
+  transfer_leadership`/`propose`/`change_membership`/`broadcast_append`;
+  `animus-cp-data::RaftKvNode::reconfigure_step`; regressions in
+  `animus-control/tests/leadership_transfer.rs`,
+  `animus-cp-data/tests/leader_transfer_reconfigure.rs` — the hand-driven
+  variant is the one proven to fail against the pre-fix source — and
+  `animus-cp-data/tests/reconfigure_down_extra_priority.rs`.)
 - **`tokio::fs::File` writes are not ordered or durable until `flush().await` —
   a dropped handle completes its write in the background, so two sequential
   appends via separate handles can land INVERTED on disk, and a later `sync` on a
@@ -1557,6 +1606,58 @@ cross-cutting ones. Prune/merge entries that become obsolete.
   `animus-control::node::detect_loop`; `animusd/tests/cluster_growth.rs`;
   `animus-control/tests/{placement_auto_reconcile,placement_rebalance,
   placement_reconcile,prod_liveness}.rs`.)
+- **A safety mechanism that exists and is unit-tested but has zero production
+  callers is dead code with a green suite — second instance of the
+  `narrow_scope` pattern above, on the *write* side this time.** ADR 0028's
+  crossover-window write fences (`RaftKvNode::put_fenced`/`delete_fenced`/
+  `put_batch_fenced`, a `fence: KeyRange` embedded in the proposed command
+  and checked at apply time) landed additively with a thorough sim suite
+  (`animus-cp-data/tests/fenced_commands.rs`) — but `grep -rn "_fenced"
+  crates/animusd/src` found **zero** callers: `cp_put_local`/
+  `cp_delete_local`/`cp_batch_propose` (reached by every client write,
+  including every `cp_serve_forwarded` counterpart) all called the
+  *unfenced* `put`/`delete`/`put_batch`, which stamp `fence =
+  KeyRange::whole()` — so the apply-time check was a permanent no-op in the
+  one place it needed to matter. The trigger: a node whose `Metadata` view
+  hasn't yet observed a `SplitTablet` commit still resolves a child-range
+  key to the parent's (now too-wide) group via `cp_route`'s `Local` branch
+  (no re-resolution once routed); the unfenced write then applies onto the
+  shared engine's physical key the child now logically owns, shadowing or
+  corrupting it via LWW — invisible to every existing test because nothing
+  drove a write into that specific crossover window. Fixed by adding an
+  additive `RaftKvNode::scope_range()` accessor (a `StorageScope::range()`
+  getter underneath) and stamping it as the fence on every real proposal.
+  **The sharper lesson is the second half of the fix, not the wiring
+  itself:** the fence alone is not sufficient, because `cp_put_local`/
+  `cp_delete_local` confirm success by polling for the proposed value (or
+  its absence) to read back from **local** storage — and a fenced-out entry
+  still commits and applies as a deterministic no-op, silently advancing
+  any coarser "did this commit" signal (e.g. `engine_applied_index()`
+  alone) right along with it. Had the confirm loop been keyed on such a
+  signal instead of exact value equality, wiring the fence alone would have
+  turned "silently corrupts the child" into "silently falsely-acks a write
+  that never happened" — a *different* silent-failure mode, not a fix. The
+  actual fix pairs the fence with a **pre-propose range check**: reject
+  before ever proposing if a key falls outside the group's current
+  `scope_range()`, returning the same error shape a routing failure already
+  produces so the caller's retry re-resolves `cp_route`; the embedded fence
+  then only has to cover the much smaller residual race between that check
+  and the entry's actual apply. **General checks this generalizes to:** (1)
+  when auditing a safety mechanism for "is it wired in," also ask "does the
+  *confirmation* path downstream of it use a signal precise enough that a
+  mechanism turning a write into a no-op is distinguishable from the write
+  actually succeeding" — a coarse confirm signal can convert a newly-fixed
+  correctness bug into a new, differently-shaped one; (2) a regression test
+  for this class of bug needs access to the private routing internals (here,
+  a specific tablet's `CpGroup` handle) to *force* the stale-routing shape
+  deterministically, since the real race is not reliably reproducible over
+  wall-clock timing — when the integration crate under `tests/` can't reach
+  what's needed (its types are only `pub(crate)`/private), an **in-crate**
+  `#[cfg(test)] mod` (a child module of the module holding the private
+  items, hence able to see them) is the right tool, not a workaround.
+  (`animus-cp-data::RaftKvNode::scope_range`; `animusd`
+  `cp_put_local`/`cp_delete_local`/`cp_batch_propose`,
+  `split_fence_tests::stale_routed_write_for_a_split_childs_key_is_rejected_not_lost`.)
 
 ### Parallel-agent orchestration
 - **Partition work by disjoint crate ownership — exactly one owner per shared

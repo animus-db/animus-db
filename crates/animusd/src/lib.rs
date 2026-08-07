@@ -83,29 +83,36 @@ enum CpGroup {
 }
 
 impl CpGroup {
-    /// Propose a write to the group (honored on the leader). See
-    /// [`RaftKvNode::put`].
-    fn put(&self, key: Vec<u8>, value: Vec<u8>) -> ProposeResult {
+    /// Propose a write to the group (honored on the leader), stamping `fence`
+    /// (ADR 0028 write-fence wiring — see [`RaftKvNode::put_fenced`]) so every
+    /// replica's apply checks the key against the range embedded in the entry
+    /// itself. Every real caller (`ClientCtx::cp_put_local`) stamps the
+    /// group's own current [`scope_range`](Self::scope_range) here — there is
+    /// no unfenced `put` left in this crate; `KeyRange::whole()` is only ever
+    /// used by tests/tools with no split-crossover exposure to guard against.
+    fn put_fenced(&self, key: Vec<u8>, value: Vec<u8>, fence: KeyRange) -> ProposeResult {
         match self {
-            CpGroup::Lsm(n) => n.put(key, value),
-            CpGroup::Mem(n) => n.put(key, value),
+            CpGroup::Lsm(n) => n.put_fenced(key, value, fence),
+            CpGroup::Mem(n) => n.put_fenced(key, value, fence),
         }
     }
 
-    /// Propose a **batch put** — commit every `(key, value)` as one Raft entry. See
-    /// [`RaftKvNode::put_batch`].
-    fn put_batch(&self, puts: Vec<(Vec<u8>, Vec<u8>)>) -> ProposeResult {
+    /// As [`put_fenced`](Self::put_fenced), but for a **batch put** — commit
+    /// every `(key, value)` as one Raft entry. See
+    /// [`RaftKvNode::put_batch_fenced`].
+    fn put_batch_fenced(&self, puts: Vec<(Vec<u8>, Vec<u8>)>, fence: KeyRange) -> ProposeResult {
         match self {
-            CpGroup::Lsm(n) => n.put_batch(puts),
-            CpGroup::Mem(n) => n.put_batch(puts),
+            CpGroup::Lsm(n) => n.put_batch_fenced(puts, fence),
+            CpGroup::Mem(n) => n.put_batch_fenced(puts, fence),
         }
     }
 
-    /// Propose a delete (tombstone) to the group. See [`RaftKvNode::delete`].
-    fn delete(&self, key: Vec<u8>) -> ProposeResult {
+    /// As [`put_fenced`](Self::put_fenced), but for a delete (tombstone). See
+    /// [`RaftKvNode::delete_fenced`].
+    fn delete_fenced(&self, key: Vec<u8>, fence: KeyRange) -> ProposeResult {
         match self {
-            CpGroup::Lsm(n) => n.delete(key),
-            CpGroup::Mem(n) => n.delete(key),
+            CpGroup::Lsm(n) => n.delete_fenced(key, fence),
+            CpGroup::Mem(n) => n.delete_fenced(key, fence),
         }
     }
 
@@ -390,6 +397,17 @@ impl CpGroup {
         match self {
             CpGroup::Lsm(n) => n.narrow_scope(new_range),
             CpGroup::Mem(n) => n.narrow_scope(new_range),
+        }
+    }
+
+    /// This group's own current `StorageScope` range (ADR 0028 write-fence
+    /// wiring): the pre-propose fence check + fence-to-stamp source for
+    /// [`ClientCtx::cp_put_local`]/[`cp_delete_local`]/[`cp_batch_propose`].
+    /// See [`RaftKvNode::scope_range`].
+    fn scope_range(&self) -> KeyRange {
+        match self {
+            CpGroup::Lsm(n) => n.scope_range(),
+            CpGroup::Mem(n) => n.scope_range(),
         }
     }
 
@@ -1748,12 +1766,45 @@ impl ClientCtx {
     /// for the same data while a poll is still pending (see
     /// [`ClientCtx::cp_batch_write_patient`]'s doc for why re-proposing an
     /// already-accepted-but-unconfirmed batch is actively harmful).
+    ///
+    /// **Pre-propose range check (ADR 0028 write fences).** `cp_route` can
+    /// resolve `Local` off a stale `Metadata` view during a split's crossover
+    /// window (this node still thinks it hosts the leader for a wider range
+    /// than the tablet's group has actually narrowed to). Proposing anyway
+    /// and relying solely on the *embedded* fence to no-op the entry at apply
+    /// time is not enough here: `cp_batch_local`'s confirm loop
+    /// ([`poll_probe`]) waits for the **last key's value to read back**, and a
+    /// fenced-out batch never writes anything — so the loop just times out
+    /// with a generic "did not commit" error rather than a clean routing
+    /// error, and (see `cp_put_local`'s doc for the sharper version of this
+    /// hazard) a confirm mechanism keyed on a coarser signal than value
+    /// equality (e.g. an engine-applied index, which a no-op still advances)
+    /// could go further and **falsely ack** a write that never happened. So
+    /// every key is checked against the leader's own live
+    /// [`RaftKvNode::scope_range`] *before* proposing: on a miss, this
+    /// returns `Err` **without proposing**, in the same shape as the
+    /// `NotLeader` case below, so `cp_batch_write`/`cp_batch_write_patient`'s
+    /// caller sees an ordinary routing failure and retries (re-resolving
+    /// `cp_route`, which reaches the correct child once this node's own view
+    /// of the split has caught up). The embedded `fence` (stamped from this
+    /// same read) still rides the proposed entry regardless, covering the
+    /// residual race between this check and the entry's actual apply — see
+    /// [`RaftKvNode::scope_range`]'s doc for why that sliver can't be closed
+    /// for free; an out-of-range write landing in that sliver is *dropped*
+    /// (a safe no-op), never mis-applied, so the residual risk is a
+    /// mis-timed error, not silent corruption.
     fn cp_batch_propose(
         leader: &CpGroup,
         group: Vec<(Vec<u8>, Vec<u8>)>,
     ) -> Result<Option<KvPair>, String> {
         let probe = group.last().cloned();
-        match leader.put_batch(group) {
+        let fence = leader.scope_range();
+        if let Some((bad_key, _)) = group.iter().find(|(k, _)| !fence.contains(k)) {
+            return Err(format!(
+                "key {bad_key:?} outside tablet's current range (stale routing, likely a split crossover); retry"
+            ));
+        }
+        match leader.put_batch_fenced(group, fence) {
             ProposeResult::Accepted { .. } => Ok(probe),
             ProposeResult::NotLeader { .. } => Err("CP group leader moved; retry".into()),
         }
@@ -2049,8 +2100,41 @@ impl ClientCtx {
     /// not scale under concurrent load. (If we lose leadership before commit, the
     /// entry is truncated and never appears locally → we time out, which is
     /// correct: the write did not commit.)
+    ///
+    /// **Pre-propose range check (ADR 0028 write fences).** `cp_route` can hand
+    /// us a `Local` leader off a stale `Metadata` view during a split's
+    /// crossover window — this node still believes it hosts the leader for a
+    /// range wider than the tablet's group has actually narrowed to (e.g. this
+    /// key now belongs to a just-minted sibling on the same shared engine).
+    /// Stamping the leader's own `fence` on the proposed entry (below) is
+    /// necessary but **not sufficient on its own**: a fenced-out entry still
+    /// commits and applies as a no-op, and *if* a confirm mechanism ever keyed
+    /// success on a coarser signal than exact value equality (e.g. "has this
+    /// index applied yet" — a no-op still advances that watermark) it would
+    /// **falsely ack** a write that never actually landed anywhere. This confirm
+    /// loop happens to poll value equality, which degrades that hazard to "waits
+    /// out `CLIENT_TIMEOUT` and returns an error" rather than a false ack — but
+    /// that is a property of *this* poll, not a defense to rely on, so the
+    /// explicit pre-check below is the actual guard: reject an out-of-range key
+    /// **before proposing at all**, in the same `Err` shape as the `NotLeader`
+    /// case, so the caller (`cp_write`) sees an ordinary routing failure and its
+    /// own retry re-resolves `cp_route` (reaching the correct child once this
+    /// node's view of the split has caught up), instead of a write that silently
+    /// shadowed/corrupted the child's data. The embedded `fence` (stamped from
+    /// the *same* `scope_range()` read used for the check) still rides the
+    /// entry regardless, to cover the residual race between this check and the
+    /// entry's actual apply (the scope can narrow further in between) — see
+    /// [`RaftKvNode::scope_range`]'s doc for why that sliver isn't free to
+    /// close; a write landing in it is *dropped* (a safe no-op that this loop
+    /// times out on), never mis-applied.
     async fn cp_put_local(leader: &CpGroup, key: Vec<u8>, value: Vec<u8>) -> Result<(), String> {
-        match leader.put(key.clone(), value.clone()) {
+        let fence = leader.scope_range();
+        if !fence.contains(&key) {
+            return Err(
+                "key outside tablet's current range (stale routing, likely a split crossover); retry".into(),
+            );
+        }
+        match leader.put_fenced(key.clone(), value.clone(), fence) {
             ProposeResult::Accepted { .. } => {
                 let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
                 let mut poll = CP_CONFIRM_POLL_INIT;
@@ -2072,9 +2156,23 @@ impl ClientCtx {
     /// Propose a CP delete on a **known-leader** local handle and wait until the
     /// key reads absent locally (committed + durable + applied tombstone) —
     /// durable-before-ack. Local read, not a barrier, as in
-    /// [`cp_put_local`](Self::cp_put_local).
+    /// [`cp_put_local`](Self::cp_put_local) — and the **same pre-propose range
+    /// check** against the leader's live `scope_range()` before proposing, for
+    /// the same reason: a stale-routed delete for a key that now belongs to a
+    /// split sibling must not be silently accepted as a fenced-out no-op (which
+    /// would otherwise leave the sibling's real value untouched but let the
+    /// caller believe the delete succeeded once the parent's own read of that
+    /// physical key coincidentally reads absent — see `cp_put_local`'s doc for
+    /// the full hazard and why the pre-check, not just the embedded fence, is
+    /// the actual guard).
     async fn cp_delete_local(leader: &CpGroup, key: Vec<u8>) -> Result<(), String> {
-        match leader.delete(key.clone()) {
+        let fence = leader.scope_range();
+        if !fence.contains(&key) {
+            return Err(
+                "key outside tablet's current range (stale routing, likely a split crossover); retry".into(),
+            );
+        }
+        match leader.delete_fenced(key.clone(), fence) {
             ProposeResult::Accepted { .. } => {
                 let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
                 let mut poll = CP_CONFIRM_POLL_INIT;
@@ -4075,4 +4173,244 @@ pub async fn read_frame<T: DeserializeOwned>(stream: &mut TcpStream) -> std::io:
     let msg = serde_json::from_slice(&buf)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     Ok(Some(msg))
+}
+
+/// Regression tests for the ADR 0028 write-fence pre-propose check
+/// (`cp_put_local`/`cp_delete_local`/`cp_batch_propose`). These live **inside**
+/// the crate (as opposed to `tests/*.rs`, a separate crate) specifically to
+/// reach the private `CpGroup`/`ClientCtx` handles a real stale-routed write
+/// needs to be driven directly against a specific tablet's group — nothing
+/// under `tests/` can construct this scenario, since `cp_route`'s normal
+/// resolution reads this node's own (freshly polled) `Metadata` and would
+/// simply route a post-split write to the correct child on its own.
+#[cfg(test)]
+mod split_fence_tests {
+    use std::net::SocketAddr;
+    use std::time::Duration;
+
+    use crate::{
+        ClientCtx, ClientRequest, ClientResponse, ClusterConfig, RoleAddrs, read_frame, run_node,
+        write_frame,
+    };
+    use serde_json::Value;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+    use tokio::time::{sleep, timeout};
+
+    fn free_addrs(count: usize) -> Vec<SocketAddr> {
+        let ls: Vec<std::net::TcpListener> = (0..count)
+            .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+            .collect();
+        ls.iter().map(|l| l.local_addr().unwrap()).collect()
+    }
+
+    /// Minimal admin HTTP `POST`, mirroring `tests/admin_endpoint.rs`'s helper
+    /// (duplicated rather than shared, since this module lives in a different
+    /// compilation unit than the `tests/` integration crate).
+    async fn admin_post(addr: SocketAddr, path: &str, body: &str) -> (u16, Value) {
+        let mut stream = TcpStream::connect(addr).await.expect("connect to admin");
+        let request = format!(
+            "POST {path} HTTP/1.0\r\n\
+             Host: animus\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\
+             \r\n\
+             {body}",
+            body.len(),
+        );
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("send request");
+        stream.flush().await.expect("flush");
+        let mut raw = Vec::new();
+        stream.read_to_end(&mut raw).await.expect("read response");
+        let text = String::from_utf8(raw).expect("utf8 response");
+        let (head, payload) = text.split_once("\r\n\r\n").expect("response has a body");
+        let status: u16 = head
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|code| code.parse().ok())
+            .expect("status line");
+        let value = serde_json::from_str(payload).unwrap_or(Value::Null);
+        (status, value)
+    }
+
+    /// A write for a key that a split has just handed off to a CHILD tablet,
+    /// driven directly against the **PARENT**'s own `RaftKvNode` handle — the
+    /// exact shape of the crossover-window hazard ADR 0028 §3 describes: a node
+    /// whose `Metadata` view has not yet observed the split still resolves the
+    /// key to the parent's (now too-wide) group via `cp_route`'s `Local`
+    /// branch. Before this fix, `cp_put_local` stamped `KeyRange::whole()` and
+    /// proposed unconditionally, so the parent's group would accept and apply
+    /// the write onto the shared engine's physical key the child now owns — a
+    /// silent shadow/corruption of the child's data. This test bypasses
+    /// `cp_route` entirely (fetching the parent's group handle directly via
+    /// `edge.local_cp`) to drive exactly that write, and asserts it is
+    /// rejected — not silently accepted — and never lands in the shared
+    /// physical key on the parent's own storage.
+    ///
+    /// **What this proves and does not prove:** it proves the pre-propose
+    /// range check itself — given a write for an out-of-range key handed
+    /// directly to a narrowed group's local helper, the write errors instead
+    /// of being falsely acked, and the rejected value never reaches the
+    /// shared engine (read back, for lack of a scope-range-aware read
+    /// primitive, via the parent's own scope-oblivious `local_get`). It does
+    /// **not** reproduce the full end-to-end race (a *live* node
+    /// actually routing a real client request to the parent because its own
+    /// cached `Metadata` genuinely lags the split) — that race depends on
+    /// timing between the control-plane replication of `SplitTablet` and a
+    /// concurrent client request that is not reliably forceable in a test.
+    /// Driving the write directly against the parent's handle is the
+    /// deterministic substitute: it exercises the identical code path
+    /// (`ClientCtx::cp_put_local` against a `CpGroup`) a stale `cp_route`
+    /// resolution would have handed the same key to.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stale_routed_write_for_a_split_childs_key_is_rejected_not_lost() {
+        timeout(Duration::from_secs(60), async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let addrs = free_addrs(6);
+            let config = ClusterConfig {
+                nodes: vec![RoleAddrs {
+                    control: addrs[0],
+                    client: addrs[1],
+                    dynamo: addrs[2],
+                    cql: addrs[3],
+                    raftkv: addrs[4],
+                    admin: addrs[5],
+                }],
+            };
+            let node = run_node(&config, 0, dir.path().join("node-0"))
+                .await
+                .expect("bind + start a single-node cluster");
+
+            timeout(Duration::from_secs(10), async {
+                loop {
+                    if node.is_control_leader() {
+                        return;
+                    }
+                    sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("the sole node did not become control leader");
+
+            // Seed the bootstrap tablet with keys spanning the eventual split
+            // point, through the real client API.
+            let mut stream = TcpStream::connect(node.client_addr())
+                .await
+                .expect("connect to client port");
+            for i in 0..10u32 {
+                let key = format!("key{i:02}").into_bytes();
+                let value = format!("v{i}").into_bytes();
+                write_frame(
+                    &mut stream,
+                    &ClientRequest::Put {
+                        key,
+                        value,
+                        table: "kv".to_string(),
+                    },
+                )
+                .await
+                .expect("send put");
+                let resp: ClientResponse = read_frame(&mut stream)
+                    .await
+                    .expect("read reply")
+                    .expect("a reply");
+                assert!(
+                    matches!(resp, ClientResponse::PutOk),
+                    "put failed: {resp:?}"
+                );
+            }
+
+            let parent_tablet = *node
+                .metadata()
+                .tablets
+                .keys()
+                .next()
+                .expect("the bootstrap tablet exists");
+
+            let (status, split_resp) = admin_post(
+                node.admin_addr(),
+                "/admin/tablet/split",
+                &format!(r#"{{"tablet":{},"split_key":"key05"}}"#, parent_tablet.0),
+            )
+            .await;
+            assert_eq!(status, 200, "split committed: {split_resp}");
+
+            timeout(Duration::from_secs(15), async {
+                loop {
+                    if node.metadata().tablets.len() >= 2 {
+                        return;
+                    }
+                    sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await
+            .expect("split did not produce two tablets");
+
+            // `key07` is `>= "key05"`, so the split handed it to the child.
+            let child_key = b"key07".to_vec();
+
+            // Fetch the PARENT's own group handle directly, bypassing
+            // `cp_route`'s normal (now-fresh) resolution — the deterministic
+            // stand-in for "a node whose routing decision is stale."
+            let parent = node
+                .edge
+                .local_cp(parent_tablet)
+                .expect("this node hosts the parent tablet's group");
+
+            // Sanity: the parent's own live scope really has narrowed past the
+            // child key, so the pre-check below is exercising the real thing.
+            // `narrow_scope` is applied by the per-node join-host loop's
+            // periodic re-narrow (`CP_JOIN_HOST_INTERVAL`), not synchronously
+            // with the split's commit, so poll for it.
+            timeout(Duration::from_secs(10), async {
+                loop {
+                    if !parent.scope_range().contains(&child_key) {
+                        return;
+                    }
+                    sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("the parent's scope never narrowed past the split key");
+
+            let result =
+                ClientCtx::cp_put_local(&parent, child_key.clone(), b"corrupt".to_vec()).await;
+            assert!(
+                result.is_err(),
+                "a write for a child-range key driven at the parent must be \
+                 rejected, not silently acked: {result:?}"
+            );
+
+            // The physical key `key07` was written (as `v7`) during the initial
+            // seed, before the split — its bytes never move (ADR 0028: a split
+            // narrows the *scope*, not the data), so `local_get` (which is
+            // scope-*range*-oblivious, reading by physical key regardless of
+            // which tablet currently logically owns that range) still finds
+            // the pre-split value at that shared physical location. The actual
+            // safety property under test is that the REJECTED write's value
+            // never landed there — i.e. this node's own parent-side storage
+            // was never mutated to `corrupt`, which would have been the
+            // shadow/corruption this fix exists to prevent.
+            assert_ne!(
+                parent.local_get(&child_key).await,
+                Some(b"corrupt".to_vec()),
+                "the rejected write must never land in the shared engine, even \
+                 read back through the parent's own (too-wide) scope"
+            );
+            assert_eq!(
+                parent.local_get(&child_key).await,
+                Some(b"v7".to_vec()),
+                "key07's pre-split value must be untouched by the rejected write"
+            );
+
+            node.shutdown();
+        })
+        .await
+        .expect("test timed out");
+    }
 }

@@ -168,6 +168,22 @@ impl StorageScope {
         *self.range.lock().expect("storage scope range poisoned") = new_range;
     }
 
+    /// A snapshot of this scope's current live range (see the type doc). The
+    /// range can narrow again the instant after this call returns — this is
+    /// a point-in-time read, not a held lock — so a caller using it as a
+    /// pre-propose fence-check (ADR 0028 write-fence wiring, `animusd`'s
+    /// `cp_put_local`/`cp_delete_local`/`cp_batch_propose`) still needs the
+    /// *proposed* command's own embedded `fence` (stamped from this same
+    /// read) to cover the residual race between this read and the entry's
+    /// actual apply.
+    #[must_use]
+    pub fn range(&self) -> KeyRange {
+        self.range
+            .lock()
+            .expect("storage scope range poisoned")
+            .clone()
+    }
+
     /// The physical storage key for logical `key`.
     fn physical(&self, key: &[u8]) -> Vec<u8> {
         let mut out = self.prefix.clone();
@@ -793,7 +809,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// heartbeat — mirrors `change_membership`'s wake-on-propose. Returns
     /// whether the transfer was armed.
     pub fn transfer_leadership(&self, target: NodeId) -> bool {
-        let armed = self.lock().transfer_leadership(target);
+        let armed = self.lock().transfer_leadership(target, self.env.now());
         if armed {
             self.propose_signal.notify();
         }
@@ -846,11 +862,23 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             return None;
         }
         let me = self.env.node_id();
+        // Any extra (non-self) voter, regardless of liveness — used by step 3
+        // (a *healthy* extra). Step 1 below searches independently for a *down*
+        // extra: `extra().filter(down.contains)` would only ever look at the
+        // lowest-id extra (bug fixed under ADR 0029's follow-up — see the root
+        // CLAUDE.md engineering-practices entry), silently skipping a Down extra
+        // that happens to sort after a healthy one.
         let extra = || current.difference(desired).find(|&&n| n != me).copied();
+        let down_extra = || {
+            current
+                .difference(desired)
+                .find(|&&n| n != me && down.contains(&n))
+                .copied()
+        };
 
-        if let Some(down_extra) = extra().filter(|n| down.contains(n)) {
+        if let Some(target) = down_extra() {
             let mut c = current.clone();
-            c.remove(&down_extra);
+            c.remove(&target);
             return self.propose_config(c);
         }
         if let Some(&missing) = desired.difference(&current).next() {
@@ -871,14 +899,49 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             c.remove(&healthy_extra);
             return self.propose_config(c);
         }
-        // The only delta left is removing the leader itself.
+        // The only delta left is removing the leader itself. Select the
+        // lowest-id member of `desired` reasonably close to caught up
+        // (`>= commit_index`, matching `RaftCore::transfer_leadership`'s arm
+        // gate) and try to arm a transfer to it — idempotent, and retried every
+        // tick via `spawn_reconfigure_loop` as long as this delta persists, so a
+        // one-time arming failure (e.g. every candidate momentarily fell behind
+        // `commit_index`) self-heals on the next tick rather than needing a
+        // caller-visible retry. Log (don't silently drop) both outcomes: a
+        // stalled rebalance move that never finds an eligible target is
+        // otherwise invisible until an operator notices a tablet's leader never
+        // migrates off a node it should have left.
         let commit = self.commit_index();
-        if let Some(&target) = desired
+        match desired
             .iter()
             .filter(|&&n| n != me && self.peer_match(n) >= commit)
             .min()
         {
-            self.transfer_leadership(target);
+            Some(&target) => {
+                let armed = self.transfer_leadership(target);
+                // NOTE: the field is named `xfer_target`, not `target` —
+                // `tracing`'s macros reserve the bare `target` identifier for
+                // overriding the event's own target module path.
+                if armed {
+                    tracing::debug!(
+                        xfer_target = target,
+                        commit,
+                        "reconfigure_step: armed leadership transfer to remove self"
+                    );
+                } else {
+                    tracing::warn!(
+                        xfer_target = target,
+                        commit,
+                        "reconfigure_step: transfer_leadership rejected an apparently-eligible target"
+                    );
+                }
+            }
+            None => {
+                tracing::warn!(
+                    ?desired,
+                    commit,
+                    "reconfigure_step: must remove self but no member of `desired` is caught up to commit_index yet"
+                );
+            }
         }
         None
     }
@@ -930,6 +993,23 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// there.
     pub fn narrow_scope(&self, new_range: KeyRange) {
         self.scope.narrow(new_range);
+    }
+
+    /// This group's own current [`StorageScope`] range (see its doc) — a
+    /// point-in-time snapshot, additive accessor (ADR 0028 write-fence
+    /// wiring). Lets a caller (e.g. `animusd`'s `cp_put_local`/
+    /// `cp_delete_local`/`cp_batch_propose`) both **pre-check** a key against
+    /// this group's live scope *before* proposing (so a stale-routed,
+    /// out-of-range write errors instead of being silently accepted as a
+    /// fenced-out no-op — see those callers' doc for why the pre-check
+    /// matters even though the fence itself also protects apply) and stamp
+    /// the *same* range as the proposed command's own `fence` (`put_fenced`/
+    /// `delete_fenced`/`put_batch_fenced`), so every replica's apply makes
+    /// the identical accept/reject decision regardless of how far it has
+    /// independently progressed observing a concurrent split.
+    #[must_use]
+    pub fn scope_range(&self) -> KeyRange {
+        self.scope.range()
     }
 
     /// Read `key` from this replica's **local engine**. NOTE: this is a local read

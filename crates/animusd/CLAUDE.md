@@ -134,6 +134,34 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   addressing; the per-node hosting mechanics are the join-host loop entry
   below; `auto_split_loop`'s current (single-step) shape is documented at its
   definition in `lib.rs`.
+- **Every CP write path stamps + pre-checks the ADR 0028 write fence** (fixed
+  2026-08-07 — the fences existed and were unit-tested in `animus-cp-data`
+  since the split redesign, but had zero real callers here: `cp_put_local`/
+  `cp_delete_local`/`cp_batch_propose` called the *unfenced* `RaftKvNode::
+  put`/`delete`/`put_batch`, so `fence = KeyRange::whole()` on every real
+  write and the apply-time check was a permanent no-op). Now each of those
+  three helpers reads the target group's own live `RaftKvNode::scope_range()`
+  and (1) **rejects the write before proposing** if any key falls outside it
+  — returning an ordinary routing-failure error so the caller's retry
+  re-resolves `cp_route` and reaches the correct child instead of the write
+  being silently accepted — and (2) stamps that same range as the proposed
+  entry's `fence` via `put_fenced`/`delete_fenced`/`put_batch_fenced`
+  (`CpGroup`'s unfenced `put`/`delete`/`put_batch` wrappers are gone — there
+  is no unfenced real write path left). The pre-check is load-bearing, not
+  redundant with the fence: `cp_put_local`/`cp_delete_local` confirm success
+  by reading the proposed value (or its absence) back from **local**
+  storage, and a fenced-out entry still commits and applies as a no-op — so a
+  confirm keyed on any coarser signal (e.g. `engine_applied_index()` alone,
+  which a no-op still advances) would have **falsely acked** a write that
+  never happened; the pre-check keeps the actual failure mode "clean error,
+  client retries" instead of "silent success, silent data loss." A window
+  still exists between the pre-check read and the entry's actual apply (the
+  scope can narrow further in between) — the embedded fence covers exactly
+  that sliver, dropping such a write as a safe no-op rather than mis-applying
+  it. See `animusd/src/lib.rs`'s `split_fence_tests` module (an *in-crate*
+  test — it needs the private `CpGroup`/`ClientCtx` handles to drive a write
+  directly against a specific tablet's group, which nothing under `tests/`
+  can reach) and ADR 0028 §3's update note.
 - **The cluster's members are the CP `raftkv` nodes, not the control ids.** The
   control ids `0..N` are only the Raft *consensus group* for metadata; `bootstrap`
   (leader-only, idempotent) registers the **raftkv ids** (`300+i`) as `Active`
