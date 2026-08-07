@@ -122,11 +122,17 @@ impl CpGroup {
         }
     }
 
-    /// Linearizable ReadIndex read. See [`RaftKvNode::linearizable_get`].
-    async fn linearizable_get(&self, key: &[u8]) -> Option<Vec<u8>> {
+    /// Linearizable ReadIndex read with "not served" disambiguated from
+    /// "served, absent" — see [`RaftKvNode::linearizable_get_served`]. Every
+    /// client-facing get MUST use this (never the collapsed
+    /// `RaftKvNode::linearizable_get`, whose single `None` would report a
+    /// read-barrier failure as a definitive "key absent" — the ADR 0033
+    /// read-path fix; this crate deliberately has no wrapper for the
+    /// collapsed variant so the unsafe shape can't be reached here).
+    async fn linearizable_get_served(&self, key: &[u8]) -> Option<Option<Vec<u8>>> {
         match self {
-            CpGroup::Lsm(n) => n.linearizable_get(key).await,
-            CpGroup::Mem(n) => n.linearizable_get(key).await,
+            CpGroup::Lsm(n) => n.linearizable_get_served(key).await,
+            CpGroup::Mem(n) => n.linearizable_get_served(key).await,
         }
     }
 
@@ -549,6 +555,16 @@ pub enum ClientRequest {
     /// gone; see the root `CLAUDE.md`). The interim manual trigger; an automatic
     /// size-telemetry trigger is `auto_split_loop`.
     SplitTablet { tablet: u64, split_key: Vec<u8> },
+    /// **Admin: merge two adjacent CP tablets** (ADR 0033). A single, atomic
+    /// control-plane command (`MetaCommand::MergeTablets`, epoch-CAS gated on
+    /// both tablets): `left`'s range widens to absorb `right`'s (which is
+    /// removed from the tablet map), both served by the *same* replicas'
+    /// existing per-node shared engine — no data moves, and there is no
+    /// second, data-plane step that can fail independently (the dual of
+    /// `SplitTablet` above). The interim manual trigger; an automatic
+    /// size-based merge trigger is out of scope for this increment (see ADR
+    /// 0033's "Future work").
+    MergeTablets { left: u64, right: u64 },
     /// **Join discovery** (ADR 0032 PR2, `animusd join`): a node that knows only
     /// a *seed* address (any already-running node's client address — old or
     /// newly grown, PR1 made every node's address book equally current) asks
@@ -614,6 +630,12 @@ fn is_relayable_command(command: &MetaCommand) -> bool {
             // reach the control leader).
             | MetaCommand::RegisterNodeAddrs { .. }
             | MetaCommand::SplitTablet { .. }
+            // Tablet merge (ADR 0033): the same relay reason as `SplitTablet` —
+            // already client-exposed via `ClientRequest::MergeTablets`, so
+            // relaying it adds no new authority, it just lets the trigger
+            // reach the control leader cross-process when driven from a
+            // follower.
+            | MetaCommand::MergeTablets { .. }
             // Provision-at-create (ADR 0023): a `CreateTable` on a follower-connected
             // client relays the table's tablet creation + RF policy to the control
             // leader. Scoped to one tablet per table by the state machine's guard.
@@ -1791,35 +1813,119 @@ impl ClientCtx {
         None
     }
 
+    /// Whether a CP read error is a **transient routing/leadership/scope race**
+    /// the reader should retry with re-resolved routing (the `"; retry"` shape
+    /// every such error in this file carries), as opposed to a genuine failure
+    /// to surface. Shared by [`cp_read`](Self::cp_read)/[`cp_scan_one`]'s
+    /// internal retry loops.
+    fn read_should_retry(e: &str) -> bool {
+        e.ends_with("; retry")
+    }
+
+    /// Serve a linearizable **get** on a known-leader local handle, enforcing
+    /// the **read-side scope pre-check** (ADR 0033 — the read dual of
+    /// [`cp_put_local`](Self::cp_put_local)'s pre-propose range check) and the
+    /// served/absent disambiguation. Shared by [`cp_read`](Self::cp_read)'s
+    /// `Local` arm and `cp_serve_forwarded`'s `Get` arm, so both make the
+    /// identical decision.
+    ///
+    /// `Ok(None)` is a genuinely **served** absent. `Err("…; retry")` covers
+    /// the two conditions that must never be reported as absence: (1) the
+    /// group's live `scope_range()` does not contain `key` — this routing
+    /// resolution raced a split's narrow or a merge's widen, so this group
+    /// does not (or does not *yet*) own the key, and serving from its engine
+    /// could return absent-or-stale for data another group (or a
+    /// not-yet-drained absorbed sibling) is authoritative for; (2) the
+    /// ReadIndex barrier failed (deposed / mid-election leader) — nothing can
+    /// be concluded about the key at all. Both were previously collapsed into
+    /// "absent" (`Value(None)`), which read exactly like data loss from the
+    /// outside — the ADR 0033 regression `tests/tablet_merge.rs` caught.
+    async fn cp_get_local(leader: &CpGroup, key: &[u8]) -> Result<Option<Vec<u8>>, String> {
+        if !leader.scope_range().contains(key) {
+            return Err(format!(
+                "key {key:?} outside tablet's current range (stale routing, likely a split/merge crossover); retry"
+            ));
+        }
+        match leader.linearizable_get_served(key).await {
+            Some(v) => Ok(v),
+            None => Err("CP group leader moved; retry".into()),
+        }
+    }
+
+    /// Serve a linearizable **scan** on a known-leader local handle, enforcing
+    /// the read-side scope pre-check — the scan flavor of
+    /// [`cp_get_local`](Self::cp_get_local): `linearizable_scan` filters every
+    /// row through the group's live scope (`strip_in_range`), so a scope that
+    /// has not yet caught up to the metadata-derived request window (a merge's
+    /// widen in flight) would **silently truncate** the results rather than
+    /// error. Shared by [`cp_scan_one`] and `cp_serve_forwarded`'s `Scan` arm.
+    async fn cp_scan_local(
+        leader: &CpGroup,
+        start: &[u8],
+        end: Option<&[u8]>,
+        limit: Option<usize>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
+        let requested = KeyRange::new(start.to_vec(), end.map(<[u8]>::to_vec));
+        if !leader.scope_range().contains_range(&requested) {
+            return Err(format!(
+                "scan window {requested:?} outside tablet's current range (stale routing, likely a split/merge crossover); retry"
+            ));
+        }
+        match leader.linearizable_scan(start, end, limit).await {
+            Some(p) => Ok(p),
+            None => Err("CP group leader moved; retry".into()),
+        }
+    }
+
     /// Linearizable CP **read** of `key` (ADR 0017): ReadIndex on the group leader,
     /// forwarded to the leader's node if this node isn't it. `Ok(None)` is an
-    /// absent key; `Err` is "no leader reachable" (never a stale value — a deposed
-    /// leader's ReadIndex returns `None`, treated as absent). The CP read primitive
-    /// the wire edges call directly.
+    /// absent key — and **only** a genuinely served absent (ADR 0033 read-path
+    /// fix): a read-barrier failure (deposed/mid-election leader) is a
+    /// retryable condition, never reported as absence, and a leader whose live
+    /// `scope_range()` does not contain `key` (this node's routing raced a
+    /// split's narrow or a merge's widen — metadata says the group owns the
+    /// key, its scope hasn't caught up) is likewise retried until routing and
+    /// scope agree, mirroring the write side's pre-propose range check. `Err`
+    /// is "no leader reachable / did not become serveable in time". The CP
+    /// read primitive the wire edges call directly.
     pub(crate) async fn cp_read(
         &self,
         table: &str,
         key: Vec<u8>,
     ) -> Result<Option<Vec<u8>>, String> {
-        match self.cp_route(table, &key).await {
-            CpRoute::Local(leader) => Ok(leader.linearizable_get(&key).await),
-            CpRoute::Forward(addr) => {
-                match self
-                    .cp_forward(
-                        addr,
-                        ClientRequest::Get {
-                            key,
-                            table: table.to_owned(),
-                        },
-                    )
-                    .await
-                {
-                    ClientResponse::Value(v) => Ok(v),
-                    ClientResponse::Error(e) => Err(e),
-                    other => Err(format!("unexpected reply to forwarded CP read: {other:?}")),
+        let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
+        loop {
+            let err = match self.cp_route(table, &key).await {
+                CpRoute::Local(leader) => match Self::cp_get_local(&leader, &key).await {
+                    Ok(v) => return Ok(v),
+                    Err(e) => e,
+                },
+                CpRoute::Forward(addr) => {
+                    match self
+                        .cp_forward(
+                            addr,
+                            ClientRequest::Get {
+                                key: key.clone(),
+                                table: table.to_owned(),
+                            },
+                        )
+                        .await
+                    {
+                        ClientResponse::Value(v) => return Ok(v),
+                        ClientResponse::Error(e) => e,
+                        other => {
+                            return Err(format!(
+                                "unexpected reply to forwarded CP read: {other:?}"
+                            ));
+                        }
+                    }
                 }
+                CpRoute::None => return Err("no CP group leader reachable".into()),
+            };
+            if !Self::read_should_retry(&err) || tokio::time::Instant::now() >= deadline {
+                return Err(err);
             }
-            CpRoute::None => Err("no CP group leader reachable".into()),
+            tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
         }
     }
 
@@ -2226,30 +2332,43 @@ impl ClientCtx {
         end: Option<Vec<u8>>,
         limit: Option<usize>,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
-        match self.cp_route(table, &start).await {
-            CpRoute::Local(leader) => leader
-                .linearizable_scan(&start, end.as_deref(), limit)
-                .await
-                .ok_or_else(|| "CP group leader moved; retry".into()),
-            CpRoute::Forward(addr) => {
-                match self
-                    .cp_forward(
-                        addr,
-                        ClientRequest::Scan {
-                            start,
-                            end,
-                            limit,
-                            table: table.to_owned(),
-                        },
-                    )
-                    .await
-                {
-                    ClientResponse::Pairs(p) => Ok(p),
-                    ClientResponse::Error(e) => Err(e),
-                    other => Err(format!("unexpected reply to forwarded CP scan: {other:?}")),
+        let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
+        loop {
+            let err = match self.cp_route(table, &start).await {
+                CpRoute::Local(leader) => {
+                    match Self::cp_scan_local(&leader, &start, end.as_deref(), limit).await {
+                        Ok(p) => return Ok(p),
+                        Err(e) => e,
+                    }
                 }
+                CpRoute::Forward(addr) => {
+                    match self
+                        .cp_forward(
+                            addr,
+                            ClientRequest::Scan {
+                                start: start.clone(),
+                                end: end.clone(),
+                                limit,
+                                table: table.to_owned(),
+                            },
+                        )
+                        .await
+                    {
+                        ClientResponse::Pairs(p) => return Ok(p),
+                        ClientResponse::Error(e) => e,
+                        other => {
+                            return Err(format!(
+                                "unexpected reply to forwarded CP scan: {other:?}"
+                            ));
+                        }
+                    }
+                }
+                CpRoute::None => return Err("no CP group leader reachable".into()),
+            };
+            if !Self::read_should_retry(&err) || tokio::time::Instant::now() >= deadline {
+                return Err(err);
             }
-            CpRoute::None => Err("no CP group leader reachable".into()),
+            tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
         }
     }
 
@@ -2595,7 +2714,15 @@ impl ClientCtx {
                 }
             }
             ClientRequest::Get { key, table } => match self.cp_leader_for(&table, &key) {
-                Some(leader) => ClientResponse::Value(leader.linearizable_get(&key).await),
+                // Read-side scope pre-check + served/absent disambiguation
+                // (ADR 0033) — the same `cp_get_local` decision as `cp_read`'s
+                // Local arm. Serve-or-error only (never re-forward, never
+                // wait): the forwarder's own retry loop re-resolves routing on
+                // a `"; retry"` error.
+                Some(leader) => match Self::cp_get_local(&leader, &key).await {
+                    Ok(v) => ClientResponse::Value(v),
+                    Err(e) => ClientResponse::Error(e),
+                },
                 None => ClientResponse::Error("forwarded CP op: not the leader here".into()),
             },
             ClientRequest::Delete { key, table } => {
@@ -2616,12 +2743,13 @@ impl ClientCtx {
                 let Some(leader) = self.cp_leader_for(&table, &start) else {
                     return ClientResponse::Error("forwarded CP op: not the leader here".into());
                 };
-                match leader
-                    .linearizable_scan(&start, end.as_deref(), limit)
-                    .await
-                {
-                    Some(p) => ClientResponse::Pairs(p),
-                    None => ClientResponse::Error("CP group leader moved; retry".into()),
+                // Read-side scope pre-check (ADR 0033) — the same
+                // `cp_scan_local` decision as `cp_scan_one`'s Local arm: a
+                // scope lagging the metadata-derived scan window would
+                // silently truncate results, not error.
+                match Self::cp_scan_local(&leader, &start, end.as_deref(), limit).await {
+                    Ok(p) => ClientResponse::Pairs(p),
+                    Err(e) => ClientResponse::Error(e),
                 }
             }
             _ => ClientResponse::Error("unexpected forwarded request".into()),
@@ -3168,6 +3296,7 @@ async fn tablet_host_reconciler_loop(ctx: ClientCtx, mut reconciler: CpReconcile
         let view = MetadataView {
             tablets: meta.tablets,
             down,
+            merged: meta.merged_tablets,
         };
         reconciler.tick(&view).await;
     }
@@ -3469,6 +3598,7 @@ fn request_kind(request: &ClientRequest) -> &'static str {
         ClientRequest::Forwarded { .. } => "forwarded",
         ClientRequest::ProposeSchema(_) => "propose_schema",
         ClientRequest::SplitTablet { .. } => "split_tablet",
+        ClientRequest::MergeTablets { .. } => "merge_tablets",
         ClientRequest::JoinInfo => "join_info",
     }
 }
@@ -3512,6 +3642,11 @@ async fn handle_request(ctx: &ClientCtx, request: ClientRequest) -> ClientRespon
         // Admin: split a CP tablet — a single atomic control-plane command.
         ClientRequest::SplitTablet { tablet, split_key } => {
             ctx.trigger_split(TabletId(tablet), split_key).await
+        }
+        // Admin: merge two adjacent CP tablets (ADR 0033) — a single atomic
+        // control-plane command, the dual of split above.
+        ClientRequest::MergeTablets { left, right } => {
+            ctx.trigger_merge(TabletId(left), TabletId(right)).await
         }
         // A CP op forwarded from another node (cross-process routing, ADR 0017
         // #3b): serve locally iff we are the leader; never re-forward. The
@@ -3675,6 +3810,60 @@ impl ClientCtx {
         {
             Ok(()) => ClientResponse::PutOk,
             Err(()) => ClientResponse::Error("split did not commit in time".into()),
+        }
+    }
+
+    /// Merge adjacent CP tablets `left` and `right` (ADR 0033): a **single,
+    /// atomic** control-plane command (`MetaCommand::MergeTablets`,
+    /// epoch-CAS gated on both tablets — the dual of `trigger_split` above).
+    /// `left`'s range widens to `[left.start, right.end)` and `right` is
+    /// removed from the tablet map — both served by the **same** replicas'
+    /// existing per-node shared engine (ADR 0026/0028: one LSM tree per node,
+    /// confined by `StorageScope`), so no data moves and there is no second,
+    /// data-plane step that can fail independently. The per-node tablet-host
+    /// reconciler (ADR 0031 PR4, extended by ADR 0033) then widens `left`'s
+    /// live scope and tears down `right`'s group on every replica **without
+    /// erasing its data** — a sibling now owns that range on the same shared
+    /// engine.
+    ///
+    /// Routed to the control leader (relayable, [`is_relayable_command`]), so
+    /// this works from any node the client happens to be connected to.
+    #[tracing::instrument(name = "merge_tablets", skip(self), fields(left = left.0, right = right.0))]
+    async fn trigger_merge(&self, left: TabletId, right: TabletId) -> ClientResponse {
+        // Both epochs come from the **same** metadata snapshot, so the CAS
+        // reflects exactly what this call saw (mirroring `trigger_split`'s
+        // `new_id`/`expected_epoch` pairing).
+        let meta = self.raft.metadata();
+        let Some(expected_left_epoch) = meta.tablets.get(&left).map(|t| t.epoch) else {
+            return ClientResponse::Error("no such tablet".into());
+        };
+        let Some(expected_right_epoch) = meta.tablets.get(&right).map(|t| t.epoch) else {
+            return ClientResponse::Error("no such tablet".into());
+        };
+        let cmd = MetaCommand::MergeTablets {
+            left,
+            expected_left_epoch,
+            right,
+            expected_right_epoch,
+        };
+        // Confirm by a signal robust against `right` vanishing for an
+        // unrelated reason (e.g. a concurrent table drop): `left`'s epoch
+        // must have advanced past what this call read AND `right` must be
+        // gone — the exact pair `MergeTablets`'s apply produces together,
+        // atomically, and nothing else in this state machine produces.
+        match self
+            .propose_and_await(cmd, SCHEMA_COMMIT_TIMEOUT, || {
+                let m = self.raft.metadata();
+                let left_bumped = m
+                    .tablets
+                    .get(&left)
+                    .is_some_and(|t| t.epoch > expected_left_epoch);
+                (left_bumped && !m.tablets.contains_key(&right)).then_some(())
+            })
+            .await
+        {
+            Ok(()) => ClientResponse::PutOk,
+            Err(()) => ClientResponse::Error("merge did not commit in time".into()),
         }
     }
 
@@ -4652,6 +4841,41 @@ mod split_fence_tests {
                 "a write for a child-range key driven at the parent must be \
                  rejected, not silently acked: {result:?}"
             );
+
+            // The READ-side dual (ADR 0033): a linearizable get for the same
+            // child-range key driven at the parent's handle — the exact shape
+            // a stale routing resolution would produce — must surface as a
+            // retryable error (so the caller re-resolves and reaches the
+            // child), never as a served answer. Serving it would return a
+            // value NOT linearized against the child group's writes (the
+            // child's leader may be on another node whose writes this engine
+            // hasn't applied yet) — or, in the merge crossover's dual (a
+            // survivor not yet widened over a not-yet-drained absorbed
+            // sibling), a false "absent" indistinguishable from data loss.
+            let read = ClientCtx::cp_get_local(&parent, &child_key).await;
+            match read {
+                Err(e) => assert!(
+                    ClientCtx::read_should_retry(&e),
+                    "the stale-scope read error must be retryable: {e}"
+                ),
+                Ok(v) => panic!(
+                    "a read for a child-range key driven at the parent must be \
+                     a retryable error, never a served answer: {v:?}"
+                ),
+            }
+            // And the scan flavor: a window reaching past the parent's
+            // narrowed scope must error retryably, not silently truncate.
+            let scan = ClientCtx::cp_scan_local(&parent, b"key00", Some(b"key09"), None).await;
+            match scan {
+                Err(e) => assert!(
+                    ClientCtx::read_should_retry(&e),
+                    "the stale-scope scan error must be retryable: {e}"
+                ),
+                Ok(p) => panic!(
+                    "a scan window past the parent's narrowed scope must be a \
+                     retryable error, never a (truncated) result: {p:?}"
+                ),
+            }
 
             // The physical key `key07` was written (as `v7`) during the initial
             // seed, before the split — its bytes never move (ADR 0028: a split

@@ -20,7 +20,15 @@ epoch compare-and-swap transactions.
   `CreateTablet`, `CasTabletReplicas`, **`SplitTablet`** (ADR 0028: the *entire*
   split operation — epoch-CAS gated like `CasTabletReplicas`; narrows the source
   tablet's range and mints a new sibling tablet over the same node-shared storage
-  engine, no data-plane half, no possible orphan), `MergeTablets`,
+  engine, no data-plane half, no possible orphan), **`MergeTablets`** (ADR
+  0033, split's dual: epoch-CAS gated on **both** `left` and `right`, and
+  rejects a cross-table merge; widens `left`'s range to absorb `right`'s,
+  removes `right`, and records it in `Metadata::merged_tablets` — a tiny,
+  never-pruned marker set the per-node reconciler needs to tell "merged into
+  a sibling" apart from "table dropped," since a hosted-but-vanished tablet
+  looks identical from the tablet map alone in either case; now wired all the
+  way through `animusd::trigger_merge` and `animus_cp_data::host`'s
+  `WidenScope`/`Absorb` planner actions — see `animusd/CLAUDE.md`),
   `SetTabletPolicy`, `CreateTableSchema`, `DropTableSchema`,
   **`DropTableTablets`** (ADR 0024: removes *every* tablet scoped to a table +
   its policies in one apply — the metadata half of drop-table GC, mirroring the
@@ -239,6 +247,29 @@ epoch compare-and-swap transactions.
   tablet is now structurally impossible; the old `DropOrphanTablet` cleanup
   command this used to need is gone. See `animusd/CLAUDE.md`'s `trigger_split`
   notes for the calling side.
+- **`MergeTablets` (ADR 0033) is `SplitTablet`'s dual, epoch-CAS gated on
+  *both* tablets.** Unlike `Split`/`Cas`'s single `expected_epoch`, a merge
+  reads two tablets from one `Metadata` snapshot, so either one drifting
+  before commit — a racing rebalance/repair CAS, or another split/merge
+  touching either side — must reject cleanly; `MergeTablets` therefore
+  carries `expected_left_epoch` **and** `expected_right_epoch`, both checked
+  before the adjacency/replica-set/table checks. It also rejects merging
+  tablets from **different tables** (a check the original, long-unwired
+  implementation lacked) — merging across tables would silently conflate two
+  unrelated tables' physical keyspaces once a per-node data-plane reaction
+  exists (ADR 0033/`animus-cp-data::host`). On commit, `right` is recorded in
+  the new `Metadata::merged_tablets: BTreeSet<TabletId>` — a tiny, **never
+  pruned** marker (tablet ids are never reused, so an entry can never
+  resurrect a wrong decision) that is the only sound way a per-node
+  reconciler can tell "this hosted tablet vanished because it was merged
+  into a sibling" apart from "vanished because its whole table was dropped"
+  — inferring it from range containment alone is unsound, since two
+  different tables' still-unsplit tablets can share a byte-identical default
+  `KeyRange::whole()` range with no table identity left to disambiguate by
+  the time the tablet itself is gone from the map. See
+  `tablet_split_merge.rs::merge_rejects_a_stale_epoch_racing_a_concurrent_replica_change`
+  and `::merge_rejects_tablets_from_different_tables`, and `animus-cp-data/
+  CLAUDE.md`'s host-module section for the data-plane half.
 - **Automatic placement (ADR 0005).** Policies are replicated in `Metadata`
   (`SetTabletPolicy` → `policies` map). The decision lives in the pure
   `Metadata::reconcile` (runs `animus_placement::replan` over `Active` members,

@@ -125,6 +125,31 @@ pub struct Metadata {
     /// keeps pre-ADR-0032 snapshots loading (empty map).
     #[serde(default)]
     pub node_addrs: BTreeMap<NodeId, NodeAddrs>,
+    /// Tablet ids that have been **merged away** (ADR 0033): a
+    /// [`MetaCommand::MergeTablets`] apply inserts `right` here (never
+    /// pruned — tablet ids are never reused, by the same monotonic-allocator
+    /// invariant [`Metadata::next_tablet_id`] already enforces, so an entry
+    /// can never resurrect a wrong decision for a later, unrelated tablet
+    /// reusing the id). This is what lets a per-node tablet-host reconciler
+    /// tell "this hosted tablet vanished from `tablets` because it was
+    /// **merged into a sibling** — tear its group down but never touch its
+    /// data, a survivor now owns that range on the same shared engine" apart
+    /// from "vanished because its **whole table was dropped**
+    /// ([`MetaCommand::DropTableTablets`]) — tear down **and** erase."
+    /// Inferring this purely from the tablet map (e.g. "does some other
+    /// tablet's range now cover mine") is unsound: two different tables'
+    /// still-unsplit tablets can have byte-identical default ranges
+    /// ([`animus_tablet::KeyRange::whole`]), so a range-containment check
+    /// with no table identity to disambiguate would misattribute an
+    /// unrelated table's tablet as "the merge survivor" and silently skip a
+    /// real drop's erase. A tiny, permanently-retained marker per merge ever
+    /// performed (bounded by the total number of splits ever performed,
+    /// since a tablet cannot be merged unless it was first split off from
+    /// something) is far cheaper than getting that inference wrong. See ADR
+    /// 0033. `#[serde(default)]` keeps pre-ADR-0033 snapshots loading (empty
+    /// set).
+    #[serde(default)]
+    pub merged_tablets: BTreeSet<TabletId>,
 }
 
 /// A mutation of [`Metadata`], replicated through Raft and applied in log order.
@@ -173,10 +198,23 @@ pub enum MetaCommand {
         split_key: Vec<u8>,
         new_id: TabletId,
     },
-    /// Merge adjacent tablets `left` and `right` (where `left.end == right.start`
-    /// and they share a replica set) into `left`, extended to cover both ranges
-    /// with a bumped epoch; `right` is removed.
-    MergeTablets { left: TabletId, right: TabletId },
+    /// Merge adjacent tablets `left` and `right` (where `left.end == right.start`,
+    /// they share a replica set, and they are scoped to the same table) into
+    /// `left`, extended to cover both ranges with a bumped epoch; `right` is
+    /// removed and recorded in [`Metadata::merged_tablets`] (ADR 0033) so a
+    /// per-node reconciler can tell this apart from a table drop. **Compare-and-swap
+    /// on both `expected_left_epoch` and `expected_right_epoch`** (mirroring
+    /// `SplitTablet`/`CasTabletReplicas`): rejected if either tablet's epoch has
+    /// moved since the caller read it, so a merge proposal computed from a stale
+    /// view (e.g. racing a concurrent rebalance/repair CAS or another split/merge
+    /// touching either tablet) is cleanly rejected instead of applying against
+    /// state the proposer never actually observed.
+    MergeTablets {
+        left: TabletId,
+        expected_left_epoch: Epoch,
+        right: TabletId,
+        expected_right_epoch: Epoch,
+    },
     /// Set (or clear) a tablet's placement policy (ADR 0005). Once a tablet has
     /// a policy, the leader's reconciler keeps its replica set satisfying it;
     /// `policy: None` removes the policy and stops automatic reconciliation. The
@@ -597,15 +635,36 @@ impl Metadata {
                 }
                 ApplyOutcome::Applied
             }
-            MetaCommand::MergeTablets { left, right } => {
+            MetaCommand::MergeTablets {
+                left,
+                expected_left_epoch,
+                right,
+                expected_right_epoch,
+            } => {
                 let (Some(l), Some(r)) = (self.tablets.get(left), self.tablets.get(right)) else {
                     return ApplyOutcome::Rejected("no such tablet");
                 };
+                // CAS on both epochs (mirroring `SplitTablet`/`CasTabletReplicas`,
+                // ADR 0033): a merge proposal is computed from one metadata
+                // snapshot of both tablets, so either one drifting since — a
+                // racing rebalance/repair CAS, or another split/merge touching
+                // either side — must reject cleanly rather than apply against
+                // stale assumptions the proposer never actually observed.
+                if l.epoch != *expected_left_epoch || r.epoch != *expected_right_epoch {
+                    return ApplyOutcome::Rejected("epoch mismatch");
+                }
                 if !l.range.abuts(&r.range) {
                     return ApplyOutcome::Rejected("tablets are not adjacent");
                 }
                 if l.replicas != r.replicas {
                     return ApplyOutcome::Rejected("tablets have different replica sets");
+                }
+                // A merge never crosses a table boundary: both halves' physical
+                // keys live under the same table's `StorageScope` prefix on the
+                // node-shared engine (ADR 0026/0028), which only makes sense if
+                // they were always the same table to begin with.
+                if l.table != r.table {
+                    return ApplyOutcome::Rejected("tablets belong to different tables");
                 }
                 let new_end = r.range.end.clone();
                 let l = self.tablets.get_mut(left).expect("tablet present");
@@ -614,6 +673,10 @@ impl Metadata {
                 self.tablets.remove(right);
                 // The merged-away tablet can no longer be reconciled.
                 self.policies.remove(right);
+                // Recorded so a per-node reconciler can tell "merged into a
+                // sibling" apart from "table dropped" (ADR 0033) — see
+                // `Metadata::merged_tablets`'s doc. Never pruned.
+                self.merged_tablets.insert(*right);
                 // …and its CP members' addresses are dead (ADR 0024 GC).
                 self.prune_cp_member_addrs();
                 ApplyOutcome::Applied
@@ -1206,7 +1269,9 @@ mod tests {
         assert_eq!(
             m.apply(&MetaCommand::MergeTablets {
                 left: TabletId(1),
+                expected_left_epoch: Epoch::INITIAL,
                 right: TabletId(2),
+                expected_right_epoch: Epoch::INITIAL,
             }),
             ApplyOutcome::Applied
         );
@@ -1215,6 +1280,10 @@ mod tests {
         assert!(!m.cp_member_tablets.contains_key(&2301));
         assert!(m.cp_member_addrs.contains_key(&1301));
         assert_eq!(m.cp_member_tablets.get(&1301), Some(&TabletId(1)));
+        assert!(
+            m.merged_tablets.contains(&TabletId(2)),
+            "the merged-away tablet must be recorded (ADR 0033)"
+        );
     }
 
     /// `DropTableTablets` (ADR 0024): removes every tablet scoped to the table —

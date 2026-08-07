@@ -34,6 +34,7 @@
 //! - `GET  /admin/metrics/history`     — periodic snapshots, ~2h ring buffer (ADR 0021 sparklines)
 //! - `GET  /admin/health`              — liveness/readiness
 //! - `POST /admin/tablet/split`        — `{tablet, split_key}`
+//! - `POST /admin/tablet/merge`        — `{left, right}` (ADR 0033)
 //! - `POST /admin/storage/flush`       — `{tablet}`
 //! - `POST /admin/storage/compact`     — `{tablet}`
 //! - `POST /admin/raftkv/reconfigure`  — `{tablet, voters}`
@@ -254,6 +255,7 @@ async fn dispatch(ctx: &ClientCtx, request: &http::HttpRequest) -> (u16, String)
         ("GET", "/admin/member/drain-status") => member_drain_status(ctx, q),
         ("GET", "/admin/health") => health(ctx),
         ("POST", "/admin/tablet/split") => action_split(ctx, &request.body).await,
+        ("POST", "/admin/tablet/merge") => action_merge(ctx, &request.body).await,
         ("POST", "/admin/storage/flush") => action_flush(ctx, &request.body).await,
         ("POST", "/admin/storage/compact") => action_compact(ctx, &request.body).await,
         ("POST", "/admin/raftkv/reconfigure") => action_reconfigure(ctx, &request.body),
@@ -624,6 +626,28 @@ async fn action_split(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
         .trigger_split(TabletId(req.tablet), req.split_key.into_bytes())
         .await;
     client_response_to_json(resp, json!({"ok": true, "tablet": req.tablet}))
+}
+
+/// `POST /admin/tablet/merge` request body (ADR 0033): `left`/`right` are
+/// adjacent tablet ids — `left` survives (widened), `right` is absorbed.
+#[derive(Deserialize)]
+struct MergeReq {
+    left: u64,
+    right: u64,
+}
+
+async fn action_merge(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
+    let req: MergeReq = match parse_body(body) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    let resp = ctx
+        .trigger_merge(TabletId(req.left), TabletId(req.right))
+        .await;
+    client_response_to_json(
+        resp,
+        json!({"ok": true, "left": req.left, "right": req.right}),
+    )
 }
 
 async fn action_flush(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {

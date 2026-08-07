@@ -59,6 +59,7 @@ fn view(tablets: impl IntoIterator<Item = Tablet>) -> MetadataView {
     MetadataView {
         tablets: tablets.into_iter().map(|t| (t.id, t)).collect(),
         down: Default::default(),
+        merged: Default::default(),
     }
 }
 

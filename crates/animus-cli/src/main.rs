@@ -40,6 +40,7 @@ const ADMIN_USAGE: &str = "  admin <subcommand> <admin-addr> [args]:\n    \
     wal-segment <admin-addr> <seg> [tablet]\n    \
     key <admin-addr> <key> [tablet]\n    \
     split <admin-addr> <tablet> <split-key>\n    \
+    merge <admin-addr> <left> <right>\n    \
     flush|compact <admin-addr> <tablet>\n    \
     reconfigure <admin-addr> <tablet> <voter,voter,...>\n    \
     drain <admin-addr> <node-id>\n    \
@@ -152,6 +153,18 @@ async fn run_admin(args: &[String]) -> Result<(), String> {
             let split_key = arg(3).ok_or("split needs <split-key>")?;
             let body = serde_json::json!({"tablet": tablet, "split_key": split_key}).to_string();
             ("POST", "/admin/tablet/split".into(), Some(body))
+        }
+        "merge" => {
+            let left: u64 = arg(2)
+                .ok_or("merge needs <left>")?
+                .parse()
+                .map_err(|_| "left must be a number")?;
+            let right: u64 = arg(3)
+                .ok_or("merge needs <right>")?
+                .parse()
+                .map_err(|_| "right must be a number")?;
+            let body = serde_json::json!({"left": left, "right": right}).to_string();
+            ("POST", "/admin/tablet/merge".into(), Some(body))
         }
         "flush" | "compact" => {
             let tablet: u64 = arg(2)

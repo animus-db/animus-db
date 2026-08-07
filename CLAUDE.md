@@ -1636,6 +1636,82 @@ to the archive stays in place below.
   independent tables (`tests/decommission.rs` uses three, mirroring
   `tests/seed_join.rs`'s `TABLES`), so the pre-growth distribution is
   imbalanced enough to guarantee at least one move onto the new node.
+- **When two different root causes produce the identical observable absence,
+  don't try to reconstruct which one happened from the remaining state —
+  record an explicit signal at the moment the distinction is still known.**
+  Wiring tablet merge (ADR 0033, the data-plane dual of ADR 0028's split), a
+  per-node reconciler observing "a tablet I used to host vanished from the
+  replicated tablet map" must react completely differently depending on
+  *why*: merged into a sibling (tear the group down, but the data is still
+  live — a survivor now serves it on the same shared engine, so **never
+  erase**) vs. the whole table dropped (tear down **and erase** — nothing is
+  left to serve that range). Both produce the exact same absence from
+  `Metadata.tablets`, and the tempting inference — "does some other tablet's
+  range now cover mine, so it must be a merge survivor" — is unsound: two
+  different tables' still-unsplit tablets can have byte-identical default
+  ranges (`KeyRange::whole()`), and by the time the reconciler is deciding
+  what to do, the vanished tablet's own table identity is gone from view too
+  (it's not in the map anymore), so there's no way to disambiguate a
+  same-table survivor from an unrelated table's coincidentally-matching
+  tablet. The fix was a tiny, explicit, **permanently-retained** replicated
+  marker (`Metadata::merged_tablets: BTreeSet<TabletId>`, ADR 0033) set at
+  the one moment the distinction is unambiguous (the `MergeTablets` apply
+  itself, which knows exactly which tablet it just absorbed) — cheap because
+  tablet ids are never reused (so the marker never needs pruning and can
+  never resurrect a wrong decision for a later id), and correct by
+  construction instead of by inference. **General check when a planner reacts
+  to "X disappeared" from a coarser view: are there multiple legitimate
+  reasons X can disappear that demand different actions, and if so, is there
+  actually enough information left in the coarser view at decision time to
+  tell them apart — or does the distinguishing fact need to be captured
+  explicitly, closer to where it was still known, even at the cost of a
+  small permanent marker?** (`animus-control::Metadata::merged_tablets`;
+  `animus-cp-data::host::{HostAction::Absorb, MetadataView::merged}`.)
+- **Tearing down a Raft group whose data will keep being SERVED (not erased)
+  must drain the group's committed log into the engine first — `shutdown()`
+  halts the async apply task at its next loop-top check WITHOUT draining, and
+  deleting the group's WAL then destroys the only local copy of the
+  committed-but-unapplied tail.** Found via ADR 0033's own 3-node merge
+  integration test flaking ~1-in-5 *in isolation* (per the standing rule, a
+  flaky `ProdEnv` test is a real bug): a write acked by the absorbed group's
+  leader right before the merge was applied to *that leader's* engine (ack
+  requires leader-local apply) but not yet to a follower's — commit-index
+  propagation runs up to one heartbeat behind, while the reconciler's
+  event-driven `metadata_watch` fires the `Absorb` teardown on the very
+  commit that made the merge visible, i.e. *designed* to race that window.
+  The follower's engine then permanently lacked the acked key, and if that
+  node hosted the merge survivor's leader, linearizable reads answered a
+  definitive "key absent" forever — indistinguishable from data loss. The
+  same non-draining shutdown is **harmless for `Release`/`Reclaim`** (their
+  teardowns erase the data anyway; other replicas serve) — which is exactly
+  why it was never noticed: the invariant "a torn-down group's unapplied
+  tail doesn't matter" was true for every teardown that existed before merge
+  added one whose data lives on. Three-part fix, each load-bearing: the
+  `Absorb` teardown drains (commit covers the local log, engine-applied
+  covers commit) while the driver is still live; `plan` defers the
+  survivor's `WidenScope` until the absorb confirms (drain-before-widen —
+  the planner's fixed emission order alone would have widened *first*); and
+  the read path stopped conflating two "None"s — a ReadIndex barrier
+  failure and a genuinely-served absent — plus gained the read-side dual of
+  ADR 0028's pre-propose range check (a get/scan whose group's live
+  `scope_range()` doesn't contain the request errors retryably; for scans
+  the un-widened scope was otherwise a *silent truncation*, since
+  `linearizable_scan` filters rows through the live scope). **Two general
+  checks: (1) when a new feature makes a previously-universal teardown
+  invariant ("this group's data dies with it") false for one new path, audit
+  the teardown's every step against the new path — the WAL delete that was
+  cleanup before is data loss now; (2) grep read paths for `Option`-collapse
+  points where "couldn't serve" and "served: absent" merge into one value —
+  the Get/Scan arm asymmetry (Get mapped `None` to absent, Scan mapped it to
+  an error) was the tell.** The deterministic regression drives the write →
+  merge-view tick with zero intervening sim time, so the apply task provably
+  hasn't run — no wall-clock race needed.
+  (`animus-cp-data::host::Reconciler::teardown`'s Absorb drain + `plan`'s
+  `absorbing` gate; `RaftKvNode::linearizable_get_served`; `animusd`
+  `cp_get_local`/`cp_scan_local`; regressions:
+  `reconciler_corpus.rs::scenario_merge_widens_and_absorbs`,
+  `host::tests::widen_is_deferred_while_the_absorbed_sibling_is_still_hosted`,
+  `animusd` `split_fence_tests`' read/scan duals.)
 - **A "weighted median via one accumulate-and-threshold pass" is only correct
   when no single item can dominate half the total weight — once one can,
   scan every achievable cut point and pick the closest to half, don't commit
