@@ -215,6 +215,101 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   *bimodal* failure: works when the connected node happens to be the control
   leader, silently times out ("did not commit") when it must relay
   (`tests/drop_table_gc.rs` caught exactly this for `DropTableTablets`).
+- **Removed-replica GC (ADR 0029) is `cp_gc_loop`'s *second phase* — the release
+  dual of the reclaim (drop-table) phase above.** When a tablet's replica set
+  moves *off* this node while the tablet still **exists** (a manual `drain`, an
+  automatic failure-repair swap, or a rebalance move — not the whole table being
+  dropped), the same loop stops the now-idle group and erases its data via the
+  **identical** `cp_gc_tablet` teardown; the only difference from reclaim is the
+  predicate: `topology::tablets_to_release` (present **and** `base_id ∉ replicas`)
+  vs. `tablets_to_reclaim` (absent). The two partition this node's `minted` set —
+  a tablet is never both. **Two live guards make release safe where reclaim needs
+  none:** (1) the **local-config gate** — `cp_gc_release_phase` acts only once
+  this node's *own durable Raft log* voter config (`CpGroup::config`) already
+  excludes `base_id`. That is the replay-independent anchor PR1's `departing`
+  mechanism guarantees a removed node reliably adopts — unlike replicated
+  `Metadata.tablets`, which a restarting control replica replays through
+  *historical* states, so the metadata signal alone can flicker; and (2) an
+  **epoch-stability dampener** (`pending_release`, `tablet → (epoch, consecutive
+  ticks)`): the release condition must hold for `RELEASE_CONFIRM_TICKS` (3)
+  consecutive ticks *at an unchanged tablet epoch* before acting — any epoch
+  change (a re-add's CAS bumps it) or condition flip resets the counter, so a
+  replay transient can't trigger a release and a re-add cancels one in flight.
+  A **joining spare is structurally never released**: it *is* in `replicas`, so
+  `tablets_to_release` excludes it even during its brief non-voter formation
+  window. **One accepted residual gap** (same shape the pre-ADR-0029 drain/repair
+  paths already had — not a new risk): a node that crashes *before* it ever
+  receives the removal config entry recovers a log whose config still lists
+  itself, so the local-config gate never passes and that node leaks the group
+  forever. Documented at the loop; before ADR 0029 *nothing* released such a
+  tablet on any node. `tests/cp_rebalance_gc.rs` (a `CasTabletReplicas` move-off →
+  stop + erase; release converges across a restart-replay without resurrecting,
+  while an unrelated still-hosted tablet is untouched; a repair-onto-spare join is
+  never prematurely erased), plus the pure `tablets_to_release` unit tests in
+  `src/topology.rs`.
+- **`resolve_cp_route`'s `has_local_replica` gate must re-verify against this
+  node's own current Raft config, not just "do I have a registered handle at
+  all" — a lesson the release-GC's own grace window (above) creates.** Before
+  ADR 0029, a registered local handle for a tablet was always a *current*
+  replica (nothing ever removed a node from a still-existing tablet's replica
+  set while leaving its handle registered), so `resolve_cp_route` trusted
+  `local_cp(tablet).is_some()` as "wait for my own group to elect, don't
+  bother forwarding." Once a healthy rebalance/repair move can leave a
+  departed node's handle registered for up to `RELEASE_CONFIRM_TICKS` ticks
+  (the release-GC's own grace window, by design), that node's client-facing
+  requests for the tablet it just left hit exactly this branch and **wait
+  forever** — `decide_cp_route`'s `!has_local_replica` guard skips computing
+  `is_replica`/`fallback_forward` entirely whenever a local handle exists, so
+  a stale handle can never fall through to "forward to whoever the metadata
+  says actually replicates this now." Fixed by re-deriving `has_local_replica`
+  as "a local handle exists **and** its own `CpGroup::config()` still lists
+  this node" — the identical local, non-`Metadata` signal the release-GC gate
+  already trusts (PR1's `departing` mechanism is what makes it durable). Found
+  live via `tests/cp_rebalance.rs`: every client request to a just-rebalanced
+  table hung until its own 10s `CLIENT_TIMEOUT`, on every node, not just the
+  departed ones — because the *actual* current leader's own read barrier was
+  separately broken (next entry) and looked identical from the client's side.
+  **General check for any "cheap local check short-circuits a `Metadata`
+  read" optimization: does staying valid for the life of the local handle
+  actually depend on an invariant a *later* change (here, delayed release)
+  quietly breaks?**
+- **`RaftKvNode`'s read-barrier quorum (`majority` + which peers get probed)
+  was keyed on `all_nodes` — the peer set a node happened to be *hosted with*,
+  frozen at construction — never the group's live Raft `config()`.** Every
+  membership change before ADR 0029 was a same-size, pre-known swap (a
+  failure-repair spare was already listed in every replica's `all_nodes` from
+  the moment the group formed, `membership.rs`'s and `reconfigure_trigger.rs`'s
+  join tests all construct it that way), so `all_nodes` never actually
+  diverged from the live config and this was invisible. A healthy rebalance
+  move breaks that assumption outright: it can rotate a majority of a tablet's
+  replicas onto nodes that were never in *any* surviving replica's `all_nodes`
+  at all. The surviving leader's `read_barrier` then probes only its own stale
+  peer set — which, after a full rotation, can intersect the *current* voter
+  config in nothing but itself — so it can never collect the acks its own
+  `majority()` (also computed from the same stale `all_nodes`) requires, and
+  every `linearizable_get`/`linearizable_scan` on that tablet times out and
+  reports the key **absent** (indistinguishable from genuine data loss from
+  the outside) forever after. Fixed by computing both `majority()` and the
+  probe fanout from `self.config()` (the live voter set) instead — `all_nodes`
+  is now dead as a stored field (removed) and survives only as the one-time
+  bootstrap value `RaftCore::new`/`recovered` seed their *initial* config from.
+  Regression: `animus-cp-data/tests/read_index.rs`'s
+  `linearizable_read_succeeds_after_a_full_membership_rotation` — rotates a
+  3-node group `{0,1,2}` to `{2,3,4}` (two of three members replaced, mirroring
+  the exact production shape) and stops the departed nodes outright (a
+  still-live departed peer can accidentally still ack on term match alone,
+  which masked an earlier, weaker version of this same test — a regression
+  test for a "the sender doesn't respond" bug must actually make the sender
+  not respond, not just remove it from the *current* config while it keeps
+  running). **This is the cp-data-plane sibling of the exact bug class the
+  root CLAUDE.md already documents for the control plane** ("a cached
+  per-node handle derived from replicated state needs an explicit re-sync
+  step for every way that state can change in place") — but it had never
+  actually been triggered before ADR 0029 gave membership a shape (a full
+  rotation) that could expose it. When adding new ways an existing invariant
+  can change (here: "a group's peer set now evolves after hosting", where it
+  used to be fixed), grep for every place that invariant's *original* form is
+  cached, not just the mechanism that changes it.
 - **The CP group is durable by default**: a node opens **one shared** `LsmEngine`
   over its **raftkv** `ProdEnv` at start (`StorageBackend::Lsm`), cloned into every
   tablet's `RaftKvNode` (ADR 0026/0028) — so a value acked to a client

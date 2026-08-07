@@ -182,6 +182,15 @@ pub enum RaftMsg<C = MetaCommand> {
     /// rides the same `RaftMsg` wire enum (and thus the single per-node inbox) so
     /// a member needs only one message channel to the control group.
     Heartbeat { node: NodeId },
+    /// Sent only by [`RaftCore::transfer_leadership`]: tells a fully caught-up
+    /// voter to campaign **immediately**, bypassing the election timeout (and,
+    /// crucially, pre-vote — a live leader's lease would otherwise reject the
+    /// pre-vote round). `term` is the sending leader's current term; a recipient
+    /// no longer at that term (e.g. it already saw a newer leader) ignores it.
+    /// Resolves the "leader can never remove itself" gap: to move a healthy
+    /// replica off the current leader, the leader transfers away first, then the
+    /// new leader performs the removal itself.
+    TimeoutNow { term: u64 },
 }
 
 impl<C> RaftMsg<C> {
@@ -197,7 +206,8 @@ impl<C> RaftMsg<C> {
             | RaftMsg::AppendEntries { term, .. }
             | RaftMsg::AppendEntriesResp { term, .. }
             | RaftMsg::InstallSnapshot { term, .. }
-            | RaftMsg::InstallSnapshotResp { term, .. } => *term,
+            | RaftMsg::InstallSnapshotResp { term, .. }
+            | RaftMsg::TimeoutNow { term } => *term,
             RaftMsg::Heartbeat { .. } => 0,
         }
     }
@@ -298,6 +308,21 @@ pub struct RaftCore<C = MetaCommand, S = Metadata> {
     // Leader state.
     next_index: BTreeMap<NodeId, u64>,
     match_index: BTreeMap<NodeId, u64>,
+    // Set by `transfer_leadership`: a caught-up voter this leader is handing off
+    // to. Re-sent as a `TimeoutNow` on every heartbeat (`broadcast_append`) until
+    // this node steps down (the transfer succeeded) — so a single dropped message
+    // doesn't strand the handoff. Cleared fresh on every election win.
+    transfer_target: Option<NodeId>,
+    // A peer this leader has just voted out of the configuration, mapped to the
+    // index of the config entry that removed it. `broadcast_append` keeps
+    // replicating to a departing peer (even though `apply_config` has already
+    // dropped it from `peers`) until its `match_index` reaches that index, so the
+    // peer durably adopts the config excluding itself instead of only inferring
+    // its removal from pre-vote rejection. Leader-local and volatile: cleared on
+    // every election win, so a fresh leader's own subsequent removals repopulate
+    // it — see the root CLAUDE.md rebalancing ADR for why this is sufficient
+    // rather than reconstructed across leadership changes.
+    departing: BTreeMap<NodeId, u64>,
     // The index of the first entry this node appended in its current leadership
     // term — the election no-op from `become_leader`. Raft §6.4 / the
     // reconfiguration erratum: a fresh leader's `commit_index` is guaranteed to
@@ -397,6 +422,8 @@ where
             votes: BTreeSet::new(),
             next_index: BTreeMap::new(),
             match_index: BTreeMap::new(),
+            departing: BTreeMap::new(),
+            transfer_target: None,
             first_term_index: 0,
             snapshot_offset: BTreeMap::new(),
             incoming_snapshot: None,
@@ -892,6 +919,52 @@ where
         ProposeResult::Accepted { index }
     }
 
+    /// The leader's last-known replicated log index for `node` (0 if unknown —
+    /// e.g. not currently a peer). The caught-up primitive: a caller comparing
+    /// this against [`commit_index`](Self::commit_index) or
+    /// [`last_log_index`](Self::last_log_index) can tell whether `node` has
+    /// actually received everything before, say, removing a different voter out
+    /// from under it.
+    #[must_use]
+    pub fn peer_match(&self, node: NodeId) -> u64 {
+        self.match_index.get(&node).copied().unwrap_or(0)
+    }
+
+    /// Arm a leadership transfer to `target`: once armed, `broadcast_append`
+    /// sends it a [`RaftMsg::TimeoutNow`] on every heartbeat (see the
+    /// `transfer_target` field doc) until this node steps down — resilient to a
+    /// single dropped message, and, like `change_membership`, something a caller
+    /// outside the driver loop can trigger and then wake the loop to send
+    /// promptly (`propose_and_wake`'s pattern) rather than a method that hands
+    /// back messages to deliver itself. Returns whether the transfer was armed.
+    /// Leader-only; rejected (no state change) unless `target` is a
+    /// **different**, current voter whose log is fully caught up
+    /// (`peer_match(target) == last_log_index()`) and no config change is in
+    /// flight — a transfer to a lagging or not-yet-a-voter target could stall the
+    /// group with no leader able to make progress. This node's own
+    /// term/role/leader_id are **not** touched here: the actual handoff happens
+    /// when `target` wins the resulting election and its higher term reaches
+    /// this node through the normal step-down path.
+    ///
+    /// This is what makes it possible to move the *leader's own* replica in a
+    /// membership change: [`change_membership`](Self::change_membership) always
+    /// rejects removing the leader, so a caller that needs to do so (e.g. a
+    /// rebalance move landing on the current leader) transfers leadership to
+    /// another member of the target configuration first; that new leader then
+    /// removes the old one itself, which is an ordinary (non-self) removal.
+    pub fn transfer_leadership(&mut self, target: NodeId) -> bool {
+        if self.role != Role::Leader
+            || target == self.id
+            || !self.config.contains(&target)
+            || self.config_change_in_flight()
+            || self.peer_match(target) < self.last_log_index()
+        {
+            return false;
+        }
+        self.transfer_target = Some(target);
+        true
+    }
+
     /// Set the **election-timeout base** and re-arm the election timer from `now`.
     /// The randomized timeout is drawn from `[base, 2*base)` (as always); widening
     /// `base` makes this node slower to campaign, which the assembly layer wants
@@ -923,7 +996,18 @@ where
     /// adopted immediately (Raft single-server change: latest log config wins).
     fn log_append(&mut self, entry: LogEntry<C>) {
         if let Some(voters) = &entry.config {
+            let old_peers = self.peers.clone();
             self.apply_config(voters.clone());
+            // Leader-only bookkeeping: a peer this entry just dropped from `peers`
+            // must still be told, so track it as departing until it acks past this
+            // entry's index (see the `departing` field doc). A peer this entry
+            // brought back is no longer departing.
+            if self.role == Role::Leader {
+                for removed in old_peers.iter().filter(|n| !self.peers.contains(n)) {
+                    self.departing.insert(*removed, entry.index);
+                }
+            }
+            self.departing.retain(|n, _| !self.peers.contains(n));
         }
         self.pending.push(WalRecord::Append(entry.clone()));
         self.log.push(entry);
@@ -1085,7 +1169,23 @@ where
             // detector (ADR 0012); they are not consensus traffic, so the core
             // ignores any that reach it.
             RaftMsg::Heartbeat { .. } => Vec::new(),
+            RaftMsg::TimeoutNow { term } => self.handle_timeout_now(term, now, entropy),
         }
+    }
+
+    /// Handle a leadership-transfer request (see [`RaftMsg::TimeoutNow`]).
+    /// Ignored unless it is for our current term, we are not already the leader,
+    /// and we are a voter — a stale transfer (superseded by a newer election) or
+    /// one addressed to a node since removed from the configuration is a no-op.
+    /// Otherwise campaign immediately via [`start_election`](Self::start_election),
+    /// deliberately skipping the pre-vote phase: pre-vote exists to stop a
+    /// partitioned node from disrupting a *live* leader, which does not apply
+    /// here — the live leader itself asked for this.
+    fn handle_timeout_now(&mut self, term: u64, now: Nanos, entropy: u64) -> Vec<Out<C>> {
+        if term != self.current_term || self.role == Role::Leader || !self.is_voter() {
+            return Vec::new();
+        }
+        self.start_election(now, entropy)
     }
 
     /// Propose a command. If leader, append it (replicated on the next
@@ -1341,6 +1441,13 @@ where
             self.next_index.insert(from, match_index + 1);
             self.maybe_advance_commit();
             self.apply();
+            if self
+                .departing
+                .get(&from)
+                .is_some_and(|&needed| match_index >= needed)
+            {
+                self.departing.remove(&from);
+            }
             if self.next_index.get(&from).copied().unwrap_or(1) <= self.last_log_index() {
                 return self.replicate_to(from).into_iter().collect();
             }
@@ -1668,6 +1775,12 @@ where
             self.next_index.insert(p, last + 1);
             self.match_index.insert(p, 0);
         }
+        // A fresh leadership stint starts with no departing-peer bookkeeping — any
+        // peer still owed a removal notification is discovered anew the next time
+        // this leader itself appends a config entry removing it (see the field
+        // doc); it is not reconstructed from a previous leader's in-flight state.
+        self.departing.clear();
+        self.transfer_target = None;
         // A fresh term restarts any snapshot transfer from offset 0.
         self.snapshot_offset.clear();
         // No-op entry so prior-term entries can be committed under our term.
@@ -1692,8 +1805,25 @@ where
     }
 
     fn broadcast_append(&mut self) -> Vec<Out<C>> {
-        let peers = self.peers.clone();
-        peers.iter().filter_map(|&p| self.replicate_to(p)).collect()
+        // Include departing peers (see the `departing` field doc): a peer just
+        // removed from `peers` still needs the removing entry replicated to it.
+        let mut targets = self.peers.clone();
+        targets.extend(self.departing.keys().copied());
+        let mut outs: Vec<Out<C>> = targets
+            .iter()
+            .filter_map(|&p| self.replicate_to(p))
+            .collect();
+        // Re-send an in-flight leadership transfer every heartbeat (see
+        // `transfer_target` field doc) until this node steps down.
+        if let Some(target) = self.transfer_target {
+            outs.push((
+                target,
+                RaftMsg::TimeoutNow {
+                    term: self.current_term,
+                },
+            ));
+        }
+        outs
     }
 
     /// Build the right replication message for `peer`: an `InstallSnapshot` chunk

@@ -18,6 +18,18 @@ membership and a placement policy, decide which nodes replicate a tablet.
   - `replan(current, candidates, policy)` — recompute after a membership
     change, **keeping eligible survivors** so only failed/ineligible replicas
     move (minimal data churn).
+  - `rebalance_step(tablets, candidates)` — one **load-rebalancing** move (ADR
+    0029): the balance-driven counterpart of `replan`. Where `replan` only moves
+    a replica *off* a failed/ineligible node, this moves a *healthy* replica from
+    a most-loaded node to a least-loaded one so a cluster grown N→M spreads its
+    existing tablets onto the new members. At most **one** move per call
+    (`Some((tablet, new_set))` / `None` when balanced or no legal move) — a
+    deliberate one-CAS-per-evaluation churn bound; repeated application converges
+    to max−min ≤ 1 (moving src→dst with count diff ≥ 2 strictly reduces the
+    sum-of-squares, so it never oscillates). Skips tablets whose *current* set
+    violates their policy (that's `replan`/reconcile's job), preserves residency,
+    and never worsens spread (strict: keeps distinct domains; best-effort: never
+    raises max-per-domain).
   - `PlacementError` (`InsufficientCandidates`, `InsufficientDomains`).
 
 ## What's non-obvious
@@ -54,9 +66,13 @@ membership and a placement policy, decide which nodes replicate a tablet.
 ## Tests
 
 `cargo test -p animus-placement` — residency, strict/best-effort spread, error
-cases, determinism, churn-minimizing `replan` (`tests/placement.rs`). The
-through-Raft, fault-injecting integration test is
-`animus-control/tests/placement_reconcile.rs`.
+cases, determinism, churn-minimizing `replan` (`tests/placement.rs`), and the
+`rebalance_step` planner: noop-when-balanced, single most→least move, residency +
+strict/best-effort spread guards, at-most-one-move + repeated-application
+convergence, and input-permutation determinism (`tests/rebalance.rs`). The
+through-Raft, fault-injecting integration tests are
+`animus-control/tests/placement_reconcile.rs` (repair) and
+`placement_rebalance.rs` (rebalancing).
 
 ## Deferred (ADR 0005)
 

@@ -221,24 +221,55 @@ the engine — the `AccordCore` sync-core/async-driver split.
   control-plane serde_json `PersistedState` format).
   `tests/snapshot_catchup.rs` (crash a follower, write past the
   threshold so the leader compacts, restart → it catches up via snapshot).
-- **C (done)** — single-server Raft **membership change** (`change_membership`):
-  config lives in the log (`RaftCore`, branched so the control plane is unchanged);
-  a node uses the latest log config for quorum/election, the config rides snapshots
-  + `InstallSnapshot`, a removed node stops campaigning, and changes are restricted
-  to a single-server delta + one-in-flight + no leader self-removal.
-  `tests/membership.rs` (remove a follower, add + catch up a node, reconfigure off
-  a crashed node, reject multi-server/self-removal, reproducibility). The
-  **automatic trigger is now wired** (SimEnv): `reconfigure_step` takes one
-  single-server step toward a desired voter set (remove an extra non-leader voter
-  before adding a missing one), and `spawn_reconfigure_loop` drives it from an
-  **epoch-driven pull** — each group leader polls the control plane's replicated
-  `Metadata.tablets[t].replicas` and reconfigures itself (no new control→data
-  command; mirrors the control plane's `reconcile_loop` — decision in
-  `reconfigure_step`, timing in the loop). `tests/reconfigure_trigger.rs` proves
-  the end-to-end cascade (crash → detector `Down` → reconciler `CasTabletReplicas`
-  → group leader swaps the dead node for a same-zone spare, which catches up and
-  the group keeps serving). The `ProdEnv`/`animusd` production assembly (hosting
-  groups + leader-reporting for routing) remains.
+- **C (done, extended by ADR 0029)** — single-server Raft **membership change**
+  (`change_membership`): config lives in the log (`RaftCore`, branched so the
+  control plane is unchanged); a node uses the latest log config for
+  quorum/election, the config rides snapshots + `InstallSnapshot`, a removed
+  node stops campaigning, and changes are restricted to a single-server delta +
+  one-in-flight + no leader self-removal. `tests/membership.rs` (remove a
+  follower, add + catch up a node, reconfigure off a crashed node, reject
+  multi-server/self-removal, reproducibility). The **automatic trigger is
+  wired** (SimEnv): `RaftKvNode::reconfigure_step(desired, down)` takes one
+  single-server step toward a desired voter set, and `spawn_reconfigure_loop`
+  drives it from an **epoch-driven pull** — each group leader polls the control
+  plane's replicated `Metadata.tablets[t].replicas` (+ `Down`-status members)
+  and reconfigures itself (no new control→data command; mirrors the control
+  plane's `reconcile_loop` — decision in `reconfigure_step`, timing in the
+  loop). `tests/reconfigure_trigger.rs` proves the end-to-end cascade (crash →
+  detector `Down` → reconciler `CasTabletReplicas` → group leader swaps the
+  dead node for a same-zone spare, which catches up and the group keeps
+  serving).
+  - **ADR 0029 gave `reconfigure_step` a priority-ordered, down-aware sequence**
+    (see its doc comment): remove an extra `Down` voter first (unchanged repair
+    order); add a missing voter before removing a *healthy* extra one, gated on
+    every `desired` member having caught up to `commit_index` (a healthy move
+    must never drop quorum margin under a still-catching-up newcomer); and if
+    the only remaining delta is removing the **leader's own** replica —
+    previously a permanently-stuck case, `change_membership` always rejects
+    self-removal — transfer leadership (`RaftCore::transfer_leadership` /
+    `RaftMsg::TimeoutNow`, `animus-control`) to a caught-up member of `desired`
+    first, so the new leader performs the removal itself as an ordinary step.
+  - **ADR 0029 also fixed a latent bug `reconfigure_step`'s original design
+    never triggered: the read barrier's quorum (`majority()` + which peers get
+    probed) was keyed on `all_nodes` (this node's hosting-time peer snapshot),
+    never the live `config()`.** Every membership change before ADR 0029 was a
+    same-size, pre-known swap — a failure-repair spare was already listed in
+    every replica's `all_nodes` from the start (see the join-host gotcha
+    below), so `all_nodes` never actually diverged from the live config. A
+    healthy rebalance move can rotate a majority of a group's replicas onto
+    nodes no surviving replica's `all_nodes` ever included, at which point a
+    stale-`all_nodes` read barrier can only ever self-ack and every
+    `linearizable_get`/`scan` on that tablet times out — reporting the key
+    **absent** — forever after. Fixed by deriving both from `self.config()`;
+    `all_nodes` is no longer a stored field (only a one-time bootstrap value
+    for `RaftCore::new`/`recovered`'s *initial* config). Regression:
+    `tests/read_index.rs::linearizable_read_succeeds_after_a_full_membership_rotation`
+    (rotates `{0,1,2}` → `{2,3,4}`, two of three members replaced — the exact
+    production shape — and stops the departed nodes outright, since a
+    still-live departed peer can accidentally still ack on term match alone
+    and mask the bug). See the root `CLAUDE.md` "a cached per-node handle
+    needs an explicit re-sync step" entry — this is that pattern's data-plane
+    read-barrier instance.
   - **Test gotcha (membership):** pre-start a to-be-added node knowing only the
     *current* voters, NOT itself — a node started inside its own initial config is
     a voter that can campaign, win, and inject itself into the group before the

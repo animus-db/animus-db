@@ -10,7 +10,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use animus_env::NodeId;
-use animus_placement::{Candidate, PlacementPolicy, replan};
+use animus_placement::{Candidate, PlacementPolicy, rebalance_step, replan};
 use animus_tablet::{Epoch, KeyRange, Tablet, TabletId};
 use serde::{Deserialize, Serialize};
 
@@ -277,6 +277,13 @@ impl PlacementView {
     pub fn reconcile(&self) -> Vec<MetaCommand> {
         reconcile_placement(&self.members, &self.tablets, &self.policies)
     }
+
+    /// The pure load-rebalancing decision over this view — identical to
+    /// [`Metadata::rebalance`] (both delegate to the same body).
+    #[must_use]
+    pub fn rebalance(&self) -> Option<MetaCommand> {
+        rebalance_placement(&self.members, &self.tablets, &self.policies)
+    }
 }
 
 /// Build placement candidates from the `Active` members and their labels.
@@ -321,6 +328,36 @@ fn reconcile_placement(
         .collect()
 }
 
+/// The shared body of [`Metadata::rebalance`] / [`PlacementView::rebalance`]: the
+/// pure load-rebalancing decision (ADR 0029). Builds the
+/// `(TabletId, &[NodeId], &PlacementPolicy)` slice for every policied tablet and
+/// asks [`rebalance_step`] for a single balance-improving move, wrapping it as a
+/// `CasTabletReplicas` at the tablet's current epoch. Returns at most one command
+/// per call; `None` when the cluster is already balanced or no policy-legal move
+/// exists. Deterministic (only `BTreeMap` iteration + the pure planner), so every
+/// replica agrees — though only the leader ever *proposes* the result.
+fn rebalance_placement(
+    members: &BTreeMap<NodeId, Member>,
+    tablets: &BTreeMap<TabletId, Tablet>,
+    policies: &BTreeMap<TabletId, PlacementPolicy>,
+) -> Option<MetaCommand> {
+    let candidates = active_candidates(members);
+    let entries: Vec<(TabletId, &[NodeId], &PlacementPolicy)> = policies
+        .iter()
+        .filter_map(|(tablet, policy)| {
+            let t = tablets.get(tablet)?;
+            Some((*tablet, t.replicas.as_slice(), policy))
+        })
+        .collect();
+    let (tablet, replicas) = rebalance_step(&entries, &candidates)?;
+    let epoch = tablets.get(&tablet)?.epoch;
+    Some(MetaCommand::CasTabletReplicas {
+        tablet,
+        expected_epoch: epoch,
+        replicas,
+    })
+}
+
 impl Metadata {
     /// The narrow placement view ([`PlacementView`]) — clones only the
     /// placement-relevant maps, never the schema catalog / CP address book.
@@ -351,6 +388,24 @@ impl Metadata {
     #[must_use]
     pub fn reconcile(&self) -> Vec<MetaCommand> {
         reconcile_placement(&self.members, &self.tablets, &self.policies)
+    }
+
+    /// The single load-rebalancing move to make right now (ADR 0029), or `None`
+    /// if the cluster is already balanced or no policy-legal move exists.
+    ///
+    /// Where [`reconcile`](Self::reconcile) is **violation-driven** (moves a
+    /// replica off a `Down`/ineligible node), this is **balance-driven**: it moves
+    /// a *healthy* replica from a most-loaded node onto a least-loaded one so a
+    /// cluster grown from N to M members spreads its existing tablets onto the new
+    /// members (the reconciler never does, since surviving eligible replicas are
+    /// pinned). Also **pure + deterministic**, returning at most one
+    /// `CasTabletReplicas` per call — a deliberate one-CAS-per-tick churn bound;
+    /// the leader's `reconcile_loop` calls it (paced) only once repair had nothing
+    /// to do. Safety rests on the epoch-CAS (a stale move is epoch-rejected) and the
+    /// data-plane catch-up gate, not on the cadence.
+    #[must_use]
+    pub fn rebalance(&self) -> Option<MetaCommand> {
+        rebalance_placement(&self.members, &self.tablets, &self.policies)
     }
 
     /// Apply a command, returning the (deterministic) outcome.
@@ -467,6 +522,13 @@ impl Metadata {
                 source.epoch = source.epoch.next();
                 self.tablets.insert(*new_id, new_tablet);
                 self.next_tablet_id = self.next_tablet_id.max(new_id.0 + 1);
+                // The split child inherits the source's placement policy (ADR 0029):
+                // without it the new sibling has no policy and is invisible to both
+                // the repair reconciler and the load rebalancer, so it would never
+                // be re-placed or balanced onto new members.
+                if let Some(policy) = self.policies.get(tablet).cloned() {
+                    self.policies.insert(*new_id, policy);
+                }
                 ApplyOutcome::Applied
             }
             MetaCommand::MergeTablets { left, right } => {

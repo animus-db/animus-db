@@ -644,7 +644,11 @@ fn action_reconfigure(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
         };
     };
     let desired: std::collections::BTreeSet<NodeId> = req.voters.into_iter().collect();
-    match leader.reconfigure_step(&desired) {
+    // A manual admin step has no failure-detector input, so it always takes the
+    // safe "healthy move" priority order (add before remove, gated on the
+    // newcomer catching up) rather than the "remove first" failure-repair order
+    // — see `RaftKvNode::reconfigure_step` (ADR 0029).
+    match leader.reconfigure_step(&desired, &std::collections::BTreeSet::new()) {
         Some(stepped) => (
             200,
             json!({"ok": true, "tablet": req.tablet, "stepped_to": stepped.into_iter().collect::<Vec<_>>()}),

@@ -113,7 +113,10 @@ constraint; topology labels from config are future work.)
 
 **Still deferred** (the remaining weakest-path work above): residency enforcement
 across backup. The reconciler keeps a tablet's *surviving*
-eligible replicas (minimal churn), so it repairs drift but does not re-optimize
-an already-placed compliant-enough set; a cluster-default policy, topology labels
-in `animusd`'s deployment config, and operator-facing policy management (CLI/wire)
-are also future work.
+eligible replicas (minimal churn), so it repairs drift but does not itself
+re-optimize an already-placed compliant-enough set — **that re-optimization is
+now a separate, balance-driven complement**, `Metadata::rebalance` (ADR 0029),
+driven by the same `reconcile_loop` on a slower cadence whenever repair has
+nothing to do. A cluster-default policy, topology labels in `animusd`'s
+deployment config, and operator-facing policy management (CLI/wire) are still
+future work.

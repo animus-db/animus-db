@@ -173,6 +173,170 @@ pub fn replan(
     choose(&eligible, &keep, policy)
 }
 
+/// One step of **load rebalancing** across the candidate nodes (ADR 0029): move a
+/// single replica of a single tablet from a most-loaded node to a least-loaded
+/// one, iff doing so strictly improves balance and keeps every policy satisfied.
+/// Returns `Some((tablet, new_sorted_replica_set))` for the one move to make, or
+/// `None` when the cluster is already balanced (max−min replica count ≤ 1 across
+/// candidates) or no policy-legal move exists.
+///
+/// Unlike [`replan`] — which is **violation-driven** (it only moves a replica off
+/// a failed/ineligible node) — this is **balance-driven**: it moves *healthy*
+/// replicas onto under-loaded nodes so that a cluster grown from N to M members
+/// eventually spreads its existing tablets onto the new members. It is the
+/// counterpart the control plane's reconciler calls once repair has nothing to do.
+///
+/// Algorithm:
+/// - Seed a per-node replica count at `0` for **every** candidate (so a freshly
+///   added, empty node participates as a genuine minimum), then `+1` for each
+///   replica of each tablet whose *current* replica set already satisfies its
+///   policy. A tablet whose set violates its policy is skipped entirely — bringing
+///   it into compliance is [`replan`]'s / the reconciler's job, not rebalance's, so
+///   this function is robust to being handed a mixed input.
+/// - Consider candidate **sources** in `(count desc, node id asc)` order and
+///   **destinations** in `(count asc, node id asc)` order, only for a `(src, dst)`
+///   pair with `count[src] − count[dst] ≥ 2` (the per-pair form of "max − min ≥ 2":
+///   moving one replica src→dst strictly reduces the sum-of-squares of the counts,
+///   which is what guarantees termination — repeated application converges to
+///   max − min ≤ 1 and never oscillates).
+/// - For that pair, scan the eligible tablets in `K` order for the first with a
+///   replica on `src` where `dst` is not already a replica, `dst` is admitted by
+///   the policy, and the **post-move** set (src's replica swapped for dst) still
+///   satisfies the policy (see [`set_satisfies`]) without worsening best-effort
+///   spread. Return that move; at most **one** move per call (a deliberate
+///   one-CAS-per-evaluation churn bound).
+///
+/// Fully deterministic (only `BTreeMap`/`BTreeSet` + stable sorts, no clock/RNG),
+/// so it returns the identical move on every replica and under input permutation.
+#[must_use]
+pub fn rebalance_step<K: Ord + Copy>(
+    tablets: &[(K, &[NodeId], &PlacementPolicy)],
+    candidates: &[Candidate],
+) -> Option<(K, Vec<NodeId>)> {
+    // Per-node replica counts, seeded 0 for every candidate so an empty new node
+    // is a genuine minimum (a destination), not simply absent.
+    let mut counts: BTreeMap<NodeId, usize> = candidates.iter().map(|c| (c.node, 0)).collect();
+
+    // Only tablets whose *current* set already satisfies their policy count toward
+    // load or are eligible to move; a violating set is the repair reconciler's job.
+    let mut eligible: Vec<(K, &[NodeId], &PlacementPolicy)> = tablets
+        .iter()
+        .filter(|(_, replicas, policy)| set_satisfies(replicas, candidates, policy))
+        .map(|(k, replicas, policy)| (*k, *replicas, *policy))
+        .collect();
+    eligible.sort_by_key(|(k, _, _)| *k);
+
+    for (_, replicas, _) in &eligible {
+        for r in *replicas {
+            if let Some(c) = counts.get_mut(r) {
+                *c += 1;
+            }
+        }
+    }
+
+    // Sources most-loaded first; destinations least-loaded first (id-asc ties).
+    let mut sources: Vec<(NodeId, usize)> = counts.iter().map(|(&n, &c)| (n, c)).collect();
+    let mut dests = sources.clone();
+    sources.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    dests.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+
+    for &(src, src_count) in &sources {
+        for &(dst, dst_count) in &dests {
+            // Only a pair whose imbalance a single move strictly reduces.
+            if src == dst || src_count < dst_count + 2 {
+                continue;
+            }
+            for (k, replicas, policy) in &eligible {
+                if !replicas.contains(&src) || replicas.contains(&dst) {
+                    continue;
+                }
+                let Some(dst_cand) = candidate_for(candidates, dst) else {
+                    continue;
+                };
+                if !policy.admits(dst_cand) {
+                    continue;
+                }
+                let mut post: Vec<NodeId> =
+                    replicas.iter().copied().filter(|&n| n != src).collect();
+                post.push(dst);
+                post.sort_unstable();
+                if !set_satisfies(&post, candidates, policy) {
+                    continue;
+                }
+                // Best-effort spread: never make the worst domain worse.
+                if let Some(sp) = &policy.spread {
+                    if !sp.strict
+                        && max_per_domain(&post, candidates, sp)
+                            > max_per_domain(replicas, candidates, sp)
+                    {
+                        continue;
+                    }
+                }
+                return Some((*k, post));
+            }
+        }
+    }
+    None
+}
+
+/// The candidate for `node`, if it is in the pool.
+fn candidate_for(candidates: &[Candidate], node: NodeId) -> Option<&Candidate> {
+    candidates.iter().find(|c| c.node == node)
+}
+
+/// Whether `replicas` satisfies `policy`'s **hard** constraints under the current
+/// candidate pool: exactly `replication_factor` replicas, every one a candidate
+/// admitted by residency, and — for a **strict** spread — each in a distinct
+/// failure domain (with the domain label present). Best-effort spread imposes no
+/// hard constraint here (doubling up is allowed); its "never worsen" rule is
+/// applied per-move in [`rebalance_step`], which needs the pre-move set to compare
+/// against. Used both to decide which tablets *count* toward load and to validate
+/// a candidate post-move set.
+///
+/// Note this is **not** the same as `replan(replicas) == replicas`: `replan` seeds
+/// its survivors without re-validating spread, so it would wrongly accept a
+/// spread-violating survivor set (see `replan_keeps_survivors_and_replaces_only_the_lost`).
+fn set_satisfies(replicas: &[NodeId], candidates: &[Candidate], policy: &PlacementPolicy) -> bool {
+    if replicas.len() != policy.replication_factor {
+        return false;
+    }
+    for r in replicas {
+        match candidate_for(candidates, *r) {
+            Some(c) if policy.admits(c) => {}
+            _ => return false,
+        }
+    }
+    if let Some(sp) = &policy.spread {
+        if sp.strict {
+            let mut seen: BTreeSet<&String> = BTreeSet::new();
+            for r in replicas {
+                let Some(c) = candidate_for(candidates, *r) else {
+                    return false;
+                };
+                let Some(domain) = c.labels.get(&sp.domain) else {
+                    return false;
+                };
+                if !seen.insert(domain) {
+                    return false; // two replicas in one strict domain
+                }
+            }
+        }
+    }
+    true
+}
+
+/// The greatest number of `replicas` sharing any one failure domain (via each
+/// replica's candidate's `sp.domain` label). Used to enforce that a best-effort
+/// spread move never increases the worst domain's replica count.
+fn max_per_domain(replicas: &[NodeId], candidates: &[Candidate], sp: &SpreadPolicy) -> usize {
+    let mut counts: BTreeMap<Option<&String>, usize> = BTreeMap::new();
+    for r in replicas {
+        let domain = candidate_for(candidates, *r).and_then(|c| c.labels.get(&sp.domain));
+        *counts.entry(domain).or_default() += 1;
+    }
+    counts.values().copied().max().unwrap_or(0)
+}
+
 /// The eligible candidates with their spread-domain value, sorted by node id.
 /// Under residency, ineligible nodes are dropped; under a spread policy, a node
 /// lacking the spread label is also dropped (it cannot be placed in a domain).

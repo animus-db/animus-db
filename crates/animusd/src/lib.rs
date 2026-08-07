@@ -53,7 +53,7 @@ use animus_control::{PlacementPolicy, ProposeResult, RaftNode};
 use animus_cp_data::{RaftKvNode, StorageScope};
 use animus_env::{Disk, Env, Metric, MetricsHandle, NodeId, ProdEnv};
 use animus_storage::{LsmEngine, MemoryEngine, SsTableView, WalRecordView};
-use animus_tablet::{KeyRange, Tablet, TabletId, escape};
+use animus_tablet::{Epoch, KeyRange, Tablet, TabletId, escape};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -356,11 +356,17 @@ impl CpGroup {
 
     /// **Admin action:** take one single-server reconfigure step toward `desired`
     /// (the `change_membership` contract), returning the voter set it proposed, or
-    /// `None` if no step is needed / this node isn't the leader.
-    fn reconfigure_step(&self, desired: &BTreeSet<NodeId>) -> Option<BTreeSet<NodeId>> {
+    /// `None` if no step is needed / this node isn't the leader. `down` is this
+    /// tablet's currently-`Down` members — see [`RaftKvNode::reconfigure_step`]
+    /// (ADR 0029) for the priority order it drives.
+    fn reconfigure_step(
+        &self,
+        desired: &BTreeSet<NodeId>,
+        down: &BTreeSet<NodeId>,
+    ) -> Option<BTreeSet<NodeId>> {
         match self {
-            CpGroup::Lsm(n) => n.reconfigure_step(desired),
-            CpGroup::Mem(n) => n.reconfigure_step(desired),
+            CpGroup::Lsm(n) => n.reconfigure_step(desired, down),
+            CpGroup::Mem(n) => n.reconfigure_step(desired, down),
         }
     }
 
@@ -384,6 +390,19 @@ impl CpGroup {
         match self {
             CpGroup::Lsm(n) => n.narrow_scope(new_range),
             CpGroup::Mem(n) => n.narrow_scope(new_range),
+        }
+    }
+
+    /// This group's active Raft voter configuration, as **this node's** own
+    /// durable log sees it. The safety anchor for release GC (ADR 0029): a
+    /// removed node only stops being a voter here once it has adopted the config
+    /// entry that excludes it — a replay-independent, node-local signal (unlike
+    /// replicated `Metadata`, which a restarting node replays through historical
+    /// states). See [`RaftKvNode::config`].
+    fn config(&self) -> BTreeSet<NodeId> {
+        match self {
+            CpGroup::Lsm(n) => n.config(),
+            CpGroup::Mem(n) => n.config(),
         }
     }
 }
@@ -863,6 +882,7 @@ impl BoundNode {
             storage,
             base_id: my_raftkv_id,
             minted: minted.clone(),
+            pending_release: Arc::new(Mutex::new(BTreeMap::new())),
         };
         // No CP group is stood up at node start (ADR 0023): a fresh cluster has zero
         // data tablets. The per-node join-host loop (below) stands up each table's
@@ -1463,7 +1483,21 @@ impl ClientCtx {
         // one case that needs them, matching `decide_cp_route`'s own short-circuit
         // order (avoids the "re-clone `Metadata` per request" cost the wire edges
         // already learned to snapshot around).
-        let has_local_replica = self.edge.local_cp(tablet).is_some();
+        //
+        // A registered local handle only counts as "this node hosts a replica"
+        // for routing if this node's *own durable Raft config* still lists it as
+        // a voter (a local, non-`Metadata` check — `CpGroup::config()`). ADR 0029
+        // introduced a window where that is not true: a node moved off a tablet
+        // (a healthy rebalance/repair swap) keeps its handle registered until the
+        // release-GC's grace period confirms the move and erases it. Before that
+        // gate closes, `local_cp` still returns `Some`, and this used to make
+        // every branch below short-circuit to `Wait` forever — routing waited on
+        // a group this node had already left, instead of forwarding to the
+        // node(s) that actually replicate it now. A departing/stale handle must
+        // fall through to the metadata-derived path below exactly as if there
+        // were no local handle at all.
+        let local_group = self.edge.local_cp(tablet);
+        let has_local_replica = local_group.is_some_and(|g| g.config().contains(&self.base_id));
         let (is_replica, fallback_forward) = if has_local_replica {
             (false, None)
         } else {
@@ -2419,6 +2453,15 @@ struct CpHostCtx {
     storage: SharedEngine,
     base_id: NodeId,
     minted: Arc<Mutex<BTreeSet<TabletId>>>,
+    /// Per-node epoch-stability dampener for the release-GC phase (ADR 0029):
+    /// `tablet -> (epoch observed, consecutive confirming ticks)`. A tablet must
+    /// satisfy the release condition (dropped from its replica set **and** this
+    /// node's own Raft config already excludes it) for [`RELEASE_CONFIRM_TICKS`]
+    /// consecutive ticks *at an unchanged epoch* before it is actually released —
+    /// so a replay transient in the replicated map can't trigger a release, and a
+    /// re-add (which bumps the epoch via the CAS) cancels one in flight. Not
+    /// persisted (like `minted`): a restart re-derives it from replicated state.
+    pending_release: Arc<Mutex<BTreeMap<TabletId, (Epoch, u8)>>>,
 }
 
 /// How often the CP reconfigure loop pulls the tablet map and steps a group it
@@ -2470,13 +2513,23 @@ const CP_RECONFIGURE_INTERVAL: Duration = Duration::from_millis(150);
 async fn cp_reconfigure_loop(ctx: ClientCtx) {
     loop {
         tokio::time::sleep(CP_RECONFIGURE_INTERVAL + jitter(CP_RECONFIGURE_INTERVAL)).await;
-        let tablets = ctx.raft.metadata().tablets;
-        for (tablet, t) in tablets {
+        let meta = ctx.raft.metadata();
+        // The same read this loop already takes; the down-set is the priority
+        // input `reconfigure_step` (ADR 0029) uses to tell a genuine failure
+        // repair (remove first) from a healthy rebalance move (add first, then
+        // gate the removal on the newcomer catching up).
+        let down: BTreeSet<NodeId> = meta
+            .members
+            .iter()
+            .filter(|(_, m)| m.status == NodeStatus::Down)
+            .map(|(id, _)| *id)
+            .collect();
+        for (tablet, t) in meta.tablets {
             let Some(leader) = ctx.edge.cp_leader(tablet) else {
                 continue;
             };
             let desired: BTreeSet<NodeId> = t.replicas.iter().copied().collect();
-            leader.reconfigure_step(&desired);
+            leader.reconfigure_step(&desired, &down);
         }
     }
 }
@@ -2631,6 +2684,15 @@ const CP_GC_INTERVAL: Duration = Duration::from_millis(500);
 /// while the driver might still write.
 const CP_GC_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How many consecutive GC ticks — **at an unchanged tablet epoch** — the
+/// release condition (dropped from the replica set **and** this node's own Raft
+/// config excludes it) must hold before the release phase actually stops+erases
+/// a moved-off tablet (ADR 0029). A small dampener so a restarting control
+/// replica's replay transients (which pass `tablets` through historical states)
+/// can't trigger a spurious release, and a metadata re-add (which bumps the
+/// tablet's epoch via the placement CAS) cancels a release part-way confirmed.
+const RELEASE_CONFIRM_TICKS: u8 = 3;
+
 /// The per-node **CP GC loop** (ADR 0024 drop-table teardown): when a tablet
 /// this node hosts disappears from the replicated tablet map (a committed
 /// `DropTableTablets`), reclaim everything local to it — unregister the group
@@ -2653,6 +2715,31 @@ const CP_GC_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 /// range was already erased, and routing consults the current map, so it
 /// serves nothing). Once replay reaches the committed drop, this loop reclaims
 /// it again; drop + GC are convergent, not one-shot.
+///
+/// **Second phase — release a tablet moved *off* this node (ADR 0029).** A
+/// tablet that still exists but whose replica set no longer places a replica on
+/// this node (an operator `drain`, an automatic failure-repair swap, or a
+/// rebalance move) must also be stopped + erased here — otherwise a node dropped
+/// from a still-existing tablet's replica set keeps an idle group running and
+/// its data lingering in the shared engine forever. This is the exact dual of
+/// the reclaim phase, differing only in the predicate
+/// ([`topology::tablets_to_release`] vs. `tablets_to_reclaim`); once decided,
+/// both run the identical [`cp_gc_tablet`] teardown. Two guards make it safe:
+/// (1) the **local-config gate** — only act once this node's *own durable Raft
+/// log* config (`CpGroup::config`) already excludes `base_id`, the
+/// replay-independent signal PR1's `departing` mechanism guarantees a removed
+/// node reliably adopts; and (2) an **epoch-stability dampener**
+/// ([`RELEASE_CONFIRM_TICKS`] consecutive ticks at an unchanged epoch) that
+/// absorbs replay flicker and lets a re-add cancel a release in flight.
+///
+/// **Residual gap (accepted, matches the pre-existing drain/repair behavior):**
+/// a node that crashes *before* it ever receives the removal config entry (i.e.
+/// before the leader's `departing` bookkeeping relays it) recovers a Raft log
+/// whose config still includes itself, so the local-config gate never passes and
+/// the group leaks (stays hosted + un-erased) forever on that node. This is not
+/// a regression — before ADR 0029 *nothing* released such a tablet on any node,
+/// under any removal path — just an accepted incompleteness of the durable
+/// release signal.
 async fn cp_gc_loop(host: CpHostCtx) {
     loop {
         tokio::time::sleep(CP_GC_INTERVAL).await;
@@ -2670,8 +2757,88 @@ async fn cp_gc_loop(host: CpHostCtx) {
             .iter()
             .copied()
             .collect();
+
+        // Phase 1 (ADR 0024): reclaim tablets whose whole table was dropped
+        // (absent from the map).
         for tablet in topology::tablets_to_reclaim(&mine, &tablets) {
             cp_gc_tablet(&host, tablet).await;
+        }
+
+        // Phase 2 (ADR 0029): release tablets still present but moved off this
+        // node's replica set. `mine` may now be stale for anything phase 1 just
+        // reclaimed, but a reclaimed tablet is absent from `tablets`, so
+        // `tablets_to_release` (present-only) never returns it — the two phases
+        // partition `mine`.
+        cp_gc_release_phase(&host, &mine, &tablets).await;
+    }
+}
+
+/// The release phase of [`cp_gc_loop`] (ADR 0029): stop + erase every tablet in
+/// `mine` that is still present in `tablets` but no longer places a replica on
+/// this node, once the local-config gate and epoch-stability dampener both
+/// confirm it. Kept as a helper so the confirm-state bookkeeping doesn't clutter
+/// the loop body.
+async fn cp_gc_release_phase(
+    host: &CpHostCtx,
+    mine: &[TabletId],
+    tablets: &BTreeMap<TabletId, Tablet>,
+) {
+    let candidates = topology::tablets_to_release(mine, tablets, host.base_id);
+    let candidate_set: BTreeSet<TabletId> = candidates.iter().copied().collect();
+    // Drop confirm state for anything no longer a candidate (condition flipped —
+    // re-added to the replica set, or reclaimed): its counter must restart.
+    host.pending_release
+        .lock()
+        .expect("pending_release poisoned")
+        .retain(|t, _| candidate_set.contains(t));
+
+    for tablet in candidates {
+        // Safety anchor: only trust the metadata-based signal once this node's
+        // **own durable Raft log** independently confirms it's no longer a voter.
+        // If the local handle is gone (already released / stand-up in flight) or
+        // its config still lists us, reset this tablet's confirm counter and wait.
+        let excluded = match host.ctx.edge.local_cp_member(tablet, host.base_id) {
+            Some(group) => !group.config().contains(&host.base_id),
+            None => false,
+        };
+        if !excluded {
+            host.pending_release
+                .lock()
+                .expect("pending_release poisoned")
+                .remove(&tablet);
+            continue;
+        }
+
+        // `tablets_to_release` only returns present tablets, so the epoch is here.
+        let epoch = match tablets.get(&tablet) {
+            Some(t) => t.epoch,
+            None => continue,
+        };
+        let confirmed = {
+            let mut pending = host
+                .pending_release
+                .lock()
+                .expect("pending_release poisoned");
+            match pending.get_mut(&tablet) {
+                // Same epoch, still confirming: advance the tick count.
+                Some((seen, ticks)) if *seen == epoch => {
+                    *ticks = ticks.saturating_add(1);
+                    *ticks >= RELEASE_CONFIRM_TICKS
+                }
+                // First observation, or the epoch changed (a re-add/CAS bumped it):
+                // (re)start the counter at this epoch.
+                _ => {
+                    pending.insert(tablet, (epoch, 1));
+                    RELEASE_CONFIRM_TICKS <= 1
+                }
+            }
+        };
+        if confirmed {
+            host.pending_release
+                .lock()
+                .expect("pending_release poisoned")
+                .remove(&tablet);
+            cp_gc_tablet(host, tablet).await;
         }
     }
 }

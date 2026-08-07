@@ -221,6 +221,22 @@ epoch compare-and-swap transactions.
   driver and the *decision* pure — don't put a clock or RNG in `reconcile`, and
   don't reconcile off-leader (a non-leader `propose` is dropped; a stale CAS is
   epoch-rejected). `animus-placement` is a **normal** dependency now (no cycle).
+- **Automatic load rebalancing (ADR 0029).** The pin-survivors reconciler above
+  never moves a *healthy* replica, so a cluster grown 3→5 leaves old tablets
+  stranded on the original nodes. `Metadata::rebalance` (shared body
+  `rebalance_placement`, also backing `PlacementView::rebalance`) is the
+  balance-driven complement: it asks `animus_placement::rebalance_step` for a
+  *single* balance-improving move (a healthy replica from a most-loaded node onto
+  a least-loaded one) and wraps it as a `CasTabletReplicas` at the tablet's
+  current epoch — reusing the existing command, so no relay-allowlist change. The
+  **same** `reconcile_loop` drives it: each tick runs repair first, and **only if
+  repair proposed nothing** *and* `tick % REBALANCE_EVERY_N_TICKS == 0` does it
+  evaluate `rebalance()` and propose the one move. `REBALANCE_EVERY_N_TICKS` is
+  **pure churn control, not a safety invariant** — correctness rests entirely on
+  the epoch-CAS (a stale move is epoch-rejected) and the data-plane catch-up gate,
+  so any value yields a correct cluster, just a different rebalancing speed. A
+  split child now **inherits the source tablet's policy** in `SplitTablet`'s apply
+  (else it would be invisible to both repair and rebalance).
 - **Automatic failure detection (ADR 0012).** Members heartbeat the control group
   (`heartbeat_loop` → `RaftMsg::Heartbeat`, a term-less message the driver
   **intercepts** in its `recv` arm and feeds to the shared `FailureDetector` —
@@ -322,6 +338,13 @@ plus a far-behind follower catching up via a **multi-chunk** `InstallSnapshot`
 replica death + follower crash (`placement_reconcile.rs`, driving
 `animus-placement`), and **leader-driven automatic** reconcile from a replicated
 policy (`placement_auto_reconcile.rs` — no test-side `replan`/CAS), and
+**leader-driven automatic load rebalancing** (`placement_rebalance.rs`, ADR 0029 —
+no test-side placement math: grow the cluster and only advance virtual time; a
+cluster spreads existing tablets onto new members to max−min ≤ 1 and then goes
+quiet, repair defers to rebalance correctly, residency + strict spread hold at
+every intermediate state while excluded nodes never gain a replica, and
+rebalancing still converges after the control leader is killed mid-flight;
+seed-swept), and
 **heartbeat-based failure detection** end to end (`failure_detection.rs`, ADR
 0012 — a member crashes, the leader auto-commits `Down`, placement reconciles off
 it, then the member restarts and returns to `Active`; plus detector unit tests in

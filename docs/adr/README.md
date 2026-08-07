@@ -34,3 +34,4 @@ relevant ADR (or supersede it) in the same PR as the code change.
 | [0026](0026-multiplexed-node-stream-addressing.md) | Multiplexed `(node, stream)` addressing on the `Network` seam (retires the `Coresident` sibling-pool liveness cliff) | Accepted |
 | [0027](0027-tracing-observability.md) | OpenTelemetry-compatible distributed tracing: `animusd`-only OTLP export, W3C trace-context propagation across a forwarded hop | Accepted |
 | [0028](0028-shared-storage-single-command-split.md) | Shared per-node storage, control-plane-only tablet split (supersedes 0017 §4/split) | Accepted |
+| [0029](0029-replica-rebalancing.md) | Automatic tablet-replica rebalancing (amends 0005's reconciler, 0017's membership-change primitive) | Accepted |
