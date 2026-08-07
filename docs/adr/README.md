@@ -23,13 +23,14 @@ relevant ADR (or supersede it) in the same PR as the code change.
 | [0014](0014-elle-accord-scenario-corpus.md) | Elle consistency testing against Accord + a frozen scenario corpus | Accepted |
 | [0015](0015-observability.md) | Deterministic-safe observability seam (metrics) | Accepted |
 | [0016](0016-pluggable-replication-per-tablet-raft.md) | Pluggable replication: per-tablet Raft (CP) alongside the AP data plane | Accepted |
-| [0017](0017-per-tablet-raft-data-plane.md) | Per-tablet Raft data plane (leaderful, linearizable KV) | Accepted |
+| [0017](0017-per-tablet-raft-data-plane.md) | Per-tablet Raft data plane (leaderful, linearizable KV) | Accepted (§4/split superseded by 0028) |
 | [0018](0018-cross-tablet-transactions.md) | Cross-tablet transactions on the CP plane (2PC over per-tablet Raft + HLC + MVCC) | Proposed |
 | [0019](0019-cp-only-v1-defer-ap.md) | v1 ships the CP plane only; the leaderless AP data plane is deferred | Accepted |
 | [0020](0020-admin-interface.md) | Admin / debug interface on a dedicated port (config, status, Raft + storage introspection, operator actions) | Accepted |
 | [0021](0021-web-dashboard.md) | Web dashboard over the admin JSON surface (observe + operator actions, static + self-contained) | Accepted |
 | [0022](0022-hash-ring-partitioning.md) | Murmur3 partition token: hash the partition key (amends 0002) | Accepted |
 | [0023](0023-table-scoped-tablets.md) | Table-scoped tablets on a per-table hash ring | Accepted |
-| [0024](0024-drop-table-data-gc.md) | Drop-table data GC: `DropTableTablets` + a per-node reclaim loop (group stop, engine/WAL file deletion, marker prune) | Accepted |
-| [0026](0026-multiplexed-node-stream-addressing.md) | Multiplexed `(node, stream)` addressing on the `Network` seam (retires the `Coresident` sibling-pool liveness cliff) | Proposed |
+| [0024](0024-drop-table-data-gc.md) | Drop-table data GC: `DropTableTablets` + a per-node reclaim loop (group stop, engine range erase, WAL file deletion) | Accepted |
+| [0026](0026-multiplexed-node-stream-addressing.md) | Multiplexed `(node, stream)` addressing on the `Network` seam (retires the `Coresident` sibling-pool liveness cliff) | Accepted |
 | [0027](0027-tracing-observability.md) | OpenTelemetry-compatible distributed tracing: `animusd`-only OTLP export, W3C trace-context propagation across a forwarded hop | Accepted |
+| [0028](0028-shared-storage-single-command-split.md) | Shared per-node storage, control-plane-only tablet split (supersedes 0017 §4/split) | Accepted |

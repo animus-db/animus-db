@@ -1,6 +1,14 @@
 # ADR 0017 — Per-tablet Raft data plane (leaderful, linearizable KV)
 
-- **Status:** Accepted — **Stages A–D implemented** in `animus-cp-data`
+- **Status:** Accepted. **§4's tablet-split design and the "D" stage (D1–D3)
+  described below are superseded by ADR 0028** (shared per-node storage,
+  control-plane-only split) — the two-phase split, `Coresident`-minted
+  sibling groups, derived member ids, and the associated production-assembly
+  bullets (#2/#4, D1–D3) no longer describe any code in this workspace. They
+  are kept below verbatim as the historical record of the design that led to
+  ADR 0028; everything else in this ADR (Stages A–C, ReadIndex, membership
+  change, the overall per-tablet-Raft architecture) is current.
+- **Status (original):** Accepted — **Stages A–D implemented** in `animus-cp-data`
   (linearizable single-tablet KV, compaction + streaming snapshots, single-server
   membership change, tablet split) plus linearizable **CAS**, all sim-tested; the
   plane's linearizability is verified by a dedicated **Elle corpus**

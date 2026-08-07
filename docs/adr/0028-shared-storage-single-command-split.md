@@ -1,0 +1,217 @@
+# ADR 0028 — Shared per-node storage, control-plane-only tablet split
+
+- **Status:** Accepted — implemented in `animus-control`, `animus-cp-data`,
+  `animusd`. Supersedes ADR 0017 §4's tablet-split design and the "D" stage
+  (D1–D3) described in ADR 0017's implementation log.
+- **Date:** 2026-08-07
+
+## Context
+
+Tablet split (ADR 0017 §4, Stage D) was a **two-phase** operation: the control
+plane committed `MetaCommand::SplitTablet` (metadata only — mints a new tablet
+id, narrows the source's range), and *separately* the source tablet's own
+per-tablet Raft group had to agree a `KvCommand::Split` and physically hand off
+the upper range's data to a **brand-new** group, minted via `Coresident::sibling`
+(a fresh `NodeId`/env/directory/WAL per new tablet, `cp_member_id = base +
+tablet * CP_SPLIT_ID_STRIDE`).
+
+The non-atomicity between those two phases was not an edge case — it was the
+direct cause of a long, still-growing list of documented bugs (see the root
+`CLAUDE.md` Engineering Practices section, now marked superseded): orphaned
+metadata-only tablets when step 2 failed independently of step 1, retry-storm
+amplification in the step-2 confirm loop, an epoch-CAS race between two
+proposers minting different children of the same tablet, a `pending`-retry map
+and a cluster-wide auto-split claim to work around all of the above, a
+`DropOrphanTablet` cleanup command, and a `Coresident`-minted sibling-pool
+liveness cliff (a hard-coded `CP_SIBLING_POOL = 64` cap, panicking the split
+hook on exhaustion, leaving the over-cap tablet permanently leaderless).
+Nearly every "Code patterns" entry from the last dozen PRs on this codebase
+traces back to this one seam.
+
+Two prior, independent decisions made a fundamentally different design
+possible:
+
+- **ADR 0026 Stage A** gave `Network` a `(node, stream)` addressing axis, so a
+  node can host an unbounded number of protocol instances on one inbox instead
+  of minting a new `NodeId`/env per instance.
+- The `StorageEngine` trait (ADR 0004/0008) already supports an arbitrary
+  key-range **scan** and **`merge_tombstone`**, which is all that is needed to
+  confine multiple tenants to disjoint physical key ranges within one engine.
+
+Given those, the reason a data-plane split command ever existed — **physical
+data movement**, handing bytes from one tablet's dedicated engine/WAL to a
+brand-new one's — turns out to be self-inflicted: it exists only because each
+tablet had its *own* engine and its *own* Raft group inbox. Remove both of
+those constraints and a split has nothing left to move.
+
+## Decision
+
+We will:
+
+1. **Give every node one shared `StorageEngine`** (an `LsmEngine` or
+   `MemoryEngine`, matching the existing `StorageBackend` choice), opened once
+   at node start, instead of one engine per tablet. Every tablet a node hosts —
+   across every table — merges into this same engine.
+2. **Confine each tablet's physical key access with a `StorageScope`**
+   (`animus-cp-data`): a `prefix` (the owning table's identity, `escape(table_name)`
+   — order-preserving and prefix-free, so tables can never collide even sharing
+   one engine) plus a `range` (this tablet's own sub-portion of that table's
+   keyspace). The range is **live-narrowable** (`Arc<Mutex<KeyRange>>` +
+   `narrow()`), because a tablet's range shrinks when it is the source of a
+   split while its physical data does not move.
+3. **Fence every proposed write with its own range at propose time**
+   (`fence: KeyRange` riding inside `Put`/`Delete`/`Cas`/`Batch`, checked at
+   apply time against the fence *embedded in the log entry* — never a
+   locally-polled value). This is what keeps the crossover window — a stale
+   client still addressing the old, wider range right after a split narrows it
+   — deterministic: every replica, regardless of how far it has independently
+   progressed through observing the split's `Metadata`, makes the identical
+   accept/reject decision for the same committed entry, because the decision
+   travels with the entry rather than depending on when each replica happens
+   to notice the split.
+4. **Adopt ADR 0026 Stage B**: migrate `RaftKvNode` fully onto `(node, stream)`
+   addressing, `stream = tablet_id`, on the node's one `raftkv` env. A tablet's
+   CP group member id is therefore simply the base `raftkv` id — not a derived
+   `NodeId` — at any split depth. This retires `Coresident`/the `ProdEnv`
+   sibling pool/`CP_SIBLING_POOL` and the whole
+   `cp_member_id`/`cp_base_id`/`cp_members_for`/`CP_SPLIT_ID_STRIDE`
+   translation seam for this crate pair.
+5. **Make `MetaCommand::SplitTablet` (`animus-control`) the entire split
+   operation.** It is epoch-CAS gated exactly like `CasTabletReplicas`
+   (rejecting a stale-epoch racing proposer cleanly, at propose time). On
+   commit, the source tablet's range narrows and a new sibling tablet is
+   minted covering the handed-off range — both immediately servable, because
+   the new sibling's `StorageScope` already covers live data on the same
+   shared engine. There is no second, data-plane step to fail, retry, or leave
+   half-done. The per-node **join-host loop** (`animusd`) then simply starts
+   the new tablet's `RaftKvNode` the same way it starts any fresh tablet's —
+   `topology::plan_join_host` no longer distinguishes "fresh split child" from
+   "fresh whole-keyspace tablet" at all, because both start from data already
+   present (or absent) in the shared engine, with nothing to seed.
+6. **Full replace, not a dual-mode shim.** Pre-alpha, no migration concerns:
+   `KvCommand::Split`, `propose_split`, `current_split_bound`/`SPLIT_BOUND_KEY`,
+   the split hook (`SplitHook`, `start_with_split_hook`/`start_seeded_with_split_hook`),
+   the `cp-hosted` durable marker (`load_hosted_cp`/`save_hosted_cp`), and
+   `MetaCommand::DropOrphanTablet` are all **deleted**, not deprecated.
+
+### What replaces the durable "which tablets does this node host" marker
+
+The old design needed a durable per-node marker (`cp-hosted`) because "which
+co-resident engines physically exist on this node" was local state not
+derivable from the replicated tablet map. With one shared engine, that
+question no longer needs answering at all — a restart just re-opens the one
+engine (which recovers its own durable state) and the join-host loop
+re-discovers every tablet to host by polling replicated `Metadata` fresh; if a
+tablet was already resident, `StorageScope::has_data` (an async presence
+check against the shared engine) tells the join-host loop "reform with the
+full voter config," the same way a fresh-formation epoch does.
+
+### What drop-table GC does instead of deleting files
+
+Dropping a table's tablets (ADR 0024) can no longer delete "this tablet's
+engine files," because the engine is shared. Instead, `RaftKvNode::erase_scope`
+tombstones every key in the tablet's own `StorageScope` via
+`StorageEngine::merge_tombstone` — never `delete_range`, which enforces an
+engine-wide monotonic version floor that multiple independent per-tablet Raft
+groups sharing one engine do not (and should not) share — at a version
+(`last_applied() + 1`) guaranteed to exceed every version that specific group
+ever wrote, since every merge it ever performed was stamped at most its own
+applied index. Actual space reclaim happens later via the engine's existing
+tombstone-GC compaction. Each tablet still gets its **own Raft WAL file**
+(`raftkv.wal.<tablet>`) on the shared env, since `Disk` files are keyed by
+name, not by stream (see "Deferred," below); GC deletes that one file
+directly.
+
+### The auto-split trigger simplifies to match
+
+`animusd::auto_split_loop` no longer needs the `pending`-retry map (there is
+no step 2 to retry), the cluster-wide `claim_auto_split`/`release_auto_split`
+contention guard (a same-tick redundant `SplitTablet` from multiple nodes is
+just a normal epoch-CAS race with one clean winner now — no orphan risk to
+guard against), or any "already split once" exclusion (a tablet was never
+actually limited to one split; splitting was always just a range-narrowing
+command, so a regrown tablet is a legitimate candidate again with no special
+case).
+
+## A race this change newly exposed (and its fix)
+
+`animusd::cp_reconfigure_loop` (steps a CP group's Raft voters toward a
+tablet's replicated replica set) and `animus-control`'s policy `reconcile_loop`
+(re-CASes a replica set back to satisfy its placement policy) are two
+independent, un-jittered, fixed-500ms pollers. A manual (or higher-level)
+replica-set change is a **one-shot race** between them — whichever observes it
+first decides the outcome, since the loser's own next tick sees an
+already-equal-to-desired state and never retries. Reordering this change's own
+node-startup sequence (opening the shared engine before spawning the
+control-plane's `RaftNode`, rather than after) shifted, but did not eliminate,
+which side had first-mover advantage. The fix: `cp_reconfigure_loop` now polls
+at a third of `reconcile_loop`'s period (150ms vs. 500ms, plus jitter), so an
+operator-driven replica-set change reliably wins. See the root `CLAUDE.md`
+Engineering Practices entry for the full diagnosis.
+
+## Consequences
+
+**Enabled:**
+
+- Orphaned, leaderless, metadata-only tablets are now **structurally
+  impossible** — there is no second step that can fail independently of the
+  first, so there is nothing left to leave half-done.
+- Deletes an entire class of previously-patched bugs at the root instead of
+  continuing to patch them (retry-amplification, cluster-wide contention
+  claims, epoch-CAS-only-catches-the-concurrent-case, orphan GC with an
+  inherently ambiguous confirm signal).
+- A node's storage footprint is no longer duplicated per tablet (one
+  `LsmEngine`'s memtable/SSTable/compaction machinery per node, not one per
+  tablet), and a split is instant from the storage engine's perspective — no
+  data-copy latency, no handoff window.
+- Removes a confirmed liveness cliff (`CP_SIBLING_POOL` exhaustion) entirely,
+  not just raises its ceiling.
+
+**Costs and risks knowingly accepted:**
+
+- **Not yet a single physically-multiplexed WAL file per node.** Each tablet
+  still gets its own Raft WAL file (`raftkv.wal.<tablet>`) on the shared env,
+  because `Disk` files are keyed by name, not by stream. A prior increment
+  built (but did not wire in) exactly the machinery for this — a
+  `TaggedRecord`/`SharedWal` scheme in `animus-control` that multiplexes
+  multiple tablets' WAL records into one physical file with per-tablet
+  compaction and cross-tablet segment GC. Wiring it into `animus-cp-data`'s
+  `drive`/`persist_wal`/`apply_and_compact` is deliberately **deferred** — it
+  needs its own segment-GC design and fault-injection tests (crash
+  mid-segment-roll, crash mid-per-tablet compaction, one tablet's compaction
+  racing another's), which is exactly the kind of change that should not be
+  bundled into an already-large integration PR.
+- **A node's tablets now share one engine's write path, memtable, and
+  compaction state.** A very hot tablet's write load or a large compaction now
+  has *some* shared-resource interaction with every other tablet on the node
+  (memtable flush thresholds, compaction scheduling), where before each
+  tablet's engine was fully isolated. `merge`/`merge_tombstone`/`merge_batch`
+  already tolerate multiple independent version streams sharing one engine (no
+  engine-wide monotonic floor — only `put`/`delete`/`delete_range` enforce
+  that, which is why GC uses `merge_tombstone`, not `delete_range`), so this is
+  a resource-contention concern, not a correctness one; no regression was
+  observed in the production wiring's own multi-tablet write-path tests, but a
+  dedicated multi-thread `ProdEnv` load test analogous to
+  `seed_load_does_not_storm_cp_elections` (proving N concurrent tablet apply
+  loops on one shared engine don't stall each other into an election storm)
+  is a natural follow-up, not yet written.
+- **The `cp_reconfigure_loop`/`reconcile_loop` race (above) is mitigated, not
+  eliminated.** A sufficiently large scheduling perturbation (e.g. heavy host
+  contention) could still occasionally let the slower loop win; the fix
+  reduces the failure probability by roughly polling-period-ratio, it does not
+  make the race structurally impossible. An event-driven reconfiguration
+  trigger (react to a `Metadata` change directly, rather than polling) would
+  close this properly and is a candidate follow-up if it is ever observed to
+  matter beyond test flakiness.
+- **`animus-env`'s `Coresident` trait and its `SimEnv`/`ProdEnv`
+  implementations are left in place**, unused by `animus-cp-data`/`animusd`
+  now. Not removed, since it is a general `Env`-seam capability that might be
+  needed again for an unrelated purpose; ADR 0026 tracks its status.
+
+This ADR builds on ADR 0016/0017 (the per-tablet Raft data plane, whose §4
+split design and Stage D this supersedes), ADR 0004/0008 (the `StorageEngine`
+trait this depends on), and ADR 0026 (the stream-addressing seam this
+completes Stage B of). The control plane's epoch-CAS discipline
+(`CasTabletReplicas`, ADR 0005) is unchanged in shape — `SplitTablet` was
+always the same shape, it simply now carries the *entire* operation instead of
+one half of it.

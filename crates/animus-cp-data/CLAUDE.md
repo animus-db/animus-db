@@ -23,7 +23,37 @@ the engine — the `AccordCore` sync-core/async-driver split.
 
 ## Entry points
 
-- `KvCommand` (`Put`/`Batch`/`Delete`/`Cas`/`Split`/`NoOp`), `KvState` (the `DRIVER_APPLIED` SM).
+- `KvCommand` (`Put`/`Batch`/`Delete`/`Cas`/`NoOp`), `KvState` (the `DRIVER_APPLIED` SM).
+- **`StorageScope`** (ADR 0026/0028): confines a `RaftKvNode`'s physical key
+  access within a possibly node-shared `StorageEngine` — a `prefix` (the
+  owning table's identity, `escape(table_name)`) plus a live-narrowable
+  `range` (this tablet's own sub-portion of that table's keyspace, an
+  `Arc<Mutex<KeyRange>>` so a split can narrow it without restarting the
+  group). `physical(key)` maps a logical key to its on-engine key;
+  `strip_in_range`/`strip_prefix_only` are the inverse for scans;
+  `has_data(&storage)` is the async presence check `animusd` uses to tell "am
+  I re-forming after a restart" (full voter config) from "am I a brand-new
+  spare joining" (non-voter) without a durable per-tablet marker. `start`
+  defaults to `StorageScope::whole()` (no prefix, unbounded range — the
+  identity, so an unscoped caller is byte-for-byte the pre-scoping behavior);
+  `start_scoped`/`start_hosted` take an explicit scope.
+- **Fenced commands** (ADR 0026): `put_fenced`/`delete_fenced`/`cas_fenced`/
+  `put_batch_fenced` (and their unfenced siblings, which use
+  `KeyRange::whole()`) carry a `fence: KeyRange` *inside the proposed command
+  itself* — stamped by the leader at propose time from its own current
+  `StorageScope.range` — so every replica's apply checks the key against the
+  fence embedded in the log entry, never a locally-polled value. This is what
+  keeps a crossover window (a stale client addressing the old, wider range
+  right after a split narrows it) deterministic: two replicas at different
+  points in observing the split's `Metadata` still make the identical
+  accept/reject decision for the same log entry, because the decision travels
+  *with* the entry.
+- **Stream addressing** (ADR 0026 Stage B): `start_hosted(env, all_nodes,
+  storage, scope, stream)` addresses a tablet's Raft traffic by `(node,
+  stream)` (`env.send_stream`/`recv_stream`, `stream` = the tablet id) instead
+  of a distinct `NodeId`/env per tablet — so every tablet a node hosts shares
+  one env/port. Replaces the retired `Coresident` sibling-minting approach for
+  this crate (`animus-env`'s `Coresident` trait itself is unused here now).
 - **Batch put** — `KvCommand::Batch(Vec<(k, v)>)` + `RaftKvNode::put_batch` commit
   **N keys as one Raft log entry** (one propose → one commit round → one apply), the
   bulk-write throughput primitive. Applied as one arm in `apply_and_compact`: every
@@ -92,7 +122,7 @@ the engine — the `AccordCore` sync-core/async-driver split.
     racing teardown can fail the `replace`). `is_stopped()` requires *both* tasks
     stopped (`stopped` && `apply_stopped`) before the GC deletes artifacts.
 - **Wake-on-propose cuts single-write latency.** `put`/`delete`/`cas`/
-  `propose_split`/`change_membership` route through `propose_and_wake`: after the
+  `change_membership` route through `propose_and_wake`: after the
   core appends the entry, the proposer raises a `ProposeSignal` (`AtomicBool` +
   `futures::task::AtomicWaker`) that the consensus loop races as a third arm of its
   `select(recv, timer)`. On that wake the loop calls `RaftCore::replicate_now`
@@ -215,109 +245,25 @@ the engine — the `AccordCore` sync-core/async-driver split.
     real add (`RaftCore::start_election` gates on `is_voter`). A `RaftKvNode::start`
     whose `all_nodes` excludes its own id is a quiet non-voter until the leader adds
     it. (Caught by the `reconfigure_trigger` seed sweep — a single seed hid it.)
-- **D (done)** — **tablet split** (`propose_split`): the split point is agreed via
-  a committed `KvCommand::Split { at }`, so every replica splits at the same point
-  in the command order; on apply each replica **tombstones the handed-off range**
-  `[at, ∞)` (it now serves only `[lo, at)`), and that range is seeded into a new
-  independent group (`range_snapshot` → `start_seeded`). `tests/split.rs` (the
-  original keeps the lower range + drops the upper on every replica; the new group
-  serves the upper range; both operate independently; reproducibility).
-  **In-band new-group creation is now wired** (the deferred `Env`-seam extension):
-  the new `animus_env::Coresident` sub-trait (`sibling(id) -> Self`, impl'd for
-  `SimEnv`) lets a replica mint a co-resident inbox at runtime, and the driver
-  gained an optional **split hook** (`start_with_split_hook` +
-  `in_band_split_hook`). On apply of `Split`, `flush_and_apply` captures the
-  handed-off `[at, ∞)` range and invokes the hook; the in-band hook mints
-  `sibling(my_new_id)` and `start_seeded`s the new-tablet replica there (collected
-  into a caller sink for observation). Wire one hook per original replica → on
-  apply the new group forms with no external handoff. `tests/split_in_band.rs`.
-  Decided seam (per maintainer): SimEnv first; `Coresident` is a *separate* trait
-  bound only on the split path, so `ProdEnv`/other envs and the external-handoff
-  `split.rs` (hook = `None`) are untouched. **The hook fires on every apply**, so a
-  `Split` re-applied after a crash recovery would mint the sibling twice — but
-  **recovery-idempotency is now handled at the `animusd` assembly layer** (#2/#4):
-  the ProdEnv hook gates on a per-node `minted` set that is pre-populated at start
-  from a durable `cp-hosted` marker, so a re-applied `Split` finds the tablet already
-  hosted and does not re-mint (and the tablet is instead re-hosted from its on-disk
-  engine). **Deep splits (D3):** a split-created group can be split again — `animusd`
-  starts *every* group with a hook (`start_seeded_with_split_hook` /
-  `start_with_split_hook`) and derives member ids **flatly** from the node's base id
-  (`base + tablet * STRIDE`, matching the reconfigure loop at any depth), so
-  auto-sharding keeps working as a shard grows. **Remaining limitation:** the new
-  group's ids are derived in `animusd` rather than allocated by the control plane's
-  `SplitTablet`, and `Metadata.tablets[new].replicas` records the parent's base ids,
-  not the derived member ids (the data plane translates per tablet) — fine for
-  realistic clusters. **`propose_split`'s `ProposeResult::Accepted` is not
-  confirmation** — like every proposal here, it only means the entry was appended
-  to the leader's local log; a caller must poll
-  [`current_split_bound`](RaftKvNode::current_split_bound) before trusting it, the
-  same way `engine_applied_index` is polled to confirm a write. `animusd`'s
-  `propose_split_data`/`cp_split_here` learned this the hard way: trusting
-  `Accepted` let an accepted-but-never-committed `Split` (truncated by leader churn)
-  report false success, permanently stranding the tablet its metadata layer had
-  already created. **The confirmation must compare the *exact* key, not just "has
-  this group split"**: if two callers race with *different* keys on the same
-  tablet (a real scenario under `animusd`'s `--cluster N` shared-edge redundant
-  triggering — see its `CLAUDE.md`), the loser's bare "did *a* split happen" check
-  would pass even though its own key never applied.
-- **A group can be split more than once over its life** — `KvCommand::Split`'s
-  apply-time check is a CAS against the group's *current* boundary
-  (`current_split_bound`), not the one-shot "has it split at all" latch this
-  started as. `Split { at }` is accepted iff `at` is strictly less than the
-  current boundary (`None` — never split — always accepts); each accepted split
-  narrows the boundary further, so the sequence only ever moves toward smaller
-  keys. This still rejects the race the original one-shot guard was built for —
-  two proposers racing to split the *same* still-equally-bounded group at the
-  same moment, whichever commits second finds `at` no longer strictly less than
-  the boundary the first just set — while allowing a tablet that regrows past a
-  threshold to shard again, any number of times, instead of being permanently
-  frozen after its first split (the original design's actual limitation, not a
-  deliberate choice — lifting it needed `animusd`'s `auto_split_loop` to stop
-  treating "already split once" as permanent exclusion too; see its `CLAUDE.md`).
-  `tests/cp_deep_split.rs` (a split-created tablet can be split again, via
-  `animusd`), `animusd/tests/cp_plane.rs::already_split_tablet_splits_again_once_it_regrows`.
-  - **The boundary is `current_split_bound`, deliberately just the current
-    value — not a per-split history.** A history would let a caller confirm
-    "did my exact key ever apply" unambiguously forever, but that's O(n) state
-    that grows for the life of a heavily-resplit lineage, and costs O(n²) total
-    to maintain (each split re-persists the whole history). Instead
-    `current_split_bound` only answers "is `K` still a legal *new* split point"
-    reliably; "did key `K` apply" is answered *reliably only while `K` is still
-    the current value* — once a *later* split narrows past `K`, this can no
-    longer distinguish "`K` applied, then something else narrowed further" from
-    "`K` never applied, something else did instead." That ambiguity is
-    intentional: `animusd` never trusts it alone to *delete* anything (see its
-    `CLAUDE.md`'s `drop_orphan_tablet` note) — a caller confirming success
-    treats "still equal" as certain success and anything else as "stop retrying
-    this key," and a *second*, independent check (local hosting) is what
-    decides whether the ambiguous case is actually safe to clean up. Bounded
-    O(1) state forever is worth a caller-side ambiguity that has a cheap,
-    independent safety net.
-  - **Durability: stored *inside the engine*, not in Raft-log/WAL-snapshot
-    state.** `RaftCore`'s `DRIVER_APPLIED` contract keeps `core.metadata`
-    (`KvState`) a permanent unit placeholder for this state machine — real state
-    lives only in the engine, never in-core (see the driver-liveness /
-    `DRIVER_APPLIED` snapshot notes above). So `current_split_bound` rides as a
-    normal entry under a reserved key (`SPLIT_BOUND_KEY`), written via the
-    *same* `merge_batch` call as a `Split`'s tombstones (one fsync, not two).
-    This is what makes it survive WAL compaction and process restart correctly:
-    a bare in-memory flag (the original `applied_split_key`) is *not*
-    recoverable once a `Split` entry's Raft index falls below
-    `snapshot_index` — compaction discards it from the log for good, and
-    nothing else re-derives that the group had already split (a real, latent
-    bug in the original one-shot design, never triggered because nothing
-    combined enough writes-after-a-split with a restart to hit it). Recovered
-    at driver startup (`drive`) via a direct `storage.get(SPLIT_BOUND_KEY)` —
-    never from WAL replay — and re-synced the same way after installing a
-    received snapshot (`apply_and_compact`'s `pending_install` branch), since
-    `RaftCore::handle_install_snapshot` clears this follower's log on
-    completion. **Excluded from every application-facing read** (`keys_from`
-    — also the split handoff, so a child never inherits the parent's boundary
-    — and both branches of `linearizable_scan`); *not* excluded from
-    `entries_with_tombstones` (`engine_image`'s source), since the snapshot
-    image is exactly what should carry it to a lagging follower or a restart.
-    `tests/cp_rehost.rs::split_tablet_survives_cluster_restart` exercises the
-    restart path end to end (via `animusd`).
+- **D (superseded by ADR 0028) — tablet split is no longer a data-plane
+  concern at all.** The original design (`KvCommand::Split`, `propose_split`,
+  `current_split_bound`, `Coresident`-minted sibling groups, a split hook fired
+  on apply) is **deleted**. Since ADR 0026 Stage B gave every tablet a node
+  hosts one shared env (stream-addressed) and ADR 0028 gave every tablet on a
+  node one shared `StorageEngine` (confined by its own `StorageScope`), a split
+  needs no data-plane command at all: the control plane's `MetaCommand::
+  SplitTablet` (`animus-control`) narrows the source tablet's `StorageScope`
+  range and the new sibling's range starts already covering live data on the
+  *same* engine — no handoff, no new-group bootstrap message, nothing for this
+  crate to agree on. `animusd`'s per-node join-host loop then simply starts the
+  new tablet's `RaftKvNode` the same way it starts any fresh tablet. See
+  ADR 0028 and `animusd/CLAUDE.md` for the full mechanism and the calling side.
+  This history (in-band `Coresident` sibling minting, the split-hook
+  recovery-idempotency story, the "a group can be split more than once"
+  CAS-against-a-moving-boundary design, `SPLIT_BOUND_KEY`'s in-engine
+  durability) is preserved in the root `CLAUDE.md` Engineering Practices
+  section and ADR 0017's original text for archaeology — it no longer
+  describes any code in this crate.
 
 ## Tests
 

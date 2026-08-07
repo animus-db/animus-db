@@ -1,10 +1,19 @@
 # ADR 0026 — Multiplexed `(node, stream)` addressing on the `Network` seam
 
-- **Status:** Proposed — **Stage A implemented** (the `stream` field + seam,
-  `SimEnv`/`ProdEnv` implementations, determinism + concurrency proof). Stage B
-  (migrating a real consumer off `Coresident`) and the full retirement of
-  `Coresident`/the `ProdEnv` sibling pool/the `base + tablet*STRIDE` id scheme are
-  **follow-up work**, sequenced at the end of this ADR.
+- **Status:** Accepted — **Stages A and B both implemented.** Stage A (this
+  document's original scope: the `stream` field + seam, `SimEnv`/`ProdEnv`
+  implementations, determinism + concurrency proof) landed first; Stage B
+  (migrating `animus-cp-data`'s `RaftKvNode` fully onto stream addressing,
+  keyed by tablet id) landed as part of ADR 0028's shared-storage/
+  single-command-split work. `Coresident`, the `ProdEnv` sibling pool
+  (`CP_SIBLING_POOL`), and `cp_member_id`/`cp_base_id`/`cp_members_for`/
+  `CP_SPLIT_ID_STRIDE` are **fully retired** for `animus-cp-data`/`animusd` —
+  a tablet's CP group member id is simply its base `raftkv` id, at any split
+  depth. `animus-env`'s `Coresident` trait and its `SimEnv`/`ProdEnv` impls
+  are left in place (harmless, unused by this crate pair now) in case a
+  future capability needs the sub-trait pattern again; nothing in this
+  workspace currently calls `.sibling(...)`. See ADR 0028 for the shared-
+  storage decision Stage B's completion was bundled with.
 - **Date:** 2026-08-06
 
 ## Context
@@ -332,24 +341,19 @@ serialized message.
 
 **Explicitly out of scope for this PR (follow-up work):**
 
-1. **Migrating any real consumer off `Coresident`.** Stage B (attempted if time
-   allows) migrates *one* consumer — the simplest split-created `RaftKvNode`
-   sibling — onto a stream on the parent's env, as a proof the new seam actually
-   replaces the mechanism for a real case, **without** removing `Coresident`
-   itself. A mixed state (some paths on streams, some still on `Coresident`) is
-   expected and fine as an intermediate state, as long as both are tested green.
-2. **Removing `Coresident`, the `ProdEnv` sibling pool, and `CP_SIBLING_POOL`
-   entirely.** Only sound after *every* caller has migrated (§4) — a larger,
-   separately-sequenced change touching `animus-cp-data`'s split hook and every
-   `animusd` hosting/re-hosting/GC path that calls `.sibling(...)`.
-3. **Removing `cp_member_id`/`cp_base_id`/`cp_members_for`/
-   `CP_SPLIT_ID_STRIDE`** and re-keying `animusd`'s CP routing tables from
-   `NodeId` to `(NodeId, TabletId)` (or an equivalent pair type). This is a
-   real data-model change to replicated-adjacent routing state (`client_route`,
-   the edge's `CpGroup` registry) and needs its own careful, tested migration —
-   not a mechanical rename, since today's code paths assume a single `NodeId`
-   in several places (e.g. failure detection heartbeats by base id, which stays
-   unchanged either way).
+1. ✅ **Done (ADR 0028).** Migrating `RaftKvNode` fully onto stream addressing —
+   every tablet a node hosts, not just split children, uses `start_hosted(env,
+   ..., stream)` with `stream = tablet_id` on the node's one `raftkv` env.
+2. ✅ **Done (ADR 0028).** `Coresident`/the `ProdEnv` sibling pool/
+   `CP_SIBLING_POOL` are removed from `animus-cp-data` and `animusd` — every
+   caller migrated in the same change that made tablet split control-plane-only
+   (there was no more reason to mint a sibling inbox once every tablet uses a
+   stream on the shared env instead).
+3. ✅ **Done (ADR 0028).** `cp_member_id`/`cp_base_id`/`cp_members_for`/
+   `CP_SPLIT_ID_STRIDE` are deleted; `animusd`'s CP routing tables (`client_route`,
+   the edge's `CpGroup` registry) are keyed on the plain base `NodeId` — no pair
+   type needed, since a tablet's group member id *is* the base id now (the
+   tablet axis lives in the `stream`/`StorageScope`, not in the id).
 4. **Stream-count observability** (self-review point (b)) — an admin/metrics
    surface for live stream count per node, useful once something actually opens
    more than one stream.
