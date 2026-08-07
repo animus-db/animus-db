@@ -101,6 +101,12 @@ epoch compare-and-swap transactions.
   `Metadata` **once**, not twice (once to ship, once for the WAL) — see the
   driver-liveness note below. Byte-identical to the plain encode; guarded by
   `snapshot_record_blob_reuse_round_trips`.
+- `shared_wal.rs` — `SharedWal` (ADR 0028 PR1): a multi-tenant WAL I/O
+  coordinator that serializes concurrent tablet WAL writers into one file
+  with coalesced `append`+`sync`. **Status: built and unit-tested, but
+  unwired** — no `animusd`/`animus-cp-data` code constructs one, and every
+  tablet on a node still writes its own WAL file. Whether to wire it in or
+  delete it is an open decision (see ADR 0028).
 - `node.rs` — `RaftNode<E>`: the `Env` driver wrapping the core, plus
   `reconcile_loop` (the leader's automatic placement reconciler) and
   `detect_loop` (the leader's failure detector, ADR 0012). Also the
