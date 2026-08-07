@@ -870,13 +870,16 @@ impl BoundNode {
         };
 
         let raft = RaftNode::start(self.control_env, control_ids.clone());
-        // Register this node's control handle in the **per-cluster** set the wire
-        // edges use to reach the control-plane leader for schema proposals
-        // (ADR 0013). In `--cluster N` mode this lets any node's CQL/DynamoDB edge
-        // propose a `CreateTableSchema` on whichever in-process node is currently
-        // leader, so DDL on a follower-connected client still commits. The set is
-        // owned by the `ClusterEdgeState` (one per cluster), not a process global,
-        // so two in-process clusters in one test do not share handles.
+        // Register this node's control handle in this **node's own**
+        // `ClusterEdgeState` (ADR 0013/ADR 0031 PR2 — edge state is always
+        // per-node, in `--cluster N` exactly as in one-process-per-node), so
+        // `propose_schema` can propose locally when this node happens to be the
+        // control leader. When it isn't, `propose_schema` relays
+        // `ClientRequest::ProposeSchema` one hop to the leader's node via
+        // `client_route` — the same relay path a follower-connected DDL always
+        // used in one-process-per-node mode (`tests/schema_ddl_relay.rs`); a
+        // `--cluster N` in-process node now exercises it too instead of always
+        // finding the leader's handle locally.
         edge.register_control(raft.clone());
 
         // **Leaderful CP per-tablet Raft group** (ADR 0017 #3a) — the v1 data plane
@@ -884,8 +887,9 @@ impl BoundNode {
         // the first `min(N, MAX_REPLICATION_FACTOR)` nodes' `raftkv` ids. A node in
         // that set runs a `RaftKvNode` on its `raftkv_env` (own id/port/dir — the
         // single-consumer inbox rule), backed by its own engine; the handle is
-        // registered in the per-cluster edge state so the wire edges route a table's
-        // reads/writes to the group leader. The group is started with a **split
+        // registered in this node's own edge state so the wire edges route a table's
+        // reads/writes locally when this node leads (else forward, via
+        // `client_route`). The group is started with a **split
         // hook** (Phase 2.2): on a committed `Split` it mints the new tablet's
         // co-resident group. Dynamic CP reconfigure over `ProdEnv` is later v1 work.
         //
@@ -1071,9 +1075,9 @@ pub struct Node {
     /// The client-facing listener tasks (client TCP / dynamo HTTP / cql), which
     /// run on plain `tokio::spawn` off the `Env` network; aborted on shutdown.
     tasks: Vec<tokio::task::JoinHandle<()>>,
-    /// This cluster's shared CP-group registry (cheap to clone — `Arc`-wrapped
+    /// This node's own edge state (ADR 0031 PR2 — cheap to clone, `Arc`-wrapped
     /// internally), kept so [`shutdown_graceful`](Self::shutdown_graceful) can
-    /// gracefully halt every hosted CP group before the hard abort in
+    /// gracefully halt every CP group *this node* hosts before the hard abort in
     /// [`shutdown`](Self::shutdown).
     edge: ClusterEdgeState,
     client_addr: SocketAddr,
@@ -1221,41 +1225,61 @@ impl Node {
     }
 }
 
-/// The wire edges' mutable state, scoped to **one cluster** (one process in
-/// `--cluster N` mode; one node in one-process-per-node mode) rather than to the
-/// whole process (ADR 0013). Holding it here — threaded through [`ClientCtx`] —
-/// instead of in `OnceLock` process statics is what lets a test harness run
-/// several independent clusters in one process without their edge state leaking
-/// across them (registries, prepared statements, and especially the set of
-/// control handles a schema proposal fans out to).
+/// The wire edges' mutable state, scoped to **one node** (ADR 0013; made
+/// genuinely per-node by ADR 0031 PR2 — see the historical note below) rather
+/// than to the whole process or, in `--cluster N`, the whole in-process
+/// cluster. Holding it here — threaded through [`ClientCtx`] — instead of in
+/// `OnceLock` process statics is what lets a test harness run several
+/// independent clusters (and, within a cluster, several independent nodes) in
+/// one process without their edge state leaking across each other
+/// (registries, prepared statements, and the control/CP-group handles each
+/// node registers).
 ///
-/// Cloning shares the same underlying state (it is `Arc`-backed), so every node
-/// and every connection of a cluster sees one registry / handle set; a fresh
-/// [`ClusterEdgeState::new`] is a distinct, isolated set.
+/// Cloning shares the same underlying state (it is `Arc`-backed) — cheap, and
+/// used to hand every connection *of the same node* the same handle set. A
+/// fresh [`ClusterEdgeState::new`] is a distinct, isolated set, and
+/// [`start_cluster_with`] (the `--cluster N` in-process bring-up) now creates
+/// one **per node**, not one shared by the whole cluster.
+///
+/// **Historical note (ADR 0031 PR2):** before this change, `--cluster N`
+/// created a *single* `ClusterEdgeState` shared by every in-process node —
+/// convenient (any node's edge reached every other node's handles directly,
+/// in-process), but it made every `edge.*` read answer "does *anyone* in the
+/// cluster satisfy this" instead of "does *this node*" — masking real
+/// cross-process leader-routing / DDL-relay / per-node-dedup bugs that only
+/// showed up in a genuine one-process-per-node deployment (several are
+/// recorded in the root `CLAUDE.md` Engineering Practices section). `--cluster
+/// N` now behaves identically to one-process-per-node: every node gets its own
+/// edge state, and cross-node reach happens only through the real
+/// client-protocol forwarding (`cp_route`/`cp_forward`) and schema-DDL relay
+/// (`propose_schema`) paths, both proven by the per-process test suite
+/// already. A few fields below still carry stale "shared in `--cluster N`"
+/// commentary describing that retired shape; treat any such comment as
+/// historical, not current behavior.
 #[derive(Clone)]
 pub struct ClusterEdgeState {
-    /// This cluster's control `RaftNode` handles, so a wire edge (CQL/DynamoDB)
-    /// can reach the control-plane **leader** to propose a schema `MetaCommand`
-    /// even when the client connected to a follower (ADR 0013). In `--cluster N`
-    /// mode every node of the cluster registers here, so the leader is always
-    /// present; in one-process-per-node mode only the local handle is registered
-    /// (cross-process proposal forwarding is future work — DDL then commits when
-    /// this node is the leader, like the bootstrap path).
+    /// This **node's own** control `RaftNode` handle (at most one entry — see
+    /// [`register_control`](Self::register_control)), so `propose_schema` can
+    /// propose a schema `MetaCommand` **locally** when this node is the
+    /// control-plane leader. When it isn't, `propose_schema` relays
+    /// [`ClientRequest::ProposeSchema`] one hop to the leader's node via
+    /// `client_route` (ADR 0013) — the same path every follower-connected DDL
+    /// in a one-process-per-node deployment always used.
     control: Arc<Mutex<Vec<RaftNode<ProdEnv>>>>,
     /// The DynamoDB edge's in-memory GSI declarations + observation-built
-    /// written-key index (ADR 0006). Not durable / not replicated; per-cluster.
+    /// written-key index (ADR 0006). Not durable / not replicated; per-node.
     dynamo_registry: Arc<Mutex<animus_dynamo::SchemaRegistry>>,
     /// The CQL edge's keyspaces + prepared-statement store (ADR 0013). Not
-    /// durable / not replicated; per-cluster.
+    /// durable / not replicated; per-node — a statement `PREPARE`d on one node
+    /// is only `EXECUTE`-able on connections to *that* node (matching a real
+    /// one-process-per-node deployment's per-process catalog).
     cql_state: Arc<tokio::sync::Mutex<cql::CqlState>>,
-    /// This cluster's **leaderful CP** per-tablet Raft group handles (ADR 0017 #3a),
-    /// **keyed by tablet** so a wire edge routes a key to its owning tablet's group
-    /// **leader** (Phase 2: multi-tablet CP). Each tablet maps to the locally-hosted
-    /// group handle(s) for it. In `--cluster N` mode every hosting node registers
-    /// here (so the leader is always present in-process); one-process-per-node
-    /// registers only the local handle (cross-process routing forwards). Today the
-    /// cluster has one whole-keyspace tablet, so there is one entry; a tablet split
-    /// adds another.
+    /// This **node's own** hosted **leaderful CP** per-tablet Raft group
+    /// handles (ADR 0017 #3a), **keyed by tablet** so a wire edge routes a key
+    /// to its owning tablet's group **leader** when this node hosts it, or
+    /// forwards otherwise (`cp_route`/`client_route`). Each tablet maps to the
+    /// handle(s) *this node* locally hosts for it (in practice at most one,
+    /// since a node hosts at most one replica of a given tablet).
     raftkv: Arc<Mutex<BTreeMap<TabletId, Vec<CpGroup>>>>,
 }
 
@@ -1296,14 +1320,15 @@ impl ClusterEdgeState {
             .push(cp);
     }
 
-    /// Remove and return **one node's** registered handle for `tablet` — the one
-    /// whose env runs as group member `member` — dropping the tablet's entry once
-    /// the last handle is gone (drop-table GC, ADR 0024). Matched per member id
-    /// because in an in-process `--cluster N` run this edge is **shared** across
-    /// nodes: every replica's GC loop must reclaim its *own* group, not whichever
-    /// handle happens to be first. `None` if no such handle is registered (e.g.
-    /// the stand-up path claimed the tablet but has not registered yet — the
-    /// caller retries on a later tick rather than GC-ing a group mid-standup).
+    /// Remove and return this (node-local) edge's registered handle for
+    /// `tablet` — the one whose env runs as group member `member` — dropping
+    /// the tablet's entry once the last handle is gone (drop-table GC, ADR
+    /// 0024). Matched per member id defensively (this edge only ever holds
+    /// this node's own handles since ADR 0031 PR2, but a tablet could in
+    /// principle have more than one locally-registered entry across its
+    /// lifetime). `None` if no such handle is registered (e.g. the stand-up
+    /// path claimed the tablet but has not registered yet — the caller
+    /// retries on a later tick rather than GC-ing a group mid-standup).
     fn unregister_raftkv(&self, tablet: TabletId, member: NodeId) -> Option<CpGroup> {
         let mut map = self.raftkv.lock().expect("raftkv handles poisoned");
         let groups = map.get_mut(&tablet)?;
@@ -1381,14 +1406,12 @@ impl ClusterEdgeState {
             .cloned()
     }
 
-    /// **This node's own** registered handle for `tablet` — the one whose env
-    /// runs as group member `member` — without removing it (contrast
+    /// This node's own registered handle for `tablet` — the one whose env runs
+    /// as group member `member` — without removing it (contrast
     /// [`unregister_raftkv`](Self::unregister_raftkv)). Matched per member id
-    /// for the same reason as `unregister_raftkv`: in an in-process `--cluster
-    /// N` run this edge is **shared** across nodes, so `local_cp`'s "first
-    /// registered handle" can belong to a different node. Used by
-    /// `cp_join_host_loop` to re-narrow an already-hosted tablet's own
-    /// `StorageScope` after a split, without touching a sibling node's handle.
+    /// for the same reason as `unregister_raftkv`. Used by `cp_join_host_loop`
+    /// to re-narrow an already-hosted tablet's own `StorageScope` after a
+    /// split.
     fn local_cp_member(&self, tablet: TabletId, member: NodeId) -> Option<CpGroup> {
         self.raftkv
             .lock()
@@ -1420,12 +1443,12 @@ impl ClusterEdgeState {
             .cloned()
     }
 
-    /// The DynamoDB edge's per-cluster registry.
+    /// The DynamoDB edge's per-node registry.
     pub(crate) fn dynamo_registry(&self) -> &Arc<Mutex<animus_dynamo::SchemaRegistry>> {
         &self.dynamo_registry
     }
 
-    /// The CQL edge's per-cluster state.
+    /// The CQL edge's per-node state.
     pub(crate) fn cql_state(&self) -> &Arc<tokio::sync::Mutex<cql::CqlState>> {
         &self.cql_state
     }
@@ -1433,8 +1456,8 @@ impl ClusterEdgeState {
 
 /// Shared context for the client request server and the DynamoDB/CQL endpoints:
 /// the control `RaftNode` (for cached metadata + schema proposals), the per-node
-/// RMW serialization lock, the per-cluster wire-edge state (incl. the CP group
-/// handles), and the cross-process CP routing table.
+/// RMW serialization lock, this node's own wire-edge state (incl. the CP group
+/// handles it hosts), and the cross-node CP routing table.
 #[derive(Clone)]
 pub(crate) struct ClientCtx {
     raft: RaftNode<ProdEnv>,
@@ -1449,9 +1472,11 @@ pub(crate) struct ClientCtx {
     /// CP-group routing table: each CP group member id (`raftkv_id`, `300+i`) → the
     /// **client API** address of its hosting node (ADR 0017 #3b). Lets a node that
     /// received a CP op but doesn't host the group leader **forward** the request to
-    /// the leader's node. Built from the cluster config/bound addresses; empty in a
-    /// single-process `--cluster N` run (where the shared edge state already reaches
-    /// every group handle in-process, so no forwarding is needed).
+    /// the leader's node. Built from the cluster config/bound addresses — always
+    /// populated (ADR 0031 PR2: `start_cluster_with`'s in-process `--cluster N`
+    /// bring-up builds this the same way `run_node_with` does, since each node
+    /// now has its own `ClusterEdgeState` and must genuinely forward to reach
+    /// another node's group).
     client_route: BTreeMap<NodeId, SocketAddr>,
     /// This node's **base `raftkv` id** — its identity in a tablet's replica set
     /// (ADR 0023). Used by routing to tell "this node is a replica of the tablet, so
@@ -2909,8 +2934,11 @@ const CP_JOIN_HOST_INTERVAL: Duration = Duration::from_millis(250);
 /// restore voter status from a non-voter start) — detected by
 /// `StorageScope::has_data`, an async engine read the pure decision can't do, so
 /// `cp_join_host` layers it on top. Double-hosting is prevented **per node** by the
-/// `minted` claim set, not `edge.local_cp` (which is shared across nodes in an
-/// in-process `--cluster N` run).
+/// `minted` claim set, not `edge.local_cp` — even though `edge` is itself
+/// per-node now (ADR 0031 PR2), `minted` is claimed synchronously at decision
+/// time, before the (async) join-host actually registers a handle, so it can't
+/// race a later tick in this same loop the way a registration-based check
+/// could.
 ///
 /// **Also re-narrows an already-hosted tablet's `StorageScope` every tick.** A
 /// single-command split (ADR 0028) narrows the *source* tablet's range in
@@ -2935,14 +2963,12 @@ async fn cp_join_host_loop(host: CpHostCtx) {
             let Some(plan) = topology::plan_join_host(host.base_id, &t.replicas, t.epoch) else {
                 continue;
             };
-            // Dedup **per node** via the `minted` claim set — NOT via `edge.local_cp`,
-            // which in an in-process `--cluster N` run is a **shared**
-            // `ClusterEdgeState`: it would report *another* node's just-hosted group
-            // and make this node skip, leaving a freshly provisioned tablet hosted on
-            // only one replica (no majority → no election → "no CP group leader
-            // reachable"). The minted set is genuinely per-node, so it dedups
-            // correctly in both deployment modes. This stateful claim stays here — it
-            // is not part of the pure decision.
+            // Dedup **per node** via the `minted` claim set — NOT via `edge.local_cp`.
+            // `edge` is per-node (ADR 0031 PR2), so this is no longer about avoiding
+            // another node's state; it's that `minted` is claimed *before* the async
+            // join-host registers a handle, so it can't race this same loop's next
+            // tick the way checking for a registered handle could. This stateful
+            // claim stays here — it is not part of the pure decision.
             let already_hosted = {
                 let mut h = host.minted.lock().expect("hosting set poisoned");
                 !h.insert(tablet)
@@ -3039,7 +3065,7 @@ const RELEASE_CONFIRM_TICKS: u8 = 3;
 /// handle, stop its driver, erase its range from the shared engine, delete its
 /// WAL file, and release the `minted` claim. The exact dual of
 /// [`cp_join_host_loop`]: same pull-from-replicated-state shape, same per-node
-/// `minted` state for the decision (never the shared `--cluster N` edge).
+/// `minted` state for the decision.
 ///
 /// Deciding "dropped" from *absence* in the map is sound only over recovered,
 /// durable metadata: this node minted a tablet only after **applying** its
@@ -3359,12 +3385,14 @@ const AUTO_SPLIT_EST_ENTRY_BYTES: u64 = 32;
 /// `SplitTablet` is rejected cleanly at propose time (stale epoch); the winner's
 /// commit is the entire operation.
 ///
-/// Only the node hosting a tablet's leader reads `local_pairs`/triggers, so in a
-/// one-process-per-node deployment exactly one node triggers. In a single
-/// `--cluster N` process the edge state is shared, so more than one node's loop
-/// can see the same leader handle and race a `trigger_split` for the same tablet
-/// in the same tick — harmless: the epoch CAS lets exactly one win, and the loser
-/// just tries again (or backs off) next tick.
+/// Only the node hosting a tablet's leader reads `local_pairs`/triggers — `edge`
+/// is per-node (ADR 0031 PR2), so `ctx.edge.cp_leader(tablet)` only returns
+/// `Some` on the one node that actually leads that tablet's group, in both
+/// one-process-per-node and `--cluster N`. A genuine same-tick race is still
+/// possible (e.g. a leadership handoff mid-tick, or two distinct trigger
+/// sources such as a manual split racing this loop) — harmless: the epoch CAS
+/// lets exactly one win, and the loser just tries again (or backs off) next
+/// tick.
 ///
 /// `threshold` is a **key count** here — a placeholder size signal; a real
 /// byte/size-based threshold is future tuning. Disabled unless a threshold is
@@ -3992,10 +4020,19 @@ async fn start_cluster_inner(
     let control_ids: Vec<NodeId> = (0..n).map(config::control_id).collect();
     let peers: BTreeMap<NodeId, SocketAddr> =
         bound.iter().flat_map(BoundNode::peer_entries).collect();
-    // One edge-state set shared by every node of *this* cluster (so any node's
-    // edge can reach the cluster's leader and they agree on CP/keyspace state),
-    // but distinct from any other cluster in the same process.
-    let edge = ClusterEdgeState::new();
+    // Cross-node routing (ADR 0017 #3b / ADR 0013): map each node's CP group
+    // member id (`raftkv_id`) **and** its control id to that node's client API
+    // address, so an op landing on a node that isn't the relevant leader
+    // forwards to the leader's node — identical to the per-process path
+    // (`run_node_with`). `--cluster N` gives **each node its own
+    // `ClusterEdgeState`** (below), matching one-process-per-node exactly:
+    // cross-node reach happens only through this real forwarding/relay path,
+    // never a shared in-process registry (root `CLAUDE.md`'s documented
+    // "shared edge masks per-node bugs" gotcha — this removes the sharing).
+    let client_route: BTreeMap<NodeId, SocketAddr> = bound
+        .iter()
+        .flat_map(|b| [(b.raftkv_id, b.client_addr), (b.control_id, b.client_addr)])
+        .collect();
     // Every node's admin address, so each node's dashboard (ADR 0021) can fan out
     // to the whole in-process cluster.
     let admin_addrs: Vec<SocketAddr> = bound.iter().map(BoundNode::admin_addr).collect();
@@ -4006,10 +4043,11 @@ async fn start_cluster_inner(
                 peers.clone(),
                 control_ids.clone(),
                 backend,
-                edge.clone(),
-                // In-process cluster: the shared edge state reaches every CP group
-                // handle in-process, so no cross-process forwarding route is needed.
-                BTreeMap::new(),
+                // A fresh, node-local edge-state set per node — never shared
+                // across the in-process cluster (see the `client_route`
+                // comment above).
+                ClusterEdgeState::new(),
+                client_route.clone(),
                 auto_split_threshold,
                 admin_addrs.clone(),
             )

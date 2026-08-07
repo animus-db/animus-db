@@ -66,11 +66,14 @@ pub(crate) struct CpRaftView {
     pub(crate) tablet: u64,
     /// The `raftkv` id of the node hosting this replica (since ADR 0026 Stage
     /// B / ADR 0028 a tablet's CP group member id **is** simply this base id —
-    /// no derived-id translation needed). Needed because under `--cluster N`
-    /// every node's `/admin/raftkv` response lists **every** hosted replica
-    /// across the whole cluster (the shared `ClusterEdgeState`, see its doc),
-    /// so a client cannot infer which physical node a group belongs to from
-    /// which admin port answered the request.
+    /// no derived-id translation needed). `/admin/raftkv` is node-local (ADR
+    /// 0031 PR2: `ClusterEdgeState` is always per-node, in `--cluster N`
+    /// exactly as in one-process-per-node), so every entry in a given
+    /// response already belongs to the answering node — but the dashboard's
+    /// cross-node fan-out (ADR 0021) merges responses from every node into
+    /// one view, and a client cannot infer which physical node a merged
+    /// entry came from just from which admin port happened to answer, so this
+    /// field is still carried explicitly.
     pub(crate) node: NodeId,
     pub(crate) backend: &'static str,
     pub(crate) role: String,

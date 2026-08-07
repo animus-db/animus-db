@@ -58,10 +58,15 @@
 //! its index machinery from the catalog, not from process-local memory. Only the
 //! index **entry data** (the `escape(hash) [|| escape(sort)] || base_key` index)
 //! stays in-memory and not durable, rebuilt from observed `note_put`/`note_delete`
-//! writes. The registry is **per-cluster**: held in the cluster's
-//! `ClusterEdgeState` (threaded through `ClientCtx`), not a process `OnceLock`, so
-//! two in-process clusters in one test do not share a registry. In `--cluster N`
-//! dev mode the cluster's nodes share one registry.
+//! writes. The registry is **per-node** (ADR 0031 PR2 — `ClusterEdgeState` is
+//! always per-node, in `--cluster N` exactly as in one-process-per-node): held in
+//! the node's own `ClusterEdgeState` (threaded through `ClientCtx`), not a
+//! process `OnceLock`, so two in-process clusters — or two nodes of the same
+//! `--cluster N` cluster — never share a registry. The index *definitions*
+//! (replicated, above) reach every node the same way regardless; a node whose
+//! registry doesn't yet have an index's entry data lazily backfills it on the
+//! first query against that index (`backfill_index_if_needed`), so a
+//! cross-node index query is correct without a shared in-memory registry.
 //!
 //! ## Query, Scan, and secondary indexes
 //!
