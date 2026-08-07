@@ -47,7 +47,16 @@ the engine — the `AccordCore` sync-core/async-driver split.
   right after a split narrows it) deterministic: two replicas at different
   points in observing the split's `Metadata` still make the identical
   accept/reject decision for the same log entry, because the decision travels
-  *with* the entry.
+  *with* the entry. **`RaftKvNode::scope_range()`** (additive accessor,
+  2026-08-07) is the read side: a point-in-time snapshot of the group's own
+  live `StorageScope` range, meant to be both (1) checked against a proposed
+  key **before** proposing (a pre-propose reject, not just relying on the
+  embedded fence — see `animusd/CLAUDE.md`'s CP-routing section for why the
+  pre-check is load-bearing, not redundant, given how `animusd` confirms a
+  write) and (2) stamped as that same proposal's `fence`. It was this
+  accessor's *absence* that had left the fences unwired in `animusd` for as
+  long as they existed — see the root `CLAUDE.md`'s entry on a safety
+  mechanism with zero production callers.
 - **Stream addressing** (ADR 0026 Stage B): `start_hosted(env, all_nodes,
   storage, scope, stream)` addresses a tablet's Raft traffic by `(node,
   stream)` (`env.send_stream`/`recv_stream`, `stream` = the tablet id) instead
