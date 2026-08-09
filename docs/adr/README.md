@@ -40,3 +40,4 @@ relevant ADR (or supersede it) in the same PR as the code change.
 | [0032](0032-seed-join-membership.md) | Seed/join membership: a replicated node address book, `animusd join`, and decommission (closes 0030's `client_route` gap; amends 0024, 0030) | Accepted — implemented incrementally (PR1: address book; PR2: `animusd join`) |
 | [0033](0033-tablet-merge.md) | Tablet merge: an operator-driven, control-plane-only dual of split (amends 0029, extends 0031) | Accepted |
 | [0034](0034-byte-based-auto-split.md) | Byte-based auto-split trigger: scoped byte estimate + byte-weighted median (amends 0002, 0028's auto-split loop) | Accepted |
+| [0035](0035-control-plane-separate-deployment.md) | Control plane as a separate deployment: `animusd control` / `animusd data` over a `ControlHandle` seam (amends 0030, 0032) | Proposed |
