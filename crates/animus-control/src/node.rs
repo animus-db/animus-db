@@ -122,7 +122,14 @@ impl MetadataWatch {
     /// e.g. a stale call from a driver iteration that changed nothing) and
     /// wake a parked waiter only when it actually moved. Called by the driver
     /// wherever a flush could have advanced client-visible state.
-    fn bump(&self, index: u64) {
+    ///
+    /// **Public since ADR 0035 PR5**: a data-only node's `RemoteControlClient`
+    /// (`animusd`) owns its own disconnected `MetadataWatch` and drives it
+    /// directly from the watermark carried on each `WatchMetadata`/`Status`
+    /// reply — the same "external owner bumps a watch it did not itself
+    /// derive from a live `RaftCore`" shape this method already supported
+    /// in-process, just crossing a network hop instead of a task boundary.
+    pub fn bump(&self, index: u64) {
         let prev = self.0.applied.fetch_max(index, Ordering::AcqRel);
         if index > prev {
             self.0.waker.wake();

@@ -1,6 +1,6 @@
 //! AnimusDB node server (`animusd`).
 //!
-//! Six modes:
+//! Seven modes:
 //!
 //! ```text
 //! animusd gen-config --nodes N [--host H] [--base-port P]   # print a combined-mode cluster config (JSON)
@@ -10,6 +10,7 @@
 //! animusd join --seed ADDR[,ADDR...] --node I [--ip A] [--base-port P] [--dir D] [--ephemeral] # seed/join startup (ADR 0032 PR2)
 //! animusd control --config FILE --node I [--dir DIR] # run node I as a control-only node (ADR 0035 PR3)
 //! animusd data --config FILE --node I [--dir DIR] [--ephemeral] # run node I as a data-only node (ADR 0035 PR4)
+//! animusd data --seed ADDR[,ADDR...] --node I [--ip A] [--base-port P] [--dir D] [--ephemeral] # data-only seed/join (ADR 0035 PR5)
 //! ```
 //!
 //! The data replica is durable by default (an on-disk LSM under the node's data
@@ -21,7 +22,9 @@
 //! node that has no expanded config at all — just the client address of any
 //! already-running node — can instead `animusd join --seed <that address>
 //! --node I`, learning everything else it needs from the cluster itself (ADR
-//! 0032 PR2: a real data-plane member, control group unchanged, ADR 0030).
+//! 0032 PR2: a real data-plane member, control group unchanged, ADR 0030); a
+//! data-only node has the same option (`animusd data --seed <that address>
+//! --node I`, ADR 0035 PR5) against a separately-deployed control plane.
 //!
 //! `animusd control` runs one of a config's control-role node(s) only — no
 //! storage engine, no `raftkv` env, no DynamoDB/CQL listeners; `animusd data`
@@ -98,7 +101,8 @@ const USAGE: &str = "usage:\n  \
     animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B]\n  \
     animusd join --seed ADDR[,ADDR...] --node I [--ip A] [--base-port P] [--dir D] [--ephemeral]\n  \
     animusd control --config FILE --node I [--dir DIR]\n  \
-    animusd data --config FILE --node I [--dir DIR] [--ephemeral]";
+    animusd data --config FILE --node I [--dir DIR] [--ephemeral]\n  \
+    animusd data --seed ADDR[,ADDR...] --node I [--ip A] [--base-port P] [--dir D] [--ephemeral]";
 
 /// `gen-config`: print a generated cluster config as JSON — either combined-mode
 /// (`--nodes N`) or the ADR 0035 split-deployment shape (`--control-nodes N
@@ -262,16 +266,23 @@ async fn run_control(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// `data`: run node `index` of `config` as a **data-only** node (ADR 0035
-/// PR4) — no control env, no local control `RaftCore`, reaching the
-/// separately-deployed control plane over the network instead. See
-/// [`animusd::run_node_data`]'s doc for the exact control-deployment
-/// discovery this needs from `config` (its control-role entries).
+/// `data`: run node `index` as a **data-only** node (ADR 0035 PR4, or PR5's
+/// `--seed` join variant) — no control env, no local control `RaftCore`,
+/// reaching the separately-deployed control plane over the network instead.
+/// Either `--config FILE` (an operator-assembled `ClusterConfig` listing the
+/// control deployment's addresses up front — see
+/// [`animusd::run_node_data`]'s doc) or `--seed ADDR[,ADDR...]` (this node
+/// discovers the control deployment from any already-running node's client
+/// address, mirroring `animusd join`'s discovery — see
+/// [`animusd::run_node_data_join`]'s doc), never both.
 async fn run_data(args: &[String]) -> Result<(), String> {
     let mut config_path: Option<String> = None;
     let mut node: Option<usize> = None;
     let mut dir: Option<std::path::PathBuf> = None;
     let mut backend = animusd::StorageBackend::default();
+    let mut seed_arg: Option<String> = None;
+    let mut ip: IpAddr = "127.0.0.1".parse().unwrap();
+    let mut base_port: Option<u16> = None;
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -280,12 +291,32 @@ async fn run_data(args: &[String]) -> Result<(), String> {
             "--node" => node = Some(parse_next(&mut it, "--node")?),
             "--dir" => dir = Some(parse_next::<String>(&mut it, "--dir")?.into()),
             "--ephemeral" => backend = animusd::StorageBackend::Memory,
+            "--seed" => seed_arg = Some(parse_next::<String>(&mut it, "--seed")?),
+            "--ip" => ip = parse_next(&mut it, "--ip")?,
+            "--base-port" => base_port = Some(parse_next(&mut it, "--base-port")?),
             other => return Err(format!("unknown data argument `{other}`")),
         }
     }
-    let path = config_path.ok_or("data requires --config FILE")?;
     let index = node.ok_or("data requires --node I")?;
-    let text = std::fs::read_to_string(&path).map_err(|e| format!("reading {path}: {e}"))?;
+
+    match (config_path, seed_arg) {
+        (Some(_), Some(_)) => Err("use either --config or --seed, not both".into()),
+        (Some(path), None) => run_data_config(&path, index, dir, backend).await,
+        (None, Some(seed_arg)) => {
+            run_data_join(&seed_arg, index, ip, base_port, dir, backend).await
+        }
+        (None, None) => Err("data requires --config FILE or --seed ADDR[,ADDR...]".into()),
+    }
+}
+
+/// `animusd data --config FILE --node I` (ADR 0035 PR4): the operator-assembled-config half of [`run_data`].
+async fn run_data_config(
+    path: &str,
+    index: usize,
+    dir: Option<std::path::PathBuf>,
+    backend: animusd::StorageBackend,
+) -> Result<(), String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("reading {path}: {e}"))?;
     let config = ClusterConfig::from_json(&text).map_err(|e| format!("parsing {path}: {e}"))?;
     let dir = dir.unwrap_or_else(|| std::env::temp_dir().join(format!("animusd-data-{index}")));
 
@@ -295,6 +326,63 @@ async fn run_data(args: &[String]) -> Result<(), String> {
     println!(
         "animusd: data node {index}/{} up (CP) — client {} — dynamo http {} — cql {} — admin http://{}",
         config.len(),
+        node.client_addr(),
+        node.dynamo_addr(),
+        node.cql_addr(),
+        node.admin_addr(),
+    );
+    println!("animusd: ready — Ctrl-C to stop");
+    wait_for_ctrl_c().await;
+    node.shutdown_graceful().await;
+    Ok(())
+}
+
+/// `animusd data --seed ADDR[,ADDR...] --node I` (ADR 0035 PR5): the
+/// seed/join half of [`run_data`] — mirrors [`run_join`]'s port-derivation
+/// and CLI shape exactly, minus the control port (a data-only `RoleAddrs` has
+/// none) and using [`animusd::run_node_data_join`] instead of
+/// [`animusd::run_node_join`].
+async fn run_data_join(
+    seed_arg: &str,
+    index: usize,
+    ip: IpAddr,
+    base_port: Option<u16>,
+    dir: Option<std::path::PathBuf>,
+    backend: animusd::StorageBackend,
+) -> Result<(), String> {
+    let seeds: Vec<SocketAddr> = seed_arg
+        .split(',')
+        .map(|s| {
+            s.trim()
+                .parse::<SocketAddr>()
+                .map_err(|e| format!("invalid --seed address `{s}`: {e}"))
+        })
+        .collect::<Result<_, _>>()?;
+    if seeds.is_empty() {
+        return Err("data --seed requires at least one address".into());
+    }
+
+    // Same six-port-per-index stride as `run_join`/`gen-config`, minus the
+    // control port this data-only node never binds (left `None` below).
+    let base_port = base_port.unwrap_or(7100_u16.wrapping_add((index as u16).wrapping_mul(6)));
+    let p = |role: u16| SocketAddr::new(ip, base_port.wrapping_add(role));
+    let addrs = RoleAddrs {
+        role: animusd::config::NodeRole::Data,
+        control: None,
+        client: p(1),
+        dynamo: p(2),
+        cql: p(3),
+        raftkv: Some(p(4)),
+        admin: p(5),
+    };
+    let dir =
+        dir.unwrap_or_else(|| std::env::temp_dir().join(format!("animusd-data-join-{index}")));
+
+    let node = animusd::run_node_data_join(seeds, index, addrs, &dir, backend)
+        .await
+        .map_err(|e| format!("failed to join as data node {index}: {e}"))?;
+    println!(
+        "animusd: data node {index} joined (CP) — client {} — dynamo http {} — cql {} — admin http://{}",
         node.client_addr(),
         node.dynamo_addr(),
         node.cql_addr(),

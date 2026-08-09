@@ -9,7 +9,10 @@
 //!   the relayed `admin_add_member`, get promoted `Active` by the unmodified
 //!   ADR 0012 heartbeat/failure-detector chain, a table provisions onto
 //!   them, and `Put`/`Get` work through a data node — including a read
-//!   served by a *different* data node than the one written through;
+//!   served by a *different* data node than the one written through — and
+//!   also through a **control-only** node's client port (which hosts zero
+//!   local CP replicas of anything, so it must forward both ways to reach
+//!   the genuinely-`Remote` data fleet);
 //! - schema DDL issued against a data node relays to the control leader and
 //!   commits, visible from every node (`metadata_fresh` soundness: the data
 //!   node's own commit-wait poll must observe its just-proposed command,
@@ -24,16 +27,15 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use animusd::config::NodeRole;
 use animusd::{
-    ClientRequest, ClientResponse, ClusterConfig, ColumnType, MetaCommand, Node, RoleAddrs,
-    StorageBackend, TableSchema, read_frame,
+    ClientRequest, ClientResponse, ColumnType, MetaCommand, Node, StorageBackend, TableSchema,
+    read_frame,
 };
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
 mod support;
-use support::free_addrs;
+use support::{await_data_nodes_active, await_leader, bring_up_split};
 
 async fn call(addr: SocketAddr, req: ClientRequest) -> ClientResponse {
     let mut stream = TcpStream::connect(addr).await.expect("connect");
@@ -67,118 +69,6 @@ async fn admin_get(addr: SocketAddr, path: &str) -> (u16, serde_json::Value) {
     let value: serde_json::Value = serde_json::from_str(payload)
         .unwrap_or_else(|e| panic!("admin body is not JSON ({e}): {payload}"));
     (status, value)
-}
-
-/// Bring up a genuine split cluster: `control_n` control-only nodes
-/// (`animusd control`'s `run_node_control`) plus `data_n` data-only nodes
-/// (`animusd data`'s `run_node_data`, `ControlHandle::Remote`) — **no**
-/// combined-mode node anywhere, one process (in this test binary) per node,
-/// each its own `ClusterEdgeState`. Retries the (allocate-fresh-ports +
-/// start-all) as a unit, mirroring `tests/control_only.rs`'s
-/// `bring_up_control` (the documented port-TOCTOU mitigation).
-async fn bring_up_split(
-    control_n: usize,
-    data_n: usize,
-    dir: &std::path::Path,
-) -> (Vec<Node>, Vec<Node>, ClusterConfig) {
-    let total = control_n + data_n;
-    for attempt in 0..16 {
-        let addrs = free_addrs(total * 6);
-        let nodes_cfg: Vec<RoleAddrs> = (0..total)
-            .map(|i| {
-                let role = if i < control_n {
-                    NodeRole::Control
-                } else {
-                    NodeRole::Data
-                };
-                RoleAddrs {
-                    role,
-                    control: role.has_control().then_some(addrs[6 * i]),
-                    client: addrs[6 * i + 1],
-                    dynamo: addrs[6 * i + 2],
-                    cql: addrs[6 * i + 3],
-                    raftkv: role.has_data().then_some(addrs[6 * i + 4]),
-                    admin: addrs[6 * i + 5],
-                }
-            })
-            .collect();
-        let config = ClusterConfig { nodes: nodes_cfg };
-
-        let mut control_nodes = Vec::new();
-        let mut data_nodes = Vec::new();
-        let mut failed = false;
-        for i in 0..control_n {
-            match animusd::run_node_control(&config, i, dir.join(format!("a{attempt}-c{i}"))).await
-            {
-                Ok(n) => control_nodes.push(n),
-                Err(_) => {
-                    failed = true;
-                    break;
-                }
-            }
-        }
-        if !failed {
-            for i in control_n..total {
-                match animusd::run_node_data(
-                    &config,
-                    i,
-                    dir.join(format!("a{attempt}-d{i}")),
-                    StorageBackend::Memory,
-                )
-                .await
-                {
-                    Ok(n) => data_nodes.push(n),
-                    Err(_) => {
-                        failed = true;
-                        break;
-                    }
-                }
-            }
-        }
-        if !failed {
-            return (control_nodes, data_nodes, config);
-        }
-        for n in control_nodes.iter().chain(data_nodes.iter()) {
-            n.shutdown_graceful().await;
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
-    panic!("could not bring up split cluster after retries (ports kept getting stolen)");
-}
-
-async fn await_leader(control_nodes: &[Node]) {
-    timeout(Duration::from_secs(20), async {
-        loop {
-            if control_nodes.iter().any(Node::is_control_leader) {
-                return;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("control deployment did not elect a leader in 20s");
-}
-
-/// Wait for every data node's raftkv id to become `Active` in the control
-/// deployment's own metadata (the unmodified ADR 0012 heartbeat/detector
-/// promotion chain — `tests/cluster_growth.rs` is the existing proof this
-/// mechanism works unattended; no test-side force here).
-async fn await_data_nodes_active(control_nodes: &[Node], data_raftkv_ids: &[animus_env::NodeId]) {
-    timeout(Duration::from_secs(20), async {
-        loop {
-            if data_raftkv_ids.iter().all(|id| {
-                control_nodes.iter().any(|n| {
-                    n.metadata().members.get(id).map(|m| m.status)
-                        == Some(animusd::NodeStatus::Active)
-                })
-            }) {
-                return;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("data nodes did not become Active in 20s");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -229,6 +119,47 @@ async fn split_cluster_serves_reads_and_writes_across_data_nodes() {
             get,
             ClientResponse::Value(Some(b"split-val".to_vec())),
             "read-back via the other data node"
+        );
+
+        // A `Put`/`Get` issued against a **control-only** node's client port
+        // — that node hosts zero local CP replicas of anything
+        // (`ClientCtx.data == None`), so `resolve_cp_route` must take its
+        // no-local-replica "forward to any known route" branch to reach the
+        // data fleet at all. `control_only.rs`'s own mixed-cluster test
+        // predates PR4 and only exercises this against an ADR 0030 growth
+        // node; this is the genuine-`Remote`-data-fleet version of the same
+        // assertion.
+        timeout(Duration::from_secs(20), async {
+            loop {
+                let put = call(
+                    control_nodes[0].client_addr(),
+                    ClientRequest::Put {
+                        key: b"via-control-key".to_vec(),
+                        value: b"via-control-val".to_vec(),
+                        table: "split_t".to_string(),
+                    },
+                )
+                .await;
+                if matches!(put, ClientResponse::PutOk) {
+                    return;
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("put via a control-only node did not succeed in 20s");
+        let get_via_control = call(
+            control_nodes[0].client_addr(),
+            ClientRequest::Get {
+                key: b"via-control-key".to_vec(),
+                table: "split_t".to_string(),
+            },
+        )
+        .await;
+        assert_eq!(
+            get_via_control,
+            ClientResponse::Value(Some(b"via-control-val".to_vec())),
+            "read-back via the same control-only node (forwarded to the data fleet both ways)"
         );
 
         // The data-only nodes' own `/admin/health` reports data-plane

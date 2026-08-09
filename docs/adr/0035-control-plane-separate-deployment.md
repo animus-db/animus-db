@@ -130,15 +130,37 @@ behind a seam so the data-node mode never needs a local `RaftCore` at all.
    static root of discovery** for everything downstream (join, growth,
    rebalancing all resolve through it), exactly as the pre-growth control
    group already is the root of discovery in ADR 0030/0032.
-4. **`metadata_watch()` stays in-process only.** A `Remote` data node starts
-   with the existing 200–500ms poll cadence (`remote_metadata_sync_loop`,
-   generalized from "growth-node fallback" to "how every data node syncs"),
-   not the event-driven watch — `MetadataWatch`'s `AtomicWaker` is a
-   same-process primitive (ADR 0031 §trigger) and does not cross a network
-   hop. PR5 (below) upgrades this to a long-poll watch keyed on the applied-
-   index watermark the control deployment already exposes, closing most of
-   the latency gap between "control commits" and "data node observes it"
-   without requiring a new push mechanism.
+4. **`metadata_watch()` stays in-process only — PR4 starts a `Remote` data
+   node on the fixed-interval poll; PR5 upgrades it to a long-poll wire
+   primitive keyed on the same primitive.** `MetadataWatch`'s `AtomicWaker`
+   itself never crosses a network hop — that part of the original sketch
+   holds. What changed in delivery: rather than inventing a new push
+   mechanism, PR5 adds `ClientRequest::WatchMetadata { last_seen }` — a node
+   parks on **its own** `MetadataWatch` (server-side, only a genuine
+   `ControlHandle::Local` replica serves it — see below) for a bounded
+   `WATCH_METADATA_SERVER_TIMEOUT` (8s) and replies with the current
+   `Metadata` either way, extending the existing `ClientResponse::Status`
+   shape with a `watermark: u64` field. A `Remote` data node's
+   `RemoteControlClient` then owns its **own** same-process `MetadataWatch`
+   (disconnected from any `RaftCore`, exactly as before) but now **drives**
+   it itself — `observe()` calls `watch.bump(watermark)` on every reply — so
+   `ControlHandle::metadata_watch()` for `Remote` hands the tablet-host
+   reconciler a real wake-on-change signal instead of the permanently-inert
+   default PR4 shipped. `remote_metadata_watch_loop` replaces the fixed
+   200ms poll: long-poll (preferring the leader hint, then every seed),
+   falling back to a plain `Status` poll + backoff only when every seed
+   fails at the transport level. Two hardening details worth recording: (1)
+   `MetadataWatch::bump` had to become `pub` in `animus-control` so
+   `RemoteControlClient` could drive it from outside the crate — a small,
+   safe widening of an existing primitive, not a new one; (2) `observe()`
+   gained a non-regression guard (skip the mirror-overwrite unless
+   `watermark >= watch.latest()`), since *any* control node may answer, not
+   necessarily the most caught-up one, and a lagging replica's reply must
+   never regress a mirror that had already advanced further. This closes
+   most of the latency gap between "control commits" and "data node
+   observes it" without a new push mechanism, exactly as originally
+   sketched — only the wire shape (a dedicated long-poll request/reply
+   pair, not a bare push) differs from the one-line description above.
 5. **The ADR 0028/0033 write fence and read-side scope check become
    load-bearing for every node, not just a crossover-window edge case.**
    Today every node's own `Metadata` view can only ever be *slightly* behind
@@ -209,14 +231,30 @@ low-risk mechanical piece first (ADR 0031/0032's PR stacks):
    binds only the control Raft + placement/detector loops + client/admin
    endpoints.
 5. **PR4: `animusd data` with `Remote` handle.** Implement
-   `ControlHandle::Remote`, wire it into the data-only entry point; a data
-   node joins via seed against a control deployment and never binds a local
-   `RaftCore`.
-6. **PR5: long-poll watch + staleness audit.** Upgrade `Remote::
-   metadata_cached()` from fixed-interval polling to a long-poll watch keyed
-   on the control deployment's applied-index watermark; audit every call site
-   touched in PR1 against the "routine staleness, not crossover-only"
-   reasoning in §5 above.
+   `ControlHandle::Remote`, wire it into the data-only entry point
+   (`animusd data --config FILE`) — a data node never binds a local
+   `RaftCore`. The seed/join variant (`animusd data --seed`) landed in PR5,
+   below, alongside the freshness work it depends on.
+6. **PR5: long-poll watch + seed/join + staleness audit.** Shipped three
+   bounded pieces: (1) `ClientRequest::WatchMetadata` — a long-poll wire
+   primitive a genuine control replica serves off its own `MetadataWatch`;
+   `RemoteControlClient` gains its own driven copy of the same primitive, and
+   `remote_metadata_watch_loop` replaces the fixed-interval poll for a
+   `Remote` data node (see §4 above for the mechanism, which differs in
+   shape from the original one-line sketch); (2) `animusd data --seed` /
+   `run_node_data_join` — the data-only counterpart of `animusd join`,
+   reusing its `JoinInfo` discovery + `Status` collision guard via two
+   factored-out helpers (`discover_join_info`/`check_join_collision`); (3) a
+   staleness-classification pass over every `metadata_cached()`/
+   `effective_metadata()` call site touched since PR1, fixing the ones
+   feeding a permanent/one-shot decision (`cp_scan`'s tablet ranges,
+   `trigger_split`/`trigger_merge`'s CAS preconditions, `drop_table`'s
+   confirm poll, `create_keyspace`'s RYW check, `admin_drain`'s
+   leader-then-metadata ordering) and documenting the ones left as-is
+   (`/admin/raft`'s own-replica-diagnostic view; `trigger_split`/
+   `trigger_merge`'s *epoch*-staleness tolerance, distinct from the
+   permanently-empty-view bug fixed alongside it). See `crates/animusd/
+   CLAUDE.md`'s "What's non-obvious" entries for the full detail.
 7. **PR6: per-process split-cluster integration tests + docs/dashboard.**
    End-to-end tests running a real `animusd control` process alongside
    several real `animusd data` processes (not combined mode); dashboard and

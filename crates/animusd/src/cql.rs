@@ -59,7 +59,7 @@
 //! Keyspaces **are** now control-plane replicated too (v1 A3): `CREATE KEYSPACE`
 //! proposes `MetaCommand::CreateKeyspace` (durable + cluster-agreed, surviving
 //! restart), and `USE`/qualifier validation reads the replicated keyspace set
-//! (`ClientCtx::has_keyspace`), with a `ks.table`-prefix fallback so a keyspace
+//! ([`keyspace_exists`]), with a `ks.table`-prefix fallback so a keyspace
 //! that has tables is still recognized. Keyspace *properties* (replication
 //! strategy/factor) are not modelled — only the name namespace.
 //!
@@ -735,11 +735,12 @@ async fn run_statement(
 /// recognized even if its `CREATE KEYSPACE` predates replicated keyspaces).
 async fn keyspace_exists(ctx: &ClientCtx, keyspace: &str) -> bool {
     let ks = keyspace.to_ascii_lowercase();
-    // One metadata snapshot for both checks — `ctx.has_keyspace` +
-    // `ctx.has_table_schema_with_prefix` would each deep-clone the replicated
-    // metadata under the Raft handle's lock. Cache-tolerant (ADR 0035 PR1:
-    // `ctx.effective_metadata()`, not `ctx.control.metadata_cached()`
-    // directly) — a plain lookup, not a commit-wait poll.
+    // One metadata snapshot for both checks — calling `Metadata::has_keyspace`
+    // and re-deriving the table-schema fallback separately would each
+    // deep-clone the replicated metadata under the Raft handle's lock.
+    // Cache-tolerant (`ctx.effective_metadata()`, not
+    // `ctx.control.metadata_cached()` directly) — a plain lookup, not a
+    // commit-wait poll.
     let meta = ctx.effective_metadata();
     meta.has_keyspace(&ks)
         || meta
