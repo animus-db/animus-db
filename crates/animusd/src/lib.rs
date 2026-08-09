@@ -5406,6 +5406,152 @@ async fn start_cluster_inner(
     Ok(nodes)
 }
 
+/// Bind and start a whole **split-deployment** cluster in one process
+/// (`--cluster-control N --cluster-data M`): `control_n` control-only nodes
+/// (`Node::bind_control`/`BoundControlNode::start_control_with`, ADR 0035
+/// PR3) followed by `data_n` data-only nodes
+/// (`Node::bind_data`/`BoundDataNode::start_data_with`, ADR 0035 PR4) — no
+/// combined-mode node anywhere. The in-process, single-command counterpart of
+/// [`ClusterConfig::generate_split`] + `animusd control`/`animusd data`
+/// (real separate processes): same id/index convention (control-role
+/// indexes `0..control_n`, data-role indexes `control_n..control_n+data_n`,
+/// `config::control_id`/`config::raftkv_id` applied straight to those
+/// indexes) and same per-node `dir/node-{index}` subdirectory layout as
+/// [`bind_cluster`]/[`start_cluster_inner`], just role-split instead of every
+/// node being `Both`.
+///
+/// Every node gets its **own** [`ClusterEdgeState`] (ADR 0031 PR2 doctrine —
+/// never shared across the in-process cluster) and reaches every other node
+/// only through the same forwarding/relay/mirror paths a genuine
+/// one-process-per-node split deployment uses ([`BoundDataNode::start_data_with`]'s
+/// `ControlHandle::Remote`, `client_route`, `route_sync_loop`) — nothing here
+/// shortcuts cross-node reach through shared in-process state. `ip` binds
+/// every listener at an ephemeral port on that address (mirroring
+/// [`bind_cluster`]'s own `SocketAddr::new(ip, 0)` convention); `backend` and
+/// the two auto-split thresholds apply to the **data** nodes only (a
+/// control-only node hosts no storage engine to split).
+///
+/// # Errors
+/// Propagates any bind failure or a failure to open a data node's CP group
+/// engine (LSM backend only).
+pub async fn start_split_cluster_with(
+    control_n: usize,
+    data_n: usize,
+    dir: impl Into<PathBuf>,
+    ip: std::net::IpAddr,
+    backend: StorageBackend,
+    auto_split_threshold: Option<usize>,
+    auto_split_bytes_threshold: Option<u64>,
+) -> std::io::Result<Vec<Node>> {
+    let dir = dir.into();
+    let total = control_n + data_n;
+    let ephemeral = || SocketAddr::new(ip, 0);
+
+    let mut control_bound = Vec::with_capacity(control_n);
+    for i in 0..control_n {
+        let addrs = RoleAddrs {
+            role: config::NodeRole::Control,
+            control: Some(ephemeral()),
+            client: ephemeral(),
+            dynamo: ephemeral(),
+            cql: ephemeral(),
+            raftkv: None,
+            admin: ephemeral(),
+        };
+        control_bound.push(
+            Node::bind_control(config::control_id(i), addrs, dir.join(format!("node-{i}"))).await?,
+        );
+    }
+    let mut data_bound = Vec::with_capacity(data_n);
+    for i in control_n..total {
+        let addrs = RoleAddrs {
+            role: config::NodeRole::Data,
+            control: None,
+            client: ephemeral(),
+            dynamo: ephemeral(),
+            cql: ephemeral(),
+            raftkv: Some(ephemeral()),
+            admin: ephemeral(),
+        };
+        data_bound.push(
+            Node::bind_data(config::raftkv_id(i), addrs, dir.join(format!("node-{i}"))).await?,
+        );
+    }
+
+    let control_ids: Vec<NodeId> = (0..control_n).map(config::control_id).collect();
+
+    // Each role's own internal peer book, plus the union a data node's single
+    // `raftkv` env needs (its `heartbeat_loop` targets the control ids over
+    // that same env — `ClusterConfig::control_peer_book`'s doc explains why
+    // `raftkv_peer_book()` alone isn't enough).
+    let control_peer_book: BTreeMap<NodeId, SocketAddr> = control_bound
+        .iter()
+        .map(|b| (b.control_id, b.control_addr))
+        .collect();
+    let raftkv_peer_book: BTreeMap<NodeId, SocketAddr> = data_bound
+        .iter()
+        .map(|b| (b.raftkv_id, b.raftkv_addr))
+        .collect();
+    let mut data_env_peers = raftkv_peer_book;
+    data_env_peers.extend(control_peer_book.clone());
+
+    // Cross-node routing (ADR 0017 #3b / ADR 0013): every control id and
+    // every raftkv id resolves to its node's client API address, exactly like
+    // `run_node_control`/`run_node_data`'s per-process assembly.
+    let mut client_route: BTreeMap<NodeId, SocketAddr> = BTreeMap::new();
+    for b in &control_bound {
+        client_route.insert(b.control_id, b.client_addr);
+    }
+    for b in &data_bound {
+        client_route.insert(b.raftkv_id, b.client_addr);
+    }
+
+    // The control deployment's client addresses — the discovery root each
+    // data node's `ControlHandle::Remote` mirrors from.
+    let control_client_addrs: Vec<SocketAddr> =
+        control_bound.iter().map(|b| b.client_addr).collect();
+
+    // Every node's admin address, so each node's dashboard (ADR 0021) fans
+    // out to the whole split deployment.
+    let admin_addrs: Vec<SocketAddr> = control_bound
+        .iter()
+        .map(|b| b.admin_addr)
+        .chain(data_bound.iter().map(|b| b.admin_addr))
+        .collect();
+
+    let mut nodes = Vec::with_capacity(total);
+    for b in control_bound {
+        nodes.push(
+            b.start_control_with(
+                control_peer_book.clone(),
+                control_ids.clone(),
+                client_route.clone(),
+                admin_addrs.clone(),
+            )
+            .await,
+        );
+    }
+    for b in data_bound {
+        nodes.push(
+            b.start_data_with(
+                data_env_peers.clone(),
+                control_ids.clone(),
+                control_client_addrs.clone(),
+                backend,
+                // A fresh, node-local edge-state set per node — never shared
+                // (see the doc comment above).
+                ClusterEdgeState::new(),
+                client_route.clone(),
+                auto_split_threshold,
+                auto_split_bytes_threshold,
+                admin_addrs.clone(),
+            )
+            .await?,
+        );
+    }
+    Ok(nodes)
+}
+
 /// Start the single node at `index` in `config` (per-process deployment): bind
 /// this node's configured listeners, wire the cluster's peer address book from
 /// the config, and start its protocols with the durable on-disk [`LsmEngine`] CP

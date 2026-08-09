@@ -1,12 +1,13 @@
 //! AnimusDB node server (`animusd`).
 //!
-//! Seven modes:
+//! Eight modes:
 //!
 //! ```text
 //! animusd gen-config --nodes N [--host H] [--base-port P]   # print a combined-mode cluster config (JSON)
 //! animusd gen-config --control-nodes N --data-nodes M [--host H] [--base-port P] # print a split-deployment config (ADR 0035)
 //! animusd --config FILE --node I [--dir DIR] [--ephemeral] # run node I of a cluster (one process)
 //! animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B] # run an N-node cluster in one process
+//! animusd --cluster-control N --cluster-data M [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B] # run a whole split deployment in one process (ADR 0035)
 //! animusd join --seed ADDR[,ADDR...] --node I [--ip A] [--base-port P] [--dir D] [--ephemeral] # seed/join startup (ADR 0032 PR2)
 //! animusd control --config FILE --node I [--dir DIR] # run node I as a control-only node (ADR 0035 PR3)
 //! animusd data --config FILE --node I [--dir DIR] [--ephemeral] # run node I as a data-only node (ADR 0035 PR4)
@@ -39,6 +40,14 @@
 //! deployment (see `crates/animusd/CLAUDE.md`). A mixed deployment — some
 //! nodes still combined-mode (`--config FILE --node I` against a `Both`-role
 //! config) — keeps working exactly as before.
+//!
+//! `--cluster-control N --cluster-data M` is `--cluster N`'s split-deployment
+//! sibling: a whole split deployment (`N` control-only + `M` data-only
+//! nodes, no combined-mode node) in **one process**, dev-convenience the same
+//! way `--cluster N` is — the real multi-process shape is `animusd control`/
+//! `animusd data` above. Each node still gets its own edge state and reaches
+//! every other node only through real forwarding/relay/mirror paths, exactly
+//! as the multi-process deployment does.
 
 use std::net::{IpAddr, SocketAddr};
 use std::process::ExitCode;
@@ -99,6 +108,7 @@ const USAGE: &str = "usage:\n  \
     animusd gen-config --control-nodes N --data-nodes M [--host H] [--base-port P]\n  \
     animusd --config FILE --node I [--dir DIR] [--ephemeral]\n  \
     animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B]\n  \
+    animusd --cluster-control N --cluster-data M [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B]\n  \
     animusd join --seed ADDR[,ADDR...] --node I [--ip A] [--base-port P] [--dir D] [--ephemeral]\n  \
     animusd control --config FILE --node I [--dir DIR]\n  \
     animusd data --config FILE --node I [--dir DIR] [--ephemeral]\n  \
@@ -155,6 +165,8 @@ async fn run(args: &[String]) -> Result<(), String> {
     let mut config_path: Option<String> = None;
     let mut node: Option<usize> = None;
     let mut cluster: Option<usize> = None;
+    let mut cluster_control: Option<usize> = None;
+    let mut cluster_data: Option<usize> = None;
     let mut dir: Option<std::path::PathBuf> = None;
     let mut ip: IpAddr = "127.0.0.1".parse().unwrap();
     // Data replica engine: durable on-disk LSM by default; `--ephemeral` selects
@@ -177,6 +189,10 @@ async fn run(args: &[String]) -> Result<(), String> {
             "--config" => config_path = Some(parse_next(&mut it, "--config")?),
             "--node" => node = Some(parse_next(&mut it, "--node")?),
             "--cluster" => cluster = Some(parse_next(&mut it, "--cluster")?),
+            "--cluster-control" => {
+                cluster_control = Some(parse_next(&mut it, "--cluster-control")?)
+            }
+            "--cluster-data" => cluster_data = Some(parse_next(&mut it, "--cluster-data")?),
             "--dir" => dir = Some(parse_next::<String>(&mut it, "--dir")?.into()),
             "--ip" => ip = parse_next(&mut it, "--ip")?,
             "--ephemeral" => backend = animusd::StorageBackend::Memory,
@@ -186,6 +202,27 @@ async fn run(args: &[String]) -> Result<(), String> {
             }
             other => return Err(format!("unknown argument `{other}`")),
         }
+    }
+
+    if cluster_control.is_some() || cluster_data.is_some() {
+        if config_path.is_some() || cluster.is_some() {
+            return Err(
+                "use either --config, --cluster, or --cluster-control/--cluster-data, not both"
+                    .into(),
+            );
+        }
+        let control_n = cluster_control.ok_or("--cluster-data also needs --cluster-control N")?;
+        let data_n = cluster_data.ok_or("--cluster-control also needs --cluster-data M")?;
+        return run_in_process_split_cluster(
+            control_n,
+            data_n,
+            ip,
+            dir,
+            backend,
+            auto_split,
+            auto_split_bytes,
+        )
+        .await;
     }
 
     match (config_path, cluster) {
@@ -508,6 +545,74 @@ async fn run_in_process_cluster(
     for (i, node) in nodes.iter().enumerate() {
         println!(
             "  node {i}: client {} — dynamo http {} — cql {} — admin http://{}",
+            node.client_addr(),
+            node.dynamo_addr(),
+            node.cql_addr(),
+            node.admin_addr(),
+        );
+    }
+    println!("animusd: ready — Ctrl-C to stop");
+    wait_for_ctrl_c().await;
+    for node in &nodes {
+        node.shutdown_graceful().await;
+    }
+    Ok(())
+}
+
+/// In-process: run a whole split deployment (`control_n` control-only nodes
+/// and `data_n` data-only nodes, no combined-mode node) in one process — the
+/// `--cluster-control N --cluster-data M` dev-convenience sibling of
+/// `--cluster N` ([`run_in_process_cluster`]), backed by
+/// [`animusd::start_split_cluster_with`].
+async fn run_in_process_split_cluster(
+    control_n: usize,
+    data_n: usize,
+    ip: IpAddr,
+    dir: Option<std::path::PathBuf>,
+    backend: animusd::StorageBackend,
+    auto_split: Option<usize>,
+    auto_split_bytes: Option<u64>,
+) -> Result<(), String> {
+    if control_n == 0 || data_n == 0 {
+        return Err("--cluster-control and --cluster-data must each be at least 1".into());
+    }
+    let dir = dir.unwrap_or_else(|| std::env::temp_dir().join("animusd"));
+    let nodes = animusd::start_split_cluster_with(
+        control_n,
+        data_n,
+        &dir,
+        ip,
+        backend,
+        auto_split,
+        auto_split_bytes,
+    )
+    .await
+    .map_err(|e| format!("failed to start split cluster: {e}"))?;
+
+    match (auto_split, auto_split_bytes) {
+        (Some(k), Some(b)) => println!(
+            "animusd: started split cluster ({control_n} control + {data_n} data, CP) — auto-split at {k} keys or {b} bytes/tablet"
+        ),
+        (Some(k), None) => println!(
+            "animusd: started split cluster ({control_n} control + {data_n} data, CP) — auto-split at {k} keys/tablet"
+        ),
+        (None, Some(b)) => println!(
+            "animusd: started split cluster ({control_n} control + {data_n} data, CP) — auto-split at {b} bytes/tablet"
+        ),
+        (None, None) => {
+            println!("animusd: started split cluster ({control_n} control + {data_n} data, CP)")
+        }
+    }
+    for (i, node) in nodes.iter().take(control_n).enumerate() {
+        println!(
+            "  control node {i}: client {} — admin http://{}",
+            node.client_addr(),
+            node.admin_addr(),
+        );
+    }
+    for (i, node) in nodes.iter().skip(control_n).enumerate() {
+        println!(
+            "  data node {i}: client {} — dynamo http {} — cql {} — admin http://{}",
             node.client_addr(),
             node.dynamo_addr(),
             node.cql_addr(),

@@ -108,6 +108,32 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   see its own "What's non-obvious" entry below.
 - `bind_cluster` / `start_cluster` — spin up an in-process cluster (the binary's
   `--cluster N` mode and `tests/cluster.rs`).
+- **`start_split_cluster_with` — the in-process, single-command counterpart of
+  a genuine split deployment (`animusd --cluster-control N --cluster-data M`,
+  symmetric with `--cluster N`).** Binds `control_n` control-only nodes
+  (`Node::bind_control`/`BoundControlNode::start_control_with`) followed by
+  `data_n` data-only nodes (`Node::bind_data`/`BoundDataNode::start_data_with`)
+  in one process — no combined-mode node anywhere — each with its own
+  `ClusterEdgeState` (ADR 0031 PR2 doctrine: never shared), the same
+  `dir/node-{index}` layout and control/raftkv id convention (`config::
+  control_id`/`config::raftkv_id` over indexes `0..control_n` then
+  `control_n..control_n+data_n`) `bind_cluster`/`ClusterConfig::generate_split`
+  already establish. Every data node's `raftkv` env peer book is the union of
+  the control and raftkv peer books (`ClusterConfig::control_peer_book`'s doc
+  explains why `raftkv_peer_book()` alone isn't enough — `heartbeat_loop`
+  targets the control ids over that same env); `backend` and both auto-split
+  thresholds apply to the data nodes only. `tests/cluster_split.rs` is the
+  in-process regression (`animusd control`/`animusd data` real-process split
+  is `tests/split_cluster.rs`'s job instead) — its one flake during
+  development is worth recording: a write issued through a single **fixed**
+  control-only node's client address hit the documented "zero-replica
+  blind-forward" hazard (root `CLAUDE.md`) intermittently under
+  `cargo test`'s parallel load — a control node forwards to *some* known
+  replica of the tablet, not necessarily its leader, and can retry the same
+  non-leader forever. Fixed by round-robining the control addresses (with the
+  data addresses as fallback) instead of asserting through one fixed
+  no-replica node, the same fix shape `tests/cluster_growth.rs`/
+  `tests/seed_join.rs` already use for this exact hazard.
 - `run_node_growth` — start a node as an ADR 0030 **growth member** from an
   operator-assembled *expanded* config (its control role is a permanent
   non-voter of the pre-growth control group; `start_with` detects this and
