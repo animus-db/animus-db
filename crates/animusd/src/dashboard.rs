@@ -1,6 +1,9 @@
 //! The AnimusDB Console (ADR 0021): a self-contained single-page app served
 //! from the admin port for manual cluster testing and operation — Overview,
-//! Placement, Tablets, Data Browser, and Storage.
+//! Placement, Tablets, Data Browser, and Storage. ADR 0035 PR7 adds a sixth
+//! view, Node, and gates which views are shown on this node's own role
+//! (control/data/combined, `admin.rs::config_view`'s `role` field) — see
+//! `dashboard_core.js`'s `ROLE_TABS`.
 //!
 //! It is embedded in the binary (`include_str!`) and served verbatim as
 //! `text/html`/`text/css`/`text/javascript` by [`crate::admin`]; it is a pure
@@ -17,9 +20,9 @@
 //! (`admin.rs::static_asset`) instead of inlined in one document. `CORE_JS`
 //! holds shared state/fetch/routing/theme/data-derivation utilities every
 //! other module depends on; `OVERVIEW_JS`/`PLACEMENT_JS`/`TABLETS_JS`/
-//! `BROWSER_JS`/`STORAGE_JS` are the five views' own render logic, loaded in
-//! that order (each may call functions defined earlier, since plain
-//! `<script src>` tags share one global scope).
+//! `BROWSER_JS`/`STORAGE_JS`/`NODE_JS` are the six views' own render logic,
+//! loaded in that order (each may call functions defined earlier, since
+//! plain `<script src>` tags share one global scope).
 //!
 //! Read-only mostly — Data Browser and Storage's bulk-seed carry real
 //! mutations; the ADR 0020 gated operator actions (split/flush/compact/
@@ -45,3 +48,9 @@ pub(crate) const BROWSER_JS: &str = include_str!("dashboard_browser.js");
 /// debug tools (not part of the source design, preserved from the
 /// pre-redesign dashboard so no capability is lost).
 pub(crate) const STORAGE_JS: &str = include_str!("dashboard_storage.js");
+/// The Node view (ADR 0035 PR7): a data-only node's dedicated page — its own
+/// identity/health/control-plane mirror status, hosted tablets, a
+/// node-scoped storage debug panel, and a link to a reachable
+/// control/combined node's Console. Shown instead of the cluster Console on
+/// a data-only node, and appended after it on a combined node.
+pub(crate) const NODE_JS: &str = include_str!("dashboard_node.js");

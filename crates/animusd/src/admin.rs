@@ -230,6 +230,7 @@ fn static_asset(path: &str) -> Option<(&'static str, &'static str)> {
         "/admin/ui/dashboard_tablets.js" => Some((JS, crate::dashboard::TABLETS_JS)),
         "/admin/ui/dashboard_browser.js" => Some((JS, crate::dashboard::BROWSER_JS)),
         "/admin/ui/dashboard_storage.js" => Some((JS, crate::dashboard::STORAGE_JS)),
+        "/admin/ui/dashboard_node.js" => Some((JS, crate::dashboard::NODE_JS)),
         _ => None,
     }
 }
@@ -392,6 +393,26 @@ fn raft_view(ctx: &ClientCtx) -> Value {
         "log_len": r.log_len(),
         "voters": r.config().into_iter().collect::<Vec<_>>(),
         "members": members,
+        // ADR 0035 PR7: this handle's control-plane mirror status — the one
+        // thing a genuine control-group voter (`ControlHandle::Local`) can't
+        // show here (its own Raft state above already *is* the ground truth,
+        // no mirror involved), but the only window a data-only node
+        // (`ControlHandle::Remote`, no local `RaftCore` at all) has onto how
+        // caught-up its view of `Metadata` is. `watermark` is this handle's
+        // own applied-index watch (`Local`: effectively its own
+        // `last_applied`; `Remote`: the last `Status`/`WatchMetadata` reply's
+        // watermark, ADR 0035 §1/§5). `leader_hint` is the control-plane
+        // leader's client-API address if directly known (always `null` for
+        // `Local`, which resolves a leader's address via `route_addr`
+        // instead — see `ControlHandle::leader_addr_hint`'s doc). `has_synced`
+        // is whether this handle's mirror has ever synced at least once
+        // (always `false` for `Local`; its own `last_applied()` above already
+        // tells that story for it).
+        "control_mirror": {
+            "watermark": r.metadata_watch().latest(),
+            "leader_hint": r.leader_addr_hint().map(|a| a.to_string()),
+            "has_synced": r.has_synced_metadata(),
+        },
     })
 }
 

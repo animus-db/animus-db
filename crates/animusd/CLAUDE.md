@@ -1105,13 +1105,15 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
     carries **CORS** (`http::CORS_HEADERS`; an `OPTIONS` preflight returns 204)
     because the page loaded from one node fans out in the browser to **every**
     node. The fan-out seed is **`GET /admin/peers`**.
-    **Shell: a sidebar, not a top tab row** (`dashboard.html`) — five views,
-    `overview`/`placement`/`tablets`/`browser`/`storage` (`TABS` in
-    `dashboard_core.js`), each with its own JS module
+    **Shell: a sidebar, not a top tab row** (`dashboard.html`) — six views,
+    `overview`/`placement`/`tablets`/`browser`/`storage`/`node` (the mutable
+    `TABS` in `dashboard_core.js`, recomputed per this node's own role — see
+    the ADR 0035 PR7 entry below), each with its own JS module
     (`dashboard_overview.js`/`dashboard_placement.js`/`dashboard_tablets.js`/
-    `dashboard_browser.js`/`dashboard_storage.js`, loaded after `dashboard_core.js`
-    in that order — plain `<script src>` tags sharing one global scope, so later
-    files call earlier ones' functions freely). **Each view keeps a real URL**
+    `dashboard_browser.js`/`dashboard_storage.js`/`dashboard_node.js`, loaded
+    after `dashboard_core.js` in that order — plain `<script src>` tags
+    sharing one global scope, so later files call earlier ones' functions
+    freely). **Each view keeps a real URL**
     (ADR 0021 follow-up 7): `/admin/ui/<tab>`, `admin.rs::is_ui_path` prefix-serving
     the SPA for any path under it (an unrecognized tab 200s and falls back to
     the default client-side, so a stale bookmark degrades gracefully); the page
@@ -1224,6 +1226,80 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
       per-node degrade signal to begin with, so point (c) of the review
       ("don't read a data node's non-leadership as degraded") was already
       satisfied by the existing design; verified, not changed.
+    - **Role-gated dashboards (ADR 0035 PR7): every node still serves the
+      identical SPA shell/assets (`admin.rs::static_asset`/`is_ui_path` are
+      unchanged), but which tabs a node's own page shows is gated on ITS OWN
+      role, not a cluster-wide property.** PR6 made the dashboard *render* a
+      split deployment correctly; PR7 makes each node's page *match* what it
+      actually is, instead of every node — including a data-only node with
+      no control-plane Raft state and, being a single node, nothing to
+      place/balance — showing the same five cluster-wide tabs
+      (Overview/Placement/Tablets/Storage) it can't usefully serve. A
+      control-only or combined node's page is byte-for-byte unchanged
+      (`ROLE_TABS.control`/`ROLE_TABS.combined` both start with the original
+      five, in the original order, so the default tab stays "overview"); a
+      data-only node gets a sixth view, **Node** (`dashboard_node.js`),
+      instead: this node's own identity/health, control-plane mirror status,
+      hosted tablets (its own `/admin/raftkv`), a storage-debug panel scoped
+      to just this node (no node dropdown — there's only one node in scope,
+      unlike the Storage tab's cluster-wide picker, so this is a trimmed
+      local variant of `dashboard_storage.js`'s WAL/LSM/key/scan panels
+      rather than a shared helper, since those functions are wired to
+      specific `st-tablet`/`st-node` DOM ids a second concurrent instance
+      can't reuse without ID collisions), and a link to a reachable
+      control/combined node's Console. `ROLE_TABS.data = ["node",
+      "browser"]` — Data Browser stays available (browsing your own data
+      edge is node-dedicated UX), everything else is hidden. A combined node
+      gets **all six**, Node appended last (it's also a data node).
+      **Gating is entirely client-side** (`dashboard_core.js`'s
+      `applyRoleGating`, hiding/showing `.sidebar button.navlink` elements
+      and recomputing the mutable `TABS` list `tabFromPath`/`activateTab`
+      already read) — the shell always contains every section; a role just
+      controls which ones are reachable, so a role-inappropriate deep link
+      (e.g. `/admin/ui/placement` loaded directly on a data-only node) falls
+      back to that role's own default tab (`TABS[0]`) via the same
+      unknown-tab fallback `tabFromPath` already had, rather than 404ing or
+      going blank.
+      **One backend addition**: `/admin/raft`'s `control_mirror` object
+      (`watermark`, `leader_hint`, `has_synced`) — a data node has no
+      cluster-wide state of its own to show, so "is my view of the control
+      plane caught up, and who does it think leads" is the one genuinely
+      new fact the Node view needed that no existing endpoint surfaced.
+      Every field is a direct passthrough of a `ControlHandle` accessor
+      that ADR 0035 PR4/PR5 already built for the `Remote` variant
+      (`metadata_watch().latest()`, `leader_addr_hint()`,
+      `has_synced_metadata()`) — grepping for the mechanism before adding
+      anything found it was all already there, just never read by any
+      client; the fix was three lines in `raft_view()`, not a new
+      subsystem. For a `Local` handle (a control-only or combined node,
+      which IS a control-plane voter) the same fields degrade to their
+      honest values (`leader_hint: null`, `has_synced: false`) — there is no
+      mirror for a voter to be "synced" against, its own Raft state above
+      already is the ground truth, and the Node view's own copy says so
+      explicitly rather than showing a misleading "not synced" pill.
+      **The role probe is deliberately split from the cluster-wide
+      fan-out**: `loadSelf()` fetches only this node's own `/admin/config`/
+      `/admin/raft`/`/admin/raftkv`/`/admin/health` (never a peer), so
+      resolving the role and gating the sidebar can never stall on a
+      slow/unreachable OTHER node the way the existing `/admin/peers`-seeded
+      fan-out in `loadAll()` can — `loadAll()` calls `loadSelf()` first,
+      then proceeds to the slower cluster-wide fetch exactly as before. The
+      "Open cluster console" link's discovery reuses that SAME cluster-wide
+      fan-out's `STATE.nodes` (each entry already carries `config.role` from
+      the existing per-node `/admin/config` fetch) to find a reachable
+      control/combined node — **no second probe was written**, since the
+      fan-out the dashboard already performs for every other view already
+      contains the answer; see the root `CLAUDE.md`'s matching
+      engineering-practices entry on checking existing fan-out data before
+      adding a new discovery probe.
+      `tests/dashboard_endpoint.rs::dashboard_role_gating_split_deployment`
+      (reusing `tests/support::bring_up_split`) proves both roles serve the
+      same shell + `dashboard_node.js`, asserts the gating markers against
+      `dashboard_core.js`/`dashboard_node.js` (not the shell — this file's
+      own documented "assert against the asset that carries the behavior"
+      lesson), asserts `/admin/config`'s `role` differs across the split,
+      and polls the data-only node's `/admin/raft` until `control_mirror.
+      has_synced` goes true.
     - **Displayed keys show the partition token as unpadded base64url**
       (`admin.rs::key_display`): a wire-edge/seeder key is `token || escape(pk) ||
       rk` (ADR 0022), and the leading `TOKEN_BYTES` are a **binary** Murmur3 token
