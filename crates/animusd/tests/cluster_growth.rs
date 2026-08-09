@@ -33,15 +33,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
-const TABLES: [&str; 3] = ["grow0", "grow1", "grow2"];
+mod support;
 
-/// Reserve `count` free loopback ports (bind :0, read addr, release).
-fn free_addrs(count: usize) -> Vec<SocketAddr> {
-    let ls: Vec<std::net::TcpListener> = (0..count)
-        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
-        .collect();
-    ls.iter().map(|l| l.local_addr().unwrap()).collect()
-}
+const TABLES: [&str; 3] = ["grow0", "grow1", "grow2"];
 
 /// Bring up the **initial** `n`-node cluster, one process per node, retrying the
 /// (allocate-fresh-ports + start-all) as a unit — the documented port-TOCTOU
@@ -49,7 +43,7 @@ fn free_addrs(count: usize) -> Vec<SocketAddr> {
 /// real bind).
 async fn bring_up(n: usize, dir: &std::path::Path) -> (Vec<Node>, ClusterConfig) {
     for attempt in 0..16 {
-        let addrs = free_addrs(n * 6);
+        let addrs = support::free_addrs(n * 6);
         let nodes_cfg: Vec<RoleAddrs> = (0..n)
             .map(|i| RoleAddrs {
                 role: animusd::config::NodeRole::Both,
@@ -98,7 +92,7 @@ async fn grow(
     let original_control_ids = base.control_ids();
     let base_n = base.nodes.len();
     for attempt in 0..16 {
-        let addrs = free_addrs(extra * 6);
+        let addrs = support::free_addrs(extra * 6);
         let mut nodes_cfg = base.nodes.clone();
         for i in 0..extra {
             nodes_cfg.push(RoleAddrs {

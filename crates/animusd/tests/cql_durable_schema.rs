@@ -16,12 +16,10 @@
 //!
 //! Like the other `animusd` tests it uses real TCP/time and polls with timeouts.
 
-use std::net::SocketAddr;
-use std::path::Path;
 use std::time::Duration;
 
 use animus_cql::frame::{self, Frame, Opcode, REQUEST_VERSION};
-use animusd::{ClusterConfig, Node, RoleAddrs};
+use animusd::{Node, StorageBackend};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
@@ -140,28 +138,6 @@ fn parse_rows(body: &[u8]) -> Vec<Vec<Option<Vec<u8>>>> {
 
 // --- node lifecycle helpers (shared shape with durable_restart.rs) ----------
 
-fn fixed_addrs(count: usize) -> Vec<SocketAddr> {
-    let listeners: Vec<std::net::TcpListener> = (0..count)
-        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
-        .collect();
-    listeners.iter().map(|l| l.local_addr().unwrap()).collect()
-}
-
-fn single_node_config() -> ClusterConfig {
-    let a = fixed_addrs(6);
-    ClusterConfig {
-        nodes: vec![RoleAddrs {
-            role: animusd::config::NodeRole::Both,
-            control: Some(a[0]),
-            client: a[1],
-            dynamo: a[2],
-            cql: a[3],
-            raftkv: Some(a[4]),
-            admin: a[5],
-        }],
-    }
-}
-
 async fn await_bootstrap(node: &Node) {
     let ready = async {
         loop {
@@ -182,36 +158,13 @@ async fn stop(node: Node) {
     sleep(Duration::from_millis(200)).await;
 }
 
-/// Start a single node, retrying with **fresh ephemeral ports** on a bind/startup
-/// failure. `fixed_addrs` binds `:0`, reads the addr, then drops the listener —
-/// under `cargo test --workspace` (many test binaries in parallel) another binder
-/// can steal a freed port in that TOCTOU window, so the subsequent `run_node`
-/// rebind intermittently fails with `AddrInUse`. Retrying with a brand-new config
-/// makes the first bring-up robust. Returns the started `Node` **and** the
-/// `ClusterConfig` it actually bound, so a restart-style test can reuse the same
-/// addresses (its reuse window is tiny and acceptable).
-async fn start_single_node(dir: &Path) -> (Node, ClusterConfig) {
-    let mut last_err = None;
-    for attempt in 0..10 {
-        let config = single_node_config();
-        match animusd::run_node(&config, 0, dir).await {
-            Ok(node) => return (node, config),
-            Err(e) => {
-                last_err = Some(e);
-                sleep(Duration::from_millis(50 * (attempt + 1))).await;
-            }
-        }
-    }
-    panic!("single node failed to start after 10 attempts: {last_err:?}");
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cql_schema_and_row_survive_node_restart() {
     let dir = tempfile::TempDir::new().unwrap();
     let node_dir = dir.path().join("node-0");
 
     // --- First incarnation: CREATE TABLE (replicated) + INSERT a row. ---
-    let (node, config) = start_single_node(&node_dir).await;
+    let (node, config) = support::start_single_node(&node_dir, StorageBackend::default()).await;
     let cql_addr = config.nodes[0].cql;
     await_bootstrap(&node).await;
 
@@ -295,7 +248,8 @@ async fn cql_schema_and_row_survive_node_restart() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cql_batch_alter_drop_surface() {
     let dir = tempfile::TempDir::new().unwrap();
-    let (node, config) = start_single_node(&dir.path().join("node-0")).await;
+    let (node, config) =
+        support::start_single_node(&dir.path().join("node-0"), StorageBackend::default()).await;
     let cql_addr = config.nodes[0].cql;
     await_bootstrap(&node).await;
 

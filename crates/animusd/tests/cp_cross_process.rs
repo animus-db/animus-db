@@ -21,6 +21,8 @@ use animusd::{
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
+mod support;
+
 const CP_TABLE: &str = "cp_t";
 
 async fn call(addr: SocketAddr, req: ClientRequest) -> ClientResponse {
@@ -32,21 +34,13 @@ async fn call(addr: SocketAddr, req: ClientRequest) -> ClientResponse {
         .expect("a reply")
 }
 
-/// Reserve `count` free loopback ports (bind :0, read addr, release).
-fn free_addrs(count: usize) -> Vec<SocketAddr> {
-    let ls: Vec<std::net::TcpListener> = (0..count)
-        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
-        .collect();
-    ls.iter().map(|l| l.local_addr().unwrap()).collect()
-}
-
 /// Bring up `n` per-process nodes (each via `run_node`, so each has its own edge
 /// state), wrapped in the documented **port-TOCTOU retry**: `free_addrs` releases
 /// the probed ports before `run_node` rebinds them, so a concurrent test binary can
 /// steal one — re-allocate fresh ports and retry the whole bring-up as a unit.
 async fn bring_up(n: usize, dir: &std::path::Path) -> (Vec<Node>, animusd::ClusterConfig) {
     for attempt in 0..16 {
-        let addrs = free_addrs(n * 6);
+        let addrs = support::free_addrs(n * 6);
         let nodes_cfg: Vec<animusd::RoleAddrs> = (0..n)
             .map(|i| animusd::RoleAddrs {
                 role: animusd::config::NodeRole::Both,

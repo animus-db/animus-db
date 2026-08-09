@@ -28,6 +28,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
+mod support;
+
 /// Several tables, mirroring `tests/seed_join.rs`'s `TABLES`: rebalancing
 /// (ADR 0029) only ever proposes a move while it improves the *global*
 /// imbalance and stops once `max - min <= 1`, so with just one table/tablet a
@@ -35,21 +37,11 @@ use tokio::time::{sleep, timeout};
 /// independent tablets raise the odds that at least one lands on it.
 const TABLES: [&str; 3] = ["decomm0", "decomm1", "decomm2"];
 
-/// Reserve `count` free loopback ports (bind :0, read addr, release) — the
-/// documented port-TOCTOU-tolerant pattern every `animusd` integration test
-/// bring-up uses.
-fn free_addrs(count: usize) -> Vec<SocketAddr> {
-    let ls: Vec<std::net::TcpListener> = (0..count)
-        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
-        .collect();
-    ls.iter().map(|l| l.local_addr().unwrap()).collect()
-}
-
 /// Bring up the initial `n`-node config core, one process per node, retrying
 /// the (allocate-fresh-ports + start-all) as a unit (port-TOCTOU mitigation).
 async fn bring_up(n: usize, dir: &Path) -> (Vec<Node>, ClusterConfig) {
     for attempt in 0..16 {
-        let addrs = free_addrs(n * 6);
+        let addrs = support::free_addrs(n * 6);
         let nodes_cfg: Vec<RoleAddrs> = (0..n)
             .map(|i| RoleAddrs {
                 role: animusd::config::NodeRole::Both,
@@ -110,7 +102,7 @@ async fn join_fresh(
     backend: StorageBackend,
 ) -> (Node, RoleAddrs, PathBuf) {
     for attempt in 0..16 {
-        let raw = free_addrs(6);
+        let raw = support::free_addrs(6);
         let addrs = RoleAddrs {
             role: animusd::config::NodeRole::Both,
             control: Some(raw[0]),

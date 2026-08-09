@@ -17,10 +17,9 @@
 //! (the ProdEnv edge).
 
 use std::net::SocketAddr;
-use std::path::Path;
 use std::time::Duration;
 
-use animusd::{ClientRequest, ClientResponse, ClusterConfig, Node, RoleAddrs, StorageBackend};
+use animusd::{ClientRequest, ClientResponse, Node, StorageBackend};
 use tempfile::TempDir;
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
@@ -50,58 +49,6 @@ async fn await_bootstrap(node: &Node) {
         .expect("node did not bootstrap in 20s");
 }
 
-/// Reserve `count` free TCP ports on loopback (bind to :0, read the addr, then
-/// release). The restarted node must rebind these exact addresses, which is the
-/// point of the test.
-fn fixed_addrs(count: usize) -> Vec<SocketAddr> {
-    let listeners: Vec<std::net::TcpListener> = (0..count)
-        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
-        .collect();
-    listeners.iter().map(|l| l.local_addr().unwrap()).collect()
-    // listeners dropped here, freeing the ports for the node to bind.
-}
-
-/// A single-node config pinned to fixed addresses, so the same config can start,
-/// stop, and restart the same node.
-fn single_node_config() -> ClusterConfig {
-    let a = fixed_addrs(6);
-    ClusterConfig {
-        nodes: vec![RoleAddrs {
-            role: animusd::config::NodeRole::Both,
-            control: Some(a[0]),
-            client: a[1],
-            dynamo: a[2],
-            cql: a[3],
-            raftkv: Some(a[4]),
-            admin: a[5],
-        }],
-    }
-}
-
-/// Start a single node, retrying with **fresh ephemeral ports** on a bind/startup
-/// failure. `fixed_addrs` binds `:0`, reads the addr, then drops the listener —
-/// under `cargo test --workspace` (many test binaries in parallel) another binder
-/// can steal a freed port in that TOCTOU window, so the subsequent `run_node`
-/// rebind intermittently fails with `AddrInUse`. Retrying with a brand-new config
-/// makes the first bring-up robust. Returns the started `Node` **and** the
-/// `ClusterConfig` it actually bound, so the restart can reuse the same addresses
-/// (the restart's own rebind window is ridden out by
-/// `support::restart_same_addrs`).
-async fn start_single_node(dir: &Path, backend: StorageBackend) -> (Node, ClusterConfig) {
-    let mut last_err = None;
-    for attempt in 0..10 {
-        let config = single_node_config();
-        match animusd::run_node_with(&config, 0, dir, backend).await {
-            Ok(node) => return (node, config),
-            Err(e) => {
-                last_err = Some(e);
-                sleep(Duration::from_millis(50 * (attempt + 1))).await;
-            }
-        }
-    }
-    panic!("single node failed to start after 10 attempts: {last_err:?}");
-}
-
 /// Stop a node cleanly and give the OS a moment to release its now-aborted
 /// listeners' ports, so the replacement can rebind the same addresses.
 async fn stop(node: Node) {
@@ -116,7 +63,7 @@ async fn data_survives_node_restart_on_disk() {
     let node_dir = dir.path().join("node-0");
 
     // --- First incarnation: write a durable key, then shut down cleanly. ---
-    let (node, config) = start_single_node(&node_dir, StorageBackend::default()).await;
+    let (node, config) = support::start_single_node(&node_dir, StorageBackend::default()).await;
     let client = config.nodes[0].client;
     await_bootstrap(&node).await;
 
@@ -210,7 +157,7 @@ async fn acked_write_survives_memory_backend_restart_via_raft_wal() {
     let dir = TempDir::new().unwrap();
     let node_dir = dir.path().join("node-0");
 
-    let (node, config) = start_single_node(&node_dir, StorageBackend::Memory).await;
+    let (node, config) = support::start_single_node(&node_dir, StorageBackend::Memory).await;
     let client = config.nodes[0].client;
     await_bootstrap(&node).await;
 
