@@ -589,6 +589,21 @@ pub enum ClientRequest {
     /// this repo's pre-alpha stance, so no version negotiation is needed for
     /// an older peer that predates it.
     JoinInfo,
+    /// **Long-poll metadata watch** (ADR 0035 PR5): park on the answering
+    /// node's own [`animus_control::MetadataWatch`] for up to
+    /// [`WATCH_METADATA_SERVER_TIMEOUT`] and reply once it advances past
+    /// `last_seen` **or** the bound elapses (a normal, not-an-error outcome —
+    /// the caller just retries with the same `last_seen`, exactly like a
+    /// `Status` poll that happened not to see a change). Replaces the old
+    /// fixed-[`REMOTE_METADATA_SYNC_INTERVAL`] poll a data-only node's mirror
+    /// sync used, closing most of the latency gap between "control commits"
+    /// and "data node observes it" without a new push mechanism. Only a
+    /// genuine control-group replica (`ControlHandle::Local`) serves this —
+    /// see [`ClientCtx::watch_metadata`]'s doc for why a `Remote` node
+    /// rejects it instead of degrading. Replies with the same
+    /// [`ClientResponse::Status`] shape a plain `Status` request gets,
+    /// carrying the watermark to pass back as the next call's `last_seen`.
+    WatchMetadata { last_seen: u64 },
 }
 
 /// Whether `command` may be **relayed to the control leader** via
@@ -677,12 +692,21 @@ pub enum ClientResponse {
     /// 0035 PR4 needs from one reply: `ControlHandle::Remote`'s `leader()`/
     /// `leader_addr_hint()`, `metadata_fresh`'s leader-directed retry target,
     /// and an efficient `propose_schema` relay (no extra `route_addr` hop).
-    /// `#[serde(default)]` so an older node's reply (predating this field)
-    /// still parses, decoding to `None`.
+    /// `#[serde(default)]` so an older node's reply (predating either field)
+    /// still parses, decoding to `None`/`0`.
+    ///
+    /// **`watermark` (ADR 0035 PR5)**: the answering node's own applied-index
+    /// watch (`ControlHandle::metadata_watch().latest()`) at reply time — the
+    /// value a caller passes back as the next
+    /// [`ClientRequest::WatchMetadata`]'s `last_seen`, and the monotonic
+    /// freshness proxy [`control_handle::RemoteControlClient::observe`] uses
+    /// to reject a reply from a replica lagging behind one it already saw.
     Status {
         metadata: Metadata,
         #[serde(default)]
         leader_hint: Option<(NodeId, SocketAddr)>,
+        #[serde(default)]
+        watermark: u64,
     },
     /// A write reached its quorum.
     PutOk,
@@ -2434,15 +2458,14 @@ impl ClientCtx {
     ///
     /// **Use this, not `self.control.metadata_cached()` directly, for anything
     /// that must work on a growth node**: CP routing (`tablet_for`/
-    /// `resolve_cp_route`), the per-node join-host/reconfigure loops, this
-    /// node's own address-registration commit check, the raftkv peer-sync
-    /// loop, and (ADR 0035 PR1) the general-purpose schema-catalog reads
-    /// (`table_schema`/`has_table_schema`) the CQL/DynamoDB wire edges use for
+    /// `resolve_cp_route`/`cp_scan`), the per-node join-host/reconfigure loops,
+    /// this node's own address-registration commit check, the raftkv peer-sync
+    /// loop, the split/merge triggers' precondition reads, and (ADR 0035 PR1)
+    /// the general-purpose schema-catalog reads (`table_schema`/
+    /// `has_table_schema`, and — since the PR5 staleness audit closed the gap
+    /// PR1 flagged — `has_keyspace` too) the CQL/DynamoDB wire edges use for
     /// everything except their own commit-wait polls (see
-    /// [`metadata_fresh`](Self::metadata_fresh) for those). `has_keyspace` is
-    /// **not** switched — a growth node is not expected to serve DDL locally
-    /// in this v1 slice (ADR 0030); route schema operations through an
-    /// original control node.
+    /// [`metadata_fresh`](Self::metadata_fresh) for those).
     fn effective_metadata(&self) -> Metadata {
         if let Some(meta) = self
             .remote_metadata
@@ -2477,6 +2500,44 @@ impl ClientCtx {
     /// [`ControlHandle::metadata_fresh`]'s doc.
     async fn metadata_fresh(&self) -> Metadata {
         self.control.metadata_fresh().await
+    }
+
+    /// Serve a long-poll [`ClientRequest::WatchMetadata`] (ADR 0035 PR5):
+    /// park on this node's own [`ControlHandle::metadata_watch`] for up to
+    /// [`WATCH_METADATA_SERVER_TIMEOUT`], then reply with whatever `Metadata`
+    /// is current — either because it genuinely advanced past `last_seen`,
+    /// or because the bound elapsed with nothing new (a normal outcome, not
+    /// an error; the caller just retries with the same `last_seen`, exactly
+    /// like a `Status` poll that happened not to observe a change).
+    ///
+    /// Only a genuine control-group replica (`ControlHandle::Local`) can
+    /// serve this. A `Remote` data-only node **rejects** it instead of
+    /// degrading: its own `ControlHandle::metadata_watch()` is itself driven
+    /// by replies to *this exact request* (see
+    /// [`control_handle::RemoteControlClient`]'s doc), so serving it here
+    /// would only let a misdirected watch (e.g. a stale `client_route` entry
+    /// pointing at a data node instead of a control node) degrade silently to
+    /// an effective ~[`WATCH_METADATA_SERVER_TIMEOUT`]-second poll — worse
+    /// than the pre-PR5 fixed-interval poll, not better. Rejecting fails the
+    /// misdirected watch fast instead.
+    pub(crate) async fn watch_metadata(&self, last_seen: u64) -> ClientResponse {
+        if matches!(self.control, ControlHandle::Remote(_)) {
+            return ClientResponse::Error(
+                "this node has no local control-plane watch to serve (ADR 0035 data-only node); \
+                 watch a control-plane node instead"
+                    .into(),
+            );
+        }
+        let watch = self.control.metadata_watch();
+        tokio::select! {
+            _ = watch.changed(last_seen) => {}
+            () = tokio::time::sleep(WATCH_METADATA_SERVER_TIMEOUT) => {}
+        }
+        ClientResponse::Status {
+            metadata: self.effective_metadata(),
+            leader_hint: self.control_leader_hint(),
+            watermark: watch.latest(),
+        }
     }
 
     /// The client-API address `id` currently routes to, if known (ADR 0032
@@ -3133,9 +3194,16 @@ impl ClientCtx {
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
         // The table's tablets overlapping [start, end), in token (range.start) order.
         // `end == None` is unbounded above (a whole-table scan).
+        //
+        // `effective_metadata()`, not `self.control.metadata_cached()`
+        // directly (ADR 0035 PR5 staleness-audit fix): the latter is
+        // permanently empty on a control-plane-follower-less growth node
+        // (ADR 0030), which would silently compute zero overlapping ranges
+        // and make `cp_scan` return an empty result forever on such a
+        // node — the exact staleness class `cp_put`/`cp_get`/`cp_batch_write`'s
+        // `has_table_tablet` gate already guards against, just missed here.
         let mut ranges: Vec<KeyRange> = self
-            .control
-            .metadata_cached()
+            .effective_metadata()
             .tablets_for_table(table)
             .map(|(_, t)| t.range.clone())
             .filter(|r| {
@@ -3721,14 +3789,22 @@ impl ClientCtx {
     /// returns an error and the operator retries on the leader). Preserves the
     /// member's existing labels. Returns the accepted state or an error.
     pub(crate) fn admin_drain(&self, node: NodeId) -> Result<(), String> {
+        // Check leadership BEFORE reading `self.control.metadata_cached()`
+        // for the member lookup below (ADR 0035 PR5 staleness-audit fix,
+        // mirroring `admin_remove_member`'s already-fixed ordering — same
+        // reasoning: a follower's own replica can lag the leader's
+        // just-committed membership state under load, so evaluating "is this
+        // a member" off a follower's stale view can misfire as "not a
+        // cluster member" instead of the intended "retry on the leader"
+        // routing error).
+        let Some(leader) = self.edge.leader_handle() else {
+            return Err(self.not_leader_error());
+        };
         let meta = self.control.metadata_cached();
         let Some(member) = meta.members.get(&node) else {
             return Err(format!("node {node} is not a cluster member"));
         };
         let labels = member.labels.clone();
-        let Some(leader) = self.edge.leader_handle() else {
-            return Err(self.not_leader_error());
-        };
         match leader.propose(MetaCommand::UpsertMember {
             node,
             labels,
@@ -4013,54 +4089,149 @@ async fn route_sync_loop(ctx: ClientCtx, static_route: BTreeMap<NodeId, SocketAd
 /// mirror of the real cluster's `Metadata` — see [`remote_metadata_sync_loop`].
 /// Brisk, matching [`PEER_SYNC_INTERVAL`]'s cadence: the mirror gates the same
 /// kind of "did my own registration land yet" / "was I placed on a tablet yet"
-/// polling loops that read it.
+/// polling loops that read it. **Not** used by an ADR 0035 PR4 data-only
+/// node's mirror sync anymore (PR5) — that now long-polls, see
+/// [`remote_metadata_watch_loop`].
 const REMOTE_METADATA_SYNC_INTERVAL: Duration = Duration::from_millis(200);
 
-/// Mirror the real cluster's replicated `Metadata` by periodically polling
-/// `ClientRequest::Status` against one of `seeds` — **generalized (ADR 0035
+/// Upper bound the serving node parks on its own [`animus_control::MetadataWatch`]
+/// before replying to a [`ClientRequest::WatchMetadata`] anyway with whatever
+/// `Metadata` is current (ADR 0035 PR5) — see [`ClientCtx::watch_metadata`]'s
+/// doc. Bounded so a long-poll connection never ties up a serving task (or a
+/// caller's own connection) forever when nothing changes, and short enough
+/// that [`WATCH_METADATA_CLIENT_TIMEOUT`]'s transport timeout always has
+/// comfortable margin to receive the reply.
+const WATCH_METADATA_SERVER_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Transport timeout for a [`ClientRequest::WatchMetadata`] round trip
+/// (via [`relay_request_with_timeout`]) — deliberately **not**
+/// [`CLIENT_TIMEOUT`], the generic per-hop timeout for ordinary,
+/// non-blocking requests: reusing that here would race the serving node's
+/// own [`WATCH_METADATA_SERVER_TIMEOUT`] park (both are 10s-scale), so a
+/// slow-but-legitimate "nothing changed yet" reply could be spuriously
+/// reported as a transport failure right as the server was about to send it.
+/// This exceeds the server's own bound by a comfortable margin instead.
+const WATCH_METADATA_CLIENT_TIMEOUT: Duration = Duration::from_secs(12);
+
+/// Backoff after a [`remote_metadata_watch_loop`] long-poll attempt fails at
+/// the *transport* level (every seed unreachable, or an explicit rejection —
+/// e.g. a misdirected watch against a `Remote` node, see
+/// [`ClientCtx::watch_metadata`]'s doc) — as opposed to the serving node's own
+/// bounded park, which is a normal "nothing changed yet" outcome, not a
+/// failure, and needs no extra backoff (the server-side bound already
+/// throttles the loop). Avoids busy-looping against an unreachable control
+/// deployment.
+const REMOTE_WATCH_RETRY_BACKOFF: Duration = Duration::from_millis(500);
+
+/// Mirror the real cluster's replicated `Metadata` — **generalized (ADR 0035
 /// §4) from "the fallback for a control-plane-follower-less growth node" to
 /// "how every node with no *real* local Raft replication for `Metadata` stays
-/// current"**, which now covers two shapes: an ADR 0030 **growth node**
-/// (`seeds` = the pre-growth control nodes' client addresses; `ctx.control` is
-/// `Local`, so the mirror lands in `ctx.remote_metadata` and `effective_metadata`
-/// prefers it) and an ADR 0035 PR4 **data-only node** (`seeds` = the control
-/// deployment's client addresses; `ctx.control` is `Remote`, so the mirror
-/// lands in that handle's own [`RemoteControlClient`](control_handle::RemoteControlClient),
-/// which `metadata_cached()`/`metadata_fresh()` already read directly — no
-/// separate `ctx.remote_metadata` involvement needed for this shape). Also
-/// refreshes `leader_hint` (ADR 0035 §1) on the `Remote` branch.
-///
-/// Tries every seed in order each tick, keeping whichever answers first; a
-/// no-op (returns immediately) when `seeds` is empty — the case for every
-/// node that *is* a real control-group voter, since `effective_metadata` then
-/// passes straight through to `self.control.metadata_cached()` and nothing
-/// needs mirroring. Best-effort: a tick where every seed is unreachable just
-/// leaves the previous snapshot in place (stale, not wrong — every consumer
-/// already tolerates a few hundred milliseconds of staleness from its own
-/// polling cadence).
+/// current"**, which now covers two shapes with two different mechanisms
+/// (ADR 0035 PR5): an ADR 0030 **growth node** (`seeds` = the pre-growth
+/// control nodes' client addresses; `ctx.control` is `Local`, so the mirror
+/// lands in `ctx.remote_metadata` and `effective_metadata` prefers it) keeps
+/// the original fixed-[`REMOTE_METADATA_SYNC_INTERVAL`] `Status` poll below;
+/// an ADR 0035 PR4 **data-only node** (`seeds` = the control deployment's
+/// client addresses; `ctx.control` is `Remote`) now long-polls instead — see
+/// [`remote_metadata_watch_loop`]. A no-op (returns immediately) when `seeds`
+/// is empty — the case for every node that *is* a real control-group voter,
+/// since `effective_metadata` then passes straight through to
+/// `self.control.metadata_cached()` and nothing needs mirroring.
 async fn remote_metadata_sync_loop(ctx: ClientCtx, seeds: Vec<SocketAddr>) {
     if seeds.is_empty() {
         return;
     }
+    if let ControlHandle::Remote(remote) = &ctx.control {
+        return remote_metadata_watch_loop(remote.clone(), seeds).await;
+    }
+    // Growth-node (ADR 0030) branch, unchanged from before PR5: tries every
+    // seed in order each tick, keeping whichever answers first. Best-effort —
+    // a tick where every seed is unreachable just leaves the previous
+    // snapshot in place (stale, not wrong — every consumer already tolerates
+    // a few hundred milliseconds of staleness from its own polling cadence).
     loop {
         for &addr in &seeds {
-            if let ClientResponse::Status {
-                metadata,
-                leader_hint,
-            } = ctx.relay(addr, ClientRequest::Status).await
+            if let ClientResponse::Status { metadata, .. } =
+                ctx.relay(addr, ClientRequest::Status).await
             {
-                match &ctx.control {
-                    ControlHandle::Remote(remote) => remote.observe(metadata, leader_hint),
-                    ControlHandle::Local(_) => {
-                        *ctx.remote_metadata
-                            .lock()
-                            .expect("remote metadata poisoned") = Some(metadata);
-                    }
-                }
+                *ctx.remote_metadata
+                    .lock()
+                    .expect("remote metadata poisoned") = Some(metadata);
                 break;
             }
         }
         tokio::time::sleep(REMOTE_METADATA_SYNC_INTERVAL).await;
+    }
+}
+
+/// **Long-poll metadata sync for a data-only node's [`RemoteControlClient`]**
+/// (ADR 0035 PR5): replaces the old fixed-[`REMOTE_METADATA_SYNC_INTERVAL`]
+/// poll with a [`ClientRequest::WatchMetadata`] round trip parked on the
+/// answering control node's own `MetadataWatch` — so a metadata change is
+/// observed roughly as soon as the control leader's own commit makes it
+/// visible plus one network hop, not up to one 200ms poll cycle later. Tries
+/// the current leader hint first (mirroring
+/// [`RemoteControlClient::metadata_fresh`]'s own candidate order — the leader
+/// is the node most likely to have just applied the change this loop is
+/// waiting for), then every seed in order.
+///
+/// **Never busy-loops**: either the serving node's own bounded park
+/// ([`WATCH_METADATA_SERVER_TIMEOUT`]) or, when every candidate fails at the
+/// transport level, a plain `Status` poll plus [`REMOTE_WATCH_RETRY_BACKOFF`]
+/// always separates consecutive attempts — there is no code path that retries
+/// immediately in a tight loop.
+async fn remote_metadata_watch_loop(remote: RemoteControlClient, seeds: Vec<SocketAddr>) {
+    loop {
+        let last_seen = remote.metadata_watch().latest();
+        let mut candidates = Vec::with_capacity(seeds.len() + 1);
+        if let Some(addr) = remote.leader_addr_hint() {
+            candidates.push(addr);
+        }
+        candidates.extend(seeds.iter().copied());
+
+        let mut synced = false;
+        for addr in candidates {
+            if let ClientResponse::Status {
+                metadata,
+                leader_hint,
+                watermark,
+            } = relay_request_with_timeout(
+                addr,
+                &ClientRequest::WatchMetadata { last_seen },
+                WATCH_METADATA_CLIENT_TIMEOUT,
+            )
+            .await
+            {
+                remote.observe(metadata, leader_hint, watermark);
+                synced = true;
+                break;
+            }
+        }
+        if synced {
+            // Either a real change resolved the watch, or the serving node's
+            // own bound elapsed and it replied anyway — both are a normal
+            // round trip; the server-side bound is itself the throttle, so
+            // loop straight into the next long poll with no added sleep.
+            continue;
+        }
+        // Every candidate failed at the transport level (unreachable, or an
+        // explicit rejection — e.g. a stale hint pointing at a `Remote` node,
+        // which rejects `WatchMetadata` outright, see
+        // `ClientCtx::watch_metadata`'s doc). Fall back to a plain `Status`
+        // poll before retrying, rather than hammering unreachable seeds in a
+        // tight loop.
+        for &addr in &seeds {
+            if let ClientResponse::Status {
+                metadata,
+                leader_hint,
+                watermark,
+            } = relay_request(addr, &ClientRequest::Status).await
+            {
+                remote.observe(metadata, leader_hint, watermark);
+                break;
+            }
+        }
+        tokio::time::sleep(REMOTE_WATCH_RETRY_BACKOFF).await;
     }
 }
 
@@ -4518,6 +4689,7 @@ fn request_kind(request: &ClientRequest) -> &'static str {
         ClientRequest::SplitTablet { .. } => "split_tablet",
         ClientRequest::MergeTablets { .. } => "merge_tablets",
         ClientRequest::JoinInfo => "join_info",
+        ClientRequest::WatchMetadata { .. } => "watch_metadata",
     }
 }
 
@@ -4535,6 +4707,7 @@ async fn handle_request(ctx: &ClientCtx, request: ClientRequest) -> ClientRespon
         ClientRequest::Status => ClientResponse::Status {
             metadata: ctx.effective_metadata(),
             leader_hint: ctx.control_leader_hint(),
+            watermark: ctx.control.metadata_watch().latest(),
         },
         // All data ops route to the leaderful CP per-tablet Raft group (ADR 0017
         // #3a), scoped to the named table (ADR 0023). `table` is a required field
@@ -4598,6 +4771,9 @@ async fn handle_request(ctx: &ClientCtx, request: ClientRequest) -> ClientRespon
             client_route: ctx.route_snapshot(),
             admin_addrs: ctx.admin.admin_addrs.clone(),
         },
+        // Long-poll metadata watch (ADR 0035 PR5) — see `ClientCtx::
+        // watch_metadata`'s doc.
+        ClientRequest::WatchMetadata { last_seen } => ctx.watch_metadata(last_seen).await,
     }
 }
 
@@ -4651,16 +4827,6 @@ impl ClientCtx {
     /// doc for the same cache-tolerant-but-not-commit-wait-safe contract.
     pub(crate) fn has_table_schema(&self, table: &str) -> bool {
         self.effective_metadata().has_table_schema(table)
-    }
-
-    /// Whether `keyspace` is registered in the replicated catalog (v1 A3) — the
-    /// CQL edge's `USE` / qualifier check, replacing per-process edge state.
-    /// **Not** switched to `effective_metadata()` (ADR 0035 PR1 leaves this one
-    /// as-is, matching the pre-existing carve-out for schema-catalog reads on a
-    /// growth node — see `effective_metadata`'s doc); a candidate for the PR5
-    /// staleness audit.
-    pub(crate) fn has_keyspace(&self, keyspace: &str) -> bool {
-        self.control.metadata_cached().has_keyspace(keyspace)
     }
 
     /// Register this node's **full address book** (ADR 0032 PR1: raftkv +
@@ -4724,7 +4890,20 @@ impl ClientCtx {
         // after a `DropTableTablets`. `new_id` and `expected_epoch` come from
         // the **same** metadata snapshot so the CAS reflects exactly what this
         // call saw.
-        let meta = self.control.metadata_cached();
+        //
+        // `effective_metadata()`, not `self.control.metadata_cached()`
+        // directly (ADR 0035 PR5 staleness-audit fix): unlike a plain stale
+        // read racing a *concurrent* epoch bump — which the CAS below catches
+        // cleanly, since `expected_epoch` would just fail to match at apply
+        // time — `metadata_cached()` is *permanently* empty on a
+        // control-plane-follower-less growth node (ADR 0030), so the
+        // `tablets.get(&tablet)` lookup below would unconditionally miss and
+        // this would always return "no such tablet" before ever proposing
+        // anything, on every call, regardless of whether the tablet actually
+        // exists on the real cluster. The CAS only protects against
+        // staleness *after* a read succeeds; it can't rescue a read that
+        // never has anything to see.
+        let meta = self.effective_metadata();
         let new_id = meta.next_free_tablet_id();
         let Some(expected_epoch) = meta.tablets.get(&tablet).map(|t| t.epoch) else {
             return ClientResponse::Error("no such tablet".into());
@@ -4738,8 +4917,7 @@ impl ClientCtx {
         };
         match self
             .propose_and_await(cmd, SCHEMA_COMMIT_TIMEOUT, || async {
-                self.control
-                    .metadata_cached()
+                self.effective_metadata()
                     .tablets
                     .contains_key(&new_id)
                     .then_some(())
@@ -4770,8 +4948,9 @@ impl ClientCtx {
     async fn trigger_merge(&self, left: TabletId, right: TabletId) -> ClientResponse {
         // Both epochs come from the **same** metadata snapshot, so the CAS
         // reflects exactly what this call saw (mirroring `trigger_split`'s
-        // `new_id`/`expected_epoch` pairing).
-        let meta = self.control.metadata_cached();
+        // `new_id`/`expected_epoch` pairing). `effective_metadata()` for the
+        // same reason as `trigger_split` — see that method's comment.
+        let meta = self.effective_metadata();
         let Some(expected_left_epoch) = meta.tablets.get(&left).map(|t| t.epoch) else {
             return ClientResponse::Error("no such tablet".into());
         };
@@ -4791,7 +4970,7 @@ impl ClientCtx {
         // atomically, and nothing else in this state machine produces.
         match self
             .propose_and_await(cmd, SCHEMA_COMMIT_TIMEOUT, || async {
-                let m = self.control.metadata_cached();
+                let m = self.effective_metadata();
                 let left_bumped = m
                     .tablets
                     .get(&left)
@@ -4811,7 +4990,17 @@ impl ClientCtx {
     /// state. Idempotent (an existing keyspace returns immediately). Routes via the
     /// A2 leader relay; times out after [`SCHEMA_COMMIT_TIMEOUT`].
     pub(crate) async fn create_keyspace(&self, keyspace: String) -> Result<(), String> {
-        if self.has_keyspace(&keyspace) {
+        // Fresh, not `self.has_keyspace` (ADR 0035 PR5 staleness-audit fix —
+        // see `create_table_schema`'s identical note): this whole function is
+        // the CreateKeyspace commit-wait poll, which must observe its own
+        // just-proposed command landing in the authoritative state, never a
+        // cache-tolerant mirror that could still be a poll interval behind —
+        // the pre-fix version, keyed on `has_keyspace`'s (then)
+        // `metadata_cached()`-based check, never resolved at all on a
+        // control-plane-follower-less growth node (permanently empty local
+        // view), so `CREATE KEYSPACE` always timed out there even after
+        // genuinely committing to the real cluster.
+        if self.metadata_fresh().await.has_keyspace(&keyspace) {
             return Ok(());
         }
         let ks = keyspace.clone();
@@ -4820,7 +5009,7 @@ impl ClientCtx {
                 keyspace: keyspace.clone(),
             },
             SCHEMA_COMMIT_TIMEOUT,
-            || async { self.has_keyspace(&ks).then_some(()) },
+            || async { self.metadata_fresh().await.has_keyspace(&ks).then_some(()) },
         )
         .await
         .map_err(|()| {
@@ -4954,9 +5143,18 @@ impl ClientCtx {
         // wait above already forced this replica past the tablet's creation in
         // the log — but a plain-client table skips that wait.)
         self.propose_schema(&command).await;
+        // `effective_metadata()`, not `self.control.metadata_cached()`
+        // directly (ADR 0035 PR5 staleness-audit fix): the latter is
+        // permanently empty on a control-plane-follower-less growth node
+        // (ADR 0030), so `tablets_for_table(&table).next().is_none()` was
+        // unconditionally `true` there — reporting a false success on the
+        // very first poll regardless of whether the drop actually committed,
+        // not merely timing out. `effective_metadata()`'s mirror is the
+        // right contract here (this poll confirms *absence*, which the
+        // cache-tolerant view proves just as soundly as a fresh one once it
+        // has synced at all).
         self.propose_and_await(command, SCHEMA_COMMIT_TIMEOUT, || async {
-            self.control
-                .metadata_cached()
+            self.effective_metadata()
                 .tablets_for_table(&table)
                 .next()
                 .is_none()
@@ -5611,6 +5809,12 @@ async fn poll_seeds_for(
 /// corrupting anything, but this pre-bind check is a best-effort convenience,
 /// not a distributed lock.
 ///
+/// **ADR 0035 PR5**: the discovery + collision-guard steps above are now the
+/// factored-out [`discover_join_info`]/[`check_join_collision`] helpers, so
+/// [`run_node_data_join`] (the data-only counterpart, `animusd data --seed`)
+/// reuses them verbatim instead of duplicating this poll/match/error-format
+/// boilerplate.
+///
 /// # Errors
 /// An `io::Error` (`TimedOut`) if no seed answers within
 /// [`JOIN_DISCOVERY_BUDGET`], `AlreadyExists` if the collision guard rejects
@@ -5637,7 +5841,7 @@ pub async fn run_node_join(
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "join needs a raftkv address (RoleAddrs.raftkv is None) — \
-             data-only join is ADR 0035 PR3/PR4",
+             data-only join is ADR 0035 PR3/PR4 (see `run_node_data_join`)",
         )
     })?;
     if addrs.control.is_none() {
@@ -5651,48 +5855,18 @@ pub async fn run_node_join(
     let my_raftkv_id = config::raftkv_id(index);
 
     let (original_control_ids, mut peers, mut client_route, mut admin_addrs) =
-        match poll_seeds_for(&seeds, &ClientRequest::JoinInfo, JOIN_DISCOVERY_BUDGET).await? {
-            ClientResponse::JoinInfo {
-                control_ids,
-                peers,
-                client_route,
-                admin_addrs,
-            } => (control_ids, peers, client_route, admin_addrs),
-            other => {
-                return Err(std::io::Error::other(format!(
-                    "seed returned an unexpected reply to JoinInfo: {other:?}"
-                )));
-            }
-        };
-
-    // Collision guard (see doc above): reject a conflicting pre-existing
-    // registration at this index before binding anything.
-    match poll_seeds_for(&seeds, &ClientRequest::Status, JOIN_DISCOVERY_BUDGET).await? {
-        ClientResponse::Status { metadata: meta, .. } => {
-            let mine = NodeAddrs {
-                raftkv: my_raftkv_addr.to_string(),
-                client: addrs.client.to_string(),
-                admin: addrs.admin.to_string(),
-            };
-            if let Some(existing) = meta.node_addrs.get(&my_raftkv_id) {
-                if existing != &mine {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::AlreadyExists,
-                        format!(
-                            "join index {index} (raftkv id {my_raftkv_id}) is already \
-                             registered with different addresses ({existing:?} != {mine:?}) \
-                             — pick a different --node index"
-                        ),
-                    ));
-                }
-            }
-        }
-        other => {
-            return Err(std::io::Error::other(format!(
-                "seed returned an unexpected reply to Status: {other:?}"
-            )));
-        }
-    }
+        discover_join_info(&seeds).await?;
+    check_join_collision(
+        &seeds,
+        index,
+        my_raftkv_id,
+        &NodeAddrs {
+            raftkv: my_raftkv_addr.to_string(),
+            client: addrs.client.to_string(),
+            admin: addrs.admin.to_string(),
+        },
+    )
+    .await?;
 
     let bound = Node::bind(my_control_id, my_raftkv_id, addrs, dir).await?;
 
@@ -5731,6 +5905,174 @@ pub async fn run_node_join(
         .await
 }
 
+/// The `JoinInfo` discovery half of [`run_node_join`]/[`run_node_data_join`]
+/// (ADR 0035 PR5 — factored out so the data-only join variant can reuse it
+/// verbatim instead of duplicating the poll/match/error-format boilerplate):
+/// polls `seeds` for a [`ClientResponse::JoinInfo`] reply within
+/// [`JOIN_DISCOVERY_BUDGET`].
+async fn discover_join_info(
+    seeds: &[SocketAddr],
+) -> std::io::Result<(
+    Vec<NodeId>,
+    BTreeMap<NodeId, SocketAddr>,
+    BTreeMap<NodeId, SocketAddr>,
+    Vec<SocketAddr>,
+)> {
+    match poll_seeds_for(seeds, &ClientRequest::JoinInfo, JOIN_DISCOVERY_BUDGET).await? {
+        ClientResponse::JoinInfo {
+            control_ids,
+            peers,
+            client_route,
+            admin_addrs,
+        } => Ok((control_ids, peers, client_route, admin_addrs)),
+        other => Err(std::io::Error::other(format!(
+            "seed returned an unexpected reply to JoinInfo: {other:?}"
+        ))),
+    }
+}
+
+/// The collision-guard half of [`run_node_join`]/[`run_node_data_join`] (ADR
+/// 0035 PR5 — factored out alongside [`discover_join_info`]): reject a
+/// conflicting pre-existing registration at `my_id` before binding anything.
+/// An **identical** existing entry (a restart with the same index/addresses/
+/// dir) is a rejoin and returns `Ok(())`; a **different** one fails loudly
+/// with `AlreadyExists` instead of silently colliding with it — see
+/// [`run_node_join`]'s doc for the narrower, best-effort race this doesn't
+/// fully close (the real guard is `RegisterNodeAddrs`'s own idempotent
+/// apply-time check).
+async fn check_join_collision(
+    seeds: &[SocketAddr],
+    index: usize,
+    my_id: NodeId,
+    mine: &NodeAddrs,
+) -> std::io::Result<()> {
+    match poll_seeds_for(seeds, &ClientRequest::Status, JOIN_DISCOVERY_BUDGET).await? {
+        ClientResponse::Status { metadata: meta, .. } => {
+            if let Some(existing) = meta.node_addrs.get(&my_id) {
+                if existing != mine {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        format!(
+                            "join index {index} (id {my_id}) is already \
+                             registered with different addresses ({existing:?} != {mine:?}) \
+                             — pick a different --node index"
+                        ),
+                    ));
+                }
+            }
+            Ok(())
+        }
+        other => Err(std::io::Error::other(format!(
+            "seed returned an unexpected reply to Status: {other:?}"
+        ))),
+    }
+}
+
+/// Start node `index` as a **data-only seed/join member** (ADR 0035 PR5): the
+/// data-only counterpart of [`run_node_join`], reusing its `JoinInfo`
+/// discovery + `Status` collision guard verbatim
+/// ([`discover_join_info`]/[`check_join_collision`]) but constructing the
+/// **`Remote`** data-role assembly ([`BoundDataNode::start_data_with`])
+/// instead of a combined-mode node with a local control `RaftCore`. CLI:
+/// `animusd data --seed ADDR[,ADDR...] --node I [--dir D] [--ephemeral]`.
+///
+/// `addrs.control` must be `None` and `addrs.raftkv` must be `Some` — the
+/// dual of `run_node_join`'s own role check (that entry point rejects a
+/// missing `raftkv` address as "data-only join is PR3/PR4"; this one is that
+/// PR3/PR4). The discovered `original_control_ids` (the seed's `JoinInfo`
+/// reply) feed both `heartbeat_loop`'s failure-detection target and, via the
+/// merged `client_route`, [`RemoteControlClient::new`]'s `control_seeds` — the
+/// discovery root this node's mirror sync/long-poll watch loop
+/// ([`remote_metadata_watch_loop`]) polls from then on. Mirrors
+/// [`run_node_data`]'s own note on why the internal `raftkv` env's peer book
+/// must stay the **union** of data + control addresses (`peers`, built from
+/// the discovery reply's `peers` map, which already carries both axes) rather
+/// than data-only addresses alone: `heartbeat_loop` sends to `control_ids`
+/// over that very env.
+///
+/// # Errors
+/// As [`run_node_join`]: an `io::Error` (`InvalidInput`) if `addrs` has the
+/// wrong role shape, `TimedOut` if no seed answers within
+/// [`JOIN_DISCOVERY_BUDGET`], `AlreadyExists` if the collision guard rejects
+/// a conflicting address book at this index, or a bind / engine-open
+/// failure.
+pub async fn run_node_data_join(
+    seeds: Vec<SocketAddr>,
+    index: usize,
+    addrs: RoleAddrs,
+    dir: &Path,
+    backend: StorageBackend,
+) -> std::io::Result<Node> {
+    if seeds.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "join needs at least one --seed address",
+        ));
+    }
+    let my_raftkv_addr = addrs.raftkv.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "data join needs a raftkv address (RoleAddrs.raftkv is None)",
+        )
+    })?;
+    if addrs.control.is_some() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "data join must not have a control address (RoleAddrs.control is Some) — \
+             use `animusd join` for a combined-mode join",
+        ));
+    }
+    let my_raftkv_id = config::raftkv_id(index);
+
+    let (original_control_ids, mut peers, mut client_route, mut admin_addrs) =
+        discover_join_info(&seeds).await?;
+    check_join_collision(
+        &seeds,
+        index,
+        my_raftkv_id,
+        &NodeAddrs {
+            raftkv: my_raftkv_addr.to_string(),
+            client: addrs.client.to_string(),
+            admin: addrs.admin.to_string(),
+        },
+    )
+    .await?;
+
+    let bound = Node::bind_data(my_raftkv_id, addrs, dir).await?;
+
+    // Merge this node's own entries into the discovered peer/route/admin sets
+    // — the data-only dual of `run_node_join`'s merge (a single raftkv peer
+    // entry, no control id of its own to add).
+    let (peer_id, peer_addr) = bound.peer_entry();
+    peers.insert(peer_id, peer_addr);
+    client_route.insert(my_raftkv_id, addrs.client);
+    if !admin_addrs.contains(&addrs.admin) {
+        admin_addrs.push(addrs.admin);
+    }
+
+    // The control deployment's client-API addresses (ADR 0035 §1/§4) — the
+    // same derivation `run_node_data` does from a static `ClusterConfig`,
+    // here from the merged, discovery-built `client_route` instead.
+    let control_seeds: Vec<SocketAddr> = original_control_ids
+        .iter()
+        .filter_map(|id| client_route.get(id).copied())
+        .collect();
+
+    bound
+        .start_data_with(
+            peers,
+            original_control_ids,
+            control_seeds,
+            backend,
+            ClusterEdgeState::new(),
+            client_route,
+            None,
+            None,
+            admin_addrs,
+        )
+        .await
+}
+
 /// Upper bound on a client-protocol frame (the `u32` length prefix is
 /// **untrusted** input on the client + cross-node relay ports — without a cap,
 /// four bytes from any dialer forces up to a 4 GiB allocation in [`read_frame`]).
@@ -5755,7 +6097,21 @@ pub const MAX_FRAME_LEN: usize = 64 << 20;
 /// other cross-node relay in this crate uses — [`ClientCtx::relay`] is now a
 /// thin wrapper over this.
 pub(crate) async fn relay_request(addr: SocketAddr, request: &ClientRequest) -> ClientResponse {
-    match tokio::time::timeout(CLIENT_TIMEOUT, async {
+    relay_request_with_timeout(addr, request, CLIENT_TIMEOUT).await
+}
+
+/// Like [`relay_request`], but with an explicit transport timeout instead of
+/// the default [`CLIENT_TIMEOUT`] (ADR 0035 PR5) — needed by
+/// [`remote_metadata_watch_loop`], whose long-poll request's own
+/// [`WATCH_METADATA_CLIENT_TIMEOUT`] must exceed the serving node's
+/// [`WATCH_METADATA_SERVER_TIMEOUT`] bound by a comfortable margin; reusing
+/// the generic [`CLIENT_TIMEOUT`] here would race the server's own reply.
+async fn relay_request_with_timeout(
+    addr: SocketAddr,
+    request: &ClientRequest,
+    timeout: Duration,
+) -> ClientResponse {
+    match tokio::time::timeout(timeout, async {
         let mut stream = TcpStream::connect(addr).await.ok()?;
         write_frame(&mut stream, request).await.ok()?;
         read_frame::<ClientResponse>(&mut stream).await.ok()?

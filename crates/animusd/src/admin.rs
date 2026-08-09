@@ -292,7 +292,13 @@ async fn dispatch(ctx: &ClientCtx, request: &http::HttpRequest) -> (u16, String)
 
 fn config_view(ctx: &ClientCtx) -> Value {
     let a = &ctx.admin;
-    let meta = ctx.control.metadata_cached();
+    // `effective_metadata()`, not `ctx.control.metadata_cached()` directly
+    // (ADR 0035 PR5 staleness-audit fix, matching `/admin/status`/
+    // `/admin/peers` above): a control-plane-follower-less growth node's own
+    // control raft never replicates, so `cp_member_addrs` below would
+    // otherwise show an empty map forever on exactly the node an operator
+    // most wants to inspect.
+    let meta = ctx.effective_metadata();
     let peers: std::collections::BTreeMap<String, String> = a
         .peers
         .iter()
@@ -348,6 +354,14 @@ fn peers_view(ctx: &ClientCtx) -> Value {
 
 fn raft_view(ctx: &ClientCtx) -> Value {
     let r = &ctx.control;
+    // Deliberately `metadata_cached()`, NOT `effective_metadata()` (ADR 0035
+    // PR5 staleness audit, documented rather than "fixed"): `/admin/raft` is
+    // a diagnostic of *this replica's own* control-plane view — `believes_alive`
+    // is meaningless against a mirror from a different node entirely — unlike
+    // `/admin/status`/`/admin/config`/`/admin/peers`, which are cluster-wide
+    // summaries and correctly prefer the mirror. Showing a growth/data-only
+    // node's permanently-empty local view here is the honest answer to "what
+    // does this node's own Raft role see", not a bug to paper over.
     let meta = r.metadata_cached();
     let members: Vec<Value> = meta
         .members

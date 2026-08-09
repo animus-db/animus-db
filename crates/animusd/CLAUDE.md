@@ -103,6 +103,9 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   restart re-hosting its tablet from the surviving replica's Raft
   replication (not local state — the test uses the ephemeral memory backend
   specifically to prove this is real catch-up, not a local reopen).
+  `run_node_data` (`--config`-based) covers only PR4's shape; ADR 0035 PR5
+  adds the seed/join sibling, `run_node_data_join` (`animusd data --seed`) —
+  see its own "What's non-obvious" entry below.
 - `bind_cluster` / `start_cluster` — spin up an in-process cluster (the binary's
   `--cluster N` mode and `tests/cluster.rs`).
 - `run_node_growth` — start a node as an ADR 0030 **growth member** from an
@@ -128,6 +131,10 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   [--dir D] [--ephemeral]` binds six consecutive ports from `--base-port`
   (default `7100 + 6*I`, mirroring `gen-config`'s stride/role order).
   `tests/seed_join.rs` covers happy path / collision / rejoin.
+  **`run_node_data_join`** (ADR 0035 PR5, `animusd data --seed`) is the
+  data-only sibling — see its own doc + the "What's non-obvious" entry
+  below; it reuses this entry point's discovery/collision-guard logic via
+  two factored-out helpers rather than duplicating it.
 - `ClientRequest` / `ClientResponse` + `read_frame` / `write_frame` — the
   length-prefixed JSON client protocol (reused by `animus-cli`).
   `ClientRequest::JoinInfo` → `ClientResponse::JoinInfo` is the join
@@ -276,6 +283,134 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
     time (ADR 0035 §5's own thesis), re-audit every `metadata_cached()`/
     `effective_metadata()` call site that feeds a *non-retried, permanent*
     decision — not just the ones already flagged as commit-wait polls.**
+  - **The PR5 staleness audit this lesson called for found and fixed four
+    more instances of the same shape** (all four had the identical
+    signature: a `self.control.metadata_cached()` read feeding a decision
+    with no re-check, permanently empty on a growth node, harmless on a
+    `Remote` node since its `metadata_cached()` *is* the mirror already):
+    `cp_scan`'s tablet-range computation (would silently return an empty
+    result forever, not error or wait); `trigger_split`/`trigger_merge`'s
+    `expected_epoch`/`new_id` precondition reads *and* their confirm-poll
+    closures (would unconditionally return "no such tablet" before ever
+    proposing, on every call — the epoch-CAS at apply time protects against
+    a *concurrent* stale read racing another proposer, it cannot rescue a
+    read that has nothing to see at all); `drop_table`'s `DropTableTablets`
+    confirm poll (would report a **false success** on the very first poll,
+    not merely time out, since "no tablets found" is indistinguishable from
+    "already dropped" when the view is permanently empty); and
+    `create_keyspace`'s pre-check + confirm poll via `has_keyspace` (would
+    never resolve, so `CREATE KEYSPACE` always timed out even after
+    genuinely committing — fixed by having `create_keyspace` go through
+    `metadata_fresh()` directly, the same RYW split `create_table_schema`
+    already used, and switching the now-unused `ClientCtx::has_keyspace`
+    wrapper itself to `effective_metadata()` before removing it as dead
+    code). Also hardened, a related but distinct class (not staleness, a
+    *local-replica* freshness-ordering bug): `admin_drain` read
+    `self.control.metadata_cached()` for its member lookup *before* checking
+    `self.edge.leader_handle()`, unlike its sibling `admin_remove_member`
+    (already fixed for exactly this — see the root `CLAUDE.md`'s
+    "decommission" engineering-practices entry) — reordered to check
+    leadership first. **Left deliberately as-is, with a comment recording
+    why**: `/admin/raft`'s `raft_view` reads `metadata_cached()` directly
+    (it's a diagnostic of *this replica's own* Raft view, not a cluster-wide
+    summary — `effective_metadata()` would be the wrong contract there, not
+    a missed fix). **General pattern to keep watching for**: grep every
+    `self.control.metadata_cached()` (not `effective_metadata()`/
+    `metadata_fresh()`) call site whenever a new consumer of `ControlHandle`
+    is added — the type system can't catch this, `Remote` and a genuine
+    `Local` voter both compile and both look identical in a single-node test
+    that never exercises the mirror-substitution paths at all.
+- **Long-poll metadata watch (ADR 0035 PR5): `ClientRequest::WatchMetadata {
+  last_seen: u64 }`.** Replaces the ADR 0035 PR4 fixed-200ms
+  `remote_metadata_sync_loop` poll for a `Remote` data node with a real
+  wake-on-commit signal, reusing the ADR 0031 §trigger `MetadataWatch`
+  primitive across the wire instead of inventing a new push mechanism.
+  - **Server side** (`ClientCtx::watch_metadata`): only a genuine
+    `ControlHandle::Local` replica serves it — it parks on
+    `self.control.metadata_watch().changed(last_seen)` racing a
+    `WATCH_METADATA_SERVER_TIMEOUT` (8s) sleep, then replies with the
+    current `Metadata` either way (a timeout is a normal "nothing changed
+    yet" outcome, not an error — the caller just retries with the same
+    `last_seen`). A `Remote` node **rejects** the request outright
+    (`ClientResponse::Error`) rather than degrading: its own
+    `ControlHandle::metadata_watch()` is itself driven by replies to *this
+    exact request*, so serving it would only let a misdirected watch (a
+    stale `client_route` entry) degrade silently to an ~8s effective poll —
+    worse than the pre-PR5 fixed-interval poll, not better. Rejecting fails
+    fast instead.
+  - **Reply shape**: `ClientResponse::Status` gained a `watermark: u64`
+    field (`#[serde(default)]`, so it decodes to `0` from an older reply) —
+    the answering node's own `metadata_watch().latest()` at reply time, which
+    the caller passes back as the next call's `last_seen`. Every `Status`
+    reply carries it now, not just a `WatchMetadata` one, since both are the
+    same response type.
+  - **Client side** (`remote_metadata_watch_loop`, replacing the `Remote`
+    branch of `remote_metadata_sync_loop`): tries the current leader hint
+    first (mirroring `RemoteControlClient::metadata_fresh`'s own candidate
+    order — the leader is the node most likely to have just applied the
+    change being waited for), then every seed; on a successful round trip
+    (whether via a real change or the server's own timeout) it loops
+    straight into the next long poll — the server-side bound is itself the
+    throttle. Falls back to a plain `Status` poll + a short backoff only
+    when *every* candidate fails at the transport level (never busy-loops).
+  - **`RemoteControlClient` now owns its own driven `MetadataWatch`**
+    (previously `ControlHandle::metadata_watch()` handed a `Remote` node a
+    permanently-inert default — see the PR4 entry above, now superseded):
+    `observe()` calls `watch.bump(watermark)` on every reply, so
+    `tablet_host_reconciler_loop`'s `select!` on this now wakes on a real,
+    network-relayed metadata change for a data-only node too, not only via
+    its `RECONCILE_FALLBACK_INTERVAL` sleep arm. This required making
+    `animus_control::MetadataWatch::bump` **`pub`** (it was crate-private,
+    called only by the control driver's own loop) — a small, safe widening:
+    the primitive's contract (fetch-max, wake-if-advanced) doesn't change,
+    only who may call it from outside `animus-control`.
+  - **Non-regression guard, found necessary while wiring this up**: *any*
+    control node may answer a `Status`/`WatchMetadata` request, not
+    necessarily the most caught-up one — the pre-PR5 poll already had this
+    property (whichever seed answered first won, unconditionally), but PR5's
+    watermark gave it, for the first time, something to check *against*.
+    `RemoteControlClient::observe` now skips the mirror-overwrite (and the
+    watch bump) unless `watermark >= watch.latest()`, so a reply from a
+    replica lagging behind one this handle already saw can't regress the
+    mirror's *content* even though the watch's watermark is itself
+    monotonic (`fetch_max`) regardless — without the guard those two could
+    silently disagree (the watch says "I've seen index 50," the mirror
+    actually holds the state as of index 40). The leader hint is still taken
+    unconditionally (it self-heals independently, see below) — only the
+    metadata snapshot + watch pairing is guarded.
+  - **Known, audited, and left as-is**: the leader-hint "trust whoever
+    answers" looseness PR4 flagged. Verified every consumer (`propose_schema`,
+    `RemoteControlClient::metadata_fresh`, the new watch loop) degrades to a
+    seed-scan/broadcast tier on a transport failure, and confirmed *why* a
+    stale hint self-heals in practice rather than compounding: a control
+    node's own `leader()` is kept current by real Raft heartbeats/
+    AppendEntries (not the ADR 0035 mirror-poll-interval class of
+    staleness), and the periodic full-seed-list sync — not just the hint —
+    refreshes it from whichever node answers, within one sync cycle even if
+    the hinted address itself has gone unreachable. No code change needed;
+    the existing design already degrades soundly.
+- **`animusd data --seed` (ADR 0035 PR5, `run_node_data_join`) — the
+  data-only counterpart of `animusd join`/`run_node_join`.** Reuses that
+  entry point's `JoinInfo` discovery + `Status` collision guard **verbatim**
+  via two factored-out free functions, `discover_join_info`/
+  `check_join_collision` (both entry points previously duplicated this
+  poll/match/error-format logic inline) — then constructs the `Remote` data
+  assembly (`Node::bind_data` → `BoundDataNode::start_data_with`) instead of
+  a combined-mode node with a local control `RaftCore`. `control_seeds` (the
+  discovery root `RemoteControlClient::new` needs) is derived the same way
+  `run_node_data` derives it from a static `ClusterConfig`, just from the
+  discovery-built `client_route` map instead: filter `original_control_ids`
+  through it. CLI: `animusd data --seed ADDR[,ADDR...] --node I [--dir D]
+  [--ephemeral]`, mirroring `animusd join`'s port-derivation convention
+  (`--base-port`, default `7100 + 6*index`) minus the control port a
+  data-only `RoleAddrs` never binds. `tests/data_join.rs` covers a data-only
+  node joining a running split cluster (3 control-only + 2 data-only), being
+  promoted `Active` with zero operator admin calls, and gaining a real
+  rebalanced tablet replica — seeded across several independent tables per
+  the standing "the rebalancer needs an imbalanced starting point" lesson
+  (root `CLAUDE.md`), since this test's whole point is exercising the same
+  rebalance-onto-a-grown-node path `tests/seed_join.rs` already proves for
+  combined-mode joins.
 - **`ClientCtx.data: Option<DataRole>` (ADR 0035 PR3)** groups every field
   that only makes sense on a data-role node — `rmw_lock` (the per-node RMW
   serialization lock), `raftkv_metrics` (the raftkv env's metrics sink), and

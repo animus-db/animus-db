@@ -1,4 +1,4 @@
-//! The `ControlHandle` seam (ADR 0035 PR1, extended by PR4).
+//! The `ControlHandle` seam (ADR 0035 PR1, extended by PR4 and PR5).
 //!
 //! Before this seam, every `animusd` node's [`crate::ClientCtx`] reached the
 //! control plane through a bare `RaftNode<ProdEnv>` — this process's own
@@ -92,7 +92,22 @@ pub(crate) enum ControlHandle {
 /// which `ClientCtx::propose_schema` prefers over a `route_addr` lookup —
 /// see that method's doc). The hint is *never* independently verified against
 /// the answering node's own role; see `metadata_fresh`'s doc for the
-/// consequence and the PR5 follow-up this is flagged for.
+/// consequence — audited in PR5 (see `crate::remote_metadata_watch_loop`'s
+/// doc) and found self-healing in practice: every control node's own
+/// `leader()` is kept current by real Raft heartbeats/AppendEntries (not the
+/// ADR 0035 mirror-poll-interval class of staleness), and the periodic
+/// full-seed-list sync (not just the hint) refreshes it from whichever
+/// control node answers, so a stale hint corrects itself within one sync
+/// cycle even if the hinted address itself has gone unreachable.
+///
+/// **Applied-index watch (ADR 0035 PR5).** `watch` is this handle's own
+/// same-process [`MetadataWatch`] — disconnected from any `RaftCore` (this
+/// node has none), but driven directly by [`observe`](Self::observe) from
+/// the watermark every `Status`/`WatchMetadata` reply now carries. This is
+/// what lets [`ControlHandle::metadata_watch`] hand the tablet-host
+/// reconciler a *real* wake-on-change signal for a data-only node instead of
+/// the permanently-disconnected default PR4 shipped with — see
+/// `crate::remote_metadata_watch_loop`'s doc for how it's kept current.
 #[derive(Clone)]
 pub(crate) struct RemoteControlClient {
     /// The control deployment's own **client**-API addresses — the discovery
@@ -109,6 +124,11 @@ pub(crate) struct RemoteControlClient {
     /// The last-known control-plane leader `(id, client address)` — see the
     /// type doc's "leader-hint lifecycle" section.
     leader_hint: Arc<Mutex<Option<(NodeId, SocketAddr)>>>,
+    /// This handle's own applied-index watch (ADR 0035 PR5) — see the type
+    /// doc's "applied-index watch" section. Bumped only by
+    /// [`observe`](Self::observe); handed out (cloned) via
+    /// [`metadata_watch`](Self::metadata_watch).
+    watch: MetadataWatch,
     /// No-op metrics sink: a data-only node's control-plane access has no
     /// local Raft loops to instrument (unlike `Local`, whose `RaftNode`
     /// records into its own env's real sink).
@@ -121,6 +141,7 @@ impl RemoteControlClient {
             seeds,
             mirror: Arc::new(Mutex::new(None)),
             leader_hint: Arc::new(Mutex::new(None)),
+            watch: MetadataWatch::default(),
             metrics: MetricsHandle::noop(),
         }
     }
@@ -160,14 +181,40 @@ impl RemoteControlClient {
             .map(|(_, addr)| *addr)
     }
 
-    /// Record a `Status` reply's metadata + leader hint. Called by the
-    /// generalized `remote_metadata_sync_loop` and by
-    /// [`metadata_fresh`](Self::metadata_fresh)'s own live fetch — both
+    /// This handle's own applied-index watch (ADR 0035 PR5) — see the type
+    /// doc's "applied-index watch" section.
+    pub(crate) fn metadata_watch(&self) -> MetadataWatch {
+        self.watch.clone()
+    }
+
+    /// Record a `Status`/`WatchMetadata` reply's metadata + leader hint +
+    /// applied-index watermark. Called by [`crate::remote_metadata_watch_loop`]
+    /// and by [`metadata_fresh`](Self::metadata_fresh)'s own live fetch — both
     /// observe the identical wire shape, so both refresh the same state.
-    pub(crate) fn observe(&self, metadata: Metadata, leader_hint: Option<(NodeId, SocketAddr)>) {
-        *self.mirror.lock().expect("remote control mirror poisoned") = Some(metadata);
+    ///
+    /// **Non-regression guard (ADR 0035 PR5):** any control node may answer —
+    /// not necessarily the most caught-up one — so a reply from a replica
+    /// lagging behind one this handle already observed must not overwrite a
+    /// fresher mirror with a staler snapshot. `watermark` is the answering
+    /// node's own applied index at reply time, a monotonic proxy for how
+    /// fresh `metadata` is; the mirror + watch only advance together
+    /// (`watermark >= watch.latest()`, so a same-watermark reply still
+    /// refreshes the mirror — e.g. an unchanged snapshot re-observed after a
+    /// timed-out long-poll retry). The leader hint is taken unconditionally
+    /// regardless — it self-heals independently (see the type doc) and isn't
+    /// a snapshot whose *content* can regress the same way.
+    pub(crate) fn observe(
+        &self,
+        metadata: Metadata,
+        leader_hint: Option<(NodeId, SocketAddr)>,
+        watermark: u64,
+    ) {
         if let Some(hint) = leader_hint {
             *self.leader_hint.lock().expect("leader hint poisoned") = Some(hint);
+        }
+        if watermark >= self.watch.latest() {
+            *self.mirror.lock().expect("remote control mirror poisoned") = Some(metadata);
+            self.watch.bump(watermark);
         }
     }
 
@@ -177,18 +224,20 @@ impl RemoteControlClient {
     /// (this handle has no `ClientCtx` of its own to reach `propose_schema`
     /// through, so it repeats the same policy directly over
     /// [`relay_request`](crate::relay_request)). Whichever reply lands also
-    /// refreshes the mirror + hint, exactly like the periodic sync loop.
+    /// refreshes the mirror + hint + watch, exactly like the periodic sync
+    /// loop.
     ///
-    /// **Known looseness** (flagged for the PR5 staleness audit): like
-    /// `propose_schema`'s broadcast fallback, this trusts whichever node
-    /// answers — it does not independently verify the responder self-reports
-    /// as the leader. A stale hint can therefore serve a reply one hop behind
-    /// the real leader; the caller's own retry loop (e.g.
-    /// `ClientCtx::propose_and_await`) re-invokes this on its next poll tick,
-    /// and a non-leader's own `Status` reply carries *its* leader hint, so
-    /// staleness self-heals within a couple of hops rather than compounding.
-    /// Falls back to the current mirror if no seed answers at all, rather
-    /// than blocking — the caller's own poll loop bounds the wait.
+    /// **Known looseness, audited in PR5** (see the type doc's "leader-hint
+    /// lifecycle" section): like `propose_schema`'s broadcast fallback, this
+    /// trusts whichever node answers — it does not independently verify the
+    /// responder self-reports as the leader. A stale hint can therefore serve
+    /// a reply one hop behind the real leader; the caller's own retry loop
+    /// (e.g. `ClientCtx::propose_and_await`) re-invokes this on its next poll
+    /// tick, and a non-leader's own `Status` reply carries *its* leader hint,
+    /// so staleness self-heals within a couple of hops rather than
+    /// compounding. Falls back to the current mirror if no seed answers at
+    /// all, rather than blocking — the caller's own poll loop bounds the
+    /// wait.
     pub(crate) async fn metadata_fresh(&self) -> Metadata {
         let mut candidates = Vec::with_capacity(self.seeds.len() + 1);
         if let Some(addr) = self.leader_addr_hint() {
@@ -199,9 +248,10 @@ impl RemoteControlClient {
             if let ClientResponse::Status {
                 metadata,
                 leader_hint,
+                watermark,
             } = relay_request(addr, &ClientRequest::Status).await
             {
-                self.observe(metadata.clone(), leader_hint);
+                self.observe(metadata.clone(), leader_hint, watermark);
                 return metadata;
             }
         }
@@ -373,18 +423,22 @@ impl ControlHandle {
     }
 
     /// An executor-agnostic "applied index advanced" notification — see
-    /// `MetadataWatch`'s own doc (ADR 0031 §trigger). Same-process only, so a
-    /// `Remote` handle hands out a fresh, disconnected default: nothing ever
-    /// calls `bump` on it, so `changed()` never resolves and `latest()` stays
-    /// `0` forever — which is exactly the desired effect (ADR 0035 §4):
-    /// `tablet_host_reconciler_loop`'s `select!` then always falls through to
-    /// its `RECONCILE_FALLBACK_INTERVAL` sleep arm for a data-only node,
-    /// without that loop needing to special-case `Remote` at all. PR5 upgrades
-    /// this to a real long-poll equivalent.
+    /// `MetadataWatch`'s own doc (ADR 0031 §trigger). Same-process only (the
+    /// primitive itself never crosses a network hop) — but as of **ADR 0035
+    /// PR5**, a `Remote` handle no longer hands out a disconnected default:
+    /// it returns [`RemoteControlClient`]'s own `watch`, which
+    /// [`crate::remote_metadata_watch_loop`] drives from the applied-index
+    /// watermark carried on every `WatchMetadata`/`Status` reply — so
+    /// `tablet_host_reconciler_loop`'s `select!` on this wakes on a real
+    /// (network-relayed, long-poll-latency-bounded) metadata change instead
+    /// of always falling through to its `RECONCILE_FALLBACK_INTERVAL` sleep
+    /// arm. The fallback still fires normally whenever the watch loop itself
+    /// is between polls or degraded to its plain-`Status` fallback — it was
+    /// never *only* a `Remote`-specific safety net (see that constant's doc).
     pub(crate) fn metadata_watch(&self) -> MetadataWatch {
         match self {
             Self::Local(raft) => raft.metadata_watch(),
-            Self::Remote(_) => MetadataWatch::default(),
+            Self::Remote(remote) => remote.metadata_watch(),
         }
     }
 
