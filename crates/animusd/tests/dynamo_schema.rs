@@ -142,11 +142,12 @@ fn single_node_config() -> ClusterConfig {
     let a = fixed_addrs(6);
     ClusterConfig {
         nodes: vec![RoleAddrs {
-            control: a[0],
+            role: animusd::config::NodeRole::Both,
+            control: Some(a[0]),
             client: a[1],
             dynamo: a[2],
             cql: a[3],
-            raftkv: a[4],
+            raftkv: Some(a[4]),
             admin: a[5],
         }],
     }

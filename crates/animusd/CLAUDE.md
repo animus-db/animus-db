@@ -16,7 +16,25 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
 - `config::ClusterConfig` — the per-process deployment config (every node's six
   addresses). Node ids follow a fixed convention from the index (control `i`,
   raftkv `300+i`) so processes agree without listing ids. `run_node(config, index,
-  dir)` binds *this* node and starts it.
+  dir)` binds *this* node and starts it. **ADR 0035 PR2 (config/identity
+  decoupling)** adds `RoleAddrs.role: NodeRole` (`Control`/`Data`/`Both`,
+  default `Both` — every JSON config before this field existed, and every
+  entry point today, is `Both`): `control`/`raftkv` are now `Option<SocketAddr>`
+  (`None` when that role isn't run), with a custom serde default
+  (`Some(ephemeral)`, not the blanket `None` a bare `#[serde(default)]` would
+  give — see the root `CLAUDE.md`'s entry on this) so an old config missing
+  the field entirely still means combined mode. `ClusterConfig::control_ids`/
+  `raftkv_ids`/`control_peer_book`/`raftkv_peer_book` are now role-filtered
+  (identical output for an all-`Both` config); `BoundNode::start_with` takes
+  an explicit `data_raftkv_ids` parameter (what `bootstrap` auto-registers as
+  `Active` data members) instead of deriving it from `control_ids.len()`, so
+  a caller can scope it to only the data-role nodes — every real entry point
+  still passes the same set as before (combined mode is unchanged byte-for-
+  byte). `Node::bind` and every entry point still require both addresses
+  present (`Both`); actually assembling a control-only or data-only *process*
+  (skipping the unused listeners/engine) is PR3/PR4 — this PR is the config
+  layer only. `ClusterConfig::generate_split` is additive scaffolding for that
+  (not wired into `gen-config` yet).
 - `bind_cluster` / `start_cluster` — spin up an in-process cluster (the binary's
   `--cluster N` mode and `tests/cluster.rs`).
 - `run_node_growth` — start a node as an ADR 0030 **growth member** from an

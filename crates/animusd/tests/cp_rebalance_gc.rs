@@ -76,11 +76,12 @@ async fn bring_up(n: usize, dir: &Path) -> (Vec<Node>, ClusterConfig, Vec<PathBu
         let config = ClusterConfig {
             nodes: (0..n)
                 .map(|i| RoleAddrs {
-                    control: a[6 * i],
+                    role: animusd::config::NodeRole::Both,
+                    control: Some(a[6 * i]),
                     client: a[6 * i + 1],
                     dynamo: a[6 * i + 2],
                     cql: a[6 * i + 3],
-                    raftkv: a[6 * i + 4],
+                    raftkv: Some(a[6 * i + 4]),
                     admin: a[6 * i + 5],
                 })
                 .collect(),
