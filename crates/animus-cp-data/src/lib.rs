@@ -1152,9 +1152,12 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// This replica's live `(key, value)` pairs with `start <= key < end`, sorted
     /// by key, up to `limit`, from the **local engine** — *not* linearizable (no
     /// ReadIndex barrier), the scan counterpart of [`local_get`](Self::local_get).
-    /// `end == None` is unbounded above. Used for admin/debug introspection and
-    /// the auto-split key-materialization path, which only ever run on a replica
-    /// inspecting its own state.
+    /// `end == None` is unbounded above, but still bounded to *this scope*'s own
+    /// physical range via [`StorageScope::physical_bounds`] — see the body's
+    /// comment for why an actual whole-engine scan there would be a real cost
+    /// bug on a node hosting several tablets (ADR 0028). Used for admin/debug
+    /// introspection and the auto-split key-materialization path, which only
+    /// ever run on a replica inspecting its own state.
     pub async fn local_scan(
         &self,
         start: &[u8],
@@ -1166,10 +1169,20 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         // filtering; both `scan` and `entries` return key-ordered results by the
         // `StorageEngine` contract, so the old re-sort was redundant — drop it
         // and apply the limit to the already-ordered rows. An unbounded-above
-        // scan (`end == None`, e.g. a full-table `Scan`) still goes through
-        // `entries()` — the trait's `scan` takes a finite exclusive bound and
-        // arbitrary byte keys have no max sentinel; pushing a limit *into* the
-        // engine is a `StorageEngine` API change, out of scope here.
+        // scan (`end == None`, e.g. a full-table `Scan`) uses
+        // `StorageScope::physical_bounds()` (ADR 0034) to derive a genuinely
+        // bounded physical upper bound for *this scope* — the tablet's own
+        // `range.end` if set, else the prefix-upper-bound trick for a
+        // not-yet-split tablet — and falls back to `entries()` (a whole-engine
+        // scan) only for the one case that has no finite bound at all,
+        // `StorageScope::whole()` (no prefix). This matters because a node's
+        // tablets share one `StorageEngine` (ADR 0028): `entries()` scans every
+        // co-resident tablet's data, not just this one's, so on a node hosting
+        // several tablets `local_scan`/`local_pairs`'s unbounded path used to
+        // cost O(hosted tablets × whole node engine) — every `/admin/raftkv`
+        // request and every `erase_scope()` teardown (rebalance `Release`,
+        // drop-table `Reclaim`) paid a full-engine scan just to find this one
+        // tablet's own handful of keys.
         // Both branches physically bound/filter to `self.scope` — on a
         // possibly-shared engine, `entries()` in particular would otherwise
         // return every other tenant's keys too (see `StorageScope`'s doc).
@@ -1189,18 +1202,32 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
                     Some((logical.to_vec(), vv.value))
                 })
                 .collect(),
-            None => self
-                .storage
-                .entries()
-                .await
-                .ok()
-                .into_iter()
-                .flatten()
-                .filter_map(|(k, vv)| {
-                    let logical = self.scope.strip_in_range(&k)?;
-                    (logical >= start).then(|| (logical.to_vec(), vv.value))
-                })
-                .collect(),
+            None => match self.scope.physical_bounds().1 {
+                Some(physical_end) => self
+                    .storage
+                    .scan(&self.scope.physical(start), &physical_end)
+                    .await
+                    .ok()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|(k, vv)| {
+                        let logical = self.scope.strip_in_range(&k)?;
+                        Some((logical.to_vec(), vv.value))
+                    })
+                    .collect(),
+                None => self
+                    .storage
+                    .entries()
+                    .await
+                    .ok()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|(k, vv)| {
+                        let logical = self.scope.strip_in_range(&k)?;
+                        (logical >= start).then(|| (logical.to_vec(), vv.value))
+                    })
+                    .collect(),
+            },
         };
         if let Some(n) = limit {
             pairs.truncate(n);
