@@ -42,12 +42,15 @@ pub use animus_control::{
 };
 
 mod admin;
+mod control_handle;
 mod cql;
 mod cql_client;
 mod dashboard;
 mod dynamo;
 mod http;
 mod topology;
+
+use control_handle::ControlHandle;
 
 use animus_control::node::heartbeat_loop;
 use animus_control::{PlacementPolicy, ProposeResult, RaftNode};
@@ -988,7 +991,7 @@ impl BoundNode {
         // same static-base pattern `peer_sync_loop` already uses.
         let static_route = client_route.clone();
         let ctx = ClientCtx {
-            raft: raft.clone(),
+            control: ControlHandle::Local(raft.clone()),
             rmw_lock: Arc::new(tokio::sync::Mutex::new(())),
             edge: edge.clone(),
             raftkv_metrics,
@@ -1593,12 +1596,13 @@ impl ClusterEdgeState {
 }
 
 /// Shared context for the client request server and the DynamoDB/CQL endpoints:
-/// the control `RaftNode` (for cached metadata + schema proposals), the per-node
-/// RMW serialization lock, this node's own wire-edge state (incl. the CP group
-/// handles it hosts), and the cross-node CP routing table.
+/// the control-plane handle (for cached metadata + schema proposals — a
+/// [`ControlHandle`], ADR 0035 PR1), the per-node RMW serialization lock, this
+/// node's own wire-edge state (incl. the CP group handles it hosts), and the
+/// cross-node CP routing table.
 #[derive(Clone)]
 pub(crate) struct ClientCtx {
-    raft: RaftNode<ProdEnv>,
+    control: ControlHandle,
     /// Serializes a node's read-modify-writes so a CQL/DynamoDB RMW (linearizable
     /// CP read → CP write) is atomic *per node*. Cross-node atomicity (a CAS on the
     /// CP group) is later v1 work.
@@ -1641,33 +1645,37 @@ pub(crate) struct ClientCtx {
     /// real cluster's replicated `Metadata`, refreshed by
     /// [`remote_metadata_sync_loop`] polling `ClientRequest::Status` against one
     /// of the pre-growth control nodes. `None` for every node that is a genuine
-    /// voter of `self.raft`'s own control group (the overwhelming common case —
-    /// the control group is static, ADR 0030's documented v1 limitation, so this
-    /// is only ever populated on a node started via [`run_node_growth`]). Read
-    /// through [`effective_metadata`](Self::effective_metadata), never directly —
-    /// see that method's doc for which call sites must use it.
+    /// voter of `self.control`'s own control group (the overwhelming common case
+    /// — the control group is static, ADR 0030's documented v1 limitation, so
+    /// this is only ever populated on a node started via [`run_node_growth`]).
+    /// Read through [`effective_metadata`](Self::effective_metadata), never
+    /// directly — see that method's doc for which call sites must use it.
     remote_metadata: Arc<Mutex<Option<Metadata>>>,
 }
 
 impl ClientCtx {
-    /// This node's best available view of the cluster's replicated `Metadata`:
-    /// this node's own live `RaftNode` for a genuine control-group voter (the
-    /// common case — reflects committed state via real Raft replication), or the
-    /// **mirrored** snapshot [`remote_metadata_sync_loop`] maintains for a
-    /// control-plane-follower-less growth node (ADR 0030) whose own control
+    /// This node's best available **cache-tolerant** view of the cluster's
+    /// replicated `Metadata`: this node's own control handle's
+    /// [`ControlHandle::metadata_cached`] for a genuine control-group voter
+    /// (the common case — reflects committed state via real Raft replication),
+    /// or the **mirrored** snapshot [`remote_metadata_sync_loop`] maintains for
+    /// a control-plane-follower-less growth node (ADR 0030) whose own control
     /// `RaftCore` never receives real Raft traffic for a group it was never a
     /// voter of (`self.remote_metadata` stays `None` for every other node, so
-    /// this is a plain passthrough to `self.raft.metadata()` everywhere else —
-    /// zero behavior change).
+    /// this is a plain passthrough to `self.control.metadata_cached()`
+    /// everywhere else — zero behavior change).
     ///
-    /// **Use this, not `self.raft.metadata()` directly, for anything that must
-    /// work on a growth node**: CP routing (`tablet_for`/`resolve_cp_route`),
-    /// the per-node join-host/reconfigure loops, this node's own
-    /// address-registration commit check, and the raftkv peer-sync loop. Plain
-    /// schema-catalog reads (`table_schema`/`has_keyspace`, used by the
-    /// CQL/DynamoDB wire edges) are **not** switched — a growth node is not
-    /// expected to serve DDL locally in this v1 slice (ADR 0030); route schema
-    /// operations through an original control node.
+    /// **Use this, not `self.control.metadata_cached()` directly, for anything
+    /// that must work on a growth node**: CP routing (`tablet_for`/
+    /// `resolve_cp_route`), the per-node join-host/reconfigure loops, this
+    /// node's own address-registration commit check, the raftkv peer-sync
+    /// loop, and (ADR 0035 PR1) the general-purpose schema-catalog reads
+    /// (`table_schema`/`has_table_schema`) the CQL/DynamoDB wire edges use for
+    /// everything except their own commit-wait polls (see
+    /// [`metadata_fresh`](Self::metadata_fresh) for those). `has_keyspace` is
+    /// **not** switched — a growth node is not expected to serve DDL locally
+    /// in this v1 slice (ADR 0030); route schema operations through an
+    /// original control node.
     fn effective_metadata(&self) -> Metadata {
         if let Some(meta) = self
             .remote_metadata
@@ -1677,7 +1685,26 @@ impl ClientCtx {
         {
             return meta;
         }
-        self.raft.metadata()
+        self.control.metadata_cached()
+    }
+
+    /// This node's **read-your-writes** view of the control plane's replicated
+    /// `Metadata` (ADR 0035 PR1) — never the growth-node mirror
+    /// [`effective_metadata`](Self::effective_metadata) substitutes. For every
+    /// node today (`ControlHandle::Local`) this is this node's own control
+    /// handle's applied state, unconditionally — including on a growth node,
+    /// where it stays exactly as fresh (or as stuck) as it always was before
+    /// this seam existed.
+    ///
+    /// Used by the schema commit-wait polls (`create_table_schema`/
+    /// `replace_table_schema`/`drop_table_schema`/`trigger_split`/
+    /// `trigger_merge` below) and the DynamoDB conditional-write existence
+    /// gate (`dynamo.rs::quorum_read`'s live re-check on a snapshot miss) —
+    /// each must observe its own just-proposed command (or a concurrent
+    /// writer's) landing in the authoritative state, not a possibly-stale
+    /// mirror.
+    fn metadata_fresh(&self) -> Metadata {
+        self.control.metadata_fresh()
     }
 
     /// The client-API address `id` currently routes to, if known (ADR 0032
@@ -1987,7 +2014,9 @@ impl ClientCtx {
             return Ok(());
         }
         // Auto-provision the table's tablet on first write (ADR 0023), as `cp_write`.
-        if !self.raft.metadata().has_table_tablet(table) {
+        // Read through `effective_metadata()` so an ADR 0030 growth node (and PR4's
+        // control-less data node) consults the mirror, not an empty local core.
+        if !self.effective_metadata().has_table_tablet(table) {
             self.provision_tablet(table).await?;
         }
         // Group by owning tablet: every key of a `Batch` entry must belong to the
@@ -2169,7 +2198,8 @@ impl ClientCtx {
         if entries.is_empty() {
             return Ok(());
         }
-        if !self.raft.metadata().has_table_tablet(table) {
+        // `effective_metadata()`, not the raw handle: see `cp_batch_write`.
+        if !self.effective_metadata().has_table_tablet(table) {
             self.provision_tablet(table).await?;
         }
         let mut groups: BTreeMap<TabletId, KvPairs> = BTreeMap::new();
@@ -2288,8 +2318,8 @@ impl ClientCtx {
         // The table's tablets overlapping [start, end), in token (range.start) order.
         // `end == None` is unbounded above (a whole-table scan).
         let mut ranges: Vec<KeyRange> = self
-            .raft
-            .metadata()
+            .control
+            .metadata_cached()
             .tablets_for_table(table)
             .map(|(_, t)| t.range.clone())
             .filter(|r| {
@@ -2497,7 +2527,7 @@ impl ClientCtx {
     async fn cp_put(&self, table: &str, key: Vec<u8>, value: Vec<u8>) -> ClientResponse {
         // Auto-provision the table's tablet on first write (ADR 0023): the raw KV
         // client names a table but issues no DDL, so stand one up on demand.
-        // `effective_metadata` (not `self.raft.metadata()` directly): on a growth
+        // `effective_metadata` (not `self.control.metadata_cached()` directly): on a growth
         // node (ADR 0030) the local raft never reflects a table created before it
         // existed, which would otherwise misread every write as needing a brand
         // new (duplicate, rejected) tablet.
@@ -2598,7 +2628,7 @@ impl ClientCtx {
                 ProposeResult::Accepted { .. }
             );
         }
-        if let Some(leader_id) = self.raft.leader() {
+        if let Some(leader_id) = self.control.leader() {
             if let Some(addr) = self.route_addr(leader_id) {
                 return !matches!(
                     self.relay(addr, ClientRequest::ProposeSchema(command.clone()))
@@ -2654,7 +2684,7 @@ impl ClientCtx {
     pub(crate) async fn provision_tablet(&self, table: &str) -> Result<(), String> {
         let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
         loop {
-            let meta = self.raft.metadata();
+            let meta = self.control.metadata_cached();
             if let Some((&tablet, t)) = meta.tablets_for_table(table).next() {
                 // The tablet exists; ensure its RF policy is set, then we're done. The
                 // caller's op routes through `cp_route`, which itself waits for the
@@ -2779,7 +2809,7 @@ impl ClientCtx {
     /// reflects current activity rather than a cached value.
     pub(crate) fn metrics_text(&self) -> String {
         let snaps = [
-            self.raft.metrics().snapshot(),
+            self.control.metrics().snapshot(),
             self.raftkv_metrics.snapshot(),
         ];
         let mut counters: BTreeMap<Metric, u64> = BTreeMap::new();
@@ -2811,7 +2841,7 @@ impl ClientCtx {
     /// sinks, exactly as the text export.
     pub(crate) fn metrics_json(&self) -> (BTreeMap<String, u64>, i64) {
         let snaps = [
-            self.raft.metrics().snapshot(),
+            self.control.metrics().snapshot(),
             self.raftkv_metrics.snapshot(),
         ];
         let mut counters: BTreeMap<String, u64> = BTreeMap::new();
@@ -2848,7 +2878,7 @@ impl ClientCtx {
     /// returns an error and the operator retries on the leader). Preserves the
     /// member's existing labels. Returns the accepted state or an error.
     pub(crate) fn admin_drain(&self, node: NodeId) -> Result<(), String> {
-        let meta = self.raft.metadata();
+        let meta = self.control.metadata_cached();
         let Some(member) = meta.members.get(&node) else {
             return Err(format!("node {node} is not a cluster member"));
         };
@@ -2964,7 +2994,7 @@ impl ClientCtx {
                 ));
             }
         }
-        // Check leadership BEFORE reading `self.raft.metadata()` for the
+        // Check leadership BEFORE reading `self.control.metadata_cached()` for the
         // drain-status refusals below: a follower's own replica can lag the
         // leader's just-committed rebalance/release-GC moves (real replication
         // lag, not a bug), so evaluating "is it drained" off a follower's stale
@@ -2976,7 +3006,7 @@ impl ClientCtx {
         let Some(leader) = self.edge.leader_handle() else {
             return Err("this node is not the control-plane leader; retry on the leader".into());
         };
-        let meta = self.raft.metadata();
+        let meta = self.control.metadata_cached();
         let Some(member) = meta.members.get(&node) else {
             return Err(format!("node {node} is not a cluster member"));
         };
@@ -3144,7 +3174,7 @@ const REMOTE_METADATA_SYNC_INTERVAL: Duration = Duration::from_millis(200);
 /// `run_node_growth`'s doc). Tries every seed in order each tick, keeping
 /// whichever answers first; a no-op (returns immediately) when `seeds` is empty
 /// — the case for every node that *is* a real control-group voter, since
-/// `effective_metadata` then passes straight through to `self.raft.metadata()`
+/// `effective_metadata` then passes straight through to `self.control.metadata_cached()`
 /// and nothing needs mirroring. Best-effort: a tick where every seed is
 /// unreachable just leaves the previous snapshot in place (stale, not wrong —
 /// every consumer of `effective_metadata` already tolerates a few hundred
@@ -3241,7 +3271,7 @@ const RECONCILE_FALLBACK_INTERVAL: Duration = Duration::from_millis(500);
 /// [`CpReconciler::tick`] once.
 ///
 /// **Event-driven, with a periodic fallback**: races
-/// `ctx.raft.metadata_watch().changed(last_seen)` (an executor-agnostic
+/// `ctx.control.metadata_watch().changed(last_seen)` (an executor-agnostic
 /// "applied index advanced" notification, ADR 0031 §trigger) against a
 /// [`RECONCILE_FALLBACK_INTERVAL`] sleep. The fallback is load-bearing, not
 /// just a safety net: a control-plane-follower-less growth node's own
@@ -3267,7 +3297,7 @@ const RECONCILE_FALLBACK_INTERVAL: Duration = Duration::from_millis(500);
 /// requires its remote mirror to still be empty before skipping a tick, or a
 /// growth node's reconciler would never tick at all.
 async fn tablet_host_reconciler_loop(ctx: ClientCtx, mut reconciler: CpReconciler) {
-    let watch = ctx.raft.metadata_watch();
+    let watch = ctx.control.metadata_watch();
     let mut last_seen = watch.latest();
     loop {
         tokio::select! {
@@ -3286,7 +3316,7 @@ async fn tablet_host_reconciler_loop(ctx: ClientCtx, mut reconciler: CpReconcile
         // mirror. Before either exists, `effective_metadata()` reads as a
         // default, empty `Metadata`, which would otherwise look like
         // "everything dropped" to the reclaim/release phases.
-        if ctx.raft.last_applied() == 0
+        if ctx.control.last_applied() == 0
             && ctx
                 .remote_metadata
                 .lock()
@@ -3439,7 +3469,9 @@ async fn auto_split_loop(ctx: ClientCtx, thresholds: AutoSplitThresholds) {
     loop {
         tokio::time::sleep(AUTO_SPLIT_INTERVAL).await;
 
-        let tablets: Vec<TabletId> = ctx.raft.metadata().tablets.keys().copied().collect();
+        // `effective_metadata()` so a mirror-fed node (ADR 0030 / ADR 0035 PR4)
+        // sees the live tablet map, not an empty local core's.
+        let tablets: Vec<TabletId> = ctx.effective_metadata().tablets.keys().copied().collect();
         for tablet in tablets {
             if matches!(last_triggered.get(&tablet), Some(at) if at.elapsed() < AUTO_SPLIT_COOLDOWN)
             {
@@ -3615,9 +3647,9 @@ fn request_kind(request: &ClientRequest) -> &'static str {
 
 async fn handle_request(ctx: &ClientCtx, request: ClientRequest) -> ClientResponse {
     match request {
-        // `effective_metadata`, not `ctx.raft.metadata()` directly (mirroring
+        // `effective_metadata`, not `ctx.control.metadata_cached()` directly (mirroring
         // `/admin/status`, ADR 0030): on a control-plane-follower-less growth
-        // node the local raft never replicates, so a bare `raft.metadata()`
+        // node the local raft never replicates, so a bare `metadata_cached()`
         // would answer with a permanently-empty cluster — misleading for an
         // `animus status` CLI call, and a vacuous collision guard for an ADR
         // 0032 PR2 joiner that picked this (grown) node as its seed. Safe for
@@ -3719,22 +3751,37 @@ const CP_CONFIRM_POLL_MAX: Duration = Duration::from_millis(5);
 
 impl ClientCtx {
     /// The replicated schema for `table` (the control plane's `ks.table`-keyed
-    /// catalog, ADR 0013), read from this node's cached `Metadata`. Every node
-    /// applies committed metadata, so a follower sees a table the leader created
-    /// once the entry replicates. Returns `None` for an unknown table.
+    /// catalog, ADR 0013), read from this node's **cache-tolerant**
+    /// `effective_metadata()` (ADR 0035 PR1 — previously a bare
+    /// `self.control.metadata_cached()`, which on a control-plane-follower-less
+    /// growth node never reflects anything since that node's own local control
+    /// raft never replicates; this closes that latent staleness bug for the
+    /// CQL/DynamoDB wire edges' general schema lookups). Every node applies
+    /// committed metadata, so a follower sees a table the leader created once
+    /// the entry replicates. Returns `None` for an unknown table.
+    ///
+    /// **Not** for a schema commit-wait poll's own confirmation — those must
+    /// observe read-your-writes and go through
+    /// [`metadata_fresh`](Self::metadata_fresh) directly instead (see
+    /// `create_table_schema`/`replace_table_schema`/`drop_table_schema` below).
     pub(crate) fn table_schema(&self, table: &str) -> Option<TableSchema> {
-        self.raft.metadata().table_schema(table).cloned()
+        self.effective_metadata().table_schema(table).cloned()
     }
 
-    /// Whether `table` has a replicated schema (cached `Metadata`, ADR 0013).
+    /// Whether `table` has a replicated schema — see [`table_schema`](Self::table_schema)'s
+    /// doc for the same cache-tolerant-but-not-commit-wait-safe contract.
     pub(crate) fn has_table_schema(&self, table: &str) -> bool {
-        self.raft.metadata().has_table_schema(table)
+        self.effective_metadata().has_table_schema(table)
     }
 
     /// Whether `keyspace` is registered in the replicated catalog (v1 A3) — the
     /// CQL edge's `USE` / qualifier check, replacing per-process edge state.
+    /// **Not** switched to `effective_metadata()` (ADR 0035 PR1 leaves this one
+    /// as-is, matching the pre-existing carve-out for schema-catalog reads on a
+    /// growth node — see `effective_metadata`'s doc); a candidate for the PR5
+    /// staleness audit.
     pub(crate) fn has_keyspace(&self, keyspace: &str) -> bool {
-        self.raft.metadata().has_keyspace(keyspace)
+        self.control.metadata_cached().has_keyspace(keyspace)
     }
 
     /// Register this node's **full address book** (ADR 0032 PR1: raftkv +
@@ -3750,7 +3797,7 @@ impl ClientCtx {
     /// (bounded by [`SCHEMA_COMMIT_TIMEOUT`]); idempotent (re-registering an
     /// identical address book is a state-machine no-op).
     pub(crate) async fn register_node_addrs(&self, node: NodeId, addrs: NodeAddrs) {
-        // `effective_metadata`, not `self.raft.metadata()` directly: on a growth
+        // `effective_metadata`, not `self.control.metadata_cached()` directly: on a growth
         // node (ADR 0030) this is the *only* signal that its own self-registration
         // actually landed on the real cluster, since its local raft never
         // replicates — see `effective_metadata`'s doc. `propose_and_await`'s
@@ -3796,7 +3843,7 @@ impl ClientCtx {
         // after a `DropTableTablets`. `new_id` and `expected_epoch` come from
         // the **same** metadata snapshot so the CAS reflects exactly what this
         // call saw.
-        let meta = self.raft.metadata();
+        let meta = self.control.metadata_cached();
         let new_id = meta.next_free_tablet_id();
         let Some(expected_epoch) = meta.tablets.get(&tablet).map(|t| t.epoch) else {
             return ClientResponse::Error("no such tablet".into());
@@ -3810,8 +3857,8 @@ impl ClientCtx {
         };
         match self
             .propose_and_await(cmd, SCHEMA_COMMIT_TIMEOUT, || {
-                self.raft
-                    .metadata()
+                self.control
+                    .metadata_cached()
                     .tablets
                     .contains_key(&new_id)
                     .then_some(())
@@ -3843,7 +3890,7 @@ impl ClientCtx {
         // Both epochs come from the **same** metadata snapshot, so the CAS
         // reflects exactly what this call saw (mirroring `trigger_split`'s
         // `new_id`/`expected_epoch` pairing).
-        let meta = self.raft.metadata();
+        let meta = self.control.metadata_cached();
         let Some(expected_left_epoch) = meta.tablets.get(&left).map(|t| t.epoch) else {
             return ClientResponse::Error("no such tablet".into());
         };
@@ -3863,7 +3910,7 @@ impl ClientCtx {
         // atomically, and nothing else in this state machine produces.
         match self
             .propose_and_await(cmd, SCHEMA_COMMIT_TIMEOUT, || {
-                let m = self.raft.metadata();
+                let m = self.control.metadata_cached();
                 let left_bumped = m
                     .tablets
                     .get(&left)
@@ -3927,7 +3974,11 @@ impl ClientCtx {
     ) -> Result<(), String> {
         // Already present? Treat an identical schema as success (idempotent
         // re-create); a different one is a conflict the caller should surface.
-        if let Some(existing) = self.table_schema(&table) {
+        // Fresh, not `self.table_schema` (ADR 0035 PR1): this whole function is
+        // the CreateTable commit-wait poll, which must observe its own
+        // just-proposed command landing in the authoritative state, never a
+        // growth-node mirror that could still be a poll interval behind.
+        if let Some(existing) = self.metadata_fresh().table_schema(&table).cloned() {
             return if existing == schema {
                 Ok(())
             } else {
@@ -3940,8 +3991,10 @@ impl ClientCtx {
             table: table.clone(),
             schema: schema.clone(),
         };
-        self.propose_and_await(command, SCHEMA_COMMIT_TIMEOUT, || self.table_schema(&table))
-            .await
+        self.propose_and_await(command, SCHEMA_COMMIT_TIMEOUT, || {
+            self.metadata_fresh().table_schema(&table).cloned()
+        })
+        .await
             .map_err(|()| {
                 format!(
                     "CREATE TABLE `{table}` did not commit within {}s (no control-plane leader reachable?)",
@@ -3978,8 +4031,10 @@ impl ClientCtx {
             table: table.clone(),
             schema: schema.clone(),
         };
+        // Fresh, not `self.table_schema` (ADR 0035 PR1) — see
+        // `create_table_schema`'s identical note: this is a commit-wait poll.
         self.propose_and_await(command, SCHEMA_COMMIT_TIMEOUT, || {
-            (self.table_schema(&table).as_ref() == Some(&schema)).then_some(())
+            (self.metadata_fresh().table_schema(&table) == Some(&schema)).then_some(())
         })
         .await
         .map_err(|()| {
@@ -4019,8 +4074,8 @@ impl ClientCtx {
         // the log — but a plain-client table skips that wait.)
         self.propose_schema(&command).await;
         self.propose_and_await(command, SCHEMA_COMMIT_TIMEOUT, || {
-            self.raft
-                .metadata()
+            self.control
+                .metadata_cached()
                 .tablets_for_table(&table)
                 .next()
                 .is_none()
@@ -4044,14 +4099,16 @@ impl ClientCtx {
     /// and an `ALTER TABLE` replaces in place via
     /// [`replace_table_schema`](Self::replace_table_schema).
     pub(crate) async fn drop_table_schema(&self, table: String) -> Result<(), String> {
-        if !self.has_table_schema(&table) {
+        // Fresh, not `self.has_table_schema` (ADR 0035 PR1) — see
+        // `create_table_schema`'s identical note: this is a commit-wait poll.
+        if !self.metadata_fresh().has_table_schema(&table) {
             return Ok(());
         }
         let command = MetaCommand::DropTableSchema {
             table: table.clone(),
         };
         self.propose_and_await(command, SCHEMA_COMMIT_TIMEOUT, || {
-            (!self.has_table_schema(&table)).then_some(())
+            (!self.metadata_fresh().has_table_schema(&table)).then_some(())
         })
         .await
         .map_err(|()| {

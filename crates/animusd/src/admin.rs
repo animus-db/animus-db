@@ -292,7 +292,7 @@ async fn dispatch(ctx: &ClientCtx, request: &http::HttpRequest) -> (u16, String)
 
 fn config_view(ctx: &ClientCtx) -> Value {
     let a = &ctx.admin;
-    let meta = ctx.raft.metadata();
+    let meta = ctx.control.metadata_cached();
     let peers: std::collections::BTreeMap<String, String> = a
         .peers
         .iter()
@@ -341,8 +341,8 @@ fn peers_view(ctx: &ClientCtx) -> Value {
 }
 
 fn raft_view(ctx: &ClientCtx) -> Value {
-    let r = &ctx.raft;
-    let meta = r.metadata();
+    let r = &ctx.control;
+    let meta = r.metadata_cached();
     let members: Vec<Value> = meta
         .members
         .keys()
@@ -566,7 +566,7 @@ fn metrics_history_view(ctx: &ClientCtx) -> Value {
 }
 
 fn health(ctx: &ClientCtx) -> (u16, Value) {
-    let r = &ctx.raft;
+    let r = &ctx.control;
     let leader_known = r.leader().is_some();
     let hosts_cp = !ctx.edge.hosted_groups().is_empty();
     let body = json!({
@@ -976,7 +976,7 @@ async fn action_data_seed(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
     // table** — it never creates one. Look the table up (a read of the replicated
     // tablet map); reject if it doesn't exist — the caller must create it first.
     let table = req.table;
-    if !ctx.raft.metadata().has_table_tablet(&table) {
+    if !ctx.effective_metadata().has_table_tablet(&table) {
         return (
             404,
             serde_json::json!({
