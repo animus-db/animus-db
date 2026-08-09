@@ -209,6 +209,48 @@ async fn dashboard_serves_spa_with_cors_and_peers() {
             "peers marks the serving node: {peers}"
         );
 
+        // ---- /admin/config's derived `role` (ADR 0035 PR6) -----------------
+        // This cluster is combined-mode (every node `Both`); the dashboard
+        // renders per-node role from this same field for a split deployment
+        // (see the JS asset checks below), so a combined node reporting
+        // "combined" here is what makes that rendering honest rather than
+        // coincidentally correct.
+        let (s, _, body) = raw(admin_addr, "GET", "/admin/config").await;
+        assert_eq!(s, 200);
+        let config_view: Value = serde_json::from_str(&body).expect("config is JSON");
+        assert_eq!(
+            config_view["role"].as_str(),
+            Some("combined"),
+            "a combined-mode node's /admin/config reports role=combined: {config_view}"
+        );
+
+        // ---- the Overview view renders a node's role, including a
+        // control-only node's leader label (ADR 0035 PR6) -------------------
+        // Asserted against the JS assets that actually carry this behavior
+        // (`dashboard_core.js`'s `nodeDisplayId` helper, `dashboard_overview.js`'s
+        // use of it for the control-leader label, and its per-node role tag) —
+        // not the shell's own body, which never contained this logic even
+        // before the split-file rewrite (see this file's own note above on
+        // why that distinction matters).
+        let (s, _, core_js) = raw(admin_addr, "GET", "/admin/ui/dashboard_core.js").await;
+        assert_eq!(s, 200, "dashboard_core.js is served");
+        assert!(
+            core_js.contains("function nodeDisplayId"),
+            "dashboard_core.js defines nodeDisplayId (falls back to control_id \
+             for a control-only leader, ADR 0035)"
+        );
+        let (s, _, overview_js) = raw(admin_addr, "GET", "/admin/ui/dashboard_overview.js").await;
+        assert_eq!(s, 200, "dashboard_overview.js is served");
+        assert!(
+            overview_js.contains("nodeDisplayId(h.controlLeader)"),
+            "the control-plane tile/banner label the leader via nodeDisplayId, \
+             not nodeRaftkvId (which is null for a control-only leader)"
+        );
+        assert!(
+            overview_js.contains("config.role"),
+            "the nodes list renders each row's role (control/data/combined)"
+        );
+
         for node in &nodes {
             node.shutdown_graceful().await;
         }

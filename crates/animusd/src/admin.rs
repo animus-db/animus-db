@@ -304,7 +304,19 @@ fn config_view(ctx: &ClientCtx) -> Value {
         .iter()
         .map(|(id, addr)| (id.to_string(), addr.to_string()))
         .collect();
+    // Derived from the same two `Option`s the dashboard would otherwise have
+    // to null-check itself (ADR 0035 PR6) — "control" (no `raftkv_id`),
+    // "data" (no `control_id`), or "combined" (both present, every shape
+    // before this ADR and still what `--cluster N`/plain `--config`/`--node`
+    // assemble). One string a node-identity row can show directly.
+    let role = match (a.control_id.is_some(), a.raftkv_id.is_some()) {
+        (true, false) => "control",
+        (false, true) => "data",
+        (true, true) => "combined",
+        (false, false) => "unknown", // structurally shouldn't happen
+    };
     json!({
+        "role": role,
         // `null` on a data-only node (ADR 0035 PR4) — it has no local control
         // `RaftCore`/id at all.
         "control_id": a.control_id,

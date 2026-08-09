@@ -258,12 +258,21 @@ documented port-TOCTOU bring-up retry.
   naturally do after growing a cluster. Closing this fully needs a second,
   replicated client-address map (mirroring `cp_member_addrs`, but for the
   client-facing port) — left as follow-up, not required for the stated
-  "rebalancing works, reads/writes keep working" bar.
+  "rebalancing works, reads/writes keep working" bar. **Update (ADR 0032
+  PR1): closed.** `Metadata.node_addrs` + `route_sync_loop` keep every node's
+  `client_route` live (static seed ∪ replicated overlay), so an original
+  node now forwards correctly to a leader that has since moved onto a node
+  grown in afterward — see ADR 0032's own doc for the mechanism.
 - A growth node does not serve schema-catalog reads/writes
   (`table_schema`/`has_keyspace`, used by the CQL/DynamoDB wire edges) through
   its own mirror — only the CP routing / hosting paths were switched to
   `effective_metadata()`. Route DDL through an original control node in this
-  v1 slice.
+  v1 slice. **Update: closed.** `table_schema`/`has_table_schema` were
+  switched to `effective_metadata()` (`ClientCtx::table_schema`, `lib.rs`);
+  `has_keyspace` was removed as dead code once `create_keyspace` was moved to
+  read `metadata_fresh()` directly (the same read-your-writes contract
+  `create_table_schema` already used) — see the ADR 0035 PR5 staleness-audit
+  note in `crates/animusd/CLAUDE.md` for the fix that also touched this path.
 
 ## Engineering lesson
 
@@ -275,3 +284,17 @@ does, by its own admission) only proves the *planner*, never the actual growth
 `raftkv_ids` from `control_ids.len()` looks like an implementation detail, but
 it is the entire ceiling. Recorded in the root `CLAUDE.md` Engineering
 Practices section.
+
+## Amended by ADR 0035
+
+[ADR 0035](0035-control-plane-separate-deployment.md) generalizes this ADR's
+non-voter control-core mirror (`remote_metadata_sync_loop` /
+`ClientCtx::effective_metadata()`) from "what a growth node falls back to"
+into `ControlHandle::Remote` — the *only* way any data-only node ever sees
+`Metadata`, with no local control `RaftCore` at all (not even a non-voter
+one). This ADR's finding that a non-voter's local `Metadata` never advances
+via real Raft replication, no matter how long it waits, is exactly the
+observation ADR 0035 cites as proof the mirror path was already sufficient on
+its own. The control group's static size (this ADR's own accepted
+limitation, above) is unchanged by the split — ADR 0035 relocates the static
+group into its own deployment, it does not make it elastic.
