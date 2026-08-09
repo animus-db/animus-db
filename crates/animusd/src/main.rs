@@ -234,11 +234,12 @@ async fn run_join(args: &[String]) -> Result<(), String> {
     let base_port = base_port.unwrap_or(7100_u16.wrapping_add((index as u16).wrapping_mul(6)));
     let p = |role: u16| SocketAddr::new(ip, base_port.wrapping_add(role));
     let addrs = RoleAddrs {
-        control: p(0),
+        role: animusd::config::NodeRole::Both,
+        control: Some(p(0)),
         client: p(1),
         dynamo: p(2),
         cql: p(3),
-        raftkv: p(4),
+        raftkv: Some(p(4)),
         admin: p(5),
     };
     let dir = dir.unwrap_or_else(|| std::env::temp_dir().join(format!("animusd-join-{index}")));

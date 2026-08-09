@@ -700,9 +700,42 @@ pub enum ClientResponse {
 /// control + **raftkv** (CP per-tablet Raft) internal `ProdEnv` roles + the client
 /// API + the DynamoDB HTTP and CQL endpoints. v1 (ADR 0019) is CP-only — the AP
 /// `data`/`coord` roles are gone.
+///
+/// **ADR 0035** adds [`role`](Self::role): a node declares whether it runs the
+/// control role, the data role, or both (`Both`, the default — and, before
+/// this ADR, the *only* shape). `control` and `raftkv` are therefore
+/// `Option` — `None` when the corresponding role isn't run (a data-only
+/// node has no `control` address; a control-only node has no `raftkv`
+/// address) — while `client`/`admin` (both roles serve them) and
+/// `dynamo`/`cql` (unused by a control-only node today, but already
+/// optional-by-default for older configs via `default_ephemeral_addr`, so
+/// there was no back-compat reason to change their type here) stay plain
+/// `SocketAddr`. See `crate::config::NodeRole` for the role-derived
+/// `ClusterConfig` helpers (`control_ids`/`raftkv_ids`/`control_peer_book`/
+/// `raftkv_peer_book`) that key off this field. This PR (ADR 0035 PR2) is the
+/// config layer only: every entry point still requires both `control` and
+/// `raftkv` to be `Some` (i.e. `Both`) — actually assembling a control-only
+/// or data-only *process* is PR3/PR4.
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct RoleAddrs {
-    pub control: SocketAddr,
+    /// Which role(s) this node runs (ADR 0035). Defaults to
+    /// [`Both`](config::NodeRole::Both) when absent — the shape every config
+    /// used before this field existed.
+    #[serde(default)]
+    pub role: config::NodeRole,
+    /// The control-plane Raft listen address. `None` for a data-only node
+    /// (ADR 0035); always `Some` for `Control`/`Both`. **Defaults to
+    /// `Some(ephemeral)`, not `None`, when the key is absent from JSON
+    /// entirely** — mirroring `dynamo`/`cql`/`admin`'s existing
+    /// "missing-in-an-old-config means ephemeral" contract below, so a
+    /// hand-truncated or pre-this-field config (which never declared `role`
+    /// either, hence defaults to `Both`) still means combined mode, not a
+    /// role/address mismatch. A JSON value of explicit `null` (which only a
+    /// role-aware writer, e.g. [`ClusterConfig::generate_split`], ever
+    /// produces) still deserializes to `None` — this default only applies
+    /// when the key is missing outright.
+    #[serde(default = "default_ephemeral_control_addr")]
+    pub control: Option<SocketAddr>,
     pub client: SocketAddr,
     /// The DynamoDB JSON-over-HTTP endpoint. Defaults (when absent in older
     /// configs) to an ephemeral loopback port.
@@ -713,10 +746,14 @@ pub struct RoleAddrs {
     #[serde(default = "default_ephemeral_addr")]
     pub cql: SocketAddr,
     /// The **leaderful CP** per-tablet Raft role's internal `ProdEnv` listen
-    /// address (ADR 0017 #3a) — the data plane. Defaults (when absent in older
-    /// configs) to an ephemeral loopback port.
-    #[serde(default = "default_ephemeral_addr")]
-    pub raftkv: SocketAddr,
+    /// address (ADR 0017 #3a) — the data plane. `None` for a control-only
+    /// node (ADR 0035); always `Some` for `Data`/`Both`. Same
+    /// missing-key-defaults-to-`Some(ephemeral)` back-compat reasoning as
+    /// `control` above (this is the field that actually matters for
+    /// back-compat: every pre-ADR-0017 config lacks `raftkv` entirely, and
+    /// must still mean "combined mode, give it an ephemeral raftkv port").
+    #[serde(default = "default_ephemeral_raftkv_addr")]
+    pub raftkv: Option<SocketAddr>,
     /// The **admin / debug** HTTP-JSON endpoint (ADR 0020) — a read-only
     /// introspection + operator-action surface on its own port, isolated from the
     /// client/dynamo/cql data edges. Defaults (when absent in older configs) to an
@@ -729,6 +766,18 @@ pub struct RoleAddrs {
 /// port on the loopback (the real port is learned after bind).
 fn default_ephemeral_addr() -> SocketAddr {
     SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0)
+}
+
+/// `RoleAddrs.control`'s missing-key default (ADR 0035): `Some`, not `None`
+/// — see that field's doc.
+fn default_ephemeral_control_addr() -> Option<SocketAddr> {
+    Some(default_ephemeral_addr())
+}
+
+/// `RoleAddrs.raftkv`'s missing-key default (ADR 0035): `Some`, not `None`
+/// — see that field's doc.
+fn default_ephemeral_raftkv_addr() -> Option<SocketAddr> {
+    Some(default_ephemeral_addr())
 }
 
 /// A node whose listeners are bound but whose protocols are not yet started.
@@ -820,6 +869,11 @@ impl BoundNode {
     /// Wire the peer address book into every env and start all protocols, with
     /// the CP group backed by the durable on-disk [`LsmEngine`]
     /// ([`StorageBackend::Lsm`]). `control_ids` is the full control group.
+    /// Combined-mode-only convenience: derives the `data_raftkv_ids`
+    /// [`start_with`](Self::start_with) now takes explicitly by assuming
+    /// every id in `control_ids` is also a data-role node's control id (true
+    /// for every caller of this simpler entry point — nothing calls it with
+    /// a split-role `control_ids`).
     ///
     /// # Errors
     /// Propagates a failure to open the CP group's on-disk engine.
@@ -829,9 +883,14 @@ impl BoundNode {
         control_ids: Vec<NodeId>,
     ) -> std::io::Result<Node> {
         let admin_addr = self.admin_addr;
+        let data_raftkv_ids = control_ids
+            .iter()
+            .map(|&id| config::raftkv_id(id as usize))
+            .collect();
         self.start_with(
             peers,
             control_ids,
+            data_raftkv_ids,
             StorageBackend::default(),
             ClusterEdgeState::new(),
             BTreeMap::new(),
@@ -851,6 +910,19 @@ impl BoundNode {
     /// (approximate) scoped-bytes trigger. Either, both, or neither may be
     /// `Some`; `(None, None)` (the default) disables auto-split entirely.
     ///
+    /// `data_raftkv_ids` (ADR 0035 PR2) is the set of `raftkv` ids
+    /// [`bootstrap`] auto-registers as `Active` data members — i.e. the ids
+    /// of nodes that actually run the **data** role. Before ADR 0035 this was
+    /// computed unconditionally as `(0..control_ids.len()).map(raftkv_id)`,
+    /// silently assuming every control-group index also ran the data role;
+    /// callers now compute it explicitly (in combined mode, still every
+    /// control id's paired `raftkv_id` — see [`ClusterConfig::raftkv_ids`] —
+    /// so combined-mode behavior is byte-for-byte unchanged). A growth/join
+    /// caller passes the **pre-growth** set here too, mirroring
+    /// `control_ids`: bootstrap must never auto-register a growth node itself
+    /// (it self-registers `Down` via `admin_add_member` instead, promoted to
+    /// `Active` by its own heartbeat — see `run_node_growth`'s doc).
+    ///
     /// # Errors
     /// Propagates a failure to open the CP group's on-disk engine (LSM backend
     /// only).
@@ -859,6 +931,7 @@ impl BoundNode {
         self,
         peers: BTreeMap<NodeId, SocketAddr>,
         control_ids: Vec<NodeId>,
+        data_raftkv_ids: Vec<NodeId>,
         backend: StorageBackend,
         edge: ClusterEdgeState,
         client_route: BTreeMap<NodeId, SocketAddr>,
@@ -1001,7 +1074,6 @@ impl BoundNode {
             metrics_history: Arc::new(Mutex::new(VecDeque::with_capacity(METRICS_HISTORY_CAP))),
             remote_metadata: Arc::new(Mutex::new(None)),
         };
-        let n = control_ids.len();
 
         // The per-node **tablet-host reconciler** (ADR 0031 PR4): the single
         // writer of "does this node host tablet T" — see
@@ -1052,8 +1124,11 @@ impl BoundNode {
         // abort them and release the client/dynamo/cql listener ports (these run
         // on plain `tokio::spawn`, off the `Env` network).
         let mut tasks = Vec::with_capacity(6);
-        let raftkv_ids: Vec<NodeId> = (0..n).map(config::raftkv_id).collect();
-        tasks.push(tokio::spawn(bootstrap(raft.clone(), raftkv_ids)));
+        // ADR 0035 PR2: `data_raftkv_ids` is caller-supplied (see `start_with`'s
+        // doc) — no longer derived here from `control_ids.len()`, so a caller
+        // that scopes it to only the data-role nodes (or, for growth/join, the
+        // pre-growth set) is respected exactly.
+        tasks.push(tokio::spawn(bootstrap(raft.clone(), data_raftkv_ids)));
 
         // Peer-sync loop (Phase 2.3a): keep the raftkv family's peer book =
         // `static ∪ Metadata.cp_member_addrs`, so a runtime-registered CP member
@@ -1236,8 +1311,18 @@ impl Node {
     /// TCP server + the DynamoDB HTTP and CQL endpoints) and create its data
     /// directory.
     ///
+    /// This PR (ADR 0035 PR2) is the config layer only: `Node::bind` still
+    /// unconditionally requires both a control and a raftkv address (i.e.
+    /// `addrs.role` must be [`Both`](config::NodeRole::Both), today's only
+    /// real shape) — a control-only or data-only `RoleAddrs` fails cleanly
+    /// here rather than binding a wrong/missing listener. Dedicated
+    /// control-only/data-only bind paths that only bind what each role needs
+    /// are PR3/PR4.
+    ///
     /// # Errors
-    /// Propagates any bind / directory-creation failure.
+    /// Returns `InvalidInput` if `addrs` is missing the `control` or `raftkv`
+    /// address this combined-mode bind requires, or propagates any bind /
+    /// directory-creation failure.
     pub async fn bind(
         control_id: NodeId,
         raftkv_id: NodeId,
@@ -1245,15 +1330,30 @@ impl Node {
         data_dir: impl Into<PathBuf>,
     ) -> std::io::Result<BoundNode> {
         let dir = data_dir.into();
+        let control_listen = addrs.control.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Node::bind requires a control address (RoleAddrs.control is None — \
+                 a control-only/data-only split-deployment node isn't bindable through \
+                 this combined-mode path yet, ADR 0035 PR3/PR4)",
+            )
+        })?;
         let (control_env, control_addr) =
-            ProdEnv::bind(control_id, addrs.control, dir.join("control")).await?;
+            ProdEnv::bind(control_id, control_listen, dir.join("control")).await?;
         // The leaderful CP per-tablet Raft role's internal env (ADR 0017 #3a) — the
         // v1 data plane; distinct id/port/dir from the control role (single-consumer
         // inbox). Since ADR 0026 Stage B every tablet this node hosts shares this
         // **one** env, addressed by `stream` (the tablet id) — no more per-tablet
         // sibling inbox to pre-bind (`Coresident`/`CP_SIBLING_POOL` are gone).
+        let raftkv_listen = addrs.raftkv.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Node::bind requires a raftkv address (RoleAddrs.raftkv is None — \
+                 see the control-address error above)",
+            )
+        })?;
         let (raftkv_env, raftkv_addr) =
-            ProdEnv::bind(raftkv_id, addrs.raftkv, dir.join("raftkv")).await?;
+            ProdEnv::bind(raftkv_id, raftkv_listen, dir.join("raftkv")).await?;
         let client_listener = TcpListener::bind(addrs.client).await?;
         let client_addr = client_listener.local_addr()?;
         let dynamo_listener = TcpListener::bind(addrs.dynamo).await?;
@@ -3068,6 +3168,13 @@ impl ClientCtx {
 /// to `Down` after one ordinary `DETECT_TIMEOUT`, same as any other failure,
 /// while a node whose real heartbeat arrives promptly (the overwhelmingly
 /// common case) is unaffected.
+///
+/// **`raftkv_ids` is caller-supplied (ADR 0035 PR2)** — the raftkv ids of
+/// nodes that actually run the **data** role, scoped by
+/// [`BoundNode::start_with`]'s `data_raftkv_ids` parameter, not derived here
+/// from a bare node count. In combined mode (every node `Both`, still the
+/// only shape any entry point actually assembles) this is every control id's
+/// paired `raftkv_id`, unchanged from before this ADR.
 async fn bootstrap(raft: RaftNode<ProdEnv>, raftkv_ids: Vec<NodeId>) {
     loop {
         if raft.is_leader() {
@@ -4173,11 +4280,12 @@ pub async fn bind_cluster(
     for i in 0..n {
         let addr = || SocketAddr::new(ip, 0);
         let addrs = RoleAddrs {
-            control: addr(),
+            role: config::NodeRole::Both,
+            control: Some(addr()),
             client: addr(),
             dynamo: addr(),
             cql: addr(),
-            raftkv: addr(),
+            raftkv: Some(addr()),
             admin: addr(),
         };
         let node = Node::bind(
@@ -4265,6 +4373,13 @@ async fn start_cluster_inner(
 ) -> std::io::Result<Vec<Node>> {
     let n = bound.len();
     let control_ids: Vec<NodeId> = (0..n).map(config::control_id).collect();
+    // ADR 0035 PR2: `bind_cluster` (the only producer of a `Vec<BoundNode>`
+    // this function is ever called with) always assembles combined-mode
+    // (`Both`-role) nodes, so every bound node's own `raftkv_id` is a genuine
+    // data-role member — read straight off each `BoundNode` rather than
+    // re-deriving from `control_ids`, so this stays correct even if a future
+    // caller's `bound` isn't a contiguous `0..n` index range.
+    let data_raftkv_ids: Vec<NodeId> = bound.iter().map(|b| b.raftkv_id).collect();
     let peers: BTreeMap<NodeId, SocketAddr> =
         bound.iter().flat_map(BoundNode::peer_entries).collect();
     // Cross-node routing (ADR 0017 #3b / ADR 0013): map each node's CP group
@@ -4293,6 +4408,7 @@ async fn start_cluster_inner(
             .start_with(
                 peers.clone(),
                 control_ids.clone(),
+                data_raftkv_ids.clone(),
                 backend,
                 // A fresh, node-local edge-state set per node — never shared
                 // across the in-process cluster (see the `client_route`
@@ -4365,6 +4481,7 @@ pub async fn run_node_with(
         .start_with(
             config.peer_book(),
             config.control_ids(),
+            config.raftkv_ids(),
             backend,
             ClusterEdgeState::new(),
             client_route,
@@ -4432,10 +4549,22 @@ pub async fn run_node_growth(
         client_route.insert(config::control_id(i), addrs.client);
     }
     let admin_addrs: Vec<SocketAddr> = config.nodes.iter().map(|n| n.admin).collect();
+    // ADR 0035 PR2: `bootstrap` must never auto-register this growth node
+    // itself (it self-registers `Down` via `admin_add_member` instead, see
+    // this fn's doc) — so, mirroring `original_control_ids`, scope
+    // `data_raftkv_ids` to the **pre-growth** set's paired raftkv ids, not
+    // `config`'s (expanded) `raftkv_ids()`. Identical to what `start_with`
+    // used to derive unconditionally from `control_ids.len()` before this
+    // parameter existed.
+    let data_raftkv_ids: Vec<NodeId> = original_control_ids
+        .iter()
+        .map(|&id| config::raftkv_id(id as usize))
+        .collect();
     bound
         .start_with(
             config.peer_book(),
             original_control_ids,
+            data_raftkv_ids,
             backend,
             ClusterEdgeState::new(),
             client_route,
@@ -4558,6 +4687,24 @@ pub async fn run_node_join(
             "join needs at least one --seed address",
         ));
     }
+    // ADR 0035 PR2 is the config layer only: `run_node_join` still only
+    // supports joining as a combined-mode (`Both`-role) node — fail fast with
+    // a join-specific message rather than surfacing `Node::bind`'s generic
+    // one later, once discovery/collision-guard work has already happened.
+    let my_raftkv_addr = addrs.raftkv.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "join needs a raftkv address (RoleAddrs.raftkv is None) — \
+             data-only join is ADR 0035 PR3/PR4",
+        )
+    })?;
+    if addrs.control.is_none() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "join needs a control address (RoleAddrs.control is None) — \
+             control-only join is ADR 0035 PR3/PR4",
+        ));
+    }
     let my_control_id = config::control_id(index);
     let my_raftkv_id = config::raftkv_id(index);
 
@@ -4581,7 +4728,7 @@ pub async fn run_node_join(
     match poll_seeds_for(&seeds, &ClientRequest::Status, JOIN_DISCOVERY_BUDGET).await? {
         ClientResponse::Status(meta) => {
             let mine = NodeAddrs {
-                raftkv: addrs.raftkv.to_string(),
+                raftkv: my_raftkv_addr.to_string(),
                 client: addrs.client.to_string(),
                 admin: addrs.admin.to_string(),
             };
@@ -4620,10 +4767,18 @@ pub async fn run_node_join(
         admin_addrs.push(addrs.admin);
     }
 
+    // ADR 0035 PR2: as in `run_node_growth`, `bootstrap` must never
+    // auto-register this joining node itself — scope `data_raftkv_ids` to
+    // the pre-growth set discovered via `JoinInfo`, not including this node.
+    let data_raftkv_ids: Vec<NodeId> = original_control_ids
+        .iter()
+        .map(|&id| config::raftkv_id(id as usize))
+        .collect();
     bound
         .start_with(
             peers,
             original_control_ids,
+            data_raftkv_ids,
             backend,
             ClusterEdgeState::new(),
             client_route,
@@ -4711,6 +4866,7 @@ mod split_fence_tests {
     use std::net::SocketAddr;
     use std::time::Duration;
 
+    use crate::config::NodeRole;
     use crate::{
         ClientCtx, ClientRequest, ClientResponse, ClusterConfig, RoleAddrs, read_frame, run_node,
         write_frame,
@@ -4797,11 +4953,12 @@ mod split_fence_tests {
             let addrs = free_addrs(6);
             let config = ClusterConfig {
                 nodes: vec![RoleAddrs {
-                    control: addrs[0],
+                    role: NodeRole::Both,
+                    control: Some(addrs[0]),
                     client: addrs[1],
                     dynamo: addrs[2],
                     cql: addrs[3],
-                    raftkv: addrs[4],
+                    raftkv: Some(addrs[4]),
                     admin: addrs[5],
                 }],
             };

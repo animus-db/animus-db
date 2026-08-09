@@ -695,6 +695,55 @@ to the archive stays in place below.
   viable" as a permanent wall.**
 
 ### Code patterns
+- **Converting a required address field with an ephemeral-fallback default
+  (`SocketAddr` + `#[serde(default = "default_ephemeral_addr")]`) to
+  `Option<SocketAddr>` and reusing a bare `#[serde(default)]` silently changes
+  what "missing from JSON" means — from "give it a working ephemeral value"
+  to "this role isn't run here."** Splitting `animusd`'s `RoleAddrs.control`/
+  `raftkv` into per-role `Option<SocketAddr>` (ADR 0035 PR2 — a data-only node
+  has no `control` address, a control-only node has no `raftkv` address),
+  `#[serde(default)]` on `Option<T>` defaults a wholly-missing key to `None`,
+  not to the old ephemeral fallback — so an ancient config (predating the
+  `raftkv` field, hence always missing it, and also predating `role` so it
+  defaults to `Both`) would deserialize as "`Both`-role but no `raftkv`
+  address," an internally inconsistent state the actual entry points (`Node::
+  bind`) then reject as a hard error. Caught immediately by a same-PR back-
+  compat unit test built specifically to probe this case
+  (`oldest_json_shape_missing_optional_fields_loads`) rather than discovered
+  later against a real old config. Fix: give the field its own named default
+  function returning `Some(default_ephemeral_addr())`, so a wholly-absent key
+  still means "ephemeral, combined mode" while an explicit JSON `null` (only
+  ever written by a role-aware producer) still means `None`. **When narrowing
+  a field's type from `T` to `Option<T>` for a new "this doesn't apply"
+  case, re-derive what a *missing key* should mean — don't assume
+  `#[serde(default)]`'s blanket `None` matches the old defaulted-`T`
+  behavior; write a test that deserializes the actual old-shape JSON (not
+  just the new struct's `Default`) to prove it.** (`animusd::RoleAddrs`,
+  `config.rs`.)
+- **Splitting a peer/address book by role must still satisfy any consumer that
+  legitimately spans roles — enumerate cross-role wiring before assuming
+  "role A's book" and "role B's book" are each other's complement.**
+  Decoupling `animusd`'s single `peer_book()` into `control_peer_book()` (ADR
+  0035 PR2) surfaced that a **data**-role node's `raftkv` env is not a pure
+  data-role consumer: `heartbeat_loop` (ADR 0012 failure detection) runs *on*
+  that env and sends `RaftMsg::Heartbeat` to the **control** ids — so a
+  future data-only node whose `raftkv` env peer book was installed as
+  `raftkv_peer_book()` alone would have the control ids simply absent from
+  its own book, and every heartbeat would have nowhere to route, silently
+  killing failure detection for the whole data fleet with no error anywhere
+  (`set_peers` with a missing entry just drops the send — no panic, no log).
+  The fix is not a new book, just documentation + a test proving it: the
+  correct book for that env is the **union** (`raftkv_peer_book() ∪
+  control_peer_book()`, i.e. `peer_book()` itself) — call this out explicitly
+  in the narrower book's doc comment, and add a unit test that demonstrates
+  the negative (the narrow book alone lacks the ids a real consumer needs)
+  before asserting the union has them. General check when splitting a
+  previously-unified resource by role/tier: for each new narrower view, ask
+  "does anything that conceptually belongs to the *other* side still need to
+  read this one" — a cross-cutting concern (heartbeats, tracing, metrics) is
+  exactly where this hides, because it rides on a role's transport without
+  being that role's own data. (`animusd::config::{control_peer_book,
+  raftkv_peer_book}`.)
 - **A health/status rollup that gates on a *proxy* signal (a member's `Down`
   status) rather than the actual risk that signal stands in for (a tablet
   under-replicated/leaderless) can diverge from reality forever, because the

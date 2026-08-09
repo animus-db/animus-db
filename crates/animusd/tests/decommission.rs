@@ -52,11 +52,12 @@ async fn bring_up(n: usize, dir: &Path) -> (Vec<Node>, ClusterConfig) {
         let addrs = free_addrs(n * 6);
         let nodes_cfg: Vec<RoleAddrs> = (0..n)
             .map(|i| RoleAddrs {
-                control: addrs[6 * i],
+                role: animusd::config::NodeRole::Both,
+                control: Some(addrs[6 * i]),
                 client: addrs[6 * i + 1],
                 dynamo: addrs[6 * i + 2],
                 cql: addrs[6 * i + 3],
-                raftkv: addrs[6 * i + 4],
+                raftkv: Some(addrs[6 * i + 4]),
                 admin: addrs[6 * i + 5],
             })
             .collect();
@@ -111,11 +112,12 @@ async fn join_fresh(
     for attempt in 0..16 {
         let raw = free_addrs(6);
         let addrs = RoleAddrs {
-            control: raw[0],
+            role: animusd::config::NodeRole::Both,
+            control: Some(raw[0]),
             client: raw[1],
             dynamo: raw[2],
             cql: raw[3],
-            raftkv: raw[4],
+            raftkv: Some(raw[4]),
             admin: raw[5],
         };
         let node_dir = dir.join(format!("join-{index}-{attempt}"));
