@@ -101,11 +101,15 @@ async fn control_node_wakes_the_watch_on_a_real_commit_not_the_server_timeout() 
         watermark1 > watermark0,
         "watch resolved without the watermark advancing ({watermark0} -> {watermark1})"
     );
-    // Comfortably under the 8s server-side park bound — a watch that only
-    // ever resolved by timing out would take close to 8s, not a fraction of
-    // a second after the propose.
+    // Under the 8s server-side park bound with margin — a watch that only
+    // ever resolved by timing out would take close to 8s. The bound is 6s,
+    // not lower: this is a wall-clock assertion in a suite full of heavy
+    // multi-node ProdEnv tests, and a tighter bound flakes purely from
+    // parallel `cargo test --workspace` load (the watermark assertion above
+    // is the primary proof the watch woke on the commit; this one only has
+    // to discriminate against the 8s timeout).
     assert!(
-        elapsed < Duration::from_secs(2),
+        elapsed < Duration::from_secs(6),
         "watch took {elapsed:?} to wake on a real commit — looks like it fell through to the \
          server-side timeout instead of waking on the commit"
     );

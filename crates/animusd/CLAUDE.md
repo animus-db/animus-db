@@ -1180,6 +1180,50 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
     this rewrite touched the same test. When splitting a previously-inline asset
     into files, re-audit every test assertion that greps the *original*
     response body for content that may have moved.
+    - **A split deployment (ADR 0035) needed one real bug fix and one
+      additive field, not a new panel.** `/admin/config` gained a derived
+      `role` string (`"control"`/`"data"`/`"combined"`, from the same
+      `control_id`/`raftkv_id` `Option`s the JSON already carried — cheaper
+      for every consumer than re-deriving the null-check itself). The
+      Overview's node list now shows every CONTROL-only node too (previously
+      it only ever iterated `Metadata.members`, which a control-only node is
+      never a part of — see the crate's "the cluster's members are the CP
+      raftkv nodes" entry above — so a control node was invisible anywhere
+      in the dashboard), tagging each row with its role. Finding this
+      surfaced a **real, pre-existing latent bug**: the "control leader"
+      label (the health banner and the "Control plane" stat tile) resolved
+      the leader's display id via `nodeRaftkvId`, which returns the node's
+      `raftkv_id` — `null` for a control-only node — so a split deployment's
+      Overview would have rendered "control leader node null" the first time
+      its leader happened to be a control-only node (in combined mode this
+      was invisible, because every node has a `raftkv_id`, so the bug had
+      zero blast radius until a role that lacks one existed at all). Fixed
+      with a new `nodeDisplayId` helper (`dashboard_core.js`) — prefers
+      `raftkv_id`, falls back to `control_id` — used only at the two
+      "identify an arbitrary node" call sites; every existing `nodeRaftkvId`
+      call site is a raftkv-id-*keyed lookup* (matching a CP group's owning
+      node, or a `Metadata.members` row), which structurally never receives
+      a control-only node in the first place, so those were correctly left
+      alone. **General lesson: a "get this node's id" helper that silently
+      returns one specific role's id field breaks the moment a node without
+      that field exists — audit every call site for "is this matching by
+      that id" (safe) vs. "is this just labeling an arbitrary node for a
+      human" (needs the fallback) before reusing it.** No other view needed
+      changes: every node-local storage/raftkv query is either fetched
+      tolerantly for every node during the fan-out (`/admin/raftkv`/
+      `/admin/health` already answer a control-only node with an honest
+      empty/false result, not an error — no `Remote`/control-only-specific
+      code exists in `admin.rs` for them at all) or is only ever issued
+      on-demand against a node already filtered to "hosts this tablet"
+      (the Storage view's node dropdown, the Tablets detail panel's storage
+      fetch) — a control-only node structurally never hosts a tablet, so it
+      was already excluded by the existing filter, not by a new one. And
+      `computeHealth()`'s only per-node read of control leadership
+      (`n.raft.is_leader`) is a `.find()` across every node for "is *anyone*
+      leader" — a single data node's `is_leader: false` was never a
+      per-node degrade signal to begin with, so point (c) of the review
+      ("don't read a data node's non-leadership as degraded") was already
+      satisfied by the existing design; verified, not changed.
     - **Displayed keys show the partition token as unpadded base64url**
       (`admin.rs::key_display`): a wire-edge/seeder key is `token || escape(pk) ||
       rk` (ADR 0022), and the leading `TOKEN_BYTES` are a **binary** Murmur3 token
@@ -1447,6 +1491,24 @@ over to a remaining control seed when one control node goes down, and a
 data-node restart re-hosting its tablet from the surviving replica's real
 Raft replication — the ephemeral memory backend is deliberate here, so
 catch-up can only be real replication, never a local reopen),
+`tests/data_join.rs` (ADR 0035 PR5, `animusd data --seed`: a data-only node
+joins a running split cluster via `JoinInfo` discovery with no local control
+`RaftCore` at all, is promoted `Active` with zero operator admin calls, gains
+a real rebalanced tablet replica, and reads/writes round-trip through it both
+ways), `tests/watch_metadata.rs` (ADR 0035 PR5, the long-poll
+`ClientRequest::WatchMetadata` wire primitive: a genuine control replica
+wakes a parked watch on the actual commit, well inside its server-side
+timeout bound, and a data-only node rejects the request outright rather than
+degrading), `tests/split_cluster.rs` (ADR 0035 PR6, scenarios spanning a
+**genuine** split deployment — real `animusd control` + `animusd data`
+processes, no combined-mode node anywhere — beyond PR3–PR5's own coverage:
+control-LEADER failover under live data traffic with no lost acked write and
+a post-failover DDL still committing; tablet split + merge triggered against
+the data fleet's own admin port; a data-node failure detected and repaired
+onto a spare; decommission of a data node gated to the control leader's
+admin port, with the data node's own admin port refusing with a
+leader-routing hint; and a full stop/restart of every process recovering
+both control metadata and data from disk),
 `tests/dynamo_wire.rs` (PutItem → GetItem → DeleteItem over the real DynamoDB
 JSON/HTTP wire), `tests/cql_wire.rs` (STARTUP → CREATE KEYSPACE/USE/CREATE
 TABLE → PREPARE INSERT → EXECUTE with typed bound values → typed SELECT, columns

@@ -1,8 +1,8 @@
 # ADR 0035 — Control plane as a separate deployment
 
-- **Status:** Proposed. Delivery is a 6-PR stack (§Delivery plan); this ADR is
-  PR0. Amends ADR 0030 (data-plane-only growth) and ADR 0032 (seed/join,
-  address book) — see the note at the end of each amended ADR.
+- **Status:** Implemented — PR0 through PR6 are all shipped (§Delivery plan).
+  Amends ADR 0030 (data-plane-only growth) and ADR 0032 (seed/join, address
+  book) — see the note at the end of ADR 0030 and the top of ADR 0032.
 - **Date:** 2026-08-09
 
 ## Context
@@ -255,11 +255,52 @@ low-risk mechanical piece first (ADR 0031/0032's PR stacks):
    `trigger_merge`'s *epoch*-staleness tolerance, distinct from the
    permanently-empty-view bug fixed alongside it). See `crates/animusd/
    CLAUDE.md`'s "What's non-obvious" entries for the full detail.
-7. **PR6: per-process split-cluster integration tests + docs/dashboard.**
-   End-to-end tests running a real `animusd control` process alongside
-   several real `animusd data` processes (not combined mode); dashboard and
-   `CLAUDE.md` updates reflecting the new topology as a first-class,
-   documented deployment shape rather than only combined mode.
+7. **PR6 (implemented): per-process split-cluster integration tests +
+   docs/dashboard.** End-to-end tests running real `animusd control`
+   processes alongside real `animusd data` processes (not combined mode,
+   `tests/split_cluster.rs` plus the PR3/PR4/PR5 coverage already in
+   `control_only.rs`/`data_only.rs`/`data_join.rs`/`watch_metadata.rs`):
+   control-leader failover under live data traffic, tablet split + merge
+   triggered against the data fleet's own admin port, a data-node failure
+   detected and repaired onto a spare, decommission of a data node gated to
+   the control leader's admin port (a data node's own admin port refuses
+   with a leader-routing hint — it never registers a local control handle
+   at all), and a full stop/restart of every process recovering both
+   control metadata and data. Dashboard and `CLAUDE.md` updates reflecting
+   the new topology as a first-class, documented deployment shape rather
+   than only combined mode.
+
+### Rolling upgrade / mixed-version compatibility
+
+A cluster transitioning onto ADR 0035 (an old binary/config on some nodes,
+a new one on others, mid-rollout) is safe in both directions:
+
+- **Old config, new binary.** Every new field this ADR added
+  (`RoleAddrs.role`, the `Option`-wrapped `control`/`raftkv` addresses,
+  `ClientResponse::Status`'s `leader_hint`/`watermark`) has a
+  `#[serde(default)]` (or an equivalent custom default, for the address
+  `Option`s — see `crates/animusd/CLAUDE.md`'s note on why a bare
+  `#[serde(default)]` would be wrong there) that resolves to combined mode
+  for any config/wire payload written before this ADR. A new binary reading
+  an old config or talking to an old peer behaves exactly as it did
+  pre-ADR-0035.
+- **New config/binary talking to an old binary.** `ClientRequest::
+  WatchMetadata` and the `leader_hint`/`watermark` fields are additive; an
+  old binary that has never heard of them simply never sends them (the
+  field decodes to its default) and never receives a `WatchMetadata` (no
+  new caller ever issues one against a peer it doesn't know supports it —
+  every long-poll caller is itself a new-binary `Remote` data node, which by
+  construction only exists once at least PR4 has shipped).
+- **What does NOT work**: a `--control-nodes`/`--data-nodes` split config
+  (`ClusterConfig::generate_split`) will not *parse* on a pre-ADR-0035
+  binary — the old binary's config schema has no `role` concept and no
+  `Option`-wrapped address fields, so it either fails to deserialize or
+  silently misreads a `null` address. This is harmless in practice: a
+  pre-ADR-0035 binary also has no `animusd control`/`animusd data`
+  subcommands to run that config with, so the failure mode is "the old
+  binary can't run the new topology at all," not silent misbehavior. A
+  rolling upgrade therefore upgrades the **binary** everywhere first (safe,
+  combined-mode-equivalent), then migrates config/topology node by node.
 
 ## Consequences
 

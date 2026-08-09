@@ -128,7 +128,22 @@ function dot(cls) { return `<span class="dot ${esc(cls)}"></span>`; }
 function nodeByRaftkv(id) {
   return STATE.nodes.find((n) => n.ok && n.config && n.config.raftkv_id === id);
 }
+// The raftkv (data-plane) id a CP-group/member row is keyed by — only ever
+// called on a node known to host data (a CP group's owning node, a
+// `Metadata.members` row), never a bare "which node is this" label, so
+// `null` (a control-only node, ADR 0035) never actually reaches here in
+// practice.
 function nodeRaftkvId(n) { return n.config ? n.config.raftkv_id : "?"; }
+// A human-facing "which node is this" label for an ARBITRARY node — unlike
+// `nodeRaftkvId` above, this must work for a control-only node too (ADR
+// 0035), which has no `raftkv_id` at all: prefer the raftkv id (the
+// identifier every other view already keys on), fall back to the control
+// id, and only show "?" if somehow neither is known.
+function nodeDisplayId(n) {
+  const c = n && n.config;
+  if (!c) return "?";
+  return c.raftkv_id != null ? c.raftkv_id : (c.control_id != null ? c.control_id : "?");
+}
 
 // Collect every hosted CP group across reachable nodes, indexed by tablet id.
 // Each group carries its own owning node's raftkv id (`g.node`, from

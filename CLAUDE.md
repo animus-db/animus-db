@@ -135,8 +135,17 @@ truth; this map is just for navigation.
 - **Runnable node** — `animusd`, `animus-cli`. v1 (ADR 0019) assembles the
   **control plane + the CP data plane** (`animus-cp-data`) over `ProdEnv` — all
   client reads/writes route to the per-tablet Raft group leader (forwarded
-  cross-process); the leaderless AP plane is dropped. Runs as one process
-  (`animusd --cluster N`) or one per node (`animusd --config FILE --node I`).
+  cross-process); the leaderless AP plane is dropped. Three deployment
+  shapes, all built from the same two role assemblies (ADR 0035): **combined**
+  (every node runs both roles — `animusd --cluster N` in one process, or
+  `animusd --config FILE --node I` one per node); **control-only**
+  (`animusd control --config FILE --node I` — a small static metadata quorum,
+  no storage engine, no data-plane role); and **data-only** (`animusd data
+  --config FILE --node I`, or `animusd data --seed ADDR[,ADDR...]` to join —
+  no local control `RaftCore` at all, `Metadata` comes from a polled/
+  long-polled mirror of the separately-deployed control plane via
+  `ControlHandle::Remote`). A config can mix combined-mode indices with
+  control-only/data-only ones for an incremental migration.
 
 **Cross-cutting gotcha — a node's inbox is single-consumer.** `Network::recv` for
 a node id has exactly one consumer; never run two protocols (e.g. a control
@@ -389,6 +398,33 @@ to the archive stays in place below.
   raises probe pressure on everyone else — under `--workspace` load the restart
   tests flaked ~2 in 5 full runs until retried. Both retries are bounded, so a
   genuinely occupied port still fails. (`animusd` tests.)
+- **A same-address restart test that rebinds N nodes sequentially multiplies
+  a single node's port-TOCTOU exposure by N — the fix is a bigger retry
+  budget AND fewer nodes, not just one of the two.** Building the ADR 0035
+  PR6 full-split-cluster restart test (stop control trio + data fleet, rebind
+  every node on its own dir/address, assert recovery), `Address already in
+  use` recurred under `cargo test --workspace`-level contention even after
+  raising the single-node restart bound (`support::restart_same_addrs`'s 5s)
+  to 30s, because this test does the rebind race *five times* in one run
+  instead of once. First ruled out a lingering-`TIME_WAIT` explanation by
+  checking the vendored `mio` source directly (`mio::net::TcpListener::bind`
+  already sets `SO_REUSEADDR`), confirming every failure really was another
+  process's live bind on that exact port, not a socket-close-ordering bug in
+  `Node::shutdown()`. Fix was two changes together: raise the per-node bound
+  further (60s — a full-outage restart is rare enough that patience is
+  cheap) *and* shrink the fleet this specific test needs to rebind (one data
+  node instead of two — replication/HA across multiple data nodes is
+  already covered by other tests in the same file, so this test only needs
+  to prove "every process comes back", not "multiple data replicas each
+  come back"). Also added a diagnostic (`ss -ltnp`, best-effort) attached to
+  the panic message so a *future* recurrence carries forensic evidence
+  (who holds the port) instead of just "address already in use" — cheap
+  insurance for a flake that is inherently hard to reproduce on demand.
+  **General rule: when a bounded-retry mitigation for a known race is
+  ported into a test that repeats the racy operation multiple times per
+  run, the exposure is multiplicative — widen the bound AND look for a way
+  to do the operation fewer times, don't just widen the bound.**
+  (`animusd/tests/split_cluster.rs::full_split_cluster_restart_recovers_metadata_and_data`.)
 - **Never `let _ = storage.merge(...)` on the write path** — an ack must mean the
   write durably applied; surface storage errors so a non-durable write isn't
   counted toward the quorum (`animus-data` `ack_durability.rs`).
@@ -656,6 +692,18 @@ to the archive stays in place below.
   behavior itself is a known production shape (the client is expected to
   retry with fresh routing), not a bug this test should have papered over
   with a longer timeout. (`animusd` `tests/seed_join.rs::table_with_replica`.)
+  **Generalizes beyond "just-grown node + arbitrary table" (ADR 0035 PR5):
+  ANY node with zero local replicas of anything hits the identical
+  fixed-non-leader-pick flake** — a control-only node (ADR 0035 PR3/PR4)
+  *structurally* never has a replica of any tablet, so a test asserting a
+  `Put`/`Get` succeeds through one fixed control node's client address alone
+  flakes on whichever of the tablet's replicas happens to win that
+  particular Raft election (a genuine ~50/50 for RF=2, not tied to growth/
+  rebalancing timing at all). Same fix: round-robin across every node's
+  client address, control **and** data, so the round-robin is guaranteed to
+  hit a node that resolves correctly (a real replica) even when the
+  control-node leg of the same loop lands on the wrong pick.
+  (`animusd` `tests/data_only.rs::split_cluster_serves_reads_and_writes_across_data_nodes`.)
 - **Adding an automatic background registration/bring-up step makes any
   test's "not yet registered" pre-assertion a race, not an invariant — sweep
   for assertions on the *absence* of state the new automation now
