@@ -163,8 +163,8 @@ fn metadata(ctx: &ClientCtx) -> Metadata {
 /// must observe its own just-proposed command (or a concurrent writer's)
 /// landing in the authoritative state: the `CreateTable` commit-wait loops
 /// below, and [`quorum_read`]'s live re-check on a snapshot miss.
-fn metadata_fresh(ctx: &ClientCtx) -> Metadata {
-    ctx.metadata_fresh()
+async fn metadata_fresh(ctx: &ClientCtx) -> Metadata {
+    ctx.metadata_fresh().await
 }
 
 /// The DynamoDB key schema for `table`, resolved from the **replicated catalog**
@@ -555,7 +555,7 @@ async fn create_table(
     // before we propose (the state machine also rejects, but this gives the right
     // wire code without waiting on a commit that will be a no-op). Fresh, not
     // `metadata(ctx)`: this whole function is a commit-wait poll (ADR 0035 PR1).
-    if metadata_fresh(ctx).has_table_schema(table) {
+    if metadata_fresh(ctx).await.has_table_schema(table) {
         return Err(registry_error(animus_dynamo::RegistryError::TableExists(
             table.to_owned(),
         )));
@@ -575,7 +575,7 @@ async fn create_table(
             schema: control_schema.clone(),
         })
         .await;
-        if metadata_fresh(ctx).has_table_schema(table) {
+        if metadata_fresh(ctx).await.has_table_schema(table) {
             break;
         }
         if tokio::time::Instant::now() >= deadline {
@@ -605,6 +605,7 @@ async fn create_table(
             })
             .await;
             if metadata_fresh(ctx)
+                .await
                 .table_indexes(table)
                 .iter()
                 .any(|d| d.name == def.name)
@@ -631,7 +632,7 @@ async fn create_table(
     // the request's declarations — so the source of truth is the committed catalog).
     // A *fresh* snapshot on purpose: the request-entry snapshot predates the schema
     // this very request just committed.
-    mirror_catalog_schema(ctx, &metadata_fresh(ctx), table);
+    mirror_catalog_schema(ctx, &metadata_fresh(ctx).await, table);
     Ok(wire::create_table_response(table, schema, indexes))
 }
 
@@ -1298,7 +1299,7 @@ async fn quorum_read(
     // existence gate, which must not conclude "absent" from a growth-node
     // mirror that could still be a poll interval behind a concurrent writer's
     // just-committed provisioning.
-    if !meta.has_table_tablet(table) && !metadata_fresh(ctx).has_table_tablet(table) {
+    if !meta.has_table_tablet(table) && !metadata_fresh(ctx).await.has_table_tablet(table) {
         return Ok(None);
     }
     match ctx

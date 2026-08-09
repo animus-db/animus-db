@@ -299,12 +299,15 @@ fn config_view(ctx: &ClientCtx) -> Value {
         .map(|(id, addr)| (id.to_string(), addr.to_string()))
         .collect();
     json!({
+        // `null` on a data-only node (ADR 0035 PR4) — it has no local control
+        // `RaftCore`/id at all.
         "control_id": a.control_id,
         // `null` on a control-only node (ADR 0035 PR3) — it has no raftkv id.
         "raftkv_id": a.raftkv_id,
         "control_ids": a.control_ids,
         "addrs": {
-            "control": a.control_addr.to_string(),
+            // `null` on a data-only node — see `control_id` above.
+            "control": a.control_addr.map(|x| x.to_string()),
             "client": a.client_addr.to_string(),
             // `null` on a control-only node — these listeners are never bound
             // there.

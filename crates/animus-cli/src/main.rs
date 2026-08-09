@@ -325,7 +325,7 @@ async fn http_call(
 
 fn print_response(response: &ClientResponse) {
     match response {
-        ClientResponse::Status(meta) => {
+        ClientResponse::Status { metadata: meta, .. } => {
             println!("members: {}", meta.members.len());
             for (id, member) in &meta.members {
                 println!("  node {id}: {:?}", member.status);

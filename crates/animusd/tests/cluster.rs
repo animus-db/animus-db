@@ -52,7 +52,7 @@ async fn cluster_serves_put_get_and_status_over_tcp() {
     // Status reflects the bootstrapped tablet and membership.
     let addr0 = nodes[0].client_addr();
     match call(addr0, ClientRequest::Status).await {
-        ClientResponse::Status(meta) => {
+        ClientResponse::Status { metadata: meta, .. } => {
             // ADR 0023: a fresh cluster has **no** data tablet until the first write
             // provisions one (the put below auto-provisions the `kv` table's tablet).
             assert_eq!(meta.tablets.len(), 0, "no data tablet until first write");

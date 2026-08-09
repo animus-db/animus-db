@@ -32,10 +32,12 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   still passes the same set as before (combined mode is unchanged byte-for-
   byte). `Node::bind` (combined mode) still requires both addresses present
   (`Both`) — **ADR 0035 PR3** adds the control-only sibling,
-  `Node::bind_control` → `BoundControlNode::start_control_with`, below.
-  `ClusterConfig::generate_split` is wired into `gen-config
-  --control-nodes/--data-nodes` (PR3); its data-role entries aren't runnable
-  through any entry point yet — that's PR4's `animusd data`.
+  `Node::bind_control` → `BoundControlNode::start_control_with` (below), and
+  **ADR 0035 PR4** adds the data-only sibling, `Node::bind_data` →
+  `BoundDataNode::start_data_with` (below). `ClusterConfig::generate_split`
+  is wired into `gen-config --control-nodes/--data-nodes` (PR3); both its
+  control- and data-role entries are now runnable, via `animusd control` and
+  `animusd data` respectively, targeting the *same* config.
 - **`Node::bind_control` → `BoundControlNode::start_control_with` — the
   control-only counterpart of `Node::bind`/`BoundNode::start_with` (ADR 0035
   PR3, `animusd control`).** Binds only the control internal `ProdEnv` role
@@ -64,10 +66,43 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   quiescence with zero data members), schema DDL direct-propose + follower
   relay against a control-only cluster, and a mixed cluster (a control-only
   trio plus one combined-mode data node reached via the ADR 0030 growth-node
-  mirror — the closest existing "no local control voter slot" mechanism
-  until PR4's `ControlHandle::Remote` — proving a `Put` issued against the
-  CONTROL node's client port provisions + forwards to the data node and a
-  schema command issued against the DATA node relays to the control leader).
+  mirror — the mechanism PR4 below generalizes into a real data-only node —
+  proving a `Put` issued against the CONTROL node's client port provisions +
+  forwards to the data node and a schema command issued against the DATA
+  node relays to the control leader).
+- **`Node::bind_data` → `BoundDataNode::start_data_with` — the data-only
+  counterpart of `Node::bind`/`BoundNode::start_with` (ADR 0035 PR4,
+  `animusd data`).** Binds only the `raftkv` internal `ProdEnv` role plus the
+  client/dynamo/cql/admin TCP listeners — **no control env, no local control
+  `RaftCore` at all**. This node's `ClientCtx.control` is
+  `ControlHandle::Remote(RemoteControlClient)` (`control_handle.rs`), not
+  `Local`: it reaches the separately-deployed control plane exclusively over
+  the network, via `control_seeds` (the control deployment's **client**-API
+  addresses, a distinct axis from the internal `raftkv`-env peer book —
+  see `run_node_data`'s doc for why this node's `raftkv` env peer book must
+  still be `ClusterConfig::peer_book()`, the union with the control
+  addresses, not `raftkv_peer_book()` alone: `heartbeat_loop` sends to
+  `control_ids` over that very env). `run_node_data(config, index, dir,
+  backend)` is the `run_node`/`run_node_control`-shaped top-level entry
+  point; CLI: `animusd data --config FILE --node I [--dir DIR]
+  [--ephemeral]`. Spawns exactly what `BoundNode::start_with` spawns for a
+  data-role node minus everything control-plane-specific (`bootstrap`,
+  `edge.register_control` — there is no local control handle to register):
+  `spawn_common_tail`'s shared tail, `peer_sync_loop`, the (now-generalized,
+  see "What's non-obvious") `remote_metadata_sync_loop`, a relayed
+  `admin_add_member` self-registration, `heartbeat_loop`, the tablet-host
+  reconciler, `auto_split_loop`, and the dynamo/cql listeners.
+  `tests/data_only.rs` covers a genuine split cluster (3 control-only + 2
+  data-only nodes, no combined-mode node anywhere): reads/writes across two
+  data nodes (including a write via one and a read via the *other*, and
+  polling `/admin/health`'s `hosts_cp` to converge — see its own doc on why
+  that must be a poll, not a snapshot, right after a just-provisioned
+  tablet's first write), schema DDL issued against a data node relaying to
+  and committing on the control leader, a data node falling over to a
+  remaining control seed when one control node goes down, and a data-node
+  restart re-hosting its tablet from the surviving replica's Raft
+  replication (not local state — the test uses the ephemeral memory backend
+  specifically to prove this is real catch-up, not a local reopen).
 - `bind_cluster` / `start_cluster` — spin up an in-process cluster (the binary's
   `--cluster N` mode and `tests/cluster.rs`).
 - `run_node_growth` — start a node as an ADR 0030 **growth member** from an
@@ -139,17 +174,108 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
 ## What's non-obvious
 
 - **`ClientCtx.control` is a `ControlHandle`, not a bare `RaftNode<ProdEnv>`
-  (ADR 0035 PR1)** — a pure-refactor seam with a single `Local` variant today
-  (`control_handle.rs`); PR4 adds `Remote` for a data-only node with no local
-  control `RaftCore` at all. Reads split by freshness contract:
-  `metadata_cached()` (staleness-tolerant; `ClientCtx::effective_metadata()`
-  layers the ADR 0030 growth-node mirror on top of it) vs. `metadata_fresh()`
-  (read-your-writes, never mirror-substituted — used by the schema
-  commit-wait polls and the DynamoDB conditional-write existence gate). Both
-  are identical for `Local` today; the distinction only matters once `Remote`
-  exists. `ClusterEdgeState::leader_handle()` deliberately stays a concrete
+  (ADR 0035 PR1, `Remote` added PR4)** — `control_handle.rs`. Reads split by
+  freshness contract: `metadata_cached()` (staleness-tolerant;
+  `ClientCtx::effective_metadata()` layers the ADR 0030 growth-node mirror on
+  top of it) vs. `metadata_fresh()` (read-your-writes, never
+  mirror-substituted — used by the schema commit-wait polls, the DynamoDB
+  conditional-write existence gate, and — fixed alongside PR4, see below —
+  `provision_tablet`'s initial replica-set read). Both are identical
+  (`raft.metadata()`) for `Local`; `Remote` genuinely differs, per below.
+  `ClusterEdgeState::leader_handle()` deliberately stays a concrete
   `RaftNode<ProdEnv>` registry — proposing is inherently local-Raft-log-only,
   so it never goes through `ControlHandle`.
+- **`ControlHandle::Remote(RemoteControlClient)` (ADR 0035 PR4) is a
+  data-only node's *entire* control-plane access — no local `RaftCore`, no
+  local WAL, nothing to flush on shutdown.** `RemoteControlClient` holds:
+  `seeds` (the control deployment's static **client**-API addresses — the
+  discovery root), a polled `mirror: Arc<Mutex<Option<Metadata>>>`
+  (`metadata_cached()` returns its last value, or default-empty until the
+  first sync — `has_synced()` tells the two apart), and a `leader_hint:
+  Arc<Mutex<Option<(NodeId, SocketAddr)>>>`. **`metadata_fresh()` is now
+  `async`** (a real network round trip for `Remote`; a synchronous-in-
+  substance passthrough for `Local`) — this rippled `propose_and_await`'s
+  `committed` parameter from a plain `Fn() -> Option<T>` closure to `Fn() ->
+  Fut where Fut: Future<Output = Option<T>>`; every call site's predicate
+  became `|| async { ... }` (a *sync* closure returning an async block — no
+  edition-2024 async-closure syntax needed, just the pre-existing "return a
+  future from a plain closure" idiom), with zero behavior change for any
+  existing (`Local`) node.
+  - **The leader-hint lifecycle (ADR 0035 §1).** `ClientResponse::Status`
+    changed from a bare tuple `Status(Metadata)` to a struct variant
+    `Status { metadata, leader_hint: Option<(NodeId, SocketAddr)> }`
+    (`#[serde(default)]` on the new field). The answering node fills
+    `leader_hint` from its own `self.control.leader()` +
+    `ClientCtx::route_addr(leader_id)` (`ClientCtx::control_leader_hint`) —
+    the exact lookup `propose_schema`'s relay tier already did. Every
+    `Status` consumer (the generalized `remote_metadata_sync_loop`, a live
+    `metadata_fresh` fetch, `run_node_join`'s collision guard, the CLI, both
+    combined-mode/per-process test files) now destructures the struct
+    shape. `RemoteControlClient::metadata_fresh()` tries the current hint
+    first, falls back to scanning every seed, and refreshes both the mirror
+    and the hint from whichever reply lands — mirroring, not reusing (this
+    handle has no `ClientCtx` to call through), `propose_schema`'s own
+    hint-first-then-broadcast shape; it does **not** independently verify
+    the responder self-reports as leader (documented as a known looseness,
+    flagged for the PR5 staleness audit — a stale hint self-heals within a
+    couple of hops since a non-leader's own reply carries *its* hint).
+    `propose_schema` itself gained a new tier, `ControlHandle::
+    leader_addr_hint()`, tried **before** the existing `leader()` +
+    `route_addr()` lookup — the hint is strictly fresher for a data-only
+    node (same `Status` reply that filled the mirror) and is `None`
+    unconditionally for `Local`, so this changes nothing for any prior node
+    shape. `ClientCtx::not_leader_error()` also uses the hint to give
+    `admin_drain`/`admin_remove_member`'s "not the leader" refusal a
+    concrete retry address when one is known.
+  - **Every other `ControlHandle` method degrades to an honest, inert value
+    for `Remote`**: `is_leader() → false`, `role() → Follower`, `term()`/
+    `commit_index()`/`durable_index()`/`snapshot_index()`/`log_len()` → `0`,
+    `config() → {}` (empty), `believes_alive() → false`, `metrics()` → a
+    permanent `MetricsHandle::noop()`. `metadata_watch()` returns a fresh
+    `MetadataWatch::default()` — since nothing ever calls `bump` on it,
+    `changed()` never resolves, which is *exactly* the desired effect: no
+    special-casing needed in `tablet_host_reconciler_loop`, whose `select!`
+    then always falls through to its `RECONCILE_FALLBACK_INTERVAL` poll for
+    a data-only node. `Node.raft` itself is now a `ControlHandle` (not a
+    bare `RaftNode<ProdEnv>`); `is_control_leader`/`metadata`/`propose_meta`/
+    `shutdown_graceful` each pattern-match or delegate accordingly
+    (`propose_meta` returns `false` and `shutdown_graceful` skips the WAL
+    flush for `Remote` — proposing/flushing are inherently local-Raft-log
+    operations a `Remote` handle has none of).
+  - **The tablet-host reconciler's pre-recovery guard gained a third OR-term,
+    `ControlHandle::has_synced_metadata()`.** The guard used to be
+    `last_applied() == 0 && ctx.remote_metadata.is_none()` (skip until *some*
+    trustworthy view exists — real recovery, or the ADR 0030 growth mirror).
+    A `Remote` handle's `last_applied()` is pinned at `0` **forever** (no
+    local log to apply at all) and it never touches `ctx.remote_metadata`
+    (that field is the ADR 0030-specific mirror; `Remote` keeps its own,
+    read straight through `metadata_cached()`) — so without a third signal
+    tied to `Remote`'s *own* readiness, the guard would never release a
+    data-only node's reconciler, ever. `has_synced_metadata()` is `false`
+    unconditionally for `Local` (its two existing signals already cover it)
+    and mirrors `RemoteControlClient::has_synced()` for `Remote`.
+  - **A real, pre-existing race this PR's own tests caught and fixed:
+    `provision_tablet`'s "no tablet yet" branch picks the table's *initial,
+    permanent* replica set from an Active-member scan.** `CreateTablet` only
+    ever succeeds once per table (idempotent, first-committer wins) — so
+    reading a stale `Metadata` view at exactly the wrong moment doesn't
+    cause a transient hiccup a later retry heals, it silently and
+    **permanently** under-replicates the tablet (nothing ever re-checks and
+    grows a already-recorded RF policy). This was already a latent,
+    vanishingly-rare hazard for `Local` (real control-Raft replication lag
+    is sub-millisecond) — invisible until a data-only node's *routinely*
+    poll-interval-stale mirror (ADR 0035 §5) made the window wide enough to
+    hit reliably: `tests/data_only.rs`'s two-data-node split-cluster test
+    flaked (RF pinned at 1 instead of 2) on almost every other run before the
+    fix. Fixed by switching `provision_tablet`'s read from
+    `metadata_cached()` to `metadata_fresh().await` — the same "the
+    decision that becomes permanent must observe committed state, not a
+    tolerant mirror" principle already applied to the schema commit-wait
+    polls, just not yet to this one. **General lesson: when a routine
+    (not just a rare crossover) staleness window opens up for the first
+    time (ADR 0035 §5's own thesis), re-audit every `metadata_cached()`/
+    `effective_metadata()` call site that feeds a *non-retried, permanent*
+    decision — not just the ones already flagged as commit-wait polls.**
 - **`ClientCtx.data: Option<DataRole>` (ADR 0035 PR3)** groups every field
   that only makes sense on a data-role node — `rmw_lock` (the per-node RMW
   serialization lock), `raftkv_metrics` (the raftkv env's metrics sink), and
@@ -1098,8 +1224,15 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   deployment). Both share `Node::bind`/`start`; only address/peer assembly
   differs. **`animusd control --config FILE --node I` (ADR 0035 PR3)** is a
   third, control-only mode sharing the equivalent `Node::bind_control`/
-  `BoundControlNode::start_control_with` pair — see the entry-points section
-  above.
+  `BoundControlNode::start_control_with` pair, and **`animusd data --config
+  FILE --node I` (ADR 0035 PR4)** is a fourth, data-only mode
+  (`Node::bind_data`/`BoundDataNode::start_data_with`, `ControlHandle::
+  Remote`) — see the entry-points section above for both. Running every
+  control-role index of a `generate_split` config with `animusd control` and
+  every data-role index with `animusd data` is the genuine split deployment
+  ADR 0035 targets; a config can still mix in combined-mode indices (plain
+  `--config FILE --node I` against a `Both`-role entry) for an incremental
+  migration.
 - **`--cluster N` without an explicit `--dir` defaults to ONE fixed path,
   `$TMPDIR/animusd` (`main.rs`), reused across every invocation on the
   machine — and `--ephemeral` does NOT make a run ephemeral with respect to
@@ -1166,11 +1299,19 @@ cluster elects a leader and serves `/admin/status`/`/admin/health`/
 `/admin/config` correctly with zero data members, quiescent over a bounded
 polling window; schema DDL direct-propose + follower relay against a
 control-only cluster; a mixed cluster — a control-only trio plus one
-combined-mode data node reached via the ADR 0030 growth-node mirror, the
-closest existing mechanism to "no local control-voter slot" until PR4's
-`ControlHandle::Remote` — proving a `Put` issued against the control node's
-client port provisions the table and forwards to the data node, and a schema
-command issued against the data node relays to the control leader),
+combined-mode data node reached via the ADR 0030 growth-node mirror — proving
+a `Put` issued against the control node's client port provisions the table
+and forwards to the data node, and a schema command issued against the data
+node relays to the control leader), `tests/data_only.rs` (ADR 0035 PR4,
+`animusd data`: a **genuine** split cluster — 3 control-only + 2 data-only
+nodes, no combined-mode node anywhere — reads/writes across two data nodes
+including a write via one and a read via the other, schema DDL issued
+against a data node relaying to and committing on the control leader (with
+every data node's own mirror converging on it too), a data node falling
+over to a remaining control seed when one control node goes down, and a
+data-node restart re-hosting its tablet from the surviving replica's real
+Raft replication — the ephemeral memory backend is deliberate here, so
+catch-up can only be real replication, never a local reopen),
 `tests/dynamo_wire.rs` (PutItem → GetItem → DeleteItem over the real DynamoDB
 JSON/HTTP wire), `tests/cql_wire.rs` (STARTUP → CREATE KEYSPACE/USE/CREATE
 TABLE → PREPARE INSERT → EXECUTE with typed bound values → typed SELECT, columns
