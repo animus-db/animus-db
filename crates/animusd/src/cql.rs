@@ -861,7 +861,7 @@ async fn run_delete(
     // Read-modify-write the partition on the CP plane under the coord lock (which
     // serializes this node's RMWs so the read+write is atomic per node). The Raft
     // index is the MVCC version, so no client-assigned version is needed.
-    let _guard = ctx.rmw_lock.lock().await;
+    let _guard = ctx.data().rmw_lock.lock().await;
     let bytes = match ctx.cp_read(table, plan.key.clone()).await {
         Ok(b) => b,
         Err(msg) => return response::error(stream, response::ERR_SERVER, &msg),
@@ -1006,7 +1006,7 @@ async fn mutate_partition_with_schema(
     schema: &CqlSchema,
     mutate: impl FnOnce(&mut Partition),
 ) -> Result<(), String> {
-    let _guard = ctx.rmw_lock.lock().await;
+    let _guard = ctx.data().rmw_lock.lock().await;
     let bytes = ctx.cp_read(table, key.to_vec()).await?;
     let mut part =
         Partition::decode(&bytes.unwrap_or_default(), schema).map_err(|e| e.to_string())?;

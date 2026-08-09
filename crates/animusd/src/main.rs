@@ -1,12 +1,14 @@
 //! AnimusDB node server (`animusd`).
 //!
-//! Four modes:
+//! Five modes:
 //!
 //! ```text
-//! animusd gen-config --nodes N [--host H] [--base-port P]   # print a cluster config (JSON)
+//! animusd gen-config --nodes N [--host H] [--base-port P]   # print a combined-mode cluster config (JSON)
+//! animusd gen-config --control-nodes N --data-nodes M [--host H] [--base-port P] # print a split-deployment config (ADR 0035)
 //! animusd --config FILE --node I [--dir DIR] [--ephemeral] # run node I of a cluster (one process)
 //! animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B] # run an N-node cluster in one process
 //! animusd join --seed ADDR[,ADDR...] --node I [--ip A] [--base-port P] [--dir D] [--ephemeral] # seed/join startup (ADR 0032 PR2)
+//! animusd control --config FILE --node I [--dir DIR] # run node I as a control-only node (ADR 0035 PR3)
 //! ```
 //!
 //! The data replica is durable by default (an on-disk LSM under the node's data
@@ -19,6 +21,19 @@
 //! already-running node — can instead `animusd join --seed <that address>
 //! --node I`, learning everything else it needs from the cluster itself (ADR
 //! 0032 PR2: a real data-plane member, control group unchanged, ADR 0030).
+//!
+//! `animusd control` runs one of a config's control-role node(s) only — no
+//! storage engine, no `raftkv` env, no DynamoDB/CQL listeners (ADR 0035:
+//! control plane as a separate deployment). `gen-config --control-nodes/
+//! --data-nodes` prints the split-deployment config *shape* (control-role
+//! entries with no `raftkv` address, data-role entries with no `control`
+//! address) that `animusd control` targets — its data-role entries are not
+//! yet runnable through any entry point (that's ADR 0035 PR4's `animusd
+//! data`, a genuinely control-`RaftCore`-less data node); until then, run a
+//! real mixed deployment by pointing `animusd control` at the config's
+//! control-role indices and keep running data nodes combined-mode (`--config
+//! FILE --node I` against a `Both`-role config, today's only way to run a
+//! data node) — see `crates/animusd/CLAUDE.md`.
 
 use std::net::{IpAddr, SocketAddr};
 use std::process::ExitCode;
@@ -33,6 +48,7 @@ async fn main() -> ExitCode {
     let result = match args.first().map(String::as_str) {
         Some("gen-config") => gen_config(&args[1..]),
         Some("join") => run_join(&args[1..]).await,
+        Some("control") => run_control(&args[1..]).await,
         _ => run(&args).await,
     };
 
@@ -74,31 +90,54 @@ fn otel_instance_label(args: &[String]) -> String {
 
 const USAGE: &str = "usage:\n  \
     animusd gen-config --nodes N [--host H] [--base-port P]\n  \
+    animusd gen-config --control-nodes N --data-nodes M [--host H] [--base-port P]\n  \
     animusd --config FILE --node I [--dir DIR] [--ephemeral]\n  \
     animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B]\n  \
-    animusd join --seed ADDR[,ADDR...] --node I [--ip A] [--base-port P] [--dir D] [--ephemeral]";
+    animusd join --seed ADDR[,ADDR...] --node I [--ip A] [--base-port P] [--dir D] [--ephemeral]\n  \
+    animusd control --config FILE --node I [--dir DIR]";
 
-/// `gen-config`: print a generated cluster config as JSON.
+/// `gen-config`: print a generated cluster config as JSON — either combined-mode
+/// (`--nodes N`) or the ADR 0035 split-deployment shape (`--control-nodes N
+/// --data-nodes M`, [`ClusterConfig::generate_split`]).
 fn gen_config(args: &[String]) -> Result<(), String> {
-    let mut nodes = None;
+    let mut nodes: Option<usize> = None;
+    let mut control_nodes: Option<usize> = None;
+    let mut data_nodes: Option<usize> = None;
     let mut host: IpAddr = "127.0.0.1".parse().unwrap();
     let mut base_port: u16 = 7100;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--nodes" => nodes = Some(parse_next(&mut it, "--nodes")?),
+            "--control-nodes" => control_nodes = Some(parse_next(&mut it, "--control-nodes")?),
+            "--data-nodes" => data_nodes = Some(parse_next(&mut it, "--data-nodes")?),
             "--host" => host = parse_next(&mut it, "--host")?,
             "--base-port" => base_port = parse_next(&mut it, "--base-port")?,
             other => return Err(format!("unknown gen-config argument `{other}`")),
         }
     }
-    let nodes: usize = nodes.ok_or("gen-config needs --nodes N")?;
-    if nodes == 0 {
-        return Err("--nodes must be at least 1".into());
+    if nodes.is_some() && (control_nodes.is_some() || data_nodes.is_some()) {
+        return Err("use either --nodes or --control-nodes/--data-nodes, not both".into());
+    }
+    if let Some(nodes) = nodes {
+        if nodes == 0 {
+            return Err("--nodes must be at least 1".into());
+        }
+        println!(
+            "{}",
+            ClusterConfig::generate(nodes, host, base_port).to_json()
+        );
+        return Ok(());
+    }
+    let control_n =
+        control_nodes.ok_or("gen-config needs --nodes N, or --control-nodes N --data-nodes M")?;
+    let data_n = data_nodes.ok_or("--control-nodes also needs --data-nodes M")?;
+    if control_n == 0 || data_n == 0 {
+        return Err("--control-nodes and --data-nodes must each be at least 1".into());
     }
     println!(
         "{}",
-        ClusterConfig::generate(nodes, host, base_port).to_json()
+        ClusterConfig::generate_split(control_n, data_n, host, base_port).to_json()
     );
     Ok(())
 }
@@ -174,6 +213,43 @@ async fn run_single(
         node.client_addr(),
         node.dynamo_addr(),
         node.cql_addr(),
+        node.admin_addr(),
+    );
+    println!("animusd: ready — Ctrl-C to stop");
+    wait_for_ctrl_c().await;
+    node.shutdown_graceful().await;
+    Ok(())
+}
+
+/// `control`: run node `index` of `config` as a **control-only** node (ADR
+/// 0035 PR3) — no storage engine, no `raftkv` env, no DynamoDB/CQL listeners.
+async fn run_control(args: &[String]) -> Result<(), String> {
+    let mut config_path: Option<String> = None;
+    let mut node: Option<usize> = None;
+    let mut dir: Option<std::path::PathBuf> = None;
+
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--config" => config_path = Some(parse_next(&mut it, "--config")?),
+            "--node" => node = Some(parse_next(&mut it, "--node")?),
+            "--dir" => dir = Some(parse_next::<String>(&mut it, "--dir")?.into()),
+            other => return Err(format!("unknown control argument `{other}`")),
+        }
+    }
+    let path = config_path.ok_or("control requires --config FILE")?;
+    let index = node.ok_or("control requires --node I")?;
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("reading {path}: {e}"))?;
+    let config = ClusterConfig::from_json(&text).map_err(|e| format!("parsing {path}: {e}"))?;
+    let dir = dir.unwrap_or_else(|| std::env::temp_dir().join(format!("animusd-control-{index}")));
+
+    let node = animusd::run_node_control(&config, index, &dir)
+        .await
+        .map_err(|e| format!("failed to start control node {index}: {e}"))?;
+    println!(
+        "animusd: control node {index}/{} up — client {} — admin http://{}",
+        config.len(),
+        node.client_addr(),
         node.admin_addr(),
     );
     println!("animusd: ready — Ctrl-C to stop");

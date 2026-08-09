@@ -30,11 +30,44 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   `Active` data members) instead of deriving it from `control_ids.len()`, so
   a caller can scope it to only the data-role nodes — every real entry point
   still passes the same set as before (combined mode is unchanged byte-for-
-  byte). `Node::bind` and every entry point still require both addresses
-  present (`Both`); actually assembling a control-only or data-only *process*
-  (skipping the unused listeners/engine) is PR3/PR4 — this PR is the config
-  layer only. `ClusterConfig::generate_split` is additive scaffolding for that
-  (not wired into `gen-config` yet).
+  byte). `Node::bind` (combined mode) still requires both addresses present
+  (`Both`) — **ADR 0035 PR3** adds the control-only sibling,
+  `Node::bind_control` → `BoundControlNode::start_control_with`, below.
+  `ClusterConfig::generate_split` is wired into `gen-config
+  --control-nodes/--data-nodes` (PR3); its data-role entries aren't runnable
+  through any entry point yet — that's PR4's `animusd data`.
+- **`Node::bind_control` → `BoundControlNode::start_control_with` — the
+  control-only counterpart of `Node::bind`/`BoundNode::start_with` (ADR 0035
+  PR3, `animusd control`).** Binds only the control internal `ProdEnv` role
+  plus the client + admin TCP listeners — no `raftkv` env, no dynamo/cql
+  listeners, no CP storage engine. `run_node_control(config, index, dir)` is
+  the `run_node`-shaped top-level entry point; CLI: `animusd control --config
+  FILE --node I [--dir DIR]`. Both `BoundNode::start_with` and
+  `BoundControlNode::start_control_with` build their `ClientCtx` and spawn
+  the tasks every node shape needs (`route_sync_loop`/`metrics_sample_loop`/
+  this node's own `register_node_addrs` self-registration/`serve_clients`/
+  `admin::serve`) through one shared private helper, `spawn_common_tail` —
+  everything role-specific (`bootstrap`/`peer_sync_loop`/the growth-node
+  mirror/`heartbeat_loop`/the tablet-host reconciler/`auto_split_loop`/the
+  dynamo+cql listeners) stays in `start_with` alone, appended after the
+  shared tail returns. **No new rejection code was needed on the client
+  dispatch side**: `Status`/`ProposeSchema`/`JoinInfo`/`SplitTablet`/
+  `MergeTablets` only ever touch control `Metadata` (already correct on a
+  control-only node, which has real local control Raft, just no data role);
+  the data ops (`Put`/`Get`/`Scan`/`Delete`/`PutBatch`) degrade exactly like
+  any other node that hosts zero local replicas — `resolve_cp_route`'s
+  `ClientCtx.data == None` case falls straight into the existing "no local
+  replica, forward via `client_route`" branch (see `ClientCtx::data`'s doc
+  for the `Option<DataRole>` split this relies on, under "What's
+  non-obvious"). `tests/control_only.rs` covers a bare control-only cluster
+  (leader election + `/admin/status`/`/admin/health`/`/admin/config` +
+  quiescence with zero data members), schema DDL direct-propose + follower
+  relay against a control-only cluster, and a mixed cluster (a control-only
+  trio plus one combined-mode data node reached via the ADR 0030 growth-node
+  mirror — the closest existing "no local control voter slot" mechanism
+  until PR4's `ControlHandle::Remote` — proving a `Put` issued against the
+  CONTROL node's client port provisions + forwards to the data node and a
+  schema command issued against the DATA node relays to the control leader).
 - `bind_cluster` / `start_cluster` — spin up an in-process cluster (the binary's
   `--cluster N` mode and `tests/cluster.rs`).
 - `run_node_growth` — start a node as an ADR 0030 **growth member** from an
@@ -117,6 +150,29 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   exists. `ClusterEdgeState::leader_handle()` deliberately stays a concrete
   `RaftNode<ProdEnv>` registry — proposing is inherently local-Raft-log-only,
   so it never goes through `ControlHandle`.
+- **`ClientCtx.data: Option<DataRole>` (ADR 0035 PR3)** groups every field
+  that only makes sense on a data-role node — `rmw_lock` (the per-node RMW
+  serialization lock), `raftkv_metrics` (the raftkv env's metrics sink), and
+  `base_id` (this node's own raftkv id, used by routing) — behind one
+  `Option`, so "does this node have a data role" is a single type-level fact
+  instead of three loose optionals that could disagree. `None` on a
+  control-only node. Access via `ClientCtx::data()`, which **panics** if
+  absent — safe only from a path that structurally cannot run on a
+  control-only node (the dynamo/cql wire edges, whose listeners are never
+  bound there, or `auto_split_loop`, only ever spawned for a data-capable
+  node). **`resolve_cp_route` is the one call site that must never panic**
+  (it sits on the client-request dispatch path a control-only node genuinely
+  reaches for `Put`/`Get`/`Scan`/`Delete`/`PutBatch`) — it matches on
+  `self.data.as_ref()` directly instead, so `has_local_replica`/`is_replica`
+  come out `false` for a control-only node exactly as they would for any
+  other node hosting zero local replicas of a tablet. `AdminInfo.raftkv_id`/
+  `raftkv_addr`/`dynamo_addr`/`cql_addr` are the sibling `Option`s on the
+  admin-view side (`None` on a control-only node; `/admin/config` renders
+  them as JSON `null`), and `Node.dynamo_addr`/`cql_addr` are `Option`
+  internally but keep their public accessors returning a bare `SocketAddr`
+  (panicking if absent) so every existing combined-mode caller is
+  unaffected — the same "expect() internally, don't change combined mode's
+  public surface" pattern.
 - A node runs **two internal `ProdEnv` roles on distinct ids/ports** — control
   (Raft metadata, id `i`) and **raftkv** (the leaderful **CP** per-tablet Raft
   group, `300+i`, ADR 0017 #3a — the v1 data plane) — because one inbox is
@@ -1037,9 +1093,13 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   `attribute_not_exists` puts both succeeded when the gate trusted the snapshot —
   caught by `dynamo_extended.rs::concurrent_conditional_puts_one_wins`). Trust
   the snapshot on the hit path; re-verify on the miss path.
-- Two run modes: `--cluster N` (whole cluster in one process, dev convenience)
-  and `--config FILE --node I` (one node per process — real deployment). Both
-  share `Node::bind`/`start`; only address/peer assembly differs.
+- Two combined-mode run modes: `--cluster N` (whole cluster in one process,
+  dev convenience) and `--config FILE --node I` (one node per process — real
+  deployment). Both share `Node::bind`/`start`; only address/peer assembly
+  differs. **`animusd control --config FILE --node I` (ADR 0035 PR3)** is a
+  third, control-only mode sharing the equivalent `Node::bind_control`/
+  `BoundControlNode::start_control_with` pair — see the entry-points section
+  above.
 - **`--cluster N` without an explicit `--dir` defaults to ONE fixed path,
   `$TMPDIR/animusd` (`main.rs`), reused across every invocation on the
   machine — and `--ephemeral` does NOT make a run ephemeral with respect to
@@ -1101,6 +1161,16 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
 
 `cargo test -p animusd` — `tests/cluster.rs` (in-process cluster),
 `tests/per_process.rs` (nodes started independently from a shared config),
+`tests/control_only.rs` (ADR 0035 PR3, `animusd control`: a bare control-only
+cluster elects a leader and serves `/admin/status`/`/admin/health`/
+`/admin/config` correctly with zero data members, quiescent over a bounded
+polling window; schema DDL direct-propose + follower relay against a
+control-only cluster; a mixed cluster — a control-only trio plus one
+combined-mode data node reached via the ADR 0030 growth-node mirror, the
+closest existing mechanism to "no local control-voter slot" until PR4's
+`ControlHandle::Remote` — proving a `Put` issued against the control node's
+client port provisions the table and forwards to the data node, and a schema
+command issued against the data node relays to the control leader),
 `tests/dynamo_wire.rs` (PutItem → GetItem → DeleteItem over the real DynamoDB
 JSON/HTTP wire), `tests/cql_wire.rs` (STARTUP → CREATE KEYSPACE/USE/CREATE
 TABLE → PREPARE INSERT → EXECUTE with typed bound values → typed SELECT, columns
