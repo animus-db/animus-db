@@ -300,14 +300,17 @@ fn config_view(ctx: &ClientCtx) -> Value {
         .collect();
     json!({
         "control_id": a.control_id,
+        // `null` on a control-only node (ADR 0035 PR3) — it has no raftkv id.
         "raftkv_id": a.raftkv_id,
         "control_ids": a.control_ids,
         "addrs": {
             "control": a.control_addr.to_string(),
             "client": a.client_addr.to_string(),
-            "dynamo": a.dynamo_addr.to_string(),
-            "cql": a.cql_addr.to_string(),
-            "raftkv": a.raftkv_addr.to_string(),
+            // `null` on a control-only node — these listeners are never bound
+            // there.
+            "dynamo": a.dynamo_addr.map(|x| x.to_string()),
+            "cql": a.cql_addr.map(|x| x.to_string()),
+            "raftkv": a.raftkv_addr.map(|x| x.to_string()),
             "admin": a.admin_addr.to_string(),
         },
         "peers": peers,
@@ -862,7 +865,14 @@ async fn action_data_cql(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
         Ok(r) => r,
         Err(e) => return e,
     };
-    match crate::cql_client::run(ctx.admin.cql_addr, req.keyspace.as_deref(), &req.query).await {
+    // A control-only node (ADR 0035 PR3) has no CQL listener to proxy to.
+    let Some(cql_addr) = ctx.admin.cql_addr else {
+        return (
+            404,
+            json!({"error": "this node has no data role (control-only) — no CQL listener"}),
+        );
+    };
+    match crate::cql_client::run(cql_addr, req.keyspace.as_deref(), &req.query).await {
         Ok(results) => (200, json!({ "results": results })),
         Err(e) => (502, json!({ "error": e })),
     }
