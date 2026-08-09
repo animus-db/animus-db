@@ -30,6 +30,7 @@
     <button class="navlink" data-tab="tablets">Tablets</button>
     <button class="navlink" data-tab="browser">Data Browser</button>
     <button class="navlink" data-tab="storage">Storage</button>
+    <button class="navlink" data-tab="node">Node</button>
     <span class="spacer"></span>
     <div class="sidebar-foot" id="sidebar-foot"></div>
   </div>
@@ -250,6 +251,59 @@
         <div id="seed-status"></div>
       </div>
     </section>
+
+    <section id="node" class="view-max">
+      <div class="view-head">
+        <h1>Node</h1>
+        <span class="muted" id="nd-summary"></span>
+      </div>
+      <div class="card" id="nd-identity"></div>
+      <div class="grid-2">
+        <div class="card" id="nd-health"></div>
+        <div class="card" id="nd-mirror"></div>
+      </div>
+      <div class="card">
+        <div class="section-head"><span class="title">Hosted tablets</span></div>
+        <div id="nd-tablets"></div>
+      </div>
+      <div class="card" id="nd-console-link"></div>
+
+      <div class="card scroll" style="margin-top:14px">
+        <div class="section-head"><span class="title">Storage debug (this node)</span></div>
+        <div class="row" style="margin-bottom:10px">
+          <label>tablet</label><select id="nd-tablet-sel"></select>
+          <button id="nd-load">Load</button>
+          <span id="nd-hint" class="muted"></span>
+        </div>
+        <h2>WAL segments</h2>
+        <div id="nd-wal-body"><div class="empty">pick a tablet and Load</div></div>
+      </div>
+      <div class="card scroll" id="nd-wal-records-card" style="display:none">
+        <h2>WAL records — segment <span id="nd-wal-seg"></span></h2>
+        <div id="nd-wal-records"></div>
+      </div>
+      <div class="card scroll">
+        <h2>LSM shape</h2>
+        <div id="nd-lsm-body"><div class="empty">pick a tablet and Load</div></div>
+      </div>
+      <div class="card scroll">
+        <h2>Browse keys</h2>
+        <div class="row" style="margin-bottom:10px">
+          <label>start ≥</label><input type="text" id="nd-scan-start" placeholder="(beginning)">
+          <label>limit</label><input type="text" id="nd-scan-limit" value="50" style="width:5em">
+          <button id="nd-scan-load">Browse</button>
+        </div>
+        <div id="nd-scan-body"><div class="empty">pick a tablet and Browse</div></div>
+      </div>
+      <div class="card">
+        <h2>Key inspector</h2>
+        <div class="row" style="margin-bottom:10px">
+          <label>key</label><input type="text" id="nd-key-input" placeholder="key bytes (utf-8)">
+          <button id="nd-key-load">Inspect</button>
+        </div>
+        <div id="nd-key-body"></div>
+      </div>
+    </section>
   </main>
 </div>
 
@@ -259,6 +313,7 @@
 <script src="/admin/ui/dashboard_tablets.js"></script>
 <script src="/admin/ui/dashboard_browser.js"></script>
 <script src="/admin/ui/dashboard_storage.js"></script>
+<script src="/admin/ui/dashboard_node.js"></script>
 <script>
 "use strict";
 // Wiring: event listeners + initial render. Runs after every module above has
@@ -273,8 +328,6 @@ window.addEventListener("popstate", () => {
   activateTab(tabFromPath(window.location.pathname), { silent: true });
   if (activeTab === "storage") applyPendingStorageParams();
 });
-pendingStorageParams = paramsFromLocation();
-activateTab(tabFromPath(window.location.pathname));
 
 $("refresh").addEventListener("click", loadAll);
 
@@ -324,6 +377,11 @@ $("seed-table").addEventListener("change", () => { seedTable = $("seed-table").v
 $("seed-go").addEventListener("click", seedRun);
 $("seed-stop").addEventListener("click", () => { seeding = false; });
 
+// Node (ADR 0035 PR7) — storage debug scoped to this node only, no node dropdown.
+$("nd-load").addEventListener("click", loadNodeStorage);
+$("nd-scan-load").addEventListener("click", browseNodeKeys);
+$("nd-key-load").addEventListener("click", inspectNodeKey);
+
 let timer = null;
 function arm() {
   if (timer) clearInterval(timer);
@@ -332,8 +390,19 @@ function arm() {
 }
 $("auto").addEventListener("change", arm);
 
-loadAll();
-arm();
+// This node's own role (ADR 0035 PR7) gates which tabs are shown — resolve it
+// first (fast, local-only: `loadSelf()` never talks to a peer, so this can't
+// stall on a slow/unreachable OTHER node) before picking the initial tab from
+// the URL, so a role-inappropriate deep link falls back correctly on first
+// paint rather than flashing the wrong tab. `loadAll()` (the full cluster-wide
+// fan-out, which CAN be slow) starts only after that.
+(async () => {
+  await loadSelf();
+  pendingStorageParams = paramsFromLocation();
+  activateTab(tabFromPath(window.location.pathname));
+  loadAll();
+  arm();
+})();
 </script>
 </body>
 </html>

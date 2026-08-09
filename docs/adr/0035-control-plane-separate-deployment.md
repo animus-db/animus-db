@@ -1,6 +1,6 @@
 # ADR 0035 — Control plane as a separate deployment
 
-- **Status:** Implemented — PR0 through PR6 are all shipped (§Delivery plan).
+- **Status:** Implemented — PR0 through PR7 are all shipped (§Delivery plan).
   Amends ADR 0030 (data-plane-only growth) and ADR 0032 (seed/join, address
   book) — see the note at the end of ADR 0030 and the top of ADR 0032.
 - **Date:** 2026-08-09
@@ -213,7 +213,7 @@ ADR answers no to.)
 
 ## Delivery plan
 
-Six stacked PRs, following this codebase's standing discipline of landing the
+Seven stacked PRs, following this codebase's standing discipline of landing the
 low-risk mechanical piece first (ADR 0031/0032's PR stacks):
 
 1. **PR0 (this ADR).**
@@ -269,6 +269,27 @@ low-risk mechanical piece first (ADR 0031/0032's PR stacks):
    control metadata and data. Dashboard and `CLAUDE.md` updates reflecting
    the new topology as a first-class, documented deployment shape rather
    than only combined mode.
+8. **PR7 (implemented): role-gated dashboards.** PR6 taught the dashboard to
+   *render* a split deployment (the derived `role` field, the
+   `nodeDisplayId` fix); PR7 makes each node's **own** page match its role,
+   rather than every node showing the same five-tab cluster Console
+   regardless of what it actually is. A control-only or combined node's page
+   is unchanged; a data-only node instead gets a dedicated Node view — its
+   own identity/health, control-plane mirror status, hosted tablets, a
+   node-scoped storage-debug panel, and a link to a reachable
+   control/combined node's Console — since the cluster-wide views
+   (Overview/Placement/Tablets/Storage's node picker) have nothing useful to
+   show a node with no control-plane Raft state of its own and, being a
+   single node, nothing to place or balance. One backend addition:
+   `/admin/raft`'s `control_mirror` (watermark, leader-address hint,
+   has-synced) exposes `ControlHandle`'s existing `metadata_watch().latest()`/
+   `leader_addr_hint()`/`has_synced_metadata()` — all already built for PR4/
+   PR5's `Remote` handle, just not previously surfaced to any client. Tab
+   gating is entirely client-side (`dashboard_core.js`'s `ROLE_TABS`, keyed
+   on `/admin/config`'s `role`), resolved from a fast, node-local-only probe
+   so it can never stall on a slow/unreachable peer the way the existing
+   cluster-wide fan-out can. See `crates/animusd/CLAUDE.md`'s dashboard
+   section for the full detail.
 
 ### Rolling upgrade / mixed-version compatibility
 

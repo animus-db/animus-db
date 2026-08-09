@@ -258,3 +258,118 @@ async fn dashboard_serves_spa_with_cors_and_peers() {
     .await
     .expect("test timed out");
 }
+
+/// ADR 0035 PR7: role-gated dashboards. A genuine split deployment (a
+/// control-only node, no data role at all, alongside a data-only node, no
+/// local control `RaftCore` at all — `support::bring_up_split`) still serves
+/// the identical SPA shell + JS assets from both admin ports (no forked
+/// shell, no second HTML file — `admin.rs::is_ui_path`/`static_asset` are
+/// unchanged by this feature); what differs is which tabs the *client-side*
+/// role gating shows, which we assert against the JS assets that actually
+/// carry that behavior (`dashboard_core.js`'s `ROLE_TABS`, `dashboard_node.js`
+/// itself), per this file's own documented lesson on asserting against the
+/// asset that carries the behavior rather than the shell. Also proves the
+/// backend addition this PR needed: `/admin/raft`'s `control_mirror` (the ADR
+/// 0035 §1/§5 watermark + leader hint) actually syncs on the data-only node.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn dashboard_role_gating_split_deployment() {
+    timeout(Duration::from_secs(60), async {
+        let dir = tempfile::tempdir().unwrap();
+        let (control_nodes, data_nodes, _config) = support::bring_up_split(1, 1, dir.path()).await;
+        support::await_leader(&control_nodes).await;
+        let data_raftkv_ids: Vec<animus_env::NodeId> =
+            (1..2).map(animusd::config::raftkv_id).collect();
+        support::await_data_nodes_active(&control_nodes, &data_raftkv_ids).await;
+
+        let control_admin = control_nodes[0].admin_addr();
+        let data_admin = data_nodes[0].admin_addr();
+
+        // ---- both roles serve the same shell + JS assets ------------------
+        for addr in [control_admin, data_admin] {
+            let (s, head, body) = raw(addr, "GET", "/").await;
+            assert_eq!(s, 200, "the shell 200s on both roles");
+            assert!(
+                head.to_ascii_lowercase()
+                    .contains("content-type: text/html"),
+                "shell is html: {head}"
+            );
+            assert!(
+                body.contains("AnimusDB Console") && body.contains("dashboard_node.js"),
+                "shell references the new Node view asset: {body}"
+            );
+            let (s, _, node_js) = raw(addr, "GET", "/admin/ui/dashboard_node.js").await;
+            assert_eq!(s, 200, "dashboard_node.js is served on both roles");
+            assert!(
+                node_js.contains("function renderNode")
+                    && node_js.contains("control_mirror")
+                    && node_js.contains("nd-tablet-sel"),
+                "dashboard_node.js carries the Node view's rendering + storage-debug markers"
+            );
+        }
+
+        // ---- the gating logic itself lives in dashboard_core.js -----------
+        let (s, _, core_js) = raw(control_admin, "GET", "/admin/ui/dashboard_core.js").await;
+        assert_eq!(s, 200);
+        assert!(
+            core_js.contains("ROLE_TABS")
+                && core_js.contains("applyRoleGating")
+                && core_js.contains(r#"data: ["node", "browser"]"#),
+            "dashboard_core.js defines the per-role tab gating, including the \
+             data role's node-first tab list: {core_js}"
+        );
+
+        // ---- /admin/config's role differs across the split -----------------
+        let (s, _, body) = raw(control_admin, "GET", "/admin/config").await;
+        assert_eq!(s, 200);
+        let cfg: Value = serde_json::from_str(&body).expect("config is JSON");
+        assert_eq!(cfg["role"].as_str(), Some("control"));
+
+        let (s, _, body) = raw(data_admin, "GET", "/admin/config").await;
+        assert_eq!(s, 200);
+        let cfg: Value = serde_json::from_str(&body).expect("config is JSON");
+        assert_eq!(cfg["role"].as_str(), Some("data"));
+
+        // ---- the data-only node's control-plane mirror actually syncs -----
+        // (ADR 0035 PR7's one backend addition: `/admin/raft`'s
+        // `control_mirror`.) Bounded poll — the mirror needs at least one
+        // sync/long-poll round trip against the control deployment.
+        timeout(Duration::from_secs(20), async {
+            loop {
+                let (s, _, body) = raw(data_admin, "GET", "/admin/raft").await;
+                assert_eq!(s, 200);
+                let view: Value = serde_json::from_str(&body).expect("raft view is JSON");
+                let cm = &view["control_mirror"];
+                assert!(cm.is_object(), "control_mirror is present: {view}");
+                assert!(cm["watermark"].is_u64(), "watermark is a number: {cm}");
+                assert!(
+                    cm["leader_hint"].is_null() || cm["leader_hint"].is_string(),
+                    "leader_hint is null or a string: {cm}"
+                );
+                if cm["has_synced"] == Value::Bool(true) {
+                    return;
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("data-only node's control_mirror did not sync in 20s");
+
+        // A control-only node IS a control-plane voter, so its own `/admin/raft`
+        // reports the honest degenerate mirror (never synced via a mirror —
+        // its own Raft state above already is the ground truth).
+        let (s, _, body) = raw(control_admin, "GET", "/admin/raft").await;
+        assert_eq!(s, 200);
+        let view: Value = serde_json::from_str(&body).expect("raft view is JSON");
+        assert_eq!(
+            view["control_mirror"]["has_synced"],
+            Value::Bool(false),
+            "a control-plane voter's own mirror is never 'synced' (no mirror involved): {view}"
+        );
+
+        for node in control_nodes.iter().chain(data_nodes.iter()) {
+            node.shutdown_graceful().await;
+        }
+    })
+    .await
+    .expect("test timed out");
+}

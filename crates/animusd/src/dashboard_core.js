@@ -15,6 +15,34 @@ const esc = (s) => String(s).replace(/[&<>"]/g, (c) =>
 // State assembled each refresh.
 let STATE = { status: null, nodes: [], peersErr: null };
 
+// ---- this node's own role (ADR 0035 PR7) ----
+// `SELF` is this node's own `/admin/config`+`/admin/raft`+`/admin/raftkv`+
+// `/admin/health` — fetched directly against `SEED` (never a peer), so
+// deriving the role and gating the sidebar never waits on a slow/unreachable
+// OTHER node the way the full cluster-wide fan-out in `loadAll()` below can.
+// `ROLE` defaults to "combined" (the superset of tabs) until the first
+// `loadSelf()` resolves, so an early deep-link / popstate before that first
+// resolve degrades to "show every tab", not "show none".
+let ROLE = "combined";
+let SELF = { ok: false, base: SEED };
+
+async function loadSelf() {
+  try {
+    const [config, raft, raftkv, health] = await Promise.all([
+      getJSON(SEED, "/admin/config"),
+      getJSON(SEED, "/admin/raft").catch(() => null),
+      getJSON(SEED, "/admin/raftkv").catch(() => null),
+      getJSON(SEED, "/admin/health").catch(() => null),
+    ]);
+    SELF = { base: SEED, config, raft, raftkv, health, ok: true };
+    ROLE = config.role || "combined";
+  } catch (e) {
+    SELF = { base: SEED, ok: false, error: String(e) };
+  }
+  applyRoleGating();
+  return ROLE;
+}
+
 // ---- theme ----
 // A UI preference, not data — persisted client-side only. Both palettes are
 // fully defined in dashboard.css; this just toggles which one applies.
@@ -257,6 +285,9 @@ function renderSidebarFoot() {
 }
 
 async function loadAll() {
+  // This node's own view first (fast, local-only) — see `SELF`'s doc above
+  // for why this must never wait on the slower peer fan-out below.
+  await loadSelf();
   let peers;
   try {
     peers = await getJSON(SEED, "/admin/peers");
@@ -292,6 +323,7 @@ async function loadAll() {
 }
 
 function render() {
+  applyRoleGating();
   renderHealthPill();
   renderSidebarFoot();
   renderOverview();
@@ -300,6 +332,7 @@ function render() {
   renderStorageSelectors();
   renderBrowserTables();
   renderSeedTables();
+  renderNode();
   // Rebuild the Dynamo editor's skeleton only when the effective table
   // changed (first load, table created/dropped, or a manual switch) — never
   // on a routine refresh with the same selection, so in-progress edits survive.
@@ -314,11 +347,44 @@ function render() {
 // AnimusDB Console design's shell). Each keeps its own id and `/admin/ui/<tab>`
 // path (the server's `is_ui_path` just prefix-matches, and existing
 // bookmarks/tests target these exact leaves).
-const TABS = ["overview", "placement", "tablets", "browser", "storage"];
+//
+// ADR 0035 PR7: which tabs this node shows is gated on its OWN role (`SELF`/
+// `ROLE`, from `/admin/config`) — a control-only node keeps exactly today's
+// five-tab cluster Console; a data-only node gets a dedicated Node view (plus
+// Data Browser — browsing through your own data edge is node-dedicated UX)
+// instead of the cluster-wide views it can't usefully render (it hosts no
+// control-plane Raft state and, being a single node, has nothing to place/
+// balance); a combined node gets everything, with Node appended last since a
+// combined node is also a data node. Each role list's first entry is that
+// role's default tab (`tabFromPath`'s fallback, `activateTab`'s
+// role-mismatch fallback below) — control/combined default to "overview"
+// (unchanged), data defaults to "node".
+const ROLE_TABS = {
+  control: ["overview", "placement", "tablets", "browser", "storage"],
+  combined: ["overview", "placement", "tablets", "browser", "storage", "node"],
+  data: ["node", "browser"],
+};
+// The currently-visible tab set — starts as the superset (`combined`) until
+// `loadSelf()` resolves this node's own role; see `ROLE`'s doc above.
+let TABS = ROLE_TABS.combined;
 
 function tabFromPath(path) {
   const m = /^\/admin\/ui\/([^/?#]+)/.exec(path);
   return m && TABS.includes(m[1]) ? m[1] : TABS[0];
+}
+
+// Recompute `TABS` from this node's own `ROLE`, show/hide the sidebar's nav
+// links to match, and correct the active tab if it's no longer valid for
+// this role — a role-inappropriate deep link (e.g. `/admin/ui/placement` on a
+// data-only node), or a tab picked from the default superset before the first
+// `loadSelf()` resolved. Idempotent; safe to call on every `loadSelf()`/
+// `render()` cycle.
+function applyRoleGating() {
+  TABS = ROLE_TABS[ROLE] || ROLE_TABS.combined;
+  document.querySelectorAll(".sidebar button.navlink").forEach((b) => {
+    b.style.display = TABS.includes(b.dataset.tab) ? "" : "none";
+  });
+  if (!TABS.includes(activeTab)) activateTab(TABS[0], { silent: true });
 }
 
 let activeTab = TABS[0];
