@@ -91,6 +91,14 @@ existing structural requirement that every node has a `ClientCtx.raft:
 RaftNode<ProdEnv>` — "no control role at all" is not viable without a much
 larger refactor than this slice warrants (see *Consequences*).
 
+**Superseded by ADR 0035:** that larger refactor is now decided. ADR 0035
+replaces `ClientCtx.raft`'s bare `RaftNode<ProdEnv>` with a `ControlHandle`
+seam (`Local`/`Remote`) precisely so a data node can run with **no control
+role at all** — not even the non-voter shape verified above — reusing this
+section's own `remote_metadata_sync_loop`/`effective_metadata()` mechanism as
+the *only* way a data node ever sees `Metadata`, generalized from "growth-node
+fallback" to "how every data node syncs."
+
 ### The two things this slice adds (§4, §5)
 
 4. **A metadata mirror for a genuinely non-participating node.** A node

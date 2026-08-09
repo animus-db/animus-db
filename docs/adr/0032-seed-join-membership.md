@@ -2,7 +2,12 @@
 
 - **Status:** Accepted — implemented incrementally (PR1: replicated node
   address book; PR2: `animusd join`; PR3: decommission). **All three PRs are
-  landed.**
+  landed.** Extended by ADR 0035 (control plane as a separate deployment):
+  PR2's join flow generalizes unchanged — a joining data node's `--seed` may
+  be a control-only node (ADR 0035's static discovery root) as well as a
+  combined node, since `JoinInfo` is answered from replicated `Metadata`
+  (`node_addrs`/`client_route`), which a control-only node holds exactly as a
+  combined node does.
 - **Date:** 2026-08-07
 
 ## Context

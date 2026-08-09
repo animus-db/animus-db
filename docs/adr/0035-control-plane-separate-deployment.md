@@ -1,0 +1,272 @@
+# ADR 0035 — Control plane as a separate deployment
+
+- **Status:** Proposed. Delivery is a 6-PR stack (§Delivery plan); this ADR is
+  PR0. Amends ADR 0030 (data-plane-only growth) and ADR 0032 (seed/join,
+  address book) — see the note at the end of each amended ADR.
+- **Date:** 2026-08-09
+
+## Context
+
+Every `animusd` process today assembles **both** planes on fixed,
+index-derived ids: `config::control_id(i) = i` (this process's metadata Raft
+voter) and `config::raftkv_id(i) = RAFTKV_ID_BASE + i` (this process's
+per-tablet CP-data role), both bound from the same `ClusterConfig` entry at
+index `i` (`crates/animusd/src/config.rs`). `ClientCtx.raft` is a bare
+`RaftNode<ProdEnv>` — the process's own in-process control-plane handle — read
+directly at roughly thirty call sites across `lib.rs`, `dynamo.rs`, `cql.rs`,
+and `admin.rs` (`ctx.raft.metadata()`, `ctx.raft.last_applied()`,
+`ctx.raft.propose(..)`, and friends). `bootstrap` (leader-only, idempotent)
+registers **every control voter's own `raftkv` id** as an `Active` data
+member — so today a control-plane voter is unconditionally also a data node;
+there is no way to run one without the other.
+
+ADR 0030 and ADR 0032 already built most of the machinery a *data-only* node
+needs, but only as a **growth path**, layered on top of a normal node that
+still always starts with a full local control role:
+
+- ADR 0030's non-voter control core (`!control_ids.contains(&self.control_id)`)
+  plus `remote_metadata_sync_loop` / `ClientCtx::effective_metadata()` proves a
+  node can serve every CP-routing, hosting, and admin-status call correctly
+  off a **polled mirror** of another node's `Metadata`, with no local control
+  Raft replication of its own.
+- ADR 0030 §3 ("Non-voter control id — verified, and found insufficient on its
+  own") explicitly considered and rejected running a node with **no control
+  role at all**, calling it "not viable without a much larger refactor than
+  this slice warrants" — at the time, `BoundNode::start_with`'s structural
+  requirement that every node owns a `ClientCtx.raft: RaftNode<ProdEnv>` made
+  that true. This ADR is that larger refactor, made from having watched the
+  mirror path work in production for two ADRs' worth of features (growth,
+  then join) with zero correctness incidents traced to staleness.
+- ADR 0032 PR1's replicated node address book and `route_sync_loop` close the
+  one gap ADR 0030 left open (a node's own `client_route`/admin peer list
+  going stale as the cluster grows) — a live, cluster-wide address book that a
+  *pure* data node can rely on exactly as a growth node already does.
+
+What's still missing is a deployment shape where the **control-plane role
+itself** can be operated, scaled, and reasoned about independently of the
+data plane: a small, fixed-membership metadata quorum that never has to
+absorb data-node churn (every join/decommission today proposes through
+whichever control voters happen to also be running as data nodes), and a
+data fleet that can grow/shrink/restart without ever touching control-plane
+Raft state at all. Splitting the *deployment* is also a prerequisite for
+independently tuning each side's resource profile (the control group's WAL is
+small and latency-sensitive; the data fleet's LSM engines are the
+capacity-heavy side) and for a future control-plane-only upgrade or restart
+that doesn't require touching every data node's process.
+
+## Decision
+
+We will add two new, additive `animusd` deployment modes on top of the
+existing role assemblies, and decouple `ClientCtx`'s control-plane access
+behind a seam so the data-node mode never needs a local `RaftCore` at all.
+
+### Target topology
+
+- **`animusd control`** — a small static group (e.g. 3 nodes) running only:
+  the control `RaftNode` (metadata Raft — membership, tablet map, schema
+  catalog, node address book), the placement `reconcile_loop`, the failure
+  detector (`detect_loop`), and the client + admin endpoints that serve
+  `Status` / `ProposeSchema` / `JoinInfo` / admin actions (including
+  decommission) and the dashboard. **No storage engine, no `raftkv` env, no
+  DynamoDB/CQL edges** — a control node never hosts a tablet and never speaks
+  the data-plane wire protocols.
+- **`animusd data`** — N nodes running only: the shared LSM engine, the
+  `raftkv` env + per-tablet Raft groups, the tablet-host reconciler (ADR
+  0031), and the client/DynamoDB/CQL/admin edges. **No local control
+  `RaftCore` at all** — metadata comes from a mirror of the control
+  deployment, i.e. the ADR 0030 growth-node path (`remote_metadata_sync_loop`
+  / `effective_metadata()`) promoted from "what a growth node falls back to"
+  to **the only way any data node ever sees `Metadata`**. Data nodes join via
+  seeds pointing at the control deployment (ADR 0032's `animusd join`,
+  generalized so a seed can be a control-only node); data-node membership is
+  always dynamic, allocated at join — never baked into a shared
+  control/data config index the way `control_id(i)`/`raftkv_id(i)` are today.
+- **Combined mode retained** for dev and the existing test suite: `--cluster
+  N` and today's `--config`/`--node` flows keep assembling both role sets in
+  one process, refactored as **composition of the two role assemblies**
+  (`animusd control`'s bring-up + `animusd data`'s bring-up, wired to the same
+  in-process `RaftNode` via a `Local` handle) rather than a third, independent
+  code path. Nothing about `--cluster N`'s or `run_node`'s external behavior
+  changes.
+
+### Key mechanism decisions
+
+1. **A `ControlHandle` seam replaces `ClientCtx.raft`'s bare
+   `RaftNode<ProdEnv>`.** `enum ControlHandle { Local(RaftNode<ProdEnv>),
+   Remote(RemoteControlClient) }`. Reads split by freshness contract, mirroring
+   the existing `metadata()`/`effective_metadata()` split:
+   - `metadata_cached()` — mirror-acceptable staleness (the existing
+     `remote_metadata_sync_loop` polling contract). Used by CP routing,
+     tablet-host reconciliation, `/admin/status`, `peer_sync_loop`,
+     `route_sync_loop`, and every other call site ADR 0030 already routes
+     through `effective_metadata()`.
+   - `metadata_fresh()` — must reach the control leader itself, no mirror
+     substitution. Two call sites need this today and must keep needing it
+     under the split: the `CreateTable` commit-wait poll (`dynamo.rs`/
+     `cql.rs`, which today call `ctx.raft.metadata()` directly rather than
+     through `effective_metadata()`) and the DynamoDB conditional-write
+     existence gate. `Remote::metadata_fresh()` proxies a `Status` request to
+     the control deployment (relayed to its leader, mirroring
+     `propose_schema`'s existing relay shape) rather than returning a locally
+     cached value.
+2. **Config/identity decoupling.** Today `control_id(i) = i` and
+   `raftkv_id(i) = 300 + i` derive from one shared per-process index
+   (`config.rs`), `peer_book` bundles both roles' addresses into one map, and
+   `bootstrap` registers every control voter's `raftkv` id as an `Active` data
+   member. Post-split: control membership is its own static list, independent
+   of any data-node index; data-node ids are allocated at join time (as ADR
+   0032's collision guard already does for a growth/join node), not derived
+   from a control-group position; per-role peer books (a control node's peer
+   book lists only control voters; a data node's lists only other data
+   nodes' `raftkv` addresses); `bootstrap` stops auto-registering control
+   voters as data members **outside combined mode** — combined mode keeps
+   today's behavior exactly (a combined node is simultaneously a control
+   voter and a data member, as it always has been).
+3. **Heartbeats stay on the internal `Env` `Network`.** A data node's
+   `raftkv` env keeps heartbeating the control ids as `RaftMsg::Heartbeat`
+   (unchanged detector semantics, ADR 0012) — failure detection does not move
+   to a new transport. Data nodes get the control deployment's internal
+   addresses from seed config; **the control deployment's addresses are the
+   static root of discovery** for everything downstream (join, growth,
+   rebalancing all resolve through it), exactly as the pre-growth control
+   group already is the root of discovery in ADR 0030/0032.
+4. **`metadata_watch()` stays in-process only.** A `Remote` data node starts
+   with the existing 200–500ms poll cadence (`remote_metadata_sync_loop`,
+   generalized from "growth-node fallback" to "how every data node syncs"),
+   not the event-driven watch — `MetadataWatch`'s `AtomicWaker` is a
+   same-process primitive (ADR 0031 §trigger) and does not cross a network
+   hop. PR5 (below) upgrades this to a long-poll watch keyed on the applied-
+   index watermark the control deployment already exposes, closing most of
+   the latency gap between "control commits" and "data node observes it"
+   without requiring a new push mechanism.
+5. **The ADR 0028/0033 write fence and read-side scope check become
+   load-bearing for every node, not just a crossover-window edge case.**
+   Today every node's own `Metadata` view can only ever be *slightly* behind
+   the control leader's (same cluster, tight replication or a bounded growth-
+   node poll). Once **every** data node routes off a polled mirror as a
+   matter of course, the routing decision a client op is dispatched on is
+   *routinely* one poll interval stale, not just during a rare split/merge/
+   rebalance crossover — so the pre-propose range check
+   (`cp_put_local`/`cp_delete_local`/`cp_batch_propose`), the embedded
+   per-command fence, and the read-side `scope_range()` pre-check
+   (`cp_get_local`/`cp_scan_local`) are what keep a stale-routed op safe
+   (retryable error, never silent corruption or a false "absent") rather than
+   a correctness assumption this split would otherwise quietly violate. Call
+   this out explicitly in the safety review for PR4/PR5: these mechanisms
+   already exist and are already tested (root `CLAUDE.md`'s "write fence"/
+   "read-side scope pre-check" entries), but their justification changes from
+   "covers a narrow race window" to "covers the routine case" the moment a
+   data node has no local control Raft to fall back on.
+
+### Rationale: zero control Raft code on a data node, not a non-voter core
+
+We choose "data nodes run **zero** control-plane Raft code" over "data nodes
+run a **non-voter** control `RaftCore`" (the shape ADR 0030 §3 built and this
+ADR's own Context section describes). The non-voter shape is *available* and
+already proven safe (`is_voter()` gates campaigning cleanly, ADR 0030 §3), but
+carries WAL, snapshot-recovery, and replay machinery on every data node for a
+consensus group that node never actually participates in — pure overhead with
+no correctness or latency benefit, since a non-voter's local `Metadata` never
+advances via real replication anyway (ADR 0030 §3's own finding: "a non-voter
+role's local `Metadata` never updates via real Raft replication, no matter
+how long it waits"). The growth-node mirror path already proves the
+poll-based `Remote` shape works correctly in production; there is nothing the
+non-voter core buys a *permanent* data node that the mirror doesn't already
+provide more cheaply. (A control-plane-follower-less **growth** node
+transitioning to a real voter, ADR 0030's own follow-up note, is a different
+question — about the *control* group growing, out of scope here — from
+whether an ordinary data node should carry a dormant control core, which this
+ADR answers no to.)
+
+## Non-goals (v1)
+
+- **Control-group membership stays static**, as ADR 0030 decided. Making the
+  control deployment itself elastic (`RaftCore::change_membership` on the
+  control plane) is a future ADR; this one only relocates the static group
+  into its own deployment, it does not make it grow.
+- **No change to the consensus protocols themselves.** `RaftCore` stays sync
+  and `Env`-free; `animus-cp-data`'s per-tablet Raft groups, `animus-consensus`
+  Accord, and every wire protocol are untouched. This is a deployment-topology
+  and call-site-routing change, not a protocol change.
+
+## Delivery plan
+
+Six stacked PRs, following this codebase's standing discipline of landing the
+low-risk mechanical piece first (ADR 0031/0032's PR stacks):
+
+1. **PR0 (this ADR).**
+2. **PR1: `ControlHandle` seam.** Pure refactor — introduce `ControlHandle`
+   wrapping today's `RaftNode<ProdEnv>` as `Local` only (no `Remote` variant
+   wired up yet), migrate every `ClientCtx.raft` call site to
+   `metadata_cached()`/`metadata_fresh()`/the handle's propose/relay methods.
+   No behavior change; existing combined-mode tests are the regression
+   coverage.
+3. **PR2: config/identity decoupling.** Split `control_id`/`raftkv_id`
+   derivation off the shared per-process index; per-role peer books; scope
+   `bootstrap`'s auto-registration of control voters as data members to
+   combined mode only.
+4. **PR3: `animusd control`.** The control-only entry point and CLI subcommand;
+   binds only the control Raft + placement/detector loops + client/admin
+   endpoints.
+5. **PR4: `animusd data` with `Remote` handle.** Implement
+   `ControlHandle::Remote`, wire it into the data-only entry point; a data
+   node joins via seed against a control deployment and never binds a local
+   `RaftCore`.
+6. **PR5: long-poll watch + staleness audit.** Upgrade `Remote::
+   metadata_cached()` from fixed-interval polling to a long-poll watch keyed
+   on the control deployment's applied-index watermark; audit every call site
+   touched in PR1 against the "routine staleness, not crossover-only"
+   reasoning in §5 above.
+7. **PR6: per-process split-cluster integration tests + docs/dashboard.**
+   End-to-end tests running a real `animusd control` process alongside
+   several real `animusd data` processes (not combined mode); dashboard and
+   `CLAUDE.md` updates reflecting the new topology as a first-class,
+   documented deployment shape rather than only combined mode.
+
+## Consequences
+
+- **Independent scaling and operations.** The control deployment can be sized
+  and tuned for a small, latency-sensitive metadata quorum; the data fleet can
+  grow, shrink, restart, or be rebuilt without any control-plane Raft state
+  ever being touched — closing the coupling ADR 0030/0032's growth/join
+  machinery worked around but never eliminated (a growth/join node was always
+  additive to a combined-mode core that still existed).
+- **A data node's `Metadata` view is routinely, not just occasionally, one
+  poll interval stale.** This makes the ADR 0028/0033 write fence and
+  read-side scope check permanently load-bearing for every write and read on
+  every data node (§5 above) — accepted, since those mechanisms are already
+  built, tested, and exactly designed for this failure shape; what changes is
+  how often they're expected to actually fire.
+- **Combined mode is preserved exactly**, so the existing test suite, dev
+  workflow, and `--cluster N` docs need no behavioral rewrite — only an
+  internal reorganization into "compose the two role assemblies." This bounds
+  the risk of the refactor: if PR1/PR2 regress anything, combined-mode tests
+  catch it before PR3/PR4 ever introduce a genuinely new topology.
+- **The control deployment becomes a harder single point of failure for
+  *availability of change*, not of reads/writes.** A data fleet with a live
+  `Metadata` mirror keeps serving CP reads/writes even if the control
+  deployment is briefly unreachable (same as today's growth-node behavior);
+  what it loses is the ability to observe *new* placement/schema/membership
+  changes until the mirror reconnects. This is the same trade-off ADR 0030's
+  growth node already accepted, now generalized to the whole data fleet.
+- **`RaftCore::change_membership` on the control plane remains unbuilt.** A
+  future ADR that wants the control deployment itself to grow past its
+  initial static size still needs that mechanism plus its own safety review;
+  this ADR's split composes with it later without conflict.
+
+## Engineering lesson
+
+ADR 0030 §3 evaluated "a node with no control role at all" and rejected it as
+"not viable without a much larger refactor than this slice warrants" — a
+correct call at the time, since `BoundNode::start_with` had a hard structural
+requirement (every node owns a local `RaftCore`) with no seam to route around
+it. Two ADRs later, that same slice (the growth-node remote-metadata mirror,
+built for a narrower reason — letting a non-voter observe `Metadata` at all)
+turned out to already be the missing piece: once a mirror is proven correct
+in production, "no control role at all" stops being a refactor and becomes a
+generalization of code that already exists. **A prior ADR's "out of scope,
+too large a refactor" framing is a decision made against the codebase as it
+existed then — recheck it against what has actually shipped since, especially
+when a later feature (here, growth *and* join) incrementally builds the exact
+mechanism the earlier ADR said was missing.** Recorded in the root `CLAUDE.md`
+Engineering Practices section.
