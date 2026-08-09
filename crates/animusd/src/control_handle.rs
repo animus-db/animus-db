@@ -1,27 +1,34 @@
-//! The `ControlHandle` seam (ADR 0035 PR1).
+//! The `ControlHandle` seam (ADR 0035 PR1, extended by PR4).
 //!
-//! Today every `animusd` node's [`crate::ClientCtx`] reaches the control plane
-//! through a bare `RaftNode<ProdEnv>` — this process's own in-process control
-//! Raft replica. ADR 0035 splits `animusd` into a small control-only
-//! deployment and a data-only fleet with **no local control `RaftCore` at
-//! all**, reaching the control deployment over the network instead. This
-//! module introduces the seam that split needs, but wires up only the
-//! `Local` variant: every method here delegates straight to the same
-//! `RaftNode<ProdEnv>` calls `ClientCtx` already made directly, so this PR is
-//! a pure refactor with no behavior change on any node that exists today
-//! (every one of them is `Local`).
+//! Before this seam, every `animusd` node's [`crate::ClientCtx`] reached the
+//! control plane through a bare `RaftNode<ProdEnv>` — this process's own
+//! in-process control Raft replica. ADR 0035 splits `animusd` into a small
+//! control-only deployment and a data-only fleet with **no local control
+//! `RaftCore` at all**, reaching the control deployment over the network
+//! instead. PR1 introduced the seam with only the `Local` variant wired up
+//! (a pure refactor — every method delegated straight to the same
+//! `RaftNode<ProdEnv>` calls `ClientCtx` already made directly, so no node
+//! that existed then — every one of them `Local` — changed behavior).
 //!
-//! PR4 adds `ControlHandle::Remote(RemoteControlClient)` for a data-only node
-//! and implements its side of the two read methods below (a polled/long-poll
-//! mirror for [`metadata_cached`](ControlHandle::metadata_cached), a
-//! leader-directed `Status` fetch for
-//! [`metadata_fresh`](ControlHandle::metadata_fresh)) — see ADR 0035 §"Key
-//! mechanism decisions" #1.
+//! **PR4 adds `ControlHandle::Remote(RemoteControlClient)`** for a data-only
+//! node: a polled mirror for
+//! [`metadata_cached`](ControlHandle::metadata_cached) (kept fresh by the
+//! generalized `remote_metadata_sync_loop`, ADR 0035 §4) and a genuine
+//! leader-directed network fetch for
+//! [`metadata_fresh`](ControlHandle::metadata_fresh) (ADR 0035 §1) — see
+//! [`RemoteControlClient`]'s own doc for both, plus the leader-hint lifecycle
+//! that backs [`ControlHandle::leader_addr_hint`]. PR5 upgrades
+//! `metadata_cached`'s fixed-interval poll to a long-poll watch and audits
+//! every `Remote` degrade below against real staleness/liveness traffic.
 
 use std::collections::BTreeSet;
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 
 use animus_control::{Metadata, MetadataWatch, RaftNode, Role};
 use animus_env::{MetricsHandle, NodeId, ProdEnv};
+
+use crate::{ClientRequest, ClientResponse, relay_request};
 
 /// This node's access to the control plane's replicated [`Metadata`] and
 /// this-node's-own-Raft-state introspection (`/admin/raft`, `/metrics`).
@@ -62,6 +69,144 @@ use animus_env::{MetricsHandle, NodeId, ProdEnv};
 #[derive(Clone)]
 pub(crate) enum ControlHandle {
     Local(RaftNode<ProdEnv>),
+    /// A data-only node's control-plane access (ADR 0035 PR4): no local
+    /// `RaftCore` at all. See [`RemoteControlClient`]'s own doc.
+    Remote(RemoteControlClient),
+}
+
+/// A data-only node's (ADR 0035 PR4) access to the **separately-deployed**
+/// control plane: no local `RaftCore`, so every read is either a poll of a
+/// mirror (`metadata_cached`, refreshed by the generalized
+/// `remote_metadata_sync_loop`) or a direct live fetch (`metadata_fresh`).
+/// Cheap to clone (every field is `Arc`-backed), mirroring `RaftNode`'s own
+/// shape.
+///
+/// **Leader-hint lifecycle (ADR 0035 §1).** Every `ClientRequest::Status`
+/// reply now carries the answering node's own `self.control.leader()` +
+/// `route_addr(leader_id)` as `leader_hint: Option<(NodeId, SocketAddr)>`
+/// (`#[serde(default)]`, so an old reply without the field still parses as
+/// `None`). This handle keeps the most recent one it has seen — updated by
+/// the periodic sync loop *and* by [`metadata_fresh`](Self::metadata_fresh)'s
+/// own live fetch — and hands it out via [`leader`](Self::leader) (the id)
+/// and [`leader_addr_hint`](Self::leader_addr_hint) (the client-API address,
+/// which `ClientCtx::propose_schema` prefers over a `route_addr` lookup —
+/// see that method's doc). The hint is *never* independently verified against
+/// the answering node's own role; see `metadata_fresh`'s doc for the
+/// consequence and the PR5 follow-up this is flagged for.
+#[derive(Clone)]
+pub(crate) struct RemoteControlClient {
+    /// The control deployment's own **client**-API addresses — the discovery
+    /// root for the mirror sync loop and `metadata_fresh`'s fallback scan.
+    /// Static for this node's lifetime (the control group itself is static,
+    /// ADR 0030); every actual hop still prefers `leader_hint` first.
+    seeds: Vec<SocketAddr>,
+    /// The last `Metadata` observed from any control node's `Status` reply.
+    /// `None` until the very first sync — the readiness signal
+    /// [`has_synced`](Self::has_synced) exposes for the tablet-host
+    /// reconciler's pre-recovery guard, which otherwise has no local
+    /// `last_applied()` to gate on (this handle's is pinned at 0 forever).
+    mirror: Arc<Mutex<Option<Metadata>>>,
+    /// The last-known control-plane leader `(id, client address)` — see the
+    /// type doc's "leader-hint lifecycle" section.
+    leader_hint: Arc<Mutex<Option<(NodeId, SocketAddr)>>>,
+    /// No-op metrics sink: a data-only node's control-plane access has no
+    /// local Raft loops to instrument (unlike `Local`, whose `RaftNode`
+    /// records into its own env's real sink).
+    metrics: MetricsHandle,
+}
+
+impl RemoteControlClient {
+    pub(crate) fn new(seeds: Vec<SocketAddr>) -> Self {
+        Self {
+            seeds,
+            mirror: Arc::new(Mutex::new(None)),
+            leader_hint: Arc::new(Mutex::new(None)),
+            metrics: MetricsHandle::noop(),
+        }
+    }
+
+    /// The mirror's last synced value, or a default-empty `Metadata` if it
+    /// has never synced (see [`has_synced`](Self::has_synced) for telling the
+    /// two apart).
+    pub(crate) fn metadata_cached(&self) -> Metadata {
+        self.mirror
+            .lock()
+            .expect("remote control mirror poisoned")
+            .clone()
+            .unwrap_or_default()
+    }
+
+    /// Whether this handle's mirror has synced at least once.
+    pub(crate) fn has_synced(&self) -> bool {
+        self.mirror
+            .lock()
+            .expect("remote control mirror poisoned")
+            .is_some()
+    }
+
+    pub(crate) fn leader(&self) -> Option<NodeId> {
+        self.leader_hint
+            .lock()
+            .expect("leader hint poisoned")
+            .as_ref()
+            .map(|(id, _)| *id)
+    }
+
+    pub(crate) fn leader_addr_hint(&self) -> Option<SocketAddr> {
+        self.leader_hint
+            .lock()
+            .expect("leader hint poisoned")
+            .as_ref()
+            .map(|(_, addr)| *addr)
+    }
+
+    /// Record a `Status` reply's metadata + leader hint. Called by the
+    /// generalized `remote_metadata_sync_loop` and by
+    /// [`metadata_fresh`](Self::metadata_fresh)'s own live fetch — both
+    /// observe the identical wire shape, so both refresh the same state.
+    pub(crate) fn observe(&self, metadata: Metadata, leader_hint: Option<(NodeId, SocketAddr)>) {
+        *self.mirror.lock().expect("remote control mirror poisoned") = Some(metadata);
+        if let Some(hint) = leader_hint {
+            *self.leader_hint.lock().expect("leader hint poisoned") = Some(hint);
+        }
+    }
+
+    /// A live, leader-directed `Status` fetch (ADR 0035 §1): try the current
+    /// leader hint first, falling back to a scan of every seed — mirroring
+    /// `ClientCtx::propose_schema`'s own hint-first-then-scan relay shape
+    /// (this handle has no `ClientCtx` of its own to reach `propose_schema`
+    /// through, so it repeats the same policy directly over
+    /// [`relay_request`](crate::relay_request)). Whichever reply lands also
+    /// refreshes the mirror + hint, exactly like the periodic sync loop.
+    ///
+    /// **Known looseness** (flagged for the PR5 staleness audit): like
+    /// `propose_schema`'s broadcast fallback, this trusts whichever node
+    /// answers — it does not independently verify the responder self-reports
+    /// as the leader. A stale hint can therefore serve a reply one hop behind
+    /// the real leader; the caller's own retry loop (e.g.
+    /// `ClientCtx::propose_and_await`) re-invokes this on its next poll tick,
+    /// and a non-leader's own `Status` reply carries *its* leader hint, so
+    /// staleness self-heals within a couple of hops rather than compounding.
+    /// Falls back to the current mirror if no seed answers at all, rather
+    /// than blocking — the caller's own poll loop bounds the wait.
+    pub(crate) async fn metadata_fresh(&self) -> Metadata {
+        let mut candidates = Vec::with_capacity(self.seeds.len() + 1);
+        if let Some(addr) = self.leader_addr_hint() {
+            candidates.push(addr);
+        }
+        candidates.extend(self.seeds.iter().copied());
+        for addr in candidates {
+            if let ClientResponse::Status {
+                metadata,
+                leader_hint,
+            } = relay_request(addr, &ClientRequest::Status).await
+            {
+                self.observe(metadata.clone(), leader_hint);
+                return metadata;
+            }
+        }
+        self.metadata_cached()
+    }
 }
 
 impl ControlHandle {
@@ -74,6 +219,7 @@ impl ControlHandle {
     pub(crate) fn metadata_cached(&self) -> Metadata {
         match self {
             Self::Local(raft) => raft.metadata(),
+            Self::Remote(remote) => remote.metadata_cached(),
         }
     }
 
@@ -83,107 +229,188 @@ impl ControlHandle {
     /// which must observe their own just-proposed command landing in the
     /// authoritative state, never a mirror that could still be a poll
     /// interval behind.
-    pub(crate) fn metadata_fresh(&self) -> Metadata {
+    ///
+    /// `Local` stays a synchronous passthrough to `metadata_cached` (this
+    /// node's own applied state already *is* the RYW source); `Remote`
+    /// performs a genuine network round trip — see
+    /// [`RemoteControlClient::metadata_fresh`]'s doc for its leader-directed
+    /// fetch + fallback policy.
+    pub(crate) async fn metadata_fresh(&self) -> Metadata {
         match self {
             Self::Local(raft) => raft.metadata(),
+            Self::Remote(remote) => remote.metadata_fresh().await,
         }
     }
 
     /// Whether this handle currently believes it is the control-plane leader.
+    /// Always `false` for `Remote` — a data-only node never holds any
+    /// control-group Raft role at all, so "am I the leader" is meaningless
+    /// for it (`ClientCtx::propose_schema`/`admin_drain`/`admin_remove_member`
+    /// already treat "not the leader" as "relay or ask the operator to retry
+    /// on the leader", which is exactly the right degrade here).
     pub(crate) fn is_leader(&self) -> bool {
         match self {
             Self::Local(raft) => raft.is_leader(),
+            Self::Remote(_) => false,
         }
     }
 
-    /// The current leader's id, if this handle knows one.
+    /// The current leader's id, if this handle knows one. For `Remote`, the
+    /// id half of the [leader hint](RemoteControlClient) — see that type's
+    /// doc.
     pub(crate) fn leader(&self) -> Option<NodeId> {
         match self {
             Self::Local(raft) => raft.leader(),
+            Self::Remote(remote) => remote.leader(),
+        }
+    }
+
+    /// The current leader's **client-API** address, if directly known (ADR
+    /// 0035 PR4) — always `None` for `Local` (a genuine control-group voter
+    /// has no separate notion of "the leader's client address"; callers that
+    /// need one resolve it via `ClientCtx::route_addr` on `leader()`'s id).
+    /// For `Remote`, this is the [leader hint](RemoteControlClient) a
+    /// `Status` reply carries, which `ClientCtx::propose_schema` prefers over
+    /// a `route_addr` lookup — the hint is strictly fresher for a data-only
+    /// node, since it comes straight off the same `Status` reply that filled
+    /// the mirror, whereas `route_addr` needs the leader's address to have
+    /// separately synced into the replicated node-address book.
+    pub(crate) fn leader_addr_hint(&self) -> Option<SocketAddr> {
+        match self {
+            Self::Local(_) => None,
+            Self::Remote(remote) => remote.leader_addr_hint(),
         }
     }
 
     /// This handle's current Raft role (introspection, `/admin/raft`).
+    /// `Remote` reports `Follower` — the closest honest approximation (it
+    /// holds no vote, campaigns for nothing, and is certainly not `Leader`).
     pub(crate) fn role(&self) -> Role {
         match self {
             Self::Local(raft) => raft.role(),
+            Self::Remote(_) => Role::Follower,
         }
     }
 
-    /// This handle's current Raft term (introspection, `/admin/raft`).
+    /// This handle's current Raft term (introspection, `/admin/raft`). Always
+    /// `0` for `Remote` — it has no local Raft term at all.
     pub(crate) fn term(&self) -> u64 {
         match self {
             Self::Local(raft) => raft.term(),
+            Self::Remote(_) => 0,
         }
     }
 
-    /// This handle's commit index (introspection, `/admin/raft`).
+    /// This handle's commit index (introspection, `/admin/raft`). Always `0`
+    /// for `Remote` — see [`term`](Self::term)'s doc.
     pub(crate) fn commit_index(&self) -> u64 {
         match self {
             Self::Local(raft) => raft.commit_index(),
+            Self::Remote(_) => 0,
         }
     }
 
     /// This handle's last-applied index — also the pre-recovery-replay guard
     /// the tablet-host reconciler trigger reads directly (see
-    /// `tablet_host_reconciler_loop`'s doc).
+    /// `tablet_host_reconciler_loop`'s doc). **Pinned at `0` forever for
+    /// `Remote`** (it has no local Raft log to apply at all) — the
+    /// reconciler's guard also ORs in [`has_synced_metadata`]
+    /// (Self::has_synced_metadata) so a data-only node isn't permanently
+    /// gated off by a signal that can never become true for it.
     pub(crate) fn last_applied(&self) -> u64 {
         match self {
             Self::Local(raft) => raft.last_applied(),
+            Self::Remote(_) => 0,
         }
     }
 
     /// This handle's durable (fsynced) index (introspection, `/admin/raft`).
+    /// Always `0` for `Remote` — see [`term`](Self::term)'s doc.
     pub(crate) fn durable_index(&self) -> u64 {
         match self {
             Self::Local(raft) => raft.durable_index(),
+            Self::Remote(_) => 0,
         }
     }
 
-    /// This handle's snapshot index (introspection, `/admin/raft`).
+    /// This handle's snapshot index (introspection, `/admin/raft`). Always
+    /// `0` for `Remote` — see [`term`](Self::term)'s doc.
     pub(crate) fn snapshot_index(&self) -> u64 {
         match self {
             Self::Local(raft) => raft.snapshot_index(),
+            Self::Remote(_) => 0,
         }
     }
 
     /// This handle's in-memory log length (introspection, `/admin/raft`).
+    /// Always `0` for `Remote` — see [`term`](Self::term)'s doc.
     pub(crate) fn log_len(&self) -> usize {
         match self {
             Self::Local(raft) => raft.log_len(),
+            Self::Remote(_) => 0,
         }
     }
 
     /// This handle's current voter configuration (introspection,
-    /// `/admin/raft`).
+    /// `/admin/raft`). Always empty for `Remote` — it is not a voter of
+    /// anything.
     pub(crate) fn config(&self) -> BTreeSet<NodeId> {
         match self {
             Self::Local(raft) => raft.config(),
+            Self::Remote(_) => BTreeSet::new(),
         }
     }
 
     /// This handle's recording metrics sink (aggregated into the `/metrics`
-    /// export alongside the raftkv-role sink).
+    /// export alongside the raftkv-role sink). A `Remote` handle's sink is a
+    /// permanent no-op (see [`RemoteControlClient`]'s doc) — the raftkv-role
+    /// sink still records real counters on a data-only node.
     pub(crate) fn metrics(&self) -> &MetricsHandle {
         match self {
             Self::Local(raft) => raft.metrics(),
+            Self::Remote(remote) => &remote.metrics,
         }
     }
 
     /// An executor-agnostic "applied index advanced" notification — see
-    /// `MetadataWatch`'s own doc (ADR 0031 §trigger). Same-process only; PR5
-    /// upgrades a `Remote` handle to a long-poll equivalent (ADR 0035 §4).
+    /// `MetadataWatch`'s own doc (ADR 0031 §trigger). Same-process only, so a
+    /// `Remote` handle hands out a fresh, disconnected default: nothing ever
+    /// calls `bump` on it, so `changed()` never resolves and `latest()` stays
+    /// `0` forever — which is exactly the desired effect (ADR 0035 §4):
+    /// `tablet_host_reconciler_loop`'s `select!` then always falls through to
+    /// its `RECONCILE_FALLBACK_INTERVAL` sleep arm for a data-only node,
+    /// without that loop needing to special-case `Remote` at all. PR5 upgrades
+    /// this to a real long-poll equivalent.
     pub(crate) fn metadata_watch(&self) -> MetadataWatch {
         match self {
             Self::Local(raft) => raft.metadata_watch(),
+            Self::Remote(_) => MetadataWatch::default(),
         }
     }
 
     /// Whether this handle's failure detector currently believes `member` is
-    /// alive (`/admin/raft`'s per-member view).
+    /// alive (`/admin/raft`'s per-member view). Always `false` for `Remote`
+    /// — a data-only node runs no failure detector of its own (that lives on
+    /// the control deployment).
     pub(crate) fn believes_alive(&self, member: NodeId) -> bool {
         match self {
             Self::Local(raft) => raft.believes_alive(member),
+            Self::Remote(_) => false,
+        }
+    }
+
+    /// Whether this handle's view of `Metadata` has ever synced at all — the
+    /// readiness signal `tablet_host_reconciler_loop`'s pre-recovery guard
+    /// needs in place of `last_applied() > 0`, which is pinned at `0` forever
+    /// for `Remote` (see that method's doc). `Local` answers `false`
+    /// unconditionally: its own `last_applied()` (or, for an ADR 0030 growth
+    /// node, `ClientCtx.remote_metadata`) already tells this story, so this
+    /// method contributes nothing new for it — the guard ORs all three
+    /// signals together.
+    pub(crate) fn has_synced_metadata(&self) -> bool {
+        match self {
+            Self::Local(_) => false,
+            Self::Remote(remote) => remote.has_synced(),
         }
     }
 }

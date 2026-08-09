@@ -94,7 +94,7 @@ async fn per_process_nodes_form_a_cluster_from_shared_config() {
     let client2 = config.nodes[2].client;
 
     match call(client0, ClientRequest::Status).await {
-        ClientResponse::Status(meta) => {
+        ClientResponse::Status { metadata: meta, .. } => {
             assert_eq!(meta.members.len(), 3);
             // ADR 0023: no data tablet until the first write provisions one.
             assert_eq!(meta.tablets.len(), 0);

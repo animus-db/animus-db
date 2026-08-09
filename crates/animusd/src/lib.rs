@@ -50,7 +50,7 @@ mod dynamo;
 mod http;
 mod topology;
 
-use control_handle::ControlHandle;
+use control_handle::{ControlHandle, RemoteControlClient};
 
 use animus_control::node::heartbeat_loop;
 use animus_control::{PlacementPolicy, ProposeResult, RaftNode};
@@ -670,8 +670,20 @@ fn is_relayable_command(command: &MetaCommand) -> bool {
 /// A node's reply to a [`ClientRequest`].
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ClientResponse {
-    /// Cached cluster metadata (membership + tablet map).
-    Status(Metadata),
+    /// Cached cluster metadata (membership + tablet map), plus (ADR 0035 §1)
+    /// the answering node's own best-known control-plane leader —
+    /// `self.control.leader()` + `ClientCtx::route_addr(leader_id)`, the same
+    /// lookup `propose_schema`'s relay tier already does. Serves three ADR
+    /// 0035 PR4 needs from one reply: `ControlHandle::Remote`'s `leader()`/
+    /// `leader_addr_hint()`, `metadata_fresh`'s leader-directed retry target,
+    /// and an efficient `propose_schema` relay (no extra `route_addr` hop).
+    /// `#[serde(default)]` so an older node's reply (predating this field)
+    /// still parses, decoding to `None`.
+    Status {
+        metadata: Metadata,
+        #[serde(default)]
+        leader_hint: Option<(NodeId, SocketAddr)>,
+    },
     /// A write reached its quorum.
     PutOk,
     /// A read reached its quorum; the value (or `None` if absent).
@@ -805,11 +817,19 @@ pub struct BoundNode {
 /// onto every connection. The live CP-member address map is read from replicated
 /// `Metadata` at request time, not cached here.
 pub(crate) struct AdminInfo {
-    pub(crate) control_id: NodeId,
+    /// This node's control id, if it runs the control role (ADR 0035 PR4).
+    /// `None` on a **data-only** node (`ControlHandle::Remote`) — it has no
+    /// local control `RaftCore` at all, hence no control id of its own. Never
+    /// `None` for a control-only or combined-mode node — see
+    /// [`control_addr`](Self::control_addr)'s doc for the paired field.
+    pub(crate) control_id: Option<NodeId>,
     /// This node's raftkv id, if it runs the data role (ADR 0035 PR3). `None`
     /// on a control-only node, which never hosts a tablet.
     pub(crate) raftkv_id: Option<NodeId>,
-    pub(crate) control_addr: SocketAddr,
+    /// This node's control-plane Raft listen address, if it runs the control
+    /// role — see [`control_id`](Self::control_id)'s doc; `None` on a
+    /// data-only node for the identical reason.
+    pub(crate) control_addr: Option<SocketAddr>,
     /// `None` on a control-only node (no `raftkv` env bound) — see
     /// [`raftkv_id`](Self::raftkv_id)'s doc.
     pub(crate) raftkv_addr: Option<SocketAddr>,
@@ -1054,9 +1074,9 @@ impl BoundNode {
         // The node's identity + bound addresses for the admin `/admin/config`
         // view (ADR 0020), captured before the envs are consumed below.
         let admin_info = Arc::new(AdminInfo {
-            control_id: self.control_id,
+            control_id: Some(self.control_id),
             raftkv_id: Some(self.raftkv_id),
-            control_addr: self.control_addr,
+            control_addr: Some(self.control_addr),
             raftkv_addr: Some(self.raftkv_addr),
             client_addr: self.client_addr,
             dynamo_addr: Some(self.dynamo_addr),
@@ -1333,7 +1353,7 @@ impl BoundNode {
         tasks.push(tokio::spawn(cql::serve(self.cql_listener, ctx.clone())));
 
         Ok(Node {
-            raft,
+            raft: ControlHandle::Local(raft),
             envs,
             tasks,
             edge: ctx.edge.clone(),
@@ -1356,11 +1376,18 @@ impl BoundNode {
 /// return a bare `SocketAddr` (panicking if absent) so every existing
 /// combined-mode caller — which only ever holds a `Some` — is unaffected.
 pub struct Node {
-    raft: RaftNode<ProdEnv>,
+    /// This node's control-plane access (ADR 0035 PR1/PR4) — `Local` for
+    /// combined mode and a control-only node (both hold a real local
+    /// `RaftNode`); `Remote` for a data-only node (ADR 0035 PR4, no local
+    /// control `RaftCore` at all). [`is_control_leader`](Self::is_control_leader)/
+    /// [`metadata`](Self::metadata)/[`propose_meta`](Self::propose_meta)
+    /// degrade accordingly for `Remote` — see each method's doc.
+    raft: ControlHandle,
     /// This node's internal `ProdEnv` role(s) — control + raftkv for
-    /// combined mode, control only for a control-only node (ADR 0035 PR3) —
-    /// kept so [`shutdown`](Node::shutdown) can abort every task they own and
-    /// free their listener ports.
+    /// combined mode, control only for a control-only node (ADR 0035 PR3),
+    /// raftkv only for a data-only node (ADR 0035 PR4) — kept so
+    /// [`shutdown`](Node::shutdown) can abort every task they own and free
+    /// their listener ports.
     envs: Vec<ProdEnv>,
     /// The client-facing listener tasks (client TCP / dynamo HTTP / cql), which
     /// run on plain `tokio::spawn` off the `Env` network; aborted on shutdown.
@@ -1495,6 +1522,56 @@ impl Node {
         })
     }
 
+    /// Bind a **data-only** node's listeners (ADR 0035 PR4): the `raftkv`
+    /// internal `ProdEnv` role plus the client/dynamo/cql/admin TCP
+    /// listeners — no control env at all (a data-only node holds no local
+    /// control `RaftCore`, `Node::bind_control`'s exact dual). `addrs.raftkv`
+    /// must be `Some` (a control-only `RoleAddrs` fails cleanly here);
+    /// `addrs.control` is ignored (a mixed-topology config's control-role
+    /// entries carry one, but a data-role entry's own `control` field —
+    /// `None`, since `ClusterConfig::generate_split` sets it that way — is
+    /// never consulted).
+    ///
+    /// # Errors
+    /// Returns `InvalidInput` if `addrs.raftkv` is `None`, or propagates any
+    /// bind / directory-creation failure.
+    pub async fn bind_data(
+        raftkv_id: NodeId,
+        addrs: RoleAddrs,
+        data_dir: impl Into<PathBuf>,
+    ) -> std::io::Result<BoundDataNode> {
+        let dir = data_dir.into();
+        let raftkv_listen = addrs.raftkv.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Node::bind_data requires a raftkv address (RoleAddrs.raftkv is None)",
+            )
+        })?;
+        let (raftkv_env, raftkv_addr) =
+            ProdEnv::bind(raftkv_id, raftkv_listen, dir.join("raftkv")).await?;
+        let client_listener = TcpListener::bind(addrs.client).await?;
+        let client_addr = client_listener.local_addr()?;
+        let dynamo_listener = TcpListener::bind(addrs.dynamo).await?;
+        let dynamo_addr = dynamo_listener.local_addr()?;
+        let cql_listener = TcpListener::bind(addrs.cql).await?;
+        let cql_addr = cql_listener.local_addr()?;
+        let admin_listener = TcpListener::bind(addrs.admin).await?;
+        let admin_addr = admin_listener.local_addr()?;
+        Ok(BoundDataNode {
+            raftkv_id,
+            raftkv_env,
+            raftkv_addr,
+            client_listener,
+            client_addr,
+            dynamo_listener,
+            dynamo_addr,
+            cql_listener,
+            cql_addr,
+            admin_listener,
+            admin_addr,
+        })
+    }
+
     /// The address clients connect to.
     pub fn client_addr(&self) -> SocketAddr {
         self.client_addr
@@ -1526,13 +1603,18 @@ impl Node {
     }
 
     /// Whether this node's control replica currently believes it is leader.
+    /// Always `false` for a data-only node (ADR 0035 PR4) — it holds no
+    /// control-plane Raft role at all.
     pub fn is_control_leader(&self) -> bool {
         self.raft.is_leader()
     }
 
-    /// This node's cached cluster metadata.
+    /// This node's cached cluster metadata. For a data-only node (ADR 0035
+    /// PR4) this is its own polled mirror of the control deployment — see
+    /// `ControlHandle::metadata_cached`'s doc — rather than a local Raft
+    /// replica's applied state.
     pub fn metadata(&self) -> Metadata {
-        self.raft.metadata()
+        self.raft.metadata_cached()
     }
 
     /// Propose a control-plane [`MetaCommand`] on this node's control replica,
@@ -1542,8 +1624,18 @@ impl Node {
     /// `MetaCommand::SetTableMode`. A non-leader proposal is dropped (`false`); the
     /// caller retries on the current leader. Replication + durability are the
     /// control plane's (the command commits through Raft).
+    ///
+    /// Always `false` for a data-only node (ADR 0035 PR4): proposing is
+    /// inherently a local-Raft-log operation (`ControlHandle`'s own doc), and
+    /// a `Remote` handle has no local log to append to — the caller must
+    /// target a real control-group member instead.
     pub fn propose_meta(&self, command: MetaCommand) -> bool {
-        matches!(self.raft.propose(command), ProposeResult::Accepted { .. })
+        match &self.raft {
+            ControlHandle::Local(raft) => {
+                matches!(raft.propose(command), ProposeResult::Accepted { .. })
+            }
+            ControlHandle::Remote(_) => false,
+        }
     }
 
     /// Gracefully stop the node: abort its client-facing listeners (client, plus
@@ -1591,7 +1683,11 @@ impl Node {
     /// `kill -9` is still exposed; the durable-before-ack control-plane fix is a
     /// tracked follow-up.)
     pub async fn shutdown_graceful(&self) {
-        self.raft.flush().await;
+        // A data-only node (ADR 0035 PR4) has no local control WAL to flush —
+        // `RaftNode::flush` only exists on a genuine local Raft replica.
+        if let ControlHandle::Local(raft) = &self.raft {
+            raft.flush().await;
+        }
         self.edge.shutdown_all_cp_groups().await;
         self.shutdown();
     }
@@ -1689,9 +1785,9 @@ impl BoundControlNode {
         let envs = vec![self.control_env.clone()];
 
         let admin_info = Arc::new(AdminInfo {
-            control_id: self.control_id,
+            control_id: Some(self.control_id),
             raftkv_id: None,
-            control_addr: self.control_addr,
+            control_addr: Some(self.control_addr),
             raftkv_addr: None,
             client_addr: self.client_addr,
             dynamo_addr: None,
@@ -1736,7 +1832,7 @@ impl BoundControlNode {
         );
 
         Node {
-            raft,
+            raft: ControlHandle::Local(raft),
             envs,
             tasks,
             edge: ctx.edge.clone(),
@@ -1745,6 +1841,276 @@ impl BoundControlNode {
             cql_addr: None,
             admin_addr: self.admin_addr,
         }
+    }
+}
+
+/// A **data-only** node (ADR 0035 PR4) whose listeners are bound but not yet
+/// started — the data-only counterpart of [`BoundNode`] (which is
+/// [`BoundControlNode`]'s own dual). Binds only the `raftkv` internal
+/// `ProdEnv` role plus the client/dynamo/cql/admin TCP listeners; no control
+/// env, no local control `RaftCore`, no bootstrap. See [`Node::bind_data`] to
+/// construct one and [`start_data_with`](Self::start_data_with) to start it.
+pub struct BoundDataNode {
+    raftkv_id: NodeId,
+    raftkv_env: ProdEnv,
+    raftkv_addr: SocketAddr,
+    client_listener: TcpListener,
+    client_addr: SocketAddr,
+    dynamo_listener: TcpListener,
+    dynamo_addr: SocketAddr,
+    cql_listener: TcpListener,
+    cql_addr: SocketAddr,
+    admin_listener: TcpListener,
+    admin_addr: SocketAddr,
+}
+
+impl BoundDataNode {
+    /// The address clients connect to.
+    pub fn client_addr(&self) -> SocketAddr {
+        self.client_addr
+    }
+
+    /// The address the DynamoDB JSON/HTTP endpoint listens on.
+    pub fn dynamo_addr(&self) -> SocketAddr {
+        self.dynamo_addr
+    }
+
+    /// The address the CQL binary-protocol endpoint listens on.
+    pub fn cql_addr(&self) -> SocketAddr {
+        self.cql_addr
+    }
+
+    /// The address the admin / debug HTTP endpoint listens on (ADR 0020).
+    pub fn admin_addr(&self) -> SocketAddr {
+        self.admin_addr
+    }
+
+    /// `(raftkv_id, addr)` — this node's entry in the cluster's *raftkv* peer
+    /// book (the [`BoundNode::peer_entries`] dual, minus the `control` entry
+    /// a data-only node has none of).
+    pub fn peer_entry(&self) -> (NodeId, SocketAddr) {
+        (self.raftkv_id, self.raftkv_addr)
+    }
+
+    /// Wire the peer address book into the `raftkv` env and start the data
+    /// role's protocols: **no local control `RaftCore` at all** — this node's
+    /// [`ControlHandle`] is [`Remote`](ControlHandle::Remote), reaching the
+    /// separately-deployed control plane exclusively via `control_seeds`
+    /// (its **client**-API addresses — the discovery root for the mirror
+    /// sync loop, the leader-hint-directed live fetch, and `propose_schema`'s
+    /// relay/broadcast tiers, ADR 0035 §1/§4).
+    ///
+    /// `peers` is this node's **raftkv env's** peer book — per
+    /// `ClusterConfig::control_peer_book`'s doc, this must be the *union* of
+    /// the data fleet's own raftkv addresses and the control deployment's
+    /// control addresses (`ClusterConfig::peer_book`), not
+    /// `raftkv_peer_book()` alone: `heartbeat_loop` (below) sends
+    /// `RaftMsg::Heartbeat` to `control_ids` over this very env, and those
+    /// ids resolve through `peers`, not through `control_seeds` (a separate,
+    /// client-API-address axis entirely — the internal `Env` `Network` never
+    /// touches a client port). `control_ids` is the control deployment's
+    /// control-plane Raft membership (the failure-detection heartbeat
+    /// target); it plays no role in address resolution.
+    ///
+    /// Otherwise mirrors [`BoundNode::start_with`]'s data-role assembly
+    /// exactly (the shared storage engine, the tablet-host reconciler, the
+    /// dynamo/cql listeners) minus everything control-plane-specific
+    /// (`bootstrap`, `edge.register_control`) — see that method's doc for
+    /// what each shared piece does. `spawn_common_tail` still runs
+    /// unconditionally (`route_sync_loop`/`metrics_sample_loop`/this node's
+    /// own `register_node_addrs` self-registration/`serve_clients`/
+    /// `admin::serve`), and this node's own `admin_add_member` self-registers
+    /// its membership exactly like an ADR 0030 growth node's does (relayed —
+    /// a data-only node can never satisfy `propose_schema`'s local-leader
+    /// branch itself).
+    ///
+    /// # Errors
+    /// Propagates a failure to open the CP group's on-disk engine (LSM
+    /// backend only).
+    #[allow(clippy::too_many_arguments)] // node assembly: mirrors `BoundNode::start_with`'s arity
+    pub async fn start_data_with(
+        self,
+        peers: BTreeMap<NodeId, SocketAddr>,
+        control_ids: Vec<NodeId>,
+        control_seeds: Vec<SocketAddr>,
+        backend: StorageBackend,
+        edge: ClusterEdgeState,
+        client_route: BTreeMap<NodeId, SocketAddr>,
+        auto_split_threshold: Option<usize>,
+        auto_split_bytes_threshold: Option<u64>,
+        cluster_admin_addrs: Vec<SocketAddr>,
+    ) -> std::io::Result<Node> {
+        self.raftkv_env.set_peers(peers.clone());
+        let static_peers = peers;
+        let raftkv_sync_env = self.raftkv_env.clone();
+        let raftkv_hook_env = self.raftkv_env.clone();
+        let raftkv_hb_env = self.raftkv_env.clone();
+        let my_raftkv_id = self.raftkv_id;
+        let my_raftkv_addr = self.raftkv_addr;
+        let my_client_addr = self.client_addr;
+        let my_admin_addr = self.admin_addr;
+
+        let control = ControlHandle::Remote(RemoteControlClient::new(control_seeds.clone()));
+
+        let admin_info = Arc::new(AdminInfo {
+            control_id: None,
+            raftkv_id: Some(self.raftkv_id),
+            control_addr: None,
+            raftkv_addr: Some(self.raftkv_addr),
+            client_addr: self.client_addr,
+            dynamo_addr: Some(self.dynamo_addr),
+            cql_addr: Some(self.cql_addr),
+            admin_addr: self.admin_addr,
+            control_ids: control_ids.clone(),
+            peers: static_peers.clone(),
+            admin_addrs: if cluster_admin_addrs.is_empty() {
+                vec![self.admin_addr]
+            } else {
+                cluster_admin_addrs
+            },
+            auto_split_threshold,
+            auto_split_bytes_threshold,
+        });
+
+        let envs = vec![self.raftkv_env.clone()];
+        let raftkv_metrics = self.raftkv_env.metrics();
+
+        // Same shared-engine assembly as `BoundNode::start_with` — see that
+        // method's doc.
+        let storage = match backend {
+            StorageBackend::Lsm => match LsmEngine::open(self.raftkv_env.clone(), LSM_PREFIX).await
+            {
+                Ok(lsm) => SharedEngine::Lsm(lsm),
+                Err(e) => {
+                    return Err(std::io::Error::other(format!(
+                        "opening the node's shared CP storage engine: {e}"
+                    )));
+                }
+            },
+            StorageBackend::Memory => SharedEngine::Mem(MemoryEngine::new()),
+        };
+
+        let data_role = DataRole {
+            rmw_lock: Arc::new(tokio::sync::Mutex::new(())),
+            raftkv_metrics,
+            base_id: my_raftkv_id,
+        };
+        let (ctx, mut tasks) = spawn_common_tail(
+            control,
+            edge.clone(),
+            Some(data_role),
+            admin_info,
+            client_route,
+            (
+                my_raftkv_id,
+                NodeAddrs {
+                    raftkv: my_raftkv_addr.to_string(),
+                    client: my_client_addr.to_string(),
+                    admin: my_admin_addr.to_string(),
+                },
+            ),
+            self.client_listener,
+            self.admin_listener,
+        );
+
+        // The per-node tablet-host reconciler (ADR 0031 PR4) — identical
+        // shape to `BoundNode::start_with`'s.
+        let reconciler = {
+            let host_edge = edge.clone();
+            let teardown_edge = edge.clone();
+            let base_id = my_raftkv_id;
+            let on_teardown = move |tablet: TabletId| {
+                teardown_edge.unregister_raftkv(tablet, base_id);
+            };
+            match storage {
+                SharedEngine::Lsm(lsm) => CpReconciler::Lsm(Reconciler::new(
+                    raftkv_hook_env,
+                    lsm,
+                    my_raftkv_id,
+                    table_scope_prefix,
+                    move |tablet, node: &RaftKvNode<ProdEnv, LsmEngine<ProdEnv>>| {
+                        host_edge.register_raftkv(tablet, CpGroup::Lsm(node.clone()));
+                    },
+                    on_teardown,
+                )),
+                SharedEngine::Mem(mem) => CpReconciler::Mem(Reconciler::new(
+                    raftkv_hook_env,
+                    mem,
+                    my_raftkv_id,
+                    table_scope_prefix,
+                    move |tablet, node: &RaftKvNode<ProdEnv, MemoryEngine>| {
+                        host_edge.register_raftkv(tablet, CpGroup::Mem(node.clone()));
+                    },
+                    on_teardown,
+                )),
+            }
+        };
+
+        // No `bootstrap` — a data-only node holds no control-plane Raft role
+        // to register members against; that is entirely the control
+        // deployment's own concern (its `bootstrap`, run by the combined-mode
+        // or control-only nodes that actually host it).
+
+        tasks.push(tokio::spawn(peer_sync_loop(
+            ctx.clone(),
+            raftkv_sync_env,
+            static_peers.clone(),
+        )));
+
+        // The generalized mirror + leader-hint sync loop (ADR 0035 §4) —
+        // every data-only node's *only* way to see `Metadata` at all (unlike
+        // an ADR 0030 growth node, this is never conditional: a data-only
+        // node has no local control raft to ever be a "genuine voter"
+        // instead).
+        tasks.push(tokio::spawn(remote_metadata_sync_loop(
+            ctx.clone(),
+            control_seeds,
+        )));
+
+        // Self-registration (ADR 0032 PR2/PR4): a data-only node has no
+        // local control leader to propose against, so this always relays —
+        // `propose_schema`'s `leader_addr_hint`-then-`route_addr`-then-
+        // broadcast tiers are this node's *only* path to the real cluster.
+        {
+            let ctx = ctx.clone();
+            let node = my_raftkv_id;
+            tasks.push(tokio::spawn(async move {
+                let _ = ctx.admin_add_member(node, BTreeMap::new()).await;
+            }));
+        }
+
+        tasks.push(tokio::spawn(heartbeat_loop(raftkv_hb_env, control_ids)));
+
+        tasks.push(tokio::spawn(tablet_host_reconciler_loop(
+            ctx.clone(),
+            reconciler,
+        )));
+
+        if auto_split_threshold.is_some() || auto_split_bytes_threshold.is_some() {
+            tasks.push(tokio::spawn(auto_split_loop(
+                ctx.clone(),
+                AutoSplitThresholds {
+                    keys: auto_split_threshold,
+                    bytes: auto_split_bytes_threshold,
+                },
+            )));
+        }
+        tasks.push(tokio::spawn(dynamo::serve(
+            self.dynamo_listener,
+            ctx.clone(),
+        )));
+        tasks.push(tokio::spawn(cql::serve(self.cql_listener, ctx.clone())));
+
+        Ok(Node {
+            raft: ctx.control.clone(),
+            envs,
+            tasks,
+            edge: ctx.edge.clone(),
+            client_addr: self.client_addr,
+            dynamo_addr: Some(self.dynamo_addr),
+            cql_addr: Some(self.cql_addr),
+            admin_addr: self.admin_addr,
+        })
     }
 }
 
@@ -2104,8 +2470,13 @@ impl ClientCtx {
     /// each must observe its own just-proposed command (or a concurrent
     /// writer's) landing in the authoritative state, not a possibly-stale
     /// mirror.
-    fn metadata_fresh(&self) -> Metadata {
-        self.control.metadata_fresh()
+    ///
+    /// **Async since ADR 0035 PR4**: `Local` stays a synchronous-in-substance
+    /// passthrough (no `.await` point actually yields), but `Remote`
+    /// performs a genuine leader-directed network round trip — see
+    /// [`ControlHandle::metadata_fresh`]'s doc.
+    async fn metadata_fresh(&self) -> Metadata {
+        self.control.metadata_fresh().await
     }
 
     /// The client-API address `id` currently routes to, if known (ADR 0032
@@ -2129,6 +2500,36 @@ impl ClientCtx {
             .lock()
             .expect("client route poisoned")
             .clone()
+    }
+
+    /// This node's own best-known control-plane leader, as `(id, client-API
+    /// address)` — the `leader_hint` every `Status` reply now carries (ADR
+    /// 0035 §1), so a `Remote` data node's mirror-sync/live-fetch loop can
+    /// hop toward the real leader without a separate `route_addr` lookup on
+    /// the *answering* side. `None` if this node doesn't currently know a
+    /// leader (mid-election, or — for this node itself, if it's a growth/data
+    /// node — no leader signal at all).
+    fn control_leader_hint(&self) -> Option<(NodeId, SocketAddr)> {
+        let id = self.control.leader()?;
+        let addr = self.route_addr(id)?;
+        Some((id, addr))
+    }
+
+    /// The standard "retry on the leader" refusal for a local-leader-only
+    /// admin action ([`admin_drain`](Self::admin_drain)/
+    /// [`admin_remove_member`](Self::admin_remove_member)) — carries the
+    /// control handle's own [`leader_addr_hint`](ControlHandle::leader_addr_hint)
+    /// when one is known (ADR 0035 PR4: always populated for a `Remote` data
+    /// node once its mirror has synced at least once, since neither admin
+    /// action is relayable and a data-only node can never satisfy either
+    /// itself), so an operator hitting this on a data-only node gets a
+    /// concrete address to retry against instead of a bare "retry on the
+    /// leader".
+    fn not_leader_error(&self) -> String {
+        match self.control.leader_addr_hint() {
+            Some(addr) => format!("this node is not the control-plane leader; retry on {addr}"),
+            None => "this node is not the control-plane leader; retry on the leader".into(),
+        }
     }
 
     /// The id of the tablet whose key range covers `key`, from this node's cached
@@ -3002,18 +3403,12 @@ impl ClientCtx {
 
     /// Send `request` to a peer node's client API over a fresh connection and
     /// return its reply (or an error on any transport failure). The cross-node
-    /// relay primitive for CP forwarding (A1) and schema-DDL relay (A2).
+    /// relay primitive for CP forwarding (A1) and schema-DDL relay (A2). Thin
+    /// wrapper over the free [`relay_request`] (ADR 0035 PR4 — extracted so
+    /// [`control_handle::RemoteControlClient`], which has no `ClientCtx` of
+    /// its own, can use the identical wire primitive).
     async fn relay(&self, addr: SocketAddr, request: ClientRequest) -> ClientResponse {
-        match tokio::time::timeout(CLIENT_TIMEOUT, async {
-            let mut stream = TcpStream::connect(addr).await.ok()?;
-            write_frame(&mut stream, &request).await.ok()?;
-            read_frame::<ClientResponse>(&mut stream).await.ok()?
-        })
-        .await
-        {
-            Ok(Some(resp)) => resp,
-            _ => ClientResponse::Error("relay to peer node failed".into()),
-        }
+        relay_request(addr, &request).await
     }
 
     /// Propose a **schema-catalog** `command` toward the control-plane leader
@@ -3041,6 +3436,22 @@ impl ClientCtx {
             return matches!(
                 leader.propose(command.clone()),
                 ProposeResult::Accepted { .. }
+            );
+        }
+        // Prefer the control handle's own leader-address hint (ADR 0035 PR4:
+        // populated directly from `Status` replies for a `Remote` data node,
+        // see `ControlHandle::leader_addr_hint`'s doc) over a `route_addr`
+        // lookup — the hint is strictly fresher for a data-only node, since
+        // it rides the very `Status` reply that filled the mirror, whereas
+        // `route_addr` needs this leader's address to have separately synced
+        // into the replicated node-address book. A no-op for `Local` (always
+        // `None`), so this changes nothing for any node shape that existed
+        // before this PR.
+        if let Some(addr) = self.control.leader_addr_hint() {
+            return !matches!(
+                self.relay(addr, ClientRequest::ProposeSchema(command.clone()))
+                    .await,
+                ClientResponse::Error(_)
             );
         }
         if let Some(leader_id) = self.control.leader() {
@@ -3099,7 +3510,22 @@ impl ClientCtx {
     pub(crate) async fn provision_tablet(&self, table: &str) -> Result<(), String> {
         let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
         loop {
-            let meta = self.control.metadata_cached();
+            // Fresh, not `metadata_cached()` (ADR 0035 PR4): the "no tablet
+            // yet" branch below picks the tablet's **initial, permanent**
+            // replica set from `meta.members` — `CreateTablet` only ever
+            // succeeds once per table (idempotent, first-committer wins), so
+            // a stale mirror read here isn't a transient staleness a later
+            // retry heals, it silently and *permanently* under-replicates
+            // the tablet (no periodic re-check ever grows a recorded RF
+            // policy after the fact). This mattered only theoretically for a
+            // `Local` handle (control replication lag is sub-millisecond),
+            // but a `Remote` data node's mirror is *routinely* a poll
+            // interval stale (ADR 0035 §5) — caught live by
+            // `tests/data_only.rs` flaking on exactly this race (a freshly
+            // `Active`-promoted second data member not yet visible to a
+            // still-catching-up mirror at the moment the first write
+            // provisioned the table).
+            let meta = self.control.metadata_fresh().await;
             if let Some((&tablet, t)) = meta.tablets_for_table(table).next() {
                 // The tablet exists; ensure its RF policy is set, then we're done. The
                 // caller's op routes through `cp_route`, which itself waits for the
@@ -3301,7 +3727,7 @@ impl ClientCtx {
         };
         let labels = member.labels.clone();
         let Some(leader) = self.edge.leader_handle() else {
-            return Err("this node is not the control-plane leader; retry on the leader".into());
+            return Err(self.not_leader_error());
         };
         match leader.propose(MetaCommand::UpsertMember {
             node,
@@ -3348,7 +3774,7 @@ impl ClientCtx {
                 status: NodeStatus::Down,
             },
             SCHEMA_COMMIT_TIMEOUT,
-            || {
+            || async {
                 self.effective_metadata()
                     .members
                     .contains_key(&node)
@@ -3421,7 +3847,7 @@ impl ClientCtx {
         // error. The leader's own metadata is what actually gates the apply, so
         // checking leadership first makes every other refusal here trustworthy.
         let Some(leader) = self.edge.leader_handle() else {
-            return Err("this node is not the control-plane leader; retry on the leader".into());
+            return Err(self.not_leader_error());
         };
         let meta = self.control.metadata_cached();
         let Some(member) = meta.members.get(&node) else {
@@ -3590,29 +4016,47 @@ async fn route_sync_loop(ctx: ClientCtx, static_route: BTreeMap<NodeId, SocketAd
 /// polling loops that read it.
 const REMOTE_METADATA_SYNC_INTERVAL: Duration = Duration::from_millis(200);
 
-/// Mirror the real cluster's replicated `Metadata` into `ctx.remote_metadata` by
-/// periodically polling `ClientRequest::Status` against one of `seeds` (the
-/// pre-growth control nodes' client addresses) — the fallback for a **control-
-/// plane-follower-less growth node** (ADR 0030) whose own control `RaftCore` can
-/// never receive real Raft replication for a group it was never a voter of (see
-/// `run_node_growth`'s doc). Tries every seed in order each tick, keeping
-/// whichever answers first; a no-op (returns immediately) when `seeds` is empty
-/// — the case for every node that *is* a real control-group voter, since
-/// `effective_metadata` then passes straight through to `self.control.metadata_cached()`
-/// and nothing needs mirroring. Best-effort: a tick where every seed is
-/// unreachable just leaves the previous snapshot in place (stale, not wrong —
-/// every consumer of `effective_metadata` already tolerates a few hundred
-/// milliseconds of staleness from its own polling cadence).
+/// Mirror the real cluster's replicated `Metadata` by periodically polling
+/// `ClientRequest::Status` against one of `seeds` — **generalized (ADR 0035
+/// §4) from "the fallback for a control-plane-follower-less growth node" to
+/// "how every node with no *real* local Raft replication for `Metadata` stays
+/// current"**, which now covers two shapes: an ADR 0030 **growth node**
+/// (`seeds` = the pre-growth control nodes' client addresses; `ctx.control` is
+/// `Local`, so the mirror lands in `ctx.remote_metadata` and `effective_metadata`
+/// prefers it) and an ADR 0035 PR4 **data-only node** (`seeds` = the control
+/// deployment's client addresses; `ctx.control` is `Remote`, so the mirror
+/// lands in that handle's own [`RemoteControlClient`](control_handle::RemoteControlClient),
+/// which `metadata_cached()`/`metadata_fresh()` already read directly — no
+/// separate `ctx.remote_metadata` involvement needed for this shape). Also
+/// refreshes `leader_hint` (ADR 0035 §1) on the `Remote` branch.
+///
+/// Tries every seed in order each tick, keeping whichever answers first; a
+/// no-op (returns immediately) when `seeds` is empty — the case for every
+/// node that *is* a real control-group voter, since `effective_metadata` then
+/// passes straight through to `self.control.metadata_cached()` and nothing
+/// needs mirroring. Best-effort: a tick where every seed is unreachable just
+/// leaves the previous snapshot in place (stale, not wrong — every consumer
+/// already tolerates a few hundred milliseconds of staleness from its own
+/// polling cadence).
 async fn remote_metadata_sync_loop(ctx: ClientCtx, seeds: Vec<SocketAddr>) {
     if seeds.is_empty() {
         return;
     }
     loop {
         for &addr in &seeds {
-            if let ClientResponse::Status(meta) = ctx.relay(addr, ClientRequest::Status).await {
-                *ctx.remote_metadata
-                    .lock()
-                    .expect("remote metadata poisoned") = Some(meta);
+            if let ClientResponse::Status {
+                metadata,
+                leader_hint,
+            } = ctx.relay(addr, ClientRequest::Status).await
+            {
+                match &ctx.control {
+                    ControlHandle::Remote(remote) => remote.observe(metadata, leader_hint),
+                    ControlHandle::Local(_) => {
+                        *ctx.remote_metadata
+                            .lock()
+                            .expect("remote metadata poisoned") = Some(metadata);
+                    }
+                }
                 break;
             }
         }
@@ -3719,7 +4163,14 @@ const RECONCILE_FALLBACK_INTERVAL: Duration = Duration::from_millis(500);
 /// growth node's local raft never leaves `last_applied() == 0` (it is a
 /// permanent non-voter of a group it never replicates), so the guard also
 /// requires its remote mirror to still be empty before skipping a tick, or a
-/// growth node's reconciler would never tick at all.
+/// growth node's reconciler would never tick at all. **ADR 0035 PR4** adds a
+/// third OR-term, `ctx.control.has_synced_metadata()`: a data-only node's
+/// `ControlHandle::Remote` has no local raft at all, so its `last_applied()`
+/// is pinned at `0` forever (never a "recovered" signal) and it never
+/// populates `ctx.remote_metadata` (that field is the ADR 0030 growth-node
+/// mirror specifically — `Remote` keeps its own, read straight through
+/// `metadata_cached()`); without this third term the guard would never
+/// release a data-only node's reconciler, ever.
 async fn tablet_host_reconciler_loop(ctx: ClientCtx, mut reconciler: CpReconciler) {
     let watch = ctx.control.metadata_watch();
     let mut last_seen = watch.latest();
@@ -3746,6 +4197,7 @@ async fn tablet_host_reconciler_loop(ctx: ClientCtx, mut reconciler: CpReconcile
                 .lock()
                 .expect("remote metadata poisoned")
                 .is_none()
+            && !ctx.control.has_synced_metadata()
         {
             continue;
         }
@@ -4080,7 +4532,10 @@ async fn handle_request(ctx: &ClientCtx, request: ClientRequest) -> ClientRespon
         // `remote_metadata_sync_loop`'s own polling: its seeds are always the
         // pre-growth control nodes (genuine voters, where this is a plain
         // passthrough), so no mirror ever feeds another mirror.
-        ClientRequest::Status => ClientResponse::Status(ctx.effective_metadata()),
+        ClientRequest::Status => ClientResponse::Status {
+            metadata: ctx.effective_metadata(),
+            leader_hint: ctx.control_leader_hint(),
+        },
         // All data ops route to the leaderful CP per-tablet Raft group (ADR 0017
         // #3a), scoped to the named table (ADR 0023). `table` is a required field
         // on the request type, so there is no unscoped data op to reject here.
@@ -4235,7 +4690,9 @@ impl ClientCtx {
             .propose_and_await(
                 MetaCommand::RegisterNodeAddrs { node, addrs },
                 SCHEMA_COMMIT_TIMEOUT,
-                || (self.effective_metadata().node_addrs.get(&node) == Some(&want)).then_some(()),
+                || async {
+                    (self.effective_metadata().node_addrs.get(&node) == Some(&want)).then_some(())
+                },
             )
             .await;
     }
@@ -4280,7 +4737,7 @@ impl ClientCtx {
             new_id,
         };
         match self
-            .propose_and_await(cmd, SCHEMA_COMMIT_TIMEOUT, || {
+            .propose_and_await(cmd, SCHEMA_COMMIT_TIMEOUT, || async {
                 self.control
                     .metadata_cached()
                     .tablets
@@ -4333,7 +4790,7 @@ impl ClientCtx {
         // gone — the exact pair `MergeTablets`'s apply produces together,
         // atomically, and nothing else in this state machine produces.
         match self
-            .propose_and_await(cmd, SCHEMA_COMMIT_TIMEOUT, || {
+            .propose_and_await(cmd, SCHEMA_COMMIT_TIMEOUT, || async {
                 let m = self.control.metadata_cached();
                 let left_bumped = m
                     .tablets
@@ -4363,7 +4820,7 @@ impl ClientCtx {
                 keyspace: keyspace.clone(),
             },
             SCHEMA_COMMIT_TIMEOUT,
-            || self.has_keyspace(&ks).then_some(()),
+            || async { self.has_keyspace(&ks).then_some(()) },
         )
         .await
         .map_err(|()| {
@@ -4402,7 +4859,7 @@ impl ClientCtx {
         // the CreateTable commit-wait poll, which must observe its own
         // just-proposed command landing in the authoritative state, never a
         // growth-node mirror that could still be a poll interval behind.
-        if let Some(existing) = self.metadata_fresh().table_schema(&table).cloned() {
+        if let Some(existing) = self.metadata_fresh().await.table_schema(&table).cloned() {
             return if existing == schema {
                 Ok(())
             } else {
@@ -4415,8 +4872,8 @@ impl ClientCtx {
             table: table.clone(),
             schema: schema.clone(),
         };
-        self.propose_and_await(command, SCHEMA_COMMIT_TIMEOUT, || {
-            self.metadata_fresh().table_schema(&table).cloned()
+        self.propose_and_await(command, SCHEMA_COMMIT_TIMEOUT, || async {
+            self.metadata_fresh().await.table_schema(&table).cloned()
         })
         .await
             .map_err(|()| {
@@ -4457,8 +4914,8 @@ impl ClientCtx {
         };
         // Fresh, not `self.table_schema` (ADR 0035 PR1) — see
         // `create_table_schema`'s identical note: this is a commit-wait poll.
-        self.propose_and_await(command, SCHEMA_COMMIT_TIMEOUT, || {
-            (self.metadata_fresh().table_schema(&table) == Some(&schema)).then_some(())
+        self.propose_and_await(command, SCHEMA_COMMIT_TIMEOUT, || async {
+            (self.metadata_fresh().await.table_schema(&table) == Some(&schema)).then_some(())
         })
         .await
         .map_err(|()| {
@@ -4497,7 +4954,7 @@ impl ClientCtx {
         // wait above already forced this replica past the tablet's creation in
         // the log — but a plain-client table skips that wait.)
         self.propose_schema(&command).await;
-        self.propose_and_await(command, SCHEMA_COMMIT_TIMEOUT, || {
+        self.propose_and_await(command, SCHEMA_COMMIT_TIMEOUT, || async {
             self.control
                 .metadata_cached()
                 .tablets_for_table(&table)
@@ -4525,14 +4982,14 @@ impl ClientCtx {
     pub(crate) async fn drop_table_schema(&self, table: String) -> Result<(), String> {
         // Fresh, not `self.has_table_schema` (ADR 0035 PR1) — see
         // `create_table_schema`'s identical note: this is a commit-wait poll.
-        if !self.metadata_fresh().has_table_schema(&table) {
+        if !self.metadata_fresh().await.has_table_schema(&table) {
             return Ok(());
         }
         let command = MetaCommand::DropTableSchema {
             table: table.clone(),
         };
-        self.propose_and_await(command, SCHEMA_COMMIT_TIMEOUT, || {
-            (!self.metadata_fresh().has_table_schema(&table)).then_some(())
+        self.propose_and_await(command, SCHEMA_COMMIT_TIMEOUT, || async {
+            (!self.metadata_fresh().await.has_table_schema(&table)).then_some(())
         })
         .await
         .map_err(|()| {
@@ -4552,16 +5009,25 @@ impl ClientCtx {
     /// reached a leader's log, only resubmitting immediately when we know it
     /// wasn't sent anywhere. Returns the committed value `committed` observed,
     /// or `Err(())` on timeout.
-    async fn propose_and_await<T>(
+    ///
+    /// `committed` is an **async** closure (ADR 0035 PR4 — [`metadata_fresh`]
+    /// is now a genuine network round trip on a `Remote` handle, so every
+    /// caller's commit-wait predicate must be able to `.await` it; every
+    /// existing call site's predicate — sync in substance for a `Local`
+    /// handle — just gained an `async` wrapper with no behavior change).
+    async fn propose_and_await<T, Fut>(
         &self,
         command: MetaCommand,
         timeout: Duration,
-        committed: impl Fn() -> Option<T>,
-    ) -> Result<T, ()> {
+        committed: impl Fn() -> Fut,
+    ) -> Result<T, ()>
+    where
+        Fut: std::future::Future<Output = Option<T>>,
+    {
         let deadline = tokio::time::Instant::now() + timeout;
         let mut next_propose_at = tokio::time::Instant::now();
         loop {
-            if let Some(value) = committed() {
+            if let Some(value) = committed().await {
                 return Ok(value);
             }
             let now = tokio::time::Instant::now();
@@ -4874,6 +5340,100 @@ pub async fn run_node_control(
         .await)
 }
 
+/// Start node `index` from `config` as a **data-only** node (ADR 0035 PR4,
+/// `animusd data`): binds only the `raftkv` internal `ProdEnv` role plus the
+/// client/dynamo/cql/admin listeners, and runs no local control `RaftCore` at
+/// all — `Metadata` comes from a polled mirror of the control deployment
+/// (`ControlHandle::Remote`, [`BoundDataNode::start_data_with`]) rather than
+/// this process's own Raft replication.
+///
+/// `config`'s data-role entries (`ClusterConfig::data_indexes`) are this
+/// node's data fleet — `index` must be one of them. `config`'s control-role
+/// entries (`ClusterConfig::control_ids`) are the **separately-deployed**
+/// control plane this node mirrors: their **client** addresses seed the
+/// mirror + leader-hint sync loop and `propose_schema`'s relay/broadcast
+/// tiers (ADR 0035 §1/§4), and their **control** ids are what this node's own
+/// `heartbeat_loop` targets (unchanged ADR 0012 failure-detection semantics —
+/// see `ClusterConfig::control_peer_book`'s doc for why this node's `raftkv`
+/// env peer book must union both address books, not `raftkv_peer_book()`
+/// alone).
+///
+/// # Errors
+/// Returns `InvalidInput` if `index` is out of range, does not run the data
+/// role, or `config` has no control-role entry for this node to mirror; or
+/// propagates a bind / engine-open failure.
+pub async fn run_node_data(
+    config: &ClusterConfig,
+    index: usize,
+    dir: impl Into<PathBuf>,
+    backend: StorageBackend,
+) -> std::io::Result<Node> {
+    let addrs = *config.nodes.get(index).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "node index out of range")
+    })?;
+    if !addrs.role.has_data() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "node index does not run the data role",
+        ));
+    }
+    let control_ids = config.control_ids();
+    if control_ids.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "config has no control-role node for this data node to mirror",
+        ));
+    }
+    let bound = Node::bind_data(config::raftkv_id(index), addrs, dir).await?;
+
+    // The control deployment's **client**-API addresses — the mirror/
+    // leader-hint discovery root (ADR 0035 §1/§4), a wholly different address
+    // axis from the internal `raftkv`-env peer book below.
+    let control_client_addrs: Vec<SocketAddr> = config
+        .nodes
+        .iter()
+        .filter(|a| a.role.has_control())
+        .map(|a| a.client)
+        .collect();
+
+    // Cross-node routing (ADR 0017 #3b / ADR 0013): map every control-role
+    // node's control id and every data-role node's raftkv id to that node's
+    // client API address — the same shape `run_node_control` builds,
+    // role-filtered (a data-only entry has no `control` id to route to).
+    let mut client_route: BTreeMap<NodeId, SocketAddr> = BTreeMap::new();
+    for (i, a) in config.nodes.iter().enumerate() {
+        if a.role.has_control() {
+            client_route.insert(config::control_id(i), a.client);
+        }
+        if a.role.has_data() {
+            client_route.insert(config::raftkv_id(i), a.client);
+        }
+    }
+    // Every node's admin address from the shared config, so this node's
+    // dashboard fan-out (ADR 0021) covers the whole split deployment.
+    let admin_addrs: Vec<SocketAddr> = config.nodes.iter().map(|n| n.admin).collect();
+
+    bound
+        .start_data_with(
+            // This node's `raftkv` env peer book: the union of every
+            // data-role node's `raftkv` address and every control-role
+            // node's `control` address — `ClusterConfig::peer_book`, not
+            // `raftkv_peer_book()` alone (see `control_peer_book`'s doc for
+            // why: `heartbeat_loop` below sends to `control_ids` over this
+            // very env).
+            config.peer_book(),
+            control_ids,
+            control_client_addrs,
+            backend,
+            ClusterEdgeState::new(),
+            client_route,
+            None,
+            None,
+            admin_addrs,
+        )
+        .await
+}
+
 /// Start node `index` from `config` as a **control-plane-follower-less growth
 /// member** (ADR 0030): online cluster growth, data-plane only. `config` is an
 /// **expanded** config — it lists every pre-growth node plus every node added so
@@ -5108,7 +5668,7 @@ pub async fn run_node_join(
     // Collision guard (see doc above): reject a conflicting pre-existing
     // registration at this index before binding anything.
     match poll_seeds_for(&seeds, &ClientRequest::Status, JOIN_DISCOVERY_BUDGET).await? {
-        ClientResponse::Status(meta) => {
+        ClientResponse::Status { metadata: meta, .. } => {
             let mine = NodeAddrs {
                 raftkv: my_raftkv_addr.to_string(),
                 client: addrs.client.to_string(),
@@ -5186,6 +5746,26 @@ pub async fn run_node_join(
 /// An over-cap length prefix is rejected with a clean `InvalidData` error (the
 /// connection closes) before any allocation, never a panic or an OOM.
 pub const MAX_FRAME_LEN: usize = 64 << 20;
+
+/// Send `request` to a peer node's client API over a fresh connection and
+/// return its reply (or a [`ClientResponse::Error`] on any transport
+/// failure). Free function, not a [`ClientCtx`] method (ADR 0035 PR4): the
+/// data-only node's [`control_handle::RemoteControlClient`] has no `ClientCtx`
+/// of its own to reach through, but needs the exact same wire primitive every
+/// other cross-node relay in this crate uses — [`ClientCtx::relay`] is now a
+/// thin wrapper over this.
+pub(crate) async fn relay_request(addr: SocketAddr, request: &ClientRequest) -> ClientResponse {
+    match tokio::time::timeout(CLIENT_TIMEOUT, async {
+        let mut stream = TcpStream::connect(addr).await.ok()?;
+        write_frame(&mut stream, request).await.ok()?;
+        read_frame::<ClientResponse>(&mut stream).await.ok()?
+    })
+    .await
+    {
+        Ok(Some(resp)) => resp,
+        _ => ClientResponse::Error("relay to peer node failed".into()),
+    }
+}
 
 /// Write a length-prefixed (`u32` big-endian) JSON frame.
 ///

@@ -1,6 +1,6 @@
 //! AnimusDB node server (`animusd`).
 //!
-//! Five modes:
+//! Six modes:
 //!
 //! ```text
 //! animusd gen-config --nodes N [--host H] [--base-port P]   # print a combined-mode cluster config (JSON)
@@ -9,6 +9,7 @@
 //! animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B] # run an N-node cluster in one process
 //! animusd join --seed ADDR[,ADDR...] --node I [--ip A] [--base-port P] [--dir D] [--ephemeral] # seed/join startup (ADR 0032 PR2)
 //! animusd control --config FILE --node I [--dir DIR] # run node I as a control-only node (ADR 0035 PR3)
+//! animusd data --config FILE --node I [--dir DIR] [--ephemeral] # run node I as a data-only node (ADR 0035 PR4)
 //! ```
 //!
 //! The data replica is durable by default (an on-disk LSM under the node's data
@@ -23,17 +24,18 @@
 //! 0032 PR2: a real data-plane member, control group unchanged, ADR 0030).
 //!
 //! `animusd control` runs one of a config's control-role node(s) only — no
-//! storage engine, no `raftkv` env, no DynamoDB/CQL listeners (ADR 0035:
-//! control plane as a separate deployment). `gen-config --control-nodes/
-//! --data-nodes` prints the split-deployment config *shape* (control-role
-//! entries with no `raftkv` address, data-role entries with no `control`
-//! address) that `animusd control` targets — its data-role entries are not
-//! yet runnable through any entry point (that's ADR 0035 PR4's `animusd
-//! data`, a genuinely control-`RaftCore`-less data node); until then, run a
-//! real mixed deployment by pointing `animusd control` at the config's
-//! control-role indices and keep running data nodes combined-mode (`--config
-//! FILE --node I` against a `Both`-role config, today's only way to run a
-//! data node) — see `crates/animusd/CLAUDE.md`.
+//! storage engine, no `raftkv` env, no DynamoDB/CQL listeners; `animusd data`
+//! runs one of a config's data-role node(s) only — no control env, no local
+//! control `RaftCore` at all, reaching a **separately-deployed** control
+//! plane over the network instead (ADR 0035: control plane as a separate
+//! deployment). `gen-config --control-nodes/--data-nodes` prints the
+//! split-deployment config *shape* (control-role entries with no `raftkv`
+//! address, data-role entries with no `control` address) both target — run
+//! every control-role index with `animusd control` and every data-role index
+//! with `animusd data` against the same config for a genuine split
+//! deployment (see `crates/animusd/CLAUDE.md`). A mixed deployment — some
+//! nodes still combined-mode (`--config FILE --node I` against a `Both`-role
+//! config) — keeps working exactly as before.
 
 use std::net::{IpAddr, SocketAddr};
 use std::process::ExitCode;
@@ -49,6 +51,7 @@ async fn main() -> ExitCode {
         Some("gen-config") => gen_config(&args[1..]),
         Some("join") => run_join(&args[1..]).await,
         Some("control") => run_control(&args[1..]).await,
+        Some("data") => run_data(&args[1..]).await,
         _ => run(&args).await,
     };
 
@@ -94,7 +97,8 @@ const USAGE: &str = "usage:\n  \
     animusd --config FILE --node I [--dir DIR] [--ephemeral]\n  \
     animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B]\n  \
     animusd join --seed ADDR[,ADDR...] --node I [--ip A] [--base-port P] [--dir D] [--ephemeral]\n  \
-    animusd control --config FILE --node I [--dir DIR]";
+    animusd control --config FILE --node I [--dir DIR]\n  \
+    animusd data --config FILE --node I [--dir DIR] [--ephemeral]";
 
 /// `gen-config`: print a generated cluster config as JSON — either combined-mode
 /// (`--nodes N`) or the ADR 0035 split-deployment shape (`--control-nodes N
@@ -250,6 +254,50 @@ async fn run_control(args: &[String]) -> Result<(), String> {
         "animusd: control node {index}/{} up — client {} — admin http://{}",
         config.len(),
         node.client_addr(),
+        node.admin_addr(),
+    );
+    println!("animusd: ready — Ctrl-C to stop");
+    wait_for_ctrl_c().await;
+    node.shutdown_graceful().await;
+    Ok(())
+}
+
+/// `data`: run node `index` of `config` as a **data-only** node (ADR 0035
+/// PR4) — no control env, no local control `RaftCore`, reaching the
+/// separately-deployed control plane over the network instead. See
+/// [`animusd::run_node_data`]'s doc for the exact control-deployment
+/// discovery this needs from `config` (its control-role entries).
+async fn run_data(args: &[String]) -> Result<(), String> {
+    let mut config_path: Option<String> = None;
+    let mut node: Option<usize> = None;
+    let mut dir: Option<std::path::PathBuf> = None;
+    let mut backend = animusd::StorageBackend::default();
+
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--config" => config_path = Some(parse_next(&mut it, "--config")?),
+            "--node" => node = Some(parse_next(&mut it, "--node")?),
+            "--dir" => dir = Some(parse_next::<String>(&mut it, "--dir")?.into()),
+            "--ephemeral" => backend = animusd::StorageBackend::Memory,
+            other => return Err(format!("unknown data argument `{other}`")),
+        }
+    }
+    let path = config_path.ok_or("data requires --config FILE")?;
+    let index = node.ok_or("data requires --node I")?;
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("reading {path}: {e}"))?;
+    let config = ClusterConfig::from_json(&text).map_err(|e| format!("parsing {path}: {e}"))?;
+    let dir = dir.unwrap_or_else(|| std::env::temp_dir().join(format!("animusd-data-{index}")));
+
+    let node = animusd::run_node_data(&config, index, &dir, backend)
+        .await
+        .map_err(|e| format!("failed to start data node {index}: {e}"))?;
+    println!(
+        "animusd: data node {index}/{} up (CP) — client {} — dynamo http {} — cql {} — admin http://{}",
+        config.len(),
+        node.client_addr(),
+        node.dynamo_addr(),
+        node.cql_addr(),
         node.admin_addr(),
     );
     println!("animusd: ready — Ctrl-C to stop");
