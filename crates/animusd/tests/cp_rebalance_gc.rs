@@ -58,21 +58,13 @@ const KV_TABLET: TabletId = TabletId(1);
 
 // ---- bring-up + polling helpers (mirrors cp_reconfigure.rs / drop_table_gc.rs) --
 
-/// Reserve `count` free loopback ports (bind :0, read addr, release).
-fn free_addrs(count: usize) -> Vec<SocketAddr> {
-    let ls: Vec<std::net::TcpListener> = (0..count)
-        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
-        .collect();
-    ls.iter().map(|l| l.local_addr().unwrap()).collect()
-}
-
 /// Bring up an `n`-node cluster, one process per node (node-local admin views +
 /// separate edge state — the real deployment shape), retrying the
 /// (allocate-fresh-ports + start-all) unit on a bind race. Returns the per-node
 /// data dirs so a test can assert on-disk WAL state and restart nodes in place.
 async fn bring_up(n: usize, dir: &Path) -> (Vec<Node>, ClusterConfig, Vec<PathBuf>) {
     for attempt in 0..16 {
-        let a = free_addrs(n * 6);
+        let a = support::free_addrs(n * 6);
         let config = ClusterConfig {
             nodes: (0..n)
                 .map(|i| RoleAddrs {

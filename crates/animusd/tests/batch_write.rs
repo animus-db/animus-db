@@ -12,10 +12,9 @@
 //! timeouts (the `ProdEnv` edge is non-deterministic by design).
 
 use std::net::SocketAddr;
-use std::path::Path;
 use std::time::{Duration, Instant};
 
-use animusd::{ClusterConfig, Node, RoleAddrs, StorageBackend};
+use animusd::{Node, StorageBackend};
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -72,45 +71,6 @@ async fn await_bootstrap(node: &Node) {
         .expect("node did not bootstrap in 20s");
 }
 
-/// Reserve `count` free loopback ports (bind :0, read addr, release).
-fn fixed_addrs(count: usize) -> Vec<SocketAddr> {
-    let listeners: Vec<std::net::TcpListener> = (0..count)
-        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
-        .collect();
-    listeners.iter().map(|l| l.local_addr().unwrap()).collect()
-}
-
-fn single_node_config() -> ClusterConfig {
-    let a = fixed_addrs(6);
-    ClusterConfig {
-        nodes: vec![RoleAddrs {
-            role: animusd::config::NodeRole::Both,
-            control: Some(a[0]),
-            client: a[1],
-            dynamo: a[2],
-            cql: a[3],
-            raftkv: Some(a[4]),
-            admin: a[5],
-        }],
-    }
-}
-
-/// Start a single node, retrying with fresh ephemeral ports on a bind TOCTOU.
-async fn start_single_node(dir: &Path) -> (Node, ClusterConfig) {
-    let mut last_err = None;
-    for attempt in 0..10 {
-        let config = single_node_config();
-        match animusd::run_node_with(&config, 0, dir, StorageBackend::default()).await {
-            Ok(node) => return (node, config),
-            Err(e) => {
-                last_err = Some(e);
-                sleep(Duration::from_millis(50 * (attempt + 1))).await;
-            }
-        }
-    }
-    panic!("single node failed to start after 10 attempts: {last_err:?}");
-}
-
 async fn stop(node: Node) {
     node.shutdown();
     drop(node);
@@ -132,7 +92,7 @@ async fn batch_write_round_trip_survives_restart() {
     let dir = TempDir::new().unwrap();
     let node_dir = dir.path().join("node-0");
 
-    let (node, config) = start_single_node(&node_dir).await;
+    let (node, config) = support::start_single_node(&node_dir, StorageBackend::default()).await;
     let dynamo_addr = config.nodes[0].dynamo;
     await_bootstrap(&node).await;
 
@@ -196,7 +156,7 @@ async fn batched_write_beats_per_key() {
     timeout(Duration::from_secs(60), async {
         let dir = TempDir::new().unwrap();
         let node_dir = dir.path().join("node-0");
-        let (node, config) = start_single_node(&node_dir).await;
+        let (node, config) = support::start_single_node(&node_dir, StorageBackend::default()).await;
         let dynamo_addr = config.nodes[0].dynamo;
         await_bootstrap(&node).await;
 

@@ -19,13 +19,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
-/// Reserve `count` free loopback ports (bind :0, read addr, release).
-fn free_addrs(count: usize) -> Vec<SocketAddr> {
-    let ls: Vec<std::net::TcpListener> = (0..count)
-        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
-        .collect();
-    ls.iter().map(|l| l.local_addr().unwrap()).collect()
-}
+mod support;
 
 /// Bring up an `n`-node cluster, one process per node (each its own edge state),
 /// retrying the (allocate-fresh-ports + start-all) as a unit. `free_addrs` frees
@@ -34,7 +28,7 @@ fn free_addrs(count: usize) -> Vec<SocketAddr> {
 /// torn down first (the documented port-TOCTOU mitigation, see the crate guide).
 async fn bring_up(n: usize, dir: &std::path::Path) -> (Vec<Node>, animusd::ClusterConfig) {
     for attempt in 0..16 {
-        let addrs = free_addrs(n * 6);
+        let addrs = support::free_addrs(n * 6);
         let nodes_cfg: Vec<animusd::RoleAddrs> = (0..n)
             .map(|i| animusd::RoleAddrs {
                 role: animusd::config::NodeRole::Both,

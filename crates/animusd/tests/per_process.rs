@@ -10,6 +10,8 @@ use animusd::{ClientRequest, ClientResponse, ClusterConfig, Node, RoleAddrs, rea
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
+mod support;
+
 async fn call(addr: SocketAddr, req: ClientRequest) -> ClientResponse {
     let mut stream = TcpStream::connect(addr).await.expect("connect to node");
     animusd::write_frame(&mut stream, &req).await.expect("send");
@@ -35,16 +37,6 @@ async fn await_bootstrap(nodes: &[Node]) {
         .expect("cluster did not bootstrap in 20s");
 }
 
-/// Reserve `count` free TCP ports on loopback (bind to :0, read the addr, then
-/// release). A small reuse race, acceptable for a test.
-fn free_addrs(count: usize) -> Vec<SocketAddr> {
-    let listeners: Vec<std::net::TcpListener> = (0..count)
-        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
-        .collect();
-    listeners.iter().map(|l| l.local_addr().unwrap()).collect()
-    // listeners dropped here, freeing the ports for the nodes to bind.
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn per_process_nodes_form_a_cluster_from_shared_config() {
     let n = 3;
@@ -55,7 +47,7 @@ async fn per_process_nodes_form_a_cluster_from_shared_config() {
     let dir = tempfile::tempdir().unwrap();
     let mut brought_up = None;
     'attempts: for attempt in 0..16 {
-        let addrs = free_addrs(n * 6);
+        let addrs = support::free_addrs(n * 6);
         let nodes_cfg: Vec<RoleAddrs> = (0..n)
             .map(|i| RoleAddrs {
                 role: animusd::config::NodeRole::Both,

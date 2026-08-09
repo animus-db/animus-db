@@ -30,10 +30,9 @@
 //! Real time/sockets (the ProdEnv edge), so we poll with generous timeouts.
 
 use std::net::SocketAddr;
-use std::path::Path;
 use std::time::Duration;
 
-use animusd::{ClusterConfig, Node, RoleAddrs, bind_cluster, start_cluster};
+use animusd::{Node, StorageBackend, bind_cluster, start_cluster};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
@@ -131,51 +130,6 @@ async fn await_table_schema(node: &Node, table: &str) {
         .unwrap_or_else(|_| panic!("table {table} schema not recovered within 20s"));
 }
 
-fn fixed_addrs(count: usize) -> Vec<SocketAddr> {
-    let listeners: Vec<std::net::TcpListener> = (0..count)
-        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
-        .collect();
-    listeners.iter().map(|l| l.local_addr().unwrap()).collect()
-}
-
-fn single_node_config() -> ClusterConfig {
-    let a = fixed_addrs(6);
-    ClusterConfig {
-        nodes: vec![RoleAddrs {
-            role: animusd::config::NodeRole::Both,
-            control: Some(a[0]),
-            client: a[1],
-            dynamo: a[2],
-            cql: a[3],
-            raftkv: Some(a[4]),
-            admin: a[5],
-        }],
-    }
-}
-
-/// Start a single node, retrying with **fresh ephemeral ports** on a bind/startup
-/// failure. `fixed_addrs` binds `:0`, reads the addr, then drops the listener —
-/// under `cargo test --workspace` (many test binaries in parallel) another binder
-/// can steal a freed port in that TOCTOU window, so the subsequent `run_node`
-/// rebind intermittently fails with `AddrInUse`. Retrying with a brand-new config
-/// makes the first bring-up robust. Returns the started `Node` **and** the
-/// `ClusterConfig` it actually bound, so a restart-style test can reuse the same
-/// addresses (its reuse window is tiny and acceptable).
-async fn start_single_node(dir: &Path) -> (Node, ClusterConfig) {
-    let mut last_err = None;
-    for attempt in 0..10 {
-        let config = single_node_config();
-        match animusd::run_node(&config, 0, dir).await {
-            Ok(node) => return (node, config),
-            Err(e) => {
-                last_err = Some(e);
-                sleep(Duration::from_millis(50 * (attempt + 1))).await;
-            }
-        }
-    }
-    panic!("single node failed to start after 10 attempts: {last_err:?}");
-}
-
 async fn stop(node: Node) {
     // Graceful: durably flush the control-plane WAL before aborting tasks, so a
     // just-acked `CreateTable` schema survives the restart (a bare `shutdown`
@@ -191,7 +145,7 @@ async fn create_table_survives_node_restart() {
     let node_dir = dir.path().join("node-0");
 
     // --- First incarnation: create a composite table, write + read an item. ---
-    let (node, config) = start_single_node(&node_dir).await;
+    let (node, config) = support::start_single_node(&node_dir, StorageBackend::default()).await;
     let dynamo_addr = config.nodes[0].dynamo;
     await_node_bootstrap(&node).await;
 
@@ -271,7 +225,7 @@ async fn scan_and_query_read_live_storage_after_restart() {
 
     // --- First incarnation: create a composite table and write three rows in two
     // partitions, then stop the node (this wipes the in-memory registry). ---
-    let (node, config) = start_single_node(&node_dir).await;
+    let (node, config) = support::start_single_node(&node_dir, StorageBackend::default()).await;
     let dynamo_addr = config.nodes[0].dynamo;
     await_node_bootstrap(&node).await;
 
@@ -465,7 +419,7 @@ async fn create_table_index_survives_node_restart() {
     let node_dir = dir.path().join("node-0");
 
     // --- First incarnation: create a table with a GSI + write an indexed item. ---
-    let (node, config) = start_single_node(&node_dir).await;
+    let (node, config) = support::start_single_node(&node_dir, StorageBackend::default()).await;
     let dynamo_addr = config.nodes[0].dynamo;
     await_node_bootstrap(&node).await;
 

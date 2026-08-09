@@ -27,14 +27,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
-/// Reserve `count` free loopback ports (bind :0, read addr, release).
-fn free_addrs(count: usize) -> Vec<SocketAddr> {
-    let ls: Vec<std::net::TcpListener> = (0..count)
-        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
-        .collect();
-    ls.iter().map(|l| l.local_addr().unwrap()).collect()
-}
-
 /// Bring up an `n`-node cluster, one process per node, retrying the
 /// (allocate-fresh-ports + start-all) as a unit (the documented port-TOCTOU
 /// mitigation). Returns the per-node data dirs so the test can assert on-disk
@@ -44,7 +36,7 @@ async fn bring_up(
     dir: &Path,
 ) -> (Vec<Node>, animusd::ClusterConfig, Vec<std::path::PathBuf>) {
     for attempt in 0..16 {
-        let addrs = free_addrs(n * 6);
+        let addrs = support::free_addrs(n * 6);
         let nodes_cfg: Vec<animusd::RoleAddrs> = (0..n)
             .map(|i| animusd::RoleAddrs {
                 role: animusd::config::NodeRole::Both,

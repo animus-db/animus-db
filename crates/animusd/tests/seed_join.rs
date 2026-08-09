@@ -20,23 +20,15 @@ use animusd::{
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
-const TABLES: [&str; 3] = ["seedjoin0", "seedjoin1", "seedjoin2"];
+mod support;
 
-/// Reserve `count` free loopback ports (bind :0, read addr, release) — the
-/// documented port-TOCTOU-tolerant pattern every `animusd` integration test
-/// bring-up uses.
-fn free_addrs(count: usize) -> Vec<SocketAddr> {
-    let ls: Vec<std::net::TcpListener> = (0..count)
-        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
-        .collect();
-    ls.iter().map(|l| l.local_addr().unwrap()).collect()
-}
+const TABLES: [&str; 3] = ["seedjoin0", "seedjoin1", "seedjoin2"];
 
 /// Bring up the initial `n`-node config core, one process per node, retrying
 /// the (allocate-fresh-ports + start-all) as a unit (port-TOCTOU mitigation).
 async fn bring_up(n: usize, dir: &Path) -> (Vec<Node>, ClusterConfig) {
     for attempt in 0..16 {
-        let addrs = free_addrs(n * 6);
+        let addrs = support::free_addrs(n * 6);
         let nodes_cfg: Vec<RoleAddrs> = (0..n)
             .map(|i| RoleAddrs {
                 role: animusd::config::NodeRole::Both,
@@ -98,7 +90,7 @@ async fn join_fresh(
     backend: StorageBackend,
 ) -> (Node, RoleAddrs, PathBuf) {
     for attempt in 0..16 {
-        let raw = free_addrs(6);
+        let raw = support::free_addrs(6);
         let addrs = RoleAddrs {
             role: animusd::config::NodeRole::Both,
             control: Some(raw[0]),
@@ -405,7 +397,7 @@ async fn node_joins_via_seed_with_no_expanded_config() {
     // 7. Collision: joining at the SAME index with DIFFERENT addresses must
     // fail loudly (the collision guard), and the cluster stays unharmed.
     let collision_addrs = {
-        let raw = free_addrs(6);
+        let raw = support::free_addrs(6);
         RoleAddrs {
             role: animusd::config::NodeRole::Both,
             control: Some(raw[0]),
