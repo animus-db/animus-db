@@ -2817,6 +2817,8 @@ impl ClientCtx {
                 CpRoute::Forward(addr) => {
                     match self
                         .cp_forward(
+                            table,
+                            &key,
                             addr,
                             ClientRequest::Get {
                                 key: key.clone(),
@@ -2855,18 +2857,17 @@ impl ClientCtx {
     ) -> Result<(), String> {
         match self.cp_route(table, &key).await {
             CpRoute::Local(leader) => Self::cp_put_local(&leader, key, value).await,
-            CpRoute::Forward(addr) => Self::ok_or_err(
-                self.cp_forward(
-                    addr,
-                    ClientRequest::Put {
-                        key,
-                        value,
-                        table: table.to_owned(),
-                    },
+            CpRoute::Forward(addr) => {
+                let request = ClientRequest::Put {
+                    key: key.clone(),
+                    value,
+                    table: table.to_owned(),
+                };
+                Self::ok_or_err(
+                    self.cp_forward(table, &key, addr, request).await,
+                    "forwarded CP write",
                 )
-                .await,
-                "forwarded CP write",
-            ),
+            }
             CpRoute::None => Err("no CP group leader reachable".into()),
         }
     }
@@ -2926,17 +2927,16 @@ impl ClientCtx {
         };
         match self.cp_route(table, &first).await {
             CpRoute::Local(leader) => Self::cp_batch_local(&leader, group).await,
-            CpRoute::Forward(addr) => Self::ok_or_err(
-                self.cp_forward(
-                    addr,
-                    ClientRequest::PutBatch {
-                        entries: group,
-                        table: table.to_owned(),
-                    },
+            CpRoute::Forward(addr) => {
+                let request = ClientRequest::PutBatch {
+                    entries: group,
+                    table: table.to_owned(),
+                };
+                Self::ok_or_err(
+                    self.cp_forward(table, &first, addr, request).await,
+                    "forwarded CP batch write",
                 )
-                .await,
-                "forwarded CP batch write",
-            ),
+            }
             CpRoute::None => Err("no CP group leader reachable".into()),
         }
     }
@@ -3128,16 +3128,11 @@ impl ClientCtx {
                     Err(e) => last_err = e,
                 },
                 CpRoute::Forward(addr) => {
-                    match self
-                        .cp_forward(
-                            addr,
-                            ClientRequest::PutBatch {
-                                entries: group.clone(),
-                                table: table.to_owned(),
-                            },
-                        )
-                        .await
-                    {
+                    let request = ClientRequest::PutBatch {
+                        entries: group.clone(),
+                        table: table.to_owned(),
+                    };
+                    match self.cp_forward(table, &first, addr, request).await {
                         ClientResponse::PutOk => return Ok(()),
                         ClientResponse::Error(e) => last_err = e,
                         other => {
@@ -3163,17 +3158,16 @@ impl ClientCtx {
     pub(crate) async fn cp_delete(&self, table: &str, key: Vec<u8>) -> Result<(), String> {
         match self.cp_route(table, &key).await {
             CpRoute::Local(leader) => Self::cp_delete_local(&leader, key).await,
-            CpRoute::Forward(addr) => Self::ok_or_err(
-                self.cp_forward(
-                    addr,
-                    ClientRequest::Delete {
-                        key,
-                        table: table.to_owned(),
-                    },
+            CpRoute::Forward(addr) => {
+                let request = ClientRequest::Delete {
+                    key: key.clone(),
+                    table: table.to_owned(),
+                };
+                Self::ok_or_err(
+                    self.cp_forward(table, &key, addr, request).await,
+                    "forwarded CP delete",
                 )
-                .await,
-                "forwarded CP delete",
-            ),
+            }
             CpRoute::None => Err("no CP group leader reachable".into()),
         }
     }
@@ -3266,18 +3260,13 @@ impl ClientCtx {
                     }
                 }
                 CpRoute::Forward(addr) => {
-                    match self
-                        .cp_forward(
-                            addr,
-                            ClientRequest::Scan {
-                                start: start.clone(),
-                                end: end.clone(),
-                                limit,
-                                table: table.to_owned(),
-                            },
-                        )
-                        .await
-                    {
+                    let request = ClientRequest::Scan {
+                        start: start.clone(),
+                        end: end.clone(),
+                        limit,
+                        table: table.to_owned(),
+                    };
+                    match self.cp_forward(table, &start, addr, request).await {
                         ClientResponse::Pairs(p) => return Ok(p),
                         ClientResponse::Error(e) => e,
                         other => {
@@ -3440,33 +3429,133 @@ impl ClientCtx {
         }
     }
 
-    /// The client-API address to forward a `tablet` op to: the hosting node of that
-    /// tablet's group leader as a local replica currently sees it (`leader()` hint →
-    /// `client_route`). `None` if this node hosts no replica of `tablet`, the replica
-    /// has no leader hint yet (mid-election — the caller waits rather than guessing,
-    /// so it never forwards a CP op to a non-leader, including itself), or the hinted
-    /// id has no known route.
-    fn cp_forward_target(&self, tablet: TabletId) -> Option<SocketAddr> {
+    /// This node's local replica's own leader **hint** for `tablet` — `(id,
+    /// client-API address)` — as it currently sees it (`leader()` hint →
+    /// `client_route`). `None` if this node hosts no replica of `tablet`, the
+    /// replica has no leader hint yet (mid-election), or the hinted id has no
+    /// known route. The one shared lookup behind both
+    /// [`cp_forward_target`](Self::cp_forward_target) (this node deciding
+    /// where to route/forward *before* proposing) and a "not the leader
+    /// here" refusal's embedded hint
+    /// ([`topology::format_not_leader_refusal`]) — a node refusing a
+    /// forwarded op always hosts *some* local replica of the tablet (that's
+    /// why it was targeted), so its own knowledge of the group's leader is
+    /// exactly the hint a forwarder chasing a wrong first guess needs.
+    fn cp_leader_hint(&self, tablet: TabletId) -> Option<(NodeId, SocketAddr)> {
         // Since ADR 0026 Stage B a tablet's CP group member id **is** simply the
         // base `raftkv` id, so the local replica's leader hint is already a
         // `client_route` key — no more base<->member translation needed.
         let leader = self.edge.local_cp(tablet).and_then(|n| n.leader())?;
-        self.route_addr(leader)
+        let addr = self.route_addr(leader)?;
+        Some((leader, addr))
     }
 
-    /// Forward a CP op to another node's client API (wrapped so the receiver
+    /// The client-API address to forward a `tablet` op to — see
+    /// [`cp_leader_hint`](Self::cp_leader_hint) (the caller waits rather than
+    /// guessing when there is no hint yet, so it never forwards a CP op to a
+    /// non-leader, including itself).
+    fn cp_forward_target(&self, tablet: TabletId) -> Option<SocketAddr> {
+        self.cp_leader_hint(tablet).map(|(_, addr)| addr)
+    }
+
+    /// A "not the leader here" refusal for a forwarded CP op that resolved to
+    /// `tablet` (or `None`, if this node couldn't even resolve which tablet
+    /// the op belongs to) — enriched with this node's own
+    /// [`cp_leader_hint`](Self::cp_leader_hint) for `tablet`, if it has one.
+    fn not_leader_refusal(&self, tablet: Option<TabletId>) -> ClientResponse {
+        let hint = tablet.and_then(|t| self.cp_leader_hint(t));
+        ClientResponse::Error(topology::format_not_leader_refusal(hint))
+    }
+
+    /// Another known client-API address for `tablet`, distinct from every
+    /// address already in `tried` — the fallback
+    /// [`cp_forward`](Self::cp_forward)'s hinted retry chases once the
+    /// refusal's own leader hint is exhausted (already tried, or absent
+    /// because the refusing node's own replica was mid-election). Walks the
+    /// tablet's replicas in `Metadata` order (deterministic); `None` once
+    /// every known replica address has been tried (or the tablet/its route
+    /// isn't known at all).
+    fn other_tablet_replica_addr(
+        &self,
+        tablet: TabletId,
+        tried: &BTreeSet<SocketAddr>,
+    ) -> Option<SocketAddr> {
+        let meta = self.effective_metadata();
+        let replicas = meta.tablets.get(&tablet)?.replicas.clone();
+        let route = self.route_snapshot();
+        replicas
+            .into_iter()
+            .find_map(|id| route.get(&id).copied().filter(|a| !tried.contains(a)))
+    }
+
+    /// Forward a CP op for `(table, key)` to `addr` (wrapped so the receiver
     /// serves-or-errors, never re-forwards) and relay its reply. Carries the
     /// current span's trace context (ADR 0027) so the receiving node's
     /// handling of the forwarded op joins the same distributed trace.
-    async fn cp_forward(&self, addr: SocketAddr, request: ClientRequest) -> ClientResponse {
-        self.relay(
-            addr,
-            ClientRequest::Forwarded {
-                request: Box::new(request),
-                traceparent: crate::otel::current_traceparent(),
-            },
-        )
-        .await
+    ///
+    /// **Hinted retry — closes the "zero-replica blind-forward" hazard (root
+    /// `CLAUDE.md`).** A node with no local replica of the op's tablet can
+    /// only *guess* a first forward target among the tablet's replicas
+    /// (`resolve_cp_route`'s no-local-replica fallback); previously a wrong
+    /// guess errored forever, because the receiver never re-forwards
+    /// (routing stays bounded to one hop by design) and this method had no
+    /// better address to retry with. Now a "not the leader here" refusal
+    /// carries the refusing (replica-hosting) node's own leader hint
+    /// (`topology::format_not_leader_refusal`), and this is the single choke
+    /// point every CP forward call goes through (all six call sites), so the
+    /// retry lives here once: on a parseable not-leader refusal, retry at the
+    /// hint's address if untried, else at another of the tablet's known
+    /// replica addresses ([`other_tablet_replica_addr`](Self::other_tablet_replica_addr)),
+    /// skipping every address already tried. Bounded to at most one pass
+    /// over {hint} ∪ replicas (each address tried at most once — the
+    /// tablet's replica set is small and finite) and to the overall
+    /// [`CLIENT_TIMEOUT`] budget for the *whole* sequence, not per attempt,
+    /// so a forwarder chasing a bad guess still fails within one hop's usual
+    /// time budget rather than several multiples of it. The one-hop
+    /// invariant itself is unchanged: only the *forwarder* retries; the
+    /// receiver ([`cp_serve_forwarded`](Self::cp_serve_forwarded)) still only
+    /// ever serves-or-refuses, never re-forwards.
+    async fn cp_forward(
+        &self,
+        table: &str,
+        key: &[u8],
+        addr: SocketAddr,
+        request: ClientRequest,
+    ) -> ClientResponse {
+        let tablet = self.tablet_for(table, key);
+        let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
+        let mut tried: BTreeSet<SocketAddr> = BTreeSet::new();
+        let mut next = addr;
+        loop {
+            tried.insert(next);
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let resp = relay_request_with_timeout(
+                next,
+                &ClientRequest::Forwarded {
+                    request: Box::new(request.clone()),
+                    traceparent: crate::otel::current_traceparent(),
+                },
+                remaining,
+            )
+            .await;
+            let ClientResponse::Error(e) = &resp else {
+                return resp;
+            };
+            let Some(hint) = topology::parse_not_leader_refusal(e) else {
+                return resp;
+            };
+            if tokio::time::Instant::now() >= deadline {
+                return resp;
+            }
+            let candidate = hint
+                .filter(|(_, a)| !tried.contains(a))
+                .map(|(_, a)| a)
+                .or_else(|| tablet.and_then(|t| self.other_tablet_replica_addr(t, &tried)));
+            match candidate {
+                Some(a) => next = a,
+                None => return resp,
+            }
+        }
     }
 
     /// Send `request` to a peer node's client API over a fresh connection and
@@ -3560,13 +3649,6 @@ impl ClientCtx {
         false
     }
 
-    /// This node's leader handle for the tablet of `table` owning `key`, if it hosts
-    /// it and leads — the local serve target for a forwarded op.
-    fn cp_leader_for(&self, table: &str, key: &[u8]) -> Option<CpGroup> {
-        self.tablet_for(table, key)
-            .and_then(|t| self.edge.cp_leader(t))
-    }
-
     /// Provision the **first tablet** of `table` (ADR 0023): a fresh cluster has no
     /// data tablet, so `CreateTable` stands one up — a single tablet covering the
     /// whole token ring, scoped to `table`, which splits on demand as it grows. The
@@ -3640,8 +3722,9 @@ impl ClientCtx {
     async fn cp_serve_forwarded(&self, inner: ClientRequest) -> ClientResponse {
         match inner {
             ClientRequest::Put { key, value, table } => {
-                let Some(leader) = self.cp_leader_for(&table, &key) else {
-                    return ClientResponse::Error("forwarded CP op: not the leader here".into());
+                let tablet = self.tablet_for(&table, &key);
+                let Some(leader) = tablet.and_then(|t| self.edge.cp_leader(t)) else {
+                    return self.not_leader_refusal(tablet);
                 };
                 match Self::cp_put_local(&leader, key, value).await {
                     Ok(()) => ClientResponse::PutOk,
@@ -3654,29 +3737,34 @@ impl ClientCtx {
                 let Some(first) = entries.first().map(|(k, _)| k.clone()) else {
                     return ClientResponse::PutOk; // empty batch is a no-op
                 };
-                let Some(leader) = self.cp_leader_for(&table, &first) else {
-                    return ClientResponse::Error("forwarded CP op: not the leader here".into());
+                let tablet = self.tablet_for(&table, &first);
+                let Some(leader) = tablet.and_then(|t| self.edge.cp_leader(t)) else {
+                    return self.not_leader_refusal(tablet);
                 };
                 match Self::cp_batch_local(&leader, entries).await {
                     Ok(()) => ClientResponse::PutOk,
                     Err(e) => ClientResponse::Error(e),
                 }
             }
-            ClientRequest::Get { key, table } => match self.cp_leader_for(&table, &key) {
-                // Read-side scope pre-check + served/absent disambiguation
-                // (ADR 0033) — the same `cp_get_local` decision as `cp_read`'s
-                // Local arm. Serve-or-error only (never re-forward, never
-                // wait): the forwarder's own retry loop re-resolves routing on
-                // a `"; retry"` error.
-                Some(leader) => match Self::cp_get_local(&leader, &key).await {
-                    Ok(v) => ClientResponse::Value(v),
-                    Err(e) => ClientResponse::Error(e),
-                },
-                None => ClientResponse::Error("forwarded CP op: not the leader here".into()),
-            },
+            ClientRequest::Get { key, table } => {
+                let tablet = self.tablet_for(&table, &key);
+                match tablet.and_then(|t| self.edge.cp_leader(t)) {
+                    // Read-side scope pre-check + served/absent disambiguation
+                    // (ADR 0033) — the same `cp_get_local` decision as `cp_read`'s
+                    // Local arm. Serve-or-error only (never re-forward, never
+                    // wait): the forwarder's own retry loop re-resolves routing on
+                    // a `"; retry"` error.
+                    Some(leader) => match Self::cp_get_local(&leader, &key).await {
+                        Ok(v) => ClientResponse::Value(v),
+                        Err(e) => ClientResponse::Error(e),
+                    },
+                    None => self.not_leader_refusal(tablet),
+                }
+            }
             ClientRequest::Delete { key, table } => {
-                let Some(leader) = self.cp_leader_for(&table, &key) else {
-                    return ClientResponse::Error("forwarded CP op: not the leader here".into());
+                let tablet = self.tablet_for(&table, &key);
+                let Some(leader) = tablet.and_then(|t| self.edge.cp_leader(t)) else {
+                    return self.not_leader_refusal(tablet);
                 };
                 match Self::cp_delete_local(&leader, key).await {
                     Ok(()) => ClientResponse::PutOk,
@@ -3689,8 +3777,9 @@ impl ClientCtx {
                 limit,
                 table,
             } => {
-                let Some(leader) = self.cp_leader_for(&table, &start) else {
-                    return ClientResponse::Error("forwarded CP op: not the leader here".into());
+                let tablet = self.tablet_for(&table, &start);
+                let Some(leader) = tablet.and_then(|t| self.edge.cp_leader(t)) else {
+                    return self.not_leader_refusal(tablet);
                 };
                 // Read-side scope pre-check (ADR 0033) — the same
                 // `cp_scan_local` decision as `cp_scan_one`'s Local arm: a

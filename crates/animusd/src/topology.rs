@@ -25,6 +25,7 @@
 
 use std::net::SocketAddr;
 
+use animus_env::NodeId;
 use animus_tablet::{Tablet, TabletId};
 
 /// The tablet whose range contains `key`, chosen from `tablets` (already
@@ -107,6 +108,68 @@ pub(crate) fn decide_cp_route(
         }
     }
     RouteDecision::Wait
+}
+
+/// The fixed prefix of a "not the leader here" refusal
+/// (`ClientCtx::cp_serve_forwarded`) — shared by [`format_not_leader_refusal`]
+/// and [`parse_not_leader_refusal`] so the two stay in lockstep.
+const NOT_LEADER_REFUSAL_PREFIX: &str = "forwarded CP op: not the leader here";
+
+/// Build a "not the leader here" refusal, optionally carrying the refusing
+/// (replica-hosting) node's own leader **hint** — `(id, client-API address)`
+/// — for the tablet whose op it refused (hinted-retry forwarding, closing the
+/// "zero-replica blind-forward" hazard documented in the root `CLAUDE.md`: a
+/// node with no local replica of a tablet can only guess a first forward
+/// target, and a wrong guess used to error forever since the receiver never
+/// re-forwards). The receiving node was targeted *because* it hosts a
+/// replica of the tablet, so its own knowledge of the group's current leader
+/// (`None` only when mid-election) is exactly what a forwarder chasing a
+/// wrong first guess needs to retry correctly instead of forwarding blindly
+/// again.
+///
+/// Deliberately kept a plain [`ClientResponse::Error`](crate::ClientResponse::Error)
+/// string rather than a new wire variant, so old and new binaries
+/// interoperate: an older receiver's bare refusal still parses (via
+/// [`parse_not_leader_refusal`]) as "no hint", and a non-`animusd` client
+/// just sees a slightly more detailed message.
+pub(crate) fn format_not_leader_refusal(hint: Option<(NodeId, SocketAddr)>) -> String {
+    match hint {
+        Some((id, addr)) => format!("{NOT_LEADER_REFUSAL_PREFIX}; leader_hint={id}@{addr}"),
+        None => format!("{NOT_LEADER_REFUSAL_PREFIX}; leader_hint=none"),
+    }
+}
+
+/// Parse a refusal built by [`format_not_leader_refusal`]. `None` means `msg`
+/// isn't this refusal class at all (a genuinely different error — the caller
+/// must not retry-with-a-guess on those). `Some(None)` is a genuine "not the
+/// leader here" refusal carrying **no** hint (the refusing node's own
+/// replica is mid-election, or the message predates hinted refusals);
+/// `Some(Some(..))` carries a concrete `(id, address)` to retry at.
+///
+/// Deliberately tolerant of a garbled suffix (a future wire change, a
+/// non-`animusd` peer echoing a similar-looking string): anything after the
+/// known prefix that doesn't parse as either recognized shape falls back to
+/// "no hint" rather than panicking or, worse, silently routing a retry to a
+/// bogus address.
+pub(crate) fn parse_not_leader_refusal(msg: &str) -> Option<Option<(NodeId, SocketAddr)>> {
+    let suffix = msg.strip_prefix(NOT_LEADER_REFUSAL_PREFIX)?;
+    let Some(hint_str) = suffix.strip_prefix("; leader_hint=") else {
+        // Predates hinted refusals, or an unrecognized suffix shape — still a
+        // genuine "not the leader here" refusal, just with no usable hint.
+        return Some(None);
+    };
+    if hint_str == "none" {
+        return Some(None);
+    }
+    match hint_str.split_once('@') {
+        Some((id_str, addr_str)) => {
+            match (id_str.parse::<NodeId>(), addr_str.parse::<SocketAddr>()) {
+                (Ok(id), Ok(addr)) => Some(Some((id, addr))),
+                _ => Some(None),
+            }
+        }
+        None => Some(None),
+    }
 }
 
 #[cfg(test)]
@@ -252,6 +315,59 @@ mod tests {
         assert_eq!(
             decide_cp_route(false, None, false, false, None),
             RouteDecision::Wait
+        );
+    }
+
+    // --- not-leader refusal format/parse --------------------------------------
+
+    #[test]
+    fn not_leader_refusal_round_trips_with_a_hint() {
+        let hint = Some((7u64, addr(9001)));
+        let msg = format_not_leader_refusal(hint);
+        assert_eq!(parse_not_leader_refusal(&msg), Some(hint));
+    }
+
+    #[test]
+    fn not_leader_refusal_round_trips_without_a_hint() {
+        let msg = format_not_leader_refusal(None);
+        assert_eq!(parse_not_leader_refusal(&msg), Some(None));
+    }
+
+    /// An older peer's exact pre-hint message (no `; leader_hint=…` suffix at
+    /// all): still recognized as the same refusal class, just with no hint.
+    #[test]
+    fn not_leader_refusal_tolerates_a_pre_hint_bare_refusal() {
+        assert_eq!(
+            parse_not_leader_refusal("forwarded CP op: not the leader here"),
+            Some(None)
+        );
+    }
+
+    #[test]
+    fn not_leader_refusal_tolerates_a_garbled_hint_suffix() {
+        assert_eq!(
+            parse_not_leader_refusal("forwarded CP op: not the leader here; leader_hint=garbage"),
+            Some(None)
+        );
+        assert_eq!(
+            parse_not_leader_refusal(
+                "forwarded CP op: not the leader here; leader_hint=notanumber@127.0.0.1:1"
+            ),
+            Some(None)
+        );
+        assert_eq!(
+            parse_not_leader_refusal(
+                "forwarded CP op: not the leader here; leader_hint=7@not-an-addr"
+            ),
+            Some(None)
+        );
+    }
+
+    #[test]
+    fn not_leader_refusal_is_not_confused_with_an_unrelated_error() {
+        assert_eq!(
+            parse_not_leader_refusal("CP group leader moved; retry"),
+            None
         );
     }
 }
