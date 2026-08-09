@@ -737,8 +737,10 @@ async fn keyspace_exists(ctx: &ClientCtx, keyspace: &str) -> bool {
     let ks = keyspace.to_ascii_lowercase();
     // One metadata snapshot for both checks — `ctx.has_keyspace` +
     // `ctx.has_table_schema_with_prefix` would each deep-clone the replicated
-    // metadata under the Raft handle's lock.
-    let meta = ctx.raft.metadata();
+    // metadata under the Raft handle's lock. Cache-tolerant (ADR 0035 PR1:
+    // `ctx.effective_metadata()`, not `ctx.control.metadata_cached()`
+    // directly) — a plain lookup, not a commit-wait poll.
+    let meta = ctx.effective_metadata();
     meta.has_keyspace(&ks)
         || meta
             .table_schemas()

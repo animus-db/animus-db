@@ -87,6 +87,18 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
 
 ## What's non-obvious
 
+- **`ClientCtx.control` is a `ControlHandle`, not a bare `RaftNode<ProdEnv>`
+  (ADR 0035 PR1)** — a pure-refactor seam with a single `Local` variant today
+  (`control_handle.rs`); PR4 adds `Remote` for a data-only node with no local
+  control `RaftCore` at all. Reads split by freshness contract:
+  `metadata_cached()` (staleness-tolerant; `ClientCtx::effective_metadata()`
+  layers the ADR 0030 growth-node mirror on top of it) vs. `metadata_fresh()`
+  (read-your-writes, never mirror-substituted — used by the schema
+  commit-wait polls and the DynamoDB conditional-write existence gate). Both
+  are identical for `Local` today; the distinction only matters once `Remote`
+  exists. `ClusterEdgeState::leader_handle()` deliberately stays a concrete
+  `RaftNode<ProdEnv>` registry — proposing is inherently local-Raft-log-only,
+  so it never goes through `ControlHandle`.
 - A node runs **two internal `ProdEnv` roles on distinct ids/ports** — control
   (Raft metadata, id `i`) and **raftkv** (the leaderful **CP** per-tablet Raft
   group, `300+i`, ADR 0017 #3a — the v1 data plane) — because one inbox is
@@ -441,7 +453,7 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   (`tablet_host_reconciler_loop` + the `CpReconciler` backend enum in
   `lib.rs`):
   - **The trigger**: one spawned task per node racing
-    `ctx.raft.metadata_watch().changed(last_seen)` (ADR 0031 §trigger —
+    `ctx.control.metadata_watch().changed(last_seen)` (ADR 0031 §trigger —
     event-driven, so a replica-set change is observed on the commit that made
     it, not on the next arbitrarily-phased poll tick) against a
     `RECONCILE_FALLBACK_INTERVAL` (500ms) sleep. The fallback is

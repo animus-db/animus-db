@@ -145,10 +145,26 @@ const SCHEMA_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// and threads `&Metadata` through the helpers — the schema lookups, table/tablet
 /// existence checks, and index mirroring of one request all read the same
 /// consistent snapshot instead of re-cloning 2+ times per request. Paths that
-/// must observe *fresh* state (the `CreateTable` commit-wait polls) still call
-/// this directly.
+/// must observe *fresh* state (the `CreateTable` commit-wait polls, and the
+/// conditional-write existence gate's live re-check) use
+/// [`metadata_fresh`] instead — see that function's doc.
+///
+/// Cache-tolerant (ADR 0035 PR1: `ctx.effective_metadata()`, not
+/// `ctx.control.metadata_cached()` directly) — on a control-plane-follower-less
+/// growth node (ADR 0030) this is the difference between resolving a table's
+/// schema at all and a permanently-empty local view, since that node's own
+/// control raft never replicates.
 fn metadata(ctx: &ClientCtx) -> Metadata {
-    ctx.raft.metadata()
+    ctx.effective_metadata()
+}
+
+/// Read-your-writes view of the replicated `Metadata` (ADR 0035 PR1) — never
+/// the growth-node mirror [`metadata`] can substitute. Used only where a poll
+/// must observe its own just-proposed command (or a concurrent writer's)
+/// landing in the authoritative state: the `CreateTable` commit-wait loops
+/// below, and [`quorum_read`]'s live re-check on a snapshot miss.
+fn metadata_fresh(ctx: &ClientCtx) -> Metadata {
+    ctx.metadata_fresh()
 }
 
 /// The DynamoDB key schema for `table`, resolved from the **replicated catalog**
@@ -537,8 +553,9 @@ async fn create_table(
 ) -> Result<String, WireError> {
     // Reject a duplicate up front, matching DynamoDB's `ResourceInUseException`,
     // before we propose (the state machine also rejects, but this gives the right
-    // wire code without waiting on a commit that will be a no-op).
-    if metadata(ctx).has_table_schema(table) {
+    // wire code without waiting on a commit that will be a no-op). Fresh, not
+    // `metadata(ctx)`: this whole function is a commit-wait poll (ADR 0035 PR1).
+    if metadata_fresh(ctx).has_table_schema(table) {
         return Err(registry_error(animus_dynamo::RegistryError::TableExists(
             table.to_owned(),
         )));
@@ -558,7 +575,7 @@ async fn create_table(
             schema: control_schema.clone(),
         })
         .await;
-        if metadata(ctx).has_table_schema(table) {
+        if metadata_fresh(ctx).has_table_schema(table) {
             break;
         }
         if tokio::time::Instant::now() >= deadline {
@@ -587,7 +604,7 @@ async fn create_table(
                 index: def.clone(),
             })
             .await;
-            if metadata(ctx)
+            if metadata_fresh(ctx)
                 .table_indexes(table)
                 .iter()
                 .any(|d| d.name == def.name)
@@ -614,7 +631,7 @@ async fn create_table(
     // the request's declarations — so the source of truth is the committed catalog).
     // A *fresh* snapshot on purpose: the request-entry snapshot predates the schema
     // this very request just committed.
-    mirror_catalog_schema(ctx, &metadata(ctx), table);
+    mirror_catalog_schema(ctx, &metadata_fresh(ctx), table);
     Ok(wire::create_table_response(table, schema, indexes))
 }
 
@@ -1277,7 +1294,11 @@ async fn quorum_read(
     // writer's read *must* see it (two racing `attribute_not_exists` puts both
     // "succeeding" was the failure mode). Trust the snapshot on the hit path
     // (tablets are only removed by drop-table); re-check **live** on the miss.
-    if !meta.has_table_tablet(table) && !metadata(ctx).has_table_tablet(table) {
+    // Fresh, not `metadata(ctx)` (ADR 0035 PR1): this is the conditional-write
+    // existence gate, which must not conclude "absent" from a growth-node
+    // mirror that could still be a poll interval behind a concurrent writer's
+    // just-committed provisioning.
+    if !meta.has_table_tablet(table) && !metadata_fresh(ctx).has_table_tablet(table) {
         return Ok(None);
     }
     match ctx
