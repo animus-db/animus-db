@@ -148,6 +148,37 @@ per-tablet CP data plane (`animus-cp-data`).
   `animusd`/`animus-cp-data` code constructs one; every tablet still writes its
   own WAL file. Wire-in-or-delete is an open decision (see ADR 0028).
 
+- **`syskv.rs`** (ADR 0038 PR1) — the control plane's reserved **system
+  keyspace** key encoding: pure functions, no I/O, **unwired in this PR** (no
+  engine is threaded into `RaftNode`, no `StateMachine::DRIVER_APPLIED`
+  change, no `node.rs` change — a later PR in the stack mirrors `Metadata`
+  through it into a per-node `StorageEngine`). `RESERVED_NAMESPACE =
+  "__animus_system"` is the top-level namespace no user table/keyspace may
+  claim; `entity_key(EntityKind, id)` encodes `escape(RESERVED_NAMESPACE) ||
+  escape(kind) || escape(id)` reusing `animus_tablet::escape` byte-for-byte
+  (this crate already depends on `animus-tablet`, so no new dependency edge —
+  unlike the wire adapters, which deliberately *duplicate* `escape` to stay
+  dependency-light of this crate, there's no such constraint here). One
+  `EntityKind` per `Metadata` collection (`Tablet`/`Member`/`Schema`/`Policy`/
+  `NodeAddrs`/`Keyspace`/`Merged`), plus typed `tablet_key`/`member_key`/
+  `schema_key`/`policy_key`/`node_addrs_key`/`keyspace_key`/`merged_key`
+  helpers and a dedicated `applied_index_key()` watermark (a sibling of the
+  entity-kind segment, not under one — mirrors `animus-cp-data`'s
+  `engine_applied_index`). `decode_key` inverts `entity_key`/
+  `applied_index_key` for a later PR's engine-scan path and this module's own
+  round-trip tests. **`is_reserved_name` is the one piece wired in this PR**:
+  called from `Metadata::apply`'s `CreateTableSchema`/`CreateKeyspace` arms
+  (the state-machine-level, every-replica-agrees gate) and from both wire
+  edges' `CreateTable`/`CREATE KEYSPACE`/`CREATE TABLE` paths (client-side,
+  so a reserved-name collision surfaces as an immediate
+  `ValidationException`/`ERR_INVALID` instead of an opaque commit-wait
+  timeout) — same two-layer idiom the existing duplicate-table check already
+  uses. Matching is a case-sensitive prefix test (exact match *or* merely
+  prefixed, e.g. `__animus_system_backup`), since a later PR scopes this
+  keyspace into a combined node's shared engine via a reserved
+  `StorageScope` keyed on the exact namespace string, and a prefix match is
+  the collision that scoping scheme cannot tell apart from a real system key.
+
 ## Key invariants
 
 - **Config-in-log + current-term-commit gate (ADR 0017 C).** `LogEntry` may

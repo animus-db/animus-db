@@ -551,6 +551,16 @@ async fn create_table(
     key_types: &[(String, String)],
     indexes: &[animus_dynamo::SecondaryIndex],
 ) -> Result<String, WireError> {
+    // Reject a name that collides with the control plane's reserved system
+    // keyspace (ADR 0038) up front, client-side, with a clear message — the
+    // state machine also rejects this (`Metadata::apply`'s `CreateTableSchema`
+    // arm), but that would otherwise surface as an opaque commit-wait timeout.
+    if animus_control::syskv::is_reserved_name(table) {
+        return Err(WireError {
+            code: "ValidationException",
+            message: format!("table name `{table}` collides with the reserved system namespace"),
+        });
+    }
     // Reject a duplicate up front, matching DynamoDB's `ResourceInUseException`,
     // before we propose (the state machine also rejects, but this gives the right
     // wire code without waiting on a commit that will be a no-op). Fresh, not

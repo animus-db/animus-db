@@ -212,6 +212,65 @@ async fn create_table_survives_node_restart() {
     stop(node).await;
 }
 
+/// `CreateTable` rejects a table name that collides with the control plane's
+/// reserved system-keyspace namespace (ADR 0038 PR1), client-side, with a
+/// clear `ValidationException` — not a commit-wait timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn create_table_rejects_reserved_namespace() {
+    let dir = tempfile::tempdir().unwrap();
+    let node_dir = dir.path().join("node-0");
+    let (node, config) = support::start_single_node(&node_dir, StorageBackend::default()).await;
+    let dynamo_addr = config.nodes[0].dynamo;
+    await_node_bootstrap(&node).await;
+
+    // An exact match on the reserved namespace.
+    let (status, body) = dynamo(
+        dynamo_addr,
+        "DynamoDB_20120810.CreateTable",
+        r#"{"TableName":"__animus_system",
+            "KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],
+            "AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"}]}"#,
+    )
+    .await;
+    assert_eq!(status, 400, "reserved name should be rejected: {body}");
+    assert!(
+        body.contains("ValidationException"),
+        "expected ValidationException, got: {body}"
+    );
+    assert!(
+        body.contains("reserved system namespace"),
+        "expected a clear message, got: {body}"
+    );
+
+    // A name merely prefixed by the reserved namespace also collides.
+    let (status, body) = dynamo(
+        dynamo_addr,
+        "DynamoDB_20120810.CreateTable",
+        r#"{"TableName":"__animus_system_backup",
+            "KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],
+            "AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"}]}"#,
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "prefix-colliding name should be rejected: {body}"
+    );
+    assert!(body.contains("ValidationException"), "{body}");
+
+    // An ordinary table name is unaffected.
+    let (status, body) = dynamo(
+        dynamo_addr,
+        "DynamoDB_20120810.CreateTable",
+        r#"{"TableName":"orders",
+            "KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],
+            "AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"}]}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "ordinary CreateTable should succeed: {body}");
+
+    stop(node).await;
+}
+
 /// The native range scan reads **live storage**, not an in-memory written-key
 /// index: after a node restart the in-memory `SchemaRegistry` is empty (no
 /// `note_put` was ever replayed), yet a base-table `Query` and a `Scan` still
