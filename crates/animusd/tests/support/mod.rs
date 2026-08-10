@@ -137,7 +137,13 @@ pub async fn bring_up_split(
         let mut data_nodes = Vec::new();
         let mut failed = false;
         for i in 0..control_n {
-            match animusd::run_node_control(&config, i, dir.join(format!("a{attempt}-c{i}"))).await
+            match animusd::run_node_control(
+                &config,
+                i,
+                dir.join(format!("a{attempt}-c{i}")),
+                animusd::StorageBackend::default(),
+            )
+            .await
             {
                 Ok(n) => control_nodes.push(n),
                 Err(_) => {

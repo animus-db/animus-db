@@ -10,13 +10,16 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use animus_env::{Env, EnvExt, Metric, MetricsHandle, NodeId};
+use animus_storage::{MergeOp, StorageEngine};
 use futures::future::{Either, select};
 use futures::task::AtomicWaker;
 
 use crate::detector::FailureDetector;
 use crate::meta::{Member, MetaCommand, Metadata, NodeStatus};
+use crate::mirror::{self, KeyWrite};
 use crate::persist::PersistedState;
 use crate::raft::{Out, ProposeResult, RaftCore, RaftMsg, Role};
+use crate::syskv;
 
 /// File name of the per-node Raft write-ahead log on the `Env` disk.
 const WAL: &str = "raft.wal";
@@ -236,6 +239,74 @@ impl<E: Env> RaftNode<E> {
         node
     }
 
+    /// Like [`start`](Self::start), but additionally attaches a **shadow-mode
+    /// system-keyspace engine mirror** (ADR 0038 PR2): a `mirror_loop` task
+    /// that, after each in-core [`Metadata`] apply, derives the touched
+    /// [`syskv`](crate::syskv) keys (via [`mirror::apply_and_derive_mirror`])
+    /// and merge-batches them into `mirror_engine`. Purely additive and
+    /// observational — the real in-core `Metadata::apply` this node serves
+    /// reads/writes from is completely unchanged (`StateMachine::DRIVER_APPLIED`
+    /// stays `false`); a mirror write failure would `panic` the mirror task,
+    /// not this node's consensus/apply path (they share no lock beyond the
+    /// same `RaftCore` mutex `drain_mirror_log` briefly takes).
+    ///
+    /// One `RaftNode` attaches at most one mirror engine — call this instead
+    /// of [`start`](Self::start)/[`start_with_metrics`](Self::start_with_metrics),
+    /// not in addition to them. `S: StorageEngine + 'static` so the mirror
+    /// task can own a clone of it for its own lifetime; combined-mode
+    /// `animusd` passes the node's already-open shared engine directly
+    /// (system-keyspace keys are already globally namespaced by
+    /// [`syskv::RESERVED_NAMESPACE`](crate::syskv::RESERVED_NAMESPACE), so no
+    /// `StorageScope` wrapper is needed — see the PR2 report), a control-only
+    /// node passes a small dedicated one.
+    ///
+    /// **Race note**: `mirror_capture` must be enabled *synchronously*,
+    /// before any task (in particular `drive()`) gets its first poll — a
+    /// restarted node's `drive()` may replay a whole committed-but-not-yet-
+    /// applied log tail (a restart-time catch-up, not a first-open) on its
+    /// very first iteration, and any of that tail applied before capture
+    /// turns on would silently never reach the mirror. So this does **not**
+    /// delegate to [`start_with_metrics`](Self::start_with_metrics) (which
+    /// spawns `drive` immediately) — it builds the same shape itself, with
+    /// [`RaftCore::enable_mirror_capture`] called on the freshly constructed
+    /// core *before* any `env.spawn_task` call.
+    pub fn start_with_mirror<S: StorageEngine + 'static>(
+        env: E,
+        all_nodes: Vec<NodeId>,
+        metrics: MetricsHandle,
+        mirror_engine: S,
+    ) -> Self {
+        let mut inner = RaftCore::new(env.node_id(), &all_nodes, env.now(), env.next_u64());
+        inner.enable_mirror_capture();
+        let core = Arc::new(Mutex::new(inner));
+        let detector = Arc::new(Mutex::new(FailureDetector::new(DETECT_TIMEOUT)));
+        let watch = MetadataWatch::default();
+        let node = Self {
+            env: env.clone(),
+            core: Arc::clone(&core),
+            detector: Arc::clone(&detector),
+            watch: watch.clone(),
+            metrics: metrics.clone(),
+        };
+        env.spawn_task(drive(
+            env.clone(),
+            Arc::clone(&core),
+            Arc::clone(&detector),
+            all_nodes,
+            metrics.clone(),
+            watch,
+        ));
+        env.spawn_task(reconcile_loop(env.clone(), Arc::clone(&core)));
+        env.spawn_task(detect_loop(
+            env.clone(),
+            Arc::clone(&core),
+            detector,
+            metrics,
+        ));
+        env.spawn_task(mirror_loop(env.clone(), core, mirror_engine));
+        node
+    }
+
     /// This node's metrics handle (ADR 0015). A snapshot of it
     /// (`node.metrics().snapshot()`) is the control-plane observability surface.
     #[must_use]
@@ -444,8 +515,26 @@ async fn drive<E: Env>(
     let bytes = env.read(WAL).await.unwrap_or_default();
     let state = PersistedState::replay(PersistedState::decode(&bytes));
     if !state.is_empty() {
-        let recovered =
+        let mut recovered =
             RaftCore::recovered(env.node_id(), &all_nodes, state, env.now(), env.next_u64());
+        // ADR 0038 PR2: `RaftCore::recovered` builds a *fresh* core (via
+        // `Self::new`, then overrides specific fields) — `mirror_capture`
+        // defaults `false` on it like any other fresh core, silently
+        // dropping a mirror driver's earlier `enable_mirror_capture()` call
+        // right as this swap installs it. Carry the flag across the swap
+        // explicitly: whatever the *pre-recovery* core had (set
+        // synchronously by `RaftNode::start_with_mirror` before this task
+        // ever got its first poll — see that method's race note) is the
+        // value that must survive. Without this, a restarted mirror-attached
+        // node would silently stop mirroring the moment its committed WAL
+        // tail gets caught up and re-applied post-restart.
+        if core
+            .lock()
+            .expect("raft core poisoned")
+            .mirror_capture_enabled()
+        {
+            recovered.enable_mirror_capture();
+        }
         *core.lock().expect("raft core poisoned") = recovered;
     }
     // A restart can recover already-applied state (WAL replay); a watcher
@@ -540,6 +629,110 @@ async fn drive<E: Env>(
             env.send(to, bytes).await;
         }
     }
+}
+
+/// How often [`mirror_loop`] drains newly in-core-applied commands and
+/// merge-batches their derived system-keyspace writes into the attached
+/// engine (ADR 0038 PR2, shadow mode). A plain fixed timer, not a
+/// `metadata_watch()`-driven wake: simplest-thing-that-works for a
+/// shadow-mode mirror with no reader yet: a real consumer (PR3's cutover)
+/// would want the tighter wake-on-apply latency `metadata_watch` gives the
+/// per-node tablet-host reconciler (ADR 0031); until then, a short poll
+/// bounds mirror lag without adding a second wake seam to `RaftCore` this PR
+/// doesn't otherwise need. Short relative to [`RECONCILE_INTERVAL`] — control
+/// metadata commands are rare (schema DDL, membership, split/merge/reconcile
+/// CASes) compared to the data plane's own per-write traffic, which never
+/// touches this loop at all.
+const MIRROR_INTERVAL: Duration = Duration::from_millis(50);
+
+/// The shadow-mode system-keyspace mirror driver (ADR 0038 PR2), spawned by
+/// [`RaftNode::start_with_mirror`]. Owns a private `Metadata` cache
+/// (`shadow`) it advances by re-deriving each newly in-core-applied command
+/// through [`mirror::apply_and_derive_mirror`] — deliberately **not** shared
+/// with the real `RaftCore`'s own `Metadata` (that stays exactly as it is
+/// today; this task only *observes* what was applied, via
+/// [`RaftCore::drain_mirror_log`]). Since `Metadata::apply` is a pure,
+/// deterministic function of state + command, and `shadow` starts from
+/// whatever `mirror_engine` already durably holds (empty on a fresh engine,
+/// a prior run's content after a restart) via
+/// [`mirror::rebuild_metadata_from_engine`], replaying the identical command
+/// sequence keeps `shadow` byte-identical to the real `Metadata` at every
+/// index — the property the differential-oracle test asserts directly.
+///
+/// Engine writes use [`StorageEngine::merge_batch`] (per-key LWW, versioned
+/// at each command's own Raft log index), never `write_batch`/`put` (which
+/// enforce a single **engine-wide** monotonic version) — a combined node's
+/// mirror shares its engine with the CP data plane's own, independently
+/// versioned writes, and `merge_batch` is the same write primitive that data
+/// plane's own leaderful-Raft apply path already uses for exactly this
+/// reason (see [`animus_storage::StorageEngine::merge_batch`]'s doc). This
+/// keeps engine I/O off `drive`'s own loop (a genuinely separate spawned
+/// task, not inline in consensus message handling) even though it is not yet
+/// the full apply-task split PR3 will do — see the PR2 report's
+/// inline-vs-offloaded measurement.
+async fn mirror_loop<E: Env, S: StorageEngine>(
+    env: E,
+    core: Arc<Mutex<RaftCore>>,
+    mirror_engine: S,
+) {
+    // Belt-and-braces only: `start_with_mirror` already enables capture
+    // *synchronously* before this task (or `drive`) ever gets a first poll —
+    // see its doc's race note. Idempotent, so calling it again here is free.
+    core.lock()
+        .expect("raft core poisoned")
+        .enable_mirror_capture();
+    let mut shadow = mirror::rebuild_metadata_from_engine(&mirror_engine)
+        .await
+        .expect("system-keyspace engine scan (rebuild)");
+    let mut watermark = mirror_engine
+        .get(&syskv::applied_index_key())
+        .await
+        .expect("system-keyspace engine read (watermark)")
+        .map(|v| decode_watermark(&v.value))
+        .unwrap_or(0);
+    loop {
+        env.sleep(MIRROR_INTERVAL).await;
+        let drained = core.lock().expect("raft core poisoned").drain_mirror_log();
+        if drained.is_empty() {
+            continue;
+        }
+        let mut ops = Vec::new();
+        for (index, command) in drained {
+            let (_, writes) = mirror::apply_and_derive_mirror(&mut shadow, &command);
+            for write in writes {
+                ops.push(match write {
+                    KeyWrite::Put(key, value) => MergeOp::put(key, value, index),
+                    KeyWrite::Delete(key) => MergeOp::tombstone(key, index),
+                });
+            }
+            watermark = watermark.max(index);
+        }
+        // The `_applied_index` watermark rides the same batch, at the batch's
+        // own highest index — mirrors `animus-cp-data`'s `engine_applied_index`
+        // (ADR 0038's design doc), so a restart's rebuild (above) plus this
+        // value is enough to know how far the mirror had gotten without
+        // needing to inspect the raw Raft log/WAL at all.
+        ops.push(MergeOp::put(
+            syskv::applied_index_key(),
+            watermark.to_be_bytes().to_vec(),
+            watermark,
+        ));
+        mirror_engine
+            .merge_batch(ops)
+            .await
+            .expect("system-keyspace mirror write");
+    }
+}
+
+/// Decode an 8-byte big-endian `u64` watermark value (the same encoding
+/// [`syskv::applied_index_key`]'s value uses). Panics on a malformed value —
+/// this loop is the only writer of this key, so a mismatch is an internal
+/// bug.
+fn decode_watermark(bytes: &[u8]) -> u64 {
+    let array: [u8; 8] = bytes
+        .try_into()
+        .expect("applied-index watermark is exactly 8 bytes");
+    u64::from_be_bytes(array)
 }
 
 /// Notify any `metadata_watch()` waiter if the core's applied index has moved

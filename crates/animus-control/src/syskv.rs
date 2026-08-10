@@ -3,13 +3,17 @@
 //! reserved-namespace guard that keeps a user table/keyspace name from ever
 //! colliding with it.
 //!
-//! This module is **inert in PR1** — nothing calls [`entity_key`] yet (no
-//! engine is wired to a `RaftNode`, no `StateMachine::DRIVER_APPLIED` change,
-//! no `node.rs` change). It exists so the key layout can be reviewed and
-//! unit-tested on its own before a later PR in the stack actually writes
-//! through it. [`is_reserved_name`] is the one piece that *is* wired in this
-//! PR, at `Metadata::apply`'s `CreateTableSchema`/`CreateKeyspace` arms and at
-//! both wire edges' `CreateTable`/`CREATE KEYSPACE` paths.
+//! **PR1** left this module inert — nothing called [`entity_key`] yet (no
+//! engine wired to a `RaftNode`, no `StateMachine::DRIVER_APPLIED` change, no
+//! `node.rs` change); only [`is_reserved_name`] was wired, at
+//! `Metadata::apply`'s `CreateTableSchema`/`CreateKeyspace` arms and both wire
+//! edges' `CreateTable`/`CREATE KEYSPACE` paths. **PR2** (`mirror.rs`) is the
+//! first real writer: it derives per-command system-keyspace writes from
+//! these keys and shadow-mirrors them into a `StorageEngine` **after** the
+//! unchanged in-core `Metadata::apply` still runs (`DRIVER_APPLIED` stays
+//! `false` — dual-write, zero behavior change). PR2 also added three
+//! [`EntityKind`] variants (`Counter`/`CpMemberAddr`/`NodeIdAlloc`) this
+//! module's doc covers inline where they're declared.
 //!
 //! ## Key layout
 //!
@@ -76,6 +80,18 @@ pub fn is_reserved_name(name: &str) -> bool {
 
 /// One system-keyspace entity kind (ADR 0038). Each gets its own segment so a
 /// command touches only the keys of the entities it actually mutates.
+///
+/// The last three variants (`Counter`, `CpMemberAddr`, `NodeIdAlloc`) were
+/// added in PR2 alongside the mirror itself (`mirror.rs`) — PR1 only encoded
+/// the seven fields a shadow rebuild can reconstruct without them, but a
+/// **byte-identical** `Metadata` round trip (the differential-oracle test)
+/// also needs `Metadata`'s two monotonic id allocators
+/// (`next_tablet_id`/`next_alloc_id`), the `AllocateNodeId` idempotency ledger
+/// (`node_id_allocations`), and the legacy CP-member address book
+/// (`cp_member_addrs`/`cp_member_tablets`) — so PR2 extends the enum rather
+/// than leaving those fields unmirrored. Additive: every PR1 key a running
+/// system produced still decodes identically (`from_segment` only gained
+/// arms, `as_str` only gained cases).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum EntityKind {
     /// A tablet (`Metadata::tablets`), keyed by [`TabletId`].
@@ -95,6 +111,23 @@ pub enum EntityKind {
     /// A never-pruned merge marker (`Metadata::merged_tablets`), keyed by the
     /// merged-away [`TabletId`].
     Merged,
+    /// A monotonic id-allocator counter (`Metadata::next_tablet_id` /
+    /// `Metadata::next_alloc_id`), keyed by a fixed ASCII counter name (PR2:
+    /// `mirror::NEXT_TABLET_ID_COUNTER` / `mirror::NEXT_ALLOC_ID_COUNTER`).
+    /// Not a per-`MetaCommand` entity — a process-wide scalar — but shaped as
+    /// an ordinary entity key (one segment, one id) rather than a bespoke
+    /// watermark-style key (like [`applied_index_key`]) so a new counter can
+    /// be added later without inventing a third key shape.
+    Counter,
+    /// A legacy CP-group member's address registration
+    /// (`Metadata::cp_member_addrs`/`Metadata::cp_member_tablets`, mutated
+    /// only by the back-compat-only `MetaCommand::RegisterCpAddr`), keyed by
+    /// [`NodeId`] (PR2).
+    CpMemberAddr,
+    /// One `MetaCommand::AllocateNodeId` idempotency-ledger entry
+    /// (`Metadata::node_id_allocations`), keyed by the join attempt's nonce
+    /// string (PR2).
+    NodeIdAlloc,
 }
 
 impl EntityKind {
@@ -109,6 +142,9 @@ impl EntityKind {
             EntityKind::NodeAddrs => "node_addrs",
             EntityKind::Keyspace => "keyspace",
             EntityKind::Merged => "merged",
+            EntityKind::Counter => "counter",
+            EntityKind::CpMemberAddr => "cp_member_addr",
+            EntityKind::NodeIdAlloc => "node_id_alloc",
         }
     }
 
@@ -125,6 +161,9 @@ impl EntityKind {
             b"node_addrs" => EntityKind::NodeAddrs,
             b"keyspace" => EntityKind::Keyspace,
             b"merged" => EntityKind::Merged,
+            b"counter" => EntityKind::Counter,
+            b"cp_member_addr" => EntityKind::CpMemberAddr,
+            b"node_id_alloc" => EntityKind::NodeIdAlloc,
             _ => return None,
         })
     }
@@ -196,6 +235,28 @@ pub fn merged_key(id: TabletId) -> Vec<u8> {
     entity_key(EntityKind::Merged, &id.0.to_be_bytes())
 }
 
+/// A named counter's key under [`EntityKind::Counter`] (PR2). `name` is a
+/// fixed ASCII constant (`mirror::NEXT_TABLET_ID_COUNTER` /
+/// `mirror::NEXT_ALLOC_ID_COUNTER`), not user input.
+#[must_use]
+pub fn counter_key(name: &str) -> Vec<u8> {
+    entity_key(EntityKind::Counter, name.as_bytes())
+}
+
+/// A [`NodeId`]'s key under [`EntityKind::CpMemberAddr`] (PR2, the legacy
+/// `Metadata::cp_member_addrs`/`cp_member_tablets` pair).
+#[must_use]
+pub fn cp_member_addr_key(id: NodeId) -> Vec<u8> {
+    entity_key(EntityKind::CpMemberAddr, &id.to_be_bytes())
+}
+
+/// A join attempt's nonce string's key under [`EntityKind::NodeIdAlloc`]
+/// (PR2, `Metadata::node_id_allocations`).
+#[must_use]
+pub fn node_id_alloc_key(nonce: &str) -> Vec<u8> {
+    entity_key(EntityKind::NodeIdAlloc, nonce.as_bytes())
+}
+
 /// The decoded form of a system-keyspace key ([`decode_key`]'s result).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DecodedKey {
@@ -263,7 +324,7 @@ pub fn decode_key(key: &[u8]) -> Option<DecodedKey> {
 mod tests {
     use super::*;
 
-    const ALL_KINDS: [EntityKind; 7] = [
+    const ALL_KINDS: [EntityKind; 10] = [
         EntityKind::Tablet,
         EntityKind::Member,
         EntityKind::Schema,
@@ -271,6 +332,9 @@ mod tests {
         EntityKind::NodeAddrs,
         EntityKind::Keyspace,
         EntityKind::Merged,
+        EntityKind::Counter,
+        EntityKind::CpMemberAddr,
+        EntityKind::NodeIdAlloc,
     ];
 
     // --- reserved-name guard -------------------------------------------------
@@ -394,6 +458,42 @@ mod tests {
         assert_eq!(
             decode_key(&applied_index_key()),
             Some(DecodedKey::AppliedIndex)
+        );
+    }
+
+    #[test]
+    fn counter_key_round_trips() {
+        let key = counter_key("next_tablet_id");
+        assert_eq!(
+            decode_key(&key),
+            Some(DecodedKey::Entity {
+                kind: EntityKind::Counter,
+                id: b"next_tablet_id".to_vec(),
+            })
+        );
+    }
+
+    #[test]
+    fn cp_member_addr_key_round_trips() {
+        let key = cp_member_addr_key(1301);
+        assert_eq!(
+            decode_key(&key),
+            Some(DecodedKey::Entity {
+                kind: EntityKind::CpMemberAddr,
+                id: 1301u64.to_be_bytes().to_vec(),
+            })
+        );
+    }
+
+    #[test]
+    fn node_id_alloc_key_round_trips() {
+        let key = node_id_alloc_key("join-1");
+        assert_eq!(
+            decode_key(&key),
+            Some(DecodedKey::Entity {
+                kind: EntityKind::NodeIdAlloc,
+                id: b"join-1".to_vec(),
+            })
         );
     }
 

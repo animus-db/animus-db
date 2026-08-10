@@ -487,6 +487,18 @@ const MAX_REPLICATION_FACTOR: usize = 3;
 /// role's data dir and does not create intermediate directories.
 const LSM_PREFIX: &str = "db-";
 
+/// Filename prefix for a **control-only** node's dedicated ADR 0038 PR2
+/// system-keyspace mirror engine, opened on the same `control` `ProdEnv`
+/// directory the control Raft's own `raft.wal` already lives in (a
+/// control-only node has no separate `raftkv` env/dir the way a combined
+/// node does) — distinct from [`LSM_PREFIX`] and from the fixed `raft.wal`
+/// filename, so the two never collide on one directory. `pub` so an
+/// integration test can reopen the same on-disk engine directly (by
+/// constructing its own `ProdEnv` over the same directory) to verify it
+/// survives a real process restart, without `animusd` needing to expose the
+/// live mirror handle itself.
+pub const SYSKV_LSM_PREFIX: &str = "syskv-";
+
 /// Which storage engine backs a node's CP group.
 ///
 /// The default, [`StorageBackend::Lsm`], is the durable on-disk
@@ -1239,7 +1251,30 @@ impl BoundNode {
             StorageBackend::Memory => SharedEngine::Mem(MemoryEngine::new()),
         };
 
-        let raft = RaftNode::start(self.control_env, control_ids.clone());
+        // Attach the ADR 0038 PR2 shadow-mode system-keyspace mirror using
+        // this **same already-open shared engine**: mirrored keys are already
+        // globally namespaced under `syskv::RESERVED_NAMESPACE` (PR1's
+        // reserved-name rejection guarantees no user table/keyspace can ever
+        // collide with it), so no `StorageScope` wrapper is needed the way a
+        // per-tablet CP group needs one — this is a genuinely global,
+        // node-wide keyspace, not a per-tenant slice of one. Zero behavior
+        // change: the real in-core `Metadata::apply` this node serves
+        // reads/writes from is untouched.
+        let control_metrics = self.control_env.metrics();
+        let raft = match &storage {
+            SharedEngine::Lsm(lsm) => RaftNode::start_with_mirror(
+                self.control_env,
+                control_ids.clone(),
+                control_metrics,
+                lsm.clone(),
+            ),
+            SharedEngine::Mem(mem) => RaftNode::start_with_mirror(
+                self.control_env,
+                control_ids.clone(),
+                control_metrics,
+                mem.clone(),
+            ),
+        };
         // Register this node's control handle in this **node's own**
         // `ClusterEdgeState` (ADR 0013/ADR 0031 PR2 — edge state is always
         // per-node, in `--cluster N` exactly as in one-process-per-node), so
@@ -1968,6 +2003,67 @@ impl BoundControlNode {
         client_route: BTreeMap<NodeId, SocketAddr>,
         cluster_admin_addrs: Vec<SocketAddr>,
     ) -> Node {
+        // `mirror_backend: None` never opens an engine, so this can never
+        // actually hit the `Err` path `start_control_with_opts` otherwise
+        // has to support for `start_control_with_mirror`'s benefit — keeping
+        // this method's signature (and its callers, incl.
+        // `tests/control_membership_admin.rs`) byte-for-byte unchanged.
+        match self
+            .start_control_with_opts(peers, control_ids, client_route, cluster_admin_addrs, None)
+            .await
+        {
+            Ok(node) => node,
+            Err(_) => {
+                unreachable!("start_control_with attaches no mirror engine, so it cannot fail")
+            }
+        }
+    }
+
+    /// Like [`start_control_with`](Self::start_control_with), but also opens
+    /// a **dedicated** ADR 0038 PR2 system-keyspace mirror engine
+    /// (`backend`-selected: [`StorageBackend::Lsm`] durable by default,
+    /// [`StorageBackend::Memory`] under `--ephemeral`) on this node's own
+    /// `control` `ProdEnv` directory — a control-only node has no separate
+    /// `raftkv` env/dir the way a combined node's [`BoundNode::start_with`]
+    /// does, so unlike that method (which reuses the node's already-open
+    /// *shared* engine), this one provisions a small engine just for the
+    /// mirror. Attaches it via [`RaftNode::start_with_mirror`]; zero
+    /// behavior change otherwise (shadow mode).
+    ///
+    /// # Errors
+    /// Propagates a failure to open the dedicated mirror engine (LSM backend
+    /// only).
+    pub async fn start_control_with_mirror(
+        self,
+        peers: BTreeMap<NodeId, SocketAddr>,
+        control_ids: Vec<NodeId>,
+        client_route: BTreeMap<NodeId, SocketAddr>,
+        cluster_admin_addrs: Vec<SocketAddr>,
+        backend: StorageBackend,
+    ) -> std::io::Result<Node> {
+        self.start_control_with_opts(
+            peers,
+            control_ids,
+            client_route,
+            cluster_admin_addrs,
+            Some(backend),
+        )
+        .await
+    }
+
+    /// Shared body behind [`start_control_with`](Self::start_control_with) /
+    /// [`start_control_with_mirror`](Self::start_control_with_mirror) —
+    /// `mirror_backend: None` reproduces `start_control_with`'s original,
+    /// never-fails behavior exactly; `Some(backend)` additionally opens and
+    /// attaches the mirror engine described on that method.
+    async fn start_control_with_opts(
+        self,
+        peers: BTreeMap<NodeId, SocketAddr>,
+        control_ids: Vec<NodeId>,
+        client_route: BTreeMap<NodeId, SocketAddr>,
+        cluster_admin_addrs: Vec<SocketAddr>,
+        mirror_backend: Option<StorageBackend>,
+    ) -> std::io::Result<Node> {
         self.control_env.set_peers(peers.clone());
         let envs = vec![self.control_env.clone()];
 
@@ -1991,7 +2087,40 @@ impl BoundControlNode {
             auto_split_bytes_threshold: None,
         });
 
-        let raft = RaftNode::start(self.control_env, control_ids.clone());
+        let raft = match mirror_backend {
+            None => RaftNode::start(self.control_env, control_ids.clone()),
+            Some(backend) => {
+                let control_metrics = self.control_env.metrics();
+                // A control-only node has only its own `control` env/dir to
+                // open a dedicated engine on (no separate `raftkv` env the
+                // way combined mode reuses) — clone it for the engine, keep
+                // the original for the `RaftNode` itself.
+                let mirror_env = self.control_env.clone();
+                match backend {
+                    StorageBackend::Lsm => {
+                        match LsmEngine::open(mirror_env, SYSKV_LSM_PREFIX).await {
+                            Ok(lsm) => RaftNode::start_with_mirror(
+                                self.control_env,
+                                control_ids.clone(),
+                                control_metrics,
+                                lsm,
+                            ),
+                            Err(e) => {
+                                return Err(std::io::Error::other(format!(
+                                    "opening the control-only node's system-keyspace mirror engine: {e}"
+                                )));
+                            }
+                        }
+                    }
+                    StorageBackend::Memory => RaftNode::start_with_mirror(
+                        self.control_env,
+                        control_ids.clone(),
+                        control_metrics,
+                        MemoryEngine::new(),
+                    ),
+                }
+            }
+        };
         // A fresh, node-local edge state (ADR 0031 PR2 doctrine — every node
         // gets its own, never shared); it stays permanently empty of CP group
         // handles (`raftkv`) since this node hosts none, but `register_control`
@@ -2028,7 +2157,7 @@ impl BoundControlNode {
         // does (both hold a genuine `ControlHandle::Local`).
         tasks.push(tokio::spawn(control_peer_sync_loop(ctx.clone())));
 
-        Node {
+        Ok(Node {
             raft: ControlHandle::Local(raft),
             envs,
             tasks,
@@ -2037,7 +2166,7 @@ impl BoundControlNode {
             dynamo_addr: None,
             cql_addr: None,
             admin_addr: self.admin_addr,
-        }
+        })
     }
 }
 
@@ -6286,8 +6415,13 @@ pub async fn run_node_with(
 /// plus the client + admin listeners, and runs only the control [`RaftNode`]
 /// (its own `reconcile_loop`/`detect_loop`) plus the tail every node shape
 /// shares (`route_sync_loop`/`metrics_sample_loop`/self-registration/
-/// `serve_clients`/admin `serve`, via [`BoundControlNode::start_control_with`])
-/// — no storage engine, no `raftkv` env, no DynamoDB/CQL listeners.
+/// `serve_clients`/admin `serve`, via
+/// [`BoundControlNode::start_control_with_mirror`]) — no CP data storage
+/// engine, no `raftkv` env, no DynamoDB/CQL listeners. `backend` (ADR 0038
+/// PR2) selects the **dedicated** system-keyspace mirror engine this control-
+/// only node now provisions (`StorageBackend::Lsm` durable by default,
+/// `::Memory` under `--ephemeral`) — shadow mode, zero behavior change to
+/// anything this node actually serves.
 ///
 /// `config`'s control-role entries (`ClusterConfig::control_ids`) are this
 /// node's control-plane voter set — `index` must be one of them. `config` may
@@ -6299,11 +6433,13 @@ pub async fn run_node_with(
 ///
 /// # Errors
 /// Returns `InvalidInput` if `index` is out of range or does not run the
-/// control role, or propagates a bind failure.
+/// control role, or propagates a bind failure or a mirror-engine-open
+/// failure.
 pub async fn run_node_control(
     config: &ClusterConfig,
     index: usize,
     dir: impl Into<PathBuf>,
+    backend: StorageBackend,
 ) -> std::io::Result<Node> {
     let addrs = *config.nodes.get(index).ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "node index out of range")
@@ -6336,14 +6472,15 @@ pub async fn run_node_control(
     // nodes alike).
     let admin_addrs: Vec<SocketAddr> = config.nodes.iter().map(|n| n.admin).collect();
 
-    Ok(bound
-        .start_control_with(
+    bound
+        .start_control_with_mirror(
             config.control_peer_book(),
             config.control_ids(),
             client_route,
             admin_addrs,
+            backend,
         )
-        .await)
+        .await
 }
 
 /// Start node `index` from `config` as a **data-only** node (ADR 0035 PR4,

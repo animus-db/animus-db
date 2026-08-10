@@ -719,7 +719,7 @@ async fn bring_up_split_durable(
         let mut data_nodes = Vec::new();
         let mut failed = false;
         for (i, d) in control_dirs.iter().enumerate() {
-            match animusd::run_node_control(&config, i, d).await {
+            match animusd::run_node_control(&config, i, d, StorageBackend::Lsm).await {
                 Ok(n) => control_nodes.push(n),
                 Err(_) => {
                     failed = true;
@@ -776,7 +776,7 @@ const RESTART_REBIND_TIMEOUT: Duration = Duration::from_secs(60);
 async fn restart_control(config: &ClusterConfig, index: usize, dir: &Path) -> Node {
     let deadline = tokio::time::Instant::now() + RESTART_REBIND_TIMEOUT;
     loop {
-        match animusd::run_node_control(config, index, dir).await {
+        match animusd::run_node_control(config, index, dir, StorageBackend::Lsm).await {
             Ok(n) => return n,
             Err(e) => {
                 if tokio::time::Instant::now() >= deadline {

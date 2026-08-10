@@ -103,9 +103,15 @@ Three shapes, all built from the same role assemblies:
 - **Combined** — every node runs both roles. `--cluster N` (one process) or
   `--config FILE --node I` (one process per node), against a `Both`-role config.
   `Node::bind` → `BoundNode::start_with`.
-- **Control-only** — a small static metadata quorum, no storage engine, no data
-  role. `animusd control --config FILE --node I`. `Node::bind_control` →
-  `BoundControlNode::start_control_with`; has real local control Raft.
+- **Control-only** — a small static metadata quorum, no CP **data** storage
+  engine, no data role. `animusd control --config FILE --node I`.
+  `Node::bind_control` → `BoundControlNode::start_control_with_mirror` (which
+  `start_control_with` now delegates to with no mirror attached, keeping its
+  own signature unchanged); has real local control Raft. It does provision
+  one small **dedicated** engine of its own (ADR 0038 PR2): a shadow-mode
+  system-keyspace mirror of `Metadata`, `StorageBackend::Lsm` by default —
+  see `animus-control/CLAUDE.md`'s `mirror.rs` entry. Zero behavior change;
+  nothing reads from it yet.
 - **Data-only** — no local control `RaftCore` at all; `Metadata` comes from a
   polled/long-polled mirror of a separately-deployed control plane via
   `ControlHandle::Remote`. `animusd data --config FILE --node I` (or `data
