@@ -180,6 +180,23 @@ async fn control_only_cluster_elects_leader_and_serves_status() {
                 config_view["addrs"]["cql"].is_null(),
                 "a control-only node's cql listener is never bound: {config_view}"
             );
+
+            // ADR 0038 PR4: a control-only node unconditionally provisions
+            // its own dedicated system-keyspace engine (the durable home of
+            // the apply task's published `Metadata` cache) — unlike every
+            // other `/admin/storage/*` route (all keyed on a hosted CP
+            // tablet group, which a control-only node never has), this one
+            // is available here.
+            let (s, ctl_storage) = admin_get(node.admin_addr(), "/admin/storage/control").await;
+            assert_eq!(s, 200, "admin/storage/control on {}", node.admin_addr());
+            assert_eq!(
+                ctl_storage["available"], true,
+                "a control-only node has its own dedicated system-keyspace engine: {ctl_storage}"
+            );
+            assert_eq!(
+                ctl_storage["backend"], "lsm",
+                "bring_up_control uses the durable default backend: {ctl_storage}"
+            );
         }
 
         // No data members were ever registered — the placement reconciler

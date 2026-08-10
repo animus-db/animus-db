@@ -200,6 +200,30 @@ async fn split_cluster_serves_reads_and_writes_across_data_nodes() {
                 health["is_control_leader"], false,
                 "a data-only node never leads the control plane: {health}"
             );
+
+            // ADR 0038 PR4: a data-only node has no local control role at
+            // all (`ControlHandle::Remote`), so it has no system-keyspace
+            // engine to surface here — a plain, honest "not available",
+            // never a 404 (mirrors every other `/admin/storage/*` route's
+            // absence-is-data shape).
+            let (status, ctl_storage) = admin_get(n.admin_addr(), "/admin/storage/control").await;
+            assert_eq!(status, 200, "admin/storage/control on {}", n.admin_addr());
+            assert_eq!(
+                ctl_storage["available"], false,
+                "a data-only node has no local control-plane engine: {ctl_storage}"
+            );
+        }
+        // The dual, on the control-only side of the same split deployment:
+        // each control node's own dedicated system-keyspace engine is
+        // available (control_only.rs covers this in more depth; asserted
+        // here too since this fixture is the genuine-split-deployment one).
+        for n in &control_nodes {
+            let (status, ctl_storage) = admin_get(n.admin_addr(), "/admin/storage/control").await;
+            assert_eq!(status, 200, "admin/storage/control on {}", n.admin_addr());
+            assert_eq!(
+                ctl_storage["available"], true,
+                "a control-only node has its own dedicated system-keyspace engine: {ctl_storage}"
+            );
         }
         timeout(Duration::from_secs(20), async {
             loop {

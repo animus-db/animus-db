@@ -26,7 +26,11 @@ use std::time::Duration;
 use animus_control::mirror::rebuild_metadata_from_engine;
 use animus_env::{NodeId, ProdEnv};
 use animus_storage::LsmEngine;
-use animusd::{ClientRequest, ClientResponse, MetaCommand, Node, NodeStatus, read_frame};
+use animus_tablet::{KeyRange, TabletId};
+use animusd::{
+    ClientRequest, ClientResponse, ColumnType, MetaCommand, Node, NodeStatus, TableSchema,
+    read_frame,
+};
 use tempfile::TempDir;
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
@@ -190,4 +194,125 @@ async fn control_only_mirror_engine_survives_a_real_process_restart() {
         mirrored_after, reference_after,
         "mirror engine should survive the restart with consistent, caught-up content"
     );
+}
+
+/// ADR 0038 PR4: the sibling of the test above, widened from `members` alone
+/// to the **full replicated-metadata shape** the plan's restart matrix calls
+/// out explicitly — the schema catalog and the tablet map, not just
+/// membership — over the exact same real-`ProdEnv`-restart, dedicated-engine
+/// path. A control-only node hosts no CP tablet group itself, but its own
+/// control plane still owns the authoritative tablet *map* (placement
+/// metadata), so this proposes a `CreateTableSchema` and a `CreateTablet`
+/// alongside an `UpsertMember`, then proves all three survive a **hard**
+/// restart (`shutdown_and_wait`, no `flush()` — the restart recovers from
+/// whatever the real Raft WAL + system-keyspace engine already made durable
+/// on their own schedule, not from a clean-teardown flush), both through the
+/// restarted node's own `metadata()` and through an entirely separate
+/// `LsmEngine` handle reopened over the same directory.
+#[tokio::test(flavor = "multi_thread")]
+async fn control_only_schema_and_tablet_map_survive_a_hard_restart() {
+    let dir = TempDir::new().unwrap();
+    let node_dir = dir.path().join("node-0");
+    let addrs = animusd::RoleAddrs {
+        role: animusd::config::NodeRole::Control,
+        control: Some(free_addr()),
+        client: free_addr(),
+        dynamo: free_addr(),
+        cql: free_addr(),
+        raftkv: None,
+        admin: free_addr(),
+    };
+
+    let table = "ctl_meta_t";
+    let tablet = TabletId(4242);
+
+    // --- First incarnation: propose membership + schema + a tablet, then a
+    // hard (non-graceful) shutdown. ---
+    let node = start(addrs, &node_dir).await;
+    await_leader(&node).await;
+    propose_and_await(&node, addrs.client, upsert(7, NodeStatus::Down)).await;
+
+    let create_schema = MetaCommand::CreateTableSchema {
+        table: table.to_string(),
+        schema: TableSchema::simple("id", ColumnType::String),
+    };
+    let resp = call(addrs.client, ClientRequest::ProposeSchema(create_schema)).await;
+    assert!(matches!(resp, ClientResponse::PutOk));
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if node.metadata().has_table_schema(table) {
+                return;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("schema did not land in 10s");
+
+    let create_tablet = MetaCommand::CreateTablet {
+        tablet,
+        table: Some(table.to_string()),
+        range: KeyRange::whole(),
+        replicas: vec![300],
+    };
+    let resp = call(addrs.client, ClientRequest::ProposeSchema(create_tablet)).await;
+    assert!(matches!(resp, ClientResponse::PutOk));
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if node.metadata().tablets.contains_key(&tablet) {
+                return;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("tablet did not land in 10s");
+
+    // Let the apply task's engine merge catch up, then a genuinely **hard**
+    // shutdown — `shutdown_and_wait` still hard-`abort()`s every task (no
+    // `RaftNode::flush()` call), it only additionally waits for the abort to
+    // finish unwinding so the immediate rebind below doesn't race this same
+    // process's own not-yet-freed listener ports (the documented
+    // `AddrInUse` flake, see `docs/engineering-lessons.md`) — durability
+    // itself still comes entirely from whatever the Raft WAL/engine already
+    // made durable on their own schedule, exactly what a real `kill`+restart
+    // would exercise.
+    sleep(Duration::from_millis(500)).await;
+    node.shutdown_and_wait().await;
+
+    let mirrored_before = read_mirror_from_disk(&node_dir).await;
+    assert!(
+        mirrored_before.members.contains_key(&7),
+        "engine should hold the pre-restart member"
+    );
+    assert!(
+        mirrored_before.has_table_schema(table),
+        "engine should hold the pre-restart schema"
+    );
+    assert!(
+        mirrored_before.tablets.contains_key(&tablet),
+        "engine should hold the pre-restart tablet"
+    );
+
+    // --- Second incarnation: same directory, same addresses — the DEDICATED
+    // system-keyspace engine path (a control-only node has no separate
+    // `raftkv` engine to fall back on). ---
+    let node = start(addrs, &node_dir).await;
+    await_leader(&node).await;
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let meta = node.metadata();
+            if meta.members.contains_key(&7)
+                && meta.has_table_schema(table)
+                && meta.tablets.contains_key(&tablet)
+            {
+                return;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("restarted node did not recover the full pre-restart metadata shape in 10s");
+
+    node.shutdown_and_wait().await;
 }

@@ -216,6 +216,20 @@ async fn admin_interface_surfaces_state_and_actions() {
             "WAL has at least one live segment: {wal}"
         );
 
+        // ---- /admin/storage/control (ADR 0038 PR4) -------------------------
+        // A combined node has a `ControlHandle::Local` control role, so its
+        // own control-plane system-keyspace engine is available — the exact
+        // same physical shared engine `/admin/raftkv`'s hosted tablet above
+        // also reports on (`Metadata` just lives at a reserved key prefix
+        // within it, ADR 0038), so the backend agrees.
+        let (s, ctl_storage) = admin_get(admin_addr, "/admin/storage/control").await;
+        assert_eq!(s, 200);
+        assert_eq!(
+            ctl_storage["available"], true,
+            "a combined node has a local control-plane system-keyspace engine: {ctl_storage}"
+        );
+        assert_eq!(ctl_storage["backend"], "lsm");
+
         // ---- /admin/metrics ------------------------------------------------
         // Metrics are per-node sinks (a follower's leader-only counters are 0), so
         // every node exposes the full counter set as JSON, and the *control
