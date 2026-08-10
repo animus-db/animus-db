@@ -370,6 +370,13 @@ fn print_response(response: &ClientResponse) {
             println!("client route: {client_route:?}");
             println!("admin addrs: {admin_addrs:?}");
         }
+        // Cluster-allocated member id (ADR 0036): consumed programmatically
+        // by `animusd join`/`data --seed`'s no-`--node` startup path, not
+        // requested by any CLI subcommand of its own — printed raw if one
+        // ever surfaces here (mirroring `JoinInfo` above).
+        ClientResponse::NodeIdAllocated { node } => {
+            println!("allocated node id: {node}");
+        }
     }
 }
 

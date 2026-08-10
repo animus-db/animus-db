@@ -75,14 +75,26 @@ can't reach: `split_fence_tests` (lib.rs:6452) and `auto_split_median_tests`
 | `--config FILE --node I [--dir DIR] [--ephemeral]` | run node I of a config, combined mode (one process per node) |
 | `--cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B]` | run an N-node combined cluster in one process (dev) |
 | `--cluster-control N --cluster-data M [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B]` | run a whole split deployment in one process (dev, ADR 0035) |
-| `join --seed ADDR[,ADDR...] --node I [--ip A] [--base-port P] [--dir D] [--ephemeral]` | combined-mode seed/join startup (ADR 0032 PR2) |
+| `join --seed ADDR[,ADDR...] [--node I] [--ip A] [--base-port P] [--dir D] [--ephemeral]` | combined-mode seed/join startup (ADR 0032 PR2; `--node` omitted → ADR 0036 cluster-allocated id) |
 | `control --config FILE --node I [--dir DIR]` | run node I as a control-only node (ADR 0035 PR3) |
 | `data --config FILE --node I [--dir DIR] [--ephemeral]` | run node I as a data-only node (ADR 0035 PR4) |
-| `data --seed ADDR[,ADDR...] --node I [--ip A] [--base-port P] [--dir D] [--ephemeral]` | data-only seed/join (ADR 0035 PR5) |
+| `data --seed ADDR[,ADDR...] [--node I] [--ip A] [--base-port P] [--dir D] [--ephemeral]` | data-only seed/join (ADR 0035 PR5; `--node` omitted → ADR 0036 cluster-allocated id) |
 
 `--auto-split K` (key count) and `--auto-split-bytes B` (byte size) are
 independent OR-gated triggers — either, both, or neither. `join`/`data --seed`
-derive six consecutive ports from `--base-port` (default `7100 + 6*I`).
+derive six consecutive ports from `--base-port` (default `7100 + 6*I`) when
+`--node I` is given. **`--node I` is optional on `join`/`data --seed`** (ADR
+0036): omit it to have the control plane mint this node's id atomically from
+its own `MetaCommand::AllocateNodeId` monotonic allocator instead of an
+operator picking `I` — but then `--base-port` is **required** (an allocated
+id is not a small index, so there's no `7100 + 6*I` to fall back to) and the
+join is **ephemeral-identity**: a restart with a fresh dir gets a *new*
+allocated id, and the old id's `Member` entry lingers `Down`/address-less
+forever (never reused, prunable later via the existing `RemoveMember`/
+decommission path). `--node I`'s durable, restart-stable identity is
+unaffected — this is purely additive (`run_node_join_allocated`/
+`run_node_data_join_allocated` in `lib.rs`, alongside the untouched
+`run_node_join`/`run_node_data_join`).
 
 ## Deployment shapes (ADR 0035)
 
@@ -392,6 +404,20 @@ route below the edge through the same `ClientCtx` CP primitives.
   leadership *before* any metadata-dependent refusal (a follower's replica lags).
   Not a fence — a restarted process at the same raftkv id rejoins like a fresh
   join.
+- **Cluster-allocated member ids (ADR 0036)** live in a disjoint id range
+  (`animus_control::meta::ALLOC_ID_BASE = 1_000_000`, far above
+  `config::RAFTKV_ID_BASE = 300`) so an allocated id can never collide with an
+  operator-chosen `--node I` id — see `MetaCommand::AllocateNodeId`'s doc in
+  `animus-control` for the allocator itself. `config::synthetic_control_id_for`
+  (`raftkv_id | (1 << 63)`) derives a combined-mode allocated join's *local,
+  non-replicated* placeholder control id from its freshly minted raftkv id
+  (there's no small operator index to derive one from, unlike `control_id
+  (index)`) — never written to `Metadata`, never dialed by another process,
+  purely a structurally-safe permanent-non-voter placeholder exactly like a
+  `--node`-indexed join's real control id serves. `is_relayable_command`
+  (below) must allow `AllocateNodeId` — a joining process has no local
+  control role at all yet, so it is that process's *only* way to reach the
+  real leader.
 - **The CP group is durable by default** — one shared `LsmEngine` over the raftkv
   env, cloned into every tablet's `RaftKvNode`; acked writes survive restart. Files
   use a flat filename prefix (`LSM_PREFIX = "db-"`), not a subdirectory (`ProdEnv`'s

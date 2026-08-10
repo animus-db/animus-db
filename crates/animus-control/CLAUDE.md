@@ -69,6 +69,16 @@ per-tablet CP data plane (`animus-cp-data`).
     already (idempotent), `Leaving`/`Down` (never `Active`/`Joining`), and
     unreferenced by any tablet (`Metadata::tablets_referencing`, also the
     drain-complete predicate `/admin/member/drain-status` reports).
+  - `AllocateNodeId` (ADR 0036) — atomically mint a fresh member id from the
+    `ALLOC_ID_BASE`-disjoint monotonic allocator (`Metadata.next_alloc_id`)
+    and register it `Down` with the given labels, no address yet. Idempotent
+    on `nonce` (`Metadata.node_id_allocations: BTreeMap<String, NodeId>`, the
+    idempotency ledger) — a proposer retry with the same nonce is a `NoOp`
+    that returns the identical, already-minted id, never a second one. No
+    epoch-CAS needed: uniqueness comes from the same monotonic-floor-plus-
+    presence-check discipline `SplitTablet`'s allocator guard already uses
+    for tablet ids. `Metadata::next_free_alloc_id` is this allocator's
+    `next_free_tablet_id` analogue.
 
 - **`raft.rs`** — `RaftCore<C, S>`: the synchronous, I/O-free Raft state
   machine, **generic over its command `C` and applied state-machine `S`**

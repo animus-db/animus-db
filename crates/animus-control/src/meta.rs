@@ -16,6 +16,19 @@ use serde::{Deserialize, Serialize};
 
 use crate::schema::{IndexDef, SchemaCatalog, TableName, TableSchema};
 
+/// The floor of the **cluster-allocated member id** range (ADR 0036):
+/// comfortably above `animusd`'s `RAFTKV_ID_BASE` (300) plus any realistic
+/// manually-configured `--node I` node count, so an id minted by
+/// [`Metadata::next_free_alloc_id`] can never collide with an operator-chosen
+/// `raftkv_id(I) = 300 + I`. This crate has no dependency on `animusd` (the
+/// dependency runs the other way), so the disjointness is documented here in
+/// prose rather than enforced by sharing a constant — the same discipline
+/// already used for [`NodeAddrs::role`]'s plain-`String` vocabulary. Not
+/// enforced at apply time against a real cluster's chosen ids either (ADR
+/// 0036's explicit non-goal): a manually-configured cluster with more than
+/// ~1M nodes is not a realistic scenario this needs to guard against.
+pub const ALLOC_ID_BASE: NodeId = 1_000_000;
+
 /// Lifecycle status of a cluster member.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NodeStatus {
@@ -171,6 +184,38 @@ pub struct Metadata {
     /// set).
     #[serde(default)]
     pub merged_tablets: BTreeSet<TabletId>,
+    /// The next **cluster-allocated member id** to hand out (ADR 0036) — a
+    /// monotonic allocator over the [`ALLOC_ID_BASE`]-disjoint range,
+    /// mirroring [`Metadata::next_tablet_id`]'s discipline exactly: bumped
+    /// past every id [`MetaCommand::AllocateNodeId`] mints, so two
+    /// concurrent allocations can't derive the same id, and a never-reused
+    /// id can't alias a stale, still-`Down`, address-less member entry left
+    /// behind by an abandoned join attempt (see that command's doc).
+    /// `#[serde(default = "default_next_alloc_id")]` keeps a pre-ADR-0036
+    /// snapshot loading at the base rather than `0`, which would otherwise
+    /// collide with (and be rejected below) every operator-chosen id —
+    /// [`Metadata::next_free_alloc_id`] also folds in the highest existing
+    /// allocation, so this is a floor, not the sole source of truth.
+    #[serde(default = "default_next_alloc_id")]
+    pub next_alloc_id: NodeId,
+    /// The **idempotency ledger** for [`MetaCommand::AllocateNodeId`] (ADR
+    /// 0036): every nonce a join attempt has ever proposed, mapped to the id
+    /// it was (or would have been, on a retry) allocated. Bounded by "one
+    /// entry per join attempt ever made" — the same accepted, unbounded-but-
+    /// slow growth already accepted for [`Metadata::merged_tablets`].
+    /// `#[serde(default)]` keeps a pre-ADR-0036 snapshot loading (empty map).
+    #[serde(default)]
+    pub node_id_allocations: BTreeMap<String, NodeId>,
+}
+
+/// [`Metadata::next_alloc_id`]'s missing-field default: [`ALLOC_ID_BASE`],
+/// not `0` — a decoded pre-ADR-0036 snapshot has no allocations yet, so
+/// starting the counter at the base (rather than `0`, which would immediately
+/// collide with real, small operator-chosen ids) is both correct and the
+/// obviously-intended value, mirroring `NodeAddrs::role`'s
+/// historically-accurate-default reasoning.
+fn default_next_alloc_id() -> NodeId {
+    ALLOC_ID_BASE
 }
 
 /// A mutation of [`Metadata`], replicated through Raft and applied in log order.
@@ -365,6 +410,37 @@ pub enum MetaCommand {
     /// raftkv id re-registers and rejoins exactly like a fresh join. The
     /// decommission flow's real last step is stopping the process.
     RemoveMember { node: NodeId },
+    /// **Cluster-allocated member id** (ADR 0036): atomically mint a fresh,
+    /// never-reused member id from the [`ALLOC_ID_BASE`]-disjoint monotonic
+    /// allocator and register it [`Down`](NodeStatus::Down) with `labels` and
+    /// no address yet — the address arrives later via the joiner's own,
+    /// unchanged [`MetaCommand::RegisterNodeAddrs`] self-registration. This
+    /// is the *hard* alternative to an operator picking a `--node I` index by
+    /// hand: uniqueness comes from the same monotonic-floor-plus-presence-
+    /// check discipline [`MetaCommand::SplitTablet`]'s allocator guard
+    /// already uses for tablet ids, evaluated identically on every replica,
+    /// so no epoch-CAS or pre-bind collision check is needed — two proposers
+    /// racing through this command can never both mint the same id.
+    ///
+    /// `nonce` is a **joiner-generated idempotency key**: replaying the same
+    /// nonce (a proposer retry after an `Accepted`-but-unconfirmed propose —
+    /// the durable-before-visible discipline every proposer here must respect,
+    /// root `CLAUDE.md`) applies as a no-op that returns the identical,
+    /// already-allocated id, recorded once in
+    /// [`Metadata::node_id_allocations`] — so a retried join attempt can never
+    /// mint a second id for itself, and a genuinely distinct join attempt
+    /// (a different nonce) always gets a fresh one.
+    ///
+    /// An abandoned join attempt (the process crashes before ever
+    /// self-registering an address) leaves its allocated id `Down` and
+    /// address-less **forever** — this is accepted, not a leak to fix: ids
+    /// are never reused (mirroring tablet ids), and the entry is prunable
+    /// through the existing [`MetaCommand::RemoveMember`] path exactly like
+    /// any other drained, unreferenced member, once an operator notices it.
+    AllocateNodeId {
+        nonce: String,
+        labels: BTreeMap<String, String>,
+    },
 }
 
 /// The deterministic result of applying a [`MetaCommand`].
@@ -897,6 +973,26 @@ impl Metadata {
                 self.cp_member_tablets.remove(node);
                 ApplyOutcome::Applied
             }
+            MetaCommand::AllocateNodeId { nonce, labels } => {
+                if self.node_id_allocations.contains_key(nonce) {
+                    // Idempotent replay of an already-served join attempt
+                    // (same house style as `RegisterNodeAddrs`'s identical-
+                    // input no-op) — the caller re-reads the id from
+                    // `node_id_allocations`, never from this outcome alone.
+                    return ApplyOutcome::NoOp;
+                }
+                let node_id = self.next_free_alloc_id();
+                self.next_alloc_id = node_id + 1;
+                self.node_id_allocations.insert(nonce.clone(), node_id);
+                self.members.insert(
+                    node_id,
+                    Member {
+                        labels: labels.clone(),
+                        status: NodeStatus::Down,
+                    },
+                );
+                ApplyOutcome::Applied
+            }
         }
     }
 
@@ -1013,6 +1109,40 @@ impl Metadata {
     pub fn next_free_tablet_id(&self) -> TabletId {
         let highest = self.tablets.keys().map(|t| t.0).max().unwrap_or(0);
         TabletId(self.next_tablet_id.max(highest + 1).max(1))
+    }
+
+    /// The next cluster-allocated member id a proposer should mint (ADR
+    /// 0036) — the [`ALLOC_ID_BASE`]-range dual of
+    /// [`next_free_tablet_id`](Self::next_free_tablet_id): folds the
+    /// monotonic `next_alloc_id` counter together with the highest id
+    /// already seen in either `members` or `node_id_allocations` (so a
+    /// pre-counter snapshot, or one whose counter somehow lagged a recorded
+    /// allocation, still allocates strictly above every id it has ever
+    /// handed out) and a floor of [`ALLOC_ID_BASE`] itself. Race-safe by
+    /// construction, same as the tablet allocator: [`MetaCommand::
+    /// AllocateNodeId`]'s apply always calls this immediately before
+    /// minting, under the single-threaded state-machine apply, so two
+    /// concurrent proposals are simply applied in some log order — the
+    /// second sees the first's bumped counter.
+    #[must_use]
+    pub fn next_free_alloc_id(&self) -> NodeId {
+        let highest_member = self
+            .members
+            .keys()
+            .copied()
+            .filter(|&id| id >= ALLOC_ID_BASE)
+            .max()
+            .unwrap_or(0);
+        let highest_allocation = self
+            .node_id_allocations
+            .values()
+            .copied()
+            .max()
+            .unwrap_or(0);
+        self.next_alloc_id
+            .max(highest_member + 1)
+            .max(highest_allocation + 1)
+            .max(ALLOC_ID_BASE)
     }
 }
 
@@ -1843,5 +1973,132 @@ mod tests {
         let value = serde_json::to_value(&m).expect("metadata serializes");
         let decoded: Metadata = serde_json::from_value(value).expect("metadata round-trips");
         assert_eq!(decoded, m);
+    }
+
+    /// The cluster-allocated member id allocator (ADR 0036) is monotonic and
+    /// its range is disjoint from every small, manually-configured id (the
+    /// `--node I` convention's `0..RAFTKV_ID_BASE+N`, modeled here by a
+    /// handful of ordinary `UpsertMember`s) — mirroring
+    /// `next_tablet_id_is_monotonic_across_create_and_split`'s coverage for
+    /// the tablet allocator this one is deliberately shaped after.
+    #[test]
+    fn allocate_node_id_is_monotonic_and_disjoint_from_small_manual_ids() {
+        let mut m = Metadata::default();
+        // A handful of ordinary, small manually-configured members —
+        // comfortably inside `0..RAFTKV_ID_BASE+N` for any realistic N.
+        for node in [0u64, 1, 300, 301, 302] {
+            m.apply(&MetaCommand::UpsertMember {
+                node,
+                labels: BTreeMap::new(),
+                status: NodeStatus::Active,
+            });
+        }
+
+        assert_eq!(m.next_free_alloc_id(), ALLOC_ID_BASE);
+        assert_eq!(
+            m.apply(&MetaCommand::AllocateNodeId {
+                nonce: "join-1".to_owned(),
+                labels: BTreeMap::new(),
+            }),
+            ApplyOutcome::Applied
+        );
+        let first = *m.node_id_allocations.get("join-1").expect("recorded");
+        assert_eq!(first, ALLOC_ID_BASE, "first allocation lands at the base");
+        assert!(
+            first > 302,
+            "allocated id must never collide with a small manual id"
+        );
+
+        // A second, distinct join attempt allocates strictly past the first —
+        // the counter never goes backward.
+        assert_eq!(
+            m.apply(&MetaCommand::AllocateNodeId {
+                nonce: "join-2".to_owned(),
+                labels: BTreeMap::new(),
+            }),
+            ApplyOutcome::Applied
+        );
+        let second = *m.node_id_allocations.get("join-2").expect("recorded");
+        assert_eq!(second, first + 1);
+        assert_eq!(m.next_free_alloc_id(), second + 1);
+    }
+
+    /// Replaying the **same nonce** (a proposer retry after an `Accepted`-
+    /// but-unconfirmed propose) is a no-op that returns the identical,
+    /// already-allocated id — never a second one — and mutates nothing else
+    /// (no bump of `next_alloc_id`, no second `members` entry). A genuinely
+    /// **different** nonce always gets a fresh id.
+    #[test]
+    fn allocate_node_id_same_nonce_is_idempotent_distinct_nonces_get_distinct_ids() {
+        let mut m = Metadata::default();
+        let alloc = |nonce: &str| MetaCommand::AllocateNodeId {
+            nonce: nonce.to_owned(),
+            labels: BTreeMap::new(),
+        };
+
+        assert_eq!(m.apply(&alloc("retry-me")), ApplyOutcome::Applied);
+        let id = *m.node_id_allocations.get("retry-me").expect("recorded");
+        let after_first = m.clone();
+
+        // A retry with the same nonce: no-op, identical id, no further
+        // mutation of `Metadata` at all (proposer-observable state is
+        // unchanged, not just the returned id).
+        assert_eq!(m.apply(&alloc("retry-me")), ApplyOutcome::NoOp);
+        assert_eq!(*m.node_id_allocations.get("retry-me").unwrap(), id);
+        assert_eq!(m, after_first, "a same-nonce replay must mutate nothing");
+
+        // A third, distinct nonce still gets a fresh id.
+        assert_eq!(m.apply(&alloc("different-attempt")), ApplyOutcome::Applied);
+        let other = *m
+            .node_id_allocations
+            .get("different-attempt")
+            .expect("recorded");
+        assert_ne!(other, id);
+    }
+
+    /// A successful allocation registers the id in `members` as `Down` with
+    /// the given labels and no address — the address arrives later via the
+    /// joiner's own `RegisterNodeAddrs` self-registration, unchanged.
+    #[test]
+    fn allocate_node_id_registers_the_member_down_with_labels() {
+        let mut m = Metadata::default();
+        let mut labels = BTreeMap::new();
+        labels.insert("region".to_owned(), "eu-west".to_owned());
+
+        assert_eq!(
+            m.apply(&MetaCommand::AllocateNodeId {
+                nonce: "join-1".to_owned(),
+                labels: labels.clone(),
+            }),
+            ApplyOutcome::Applied
+        );
+        let id = *m.node_id_allocations.get("join-1").expect("recorded");
+        let member = m.members.get(&id).expect("member registered");
+        assert_eq!(member.status, NodeStatus::Down);
+        assert_eq!(member.labels, labels);
+        assert!(
+            !m.node_addrs.contains_key(&id),
+            "no address yet — that's a separate, later self-registration"
+        );
+    }
+
+    /// A `Metadata` snapshot serialized before ADR 0036 (no `next_alloc_id`/
+    /// `node_id_allocations` fields in the JSON) still decodes: the counter
+    /// defaults to `ALLOC_ID_BASE` (not `0`, which would immediately collide
+    /// with real small ids) and the ledger defaults to empty — the same
+    /// `#[serde(default)]` back-compat contract every other additive field on
+    /// `Metadata` already carries.
+    #[test]
+    fn metadata_without_alloc_fields_still_decodes_at_the_base() {
+        let m = Metadata::default();
+        let mut value = serde_json::to_value(&m).expect("metadata serializes");
+        let obj = value.as_object_mut().expect("metadata is a JSON object");
+        obj.remove("next_alloc_id");
+        obj.remove("node_id_allocations");
+        let decoded: Metadata =
+            serde_json::from_value(value).expect("metadata without alloc fields still decodes");
+        assert_eq!(decoded.next_alloc_id, ALLOC_ID_BASE);
+        assert!(decoded.node_id_allocations.is_empty());
+        assert_eq!(decoded.next_free_alloc_id(), ALLOC_ID_BASE);
     }
 }

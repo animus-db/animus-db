@@ -32,9 +32,14 @@ animus get    <node-addr> <table> <key>
 - It depends on `animusd` only for the shared protocol types and frame helpers
   (`ClientRequest`/`ClientResponse`, `read_frame`/`write_frame`) — it does
   **not** speak the internal `Network`.
-- `print_response` also handles `ClientResponse::JoinInfo` (ADR 0032): the
-  join-discovery reply `animusd join` consumes at startup — not a CLI
-  subcommand of its own.
+- `print_response` also handles `ClientResponse::JoinInfo` (ADR 0032) and
+  `ClientResponse::NodeIdAllocated` (ADR 0036): the join-discovery and
+  cluster-allocated-id replies `animusd join`/`data --seed` consume at
+  startup — not CLI subcommands of their own. **`ClientResponse` gaining a
+  variant means `print_response`'s `match` stops compiling until it's
+  handled here too** — this is a separate exhaustiveness site from
+  `animusd`'s own `is_relayable_command`/`ClientRequest` dispatch; both need
+  checking whenever either enum grows.
 
 ## Admin subcommand group
 

@@ -41,3 +41,4 @@ relevant ADR (or supersede it) in the same PR as the code change.
 | [0033](0033-tablet-merge.md) | Tablet merge: an operator-driven, control-plane-only dual of split (amends 0029, extends 0031) | Accepted |
 | [0034](0034-byte-based-auto-split.md) | Byte-based auto-split trigger: scoped byte estimate + byte-weighted median (amends 0002, 0028's auto-split loop) | Accepted |
 | [0035](0035-control-plane-separate-deployment.md) | Control plane as a separate deployment: `animusd control` / `animusd data` over a `ControlHandle` seam (amends 0030, 0032) | Implemented — all 6 PRs shipped |
+| [0036](0036-cluster-allocated-member-ids.md) | Cluster-allocated member ids: a monotonic `MetaCommand::AllocateNodeId` allocator, closing 0032's residual join-index race (amends 0032) | Accepted — implemented |

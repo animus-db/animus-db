@@ -53,6 +53,37 @@ pub fn raftkv_id(index: usize) -> NodeId {
     RAFTKV_ID_BASE + index as NodeId
 }
 
+/// A **local, non-replicated** placeholder control id for a combined-mode
+/// **cluster-allocated** join's (ADR 0036) permanent-non-voter control
+/// `RaftCore` — the same structural mechanism ADR 0030 §3 already relies on
+/// for a `--node`-indexed growth/join node (a control id outside
+/// `control_ids` is a structurally safe permanent non-voter that can never
+/// campaign or become a real member; see that ADR's "Non-voter control id"
+/// investigation). An allocated join has no small operator index to derive a
+/// control id from ([`control_id`]) — it only has the fresh **raftkv** id the
+/// cluster's `AllocateNodeId` allocator just minted — so this derives one
+/// from that id instead: setting the top bit of the `u64` [`NodeId`] keeps it
+/// (a) always distinct from this same process's own `raftkv_id` (the
+/// single-consumer-inbox rule every node's two internal roles already
+/// depend on — see the root `CLAUDE.md`'s `Env` gotcha) and (b) never
+/// colliding with a real control id (`0..N`, always far below `1 << 63` for
+/// any realistic cluster). Never written to replicated `Metadata` (no
+/// `MetaCommand` ever carries a control id at all) and never dialed by
+/// another process (a real control voter's peer set is derived from
+/// `control_ids`, which never includes this) — purely a local, in-process
+/// placeholder, exactly like the real `control_id(index)` a `--node`-indexed
+/// join uses for the identical structural purpose.
+///
+/// Assumes [`NodeId`] stays a `u64` and no real id space (control ids,
+/// [`RAFTKV_ID_BASE`]-offset raftkv ids, or
+/// `animus_control::meta::ALLOC_ID_BASE`-offset allocated ids) ever
+/// approaches `2^63` — not enforced, just asserted here in prose, mirroring
+/// `ALLOC_ID_BASE`'s own identical non-goal.
+#[must_use]
+pub fn synthetic_control_id_for(raftkv_id: NodeId) -> NodeId {
+    raftkv_id | (1 << 63)
+}
+
 /// Which role(s) a [`RoleAddrs`] entry runs (ADR 0035).
 ///
 /// `Both` is the default and was, before ADR 0035, the *only* shape every
@@ -432,6 +463,30 @@ mod tests {
         assert_eq!(control_id(2), 2);
         assert_eq!(raftkv_id(0), RAFTKV_ID_BASE);
         assert_eq!(raftkv_id(2), RAFTKV_ID_BASE + 2);
+    }
+
+    /// `synthetic_control_id_for` (ADR 0036) is distinct from its own
+    /// `raftkv_id` and from every realistic real control id, for a
+    /// representative range of allocated raftkv ids (including
+    /// `animus_control::meta::ALLOC_ID_BASE` itself, without depending on
+    /// that crate here).
+    #[test]
+    fn synthetic_control_id_never_collides_with_raftkv_or_real_control_ids() {
+        for raftkv in [1_000_000u64, 1_000_001, 2_000_000, u64::MAX >> 1] {
+            let synthetic = synthetic_control_id_for(raftkv);
+            assert_ne!(
+                synthetic, raftkv,
+                "must differ from this same process's own raftkv id"
+            );
+            assert!(
+                synthetic >= (1 << 63),
+                "must land in the top-bit-set half, never colliding with a \
+                 real control id (0..N)"
+            );
+            for real_control in [0u64, 1, 300, 10_000] {
+                assert_ne!(synthetic, real_control);
+            }
+        }
     }
 
     #[test]
