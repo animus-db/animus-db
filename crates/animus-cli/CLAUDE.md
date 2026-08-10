@@ -64,6 +64,9 @@ drain <admin-addr> <node-id>                   # ADR 0029/0032 release replicas
 drain-status <admin-addr> <node-id>
 remove <admin-addr> <node-id>
 decommission <admin-addr> <node-id>            # composite, see below
+control-add <leader-admin-addr> <node-id> <new-node-admin-addr>      # ADR 0037 PR3
+control-remove <leader-admin-addr> <node-id>                         # ADR 0037 PR3
+control-grow <leader-admin-addr> <node-id> <admin-addr> [<node-id> <admin-addr>...]
 ```
 
 - Metrics/storage views are **per node** (a follower's leader-only counters
@@ -74,6 +77,18 @@ decommission <admin-addr> <node-id>            # composite, see below
   **control-plane leader's** admin address (the underlying admin actions are
   local-leader-only and not relayed); on a follower it fails with a
   "not the control-plane leader" routing error — retry against the leader.
+- **`control-add`/`control-grow` are also orchestration, not passthroughs**
+  (ADR 0037 PR3): they take the new control voter's own **admin** address
+  (this CLI's convention everywhere else), not the internal control-Raft
+  address `POST /admin/control/member/add`'s wire payload actually wants —
+  `run_control_add` bridges the two itself via a `GET /admin/config` against
+  the new node (which doubles as the "confirm it's up" liveness check), then
+  polls the **new node's own** `/admin/control/members` until it reports
+  itself a voter. `control-grow` is a sequential loop of `control-add` calls
+  (one server at a time — `RaftCore::change_membership` never accepts a
+  multi-server delta), each waiting for its own catch-up before the next.
+  `control-add`/`control-remove`/`control-grow` all target the **leader's**
+  admin address, same "not relayed" discipline as `decommission`.
 
 ## Tests
 

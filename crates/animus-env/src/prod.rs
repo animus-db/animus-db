@@ -204,6 +204,42 @@ impl ProdEnv {
         *self.inner.peers.lock().expect("peers poisoned") = peers;
     }
 
+    /// Add or replace a **single** entry in the peer address book, leaving every
+    /// other entry untouched — the incremental dual of [`set_peers`](Self::set_peers),
+    /// which replaces the whole map (there is no `get_peers` to read-modify-write
+    /// around, by design: a full periodic rebuild from a known-good source, as
+    /// `animusd`'s `peer_sync_loop` does for the `raftkv` role, is the intended
+    /// pattern for anything that needs to *converge*).
+    ///
+    /// This exists for a case that pattern doesn't cover: a **control**-role
+    /// voter added at runtime via `RaftCore::change_membership` (ADR 0037) needs
+    /// its address reachable *before* the leader can replicate anything to it,
+    /// and unlike the `raftkv` role, the control role has no periodic peer-sync
+    /// loop (the control group was static before ADR 0037, ADR 0030's scope
+    /// decision). `animusd`'s control-membership admin action calls this on the
+    /// **local leader's** own env immediately after registering the new voter,
+    /// so its very next `AppendEntries`/`InstallSnapshot` has somewhere to go —
+    /// see `ProdEnv::send`'s own doc for what happens to a message with no known
+    /// peer address ("dropped... Raft retries once the address lands").
+    ///
+    /// **Known scope limit (documented, not fixed here):** this updates only
+    /// *this* env's own peer book, i.e. whichever node happens to make the call
+    /// (the leader at the time of the admin action). Another existing voter
+    /// learns the new peer's address only once *it* independently sends to
+    /// (or receives a message identifying) that id through some other path —
+    /// today, only by itself later becoming leader and being handed the same
+    /// admin call, or an operator restarting it with an updated static config.
+    /// A generalized replicated-address + periodic-resync mechanism for the
+    /// control role (mirroring `peer_sync_loop`) is deliberately deferred —
+    /// see the ADR 0037 stack's engineering-lessons entry.
+    pub fn merge_peer(&self, id: NodeId, addr: SocketAddr) {
+        self.inner
+            .peers
+            .lock()
+            .expect("peers poisoned")
+            .insert(id, addr);
+    }
+
     /// Abort every task this env owns — its inbound-connection accept loop and
     /// everything spawned through [`Spawner::spawn`] — so the node can be torn
     /// down cleanly and its listener port freed for a restart. Idempotent; once
@@ -1147,6 +1183,50 @@ mod tests {
         b2.shutdown();
         let _ = std::fs::remove_dir_all(&dir_a);
         let _ = std::fs::remove_dir_all(&dir_b);
+    }
+
+    /// `merge_peer` adds a reachable entry without disturbing any other
+    /// existing entry (ADR 0037) — the incremental dual of `set_peers`'s full
+    /// replace. Binds three envs: `a` starts with a peer book containing only
+    /// `b`, then `merge_peer`s in `c` — `a` must now be able to reach *both*
+    /// `b` (untouched) and `c` (newly added), never just one.
+    #[tokio::test]
+    async fn merge_peer_adds_one_entry_without_disturbing_others() {
+        use crate::Network;
+
+        let dir_a = unique_tmp_dir();
+        let dir_b = unique_tmp_dir();
+        let dir_c = unique_tmp_dir();
+        let (a, b, _b_addr) = bound_pair(&dir_a, &dir_b).await;
+        let loop0 = "127.0.0.1:0".parse::<SocketAddr>().unwrap();
+        let (c, c_addr) = ProdEnv::bind(2, loop0, &dir_c).await.expect("bind c");
+
+        // Before merging, `a` has no route to `c` at all — a send is simply
+        // dropped (see `Network::send`'s doc), not an error.
+        a.send(2, b"too-early".to_vec()).await;
+
+        a.merge_peer(2, c_addr);
+
+        // The pre-existing entry for `b` still works...
+        a.send(1, b"still-reachable".to_vec()).await;
+        let env = tokio::time::timeout(Duration::from_secs(10), b.recv())
+            .await
+            .expect("recv from b timed out");
+        assert_eq!(env.payload, b"still-reachable");
+
+        // ...and the newly merged entry for `c` now works too.
+        a.send(2, b"newly-reachable".to_vec()).await;
+        let env = tokio::time::timeout(Duration::from_secs(10), c.recv())
+            .await
+            .expect("recv from c timed out");
+        assert_eq!(env.payload, b"newly-reachable");
+
+        a.shutdown();
+        b.shutdown();
+        c.shutdown();
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+        let _ = std::fs::remove_dir_all(&dir_c);
     }
 
     /// Durability smoke test for the directory-fsync paths: `replace` (rename +

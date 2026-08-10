@@ -340,9 +340,10 @@ route below the edge through the same `ClientCtx` CP primitives.
   content-addressed (FNV-1a of the text).
 - **Admin / debug** (`admin.rs`, `RoleAddrs.admin`, ADR 0020) — read-only `GET`
   views (`/admin/{config,status,peers,raft,raftkv,storage/*,metrics,metrics/
-  history,member/drain-status,health}`) + gated `POST` actions (`/admin/{tablet/
-  split,tablet/merge,storage/flush,storage/compact,raftkv/reconfigure,drain,
-  member/add,member/remove}`) + data writes (`/admin/data/{dynamo,cql,drop-table,
+  history,member/drain-status,health,control/members}`) + gated `POST` actions
+  (`/admin/{tablet/split,tablet/merge,storage/flush,storage/compact,raftkv/
+  reconfigure,drain,member/add,member/remove,control/member/add,control/
+  member/remove}`) + data writes (`/admin/data/{dynamo,cql,drop-table,
   seed}`). Below the edge it only reads node state (aggregated live per request) or
   drives a gated action. **No auth — bind to a trusted interface.** The `animus
   admin` CLI consumes it. The bulk seeder (`action_data_seed`) writes real
@@ -444,6 +445,39 @@ route below the edge through the same `ClientCtx` CP primitives.
   (below) must allow `AllocateNodeId` — a joining process has no local
   control role at all yet, so it is that process's *only* way to reach the
   real leader.
+- **Control-plane membership change (ADR 0037 PR3)**: `ClientCtx::
+  admin_add_control_member`/`admin_remove_control_member` (`lib.rs`, near
+  `admin_add_member`/`admin_remove_member`) grow/shrink the control group's
+  *live* `RaftCore` config at runtime — local-control-leader-only, **not**
+  relayed, **not** in `is_relayable_command` (the underlying primitive is
+  `RaftNode::change_membership`, not a `MetaCommand` proposal, so there is no
+  meaningful "relay" shape for it — only a genuine control-group voter's own
+  in-process handle can call it). `POST /admin/control/member/{add,remove}` +
+  `GET /admin/control/members` in `admin.rs`; `animus admin
+  control-{add,remove,grow}` in `animus-cli`. Add takes an **operator-
+  supplied** id below `animus_control::meta::ALLOC_ID_BASE` (the ADR 0036
+  allocator is not wired into this path — a stopgap, flagged as future work)
+  and the new voter's **internal control-Raft** address (distinct from its
+  admin/client/raftkv ports — `animus admin control-add` resolves it from the
+  new node's own `/admin/config` so the operator only ever deals in admin
+  addresses). **Known scope limit**: making a freshly-added voter actually
+  *reachable* needed `ProdEnv::merge_peer` (a new incremental peer-book
+  update, since the control role never had `peer_sync_loop`'s per-tick
+  static-∪-replicated overlay the `raftkv` role has) — called only on the
+  **local leader's own** env, so a *later* leader (after a subsequent
+  transfer or crash) has no path to independently rediscover that address;
+  see `animus-env/CLAUDE.md`'s `merge_peer` entry and
+  `docs/engineering-lessons.md`'s "Code patterns" entry on this gap.
+  Remove's quorum-loss warning (down to 1 voter) is the only implemented
+  trigger — the plan's second trigger ("every other voter believed Down")
+  was dropped: `ControlHandle::believes_alive` is keyed to **raftkv** ids
+  (see the "cluster's members are the raftkv ids, not the control ids"
+  gotcha above), so calling it with a control id is always `false`, not
+  "unknown" — see the engineering-lessons "id-space mismatch" entry.
+  Removing the current leader's own slot arms a `transfer_leadership` and
+  returns the same not-leader refusal every other case here uses (never a
+  silent success) rather than trying to complete the removal itself once it
+  has stepped down.
 - **The CP group is durable by default** — one shared `LsmEngine` over the raftkv
   env, cloned into every tablet's `RaftKvNode`; acked writes survive restart. Files
   use a flat filename prefix (`LSM_PREFIX = "db-"`), not a subdirectory (`ProdEnv`'s
@@ -492,6 +526,15 @@ Test-file map (`tests/`):
 - `cluster_growth.rs` — 3→5 online growth without restarting the original 3.
 - `seed_join.rs` — combined-mode seed/join (happy/collision/rejoin).
 - `decommission.rs` — full drain → remove flow + refusal shapes.
+- `control_membership_admin.rs` — control-plane membership-change admin API
+  (ADR 0037 PR3): grow a control voter end to end (quiet non-voter →
+  `POST /admin/control/member/add` → converges everywhere incl. a data-only
+  node's `Remote` mirror); add collision refusals (existing voter is
+  idempotent, existing member/`ALLOC_ID_BASE` are refused); remove's full
+  refusal/warning matrix (idempotent unknown-node no-op, non-leader voter
+  removes cleanly, leader self-removal arms a transfer and refuses rather
+  than silently completing, down-to-1-voter warns, down-to-0 is refused);
+  both mutating actions refuse on a follower (not relayable).
 - `cp_plane.rs` — CP round-trip (write one node, read another) + write latency.
 - `cp_cross_process.rs` — cross-process forwarding to the leader's node.
 - `cp_reconfigure.rs` — failure detection, group-follows-replica-set, auto-repair.

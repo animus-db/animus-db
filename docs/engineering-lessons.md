@@ -787,8 +787,69 @@ debugging anything that feels like it might have happened before.
   logic bug your change introduced, and the fix (if any) belongs in that
   test's real-time budget/CI parallelism, not in the unrelated change you're
   landing.
+- **A real leadership-transfer end-to-end test (`transfer_leadership` +
+  `TimeoutNow` over real `ProdEnv`/tokio) must poll-and-retry the *whole
+  operation* against "whoever is leader now", not assert a single
+  deterministic hand-off to a pre-picked target.** Writing the ADR 0037 PR3
+  self-removal test (leader removes its own control-voter slot, which arms a
+  transfer to the other remaining voter first), a first draft asserted
+  "exactly one specific other node becomes leader within N seconds" and hit a
+  real, reproducible stall under `cargo test`'s real scheduling: the old
+  leader's own step-down (satisfying the *server-side* 5s poll inside the
+  admin action) and the *test's* separate poll for "some other node is now
+  leader" can straddle a transient flip-flop (the target wins via
+  `TimeoutNow`, but the old leader's election timer also fires and it wins a
+  subsequent term back) that a 100ms-granularity poll can miss entirely,
+  leaving the test waiting on a leader identity that already changed again.
+  The robust shape (and the more realistic one — this is what an operator's
+  own retry already has to do) is a bounded loop that re-checks who is
+  currently leader among the surviving voters on every iteration and retries
+  the mutating call there, rather than snapshotting a target once. See
+  `crates/animusd/tests/control_membership_admin.rs::
+  remove_control_voter_refusals_transfer_and_quorum_warnings`.
+- **A failure-detector/liveness accessor keyed to one id space (raftkv ids)
+  will silently return a wrong-but-plausible answer if called with an id
+  from a *different* id space (control ids) — it never panics, it just lies.**
+  `ControlHandle::believes_alive`/the underlying `FailureDetector` only ever
+  observes heartbeats from **raftkv** ids (`heartbeat_loop` runs on the data
+  role only, ADR 0012); calling it with a **control** id (as a first draft of
+  the ADR 0037 PR3 quorum-loss warning did, checking "are all other control
+  voters believed Down") returns `false` unconditionally for every control
+  id, not "unknown" — so the warning fired on *every* removal, not just the
+  risky ones, and a naive test would have "passed" by coincidence (the
+  warning was expected on the specific case being tested) while being wrong
+  in general. Caught by testing the *negative* case too (a removal that
+  should carry no warning) and getting one anyway. The fix was to drop the
+  liveness-based trigger entirely rather than bridge id spaces by convention
+  (`RAFTKV_ID_BASE + control_id` is a *naming* convention for combined-mode,
+  not a structural guarantee for an operator-chosen or control-only id) —
+  when there is no real signal in the id space you actually have, don't
+  guess one from a different id space's accessor just because it type-checks.
 
 ### Code patterns
+- **A per-role internal `Env` peer address book (`ProdEnv::set_peers`) that
+  is only ever installed once, at process bring-up, from static config has no
+  path for a peer added *after* bring-up to become reachable — even once a
+  higher-level replicated membership change (e.g. `RaftCore::
+  change_membership`) accepts it.** The `raftkv` role already has this solved
+  generically (`animusd::peer_sync_loop`, a periodic static-base ∪
+  replicated-`Metadata.node_addrs[*].raftkv`-overlay rebuild); the **control**
+  role never needed it before ADR 0037 because the control group was static
+  (ADR 0030's scope decision) — so implementing "add a control voter at
+  runtime" (PR3 of the ADR 0037 stack) rediscovered the same class of gap
+  `ProdEnv::send`'s own doc already anticipates ("an unknown peer is just
+  another way the message is dropped... Raft retries once the address
+  lands" — but only if *something* makes the address land). Scoped down for
+  PR3 to a narrower, still-correct fix rather than porting the full
+  `peer_sync_loop` pattern to the control role: a new `ProdEnv::merge_peer`
+  (add one entry without replacing the whole book) called by the admin
+  action on the **local leader's own** env only, immediately before
+  `change_membership` — sufficient for the leader to replicate to a freshly
+  added voter, but *not* for a different, later leader (after a subsequent
+  transfer/crash) to independently rediscover that voter's address; that
+  gap is named, not silently left for a future maintainer to rediscover the
+  hard way. See `crates/animus-env/src/prod.rs::ProdEnv::merge_peer`'s doc
+  and `ClientCtx::admin_add_control_member`'s doc (`animusd`).
 - **Converting a required address field with an ephemeral-fallback default
   (`SocketAddr` + `#[serde(default = "default_ephemeral_addr")]`) to
   `Option<SocketAddr>` and reusing a bare `#[serde(default)]` silently changes
@@ -2333,3 +2394,27 @@ debugging anything that feels like it might have happened before.
 - **Tell agents to keep public signatures stable** when a sibling depends on them
   (additive changes only), and to **stop-and-report rather than loop** on a
   transient API error.
+- **A worktree-isolated agent must never `cd` into the main checkout — even
+  once, even to "just look."** The harness already starts the agent's Bash
+  tool in its own worktree's directory; a `cd /path/to/main/checkout && ...`
+  prefix is pure reflex (muscle memory from non-worktree sessions), not
+  something the task ever required, and every subsequent command in that
+  shell then runs — and, if the agent commits, *commits* — against the
+  user's real local `main`, not the isolated branch it was supposed to be
+  building. This happened once in the ADR 0037 stack (a prior agent's stray
+  commit landed on the user's main and had to be found and dealt with
+  separately from the actual PR work). The correct discipline is simpler
+  than remembering not to `cd`: never construct a command with a `cd`
+  prefix pointing outside the current working directory at all — if a path
+  needs to be absolute, write the absolute path directly into the command
+  (`git -C "$(pwd)" ...` or, more simply, no `-C`/`cd` at all, since the
+  tool's cwd is already correct) rather than reaching for `cd first-dir &&`.
+  Separately: a tool that reads files by absolute path (e.g. `Read`) is
+  **not** guaranteed to be worktree-scoped the way the Bash tool's cwd is —
+  hardcoding the *main checkout's* path (as opposed to the assigned
+  worktree's path) in a `Read`/`Edit` call silently reads/writes the wrong
+  copy with no error (for `Read`) or a clear refusal (for `Edit`/`Write`,
+  which do check). Confirm `git rev-parse --show-toplevel` once at the start
+  of a session and reuse *that* prefix for every absolute path, rather than
+  assuming the repo's conventional root path is the same as the assigned
+  worktree.
