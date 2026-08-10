@@ -91,7 +91,20 @@ per-tablet CP data plane (`animus-cp-data`).
   `start_with_metrics` lets a sim test supply the sink. Read-only state
   accessors (`role`/`term`/`leader`/`is_leader`/`commit_index`/`last_applied`/
   `durable_index`/`snapshot_index`/`log_len`/`last_log_index`/`config`) back the
-  `animusd` admin interface (ADR 0020). `metadata_watch() -> MetadataWatch` (ADR
+  `animusd` admin interface (ADR 0020). **`change_membership`/
+  `transfer_leadership`** (ADR 0036 PR1, `tests/control_membership.rs`) are
+  thin wrappers over the identical-shaped `RaftCore` methods `animus-cp-data`
+  already drives for a per-tablet group — the control plane's *own* Raft
+  group can now grow/shrink/replace a voter one server at a time, recorded
+  under their own `ControlReconfigureAccepted`/`Rejected` metric family
+  (kept separate from cp-data's per-tablet `CpReconfigureAccepted`/
+  `Rejected`). Unlike cp-data's `propose_and_wake`, there is no propose-side
+  wake seam here — `RaftNode`'s plain `propose` has never had one either, so
+  a control-plane proposal (including a membership change) is always
+  serviced on the driver's next heartbeat tick; no seam was added to keep
+  this PR a pure thin-wrapper addition. No admin/CLI surface yet — that is a
+  later PR in the stack; this crate only has the primitive + core-level
+  tests so far. `metadata_watch() -> MetadataWatch` (ADR
   0031) is the executor-agnostic "applied index advanced" notification the
   per-node CP reconciler uses to react to a `Metadata` change without polling.
 

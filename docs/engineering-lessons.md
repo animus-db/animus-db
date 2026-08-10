@@ -755,6 +755,38 @@ debugging anything that feels like it might have happened before.
   their very first run and stayed stable across 5+ isolated re-runs plus
   repeated full-file runs — no product bug surfaced (the fences/reconciler
   work ADR 0028/0031/0033 already built handled the crossover correctly).
+- **A single-server `change_membership` delta is computed against the
+  *current* config, not the original one — so a second growth step must add
+  relative to the config the first step already produced, never restate the
+  original set with one more id swapped in.** Writing
+  `animus-control/tests/control_membership.rs`'s "gate reopens after commit"
+  case (PR1 of the control-plane membership-change stack), growing
+  `{0,1,2} -> {0,1,2,3}` and then, after it committed, trying
+  `{0,1,2,3} -> {0,1,2,4}` (drop 3, add 4) was rejected as a *multi-server*
+  delta (`symmetric_difference` = `{3,4}`, count 2) — correct behavior, wrong
+  test expectation. The fix was `{0,1,2,3} -> {0,1,2,3,4}` (append, don't
+  swap). `RaftCore::change_membership`'s `delta != 1` check is symmetric
+  difference against `self.config` (whatever the latest log entry set it
+  to), never the group's *original* `all_nodes` — a caller chaining several
+  growth/shrink steps must always diff against the *current* `config()`
+  right before each call, not a value computed once up front.
+- **A real `#[tokio::test(multi_thread)]` ProdEnv liveness test (`animus-
+  control/tests/prod_liveness.rs::large_metadata_catch_up_stays_live`) can
+  fail under `cargo test --workspace`'s full parallel run while passing
+  instantly (both before and after the same code change) in isolation
+  (`cargo test -p animus-control --test prod_liveness`) — pure CPU/thread
+  contention from dozens of concurrently-running test binaries starving its
+  real-time catch-up budget, not a regression.** Confirmed by running the
+  isolated binary against both the working tree and a `git stash`-clean
+  checkout of the same commit: both pass in ~2s solo. Per the root
+  `CLAUDE.md`'s "a flaky ProdEnv test is a real bug, don't bump the
+  timeout" rule, the right response to a `--workspace`-only failure in a
+  test that is unrelated to your diff is to **reproduce it in isolation
+  first** — if it's solid alone (and, ideally, also solid alone on the
+  pre-change commit), it's machine-load flakiness in the *harness*, not a
+  logic bug your change introduced, and the fix (if any) belongs in that
+  test's real-time budget/CI parallelism, not in the unrelated change you're
+  landing.
 
 ### Code patterns
 - **Converting a required address field with an ephemeral-fallback default
