@@ -38,6 +38,19 @@ the production implementation; the deterministic implementation lives in
   warning).
 - `Network::send` is fire-and-forget (no delivery result); `recv` is
   **single-consumer per node** — never run two receive loops on one `NodeId`.
+- **`ProdEnv::merge_peer(id, addr)` (ADR 0037 PR3) adds/replaces a single peer
+  entry without disturbing the rest of the book** — the incremental dual of
+  `set_peers`'s full replace, with no `get_peers` to read-modify-write around
+  by design (a full periodic rebuild from a known-good source, like
+  `animusd::peer_sync_loop` does for the `raftkv` role, is the intended
+  pattern for anything that needs to *converge*; `merge_peer` is for a
+  one-off "make this one id reachable right now" case that has no such loop
+  yet — the control role, whose peer book was never touched after bring-up
+  before this PR since the control group was static, ADR 0030). Known scope
+  limit, deliberately not solved here: it updates only the calling env's own
+  book, so another node only learns the new peer's address once *it*
+  independently exercises some other path (see the call site's doc for
+  specifics).
 - **`ProdEnv` pools one outbound TCP connection per destination *address***
   (`TCP_NODELAY` set) instead of dialing per message — a Raft heartbeat no
   longer pays a handshake. Frames (`[from: u64][len: u32][payload]`) are

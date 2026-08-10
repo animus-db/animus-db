@@ -46,7 +46,10 @@ const ADMIN_USAGE: &str = "  admin <subcommand> <admin-addr> [args]:\n    \
     drain <admin-addr> <node-id>\n    \
     drain-status <admin-addr> <node-id>\n    \
     remove <admin-addr> <node-id>\n    \
-    decommission <admin-addr> <node-id>";
+    decommission <admin-addr> <node-id>\n    \
+    control-add <leader-admin-addr> <node-id> <new-node-admin-addr>\n    \
+    control-remove <leader-admin-addr> <node-id>\n    \
+    control-grow <leader-admin-addr> <node-id> <admin-addr> [<node-id> <admin-addr>...]";
 
 async fn run(args: &[String]) -> Result<(), String> {
     let cmd = args.first().map(String::as_str).ok_or("missing command")?;
@@ -116,6 +119,36 @@ async fn run_admin(args: &[String]) -> Result<(), String> {
     if sub == "decommission" {
         let node = arg(2).ok_or("decommission needs <node-id>")?;
         return run_decommission(addr, node).await;
+    }
+
+    // `control-add`/`control-remove`/`control-grow` (ADR 0037 PR3) are the
+    // control-plane-membership counterparts of `decommission`: multi-step
+    // orchestration (an address lookup + a catch-up poll, or a sequential
+    // one-at-a-time loop), not a single request/response, so they too are
+    // handled before the generic one-shot dispatch below.
+    if sub == "control-add" {
+        let node: u64 = arg(2)
+            .ok_or("control-add needs <node-id>")?
+            .parse()
+            .map_err(|_| "node id must be a number")?;
+        let new_node_admin_addr = arg(3).ok_or("control-add needs <new-node-admin-addr>")?;
+        return run_control_add(addr, node, new_node_admin_addr).await;
+    }
+    if sub == "control-remove" {
+        let node: u64 = arg(2)
+            .ok_or("control-remove needs <node-id>")?
+            .parse()
+            .map_err(|_| "node id must be a number")?;
+        return run_control_remove(addr, node).await;
+    }
+    if sub == "control-grow" {
+        let pairs = &args[2..];
+        if pairs.is_empty() || !pairs.len().is_multiple_of(2) {
+            return Err(
+                "control-grow needs one or more <node-id> <new-node-admin-addr> pairs".into(),
+            );
+        }
+        return run_control_grow(addr, pairs).await;
     }
 
     let (method, path, body): (&str, String, Option<String>) = match sub {
@@ -274,6 +307,117 @@ async fn run_decommission(addr: &str, node: &str) -> Result<(), String> {
         return Err(format!("remove failed (HTTP {status}): {resp}"));
     }
     println!("node {node} removed; safe to stop the process");
+    Ok(())
+}
+
+/// `animus admin control-add <leader-admin-addr> <node-id> <new-node-admin-addr>`
+/// (ADR 0037 PR3): grow the control group by one voter. This CLI speaks in
+/// **admin** addresses everywhere else, so `<new-node-admin-addr>` is that —
+/// not the internal control-Raft address `POST /admin/control/member/add`'s
+/// wire payload actually wants. This resolves the difference itself: a `GET
+/// /admin/config` against the new node's own admin port doubles as the
+/// "confirm it's up" liveness check the runbook wants and yields its
+/// `control` address, which then goes into the add request to the **leader**.
+/// Finally polls the **new node's own** `/admin/control/members` until it
+/// reports itself a voter — mirroring `run_decommission`'s
+/// poll-to-convergence shape (bounded, no fixed sleep-and-hope).
+async fn run_control_add(
+    leader_admin_addr: &str,
+    node: u64,
+    new_node_admin_addr: &str,
+) -> Result<(), String> {
+    let (status, resp) = http_call(new_node_admin_addr, "GET", "/admin/config", None).await?;
+    if !(200..300).contains(&status) {
+        return Err(format!(
+            "could not reach the new node's admin port {new_node_admin_addr} \
+             (HTTP {status}): {resp}"
+        ));
+    }
+    let cfg: serde_json::Value = serde_json::from_str(&resp)
+        .map_err(|e| format!("malformed /admin/config response: {e}"))?;
+    let control_addr = cfg["control"].as_str().ok_or(
+        "the new node's /admin/config has no `control` address \
+         (is it a control-role or combined-mode node?)",
+    )?;
+
+    let body = serde_json::json!({"node": node, "addr": control_addr}).to_string();
+    let (status, resp) = http_call(
+        leader_admin_addr,
+        "POST",
+        "/admin/control/member/add",
+        Some(body),
+    )
+    .await?;
+    if !(200..300).contains(&status) {
+        return Err(format!("control/member/add failed (HTTP {status}): {resp}"));
+    }
+    println!("added control voter {node} ({control_addr}); waiting for it to catch up...");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let (status, resp) = http_call(new_node_admin_addr, "GET", "/admin/control/members", None)
+            .await
+            .unwrap_or((0, String::new()));
+        if status == 200
+            && let Ok(v) = serde_json::from_str::<serde_json::Value>(&resp)
+            && v["voters"]
+                .as_array()
+                .is_some_and(|vs| vs.iter().any(|x| x.as_u64() == Some(node)))
+        {
+            println!("node {node} is now a control voter");
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "node {node} did not report itself a control voter within 60s"
+            ));
+        }
+        sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// `animus admin control-remove <leader-admin-addr> <node-id>` (ADR 0037
+/// PR3): a thin wrap over `POST /admin/control/member/remove`, printing the
+/// server's `warning` field (ADR 0037 §2's deliberately-allowed-but-risky
+/// quorum-loss cases) to stderr rather than swallowing it — mirroring
+/// `remove`'s existing print-then-check-status shape.
+async fn run_control_remove(leader_admin_addr: &str, node: u64) -> Result<(), String> {
+    let body = serde_json::json!({"node": node}).to_string();
+    let (status, resp) = http_call(
+        leader_admin_addr,
+        "POST",
+        "/admin/control/member/remove",
+        Some(body),
+    )
+    .await?;
+    println!("{resp}");
+    if !(200..300).contains(&status) {
+        return Err(format!("control/member/remove failed (HTTP {status})"));
+    }
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&resp)
+        && let Some(w) = v["warning"].as_str()
+    {
+        eprintln!("warning: {w}");
+    }
+    Ok(())
+}
+
+/// `animus admin control-grow <leader-admin-addr> <node-id> <new-node-admin-addr>
+/// [<node-id> <new-node-admin-addr>...]` (ADR 0037 PR3): the "3→5" composite —
+/// `RaftCore::change_membership` is single-server-at-a-time (ADR 0017 C), so
+/// growing by more than one voter is a **sequential** loop of
+/// [`run_control_add`] calls, each waiting for its own catch-up before the
+/// next is even proposed (a second concurrent change would be rejected as
+/// "already in flight" anyway). `pairs` is `args[2..]`, already validated
+/// non-empty and even-length by the caller.
+async fn run_control_grow(leader_admin_addr: &str, pairs: &[String]) -> Result<(), String> {
+    for chunk in pairs.chunks(2) {
+        let node: u64 = chunk[0]
+            .parse()
+            .map_err(|_| "node id must be a number".to_string())?;
+        let new_node_admin_addr = &chunk[1];
+        run_control_add(leader_admin_addr, node, new_node_admin_addr).await?;
+    }
     Ok(())
 }
 

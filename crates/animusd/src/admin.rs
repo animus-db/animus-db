@@ -42,6 +42,9 @@
 //! - `POST /admin/drain`               — `{node}`
 //! - `POST /admin/member/add`          — `{node, labels?}` — online growth (ADR 0030)
 //! - `POST /admin/member/remove`       — `{node}` — decommission (ADR 0032 PR3)
+//! - `GET  /admin/control/members`     — live control-plane voters + address book (ADR 0037 PR3)
+//! - `POST /admin/control/member/add`    — `{node, addr}` — grow the control group (ADR 0037 PR3)
+//! - `POST /admin/control/member/remove` — `{node}` — shrink the control group (ADR 0037 PR3)
 //! - `POST /admin/data/dynamo`         — run a DynamoDB op `{op, payload}` (ADR 0021)
 //! - `POST /admin/data/cql`            — run CQL `{query, keyspace?}` (ADR 0021)
 //! - `POST /admin/data/drop-table`     — drop a table's schema `{table}` (ADR 0021)
@@ -272,6 +275,13 @@ async fn dispatch(ctx: &ClientCtx, request: &http::HttpRequest) -> (u16, String)
         ("POST", "/admin/drain") => action_drain(ctx, &request.body),
         ("POST", "/admin/member/add") => action_add_member(ctx, &request.body).await,
         ("POST", "/admin/member/remove") => action_remove_member(ctx, &request.body),
+        ("GET", "/admin/control/members") => (200, control_members_view(ctx)),
+        ("POST", "/admin/control/member/add") => {
+            action_add_control_member(ctx, &request.body).await
+        }
+        ("POST", "/admin/control/member/remove") => {
+            action_remove_control_member(ctx, &request.body).await
+        }
         ("POST", "/admin/data/dynamo") => action_data_dynamo(ctx, &request.body).await,
         ("POST", "/admin/data/cql") => action_data_cql(ctx, &request.body).await,
         ("POST", "/admin/data/drop-table") => action_drop_table(ctx, &request.body).await,
@@ -725,6 +735,23 @@ struct AddMemberReq {
     labels: BTreeMap<String, String>,
 }
 
+/// `POST /admin/control/member/add` request body (ADR 0037 PR3): `node` is an
+/// **operator-supplied** control-plane voter id (below `ALLOC_ID_BASE` —
+/// see `ClientCtx::admin_add_control_member`'s doc); `addr` is that node's
+/// internal control-Raft listen address, not its admin/client address.
+#[derive(Deserialize)]
+struct AddControlMemberReq {
+    node: NodeId,
+    addr: std::net::SocketAddr,
+}
+
+/// `POST /admin/control/member/remove` request body (ADR 0037 PR3): `node` is
+/// the control-plane voter id to remove.
+#[derive(Deserialize)]
+struct RemoveControlMemberReq {
+    node: NodeId,
+}
+
 async fn action_split(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
     let req: SplitReq = match parse_body(body) {
         Ok(r) => r,
@@ -911,6 +938,68 @@ async fn action_add_member(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
     match ctx.admin_add_member(req.node, req.labels).await {
         Ok(()) => (200, json!({"ok": true, "node": req.node})),
         Err(e) => (504, json!({"error": e})),
+    }
+}
+
+/// `GET /admin/control/members` (ADR 0037 PR3) — the live control-plane voter
+/// set plus the replicated address book, read-only and served on **any**
+/// node (unlike the two mutating actions below, this is a plain view — a
+/// `Remote`/data-only node answers honestly off the last `Status`/
+/// `WatchMetadata` reply it observed, per `ControlHandle::config`'s doc).
+/// `voters` is `null`, not `[]`, if this handle has never observed a voter set
+/// at all (a `Remote` handle before its first sync) — the same "unknown vs.
+/// genuinely empty" distinction `ControlHandle::config()`'s `Option` exists
+/// to preserve; `/admin/raft`'s `voters` field predates that distinction and
+/// stays an always-empty-list default for back-compat, but this new view has
+/// no back-compat constraint to honor. The poll target for "has my
+/// `control/member/add` committed / caught up" — `animus admin control-add`
+/// polls this (via `ControlHandle::config` observed on the **new node's own**
+/// admin port) until it reports itself a voter.
+fn control_members_view(ctx: &ClientCtx) -> Value {
+    let addrs = ctx.effective_metadata().node_addrs;
+    json!({
+        "voters": ctx.control.config().map(|v| v.into_iter().collect::<Vec<_>>()),
+        "addrs": addrs,
+    })
+}
+
+/// `POST /admin/control/member/add {node, addr}` — grow the control group by
+/// one voter (ADR 0037 PR3). **Local-control-leader-only, not relayed** — see
+/// [`crate::ClientCtx::admin_add_control_member`]'s doc for the full
+/// rationale and the collision/idempotence rules. `addr` is the new voter's
+/// **internal control-Raft** listen address (distinct from its admin/client/
+/// raftkv ports) — `animus admin control-add` resolves it from the new
+/// node's own `/admin/config` before calling this.
+async fn action_add_control_member(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
+    let req: AddControlMemberReq = match parse_body(body) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    match ctx.admin_add_control_member(req.node, req.addr) {
+        Ok(()) => (200, json!({"ok": true, "node": req.node})),
+        Err(e) => (409, json!({"error": e})),
+    }
+}
+
+/// `POST /admin/control/member/remove {node}` — shrink the control group by
+/// one voter (ADR 0037 PR3). **Local-control-leader-only, not relayed** — see
+/// [`crate::ClientCtx::admin_remove_control_member`]'s doc for the quorum-loss
+/// warning policy and the leader-self-removal transfer flow. A successful
+/// removal's `warning` field is `null` in the ordinary case, or a non-empty
+/// string for the deliberately-allowed-but-risky quorum-loss cases (ADR 0037
+/// §2) — surfaced here, never swallowed, so `animus admin control-remove`
+/// can print it.
+async fn action_remove_control_member(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
+    let req: RemoveControlMemberReq = match parse_body(body) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    match ctx.admin_remove_control_member(req.node).await {
+        Ok(outcome) => (
+            200,
+            json!({"ok": true, "node": req.node, "warning": outcome.warning}),
+        ),
+        Err(e) => (409, json!({"error": e})),
     }
 }
 

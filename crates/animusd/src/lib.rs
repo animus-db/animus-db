@@ -52,6 +52,7 @@ mod topology;
 
 use control_handle::{ControlHandle, RemoteControlClient};
 
+use animus_control::meta::ALLOC_ID_BASE;
 use animus_control::node::heartbeat_loop;
 use animus_control::{PlacementPolicy, ProposeResult, RaftNode};
 use animus_cp_data::RaftKvNode;
@@ -4218,6 +4219,241 @@ impl ClientCtx {
             }
         }
     }
+
+    /// **Admin action (ADR 0037 PR3): add a control-plane voter.**
+    ///
+    /// Local-control-leader-only, deliberately **not** relayed (unlike
+    /// [`admin_add_member`](Self::admin_add_member)'s data-plane counterpart) —
+    /// a brand-new control node has no established control-group peer at all
+    /// yet, so there is no meaningful "relay from the new node itself" case;
+    /// the *operator* calling this must already know a reachable control
+    /// leader, the same discipline [`admin_drain`](Self::admin_drain)/
+    /// [`admin_remove_member`](Self::admin_remove_member) already hold to. Not
+    /// added to [`is_relayable_command`] for the same reason: this isn't even
+    /// a `MetaCommand` proposal at the top level — the actual membership
+    /// change is `RaftNode::change_membership`, a distinct method only a
+    /// genuine control-group voter's own in-process handle can call.
+    ///
+    /// `node` is an **operator-supplied** id (ADR 0036's cluster-allocated
+    /// allocator is not wired into this path — see the module doc below for
+    /// why, and the note on switching to it as future work), checked against
+    /// three collision surfaces before ever touching Raft: (1) already a live
+    /// control voter (`self.control.config()`) — idempotent success, not an
+    /// error, mirroring `admin_add_member`'s "already registered" no-op; (2)
+    /// already claimed by *any* existing member — raftkv id, cluster-core
+    /// control id, or a previously cluster-allocated id (`Metadata::members`,
+    /// which `MetaCommand::AllocateNodeId`'s apply always populates too, so
+    /// this one check covers both) — refused, since a control voter and a
+    /// data-plane/other member must never share a numeric identity; (3) at or
+    /// above [`ALLOC_ID_BASE`] — refused outright, keeping the operator-chosen
+    /// range and the allocator's own disjoint range structurally non-
+    /// overlapping in both directions (the allocator already never dips below
+    /// its base; this is the missing other half).
+    ///
+    /// Two steps, honestly partial on a failure between them (mirroring
+    /// [`admin_add_member`]'s "both-or-honest-partial-state" idempotence,
+    /// since a retry of this whole call is always safe): (a) proposes a
+    /// bookkeeping [`MetaCommand::RegisterNodeAddrs`] — merged into whatever
+    /// address-book entry already exists for `node` (e.g. from the new
+    /// process's own self-registration at startup) rather than blindly
+    /// overwritten, so a real `client`/`admin` address a self-registration
+    /// already recorded is never clobbered by this call's own more limited
+    /// view — proposed directly on the local leader handle (not relayed:
+    /// we already require being the leader to get this far); (b) merges
+    /// `addr` into the **local leader's own** `ProdEnv` peer book
+    /// ([`animus_env::ProdEnv::merge_peer`]) so its very next
+    /// `AppendEntries`/`InstallSnapshot` to `node` has somewhere to go, then
+    /// (c) calls `change_membership` to actually add the voter. See
+    /// `ProdEnv::merge_peer`'s doc for the known scope limit this leaves (only
+    /// *this* env's peer book is updated — a later leadership change needs
+    /// its own follow-up, deliberately deferred out of this PR).
+    pub(crate) fn admin_add_control_member(
+        &self,
+        node: NodeId,
+        addr: SocketAddr,
+    ) -> Result<(), String> {
+        if node >= ALLOC_ID_BASE {
+            return Err(format!(
+                "node {node} is at or above the cluster-allocated id range \
+                 (ALLOC_ID_BASE = {ALLOC_ID_BASE}); an operator-supplied control \
+                 voter id must stay below it"
+            ));
+        }
+        let Some(leader) = self.edge.leader_handle() else {
+            return Err(self.not_leader_error());
+        };
+        let current = self.control.config().unwrap_or_default();
+        if current.contains(&node) {
+            // Idempotent: already a voter. Still worth refreshing the local
+            // peer-book entry in case `addr` changed (e.g. a replacement
+            // process at the same id) — cheap and harmless either way.
+            leader.env().merge_peer(node, addr);
+            return Ok(());
+        }
+        let meta = self.control.metadata_cached();
+        if meta.members.contains_key(&node) {
+            return Err(format!(
+                "node {node} already exists as a cluster member (data-plane, \
+                 control-core, or previously allocated); pick a different id"
+            ));
+        }
+        let addrs = meta.node_addrs.get(&node).cloned().unwrap_or(NodeAddrs {
+            raftkv: String::new(),
+            client: String::new(),
+            admin: String::new(),
+            role: "control".to_string(),
+        });
+        match leader.propose(MetaCommand::RegisterNodeAddrs { node, addrs }) {
+            ProposeResult::Accepted { .. } => {}
+            ProposeResult::NotLeader { .. } => {
+                return Err("control leadership moved; retry on the leader".into());
+            }
+        }
+        leader.env().merge_peer(node, addr);
+        let mut voters = current;
+        voters.insert(node);
+        match leader.change_membership(voters) {
+            ProposeResult::Accepted { .. } => Ok(()),
+            ProposeResult::NotLeader { .. } => Err(
+                "control leadership moved, or a membership change is already in \
+                 flight; the address book was updated (retry-safe) but the voter \
+                 was not added — retry on the leader"
+                    .into(),
+            ),
+        }
+    }
+
+    /// **Admin action (ADR 0037 PR3): remove a control-plane voter.**
+    ///
+    /// Local-control-leader-only, not relayed — same rationale as
+    /// [`admin_add_control_member`](Self::admin_add_control_member).
+    ///
+    /// Refusals, before ever touching Raft:
+    /// - `node` is not currently a live voter (`self.control.config()`):
+    ///   idempotent success (mirrors [`admin_remove_member`]'s idempotent
+    ///   philosophy for an already-absent member).
+    /// - removing `node` would leave **zero** voters (`current.len() <= 1`):
+    ///   refused outright — there is no admin action that can recover a
+    ///   control group with no voters at all.
+    ///
+    /// **Quorum-loss policy (ADR 0037 §2, a deliberate decision, not a TODO):**
+    /// a removal that leaves exactly **one** voter (no fault tolerance) still
+    /// **proceeds** — Raft itself tolerates it — but the success carries a
+    /// non-empty `warning` the caller (admin.rs, the CLI) must surface, never
+    /// silently swallow.
+    ///
+    /// The plan's second warning trigger — "every *other* remaining voter is
+    /// currently marked Down" — is **deliberately not implemented as
+    /// `ControlHandle::believes_alive`**, which is the wrong id space: the
+    /// failure detector only ever observes heartbeats keyed by **raftkv**
+    /// ids (`heartbeat_loop` runs only on the data role, ADR 0012 — see the
+    /// root `CLAUDE.md`'s "cluster's members are the raftkv ids, not the
+    /// control ids" gotcha), so `believes_alive(control_id)` is always
+    /// `false` for a genuine control voter — permanently "believed dead" for
+    /// reasons that have nothing to do with actual liveness, which would
+    /// make this warning fire unconditionally rather than only when it is
+    /// actually informative. A combined-mode voter's paired raftkv id
+    /// (`RAFTKV_ID_BASE + control_id`) is only a *naming convention*, not a
+    /// structural guarantee for an id an operator chose freely at
+    /// `control-add` time, so bridging id spaces here would be guessing, not
+    /// reading a real signal. Left as follow-up work if a real per-control-
+    /// voter liveness signal is added later (see
+    /// `docs/engineering-lessons.md`).
+    ///
+    /// **Removing the current leader's own slot** needs a leadership transfer
+    /// first (`RaftCore::change_membership` always rejects leader self-
+    /// removal) — this method arms one to another live voter and polls
+    /// (bounded by [`CONTROL_TRANSFER_POLL_TIMEOUT`]) for this node to step
+    /// down. On success it does **not** silently retry the removal itself —
+    /// once this node has stepped down it may no longer be the leader of
+    /// *any* process reachable from this call, so it returns the same
+    /// familiar "control leadership moved; retry on the leader" refusal every
+    /// other not-leader case here already uses (now proactively triggered
+    /// rather than discovered), telling the caller exactly what
+    /// `admin_remove_member`'s not-leader case already tells them: retry
+    /// against the leader (now a different node). A transfer that never
+    /// completes in time surfaces as its own, distinct timeout error.
+    pub(crate) async fn admin_remove_control_member(
+        &self,
+        node: NodeId,
+    ) -> Result<ControlRemoveOutcome, String> {
+        let Some(leader) = self.edge.leader_handle() else {
+            return Err(self.not_leader_error());
+        };
+        let my_id = leader.env().node_id();
+        let current = self.control.config().unwrap_or_default();
+        if !current.contains(&node) {
+            // Idempotent: already not a voter.
+            return Ok(ControlRemoveOutcome { warning: None });
+        }
+        if current.len() <= 1 {
+            return Err(format!(
+                "refusing to remove control voter {node}: only {} voter(s) remain; \
+                 this would leave zero",
+                current.len()
+            ));
+        }
+        if node == my_id {
+            let Some(&target) = current.iter().find(|&&id| id != my_id) else {
+                return Err("no other control voter available to transfer leadership to".into());
+            };
+            if !leader.transfer_leadership(target) {
+                return Err(format!(
+                    "could not arm a leadership transfer to node {target} (already \
+                     mid-transfer, or {target} has not caught up); retry"
+                ));
+            }
+            let deadline = tokio::time::Instant::now() + CONTROL_TRANSFER_POLL_TIMEOUT;
+            loop {
+                if !leader.is_leader() {
+                    return Err(format!(
+                        "control leadership transferred away (to node {target}) so this \
+                         node can complete the removal itself; retry on the leader"
+                    ));
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(format!(
+                        "leadership transfer to node {target} did not complete within \
+                         {}s; retry",
+                        CONTROL_TRANSFER_POLL_TIMEOUT.as_secs()
+                    ));
+                }
+                tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+            }
+        }
+        let remaining: BTreeSet<NodeId> =
+            current.iter().copied().filter(|&id| id != node).collect();
+        let warning = if remaining.len() == 1 {
+            Some(format!(
+                "removing node {node} leaves only 1 control voter: no fault tolerance"
+            ))
+        } else {
+            None
+        };
+        match leader.change_membership(remaining) {
+            ProposeResult::Accepted { .. } => Ok(ControlRemoveOutcome { warning }),
+            ProposeResult::NotLeader { .. } => Err(
+                "control leadership moved, or a membership change is already in \
+                     flight; retry on the leader"
+                    .into(),
+            ),
+        }
+    }
+}
+
+/// How long [`ClientCtx::admin_remove_control_member`] polls for a self-removal's
+/// leadership transfer to complete before giving up with an honest timeout error
+/// — generous relative to the default 150ms election timeout (several rounds of
+/// pre-vote + real vote + `TimeoutNow` under real scheduling jitter), mirroring
+/// the other bounded admin polls in this file (e.g. [`SCHEMA_COMMIT_TIMEOUT`]).
+const CONTROL_TRANSFER_POLL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The result of a successful [`ClientCtx::admin_remove_control_member`] call —
+/// `warning` is `Some` for the deliberately-allowed-but-risky quorum-loss cases
+/// (ADR 0037 §2: down to one voter, or every other remaining voter looks `Down`)
+/// that the caller (`admin.rs`, the CLI) must surface, never silently drop.
+pub(crate) struct ControlRemoveOutcome {
+    pub(crate) warning: Option<String>,
 }
 
 /// The leader's one-time cluster bootstrap, retried on a timer until it lands.
