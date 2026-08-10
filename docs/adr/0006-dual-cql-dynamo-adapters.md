@@ -174,22 +174,27 @@ convention:
   restart) and **cluster-agreed**, replacing the old per-process in-memory
   catalog. `INSERT`/`SELECT`/`UPDATE`/`DELETE` resolve the schema from the
   replicated `Metadata`. The `animusd` edge maps the CQL type system onto the
-  shared `ColumnType` vocabulary and reaches the leader through a process-global
-  set of registered control handles (mirroring the DynamoDB edge). A row is
-  serialized to one data-plane value (a versioned blob of `(schema column index,
-  cell)` pairs) keyed by `escape(table) || pk_key_bytes`. Keyspaces themselves are
-  not separately replicated (the catalog models tables); the edge keeps a
-  process-local keyspace set plus treats a keyspace with a replicated `ks.table`
-  as existing — replicating keyspace metadata is future work.
+  shared `ColumnType` vocabulary and reaches the leader through the node's own
+  `ClusterEdgeState` (threaded via `ClientCtx`, not a process `OnceLock` — ADR
+  0031 PR2, mirroring the DynamoDB edge). A row is serialized to one data-plane
+  value (a versioned blob of `(schema column index, cell)` pairs) keyed by
+  `escape(table) || pk_key_bytes`. **Keyspace metadata is also control-plane
+  replicated now (ADR 0013), no longer future work:** `Metadata` carries a
+  `keyspaces: BTreeSet<String>` field mutated by
+  `MetaCommand::CreateKeyspace`/`DropKeyspace` and read via
+  `Metadata::has_keyspace`, so `CREATE KEYSPACE`/`USE` are durable and
+  cluster-agreed exactly like a table schema, not a process-local set.
 - **`DROP TABLE` / `ALTER TABLE ... ADD`.** `DROP TABLE [IF EXISTS]` proposes
   `DropTableSchema` and waits for it to replicate. `ALTER TABLE ... ADD <col>
-  <type>` appends columns by dropping + recreating the replicated schema with the
-  extended column list (column indices are preserved, so stored rows still decode)
-  — not atomic across the two steps; an in-place schema-mutation command is future
-  work.
+  <type>` appends columns via `MetaCommand::ReplaceTableSchema` — **one atomic
+  in-place replacement, no longer future work**: the former drop-then-recreate
+  could strand the table schema-less on a crash between the two commands, or
+  let a concurrent reader see the table momentarily missing; the new column is
+  appended after existing columns (indices preserved), so stored rows still
+  decode under the new schema (`animusd::cql::alter_table`).
 - **`BATCH`.** `BEGIN [UNLOGGED|LOGGED] BATCH <mutation>; ... APPLY BATCH` applies
   a sequence of `INSERT`/`UPDATE`/`DELETE` statements in order (not atomically;
-  CQL logged-batch atomicity is future work).
+  CQL logged-batch atomicity is still future work).
 - **Prepared statements.** `PREPARE` parses + resolves a statement's `?` bind
   markers against the catalog and replies `RESULT/Prepared` (a
   content-addressed statement id + the bind-variable metadata); `EXECUTE` decodes

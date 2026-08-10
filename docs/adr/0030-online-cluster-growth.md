@@ -106,8 +106,10 @@ fallback" to "how every data node syncs."
    **pre-growth** control group as `control_ids` — a real, permanent,
    structurally-safe non-voter (§3) — and `BoundNode::start_with` detects this
    (`!control_ids.contains(&self.control_id)`) and spawns
-   `remote_metadata_sync_loop`: it polls `ClientRequest::Status` against one of
-   the pre-growth control nodes' client addresses (resolvable because the
+   `remote_metadata_sync_loop`: it long-polls `ClientRequest::WatchMetadata`
+   (ADR 0035 PR5 — originally a fixed-200ms `ClientRequest::Status` poll, ported
+   onto the same long-poll mechanism ADR 0035 PR5 gave the data-only node) against
+   one of the pre-growth control nodes' client addresses (resolvable because the
    growth node's own `client_route`, built from the *expanded* config it
    starts with, already lists them) and caches the result in
    `ClientCtx::remote_metadata`. `ClientCtx::effective_metadata()` is a thin

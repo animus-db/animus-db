@@ -1,6 +1,14 @@
 # ADR 0010 — AP repair: read-repair + background anti-entropy
 
-- **Status:** Accepted
+- **Status:** Accepted. **Note (ADR 0019):** this entire mechanism — read-repair,
+  background anti-entropy, hinted handoff, and the `HintStore` — lived in the
+  leaderless **AP data plane** (`animus-data`), which was subsequently
+  **deleted** (v1 ships the CP plane only). None of the code or tests this ADR
+  cites (`animus-data/tests/{repair,hinted_handoff}.rs`) exist in this
+  workspace today; the design is kept below as the historical record and
+  remains retrievable from git history if the AP plane is ever revived (the
+  "still deferred"/"future work" items below describe gaps in that deleted
+  subsystem, not open work on anything currently built).
 - **Date:** 2026-08-01
 
 ## Context
