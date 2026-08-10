@@ -509,6 +509,18 @@ pub struct RaftKvNode<E: Env, S: StorageEngine> {
     /// uses so several tablet groups can share one node's inbox (stream =
     /// tablet id) instead of each minting a distinct `Coresident` sibling id.
     stream: u64,
+    /// The MVCC version floor this group's apply logic adds to its own local
+    /// Raft log index before stamping a per-key LWW version on the (possibly
+    /// node-shared) `StorageEngine` — see `animus_tablet::Tablet::
+    /// version_floor`'s doc for the full cross-group-collision rationale.
+    /// `0` (every existing constructor) is byte-identical to using the raw
+    /// index, exactly today's behavior; only [`start_hosted_with_floor`]
+    /// (the real per-tablet hosting path, driven from replicated `Metadata`)
+    /// ever passes something else. Live-bumpable (never lowered) via
+    /// [`bump_version_floor`](Self::bump_version_floor) for the merge-survivor
+    /// case, where the group keeps running but must widen past a value only
+    /// known once the merge commits.
+    version_floor: Arc<AtomicU64>,
 }
 
 impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
@@ -530,6 +542,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             metrics,
             StorageScope::whole(),
             PRIMARY_STREAM,
+            0,
         )
     }
 
@@ -540,7 +553,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// was started with; `scope` is what keeps them from colliding.
     pub fn start_scoped(env: E, all_nodes: Vec<NodeId>, storage: S, scope: StorageScope) -> Self {
         let metrics = env.metrics();
-        Self::start_inner(env, all_nodes, storage, metrics, scope, PRIMARY_STREAM)
+        Self::start_inner(env, all_nodes, storage, metrics, scope, PRIMARY_STREAM, 0)
     }
 
     /// Like [`start_scoped`](Self::start_scoped), but the group also sends/recvs
@@ -549,7 +562,9 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// by stream, typically the tablet id) instead of each minting a distinct
     /// `Coresident` sibling id. Combined with a shared `storage` + distinct
     /// `scope`s, this is the full "several tablets co-resident on one node" shape
-    /// `animusd`'s real hosting path (`cp_join_host`) uses.
+    /// `animusd`'s real hosting path (`cp_join_host`) uses. Version floor `0`
+    /// (raw log index) — see [`start_hosted_with_floor`](Self::start_hosted_with_floor)
+    /// for the cross-group-LWW-safe variant the real per-tablet reconciler uses.
     pub fn start_hosted(
         env: E,
         all_nodes: Vec<NodeId>,
@@ -558,7 +573,36 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         stream: u64,
     ) -> Self {
         let metrics = env.metrics();
-        Self::start_inner(env, all_nodes, storage, metrics, scope, stream)
+        Self::start_inner(env, all_nodes, storage, metrics, scope, stream, 0)
+    }
+
+    /// Like [`start_hosted`](Self::start_hosted), but seeds this group's MVCC
+    /// version floor (see [`RaftKvNode`]'s `version_floor` field doc and
+    /// `animus_tablet::Tablet::version_floor`) instead of defaulting to `0`.
+    /// This is the constructor the real per-node tablet-host reconciler uses
+    /// (`animus_tablet::Tablet::version_floor`, read from replicated
+    /// `Metadata` at `Host` time) — a split sibling or a restart-rehosted
+    /// tablet must never restart its own version accounting from scratch
+    /// when its scope may already contain data versioned by a *different*
+    /// group's log index sequence.
+    pub fn start_hosted_with_floor(
+        env: E,
+        all_nodes: Vec<NodeId>,
+        storage: S,
+        scope: StorageScope,
+        stream: u64,
+        version_floor: u64,
+    ) -> Self {
+        let metrics = env.metrics();
+        Self::start_inner(
+            env,
+            all_nodes,
+            storage,
+            metrics,
+            scope,
+            stream,
+            version_floor,
+        )
     }
 
     /// Like [`start`](Self::start), but records into the supplied `metrics` handle
@@ -578,9 +622,11 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             metrics,
             StorageScope::whole(),
             PRIMARY_STREAM,
+            0,
         )
     }
 
+    #[allow(clippy::too_many_arguments)] // internal constructor bundle
     fn start_inner(
         env: E,
         all_nodes: Vec<NodeId>,
@@ -588,6 +634,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         metrics: MetricsHandle,
         scope: StorageScope,
         stream: u64,
+        version_floor: u64,
     ) -> Self {
         let core = Arc::new(Mutex::new(RaftCore::new(
             env.node_id(),
@@ -603,6 +650,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         let engine_applied = Arc::new(AtomicU64::new(0));
         let wal_lock = Arc::new(AsyncMutex::new(()));
         let propose_signal = Arc::new(ProposeSignal::default());
+        let version_floor = Arc::new(AtomicU64::new(version_floor));
         let node = Self {
             env: env.clone(),
             core: Arc::clone(&core),
@@ -617,6 +665,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             metrics: metrics.clone(),
             scope: scope.clone(),
             stream,
+            version_floor: Arc::clone(&version_floor),
         };
         // The consensus loop recovers from the WAL, then spawns the apply task
         // (so the apply task sees the recovered core + the correct
@@ -637,6 +686,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             metrics,
             scope,
             stream,
+            version_floor,
         }));
         node
     }
@@ -1064,6 +1114,32 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// specific call safe to widen" from context each time.
     pub fn widen_scope(&self, new_range: KeyRange) {
         self.scope.narrow(new_range);
+    }
+
+    /// Raise this group's live MVCC version floor (see [`RaftKvNode`]'s
+    /// `version_floor` field doc) to `new_floor`, if higher than the current
+    /// value — never lowered, mirroring [`narrow_scope`](Self::narrow_scope)/
+    /// [`widen_scope`](Self::widen_scope)'s one-directional-only shape. This
+    /// is the merge-survivor case: unlike a split sibling (whose floor is
+    /// fixed once at [`start_hosted_with_floor`](Self::start_hosted_with_floor)
+    /// time, before the group ever proposes anything), a merge survivor's
+    /// group is *already running* when it must widen past a value only known
+    /// once `MetaCommand::MergeTablets` commits (`animus_tablet::Tablet::
+    /// version_floor`) — the caller (the per-node tablet-host reconciler)
+    /// calls this alongside [`widen_scope`](Self::widen_scope) for the same
+    /// `WidenScope` action, reading the tablet's current replicated
+    /// `version_floor` fresh each time (so it converges even if a tick is
+    /// missed) rather than computing it locally.
+    pub fn bump_version_floor(&self, new_floor: u64) {
+        self.version_floor.fetch_max(new_floor, Ordering::SeqCst);
+    }
+
+    /// This group's own current MVCC version floor — a point-in-time
+    /// snapshot, additive accessor (test/observability aid, mirroring
+    /// [`scope_range`](Self::scope_range)).
+    #[must_use]
+    pub fn version_floor(&self) -> u64 {
+        self.version_floor.load(Ordering::SeqCst)
     }
 
     /// This group's own current [`StorageScope`] range (see its doc) — a
@@ -1559,6 +1635,33 @@ async fn persist_wal<E: Env>(
         .mark_durable_through(through);
 }
 
+/// Scale factor between a tablet's `version_floor` "generation" and its own
+/// local Raft log index in the stamped MVCC version (`effective_version`,
+/// below) — see `animus_tablet::Tablet::version_floor`'s doc for the full
+/// cross-group-LWW-collision rationale this exists to close. `2^40` (~1.1
+/// trillion) is astronomically generous headroom for "how many commands can
+/// one tablet group apply between rescopes": `--auto-split` already caps a
+/// tablet at a few thousand to a few million keys/bytes long before its own
+/// local index could plausibly approach this, and every generation change
+/// (a split or a merge touching this tablet) strictly increases the floor,
+/// so any two generations are always separated by at least one full `SCALE`
+/// regardless of how much index space either one consumed.
+const VERSION_FLOOR_SCALE: u64 = 1 << 40;
+
+/// The MVCC version a command at Raft log `index` stamps on the engine, given
+/// this group's current `floor` (`RaftKvNode::version_floor`, sourced from
+/// `animus_tablet::Tablet::version_floor` — `0` for a tablet that has never
+/// been split/merged, byte-identical to using `index` verbatim). Saturating
+/// arithmetic: an overflow here would require an unrealistic number of
+/// rescopes or applies (see `VERSION_FLOOR_SCALE`'s doc) and saturating is a
+/// strictly safer failure mode than wrapping (still monotonic, never *lower*
+/// than intended).
+fn effective_version(floor: u64, index: u64) -> u64 {
+    floor
+        .saturating_mul(VERSION_FLOOR_SCALE)
+        .saturating_add(index)
+}
+
 /// Install any received snapshot, apply committed-and-durable commands to the
 /// engine in commit order, and compact when the engine has merged enough past the
 /// snapshot base. **Runs on the apply task only** — off the consensus loop, so a
@@ -1578,8 +1681,13 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
     halted: &AtomicBool,
     metrics: &MetricsHandle,
     scope: &StorageScope,
+    version_floor: &AtomicU64,
 ) -> bool {
     let mut did_work = false;
+    // Read once per pass: `version_floor` only ever moves via `bump_version_floor`
+    // (merge), a rare operator-driven event, so a single snapshot for the whole
+    // pass is fine — no command in this pass needs a floor that changed mid-pass.
+    let floor = version_floor.load(Ordering::SeqCst);
 
     // Install a fully-received snapshot (a follower catching up) into the engine
     // *before* applying log-tail effects, so the tail merges on top of the base.
@@ -1628,7 +1736,11 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 // address (see `StorageScope`'s doc — under the default scope
                 // this is an identity transform).
                 if fence.contains(&key) {
-                    pending.push(MergeOp::put(scope.physical(&key), value, index));
+                    pending.push(MergeOp::put(
+                        scope.physical(&key),
+                        value,
+                        effective_version(floor, index),
+                    ));
                 }
             }
             KvCommand::Batch { puts, fence } => {
@@ -1644,7 +1756,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 if puts.iter().all(|(key, _)| fence.contains(key)) {
                     for (key, value) in &puts {
                         storage
-                            .merge(&scope.physical(key), value, index)
+                            .merge(&scope.physical(key), value, effective_version(floor, index))
                             .await
                             .expect("raftkv apply batch put");
                     }
@@ -1652,7 +1764,10 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
             }
             KvCommand::Delete { key, fence } => {
                 if fence.contains(&key) {
-                    pending.push(MergeOp::tombstone(scope.physical(&key), index));
+                    pending.push(MergeOp::tombstone(
+                        scope.physical(&key),
+                        effective_version(floor, index),
+                    ));
                 }
             }
             KvCommand::Cas {
@@ -1686,10 +1801,11 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                         .map(|vv| vv.value);
                     let swapped = current == expected;
                     if swapped {
-                        // Same write path as `Put`: index is the MVCC version, so
-                        // re-applying on recovery is idempotent (per-key LWW).
+                        // Same write path as `Put`: `effective_version(floor, index)`
+                        // is the MVCC version, so re-applying on recovery is
+                        // idempotent (per-key LWW).
                         storage
-                            .merge(&physical_key, &value, index)
+                            .merge(&physical_key, &value, effective_version(floor, index))
                             .await
                             .expect("raftkv apply cas");
                     }
@@ -1912,6 +2028,7 @@ struct DriveState<E: Env, S: StorageEngine> {
     metrics: MetricsHandle,
     scope: StorageScope,
     stream: u64,
+    version_floor: Arc<AtomicU64>,
 }
 
 /// Idle back-off for the apply task: when there is nothing committed-and-durable to
@@ -1945,6 +2062,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         metrics,
         scope,
         stream,
+        version_floor,
     } = st;
 
     let wal = wal_file(stream);
@@ -1978,6 +2096,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         apply_stopped,
         metrics.clone(),
         scope,
+        version_floor,
     ));
 
     loop {
@@ -2113,6 +2232,7 @@ async fn apply_loop<E: Env, S: StorageEngine>(
     apply_stopped: Arc<AtomicBool>,
     metrics: MetricsHandle,
     scope: StorageScope,
+    version_floor: Arc<AtomicU64>,
 ) {
     loop {
         if halted.load(Ordering::SeqCst) {
@@ -2130,6 +2250,7 @@ async fn apply_loop<E: Env, S: StorageEngine>(
             &halted,
             &metrics,
             &scope,
+            &version_floor,
         )
         .await;
         if !did_work {

@@ -615,12 +615,30 @@ impl Metadata {
                 // The split child inherits the parent's table scope (ADR 0023): a
                 // split never crosses a table boundary, so both halves stay scoped
                 // to the same table.
-                let new_tablet = Tablet::with_table(
+                let mut new_tablet = Tablet::with_table(
                     *new_id,
                     source.table.clone(),
                     right,
                     source.replicas.clone(),
                 );
+                // Cross-group LWW version-floor fix: the new sibling is a brand-new
+                // data-plane Raft group whose own log index restarts low, but it
+                // immediately serves keys the *source* group already wrote at
+                // whatever (possibly much higher) index it had reached — on the
+                // same node-shared `StorageEngine` (ADR 0026/0028). Without a floor
+                // strictly past the source's, a subsequent write through the
+                // sibling could carry a version no higher than what's already
+                // stored, and per-key LWW would silently drop it (a write-confirm
+                // timeout, not corruption — but the write never lands). Bumping
+                // past `source.version_floor` (not `new_id`, which is a *different*
+                // monotonic sequence — see `Tablet::version_floor`'s doc) is both
+                // necessary and sufficient: it exceeds every version the source
+                // could ever have stamped, as long as the source's own local index
+                // never reaches `VERSION_FLOOR_SCALE` (`animus-cp-data`) between
+                // rescopes — astronomically generous given auto-split already caps
+                // a tablet's key/byte count long before that. The source's own
+                // floor is untouched (it never absorbs foreign data, only narrows).
+                new_tablet.version_floor = source.version_floor + 1;
                 let source = self.tablets.get_mut(tablet).expect("tablet present");
                 source.range = left;
                 source.epoch = source.epoch.next();
@@ -667,9 +685,19 @@ impl Metadata {
                     return ApplyOutcome::Rejected("tablets belong to different tables");
                 }
                 let new_end = r.range.end.clone();
+                // Cross-group LWW version-floor fix (the merge dual of
+                // `SplitTablet`'s, see `Tablet::version_floor`'s doc): `left`'s
+                // group keeps running unchanged, but is about to start serving
+                // keys `right`'s group already wrote under its own, unrelated
+                // index sequence on the same node-shared engine. Bump `left`'s
+                // floor past *both* current floors so every future write through
+                // `left` outranks anything either side ever stamped — read
+                // `r.version_floor` before `r` is dropped below.
+                let right_floor = r.version_floor;
                 let l = self.tablets.get_mut(left).expect("tablet present");
                 l.range.end = new_end;
                 l.epoch = l.epoch.next();
+                l.version_floor = l.version_floor.max(right_floor).saturating_add(1);
                 self.tablets.remove(right);
                 // The merged-away tablet can no longer be reconciled.
                 self.policies.remove(right);
@@ -1284,6 +1312,130 @@ mod tests {
             m.merged_tablets.contains(&TabletId(2)),
             "the merged-away tablet must be recorded (ADR 0033)"
         );
+    }
+
+    /// Cross-group LWW version-floor fix (flagged in a PR #90 review comment,
+    /// root `CLAUDE.md`'s cross-group-LWW entry): `SplitTablet` seeds the new
+    /// sibling's `version_floor` strictly past the source's own — every
+    /// tablet's data-plane group stamps its own local Raft log index as the
+    /// MVCC version (`animus-cp-data`), so a fresh sibling group serving keys
+    /// the source already wrote at a (possibly much higher) index must never
+    /// restart at a version low enough to collide. The source's own floor is
+    /// untouched — it never absorbs foreign data, only narrows.
+    #[test]
+    fn split_tablet_seeds_the_new_siblings_version_floor_past_the_sources() {
+        let mut m = Metadata::default();
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTablet {
+                tablet: TabletId(1),
+                table: None,
+                range: KeyRange::whole(),
+                replicas: vec![1, 2, 3],
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(m.tablets[&TabletId(1)].version_floor, 0);
+
+        assert_eq!(
+            m.apply(&MetaCommand::SplitTablet {
+                tablet: TabletId(1),
+                expected_epoch: Epoch::INITIAL,
+                split_key: 0x8000_0000_0000_0000u64.to_be_bytes().to_vec(),
+                new_id: TabletId(2),
+            }),
+            ApplyOutcome::Applied
+        );
+        // The source's own floor is unchanged (it never absorbs foreign data)…
+        assert_eq!(m.tablets[&TabletId(1)].version_floor, 0);
+        // …while the sibling's is strictly past it.
+        assert_eq!(m.tablets[&TabletId(2)].version_floor, 1);
+
+        // A second split (of the sibling, which now itself has a nonzero
+        // floor) must seed its own new child past ITS floor, not just past 0
+        // or the tablet id — proving the formula reads `version_floor`, not
+        // some other monotonic counter.
+        assert_eq!(
+            m.apply(&MetaCommand::SplitTablet {
+                tablet: TabletId(2),
+                expected_epoch: Epoch::INITIAL,
+                split_key: 0xC000_0000_0000_0000u64.to_be_bytes().to_vec(),
+                new_id: TabletId(3),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(m.tablets[&TabletId(2)].version_floor, 1);
+        assert_eq!(m.tablets[&TabletId(3)].version_floor, 2);
+    }
+
+    /// `MergeTablets` bumps the surviving `left`'s `version_floor` to
+    /// `max(left, right) + 1` — the merge dual of the split fix above. Built
+    /// with `right`'s floor *higher* than `left`'s (via a prior split) so the
+    /// test cannot pass by accident from a naive `left + 1` formula that
+    /// ignores `right` entirely.
+    #[test]
+    fn merge_tablets_bumps_the_survivors_version_floor_past_both_sides() {
+        let mut m = Metadata::default();
+        let mid = 0x8000_0000_0000_0000u64.to_be_bytes().to_vec();
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTablet {
+                tablet: TabletId(1),
+                table: None,
+                range: KeyRange::new(Vec::new(), Some(mid.clone())),
+                replicas: vec![1, 2, 3],
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTablet {
+                tablet: TabletId(2),
+                table: None,
+                range: KeyRange::new(mid.clone(), None),
+                replicas: vec![1, 2, 3],
+            }),
+            ApplyOutcome::Applied
+        );
+        // Give `right` (tablet 2) a HIGHER floor than `left` (tablet 1) via a
+        // split-and-merge-back-in dance is overkill — directly split tablet 2
+        // once (against a third, throwaway sibling) so its own floor becomes
+        // 1, strictly above tablet 1's untouched 0.
+        assert_eq!(
+            m.apply(&MetaCommand::SplitTablet {
+                tablet: TabletId(2),
+                expected_epoch: Epoch::INITIAL,
+                split_key: 0xC000_0000_0000_0000u64.to_be_bytes().to_vec(),
+                new_id: TabletId(3),
+            }),
+            ApplyOutcome::Applied
+        );
+        // Merge the throwaway sibling straight back into tablet 2, so tablet
+        // 2's range is whole again (abutting tablet 1) but its floor is now 2
+        // (bumped past both its own prior 0 and the throwaway's 1).
+        assert_eq!(
+            m.apply(&MetaCommand::MergeTablets {
+                left: TabletId(2),
+                expected_left_epoch: m.tablets[&TabletId(2)].epoch,
+                right: TabletId(3),
+                expected_right_epoch: m.tablets[&TabletId(3)].epoch,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(m.tablets[&TabletId(2)].version_floor, 2);
+        assert_eq!(m.tablets[&TabletId(1)].version_floor, 0);
+
+        // Now merge tablet 1 (`left`, floor 0) with tablet 2 (`right`, floor
+        // 2) — the survivor's floor must become `max(0, 2) + 1 = 3`, proving
+        // the formula reads BOTH sides, not just `left`.
+        assert_eq!(
+            m.apply(&MetaCommand::MergeTablets {
+                left: TabletId(1),
+                expected_left_epoch: m.tablets[&TabletId(1)].epoch,
+                right: TabletId(2),
+                expected_right_epoch: m.tablets[&TabletId(2)].epoch,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(m.tablets[&TabletId(1)].version_floor, 3);
+        assert!(!m.tablets.contains_key(&TabletId(2)));
     }
 
     /// `DropTableTablets` (ADR 0024): removes every tablet scoped to the table —

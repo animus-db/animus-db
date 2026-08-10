@@ -4,18 +4,43 @@ This file provides guidance to Claude Code (claude.ai/code) when working in this
 
 ## Purpose
 
-The tablet model: the unit of placement and migration (ADR 0002). Shared types
-used by both planes; no behavior of its own beyond range/epoch helpers.
+The tablet model — the unit of placement and migration (ADR 0002) — **plus the
+per-table hash-ring key layout** (ADR 0022/0023): this crate owns the Murmur3
+partitioner and the order-preserving key-escape primitives every data-plane key
+is built from. Shared types used across the control plane, the CP data plane,
+and the wire edges. One file: `src/lib.rs`.
 
-## Entry points
+## Key layout (ADR 0022/0023)
 
-- `TabletId`, `Epoch` (`INITIAL`, `next()`), `KeyRange`, `Tablet`.
+- `TOKEN_BYTES` + `partition_token(&[u8]) -> [u8; TOKEN_BYTES]` — the
+  Cassandra-compatible **Murmur3 x64_128** partition token (helpers
+  `murmur3_x64_128`, `fmix64`) that leads every data-plane key.
+  **Load-bearing invariant (from the code's own doc):** every node and every
+  restart must agree on the token — it is fixed, seedless, no RNG/host state;
+  **do not change the function without a data migration**, the bytes are baked
+  into stored keys.
+- `escape(&[u8]) -> Vec<u8>` — the order-preserving, **prefix-free** escape
+  (no key's encoding prefixes another's). It is **deliberately duplicated**
+  from the wire adapters (`animus-dynamo`/`animus-cql` carry their own copies)
+  and must match them **byte-for-byte** — the duplication keeps this crate
+  dependency-light while the adapters stay pure.
+- `table_key_block(&str) -> KeyRange` — a table's whole key block
+  `[escape(table), block_end)`, used where a table-scoped range is needed.
+
+## Tablets & ranges
+
+- `TabletId`, `Epoch` (`INITIAL`, `next()`), `TableName` (type alias),
+  `KeyRange`, `Tablet` (incl. `version_floor: u64` — the cross-group MVCC
+  version-floor fix, see below).
+- `Tablet` is **table-scoped** (ADR 0023): field `table: Option<TableName>`
+  (`None` = a legacy whole-keyspace tablet). Constructors `new` /
+  `new_for_table` / `with_table` (all normalize — sort/dedup — the replica
+  set); predicates `serves_table`, `has_replica`.
 - `KeyRange`: `whole()`, `contains`, `contains_range` (subset containment —
   the shared primitive behind the reconciler's narrow-only/widen-only checks
   and `animusd`'s read-path scope pre-checks, ADR 0031/0033), `split_at`
   (strictly-inside split into two half-open ranges), `abuts` (contiguity test
   — the primitives behind split/merge).
-- `Tablet::new` normalizes (sorts/dedups) the replica set.
 
 ## What's non-obvious
 
@@ -24,11 +49,31 @@ used by both planes; no behavior of its own beyond range/epoch helpers.
   unbounded-above range (nothing follows it).
 - `Epoch` is the **data-plane fencing token**: every placement change bumps it.
   The actual split/merge *state transitions* live in `animus-control`'s
-  `Metadata::apply`; this crate only provides the range primitives.
+  `Metadata::apply`; this crate provides the range primitives.
+- **`Tablet::version_floor` (cross-group LWW version-floor fix, confirmed
+  real — `docs/engineering-lessons.md` has the full writeup) closes a hazard
+  where a fresh/widened `animus-cp-data` group's own local Raft log index
+  (its MVCC version) could collide with a version a *different* group already
+  stamped for the same key on the node-shared `StorageEngine`.** `0` by
+  default (`#[serde(default)]`, and every existing `Tablet::new`/
+  `new_for_table`/`with_table` constructor) — byte-identical to using the raw
+  log index, so a tablet that has never been split/merged is completely
+  unaffected. Only `animus-control`'s `SplitTablet`/`MergeTablets` apply ever
+  set it (`source.version_floor + 1` for a fresh sibling, `max(left, right)
+  + 1` for a merge survivor) — a pure function of already-replicated state,
+  computed once by the control plane's own deterministic apply, so every data
+  replica reads the identical value. `animus-cp-data::RaftKvNode` is what
+  actually consumes it (`start_hosted_with_floor`/`bump_version_floor`/
+  `effective_version`); this crate just carries the field.
 - Serializable (`serde`) because tablets travel inside control-plane Raft log
   entries and data-plane routing views.
+- Dependency direction: `animus-control`, `animus-cql`, `animus-cp-data`, and
+  `animusd` all depend on this crate — never the reverse. That reverse-dep ban
+  is exactly why `escape`/`TableName` are duplicated here rather than imported.
 
 ## Tests
 
-`cargo test -p animus-tablet` — inline unit tests for `contains`, `split_at`
-bounds, and `abuts`.
+`cargo test -p animus-tablet` — inline unit tests for `contains`/
+`contains_range`, `split_at` bounds, `abuts`, token determinism + fixed width,
+the Murmur3 empty-input spec anchor, token spread across ring octants,
+table-scoped `serves_table`, and `table_key_block` isolation.

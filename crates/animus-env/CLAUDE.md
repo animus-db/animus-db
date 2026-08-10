@@ -13,16 +13,20 @@ the production implementation; the deterministic implementation lives in
 
 - `lib.rs` — the traits `Clock`, `Rng`, `Network`, `Disk`, `Spawner`, combined
   into the **`Env` supertrait** (scoped to one `NodeId`), plus `Nanos`,
-  `Envelope`, `BoxFuture`, and the `EnvExt::spawn_task` convenience.
+  `Envelope`, `BoxFuture`, `PRIMARY_STREAM` (the default stream id the
+  `send`/`recv` defaults ride on, ADR 0026), and the `EnvExt::spawn_task`
+  convenience. Also the vestigial `Coresident` sub-trait (see below).
 - `prod.rs` — `ProdEnv`: real monotonic clock, `OsRng`, `tokio::spawn`,
   length-prefixed TCP, `tokio::fs` + `fsync`. Owns a real recording metrics sink
   and exposes `metrics_text()` (ADR 0015).
 - `metrics.rs` — the **observability seam** (ADR 0015): a closed `Metric` enum
-  (`control_*` Raft + `data_*` leaderless-AP + `storage_*` LSM-engine counters), a fixed-array lock-free
-  `MetricSink`, the cheap-to-clone `MetricsHandle`, and the `MetricSnapshot` text
-  export. The enum is **append-only**: add new variants *after* the existing ones
-  (and a matching row in `Metric::ALL`) so slots and the export order stay stable
-  and the snapshot remains byte-reproducible.
+  (`control_*` Raft + `storage_*` LSM-engine counters, plus legacy `data_*`
+  leaderless-AP counters that are **dormant** — the AP plane was deleted, ADR
+  0019, but the enum is append-only so the variants stay), a fixed-array
+  lock-free `MetricSink`, the cheap-to-clone `MetricsHandle`, and the
+  `MetricSnapshot` text export. The enum is **append-only**: add new variants
+  *after* the existing ones (and a matching row in `Metric::ALL`) so slots and
+  the export order stay stable and the snapshot remains byte-reproducible.
 
 ## What's non-obvious
 
@@ -45,30 +49,17 @@ the production implementation; the deterministic implementation lives in
   fire-and-forget, and the frame in flight when a peer dies can be lost
   (higher layers retry, as before). The cache is shared with siblings like the
   peer book.
-- **`Coresident` (ADR 0017 D) is a *sub-trait*, not part of `Env`.** It adds one
-  method — `sibling(&self, id) -> Self`, a fresh handle on the same physical node
-  bound to a different `NodeId` (its own inbox) — so a node can host a *second*
-  protocol instance (the new tablet's Raft group after a split) by minting its id
-  **in band**, instead of the harness/bootstrap pre-allocating every id. It is
-  deliberately separate from the `Env` supertrait: only the co-residency-aware
-  split path bounds on it, so every other `E: Env` is unaffected and an env that
-  can't multiplex inboxes (a transport keyed by one address) simply isn't
-  `Coresident`. `SimEnv` implements it (trivially — `Simulator::env` already mints
-  inboxes lazily); **`ProdEnv` implements it too now** (ADR 0017 #3b) via a
-  **pre-bound listener pool**: `bind_with_pool(node_id, listen, pool_listens, dir)`
-  binds the main listener plus one spare listener per `pool_listens` addr (each its
-  own accept loop + inbox), and `sibling(id)` hands one out **synchronously** —
-  binding a socket is `async`/fallible but the trait method is sync/infallible, so
-  the listeners are pre-bound. A sibling shares the parent's **peer book** (`Arc`,
-  so a later `set_peers` reaches it) and the pool, but gets its own inbox, id, and
-  data dir (`<dir>/sib-<id>`); the pool size **bounds** co-resident groups —
-  exhausting it **panics** the (background) split-hook task, so the over-cap
-  tablet's group is never minted and that tablet ends up **leaderless** (writes to
-  its range then hang). Size the pool generously for the workload (`animusd` uses
-  `CP_SIBLING_POOL = 64`); a truly unbounded fix needs an `async`/fallible
-  `sibling` that binds on demand. The caller publishes the sibling's `local_addr()` for
-  address distribution — which (carrying group-replica addrs in replicated
-  `Metadata` + a per-node `set_peers` sync loop) is the remaining 3b plumbing.
+- **`Coresident` (ADR 0017 D) is vestigial — superseded by multiplexed streams
+  (ADR 0026, below).** The sub-trait (`sibling(&self, id) -> Self`: a fresh
+  handle on the same physical node bound to a different `NodeId` with its own
+  inbox) still exists and `SimEnv`/`ProdEnv` still implement it, but it has
+  **zero live call sites**: co-hosting a second protocol instance (a tablet's
+  CP Raft group) now rides a distinct *stream* on the node's own id, and
+  `animusd`'s `CP_SIBLING_POOL`/listener-pool plumbing is gone. Being a
+  *sub-trait* (not part of the `Env` supertrait) was the right shape — nothing
+  else ever had to care — and remains the pattern for any future opt-in env
+  capability. Don't build new features on `sibling`; if a use appears, prefer
+  a stream.
 - `Disk` is append + explicit `sync`; bytes are not durable until `sync`
   returns. This models real crash semantics and is what `animus-sim` exploits.
   `Disk::replace` atomically swaps a file's whole contents (temp-file + rename
@@ -111,26 +102,22 @@ the production implementation; the deterministic implementation lives in
   overrides `metrics()` with a recording sink; a sim test that wants to *read*
   counters threads a recording handle into the component (e.g.
   `RaftNode::start_with_metrics`) rather than relying on the no-op default — so
-  no change to `animus-sim` is needed to observe metrics. The data plane follows
-  the same pattern: the `DataClient` coordinator defaults to `env.metrics()` and
-  takes an explicit handle via `DataClient::with_metrics`; the background loops
-  have additive `serve_anti_entropy_with_metrics` / `serve_hint_*_with_metrics`
-  variants (the originals forward `env.metrics()`). The storage engine follows it
-  too: `LsmEngine::open`/`open_with` forward `env.metrics()`, and the additive
-  `LsmEngine::open_with_metrics` threads a recording handle in for a sim test.
+  no change to `animus-sim` is needed to observe metrics. The storage engine
+  follows the same pattern: `LsmEngine::open`/`open_with` forward
+  `env.metrics()`, and the additive `LsmEngine::open_with_metrics` threads a
+  recording handle in for a sim test. (The deleted AP data plane's
+  `DataClient::with_metrics`/`serve_*_with_metrics` variants followed it too —
+  gone with `animus-data`, ADR 0019.)
 - **`Disk::list` is per-env and non-recursive** (ADR 0024): it enumerates only the
   files this handle's own `Disk` methods could open — production reads the env's
   data dir without descending into a sibling's `sib-<id>/` (that is the sibling's
   disk). It exists so a teardown path (drop-table GC) can find every file of a
   prefix-named component; deletion stays on the seam (`remove`), so teardown is
   sim-testable.
-- **Tearing down a single sibling: `ProdEnv::shutdown_tasks()`, never
-  `shutdown()`.** A sibling shares its parent's listener **pool** (`Arc`), and
-  `shutdown()` drains the pool and aborts the unclaimed slots' accept loops —
-  killing the spare inboxes every *future* split on that node needs.
-  `shutdown_tasks()` aborts only the env's own tasks (its accept loop + everything
-  it spawned) and leaves the pool alone. The claimed slot is not returned to the
-  pool (slots are single-use by design); `CP_SIBLING_POOL` sizing accounts for it.
+- `ProdEnv::shutdown_tasks()` (abort only the env's own tasks, leave shared
+  resources alone) is **vestigial with zero callers** — it existed to tear down
+  a single sibling without draining the shared listener pool. Prefer
+  `shutdown()`; remove `shutdown_tasks` if you're cleaning up.
 
 - **Multiplexed `(node, stream)` addressing (ADR 0026).** `Network` gained a
   second addressing axis so a node can host more than one protocol instance
@@ -144,16 +131,9 @@ the production implementation; the deterministic implementation lives in
   behind one `Arc<StdMutex<_>>` per env, fed by a background pump task that
   drains the accept loop's raw frames (now `[from][stream][len][payload]`,
   the `stream` field ADR 0026 added) and routes each into its stream's queue,
-  waking a parked `recv_stream(stream)`. A `Coresident::sibling` gets its own
-  `Demux` + pump (its inbox is genuinely separate). **The staged retirement
-  this once described is done**: since ADR 0028 (shared per-node storage,
-  control-plane-only split) every tablet a node hosts shares **one** `raftkv`
-  env, addressed by `stream` (the tablet id) — `animusd`'s production wiring no
-  longer mints a per-tablet `Coresident` sibling at all (`Node::bind`'s doc
-  comment: "`Coresident`/`CP_SIBLING_POOL` are gone"). The trait itself (and its
-  `SimEnv`/`ProdEnv` impls) is left in place, unused by any production caller,
-  rather than removed — it stays available as a capability, not a load-bearing
-  path.
+  waking a parked `recv_stream(stream)`. The staged plan in the ADR completed:
+  the per-tablet CP Raft groups (`animus-cp-data`) migrated onto streams
+  (Stage B), which is what made `Coresident`/the sibling pool vestigial.
   This is the same "additive default over a well-known constant" shape the
   metrics seam (`Env::metrics()`) uses — extend the trait so nothing existing
   has to change, not by widening every implementor's required surface.

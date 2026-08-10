@@ -603,9 +603,10 @@ pub enum ClientRequest {
     /// `last_seen` **or** the bound elapses (a normal, not-an-error outcome —
     /// the caller just retries with the same `last_seen`, exactly like a
     /// `Status` poll that happened not to see a change). Replaces the old
-    /// fixed-[`REMOTE_METADATA_SYNC_INTERVAL`] poll a data-only node's mirror
-    /// sync used, closing most of the latency gap between "control commits"
-    /// and "data node observes it" without a new push mechanism. Only a
+    /// fixed-interval `Status` poll both a data-only node's and (ADR 0035 PR5)
+    /// an ADR 0030 growth node's mirror sync used, closing most of the
+    /// latency gap between "control commits" and "the mirror observes it"
+    /// without a new push mechanism. Only a
     /// genuine control-group replica (`ControlHandle::Local`) serves this —
     /// see [`ClientCtx::watch_metadata`]'s doc for why a `Remote` node
     /// rejects it instead of degrading. Replies with the same
@@ -4208,15 +4209,6 @@ async fn route_sync_loop(ctx: ClientCtx, static_route: BTreeMap<NodeId, SocketAd
     }
 }
 
-/// How often a control-plane-follower-less growth node (ADR 0030) refreshes its
-/// mirror of the real cluster's `Metadata` — see [`remote_metadata_sync_loop`].
-/// Brisk, matching [`PEER_SYNC_INTERVAL`]'s cadence: the mirror gates the same
-/// kind of "did my own registration land yet" / "was I placed on a tablet yet"
-/// polling loops that read it. **Not** used by an ADR 0035 PR4 data-only
-/// node's mirror sync anymore (PR5) — that now long-polls, see
-/// [`remote_metadata_watch_loop`].
-const REMOTE_METADATA_SYNC_INTERVAL: Duration = Duration::from_millis(200);
-
 /// Upper bound the serving node parks on its own [`animus_control::MetadataWatch`]
 /// before replying to a [`ClientRequest::WatchMetadata`] anyway with whatever
 /// `Metadata` is current (ADR 0035 PR5) — see [`ClientCtx::watch_metadata`]'s
@@ -4249,16 +4241,19 @@ const REMOTE_WATCH_RETRY_BACKOFF: Duration = Duration::from_millis(500);
 /// Mirror the real cluster's replicated `Metadata` — **generalized (ADR 0035
 /// §4) from "the fallback for a control-plane-follower-less growth node" to
 /// "how every node with no *real* local Raft replication for `Metadata` stays
-/// current"**, which now covers two shapes with two different mechanisms
-/// (ADR 0035 PR5): an ADR 0030 **growth node** (`seeds` = the pre-growth
-/// control nodes' client addresses; `ctx.control` is `Local`, so the mirror
-/// lands in `ctx.remote_metadata` and `effective_metadata` prefers it) keeps
-/// the original fixed-[`REMOTE_METADATA_SYNC_INTERVAL`] `Status` poll below;
-/// an ADR 0035 PR4 **data-only node** (`seeds` = the control deployment's
-/// client addresses; `ctx.control` is `Remote`) now long-polls instead — see
-/// [`remote_metadata_watch_loop`]. A no-op (returns immediately) when `seeds`
-/// is empty — the case for every node that *is* a real control-group voter,
-/// since `effective_metadata` then passes straight through to
+/// current"**, covering two shapes that now share **one** mechanism (ADR 0035
+/// PR5): an ADR 0030 **growth node** (`seeds` = the pre-growth control nodes'
+/// client addresses; `ctx.control` is `Local`, so the mirror lands in
+/// `ctx.remote_metadata` and `effective_metadata` prefers it) and an ADR 0035
+/// PR4 **data-only node** (`seeds` = the control deployment's client
+/// addresses; `ctx.control` is `Remote`) both long-poll via
+/// [`remote_metadata_watch_loop`] — the growth-node branch constructs a
+/// standalone [`RemoteControlClient`] sharing `ctx.remote_metadata` as its
+/// mirror (`RemoteControlClient::with_mirror`) purely to drive the identical
+/// loop, since `ctx.control` itself is `Local`, not `Remote`, for a growth
+/// node (see that constructor's doc). A no-op (returns immediately) when
+/// `seeds` is empty — the case for every node that *is* a real control-group
+/// voter, since `effective_metadata` then passes straight through to
 /// `self.control.metadata_cached()` and nothing needs mirroring.
 async fn remote_metadata_sync_loop(ctx: ClientCtx, seeds: Vec<SocketAddr>) {
     if seeds.is_empty() {
@@ -4267,36 +4262,27 @@ async fn remote_metadata_sync_loop(ctx: ClientCtx, seeds: Vec<SocketAddr>) {
     if let ControlHandle::Remote(remote) = &ctx.control {
         return remote_metadata_watch_loop(remote.clone(), seeds).await;
     }
-    // Growth-node (ADR 0030) branch, unchanged from before PR5: tries every
-    // seed in order each tick, keeping whichever answers first. Best-effort —
-    // a tick where every seed is unreachable just leaves the previous
-    // snapshot in place (stale, not wrong — every consumer already tolerates
-    // a few hundred milliseconds of staleness from its own polling cadence).
-    loop {
-        for &addr in &seeds {
-            if let ClientResponse::Status { metadata, .. } =
-                ctx.relay(addr, ClientRequest::Status).await
-            {
-                *ctx.remote_metadata
-                    .lock()
-                    .expect("remote metadata poisoned") = Some(metadata);
-                break;
-            }
-        }
-        tokio::time::sleep(REMOTE_METADATA_SYNC_INTERVAL).await;
-    }
+    // Growth-node (ADR 0030) branch (ADR 0035 PR5: now long-polls, like the
+    // data-only branch above, instead of a fixed-200ms `Status` poll) — this
+    // node's own `ClientCtx.control` is `ControlHandle::Local` (a growth node
+    // is a real, if permanently non-voting, control-group member), so there
+    // is no `ControlHandle::Remote` to share; construct a standalone
+    // `RemoteControlClient` that shares `ctx.remote_metadata` directly as its
+    // mirror instead, so `effective_metadata()` keeps reading the same field
+    // it always has.
+    let remote = RemoteControlClient::with_mirror(seeds.clone(), ctx.remote_metadata.clone());
+    remote_metadata_watch_loop(remote, seeds).await
 }
 
-/// **Long-poll metadata sync for a data-only node's [`RemoteControlClient`]**
-/// (ADR 0035 PR5): replaces the old fixed-[`REMOTE_METADATA_SYNC_INTERVAL`]
-/// poll with a [`ClientRequest::WatchMetadata`] round trip parked on the
-/// answering control node's own `MetadataWatch` — so a metadata change is
-/// observed roughly as soon as the control leader's own commit makes it
-/// visible plus one network hop, not up to one 200ms poll cycle later. Tries
-/// the current leader hint first (mirroring
-/// [`RemoteControlClient::metadata_fresh`]'s own candidate order — the leader
-/// is the node most likely to have just applied the change this loop is
-/// waiting for), then every seed in order.
+/// **Long-poll metadata sync, shared by both mirror shapes** [`remote_metadata_sync_loop`]
+/// drives (ADR 0035 PR5): replaces a fixed-interval `Status` poll with a
+/// [`ClientRequest::WatchMetadata`] round trip parked on the answering
+/// control node's own `MetadataWatch` — so a metadata change is observed
+/// roughly as soon as the control leader's own commit makes it visible plus
+/// one network hop, not up to one poll cycle later. Tries the current leader
+/// hint first (mirroring [`RemoteControlClient::metadata_fresh`]'s own
+/// candidate order — the leader is the node most likely to have just applied
+/// the change this loop is waiting for), then every seed in order.
 ///
 /// **Never busy-loops**: either the serving node's own bounded park
 /// ([`WATCH_METADATA_SERVER_TIMEOUT`]) or, when every candidate fails at the
