@@ -931,7 +931,7 @@ debugging anything that feels like it might have happened before.
   guess one from a different id space's accessor just because it type-checks.
 
   **Update: closed by the ADR 0037 hardening trio's quorum-guard liveness
-  fix (PR 2)** — not by bridging `believes_alive` after all, but by growing a
+  fix (PR 2, PR #136)** — not by bridging `believes_alive` after all, but by growing a
   genuinely **control**-id-native signal instead: `RaftCore` already knows
   exactly who has recently acked an `AppendEntriesResp` (success or reject),
   since that's the leader's own control-Raft traffic — no id-space crossing
@@ -977,7 +977,7 @@ debugging anything that feels like it might have happened before.
   above already explains why PR3 didn't attempt.
 
   **Update: closed by the ADR 0037 hardening trio's quorum-guard liveness
-  fix (PR 2)**, via the previous entry's `control_peer_believed_alive`
+  fix (PR 2, PR #136)**, via the previous entry's `control_peer_believed_alive`
   signal — `admin_remove_control_member` now computes `live` = how many of
   the *resulting* voters are actually reachable, refusing when that's below
   a majority (naming the apparently-dead voter(s), pointing at a new

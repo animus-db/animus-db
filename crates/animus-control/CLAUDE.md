@@ -135,7 +135,7 @@ per-tablet CP data plane (`animus-cp-data`).
   0031) is the executor-agnostic "applied index advanced" notification the
   per-node CP reconciler uses to react to a `Metadata` change without polling.
 
-  **ADR 0037 hardening PR2 (the quorum-guard liveness fix) adds a genuinely
+  **ADR 0037 hardening PR2 (PR #136, the quorum-guard liveness fix) adds a genuinely
   control-id-native liveness signal**, closing the gap PR3's own doc and
   `docs/engineering-lessons.md`'s "id-space mismatch" entry flagged:
   `ControlHandle::believes_alive` is keyed to **raftkv** ids (the failure

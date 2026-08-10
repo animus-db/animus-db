@@ -628,7 +628,7 @@ route below the edge through the same `ClientCtx` CP primitives.
   always `false`, not "unknown" — see the engineering-lessons "id-space
   mismatch" entry.
 
-  **Update (ADR 0037 hardening PR2, the quorum-guard liveness fix): a real
+  **Update (ADR 0037 hardening PR2, PR #136, the quorum-guard liveness fix): a real
   survivor-liveness trigger now exists**, via a genuinely control-id-native
   signal instead of bridging `believes_alive`'s raftkv-keyed one:
   `RaftCore::peer_last_contact` (`animus-control/src/raft.rs`) tracks, per

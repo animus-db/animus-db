@@ -102,7 +102,7 @@ control-grow <leader-admin-addr> <node-id> <admin-addr> [<node-id> <admin-addr>.
   multi-server delta), each waiting for its own catch-up before the next.
   `control-add`/`control-remove`/`control-grow` all target the **leader's**
   admin address, same "not relayed" discipline as `decommission`.
-- **`control-remove ... [--force]` (ADR 0037 hardening PR2, the quorum-guard
+- **`control-remove ... [--force]` (ADR 0037 hardening PR2, PR #136, the quorum-guard
   liveness fix)**: the server now refuses a removal that would leave fewer
   than a majority of the *resulting* voters reachable (per
   `RaftNode::control_peer_believed_alive`, a control-id-native liveness

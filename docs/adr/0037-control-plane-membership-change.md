@@ -235,7 +235,7 @@ is future work, not solved twice here.
   guard counts the resulting voter set only. A real per-control-voter
   liveness signal (closing the id-space mismatch `believes_alive` hits)
   is left as follow-up work, not built here. **Update: implemented by the
-  ADR 0037 hardening trio's PR 2 (the quorum-guard liveness fix)** — not by
+  ADR 0037 hardening trio's PR 2 (PR #136, the quorum-guard liveness fix)** — not by
   bridging `believes_alive`'s raftkv-keyed signal, but by growing a new,
   genuinely control-id-native one: `RaftCore::peer_last_contact`
   (stamped from the leader's own `AppendEntriesResp` traffic, success or
@@ -274,7 +274,7 @@ is future work, not solved twice here.
   liveness-aware guard) needs the id-space unification flagged as future
   work, not a quick fix.
 
-  **Update: the ADR 0037 hardening trio's PR 2 closes this risk by default**
+  **Update: the ADR 0037 hardening trio's PR 2 (PR #136) closes this risk by default**
   — the count-only guard above is superseded by the liveness-aware one (see
   the Non-goals update above): the exact scenario this bullet describes (a
   removal that strands the group because a *different* survivor is already
@@ -359,7 +359,7 @@ Any "how many are left" quorum check needs an explicit test for "one of the
 one action," or it will pass every test that only ever removes/kills one
 node at a time and still ship a silent stranding hazard.
 
-**Update: closed by the ADR 0037 hardening trio's PR 2** — see the Non-goals
+**Update: closed by the ADR 0037 hardening trio's PR 2 (PR #136)** — see the Non-goals
 and Consequences "Update" paragraphs above, and `docs/engineering-lessons.md`'s
 matching closure notes on its "id-space mismatch" and "resulting count only"
 entries.
