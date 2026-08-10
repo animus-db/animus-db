@@ -24,7 +24,8 @@
 //! loaded in that order (each may call functions defined earlier, since
 //! plain `<script src>` tags share one global scope).
 //!
-//! Read-only mostly — Data Browser and Storage's bulk-seed carry real
+//! Read-only mostly — the Data Browser (item CRUD, table DDL, and the
+//! bulk-seed tool, which writes real DynamoDB items) carries the real
 //! mutations; the ADR 0020 gated operator actions (split/flush/compact/
 //! reconfigure/drain) and the ADR 0018 transaction view are not yet surfaced.
 
@@ -42,11 +43,13 @@ pub(crate) const OVERVIEW_JS: &str = include_str!("dashboard_overview.js");
 pub(crate) const PLACEMENT_JS: &str = include_str!("dashboard_placement.js");
 /// The Tablets view: filterable list + raft-group/storage detail panel.
 pub(crate) const TABLETS_JS: &str = include_str!("dashboard_tablets.js");
-/// The Data Browser view: CQL + real DynamoDB Scan/Query/item CRUD/table DDL.
+/// The Data Browser view: CQL + real DynamoDB Scan/Query/item CRUD/table DDL,
+/// plus the bulk-seed tool (it writes real DynamoDB items, so it lives in the
+/// DynamoDB panel).
 pub(crate) const BROWSER_JS: &str = include_str!("dashboard_browser.js");
-/// The Storage view: folded-in WAL/LSM/key-inspector/browse-keys/bulk-seed
-/// debug tools (not part of the source design, preserved from the
-/// pre-redesign dashboard so no capability is lost).
+/// The Storage view: folded-in WAL/LSM/key-inspector/browse-keys debug tools
+/// (not part of the source design, preserved from the pre-redesign dashboard
+/// so no capability is lost).
 pub(crate) const STORAGE_JS: &str = include_str!("dashboard_storage.js");
 /// The Node view (ADR 0035 PR7): a data-only node's dedicated page — its own
 /// identity/health/control-plane mirror status, hosted tablets, a
