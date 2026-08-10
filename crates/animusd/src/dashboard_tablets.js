@@ -57,10 +57,10 @@ function renderTablets() {
     // silently masking the other.
     const keysCell = keyCount == null
       ? `<span class="muted">—</span>`
-      : `${esc(keyCount.toLocaleString())}` + (keyOver ? " " + pill("under-replicated", "over " + thresholds.keys.toLocaleString()) : "");
+      : `${esc(keyCount.toLocaleString())}` + (keyOver ? " " + pill("warn", "over " + thresholds.keys.toLocaleString()) : "");
     const sizeCell = byteSize == null
       ? `<span class="muted">—</span>`
-      : `${esc(humanBytes(byteSize))}` + (byteOver ? " " + pill("under-replicated", "over " + humanBytes(thresholds.bytes)) : "");
+      : `${esc(humanBytes(byteSize))}` + (byteOver ? " " + pill("warn", "over " + humanBytes(thresholds.bytes)) : "");
     const replicaDots = (t.replicas || []).map((rid) => {
       const g = gs.find((x) => nodeRaftkvId(x.node) === rid);
       const cls = g ? (g.g.is_leader ? "ok-dot" : "dim-dot") : "bad-dot";

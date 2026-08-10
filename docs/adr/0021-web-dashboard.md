@@ -212,6 +212,35 @@ tests. Add:
 The dashboard is a debug/operability tool, not a correctness surface; its bar is
 "the JSON it renders is the tested JSON," not a new property to prove.
 
+### 7. Health semantics: health ≈ "is the data at risk"
+
+The cluster health pill/banner (`dashboard_core.js::computeHealth`) means **is
+the data at risk**, not **is anything in transition**. A tablet mid-formation —
+a split-child standing up its Raft group, a freshly-provisioned table's first
+election, a rebalance/repair move catching up, or plain reconciler/admin-fan-out
+lag — is not a data-risk state as long as every replica assigned to it is on a
+live node: per ADR 0028, split/merge/provision are each a single control-plane
+command with no data-plane half, so the data already sits safely in the source
+replicas' shared storage engines the whole time the new group is forming. That
+state renders as a neutral **`forming`** pill and does **not** degrade health —
+otherwise every routine split would read as an outage.
+
+What *does* mean the data is at risk: an assigned replica's node actually being
+`Down` (**`under-replicated`** — redundancy genuinely reduced, repair pending)
+or a tablet dropping below a quorum of live assigned replicas (**`quorum-lost`**
+— the group can't commit, and one more failure loses data; always critical). A
+lingering `Down` *member* that no tablet still depends on is, by the same logic,
+not degrading by itself.
+
+**Overdue-forming guardrail**: a formation that never converges — a stuck
+election, a wedged reconciler — is a real problem and must not hide behind
+"it's just forming" forever. The client tracks, per tablet, how long it has
+been continuously observed `forming`; past 60 seconds it counts toward
+`overdueFormingCount`, which *does* degrade health. This is plain
+browser-side wall-clock state (`Date.now()`), not part of the deterministic
+simulation surface (ADR 0003 scopes to `SimEnv`/`ProdEnv` Rust logic, not this
+client-side SPA).
+
 ## Consequences
 
 **Enabled:**
