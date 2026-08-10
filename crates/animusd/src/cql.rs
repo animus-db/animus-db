@@ -538,10 +538,23 @@ async fn run_statement(
             keyspace,
             if_not_exists: _,
         } => {
+            let lowered = keyspace.to_ascii_lowercase();
+            // Reject a name that collides with the control plane's reserved
+            // system keyspace (ADR 0038) up front, client-side, with a clear
+            // message — the state machine also rejects this
+            // (`Metadata::apply`'s `CreateKeyspace` arm), but that would
+            // otherwise surface as an opaque commit-wait timeout.
+            if animus_control::syskv::is_reserved_name(&lowered) {
+                return response::error(
+                    stream,
+                    response::ERR_INVALID,
+                    &format!("keyspace `{keyspace}` collides with the reserved system namespace"),
+                );
+            }
             // Replicated through the control plane (v1 A3): durable + cluster-agreed,
             // surviving restart (routed to the leader, so a follower-connected
             // `CREATE KEYSPACE` still commits).
-            match ctx.create_keyspace(keyspace.to_ascii_lowercase()).await {
+            match ctx.create_keyspace(lowered).await {
                 Ok(()) => {
                     response::schema_change_result(stream, "CREATED", "KEYSPACE", &keyspace, "")
                 }
@@ -564,6 +577,21 @@ async fn run_statement(
             // plane, so it is created in `ReplicationMode::Cp`.
             let control_schema = cql_schema_to_control(&cql_schema).with_mode(ReplicationMode::Cp);
             let control_name = control_table_name(&keyspace, &ct.table);
+            // Reject a (keyspace-qualified) name that collides with the
+            // control plane's reserved system keyspace (ADR 0038) up front,
+            // client-side, with a clear message — the state machine also
+            // rejects this (`Metadata::apply`'s `CreateTableSchema` arm), but
+            // that would otherwise surface as an opaque commit-wait timeout.
+            if animus_control::syskv::is_reserved_name(&control_name) {
+                return response::error(
+                    stream,
+                    response::ERR_INVALID,
+                    &format!(
+                        "table `{keyspace}.{}` collides with the reserved system namespace",
+                        ct.table
+                    ),
+                );
+            }
             // IF NOT EXISTS: a table already present is a no-op success.
             if ct.if_not_exists && ctx.has_table_schema(&control_name) {
                 return response::schema_change_result(

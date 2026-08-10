@@ -821,6 +821,11 @@ impl Metadata {
                 ApplyOutcome::Applied
             }
             MetaCommand::CreateTableSchema { table, schema } => {
+                if crate::syskv::is_reserved_name(table) {
+                    return ApplyOutcome::Rejected(
+                        "table name collides with the reserved system namespace",
+                    );
+                }
                 if self.schemas.contains(table) {
                     return ApplyOutcome::Rejected("table schema already exists");
                 }
@@ -904,6 +909,11 @@ impl Metadata {
                 ApplyOutcome::Applied
             }
             MetaCommand::CreateKeyspace { keyspace } => {
+                if crate::syskv::is_reserved_name(keyspace) {
+                    return ApplyOutcome::Rejected(
+                        "keyspace name collides with the reserved system namespace",
+                    );
+                }
                 if self.keyspaces.insert(keyspace.clone()) {
                     ApplyOutcome::Applied
                 } else {
@@ -1229,6 +1239,63 @@ mod tests {
             ApplyOutcome::Rejected("malformed table schema")
         );
         assert_eq!(m.schemas.get("ks.users"), Some(&extended));
+    }
+
+    /// `CreateTableSchema` rejects a table name that collides with the
+    /// reserved system-keyspace namespace (ADR 0038), both an exact match and
+    /// a name merely prefixed by it, and leaves the catalog untouched.
+    #[test]
+    fn create_table_schema_rejects_reserved_namespace() {
+        let mut m = Metadata::default();
+        let schema = TableSchema::simple("pk", ColumnType::String);
+
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTableSchema {
+                table: crate::syskv::RESERVED_NAMESPACE.to_owned(),
+                schema: schema.clone(),
+            }),
+            ApplyOutcome::Rejected("table name collides with the reserved system namespace")
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTableSchema {
+                table: format!("{}_backup", crate::syskv::RESERVED_NAMESPACE),
+                schema: schema.clone(),
+            }),
+            ApplyOutcome::Rejected("table name collides with the reserved system namespace")
+        );
+        assert!(m.schemas.is_empty(), "no schema should have been recorded");
+
+        // An ordinary name is unaffected.
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTableSchema {
+                table: "ks.orders".to_owned(),
+                schema,
+            }),
+            ApplyOutcome::Applied
+        );
+    }
+
+    /// `CreateKeyspace` rejects the same reserved-namespace collision as
+    /// `CreateTableSchema` (ADR 0038).
+    #[test]
+    fn create_keyspace_rejects_reserved_namespace() {
+        let mut m = Metadata::default();
+        assert_eq!(
+            m.apply(&MetaCommand::CreateKeyspace {
+                keyspace: crate::syskv::RESERVED_NAMESPACE.to_owned(),
+            }),
+            ApplyOutcome::Rejected("keyspace name collides with the reserved system namespace")
+        );
+        assert!(!m.has_keyspace(crate::syskv::RESERVED_NAMESPACE));
+
+        // An ordinary keyspace name is unaffected.
+        assert_eq!(
+            m.apply(&MetaCommand::CreateKeyspace {
+                keyspace: "orders_ks".to_owned(),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert!(m.has_keyspace("orders_ks"));
     }
 
     /// `RegisterCpAddr` records a CP member's address, updates on change, and is a

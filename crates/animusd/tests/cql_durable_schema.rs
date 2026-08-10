@@ -343,3 +343,87 @@ async fn cql_batch_alter_drop_surface() {
 
     stop(node).await;
 }
+
+/// Read a `RESULT/Error` body's `[string]` message (a 4-byte error code
+/// followed by the message), for asserting on the client-facing text.
+fn error_message(body: &[u8]) -> String {
+    let mut pos = 4usize;
+    animus_cql::response::read_body_string(body, &mut pos).expect("error message string")
+}
+
+/// `CREATE KEYSPACE` and `CREATE TABLE` both reject a name that collides with
+/// the control plane's reserved system-keyspace namespace (ADR 0038 PR1),
+/// client-side, with a clear `ERR_INVALID` — not a commit-wait timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cql_rejects_reserved_namespace() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let node_dir = dir.path().join("node-0");
+    let (node, config) = support::start_single_node(&node_dir, StorageBackend::default()).await;
+    let cql_addr = config.nodes[0].cql;
+    await_bootstrap(&node).await;
+
+    let mut conn = TcpStream::connect(cql_addr).await.expect("connect cql");
+    handshake(&mut conn).await;
+
+    // CREATE KEYSPACE __animus_system is rejected outright.
+    let bad_ks = round_trip(
+        &mut conn,
+        &request(
+            2,
+            Opcode::Query,
+            &query_body("CREATE KEYSPACE __animus_system"),
+        ),
+    )
+    .await;
+    assert_eq!(
+        bad_ks.opcode,
+        Opcode::Error,
+        "reserved keyspace name should ERROR"
+    );
+    assert!(
+        error_message(&bad_ks.body).contains("reserved system namespace"),
+        "expected a clear message, got: {}",
+        error_message(&bad_ks.body)
+    );
+
+    // An ordinary keyspace works, but a table whose keyspace-qualified name
+    // collides with the reserved namespace is still rejected at CREATE TABLE.
+    ok_query(&mut conn, 3, "CREATE KEYSPACE app").await;
+    let bad_table = round_trip(
+        &mut conn,
+        &request(
+            4,
+            Opcode::Query,
+            &query_body("CREATE TABLE __animus_system.t (id int, PRIMARY KEY (id))"),
+        ),
+    )
+    .await;
+    assert_eq!(
+        bad_table.opcode,
+        Opcode::Error,
+        "reserved-namespace-qualified table name should ERROR"
+    );
+    assert!(
+        error_message(&bad_table.body).contains("reserved system namespace"),
+        "expected a clear message, got: {}",
+        error_message(&bad_table.body)
+    );
+
+    // An ordinary table in an ordinary keyspace is unaffected.
+    let ok_table = round_trip(
+        &mut conn,
+        &request(
+            5,
+            Opcode::Query,
+            &query_body("CREATE TABLE app.users (id int, PRIMARY KEY (id))"),
+        ),
+    )
+    .await;
+    assert_eq!(
+        ok_table.opcode,
+        Opcode::Result,
+        "ordinary CREATE TABLE should succeed"
+    );
+
+    stop(node).await;
+}

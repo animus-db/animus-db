@@ -18,6 +18,10 @@
 //!   [`TableSchema`] and [`SchemaCatalog`], held in [`Metadata`] and mutated by
 //!   `MetaCommand::{CreateTableSchema, DropTableSchema}`, so a wire adapter's
 //!   `CreateTable`/`CREATE TABLE` survives restart and is agreed cluster-wide.
+//! - [`syskv`] — the reserved system-keyspace key encoding (ADR 0038): pure,
+//!   unwired in this PR (a later PR in the stack mirrors `Metadata` through it
+//!   into a per-node `StorageEngine`). `syskv::is_reserved_name` guards
+//!   `TableName`/keyspace validation so no user table can ever collide with it.
 
 pub mod detector;
 pub mod meta;
@@ -26,6 +30,7 @@ pub mod persist;
 pub mod raft;
 pub mod schema;
 pub mod shared_wal;
+pub mod syskv;
 
 pub use detector::{FailureDetector, Liveness};
 pub use meta::{ApplyOutcome, Member, MetaCommand, Metadata, NodeAddrs, NodeStatus};
