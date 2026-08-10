@@ -81,6 +81,16 @@ pub(crate) enum ControlHandle {
 /// Cheap to clone (every field is `Arc`-backed), mirroring `RaftNode`'s own
 /// shape.
 ///
+/// **Also reused, standalone, by an ADR 0030 growth node (ADR 0035 PR5).** A
+/// growth node's `ClientCtx.control` stays `ControlHandle::Local` (it is a
+/// real, permanently non-voting control-group member, not a data-only node),
+/// so it never holds one of these inside a `ControlHandle::Remote` — but
+/// `crate::remote_metadata_sync_loop`'s growth-node branch constructs one
+/// directly via [`with_mirror`](Self::with_mirror), sharing
+/// `ClientCtx.remote_metadata` as its `mirror`, purely to drive
+/// `crate::remote_metadata_watch_loop` (the identical long-poll logic) —
+/// see that constructor's doc.
+///
 /// **Leader-hint lifecycle (ADR 0035 §1).** Every `ClientRequest::Status`
 /// reply now carries the answering node's own `self.control.leader()` +
 /// `route_addr(leader_id)` as `leader_hint: Option<(NodeId, SocketAddr)>`
@@ -137,9 +147,31 @@ pub(crate) struct RemoteControlClient {
 
 impl RemoteControlClient {
     pub(crate) fn new(seeds: Vec<SocketAddr>) -> Self {
+        Self::with_mirror(seeds, Arc::new(Mutex::new(None)))
+    }
+
+    /// Like [`new`](Self::new), but shares an existing `mirror` `Arc` instead
+    /// of starting a fresh, empty one.
+    ///
+    /// Used by `crate::remote_metadata_sync_loop`'s ADR 0030 growth-node
+    /// branch (ADR 0035 PR5's long-poll port of it): a growth node's
+    /// `ClientCtx.control` stays `ControlHandle::Local` (it *is* a real, if
+    /// permanently non-voting, control-group member — unlike a genuine ADR
+    /// 0035 PR4 data-only node), so there is no `ControlHandle::Remote` to
+    /// hold a full `RemoteControlClient`. But the long-poll watch loop
+    /// (`crate::remote_metadata_watch_loop`) is otherwise identical for both
+    /// cases, so the growth-node branch constructs a standalone
+    /// `RemoteControlClient` here — never installed into `ControlHandle` —
+    /// sharing `ClientCtx.remote_metadata` directly as its `mirror` so every
+    /// existing reader of that field (`effective_metadata()`) keeps working
+    /// unchanged, with no separate copy of the mirror to keep in sync.
+    pub(crate) fn with_mirror(
+        seeds: Vec<SocketAddr>,
+        mirror: Arc<Mutex<Option<Metadata>>>,
+    ) -> Self {
         Self {
             seeds,
-            mirror: Arc::new(Mutex::new(None)),
+            mirror,
             leader_hint: Arc::new(Mutex::new(None)),
             watch: MetadataWatch::default(),
             metrics: MetricsHandle::noop(),
