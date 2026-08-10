@@ -10,11 +10,27 @@ properties; it also hosts cross-crate fault sweeps.
 
 ## Entry points
 
-- `history.rs` — `Recorder` (`invoke`/`ok`/`fail`/`info`), `History`, `Mop`
+`src/` is the small reusable library; the rich content lives under `tests/`.
+
+- `src/history.rs` — `Recorder` (`invoke`/`ok`/`fail`/`info`), `History`, `Mop`
   (list-append `Append`/`Read`), `Outcome`.
-- `check.rs` — `check_cycles` (serializability), `check_durability`,
+- `src/check.rs` — `check_cycles` (serializability), `check_durability`,
   `check_convergence`; each returns a `CheckReport` carrying the run seed.
-- `export.rs` — `to_json`, `to_edn` (Jepsen/Elle).
+- `src/export.rs` — `to_json`, `to_edn` (Jepsen/Elle).
+- `tests/support/mod.rs` — the shared Accord harness: the declarative
+  `Scenario`/`NemesisAction` model, `run_scenario`, the frozen `corpus()`
+  generator, and the depth/breadth expansions (`seed_expand`,
+  `corpus_extended`). See the corpus sections below.
+
+Env knobs at a glance (details in the sections below):
+
+| Knob | Default | Effect |
+|------|---------|--------|
+| `ANIMUS_SEED` | unset | replay one failed sim run from its printed seed (repo-wide convention) |
+| `ANIMUS_CORPUS_SEEDS=K` | 1 | K seed variants per Accord-corpus cell (depth) |
+| `ANIMUS_CORPUS_FULL=1` | off | extended Accord-corpus dimensions (breadth) |
+| `ANIMUS_RAFTKV_SEEDS=K` | 1 | K seed variants per raftkv-corpus cell |
+| `ANIMUS_RAFTKV_LSM=1` | off | run the whole raftkv corpus over `LsmEngine<SimEnv>` |
 
 ## What's non-obvious
 

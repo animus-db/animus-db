@@ -296,6 +296,42 @@ pub struct Tablet {
     pub replicas: Vec<NodeId>,
     /// The current placement epoch.
     pub epoch: Epoch,
+    /// The MVCC version floor this tablet's data-plane group must add to its
+    /// own local Raft log index before stamping a per-key LWW version on the
+    /// shared `StorageEngine` (`effective_version = version_floor * SCALE +
+    /// local_index`, see `animus-cp-data`).
+    ///
+    /// **Why this exists**: every tablet on a node shares one physical
+    /// `StorageEngine` (ADR 0026/0028), and a tablet's own Raft log index is
+    /// the MVCC version stamped on writes (`animus-cp-data`'s "the Raft log
+    /// index is the MVCC version" invariant) — but a **fresh** group's index
+    /// always restarts low. A split's new sibling is a brand-new group
+    /// serving keys the *source* group already wrote at whatever (possibly
+    /// much higher) index it had reached; a merge survivor's group keeps
+    /// running, but starts serving keys the *absorbed* sibling's group
+    /// already wrote under its own, unrelated index sequence. Either way, a
+    /// subsequent write through the new/widened group could carry a version
+    /// no higher than what is already stored for that key, and per-key LWW
+    /// (`StorageEngine::merge`) silently drops it — surfacing as a
+    /// write-confirm timeout (the confirm loop polls for exact value
+    /// equality), not corruption, but the write never lands and nothing
+    /// raises the version past the collision on its own.
+    ///
+    /// `0` (the default — `#[serde(default)]` keeps every pre-existing
+    /// snapshot/tablet loading unchanged) means "use the raw log index
+    /// verbatim," byte-identical to the pre-fix behavior — a tablet that has
+    /// never been through a split or a merge never has this bumped, so an
+    /// ordinary never-rescoped tablet's stored versions are unaffected.
+    /// `MetaCommand::SplitTablet` (`animus-control`) sets a fresh sibling's
+    /// floor to `source.version_floor + 1` (strictly past anything the
+    /// source could ever have stamped, since a group's own local index never
+    /// realistically reaches the scale factor); `MetaCommand::MergeTablets`
+    /// bumps the surviving `left`'s floor to `max(left, right) + 1`. Both are
+    /// pure functions of already-agreed replicated state, computed once by
+    /// the control plane's own deterministic apply, so every data replica
+    /// converges on the identical floor with no new cross-node query.
+    #[serde(default)]
+    pub version_floor: u64,
 }
 
 impl Tablet {
@@ -336,6 +372,7 @@ impl Tablet {
             range,
             replicas,
             epoch: Epoch::INITIAL,
+            version_floor: 0,
         }
     }
 

@@ -294,6 +294,14 @@ pub enum HostAction {
         /// The new (wider-or-equal) range to widen to — the tablet's current
         /// metadata range.
         range: KeyRange,
+        /// This tablet's current `Metadata`-replicated MVCC version floor
+        /// (`animus_tablet::Tablet::version_floor`) — the executor bumps the
+        /// already-running group's live floor to (at least) this value
+        /// alongside widening its scope, closing the cross-group LWW
+        /// version-collision hazard a merge survivor's group would otherwise
+        /// hit serving keys the absorbed sibling's group already wrote under
+        /// a different index sequence (root `CLAUDE.md`).
+        version_floor: u64,
     },
     /// Stand up this node's member of `tablet`'s group for the first time —
     /// a fresh whole-keyspace tablet, a split child, or a reconciler-placed
@@ -310,6 +318,14 @@ pub enum HostAction {
         /// or is re-forming after a restart with data already on disk).
         /// `false` — start as a quiet non-voter joining an already-led group.
         initial_formation: bool,
+        /// This tablet's `Metadata`-replicated MVCC version floor
+        /// (`animus_tablet::Tablet::version_floor`) — seeded into the freshly
+        /// started group so a split sibling's brand-new Raft log index never
+        /// collides with a version the *source* group already stamped for a
+        /// key now in this tablet's range (root `CLAUDE.md`'s cross-group LWW
+        /// entry). `0` for a tablet that has never been split/merged, which
+        /// is byte-identical to the pre-fix behavior.
+        version_floor: u64,
     },
     /// Take one single-server `reconfigure_step` toward `desired`, given the
     /// currently-`Down` node set — planned every tick this node leads
@@ -445,6 +461,7 @@ pub fn plan(
                                 actions.push(HostAction::WidenScope {
                                     tablet,
                                     range: t.range.clone(),
+                                    version_floor: t.version_floor,
                                 });
                             }
                             // Neither a subset nor a superset of the current
@@ -466,6 +483,7 @@ pub fn plan(
             table: t.table.clone().unwrap_or_default(),
             range: t.range.clone(),
             initial_formation: join_plan.initial_formation || has_data,
+            version_floor: t.version_floor,
         });
         next.hosted.insert(tablet);
     }
@@ -726,9 +744,14 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
                         node.narrow_scope(range);
                     }
                 }
-                HostAction::WidenScope { tablet, range } => {
+                HostAction::WidenScope {
+                    tablet,
+                    range,
+                    version_floor,
+                } => {
                     if let Some(node) = self.hosted.get(&tablet) {
                         node.widen_scope(range);
+                        node.bump_version_floor(version_floor);
                     }
                 }
                 HostAction::Host {
@@ -736,9 +759,17 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
                     table,
                     range,
                     initial_formation,
+                    version_floor,
                 } => {
-                    self.host(view, tablet, &table, range, initial_formation)
-                        .await;
+                    self.host(
+                        view,
+                        tablet,
+                        &table,
+                        range,
+                        initial_formation,
+                        version_floor,
+                    )
+                    .await;
                 }
                 HostAction::Reconfigure {
                     tablet,
@@ -817,6 +848,7 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
     /// there is no in-flight "claimed but not yet registered" window to dedup
     /// against — unlike the old `minted`-claim-set loop, `self.hosted` is
     /// authoritative the instant this returns.
+    #[allow(clippy::too_many_arguments)] // mirrors HostAction::Host's field set
     async fn host(
         &mut self,
         view: &MetadataView,
@@ -824,6 +856,7 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
         table: &str,
         range: KeyRange,
         initial_formation: bool,
+        version_floor: u64,
     ) {
         let Some(t) = view.tablets.get(&tablet) else {
             return;
@@ -836,12 +869,18 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
             .filter(|&id| id != self.base_id)
             .collect();
         let config = if initial_formation { full } else { others };
-        let node = RaftKvNode::start_hosted(
+        // `start_hosted_with_floor` (not `start_hosted`): seed this group's MVCC
+        // version floor from replicated `Metadata` (root `CLAUDE.md`'s cross-group
+        // LWW entry) — a split sibling's brand-new log index must never collide
+        // with a version the source group already stamped for a key now in this
+        // tablet's range.
+        let node = RaftKvNode::start_hosted_with_floor(
             self.env.clone(),
             config,
             self.storage.clone(),
             scope,
             tablet.0,
+            version_floor,
         );
         (self.on_host)(tablet, &node);
         self.hosted.insert(tablet, node);
@@ -1284,6 +1323,7 @@ mod tests {
             vec![HostAction::WidenScope {
                 tablet: TabletId(1),
                 range: KeyRange::new(b"a".to_vec(), Some(b"z".to_vec())),
+                version_floor: 0,
             }]
         );
     }
@@ -1337,6 +1377,7 @@ mod tests {
             vec![HostAction::WidenScope {
                 tablet: TabletId(1),
                 range: KeyRange::new(b"a".to_vec(), Some(b"z".to_vec())),
+                version_floor: 0,
             }]
         );
     }
@@ -1399,6 +1440,7 @@ mod tests {
                 table: "t".to_string(),
                 range: KeyRange::whole(),
                 initial_formation: true,
+                version_floor: 0,
             }]
         );
         assert!(next.hosted.contains(&TabletId(1)));
@@ -1423,6 +1465,7 @@ mod tests {
                 table: "t".to_string(),
                 range: KeyRange::whole(),
                 initial_formation: false,
+                version_floor: 0,
             }]
         );
     }
@@ -1453,6 +1496,7 @@ mod tests {
                 table: "t".to_string(),
                 range: KeyRange::whole(),
                 initial_formation: true,
+                version_floor: 0,
             }]
         );
     }

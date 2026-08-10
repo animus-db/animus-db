@@ -34,8 +34,14 @@ rejects it if the operation's epoch is older than the replica's (fencing is
 tracked **per tablet**). Tablets **split and merge** via control-plane
 commands (`SplitTablet`/`MergeTablets`), each bumping the affected tablet's
 epoch; the data-plane `Router` resolves a key to its owning tablet from a cached
-tablet map. Choosing split points automatically, and rebalancing replica sets on
-split/merge, remain future work — splits here keep the parent's replica set.
+tablet map. **Split, merge, automatic split-point selection, and replica
+rebalancing have since all shipped** (originally future work at this ADR's
+writing): manual/triggered split is a single control-plane command (ADR 0028);
+merge is its data-plane dual (ADR 0033); split points are chosen automatically
+via a byte-weighted median over the tablet's live data, not a plain positional
+midpoint (ADR 0034); and replica-set rebalancing — including after a
+split/merge, since a new tablet starts from the parent's replica set — runs
+continuously via `Metadata::rebalance` (ADR 0029), independent of repair.
 
 ## Consequences
 
@@ -43,5 +49,7 @@ split/merge, remain future work — splits here keep the parent's replica set.
 - Migration and rebalancing move whole tablets, decoupled from any hash ring.
 - Every replica-set or range change is observable as an epoch bump, giving the
   data plane a clean fencing token and a clean cache-invalidation signal.
-- Splitting and merging tablets (and choosing split points) is real future work;
-  the epoch and range model is designed up front to accommodate it.
+- Splitting, merging, automatic split-point selection, and rebalancing — all
+  future work at this ADR's writing — are now built (ADR 0028, 0033, 0034,
+  0029); the epoch and range model designed up front here is what let each
+  land without changing this ADR's fencing/cache-invalidation contract.
