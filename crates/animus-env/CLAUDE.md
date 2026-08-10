@@ -44,13 +44,20 @@ the production implementation; the deterministic implementation lives in
   by design (a full periodic rebuild from a known-good source, like
   `animusd::peer_sync_loop` does for the `raftkv` role, is the intended
   pattern for anything that needs to *converge*; `merge_peer` is for a
-  one-off "make this one id reachable right now" case that has no such loop
-  yet — the control role, whose peer book was never touched after bring-up
-  before this PR since the control group was static, ADR 0030). Known scope
-  limit, deliberately not solved here: it updates only the calling env's own
-  book, so another node only learns the new peer's address once *it*
-  independently exercises some other path (see the call site's doc for
-  specifics).
+  one-off "make this one id reachable right now" case). It updates only the
+  *calling* env's own book — by itself that left a known scope limit (PR3):
+  a runtime-added control voter's address was only ever merged into
+  whichever node happened to be leader at add time, so a later leadership
+  change or crash left every other voter unable to reach it. **PR4 closes
+  this**: `animusd`'s `control_peer_sync_loop` now calls `merge_peer` on
+  *every* control-role node's own env, every tick, off the replicated
+  `NodeAddrs.control` field (`animus-control`) — the "full periodic rebuild
+  from a known-good source" pattern this doc paragraph already names, just
+  layered on top of `merge_peer` incrementally (there is no separate static
+  control peer book to rebuild under it, unlike `peer_sync_loop`'s
+  `raftkv`/`set_peers` shape) rather than the one-off single-caller use PR3
+  shipped with. See `animusd/CLAUDE.md`'s "Control-plane membership change"
+  gotcha and `docs/engineering-lessons.md` for the full story.
 - **`ProdEnv` pools one outbound TCP connection per destination *address***
   (`TCP_NODELAY` set) instead of dialing per message — a Raft heartbeat no
   longer pays a handshake. Frames (`[from: u64][len: u32][payload]`) are

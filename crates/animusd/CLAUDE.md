@@ -410,6 +410,17 @@ route below the edge through the same `ClientCtx` CP primitives.
   (leader-only, idempotent) registers `300+i` as `Active`. Failure detection runs
   over `ProdEnv`: each node's `heartbeat_loop` heartbeats the control group *as its
   raftkv id*, so the control leader's `detect_loop` marks a crashed CP node `Down`.
+  **`heartbeat_loop`'s `control_ids` (heartbeat destination list) is a
+  bring-up-time snapshot with no live-overlay refresh (ADR 0037 PR4 audit,
+  flagged and deliberately left as a follow-up, not fixed here)**: a raftkv
+  node started before a control voter is added at runtime never heartbeats
+  that voter directly, so if it later becomes leader, this specific
+  already-running raftkv node's heartbeats keep missing it — bounded in
+  practice (every *other* raftkv node's heartbeats still reach it, and a
+  restart re-reads current `control_ids`), but a real, if narrow, gap. See
+  `docs/engineering-lessons.md`'s ADR 0037 PR4 `control_ids` audit entry for
+  the full reasoning on why this one was scoped out while
+  `admin_remove_member`'s refusal (below) was fixed in the same PR.
 - **Online growth (ADR 0030) is data-plane only** — the control group stays static;
   a grown node's control role is a permanent non-voter and mirrors `Metadata` via
   `remote_metadata_sync_loop` into `effective_metadata()` — long-polling
@@ -430,7 +441,24 @@ route below the edge through the same `ClientCtx` CP primitives.
 - **Decommission (ADR 0032 PR3)** = `drain` + `MetaCommand::RemoveMember`; check
   leadership *before* any metadata-dependent refusal (a follower's replica lags).
   Not a fence — a restarted process at the same raftkv id rejoins like a fresh
-  join.
+  join. **`admin_remove_member`'s control-voter refusal is now dynamic (ADR
+  0037 PR4)**: it reads `self.control.config()` (the live Raft config), not
+  the static `self.admin.control_ids` snapshot ADR 0030/0032 read — a node
+  that *used to be* a control-core voter but has since been control-removed
+  decommissions normally; a node that is still a *live* voter (even one
+  added at runtime, an id the static list never knew about) is still
+  correctly refused, now pointing the operator at the two-phase fix: `animus
+  admin decommission --force-control-remove` (`animus-cli`) checks
+  `GET /admin/control/members` up front and, if the target is a live voter,
+  runs `control-remove` + polls to convergence *before* the ordinary
+  drain → drain-status → remove flow (unchanged) even starts — without the
+  flag it refuses immediately with the same message, before wasting a drain
+  cycle on a target the final step would refuse anyway. Regression:
+  `tests/decommission.rs::
+  decommission_refuses_live_control_voter_then_succeeds_after_control_remove`.
+  See the full `control_ids`/`admin.control_ids` static-vs-live audit in the
+  ADR 0037 PR4 PR description (every other read is a legitimate seed/
+  bootstrap use, left static on purpose).
 - **Cluster-allocated member ids (ADR 0036)** live in a disjoint id range
   (`animus_control::meta::ALLOC_ID_BASE = 1_000_000`, far above
   `config::RAFTKV_ID_BASE = 300`) so an allocated id can never collide with an
@@ -460,14 +488,30 @@ route below the edge through the same `ClientCtx` CP primitives.
   and the new voter's **internal control-Raft** address (distinct from its
   admin/client/raftkv ports — `animus admin control-add` resolves it from the
   new node's own `/admin/config` so the operator only ever deals in admin
-  addresses). **Known scope limit**: making a freshly-added voter actually
-  *reachable* needed `ProdEnv::merge_peer` (a new incremental peer-book
-  update, since the control role never had `peer_sync_loop`'s per-tick
-  static-∪-replicated overlay the `raftkv` role has) — called only on the
-  **local leader's own** env, so a *later* leader (after a subsequent
-  transfer or crash) has no path to independently rediscover that address;
-  see `animus-env/CLAUDE.md`'s `merge_peer` entry and
-  `docs/engineering-lessons.md`'s "Code patterns" entry on this gap.
+  addresses). **The PR3 known scope limit is closed (ADR 0037 PR4)**: PR3
+  shipped with the freshly-added voter's address known only via
+  `ProdEnv::merge_peer` called on **whichever node happened to be leader** at
+  add time — a *later* leader (after a subsequent transfer or crash) had no
+  path to independently rediscover it. PR4 adds `NodeAddrs.control:
+  Option<SocketAddr>` (`animus-control`'s `meta.rs`, `#[serde(default)]`,
+  `None` for every statically-configured voter) — `admin_add_control_member`
+  now proposes it via the existing `RegisterNodeAddrs` (replicated to every
+  voter, same as the `raftkv`/`client`/`admin` axes always were), and every
+  control-role node runs its own `control_peer_sync_loop` (near
+  `peer_sync_loop`/`route_sync_loop`, same `PEER_SYNC_INTERVAL` cadence) to
+  merge `Metadata.node_addrs[*].control` into its own control env via
+  `ControlHandle::merge_control_peer` — so *any* node that might later become
+  leader already knows every runtime-added voter's address, not just the one
+  that added it. `admin_remove_control_member` prunes the field back to
+  `None` on removal (best-effort — a stale leftover is harmless bookkeeping,
+  not a safety issue). Regression: `tests/control_membership_admin.rs::
+  runtime_added_voter_survives_leadership_change_to_a_different_original_voter`
+  (self-removes the adder to force a transfer to a *different* original
+  voter, then proves a fresh proposal still replicates to the runtime-added
+  voter). See `animus-env/CLAUDE.md`'s `merge_peer` entry and
+  `docs/engineering-lessons.md` for the full war story (including a real
+  self-registration/admin-action clobber race the regression test's
+  bring-up had to sequence around).
   Remove's quorum-loss warning (down to 1 voter) is the only implemented
   trigger — the plan's second trigger ("every other voter believed Down")
   was dropped: `ControlHandle::believes_alive` is keyed to **raftkv** ids

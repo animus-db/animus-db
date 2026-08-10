@@ -14,6 +14,7 @@
 use std::process::ExitCode;
 use std::time::Duration;
 
+use animusd::config::RAFTKV_ID_BASE;
 use animusd::{ClientRequest, ClientResponse, read_frame, write_frame};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -46,7 +47,7 @@ const ADMIN_USAGE: &str = "  admin <subcommand> <admin-addr> [args]:\n    \
     drain <admin-addr> <node-id>\n    \
     drain-status <admin-addr> <node-id>\n    \
     remove <admin-addr> <node-id>\n    \
-    decommission <admin-addr> <node-id>\n    \
+    decommission <admin-addr> <node-id> [--force-control-remove]\n    \
     control-add <leader-admin-addr> <node-id> <new-node-admin-addr>\n    \
     control-remove <leader-admin-addr> <node-id>\n    \
     control-grow <leader-admin-addr> <node-id> <admin-addr> [<node-id> <admin-addr>...]";
@@ -118,7 +119,8 @@ async fn run_admin(args: &[String]) -> Result<(), String> {
     // generic one-shot dispatch below (ADR 0032 PR3).
     if sub == "decommission" {
         let node = arg(2).ok_or("decommission needs <node-id>")?;
-        return run_decommission(addr, node).await;
+        let force_control_remove = arg(3) == Some("--force-control-remove");
+        return run_decommission(addr, node, force_control_remove).await;
     }
 
     // `control-add`/`control-remove`/`control-grow` (ADR 0037 PR3) are the
@@ -256,17 +258,112 @@ async fn run_admin(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// The operator's whole decommission flow (ADR 0032 PR3), as a single
-/// command: `POST /admin/drain` → poll `GET /admin/member/drain-status` until
-/// draining has actually converged (no tablet still references the member,
-/// and it isn't mid-service) → `POST /admin/member/remove`. All three requests
-/// go to `addr`, which must be the **control-plane leader's** admin port —
-/// both `/admin/drain` and `/admin/member/remove` are deliberately
-/// local-leader-only, not relayed (see `is_relayable_command`'s doc in
-/// `animusd`), so this fails loudly with the same "not the control-plane
-/// leader" error a bare `drain`/`remove` call would if pointed at a follower.
-async fn run_decommission(addr: &str, node: &str) -> Result<(), String> {
+/// The operator's whole decommission flow (ADR 0032 PR3, extended by ADR 0037
+/// PR4 for a combined node that is also a **live** control-plane voter), as a
+/// single command: an optional control-voter pre-check/two-phase removal (see
+/// below), then `POST /admin/drain` → poll `GET /admin/member/drain-status`
+/// until draining has actually converged (no tablet still references the
+/// member, and it isn't mid-service) → `POST /admin/member/remove`. Every
+/// request goes to `addr`, which must be the **control-plane leader's** admin
+/// port — `/admin/drain`, `/admin/member/remove`, and both
+/// `/admin/control/member/*` actions are deliberately local-leader-only, not
+/// relayed (see `is_relayable_command`'s doc in `animusd`), so this fails
+/// loudly with the same "not the control-plane leader" error a bare
+/// `drain`/`remove`/`control-remove` call would if pointed at a follower.
+///
+/// **Combined-node-is-a-control-voter flow (ADR 0037 PR4, plan §7/§8):**
+/// `animusd`'s own `admin_remove_member` refuses the final `/admin/member/
+/// remove` step outright while `node`'s paired **control** id (`node -
+/// RAFTKV_ID_BASE`, the same combined-mode convention `animus admin
+/// control-add/-remove` already use) is a *current, live* control-plane
+/// voter (`ClientCtx::admin_remove_member`'s doc) — that server-side check is
+/// the actual authority. This flow adds a **friendlier, fail-fast** CLI-side
+/// pre-check so an operator doesn't drain a node for two minutes only to have
+/// the final step refused: it asks `GET /admin/control/members` up front and,
+/// if `node`'s control id is listed as a live voter:
+/// - without `force_control_remove`: refuses immediately with a clear
+///   message naming the two-phase path, before ever touching `/admin/drain`;
+/// - with `force_control_remove`: runs the control-plane-membership removal
+///   first (`run_control_remove`, which itself arms a leadership transfer if
+///   `node` happens to be the control leader — see that function's doc),
+///   polls `/admin/control/members` until the live voter set no longer lists
+///   it (bounded, since a transfer can take a few election-timeout rounds
+///   under real scheduling), and only then falls through to the *unchanged*
+///   drain → drain-status → remove flow below.
+///
+/// If `/admin/control/members` itself is unreachable (e.g. an old `animusd`
+/// binary predating ADR 0037 — the endpoint didn't exist), this pre-check is
+/// skipped entirely and the flow proceeds exactly as it did before this PR:
+/// the server-side `admin_remove_member` refusal (if `node` really is a live
+/// control voter) still surfaces at the final `remove` step, just later and
+/// after an unnecessary drain — a graceful degrade, not a silent skip of the
+/// real safety check.
+async fn run_decommission(
+    addr: &str,
+    node: &str,
+    force_control_remove: bool,
+) -> Result<(), String> {
     let node: u64 = node.parse().map_err(|_| "node id must be a number")?;
+
+    if let Some(control_id) = node.checked_sub(RAFTKV_ID_BASE)
+        // Unreachable / non-200 (e.g. an old binary with no such route, or a
+        // follower's admin port before the caller even knows who leads):
+        // skip the pre-check and let the ordinary flow's own final `remove`
+        // step surface the authoritative refusal, if any.
+        && let Ok((200, resp)) = http_call(addr, "GET", "/admin/control/members", None).await
+    {
+        let is_live_voter = serde_json::from_str::<serde_json::Value>(&resp)
+            .ok()
+            .and_then(|v| v.get("voters").cloned())
+            .and_then(|v| v.as_array().cloned())
+            .is_some_and(|voters| voters.iter().any(|x| x.as_u64() == Some(control_id)));
+        if is_live_voter {
+            if !force_control_remove {
+                return Err(format!(
+                    "node {node} (control id {control_id}) is a current \
+                     control-plane voter; decommissioning it requires \
+                     removing it from the control group first. Retry with \
+                     `--force-control-remove`, or run `animus admin \
+                     control-remove {addr} {control_id}` yourself first"
+                ));
+            }
+            println!(
+                "node {node} is a control voter (control id {control_id}); \
+                 removing it from the control group first..."
+            );
+            run_control_remove(addr, control_id).await?;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                let (status, resp) = http_call(addr, "GET", "/admin/control/members", None).await?;
+                if status != 200 {
+                    return Err(format!(
+                        "control/members failed while polling for {control_id}'s \
+                         removal (HTTP {status}): {resp}"
+                    ));
+                }
+                let still_voter = serde_json::from_str::<serde_json::Value>(&resp)
+                    .ok()
+                    .and_then(|v| v.get("voters").cloned())
+                    .and_then(|v| v.as_array().cloned())
+                    .is_some_and(|voters| voters.iter().any(|x| x.as_u64() == Some(control_id)));
+                if !still_voter {
+                    println!(
+                        "node {node} (control id {control_id}) is no longer a \
+                         control voter; proceeding with decommission..."
+                    );
+                    break;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(format!(
+                        "control id {control_id} was still a live voter 30s \
+                         after control-remove; retry"
+                    ));
+                }
+                sleep(Duration::from_millis(200)).await;
+            }
+        }
+    }
+
     let drain_body = serde_json::json!({"node": node}).to_string();
     let (status, resp) = http_call(addr, "POST", "/admin/drain", Some(drain_body)).await?;
     if !(200..300).contains(&status) {
