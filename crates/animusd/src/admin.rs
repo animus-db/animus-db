@@ -31,6 +31,7 @@
 //! - `GET  /admin/storage/wal/segment` — decoded WAL records (`?tablet=&seg=`)
 //! - `GET  /admin/storage/key`         — on-disk versions of a key (`?tablet=&key=`)
 //! - `GET  /admin/storage/scan`        — first N live pairs (`?tablet=&start=&limit=`)
+//! - `GET  /admin/system-table`        — browse the control-plane system keyspace (`?kind=&after=&limit=`, ADR 0038 addendum)
 //! - `GET  /admin/metrics`             — the metrics snapshot as JSON
 //! - `GET  /admin/metrics/history`     — periodic snapshots, ~2h ring buffer (ADR 0021 sparklines)
 //! - `GET  /admin/health`              — liveness/readiness
@@ -55,6 +56,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use animus_control::ColumnType;
+use animus_control::syskv;
 use animus_dynamo::wire::{base64url_decode, base64url_encode};
 use animus_dynamo::{AttributeValue, Item};
 use animus_env::NodeId;
@@ -265,6 +267,7 @@ async fn dispatch(ctx: &ClientCtx, request: &http::HttpRequest) -> (u16, String)
         ("GET", "/admin/storage/wal/segment") => storage_wal_segment(ctx, q).await,
         ("GET", "/admin/storage/key") => storage_key(ctx, q).await,
         ("GET", "/admin/storage/scan") => storage_scan(ctx, q).await,
+        ("GET", "/admin/system-table") => system_table(ctx, q).await,
         ("GET", "/admin/metrics") => (200, metrics_view(ctx)),
         ("GET", "/admin/metrics/history") => (200, metrics_history_view(ctx)),
         ("GET", "/admin/member/drain-status") => member_drain_status(ctx, q),
@@ -740,6 +743,215 @@ async fn storage_scan(ctx: &ClientCtx, q: &str) -> (u16, Value) {
             "items": items,
         }),
     )
+}
+
+/// `GET /admin/system-table?kind=&after=&limit=` (plan-syskv-ui, an ADR 0038
+/// addendum) — a read-only browse of this node's own control-plane **system
+/// keyspace** (`animus_control::syskv::RESERVED_NAMESPACE`): every mirrored
+/// `Metadata` entity (tablets, members, schemas, policies, the node address
+/// book, keyspaces, merge markers) **plus** the internal/legacy bookkeeping
+/// kinds (the two monotonic id-allocator counters, the legacy CP-member
+/// address book, the `AllocateNodeId` idempotency ledger) — full
+/// transparency by default, no kind hidden here; only the dashboard labels
+/// the internal/legacy ones for an operator's benefit.
+///
+/// `{"available": false}` on a data-only node (`ctx.control_storage` is
+/// `None` — no local control role at all, ADR 0035), the same honest-absence
+/// shape `/admin/storage/control` already uses. `kind`, if given, must be one
+/// of `syskv::EntityKind::as_str`'s values (400 on an unrecognized one — the
+/// dashboard's own select only ever offers valid values, so this only fires
+/// on a hand-crafted URL/bug). `limit` defaults to 100, capped at 1000.
+///
+/// **Load-bearing implementation choice**: scans
+/// [`syskv::reserved_scan_bounds`]'s `[start, end)` — the reserved
+/// namespace's own range — via one [`animus_storage::StorageEngine::scan`]
+/// call, filtering by `kind` **in memory** afterward. This deliberately never
+/// calls [`animus_storage::StorageEngine::entries`], which would scan the
+/// **whole engine**: on a combined node this engine is shared with the CP
+/// data plane (ADR 0028), so `entries()` would be O(all user data on this
+/// node), not O(system-keyspace) — a future "simplification" to `entries()`
+/// would silently reintroduce that cost. See `docs/engineering-lessons.md`
+/// and `syskv::reserved_scan_bounds`'s own doc for the same warning at the
+/// source.
+///
+/// `applied_index` is a **dedicated point read** of the `_applied_index`
+/// watermark key ([`syskv::applied_index_key`]) — never derived from the scan
+/// window itself (which may be empty, kind-filtered, or a later page) — so it
+/// always reflects this node's own apply-task watermark regardless of what
+/// `items` happens to contain.
+///
+/// **Cursor**: `after`/`next_after` are the base64url (`animus_dynamo::wire`,
+/// **not** [`key_display`] — a system key isn't a data-plane key, and
+/// `key_display` mangles anything that isn't one) of the raw engine key of
+/// the last item on a page. The next page's scan lower bound is that key's
+/// bytes with one `0x00` byte appended — an exact exclusive-after bound
+/// because `syskv`'s keys are prefix-free (`syskv`'s own
+/// `no_two_distinct_entity_keys_prefix_one_another` test): no other key can
+/// start with `after`'s bytes, so appending `0x00` steps past it with no gap
+/// and no chance of re-showing it on the next page.
+async fn system_table(ctx: &ClientCtx, q: &str) -> (u16, Value) {
+    let Some(engine) = &ctx.control_storage else {
+        return (200, json!({"available": false}));
+    };
+
+    let kind_filter = match http::query_param(q, "kind") {
+        Some(k) => match syskv::EntityKind::from_segment(k.as_bytes()) {
+            Some(kind) => Some(kind),
+            None => {
+                return (
+                    400,
+                    json!({"error": format!("unknown system-table kind {k:?}")}),
+                );
+            }
+        },
+        None => None,
+    };
+    let limit = http::query_param(q, "limit")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(100)
+        .clamp(1, 1000);
+    let after = http::query_param(q, "after").and_then(|s| base64url_decode(&s));
+
+    let (ns_start, ns_end) = syskv::reserved_scan_bounds();
+    let scan_start = match after {
+        Some(mut bytes) => {
+            bytes.push(0x00);
+            bytes
+        }
+        None => ns_start,
+    };
+
+    // Dedicated point read — never derived from the (possibly empty/
+    // kind-filtered/paginated) scan window below.
+    let applied_index = engine
+        .get(&syskv::applied_index_key())
+        .await
+        .expect("system-keyspace engine read (watermark)")
+        .and_then(|v| <[u8; 8]>::try_from(v.value.as_slice()).ok())
+        .map(u64::from_be_bytes)
+        .unwrap_or(0);
+
+    // The load-bearing whole-reserved-namespace RANGE scan — see this
+    // function's doc for why this must never become `engine.entries()`.
+    let pairs = engine
+        .scan(&scan_start, &ns_end)
+        .await
+        .expect("system-keyspace engine scan");
+
+    let mut items: Vec<Value> = Vec::new();
+    let mut truncated = false;
+    let mut last_included_key: Option<Vec<u8>> = None;
+    for (key, versioned) in pairs {
+        let Some(syskv::DecodedKey::Entity { kind, id }) = syskv::decode_key(&key) else {
+            // The `_applied_index` watermark itself, or anything undecodable
+            // — never a browsable row.
+            continue;
+        };
+        if let Some(want) = kind_filter
+            && kind != want
+        {
+            continue;
+        }
+        if items.len() == limit {
+            truncated = true;
+            break;
+        }
+        items.push(system_table_item(
+            kind,
+            &id,
+            &versioned.value,
+            versioned.version,
+        ));
+        last_included_key = Some(key);
+    }
+    let next_after = if truncated {
+        last_included_key.map(|k| base64url_encode(&k))
+    } else {
+        None
+    };
+
+    (
+        200,
+        json!({
+            "available": true,
+            "applied_index": applied_index,
+            "kind_filter": kind_filter.map(syskv::EntityKind::as_str),
+            "count": items.len(),
+            "limit": limit,
+            "truncated": truncated,
+            "next_after": next_after,
+            "items": items,
+        }),
+    )
+}
+
+/// Whether `kind`'s entity id is a big-endian `u64` (a `TabletId`/`NodeId`) —
+/// see [`system_table_id_display`].
+fn system_table_id_is_numeric(kind: syskv::EntityKind) -> bool {
+    matches!(
+        kind,
+        syskv::EntityKind::Tablet
+            | syskv::EntityKind::Member
+            | syskv::EntityKind::Policy
+            | syskv::EntityKind::NodeAddrs
+            | syskv::EntityKind::Merged
+            | syskv::EntityKind::CpMemberAddr
+    )
+}
+
+/// Render one system-keyspace entry's decoded `id` bytes: a numeric kind's id
+/// ([`system_table_id_is_numeric`]) is 8 big-endian bytes, rendered as a
+/// decimal **string** (not a JSON number — a `u64` can exceed `f64`'s exact
+/// integer range, and JSON has no native 64-bit integer type); every other
+/// kind's id is a UTF-8 name, rendered verbatim (lossy on malformed UTF-8,
+/// defensive only — this module never writes anything else there).
+fn system_table_id_display(kind: syskv::EntityKind, id: &[u8]) -> Value {
+    if system_table_id_is_numeric(kind) {
+        match <[u8; 8]>::try_from(id) {
+            Ok(bytes) => json!(u64::from_be_bytes(bytes).to_string()),
+            Err(_) => json!(key_str(id)),
+        }
+    } else {
+        json!(key_str(id))
+    }
+}
+
+/// Render one system-keyspace entry's raw `value` bytes, mirroring
+/// `animus_control::mirror::apply_put`'s decode exactly: `Tablet`/`Member`/
+/// `Schema`/`Policy`/`NodeAddrs`/`CpMemberAddr` are `serde_json` passthrough
+/// (`null` on a malformed value — defensive only, every real writer produces
+/// valid JSON here); `Counter`/`NodeIdAlloc` are a raw big-endian `u64`
+/// (`null` if not exactly 8 bytes); `Keyspace`/`Merged` are presence-only
+/// (their value is always empty) — always `null`, regardless of the actual
+/// bytes.
+fn system_table_value_display(kind: syskv::EntityKind, value: &[u8]) -> Value {
+    match kind {
+        syskv::EntityKind::Tablet
+        | syskv::EntityKind::Member
+        | syskv::EntityKind::Schema
+        | syskv::EntityKind::Policy
+        | syskv::EntityKind::NodeAddrs
+        | syskv::EntityKind::CpMemberAddr => {
+            serde_json::from_slice::<Value>(value).unwrap_or(Value::Null)
+        }
+        syskv::EntityKind::Counter | syskv::EntityKind::NodeIdAlloc => {
+            match <[u8; 8]>::try_from(value) {
+                Ok(bytes) => json!(u64::from_be_bytes(bytes)),
+                Err(_) => Value::Null,
+            }
+        }
+        syskv::EntityKind::Keyspace | syskv::EntityKind::Merged => Value::Null,
+    }
+}
+
+/// One `GET /admin/system-table` row: `{kind, id, version, value}`.
+fn system_table_item(kind: syskv::EntityKind, id: &[u8], value: &[u8], version: u64) -> Value {
+    json!({
+        "kind": kind.as_str(),
+        "id": system_table_id_display(kind, id),
+        "version": version,
+        "value": system_table_value_display(kind, value),
+    })
 }
 
 fn metrics_view(ctx: &ClientCtx) -> Value {

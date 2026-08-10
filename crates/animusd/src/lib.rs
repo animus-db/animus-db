@@ -58,7 +58,10 @@ use animus_control::{PlacementPolicy, ProposeResult, RaftNode};
 use animus_cp_data::RaftKvNode;
 use animus_cp_data::host::{MetadataView, Reconciler};
 use animus_env::{Env, Metric, MetricsHandle, NodeId, ProdEnv};
-use animus_storage::{LsmEngine, MemoryEngine, SsTableView, WalRecordView};
+use animus_storage::{
+    Key, LsmEngine, MemoryEngine, SsTableView, StorageEngine, StorageError, VersionedValue,
+    WalRecordView,
+};
 use animus_tablet::{KeyRange, TabletId, escape};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -5184,6 +5187,39 @@ impl SharedEngine {
         match self {
             SharedEngine::Lsm(e) => Some((e.wal_durable_seq(), e.wal_rotation_count())),
             SharedEngine::Mem(_) => None,
+        }
+    }
+
+    // ---- plain `StorageEngine` passthroughs (plan-syskv-ui) ----------------
+    // `GET /admin/system-table`'s system-keyspace browse surface reads this
+    // engine directly — a dedicated point read of the `_applied_index`
+    // watermark key, plus one bounded range scan over
+    // `animus_control::syskv::reserved_scan_bounds()` — rather than through
+    // any tablet-shaped wrapper (there is none here; this engine may not
+    // host any CP tablet at all on a control-only node). `SharedEngine`
+    // doesn't otherwise implement `StorageEngine` itself (its `Snapshot`
+    // associated type would have to pick one arm arbitrarily), so these are
+    // two plain inherent methods forwarding to whichever concrete engine
+    // this node chose, exactly like every other method in this impl block.
+
+    /// A dedicated point read at `key` (used for the `_applied_index`
+    /// watermark — never scraped from a scan window).
+    async fn get(&self, key: &[u8]) -> Result<Option<VersionedValue>, StorageError> {
+        match self {
+            SharedEngine::Lsm(e) => e.get(key).await,
+            SharedEngine::Mem(e) => e.get(key).await,
+        }
+    }
+
+    /// The live `[start, end)` pairs, in key order.
+    async fn scan(
+        &self,
+        start: &[u8],
+        end: &[u8],
+    ) -> Result<Vec<(Key, VersionedValue)>, StorageError> {
+        match self {
+            SharedEngine::Lsm(e) => e.scan(start, end).await,
+            SharedEngine::Mem(e) => e.scan(start, end).await,
         }
     }
 }

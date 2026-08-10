@@ -212,6 +212,17 @@ async fn split_cluster_serves_reads_and_writes_across_data_nodes() {
                 ctl_storage["available"], false,
                 "a data-only node has no local control-plane engine: {ctl_storage}"
             );
+
+            // The system-table browse surface (plan-syskv-ui) is the same
+            // absence-is-data shape as `/admin/storage/control` right above
+            // — a data-only node has no `ctx.control_storage` engine to
+            // scan, never a 404.
+            let (status, syst) = admin_get(n.admin_addr(), "/admin/system-table").await;
+            assert_eq!(status, 200, "admin/system-table on {}", n.admin_addr());
+            assert_eq!(
+                syst["available"], false,
+                "a data-only node has no system keyspace to browse: {syst}"
+            );
         }
         // The dual, on the control-only side of the same split deployment:
         // each control node's own dedicated system-keyspace engine is
@@ -223,6 +234,22 @@ async fn split_cluster_serves_reads_and_writes_across_data_nodes() {
             assert_eq!(
                 ctl_storage["available"], true,
                 "a control-only node has its own dedicated system-keyspace engine: {ctl_storage}"
+            );
+
+            // A control-only node's own system-table is available and lists
+            // at least its own membership rows (control_only.rs covers the
+            // full endpoint contract; this just proves it composes with a
+            // genuine split deployment, matching the storage/control dual
+            // above).
+            let (status, syst) = admin_get(n.admin_addr(), "/admin/system-table").await;
+            assert_eq!(status, 200, "admin/system-table on {}", n.admin_addr());
+            assert_eq!(
+                syst["available"], true,
+                "a control-only node has a system keyspace to browse: {syst}"
+            );
+            assert!(
+                syst["count"].as_u64().is_some_and(|c| c > 0),
+                "a running control-only node's system keyspace has at least member rows: {syst}"
             );
         }
         timeout(Duration::from_secs(20), async {

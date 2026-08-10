@@ -293,7 +293,23 @@ per-tablet CP data plane (`animus-cp-data`).
   directly through this same already-globally-namespaced engine with no
   further `StorageScope` wrapper (see `mirror.rs`'s doc for why), and a
   prefix match is the collision that scheme cannot tell apart from a real
-  system key.
+  system key. **PR6 additions** (`animusd`'s read-only `GET
+  /admin/system-table` browse surface): `EntityKind::as_str`/
+  `EntityKind::from_segment` are now `pub` — the admin endpoint parses/
+  renders a `?kind=` filter through them directly rather than re-deriving
+  the segment table a third time. `prefix_successor(prefix) ->
+  Option<Vec<u8>>` is a general byte-lexicographic-successor helper
+  (increment the last non-`0xFF` byte, dropping trailing `0xFF`s first;
+  `None` only for an empty or all-`0xFF` prefix — unit-tested including that
+  edge case, even though the one real caller below never hits it).
+  `reserved_scan_bounds() -> (Vec<u8>, Vec<u8>)` is the `[start, end)` pair
+  covering the **entire** reserved namespace (every `EntityKind` plus the
+  `_applied_index` watermark), built from it — **the load-bearing bound the
+  admin endpoint scans with instead of `StorageEngine::entries()`**, which
+  would scan the whole engine (every user table's data too, on a combined
+  node sharing it with the CP data plane, ADR 0028). See
+  `docs/engineering-lessons.md` for why this must never be "simplified" to
+  `entries()`.
 
 - **`mirror.rs`** (ADR 0038 PR2, promoted to the real apply path's core by
   PR3) — no longer a shadow: this module's two halves are now the apply
