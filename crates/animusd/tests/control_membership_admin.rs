@@ -35,6 +35,22 @@
 //!   runtime-added voter, via the replicated `NodeAddrs.control` field +
 //!   `control_peer_sync_loop`, not the ephemeral single-env `merge_peer` call
 //!   PR3 shipped with.
+//! - [`removing_a_live_voter_while_another_is_already_dead_can_silently_strand_the_group`]
+//!   (ADR 0037 PR5, §9): the shipped quorum-loss guard only ever counts the
+//!   *resulting* voter set (refuse `< 1`, warn `== 1`) — it has no survivor-
+//!   liveness signal at all. Proves the accepted risk end to end through the
+//!   real admin path: killing one follower for good, then removing a
+//!   *different* live voter succeeds with no warning (3 -> 2, nowhere near
+//!   the threshold), but the group is now wedged for any further membership
+//!   change (`config_change_in_flight` never clears, since the dead voter
+//!   can never ack).
+//! - [`concurrent_control_add_surfaces_in_flight_as_a_clean_retryable_error`]
+//!   (ADR 0037 PR5, §9): the core-level in-flight rejection
+//!   (`animus-control`'s `rejects_a_change_while_one_is_in_flight`) surfaced
+//!   through the real admin HTTP path — two concurrent `control/member/add`
+//!   calls for different ids race at the leader's shared lock; the loser
+//!   gets a clean `409` it can retry, not a hang or a silent no-op, and the
+//!   retry succeeds once the winner has committed.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -665,6 +681,201 @@ async fn runtime_added_voter_survives_leadership_change_to_a_different_original_
         .expect("the runtime-added voter never saw the new leader's proposal replicate");
 
     grown.shutdown();
+    for node in nodes {
+        node.shutdown();
+    }
+}
+
+/// **ADR 0037 PR5 (§9 "quorum-loss guard... with a voter already Down")**:
+/// `admin_remove_control_member`'s quorum-loss warning (down to 1 voter,
+/// tested above) only ever counts the *resulting* voter set — it has no
+/// signal for whether any of the survivors are actually reachable (see that
+/// method's own doc for why a liveness-aware trigger was assessed and
+/// deliberately dropped: `ControlHandle::believes_alive` is keyed to raftkv
+/// ids, not control ids, so it can't tell). This test proves the resulting
+/// operational risk end to end, through the real admin HTTP path: a 3-node
+/// combined core has one non-leader voter genuinely killed (process shut
+/// down, still occupying its control-voter slot) and stays that way; the
+/// leader is then asked to remove a *different*, live voter — a plain
+/// 3-voter -> 2-voter removal, nowhere near the down-to-1 warning threshold,
+/// so it succeeds with **no warning at all**. But one of the resulting 2
+/// voters is dead, so the group needs a unanimous 2-of-2 to commit anything
+/// from here on — strictly worse fault tolerance than the 3-voter group it
+/// replaced. Proven not by prose but by an observable consequence: a
+/// *subsequent* control-membership change (adding a 4th voter) can never
+/// complete — `RaftCore::config_change_in_flight` stays permanently true,
+/// since the removal's own config-change log entry can itself never commit
+/// (it needs the dead voter's ack) — so every retry keeps getting the
+/// familiar "already in flight" refusal, forever, not eventually succeeding.
+#[tokio::test(flavor = "multi_thread", worker_threads = 10)]
+async fn removing_a_live_voter_while_another_is_already_dead_can_silently_strand_the_group() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut nodes, config) = bring_up_combined(3, dir.path()).await;
+    await_bootstrap(&nodes).await;
+    let admin_addrs: Vec<SocketAddr> = config.nodes.iter().map(|n| n.admin).collect();
+
+    let leader = leader_index(&nodes);
+    let followers: Vec<usize> = (0..3).filter(|&i| i != leader).collect();
+    let dead_idx = followers[0];
+    let live_target_idx = followers[1];
+
+    // Kill one follower for good — it never comes back, but it still
+    // occupies its control-voter slot (nobody has removed it).
+    let dead_node = nodes.remove(dead_idx);
+    dead_node.shutdown_graceful().await;
+    // Re-index: `nodes`/positions shifted after the `remove` above.
+    let leader_admin = admin_addrs[leader];
+    let live_target_id = live_target_idx as u64;
+
+    // The leader removes the OTHER (live) follower: a plain 3 -> 2 removal,
+    // nowhere near the down-to-1 threshold — succeeds with NO warning, even
+    // though one of the 2 resulting voters is already dead.
+    let (status, body) = remove_control_member(leader_admin, live_target_id).await;
+    assert_eq!(
+        status, 200,
+        "removing a live voter while another is already dead is not refused \
+         by the shipped count-only guard: {body}"
+    );
+    assert!(
+        body["warning"].is_null(),
+        "the shipped guard only ever counts resulting voters (2, not 1), so it \
+         carries NO warning here even though one of the 2 is dead — this IS the \
+         gap this test documents, not a bug in the test: {body}"
+    );
+
+    // The real consequence: the control group is now wedged for any FURTHER
+    // membership change, because the removal's own config-change entry can
+    // never commit (needs the dead voter's ack) — `config_change_in_flight`
+    // stays true forever. Retrying an unrelated add (a 4th voter) must keep
+    // failing with the familiar in-flight/leader-routing refusal, never
+    // eventually succeeding, across a generous polling window.
+    let probe_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut ever_succeeded = false;
+    let mut last_body = serde_json::Value::Null;
+    while tokio::time::Instant::now() < probe_deadline {
+        let (status, body) = add_control_member(leader_admin, 90, admin_addrs[leader]).await;
+        if status == 200 {
+            ever_succeeded = true;
+            last_body = body;
+            break;
+        }
+        last_body = body;
+        sleep(Duration::from_millis(150)).await;
+    }
+    assert!(
+        !ever_succeeded,
+        "a further control-membership change must never succeed once the group is \
+         stranded (one dead survivor out of 2 voters) — but it did: {last_body}"
+    );
+
+    for node in nodes {
+        node.shutdown();
+    }
+}
+
+/// **ADR 0037 PR5 (§9 "change already in flight... surfaced through the
+/// ADMIN path")**: the core-level rejection of a second concurrent
+/// `change_membership` while one is uncommitted is already proven at
+/// `animus-control`'s `tests/control_membership.rs::
+/// rejects_a_change_while_one_is_in_flight`. This test proves the SAME
+/// mechanism surfaces as a clean, retryable HTTP error through the actual
+/// admin path (not a silent no-op, not a hang, not a crash): two concurrent
+/// `POST /admin/control/member/add` calls for two *different* new ids, fired
+/// at the same leader via `tokio::join!`, race at the leader's internal
+/// `Mutex<RaftCore>` — whichever wins appends its config-change entry first
+/// and (per this codebase's own "adopted locally and immediately" single-
+/// server-change semantics) that leader's own config now requires the new
+/// entry to commit before another config change is even attempted; the
+/// loser's own `change_membership` call observes `config_change_in_flight`
+/// and is rejected. A real network round trip (committing the winner's
+/// change across a majority) takes far longer than the in-process work of
+/// reaching the shared lock, so this race is not a hopeful coin flip — it is
+/// the expected, reliable outcome of two requests serialized by one mutex
+/// while only one of them has anywhere to go yet.
+#[tokio::test(flavor = "multi_thread", worker_threads = 10)]
+async fn concurrent_control_add_surfaces_in_flight_as_a_clean_retryable_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let (nodes, config) = bring_up_combined(3, dir.path()).await;
+    await_bootstrap(&nodes).await;
+    let admin_addrs: Vec<SocketAddr> = config.nodes.iter().map(|n| n.admin).collect();
+    let leader = leader_index(&nodes);
+    let leader_admin = admin_addrs[leader];
+
+    let (r1, r2) = tokio::join!(
+        add_control_member(leader_admin, 10, admin_addrs[leader]),
+        add_control_member(leader_admin, 11, admin_addrs[leader]),
+    );
+
+    let outcomes = [&r1, &r2];
+    let successes = outcomes.iter().filter(|(status, _)| *status == 200).count();
+    let failures: Vec<&(u16, serde_json::Value)> = outcomes
+        .iter()
+        .copied()
+        .filter(|(status, _)| *status != 200)
+        .collect();
+    assert_eq!(
+        successes, 1,
+        "exactly one of two concurrent control-add calls should win: r1={r1:?}, r2={r2:?}"
+    );
+    assert_eq!(
+        failures.len(),
+        1,
+        "exactly one of two concurrent control-add calls should lose cleanly: \
+         r1={r1:?}, r2={r2:?}"
+    );
+    let (loser_status, loser_body) = failures[0];
+    assert_eq!(
+        *loser_status, 409,
+        "the loser must fail cleanly, not hang/crash"
+    );
+    let msg = loser_body["error"]
+        .as_str()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    assert!(
+        msg.contains("flight") || msg.contains("leader") || msg.contains("retry"),
+        "expected a clear, retryable-sounding error for the loser, got: {msg}"
+    );
+
+    // Whichever id lost, retrying it once the winner's change has committed
+    // and caught up must succeed — proving the error was genuinely
+    // retryable, not a permanent refusal.
+    let winner_id: u64 = if r1.0 == 200 { 10 } else { 11 };
+    let loser_id: u64 = if winner_id == 10 { 11 } else { 10 };
+
+    let converged = async {
+        loop {
+            let (status, body) = control_members(leader_admin).await;
+            if status == 200
+                && let Some(v) = voters_of(&body)
+                && v.contains(&winner_id)
+            {
+                return;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    };
+    timeout(Duration::from_secs(15), converged)
+        .await
+        .expect("the winning control-add never converged");
+
+    let retry_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut retried_ok = false;
+    let mut last_body = serde_json::Value::Null;
+    while tokio::time::Instant::now() < retry_deadline {
+        let (status, body) = add_control_member(leader_admin, loser_id, admin_addrs[leader]).await;
+        if status == 200 {
+            retried_ok = true;
+            break;
+        }
+        last_body = body;
+        sleep(Duration::from_millis(150)).await;
+    }
+    assert!(
+        retried_ok,
+        "the loser's retry should eventually succeed once the winner committed: {last_body}"
+    );
+
     for node in nodes {
         node.shutdown();
     }

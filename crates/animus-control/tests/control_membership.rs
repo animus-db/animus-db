@@ -182,6 +182,85 @@ fn remove_a_follower_shrinks_the_quorum() {
     }
 }
 
+/// ADR 0037 PR5 (§9 "quorum-loss guard... with a voter already Down"): the
+/// core-level guard `change_membership` actually enforces is single-server-
+/// delta + no-leader-self-removal — **nothing about survivor liveness**
+/// (that policy, deliberately, lives only at the admin layer, ADR 0037 §2,
+/// and even there only ever counts the resulting voter set, never checks
+/// which of them are actually reachable — see `animusd`'s
+/// `admin_remove_control_member` doc for why a liveness-aware trigger was
+/// assessed and dropped). This test proves the resulting operational risk
+/// directly at the core level, with no admin-layer plumbing involved: a
+/// 3-voter group with one voter genuinely dead (crashed, never restarting)
+/// accepts a `change_membership` that removes a *different*, live voter —
+/// the single-server-delta rule alone permits it — leaving exactly 2 voters,
+/// one of which is dead. Going from an odd 3 (majority 2-of-3, tolerates one
+/// failure) to an even 2 (majority 2-of-2, tolerates none) while a survivor
+/// is already down **strands the group**: the sole remaining live voter can
+/// never single-handedly reach majority again. This is the risk ADR 0037's
+/// Consequences section documents as knowingly accepted, not fixed.
+#[test]
+fn removing_a_live_voter_while_a_third_is_already_dead_can_strand_the_group() {
+    let seed = 0xDEAD_0002;
+    let ids = [0u64, 1, 2];
+    let (mut sim, nodes) = cluster(seed, &ids);
+    sim.run_for(Duration::from_secs(2));
+    let l = unique_leader(&nodes, &[0, 1, 2], seed);
+    assert!(
+        matches!(nodes[l].propose(upsert(1)), ProposeResult::Accepted { .. }),
+        "seed={seed}"
+    );
+    sim.run_for(Duration::from_secs(1));
+    let committed_before = nodes[l].metadata();
+
+    // Crash one follower for good — it never comes back.
+    let followers: Vec<usize> = (0..3).filter(|&i| i != l).collect();
+    let dead = followers[0];
+    let live_follower = followers[1];
+    sim.crash(dead as u64);
+    sim.run_for(Duration::from_secs(1));
+
+    // The leader removes the OTHER (live) follower — a plain single-server
+    // delta, accepted with no guard at the core level.
+    let remaining: BTreeSet<u64> = ids
+        .iter()
+        .copied()
+        .filter(|&n| n as usize != live_follower)
+        .collect();
+    assert!(
+        matches!(
+            nodes[l].change_membership(remaining),
+            ProposeResult::Accepted { .. }
+        ),
+        "seed={seed}: the core has no survivor-liveness guard; this must be accepted"
+    );
+    sim.run_for(Duration::from_secs(3));
+
+    // Stranded: {leader, dead} is the new config, and a majority of 2 needs
+    // both — the leader alone can never commit anything again. `propose`
+    // itself still returns `Accepted` (it only means "appended to the
+    // leader's own log", per this codebase's own durable-before-visible
+    // discipline — never "committed"), but the entry never actually commits,
+    // so applied state never advances past what was already committed before
+    // the stranding.
+    assert!(
+        matches!(nodes[l].propose(upsert(2)), ProposeResult::Accepted { .. }),
+        "seed={seed}: `propose` itself still locally accepts (appends to its own log)"
+    );
+    sim.run_for(Duration::from_secs(5));
+    assert_eq!(
+        nodes[l].metadata(),
+        committed_before,
+        "seed={seed}: a stranded 2-voter group (one dead) must never commit anything \
+         past what was already agreed before the stranding — proving the accepted \
+         risk, not merely asserting it in prose"
+    );
+    assert!(
+        !nodes[l].metadata().members.contains_key(&2),
+        "seed={seed}: the post-stranding write must never actually commit"
+    );
+}
+
 #[test]
 fn rejects_a_multi_server_delta() {
     let seed = 0xBEEF;
@@ -442,6 +521,103 @@ fn run_is_deterministic_from_seed() {
     );
     assert_eq!(config_a, config_b);
     assert!(!trace_a.is_empty());
+}
+
+/// ADR 0037 PR5 (§9 "restart of a node mid-catch-up"): a freshly-added
+/// control voter — still catching up via `AppendEntries`/`InstallSnapshot`,
+/// possibly having received nothing durable at all yet — has its process
+/// stopped (`Simulator::stop`, mirroring `restart.rs`'s existing
+/// restart-and-rejoin coverage for an ordinary stable-group follower) and is
+/// then restarted on the same node id/disk. It must recover from whatever WAL/
+/// snapshot it had (possibly none) and resume catch-up exactly like any other
+/// restarted follower, converging with the rest of the group once caught up.
+#[test]
+fn restart_of_freshly_added_voter_mid_catchup_resumes_and_converges() {
+    let seed = 0x9A17_C0DE;
+    let base_ids = [0u64, 1, 2];
+    let all_ids = [0u64, 1, 2, 3];
+    let (mut sim, nodes) = cluster(seed, &base_ids);
+    sim.run_for(Duration::from_secs(2));
+    let l = unique_leader(&nodes, &[0, 1, 2], seed);
+
+    // Build up some pre-existing state the new voter will need to catch up
+    // on, exactly like `add_a_node_...`.
+    for id in 0..10u64 {
+        assert!(
+            matches!(nodes[l].propose(upsert(id)), ProposeResult::Accepted { .. }),
+            "seed={seed}"
+        );
+    }
+    sim.run_for(Duration::from_secs(1));
+
+    // Node 3 starts life a quiet non-voter (its own config already includes
+    // itself; the original three don't yet know about it). Its handle is
+    // dropped immediately — we crash it before ever using it, and reconstruct
+    // a fresh handle after the restart below.
+    drop(RaftNode::start(sim.env(3), all_ids.to_vec()));
+    assert!(
+        matches!(
+            nodes[l].change_membership(set(&all_ids)),
+            ProposeResult::Accepted { .. }
+        ),
+        "seed={seed}: adding node 3 should be accepted as a single-server delta"
+    );
+
+    // Let a little time pass — enough for node 3 to be reachable and maybe
+    // start receiving replication, but bounded well short of the ~3s the
+    // stable-group tests give a new voter to fully catch up — then stop its
+    // process before we know (or care) exactly how much it received. This
+    // exercises the "possibly none, possibly partial" WAL/snapshot state the
+    // plan calls out, without pinning the test to precise chunk-timing.
+    sim.run_for(Duration::from_millis(50));
+    sim.stop(3);
+
+    // The surviving 3-of-4 (the original group, none of whom needed node 3 to
+    // form a majority) keeps making progress while node 3 is down.
+    for id in 10..20u64 {
+        assert!(
+            matches!(nodes[l].propose(upsert(id)), ProposeResult::Accepted { .. }),
+            "seed={seed}"
+        );
+    }
+    sim.run_for(Duration::from_secs(2));
+
+    // Restart node 3 on the same id/disk — it recovers from whatever WAL/
+    // snapshot it had (possibly none at all, if it was stopped before any
+    // replication reached it) and resumes catch-up like any other restarted
+    // follower.
+    let node3 = RaftNode::start(sim.env(3), all_ids.to_vec());
+    sim.run_for(Duration::from_secs(4));
+
+    let reference = nodes[l].metadata();
+    assert_eq!(
+        node3.metadata(),
+        reference,
+        "seed={seed}: restarted freshly-added voter never converged"
+    );
+    assert_eq!(
+        node3.config(),
+        set(&all_ids),
+        "seed={seed}: restarted freshly-added voter never adopted the grown config"
+    );
+
+    // It genuinely participates in quorum now: crash an original follower,
+    // leaving leader + node 3 + one original follower — a majority only if
+    // node 3 really acks.
+    let extra_follower = (0..3).find(|&i| i != l).expect("an original follower");
+    sim.crash(extra_follower as u64);
+    assert!(
+        matches!(
+            nodes[l].propose(upsert(100)),
+            ProposeResult::Accepted { .. }
+        ),
+        "seed={seed}"
+    );
+    sim.run_for(Duration::from_secs(2));
+    assert!(
+        node3.metadata().members.contains_key(&100),
+        "seed={seed}: restarted node 3 must help form quorum for a post-recovery write"
+    );
 }
 
 /// Guard against `crash_of_leader_mid_change_converges_either_way` passing

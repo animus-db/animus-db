@@ -383,3 +383,17 @@ one, closing this ADR's own documented residual race (two simultaneous
 `--node`-indexed joiners choosing the same index) for anyone who opts in.
 `--node I`'s durable-identity contract described above is unchanged and
 remains fully supported.
+
+## Amended by ADR 0037
+
+[ADR 0037](0037-control-plane-membership-change.md) changes PR3's
+decommission refusal (above) for a node that is a **control-core** member:
+`admin_remove_member`'s check moves from the static `ClusterConfig`-derived
+`control_ids` list to the *live* `RaftCore` config
+(`ctx.control.config()`) — a node that *used to be* a control-core voter but
+has since been runtime-removed via ADR 0037's own `control-remove` now
+decommissions normally; a node that is still a live voter is still correctly
+refused, just for a dynamic rather than a static reason. `animus admin
+decommission --force-control-remove` runs `control-remove` first (with its
+own leadership-transfer handling), then this ADR's unchanged
+drain→drain-status→remove flow.

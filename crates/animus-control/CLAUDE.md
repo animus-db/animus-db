@@ -417,7 +417,7 @@ per-tablet CP data plane (`animus-cp-data`).
 ## Tests
 
 `cargo test -p animus-control` (use `run_for`, never `run()` — perpetual
-heartbeats). The 21 binaries:
+heartbeats). The 24 binaries:
 
 - **`control_raft.rs`** — election/replication/leader-kill + multi-seed
   convergence.
@@ -490,3 +490,26 @@ heartbeats). The 21 binaries:
   safe by construction).
 - **`prod_liveness.rs`** — a real-thread `ProdEnv` smoke test guarding the
   liveness properties `SimEnv`'s virtual clock can't see.
+- **`node_id_allocation.rs`** — `MetaCommand::AllocateNodeId` (ADR 0036): the
+  monotonic allocator mints distinct ids under concurrent proposals, a
+  replayed nonce is idempotent, and the counter survives a restart.
+- **`control_membership.rs`** — `RaftNode::change_membership`/
+  `transfer_leadership` (ADR 0037 PR1): add/remove a voter and catch it up,
+  reject a multi-server delta / leader self-removal / a second change while
+  one is in flight, transfer-then-remove the leader, crash-mid-change
+  converges either way (single-seed + a 200-seed sweep), byte-reproducible
+  from a seed; plus two PR5 additions — a freshly-added voter's process
+  restarting before it's caught up recovers from whatever WAL/snapshot it had
+  and resumes, and removing a live voter while a different one is already
+  dead is accepted (no core-level survivor-liveness guard) and demonstrably
+  strands the group (a stranded 2-voter config with one dead never commits
+  anything again) — the risk ADR 0037's Consequences section documents as
+  knowingly accepted.
+- **`control_membership_prod.rs`** (ADR 0037 PR5) — the real-thread `ProdEnv`
+  liveness counterpart to `control_membership.rs`: grows a real 3-node
+  control group to 5 (two sequential single-server `change_membership`
+  calls, exactly as `animus admin control-grow`'s client-side loop
+  sequences them) under real sockets/time/threads, asserting both prompt
+  catch-up and that leadership stays bounded and settles to one stable
+  leader afterward — no election storm from real-thread scheduling around a
+  runtime membership change.
