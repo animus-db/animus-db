@@ -484,8 +484,14 @@ const MAX_REPLICATION_FACTOR: usize = 3;
 /// from each other by a [`StorageScope`] (table-id key prefix + tablet range),
 /// not by separate files. The prefix is a flat filename prefix, **not** a
 /// subdirectory (no `/`): `ProdEnv`'s disk opens files directly under the
-/// role's data dir and does not create intermediate directories.
-const LSM_PREFIX: &str = "db-";
+/// role's data dir and does not create intermediate directories. `pub` for
+/// the same reason [`SYSKV_LSM_PREFIX`] is (ADR 0038 PR4): an integration
+/// test can reopen a combined node's shared engine directly (over a fresh
+/// `ProdEnv` bound to the same `raftkv` directory) to verify its
+/// control-plane system-keyspace contents survive a restart independent of
+/// any node's own in-memory state, mirroring the control-only-node check
+/// `SYSKV_LSM_PREFIX` already backs.
+pub const LSM_PREFIX: &str = "db-";
 
 /// Filename prefix for a **control-only** node's dedicated ADR 0038 PR2
 /// system-keyspace mirror engine, opened on the same `control` `ProdEnv`
@@ -1012,6 +1018,7 @@ fn spawn_common_tail(
     self_addrs: (NodeId, NodeAddrs),
     client_listener: TcpListener,
     admin_listener: TcpListener,
+    control_storage: Option<SharedEngine>,
 ) -> (ClientCtx, Vec<tokio::task::JoinHandle<()>>) {
     // The seed `route_sync_loop` (below) re-overlays `Metadata.node_addrs[*].client`
     // onto every tick (ADR 0032 PR1) — the same static-base pattern
@@ -1025,6 +1032,7 @@ fn spawn_common_tail(
         admin: admin_info,
         metrics_history: Arc::new(Mutex::new(VecDeque::with_capacity(METRICS_HISTORY_CAP))),
         remote_metadata: Arc::new(Mutex::new(None)),
+        control_storage,
     };
 
     let mut tasks = Vec::with_capacity(5);
@@ -1337,6 +1345,7 @@ impl BoundNode {
             ),
             self.client_listener,
             self.admin_listener,
+            Some(storage.clone()),
         );
 
         // The per-node **tablet-host reconciler** (ADR 0031 PR4): the single
@@ -2045,13 +2054,21 @@ impl BoundControlNode {
         // reuses) — clone it for the engine, keep the original for the
         // `RaftNode` itself.
         let engine_env = self.control_env.clone();
-        let raft = match backend {
+        // Keep a clone of this control-only node's dedicated engine for admin
+        // introspection (`/admin/storage/control`, ADR 0038 PR4) — a second,
+        // read-only handle onto the same live engine; the apply task's own
+        // handle (moved into `RaftNode::start_with_metrics` below) stays the
+        // sole writer.
+        let (raft, control_storage) = match backend {
             StorageBackend::Lsm => match LsmEngine::open(engine_env, SYSKV_LSM_PREFIX).await {
-                Ok(lsm) => RaftNode::start_with_metrics(
-                    self.control_env,
-                    control_ids.clone(),
-                    control_metrics,
-                    lsm,
+                Ok(lsm) => (
+                    RaftNode::start_with_metrics(
+                        self.control_env,
+                        control_ids.clone(),
+                        control_metrics,
+                        lsm.clone(),
+                    ),
+                    SharedEngine::Lsm(lsm),
                 ),
                 Err(e) => {
                     return Err(std::io::Error::other(format!(
@@ -2059,12 +2076,18 @@ impl BoundControlNode {
                     )));
                 }
             },
-            StorageBackend::Memory => RaftNode::start_with_metrics(
-                self.control_env,
-                control_ids.clone(),
-                control_metrics,
-                MemoryEngine::new(),
-            ),
+            StorageBackend::Memory => {
+                let mem = MemoryEngine::new();
+                (
+                    RaftNode::start_with_metrics(
+                        self.control_env,
+                        control_ids.clone(),
+                        control_metrics,
+                        mem.clone(),
+                    ),
+                    SharedEngine::Mem(mem),
+                )
+            }
         };
         // A fresh, node-local edge state (ADR 0031 PR2 doctrine — every node
         // gets its own, never shared); it stays permanently empty of CP group
@@ -2095,6 +2118,7 @@ impl BoundControlNode {
             ),
             self.client_listener,
             self.admin_listener,
+            Some(control_storage),
         );
 
         // Control-role peer-sync loop (ADR 0037 PR4) — see its own doc; a
@@ -2286,6 +2310,9 @@ impl BoundDataNode {
             ),
             self.client_listener,
             self.admin_listener,
+            // A data-only node has no local control role at all (ADR 0035) —
+            // no system-keyspace engine to surface (ADR 0038 PR4).
+            None,
         );
 
         // The per-node tablet-host reconciler (ADR 0031 PR4) — identical
@@ -2676,6 +2703,17 @@ pub(crate) struct ClientCtx {
     /// Read through [`effective_metadata`](Self::effective_metadata), never
     /// directly — see that method's doc for which call sites must use it.
     remote_metadata: Arc<Mutex<Option<Metadata>>>,
+    /// This node's own control-plane **system-keyspace** engine handle (ADR
+    /// 0038 PR4), if it has a `ControlHandle::Local` control role — a clone
+    /// of exactly the engine handle passed to `RaftNode::start_with_metrics`
+    /// (a combined node's already-open *shared* CP-data engine; a
+    /// control-only node's own small *dedicated* engine). `None` on a
+    /// data-only node (no local control role at all). Read-only: this is a
+    /// second handle onto the same live engine purely for admin
+    /// introspection (`/admin/storage/control`) — the apply task's own
+    /// handle (moved into `RaftNode::start_with_metrics`) remains the sole
+    /// writer.
+    pub(crate) control_storage: Option<SharedEngine>,
 }
 
 impl ClientCtx {
@@ -4938,6 +4976,61 @@ enum SharedEngine {
     Lsm(LsmEngine<ProdEnv>),
     /// Volatile in-memory engine (ephemeral runs).
     Mem(MemoryEngine),
+}
+
+impl SharedEngine {
+    // ---- admin / debug introspection (ADR 0020, extended ADR 0038 PR4) ----
+    // Mirrors `CpGroup`'s own identically-shaped introspection methods
+    // (`backend_name`/`lsm_sstables`/`lsm_memtable`/`wal_segment_sizes`/
+    // `wal_stats`) verbatim, one level shallower: `CpGroup` reads through
+    // `RaftKvNode::storage()` to reach the shared engine `SharedEngine`
+    // already *is* here, so these call straight into the engine's own
+    // methods. Used by `/admin/storage/control` (ADR 0038 PR4) to surface
+    // the control-plane system-keyspace engine's own stats — on a combined
+    // node this is the exact same physical engine/files a hosted tablet's
+    // `/admin/storage/lsm` already shows (the control plane's `Metadata`
+    // just lives at a reserved key prefix within it); on a control-only node
+    // it is this node's own small dedicated engine, otherwise invisible to
+    // any `/admin/storage/*` route (which are all `ctx.edge.local_cp`-keyed,
+    // and a control-only node hosts no CP groups at all).
+    fn backend_name(&self) -> &'static str {
+        match self {
+            SharedEngine::Lsm(_) => "lsm",
+            SharedEngine::Mem(_) => "memory",
+        }
+    }
+
+    /// Live SSTable views, or `None` on the volatile memory backend.
+    fn lsm_sstables(&self) -> Option<Vec<SsTableView>> {
+        match self {
+            SharedEngine::Lsm(e) => Some(e.sstable_views()),
+            SharedEngine::Mem(_) => None,
+        }
+    }
+
+    /// `(memtable key count, approx bytes)`, or `None` on the memory backend.
+    fn lsm_memtable(&self) -> Option<(usize, usize)> {
+        match self {
+            SharedEngine::Lsm(e) => Some((e.memtable_len(), e.memtable_bytes())),
+            SharedEngine::Mem(_) => None,
+        }
+    }
+
+    /// Live WAL segments + byte sizes, or `None` on the memory backend.
+    async fn wal_segment_sizes(&self) -> Option<Vec<(u64, u64)>> {
+        match self {
+            SharedEngine::Lsm(e) => Some(e.wal_segment_sizes().await),
+            SharedEngine::Mem(_) => None,
+        }
+    }
+
+    /// `(durable_seq, rotation_count)`, or `None` on the memory backend.
+    fn wal_stats(&self) -> Option<(u64, u64)> {
+        match self {
+            SharedEngine::Lsm(e) => Some((e.wal_durable_seq(), e.wal_rotation_count())),
+            SharedEngine::Mem(_) => None,
+        }
+    }
 }
 
 /// The `StorageScope` prefix confining `table`'s tablets on a node's shared

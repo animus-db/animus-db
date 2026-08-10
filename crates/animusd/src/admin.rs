@@ -26,6 +26,7 @@
 //! - `GET  /admin/raft`                — control-plane Raft state
 //! - `GET  /admin/raftkv`              — per hosted CP group Raft state
 //! - `GET  /admin/storage/lsm`         — LSM levels / SSTables / memtable (`?tablet=`)
+//! - `GET  /admin/storage/control`     — control-plane system-keyspace engine stats (ADR 0038 PR4)
 //! - `GET  /admin/storage/wal`         — WAL segments + sizes (`?tablet=`)
 //! - `GET  /admin/storage/wal/segment` — decoded WAL records (`?tablet=&seg=`)
 //! - `GET  /admin/storage/key`         — on-disk versions of a key (`?tablet=&key=`)
@@ -259,6 +260,7 @@ async fn dispatch(ctx: &ClientCtx, request: &http::HttpRequest) -> (u16, String)
         ("GET", "/admin/raft") => (200, raft_view(ctx)),
         ("GET", "/admin/raftkv") => (200, raftkv_view(ctx).await),
         ("GET", "/admin/storage/lsm") => storage_lsm(ctx, q).await,
+        ("GET", "/admin/storage/control") => storage_control(ctx).await,
         ("GET", "/admin/storage/wal") => storage_wal(ctx, q).await,
         ("GET", "/admin/storage/wal/segment") => storage_wal_segment(ctx, q).await,
         ("GET", "/admin/storage/key") => storage_key(ctx, q).await,
@@ -526,6 +528,83 @@ async fn storage_lsm(ctx: &ClientCtx, q: &str) -> (u16, Value) {
             "levels": levels,
             "sstables": sstables,
             "memtable": {"keys": mt_keys, "approx_bytes": mt_bytes},
+        }),
+    )
+}
+
+/// `GET /admin/storage/control` (ADR 0038 PR4) — this node's own control-plane
+/// **system-keyspace** engine's LSM/WAL/size stats, the control-plane analogue
+/// of `storage_lsm`/`storage_wal` above. Node-local, like every other
+/// `/admin/storage/*` route, but keyed on `ctx.control_storage` rather than
+/// `ctx.edge.local_cp(tablet)` — this engine isn't a hosted CP tablet group at
+/// all (a control-only node hosts none), it's the durable home of the control
+/// plane's own `Metadata` apply-task cache. `{"available": false}` on a
+/// data-only node (no local control role, ADR 0035) — the dashboard's Storage
+/// tab isn't even shown there (ADR 0035 PR7 role gating), but the admin API
+/// itself stays a plain, honest "nothing here" rather than a 404 (mirroring
+/// `storage_lsm`'s memory-backend `{"sstables": null}` shape: absence is data,
+/// not an error). On a **combined** node this is the exact same physical
+/// engine/files a hosted tablet's own `/admin/storage/lsm` already reports —
+/// `Metadata` just lives at a reserved key prefix within it (ADR 0038) — so
+/// the numbers legitimately coincide; on a **control-only** node it is this
+/// node's own small dedicated engine, otherwise invisible to any
+/// `/admin/storage/*` route.
+async fn storage_control(ctx: &ClientCtx) -> (u16, Value) {
+    let Some(engine) = &ctx.control_storage else {
+        return (200, json!({"available": false}));
+    };
+    let backend = engine.backend_name();
+    let Some(views) = engine.lsm_sstables() else {
+        // Memory backend: no SSTables/WAL, but this node genuinely does have
+        // a control-plane engine (unlike the `None` case above).
+        return (200, json!({"available": true, "backend": backend}));
+    };
+    let mut levels: std::collections::BTreeMap<u32, usize> = std::collections::BTreeMap::new();
+    for s in &views {
+        *levels.entry(s.level).or_default() += 1;
+    }
+    let levels: Vec<Value> = levels
+        .into_iter()
+        .map(|(level, tables)| json!({"level": level, "tables": tables}))
+        .collect();
+    let sstables: Vec<Value> = views
+        .iter()
+        .map(|s| {
+            json!({
+                "seq": s.seq,
+                "level": s.level,
+                "min_key": s.min_key.as_deref().map(key_display),
+                "max_key": s.max_key.as_deref().map(key_display),
+                "min_version": s.min_version,
+                "max_version": s.max_version,
+                "file_size": s.file_size,
+                "has_bloom": s.has_bloom,
+                "format": s.format,
+            })
+        })
+        .collect();
+    let (mt_keys, mt_bytes) = engine.lsm_memtable().unwrap_or((0, 0));
+    let (durable_seq, rotations) = engine.wal_stats().unwrap_or((0, 0));
+    let segments: Vec<Value> = engine
+        .wal_segment_sizes()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .map(|(seg, bytes)| json!({"segment": seg, "bytes": bytes}))
+        .collect();
+    (
+        200,
+        json!({
+            "available": true,
+            "backend": backend,
+            "levels": levels,
+            "sstables": sstables,
+            "memtable": {"keys": mt_keys, "approx_bytes": mt_bytes},
+            "wal": {
+                "durable_seq": durable_seq,
+                "rotations": rotations,
+                "segments": segments,
+            },
         }),
     )
 }

@@ -76,7 +76,7 @@ can't reach: `split_fence_tests` (lib.rs:6452) and `auto_split_median_tests`
 | `--cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B]` | run an N-node combined cluster in one process (dev) |
 | `--cluster-control N --cluster-data M [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B]` | run a whole split deployment in one process (dev, ADR 0035) |
 | `join --seed ADDR[,ADDR...] [--node I] [--ip A] [--base-port P] [--dir D] [--ephemeral]` | combined-mode seed/join startup (ADR 0032 PR2; `--node` omitted → ADR 0036 cluster-allocated id) |
-| `control --config FILE --node I [--dir DIR]` | run node I as a control-only node (ADR 0035 PR3) |
+| `control --config FILE --node I [--dir DIR] [--ephemeral]` | run node I as a control-only node (ADR 0035 PR3); `--ephemeral` (ADR 0038) selects a volatile in-memory system-keyspace engine instead of the durable on-disk default — `Metadata` does NOT survive a restart |
 | `data --config FILE --node I [--dir DIR] [--ephemeral]` | run node I as a data-only node (ADR 0035 PR4) |
 | `data --seed ADDR[,ADDR...] [--node I] [--ip A] [--base-port P] [--dir D] [--ephemeral]` | data-only seed/join (ADR 0035 PR5; `--node` omitted → ADR 0036 cluster-allocated id) |
 
@@ -368,11 +368,29 @@ route below the edge through the same `ClientCtx` CP primitives.
   straight off replicated `Metadata.node_addrs[*].role` — closing the gap
   where role was only knowable by fetching that specific node's own
   `/admin/config` first; `admin_addrs` itself is unchanged.
+  **`GET /admin/storage/control` (ADR 0038 PR4)** surfaces the
+  **control-plane's own system-keyspace engine** stats (LSM levels/SSTables/
+  memtable + WAL segments/durable_seq/rotations) — the control-plane
+  analogue of `/admin/storage/lsm`+`/admin/storage/wal`, but keyed on
+  `ctx.control_storage` (a second, read-only clone of exactly the engine
+  handle passed to `RaftNode::start_with_metrics`) rather than a hosted CP
+  tablet group, since a control-only node hosts none. `{"available": false}`
+  on a data-only node (no local control role at all); on a **combined** node
+  the numbers legitimately coincide with a hosted tablet's own
+  `/admin/storage/lsm` — it's the exact same physical shared engine,
+  `Metadata` just lives at a reserved key prefix within it.
 - **Web console** (`dashboard.rs` + assets, ADR 0021) — a self-contained
   vanilla-JS SPA, a pure client of `/admin/*` JSON (so responses carry CORS). Six
   views seeded by a `/admin/peers` fan-out; tabs are **role-gated client-side**
   (`applyRoleGating`, ADR 0035 PR7) — a data-only node shows a dedicated **Node**
-  view (`dashboard_node.js`) instead of the cluster-wide tabs. `loadSelf()`
+  view (`dashboard_node.js`) instead of the cluster-wide tabs. The **Storage**
+  tab (shown to control-only and combined nodes) carries a distinct "Control
+  system keyspace" card (ADR 0038 PR4, `dashboard_storage.js`'s
+  `loadControlStorage`/`updateControlStorageNodeOptions`) — its own node
+  selector, filtered to nodes with a control role (`n.role === "control" ||
+  "combined"`), independent of the per-tablet `st-tablet`/`st-node`
+  selectors' hosting-based filter (which would otherwise always be empty for
+  a control-only node, since it hosts no CP tablet group at all). `loadSelf()`
   resolves this node's own role from a self-only fetch, kept separate from the
   slower cluster-wide fan-out. `/admin/config` carries a derived `role` string;
   `/admin/raft` carries a `control_mirror` object for the Node view. The
@@ -621,7 +639,21 @@ Test-file map (`tests/`):
 - `drop_table_gc.rs` — drop-table `Reclaim` (incl. the relay bimodal case).
 - `tablet_merge.rs` — end-to-end split → merge → read through the survivor.
 - `batch_write.rs` — `cp_batch_write` / `PutBatch` forwarding.
-- `durable_restart.rs` — write survives restart on LSM, lost on `--ephemeral`.
+- `durable_restart.rs` — write survives restart on LSM, lost on `--ephemeral`
+  (data plane).
+- `control_mirror_restart.rs` (ADR 0038) — a control-only node's real process
+  restart over its **dedicated** system-keyspace engine: membership
+  (original PR2/PR3 test) and, since PR4, the fuller schema-catalog +
+  tablet-map shape too, both via the restarted node's own `metadata()` and an
+  independently-reopened `LsmEngine` handle.
+- `control_metadata_restart.rs` (ADR 0038 PR4) — rounds out the control-plane
+  restart matrix: a **combined** node's restart recovers the schema catalog +
+  members + tablet map via the exact same physical **shared** CP-data engine
+  a hosted tablet's own data lives on; an **`--ephemeral`** control-only
+  restart on a *fresh* directory does not inherit the previous incarnation's
+  `Metadata` and re-bootstraps cleanly (see the engineering-lessons entry on
+  why a same-dir `--ephemeral` restart is a different, not equivalent, claim
+  — the control Raft's own WAL is real disk regardless of engine backend).
 - `self_heal.rs` — concurrent-load smoke test (no deadlock).
 - `dynamo_wire.rs` / `dynamo_extended.rs` / `dynamo_documents.rs` /
   `dynamo_indexes.rs` / `dynamo_schema.rs` — the DynamoDB edge (wire round-trip,

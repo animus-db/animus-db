@@ -18,10 +18,57 @@ function renderStorageSelectors() {
   tsel.innerHTML = tablets.map((id) => `<option value="${id}">tablet ${id}</option>`).join("");
   if (prevT && [...tsel.options].some((o) => o.value === prevT)) tsel.value = prevT;
   updateStorageNodeOptions();
+  updateControlStorageNodeOptions();
   // A deep-linked tablet/node (from the URL on load, or a browser back/forward
   // into the Storage tab, or the Tablets view's "Open in Storage" link) is
   // applied once the options it needs actually exist.
   if (pendingStorageParams) applyPendingStorageParams();
+}
+
+// The control-plane system-keyspace storage section (ADR 0038 PR4) is scoped
+// to nodes with a LOCAL control role — a control-only or combined node, never
+// a data-only one (which has no local control `RaftCore`/engine at all, ADR
+// 0035; its Storage tab isn't even shown, ROLE_TABS in `dashboard_core.js`).
+// Independent of `updateStorageNodeOptions`'s per-tablet-hosting filter above:
+// a control-only node hosts no CP tablet group, so it would never appear
+// there even though it's exactly the node this section exists to surface.
+function updateControlStorageNodeOptions() {
+  const sel = $("ctl-node");
+  const prev = sel.value;
+  const nodes = STATE.nodes.filter((n) => n.ok && (n.role === "control" || n.role === "combined"));
+  sel.innerHTML = nodes.map((n) =>
+    `<option value="${esc(n.base)}">node ${esc(n.addr)} (${esc(n.role)})</option>`).join("");
+  if (prev && [...sel.options].some((o) => o.value === prev)) sel.value = prev;
+  $("ctl-hint").textContent = nodes.length ? "" : "no reachable control-role node";
+}
+
+async function loadControlStorage() {
+  const base = $("ctl-node").value;
+  if (!base) { $("ctl-storage-body").innerHTML = `<div class="empty">pick a control node</div>`; return; }
+  try {
+    const r = await getJSON(base, "/admin/storage/control");
+    if (!r.available) {
+      $("ctl-storage-body").innerHTML = `<div class="empty">no control-plane system-keyspace engine on this node</div>`;
+      return;
+    }
+    if (r.backend === "memory" || r.sstables == null) {
+      $("ctl-storage-body").innerHTML = `<div class="muted">backend memory (--ephemeral) — no WAL/SSTables; metadata does not survive a restart</div>`;
+      return;
+    }
+    const levels = (r.levels || []).map((x) => `L${x.level}:${x.tables}`).join("  ") || "—";
+    const tbl = r.sstables.map((s) => `<tr>
+      <td class="mono">${esc(s.seq)}</td><td class="mono">${esc(s.level)}</td>
+      <td class="mono">${esc(bytes(s.min_key))} → ${esc(bytes(s.max_key))}</td>
+      <td class="mono">${esc(s.min_version)}–${esc(s.max_version)}</td>
+      <td class="mono">${esc(s.file_size)}</td><td>${s.has_bloom ? "✓" : ""}</td></tr>`).join("");
+    $("ctl-storage-body").innerHTML =
+      `<div class="muted">backend ${esc(r.backend)} · levels ${esc(levels)}
+        · memtable ${esc(r.memtable.keys)} keys / ${esc(r.memtable.approx_bytes)} B
+        · WAL durable_seq ${esc(r.wal.durable_seq)} · rotations ${esc(r.wal.rotations)}
+        · ${esc((r.wal.segments || []).length)} segment(s)</div>`
+      + (tbl ? `<table><thead><tr><th>seq</th><th>level</th><th>key range</th><th>versions</th><th>bytes</th><th>bloom</th></tr></thead><tbody>${tbl}</tbody></table>`
+             : `<div class="empty">no sstables (all in memtable)</div>`);
+  } catch (e) { $("ctl-storage-body").innerHTML = `<div class="err-line">${esc(e)}</div>`; }
 }
 
 // The storage endpoints (WAL/LSM/scan/key) are node-local — a node that hosts no

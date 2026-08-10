@@ -135,6 +135,24 @@ async fn dashboard_serves_spa_with_cors_and_peers() {
             browser_js.contains("key-badge"),
             "the item form locks key attribute rows (no delete on pk/sk)"
         );
+        // ADR 0038 PR4: the Storage tab's control-plane system-keyspace
+        // section — the shell carries the markup (a distinct node selector +
+        // card, independent of the per-tablet `st-tablet`/`st-node` ones,
+        // since a control-only node hosts no CP tablet at all), and
+        // dashboard_storage.js carries the fetch/render logic against
+        // `/admin/storage/control`.
+        assert!(
+            body.contains("ctl-node") && body.contains("ctl-storage-body"),
+            "the Storage tab's shell carries the control-plane storage section"
+        );
+        let (s, _, storage_js) = raw(admin_addr, "GET", "/admin/ui/dashboard_storage.js").await;
+        assert_eq!(s, 200, "dashboard_storage.js is served");
+        assert!(
+            storage_js.contains("function loadControlStorage")
+                && storage_js.contains("/admin/storage/control")
+                && storage_js.contains("function updateControlStorageNodeOptions"),
+            "dashboard_storage.js fetches and renders the control-plane storage section"
+        );
         // The /admin/ui alias serves the same asset.
         let (s, _, body2) = raw(admin_addr, "GET", "/admin/ui").await;
         assert_eq!(s, 200);
