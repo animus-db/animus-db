@@ -613,6 +613,26 @@ pub enum ClientRequest {
     /// [`ClientResponse::Status`] shape a plain `Status` request gets,
     /// carrying the watermark to pass back as the next call's `last_seen`.
     WatchMetadata { last_seen: u64 },
+    /// **Cluster-allocated member id** (ADR 0036): request a fresh member id
+    /// minted from the control plane's own monotonic allocator
+    /// (`Metadata::next_alloc_id`, disjoint from every operator-chosen
+    /// `--node I` id) instead of an operator picking a small index. `nonce`
+    /// is the caller's idempotency key — see
+    /// [`MetaCommand::AllocateNodeId`]'s doc: a proposer retry after an
+    /// unconfirmed accept passes the *same* nonce and observes the *same*
+    /// allocated id, never a second one. `labels` seed the new member's
+    /// topology labels, exactly like [`ClientCtx::admin_add_member`]'s.
+    /// Any node answers this fully — including its own propose-and-confirm
+    /// round trip through the control leader (locally or relayed, see
+    /// [`is_relayable_command`]) — so the caller (typically a joining
+    /// process with no local `Metadata` yet to poll itself) gets a final
+    /// answer in one round trip. An additive variant, no version
+    /// negotiation needed (see [`JoinInfo`](Self::JoinInfo)'s doc for the
+    /// same reasoning).
+    AllocateNodeId {
+        nonce: String,
+        labels: BTreeMap<String, String>,
+    },
 }
 
 /// Whether `command` may be **relayed to the control leader** via
@@ -688,6 +708,21 @@ fn is_relayable_command(command: &MetaCommand) -> bool {
                 status: NodeStatus::Down,
                 ..
             }
+            // Cluster-allocated member ids (ADR 0036): a joining process has
+            // no local control role at all yet (it hasn't even bound its
+            // listeners), so `ClientRequest::AllocateNodeId` is its *only*
+            // way to reach the real leader — exactly the `Down`-registering
+            // `UpsertMember` case just above, and safe for the identical
+            // reason: `AllocateNodeId`'s apply always registers the new
+            // member `Down` (never any other status), granting no placement
+            // eligibility by itself — the detector still requires a real
+            // heartbeat before anything happens to it. Missing this arm
+            // would be the exact bimodal-per-process flake the root
+            // `CLAUDE.md` warns about: a join that happens to land on a
+            // follower-connected seed would hang until `JOIN_DISCOVERY_BUDGET`
+            // expires, indistinguishable from "no seed answered" — see
+            // `tests/seed_join_allocated.rs`'s follower-connected-seed case.
+            | MetaCommand::AllocateNodeId { .. }
     )
 }
 
@@ -739,6 +774,11 @@ pub enum ClientResponse {
         client_route: BTreeMap<NodeId, SocketAddr>,
         admin_addrs: Vec<SocketAddr>,
     },
+    /// Reply to [`AllocateNodeId`](ClientRequest::AllocateNodeId) (ADR
+    /// 0036): the freshly allocated member id — or, on a same-nonce retry,
+    /// the identical id already allocated for that nonce (never a second
+    /// one; see [`MetaCommand::AllocateNodeId`]'s doc).
+    NodeIdAllocated { node: NodeId },
 }
 
 /// Listen addresses for a node's endpoints (use port 0 for ephemeral): the
@@ -4802,6 +4842,7 @@ fn request_kind(request: &ClientRequest) -> &'static str {
         ClientRequest::MergeTablets { .. } => "merge_tablets",
         ClientRequest::JoinInfo => "join_info",
         ClientRequest::WatchMetadata { .. } => "watch_metadata",
+        ClientRequest::AllocateNodeId { .. } => "allocate_node_id",
     }
 }
 
@@ -4886,6 +4927,11 @@ async fn handle_request(ctx: &ClientCtx, request: ClientRequest) -> ClientRespon
         // Long-poll metadata watch (ADR 0035 PR5) — see `ClientCtx::
         // watch_metadata`'s doc.
         ClientRequest::WatchMetadata { last_seen } => ctx.watch_metadata(last_seen).await,
+        // Cluster-allocated member id (ADR 0036) — see `ClientCtx::
+        // allocate_node_id`'s doc.
+        ClientRequest::AllocateNodeId { nonce, labels } => {
+            ctx.allocate_node_id(nonce, labels).await
+        }
     }
 }
 
@@ -5093,6 +5139,43 @@ impl ClientCtx {
         {
             Ok(()) => ClientResponse::PutOk,
             Err(()) => ClientResponse::Error("merge did not commit in time".into()),
+        }
+    }
+
+    /// **Cluster-allocated member id** (ADR 0036): propose
+    /// `MetaCommand::AllocateNodeId` on the control-plane leader (locally if
+    /// we are it, else relayed — [`is_relayable_command`] allows this
+    /// command) and wait for the nonce's entry to commit + replicate here,
+    /// structurally identical to [`trigger_split`](Self::trigger_split) —
+    /// propose, then poll [`effective_metadata`](Self::effective_metadata)
+    /// for the exact effect. `effective_metadata()`, not
+    /// `self.control.metadata_cached()` directly, for the same
+    /// control-plane-follower-less-node staleness reason `trigger_split`'s
+    /// doc explains: this call itself may be running on a growth/data-only
+    /// node relaying on a caller's behalf. The whole propose-then-confirm
+    /// loop runs here, server-side, in one round trip — the caller (a
+    /// joining process with no local `Metadata` yet) just waits for the
+    /// reply.
+    async fn allocate_node_id(
+        &self,
+        nonce: String,
+        labels: BTreeMap<String, String>,
+    ) -> ClientResponse {
+        let cmd = MetaCommand::AllocateNodeId {
+            nonce: nonce.clone(),
+            labels,
+        };
+        match self
+            .propose_and_await(cmd, SCHEMA_COMMIT_TIMEOUT, || async {
+                self.effective_metadata()
+                    .node_id_allocations
+                    .get(&nonce)
+                    .copied()
+            })
+            .await
+        {
+            Ok(node) => ClientResponse::NodeIdAllocated { node },
+            Err(()) => ClientResponse::Error("node id allocation did not commit in time".into()),
         }
     }
 
@@ -6112,7 +6195,7 @@ pub async fn run_node_join(
     let my_control_id = config::control_id(index);
     let my_raftkv_id = config::raftkv_id(index);
 
-    let (original_control_ids, mut peers, mut client_route, mut admin_addrs) =
+    let (original_control_ids, peers, client_route, admin_addrs) =
         discover_join_info(&seeds).await?;
     check_join_collision(
         &seeds,
@@ -6129,22 +6212,56 @@ pub async fn run_node_join(
 
     let bound = Node::bind(my_control_id, my_raftkv_id, addrs, dir).await?;
 
-    // Merge this node's own entries into the discovered peer/route/admin sets
-    // — the same union `run_node_growth`'s expanded-config construction
-    // already produces, just built from a discovery reply instead of a
-    // pre-assembled config.
+    finish_combined_join(
+        bound,
+        my_control_id,
+        my_raftkv_id,
+        addrs.client,
+        addrs.admin,
+        original_control_ids,
+        peers,
+        client_route,
+        admin_addrs,
+        backend,
+    )
+    .await
+}
+
+/// The shared "merge discovered peers/route/admin → build `data_raftkv_ids`
+/// → `start_with`" tail of every **combined-mode** seed/join entry point —
+/// [`run_node_join`] (an operator-indexed id) and
+/// [`run_node_join_allocated`] (ADR 0036's cluster-allocated id): once a
+/// joiner has bound its listeners and knows its own ids and client address,
+/// finishing the join is identical regardless of *how* it picked those ids.
+/// Merges this node's own entries into the discovered peer/route/admin sets
+/// — the same union `run_node_growth`'s expanded-config construction already
+/// produces, just built from a discovery reply instead of a pre-assembled
+/// config — then starts the node exactly like `run_node_growth` does; ADR
+/// 0035 PR2's own note applies unchanged: `bootstrap` must never
+/// auto-register the joining node itself, so `data_raftkv_ids` is scoped to
+/// the pre-growth set discovered via `JoinInfo`, never including this node.
+#[allow(clippy::too_many_arguments)] // a join's ids + addrs + discovered sets, no natural grouping
+async fn finish_combined_join(
+    bound: BoundNode,
+    my_control_id: NodeId,
+    my_raftkv_id: NodeId,
+    my_client_addr: SocketAddr,
+    my_admin_addr: SocketAddr,
+    original_control_ids: Vec<NodeId>,
+    mut peers: BTreeMap<NodeId, SocketAddr>,
+    mut client_route: BTreeMap<NodeId, SocketAddr>,
+    mut admin_addrs: Vec<SocketAddr>,
+    backend: StorageBackend,
+) -> std::io::Result<Node> {
     for (id, addr) in bound.peer_entries() {
         peers.insert(id, addr);
     }
-    client_route.insert(my_raftkv_id, addrs.client);
-    client_route.insert(my_control_id, addrs.client);
-    if !admin_addrs.contains(&addrs.admin) {
-        admin_addrs.push(addrs.admin);
+    client_route.insert(my_raftkv_id, my_client_addr);
+    client_route.insert(my_control_id, my_client_addr);
+    if !admin_addrs.contains(&my_admin_addr) {
+        admin_addrs.push(my_admin_addr);
     }
 
-    // ADR 0035 PR2: as in `run_node_growth`, `bootstrap` must never
-    // auto-register this joining node itself — scope `data_raftkv_ids` to
-    // the pre-growth set discovered via `JoinInfo`, not including this node.
     let data_raftkv_ids: Vec<NodeId> = original_control_ids
         .iter()
         .map(|&id| config::raftkv_id(id as usize))
@@ -6227,6 +6344,145 @@ async fn check_join_collision(
     }
 }
 
+/// Generate a fresh join-attempt idempotency nonce (ADR 0036) at the **CLI
+/// pre-bind boundary** — before any listener is bound, any command proposed,
+/// or anything `SimEnv` could ever drive. This is a deliberate, narrow
+/// exception to the `Env`-seam rule (ADR 0003: no unseeded randomness outside
+/// `ProdEnv`/test code): [`run_node_join_allocated`]/
+/// [`run_node_data_join_allocated`] are real-process, real-`TcpStream` entry
+/// points that never run under `SimEnv` — no sim test ever calls them (the
+/// control-plane sim coverage of `MetaCommand::AllocateNodeId` itself, in
+/// `animus-control`'s `tests/node_id_allocation.rs`, drives the command
+/// directly and never touches this CLI-facing wrapper) — so a real random
+/// source here can never desync a deterministic replay the way it would
+/// inside anything the simulator steps. Analogous to the OS handing out an
+/// ephemeral TCP port: this value only needs to be practically unique for
+/// the lifetime of one join attempt, not cryptographically strong or
+/// globally unique forever — a collision would, at worst, make two unrelated
+/// join attempts share one idempotency key, so one attempt's retry would
+/// (harmlessly) observe the other's already-committed allocation instead of
+/// its own. **Do not** thread this into anything `SimEnv` could drive, and
+/// do not add a second call site without re-reading this doc.
+fn generate_join_nonce() -> String {
+    format!("{:032x}", rand::random::<u128>())
+}
+
+/// Request a fresh, cluster-allocated member id (ADR 0036): polls `seeds`
+/// for a [`ClientResponse::NodeIdAllocated`] reply to
+/// [`ClientRequest::AllocateNodeId`] within [`JOIN_DISCOVERY_BUDGET`] —
+/// the `AllocateNodeId` dual of [`discover_join_info`]. `nonce` makes every
+/// retry across [`poll_seeds_for`]'s passes safe: replaying the same nonce
+/// (see [`MetaCommand::AllocateNodeId`]'s doc) converges to the one id
+/// already minted for this join attempt, never a second one.
+async fn allocate_node_id(
+    seeds: &[SocketAddr],
+    nonce: String,
+    labels: BTreeMap<String, String>,
+) -> std::io::Result<NodeId> {
+    match poll_seeds_for(
+        seeds,
+        &ClientRequest::AllocateNodeId { nonce, labels },
+        JOIN_DISCOVERY_BUDGET,
+    )
+    .await?
+    {
+        ClientResponse::NodeIdAllocated { node } => Ok(node),
+        other => Err(std::io::Error::other(format!(
+            "seed returned an unexpected reply to AllocateNodeId: {other:?}"
+        ))),
+    }
+}
+
+/// Start a node as a **cluster-allocated-id seed/join member** (ADR 0036):
+/// the additive sibling of [`run_node_join`] for `animusd join --seed
+/// ADDR[,ADDR...] --base-port P` with **no `--node`** — the control plane's
+/// own [`MetaCommand::AllocateNodeId`] monotonic allocator mints this node's
+/// id atomically instead of an operator picking a small index, closing ADR
+/// 0032's own documented residual race (two simultaneous `--node`-indexed
+/// joiners choosing the same index) by construction: the allocator's
+/// disjoint range + apply-time presence check make every minted id unique
+/// on every replica, with no epoch-CAS and no pre-bind guess needed.
+///
+/// Same discovery ([`discover_join_info`]) as `run_node_join`, but
+/// **deliberately skips [`check_join_collision`] entirely** — there is
+/// nothing to collide with an id that was just freshly minted by
+/// construction — then asks the cluster itself for the id
+/// ([`allocate_node_id`], keyed by a nonce generated once here at the CLI
+/// boundary, [`generate_join_nonce`]) before binding anything. This node's
+/// own control id is a [`config::synthetic_control_id_for`] placeholder
+/// derived from the allocated raftkv id — a structurally safe permanent
+/// non-voter, exactly like a `--node`-indexed join's real `control_id(index)`
+/// serves the identical purpose (see that function's doc). Everything past
+/// binding is the same [`finish_combined_join`] tail `run_node_join` uses.
+///
+/// **Ephemeral identity**: a restart with a fresh nonce (a new process, or
+/// this same process retried after losing its own in-memory nonce) allocates
+/// a **new** id — the old id's `Member` entry lingers `Down`/address-less
+/// forever (ids are never reused, mirroring tablet ids), prunable later via
+/// the existing `RemoveMember`/decommission path like any other drained,
+/// unreferenced member. This is accepted ADR 0036 semantics, not a gap — see
+/// that ADR's "Back-compat / operator semantics" section. An operator who
+/// wants durable identity across restarts should keep using `--node I`.
+///
+/// # Errors
+/// An `io::Error` (`TimedOut`) if no seed answers [`JoinInfo`](ClientRequest::JoinInfo)
+/// or [`AllocateNodeId`](ClientRequest::AllocateNodeId) within
+/// [`JOIN_DISCOVERY_BUDGET`], or (as [`run_node_join`]) a bind / engine-open
+/// failure.
+pub async fn run_node_join_allocated(
+    seeds: Vec<SocketAddr>,
+    addrs: RoleAddrs,
+    dir: &Path,
+    backend: StorageBackend,
+    labels: BTreeMap<String, String>,
+) -> std::io::Result<Node> {
+    if seeds.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "join needs at least one --seed address",
+        ));
+    }
+    // Same combined-mode role requirement as `run_node_join` — see that
+    // entry point's doc for why (ADR 0035 PR2 is the config layer only).
+    addrs.raftkv.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "join needs a raftkv address (RoleAddrs.raftkv is None) — \
+             data-only join is `run_node_data_join_allocated`",
+        )
+    })?;
+    if addrs.control.is_none() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "join needs a control address (RoleAddrs.control is None) — \
+             control-only join is ADR 0035 PR3/PR4",
+        ));
+    }
+
+    let (original_control_ids, peers, client_route, admin_addrs) =
+        discover_join_info(&seeds).await?;
+
+    let nonce = generate_join_nonce();
+    let my_raftkv_id = allocate_node_id(&seeds, nonce, labels).await?;
+    let my_control_id = config::synthetic_control_id_for(my_raftkv_id);
+
+    let bound = Node::bind(my_control_id, my_raftkv_id, addrs, dir).await?;
+
+    finish_combined_join(
+        bound,
+        my_control_id,
+        my_raftkv_id,
+        addrs.client,
+        addrs.admin,
+        original_control_ids,
+        peers,
+        client_route,
+        admin_addrs,
+        backend,
+    )
+    .await
+}
+
 /// Start node `index` as a **data-only seed/join member** (ADR 0035 PR5): the
 /// data-only counterpart of [`run_node_join`], reusing its `JoinInfo`
 /// discovery + `Status` collision guard verbatim
@@ -6283,7 +6539,7 @@ pub async fn run_node_data_join(
     }
     let my_raftkv_id = config::raftkv_id(index);
 
-    let (original_control_ids, mut peers, mut client_route, mut admin_addrs) =
+    let (original_control_ids, peers, client_route, admin_addrs) =
         discover_join_info(&seeds).await?;
     check_join_collision(
         &seeds,
@@ -6300,14 +6556,43 @@ pub async fn run_node_data_join(
 
     let bound = Node::bind_data(my_raftkv_id, addrs, dir).await?;
 
-    // Merge this node's own entries into the discovered peer/route/admin sets
-    // — the data-only dual of `run_node_join`'s merge (a single raftkv peer
-    // entry, no control id of its own to add).
+    finish_data_join(
+        bound,
+        my_raftkv_id,
+        addrs.client,
+        addrs.admin,
+        original_control_ids,
+        peers,
+        client_route,
+        admin_addrs,
+        backend,
+    )
+    .await
+}
+
+/// The **data-only** dual of [`finish_combined_join`]: the shared "merge
+/// discovered peers/route/admin → derive control seeds → `start_data_with`"
+/// tail of [`run_node_data_join`] (an operator-indexed id) and
+/// [`run_node_data_join_allocated`] (ADR 0036's cluster-allocated id).
+#[allow(clippy::too_many_arguments)] // mirrors `finish_combined_join`'s shape
+async fn finish_data_join(
+    bound: BoundDataNode,
+    my_raftkv_id: NodeId,
+    my_client_addr: SocketAddr,
+    my_admin_addr: SocketAddr,
+    original_control_ids: Vec<NodeId>,
+    mut peers: BTreeMap<NodeId, SocketAddr>,
+    mut client_route: BTreeMap<NodeId, SocketAddr>,
+    mut admin_addrs: Vec<SocketAddr>,
+    backend: StorageBackend,
+) -> std::io::Result<Node> {
+    // The data-only dual of `finish_combined_join`'s merge (a single raftkv
+    // peer entry, no control id of its own to add).
     let (peer_id, peer_addr) = bound.peer_entry();
     peers.insert(peer_id, peer_addr);
-    client_route.insert(my_raftkv_id, addrs.client);
-    if !admin_addrs.contains(&addrs.admin) {
-        admin_addrs.push(addrs.admin);
+    client_route.insert(my_raftkv_id, my_client_addr);
+    if !admin_addrs.contains(&my_admin_addr) {
+        admin_addrs.push(my_admin_addr);
     }
 
     // The control deployment's client-API addresses (ADR 0035 §1/§4) — the
@@ -6331,6 +6616,71 @@ pub async fn run_node_data_join(
             admin_addrs,
         )
         .await
+}
+
+/// Start a node as a **data-only, cluster-allocated-id seed/join member**
+/// (ADR 0036): the data-only dual of [`run_node_join_allocated`], for
+/// `animusd data --seed ADDR[,ADDR...] --base-port P` with **no `--node`**.
+/// Reuses [`discover_join_info`] verbatim, **skips
+/// [`check_join_collision`] entirely** (nothing to collide with a freshly
+/// minted id), asks the cluster for an id via [`allocate_node_id`], and
+/// finishes through [`finish_data_join`] — the same shape
+/// [`run_node_join_allocated`] uses for the combined-mode role. See that
+/// function's doc for the ephemeral-identity trade-off (a restart with a
+/// fresh nonce allocates a new id; the old one lingers `Down`, prunable via
+/// `RemoveMember`).
+///
+/// # Errors
+/// As [`run_node_join_allocated`]: an `io::Error` (`InvalidInput`) if `addrs`
+/// has the wrong role shape, `TimedOut` if no seed answers within
+/// [`JOIN_DISCOVERY_BUDGET`], or a bind / engine-open failure.
+pub async fn run_node_data_join_allocated(
+    seeds: Vec<SocketAddr>,
+    addrs: RoleAddrs,
+    dir: &Path,
+    backend: StorageBackend,
+    labels: BTreeMap<String, String>,
+) -> std::io::Result<Node> {
+    if seeds.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "join needs at least one --seed address",
+        ));
+    }
+    addrs.raftkv.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "data join needs a raftkv address (RoleAddrs.raftkv is None)",
+        )
+    })?;
+    if addrs.control.is_some() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "data join must not have a control address (RoleAddrs.control is Some) — \
+             use `run_node_join_allocated` for a combined-mode join",
+        ));
+    }
+
+    let (original_control_ids, peers, client_route, admin_addrs) =
+        discover_join_info(&seeds).await?;
+
+    let nonce = generate_join_nonce();
+    let my_raftkv_id = allocate_node_id(&seeds, nonce, labels).await?;
+
+    let bound = Node::bind_data(my_raftkv_id, addrs, dir).await?;
+
+    finish_data_join(
+        bound,
+        my_raftkv_id,
+        addrs.client,
+        addrs.admin,
+        original_control_ids,
+        peers,
+        client_route,
+        admin_addrs,
+        backend,
+    )
+    .await
 }
 
 /// Upper bound on a client-protocol frame (the `u32` length prefix is

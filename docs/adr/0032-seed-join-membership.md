@@ -373,3 +373,13 @@ cleanup.
   the same index with a fresh dir — id reuse), plus all three refusal shapes
   (an original control-core member, a still-`Active` member, and
   `/admin/member/remove` posted to a follower's admin port).
+
+## Amended by ADR 0036
+
+[ADR 0036](0036-cluster-allocated-member-ids.md) makes `--node I` optional on
+`join`/`data --seed`: omitted, the control plane mints the joining node's id
+atomically from its own monotonic allocator instead of an operator picking
+one, closing this ADR's own documented residual race (two simultaneous
+`--node`-indexed joiners choosing the same index) for anyone who opts in.
+`--node I`'s durable-identity contract described above is unchanged and
+remains fully supported.

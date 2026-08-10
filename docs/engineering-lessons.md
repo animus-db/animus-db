@@ -2265,6 +2265,39 @@ debugging anything that feels like it might have happened before.
   `admin.rs::action_data_seed`, `dynamo.rs::item_key`,
   `animus-dynamo` `wire::encode_stored_item`;
   `admin_endpoint.rs::admin_seed_writes_synthetic_keys`.)
+- **A monotonic allocator with a disjoint base range gives a *hard*
+  uniqueness guarantee and needs no pre-check — prefer it over a best-effort
+  collision guard whenever the state machine itself can enforce uniqueness.**
+  `animusd join --node I` (ADR 0032) protects against two operators picking
+  the same index with a pre-bind `Status` read compared for exact
+  address-book equality — the ADR's own doc names the *real* backstop as
+  `RegisterNodeAddrs`'s idempotent apply, i.e. the pre-check narrows but does
+  not close the race. Adding `MetaCommand::AllocateNodeId` (ADR 0036) —
+  mirroring the existing tablet-id allocator
+  (`Metadata::next_tablet_id`/`next_free_tablet_id`, ADR 0023) instead of
+  inventing a new mechanism — makes two racing proposals land on two
+  distinct ids *by construction*: the monotonic floor plus an apply-time
+  presence check is evaluated identically on every replica, so no epoch-CAS
+  and no pre-bind guess is needed at all. General shape to reach for: when a
+  cluster hands out an id/slot/index anywhere, ask whether a client-side
+  guess-then-verify is standing in for a server-side monotonic allocator that
+  could instead make the race structurally impossible.
+- **Adding a variant to *any* wire enum that flows through an exhaustive
+  `match` needs a grep of every match site for *that enum*, not just the
+  usual `is_relayable_command`/`ClientRequest` dispatch allowlist.** Adding
+  `ClientResponse::NodeIdAllocated` broke `animus-cli`'s
+  `print_response(&ClientResponse)` — a plain, exhaustive `match` with no
+  wildcard arm, in a crate `is_relayable_command`'s doc comment never
+  mentions because it isn't a *command*-gating site at all; it's a
+  *response*-rendering one. The compiler caught this one (non-exhaustive
+  match is a hard error), but only because the match had no `_ =>` catch-all
+  — a wildcard arm would have silently swallowed the new variant with no
+  error and no runtime symptom until someone noticed the CLI printed
+  nothing useful for it. Lesson generalizes past this one enum: before
+  calling a "new variant" change done, `grep` for every `match` (and
+  `matches!`) over the enum's type name across the whole workspace, not just
+  the crate where the variant was added. (`animus-cli/src/main.rs::
+  print_response`; ADR 0036.)
 
 ### Parallel-agent orchestration
 - **Partition work by disjoint crate ownership — exactly one owner per shared

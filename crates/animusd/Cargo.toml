@@ -30,6 +30,11 @@ animus-cql.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+# Real (non-`Env`) randomness, used in exactly one deliberate, narrowly
+# commented place: `generate_join_nonce` at the CLI pre-bind boundary of a
+# cluster-allocated-id join (ADR 0036) — a leaf that never runs under
+# `SimEnv`. See that function's doc before adding another caller.
+rand.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 tracing-opentelemetry.workspace = true

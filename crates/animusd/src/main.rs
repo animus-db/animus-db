@@ -8,10 +8,10 @@
 //! animusd --config FILE --node I [--dir DIR] [--ephemeral] # run node I of a cluster (one process)
 //! animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B] # run an N-node cluster in one process
 //! animusd --cluster-control N --cluster-data M [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B] # run a whole split deployment in one process (ADR 0035)
-//! animusd join --seed ADDR[,ADDR...] --node I [--ip A] [--base-port P] [--dir D] [--ephemeral] # seed/join startup (ADR 0032 PR2)
+//! animusd join --seed ADDR[,ADDR...] [--node I] [--ip A] [--base-port P] [--dir D] [--ephemeral] # seed/join startup (ADR 0032 PR2; ADR 0036 if --node is omitted)
 //! animusd control --config FILE --node I [--dir DIR] # run node I as a control-only node (ADR 0035 PR3)
 //! animusd data --config FILE --node I [--dir DIR] [--ephemeral] # run node I as a data-only node (ADR 0035 PR4)
-//! animusd data --seed ADDR[,ADDR...] --node I [--ip A] [--base-port P] [--dir D] [--ephemeral] # data-only seed/join (ADR 0035 PR5)
+//! animusd data --seed ADDR[,ADDR...] [--node I] [--ip A] [--base-port P] [--dir D] [--ephemeral] # data-only seed/join (ADR 0035 PR5; ADR 0036 if --node is omitted)
 //! ```
 //!
 //! The data replica is durable by default (an on-disk LSM under the node's data
@@ -26,6 +26,13 @@
 //! 0032 PR2: a real data-plane member, control group unchanged, ADR 0030); a
 //! data-only node has the same option (`animusd data --seed <that address>
 //! --node I`, ADR 0035 PR5) against a separately-deployed control plane.
+//! **`--node I` is optional on both `join` and `data --seed`** (ADR 0036):
+//! omit it (and pass `--base-port P` explicitly instead) to let the control
+//! plane mint the joining node's id atomically from its own monotonic
+//! allocator, closing the residual race two simultaneous `--node`-indexed
+//! joiners could hit. This is an **ephemeral-identity** join — a restart
+//! with a fresh dir gets a *new* allocated id, unlike `--node I`'s durable,
+//! restart-stable identity; see `crates/animusd/CLAUDE.md` and ADR 0036.
 //!
 //! `animusd control` runs one of a config's control-role node(s) only — no
 //! storage engine, no `raftkv` env, no DynamoDB/CQL listeners; `animusd data`
@@ -109,10 +116,10 @@ const USAGE: &str = "usage:\n  \
     animusd --config FILE --node I [--dir DIR] [--ephemeral]\n  \
     animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B]\n  \
     animusd --cluster-control N --cluster-data M [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B]\n  \
-    animusd join --seed ADDR[,ADDR...] --node I [--ip A] [--base-port P] [--dir D] [--ephemeral]\n  \
+    animusd join --seed ADDR[,ADDR...] [--node I] [--ip A] [--base-port P] [--dir D] [--ephemeral]\n  \
     animusd control --config FILE --node I [--dir DIR]\n  \
     animusd data --config FILE --node I [--dir DIR] [--ephemeral]\n  \
-    animusd data --seed ADDR[,ADDR...] --node I [--ip A] [--base-port P] [--dir D] [--ephemeral]";
+    animusd data --seed ADDR[,ADDR...] [--node I] [--ip A] [--base-port P] [--dir D] [--ephemeral]";
 
 /// `gen-config`: print a generated cluster config as JSON — either combined-mode
 /// (`--nodes N`) or the ADR 0035 split-deployment shape (`--control-nodes N
@@ -312,6 +319,14 @@ async fn run_control(args: &[String]) -> Result<(), String> {
 /// discovers the control deployment from any already-running node's client
 /// address, mirroring `animusd join`'s discovery — see
 /// [`animusd::run_node_data_join`]'s doc), never both.
+///
+/// **`--node I` is required with `--config`** (unchanged), but **optional
+/// with `--seed`** (ADR 0036): present, this is byte-for-byte the existing
+/// operator-indexed join ([`run_data_join`]); absent, the control plane
+/// mints this node's id atomically instead ([`run_data_join_allocated`]),
+/// which needs an explicit `--base-port` in place of the index-derived
+/// default (an allocated id is not a small index, so there is no
+/// conventional port range to derive from it).
 async fn run_data(args: &[String]) -> Result<(), String> {
     let mut config_path: Option<String> = None;
     let mut node: Option<usize> = None;
@@ -334,14 +349,24 @@ async fn run_data(args: &[String]) -> Result<(), String> {
             other => return Err(format!("unknown data argument `{other}`")),
         }
     }
-    let index = node.ok_or("data requires --node I")?;
 
     match (config_path, seed_arg) {
         (Some(_), Some(_)) => Err("use either --config or --seed, not both".into()),
-        (Some(path), None) => run_data_config(&path, index, dir, backend).await,
-        (None, Some(seed_arg)) => {
-            run_data_join(&seed_arg, index, ip, base_port, dir, backend).await
+        (Some(path), None) => {
+            let index = node.ok_or("data requires --node I")?;
+            run_data_config(&path, index, dir, backend).await
         }
+        (None, Some(seed_arg)) => match node {
+            Some(index) => run_data_join(&seed_arg, index, ip, base_port, dir, backend).await,
+            None => {
+                let base_port = base_port.ok_or(
+                    "data --seed without --node requires an explicit --base-port \
+                     (a cluster-allocated id is not a small index, so there is no \
+                     conventional default port range for it — ADR 0036)",
+                )?;
+                run_data_join_allocated(&seed_arg, ip, base_port, dir, backend).await
+            }
+        },
         (None, None) => Err("data requires --config FILE or --seed ADDR[,ADDR...]".into()),
     }
 }
@@ -431,12 +456,74 @@ async fn run_data_join(
     Ok(())
 }
 
+/// `animusd data --seed ADDR[,ADDR...] --base-port P` with **no `--node`**
+/// (ADR 0036): the data-only dual of [`run_join_allocated`] — the control
+/// plane mints this node's raftkv id atomically ([`animusd::
+/// run_node_data_join_allocated`]) instead of an operator picking one.
+/// `base_port` is used **literally**, with no index multiplication (see
+/// [`run_join_allocated`]'s doc for why).
+async fn run_data_join_allocated(
+    seed_arg: &str,
+    ip: IpAddr,
+    base_port: u16,
+    dir: Option<std::path::PathBuf>,
+    backend: animusd::StorageBackend,
+) -> Result<(), String> {
+    let seeds: Vec<SocketAddr> = seed_arg
+        .split(',')
+        .map(|s| {
+            s.trim()
+                .parse::<SocketAddr>()
+                .map_err(|e| format!("invalid --seed address `{s}`: {e}"))
+        })
+        .collect::<Result<_, _>>()?;
+    if seeds.is_empty() {
+        return Err("data --seed requires at least one address".into());
+    }
+
+    let p = |role: u16| SocketAddr::new(ip, base_port.wrapping_add(role));
+    let addrs = RoleAddrs {
+        role: animusd::config::NodeRole::Data,
+        control: None,
+        client: p(1),
+        dynamo: p(2),
+        cql: p(3),
+        raftkv: Some(p(4)),
+        admin: p(5),
+    };
+    let dir = dir.unwrap_or_else(|| {
+        std::env::temp_dir().join(format!("animusd-data-join-alloc-{base_port}"))
+    });
+
+    let node =
+        animusd::run_node_data_join_allocated(seeds, addrs, &dir, backend, Default::default())
+            .await
+            .map_err(|e| format!("failed to join as a data node with an allocated id: {e}"))?;
+    println!(
+        "animusd: data node joined with an allocated id (CP) — client {} — dynamo http {} — cql {} — admin http://{}",
+        node.client_addr(),
+        node.dynamo_addr(),
+        node.cql_addr(),
+        node.admin_addr(),
+    );
+    println!("animusd: ready — Ctrl-C to stop");
+    wait_for_ctrl_c().await;
+    node.shutdown_graceful().await;
+    Ok(())
+}
+
 /// `join`: seed/join startup (ADR 0032 PR2) — a new node starts knowing only
 /// its own addresses + a seed list (client addresses of any existing nodes),
 /// learning the pre-growth control group + peer/route/admin address books
 /// from the cluster itself instead of an operator-assembled expanded
 /// `ClusterConfig`. See [`animusd::run_node_join`]'s doc for the collision
 /// guard + growth semantics this drives.
+///
+/// **`--node I` is optional** (ADR 0036): present, this is byte-for-byte the
+/// existing operator-indexed join path below; absent, [`run_join_allocated`]
+/// takes over — the control plane mints this node's id atomically instead,
+/// which needs an explicit `--base-port` (an allocated id is not a small
+/// index, so there is no conventional index-derived port range for it).
 async fn run_join(args: &[String]) -> Result<(), String> {
     let mut seed_arg: Option<String> = None;
     let mut index: Option<usize> = None;
@@ -459,7 +546,6 @@ async fn run_join(args: &[String]) -> Result<(), String> {
     }
 
     let seed_arg = seed_arg.ok_or("join requires --seed ADDR[,ADDR...]")?;
-    let index = index.ok_or("join requires --node I")?;
     let seeds: Vec<SocketAddr> = seed_arg
         .split(',')
         .map(|s| {
@@ -472,6 +558,30 @@ async fn run_join(args: &[String]) -> Result<(), String> {
         return Err("join requires at least one --seed address".into());
     }
 
+    match index {
+        Some(index) => run_join_indexed(seeds, index, ip, base_port, dir, backend).await,
+        None => {
+            let base_port = base_port.ok_or(
+                "join without --node requires an explicit --base-port \
+                 (a cluster-allocated id is not a small index, so there is no \
+                 conventional default port range for it — ADR 0036)",
+            )?;
+            run_join_allocated(seeds, ip, base_port, dir, backend).await
+        }
+    }
+}
+
+/// `join --seed ... --node I` (ADR 0032 PR2): the byte-for-byte-unchanged,
+/// operator-indexed half of [`run_join`] — see that function's doc for the
+/// two CLI contracts.
+async fn run_join_indexed(
+    seeds: Vec<SocketAddr>,
+    index: usize,
+    ip: IpAddr,
+    base_port: Option<u16>,
+    dir: Option<std::path::PathBuf>,
+    backend: animusd::StorageBackend,
+) -> Result<(), String> {
     // Six consecutive ports, same stride/role order as `ClusterConfig::generate`
     // (control/client/dynamo/cql/raftkv/admin) — defaults to `7100 + 6*index`,
     // mirroring `gen-config`'s own per-node base port so a joined node's
@@ -498,6 +608,51 @@ async fn run_join(args: &[String]) -> Result<(), String> {
         .map_err(|e| format!("failed to join as node {index}: {e}"))?;
     println!(
         "animusd: node {index} joined (CP) — client {} — dynamo http {} — cql {} — admin http://{}",
+        node.client_addr(),
+        node.dynamo_addr(),
+        node.cql_addr(),
+        node.admin_addr(),
+    );
+    println!("animusd: ready — Ctrl-C to stop");
+    wait_for_ctrl_c().await;
+    node.shutdown_graceful().await;
+    Ok(())
+}
+
+/// `join --seed ... --base-port P` with **no `--node`** (ADR 0036): the
+/// control plane mints this node's id atomically
+/// ([`animusd::run_node_join_allocated`]) instead of an operator picking
+/// one, closing ADR 0032's own documented residual race (two simultaneous
+/// `--node`-indexed joiners choosing the same index) by construction.
+/// `base_port` is used **literally**, with no index multiplication — an
+/// allocated id can be `>= 1_000_000`, so there is nothing conventional to
+/// derive a port range from; the caller must pass a `--base-port` whose
+/// six-port block doesn't collide with any other process's.
+async fn run_join_allocated(
+    seeds: Vec<SocketAddr>,
+    ip: IpAddr,
+    base_port: u16,
+    dir: Option<std::path::PathBuf>,
+    backend: animusd::StorageBackend,
+) -> Result<(), String> {
+    let p = |role: u16| SocketAddr::new(ip, base_port.wrapping_add(role));
+    let addrs = RoleAddrs {
+        role: animusd::config::NodeRole::Both,
+        control: Some(p(0)),
+        client: p(1),
+        dynamo: p(2),
+        cql: p(3),
+        raftkv: Some(p(4)),
+        admin: p(5),
+    };
+    let dir =
+        dir.unwrap_or_else(|| std::env::temp_dir().join(format!("animusd-join-alloc-{base_port}")));
+
+    let node = animusd::run_node_join_allocated(seeds, addrs, &dir, backend, Default::default())
+        .await
+        .map_err(|e| format!("failed to join with an allocated id: {e}"))?;
+    println!(
+        "animusd: node joined with an allocated id (CP) — client {} — dynamo http {} — cql {} — admin http://{}",
         node.client_addr(),
         node.dynamo_addr(),
         node.cql_addr(),
