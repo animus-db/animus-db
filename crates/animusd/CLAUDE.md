@@ -183,7 +183,33 @@ For `Local` the two are identical (`raft.metadata()`); `Remote` genuinely differ
 (mirror vs. network fetch). **Proposing is inherently local-Raft-log-only** —
 `ClusterEdgeState::leader_handle()` stays a concrete `RaftNode` registry and never
 goes through `ControlHandle`; `Remote` returns inert honest values for
-`is_leader()`/`term()`/`config()`/etc.
+`is_leader()`/`term()`/etc.
+
+**`config()` returns `Option<BTreeSet<NodeId>>`, not a bare set (ADR 0037 PR2).**
+`Local` is always `Some(raft.config())` — a genuine control-group replica reading
+its own live `RaftCore` config. `Remote` has no local `RaftCore`, so it answers
+the last control-voter set it has *observed on the wire* (`RemoteControlClient::
+control_voters`, fed by `observe()` under the same freshness gate as the metadata
+mirror) — `None` until the first `Status`/`WatchMetadata` reply lands. This is
+deliberately an `Option`, not an always-populated `BTreeSet::new()` default as it
+used to be: "never fetched yet" and "the control group genuinely has zero
+voters" must stay distinguishable to any caller that cares (see the
+engineering-lessons "handle has no local authority" entry) — most callers don't
+and just `.unwrap_or_default()` it (`/admin/raft`'s `voters` field, the
+`ClientResponse::Status::control_voters` wire field below).
+
+**`ClientResponse::Status` carries `control_voters: BTreeSet<NodeId>`
+(`#[serde(default)]`, ADR 0037 PR2)** — the answering node's own
+`ctx.control.config().unwrap_or_default()` at reply time. This is the wire echo
+of the *live* Raft config that actually governs control-plane quorum, distinct
+from `Metadata.node_addrs`' `role: "control"` bookkeeping (a discovery hint: a
+node can be registered with the control role and not currently be a live voter —
+before its membership change lands, or after it's been removed). It rides the
+same `Status`/`WatchMetadata` round trip `metadata_fresh()`/the mirror sync loop
+already make, so a `Remote` node's own `RemoteControlClient` picks it up for
+free — no new request type. A future control-plane membership-change admin
+surface (later PR in the ADR 0037 stack) is the intended reader of this on a
+`Remote`/CLI/dashboard caller that needs "who can I even try talking to."
 
 **Discipline**: a read feeding a *non-retried, permanent* decision must use
 `metadata_fresh()`, not `metadata_cached()`/`effective_metadata()` — a data-only

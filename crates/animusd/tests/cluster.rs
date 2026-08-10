@@ -52,11 +52,25 @@ async fn cluster_serves_put_get_and_status_over_tcp() {
     // Status reflects the bootstrapped tablet and membership.
     let addr0 = nodes[0].client_addr();
     match call(addr0, ClientRequest::Status).await {
-        ClientResponse::Status { metadata: meta, .. } => {
+        ClientResponse::Status {
+            metadata: meta,
+            control_voters,
+            ..
+        } => {
             // ADR 0023: a fresh cluster has **no** data tablet until the first write
             // provisions one (the put below auto-provisions the `kv` table's tablet).
             assert_eq!(meta.tablets.len(), 0, "no data tablet until first write");
             assert_eq!(meta.members.len(), 3, "expected three members");
+            // ADR 0037 PR2: a combined-mode node is a genuine control-group
+            // voter (`ControlHandle::Local`), so its own `Status` reply
+            // carries the live 3-member control-voter set straight off
+            // `RaftCore::config()` — ids 0..3 by this cluster's id scheme
+            // (`config::control_id`).
+            assert_eq!(
+                control_voters,
+                std::collections::BTreeSet::from([0, 1, 2]),
+                "combined node's Status did not carry the live control-voter set"
+            );
         }
         other => panic!("unexpected status response: {other:?}"),
     }

@@ -467,3 +467,56 @@ async fn data_node_restart_rejoins_and_serves_reads_again() {
     .await
     .expect("data_node_restart_rejoins_and_serves_reads_again timed out");
 }
+
+/// ADR 0037 PR2: a data-only node (`ControlHandle::Remote`, no local
+/// `RaftCore` at all) must be able to learn the control plane's *live*
+/// voter set — not just the address-book bookkeeping in `Metadata.
+/// node_addrs` — purely from the same `Status`/`WatchMetadata` round trip
+/// `metadata_fresh`/the mirror sync loop already make. Before this PR,
+/// `ControlHandle::Remote::config()` always answered an unconditional empty
+/// set; this proves the wired-through value actually lands, and lands the
+/// *real* 3-member control group, not a placeholder.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn data_node_observes_live_control_voters_after_a_fresh_fetch() {
+    timeout(Duration::from_secs(90), async {
+        let dir = tempfile::tempdir().unwrap();
+        let (control_nodes, data_nodes, _config) = bring_up_split(3, 2, dir.path()).await;
+        await_leader(&control_nodes).await;
+
+        let expected: std::collections::BTreeSet<animus_env::NodeId> =
+            (0..3).map(animusd::config::control_id).collect();
+
+        // Converged-or-timeout poll (never a fixed sleep): the data node's
+        // own `remote_metadata_sync_loop` only refreshes its
+        // `RemoteControlClient` on its own schedule, so query it with a
+        // plain `Status` request (server-side, this hits the SAME
+        // `ctx.control.config()` call the sync loop's `observe` feeds) and
+        // retry until it has synced at least once.
+        for data_node in &data_nodes {
+            timeout(Duration::from_secs(20), async {
+                loop {
+                    if let ClientResponse::Status { control_voters, .. } =
+                        call(data_node.client_addr(), ClientRequest::Status).await
+                        && control_voters == expected
+                    {
+                        return;
+                    }
+                    sleep(Duration::from_millis(100)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "data node {} never observed the live control-voter set in 20s",
+                    data_node.client_addr()
+                )
+            });
+        }
+
+        for n in control_nodes.iter().chain(data_nodes.iter()) {
+            n.shutdown_graceful().await;
+        }
+    })
+    .await
+    .expect("data_node_observes_live_control_voters_after_a_fresh_fetch timed out");
+}
