@@ -1292,6 +1292,12 @@ impl BoundNode {
                     client: my_client_addr.to_string(),
                     admin: my_admin_addr.to_string(),
                     role: "combined".to_string(),
+                    // No control-Raft address here (ADR 0037 PR4): a
+                    // statically-configured voter's address comes from
+                    // `ClusterConfig` at every node's own bring-up, not this
+                    // self-registration — `control` exists only for a
+                    // runtime-added voter (`admin_add_control_member`).
+                    control: None,
                 },
             ),
             self.client_listener,
@@ -1366,6 +1372,11 @@ impl BoundNode {
             raftkv_sync_env,
             static_peers.clone(),
         )));
+
+        // Control-role peer-sync loop (ADR 0037 PR4): the peer_sync_loop
+        // above's dual for the control env — keeps this node able to reach
+        // any control voter added at runtime. See its own doc.
+        tasks.push(tokio::spawn(control_peer_sync_loop(ctx.clone())));
 
         // **Control-plane-follower-less growth node mirror** (ADR 0030): this
         // node's own control role is a genuine voter of `control_ids` iff its own
@@ -1989,7 +2000,7 @@ impl BoundControlNode {
         let edge = ClusterEdgeState::new();
         edge.register_control(raft.clone());
 
-        let (ctx, tasks) = spawn_common_tail(
+        let (ctx, mut tasks) = spawn_common_tail(
             ControlHandle::Local(raft.clone()),
             edge,
             None,
@@ -2002,11 +2013,20 @@ impl BoundControlNode {
                     client: self.client_addr.to_string(),
                     admin: self.admin_addr.to_string(),
                     role: "control".to_string(),
+                    // Same reasoning as the combined-mode self-registration
+                    // above: statically-configured, so its address comes
+                    // from `ClusterConfig`, not this call (ADR 0037 PR4).
+                    control: None,
                 },
             ),
             self.client_listener,
             self.admin_listener,
         );
+
+        // Control-role peer-sync loop (ADR 0037 PR4) — see its own doc; a
+        // control-only node needs it exactly as much as a combined node
+        // does (both hold a genuine `ControlHandle::Local`).
+        tasks.push(tokio::spawn(control_peer_sync_loop(ctx.clone())));
 
         Node {
             raft: ControlHandle::Local(raft),
@@ -2185,6 +2205,9 @@ impl BoundDataNode {
                     client: my_client_addr.to_string(),
                     admin: my_admin_addr.to_string(),
                     role: "data".to_string(),
+                    // A data-only node has no control role at all (ADR 0037
+                    // PR4's `control` field is moot here).
+                    control: None,
                 },
             ),
             self.client_listener,
@@ -4151,14 +4174,20 @@ impl ClientCtx {
     /// resolved there, deterministically, same as every other CAS-style
     /// command in this codebase):
     /// - `node`'s paired **control** id (`node - RAFTKV_ID_BASE`, guarded
-    ///   against underflow for a `node` below the base) is one of this
-    ///   cluster's original control-plane ids: an original control-core
-    ///   member must never be decommissioned this way. The control Raft group
-    ///   is static (ADR 0030) — this call only ever prunes `Metadata.members`,
-    ///   it cannot remove a real control-group voter — and `bootstrap`
-    ///   (idempotent, `BoundNode::start_with`) re-registers every control-core
-    ///   raftkv id `Active` on its very next tick regardless, so "removing"
-    ///   one would just be a no-op loop, not a real decommission.
+    ///   against underflow for a `node` below the base) is a **currently
+    ///   live** control-plane voter (ADR 0037 — this reads `self.control.
+    ///   config()`, the live Raft config, **not** a static original-members
+    ///   list). Before ADR 0037 the control group was static (ADR 0030) and
+    ///   this check read `self.admin.control_ids`, the process-start
+    ///   snapshot — a genuine "is this id part of the control plane" decision
+    ///   that a static read gets wrong the instant the group becomes elastic
+    ///   (the exact class of bug the ADR 0029 ReadIndex-quorum lesson warns
+    ///   about, see `docs/engineering-lessons.md`): a control-removed id must
+    ///   become decommissionable, and a still-live voter — even one added at
+    ///   runtime, an id `self.admin.control_ids` never even knew about — must
+    ///   still be refused. `animus admin decommission --force-control-remove`
+    ///   drives the two-phase flow this refusal points the operator at:
+    ///   control-remove first, then this call.
     /// - the member is not drained: still `Active`/`Joining`, or still
     ///   referenced by any tablet ([`Metadata::tablets_referencing`]) — refused
     ///   with the same counts `/admin/member/drain-status` reports, rather
@@ -4174,27 +4203,33 @@ impl ClientCtx {
     /// decommission flow's real last step is stopping the process, not this
     /// call.
     pub(crate) fn admin_remove_member(&self, node: NodeId) -> Result<(), String> {
-        if let Some(control_id) = node.checked_sub(config::RAFTKV_ID_BASE)
-            && self.admin.control_ids.contains(&control_id)
-        {
-            return Err(format!(
-                "node {node} is an original control-plane core member (control id \
-                     {control_id}); the control group is static (ADR 0030) and this member \
-                     must never be decommissioned"
-            ));
-        }
-        // Check leadership BEFORE reading `self.control.metadata_cached()` for the
-        // drain-status refusals below: a follower's own replica can lag the
-        // leader's just-committed rebalance/release-GC moves (real replication
-        // lag, not a bug), so evaluating "is it drained" off a follower's stale
-        // view can misfire as "still referenced" even after the operator has
-        // confirmed (on the leader) that draining converged — surfacing the
-        // wrong refusal instead of the intended "retry on the leader" routing
-        // error. The leader's own metadata is what actually gates the apply, so
-        // checking leadership first makes every other refusal here trustworthy.
+        // Check leadership BEFORE reading `self.control.config()` (the
+        // control-voter refusal below) or `self.control.metadata_cached()`
+        // (the drain-status refusals below): a follower's own applied state
+        // can lag the leader's just-committed control-membership change or
+        // rebalance/release-GC move (real replication lag, not a bug), so
+        // evaluating any of these off a follower's stale view can misfire
+        // instead of the intended "retry on the leader" routing error. The
+        // leader's own state is what actually gates the apply, so checking
+        // leadership first makes every refusal here trustworthy.
         let Some(leader) = self.edge.leader_handle() else {
             return Err(self.not_leader_error());
         };
+        if let Some(control_id) = node.checked_sub(config::RAFTKV_ID_BASE)
+            && self
+                .control
+                .config()
+                .unwrap_or_default()
+                .contains(&control_id)
+        {
+            return Err(format!(
+                "node {node} is a CURRENT control-plane voter (control id \
+                 {control_id}); the control group is elastic now (ADR 0037) — \
+                 control-remove it first (`animus admin control-remove`), or run \
+                 `animus admin decommission --force-control-remove`, which does \
+                 that for you before proceeding"
+            ));
+        }
         let meta = self.control.metadata_cached();
         let Some(member) = meta.members.get(&node) else {
             return Err(format!("node {node} is not a cluster member"));
@@ -4284,10 +4319,24 @@ impl ClientCtx {
         };
         let current = self.control.config().unwrap_or_default();
         if current.contains(&node) {
-            // Idempotent: already a voter. Still worth refreshing the local
-            // peer-book entry in case `addr` changed (e.g. a replacement
-            // process at the same id) — cheap and harmless either way.
+            // Idempotent: already a voter. Still worth refreshing this env's
+            // own local peer-book entry in case `addr` changed (e.g. a
+            // replacement process at the same id) — cheap and harmless
+            // either way. Also re-propose the *replicated* address if it
+            // changed (ADR 0037 PR4): `merge_peer` alone only updates this
+            // leader's own env, exactly the known scope limit that motivated
+            // adding `NodeAddrs.control` in the first place — every other
+            // control-role node's `control_peer_sync_loop` only ever learns
+            // an updated address from `Metadata.node_addrs`, never from this
+            // call's local `merge_peer` side effect.
             leader.env().merge_peer(node, addr);
+            let meta = self.control.metadata_cached();
+            if let Some(mut addrs) = meta.node_addrs.get(&node).cloned()
+                && addrs.control != Some(addr)
+            {
+                addrs.control = Some(addr);
+                let _ = leader.propose(MetaCommand::RegisterNodeAddrs { node, addrs });
+            }
             return Ok(());
         }
         let meta = self.control.metadata_cached();
@@ -4297,12 +4346,22 @@ impl ClientCtx {
                  control-core, or previously allocated); pick a different id"
             ));
         }
-        let addrs = meta.node_addrs.get(&node).cloned().unwrap_or(NodeAddrs {
+        // Merge into whatever address-book entry already exists for `node`
+        // (e.g. a self-registration this same process already made for its
+        // client/admin addresses) rather than blindly overwriting it, then
+        // stamp `control` — the field this action exists to populate (ADR
+        // 0037 PR4): replicated so every control-role node's own
+        // `control_peer_sync_loop` can reach the new voter, not just this
+        // leader's own env (see `ProdEnv::merge_peer`'s doc for the gap this
+        // closes).
+        let mut addrs = meta.node_addrs.get(&node).cloned().unwrap_or(NodeAddrs {
             raftkv: String::new(),
             client: String::new(),
             admin: String::new(),
             role: "control".to_string(),
+            control: None,
         });
+        addrs.control = Some(addr);
         match leader.propose(MetaCommand::RegisterNodeAddrs { node, addrs }) {
             ProposeResult::Accepted { .. } => {}
             ProposeResult::NotLeader { .. } => {
@@ -4431,7 +4490,28 @@ impl ClientCtx {
             None
         };
         match leader.change_membership(remaining) {
-            ProposeResult::Accepted { .. } => Ok(ControlRemoveOutcome { warning }),
+            ProposeResult::Accepted { .. } => {
+                // Prune the replicated control address (ADR 0037 PR4) —
+                // mirrors `RemoveMember`'s own address pruning, but only the
+                // `control` field, not the whole `NodeAddrs` entry: `node`
+                // may still be a data-role/combined cluster member after
+                // losing its control-voter status, and its `raftkv`/
+                // `client`/`admin` addresses must survive. Best-effort: a
+                // stray leftover address is harmless bookkeeping (every
+                // control-role node's `control_peer_sync_loop` simply keeps
+                // `merge_peer`-ing an address for an id no longer in the
+                // live Raft config, which nothing ever addresses), so a
+                // races-with-a-fresh-leadership-change failure here does not
+                // fail the removal itself — the removal already committed.
+                let meta = self.control.metadata_cached();
+                if let Some(mut addrs) = meta.node_addrs.get(&node).cloned()
+                    && addrs.control.is_some()
+                {
+                    addrs.control = None;
+                    let _ = leader.propose(MetaCommand::RegisterNodeAddrs { node, addrs });
+                }
+                Ok(ControlRemoveOutcome { warning })
+            }
             ProposeResult::NotLeader { .. } => Err(
                 "control leadership moved, or a membership change is already in \
                      flight; retry on the leader"
@@ -4586,6 +4666,52 @@ async fn route_sync_loop(ctx: ClientCtx, static_route: BTreeMap<NodeId, SocketAd
             }
         }
         *ctx.client_route.lock().expect("client route poisoned") = book;
+        tokio::time::sleep(PEER_SYNC_INTERVAL).await;
+    }
+}
+
+/// Keep every **control**-role node's own control env peer book current with
+/// runtime-added control voters (ADR 0037 PR4): merges `Metadata.node_addrs
+/// [*].control` into `ctx.control` via [`ControlHandle::merge_control_peer`]
+/// each tick — the control-role dual of [`peer_sync_loop`]'s raftkv overlay
+/// and [`route_sync_loop`]'s client-route overlay, closing the gap
+/// `ProdEnv::merge_peer`'s own doc names: before this loop existed, a
+/// runtime-added voter's address was known only to whichever node happened
+/// to be leader at `admin_add_control_member` time, so a later leadership
+/// change or crash left every *other* voter (and any newly-added voter after
+/// *that*) permanently unable to reach it.
+///
+/// Spawned only where `ctx.control` is genuinely [`ControlHandle::Local`] —
+/// [`BoundNode::start_with`] (combined) and [`BoundControlNode::
+/// start_control_with`] (control-only) — never on a data-only node
+/// ([`BoundDataNode::start_data_with`]), which has no local control env at
+/// all; `merge_control_peer` itself is also a no-op on `Remote`, so spawning
+/// it there would just be a wasted task, not a bug.
+///
+/// A no-op, not a gap, for every **statically**-configured voter: its
+/// address comes from `ClusterConfig` at every node's own process start
+/// (unchanged, the same static book every node has always built at
+/// bring-up) and its `NodeAddrs.control` stays `None` (see that field's own
+/// doc) — this loop only ever has something to merge for a voter added
+/// after the fact.
+///
+/// Uses [`ControlHandle::merge_control_peer`] (incremental), not a full
+/// `set_peers` rebuild like [`peer_sync_loop`]: unlike the raftkv/
+/// client-route overlays, there is no separate "static control peer book"
+/// parameter to layer under here — each control-role node's own static book
+/// was already installed once, directly, at `RaftNode::start`, and a
+/// periodic *partial* rebuild (this loop only ever sees `control` addresses,
+/// never the full peer set) would have to either omit or somehow
+/// reconstruct that static portion on every tick; incremental `merge_peer`
+/// sidesteps the question entirely by never touching an entry this loop
+/// didn't itself add.
+async fn control_peer_sync_loop(ctx: ClientCtx) {
+    loop {
+        for (id, addrs) in ctx.effective_metadata().node_addrs {
+            if let Some(addr) = addrs.control {
+                ctx.control.merge_control_peer(id, addr);
+            }
+        }
         tokio::time::sleep(PEER_SYNC_INTERVAL).await;
     }
 }
@@ -6547,6 +6673,7 @@ pub async fn run_node_join(
             client: addrs.client.to_string(),
             admin: addrs.admin.to_string(),
             role: "combined".to_string(),
+            control: None,
         },
     )
     .await?;
@@ -6891,6 +7018,7 @@ pub async fn run_node_data_join(
             client: addrs.client.to_string(),
             admin: addrs.admin.to_string(),
             role: "data".to_string(),
+            control: None,
         },
     )
     .await?;

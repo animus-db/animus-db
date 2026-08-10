@@ -24,6 +24,17 @@
 //!   but carries a `warning`; removing the last voter is refused outright;
 //!   and neither admin action is relayable — a follower's admin port refuses
 //!   both, symmetric with `/admin/drain`/`/admin/member/remove`.
+//! - [`runtime_added_voter_survives_leadership_change_to_a_different_original_voter`]
+//!   (ADR 0037 PR4): closes PR3's known gap where a runtime-added voter's
+//!   address was only ever known to whichever node happened to be leader at
+//!   `admin_add_control_member` time (`ProdEnv::merge_peer`'s "known scope
+//!   limit") — forces a leadership transfer to a *different* ORIGINAL voter
+//!   (self-removing the adder, which arms a transfer without actually
+//!   completing the removal — see `admin_remove_control_member`'s doc) and
+//!   proves the new leader still replicates a fresh proposal to the
+//!   runtime-added voter, via the replicated `NodeAddrs.control` field +
+//!   `control_peer_sync_loop`, not the ephemeral single-env `merge_peer` call
+//!   PR3 shipped with.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -31,7 +42,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use animusd::config::NodeRole;
-use animusd::{ClusterConfig, Node, RoleAddrs};
+use animusd::{ClusterConfig, MetaCommand, Node, NodeStatus, RoleAddrs};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
@@ -502,6 +513,158 @@ async fn remove_control_voter_refusals_transfer_and_quorum_warnings() {
         );
     }
 
+    for node in nodes {
+        node.shutdown();
+    }
+}
+
+/// **ADR 0037 PR4 regression**: PR3 shipped `admin_add_control_member` with a
+/// known, documented gap (`ProdEnv::merge_peer`'s doc, `admin_add_control_
+/// member`'s own doc) — a runtime-added voter's control-Raft address was only
+/// ever merged into *whichever node happened to be leader* at the moment of
+/// the add, so a *later* leadership change left every other voter (including
+/// any future one) permanently unable to reach it: their own control env's
+/// peer book simply never learned the address. This test drives exactly that
+/// sequence and proves the fix (the replicated `NodeAddrs.control` field +
+/// every control-role node's own `control_peer_sync_loop`) closes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 10)]
+async fn runtime_added_voter_survives_leadership_change_to_a_different_original_voter() {
+    let dir = tempfile::tempdir().unwrap();
+    let (nodes, config) = bring_up_combined(3, dir.path()).await;
+    await_bootstrap(&nodes).await;
+    let admin_addrs: Vec<SocketAddr> = config.nodes.iter().map(|n| n.admin).collect();
+
+    let adder = leader_index(&nodes);
+
+    // Add a 4th control voter through the current leader (`adder`).
+    let new_id = 3u64;
+    let (grown, grown_addrs) = join_control_nonvoter(&config, new_id, dir.path()).await;
+    let grown_control_addr = grown_addrs
+        .control
+        .expect("control-only node has a control addr");
+
+    // Wait for `grown`'s own one-shot self-registration (`ClientCtx::
+    // register_node_addrs`, relayed since it starts life a non-voter) to
+    // land on the REAL cluster (checked via an original voter's applied
+    // `Metadata` — `grown`'s OWN view stays permanently empty until it is
+    // actually added as a voter below: a quiet non-voter receives no real
+    // Raft replication at all, by design, so it structurally can never
+    // observe its own commit through its own `effective_metadata()`)
+    // *and* give its bounded retry loop time to fully exhaust
+    // (`SCHEMA_COMMIT_TIMEOUT`, 10s): since a non-voter can never see its
+    // own registration confirmed, that loop keeps re-proposing its
+    // (unmodified, `control: None`) desired value on every tick until it
+    // gives up — racing `control/member/add`'s differing `control: Some`
+    // write within that window would let a later retry clobber it back to
+    // `None`. Mirrors the real operator runbook's own "confirm it's up
+    // first" step (plan §3) — this test exercises the intended sequencing,
+    // not the race a too-hasty add would hit.
+    let self_registered_on_cluster = async {
+        loop {
+            if nodes[adder].metadata().node_addrs.contains_key(&new_id) {
+                return;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    };
+    timeout(Duration::from_secs(15), self_registered_on_cluster)
+        .await
+        .expect("grown node's own self-registration never landed on the real cluster");
+    sleep(Duration::from_secs(11)).await;
+
+    let (status, body) = add_control_member(admin_addrs[adder], new_id, grown_control_addr).await;
+    assert_eq!(status, 200, "control/member/add failed: {body}");
+
+    // Converge on {0,1,2,3} everywhere (every original voter + the new node's
+    // own view) before forcing the transfer — this also guarantees every
+    // original voter's own `control_peer_sync_loop` has had at least one
+    // tick to merge in id 3's replicated address, since `RegisterNodeAddrs`
+    // commits strictly before the config-change entry that this poll
+    // observes.
+    let grown_admin = grown.admin_addr();
+    for &a in admin_addrs.iter().chain(std::iter::once(&grown_admin)) {
+        let converged = async {
+            loop {
+                let (status, body) = control_members(a).await;
+                if status == 200 && voters_of(&body) == Some(vec![0, 1, 2, 3]) {
+                    return;
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        };
+        timeout(Duration::from_secs(30), converged)
+            .await
+            .unwrap_or_else(|_| panic!("node at {a} never converged to voters {{0,1,2,3}}"));
+    }
+
+    // Force a leadership transfer away from `adder`: self-remove its own
+    // slot. `admin_remove_control_member` arms `transfer_leadership` to the
+    // smallest OTHER live voter id in `{0,1,2,3}` — always one of the THREE
+    // ORIGINAL voters here (id 3, the just-added one, is the largest id in
+    // the set, so it can never be the smallest-other-than-`adder`) — then
+    // reports the transfer via an error rather than completing the removal,
+    // so the live voter set stays exactly `{0,1,2,3}`; only leadership moves.
+    let (status, _body) = remove_control_member(admin_addrs[adder], adder as u64).await;
+    assert_eq!(
+        status, 409,
+        "self-removal should report the transfer, not silently succeed"
+    );
+
+    // Wait for a DIFFERENT original voter to report itself leader.
+    let wait_for_new_leader = async {
+        loop {
+            if let Some(i) = (0..3).find(|&i| i != adder && nodes[i].is_control_leader()) {
+                return i;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    };
+    let new_leader_idx = timeout(Duration::from_secs(15), wait_for_new_leader)
+        .await
+        .expect("leadership never transferred to a different original voter");
+    assert_ne!(new_leader_idx, adder, "leadership should have moved");
+
+    // The config is unaffected by the transfer alone — still all 4 voters.
+    let (status, body) = control_members(admin_addrs[new_leader_idx]).await;
+    assert_eq!(status, 200, "control/members failed: {body}");
+    assert_eq!(voters_of(&body), Some(vec![0, 1, 2, 3]));
+
+    // The real proof: propose something new *through the new (different)
+    // leader* and confirm it replicates to the runtime-added voter's own
+    // locally-applied `Metadata`. This is only possible if the new leader's
+    // own control env actually knows id 3's control address — before this
+    // PR, only `adder`'s env ever learned it, so this same sequence would
+    // have left id 3 permanently unreachable from the new leader (a
+    // silently-dropped `AppendEntries`/`InstallSnapshot`, per
+    // `ProdEnv::send`'s doc for a destination with no known peer address).
+    let label_key = "adr0037_pr4_regression".to_string();
+    assert!(
+        nodes[new_leader_idx].propose_meta(MetaCommand::UpsertMember {
+            node: 12_345,
+            labels: BTreeMap::from([(label_key.clone(), "1".to_string())]),
+            status: NodeStatus::Down,
+        }),
+        "the new leader should accept its own proposal"
+    );
+    let replicated_to_grown = async {
+        loop {
+            if grown
+                .metadata()
+                .members
+                .get(&12_345)
+                .and_then(|m| m.labels.get(&label_key))
+                .is_some()
+            {
+                return;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    };
+    timeout(Duration::from_secs(15), replicated_to_grown)
+        .await
+        .expect("the runtime-added voter never saw the new leader's proposal replicate");
+
+    grown.shutdown();
     for node in nodes {
         node.shutdown();
     }

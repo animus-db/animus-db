@@ -10,10 +10,17 @@
 //! `/admin/status` (membership **and** the address book) while the cluster
 //! keeps serving reads/writes → stop the removed node's process → rejoin at
 //! the same index with a fresh dir (proving id reuse after removal). Also
-//! exercises the three refusal shapes: an original control-core member can
-//! never be removed, an `Active` member can't be removed before draining,
-//! and `/admin/member/remove` is local-control-leader-only (a follower
-//! refuses cleanly, mirroring `/admin/drain`).
+//! exercises the three refusal shapes: a still-**live** control-plane voter
+//! can never be removed this way (ADR 0037 — a *dynamic* check now, not the
+//! static original-members list ADR 0030/0032 used), an `Active` member
+//! can't be removed before draining, and `/admin/member/remove` is
+//! local-control-leader-only (a follower refuses cleanly, mirroring
+//! `/admin/drain`).
+//!
+//! [`decommission_refuses_live_control_voter_then_succeeds_after_control_remove`]
+//! (ADR 0037 PR4) drives the combined-node-is-a-control-voter two-phase
+//! flow's server-side halves directly: refuse while the target's control id
+//! is a live voter, control-remove it, then the same decommission succeeds.
 //!
 //! Real TCP/time — polls with generous timeouts, not deterministic assertions.
 
@@ -696,6 +703,163 @@ async fn dashboard_health_recovers_after_decommission_shrink() {
     );
 
     joined_nodes[1].shutdown();
+    for node in core_nodes {
+        node.shutdown();
+    }
+}
+
+/// **ADR 0037 PR4**: a combined node's control-voter status must gate its
+/// data-plane decommission through the LIVE control config, not the static
+/// original-members snapshot `admin_remove_member` used to read before this
+/// PR (ADR 0030/0032's "an original control-core member can never be
+/// decommissioned" rule — see the refusal in
+/// `decommission_drains_removes_and_allows_id_reuse` above, which still
+/// holds because that test never control-removes anyone).
+///
+/// Drives the plan §7/§8 two-phase flow's server-side halves directly (the
+/// same admin actions `animus admin decommission --force-control-remove`
+/// orchestrates client-side, `run_control_remove` + a convergence poll then
+/// the ordinary drain → drain-status → remove flow): fully drain an original
+/// combined node, confirm `/admin/member/remove` still refuses it (its
+/// control id is a *live* voter), control-remove it, poll to convergence,
+/// then confirm the *same* `/admin/member/remove` call now succeeds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 10)]
+async fn decommission_refuses_live_control_voter_then_succeeds_after_control_remove() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // 1. Bring up a 3-node combined core (control voters {0,1,2}).
+    let (core_nodes, core_config) = bring_up(3, dir.path()).await;
+    await_bootstrap(&core_nodes).await;
+    let core_clients: Vec<SocketAddr> = core_config.nodes.iter().map(|a| a.client).collect();
+    let core_admin: Vec<SocketAddr> = core_config.nodes.iter().map(|a| a.admin).collect();
+    for table in TABLES {
+        put(&core_clients, table, b"k0", b"v0", 30).await;
+    }
+
+    // 2. Join a 4th combined node so there's somewhere to relocate the
+    // target's replicas to when it drains — it stays a permanent control
+    // non-voter (ADR 0030); this test only needs its data role.
+    let join_index = core_config.len();
+    let (joined, _joined_addrs, _joined_dir) = join_fresh(
+        &core_clients,
+        join_index,
+        dir.path(),
+        StorageBackend::default(),
+    )
+    .await;
+    let join_raftkv_id = animusd::config::raftkv_id(join_index);
+    let promoted = async {
+        loop {
+            if member_statuses(core_admin[0])
+                .await
+                .get(&join_raftkv_id)
+                .map(String::as_str)
+                == Some("Active")
+            {
+                return;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    };
+    timeout(Duration::from_secs(20), promoted)
+        .await
+        .unwrap_or_else(|_| panic!("joined node never promoted to Active"));
+
+    // 3. Target a NON-LEADER original combined node (control id == its
+    // index here) — keeps this test focused on the decommission-integration
+    // behavior, not the leader-self-removal transfer mechanics already
+    // covered by `control_membership_admin.rs`.
+    let leader = leader_index(&core_nodes);
+    let target = (0..3usize)
+        .find(|&i| i != leader)
+        .expect("a non-leader exists in a 3-node core");
+    let target_control_id = target as u64;
+    let target_raftkv_id = animusd::config::raftkv_id(target);
+    let leader_admin = core_admin[leader];
+
+    // 4. Drain the target and poll to convergence — its replicas relocate to
+    // the joined 4th node.
+    {
+        let body = serde_json::json!({"node": target_raftkv_id}).to_string();
+        let (status, resp) = admin(leader_admin, "POST", "/admin/drain", Some(&body)).await;
+        assert_eq!(status, 200, "drain failed: {resp}");
+    }
+    let drained = async {
+        loop {
+            let (status, body) = drain_status(leader_admin, target_raftkv_id).await;
+            if status == 200 {
+                let remaining = body["tablets_remaining"].as_u64().unwrap_or(u64::MAX);
+                let node_status = body["status"].as_str().unwrap_or("");
+                if remaining == 0 && node_status != "Active" {
+                    return;
+                }
+            }
+            sleep(Duration::from_millis(200)).await;
+        }
+    };
+    timeout(Duration::from_secs(60), drained)
+        .await
+        .unwrap_or_else(|_| panic!("target node never finished draining"));
+
+    // 5. Refusal: fully drained, but its control id is STILL a live voter —
+    // `/admin/member/remove` refuses (409), naming the control-plane reason.
+    {
+        let (status, body) = remove_member(leader_admin, target_raftkv_id).await;
+        assert_eq!(
+            status, 409,
+            "removing a still-live control voter should be refused: {body}"
+        );
+        let msg = body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        assert!(
+            msg.contains("control"),
+            "refusal should name the control-plane reason: {msg}"
+        );
+    }
+
+    // 6. Control-remove it — the two-phase flow's first step.
+    {
+        let body = serde_json::json!({"node": target_control_id}).to_string();
+        let (status, resp) = admin(
+            leader_admin,
+            "POST",
+            "/admin/control/member/remove",
+            Some(&body),
+        )
+        .await;
+        assert_eq!(status, 200, "control/member/remove failed: {resp}");
+    }
+    let control_removed = async {
+        loop {
+            let (status, body) = admin(leader_admin, "GET", "/admin/control/members", None).await;
+            if status == 200
+                && let Some(voters) = body["voters"].as_array()
+                && !voters.iter().any(|v| v.as_u64() == Some(target_control_id))
+            {
+                return;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    };
+    timeout(Duration::from_secs(15), control_removed)
+        .await
+        .unwrap_or_else(|_| panic!("control voter removal never converged"));
+
+    // 7. The two-phase flow's second half: the SAME `/admin/member/remove`
+    // call now succeeds — proving the refusal in step 5 read the LIVE
+    // config (ADR 0037), not a static original-members snapshot that would
+    // have refused forever (the pre-ADR-0037 behavior).
+    {
+        let (status, body) = remove_member(leader_admin, target_raftkv_id).await;
+        assert_eq!(
+            status, 200,
+            "removing the now-control-removed node should succeed: {body}"
+        );
+    }
+
+    joined.shutdown();
     for node in core_nodes {
         node.shutdown();
     }

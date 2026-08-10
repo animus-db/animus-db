@@ -63,7 +63,7 @@ reconfigure <admin-addr> <tablet> <voter,voter,...>
 drain <admin-addr> <node-id>                   # ADR 0029/0032 release replicas
 drain-status <admin-addr> <node-id>
 remove <admin-addr> <node-id>
-decommission <admin-addr> <node-id>            # composite, see below
+decommission <admin-addr> <node-id> [--force-control-remove]  # composite, see below (ADR 0037 PR4)
 control-add <leader-admin-addr> <node-id> <new-node-admin-addr>      # ADR 0037 PR3
 control-remove <leader-admin-addr> <node-id>                         # ADR 0037 PR3
 control-grow <leader-admin-addr> <node-id> <admin-addr> [<node-id> <admin-addr>...]
@@ -77,6 +77,19 @@ control-grow <leader-admin-addr> <node-id> <admin-addr> [<node-id> <admin-addr>.
   **control-plane leader's** admin address (the underlying admin actions are
   local-leader-only and not relayed); on a follower it fails with a
   "not the control-plane leader" routing error — retry against the leader.
+  **A combined node that is also a *live* control-plane voter (ADR 0037
+  PR4)**: `run_decommission` asks `GET /admin/control/members` up front
+  (best-effort — an old binary/route-miss just skips this pre-check and
+  falls through to the ordinary flow, whose own final `remove` step still
+  carries the authoritative refusal); if the target's paired **control** id
+  (`node - RAFTKV_ID_BASE`, the same combined-mode convention `control-add`/
+  `control-remove` already use) is a live voter, it refuses immediately
+  (before ever draining) unless `--force-control-remove` is passed, in which
+  case it runs `control-remove` + polls to convergence *first*, then falls
+  through to the unchanged drain → drain-status → remove flow. The
+  authoritative refusal always lives server-side in `admin_remove_member`
+  (`animusd`) — this is a friendlier, fail-fast CLI-side mirror of it, not a
+  replacement.
 - **`control-add`/`control-grow` are also orchestration, not passthroughs**
   (ADR 0037 PR3): they take the new control voter's own **admin** address
   (this CLI's convention everywhere else), not the internal control-Raft

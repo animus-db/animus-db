@@ -916,6 +916,69 @@ debugging anything that feels like it might have happened before.
   gap is named, not silently left for a future maintainer to rediscover the
   hard way. See `crates/animus-env/src/prod.rs::ProdEnv::merge_peer`'s doc
   and `ClientCtx::admin_add_control_member`'s doc (`animusd`).
+  **Update (ADR 0037 PR4): this gap is now closed**, by finishing the port
+  the paragraph above predicted — `animus-control::NodeAddrs` gained a
+  `control: Option<SocketAddr>` field (replicated via the existing
+  `RegisterNodeAddrs`, `None` for every statically-configured voter) and
+  `animusd` gained `control_peer_sync_loop`, a genuine per-tick
+  static-∪-replicated overlay for the control role (mirroring
+  `peer_sync_loop`, but `merge_peer`-incremental rather than
+  `set_peers`-rebuilding, since there is no separate static control peer
+  book parameter to layer under here — each node's static book was already
+  installed once, directly, at `RaftNode::start`). Regression:
+  `crates/animusd/tests/control_membership_admin.rs::
+  runtime_added_voter_survives_leadership_change_to_a_different_original_voter`
+  (self-removes the adder to force a transfer to a *different* original
+  voter, then proves a fresh proposal still reaches the runtime-added
+  voter). Building that regression test surfaced a second, unrelated race
+  worth its own note (below): a non-voter's self-registration can never
+  observe its own commit, so its bounded retry keeps re-proposing (and can
+  clobber a concurrent admin action's write) for the full
+  `SCHEMA_COMMIT_TIMEOUT`.
+- **A newly-joined control-only *non-voter*'s own self-registration retry
+  can never observe its own commit landing — so it keeps re-proposing (and
+  can clobber a concurrent writer's update to the same replicated entry)
+  for the *entire* bounded retry window, not just until the first
+  successful commit.** `ClientCtx::register_node_addrs`'s doc already
+  describes it as "best-effort... re-proposing each tick" bounded by
+  `SCHEMA_COMMIT_TIMEOUT` (10s) — the *intended* shape is: propose, then
+  stop once `effective_metadata()` (this node's own applied view) reflects
+  it. That confirmation path silently assumes the caller's own applied
+  state eventually reflects the commit — true for every existing caller
+  (a combined/data node is either already a real voter, or an ADR 0030
+  growth node reading the `remote_metadata_sync_loop` mirror through
+  `effective_metadata()`), but **false for a genuine control-only non-voter**
+  (ADR 0037's own "quiet non-voter until `change_membership` adds it"
+  shape): its `ControlHandle::Local` has no mirror substitution and its own
+  `RaftCore` never receives real replication while it isn't a voter, so
+  `effective_metadata()` stays a permanently-empty default the whole time —
+  the confirmation condition can *never* become true, so the loop keeps
+  firing on every `SCHEMA_POLL_INTERVAL` tick until the full 10s elapses,
+  regardless of whether the relay actually landed on the first attempt.
+  Building the PR4 regression test above, calling `admin_add_control_member`
+  (which stamps `NodeAddrs.control`) while this window was still open let a
+  *later* self-registration retry (still proposing the node's original,
+  `control: None` self-registration) silently overwrite the admin action's
+  write straight back to `None` — reproduced 100% of the time when the
+  admin action ran immediately after the non-voter's own bring-up, and
+  confirmed by direct inspection (dumping the non-voter's own applied
+  `Metadata`, which stayed completely empty throughout — the "never
+  observes its own commit" half of the diagnosis, not a race that only
+  sometimes loses). Fixed at the call site, not the mechanism: the test
+  now waits for self-registration to land **on the real cluster** (an
+  original voter's applied `Metadata`, not the non-voter's own) *and* then
+  waits out the remainder of the fixed 10s retry-exhaustion window before
+  driving any other write to that same node's address-book entry —
+  mirroring what the real operator runbook's own "confirm it's up first"
+  step (plan §3) already achieves in practice (a real "start the process,
+  then go confirm health" gap is almost always ≥10s). **General check
+  before trusting a "propose then confirm via my own state" retry helper
+  for a new caller class**: does *this* caller's own read of "did it land"
+  ever actually observe the commit, or does it structurally read a view
+  that can't reflect it yet (a permanent non-voter, a disconnected mirror,
+  a stale cache)? If it can't, the retry isn't "best-effort until
+  confirmed" — it's "unconditionally retry for the full bound," which is a
+  much bigger window for a concurrent writer to lose a race in.
 - **Converting a required address field with an ephemeral-fallback default
   (`SocketAddr` + `#[serde(default = "default_ephemeral_addr")]`) to
   `Option<SocketAddr>` and reusing a bare `#[serde(default)]` silently changes
@@ -2444,6 +2507,52 @@ debugging anything that feels like it might have happened before.
   being wrong is a signature-widening PR later that touches every call site,
   not a graceful extension. (`animusd` `control_handle.rs::ControlHandle::
   config`, `RemoteControlClient::control_voters`.)
+
+- **A "which ids are the control plane" read has (at least) two structurally
+  different purposes — a *seed* for a node's own bring-up vs. a *live
+  authority* for a running correctness decision — and only an explicit,
+  named audit catches every instance of the second kind hiding behind the
+  first kind's static source.** Auditing every `control_ids`/`admin.
+  control_ids`/`ClusterConfig::control_ids()` read in `animusd` for ADR 0037
+  PR4 (the plan's own named deliverable, mirroring the ADR 0029 ReadIndex-
+  quorum lesson's warning that this exact class of bug is invisible until a
+  *real* membership change exercises the divergence): the overwhelming
+  majority are legitimately static — `RaftNode::start`'s initial `all_nodes`
+  at process bring-up, `ClusterConfig::control_ids()`'s config-file-derived
+  helper (there is no "live" analogue for a plain config accessor), and
+  `ClientRequest::JoinInfo`'s reply (a joining node's *seed*, which the
+  replicated `node_addrs` overlay + this same PR's `control_peer_sync_loop`
+  already keep current after that point, same as every other ADR 0032 PR1
+  seed-then-overlay axis). Exactly **one** site was a live-authority
+  decision wearing a static-seed's clothes: `admin_remove_member`'s
+  control-voter refusal, fixed to read `self.control.config()` (see the
+  `docs/engineering-lessons.md` entry on `ControlHandle::config()`'s
+  `Option`, and `animusd/CLAUDE.md`'s decommission gotcha). **One further
+  site was flagged, not fixed, as an accepted, narrower, deliberately
+  out-of-scope gap**: `heartbeat_loop`'s `control_ids` parameter (a raftkv-
+  role node's heartbeat *destination* list, captured once at that node's own
+  process start) never gets a live-overlay refresh the way `peer_sync_loop`/
+  `route_sync_loop`/this PR's own `control_peer_sync_loop` do for their
+  respective axes — so a raftkv node started before a control voter was
+  added at runtime never heartbeats that voter directly, and if it later
+  becomes leader, this specific already-running raftkv node's heartbeats
+  keep missing it (a *bounded*, self-healing gap in practice: the *other*
+  raftkv nodes docker/replicas/heartbeats still reach it, and a restart of
+  the affected node picks up the current `control_ids` again) rather than a
+  silent total loss of failure detection. Fixing it properly is the same
+  "port `peer_sync_loop`'s pattern to a new axis" shape this PR already did
+  twice (`control_peer_sync_loop` for the control role's own peer book,
+  PR2's `node_addrs`/`Status.control_voters` wiring for discovery) — sizing
+  it as its own follow-up rather than a third instance crammed into this PR
+  keeps the diff reviewable, per this file's own standing don't-conflate-
+  unrelated-fixes discipline. **General rule for any future "is this id
+  part of X" read**: ask whether getting it wrong for one tick is (a)
+  "a joining node briefly doesn't know about a very recent peer, self-heals
+  next sync tick" (fine, static) or (b) "a decision that, once made, is hard
+  or impossible to undo, or degrades a safety/liveness property with no
+  self-healing path" (must read the live authority) — and write the answer
+  down at the call site, not just in an audit PR's description, so the next
+  reader doesn't have to re-derive it.
 
 ### Parallel-agent orchestration
 - **Partition work by disjoint crate ownership — exactly one owner per shared
