@@ -9,7 +9,7 @@
 //! animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B] # run an N-node cluster in one process
 //! animusd --cluster-control N --cluster-data M [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B] # run a whole split deployment in one process (ADR 0035)
 //! animusd join --seed ADDR[,ADDR...] [--node I] [--ip A] [--base-port P] [--dir D] [--ephemeral] # seed/join startup (ADR 0032 PR2; ADR 0036 if --node is omitted)
-//! animusd control --config FILE --node I [--dir DIR] # run node I as a control-only node (ADR 0035 PR3)
+//! animusd control --config FILE --node I [--dir DIR] [--ephemeral] # run node I as a control-only node (ADR 0035 PR3)
 //! animusd data --config FILE --node I [--dir DIR] [--ephemeral] # run node I as a data-only node (ADR 0035 PR4)
 //! animusd data --seed ADDR[,ADDR...] [--node I] [--ip A] [--base-port P] [--dir D] [--ephemeral] # data-only seed/join (ADR 0035 PR5; ADR 0036 if --node is omitted)
 //! ```
@@ -117,7 +117,7 @@ const USAGE: &str = "usage:\n  \
     animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B]\n  \
     animusd --cluster-control N --cluster-data M [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B]\n  \
     animusd join --seed ADDR[,ADDR...] [--node I] [--ip A] [--base-port P] [--dir D] [--ephemeral]\n  \
-    animusd control --config FILE --node I [--dir DIR]\n  \
+    animusd control --config FILE --node I [--dir DIR] [--ephemeral]\n  \
     animusd data --config FILE --node I [--dir DIR] [--ephemeral]\n  \
     animusd data --seed ADDR[,ADDR...] [--node I] [--ip A] [--base-port P] [--dir D] [--ephemeral]";
 
@@ -274,11 +274,14 @@ async fn run_single(
 }
 
 /// `control`: run node `index` of `config` as a **control-only** node (ADR
-/// 0035 PR3) — no storage engine, no `raftkv` env, no DynamoDB/CQL listeners.
+/// 0035 PR3) — no CP data storage engine, no `raftkv` env, no DynamoDB/CQL
+/// listeners. `--ephemeral` (ADR 0038 PR2) selects a volatile in-memory
+/// system-keyspace mirror engine instead of the durable on-disk default.
 async fn run_control(args: &[String]) -> Result<(), String> {
     let mut config_path: Option<String> = None;
     let mut node: Option<usize> = None;
     let mut dir: Option<std::path::PathBuf> = None;
+    let mut backend = animusd::StorageBackend::default();
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -286,6 +289,7 @@ async fn run_control(args: &[String]) -> Result<(), String> {
             "--config" => config_path = Some(parse_next(&mut it, "--config")?),
             "--node" => node = Some(parse_next(&mut it, "--node")?),
             "--dir" => dir = Some(parse_next::<String>(&mut it, "--dir")?.into()),
+            "--ephemeral" => backend = animusd::StorageBackend::Memory,
             other => return Err(format!("unknown control argument `{other}`")),
         }
     }
@@ -295,7 +299,7 @@ async fn run_control(args: &[String]) -> Result<(), String> {
     let config = ClusterConfig::from_json(&text).map_err(|e| format!("parsing {path}: {e}"))?;
     let dir = dir.unwrap_or_else(|| std::env::temp_dir().join(format!("animusd-control-{index}")));
 
-    let node = animusd::run_node_control(&config, index, &dir)
+    let node = animusd::run_node_control(&config, index, &dir, backend)
         .await
         .map_err(|e| format!("failed to start control node {index}: {e}"))?;
     println!(

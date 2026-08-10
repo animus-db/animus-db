@@ -72,8 +72,13 @@ async fn bring_up_control(n: usize, dir: &std::path::Path) -> (Vec<Node>, animus
         let mut nodes = Vec::new();
         let mut failed = false;
         for i in 0..n {
-            match animusd::run_node_control(&config, i, dir.join(format!("node-{attempt}-{i}")))
-                .await
+            match animusd::run_node_control(
+                &config,
+                i,
+                dir.join(format!("node-{attempt}-{i}")),
+                animusd::StorageBackend::default(),
+            )
+            .await
             {
                 Ok(node) => nodes.push(node),
                 Err(_) => {
@@ -333,7 +338,13 @@ async fn mixed_cluster_put_via_control_node_forwards_to_data_node() {
             let mut control_nodes: Vec<Node> = Vec::new();
             let mut ok = true;
             for i in 0..3 {
-                match animusd::run_node_control(&config, i, dir.path().join(format!("c-{i}"))).await
+                match animusd::run_node_control(
+                    &config,
+                    i,
+                    dir.path().join(format!("c-{i}")),
+                    animusd::StorageBackend::default(),
+                )
+                .await
                 {
                     Ok(n) => control_nodes.push(n),
                     Err(_) => {

@@ -25,6 +25,7 @@
 
 pub mod detector;
 pub mod meta;
+pub mod mirror;
 pub mod node;
 pub mod persist;
 pub mod raft;

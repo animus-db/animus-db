@@ -15,6 +15,10 @@ workspace = true
 animus-env.workspace = true
 animus-tablet.workspace = true
 animus-placement.workspace = true
+# The system-keyspace engine mirror (ADR 0038 PR2, `mirror.rs`): the mirror
+# writes through the plain `StorageEngine` trait (`merge_batch`), the same
+# per-key-LWW primitive the leaderful CP data plane's own apply path uses.
+animus-storage.workspace = true
 serde.workspace = true
 # `raw_value`: compaction embeds the cached, already-serialized snapshot image
 # (`snapshot_blob`) into the WAL `Snapshot` record via `RawValue` so the (large)
