@@ -649,8 +649,19 @@ heartbeats). The 25 binaries:
   stays parked across steady-state traffic with nothing proposed, and resolves
   on its first poll when the advance already happened (the wake-before-park case,
   safe by construction).
-- **`prod_liveness.rs`** — a real-thread `ProdEnv` smoke test guarding the
-  liveness properties `SimEnv`'s virtual clock can't see.
+- **`prod_liveness.rs`** — real-thread `ProdEnv` smoke tests guarding the
+  liveness properties `SimEnv`'s virtual clock can't see: a freshly-joined
+  follower catches a large, compacted `Metadata` cluster up quickly without
+  running leadership away (`large_metadata_catch_up_stays_live`); and (ADR
+  0038 PR3) `sustained_metadata_churn_over_a_real_engine_stays_live` —
+  hundreds of `MetaCommand`s at a steady drip through a 3-node group backed
+  by a **real on-disk `LsmEngine`** (not `MemoryEngine`, whose I/O is
+  synchronous/trivial and so can't exercise this), asserting both a bounded
+  term delta *and* a bounded count of leadership transitions actually
+  observed during the churn, plus bounded-deadline convergence — the direct
+  real-thread proof that the apply task's real engine I/O (now on a separate
+  task from consensus) never blocks heartbeat/`AppendEntries` processing
+  long enough to trip the election timeout.
 - **`node_id_allocation.rs`** — `MetaCommand::AllocateNodeId` (ADR 0036): the
   monotonic allocator mints distinct ids under concurrent proposals, a
   replayed nonce is idempotent, and the counter survives a restart.

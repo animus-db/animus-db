@@ -374,6 +374,29 @@ debugging anything that feels like it might have happened before.
   the wrong question reads as confirmation and can misdirect the next
   person for months.** (`animus-env`, `animusd`;
   `animusd/tests/split_cluster.rs::full_split_cluster_restart_recovers_metadata_and_data`.)
+  **Same general rule, a fresh instance (ADR 0038 PR3, ProdEnv liveness
+  tests over a real `LsmEngine`)**: a test's teardown calling the plain
+  `ProdEnv::shutdown()` (abort-and-return, not `shutdown_and_wait`) then
+  immediately `std::fs::remove_dir_all(dir)` can yank a directory out from
+  under a still-unaborted background task's in-flight file write — observed
+  as the control plane's apply task (`node.rs`'s `meta_apply_and_compact`)
+  panicking on `env.replace(WAL, ..).await.expect("wal compaction")` with a
+  `NotFound`-class I/O error, logged from a `tokio-rt-worker` thread after
+  the foreground test had already reported `ok` (a background-task panic
+  doesn't fail the test unless something joins/unwraps that handle). Not a
+  new bug introduced by the apply-task split — the same `env.replace(WAL,
+  ..)` call already raced identically when it lived inline on `drive()`
+  pre-cutover — just newly visible because a `ProdEnv` liveness test now
+  exercises a real on-disk engine, and confirmed pre-existing by reproducing
+  it with only the *unmodified* `large_metadata_catch_up_stays_live` test
+  (`MemoryEngine`-backed, no PR3 code path involved). Left unfixed here
+  (per this repo's own "root-cause + fix incidental live bugs as their own
+  PR" discipline) — noted as a candidate follow-up: either every `ProdEnv`
+  liveness test's teardown should use `shutdown_and_wait` before deleting
+  its temp dirs, or `meta_apply_and_compact`'s WAL replace should tolerate a
+  torn-directory error the way `animus-cp-data`'s own compaction path does
+  (checked against a `halted` flag before asserting) — the latter needs a
+  shutdown/halted signal `animus-control::RaftNode` doesn't have yet.
   **Environmental confound noted while debugging this (2026-07):** the day's
   elevated failure rate (3 of 4 full-workspace runs) partly coincided with an
   unrelated long-lived `animusd --cluster-control 3 --cluster-data 5` process
