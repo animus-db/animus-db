@@ -53,15 +53,15 @@ membership and a placement policy, decide which nodes replicate a tablet.
 - Liveness is the **caller's** job: pass only the candidates you'd place on
   (e.g. `Active` members). This crate enforces *policy* (residency + spread),
   not health.
-- **Tablet placement now also places Accord consensus groups.** Per-shard
-  consensus (ADR 0011, `animus-consensus`'s `ShardedOwner`/`ShardRouter`) runs
-  **one Accord group per tablet**, and a tablet's replica set *is* its consensus
-  group's replica set — derived from the same tablet map this crate computes
-  placement for. So `select_replicas`/`replan` choosing a tablet's replicas
-  transitively decides where that shard's consensus participants live; there is no
-  separate placement axis for consensus. (No code in this crate changed for that —
-  it is a consumer relationship: consensus reads the tablet map, this crate writes
-  it via the control plane.)
+- `rebalance_step` is generic over the tablet key (`<K: Ord + Copy>`) — the only
+  generic in the crate; callers pass whatever id type indexes their tablet map.
+- No seeds/replay apply here: this is a pure library with no sim timers — the
+  `ANIMUS_SEED` convention belongs to the through-Raft integration tests in
+  `animus-control`, not to this crate's own suite.
+- Historical note: per-shard Accord placement (`animus-consensus`'s
+  `ShardedOwner`/`ShardRouter`, one Accord group per tablet whose replica set was
+  the tablet's) used to be a consumer of the tablet map this crate feeds; that
+  driver was trimmed with Accord's testbed-only scope (ADR 0018/0019).
 
 ## Tests
 

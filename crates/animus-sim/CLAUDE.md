@@ -58,13 +58,11 @@ function of one seed. This is the substrate every distributed test runs on.
   afterward and it recovers from disk — the real restart-and-rejoin path (see
   `animus-control/tests/restart.rs`). `crash` keeps the tasks running but mute;
   `stop` ends them.
-- **`Coresident::sibling` mints a co-resident inbox at runtime** (ADR 0017 D): it
-  registers the new id in the shared `nodes`/`inboxes` maps exactly as
-  `Simulator::env` does (idempotent `entry(..).or_default()`) and returns a `SimEnv`
-  bound to it — sharing the same `Arc<Shared>` (clock, disk, executor). Touches
-  only those maps: no RNG draw, no timeline event, so a trace stays a pure function
-  of the seed. This is what lets a split's apply spawn the new tablet's group on the
-  same simulated node without the test pre-allocating its id.
+- `SimEnv` still implements `Coresident::sibling` (mint a co-resident inbox at
+  runtime, ADR 0017 D), but the mechanism is **vestigial**: production co-hosting
+  moved to multiplexed `(node, stream)` addressing (ADR 0026, below) and nothing
+  live calls `sibling` anymore. It touches only the `nodes`/`inboxes` maps (no
+  RNG draw, no timeline event), so keeping it costs determinism nothing.
 - Determinism invariants to preserve when editing: only `BTreeMap`/`BTreeSet`,
   RNG drawn only in deterministic order, no wall clock. Disk ops add no timeline
   events and — under the **default** `DiskConfig` — draw no RNG, so they don't

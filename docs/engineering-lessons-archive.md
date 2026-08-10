@@ -1,6 +1,8 @@
 # Engineering-lessons archive
 
-This file holds root-`CLAUDE.md` "Engineering practices" entries that have
+This file holds engineering-lessons entries (from
+[`engineering-lessons.md`](engineering-lessons.md), formerly the root
+`CLAUDE.md`'s "Engineering practices" section) that have
 been **superseded**: the specific mechanism, function, or field each entry
 describes has since been deleted or replaced by a later redesign, so the
 entry no longer describes any code in this repository. They are moved here
@@ -10,8 +12,9 @@ project's institutional memory — grep this file when a change rhymes with
 one of these stories, even though the specific names/functions no longer
 exist.
 
-Where a superseded entry's lesson is still generally applicable, the root
-`CLAUDE.md` keeps a one-line pointer back here instead of the full entry.
+Where a superseded entry's lesson is still generally applicable,
+`engineering-lessons.md` keeps a one-line pointer back here instead of the
+full entry.
 Entries are grouped by the ADR/PR that superseded them and otherwise appear
 in their original order.
 
