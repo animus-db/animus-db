@@ -124,16 +124,17 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   targets the control ids over that same env); `backend` and both auto-split
   thresholds apply to the data nodes only. `tests/cluster_split.rs` is the
   in-process regression (`animusd control`/`animusd data` real-process split
-  is `tests/split_cluster.rs`'s job instead) — its one flake during
-  development is worth recording: a write issued through a single **fixed**
-  control-only node's client address hit the documented "zero-replica
-  blind-forward" hazard (root `CLAUDE.md`) intermittently under
-  `cargo test`'s parallel load — a control node forwards to *some* known
-  replica of the tablet, not necessarily its leader, and can retry the same
-  non-leader forever. Fixed by round-robining the control addresses (with the
-  data addresses as fallback) instead of asserting through one fixed
-  no-replica node, the same fix shape `tests/cluster_growth.rs`/
-  `tests/seed_join.rs` already use for this exact hazard.
+  is `tests/split_cluster.rs`'s job instead). It originally flaked under
+  `cargo test`'s parallel load on a write issued through a single **fixed**
+  control-only node's client address, hitting the documented "zero-replica
+  blind-forward" hazard (root `CLAUDE.md`): a control node forwards to *some*
+  known replica of the tablet, not necessarily its leader. **That hazard is
+  now closed at the source** (`ClientCtx::cp_forward` retries a "not the
+  leader here" refusal at the refusing node's own embedded leader hint, then
+  at the tablet's other replicas — see the root `CLAUDE.md` entry), so the
+  test asserts through a single fixed control-only address deterministically;
+  `fixed_control_node_write_read_is_deterministic` is the dedicated
+  regression (20 keys through one fixed control node, no round-robin).
 - `run_node_growth` — start a node as an ADR 0030 **growth member** from an
   operator-assembled *expanded* config (its control role is a permanent
   non-voter of the pre-growth control group; `start_with` detects this and

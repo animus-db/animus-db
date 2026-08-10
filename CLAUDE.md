@@ -704,6 +704,24 @@ to the archive stays in place below.
   hit a node that resolves correctly (a real replica) even when the
   control-node leg of the same loop lands on the wrong pick.
   (`animusd` `tests/data_only.rs::split_cluster_serves_reads_and_writes_across_data_nodes`.)
+  **Update (hinted-retry forwarding, closes the hazard): `ClientCtx::cp_forward`
+  is now the single choke point every CP forward call goes through, and it
+  retries.** A "not the leader here" refusal (`cp_serve_forwarded`) now
+  carries the refusing (replica-hosting) node's own leader hint —
+  `topology::format_not_leader_refusal`/`parse_not_leader_refusal`, a plain
+  string suffix so old and new binaries still interoperate — and `cp_forward`
+  chases it: retry at the hint's address if untried, else at another of the
+  tablet's known replicas, bounded to one pass over {hint} ∪ replicas and to
+  the existing per-hop `CLIENT_TIMEOUT` budget for the whole sequence (not
+  per attempt). The one-hop invariant is unchanged — only the *forwarder*
+  retries, the receiver still never re-forwards. A node with zero local
+  replicas now resolves deterministically through a single fixed address, so
+  the round-robin test crutches above are no longer needed for *this*
+  hazard specifically (`tests/data_only.rs`/`tests/cluster_split.rs` reverted
+  to a fixed control-only node's address; `tests/cluster_split.rs::
+  fixed_control_node_write_read_is_deterministic` is the focused regression).
+  The general lesson stands for any *other* future one-hop-forward gap this
+  pattern doesn't cover.
 - **Adding an automatic background registration/bring-up step makes any
   test's "not yet registered" pre-assertion a race, not an invariant — sweep
   for assertions on the *absence* of state the new automation now

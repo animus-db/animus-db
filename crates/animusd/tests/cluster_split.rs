@@ -51,9 +51,12 @@ async fn admin_get(addr: SocketAddr, path: &str) -> (u16, serde_json::Value) {
     (status, value)
 }
 
-/// Try every client address in `clients` (round-robin) until one accepts the
-/// write — the documented "a control-only node's forward path needs
-/// round-robin, not a single fixed node" lesson (root `CLAUDE.md`).
+/// Try every client address in `clients` (round-robin, retrying until the
+/// deadline) until one accepts the write. `clients` is usually a single fixed
+/// address in this file — the hinted-retry forwarder (root `CLAUDE.md`'s
+/// "zero-replica blind-forward" entry) now resolves a zero-replica node's
+/// forward deterministically, so a round-robin across many addresses is no
+/// longer needed just to dodge that hazard.
 async fn put(clients: &[SocketAddr], table: &str, key: &[u8], value: &[u8]) {
     let w = async {
         loop {
@@ -161,10 +164,11 @@ async fn in_process_split_cluster_serves_writes_and_reports_roles() {
     .await
     .expect("data nodes did not become Active in 20s");
 
-    // Table CRUD round-trip through a DATA node's client address —
-    // round-robin across every client address (control nodes included: a
-    // Put against a control-only node's client port must forward correctly
-    // too, the same shape `tests/data_only.rs` exercises).
+    // Table CRUD round-trip through a DATA node's client address; `all_clients`
+    // (every control and data node) is used below to confirm the write is
+    // visible cluster-wide, and separately to exercise a control-only node's
+    // forward path with a single fixed address (the same shape
+    // `tests/data_only.rs` exercises).
     let all_clients: Vec<SocketAddr> = nodes.iter().map(Node::client_addr).collect();
     let data_client = data_nodes[0].client_addr();
 
@@ -175,21 +179,20 @@ async fn in_process_split_cluster_serves_writes_and_reports_roles() {
     put(&[data_client], "kv", b"cross", b"replica").await;
     await_value(&[data_nodes[1].client_addr()], "kv", b"cross", b"replica").await;
 
-    // A write issued while *preferring* a control node's client address —
-    // round-robin across every address (not a single fixed control node),
-    // per the documented "zero-replica blind-forward" lesson: a node with no
+    // A write issued through a single **fixed** control-only node's client
+    // address — that node hosts zero local CP replicas of anything, so this
+    // exercises `resolve_cp_route`'s no-local-replica forward branch. This
+    // used to need a round-robin across every address, per the documented
+    // "zero-replica blind-forward" lesson (root `CLAUDE.md`): a node with no
     // local replica forwards to *some* known replica of the tablet, not
-    // necessarily its leader, so a single fixed no-replica node can retry the
-    // same non-leader forever. Putting the control addresses first in the
-    // list still exercises their forward path on every attempt that reaches
-    // them; the data addresses are the fallback that keeps this assertion
-    // sound rather than flaky.
-    let control_first: Vec<SocketAddr> = control_nodes
-        .iter()
-        .chain(data_nodes.iter())
-        .map(Node::client_addr)
-        .collect();
-    put(&control_first, "kv", b"via-control", b"ok").await;
+    // necessarily its leader, and a wrong guess used to error forever
+    // (the receiver never re-forwards). The forwarder now retries a "not
+    // the leader here" refusal at the refusing node's own embedded leader
+    // hint, then at the tablet's other replicas, so a single fixed control
+    // node resolves deterministically — this is the intended regression
+    // proof that the hazard is closed.
+    let fixed_control = control_nodes[0].client_addr();
+    put(&[fixed_control], "kv", b"via-control", b"ok").await;
     await_value(&all_clients, "kv", b"via-control", b"ok").await;
 
     // `/admin/config`'s `role` differs across a control vs. data node.
@@ -202,6 +205,81 @@ async fn in_process_split_cluster_serves_writes_and_reports_roles() {
     assert_eq!(status, 200);
     assert_eq!(data_cfg["role"], "data");
     assert!(data_cfg["addrs"]["control"].is_null());
+
+    for node in &nodes {
+        node.shutdown_graceful().await;
+    }
+}
+
+/// Focused regression for the hinted-retry forwarder (root `CLAUDE.md`'s
+/// "zero-replica blind-forward" entry): a control-only node hosts zero local
+/// CP replicas of anything, so every write/read through it must take
+/// `resolve_cp_route`'s no-local-replica forward branch, guessing a first
+/// target among the tablet's replicas. Pre-fix, a wrong guess (a non-leader
+/// replica) errored forever — the receiver never re-forwards — so a
+/// repeated write/read through **one fixed** control node's client address
+/// failed on roughly half of runs (whichever replica happened to win the
+/// tablet's Raft election). Post-fix, `ClientCtx::cp_forward` retries a "not
+/// the leader here" refusal at the refusing node's own embedded leader hint
+/// (or another known replica), so this must succeed deterministically for
+/// every key, every run — no round-robin across addresses needed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fixed_control_node_write_read_is_deterministic() {
+    let dir = tempfile::tempdir().unwrap();
+    const CONTROL_N: usize = 3;
+    const DATA_N: usize = 2;
+
+    let nodes: Vec<Node> = animusd::start_split_cluster_with(
+        CONTROL_N,
+        DATA_N,
+        dir.path(),
+        "127.0.0.1".parse().unwrap(),
+        StorageBackend::Memory,
+        None,
+        None,
+    )
+    .await
+    .expect("split cluster starts");
+
+    let control_nodes = &nodes[..CONTROL_N];
+
+    timeout(Duration::from_secs(20), async {
+        loop {
+            if control_nodes.iter().any(Node::is_control_leader) {
+                return;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("control deployment did not elect a leader in 20s");
+
+    let data_raftkv_ids: Vec<animus_env::NodeId> = (0..DATA_N)
+        .map(|i| animusd::config::raftkv_id(CONTROL_N + i))
+        .collect();
+    timeout(Duration::from_secs(20), async {
+        loop {
+            if data_raftkv_ids.iter().all(|id| {
+                control_nodes.iter().any(|n| {
+                    n.metadata().members.get(id).map(|m| m.status)
+                        == Some(animusd::NodeStatus::Active)
+                })
+            }) {
+                return;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("data nodes did not become Active in 20s");
+
+    let fixed_control = control_nodes[0].client_addr();
+    for i in 0..20u32 {
+        let key = format!("fixed-key-{i}").into_bytes();
+        let value = format!("fixed-val-{i}").into_bytes();
+        put(&[fixed_control], "fixed_kv", &key, &value).await;
+        await_value(&[fixed_control], "fixed_kv", &key, &value).await;
+    }
 
     for node in &nodes {
         node.shutdown_graceful().await;

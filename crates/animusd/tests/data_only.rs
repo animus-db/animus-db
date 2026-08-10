@@ -10,11 +10,11 @@
 //!   ADR 0012 heartbeat/failure-detector chain, a table provisions onto
 //!   them, and `Put`/`Get` work through a data node — including a read
 //!   served by a *different* data node than the one written through — and,
-//!   round-robining across every node's client address (a **control-only**
-//!   node hosts zero local CP replicas of anything, so exercising its
-//!   forward path specifically needs the round-robin — see that
-//!   assertion's own doc for why a single fixed control node would flake),
-//!   also through a control node against the genuinely-`Remote` data fleet;
+//!   through a single **fixed control-only** node's client port (a
+//!   control-only node hosts zero local CP replicas of anything, so this
+//!   exercises `resolve_cp_route`'s no-local-replica forward branch plus the
+//!   hinted-retry forwarder that resolves it deterministically — see that
+//!   assertion's own doc), also against the genuinely-`Remote` data fleet;
 //! - schema DDL issued against a data node relays to the control leader and
 //!   commits, visible from every node (`metadata_fresh` soundness: the data
 //!   node's own commit-wait poll must observe its just-proposed command,
@@ -123,82 +123,67 @@ async fn split_cluster_serves_reads_and_writes_across_data_nodes() {
             "read-back via the other data node"
         );
 
-        // A `Put`/`Get` issued against a **control-only** node's client port
-        // — that node hosts zero local CP replicas of anything
-        // (`ClientCtx.data == None`), so `resolve_cp_route` must take its
-        // no-local-replica "forward to any known route" branch to reach the
-        // data fleet at all. `control_only.rs`'s own mixed-cluster test
-        // predates PR4 and only exercises this against an ADR 0030 growth
-        // node; this is the genuine-`Remote`-data-fleet version of the same
-        // assertion.
+        // A `Put`/`Get` issued against a **single, fixed control-only**
+        // node's client port — that node hosts zero local CP replicas of
+        // anything (`ClientCtx.data == None`), so `resolve_cp_route` must
+        // take its no-local-replica "forward to any known route" branch to
+        // reach the data fleet at all. `control_only.rs`'s own mixed-cluster
+        // test predates PR4 and only exercises this against an ADR 0030
+        // growth node; this is the genuine-`Remote`-data-fleet version of
+        // the same assertion.
         //
-        // **Round-robin across every node's client address** (control nodes
-        // first, then data nodes), not a single fixed control node — a
-        // zero-replica node's fallback-forward target is a *fixed* replica
-        // pick (the first one in the tablet's replica list, deterministic
-        // across every control node and every retry), not necessarily the
-        // group's actual current leader, and a forwarded op that lands on a
-        // non-leader replica errors ("not the leader here") rather than
-        // re-forwarding (routing is bounded to one hop). Which of this
-        // tablet's two data replicas actually wins its Raft election is
-        // genuinely nondeterministic, so a control node's forward can land
-        // on the wrong one indefinitely on an unlucky run — mirroring the
-        // documented `seed_join.rs`/`table_with_replica` lesson ("give the
-        // client every node's address"), this rotates through every
-        // control **and** data address each cycle so the request always has
-        // a path that resolves correctly (a data node always knows or
-        // forwards-with-an-accurate-hint to the true leader), while the
-        // control-node addresses are tried first every cycle and so are
-        // exercised — and, whenever the lucky/unlucky replica pick lines up,
-        // proven to actually succeed — on every run.
-        let all_clients: Vec<SocketAddr> = control_nodes
-            .iter()
-            .chain(data_nodes.iter())
-            .map(Node::client_addr)
-            .collect();
+        // This used to need a round-robin across every node's client
+        // address: a zero-replica node's fallback-forward target was a
+        // *fixed* replica pick (the first one in the tablet's replica list),
+        // not necessarily the group's actual current leader, and a forwarded
+        // op landing on a non-leader replica errored ("not the leader here")
+        // forever rather than re-forwarding (routing is bounded to one hop).
+        // The forwarder (`ClientCtx::cp_forward`) now retries a "not the
+        // leader here" refusal at the refusing node's own embedded leader
+        // hint, then at the tablet's other known replicas, so a single fixed
+        // control node resolves deterministically — this is the intended
+        // regression proof that the hazard is closed (see the root
+        // `CLAUDE.md`'s "zero-replica blind-forward" entry).
+        let fixed_control = control_nodes[0].client_addr();
         timeout(Duration::from_secs(20), async {
             loop {
-                for &addr in &all_clients {
-                    let put = call(
-                        addr,
-                        ClientRequest::Put {
-                            key: b"via-control-key".to_vec(),
-                            value: b"via-control-val".to_vec(),
-                            table: "split_t".to_string(),
-                        },
-                    )
-                    .await;
-                    if matches!(put, ClientResponse::PutOk) {
-                        return;
-                    }
+                let put = call(
+                    fixed_control,
+                    ClientRequest::Put {
+                        key: b"via-control-key".to_vec(),
+                        value: b"via-control-val".to_vec(),
+                        table: "split_t".to_string(),
+                    },
+                )
+                .await;
+                if matches!(put, ClientResponse::PutOk) {
+                    return;
                 }
                 sleep(Duration::from_millis(100)).await;
             }
         })
         .await
-        .expect("put via a control/data node did not succeed in 20s");
+        .expect("put via a fixed control node did not succeed in 20s");
         timeout(Duration::from_secs(20), async {
             loop {
-                for &addr in &all_clients {
-                    if let ClientResponse::Value(Some(v)) = call(
-                        addr,
-                        ClientRequest::Get {
-                            key: b"via-control-key".to_vec(),
-                            table: "split_t".to_string(),
-                        },
-                    )
-                    .await
-                    {
-                        if v == b"via-control-val" {
-                            return;
-                        }
+                if let ClientResponse::Value(Some(v)) = call(
+                    fixed_control,
+                    ClientRequest::Get {
+                        key: b"via-control-key".to_vec(),
+                        table: "split_t".to_string(),
+                    },
+                )
+                .await
+                {
+                    if v == b"via-control-val" {
+                        return;
                     }
                 }
                 sleep(Duration::from_millis(150)).await;
             }
         })
         .await
-        .expect("read-back via a control/data node never observed the written value in 20s");
+        .expect("read-back via a fixed control node never observed the written value in 20s");
 
         // The data-only nodes' own `/admin/health` reports data-plane
         // readiness with `is_control_leader` hardcoded false (no local
