@@ -327,6 +327,72 @@ debugging anything that feels like it might have happened before.
   run, the exposure is multiplicative — widen the bound AND look for a way
   to do the operation fewer times, don't just widen the bound.**
   (`animusd/tests/split_cluster.rs::full_split_cluster_restart_recovers_metadata_and_data`.)
+  **Correction (see the next entry): the "not a socket-close-ordering bug in
+  `Node::shutdown()`" conclusion above was wrong.** Checking that `mio` sets
+  `SO_REUSEADDR` only rules out *TIME_WAIT*-reuse contention; it says nothing
+  about a **live** listener still bound by this *same* process, which is
+  exactly what a not-yet-unwound aborted task looks like from the outside —
+  externally indistinguishable from "another process is squatting on it."
+  The 60s bound + smaller fleet made the symptom rare enough to ship, but the
+  test kept flaking under `--workspace` load months later until the actual
+  mechanism below was found and fixed at the source.
+- **`abort()` on a `tokio::task::JoinHandle`/`AbortHandle` only *requests*
+  cancellation — it does not wait for the task to stop, and the resources
+  that task owns (most importantly, a `TcpListener` it's blocked accepting
+  on) are only released once the runtime actually polls and drops it, which
+  can lag arbitrarily behind `abort()` returning under CPU contention.**
+  This is the real root cause the previous entry's fleet-shrink/bound-raise
+  mitigated but didn't fix: `ProdEnv`'s internal accept-loop task owns the
+  env's `TcpListener` by value (moved into the `tokio::spawn`ed future), and
+  both `ProdEnv::shutdown()` and `animusd::Node::shutdown()` were fire-and-
+  forget — call `abort()` on every task, then return immediately, with no
+  wait for the cancellation to actually take effect. A same-address restart
+  test that calls `shutdown()` and immediately rebinds is thus racing its
+  *own* not-yet-dropped listener for the port: under light load the runtime
+  polls (and drops) the cancelled task within microseconds, so the race
+  window is usually too small to hit; under `cargo test --workspace`-level
+  CPU contention (dozens of test binaries and their own worker threads
+  fighting for the same cores) that window can stretch for seconds — long
+  enough to occasionally outlast even a 60s bounded rebind-retry, because
+  every failed rebind attempt in that retry loop was itself contending for
+  the same scarce CPU time the cancelled task needed to finally get polled.
+  Fixed by adding `ProdEnv::shutdown_and_wait`/`Node::shutdown_and_wait`
+  (`crates/animus-env/src/prod.rs`, `crates/animusd/src/lib.rs`): `abort()`
+  every task as before, then poll `is_finished()` on each handle (bounded,
+  a few seconds) before returning, so the caller only proceeds once the
+  listener is *provably* dropped. `Node::shutdown_graceful` — what every
+  restart test already calls before rebinding — now ends in this instead of
+  the plain hard-abort `shutdown`, so the fix required no test changes.
+  **General rule: `abort()` (or any cancellation-request API) is a request,
+  not a synchronous guarantee — code that aborts a task and then immediately
+  reacquires a resource that task owned (a port, a file lock, a fd) must wait
+  for confirmed termination (`is_finished()`/`JoinHandle::await`), not just
+  call `abort()` and move on. And when ruling out a race by checking a
+  socket option (`SO_REUSEADDR`), be precise about which race it rules out
+  (TIME_WAIT-reuse) versus which it says nothing about (a still-live
+  listener, in this process or another) — a clean diagnostic that answers
+  the wrong question reads as confirmation and can misdirect the next
+  person for months.** (`animus-env`, `animusd`;
+  `animusd/tests/split_cluster.rs::full_split_cluster_restart_recovers_metadata_and_data`.)
+  **Environmental confound noted while debugging this (2026-07):** the day's
+  elevated failure rate (3 of 4 full-workspace runs) partly coincided with an
+  unrelated long-lived `animusd --cluster-control 3 --cluster-data 5` process
+  (started from a developer's own terminal, hours earlier) permanently
+  holding ~25 ports in the machine's ephemeral range
+  (`/proc/sys/net/ipv4/ip_local_port_range`, ~4096 ports wide here). It can
+  never be the *exact* port a test's `free_addrs()` probe collides on (the
+  kernel never hands `bind("…:0")` a port that's actually still listening),
+  but shrinking the effective ephemeral pool measurably tightens every
+  probe-then-drop-then-rebind race described above and in the port-TOCTOU
+  entries — more probes chasing fewer numbers means the freed slot a
+  `free_addrs()` probe just released is more likely to already be someone
+  else's next pick by the time the real bind happens. **Before writing off a
+  test-infra flake as purely a code bug, `ss -ltnp` the ephemeral range for
+  long-lived squatters** — the fix here was still a real self-inflicted race
+  in `shutdown`/`shutdown_and_wait` (confirmed by clean stress runs on this
+  same, still-polluted machine after the fix), but the environmental factor
+  is real too and worth ruling in/out explicitly rather than silently
+  absorbing it into "the test is flaky."
 - **Never `let _ = storage.merge(...)` on the write path** — an ack must mean the
   write durably applied; surface storage errors so a non-durable write isn't
   counted toward the quorum (`animus-data` `ack_durability.rs`).

@@ -208,6 +208,17 @@ impl ProdEnv {
     /// everything spawned through [`Spawner::spawn`] — so the node can be torn
     /// down cleanly and its listener port freed for a restart. Idempotent; once
     /// called, this env should no longer be used to spawn or receive.
+    ///
+    /// **`abort()` only *requests* cancellation — it does not wait for the
+    /// task to actually stop.** The accept loop's `TcpListener` (and thus the
+    /// port) is only released once the aborted task is next polled and
+    /// dropped by the runtime, which can lag arbitrarily behind this call
+    /// returning under CPU contention. A caller that must rebind the same
+    /// address afterward (a same-address restart) needs
+    /// [`shutdown_and_wait`](Self::shutdown_and_wait) instead; this plain
+    /// `shutdown` remains for callers that only need the task to stop
+    /// eventually (most simulated-crash tests never rebind the killed node's
+    /// address in the same process).
     pub fn shutdown(&self) {
         let handles = std::mem::take(&mut *self.inner.tasks.lock().expect("tasks poisoned"));
         for h in handles {
@@ -219,6 +230,44 @@ impl ProdEnv {
         for slot in std::mem::take(&mut *self.inner.pool.lock().expect("pool poisoned")) {
             slot.accept_abort.abort();
         }
+    }
+
+    /// Like [`shutdown`](Self::shutdown), but also waits (bounded,
+    /// best-effort) for every aborted task — including the accept loop that
+    /// owns this env's listening `TcpListener` — to actually finish
+    /// unwinding before returning, so the listener really is dropped and its
+    /// port really is free by the time this call completes.
+    ///
+    /// This closes a real flake: `abort()` schedules cancellation but does not
+    /// synchronously drop the task's future, so a bare [`shutdown`] followed
+    /// immediately by a rebind on the same address can race this *same*
+    /// process's own not-yet-unwound accept-loop task for the port. Under
+    /// light load the runtime polls (and drops) the cancelled task within
+    /// microseconds; under `cargo test --workspace`-level CPU contention that
+    /// can lag for seconds — long enough to intermittently fail a
+    /// same-address restart test even behind a generous rebind-retry bound
+    /// (`AddrInUse`, indistinguishable from a genuinely-occupied port without
+    /// this fix — see the port-TOCTOU entries in
+    /// `docs/engineering-lessons.md`). The wait itself is capped at a few
+    /// seconds so a task that is somehow never polled again can't hang a
+    /// caller forever — a vanishingly unlikely case given accept loops are
+    /// perpetually parked in `.accept().await` (an immediately-cancellable
+    /// await point), included only as defense in depth.
+    pub async fn shutdown_and_wait(&self) {
+        let handles = std::mem::take(&mut *self.inner.tasks.lock().expect("tasks poisoned"));
+        for h in &handles {
+            h.abort();
+        }
+        wait_all_finished(&handles).await;
+        // Also abort (and wait for) any still-unclaimed sibling-pool accept
+        // loops, the `shutdown_and_wait` dual of `shutdown`'s pool cleanup.
+        let pool = std::mem::take(&mut *self.inner.pool.lock().expect("pool poisoned"));
+        for slot in &pool {
+            slot.accept_abort.abort();
+        }
+        let pool_handles: Vec<tokio::task::AbortHandle> =
+            pool.into_iter().map(|slot| slot.accept_abort).collect();
+        wait_all_finished(&pool_handles).await;
     }
 
     /// Abort only the tasks **this env itself** owns — its accept loop and
@@ -487,6 +536,31 @@ impl Coresident for ProdEnv {
             }),
         }
     }
+}
+
+/// How long [`ProdEnv::shutdown_and_wait`] polls for every aborted task to
+/// report finished before giving up. Generous — this only ever matters under
+/// heavy host-level contention — but bounded so a caller can never hang
+/// forever on a task that, for some unforeseen reason, is never polled again.
+const SHUTDOWN_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Poll `AbortHandle::is_finished` on every handle until they've all reported
+/// finished or [`SHUTDOWN_WAIT_TIMEOUT`] elapses, whichever comes first —
+/// [`ProdEnv::shutdown_and_wait`]'s "actually wait for the abort to take
+/// effect" step. Best-effort: a timeout here is silently swallowed (the
+/// handles were already aborted; the caller proceeds regardless), matching
+/// `shutdown`'s existing fire-and-forget failure mode for the pathological
+/// case, while still turning the common case into a genuine guarantee.
+async fn wait_all_finished(handles: &[tokio::task::AbortHandle]) {
+    let poll = async {
+        loop {
+            if handles.iter().all(tokio::task::AbortHandle::is_finished) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    };
+    let _ = tokio::time::timeout(SHUTDOWN_WAIT_TIMEOUT, poll).await;
 }
 
 /// Spawn the accept loop for `listener` — one reader task per inbound connection,

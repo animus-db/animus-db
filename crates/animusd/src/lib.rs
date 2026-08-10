@@ -1731,12 +1731,48 @@ impl Node {
     /// On-disk state is unaffected: a value already acked to a client was Raft-
     /// committed + fsynced to the CP group's LSM WAL before the ack, so it survives
     /// the restart.
+    ///
+    /// **`abort()` on a `JoinHandle`/`AbortHandle` only *requests* cancellation
+    /// — it doesn't wait for the task to actually stop**, so the listener a
+    /// just-aborted task owns (e.g. the admin/client TCP listener, or a
+    /// `ProdEnv` role's internal accept loop) isn't guaranteed dropped, and its
+    /// port isn't guaranteed free, the instant this call returns. A caller that
+    /// immediately rebinds the same address (a same-address restart) needs
+    /// [`shutdown_and_wait`](Self::shutdown_and_wait) instead — plain `shutdown`
+    /// remains for callers that only need the node to stop (most simulated-crash
+    /// tests never rebind the killed node's own address in the same process).
     pub fn shutdown(&self) {
         for task in &self.tasks {
             task.abort();
         }
         for env in &self.envs {
             env.shutdown();
+        }
+    }
+
+    /// Like [`shutdown`](Self::shutdown), but also waits (bounded,
+    /// best-effort) for every aborted task — this node's client-facing
+    /// listeners and each internal `ProdEnv` role's accept loop alike — to
+    /// actually finish unwinding before returning, so every listener this
+    /// node owns is genuinely dropped, and every port genuinely free, by the
+    /// time this call completes.
+    ///
+    /// Root-causes the `full_split_cluster_restart_recovers_metadata_and_data`
+    /// flake (`AddrInUse` on rebind under `cargo test --workspace`-level
+    /// contention, see `docs/engineering-lessons.md`): a bare `shutdown`
+    /// followed immediately by a same-address rebind can race this *same*
+    /// process's own not-yet-unwound listener task for the port, and under
+    /// enough CPU contention that race can outlast even a generous
+    /// rebind-retry bound. [`shutdown_graceful`](Self::shutdown_graceful) —
+    /// what every restart test already calls before rebinding — uses this
+    /// instead of the plain `shutdown` for exactly this reason.
+    pub async fn shutdown_and_wait(&self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+        wait_all_finished(&self.tasks).await;
+        for env in &self.envs {
+            env.shutdown_and_wait().await;
         }
     }
 
@@ -1764,6 +1800,13 @@ impl Node {
     /// `shutdown`'s abort has nothing in flight to race. (A
     /// `kill -9` is still exposed; the durable-before-ack control-plane fix is a
     /// tracked follow-up.)
+    ///
+    /// Ends in [`shutdown_and_wait`](Self::shutdown_and_wait), not the plain
+    /// hard-abort [`shutdown`](Self::shutdown) — every caller of
+    /// `shutdown_graceful` in this codebase is a restart test that rebinds
+    /// this node's own addresses right afterward, so it needs the "listener
+    /// really is dropped, port really is free" guarantee (see that method's
+    /// doc for why a bare `abort()` doesn't provide one).
     pub async fn shutdown_graceful(&self) {
         // A data-only node (ADR 0035 PR4) has no local control WAL to flush —
         // `RaftNode::flush` only exists on a genuine local Raft replica.
@@ -1771,8 +1814,35 @@ impl Node {
             raft.flush().await;
         }
         self.edge.shutdown_all_cp_groups().await;
-        self.shutdown();
+        self.shutdown_and_wait().await;
     }
+}
+
+/// How long [`Node::shutdown_and_wait`] polls for every aborted listener task
+/// to report finished before giving up. Generous — this only ever matters
+/// under heavy host-level contention — but bounded so a caller can never hang
+/// forever on a task that, for some unforeseen reason, is never polled again.
+/// Mirrors `animus_env::ProdEnv::shutdown_and_wait`'s identical constant one
+/// layer down (this node's own listener tasks vs. each internal role env's).
+const NODE_SHUTDOWN_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Poll `JoinHandle::is_finished` on every task until they've all reported
+/// finished or [`NODE_SHUTDOWN_WAIT_TIMEOUT`] elapses, whichever comes
+/// first — [`Node::shutdown_and_wait`]'s "actually wait for the abort to take
+/// effect" step. Best-effort: a timeout here is silently swallowed (the tasks
+/// were already aborted; the caller proceeds regardless), matching
+/// `shutdown`'s existing fire-and-forget failure mode for the pathological
+/// case, while still turning the common case into a genuine guarantee.
+async fn wait_all_finished(tasks: &[tokio::task::JoinHandle<()>]) {
+    let poll = async {
+        loop {
+            if tasks.iter().all(tokio::task::JoinHandle::is_finished) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    };
+    let _ = tokio::time::timeout(NODE_SHUTDOWN_WAIT_TIMEOUT, poll).await;
 }
 
 /// How long a graceful process teardown ([`Node::shutdown_graceful`], via
