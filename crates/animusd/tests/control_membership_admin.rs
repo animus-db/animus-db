@@ -63,6 +63,25 @@
 //!   calls for different ids race at the leader's shared lock; the loser
 //!   gets a clean `409` it can retry, not a hang or a silent no-op, and the
 //!   retry succeeds once the winner has committed.
+//! - [`omitted_node_add_mints_an_id_and_converges_to_a_live_voter`] (ADR 0037
+//!   hardening trio's PR3 — wires ADR 0036's allocator into `control-add`,
+//!   closing ADR 0037's own "Coordination with ADR 0036" deferral):
+//!   `POST /admin/control/member/add` with `node` omitted mints a fresh id
+//!   from `MetaCommand::AllocateNodeId` instead of requiring one, at/above
+//!   `ALLOC_ID_BASE`, and converges to a live voter exactly like an
+//!   operator-supplied id does.
+//! - [`concurrent_omitted_node_adds_mint_distinct_ids_and_both_become_voters`]:
+//!   the omitted-node dual of `concurrent_control_add_surfaces_in_flight_as_
+//!   a_clean_retryable_error` — two concurrent omitted-node adds each mint
+//!   (the allocator itself never collides), but their `change_membership`
+//!   calls race like any other concurrent pair; the loser retries (a fresh
+//!   omitted-node call, necessarily minting a second distinct id) and both a
+//!   winner and a second id eventually become voters.
+//! - [`add_control_member_collision_shapes`] gained a third case: manually
+//!   targeting the allocated range (`node` at/above `ALLOC_ID_BASE`) stays
+//!   refused even now that this same action can mint ids there itself for an
+//!   omitted `node` — the refusal is unconditional for an operator-supplied
+//!   id, never bypassed.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -127,6 +146,24 @@ async fn add_control_member(
     addr: SocketAddr,
 ) -> (u16, serde_json::Value) {
     let body = serde_json::json!({"node": node, "addr": addr.to_string()}).to_string();
+    admin(admin_addr, "POST", "/admin/control/member/add", Some(&body)).await
+}
+
+/// The **allocator-minted-id** form (ADR 0037 hardening trio's PR3): `node`
+/// omitted entirely (not merely `null`) — exercises `AddControlMemberReq`'s
+/// `#[serde(default)]` the same way a real 2-arg `animus admin control-add`
+/// call would (the CLI's own JSON body simply never sets the field). Like
+/// [`add_control_member`] and `concurrent_control_add_surfaces_in_flight_as_a_
+/// clean_retryable_error`'s existing convention, `addr` here is a fake,
+/// never-connected-to placeholder (an existing node's own admin address) —
+/// these tests prove the admin-plane mint + register + `change_membership`
+/// mechanics, not real Raft catch-up (already covered for the
+/// operator-supplied path by `grow_control_group_converges_everywhere`).
+async fn add_control_member_allocated(
+    admin_addr: SocketAddr,
+    addr: SocketAddr,
+) -> (u16, serde_json::Value) {
+    let body = serde_json::json!({"addr": addr.to_string()}).to_string();
     admin(admin_addr, "POST", "/admin/control/member/add", Some(&body)).await
 }
 
@@ -345,7 +382,13 @@ async fn grow_control_group_converges_everywhere() {
 
 /// Refusal to add a colliding id: an id that already names a live control
 /// voter is an idempotent success (not an error); an id that already names a
-/// data-plane member is refused.
+/// data-plane member is refused; an id at/above `ALLOC_ID_BASE` is refused
+/// **even after** the ADR 0037 hardening trio's PR3 taught this same action
+/// to mint ids in that exact range for an omitted `node` — manually
+/// targeting the allocated range stays blocked regardless (see
+/// `admin_add_control_member`'s doc: only its own `None` branch may skip this
+/// check, for the id *it itself* just minted, never for an operator-supplied
+/// one).
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn add_control_member_collision_shapes() {
     let dir = tempfile::tempdir().unwrap();
@@ -373,10 +416,16 @@ async fn add_control_member_collision_shapes() {
         );
     }
 
-    // At/above the cluster-allocated id range: refused outright.
+    // At/above the cluster-allocated id range: refused outright, still, even
+    // though this same action now mints ids in exactly this range for its
+    // own omitted-`node` path (see this test's own doc).
     {
-        let (status, body) =
-            add_control_member(admin_addrs[leader], 1_000_000, admin_addrs[leader]).await;
+        let (status, body) = add_control_member(
+            admin_addrs[leader],
+            animus_control::meta::ALLOC_ID_BASE,
+            admin_addrs[leader],
+        )
+        .await;
         assert_eq!(
             status, 409,
             "adding a control voter at/above ALLOC_ID_BASE should be refused: {body}"
@@ -1027,6 +1076,176 @@ async fn concurrent_control_add_surfaces_in_flight_as_a_clean_retryable_error() 
         retried_ok,
         "the loser's retry should eventually succeed once the winner committed: {last_body}"
     );
+
+    for node in nodes {
+        node.shutdown();
+    }
+}
+
+/// **ADR 0037 hardening trio's PR3**: `POST /admin/control/member/add` with
+/// `node` omitted mints a fresh id from the control plane's own ADR 0036
+/// allocator (`MetaCommand::AllocateNodeId`, via `ClientCtx::allocate_node_id`
+/// — the exact same helper the wire-level join path uses) instead of
+/// requiring an operator-chosen one, then proceeds through the identical
+/// address-registration + `change_membership` tail — closing ADR 0037's own
+/// "Coordination with ADR 0036" deferral. Proves: the response carries the
+/// minted id, it is at/above `ALLOC_ID_BASE` (the allocator's disjoint
+/// range), and it converges to a live voter via the existing
+/// `GET /admin/control/members` poll — the same convergence signal
+/// `concurrent_control_add_surfaces_in_flight_as_a_clean_retryable_error`
+/// already trusts for the operator-supplied path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn omitted_node_add_mints_an_id_and_converges_to_a_live_voter() {
+    let dir = tempfile::tempdir().unwrap();
+    let (nodes, config) = bring_up_combined(3, dir.path()).await;
+    await_bootstrap(&nodes).await;
+    let admin_addrs: Vec<SocketAddr> = config.nodes.iter().map(|n| n.admin).collect();
+    let leader = leader_index(&nodes);
+    let leader_admin = admin_addrs[leader];
+
+    let (status, body) = add_control_member_allocated(leader_admin, admin_addrs[leader]).await;
+    assert_eq!(
+        status, 200,
+        "omitted-node control/member/add failed: {body}"
+    );
+    let minted = body["node"]
+        .as_u64()
+        .expect("the response carries the minted `node`");
+    assert!(
+        minted >= animus_control::meta::ALLOC_ID_BASE,
+        "minted id {minted} should be at/above ALLOC_ID_BASE ({})",
+        animus_control::meta::ALLOC_ID_BASE
+    );
+
+    let converged = async {
+        loop {
+            let (status, body) = control_members(leader_admin).await;
+            if status == 200 && voters_of(&body).is_some_and(|v| v.contains(&minted)) {
+                return;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    };
+    timeout(Duration::from_secs(15), converged)
+        .await
+        .unwrap_or_else(|_| panic!("minted voter {minted} never converged to a live voter"));
+
+    for node in nodes {
+        node.shutdown();
+    }
+}
+
+/// Two **concurrent** omitted-node adds (ADR 0037 hardening trio's PR3): the
+/// allocator itself never collides (ADR 0036's own monotonic-plus-presence-
+/// check guarantee — minting is not the contended resource here), but the
+/// *subsequent* `change_membership` each mint feeds into is a genuinely
+/// sequential single-server delta, so exactly one of the two concurrent
+/// calls wins outright and the other gets the same clean, retryable
+/// "already in flight" 409
+/// `concurrent_control_add_surfaces_in_flight_as_a_clean_retryable_error`
+/// already proves for the operator-supplied path — handled here the same
+/// way a real caller must: retry. A losing call's own minted id (if minting
+/// completed before it lost the `change_membership` race) is left as an
+/// orphaned, address-less `Down` member — accepted ADR 0036 semantics (see
+/// that ADR's "orphaned Down allocations" consequence), not a defect this
+/// test chases down: what "both eventually become voters" needs to show is
+/// that a *second*, distinct, minted id eventually joins the first as a
+/// voter, not that the loser's original specific id is the one that does
+/// (retrying the omitted-node path — unlike retrying an operator-supplied
+/// id — always mints a *fresh* id, since the nonce is generated fully
+/// server-side inside `admin_add_control_member` and never exposed to the
+/// caller to replay).
+#[tokio::test(flavor = "multi_thread", worker_threads = 10)]
+async fn concurrent_omitted_node_adds_mint_distinct_ids_and_both_become_voters() {
+    let dir = tempfile::tempdir().unwrap();
+    let (nodes, config) = bring_up_combined(3, dir.path()).await;
+    await_bootstrap(&nodes).await;
+    let admin_addrs: Vec<SocketAddr> = config.nodes.iter().map(|n| n.admin).collect();
+    let leader = leader_index(&nodes);
+    let leader_admin = admin_addrs[leader];
+
+    let (r1, r2) = tokio::join!(
+        add_control_member_allocated(leader_admin, admin_addrs[leader]),
+        add_control_member_allocated(leader_admin, admin_addrs[leader]),
+    );
+    for (status, body) in [&r1, &r2] {
+        assert!(
+            *status == 200 || *status == 409,
+            "unexpected status for a concurrent omitted-node add: {body}"
+        );
+    }
+    let successes: Vec<u64> = [&r1, &r2]
+        .iter()
+        .filter(|(status, _)| *status == 200)
+        .map(|(_, body)| {
+            body["node"]
+                .as_u64()
+                .expect("a successful omitted-node add carries the minted `node`")
+        })
+        .collect();
+    assert_eq!(
+        successes.len(),
+        1,
+        "exactly one concurrent omitted-node add should win outright: r1={r1:?}, r2={r2:?}"
+    );
+    let winner_id = successes[0];
+    assert!(
+        winner_id >= animus_control::meta::ALLOC_ID_BASE,
+        "minted id {winner_id} should be at/above ALLOC_ID_BASE"
+    );
+
+    let winner_converged = async {
+        loop {
+            let (status, body) = control_members(leader_admin).await;
+            if status == 200 && voters_of(&body).is_some_and(|v| v.contains(&winner_id)) {
+                return;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    };
+    timeout(Duration::from_secs(15), winner_converged)
+        .await
+        .unwrap_or_else(|_| panic!("winner {winner_id} never converged to a live voter"));
+
+    // Retry the loser: a fresh omitted-node call mints a *second*,
+    // necessarily distinct, id (see this test's own doc for why it cannot be
+    // the loser's original one) and adds it once the winner's change has
+    // cleared `config_change_in_flight`.
+    let retry_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut second_id = None;
+    let mut last_body = serde_json::Value::Null;
+    while tokio::time::Instant::now() < retry_deadline {
+        let (status, body) = add_control_member_allocated(leader_admin, admin_addrs[leader]).await;
+        if status == 200 {
+            second_id = body["node"].as_u64();
+            break;
+        }
+        last_body = body;
+        sleep(Duration::from_millis(150)).await;
+    }
+    let second_id = second_id
+        .unwrap_or_else(|| panic!("the retried omitted-node add never succeeded: {last_body}"));
+    assert_ne!(
+        second_id, winner_id,
+        "the retry must mint an id distinct from the winner's"
+    );
+    assert!(
+        second_id >= animus_control::meta::ALLOC_ID_BASE,
+        "minted id {second_id} should be at/above ALLOC_ID_BASE"
+    );
+
+    let second_converged = async {
+        loop {
+            let (status, body) = control_members(leader_admin).await;
+            if status == 200 && voters_of(&body).is_some_and(|v| v.contains(&second_id)) {
+                return;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    };
+    timeout(Duration::from_secs(15), second_converged)
+        .await
+        .unwrap_or_else(|_| panic!("second minted voter {second_id} never converged"));
 
     for node in nodes {
         node.shutdown();

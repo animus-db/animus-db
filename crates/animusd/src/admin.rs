@@ -45,7 +45,7 @@
 //! - `POST /admin/member/add`          — `{node, labels?}` — online growth (ADR 0030)
 //! - `POST /admin/member/remove`       — `{node}` — decommission (ADR 0032 PR3)
 //! - `GET  /admin/control/members`     — live control-plane voters + address book (ADR 0037 PR3)
-//! - `POST /admin/control/member/add`    — `{node, addr}` — grow the control group (ADR 0037 PR3)
+//! - `POST /admin/control/member/add`    — `{node?, addr}` — grow the control group (ADR 0037 PR3; `node` optional since the ADR 0037 hardening trio's PR3, allocator-minted)
 //! - `POST /admin/control/member/remove` — `{node}` — shrink the control group (ADR 0037 PR3)
 //! - `POST /admin/data/dynamo`         — run a DynamoDB op `{op, payload}` (ADR 0021)
 //! - `POST /admin/data/cql`            — run CQL `{query, keyspace?}` (ADR 0021)
@@ -1026,14 +1026,23 @@ struct AddMemberReq {
     labels: BTreeMap<String, String>,
 }
 
-/// `POST /admin/control/member/add` request body (ADR 0037 PR3): `node` is an
+/// `POST /admin/control/member/add` request body (ADR 0037 PR3, `node`
+/// optional since the hardening trio's PR3): `node`, when given, is an
 /// **operator-supplied** control-plane voter id (below `ALLOC_ID_BASE` —
-/// see `ClientCtx::admin_add_control_member`'s doc); `addr` is that node's
-/// internal control-Raft listen address, not its admin/client address.
+/// see `ClientCtx::admin_add_control_member`'s doc); omitted (`null` or
+/// absent, `#[serde(default)]`), the control plane mints a fresh one from
+/// its own ADR 0036 allocator instead. `addr` is that node's internal
+/// control-Raft listen address, not its admin/client address. `labels` seed
+/// the minted member's topology labels (ignored for an operator-supplied
+/// `node`, which is never fresh — see the doc above), the same shape
+/// `AddMemberReq`'s does.
 #[derive(Deserialize)]
 struct AddControlMemberReq {
-    node: NodeId,
+    #[serde(default)]
+    node: Option<NodeId>,
     addr: std::net::SocketAddr,
+    #[serde(default)]
+    labels: BTreeMap<String, String>,
 }
 
 /// `POST /admin/control/member/remove` request body (ADR 0037 PR3): `node` is
@@ -1259,20 +1268,28 @@ fn control_members_view(ctx: &ClientCtx) -> Value {
     })
 }
 
-/// `POST /admin/control/member/add {node, addr}` — grow the control group by
-/// one voter (ADR 0037 PR3). **Local-control-leader-only, not relayed** — see
+/// `POST /admin/control/member/add {node?, addr}` — grow the control group by
+/// one voter (ADR 0037 PR3; `node` optional since the hardening trio's PR3).
+/// **Local-control-leader-only, not relayed** — see
 /// [`crate::ClientCtx::admin_add_control_member`]'s doc for the full
-/// rationale and the collision/idempotence rules. `addr` is the new voter's
-/// **internal control-Raft** listen address (distinct from its admin/client/
-/// raftkv ports) — `animus admin control-add` resolves it from the new
-/// node's own `/admin/config` before calling this.
+/// rationale, the collision/idempotence rules, and the allocator-minted path.
+/// `addr` is the new voter's **internal control-Raft** listen address
+/// (distinct from its admin/client/raftkv ports) — `animus admin control-add`
+/// resolves it from the new node's own `/admin/config` before calling this.
+/// The response's `"node"` is the **effective** id either way: echoed back
+/// when operator-supplied, or the freshly-minted one when `node` was omitted
+/// — the caller (the CLI, an operator) needs this to know what id the new
+/// process should actually come up as.
 async fn action_add_control_member(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
     let req: AddControlMemberReq = match parse_body(body) {
         Ok(r) => r,
         Err(e) => return e,
     };
-    match ctx.admin_add_control_member(req.node, req.addr) {
-        Ok(()) => (200, json!({"ok": true, "node": req.node})),
+    match ctx
+        .admin_add_control_member(req.node, req.addr, req.labels)
+        .await
+    {
+        Ok(node) => (200, json!({"ok": true, "node": node})),
         Err(e) => (409, json!({"error": e})),
     }
 }
