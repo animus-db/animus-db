@@ -1,10 +1,13 @@
 "use strict";
-// The Overview view: health banner, stat tiles, a top-N nodes list, a
-// per-table breakdown (real data — the design's "Recent activity" panel is
-// dropped, since there is no backend event log to back it), and a
-// tablets-per-node balance chart. Depends on `dashboard_core.js` having
-// loaded first (STATE, $, esc, pill, dot, nodeRaftkvId, nodeDisplayId,
-// cpGroupsByTablet, tabletStatus, statusDotClass, computeHealth, activateTab).
+// The Overview view: health banner, stat tiles, a nodes list (grouped into
+// "Control plane" / "Data nodes" sections when a split deployment's
+// control-only nodes exist, each reachable row linking to that node's own
+// admin console), a per-table breakdown (real data — the design's "Recent
+// activity" panel is dropped, since there is no backend event log to back
+// it), and a tablets-per-node balance chart. Depends on `dashboard_core.js`
+// having loaded first (STATE, $, esc, pill, dot, consoleLink, nodeRaftkvId,
+// nodeDisplayId, cpGroupsByTablet, tabletStatus, statusDotClass,
+// computeHealth, activateTab).
 
 function renderOverview() {
   const status = STATE.status;
@@ -16,7 +19,19 @@ function renderOverview() {
   const nodeCount = memberIds.length || STATE.nodes.length;
 
   const h = computeHealth();
-  $("ov-summary").textContent = `${nodeCount} node(s) · ${tabletIds.length} tablet(s)`;
+  // Control-only nodes are never `Metadata.members` (see the crate guide's
+  // "the cluster's members are the CP raftkv nodes" entry) — they're only
+  // discoverable through the `/admin/peers` fan-out.
+  const controlRows = STATE.nodes
+    .filter((n) => n.ok && n.config && n.config.role === "control")
+    .map((n) => ({
+      id: n.config.control_id, role: "control", up: true, base: n.base,
+      detail: (n.raft && n.raft.is_leader) ? "control leader" : "control node",
+      statusText: "reachable",
+    }));
+  $("ov-summary").textContent = controlRows.length
+    ? `${controlRows.length} control + ${nodeCount} data node(s) · ${tabletIds.length} tablet(s)`
+    : `${nodeCount} node(s) · ${tabletIds.length} tablet(s)`;
 
   // ---- health banner ----
   // Degraded is driven by tablet health (leaderless/under-replicated), not by
@@ -53,15 +68,20 @@ function renderOverview() {
     `<div class="stat-tile"><div class="label">${esc(t.label)}</div><div class="value">${t.value}</div><div class="sub">${esc(t.sub)}</div></div>`
   ).join("");
 
-  // ---- nodes list (top 6) ----
+  // ---- nodes list ----
   // Every DATA member (tracked in replicated `Metadata`, keyed by raftkv id —
   // covers both a "data"-role and a "combined"-role node) plus every
-  // CONTROL-ONLY node reachable via the `/admin/peers` fan-out (ADR 0035): a
-  // control-only node is never a data member at all, so without the second
-  // half it would never appear anywhere in the dashboard despite being a
-  // real part of the cluster. Each row is tagged with its role so a split
-  // deployment's control trio and data fleet read as what they are, not as
-  // an undifferentiated node list.
+  // CONTROL-ONLY node reachable via the `/admin/peers` fan-out (ADR 0035,
+  // `controlRows` above): a control-only node is never a data member at all,
+  // so without the second half it would never appear anywhere in the
+  // dashboard despite being a real part of the cluster. In a split
+  // deployment the two kinds render as separate "Control plane" / "Data
+  // nodes" groups; a combined-mode cluster (no control-only nodes) keeps the
+  // single flat list, each row tagged with its role either way. Every
+  // reachable node's row links to that node's OWN admin console (its admin
+  // `base` origin, already resolved by the fan-out) — the same
+  // `target="_blank"` pattern the Node view's "Open cluster console" link
+  // uses — so hopping between nodes' consoles never means retyping a port.
   const dataRows = (memberIds.length ? memberIds : STATE.nodes.filter((n) => n.ok).map((n) => n.config.raftkv_id))
     .map((id) => {
       const m = members[id];
@@ -71,25 +91,25 @@ function renderOverview() {
       const role = (node && node.config && node.config.role) || "data";
       return {
         id, role, up,
+        base: node && node.ok ? node.base : null,
         detail: `${hostedCount} tablet(s)`,
         statusText: m ? m.status : (up ? "reachable" : "unreachable"),
       };
     });
-  const controlOnlyRows = STATE.nodes
-    .filter((n) => n.ok && n.config && n.config.role === "control")
-    .map((n) => ({
-      id: n.config.control_id, role: "control", up: true,
-      detail: (n.raft && n.raft.is_leader) ? "control leader" : "control node",
-      statusText: "reachable",
-    }));
-  const nodeRows = [...dataRows, ...controlOnlyRows].slice(0, 6).map((r) =>
-    `<div class="list-row">${dot(r.up ? "ok-dot" : "bad-dot")}
+  const nodeRow = (r) => `<div class="list-row">${dot(r.up ? "ok-dot" : "bad-dot")}
       <span class="id mono">${esc(r.id)}</span>
       <span class="muted" style="font-size:10px;text-transform:uppercase;letter-spacing:.03em">${esc(r.role)}</span>
       <span class="detail">${esc(r.detail)}</span>
+      ${consoleLink(r.base, r.id)}
       <span class="status-text" style="color:var(${r.up ? "--ok" : "--danger"})">${esc(r.statusText)}</span>
-    </div>`).join("");
-  $("ov-nodes").innerHTML = nodeRows || `<div class="empty">no members yet</div>`;
+    </div>`;
+  const groupHead = (label) =>
+    `<div class="muted" style="font-size:10px;text-transform:uppercase;letter-spacing:.05em;margin:10px 0 2px">${esc(label)}</div>`;
+  $("ov-nodes").innerHTML = controlRows.length
+    ? groupHead("Control plane") + controlRows.slice(0, 6).map(nodeRow).join("")
+      + groupHead("Data nodes")
+      + (dataRows.slice(0, 6).map(nodeRow).join("") || `<div class="empty">no data members yet</div>`)
+    : (dataRows.slice(0, 6).map(nodeRow).join("") || `<div class="empty">no members yet</div>`);
 
   // ---- tables summary (real substitute for the design's activity feed) ----
   const byTable = {};

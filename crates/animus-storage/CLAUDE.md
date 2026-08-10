@@ -36,16 +36,17 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
   strictly increasing** (enforced via `StorageError::NonMonotonicVersion`).
   Given that, a `Snapshot` taken at version `v` is isolated from later writes —
   snapshots are version-pinned read views, not copies.
-- `merge(key, value, version)` is the **leaderless-replication** primitive (ADR
-  0010): per-key LWW that applies iff `version` is newer for *that key*,
-  bypassing the engine-wide monotonic floor `put` enforces (so a repair can
-  re-apply a value at its original, below-floor version). Idempotent and
-  commutative ⇒ convergence regardless of delivery order. `merge_tombstone(key,
+- `merge(key, value, version)` is the **per-key LWW** primitive: it applies iff
+  `version` is newer for *that key*, bypassing the engine-wide monotonic floor
+  `put` enforces (so a re-apply can land a value at its original, below-floor
+  version). Idempotent and commutative ⇒ convergence regardless of delivery
+  order. Born for leaderless replication (ADR 0010 — that AP plane is deleted,
+  ADR 0019); today its main consumer is the **CP-data Raft apply loop**
+  (re-applying a recovered log tail must be idempotent). `merge_tombstone(key,
   version)` is its delete counterpart: same per-key LWW, applying a tombstone.
   `entries()` returns the full *live* digest; `entries_with_tombstones()`
   returns each key's latest record including tombstones (`(key, Option<value>,
-  version)`), which anti-entropy uses so deletes propagate too. `put` keeps its
-  global contract for single-writer callers (control plane, dynamo adapter).
+  version)`). `put` keeps its global contract for single-writer callers.
 - **`merge_batch(Vec<MergeOp>)` coalesces a *sequential* run of merges into one WAL
   `fsync`.** Each `MergeOp` carries its **own** version (unlike `write_batch`, which
   stamps one version and uses `put`/monotonic-floor semantics) and applies with the
@@ -309,7 +310,9 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
 
 ## Tests & benchmark
 
-`cargo test -p animus-storage` (proptest semantics + units). Library unit tests
+`cargo test -p animus-storage` (proptest semantics + units). The
+`MemoryEngine`-level suites are `tests/storage_basic.rs` (trait-contract units)
+and `tests/storage_props.rs` (property tests). Library unit tests
 also cover the perf formats: `sstable::tests` round-trips a compressible and
 an incompressible block (asserting LZ4 shrinks the former and never inflates the
 latter), round-trips the **shared-prefix codec** across every prefix relation +

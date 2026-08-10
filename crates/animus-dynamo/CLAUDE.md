@@ -100,21 +100,27 @@ adapter wedge. The transport (HTTP, sockets) and the distributed routing live in
   the control plane's replicated catalog (ADR 0013)** and reads schemas back from
   `Metadata`, holds one process-wide `SchemaRegistry` (now only GSI/LSI + the
   written-key index) behind a lock, and routes decoded ops through the data plane.
-- Storage key = `escape(partition_key) || sort_key`, using an order-preserving,
-  prefix-free escape (no key's encoding prefixes another's). So a partition's
-  items are contiguous and sort-ordered, and `query` is one range scan. Numbers (`N`) are carried as text and sort lexicographically (a
+- This crate's `storage_key` = `escape(partition_key) || sort_key`, using an
+  order-preserving, prefix-free escape (no key's encoding prefixes another's).
+  So a partition's items are contiguous and sort-ordered, and `query` is one
+  range scan. Numbers (`N`) are carried as text and sort lexicographically (a
   documented simplification). `SortKeyCondition::matches` compares the same
-  key-bytes, so it agrees with the scan range.
-- `Query` / `Scan` over the **distributed** plane now use the data plane's
-  **native quorum range scan** (`DataClient::scan`), not a tracked key set. A base
-  `Query` scans the partition's contiguous data-plane sub-range
-  `[escape(table) || escape(pk), …)`; a `Scan` scans the whole table's range
-  `[escape(table), …)` and paginates with `Limit` +
+  key-bytes, so it agrees with the scan range. **The stored data-plane key adds
+  a prefix at the `animusd` edge** (`dynamo.rs::item_key`, ADR 0022/0023):
+  `partition_token(escape(pk)) || escape(pk) || sk` — a Murmur3 token spreads
+  partitions across the table's hash ring, and there is **no table prefix**
+  (tables are separated by per-table tablets, the table is a routing argument).
+- `Query` / `Scan` over the **distributed** plane use the CP data plane's
+  **linearizable range scan** (`animusd`'s `native_scan` → `ClientCtx::cp_scan`,
+  ReadIndex on each tablet leader, forwarded cross-process), not a tracked key
+  set. A base `Query` scans the partition's contiguous sub-range
+  `[token(pk) || escape(pk), …)`; a `Scan` fans out across the table's tablets
+  in token order and paginates with `Limit` +
   `ExclusiveStartKey`/`LastEvaluatedKey` over the **live** keys the scan returns.
   An **index** `Query` still uses the in-memory GSI/LSI index (`index_query_keys`)
   — the native scan covers the base keyspace, not an index's alternate ordering.
   The range math (escape is prefix-free, ending `0x00 0x00`, so the first key past
-  a prefix bumps the last byte to `0x01`) lives at the `animusd` edge now.
+  a prefix bumps the last byte to `0x01`) lives at the `animusd` edge.
   `Table::query_with` is the *local-engine* equivalent (a real engine scan),
   used by the item-API tests.
 - **Secondary indexes** (any number per table, GSI + LSI): `note_put` extracts

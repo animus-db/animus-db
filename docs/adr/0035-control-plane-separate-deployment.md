@@ -149,7 +149,18 @@ behind a seam so the data-node mode never needs a local `RaftCore` at all.
    default PR4 shipped. `remote_metadata_watch_loop` replaces the fixed
    200ms poll: long-poll (preferring the leader hint, then every seed),
    falling back to a plain `Status` poll + backoff only when every seed
-   fails at the transport level. Two hardening details worth recording: (1)
+   fails at the transport level. **A follow-up increment ports the ADR 0030
+   growth-node branch of `remote_metadata_sync_loop` onto this same
+   `remote_metadata_watch_loop` mechanism** — PR5 as originally shipped left
+   it on the pre-existing fixed-200ms `Status` poll, since a growth node's
+   `ClientCtx.control` is `ControlHandle::Local` (a real, permanently
+   non-voting control-group member), not `Remote`, so it had no
+   `RemoteControlClient` to reuse; the growth-node branch now constructs a
+   standalone one via `RemoteControlClient::with_mirror`, sharing
+   `ClientCtx.remote_metadata`'s existing `Arc<Mutex<Option<Metadata>>>`
+   directly as its mirror, purely to drive the identical long-poll loop.
+   See `crates/animusd/CLAUDE.md`'s dedicated bullet for the detail. Two
+   hardening details worth recording: (1)
    `MetadataWatch::bump` had to become `pub` in `animus-control` so
    `RemoteControlClient` could drive it from outside the crate — a small,
    safe widening of an existing primitive, not a new one; (2) `observe()`

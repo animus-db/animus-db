@@ -3,7 +3,7 @@
 // for the AnimusDB Console. `dashboard_overview.js`, `dashboard_placement.js`,
 // `dashboard_tablets.js`, `dashboard_browser.js`, and `dashboard_storage.js`
 // load after this file and call into it (STATE, $, esc, getJSON, postJSON,
-// pill, bytes, humanBytes, tokenBound, b64url, nodeRaftkvId, cpGroupsByTablet,
+// pill, consoleLink, bytes, humanBytes, tokenBound, b64url, nodeRaftkvId, cpGroupsByTablet,
 // autoSplitThresholds, tabletStatus, computeHealth, activateTab, gotoStorage);
 // nothing here calls into them except `render()`, the single per-refresh
 // entry point every view's render function hangs off of.
@@ -150,6 +150,18 @@ function tokenBound(v, fill) {
 
 function pill(cls, text) { return `<span class="pill ${esc(cls)}">${esc(text)}</span>`; }
 function dot(cls) { return `<span class="dot ${esc(cls)}"></span>`; }
+
+// A "console →" link to another node's OWN admin console, from its admin
+// `base` origin (already resolved by `loadAll()`'s fan-out). Empty when the
+// base is unknown (unreachable node) or is this very page's own origin —
+// linking a node to itself is noise, not navigation. Opens in a new tab
+// (same pattern as the Node view's "Open cluster console" link) so the
+// current console's state isn't lost by hopping.
+function consoleLink(base, id) {
+  if (!base || base === SEED) return "";
+  return `<a class="link-text" href="${esc(base)}/admin/ui/overview" target="_blank" rel="noopener"
+    title="open node ${esc(id)}'s own console">console →</a>`;
+}
 
 // ---- shared data-derivation helpers (used by more than one view) ----
 
