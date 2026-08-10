@@ -14,7 +14,6 @@
 //! assertions (a flaky `ProdEnv` test is a real bug, per the root
 //! `CLAUDE.md`).
 
-use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -31,43 +30,10 @@ mod support;
 
 const TABLES: [&str; 3] = ["allocjoin0", "allocjoin1", "allocjoin2"];
 
-/// Bring up the initial `n`-node combined-mode config core, one process per
-/// node — mirrors `tests/seed_join.rs::bring_up` verbatim.
+/// Bring up the initial `n`-node combined-mode config core (port-TOCTOU
+/// mitigation) — see `support::bring_up_deadline`.
 async fn bring_up(n: usize, dir: &Path) -> (Vec<Node>, ClusterConfig) {
-    for attempt in 0..16 {
-        let addrs = support::free_addrs(n * 6);
-        let nodes_cfg: Vec<RoleAddrs> = (0..n)
-            .map(|i| RoleAddrs {
-                role: animusd::config::NodeRole::Both,
-                control: Some(addrs[6 * i]),
-                client: addrs[6 * i + 1],
-                dynamo: addrs[6 * i + 2],
-                cql: addrs[6 * i + 3],
-                raftkv: Some(addrs[6 * i + 4]),
-                admin: addrs[6 * i + 5],
-            })
-            .collect();
-        let config = ClusterConfig { nodes: nodes_cfg };
-        let mut nodes = Vec::new();
-        let mut failed = false;
-        for i in 0..n {
-            match animusd::run_node(&config, i, dir.join(format!("core-{attempt}-{i}"))).await {
-                Ok(node) => nodes.push(node),
-                Err(_) => {
-                    failed = true;
-                    break;
-                }
-            }
-        }
-        if !failed {
-            return (nodes, config);
-        }
-        for node in &nodes {
-            node.shutdown();
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
-    panic!("could not bring up the initial cluster after retries");
+    support::bring_up_deadline(n, dir, support::JOIN_DEADLINE).await
 }
 
 async fn await_bootstrap(nodes: &[Node]) {
@@ -95,78 +61,27 @@ fn leader_index(nodes: &[Node]) -> usize {
 
 /// Join a fresh **combined-mode, cluster-allocated-id** node against `seeds`
 /// (ADR 0036) — the allocated-id counterpart of `tests/seed_join.rs::
-/// join_fresh`. `label` disambiguates the data dir across concurrent callers
-/// sharing one `dir` (unlike the `--node`-indexed helper, there is no index
-/// to name it after). Retries the (allocate-ports + join) as a unit, the
-/// same port-TOCTOU mitigation every bring-up helper in this suite uses.
+/// join_fresh`, see `support::join_allocated_fresh_deadline`.
 async fn join_allocated_fresh(
     seeds: &[SocketAddr],
     dir: &Path,
     label: &str,
     backend: StorageBackend,
 ) -> (Node, RoleAddrs, PathBuf) {
-    for attempt in 0..16 {
-        let raw = support::free_addrs(6);
-        let addrs = RoleAddrs {
-            role: animusd::config::NodeRole::Both,
-            control: Some(raw[0]),
-            client: raw[1],
-            dynamo: raw[2],
-            cql: raw[3],
-            raftkv: Some(raw[4]),
-            admin: raw[5],
-        };
-        let node_dir = dir.join(format!("join-alloc-{label}-{attempt}"));
-        match animusd::run_node_join_allocated(
-            seeds.to_vec(),
-            addrs,
-            &node_dir,
-            backend,
-            BTreeMap::new(),
-        )
-        .await
-        {
-            Ok(node) => return (node, addrs, node_dir),
-            Err(_) => sleep(Duration::from_millis(50)).await,
-        }
-    }
-    panic!("could not join (allocated id) after retries");
+    support::join_allocated_fresh_deadline(seeds, dir, label, backend, support::JOIN_DEADLINE).await
 }
 
 /// Join a fresh **data-only, cluster-allocated-id** node against `seeds`
-/// (ADR 0036) — the data-only dual of [`join_allocated_fresh`].
+/// (ADR 0036) — the data-only dual of [`join_allocated_fresh`], see
+/// `support::join_data_allocated_fresh_deadline`.
 async fn join_data_allocated_fresh(
     seeds: &[SocketAddr],
     dir: &Path,
     label: &str,
     backend: StorageBackend,
 ) -> Node {
-    for attempt in 0..16 {
-        let raw = support::free_addrs(6);
-        let addrs = RoleAddrs {
-            role: animusd::config::NodeRole::Data,
-            control: None,
-            client: raw[1],
-            dynamo: raw[2],
-            cql: raw[3],
-            raftkv: Some(raw[4]),
-            admin: raw[5],
-        };
-        let node_dir = dir.join(format!("data-join-alloc-{label}-{attempt}"));
-        match animusd::run_node_data_join_allocated(
-            seeds.to_vec(),
-            addrs,
-            &node_dir,
-            backend,
-            BTreeMap::new(),
-        )
+    support::join_data_allocated_fresh_deadline(seeds, dir, label, backend, support::JOIN_DEADLINE)
         .await
-        {
-            Ok(node) => return node,
-            Err(_) => sleep(Duration::from_millis(50)).await,
-        }
-    }
-    panic!("could not join as a data node (allocated id) after retries");
 }
 
 /// One HTTP/1.0 request to the admin endpoint; returns `(status, parsed
