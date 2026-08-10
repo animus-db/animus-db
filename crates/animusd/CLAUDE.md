@@ -293,7 +293,13 @@ route below the edge through the same `ClientCtx` CP primitives.
   view (`dashboard_node.js`) instead of the cluster-wide tabs. `loadSelf()`
   resolves this node's own role from a self-only fetch, kept separate from the
   slower cluster-wide fan-out. `/admin/config` carries a derived `role` string;
-  `/admin/raft` carries a `control_mirror` object for the Node view.
+  `/admin/raft` carries a `control_mirror` object for the Node view. The
+  Overview groups nodes as "Control plane" / "Data nodes" when any
+  control-only node exists (a combined cluster keeps the flat list), and every
+  reachable node's row — plus the Placement view's selected-node header —
+  carries a `consoleLink()` (`dashboard_core.js`) to that node's OWN admin
+  console, built from the origin the `/admin/peers` fan-out already resolved
+  (empty for this page's own origin — a self-link is noise).
 - **OTel** (`otel.rs`, ADR 0027) — `init_tracing(instance_id)` from `main.rs`;
   `current_traceparent`/`set_parent_traceparent` carry W3C trace context across a
   forwarded hop (`cp_forward` injects, the receiver's `handle_client`
