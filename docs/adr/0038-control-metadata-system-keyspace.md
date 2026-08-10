@@ -14,6 +14,10 @@
 - **Amends:** ADR 0009 (in-house Raft over `Env`), ADR 0013 (replicated schema
   catalog), ADR 0028 (shared per-node storage), ADR 0031 (tablet-host
   reconciler + `metadata_watch`), ADR 0035 (control-plane separate deployment).
+- **See also:** ADR 0039 works out this ADR's own Option B ("bootstrap system
+  tablet," rejected below) in detail — design-only, not scheduled — and finds
+  that its scaling payoff is gated on ADR 0018 (cross-tablet transactions),
+  not on Option B alone.
 
 ## Context
 
