@@ -4,5 +4,5 @@
 # (the `clippy::precedence` drift that once landed a red `main`). Bump this and
 # the workspace `rust-version` together.
 [toolchain]
-channel = "1.85"
+channel = "1.96"
 components = ["clippy", "rustfmt"]

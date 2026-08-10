@@ -194,8 +194,8 @@ fn torn_tail_crash_keeps_a_reproducible_strict_prefix() {
             });
             sim.run();
         }
-        let bytes = out.lock().unwrap().clone();
-        bytes
+
+        out.lock().unwrap().clone()
     }
 
     let seed = 0xD15C_0004;
@@ -301,8 +301,8 @@ fn corrupt_on_crash_flips_one_byte_in_the_retained_region() {
             });
             sim.run();
         }
-        let bytes = out.lock().unwrap().clone();
-        bytes
+
+        out.lock().unwrap().clone()
     }
 
     let written: &[u8] = b"KEEP0123456789abcdef0123456789abcdef";

@@ -155,22 +155,22 @@ async fn handle_conn(mut stream: TcpStream, ctx: ClientCtx) -> std::io::Result<(
         // The dashboard's CSS/JS assets (ADR 0021), served self-contained from the
         // admin port under exact paths. Checked before `is_ui_path` below, since
         // that function's `/admin/ui/` prefix match would otherwise swallow these.
-        if request.method == "GET" {
-            if let Some((content_type, body)) = static_asset(&request.path) {
-                http::write_response_with(
-                    &mut stream,
-                    200,
-                    content_type,
-                    body,
-                    keep_alive,
-                    http::CORS_HEADERS,
-                )
-                .await?;
-                if !keep_alive {
-                    return Ok(());
-                }
-                continue;
+        if request.method == "GET"
+            && let Some((content_type, body)) = static_asset(&request.path)
+        {
+            http::write_response_with(
+                &mut stream,
+                200,
+                content_type,
+                body,
+                keep_alive,
+                http::CORS_HEADERS,
+            )
+            .await?;
+            if !keep_alive {
+                return Ok(());
             }
+            continue;
         }
         // The static web dashboard asset (ADR 0021), served self-contained from the
         // admin port. A pure client of the `/admin/*` JSON below.

@@ -240,10 +240,10 @@ impl KeyRange {
         if at <= self.start.as_slice() {
             return None;
         }
-        if let Some(end) = self.end.as_deref() {
-            if at >= end {
-                return None;
-            }
+        if let Some(end) = self.end.as_deref()
+            && at >= end
+        {
+            return None;
         }
         let left = KeyRange {
             start: self.start.clone(),

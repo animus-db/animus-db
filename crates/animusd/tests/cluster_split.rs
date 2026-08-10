@@ -94,10 +94,9 @@ async fn await_value(clients: &[SocketAddr], table: &str, key: &[u8], want: &[u8
                     },
                 )
                 .await
+                    && v == want
                 {
-                    if v == want {
-                        return;
-                    }
+                    return;
                 }
             }
             sleep(Duration::from_millis(100)).await;

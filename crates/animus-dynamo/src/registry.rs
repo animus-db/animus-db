@@ -577,10 +577,10 @@ impl SchemaRegistry {
                 // The sort value is `escape(sort)` (prefix-free), then the base
                 // key. Recover it to test the condition.
                 let (sort_bytes, base) = split_escaped_prefix(suffix);
-                if let Some(cond) = condition {
-                    if !cond.matches(&AttributeValue::B(sort_bytes.to_vec())) {
-                        continue;
-                    }
+                if let Some(cond) = condition
+                    && !cond.matches(&AttributeValue::B(sort_bytes.to_vec()))
+                {
+                    continue;
                 }
                 keys.push(base.to_vec());
             } else {

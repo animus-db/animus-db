@@ -444,6 +444,10 @@ impl CpGroup {
 
 /// How a CP op originating on this node reaches the group leader
 /// ([`ClientCtx::cp_route`]).
+// Transient per-request value: created, matched once, dropped — never stored.
+// Boxing `Local`'s `CpGroup` would put a heap allocation on the read/write hot
+// path just to shrink a stack value that lives for one match.
+#[allow(clippy::large_enum_variant)]
 enum CpRoute {
     /// This node hosts the current leader — serve from `leader` directly.
     Local(CpGroup),
@@ -2649,10 +2653,10 @@ impl ClientCtx {
     async fn cp_route(&self, table: &str, key: &[u8]) -> CpRoute {
         let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
         loop {
-            if let Some(tablet) = self.tablet_for(table, key) {
-                if let Some(route) = self.resolve_cp_route(tablet) {
-                    return route;
-                }
+            if let Some(tablet) = self.tablet_for(table, key)
+                && let Some(route) = self.resolve_cp_route(tablet)
+            {
+                return route;
             }
             if tokio::time::Instant::now() >= deadline {
                 return CpRoute::None;
@@ -3221,10 +3225,10 @@ impl ClientCtx {
         ranges.sort();
         let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         for r in ranges {
-            if let Some(l) = limit {
-                if out.len() >= l {
-                    break;
-                }
+            if let Some(l) = limit
+                && out.len() >= l
+            {
+                break;
             }
             // Clip the scan window to this tablet's sub-range; the exclusive upper
             // bound is the lesser of the tablet's end and the scan's end (None = ∞).
@@ -3234,10 +3238,10 @@ impl ClientCtx {
                 (Some(re), None) => Some(re),
                 (Some(re), Some(e)) => Some(re.min(e.clone())),
             };
-            if let Some(se) = &sub_end {
-                if sub_start.as_slice() >= se.as_slice() {
-                    continue;
-                }
+            if let Some(se) = &sub_end
+                && sub_start.as_slice() >= se.as_slice()
+            {
+                continue;
             }
             let remaining = limit.map(|l| l - out.len());
             out.extend(
@@ -3416,10 +3420,10 @@ impl ClientCtx {
         // node (ADR 0030) the local raft never reflects a table created before it
         // existed, which would otherwise misread every write as needing a brand
         // new (duplicate, rejected) tablet.
-        if !self.effective_metadata().has_table_tablet(table) {
-            if let Err(e) = self.provision_tablet(table).await {
-                return ClientResponse::Error(e);
-            }
+        if !self.effective_metadata().has_table_tablet(table)
+            && let Err(e) = self.provision_tablet(table).await
+        {
+            return ClientResponse::Error(e);
         }
         match self.cp_write(table, key, value).await {
             Ok(()) => ClientResponse::PutOk,
@@ -3649,14 +3653,14 @@ impl ClientCtx {
                 ClientResponse::Error(_)
             );
         }
-        if let Some(leader_id) = self.control.leader() {
-            if let Some(addr) = self.route_addr(leader_id) {
-                return !matches!(
-                    self.relay(addr, ClientRequest::ProposeSchema(command.clone()))
-                        .await,
-                    ClientResponse::Error(_)
-                );
-            }
+        if let Some(leader_id) = self.control.leader()
+            && let Some(addr) = self.route_addr(leader_id)
+        {
+            return !matches!(
+                self.relay(addr, ClientRequest::ProposeSchema(command.clone()))
+                    .await,
+                ClientResponse::Error(_)
+            );
         }
         // No locally-known leader. The common cause is a real control-group
         // voter mid-election (rare, brief); the other is a **control-plane-
@@ -4031,14 +4035,14 @@ impl ClientCtx {
     /// decommission flow's real last step is stopping the process, not this
     /// call.
     pub(crate) fn admin_remove_member(&self, node: NodeId) -> Result<(), String> {
-        if let Some(control_id) = node.checked_sub(config::RAFTKV_ID_BASE) {
-            if self.admin.control_ids.contains(&control_id) {
-                return Err(format!(
-                    "node {node} is an original control-plane core member (control id \
+        if let Some(control_id) = node.checked_sub(config::RAFTKV_ID_BASE)
+            && self.admin.control_ids.contains(&control_id)
+        {
+            return Err(format!(
+                "node {node} is an original control-plane core member (control id \
                      {control_id}); the control group is static (ADR 0030) and this member \
                      must never be decommissioned"
-                ));
-            }
+            ));
         }
         // Check leadership BEFORE reading `self.control.metadata_cached()` for the
         // drain-status refusals below: a follower's own replica can lag the
@@ -5998,10 +6002,10 @@ async fn join_request(seeds: &[SocketAddr], request: &ClientRequest) -> Option<C
             read_frame::<ClientResponse>(&mut stream).await.ok()?
         })
         .await;
-        if let Ok(Some(resp)) = reply {
-            if !matches!(resp, ClientResponse::Error(_)) {
-                return Some(resp);
-            }
+        if let Ok(Some(resp)) = reply
+            && !matches!(resp, ClientResponse::Error(_))
+        {
+            return Some(resp);
         }
     }
     None
@@ -6207,17 +6211,17 @@ async fn check_join_collision(
 ) -> std::io::Result<()> {
     match poll_seeds_for(seeds, &ClientRequest::Status, JOIN_DISCOVERY_BUDGET).await? {
         ClientResponse::Status { metadata: meta, .. } => {
-            if let Some(existing) = meta.node_addrs.get(&my_id) {
-                if existing != mine {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::AlreadyExists,
-                        format!(
-                            "join index {index} (id {my_id}) is already \
+            if let Some(existing) = meta.node_addrs.get(&my_id)
+                && existing != mine
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!(
+                        "join index {index} (id {my_id}) is already \
                              registered with different addresses ({existing:?} != {mine:?}) \
                              — pick a different --node index"
-                        ),
-                    ));
-                }
+                    ),
+                ));
             }
             Ok(())
         }

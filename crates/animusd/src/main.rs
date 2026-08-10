@@ -69,10 +69,10 @@ async fn main() -> ExitCode {
 
     // Flush any spans still buffered in the OTLP batch exporter (ADR 0027)
     // before the process exits; a no-op if export isn't configured.
-    if let Some(provider) = tracer_provider {
-        if let Err(err) = provider.shutdown() {
-            tracing::warn!(%err, "failed to flush OpenTelemetry tracer provider on exit");
-        }
+    if let Some(provider) = tracer_provider
+        && let Err(err) = provider.shutdown()
+    {
+        tracing::warn!(%err, "failed to flush OpenTelemetry tracer provider on exit");
     }
 
     match result {
@@ -92,10 +92,10 @@ async fn main() -> ExitCode {
 /// no single node id applies at the process/resource level — per-span
 /// `node_id` fields still distinguish them within a trace).
 fn otel_instance_label(args: &[String]) -> String {
-    if let Some(pos) = args.iter().position(|a| a == "--node") {
-        if let Some(index) = args.get(pos + 1) {
-            return format!("node-{index}");
-        }
+    if let Some(pos) = args.iter().position(|a| a == "--node")
+        && let Some(index) = args.get(pos + 1)
+    {
+        return format!("node-{index}");
     }
     if args.iter().any(|a| a == "--cluster") {
         return "cluster".to_owned();

@@ -267,10 +267,10 @@ async fn form_kv_group(nodes: &[Node], clients: &[SocketAddr]) -> usize {
     let formed = async {
         loop {
             for (i, node) in nodes.iter().enumerate() {
-                if let Some((true, voters)) = tablet_group(node.admin_addr(), KV_TABLET).await {
-                    if voters.len() == 3 {
-                        return i;
-                    }
+                if let Some((true, voters)) = tablet_group(node.admin_addr(), KV_TABLET).await
+                    && voters.len() == 3
+                {
+                    return i;
                 }
             }
             sleep(Duration::from_millis(100)).await;
@@ -568,13 +568,11 @@ async fn a_joining_spare_is_never_released() {
                 for &i in &survivors {
                     if let Some((true, voters)) =
                         tablet_group(config.nodes[i].admin, KV_TABLET).await
+                        && voters.len() == 3
+                        && voters.contains(&spare)
+                        && !voters.contains(&killed_id)
                     {
-                        if voters.len() == 3
-                            && voters.contains(&spare)
-                            && !voters.contains(&killed_id)
-                        {
-                            return;
-                        }
+                        return;
                     }
                 }
                 sleep(Duration::from_millis(150)).await;

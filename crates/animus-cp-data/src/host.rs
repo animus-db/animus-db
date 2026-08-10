@@ -442,35 +442,33 @@ pub fn plan(
             continue;
         };
         if next.hosted.contains(&tablet) {
-            if let Some(f) = facts.get(&tablet) {
-                if f.hosted {
-                    if let Some(current) = &f.scope_range {
-                        if t.range != *current {
-                            if is_subrange(&t.range, current) {
-                                actions.push(HostAction::NarrowScope {
-                                    tablet,
-                                    range: t.range.clone(),
-                                });
-                            } else if !absorbing && is_subrange(current, &t.range) {
-                                // ADR 0033: this tablet was the surviving
-                                // (`left`) side of a merge — its metadata
-                                // range grew to cover the absorbed sibling's
-                                // range, already present on the shared engine.
-                                // Only once no absorb is pending locally (see
-                                // `absorbing` above): drain before widen.
-                                actions.push(HostAction::WidenScope {
-                                    tablet,
-                                    range: t.range.clone(),
-                                    version_floor: t.version_floor,
-                                });
-                            }
-                            // Neither a subset nor a superset of the current
-                            // scope: an incomparable range mismatch that
-                            // should never happen in practice — deliberately
-                            // no-op rather than guess a direction.
-                        }
-                    }
+            if let Some(f) = facts.get(&tablet)
+                && f.hosted
+                && let Some(current) = &f.scope_range
+                && t.range != *current
+            {
+                if is_subrange(&t.range, current) {
+                    actions.push(HostAction::NarrowScope {
+                        tablet,
+                        range: t.range.clone(),
+                    });
+                } else if !absorbing && is_subrange(current, &t.range) {
+                    // ADR 0033: this tablet was the surviving
+                    // (`left`) side of a merge — its metadata
+                    // range grew to cover the absorbed sibling's
+                    // range, already present on the shared engine.
+                    // Only once no absorb is pending locally (see
+                    // `absorbing` above): drain before widen.
+                    actions.push(HostAction::WidenScope {
+                        tablet,
+                        range: t.range.clone(),
+                        version_floor: t.version_floor,
+                    });
                 }
+                // Neither a subset nor a superset of the current
+                // scope: an incomparable range mismatch that
+                // should never happen in practice — deliberately
+                // no-op rather than guess a direction.
             }
         } else {
             to_host.push((tablet, t, join_plan));

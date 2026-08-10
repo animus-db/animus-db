@@ -592,20 +592,20 @@ impl SsTableReader {
         for bi in &self.index[first..] {
             // Stop once a block's first key is already past `end` (blocks are
             // ordered by first key, so nothing later can be in range).
-            if let Some(e) = end {
-                if bi.first_key.as_slice() >= e {
-                    break;
-                }
+            if let Some(e) = end
+                && bi.first_key.as_slice() >= e
+            {
+                break;
             }
             let block = self.read_block(env, bi).await?;
             for r in block {
                 if r.key.as_slice() < start {
                     continue;
                 }
-                if let Some(e) = end {
-                    if r.key.as_slice() >= e {
-                        continue;
-                    }
+                if let Some(e) = end
+                    && r.key.as_slice() >= e
+                {
+                    continue;
                 }
                 if r.version > version {
                     continue;
