@@ -53,7 +53,7 @@ mod topology;
 use control_handle::{ControlHandle, RemoteControlClient};
 
 use animus_control::meta::ALLOC_ID_BASE;
-use animus_control::node::heartbeat_loop;
+use animus_control::node::{HEARTBEAT_INTERVAL, send_heartbeat};
 use animus_control::{PlacementPolicy, ProposeResult, RaftNode};
 use animus_cp_data::RaftKvNode;
 use animus_cp_data::host::{MetadataView, Reconciler};
@@ -1505,10 +1505,16 @@ impl BoundNode {
         // `raftkv` ids, registered by `bootstrap`), so the control leader's
         // `detect_loop` marks a crashed CP node `Down`. Runs on every node; the
         // raftkv peer book includes the control addrs (the static book), so the
-        // heartbeats reach the control group.
-        tasks.push(tokio::spawn(heartbeat_loop(
+        // heartbeats reach the control group. **Live destinations (ADR 0037
+        // closing PR)**: `heartbeat_loop_live` re-derives the target list from
+        // `ctx.control.config()` each tick (falling back to this node's own
+        // static `control_ids` snapshot only until the first live read
+        // lands), so a control voter added at runtime is heartbeated without
+        // needing this node to restart — see that function's doc.
+        tasks.push(tokio::spawn(heartbeat_loop_live(
+            ctx.clone(),
             raftkv_hb_env,
-            control_ids.clone(),
+            control_ids,
         )));
 
         // **Tablet-host reconciler trigger** (ADR 0031 PR4): replaces the three
@@ -2412,7 +2418,16 @@ impl BoundDataNode {
             }));
         }
 
-        tasks.push(tokio::spawn(heartbeat_loop(raftkv_hb_env, control_ids)));
+        // Live destinations (ADR 0037 closing PR) — see `heartbeat_loop_live`'s
+        // doc; on this data-only node `ctx.control` is `ControlHandle::Remote`,
+        // so the live list comes from the last `Status`/`WatchMetadata` reply's
+        // `control_voters`, falling back to this node's static `control_ids`
+        // seed until the first one lands.
+        tasks.push(tokio::spawn(heartbeat_loop_live(
+            ctx.clone(),
+            raftkv_hb_env,
+            control_ids,
+        )));
 
         tasks.push(tokio::spawn(tablet_host_reconciler_loop(
             ctx.clone(),
@@ -4783,14 +4798,24 @@ async fn bootstrap(raft: RaftNode<ProdEnv>, raftkv_ids: Vec<NodeId>) {
 const PEER_SYNC_INTERVAL: Duration = Duration::from_millis(200);
 
 /// Keep the `raftkv` env family's peer book = the **static** book ∪ the replicated
-/// `Metadata.cp_member_addrs` ∪ `Metadata.node_addrs[*].raftkv` (Phase 2.3a address
-/// distribution, extended by ADR 0032 PR1's node address book — a node's own
-/// `raftkv` address is registered there too, so a node that joined via `RegisterNodeAddrs`
-/// alone, without ever going through `RegisterCpAddr`, is still reachable). `set_peers`
-/// replaces the book and a `sibling` env shares the same book `Arc`, so syncing the
-/// `raftkv` env reaches every co-resident CP group. Idempotent each tick; runs for
-/// the life of the node (a perpetual loop, aborted on `shutdown`). A peer entry
-/// whose address fails to parse is skipped (the control plane stores it opaquely).
+/// `Metadata.cp_member_addrs` ∪ `Metadata.node_addrs[*].raftkv` ∪
+/// `Metadata.node_addrs[*].control` (Phase 2.3a address distribution, extended
+/// by ADR 0032 PR1's node address book — a node's own `raftkv` address is
+/// registered there too, so a node that joined via `RegisterNodeAddrs` alone,
+/// without ever going through `RegisterCpAddr`, is still reachable; and by ADR
+/// 0037's closing PR — a runtime-added control voter's `.control` address must
+/// land in this **raftkv**-env book too, not just a control-role node's own
+/// control env via `control_peer_sync_loop`, because [`heartbeat_loop_live`]
+/// sends `RaftMsg::Heartbeat` to a control id over *this very env*: without
+/// this merge, `ProdEnv::send` silently drops the heartbeat for any control
+/// voter added after this node's own bring-up, even once
+/// `heartbeat_loop_live` names it as a destination — see that function's doc
+/// and `docs/engineering-lessons.md`'s two-staleness-axes entry for the full
+/// story). `set_peers` replaces the book and a `sibling` env shares the same
+/// book `Arc`, so syncing the `raftkv` env reaches every co-resident CP
+/// group. Idempotent each tick; runs for the life of the node (a perpetual
+/// loop, aborted on `shutdown`). A peer entry whose address fails to parse is
+/// skipped (the control plane stores it opaquely).
 ///
 /// Takes the whole [`ClientCtx`] (not a bare `RaftNode`) so a control-plane-
 /// follower-less growth node (ADR 0030) reads `effective_metadata` — its mirror
@@ -4813,6 +4838,9 @@ async fn peer_sync_loop(
         for (id, addrs) in meta.node_addrs {
             if let Ok(sa) = addrs.raftkv.parse::<SocketAddr>() {
                 book.insert(id, sa);
+            }
+            if let Some(addr) = addrs.control {
+                book.insert(id, addr);
             }
         }
         raftkv_env.set_peers(book);
@@ -4887,6 +4915,48 @@ async fn control_peer_sync_loop(ctx: ClientCtx) {
             }
         }
         tokio::time::sleep(PEER_SYNC_INTERVAL).await;
+    }
+}
+
+/// Failure-detection heartbeat loop with a **live** destination list (ADR
+/// 0037 "known deferrals" #1, closed by this PR): every [`HEARTBEAT_INTERVAL`],
+/// re-derive the control-group heartbeat targets from this node's own
+/// [`ControlHandle::config`] (`ctx.control`) instead of the bring-up-time
+/// `static_control_ids` snapshot [`heartbeat_loop`] was pinned to forever —
+/// so a control voter added at runtime (`admin_add_control_member`, ADR 0037
+/// PR3) starts receiving this node's heartbeats on the very next tick, not
+/// only after this node itself restarts.
+///
+/// `ctx.control.config()` is `Some(..)` unconditionally for a genuine control
+/// voter (`ControlHandle::Local`, always fresh — it's this node's own
+/// `RaftCore::config()`) and, for a data-only node (`ControlHandle::Remote`),
+/// the last voter set observed on any `Status`/`WatchMetadata` reply — `None`
+/// until the first one lands, in which case this falls back to
+/// `static_control_ids` (the config-file seed every node still has at
+/// bring-up) so a freshly-started data-only node's heartbeats aren't dropped
+/// entirely for the one tick before its first reply arrives.
+///
+/// Only fixes *which ids* this node targets — see `peer_sync_loop`'s doc for
+/// this loop's other half: without also merging `Metadata.node_addrs[*]
+/// .control`/`.raftkv` into the raftkv env's own peer book, a live id this
+/// loop names still cannot be dialed (`ProdEnv::send` silently drops an
+/// address-less peer). Both halves must ship together — see
+/// `docs/engineering-lessons.md`'s entry on this PR for the two-staleness-
+/// axes lesson.
+///
+/// Deliberately **not** a change to [`animus_control::node::heartbeat_loop`]
+/// itself — that function (and its sim call sites) keeps its original
+/// static-list contract; this is an animusd-local wrapper around the
+/// already-`pub` [`send_heartbeat`] built specifically for the two real-node
+/// call sites ([`BoundNode::start_with`], [`BoundNode::start_data_with`]).
+async fn heartbeat_loop_live(ctx: ClientCtx, env: ProdEnv, static_control_ids: Vec<NodeId>) {
+    loop {
+        let control_ids: Vec<NodeId> = match ctx.control.config() {
+            Some(voters) => voters.into_iter().collect(),
+            None => static_control_ids.clone(),
+        };
+        send_heartbeat(&env, &control_ids).await;
+        tokio::time::sleep(HEARTBEAT_INTERVAL).await;
     }
 }
 

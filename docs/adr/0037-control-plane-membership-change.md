@@ -238,7 +238,8 @@ is future work, not solved twice here.
 - **Wiring ADR 0036's allocator into `control-add`.** See "Coordination with
   ADR 0036" above.
 - **Fixing `heartbeat_loop`'s static destination list.** See "Known
-  deferrals" below.
+  deferrals" below. **Update: closed by PR #134** — see that deferral's own
+  "Update" paragraph for the fix (which turned out to be two parts, not one).
 
 ## Consequences
 
@@ -278,6 +279,40 @@ silently vanish between PRs)
    see `crates/animusd/CLAUDE.md`'s "cluster's members are the raftkv ids"
    gotcha and `docs/engineering-lessons.md`'s ADR 0037 PR4 audit entry for
    the full reasoning on why this one was scoped out.
+
+   **Update: closed by PR #134** (the ADR 0037 hardening trio's PR 1). The
+   fix is two parts, not one — this deferral's own text above named only the
+   destination-list half; the investigation that closed it surfaced a
+   second, previously-undocumented half the original text missed entirely:
+   even a fully live destination list is inert if the *sending* node's
+   `raftkv` env peer book never learns the runtime-added voter's *address*.
+   `peer_sync_loop` merged `Metadata.cp_member_addrs`/`node_addrs[*].raftkv`
+   into that book, but never `node_addrs[*].control` — so `ProdEnv::send`
+   silently dropped every heartbeat aimed at a runtime-added voter even once
+   it was correctly named as a destination (`ProdEnv::send`'s own doc: an
+   address-less peer is a fire-and-forget drop, no error surfaced anywhere).
+   Both halves shipped together, since fixing only one leaves the other's
+   silent drop in place: (a) `peer_sync_loop` now also merges
+   `node_addrs[*].control` into the raftkv env's own peer book, alongside
+   its existing `.raftkv`/`cp_member_addrs` merges; (b) a new animusd-local
+   `heartbeat_loop_live` re-derives the destination list every tick from
+   `ctx.control.config()` (falling back to the static list until a
+   `ControlHandle::Remote` data-only node's first live read lands), replacing
+   the two animusd call sites that previously pinned
+   `animus_control::node::heartbeat_loop`'s static `control_ids` argument
+   forever — that function itself (and its sim call sites) is untouched, by
+   design: the static-list contract is still correct and load-bearing for
+   `SimEnv`. Regression: `tests/heartbeat_live_destinations.rs::
+   heartbeat_reaches_a_runtime_added_voter_after_it_becomes_leader` — grows a
+   control voter at runtime, forces a deterministic 2-voter leadership
+   transfer onto it (not a race: with exactly two voters, a self-removal's
+   armed transfer has only one possible target), and proves a pre-existing
+   combined node's heartbeats sustain `believes_alive: true` on the new
+   leader's own `/admin/raft` view across several `DETECT_TIMEOUT` windows —
+   which would have failed on either half of the fix alone. See
+   `docs/engineering-lessons.md`'s entry on this PR for the mini-lesson
+   (a static-destination-list audit must also check the transport address
+   book) and `crates/animusd/CLAUDE.md`'s updated gotcha.
 2. **`control-grow`'s CLI-side orchestration loop is tested server-side, not
    at the CLI-binary level.** `animus-cli` has no integration-test harness
    that spawns the actual `animus` binary; `control-grow`'s sequential-add
