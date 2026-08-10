@@ -234,7 +234,20 @@ is future work, not solved twice here.
 - **A liveness-aware quorum-loss guard.** As documented above: the shipped
   guard counts the resulting voter set only. A real per-control-voter
   liveness signal (closing the id-space mismatch `believes_alive` hits)
-  is left as follow-up work, not built here.
+  is left as follow-up work, not built here. **Update: implemented by the
+  ADR 0037 hardening trio's PR 2 (the quorum-guard liveness fix)** — not by
+  bridging `believes_alive`'s raftkv-keyed signal, but by growing a new,
+  genuinely control-id-native one: `RaftCore::peer_last_contact`
+  (stamped from the leader's own `AppendEntriesResp` traffic, success or
+  reject) backs `RaftNode::control_peer_believed_alive`
+  (`CONTROL_PEER_LIVENESS_TIMEOUT = 500ms`). `admin_remove_control_member`
+  now refuses a removal that would leave fewer than a majority of the
+  *resulting* voters reachable, with a `force: bool` escape hatch
+  (`animus admin control-remove ... [--force]`) deliberately **independent**
+  of `decommission --force-control-remove` — see `animus-control/CLAUDE.md`'s
+  `node.rs` entry, `animusd/CLAUDE.md`'s "Control-plane membership change"
+  gotcha, and `docs/engineering-lessons.md`'s two closed entries for the
+  mechanism, the consumer, and the general lesson.
 - **Wiring ADR 0036's allocator into `control-add`.** See "Coordination with
   ADR 0036" above.
 - **Fixing `heartbeat_loop`'s static destination list.** See "Known
@@ -260,6 +273,17 @@ is future work, not solved twice here.
   documented trade-off rather than a defect — the alternative (a
   liveness-aware guard) needs the id-space unification flagged as future
   work, not a quick fix.
+
+  **Update: the ADR 0037 hardening trio's PR 2 closes this risk by default**
+  — the count-only guard above is superseded by the liveness-aware one (see
+  the Non-goals update above): the exact scenario this bullet describes (a
+  removal that strands the group because a *different* survivor is already
+  dead) is now refused outright unless the operator passes `--force`. The
+  risk is not eliminated — `--force` still reaches it, deliberately, since
+  an operator sometimes genuinely needs to push through a removal despite a
+  known-dead peer (e.g. mid-replacement) — but it is no longer the
+  *unconditional default*; using it is now informed consent to a named,
+  explained risk rather than a silent gap the count-only guard couldn't see.
 - **`admin_remove_member`'s control-core-id check is now dynamic, not
   static** (PR4) — every other `control_ids`/`admin.control_ids` read in
   `animusd` was audited and left static on purpose (legitimate seed/bootstrap
@@ -334,3 +358,8 @@ Any "how many are left" quorum check needs an explicit test for "one of the
 *other* survivors is already gone," not just "how many remain after this
 one action," or it will pass every test that only ever removes/kills one
 node at a time and still ship a silent stranding hazard.
+
+**Update: closed by the ADR 0037 hardening trio's PR 2** — see the Non-goals
+and Consequences "Update" paragraphs above, and `docs/engineering-lessons.md`'s
+matching closure notes on its "id-space mismatch" and "resulting count only"
+entries.

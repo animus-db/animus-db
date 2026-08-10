@@ -35,15 +35,27 @@
 //!   runtime-added voter, via the replicated `NodeAddrs.control` field +
 //!   `control_peer_sync_loop`, not the ephemeral single-env `merge_peer` call
 //!   PR3 shipped with.
-//! - [`removing_a_live_voter_while_another_is_already_dead_can_silently_strand_the_group`]
-//!   (ADR 0037 PR5, §9): the shipped quorum-loss guard only ever counts the
-//!   *resulting* voter set (refuse `< 1`, warn `== 1`) — it has no survivor-
-//!   liveness signal at all. Proves the accepted risk end to end through the
-//!   real admin path: killing one follower for good, then removing a
-//!   *different* live voter succeeds with no warning (3 -> 2, nowhere near
-//!   the threshold), but the group is now wedged for any further membership
-//!   change (`config_change_in_flight` never clears, since the dead voter
-//!   can never ack).
+//! - [`removing_a_live_voter_while_another_is_already_dead_is_refused_without_force`]
+//!   (ADR 0037 hardening PR2, superseding the PR5 §9 test of the same shape
+//!   that used to document this as an *accepted* risk): the original
+//!   count-only guard (refuse `< 1`, warn `== 1`) had no survivor-liveness
+//!   signal, so it let a removal through that stranded the group forever.
+//!   The liveness-aware guard closes this — killing one follower for good,
+//!   then removing a *different* live voter is now refused outright (3 -> 2,
+//!   only 1 of the resulting 2 is reachable, short of the 2-voter majority).
+//! - [`removing_a_live_voter_while_another_is_already_dead_succeeds_with_force`]:
+//!   the `--force` escape hatch still allows the same operationally-risky
+//!   removal the old guard let through unconditionally — proves it succeeds
+//!   with `force: true` and still strands the group for any further
+//!   membership change (`config_change_in_flight` never clears, since the
+//!   dead voter can never ack), i.e. `force` is explicit informed consent to
+//!   the exact risk ADR 0037's Consequences section originally documented.
+//! - [`removing_the_actually_dead_voter_itself_needs_no_force`]: removing the
+//!   dead voter itself is unaffected by the guard (it's excluded from
+//!   `remaining` by construction) — no `force` needed.
+//! - [`removing_a_voter_when_every_remaining_voter_is_alive_is_never_refused`]:
+//!   the negative case — with every voter genuinely alive, the liveness
+//!   guard never fires, `force` or not.
 //! - [`concurrent_control_add_surfaces_in_flight_as_a_clean_retryable_error`]
 //!   (ADR 0037 PR5, §9): the core-level in-flight rejection
 //!   (`animus-control`'s `rejects_a_change_while_one_is_in_flight`) surfaced
@@ -57,6 +69,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
 
+use animus_control::node::CONTROL_PEER_LIVENESS_TIMEOUT;
 use animusd::config::NodeRole;
 use animusd::{ClusterConfig, MetaCommand, Node, NodeStatus, RoleAddrs};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -118,7 +131,17 @@ async fn add_control_member(
 }
 
 async fn remove_control_member(admin_addr: SocketAddr, node: u64) -> (u16, serde_json::Value) {
-    let body = serde_json::json!({"node": node}).to_string();
+    remove_control_member_forced(admin_addr, node, false).await
+}
+
+/// `force` (ADR 0037 hardening PR2) bypasses the liveness-aware quorum-loss
+/// guard — see `ClientCtx::admin_remove_control_member`'s doc.
+async fn remove_control_member_forced(
+    admin_addr: SocketAddr,
+    node: u64,
+    force: bool,
+) -> (u16, serde_json::Value) {
+    let body = serde_json::json!({"node": node, "force": force}).to_string();
     admin(
         admin_addr,
         "POST",
@@ -688,31 +711,22 @@ async fn runtime_added_voter_survives_leadership_change_to_a_different_original_
     }
 }
 
-/// **ADR 0037 PR5 (§9 "quorum-loss guard... with a voter already Down")**:
-/// `admin_remove_control_member`'s quorum-loss warning (down to 1 voter,
-/// tested above) only ever counts the *resulting* voter set — it has no
-/// signal for whether any of the survivors are actually reachable (see that
-/// method's own doc for why a liveness-aware trigger was assessed and
-/// deliberately dropped: `ControlHandle::believes_alive` is keyed to raftkv
-/// ids, not control ids, so it can't tell). This test proves the resulting
-/// operational risk end to end, through the real admin HTTP path: a 3-node
-/// combined core has one non-leader voter genuinely killed (process shut
-/// down, still occupying its control-voter slot) and stays that way; the
-/// leader is then asked to remove a *different*, live voter — a plain
-/// 3-voter -> 2-voter removal, nowhere near the down-to-1 warning threshold,
-/// so it succeeds with **no warning at all**. But one of the resulting 2
-/// voters is dead, so the group needs a unanimous 2-of-2 to commit anything
-/// from here on — strictly worse fault tolerance than the 3-voter group it
-/// replaced. Proven not by prose but by an observable consequence: a
-/// *subsequent* control-membership change (adding a 4th voter) can never
-/// complete — `RaftCore::config_change_in_flight` stays permanently true,
-/// since the removal's own config-change log entry can itself never commit
-/// (it needs the dead voter's ack) — so every retry keeps getting the
-/// familiar "already in flight" refusal, forever, not eventually succeeding.
-#[tokio::test(flavor = "multi_thread", worker_threads = 10)]
-async fn removing_a_live_voter_while_another_is_already_dead_can_silently_strand_the_group() {
-    let dir = tempfile::tempdir().unwrap();
-    let (mut nodes, config) = bring_up_combined(3, dir.path()).await;
+/// Bring up a 3-node combined core, kill one non-leader follower for good
+/// (process shut down, still occupying its control-voter slot — nobody has
+/// removed it), and wait deliberately past
+/// [`CONTROL_PEER_LIVENESS_TIMEOUT`] before returning — there is no admin
+/// surface exposing per-voter liveness to poll on directly (this crate's
+/// `control_peer_believed_alive` is a leader-internal fact, not a wire
+/// field), so aging the dead follower out of the leader's `last_contact` map
+/// needs a deliberate real-time wait, not a converged-condition poll (unlike
+/// most of this test suite — see `docs/engineering-lessons.md`). The margin
+/// (3x the timeout) absorbs real scheduling jitter under a loaded CI
+/// machine. Returns `(nodes, admin_addrs, leader_admin, dead_id,
+/// live_target_id)`.
+async fn bring_up_with_one_dead_follower(
+    dir: &Path,
+) -> (Vec<Node>, Vec<SocketAddr>, SocketAddr, u64, u64) {
+    let (mut nodes, config) = bring_up_combined(3, dir).await;
     await_bootstrap(&nodes).await;
     let admin_addrs: Vec<SocketAddr> = config.nodes.iter().map(|n| n.admin).collect();
 
@@ -721,28 +735,102 @@ async fn removing_a_live_voter_while_another_is_already_dead_can_silently_strand
     let dead_idx = followers[0];
     let live_target_idx = followers[1];
 
-    // Kill one follower for good — it never comes back, but it still
-    // occupies its control-voter slot (nobody has removed it).
     let dead_node = nodes.remove(dead_idx);
     dead_node.shutdown_graceful().await;
     // Re-index: `nodes`/positions shifted after the `remove` above.
     let leader_admin = admin_addrs[leader];
+    let dead_id = dead_idx as u64;
     let live_target_id = live_target_idx as u64;
 
-    // The leader removes the OTHER (live) follower: a plain 3 -> 2 removal,
-    // nowhere near the down-to-1 threshold — succeeds with NO warning, even
-    // though one of the 2 resulting voters is already dead.
+    sleep(CONTROL_PEER_LIVENESS_TIMEOUT * 3).await;
+
+    (nodes, admin_addrs, leader_admin, dead_id, live_target_id)
+}
+
+/// **ADR 0037 hardening PR2**: supersedes the original PR5 §9 test of this
+/// name (`..._can_silently_strand_the_group`), which documented — as an
+/// *accepted* risk — that the old count-only guard (refuse `< 1`, warn
+/// `== 1`) let a removal through that permanently wedges the group when a
+/// *different* survivor is already dead. The liveness-aware guard closes
+/// this: a 3-node combined core has one non-leader voter genuinely killed;
+/// the leader is then asked to remove the OTHER (live) follower — a plain
+/// 3 -> 2 removal that the old count-only guard would have allowed
+/// unconditionally. The new guard computes `remaining = {leader,
+/// dead_follower}`, sees only 1 of the 2 is reachable (short of the 2-voter
+/// majority), and refuses — naming the dead voter and pointing at `--force`.
+/// The config is left unchanged (still all 3 original voters).
+#[tokio::test(flavor = "multi_thread", worker_threads = 10)]
+async fn removing_a_live_voter_while_another_is_already_dead_is_refused_without_force() {
+    let dir = tempfile::tempdir().unwrap();
+    let (nodes, _admin_addrs, leader_admin, dead_id, live_target_id) =
+        bring_up_with_one_dead_follower(dir.path()).await;
+
     let (status, body) = remove_control_member(leader_admin, live_target_id).await;
     assert_eq!(
+        status, 409,
+        "removing a live voter while a different survivor is already dead \
+         should be refused by the liveness-aware guard: {body}"
+    );
+    let msg = body["error"]
+        .as_str()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    assert!(
+        msg.contains(&dead_id.to_string()),
+        "the refusal should name the apparently-dead voter ({dead_id}): {msg}"
+    );
+    assert!(
+        msg.contains("force"),
+        "the refusal should point the operator at --force: {msg}"
+    );
+
+    // Unchanged: the refusal didn't touch the config.
+    let (status, body) = control_members(leader_admin).await;
+    assert_eq!(status, 200, "control/members failed: {body}");
+    assert_eq!(
+        voters_of(&body).map(|mut v| {
+            v.sort_unstable();
+            v
+        }),
+        Some(vec![0, 1, 2]),
+        "a refused removal must not change the live voter set: {body}"
+    );
+
+    for node in nodes {
+        node.shutdown();
+    }
+}
+
+/// The `--force` sibling of the test above: the same setup (one follower
+/// genuinely dead, the leader asked to remove the OTHER live follower), but
+/// with `force: true` — the explicit escape hatch still allows the
+/// operationally-risky removal the old, unconditional count-only guard used
+/// to let through by default. Proves both that it succeeds (with no
+/// additional warning — `remaining.len() == 2`, not the down-to-1 case) and
+/// that it still leaves the group stranded for any FURTHER membership
+/// change: the removal's own config-change log entry can never commit
+/// (needs the dead voter's ack), so `RaftCore::config_change_in_flight`
+/// stays permanently true and every subsequent add keeps getting the
+/// familiar "already in flight"/leader-routing refusal, never eventually
+/// succeeding, across a generous polling window. `force` is informed
+/// consent to exactly the risk ADR 0037's Consequences section originally
+/// documented as unconditionally accepted — it is no longer unconditional.
+#[tokio::test(flavor = "multi_thread", worker_threads = 10)]
+async fn removing_a_live_voter_while_another_is_already_dead_succeeds_with_force() {
+    let dir = tempfile::tempdir().unwrap();
+    let (nodes, _admin_addrs, leader_admin, _dead_id, live_target_id) =
+        bring_up_with_one_dead_follower(dir.path()).await;
+
+    let (status, body) = remove_control_member_forced(leader_admin, live_target_id, true).await;
+    assert_eq!(
         status, 200,
-        "removing a live voter while another is already dead is not refused \
-         by the shipped count-only guard: {body}"
+        "removing a live voter while another is already dead should succeed \
+         with --force: {body}"
     );
     assert!(
         body["warning"].is_null(),
-        "the shipped guard only ever counts resulting voters (2, not 1), so it \
-         carries NO warning here even though one of the 2 is dead — this IS the \
-         gap this test documents, not a bug in the test: {body}"
+        "a 3 -> 2 removal (not down to 1) carries no warning even with \
+         --force: {body}"
     );
 
     // The real consequence: the control group is now wedged for any FURTHER
@@ -755,7 +843,11 @@ async fn removing_a_live_voter_while_another_is_already_dead_can_silently_strand
     let mut ever_succeeded = false;
     let mut last_body = serde_json::Value::Null;
     while tokio::time::Instant::now() < probe_deadline {
-        let (status, body) = add_control_member(leader_admin, 90, admin_addrs[leader]).await;
+        // The placeholder `addr` never needs to resolve to anything real —
+        // the config-change is rejected before any connection is attempted
+        // (`config_change_in_flight`), so `leader_admin` itself is a
+        // convenient, always-valid `SocketAddr` to reuse here.
+        let (status, body) = add_control_member(leader_admin, 90, leader_admin).await;
         if status == 200 {
             ever_succeeded = true;
             last_body = body;
@@ -768,6 +860,64 @@ async fn removing_a_live_voter_while_another_is_already_dead_can_silently_strand
         !ever_succeeded,
         "a further control-membership change must never succeed once the group is \
          stranded (one dead survivor out of 2 voters) — but it did: {last_body}"
+    );
+
+    for node in nodes {
+        node.shutdown();
+    }
+}
+
+/// The dead voter is excluded from `remaining` by construction, so removing
+/// it — rather than a *different* live voter — needs no `--force`: the
+/// guard only ever counts the *resulting* voters, and the node being removed
+/// was never part of that set to begin with.
+#[tokio::test(flavor = "multi_thread", worker_threads = 10)]
+async fn removing_the_actually_dead_voter_itself_needs_no_force() {
+    let dir = tempfile::tempdir().unwrap();
+    let (nodes, _admin_addrs, leader_admin, dead_id, _live_target_id) =
+        bring_up_with_one_dead_follower(dir.path()).await;
+
+    let (status, body) = remove_control_member(leader_admin, dead_id).await;
+    assert_eq!(
+        status, 200,
+        "removing the actually-dead voter itself should succeed with no \
+         --force needed: {body}"
+    );
+    assert!(
+        body["warning"].is_null(),
+        "removing down to 2 voters, both alive (leader + the other live \
+         follower), should carry no warning: {body}"
+    );
+
+    for node in nodes {
+        node.shutdown();
+    }
+}
+
+/// The negative case: with every voter genuinely alive, the liveness-aware
+/// guard never fires — removing a non-leader voter succeeds exactly as it
+/// always has, `--force` or not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 10)]
+async fn removing_a_voter_when_every_remaining_voter_is_alive_is_never_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (nodes, config) = bring_up_combined(3, dir.path()).await;
+    await_bootstrap(&nodes).await;
+    let admin_addrs: Vec<SocketAddr> = config.nodes.iter().map(|n| n.admin).collect();
+
+    let leader = leader_index(&nodes);
+    let non_leader_voter = (0..3u64)
+        .find(|&i| i != leader as u64)
+        .expect("a follower id exists");
+
+    let (status, body) = remove_control_member(admin_addrs[leader], non_leader_voter).await;
+    assert_eq!(
+        status, 200,
+        "removing a voter when every remaining voter is alive should never \
+         be refused by the liveness guard: {body}"
+    );
+    assert!(
+        body["warning"].is_null(),
+        "removing down to 2 healthy voters should carry no warning: {body}"
     );
 
     for node in nodes {

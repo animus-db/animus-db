@@ -308,6 +308,22 @@ pub struct RaftCore<C = MetaCommand, S = Metadata> {
     // Leader state.
     next_index: BTreeMap<NodeId, u64>,
     match_index: BTreeMap<NodeId, u64>,
+    // Leader-only, volatile liveness bookkeeping (ADR 0037 hardening PR2): the
+    // `now` at which this leader last heard an `AppendEntriesResp` (success OR
+    // reject — either proves the peer is up and reachable) from each peer.
+    // Stamped in `handle_append_resp` and seeded for every peer in
+    // `become_leader`. Deliberately **never persisted or snapshotted** — like
+    // `next_index`/`match_index`, it is meaningless across a leadership change
+    // (a fresh leader has heard nothing yet) and is rebuilt empty on recovery.
+    // A freshly-added peer (via `change_membership`) gets no explicit entry
+    // here — `RaftNode::control_peer_believed_alive`'s "never contacted yet"
+    // grace clause is the intended handling for that gap, exactly the way
+    // `next_index`/`match_index` rely on a sensible `.unwrap_or(..)` default
+    // rather than an explicit write at peer-add time. Do NOT "complete" this by
+    // wiring it into `PersistedState`/`WalRecord` — that would make a leader's
+    // liveness judgment of its peers depend on stale, potentially very old
+    // wall-clock reads survived across a restart, which is actively wrong.
+    last_contact: BTreeMap<NodeId, Nanos>,
     // Set by `transfer_leadership`: a caught-up voter this leader is handing off
     // to. Re-sent as a `TimeoutNow` on every heartbeat (`broadcast_append`) until
     // this node steps down (the transfer succeeded) — so a single dropped message
@@ -432,6 +448,7 @@ where
             votes: BTreeSet::new(),
             next_index: BTreeMap::new(),
             match_index: BTreeMap::new(),
+            last_contact: BTreeMap::new(),
             departing: BTreeMap::new(),
             transfer_target: None,
             transfer_deadline: Nanos(0),
@@ -957,6 +974,18 @@ where
         self.match_index.get(&node).copied().unwrap_or(0)
     }
 
+    /// The `now` at which this leader last heard an `AppendEntriesResp` (success
+    /// or reject) from `node`, or `None` if it never has (either `node` isn't a
+    /// peer, or this leadership stint hasn't heard from it yet — see the
+    /// `last_contact` field doc for why that second case isn't back-filled).
+    /// A raw fact with **no policy baked in** — deciding "alive" from it (a
+    /// timeout, a grace period for the never-contacted case) is
+    /// `RaftNode::control_peer_believed_alive`'s job, not this core's.
+    #[must_use]
+    pub fn peer_last_contact(&self, node: NodeId) -> Option<Nanos> {
+        self.last_contact.get(&node).copied()
+    }
+
     /// Arm a leadership transfer to `target` (Raft §3.10): once armed,
     /// `propose`/`change_membership` freeze (report `NotLeader`) so the log stops
     /// growing, and `broadcast_append` sends `target` a [`RaftMsg::TimeoutNow`]
@@ -1214,7 +1243,7 @@ where
                 term,
                 success,
                 match_index,
-            } => self.handle_append_resp(from, term, success, match_index),
+            } => self.handle_append_resp(from, term, success, match_index, now),
             RaftMsg::InstallSnapshot {
                 term,
                 leader,
@@ -1512,10 +1541,16 @@ where
         term: u64,
         success: bool,
         match_index: u64,
+        now: Nanos,
     ) -> Vec<Out<C>> {
         if self.role != Role::Leader || term != self.current_term {
             return Vec::new();
         }
+        // Either outcome — success or reject — proves `from` is up and
+        // reachable right now, which is exactly the liveness signal
+        // `peer_last_contact`/`control_peer_believed_alive` need. Stamped once
+        // here, ahead of the branch, so both paths get it identically.
+        self.last_contact.insert(from, now);
         if success {
             let m = self.match_index.entry(from).or_insert(0);
             *m = (*m).max(match_index);
@@ -1856,6 +1891,12 @@ where
         for &p in &self.peers {
             self.next_index.insert(p, last + 1);
             self.match_index.insert(p, 0);
+            // Start every peer's liveness clock fresh on this leader's own
+            // stint: an unresponsive peer must age out `CONTROL_PEER_LIVENESS_
+            // TIMEOUT` after this leader took over, not be granted the
+            // "never contacted yet" grace forever just because this
+            // leader's own `last_contact` map starts empty.
+            self.last_contact.insert(p, now);
         }
         // A fresh leadership stint starts with no departing-peer bookkeeping — any
         // peer still owed a removal notification is discovered anew the next time

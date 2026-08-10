@@ -4627,6 +4627,7 @@ impl ClientCtx {
     pub(crate) async fn admin_remove_control_member(
         &self,
         node: NodeId,
+        force: bool,
     ) -> Result<ControlRemoveOutcome, String> {
         let Some(leader) = self.edge.leader_handle() else {
             return Err(self.not_leader_error());
@@ -4638,11 +4639,55 @@ impl ClientCtx {
             return Ok(ControlRemoveOutcome { warning: None });
         }
         if current.len() <= 1 {
+            // Never forceable: there is no admin action that can recover a
+            // control group with zero voters, so `force` cannot buy this one.
             return Err(format!(
                 "refusing to remove control voter {node}: only {} voter(s) remain; \
                  this would leave zero",
                 current.len()
             ));
+        }
+        let remaining: BTreeSet<NodeId> =
+            current.iter().copied().filter(|&id| id != node).collect();
+        // Liveness-aware quorum-loss guard (ADR 0037 hardening PR2). The
+        // original ADR 0037 guard counted only the *resulting* voter count
+        // (refuse `< 1`, warn `== 1`) — which looks complete but misses the
+        // case a different, already-dead survivor is left in `remaining`: an
+        // odd-sized group (tolerates one failure) going to an even-sized one
+        // (tolerates none) with a dead member carries no warning at all if
+        // the resulting count is 2 or more, yet the group is now permanently
+        // wedged (its own config-change entry can never commit, so every
+        // further membership change fails "already in flight" forever — see
+        // ADR 0037's Consequences section). `node` itself is excluded from
+        // `remaining` already, so removing the actually-dead voter needs no
+        // `--force` — only a *different* already-dead survivor trips this.
+        // Deliberately independent of `--force-control-remove`
+        // (`admin_remove_member`'s decommission integration, ADR 0037 PR4):
+        // that flag only means "run control-remove as part of decommission,"
+        // never "and skip control-remove's own safety checks" — the two
+        // flags are separate and each must be independently explicit.
+        if !force {
+            let dead: Vec<NodeId> = remaining
+                .iter()
+                .copied()
+                .filter(|&id| !leader.control_peer_believed_alive(id))
+                .collect();
+            let live = remaining.len() - dead.len();
+            let majority = remaining.len() / 2 + 1;
+            if live < majority {
+                let dead_list = dead
+                    .iter()
+                    .map(|id| id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(format!(
+                    "refusing to remove control voter {node}: only {live} of the \
+                     remaining {} voter(s) are reachable (need {majority} for \
+                     quorum) — apparently-dead voter(s): {dead_list}; retry with \
+                     --force to remove anyway",
+                    remaining.len()
+                ));
+            }
         }
         if node == my_id {
             let Some(&target) = current.iter().find(|&&id| id != my_id) else {
@@ -4672,8 +4717,6 @@ impl ClientCtx {
                 tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
             }
         }
-        let remaining: BTreeSet<NodeId> =
-            current.iter().copied().filter(|&id| id != node).collect();
         let warning = if remaining.len() == 1 {
             Some(format!(
                 "removing node {node} leaves only 1 control voter: no fault tolerance"
