@@ -26,16 +26,22 @@ use animus_control::ColumnType;
 use animus_control::raft::ProposeResult;
 use animus_control::{IndexDef, IndexKind, IndexProjection, MetaCommand, RaftNode, TableSchema};
 use animus_sim::{SimEnv, Simulator};
+use animus_storage::MemoryEngine;
 
 const NODES: [u64; 3] = [0, 1, 2];
 
-fn cluster(seed: u64) -> (Simulator, Vec<RaftNode<SimEnv>>) {
+/// Also returns each node's system-keyspace engine (ADR 0038 PR3) so a caller
+/// that restarts a node can re-clone the *same* handle — `MemoryEngine`
+/// clones share state (like a real node's on-disk engine surviving a process
+/// restart), so a restart must reuse it, not construct a fresh, empty one.
+fn cluster(seed: u64) -> (Simulator, Vec<RaftNode<SimEnv>>, Vec<MemoryEngine>) {
     let sim = Simulator::new(seed);
+    let engines: Vec<MemoryEngine> = NODES.iter().map(|_| MemoryEngine::new()).collect();
     let nodes = NODES
         .iter()
-        .map(|&id| RaftNode::start(sim.env(id), NODES.to_vec()))
+        .map(|&id| RaftNode::start(sim.env(id), NODES.to_vec(), engines[id as usize].clone()))
         .collect();
-    (sim, nodes)
+    (sim, nodes, engines)
 }
 
 fn unique_leader(nodes: &[RaftNode<SimEnv>], live: &[usize], seed: u64) -> usize {
@@ -74,7 +80,7 @@ fn index_definition_replicates_survives_restart_and_drops() {
 }
 
 fn run(seed: u64) {
-    let (mut sim, mut nodes) = cluster(seed);
+    let (mut sim, mut nodes, engines) = cluster(seed);
     sim.run_for(Duration::from_secs(2));
     let leader = unique_leader(&nodes, &[0, 1, 2], seed);
 
@@ -148,7 +154,11 @@ fn run(seed: u64) {
     let follower = (0..3).find(|&i| i != leader).unwrap();
     sim.stop(follower as u64);
     sim.run_for(Duration::from_secs(1));
-    nodes[follower] = RaftNode::start(sim.env(follower as u64), NODES.to_vec());
+    nodes[follower] = RaftNode::start(
+        sim.env(follower as u64),
+        NODES.to_vec(),
+        engines[follower].clone(),
+    );
     sim.run_for(Duration::from_secs(3));
     assert_eq!(
         nodes[follower].metadata().table_indexes("users"),
@@ -183,7 +193,7 @@ fn run(seed: u64) {
 #[test]
 fn index_catalog_is_reproducible_from_seed() {
     fn trace(seed: u64) -> Vec<String> {
-        let (mut sim, nodes) = cluster(seed);
+        let (mut sim, nodes, _engines) = cluster(seed);
         sim.run_for(Duration::from_secs(2));
         let leader = unique_leader(&nodes, &[0, 1, 2], seed);
         nodes[leader].propose(MetaCommand::CreateTableSchema {

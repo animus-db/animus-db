@@ -1189,15 +1189,29 @@ impl Metadata {
     }
 }
 
-/// `Metadata` is the control plane's replicated state machine: the [`RaftCore`]
-/// agrees the order of [`MetaCommand`]s and applies them here. (The inherent
-/// [`Metadata::apply`] returns an [`ApplyOutcome`] for callers that care; the
-/// consensus core only needs the order, so the trait impl discards it.)
+/// `Metadata` is the control plane's replicated state machine. **ADR 0038
+/// PR3 (the cutover): `DRIVER_APPLIED = true`.** `RaftCore` no longer applies
+/// commands in-core — it agrees the order and durability of `MetaCommand`s and
+/// buffers each committed-and-durable one as an effect (`RaftCore::drain_apply`)
+/// for `node.rs`'s async apply task to apply to its own privately-owned
+/// `Metadata` (still via the real, unchanged inherent [`Metadata::apply`],
+/// which returns an [`ApplyOutcome`] the apply task uses to decide what to
+/// mirror into the system keyspace) and publish into the engine-backed,
+/// `engine_applied`-gated cache every reader (`RaftNode::metadata`, `admin.rs`,
+/// the dashboard, `reconcile_loop`/`detect_loop`) now reads. This trait impl's
+/// own `apply` is consequently never called — mirroring
+/// `animus-cp-data::KvState`'s identical `unreachable!()` shape for its own
+/// `DRIVER_APPLIED` state machine.
 ///
 /// [`RaftCore`]: crate::raft::RaftCore
 impl crate::raft::StateMachine<MetaCommand> for Metadata {
-    fn apply(&mut self, command: &MetaCommand) {
-        let _ = Metadata::apply(self, command);
+    const DRIVER_APPLIED: bool = true;
+
+    fn apply(&mut self, _command: &MetaCommand) {
+        unreachable!(
+            "Metadata is DRIVER_APPLIED (ADR 0038 PR3); node.rs's apply task \
+             applies to its own owned Metadata and the system-keyspace engine"
+        )
     }
 
     fn noop() -> MetaCommand {

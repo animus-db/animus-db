@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use animus_control::{MetaCommand, NodeStatus, RaftNode};
 use animus_env::{Env, NodeId, ProdEnv};
+use animus_storage::MemoryEngine;
 use tokio::time::{Instant, sleep, timeout};
 
 fn unique_tmp_dir() -> std::path::PathBuf {
@@ -84,9 +85,9 @@ async fn grow_three_to_five_under_real_time_stays_live() {
             e.set_peers(book.clone());
         }
 
-        let node0 = RaftNode::start(envs[0].clone(), group.clone());
-        let node1 = RaftNode::start(envs[1].clone(), group.clone());
-        let node2 = RaftNode::start(envs[2].clone(), group.clone());
+        let node0 = RaftNode::start(envs[0].clone(), group.clone(), MemoryEngine::new());
+        let node1 = RaftNode::start(envs[1].clone(), group.clone(), MemoryEngine::new());
+        let node2 = RaftNode::start(envs[2].clone(), group.clone(), MemoryEngine::new());
         let original = [&node0, &node1, &node2];
 
         let leader_idx = wait_for_leader(&original).await;
@@ -103,7 +104,7 @@ async fn grow_three_to_five_under_real_time_stays_live() {
         // includes itself and the current three voters; the current three
         // don't yet know about it) — the same shape as a real freshly-started
         // `animusd control` growth process.
-        let node3 = RaftNode::start(envs[3].clone(), vec![0, 1, 2, 3]);
+        let node3 = RaftNode::start(envs[3].clone(), vec![0, 1, 2, 3], MemoryEngine::new());
         let leader_idx = wait_for_leader(&original).await;
         let leader = original[leader_idx];
         assert!(
@@ -129,7 +130,7 @@ async fn grow_three_to_five_under_real_time_stays_live() {
         // Grow again, 4 -> 5, against whichever node is leader now (may have
         // moved during the first growth step's scheduling jitter).
         let quartet = [&node0, &node1, &node2, &node3];
-        let node4 = RaftNode::start(envs[4].clone(), vec![0, 1, 2, 3, 4]);
+        let node4 = RaftNode::start(envs[4].clone(), vec![0, 1, 2, 3, 4], MemoryEngine::new());
         let leader_idx = wait_for_leader(&quartet).await;
         let leader = quartet[leader_idx];
         assert!(

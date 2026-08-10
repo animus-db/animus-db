@@ -21,6 +21,7 @@ use std::time::Duration;
 
 use animus_control::{MetaCommand, NodeStatus, RaftNode};
 use animus_env::{Env, NodeId, ProdEnv};
+use animus_storage::MemoryEngine;
 use tokio::time::{sleep, timeout};
 
 fn unique_tmp_dir() -> std::path::PathBuf {
@@ -84,8 +85,8 @@ async fn large_metadata_catch_up_stays_live() {
         }
 
         // Start the two-node majority (2/3 of the 3-voter group commits without 2).
-        let node0 = RaftNode::start(envs[0].clone(), group.clone());
-        let node1 = RaftNode::start(envs[1].clone(), group.clone());
+        let node0 = RaftNode::start(envs[0].clone(), group.clone(), MemoryEngine::new());
+        let node1 = RaftNode::start(envs[1].clone(), group.clone(), MemoryEngine::new());
 
         async fn leader_of<'a>(nodes: &'a [&'a RaftNode<ProdEnv>]) -> Option<usize> {
             for _ in 0..200 {
@@ -149,7 +150,7 @@ async fn large_metadata_catch_up_stays_live() {
         // state. Primary signal: it does so promptly (12s budget; the fix serves the
         // ~1100-chunk snapshot in well under a second — the timed core test proves the
         // per-chunk cost directly).
-        let node2 = RaftNode::start(envs[2].clone(), group.clone());
+        let node2 = RaftNode::start(envs[2].clone(), group.clone(), MemoryEngine::new());
         let started = std::time::Instant::now();
         let mut caught_up = false;
         for _ in 0..240 {

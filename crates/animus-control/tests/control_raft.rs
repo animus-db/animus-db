@@ -10,6 +10,7 @@ use std::time::Duration;
 use animus_control::raft::ProposeResult;
 use animus_control::{MetaCommand, Metadata, NodeStatus, RaftNode};
 use animus_sim::{SimEnv, Simulator};
+use animus_storage::MemoryEngine;
 use animus_tablet::{Epoch, KeyRange, TabletId};
 
 const NODES: [u64; 3] = [0, 1, 2];
@@ -18,7 +19,7 @@ fn cluster(seed: u64) -> (Simulator, Vec<RaftNode<SimEnv>>) {
     let sim = Simulator::new(seed);
     let nodes = NODES
         .iter()
-        .map(|&id| RaftNode::start(sim.env(id), NODES.to_vec()))
+        .map(|&id| RaftNode::start(sim.env(id), NODES.to_vec(), MemoryEngine::new()))
         .collect();
     (sim, nodes)
 }
@@ -102,16 +103,13 @@ fn replicates_metadata_in_total_order() {
 
     sim.run_for(Duration::from_secs(2));
 
-    // Every node applied the same commands in the same order, with identical
-    // resulting metadata.
-    let reference = nodes[leader].applied();
+    // Every node applied the same commands in the same order — proven by
+    // identical resulting metadata (ADR 0038 PR3: `Metadata` is
+    // `DRIVER_APPLIED`, so there is no per-core `applied()` command list to
+    // compare directly anymore; the apply task's published cache is the
+    // observable convergence point).
     let reference_meta = nodes[leader].metadata();
     for (i, n) in nodes.iter().enumerate() {
-        assert_eq!(
-            n.applied(),
-            reference,
-            "node {i} applied a divergent order (seed={seed})"
-        );
         assert_eq!(
             n.metadata(),
             reference_meta,

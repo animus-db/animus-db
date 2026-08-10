@@ -374,25 +374,6 @@ pub struct RaftCore<C = MetaCommand, S = Metadata> {
     // empty for the in-core control plane. Drained by [`RaftCore::drain_apply`].
     pending_apply: Vec<(u64, C)>,
 
-    // ADR 0038 PR2 (`animus-control`'s `mirror.rs`/`node.rs` only — an inert,
-    // additive field for any other `S`): whether the in-core apply path
-    // (`Self::apply`'s `else` branch, `S::DRIVER_APPLIED == false`) should also
-    // record each just-applied `(index, command)` into `mirror_log`, below.
-    // Defaults `false` — set once via [`RaftCore::enable_mirror_capture`] by a
-    // driver that actually attaches an engine mirror, so a `RaftCore` with no
-    // mirror (every existing test/caller) never grows this at all.
-    mirror_capture: bool,
-    // Committed, in-core-applied `(index, command)` pairs not yet drained by a
-    // mirror driver (`RaftNode::start_with_mirror`'s `mirror_loop`), in commit
-    // order. Unlike `applied` (bounded by snapshot truncation, and meant for
-    // tests/divergence checks — see its own doc), this is a plain drain-once
-    // queue: [`RaftCore::drain_mirror_log`] `mem::take`s it every time, so as
-    // long as a driver drains at least once per outer loop iteration (which
-    // `mirror_loop` does), it never grows unbounded and is never touched by
-    // `snapshot()`'s truncation of `applied`. Always empty unless
-    // `mirror_capture` is `true`.
-    mirror_log: Vec<(u64, C)>,
-
     // Durable-state changes awaiting write to the WAL, plus the hard state last
     // marked for persistence (to detect term/vote changes).
     pending: Vec<WalRecord<C, S>>,
@@ -464,8 +445,6 @@ where
             metadata: S::default(),
             applied: Vec::new(),
             pending_apply: Vec::new(),
-            mirror_capture: false,
-            mirror_log: Vec::new(),
             snapshot_blob: None,
             pending_install: None,
             snapshot_needed: false,
@@ -791,38 +770,6 @@ where
     /// `apply` instead). Mirrors `AccordCore::drain_apply` (ADR 0017).
     pub fn drain_apply(&mut self) -> Vec<(u64, C)> {
         std::mem::take(&mut self.pending_apply)
-    }
-
-    /// Enable [`mirror_log`](Self)'s capture (ADR 0038 PR2): from the next
-    /// in-core apply onward, every `(index, command)` this core applies is
-    /// also recorded for [`drain_mirror_log`](Self::drain_mirror_log). A
-    /// one-way switch (there is no `disable_*` — nothing in this stack needs
-    /// to turn it back off once a driver has attached a mirror), idempotent
-    /// to call more than once. A no-op for a `DRIVER_APPLIED` state machine
-    /// (its commands never reach the in-core `else` branch this feeds).
-    pub fn enable_mirror_capture(&mut self) {
-        self.mirror_capture = true;
-    }
-
-    /// Whether [`enable_mirror_capture`](Self::enable_mirror_capture) has been
-    /// called. `pub(crate)`, used only by `node.rs`'s `drive()` to carry the
-    /// flag across a WAL-triggered recovery swap (see that call site's
-    /// comment) — a driver-internal plumbing detail, not part of the public
-    /// mirror API.
-    pub(crate) fn mirror_capture_enabled(&self) -> bool {
-        self.mirror_capture
-    }
-
-    /// Take every `(index, command)` this core has in-core-applied since the
-    /// last call (or since [`enable_mirror_capture`](Self::enable_mirror_capture),
-    /// for the first call), in commit order. Unlike [`applied`](Self::applied)
-    /// (a bounded, non-consuming window for tests), this is a plain
-    /// drain-once queue with no snapshot-truncation interaction — see
-    /// `mirror_log`'s own doc. A driver that has enabled capture must drain
-    /// at least once per outer loop iteration to keep this bounded; one that
-    /// never enables it always gets an empty vec here for free.
-    pub fn drain_mirror_log(&mut self) -> Vec<(u64, C)> {
-        std::mem::take(&mut self.mirror_log)
     }
 
     /// Provide the engine-image bytes a `DRIVER_APPLIED` leader ships to a lagging
@@ -2128,13 +2075,6 @@ where
                 // unbounded `applied` log for the data plane.
                 self.pending_apply.push((self.last_applied, command));
             } else {
-                // ADR 0038 PR2: capture the exact same (index, command) pair a
-                // mirror driver needs, *before* `applied.push` moves `command` —
-                // additive, and free when `mirror_capture` is off (the default
-                // for every `RaftCore` with no mirror attached).
-                if self.mirror_capture {
-                    self.mirror_log.push((self.last_applied, command.clone()));
-                }
                 self.metadata.apply(&command);
                 self.applied.push(command);
             }
@@ -2148,30 +2088,10 @@ where
     }
 }
 
-/// Control-plane-specific conveniences for the default instantiation
-/// (`RaftCore<MetaCommand, Metadata>`), so existing callers keep reading the
-/// applied state as `Metadata` rather than the generic [`RaftCore::state`].
-impl RaftCore<MetaCommand, Metadata> {
-    /// A clone of the applied metadata state machine.
-    pub fn metadata(&self) -> Metadata {
-        self.state()
-    }
-
-    /// A clone of just the **membership map** — the failure detector's input.
-    /// Narrow on purpose (clone-churn fix): the `detect_loop` ticks every 100ms
-    /// and used to clone the *whole* `Metadata` (schema catalog, tablet map, CP
-    /// address book included) under the core mutex each tick; this clones only
-    /// what the liveness decision reads, and the caller evaluates off the lock.
-    pub fn members(&self) -> BTreeMap<NodeId, crate::meta::Member> {
-        self.metadata.members.clone()
-    }
-
-    /// A clone of the **placement-relevant subset** of the metadata
-    /// ([`PlacementView`](crate::meta::PlacementView): members + tablets +
-    /// policies — never the schema catalog). Same rationale as
-    /// [`members`](Self::members): the `reconcile_loop` clones this narrow view
-    /// under the lock and runs the pure placement decision outside it.
-    pub fn placement_view(&self) -> crate::meta::PlacementView {
-        self.metadata.placement_view()
-    }
-}
+// ADR 0038 PR3: the `RaftCore<MetaCommand, Metadata>` conveniences that used
+// to live here (`metadata`/`members`/`placement_view`, reading `self.metadata`
+// directly) are gone — `Metadata` is now `DRIVER_APPLIED`, so `self.metadata`
+// is an unused default the core never touches (mirroring `animus-cp-data`'s
+// `KvState` placeholder). The equivalent reads now live on `RaftNode` (in
+// `node.rs`), backed by the apply task's own owned `Metadata` published into
+// an `engine_applied`-gated cache — never the core's in-memory field.

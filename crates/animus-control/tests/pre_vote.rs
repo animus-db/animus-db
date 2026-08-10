@@ -16,6 +16,7 @@ use animus_control::raft::{RaftCore, RaftMsg, Role};
 use animus_control::{MetaCommand, NodeStatus, RaftNode};
 use animus_env::{Nanos, NodeId};
 use animus_sim::{SimEnv, Simulator};
+use animus_storage::MemoryEngine;
 
 const NODES: [u64; 3] = [0, 1, 2];
 
@@ -151,7 +152,7 @@ fn cluster(seed: u64) -> (Simulator, Vec<RaftNode<SimEnv>>) {
     let sim = Simulator::new(seed);
     let nodes = NODES
         .iter()
-        .map(|&id| RaftNode::start(sim.env(id), NODES.to_vec()))
+        .map(|&id| RaftNode::start(sim.env(id), NODES.to_vec(), MemoryEngine::new()))
         .collect();
     (sim, nodes)
 }

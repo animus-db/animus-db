@@ -25,6 +25,7 @@ use animus_control::node::heartbeat_loop;
 use animus_control::{MetaCommand, NodeStatus, RaftNode};
 use animus_env::{EnvExt, Metric, MetricsHandle};
 use animus_sim::{SimEnv, Simulator};
+use animus_storage::MemoryEngine;
 
 const CONTROL: [u64; 3] = [0, 1, 2];
 const MEMBER: u64 = 10;
@@ -39,7 +40,12 @@ fn cluster(seed: u64) -> (Simulator, Vec<RaftNode<SimEnv>>, Vec<MetricsHandle>) 
         .iter()
         .enumerate()
         .map(|(i, &id)| {
-            RaftNode::start_with_metrics(sim.env(id), CONTROL.to_vec(), handles[i].clone())
+            RaftNode::start_with_metrics(
+                sim.env(id),
+                CONTROL.to_vec(),
+                handles[i].clone(),
+                MemoryEngine::new(),
+            )
         })
         .collect();
     // One data member heartbeats the whole control group on a timer, so the
