@@ -105,13 +105,16 @@ Three shapes, all built from the same role assemblies:
   `Node::bind` → `BoundNode::start_with`.
 - **Control-only** — a small static metadata quorum, no CP **data** storage
   engine, no data role. `animusd control --config FILE --node I`.
-  `Node::bind_control` → `BoundControlNode::start_control_with_mirror` (which
-  `start_control_with` now delegates to with no mirror attached, keeping its
-  own signature unchanged); has real local control Raft. It does provision
-  one small **dedicated** engine of its own (ADR 0038 PR2): a shadow-mode
-  system-keyspace mirror of `Metadata`, `StorageBackend::Lsm` by default —
-  see `animus-control/CLAUDE.md`'s `mirror.rs` entry. Zero behavior change;
-  nothing reads from it yet.
+  `Node::bind_control` → `BoundControlNode::start_control_with(.., backend)` —
+  **fallible** (`io::Result<Node>`) and takes a `StorageBackend` since ADR
+  0038: it now **unconditionally** provisions one small **dedicated** system-
+  keyspace engine (`StorageBackend::Lsm` by default, `::Memory` under
+  `--ephemeral`) — see `animus-control/CLAUDE.md`'s `node.rs`/`mirror.rs`
+  entries. This is no longer an optional shadow-mode mirror (ADR 0038 PR2's
+  original shape): `Metadata` is `StateMachine::DRIVER_APPLIED`, so this
+  engine is the durable home of the control plane's async apply task's
+  published cache — there is no more engine-less control-plane deployment
+  shape.
 - **Data-only** — no local control `RaftCore` at all; `Metadata` comes from a
   polled/long-polled mirror of a separately-deployed control plane via
   `ControlHandle::Remote`. `animusd data --config FILE --node I` (or `data

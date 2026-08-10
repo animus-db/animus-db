@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use animus_control::{MetaCommand, NodeStatus, ProposeResult, RaftNode};
 use animus_sim::{SimEnv, Simulator};
+use animus_storage::MemoryEngine;
 
 /// Bring up a control group over node ids `ids` (each its own `RaftCore`,
 /// self-included in its own `all_nodes` — the ordinary, stable-group case).
@@ -25,7 +26,7 @@ fn cluster(seed: u64, ids: &[u64]) -> (Simulator, Vec<RaftNode<SimEnv>>) {
     let sim = Simulator::new(seed);
     let nodes = ids
         .iter()
-        .map(|&id| RaftNode::start(sim.env(id), ids.to_vec()))
+        .map(|&id| RaftNode::start(sim.env(id), ids.to_vec(), MemoryEngine::new()))
         .collect();
     (sim, nodes)
 }
@@ -85,7 +86,7 @@ fn add_a_node_grows_the_group_catches_up_and_joins_quorum() {
     // the other three nodes' own configs — what actually governs quorum and
     // replication — still exclude it, so node 3 stays a quiet non-voter until
     // `change_membership` actually adds it.
-    let node3 = RaftNode::start(sim.env(3), all_ids.to_vec());
+    let node3 = RaftNode::start(sim.env(3), all_ids.to_vec(), MemoryEngine::new());
 
     assert!(
         matches!(
@@ -553,8 +554,15 @@ fn restart_of_freshly_added_voter_mid_catchup_resumes_and_converges() {
     // Node 3 starts life a quiet non-voter (its own config already includes
     // itself; the original three don't yet know about it). Its handle is
     // dropped immediately — we crash it before ever using it, and reconstruct
-    // a fresh handle after the restart below.
-    drop(RaftNode::start(sim.env(3), all_ids.to_vec()));
+    // a fresh handle after the restart below, reusing the *same* engine handle
+    // (a real restart's engine durably survives; `engine3` models that here —
+    // ADR 0038 PR3).
+    let engine3 = MemoryEngine::new();
+    drop(RaftNode::start(
+        sim.env(3),
+        all_ids.to_vec(),
+        engine3.clone(),
+    ));
     assert!(
         matches!(
             nodes[l].change_membership(set(&all_ids)),
@@ -586,7 +594,7 @@ fn restart_of_freshly_added_voter_mid_catchup_resumes_and_converges() {
     // snapshot it had (possibly none at all, if it was stopped before any
     // replication reached it) and resumes catch-up like any other restarted
     // follower.
-    let node3 = RaftNode::start(sim.env(3), all_ids.to_vec());
+    let node3 = RaftNode::start(sim.env(3), all_ids.to_vec(), engine3);
     sim.run_for(Duration::from_secs(4));
 
     let reference = nodes[l].metadata();

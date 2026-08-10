@@ -19,6 +19,13 @@
   silently drop the overwrite. The two in-text notes below are otherwise
   unchanged (this is additive, not a retraction — `merge`/`merge_tombstone`
   still have no *engine-wide* monotonic floor, and still shouldn't).
+- **2026-08-10 note:** ADR 0038 gives the **control plane** a per-node
+  system-keyspace slice of "one shared engine" too (a combined node's control
+  `Metadata` now durably lives in the same already-open shared engine this
+  ADR describes, globally namespaced rather than `StorageScope`-confined per
+  tenant) — the sharing *mechanism* this ADR established (one engine, many
+  independently-versioned writers) is what makes that possible with no new
+  storage-layer primitive.
 - **Date:** 2026-08-07
 
 ## Context

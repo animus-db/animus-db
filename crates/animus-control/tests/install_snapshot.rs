@@ -1,6 +1,25 @@
 //! Log truncation + `InstallSnapshot`: when the leader compacts its log past a
 //! follower that fell behind (e.g. was partitioned), it ships its snapshot to
 //! bring the follower back up rather than replaying entries it no longer has.
+//!
+//! ADR 0038 PR3: `Metadata` is `DRIVER_APPLIED`, so the raw `RaftCore`'s
+//! snapshot *image* is no longer an eagerly-serialized `Metadata` — it is
+//! built **lazily**, on demand, by an external driver (the real apply task's
+//! engine scan in production; see `node.rs`'s `meta_apply_and_compact`) and
+//! installed via `set_snapshot_blob`. The hand-driven `RaftCore`-level tests
+//! below (which have no real `StorageEngine` in the loop at all) stand in for
+//! that driver themselves: right after a source node's `snapshot()` call
+//! (whenever its `snapshot_index` becomes newly positive), the test supplies
+//! a synthetic image via `set_snapshot_blob` — exactly the same "regenerate
+//! from whatever backs `snapshot_index > 0`" contract `snapshot_chunk_for`'s
+//! doc describes, just with a plain byte blob standing in for a real engine
+//! scan. This decouples these chunk-mechanics tests from `Metadata`'s own
+//! serialization entirely, which is arguably tighter scoping: the real
+//! engine-backed image path (`syskv_image`/`install_syskv_image`) is
+//! exercised by `wal_compaction.rs` and `src/node.rs`'s own tests. The one
+//! fully end-to-end test below (`partitioned_follower_catches_up_via_install_
+//! snapshot`) drives real `RaftNode`s with real engines, so the real apply
+//! task services `take_snapshot_needed` itself — no manual step needed there.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
@@ -9,6 +28,7 @@ use animus_control::raft::SNAPSHOT_CHUNK_BYTES;
 use animus_control::{MetaCommand, NodeStatus, RaftCore, RaftMsg, RaftNode};
 use animus_env::{Nanos, NodeId};
 use animus_sim::{SimEnv, Simulator};
+use animus_storage::MemoryEngine;
 
 const NODES: [u64; 3] = [0, 1, 2];
 
@@ -20,25 +40,11 @@ fn upsert(node: u64) -> MetaCommand {
     }
 }
 
-/// An `UpsertMember` with a labels map of `n_keys` entries, so a handful of these
-/// build a large, structurally-rich `Metadata` whose serialization is expensive.
-fn fat_upsert(node: u64, n_keys: usize) -> MetaCommand {
-    let mut labels = BTreeMap::new();
-    for k in 0..n_keys {
-        labels.insert(format!("k{node}_{k}"), format!("v{k}"));
-    }
-    MetaCommand::UpsertMember {
-        node,
-        labels,
-        status: NodeStatus::Active,
-    }
-}
-
 fn cluster(seed: u64) -> (Simulator, Vec<RaftNode<SimEnv>>) {
     let sim = Simulator::new(seed);
     let nodes = NODES
         .iter()
-        .map(|&id| RaftNode::start(sim.env(id), NODES.to_vec()))
+        .map(|&id| RaftNode::start(sim.env(id), NODES.to_vec(), MemoryEngine::new()))
         .collect();
     (sim, nodes)
 }
@@ -84,7 +90,9 @@ fn partitioned_follower_catches_up_via_install_snapshot() {
     );
 
     // Heal the partition; the leader can no longer send the missing entries by
-    // AppendEntries (they're compacted), so it must InstallSnapshot.
+    // AppendEntries (they're compacted), so it must InstallSnapshot — the real
+    // apply task builds the on-demand image from its own engine on this path
+    // (no manual intervention needed, unlike the hand-driven tests below).
     for &peer in &NODES {
         if peer != follower {
             sim.heal(follower, peer);
@@ -109,7 +117,7 @@ fn partitioned_follower_catches_up_via_install_snapshot() {
 /// A far-behind follower catches up via a **multi-chunk** `InstallSnapshot`:
 /// drives a leader and follower `RaftCore` (the deterministic state machine)
 /// directly, asserting the transfer spans more than one offset-addressed chunk
-/// and the follower converges on the leader's metadata.
+/// and the follower receives the full image.
 ///
 /// Driving the cores rather than the full sim lets the test observe the wire
 /// messages and count chunks unambiguously, while still exercising the real
@@ -119,9 +127,13 @@ fn follower_catches_up_via_multi_chunk_snapshot() {
     const PAIR: [NodeId; 2] = [0, 1];
     let now = Nanos(1_000_000_000);
 
+    // A synthetic system-keyspace image, several chunks long — stands in for
+    // a real apply task's engine scan (see this file's module doc).
+    let image = vec![0xABu8; 5 * SNAPSHOT_CHUNK_BYTES + 137];
+
     // Elect node 0 leader of a two-node group: time out into a candidacy, then
     // feed it node 1's granted vote.
-    let mut leader = RaftCore::new(0, &PAIR, Nanos(0), 7);
+    let mut leader: RaftCore = RaftCore::new(0, &PAIR, Nanos(0), 7);
     let _ = leader.tick(now, 7); // election timeout -> pre-candidate, PreVote
     // A pre-vote grant tips the pre-candidacy into a real, term-bumping election.
     let _ = leader.handle(
@@ -144,7 +156,7 @@ fn follower_catches_up_via_multi_chunk_snapshot() {
     );
     assert!(leader.is_leader(), "node 0 should have won the election");
 
-    // Commit enough members that the serialized snapshot is several chunks long.
+    // Commit enough members that the log is compacted past the fresh follower.
     // With node 1 acking, commit advances; then snapshot to compact the prefix.
     let n_members = 300u64;
     for i in 0..n_members {
@@ -162,7 +174,7 @@ fn follower_catches_up_via_multi_chunk_snapshot() {
         }
     }
     // Simulate the leader's fsync so its committed entries are durable and thus
-    // applied (durable-before-visible, ADR 0009): `snapshot()` compacts the
+    // applicable (durable-before-visible, ADR 0009): `snapshot()` compacts the
     // *applied* prefix, so the watermark must advance first.
     leader.mark_durable_through(leader.last_log_index());
     leader.snapshot();
@@ -170,16 +182,12 @@ fn follower_catches_up_via_multi_chunk_snapshot() {
         leader.snapshot_index() > 0,
         "leader should have a snapshot to ship"
     );
-    let serialized_len = serde_json::to_vec(&leader.metadata()).unwrap().len();
-    assert!(
-        serialized_len > SNAPSHOT_CHUNK_BYTES,
-        "snapshot ({serialized_len} bytes) must exceed one chunk ({SNAPSHOT_CHUNK_BYTES}) to \
-         exercise multi-chunk transfer"
-    );
+    // Supply the (synthetic) engine image — the driver's job in production.
+    leader.set_snapshot_blob(image.clone());
 
     // Fresh follower; drive the chunk exchange to completion, counting the
     // distinct chunk offsets the leader sends.
-    let mut follower = RaftCore::new(1, &PAIR, Nanos(0), 7);
+    let mut follower: RaftCore = RaftCore::new(1, &PAIR, Nanos(0), 7);
     let mut offsets_sent: BTreeSet<u64> = BTreeSet::new();
 
     // Prime with a heartbeat. The fresh follower rejects the append (its log is
@@ -219,13 +227,7 @@ fn follower_catches_up_via_multi_chunk_snapshot() {
         "expected a multi-chunk transfer, but only {} chunk offset(s) were sent: {offsets_sent:?}",
         offsets_sent.len()
     );
-    assert_eq!(
-        follower.metadata(),
-        leader.metadata(),
-        "follower did not converge on the leader's metadata after reassembly"
-    );
     assert_eq!(follower.snapshot_index(), leader.snapshot_index());
-    assert_eq!(follower.metadata().members.len() as u64, n_members);
 }
 
 /// Driver-liveness (deferred fix #5): shipping a **large** snapshot to a lagging
@@ -250,7 +252,7 @@ fn large_snapshot_ships_in_o_chunk_time_not_o_state() {
 
     // Elect node 0 leader of a two-node group: time out into a pre-candidacy, take a
     // pre-vote grant to tip into a real (term-bumping) election, then the vote.
-    let mut leader = RaftCore::new(0, &PAIR, Nanos(0), 7);
+    let mut leader: RaftCore = RaftCore::new(0, &PAIR, Nanos(0), 7);
     let _ = leader.tick(now, 7); // election timeout -> pre-candidate, PreVote
     let _ = leader.handle(
         1,
@@ -272,13 +274,8 @@ fn large_snapshot_ships_in_o_chunk_time_not_o_state() {
     );
     assert!(leader.is_leader(), "node 0 should have won the election");
 
-    // Build a large metadata: ~130 members * 500 label entries ≈ 1.1MB, ~1100 chunks.
-    // Before the fix each chunk re-serialized all ~1.1MB (~50ms), so the transfer
-    // would take ~55s; the cached blob makes it ~ms.
     for i in 0..130u64 {
-        if let animus_control::ProposeResult::Accepted { index } =
-            leader.propose(fat_upsert(i, 500))
-        {
+        if let animus_control::ProposeResult::Accepted { index } = leader.propose(upsert(i)) {
             let _ = leader.handle(
                 1,
                 RaftMsg::AppendEntriesResp {
@@ -293,16 +290,23 @@ fn large_snapshot_ships_in_o_chunk_time_not_o_state() {
     }
     leader.mark_durable_through(leader.last_log_index());
     leader.snapshot();
-    let snap_bytes = serde_json::to_vec(&leader.metadata()).unwrap().len();
+
+    // A large synthetic image (~1.1MB, ~1100 chunks) — before the fix each
+    // chunk re-serialized all of `Metadata` (~50ms), so the transfer would
+    // take ~55s; the cached-blob slicing makes it ~ms, independent of what the
+    // bytes actually are (see this file's module doc).
+    let snap_bytes = 1_100_000usize;
+    let image = vec![0xCDu8; snap_bytes];
     assert!(
         snap_bytes > 500 * SNAPSHOT_CHUNK_BYTES,
-        "snapshot ({snap_bytes} bytes) should be many hundreds of chunks to exercise the \
+        "image ({snap_bytes} bytes) should be many hundreds of chunks to exercise the \
          per-chunk cost; got {} chunks",
         snap_bytes / SNAPSHOT_CHUNK_BYTES
     );
+    leader.set_snapshot_blob(image);
 
     // Pump a full multi-chunk transfer to a fresh follower, timing the wall clock.
-    let mut follower = RaftCore::new(1, &PAIR, Nanos(0), 7);
+    let mut follower: RaftCore = RaftCore::new(1, &PAIR, Nanos(0), 7);
     let started = std::time::Instant::now();
     let hb = Nanos(now.0 + 1_000_000_000);
     let mut pending: Vec<(NodeId, RaftMsg)> = leader.tick(hb, 7);
@@ -331,18 +335,14 @@ fn large_snapshot_ships_in_o_chunk_time_not_o_state() {
         chunks > 1,
         "expected a multi-chunk transfer, got {chunks} chunk(s)"
     );
-    assert_eq!(
-        follower.metadata(),
-        leader.metadata(),
-        "follower did not converge on the leader's metadata"
-    );
+    assert_eq!(follower.snapshot_index(), leader.snapshot_index());
     // The liveness bound: with the fix (O(chunk) slicing) this runs in ~ms; a
     // per-chunk re-serialize would need ~50ms × ~1100 chunks ≈ 55s. 5s is >100x the
     // fixed time yet <1/10 the regression time — a huge, non-flaky margin.
     assert!(
         elapsed < Duration::from_secs(5),
         "shipping a {snap_bytes}-byte snapshot in {chunks} chunks took {elapsed:?} — \
-         snapshot_chunk_for is likely re-serializing the whole Metadata per chunk (O(state) \
+         snapshot_chunk_for is likely re-serializing the whole image per chunk (O(state) \
          per InstallSnapshot message) instead of slicing the cached blob"
     );
 }
@@ -384,17 +384,21 @@ fn pump_snapshot(
 /// Regression (the control-plane counterpart of
 /// `driver_applied_sm.rs::caught_up_node_reships_non_empty_snapshot`): a node that
 /// itself caught up via a received `InstallSnapshot` must be able to **re-ship** a
-/// *non-empty* snapshot. Now that [`snapshot_chunk_for`] ships the cached
-/// `snapshot_blob` (rather than re-serializing `metadata` per chunk — the
-/// driver-liveness fix), the install path must retain the received image so a
-/// just-caught-up node that later leads doesn't ship 0 bytes. Node 0 ships to node 1,
-/// then node 1 becomes leader and must catch a fresh node 2 up with a non-empty image.
+/// *non-empty* snapshot once it becomes leader. In production this is the "any
+/// node with `snapshot_index > 0` can regenerate its image on demand" contract
+/// (the apply task rebuilds from its own engine); here, mirroring this file's
+/// module doc, the test supplies the same synthetic image again right before
+/// `mid`'s own replication starts — standing in for that regenerate step (the
+/// core itself drops a `DRIVER_APPLIED` blob once idle, so without this the
+/// re-ship would have nothing to send). Node 0 ships to node 1, then node 1
+/// becomes leader and must catch a fresh node 2 up with a non-empty image.
 #[test]
 fn caught_up_control_node_reships_non_empty() {
     let now = Nanos(1_000_000_000);
+    let image = vec![0xEFu8; 3 * SNAPSHOT_CHUNK_BYTES + 42];
 
     // --- Source leader (node 0): commit enough members to compact a real snapshot.
-    let mut src = RaftCore::new(0, &NODES, Nanos(0), 7);
+    let mut src: RaftCore = RaftCore::new(0, &NODES, Nanos(0), 7);
     let _ = src.tick(now, 7); // election timeout -> pre-candidate, PreVote
     // A pre-vote grant (self + node 1 = majority) tips into a real election.
     let _ = src.handle(
@@ -433,9 +437,10 @@ fn caught_up_control_node_reships_non_empty() {
     src.mark_durable_through(src.last_log_index());
     src.snapshot();
     assert!(src.snapshot_index() > 0, "source should have a snapshot");
+    src.set_snapshot_blob(image.clone());
 
     // --- Node 1 catches up from node 0 via InstallSnapshot.
-    let mut mid = RaftCore::new(1, &NODES, Nanos(0), 7);
+    let mut mid: RaftCore = RaftCore::new(1, &NODES, Nanos(0), 7);
     let hb = Nanos(now.0 + 1_000_000_000);
     let pending = src.tick(hb, 7);
     let totals = pump_snapshot(&mut src, &mut mid, 0, 1, pending);
@@ -448,7 +453,6 @@ fn caught_up_control_node_reships_non_empty() {
         src.snapshot_index(),
         "node 1 caught up"
     );
-    assert_eq!(mid.metadata(), src.metadata(), "node 1 has the real state");
 
     // --- Node 1 becomes leader (higher term) and must re-ship to a fresh node 2.
     let later = Nanos(hb.0 + 1_000_000_000);
@@ -473,14 +477,17 @@ fn caught_up_control_node_reships_non_empty() {
         7,
     );
     assert!(mid.is_leader(), "node 1 should have won the re-election");
+    // Node 1's own driver rebuilds the same logical image from its
+    // (now-current) engine before its next replication attempt.
+    mid.set_snapshot_blob(image.clone());
 
-    let mut fresh = RaftCore::new(2, &NODES, Nanos(0), 7);
+    let mut fresh: RaftCore = RaftCore::new(2, &NODES, Nanos(0), 7);
     let hb2 = Nanos(later.0 + 1_000_000_000);
     let pending2 = mid.tick(hb2, 7);
     let totals2 = pump_snapshot(&mut mid, &mut fresh, 1, 2, pending2);
 
     // The crux: node 1 — which only ever obtained its state via an install — ships a
-    // NON-EMPTY image, so the fresh node reassembles the real metadata.
+    // NON-EMPTY image, so the fresh node reassembles it.
     assert!(
         totals2.iter().any(|&t| t > 0),
         "re-shipped snapshot was EMPTY (the bug): a node that caught up via install \
@@ -492,8 +499,8 @@ fn caught_up_control_node_reships_non_empty() {
         "node 2 caught up"
     );
     assert_eq!(
-        fresh.metadata(),
-        src.metadata(),
-        "node 2 reassembled the original metadata via the re-shipped image"
+        totals2.iter().max(),
+        Some(&(image.len() as u64)),
+        "node 2 reassembled the full original image via the re-shipped chunks"
     );
 }

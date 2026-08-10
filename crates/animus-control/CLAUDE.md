@@ -135,6 +135,56 @@ per-tablet CP data plane (`animus-cp-data`).
   0031) is the executor-agnostic "applied index advanced" notification the
   per-node CP reconciler uses to react to a `Metadata` change without polling.
 
+  **ADR 0038 PR3 (the cutover): `Metadata` is `DRIVER_APPLIED`, so `RaftNode`'s
+  single driver is now split into a consensus loop and an async apply task**,
+  mirroring `animus-cp-data`'s proven shape exactly:
+  - `drive()` (the **consensus loop**) recovers from the WAL, spawns the apply
+    task, then only persists (`persist_wal`), steps the core, and ships
+    outbound messages — **no engine I/O**, so it always services
+    heartbeats/`AppendEntries` within the election timeout regardless of how
+    slow an engine merge or compaction is (the reintroduction of the
+    `animus-cp-data` election-storm bug class this split exists to prevent).
+  - `meta_apply_loop`/`meta_apply_and_compact` (the **apply task**, spawned by
+    `drive` right after WAL recovery) owns the *only* mutable `Metadata`
+    (a private `shadow`, never shared with the core). It rebuilds `shadow`
+    from the engine (`mirror::rebuild_metadata_from_engine`) and seeds its
+    watermark from the engine's own `_applied_index` key (**not**
+    `core.last_applied()`, which after recovery only reflects the last
+    *compacted* base and can understate what the engine already durably
+    holds); drains `RaftCore::drain_apply()`, **skipping any command whose
+    index the watermark already covers** (the robust, index-based restart-tail
+    filter — not reliance on incidental command idempotency); applies
+    survivors via the real, unchanged `Metadata::apply` (through
+    `mirror::apply_and_derive_mirror`); merge-batches the derived writes into
+    the engine; and publishes the refreshed `Metadata` into `cache:
+    Arc<Mutex<Metadata>>`, gated by `engine_applied: Arc<AtomicU64>` — bumping
+    `MetadataWatch` only *after* that publish, so a watcher never observes a
+    change before it is both durable and visible.
+  - **Every reader now reads `cache`, never the core.** `RaftNode::metadata()`/
+    `members()`/`placement_view()` (the latter two promoted from
+    `RaftCore<MetaCommand, Metadata>` inherent methods, which are gone —
+    `self.metadata` on a `DRIVER_APPLIED` core is an unused default, mirroring
+    `KvState`'s placeholder) all lock `cache` directly; `reconcile_loop`/
+    `detect_loop` still read leadership/term off the core (a consensus-level
+    fact, unaffected) but the placement view / membership map off `cache`.
+  - Snapshotting reuses the same `take_snapshot_needed`/`set_snapshot_blob`
+    lazy-image machinery `animus-cp-data` uses, retargeted at
+    `syskv_image`/`install_syskv_image` (a scan/encode of the system keyspace,
+    filtered by `syskv::decode_key`) instead of `engine_image`/
+    `install_engine_image`'s per-tablet range.
+  - `start`/`start_with_metrics` now **require** a `StorageEngine` (an added
+    3rd/4th parameter) — there is no more engine-less control-plane
+    deployment shape. `start_with_mirror` (PR2's shadow-mode attach point) and
+    `RaftCore`'s `mirror_capture`/`mirror_log`/`enable_mirror_capture`/
+    `drain_mirror_log` are **removed**: the generic `pending_apply`/
+    `drain_apply` machinery this PR wires up for real already does the
+    identical job, so keeping both would have been two write paths for one
+    fact.
+  - `RaftNode::applied()` (a bounded, `Vec<MetaCommand>` window for tests) is
+    also removed — `core.applied()` is always empty once `DRIVER_APPLIED`
+    (nothing pushes to it); tests that used it now compare converged
+    `metadata()` across nodes instead (a strictly stronger convergence proof).
+
 - **`schema.rs`** — the replicated **table-schema catalog** (ADR 0013), all
   plain data (no I/O/clock/RNG). `TableSchema` (partition key + ordered
   clustering keys + typed `ColumnDef`s + `indexes: Vec<IndexDef>`), `ColumnType`
@@ -149,9 +199,15 @@ per-tablet CP data plane (`animus-cp-data`).
   write/compact/recover flow is diagrammed in `docs/wal.md`).
   `encode_snapshot_record_from_blob` encodes the WAL `Snapshot` line **reusing
   the core's cached serialized image** (`snapshot_blob`, via `serde_json`
-  `RawValue`) so compaction serializes `Metadata` once, not twice —
-  byte-identical to the plain encode, guarded by
-  `snapshot_record_blob_reuse_round_trips`.
+  `RawValue`) — for an in-core state machine this serializes its whole state
+  once per compaction, not twice, byte-identical to the plain encode, guarded
+  by `snapshot_record_blob_reuse_round_trips`. **Since ADR 0038 PR3,
+  `Metadata` is `DRIVER_APPLIED`, so its WAL `Snapshot` record's `metadata`
+  field is always the meaningless `Metadata::default()`** (the real durable
+  state lives in the system-keyspace engine, not this record) — this
+  reuse path is exercised by this crate's other `DRIVER_APPLIED` uses
+  (`driver_applied_sm.rs`'s toy state machine) and by `animus-cp-data`'s
+  identical-shaped `KvState`, not by `Metadata` anymore.
 
 - **`detector.rs`** — `FailureDetector` (ADR 0012): a pure, unit-tested
   interval+timeout liveness detector (last-heartbeat instants + `now` +
@@ -163,7 +219,7 @@ per-tablet CP data plane (`animus-cp-data`).
   `animusd`/`animus-cp-data` code constructs one; every tablet still writes its
   own WAL file. Wire-in-or-delete is an open decision (see ADR 0028).
 
-- **`syskv.rs`** (ADR 0038 PR1, extended PR2) — the control plane's reserved
+- **`syskv.rs`** (ADR 0038 PR1, extended PR2; wired for real by PR3) — the control plane's reserved
   **system keyspace** key encoding: pure functions, no I/O. `RESERVED_NAMESPACE
   = "__animus_system"` is the top-level namespace no user table/keyspace may
   claim; `entity_key(EntityKind, id)` encodes `escape(RESERVED_NAMESPACE) ||
@@ -200,9 +256,10 @@ per-tablet CP data plane (`animus-cp-data`).
   prefix match is the collision that scheme cannot tell apart from a real
   system key.
 
-- **`mirror.rs`** (ADR 0038 PR2) — the **shadow-mode system-keyspace mirror**:
-  dual-write, zero behavior change (`StateMachine::DRIVER_APPLIED` stays
-  `false`; the real in-core `Metadata::apply` is untouched). Two halves:
+- **`mirror.rs`** (ADR 0038 PR2, promoted to the real apply path's core by
+  PR3) — no longer a shadow: this module's two halves are now the apply
+  task's actual write-derivation and restart-rebuild logic, not a dual-write
+  mirror of a separate in-core copy.
   - **Write derivation**: `apply_and_derive_mirror(meta: &mut Metadata,
     command: &MetaCommand) -> (ApplyOutcome, Vec<KeyWrite>)` delegates to the
     real `Metadata::apply` and derives the `syskv` writes that command
@@ -218,87 +275,49 @@ per-tablet CP data plane (`animus-cp-data`).
     against post-apply `tablets` absence) — diffing this way, rather than
     re-deriving `Metadata::prune_cp_member_addrs`'s predicate a second time,
     avoids the exact "two places must agree on a gating rule" hazard this
-    crate's engineering practices warn about.
+    crate's engineering practices warn about. `node.rs`'s
+    `meta_apply_and_compact` calls this directly, once per drained command.
   - **Read side**: `rebuild_metadata_from_engine(engine: &S) ->
     Result<Metadata, StorageError>` scans a `StorageEngine`'s live entries,
     decodes each via `syskv::decode_key`, and reconstructs a `Metadata` —
-    used by the differential-oracle test, a restart's shadow-cache rebuild,
-    and (foreshadowing PR3) an apply task's own cache-rebuild-on-restart
-    step.
+    used by `meta_apply_loop`'s own startup/restart rebuild, and by the
+    differential-oracle tests (`apply_engine.rs`).
 
-  Wired into `node.rs`'s `RaftNode::start_with_mirror` (additive — `start`/
-  `start_with_metrics` are untouched): a `mirror_loop` task owns a *private*
-  shadow `Metadata` it advances by independently re-deriving each drained
-  `(index, command)` pair, seeded at startup from
-  `rebuild_metadata_from_engine` (empty on a fresh engine, a prior run's
-  content after a restart) — never sharing the real `RaftCore`'s own
-  `Metadata`. Engine writes use `StorageEngine::merge_batch` (per-key LWW,
-  each op versioned at its command's own Raft log index) — **not**
-  `write_batch`/`put`, which enforce a single engine-wide monotonic version a
-  combined node's mirror can't assume (it shares the engine with the CP data
-  plane's own, independently-versioned writes; `merge_batch` is the exact
-  primitive `animus-cp-data`'s own leaderful-Raft apply path already uses for
-  this reason). The mirror runs on a **plain fixed timer** (`MIRROR_INTERVAL`,
-  50ms), not a `metadata_watch()` wake — deliberately the simplest thing that
-  works for a shadow mirror with no reader yet; a real consumer (PR3) would
-  want tighter latency.
+  `node.rs`'s `meta_apply_loop`/`meta_apply_and_compact` are the sole
+  writer/reader pair now — see that module's `CLAUDE.md` entry above for the
+  full consensus-loop/apply-task split. PR2's shadow-only plumbing
+  (`RaftCore::mirror_capture`/`mirror_log`, `RaftNode::start_with_mirror`, the
+  `mirror_capture`-across-recovery-swap race its own crash test caught — see
+  `docs/engineering-lessons.md`'s ADR 0038 PR2 entry, still recorded as a
+  generalizable lesson even though its specific mechanism is now gone) is
+  **removed**: the generic `RaftCore::pending_apply`/`drain_apply` machinery
+  every `DRIVER_APPLIED` state machine already has does the identical job
+  with no separate flag/queue to keep in sync across a recovery swap.
 
-  **Race note (a real bug this PR's crash-recovery test caught — see
-  `docs/engineering-lessons.md`)**: `RaftCore::mirror_capture` (the flag
-  gating whether in-core `apply()` also records into `mirror_log`) must be
-  enabled *synchronously* at `start_with_mirror`'s construction time, before
-  any task is spawned — not as `mirror_loop`'s first async line, which races
-  `drive()`'s own first poll. And because `drive()`'s WAL-recovery step
-  (`node.rs`) **replaces the entire `RaftCore` wholesale**
-  (`*core.lock() = RaftCore::recovered(..)`), the flag must also be
-  explicitly carried across that swap (`RaftCore::mirror_capture_enabled`,
-  `pub(crate)`) — otherwise a restarted mirror-attached node silently stops
-  mirroring the instant its post-restart catch-up tail gets applied.
-
-  `RaftCore` (`raft.rs`) gained the minimal, additive plumbing this needs:
-  `mirror_capture: bool` (default `false`) + `mirror_log: Vec<(u64, C)>`,
-  populated in `apply()`'s existing in-core (`else`) branch alongside
-  `applied.push(command)` — unlike `applied` (a bounded, non-consuming test
-  window truncated by `snapshot()`), `mirror_log` is a plain drain-once queue
-  (`drain_mirror_log`) untouched by snapshot truncation, so a driver that
-  drains at least once per outer-loop iteration never loses an entry.
-
-  **Deployment wiring** (`animusd`): a **combined** node's `RaftNode::start`
-  call site passes the node's already-open **shared** CP-data engine directly
-  (no `StorageScope` wrapper — `syskv` keys are already globally namespaced
-  under `RESERVED_NAMESPACE`, and PR1's reserved-name rejection guarantees no
-  user table can ever collide with it, so wrapping would only double-prefix
-  for no benefit). A **control-only** node (`BoundControlNode::
-  start_control_with_mirror`, additive — `start_control_with`'s signature is
-  untouched) opens a small **dedicated** engine on its own `control`
-  `ProdEnv` directory (`SYSKV_LSM_PREFIX`, distinct from the fixed `raft.wal`
-  filename it shares that directory with) — `StorageBackend::Lsm` by default,
-  `::Memory` under `--ephemeral`. A **data-only** node gets nothing (no local
-  control `RaftCore` to mirror at all).
-
-  **Inline-vs-offloaded write path**: mirror engine I/O runs on its own
-  spawned task (`mirror_loop`), never inline in `drive()`'s own
-  message-servicing loop — so it cannot reintroduce the cp-data
-  election-storm bug class (engine I/O blocking `AppendEntries`/heartbeat
-  responses). It is *not yet* the full consensus-loop/apply-task split PR3
-  will build (that formalizes the shadow-Metadata-plus-engine-mirror shape
-  this module already previews into the *actual* state-machine driver); for
-  shadow mode, a separate task polling every 50ms is simplest-that-works and
-  measured to add no observable latency to the existing `drive()` loop (they
-  share the `RaftCore` mutex only for the brief `drain_mirror_log()` call).
+  **Deployment wiring** (`animusd`): a **combined** node's `RaftNode::start`/
+  `start_with_metrics` call site passes the node's already-open **shared**
+  CP-data engine directly (no `StorageScope` wrapper — `syskv` keys are
+  already globally namespaced under `RESERVED_NAMESPACE`, and PR1's
+  reserved-name rejection guarantees no user table can ever collide with it).
+  A **control-only** node (`BoundControlNode::start_control_with`, which now
+  **always** opens an engine — the `mirror_backend: Option<..>` PR2 shipped
+  is gone, since there is no more engine-less shape) opens a small
+  **dedicated** engine on its own `control` `ProdEnv` directory
+  (`SYSKV_LSM_PREFIX`, distinct from the fixed `raft.wal` filename it shares
+  that directory with) — `StorageBackend::Lsm` by default, `::Memory` under
+  `--ephemeral`. A **data-only** node still gets nothing (no local control
+  `RaftCore` at all).
 
   **Tests**: `mirror.rs`'s own unit tests cover every `MetaCommand` variant's
   derivation (including the pre-apply-diff cases) plus a unit-scale
-  engine-rebuild round trip; `tests/mirror_engine.rs` is the real
-  `SimEnv`-driven differential oracle (a 3-node group, mirror on one node,
-  seed-swept scenario mixing membership/schema DDL/tablet split+merge/
-  keyspace/node-id-allocation/member-removal, asserting engine-rebuilt
-  `Metadata` equals in-core `Metadata` after every step) plus the crash-kill-
-  restart regression that caught the race above; `animusd`'s
-  `tests/control_mirror_restart.rs` proves the same durability claim over a
-  **real** `ProdEnv` process restart (real disk, real TCP) for a control-only
-  node, reopening the mirror's `LsmEngine` from an entirely separate handle
-  after the node that wrote it has been shut down.
+  engine-rebuild round trip; `tests/apply_engine.rs` is the real
+  `SimEnv`-driven differential oracle (see the Tests section below);
+  `animusd`'s `tests/control_mirror_restart.rs` (file name kept from PR2 —
+  what it proves is no longer about a shadow mirror, but the exact same
+  real-disk assertion now applies to the actual source of truth) proves the
+  same durability claim over a **real** `ProdEnv` process restart (real disk,
+  real TCP) for a control-only node, reopening the engine from an entirely
+  separate handle after the node that wrote it has been shut down.
 
 ## Key invariants
 
@@ -375,12 +394,20 @@ per-tablet CP data plane (`animus-cp-data`).
   `futures::select`, drawing `entropy` every iteration for randomized election
   timeouts.
 
-- **Two apply models (ADR 0017).** `Metadata` applies **in-core, synchronously**
-  (`StateMachine::DRIVER_APPLIED = false`, the default). A data-plane KV store
-  sets `DRIVER_APPLIED = true`: the core does *not* apply in-core — it buffers
-  each committed-and-durable command as an effect for the async driver to apply
-  to a real `StorageEngine` (drained via `drain_apply`, which only hands out
-  fsynced commands, since engine I/O is async and the core is sync).
+- **One apply model, generic across both planes (ADR 0017, cut over to
+  `Metadata` by ADR 0038 PR3).** `StateMachine::DRIVER_APPLIED = true` is now
+  set for **both** `Metadata` (this crate) and the data plane's `KvState`
+  (`animus-cp-data`) — the core never applies in-core for either; it buffers
+  each committed-and-durable command as an effect (`drain_apply`, which only
+  hands out fsynced commands, since engine I/O is async and the core is
+  sync) for an async **apply task** to apply to a real `StorageEngine`.
+  For `Metadata` that apply task is `node.rs`'s `meta_apply_loop`/
+  `meta_apply_and_compact` — see that module's doc and the "syskv.rs"/
+  "mirror.rs" entries below. `DRIVER_APPLIED = false` (in-core, synchronous
+  apply) is still the trait default and is exercised by
+  `generic_state_machine.rs`'s toy state machine (proving `RaftCore<C, S>`'s
+  genericity in both directions), but no real state machine in this codebase
+  uses it anymore.
 
 - **Pre-vote (ADR 0009).** An election timeout does **not** campaign directly —
   the node becomes a `PreCandidate` and runs a `PreVote`/`PreVoteResp` round
@@ -528,12 +555,16 @@ heartbeats). The 25 binaries:
 - **`control_raft.rs`** — election/replication/leader-kill + multi-seed
   convergence.
 - **`persistence.rs`** — durability/recovery; the hand-driven leader `persist`
-  helper (drain + `mark_durable_through`).
+  helper (drain + `mark_durable_through`) plus (ADR 0038 PR3) `drain_and_apply`
+  — since `Metadata` is `DRIVER_APPLIED`, "is this entry visible" is now "does
+  `drain_apply()` yield it", drained onto a local oracle `Metadata` via
+  `mirror::apply_and_derive_mirror` — the porting idiom every hand-driven
+  `RaftCore<MetaCommand, Metadata>` test in this crate now uses.
 - **`follower_visibility.rs`** — the role-aware apply gate (ADR 0009): a
-  hand-driven follower applies a committed entry with `durable_index == 0`, a
-  leader stays gated on its own proposal, a follower→leader transition keeps the
-  applied entry and gates new proposals, and both `SimEnv` followers reflect the
-  leader's committed command.
+  hand-driven follower's committed entry becomes drainable with
+  `durable_index == 0`, a leader stays gated on its own proposal, a
+  follower→leader transition keeps the drained entry and gates new proposals,
+  and both `SimEnv` followers reflect the leader's committed command.
 - **`membership_commit_gate.rs`** — core-level `change_membership`: the
   current-term-commit gate (`commit_index >= first_term_index`, leader-only) plus
   the single-server rules, driven at message granularity.
@@ -547,11 +578,35 @@ heartbeats). The 25 binaries:
 - **`tablet_split_merge.rs`** — split and merge through Raft: racing splits at
   the same epoch (only the first applies), and merge rejecting a stale epoch
   racing a replica change / tablets from different tables.
-- **`wal_compaction.rs`** — snapshot truncation.
+- **`wal_compaction.rs`** (ADR 0038 PR3) — engine-backed WAL compaction: a real
+  `RaftNode` + `MemoryEngine` under sustained load truncates the WAL and the
+  engine stays the source of truth (`mirror::rebuild_metadata_from_engine`
+  agrees with the live cache); a crash during sustained compaction-triggering
+  load recovers to the same state a same-seed uninterrupted run reaches. The
+  precise, deterministic unit-level proof of watermark-gated tail replay
+  (never re-deriving writes for an already-engine-covered command) is a
+  white-box `#[cfg(test)]` in `src/node.rs` itself (drives the private
+  `meta_apply_and_compact` directly), not here.
 - **`install_snapshot.rs`** — a partitioned follower catching up via
-  `InstallSnapshot`, a far-behind follower via a *multi-chunk* one, non-empty
-  reship, and the wall-clock-timed O(chunk)-not-O(state) liveness test.
-- **`restart.rs`** — process restart-and-rejoin (via `Simulator::stop`).
+  `InstallSnapshot` (`RaftNode`-level, real apply task), a far-behind follower
+  via a *multi-chunk* one, non-empty reship, and the wall-clock-timed
+  O(chunk)-not-O(state) liveness test — the last three are hand-driven
+  `RaftCore`-level tests that supply a synthetic image via `set_snapshot_blob`
+  right after `snapshot()` (ADR 0038 PR3: `Metadata`'s image is now built
+  lazily by an external driver, so these tests stand in for it directly,
+  decoupling them from `Metadata`'s own serialization — the real engine-backed
+  image path is `wal_compaction.rs`'s job).
+- **`apply_engine.rs`** (ADR 0038 PR3) — the differential oracle succeeding
+  PR2's `mirror_engine.rs`: no more shadow side to diff against a separate
+  real side — `cache` *is* the real side. Asserts every node's published cache
+  agrees with its own engine's independent rebuild through a mixed scenario
+  (membership, schema, tablet create/split/drop-table, keyspace,
+  node-id-allocation) and across a genuine crash + restart, seed-swept.
+- **`restart.rs`** — process restart-and-rejoin (via `Simulator::stop`); each
+  node's `MemoryEngine` handle is created once and re-cloned at restart (ADR
+  0038 PR3 gotcha — see `docs/engineering-lessons.md`: a restart must reuse
+  the same engine handle, not construct a fresh one, or it silently loses
+  everything the (real, disk-backed in production) engine would have kept).
 - **`placement_reconcile.rs`** — caller-driven placement reconcile through Raft
   under a replica death + follower crash (drives `animus-placement`).
 - **`placement_auto_reconcile.rs`** — leader-driven automatic reconcile from a
@@ -594,8 +649,19 @@ heartbeats). The 25 binaries:
   stays parked across steady-state traffic with nothing proposed, and resolves
   on its first poll when the advance already happened (the wake-before-park case,
   safe by construction).
-- **`prod_liveness.rs`** — a real-thread `ProdEnv` smoke test guarding the
-  liveness properties `SimEnv`'s virtual clock can't see.
+- **`prod_liveness.rs`** — real-thread `ProdEnv` smoke tests guarding the
+  liveness properties `SimEnv`'s virtual clock can't see: a freshly-joined
+  follower catches a large, compacted `Metadata` cluster up quickly without
+  running leadership away (`large_metadata_catch_up_stays_live`); and (ADR
+  0038 PR3) `sustained_metadata_churn_over_a_real_engine_stays_live` —
+  hundreds of `MetaCommand`s at a steady drip through a 3-node group backed
+  by a **real on-disk `LsmEngine`** (not `MemoryEngine`, whose I/O is
+  synchronous/trivial and so can't exercise this), asserting both a bounded
+  term delta *and* a bounded count of leadership transitions actually
+  observed during the churn, plus bounded-deadline convergence — the direct
+  real-thread proof that the apply task's real engine I/O (now on a separate
+  task from consensus) never blocks heartbeat/`AppendEntries` processing
+  long enough to trip the election timeout.
 - **`node_id_allocation.rs`** — `MetaCommand::AllocateNodeId` (ADR 0036): the
   monotonic allocator mints distinct ids under concurrent proposals, a
   replayed nonce is idempotent, and the counter survives a restart.
@@ -619,10 +685,6 @@ heartbeats). The 25 binaries:
   catch-up and that leadership stays bounded and settles to one stable
   leader afterward — no election storm from real-thread scheduling around a
   runtime membership change.
-- **`mirror_engine.rs`** (ADR 0038 PR2) — the shadow-mode system-keyspace
-  mirror's differential oracle: a 3-node group with `RaftNode::start_with_mirror`
-  on one node, seed-swept over a scenario mixing membership/schema DDL/tablet
-  split+merge/keyspace/node-id-allocation/member-removal, asserting
-  `mirror::rebuild_metadata_from_engine` equals that node's in-core `Metadata`
-  after every step; plus a crash-kill-and-restart regression (caught the
-  `mirror_capture`-across-recovery-swap race, see `docs/engineering-lessons.md`).
+  (PR2's shadow-mode `mirror_engine.rs`, which drove this same differential
+  oracle against `RaftNode::start_with_mirror`, is superseded by
+  `apply_engine.rs` above — ADR 0038 PR3.)

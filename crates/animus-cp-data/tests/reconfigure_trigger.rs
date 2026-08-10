@@ -127,7 +127,7 @@ fn run(seed: u64) {
     // --- Control plane (ids 0..3). ---
     let control: Vec<RaftNode<SimEnv>> = CONTROL
         .iter()
-        .map(|&id| RaftNode::start(sim.env(id), CONTROL.to_vec()))
+        .map(|&id| RaftNode::start(sim.env(id), CONTROL.to_vec(), MemoryEngine::new()))
         .collect();
     // Every data member heartbeats the control group (so the detector sees them).
     for (id, _, _) in DATA_NODES {
@@ -303,7 +303,7 @@ fn auto_reconfigure_is_reproducible_from_seed() {
         let sim = Simulator::new(seed);
         let control: Vec<RaftNode<SimEnv>> = CONTROL
             .iter()
-            .map(|&id| RaftNode::start(sim.env(id), CONTROL.to_vec()))
+            .map(|&id| RaftNode::start(sim.env(id), CONTROL.to_vec(), MemoryEngine::new()))
             .collect();
         for (id, _, _) in DATA_NODES {
             let env = sim.env(id);

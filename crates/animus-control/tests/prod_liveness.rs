@@ -21,6 +21,7 @@ use std::time::Duration;
 
 use animus_control::{MetaCommand, NodeStatus, RaftNode};
 use animus_env::{Env, NodeId, ProdEnv};
+use animus_storage::{LsmEngine, MemoryEngine};
 use tokio::time::{sleep, timeout};
 
 fn unique_tmp_dir() -> std::path::PathBuf {
@@ -84,8 +85,8 @@ async fn large_metadata_catch_up_stays_live() {
         }
 
         // Start the two-node majority (2/3 of the 3-voter group commits without 2).
-        let node0 = RaftNode::start(envs[0].clone(), group.clone());
-        let node1 = RaftNode::start(envs[1].clone(), group.clone());
+        let node0 = RaftNode::start(envs[0].clone(), group.clone(), MemoryEngine::new());
+        let node1 = RaftNode::start(envs[1].clone(), group.clone(), MemoryEngine::new());
 
         async fn leader_of<'a>(nodes: &'a [&'a RaftNode<ProdEnv>]) -> Option<usize> {
             for _ in 0..200 {
@@ -149,7 +150,7 @@ async fn large_metadata_catch_up_stays_live() {
         // state. Primary signal: it does so promptly (12s budget; the fix serves the
         // ~1100-chunk snapshot in well under a second — the timed core test proves the
         // per-chunk cost directly).
-        let node2 = RaftNode::start(envs[2].clone(), group.clone());
+        let node2 = RaftNode::start(envs[2].clone(), group.clone(), MemoryEngine::new());
         let started = std::time::Instant::now();
         let mut caught_up = false;
         for _ in 0..240 {
@@ -189,4 +190,176 @@ async fn large_metadata_catch_up_stays_live() {
     })
     .await
     .expect("control driver-liveness smoke test timed out");
+}
+
+/// How many `MetaCommand`s the sustained-churn test below proposes.
+const CHURN_COMMANDS: u64 = 300;
+
+/// Spacing between churn proposals — a steady drip, not a burst, so the
+/// apply task's real engine I/O is exercised continuously across several
+/// seconds of wall-clock time rather than all at once.
+const CHURN_INTERVAL: Duration = Duration::from_millis(10);
+
+/// **ADR 0038 PR3's actual storm-risk surface**: sustained `MetaCommand`
+/// churn through the leader of a real 3-node control group backed by a
+/// **genuine on-disk `LsmEngine`** — not `MemoryEngine`, whose I/O is
+/// synchronous/trivial and so cannot exercise the hazard at all. Since the
+/// cutover, every committed-and-durable command is applied by a separate
+/// async apply task that does real engine I/O (`merge_batch`, periodic
+/// WAL/SSTable compaction) — exactly the shape that caused the
+/// `animus-cp-data` election-storm bug class when apply/compaction ran
+/// inline on the consensus loop (root `CLAUDE.md`'s engineering-lessons
+/// entry). This test is the real-thread integration guard that a slow batch
+/// of real disk merges never blocks the *consensus* loop's own
+/// heartbeat/`AppendEntries` servicing long enough to trip the election
+/// timeout — the property `SimEnv`'s virtual clock cannot observe and that
+/// this file's other `MemoryEngine`-backed test does not exercise.
+///
+/// Asserts, mirroring `control_membership_prod.rs`'s
+/// `grow_three_to_five_under_real_time_stays_live` technique: (a) a bounded
+/// term delta across the whole churn window (a coarse runaway-storm guard —
+/// a handful of bumps from real scheduling jitter is not a storm) *and* a
+/// bounded count of leadership transitions actually observed while churning
+/// (the tighter "stayed stable throughout," not just "didn't run away"
+/// signal); and (b) every node's published cache converges on all churned
+/// commands within a bounded deadline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn sustained_metadata_churn_over_a_real_engine_stays_live() {
+    const MAX_TERM_DELTA: u64 = 20;
+    const MAX_TRANSITIONS: u32 = 3;
+
+    timeout(Duration::from_secs(120), async {
+        let group: Vec<NodeId> = vec![0, 1, 2];
+        let dirs: Vec<_> = (0..3).map(|_| unique_tmp_dir()).collect();
+        let loop0 = || "127.0.0.1:0".parse::<SocketAddr>().unwrap();
+
+        let mut envs = Vec::new();
+        for (i, dir) in dirs.iter().enumerate() {
+            let (env, _addr) = ProdEnv::bind(i as u64, loop0(), dir).await.expect("bind");
+            envs.push(env);
+        }
+        let book: BTreeMap<NodeId, SocketAddr> =
+            envs.iter().map(|e| (e.node_id(), e.local_addr())).collect();
+        for e in &envs {
+            e.set_peers(book.clone());
+        }
+
+        // A REAL on-disk system-keyspace engine per node (distinct file
+        // prefix from `raft.wal`, same directory — mirrors `animusd`'s own
+        // `SYSKV_LSM_PREFIX` convention) — the apply task's `merge_batch`
+        // and periodic compaction genuinely touch disk here, unlike every
+        // other `RaftNode`-based test in this file/suite.
+        let engine0 = LsmEngine::open(envs[0].clone(), "ctrl-syskv")
+            .await
+            .expect("open node 0's real on-disk system-keyspace engine");
+        let engine1 = LsmEngine::open(envs[1].clone(), "ctrl-syskv")
+            .await
+            .expect("open node 1's real on-disk system-keyspace engine");
+        let engine2 = LsmEngine::open(envs[2].clone(), "ctrl-syskv")
+            .await
+            .expect("open node 2's real on-disk system-keyspace engine");
+
+        let node0 = RaftNode::start(envs[0].clone(), group.clone(), engine0);
+        let node1 = RaftNode::start(envs[1].clone(), group.clone(), engine1);
+        let node2 = RaftNode::start(envs[2].clone(), group.clone(), engine2);
+        let nodes = [&node0, &node1, &node2];
+
+        async fn leader_of(nodes: &[&RaftNode<ProdEnv>; 3]) -> Option<usize> {
+            for _ in 0..200 {
+                for (i, n) in nodes.iter().enumerate() {
+                    if n.is_leader() {
+                        return Some(i);
+                    }
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+            None
+        }
+
+        // --- Initial settle: elect a leader before measuring anything.
+        let mut leader_idx = leader_of(&nodes).await.expect("no leader elected");
+        let term_start = nodes[leader_idx].term();
+
+        // --- Sustained churn: CHURN_COMMANDS at a steady drip through the
+        // leader (re-resolving it if leadership moves mid-churn), tracking
+        // every leadership transition actually observed along the way.
+        let churn_started = std::time::Instant::now();
+        let mut transitions = 0u32;
+        let mut last_leader_term = term_start;
+        for i in 0..CHURN_COMMANDS {
+            if !nodes[leader_idx].is_leader() {
+                leader_idx = leader_of(&nodes)
+                    .await
+                    .unwrap_or_else(|| panic!("no leader mid-churn at command {i}"));
+            }
+            let term_now = nodes[leader_idx].term();
+            if term_now != last_leader_term {
+                transitions += 1;
+                last_leader_term = term_now;
+            }
+            nodes[leader_idx].propose(MetaCommand::UpsertMember {
+                node: 1_000 + i,
+                labels: BTreeMap::new(),
+                // `Joining`, not `Active` — see `fat_member`'s doc above:
+                // the failure detector never judges this status, so this
+                // pure churn workload can't trip an unrelated `Down` storm.
+                status: NodeStatus::Joining,
+            });
+            sleep(CHURN_INTERVAL).await;
+        }
+        let churn_secs = churn_started.elapsed().as_secs_f64();
+        let term_after_churn = nodes.iter().map(|n| n.term()).max().unwrap();
+        let delta = term_after_churn.saturating_sub(term_start);
+
+        // --- Convergence: every node's apply-task-published cache reflects
+        // all CHURN_COMMANDS churned members within a bounded deadline —
+        // real engine I/O (fsync/compaction) is slower than `MemoryEngine`,
+        // so this budget is generous (20s) to stay non-flaky on a busy box.
+        let convergence_started = std::time::Instant::now();
+        let mut converged = false;
+        for _ in 0..400 {
+            if nodes
+                .iter()
+                .all(|n| n.metadata().members.len() as u64 >= CHURN_COMMANDS)
+            {
+                converged = true;
+                break;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+        let convergence_secs = convergence_started.elapsed().as_secs_f64();
+        let member_counts: Vec<usize> = nodes.iter().map(|n| n.metadata().members.len()).collect();
+
+        eprintln!(
+            "sustained real-engine churn: {CHURN_COMMANDS} commands over {churn_secs:.2}s, \
+             control term Δ{delta} (start={term_start}, after={term_after_churn}), \
+             {transitions} leadership transition(s) observed during churn, \
+             converged={converged} in {convergence_secs:.2}s (member counts={member_counts:?})"
+        );
+
+        assert!(
+            converged,
+            "nodes did not converge on {CHURN_COMMANDS} churned members within budget: \
+             member counts = {member_counts:?}"
+        );
+        assert!(
+            delta <= MAX_TERM_DELTA,
+            "control leadership ran away during sustained real-engine churn: term Δ{delta} > \
+             {MAX_TERM_DELTA}"
+        );
+        assert!(
+            transitions <= MAX_TRANSITIONS,
+            "leadership did not stay stable during sustained real-engine churn: {transitions} \
+             transitions observed (> {MAX_TRANSITIONS}), term Δ{delta}"
+        );
+
+        for e in &envs {
+            e.shutdown();
+        }
+        for dir in &dirs {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    })
+    .await
+    .expect("sustained real-engine metadata churn liveness test timed out");
 }

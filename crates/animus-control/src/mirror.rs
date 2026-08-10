@@ -1,15 +1,21 @@
-//! The control plane's **shadow-mode system-keyspace mirror** (ADR 0038 PR2):
-//! given a just-applied [`MetaCommand`] and the [`Metadata`] it was applied
-//! against, derive the bounded set of [`syskv`] key/value writes that command
-//! implies, and (separately) rebuild a [`Metadata`] back out of a
-//! `StorageEngine`'s system keyspace. Both directions are exercised by the
-//! differential-oracle tests (`tests/mirror_engine.rs`): drive a real
-//! `Metadata`/`RaftCore` and a mirror side by side and assert they agree.
+//! The control plane's **system-keyspace derivation + rebuild logic** (ADR
+//! 0038). Introduced in PR2 as a shadow-mode dual-write mirror; **PR3 (the
+//! cutover) promotes it to the real apply path's core**: given a just-applied
+//! [`MetaCommand`] and the [`Metadata`] it was applied against, derive the
+//! bounded set of [`syskv`] key/value writes that command implies, and
+//! (separately) rebuild a [`Metadata`] back out of a `StorageEngine`'s system
+//! keyspace. Both directions are exercised by the differential-oracle tests
+//! (`tests/apply_engine.rs`, the PR3 successor to PR2's `mirror_engine.rs`):
+//! drive a real `RaftNode` (its apply task is now the only writer) and assert
+//! its published cache agrees with an independent engine rebuild.
 //!
 //! This module is **pure** (no `Env`, no I/O) except [`rebuild_metadata_from_engine`],
 //! which only *reads* a [`StorageEngine`] — the actual write path (deriving
 //! writes here, then `merge_batch`-ing them into an engine) is driven by
-//! `node.rs`'s `RaftNode::start_with_mirror`/`mirror_loop`.
+//! `node.rs`'s apply task (`meta_apply_loop`/`meta_apply_and_compact`), which
+//! also owns the *only* mutable in-memory `Metadata` now that
+//! `StateMachine::DRIVER_APPLIED = true` — there is no longer a separate
+//! in-core copy this module's output merely shadows.
 //!
 //! ## Why derivation needs *pre*-apply state, not just post-apply `Metadata`
 //!

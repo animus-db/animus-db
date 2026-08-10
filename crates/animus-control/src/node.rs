@@ -2,6 +2,7 @@
 //! ferries time and messages between the network and the synchronous
 //! [`RaftCore`].
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -12,10 +13,11 @@ use std::time::Duration;
 use animus_env::{Env, EnvExt, Metric, MetricsHandle, NodeId};
 use animus_storage::{MergeOp, StorageEngine};
 use futures::future::{Either, select};
+use futures::lock::Mutex as AsyncMutex;
 use futures::task::AtomicWaker;
 
 use crate::detector::FailureDetector;
-use crate::meta::{Member, MetaCommand, Metadata, NodeStatus};
+use crate::meta::{Member, MetaCommand, Metadata, NodeStatus, PlacementView};
 use crate::mirror::{self, KeyWrite};
 use crate::persist::PersistedState;
 use crate::raft::{Out, ProposeResult, RaftCore, RaftMsg, Role};
@@ -27,7 +29,18 @@ const WAL: &str = "raft.wal";
 /// Snapshot (truncating the covered log prefix) and rewrite the WAL once this
 /// many applied entries have accumulated beyond the current snapshot base. This
 /// bounds both the in-memory log and the WAL to roughly the live tail.
+/// Compared against **`engine_applied`**, not the core's own `last_applied`
+/// (ADR 0038 PR3: the apply task, not the consensus loop, drives compaction —
+/// see [`meta_apply_and_compact`]'s doc).
 const SNAPSHOT_THRESHOLD: u64 = 64;
+
+/// Idle back-off for the apply task ([`meta_apply_loop`]): when there is
+/// nothing committed-and-durable to apply it sleeps this long before
+/// re-checking. Under load [`meta_apply_and_compact`] keeps returning `true`,
+/// so the task never sleeps and stays close behind commit — this only bounds
+/// latency (and CPU) while idle. Mirrors `animus-cp-data`'s identical
+/// `APPLY_IDLE_POLL`.
+const APPLY_IDLE_POLL: Duration = Duration::from_millis(5);
 
 /// How often the leader re-evaluates placement and proposes any corrective
 /// `CasTabletReplicas` (ADR 0005). Long relative to the heartbeat interval:
@@ -169,14 +182,35 @@ impl Future for MetadataChanged<'_> {
 pub struct RaftNode<E: Env> {
     env: E,
     core: Arc<Mutex<RaftCore>>,
+    /// The apply task's published, `engine_applied`-gated `Metadata` cache
+    /// (ADR 0038 PR3) — every reader (`metadata()`, `members()`,
+    /// `placement_view()`, `admin.rs`, the dashboard, `reconcile_loop`/
+    /// `detect_loop`) reads *this*, never the core's own (unused, since
+    /// `Metadata: DRIVER_APPLIED`) in-memory field. The apply task
+    /// (`meta_apply_loop`) is its sole writer.
+    cache: Arc<Mutex<Metadata>>,
+    /// The highest Raft log index the system-keyspace engine has durably
+    /// merged (ADR 0038 PR3) — mirrors `animus-cp-data`'s `engine_applied`.
+    /// `cache` is only ever published *after* the matching engine write, so
+    /// this and `cache`'s content always agree: a reader that wants to
+    /// confirm a specific proposed index took effect polls this (or
+    /// `metadata_watch()`), never the core's `last_applied` (which the apply
+    /// task lags).
+    engine_applied: Arc<AtomicU64>,
     /// Shared heartbeat failure detector (ADR 0012). The driver feeds it observed
     /// heartbeats; the `detect_loop` reads it and, when leader, proposes liveness
     /// transitions. Shared so both run against one view.
     detector: Arc<Mutex<FailureDetector>>,
-    /// Applied-index change notification (ADR 0031). Shared with the `drive`
-    /// loop, which is the sole writer (`bump`); `metadata_watch()` hands out
-    /// clones to read/wait on it.
+    /// Applied-index change notification (ADR 0031). Shared with the apply
+    /// task, which is the sole writer (`bump`, once the cache publish it
+    /// describes is actually visible — ADR 0038 PR3); `metadata_watch()`
+    /// hands out clones to read/wait on it.
     watch: MetadataWatch,
+    /// Serializes the consensus loop's WAL append/fsync against the apply
+    /// task's WAL-compaction rewrite of the same file (ADR 0038 PR3) — both
+    /// tasks write `raft.wal`. Also held by [`flush`](Self::flush) for the
+    /// same reason.
+    wal_lock: Arc<AsyncMutex<()>>,
     /// Observability sink (ADR 0015). The driver loops record control-plane
     /// counters into it (elections, append-entries, snapshot installs, failure
     /// detector transitions) and keep the leadership gauge current. Cheap to
@@ -185,8 +219,14 @@ pub struct RaftNode<E: Env> {
 }
 
 impl<E: Env> RaftNode<E> {
-    /// Start a node: build its [`RaftCore`] and spawn the driver loop on `env`.
-    /// `all_nodes` is the full control-group membership (including this node).
+    /// Start a node: build its [`RaftCore`] and spawn the consensus loop plus
+    /// the async **apply task** (ADR 0038 PR3) on `env`. `all_nodes` is the
+    /// full control-group membership (including this node); `engine` is this
+    /// node's system-keyspace [`StorageEngine`] handle — the durable home of
+    /// `Metadata` now that `StateMachine::DRIVER_APPLIED = true` (a combined
+    /// node passes its already-open shared CP-data engine, globally
+    /// namespaced under [`syskv::RESERVED_NAMESPACE`]; a control-only node
+    /// passes a small dedicated one — see `animusd`'s wiring).
     ///
     /// Metrics (ADR 0015) are recorded into the env's own sink (`env.metrics()`)
     /// — for `ProdEnv` a real recording handle, so an assembled production node
@@ -194,9 +234,9 @@ impl<E: Env> RaftNode<E> {
     /// counters under deterministic simulation (where `SimEnv::metrics()` is the
     /// no-op default), construct with [`start_with_metrics`](Self::start_with_metrics)
     /// and pass a recording [`MetricsHandle`] the test keeps.
-    pub fn start(env: E, all_nodes: Vec<NodeId>) -> Self {
+    pub fn start<S: StorageEngine + 'static>(env: E, all_nodes: Vec<NodeId>, engine: S) -> Self {
         let metrics = env.metrics();
-        Self::start_with_metrics(env, all_nodes, metrics)
+        Self::start_with_metrics(env, all_nodes, metrics, engine)
     }
 
     /// Like [`start`](Self::start), but records into the supplied `metrics`
@@ -204,7 +244,12 @@ impl<E: Env> RaftNode<E> {
     /// `start`); the sim observability test threads in a recording handle here so
     /// it can read counters back without editing `animus-sim`, and integration
     /// can pass `env.metrics()` (or any chosen sink) explicitly.
-    pub fn start_with_metrics(env: E, all_nodes: Vec<NodeId>, metrics: MetricsHandle) -> Self {
+    pub fn start_with_metrics<S: StorageEngine + 'static>(
+        env: E,
+        all_nodes: Vec<NodeId>,
+        metrics: MetricsHandle,
+        engine: S,
+    ) -> Self {
         let core = Arc::new(Mutex::new(RaftCore::new(
             env.node_id(),
             &all_nodes,
@@ -213,11 +258,17 @@ impl<E: Env> RaftNode<E> {
         )));
         let detector = Arc::new(Mutex::new(FailureDetector::new(DETECT_TIMEOUT)));
         let watch = MetadataWatch::default();
+        let cache = Arc::new(Mutex::new(Metadata::default()));
+        let engine_applied = Arc::new(AtomicU64::new(0));
+        let wal_lock = Arc::new(AsyncMutex::new(()));
         let node = Self {
             env: env.clone(),
             core: Arc::clone(&core),
+            cache: Arc::clone(&cache),
+            engine_applied: Arc::clone(&engine_applied),
             detector: Arc::clone(&detector),
             watch: watch.clone(),
+            wal_lock: Arc::clone(&wal_lock),
             metrics: metrics.clone(),
         };
         env.spawn_task(drive(
@@ -226,84 +277,24 @@ impl<E: Env> RaftNode<E> {
             Arc::clone(&detector),
             all_nodes,
             metrics.clone(),
-            watch,
+            watch.clone(),
+            engine,
+            Arc::clone(&cache),
+            engine_applied,
+            wal_lock,
         ));
         // The placement reconciler runs alongside the driver; it only ever
         // *proposes* on the core (no I/O of its own), and proposals are honored
         // only when this node is leader — so it is safe to run on every node.
-        env.spawn_task(reconcile_loop(env.clone(), Arc::clone(&core)));
+        env.spawn_task(reconcile_loop(
+            env.clone(),
+            Arc::clone(&core),
+            Arc::clone(&cache),
+        ));
         // The failure detector evaluates member liveness on a timer and, when
         // leader, proposes `UpsertMember` transitions (ADR 0012). Like the
         // reconciler it only *proposes*, so it is safe to run on every node.
-        env.spawn_task(detect_loop(env.clone(), core, detector, metrics));
-        node
-    }
-
-    /// Like [`start`](Self::start), but additionally attaches a **shadow-mode
-    /// system-keyspace engine mirror** (ADR 0038 PR2): a `mirror_loop` task
-    /// that, after each in-core [`Metadata`] apply, derives the touched
-    /// [`syskv`](crate::syskv) keys (via [`mirror::apply_and_derive_mirror`])
-    /// and merge-batches them into `mirror_engine`. Purely additive and
-    /// observational — the real in-core `Metadata::apply` this node serves
-    /// reads/writes from is completely unchanged (`StateMachine::DRIVER_APPLIED`
-    /// stays `false`); a mirror write failure would `panic` the mirror task,
-    /// not this node's consensus/apply path (they share no lock beyond the
-    /// same `RaftCore` mutex `drain_mirror_log` briefly takes).
-    ///
-    /// One `RaftNode` attaches at most one mirror engine — call this instead
-    /// of [`start`](Self::start)/[`start_with_metrics`](Self::start_with_metrics),
-    /// not in addition to them. `S: StorageEngine + 'static` so the mirror
-    /// task can own a clone of it for its own lifetime; combined-mode
-    /// `animusd` passes the node's already-open shared engine directly
-    /// (system-keyspace keys are already globally namespaced by
-    /// [`syskv::RESERVED_NAMESPACE`](crate::syskv::RESERVED_NAMESPACE), so no
-    /// `StorageScope` wrapper is needed — see the PR2 report), a control-only
-    /// node passes a small dedicated one.
-    ///
-    /// **Race note**: `mirror_capture` must be enabled *synchronously*,
-    /// before any task (in particular `drive()`) gets its first poll — a
-    /// restarted node's `drive()` may replay a whole committed-but-not-yet-
-    /// applied log tail (a restart-time catch-up, not a first-open) on its
-    /// very first iteration, and any of that tail applied before capture
-    /// turns on would silently never reach the mirror. So this does **not**
-    /// delegate to [`start_with_metrics`](Self::start_with_metrics) (which
-    /// spawns `drive` immediately) — it builds the same shape itself, with
-    /// [`RaftCore::enable_mirror_capture`] called on the freshly constructed
-    /// core *before* any `env.spawn_task` call.
-    pub fn start_with_mirror<S: StorageEngine + 'static>(
-        env: E,
-        all_nodes: Vec<NodeId>,
-        metrics: MetricsHandle,
-        mirror_engine: S,
-    ) -> Self {
-        let mut inner = RaftCore::new(env.node_id(), &all_nodes, env.now(), env.next_u64());
-        inner.enable_mirror_capture();
-        let core = Arc::new(Mutex::new(inner));
-        let detector = Arc::new(Mutex::new(FailureDetector::new(DETECT_TIMEOUT)));
-        let watch = MetadataWatch::default();
-        let node = Self {
-            env: env.clone(),
-            core: Arc::clone(&core),
-            detector: Arc::clone(&detector),
-            watch: watch.clone(),
-            metrics: metrics.clone(),
-        };
-        env.spawn_task(drive(
-            env.clone(),
-            Arc::clone(&core),
-            Arc::clone(&detector),
-            all_nodes,
-            metrics.clone(),
-            watch,
-        ));
-        env.spawn_task(reconcile_loop(env.clone(), Arc::clone(&core)));
-        env.spawn_task(detect_loop(
-            env.clone(),
-            Arc::clone(&core),
-            detector,
-            metrics,
-        ));
-        env.spawn_task(mirror_loop(env.clone(), core, mirror_engine));
+        env.spawn_task(detect_loop(env.clone(), core, cache, detector, metrics));
         node
     }
 
@@ -312,6 +303,14 @@ impl<E: Env> RaftNode<E> {
     #[must_use]
     pub fn metrics(&self) -> &MetricsHandle {
         &self.metrics
+    }
+
+    /// The highest Raft log index this node's system-keyspace engine has
+    /// durably merged (ADR 0038 PR3) — the watermark [`metadata`](Self::metadata)
+    /// is gated on. Mirrors `animus-cp-data::RaftKvNode::engine_applied_index`.
+    #[must_use]
+    pub fn engine_applied_index(&self) -> u64 {
+        self.engine_applied.load(Ordering::Acquire)
     }
 
     /// Propose a metadata command. See [`ProposeResult`].
@@ -336,7 +335,7 @@ impl<E: Env> RaftNode<E> {
     /// *before* it becomes client-visible is the proper fix, tracked as a follow-up
     /// (ADR 0009 — see the root CLAUDE.md engineering-practices note).
     pub async fn flush(&self) -> usize {
-        flush_wal(&self.env, &self.core).await
+        persist_wal(&self.env, &self.core, &self.wal_lock).await
     }
 
     /// This node's environment handle.
@@ -373,16 +372,29 @@ impl<E: Env> RaftNode<E> {
         self.lock().leader()
     }
 
-    /// A clone of the applied metadata state.
+    /// A clone of the apply task's published `Metadata` cache (ADR 0038 PR3)
+    /// — gated on [`engine_applied_index`](Self::engine_applied_index), never
+    /// the core's own (unused) in-memory state. May briefly read a fresher
+    /// node's `Metadata::default()` before the apply task's first rebuild
+    /// completes; a caller that needs read-your-writes should confirm via
+    /// [`metadata_watch`](Self::metadata_watch) or
+    /// [`engine_applied_index`](Self::engine_applied_index) instead of
+    /// assuming this call alone is synchronized with a just-issued `propose`.
     pub fn metadata(&self) -> Metadata {
-        self.lock().metadata()
+        self.cache.lock().expect("cache poisoned").clone()
     }
 
-    /// The commands applied **since the last snapshot**, in order (a bounded
-    /// window for tests / divergence checks — compaction drops the covered
-    /// prefix, so compare it before the snapshot threshold is crossed).
-    pub fn applied(&self) -> Vec<MetaCommand> {
-        self.lock().applied()
+    /// A clone of just the **membership map** — the failure detector's
+    /// input, off the apply task's published cache (ADR 0038 PR3).
+    pub fn members(&self) -> BTreeMap<NodeId, Member> {
+        self.cache.lock().expect("cache poisoned").members.clone()
+    }
+
+    /// A clone of the **placement-relevant subset** of the metadata (members,
+    /// tablets, and policies — never the schema catalog), off the apply
+    /// task's published cache (ADR 0038 PR3).
+    pub fn placement_view(&self) -> PlacementView {
+        self.cache.lock().expect("cache poisoned").placement_view()
     }
 
     /// Highest committed log index.
@@ -500,51 +512,59 @@ pub async fn heartbeat_loop<E: Env>(env: E, control: Vec<NodeId>) {
     }
 }
 
-/// The per-node driver loop: recover durable state, then repeatedly wait for the
-/// next message or timer, hand it to the core, persist the resulting durable
-/// changes, and ship whatever the core wants sent.
-async fn drive<E: Env>(
+/// The per-node **consensus loop** (ADR 0038 PR3): recover durable state,
+/// spawn the async apply task, then repeatedly persist the WAL, wait for the
+/// next message or timer, hand it to the core, persist again, and ship
+/// whatever the core wants sent. Does **no** system-keyspace engine I/O
+/// itself — that (and WAL compaction) is [`meta_apply_loop`]'s job on a
+/// separate task, so a slow engine merge/compaction/snapshot-image build can
+/// never block heartbeat/append processing past the election timeout (the
+/// `animus-cp-data` driver-liveness fix, ADR 0017 — see this crate's
+/// `CLAUDE.md`'s election-storm entry). Mirrors `animus-cp-data`'s own
+/// `drive`, minus its ReadIndex/propose-wake plumbing this plane doesn't have.
+#[allow(clippy::too_many_arguments)]
+async fn drive<E: Env, S: StorageEngine + 'static>(
     env: E,
     core: Arc<Mutex<RaftCore>>,
     detector: Arc<Mutex<FailureDetector>>,
     all_nodes: Vec<NodeId>,
     metrics: MetricsHandle,
     watch: MetadataWatch,
+    engine: S,
+    cache: Arc<Mutex<Metadata>>,
+    engine_applied: Arc<AtomicU64>,
+    wal_lock: Arc<AsyncMutex<()>>,
 ) {
     // Recover from the WAL before serving anything.
     let bytes = env.read(WAL).await.unwrap_or_default();
     let state = PersistedState::replay(PersistedState::decode(&bytes));
     if !state.is_empty() {
-        let mut recovered =
+        let recovered =
             RaftCore::recovered(env.node_id(), &all_nodes, state, env.now(), env.next_u64());
-        // ADR 0038 PR2: `RaftCore::recovered` builds a *fresh* core (via
-        // `Self::new`, then overrides specific fields) — `mirror_capture`
-        // defaults `false` on it like any other fresh core, silently
-        // dropping a mirror driver's earlier `enable_mirror_capture()` call
-        // right as this swap installs it. Carry the flag across the swap
-        // explicitly: whatever the *pre-recovery* core had (set
-        // synchronously by `RaftNode::start_with_mirror` before this task
-        // ever got its first poll — see that method's race note) is the
-        // value that must survive. Without this, a restarted mirror-attached
-        // node would silently stop mirroring the moment its committed WAL
-        // tail gets caught up and re-applied post-restart.
-        if core
-            .lock()
-            .expect("raft core poisoned")
-            .mirror_capture_enabled()
-        {
-            recovered.enable_mirror_capture();
-        }
         *core.lock().expect("raft core poisoned") = recovered;
     }
-    // A restart can recover already-applied state (WAL replay); a watcher
-    // parked before the first loop iteration should see it too.
-    signal_metadata_watch(&core, &watch);
+    // Spawn the apply task now — after recovery has installed the recovered
+    // core, so its first `drain_apply` sees the real post-recovery frontier,
+    // not a fresh node's empty one (mirrors `animus-cp-data::drive`'s
+    // ordering). The apply task rebuilds its own cache from `engine` and
+    // signals `watch` itself once that rebuild (which may recover
+    // already-applied state) completes — so a watcher parked before this
+    // node's first loop iteration still sees it, without `drive` touching
+    // `cache`/`watch` at all (ADR 0038 PR3: this loop does no engine I/O and
+    // has no business deciding when `Metadata` is visible).
+    env.spawn_task(meta_apply_loop(
+        env.clone(),
+        Arc::clone(&core),
+        engine,
+        cache,
+        engine_applied,
+        watch,
+        Arc::clone(&wal_lock),
+    ));
 
     loop {
         // Persist anything queued out-of-band (e.g. a client `propose`).
-        flush_and_maybe_compact(&env, &core).await;
-        signal_metadata_watch(&core, &watch);
+        persist_wal(&env, &core, &wal_lock).await;
 
         let now = env.now();
         let deadline = core.lock().expect("raft core poisoned").next_deadline();
@@ -617,12 +637,12 @@ async fn drive<E: Env>(
         // Durability before action: persist (and fsync) the core's state changes
         // before sending the responses that depend on them (a granted vote, an
         // acknowledged append). This is also where a *leader's* durable-gated
-        // apply actually advances (`mark_durable_through`, inside `flush_wal`);
-        // a follower may have already applied on commit inside `handle` above
-        // (no durability gate there) — either way, `last_applied` here reflects
-        // everything this iteration could have made client-visible.
-        flush_and_maybe_compact(&env, &core).await;
-        signal_metadata_watch(&core, &watch);
+        // apply frontier (`last_applied`) actually advances
+        // (`mark_durable_through`, inside `persist_wal`) — the apply task picks
+        // up whatever that makes newly `drain_apply`-able on its own schedule;
+        // a follower may have already advanced it on commit inside `handle`
+        // above (no durability gate there).
+        persist_wal(&env, &core, &wal_lock).await;
 
         for (to, msg) in outs {
             let bytes = serde_json::to_vec(&msg).expect("raft message serializes");
@@ -631,119 +651,277 @@ async fn drive<E: Env>(
     }
 }
 
-/// How often [`mirror_loop`] drains newly in-core-applied commands and
-/// merge-batches their derived system-keyspace writes into the attached
-/// engine (ADR 0038 PR2, shadow mode). A plain fixed timer, not a
-/// `metadata_watch()`-driven wake: simplest-thing-that-works for a
-/// shadow-mode mirror with no reader yet: a real consumer (PR3's cutover)
-/// would want the tighter wake-on-apply latency `metadata_watch` gives the
-/// per-node tablet-host reconciler (ADR 0031); until then, a short poll
-/// bounds mirror lag without adding a second wake seam to `RaftCore` this PR
-/// doesn't otherwise need. Short relative to [`RECONCILE_INTERVAL`] — control
-/// metadata commands are rare (schema DDL, membership, split/merge/reconcile
-/// CASes) compared to the data plane's own per-write traffic, which never
-/// touches this loop at all.
-const MIRROR_INTERVAL: Duration = Duration::from_millis(50);
-
-/// The shadow-mode system-keyspace mirror driver (ADR 0038 PR2), spawned by
-/// [`RaftNode::start_with_mirror`]. Owns a private `Metadata` cache
-/// (`shadow`) it advances by re-deriving each newly in-core-applied command
-/// through [`mirror::apply_and_derive_mirror`] — deliberately **not** shared
-/// with the real `RaftCore`'s own `Metadata` (that stays exactly as it is
-/// today; this task only *observes* what was applied, via
-/// [`RaftCore::drain_mirror_log`]). Since `Metadata::apply` is a pure,
-/// deterministic function of state + command, and `shadow` starts from
-/// whatever `mirror_engine` already durably holds (empty on a fresh engine,
-/// a prior run's content after a restart) via
-/// [`mirror::rebuild_metadata_from_engine`], replaying the identical command
-/// sequence keeps `shadow` byte-identical to the real `Metadata` at every
-/// index — the property the differential-oracle test asserts directly.
-///
-/// Engine writes use [`StorageEngine::merge_batch`] (per-key LWW, versioned
-/// at each command's own Raft log index), never `write_batch`/`put` (which
-/// enforce a single **engine-wide** monotonic version) — a combined node's
-/// mirror shares its engine with the CP data plane's own, independently
-/// versioned writes, and `merge_batch` is the same write primitive that data
-/// plane's own leaderful-Raft apply path already uses for exactly this
-/// reason (see [`animus_storage::StorageEngine::merge_batch`]'s doc). This
-/// keeps engine I/O off `drive`'s own loop (a genuinely separate spawned
-/// task, not inline in consensus message handling) even though it is not yet
-/// the full apply-task split PR3 will do — see the PR2 report's
-/// inline-vs-offloaded measurement.
-async fn mirror_loop<E: Env, S: StorageEngine>(
+/// The per-node **apply task** (ADR 0038 PR3): repeatedly install any received
+/// `InstallSnapshot` image, apply committed-and-durable `MetaCommand`s to this
+/// task's own privately-owned `Metadata` (via the real, unchanged
+/// [`Metadata::apply`], through [`mirror::apply_and_derive_mirror`] so the
+/// derived system-keyspace writes ride the same pass), publish the refreshed
+/// state into `cache`, and compact — all off the consensus loop (`drive`), so
+/// this slow work never delays Raft message/heartbeat processing (the
+/// `animus-cp-data` driver-liveness fix, ADR 0017). Backs off by
+/// [`APPLY_IDLE_POLL`] only when idle; under load it stays in lockstep behind
+/// commit. Mirrors `animus-cp-data`'s `apply_loop`/`apply_and_compact` split
+/// exactly, retargeted at the system keyspace instead of a per-tablet range.
+async fn meta_apply_loop<E: Env, S: StorageEngine>(
     env: E,
     core: Arc<Mutex<RaftCore>>,
-    mirror_engine: S,
+    engine: S,
+    cache: Arc<Mutex<Metadata>>,
+    engine_applied: Arc<AtomicU64>,
+    watch: MetadataWatch,
+    wal_lock: Arc<AsyncMutex<()>>,
 ) {
-    // Belt-and-braces only: `start_with_mirror` already enables capture
-    // *synchronously* before this task (or `drive`) ever gets a first poll —
-    // see its doc's race note. Idempotent, so calling it again here is free.
-    core.lock()
-        .expect("raft core poisoned")
-        .enable_mirror_capture();
-    let mut shadow = mirror::rebuild_metadata_from_engine(&mirror_engine)
+    // Rebuild this task's own owned `Metadata` from whatever the engine
+    // already durably holds (empty on a fresh engine; a prior run's content
+    // after a restart) and seed `engine_applied` from the engine's own
+    // persisted watermark — **not** `core.last_applied()`, which after a WAL
+    // recovery only reflects the snapshot base and can understate what the
+    // engine already has (compaction only truncates the log periodically;
+    // the engine watermark advances every apply pass). Reading the true
+    // watermark here is what lets the loop below replay only the log tail
+    // beyond it, instead of re-deriving writes for commands the engine
+    // already durably reflects (ADR 0038 PR3's restart-recovery contract).
+    let mut shadow = mirror::rebuild_metadata_from_engine(&engine)
         .await
         .expect("system-keyspace engine scan (rebuild)");
-    let mut watermark = mirror_engine
+    let mut watermark = engine
         .get(&syskv::applied_index_key())
         .await
         .expect("system-keyspace engine read (watermark)")
         .map(|v| decode_watermark(&v.value))
         .unwrap_or(0);
+    *cache.lock().expect("cache poisoned") = shadow.clone();
+    engine_applied.store(watermark, Ordering::SeqCst);
+    // A restart can recover already-applied state; a watcher parked before
+    // this task's first loop iteration should see it too.
+    watch.bump(watermark);
+
     loop {
-        env.sleep(MIRROR_INTERVAL).await;
-        let drained = core.lock().expect("raft core poisoned").drain_mirror_log();
-        if drained.is_empty() {
+        let did_work = meta_apply_and_compact(
+            &env,
+            &core,
+            &engine,
+            &cache,
+            &engine_applied,
+            &watch,
+            &wal_lock,
+            &mut shadow,
+            &mut watermark,
+        )
+        .await;
+        if !did_work {
+            env.sleep(APPLY_IDLE_POLL).await;
+        }
+    }
+}
+
+/// Install a fully-received snapshot image, apply the committed-and-durable
+/// `MetaCommand` tail beyond `*watermark`, publish `cache`, and compact once
+/// the engine has merged enough past the snapshot base. Returns whether it
+/// did any work (so the caller backs off only when idle). Mirrors
+/// `animus-cp-data::apply_and_compact`'s shape/ordering precisely.
+#[allow(clippy::too_many_arguments)]
+async fn meta_apply_and_compact<E: Env, S: StorageEngine>(
+    env: &E,
+    core: &Arc<Mutex<RaftCore>>,
+    engine: &S,
+    cache: &Arc<Mutex<Metadata>>,
+    engine_applied: &Arc<AtomicU64>,
+    watch: &MetadataWatch,
+    wal_lock: &AsyncMutex<()>,
+    shadow: &mut Metadata,
+    watermark: &mut u64,
+) -> bool {
+    let mut did_work = false;
+
+    // Install a fully-received snapshot (a follower catching up) into the
+    // engine *before* applying log-tail effects, so the tail merges on top —
+    // then rebuild `shadow`/`cache` from the now-current engine rather than
+    // replaying, since an installed image can jump the base arbitrarily far
+    // ahead of whatever `shadow` reflected.
+    let pending_install = core
+        .lock()
+        .expect("raft core poisoned")
+        .drain_pending_install();
+    if let Some((last_index, bytes)) = pending_install {
+        install_syskv_image(engine, &bytes).await;
+        *shadow = mirror::rebuild_metadata_from_engine(engine)
+            .await
+            .expect("system-keyspace engine scan (post-install rebuild)");
+        *watermark = last_index;
+        *cache.lock().expect("cache poisoned") = shadow.clone();
+        engine_applied.fetch_max(last_index, Ordering::SeqCst);
+        watch.bump(last_index);
+        did_work = true;
+    }
+
+    // Apply the now-durable committed commands in commit order, skipping any
+    // whose index the engine already durably reflects (a post-restart tail
+    // replay can redeliver commands the engine caught before the last
+    // compaction — see `meta_apply_loop`'s doc). Every `MetaCommand` variant
+    // has an explicit, exhaustively-matched mirror derivation
+    // (`mirror::apply_and_derive_mirror`), so this never silently
+    // double-applies a non-idempotent decision onto `shadow`.
+    let effects = core.lock().expect("raft core poisoned").drain_apply();
+    let mut ops = Vec::new();
+    let mut max_index = *watermark;
+    for (index, command) in effects {
+        if index <= *watermark {
             continue;
         }
-        let mut ops = Vec::new();
-        for (index, command) in drained {
-            let (_, writes) = mirror::apply_and_derive_mirror(&mut shadow, &command);
-            for write in writes {
-                ops.push(match write {
-                    KeyWrite::Put(key, value) => MergeOp::put(key, value, index),
-                    KeyWrite::Delete(key) => MergeOp::tombstone(key, index),
-                });
-            }
-            watermark = watermark.max(index);
+        did_work = true;
+        let (_, writes) = mirror::apply_and_derive_mirror(shadow, &command);
+        for write in writes {
+            ops.push(match write {
+                KeyWrite::Put(key, value) => MergeOp::put(key, value, index),
+                KeyWrite::Delete(key) => MergeOp::tombstone(key, index),
+            });
         }
-        // The `_applied_index` watermark rides the same batch, at the batch's
-        // own highest index — mirrors `animus-cp-data`'s `engine_applied_index`
-        // (ADR 0038's design doc), so a restart's rebuild (above) plus this
-        // value is enough to know how far the mirror had gotten without
-        // needing to inspect the raw Raft log/WAL at all.
+        max_index = index;
+    }
+    if max_index > *watermark {
+        // The watermark rides the same batch, at the batch's own highest
+        // index (mirrors `animus-cp-data`'s `engine_applied_index`), so a
+        // restart's rebuild plus this key is enough to resume without
+        // inspecting the raw Raft log/WAL at all.
         ops.push(MergeOp::put(
             syskv::applied_index_key(),
-            watermark.to_be_bytes().to_vec(),
-            watermark,
+            max_index.to_be_bytes().to_vec(),
+            max_index,
         ));
-        mirror_engine
+        engine
             .merge_batch(ops)
             .await
-            .expect("system-keyspace mirror write");
+            .expect("system-keyspace apply write");
+        *watermark = max_index;
+        *cache.lock().expect("cache poisoned") = shadow.clone();
+        engine_applied.fetch_max(max_index, Ordering::SeqCst);
+        watch.bump(max_index);
     }
+
+    // Compact once the *engine* has merged enough past the snapshot base:
+    // truncate the Raft log prefix and rewrite the WAL to its bounded image
+    // (ADR 0017 A.2 / ADR 0038 PR3). Gated on `engine_applied`, not the
+    // core's own `last_applied` (which this task lags), so the truncated log
+    // prefix never runs past what the engine actually contains. This task is
+    // the engine's only writer, so nothing merges between reading `ea` and
+    // snapshotting below.
+    //
+    // The image is built **lazily, on demand** (mirrors
+    // `animus-cp-data`): the core raises `take_snapshot_needed` only when its
+    // replication path actually needs to ship an `InstallSnapshot` chunk and
+    // has no image; this pass then scans the engine once, re-bases the
+    // snapshot to exactly what that image reflects (`snapshot_upto(ea)`
+    // *before* `set_snapshot_blob`, so base and image agree), and installs
+    // it.
+    let ea = engine_applied.load(Ordering::SeqCst);
+    let (behind, image_needed) = {
+        let mut c = core.lock().expect("raft core poisoned");
+        (
+            ea.saturating_sub(c.snapshot_index()),
+            c.take_snapshot_needed(),
+        )
+    };
+    if behind >= SNAPSHOT_THRESHOLD || image_needed {
+        let image = if image_needed {
+            Some(syskv_image(engine).await)
+        } else {
+            None
+        };
+        // Serialize the WAL rewrite against the consensus loop's appends —
+        // both tasks write the same file.
+        let _wal = wal_lock.lock().await;
+        let (bytes, lli) = {
+            let mut c = core.lock().expect("raft core poisoned");
+            c.snapshot_upto(ea);
+            if let Some(image) = image {
+                c.set_snapshot_blob(image);
+            }
+            if !c.take_snapshot_dirty() {
+                (None, 0)
+            } else {
+                let lli = c.last_log_index();
+                let mut buf = Vec::new();
+                for record in c.wal_image() {
+                    buf.extend(PersistedState::encode_record(&record));
+                }
+                // The rewrite below makes the whole current log durable, so
+                // the consensus loop's own accumulated pending append
+                // records are now redundant (`replay` is push-based —
+                // re-appending them would duplicate entries).
+                let _ = c.drain_persist();
+                (Some(buf), lli)
+            }
+        };
+        if let Some(bytes) = bytes {
+            env.replace(WAL, &bytes).await.expect("wal compaction");
+            core.lock()
+                .expect("raft core poisoned")
+                .mark_durable_through(lli);
+        }
+        did_work = true;
+    }
+
+    did_work
+}
+
+/// Build the system-keyspace image shipped to a lagging follower via
+/// `InstallSnapshot` (ADR 0038 PR3): every live `(key, value-or-tombstone,
+/// version)` under [`syskv::RESERVED_NAMESPACE`] — tombstones are carried
+/// (not just omitted) so a receiver applying this via `merge_batch` correctly
+/// overwrites any stale value it might already hold from an earlier,
+/// incomplete transfer. Filtering by [`syskv::decode_key`] matters only on a
+/// **combined** node, whose engine is shared with the CP data plane's own,
+/// differently-keyed entries.
+async fn syskv_image<S: StorageEngine>(engine: &S) -> Vec<u8> {
+    let entries: Vec<(Vec<u8>, Option<Vec<u8>>, u64)> = engine
+        .entries_with_tombstones()
+        .await
+        .expect("system-keyspace engine scan (image)")
+        .into_iter()
+        .filter(|(key, _, _)| syskv::decode_key(key).is_some())
+        .collect();
+    serde_json::to_vec(&entries).expect("system-keyspace image serializes")
+}
+
+/// Write a received system-keyspace image into the engine (a follower
+/// catching up via `InstallSnapshot`), the dual of [`syskv_image`]. Logs a
+/// warning and drops the image on an undecodable payload rather than
+/// panicking — mirrors `animus-cp-data::install_engine_image`'s treatment of
+/// a corrupt wire image.
+async fn install_syskv_image<S: StorageEngine>(engine: &S, bytes: &[u8]) {
+    let entries: Vec<(Vec<u8>, Option<Vec<u8>>, u64)> = match serde_json::from_slice(bytes) {
+        Ok(e) => e,
+        Err(err) => {
+            tracing::warn!(?err, "undecodable system-keyspace snapshot image dropped");
+            return;
+        }
+    };
+    if entries.is_empty() {
+        return;
+    }
+    let ops = entries
+        .into_iter()
+        .map(|(key, value, version)| match value {
+            Some(v) => MergeOp::put(key, v, version),
+            None => MergeOp::tombstone(key, version),
+        })
+        .collect();
+    engine
+        .merge_batch(ops)
+        .await
+        .expect("system-keyspace image install");
 }
 
 /// Decode an 8-byte big-endian `u64` watermark value (the same encoding
 /// [`syskv::applied_index_key`]'s value uses). Panics on a malformed value —
-/// this loop is the only writer of this key, so a mismatch is an internal
-/// bug.
+/// the apply task is the only writer of this key, so a mismatch is an
+/// internal bug.
 fn decode_watermark(bytes: &[u8]) -> u64 {
     let array: [u8; 8] = bytes
         .try_into()
         .expect("applied-index watermark is exactly 8 bytes");
     u64::from_be_bytes(array)
-}
-
-/// Notify any `metadata_watch()` waiter if the core's applied index has moved
-/// since it last observed one (ADR 0031). Cheap (one lock, one `fetch_max`);
-/// call this every time the driver's own actions could have advanced
-/// client-visible state — `bump` itself is a no-op (no wake) when nothing
-/// actually changed, so calling it defensively at multiple points in the loop
-/// costs nothing extra on the common "nothing changed" iteration.
-fn signal_metadata_watch(core: &Arc<Mutex<RaftCore>>, watch: &MetadataWatch) {
-    let applied = core.lock().expect("raft core poisoned").last_applied();
-    watch.bump(applied);
 }
 
 /// Record the metrics implied by the messages the core just emitted (ADR 0015):
@@ -823,23 +1001,23 @@ fn record_transition(
 /// this tick* (violation repair always wins), it proposes a single
 /// balance-improving move so a grown cluster spreads its existing tablets onto new
 /// members — something the pin-survivors reconciler never does on its own.
-async fn reconcile_loop<E: Env>(env: E, core: Arc<Mutex<RaftCore>>) {
+async fn reconcile_loop<E: Env>(env: E, core: Arc<Mutex<RaftCore>>, cache: Arc<Mutex<Metadata>>) {
     let mut tick: u64 = 0;
     loop {
         env.sleep(RECONCILE_INTERVAL).await;
         tick = tick.wrapping_add(1);
-        // Clone only the placement-relevant view under the lock (members +
-        // tablets + policies — not the schema catalog or the CP address book,
-        // which dominate a grown `Metadata`), and run the pure decision *off*
-        // the lock, so a big catalog never turns this background tick into a
-        // full-blob clone on the consensus mutex every 500ms (clone-churn fix).
-        let view = {
-            let core = core.lock().expect("raft core poisoned");
-            if !core.is_leader() {
-                continue;
-            }
-            core.placement_view()
-        };
+        // Leadership is a consensus-level fact (unaffected by ADR 0038 PR3),
+        // still read off the core; the placement *view* now comes from the
+        // apply task's published cache. Clone only the placement-relevant
+        // view (members + tablets + policies — not the schema catalog or the
+        // CP address book, which dominate a grown `Metadata`), and run the
+        // pure decision *off* the lock, so a big catalog never turns this
+        // background tick into a full-blob clone every 500ms (clone-churn
+        // fix).
+        if !core.lock().expect("raft core poisoned").is_leader() {
+            continue;
+        }
+        let view = cache.lock().expect("cache poisoned").placement_view();
         let proposals = view.reconcile();
         let repaired = !proposals.is_empty();
         for command in proposals {
@@ -911,6 +1089,7 @@ async fn reconcile_loop<E: Env>(env: E, core: Arc<Mutex<RaftCore>>) {
 async fn detect_loop<E: Env>(
     env: E,
     core: Arc<Mutex<RaftCore>>,
+    cache: Arc<Mutex<Metadata>>,
     detector: Arc<Mutex<FailureDetector>>,
     metrics: MetricsHandle,
 ) {
@@ -921,31 +1100,30 @@ async fn detect_loop<E: Env>(
     loop {
         env.sleep(DETECT_INTERVAL).await;
         let now = env.now();
-        // Under the core lock take only what the decision needs: leadership +
-        // term and a clone of the **membership map** — never the whole
-        // `Metadata` (this loop ticks every 100ms; cloning the full blob,
-        // schema catalog included, under the consensus mutex was the
-        // clone-churn hot spot).
-        let allow_down;
-        let members = {
+        // Leadership/term are consensus-level facts, still read off the core
+        // (unaffected by ADR 0038 PR3); the **membership map** now comes from
+        // the apply task's published cache — never the whole `Metadata` (this
+        // loop ticks every 100ms; cloning the full blob, schema catalog
+        // included, was the clone-churn hot spot).
+        let term_now = {
             let core = core.lock().expect("raft core poisoned");
             if !core.is_leader() {
                 leader_since = None;
                 continue;
             }
-            let term = core.term();
-            // Re-arm the grace on a fresh leadership or a new term.
-            let since = match leader_since {
-                Some((t, since)) if t == term => since,
-                _ => {
-                    leader_since = Some((term, now));
-                    now
-                }
-            };
-            // Suppress `Down` until the cold detector has had a heartbeat round.
-            allow_down = now.duration_since(since) >= LEADER_GRACE;
-            core.members()
+            core.term()
         };
+        // Re-arm the grace on a fresh leadership or a new term.
+        let since = match leader_since {
+            Some((t, since)) if t == term_now => since,
+            _ => {
+                leader_since = Some((term_now, now));
+                now
+            }
+        };
+        // Suppress `Down` until the cold detector has had a heartbeat round.
+        let allow_down = now.duration_since(since) >= LEADER_GRACE;
+        let members = cache.lock().expect("cache poisoned").members.clone();
         // Decommission cleanup (ADR 0032 PR3): a member `RemoveMember` already
         // pruned from `members` should stop being tracked too — otherwise
         // `last_seen` grows unboundedly across a cluster's lifetime, and a
@@ -1066,36 +1244,21 @@ fn transition(node: NodeId, member: &Member, status: NodeStatus) -> MetaCommand 
     }
 }
 
-/// Flush pending records, then rewrite the WAL to its compact image when needed:
-/// either a snapshot base moved (a local snapshot or an installed one — which
-/// must be materialized as a full rewrite before we act on it), or enough
-/// applied entries have accumulated that we take a threshold snapshot (which
-/// truncates the covered log prefix) and rewrite.
-async fn flush_and_maybe_compact<E: Env>(env: &E, core: &Arc<Mutex<RaftCore>>) {
-    flush_wal(env, core).await;
-
-    let (mut rewrite, behind) = {
-        let mut core = core.lock().expect("raft core poisoned");
-        (core.take_snapshot_dirty(), core.applied_since_snapshot())
-    };
-    if behind >= SNAPSHOT_THRESHOLD {
-        core.lock().expect("raft core poisoned").snapshot();
-        rewrite = true;
-    }
-    if rewrite {
-        compact_wal(env, core).await;
-        // Clear the dirty flag `snapshot()` may have just set — we are writing
-        // exactly that image now.
-        core.lock()
-            .expect("raft core poisoned")
-            .take_snapshot_dirty();
-    }
-}
-
 /// Append and `fsync` any pending durable-state records to the WAL, then advance
 /// the core's durable watermark so the now-on-disk entries become client-visible
 /// (durable-before-visible, ADR 0009). Returns how many records were written.
-async fn flush_wal<E: Env>(env: &E, core: &Arc<Mutex<RaftCore>>) -> usize {
+/// **Runs on the consensus loop only** (ADR 0038 PR3) and is deliberately
+/// cheap — engine apply and WAL *compaction* now run on the separate apply
+/// task ([`meta_apply_and_compact`]), so this stays responsive to Raft
+/// messages/heartbeats within the election timeout. Holds `wal_lock` so this
+/// append cannot interleave with the apply task's compaction rewrite of the
+/// same file.
+async fn persist_wal<E: Env>(
+    env: &E,
+    core: &Arc<Mutex<RaftCore>>,
+    wal_lock: &AsyncMutex<()>,
+) -> usize {
+    let _wal = wal_lock.lock().await;
     // Capture the log high-water under the same lock as the drain: after we sync
     // the drained records, every entry up to here is durable. Entries appended
     // after this point ride the next flush.
@@ -1119,18 +1282,6 @@ async fn flush_wal<E: Env>(env: &E, core: &Arc<Mutex<RaftCore>>) -> usize {
         .expect("raft core poisoned")
         .mark_durable_through(through);
     records.len()
-}
-
-/// Atomically rewrite the WAL to the core's compact image (latest checkpoint +
-/// hard state + current log). Safe because [`flush_wal`] has already persisted
-/// everything the image is built from.
-async fn compact_wal<E: Env>(env: &E, core: &Arc<Mutex<RaftCore>>) {
-    // `encoded_wal_image` reuses the cached `snapshot_blob` for the snapshot record,
-    // so the (potentially large) `Metadata` is serialized once per compaction (into
-    // the blob, by `snapshot()`), not a second time here — keeping the compaction's
-    // inline serialize on the driver loop bounded to a single pass.
-    let bytes = core.lock().expect("raft core poisoned").encoded_wal_image();
-    env.replace(WAL, &bytes).await.expect("wal compaction");
 }
 
 #[cfg(test)]
@@ -1231,5 +1382,171 @@ mod tests {
             det.forget(id);
         }
         assert!(!det.tracks(99));
+    }
+
+    // --- ADR 0038 PR3: the apply task's watermark-gated tail replay ---------
+    //
+    // These drive `meta_apply_and_compact` directly (white-box — it is not
+    // `pub`), so they don't need a real `RaftNode`/`Simulator` to pin the
+    // exact index a real restart's engine watermark would land on: they set
+    // it up by hand and assert precisely.
+
+    fn upsert(node: NodeId) -> MetaCommand {
+        MetaCommand::UpsertMember {
+            node,
+            labels: BTreeMap::new(),
+            status: NodeStatus::Active,
+        }
+    }
+
+    /// If the apply task's watermark already covers every committed-and-durable
+    /// command the core has buffered (as a restart's engine-rebuild can leave
+    /// it, if nothing committed after the crash), a pass does nothing: no
+    /// engine write, no cache publish, no watch bump. The boundary case for
+    /// the "skip anything the engine already durably reflects" rule ADR 0038
+    /// PR3's restart-recovery contract requires.
+    #[tokio::test]
+    async fn apply_and_compact_is_a_no_op_when_the_watermark_already_covers_everything() {
+        let sim = animus_sim::Simulator::new(0xF00D);
+        let env = sim.env(0);
+
+        let mut core = RaftCore::new(0, &[0], Nanos(0), 7);
+        core.tick(Nanos(1_000_000_000), 7); // sole leader; index 1 = election no-op
+        for i in 0..5u64 {
+            core.propose(upsert(i)); // indices 2..=6
+        }
+        core.mark_durable_through(core.last_log_index());
+        let last_applied = core.last_applied();
+        assert_eq!(last_applied, 6);
+
+        let core = Arc::new(Mutex::new(core));
+        let engine = animus_storage::MemoryEngine::new();
+        let cache = Arc::new(Mutex::new(Metadata::default()));
+        let engine_applied = Arc::new(AtomicU64::new(0));
+        let watch = MetadataWatch::default();
+        let wal_lock = Arc::new(AsyncMutex::new(()));
+        let mut shadow = Metadata::default();
+        // Pretend a restart's rebuild already caught the watermark up to
+        // cover every one of these commands.
+        let mut watermark = last_applied;
+
+        let did_work = meta_apply_and_compact(
+            &env,
+            &core,
+            &engine,
+            &cache,
+            &engine_applied,
+            &watch,
+            &wal_lock,
+            &mut shadow,
+            &mut watermark,
+        )
+        .await;
+
+        assert!(
+            !did_work,
+            "nothing to do: every drained command was already covered by the watermark"
+        );
+        assert_eq!(shadow, Metadata::default(), "shadow must not have advanced");
+        assert_eq!(
+            *cache.lock().expect("cache poisoned"),
+            Metadata::default(),
+            "cache must not have been (re)published"
+        );
+        assert_eq!(
+            engine_applied.load(Ordering::SeqCst),
+            0,
+            "engine_applied must not advance on a no-op pass"
+        );
+        assert!(
+            engine.entries().await.expect("engine scan").is_empty(),
+            "nothing should have been written to the engine"
+        );
+    }
+
+    /// The general case: the watermark covers only a *prefix* of what the
+    /// core has buffered (the realistic post-restart shape — a recovered
+    /// core's freshly-established commit frontier can run well past what the
+    /// engine had durably merged before the crash). Only the tail beyond the
+    /// watermark is derived/merged; the pre-seeded `shadow` (standing in for
+    /// a restart's `rebuild_metadata_from_engine`) plus that tail reaches the
+    /// same union the full command set would.
+    #[tokio::test]
+    async fn apply_and_compact_replays_only_the_tail_beyond_the_watermark() {
+        let sim = animus_sim::Simulator::new(0xF00D);
+        let env = sim.env(0);
+
+        let mut core = RaftCore::new(0, &[0], Nanos(0), 7);
+        core.tick(Nanos(1_000_000_000), 7); // index 1: leader no-op
+        for i in 0..5u64 {
+            core.propose(upsert(i)); // indices 2..=6
+        }
+        core.mark_durable_through(core.last_log_index());
+        let last_applied = core.last_applied();
+        assert_eq!(last_applied, 6);
+
+        let core = Arc::new(Mutex::new(core));
+        let engine = animus_storage::MemoryEngine::new();
+        let cache = Arc::new(Mutex::new(Metadata::default()));
+        let engine_applied = Arc::new(AtomicU64::new(0));
+        let watch = MetadataWatch::default();
+        let wal_lock = Arc::new(AsyncMutex::new(()));
+
+        // Simulate "the engine already durably reflects the no-op and the
+        // first two upserts" (members 0 and 1) — exactly what a genuine
+        // restart's `rebuild_metadata_from_engine` would have produced had
+        // the crash happened right there.
+        let mut shadow = Metadata::default();
+        let _ = mirror::apply_and_derive_mirror(&mut shadow, &MetaCommand::NoOp);
+        let _ = mirror::apply_and_derive_mirror(&mut shadow, &upsert(0));
+        let _ = mirror::apply_and_derive_mirror(&mut shadow, &upsert(1));
+        let mut watermark = 3; // covers indices 1..=3
+
+        let did_work = meta_apply_and_compact(
+            &env,
+            &core,
+            &engine,
+            &cache,
+            &engine_applied,
+            &watch,
+            &wal_lock,
+            &mut shadow,
+            &mut watermark,
+        )
+        .await;
+
+        assert!(did_work);
+        assert_eq!(
+            watermark, last_applied,
+            "watermark advances to the core's real frontier"
+        );
+        let published = cache.lock().expect("cache poisoned").clone();
+        assert_eq!(
+            published.members.len(),
+            5,
+            "the tail (members 2..4) merged on top of the pre-seeded state \
+             reaches the full union"
+        );
+        assert_eq!(
+            engine_applied.load(Ordering::SeqCst),
+            last_applied,
+            "engine_applied publishes the new watermark"
+        );
+        assert_eq!(
+            watch.latest(),
+            last_applied,
+            "a parked metadata_watch() waiter would see this advance"
+        );
+        // Only the tail (3 commands: indices 4, 5, 6) should have been
+        // written — not the whole 6-command history the core's drain
+        // returned (proving the `index <= watermark` entries were skipped,
+        // not silently re-derived/re-merged).
+        let engine_entries = engine.entries().await.expect("engine scan");
+        assert_eq!(
+            engine_entries.len(),
+            3 + 1, // 3 member upserts + the shared `_applied_index` watermark key
+            "expected exactly the tail's writes plus the watermark key, got {} entries",
+            engine_entries.len()
+        );
     }
 }

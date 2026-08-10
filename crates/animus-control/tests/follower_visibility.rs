@@ -12,14 +12,22 @@
 //! [`RaftCore`] follower vs. leader (precise control of the durable watermark),
 //! and end-to-end over a `SimEnv` `RaftNode` cluster (a follower reflects a
 //! leader's committed command).
+//!
+//! ADR 0038 PR3: `Metadata` is `DRIVER_APPLIED`, so a hand-driven `RaftCore` has
+//! no `metadata()` to read — "is this entry visible" is instead "does
+//! `drain_apply()` yield it", the exact same underlying frontier gate
+//! (`RaftCore::apply`'s role-aware `min(commit_index, durable_index)` on a
+//! leader / `commit_index` on a follower) just observed at its new drain
+//! point. See `persistence.rs`'s `drain_and_apply` idiom.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
 
 use animus_control::raft::{LogEntry, RaftMsg, Role};
-use animus_control::{MetaCommand, NodeStatus, RaftCore, RaftNode};
+use animus_control::{MetaCommand, Metadata, NodeStatus, RaftCore, RaftNode, mirror};
 use animus_env::Nanos;
 use animus_sim::{SimEnv, Simulator};
+use animus_storage::MemoryEngine;
 
 const NODES: [u64; 3] = [0, 1, 2];
 
@@ -31,10 +39,23 @@ fn upsert(node: u64) -> MetaCommand {
     }
 }
 
+/// Whether `core.drain_apply()` currently yields a command that upserts
+/// `node` — the DRIVER_APPLIED-era stand-in for "is this entry visible in
+/// `metadata()`". Applies whatever's drained onto a throwaway oracle so the
+/// check is a real `Metadata::apply`, not just an index comparison.
+fn drained_contains_member(core: &mut RaftCore, node: u64) -> bool {
+    let mut oracle = Metadata::default();
+    for (_, command) in core.drain_apply() {
+        let _ = mirror::apply_and_derive_mirror(&mut oracle, &command);
+    }
+    oracle.members.contains_key(&node)
+}
+
 /// A **follower** applies a committed entry on commit — *without* its own local
-/// fsync — so its `metadata()` reflects the entry even while `last_applied`
-/// would still be gated on `durable_index`. This is the cross-node
-/// read-visibility relaxation: a follower's reads track commit, not its own disk.
+/// fsync — so it becomes drainable via `drain_apply()` even while
+/// `last_applied` would still be gated on `durable_index` for a leader. This is
+/// the cross-node read-visibility relaxation: a follower's reads track commit,
+/// not its own disk.
 #[test]
 fn follower_applies_on_commit_without_its_own_fsync() {
     // A follower in term 1 that has not fsynced anything (durable_index == 0).
@@ -78,16 +99,16 @@ fn follower_applies_on_commit_without_its_own_fsync() {
         "a follower applies on commit, not gated on its own durable_index"
     );
     assert!(
-        follower.metadata().members.contains_key(&42),
-        "a committed entry is read-visible on a follower without its own fsync"
+        drained_contains_member(&mut follower, 42),
+        "a committed entry is applicable on a follower without its own fsync"
     );
 }
 
 /// A **leader** stays durability-gated: a freshly proposed command commits (sole
 /// quorum reasoning aside, single-node commits immediately) but does **not**
-/// become visible until the leader fsyncs it. This is the ack-path guarantee the
-/// refinement must preserve — proven here on a single-node group, exactly the
-/// shape of the `persistence.rs` regression.
+/// become applicable until the leader fsyncs it. This is the ack-path guarantee
+/// the refinement must preserve — proven here on a single-node group, exactly
+/// the shape of the `persistence.rs` regression.
 #[test]
 fn leader_stays_durability_gated_on_its_own_proposal() {
     let mut leader = RaftCore::new(0, &[0], Nanos(0), 7);
@@ -97,6 +118,7 @@ fn leader_stays_durability_gated_on_its_own_proposal() {
     let through = leader.last_log_index();
     let _ = leader.drain_persist();
     leader.mark_durable_through(through);
+    let _ = leader.drain_apply(); // drain the no-op away
 
     leader.propose(upsert(42));
     assert!(
@@ -104,17 +126,17 @@ fn leader_stays_durability_gated_on_its_own_proposal() {
         "single-node commit is immediate, but it is not yet fsynced"
     );
     assert!(
-        !leader.metadata().members.contains_key(&42),
+        !drained_contains_member(&mut leader, 42),
         "the leader must NOT expose its own committed-but-unsynced proposal"
     );
 
-    // Fsync: only now is it visible (the ack-path durable-before-visible rule).
+    // Fsync: only now is it applicable (the ack-path durable-before-visible rule).
     let through = leader.last_log_index();
     let _ = leader.drain_persist();
     leader.mark_durable_through(through);
     assert!(
-        leader.metadata().members.contains_key(&42),
-        "after the fsync the leader's proposal is durable and visible"
+        drained_contains_member(&mut leader, 42),
+        "after the fsync the leader's proposal is durable and applicable"
     );
 }
 
@@ -182,8 +204,9 @@ fn follower_to_leader_keeps_applied_then_gates_new_proposals() {
 
     // The previously-applied entry is retained (last_applied did not regress),
     // even though durable_index is still 0 < commit_index.
+    let new_proposal_index = node.last_log_index();
     assert!(
-        node.metadata().members.contains_key(&42),
+        drained_contains_member(&mut node, 42),
         "a committed entry applied as a follower survives the role change"
     );
     assert!(
@@ -193,7 +216,6 @@ fn follower_to_leader_keeps_applied_then_gates_new_proposals() {
 
     // The leader's own new no-op (appended on becoming leader) is NOT visible
     // until the leader fsyncs it: new leader proposals stay durability-gated.
-    let new_proposal_index = node.last_log_index();
     assert!(
         new_proposal_index > node.durable_index(),
         "the leader's own fresh entry is ahead of its durable frontier"
@@ -204,7 +226,7 @@ fn cluster(seed: u64) -> (Simulator, Vec<RaftNode<SimEnv>>) {
     let sim = Simulator::new(seed);
     let nodes = NODES
         .iter()
-        .map(|&id| RaftNode::start(sim.env(id), NODES.to_vec()))
+        .map(|&id| RaftNode::start(sim.env(id), NODES.to_vec(), MemoryEngine::new()))
         .collect();
     (sim, nodes)
 }
@@ -216,9 +238,10 @@ fn unique_leader(nodes: &[RaftNode<SimEnv>], seed: u64) -> usize {
 }
 
 /// End-to-end over a `SimEnv` cluster: a leader's committed `MetaCommand` becomes
-/// read-visible on **both followers** (their `metadata()` reflects it). The
-/// follower path applies on commit — the realistic confirmation of the
-/// relaxation, on top of the precise hand-driven core tests above.
+/// read-visible on **both followers** (their `metadata()` reflects it, once the
+/// apply task on each node has caught up). The follower path applies on commit
+/// — the realistic confirmation of the relaxation, on top of the precise
+/// hand-driven core tests above.
 #[test]
 fn followers_reflect_a_committed_command() {
     let seed = 0xF0_110E5;

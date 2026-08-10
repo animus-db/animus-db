@@ -143,6 +143,9 @@ truth; this map is just for navigation.
   (ADR 0013); `metadata_watch()` change notification (ADR 0031); the control
   group itself can grow/shrink/replace voters **at runtime** via
   `change_membership`/`transfer_leadership` + an admin API/CLI (ADR 0037).
+  `Metadata` is itself `DRIVER_APPLIED` (ADR 0038): a per-node async apply
+  task, not the sync core, owns it and durably mirrors it into a per-node
+  system-keyspace `StorageEngine`.
 - **CP data plane** — `animus-cp-data` (ADR 0016, 0017). Each tablet is its own
   Raft group with a single leader serving **linearizable** single-tablet
   reads/writes/scans, durable on a real `StorageEngine`; reuses the control

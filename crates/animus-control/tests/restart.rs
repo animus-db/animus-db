@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use animus_control::{MetaCommand, NodeStatus, RaftNode};
 use animus_sim::{SimEnv, Simulator};
+use animus_storage::MemoryEngine;
 
 const NODES: [u64; 3] = [0, 1, 2];
 
@@ -28,9 +29,15 @@ fn node_restarts_from_its_disk_and_rejoins() {
     let seed = 0x4E57;
     let sim = Simulator::new(seed);
     let mut sim = sim;
+    // One system-keyspace engine per node, created once and kept alive across
+    // the restart below — `MemoryEngine` clones share state (like a real
+    // node's on-disk engine surviving a process restart), so re-cloning the
+    // *same* handle at restart is what actually exercises "the engine
+    // durably survives", not a fresh, empty one (ADR 0038 PR3).
+    let engines: Vec<MemoryEngine> = NODES.iter().map(|_| MemoryEngine::new()).collect();
     let mut nodes: Vec<RaftNode<SimEnv>> = NODES
         .iter()
-        .map(|&id| RaftNode::start(sim.env(id), NODES.to_vec()))
+        .map(|&id| RaftNode::start(sim.env(id), NODES.to_vec(), engines[id as usize].clone()))
         .collect();
 
     sim.run_for(Duration::from_secs(2));
@@ -59,8 +66,13 @@ fn node_restarts_from_its_disk_and_rejoins() {
     }
     sim.run_for(Duration::from_secs(2));
 
-    // Start a fresh node on the same node id / disk — it recovers from the WAL.
-    nodes[follower] = RaftNode::start(sim.env(follower as u64), NODES.to_vec());
+    // Start a fresh node on the same node id / disk — it recovers from the WAL
+    // *and* the same (durable) engine, exactly like a real restart.
+    nodes[follower] = RaftNode::start(
+        sim.env(follower as u64),
+        NODES.to_vec(),
+        engines[follower].clone(),
+    );
     sim.run_for(Duration::from_secs(3));
 
     // It rejoined and converged, including the writes made during its downtime.

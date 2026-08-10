@@ -30,6 +30,7 @@ use animus_control::{MetaCommand, Metadata, NodeStatus, RaftNode};
 use animus_env::EnvExt;
 use animus_placement::PlacementPolicy;
 use animus_sim::{SimEnv, Simulator};
+use animus_storage::MemoryEngine;
 use animus_tablet::{KeyRange, TabletId};
 
 const CONTROL: [u64; 3] = [0, 1, 2];
@@ -51,7 +52,7 @@ fn cluster(seed: u64) -> (Simulator, Vec<RaftNode<SimEnv>>) {
     let sim = Simulator::new(seed);
     let nodes = CONTROL
         .iter()
-        .map(|&id| RaftNode::start(sim.env(id), CONTROL.to_vec()))
+        .map(|&id| RaftNode::start(sim.env(id), CONTROL.to_vec(), MemoryEngine::new()))
         .collect();
     // Every data node heartbeats the control group — see this file's doc.
     for (id, _, _) in DATA_NODES {
