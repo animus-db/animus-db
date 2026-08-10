@@ -7,13 +7,20 @@
 //! support module (same shape as `tests/common/mod.rs` elsewhere).
 #![allow(dead_code)]
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use animusd::config::NodeRole;
 use animusd::{ClusterConfig, Node, RoleAddrs, StorageBackend};
 use tokio::time::{sleep, timeout};
+
+/// Default wall-clock deadline for the `*_deadline` join/bring-up helpers
+/// below — generous enough that a genuinely broken join still fails loudly,
+/// while riding out the transient port-TOCTOU-under-`--workspace`-contention
+/// window that a fixed attempt count could exhaust (see each helper's doc).
+pub const JOIN_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Reserve `count` free loopback ports (bind :0, read addr, release the
 /// listener). This is itself the source of the documented port-TOCTOU: the
@@ -91,6 +98,307 @@ pub async fn restart_same_addrs(
                     "restart on the same dir/addresses did not rebind: {e}"
                 );
                 tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
+}
+
+/// Bring up a combined-mode `n`-node core, one process per node, retrying the
+/// (allocate-fresh-ports + start-all) as a unit against a wall-clock
+/// `deadline` rather than a fixed attempt count — same shape as
+/// [`restart_same_addrs`], generalized from a fixed 16-attempt/50ms retry
+/// (duplicated near-verbatim across `decommission.rs`, `seed_join.rs`,
+/// `seed_join_allocated.rs`, and `cluster_growth.rs`) that could exhaust
+/// under `cargo test --workspace`-level port-TOCTOU contention while the
+/// churn was still transient.
+pub async fn bring_up_deadline(
+    n: usize,
+    dir: &Path,
+    deadline: Duration,
+) -> (Vec<Node>, ClusterConfig) {
+    let hard_deadline = tokio::time::Instant::now() + deadline;
+    let mut attempt: u64 = 0;
+    loop {
+        let addrs = free_addrs(n * 6);
+        let nodes_cfg: Vec<RoleAddrs> = (0..n)
+            .map(|i| RoleAddrs {
+                role: NodeRole::Both,
+                control: Some(addrs[6 * i]),
+                client: addrs[6 * i + 1],
+                dynamo: addrs[6 * i + 2],
+                cql: addrs[6 * i + 3],
+                raftkv: Some(addrs[6 * i + 4]),
+                admin: addrs[6 * i + 5],
+            })
+            .collect();
+        let config = ClusterConfig { nodes: nodes_cfg };
+        let mut nodes = Vec::new();
+        let mut failed = false;
+        for i in 0..n {
+            match animusd::run_node(&config, i, dir.join(format!("core-{attempt}-{i}"))).await {
+                Ok(node) => nodes.push(node),
+                Err(_) => {
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        if !failed {
+            return (nodes, config);
+        }
+        for node in &nodes {
+            node.shutdown();
+        }
+        assert!(
+            tokio::time::Instant::now() < hard_deadline,
+            "could not bring up the initial {n}-node cluster within {deadline:?}"
+        );
+        sleep(Duration::from_millis(50)).await;
+        attempt += 1;
+    }
+}
+
+/// Grow `base` by `extra` control-plane-follower-less nodes (ADR 0030) via
+/// `run_node_growth`, retrying the new nodes' freshly-allocated ports as a
+/// unit against a wall-clock `deadline` — the `grow`-loop counterpart of
+/// [`bring_up_deadline`] (`cluster_growth.rs`'s own fixed-16-attempt loop).
+/// The original nodes in `base` are never touched.
+pub async fn grow_deadline(
+    base: &ClusterConfig,
+    extra: usize,
+    dir: &Path,
+    deadline: Duration,
+) -> (Vec<Node>, ClusterConfig) {
+    let original_control_ids = base.control_ids();
+    let base_n = base.nodes.len();
+    let hard_deadline = tokio::time::Instant::now() + deadline;
+    let mut attempt: u64 = 0;
+    loop {
+        let addrs = free_addrs(extra * 6);
+        let mut nodes_cfg = base.nodes.clone();
+        for i in 0..extra {
+            nodes_cfg.push(RoleAddrs {
+                role: NodeRole::Both,
+                control: Some(addrs[6 * i]),
+                client: addrs[6 * i + 1],
+                dynamo: addrs[6 * i + 2],
+                cql: addrs[6 * i + 3],
+                raftkv: Some(addrs[6 * i + 4]),
+                admin: addrs[6 * i + 5],
+            });
+        }
+        let expanded = ClusterConfig { nodes: nodes_cfg };
+        let mut nodes = Vec::new();
+        let mut failed = false;
+        for i in 0..extra {
+            match animusd::run_node_growth(
+                &expanded,
+                base_n + i,
+                original_control_ids.clone(),
+                dir.join(format!("grow-{attempt}-{i}")),
+                StorageBackend::default(),
+            )
+            .await
+            {
+                Ok(node) => nodes.push(node),
+                Err(_) => {
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        if !failed {
+            return (nodes, expanded);
+        }
+        for node in &nodes {
+            node.shutdown();
+        }
+        assert!(
+            tokio::time::Instant::now() < hard_deadline,
+            "could not grow the cluster by {extra} node(s) within {deadline:?}"
+        );
+        sleep(Duration::from_millis(50)).await;
+        attempt += 1;
+    }
+}
+
+/// Join a fresh **combined-mode**, index-addressed node against `seeds` via
+/// `run_node_join`, retrying the (allocate-ports + join) as a unit against a
+/// wall-clock `deadline` rather than a fixed attempt count. Generalized from
+/// the identical fixed-16-attempt/50ms helper duplicated in `decommission.rs`
+/// and `seed_join.rs`: under `cargo test --workspace`-level port-TOCTOU
+/// contention, 16 attempts (0.8s total) could exhaust while the port churn
+/// was still transient, surfacing as a spurious "could not join node N"
+/// panic rather than a real join bug. Trade-off (same as
+/// [`restart_same_addrs`]): a genuinely-broken join now takes up to
+/// `deadline` to report instead of failing in under a second.
+///
+/// Returns the node, the addresses it actually bound, and the data dir it
+/// used (a caller that needs to rejoin at the exact same addresses/dir, e.g.
+/// `seed_join.rs`'s rejoin test, needs all three).
+pub async fn join_fresh_deadline(
+    seeds: &[SocketAddr],
+    index: usize,
+    dir: &Path,
+    backend: StorageBackend,
+    deadline: Duration,
+) -> (Node, RoleAddrs, PathBuf) {
+    let hard_deadline = tokio::time::Instant::now() + deadline;
+    let mut attempt: u64 = 0;
+    loop {
+        let raw = free_addrs(6);
+        let addrs = RoleAddrs {
+            role: NodeRole::Both,
+            control: Some(raw[0]),
+            client: raw[1],
+            dynamo: raw[2],
+            cql: raw[3],
+            raftkv: Some(raw[4]),
+            admin: raw[5],
+        };
+        let node_dir = dir.join(format!("join-{index}-{attempt}"));
+        match animusd::run_node_join(seeds.to_vec(), index, addrs, &node_dir, backend).await {
+            Ok(node) => return (node, addrs, node_dir),
+            Err(e) => {
+                assert!(
+                    tokio::time::Instant::now() < hard_deadline,
+                    "could not join node {index} within {deadline:?}: {e}"
+                );
+                sleep(Duration::from_millis(50)).await;
+                attempt += 1;
+            }
+        }
+    }
+}
+
+/// Join a fresh **data-only**, index-addressed node against `seeds` via
+/// `run_node_data_join` — the data-only dual of [`join_fresh_deadline`],
+/// generalized from `data_join.rs`'s own fixed-16-attempt/50ms helper.
+pub async fn join_data_fresh_deadline(
+    seeds: &[SocketAddr],
+    index: usize,
+    dir: &Path,
+    backend: StorageBackend,
+    deadline: Duration,
+) -> Node {
+    let hard_deadline = tokio::time::Instant::now() + deadline;
+    let mut attempt: u64 = 0;
+    loop {
+        let raw = free_addrs(6);
+        let addrs = RoleAddrs {
+            role: NodeRole::Data,
+            control: None,
+            client: raw[1],
+            dynamo: raw[2],
+            cql: raw[3],
+            raftkv: Some(raw[4]),
+            admin: raw[5],
+        };
+        let node_dir = dir.join(format!("data-join-{index}-{attempt}"));
+        match animusd::run_node_data_join(seeds.to_vec(), index, addrs, &node_dir, backend).await {
+            Ok(node) => return node,
+            Err(e) => {
+                assert!(
+                    tokio::time::Instant::now() < hard_deadline,
+                    "could not join data node {index} within {deadline:?}: {e}"
+                );
+                sleep(Duration::from_millis(50)).await;
+                attempt += 1;
+            }
+        }
+    }
+}
+
+/// Join a fresh **combined-mode, cluster-allocated-id** node against `seeds`
+/// (ADR 0036) via `run_node_join_allocated` — the allocated-id counterpart of
+/// [`join_fresh_deadline`], generalized from `seed_join_allocated.rs`'s own
+/// fixed-16-attempt/50ms helper. `label` disambiguates the data dir across
+/// concurrent callers sharing one `dir` (unlike the `--node`-indexed helper,
+/// there is no index to name it after).
+pub async fn join_allocated_fresh_deadline(
+    seeds: &[SocketAddr],
+    dir: &Path,
+    label: &str,
+    backend: StorageBackend,
+    deadline: Duration,
+) -> (Node, RoleAddrs, PathBuf) {
+    let hard_deadline = tokio::time::Instant::now() + deadline;
+    let mut attempt: u64 = 0;
+    loop {
+        let raw = free_addrs(6);
+        let addrs = RoleAddrs {
+            role: NodeRole::Both,
+            control: Some(raw[0]),
+            client: raw[1],
+            dynamo: raw[2],
+            cql: raw[3],
+            raftkv: Some(raw[4]),
+            admin: raw[5],
+        };
+        let node_dir = dir.join(format!("join-alloc-{label}-{attempt}"));
+        match animusd::run_node_join_allocated(
+            seeds.to_vec(),
+            addrs,
+            &node_dir,
+            backend,
+            BTreeMap::new(),
+        )
+        .await
+        {
+            Ok(node) => return (node, addrs, node_dir),
+            Err(e) => {
+                assert!(
+                    tokio::time::Instant::now() < hard_deadline,
+                    "could not join (allocated id) within {deadline:?}: {e}"
+                );
+                sleep(Duration::from_millis(50)).await;
+                attempt += 1;
+            }
+        }
+    }
+}
+
+/// Join a fresh **data-only, cluster-allocated-id** node against `seeds`
+/// (ADR 0036) via `run_node_data_join_allocated` — the data-only dual of
+/// [`join_allocated_fresh_deadline`].
+pub async fn join_data_allocated_fresh_deadline(
+    seeds: &[SocketAddr],
+    dir: &Path,
+    label: &str,
+    backend: StorageBackend,
+    deadline: Duration,
+) -> Node {
+    let hard_deadline = tokio::time::Instant::now() + deadline;
+    let mut attempt: u64 = 0;
+    loop {
+        let raw = free_addrs(6);
+        let addrs = RoleAddrs {
+            role: NodeRole::Data,
+            control: None,
+            client: raw[1],
+            dynamo: raw[2],
+            cql: raw[3],
+            raftkv: Some(raw[4]),
+            admin: raw[5],
+        };
+        let node_dir = dir.join(format!("data-join-alloc-{label}-{attempt}"));
+        match animusd::run_node_data_join_allocated(
+            seeds.to_vec(),
+            addrs,
+            &node_dir,
+            backend,
+            BTreeMap::new(),
+        )
+        .await
+        {
+            Ok(node) => return node,
+            Err(e) => {
+                assert!(
+                    tokio::time::Instant::now() < hard_deadline,
+                    "could not join as a data node (allocated id) within {deadline:?}: {e}"
+                );
+                sleep(Duration::from_millis(50)).await;
+                attempt += 1;
             }
         }
     }

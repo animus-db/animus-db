@@ -44,43 +44,10 @@ mod support;
 /// independent tablets raise the odds that at least one lands on it.
 const TABLES: [&str; 3] = ["decomm0", "decomm1", "decomm2"];
 
-/// Bring up the initial `n`-node config core, one process per node, retrying
-/// the (allocate-fresh-ports + start-all) as a unit (port-TOCTOU mitigation).
+/// Bring up the initial `n`-node config core (port-TOCTOU mitigation) — see
+/// `support::bring_up_deadline`.
 async fn bring_up(n: usize, dir: &Path) -> (Vec<Node>, ClusterConfig) {
-    for attempt in 0..16 {
-        let addrs = support::free_addrs(n * 6);
-        let nodes_cfg: Vec<RoleAddrs> = (0..n)
-            .map(|i| RoleAddrs {
-                role: animusd::config::NodeRole::Both,
-                control: Some(addrs[6 * i]),
-                client: addrs[6 * i + 1],
-                dynamo: addrs[6 * i + 2],
-                cql: addrs[6 * i + 3],
-                raftkv: Some(addrs[6 * i + 4]),
-                admin: addrs[6 * i + 5],
-            })
-            .collect();
-        let config = ClusterConfig { nodes: nodes_cfg };
-        let mut nodes = Vec::new();
-        let mut failed = false;
-        for i in 0..n {
-            match animusd::run_node(&config, i, dir.join(format!("core-{attempt}-{i}"))).await {
-                Ok(node) => nodes.push(node),
-                Err(_) => {
-                    failed = true;
-                    break;
-                }
-            }
-        }
-        if !failed {
-            return (nodes, config);
-        }
-        for node in &nodes {
-            node.shutdown();
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
-    panic!("could not bring up the initial cluster after retries");
+    support::bring_up_deadline(n, dir, support::JOIN_DEADLINE).await
 }
 
 async fn await_bootstrap(nodes: &[Node]) {
@@ -99,33 +66,15 @@ async fn await_bootstrap(nodes: &[Node]) {
         .expect("cluster did not bootstrap within 30s");
 }
 
-/// Join a fresh node with newly-allocated addresses, retrying the
-/// (allocate-ports + join) as a unit (same port-TOCTOU mitigation as
-/// `bring_up`).
+/// Join a fresh node with newly-allocated addresses (port-TOCTOU mitigation)
+/// — see `support::join_fresh_deadline`.
 async fn join_fresh(
     seeds: &[SocketAddr],
     index: usize,
     dir: &Path,
     backend: StorageBackend,
 ) -> (Node, RoleAddrs, PathBuf) {
-    for attempt in 0..16 {
-        let raw = support::free_addrs(6);
-        let addrs = RoleAddrs {
-            role: animusd::config::NodeRole::Both,
-            control: Some(raw[0]),
-            client: raw[1],
-            dynamo: raw[2],
-            cql: raw[3],
-            raftkv: Some(raw[4]),
-            admin: raw[5],
-        };
-        let node_dir = dir.join(format!("join-{index}-{attempt}"));
-        match animusd::run_node_join(seeds.to_vec(), index, addrs, &node_dir, backend).await {
-            Ok(node) => return (node, addrs, node_dir),
-            Err(_) => sleep(Duration::from_millis(50)).await,
-        }
-    }
-    panic!("could not join node {index} after retries");
+    support::join_fresh_deadline(seeds, index, dir, backend, support::JOIN_DEADLINE).await
 }
 
 /// One HTTP/1.0 request to the admin endpoint; returns `(status, parsed JSON)`.

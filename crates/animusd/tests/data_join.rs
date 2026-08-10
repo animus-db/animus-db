@@ -29,13 +29,12 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
 
-use animusd::config::NodeRole;
-use animusd::{ClientRequest, ClientResponse, Node, RoleAddrs, StorageBackend, read_frame};
+use animusd::{ClientRequest, ClientResponse, Node, StorageBackend, read_frame};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
 mod support;
-use support::{await_data_nodes_active, await_leader, bring_up_split, free_addrs};
+use support::{await_data_nodes_active, await_leader, bring_up_split};
 
 const TABLES: [&str; 3] = ["datajoin0", "datajoin1", "datajoin2"];
 
@@ -160,33 +159,15 @@ async fn table_with_replica(admin_addr: SocketAddr, raftkv_id: u64) -> Option<St
         })
 }
 
-/// Join a fresh data-only node against `seeds`, retrying the
-/// (allocate-ports + join) as a unit — the same port-TOCTOU mitigation every
-/// bring-up helper in this suite uses.
+/// Join a fresh data-only node against `seeds` (port-TOCTOU mitigation) —
+/// see `support::join_data_fresh_deadline`.
 async fn join_data_fresh(
     seeds: &[SocketAddr],
     index: usize,
     dir: &Path,
     backend: StorageBackend,
 ) -> Node {
-    for attempt in 0..16 {
-        let raw = free_addrs(6);
-        let addrs = RoleAddrs {
-            role: NodeRole::Data,
-            control: None,
-            client: raw[1],
-            dynamo: raw[2],
-            cql: raw[3],
-            raftkv: Some(raw[4]),
-            admin: raw[5],
-        };
-        let node_dir = dir.join(format!("data-join-{index}-{attempt}"));
-        match animusd::run_node_data_join(seeds.to_vec(), index, addrs, &node_dir, backend).await {
-            Ok(node) => return node,
-            Err(_) => sleep(Duration::from_millis(50)).await,
-        }
-    }
-    panic!("could not join data node {index} after retries");
+    support::join_data_fresh_deadline(seeds, index, dir, backend, support::JOIN_DEADLINE).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 10)]

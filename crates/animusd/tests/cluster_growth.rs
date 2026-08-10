@@ -25,9 +25,7 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use animusd::{
-    ClientRequest, ClientResponse, ClusterConfig, Node, RoleAddrs, StorageBackend, read_frame,
-};
+use animusd::{ClientRequest, ClientResponse, ClusterConfig, Node, read_frame};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -37,103 +35,24 @@ mod support;
 
 const TABLES: [&str; 3] = ["grow0", "grow1", "grow2"];
 
-/// Bring up the **initial** `n`-node cluster, one process per node, retrying the
-/// (allocate-fresh-ports + start-all) as a unit — the documented port-TOCTOU
-/// mitigation (another test binary can steal a freed ephemeral port before the
-/// real bind).
+/// Bring up the **initial** `n`-node cluster, one process per node —
+/// port-TOCTOU mitigation (another test binary can steal a freed ephemeral
+/// port before the real bind); see `support::bring_up_deadline`.
 async fn bring_up(n: usize, dir: &std::path::Path) -> (Vec<Node>, ClusterConfig) {
-    for attempt in 0..16 {
-        let addrs = support::free_addrs(n * 6);
-        let nodes_cfg: Vec<RoleAddrs> = (0..n)
-            .map(|i| RoleAddrs {
-                role: animusd::config::NodeRole::Both,
-                control: Some(addrs[6 * i]),
-                client: addrs[6 * i + 1],
-                dynamo: addrs[6 * i + 2],
-                cql: addrs[6 * i + 3],
-                raftkv: Some(addrs[6 * i + 4]),
-                admin: addrs[6 * i + 5],
-            })
-            .collect();
-        let config = ClusterConfig { nodes: nodes_cfg };
-        let mut nodes = Vec::new();
-        let mut failed = false;
-        for i in 0..n {
-            match animusd::run_node(&config, i, dir.join(format!("node-{attempt}-{i}"))).await {
-                Ok(node) => nodes.push(node),
-                Err(_) => {
-                    failed = true;
-                    break;
-                }
-            }
-        }
-        if !failed {
-            return (nodes, config);
-        }
-        for node in &nodes {
-            node.shutdown();
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
-    panic!("could not bring up the initial cluster after retries");
+    support::bring_up_deadline(n, dir, support::JOIN_DEADLINE).await
 }
 
 /// Grow `base` by `extra` control-plane-follower-less nodes (ADR 0030), each
 /// started via `run_node_growth` from an **expanded** config (`base`'s nodes
 /// plus `extra` freshly bound ones) with `original_control_ids` = `base`'s own
-/// control group — the pre-growth nodes are never touched. Retries only the new
-/// nodes' freshly-allocated ports as a unit (same port-TOCTOU mitigation as
-/// `bring_up`; the original nodes' addresses are already bound and fixed).
+/// control group — the pre-growth nodes are never touched; see
+/// `support::grow_deadline`.
 async fn grow(
     base: &ClusterConfig,
     extra: usize,
     dir: &std::path::Path,
 ) -> (Vec<Node>, ClusterConfig) {
-    let original_control_ids = base.control_ids();
-    let base_n = base.nodes.len();
-    for attempt in 0..16 {
-        let addrs = support::free_addrs(extra * 6);
-        let mut nodes_cfg = base.nodes.clone();
-        for i in 0..extra {
-            nodes_cfg.push(RoleAddrs {
-                role: animusd::config::NodeRole::Both,
-                control: Some(addrs[6 * i]),
-                client: addrs[6 * i + 1],
-                dynamo: addrs[6 * i + 2],
-                cql: addrs[6 * i + 3],
-                raftkv: Some(addrs[6 * i + 4]),
-                admin: addrs[6 * i + 5],
-            });
-        }
-        let expanded = ClusterConfig { nodes: nodes_cfg };
-        let mut nodes = Vec::new();
-        let mut failed = false;
-        for i in 0..extra {
-            match animusd::run_node_growth(
-                &expanded,
-                base_n + i,
-                original_control_ids.clone(),
-                dir.join(format!("grow-{attempt}-{i}")),
-                StorageBackend::default(),
-            )
-            .await
-            {
-                Ok(node) => nodes.push(node),
-                Err(_) => {
-                    failed = true;
-                    break;
-                }
-            }
-        }
-        if !failed {
-            return (nodes, expanded);
-        }
-        for node in &nodes {
-            node.shutdown();
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
-    panic!("could not grow the cluster after retries");
+    support::grow_deadline(base, extra, dir, support::JOIN_DEADLINE).await
 }
 
 async fn await_bootstrap(nodes: &[Node]) {
