@@ -588,7 +588,22 @@ Test-file map (`tests/`):
   refusal/warning matrix (idempotent unknown-node no-op, non-leader voter
   removes cleanly, leader self-removal arms a transfer and refuses rather
   than silently completing, down-to-1-voter warns, down-to-0 is refused);
-  both mutating actions refuse on a follower (not relayable).
+  both mutating actions refuse on a follower (not relayable); a runtime-added
+  voter survives a leadership change to a different original voter (PR4);
+  plus two PR5 additions — removing a live voter while another is already
+  dead succeeds with no warning and demonstrably strands the group for any
+  further membership change (the shipped guard only ever counts the
+  resulting voter set, never survivor liveness), and two concurrent
+  `control/member/add` calls race cleanly (loser gets a retryable `409`, its
+  retry succeeds once the winner commits).
+- `control_membership_split.rs` (ADR 0037 PR5) — the `split_cluster.rs`-style
+  multi-process scenario: over a genuine split deployment (control-only +
+  data-only processes), grow the control quorum by one at runtime, then
+  replace an ORIGINAL voter (kill it for good, remove it, add a fresh
+  replacement) via the real admin HTTP surface, with continuous data-plane
+  writes spanning the whole scenario — proving runtime control-plane
+  membership change composes with a real split deployment, not just the
+  single-action coverage in `control_membership_admin.rs`.
 - `cp_plane.rs` — CP round-trip (write one node, read another) + write latency.
 - `cp_cross_process.rs` — cross-process forwarding to the leader's node.
 - `cp_reconfigure.rs` — failure detection, group-follows-replica-set, auto-repair.

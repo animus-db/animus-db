@@ -140,7 +140,9 @@ truth; this map is just for navigation.
   driver; pre-vote; leadership transfer; WAL + truncating/chunked-
   `InstallSnapshot` snapshots; epoch-CAS placement; heartbeat **failure
   detection** (ADR 0012); a replicated **table-schema catalog** in `Metadata`
-  (ADR 0013); `metadata_watch()` change notification (ADR 0031).
+  (ADR 0013); `metadata_watch()` change notification (ADR 0031); the control
+  group itself can grow/shrink/replace voters **at runtime** via
+  `change_membership`/`transfer_leadership` + an admin API/CLI (ADR 0037).
 - **CP data plane** — `animus-cp-data` (ADR 0016, 0017). Each tablet is its own
   Raft group with a single leader serving **linearizable** single-tablet
   reads/writes/scans, durable on a real `StorageEngine`; reuses the control

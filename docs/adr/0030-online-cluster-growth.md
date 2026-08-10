@@ -300,3 +300,15 @@ observation ADR 0035 cites as proof the mirror path was already sufficient on
 its own. The control group's static size (this ADR's own accepted
 limitation, above) is unchanged by the split — ADR 0035 relocates the static
 group into its own deployment, it does not make it elastic.
+
+## Amended by ADR 0037
+
+[ADR 0037](0037-control-plane-membership-change.md) lifts this ADR's own
+"the control group stays static" limitation (above): a control-plane leader
+can now grow, shrink, and replace its own voters at runtime through a thin
+`RaftNode::change_membership`/`transfer_leadership` wrapper over the same
+single-server-reconfiguration primitive `animus-cp-data` already proved safe
+in production, plus a new admin API + CLI. This was a scope decision, not a
+safety one — nothing about this ADR's or ADR 0035's static-group design was
+wrong; ADR 0037 simply finishes the generalization ADR 0035 started for
+*discovery* (a `Remote`-style mirror) by also generalizing *reconfiguration*.
