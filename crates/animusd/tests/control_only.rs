@@ -197,6 +197,59 @@ async fn control_only_cluster_elects_leader_and_serves_status() {
                 ctl_storage["backend"], "lsm",
                 "bring_up_control uses the durable default backend: {ctl_storage}"
             );
+
+            // The system-table browse surface (plan-syskv-ui, ADR 0038
+            // addendum) — real rows on this same node, since it has
+            // self-proposed its own `RegisterNodeAddrs`. `system_table.rs`
+            // covers the full endpoint contract (every kind, filtering,
+            // pagination, value shapes); this just proves it's wired up on
+            // a genuine control-only node, not just the combined-node
+            // fixture that test file uses. `await_leader` only waits for
+            // *a* leader to exist, not for *this* node's own
+            // self-registration to have committed AND been mirrored by the
+            // (ADR 0038 PR3) async apply task — so this is a bounded poll,
+            // not a single-shot assert right after `await_leader` returns
+            // (that raced and flaked under `cargo test --workspace` load:
+            // a freshly-elected leader's own election no-op can be the
+            // *only* thing applied so far, giving `count: 0`). A
+            // control-only cluster never runs the raftkv-side `bootstrap`
+            // loop (only registers raftkv ids as `Member`s), so it never
+            // has `member` rows — every control-only node's own
+            // `node_addrs` self-registration is what's actually guaranteed
+            // present here.
+            let syst = timeout(Duration::from_secs(10), async {
+                loop {
+                    let (s, syst) = admin_get(node.admin_addr(), "/admin/system-table").await;
+                    assert_eq!(s, 200, "admin/system-table on {}", node.admin_addr());
+                    assert_eq!(
+                        syst["available"], true,
+                        "a control-only node has a system keyspace to browse: {syst}"
+                    );
+                    if syst["items"]
+                        .as_array()
+                        .is_some_and(|items| items.iter().any(|it| it["kind"] == "node_addrs"))
+                    {
+                        return syst;
+                    }
+                    sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "{}'s own node_addrs self-registration did not appear in its system \
+                     keyspace within 10s",
+                    node.admin_addr()
+                )
+            });
+            assert!(
+                syst["items"]
+                    .as_array()
+                    .expect("items array")
+                    .iter()
+                    .any(|it| it["kind"] == "node_addrs"),
+                "at least one row is a node_addrs entity: {syst}"
+            );
         }
 
         // No data members were ever registered — the placement reconciler

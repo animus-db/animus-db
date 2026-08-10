@@ -19,6 +19,7 @@ function renderStorageSelectors() {
   if (prevT && [...tsel.options].some((o) => o.value === prevT)) tsel.value = prevT;
   updateStorageNodeOptions();
   updateControlStorageNodeOptions();
+  renderSystemTableKindOptions();
   // A deep-linked tablet/node (from the URL on load, or a browser back/forward
   // into the Storage tab, or the Tablets view's "Open in Storage" link) is
   // applied once the options it needs actually exist.
@@ -40,6 +41,81 @@ function updateControlStorageNodeOptions() {
     `<option value="${esc(n.base)}">node ${esc(n.addr)} (${esc(n.role)})</option>`).join("");
   if (prev && [...sel.options].some((o) => o.value === prev)) sel.value = prev;
   $("ctl-hint").textContent = nodes.length ? "" : "no reachable control-role node";
+}
+
+// The system-keyspace BROWSE section (plan-syskv-ui, an ADR 0038 addendum) —
+// nested in the same "Control system keyspace" card, reusing `ctl-node`'s
+// control-role-only node selector so it never offers a node with no local
+// control engine at all. The kind filter lists EVERY EntityKind, including
+// the internal/legacy bookkeeping ones (Counter/NodeIdAlloc/CpMemberAddr) —
+// full transparency by the project owner's own call, labeled rather than
+// hidden, since hiding them would make "what does this node actually store"
+// a lie by omission.
+const SYSTEM_TABLE_KINDS = [
+  ["", "(all kinds)"],
+  ["tablet", "tablet"],
+  ["member", "member"],
+  ["schema", "schema"],
+  ["policy", "policy"],
+  ["node_addrs", "node_addrs"],
+  ["keyspace", "keyspace"],
+  ["merged", "merged"],
+  ["counter", "counter (internal)"],
+  ["cp_member_addr", "cp_member_addr (legacy)"],
+  ["node_id_alloc", "node_id_alloc (internal)"],
+];
+
+// The forward-only pager's cursor for the CURRENTLY DISPLAYED page — `null`
+// means "first page" (or "no further page"). `GET /admin/system-table`'s
+// pagination is exclusive-after (ADR 0038 addendum), so there is no "previous
+// page" without re-walking from the start — matching the plan's deliberately
+// simple forward-only pager (this is a debug/inspection tool, not a general
+// data browser).
+let systemTableAfter = null;
+
+function renderSystemTableKindOptions() {
+  const sel = $("ctl-kind");
+  if (sel.options.length) return; // a fixed list — populate once, not per-refresh
+  sel.innerHTML = SYSTEM_TABLE_KINDS.map(([value, label]) =>
+    `<option value="${esc(value)}">${esc(label)}</option>`).join("");
+}
+
+async function loadSystemTable(reset) {
+  const base = $("ctl-node").value;
+  if (!base) { $("ctl-browse-body").innerHTML = `<div class="empty">pick a control node</div>`; return; }
+  if (reset) systemTableAfter = null;
+  const kind = $("ctl-kind").value;
+  let qs = "/admin/system-table?limit=50";
+  if (kind) qs += "&kind=" + encodeURIComponent(kind);
+  if (systemTableAfter) qs += "&after=" + encodeURIComponent(systemTableAfter);
+  try {
+    const r = await getJSON(base, qs);
+    if (!r.available) {
+      $("ctl-applied-index").textContent = "";
+      $("ctl-next-page").disabled = true;
+      $("ctl-browse-body").innerHTML = `<div class="empty">no control-plane system-keyspace engine on this node</div>`;
+      return;
+    }
+    $("ctl-applied-index").textContent = "as of index " + r.applied_index;
+    const rows = (r.items || []).map((it) => {
+      const full = JSON.stringify(it.value, null, 2);
+      const preview = full.length > 60 ? full.slice(0, 60).replace(/\n/g, " ") + "…" : full.replace(/\n/g, " ");
+      return `<tr>
+        <td class="mono">${esc(it.kind)}</td>
+        <td class="mono">${esc(it.id)}</td>
+        <td class="mono">${esc(it.version)}</td>
+        <td class="mono"><details><summary>${esc(preview)}</summary><pre>${esc(full)}</pre></details></td>
+      </tr>`;
+    }).join("");
+    const more = r.truncated
+      ? `<div class="muted">showing ${esc(r.count)} (truncated at limit ${esc(r.limit)}) — Next page for more</div>`
+      : `<div class="muted">${esc(r.count)} row(s)${kind ? " of kind " + esc(kind) : ""}</div>`;
+    $("ctl-browse-body").innerHTML = rows
+      ? more + `<table><thead><tr><th>kind</th><th>id</th><th>version</th><th>value</th></tr></thead><tbody>${rows}</tbody></table>`
+      : `<div class="empty">no rows${kind ? " for kind " + esc(kind) : ""}</div>`;
+    systemTableAfter = r.truncated ? r.next_after : null;
+    $("ctl-next-page").disabled = !r.truncated;
+  } catch (e) { $("ctl-browse-body").innerHTML = `<div class="err-line">${esc(e)}</div>`; }
 }
 
 async function loadControlStorage() {

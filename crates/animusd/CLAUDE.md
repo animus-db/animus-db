@@ -421,6 +421,29 @@ route below the edge through the same `ClientCtx` CP primitives.
   the numbers legitimately coincide with a hosted tablet's own
   `/admin/storage/lsm` — it's the exact same physical shared engine,
   `Metadata` just lives at a reserved key prefix within it.
+  **`GET /admin/system-table?kind=&after=&limit=` (plan-syskv-ui, an ADR 0038
+  addendum) browses this same engine's live rows**, one decoded system-
+  keyspace entity at a time — the read-only counterpart to
+  `/admin/storage/control`'s aggregate stats. Same `{"available": false}`
+  shape on a data-only node. **Load-bearing**: scans
+  `animus_control::syskv::reserved_scan_bounds()`'s `[start, end)` via one
+  `StorageEngine::scan`, filtering by `kind` in memory afterward — never
+  `StorageEngine::entries()`, which would scan the *whole* engine (every
+  user table's data too, on a combined node sharing it with the CP data
+  plane, ADR 0028); see the engineering-lessons entry before ever
+  "simplifying" this to `entries()`. `applied_index` is a **dedicated point
+  read** of the `_applied_index` watermark key, never derived from the
+  (possibly empty/filtered/paginated) scan window. The `after`/`next_after`
+  cursor is the base64url (`animus_dynamo::wire`, not `key_display` — a
+  system key isn't a data-plane key) of the last item's raw engine key; the
+  next page's lower bound is that key plus one `0x00` byte — exact and
+  gap-free because `syskv` keys are provably prefix-free. Value decode
+  mirrors `animus_control::mirror::apply_put` exactly (JSON passthrough for
+  six kinds; `Counter`/`NodeIdAlloc` as a raw `u64`; `Keyspace`/`Merged`
+  presence-only, always `null`); a numeric kind's `id` renders as a decimal
+  string, not a JSON number. Every `EntityKind` is browsable, including the
+  internal/legacy ones — full transparency by design, see
+  `animus-control/CLAUDE.md`'s `syskv.rs` PR6 entry.
 - **Web console** (`dashboard.rs` + assets, ADR 0021) — a self-contained
   vanilla-JS SPA, a pure client of `/admin/*` JSON (so responses carry CORS). Six
   views seeded by a `/admin/peers` fan-out; tabs are **role-gated client-side**
@@ -432,7 +455,16 @@ route below the edge through the same `ClientCtx` CP primitives.
   selector, filtered to nodes with a control role (`n.role === "control" ||
   "combined"`), independent of the per-tablet `st-tablet`/`st-node`
   selectors' hosting-based filter (which would otherwise always be empty for
-  a control-only node, since it hosts no CP tablet group at all). `loadSelf()`
+  a control-only node, since it hosts no CP tablet group at all). That same
+  card grew a **browse section** nested directly inside it (plan-syskv-ui,
+  ADR 0038 addendum) — `dashboard_storage.js`'s `loadSystemTable`/
+  `renderSystemTableKindOptions` against `GET /admin/system-table`: a kind
+  filter (every kind, internal/legacy ones labeled `(internal)`/`(legacy)`),
+  an "as of index N" watermark label, a table with `<details>`-based
+  expand-to-full-JSON per row, and a forward-only "Next page" pager
+  (`systemTableAfter`, reset on every fresh "Browse"/node-change). No new
+  tab, no `ROLE_TABS` change — rides the same control-role node selector and
+  gating the card already had. `loadSelf()`
   resolves this node's own role from a self-only fetch, kept separate from the
   slower cluster-wide fan-out. `/admin/config` carries a derived `role` string;
   `/admin/raft` carries a `control_mirror` object for the Node view. The
@@ -717,6 +749,18 @@ Test-file map (`tests/`):
 - `cql_wire.rs` / `cql_clustering.rs` / `cql_durable_schema.rs` — the CQL edge
   (typed round-trip, compound keys, durable replicated schema).
 - `admin_endpoint.rs` — admin views + gated actions + data writes + bulk seed.
+- `system_table.rs` (plan-syskv-ui, an ADR 0038 addendum) — `GET
+  /admin/system-table` end to end: seeds every `EntityKind` via the client
+  protocol (a plain `Put` auto-provisions a `Tablet`+bumps its `Counter`,
+  `ProposeSchema` reaches `Schema`/`Policy`/`Keyspace`/the legacy
+  `CpMemberAddr`, a real split+merge produces a `Merged` marker,
+  `AllocateNodeId` produces `NodeIdAlloc`) and asserts every kind's exact
+  value shape, the `kind` filter, and an unrecognized-kind 400; a separate
+  test seeds many `tablet` rows and diffs a small-`limit` forward-only
+  pager walk against one unlimited scan for gaplessness/no-duplicates.
+  `control_only.rs`/`data_only.rs` cover the available-`true`-with-rows /
+  available-`false` shapes on genuine control-only and data-only processes;
+  `dashboard_endpoint.rs` covers the served asset/markup check.
 - `dashboard_endpoint.rs` — SPA serve + CORS + deep links + peers + role gating.
 - `metrics_endpoint.rs` — `GET /metrics` (leader-only counters per node).
 - `otel_tracing.rs` — OTLP span export (decodes the protobuf payload).

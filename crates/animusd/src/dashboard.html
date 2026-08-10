@@ -225,6 +225,13 @@
       <div class="card scroll" style="margin-bottom:14px">
         <h2>Control system keyspace</h2>
         <div id="ctl-storage-body"><div class="empty">pick a control node and Load</div></div>
+        <div class="row" style="margin:10px 0">
+          <label>kind</label><select id="ctl-kind"></select>
+          <button id="ctl-browse-load">Browse</button>
+          <button id="ctl-next-page" disabled>Next page</button>
+          <span id="ctl-applied-index" class="muted"></span>
+        </div>
+        <div id="ctl-browse-body"><div class="empty">pick a control node and Browse</div></div>
       </div>
       <div class="row" style="margin-bottom:14px">
         <label>tablet</label><select id="st-tablet"></select>
@@ -380,6 +387,8 @@ $("br-dy-item-submit").addEventListener("click", submitItemForm);
 
 // Storage
 $("ctl-load").addEventListener("click", loadControlStorage);
+$("ctl-browse-load").addEventListener("click", () => loadSystemTable(true));
+$("ctl-next-page").addEventListener("click", () => loadSystemTable(false));
 $("st-tablet").addEventListener("change", () => { updateStorageNodeOptions(); syncStorageUrl(); });
 $("st-node").addEventListener("change", syncStorageUrl);
 $("st-load").addEventListener("click", () => { loadStorage(); syncStorageUrl(); });

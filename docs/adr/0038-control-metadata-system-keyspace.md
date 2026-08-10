@@ -1,16 +1,18 @@
 # ADR 0038 — Control-plane metadata backed by a per-node system-keyspace storage engine
 
-- **Status:** Accepted — implemented across five PRs. PR1 (key encoding +
+- **Status:** Accepted — implemented across six PRs. PR1 (key encoding +
   reserved namespace), PR2 (shadow-mode engine mirror, dual-write, zero
   behavior change), **PR3: the cutover** — `Metadata` is
   `StateMachine::DRIVER_APPLIED = true`; `RaftCore` no longer applies
   `MetaCommand`s in-core; a new async apply task owns the only mutable
   `Metadata`, derives per-command system-keyspace writes, and publishes an
   `engine_applied`-gated cache every reader now reads. PR4 (`animusd`
-  deployment-shape wiring polish + admin/dashboard storage surface). **PR5
-  (this amendment): "Phase 2" — incremental `WatchMetadata` deltas**, closing
-  the one item PR3's Consequences section left as future work (see below).
-- **Date:** 2026-08-10 (PR3); amended 2026-08-10 (PR5)
+  deployment-shape wiring polish + admin/dashboard storage surface). **PR5:
+  "Phase 2" — incremental `WatchMetadata` deltas**, closing the one item
+  PR3's Consequences section left as future work. **PR6 (this amendment): a
+  read-only admin browse surface** (`GET /admin/system-table` + a dashboard
+  section) over the system keyspace this ADR built (see below).
+- **Date:** 2026-08-10 (PR3); amended 2026-08-10 (PR5); amended 2026-08-10 (PR6)
 - **Amends:** ADR 0009 (in-house Raft over `Env`), ADR 0013 (replicated schema
   catalog), ADR 0028 (shared per-node storage), ADR 0031 (tablet-host
   reconciler + `metadata_watch`), ADR 0035 (control-plane separate deployment).
@@ -266,14 +268,92 @@ differential tests (`animus-control/tests/watch_deltas.rs`,
 `animusd/tests/watch_metadata.rs`) for the byte-identical-to-a-full-fetch
 proof this relies on.
 
+## PR6: a read-only admin browse surface
+
+Every prior PR here made the system keyspace faster to write and cheaper to
+ship over the wire, but there was still no way for an operator to actually
+*look at* what it holds — the only observability into it was the aggregate
+`/admin/storage/control` LSM/WAL stats (PR4). This PR adds exactly that,
+read-only, additive, no change to the write/apply path above:
+
+- **`GET /admin/system-table?kind=&after=&limit=`** — browse this node's own
+  reserved system keyspace directly, row by row. `{"available": false}` on a
+  data-only node (no local `ctx.control_storage` engine at all, ADR 0035),
+  the same honest-absence shape `/admin/storage/control` uses. Response:
+  `available`, `applied_index` (a **dedicated point read** of the
+  `_applied_index` watermark key — never derived from the scan window itself,
+  which may be empty/kind-filtered/paginated), `kind_filter`, `count`,
+  `limit`, `truncated`, `next_after`, `items: [{kind, id, version, value}]`.
+- **Every [`syskv::EntityKind`] is browsable, including the internal/legacy
+  ones** (`Counter`, `CpMemberAddr`, `NodeIdAlloc`) — a deliberate
+  full-transparency call: hiding "boring" bookkeeping kinds would make "what
+  does this node actually store" a lie by omission for the one surface whose
+  whole purpose is answering that question. The dashboard labels them
+  `(internal)`/`(legacy)` rather than hiding them.
+- **Load-bearing implementation choice, worth restating even though
+  [`syskv::reserved_scan_bounds`] and the endpoint's own doc comment already
+  say it**: the whole reserved namespace is read via **one bounded
+  `StorageEngine::scan` over `[start, end)`**, filtered by `kind` **in
+  memory** afterward — never `StorageEngine::entries()`. On a combined node
+  this engine is shared with the CP data plane (ADR 0028): `entries()` would
+  scan **every user table's data on the node**, turning an O(system-keyspace)
+  read into O(all-user-data-on-node). A future "simplification" that swaps
+  the bounded scan for `entries()` would silently reintroduce exactly the
+  scaling problem this whole ADR exists to fix, just moved from the write
+  path to a read path — see `docs/engineering-lessons.md`.
+- **`syskv.rs` additions**: [`EntityKind::as_str`]/[`EntityKind::from_segment`]
+  are now `pub` (the endpoint parses/renders a `?kind=` filter through them
+  directly, rather than re-deriving the segment table a third time);
+  [`prefix_successor`] (a general byte-lexicographic successor helper,
+  unit-tested including the trailing-`0xFF` edge case) and
+  [`reserved_scan_bounds`] (the `[start, end)` pair covering the entire
+  namespace, built from it) are the new pure primitives the scan bound
+  above uses.
+- **Cursor design**: `after`/`next_after` are the base64url
+  (`animus_dynamo::wire`, **not** `key_display` — a system key isn't a
+  data-plane key) of the raw engine key of the last item on a page. The next
+  page's lower bound is that key's bytes with one `0x00` byte appended —
+  exact and gap-free because `syskv`'s keys are provably prefix-free (the
+  existing `no_two_distinct_entity_keys_prefix_one_another` test): no other
+  key can start with `after`'s bytes, so no key can fall strictly between it
+  and its `0x00`-appended successor.
+- **Value decode mirrors `mirror::apply_put` exactly**: `Tablet`/`Member`/
+  `Schema`/`Policy`/`NodeAddrs`/`CpMemberAddr` are `serde_json` passthrough;
+  `Counter`/`NodeIdAlloc` are a raw big-endian `u64` rendered as a JSON
+  number; `Keyspace`/`Merged` are presence-only (always `null`). A numeric
+  kind's `id` (`Tablet`/`Member`/`Policy`/`NodeAddrs`/`Merged`/
+  `CpMemberAddr`) renders as a decimal **string**, not a JSON number (a
+  `u64` can exceed what JSON/JS represents exactly); every other kind's `id`
+  is its UTF-8 name verbatim.
+- **Dashboard**: the Storage tab's existing "Control system keyspace" card
+  (PR4) grew a browse section directly inside it — the same control-role
+  node selector, a kind filter (every kind, internal/legacy ones labeled),
+  an "as of index N" watermark label, a table with expand-to-full-JSON per
+  row, and a forward-only "Next page" pager. No new tab, no `ROLE_TABS`
+  change — this rides the same role gating the existing card already has.
+
+**Tests**: `animus-control`'s `syskv.rs` unit tests cover `prefix_successor`/
+`reserved_scan_bounds` directly; `animusd/tests/system_table.rs` seeds every
+`EntityKind` through the client protocol (a plain `Put` auto-provisions a
+tablet, `ProposeSchema` reaches every other mirrored `MetaCommand`, a real
+split+merge produces a `Merged` marker, `AllocateNodeId` produces the
+`NodeIdAlloc` entry) and asserts every kind's exact value shape, the `kind`
+filter, and gapless duplicate-free pagination against a differential oracle
+(one unlimited scan); `control_only.rs`/`data_only.rs` cover the
+available-`true`-with-rows / available-`false` shapes on genuine
+control-only and data-only processes; `dashboard_endpoint.rs` asserts the
+served assets carry the new markup/JS.
+
 ## See also
 
 - `crates/animus-control/CLAUDE.md` — `node.rs`/`raft.rs`/`mirror.rs`/`syskv.rs`/
   `delta_ring.rs` mechanics.
 - `crates/animusd/CLAUDE.md` — the `WatchMetadata` wire contract and
-  `RemoteControlClient` mechanics.
+  `RemoteControlClient` mechanics, and (PR6) the `GET /admin/system-table`
+  browse surface.
 - `crates/animus-cp-data/CLAUDE.md` — the proven consensus-loop/apply-task
   split and `DRIVER_APPLIED` lazy-snapshot shape this ADR ports.
 - `docs/engineering-lessons.md` — the election-storm bug class this split
-  must not reintroduce, the watermark-seeding lesson PR3 added, and the
-  concurrent-mirror-update race PR5 added.
+  must not reintroduce, the watermark-seeding lesson PR3 added, the
+  concurrent-mirror-update race PR5 added, and (PR6) the
+  whole-namespace-scan-vs-`entries()` warning.

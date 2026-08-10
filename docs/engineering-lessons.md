@@ -1020,6 +1020,51 @@ debugging anything that feels like it might have happened before.
   (a member/keyspace/tablet appearing) rather than trusting the immediate
   reply — copy that idiom, don't invent a fresh assumption about what an ack
   means.
+- **`Metadata.schemas` (a `SchemaCatalog`) serializes as `{"tables": {...}}`,
+  not a bare map — a test reading `/admin/status` JSON must index through
+  that wrapper.** Building plan-syskv-ui's `system_table.rs`, a first-draft
+  `await_status` predicate checked `status["schemas"].get("orders")` and
+  timed out at 15s even though the `ProposeSchema(CreateTableSchema)` call
+  had already returned `PutOk` and the endpoint under test was working
+  correctly — the predicate was checking the wrong JSON shape, not waiting
+  on a slow commit. `SchemaCatalog` is `#[derive(Serialize)]`'d as a
+  one-field struct (`{ tables: BTreeMap<TableName, TableSchema> }`) so its
+  iteration order stays deterministic and its accessor surface can grow
+  without widening `Metadata` — a deliberate wrapper, not an oversight —
+  but that means it does **not** serialize as a bare `{"orders": {...}}`
+  map the way every other `BTreeMap`-typed `Metadata` field
+  (`members`/`tablets`/`policies`/`node_addrs`/`cp_member_addrs`) does. A
+  15s-timeout failure with no other symptom (no error reply, no 4xx/5xx,
+  the proposal genuinely committed by the time you check by hand) is the
+  signature of "polling the wrong JSON path", not "the thing is actually
+  slow" — check the field's Rust type before writing the predicate, not
+  just its name.
+- **`await_leader`/`is_control_leader()` proves *a* leader exists, not that
+  *this specific node's* own self-registration has landed in the ADR 0038
+  `DRIVER_APPLIED` apply task's published cache yet — a single-shot assert
+  right after it is exposed to the apply task's inherent one-hop lag.**
+  Adding a `GET /admin/system-table` smoke-check to
+  `control_only.rs::control_only_cluster_elects_leader_and_serves_status`
+  (iterates every node right after `await_leader`), a first draft asserted
+  each node's own system-keyspace browse already showed its
+  `RegisterNodeAddrs` row — and flaked under `cargo test --workspace`-level
+  contention (passed every isolated run, failed once mixed with the rest of
+  the suite's load): a freshly-elected leader's own election no-op can be
+  the *only* command the async apply task (`meta_apply_loop`) has drained
+  and mirrored so far (`applied_index: 1, count: 0` in the failure), with
+  this node's own `RegisterNodeAddrs` proposal still sitting in the Raft log
+  or the apply task's queue, not yet in the engine it mirrors into. Same
+  family as the `PutOk`-doesn't-mean-committed entry above, but one layer
+  further downstream: even a *committed* command isn't necessarily
+  *mirrored into the system-keyspace engine and published* yet, because ADR
+  0038 PR3 put an async apply task between "committed" and "visible in
+  `metadata()`/the system-keyspace browse". Fixed by turning the single-shot
+  assert into a bounded poll (10s) that re-fetches `/admin/system-table`
+  until a `node_addrs` row appears, matching this codebase's standing
+  converged-or-timeout discipline for eventual properties — the general
+  form: *any* assertion against a freshly-elected cluster's *replicated,
+  apply-task-mirrored* state needs the same poll, not just assertions
+  against explicitly-slow operations.
 - **A task prompt's reference to a specific function/mechanism by name can be
   stale by the time you implement it, if an earlier PR in the same stack
   already redesigned it out of existence — grep before assuming the
@@ -2875,6 +2920,34 @@ debugging anything that feels like it might have happened before.
   the "durable" resource being threaded through needs to survive that
   specific call — a blind find-and-replace macro fix is exactly how this
   class of bug hides.
+- **A read-only browse surface over a namespaced slice of a *shared* engine
+  must scan the namespace's own bound, never `StorageEngine::entries()` —
+  the moment the engine is shared with something bigger, `entries()` stops
+  meaning "everything in my namespace" and starts meaning "everything on
+  this node."** Building plan-syskv-ui's `GET /admin/system-table` (an ADR
+  0038 addendum) — a read-only browse of the control plane's reserved
+  system keyspace — `entries()` would have been the obvious one-liner (it's
+  what `mirror::rebuild_metadata_from_engine` already calls, since *that*
+  engine genuinely holds nothing else). But on a **combined** node this same
+  physical `StorageEngine` is also the CP data plane's own storage (ADR
+  0028) — every user table's every tablet's every key lives in it too — so
+  `entries()` there is O(all user data on this node), not
+  O(system-keyspace), even though the endpoint only ever wants the tiny
+  reserved slice. The fix (`animus_control::syskv::reserved_scan_bounds()`,
+  built from a general `prefix_successor` byte-lexicographic-successor
+  helper) is a single bounded `StorageEngine::scan(start, end)` over exactly
+  the namespace's own prefix range, with any further filtering (a `?kind=`
+  query param) done **in memory** on the small resulting page, never by
+  widening the engine-level scan. **General check before wiring any new
+  read against a shared multi-tenant engine (ADR 0026/0028's whole shared-
+  engine-per-node shape, which several planes already lean on): does this
+  engine hold *only* what I think it holds, or is it namespaced/scoped
+  inside something bigger? If the latter, `entries()`/an unbounded scan is
+  a scaling foot-gun waiting for a "combined node" deployment shape to
+  trigger it** — a control-only node (this endpoint's simplest case) would
+  never have caught the bug, since its dedicated engine genuinely holds
+  nothing else; only a combined node's shared engine exposes it, which is
+  exactly the deployment shape most demos/dev clusters default to.
 
 ### Parallel-agent orchestration
 - **Partition work by disjoint crate ownership — exactly one owner per shared
@@ -2948,3 +3021,37 @@ debugging anything that feels like it might have happened before.
   `Read` of the file (forced by an external touch, which this session's
   harness surfaces as a "file was modified externally" notice) demonstrably
   matches Bash's own view again.
+- **A worktree-isolated agent must never hardcode the main checkout's path,
+  even for a `Read` — recurred (plan-syskv-ui / ADR 0038 PR6, 2026-08-10),
+  with a refinement to "a clear refusal for `Edit`/`Write`" above: that
+  refusal is not reliably active from the very first tool call of a
+  session.** Mid-session, after an
+  infrastructure-watchdog stall and resume, this agent's assigned worktree
+  path silently changed out from under it (env block said one path at
+  session start; the Bash tool's actual cwd for every call turned out to be
+  a *different* worktree entirely, discovered only via `pwd` + `git status`
+  after the resume). Several `Read`/`Edit` calls in between had used bare
+  `/home/guillaume/Code/animus-db/...` paths (no worktree segment at all) —
+  and **succeeded**, silently editing the shared main checkout, including
+  two `Edit` calls that added real content (not just a `Read`). Only a
+  *later* `Edit` attempting to *revert* that same file was refused with
+  "This session is now isolated in \<worktree\>; edit the worktree copy of
+  this file instead" — meaning the guard exists and does fire, but not from
+  the start of every session or across every call in one, so "Edit/Write
+  refuses" is not a safety net an agent can lean on; only session-start
+  verification is. **Recovery when this is discovered after the fact**:
+  `git diff` the polluted shared-checkout file to confirm every hunk is
+  really yours (here, confirmed via `git -C <main> diff -- <file>` showing
+  exactly the two intended additions, nothing else); if an *unrelated*
+  agent's own uncommitted edits are *also* present in the same shared
+  checkout (they were here — a sibling agent's in-flight `heartbeat_loop`
+  rework, and an untracked test file), leave those alone entirely and only
+  attempt to revert your own file. If the harness then refuses even a
+  read-only `git show`/`git diff`/`git checkout --` against that path (it
+  did, for every git subcommand, not just mutating ones, once the guard was
+  active), you cannot self-heal the pollution via git or `Edit`/`Write`
+  either — re-apply your intended change fresh in the correct worktree
+  (confirmed via `pwd` immediately before this recovery, not trusted from
+  the session's opening env block) and say so plainly in the final report;
+  do not claim the shared checkout was cleaned up when the tooling itself
+  prevented it.

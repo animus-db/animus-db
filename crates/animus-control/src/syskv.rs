@@ -131,9 +131,13 @@ pub enum EntityKind {
 }
 
 impl EntityKind {
-    /// The ASCII segment identifying this kind in an encoded key.
+    /// The ASCII segment identifying this kind in an encoded key. `pub` since
+    /// the admin browse surface (`GET /admin/system-table`, plan-syskv-ui)
+    /// needs it to parse a `?kind=` query parameter and to render each row's
+    /// kind back to the caller — previously private, only this module's own
+    /// key-encoding helpers used it.
     #[must_use]
-    const fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             EntityKind::Tablet => "tablet",
             EntityKind::Member => "member",
@@ -150,9 +154,12 @@ impl EntityKind {
 
     /// Recover the kind from its encoded segment. `None` for an unrecognized
     /// segment (including [`APPLIED_INDEX_SEGMENT`] — that one decodes to
-    /// [`DecodedKey::AppliedIndex`] instead, see [`decode_key`]).
+    /// [`DecodedKey::AppliedIndex`] instead, see [`decode_key`]). `pub` for
+    /// the same reason as [`as_str`](Self::as_str) — the admin browse
+    /// surface's `?kind=` filter parses the query string straight through
+    /// this rather than re-deriving the segment table.
     #[must_use]
-    fn from_segment(segment: &[u8]) -> Option<Self> {
+    pub fn from_segment(segment: &[u8]) -> Option<Self> {
         Some(match segment {
             b"tablet" => EntityKind::Tablet,
             b"member" => EntityKind::Member,
@@ -191,6 +198,54 @@ pub fn applied_index_key() -> Vec<u8> {
     let mut out = escape(RESERVED_NAMESPACE.as_bytes());
     out.extend(escape(APPLIED_INDEX_SEGMENT));
     out
+}
+
+/// The byte-lexicographic **successor** of `prefix`: the smallest byte string
+/// that is strictly greater than every string having `prefix` as a prefix.
+/// Standard prefix-range-scan technique — increment the last non-`0xFF` byte,
+/// dropping any trailing `0xFF` bytes first (e.g. `[1, 2]` → `[1, 3]`; `[1,
+/// 0xFF]` → `[2]`). Returns `None` if `prefix` is empty or consists entirely
+/// of `0xFF` bytes — no finite byte string is a valid exclusive upper bound
+/// for "every extension of this prefix" in that case (the range would have to
+/// extend to the literal end of the keyspace). Exercised directly by this
+/// module's tests, including the trailing-`0xFF` case; used by
+/// [`reserved_scan_bounds`] to bound the reserved-namespace engine range scan
+/// (never hits the `None` case there in practice, since
+/// [`RESERVED_NAMESPACE`] doesn't end in `0xFF`, but the helper stays general
+/// rather than assuming its one caller's prefix shape).
+#[must_use]
+pub fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut out = prefix.to_vec();
+    while let Some(&last) = out.last() {
+        if last == 0xFF {
+            out.pop();
+        } else {
+            *out.last_mut().expect("just confirmed non-empty via `last`") = last + 1;
+            return Some(out);
+        }
+    }
+    None
+}
+
+/// The `[start, end)` engine scan bounds covering the **entire** reserved
+/// system keyspace — every [`EntityKind`] entry plus the `_applied_index`
+/// watermark key, since both share the same [`RESERVED_NAMESPACE`] prefix.
+///
+/// **Load-bearing**: this is the bound the admin browse surface (`GET
+/// /admin/system-table`, plan-syskv-ui) scans with via a single
+/// [`animus_storage::StorageEngine::scan`] call, filtering by kind
+/// **in memory** afterward — never [`animus_storage::StorageEngine::entries`],
+/// which would scan the **whole engine**, i.e. every user table's data too on
+/// a combined node sharing this engine with the CP data plane (ADR 0028). A
+/// future "simplification" to `entries()` would silently turn an
+/// O(system-keyspace) read into O(all-user-data-on-node) — see
+/// `docs/engineering-lessons.md`.
+#[must_use]
+pub fn reserved_scan_bounds() -> (Vec<u8>, Vec<u8>) {
+    let start = escape(RESERVED_NAMESPACE.as_bytes());
+    let end =
+        prefix_successor(&start).expect("RESERVED_NAMESPACE's escaped prefix has a successor");
+    (start, end)
 }
 
 /// A [`TabletId`]'s key under [`EntityKind::Tablet`].
@@ -605,5 +660,73 @@ mod tests {
         let mut key = tablet_key(TabletId(1));
         key.push(0xff);
         assert_eq!(decode_key(&key), None);
+    }
+
+    // --- prefix_successor / reserved_scan_bounds ---------------------------
+
+    #[test]
+    fn prefix_successor_increments_the_last_byte() {
+        assert_eq!(prefix_successor(&[1, 2]), Some(vec![1, 3]));
+        assert_eq!(prefix_successor(&[0]), Some(vec![1]));
+    }
+
+    #[test]
+    fn prefix_successor_drops_trailing_0xff_bytes() {
+        assert_eq!(prefix_successor(&[1, 0xff]), Some(vec![2]));
+        assert_eq!(prefix_successor(&[1, 0xff, 0xff]), Some(vec![2]));
+        assert_eq!(prefix_successor(&[5, 0, 0xff]), Some(vec![5, 1]));
+    }
+
+    #[test]
+    fn prefix_successor_is_none_for_empty_or_all_0xff() {
+        assert_eq!(prefix_successor(&[]), None);
+        assert_eq!(prefix_successor(&[0xff]), None);
+        assert_eq!(prefix_successor(&[0xff, 0xff, 0xff]), None);
+    }
+
+    #[test]
+    fn prefix_successor_is_a_strict_upper_bound_for_every_extension() {
+        // Every string with `prefix` as a prefix must sort strictly below the
+        // successor — spot-check a representative set of extensions.
+        let prefix = vec![10, 20];
+        let successor = prefix_successor(&prefix).unwrap();
+        for ext in [vec![], vec![0], vec![0xff], vec![0, 1, 2], vec![0xff; 5]] {
+            let mut extended = prefix.clone();
+            extended.extend(ext);
+            assert!(
+                extended < successor,
+                "{extended:?} should sort below successor {successor:?}"
+            );
+        }
+        // And the successor is the *smallest* such bound: nothing strictly
+        // between the longest all-0xFF extension of `prefix` and `successor`.
+        let mut longest_extension = prefix.clone();
+        longest_extension.extend([0xff; 8]);
+        assert!(longest_extension < successor);
+    }
+
+    #[test]
+    fn reserved_scan_bounds_covers_every_entity_key_and_the_watermark() {
+        let (start, end) = reserved_scan_bounds();
+        assert!(start < end);
+        let mut keys: Vec<Vec<u8>> = ALL_KINDS
+            .iter()
+            .map(|&kind| entity_key(kind, b"some-id"))
+            .collect();
+        keys.push(applied_index_key());
+        for key in keys {
+            assert!(key >= start, "{key:?} should be >= scan start {start:?}");
+            assert!(key < end, "{key:?} should be < scan end {end:?}");
+        }
+    }
+
+    #[test]
+    fn reserved_scan_bounds_excludes_an_unrelated_namespace() {
+        let (start, end) = reserved_scan_bounds();
+        let other = escape(b"not_the_system_namespace");
+        assert!(
+            other < start || other >= end,
+            "an unrelated namespace's key must fall outside the reserved scan bounds"
+        );
     }
 }

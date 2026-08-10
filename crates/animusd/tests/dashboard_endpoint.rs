@@ -153,6 +153,23 @@ async fn dashboard_serves_spa_with_cors_and_peers() {
                 && storage_js.contains("function updateControlStorageNodeOptions"),
             "dashboard_storage.js fetches and renders the control-plane storage section"
         );
+        // plan-syskv-ui (an ADR 0038 addendum): the system-keyspace BROWSE
+        // section nested inside that same card — a kind filter, an
+        // "as of index N" watermark label, and a forward-only pager — and
+        // the JS wiring driving it against `/admin/system-table`.
+        assert!(
+            body.contains("ctl-kind")
+                && body.contains("ctl-browse-body")
+                && body.contains("ctl-applied-index")
+                && body.contains("ctl-next-page"),
+            "the Storage tab's shell carries the system-table browse section"
+        );
+        assert!(
+            storage_js.contains("function loadSystemTable")
+                && storage_js.contains("/admin/system-table")
+                && storage_js.contains("function renderSystemTableKindOptions"),
+            "dashboard_storage.js fetches and renders the system-table browse section"
+        );
         // The /admin/ui alias serves the same asset.
         let (s, _, body2) = raw(admin_addr, "GET", "/admin/ui").await;
         assert_eq!(s, 200);
