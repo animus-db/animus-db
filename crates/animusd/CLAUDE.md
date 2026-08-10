@@ -292,10 +292,14 @@ route below the edge through the same `ClientCtx` CP primitives.
   `QUERY`/`PREPARE`/`EXECUTE` via the pure `animus_cql` crate. `CREATE TABLE`
   proposes a typed schema into the replicated catalog (incl. clustering/compound
   keys). A partition is one CP value, so `INSERT`/`UPDATE`/`DELETE` are RMW under
-  `rmw_lock`; the requested consistency level is accepted but moot (CP). The
-  keyspace set + **prepared-statement store** (`CqlState`) are per-node edge state
-  (shared across connections *to the same node*, isolated between nodes); prepared
-  ids are content-addressed (FNV-1a of the text).
+  `rmw_lock`; the requested consistency level is accepted but moot (CP).
+  Keyspaces are **replicated** (`CREATE KEYSPACE` proposes
+  `MetaCommand::CreateKeyspace` into the control plane's `Metadata`, ADR 0013;
+  `USE`/qualifier validation reads the replicated set via `keyspace_exists`,
+  with a `ks.table`-prefix fallback). Only the **prepared-statement store**
+  (`CqlState`) is per-node edge state (shared across connections *to the same
+  node*, isolated between nodes, lost on restart); prepared ids are
+  content-addressed (FNV-1a of the text).
 - **Admin / debug** (`admin.rs`, `RoleAddrs.admin`, ADR 0020) — read-only `GET`
   views (`/admin/{config,status,peers,raft,raftkv,storage/*,metrics,metrics/
   history,member/drain-status,health}`) + gated `POST` actions (`/admin/{tablet/

@@ -275,8 +275,12 @@ read-barrier quorum probe, no log entry, no wall clock; a deposed leader returns
 streaming `InstallSnapshot`. All sim-tested (`tests/single_tablet.rs`,
 `read_index.rs`, `snapshot_catchup.rs`) and reproducible from a seed. It reuses
 the generic `RaftCore<C, S>` with a `DRIVER_APPLIED` KV state machine, leaving the
-control plane unchanged. **Not yet:** dynamic membership (Stage C), tablet split
-(Stage D), per-table mode selection / wiring into `animusd`, cross-tablet txns.
+control plane unchanged. *(This paragraph is an as-of-Stages-A+B snapshot; the
+"Not yet" list it originally carried here is stale — Stage C (dynamic
+membership) and Stage D (tablet split, later redesigned per ADR 0028) are both
+✅ Done below, and per-table mode selection / `animusd` wiring are done per the
+Status note above. Cross-tablet transactions remain the one genuinely open item
+— ADR 0018.)*
 
 **Implementation sequencing (each a green-keeping increment):**
 
