@@ -191,6 +191,28 @@ via `remote_metadata_watch_loop` (a genuine `Local` replica serves it, parking o
 rejects it outright). `RemoteControlClient` owns its own driven `MetadataWatch`
 (this required making `animus_control::MetadataWatch::bump` `pub`).
 
+**The ADR 0030 growth-node branch of `remote_metadata_sync_loop` uses the same
+long-poll mechanism**, not the original fixed-200ms `Status` poll — a growth
+node's `ClientCtx.control` stays `ControlHandle::Local` (a real, permanently
+non-voting control-group member, not `Remote`), so it constructs a standalone
+`RemoteControlClient::with_mirror(seeds, ctx.remote_metadata.clone())` sharing
+`ClientCtx.remote_metadata`'s existing `Arc<Mutex<Option<Metadata>>>` directly
+as its mirror, then drives it through the same `remote_metadata_watch_loop`.
+Pure latency improvement — the reconciler's own wake source is unaffected (a
+growth node's local raft never advances, so its `metadata_watch()` still never
+fires; `RECONCILE_FALLBACK_INTERVAL` still drives its ticks, just off a
+fresher mirror). Regression: `tests/cluster_growth.rs::
+growth_node_observes_metadata_promptly_via_watch`. **Gotcha surfaced by this
+port**: a `WatchMetadata` request already in flight to a node at the instant
+it's killed via `Node::shutdown()` doesn't fail over quickly — `shutdown()`
+can't abort an already-spawned `serve_clients` per-connection handler task
+(fire-and-forget, no tracked `JoinHandle`), so the zombie handler's
+`select! { changed(..), sleep(8s) }` always falls through to the timeout arm
+(its watch can never advance once the driver is dead) and replies with
+stale-but-plausible cached data up to 8s late. A fixed-sleep assertion right
+after a test's node-kill can be outrun by this; poll to convergence instead
+(see the engineering-lessons log).
+
 ## Tablet lifecycle
 
 **The per-node tablet-host reconciler (ADR 0031 PR4) is the single owner of this
@@ -333,7 +355,10 @@ route below the edge through the same `ClientCtx` CP primitives.
   raftkv id*, so the control leader's `detect_loop` marks a crashed CP node `Down`.
 - **Online growth (ADR 0030) is data-plane only** — the control group stays static;
   a grown node's control role is a permanent non-voter and mirrors `Metadata` via
-  `remote_metadata_sync_loop` into `effective_metadata()`. A replicated node
+  `remote_metadata_sync_loop` into `effective_metadata()` — long-polling
+  `ClientRequest::WatchMetadata` (ADR 0035 PR5's mechanism, ported onto this
+  branch too — see the `ControlHandle` section above), not a fixed-200ms
+  `Status` poll. A replicated node
   address book (ADR 0032 PR1, `Metadata.node_addrs` + `route_sync_loop`) keeps
   `client_route`/`/admin/peers` live so forwarding reaches nodes grown in later.
 - **Decommission (ADR 0032 PR3)** = `drain` + `MetaCommand::RemoveMember`; check
