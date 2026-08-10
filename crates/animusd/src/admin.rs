@@ -1037,10 +1037,15 @@ struct AddControlMemberReq {
 }
 
 /// `POST /admin/control/member/remove` request body (ADR 0037 PR3): `node` is
-/// the control-plane voter id to remove.
+/// the control-plane voter id to remove. `force` (ADR 0037 hardening PR2,
+/// `#[serde(default)]` so pre-existing callers/old scripts keep working
+/// unchanged) bypasses the liveness-aware quorum-loss guard — see
+/// `ClientCtx::admin_remove_control_member`'s doc.
 #[derive(Deserialize)]
 struct RemoveControlMemberReq {
     node: NodeId,
+    #[serde(default)]
+    force: bool,
 }
 
 async fn action_split(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
@@ -1285,7 +1290,7 @@ async fn action_remove_control_member(ctx: &ClientCtx, body: &[u8]) -> (u16, Val
         Ok(r) => r,
         Err(e) => return e,
     };
-    match ctx.admin_remove_control_member(req.node).await {
+    match ctx.admin_remove_control_member(req.node, req.force).await {
         Ok(outcome) => (
             200,
             json!({"ok": true, "node": req.node, "warning": outcome.warning}),

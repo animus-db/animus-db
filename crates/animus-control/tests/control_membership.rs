@@ -12,10 +12,18 @@
 //! Deterministic + seed-reproducible: every seed is printed in its assertion
 //! messages, and the same seed always drives the same sequence of `Env`
 //! events (no wall clock, no unseeded randomness).
+//!
+//! [`last_contact_ages_out_a_partitioned_peer_but_not_a_healthy_one`] (ADR
+//! 0037 hardening PR2, the quorum-guard liveness fix) covers the new
+//! control-id-native liveness signal itself (`RaftCore::peer_last_contact`/
+//! `RaftNode::control_peer_believed_alive`) at the `RaftNode` level, mirroring
+//! `pre_vote.rs`'s `isolated_follower_prevote_does_not_disturb_stable_leader`
+//! partition idiom.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
+use animus_control::node::CONTROL_PEER_LIVENESS_TIMEOUT;
 use animus_control::{MetaCommand, NodeStatus, ProposeResult, RaftNode};
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::MemoryEngine;
@@ -659,4 +667,72 @@ fn crash_mid_change_converges_across_many_seeds() {
             "seed={seed}: unexpected converged config {reference:?}"
         );
     }
+}
+
+/// **ADR 0037 hardening PR2** (the quorum-guard liveness fix): the leader's
+/// `last_contact` map — stamped from `AppendEntriesResp`, both success and
+/// reject — is a genuinely control-id-native liveness signal, unlike
+/// `ControlHandle::believes_alive` (keyed to raftkv ids, structurally unable
+/// to answer a control-voter liveness question). Partitioning one follower
+/// from the leader (and the other follower, for full isolation — mirroring
+/// `pre_vote.rs`'s idiom) stops its `AppendEntriesResp` traffic; running past
+/// [`CONTROL_PEER_LIVENESS_TIMEOUT`] ages it out of `control_peer_believed_
+/// alive`, while the never-partitioned follower — still acking every
+/// heartbeat at the ordinary cadence — stays fresh throughout.
+#[test]
+fn last_contact_ages_out_a_partitioned_peer_but_not_a_healthy_one() {
+    let seed = 0x000C_0771_20E5;
+    let ids = [0u64, 1, 2];
+    let (mut sim, nodes) = cluster(seed, &ids);
+    sim.run_for(Duration::from_secs(2));
+    let l = unique_leader(&nodes, &[0, 1, 2], seed);
+    let partitioned = (0..3).find(|&i| i != l).unwrap();
+    let healthy = (0..3).find(|&i| i != l && i != partitioned).unwrap();
+
+    // Before any partition, the leader has heard from both peers recently
+    // (heartbeat cadence keeps `last_contact` fresh).
+    assert!(
+        nodes[l].control_peer_believed_alive(partitioned as u64),
+        "seed={seed}: a never-partitioned peer should be believed alive"
+    );
+    assert!(
+        nodes[l].control_peer_believed_alive(healthy as u64),
+        "seed={seed}: a never-partitioned peer should be believed alive"
+    );
+    // Self is trivially alive.
+    assert!(
+        nodes[l].control_peer_believed_alive(l as u64),
+        "seed={seed}: a node should always believe itself alive"
+    );
+
+    // Isolate `partitioned` from both other nodes.
+    sim.partition_pair(partitioned as u64, l as u64);
+    sim.partition_pair(partitioned as u64, healthy as u64);
+
+    // Run well past the liveness timeout — several multiples, mirroring
+    // `pre_vote.rs`'s generous margin for "many election/heartbeat rounds
+    // fired" — while the leader keeps heartbeating the still-connected
+    // `healthy` follower at the ordinary cadence.
+    sim.run_for(CONTROL_PEER_LIVENESS_TIMEOUT * 6);
+
+    assert!(
+        !nodes[l].control_peer_believed_alive(partitioned as u64),
+        "seed={seed}: a peer silent past CONTROL_PEER_LIVENESS_TIMEOUT should \
+         no longer be believed alive"
+    );
+    assert!(
+        nodes[l].control_peer_believed_alive(healthy as u64),
+        "seed={seed}: a peer acking every heartbeat should stay believed \
+         alive across the same window"
+    );
+
+    // Heal: the partitioned peer resumes acking and ages back in.
+    sim.heal(partitioned as u64, l as u64);
+    sim.heal(partitioned as u64, healthy as u64);
+    sim.run_for(Duration::from_secs(1));
+    assert!(
+        nodes[l].control_peer_believed_alive(partitioned as u64),
+        "seed={seed}: a healed peer should be believed alive again once it \
+         resumes acking"
+    );
 }

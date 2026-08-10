@@ -929,6 +929,21 @@ debugging anything that feels like it might have happened before.
   not a structural guarantee for an operator-chosen or control-only id) —
   when there is no real signal in the id space you actually have, don't
   guess one from a different id space's accessor just because it type-checks.
+
+  **Update: closed by the ADR 0037 hardening trio's quorum-guard liveness
+  fix (PR 2, PR #136)** — not by bridging `believes_alive` after all, but by growing a
+  genuinely **control**-id-native signal instead: `RaftCore` already knows
+  exactly who has recently acked an `AppendEntriesResp` (success or reject),
+  since that's the leader's own control-Raft traffic — no id-space crossing
+  needed at all. A volatile `last_contact: BTreeMap<NodeId, Nanos>`
+  (`animus-control/src/raft.rs`, seeded at `become_leader`, stamped in
+  `handle_append_resp`, deliberately never persisted — same lifetime as
+  `next_index`/`match_index`) backs a new `RaftNode::
+  control_peer_believed_alive` (its own `CONTROL_PEER_LIVENESS_TIMEOUT`,
+  not a reuse of `DETECT_TIMEOUT`). The general lesson still holds — it's
+  *why* the fix had to grow a new signal in the id space that actually has
+  one, rather than solving it by finally writing the id-bridging code this
+  entry warned against.
 - **A "resulting count" quorum-loss guard only catches the failure mode where
   the node being removed is the *only* thing that changed — it is blind to
   "a different survivor was already dead before this call."** Writing ADR
@@ -960,6 +975,28 @@ debugging anything that feels like it might have happened before.
   section as a knowingly-accepted risk rather than a defect, since fixing it
   for real needs the raftkv/control id-space unification the previous entry
   above already explains why PR3 didn't attempt.
+
+  **Update: closed by the ADR 0037 hardening trio's quorum-guard liveness
+  fix (PR 2, PR #136)**, via the previous entry's `control_peer_believed_alive`
+  signal — `admin_remove_control_member` now computes `live` = how many of
+  the *resulting* voters are actually reachable, refusing when that's below
+  a majority (naming the apparently-dead voter(s), pointing at a new
+  `--force` escape hatch that is deliberately **independent** of
+  `decommission --force-control-remove` — the two flags are separate,
+  neither implies the other). The core-level primitive
+  (`RaftCore::change_membership`) still has no survivor-liveness guard by
+  design — that stays a pure single-server-delta mechanism, unchanged; the
+  guard lives one layer up, in `animusd`'s admin action, the only layer with
+  a `RaftNode` handle to ask. The regression test this entry named
+  (`animusd/tests/control_membership_admin.rs::
+  removing_a_live_voter_while_another_is_already_dead_can_silently_strand_
+  the_group`) is renamed+flipped to `..._is_refused_without_force` (proving
+  the refusal) with a `..._succeeds_with_force` sibling (proving the escape
+  hatch still reaches the exact same stranding consequence this entry
+  documents, now as informed consent rather than an unconditional default);
+  the core-level test
+  (`removing_a_live_voter_while_a_third_is_already_dead_can_strand_the_group`)
+  is unchanged, since the core itself was never in scope for this fix.
 - **Testing "does `--ephemeral` truly mean a clean slate" needs a fresh
   directory per incarnation, not just flipping the backend flag on a
   same-dir restart — same-dir + `--ephemeral` is not the same claim as

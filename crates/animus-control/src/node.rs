@@ -71,6 +71,24 @@ pub const DETECT_TIMEOUT: Duration = Duration::from_millis(500);
 /// `UpsertMember{status}` transitions (ADR 0012).
 const DETECT_INTERVAL: Duration = Duration::from_millis(100);
 
+/// How long a control-group leader tolerates silence (no `AppendEntriesResp`,
+/// success or reject) from a **control voter** before
+/// [`RaftNode::control_peer_believed_alive`] judges it dead (ADR 0037
+/// hardening PR2's quorum-guard liveness fix). Deliberately its **own**
+/// constant, not a reuse of [`DETECT_TIMEOUT`]: `DETECT_TIMEOUT` gates
+/// [`FailureDetector`]'s **raftkv**-id member liveness (heartbeats over the
+/// data-role env, ADR 0012) — a structurally different signal keyed to a
+/// different id space (see `ControlHandle::believes_alive`'s doc and
+/// `docs/engineering-lessons.md`'s "id-space mismatch" entry for why that
+/// signal can't answer a control-voter liveness question). This constant
+/// instead gates `RaftCore::peer_last_contact`, a **control**-id-native
+/// signal derived straight from control-Raft's own `AppendEntriesResp`
+/// traffic — no id bridging, no guessing. Sized to comfortably exceed a few
+/// [`HEARTBEAT_INTERVAL`]s (the control heartbeat cadence, driven by
+/// `broadcast_append` on every leader tick) so one delayed/dropped
+/// `AppendEntries` round doesn't flap a healthy voter.
+pub const CONTROL_PEER_LIVENESS_TIMEOUT: Duration = Duration::from_millis(500);
+
 /// Grace period after this node first observes itself leader for a term, during
 /// which it will **not** mark any member `Down` (ADR 0012). The
 /// [`FailureDetector`] is per-node volatile state (only the transitions it drives
@@ -557,6 +575,43 @@ impl<E: Env> RaftNode<E> {
             .lock()
             .expect("detector poisoned")
             .is_alive(member, self.env.now())
+    }
+
+    /// Whether `node` (a **control**-voter id) is believed alive, per the
+    /// control-Raft-native liveness signal `RaftCore::peer_last_contact`
+    /// tracks (ADR 0037 hardening PR2) — unlike [`believes_alive`](Self::
+    /// believes_alive), which is keyed to **raftkv** ids and thus always
+    /// `false` for a control id for reasons that have nothing to do with
+    /// actual liveness (see `docs/engineering-lessons.md`'s "id-space
+    /// mismatch" entry), this reads a fact this node's own control `RaftCore`
+    /// observed directly, no id bridging needed. Three cases:
+    /// - `node == self`: always alive — a node trivially believes itself up.
+    /// - `node` has never been heard from by this leadership stint
+    ///   (`peer_last_contact` returns `None`): alive — grace for a peer this
+    ///   leader hasn't had a chance to hear from yet, notably a just-added
+    ///   voter (`change_membership`) or a peer of a leader that only just won
+    ///   an election. Deliberately generous, not "unknown" — see the
+    ///   `last_contact` field doc in `raft.rs` for why this case is not
+    ///   back-filled instead.
+    /// - Otherwise: alive iff the last contact is within
+    ///   [`CONTROL_PEER_LIVENESS_TIMEOUT`] of now.
+    ///
+    /// Meaningful only when this node is (or recently was) the control
+    /// leader — a non-leader's `last_contact` map is always empty (nobody
+    /// sends it `AppendEntriesResp`), so every non-self peer reads as alive
+    /// on a follower, same generous-default behavior as the never-contacted
+    /// case above.
+    pub fn control_peer_believed_alive(&self, node: NodeId) -> bool {
+        if node == self.env.node_id() {
+            return true;
+        }
+        match self.lock().peer_last_contact(node) {
+            None => true,
+            Some(last) => {
+                let now = self.env.now();
+                now.0.saturating_sub(last.0) < CONTROL_PEER_LIVENESS_TIMEOUT.as_nanos() as u64
+            }
+        }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, RaftCore> {

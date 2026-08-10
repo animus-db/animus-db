@@ -620,12 +620,50 @@ route below the edge through the same `ClientCtx` CP primitives.
   `docs/engineering-lessons.md` for the full war story (including a real
   self-registration/admin-action clobber race the regression test's
   bring-up had to sequence around).
-  Remove's quorum-loss warning (down to 1 voter) is the only implemented
-  trigger — the plan's second trigger ("every other voter believed Down")
-  was dropped: `ControlHandle::believes_alive` is keyed to **raftkv** ids
-  (see the "cluster's members are the raftkv ids, not the control ids"
-  gotcha above), so calling it with a control id is always `false`, not
-  "unknown" — see the engineering-lessons "id-space mismatch" entry.
+  Remove's original quorum-loss warning (down to 1 voter) was the only
+  implemented trigger — the plan's second trigger ("every other voter
+  believed Down") was originally dropped: `ControlHandle::believes_alive` is
+  keyed to **raftkv** ids (see the "cluster's members are the raftkv ids,
+  not the control ids" gotcha above), so calling it with a control id is
+  always `false`, not "unknown" — see the engineering-lessons "id-space
+  mismatch" entry.
+
+  **Update (ADR 0037 hardening PR2, PR #136, the quorum-guard liveness fix): a real
+  survivor-liveness trigger now exists**, via a genuinely control-id-native
+  signal instead of bridging `believes_alive`'s raftkv-keyed one:
+  `RaftCore::peer_last_contact` (`animus-control/src/raft.rs`) tracks, per
+  peer, the `now` of the leader's last `AppendEntriesResp` — success or
+  reject, either proves reachability — in a volatile `last_contact:
+  BTreeMap<NodeId, Nanos>` seeded at `become_leader` and never
+  persisted/snapshotted (same lifetime discipline as `next_index`/
+  `match_index`). `RaftNode::control_peer_believed_alive` (`node.rs`, its
+  own `CONTROL_PEER_LIVENESS_TIMEOUT = 500ms`, deliberately not a reuse of
+  `DETECT_TIMEOUT`) turns that into a bool: always `true` for self, `true`
+  for a peer never yet contacted this leadership stint (grace for a
+  just-added voter), else gated on the timeout.
+  `admin_remove_control_member` now computes `live` = how many of the
+  *resulting* voters (after this removal) pass that check, and refuses if
+  `live` is below a majority of `remaining.len()` — naming the
+  apparently-dead voter(s) and pointing at a new `force: bool` parameter
+  (`POST /admin/control/member/remove {node, force}`, `#[serde(default)]`;
+  CLI: `animus admin control-remove <leader> <id> [--force]`). **`force` is
+  deliberately independent of `decommission --force-control-remove`** — the
+  latter only means "run `control-remove` as part of decommission," never
+  "and skip `control-remove`'s own safety checks"; `run_decommission`'s
+  internal call always passes `force: false`. Removing the node that is
+  itself the dead one needs no `--force` (it's excluded from `remaining` by
+  construction — the guard only ever counts *other* survivors). Regression:
+  `tests/control_membership_admin.rs`'s
+  `removing_a_live_voter_while_another_is_already_dead_is_refused_without_
+  force`/`..._succeeds_with_force`/`removing_the_actually_dead_voter_itself_
+  needs_no_force`/`removing_a_voter_when_every_remaining_voter_is_alive_is_
+  never_refused`, plus a `SimEnv` proof at the `RaftNode` level in
+  `animus-control/tests/control_membership.rs::
+  last_contact_ages_out_a_partitioned_peer_but_not_a_healthy_one`. The
+  core-level `RaftCore::change_membership` still has no survivor-liveness
+  guard by design (unchanged, still a pure single-server-delta mechanism) —
+  the guard lives one layer up, in this crate's admin action, the only layer
+  with a `RaftNode` handle to ask.
   Removing the current leader's own slot arms a `transfer_leadership` and
   returns the same not-leader refusal every other case here uses (never a
   silent success) rather than trying to complete the removal itself once it
@@ -704,12 +742,19 @@ Test-file map (`tests/`):
   than silently completing, down-to-1-voter warns, down-to-0 is refused);
   both mutating actions refuse on a follower (not relayable); a runtime-added
   voter survives a leadership change to a different original voter (PR4);
-  plus two PR5 additions — removing a live voter while another is already
-  dead succeeds with no warning and demonstrably strands the group for any
-  further membership change (the shipped guard only ever counts the
-  resulting voter set, never survivor liveness), and two concurrent
-  `control/member/add` calls race cleanly (loser gets a retryable `409`, its
-  retry succeeds once the winner commits).
+  plus a PR5 addition — two concurrent `control/member/add` calls race
+  cleanly (loser gets a retryable `409`, its retry succeeds once the winner
+  commits). **The hardening trio's PR2 (quorum-guard liveness fix) replaced
+  the original PR5 §9 test that documented "removing a live voter while
+  another is already dead succeeds with no warning" as an *accepted* risk**:
+  the liveness-aware guard now refuses that removal outright
+  (`removing_a_live_voter_while_another_is_already_dead_is_refused_without_
+  force`), with a `--force` sibling proving the same operationally-risky
+  removal (and its stranding consequence) is still reachable as an explicit
+  escape hatch (`..._succeeds_with_force`), plus the dead-voter-removes-
+  itself-needs-no-force and every-remaining-voter-alive-is-never-refused
+  cases — see `animusd/CLAUDE.md`'s "Control-plane membership change" gotcha
+  for the mechanism.
 - `control_membership_split.rs` (ADR 0037 PR5) — the `split_cluster.rs`-style
   multi-process scenario: over a genuine split deployment (control-only +
   data-only processes), grow the control quorum by one at runtime, then

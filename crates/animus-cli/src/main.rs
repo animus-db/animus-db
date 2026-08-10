@@ -49,7 +49,7 @@ const ADMIN_USAGE: &str = "  admin <subcommand> <admin-addr> [args]:\n    \
     remove <admin-addr> <node-id>\n    \
     decommission <admin-addr> <node-id> [--force-control-remove]\n    \
     control-add <leader-admin-addr> <node-id> <new-node-admin-addr>\n    \
-    control-remove <leader-admin-addr> <node-id>\n    \
+    control-remove <leader-admin-addr> <node-id> [--force]\n    \
     control-grow <leader-admin-addr> <node-id> <admin-addr> [<node-id> <admin-addr>...]";
 
 async fn run(args: &[String]) -> Result<(), String> {
@@ -141,7 +141,8 @@ async fn run_admin(args: &[String]) -> Result<(), String> {
             .ok_or("control-remove needs <node-id>")?
             .parse()
             .map_err(|_| "node id must be a number")?;
-        return run_control_remove(addr, node).await;
+        let force = arg(3) == Some("--force");
+        return run_control_remove(addr, node, force).await;
     }
     if sub == "control-grow" {
         let pairs = &args[2..];
@@ -331,7 +332,12 @@ async fn run_decommission(
                 "node {node} is a control voter (control id {control_id}); \
                  removing it from the control group first..."
             );
-            run_control_remove(addr, control_id).await?;
+            // `--force-control-remove` does NOT imply `--force`: these are
+            // separate, independently-explicit escape hatches (see
+            // `run_control_remove`'s doc). If the removal itself is refused
+            // by the liveness guard, the operator must retry with `animus
+            // admin control-remove <addr> <control_id> --force` explicitly.
+            run_control_remove(addr, control_id, false).await?;
             let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
             loop {
                 let (status, resp) = http_call(addr, "GET", "/admin/control/members", None).await?;
@@ -473,13 +479,20 @@ async fn run_control_add(
     }
 }
 
-/// `animus admin control-remove <leader-admin-addr> <node-id>` (ADR 0037
-/// PR3): a thin wrap over `POST /admin/control/member/remove`, printing the
-/// server's `warning` field (ADR 0037 §2's deliberately-allowed-but-risky
-/// quorum-loss cases) to stderr rather than swallowing it — mirroring
-/// `remove`'s existing print-then-check-status shape.
-async fn run_control_remove(leader_admin_addr: &str, node: u64) -> Result<(), String> {
-    let body = serde_json::json!({"node": node}).to_string();
+/// `animus admin control-remove <leader-admin-addr> <node-id> [--force]`
+/// (ADR 0037 PR3, `--force` added by the hardening-trio's quorum-guard
+/// liveness fix): a thin wrap over `POST /admin/control/member/remove`,
+/// printing the server's `warning` field (ADR 0037 §2's deliberately-
+/// allowed-but-risky quorum-loss cases) to stderr rather than swallowing it —
+/// mirroring `remove`'s existing print-then-check-status shape. `--force`
+/// bypasses the server's liveness-aware quorum-loss guard (refuse if fewer
+/// than a majority of the *resulting* voters are reachable) — it is **not**
+/// implied by `decommission --force-control-remove`, a deliberately separate
+/// flag: that one only says "run control-remove as part of decommission,"
+/// never "and skip control-remove's own safety checks" (see
+/// `run_decommission`'s doc and `animusd::ClientCtx::admin_remove_control_member`).
+async fn run_control_remove(leader_admin_addr: &str, node: u64, force: bool) -> Result<(), String> {
+    let body = serde_json::json!({"node": node, "force": force}).to_string();
     let (status, resp) = http_call(
         leader_admin_addr,
         "POST",

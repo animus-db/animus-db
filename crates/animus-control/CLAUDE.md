@@ -135,6 +135,37 @@ per-tablet CP data plane (`animus-cp-data`).
   0031) is the executor-agnostic "applied index advanced" notification the
   per-node CP reconciler uses to react to a `Metadata` change without polling.
 
+  **ADR 0037 hardening PR2 (PR #136, the quorum-guard liveness fix) adds a genuinely
+  control-id-native liveness signal**, closing the gap PR3's own doc and
+  `docs/engineering-lessons.md`'s "id-space mismatch" entry flagged:
+  `ControlHandle::believes_alive` is keyed to **raftkv** ids (the failure
+  detector only ever observes heartbeats on the data role, ADR 0012), so it
+  can't answer "is this control voter alive" — calling it with a control id
+  is always `false`, not "unknown". Rather than bridging that id space, this
+  reads a fact the leader's own control-Raft traffic already carries:
+  `RaftCore::peer_last_contact(node) -> Option<Nanos>` (`raft.rs`) is the
+  `now` of the last `AppendEntriesResp` (success **or** reject — either
+  proves reachability) from `node`, backed by a volatile `last_contact:
+  BTreeMap<NodeId, Nanos>` seeded for every peer in `become_leader` and
+  stamped in `handle_append_resp` — deliberately **never persisted or
+  snapshotted**, exactly like `next_index`/`match_index` (meaningless across
+  a leadership change, rebuilt empty on recovery; a freshly-added peer via
+  `change_membership` gets no explicit entry either, relying on the read
+  side's "never contacted yet ⇒ alive" grace rather than an explicit write
+  at peer-add time — see the field's own doc for why). `RaftNode::
+  control_peer_believed_alive(node) -> bool` (`node.rs`) turns the raw fact
+  into policy: always `true` for self; `true` if `node` has never been
+  contacted this leadership stint (grace for a just-added voter, or any peer
+  right after this node won an election); otherwise gated on its own
+  `CONTROL_PEER_LIVENESS_TIMEOUT = 500ms` (deliberately **not** a reuse of
+  `DETECT_TIMEOUT`, which gates a structurally different raftkv-id signal).
+  `animusd`'s `admin_remove_control_member` is the consumer — see that
+  crate's `CLAUDE.md`. Regression: `tests/control_membership.rs::
+  last_contact_ages_out_a_partitioned_peer_but_not_a_healthy_one` (a
+  `SimEnv` proof at the `RaftNode` level, mirroring `pre_vote.rs`'s
+  partition idiom) — this crate's own tests stay core/driver-level only,
+  same discipline as PR1/PR3.
+
   **ADR 0038 PR3 (the cutover): `Metadata` is `DRIVER_APPLIED`, so `RaftNode`'s
   single driver is now split into a consensus loop and an async apply task**,
   mirroring `animus-cp-data`'s proven shape exactly:
@@ -749,10 +780,18 @@ heartbeats). The 25 binaries:
   from a seed; plus two PR5 additions — a freshly-added voter's process
   restarting before it's caught up recovers from whatever WAL/snapshot it had
   and resumes, and removing a live voter while a different one is already
-  dead is accepted (no core-level survivor-liveness guard) and demonstrably
-  strands the group (a stranded 2-voter config with one dead never commits
-  anything again) — the risk ADR 0037's Consequences section documents as
-  knowingly accepted.
+  dead is accepted **at the core level** (`RaftCore::change_membership` has
+  no survivor-liveness guard, by design — that guard lives one layer up, in
+  `animusd`'s admin action; see below) and demonstrably strands the group (a
+  stranded 2-voter config with one dead never commits anything again) — the
+  risk ADR 0037's Consequences section documents as knowingly accepted at
+  the core level specifically. Plus (ADR 0037 hardening PR2, the
+  quorum-guard liveness fix): `last_contact_ages_out_a_partitioned_peer_
+  but_not_a_healthy_one` proves the new control-id-native liveness signal
+  itself (`RaftCore::peer_last_contact`/`RaftNode::
+  control_peer_believed_alive`) — partitioning one follower ages it out past
+  `CONTROL_PEER_LIVENESS_TIMEOUT` while a never-partitioned one stays fresh,
+  and it ages back in on heal.
 - **`control_membership_prod.rs`** (ADR 0037 PR5) — the real-thread `ProdEnv`
   liveness counterpart to `control_membership.rs`: grows a real 3-node
   control group to 5 (two sequential single-server `change_membership`
