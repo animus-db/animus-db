@@ -2714,6 +2714,48 @@ debugging anything that feels like it might have happened before.
   down at the call site, not just in an audit PR's description, so the next
   reader doesn't have to re-derive it.
 
+  **Update: the flagged `heartbeat_loop` gap above is now closed (PR #134,
+  the ADR 0037 hardening trio's PR 1)** — and closing it surfaced a second,
+  previously-undocumented gap the original text above never named at all,
+  which is itself the generalizable lesson: **a "this destination list is
+  static" finding must also check the transport *address book* — the two
+  are separate staleness axes that fail together, and fixing only the list
+  leaves the send silently dropped anyway.** `heartbeat_loop`'s
+  `control_ids` argument was one axis (*which ids* to heartbeat); the
+  raftkv env's own peer book was the other (*where* to actually reach each
+  of those ids) — `peer_sync_loop` already refreshed the book from
+  `Metadata.cp_member_addrs`/`node_addrs[*].raftkv` on a timer, but never
+  from `node_addrs[*].control`, so a runtime-added control voter's address
+  never landed there. A destination list naming a live id with no matching
+  address book entry is not a partial fix — `ProdEnv::send`'s fire-and-forget
+  contract means the gap stays *exactly* as silent as the one being fixed
+  (no error, no log at above debug, just a heartbeat that never arrives).
+  The fix, once both axes were identified, was mechanically the same shape
+  each time this class of bug has appeared in this ADR's own stack
+  (`control_peer_sync_loop`'s `.control` merge for the control role's own
+  peer book, PR2's `node_addrs`/`Status.control_voters` wiring for
+  discovery): (a) a new animusd-local `heartbeat_loop_live` re-derives the
+  destination list every tick from `ctx.control.config()` instead of the
+  bring-up-time snapshot `animus_control::node::heartbeat_loop` was pinned
+  to (that function itself, and its `SimEnv` call sites, are deliberately
+  untouched — the static-list contract is still correct there); (b)
+  `peer_sync_loop` gained the missing `node_addrs[*].control` merge,
+  alongside its existing `.raftkv`/`cp_member_addrs` ones. **General rule
+  for any future "is this destination list live" audit**: grep the sending
+  env's own peer-book refresh loop in the same pass — a live list and a
+  stale book produce the identical externally-visible symptom (silence),
+  so a test that only asserts on the destination-list computation, without
+  driving a real send through a real socket, will not catch the second
+  axis. `tests/heartbeat_live_destinations.rs::
+  heartbeat_reaches_a_runtime_added_voter_after_it_becomes_leader` catches
+  both together: it grows a control voter at runtime, forces a
+  deterministic 2-voter leadership transfer onto it, and polls the new
+  leader's own `/admin/raft` view for a *sustained* `believes_alive: true`
+  across several `DETECT_TIMEOUT` windows — a test that fixed only the
+  list (or only the book) would still fail this, since the other half's
+  silent drop is indistinguishable from "no fix at all" to anything short
+  of a real end-to-end delivery check.
+
 - **A one-time "enable this feature" flag set on a driver task's first async
   line races the very thing it's supposed to gate — set it synchronously,
   before any task is spawned, or thread it through anything that wholesale
@@ -2858,3 +2900,36 @@ debugging anything that feels like it might have happened before.
   of a session and reuse *that* prefix for every absolute path, rather than
   assuming the repo's conventional root path is the same as the assigned
   worktree.
+- **After editing a file via the Write/Edit tools, verify the change actually
+  reached the filesystem the Bash tool (and thus `cargo`) sees — don't trust
+  a "success" result alone.** Debugging this PR's own heartbeat-liveness
+  regression test (ADR 0037 hardening PR1, PR #134) burned well over an
+  hour chasing a phantom distributed-systems bug — a control-only leader's
+  `FailureDetector` losing `believes_alive` ~500ms after a runtime-added
+  voter took over leadership, permanently, never self-healing — that was
+  entirely explained once `git diff --stat`/`grep` **run through Bash**
+  showed the fix (`heartbeat_loop_live`, the `peer_sync_loop` address-book
+  merge) had *never actually landed* in `crates/animusd/src/lib.rs`: the
+  Write/Edit tool session had a stale/cached view of that file, diverged
+  from what a fresh `cat`/`Write` heredoc through Bash produced for a
+  *different* file in the same debugging session (a test file created via
+  `Write`, invisible to `ls`/`grep` through Bash until the same content was
+  independently written through Bash itself). Every `cargo build` in
+  between kept succeeding — which felt like confirmation the edits had
+  landed, but a clean build of *unchanged* code is indistinguishable from a
+  clean build of the intended change; a passing build proves nothing about
+  which source it built. **Concrete mitigation**: immediately after any
+  Write/Edit-tool change to a file a build depends on, run `grep`/`git diff
+  --stat` on that exact path **through the Bash tool** for a string unique
+  to the new content, before writing a single line of test/debug code
+  against the assumption it landed — this costs one command and would have
+  caught the divergence at the first edit instead of an hour into a wild
+  goose chase. If Bash's view and the Edit tool's view ever disagree on a
+  file's content (one tool sees a change the other doesn't, or a
+  freshly-`Write`-created file is invisible to `ls` through Bash), treat it
+  as a real tooling desync, not a typo — stop trusting that tool's Read
+  cache for the affected file and do all further edits to it through Bash
+  (`cat > file <<'EOF' ... EOF` / `python3` in-place patch) until a fresh
+  `Read` of the file (forced by an external touch, which this session's
+  harness surfaces as a "file was modified externally" notice) demonstrably
+  matches Bash's own view again.

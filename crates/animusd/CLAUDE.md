@@ -477,19 +477,26 @@ route below the edge through the same `ClientCtx` CP primitives.
   same on-disk WALs — always pass a fresh explicit `--dir` for a throwaway run.
 - **The cluster's members are the raftkv ids, not the control ids** — `bootstrap`
   (leader-only, idempotent) registers `300+i` as `Active`. Failure detection runs
-  over `ProdEnv`: each node's `heartbeat_loop` heartbeats the control group *as its
-  raftkv id*, so the control leader's `detect_loop` marks a crashed CP node `Down`.
-  **`heartbeat_loop`'s `control_ids` (heartbeat destination list) is a
-  bring-up-time snapshot with no live-overlay refresh (ADR 0037 PR4 audit,
-  flagged and deliberately left as a follow-up, not fixed here)**: a raftkv
-  node started before a control voter is added at runtime never heartbeats
-  that voter directly, so if it later becomes leader, this specific
-  already-running raftkv node's heartbeats keep missing it — bounded in
-  practice (every *other* raftkv node's heartbeats still reach it, and a
-  restart re-reads current `control_ids`), but a real, if narrow, gap. See
-  `docs/engineering-lessons.md`'s ADR 0037 PR4 `control_ids` audit entry for
-  the full reasoning on why this one was scoped out while
-  `admin_remove_member`'s refusal (below) was fixed in the same PR.
+  over `ProdEnv`: each node's `heartbeat_loop_live` heartbeats the control group
+  *as its raftkv id*, so the control leader's `detect_loop` marks a crashed CP
+  node `Down`. **`heartbeat_loop_live`'s destination list is now live (ADR 0037
+  hardening PR1, PR #134 — closing the ADR 0037 PR4 audit's deferred gap)**: it
+  re-derives the control-group target list from `ctx.control.config()` every
+  tick, instead of the bring-up-time `control_ids` snapshot the older
+  `animus_control::node::heartbeat_loop` was pinned to forever (that function
+  itself, and its `SimEnv` call sites, are unchanged — only `animusd`'s two
+  real-node call sites moved to the new wrapper). A `ControlHandle::Remote`
+  data-only node falls back to the static list until its first live
+  `Status`/`WatchMetadata` reply lands. **Closing this needed a second,
+  previously-undocumented fix the original deferral text never named**:
+  `peer_sync_loop` (`lib.rs`, near `control_peer_sync_loop` below) now also
+  merges `Metadata.node_addrs[*].control` into the raftkv env's own peer
+  book — without it, a live destination list alone is still inert, since
+  `ProdEnv::send` silently drops a heartbeat aimed at an address-less peer.
+  See `docs/engineering-lessons.md`'s entry on this PR for the
+  two-staleness-axes mini-lesson (a static-destination-list audit must also
+  check the transport address book) and ADR 0037's "Known deferrals" section
+  for the full "Update: closed by PR #134" note.
 - **Online growth (ADR 0030) is data-plane only** — the control group stays static;
   a grown node's control role is a permanent non-voter and mirrors `Metadata` via
   `remote_metadata_sync_loop` into `effective_metadata()` — long-polling
