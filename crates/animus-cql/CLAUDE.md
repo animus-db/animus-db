@@ -60,11 +60,9 @@ stays deterministic and unit-testable. The socket edge that drives it lives in
 - **A *partition* is the unit of storage (`plan`).** A CQL `SELECT pk = ?` is a
   **single-partition point read** of one data-plane key (CQL has no cross-partition
   or range `WHERE`), so everything it returns must live under **one** data-plane
-  key. The data plane *does* now expose a native quorum range scan
-  (`DataClient::scan`, used by the DynamoDB base `Query`/`Scan`), but CQL does not
-  use it yet — a partition is still stored as one value, so SELECT needs no scan. With clustering
+  key — a partition is stored as one value, so SELECT needs no scan. With clustering
   columns a partition key maps to *many* rows, so the whole partition is one
-  data-plane value keyed by `data_key(table, pk.to_key_bytes())`: a format byte
+  data-plane value keyed by `data_key(pk.to_key_bytes())`: a format byte
   (`ROW_FORMAT_V2`), a `u16` row count, then per row a length-prefixed clustering
   blob and the row's `(u16 schema index, u32 len, cell)` non-key cells. Decoding
   into `Partition` keys rows by their **order-preserving clustering blob**
@@ -74,6 +72,13 @@ stays deterministic and unit-testable. The socket edge that drives it lives in
   key (decoded back via the schema). `INSERT`/`UPDATE`/`DELETE` are therefore
   **read-modify-write at the edge** (read the partition, mutate, write back), and
   a `DELETE` that empties the partition tombstones the data-plane key.
+- **The data-plane key carries a Murmur3 token prefix and no table name.**
+  `data_key(pk_bytes)` (in `query.rs`) returns
+  `partition_token(pk_bytes) || pk_bytes` — the ADR 0022 hash-ring token prefix,
+  same convention as the DynamoDB edge. The former `table` argument was removed
+  by ADR 0023: tables are separated by **per-table tablets**, not by a key
+  prefix (`data_key_disambiguates_partition_keys` in `query.rs` proves it — "the
+  table is no longer in the key").
 - **Consistency is honored.** `Consistency::from_short` decodes the QUERY/EXECUTE
   `[consistency]`; `consistency_quorum(level, replicas)` maps it to a per-request
   quorum size (`ONE`→1, `QUORUM`→majority, `ALL`→all, `TWO`/`THREE`→that many,
@@ -132,10 +137,10 @@ parsing/encoding/planning stays here, control-plane wiring stays at the edge.
   (`AND ck = value`); there are no range predicates, `IN`, `ORDER BY`, or
   `LIMIT`. `INSERT`/`UPDATE` require the full primary key.
 - Because a partition is one data-plane value, a partition with very many rows is
-  a large value (no per-row paging). Acceptable for the subset; native quorum
-  range scan is future work (the data-plane primitive `DataClient::scan` now
-  exists — used by the DynamoDB base `Query`/`Scan` — but the CQL planner does not
-  yet model range/`LIMIT` predicates over it; ADR 0006).
+  a large value (no per-row paging). Acceptable for the subset; a native range
+  scan is future work (the CP data plane exposes a linearizable scan — used by
+  the DynamoDB base `Query`/`Scan` via `animusd`'s `cp_scan` — but the CQL
+  planner does not yet model range/`LIMIT` predicates over it; ADR 0006).
 - `UPDATE`/`DELETE` are upsert/whole-row only — no per-column `DELETE`, no `IF`
   (`LWT`), no counters or collection mutation.
 - The requested **consistency level is honored** (mapped to the data-plane
