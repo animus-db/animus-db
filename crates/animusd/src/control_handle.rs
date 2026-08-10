@@ -139,6 +139,20 @@ pub(crate) struct RemoteControlClient {
     /// [`observe`](Self::observe); handed out (cloned) via
     /// [`metadata_watch`](Self::metadata_watch).
     watch: MetadataWatch,
+    /// The last **live control-voter set** observed from any control node's
+    /// `Status`/`WatchMetadata` reply (ADR 0037 PR2) — `None` until the
+    /// first one lands, so a caller can tell "never fetched" apart from "the
+    /// control group genuinely has zero voters" (which can't happen in
+    /// practice, but this handle doesn't get to assume that on a caller's
+    /// behalf). This is deliberately **not** the same thing as `mirror`'s
+    /// `Metadata.node_addrs` (the replicated address *bookkeeping*, which can
+    /// list a node with `role: "control"` whether or not it is *currently* a
+    /// live Raft voter) — this is the actual `RaftCore::config()` a genuine
+    /// control-group replica would read locally, echoed over the wire so a
+    /// data-only node (or a future admin/CLI caller riding this same handle)
+    /// can learn it without one. Updated by [`observe`](Self::observe) under
+    /// the identical freshness gate as the metadata mirror.
+    control_voters: Arc<Mutex<Option<BTreeSet<NodeId>>>>,
     /// No-op metrics sink: a data-only node's control-plane access has no
     /// local Raft loops to instrument (unlike `Local`, whose `RaftNode`
     /// records into its own env's real sink).
@@ -174,6 +188,7 @@ impl RemoteControlClient {
             mirror,
             leader_hint: Arc::new(Mutex::new(None)),
             watch: MetadataWatch::default(),
+            control_voters: Arc::new(Mutex::new(None)),
             metrics: MetricsHandle::noop(),
         }
     }
@@ -219,9 +234,21 @@ impl RemoteControlClient {
         self.watch.clone()
     }
 
+    /// The last live control-voter set observed on the wire (ADR 0037 PR2) —
+    /// see the `control_voters` field's doc for what this is (and is not)
+    /// the same thing as. `None` until [`observe`](Self::observe) has landed
+    /// at least one reply.
+    pub(crate) fn control_voters(&self) -> Option<BTreeSet<NodeId>> {
+        self.control_voters
+            .lock()
+            .expect("remote control-voters poisoned")
+            .clone()
+    }
+
     /// Record a `Status`/`WatchMetadata` reply's metadata + leader hint +
-    /// applied-index watermark. Called by [`crate::remote_metadata_watch_loop`]
-    /// and by [`metadata_fresh`](Self::metadata_fresh)'s own live fetch — both
+    /// applied-index watermark + live control-voter set. Called by
+    /// [`crate::remote_metadata_watch_loop`] and by
+    /// [`metadata_fresh`](Self::metadata_fresh)'s own live fetch — both
     /// observe the identical wire shape, so both refresh the same state.
     ///
     /// **Non-regression guard (ADR 0035 PR5):** any control node may answer —
@@ -229,23 +256,29 @@ impl RemoteControlClient {
     /// lagging behind one this handle already observed must not overwrite a
     /// fresher mirror with a staler snapshot. `watermark` is the answering
     /// node's own applied index at reply time, a monotonic proxy for how
-    /// fresh `metadata` is; the mirror + watch only advance together
-    /// (`watermark >= watch.latest()`, so a same-watermark reply still
-    /// refreshes the mirror — e.g. an unchanged snapshot re-observed after a
-    /// timed-out long-poll retry). The leader hint is taken unconditionally
-    /// regardless — it self-heals independently (see the type doc) and isn't
-    /// a snapshot whose *content* can regress the same way.
+    /// fresh `metadata` is; the mirror + watch (and, ADR 0037 PR2, the
+    /// observed voter set) only advance together (`watermark >= watch.
+    /// latest()`, so a same-watermark reply still refreshes them — e.g. an
+    /// unchanged snapshot re-observed after a timed-out long-poll retry).
+    /// The leader hint is taken unconditionally regardless — it self-heals
+    /// independently (see the type doc) and isn't a snapshot whose *content*
+    /// can regress the same way.
     pub(crate) fn observe(
         &self,
         metadata: Metadata,
         leader_hint: Option<(NodeId, SocketAddr)>,
         watermark: u64,
+        control_voters: BTreeSet<NodeId>,
     ) {
         if let Some(hint) = leader_hint {
             *self.leader_hint.lock().expect("leader hint poisoned") = Some(hint);
         }
         if watermark >= self.watch.latest() {
             *self.mirror.lock().expect("remote control mirror poisoned") = Some(metadata);
+            *self
+                .control_voters
+                .lock()
+                .expect("remote control-voters poisoned") = Some(control_voters);
             self.watch.bump(watermark);
         }
     }
@@ -281,9 +314,10 @@ impl RemoteControlClient {
                 metadata,
                 leader_hint,
                 watermark,
+                control_voters,
             } = relay_request(addr, &ClientRequest::Status).await
             {
-                self.observe(metadata.clone(), leader_hint, watermark);
+                self.observe(metadata.clone(), leader_hint, watermark, control_voters);
                 return metadata;
             }
         }
@@ -433,13 +467,28 @@ impl ControlHandle {
         }
     }
 
-    /// This handle's current voter configuration (introspection,
-    /// `/admin/raft`). Always empty for `Remote` — it is not a voter of
-    /// anything.
-    pub(crate) fn config(&self) -> BTreeSet<NodeId> {
+    /// This handle's view of the **live** control-voter configuration —
+    /// introspection (`/admin/raft`) and the wire-discovery field
+    /// [`ClientResponse::Status::control_voters`](crate::ClientResponse::Status)
+    /// both read this (ADR 0037 PR2).
+    ///
+    /// `Local` always knows this outright: it's a genuine control-group
+    /// replica reading its own `RaftCore::config()` — `Some(..)`,
+    /// unconditionally. `Remote` has no local `RaftCore` to read at all, so
+    /// this instead reports the last voter set observed on any
+    /// `Status`/`WatchMetadata` reply from the control deployment (see
+    /// [`RemoteControlClient::control_voters`]) — `None` until the first one
+    /// lands. The `Option` is deliberate: "unknown, never fetched" (`None`)
+    /// and "genuinely zero voters" (`Some(empty set)`, which can't happen in
+    /// practice, but this method doesn't get to assume that on a caller's
+    /// behalf — see the plan's "honesty" requirement) must stay
+    /// distinguishable, unlike the pre-ADR-0037 behavior this replaces (a
+    /// bare, always-empty `BTreeSet` for `Remote`, which silently conflated
+    /// the two).
+    pub(crate) fn config(&self) -> Option<BTreeSet<NodeId>> {
         match self {
-            Self::Local(raft) => raft.config(),
-            Self::Remote(_) => BTreeSet::new(),
+            Self::Local(raft) => Some(raft.config()),
+            Self::Remote(remote) => remote.control_voters(),
         }
     }
 

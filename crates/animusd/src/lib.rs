@@ -753,12 +753,35 @@ pub enum ClientResponse {
     /// [`ClientRequest::WatchMetadata`]'s `last_seen`, and the monotonic
     /// freshness proxy [`control_handle::RemoteControlClient::observe`] uses
     /// to reject a reply from a replica lagging behind one it already saw.
+    ///
+    /// **`control_voters` (ADR 0037 PR2)**: the answering node's own live
+    /// control-voter set (`ControlHandle::config()`, `unwrap_or_default()`'d
+    /// — see that method's doc for the `Option`'s meaning) at reply time.
+    /// This is the wire echo of `RaftCore::config()` — the actual, live Raft
+    /// configuration that governs control-plane quorum — as opposed to
+    /// `metadata.node_addrs`' `role: "control"` bookkeeping entries (a
+    /// discovery *hint*, not this authority; a node can be registered with
+    /// the control role and still not be a live voter, e.g. before its
+    /// `change_membership` lands or after it's been removed). Lets a
+    /// `ControlHandle::Remote` data-only node, an admin caller, or a future
+    /// CLI learn "who can I even try talking to for a control-plane
+    /// proposal" without a local `RaftCore` of its own — see
+    /// `RemoteControlClient::control_voters`'s doc. `#[serde(default)]` so an
+    /// older node's reply (predating this field) still parses, decoding to
+    /// an empty set — indistinguishable on the wire from "this replica
+    /// genuinely reported zero voters" for an old peer, but no worse than
+    /// that field's total absence was before this PR, and every in-process
+    /// consumer that cares about telling "unknown" apart from "empty" reads
+    /// `ControlHandle::config()`'s `Option` directly rather than round-
+    /// tripping through this wire copy.
     Status {
         metadata: Metadata,
         #[serde(default)]
         leader_hint: Option<(NodeId, SocketAddr)>,
         #[serde(default)]
         watermark: u64,
+        #[serde(default)]
+        control_voters: BTreeSet<NodeId>,
     },
     /// A write reached its quorum.
     PutOk,
@@ -2597,6 +2620,7 @@ impl ClientCtx {
             metadata: self.effective_metadata(),
             leader_hint: self.control_leader_hint(),
             watermark: watch.latest(),
+            control_voters: self.control.config().unwrap_or_default(),
         }
     }
 
@@ -4355,6 +4379,7 @@ async fn remote_metadata_watch_loop(remote: RemoteControlClient, seeds: Vec<Sock
                 metadata,
                 leader_hint,
                 watermark,
+                control_voters,
             } = relay_request_with_timeout(
                 addr,
                 &ClientRequest::WatchMetadata { last_seen },
@@ -4362,7 +4387,7 @@ async fn remote_metadata_watch_loop(remote: RemoteControlClient, seeds: Vec<Sock
             )
             .await
             {
-                remote.observe(metadata, leader_hint, watermark);
+                remote.observe(metadata, leader_hint, watermark, control_voters);
                 synced = true;
                 break;
             }
@@ -4385,9 +4410,10 @@ async fn remote_metadata_watch_loop(remote: RemoteControlClient, seeds: Vec<Sock
                 metadata,
                 leader_hint,
                 watermark,
+                control_voters,
             } = relay_request(addr, &ClientRequest::Status).await
             {
-                remote.observe(metadata, leader_hint, watermark);
+                remote.observe(metadata, leader_hint, watermark, control_voters);
                 break;
             }
         }
@@ -4869,6 +4895,7 @@ async fn handle_request(ctx: &ClientCtx, request: ClientRequest) -> ClientRespon
             metadata: ctx.effective_metadata(),
             leader_hint: ctx.control_leader_hint(),
             watermark: ctx.control.metadata_watch().latest(),
+            control_voters: ctx.control.config().unwrap_or_default(),
         },
         // All data ops route to the leaderful CP per-tablet Raft group (ADR 0017
         // #3a), scoped to the named table (ADR 0023). `table` is a required field
@@ -7158,5 +7185,61 @@ mod auto_split_median_tests {
         let pairs = vec![pair("a", 100_000), pair("b", 1), pair("c", 1)];
         let split = byte_weighted_median(&pairs);
         assert_ne!(split, b"a".to_vec(), "must not return the first key");
+    }
+}
+
+/// Back-compat coverage for [`ClientResponse::Status`]'s additive fields
+/// (ADR 0037 PR2's `control_voters`, mirroring `leader_hint`/`watermark`'s
+/// own `#[serde(default)]` discipline when they were added) — a pre-existing
+/// binary's wire reply (predating a field) must still decode on a peer that
+/// has since upgraded, and vice versa is guaranteed by the same
+/// `#[serde(default)]` on the older side once it upgrades. Free functions
+/// under test are `pub`, so this could live under `tests/`, but the JSON
+/// surgery is a pure serde round trip with no process/socket involved —
+/// kept as an in-crate unit test alongside the other pure-function test
+/// modules in this file.
+#[cfg(test)]
+mod status_wire_compat_tests {
+    use crate::ClientResponse;
+
+    /// A `Status` reply serialized before `control_voters` existed (no such
+    /// key at all) still decodes, defaulting to an empty set — the same
+    /// "missing key, not just null" back-compat shape `leader_hint`/
+    /// `watermark` already established for this variant.
+    #[test]
+    fn status_without_control_voters_field_still_decodes() {
+        let reply = ClientResponse::Status {
+            metadata: Default::default(),
+            leader_hint: None,
+            watermark: 7,
+            control_voters: [0, 1, 2].into_iter().collect(),
+        };
+        let mut value = serde_json::to_value(&reply).expect("Status serializes");
+        // `ClientResponse` derives `Serialize`/`Deserialize` via serde's
+        // default (externally tagged) enum representation: `{"Status":
+        // {...fields...}}`. Drill into the inner object to drop the field,
+        // exactly like `meta.rs`'s `NodeAddrs` back-compat test does for its
+        // own struct.
+        value
+            .get_mut("Status")
+            .and_then(|s| s.as_object_mut())
+            .expect("Status is a JSON object")
+            .remove("control_voters");
+        let decoded: ClientResponse =
+            serde_json::from_value(value).expect("Status without control_voters still decodes");
+        match decoded {
+            ClientResponse::Status {
+                control_voters,
+                watermark,
+                ..
+            } => {
+                assert!(
+                    control_voters.is_empty(),
+                    "missing control_voters must default to empty, not fail to decode"
+                );
+                assert_eq!(watermark, 7, "sibling field must decode unaffected");
+            }
+            other => panic!("expected a Status reply, got {other:?}"),
+        }
     }
 }

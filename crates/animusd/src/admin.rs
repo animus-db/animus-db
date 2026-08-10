@@ -432,7 +432,14 @@ fn raft_view(ctx: &ClientCtx) -> Value {
         "durable_index": r.durable_index(),
         "snapshot_index": r.snapshot_index(),
         "log_len": r.log_len(),
-        "voters": r.config().into_iter().collect::<Vec<_>>(),
+        // `unwrap_or_default()`: ADR 0037 PR2 turned `config()` into an
+        // honest `Option` (`None` == "unknown", not "zero voters") for a
+        // `Remote` handle that hasn't observed a `Status` reply yet —
+        // `/admin/raft` has no separate "unknown" slot in its JSON shape, so
+        // an empty list is this endpoint's pre-existing (and still honest
+        // enough) answer for that case; a `Local` replica's is always
+        // `Some(..)`.
+        "voters": r.config().unwrap_or_default().into_iter().collect::<Vec<_>>(),
         "members": members,
         // ADR 0035 PR7: this handle's control-plane mirror status — the one
         // thing a genuine control-group voter (`ControlHandle::Local`) can't
