@@ -94,6 +94,18 @@ the production implementation; the deterministic implementation lives in
   spawned `AbortHandle`s). `animusd`'s `Node::shutdown` calls it on each of the
   node's three role envs to tear the node down and free its listener ports for a
   restart in the same runtime. Production-edge only; determinism is unaffected.
+  **`abort()` only requests cancellation — it does not wait for the task (and
+  the `TcpListener` it may own) to actually be dropped**, so a bare `shutdown`
+  followed immediately by a same-address rebind can race this same process's
+  own not-yet-unwound accept-loop task for the port; under `cargo test
+  --workspace`-level CPU contention that race can lag long enough to flake a
+  restart test even behind a generous retry bound (see the "abort() is a
+  request, not a guarantee" entry in `docs/engineering-lessons.md`). Use
+  **`ProdEnv::shutdown_and_wait()`** (async) instead when the caller needs the
+  listener genuinely gone before proceeding — it aborts the same way, then
+  polls `AbortHandle::is_finished()` (bounded) before returning.
+  `animusd::Node::shutdown_graceful` uses the `Node`-level dual
+  (`shutdown_and_wait`) for exactly this reason.
 - **Metrics are additive and determinism-safe (ADR 0015).** `Env::metrics()` has
   a **default** returning a shared no-op `MetricsHandle`, so the supertrait is
   unchanged and every `E: Env` impl (`SimEnv` included) compiles untouched.

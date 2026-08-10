@@ -426,6 +426,16 @@ route below the edge through the same `ClientCtx` CP primitives.
 - **`Node::shutdown()` is a graceful teardown** — aborts the listener tasks and
   `ProdEnv::shutdown()`s both role envs, freeing all six ports so a replacement can
   rebind the same addresses/dir. Dropping a `Node` without it leaves tasks running.
+  **It's fire-and-forget (`abort()` then return), not a guarantee those ports are
+  free the instant it returns** — see `animus-env/CLAUDE.md`'s `ProdEnv::shutdown()`
+  entry. A same-address restart needs **`Node::shutdown_and_wait()`** (aborts, then
+  waits for every task to actually finish) or, more commonly, just
+  `shutdown_graceful()` — which now ends in `shutdown_and_wait` rather than the
+  plain `shutdown` — so every existing restart test got this fix for free without
+  a test-file change. This was the actual root cause of the
+  `full_split_cluster_restart_recovers_metadata_and_data` flake under `cargo test
+  --workspace`; see `docs/engineering-lessons.md`'s "abort() is a request, not a
+  guarantee" entry.
 - **A merged-across-nodes admin view must carry each item's own identity** —
   `/admin/raftkv`'s `CpRaftView::node` carries the real hosting node id because the
   dashboard merges every node's response; the answering server isn't a reliable
