@@ -173,9 +173,38 @@ the engine — the `AccordCore` sync-core/async-driver split.
   A `NotLeader` propose appends nothing, so it doesn't wake. Latency-verified over
   `ProdEnv` in `animusd/tests/cp_plane.rs::single_write_latency_is_low` (median
   ~52ms → ~11ms).
-- **The Raft log index is the MVCC version.** Apply uses `index` as the engine
-  `version`, so per-key LWW reproduces the agreed Raft total order, and re-applying
-  on recovery is idempotent.
+- **The Raft log index is the MVCC version — scaled by this group's own
+  `version_floor` (cross-group LWW fix, confirmed real, root `CLAUDE.md`).**
+  Apply computes `effective_version(floor, index) = floor * VERSION_FLOOR_SCALE
+  + index` (`VERSION_FLOOR_SCALE = 2^40`) and stamps *that* as the engine
+  `version` at all four apply sites (`Put`/`Batch`/`Delete`/`Cas`) — never the
+  raw `index` directly. `floor` (`0` for a tablet that has never been
+  split/merged — byte-identical to using the raw index) closes a real hazard:
+  every tablet on a node shares one physical `StorageEngine` (ADR 0026/0028),
+  so a **fresh** group's own log index restarting low could carry a version
+  no higher than what a *different* group (the split source, or an absorbed
+  merge sibling) already stamped for the same key — and per-key LWW
+  (`StorageEngine::merge`) would silently drop the write (loud, not silent —
+  the confirm loop's value-equality poll times out — but it never lands).
+  `RaftKvNode::start_hosted_with_floor` seeds a fresh group's floor at
+  construction (`start_hosted`/`start`/`start_scoped`/`start_with_metrics`
+  all default to `0`, unchanged); `bump_version_floor` (mirroring
+  `narrow_scope`/`widen_scope`'s one-directional-only shape, a `fetch_max`)
+  raises an **already-running** group's floor for the merge-survivor case,
+  called by the per-node reconciler alongside `widen_scope` for the same
+  `WidenScope` action. Both read `animus_tablet::Tablet::version_floor` —
+  computed once by the control plane's `SplitTablet`/`MergeTablets` apply, so
+  every replica converges on the identical value with no live per-replica
+  computation (a per-replica-timing-dependent floor was considered and
+  rejected — see the root `CLAUDE.md` entry for why). `engine_applied` and
+  the group's own Raft log-matching are completely untouched by this — only
+  the *storage-layer version number* a command stamps changes.
+  Re-applying on recovery is still idempotent (the same command always
+  computes the same `effective_version`, since `floor` only ever increases
+  once, deterministically, before the group next proposes).
+  Regression: `tests/cross_group_lww.rs` (reproduces the hazard directly with
+  an un-seeded fresh/widened group, then proves the seeded/bumped variant
+  doesn't lose the write, for both the split and merge shape).
 - **CAS is decided at *apply* time, not propose time — that is what makes it
   linearizable + contention-correct.** The `RaftCore` agrees only the command
   *order*; `Cas` rides through it as opaque data (sync core untouched, like every
@@ -453,8 +482,11 @@ lifecycle's invariants and is directly `SimEnv`-testable:
   surviving `left` side of a `MergeTablets` commit — provably widen-only, same
   `is_subrange` check with the operands swapped; a metadata range that is
   neither a subset nor a superset of the current live scope is a defensive
-  no-op either way, never guessed), `Host` (stand up a fresh/joining/restarting
-  tablet), `Reconfigure` (one `reconfigure_step` toward the desired replica
+  no-op either way, never guessed — both `Host` and `WidenScope` also carry
+  `version_floor: u64`, read straight off `Tablet::version_floor`, so the
+  executor can seed/bump the group's cross-group LWW floor in the same pass
+  it stands up or widens it — see the version-floor entry above), `Host`
+  (stand up a fresh/joining/restarting tablet), `Reconfigure` (one `reconfigure_step` toward the desired replica
   set for every tablet this node leads, carrying the down-set), `Release`
   (tear down a tablet moved off this node, gated by
   `RELEASE_CONFIRM_TICKS` consecutive confirming calls at an unchanged

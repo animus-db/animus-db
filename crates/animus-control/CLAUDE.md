@@ -270,6 +270,26 @@ epoch compare-and-swap transactions.
   `tablet_split_merge.rs::merge_rejects_a_stale_epoch_racing_a_concurrent_replica_change`
   and `::merge_rejects_tablets_from_different_tables`, and `animus-cp-data/
   CLAUDE.md`'s host-module section for the data-plane half.
+- **`SplitTablet`/`MergeTablets` also seed/bump `Tablet::version_floor`
+  (cross-group LWW version-floor fix, confirmed real — full writeup in the
+  root `CLAUDE.md`).** Every tablet a node hosts shares one physical
+  `StorageEngine` (ADR 0026/0028), and `animus-cp-data` stamps a write's MVCC
+  version from its **own** group's local Raft log index — which restarts
+  low/independent for a fresh group, so a split sibling or a merge survivor
+  could otherwise carry a version no higher than what a *different* group
+  already stamped for the same key, and per-key LWW would silently drop the
+  write. `SplitTablet` sets the new sibling's floor to `source.version_floor
+  + 1` (the source's own floor is untouched — it never absorbs foreign data);
+  `MergeTablets` bumps the surviving `left`'s floor to `max(left, right) +
+  1` (checked against **both** sides deliberately — `left`/`right` are
+  chosen by key-range adjacency, not allocation order, so `right`'s id/floor
+  is not always the smaller one). Both are pure functions of already-agreed
+  `Metadata` state, computed once here so every data replica reads the
+  identical value instead of deriving it locally (a per-replica-timing
+  derivation was considered and rejected — see the root `CLAUDE.md` entry).
+  Regressions: `meta::tests::{split_tablet_seeds_the_new_siblings_version_
+  floor_past_the_sources, merge_tablets_bumps_the_survivors_version_floor_
+  past_both_sides}`.
 - **Automatic placement (ADR 0005).** Policies are replicated in `Metadata`
   (`SetTabletPolicy` → `policies` map). The decision lives in the pure
   `Metadata::reconcile` (runs `animus_placement::replan` over `Active` members,
