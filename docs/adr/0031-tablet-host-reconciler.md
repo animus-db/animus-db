@@ -17,6 +17,12 @@
   `reconciler_hosts_narrows_releases_and_confirms_sparing_a_sibling` test —
   see `animus-cp-data/CLAUDE.md`'s "Reconciler lifecycle corpus" section.
   PR6 (further docs cleanup) remains.
+- **2026-08-10 note:** the `metadata_watch()` primitive this ADR introduced is
+  unchanged in its public contract (fires once a `Metadata` change is durable
+  *and* visible), but under ADR 0038 the bump now comes from the control
+  plane's async apply task after it publishes its cache — not from the
+  consensus driver loop directly — since `Metadata` is no longer applied
+  in-core. Every consumer here (the reconciler's trigger) is unaffected.
 - **Date:** 2026-08-07
 
 ## Context

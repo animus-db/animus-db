@@ -2616,6 +2616,80 @@ debugging anything that feels like it might have happened before.
   **full** rebuilt state, not just liveness, to have a chance of catching
   this class of bug.
 
+- **Porting a `DRIVER_APPLIED` cutover onto a state machine that ISN'T a
+  unit placeholder is a smaller change than it looks — the generic core
+  needs zero edits.** ADR 0038 PR3 flipped `Metadata` (a large, real struct
+  with actual business logic — the control plane's whole `Metadata::apply`)
+  to `StateMachine::DRIVER_APPLIED = true`, expecting to need a new unit
+  placeholder type the way `animus-cp-data`'s `KvState` is one. It didn't:
+  `RaftCore<C, S>`'s `metadata: S` field is only ever touched by the
+  trait-impl's `apply()` (never called once `DRIVER_APPLIED`) and the
+  now-dead `WalRecord::Snapshot { metadata: S, .. }` embedding (a harmless,
+  never-populated `Metadata::default()` for a `DRIVER_APPLIED` plane, exactly
+  as trivial as a real unit type) — so `Metadata` doubles as both "the real
+  struct an external apply task privately owns" and "the harmless generic
+  `S` parameter satisfying `RaftCore`'s trait bounds," with no new type and
+  no `raft.rs` edits beyond deleting the now-meaningless
+  `RaftCore<MetaCommand, Metadata>::{metadata, members, placement_view}`
+  inherent methods. **When porting a `DRIVER_APPLIED` cutover, check whether
+  the "real" state machine can just BE the generic `S` before reaching for a
+  placeholder type — the core's own genericity (ADR 0016) was already built
+  to make this a no-op.**
+- **Seed a `DRIVER_APPLIED` apply task's durability watermark from the
+  *engine's own* persisted marker, never from the recovered core's
+  `last_applied()` — they can legitimately disagree, and only one of them is
+  actually correct after a real crash.** After `RaftCore::recovered()`, a
+  core's `last_applied()` reflects only the last **compacted** snapshot
+  base; the engine's own watermark (written every apply pass, far more
+  often than compaction runs) can already be well *ahead* of it. Seeding
+  from the core's `last_applied()` (mirroring `animus-cp-data`'s own
+  `engine_applied.store(core.last_applied())`, which is *correct* there only
+  because the data plane's per-key merges are independently idempotent under
+  replay) would, for a state machine like `Metadata` whose commands aren't
+  all trivially safe to reapply twice (counters, nonce ledgers, epoch-CAS —
+  each *happens* to be idempotent by its own construction, but relying on
+  every future command variant continuing to be is fragile), silently
+  redeliver an already-engine-durable prefix on top of a freshly
+  engine-rebuilt cache. The robust fix: read the engine's own watermark key
+  at the apply task's startup, rebuild the cache from *that* index, and
+  **filter drained effects by `index > watermark`** rather than trusting
+  that redelivering the whole tail is harmless. Regression:
+  `animus-control::node.rs`'s own `#[cfg(test)]`
+  `apply_and_compact_replays_only_the_tail_beyond_the_watermark` /
+  `..._is_a_no_op_when_the_watermark_already_covers_everything` — white-box
+  tests that drive the private apply function directly with a hand-seeded
+  watermark, precisely and deterministically, rather than trying to time a
+  real crash to land at an exact index.
+- **A `SimEnv` test that restarts a node (`Simulator::stop` + a fresh
+  `RaftNode::start` on the same id) must reuse the *same* `StorageEngine`
+  handle across the restart, not construct a fresh one — `MemoryEngine::new()`
+  at the restart call site silently and completely discards everything a
+  real (disk-backed) engine would have kept, and the bug can hide for a
+  long time under small test workloads.** Ported en masse while mechanically
+  fixing every `RaftNode::start(..)` call site across
+  `animus-control`/`animus-cp-data`'s test suites for ADR 0038 PR3 (adding
+  the now-mandatory engine argument), several restart-style tests
+  (`restart.rs`, `schema_indexes.rs`, `control_membership.rs`) got a
+  throwaway `MemoryEngine::new()` at their *second* `RaftNode::start` call —
+  which happened to still pass, because none of those scenarios crossed the
+  Raft log's own compaction threshold, so the full uncompacted WAL alone was
+  enough to replay the whole state from scratch regardless of what the
+  "restarted" engine held. That's a coincidence of test scale, not a proven
+  property — the instant a scenario compacts before the simulated crash, a
+  fresh engine would silently lose the compacted prefix with no error.
+  **Fix pattern**: create one `MemoryEngine` per node up front (`MemoryEngine`
+  clones share state, exactly like a real engine reopened from the same
+  directory), and re-clone that *same* handle into every `RaftNode::start`
+  call for that node id, including at restart — never call `::new()` a
+  second time for an id that already existed. **General rule when adding a
+  mandatory storage-engine parameter to a `start`-style constructor across a
+  large test suite**: grep for every call site that *replaces* an existing
+  instance (`nodes[i] = Type::start(..)`, a second `start` for the same id)
+  separately from fresh first-time starts, and audit each one for whether
+  the "durable" resource being threaded through needs to survive that
+  specific call — a blind find-and-replace macro fix is exactly how this
+  class of bug hides.
+
 ### Parallel-agent orchestration
 - **Partition work by disjoint crate ownership — exactly one owner per shared
   crate/file.** The assembly points (`animusd`, `animus-control`) are

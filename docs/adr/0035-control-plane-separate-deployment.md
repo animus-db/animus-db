@@ -3,6 +3,12 @@
 - **Status:** Implemented — PR0 through PR7 are all shipped (§Delivery plan).
   Amends ADR 0030 (data-plane-only growth) and ADR 0032 (seed/join, address
   book) — see the note at the end of ADR 0030 and the top of ADR 0032.
+- **2026-08-10 note:** a **control-only** node (§ this ADR's PR3) now
+  **unconditionally** provisions a dedicated system-keyspace storage engine
+  (ADR 0038) — it is no longer a storage-engine-free deployment shape.
+  `Metadata` durably lives there (an async apply task owns it), not in an
+  optional shadow mirror as ADR 0038's PR2 first shipped it. Everything else
+  about the three deployment shapes this ADR describes is unchanged.
 - **Date:** 2026-08-09
 
 ## Context

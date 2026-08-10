@@ -2,6 +2,12 @@
 
 - **Status:** Accepted
 - **Date:** 2026-08-02
+- **2026-08-10 note:** the schema catalog's durability path changed under ADR
+  0038 (the control-plane metadata cutover) — it now durably lives in a
+  per-node system-keyspace `StorageEngine`, applied by an async apply task,
+  not embedded in a whole-`Metadata` WAL snapshot blob. The replicated-catalog
+  *design* this ADR describes (one `Metadata.schemas` map, mutated only by the
+  `*TableSchema` commands) is unchanged.
 
 ## Context
 

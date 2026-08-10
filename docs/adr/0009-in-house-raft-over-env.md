@@ -2,6 +2,10 @@
 
 - **Status:** Accepted
 - **Date:** 2026-08-01
+- **2026-08-10 note:** the control plane's own state machine (`Metadata`) is
+  now `DRIVER_APPLIED` too (ADR 0038) — `RaftCore`'s sync/async split (this
+  ADR's core contribution) is unchanged, but `RaftCore` no longer applies
+  `MetaCommand`s in-core itself; see ADR 0038.
 
 ## Context
 

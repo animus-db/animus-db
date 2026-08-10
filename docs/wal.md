@@ -5,6 +5,20 @@ written, compacted, and recovered. See also
 [ADR 0009](adr/0009-in-house-raft-over-env.md) and `crates/animus-control`
 (`persist.rs`, `raft.rs`, `node.rs`).
 
+**Since [ADR 0038](adr/0038-control-metadata-system-keyspace.md)** (`Metadata`
+is `StateMachine::DRIVER_APPLIED`), this document's generic `RaftCore`
+WAL/compaction mechanics below are still accurate as written, but two things
+changed for the *control plane specifically*: (1) the `Snapshot{ metadata,
+.. }` record's `metadata` field is now always the meaningless
+`Metadata::default()` — the real durable state lives in a per-node
+system-keyspace `StorageEngine`, not this record; (2) compaction (§3) is
+driven from the async apply task's `engine_applied` watermark, not the
+consensus loop's own `applied_since_snapshot()` — see `node.rs`'s
+`meta_apply_and_compact`. The diagram below still describes exactly what
+happens for an **in-core** (`DRIVER_APPLIED = false`) state machine, which is
+what `generic_state_machine.rs`'s toy example (and no real state machine in
+this codebase anymore) exercises.
+
 The design keeps the consensus logic in a pure, I/O-free `RaftCore`: the core
 *emits* records describing its durable-state changes, and the `Env`-driven
 driver *writes* them. One append-only file per node (`raft.wal`) on the `Env`

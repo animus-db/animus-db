@@ -202,8 +202,10 @@ async fn join_control_nonvoter(
                 config.control_ids(),
                 client_route,
                 admin_addrs,
+                animusd::StorageBackend::Memory,
             )
-            .await;
+            .await
+            .expect("open the growth control-only node's system-keyspace engine");
         return (node, addrs);
     }
     panic!("could not bind a growth control-only node (id {new_control_id}) after retries");

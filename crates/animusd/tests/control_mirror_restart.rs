@@ -1,13 +1,20 @@
-//! ADR 0038 PR2: a control-only node's dedicated system-keyspace mirror
-//! engine survives a real process restart (`ProdEnv`, real disk I/O, real
-//! TCP) — the `animusd`-layer counterpart of `animus-control`'s
-//! `SimEnv`-driven `mirror_engine.rs` crash-recovery test, over the actual
-//! `Node::bind_control`/`start_control_with_mirror` assembly a real `animusd
-//! control` process runs. Pre-restart in-core/mirror agreement is already
-//! covered by `mirror_engine.rs`'s differential oracle; this test's job is
-//! specifically the **durability** claim `SimEnv` can't make: real bytes on
-//! a real disk, read back by an entirely separate `LsmEngine` handle opened
-//! after the node that wrote them has been shut down.
+//! A control-only node's dedicated system-keyspace engine survives a real
+//! process restart (`ProdEnv`, real disk I/O, real TCP) — the
+//! `animusd`-layer counterpart of `animus-control`'s `SimEnv`-driven
+//! `apply_engine.rs` differential oracle, over the actual
+//! `Node::bind_control`/`start_control_with` assembly a real `animusd
+//! control` process runs.
+//!
+//! Originally written for ADR 0038 PR2, when this engine was only a
+//! shadow-mode dual-write mirror of a separate in-core `Metadata` (so the
+//! interesting claim was "the mirror agrees with the in-core copy and both
+//! survive"). **Since PR3's cutover, this engine *is* the durable source of
+//! truth** (`Metadata: DRIVER_APPLIED` — there is no in-core copy to mirror
+//! anymore) — so this test now proves the load-bearing claim directly: real
+//! bytes on a real disk are what a restarted node's control-plane state
+//! *actually* recovers from, read back here by an entirely separate
+//! `LsmEngine` handle opened after the node that wrote them has been shut
+//! down, independent of any node's own in-memory state.
 //!
 //! Like the other `animusd` integration tests this uses real TCP/time and is
 //! non-deterministic by design (the `ProdEnv` edge); every wait is a bounded
@@ -134,7 +141,7 @@ async fn control_only_mirror_engine_survives_a_real_process_restart() {
     for id in 0..3 {
         propose_and_await(&node, addrs.client, upsert(id, NodeStatus::Down)).await;
     }
-    // Let the mirror loop (50ms poll) catch up before shutting down.
+    // Let the apply task catch up before shutting down.
     sleep(Duration::from_millis(500)).await;
     node.shutdown();
     sleep(Duration::from_millis(200)).await;
@@ -169,7 +176,7 @@ async fn control_only_mirror_engine_survives_a_real_process_restart() {
     let reference_after = node.metadata();
     assert_eq!(reference_after.members.len(), 6);
 
-    // Let the mirror loop catch up on the post-restart writes, then shut
+    // Let the apply task catch up on the post-restart writes, then shut
     // down again and verify the *reopened* engine agrees with the
     // now-6-member in-core `Metadata` — proving both that the mirror
     // survived the restart with its pre-restart content intact AND that it
