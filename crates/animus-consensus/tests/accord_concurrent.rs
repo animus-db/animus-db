@@ -167,7 +167,7 @@ async fn concurrent_conflicting_coordinators_do_not_deadlock() {
     }
 
     for n in &nodes {
-        n.env().shutdown();
+        n.env().shutdown_and_wait().await;
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -242,7 +242,7 @@ async fn many_concurrent_rounds_make_progress() {
     }
 
     for n in &nodes {
-        n.env().shutdown();
+        n.env().shutdown_and_wait().await;
     }
     let _ = std::fs::remove_dir_all(&dir);
 }

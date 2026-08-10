@@ -182,7 +182,7 @@ async fn large_metadata_catch_up_stays_live() {
         );
 
         for e in &envs {
-            e.shutdown();
+            e.shutdown_and_wait().await;
         }
         for dir in &dirs {
             let _ = std::fs::remove_dir_all(dir);
@@ -354,7 +354,7 @@ async fn sustained_metadata_churn_over_a_real_engine_stays_live() {
         );
 
         for e in &envs {
-            e.shutdown();
+            e.shutdown_and_wait().await;
         }
         for dir in &dirs {
             let _ = std::fs::remove_dir_all(dir);
