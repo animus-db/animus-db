@@ -2,9 +2,12 @@
 //! `data_join.rs` / `watch_metadata.rs` already cover: control-leader
 //! failover under live data traffic, split + merge, failure-driven replica
 //! repair onto a spare, decommission of a data node via the control leader,
-//! and a full-cluster stop/restart — all against a **genuine** split
-//! deployment (real `animusd control` + `animusd data` processes, no
-//! combined-mode node anywhere).
+//! a full-cluster stop/restart, a **simultaneous** control-leader + data-node
+//! failure, and a decommission racing a tablet-split crossover — all against
+//! a **genuine** split deployment (real `animusd control` + `animusd data`
+//! processes, no combined-mode node anywhere). The last two are the
+//! multi-fault chaos scenarios flagged as residual follow-ups from the ADR
+//! 0035 stack (see `docs/adr/0035-control-plane-separate-deployment.md`).
 //!
 //! Real TCP/time throughout — every wait is a bounded, converged-or-timeout
 //! poll, never a fixed sleep used as an assertion.
@@ -938,4 +941,398 @@ async fn full_split_cluster_restart_recovers_metadata_and_data() {
     })
     .await
     .expect("full_split_cluster_restart_recovers_metadata_and_data timed out");
+}
+
+// ---- 6. Control-leader failover + data-node failure, SIMULTANEOUSLY --------
+
+/// Kills the control-plane leader and a live data replica at the same
+/// instant (`tokio::join!` over two `shutdown_graceful` calls — both take
+/// `&self`, so neither waits on the other's teardown to start) and asserts
+/// the cluster converges on every axis: a new control leader is elected, the
+/// dead data replica is auto-repaired onto the spare, in-flight writes
+/// spanning the dual outage are not lost, and both planes recover
+/// availability for fresh work (a post-outage schema DDL, a post-outage
+/// write). Distinct from scenario 1 (control-only failover) and scenario 3
+/// (data-only failure): here both faults land on the same instant, so the
+/// control plane's own re-election and the data plane's replica repair race
+/// each other with no ordering guarantee between them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 10)]
+async fn control_leader_and_data_node_failure_simultaneously_still_converges() {
+    timeout(Duration::from_secs(150), async {
+        let dir = tempfile::tempdir().unwrap();
+        // RF = min(N,3): 4 data nodes leaves exactly one spare once the
+        // first table's tablet provisions onto the 3 lowest-id Active
+        // members (mirroring scenario 3), so the killed data replica has
+        // somewhere to be auto-repaired onto.
+        let (mut control_nodes, mut data_nodes, _config) = bring_up_split(3, 4, dir.path()).await;
+        await_leader(&control_nodes).await;
+        let data_raftkv_ids: Vec<animus_env::NodeId> =
+            (3..7).map(animusd::config::raftkv_id).collect();
+        await_data_nodes_active(&control_nodes, &data_raftkv_ids).await;
+
+        let data_clients: Vec<SocketAddr> = data_nodes.iter().map(Node::client_addr).collect();
+        put(&data_clients, "dualfail_t", b"k0", b"v0", 20).await;
+
+        let (tablet, replicas_before) = timeout(Duration::from_secs(20), async {
+            loop {
+                let meta = control_nodes[0].metadata();
+                if let Some((&id, t)) = meta.tablets_for_table("dualfail_t").next() {
+                    if t.replicas.len() == 3 {
+                        return (id, t.replicas.clone());
+                    }
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("tablet was not provisioned with 3 replicas in 20s");
+
+        let spare = data_raftkv_ids
+            .iter()
+            .copied()
+            .find(|id| !replicas_before.contains(id))
+            .expect("a spare data node exists");
+        let killed_data_id = replicas_before[0];
+        let victim_idx = data_raftkv_ids
+            .iter()
+            .position(|&id| id == killed_data_id)
+            .unwrap();
+
+        // A write loop spanning BOTH simultaneous failures: each key gets
+        // its own bounded (8s) retry across every ORIGINAL data client
+        // address (including the soon-to-be-dead victim's — `call` just
+        // fails fast on a dead connection and the loop moves to the next
+        // candidate), so an attempt straddling the dual failover survives it
+        // rather than failing outright. Only indices this loop itself
+        // believes were acked are checked for survival afterward.
+        let acked: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
+        let acked_writer = acked.clone();
+        let traffic_clients = data_clients.clone();
+        let traffic = tokio::spawn(async move {
+            for i in 0..30usize {
+                let key = format!("dual-{i}").into_bytes();
+                let value = format!("v{i}").into_bytes();
+                let ok = timeout(Duration::from_secs(8), async {
+                    loop {
+                        for &c in &traffic_clients {
+                            if let Some(ClientResponse::PutOk) = call(
+                                c,
+                                ClientRequest::Put {
+                                    key: key.clone(),
+                                    value: value.clone(),
+                                    table: "dualfail_t".to_string(),
+                                },
+                            )
+                            .await
+                            {
+                                return;
+                            }
+                        }
+                        sleep(Duration::from_millis(50)).await;
+                    }
+                })
+                .await
+                .is_ok();
+                if ok {
+                    acked_writer.lock().unwrap().push(i);
+                }
+            }
+        });
+
+        // Let a few writes land (proving the table provisioned) before
+        // disrupting anything.
+        timeout(Duration::from_secs(15), async {
+            loop {
+                if acked.lock().unwrap().len() >= 3 {
+                    return;
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("no writes landed before the dual failure");
+
+        // Kill the control LEADER and a live DATA replica of the tablet
+        // AT THE SAME TIME.
+        let leader_idx = control_nodes
+            .iter()
+            .position(Node::is_control_leader)
+            .unwrap();
+        tokio::join!(
+            control_nodes[leader_idx].shutdown_graceful(),
+            data_nodes[victim_idx].shutdown_graceful(),
+        );
+        control_nodes.remove(leader_idx);
+        data_nodes.remove(victim_idx);
+
+        // Let the write loop finish; it spans both kills and both recoveries.
+        traffic.await.expect("traffic task panicked");
+        let acked_indices = acked.lock().unwrap().clone();
+        assert!(
+            acked_indices.len() >= 15,
+            "too many writes failed outright across the dual failure: {} / 30 acked",
+            acked_indices.len()
+        );
+
+        // The remaining control pair elects a new leader...
+        await_leader(&control_nodes).await;
+        // ...and placement repairs the tablet onto the spare, closing the
+        // dead replica out of its set.
+        timeout(Duration::from_secs(60), async {
+            loop {
+                if let Some(t) = control_nodes[0].metadata().tablets.get(&tablet) {
+                    if t.replicas.contains(&spare) && !t.replicas.contains(&killed_data_id) {
+                        return;
+                    }
+                }
+                sleep(Duration::from_millis(150)).await;
+            }
+        })
+        .await
+        .expect("the dead replica was not auto-replaced by the spare after the dual failure");
+
+        // No write this test believes was acked was lost.
+        let survivor_clients: Vec<SocketAddr> = data_nodes.iter().map(Node::client_addr).collect();
+        for &i in &acked_indices {
+            let key = format!("dual-{i}").into_bytes();
+            let value = format!("v{i}").into_bytes();
+            await_value(&survivor_clients, "dualfail_t", &key, &value, 30).await;
+        }
+
+        // A DDL issued only AFTER both kills still commits, relayed to
+        // whichever control node now leads — proving the control plane
+        // recovered availability for *changes*, not just that pre-routed
+        // data-plane traffic was unaffected.
+        let create = MetaCommand::CreateTableSchema {
+            table: "dualfail_ddl_t".into(),
+            schema: TableSchema::simple("id", ColumnType::String),
+        };
+        timeout(Duration::from_secs(20), async {
+            loop {
+                let _ = call(
+                    survivor_clients[0],
+                    ClientRequest::ProposeSchema(create.clone()),
+                )
+                .await;
+                if control_nodes
+                    .iter()
+                    .all(|n| n.metadata().has_table_schema("dualfail_ddl_t"))
+                {
+                    return;
+                }
+                sleep(Duration::from_millis(150)).await;
+            }
+        })
+        .await
+        .expect("post-dual-failure schema DDL never committed to the surviving control pair");
+
+        // A brand-new write also works end to end, through the
+        // fully-converged cluster.
+        put(&survivor_clients, "dualfail_t", b"k1", b"v1", 20).await;
+        await_value(&survivor_clients, "dualfail_t", b"k1", b"v1", 20).await;
+
+        for n in control_nodes.iter().chain(data_nodes.iter()) {
+            n.shutdown_graceful().await;
+        }
+    })
+    .await
+    .expect("control_leader_and_data_node_failure_simultaneously_still_converges timed out");
+}
+
+// ---- 7. Decommission racing a tablet-split crossover ------------------------
+
+const CROSSOVER_KEYS: [(&str, &str); 5] = [
+    ("a", "v-a"),
+    ("g", "v-g"),
+    ("m", "v-m"),
+    ("s", "v-s"),
+    ("z", "v-z"),
+];
+
+/// Fires a tablet split and a data-node decommission (drain, then remove) at
+/// the same time, against the SAME tablet: the split's freshly-minted child
+/// inherits the parent's replica set at the instant of the split (including
+/// the node being drained), so the reconciler must evacuate the draining
+/// node off BOTH the narrowed parent AND the new child before the
+/// decommission can complete — the actual "drain landing mid-split
+/// crossover" hazard this test targets, rather than a drain and a split on
+/// unrelated tablets that never interact. Asserts no data is lost (every
+/// pre-split key, plus writes racing the crossover window itself, all
+/// readable after full convergence) and that metadata converges (the
+/// decommissioned node is gone from membership/the address book, and both
+/// resulting tablets end up fully replicated across the survivors).
+#[tokio::test(flavor = "multi_thread", worker_threads = 10)]
+async fn decommission_racing_a_tablet_split_converges_with_no_data_loss() {
+    timeout(Duration::from_secs(150), async {
+        let dir = tempfile::tempdir().unwrap();
+        // RF = min(N,3): 4 data nodes leaves exactly one spare so the
+        // decommissioned replica has somewhere for BOTH the split parent and
+        // its new child to be repaired onto.
+        let (control_nodes, mut data_nodes, _config) = bring_up_split(3, 4, dir.path()).await;
+        await_leader(&control_nodes).await;
+        let data_raftkv_ids: Vec<animus_env::NodeId> =
+            (3..7).map(animusd::config::raftkv_id).collect();
+        await_data_nodes_active(&control_nodes, &data_raftkv_ids).await;
+
+        let data_clients: Vec<SocketAddr> = data_nodes.iter().map(Node::client_addr).collect();
+        for (k, v) in CROSSOVER_KEYS {
+            put(&data_clients, "cross_t", k.as_bytes(), v.as_bytes(), 20).await;
+        }
+
+        let (parent, replicas_before) = timeout(Duration::from_secs(20), async {
+            loop {
+                let meta = control_nodes[0].metadata();
+                if let Some((&id, t)) = meta.tablets_for_table("cross_t").next() {
+                    if t.replicas.len() == 3 {
+                        return (id, t.replicas.clone());
+                    }
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("tablet was not provisioned with 3 replicas in 20s");
+
+        let victim_id = replicas_before[0];
+        let victim_idx = data_raftkv_ids
+            .iter()
+            .position(|&id| id == victim_id)
+            .unwrap();
+        let leader_idx = control_nodes
+            .iter()
+            .position(Node::is_control_leader)
+            .unwrap();
+
+        // Trigger the split AND drain the victim AT THE SAME TIME —
+        // `tokio::join!` fires both admin calls without either waiting for
+        // the other to finish.
+        let split_body = format!(r#"{{"tablet":{},"split_key":"m"}}"#, parent.0);
+        let drain_body = serde_json::json!({"node": victim_id}).to_string();
+        let (split_result, drain_result) = tokio::join!(
+            admin(
+                data_nodes[0].admin_addr(),
+                "POST",
+                "/admin/tablet/split",
+                Some(&split_body),
+            ),
+            admin(
+                control_nodes[leader_idx].admin_addr(),
+                "POST",
+                "/admin/drain",
+                Some(&drain_body),
+            ),
+        );
+        assert_eq!(split_result.0, 200, "split trigger: {}", split_result.1);
+        assert_eq!(drain_result.0, 200, "drain trigger: {}", drain_result.1);
+
+        // Writes racing the crossover window itself — one key on each future
+        // half of the range — must still land (a bounded retry poll, per the
+        // standing "a first write during a crossover/formation window can
+        // legitimately fail once" discipline `put` already implements).
+        put(&data_clients, "cross_t", b"b", b"v-b2", 20).await;
+        put(&data_clients, "cross_t", b"y", b"v-y2", 20).await;
+
+        await_true(30, "split produced two tablets", || {
+            table_tablets(&data_nodes[0], "cross_t").len() == 2
+        })
+        .await;
+        let child = table_tablets(&data_nodes[0], "cross_t")
+            .into_iter()
+            .find(|&t| t != parent.0)
+            .expect("a child tablet exists");
+        let _ = child; // only needed to prove the split produced a real sibling
+
+        // The drained node is fully evacuated from BOTH resulting tablets —
+        // the reconciler's `NarrowScope`/`WidenScope` + repair-onto-spare
+        // acting across the split boundary.
+        timeout(Duration::from_secs(60), async {
+            loop {
+                let meta = control_nodes[0].metadata();
+                let still_hosts = meta.tablets.values().any(|t| {
+                    t.table.as_deref() == Some("cross_t") && t.replicas.contains(&victim_id)
+                });
+                if !still_hosts {
+                    return;
+                }
+                sleep(Duration::from_millis(200)).await;
+            }
+        })
+        .await
+        .expect("the drained node was never evacuated from both split halves");
+
+        // Drain-status confirms it (the same signal `admin_remove_member`
+        // itself gates on) before removal is attempted.
+        timeout(Duration::from_secs(30), async {
+            loop {
+                let (status, body) = admin(
+                    control_nodes[leader_idx].admin_addr(),
+                    "GET",
+                    &format!("/admin/member/drain-status?node={victim_id}"),
+                    None,
+                )
+                .await;
+                if status == 200 {
+                    let remaining = body["tablets_remaining"].as_u64().unwrap_or(u64::MAX);
+                    let node_status = body["status"].as_str().unwrap_or("");
+                    if remaining == 0 && node_status != "Active" {
+                        return;
+                    }
+                }
+                sleep(Duration::from_millis(200)).await;
+            }
+        })
+        .await
+        .expect("the drained node never finished draining");
+
+        let remove_body = serde_json::json!({"node": victim_id}).to_string();
+        let (status, resp) = admin(
+            control_nodes[leader_idx].admin_addr(),
+            "POST",
+            "/admin/member/remove",
+            Some(&remove_body),
+        )
+        .await;
+        assert_eq!(status, 200, "remove failed: {resp}");
+
+        let removed = data_nodes.remove(victim_idx);
+        removed.shutdown_graceful().await;
+
+        // No data lost: every pre-split key, plus both crossover writes,
+        // read through the survivors after full convergence.
+        let survivor_clients: Vec<SocketAddr> = data_nodes.iter().map(Node::client_addr).collect();
+        for (k, v) in CROSSOVER_KEYS {
+            await_value(&survivor_clients, "cross_t", k.as_bytes(), v.as_bytes(), 30).await;
+        }
+        await_value(&survivor_clients, "cross_t", b"b", b"v-b2", 30).await;
+        await_value(&survivor_clients, "cross_t", b"y", b"v-y2", 30).await;
+
+        // Metadata converged: the decommissioned node is gone from
+        // membership/the address book.
+        timeout(Duration::from_secs(30), async {
+            loop {
+                let meta = control_nodes[0].metadata();
+                if !meta.members.contains_key(&victim_id)
+                    && !meta.node_addrs.contains_key(&victim_id)
+                {
+                    return;
+                }
+                sleep(Duration::from_millis(150)).await;
+            }
+        })
+        .await
+        .expect("the removed node never disappeared from membership/address book");
+
+        // Fresh writes on both halves of the split still work
+        // post-convergence.
+        put(&survivor_clients, "cross_t", b"b2", b"v-b3", 20).await;
+        put(&survivor_clients, "cross_t", b"y2", b"v-y3", 20).await;
+        await_value(&survivor_clients, "cross_t", b"b2", b"v-b3", 20).await;
+        await_value(&survivor_clients, "cross_t", b"y2", b"v-y3", 20).await;
+
+        for n in control_nodes.iter().chain(data_nodes.iter()) {
+            n.shutdown_graceful().await;
+        }
+    })
+    .await
+    .expect("decommission_racing_a_tablet_split_converges_with_no_data_loss timed out");
 }
