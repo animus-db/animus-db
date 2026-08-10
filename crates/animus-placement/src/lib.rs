@@ -264,13 +264,12 @@ pub fn rebalance_step<K: Ord + Copy>(
                     continue;
                 }
                 // Best-effort spread: never make the worst domain worse.
-                if let Some(sp) = &policy.spread {
-                    if !sp.strict
-                        && max_per_domain(&post, candidates, sp)
-                            > max_per_domain(replicas, candidates, sp)
-                    {
-                        continue;
-                    }
+                if let Some(sp) = &policy.spread
+                    && !sp.strict
+                    && max_per_domain(&post, candidates, sp)
+                        > max_per_domain(replicas, candidates, sp)
+                {
+                    continue;
                 }
                 return Some((*k, post));
             }
@@ -306,19 +305,19 @@ fn set_satisfies(replicas: &[NodeId], candidates: &[Candidate], policy: &Placeme
             _ => return false,
         }
     }
-    if let Some(sp) = &policy.spread {
-        if sp.strict {
-            let mut seen: BTreeSet<&String> = BTreeSet::new();
-            for r in replicas {
-                let Some(c) = candidate_for(candidates, *r) else {
-                    return false;
-                };
-                let Some(domain) = c.labels.get(&sp.domain) else {
-                    return false;
-                };
-                if !seen.insert(domain) {
-                    return false; // two replicas in one strict domain
-                }
+    if let Some(sp) = &policy.spread
+        && sp.strict
+    {
+        let mut seen: BTreeSet<&String> = BTreeSet::new();
+        for r in replicas {
+            let Some(c) = candidate_for(candidates, *r) else {
+                return false;
+            };
+            let Some(domain) = c.labels.get(&sp.domain) else {
+                return false;
+            };
+            if !seen.insert(domain) {
+                return false; // two replicas in one strict domain
             }
         }
     }
@@ -376,13 +375,14 @@ fn choose(
     let domain_of: BTreeMap<NodeId, Domain> =
         eligible.iter().map(|(n, d)| (*n, d.clone())).collect();
 
-    if let Some(sp) = &policy.spread {
-        if sp.strict && domains.len() < rf {
-            return Err(PlacementError::InsufficientDomains {
-                needed: rf,
-                available: domains.len(),
-            });
-        }
+    if let Some(sp) = &policy.spread
+        && sp.strict
+        && domains.len() < rf
+    {
+        return Err(PlacementError::InsufficientDomains {
+            needed: rf,
+            available: domains.len(),
+        });
     }
 
     let mut count: BTreeMap<Domain, usize> = domains.keys().map(|k| (k.clone(), 0)).collect();

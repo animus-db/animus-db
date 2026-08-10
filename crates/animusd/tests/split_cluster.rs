@@ -78,10 +78,9 @@ async fn await_value(clients: &[SocketAddr], table: &str, key: &[u8], want: &[u8
                     },
                 )
                 .await
+                    && v == want
                 {
-                    if v == want {
-                        return;
-                    }
+                    return;
                 }
             }
             sleep(Duration::from_millis(150)).await;
@@ -396,10 +395,10 @@ async fn data_node_failure_is_detected_and_repaired_onto_a_spare() {
         let (tablet, replicas_before) = timeout(Duration::from_secs(20), async {
             loop {
                 let meta = control_nodes[0].metadata();
-                if let Some((&id, t)) = meta.tablets_for_table("repair_t").next() {
-                    if t.replicas.len() == 3 {
-                        return (id, t.replicas.clone());
-                    }
+                if let Some((&id, t)) = meta.tablets_for_table("repair_t").next()
+                    && t.replicas.len() == 3
+                {
+                    return (id, t.replicas.clone());
                 }
                 sleep(Duration::from_millis(100)).await;
             }
@@ -442,10 +441,11 @@ async fn data_node_failure_is_detected_and_repaired_onto_a_spare() {
         // Placement repairs the tablet onto the spare.
         timeout(Duration::from_secs(60), async {
             loop {
-                if let Some(t) = control_nodes[0].metadata().tablets.get(&tablet) {
-                    if t.replicas.contains(&spare) && !t.replicas.contains(&killed_id) {
-                        return;
-                    }
+                if let Some(t) = control_nodes[0].metadata().tablets.get(&tablet)
+                    && t.replicas.contains(&spare)
+                    && !t.replicas.contains(&killed_id)
+                {
+                    return;
                 }
                 sleep(Duration::from_millis(150)).await;
             }
@@ -976,10 +976,10 @@ async fn control_leader_and_data_node_failure_simultaneously_still_converges() {
         let (tablet, replicas_before) = timeout(Duration::from_secs(20), async {
             loop {
                 let meta = control_nodes[0].metadata();
-                if let Some((&id, t)) = meta.tablets_for_table("dualfail_t").next() {
-                    if t.replicas.len() == 3 {
-                        return (id, t.replicas.clone());
-                    }
+                if let Some((&id, t)) = meta.tablets_for_table("dualfail_t").next()
+                    && t.replicas.len() == 3
+                {
+                    return (id, t.replicas.clone());
                 }
                 sleep(Duration::from_millis(100)).await;
             }
@@ -1080,10 +1080,11 @@ async fn control_leader_and_data_node_failure_simultaneously_still_converges() {
         // dead replica out of its set.
         timeout(Duration::from_secs(60), async {
             loop {
-                if let Some(t) = control_nodes[0].metadata().tablets.get(&tablet) {
-                    if t.replicas.contains(&spare) && !t.replicas.contains(&killed_data_id) {
-                        return;
-                    }
+                if let Some(t) = control_nodes[0].metadata().tablets.get(&tablet)
+                    && t.replicas.contains(&spare)
+                    && !t.replicas.contains(&killed_data_id)
+                {
+                    return;
                 }
                 sleep(Duration::from_millis(150)).await;
             }
@@ -1182,10 +1183,10 @@ async fn decommission_racing_a_tablet_split_converges_with_no_data_loss() {
         let (parent, replicas_before) = timeout(Duration::from_secs(20), async {
             loop {
                 let meta = control_nodes[0].metadata();
-                if let Some((&id, t)) = meta.tablets_for_table("cross_t").next() {
-                    if t.replicas.len() == 3 {
-                        return (id, t.replicas.clone());
-                    }
+                if let Some((&id, t)) = meta.tablets_for_table("cross_t").next()
+                    && t.replicas.len() == 3
+                {
+                    return (id, t.replicas.clone());
                 }
                 sleep(Duration::from_millis(100)).await;
             }

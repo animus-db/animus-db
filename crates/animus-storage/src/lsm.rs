@@ -1683,13 +1683,13 @@ impl<E: Env> LsmEngine<E> {
         let inner = self.lock();
         let mut by_level: BTreeMap<u32, Vec<(Key, Key)>> = BTreeMap::new();
         for t in &inner.manifest.tables {
-            if t.level >= 1 {
-                if let (Some(lo), Some(hi)) = (&t.min_key, &t.max_key) {
-                    by_level
-                        .entry(t.level)
-                        .or_default()
-                        .push((lo.clone(), hi.clone()));
-                }
+            if t.level >= 1
+                && let (Some(lo), Some(hi)) = (&t.min_key, &t.max_key)
+            {
+                by_level
+                    .entry(t.level)
+                    .or_default()
+                    .push((lo.clone(), hi.clone()));
             }
         }
         for ranges in by_level.values_mut() {
@@ -2174,10 +2174,10 @@ impl<E: Env> StorageEngine for LsmEngine<E> {
 
     async fn write_batch(&self, batch: WriteBatch) -> Result<()> {
         for op in &batch.ops {
-            if let WriteOp::DeleteRange { start, end } = op {
-                if start > end {
-                    return Err(StorageError::InvalidRange);
-                }
+            if let WriteOp::DeleteRange { start, end } = op
+                && start > end
+            {
+                return Err(StorageError::InvalidRange);
             }
         }
         {

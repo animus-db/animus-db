@@ -364,12 +364,12 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             } else {
                 None
             };
-            if let Some(cond) = &condition {
-                if !cond.evaluate(old.as_ref()) {
-                    return Err(WireError::conditional_check_failed(
-                        "the conditional request failed",
-                    ));
-                }
+            if let Some(cond) = &condition
+                && !cond.evaluate(old.as_ref())
+            {
+                return Err(WireError::conditional_check_failed(
+                    "the conditional request failed",
+                ));
             }
             let value = wire::encode_stored_item(&item);
             quorum_write(ctx, meta, &table, &key, &value).await?;
@@ -398,12 +398,12 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             } else {
                 None
             };
-            if let Some(cond) = &condition {
-                if !cond.evaluate(old.as_ref()) {
-                    return Err(WireError::conditional_check_failed(
-                        "the conditional request failed",
-                    ));
-                }
+            if let Some(cond) = &condition
+                && !cond.evaluate(old.as_ref())
+            {
+                return Err(WireError::conditional_check_failed(
+                    "the conditional request failed",
+                ));
             }
             let value = wire::encode_tombstone();
             quorum_write(ctx, meta, &table, &data_key, &value).await?;
@@ -654,12 +654,12 @@ async fn put_item(
     } else {
         None
     };
-    if let Some(cond) = condition {
-        if !cond.evaluate(old.as_ref()) {
-            return Err(WireError::conditional_check_failed(
-                "the conditional request failed",
-            ));
-        }
+    if let Some(cond) = condition
+        && !cond.evaluate(old.as_ref())
+    {
+        return Err(WireError::conditional_check_failed(
+            "the conditional request failed",
+        ));
     }
     let value = wire::encode_stored_item(item);
     quorum_write(ctx, meta, table, &key, &value).await?;
@@ -685,12 +685,12 @@ async fn delete_item(
     } else {
         None
     };
-    if let Some(cond) = condition {
-        if !cond.evaluate(old.as_ref()) {
-            return Err(WireError::conditional_check_failed(
-                "the conditional request failed",
-            ));
-        }
+    if let Some(cond) = condition
+        && !cond.evaluate(old.as_ref())
+    {
+        return Err(WireError::conditional_check_failed(
+            "the conditional request failed",
+        ));
     }
     quorum_write(ctx, meta, table, &key, &wire::encode_tombstone()).await?;
     note_delete(ctx, table, &key);
@@ -714,12 +714,12 @@ async fn run_update_item(
     let (pk, sk) = resolve_key(ctx, meta, table, key_item)?;
     let key = item_key(&pk, sk.as_ref());
     let old = quorum_read(ctx, meta, table, &key).await?;
-    if let Some(cond) = condition {
-        if !cond.evaluate(old.as_ref()) {
-            return Err(WireError::conditional_check_failed(
-                "the conditional request failed",
-            ));
-        }
+    if let Some(cond) = condition
+        && !cond.evaluate(old.as_ref())
+    {
+        return Err(WireError::conditional_check_failed(
+            "the conditional request failed",
+        ));
     }
     // Start from the existing item, or (for an upsert) the bare key attributes.
     let base = old.clone().unwrap_or_else(|| key_item.clone());
@@ -1129,10 +1129,10 @@ fn key_item_of(ctx: &ClientCtx, table: &str, item: &Item) -> Option<Item> {
         schema.partition_key.clone(),
         item.get(&schema.partition_key)?.clone(),
     );
-    if let Some(sk) = &schema.sort_key {
-        if let Some(v) = item.get(sk) {
-            key.insert(sk.clone(), v.clone());
-        }
+    if let Some(sk) = &schema.sort_key
+        && let Some(v) = item.get(sk)
+    {
+        key.insert(sk.clone(), v.clone());
     }
     Some(key)
 }

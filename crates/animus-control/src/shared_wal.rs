@@ -117,8 +117,7 @@ impl SharedWal {
         }
         match rx.await {
             Ok(result) => result.map_err(Into::into),
-            Err(_) => Err(io::Error::new(
-                io::ErrorKind::Other,
+            Err(_) => Err(io::Error::other(
                 "shared wal: leader dropped before completing this operation",
             )),
         }

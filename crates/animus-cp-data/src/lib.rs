@@ -2169,10 +2169,10 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
                     }
                     Ok(KvWire::ReadProbeAck { term, epoch }) => {
                         let mut r = reads.lock().expect("read state poisoned");
-                        if let Some((t, acks)) = r.pending.get_mut(&epoch) {
-                            if *t == term {
-                                acks.insert(envelope.from);
-                            }
+                        if let Some((t, acks)) = r.pending.get_mut(&epoch)
+                            && *t == term
+                        {
+                            acks.insert(envelope.from);
                         }
                         Vec::new()
                     }

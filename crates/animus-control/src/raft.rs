@@ -1609,10 +1609,11 @@ where
         // Append only a chunk that lands exactly at our current end, keeping the
         // buffer contiguous (a reordered/duplicate chunk is ignored and re-driven
         // by the next ack's `next_offset`).
-        if let Some(inc) = &mut self.incoming_snapshot {
-            if inc.last_index == last_index && offset == inc.buf.len() as u64 {
-                inc.buf.extend_from_slice(&data);
-            }
+        if let Some(inc) = &mut self.incoming_snapshot
+            && inc.last_index == last_index
+            && offset == inc.buf.len() as u64
+        {
+            inc.buf.extend_from_slice(&data);
         }
 
         // Complete? Install atomically.
@@ -1902,15 +1903,15 @@ where
         // and truncate entries this leader had already accepted. Once true, keep
         // re-sending every heartbeat (see the `transfer_target` field doc) until
         // this node steps down — resilient to a single dropped message.
-        if let Some(target) = self.transfer_target {
-            if self.peer_match(target) == self.last_log_index() {
-                outs.push((
-                    target,
-                    RaftMsg::TimeoutNow {
-                        term: self.current_term,
-                    },
-                ));
-            }
+        if let Some(target) = self.transfer_target
+            && self.peer_match(target) == self.last_log_index()
+        {
+            outs.push((
+                target,
+                RaftMsg::TimeoutNow {
+                    term: self.current_term,
+                },
+            ));
         }
         outs
     }

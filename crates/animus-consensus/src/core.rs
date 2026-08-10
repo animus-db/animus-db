@@ -1333,10 +1333,10 @@ impl AccordCore {
         execute_at: Timestamp,
         deps: &BTreeSet<TxnId>,
     ) -> Result<(), Ballot> {
-        if let Some(t) = self.txns.get(&txn) {
-            if ballot < t.promised {
-                return Err(t.promised);
-            }
+        if let Some(t) = self.txns.get(&txn)
+            && ballot < t.promised
+        {
+            return Err(t.promised);
         }
         self.clock.witness(execute_at);
         let entry = self.txns.entry(txn).or_insert_with(|| ReplicaTxn {
@@ -1649,23 +1649,23 @@ impl AccordCore {
         ts: Timestamp,
         deps: BTreeSet<TxnId>,
     ) {
-        if let Some(c) = self.coordinating.get_mut(&txn) {
-            if c.phase == CoordPhase::PreAccept {
-                c.replies.insert(from, (ts, deps));
-            }
+        if let Some(c) = self.coordinating.get_mut(&txn)
+            && c.phase == CoordPhase::PreAccept
+        {
+            c.replies.insert(from, (ts, deps));
         }
     }
 
     fn coordinator_record_accept(&mut self, from: NodeId, txn: TxnId) {
-        if let Some(c) = self.coordinating.get_mut(&txn) {
-            if c.phase == CoordPhase::Accept {
-                // Accept replies carry no new data; record presence with the
-                // coordinator's own chosen values (already in `replies` keyed by
-                // self). We only need the *count*, so insert a placeholder.
-                c.replies
-                    .entry(from)
-                    .or_insert_with(|| (Timestamp::ZERO, BTreeSet::new()));
-            }
+        if let Some(c) = self.coordinating.get_mut(&txn)
+            && c.phase == CoordPhase::Accept
+        {
+            // Accept replies carry no new data; record presence with the
+            // coordinator's own chosen values (already in `replies` keyed by
+            // self). We only need the *count*, so insert a placeholder.
+            c.replies
+                .entry(from)
+                .or_insert_with(|| (Timestamp::ZERO, BTreeSet::new()));
         }
     }
 
@@ -1955,10 +1955,10 @@ impl AccordCore {
         self.clock.witness(txn);
         // Reject a stale ballot: report the strictly-higher ballot we promised so
         // the superseded recoverer can retry above it (or give up).
-        if let Some(t) = self.txns.get(&txn) {
-            if ballot < t.promised {
-                return BallotReply::Nack(t.promised);
-            }
+        if let Some(t) = self.txns.get(&txn)
+            && ballot < t.promised
+        {
+            return BallotReply::Nack(t.promised);
         }
         // Never seen: witness as PreAccepted at t0 with no keys/deps known, and
         // record it durably like a `PreAccept` would.

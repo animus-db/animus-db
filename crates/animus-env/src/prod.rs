@@ -738,10 +738,10 @@ impl Disk for ProdEnv {
         };
         let mut names = Vec::new();
         while let Some(entry) = dir.next_entry().await? {
-            if entry.file_type().await?.is_file() {
-                if let Ok(name) = entry.file_name().into_string() {
-                    names.push(name);
-                }
+            if entry.file_type().await?.is_file()
+                && let Ok(name) = entry.file_name().into_string()
+            {
+                names.push(name);
             }
         }
         names.sort_unstable();

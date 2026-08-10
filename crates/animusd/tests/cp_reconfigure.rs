@@ -205,10 +205,11 @@ async fn cp_group_follows_tablet_replica_set() {
         let formed = async {
             loop {
                 for (i, node) in nodes.iter().enumerate() {
-                    if let Some((is_leader, voters)) = group_view(node.admin_addr()).await {
-                        if is_leader && voters.len() == 3 {
-                            return i;
-                        }
+                    if let Some((is_leader, voters)) = group_view(node.admin_addr()).await
+                        && is_leader
+                        && voters.len() == 3
+                    {
+                        return i;
                     }
                 }
                 sleep(Duration::from_millis(100)).await;
@@ -278,10 +279,12 @@ async fn cp_group_follows_tablet_replica_set() {
     let dropped = raftkv_ids[drop_idx];
     let reconfigured = async {
         loop {
-            if let Some((is_leader, voters)) = group_view(nodes[leader_idx].admin_addr()).await {
-                if is_leader && voters.len() == 2 && !voters.contains(&dropped) {
-                    return;
-                }
+            if let Some((is_leader, voters)) = group_view(nodes[leader_idx].admin_addr()).await
+                && is_leader
+                && voters.len() == 2
+                && !voters.contains(&dropped)
+            {
+                return;
             }
             sleep(Duration::from_millis(150)).await;
         }
@@ -349,10 +352,9 @@ async fn await_value(clients: &[SocketAddr], key: &[u8], want: &[u8], secs: u64)
                     },
                 )
                 .await
+                    && v == want
                 {
-                    if v == want {
-                        return;
-                    }
+                    return;
                 }
             }
             sleep(Duration::from_millis(150)).await;
@@ -385,10 +387,10 @@ async fn failure_auto_replaces_replica_onto_spare() {
         let formed = async {
             loop {
                 for (i, node) in nodes.iter().enumerate() {
-                    if let Some((true, voters)) = group_view(node.admin_addr()).await {
-                        if voters.len() == 3 {
-                            return i;
-                        }
+                    if let Some((true, voters)) = group_view(node.admin_addr()).await
+                        && voters.len() == 3
+                    {
+                        return i;
                     }
                 }
                 sleep(Duration::from_millis(100)).await;
@@ -416,10 +418,11 @@ async fn failure_auto_replaces_replica_onto_spare() {
     let replaced = async {
         loop {
             for &i in &survivors {
-                if let Some(t) = nodes[i].metadata().tablets.get(&BOOTSTRAP_TABLET) {
-                    if t.replicas.contains(&spare) && !t.replicas.contains(&killed_id) {
-                        return;
-                    }
+                if let Some(t) = nodes[i].metadata().tablets.get(&BOOTSTRAP_TABLET)
+                    && t.replicas.contains(&spare)
+                    && !t.replicas.contains(&killed_id)
+                {
+                    return;
                 }
             }
             sleep(Duration::from_millis(150)).await;
@@ -435,11 +438,12 @@ async fn failure_auto_replaces_replica_onto_spare() {
     let reconfigured = async {
         loop {
             for &i in &survivors {
-                if let Some((true, voters)) = group_view_opt(config.nodes[i].admin).await {
-                    if voters.len() == 3 && voters.contains(&spare) && !voters.contains(&killed_id)
-                    {
-                        return;
-                    }
+                if let Some((true, voters)) = group_view_opt(config.nodes[i].admin).await
+                    && voters.len() == 3
+                    && voters.contains(&spare)
+                    && !voters.contains(&killed_id)
+                {
+                    return;
                 }
             }
             sleep(Duration::from_millis(150)).await;

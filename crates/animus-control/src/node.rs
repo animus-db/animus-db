@@ -661,10 +661,11 @@ async fn reconcile_loop<E: Env>(env: E, core: Arc<Mutex<RaftCore>>) {
         // move (a healthy replica from a most-loaded node onto a least-loaded
         // one). The cadence is pure churn control (see `REBALANCE_EVERY_N_TICKS`):
         // safety is the epoch-CAS + data-plane catch-up gate, not this timing.
-        if !repaired && tick % REBALANCE_EVERY_N_TICKS == 0 {
-            if let Some(command) = view.rebalance() {
-                core.lock().expect("raft core poisoned").propose(command);
-            }
+        if !repaired
+            && tick.is_multiple_of(REBALANCE_EVERY_N_TICKS)
+            && let Some(command) = view.rebalance()
+        {
+            core.lock().expect("raft core poisoned").propose(command);
         }
     }
 }

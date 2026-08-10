@@ -925,10 +925,10 @@ impl Metadata {
                 // tablet's entry. The registrar's propose-and-await loop retries
                 // until its tablet lands, so a benign register-before-create race
                 // converges.
-                if let Some(t) = tablet {
-                    if !self.tablets.contains_key(t) {
-                        return ApplyOutcome::Rejected("no such tablet for cp addr");
-                    }
+                if let Some(t) = tablet
+                    && !self.tablets.contains_key(t)
+                {
+                    return ApplyOutcome::Rejected("no such tablet for cp addr");
                 }
                 if self.cp_member_addrs.get(id) == Some(addr)
                     && self.cp_member_tablets.get(id) == tablet.as_ref()

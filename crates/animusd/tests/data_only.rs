@@ -174,10 +174,9 @@ async fn split_cluster_serves_reads_and_writes_across_data_nodes() {
                     },
                 )
                 .await
+                    && v == b"via-control-val"
                 {
-                    if v == b"via-control-val" {
-                        return;
-                    }
+                    return;
                 }
                 sleep(Duration::from_millis(150)).await;
             }

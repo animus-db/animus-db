@@ -195,10 +195,10 @@ impl StorageEngine for MemoryEngine {
         let mut inner = self.lock();
         inner.check_monotonic(batch.version)?;
         for op in &batch.ops {
-            if let WriteOp::DeleteRange { start, end } = op {
-                if start > end {
-                    return Err(StorageError::InvalidRange);
-                }
+            if let WriteOp::DeleteRange { start, end } = op
+                && start > end
+            {
+                return Err(StorageError::InvalidRange);
             }
         }
         for op in &batch.ops {

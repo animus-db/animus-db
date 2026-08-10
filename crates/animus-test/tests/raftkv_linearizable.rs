@@ -711,21 +711,19 @@ async fn run_write<S: StorageEngine + 'static>(
     let mut committed = false;
     while env.now().0 < deadline {
         let epoch = shared.epoch();
-        if let Some((li, node)) = leader_slot(nodes) {
-            if proposed_on != Some((li, epoch)) {
-                if let ProposeResult::Accepted { .. } = node.put(kb.clone(), encoded.clone()) {
-                    proposed_on = Some((li, epoch));
-                }
-            }
+        if let Some((li, node)) = leader_slot(nodes)
+            && proposed_on != Some((li, epoch))
+            && let ProposeResult::Accepted { .. } = node.put(kb.clone(), encoded.clone())
+        {
+            proposed_on = Some((li, epoch));
         }
         env.sleep(POLL).await;
-        if let Some((_, node)) = leader_slot(nodes) {
-            if let Some(bytes) = node.linearizable_get(&kb).await {
-                if decode_list(&bytes).contains(&value) {
-                    committed = true;
-                    break;
-                }
-            }
+        if let Some((_, node)) = leader_slot(nodes)
+            && let Some(bytes) = node.linearizable_get(&kb).await
+            && decode_list(&bytes).contains(&value)
+        {
+            committed = true;
+            break;
         }
     }
     let mut rec = shared.rec.lock().unwrap();
@@ -760,11 +758,11 @@ async fn run_read<S: StorageEngine + 'static>(
     let deadline = env.now().0 + OP_BUDGET.as_nanos() as u64;
     let mut observed: Option<Vec<u64>> = None;
     while env.now().0 < deadline {
-        if let Some((_, node)) = leader_slot(nodes) {
-            if let Some(bytes) = node.linearizable_get(&kb).await {
-                observed = Some(decode_list(&bytes));
-                break;
-            }
+        if let Some((_, node)) = leader_slot(nodes)
+            && let Some(bytes) = node.linearizable_get(&kb).await
+        {
+            observed = Some(decode_list(&bytes));
+            break;
         }
         env.sleep(POLL).await;
     }
