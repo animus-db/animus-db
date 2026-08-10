@@ -184,12 +184,30 @@ pub enum Metric {
     /// A single-server `change_membership` step was rejected (not leader, an
     /// in-flight change, a multi-server delta, or a leader self-removal).
     CpReconfigureRejected,
+
+    // --- Control plane's own membership change (ADR 0009/0017 C reused for
+    // the control group itself, ADR 0015 control-plane extension) ---
+    // Appended after the CP-data-plane variants; every earlier variant's slot
+    // and the text-export order stay stable, so the snapshot remains
+    // byte-reproducible. Recorded by `animus-control::RaftNode::change_
+    // membership` (thin wrapper over `RaftCore::change_membership`) — kept as
+    // its own counter family, distinct from `CpReconfigureAccepted`/
+    // `CpReconfigureRejected` (the per-tablet data-plane counters), so
+    // control-*group* reconfiguration churn (growing/shrinking/replacing a
+    // control voter) is separately observable from per-tablet churn.
+    /// A single-server `change_membership` step on the control group itself
+    /// was accepted by the control leader.
+    ControlReconfigureAccepted,
+    /// A single-server `change_membership` step on the control group itself
+    /// was rejected (not leader, an in-flight change, a multi-server delta, or
+    /// a leader self-removal).
+    ControlReconfigureRejected,
 }
 
 impl Metric {
     /// Every metric, in a fixed order. The array index of a metric in `ALL` is
     /// its slot in the [`MetricSink`]; keep this in sync with the enum.
-    pub const ALL: [Metric; 41] = [
+    pub const ALL: [Metric; 43] = [
         Metric::ElectionsStarted,
         Metric::ElectionsWon,
         Metric::AppendEntriesSent,
@@ -231,6 +249,8 @@ impl Metric {
         Metric::CpSnapshotInstalls,
         Metric::CpReconfigureAccepted,
         Metric::CpReconfigureRejected,
+        Metric::ControlReconfigureAccepted,
+        Metric::ControlReconfigureRejected,
     ];
 
     /// The stable exported name of this metric (snake_case, used as the text
@@ -279,6 +299,8 @@ impl Metric {
             Metric::CpSnapshotInstalls => "cp_snapshot_installs",
             Metric::CpReconfigureAccepted => "cp_reconfigure_accepted",
             Metric::CpReconfigureRejected => "cp_reconfigure_rejected",
+            Metric::ControlReconfigureAccepted => "control_reconfigure_accepted",
+            Metric::ControlReconfigureRejected => "control_reconfigure_rejected",
         }
     }
 

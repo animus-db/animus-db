@@ -353,6 +353,38 @@ impl<E: Env> RaftNode<E> {
         self.lock().config()
     }
 
+    /// Propose a **single-server** membership change (ADR 0017 C) to the
+    /// control group's *own* Raft configuration: `voters` becomes the new
+    /// configuration. Leader-only; rejected for a multi-server delta, an
+    /// in-flight change, or removing the leader (see
+    /// [`RaftCore::change_membership`], which this is a thin wrapper over —
+    /// mirroring `animus-cp-data::RaftKvNode::change_membership`'s identical
+    /// shape for the per-tablet data plane). This is the primitive an
+    /// operator-driven control-plane membership change (admin API, a later PR
+    /// in this stack) drives to grow/shrink/replace a control voter.
+    ///
+    /// Unlike the per-tablet data plane's `propose_and_wake`, there is no
+    /// propose-signal to notify here: `RaftNode`'s own plain `propose` has
+    /// never woken the driver loop either (a control-plane proposal is always
+    /// serviced on the driver's next heartbeat tick, bounded by
+    /// [`HEARTBEAT_INTERVAL`], which is already far shorter than the
+    /// election timeout this method's own erratum/single-server gates key
+    /// off) — so this stays consistent with the rest of this type's propose
+    /// surface rather than inventing a new wake seam for one caller.
+    pub fn change_membership(&self, voters: std::collections::BTreeSet<NodeId>) -> ProposeResult {
+        record_reconfigure(&self.metrics, self.lock().change_membership(voters))
+    }
+
+    /// Arm a leadership transfer to `target` (see
+    /// [`RaftCore::transfer_leadership`]) — the escape valve
+    /// [`change_membership`](Self::change_membership) needs to remove the
+    /// *current leader's own* control-voter slot, since it always rejects
+    /// leader self-removal. Returns whether the transfer was armed. Mirrors
+    /// `animus-cp-data::RaftKvNode::transfer_leadership`'s identical shape.
+    pub fn transfer_leadership(&self, target: NodeId) -> bool {
+        self.lock().transfer_leadership(target, self.env.now())
+    }
+
     /// Whether this node's failure detector currently judges `member` alive
     /// (a heartbeat seen within the timeout). Observability for tests; the
     /// authoritative liveness lives in the replicated `Metadata` status, which
@@ -539,6 +571,21 @@ fn record_outbound(metrics: &MetricsHandle, outs: &[Out]) {
             _ => {}
         }
     }
+}
+
+/// Record the real outcome of a control-group `change_membership` step (ADR
+/// 0015) — accepted, or rejected (not leader, an in-flight change, a
+/// multi-server delta, or a leader self-removal) — and pass the result through
+/// unchanged. Mirrors `animus-cp-data`'s `record_reconfigure`, but under its
+/// own counter family (`ControlReconfigureAccepted`/`Rejected`) so control-
+/// *group* reconfiguration churn stays distinguishable from the per-tablet
+/// data plane's `CpReconfigureAccepted`/`Rejected`.
+fn record_reconfigure(metrics: &MetricsHandle, result: ProposeResult) -> ProposeResult {
+    match result {
+        ProposeResult::Accepted { .. } => metrics.incr(Metric::ControlReconfigureAccepted),
+        ProposeResult::NotLeader { .. } => metrics.incr(Metric::ControlReconfigureRejected),
+    }
+    result
 }
 
 /// Record election metrics + the leadership gauge from a role/term transition
