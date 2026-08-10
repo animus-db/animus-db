@@ -312,9 +312,19 @@ async function loadAll() {
 
   const addrs = (peers.admin_addrs && peers.admin_addrs.length) ? peers.admin_addrs
     : [SEED.replace(/^https?:\/\//, "")];
+  // Per-address role, straight from `/admin/peers`' own `peers` field (ADR
+  // 0035 residual follow-up — role now replicates alongside the address, see
+  // `admin.rs::peers_view`) rather than only ever knowable once THAT node's
+  // own `/admin/config` fetch below succeeds. Kept as a fallback on `node`
+  // (not overwriting `config.role` when the fetch does succeed) so a peer
+  // whose own fan-out fails/is still in flight still carries a role a
+  // consumer can use (e.g. tagging a down control node in the Overview list,
+  // or picking a console link target without waiting on that node itself).
+  const roleByAddr = {};
+  for (const p of (peers.peers || [])) roleByAddr[p.admin] = p.role;
   const nodes = await Promise.all(addrs.map(async (addr) => {
     const base = baseFor(addr);
-    const node = { addr, base, ok: false };
+    const node = { addr, base, ok: false, role: roleByAddr[addr] };
     try {
       const [config, raft, raftkv, health] = await Promise.all([
         getJSON(base, "/admin/config"),

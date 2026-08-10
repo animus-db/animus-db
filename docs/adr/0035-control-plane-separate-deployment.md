@@ -301,6 +301,26 @@ low-risk mechanical piece first (ADR 0031/0032's PR stacks):
    so it can never stall on a slow/unreachable peer the way the existing
    cluster-wide fan-out can. See `crates/animusd/CLAUDE.md`'s dashboard
    section for the full detail.
+9. **PR8 (implemented): per-node role in `/admin/peers`.** A residual
+   follow-up flagged after PR6/PR7 shipped: `GET /admin/peers` returned only
+   `this` + a flat `admin_addrs` list, so a consumer (chiefly the dashboard)
+   could only learn a *specific* node's role by fetching that node's own
+   `/admin/config` — meaning "label/gate by role" depended on every node's
+   own fan-out succeeding, not just this node's. Closed by adding
+   `role: String` to `animus_control::meta::NodeAddrs` (`#[serde(default =
+   "combined")]`, since every pre-ADR-0035 `RegisterNodeAddrs` registration
+   was, by construction, combined-mode) — each node stamps its own role at
+   the exact point it already self-registers its address book, so no new
+   proposal/relay/endpoint was needed. `/admin/peers` gained an additive
+   `peers: [{admin, role}, ...]` field (`admin.rs::peers_view`) reading every
+   node's role straight off replicated `Metadata.node_addrs`; the pre-existing
+   `admin_addrs` field is unchanged. The dashboard (`dashboard_core.js`)
+   captures this as a fallback (`node.role`) alongside each node's own
+   `/admin/config` fetch (`node.config.role`, still preferred when it
+   resolves), so a down control-only node now appears in the Overview list
+   tagged `"control"` and marked unreachable instead of vanishing entirely,
+   and the Node view's "Open cluster console" link can target a candidate
+   whose own `/admin/config` fetch hasn't resolved yet.
 
 ### Rolling upgrade / mixed-version compatibility
 
@@ -309,7 +329,7 @@ a new one on others, mid-rollout) is safe in both directions:
 
 - **Old config, new binary.** Every new field this ADR added
   (`RoleAddrs.role`, the `Option`-wrapped `control`/`raftkv` addresses,
-  `ClientResponse::Status`'s `leader_hint`/`watermark`) has a
+  `ClientResponse::Status`'s `leader_hint`/`watermark`, `NodeAddrs.role`) has a
   `#[serde(default)]` (or an equivalent custom default, for the address
   `Option`s — see `crates/animusd/CLAUDE.md`'s note on why a bare
   `#[serde(default)]` would be wrong there) that resolves to combined mode

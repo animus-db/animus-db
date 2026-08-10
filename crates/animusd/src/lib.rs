@@ -1219,6 +1219,7 @@ impl BoundNode {
                     raftkv: my_raftkv_addr.to_string(),
                     client: my_client_addr.to_string(),
                     admin: my_admin_addr.to_string(),
+                    role: "combined".to_string(),
                 },
             ),
             self.client_listener,
@@ -1858,6 +1859,7 @@ impl BoundControlNode {
                     raftkv: String::new(),
                     client: self.client_addr.to_string(),
                     admin: self.admin_addr.to_string(),
+                    role: "control".to_string(),
                 },
             ),
             self.client_listener,
@@ -2040,6 +2042,7 @@ impl BoundDataNode {
                     raftkv: my_raftkv_addr.to_string(),
                     client: my_client_addr.to_string(),
                     admin: my_admin_addr.to_string(),
+                    role: "data".to_string(),
                 },
             ),
             self.client_listener,
@@ -6119,6 +6122,7 @@ pub async fn run_node_join(
             raftkv: my_raftkv_addr.to_string(),
             client: addrs.client.to_string(),
             admin: addrs.admin.to_string(),
+            role: "combined".to_string(),
         },
     )
     .await?;
@@ -6289,6 +6293,7 @@ pub async fn run_node_data_join(
             raftkv: my_raftkv_addr.to_string(),
             client: addrs.client.to_string(),
             admin: addrs.admin.to_string(),
+            role: "data".to_string(),
         },
     )
     .await?;

@@ -60,7 +60,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tracing::Instrument;
 
 use crate::http;
-use crate::{ClientCtx, ClientResponse};
+use crate::{AdminInfo, ClientCtx, ClientResponse};
 
 /// This group's Raft state for the `/admin/raftkv` view (ADR 0020). Built by
 /// [`crate::CpGroup::raft_view`] over either engine arm.
@@ -291,6 +291,24 @@ async fn dispatch(ctx: &ClientCtx, request: &http::HttpRequest) -> (u16, String)
 
 // ---- read-only views ----------------------------------------------------
 
+/// This node's own deployment role, derived from the same two `Option`s the
+/// dashboard would otherwise have to null-check itself (ADR 0035 PR6) —
+/// `"control"` (no `raftkv_id`), `"data"` (no `control_id`), or `"combined"`
+/// (both present, every shape before ADR 0035 and still what `--cluster N`/
+/// plain `--config`/`--node` assemble). A node only ever authoritatively
+/// knows its *own* role this way; any *other* node's role is read from its
+/// self-registered `NodeAddrs.role` in replicated `Metadata` instead (see
+/// [`peers_view`]) — this helper is only ever called with `ctx.admin`, never
+/// with data derived from a peer.
+fn node_role_str(a: &AdminInfo) -> &'static str {
+    match (a.control_id.is_some(), a.raftkv_id.is_some()) {
+        (true, false) => "control",
+        (false, true) => "data",
+        (true, true) => "combined",
+        (false, false) => "unknown", // structurally shouldn't happen
+    }
+}
+
 fn config_view(ctx: &ClientCtx) -> Value {
     let a = &ctx.admin;
     // `effective_metadata()`, not `ctx.control.metadata_cached()` directly
@@ -305,17 +323,7 @@ fn config_view(ctx: &ClientCtx) -> Value {
         .iter()
         .map(|(id, addr)| (id.to_string(), addr.to_string()))
         .collect();
-    // Derived from the same two `Option`s the dashboard would otherwise have
-    // to null-check itself (ADR 0035 PR6) — "control" (no `raftkv_id`),
-    // "data" (no `control_id`), or "combined" (both present, every shape
-    // before this ADR and still what `--cluster N`/plain `--config`/`--node`
-    // assemble). One string a node-identity row can show directly.
-    let role = match (a.control_id.is_some(), a.raftkv_id.is_some()) {
-        (true, false) => "control",
-        (false, true) => "data",
-        (true, true) => "combined",
-        (false, false) => "unknown", // structurally shouldn't happen
-    };
+    let role = node_role_str(a);
     json!({
         "role": role,
         // `null` on a data-only node (ADR 0035 PR4) — it has no local control
@@ -351,17 +359,48 @@ fn config_view(ctx: &ClientCtx) -> Value {
 /// 0030 residual gap `route_sync_loop` closes for client-op forwarding.
 /// Deduplicated, stable (sorted) order so the dashboard's fan-out set doesn't
 /// jitter between polls. `this` marks the node serving the page.
+///
+/// **`peers` (ADR 0035 residual follow-up) additionally carries each node's
+/// deployment role** (`"control"`/`"data"`/`"combined"`), closing the gap
+/// where role was only ever knowable by fetching that *specific* node's own
+/// `/admin/config` — the dashboard used to have to fan out to every peer just
+/// to learn what it was before it could gate/label anything by role. A node
+/// only ever authoritatively knows its own role, so this is read straight off
+/// each member's self-registered `NodeAddrs.role` (replicated via
+/// `RegisterNodeAddrs`, ADR 0032 PR1 — every node proposes its own role at
+/// startup, ADR 0030 growth nodes included) rather than inferred here. An
+/// address known only from the static `admin_addrs` seed (this node hasn't
+/// yet observed that node's self-registration commit) has no role yet, so it
+/// is reported `"unknown"` — a transient startup state, not a permanent one.
+/// `admin_addrs` is kept byte-for-byte as before for any older consumer.
 fn peers_view(ctx: &ClientCtx) -> Value {
     let a = &ctx.admin;
+    let meta = ctx.effective_metadata();
     let mut admin_addrs: std::collections::BTreeSet<String> =
         a.admin_addrs.iter().map(ToString::to_string).collect();
-    for addrs in ctx.effective_metadata().node_addrs.into_values() {
-        admin_addrs.insert(addrs.admin);
+    let mut roles: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    // This node's own role is authoritative (never learned from `node_addrs`,
+    // even if this node has already self-registered) — see `node_role_str`'s
+    // doc.
+    roles.insert(a.admin_addr.to_string(), node_role_str(a).to_string());
+    for addrs in meta.node_addrs.into_values() {
+        admin_addrs.insert(addrs.admin.clone());
+        roles.entry(addrs.admin).or_insert(addrs.role);
     }
     let admin_addrs: Vec<String> = admin_addrs.into_iter().collect();
+    let peers: Vec<Value> = admin_addrs
+        .iter()
+        .map(|addr| {
+            json!({
+                "admin": addr,
+                "role": roles.get(addr).cloned().unwrap_or_else(|| "unknown".to_string()),
+            })
+        })
+        .collect();
     json!({
         "this": a.admin_addr.to_string(),
         "admin_addrs": admin_addrs,
+        "peers": peers,
     })
 }
 

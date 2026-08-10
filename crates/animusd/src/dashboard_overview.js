@@ -21,13 +21,20 @@ function renderOverview() {
   const h = computeHealth();
   // Control-only nodes are never `Metadata.members` (see the crate guide's
   // "the cluster's members are the CP raftkv nodes" entry) — they're only
-  // discoverable through the `/admin/peers` fan-out.
+  // discoverable through the `/admin/peers` fan-out. A control-only node
+  // whose own `/admin/config` fetch is down still shows up here (tagged
+  // "control", marked unreachable, no console link) as long as SOME peer's
+  // `/admin/peers` reported its role (`n.role`, ADR 0035 residual follow-up)
+  // — previously it vanished from the list entirely the moment its own
+  // fan-out failed.
   const controlRows = STATE.nodes
-    .filter((n) => n.ok && n.config && n.config.role === "control")
+    .filter((n) => (n.ok && n.config && n.config.role === "control") ||
+      (!(n.ok && n.config) && n.role === "control"))
     .map((n) => ({
-      id: n.config.control_id, role: "control", up: true, base: n.base,
-      detail: (n.raft && n.raft.is_leader) ? "control leader" : "control node",
-      statusText: "reachable",
+      id: (n.config && n.config.control_id != null) ? n.config.control_id : n.addr,
+      role: "control", up: n.ok, base: n.ok ? n.base : null,
+      detail: n.ok ? ((n.raft && n.raft.is_leader) ? "control leader" : "control node") : "control node",
+      statusText: n.ok ? "reachable" : "unreachable",
     }));
   $("ov-summary").textContent = controlRows.length
     ? `${controlRows.length} control + ${nodeCount} data node(s) · ${tabletIds.length} tablet(s)`
@@ -82,13 +89,18 @@ function renderOverview() {
   // `base` origin, already resolved by the fan-out) — the same
   // `target="_blank"` pattern the Node view's "Open cluster console" link
   // uses — so hopping between nodes' consoles never means retyping a port.
+  // Role prefers `node.config.role` (fresher, read off that node's own
+  // successful `/admin/config` fetch) and falls back to `node.role` (from
+  // `/admin/peers` itself, ADR 0035 residual follow-up) so a node whose own
+  // fan-out hasn't resolved yet still reads as its real role instead of a
+  // generic guess.
   const dataRows = (memberIds.length ? memberIds : STATE.nodes.filter((n) => n.ok).map((n) => n.config.raftkv_id))
     .map((id) => {
       const m = members[id];
       const node = nodeByRaftkv(id);
       const up = m ? m.status === "Active" : !!(node && node.ok);
       const hostedCount = groups && Object.values(groups).flat().filter((x) => nodeRaftkvId(x.node) === id).length;
-      const role = (node && node.config && node.config.role) || "data";
+      const role = (node && ((node.config && node.config.role) || node.role)) || "data";
       return {
         id, role, up,
         base: node && node.ok ? node.base : null,

@@ -312,6 +312,11 @@ route below the edge through the same `ClientCtx` CP primitives.
   in its own `admin_seed` span (it bypasses `handle_client`, so it needs one to
   emit any trace). `key_display`/`parse_key_display` render a binary partition
   token as unpadded base64url; a plain-client key is verbatim/printable.
+  `/admin/peers`'s `peers: [{admin, role}, ...]` field (ADR 0035 residual
+  follow-up, `admin.rs::peers_view`) carries each node's deployment role
+  straight off replicated `Metadata.node_addrs[*].role` — closing the gap
+  where role was only knowable by fetching that specific node's own
+  `/admin/config` first; `admin_addrs` itself is unchanged.
 - **Web console** (`dashboard.rs` + assets, ADR 0021) — a self-contained
   vanilla-JS SPA, a pure client of `/admin/*` JSON (so responses carry CORS). Six
   views seeded by a `/admin/peers` fan-out; tabs are **role-gated client-side**
@@ -365,6 +370,15 @@ route below the edge through the same `ClientCtx` CP primitives.
   `Status` poll. A replicated node
   address book (ADR 0032 PR1, `Metadata.node_addrs` + `route_sync_loop`) keeps
   `client_route`/`/admin/peers` live so forwarding reaches nodes grown in later.
+- **A node's deployment role rides that same replicated address book**
+  (`NodeAddrs.role: String`, ADR 0035 residual follow-up) — each of
+  `BoundNode::start_with`/`BoundControlNode::start_control_with`/
+  `BoundDataNode::start_data_with` stamps its own literal role
+  (`"combined"`/`"control"`/`"data"`) at its `NodeAddrs` construction site, so
+  `/admin/peers` can report every OTHER node's role straight from
+  `Metadata.node_addrs` instead of the dashboard fanning out to each node's
+  own `/admin/config` just to learn it. `#[serde(default = "combined")]` for
+  WAL back-compat (every pre-ADR-0035 registration was combined-mode).
 - **Decommission (ADR 0032 PR3)** = `drain` + `MetaCommand::RemoveMember`; check
   leadership *before* any metadata-dependent refusal (a follower's replica lags).
   Not a fence — a restarted process at the same raftkv id rejoins like a fresh

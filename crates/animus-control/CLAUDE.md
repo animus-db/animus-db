@@ -25,8 +25,17 @@ per-tablet CP data plane (`animus-cp-data`).
   and `Metadata::rebalance` are the *pure* placement decisions (see Invariants).
   `Metadata` holds members, the tablet map, placement policies, the table-schema
   catalog, keyspaces, `node_addrs` (member id → full `NodeAddrs { raftkv,
-  client, admin }`, ADR 0032 PR1) and the legacy `cp_member_addrs` (kept for WAL
-  back-compat). `PlacementView` is the narrow (members + tablets + policies, no
+  client, admin, role }`, ADR 0032 PR1) and the legacy `cp_member_addrs` (kept
+  for WAL back-compat). `NodeAddrs.role: String` (ADR 0035 residual follow-up,
+  `#[serde(default = "combined")]` for WAL back-compat) is a member's own
+  deployment role (`"control"`/`"data"`/`"combined"`) — a plain string, not an
+  `animusd`-side enum, since this crate has no dependency on `animusd` and
+  every other field here is already an opaque wire-format string this crate
+  never interprets. A node only ever authoritatively knows its own role, so
+  it is stamped once at self-registration time like the other three fields;
+  `animusd`'s `/admin/peers` reads every *other* node's role straight off
+  this field instead of fanning out to each node's own `/admin/config`.
+  `PlacementView` is the narrow (members + tablets + policies, no
   schema) clone that `RaftCore::placement_view()` hands the driver loops so they
   evaluate off the core lock instead of cloning the whole `Metadata` every tick.
   `MetaCommand` variants (all applied in log order):
