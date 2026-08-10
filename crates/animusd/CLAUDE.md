@@ -333,7 +333,13 @@ route below the edge through the same `ClientCtx` CP primitives.
   reachable node's row — plus the Placement view's selected-node header —
   carries a `consoleLink()` (`dashboard_core.js`) to that node's OWN admin
   console, built from the origin the `/admin/peers` fan-out already resolved
-  (empty for this page's own origin — a self-link is noise).
+  (empty for this page's own origin — a self-link is noise). **Cluster health
+  means "is the data at risk," not "is anything in transition"** (ADR 0021 §7):
+  `tabletStatus`'s ladder (`quorum-lost` → `under-replicated` → `healthy` →
+  `forming`) only degrades on an actual redundancy/quorum loss; a split-child
+  or freshly-provisioned tablet forming its Raft group with every assigned
+  replica's node alive renders as a neutral `forming` pill, escalating to
+  degraded only if stuck past 60s (`computeHealth`'s `overdueFormingCount`).
 - **OTel** (`otel.rs`, ADR 0027) — `init_tracing(instance_id)` from `main.rs`;
   `current_traceparent`/`set_parent_traceparent` carry W3C trace context across a
   forwarded hop (`cp_forward` injects, the receiver's `handle_client`

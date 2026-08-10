@@ -806,26 +806,33 @@ debugging anything that feels like it might have happened before.
   exactly where this hides, because it rides on a role's transport without
   being that role's own data. (`animusd::config::{control_peer_book,
   raftkv_peer_book}`.)
-- **A health/status rollup that gates on a *proxy* signal (a member's `Down`
-  status) rather than the actual risk that signal stands in for (a tablet
-  under-replicated/leaderless) can diverge from reality forever, because the
-  two clear on different triggers.** The dashboard's `computeHealth()`
-  (ADR 0021) treated any `Down` member as itself "degraded" — but a `Down`
-  member only clears on manual decommission (ADR 0032 PR3) or the node
-  rejoining, while the actual data-loss risk it represents is cleared much
-  sooner, automatically, once the placement reconciler repairs every tablet
-  the dead node used to replicate onto a spare (`failure_auto_replaces_
-  replica_onto_spare`). So a cluster whose data was fully re-replicated
-  within seconds could show "Degraded" indefinitely, until someone
-  remembered to decommission the long-dead node. Fixed by keying "degraded"
-  on the tablets' own derived status (`leaderlessCount`/`underReplicatedCount`,
-  already computed per-tablet for the "Under-replicated" stat tile) instead
-  of the member roster; `downCount` is kept as informational context in the
-  banner/tiles, not a health-gating input. **General check for any rollup
+- **A health/status rollup that gates on a *proxy* signal rather than the
+  actual risk that signal stands in for can diverge from reality forever,
+  because the two clear on different triggers. General check for any rollup
   built from "X is down/unhealthy ⇒ overall is unhealthy": does the thing
   being protected (data replication, request-serving capacity) actually
   recover on a faster/different path than the raw signal does — and if so,
-  gate on the protected property, not the signal.**
+  gate on the protected property, not the signal.** (Original mechanism —
+  gating on a lingering `Down` member instead of per-tablet status —
+  superseded by the "health ≈ is the data at risk" ladder
+  (`quorum-lost`/`under-replicated`/`healthy`/`forming`); full writeup moved
+  to `docs/engineering-lessons-archive.md`.)
+- **A CSS/pill class name that is also read as a domain-semantic status token
+  invites silent scope creep: reusing one for an unrelated visual purpose
+  quietly gives that purpose the first status's meaning.** The Tablets view's
+  "over auto-split threshold" indicator was implemented as `pill("under-
+  replicated", "over " + threshold)` — reusing the `under-replicated` status
+  class purely because it happened to render orange. That's harmless-looking
+  until something (a filter, a rollup, a screenshot-driven bug report) reads
+  the class name as "this tablet actually lost redundancy," which it didn't —
+  it was just big. Fixed by introducing a presentation-only `.warn` pill class
+  distinct from any status the health rollup ever computes, so a "just a
+  warning color" use can never be mistaken for a data-risk status again.
+  **When a class/enum name serves double duty as both a CSS selector and a
+  domain value some other code branches on, a "just reuse it for the color"
+  shortcut is a latent correctness bug, not a style nit — give purely-visual
+  reuses their own name.** (`animusd::dashboard_tablets.js`, `dashboard.css`'s
+  `.warn`/`.forming`/`.quorum-lost` classes.)
 - **A quorum primitive's "who do I need acks from" and "how many acks do I
   need" must both read the group's *live* Raft config — never a peer set
   captured once at construction, even one that looks read-only/immutable.**

@@ -4,7 +4,8 @@
 // `dashboard_tablets.js`, `dashboard_browser.js`, and `dashboard_storage.js`
 // load after this file and call into it (STATE, $, esc, getJSON, postJSON,
 // pill, consoleLink, bytes, humanBytes, tokenBound, b64url, nodeRaftkvId, cpGroupsByTablet,
-// autoSplitThresholds, tabletStatus, computeHealth, activateTab, gotoStorage);
+// autoSplitThresholds, tabletStatus, worstTabletStatus, statusDotClass, computeHealth,
+// activateTab, gotoStorage);
 // nothing here calls into them except `render()`, the single per-refresh
 // entry point every view's render function hangs off of.
 const SEED = window.location.origin;
@@ -224,36 +225,109 @@ function autoSplitThresholds() {
   };
 }
 
-// A tablet's derived status: `electing` if no elected leader among its
-// hosting groups, `under-replicated` if fewer nodes are currently reachable
-// and hosting than the tablet's configured replica count, else `healthy`.
-// `gs` is `cpGroupsByTablet()[id] || []`.
+// A tablet's derived status — health here means "is the data at risk", not
+// "is anything in transition" (see `computeHealth`'s doc below for the full
+// philosophy). `gs` is `cpGroupsByTablet()[id] || []`. Reads
+// `STATE.status.members` directly (like `cpGroupsByTablet` reads `STATE`)
+// rather than taking it as a parameter, so every call site stays a plain
+// `tabletStatus(t, gs)`.
+//
+// Ladder (first match wins):
+//   1. `quorum-lost`      — fewer than a quorum of the tablet's ASSIGNED
+//      replicas are on a live node. The group cannot commit, and one more
+//      failure loses data. Always critical.
+//   2. `under-replicated` — some assigned replica's node is genuinely down
+//      (not just mid-election/mid-formation). Redundancy is actually
+//      reduced; repair is pending. Degrades health.
+//   3. `healthy`          — a leader is elected and every configured replica
+//      is currently hosted-and-reachable.
+//   4. `forming`          — every assigned replica's node is alive, but the
+//      group hasn't converged yet (no leader elected, or fewer hosted groups
+//      than configured). This is a transition — split-child formation, first
+//      election on a freshly-provisioned table, rebalance/repair catch-up,
+//      reconciler lag, or an admin-port fan-out gap — never a data-risk
+//      state (ADR 0028: split/merge/provision are a single control-plane
+//      command with no data-plane half; the data already sits safely on the
+//      source replicas' shared storage engines while the new group stands
+//      itself up). Does NOT degrade health by itself; see the
+//      `overdueFormingCount` guardrail in `computeHealth`.
 function tabletStatus(t, gs) {
-  if (!gs.some((x) => x.g.is_leader)) return "electing";
-  const configured = (t.replicas || []).length;
-  if (configured > 0 && gs.length < configured) return "under-replicated";
-  return "healthy";
+  const members = (STATE.status && STATE.status.members) || {};
+  const membersEmpty = Object.keys(members).length === 0;
+  const replicas = t.replicas || [];
+  const configured = replicas.length;
+  // A replica's node is "live" if it isn't known to be Down — `Joining`/
+  // `Leaving` still means the node is up and its engine durable, just
+  // bootstrapping or draining. An empty members map (very early startup,
+  // before the first heartbeat round) can't distinguish live from dead, so
+  // it treats every assigned replica as live rather than screaming
+  // quorum-lost before the cluster has even reported in.
+  const isLive = (id) => membersEmpty || (!!members[id] && members[id].status !== "Down");
+  const liveAssigned = replicas.filter(isLive).length;
+  const quorum = Math.floor(configured / 2) + 1;
+  const hasLeader = gs.some((x) => x.g.is_leader);
+  const hostedLive = gs.length;
+
+  if (configured > 0 && liveAssigned < quorum) return "quorum-lost";
+  if (liveAssigned < configured) return "under-replicated";
+  if (hasLeader && hostedLive >= configured) return "healthy";
+  return "forming";
 }
+
+// Ranks `tabletStatus` outputs worst-to-best, for rollups that need "the
+// worst status among several tablets" (e.g. the Overview per-table summary).
+const TABLET_STATUS_RANK = { "quorum-lost": 3, "under-replicated": 2, forming: 1, healthy: 0 };
+function worstTabletStatus(statuses) {
+  return statuses.reduce((worst, s) => (TABLET_STATUS_RANK[s] > TABLET_STATUS_RANK[worst] ? s : worst), "healthy");
+}
+
 function statusDotClass(status) {
   if (status === "healthy" || status === "Active") return "ok-dot";
   if (status === "under-replicated" || status === "Leaving" || status === "Joining") return "warn-dot";
-  if (status === "electing" || status === "Down") return "bad-dot";
-  return "dim-dot";
+  if (status === "quorum-lost" || status === "Down") return "bad-dot";
+  return "dim-dot"; // forming, and anything unrecognized
 }
 
+// Module-level guardrail state for the "overdue forming" escalation below:
+// how long (wall-clock) each tablet has been continuously `forming`. This is
+// browser UI state, not simulation/protocol logic, so `Date.now()` is
+// intentional here — the repo's Env-determinism rule (ADR 0003) scopes to
+// deterministic Rust crate logic (`SimEnv`/`ProdEnv`), not this client-side
+// SPA, which has no replay/seed story to preserve. Do not "fix" this into an
+// injected clock.
+const FORMING_SINCE = new Map();
+const FORMING_OVERDUE_MS = 60_000;
+
 // Derive an at-a-glance health rollup from data `loadAll()` already fetched —
-// no new requests. A cluster with no control leader can't accept writes, so
-// that alone is "critical". Degraded means an actual tablet needs attention
-// (leaderless, or under-replicated per `tabletStatus` — fewer hosting groups
-// than its configured replica count). A `Down` member is NOT by itself
-// degrading: once the placement reconciler has repaired every tablet that
-// member used to replicate onto a spare (every tablet back at its configured
-// replication, none leaderless), the cluster is healthy again even though the
-// dead node is still lingering in the roster undecommissioned — the failure
-// detector/reconciler can keep trying to reach it for a while after data is
-// already fully replicated, and that lingering `Down` member shouldn't hold
-// the whole cluster at "degraded" once its data-loss risk is gone.
+// no new requests.
+//
+// ---- Philosophy: health ≈ "is the data at risk", not "is anything in
+// transition" ----
+// A tablet mid-formation — a split-child forming its Raft group, a freshly
+// created table's first election, a rebalance/repair move catching up, or a
+// reconciler/admin-fan-out lag — is not a data-risk state as long as every
+// replica assigned to it is on a live node: ADR 0028 makes split/merge/
+// provision a single control-plane command with no data-plane half, so the
+// data already sits safely in the source replicas' shared storage engines
+// the whole time the new group is standing itself up. That is exactly what
+// `tabletStatus`'s `forming` state captures, and it must not degrade the
+// cluster's health pill — otherwise every routine split reads as an outage.
+// What DOES mean data is at risk: an assigned replica's node actually being
+// `Down` (`under-replicated` — redundancy genuinely reduced) or a tablet
+// dropping below quorum (`quorum-lost` — cannot commit, one more failure
+// loses data; always critical). A lingering `Down` MEMBER that no tablet
+// still depends on (every tablet it used to replicate has been repaired onto
+// a spare) is also not degrading by itself — the failure detector/reconciler
+// can keep retrying it for a while after the actual data-loss risk is gone.
 // `downCount` is still surfaced (nodes tile, banner text) for visibility.
+//
+// ---- Overdue-forming guardrail ----
+// A formation that never converges (e.g. a stuck election, a wedged
+// reconciler) is a real problem and must not hide behind "it's just forming"
+// forever. `FORMING_SINCE` tracks, per tablet, when it was first observed
+// forming (cleared the moment it leaves forming or the tablet vanishes); a
+// tablet forming for longer than `FORMING_OVERDUE_MS` (60s) counts toward
+// `overdueFormingCount`, which DOES degrade health.
 function computeHealth() {
   const members = (STATE.status && STATE.status.members) || {};
   const memberIds = Object.keys(members);
@@ -262,28 +336,54 @@ function computeHealth() {
   const tablets = (STATE.status && STATE.status.tablets) || {};
   const tabletIds = Object.keys(tablets);
   const groups = cpGroupsByTablet();
-  const leaderlessCount = tabletIds.filter((id) => !(groups[id] || []).some((x) => x.g.is_leader)).length;
-  const underReplicatedCount = tabletIds.filter((id) => tabletStatus(tablets[id], groups[id] || []) === "under-replicated").length;
+
+  let quorumLostCount = 0, underReplicatedCount = 0, formingCount = 0, overdueFormingCount = 0;
+  const now = Date.now();
+  const stillForming = new Set();
+  for (const id of tabletIds) {
+    const st = tabletStatus(tablets[id], groups[id] || []);
+    if (st === "quorum-lost") quorumLostCount++;
+    else if (st === "under-replicated") underReplicatedCount++;
+    else if (st === "forming") {
+      formingCount++;
+      stillForming.add(id);
+      if (!FORMING_SINCE.has(id)) FORMING_SINCE.set(id, now);
+      if (now - FORMING_SINCE.get(id) > FORMING_OVERDUE_MS) overdueFormingCount++;
+    }
+  }
+  // Forget any tablet no longer forming — recovered, or gone entirely
+  // (split/merge/drop) — so a later re-entry into forming starts a fresh
+  // clock instead of reusing a stale timestamp from a previous episode.
+  for (const id of FORMING_SINCE.keys()) {
+    if (!stillForming.has(id)) FORMING_SINCE.delete(id);
+  }
 
   const controlLeader = STATE.nodes.find((n) => n.ok && n.raft && n.raft.is_leader);
 
   let status = "healthy";
-  if (leaderlessCount > 0 || underReplicatedCount > 0) status = "degraded";
-  if (!controlLeader) status = "critical";
+  if (underReplicatedCount > 0 || overdueFormingCount > 0) status = "degraded";
+  if (!controlLeader || quorumLostCount > 0) status = "critical";
 
   return {
     status, controlLeader,
     downCount, totalNodes: memberIds.length || STATE.nodes.length,
-    leaderlessCount, underReplicatedCount, totalTablets: tabletIds.length,
+    quorumLostCount, underReplicatedCount, formingCount, overdueFormingCount,
+    totalTablets: tabletIds.length,
   };
 }
 
 function renderHealthPill() {
   const h = computeHealth();
-  const issues = h.leaderlessCount + h.underReplicatedCount;
-  const label = h.status === "healthy" ? "Healthy"
-    : h.status === "critical" ? "No control leader"
-    : `Degraded · ${issues} issue${issues === 1 ? "" : "s"}`;
+  let label;
+  if (h.status === "critical") {
+    label = !h.controlLeader ? "No control leader"
+      : `${h.quorumLostCount} tablet${h.quorumLostCount === 1 ? "" : "s"} quorum-lost`;
+  } else if (h.status === "degraded") {
+    const issues = h.underReplicatedCount + h.overdueFormingCount;
+    label = `Degraded · ${issues} issue${issues === 1 ? "" : "s"}`;
+  } else {
+    label = h.formingCount ? `Healthy · ${h.formingCount} forming` : "Healthy";
+  }
   $("health-pill").className = "health-pill " + h.status;
   $("health-pill").innerHTML = `<span class="dot"></span><span class="label">${esc(label)}</span>`;
 }

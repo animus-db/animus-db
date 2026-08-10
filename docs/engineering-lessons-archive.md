@@ -526,3 +526,36 @@ tablet-host reconciler" section for the replacement.
   5. Even so this remains a genuine timing race, not a deterministic repro —
   the primitive-level test is what actually proves the fix, the E2E test is
   corroborating evidence.)
+
+## Superseded by the "health ≈ is the data at risk" dashboard ladder (PR feat/console-health-data-risk)
+
+The dashboard's `computeHealth()` originally treated any tablet without an
+elected leader (`leaderlessCount`) or with fewer hosting groups than
+configured (`underReplicatedCount`) as "degraded" — collapsing every kind of
+"not fully converged" tablet (including a split-child mid-formation, whose
+data was never at risk per ADR 0028) into the same red status as a genuine
+node-failure-driven redundancy loss. Replaced by a four-rung ladder
+(`quorum-lost`/`under-replicated`/`healthy`/`forming`) keyed on whether each
+assigned replica's *node* is actually live, so routine transitions render
+neutral and only genuine data-risk states degrade health (ADR 0021 §7).
+
+- **A health/status rollup that gates on a *proxy* signal (a member's `Down`
+  status) rather than the actual risk that signal stands in for (a tablet
+  under-replicated/leaderless) can diverge from reality forever, because the
+  two clear on different triggers.** The dashboard's `computeHealth()`
+  (ADR 0021) treated any `Down` member as itself "degraded" — but a `Down`
+  member only clears on manual decommission (ADR 0032 PR3) or the node
+  rejoining, while the actual data-loss risk it represents is cleared much
+  sooner, automatically, once the placement reconciler repairs every tablet
+  the dead node used to replicate onto a spare (`failure_auto_replaces_
+  replica_onto_spare`). So a cluster whose data was fully re-replicated
+  within seconds could show "Degraded" indefinitely, until someone
+  remembered to decommission the long-dead node. Fixed by keying "degraded"
+  on the tablets' own derived status (`leaderlessCount`/`underReplicatedCount`,
+  already computed per-tablet for the "Under-replicated" stat tile) instead
+  of the member roster; `downCount` is kept as informational context in the
+  banner/tiles, not a health-gating input. **General check for any rollup
+  built from "X is down/unhealthy ⇒ overall is unhealthy": does the thing
+  being protected (data replication, request-serving capacity) actually
+  recover on a faster/different path than the raw signal does — and if so,
+  gate on the protected property, not the signal.**

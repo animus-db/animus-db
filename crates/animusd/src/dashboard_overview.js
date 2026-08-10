@@ -6,8 +6,8 @@
 // activity" panel is dropped, since there is no backend event log to back
 // it), and a tablets-per-node balance chart. Depends on `dashboard_core.js`
 // having loaded first (STATE, $, esc, pill, dot, consoleLink, nodeRaftkvId,
-// nodeDisplayId, cpGroupsByTablet, tabletStatus, statusDotClass,
-// computeHealth, activateTab).
+// nodeDisplayId, cpGroupsByTablet, tabletStatus, worstTabletStatus,
+// statusDotClass, computeHealth, activateTab).
 
 function renderOverview() {
   const status = STATE.status;
@@ -41,22 +41,32 @@ function renderOverview() {
     : `${nodeCount} node(s) · ${tabletIds.length} tablet(s)`;
 
   // ---- health banner ----
-  // Degraded is driven by tablet health (leaderless/under-replicated), not by
-  // a lingering `Down` member — a dead node whose tablets have already been
-  // repaired onto spares no longer degrades the cluster, even though it may
-  // still be tracked (and re-contacted for a while) as a `Down` member until
-  // it's decommissioned. `downCount` is still called out for context.
-  // `nodeDisplayId`, not `nodeRaftkvId` — the control leader may be a
-  // control-ONLY node (ADR 0035), which has no `raftkv_id` at all (`null`);
-  // `nodeDisplayId` falls back to `control_id` so a split deployment's
-  // control leader shows a real node number instead of "node null".
+  // Health here means "is the data at risk", not "is anything in transition"
+  // (full philosophy on `computeHealth`, dashboard_core.js). Critical is
+  // either no control leader (can't accept metadata changes) or a tablet
+  // below quorum (can't commit, one more failure loses data). Degraded is an
+  // actual redundancy loss (under-replicated) or a formation stuck long
+  // enough to be suspicious (`overdueFormingCount`) — never a routine
+  // in-flight formation (split-child, first election, rebalance catch-up),
+  // which shows up in the healthy banner's forming count instead, called out
+  // explicitly as NOT at risk. A lingering `Down` member with nothing left
+  // depending on it is also not degrading; `downCount` is still called out
+  // for context. `nodeDisplayId`, not `nodeRaftkvId` — the control leader may
+  // be a control-ONLY node (ADR 0035), which has no `raftkv_id` at all
+  // (`null`); `nodeDisplayId` falls back to `control_id` so a split
+  // deployment's control leader shows a real node number instead of "node
+  // null".
   const bannerSummary = h.status === "critical"
-    ? "No control-plane leader known — the cluster cannot accept metadata changes right now."
+    ? (!h.controlLeader
+        ? "No control-plane leader known — the cluster cannot accept metadata changes right now."
+        : `${h.quorumLostCount} tablet(s) below quorum — can't commit; another failure would lose data.`)
     : h.status === "degraded"
-      ? `${h.leaderlessCount} tablet(s) leaderless · ${h.underReplicatedCount} under-replicated${h.downCount ? ` · ${h.downCount} node(s) down` : ""}.`
-      : h.downCount
-        ? `${h.downCount} node(s) down, but all ${tabletIds.length} tablet(s) are fully replicated · control leader ${h.controlLeader ? "node " + esc(nodeDisplayId(h.controlLeader)) : "—"}.`
-        : `All ${nodeCount} node(s) reachable · ${tabletIds.length} tablet(s) replicated · control leader ${h.controlLeader ? "node " + esc(nodeDisplayId(h.controlLeader)) : "—"}.`;
+      ? `${h.underReplicatedCount} tablet(s) under-replicated${h.overdueFormingCount ? ` · ${h.overdueFormingCount} tablet(s) stuck forming past 60s` : ""}${h.downCount ? ` · ${h.downCount} node(s) down` : ""}.`
+      : h.formingCount
+        ? `All data fully replicated and not at risk · ${h.formingCount} tablet(s) provisioning · control leader ${h.controlLeader ? "node " + esc(nodeDisplayId(h.controlLeader)) : "—"}.`
+        : h.downCount
+          ? `${h.downCount} node(s) down, but all ${tabletIds.length} tablet(s) are fully replicated · control leader ${h.controlLeader ? "node " + esc(nodeDisplayId(h.controlLeader)) : "—"}.`
+          : `All ${nodeCount} node(s) reachable · ${tabletIds.length} tablet(s) replicated · control leader ${h.controlLeader ? "node " + esc(nodeDisplayId(h.controlLeader)) : "—"}.`;
   $("ov-banner").className = "card health-banner " + h.status;
   $("ov-banner").innerHTML = `
     <div class="row" style="gap:10px">${dot((h.status === "healthy" ? "ok" : "bad") + "-dot")}
@@ -65,10 +75,15 @@ function renderOverview() {
 
   // ---- stat tiles ----
   const controlTermText = h.controlLeader && h.controlLeader.raft ? `term ${h.controlLeader.raft.term}` : "—";
+  // "At risk" = quorum-lost + under-replicated — the two statuses that mean
+  // real redundancy loss, per `computeHealth`'s philosophy. `forming` tablets
+  // are called out in the sub-text (they're a transition, not a risk) rather
+  // than counted here.
+  const atRiskCount = h.quorumLostCount + h.underReplicatedCount;
   const tiles = [
     { label: "Nodes", value: `${nodeCount - h.downCount}/${nodeCount}`, sub: h.downCount ? `${h.downCount} down` : "all up" },
     { label: "Tablets", value: `${tabletIds.length}`, sub: `across ${Object.keys((status && status.schemas && status.schemas.tables) || {}).length} table(s)` },
-    { label: "Under-replicated", value: `${h.underReplicatedCount}`, sub: h.underReplicatedCount ? "needs attention" : "none" },
+    { label: "At risk", value: `${atRiskCount}`, sub: atRiskCount ? "needs attention" : (h.formingCount ? `${h.formingCount} forming` : "none") },
     { label: "Control plane", value: h.controlLeader ? `node ${esc(nodeDisplayId(h.controlLeader))}` : "—", sub: controlTermText },
   ];
   $("ov-tiles").innerHTML = tiles.map((t) =>
@@ -133,10 +148,15 @@ function renderOverview() {
   const tableNames = Object.keys(byTable).sort();
   const tableRows = tableNames.slice(0, 6).map((name) => {
     const ts = byTable[name];
-    const bad = ts.some((t) => tabletStatus(t, groups[t.id] || []) !== "healthy");
+    // Worst status among the table's tablets, not "any non-healthy" — a
+    // table with only `forming` tablets (e.g. right after a split) gets the
+    // neutral "forming" pill, not the same orange "attention" pill as a
+    // table that's actually lost redundancy.
+    const worst = worstTabletStatus(ts.map((t) => tabletStatus(t, groups[t.id] || [])));
+    const label = worst === "healthy" ? "ok" : worst;
     return `<div class="list-row"><span class="detail mono">${esc(name)}</span>
       <span class="muted">${ts.length} tablet(s)</span>
-      ${bad ? pill("under-replicated", "attention") : pill("healthy", "ok")}
+      ${pill(worst, label)}
     </div>`;
   }).join("");
   $("ov-tables").innerHTML = tableRows || `<div class="empty">no tables yet</div>`;

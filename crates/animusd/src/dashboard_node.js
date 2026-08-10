@@ -51,8 +51,12 @@ function renderNodeHealth() {
     $("nd-health").innerHTML = `<div class="section-head"><span class="title">Health</span></div><div class="empty">loading…</div>`;
     return;
   }
+  // `h.ok` is "control leader known" (`admin.rs::health`), not a replication
+  // signal — labeling it "under-replicated" when false misattributed a
+  // control-plane liveness gap to a data-risk state. "no control leader" is
+  // the accurate read.
   $("nd-health").innerHTML = `
-    <div class="section-head"><span class="title">Health</span>${pill(h.ok ? "healthy" : "under-replicated", h.ok ? "ready" : "not ready")}</div>
+    <div class="section-head"><span class="title">Health</span>${pill(h.ok ? "healthy" : "err", h.ok ? "ready" : "no control leader")}</div>
     <div class="list-row">${dot(h.control_leader_known ? "ok-dot" : "bad-dot")}<span class="detail">control leader known</span><span class="status-text">${h.control_leader_known ? "yes" : "no"}</span></div>
     <div class="list-row">${dot(h.is_control_leader ? "ok-dot" : "dim-dot")}<span class="detail">this node is control leader</span><span class="status-text">${h.is_control_leader ? "yes" : "no"}</span></div>
     <div class="list-row">${dot(h.hosts_cp ? "ok-dot" : "dim-dot")}<span class="detail">hosts CP tablets</span><span class="status-text">${h.hosts_cp ? "yes" : "no"}</span></div>`;
@@ -79,7 +83,7 @@ function renderNodeMirror() {
     ? `<div class="muted" style="margin-top:6px">this node is a control-plane voter — no mirror is involved; the fields above already reflect its own Raft state.</div>`
     : "";
   $("nd-mirror").innerHTML = `
-    <div class="section-head"><span class="title">Control-plane mirror</span>${pill(synced ? "healthy" : "electing", synced ? "synced" : "not yet synced")}</div>
+    <div class="section-head"><span class="title">Control-plane mirror</span>${pill(synced ? "healthy" : "warn", synced ? "synced" : "not yet synced")}</div>
     <div class="list-row"><span class="detail">applied-index watermark</span><span class="status-text mono">${esc(cm.watermark)}</span></div>
     <div class="list-row"><span class="detail">control leader</span><span class="status-text mono">${r.leader != null ? "node " + esc(r.leader) : "—"}</span></div>
     <div class="list-row"><span class="detail">leader address hint</span><span class="status-text mono">${cm.leader_hint ? esc(cm.leader_hint) : "—"}</span></div>
