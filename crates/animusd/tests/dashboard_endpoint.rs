@@ -366,6 +366,57 @@ async fn dashboard_role_gating_split_deployment() {
             "a control-plane voter's own mirror is never 'synced' (no mirror involved): {view}"
         );
 
+        // ---- /admin/peers carries per-node ROLE (ADR 0035 residual
+        // follow-up) for a genuine mixed control-only + data-only cluster —
+        // previously role was only ever knowable by fetching that specific
+        // node's own `/admin/config`, so the dashboard had to fan out to
+        // every peer just to label them. Each node's role is read off its
+        // own self-registered `NodeAddrs.role` (`RegisterNodeAddrs`), a
+        // best-effort proposal — bounded poll for it to have landed, not a
+        // one-shot assert, mirroring every other commit-wait in this suite.
+        // `admin_addrs` (the pre-existing field) is asserted unchanged too,
+        // so this stays a strict addition, not a breaking response shape.
+        timeout(Duration::from_secs(20), async {
+            loop {
+                let (s, _, body) = raw(control_admin, "GET", "/admin/peers").await;
+                assert_eq!(s, 200);
+                let peers: Value = serde_json::from_str(&body).expect("peers is JSON");
+                let admin_addrs = peers["admin_addrs"]
+                    .as_array()
+                    .expect("admin_addrs is still an array");
+                let control_str = control_admin.to_string();
+                let data_str = data_admin.to_string();
+                assert!(
+                    admin_addrs
+                        .iter()
+                        .any(|a| a.as_str() == Some(control_str.as_str())),
+                    "admin_addrs still lists the control node: {peers}"
+                );
+                assert!(
+                    admin_addrs
+                        .iter()
+                        .any(|a| a.as_str() == Some(data_str.as_str())),
+                    "admin_addrs still lists the data node: {peers}"
+                );
+                let peer_list = peers["peers"].as_array().expect("peers array present");
+                let role_of = |addr: &str| {
+                    peer_list
+                        .iter()
+                        .find(|p| p["admin"].as_str() == Some(addr))
+                        .and_then(|p| p["role"].as_str())
+                        .map(str::to_string)
+                };
+                if role_of(&control_str).as_deref() == Some("control")
+                    && role_of(&data_str).as_deref() == Some("data")
+                {
+                    return;
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("peers did not report both nodes' roles in 20s");
+
         for node in control_nodes.iter().chain(data_nodes.iter()) {
             node.shutdown_graceful().await;
         }

@@ -106,9 +106,16 @@ function renderNodeTablets() {
 // first full fan-out completes, which is fine: `SELF`'s own quick probe alone
 // can never answer "is some OTHER node a control node," and the console link
 // is explicitly allowed to resolve asynchronously, after this node's own page
-// has already painted.
+// has already painted. Role prefers `n.config.role` (that node's own fetch)
+// and falls back to `n.role` (from `/admin/peers` itself, ADR 0035 residual
+// follow-up) so a candidate whose own `/admin/config` fetch hasn't resolved
+// yet can still be picked — `n.base` is set regardless of fetch success, so
+// the resulting link is always dialable.
 function findConsoleNode() {
-  return STATE.nodes.find((n) => n.ok && n.config && (n.config.role === "control" || n.config.role === "combined"));
+  return STATE.nodes.find((n) => {
+    const role = (n.config && n.config.role) || n.role;
+    return role === "control" || role === "combined";
+  });
 }
 
 function renderConsoleLink() {

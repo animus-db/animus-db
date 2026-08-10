@@ -52,6 +52,27 @@ pub struct NodeAddrs {
     pub client: String,
     /// The admin/debug HTTP listen address.
     pub admin: String,
+    /// This node's deployment role (ADR 0035): `"control"` / `"data"` /
+    /// `"combined"`, the same vocabulary `animusd`'s `/admin/config` already
+    /// derives from its own `control_id`/`raftkv_id` presence. A node only
+    /// ever *authoritatively* knows its own role, so this is filled in and
+    /// proposed once, at self-registration time (mirroring `raftkv`/`client`/
+    /// `admin` themselves) — never inferred by a reader from anything else.
+    /// Plain `String`, not an `animusd`-side enum: `animus-control` has no
+    /// dependency on `animusd` (the dependency runs the other way), and
+    /// every other field here is already an opaque wire-format string this
+    /// crate never interprets. `#[serde(default = "default_node_role")]`
+    /// keeps a pre-ADR-0035 snapshot/WAL record loading — every node that
+    /// ever proposed `RegisterNodeAddrs` before this field existed was, by
+    /// construction, a combined-mode node (ADR 0035's `Control`/`Data`
+    /// split didn't exist yet), so `"combined"` is the historically accurate
+    /// default, not just a placeholder.
+    #[serde(default = "default_node_role")]
+    pub role: String,
+}
+
+fn default_node_role() -> String {
+    "combined".to_string()
 }
 
 /// The replicated control-plane state: membership and the (single-table) tablet
@@ -1098,6 +1119,7 @@ mod tests {
             raftkv: format!("127.0.0.1:{}", 9300 + suffix),
             client: format!("127.0.0.1:{}", 9000 + suffix),
             admin: format!("127.0.0.1:{}", 9500 + suffix),
+            role: "combined".to_string(),
         };
 
         // First registration applies and is readable.
@@ -1155,6 +1177,56 @@ mod tests {
         let decoded: Metadata =
             serde_json::from_value(value).expect("metadata without node_addrs still decodes");
         assert!(decoded.node_addrs.is_empty());
+    }
+
+    /// `NodeAddrs.role` (ADR 0035 residual follow-up) replicates alongside the
+    /// rest of the address book — a control-only, data-only, and combined
+    /// registration each record their own distinct role string, readable by
+    /// every replica off `Metadata.node_addrs` alone (no fan-out to the
+    /// node's own `/admin/config` needed).
+    #[test]
+    fn register_node_addrs_records_the_role() {
+        let mut m = Metadata::default();
+        for (node, role) in [(0, "control"), (300, "data"), (301, "combined")] {
+            assert_eq!(
+                m.apply(&MetaCommand::RegisterNodeAddrs {
+                    node,
+                    addrs: NodeAddrs {
+                        raftkv: format!("127.0.0.1:{}", 9300 + node),
+                        client: format!("127.0.0.1:{}", 9000 + node),
+                        admin: format!("127.0.0.1:{}", 9500 + node),
+                        role: role.to_string(),
+                    },
+                }),
+                ApplyOutcome::Applied
+            );
+            assert_eq!(m.node_addrs.get(&node).map(|a| a.role.as_str()), Some(role));
+        }
+    }
+
+    /// A `NodeAddrs` JSON shape serialized before ADR 0035 (no `role` field)
+    /// still decodes, defaulting to `"combined"` — every node that ever
+    /// proposed `RegisterNodeAddrs` before this field existed was, by
+    /// construction, running in combined mode (the `Control`/`Data` split
+    /// didn't exist yet), so this is the historically accurate default, the
+    /// same back-compat discipline as every other additive field here.
+    #[test]
+    fn node_addrs_without_role_field_defaults_to_combined() {
+        let addrs = NodeAddrs {
+            raftkv: "127.0.0.1:9300".to_owned(),
+            client: "127.0.0.1:9000".to_owned(),
+            admin: "127.0.0.1:9500".to_owned(),
+            role: "combined".to_string(),
+        };
+        let mut value = serde_json::to_value(&addrs).expect("NodeAddrs serializes");
+        value
+            .as_object_mut()
+            .expect("NodeAddrs is a JSON object")
+            .remove("role");
+        let decoded: NodeAddrs =
+            serde_json::from_value(value).expect("NodeAddrs without role still decodes");
+        assert_eq!(decoded.role, "combined");
+        assert_eq!(decoded.raftkv, addrs.raftkv);
     }
 
     /// ADR 0024 address GC: a tablet-scoped `RegisterCpAddr` entry is pruned from
@@ -1574,6 +1646,7 @@ mod tests {
                     raftkv: "127.0.0.1:9301".to_owned(),
                     client: "127.0.0.1:9001".to_owned(),
                     admin: "127.0.0.1:9501".to_owned(),
+                    role: "combined".to_string(),
                 },
             });
             m.apply(&MetaCommand::RegisterCpAddr {

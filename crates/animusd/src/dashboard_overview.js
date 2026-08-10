@@ -56,31 +56,41 @@ function renderOverview() {
   // ---- nodes list (top 6) ----
   // Every DATA member (tracked in replicated `Metadata`, keyed by raftkv id —
   // covers both a "data"-role and a "combined"-role node) plus every
-  // CONTROL-ONLY node reachable via the `/admin/peers` fan-out (ADR 0035): a
+  // CONTROL-ONLY node known via the `/admin/peers` fan-out (ADR 0035): a
   // control-only node is never a data member at all, so without the second
   // half it would never appear anywhere in the dashboard despite being a
   // real part of the cluster. Each row is tagged with its role so a split
   // deployment's control trio and data fleet read as what they are, not as
-  // an undifferentiated node list.
+  // an undifferentiated node list. Role prefers `node.config.role` (fresher,
+  // read off that node's own successful `/admin/config` fetch) and falls
+  // back to `node.role` (from `/admin/peers` itself, ADR 0035 residual
+  // follow-up) so a node whose own fan-out hasn't resolved yet still reads
+  // as its real role instead of a generic guess.
   const dataRows = (memberIds.length ? memberIds : STATE.nodes.filter((n) => n.ok).map((n) => n.config.raftkv_id))
     .map((id) => {
       const m = members[id];
       const node = nodeByRaftkv(id);
       const up = m ? m.status === "Active" : !!(node && node.ok);
       const hostedCount = groups && Object.values(groups).flat().filter((x) => nodeRaftkvId(x.node) === id).length;
-      const role = (node && node.config && node.config.role) || "data";
+      const role = (node && ((node.config && node.config.role) || node.role)) || "data";
       return {
         id, role, up,
         detail: `${hostedCount} tablet(s)`,
         statusText: m ? m.status : (up ? "reachable" : "unreachable"),
       };
     });
+  // A control-only node whose own `/admin/config` fetch is down still shows
+  // up here (tagged "control", marked unreachable) as long as SOME peer's
+  // `/admin/peers` reported its role — previously it vanished from the list
+  // entirely the moment its own fan-out failed.
   const controlOnlyRows = STATE.nodes
-    .filter((n) => n.ok && n.config && n.config.role === "control")
+    .filter((n) => (n.ok && n.config && n.config.role === "control") ||
+      (!(n.ok && n.config) && n.role === "control"))
     .map((n) => ({
-      id: n.config.control_id, role: "control", up: true,
-      detail: (n.raft && n.raft.is_leader) ? "control leader" : "control node",
-      statusText: "reachable",
+      id: (n.config && n.config.control_id != null) ? n.config.control_id : n.addr,
+      role: "control", up: n.ok,
+      detail: n.ok ? ((n.raft && n.raft.is_leader) ? "control leader" : "control node") : "control node",
+      statusText: n.ok ? "reachable" : "unreachable",
     }));
   const nodeRows = [...dataRows, ...controlOnlyRows].slice(0, 6).map((r) =>
     `<div class="list-row">${dot(r.up ? "ok-dot" : "bad-dot")}

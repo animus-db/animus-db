@@ -13,10 +13,19 @@ epoch compare-and-swap transactions.
 - `meta.rs` — `Metadata` (members + tablet map + placement policies + the
   table-schema catalog + keyspaces + **`cp_member_addrs`**: CP group member id →
   `raftkv` address, Phase 2 address distribution + **`node_addrs`** (ADR 0032
-  PR1): member id → `NodeAddrs { raftkv, client, admin }`, the full node
+  PR1): member id → `NodeAddrs { raftkv, client, admin, role }`, the full node
   address book — a superset of `cp_member_addrs` for the client/admin axes,
   keeping `cp_member_addrs` alive only for WAL back-compat and the internal
-  `raftkv` peer book) and `MetaCommand` (`UpsertMember`,
+  `raftkv` peer book. **`role: String`** (ADR 0035 residual follow-up,
+  `#[serde(default = "combined")]`) is this node's own deployment role
+  (`"control"`/`"data"`/`"combined"`) — a plain string, not an `animusd`-side
+  enum, since this crate has no dependency on `animusd` and every other field
+  here is already an opaque wire-format string this crate never interprets.
+  A node only ever authoritatively knows its own role, so it is stamped once
+  at self-registration time, same as the other three fields; `animusd`'s
+  `/admin/peers` reads every *other* node's role straight off this field
+  instead of fanning out to each node's own `/admin/config`.) and
+  `MetaCommand` (`UpsertMember`,
   `CreateTablet`, `CasTabletReplicas`, **`SplitTablet`** (ADR 0028: the *entire*
   split operation — epoch-CAS gated like `CasTabletReplicas`; narrows the source
   tablet's range and mints a new sibling tablet over the same node-shared storage

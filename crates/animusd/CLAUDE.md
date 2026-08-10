@@ -770,6 +770,33 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   `ClientCtx::effective_metadata()`, so a control-plane-follower-less growth
   node (ADR 0030) syncs off its own remote mirror like every other
   `Metadata`-derived view it depends on.
+  **`NodeAddrs` also carries each node's deployment ROLE (ADR 0035 residual
+  follow-up, `animus_control::meta::NodeAddrs.role: String` —
+  `"control"`/`"data"`/`"combined"`, `#[serde(default = "combined")]` for WAL
+  back-compat).** A node only ever authoritatively knows its own role, so it
+  stamps it into the same `NodeAddrs` it already self-registers at startup
+  (each of `BoundNode::start_with`/`BoundControlNode::start_control_with`/
+  `BoundDataNode::start_data_with` hardcodes its own literal role at its
+  `NodeAddrs` construction site — no new proposal, no new relay-allowlist
+  entry, since it rides the existing `RegisterNodeAddrs` command). `/admin/
+  peers`'s new `peers: [{admin, role}, ...]` field (`admin.rs::peers_view`,
+  factored through a shared `node_role_str` helper also used by
+  `config_view`) reads every OTHER node's role straight from replicated
+  `Metadata.node_addrs`, closing the gap where role was only ever knowable by
+  fetching that specific node's own `/admin/config` — the dashboard used to
+  have to fan out to every peer just to learn what it was. `admin_addrs`
+  itself is untouched (kept for any older consumer); `peers` is a pure
+  addition. An address known only from the static seed (that node hasn't yet
+  self-registered as far as this replica has observed) reports `role:
+  "unknown"` — transient, not permanent. The dashboard (`dashboard_core.js`'s
+  `loadAll()`) captures this into `node.role` as a fallback alongside the
+  existing full per-node `/admin/config` fetch (`node.config.role`, still
+  preferred when it resolves) — used by the Overview node list (a down
+  control-only node now shows up tagged "control" instead of vanishing
+  entirely once its own fan-out fails) and `dashboard_node.js`'s
+  `findConsoleNode` (can pick a console-link target whose own `/admin/config`
+  fetch hasn't resolved yet, since `node.base` — needed for the link — is set
+  regardless of fetch success).
 - **Decommission (ADR 0032 PR3) is `drain` (existing) plus one new
   `MetaCommand::RemoveMember` proposal and a poll-to-convergence in between.**
   `GET /admin/member/drain-status?node=` (read-only, serves on any node via
@@ -1326,7 +1353,12 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
       own documented "assert against the asset that carries the behavior"
       lesson), asserts `/admin/config`'s `role` differs across the split,
       and polls the data-only node's `/admin/raft` until `control_mirror.
-      has_synced` goes true.
+      has_synced` goes true. The same test also polls `/admin/peers` (ADR
+      0035 residual follow-up) until its new `peers` field reports the
+      control-only node's role as `"control"` and the data-only node's as
+      `"data"` — a bounded poll, not a one-shot assert, since
+      `RegisterNodeAddrs` self-registration is best-effort/relayed and can
+      commit after this test's other convergence checks already passed.
     - **Displayed keys show the partition token as unpadded base64url**
       (`admin.rs::key_display`): a wire-edge/seeder key is `token || escape(pk) ||
       rk` (ADR 0022), and the leading `TOKEN_BYTES` are a **binary** Murmur3 token
