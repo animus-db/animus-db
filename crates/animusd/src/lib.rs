@@ -460,6 +460,14 @@ enum CpRoute {
 /// longer than a steady-state op. No happy-path cost: `cp_route` returns as soon as
 /// a leader is reachable; the cap only bounds the wait when the group is forming.
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long [`ClientCtx::cp_forward`] backs off between retry passes when every
+/// candidate replica refused a forwarded op with `leader_hint=none` — i.e. the
+/// tablet's group has no elected leader *yet* (a split-child/first-provision
+/// formation window, or a crashed leader mid-election). Roughly one election
+/// timeout: long enough that a couple of passes span a real election, short
+/// enough that the total wait stays a small fraction of [`CLIENT_TIMEOUT`]
+/// (which still hard-bounds the whole sequence).
+const FORWARD_ELECTION_BACKOFF: Duration = Duration::from_millis(100);
 /// The bootstrap CP group's replication factor (ADR 0017 #3a): the group spans the
 /// first `min(N, MAX_REPLICATION_FACTOR)` nodes' `raftkv` ids. Dynamic CP placement
 /// over more nodes is later v1 work.
@@ -3515,6 +3523,18 @@ impl ClientCtx {
     /// invariant itself is unchanged: only the *forwarder* retries; the
     /// receiver ([`cp_serve_forwarded`](Self::cp_serve_forwarded)) still only
     /// ever serves-or-refuses, never re-forwards.
+    ///
+    /// **Leaderless pass — wait out the election, don't give up.** When a
+    /// whole pass exhausts with every candidate refusing `leader_hint=none`,
+    /// the tablet's group has no elected leader *yet* — the split-child /
+    /// first-provision formation window, or a leader crash mid-election —
+    /// a state that resolves itself within an election timeout or two. The
+    /// local-serve path already waits for exactly this
+    /// (`RouteDecision::Wait`); the forwarded path now does too: back off
+    /// [`FORWARD_ELECTION_BACKOFF`], clear the tried-set, and run another
+    /// pass, still hard-bounded by the same overall deadline. Gated on the
+    /// tablet being resolvable so an op this node can't even map to a tablet
+    /// keeps failing fast instead of consuming the whole budget.
     async fn cp_forward(
         &self,
         table: &str,
@@ -3553,6 +3573,20 @@ impl ClientCtx {
                 .or_else(|| tablet.and_then(|t| self.other_tablet_replica_addr(t, &tried)));
             match candidate {
                 Some(a) => next = a,
+                None if tablet.is_some() => {
+                    // Every known candidate refused with no leader to point
+                    // at: the group is mid-election (formation window after a
+                    // split/provision, or a crashed leader). Wait it out and
+                    // re-run the pass — bounded by the same overall deadline.
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if remaining.is_zero() {
+                        return resp;
+                    }
+                    tokio::time::sleep(FORWARD_ELECTION_BACKOFF.min(remaining)).await;
+                    tried.clear();
+                    // `next` unchanged: re-probe the same replica first — once
+                    // the election completes it either serves or hints.
+                }
                 None => return resp,
             }
         }

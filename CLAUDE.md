@@ -720,6 +720,26 @@ to the archive stays in place below.
   hazard specifically (`tests/data_only.rs`/`tests/cluster_split.rs` reverted
   to a fixed control-only node's address; `tests/cluster_split.rs::
   fixed_control_node_write_read_is_deterministic` is the focused regression).
+  **Second update (user-hit live, one release later): a bounded retry pass
+  over {hint} ∪ replicas closes "wrong replica" but not "no leader YET" —
+  when every candidate refuses `leader_hint=none` (the whole group is
+  mid-election: a split-child/first-provision formation window, or a crashed
+  leader), giving up the moment one pass exhausts surfaces the refusal to
+  the client even though the election resolves within a couple hundred ms
+  and the deadline budget is barely touched.** `cp_forward` now backs off
+  `FORWARD_ELECTION_BACKOFF` (~one election timeout) and re-runs the pass,
+  still hard-bounded by the same overall `CLIENT_TIMEOUT` — the forwarded
+  dual of the local path's `RouteDecision::Wait`, which already waited out
+  its own group's election for exactly this reason. Gated on the tablet
+  being resolvable so an unmappable op keeps failing fast. General check
+  for any bounded retry-over-candidates loop: "every candidate refused" has
+  two distinct causes — *wrong candidates* (retrying the same set is
+  useless, return) vs. *right candidates, transient state* (they'll succeed
+  shortly, wait and re-ask) — and a loop that only handles the first
+  converts every instance of the second into a spurious client-visible
+  error. (`tests/cluster_split.rs::
+  single_shot_first_write_through_control_node_succeeds` — ONE un-retried
+  Put racing the provisioning/formation window.)
   The general lesson stands for any *other* future one-hop-forward gap this
   pattern doesn't cover.
 - **Adding an automatic background registration/bring-up step makes any

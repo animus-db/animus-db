@@ -285,3 +285,96 @@ async fn fixed_control_node_write_read_is_deterministic() {
         node.shutdown_graceful().await;
     }
 }
+
+/// A **single-shot** first write through a control-only node must succeed —
+/// no client-side retry loop at all. The very first `Put` to a fresh table
+/// provisions its tablet and races the group's formation/election window on
+/// the data nodes; a zero-replica control node forwards into that window and
+/// every replica refuses with `leader_hint=none` (no leader exists yet).
+/// Pre-fix, `cp_forward` gave up the moment one pass over the replicas
+/// exhausted, surfacing "not the leader here; leader_hint=none" to the
+/// client (user-hit, live); it now waits out the election
+/// (`FORWARD_ELECTION_BACKOFF` passes bounded by `CLIENT_TIMEOUT`), so the
+/// one-attempt write must land deterministically.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn single_shot_first_write_through_control_node_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    const CONTROL_N: usize = 3;
+    const DATA_N: usize = 2;
+
+    let nodes: Vec<Node> = animusd::start_split_cluster_with(
+        CONTROL_N,
+        DATA_N,
+        dir.path(),
+        "127.0.0.1".parse().unwrap(),
+        StorageBackend::Memory,
+        None,
+        None,
+    )
+    .await
+    .expect("split cluster starts");
+
+    let control_nodes = &nodes[..CONTROL_N];
+
+    timeout(Duration::from_secs(20), async {
+        loop {
+            if control_nodes.iter().any(Node::is_control_leader) {
+                return;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("control deployment did not elect a leader in 20s");
+
+    let data_raftkv_ids: Vec<animus_env::NodeId> = (0..DATA_N)
+        .map(|i| animusd::config::raftkv_id(CONTROL_N + i))
+        .collect();
+    timeout(Duration::from_secs(20), async {
+        loop {
+            if data_raftkv_ids.iter().all(|id| {
+                control_nodes.iter().any(|n| {
+                    n.metadata().members.get(id).map(|m| m.status)
+                        == Some(animusd::NodeStatus::Active)
+                })
+            }) {
+                return;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("data nodes did not become Active in 20s");
+
+    // ONE attempt, fresh table, fixed control-only address. The 15s outer
+    // bound only guards a hang; the server's own CLIENT_TIMEOUT (10s) is the
+    // real budget the forwarder works within.
+    let resp = timeout(
+        Duration::from_secs(15),
+        call(
+            control_nodes[0].client_addr(),
+            ClientRequest::Put {
+                key: b"first-key".to_vec(),
+                value: b"first-val".to_vec(),
+                table: "single_shot_kv".to_string(),
+            },
+        ),
+    )
+    .await
+    .expect("single-shot put hung");
+    assert!(
+        matches!(resp, ClientResponse::PutOk),
+        "single-shot first write through a control node failed: {resp:?}"
+    );
+    await_value(
+        &[control_nodes[0].client_addr()],
+        "single_shot_kv",
+        b"first-key",
+        b"first-val",
+    )
+    .await;
+
+    for node in &nodes {
+        node.shutdown_graceful().await;
+    }
+}
