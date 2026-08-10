@@ -1195,7 +1195,12 @@ fn registry_error(err: animus_dynamo::RegistryError) -> WireError {
 /// bytes. The token (Murmur3, fixed 8 bytes) spreads partitions across the table's
 /// ring; it is over the partition key only, so a partition's rows share the
 /// `token || escape(pk)` prefix and stay contiguous + sort-ordered.
-fn item_key(pk: &AttributeValue, sk: Option<&AttributeValue>) -> Vec<u8> {
+///
+/// `pub(crate)` because the admin bulk seeder (`admin::action_data_seed`, ADR
+/// 0021) builds its rows through this exact function — seeded keys must match
+/// what this edge computes byte-for-byte, or seeded items are unreachable via
+/// `GetItem`/`Query`.
+pub(crate) fn item_key(pk: &AttributeValue, sk: Option<&AttributeValue>) -> Vec<u8> {
     let pk_escaped = storage_key(pk, None); // == escape(pk)
     let mut key = partition_token(&pk_escaped).to_vec();
     key.extend_from_slice(&storage_key(pk, sk)); // escape(pk) || sk

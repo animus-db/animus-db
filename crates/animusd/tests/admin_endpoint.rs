@@ -552,8 +552,10 @@ async fn seed_load_does_not_storm_cp_elections() {
     .expect("seed-load election-stability test timed out");
 }
 
-/// The bulk-seed endpoint (ADR 0021) writes the requested number of synthetic keys
-/// to the CP plane, and they land durably (visible in the CP leader's storage).
+/// The bulk-seed endpoint (ADR 0021) writes the requested number of synthetic
+/// **DynamoDB items** to the CP plane: they land durably (visible in the CP
+/// leader's storage) and read back through the DynamoDB edge by their catalog
+/// key attributes (`GetItem`), for simple and composite tables alike.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn admin_seed_writes_synthetic_keys() {
     timeout(Duration::from_secs(60), async {
@@ -625,6 +627,71 @@ async fn admin_seed_writes_synthetic_keys() {
         assert!(
             seeded >= 60,
             "all seeded keys are in the leader's storage: {scan}"
+        );
+
+        // A seeded row is a real DynamoDB item — the exact key/value bytes
+        // `PutItem` would store — so it reads back through the DynamoDB edge by
+        // its catalog key attribute (`id`, not the legacy `pk`), filler
+        // `payload` included.
+        let (s, got) = admin(
+            a,
+            "POST",
+            "/admin/data/dynamo",
+            Some(
+                r#"{"op":"GetItem","payload":{"TableName":"seedt",
+                    "Key":{"id":{"S":"seed:000000000007"}}}}"#,
+            ),
+        )
+        .await;
+        assert_eq!(s, 200, "GetItem on a seeded row: {got}");
+        assert_eq!(
+            got["Item"]["id"]["S"], "seed:000000000007",
+            "seeded item carries its schema partition key: {got}"
+        );
+        assert!(
+            got["Item"]["payload"]["S"].is_string(),
+            "seeded item carries the filler payload attribute: {got}"
+        );
+
+        // A composite table seeds items with **both** key attributes (the sort
+        // key gets the same zero-padded index), addressable by the full key.
+        let (s, ct) = admin(
+            a,
+            "POST",
+            "/admin/data/dynamo",
+            Some(
+                r#"{"op":"CreateTable","payload":{"TableName":"seedc",
+                    "KeySchema":[{"AttributeName":"id","KeyType":"HASH"},
+                                 {"AttributeName":"rk","KeyType":"RANGE"}],
+                    "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"},
+                                            {"AttributeName":"rk","AttributeType":"S"}]}}"#,
+            ),
+        )
+        .await;
+        assert_eq!(s, 200, "CreateTable seedc: {ct}");
+        let (s, body) = admin(
+            a,
+            "POST",
+            "/admin/data/seed",
+            Some(r#"{"table":"seedc","count":5,"key_prefix":"seed:","value_bytes":32}"#),
+        )
+        .await;
+        assert_eq!(s, 200, "seed seedc returns 200: {body}");
+        assert_eq!(body["written"], 5, "seed wrote all requested keys: {body}");
+        let (s, got) = admin(
+            a,
+            "POST",
+            "/admin/data/dynamo",
+            Some(
+                r#"{"op":"GetItem","payload":{"TableName":"seedc",
+                    "Key":{"id":{"S":"seed:000000000003"},"rk":{"S":"000000000003"}}}}"#,
+            ),
+        )
+        .await;
+        assert_eq!(s, 200, "GetItem on a seeded composite row: {got}");
+        assert_eq!(
+            got["Item"]["rk"]["S"], "000000000003",
+            "seeded composite item carries its sort key: {got}"
         );
 
         // A displayed key (`<token-base64>:<pk>`) round-trips through the

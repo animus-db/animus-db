@@ -1,12 +1,14 @@
 "use strict";
 // The Storage view: folded-in debug tools that don't fit the console's other
-// views — per-tablet-per-node WAL/LSM inspection, a raw key browser/inspector,
-// and the bulk-seed tool for sharding tests. Ported from the pre-redesign
-// dashboard (unchanged behavior, restyled), since the AnimusDB Console design
-// doesn't include this level of manual storage debugging at all and it would
-// otherwise be lost. Depends on `dashboard_core.js` (STATE, $, esc, pill,
-// getJSON, postJSON, bytes, nodeRaftkvId, syncStorageUrl, applyPendingStorageParams,
-// pendingStorageParams, loadAll).
+// views — per-tablet-per-node WAL/LSM inspection and a raw key
+// browser/inspector. Ported from the pre-redesign dashboard (unchanged
+// behavior, restyled), since the AnimusDB Console design doesn't include this
+// level of manual storage debugging at all and it would otherwise be lost.
+// (The bulk-seed tool used to live here too; it writes real DynamoDB items
+// now, so it moved to the Data Browser's DynamoDB panel,
+// `dashboard_browser.js`.) Depends on `dashboard_core.js` (STATE, $, esc,
+// pill, getJSON, bytes, nodeRaftkvId, syncStorageUrl,
+// applyPendingStorageParams, pendingStorageParams).
 
 function renderStorageSelectors() {
   const status = STATE.status;
@@ -145,94 +147,4 @@ async function browseKeys() {
         $("key-input").scrollIntoView({ block: "nearest" });
       }));
   } catch (e) { $("scan-body").innerHTML = `<div class="err-line">${esc(e)}</div>`; }
-}
-
-// ---- Bulk seed (sharding test) ----
-let seeding = false;
-let seedTable = "";
-
-// The seed target must be a table that *has a tablet* — the exact set
-// `/admin/data/seed` accepts (it validates against the replicated tablet map),
-// so both Dynamo and CQL `ks.table` tables qualify once provisioned. Refreshed
-// by render() (which also runs mid-seed via loadAll), so keep the Seed
-// button's disabled state in sync with both table validity and `seeding`.
-// Auto-picks the first seedable table when none is selected yet or the
-// current selection no longer qualifies.
-function renderSeedTables() {
-  const tablets = (STATE.status && STATE.status.tablets) || {};
-  const seedable = [...new Set(Object.values(tablets).map((t) => t.table).filter(Boolean))].sort();
-  if (!seedable.includes(seedTable)) seedTable = seedable[0] || "";
-  const sel = $("seed-table");
-  sel.innerHTML = seedable.length
-    ? seedable.map((n) => `<option${n === seedTable ? " selected" : ""}>${esc(n)}</option>`).join("")
-    : `<option value="">(none)</option>`;
-  sel.value = seedTable;
-  const validTable = !!seedTable;
-  $("seed-no-tables").style.display = validTable ? "none" : "";
-  $("seed-no-tables").textContent = seedable.length
-    ? ""
-    : "no table has a tablet yet — write to one once (Data Browser), then it can be seeded";
-  $("seed-table").disabled = !seedable.length;
-  $("seed-go").disabled = !validTable || seeding;
-}
-
-async function seedRun() {
-  if (seeding) return;
-  const table = seedTable;
-  const prefix = $("seed-prefix").value;
-  const vbytes = Math.max(0, parseInt($("seed-vbytes").value, 10) || 0);
-  const total = Math.max(0, parseInt($("seed-total").value, 10) || 0);
-  const chunk = Math.max(1, parseInt($("seed-chunk").value, 10) || 1000);
-  if (!table) { $("seed-status").innerHTML = `<div class="empty">select a table above — every key names a table</div>`; return; }
-  if (!total) { $("seed-status").innerHTML = `<div class="empty">set a total</div>`; return; }
-  seeding = true;
-  $("seed-go").disabled = true;
-  $("seed-stop").disabled = false;
-  let done = 0;
-  const t0 = Date.now();
-  // Refresh the Tablets view live so splits appear during a large seed — but
-  // NEVER block a seed chunk on it. loadAll() serializes a full cluster-wide
-  // admin fan-out; awaiting it every chunk would fold that latency into the
-  // displayed keys/s rate and throttle throughput. Instead fire it non-blocking
-  // and at most once per REFRESH_MS of wall-clock, and drop overlapping refreshes.
-  const REFRESH_MS = 1000;
-  let lastRefresh = 0;
-  let refreshInFlight = false;
-  const liveRefresh = () => {
-    if (refreshInFlight) return;
-    const now = Date.now();
-    if (now - lastRefresh < REFRESH_MS) return;
-    lastRefresh = now;
-    refreshInFlight = true;
-    loadAll().finally(() => { refreshInFlight = false; });
-  };
-  try {
-    while (done < total && seeding) {
-      const count = Math.min(chunk, total - done);
-      const { status, body } = await postJSON(SEED, "/admin/data/seed",
-        { table, count, start: done, key_prefix: prefix, value_bytes: vbytes });
-      if (status >= 300) {
-        $("seed-status").innerHTML = `<div class="err-line">${esc((body && body.error) || ("HTTP " + status))}</div>`;
-        break;
-      }
-      const wrote = body.written || 0;
-      done += wrote;
-      const secs = Math.max(0.001, (Date.now() - t0) / 1000);
-      const rate = Math.round(done / secs);
-      $("seed-status").innerHTML =
-        `<div class="muted">seeded ${done.toLocaleString()} / ${total.toLocaleString()} keys · ${rate.toLocaleString()}/s`
-        + (body.error ? ` · <span class="err-line">last error: ${esc(body.error)}</span>` : "") + `</div>`;
-      if (wrote === 0) break; // persistent failure — don't spin
-      liveRefresh(); // non-blocking, throttled — splits show live without gating throughput
-    }
-    await loadAll(); // final authoritative refresh once seeding settles
-    if (done >= total) $("seed-status").innerHTML += `<div>${pill("ok", "done — " + done.toLocaleString() + " keys")}</div>`;
-    else if (!seeding) $("seed-status").innerHTML += `<div class="muted">stopped at ${done.toLocaleString()}</div>`;
-  } catch (e) {
-    $("seed-status").innerHTML = `<div class="err-line">${esc(e)}</div>`;
-  } finally {
-    seeding = false;
-    renderSeedTables(); // recompute seed-go (stays disabled if no tables remain)
-    $("seed-stop").disabled = true;
-  }
 }

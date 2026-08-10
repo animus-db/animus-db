@@ -45,15 +45,17 @@
 //! - `POST /admin/data/dynamo`         — run a DynamoDB op `{op, payload}` (ADR 0021)
 //! - `POST /admin/data/cql`            — run CQL `{query, keyspace?}` (ADR 0021)
 //! - `POST /admin/data/drop-table`     — drop a table's schema `{table}` (ADR 0021)
-//! - `POST /admin/data/seed`           — bulk-write synthetic keys `{count, …}` (ADR 0021)
+//! - `POST /admin/data/seed`           — bulk-write synthetic DynamoDB items `{count, …}` (ADR 0021)
 
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use animus_control::ColumnType;
 use animus_dynamo::wire::{base64url_decode, base64url_encode};
+use animus_dynamo::{AttributeValue, Item};
 use animus_env::NodeId;
 use animus_storage::WalRecordView;
-use animus_tablet::{TOKEN_BYTES, TabletId, escape, partition_token};
+use animus_tablet::{TOKEN_BYTES, TabletId};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::net::{TcpListener, TcpStream};
@@ -1028,41 +1030,59 @@ struct SeedReq {
     start: u64,
     /// Partition-key prefix (default `seed:`). Each seeded row is token-prefixed
     /// like any edge write (ADR 0022), so sequential indices still spread evenly
-    /// across the table's hash ring.
+    /// across the table's hash ring. Ignored when the table declares a
+    /// Number-typed partition key (the value must stay numeric — see
+    /// [`seed_key_attr`]).
     #[serde(default)]
     key_prefix: Option<String>,
-    /// Synthetic value size in bytes (default 64).
+    /// Approximate serialized size of each seeded item in bytes (default 64),
+    /// reached by padding a filler `payload` string attribute. An item's key
+    /// attributes alone may exceed a tiny `value_bytes`; the floor is the
+    /// unpadded item.
     #[serde(default)]
     value_bytes: Option<usize>,
     /// The table to seed into. **Required** (ADR 0023: every key names a table — no
-    /// default, so a seed request without `table` fails to decode). Its tablet is
-    /// provisioned up front if it does not exist yet.
+    /// default, so a seed request without `table` fails to decode), and it must
+    /// already have a tablet — seeding never creates or provisions one (a
+    /// tablet-less table is a `404`).
     table: String,
 }
 
-/// The data-plane key for a synthetic seed row: `partition_token(escape(pk)) ||
-/// escape(pk)`, the edges' ADR 0022/0023 layout with no sort key (the DynamoDB
-/// `item_key` shape). Seeding must hash like a real write — a raw `pk` key would
-/// partition the *raw* keyspace, so sequential seed indices would all land in one
-/// tablet's tail (the exact hot-prefix skew the token exists to remove) and split
-/// boundaries would sit in raw-key space while edge writes route by token.
-fn seed_key(pk: &[u8]) -> Vec<u8> {
-    let escaped = escape(pk);
-    let mut key = partition_token(&escaped).to_vec();
-    key.extend_from_slice(&escaped);
-    key
+/// The attribute value for a seeded key column: the column's declared catalog
+/// type (ADR 0013) picks the DynamoDB scalar family, so a seeded item carries
+/// its key with the type the table declared and `GetItem`/`Query` round-trips.
+/// Number-family columns get the bare zero-padded index (a `key_prefix` would
+/// not be numeric); `Binary` gets the prefixed text's bytes; everything else —
+/// including types that are not valid DynamoDB keys (`Bool`/`Uuid`) — falls
+/// back to a string, mirroring `animus_dynamo::schema::column_type_for`'s
+/// permissive default.
+fn seed_key_attr(ty: ColumnType, prefix: &str, index_text: &str) -> AttributeValue {
+    match ty {
+        ColumnType::Number | ColumnType::Int | ColumnType::BigInt => {
+            AttributeValue::N(index_text.to_string())
+        }
+        ColumnType::Binary => AttributeValue::B(format!("{prefix}{index_text}").into_bytes()),
+        _ => AttributeValue::S(format!("{prefix}{index_text}")),
+    }
 }
 
 /// `POST /admin/data/seed {table, count, start?, key_prefix?, value_bytes?}` —
-/// bulk-write synthetic keys to the CP plane to drive sharding tests (ADR 0021).
-/// `table` is **required** and must **already exist** (ADR 0023: seeding writes into
-/// a table, it does not create one — a non-existent table is a `404`). Each row's
-/// partition key is `key_prefix + zero-padded (start..start+count)`, stored under
-/// the same token-prefixed layout the wire edges write ([`seed_key`]) with a filler
-/// value; writes go through the normal durable `cp_write` path (routed to the
-/// leader), with bounded concurrency to amortize WAL group-commit. With
-/// `--auto-split` enabled, crossing the key-count threshold splits the tablet —
-/// visible live in the Tablets view.
+/// bulk-write synthetic **DynamoDB items** to the CP plane to drive sharding
+/// tests (ADR 0021). `table` is **required** and must **already exist** (ADR
+/// 0023: seeding writes into a table, it does not create one — a non-existent
+/// table is a `404`). Each row is a real item — the exact key
+/// ([`crate::dynamo::item_key`]) and value
+/// ([`animus_dynamo::wire::encode_stored_item`]'s envelope) bytes `PutItem`
+/// would store — so seeded data reads back through the DynamoDB
+/// edge's `GetItem`/`Query`/`Scan`, not just the raw storage views. The key
+/// attributes come from the table's replicated catalog schema (ADR 0013):
+/// partition key `key_prefix + zero-padded (start..start+count)` (typed per the
+/// declared column, [`seed_key_attr`]), plus the sort key (same index) when the
+/// table is composite; a table with no catalog schema follows the legacy
+/// hash-only `pk` convention. A filler `payload` attribute pads each item to
+/// ~`value_bytes`. Writes go through the normal durable batch path (routed to
+/// the leader). With `--auto-split` enabled, crossing the split threshold splits
+/// the tablet — visible live in the Tablets view.
 async fn action_data_seed(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
     let req: SeedReq = match parse_body(body) {
         Ok(r) => r,
@@ -1075,7 +1095,8 @@ async fn action_data_seed(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
     // table** — it never creates one. Look the table up (a read of the replicated
     // tablet map); reject if it doesn't exist — the caller must create it first.
     let table = req.table;
-    if !ctx.effective_metadata().has_table_tablet(&table) {
+    let meta = ctx.effective_metadata();
+    if !meta.has_table_tablet(&table) {
         return (
             404,
             serde_json::json!({
@@ -1083,7 +1104,58 @@ async fn action_data_seed(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
             }),
         );
     }
-    let value = vec![b'x'; value_bytes];
+    // Resolve the row's DynamoDB key shape from the replicated catalog (ADR
+    // 0013), the same source the wire edge's `schema_for` reads: attribute
+    // names + declared types, sort key included when the table is composite.
+    // A table with no catalog schema follows the legacy convention, hash-only
+    // `pk` — a legacy table treats a missing sort key as absent
+    // (`SchemaRegistry::extract_key`), so omitting `sk` keeps `GetItem{pk}`
+    // addressable.
+    let (pk_name, pk_ty, sort) = match meta.table_schema(&table) {
+        Some(cs) => {
+            let ty_of = |name: &str| {
+                cs.columns
+                    .iter()
+                    .find(|c| c.name == name)
+                    .map_or(ColumnType::String, |c| c.ty)
+            };
+            let sort = cs
+                .clustering_keys
+                .first()
+                .map(|name| (name.clone(), ty_of(name)));
+            (cs.partition_key.clone(), ty_of(&cs.partition_key), sort)
+        }
+        None => ("pk".to_string(), ColumnType::String, None),
+    };
+    // One seeded row: the exact (key, value) bytes the DynamoDB edge's
+    // `PutItem` would store for this item. The filler `payload` attribute pads
+    // the serialized item toward `value_bytes` (skipped in the corner case
+    // where the schema claims that name for a key attribute).
+    let seed_row = |index: u64, fill: usize| -> (Vec<u8>, Vec<u8>) {
+        let index_text = format!("{index:012}");
+        let pk = seed_key_attr(pk_ty, &prefix, &index_text);
+        let sk = sort
+            .as_ref()
+            .map(|(_, ty)| seed_key_attr(*ty, "", &index_text));
+        let mut item = Item::new();
+        item.insert(pk_name.clone(), pk.clone());
+        if let (Some((sk_name, _)), Some(sk_val)) = (&sort, &sk) {
+            item.insert(sk_name.clone(), sk_val.clone());
+        }
+        item.entry("payload".to_string())
+            .or_insert_with(|| AttributeValue::S("x".repeat(fill)));
+        let key = crate::dynamo::item_key(&pk, sk.as_ref());
+        // The edge's stored-value envelope (`item` vs the `DeleteItem`
+        // `tombstone` sentinel) — a bare serialized item would fail decode.
+        let value = animus_dynamo::wire::encode_stored_item(&item);
+        (key, value)
+    };
+    // Every row serializes to the same length (the index is fixed-width), so
+    // measure the zero-filler envelope once and derive the padding that lands
+    // the item at ~`value_bytes` (floored at the unpadded item).
+    let envelope = seed_row(req.start, 0).1.len();
+    let fill = value_bytes.saturating_sub(envelope);
+    let row_bytes = envelope + fill;
 
     // ADR 0027: the seeder emulates a client issuing many `PutBatch` requests,
     // but calls `cp_batch_write` directly rather than going through
@@ -1100,7 +1172,7 @@ async fn action_data_seed(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
         // Bound each batch by entry count *and* raw bytes (see `SEED_BATCH_MAX_BYTES`:
         // the forwarded `PutBatch` frame must stay under `MAX_FRAME_LEN`). ~64 B of
         // key overhead per entry (token + escaped pk); at least one entry per batch.
-        let per_entry = value_bytes + 64;
+        let per_entry = row_bytes + 64;
         let max_by_bytes = (SEED_BATCH_MAX_BYTES / per_entry).max(1) as u64;
         while i < count {
             let chunk = (count - i).min(SEED_BATCH_SIZE).min(max_by_bytes);
@@ -1108,10 +1180,7 @@ async fn action_data_seed(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
             // entry per tablet** (`cp_batch_write` groups by tablet) — one consensus
             // round for the whole chunk instead of one per key.
             let entries: Vec<(Vec<u8>, Vec<u8>)> = (0..chunk)
-                .map(|j| {
-                    let pk = format!("{prefix}{:012}", req.start + i + j);
-                    (seed_key(pk.as_bytes()), value.clone())
-                })
+                .map(|j| seed_row(req.start + i + j, fill))
                 .collect();
             // One child span per chunk (covering all its retry attempts) — gives a
             // trace backend per-batch visibility into forwarding/retries, the same
@@ -1167,6 +1236,9 @@ async fn action_data_seed(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
             "start": req.start,
             "key_prefix": prefix,
             "value_bytes": value_bytes,
+            // What each row actually serialized to (≥ `value_bytes` only when
+            // the unpadded item alone is bigger).
+            "item_bytes": row_bytes,
             "error": first_err,
         }),
     )
@@ -1360,10 +1432,11 @@ mod tests {
     }
 
     /// A key whose real token happens to be all binary also encodes, exercising
-    /// the production `seed_key` layout end to end (the display always reverses).
+    /// the production seeded-item key layout (`dynamo::item_key`, the same bytes
+    /// the DynamoDB edge writes) end to end (the display always reverses).
     #[test]
     fn key_display_round_trips_a_seed_key() {
-        let key = seed_key(b"user#42");
+        let key = crate::dynamo::item_key(&AttributeValue::S("user#42".to_string()), None);
         assert_eq!(parse_key_display(&key_display(&key)), key);
     }
 

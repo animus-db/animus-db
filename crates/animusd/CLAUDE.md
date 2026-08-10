@@ -307,10 +307,13 @@ route below the edge through the same `ClientCtx` CP primitives.
   member/add,member/remove}`) + data writes (`/admin/data/{dynamo,cql,drop-table,
   seed}`). Below the edge it only reads node state (aggregated live per request) or
   drives a gated action. **No auth — bind to a trusted interface.** The `animus
-  admin` CLI consumes it. The bulk seeder (`action_data_seed`) writes token-
-  prefixed keys (`seed_key`, ADR 0022) in `cp_batch_write_patient` batches, wrapped
-  in its own `admin_seed` span (it bypasses `handle_client`, so it needs one to
-  emit any trace). `key_display`/`parse_key_display` render a binary partition
+  admin` CLI consumes it. The bulk seeder (`action_data_seed`) writes real
+  **DynamoDB items** — key attributes resolved from the replicated catalog
+  schema (ADR 0013), key/value bytes built exactly as the DynamoDB edge's
+  `PutItem` would (`dynamo::item_key` + `wire::encode_stored_item`, ADR 0022),
+  so seeded rows read back through `GetItem`/`Query`/`Scan` — in
+  `cp_batch_write_patient` batches, wrapped in its own `admin_seed` span (it
+  bypasses `handle_client`, so it needs one to emit any trace). `key_display`/`parse_key_display` render a binary partition
   token as unpadded base64url; a plain-client key is verbatim/printable.
   `/admin/peers`'s `peers: [{admin, role}, ...]` field (ADR 0035 residual
   follow-up, `admin.rs::peers_view`) carries each node's deployment role

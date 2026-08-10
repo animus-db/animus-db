@@ -195,6 +195,22 @@
           </div>
           <div class="item-detail" id="br-dy-item-detail" style="display:none"></div>
         </div>
+
+        <div class="card scroll" style="margin-top:14px">
+          <h2>Bulk seed (sharding test)</h2>
+          <div class="muted" style="margin-bottom:10px">Writes synthetic DynamoDB items into the table selected below to grow its tablet (it must already exist — create it above). Seeded rows are real items — keyed by the table's schema, readable back with Scan/Query above — with a filler <code>payload</code> attribute padding each to ~value bytes. Run the cluster with <code>--auto-split K</code> to watch tablets split in the Tablets view as the count crosses K.</div>
+          <div class="row" style="margin-bottom:10px">
+            <label>table</label><select id="seed-table"></select>
+            <span class="muted" id="seed-no-tables" style="display:none"></span>
+            <label>key prefix</label><input type="text" id="seed-prefix" value="seed:" style="width:7em">
+            <label>value bytes</label><input type="text" id="seed-vbytes" value="64" style="width:5em">
+            <label>total</label><input type="text" id="seed-total" value="10000" style="width:7em">
+            <label>chunk</label><input type="text" id="seed-chunk" value="2000" style="width:6em">
+            <button id="seed-go">Seed</button>
+            <button id="seed-stop" disabled>Stop</button>
+          </div>
+          <div id="seed-status"></div>
+        </div>
       </div>
     </section>
 
@@ -234,21 +250,6 @@
           <button id="key-load">Inspect</button>
         </div>
         <div id="key-body"></div>
-      </div>
-      <div class="card scroll">
-        <h2>Bulk seed (sharding test)</h2>
-        <div class="muted" style="margin-bottom:10px">Writes synthetic keys into the table selected below to grow its tablet (it must already exist — create it first in the Data Browser, and write to it once so it has a tablet). Run the cluster with <code>--auto-split K</code> to watch tablets split in the Tablets view as the count crosses K.</div>
-        <div class="row" style="margin-bottom:10px">
-          <label>table</label><select id="seed-table"></select>
-          <span class="muted" id="seed-no-tables" style="display:none"></span>
-          <label>key prefix</label><input type="text" id="seed-prefix" value="seed:" style="width:7em">
-          <label>value bytes</label><input type="text" id="seed-vbytes" value="64" style="width:5em">
-          <label>total</label><input type="text" id="seed-total" value="10000" style="width:7em">
-          <label>chunk</label><input type="text" id="seed-chunk" value="2000" style="width:6em">
-          <button id="seed-go">Seed</button>
-          <button id="seed-stop" disabled>Stop</button>
-        </div>
-        <div id="seed-status"></div>
       </div>
     </section>
 
