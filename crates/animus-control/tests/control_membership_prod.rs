@@ -202,7 +202,7 @@ async fn grow_three_to_five_under_real_time_stays_live() {
         );
 
         for e in &envs {
-            e.shutdown();
+            e.shutdown_and_wait().await;
         }
         for dir in &dirs {
             let _ = std::fs::remove_dir_all(dir);

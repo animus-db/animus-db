@@ -416,6 +416,21 @@ debugging anything that feels like it might have happened before.
   same, still-polluted machine after the fix), but the environmental factor
   is real too and worth ruling in/out explicitly rather than silently
   absorbing it into "the test is flaky."
+  **Coda — the candidate follow-up above was taken (2026-08-10):** swept the
+  same bare-`shutdown()`-then-`remove_dir_all` idiom at the 5 remaining racy
+  teardown sites — `animus-control/tests/prod_liveness.rs` (2),
+  `animus-control/tests/control_membership_prod.rs` (1),
+  `animus-consensus/tests/accord_concurrent.rs` (2) — to
+  `shutdown_and_wait().await`; `animus-storage/tests/lsm_concurrent.rs` and
+  the `animusd` integration tests already used the waiting idiom, and
+  `animus-cp-data`'s own compaction path already checks a `halted` flag
+  (ADR 0033), so both were left as models rather than swept. **General rule
+  to take away: any test teardown that follows a `shutdown()` with removing
+  the directory/files that shutdown's background tasks were still writing to
+  must use `shutdown_and_wait()`, not bare `shutdown()`** — bare `shutdown()`
+  remains the *correct* choice for a test that is deliberately simulating a
+  crash (no orderly teardown to race) rather than tearing down a clean
+  liveness harness.
 - **Never `let _ = storage.merge(...)` on the write path** — an ack must mean the
   write durably applied; surface storage errors so a non-durable write isn't
   counted toward the quorum (`animus-data` `ack_durability.rs`).
