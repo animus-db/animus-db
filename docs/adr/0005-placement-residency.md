@@ -1,6 +1,15 @@
 # ADR 0005 — Placement groups + topology-aware data residency
 
-- **Status:** Accepted
+- **Status:** Accepted. **Note (ADR 0019):** the residency-enforcement mechanisms
+  this ADR describes as built for hinted handoff / read-repair / anti-entropy
+  (`serve_replica_with_residency`, `AllowedTargets`, proven in
+  `animus-data/tests/hinted_handoff.rs`) lived in the leaderless **AP data
+  plane**, which was subsequently **deleted** with `animus-data` — those specific
+  tests and code paths no longer exist in this workspace (retrievable from git
+  history). The **placement model this ADR actually decided** — topology labels,
+  placement groups, and the control-plane reconciler that satisfies them — is
+  plane-agnostic and remains current: it drives CP-plane tablet placement today
+  (`reconcile_loop`, `Metadata::rebalance`, ADR 0029) exactly as described below.
 - **Date:** 2026-08-01
 
 ## Context

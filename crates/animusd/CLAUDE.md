@@ -1082,12 +1082,15 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
   control plane's **replicated catalog** (ADR 0013) and `INSERT`/`SELECT` resolve
   columns from it (a typed row is one data-plane value keyed by `escape(table) ||
   pk_key_bytes`; the partition key is not stored in the value). `CREATE KEYSPACE`
-  records the keyspace in the per-node `CqlState` (keyspaces are not yet
-  replicated).
-  - **The keyspace set + prepared-statement store (`CqlState`) are per-node
-    edge state** (ADR 0031 PR2), held in the node's own `ClusterEdgeState`
+  proposes `MetaCommand::CreateKeyspace` into the control plane's replicated
+  `Metadata` (durable + cluster-agreed, ADR 0013), **no longer process-local**;
+  `USE`/qualifier validation reads the replicated set (`keyspace_exists`, with
+  a `ks.table`-prefix fallback so a keyspace with no `CREATE KEYSPACE` of its
+  own but an existing table still resolves).
+  - **The prepared-statement store (`CqlState`) is per-node edge state**
+    (ADR 0031 PR2), held in the node's own `ClusterEdgeState`
     (threaded through `ClientCtx::edge`), **not** a process `OnceLock` — like
-    the DynamoDB `SchemaRegistry`. They are shared across **connections to the
+    the DynamoDB `SchemaRegistry`. It is shared across **connections to the
     same node** (so `PREPARE` on one connection and `EXECUTE` on another
     resolve to the same statement, as long as both connect to the same node)
     but **isolated between two nodes** — including two nodes of the same
@@ -1095,12 +1098,13 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
     per-process catalog exactly, and between two clusters in one process (so a
     test harness can run several independent clusters, or several nodes,
     without their edge state leaking — the fix for the former process-global
-    `OnceLock` state-leak, extended one level further by ADR 0031 PR2). They
-    are still **not durable and not control-plane replicated**: lost on
-    restart, and each process/node re-creates its own keyspaces/prepares. Note
-    table *schemas* are no longer here at all — they live in the control
-    plane's replicated catalog (ADR 0013), which every node sees the same way
-    regardless. Per-connection state (the `USE`d keyspace) lives in `Session`.
+    `OnceLock` state-leak, extended one level further by ADR 0031 PR2). The
+    prepared-statement store itself is still **not durable and not
+    control-plane replicated**: lost on restart, and each process/node
+    re-creates its own prepares. Note table *schemas* **and now keyspaces**
+    are no longer here at all — both live in the control plane's replicated
+    catalog (ADR 0013), which every node sees the same way regardless. Only
+    per-connection state (the `USE`d keyspace selection) lives in `Session`.
   - The **prepared-statement id is content-addressed** — a stable hash of the
     statement text (FNV-1a, no RNG so the edge stays deterministic) — so `PREPARE`
     on one connection and `EXECUTE` on another resolve to the same statement,

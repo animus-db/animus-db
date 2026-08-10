@@ -145,10 +145,15 @@ the production implementation; the deterministic implementation lives in
   drains the accept loop's raw frames (now `[from][stream][len][payload]`,
   the `stream` field ADR 0026 added) and routes each into its stream's queue,
   waking a parked `recv_stream(stream)`. A `Coresident::sibling` gets its own
-  `Demux` + pump (its inbox is genuinely separate); this is orthogonal to (and
-  does not yet replace) `Coresident` — see the ADR for the staged plan to
-  eventually retire the sibling pool once a real consumer (the per-tablet CP
-  Raft group after a split) migrates onto a stream instead of a minted `NodeId`.
+  `Demux` + pump (its inbox is genuinely separate). **The staged retirement
+  this once described is done**: since ADR 0028 (shared per-node storage,
+  control-plane-only split) every tablet a node hosts shares **one** `raftkv`
+  env, addressed by `stream` (the tablet id) — `animusd`'s production wiring no
+  longer mints a per-tablet `Coresident` sibling at all (`Node::bind`'s doc
+  comment: "`Coresident`/`CP_SIBLING_POOL` are gone"). The trait itself (and its
+  `SimEnv`/`ProdEnv` impls) is left in place, unused by any production caller,
+  rather than removed — it stays available as a capability, not a load-bearing
+  path.
   This is the same "additive default over a well-known constant" shape the
   metrics seam (`Env::metrics()`) uses — extend the trait so nothing existing
   has to change, not by widening every implementor's required surface.

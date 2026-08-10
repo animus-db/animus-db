@@ -103,9 +103,13 @@ edge maps this crate's `TableSchema` ⇄ `animus_control::TableSchema` (`CqlType
 uuid↔Uuid) and:
 - `CREATE TABLE` proposes `MetaCommand::CreateTableSchema` (keyed `ks.table`) and
   waits for commit, so the table is **durable + cluster-agreed**;
-- `DROP TABLE` proposes `DropTableSchema`; `ALTER TABLE ... ADD` drops + recreates
-  the schema with appended columns (column indices are preserved, so stored rows
-  still decode — but the two steps are not atomic);
+- `DROP TABLE` proposes `DropTableSchema`; `ALTER TABLE ... ADD` proposes
+  `MetaCommand::ReplaceTableSchema` — **one atomic in-place replacement**
+  (appended columns preserve existing indices, so stored rows still decode; no
+  drop+recreate window where the table could be momentarily schema-less);
+- `CREATE KEYSPACE`/`USE` propose `MetaCommand::CreateKeyspace`/`DropKeyspace` —
+  **also control-plane replicated**, durable + cluster-agreed like a table
+  schema, not process-local;
 - `INSERT`/`SELECT`/`UPDATE`/`DELETE` resolve the schema from the replicated
   `Metadata` and plan against a throwaway one-table `Catalog`.
 
@@ -118,13 +122,13 @@ parsing/encoding/planning stays here, control-plane wiring stays at the edge.
 - A `BATCH` applies its members **in order but not atomically** — there is no
   cross-statement rollback; a member failing mid-batch returns its error with
   earlier members already applied. (CQL logged-batch atomicity is future work.)
-- `ALTER TABLE` supports only `ADD <col> <type>`, implemented as a non-atomic
-  drop+recreate of the replicated schema (an in-place schema-mutation
-  `MetaCommand` is future work).
-- **Keyspaces** are not separately replicated (the control catalog models tables,
-  keyed `ks.table`): the edge keeps a process-local keyspace set for
-  `USE`/qualifier checks, plus treating a keyspace with a replicated `ks.table`
-  as existing. Replicating keyspace metadata is future work (ADR 0006/0013).
+- `ALTER TABLE` supports only `ADD <col> <type>`, implemented as an **atomic
+  in-place replacement** of the replicated schema (`MetaCommand::ReplaceTableSchema`
+  — no longer a non-atomic drop+recreate; see above).
+- **Keyspaces are now control-plane replicated too** (`MetaCommand::CreateKeyspace`/
+  `DropKeyspace`, `Metadata::has_keyspace` — ADR 0006/0013, no longer future
+  work): `USE`/qualifier checks resolve against the replicated set, durable and
+  cluster-agreed exactly like a table schema.
 - A table has a **single partition-key column** (composite/multi-column
   partition keys are rejected loudly by the parser), but may have any number of
   **clustering columns**. `SELECT`/`UPDATE`/`DELETE` accept a `pk = value`
