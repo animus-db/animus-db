@@ -788,6 +788,31 @@ async fn growth_node_observes_metadata_promptly_via_watch() {
          watch, not the old fixed-200ms `Status` poll"
     );
 
+    // ADR 0038 PR5: the growth node's mirror sync
+    // (`remote_metadata_sync_loop`'s growth-node branch, `remote_metadata_
+    // watch_loop`, `RemoteControlClient::observe_delta`) is the *identical*
+    // code path a genuine data-only node's `ControlHandle::Remote` drives —
+    // one shared call site, not two parallel implementations (verified by
+    // reading the source; there is nothing growth-node-specific left to
+    // instrument separately). Confirming here that the exact wire request
+    // this growth node's own watch loop has been issuing this whole test —
+    // `ClientRequest::WatchMetadata` against a base control node, with a
+    // `last_seen` well inside the still-small ring's window — gets served as
+    // a cheap `MetadataDelta`, not a full `Status` clone, is therefore
+    // equally a proof for the growth-node path.
+    let delta_reply = call(
+        base_clients[0],
+        ClientRequest::WatchMetadata { last_seen: 0 },
+    )
+    .await
+    .expect("base control node answers WatchMetadata");
+    assert!(
+        matches!(delta_reply, ClientResponse::MetadataDelta { .. }),
+        "expected the base cluster's still-small delta ring to cover last_seen=0 with an \
+         incremental reply (the exact shape the growth node's mirror sync has been consuming \
+         throughout this test), got {delta_reply:?}"
+    );
+
     for node in growth_nodes.iter().chain(base_nodes.iter()) {
         node.shutdown();
     }

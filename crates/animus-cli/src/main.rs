@@ -618,6 +618,18 @@ fn print_response(response: &ClientResponse) {
         ClientResponse::NodeIdAllocated { node } => {
             println!("allocated node id: {node}");
         }
+        // Incremental `WatchMetadata` reply (ADR 0038 PR5): consumed
+        // programmatically by `RemoteControlClient`'s mirror sync, not
+        // requested by any CLI subcommand of its own — printed raw if one
+        // ever surfaces here (mirroring `JoinInfo`/`NodeIdAllocated` above).
+        ClientResponse::MetadataDelta {
+            writes, watermark, ..
+        } => {
+            println!(
+                "metadata delta: {} write(s) up to watermark {watermark}",
+                writes.len()
+            );
+        }
     }
 }
 

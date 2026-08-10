@@ -971,8 +971,88 @@ debugging anything that feels like it might have happened before.
   small-scale scenario's residual WAL tail get replayed"), not a substitute
   for it. See `crates/animusd/tests/control_metadata_restart.rs::
   ephemeral_control_only_restart_does_not_carry_over_metadata`.
+- **A bounded ring's "gap" check is off-by-one in a way that's easy to get
+  backwards, and the wrong direction still passes a shallow test.** Building
+  ADR 0038 PR5's per-node `DeltaRing` (`animus-control/src/delta_ring.rs`):
+  the natural-seeming assertion "if an old entry got evicted, a caller who
+  needed it must fall back" is only true when the caller's `last_seen` is
+  *behind* the evicted entry's index — if `last_seen + 1` lands exactly on
+  the ring's current front (the caller's next-needed index is exactly the
+  oldest one still retained), that is full coverage, not a gap, even though
+  something *older* than the front was indeed evicted. A first draft test
+  asserted the wrong outcome for exactly this boundary case
+  (`writes_since(2, 3)` after indices 1 and 2 were evicted, front now at 3)
+  and initially failed against genuinely-correct implementation code — the
+  fix was the test's expectation, not the ring. **When testing a
+  "contiguous coverage" predicate over a bounded/evicting structure, write
+  out the boundary case (`last_seen + 1 == front.index`) as its own explicit
+  assertion with the reasoning spelled out in a comment** — it's the one a
+  reviewer (or a future edit) is most likely to get backwards, and a test
+  that only checks the interior cases won't catch a subtly-inverted
+  condition.
+- **`PutOk`/`Accepted`-style replies from this codebase's relay/propose paths
+  mean "accepted for commit," never "committed and reflected in `Metadata`
+  yet"** (a corollary of the durable-before-visible discipline, but easy to
+  forget when writing a *test* rather than production code): a test that
+  proposes via `ClientRequest::ProposeSchema` and then immediately reads a
+  watermark/counter expecting it to have advanced will intermittently (or,
+  in one case while building ADR 0038 PR5's restart-fallback test,
+  *consistently*) observe the pre-commit value, because the apply task's
+  publish is a separate, asynchronous step the reply doesn't wait for by
+  design (`ClientRequest::ProposeSchema`'s own handler doc: "the caller
+  confirms the commit via replicated `Metadata`"). Every existing test that
+  gets this right polls (`propose_and_await`-style) for the actual effect
+  (a member/keyspace/tablet appearing) rather than trusting the immediate
+  reply — copy that idiom, don't invent a fresh assumption about what an ack
+  means.
+- **A task prompt's reference to a specific function/mechanism by name can be
+  stale by the time you implement it, if an earlier PR in the same stack
+  already redesigned it out of existence — grep before assuming the
+  follow-up still applies.** ADR 0038 PR5's brief named a specific residual
+  item from PR3 ("mirror_loop's fixed 50ms poll → wake on the apply task's
+  publish signal") as a small thing to fold in. No such function exists:
+  PR3's cutover renamed/redesigned the shadow-mode PR2 `mirror_loop` into
+  `meta_apply_loop`/`meta_apply_and_compact`, which already backs off on a
+  short idle-only timer (`APPLY_IDLE_POLL`, 5ms) and otherwise stays in
+  lockstep behind commit under load — not the "fixed 50ms poll regardless of
+  activity" shape the follow-up described. The item was already resolved by
+  a prior PR in the same stack; re-implementing "a fix" for it would have
+  been either a no-op or, worse, a regression dressed up as progress. This
+  is the root `CLAUDE.md`'s "grep before implementing a documented gap"
+  practice applying just as much to a task-prompt's own named follow-up as
+  to an ADR's prose.
 
 ### Code patterns
+- **A "full replace" update to `Arc`-shared cached state tolerates a bare
+  monotonic-watermark check-then-mutate race; an "apply an incremental delta
+  onto the existing cache" update to the *same* shared state does not, and
+  reuses the same guard incorrectly if you don't also make it atomic.**
+  `animusd`'s `RemoteControlClient` (`control_handle.rs`) is shared between a
+  background watch loop and any concurrent `metadata_fresh()` caller. Its
+  pre-existing `observe()` (a full `Metadata` replace) read
+  `self.watch.latest()`, decided whether to overwrite, then wrote and bumped
+  the watch — three separate steps, but safe anyway because a full replace is
+  order-independent modulo the monotonic-watermark guard: two concurrent
+  replaces racing only risk a *stale* value winning temporarily, never a
+  *corrupted* one, and the next reply self-heals it. ADR 0038 PR5 added
+  `observe_delta()`, which installs a batch of `KeyWrite`s onto the *existing*
+  cached value — a genuinely sequential operation that is only correct if the
+  cache is exactly at the delta's own `last_seen` basis at the moment of
+  application. Copying `observe()`'s three-separate-steps shape for
+  `observe_delta()` would have created a real corruption window: a
+  concurrent full `observe()` could advance the mirror between this method's
+  watermark check and its mutation, and the delta would then apply on top of
+  the *wrong* base, silently producing an internally-inconsistent `Metadata`
+  no later reply would ever detect or fix (unlike the full-replace race,
+  this one doesn't self-heal). The fix was to make **both** methods acquire
+  the mirror's lock first and do the check-decide-mutate-bump sequence while
+  holding it, so the two can never interleave — a case where hardening one
+  method's atomicity is forced by what gets *added next to it*, not by any
+  bug in the original method taken alone. **When adding a second mutator to
+  `Arc`-shared cached state that already has one "eventually consistent,
+  order-tolerant" writer, check whether the new one's update rule is actually
+  order-*dependent* — if so, the existing writer's looser discipline has to
+  tighten to match, not just the new one.
 - **A per-role internal `Env` peer address book (`ProdEnv::set_peers`) that
   is only ever installed once, at process bring-up, from static config has no
   path for a peer added *after* bring-up to become reachable — even once a

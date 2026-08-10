@@ -86,7 +86,13 @@ pub const NEXT_ALLOC_ID_COUNTER: &str = "next_alloc_id";
 /// single engine-wide monotonic version), since a **combined** node's mirror
 /// shares its engine with the CP data plane's own, independently-versioned
 /// writes (see the PR2 report's inline-vs-offloaded write-path note).
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// **`Serialize`/`Deserialize` (ADR 0038 PR5)**: these ride the wire
+/// verbatim as an incremental `WatchMetadata` reply's payload (`animusd`'s
+/// `ClientResponse::MetadataDelta`, fed by [`crate::delta_ring::DeltaRing`]) —
+/// see [`apply_key_write`] for the consumer side that installs a received
+/// batch of these onto a plain `Metadata` with no engine of its own.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum KeyWrite {
     /// Upsert `key` to `value`.
     Put(Vec<u8>, Vec<u8>),
@@ -284,7 +290,10 @@ fn decode_u64(bytes: &[u8]) -> u64 {
 /// keyspace — the mirror's read side, used by (a) the differential-oracle
 /// test (assert this equals the real in-core `Metadata` at the same index),
 /// (b) a restart's shadow-cache rebuild (`node.rs`'s `mirror_loop`), and (c)
-/// a future PR3 apply task's own cache-rebuild-on-restart step.
+/// the apply task's own cache-rebuild-on-restart step. Built from
+/// [`apply_key_write`] (one `Put` per live entry — `entries()` never yields
+/// tombstones, so this only ever exercises that half) so the bulk-rebuild
+/// and incremental-delta decode paths can't drift apart.
 ///
 /// Ignores any live key that doesn't decode as a system-keyspace key
 /// ([`syskv::decode_key`] returning `None`) rather than failing — a shared
@@ -300,73 +309,140 @@ pub async fn rebuild_metadata_from_engine<S: StorageEngine>(
 ) -> Result<Metadata, StorageError> {
     let mut meta = Metadata::default();
     for (key, versioned) in engine.entries().await? {
-        let Some(decoded) = syskv::decode_key(&key) else {
-            continue;
-        };
-        let DecodedKey::Entity { kind, id } = decoded else {
-            // `DecodedKey::AppliedIndex` — the watermark isn't part of
-            // `Metadata`; the mirror loop reads it separately.
-            continue;
-        };
-        match kind {
-            EntityKind::Tablet => {
-                let tablet: Tablet = serde_json::from_slice(&versioned.value)
-                    .expect("mirrored tablet value decodes");
-                meta.tablets.insert(TabletId(decode_u64(&id)), tablet);
-            }
-            EntityKind::Member => {
-                let member: Member = serde_json::from_slice(&versioned.value)
-                    .expect("mirrored member value decodes");
-                meta.members.insert(decode_u64(&id), member);
-            }
-            EntityKind::Schema => {
-                let name = String::from_utf8(id).expect("schema id is UTF-8");
-                let schema: TableSchema = serde_json::from_slice(&versioned.value)
-                    .expect("mirrored schema value decodes");
-                meta.schemas.insert(name, schema);
-            }
-            EntityKind::Policy => {
-                let policy: PlacementPolicy = serde_json::from_slice(&versioned.value)
-                    .expect("mirrored policy value decodes");
-                meta.policies.insert(TabletId(decode_u64(&id)), policy);
-            }
-            EntityKind::NodeAddrs => {
-                let addrs: NodeAddrs = serde_json::from_slice(&versioned.value)
-                    .expect("mirrored node-addrs value decodes");
-                meta.node_addrs.insert(decode_u64(&id), addrs);
-            }
-            EntityKind::Keyspace => {
-                let name = String::from_utf8(id).expect("keyspace id is UTF-8");
-                meta.keyspaces.insert(name);
-            }
-            EntityKind::Merged => {
-                meta.merged_tablets.insert(TabletId(decode_u64(&id)));
-            }
-            EntityKind::Counter => {
-                let value = decode_u64(&versioned.value);
-                if id == NEXT_TABLET_ID_COUNTER.as_bytes() {
-                    meta.next_tablet_id = value;
-                } else if id == NEXT_ALLOC_ID_COUNTER.as_bytes() {
-                    meta.next_alloc_id = value;
-                }
-            }
-            EntityKind::CpMemberAddr => {
-                let node = decode_u64(&id);
-                let entry: CpMemberAddrEntry = serde_json::from_slice(&versioned.value)
-                    .expect("mirrored cp-member-addr value decodes");
-                meta.cp_member_addrs.insert(node, entry.addr);
-                if let Some(tablet) = entry.tablet {
-                    meta.cp_member_tablets.insert(node, tablet);
-                }
-            }
-            EntityKind::NodeIdAlloc => {
-                let nonce = String::from_utf8(id).expect("node-id-alloc nonce is UTF-8");
-                meta.node_id_allocations
-                    .insert(nonce, decode_u64(&versioned.value));
-            }
-        }
+        apply_key_write(&mut meta, &KeyWrite::Put(key, versioned.value));
     }
     Ok(meta)
+}
+
+/// Install one already-derived system-keyspace [`KeyWrite`] directly onto a
+/// `Metadata` — the incremental counterpart to [`rebuild_metadata_from_engine`]'s
+/// bulk rebuild, and the read side of ADR 0038 PR5's `WatchMetadata` delta
+/// reply: `animusd::control_handle::RemoteControlClient::observe_delta`
+/// installs a leader-derived batch of these onto its own cached `Metadata`
+/// with no engine of its own, exactly the "install pre-diffed key/value
+/// pairs verbatim via the existing syskv decode/rebuild machinery" design.
+///
+/// Ignores a key that doesn't decode as a live entity ([`syskv::decode_key`]
+/// returning `None`, or the `AppliedIndex` watermark key, which isn't part
+/// of `Metadata`) — mirrors [`rebuild_metadata_from_engine`]'s defensive
+/// treatment of an unrecognized key.
+pub fn apply_key_write(meta: &mut Metadata, write: &KeyWrite) {
+    match write {
+        KeyWrite::Put(key, value) => apply_put(meta, key, value),
+        KeyWrite::Delete(key) => apply_delete(meta, key),
+    }
+}
+
+/// The `Put`/upsert half of [`apply_key_write`].
+fn apply_put(meta: &mut Metadata, key: &[u8], value: &[u8]) {
+    let Some(DecodedKey::Entity { kind, id }) = syskv::decode_key(key) else {
+        return;
+    };
+    match kind {
+        EntityKind::Tablet => {
+            let tablet: Tablet =
+                serde_json::from_slice(value).expect("mirrored tablet value decodes");
+            meta.tablets.insert(TabletId(decode_u64(&id)), tablet);
+        }
+        EntityKind::Member => {
+            let member: Member =
+                serde_json::from_slice(value).expect("mirrored member value decodes");
+            meta.members.insert(decode_u64(&id), member);
+        }
+        EntityKind::Schema => {
+            let name = String::from_utf8(id).expect("schema id is UTF-8");
+            let schema: TableSchema =
+                serde_json::from_slice(value).expect("mirrored schema value decodes");
+            meta.schemas.insert(name, schema);
+        }
+        EntityKind::Policy => {
+            let policy: PlacementPolicy =
+                serde_json::from_slice(value).expect("mirrored policy value decodes");
+            meta.policies.insert(TabletId(decode_u64(&id)), policy);
+        }
+        EntityKind::NodeAddrs => {
+            let addrs: NodeAddrs =
+                serde_json::from_slice(value).expect("mirrored node-addrs value decodes");
+            meta.node_addrs.insert(decode_u64(&id), addrs);
+        }
+        EntityKind::Keyspace => {
+            let name = String::from_utf8(id).expect("keyspace id is UTF-8");
+            meta.keyspaces.insert(name);
+        }
+        EntityKind::Merged => {
+            meta.merged_tablets.insert(TabletId(decode_u64(&id)));
+        }
+        EntityKind::Counter => {
+            let value = decode_u64(value);
+            if id == NEXT_TABLET_ID_COUNTER.as_bytes() {
+                meta.next_tablet_id = value;
+            } else if id == NEXT_ALLOC_ID_COUNTER.as_bytes() {
+                meta.next_alloc_id = value;
+            }
+        }
+        EntityKind::CpMemberAddr => {
+            let node = decode_u64(&id);
+            let entry: CpMemberAddrEntry =
+                serde_json::from_slice(value).expect("mirrored cp-member-addr value decodes");
+            meta.cp_member_addrs.insert(node, entry.addr);
+            if let Some(tablet) = entry.tablet {
+                meta.cp_member_tablets.insert(node, tablet);
+            }
+        }
+        EntityKind::NodeIdAlloc => {
+            let nonce = String::from_utf8(id).expect("node-id-alloc nonce is UTF-8");
+            meta.node_id_allocations.insert(nonce, decode_u64(value));
+        }
+    }
+}
+
+/// The `Delete`/tombstone half of [`apply_key_write`] — reachable only via a
+/// real delta (never via [`rebuild_metadata_from_engine`], whose `entries()`
+/// scan never yields a tombstone).
+fn apply_delete(meta: &mut Metadata, key: &[u8]) {
+    let Some(DecodedKey::Entity { kind, id }) = syskv::decode_key(key) else {
+        return;
+    };
+    match kind {
+        EntityKind::Tablet => {
+            meta.tablets.remove(&TabletId(decode_u64(&id)));
+        }
+        EntityKind::Member => {
+            meta.members.remove(&decode_u64(&id));
+        }
+        EntityKind::Schema => {
+            let name = String::from_utf8(id).expect("schema id is UTF-8");
+            meta.schemas.remove(&name);
+        }
+        EntityKind::Policy => {
+            meta.policies.remove(&TabletId(decode_u64(&id)));
+        }
+        EntityKind::NodeAddrs => {
+            meta.node_addrs.remove(&decode_u64(&id));
+        }
+        EntityKind::Keyspace => {
+            let name = String::from_utf8(id).expect("keyspace id is UTF-8");
+            meta.keyspaces.remove(&name);
+        }
+        EntityKind::Merged => {
+            // Never deleted in practice (`merged_tablets` is never pruned —
+            // see this crate's CLAUDE.md) — listed for match exhaustiveness.
+            meta.merged_tablets.remove(&TabletId(decode_u64(&id)));
+        }
+        EntityKind::Counter => {
+            // Never deleted in practice (a monotonic counter is only ever
+            // `Put`) — listed for match exhaustiveness.
+        }
+        EntityKind::CpMemberAddr => {
+            let node = decode_u64(&id);
+            meta.cp_member_addrs.remove(&node);
+            meta.cp_member_tablets.remove(&node);
+        }
+        EntityKind::NodeIdAlloc => {
+            // Never deleted in practice (an idempotency ledger entry is
+            // permanent) — listed for match exhaustiveness.
+        }
+    }
 }
 
 #[cfg(test)]
@@ -959,5 +1035,87 @@ mod tests {
             .expect("rebuild");
         assert_eq!(rebuilt, direct);
         assert_eq!(rebuilt, shadow);
+    }
+
+    /// The incremental-delta consumer path (ADR 0038 PR5, `apply_key_write`):
+    /// applying a command's derived `KeyWrite`s directly onto a `Metadata` —
+    /// no engine, no [`rebuild_metadata_from_engine`] bulk scan, exactly what
+    /// a `WatchMetadata` delta reply's consumer
+    /// (`animusd::control_handle::RemoteControlClient::observe_delta`) does —
+    /// reaches the identical state a direct `Metadata::apply` does. Uses
+    /// `MergeTablets` specifically because it derives `Delete`s, the half
+    /// [`rebuild_from_engine_matches_direct_apply`] above never exercises
+    /// (a live engine scan never yields a tombstone).
+    #[test]
+    fn incremental_delta_apply_matches_direct_apply_for_deletes() {
+        let mut base = Metadata::default();
+        base.apply(&MetaCommand::CreateTablet {
+            tablet: TabletId(1),
+            table: Some("t".to_string()),
+            range: KeyRange::whole().split_at(&[5]).unwrap().0,
+            replicas: vec![1],
+        });
+        let right_range = KeyRange::whole().split_at(&[5]).unwrap().1;
+        base.tablets.insert(
+            TabletId(2),
+            Tablet::with_table(TabletId(2), Some("t".to_string()), right_range, vec![1]),
+        );
+        base.cp_member_addrs.insert(99, "addr:1".to_string());
+        base.cp_member_tablets.insert(99, TabletId(2));
+
+        let command = MetaCommand::MergeTablets {
+            left: TabletId(1),
+            expected_left_epoch: Epoch::INITIAL,
+            right: TabletId(2),
+            expected_right_epoch: Epoch::INITIAL,
+        };
+
+        let mut shadow = base.clone();
+        let (outcome, writes) = apply_and_derive_mirror(&mut shadow, &command);
+        assert_eq!(outcome, ApplyOutcome::Applied);
+        assert!(
+            writes.iter().any(|w| matches!(w, KeyWrite::Delete(_))),
+            "expected MergeTablets to derive at least one delete"
+        );
+
+        let mut direct = base.clone();
+        direct.apply(&command);
+
+        let mut mirror_side = base.clone();
+        for w in &writes {
+            apply_key_write(&mut mirror_side, w);
+        }
+
+        assert_eq!(
+            shadow, direct,
+            "the apply task's own shadow matches direct apply"
+        );
+        assert_eq!(
+            mirror_side, direct,
+            "a delta-consumer's incremental apply matches direct apply"
+        );
+    }
+
+    /// `apply_key_write` ignores a key it doesn't recognize (an undecodable
+    /// key, or the `_applied_index` watermark — not part of `Metadata`)
+    /// rather than panicking, mirroring `rebuild_metadata_from_engine`'s
+    /// defensive treatment.
+    #[test]
+    fn apply_key_write_ignores_unrecognized_keys() {
+        let mut meta = Metadata::default();
+        let before = meta.clone();
+        apply_key_write(
+            &mut meta,
+            &KeyWrite::Put(b"not a system key".to_vec(), b"value".to_vec()),
+        );
+        apply_key_write(
+            &mut meta,
+            &KeyWrite::Put(syskv::applied_index_key(), 5u64.to_be_bytes().to_vec()),
+        );
+        apply_key_write(
+            &mut meta,
+            &KeyWrite::Delete(b"not a system key either".to_vec()),
+        );
+        assert_eq!(meta, before);
     }
 }

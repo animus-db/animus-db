@@ -1,15 +1,16 @@
 # ADR 0038 — Control-plane metadata backed by a per-node system-keyspace storage engine
 
-- **Status:** Accepted — implemented across three PRs. PR1 (key encoding +
+- **Status:** Accepted — implemented across five PRs. PR1 (key encoding +
   reserved namespace), PR2 (shadow-mode engine mirror, dual-write, zero
-  behavior change), **PR3 (this document): the cutover** — `Metadata` is
+  behavior change), **PR3: the cutover** — `Metadata` is
   `StateMachine::DRIVER_APPLIED = true`; `RaftCore` no longer applies
   `MetaCommand`s in-core; a new async apply task owns the only mutable
   `Metadata`, derives per-command system-keyspace writes, and publishes an
   `engine_applied`-gated cache every reader now reads. PR4 (`animusd`
-  deployment-shape wiring polish + admin/dashboard storage surface) and PR5
-  (incremental `WatchMetadata` deltas) are follow-ups, out of scope here.
-- **Date:** 2026-08-10
+  deployment-shape wiring polish + admin/dashboard storage surface). **PR5
+  (this amendment): "Phase 2" — incremental `WatchMetadata` deltas**, closing
+  the one item PR3's Consequences section left as future work (see below).
+- **Date:** 2026-08-10 (PR3); amended 2026-08-10 (PR5)
 - **Amends:** ADR 0009 (in-house Raft over `Env`), ADR 0013 (replicated schema
   catalog), ADR 0028 (shared per-node storage), ADR 0031 (tablet-host
   reconciler + `metadata_watch`), ADR 0035 (control-plane separate deployment).
@@ -179,15 +180,96 @@ consciously here.
   the identical job, so carrying both forward would have been two write
   paths for the same fact.
 - **Non-goals (v1)**: no change to the tablet map's *authoritative* location
-  (still `Metadata.tablets`, still control-plane-owned); no incremental
-  `WatchMetadata` deltas (sketched as a candidate PR5, not committed here —
-  the wire contract is unchanged, still a full `Metadata` clone per reply).
+  (still `Metadata.tablets`, still control-plane-owned). Incremental
+  `WatchMetadata` deltas were sketched here as a candidate PR5 and are now
+  shipped — see "Phase 2" below.
+
+## Phase 2 (PR5): incremental `WatchMetadata` deltas
+
+PR3 made the apply task derive each command's exact system-keyspace
+writes/deletes (`mirror::apply_and_derive_mirror`'s `Vec<KeyWrite>`) as a
+necessary step on the way to the engine — but `WatchMetadata`'s reply kept
+shipping a **full `Metadata` clone** every time, unconditionally. This PR
+makes the reply incremental, reusing that same per-command derivation instead
+of duplicating it.
+
+**Design** (unchanged from what this ADR's PR3 revision sketched, now
+committed in full):
+
+1. **Pre-diffed key/value deltas, never replayed commands.** A mirror installs
+   received `KeyWrite`s verbatim into its cached `Metadata` via
+   [`mirror::apply_key_write`](../../crates/animus-control/src/mirror.rs) — the
+   same decode logic [`mirror::rebuild_metadata_from_engine`] already used for
+   its bulk (`Put`-only) rebuild path, now shared by both. No control-plane
+   business logic (no `MetaCommand` replay) runs on a mirror — the identical
+   reasoning that already ruled out shipping raw commands over the wire.
+2. **A bounded per-node in-memory delta ring**
+   ([`delta_ring::DeltaRing`](../../crates/animus-control/src/delta_ring.rs)),
+   fed by the apply task in the same pass that publishes `cache`/bumps
+   `engine_applied`: one entry per drained command, keyed by its Raft log
+   index, holding that command's derived `KeyWrite`s (possibly empty — a
+   `NoOp`/rejected command still gets an entry, which is what keeps the ring's
+   index space contiguous with no unexplained gaps). Bounded by **both** max
+   entries and max total bytes (defaults 1024 / 4 MiB, `DeltaRing::
+   with_bounds`/`RaftNode::start_with_ring_bounds` for a different bound) —
+   oldest evicted first. Strictly per-node, best-effort, no cross-node
+   coordination — nothing here is replicated or agreed on. **Reset to empty**
+   whenever `cache` is rebuilt from a jump the ring itself didn't witness (a
+   received `InstallSnapshot`, or the apply task's own startup/restart
+   rebuild) — a mirror whose `last_seen` predates that jump then correctly
+   falls back to a full fetch rather than the ring silently under-reporting.
+3. **Serve path**: `WatchMetadata { last_seen }` answers with the ring's
+   flattened `(last_seen, current]` writes
+   (`RaftNode::watch_delta_since` → `animusd`'s
+   `ClientResponse::MetadataDelta`) when the ring contiguously covers that
+   range; otherwise falls back to the original full `ClientResponse::Status`
+   reply — the same log-tail-vs-`InstallSnapshot` fallback shape this plane
+   already has. The trivial "nothing changed since `last_seen`" case (a
+   long-poll that resolved by timing out) is always a zero-length delta, ring
+   or no ring — cheaper than a full clone even then. A plain
+   `ClientRequest::Status` request is untouched: always the full reply,
+   unconditionally — only `WatchMetadata` gained the incremental option.
+4. **Both mirror consumers adopt deltas from one shared implementation site**:
+   `animusd`'s `RemoteControlClient::observe_delta` (called from
+   `remote_metadata_watch_loop`) is driven identically whether the caller is a
+   genuine ADR 0035 PR4 data-only node (`ControlHandle::Remote`) or an ADR
+   0030 growth node's standalone `RemoteControlClient::with_mirror` — there
+   was only ever one call site to update, confirmed by reading the source
+   before implementing (per this repo's "grep before reimplementing"
+   practice). `observe_delta` only applies a delta when the mirror's current
+   watermark exactly matches the delta's own `last_seen` basis (not merely
+   `<=`) — a concurrent full `observe()` (e.g. a `metadata_fresh()` call
+   racing the background watch loop, since `RemoteControlClient` is shared
+   and both drive the same `Arc`-backed state) advancing the mirror in the
+   meantime makes a delta's *sequential* application unsafe to apply blindly;
+   detected and dropped rather than mis-applied, self-healing on the watch
+   loop's next iteration.
+
+No back-compat machinery was added (explicit call, matching this ADR's own
+precedent): the `WatchMetadata`/`Status` wire types changed directly — a new
+`ClientResponse::MetadataDelta` variant, no `V2` enum, no `#[serde(default)]`
+compatibility shim — since this is pre-alpha with no live deployments to
+interoperate with.
+
+**Consequences of Phase 2**: a `WatchMetadata` round trip against a small,
+recently-active control plane is now O(commands since `last_seen`), not
+O(cluster) — the same fix PR3 already made for durability/compaction,
+extended to this last full-`Metadata`-clone wire path. The ring is a pure
+memory/latency trade-off with no safety implication: any coverage gap
+(eviction, a snapshot install, a restart) degrades to exactly the pre-PR5
+behavior (a full fetch), never to incorrect or stale data — see the
+differential tests (`animus-control/tests/watch_deltas.rs`,
+`animusd/tests/watch_metadata.rs`) for the byte-identical-to-a-full-fetch
+proof this relies on.
 
 ## See also
 
-- `crates/animus-control/CLAUDE.md` — `node.rs`/`raft.rs`/`mirror.rs`/`syskv.rs`
-  mechanics.
+- `crates/animus-control/CLAUDE.md` — `node.rs`/`raft.rs`/`mirror.rs`/`syskv.rs`/
+  `delta_ring.rs` mechanics.
+- `crates/animusd/CLAUDE.md` — the `WatchMetadata` wire contract and
+  `RemoteControlClient` mechanics.
 - `crates/animus-cp-data/CLAUDE.md` — the proven consensus-loop/apply-task
   split and `DRIVER_APPLIED` lazy-snapshot shape this ADR ports.
 - `docs/engineering-lessons.md` — the election-storm bug class this split
-  must not reintroduce, and the watermark-seeding lesson this PR added.
+  must not reintroduce, the watermark-seeding lesson PR3 added, and the
+  concurrent-mirror-update race PR5 added.

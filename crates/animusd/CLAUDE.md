@@ -260,6 +260,48 @@ stale-but-plausible cached data up to 8s late. A fixed-sleep assertion right
 after a test's node-kill can be outrun by this; poll to convergence instead
 (see the engineering-lessons log).
 
+**`WatchMetadata`'s reply is incremental (ADR 0038 PR5).** `ClientCtx::
+watch_metadata` — after the long-poll resolves (wake-on-commit or the
+`WATCH_METADATA_SERVER_TIMEOUT` bound) — tries the serving node's own
+`RaftNode::watch_delta_since(last_seen)` first: if its bounded delta ring
+(`animus_control::DeltaRing`) contiguously covers `(last_seen, watermark]`,
+the reply is a cheap `ClientResponse::MetadataDelta { writes, watermark,
+leader_hint, control_voters }` instead of a full `Status` clone — `writes` is
+a `Vec<animus_control::mirror::KeyWrite>`, empty exactly when nothing changed
+(the timeout-elapsed case, still cheaper than cloning `Metadata`). Falls back
+to the original full `ClientResponse::Status` reply whenever the ring doesn't
+cover the range (a fresh/lagging/just-recovered replica) **or** while this
+node's own ADR 0030 growth-node mirror overlay is active
+(`ClientCtx.remote_metadata` populated) — that overlay serves
+`effective_metadata()` from a different source than this node's own
+(permanently inert, on a growth node) local ring, so a delta off that ring
+would answer the wrong question. A plain `ClientRequest::Status` request is
+untouched — always the full reply, unconditionally; only `WatchMetadata`
+gained the incremental option.
+
+`RemoteControlClient::observe_delta` is the **single shared consumer** for
+both `Remote` (a genuine ADR 0035 PR4 data-only node) and the ADR 0030
+growth-node branch above — both drive it through the identical
+`remote_metadata_watch_loop`, which now matches on both
+`ClientResponse::{Status, MetadataDelta}`. `observe_delta` installs each
+`KeyWrite` onto the cached `Metadata` via `animus_control::mirror::
+apply_key_write` (never replaying a `MetaCommand` — this crate carries no
+control-plane business logic to do that correctly). **Race guard**: since
+`RemoteControlClient` is `Arc`-shared between the background watch loop and
+any concurrent `metadata_fresh()` caller, a delta is only applied if the
+mirror's *current* watermark exactly equals the delta's own `last_seen`
+basis (checked and mutated under one lock, alongside the same tightening
+applied to `observe`'s pre-existing `watermark >= watch.latest()` check) — a
+concurrent full `observe()` moving the mirror in the meantime makes the
+delta's sequential application unsafe to apply blindly (unlike a full
+replace, which is order-independent modulo the monotonic watermark guard); a
+stale delta is dropped, not mis-applied, and self-heals on the loop's next
+iteration with a corrected `last_seen`. Regression:
+`tests/watch_metadata.rs` (the wire server side, incl. a real control-only
+process restart resetting the ring and forcing the correct fallback) and
+`tests/cluster_growth.rs::growth_node_observes_metadata_promptly_via_watch`
+(the growth-node path, proven via the shared call site).
+
 ## Tablet lifecycle
 
 **The per-node tablet-host reconciler (ADR 0031 PR4) is the single owner of this
@@ -601,7 +643,13 @@ Test-file map (`tests/`):
   cluster (ADR 0035 PR3).
 - `data_only.rs` — genuine split cluster, 3 control-only + 2 data-only (PR4).
 - `data_join.rs` — `animusd data --seed` joining a split cluster (PR5).
-- `watch_metadata.rs` — the `WatchMetadata` long-poll wire primitive (PR5).
+- `watch_metadata.rs` — the `WatchMetadata` long-poll wire primitive (ADR 0035
+  PR5) and, since ADR 0038 PR5, its incremental `MetadataDelta` reply: a
+  fresh cluster's wake-on-commit reply is specifically asserted to be a
+  `MetadataDelta` (not a full `Status`), and a real control-only process
+  restart resets that node's ring, forcing a pre-restart watcher's
+  `last_seen` to correctly fall back to a full `Status` while a caught-up
+  watcher still gets the cheap trivial delta.
 - `split_cluster.rs` — genuine multi-process split deployment scenarios: control
   failover, split+merge, failure repair, decommission, full restart (PR6).
 - `cluster_growth.rs` — 3→5 online growth without restarting the original 3.
