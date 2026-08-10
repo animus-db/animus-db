@@ -57,7 +57,7 @@ use animus_control::node::{HEARTBEAT_INTERVAL, send_heartbeat};
 use animus_control::{PlacementPolicy, ProposeResult, RaftNode};
 use animus_cp_data::RaftKvNode;
 use animus_cp_data::host::{MetadataView, Reconciler};
-use animus_env::{Env, Metric, MetricsHandle, NodeId, ProdEnv};
+use animus_env::{Env, Metric, MetricsHandle, NodeId, ProdEnv, Rng};
 use animus_storage::{
     Key, LsmEngine, MemoryEngine, SsTableView, StorageEngine, StorageError, VersionedValue,
     WalRecordView,
@@ -4461,9 +4461,7 @@ impl ClientCtx {
     /// change is `RaftNode::change_membership`, a distinct method only a
     /// genuine control-group voter's own in-process handle can call.
     ///
-    /// `node` is an **operator-supplied** id (ADR 0036's cluster-allocated
-    /// allocator is not wired into this path — see the module doc below for
-    /// why, and the note on switching to it as future work), checked against
+    /// `node`, when `Some`, is an **operator-supplied** id, checked against
     /// three collision surfaces before ever touching Raft: (1) already a live
     /// control voter (`self.control.config()`) — idempotent success, not an
     /// error, mirroring `admin_add_member`'s "already registered" no-op; (2)
@@ -4475,7 +4473,33 @@ impl ClientCtx {
     /// above [`ALLOC_ID_BASE`] — refused outright, keeping the operator-chosen
     /// range and the allocator's own disjoint range structurally non-
     /// overlapping in both directions (the allocator already never dips below
-    /// its base; this is the missing other half).
+    /// its base; this is the missing other half). Manually targeting the
+    /// allocated range is never allowed, even after this method started being
+    /// able to mint ids there itself — see the `None` case below for why that
+    /// asymmetry is intentional, not an oversight.
+    ///
+    /// `node: None` (ADR 0037 hardening trio's PR3 — closes the "Coordination
+    /// with ADR 0036" gap that ADR 0037 originally deferred) mints a fresh id
+    /// from the **same replicated allocator** ADR 0036's join path uses
+    /// (`MetaCommand::AllocateNodeId`, via the private
+    /// [`allocate_node_id`](Self::allocate_node_id) helper) instead of
+    /// requiring an operator-chosen one: a fresh nonce drawn from
+    /// `leader.env().next_u64()` — **not** [`generate_join_nonce`]'s
+    /// deliberate OS-randomness exception, since unlike that CLI-pre-bind
+    /// boundary this method runs in-process on a live control leader that a
+    /// `SimEnv` test can (and, per this PR's own tests, does) drive, so the
+    /// `Env`-seam rule (ADR 0003) applies here with no exception to invoke —
+    /// then proceeds through the *same* address-registration +
+    /// `change_membership` tail as the operator-supplied path, with checks
+    /// (2) and (3) above **skipped** for the minted id: `AllocateNodeId`'s own
+    /// apply already inserted a `Down` `Member` row for it as part of
+    /// minting, so check (2) (`Metadata::members` already contains it) would
+    /// reject the allocator's own output every single time, and check (3) is
+    /// exactly backwards for an id that by construction sits at or above
+    /// `ALLOC_ID_BASE`. This is why operator-supplied ids can still never
+    /// target the allocated range (check (3) above, unconditionally): the
+    /// allocator is the only legitimate mint authority for that range, and
+    /// only this method's own `None` branch is allowed to skip its guard.
     ///
     /// Two steps, honestly partial on a failure between them (mirroring
     /// [`admin_add_member`]'s "both-or-honest-partial-state" idempotence,
@@ -4494,20 +4518,53 @@ impl ClientCtx {
     /// `ProdEnv::merge_peer`'s doc for the known scope limit this leaves (only
     /// *this* env's peer book is updated — a later leadership change needs
     /// its own follow-up, deliberately deferred out of this PR).
-    pub(crate) fn admin_add_control_member(
+    ///
+    /// Returns the **effective** [`NodeId`] either way — the operator-supplied
+    /// one echoed back, or the freshly-minted one — so the caller (`admin.rs`,
+    /// the CLI) can tell the operator what id the new process should actually
+    /// come up as.
+    pub(crate) async fn admin_add_control_member(
         &self,
-        node: NodeId,
+        node: Option<NodeId>,
         addr: SocketAddr,
-    ) -> Result<(), String> {
-        if node >= ALLOC_ID_BASE {
-            return Err(format!(
-                "node {node} is at or above the cluster-allocated id range \
-                 (ALLOC_ID_BASE = {ALLOC_ID_BASE}); an operator-supplied control \
-                 voter id must stay below it"
-            ));
-        }
+        labels: BTreeMap<String, String>,
+    ) -> Result<NodeId, String> {
         let Some(leader) = self.edge.leader_handle() else {
             return Err(self.not_leader_error());
+        };
+        let (node, minted) = match node {
+            Some(node) => {
+                if node >= ALLOC_ID_BASE {
+                    return Err(format!(
+                        "node {node} is at or above the cluster-allocated id range \
+                         (ALLOC_ID_BASE = {ALLOC_ID_BASE}); an operator-supplied control \
+                         voter id must stay below it"
+                    ));
+                }
+                (node, false)
+            }
+            None => {
+                // Env-seam-compliant nonce (see this method's own doc above
+                // for why `generate_join_nonce`'s OS-randomness exception
+                // does not apply here): two `u64`s concatenated give the same
+                // 128 bits of practical uniqueness a join nonce needs, at no
+                // cost since `next_u64` is cheap and this call isn't hot path.
+                let nonce = format!(
+                    "{:016x}{:016x}",
+                    leader.env().next_u64(),
+                    leader.env().next_u64()
+                );
+                let node = match self.allocate_node_id(nonce, labels).await {
+                    ClientResponse::NodeIdAllocated { node } => node,
+                    ClientResponse::Error(e) => return Err(e),
+                    other => {
+                        return Err(format!(
+                            "unexpected reply allocating a control-member id: {other:?}"
+                        ));
+                    }
+                };
+                (node, true)
+            }
         };
         let current = self.control.config().unwrap_or_default();
         if current.contains(&node) {
@@ -4529,10 +4586,10 @@ impl ClientCtx {
                 addrs.control = Some(addr);
                 let _ = leader.propose(MetaCommand::RegisterNodeAddrs { node, addrs });
             }
-            return Ok(());
+            return Ok(node);
         }
         let meta = self.control.metadata_cached();
-        if meta.members.contains_key(&node) {
+        if !minted && meta.members.contains_key(&node) {
             return Err(format!(
                 "node {node} already exists as a cluster member (data-plane, \
                  control-core, or previously allocated); pick a different id"
@@ -4540,12 +4597,13 @@ impl ClientCtx {
         }
         // Merge into whatever address-book entry already exists for `node`
         // (e.g. a self-registration this same process already made for its
-        // client/admin addresses) rather than blindly overwriting it, then
-        // stamp `control` — the field this action exists to populate (ADR
-        // 0037 PR4): replicated so every control-role node's own
-        // `control_peer_sync_loop` can reach the new voter, not just this
-        // leader's own env (see `ProdEnv::merge_peer`'s doc for the gap this
-        // closes).
+        // client/admin addresses, or — for a minted id — the `Down`, address-
+        // less `Member` row `AllocateNodeId`'s own apply just inserted)
+        // rather than blindly overwriting it, then stamp `control` — the
+        // field this action exists to populate (ADR 0037 PR4): replicated so
+        // every control-role node's own `control_peer_sync_loop` can reach
+        // the new voter, not just this leader's own env (see
+        // `ProdEnv::merge_peer`'s doc for the gap this closes).
         let mut addrs = meta.node_addrs.get(&node).cloned().unwrap_or(NodeAddrs {
             raftkv: String::new(),
             client: String::new(),
@@ -4564,7 +4622,7 @@ impl ClientCtx {
         let mut voters = current;
         voters.insert(node);
         match leader.change_membership(voters) {
-            ProposeResult::Accepted { .. } => Ok(()),
+            ProposeResult::Accepted { .. } => Ok(node),
             ProposeResult::NotLeader { .. } => Err(
                 "control leadership moved, or a membership change is already in \
                  flight; the address book was updated (retry-safe) but the voter \

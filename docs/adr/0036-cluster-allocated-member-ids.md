@@ -1,7 +1,9 @@
 # ADR 0036 — Cluster-allocated member ids
 
-- **Status:** Accepted — implemented. Amended by nothing yet; amends nothing
-  (purely additive to ADR 0032).
+- **Status:** Accepted — implemented. Amends nothing (purely additive to ADR
+  0032). Amended by ADR 0037's hardening trio PR 3, which wires this
+  allocator into `control-add` — see this doc's "Follow-on work" section
+  below for the pointer.
 - **Date:** 2026-08-10
 
 ## Context
@@ -207,3 +209,11 @@ using `--node I`.
   control voter instead of a permanent non-voter; a system keyspace (a
   future ADR) could expose `node_id_allocations`/`next_alloc_id` as queryable
   rows instead of only through `/admin/status`'s raw `Metadata` dump.
+
+  **Done: control-plane membership change (ADR 0037) landed and its own
+  hardening trio's PR 3 wires this allocator into `POST
+  /admin/control/member/add`** — `node` is optional; omitted, it mints from
+  this same allocator instead of requiring an operator-chosen id (with the
+  member-collision and `ALLOC_ID_BASE` refusals skipped only for the id it
+  just minted). See ADR 0037's "Coordination with ADR 0036" section for the
+  mechanism. The system-keyspace half of this bullet remains open.

@@ -64,7 +64,8 @@ drain <admin-addr> <node-id>                   # ADR 0029/0032 release replicas
 drain-status <admin-addr> <node-id>
 remove <admin-addr> <node-id>
 decommission <admin-addr> <node-id> [--force-control-remove]  # composite, see below (ADR 0037 PR4)
-control-add <leader-admin-addr> <node-id> <new-node-admin-addr>      # ADR 0037 PR3
+control-add <leader-admin-addr> <node-id> <new-node-admin-addr>      # ADR 0037 PR3 (operator-supplied id)
+control-add <leader-admin-addr> <new-node-control-addr>              # hardening PR3 (allocator-minted id)
 control-remove <leader-admin-addr> <node-id> [--force]               # ADR 0037 PR3; --force: hardening PR2
 control-grow <leader-admin-addr> <node-id> <admin-addr> [<node-id> <admin-addr>...]
 ```
@@ -91,17 +92,31 @@ control-grow <leader-admin-addr> <node-id> <admin-addr> [<node-id> <admin-addr>.
   (`animusd`) — this is a friendlier, fail-fast CLI-side mirror of it, not a
   replacement.
 - **`control-add`/`control-grow` are also orchestration, not passthroughs**
-  (ADR 0037 PR3): they take the new control voter's own **admin** address
-  (this CLI's convention everywhere else), not the internal control-Raft
-  address `POST /admin/control/member/add`'s wire payload actually wants —
-  `run_control_add` bridges the two itself via a `GET /admin/config` against
-  the new node (which doubles as the "confirm it's up" liveness check), then
-  polls the **new node's own** `/admin/control/members` until it reports
-  itself a voter. `control-grow` is a sequential loop of `control-add` calls
-  (one server at a time — `RaftCore::change_membership` never accepts a
+  (ADR 0037 PR3): the operator-supplied-id form (3 args) takes the new
+  control voter's own **admin** address (this CLI's convention everywhere
+  else), not the internal control-Raft address `POST
+  /admin/control/member/add`'s wire payload actually wants — `run_control_add`
+  bridges the two itself via a `GET /admin/config` against the new node
+  (which doubles as the "confirm it's up" liveness check), then polls the
+  **new node's own** `/admin/control/members` until it reports itself a
+  voter. `control-grow` is a sequential loop of `control-add` calls (one
+  server at a time — `RaftCore::change_membership` never accepts a
   multi-server delta), each waiting for its own catch-up before the next.
   `control-add`/`control-remove`/`control-grow` all target the **leader's**
   admin address, same "not relayed" discipline as `decommission`.
+- **`control-add` also has a 2-arg, allocator-minted-id form** (the ADR 0037
+  hardening trio's PR3, closing ADR 0037's own "Coordination with ADR 0036"
+  deferral — locked decision: disambiguate by **arity**, no `--auto` flag):
+  `control-add <leader-admin-addr> <new-node-control-addr>` — note the single
+  positional here is the new voter's **internal control-Raft** address
+  directly, *not* an admin address to resolve via `/admin/config` like the
+  3-arg form: there is no id yet to look a running node up by (the id is
+  minted server-side, inside the same admin call, from the ADR 0036
+  allocator — `run_control_add_allocated`). It prints the minted id and
+  returns — there is no known admin port to poll for catch-up convergence,
+  since the physical process at that address may not even be running yet:
+  the operator's next step is to start it there with `--node <minted-id>`.
+  `run_control_add`'s own operator-supplied form is unchanged.
 - **`control-remove ... [--force]` (ADR 0037 hardening PR2, PR #136, the quorum-guard
   liveness fix)**: the server now refuses a removal that would leave fewer
   than a majority of the *resulting* voters reachable (per

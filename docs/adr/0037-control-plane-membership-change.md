@@ -219,6 +219,25 @@ control voter instead of a permanent non-voter." Wiring `control-add` to mint
 its id from the same allocator (rather than requiring an operator-chosen one)
 is future work, not solved twice here.
 
+**Update: closed by the ADR 0037 hardening trio's PR 3.** `POST
+/admin/control/member/add`'s `node` is now `Option<NodeId>`
+(`#[serde(default)]`): `Some(id)` is byte-for-byte the original behavior
+(all three refusals, including the at/above-`ALLOC_ID_BASE` one, still
+apply — an operator-supplied id can never target the allocated range);
+`None` mints a fresh id from the same `MetaCommand::AllocateNodeId` this
+ADR's own coordination gap named, via the private `allocate_node_id` helper
+the wire-level join path already used, with the member-collision and
+`ALLOC_ID_BASE` checks skipped *only* for the id it just minted (they would
+otherwise reject the allocator's own output). CLI: `animus admin control-add`
+disambiguates the two forms by **arity** — `control-add <leader-admin-addr>
+<new-node-control-addr>` (2 args, allocator-minted) alongside the unchanged
+3-arg operator-supplied form. See `crates/animusd/CLAUDE.md`'s
+"Control-plane membership change" entry and `docs/engineering-lessons.md`'s
+closure entry for the mechanism and the mint-then-bind ordering lesson this
+surfaced (an operator brings the new process up *after* the mint, not
+before — the reverse of the operator-supplied form's `GET /admin/config`
+liveness-check order).
+
 ## Non-goals
 
 - **Joint/multi-server config changes.** Single-server-at-a-time only, same
@@ -249,7 +268,8 @@ is future work, not solved twice here.
   gotcha, and `docs/engineering-lessons.md`'s two closed entries for the
   mechanism, the consumer, and the general lesson.
 - **Wiring ADR 0036's allocator into `control-add`.** See "Coordination with
-  ADR 0036" above.
+  ADR 0036" above. **Update: closed by the ADR 0037 hardening trio's PR 3** —
+  see that section's own "Update" paragraph.
 - **Fixing `heartbeat_loop`'s static destination list.** See "Known
   deferrals" below. **Update: closed by PR #134** — see that deferral's own
   "Update" paragraph for the fix (which turned out to be two parts, not one).

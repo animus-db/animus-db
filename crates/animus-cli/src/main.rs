@@ -48,7 +48,8 @@ const ADMIN_USAGE: &str = "  admin <subcommand> <admin-addr> [args]:\n    \
     drain-status <admin-addr> <node-id>\n    \
     remove <admin-addr> <node-id>\n    \
     decommission <admin-addr> <node-id> [--force-control-remove]\n    \
-    control-add <leader-admin-addr> <node-id> <new-node-admin-addr>\n    \
+    control-add <leader-admin-addr> <new-node-admin-addr>                    (allocator-minted id)\n    \
+    control-add <leader-admin-addr> <node-id> <new-node-admin-addr>         (operator-supplied id)\n    \
     control-remove <leader-admin-addr> <node-id> [--force]\n    \
     control-grow <leader-admin-addr> <node-id> <admin-addr> [<node-id> <admin-addr>...]";
 
@@ -128,13 +129,26 @@ async fn run_admin(args: &[String]) -> Result<(), String> {
     // orchestration (an address lookup + a catch-up poll, or a sequential
     // one-at-a-time loop), not a single request/response, so they too are
     // handled before the generic one-shot dispatch below.
+    //
+    // `control-add` disambiguates its two forms by **arity** (ADR 0037
+    // hardening trio's PR3, locked decision — no `--auto` flag): exactly one
+    // trailing arg is the allocator-minted-id form (`<new-node-admin-addr>`
+    // only); exactly two is the operator-supplied-id form (`<node-id>
+    // <new-node-admin-addr>`), unchanged from before this PR.
     if sub == "control-add" {
-        let node: u64 = arg(2)
-            .ok_or("control-add needs <node-id>")?
-            .parse()
-            .map_err(|_| "node id must be a number")?;
-        let new_node_admin_addr = arg(3).ok_or("control-add needs <new-node-admin-addr>")?;
-        return run_control_add(addr, node, new_node_admin_addr).await;
+        let rest = &args[2..];
+        return match rest.len() {
+            1 => run_control_add_allocated(addr, &rest[0]).await,
+            2 => {
+                let node: u64 = rest[0].parse().map_err(|_| "node id must be a number")?;
+                run_control_add(addr, node, &rest[1]).await
+            }
+            _ => Err(
+                "control-add needs <new-node-admin-addr> (allocator-minted id) or \
+                 <node-id> <new-node-admin-addr> (operator-supplied id)"
+                    .into(),
+            ),
+        };
     }
     if sub == "control-remove" {
         let node: u64 = arg(2)
@@ -414,7 +428,9 @@ async fn run_decommission(
 }
 
 /// `animus admin control-add <leader-admin-addr> <node-id> <new-node-admin-addr>`
-/// (ADR 0037 PR3): grow the control group by one voter. This CLI speaks in
+/// (ADR 0037 PR3, the **operator-supplied-id** form — see [`run_admin`]'s
+/// arity dispatch and [`run_control_add_allocated`] for the allocator-minted
+/// sibling): grow the control group by one voter. This CLI speaks in
 /// **admin** addresses everywhere else, so `<new-node-admin-addr>` is that —
 /// not the internal control-Raft address `POST /admin/control/member/add`'s
 /// wire payload actually wants. This resolves the difference itself: a `GET
@@ -477,6 +493,50 @@ async fn run_control_add(
         }
         sleep(Duration::from_millis(200)).await;
     }
+}
+
+/// `animus admin control-add <leader-admin-addr> <new-node-control-addr>`
+/// (ADR 0037 hardening trio's PR3, the **allocator-minted-id** form — 2 args,
+/// disambiguated by arity in [`run_admin`]'s dispatch, locked decision: no
+/// `--auto` flag). Unlike [`run_control_add`]'s operator-supplied form, there
+/// is no id yet to look a running node up by, so this skips the
+/// `GET /admin/config` liveness/address-resolution step entirely: `addr` goes
+/// straight into the request as the new voter's internal control-Raft listen
+/// address, and the control plane mints a fresh id from its own ADR 0036
+/// allocator (`POST /admin/control/member/add` with `node` omitted), then
+/// registers `addr` for it and adds it as a voter — same one-call semantics
+/// as the operator-supplied form, just with the id decided server-side.
+/// Prints the minted id and returns — there is no known admin port to poll
+/// for catch-up convergence (the physical process at `addr` may not even be
+/// running yet by design: the operator's next step is to start it there
+/// configured with `--node <minted-id>`, at which point it starts replicating
+/// like any other freshly-added voter).
+async fn run_control_add_allocated(
+    leader_admin_addr: &str,
+    new_node_control_addr: &str,
+) -> Result<(), String> {
+    let body = serde_json::json!({"addr": new_node_control_addr}).to_string();
+    let (status, resp) = http_call(
+        leader_admin_addr,
+        "POST",
+        "/admin/control/member/add",
+        Some(body),
+    )
+    .await?;
+    if !(200..300).contains(&status) {
+        return Err(format!("control/member/add failed (HTTP {status}): {resp}"));
+    }
+    let v: serde_json::Value = serde_json::from_str(&resp)
+        .map_err(|e| format!("malformed control/member/add response: {e}"))?;
+    let node = v["node"]
+        .as_u64()
+        .ok_or("control/member/add response missing `node`")?;
+    println!(
+        "allocated control voter id {node} for {new_node_control_addr}; \
+         start the new node's process there configured with --node {node} \
+         to complete the join"
+    );
+    Ok(())
 }
 
 /// `animus admin control-remove <leader-admin-addr> <node-id> [--force]`

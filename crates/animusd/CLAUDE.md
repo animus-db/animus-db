@@ -668,6 +668,42 @@ route below the edge through the same `ClientCtx` CP primitives.
   returns the same not-leader refusal every other case here uses (never a
   silent success) rather than trying to complete the removal itself once it
   has stepped down.
+
+  **Update (ADR 0037 hardening trio's PR3): the ADR 0036 allocator is now
+  wired into `control-add`**, closing the "Coordination with ADR 0036"
+  deferral above. `AddControlMemberReq.node` (`admin.rs`) is now
+  `Option<NodeId>` (`#[serde(default)]`); `admin_add_control_member`'s
+  signature is now `(node: Option<NodeId>, addr, labels) -> Result<NodeId,
+  String>` — `Some(id)` is byte-for-byte the old behavior (all three
+  refusals, including "at/above `ALLOC_ID_BASE`," still apply — an
+  operator-supplied id can never target the allocated range, full stop);
+  `None` draws a fresh nonce from `leader.env().next_u64()` (**not**
+  `generate_join_nonce`'s deliberate OS-randomness exception — this method
+  runs in-process on a live leader a `SimEnv` test can and does drive, so the
+  `Env`-seam rule applies here with no exception to invoke), mints via the
+  same private `allocate_node_id` helper the wire-level join path already
+  uses, then proceeds through the identical address-registration +
+  `change_membership` tail with the member-collision and `ALLOC_ID_BASE`
+  checks **skipped** for the minted id (they would reject the allocator's own
+  output — `AllocateNodeId`'s apply already inserted the `Down` `Member` row
+  as part of minting). The response's `"node"` is the effective id either
+  way. CLI: `control-add` disambiguates by **arity** (locked decision, no
+  `--auto` flag) — `control-add <leader-admin-addr> <new-node-admin-addr>`
+  (2 args, allocator-minted, `run_control_add_allocated`) alongside the
+  unchanged `control-add <leader-admin-addr> <node-id> <new-node-admin-addr>`
+  (3 args, operator-supplied, `run_control_add`) — see
+  `animus-cli/CLAUDE.md`'s own entry for why the 2-arg form's single
+  positional is a raw control-Raft address, not an admin address to resolve.
+  Regression: `tests/control_membership_admin.rs::
+  omitted_node_add_mints_an_id_and_converges_to_a_live_voter` +
+  `concurrent_omitted_node_adds_mint_distinct_ids_and_both_become_voters` (two
+  concurrent omitted-node adds each mint without colliding — the allocator
+  itself is not the contended resource — but their `change_membership` calls
+  race like any other pair; the loser's own minted id is left as an
+  orphaned/abandoned `Down` member, accepted ADR 0036 semantics, while a
+  retried omitted-node call mints a second, distinct id that becomes a
+  voter) + `add_control_member_collision_shapes`'s third case (manual
+  targeting of the allocated range still refused).
 - **The CP group is durable by default** — one shared `LsmEngine` over the raftkv
   env, cloned into every tablet's `RaftKvNode`; acked writes survive restart. Files
   use a flat filename prefix (`LSM_PREFIX = "db-"`), not a subdirectory (`ProdEnv`'s
