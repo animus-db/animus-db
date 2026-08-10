@@ -6,7 +6,19 @@
   now wired into every real CP write path** (`animusd`'s
   `cp_put_local`/`cp_delete_local`/`cp_batch_propose`, 2026-08-07) — see the
   note at the end of §3 below; they were merged additively but had zero
-  production callers until this fix.
+  production callers until this fix. **2026-08-10 correction to "What drop-table
+  GC does instead of deleting files" and the "shares one engine's write path"
+  consequence below**: "multiple independent version streams sharing one
+  engine" is safe **only as long as a stream never starts serving a key
+  another stream already versioned, without a floor** — a gap this ADR did
+  not call out, confirmed real and fixed (`animus_tablet::Tablet::
+  version_floor`, root `CLAUDE.md`'s cross-group-LWW entry). A split's fresh
+  sibling group's own Raft log index restarts low/independent, so it could
+  otherwise carry a version no higher than what the *source* group already
+  stamped for a key now in the sibling's range, and per-key LWW would
+  silently drop the overwrite. The two in-text notes below are otherwise
+  unchanged (this is additive, not a retraction — `merge`/`merge_tombstone`
+  still have no *engine-wide* monotonic floor, and still shouldn't).
 - **Date:** 2026-08-07
 
 ## Context

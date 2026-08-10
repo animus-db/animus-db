@@ -115,9 +115,35 @@ Three modules:
 
 State once here; cross-referenced from the sections below.
 
-- **The Raft log index is the MVCC version.** Apply uses `index` as the engine
-  `version`, so per-key LWW reproduces the agreed Raft total order, and
-  re-applying on recovery is idempotent.
+- **The Raft log index is the MVCC version — scaled by this group's own
+  `version_floor` (cross-group LWW fix, confirmed real; full writeup in
+  `docs/engineering-lessons.md`).** Apply computes
+  `effective_version(floor, index) = floor * VERSION_FLOOR_SCALE + index`
+  (`VERSION_FLOOR_SCALE = 2^40`) and stamps *that* as the engine `version` at
+  all four apply sites (`Put`/`Batch`/`Delete`/`Cas`) — never the raw `index`
+  directly, so per-key LWW reproduces the agreed Raft total order and
+  re-applying on recovery stays idempotent (the same command always computes
+  the same `effective_version`). `floor` (`0` for a tablet that has never
+  been split/merged — byte-identical to using the raw index) closes a real
+  hazard: every tablet on a node shares one physical `StorageEngine`
+  (ADR 0026/0028), so a **fresh** group's own log index restarting low could
+  carry a version no higher than what a *different* group (the split source,
+  or an absorbed merge sibling) already stamped for the same key — and
+  per-key LWW (`StorageEngine::merge`) would silently drop the write.
+  `RaftKvNode::start_hosted_with_floor` seeds a fresh group's floor at
+  construction (`start_hosted`/`start`/`start_scoped`/`start_with_metrics`
+  all default to `0`, unchanged); `bump_version_floor` (a `fetch_max`,
+  mirroring `narrow_scope`/`widen_scope`'s one-directional shape) raises an
+  **already-running** group's floor for the merge-survivor case, called by
+  the reconciler alongside `widen_scope` for the same `WidenScope` action.
+  Both read `animus_tablet::Tablet::version_floor` — computed once by the
+  control plane's `SplitTablet`/`MergeTablets` apply, so every replica
+  converges on the identical value with no live per-replica computation.
+  `engine_applied` and the group's own Raft log-matching are untouched — only
+  the *storage-layer version number* a command stamps changes. Regression:
+  `tests/cross_group_lww.rs` (reproduces the hazard with an un-seeded
+  fresh/widened group, then proves the seeded/bumped variant keeps the write,
+  for both the split and merge shape).
 - **CAS is decided at *apply* time, not propose time** — this is what makes it
   linearizable and contention-correct. `RaftCore` agrees only the order; `Cas`
   rides through as opaque data. Apply evaluates it in commit order against the
@@ -231,8 +257,8 @@ Emitted in this fixed order: `NarrowScope`/`WidenScope` → `Host` →
 | Action | What it does |
 |--------|--------------|
 | `NarrowScope` | Narrow an already-hosted tablet's scope to its current metadata range — provably narrow-only (`is_subrange`). |
-| `WidenScope` | ADR 0033 dual: widen when the metadata range *grew* (the surviving `left` of a `MergeTablets`) — provably widen-only. A range neither subset nor superset of the live scope is a defensive no-op, never guessed. Deferred while an absorb is pending (see Key invariants). |
-| `Host` | Stand up a fresh/joining/restarting tablet via `start_hosted`, with full or others-only config (`animusd::cp_join_host`'s exact decision). |
+| `WidenScope` | ADR 0033 dual: widen when the metadata range *grew* (the surviving `left` of a `MergeTablets`) — provably widen-only. A range neither subset nor superset of the live scope is a defensive no-op, never guessed. Deferred while an absorb is pending (see Key invariants). Also carries `version_floor` (read off `Tablet::version_floor`) so the executor bumps the survivor's cross-group LWW floor in the same pass (see the MVCC-version invariant above). |
+| `Host` | Stand up a fresh/joining/restarting tablet via `start_hosted`, with full or others-only config (`animusd::cp_join_host`'s exact decision). Carries `version_floor` (read off `Tablet::version_floor`) to seed the group's cross-group LWW floor (see the MVCC-version invariant above). |
 | `Reconfigure` | One `reconfigure_step` toward the desired replica set, for every tablet this node leads, carrying the down-set. Replanned every tick a node leads a group (a no-op once matched). |
 | `Release` | Tear down a tablet moved off this node, gated by `RELEASE_CONFIRM_TICKS` consecutive confirming calls at an unchanged epoch (the ADR 0029 dampener). Erases up to `erase_bound`, which is **always the tablet's current metadata range**, never a `TabletFacts::scope_range` fact — the sibling-sparing invariant this redesign makes structural. |
 | `Reclaim` | Tear down a tablet whose whole table was dropped; erases. |
