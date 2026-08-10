@@ -731,6 +731,10 @@ fn is_relayable_command(command: &MetaCommand) -> bool {
 }
 
 /// A node's reply to a [`ClientRequest`].
+// `Status` carries a whole `Metadata` by design (it IS the metadata reply);
+// the size skew vs. unit-ish variants is inherent to the wire protocol, and a
+// response is built, serialized, and dropped — never stored in bulk.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ClientResponse {
     /// Cached cluster metadata (membership + tablet map), plus (ADR 0035 §1)
