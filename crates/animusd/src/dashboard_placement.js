@@ -70,7 +70,9 @@ function renderPlacement() {
     return;
   }
   const forNode = tabletsForNode(placementSelectedNode, tablets, groups);
-  $("pl-node-title").textContent = `Tablets on node ${placementSelectedNode}`;
+  const selNode = nodeByRaftkv(placementSelectedNode);
+  $("pl-node-title").innerHTML = `Tablets on node ${esc(placementSelectedNode)}
+    ${consoleLink(selNode && selNode.ok ? selNode.base : null, placementSelectedNode)}`;
   $("pl-node-tablets").innerHTML = forNode.length ? `<table>
     <thead><tr><th>Tablet</th><th>Table</th><th>Role</th><th>Status</th></tr></thead>
     <tbody>${forNode.map((t) => `<tr class="clickable" data-tablet="${esc(t.id)}">

@@ -1218,7 +1218,15 @@ CLI wrapper. `animus-cli` depends on this crate for the client protocol types.
       it only ever iterated `Metadata.members`, which a control-only node is
       never a part of — see the crate's "the cluster's members are the CP
       raftkv nodes" entry above — so a control node was invisible anywhere
-      in the dashboard), tagging each row with its role. Finding this
+      in the dashboard), tagging each row with its role. A follow-up
+      (2026-08-10) renders the two kinds as separate "Control plane" /
+      "Data nodes" groups when any control-only node exists (a combined-mode
+      cluster keeps the single flat list, byte-identical), and gives every
+      reachable node's row — plus the Placement view's selected-node detail
+      header — a `consoleLink()` (`dashboard_core.js`) to that node's OWN
+      admin console, built from the `base` origin the `/admin/peers` fan-out
+      already resolved (empty for this page's own origin — a self-link is
+      noise). Finding this
       surfaced a **real, pre-existing latent bug**: the "control leader"
       label (the health banner and the "Control plane" stat tile) resolved
       the leader's display id via `nodeRaftkvId`, which returns the node's
