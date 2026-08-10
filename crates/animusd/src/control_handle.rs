@@ -25,6 +25,7 @@ use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
+use animus_control::mirror::{self, KeyWrite};
 use animus_control::{Metadata, MetadataWatch, RaftNode, Role};
 use animus_env::{MetricsHandle, NodeId, ProdEnv};
 
@@ -263,6 +264,14 @@ impl RemoteControlClient {
     /// The leader hint is taken unconditionally regardless — it self-heals
     /// independently (see the type doc) and isn't a snapshot whose *content*
     /// can regress the same way.
+    ///
+    /// The whole check-then-mutate-then-bump sequence runs under `mirror`'s
+    /// own lock (ADR 0038 PR5 tightening — previously the `watermark >=
+    /// watch.latest()` check and the mutation that followed it were two
+    /// separate steps, racy against a concurrent [`observe_delta`] call
+    /// applying a delta computed against a *different* `last_seen` basis; see
+    /// that method's doc for why a delta apply needs this to be atomic in a
+    /// way a full replace never did).
     pub(crate) fn observe(
         &self,
         metadata: Metadata,
@@ -273,14 +282,70 @@ impl RemoteControlClient {
         if let Some(hint) = leader_hint {
             *self.leader_hint.lock().expect("leader hint poisoned") = Some(hint);
         }
+        let mut cached = self.mirror.lock().expect("remote control mirror poisoned");
         if watermark >= self.watch.latest() {
-            *self.mirror.lock().expect("remote control mirror poisoned") = Some(metadata);
+            *cached = Some(metadata);
             *self
                 .control_voters
                 .lock()
                 .expect("remote control-voters poisoned") = Some(control_voters);
             self.watch.bump(watermark);
         }
+    }
+
+    /// The incremental counterpart to [`observe`](Self::observe) (ADR 0038
+    /// PR5): install a `WatchMetadata` [`ClientResponse::MetadataDelta`]
+    /// reply's [`KeyWrite`]s onto this handle's own cached `Metadata` via
+    /// [`mirror::apply_key_write`], never replaying a `MetaCommand` itself —
+    /// this crate carries no control-plane business logic to do that
+    /// correctly, by design (see that request variant's doc).
+    ///
+    /// `last_seen` is the exact watermark this delta was requested relative
+    /// to (i.e. what [`metadata_watch`](Self::metadata_watch)`.latest()` was
+    /// *when the request was sent*), not merely "some watermark `<=
+    /// watermark`": applying a delta is a **sequential** operation — unlike
+    /// [`observe`](Self::observe)'s full replace, which is order-independent
+    /// modulo the monotonic watermark guard, installing `(last_seen,
+    /// watermark]`'s writes is only correct if the cached `Metadata` this
+    /// handle currently holds is *exactly* the state as of `last_seen`. A
+    /// concurrent [`observe`](Self::observe)/`observe_delta` call (this
+    /// handle is shared — `metadata_fresh()` and the background watch loop
+    /// both drive it) can move the mirror past `last_seen` before this reply
+    /// lands; detected here as `self.watch.latest() != last_seen` and
+    /// **dropped** rather than mis-applied — a false negative here just
+    /// means the next long-poll iteration re-requests with the
+    /// now-corrected `last_seen` (self-healing, no correctness impact, at
+    /// most one extra round trip). Returns whether the delta was applied
+    /// (test/observability only — the caller has nothing else to do either
+    /// way, since the watch loop's next iteration reads the current
+    /// `last_seen` fresh regardless of outcome).
+    pub(crate) fn observe_delta(
+        &self,
+        last_seen: u64,
+        writes: &[KeyWrite],
+        leader_hint: Option<(NodeId, SocketAddr)>,
+        watermark: u64,
+        control_voters: BTreeSet<NodeId>,
+    ) -> bool {
+        if let Some(hint) = leader_hint {
+            *self.leader_hint.lock().expect("leader hint poisoned") = Some(hint);
+        }
+        let mut cached = self.mirror.lock().expect("remote control mirror poisoned");
+        if self.watch.latest() != last_seen {
+            // Stale relative to a concurrent update — see the doc above.
+            return false;
+        }
+        let mut meta = cached.clone().unwrap_or_default();
+        for write in writes {
+            mirror::apply_key_write(&mut meta, write);
+        }
+        *cached = Some(meta);
+        *self
+            .control_voters
+            .lock()
+            .expect("remote control-voters poisoned") = Some(control_voters);
+        self.watch.bump(watermark);
+        true
     }
 
     /// A live, leader-directed `Status` fetch (ADR 0035 §1): try the current

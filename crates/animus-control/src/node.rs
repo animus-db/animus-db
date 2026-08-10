@@ -16,6 +16,7 @@ use futures::future::{Either, select};
 use futures::lock::Mutex as AsyncMutex;
 use futures::task::AtomicWaker;
 
+use crate::delta_ring::DeltaRing;
 use crate::detector::FailureDetector;
 use crate::meta::{Member, MetaCommand, Metadata, NodeStatus, PlacementView};
 use crate::mirror::{self, KeyWrite};
@@ -176,6 +177,19 @@ impl Future for MetadataChanged<'_> {
     }
 }
 
+/// The reply to [`RaftNode::watch_delta_since`] (ADR 0038 PR5) — a
+/// `WatchMetadata` caller whose `last_seen` the delta ring still covers gets
+/// this instead of a full `Metadata` clone: `writes` is empty exactly when
+/// `watermark == last_seen` (the timeout-elapsed, nothing-changed case).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeltaReply {
+    /// The [`KeyWrite`]s committed strictly after the caller's `last_seen`,
+    /// up to and including `watermark`, in commit order.
+    pub writes: Vec<KeyWrite>,
+    /// The new watermark to pass back as the next call's `last_seen`.
+    pub watermark: u64,
+}
+
 /// A running control-plane node. Cheap to clone; clones share one [`RaftCore`]
 /// and one [`FailureDetector`].
 #[derive(Clone)]
@@ -197,6 +211,15 @@ pub struct RaftNode<E: Env> {
     /// `metadata_watch()`), never the core's `last_applied` (which the apply
     /// task lags).
     engine_applied: Arc<AtomicU64>,
+    /// The apply task's bounded, best-effort ring of per-command
+    /// [`KeyWrite`] deltas (ADR 0038 PR5), keyed by Raft log index — the
+    /// incremental half of [`watch_delta_since`](Self::watch_delta_since).
+    /// The apply task ([`meta_apply_loop`]) is its sole writer: it pushes
+    /// one entry per drained command, in the same pass that publishes
+    /// `cache`/bumps `engine_applied`, and [`DeltaRing::clear`]s it whenever
+    /// `cache` was just rebuilt from a jump the ring itself didn't witness
+    /// (a received `InstallSnapshot`, or this task's own startup rebuild).
+    delta_ring: Arc<Mutex<DeltaRing>>,
     /// Shared heartbeat failure detector (ADR 0012). The driver feeds it observed
     /// heartbeats; the `detect_loop` reads it and, when leader, proposes liveness
     /// transitions. Shared so both run against one view.
@@ -243,12 +266,32 @@ impl<E: Env> RaftNode<E> {
     /// handle instead of `env.metrics()`. Additive (existing callers use
     /// `start`); the sim observability test threads in a recording handle here so
     /// it can read counters back without editing `animus-sim`, and integration
-    /// can pass `env.metrics()` (or any chosen sink) explicitly.
+    /// can pass `env.metrics()` (or any chosen sink) explicitly. Uses the
+    /// default delta-ring bounds ([`crate::delta_ring::DEFAULT_MAX_ENTRIES`]/
+    /// [`crate::delta_ring::DEFAULT_MAX_BYTES`]) — see
+    /// [`start_with_ring_bounds`](Self::start_with_ring_bounds) for a caller
+    /// that wants different ones.
     pub fn start_with_metrics<S: StorageEngine + 'static>(
         env: E,
         all_nodes: Vec<NodeId>,
         metrics: MetricsHandle,
         engine: S,
+    ) -> Self {
+        Self::start_with_ring_bounds(env, all_nodes, metrics, engine, DeltaRing::default())
+    }
+
+    /// Like [`start_with_metrics`](Self::start_with_metrics), but with an
+    /// explicit [`DeltaRing`] (ADR 0038 PR5) instead of the default bounds —
+    /// the "configurable" half of the ring's design; a test proving
+    /// eviction/fallback behavior without pushing thousands of entries
+    /// constructs a small-bounded [`DeltaRing::with_bounds`] and passes it
+    /// here.
+    pub fn start_with_ring_bounds<S: StorageEngine + 'static>(
+        env: E,
+        all_nodes: Vec<NodeId>,
+        metrics: MetricsHandle,
+        engine: S,
+        delta_ring: DeltaRing,
     ) -> Self {
         let core = Arc::new(Mutex::new(RaftCore::new(
             env.node_id(),
@@ -260,12 +303,14 @@ impl<E: Env> RaftNode<E> {
         let watch = MetadataWatch::default();
         let cache = Arc::new(Mutex::new(Metadata::default()));
         let engine_applied = Arc::new(AtomicU64::new(0));
+        let delta_ring = Arc::new(Mutex::new(delta_ring));
         let wal_lock = Arc::new(AsyncMutex::new(()));
         let node = Self {
             env: env.clone(),
             core: Arc::clone(&core),
             cache: Arc::clone(&cache),
             engine_applied: Arc::clone(&engine_applied),
+            delta_ring: Arc::clone(&delta_ring),
             detector: Arc::clone(&detector),
             watch: watch.clone(),
             wal_lock: Arc::clone(&wal_lock),
@@ -281,6 +326,7 @@ impl<E: Env> RaftNode<E> {
             engine,
             Arc::clone(&cache),
             engine_applied,
+            delta_ring,
             wal_lock,
         ));
         // The placement reconciler runs alongside the driver; it only ever
@@ -311,6 +357,40 @@ impl<E: Env> RaftNode<E> {
     #[must_use]
     pub fn engine_applied_index(&self) -> u64 {
         self.engine_applied.load(Ordering::Acquire)
+    }
+
+    /// The incremental half of `WatchMetadata` (ADR 0038 PR5): the
+    /// [`KeyWrite`]s committed strictly after `last_seen` up to this node's
+    /// current [`engine_applied_index`](Self::engine_applied_index), or
+    /// `None` if this node's own [`DeltaRing`] doesn't (or no longer)
+    /// contiguously cover that range — telling the caller (`animusd`'s
+    /// `ClientCtx::watch_metadata`) to fall back to a full `metadata()`
+    /// clone instead (mirroring the log-tail-vs-`InstallSnapshot` fallback
+    /// shape this plane already has). Cheap even when nothing changed: the
+    /// trivial `last_seen == current` case never touches the ring lock's
+    /// contents, just `Vec::new()`.
+    ///
+    /// `last_seen` is read against `engine_applied_index()` first (the
+    /// authoritative "current" value, published by the same apply-task pass
+    /// that fed the ring) rather than the ring's own last entry — so a
+    /// narrow race where the ring lags one push behind a just-observed
+    /// `engine_applied` bump degrades to a safe `None` (full-fetch fallback)
+    /// rather than under-reporting.
+    #[must_use]
+    pub fn watch_delta_since(&self, last_seen: u64) -> Option<DeltaReply> {
+        let current = self.engine_applied_index();
+        if last_seen >= current {
+            return Some(DeltaReply {
+                writes: Vec::new(),
+                watermark: current,
+            });
+        }
+        let ring = self.delta_ring.lock().expect("delta ring poisoned");
+        let writes = ring.writes_since(last_seen, current)?;
+        Some(DeltaReply {
+            writes,
+            watermark: current,
+        })
     }
 
     /// Propose a metadata command. See [`ProposeResult`].
@@ -533,6 +613,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(
     engine: S,
     cache: Arc<Mutex<Metadata>>,
     engine_applied: Arc<AtomicU64>,
+    delta_ring: Arc<Mutex<DeltaRing>>,
     wal_lock: Arc<AsyncMutex<()>>,
 ) {
     // Recover from the WAL before serving anything.
@@ -558,6 +639,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(
         engine,
         cache,
         engine_applied,
+        delta_ring,
         watch,
         Arc::clone(&wal_lock),
     ));
@@ -662,12 +744,14 @@ async fn drive<E: Env, S: StorageEngine + 'static>(
 /// [`APPLY_IDLE_POLL`] only when idle; under load it stays in lockstep behind
 /// commit. Mirrors `animus-cp-data`'s `apply_loop`/`apply_and_compact` split
 /// exactly, retargeted at the system keyspace instead of a per-tablet range.
+#[allow(clippy::too_many_arguments)]
 async fn meta_apply_loop<E: Env, S: StorageEngine>(
     env: E,
     core: Arc<Mutex<RaftCore>>,
     engine: S,
     cache: Arc<Mutex<Metadata>>,
     engine_applied: Arc<AtomicU64>,
+    delta_ring: Arc<Mutex<DeltaRing>>,
     watch: MetadataWatch,
     wal_lock: Arc<AsyncMutex<()>>,
 ) {
@@ -681,6 +765,12 @@ async fn meta_apply_loop<E: Env, S: StorageEngine>(
     // watermark here is what lets the loop below replay only the log tail
     // beyond it, instead of re-deriving writes for commands the engine
     // already durably reflects (ADR 0038 PR3's restart-recovery contract).
+    //
+    // The delta ring (ADR 0038 PR5) is freshly constructed and therefore
+    // already empty at this point (a real process restart gets a brand-new
+    // `RaftNode`/ring) — no explicit reset needed here; only a *received*
+    // `InstallSnapshot` mid-run (`meta_apply_and_compact`'s install branch)
+    // needs to clear an already-populated ring.
     let mut shadow = mirror::rebuild_metadata_from_engine(&engine)
         .await
         .expect("system-keyspace engine scan (rebuild)");
@@ -703,6 +793,7 @@ async fn meta_apply_loop<E: Env, S: StorageEngine>(
             &engine,
             &cache,
             &engine_applied,
+            &delta_ring,
             &watch,
             &wal_lock,
             &mut shadow,
@@ -727,6 +818,7 @@ async fn meta_apply_and_compact<E: Env, S: StorageEngine>(
     engine: &S,
     cache: &Arc<Mutex<Metadata>>,
     engine_applied: &Arc<AtomicU64>,
+    delta_ring: &Arc<Mutex<DeltaRing>>,
     watch: &MetadataWatch,
     wal_lock: &AsyncMutex<()>,
     shadow: &mut Metadata,
@@ -751,6 +843,11 @@ async fn meta_apply_and_compact<E: Env, S: StorageEngine>(
         *watermark = last_index;
         *cache.lock().expect("cache poisoned") = shadow.clone();
         engine_applied.fetch_max(last_index, Ordering::SeqCst);
+        // The ring's coverage window is meaningless across a jump it didn't
+        // witness (ADR 0038 PR5) — reset it so a `WatchMetadata` caller
+        // whose `last_seen` predates this install correctly falls back to a
+        // full fetch instead of silently under-reporting.
+        delta_ring.lock().expect("delta ring poisoned").clear();
         watch.bump(last_index);
         did_work = true;
     }
@@ -764,6 +861,10 @@ async fn meta_apply_and_compact<E: Env, S: StorageEngine>(
     // double-applies a non-idempotent decision onto `shadow`.
     let effects = core.lock().expect("raft core poisoned").drain_apply();
     let mut ops = Vec::new();
+    // One entry per drained command (ADR 0038 PR5), pushed into the delta
+    // ring below only once the whole batch durably lands — mirrors the
+    // `cache` publish, which also only happens after the engine write.
+    let mut ring_batch: Vec<(u64, Vec<KeyWrite>)> = Vec::new();
     let mut max_index = *watermark;
     for (index, command) in effects {
         if index <= *watermark {
@@ -771,12 +872,13 @@ async fn meta_apply_and_compact<E: Env, S: StorageEngine>(
         }
         did_work = true;
         let (_, writes) = mirror::apply_and_derive_mirror(shadow, &command);
-        for write in writes {
-            ops.push(match write {
+        for write in &writes {
+            ops.push(match write.clone() {
                 KeyWrite::Put(key, value) => MergeOp::put(key, value, index),
                 KeyWrite::Delete(key) => MergeOp::tombstone(key, index),
             });
         }
+        ring_batch.push((index, writes));
         max_index = index;
     }
     if max_index > *watermark {
@@ -796,6 +898,15 @@ async fn meta_apply_and_compact<E: Env, S: StorageEngine>(
         *watermark = max_index;
         *cache.lock().expect("cache poisoned") = shadow.clone();
         engine_applied.fetch_max(max_index, Ordering::SeqCst);
+        // Feed the ring before bumping `watch` (ADR 0038 PR5): a watcher
+        // woken by that bump calls straight into `watch_delta_since`, which
+        // must already find this batch's entries in place.
+        {
+            let mut ring = delta_ring.lock().expect("delta ring poisoned");
+            for (index, writes) in ring_batch {
+                ring.push(index, writes);
+            }
+        }
         watch.bump(max_index);
     }
 
@@ -1423,6 +1534,7 @@ mod tests {
         let engine = animus_storage::MemoryEngine::new();
         let cache = Arc::new(Mutex::new(Metadata::default()));
         let engine_applied = Arc::new(AtomicU64::new(0));
+        let delta_ring = Arc::new(Mutex::new(DeltaRing::default()));
         let watch = MetadataWatch::default();
         let wal_lock = Arc::new(AsyncMutex::new(()));
         let mut shadow = Metadata::default();
@@ -1436,6 +1548,7 @@ mod tests {
             &engine,
             &cache,
             &engine_applied,
+            &delta_ring,
             &watch,
             &wal_lock,
             &mut shadow,
@@ -1461,6 +1574,11 @@ mod tests {
         assert!(
             engine.entries().await.expect("engine scan").is_empty(),
             "nothing should have been written to the engine"
+        );
+        assert_eq!(
+            delta_ring.lock().expect("delta ring poisoned").len(),
+            0,
+            "the ring stays untouched on a no-op pass"
         );
     }
 
@@ -1489,6 +1607,7 @@ mod tests {
         let engine = animus_storage::MemoryEngine::new();
         let cache = Arc::new(Mutex::new(Metadata::default()));
         let engine_applied = Arc::new(AtomicU64::new(0));
+        let delta_ring = Arc::new(Mutex::new(DeltaRing::default()));
         let watch = MetadataWatch::default();
         let wal_lock = Arc::new(AsyncMutex::new(()));
 
@@ -1508,6 +1627,7 @@ mod tests {
             &engine,
             &cache,
             &engine_applied,
+            &delta_ring,
             &watch,
             &wal_lock,
             &mut shadow,
@@ -1547,6 +1667,41 @@ mod tests {
             3 + 1, // 3 member upserts + the shared `_applied_index` watermark key
             "expected exactly the tail's writes plus the watermark key, got {} entries",
             engine_entries.len()
+        );
+
+        // ADR 0038 PR5: the delta ring only ever saw the tail (indices 4..6)
+        // — it has no entries for 1..3, since those were skipped by the
+        // watermark gate before ever reaching `mirror::apply_and_derive_mirror`.
+        // A `WatchMetadata` caller whose `last_seen` is inside the pre-seeded
+        // prefix (e.g. 0, which this pass never touched at all) still falls
+        // back correctly, since the ring's window starts at index 4.
+        let ring = delta_ring.lock().expect("delta ring poisoned");
+        assert_eq!(ring.len(), 3, "one ring entry per tail command");
+        assert_eq!(
+            ring.writes_since(3, last_applied),
+            Some(
+                (4..=last_applied)
+                    .flat_map(|i| {
+                        // Raft index `i` carries `upsert(i - 2)` in this
+                        // test's setup (index 2 = upsert(0), .., index 6 =
+                        // upsert(4)) — recomputed against a fresh `Metadata`
+                        // since `UpsertMember`'s derived write only reads
+                        // back its own just-written member entry, so it's
+                        // independent of any other node's prior state.
+                        let (_, writes) = mirror::apply_and_derive_mirror(
+                            &mut Metadata::default(),
+                            &upsert(i - 2),
+                        );
+                        writes
+                    })
+                    .collect::<Vec<_>>()
+            ),
+            "the ring covers exactly (watermark_before, watermark_after]"
+        );
+        assert_eq!(
+            ring.writes_since(0, last_applied),
+            None,
+            "a caller stuck before the ring's own window falls back to a full fetch"
         );
     }
 }

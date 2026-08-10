@@ -829,6 +829,37 @@ pub enum ClientResponse {
     /// the identical id already allocated for that nonce (never a second
     /// one; see [`MetaCommand::AllocateNodeId`]'s doc).
     NodeIdAllocated { node: NodeId },
+    /// **Incremental long-poll reply to
+    /// [`WatchMetadata`](ClientRequest::WatchMetadata)** (ADR 0038 PR5): the
+    /// answering node's own [`animus_control::RaftNode::watch_delta_since`]
+    /// covered `(last_seen, watermark]` contiguously in its bounded
+    /// system-keyspace delta ring, so instead of a full [`Status`](Self::Status)
+    /// clone this carries just the [`animus_control::mirror::KeyWrite`]s
+    /// those commits produced, in commit order. The caller
+    /// (`control_handle::RemoteControlClient::observe_delta`) installs them
+    /// verbatim onto its own cached `Metadata` via
+    /// `animus_control::mirror::apply_key_write`, never replaying a
+    /// `MetaCommand` itself — a mirror would otherwise need this crate's
+    /// full control-plane business logic, exactly the design constraint
+    /// `Status`'s original whole-`Metadata`-clone shape was chosen to avoid
+    /// duplicating.
+    ///
+    /// **Only ever a `WatchMetadata` reply** — a plain
+    /// [`Status`](ClientRequest::Status) request always gets the full
+    /// [`Status`](Self::Status) reply, unconditionally; `WatchMetadata`
+    /// itself falls back to [`Status`](Self::Status) whenever the ring
+    /// doesn't (or no longer) cover the requested range (a fresh, lagging,
+    /// or just-recovered replica, or a caller whose `last_seen` aged out of
+    /// the bounded window) — see [`ClientCtx::watch_metadata`]'s doc.
+    /// `writes` is empty exactly when `watermark == last_seen` (the
+    /// timeout-elapsed, nothing-changed case) — cheaper than a full
+    /// `Metadata` clone even then.
+    MetadataDelta {
+        writes: Vec<animus_control::mirror::KeyWrite>,
+        watermark: u64,
+        leader_hint: Option<(NodeId, SocketAddr)>,
+        control_voters: BTreeSet<NodeId>,
+    },
 }
 
 /// Listen addresses for a node's endpoints (use port 0 for ephemeral): the
@@ -2791,13 +2822,15 @@ impl ClientCtx {
         self.control.metadata_fresh().await
     }
 
-    /// Serve a long-poll [`ClientRequest::WatchMetadata`] (ADR 0035 PR5):
-    /// park on this node's own [`ControlHandle::metadata_watch`] for up to
-    /// [`WATCH_METADATA_SERVER_TIMEOUT`], then reply with whatever `Metadata`
-    /// is current — either because it genuinely advanced past `last_seen`,
-    /// or because the bound elapsed with nothing new (a normal outcome, not
-    /// an error; the caller just retries with the same `last_seen`, exactly
-    /// like a `Status` poll that happened not to observe a change).
+    /// Serve a long-poll [`ClientRequest::WatchMetadata`] (ADR 0035 PR5 for
+    /// the long-poll mechanism itself; ADR 0038 PR5 for the incremental
+    /// reply shape below): park on this node's own
+    /// [`ControlHandle::metadata_watch`] for up to
+    /// [`WATCH_METADATA_SERVER_TIMEOUT`], then reply — either because the
+    /// watch genuinely advanced past `last_seen`, or because the bound
+    /// elapsed with nothing new (a normal outcome, not an error; the caller
+    /// just retries with the same `last_seen`, exactly like a `Status` poll
+    /// that happened not to observe a change).
     ///
     /// Only a genuine control-group replica (`ControlHandle::Local`) can
     /// serve this. A `Remote` data-only node **rejects** it instead of
@@ -2809,24 +2842,53 @@ impl ClientCtx {
     /// an effective ~[`WATCH_METADATA_SERVER_TIMEOUT`]-second poll — worse
     /// than the pre-PR5 fixed-interval poll, not better. Rejecting fails the
     /// misdirected watch fast instead.
+    ///
+    /// **Incremental reply (ADR 0038 PR5)**: once the watch resolves, try
+    /// this node's own [`RaftNode::watch_delta_since`] first — if its bounded
+    /// delta ring covers `(last_seen, watermark]`, reply with
+    /// [`ClientResponse::MetadataDelta`] instead of a full [`ClientResponse::
+    /// Status`] clone. Falls back to the full reply whenever the ring
+    /// doesn't cover the range (a fresh/lagging/just-recovered replica, or a
+    /// caller whose `last_seen` aged out of the window) — the log-tail vs
+    /// `InstallSnapshot` fallback shape this plane already has. **Also**
+    /// falls back while the ADR 0030 growth-node mirror overlay is active on
+    /// this node (`self.remote_metadata` populated): that overlay serves
+    /// `effective_metadata()` from a *different* source than this node's own
+    /// (on a growth node, permanently inert) local ring, so a delta off that
+    /// ring would answer the wrong question.
     pub(crate) async fn watch_metadata(&self, last_seen: u64) -> ClientResponse {
-        if matches!(self.control, ControlHandle::Remote(_)) {
+        let ControlHandle::Local(raft) = &self.control else {
             return ClientResponse::Error(
                 "this node has no local control-plane watch to serve (ADR 0035 data-only node); \
                  watch a control-plane node instead"
                     .into(),
             );
-        }
-        let watch = self.control.metadata_watch();
+        };
+        let watch = raft.metadata_watch();
         tokio::select! {
             _ = watch.changed(last_seen) => {}
             () = tokio::time::sleep(WATCH_METADATA_SERVER_TIMEOUT) => {}
         }
+        let leader_hint = self.control_leader_hint();
+        let control_voters = self.control.config().unwrap_or_default();
+        let growth_mirror_active = self
+            .remote_metadata
+            .lock()
+            .expect("remote metadata poisoned")
+            .is_some();
+        if !growth_mirror_active && let Some(reply) = raft.watch_delta_since(last_seen) {
+            return ClientResponse::MetadataDelta {
+                writes: reply.writes,
+                watermark: reply.watermark,
+                leader_hint,
+                control_voters,
+            };
+        }
         ClientResponse::Status {
             metadata: self.effective_metadata(),
-            leader_hint: self.control_leader_hint(),
+            leader_hint,
             watermark: watch.latest(),
-            control_voters: self.control.config().unwrap_or_default(),
+            control_voters,
         }
     }
 
@@ -4919,21 +4981,44 @@ async fn remote_metadata_watch_loop(remote: RemoteControlClient, seeds: Vec<Sock
 
         let mut synced = false;
         for addr in candidates {
-            if let ClientResponse::Status {
-                metadata,
-                leader_hint,
-                watermark,
-                control_voters,
-            } = relay_request_with_timeout(
+            match relay_request_with_timeout(
                 addr,
                 &ClientRequest::WatchMetadata { last_seen },
                 WATCH_METADATA_CLIENT_TIMEOUT,
             )
             .await
             {
-                remote.observe(metadata, leader_hint, watermark, control_voters);
-                synced = true;
-                break;
+                ClientResponse::Status {
+                    metadata,
+                    leader_hint,
+                    watermark,
+                    control_voters,
+                } => {
+                    remote.observe(metadata, leader_hint, watermark, control_voters);
+                    synced = true;
+                    break;
+                }
+                // ADR 0038 PR5: the incremental reply — a stale-relative-to-
+                // a-concurrent-update drop (`observe_delta` returning `false`)
+                // is still a normal round trip, not a transport failure; the
+                // next iteration re-requests with the corrected `last_seen`.
+                ClientResponse::MetadataDelta {
+                    writes,
+                    watermark,
+                    leader_hint,
+                    control_voters,
+                } => {
+                    remote.observe_delta(
+                        last_seen,
+                        &writes,
+                        leader_hint,
+                        watermark,
+                        control_voters,
+                    );
+                    synced = true;
+                    break;
+                }
+                _ => {}
             }
         }
         if synced {

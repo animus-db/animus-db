@@ -22,7 +22,11 @@
 //!   unwired in this PR (a later PR in the stack mirrors `Metadata` through it
 //!   into a per-node `StorageEngine`). `syskv::is_reserved_name` guards
 //!   `TableName`/keyspace validation so no user table can ever collide with it.
+//! - [`delta_ring`] — the apply task's bounded, per-node in-memory ring of
+//!   [`mirror::KeyWrite`] deltas (ADR 0038 PR5), the incremental half of
+//!   `WatchMetadata`'s reply (`RaftNode::watch_delta_since`).
 
+pub mod delta_ring;
 pub mod detector;
 pub mod meta;
 pub mod mirror;
@@ -33,9 +37,10 @@ pub mod schema;
 pub mod shared_wal;
 pub mod syskv;
 
+pub use delta_ring::DeltaRing;
 pub use detector::{FailureDetector, Liveness};
 pub use meta::{ApplyOutcome, Member, MetaCommand, Metadata, NodeAddrs, NodeStatus};
-pub use node::{MetadataChanged, MetadataWatch, RaftNode};
+pub use node::{DeltaReply, MetadataChanged, MetadataWatch, RaftNode};
 pub use schema::{
     ColumnDef, ColumnType, IndexDef, IndexKind, IndexProjection, ReplicationMode, SchemaCatalog,
     SchemaError, TableName, TableSchema,

@@ -185,6 +185,45 @@ per-tablet CP data plane (`animus-cp-data`).
     (nothing pushes to it); tests that used it now compare converged
     `metadata()` across nodes instead (a strictly stronger convergence proof).
 
+  **ADR 0038 PR5 ("Phase 2"): incremental `WatchMetadata` deltas.**
+  `meta_apply_and_compact` now also pushes one [`delta_ring::DeltaRing`] entry
+  per drained command (index → its derived `KeyWrite`s, possibly empty) in
+  the same pass that publishes `cache`/bumps `engine_applied` — *before*
+  bumping `MetadataWatch`, so a watcher woken by that bump always finds the
+  ring already populated. `RaftNode::watch_delta_since(last_seen) ->
+  Option<DeltaReply>` is the new public read side `animusd`'s
+  `ClientCtx::watch_metadata` calls: `Some` (a cheap `DeltaReply { writes,
+  watermark }`) when the ring contiguously covers `(last_seen,
+  engine_applied_index()]`, `None` otherwise (the caller falls back to a full
+  `metadata()` clone). The ring is cleared whenever `cache` is rebuilt from a
+  jump it didn't witness (a received `InstallSnapshot`, mid-loop in
+  `meta_apply_and_compact`) — **not** on `meta_apply_loop`'s own
+  startup/restart rebuild, since a fresh `RaftNode`/ring is already empty by
+  construction at that point. `RaftNode::start_with_ring_bounds` (bounds
+  default via `DeltaRing::default`, 1024 entries / 4 MiB) is the
+  "configurable" knob the design asked for — a code-level constructor
+  parameter, not (yet) CLI-exposed, since no deployment-time need for a
+  different bound exists today.
+
+- **`delta_ring.rs`** (ADR 0038 PR5) — the apply task's bounded, per-node,
+  best-effort in-memory ring of [`mirror::KeyWrite`] deltas keyed by Raft log
+  index. Pure (no `Env`, no I/O); `push`/`clear`/`writes_since(last_seen,
+  upto)` are its whole surface. Bounded by **both** `max_entries` and
+  `max_bytes` (`DeltaRing::with_bounds`; `DeltaRing::default` uses
+  `DEFAULT_MAX_ENTRIES = 1024`/`DEFAULT_MAX_BYTES = 4 MiB`), oldest evicted
+  first — except a push never evicts the entry it just inserted, even if that
+  single entry alone exceeds `max_bytes` (there's nothing smaller left to
+  evict down to, and discarding your own freshest entry would defeat the
+  ring's purpose). `writes_since(last_seen, upto)`'s contiguity check is
+  subtle at the boundary: `last_seen + 1 == front().index` is *not* a gap
+  (the caller's very next needed index is exactly the ring's oldest retained
+  entry) — only `last_seen + 1 < front().index` is (see the unit tests'
+  `byte_bound_eviction_from_one_huge_entry` for the case this distinction
+  matters: an evicted middle entry doesn't create a gap for a caller who
+  never needed it). Unit-tested directly (no `Env`); `node.rs`'s own
+  white-box apply-task tests and `tests/watch_deltas.rs` prove it wired up
+  correctly against a real `RaftNode`.
+
 - **`schema.rs`** — the replicated **table-schema catalog** (ADR 0013), all
   plain data (no I/O/clock/RNG). `TableSchema` (partition key + ordered
   clustering keys + typed `ColumnDef`s + `indexes: Vec<IndexDef>`), `ColumnType`
@@ -278,10 +317,20 @@ per-tablet CP data plane (`animus-cp-data`).
     crate's engineering practices warn about. `node.rs`'s
     `meta_apply_and_compact` calls this directly, once per drained command.
   - **Read side**: `rebuild_metadata_from_engine(engine: &S) ->
-    Result<Metadata, StorageError>` scans a `StorageEngine`'s live entries,
-    decodes each via `syskv::decode_key`, and reconstructs a `Metadata` —
-    used by `meta_apply_loop`'s own startup/restart rebuild, and by the
-    differential-oracle tests (`apply_engine.rs`).
+    Result<Metadata, StorageError>` scans a `StorageEngine`'s live entries and
+    reconstructs a `Metadata` — used by `meta_apply_loop`'s own
+    startup/restart rebuild, and by the differential-oracle tests
+    (`apply_engine.rs`). **Since ADR 0038 PR5** it's built from
+    `apply_key_write(meta: &mut Metadata, write: &KeyWrite)` (one `Put` per
+    live entry — `entries()` never yields a tombstone, so this bulk path only
+    ever exercises that half) instead of its own separate decode match, so
+    the bulk-rebuild and incremental-delta paths share one decode
+    implementation and can't drift. `apply_key_write` is also the
+    incremental-delta consumer's whole job: `animusd`'s
+    `RemoteControlClient::observe_delta` calls it once per `KeyWrite` in a
+    `WatchMetadata` reply, installing them onto its own cached `Metadata`
+    with no engine of its own — see `delta_ring.rs`'s entry above and ADR
+    0038's "Phase 2" section.
 
   `node.rs`'s `meta_apply_loop`/`meta_apply_and_compact` are the sole
   writer/reader pair now — see that module's `CLAUDE.md` entry above for the
@@ -602,6 +651,17 @@ heartbeats). The 25 binaries:
   agrees with its own engine's independent rebuild through a mixed scenario
   (membership, schema, tablet create/split/drop-table, keyspace,
   node-id-allocation) and across a genuine crash + restart, seed-swept.
+- **`watch_deltas.rs`** (ADR 0038 PR5) — the incremental `WatchMetadata`
+  delta path's differential oracle: applying `RaftNode::watch_delta_since`'s
+  writes onto a scratch `Metadata` (via `mirror::apply_key_write`) stays
+  byte-identical to a full `metadata()` fetch at every checkpoint through the
+  same kind of mixed scenario `apply_engine.rs` drives, including a
+  `MergeTablets` step specifically to exercise a derived `Delete` (a live
+  engine scan never yields one, so the bulk-rebuild oracle alone can't); plus
+  the ring's own restart-reset contract (a pre-restart watcher's `last_seen`
+  correctly falls back to `None`, a caught-up one still gets the trivial
+  reply) and a small-bounded ring's eviction-driven fallback, proven against
+  a real `RaftNode` (not just `delta_ring.rs`'s own unit tests).
 - **`restart.rs`** — process restart-and-rejoin (via `Simulator::stop`); each
   node's `MemoryEngine` handle is created once and re-cloned at restart (ADR
   0038 PR3 gotcha — see `docs/engineering-lessons.md`: a restart must reuse
