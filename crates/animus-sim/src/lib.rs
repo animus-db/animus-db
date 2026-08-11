@@ -248,6 +248,11 @@ struct SimState {
     disk_cfg: DiskConfig,
     // Per-node overrides of the global disk fault model.
     node_disk_cfg: BTreeMap<NodeId, DiskConfig>,
+    // Per-node clock skew (signed nanoseconds), applied only to that node's
+    // own `Clock::now()` reads (ADR 0018 §2 sim support). Absent = zero skew;
+    // default-empty so every existing test stays byte-identical (see
+    // `set_clock_skew_for`).
+    clock_skew: BTreeMap<NodeId, i64>,
 
     next_task_id: TaskId,
     // `None` while a task's future is checked out for polling.
@@ -376,6 +381,7 @@ impl Simulator {
             net: NetConfig::default(),
             disk_cfg: DiskConfig::default(),
             node_disk_cfg: BTreeMap::new(),
+            clock_skew: BTreeMap::new(),
             next_task_id: 0,
             tasks: BTreeMap::new(),
             task_owner: BTreeMap::new(),
@@ -437,6 +443,30 @@ impl Simulator {
     /// healthy).
     pub fn set_disk_config_for(&self, node: NodeId, cfg: DiskConfig) {
         self.shared.lock().node_disk_cfg.insert(node, cfg);
+    }
+
+    /// Set `node`'s clock skew (signed nanoseconds, applied to `Clock::now()`
+    /// reads only) — opt-in, per-node, and default-zero (mirrors
+    /// [`set_disk_config_for`](Self::set_disk_config_for)'s shape). Models a
+    /// node whose local clock reads ahead of (positive) or behind (negative)
+    /// the simulation's global timeline, the clock-offset scenario an HLC
+    /// (ADR 0018 §2) has to tolerate.
+    ///
+    /// Deterministic by construction: the value is explicitly set here, never
+    /// drawn from the RNG, and introduces no new timeline event — so a
+    /// script of `set_clock_skew_for` calls is itself a pure function of
+    /// whatever drives the test, not of anything internal to the simulator.
+    ///
+    /// Skew is read-side only. `SimEnv`'s `Clock::sleep` timers still fire
+    /// against the single global clock: a per-node skewed *timeline*
+    /// would let nodes' timers interleave in an order that depends on their
+    /// skew, reordering the shared event loop and breaking the
+    /// single-`(time, seq)`-timeline determinism story this crate provides.
+    /// Skew instead models a node's clock *reading* wrong — exactly what an
+    /// HLC's physical component has to be robust to — without touching event
+    /// ordering at all.
+    pub fn set_clock_skew_for(&self, node: NodeId, skew_nanos: i64) {
+        self.shared.lock().clock_skew.insert(node, skew_nanos);
     }
 
     /// Flip (bit-invert) one **durable** byte of `file` on `node`'s disk at
@@ -845,7 +875,9 @@ pub struct SimEnv {
 #[async_trait::async_trait]
 impl Clock for SimEnv {
     fn now(&self) -> Nanos {
-        Nanos(self.shared.lock().clock)
+        let st = self.shared.lock();
+        let skew = st.clock_skew.get(&self.node_id).copied().unwrap_or(0);
+        Nanos(apply_clock_skew(st.clock, skew))
     }
 
     async fn sleep(&self, dur: Duration) {
@@ -1131,6 +1163,16 @@ impl Future for Recv {
 
 fn dur_nanos(d: Duration) -> u64 {
     d.as_nanos().min(u128::from(u64::MAX)) as u64
+}
+
+/// Apply a signed nanosecond skew to the global clock reading, clamped so it
+/// never underflows below 0 nor overflows past `u64::MAX` (`set_clock_skew_for`).
+fn apply_clock_skew(clock: u64, skew_nanos: i64) -> u64 {
+    if skew_nanos >= 0 {
+        clock.saturating_add(skew_nanos as u64)
+    } else {
+        clock.saturating_sub(skew_nanos.unsigned_abs())
+    }
 }
 
 /// Lemire-debiased `[0, n)` draw directly on a `ChaCha8Rng` (used internally for

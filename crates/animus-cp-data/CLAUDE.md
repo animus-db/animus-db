@@ -40,6 +40,18 @@ Three modules:
   decimal-array `Vec<u8>` rendering cost ~3–4x. Decode failures are loud (a
   logged `Err` before the message is dropped). The Raft WAL keeps the shared
   control-plane serde_json `PersistedState` format.
+- **`hlc.rs`** (ADR 0018 §2, PR1) — a pure, I/O-free Hybrid Logical Clock:
+  `HlcTimestamp { wall_ms, logical }` and the per-node `Hlc` (`mint`/`witness`,
+  both take the caller-sampled `Nanos` — `Hlc` never touches an `Env` or the
+  wall clock itself). `pack`/`unpack` encode a timestamp as the storage-engine
+  `u64` MVCC version directly (`(wall_ms << 20) | logical`, no node-id bits —
+  settled over `animus-consensus`'s `(logical, node)` scheme because a string
+  `NodeId`, ADR 0040, can't bit-pack); the 20-bit `LOGICAL_BITS` budget is
+  hard-`assert!`-checked in `pack` (never `debug_assert!` — a silent overflow
+  would silently collapse two distinct timestamps to one version). Not yet
+  wired into `RaftKvNode`'s apply path — that lands in PR2, which replaces the
+  current floor-scaled-Raft-index `mvcc_version` (see the Key invariants
+  section above) with this packed HLC.
 
 ### lib.rs API
 
@@ -419,6 +431,12 @@ internally).
 - `stream_addressing.rs` (ADR 0026 Stage B) — two groups on identical node ids
   don't cross-talk when addressed by distinct streams; sustained interleaved
   writes stay isolated and reproducible.
+- `hlc_skew.rs` (ADR 0018 §2, PR1) — the HLC/sim-clock-skew integration test:
+  lives here (not in `animus-sim`, which can't depend on this crate) because
+  it needs both `hlc::Hlc` and `animus_sim::Simulator::set_clock_skew_for`. A
+  node whose clock reads ahead mints, a node whose clock reads behind
+  witnesses it, and the behind node's next mint still strictly exceeds the
+  ahead node's — causality survives clock skew.
 - `metrics.rs` (ADR 0015) — CP-plane observability counters move under a known
   workload, threading a recording `MetricsHandle` via `start_with_metrics`:
   the *real outcome* moves each counter (accepted vs. not-leader-rejected
