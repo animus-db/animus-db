@@ -9,6 +9,17 @@
   `Metadata` durably lives there (an async apply task owns it), not in an
   optional shadow mirror as ADR 0038's PR2 first shipped it. Everything else
   about the three deployment shapes this ADR describes is unchanged.
+- **Amended by [ADR 0040](0040-self-minted-string-node-ids.md) (2026-08-11):**
+  the Context section below (`config::control_id(i) = i` /
+  `config::raftkv_id(i) = RAFTKV_ID_BASE + i`, a **combined** node binding
+  two ids on two `ProdEnv`s) describes the pre-ADR-0040 scheme, now
+  historical — a combined node binds **one** env on **one** identity (ADR
+  0040 Decision A), so the "six-port-per-node stride" this ADR's config
+  section describes is now **five** ports, and `RoleAddrs`/`NodeAddrs` carry
+  one `id`/`internal` address instead of a `control`/`raftkv` pair. The
+  three deployment *shapes* (combined/control-only/data-only) and their role
+  assemblies are otherwise unaffected — this is a same-shape addressing
+  simplification, not a new shape.
 - **Date:** 2026-08-09
 
 ## Context

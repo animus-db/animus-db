@@ -152,6 +152,21 @@ function tokenBound(v, fill) {
 function pill(cls, text) { return `<span class="pill ${esc(cls)}">${esc(text)}</span>`; }
 function dot(cls) { return `<span class="dot ${esc(cls)}"></span>`; }
 
+// A node id, truncated with an ellipsis where its column/card is narrow, full
+// value always available on hover (ADR 0040 PR5): pre-ADR-0040 ids were short
+// integers (`"3"`) that never needed this; a self-minted id is a 22-char
+// base64url string (`NodeId::mint`, ADR 0040 Decision B) that can otherwise
+// blow out a table column or wrap a card header. `extraCls` appends any
+// additional classes the call site already used on its own `<span>`
+// (`"mono"`, `"node"`, …) so this is a drop-in replacement, not a rewrite of
+// surrounding layout. CSS (`.id-trunc`) does the actual clipping; the
+// `title` attribute is the full id, so a real mouse hover (or a screen
+// reader) always sees it uncut even when the rendered text doesn't.
+function idSpan(id, extraCls) {
+  const cls = "id-trunc" + (extraCls ? " " + extraCls : "");
+  return `<span class="${cls}" title="${esc(id)}">${esc(id)}</span>`;
+}
+
 // A "console →" link to another node's OWN admin console, from its admin
 // `base` origin (already resolved by `loadAll()`'s fan-out). Empty when the
 // base is unknown (unreachable node) or is this very page's own origin —

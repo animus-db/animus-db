@@ -30,8 +30,8 @@ use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use animus_env::{
-    BoxFuture, Clock, Coresident, Disk, Env, Envelope, Nanos, Network, NodeId, PRIMARY_STREAM,
-    Rng as RngTrait, Spawner,
+    BoxFuture, Clock, Disk, Env, Envelope, Nanos, Network, NodeId, PRIMARY_STREAM, Rng as RngTrait,
+    Spawner,
 };
 use futures::task::ArcWake;
 use rand::{RngCore, SeedableRng};
@@ -1068,26 +1068,6 @@ impl Spawner for SimEnv {
 impl Env for SimEnv {
     fn node_id(&self) -> NodeId {
         self.node_id.clone()
-    }
-}
-
-impl Coresident for SimEnv {
-    /// Mint a sibling handle on the same simulated node, bound to `id` with its
-    /// own inbox. Registers `id` in the shared state exactly as
-    /// [`Simulator::env`] would (idempotent `entry(..).or_default()`), so a
-    /// component can create a co-resident protocol instance in band without the
-    /// `Simulator` pre-allocating the id. Touches only the inbox/node maps — no
-    /// RNG, no timeline event — so determinism is preserved.
-    fn sibling(&self, id: NodeId) -> Self {
-        {
-            let mut st = self.shared.lock();
-            st.nodes.insert(id.clone());
-            st.inboxes.entry((id.clone(), PRIMARY_STREAM)).or_default();
-        }
-        SimEnv {
-            shared: Arc::clone(&self.shared),
-            node_id: id,
-        }
     }
 }
 

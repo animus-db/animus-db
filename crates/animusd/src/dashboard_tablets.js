@@ -8,7 +8,7 @@
 // from a single node (/admin/storage/lsm) only for the selected tablet's
 // leader — not for every row. No election-history section: this codebase
 // tracks only current Raft state, not a history of leadership transitions.
-// Depends on `dashboard_core.js` (STATE, $, esc, pill, dot, getJSON,
+// Depends on `dashboard_core.js` (STATE, $, esc, pill, dot, idSpan, getJSON,
 // humanBytes, nodeIdOf, cpGroupsByTablet, autoSplitThresholds,
 // tabletStatus, tokenBound, gotoStorage).
 
@@ -72,7 +72,7 @@ function renderTablets() {
       <td>${t.table ? esc(t.table) : `<span class="muted">—</span>`}</td>
       <td class="mono">${keysCell}</td>
       <td class="mono">${sizeCell}</td>
-      <td class="mono">${lead ? `node ${esc(nodeIdOf(lead.node))}` : `<span class="muted">—</span>`}</td>
+      <td class="mono">${lead ? `node ${idSpan(nodeIdOf(lead.node))}` : `<span class="muted">—</span>`}</td>
       <td><span class="replica-dots">${replicaDots}</span></td>
       <td>${pill(st, st)}</td>
     </tr>`;
@@ -106,7 +106,7 @@ function renderTabletDetail(tablets, groups) {
     const role = g ? (g.g.is_leader ? "leader" : "follower") : "unreachable";
     const dotCls = g ? (g.g.is_leader ? "ok-dot" : "dim-dot") : "bad-dot";
     const meta = g ? `t${g.g.term} · i${g.g.last_applied}` : "—";
-    return `<div class="replica-row">${dot(dotCls)}<span class="node mono">${esc(rid)}</span>
+    return `<div class="replica-row">${dot(dotCls)}${idSpan(rid, "node mono")}
       <span class="role" style="color:${role === "leader" ? "var(--accent)" : role === "unreachable" ? "var(--danger)" : "var(--text2)"}">${esc(role)}</span>
       <span class="meta">${esc(meta)}</span></div>`;
   }).join("");

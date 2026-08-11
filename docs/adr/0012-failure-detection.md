@@ -1,6 +1,13 @@
 # ADR 0012 — Heartbeat-based failure detection in the control plane
 
-- **Status:** Accepted
+- **Status:** Accepted. **Amended by [ADR 0040](0040-self-minted-string-node-ids.md)
+  (2026-08-11):** before ADR 0040, a combined node heartbeated (and was
+  detected) under its **raftkv** id, a different id from the same node's
+  control-voter id — the mismatch ADR 0037's quorum-guard liveness signal
+  had to work around (see that ADR's own amendment note). ADR 0040 Decision A
+  gives a node exactly one id, so this detector's keys and the control
+  plane's voter ids are now **the same space**, structurally — no bridging
+  needed, nothing else about the detector's design changes.
 - **Date:** 2026-08-01
 
 ## Context

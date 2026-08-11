@@ -1164,6 +1164,35 @@ debugging anything that feels like it might have happened before.
   just the two obvious cases a fresh design starts with. (`animus-control`'s
   `meta.rs::register_node_claims_an_address_for_a_member_already_claimed_
   without_one`; ADR 0040 PR4.)
+- **Routing every node's self-registration through one shared command can
+  silently make a role that must never be placement-eligible show up in the
+  placement-eligible set — a second, unrelated bug the same "unify the
+  claim path" change can introduce even after the first one (above) is
+  fixed.** Once `RegisterNode` became the sole path that inserts a `members`
+  row, a **control-only** node's own self-registration inserted one too
+  (labels + `Down` status, the same as every other node) — and the existing
+  `Down → Active` promotion chain (ADR 0030 §1, unchanged) promoted it the
+  moment it started heartbeating, same as any data-capable node. Nothing
+  about `RegisterNode`'s own apply logic was wrong in isolation; the bug was
+  purely in *scope* — a control-only node has no `raftkv` role and can never
+  host a tablet, so its mere presence in `members` silently makes it a
+  placement candidate the moment the reconciler considers `Active` members,
+  corrupting replica-set assignment with no error anywhere in the write
+  path. Caught by `animusd/tests/control_only.rs` going bimodal ("put via
+  control node did not forward... Elapsed") — a downstream symptom several
+  layers removed from the actual cause, not a direct assertion on
+  membership. **Fix**: gate the `members`-row insert on the registering
+  node's own declared role (`NodeAddrs.role == "control"` skips it
+  entirely) — the address book claim (`node_addrs`) still succeeds for every
+  role; only the placement-eligibility side effect is role-gated. **General
+  rule: when unifying several roles' registration/bootstrap paths onto one
+  shared command, explicitly enumerate which side effects that command
+  produces are safe for *every* role versus which are only safe for a
+  subset — a command that "just inserts a row" can smuggle in an implicit
+  eligibility grant that was previously only reachable from a role-specific
+  code path.** (`animus-control::meta.rs::
+  register_node_never_claims_membership_for_a_control_role_registration`,
+  `animusd/tests/control_only.rs`; ADR 0040 PR4.)
 - **A test-only deterministic double for a trait bounded `Send + Sync` (the
   `Env`/`Rng` seam, ADR 0003) must use atomics, not `Cell`, even though the
   double never crosses a real thread boundary in the test itself.** A
@@ -3228,6 +3257,28 @@ debugging anything that feels like it might have happened before.
   (ADR 0040 PR4.)
 
 ### Parallel-agent orchestration
+- **A stacked series' final "docs/ADR finalization" PR must treat the stack's
+  own shipped PR bodies (`gh pr view`) as the authoritative source for
+  divergences from the plan — not the plan doc, and not just the final code
+  state.** ADR 0040's 6-PR stack had one implementer agent per PR, each of
+  which discovered and documented a real divergence from the delivery plan
+  as it built (e.g. PR4's `RegisterNode` CAS keying on `node_addrs` alone,
+  not `addrs`+`labels`, and its separate control-role-never-claims-`members`
+  fix) — but each agent's own PR body is the *only* place some of these
+  divergences are recorded end to end, since the shipped code and crate
+  `CLAUDE.md`s describe the *result* without always narrating *why it
+  diverged from what was planned*. Finalizing ADR 0040 (this PR) by reading
+  only the code + crate guides + the plan doc would have produced a
+  plausible-sounding but subtly wrong Decision C (the plan's original
+  labels-inclusive CAS design, not the shipped node-addrs-only one) — the
+  gap only closes by reading every prior PR's own body (`gh pr view
+  <N>`) for its "Deviations from the plan/brief" section before writing the
+  ADR's final Decision text. **General rule: when a task hands you a stack
+  of already-landed PRs to finalize/document, fetch and read each one's own
+  PR body before trusting the plan doc or the current code alone — a PR body
+  is where an implementer records the reasoning for a mid-flight design
+  change that neither the plan (written before) nor the code (silent on
+  *why*) captures.**
 - **Partition work by disjoint crate ownership — exactly one owner per shared
   crate/file.** The assembly points (`animusd`, `animus-control`) are
   chokepoints; if several agents must touch `animusd`, split by *file*

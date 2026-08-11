@@ -336,9 +336,9 @@ pub trait Rng: Send + Sync {
 /// existed — which is nearly all of them — needs no change and behaves
 /// identically. A component that wants a *second* protocol instance
 /// addressable on the same node (e.g. a per-tablet Raft group after a split,
-/// ADR 0017 D) can now open a second stream on the existing env instead of
-/// minting a whole new `NodeId` (the `Coresident` escape hatch this ADR aims to
-/// eventually retire).
+/// ADR 0017 D) opens a second stream on the existing env instead of minting a
+/// whole new `NodeId` — this superseded the old `Coresident`/`sibling`
+/// escape hatch outright, which is why that trait is gone (ADR 0040 PR5).
 #[async_trait::async_trait]
 pub trait Network: Send + Sync {
     /// Hand a payload to the network for delivery to `to` on `stream`.
@@ -401,11 +401,10 @@ pub trait Disk: Send + Sync {
 
     /// The names of every file on this env's disk, in lexicographic order (empty
     /// if none exist yet). Only files this handle's `Disk` methods could open —
-    /// production lists the env's own data directory, non-recursively (a
-    /// co-resident sibling's `sib-<id>/` subdirectory is that sibling's disk, not
-    /// this one's). The enumeration primitive teardown paths need to find every
-    /// artifact of a prefix-named component (e.g. a dropped tablet's
-    /// `db-t{id}-*` LSM files) without knowing the exact set.
+    /// production lists the env's own data directory, non-recursively. The
+    /// enumeration primitive teardown paths need to find every artifact of a
+    /// prefix-named component (e.g. a dropped tablet's `db-t{id}-*` LSM files)
+    /// without knowing the exact set.
     async fn list(&self) -> std::io::Result<Vec<String>>;
 }
 
@@ -450,28 +449,6 @@ pub trait EnvExt: Env {
 }
 
 impl<E: Env> EnvExt for E {}
-
-/// An `Env` that can mint a **sibling** handle on the same physical node bound to
-/// a different [`NodeId`] — its own inbox, clock-, disk- and spawn-context-shared
-/// with this one.
-///
-/// The `Network` inbox is single-consumer per `NodeId` (one `recv` loop per id),
-/// so a node that hosts a *second* protocol instance — e.g. the new tablet's Raft
-/// group after a split (ADR 0017 D) — needs a second id with its own inbox.
-/// `sibling` is how a running component mints that id **in band** (from inside an
-/// apply step) rather than relying on the test harness / process bootstrap to
-/// pre-allocate every id up front.
-///
-/// This is a **separate** trait, not part of the [`Env`] supertrait: only the few
-/// co-residency-aware components (the leaderful split path) bound on it, so every
-/// other `E: Env` impl is unaffected and an `Env` that cannot multiplex inboxes
-/// (a production transport keyed by one address) is simply not `Coresident`.
-pub trait Coresident: Env {
-    /// A fresh handle on this physical node bound to `id`, with its own inbox.
-    /// `id` must be distinct from this handle's and from any other live instance
-    /// on the node (the caller owns id allocation, as with the initial group).
-    fn sibling(&self, id: NodeId) -> Self;
-}
 
 #[cfg(test)]
 mod tests {

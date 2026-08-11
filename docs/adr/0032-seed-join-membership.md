@@ -7,7 +7,13 @@
   be a control-only node (ADR 0035's static discovery root) as well as a
   combined node, since `JoinInfo` is answered from replicated `Metadata`
   (`node_addrs`/`client_route`), which a control-only node holds exactly as a
-  combined node does.
+  combined node does. **Amended by [ADR 0040](0040-self-minted-string-node-ids.md)
+  (2026-08-11):** the `--node I` join contract this ADR's PR2 established is
+  replaced outright by `--id NAME`/self-mint, and the pre-bind collision
+  check (`check_join_collision`) this ADR added as a *narrowing, not
+  eliminating* mitigation is superseded by an apply-time registration CAS
+  that closes the residual race structurally — see the amendment section
+  below.
 - **Date:** 2026-08-07
 
 ## Context
@@ -397,3 +403,24 @@ refused, just for a dynamic rather than a static reason. `animus admin
 decommission --force-control-remove` runs `control-remove` first (with its
 own leadership-transfer handling), then this ADR's unchanged
 drain→drain-status→remove flow.
+
+## Amended by ADR 0040
+
+[ADR 0040](0040-self-minted-string-node-ids.md) replaces this ADR's `--node
+I` join contract (PR2, above) outright: `join`/`data --seed` drop `--node I`
+for `--id NAME` (proposes a durable identity) or an omitted flag
+(self-mints an ephemeral one) — `--base-port` becomes required either way,
+since there is no longer a small operator index to derive a default port
+range from. More importantly, this ADR's own documented residual race —
+"this narrows, but does not fully eliminate, the race between two
+simultaneous joiners choosing the same index; `RegisterNodeAddrs`'s own
+idempotent apply-time check is the actual backstop for that residual
+window" — is **closed structurally, not just narrowed further**: the
+pre-bind `check_join_collision` guess this ADR added is deleted outright,
+replaced by `MetaCommand::RegisterNode`'s registration compare-and-swap,
+which every joiner's claim goes through *before* binding anything. A minted
+id's collision (astronomically unlikely) re-mints and retries; a proposed
+id's collision fails loudly instead of racing on address equality. This is
+the same generalization ADR 0036 already argued for (server-side CAS
+allocation over a client-side guess) — ADR 0040 extends it to a client that
+can also propose its own name, which ADR 0036's design had no room for.

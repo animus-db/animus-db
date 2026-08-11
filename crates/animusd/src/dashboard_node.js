@@ -9,7 +9,7 @@
 // one node in scope here. Shown instead of the cluster Console on a
 // data-only node, and appended last on a combined node (a combined node is
 // also a data node). Depends on `dashboard_core.js` (SELF, ROLE, STATE, $,
-// esc, pill, dot, bytes, humanBytes, getJSON, nodeDisplayId).
+// esc, pill, dot, idSpan, bytes, humanBytes, getJSON, nodeDisplayId).
 
 function renderNode() {
   renderNodeIdentity();
@@ -38,7 +38,7 @@ function renderNodeIdentity() {
     <div class="section-head"><span class="title">This node</span>
       <span class="muted" style="font-size:10px;text-transform:uppercase;letter-spacing:.03em">${esc(c.role)}</span></div>
     <div class="stat-tiles" style="margin-bottom:14px">
-      <div class="stat-tile"><div class="label">Node id</div><div class="value">${esc(id)}</div></div>
+      <div class="stat-tile"><div class="label">Node id</div><div class="value">${idSpan(id)}</div></div>
       <div class="stat-tile"><div class="label">Role</div><div class="value" style="font-size:16px;text-transform:capitalize">${esc(c.role)}</div></div>
     </div>
     ${addrRows}`;
@@ -85,7 +85,7 @@ function renderNodeMirror() {
   $("nd-mirror").innerHTML = `
     <div class="section-head"><span class="title">Control-plane mirror</span>${pill(synced ? "healthy" : "warn", synced ? "synced" : "not yet synced")}</div>
     <div class="list-row"><span class="detail">applied-index watermark</span><span class="status-text mono">${esc(cm.watermark)}</span></div>
-    <div class="list-row"><span class="detail">control leader</span><span class="status-text mono">${r.leader != null ? "node " + esc(r.leader) : "—"}</span></div>
+    <div class="list-row"><span class="detail">control leader</span><span class="status-text mono">${r.leader != null ? "node " + idSpan(r.leader) : "—"}</span></div>
     <div class="list-row"><span class="detail">leader address hint</span><span class="status-text mono">${cm.leader_hint ? esc(cm.leader_hint) : "—"}</span></div>
     ${note}`;
 }

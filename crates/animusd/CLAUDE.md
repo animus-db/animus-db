@@ -649,30 +649,48 @@ route below the edge through the same `ClientCtx` CP primitives.
   (distinct from its
   admin/client/raftkv ports — `animus admin control-add` resolves it from the
   new node's own `/admin/config` so the operator only ever deals in admin
-  addresses). **The PR3 known scope limit is closed (ADR 0037 PR4)**: PR3
-  shipped with the freshly-added voter's address known only via
-  `ProdEnv::merge_peer` called on **whichever node happened to be leader** at
-  add time — a *later* leader (after a subsequent transfer or crash) had no
-  path to independently rediscover it. PR4 adds `NodeAddrs.control:
-  Option<SocketAddr>` (`animus-control`'s `meta.rs`, `#[serde(default)]`,
-  `None` for every statically-configured voter) — `admin_add_control_member`
-  now proposes it via the existing `RegisterNodeAddrs` (replicated to every
-  voter, same as the `raftkv`/`client`/`admin` axes always were), and every
-  control-role node runs its own `control_peer_sync_loop` (near
-  `peer_sync_loop`/`route_sync_loop`, same `PEER_SYNC_INTERVAL` cadence) to
-  merge `Metadata.node_addrs[*].control` into its own control env via
+  addresses). **The PR3 known scope limit was closed by ADR 0037 PR4, since
+  superseded by ADR 0040 PR1 (below is now historical — see the "Update"
+  paragraph after it for the current mechanism)**: PR3 shipped with the
+  freshly-added voter's address known only via `ProdEnv::merge_peer` called
+  on **whichever node happened to be leader** at add time — a *later* leader
+  (after a subsequent transfer or crash) had no path to independently
+  rediscover it. PR4 added `NodeAddrs.control: Option<SocketAddr>`
+  (`animus-control`'s `meta.rs`, `#[serde(default)]`, `None` for every
+  statically-configured voter) — `admin_add_control_member` proposed it via
+  `RegisterNodeAddrs` (replicated to every voter, same as the
+  `raftkv`/`client`/`admin` axes always were), and every control-role node
+  ran its own `control_peer_sync_loop` (near `peer_sync_loop`/
+  `route_sync_loop`, same `PEER_SYNC_INTERVAL` cadence) to merge
+  `Metadata.node_addrs[*].control` into its own control env via
   `ControlHandle::merge_control_peer` — so *any* node that might later become
-  leader already knows every runtime-added voter's address, not just the one
-  that added it. `admin_remove_control_member` prunes the field back to
-  `None` on removal (best-effort — a stale leftover is harmless bookkeeping,
-  not a safety issue). Regression: `tests/control_membership_admin.rs::
+  leader already knew every runtime-added voter's address, not just the one
+  that added it. `admin_remove_control_member` pruned the field back to
+  `None` on removal. Regression at the time:
+  `tests/control_membership_admin.rs::
   runtime_added_voter_survives_leadership_change_to_a_different_original_voter`
   (self-removes the adder to force a transfer to a *different* original
   voter, then proves a fresh proposal still replicates to the runtime-added
-  voter). See `animus-env/CLAUDE.md`'s `merge_peer` entry and
+  voter — this regression test itself is unaffected by the update below,
+  since it exercises the *outcome*, not this mechanism's internals). See
   `docs/engineering-lessons.md` for the full war story (including a real
   self-registration/admin-action clobber race the regression test's
   bring-up had to sequence around).
+
+  **Update (ADR 0040 PR1, one identity per node): `NodeAddrs.control`,
+  `control_peer_sync_loop`, and `ControlHandle::merge_control_peer` are all
+  gone outright**, not merely superseded — the two-id split
+  (`control`/`raftkv`) this whole mechanism existed to bridge no longer
+  exists, so there is no second control-only address left to separately
+  replicate/sync at all. A runtime-added control voter's one `internal`
+  address is either already known (an existing node self-registered via
+  `NodeAddrs.internal` before being promoted) or supplied directly by the
+  admin action, and the single unified `peer_sync_loop` (merging
+  `Metadata.node_addrs[*].internal`, see the gotcha above) is what every
+  node — control, data, or combined — already keeps current. See
+  `animus-env/CLAUDE.md`'s `merge_peer` entry for the primitive that
+  outlived the mechanism above, and ADR 0040's own amendment stanza on ADR
+  0037 for the ADR-level pointer.
   Remove's original quorum-loss warning (down to 1 voter) was the only
   implemented trigger — the plan's second trigger ("every other voter
   believed Down") was originally dropped: pre-ADR-0040,
@@ -766,14 +784,16 @@ route below the edge through the same `ClientCtx` CP primitives.
   retried omitted-node call mints a second, distinct id that becomes a
   voter) + `add_control_member_collision_shapes` (an id that already names an
   existing data-plane member now *succeeds*, promotion not a conflict).
-- **The CP group is durable by default** — one shared `LsmEngine` over the raftkv
-  env, cloned into every tablet's `RaftKvNode`; acked writes survive restart. Files
-  use a flat filename prefix (`LSM_PREFIX = "db-"`), not a subdirectory (`ProdEnv`'s
-  disk doesn't create intermediate dirs). Node-start entry points are
-  async+fallible (`io::Result`).
+- **The CP group is durable by default** — one shared `LsmEngine` over the node's
+  one internal env (ADR 0040 PR1), cloned into every tablet's `RaftKvNode`; acked
+  writes survive restart. Files use a flat filename prefix (`LSM_PREFIX = "db-"`),
+  not a subdirectory (`ProdEnv`'s disk doesn't create intermediate dirs).
+  Node-start entry points are async+fallible (`io::Result`).
 - **`Node::shutdown()` is a graceful teardown** — aborts the listener tasks and
-  `ProdEnv::shutdown()`s both role envs, freeing all six ports so a replacement can
-  rebind the same addresses/dir. Dropping a `Node` without it leaves tasks running.
+  `ProdEnv::shutdown()`s the node's one internal env, freeing all five ports
+  (ADR 0040 PR1's `internal`/`client`/`dynamo`/`cql`/`admin` stride — was six,
+  split across two role envs, before) so a replacement can rebind the same
+  addresses/dir. Dropping a `Node` without it leaves tasks running.
   **It's fire-and-forget (`abort()` then return), not a guarantee those ports are
   free the instant it returns** — see `animus-env/CLAUDE.md`'s `ProdEnv::shutdown()`
   entry. A same-address restart needs **`Node::shutdown_and_wait()`** (aborts, then

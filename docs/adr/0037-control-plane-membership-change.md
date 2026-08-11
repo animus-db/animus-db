@@ -7,7 +7,14 @@
   control group stays static") and ADR 0032 (seed/join membership: the
   decommission control-core-id refusal) — see the pointer notes added to
   both. Coordinates with ADR 0036 (cluster-allocated member ids): see
-  "Coordination with ADR 0036" below.
+  "Coordination with ADR 0036" below. **Amended by
+  [ADR 0040](0040-self-minted-string-node-ids.md) (2026-08-11):**
+  `control-add`'s omitted-`node` mint path now goes through
+  `NodeId::mint`/`MetaCommand::RegisterNode` instead of the ADR 0036
+  allocator this ADR's "Coordination with ADR 0036" section wired into; and
+  the `believes_alive` raftkv/control id-space mismatch this ADR's own
+  quorum-guard work had to route around (below, "Non-goals") is now
+  structurally resolved — see the amendment section below.
 - **Date:** 2026-08-10
 
 ## Context
@@ -237,6 +244,33 @@ closure entry for the mechanism and the mint-then-bind ordering lesson this
 surfaced (an operator brings the new process up *after* the mint, not
 before — the reverse of the operator-supplied form's `GET /admin/config`
 liveness-check order).
+
+## Amended by ADR 0040
+
+[ADR 0040](0040-self-minted-string-node-ids.md) touches this ADR in two
+places:
+
+- **The `control-add` mint path** ("Coordination with ADR 0036"'s "Update"
+  paragraph, above) moves off the ADR 0036 allocator it was wired into: the
+  omitted-`node` form now mints via `NodeId::mint(leader.env())` and claims
+  it through `MetaCommand::RegisterNode`'s registration CAS, and the
+  operator-supplied form drops the `ALLOC_ID_BASE`-range refusal outright
+  (no numeric ranges exist anymore to refuse against) *and* the "already
+  exists as a member" refusal — promoting an existing data-plane member to
+  a control voter is the common case now, not a conflict, since ADR 0040 PR1
+  already unified the control/data id space this refusal used to guard.
+- **The `believes_alive` id-space mismatch** this ADR's "Non-goals"/
+  Consequences sections document (a raftkv-keyed liveness signal that could
+  never answer a control-id query) is **structurally dissolved by ADR 0040
+  Decision A** — a node has exactly one id now, so `believes_alive` and the
+  control plane's own voter ids share one space by construction. The
+  dedicated `RaftCore::peer_last_contact`/`RaftNode::
+  control_peer_believed_alive` signal the hardening trio's PR 2 built (above)
+  is **kept regardless** — it answers a strictly more precise question
+  (control-Raft-traffic reachability specifically, not general network
+  reachability) than id-space unification alone would, so ADR 0040 doesn't
+  make it redundant, only makes the *bridging problem* it was partly built
+  to route around disappear.
 
 ## Non-goals
 

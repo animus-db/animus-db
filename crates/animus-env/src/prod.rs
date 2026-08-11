@@ -21,9 +21,7 @@ use tokio::sync::{Mutex, mpsc};
 
 #[cfg(test)]
 use crate::nid;
-use crate::{
-    Clock, Coresident, Disk, Env, Envelope, MetricsHandle, Nanos, Network, NodeId, Rng, Spawner,
-};
+use crate::{Clock, Disk, Env, Envelope, MetricsHandle, Nanos, Network, NodeId, Rng, Spawner};
 
 /// A production environment for a single node.
 ///
@@ -34,18 +32,6 @@ use crate::{
 #[derive(Clone)]
 pub struct ProdEnv {
     inner: Arc<Inner>,
-}
-
-/// A pre-bound spare listener a [`ProdEnv`] holds for [`Coresident::sibling`]
-/// (ADR 0017 #3b): minting a co-resident handle at runtime needs a new
-/// id-addressable inbox, but binding a socket is `async`/fallible while `sibling`
-/// is sync/infallible — so the listeners are bound up front (at `bind` time) and
-/// handed out synchronously. Each slot is a bound listener + its accept loop's
-/// inbox + the abort handle for that loop.
-struct PoolSlot {
-    addr: SocketAddr,
-    inbox: mpsc::UnboundedReceiver<Envelope>,
-    accept_abort: tokio::task::AbortHandle,
 }
 
 /// Per-stream inbound queues + parked-receiver wakers for one env's inbox
@@ -67,16 +53,10 @@ struct Demux {
 struct Inner {
     node_id: NodeId,
     start: Instant,
-    /// The peer address book, **shared** (via `Arc`) with every sibling minted off
-    /// this env (ADR 0017 #3b), so an address-distribution update (`set_peers` from
-    /// replicated `Metadata`) reaches the co-resident CP groups too.
+    /// The peer address book.
     peers: Arc<StdMutex<BTreeMap<NodeId, SocketAddr>>>,
-    /// This env's own listener address (so a caller can publish a freshly-minted
-    /// sibling's `id → addr` for distribution).
+    /// This env's own listener address.
     local_addr: SocketAddr,
-    /// Unclaimed pre-bound listeners for [`Coresident::sibling`], shared so any
-    /// clone of this env can mint a sibling. Empty for an env bound without a pool.
-    pool: Arc<StdMutex<Vec<PoolSlot>>>,
     /// Cached outbound connections, one per destination address, so `send`/
     /// `send_stream` do not pay a TCP handshake per message (Raft heartbeats/
     /// AppendEntries/votes are the hot path). Keyed by `SocketAddr`, not
@@ -87,8 +67,6 @@ struct Inner {
     /// (never held across `.await`); the per-address `tokio::sync::Mutex`
     /// serializes whole-frame writes so concurrent senders to one peer never
     /// interleave frames, without head-of-line blocking *across* peers.
-    /// Shared (via `Arc`) with siblings, like the peer book, so co-resident
-    /// groups reuse the node's connections.
     #[allow(clippy::type_complexity)]
     conns: Arc<StdMutex<BTreeMap<SocketAddr, Arc<Mutex<Option<TcpStream>>>>>>,
     data_dir: PathBuf,
@@ -97,8 +75,7 @@ struct Inner {
     /// creation is a one-time namespace change: the first `sync` of a file pays
     /// the directory fsync, later `sync`s (the WAL group-commit hot path) skip
     /// it. `remove` un-memoizes (a re-created file is a new namespace change);
-    /// `replace` re-memoizes (its rename just got the chain fsynced). Per-env
-    /// (not shared with siblings): the memo is about *this* env's data dir.
+    /// `replace` re-memoizes (its rename just got the chain fsynced).
     dir_synced: StdMutex<BTreeSet<String>>,
     /// This env's multiplexed inbox (ADR 0026): a background pump task (spawned
     /// alongside the accept loop, see `spawn_pump`) drains the accept loop's raw
@@ -134,24 +111,6 @@ impl ProdEnv {
         listen: SocketAddr,
         data_dir: impl Into<PathBuf>,
     ) -> std::io::Result<(Self, SocketAddr)> {
-        Self::bind_with_pool(node_id, listen, &[], data_dir).await
-    }
-
-    /// Like [`bind`](Self::bind), but also binds a **pool** of spare listeners (one
-    /// per address in `pool_listens`, port 0 for OS-assigned) that
-    /// [`Coresident::sibling`] hands out at runtime (ADR 0017 #3b). A node that may
-    /// host co-resident CP per-tablet Raft groups (ADR 0017) binds a pool sized to
-    /// the maximum groups it will host; an env bound with an empty pool is not
-    /// usefully `Coresident` (the first `sibling` call panics on exhaustion).
-    ///
-    /// # Errors
-    /// As [`bind`](Self::bind), for the main listener or any pool listener.
-    pub async fn bind_with_pool(
-        node_id: NodeId,
-        listen: SocketAddr,
-        pool_listens: &[SocketAddr],
-        data_dir: impl Into<PathBuf>,
-    ) -> std::io::Result<(Self, SocketAddr)> {
         let data_dir = data_dir.into();
         tokio::fs::create_dir_all(&data_dir).await?;
         let listener = TcpListener::bind(listen).await?;
@@ -160,27 +119,12 @@ impl ProdEnv {
         let demux = Arc::new(StdMutex::new(Demux::default()));
         let pump_abort = spawn_pump(raw_rx, Arc::clone(&demux));
 
-        // Pre-bind the sibling pool: each slot is a bound listener + its accept
-        // loop's inbox, held until `sibling` claims it.
-        let mut pool = Vec::with_capacity(pool_listens.len());
-        for &addr in pool_listens {
-            let l = TcpListener::bind(addr).await?;
-            let slot_addr = l.local_addr()?;
-            let (slot_rx, slot_abort) = spawn_accept(l);
-            pool.push(PoolSlot {
-                addr: slot_addr,
-                inbox: slot_rx,
-                accept_abort: slot_abort,
-            });
-        }
-
         let env = Self {
             inner: Arc::new(Inner {
                 node_id,
                 start: Instant::now(),
                 peers: Arc::new(StdMutex::new(BTreeMap::new())),
                 local_addr,
-                pool: Arc::new(StdMutex::new(pool)),
                 conns: Arc::new(StdMutex::new(BTreeMap::new())),
                 data_dir,
                 dir_synced: StdMutex::new(BTreeSet::new()),
@@ -192,9 +136,7 @@ impl ProdEnv {
         Ok((env, local_addr))
     }
 
-    /// This env's own listener address — so a caller can publish a freshly-minted
-    /// [`sibling`](Coresident::sibling)'s `id → addr` for address distribution
-    /// (ADR 0017 #3b).
+    /// This env's own listener address.
     #[must_use]
     pub fn local_addr(&self) -> SocketAddr {
         self.inner.local_addr
@@ -262,12 +204,6 @@ impl ProdEnv {
         for h in handles {
             h.abort();
         }
-        // Also abort any still-unclaimed sibling-pool accept loops so their
-        // listener ports are freed too (a claimed slot's abort moved into the
-        // sibling's own `tasks`, torn down when that sibling shuts down).
-        for slot in std::mem::take(&mut *self.inner.pool.lock().expect("pool poisoned")) {
-            slot.accept_abort.abort();
-        }
     }
 
     /// Like [`shutdown`](Self::shutdown), but also waits (bounded,
@@ -297,28 +233,6 @@ impl ProdEnv {
             h.abort();
         }
         wait_all_finished(&handles).await;
-        // Also abort (and wait for) any still-unclaimed sibling-pool accept
-        // loops, the `shutdown_and_wait` dual of `shutdown`'s pool cleanup.
-        let pool = std::mem::take(&mut *self.inner.pool.lock().expect("pool poisoned"));
-        for slot in &pool {
-            slot.accept_abort.abort();
-        }
-        let pool_handles: Vec<tokio::task::AbortHandle> =
-            pool.into_iter().map(|slot| slot.accept_abort).collect();
-        wait_all_finished(&pool_handles).await;
-    }
-
-    /// Abort only the tasks **this env itself** owns — its accept loop and
-    /// everything spawned through [`Spawner::spawn`] on this handle — leaving the
-    /// **shared** sibling listener pool untouched. The per-sibling teardown a
-    /// tablet GC needs: [`shutdown`](Self::shutdown) on a sibling would drain the
-    /// pool it shares with its parent and every other sibling, killing the
-    /// unclaimed slots future co-resident groups (splits) still need. Idempotent.
-    pub fn shutdown_tasks(&self) {
-        let handles = std::mem::take(&mut *self.inner.tasks.lock().expect("tasks poisoned"));
-        for h in handles {
-            h.abort();
-        }
     }
 
     fn path(&self, file: &str) -> PathBuf {
@@ -584,45 +498,6 @@ impl Network for ProdEnv {
     }
 }
 
-impl Coresident for ProdEnv {
-    /// Mint a co-resident handle bound to `id` (ADR 0017 #3b): claim a pre-bound
-    /// listener from the pool ([`bind_with_pool`](Self::bind_with_pool)) and return
-    /// a `ProdEnv` on it. The handle **shares this env's peer address book** (so a
-    /// later `set_peers` from distributed `Metadata` reaches it) and the same
-    /// listener pool (so it too can mint siblings), but has its own inbox, id, and
-    /// a distinct data dir (`<dir>/sib-<id>`, created lazily on first write) so its
-    /// WAL never collides with the parent's. The caller publishes the new addr
-    /// ([`local_addr`](Self::local_addr)) for distribution.
-    ///
-    /// **Panics** if the pool is exhausted — the pool size bounds how many
-    /// co-resident groups a node hosts; size it accordingly at `bind_with_pool`.
-    fn sibling(&self, id: NodeId) -> Self {
-        let slot = self.inner.pool.lock().expect("pool poisoned").pop().expect(
-            "Coresident::sibling: ProdEnv listener pool exhausted — too many \
-                 co-resident groups for the pre-bound pool; increase the pool size \
-                 (animusd's CP_SIBLING_POOL / bind_with_pool's pool_listens)",
-        );
-        let demux = Arc::new(StdMutex::new(Demux::default()));
-        let pump_abort = spawn_pump(slot.inbox, Arc::clone(&demux));
-        let sib_data_dir = self.inner.data_dir.join(format!("sib-{id}"));
-        Self {
-            inner: Arc::new(Inner {
-                node_id: id,
-                start: self.inner.start,
-                peers: Arc::clone(&self.inner.peers),
-                local_addr: slot.addr,
-                pool: Arc::clone(&self.inner.pool),
-                conns: Arc::clone(&self.inner.conns),
-                data_dir: sib_data_dir,
-                dir_synced: StdMutex::new(BTreeSet::new()),
-                demux,
-                tasks: StdMutex::new(vec![slot.accept_abort, pump_abort]),
-                metrics: self.inner.metrics.clone(),
-            }),
-        }
-    }
-}
-
 /// How long [`ProdEnv::shutdown_and_wait`] polls for every aborted task to
 /// report finished before giving up. Generous — this only ever matters under
 /// heavy host-level contention — but bounded so a caller can never hang
@@ -741,8 +616,8 @@ impl Disk for ProdEnv {
         let path = self.path(file);
         // Fast path: the data dir was created at `bind`, so don't pay a
         // `create_dir_all` per append. A file name carrying a not-yet-created
-        // subdirectory prefix (e.g. `"db/wal"`, or a sibling's lazily-created
-        // data dir) surfaces as `NotFound` — create the parents and retry once.
+        // subdirectory prefix (e.g. `"db/wal"`) surfaces as `NotFound` —
+        // create the parents and retry once.
         let mut f = match open_append(&path).await {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -890,9 +765,9 @@ impl Disk for ProdEnv {
     }
 
     async fn list(&self) -> std::io::Result<Vec<String>> {
-        // Non-recursive: a subdirectory (e.g. a sibling's `sib-<id>/`) is another
-        // env's disk. A data dir that does not exist yet reads as empty — the env
-        // creates it lazily on first write.
+        // Non-recursive: a nested subdirectory is not this env's own top-level
+        // disk contents. A data dir that does not exist yet reads as empty —
+        // the env creates it lazily on first write.
         let mut dir = match tokio::fs::read_dir(&self.inner.data_dir).await {
             Ok(dir) => dir,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -975,8 +850,8 @@ mod tests {
     }
 
     /// `Disk::list` returns this env's own files, sorted, non-recursively — a
-    /// subdirectory (a sibling's dir) is not this env's disk — and reads a
-    /// not-yet-created data dir as empty.
+    /// nested subdirectory's files are not this env's own top-level disk
+    /// contents — and reads a not-yet-created data dir as empty.
     #[tokio::test]
     async fn disk_list_is_own_files_sorted_nonrecursive() {
         let dir = unique_tmp_dir();
@@ -998,80 +873,16 @@ mod tests {
             .expect("bind");
         env.append("db-wal", b"w").await.expect("append");
         env.append("db-MANIFEST", b"m").await.expect("append");
-        env.append("sib-300/db-t2-wal", b"s").await.expect("append");
+        env.append("nested/db-t2-wal", b"s").await.expect("append");
 
         let got = env.list().await.expect("list");
         assert_eq!(
             got,
             vec!["db-MANIFEST".to_string(), "db-wal".to_string()],
-            "own files sorted; the sibling subdirectory's files are not listed"
+            "own files sorted; a nested subdirectory's files are not listed"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// `Coresident::sibling` over `ProdEnv` (ADR 0017 #3b): an env bound with a
-    /// listener pool mints a sibling at runtime with its own id-addressable inbox,
-    /// and — once the freshly-minted addresses are distributed (`set_peers`) — two
-    /// siblings on different physical nodes exchange a message over real TCP.
-    #[tokio::test]
-    async fn coresident_siblings_address_and_message_each_other() {
-        use crate::Network;
-
-        let dir_a = unique_tmp_dir();
-        let dir_b = unique_tmp_dir();
-        let loop0 = || "127.0.0.1:0".parse::<SocketAddr>().unwrap();
-        // Two physical nodes, each with a one-slot sibling pool.
-        let (a, _) = ProdEnv::bind_with_pool(nid(0), loop0(), &[loop0()], &dir_a)
-            .await
-            .expect("bind a");
-        let (b, _) = ProdEnv::bind_with_pool(nid(1), loop0(), &[loop0()], &dir_b)
-            .await
-            .expect("bind b");
-
-        // Mint a co-resident group member on each node (ids 300, 301).
-        let a_sib = a.sibling(nid(300));
-        let b_sib = b.sibling(nid(301));
-        assert_eq!(a_sib.node_id(), nid(300));
-        assert_ne!(
-            a_sib.local_addr(),
-            a.local_addr(),
-            "sibling has its own port"
-        );
-
-        // Distribute the freshly-minted addresses (what the 3b peer-sync loop does
-        // from replicated Metadata) onto the parents — siblings share the book.
-        let book: BTreeMap<NodeId, SocketAddr> = [
-            (nid(300), a_sib.local_addr()),
-            (nid(301), b_sib.local_addr()),
-        ]
-        .into_iter()
-        .collect();
-        a.set_peers(book.clone());
-        b.set_peers(book);
-
-        // 301 → 300 over real TCP, received on the sibling's own inbox.
-        let recv_handle = {
-            let a_sib = a_sib.clone();
-            tokio::spawn(async move { a_sib.recv().await })
-        };
-        // Give the receiver a moment to park on its inbox, then send.
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        b_sib.send(nid(300), b"hello-cp-sibling".to_vec()).await;
-
-        let env = tokio::time::timeout(Duration::from_secs(5), recv_handle)
-            .await
-            .expect("recv timed out")
-            .expect("recv task");
-        assert_eq!(env.from, nid(301));
-        assert_eq!(env.payload, b"hello-cp-sibling");
-
-        a.shutdown();
-        b.shutdown();
-        a_sib.shutdown();
-        b_sib.shutdown();
-        let _ = std::fs::remove_dir_all(&dir_a);
-        let _ = std::fs::remove_dir_all(&dir_b);
     }
 
     /// Multiplexed `(node, stream)` addressing (ADR 0026): two streams from one

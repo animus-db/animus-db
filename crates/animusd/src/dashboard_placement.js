@@ -5,7 +5,7 @@
 // CPU/mem/disk bars: nothing in this codebase samples host resources, and
 // fabricating them would violate this admin tool's ground-truth-data ethos.
 // Click a card to see that node's tablets. Depends on `dashboard_core.js`
-// (STATE, $, esc, pill, dot, nodeIdOf, cpGroupsByTablet, tabletStatus,
+// (STATE, $, esc, pill, dot, idSpan, nodeIdOf, cpGroupsByTablet, tabletStatus,
 // gotoStorage) having loaded first.
 
 let placementSelectedNode = null;
@@ -52,7 +52,7 @@ function renderPlacement() {
     const labelText = Object.entries(labels).map(([k, v]) => `${k}=${v}`).join(", ");
     return `<div class="placement-card${placementSelectedNode === id ? " selected" : ""}" data-node="${esc(id)}">
       <div class="head">
-        <div class="idw">${dot(up ? "ok-dot" : "bad-dot")}<span>${esc(id)}</span></div>
+        <div class="idw">${dot(up ? "ok-dot" : "bad-dot")}${idSpan(id)}</div>
         <span class="status-text" style="color:var(${up ? "--ok" : "--danger"})">${esc(m ? m.status : (up ? "reachable" : "unreachable"))}</span>
       </div>
       <div class="labels">${labelText ? esc(labelText) : "&nbsp;"}</div>

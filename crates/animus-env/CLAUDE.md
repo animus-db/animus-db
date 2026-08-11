@@ -15,7 +15,7 @@ the production implementation; the deterministic implementation lives in
   into the **`Env` supertrait** (scoped to one `NodeId`), plus `Nanos`,
   `Envelope`, `BoxFuture`, `PRIMARY_STREAM` (the default stream id the
   `send`/`recv` defaults ride on, ADR 0026), and the `EnvExt::spawn_task`
-  convenience. Also the vestigial `Coresident` sub-trait (see below).
+  convenience.
 - `prod.rs` — `ProdEnv`: real monotonic clock, `OsRng`, `tokio::spawn`,
   length-prefixed TCP, `tokio::fs` + `fsync`. Owns a real recording metrics sink
   and exposes `metrics_text()` (ADR 0015).
@@ -96,44 +96,50 @@ the production implementation; the deterministic implementation lives in
   entry without disturbing the rest of the book** — the incremental dual of
   `set_peers`'s full replace, with no `get_peers` to read-modify-write around
   by design (a full periodic rebuild from a known-good source, like
-  `animusd::peer_sync_loop` does for the `raftkv` role, is the intended
-  pattern for anything that needs to *converge*; `merge_peer` is for a
-  one-off "make this one id reachable right now" case). It updates only the
-  *calling* env's own book — by itself that left a known scope limit (PR3):
-  a runtime-added control voter's address was only ever merged into
-  whichever node happened to be leader at add time, so a later leadership
-  change or crash left every other voter unable to reach it. **PR4 closes
-  this**: `animusd`'s `control_peer_sync_loop` now calls `merge_peer` on
-  *every* control-role node's own env, every tick, off the replicated
-  `NodeAddrs.control` field (`animus-control`) — the "full periodic rebuild
-  from a known-good source" pattern this doc paragraph already names, just
-  layered on top of `merge_peer` incrementally (there is no separate static
-  control peer book to rebuild under it, unlike `peer_sync_loop`'s
-  `raftkv`/`set_peers` shape) rather than the one-off single-caller use PR3
-  shipped with. See `animusd/CLAUDE.md`'s "Control-plane membership change"
-  gotcha and `docs/engineering-lessons.md` for the full story.
+  `animusd::peer_sync_loop` does, is the intended pattern for anything that
+  needs to *converge*; `merge_peer` is for a one-off "make this one id
+  reachable right now" case). It updates only the *calling* env's own book,
+  so its remaining live callers are deliberately narrow:
+  `admin_add_control_member` calls it on the local leader's own env right
+  after registering a new/promoted voter, so that voter is reachable before
+  the next periodic sync tick, without waiting on it.
+  **Historical scope limit, since structurally closed rather than fixed in
+  place (ADR 0037 PR3 → PR4 → ADR 0040 PR1)**: PR3 shipped with a
+  runtime-added control voter's address known only via this one-off
+  `merge_peer` call on whichever node happened to be leader at add time — a
+  *later* leader had no path to independently rediscover it. PR4's fix (a
+  second periodic loop, `control_peer_sync_loop`, syncing a now-deleted
+  `NodeAddrs.control` field into `ControlHandle::merge_control_peer`) is
+  itself gone: ADR 0040 PR1 merged the `control`/`raftkv` address pair into
+  one `internal` field, so there is no separate control-only address left
+  to sync — the single, already-existing `animusd::peer_sync_loop` (which
+  every node, control/data/combined alike, already runs off
+  `Metadata.node_addrs[*].internal`) now closes this gap for free, with no
+  dedicated control-role loop needed. See `animusd/CLAUDE.md`'s
+  "Control-plane membership change" gotcha for the full historical arc and
+  `docs/engineering-lessons.md` for the war story.
 - **`ProdEnv` pools one outbound TCP connection per destination *address***
   (`TCP_NODELAY` set) instead of dialing per message — a Raft heartbeat no
-  longer pays a handshake. Frames (`[from: u64][len: u32][payload]`) are
-  unchanged and carry `from` per message, so one stream per addr is correct
-  even with co-resident ids; the per-address `tokio::sync::Mutex` is held
-  across the whole frame write (frame integrity) without head-of-line blocking
-  across peers. On a write error (peer restarted) the stale stream is dropped
-  and the send reconnects **once**, then surfaces the error — still
-  fire-and-forget, and the frame in flight when a peer dies can be lost
-  (higher layers retry, as before). The cache is shared with siblings like the
-  peer book.
-- **`Coresident` (ADR 0017 D) is vestigial — superseded by multiplexed streams
-  (ADR 0026, below).** The sub-trait (`sibling(&self, id) -> Self`: a fresh
-  handle on the same physical node bound to a different `NodeId` with its own
-  inbox) still exists and `SimEnv`/`ProdEnv` still implement it, but it has
-  **zero live call sites**: co-hosting a second protocol instance (a tablet's
-  CP Raft group) now rides a distinct *stream* on the node's own id, and
-  `animusd`'s `CP_SIBLING_POOL`/listener-pool plumbing is gone. Being a
-  *sub-trait* (not part of the `Env` supertrait) was the right shape — nothing
-  else ever had to care — and remains the pattern for any future opt-in env
-  capability. Don't build new features on `sibling`; if a use appears, prefer
-  a stream.
+  longer pays a handshake. Frames are unchanged and carry `from` per message,
+  so one connection per addr is correct even with several ids mapping to it;
+  the per-address `tokio::sync::Mutex` is held across the whole frame write
+  (frame integrity) without head-of-line blocking across peers. On a write
+  error (peer restarted) the stale stream is dropped and the send reconnects
+  **once**, then surfaces the error — still fire-and-forget, and the frame in
+  flight when a peer dies can be lost (higher layers retry, as before).
+- **`Coresident`/`sibling` (ADR 0017 D) is gone (ADR 0040 PR5)**, superseded
+  by multiplexed streams (ADR 0026, below): co-hosting a second protocol
+  instance (a tablet's CP Raft group) rides a distinct *stream* on the node's
+  own id instead of a whole second `NodeId`+inbox minted at runtime off a
+  pre-bound listener pool. It was already dead code by the time it was
+  removed — the per-tablet CP groups had migrated onto streams (ADR 0026
+  Stage B), leaving zero live call sites — so this was a pure deletion:
+  `Coresident`, `ProdEnv::bind_with_pool`/`PoolSlot`/the pool field,
+  `SimEnv`'s impl, and `ProdEnv::shutdown_tasks()` (which existed only to
+  spare a sibling's shared listener pool from a full `shutdown()`) all went
+  together. If a future need for a second addressable identity on one
+  physical node appears, prefer a stream — that is what this trait's own
+  existence proved unnecessary the first time.
 - `Disk` is append + explicit `sync`; bytes are not durable until `sync`
   returns. This models real crash semantics and is what `animus-sim` exploits.
   `Disk::replace` atomically swaps a file's whole contents (temp-file + rename
@@ -194,16 +200,12 @@ the production implementation; the deterministic implementation lives in
   recording handle in for a sim test. (The deleted AP data plane's
   `DataClient::with_metrics`/`serve_*_with_metrics` variants followed it too —
   gone with `animus-data`, ADR 0019.)
-- **`Disk::list` is per-env and non-recursive** (ADR 0024): it enumerates only the
-  files this handle's own `Disk` methods could open — production reads the env's
-  data dir without descending into a sibling's `sib-<id>/` (that is the sibling's
-  disk). It exists so a teardown path (drop-table GC) can find every file of a
-  prefix-named component; deletion stays on the seam (`remove`), so teardown is
+- **`Disk::list` is per-env and non-recursive** (ADR 0024): it enumerates only
+  the files this handle's own `Disk` methods could open — production reads the
+  env's data dir without descending into any nested subdirectory. It exists so
+  a teardown path (drop-table GC) can find every file of a prefix-named
+  component; deletion stays on the seam (`remove`), so teardown is
   sim-testable.
-- `ProdEnv::shutdown_tasks()` (abort only the env's own tasks, leave shared
-  resources alone) is **vestigial with zero callers** — it existed to tear down
-  a single sibling without draining the shared listener pool. Prefer
-  `shutdown()`; remove `shutdown_tasks` if you're cleaning up.
 
 - **Multiplexed `(node, stream)` addressing (ADR 0026).** `Network` gained a
   second addressing axis so a node can host more than one protocol instance
@@ -219,7 +221,8 @@ the production implementation; the deterministic implementation lives in
   the `stream` field ADR 0026 added) and routes each into its stream's queue,
   waking a parked `recv_stream(stream)`. The staged plan in the ADR completed:
   the per-tablet CP Raft groups (`animus-cp-data`) migrated onto streams
-  (Stage B), which is what made `Coresident`/the sibling pool vestigial.
+  (Stage B), which is what made `Coresident`/the sibling pool vestigial —
+  and, ADR 0040 PR5, deleted outright.
   This is the same "additive default over a well-known constant" shape the
   metrics seam (`Env::metrics()`) uses — extend the trait so nothing existing
   has to change, not by widening every implementor's required surface.

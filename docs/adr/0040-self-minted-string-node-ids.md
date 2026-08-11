@@ -1,14 +1,20 @@
 # ADR 0040 — Self-minted string node identities and registration-CAS membership
 
-- **Status:** Accepted — staged implementation. **PR4 of this ADR's 6-PR
-  stack lands here: Decision C (the `RegisterNode` registration CAS,
-  retiring the ADR 0036 allocator) and the join-path/`control-add` half of
-  Decision D.** PR1 (Decision A, one identity per node), PR2 (the opaque
-  `NodeId` newtype), and PR3 (Decision B in full — the string
-  representation, config `id` fields, minting groundwork) already landed;
-  PR5 (doc/ADR-amendment cleanup) and PR6 (the orphan-member auto-reclaim
-  sweep) remain. Do not read this ADR as describing the code as it stands
-  today in full — it describes the whole arc the stack is converging on.
+- **Status:** Accepted — implemented (PR1–PR5; orphan sweep lands in PR6).
+  PR1 (Decision A, one identity per node), PR2 (the opaque `NodeId`
+  newtype), PR3 (Decision B in full — string representation, config `id`
+  fields, minting groundwork), PR4 (Decision C in full — the `RegisterNode`
+  registration CAS, retiring the ADR 0036 allocator — and the
+  join-path/`control-add` half of Decision D), and PR5 (this PR: the
+  amendment stanzas on every ADR this one touches, the CLAUDE.md/
+  engineering-lessons sweep, the vestigial `Coresident` deletion, and
+  dashboard id-truncation polish — see "Staged implementation" below for
+  what PR5 did and deliberately did *not* do) have all landed. Only PR6
+  (the orphan-member auto-reclaim sweep, ADR 0040 §10 of the delivery plan)
+  remains. Read the "Staged implementation" section for the couple of
+  places the shipped code diverged from this ADR's own narrative prose —
+  each is called out inline where it matters (Decision C's CAS key, in
+  particular).
 - **Date:** 2026-08-11
 
 ## Context
@@ -112,21 +118,59 @@ exception (ADR 0003's one sanctioned deviation) — minting moves onto the
 seam, through a small `Rng` impl `animus_env::prod` exports for the CLI
 boundary, and through `SimEnv`'s existing seeded `Rng` for tests.
 
+**One storage-boundary exception, as shipped in PR3**: `animus-consensus`
+(the testbed-only Accord slice, ADR 0011/0018/0019) keeps `Timestamp`/
+`Ballot.node` as a real `NodeId` — its `core.rs` reads it semantically (e.g.
+`is_recovery_nominee`) — but its on-disk MVCC storage version encoding
+(`mvcc_version(ts) = (logical << 16) | node_index`) needs a small, dense
+bit-packed integer, which an opaque validated string can no longer provide
+directly. Rather than introduce a crate-wide opaque `NodeIdx` type, this one
+encoding folds in a node's **position in the sorted, closed replica set**
+(`node_index`) computed at the point of use, not threaded through the
+protocol core. See `animus-consensus/CLAUDE.md` for the full mechanism and
+`mvcc_version`'s encoding-contract assertions.
+
 ### Decision C — registration-CAS membership (retires ADR 0036's allocator) (**PR4**)
 
 `MetaCommand::RegisterNode { node, addrs, labels }` replaces both the
-self-registration path and `MetaCommand::AllocateNodeId` entirely. Apply-time
-semantics: an unclaimed id inserts a `Down` member + address entry
-(unchanged `Down → Active` promotion chain, ADR 0030 §1); a claimed id with a
-byte-identical `NodeAddrs`+labels re-registration is a no-op (idempotent
-retry, and the ADR 0032 rejoin case); a claimed id with a *different* entry
-is rejected. A **minted** id whose claim collides re-mints and retries (ports
-are never derived from ids under this scheme, so nothing needs rebinding); a
-**proposed** id whose claim collides fails loudly — a structural fix, not a
-pre-bind guess, for the residual race ADR 0032 documented and accepted. This
-retires `Metadata.next_alloc_id`/`node_id_allocations`, `ALLOC_ID_BASE`,
-`syskv::EntityKind::NodeIdAlloc`, and `generate_join_nonce`'s OS-randomness
-exception.
+self-registration path and `MetaCommand::AllocateNodeId` entirely. **CAS key,
+as shipped (diverges from this ADR's original narrative — see below): the
+compare-and-swap is keyed on `Metadata::node_addrs` alone, not the full
+`addrs`+`labels` pair.** An id absent from `node_addrs` claims the address
+slot — inserting a `Down` `Member` with `labels` too, but *only* as a side
+effect, and *only* if `members` doesn't already have an entry for it; a
+byte-identical re-registration (comparing `node_addrs` only) is a no-op
+(idempotent retry, and the ADR 0032 rejoin case); a *different* `NodeAddrs`
+already on file is rejected — the real collision. A **minted** id whose claim
+collides re-mints and retries (ports are never derived from ids under this
+scheme, so nothing needs rebinding); a **proposed** id whose claim collides
+fails loudly — a structural fix, not a pre-bind guess, for the residual race
+ADR 0032 documented and accepted. A control-role registration
+(`NodeAddrs.role == "control"`) additionally **never claims a `members` row
+at all** — a control-only node can never host a tablet, so appearing in
+`members` (eventually `Active`, once heartbeating) would silently make it a
+tablet-placement candidate. This retires `Metadata.next_alloc_id`/
+`node_id_allocations`, `ALLOC_ID_BASE`, `syskv::EntityKind::NodeIdAlloc`, and
+`generate_join_nonce`'s OS-randomness exception.
+
+**Why the CAS key diverges from a labels-inclusive comparison**: a
+labels-inclusive CAS (the design this ADR originally described, and PR4's
+starting point) broke two real scenarios that predate `RegisterNode`
+entirely: a fresh bootstrap node's own self-registration racing
+`bootstrap()`'s `UpsertMember` insert, and — more seriously — *any* node's
+self-registration racing an operator's `admin_add_member`/
+`admin_add_control_member` call. Both establish `members` (with real labels)
+through a wholly separate path that carries no address for `RegisterNode` to
+compare against, so a labels-inclusive CAS made whichever command lost that
+race permanently `Rejected`. Keying on `node_addrs` alone — and only ever
+inserting into `members` as a side effect, never overwriting an
+already-established row's labels/status — closes that hazard structurally.
+The control-role carve-out was found the same way: routing every node's
+self-registration through one CAS command surfaced a second real bug
+(control-only bootstrap nodes appearing in `members` and corrupting
+placement) that a labels-inclusive design would have masked by rejecting the
+second command outright instead of applying it wrongly. Both hazards are
+recorded in `docs/engineering-lessons.md`'s PR4 entry.
 
 ### Decision D — config/CLI shape (clean break) (**config half landed PR3; join/`control-add` half landed PR4**)
 
@@ -145,6 +189,14 @@ space, so there is no separate control-id range left to collide with). This
 is a **clean break**: per this repo's standing "no live deployments" rule, no
 config/wire/WAL back-compat with any pre-ADR-0040 deployment is provided or
 attempted.
+
+**No new client wire variant, as shipped**: a joining node's `RegisterNode`
+claim (and `control-add`'s mint-then-claim) both reach the leader entirely
+over the *existing* `ClientRequest::ProposeSchema`/`ClientResponse::Status`
+round trip every other relayable `MetaCommand` already uses — propose, then
+poll `metadata_fresh()` for the claim to land, the same shape
+`trigger_split` already established. No dedicated join/registration wire
+message was added or needed.
 
 ## Consequences
 
@@ -208,7 +260,7 @@ This is a 6-PR stack, each independently reviewable, stacked in this order:
    `parse_alloc_id`, an `"alloc-{n}"`-prefixed string mint over the old
    `AllocateNodeId` counter) so the allocator kept working with string ids for
    exactly one PR before PR4 retired it outright.
-4. **PR4 (this commit)** — Decision C in full (`NodeId::mint`,
+4. **PR4 (landed)** — Decision C in full (`NodeId::mint`,
    `MetaCommand::RegisterNode`'s registration CAS, `is_relayable_command`) and
    the join-path/`control-add` half of Decision D: retires the ADR 0036
    allocator and PR3's shim alike (`AllocateNodeId`, `next_alloc_id`/
@@ -222,13 +274,43 @@ This is a 6-PR stack, each independently reviewable, stacked in this order:
    `ALLOC_ID_BASE`-range refusal (no ranges exist anymore) and the
    "already exists as a member" refusal (promoting an existing member to a
    control voter is the common case now, not a conflict).
-5. **PR5** — cleanup/docs: delete `Coresident`; amendment stanzas on ADRs
-   0012, 0026, 0030, 0032, 0035, 0036, 0037, 0038 (this ADR's own Decision
-   text above previews what each amendment will say); `docs/engineering-
-   lessons.md` + crate `CLAUDE.md` sweep; dashboard id-truncation polish.
+5. **PR5 (this commit)** — cleanup/docs, per this ADR's own stanza-drafting
+   promise above, delivered in one pass rather than incrementally re-editing
+   the same ADRs across five separate PRs:
+   - **Deleted**: the vestigial `Coresident`/`sibling` trait and its
+     `ProdEnv` machinery (`bind_with_pool`/`PoolSlot`/the pool field/
+     `shutdown_tasks`) and `SimEnv` impl — zero live call sites since the
+     per-tablet CP groups migrated onto ADR 0026 streams; see
+     `animus-env/CLAUDE.md`.
+   - **Deliberately kept, not deleted**: `Metadata::cp_member_addrs`/
+     `cp_member_tablets` and `MetaCommand::RegisterCpAddr` (`animus-control`).
+     These looked, at first glance, like they'd become fully redundant with
+     the unified `NodeAddrs.internal` this ADR's Decision A/B already
+     deliver — and functionally, on a freshly bootstrapped cluster, nothing
+     in `animusd`'s production paths proposes `RegisterCpAddr` anymore (it's
+     already documented as "kept for WAL back-compat only" — see
+     `animus-control/CLAUDE.md`'s `meta.rs` entry). But three things still
+     genuinely read it: `animusd::peer_sync_loop` merges
+     `Metadata.cp_member_addrs` into the node's live peer book every tick
+     (harmless-but-live, not dead code); the ADR 0038 PR6 system-keyspace
+     browse endpoint (`GET /admin/system-table`) is explicitly designed to
+     surface every `EntityKind`, "including the internal/legacy ones — full
+     transparency by design" (`animus-control/CLAUDE.md`'s `syskv.rs` PR6
+     entry) — deleting the kind it browses would contradict that design
+     goal, not fulfill it; and removing the field/command/`EntityKind`
+     variant outright touches `Metadata::apply`, `mirror.rs`'s derivation +
+     restart-rebuild round trip, `syskv.rs`'s key encoding, `admin.rs`'s
+     JSON view, and roughly a dozen test call sites across
+     `animus-control`/`animusd` — a genuine feature removal, not the "small
+     deletion" this cleanup PR's scope calls for. Left in place; a future PR
+     that wants to actually retire `RegisterCpAddr` should treat it as its
+     own reviewable change, not a drive-by in a docs PR.
+   - Amendment stanzas landed on ADRs 0012, 0026, 0030, 0032, 0035, 0036,
+     0037, 0038 (this ADR's own Decision text above previews what each
+     says); `docs/adr/README.md`'s index updated to match; the root
+     `CLAUDE.md` + `animusd`/`animus-control`/`animus-env`/`animus-cp-data`
+     `CLAUDE.md`s swept for stale pre-ADR-0040 id-scheme claims;
+     `docs/engineering-lessons.md` verified/extended; dashboard
+     truncate-with-tooltip polish for 22-char minted ids (overview/
+     placement/raft tables).
 6. **PR6** — the orphan-member auto-reclaim sweep described above.
-
-Until PR5 lands, the other ADRs this one amends (0012, 0026, 0030, 0032,
-0035, 0036, 0037, 0038) are **not** yet stamped with amendment stanzas
-pointing back here — that stamping is PR5's own job, done once, in one pass,
-rather than incrementally re-editing the same ADRs across five separate PRs.
