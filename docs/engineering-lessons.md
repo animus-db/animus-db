@@ -1230,6 +1230,44 @@ debugging anything that feels like it might have happened before.
   right before X happens," check whether the very setup step used to get
   there is itself governed by the same increment rule being tested — if so,
   it will overshoot by exactly one step past where the story expects it to be.
+- **A DRIVER_APPLIED design (ADR 0038) makes every cache-backed read lag Raft
+  by an amount bounded only by apply-task starvation — so a test polling such
+  a read must poll for *forward progress* of the apply watermark, never
+  against a flat deadline.** The `decommission_drains_removes_and_allows_id_
+  reuse` flake: `/admin/status` reads `Metadata` off the async apply task's
+  `cache`, deliberately decoupled from the consensus loop so a slow engine
+  merge can't trip an election — which means under `cargo test --workspace`-
+  scale CPU contention the apply task can sit frozen for 30s+ (instrumented:
+  `commit_index`/`last_applied` converged in <1s while `engine_applied_index`
+  made zero progress for a full 60s, then caught up fine) with nothing wrong.
+  A flat 30s deadline turns that legitimate lag into a "flake"; bumping it
+  just moves the cliff. The principled shape: poll the apply task's own
+  watermark (`/admin/raft`'s `engine_applied_index`), fail only when it
+  *stops advancing* for a generous idle window with the awaited effect still
+  absent (that is a real stall, not contention), plus a large overall
+  backstop against livelock-shaped progress. This is the converged-or-timeout
+  rule's second-order refinement: when the property's convergence has no
+  contention-independent bound, the timeout must be on *progress*, not on
+  *arrival*. (`animusd/tests/decommission.rs`, `ControlHandle::
+  engine_applied_index`.)
+- **A retry loop whose confirmation read can never observe its own success is
+  a resurrection cannon.** The same investigation's production half:
+  `register_node`'s propose-then-confirm loop confirmed via
+  `metadata_fresh()`, which on a growth/non-voting node structurally never
+  advances (ADR 0030: its local Raft log doesn't move) — so every growth
+  node's one-shot self-registration re-proposed an already-committed
+  `RegisterNode` blindly for the whole `SCHEMA_COMMIT_TIMEOUT`, and a
+  drain+remove landing inside that window let a stale re-propose recreate
+  the just-removed member (apply can't tell a stale duplicate from a fresh
+  claim), which a live heartbeat then promoted straight back to `Active`.
+  Two generalizable checks: (a) for every propose-and-await confirmation,
+  ask "can *this caller's* read path ever observe the effect?" — a
+  confirmation source that is correct for one node shape (voter) can be
+  structurally blind on another (growth mirror); (b) an idempotent-looking
+  re-propose is not idempotent across an intervening *delete* — retry loops
+  for claim-style commands must stop as soon as any read shows the claim
+  ever existed, not only when the freshest read does. (`animusd::
+  register_node`'s `effective_metadata()` fallback.)
 
 ### Code patterns
 - **A "full replace" update to `Arc`-shared cached state tolerates a bare

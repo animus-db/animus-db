@@ -5894,16 +5894,44 @@ impl ClientCtx {
     /// we are it, else relayed — [`is_relayable_command`] allows this
     /// command) and wait for the claim to commit + replicate here,
     /// structurally identical to [`trigger_split`](Self::trigger_split) —
-    /// propose, then poll for the exact effect. **Unlike `trigger_split`,
-    /// this polls [`metadata_fresh`](Self::metadata_fresh)** (a genuine
-    /// read-your-writes round trip on `Remote`), not
-    /// `effective_metadata()`/`metadata_cached()`: a wrong "collision"
-    /// verdict here has real, structural consequences for the caller (a
-    /// minted id re-mints and retries; a proposed id fails loudly) that a
-    /// possibly-stale cached read could get wrong. The whole propose-then-
-    /// confirm loop runs here, server-side, in one round trip — the caller
-    /// (`spawn_common_tail`'s own one-shot self-registration, on **every**
-    /// node shape, or `admin_add_control_member`) just awaits the result.
+    /// propose, then poll for the exact effect. Primarily polls
+    /// [`metadata_fresh`](Self::metadata_fresh) (a genuine read-your-writes
+    /// round trip on `Remote`) rather than `effective_metadata()`/
+    /// `metadata_cached()`: a wrong "collision" verdict here has real,
+    /// structural consequences for the caller (a minted id re-mints and
+    /// retries; a proposed id fails loudly) that a possibly-stale cached
+    /// read could get wrong.
+    ///
+    /// **Falls back to [`effective_metadata`](Self::effective_metadata)
+    /// when `metadata_fresh()` hasn't (yet) confirmed anything** (root-cause
+    /// fix for a decommission-vs-self-registration race, see
+    /// `docs/engineering-lessons.md`): `metadata_fresh()`'s own doc already
+    /// documents that a growth/permanently-non-voting node's local
+    /// `RaftNode` "stays exactly as stuck" as it always was — its own local
+    /// Raft log never independently advances, by ADR 0030 design, so this
+    /// confirmation could **never** succeed for exactly the shape of caller
+    /// this function itself names as its primary one: `spawn_common_tail`'s
+    /// one-shot self-registration, which runs on *every* node shape,
+    /// including a growth node. Without the fallback, that self-registration
+    /// silently burns the *entire* `SCHEMA_COMMIT_TIMEOUT` re-proposing an
+    /// already-successful, already-committed `RegisterNode` on every single
+    /// join (never observing its own success), and if an operator drains +
+    /// removes that same node while this futile retry loop is still live,
+    /// the stale re-propose can land *after* `RemoveMember` clears
+    /// `node_addrs`/`members` — indistinguishable, at apply time, from a
+    /// genuinely fresh claim (`MetaCommand::RegisterNode`'s own apply arm
+    /// has no notion of "this identity was just decommissioned") — silently
+    /// resurrecting the just-removed node as a fresh `Down` member, which a
+    /// live heartbeat then promotes straight back to `Active`. The fallback
+    /// only ever *widens* when this converges (never narrows: `metadata_
+    /// fresh()` is still tried first, unchanged, so a genuine voter — for
+    /// which the two reads coincide, no mirror overlay ever being active —
+    /// sees no behavior change at all) — it makes a growth node's own
+    /// self-registration observe its own already-committed success
+    /// immediately (one `SCHEMA_POLL_INTERVAL` tick) instead of blindly
+    /// re-proposing for a full 10s, closing the race window this caused.
+    /// The other caller, `admin_add_control_member`, only ever runs from a
+    /// genuine control-group leader — the fallback is inert there too.
     ///
     /// Returns [`RegisterOutcome::Registered`] once `node_addrs[node]`
     /// equals exactly the `addrs` just proposed (whether from this call's
@@ -5926,11 +5954,14 @@ impl ClientCtx {
         };
         match self
             .propose_and_await(cmd, SCHEMA_COMMIT_TIMEOUT, || async {
-                match self.metadata_fresh().await.node_addrs.get(&node).cloned() {
-                    Some(existing) if existing == addrs => Some(RegisterOutcome::Registered),
-                    Some(_) => Some(RegisterOutcome::Collision),
-                    None => None,
+                if let Some(outcome) = Self::register_outcome_from(
+                    &self.metadata_fresh().await.node_addrs,
+                    &node,
+                    &addrs,
+                ) {
+                    return Some(outcome);
                 }
+                Self::register_outcome_from(&self.effective_metadata().node_addrs, &node, &addrs)
             })
             .await
         {
@@ -5940,6 +5971,24 @@ impl ClientCtx {
                  (no control-plane leader reachable?)",
                 SCHEMA_COMMIT_TIMEOUT.as_secs()
             )),
+        }
+    }
+
+    /// Shared verdict for [`register_node`](Self::register_node)'s two reads
+    /// (`metadata_fresh()` then, on `None`, the `effective_metadata()`
+    /// fallback): `node_addrs`'s entry for `node`, if any, exactly matches
+    /// `addrs` (`Registered`), is visibly something else (`Collision`), or
+    /// is absent (`None`, not yet observable from *this* source — the caller
+    /// tries the next one, or waits for the next poll tick).
+    fn register_outcome_from(
+        node_addrs: &BTreeMap<NodeId, NodeAddrs>,
+        node: &NodeId,
+        addrs: &NodeAddrs,
+    ) -> Option<RegisterOutcome> {
+        match node_addrs.get(node) {
+            Some(existing) if existing == addrs => Some(RegisterOutcome::Registered),
+            Some(_) => Some(RegisterOutcome::Collision),
+            None => None,
         }
     }
 

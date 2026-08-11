@@ -532,6 +532,27 @@ impl ControlHandle {
         }
     }
 
+    /// The highest Raft log index this node's `Metadata` **async apply
+    /// task** has durably merged into the published `cache` (introspection,
+    /// `/admin/raft`; ADR 0038 PR3) — distinct from, and can meaningfully lag
+    /// behind, [`last_applied`](Self::last_applied): the consensus loop
+    /// advances `last_applied` off the sync core alone (deliberately no
+    /// engine I/O, so a slow/contended engine merge never risks tripping an
+    /// election), while this value only advances once that engine write for
+    /// a batch has actually landed — the same decoupling that lets
+    /// `/admin/status` (which reads `Metadata` off this apply task's
+    /// `cache`, not the core) lag `/admin/raft`'s own
+    /// `commit_index`/`last_applied` by an amount bounded only by how
+    /// starved the apply task is, not by Raft. Always `0` for `Remote` — it
+    /// has no local apply task at all (see [`term`](Self::term)'s doc for
+    /// the same "no local Raft" reasoning).
+    pub(crate) fn engine_applied_index(&self) -> u64 {
+        match self {
+            Self::Local(raft) => raft.engine_applied_index(),
+            Self::Remote(_) => 0,
+        }
+    }
+
     /// This handle's view of the **live** control-voter configuration —
     /// introspection (`/admin/raft`) and the wire-discovery field
     /// [`ClientResponse::Status::control_voters`](crate::ClientResponse::Status)

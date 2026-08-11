@@ -386,7 +386,40 @@ async fn decommission_drains_removes_and_allows_id_reuse() {
 
     // 9. Poll: member absent AND its address-book entry pruned from
     // `/admin/status`, while the cluster keeps serving.
+    //
+    // **Idle-progress poll, not a flat deadline.** `/admin/member/remove`
+    // returning 200 only means `MetaCommand::RemoveMember` was *accepted* by
+    // the local Raft core (`ClientCtx::admin_remove_member`, mirroring every
+    // other control-plane admin action's fire-and-return shape) — the actual
+    // removal only becomes visible here once `RaftNode`'s **async apply
+    // task** (ADR 0038 PR3) merges it into the `Metadata` cache
+    // `/admin/status` reads, which is deliberately decoupled from Raft
+    // consensus (a slow/contended engine merge must never risk tripping an
+    // election) and so carries **no latency bound under contention** — see
+    // `ControlHandle::engine_applied_index`'s doc. This test's own
+    // instrumented reproduction (`taskset -c 0,1` plus background load,
+    // mimicking `cargo test --workspace`-scale contention) caught
+    // `/admin/raft`'s `commit_index`/`last_applied` converge across all
+    // three core nodes in under a second while the apply task's own
+    // `engine_applied_index` sat frozen — and, separately, made zero
+    // progress for a full 30s, then a full 60s, before eventually catching
+    // up — proving no single fixed deadline is principled here: the apply
+    // task can legitimately take arbitrarily long to *make progress* under
+    // contention, but once it stops making progress at all for a while with
+    // the target command still unapplied, that is no longer contention, it
+    // is a real bug. So this polls for **forward progress** of
+    // `engine_applied_index` (any single node's own apply-task watermark,
+    // read here off `core_admin[0]`) with a generous but bounded idle
+    // window, and only fails once that watermark has stopped advancing
+    // for `IDLE_STALL_TIMEOUT` with the member still present — plus an
+    // outer backstop against genuine deadlock. See
+    // `docs/engineering-lessons.md`.
+    const IDLE_STALL_TIMEOUT: Duration = Duration::from_secs(60);
+    const OVERALL_BACKSTOP: Duration = Duration::from_secs(300);
     let removed = async {
+        let overall_deadline = tokio::time::Instant::now() + OVERALL_BACKSTOP;
+        let mut last_progress_at = tokio::time::Instant::now();
+        let mut last_engine_applied: Option<u64> = None;
         loop {
             let (status, body) = admin(core_admin[0], "GET", "/admin/status", None).await;
             if status == 200 {
@@ -401,12 +434,37 @@ async fn decommission_drains_removes_and_allows_id_reuse() {
                     return;
                 }
             }
+            let (raft_status, raft_body) = admin(core_admin[0], "GET", "/admin/raft", None).await;
+            if raft_status == 200
+                && let Some(engine_applied) = raft_body["engine_applied_index"].as_u64()
+            {
+                if last_engine_applied != Some(engine_applied) {
+                    last_engine_applied = Some(engine_applied);
+                    last_progress_at = tokio::time::Instant::now();
+                } else if last_progress_at.elapsed() >= IDLE_STALL_TIMEOUT {
+                    panic!(
+                        "removed node never disappeared from /admin/status, and the \
+                         apply task's engine_applied_index has been stuck at \
+                         {engine_applied} for {IDLE_STALL_TIMEOUT:?} — this is no longer \
+                         contention-driven lag, something is actually stuck"
+                    );
+                }
+            }
+            if tokio::time::Instant::now() >= overall_deadline {
+                panic!(
+                    "removed node never disappeared from /admin/status within the \
+                     {OVERALL_BACKSTOP:?} backstop, despite apply-task progress \
+                     (last engine_applied_index={last_engine_applied:?})"
+                );
+            }
             sleep(Duration::from_millis(150)).await;
         }
     };
-    timeout(Duration::from_secs(30), removed)
-        .await
-        .unwrap_or_else(|_| panic!("removed node never disappeared from /admin/status"));
+    // No outer `tokio::time::timeout` here — `removed`'s own two panics above
+    // are its bounds (a real stall, or the generous overall backstop); a
+    // wrapping fixed timeout would reintroduce exactly the "arbitrary flat
+    // deadline" problem this poll was rewritten to avoid.
+    removed.await;
 
     // Cluster still serves reads + writes through the core.
     put(&core_clients, &hosted_table, b"post-remove", b"ok", 30).await;

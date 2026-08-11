@@ -450,6 +450,13 @@ fn raft_view(ctx: &ClientCtx) -> Value {
         "durable_index": r.durable_index(),
         "snapshot_index": r.snapshot_index(),
         "log_len": r.log_len(),
+        // ADR 0038 PR3: the `Metadata` async apply task's own watermark —
+        // what `/admin/status` (and every other `cache`-backed read) is
+        // actually gated on, which can lag `last_applied` above under
+        // contention (a slow/contended engine merge never blocks the
+        // consensus loop by design, but it does leave `cache` behind). See
+        // `ControlHandle::engine_applied_index`'s doc.
+        "engine_applied_index": r.engine_applied_index(),
         // `unwrap_or_default()`: ADR 0037 PR2 turned `config()` into an
         // honest `Option` (`None` == "unknown", not "zero voters") for a
         // `Remote` handle that hasn't observed a `Status` reply yet —
