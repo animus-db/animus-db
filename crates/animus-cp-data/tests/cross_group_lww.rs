@@ -30,6 +30,7 @@ use std::time::Duration;
 
 use animus_control::ProposeResult;
 use animus_cp_data::{RaftKvNode, StorageScope};
+use animus_env::nid;
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::MemoryEngine;
 use animus_tablet::KeyRange;
@@ -90,8 +91,8 @@ fn split_sibling_without_a_version_floor_silently_drops_an_overwrite() {
     let engine = MemoryEngine::new();
 
     let source: KvNode = RaftKvNode::start_hosted(
-        sim.env(NODE),
-        vec![NODE],
+        sim.env(nid(NODE)),
+        vec![nid(NODE)],
         engine.clone(),
         scope(KeyRange::whole()),
         1,
@@ -118,8 +119,8 @@ fn split_sibling_without_a_version_floor_silently_drops_an_overwrite() {
     // to the handed-off (upper) range — started the UN-SEEDED way (no
     // version floor), reproducing the hazard.
     let sibling: KvNode = RaftKvNode::start_hosted(
-        sim.env(NODE),
-        vec![NODE],
+        sim.env(nid(NODE)),
+        vec![nid(NODE)],
         engine.clone(),
         scope(KeyRange::new(BOUNDARY.to_vec(), None)),
         2,
@@ -151,8 +152,8 @@ fn split_sibling_seeded_with_a_version_floor_accepts_the_overwrite() {
     let engine = MemoryEngine::new();
 
     let source: KvNode = RaftKvNode::start_hosted(
-        sim.env(NODE),
-        vec![NODE],
+        sim.env(nid(NODE)),
+        vec![nid(NODE)],
         engine.clone(),
         scope(KeyRange::whole()),
         1,
@@ -169,8 +170,8 @@ fn split_sibling_seeded_with_a_version_floor_accepts_the_overwrite() {
     // Seeded with `source.version_floor() + 1` — exactly the
     // `MetaCommand::SplitTablet` apply-time formula.
     let sibling: KvNode = RaftKvNode::start_hosted_with_floor(
-        sim.env(NODE),
-        vec![NODE],
+        sim.env(nid(NODE)),
+        vec![nid(NODE)],
         engine.clone(),
         scope(KeyRange::new(BOUNDARY.to_vec(), None)),
         2,
@@ -207,8 +208,8 @@ fn merge_survivor_without_a_version_floor_bump_silently_drops_an_overwrite() {
 
     // `right`: owns the upper range, accumulates a high index, writes KEY.
     let right: KvNode = RaftKvNode::start_hosted(
-        sim.env(NODE),
-        vec![NODE],
+        sim.env(nid(NODE)),
+        vec![nid(NODE)],
         engine.clone(),
         scope(KeyRange::new(BOUNDARY.to_vec(), None)),
         2,
@@ -224,8 +225,8 @@ fn merge_survivor_without_a_version_floor_bump_silently_drops_an_overwrite() {
 
     // `left`: owns the lower range, has done far fewer writes (a low index).
     let left: KvNode = RaftKvNode::start_hosted(
-        sim.env(NODE),
-        vec![NODE],
+        sim.env(nid(NODE)),
+        vec![nid(NODE)],
         engine.clone(),
         scope(KeyRange::new(Vec::new(), Some(BOUNDARY.to_vec()))),
         1,
@@ -267,8 +268,8 @@ fn merge_survivor_with_a_version_floor_bump_accepts_the_overwrite() {
     let engine = MemoryEngine::new();
 
     let right: KvNode = RaftKvNode::start_hosted(
-        sim.env(NODE),
-        vec![NODE],
+        sim.env(nid(NODE)),
+        vec![nid(NODE)],
         engine.clone(),
         scope(KeyRange::new(BOUNDARY.to_vec(), None)),
         2,
@@ -280,8 +281,8 @@ fn merge_survivor_with_a_version_floor_bump_accepts_the_overwrite() {
     let right_floor = right.version_floor();
 
     let left: KvNode = RaftKvNode::start_hosted(
-        sim.env(NODE),
-        vec![NODE],
+        sim.env(nid(NODE)),
+        vec![nid(NODE)],
         engine.clone(),
         scope(KeyRange::new(Vec::new(), Some(BOUNDARY.to_vec()))),
         1,

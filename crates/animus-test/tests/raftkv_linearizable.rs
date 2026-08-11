@@ -68,7 +68,7 @@ use std::time::Duration;
 
 use animus_control::ProposeResult;
 use animus_cp_data::RaftKvNode;
-use animus_env::{Clock, EnvExt, Rng};
+use animus_env::{Clock, EnvExt, Rng, nid};
 use animus_sim::{NetConfig, SimEnv, Simulator};
 use animus_storage::{LsmEngine, LsmOptions, MemoryEngine, StorageEngine};
 use animus_test::history::{Key, Mop, Process};
@@ -410,7 +410,7 @@ fn lsm_opts() -> LsmOptions {
 /// replays its own WAL + manifest, then the Raft driver replays `raftkv.wal` on
 /// top (idempotent re-apply).
 fn lsm_engine(sim: &Simulator, id: u64) -> LsmEngine<SimEnv> {
-    block_on(LsmEngine::open_with(sim.env(id), "lsm/", lsm_opts())).expect("open lsm engine")
+    block_on(LsmEngine::open_with(sim.env(nid(id)), "lsm/", lsm_opts())).expect("open lsm engine")
 }
 
 // ---------------------------------------------------------------------------
@@ -510,8 +510,8 @@ impl<S: StorageEngine + 'static> Group<S> {
             .iter()
             .map(|&id| {
                 Arc::new(RaftKvNode::start(
-                    sim.env(id),
-                    ids.clone(),
+                    sim.env(nid(id)),
+                    ids.clone().into_iter().map(nid).collect(),
                     factory(&sim, id),
                 ))
             })
@@ -534,7 +534,7 @@ impl<S: StorageEngine + 'static> Group<S> {
     /// driver env, routing single-key ops to whichever group node currently leads.
     fn spawn_workload(&mut self, clients: usize, rounds: u64, keyspace: u64, read_pct: u64) {
         for (c, &client_id) in CLIENT_IDS.iter().enumerate().take(clients) {
-            let env = self.sim.env(client_id);
+            let env = self.sim.env(nid(client_id));
             let nodes = Arc::clone(&self.nodes);
             let shared = Arc::clone(&self.shared);
             let proc = c as Process;
@@ -552,7 +552,7 @@ impl<S: StorageEngine + 'static> Group<S> {
         match nem {
             Nemesis::LeaderKill => {
                 if let Some((li, _)) = leader_slot(&self.nodes) {
-                    self.sim.crash(ids[li]);
+                    self.sim.crash(nid(ids[li]));
                     self.crashed.insert(ids[li]);
                 }
             }
@@ -562,7 +562,7 @@ impl<S: StorageEngine + 'static> Group<S> {
                 let victim = (0..self.replicas)
                     .find(|&i| Some(i) != leader && !self.crashed.contains(&ids[i]));
                 if let Some(i) = victim {
-                    self.sim.crash(ids[i]);
+                    self.sim.crash(nid(ids[i]));
                     self.crashed.insert(ids[i]);
                 }
             }
@@ -570,7 +570,7 @@ impl<S: StorageEngine + 'static> Group<S> {
                 if let Some((li, _)) = leader_slot(&self.nodes) {
                     for j in 0..self.replicas {
                         if j != li {
-                            self.sim.partition_pair(ids[li], ids[j]);
+                            self.sim.partition_pair(nid(ids[li]), nid(ids[j]));
                         }
                     }
                 }
@@ -592,11 +592,15 @@ impl<S: StorageEngine + 'static> Group<S> {
                 // Process exit: tasks + in-memory RaftCore + un-synced disk die;
                 // the synced WAL (and, on the LSM tier, the engine's files)
                 // survive.
-                self.sim.stop(vid);
+                self.sim.stop(nid(vid));
                 // A fresh node on the same id: re-open the engine from disk and
                 // recover the Raft state from the durable WAL, then rejoin.
                 let engine = (self.factory)(&self.sim, vid);
-                let fresh = Arc::new(RaftKvNode::start(self.sim.env(vid), ids.clone(), engine));
+                let fresh = Arc::new(RaftKvNode::start(
+                    self.sim.env(nid(vid)),
+                    ids.clone().into_iter().map(nid).collect(),
+                    engine,
+                ));
                 self.nodes.lock().unwrap()[vi] = fresh;
                 // Proposals made to the old node object died with it.
                 self.shared.bump_epoch();
@@ -605,7 +609,7 @@ impl<S: StorageEngine + 'static> Group<S> {
                 // Every replica an island: no majority anywhere, commits stall.
                 for i in 0..self.replicas {
                     for j in (i + 1)..self.replicas {
-                        self.sim.partition_pair(ids[i], ids[j]);
+                        self.sim.partition_pair(nid(ids[i]), nid(ids[j]));
                     }
                 }
             }
@@ -618,7 +622,7 @@ impl<S: StorageEngine + 'static> Group<S> {
                     for &m in &minority {
                         for o in 0..self.replicas {
                             if !minority.contains(&o) {
-                                self.sim.partition_pair(ids[m], ids[o]);
+                                self.sim.partition_pair(nid(ids[m]), nid(ids[o]));
                             }
                         }
                     }
@@ -632,12 +636,12 @@ impl<S: StorageEngine + 'static> Group<S> {
         let ids: Vec<u64> = GROUP_IDS[..self.replicas].to_vec();
         for i in 0..ids.len() {
             for j in (i + 1)..ids.len() {
-                self.sim.heal(ids[i], ids[j]);
+                self.sim.heal(nid(ids[i]), nid(ids[j]));
             }
         }
         let crashed: Vec<u64> = self.crashed.iter().copied().collect();
         for v in crashed {
-            self.sim.restart(v);
+            self.sim.restart(nid(v));
         }
         self.crashed.clear();
         self.sim.set_net_config(NetConfig::default());

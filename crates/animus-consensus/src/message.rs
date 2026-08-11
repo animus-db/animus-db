@@ -51,13 +51,13 @@ pub enum AccordMsg {
     /// Coordinator → replicas (slow path): adopt this execution timestamp and
     /// dependency set for `txn`. `ballot` is the proposal number this round runs
     /// under (ADR 0011, recovery ballots): the **original** coordinator uses the
-    /// implicit [`Ballot::ZERO`](crate::Ballot::ZERO); a **recovery** coordinator
+    /// implicit [`Ballot::zero()`](crate::Ballot::zero()); a **recovery** coordinator
     /// uses the higher ballot it adopted. A replica rejects an `Accept` whose
     /// ballot is below the one it has promised (a higher recoverer superseded
     /// it), replying [`AccordMsg::AcceptNack`] with the promised ballot.
     Accept {
         txn: TxnId,
-        /// The proposal ballot this `Accept` runs under (`Ballot::ZERO` for the
+        /// The proposal ballot this `Accept` runs under (`Ballot::zero()` for the
         /// original coordinator). `#[serde(default)]` so the field is additive.
         #[serde(default)]
         ballot: Ballot,
@@ -84,12 +84,12 @@ pub enum AccordMsg {
     Commit {
         txn: TxnId,
         /// The **ballot** this commit was decided under (ADR 0011): the original
-        /// coordinator commits at the implicit [`Ballot::ZERO`](crate::Ballot::ZERO);
+        /// coordinator commits at the implicit [`Ballot::zero()`](crate::Ballot::zero());
         /// a *recovery* coordinator at the higher ballot it ran. A replica records
         /// the highest commit-ballot it has seen and **ignores a `Commit` whose
         /// ballot is below it**, so a late original-coordinator commit cannot revert
         /// a higher-ballot recovered decision after a heal (the failure-detector
-        /// heal race). `#[serde(default)]` for additivity (absent ⇒ `Ballot::ZERO`).
+        /// heal race). `#[serde(default)]` for additivity (absent ⇒ `Ballot::zero()`).
         #[serde(default)]
         ballot: Ballot,
         execute_at: Timestamp,
@@ -122,7 +122,7 @@ pub enum AccordMsg {
     Recover {
         txn: TxnId,
         /// The recovery ballot this query runs under. `#[serde(default)]` for
-        /// additivity (an absent ballot decodes to [`Ballot::ZERO`]).
+        /// additivity (an absent ballot decodes to [`Ballot::zero()`]).
         #[serde(default)]
         ballot: Ballot,
     },
@@ -143,7 +143,7 @@ pub enum AccordMsg {
         /// The best-known dependency set.
         deps: BTreeSet<TxnId>,
         /// The ballot under which this replica last **accepted** the reported
-        /// `(execute_at, deps)` (via `Accept`), or [`Ballot::ZERO`] if it has
+        /// `(execute_at, deps)` (via `Accept`), or [`Ballot::zero()`] if it has
         /// only PreAccepted. The recoverer adopts the `(execute_at, deps)` of the
         /// reply with the **highest** accepted ballot — the most recent proposal
         /// any replica committed to — so duelling recoverers converge. (ADR 0011.)

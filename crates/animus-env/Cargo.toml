@@ -16,3 +16,5 @@ async-trait.workspace = true
 tokio.workspace = true
 rand.workspace = true
 tracing.workspace = true
+serde.workspace = true
+thiserror.workspace = true

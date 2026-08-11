@@ -50,6 +50,7 @@ async fn per_process_nodes_form_a_cluster_from_shared_config() {
         let addrs = support::free_addrs(n * 5);
         let nodes_cfg: Vec<RoleAddrs> = (0..n)
             .map(|i| RoleAddrs {
+                id: animusd::config::node_id(i),
                 role: animusd::config::NodeRole::Both,
                 internal: addrs[5 * i],
                 client: addrs[5 * i + 1],

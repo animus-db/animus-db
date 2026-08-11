@@ -1118,6 +1118,70 @@ debugging anything that feels like it might have happened before.
   is the root `CLAUDE.md`'s "grep before implementing a documented gap"
   practice applying just as much to a task-prompt's own named follow-up as
   to an ADR's prose.
+- **When a registration/claim CAS is meant to be the "sole claim path," audit
+  every *existing* call site that currently establishes the same identity
+  through a wholly different, older command before tightening the CAS's
+  companion update-only command — a design that only reasons about "the new
+  join flow" misses the others and ships a bimodal per-process hang.**
+  Retiring the ADR 0036 allocator for ADR 0040's `MetaCommand::RegisterNode`
+  CAS, the obvious design compares the *proposed* `NodeAddrs` **and**
+  `labels` against whatever's on file, rejecting a mismatch as a genuine
+  collision — and it looks right in isolation (a fresh unit test proves the
+  fresh-claim and reject-on-mismatch cases cleanly). It broke
+  `animusd`'s `runtime_added_voter_survives_leadership_change_to_a_different_
+  original_voter` integration test (a real, pre-existing scenario, not a new
+  one this PR added) with a 15-second timeout, not a compile error: a
+  permanently-non-voter *control-only* growth node
+  (`BoundControlNode::start_control_with`) has **no other command that ever
+  claims its membership** — no `bootstrap()` insert (it's outside the
+  pre-growth set), no `admin_add_member` call (that branch only exists in
+  `BoundNode::start_with`'s combined-mode growth path) — so its *own*
+  self-registration is the *only* thing that ever creates its `members` row,
+  and a labels-strict CAS run against a `Metadata` where that row doesn't
+  exist yet works fine there. The failure mode that unit tests alone don't
+  reach: a **combined-mode** growth node's `admin_add_member(node, real_labels)`
+  (via `UpsertMember`) and its own `spawn_common_tail` self-registration race
+  *independently* (two unrelated `tokio::spawn` tasks with no ordering
+  between them) — whichever wins first "claims" membership with its own
+  labels, and the *other* command's differing labels then permanently fail
+  a labels-inclusive CAS comparison against a `Metadata` that already has a
+  `members` row but not yet a `node_addrs` one, since there is nothing there
+  to ever become "identical" (the losing command retries forever, always
+  rejected, since the winner's row never changes). **Fix**: key the CAS on
+  the *one field only this command ever writes* (`node_addrs` alone, not
+  `members`/`labels`), so "member already claimed by some other, decoupled
+  command with no address yet" is treated as an unclaimed *address* slot,
+  never a collision — the actual identity/address collision this CAS exists
+  to prevent is always visible in that one field regardless of which
+  membership-establishing command got there first. **General rule**: before
+  shipping a CAS meant to be the sole path for claiming X, grep for every
+  *pre-existing* command that can independently create a partial version of
+  X (here: three different call sites all capable of inserting a `members`
+  row with no matching `node_addrs` entry) and design the collision key
+  around the field the CAS actually owns, not the union of every field a
+  fully-formed claim eventually has — then add a regression unit test for
+  exactly the "claimed via a different command, no address yet" shape, not
+  just the two obvious cases a fresh design starts with. (`animus-control`'s
+  `meta.rs::register_node_claims_an_address_for_a_member_already_claimed_
+  without_one`; ADR 0040 PR4.)
+- **A test-only deterministic double for a trait bounded `Send + Sync` (the
+  `Env`/`Rng` seam, ADR 0003) must use atomics, not `Cell`, even though the
+  double never crosses a real thread boundary in the test itself.** A
+  scripted `Rng` built to prove `NodeId::mint`'s draw shape from a fixed
+  sequence used `Cell<usize>`/`Cell<u64>` for its cursor/fallback-counter —
+  compiles fine as a bare struct, then fails with "cannot be shared between
+  threads safely" the moment `impl Rng for ScriptedRng` is written, because
+  the *trait itself* requires `Send + Sync` (every `Env`/`Rng` implementor
+  must be usable from `tokio::spawn`'d code in production) — the compiler
+  enforces this at the `impl` site regardless of whether any given test
+  actually spawns the double across threads. Fix: `AtomicUsize`/`AtomicU64`
+  with `Ordering::Relaxed` (a single-threaded test never contends on them, so
+  the ordering choice is moot) — same shape as any other `Send + Sync`
+  interior-mutability need in this codebase. General rule: a test double for
+  an `Env`-seam trait is never exempt from that trait's own bounds just
+  because the specific test using it happens to be single-threaded — check
+  the trait's supertrait bounds before reaching for `Cell`/`RefCell`.
+  (`animus-env/src/lib.rs::tests::ScriptedRng`, ADR 0040 PR4.)
 
 ### Code patterns
 - **A "full replace" update to `Arc`-shared cached state tolerates a bare
@@ -3036,6 +3100,132 @@ debugging anything that feels like it might have happened before.
   grow_control_group_converges_everywhere}`, `control_membership_split.rs::
   grow_then_replace_a_voter_over_a_split_deployment_with_live_data_traffic`,
   ADR 0040 PR1.)
+- **A compiler-error-driven auto-fixer that blindly applies the *primary*
+  span of a "mismatched types" diagnostic corrupts call sites where rustc's
+  primary span is the *callee*, not the mismatched argument.** Turning
+  `NodeId` into a newtype (ADR 0040 PR2) meant sweeping ~300+
+  now-mismatched-argument call sites; scripting "wrap the primary span's
+  text in `nid(...)`" off `cargo build --message-format=json` worked for the
+  common single-bad-argument shape, but rustc collapses a call with **two or
+  more** simultaneously-mismatched arguments into one diagnostic titled
+  "arguments to this method are incorrect" whose *primary* span underlines
+  the **method name** (e.g. `partition_pair`) for the "where" location, with
+  each individual argument's mismatch riding a separate **non-primary**
+  span. Blindly wrapping the primary span turned `sim.partition_pair(1, 2)`
+  into `sim.nid(partition_pair)(1, 2)` — syntactically bizarre but *some*
+  of these slipped past a first pass because the corruption doesn't always
+  fail in the same file/build batch it was introduced in (a cascading parse
+  error elsewhere can suppress it from that round's diagnostics, so it only
+  surfaces once the parse error blocking it is separately fixed). **Fix:
+  detect the multi-argument shape from the diagnostic (rendered message
+  `"arguments to (this method|this function) are incorrect"`, or simply:
+  primary span text is an identifier matching the callee, not an
+  expression) and wrap each individual **argument's own non-primary span**
+  instead of the call's primary span.** A second, related hazard from the
+  same sweep: wrapping array/`vec!` literal elements one at a time from
+  per-element diagnostics can leave a literal **partially wrapped** (`[nid(0),
+  1, 2]`) if only the first element's mismatch was reported in a given pass —
+  always re-scan finished literals for a bare integer sitting next to an
+  already-`nid(...)`-wrapped sibling before considering a file done. General
+  rule for any future compiler-diagnostic-driven bulk rewrite: **verify one
+  layer down from "which span does the tool report as primary" before
+  trusting it as "the expression to edit"** — a fresh `cargo build
+  --workspace --all-targets --keep-going` after every batch of edits (not
+  just after the batch that seems to close out a file) is what caught these,
+  since a still-corrupted call site fails loudly (parse error or a
+  nonsensical type error) rather than silently. (ADR 0040 PR2, `animus-env`
+  `NodeId` newtype sweep — corruption found and fixed in `animus-sim`,
+  `animus-consensus`, `animus-cp-data`, and `animus-control` test files.)
+- **A `NodeId` representation change (`u64` → a validated string) breaks tests
+  that hardcode its *rendering*, not just its *type* — and these compile
+  clean, so only a green-then-red gate catches them.** ADR 0040 PR3 changed
+  `NodeId`'s `Display` from a bare integer (`"0"`) to `"n0"`/an
+  operator-proposed string/an allocator-minted `"alloc-…"`. Two distinct
+  failure shapes, neither a compile error: (1) `accord_backoff.rs`'s
+  `sends_from` helper built its trace-grep needle as
+  `format!("SEND {from}->")` with `from: u64` interpolated bare (`"SEND
+  0->"`), but the actual trace line now renders `"SEND n0->n1"` — the needle
+  silently matched **zero** lines forever, so a `sends >= 4` liveness
+  assertion failed at its *frozen, fixed* seed on every run, not
+  intermittently. Fix: build the needle from the same `NodeId` the trace
+  formatter uses (`format!("SEND {}->", nid(from))`), never re-derive a
+  numeric-looking string independently. (2) A test asserting an
+  allocator-minted id "never collides with a small manual id" via `first >
+  nid(302)` silently flipped from true to false: `"alloc-1000000"` sorts
+  *before* `"n302"` lexicographically (`'a' < 'n'`), even though the ids are
+  genuinely disjoint by their reserved-prefix *namespace*. **General rule:
+  after any type whose `Display`/`Ord` semantics change from "numeric
+  magnitude" to "opaque string," grep every test for `format!` needles built
+  from the raw numeric seed instead of the real formatted value, and for
+  `<`/`>`/`>=`/`<=` comparisons that encode a magnitude assumption — both
+  compile fine and fail (or silently stop testing anything) only at
+  execution.** (`animus-consensus/tests/accord_backoff.rs`,
+  `animus-control/src/meta.rs::allocate_node_id_is_monotonic_and_disjoint_
+  from_small_manual_ids`, ADR 0040 PR3 — that specific test, and the
+  allocator/`"alloc-…"` mechanism it illustrated, were deleted in ADR 0040
+  PR4; the general rule above outlives it and still applies to any other
+  `Display`/`Ord` semantics change.)
+- **A lowercase, single-letter-plus-parens test helper name (`fn c() -> T`)
+  can collide with an equally-terse, ubiquitous local variable of a
+  completely different type, and the resulting error reads as a type
+  mismatch far from the real cause.** Renaming a PR2-era `const C: NodeId`
+  (uppercase, never shadows anything) to a PR3-era `fn c() -> NodeId`
+  (lowercase, matching this codebase's `nid`-helper convention) collided with
+  `reconciler_corpus.rs`'s own near-universal `let mut c = Cluster::new(sim);`
+  scenario-harness variable — every `c()` call after that point parsed as
+  "call the local `Cluster` value named `c`," not the function, producing
+  "expected function, found `Cluster`" at a dozen unrelated-looking call
+  sites. **General rule: when a mechanical rename turns a `const` into a
+  `fn`, or otherwise introduces a new lowercase short binding, grep the
+  target file(s) for that exact identifier already in use as a *local
+  variable* before trusting the rename is safe** — a real type-level
+  namespace (`const`/`static`/type-level items don't shadow local `let`
+  bindings the same way a same-named `fn` at module scope does once called
+  with `()`) doesn't protect against this once the item becomes callable.
+  Fixed by renaming the function to a distinct name (`node_c`) instead of
+  chasing every shadowing call site. (`animus-cp-data/tests/
+  reconciler_corpus.rs`, ADR 0040 PR3.)
+- **Loosening a parsed type's charset can silently turn a test's "garbled,
+  must-be-rejected" fixture into a now-valid value the parser accepts.**
+  `animusd::topology::parse_not_leader_refusal`'s garbled-hint-suffix test
+  used `"notanumber"` as its not-a-real-id fixture — correct while `NodeId`
+  parsed as `u64` (that string could never parse), silently wrong once ADR
+  0040 PR3 gave `NodeId` a permissive `[A-Za-z0-9._-]{1,64}` charset:
+  `"notanumber"` is now syntactically a perfectly valid id, so the parse
+  that was supposed to fail-and-fall-back to "no hint" instead succeeded,
+  and the test failed asserting the old ("garbled") outcome against the new
+  (correct) one. Fix: use a fixture with a character truly outside the new
+  charset (a space), not a string that merely *used to* fail a stricter
+  parse. **General rule: when a validated type's accepted-charset widens,
+  grep tests for "deliberately invalid" string literals used as negative
+  fixtures — a literal that was invalid only by the old, narrower rule
+  needs replacing, not just recompiling.** (`animusd/src/topology.rs::
+  not_leader_refusal_tolerates_a_garbled_hint_suffix`, ADR 0040 PR3.)
+- **When a CLI's identity scheme changes from "operator-picked index" to
+  "explicit-or-self-minted string id," a test-support helper that used to
+  take the index can usually keep its own signature unchanged — just have it
+  derive the new explicit id *from* the index it already takes
+  (`config::node_id(index)`) at the one internal call site, rather than
+  propagating the new `Option<NodeId>` parameter out through every test file
+  that calls it.** ADR 0040 PR4 replaced `run_node_join(seeds, index: usize,
+  ..)` with `run_node_join(seeds, id: Option<NodeId>, .., labels)` — a
+  breaking signature change — but `animusd/tests/support/mod.rs`'s
+  `join_fresh_deadline(seeds, index: usize, ..)` (called from
+  `seed_join.rs`/`decommission.rs`/`cluster_growth.rs`) kept its own
+  `index: usize` parameter and just changed its one-line internal call to
+  `run_node_join(seeds, Some(config::node_id(index)), ..)`. Every caller
+  outside `support/mod.rs` — which mostly just wants "a distinct, readable,
+  deterministic test id for slot N," not "test the new CLI surface itself" —
+  compiled and passed completely unchanged; only the two direct,
+  bypass-the-helper call sites in `seed_join.rs` (a rejoin helper and an
+  explicit collision-guard test) needed updating to pass the id directly.
+  **General rule: when a lower-layer API's identity parameter type changes,
+  look for the test-support layer that already had a stable, semantically-
+  named wrapper around the old parameter before touching every call site —
+  the wrapper is usually the one and only place that needs to translate the
+  old convention into the new one, and preserving its signature is what
+  keeps a large, otherwise-unrelated test suite's diff to nearly nothing.**
+  (ADR 0040 PR4.)
 
 ### Parallel-agent orchestration
 - **Partition work by disjoint crate ownership — exactly one owner per shared

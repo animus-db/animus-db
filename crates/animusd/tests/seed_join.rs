@@ -74,7 +74,16 @@ async fn rejoin_same(
 ) -> Node {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
-        match animusd::run_node_join(seeds.to_vec(), index, addrs, dir, backend).await {
+        match animusd::run_node_join(
+            seeds.to_vec(),
+            Some(animusd::config::node_id(index)),
+            addrs.clone(),
+            dir,
+            backend,
+            std::collections::BTreeMap::new(),
+        )
+        .await
+        {
             Ok(node) => return node,
             Err(e) => {
                 assert!(
@@ -128,7 +137,9 @@ async fn admin(
 
 /// Every member's status, `raftkv_id -> "Active"/"Down"/...`, from
 /// `/admin/status`.
-async fn member_statuses(admin_addr: SocketAddr) -> std::collections::BTreeMap<u64, String> {
+async fn member_statuses(
+    admin_addr: SocketAddr,
+) -> std::collections::BTreeMap<animus_env::NodeId, String> {
     let (_s, v) = admin(admin_addr, "GET", "/admin/status", None).await;
     v["members"]
         .as_object()
@@ -136,7 +147,7 @@ async fn member_statuses(admin_addr: SocketAddr) -> std::collections::BTreeMap<u
         .iter()
         .map(|(id, m)| {
             (
-                id.parse().expect("member id key is numeric"),
+                id.parse().expect("member id key is a valid NodeId"),
                 m["status"].as_str().expect("status is a string").to_owned(),
             )
         })
@@ -157,7 +168,10 @@ async fn member_statuses(admin_addr: SocketAddr) -> std::collections::BTreeMap<u
 /// a distinct, cross-hop routing case `cp_serve_forwarded` never retries
 /// around (it forwards at most one hop) and not what this test means to
 /// exercise, so step 5 must pick a table this returns, not any/every table.
-async fn table_with_replica(admin_addr: SocketAddr, raftkv_id: u64) -> Option<String> {
+async fn table_with_replica(
+    admin_addr: SocketAddr,
+    raftkv_id: &animus_env::NodeId,
+) -> Option<String> {
     let (_s, v) = admin(admin_addr, "GET", "/admin/status", None).await;
     v["tablets"]
         .as_object()
@@ -168,8 +182,8 @@ async fn table_with_replica(admin_addr: SocketAddr, raftkv_id: u64) -> Option<St
                 .as_array()
                 .expect("replicas is an array")
                 .iter()
-                .filter_map(serde_json::Value::as_u64)
-                .any(|r| r == raftkv_id);
+                .filter_map(|r| r.as_str())
+                .any(|r| r == raftkv_id.as_str());
             has_replica
                 .then(|| t["table"].as_str().map(str::to_owned))
                 .flatten()
@@ -289,7 +303,7 @@ async fn node_joins_via_seed_with_no_expanded_config() {
     let hosted_table: String = {
         let discover = async {
             loop {
-                if let Some(table) = table_with_replica(core_admin[0], join_raftkv_id).await {
+                if let Some(table) = table_with_replica(core_admin[0], &join_raftkv_id).await {
                     return table;
                 }
                 sleep(Duration::from_millis(300)).await;
@@ -348,6 +362,7 @@ async fn node_joins_via_seed_with_no_expanded_config() {
     let collision_addrs = {
         let raw = support::free_addrs(5);
         RoleAddrs {
+            id: join_raftkv_id.clone(),
             role: animusd::config::NodeRole::Both,
             internal: raw[0],
             client: raw[1],
@@ -358,10 +373,11 @@ async fn node_joins_via_seed_with_no_expanded_config() {
     };
     let collision_result = animusd::run_node_join(
         core_clients.clone(),
-        join_index,
+        Some(join_raftkv_id.clone()),
         collision_addrs,
         &dir.path().join("collision"),
         StorageBackend::default(),
+        std::collections::BTreeMap::new(),
     )
     .await;
     let err = match collision_result {

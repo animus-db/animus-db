@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use animus_control::ProposeResult;
 use animus_cp_data::RaftKvNode;
-use animus_env::{EnvExt, Metric, MetricsHandle};
+use animus_env::{EnvExt, Metric, MetricsHandle, nid};
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::MemoryEngine;
 use futures::executor::block_on;
@@ -46,8 +46,8 @@ fn group(seed: u64) -> (Simulator, Vec<KvNode>, Vec<MetricsHandle>) {
         .enumerate()
         .map(|(i, &id)| {
             RaftKvNode::start_with_metrics(
-                sim.env(id),
-                NODES.to_vec(),
+                sim.env(nid(id)),
+                NODES.iter().copied().map(nid).collect(),
                 MemoryEngine::new(),
                 handles[i].clone(),
             )
@@ -191,7 +191,7 @@ fn run(seed: u64) {
     // --- Reconfigure: a single-server membership change is accepted. ---
     let mut voters: BTreeSet<u64> = NODES.iter().copied().collect();
     voters.remove(&(follower as u64));
-    match nodes[leader].change_membership(voters) {
+    match nodes[leader].change_membership(voters.into_iter().map(nid).collect()) {
         ProposeResult::Accepted { .. } => {}
         other => panic!("leader rejected the reconfigure: {other:?} (seed={seed})"),
     }

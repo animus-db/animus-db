@@ -13,6 +13,7 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use animus_consensus::{AccordNode, Key, TxnId};
+use animus_env::nid;
 use animus_sim::{SimEnv, Simulator};
 use futures::executor::block_on;
 
@@ -22,7 +23,7 @@ fn cluster(seed: u64) -> (Simulator, Vec<AccordNode<SimEnv>>) {
     let sim = Simulator::new(seed);
     let nodes = NODES
         .iter()
-        .map(|&id| AccordNode::start(sim.env(id), NODES.to_vec()))
+        .map(|&id| AccordNode::start(sim.env(nid(id)), NODES.iter().copied().map(nid).collect()))
         .collect();
     (sim, nodes)
 }
@@ -53,8 +54,8 @@ fn recovery_commits_a_stranded_transaction() {
     // Node 0 cannot reach node 2 at all, and node 1's *reply* to node 0 is dropped
     // (the PreAccept 0→1 still gets through, so node 1 learns the keys). Node 0
     // thus has only its own vote and stalls; node 2 can still reach node 1.
-    sim.partition_pair(0, 2);
-    sim.partition(1, 0);
+    sim.partition_pair(nid(0), nid(2));
+    sim.partition(nid(1), nid(0));
 
     let txn = nodes[0].submit(keys(&[7]));
     // Settle the (failed) fast-quorum attempt, but stay **inside** the driver's
@@ -66,36 +67,36 @@ fn recovery_commits_a_stranded_transaction() {
 
     // The coordinator is stranded: nobody has committed.
     assert!(
-        nodes[0].committed_execute_at(txn).is_none(),
+        nodes[0].committed_execute_at(txn.clone()).is_none(),
         "stalled coordinator should not have committed (seed={seed})"
     );
     assert!(
-        nodes[1].committed_execute_at(txn).is_none()
-            && nodes[2].committed_execute_at(txn).is_none(),
+        nodes[1].committed_execute_at(txn.clone()).is_none()
+            && nodes[2].committed_execute_at(txn.clone()).is_none(),
         "survivors should not have committed a stranded txn yet (seed={seed})"
     );
 
     // A surviving replica (node 2) takes over and recovers the transaction. It
     // can reach node 1 (only node 0 is partitioned away).
-    nodes[2].recover(txn);
+    nodes[2].recover(txn.clone());
     sim.run_for(Duration::from_secs(2));
 
     // Both survivors committed it at the same execution timestamp and deps.
-    let e1 = nodes[1].committed_execute_at(txn);
-    let e2 = nodes[2].committed_execute_at(txn);
+    let e1 = nodes[1].committed_execute_at(txn.clone());
+    let e2 = nodes[2].committed_execute_at(txn.clone());
     assert!(
         e1.is_some() && e1 == e2,
         "survivors disagree on the recovered commit: {e1:?} vs {e2:?} (seed={seed})"
     );
     assert_eq!(
-        nodes[1].committed_deps(txn),
-        nodes[2].committed_deps(txn),
+        nodes[1].committed_deps(txn.clone()),
+        nodes[2].committed_deps(txn.clone()),
         "survivors disagree on recovered deps (seed={seed})"
     );
 
     // And it executed everywhere it committed, with a converged store.
     assert!(
-        nodes[1].is_applied(txn) && nodes[2].is_applied(txn),
+        nodes[1].is_applied(txn.clone()) && nodes[2].is_applied(txn.clone()),
         "recovered txn did not execute on the survivors (seed={seed})"
     );
     assert_eq!(
@@ -116,28 +117,28 @@ fn recovery_commits_a_stranded_transaction() {
 fn recovery_consistent_across_seeds() {
     for seed in 0xFA11_1000..0xFA11_1020 {
         let (mut sim, nodes) = cluster(seed);
-        sim.partition_pair(0, 2);
+        sim.partition_pair(nid(0), nid(2));
 
         let txn = nodes[0].submit(keys(&[3, 4]));
         sim.run_for(Duration::from_secs(1));
 
-        nodes[2].recover(txn);
+        nodes[2].recover(txn.clone());
         sim.run_for(Duration::from_secs(2));
 
-        let e1 = nodes[1].committed_execute_at(txn);
-        let e2 = nodes[2].committed_execute_at(txn);
+        let e1 = nodes[1].committed_execute_at(txn.clone());
+        let e2 = nodes[2].committed_execute_at(txn.clone());
         assert!(
             e1.is_some() && e1 == e2,
             "survivors disagree on recovery (seed={seed}): {e1:?} vs {e2:?}"
         );
         assert!(
-            nodes[1].is_applied(txn) && nodes[2].is_applied(txn),
+            nodes[1].is_applied(txn.clone()) && nodes[2].is_applied(txn.clone()),
             "recovered txn not executed (seed={seed})"
         );
         for &k in &[3u64, 4u64] {
             assert_eq!(
                 store_writer(&nodes[1], k),
-                Some(txn),
+                Some(txn.clone()),
                 "node 1 missing recovered write on key {k} (seed={seed})"
             );
             assert_eq!(
@@ -164,28 +165,28 @@ fn recovery_adopts_an_existing_commit() {
     sim.run_for(Duration::from_secs(2));
 
     // The transaction committed and executed everywhere.
-    let committed_at = nodes[0].committed_execute_at(txn);
+    let committed_at = nodes[0].committed_execute_at(txn.clone());
     assert!(
         committed_at.is_some(),
         "txn should have committed (seed={seed})"
     );
     for n in &nodes {
         assert_eq!(
-            n.committed_execute_at(txn),
+            n.committed_execute_at(txn.clone()),
             committed_at,
             "commit diverged before recovery (seed={seed})"
         );
-        assert!(n.is_applied(txn), "txn not executed (seed={seed})");
+        assert!(n.is_applied(txn.clone()), "txn not executed (seed={seed})");
     }
     let writer_before = store_writer(&nodes[2], 9);
 
     // A replica runs recovery anyway; it must adopt the existing commit verbatim.
-    nodes[1].recover(txn);
+    nodes[1].recover(txn.clone());
     sim.run_for(Duration::from_secs(2));
 
     for n in &nodes {
         assert_eq!(
-            n.committed_execute_at(txn),
+            n.committed_execute_at(txn.clone()),
             committed_at,
             "recovery changed an already-committed decision (seed={seed})"
         );
@@ -203,7 +204,7 @@ fn recovery_run_is_reproducible_from_seed() {
     let seed = 0xFA11_0003;
     let trace = |seed| {
         let (mut sim, nodes) = cluster(seed);
-        sim.partition_pair(0, 2);
+        sim.partition_pair(nid(0), nid(2));
         let txn = nodes[0].submit(keys(&[7]));
         sim.run_for(Duration::from_secs(1));
         nodes[2].recover(txn);

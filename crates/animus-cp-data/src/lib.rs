@@ -903,7 +903,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// The leader's last-known replicated log index for `node` (0 if unknown).
     /// The caught-up primitive a healthy reconfigure step gates on — see
     /// [`RaftCore::peer_match`].
-    pub fn peer_match(&self, node: NodeId) -> u64 {
+    pub fn peer_match(&self, node: &NodeId) -> u64 {
         self.lock().peer_match(node)
     }
 
@@ -972,12 +972,12 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         // lowest-id extra (bug fixed under ADR 0029's follow-up — see the root
         // CLAUDE.md engineering-practices entry), silently skipping a Down extra
         // that happens to sort after a healthy one.
-        let extra = || current.difference(desired).find(|&&n| n != me).copied();
+        let extra = || current.difference(desired).find(|&n| n != &me).cloned();
         let down_extra = || {
             current
                 .difference(desired)
-                .find(|&&n| n != me && down.contains(&n))
-                .copied()
+                .find(|&n| n != &me && down.contains(n))
+                .cloned()
         };
 
         if let Some(target) = down_extra() {
@@ -985,17 +985,17 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             c.remove(&target);
             return self.propose_config(c);
         }
-        if let Some(&missing) = desired.difference(&current).next() {
+        if let Some(missing) = desired.difference(&current).next() {
             let mut c = current.clone();
-            c.insert(missing);
+            c.insert(missing.clone());
             return self.propose_config(c);
         }
         if let Some(healthy_extra) = extra() {
             let commit = self.commit_index();
             let caught_up = desired
                 .iter()
-                .filter(|&&n| n != me)
-                .all(|&n| self.peer_match(n) >= commit);
+                .filter(|&n| n != &me)
+                .all(|n| self.peer_match(n) >= commit);
             if !caught_up {
                 return None;
             }
@@ -1004,10 +1004,13 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             return self.propose_config(c);
         }
         // The only delta left is removing the leader itself. Select the
-        // lowest-id member of `desired` reasonably close to caught up
-        // (`>= commit_index`, matching `RaftCore::transfer_leadership`'s arm
-        // gate) and try to arm a transfer to it — idempotent, and retried every
-        // tick via `spawn_reconfigure_loop` as long as this delta persists, so a
+        // lexicographically-least (ADR 0040 PR3: ids are strings now, so this
+        // is no longer numeric — still a deterministic total order, so every
+        // replica picks the same target) member of `desired` reasonably close
+        // to caught up (`>= commit_index`, matching
+        // `RaftCore::transfer_leadership`'s arm gate) and try to arm a
+        // transfer to it — idempotent, and retried every tick via
+        // `spawn_reconfigure_loop` as long as this delta persists, so a
         // one-time arming failure (e.g. every candidate momentarily fell behind
         // `commit_index`) self-heals on the next tick rather than needing a
         // caller-visible retry. Log (don't silently drop) both outcomes: a
@@ -1017,23 +1020,23 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         let commit = self.commit_index();
         match desired
             .iter()
-            .filter(|&&n| n != me && self.peer_match(n) >= commit)
+            .filter(|&n| n != &me && self.peer_match(n) >= commit)
             .min()
         {
-            Some(&target) => {
-                let armed = self.transfer_leadership(target);
+            Some(target) => {
+                let armed = self.transfer_leadership(target.clone());
                 // NOTE: the field is named `xfer_target`, not `target` —
                 // `tracing`'s macros reserve the bare `target` identifier for
                 // overriding the event's own target module path.
                 if armed {
                     tracing::debug!(
-                        xfer_target = target,
+                        xfer_target = %target,
                         commit,
                         "reconfigure_step: armed leadership transfer to remove self"
                     );
                 } else {
                     tracing::warn!(
-                        xfer_target = target,
+                        xfer_target = %target,
                         commit,
                         "reconfigure_step: transfer_leadership rejected an apparently-eligible target"
                     );

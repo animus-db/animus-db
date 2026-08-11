@@ -28,6 +28,7 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use animus_consensus::{AccordNode, Key, TxnId};
+use animus_env::nid;
 use animus_sim::{SimEnv, Simulator};
 use futures::executor::block_on;
 
@@ -37,7 +38,7 @@ fn cluster(seed: u64) -> (Simulator, Vec<AccordNode<SimEnv>>) {
     let sim = Simulator::new(seed);
     let nodes = NODES
         .iter()
-        .map(|&id| AccordNode::start(sim.env(id), NODES.to_vec()))
+        .map(|&id| AccordNode::start(sim.env(nid(id)), NODES.iter().copied().map(nid).collect()))
         .collect();
     (sim, nodes)
 }
@@ -65,20 +66,20 @@ fn assert_committed_consistently(
     let mut agreed_deps: Option<BTreeSet<TxnId>> = None;
     let mut committed = 0;
     for (i, n) in nodes.iter().enumerate() {
-        if let Some(e) = n.committed_execute_at(txn) {
+        if let Some(e) = n.committed_execute_at(txn.clone()) {
             committed += 1;
-            match agreed {
+            match &agreed {
                 None => {
                     agreed = Some(e);
-                    agreed_deps = n.committed_deps(txn);
+                    agreed_deps = n.committed_deps(txn.clone());
                 }
                 Some(prev) => assert_eq!(
-                    prev, e,
+                    *prev, e,
                     "replica {i} committed at a different execute_at (seed={seed})"
                 ),
             }
             assert_eq!(
-                n.committed_deps(txn),
+                n.committed_deps(txn.clone()),
                 agreed_deps,
                 "replica {i} committed with different deps (seed={seed})"
             );
@@ -109,21 +110,21 @@ fn dead_coordinator_is_auto_recovered_within_bound() {
         // keys), then isolate the coordinator before it can commit.
         sim.run_for(Duration::from_millis(30));
         for peer in [1, 2, 3, 4] {
-            sim.partition_pair(0, peer);
+            sim.partition_pair(nid(0), nid(peer));
         }
         // Run well past the failure-detector bound (≈5s). **No explicit
         // recover():** the driver's liveness tick must auto-trigger it, then the
         // recovered transaction must commit + execute on every survivor.
         sim.run_for(Duration::from_secs(10));
 
-        let agreed = assert_committed_consistently(&nodes, txn, seed);
+        let agreed = assert_committed_consistently(&nodes, txn.clone(), seed);
         // Every survivor that applied it carries the recovered write; store converged.
         for &k in &[7u64, 8u64] {
             for n in &nodes {
-                if n.is_applied(txn) {
+                if n.is_applied(txn.clone()) {
                     assert_eq!(
                         store_writer(n, k),
-                        Some(txn),
+                        Some(txn.clone()),
                         "an applied replica missed the auto-recovered write on key {k} \
                          (seed={seed}); agreed execute_at={agreed:?}"
                     );
@@ -133,7 +134,7 @@ fn dead_coordinator_is_auto_recovered_within_bound() {
         // At least a quorum (the survivors) committed — recovery actually fired.
         let committed = nodes
             .iter()
-            .filter(|n| n.committed_execute_at(txn).is_some())
+            .filter(|n| n.committed_execute_at(txn.clone()).is_some())
             .count();
         assert!(
             committed >= 3,
@@ -161,27 +162,27 @@ fn escalating_auto_recoverers_converge() {
         // timing its recovery may or may not gather a quorum before a higher tier
         // also fires. Either way, ballots must converge the outcome.
         for peer in [1, 2, 3, 4] {
-            sim.partition_pair(0, peer);
+            sim.partition_pair(nid(0), nid(peer));
         }
-        sim.partition_pair(1, 4);
+        sim.partition_pair(nid(1), nid(4));
         // Past the failure-detector bound (≈5s) so the tier-0 nominee fires (and,
         // if it cannot reach a quorum, a higher tier escalates).
         sim.run_for(Duration::from_secs(9));
 
         // Heal node 1's link so every survivor can converge, then settle.
-        sim.heal(1, 4);
+        sim.heal(nid(1), nid(4));
         sim.run_for(Duration::from_secs(3));
 
-        let _ = assert_committed_consistently(&nodes, txn, seed);
+        let _ = assert_committed_consistently(&nodes, txn.clone(), seed);
         // Among the nodes that committed, the store is converged on the key.
         let mut writers = Vec::new();
         for n in &nodes {
-            if n.is_applied(txn) {
+            if n.is_applied(txn.clone()) {
                 writers.push(store_writer(n, 15));
             }
         }
         assert!(
-            !writers.is_empty() && writers.iter().all(|w| *w == Some(txn)),
+            !writers.is_empty() && writers.iter().all(|w| *w == Some(txn.clone())),
             "escalating auto-recovery diverged the store (seed={seed})"
         );
     }
@@ -203,17 +204,17 @@ fn slow_but_progressing_coordinator_is_not_recovered() {
 
         // Node 0 cannot reach node 4 at first (no fast quorum on the first try),
         // but the rest of the cluster is healthy, so it still makes progress.
-        sim.partition_pair(0, 4);
+        sim.partition_pair(nid(0), nid(4));
         let txn = nodes[0].submit(keys(&[9]));
         // Heal quickly — far inside the bound — so the coordinator progresses and
         // commits on its own.
         sim.run_for(Duration::from_millis(50));
-        sim.heal(0, 4);
+        sim.heal(nid(0), nid(4));
         sim.run_for(Duration::from_secs(2));
 
         // The original coordinator committed the transaction itself.
         assert!(
-            nodes[0].committed_execute_at(txn).is_some(),
+            nodes[0].committed_execute_at(txn.clone()).is_some(),
             "the slow-but-live coordinator never committed (seed={seed})"
         );
         let agreed = assert_committed_consistently(&nodes, txn, seed);
@@ -277,15 +278,15 @@ fn auto_recovery_preserves_write_value() {
 
         sim.run_for(Duration::from_millis(30));
         for peer in [1, 2, 3, 4] {
-            sim.partition_pair(0, peer);
+            sim.partition_pair(nid(0), nid(peer));
         }
         // Past the failure-detector bound (≈5s) so auto-recovery fires.
         sim.run_for(Duration::from_secs(10));
 
-        let _ = assert_committed_consistently(&nodes, txn, seed);
+        let _ = assert_committed_consistently(&nodes, txn.clone(), seed);
         let mut seen = 0;
         for n in &nodes {
-            if n.is_applied(txn) {
+            if n.is_applied(txn.clone()) {
                 seen += 1;
                 assert_eq!(
                     store_value(n, 42),
@@ -310,7 +311,7 @@ fn auto_recovery_is_reproducible_from_seed() {
         let txn = nodes[0].submit(keys(&[7]));
         sim.run_for(Duration::from_millis(30));
         for peer in [1, 2, 3, 4] {
-            sim.partition_pair(0, peer);
+            sim.partition_pair(nid(0), nid(peer));
         }
         sim.run_for(Duration::from_secs(10));
         let _ = txn;

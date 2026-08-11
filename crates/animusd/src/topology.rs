@@ -26,6 +26,8 @@
 use std::net::SocketAddr;
 
 use animus_env::NodeId;
+#[cfg(test)]
+use animus_env::nid;
 use animus_tablet::{Tablet, TabletId};
 
 /// The tablet whose range contains `key`, chosen from `tablets` (already
@@ -185,7 +187,7 @@ mod tests {
         Tablet::new(
             TabletId(id),
             KeyRange::new(start.to_vec(), end.map(|e| e.to_vec())),
-            vec![300],
+            vec![nid(300)],
         )
     }
 
@@ -322,8 +324,8 @@ mod tests {
 
     #[test]
     fn not_leader_refusal_round_trips_with_a_hint() {
-        let hint = Some((7u64, addr(9001)));
-        let msg = format_not_leader_refusal(hint);
+        let hint = Some((nid(7), addr(9001)));
+        let msg = format_not_leader_refusal(hint.clone());
         assert_eq!(parse_not_leader_refusal(&msg), Some(hint));
     }
 
@@ -349,9 +351,14 @@ mod tests {
             parse_not_leader_refusal("forwarded CP op: not the leader here; leader_hint=garbage"),
             Some(None)
         );
+        // ADR 0040 PR3: `NodeId`'s charset is `[A-Za-z0-9._-]{1,64}`, so
+        // "notanumber" is now a syntactically *valid* id (unlike the
+        // pre-PR3 `u64` parse this test originally exercised) — genuinely
+        // garbled id syntax needs a disallowed character (a space) to still
+        // trip the fallback this test means to prove.
         assert_eq!(
             parse_not_leader_refusal(
-                "forwarded CP op: not the leader here; leader_hint=notanumber@127.0.0.1:1"
+                "forwarded CP op: not the leader here; leader_hint=not a number@127.0.0.1:1"
             ),
             Some(None)
         );

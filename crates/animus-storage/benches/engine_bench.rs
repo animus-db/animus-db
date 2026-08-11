@@ -28,6 +28,8 @@
 use std::time::{Duration, Instant};
 
 use animus_env::ProdEnv;
+#[cfg(test)]
+use animus_env::nid;
 use animus_storage::{LsmEngine, LsmOptions, MemoryEngine, MergeOp, StorageEngine};
 
 /// Workload parameters, read from the environment with defaults.
@@ -252,7 +254,9 @@ async fn apply_path_throughput(
         std::process::id()
     ));
     let _ = std::fs::remove_dir_all(&dir);
-    let (env, _b) = ProdEnv::bind(0, addr, &dir).await.expect("bind ProdEnv");
+    let (env, _b) = ProdEnv::bind(nid(0), addr, &dir)
+        .await
+        .expect("bind ProdEnv");
     let lsm = LsmEngine::open_with(env, "db-", opts).await.expect("open");
     let start = Instant::now();
     if batched {
@@ -304,7 +308,9 @@ async fn main() {
     let dir = std::env::temp_dir().join(format!("animus-bench-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let addr = "127.0.0.1:0".parse().expect("addr");
-    let (env, _bound) = ProdEnv::bind(0, addr, &dir).await.expect("bind ProdEnv");
+    let (env, _bound) = ProdEnv::bind(nid(0), addr, &dir)
+        .await
+        .expect("bind ProdEnv");
     // Modest knobs so the default workload actually exercises flush + leveled
     // compaction (raise these for a production-sized memtable).
     let opts = LsmOptions {
@@ -353,7 +359,9 @@ async fn main() {
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&cdir);
-        let (cenv, _cb) = ProdEnv::bind(0, addr, &cdir).await.expect("bind ProdEnv");
+        let (cenv, _cb) = ProdEnv::bind(nid(0), addr, &cdir)
+            .await
+            .expect("bind ProdEnv");
         let clsm = LsmEngine::open_with(cenv, "db-", opts).await.expect("open");
         let (tput, elapsed) =
             concurrent_put_throughput(&clsm, conc_keys, cfg.value_bytes, writers).await;

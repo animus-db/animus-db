@@ -25,6 +25,7 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use animus_env::{NodeId, nid};
 use animusd::{ClientRequest, ClientResponse, ClusterConfig, Node, read_frame};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -106,7 +107,7 @@ async fn admin(addr: SocketAddr, method: &str, path: &str, body: Option<&str>) -
 
 /// The full replicated tablet map, `TabletId -> (replicas, epoch)`, from a
 /// node's `/admin/status` (`Metadata`, mirrored on a growth node — ADR 0030).
-async fn tablet_map(admin_addr: SocketAddr) -> BTreeMap<u64, (Vec<u64>, u64)> {
+async fn tablet_map(admin_addr: SocketAddr) -> BTreeMap<u64, (Vec<NodeId>, u64)> {
     let (_s, v) = admin(admin_addr, "GET", "/admin/status", None).await;
     v["tablets"]
         .as_object()
@@ -117,7 +118,7 @@ async fn tablet_map(admin_addr: SocketAddr) -> BTreeMap<u64, (Vec<u64>, u64)> {
                 .as_array()
                 .expect("replicas is an array")
                 .iter()
-                .filter_map(Value::as_u64)
+                .filter_map(|r| r.as_str()?.parse::<NodeId>().ok())
                 .collect();
             let epoch = t["epoch"].as_u64().expect("epoch is a number");
             (
@@ -130,7 +131,7 @@ async fn tablet_map(admin_addr: SocketAddr) -> BTreeMap<u64, (Vec<u64>, u64)> {
 
 /// Every member's status, `raftkv_id -> "Active"/"Down"/...`, from
 /// `/admin/status`.
-async fn member_statuses(admin_addr: SocketAddr) -> BTreeMap<u64, String> {
+async fn member_statuses(admin_addr: SocketAddr) -> BTreeMap<NodeId, String> {
     let (_s, v) = admin(admin_addr, "GET", "/admin/status", None).await;
     v["members"]
         .as_object()
@@ -138,7 +139,7 @@ async fn member_statuses(admin_addr: SocketAddr) -> BTreeMap<u64, String> {
         .iter()
         .map(|(id, m)| {
             (
-                id.parse().expect("member id key is numeric"),
+                id.parse().expect("member id key is a valid NodeId"),
                 m["status"].as_str().expect("status is a string").to_owned(),
             )
         })
@@ -146,19 +147,19 @@ async fn member_statuses(admin_addr: SocketAddr) -> BTreeMap<u64, String> {
 }
 
 fn replica_counts(
-    map: &BTreeMap<u64, (Vec<u64>, u64)>,
-    raftkv_ids: &[u64],
-) -> BTreeMap<u64, usize> {
-    let mut counts: BTreeMap<u64, usize> = raftkv_ids.iter().map(|&id| (id, 0)).collect();
+    map: &BTreeMap<u64, (Vec<NodeId>, u64)>,
+    raftkv_ids: &[NodeId],
+) -> BTreeMap<NodeId, usize> {
+    let mut counts: BTreeMap<NodeId, usize> = raftkv_ids.iter().map(|id| (id.clone(), 0)).collect();
     for (replicas, _) in map.values() {
-        for &r in replicas {
-            *counts.entry(r).or_insert(0) += 1;
+        for r in replicas {
+            *counts.entry(r.clone()).or_insert(0) += 1;
         }
     }
     counts
 }
 
-fn imbalance(counts: &BTreeMap<u64, usize>) -> usize {
+fn imbalance(counts: &BTreeMap<NodeId, usize>) -> usize {
     let max = counts.values().copied().max().unwrap_or(0);
     let min = counts.values().copied().min().unwrap_or(0);
     max - min
@@ -248,9 +249,9 @@ async fn cluster_grows_from_three_to_five_and_rebalances() {
     let before_growth = tablet_map(base_admin[0]).await;
     assert_eq!(before_growth.len(), TABLES.len());
     let before_counts = replica_counts(&before_growth, &raftkv_ids_3);
-    for &id in &raftkv_ids_3 {
+    for id in &raftkv_ids_3 {
         assert!(
-            before_counts[&id] > 0,
+            before_counts[id] > 0,
             "every original node should host something pre-growth: {before_counts:?}"
         );
     }
@@ -286,12 +287,12 @@ async fn cluster_grows_from_three_to_five_and_rebalances() {
     // with each node's own automatic self-registration (ADR 0032 PR2), but
     // kept as the regression proving `admin_add_member`'s idempotent-no-op
     // path still works when a member is already registered.
-    for &id in new_ids {
+    for id in new_ids {
         let (status, body) = admin(
             base_admin[0],
             "POST",
             "/admin/member/add",
-            Some(&format!("{{\"node\":{id}}}")),
+            Some(&format!("{{\"node\":\"{id}\"}}")),
         )
         .await;
         assert_eq!(status, 200, "admin add-member failed for {id}: {body}");
@@ -321,12 +322,12 @@ async fn cluster_grows_from_three_to_five_and_rebalances() {
     // task 3): register a third, never-started raftkv id and confirm it stays
     // `Down` for well past the detector's own timing constants — it can never
     // heartbeat, so it can never be promoted.
-    let phantom_id = all_raftkv_ids[4] + 1000; // an id nothing will ever run
+    let phantom_id = nid(1000); // an id nothing will ever run
     let (status, body) = admin(
         base_admin[0],
         "POST",
         "/admin/member/add",
-        Some(&format!("{{\"node\":{phantom_id}}}")),
+        Some(&format!("{{\"node\":\"{phantom_id}\"}}")),
     )
     .await;
     assert_eq!(status, 200, "admin add-member failed for phantom: {body}");
@@ -353,9 +354,9 @@ async fn cluster_grows_from_three_to_five_and_rebalances() {
     let converged_counts = timeout(Duration::from_secs(120), converged)
         .await
         .unwrap_or_else(|_| panic!("tablet replicas never spread across all 5 nodes within 120s"));
-    for &id in new_ids {
+    for id in new_ids {
         assert!(
-            converged_counts[&id] > 0,
+            converged_counts[id] > 0,
             "node {id} never gained a replica: {converged_counts:?}"
         );
     }
@@ -427,7 +428,7 @@ async fn cluster_grows_from_three_to_five_and_rebalances() {
 }
 
 /// `/admin/raftkv`'s `groups`: `(tablet, hosting node, is_leader)`.
-async fn raftkv_groups(admin_addr: SocketAddr) -> Vec<(u64, u64, bool)> {
+async fn raftkv_groups(admin_addr: SocketAddr) -> Vec<(u64, NodeId, bool)> {
     let (status, body) = admin(admin_addr, "GET", "/admin/raftkv", None).await;
     if status != 200 {
         return Vec::new();
@@ -439,7 +440,11 @@ async fn raftkv_groups(admin_addr: SocketAddr) -> Vec<(u64, u64, bool)> {
                 .map(|g| {
                     (
                         g["tablet"].as_u64().expect("tablet"),
-                        g["node"].as_u64().expect("node"),
+                        g["node"]
+                            .as_str()
+                            .expect("node")
+                            .parse()
+                            .expect("node id parses"),
                         g["is_leader"].as_bool().expect("is_leader"),
                     )
                 })
@@ -478,12 +483,12 @@ async fn dashboard_health_recovers_after_grown_cluster_loses_an_original_node() 
     let new_ids = &all_raftkv_ids[3..];
     let all_admin: Vec<SocketAddr> = expanded_config.nodes.iter().map(|a| a.admin).collect();
 
-    for &id in new_ids {
+    for id in new_ids {
         let (status, body) = admin(
             base_admin[0],
             "POST",
             "/admin/member/add",
-            Some(&format!("{{\"node\":{id}}}")),
+            Some(&format!("{{\"node\":\"{id}\"}}")),
         )
         .await;
         assert_eq!(status, 200, "admin add-member failed for {id}: {body}");
@@ -524,7 +529,7 @@ async fn dashboard_health_recovers_after_grown_cluster_loses_an_original_node() 
     // (control-core member), so it stays `Down` forever unless restarted;
     // this is a different asymmetry than killing a grown node.
     let kill_idx = 0;
-    let killed_id = all_raftkv_ids[kill_idx];
+    let killed_id = all_raftkv_ids[kill_idx].clone();
     nodes[kill_idx].shutdown();
     let survivor_idx: Vec<usize> = (0..5).filter(|&i| i != kill_idx).collect();
     let survivor_admin: Vec<SocketAddr> = survivor_idx.iter().map(|&i| all_admin[i]).collect();
@@ -574,7 +579,7 @@ async fn dashboard_health_recovers_after_grown_cluster_loses_an_original_node() 
     // worst case; poll instead, with a generous overall budget.
     let health = async {
         loop {
-            let mut groups_by_tablet: BTreeMap<u64, Vec<(u64, bool)>> = BTreeMap::new();
+            let mut groups_by_tablet: BTreeMap<u64, Vec<(NodeId, bool)>> = BTreeMap::new();
             for &addr in &survivor_admin {
                 for (tablet, node, is_leader) in raftkv_groups(addr).await {
                     let seen = groups_by_tablet.entry(tablet).or_default();

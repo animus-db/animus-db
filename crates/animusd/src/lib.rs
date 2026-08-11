@@ -52,12 +52,11 @@ mod topology;
 
 use control_handle::{ControlHandle, RemoteControlClient};
 
-use animus_control::meta::ALLOC_ID_BASE;
 use animus_control::node::{HEARTBEAT_INTERVAL, send_heartbeat};
 use animus_control::{PlacementPolicy, ProposeResult, RaftNode};
 use animus_cp_data::RaftKvNode;
 use animus_cp_data::host::{MetadataView, Reconciler};
-use animus_env::{Env, Metric, MetricsHandle, NodeId, ProdEnv, Rng};
+use animus_env::{Env, Metric, MetricsHandle, NodeId, ProdEnv};
 use animus_storage::{
     Key, LsmEngine, MemoryEngine, SsTableView, StorageEngine, StorageError, VersionedValue,
     WalRecordView,
@@ -639,26 +638,6 @@ pub enum ClientRequest {
     /// [`ClientResponse::Status`] shape a plain `Status` request gets,
     /// carrying the watermark to pass back as the next call's `last_seen`.
     WatchMetadata { last_seen: u64 },
-    /// **Cluster-allocated member id** (ADR 0036): request a fresh member id
-    /// minted from the control plane's own monotonic allocator
-    /// (`Metadata::next_alloc_id`, disjoint from every operator-chosen
-    /// `--node I` id) instead of an operator picking a small index. `nonce`
-    /// is the caller's idempotency key — see
-    /// [`MetaCommand::AllocateNodeId`]'s doc: a proposer retry after an
-    /// unconfirmed accept passes the *same* nonce and observes the *same*
-    /// allocated id, never a second one. `labels` seed the new member's
-    /// topology labels, exactly like [`ClientCtx::admin_add_member`]'s.
-    /// Any node answers this fully — including its own propose-and-confirm
-    /// round trip through the control leader (locally or relayed, see
-    /// [`is_relayable_command`]) — so the caller (typically a joining
-    /// process with no local `Metadata` yet to poll itself) gets a final
-    /// answer in one round trip. An additive variant, no version
-    /// negotiation needed (see [`JoinInfo`](Self::JoinInfo)'s doc for the
-    /// same reasoning).
-    AllocateNodeId {
-        nonce: String,
-        labels: BTreeMap<String, String>,
-    },
 }
 
 /// Whether `command` may be **relayed to the control leader** via
@@ -734,21 +713,23 @@ fn is_relayable_command(command: &MetaCommand) -> bool {
                 status: NodeStatus::Down,
                 ..
             }
-            // Cluster-allocated member ids (ADR 0036): a joining process has
+            // Registration CAS (ADR 0040 Decision C): a joining process has
             // no local control role at all yet (it hasn't even bound its
-            // listeners), so `ClientRequest::AllocateNodeId` is its *only*
-            // way to reach the real leader — exactly the `Down`-registering
-            // `UpsertMember` case just above, and safe for the identical
-            // reason: `AllocateNodeId`'s apply always registers the new
-            // member `Down` (never any other status), granting no placement
-            // eligibility by itself — the detector still requires a real
-            // heartbeat before anything happens to it. Missing this arm
-            // would be the exact bimodal-per-process flake the root
-            // `CLAUDE.md` warns about: a join that happens to land on a
-            // follower-connected seed would hang until `JOIN_DISCOVERY_BUDGET`
-            // expires, indistinguishable from "no seed answered" — see
-            // `tests/seed_join_allocated.rs`'s follower-connected-seed case.
-            | MetaCommand::AllocateNodeId { .. }
+            // listeners), so relaying `RegisterNode` via `ProposeSchema` is
+            // its *only* way to reach the real leader — exactly the
+            // `Down`-registering `UpsertMember` case just above, and safe
+            // for the identical reason: an unclaimed `RegisterNode` apply
+            // always registers the new member `Down` (never any other
+            // status), granting no placement eligibility by itself — the
+            // detector still requires a real heartbeat before anything
+            // happens to it; a *claimed* id's apply is a `NoOp`/`Rejected`
+            // no-op either way. Missing this arm would be the exact bimodal
+            // per-process flake the root `CLAUDE.md` warns about: a join
+            // that happens to land on a follower-connected seed would hang
+            // until `JOIN_DISCOVERY_BUDGET` expires, indistinguishable from
+            // "no seed answered" — see `tests/seed_join_allocated.rs`'s
+            // follower-connected-seed case.
+            | MetaCommand::RegisterNode { .. }
     )
 }
 
@@ -827,11 +808,6 @@ pub enum ClientResponse {
         client_route: BTreeMap<NodeId, SocketAddr>,
         admin_addrs: Vec<SocketAddr>,
     },
-    /// Reply to [`AllocateNodeId`](ClientRequest::AllocateNodeId) (ADR
-    /// 0036): the freshly allocated member id — or, on a same-nonce retry,
-    /// the identical id already allocated for that nonce (never a second
-    /// one; see [`MetaCommand::AllocateNodeId`]'s doc).
-    NodeIdAllocated { node: NodeId },
     /// **Incremental long-poll reply to
     /// [`WatchMetadata`](ClientRequest::WatchMetadata)** (ADR 0038 PR5): the
     /// answering node's own [`animus_control::RaftNode::watch_delta_since`]
@@ -885,8 +861,14 @@ pub enum ClientResponse {
 /// `raftkv` `Option<SocketAddr>` pair into this one required field — no
 /// wire/config back-compat with a pre-ADR-0040 deployment (fresh clusters
 /// required).
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RoleAddrs {
+    /// This node's self-minted/operator-proposed identity (ADR 0040 PR3):
+    /// every config entry now carries its own id explicitly instead of it
+    /// being purely derived from the entry's position in `nodes` — required
+    /// (no default; a clean break, fresh clusters only), and validated
+    /// unique across the whole config at load (`ClusterConfig::from_json`).
+    pub id: NodeId,
     /// Which role(s) this node runs (ADR 0035). Defaults to
     /// [`Both`](config::NodeRole::Both) when absent — the shape every config
     /// used before this field existed.
@@ -1050,15 +1032,28 @@ fn spawn_common_tail(
     // a control-only node's snapshot is just the control sink (`metrics_text`/
     // `metrics_json` skip the raftkv sink when `ctx.data` is `None`).
     tasks.push(tokio::spawn(metrics_sample_loop(ctx.clone())));
-    // This node's own address-book self-registration (ADR 0032 PR1), one-shot:
-    // so peer-sync (raftkv addresses) and any node's route/peers views
-    // (client/admin addresses) can resolve it regardless of when this node
-    // joined relative to the reader.
+    // This node's own identity self-registration (ADR 0032 PR1; ADR 0040
+    // Decision C since PR4 — the registration CAS is now the mechanism, not
+    // just an address-book update): one-shot, so peer-sync (internal
+    // addresses) and any node's route/peers views (client/admin addresses)
+    // can resolve it regardless of when this node joined relative to the
+    // reader. Every node shape reaches this — a fresh bootstrap node whose
+    // id `bootstrap()`'s own `UpsertMember`/`admin_add_member` also claims
+    // (harmless, order-independent: `RegisterNode`'s collision check is
+    // addrs-only, so it never fights over labels/status another command
+    // already owns) and a growth node with no other claim path at all (e.g.
+    // a control-only permanently-non-voter — `BoundControlNode::
+    // start_control_with` has no `admin_add_member` call of its own; this is
+    // its *only* claim). No labels here (this is a bare identity/address
+    // claim, not an operator-labeled add) — `admin_add_member`/
+    // `admin_add_control_member` are where real labels are set, and
+    // `RegisterNode`'s apply never overwrites an already-`members`-present
+    // entry's labels, so this can never clobber them.
     {
         let ctx = ctx.clone();
         let (node, addrs) = self_addrs;
         tasks.push(tokio::spawn(async move {
-            ctx.register_node_addrs(node, addrs).await;
+            let _ = ctx.register_node(node, addrs, BTreeMap::new()).await;
         }));
     }
     tasks.push(tokio::spawn(serve_clients(client_listener, ctx.clone())));
@@ -1072,7 +1067,7 @@ impl BoundNode {
     /// `(id, addr)` — the one entry this node contributes to the cluster peer
     /// book (ADR 0040 PR1: one identity, one internal `ProdEnv`, per node).
     pub fn peer_entries(&self) -> [(NodeId, SocketAddr); 1] {
-        [(self.id, self.internal_addr)]
+        [(self.id.clone(), self.internal_addr)]
     }
 
     /// The address clients connect to.
@@ -1183,7 +1178,7 @@ impl BoundNode {
         // cluster members are node ids), so the control plane's `detect_loop`
         // marks a crashed node `Down`.
         let hb_env = self.env.clone();
-        let my_id = self.id;
+        let my_id = self.id.clone();
         let my_addr = self.internal_addr;
         // Captured here (all `SocketAddr`, `Copy`) for the node-address-book
         // self-registration below (ADR 0032 PR1) — `self.client_listener`/
@@ -1195,7 +1190,7 @@ impl BoundNode {
         // The node's identity + bound addresses for the admin `/admin/config`
         // view (ADR 0020), captured before the env is consumed below.
         let admin_info = Arc::new(AdminInfo {
-            node_id: Some(self.id),
+            node_id: Some(self.id.clone()),
             internal_addr: Some(self.internal_addr),
             client_addr: self.client_addr,
             dynamo_addr: Some(self.dynamo_addr),
@@ -1322,7 +1317,7 @@ impl BoundNode {
         let data_role = DataRole {
             rmw_lock: Arc::new(tokio::sync::Mutex::new(())),
             raftkv_metrics,
-            base_id: my_id,
+            base_id: my_id.clone(),
         };
         let (ctx, mut tasks) = spawn_common_tail(
             ControlHandle::Local(raft.clone()),
@@ -1331,7 +1326,7 @@ impl BoundNode {
             admin_info,
             client_route,
             (
-                my_id,
+                my_id.clone(),
                 NodeAddrs {
                     internal: my_addr.to_string(),
                     client: my_client_addr.to_string(),
@@ -1360,15 +1355,15 @@ impl BoundNode {
         let reconciler = {
             let host_edge = edge.clone();
             let teardown_edge = edge.clone();
-            let base_id = my_id;
+            let base_id = my_id.clone();
             let on_teardown = move |tablet: TabletId| {
-                teardown_edge.unregister_raftkv(tablet, base_id);
+                teardown_edge.unregister_raftkv(tablet, base_id.clone());
             };
             match storage {
                 SharedEngine::Lsm(lsm) => CpReconciler::Lsm(Reconciler::new(
                     hook_env,
                     lsm,
-                    my_id,
+                    my_id.clone(),
                     table_scope_prefix,
                     move |tablet, node: &RaftKvNode<ProdEnv, LsmEngine<ProdEnv>>| {
                         host_edge.register_raftkv(tablet, CpGroup::Lsm(node.clone()));
@@ -1378,7 +1373,7 @@ impl BoundNode {
                 SharedEngine::Mem(mem) => CpReconciler::Mem(Reconciler::new(
                     hook_env,
                     mem,
-                    my_id,
+                    my_id.clone(),
                     table_scope_prefix,
                     move |tablet, node: &RaftKvNode<ProdEnv, MemoryEngine>| {
                         host_edge.register_raftkv(tablet, CpGroup::Mem(node.clone()));
@@ -1437,7 +1432,7 @@ impl BoundNode {
         if !control_ids.contains(&self.id) {
             let seeds: Vec<SocketAddr> = control_ids
                 .iter()
-                .filter_map(|id| ctx.route_addr(*id))
+                .filter_map(|id| ctx.route_addr(id.clone()))
                 .collect();
             tasks.push(tokio::spawn(remote_metadata_sync_loop(ctx.clone(), seeds)));
 
@@ -1584,7 +1579,8 @@ impl Node {
         data_dir: impl Into<PathBuf>,
     ) -> std::io::Result<BoundNode> {
         let dir = data_dir.into();
-        let (env, internal_addr) = ProdEnv::bind(id, addrs.internal, dir.join("internal")).await?;
+        let (env, internal_addr) =
+            ProdEnv::bind(id.clone(), addrs.internal, dir.join("internal")).await?;
         let client_listener = TcpListener::bind(addrs.client).await?;
         let client_addr = client_listener.local_addr()?;
         let dynamo_listener = TcpListener::bind(addrs.dynamo).await?;
@@ -1621,7 +1617,8 @@ impl Node {
         data_dir: impl Into<PathBuf>,
     ) -> std::io::Result<BoundControlNode> {
         let dir = data_dir.into();
-        let (env, internal_addr) = ProdEnv::bind(id, addrs.internal, dir.join("internal")).await?;
+        let (env, internal_addr) =
+            ProdEnv::bind(id.clone(), addrs.internal, dir.join("internal")).await?;
         let client_listener = TcpListener::bind(addrs.client).await?;
         let client_addr = client_listener.local_addr()?;
         let admin_listener = TcpListener::bind(addrs.admin).await?;
@@ -1651,7 +1648,8 @@ impl Node {
         data_dir: impl Into<PathBuf>,
     ) -> std::io::Result<BoundDataNode> {
         let dir = data_dir.into();
-        let (env, internal_addr) = ProdEnv::bind(id, addrs.internal, dir.join("internal")).await?;
+        let (env, internal_addr) =
+            ProdEnv::bind(id.clone(), addrs.internal, dir.join("internal")).await?;
         let client_listener = TcpListener::bind(addrs.client).await?;
         let client_addr = client_listener.local_addr()?;
         let dynamo_listener = TcpListener::bind(addrs.dynamo).await?;
@@ -1911,7 +1909,7 @@ impl BoundControlNode {
 
     /// `(id, addr)` — this node's entry in the cluster's peer book.
     pub fn peer_entry(&self) -> (NodeId, SocketAddr) {
-        (self.id, self.internal_addr)
+        (self.id.clone(), self.internal_addr)
     }
 
     /// Wire the peer address book into the control env and start the control
@@ -1969,7 +1967,7 @@ impl BoundControlNode {
         let envs = vec![self.env.clone()];
 
         let admin_info = Arc::new(AdminInfo {
-            node_id: Some(self.id),
+            node_id: Some(self.id.clone()),
             internal_addr: Some(self.internal_addr),
             client_addr: self.client_addr,
             dynamo_addr: None,
@@ -2120,7 +2118,7 @@ impl BoundDataNode {
     /// book (the [`BoundNode::peer_entries`] dual, minus the `control` entry
     /// a data-only node has none of).
     pub fn peer_entry(&self) -> (NodeId, SocketAddr) {
-        (self.id, self.internal_addr)
+        (self.id.clone(), self.internal_addr)
     }
 
     /// Wire the peer address book into the `raftkv` env and start the data
@@ -2176,7 +2174,7 @@ impl BoundDataNode {
         let sync_env = self.env.clone();
         let hook_env = self.env.clone();
         let hb_env = self.env.clone();
-        let my_id = self.id;
+        let my_id = self.id.clone();
         let my_addr = self.internal_addr;
         let my_client_addr = self.client_addr;
         let my_admin_addr = self.admin_addr;
@@ -2184,7 +2182,7 @@ impl BoundDataNode {
         let control = ControlHandle::Remote(RemoteControlClient::new(control_seeds.clone()));
 
         let admin_info = Arc::new(AdminInfo {
-            node_id: Some(self.id),
+            node_id: Some(self.id.clone()),
             internal_addr: Some(self.internal_addr),
             client_addr: self.client_addr,
             dynamo_addr: Some(self.dynamo_addr),
@@ -2222,7 +2220,7 @@ impl BoundDataNode {
         let data_role = DataRole {
             rmw_lock: Arc::new(tokio::sync::Mutex::new(())),
             raftkv_metrics,
-            base_id: my_id,
+            base_id: my_id.clone(),
         };
         let (ctx, mut tasks) = spawn_common_tail(
             control,
@@ -2231,7 +2229,7 @@ impl BoundDataNode {
             admin_info,
             client_route,
             (
-                my_id,
+                my_id.clone(),
                 NodeAddrs {
                     internal: my_addr.to_string(),
                     client: my_client_addr.to_string(),
@@ -2251,15 +2249,15 @@ impl BoundDataNode {
         let reconciler = {
             let host_edge = edge.clone();
             let teardown_edge = edge.clone();
-            let base_id = my_id;
+            let base_id = my_id.clone();
             let on_teardown = move |tablet: TabletId| {
-                teardown_edge.unregister_raftkv(tablet, base_id);
+                teardown_edge.unregister_raftkv(tablet, base_id.clone());
             };
             match storage {
                 SharedEngine::Lsm(lsm) => CpReconciler::Lsm(Reconciler::new(
                     hook_env,
                     lsm,
-                    my_id,
+                    my_id.clone(),
                     table_scope_prefix,
                     move |tablet, node: &RaftKvNode<ProdEnv, LsmEngine<ProdEnv>>| {
                         host_edge.register_raftkv(tablet, CpGroup::Lsm(node.clone()));
@@ -2269,7 +2267,7 @@ impl BoundDataNode {
                 SharedEngine::Mem(mem) => CpReconciler::Mem(Reconciler::new(
                     hook_env,
                     mem,
-                    my_id,
+                    my_id.clone(),
                     table_scope_prefix,
                     move |tablet, node: &RaftKvNode<ProdEnv, MemoryEngine>| {
                         host_edge.register_raftkv(tablet, CpGroup::Mem(node.clone()));
@@ -2833,7 +2831,7 @@ impl ClientCtx {
     /// node — no leader signal at all).
     fn control_leader_hint(&self) -> Option<(NodeId, SocketAddr)> {
         let id = self.control.leader()?;
-        let addr = self.route_addr(id)?;
+        let addr = self.route_addr(id.clone())?;
         Some((id, addr))
     }
 
@@ -3707,7 +3705,7 @@ impl ClientCtx {
         // base `raftkv` id, so the local replica's leader hint is already a
         // `client_route` key — no more base<->member translation needed.
         let leader = self.edge.local_cp(tablet).and_then(|n| n.leader())?;
-        let addr = self.route_addr(leader)?;
+        let addr = self.route_addr(leader.clone())?;
         Some((leader, addr))
     }
 
@@ -3983,7 +3981,7 @@ impl ClientCtx {
                     .members
                     .iter()
                     .filter(|(_, m)| m.status == NodeStatus::Active)
-                    .map(|(id, _)| *id)
+                    .map(|(id, _)| id.clone())
                     .collect();
                 replicas.truncate(MAX_REPLICATION_FACTOR);
                 if !replicas.is_empty() {
@@ -4225,7 +4223,7 @@ impl ClientCtx {
         }
         self.propose_and_await(
             MetaCommand::UpsertMember {
-                node,
+                node: node.clone(),
                 labels,
                 status: NodeStatus::Down,
             },
@@ -4322,7 +4320,7 @@ impl ClientCtx {
                 member.status
             ));
         }
-        let referenced = meta.tablets_referencing(node);
+        let referenced = meta.tablets_referencing(&node);
         if referenced > 0 {
             return Err(format!(
                 "node {node} still referenced by {referenced} tablet(s); wait for draining to \
@@ -4351,63 +4349,48 @@ impl ClientCtx {
     /// change is `RaftNode::change_membership`, a distinct method only a
     /// genuine control-group voter's own in-process handle can call.
     ///
-    /// `node`, when `Some`, is an **operator-supplied** id, checked against
-    /// three collision surfaces before ever touching Raft: (1) already a live
-    /// control voter (`self.control.config()`) — idempotent success, not an
-    /// error, mirroring `admin_add_member`'s "already registered" no-op; (2)
-    /// already claimed by *any* existing member — raftkv id, cluster-core
-    /// control id, or a previously cluster-allocated id (`Metadata::members`,
-    /// which `MetaCommand::AllocateNodeId`'s apply always populates too, so
-    /// this one check covers both) — refused, since a control voter and a
-    /// data-plane/other member must never share a numeric identity; (3) at or
-    /// above [`ALLOC_ID_BASE`] — refused outright, keeping the operator-chosen
-    /// range and the allocator's own disjoint range structurally non-
-    /// overlapping in both directions (the allocator already never dips below
-    /// its base; this is the missing other half). Manually targeting the
-    /// allocated range is never allowed, even after this method started being
-    /// able to mint ids there itself — see the `None` case below for why that
-    /// asymmetry is intentional, not an oversight.
+    /// `node`, when `Some`, is an **operator-supplied** id — validated via
+    /// [`NodeId::propose`] (the sanctioned re-validation every intake
+    /// boundary must run on an id that arrived through `serde`, which skips
+    /// [`NodeId::propose`]'s charset check by design). ADR 0040 PR4 deletes
+    /// the old `ALLOC_ID_BASE`-range refusal entirely — there is no more
+    /// reserved numeric range to keep clear of, since ids are opaque strings
+    /// and uniqueness is enforced structurally by [`register_node`](
+    /// Self::register_node)'s CAS, not by a magnitude convention. The target
+    /// must **already be a registered member** (its own prior
+    /// self-registration, e.g. an already-running combined node being
+    /// promoted to a control voter) **or get registered in this same
+    /// action** — there is no third case and no refusal for "already
+    /// exists": promoting an existing member to a control voter is the
+    /// common case, not a conflict (one identity per node, ADR 0040 PR1 —
+    /// there is no longer a separate control-id space an existing member
+    /// could collide with).
     ///
-    /// `node: None` (ADR 0037 hardening trio's PR3 — closes the "Coordination
-    /// with ADR 0036" gap that ADR 0037 originally deferred) mints a fresh id
-    /// from the **same replicated allocator** ADR 0036's join path uses
-    /// (`MetaCommand::AllocateNodeId`, via the private
-    /// [`allocate_node_id`](Self::allocate_node_id) helper) instead of
-    /// requiring an operator-chosen one: a fresh nonce drawn from
-    /// `leader.env().next_u64()` — **not** [`generate_join_nonce`]'s
-    /// deliberate OS-randomness exception, since unlike that CLI-pre-bind
-    /// boundary this method runs in-process on a live control leader that a
-    /// `SimEnv` test can (and, per this PR's own tests, does) drive, so the
-    /// `Env`-seam rule (ADR 0003) applies here with no exception to invoke —
-    /// then proceeds through the *same* address-registration +
-    /// `change_membership` tail as the operator-supplied path, with checks
-    /// (2) and (3) above **skipped** for the minted id: `AllocateNodeId`'s own
-    /// apply already inserted a `Down` `Member` row for it as part of
-    /// minting, so check (2) (`Metadata::members` already contains it) would
-    /// reject the allocator's own output every single time, and check (3) is
-    /// exactly backwards for an id that by construction sits at or above
-    /// `ALLOC_ID_BASE`. This is why operator-supplied ids can still never
-    /// target the allocated range (check (3) above, unconditionally): the
-    /// allocator is the only legitimate mint authority for that range, and
-    /// only this method's own `None` branch is allowed to skip its guard.
+    /// `node: None` (ADR 0037 hardening trio's PR3, re-based onto ADR 0040
+    /// Decision C) mints a fresh id via [`NodeId::mint`] off **this** leader's
+    /// own bound `Env` (`leader.env()`) — **not**
+    /// [`animus_env::prod::PreBindRng`], the pre-bind CLI-boundary exception:
+    /// this method runs in-process on a live control leader a `SimEnv` test
+    /// can (and, per this PR's own tests, does) drive, so the `Env`-seam rule
+    /// (ADR 0003) applies here with no exception to invoke. A minted
+    /// collision (astronomically unlikely, but structurally possible) simply
+    /// re-mints and retries, up to [`MAX_MINT_ATTEMPTS`] times — mirroring the
+    /// CLI join path's identical retry shape.
     ///
-    /// Two steps, honestly partial on a failure between them (mirroring
-    /// [`admin_add_member`]'s "both-or-honest-partial-state" idempotence,
-    /// since a retry of this whole call is always safe): (a) proposes a
-    /// bookkeeping [`MetaCommand::RegisterNodeAddrs`] — merged into whatever
-    /// address-book entry already exists for `node` (e.g. from the new
-    /// process's own self-registration at startup) rather than blindly
-    /// overwritten, so a real `client`/`admin` address a self-registration
-    /// already recorded is never clobbered by this call's own more limited
-    /// view — proposed directly on the local leader handle (not relayed:
-    /// we already require being the leader to get this far); (b) merges
-    /// `addr` into the **local leader's own** `ProdEnv` peer book
-    /// ([`animus_env::ProdEnv::merge_peer`]) so its very next
-    /// `AppendEntries`/`InstallSnapshot` to `node` has somewhere to go, then
-    /// (c) calls `change_membership` to actually add the voter. See
-    /// `ProdEnv::merge_peer`'s doc for the known scope limit this leaves (only
-    /// *this* env's peer book is updated — a later leadership change needs
-    /// its own follow-up, deliberately deferred out of this PR).
+    /// Three steps, honestly partial on a failure between any of them
+    /// (mirroring [`admin_add_member`]'s "both-or-honest-partial-state"
+    /// idempotence, since a retry of this whole call is always safe): (a)
+    /// [`register_node`](Self::register_node)'s CAS claims `node` if it
+    /// isn't already a member (a no-op if it already is, matching
+    /// `RegisterNodeAddrs`'s idempotent update contract) or updates its
+    /// `internal` address if it is; (b) merges `addr` into the **local
+    /// leader's own** `ProdEnv` peer book ([`animus_env::ProdEnv::
+    /// merge_peer`]) so its very next `AppendEntries`/`InstallSnapshot` to
+    /// `node` has somewhere to go; (c) calls `change_membership` to actually
+    /// add the voter. See `ProdEnv::merge_peer`'s doc for the known scope
+    /// limit this leaves (only *this* env's peer book is updated — a later
+    /// leadership change needs its own follow-up, deliberately deferred out
+    /// of this PR).
     ///
     /// Returns the **effective** [`NodeId`] either way — the operator-supplied
     /// one echoed back, or the freshly-minted one — so the caller (`admin.rs`,
@@ -4422,40 +4405,14 @@ impl ClientCtx {
         let Some(leader) = self.edge.leader_handle() else {
             return Err(self.not_leader_error());
         };
-        let (node, minted) = match node {
-            Some(node) => {
-                if node >= ALLOC_ID_BASE {
-                    return Err(format!(
-                        "node {node} is at or above the cluster-allocated id range \
-                         (ALLOC_ID_BASE = {ALLOC_ID_BASE}); an operator-supplied control \
-                         voter id must stay below it"
-                    ));
-                }
-                (node, false)
-            }
-            None => {
-                // Env-seam-compliant nonce (see this method's own doc above
-                // for why `generate_join_nonce`'s OS-randomness exception
-                // does not apply here): two `u64`s concatenated give the same
-                // 128 bits of practical uniqueness a join nonce needs, at no
-                // cost since `next_u64` is cheap and this call isn't hot path.
-                let nonce = format!(
-                    "{:016x}{:016x}",
-                    leader.env().next_u64(),
-                    leader.env().next_u64()
-                );
-                let node = match self.allocate_node_id(nonce, labels).await {
-                    ClientResponse::NodeIdAllocated { node } => node,
-                    ClientResponse::Error(e) => return Err(e),
-                    other => {
-                        return Err(format!(
-                            "unexpected reply allocating a control-member id: {other:?}"
-                        ));
-                    }
-                };
-                (node, true)
-            }
+        let (mut node, minted) = match node {
+            Some(node) => (
+                NodeId::propose(node.as_str()).map_err(|e| format!("invalid node id: {e}"))?,
+                false,
+            ),
+            None => (NodeId::mint(leader.env()), true),
         };
+
         let current = self.control.config().unwrap_or_default();
         if current.contains(&node) {
             // Idempotent: already a voter. Still worth refreshing this env's
@@ -4466,48 +4423,99 @@ impl ClientCtx {
             // env — every other control-role node's `peer_sync_loop` only
             // ever learns an updated address from `Metadata.node_addrs`,
             // never from this call's local `merge_peer` side effect.
-            leader.env().merge_peer(node, addr);
+            leader.env().merge_peer(node.clone(), addr);
             let meta = self.control.metadata_cached();
             if let Some(mut addrs) = meta.node_addrs.get(&node).cloned()
                 && addrs.internal != addr.to_string()
             {
                 addrs.internal = addr.to_string();
-                let _ = leader.propose(MetaCommand::RegisterNodeAddrs { node, addrs });
+                let _ = leader.propose(MetaCommand::RegisterNodeAddrs {
+                    node: node.clone(),
+                    addrs,
+                });
             }
             return Ok(node);
         }
+
         let meta = self.control.metadata_cached();
-        if !minted && meta.members.contains_key(&node) {
-            return Err(format!(
-                "node {node} already exists as a cluster member (data-plane, \
-                 control-core, or previously allocated); pick a different id"
-            ));
-        }
-        // Merge into whatever address-book entry already exists for `node`
-        // (e.g. a self-registration this same process already made for its
-        // client/admin addresses, or — for a minted id — the `Down`, address-
-        // less `Member` row `AllocateNodeId`'s own apply just inserted)
-        // rather than blindly overwriting it, then stamp `internal` — the
-        // field this action exists to populate: replicated so every
-        // control-role node's own `peer_sync_loop` can reach the new voter,
-        // not just this leader's own env (see `ProdEnv::merge_peer`'s doc for
-        // the gap this closes).
-        let mut addrs = meta.node_addrs.get(&node).cloned().unwrap_or(NodeAddrs {
-            internal: String::new(),
-            client: String::new(),
-            admin: String::new(),
-            role: "control".to_string(),
-        });
-        addrs.internal = addr.to_string();
-        match leader.propose(MetaCommand::RegisterNodeAddrs { node, addrs }) {
-            ProposeResult::Accepted { .. } => {}
-            ProposeResult::NotLeader { .. } => {
-                return Err("control leadership moved; retry on the leader".into());
+        if meta.members.contains_key(&node) {
+            // Already a registered member (its own self-registration, or a
+            // prior admin action) — just make sure its `internal` address
+            // (this action's whole purpose) matches `addr`. Never touches
+            // labels/status: those belong to whatever registered it, not to
+            // this control-voter promotion.
+            let mut addrs = meta.node_addrs.get(&node).cloned().unwrap_or(NodeAddrs {
+                internal: String::new(),
+                client: String::new(),
+                admin: String::new(),
+                role: "control".to_string(),
+            });
+            if addrs.internal != addr.to_string() {
+                addrs.internal = addr.to_string();
+                if let ProposeResult::NotLeader { .. } =
+                    leader.propose(MetaCommand::RegisterNodeAddrs {
+                        node: node.clone(),
+                        addrs,
+                    })
+                {
+                    return Err("control leadership moved; retry on the leader".into());
+                }
+            }
+        } else {
+            // Genuinely unclaimed: the sole claim path (ADR 0040 Decision C).
+            // A **minted** id re-mints and retries on collision
+            // (astronomically unlikely, but structurally possible — nothing
+            // needs rebinding, since ports are never derived from ids); a
+            // **proposed** id fails loudly on the first collision instead —
+            // an operator/config conflict is a real problem to report, not
+            // to paper over by silently trying something else.
+            let mut attempts_left = if minted { MAX_MINT_ATTEMPTS } else { 1 };
+            loop {
+                // Merge into whatever address-book entry this id's own
+                // self-registration may already have made (e.g. a
+                // permanently-non-voter control-only growth node that
+                // published its real `client`/`admin` addresses before this
+                // action ever ran) rather than blindly constructing a fresh,
+                // empty one — `RegisterNode`'s CAS would otherwise see this
+                // call's empty `client`/`admin` as a *different* entry and
+                // reject it as a collision against its own node's earlier
+                // self-registration.
+                let mut addrs = self
+                    .control
+                    .metadata_cached()
+                    .node_addrs
+                    .get(&node)
+                    .cloned()
+                    .unwrap_or(NodeAddrs {
+                        internal: String::new(),
+                        client: String::new(),
+                        admin: String::new(),
+                        role: "control".to_string(),
+                    });
+                addrs.internal = addr.to_string();
+                match self
+                    .register_node(node.clone(), addrs, labels.clone())
+                    .await
+                {
+                    Ok(RegisterOutcome::Registered) => break,
+                    Ok(RegisterOutcome::Collision) if minted && attempts_left > 1 => {
+                        attempts_left -= 1;
+                        node = NodeId::mint(leader.env());
+                    }
+                    Ok(RegisterOutcome::Collision) => {
+                        return Err(format!(
+                            "node {node} is already claimed by a different registration \
+                             (data-plane, control-core, or another admin action); pick a \
+                             different id"
+                        ));
+                    }
+                    Err(e) => return Err(e),
+                }
             }
         }
-        leader.env().merge_peer(node, addr);
+        leader.env().merge_peer(node.clone(), addr);
         let mut voters = current;
-        voters.insert(node);
+        voters.insert(node.clone());
         match leader.change_membership(voters) {
             ProposeResult::Accepted { .. } => Ok(node),
             ProposeResult::NotLeader { .. } => Err(
@@ -4589,7 +4597,7 @@ impl ClientCtx {
             ));
         }
         let remaining: BTreeSet<NodeId> =
-            current.iter().copied().filter(|&id| id != node).collect();
+            current.iter().filter(|&id| *id != node).cloned().collect();
         // Liveness-aware quorum-loss guard (ADR 0037 hardening PR2). The
         // original ADR 0037 guard counted only the *resulting* voter count
         // (refuse `< 1`, warn `== 1`) — which looks complete but misses the
@@ -4610,8 +4618,8 @@ impl ClientCtx {
         if !force {
             let dead: Vec<NodeId> = remaining
                 .iter()
-                .copied()
-                .filter(|&id| !leader.control_peer_believed_alive(id))
+                .filter(|id| !leader.control_peer_believed_alive((*id).clone()))
+                .cloned()
                 .collect();
             let live = remaining.len() - dead.len();
             let majority = remaining.len() / 2 + 1;
@@ -4631,10 +4639,10 @@ impl ClientCtx {
             }
         }
         if node == my_id {
-            let Some(&target) = current.iter().find(|&&id| id != my_id) else {
+            let Some(target) = current.iter().find(|&id| *id != my_id).cloned() else {
                 return Err("no other control voter available to transfer leadership to".into());
             };
-            if !leader.transfer_leadership(target) {
+            if !leader.transfer_leadership(target.clone()) {
                 return Err(format!(
                     "could not arm a leadership transfer to node {target} (already \
                      mid-transfer, or {target} has not caught up); retry"
@@ -4700,6 +4708,32 @@ pub(crate) struct ControlRemoveOutcome {
     pub(crate) warning: Option<String>,
 }
 
+/// How many times a **minted** [`NodeId`] is allowed to collide (ADR 0040
+/// Decision C) before giving up and reporting a real error — a 128-bit mint
+/// colliding even once is already astronomically unlikely; this only guards
+/// against a genuine bug (e.g. a broken `Rng`) looping forever rather than
+/// ever expecting to be exhausted in practice.
+const MAX_MINT_ATTEMPTS: u32 = 8;
+
+/// The observable outcome of [`ClientCtx::register_node`]'s propose-then-poll
+/// registration CAS (ADR 0040 Decision C) — see that method's own doc for
+/// exactly what each variant means and why they cover every case (a fresh
+/// claim, an idempotent replay, and a genuine collision) with only two
+/// values: the caller only ever needs to know "is `node_addrs[node]` now
+/// mine, or someone else's."
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RegisterOutcome {
+    /// `node_addrs[node]` holds exactly the `addrs`/`labels` this call
+    /// proposed — whether from this call's own commit, an idempotent
+    /// replay, or a concurrent identical registration.
+    Registered,
+    /// `node_addrs[node]` holds a **different** entry — the id is already
+    /// claimed by someone else. A minted caller re-mints and retries with a
+    /// different id; a caller with an operator-/config-proposed id must
+    /// fail loudly instead.
+    Collision,
+}
+
 /// The leader's one-time cluster bootstrap, retried on a timer until it lands.
 ///
 /// It registers the cluster's **CP data nodes** (the `raftkv` ids) as `Active`
@@ -4753,10 +4787,10 @@ async fn bootstrap(raft: RaftNode<ProdEnv>, raftkv_ids: Vec<NodeId>) {
             // (`ClientCtx::provision_tablet`), and the per-node join-host loop stands
             // its group up. Idempotent: only members not yet present are proposed.
             let meta = raft.metadata();
-            for &node in &raftkv_ids {
-                if !meta.members.contains_key(&node) {
+            for node in &raftkv_ids {
+                if !meta.members.contains_key(node) {
                     raft.propose(MetaCommand::UpsertMember {
-                        node,
+                        node: node.clone(),
                         labels: BTreeMap::new(),
                         status: NodeStatus::Active,
                     });
@@ -5266,7 +5300,7 @@ async fn tablet_host_reconciler_loop(ctx: ClientCtx, mut reconciler: CpReconcile
             .members
             .iter()
             .filter(|(_, m)| m.status == NodeStatus::Down)
-            .map(|(id, _)| *id)
+            .map(|(id, _)| id.clone())
             .collect();
         let view = MetadataView {
             tablets: meta.tablets,
@@ -5578,7 +5612,6 @@ fn request_kind(request: &ClientRequest) -> &'static str {
         ClientRequest::MergeTablets { .. } => "merge_tablets",
         ClientRequest::JoinInfo => "join_info",
         ClientRequest::WatchMetadata { .. } => "watch_metadata",
-        ClientRequest::AllocateNodeId { .. } => "allocate_node_id",
     }
 }
 
@@ -5664,11 +5697,6 @@ async fn handle_request(ctx: &ClientCtx, request: ClientRequest) -> ClientRespon
         // Long-poll metadata watch (ADR 0035 PR5) — see `ClientCtx::
         // watch_metadata`'s doc.
         ClientRequest::WatchMetadata { last_seen } => ctx.watch_metadata(last_seen).await,
-        // Cluster-allocated member id (ADR 0036) — see `ClientCtx::
-        // allocate_node_id`'s doc.
-        ClientRequest::AllocateNodeId { nonce, labels } => {
-            ctx.allocate_node_id(nonce, labels).await
-        }
     }
 }
 
@@ -5722,40 +5750,6 @@ impl ClientCtx {
     /// doc for the same cache-tolerant-but-not-commit-wait-safe contract.
     pub(crate) fn has_table_schema(&self, table: &str) -> bool {
         self.effective_metadata().has_table_schema(table)
-    }
-
-    /// Register this node's **full address book** (ADR 0032 PR1: raftkv +
-    /// client + admin) in the replicated `Metadata`, so any node — including one
-    /// that joined the cluster earlier and never restarted — can resolve where
-    /// to forward/relay a client op or an admin peer-list entry, closing the ADR
-    /// 0030 residual gap where `client_route`/the admin peer list were static
-    /// per-process snapshots taken once at startup. Supersedes the old
-    /// `register_cp_addr` (kept as `MetaCommand::RegisterCpAddr` only for WAL
-    /// back-compat; no longer proposed). Routes to the control leader via the
-    /// relay (`RegisterNodeAddrs` is in [`is_relayable_command`]'s allowlist) and
-    /// waits until the entry is visible here, re-proposing each tick. Best-effort
-    /// (bounded by [`SCHEMA_COMMIT_TIMEOUT`]); idempotent (re-registering an
-    /// identical address book is a state-machine no-op).
-    pub(crate) async fn register_node_addrs(&self, node: NodeId, addrs: NodeAddrs) {
-        // `effective_metadata`, not `self.control.metadata_cached()` directly: on a growth
-        // node (ADR 0030) this is the *only* signal that its own self-registration
-        // actually landed on the real cluster, since its local raft never
-        // replicates — see `effective_metadata`'s doc. `propose_and_await`'s
-        // relay reaches a real leader via `propose_schema`'s no-known-leader
-        // broadcast fallback, but confirmation must poll the mirror.
-        if self.effective_metadata().node_addrs.get(&node) == Some(&addrs) {
-            return;
-        }
-        let want = addrs.clone();
-        let _ = self
-            .propose_and_await(
-                MetaCommand::RegisterNodeAddrs { node, addrs },
-                SCHEMA_COMMIT_TIMEOUT,
-                || async {
-                    (self.effective_metadata().node_addrs.get(&node) == Some(&want)).then_some(())
-                },
-            )
-            .await;
     }
 
     /// Split CP `tablet` at `split_key`: a **single, atomic** control-plane
@@ -5879,40 +5873,57 @@ impl ClientCtx {
         }
     }
 
-    /// **Cluster-allocated member id** (ADR 0036): propose
-    /// `MetaCommand::AllocateNodeId` on the control-plane leader (locally if
+    /// **Registration compare-and-swap** (ADR 0040 Decision C): propose
+    /// `MetaCommand::RegisterNode` on the control-plane leader (locally if
     /// we are it, else relayed — [`is_relayable_command`] allows this
-    /// command) and wait for the nonce's entry to commit + replicate here,
+    /// command) and wait for the claim to commit + replicate here,
     /// structurally identical to [`trigger_split`](Self::trigger_split) —
-    /// propose, then poll [`effective_metadata`](Self::effective_metadata)
-    /// for the exact effect. `effective_metadata()`, not
-    /// `self.control.metadata_cached()` directly, for the same
-    /// control-plane-follower-less-node staleness reason `trigger_split`'s
-    /// doc explains: this call itself may be running on a growth/data-only
-    /// node relaying on a caller's behalf. The whole propose-then-confirm
-    /// loop runs here, server-side, in one round trip — the caller (a
-    /// joining process with no local `Metadata` yet) just waits for the
-    /// reply.
-    async fn allocate_node_id(
+    /// propose, then poll for the exact effect. **Unlike `trigger_split`,
+    /// this polls [`metadata_fresh`](Self::metadata_fresh)** (a genuine
+    /// read-your-writes round trip on `Remote`), not
+    /// `effective_metadata()`/`metadata_cached()`: a wrong "collision"
+    /// verdict here has real, structural consequences for the caller (a
+    /// minted id re-mints and retries; a proposed id fails loudly) that a
+    /// possibly-stale cached read could get wrong. The whole propose-then-
+    /// confirm loop runs here, server-side, in one round trip — the caller
+    /// (`spawn_common_tail`'s own one-shot self-registration, on **every**
+    /// node shape, or `admin_add_control_member`) just awaits the result.
+    ///
+    /// Returns [`RegisterOutcome::Registered`] once `node_addrs[node]`
+    /// equals exactly the `addrs` just proposed (whether from this call's
+    /// own `Applied`, an idempotent `NoOp` replay of an identical prior
+    /// claim, or a concurrent identical registration that landed first —
+    /// all indistinguishable on purpose, since only the observable state
+    /// matters); [`RegisterOutcome::Collision`] once `node_addrs[node]` is
+    /// visibly a **different** entry — a durable fact, not a timing fluke,
+    /// so a caller never needs to poll further once it sees this.
+    pub(crate) async fn register_node(
         &self,
-        nonce: String,
+        node: NodeId,
+        addrs: NodeAddrs,
         labels: BTreeMap<String, String>,
-    ) -> ClientResponse {
-        let cmd = MetaCommand::AllocateNodeId {
-            nonce: nonce.clone(),
+    ) -> Result<RegisterOutcome, String> {
+        let cmd = MetaCommand::RegisterNode {
+            node: node.clone(),
+            addrs: addrs.clone(),
             labels,
         };
         match self
             .propose_and_await(cmd, SCHEMA_COMMIT_TIMEOUT, || async {
-                self.effective_metadata()
-                    .node_id_allocations
-                    .get(&nonce)
-                    .copied()
+                match self.metadata_fresh().await.node_addrs.get(&node).cloned() {
+                    Some(existing) if existing == addrs => Some(RegisterOutcome::Registered),
+                    Some(_) => Some(RegisterOutcome::Collision),
+                    None => None,
+                }
             })
             .await
         {
-            Ok(node) => ClientResponse::NodeIdAllocated { node },
-            Err(()) => ClientResponse::Error("node id allocation did not commit in time".into()),
+            Ok(outcome) => Ok(outcome),
+            Err(()) => Err(format!(
+                "node registration for {node} did not commit within {}s \
+                 (no control-plane leader reachable?)",
+                SCHEMA_COMMIT_TIMEOUT.as_secs()
+            )),
         }
     }
 
@@ -6193,6 +6204,7 @@ pub async fn bind_cluster(
     for i in 0..n {
         let addr = || SocketAddr::new(ip, 0);
         let addrs = RoleAddrs {
+            id: config::node_id(i),
             role: config::NodeRole::Both,
             internal: addr(),
             client: addr(),
@@ -6286,7 +6298,7 @@ async fn start_cluster_inner(
     // `BoundNode` rather than re-deriving from `control_ids`, so this stays
     // correct even if a future caller's `bound` isn't a contiguous `0..n`
     // index range.
-    let data_ids: Vec<NodeId> = bound.iter().map(|b| b.id).collect();
+    let data_ids: Vec<NodeId> = bound.iter().map(|b| b.id.clone()).collect();
     let peers: BTreeMap<NodeId, SocketAddr> =
         bound.iter().flat_map(BoundNode::peer_entries).collect();
     // Cross-node routing (ADR 0017 #3b / ADR 0013): map each node's one id to
@@ -6302,8 +6314,10 @@ async fn start_cluster_inner(
     // it live thereafter by overlaying `Metadata.node_addrs[*].client` (ADR
     // 0032 PR1) — so a node grown into the cluster later is still reachable
     // from every original node.
-    let client_route: BTreeMap<NodeId, SocketAddr> =
-        bound.iter().map(|b| (b.id, b.client_addr)).collect();
+    let client_route: BTreeMap<NodeId, SocketAddr> = bound
+        .iter()
+        .map(|b| (b.id.clone(), b.client_addr))
+        .collect();
     // Every node's admin address, so each node's dashboard (ADR 0021) can fan out
     // to the whole in-process cluster.
     let admin_addrs: Vec<SocketAddr> = bound.iter().map(BoundNode::admin_addr).collect();
@@ -6374,6 +6388,7 @@ pub async fn start_split_cluster_with(
     let mut control_bound = Vec::with_capacity(control_n);
     for i in 0..control_n {
         let addrs = RoleAddrs {
+            id: config::node_id(i),
             role: config::NodeRole::Control,
             internal: ephemeral(),
             client: ephemeral(),
@@ -6388,6 +6403,7 @@ pub async fn start_split_cluster_with(
     let mut data_bound = Vec::with_capacity(data_n);
     for i in control_n..total {
         let addrs = RoleAddrs {
+            id: config::node_id(i),
             role: config::NodeRole::Data,
             internal: ephemeral(),
             client: ephemeral(),
@@ -6406,10 +6422,12 @@ pub async fn start_split_cluster_with(
     // that same env).
     let control_peer_book: BTreeMap<NodeId, SocketAddr> = control_bound
         .iter()
-        .map(|b| (b.id, b.internal_addr))
+        .map(|b| (b.id.clone(), b.internal_addr))
         .collect();
-    let raftkv_peer_book: BTreeMap<NodeId, SocketAddr> =
-        data_bound.iter().map(|b| (b.id, b.internal_addr)).collect();
+    let raftkv_peer_book: BTreeMap<NodeId, SocketAddr> = data_bound
+        .iter()
+        .map(|b| (b.id.clone(), b.internal_addr))
+        .collect();
     let mut data_env_peers = raftkv_peer_book;
     data_env_peers.extend(control_peer_book.clone());
 
@@ -6418,10 +6436,10 @@ pub async fn start_split_cluster_with(
     // `run_node_control`/`run_node_data`'s per-process assembly.
     let mut client_route: BTreeMap<NodeId, SocketAddr> = BTreeMap::new();
     for b in &control_bound {
-        client_route.insert(b.id, b.client_addr);
+        client_route.insert(b.id.clone(), b.client_addr);
     }
     for b in &data_bound {
-        client_route.insert(b.id, b.client_addr);
+        client_route.insert(b.id.clone(), b.client_addr);
     }
 
     // The control deployment's client addresses — the discovery root each
@@ -6497,7 +6515,7 @@ pub async fn run_node_with(
     dir: impl Into<PathBuf>,
     backend: StorageBackend,
 ) -> std::io::Result<Node> {
-    let addrs = *config.nodes.get(index).ok_or_else(|| {
+    let addrs = config.nodes.get(index).cloned().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "node index out of range")
     })?;
     let bound = Node::bind(config::node_id(index), addrs, dir).await?;
@@ -6561,7 +6579,7 @@ pub async fn run_node_control(
     dir: impl Into<PathBuf>,
     backend: StorageBackend,
 ) -> std::io::Result<Node> {
-    let addrs = *config.nodes.get(index).ok_or_else(|| {
+    let addrs = config.nodes.get(index).cloned().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "node index out of range")
     })?;
     if !addrs.role.has_control() {
@@ -6624,7 +6642,7 @@ pub async fn run_node_data(
     dir: impl Into<PathBuf>,
     backend: StorageBackend,
 ) -> std::io::Result<Node> {
-    let addrs = *config.nodes.get(index).ok_or_else(|| {
+    let addrs = config.nodes.get(index).cloned().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "node index out of range")
     })?;
     if !addrs.role.has_data() {
@@ -6721,7 +6739,7 @@ pub async fn run_node_growth(
     dir: impl Into<PathBuf>,
     backend: StorageBackend,
 ) -> std::io::Result<Node> {
-    let addrs = *config.nodes.get(index).ok_or_else(|| {
+    let addrs = config.nodes.get(index).cloned().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "node index out of range")
     })?;
     let bound = Node::bind(config::node_id(index), addrs, dir).await?;
@@ -6811,58 +6829,55 @@ async fn poll_seeds_for(
     }
 }
 
-/// Start node `index` as a **seed/join growth member** (ADR 0032 PR2,
-/// `animusd join`): unlike [`run_node_growth`], which needs an
-/// operator-assembled *expanded* `ClusterConfig` listing every node's
-/// addresses up front, this entry point needs only `addrs` (this node's own
-/// six addresses) and `seeds` (any already-running node's **client**
-/// address — old or newly grown, it no longer matters which, since ADR 0032
-/// PR1 made every node's address book equally current).
+/// Start a node as a **seed/join growth member** (ADR 0032 PR2, `animusd
+/// join`): unlike [`run_node_growth`], which needs an operator-assembled
+/// *expanded* `ClusterConfig` listing every node's addresses up front, this
+/// entry point needs only `addrs` (this node's own five addresses) and
+/// `seeds` (any already-running node's **client** address — old or newly
+/// grown, it no longer matters which, since ADR 0032 PR1 made every node's
+/// address book equally current).
 ///
-/// It contacts a seed for a [`ClientRequest::JoinInfo`] reply (the
-/// pre-growth control group + the answering node's internal peer book + its
-/// live client-op route + every known admin address), runs a **collision
-/// guard** against a [`ClientRequest::Status`] reply's `node_addrs` (below),
-/// then hands the discovered `original_control_ids` + merged peer/route/admin
-/// sets straight into [`BoundNode::start_with`] exactly like
-/// [`run_node_growth`] does — the ADR 0030 growth machinery
-/// (`!control_ids.contains(&self.control_id)` detection,
-/// `remote_metadata_sync_loop`, `effective_metadata`) engages automatically,
-/// including this node's own ADR 0032 PR1 address self-registration and its
-/// own [`ClientCtx::admin_add_member`] self-registration (see `start_with`'s
-/// growth-node block) — no separate step is needed here for either.
+/// **ADR 0040 PR4 clean break**: `--node I` is gone from the join path
+/// entirely (no operator-index sugar) — `id` is either an explicit,
+/// already-validated identity (`--id NAME`, [`NodeId::propose`] having run at
+/// the CLI boundary) or `None` to self-mint (ADR 0040 Decision B). Identity
+/// is claimed **before binding anything**, over the bare wire (this process
+/// has no `ClientCtx`/env yet): [`claim_join_identity`] proposes
+/// `MetaCommand::RegisterNode` via `ClientRequest::ProposeSchema` (relayed —
+/// see [`is_relayable_command`]'s allowlist) and polls a `ClientRequest::
+/// Status` reply's `node_addrs` for the same claim, exactly the propose-then-
+/// poll shape [`ClientCtx::register_node`] uses post-bind — just reached
+/// through the raw wire primitives every join entry point already has
+/// ([`join_request`]/[`poll_seeds_for`]), since there is no `ClientCtx` yet
+/// to call a method on. A **minted** id re-mints and retries on collision; a
+/// **proposed** id fails loudly (`AlreadyExists`) naming the conflict — see
+/// [`claim_join_identity`]'s own doc.
 ///
-/// **Collision guard.** Before binding, this checks the `Status` reply's
-/// `node_addrs` for an existing entry at `config::node_id(index)`: an
-/// **identical** entry (the same three addresses) is a *rejoin* of this
-/// exact node (a restart with the same index/addresses/dir) and this
-/// proceeds normally; a **different** entry means `index` is already
-/// claimed by a live member with different addresses, and startup fails
-/// loudly with an `AlreadyExists` error instead of silently colliding with
-/// it. This narrows, but does not fully eliminate, the race between two
-/// simultaneous joiners choosing the same index — `RegisterNodeAddrs` is
-/// idempotent at apply time (ADR 0032 PR1), so a genuine simultaneous
-/// collision is caught by the replicated state machine rather than
-/// corrupting anything, but this pre-bind check is a best-effort convenience,
-/// not a distributed lock.
-///
-/// **ADR 0035 PR5**: the discovery + collision-guard steps above are now the
-/// factored-out [`discover_join_info`]/[`check_join_collision`] helpers, so
-/// [`run_node_data_join`] (the data-only counterpart, `animusd data --seed`)
-/// reuses them verbatim instead of duplicating this poll/match/error-format
-/// boilerplate.
+/// Once identity is settled, this contacts a seed for a
+/// [`ClientRequest::JoinInfo`] reply (the pre-growth control group + the
+/// answering node's internal peer book + its live client-op route + every
+/// known admin address) and hands the discovered `original_control_ids` +
+/// merged peer/route/admin sets straight into [`BoundNode::start_with`]
+/// exactly like [`run_node_growth`] does — the ADR 0030 growth machinery
+/// engages automatically, including this node's own ADR 0032 PR1 address
+/// self-registration (now an idempotent `RegisterNodeAddrs` update-only
+/// re-affirmation of the claim [`claim_join_identity`] already made) and its
+/// own [`ClientCtx::admin_add_member`] self-registration (a harmless no-op —
+/// `RegisterNode` already registered the member) — no separate step is
+/// needed here for either.
 ///
 /// # Errors
 /// An `io::Error` (`TimedOut`) if no seed answers within
-/// [`JOIN_DISCOVERY_BUDGET`], `AlreadyExists` if the collision guard rejects
-/// a conflicting address book at this index, or (as [`run_node_growth`]) a
+/// [`JOIN_DISCOVERY_BUDGET`], `AlreadyExists` if an explicit `--id` collides
+/// with a different existing registration, or (as [`run_node_growth`]) a
 /// bind / engine-open failure.
 pub async fn run_node_join(
     seeds: Vec<SocketAddr>,
-    index: usize,
+    id: Option<NodeId>,
     addrs: RoleAddrs,
     dir: &Path,
     backend: StorageBackend,
+    labels: BTreeMap<String, String>,
 ) -> std::io::Result<Node> {
     if seeds.is_empty() {
         return Err(std::io::Error::new(
@@ -6870,34 +6885,26 @@ pub async fn run_node_join(
             "join needs at least one --seed address",
         ));
     }
-    // `run_node_join` still only supports joining as a combined-mode
-    // (`Both`-role) node — fail fast with a join-specific message rather
-    // than surfacing `Node::bind`'s generic one later, once discovery/
-    // collision-guard work has already happened.
-    let my_id = config::node_id(index);
-
     let (original_control_ids, peers, client_route, admin_addrs) =
         discover_join_info(&seeds).await?;
-    check_join_collision(
-        &seeds,
-        index,
-        my_id,
-        &NodeAddrs {
-            internal: addrs.internal.to_string(),
-            client: addrs.client.to_string(),
-            admin: addrs.admin.to_string(),
-            role: "combined".to_string(),
-        },
-    )
-    .await?;
 
-    let bound = Node::bind(my_id, addrs, dir).await?;
+    let mine = NodeAddrs {
+        internal: addrs.internal.to_string(),
+        client: addrs.client.to_string(),
+        admin: addrs.admin.to_string(),
+        role: "combined".to_string(),
+    };
+    let my_id = claim_join_identity(&seeds, id, &mine, &labels).await?;
+    let my_client_addr = addrs.client;
+    let my_admin_addr = addrs.admin;
+
+    let bound = Node::bind(my_id.clone(), addrs, dir).await?;
 
     finish_combined_join(
         bound,
         my_id,
-        addrs.client,
-        addrs.admin,
+        my_client_addr,
+        my_admin_addr,
         original_control_ids,
         peers,
         client_route,
@@ -6908,11 +6915,9 @@ pub async fn run_node_join(
 }
 
 /// The shared "merge discovered peers/route/admin → build `data_ids` →
-/// `start_with`" tail of every **combined-mode** seed/join entry point —
-/// [`run_node_join`] (an operator-indexed id) and
-/// [`run_node_join_allocated`] (ADR 0036's cluster-allocated id): once a
-/// joiner has bound its listener and knows its own id and client address,
-/// finishing the join is identical regardless of *how* it picked that id.
+/// `start_with`" tail of [`run_node_join`]: once a joiner has bound its
+/// listener and knows its own (claimed) id and client address, finishing the
+/// join is identical regardless of whether that id was proposed or minted.
 /// Merges this node's own entries into the discovered peer/route/admin sets
 /// — the same union `run_node_growth`'s expanded-config construction already
 /// produces, just built from a discovery reply instead of a pre-assembled
@@ -6983,173 +6988,110 @@ async fn discover_join_info(
     }
 }
 
-/// The collision-guard half of [`run_node_join`]/[`run_node_data_join`] (ADR
-/// 0035 PR5 — factored out alongside [`discover_join_info`]): reject a
-/// conflicting pre-existing registration at `my_id` before binding anything.
-/// An **identical** existing entry (a restart with the same index/addresses/
-/// dir) is a rejoin and returns `Ok(())`; a **different** one fails loudly
-/// with `AlreadyExists` instead of silently colliding with it — see
-/// [`run_node_join`]'s doc for the narrower, best-effort race this doesn't
-/// fully close (the real guard is `RegisterNodeAddrs`'s own idempotent
-/// apply-time check).
-async fn check_join_collision(
+/// How many times a **minted** join identity is allowed to collide (ADR 0040
+/// Decision C) before giving up — see [`MAX_MINT_ATTEMPTS`]'s own doc for why
+/// this bound is never expected to be hit in practice.
+const MAX_JOIN_MINT_ATTEMPTS: u32 = MAX_MINT_ATTEMPTS;
+
+/// The pre-bind (no `ClientCtx`/env yet) counterpart of [`ClientCtx::
+/// register_node`]'s propose-then-poll registration CAS — used by every join
+/// entry point before this process's own listeners exist. Same CAS/
+/// observable-state contract, reached over the bare wire primitives every
+/// join entry point already uses ([`join_request`]/[`poll_seeds_for`])
+/// instead of a genuine `ClientCtx`: (re-)propose `MetaCommand::RegisterNode`
+/// via `ClientRequest::ProposeSchema` every [`JOIN_RETRY_INTERVAL`], polling
+/// a `ClientRequest::Status` reply's `node_addrs` for the same observable
+/// outcome `register_node` confirms — `Registered` once it holds exactly
+/// `addrs`, `Collision` once it visibly holds something else.
+async fn register_node_over_wire(
     seeds: &[SocketAddr],
-    index: usize,
-    my_id: NodeId,
-    mine: &NodeAddrs,
-) -> std::io::Result<()> {
-    match poll_seeds_for(seeds, &ClientRequest::Status, JOIN_DISCOVERY_BUDGET).await? {
-        ClientResponse::Status { metadata: meta, .. } => {
-            if let Some(existing) = meta.node_addrs.get(&my_id)
-                && existing != mine
-            {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::AlreadyExists,
-                    format!(
-                        "join index {index} (id {my_id}) is already \
-                             registered with different addresses ({existing:?} != {mine:?}) \
-                             — pick a different --node index"
-                    ),
-                ));
+    node: &NodeId,
+    addrs: &NodeAddrs,
+    labels: &BTreeMap<String, String>,
+) -> std::io::Result<RegisterOutcome> {
+    let deadline = tokio::time::Instant::now() + JOIN_DISCOVERY_BUDGET;
+    let command = MetaCommand::RegisterNode {
+        node: node.clone(),
+        addrs: addrs.clone(),
+        labels: labels.clone(),
+    };
+    loop {
+        // Best-effort (re-)propose — a relay/leader race just gets retried
+        // next pass, exactly like every other join round trip here.
+        let _ = join_request(seeds, &ClientRequest::ProposeSchema(command.clone())).await;
+        if let Some(ClientResponse::Status { metadata, .. }) =
+            join_request(seeds, &ClientRequest::Status).await
+        {
+            match metadata.node_addrs.get(node) {
+                Some(existing) if existing == addrs => return Ok(RegisterOutcome::Registered),
+                Some(_) => return Ok(RegisterOutcome::Collision),
+                None => {}
             }
-            Ok(())
         }
-        other => Err(std::io::Error::other(format!(
-            "seed returned an unexpected reply to Status: {other:?}"
-        ))),
+        if tokio::time::Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "no seed in {seeds:?} confirmed registration for node {node} within \
+                     {JOIN_DISCOVERY_BUDGET:?}"
+                ),
+            ));
+        }
+        tokio::time::sleep(JOIN_RETRY_INTERVAL).await;
     }
 }
 
-/// Generate a fresh join-attempt idempotency nonce (ADR 0036) at the **CLI
-/// pre-bind boundary** — before any listener is bound, any command proposed,
-/// or anything `SimEnv` could ever drive. This is a deliberate, narrow
-/// exception to the `Env`-seam rule (ADR 0003: no unseeded randomness outside
-/// `ProdEnv`/test code): [`run_node_join_allocated`]/
-/// [`run_node_data_join_allocated`] are real-process, real-`TcpStream` entry
-/// points that never run under `SimEnv` — no sim test ever calls them (the
-/// control-plane sim coverage of `MetaCommand::AllocateNodeId` itself, in
-/// `animus-control`'s `tests/node_id_allocation.rs`, drives the command
-/// directly and never touches this CLI-facing wrapper) — so a real random
-/// source here can never desync a deterministic replay the way it would
-/// inside anything the simulator steps. Analogous to the OS handing out an
-/// ephemeral TCP port: this value only needs to be practically unique for
-/// the lifetime of one join attempt, not cryptographically strong or
-/// globally unique forever — a collision would, at worst, make two unrelated
-/// join attempts share one idempotency key, so one attempt's retry would
-/// (harmlessly) observe the other's already-committed allocation instead of
-/// its own. **Do not** thread this into anything `SimEnv` could drive, and
-/// do not add a second call site without re-reading this doc.
-fn generate_join_nonce() -> String {
-    format!("{:032x}", rand::random::<u128>())
-}
-
-/// Request a fresh, cluster-allocated member id (ADR 0036): polls `seeds`
-/// for a [`ClientResponse::NodeIdAllocated`] reply to
-/// [`ClientRequest::AllocateNodeId`] within [`JOIN_DISCOVERY_BUDGET`] —
-/// the `AllocateNodeId` dual of [`discover_join_info`]. `nonce` makes every
-/// retry across [`poll_seeds_for`]'s passes safe: replaying the same nonce
-/// (see [`MetaCommand::AllocateNodeId`]'s doc) converges to the one id
-/// already minted for this join attempt, never a second one.
-async fn allocate_node_id(
+/// Claim this join's identity, **pre-bind** (ADR 0040 Decision B/C):
+/// `explicit_id` is a `--id NAME` proposal (already validated —
+/// [`NodeId::propose`] ran at the CLI boundary), registered with one attempt
+/// and a loud, named failure on collision; `None` self-mints
+/// ([`NodeId::mint`] over [`animus_env::prod::PreBindRng`] — the sanctioned
+/// pre-bind entropy source that replaces `generate_join_nonce`'s narrower,
+/// bespoke exception) and re-mints on collision, up to
+/// [`MAX_JOIN_MINT_ATTEMPTS`] tries (astronomically unlikely to ever be
+/// needed — a 128-bit mint colliding once is already vanishing, so this
+/// bound only guards against a genuine bug looping forever).
+async fn claim_join_identity(
     seeds: &[SocketAddr],
-    nonce: String,
-    labels: BTreeMap<String, String>,
+    explicit_id: Option<NodeId>,
+    addrs: &NodeAddrs,
+    labels: &BTreeMap<String, String>,
 ) -> std::io::Result<NodeId> {
-    match poll_seeds_for(
-        seeds,
-        &ClientRequest::AllocateNodeId { nonce, labels },
-        JOIN_DISCOVERY_BUDGET,
-    )
-    .await?
-    {
-        ClientResponse::NodeIdAllocated { node } => Ok(node),
-        other => Err(std::io::Error::other(format!(
-            "seed returned an unexpected reply to AllocateNodeId: {other:?}"
-        ))),
+    match explicit_id {
+        Some(id) => match register_node_over_wire(seeds, &id, addrs, labels).await? {
+            RegisterOutcome::Registered => Ok(id),
+            RegisterOutcome::Collision => Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!(
+                    "node id `{id}` is already claimed by a different registration \
+                     (different addresses/labels) — pick a different --id"
+                ),
+            )),
+        },
+        None => {
+            for _ in 0..MAX_JOIN_MINT_ATTEMPTS {
+                let candidate = NodeId::mint(&animus_env::prod::PreBindRng);
+                match register_node_over_wire(seeds, &candidate, addrs, labels).await? {
+                    RegisterOutcome::Registered => return Ok(candidate),
+                    RegisterOutcome::Collision => continue,
+                }
+            }
+            Err(std::io::Error::other(format!(
+                "exhausted {MAX_JOIN_MINT_ATTEMPTS} self-minted id collisions in a row \
+                 (practically impossible) — this points at a real bug, not bad luck"
+            )))
+        }
     }
 }
 
-/// Start a node as a **cluster-allocated-id seed/join member** (ADR 0036):
-/// the additive sibling of [`run_node_join`] for `animusd join --seed
-/// ADDR[,ADDR...] --base-port P` with **no `--node`** — the control plane's
-/// own [`MetaCommand::AllocateNodeId`] monotonic allocator mints this node's
-/// id atomically instead of an operator picking a small index, closing ADR
-/// 0032's own documented residual race (two simultaneous `--node`-indexed
-/// joiners choosing the same index) by construction: the allocator's
-/// disjoint range + apply-time presence check make every minted id unique
-/// on every replica, with no epoch-CAS and no pre-bind guess needed.
-///
-/// Same discovery ([`discover_join_info`]) as `run_node_join`, but
-/// **deliberately skips [`check_join_collision`] entirely** — there is
-/// nothing to collide with an id that was just freshly minted by
-/// construction — then asks the cluster itself for the id
-/// ([`allocate_node_id`], keyed by a nonce generated once here at the CLI
-/// boundary, [`generate_join_nonce`]) before binding anything. **ADR 0040
-/// PR1 simplification**: one identity per node means the allocated id *is*
-/// this node's one id, full stop — no separate synthetic-control-id
-/// placeholder is needed (pre-PR1, a combined node needed a distinct local
-/// control id derived from its raftkv id; that whole derivation is gone).
-/// It is a structurally safe permanent non-voter simply because
-/// `original_control_ids` (the discovered pre-growth voter set) never
-/// contains it. Everything past binding is the same [`finish_combined_join`]
-/// tail `run_node_join` uses.
-///
-/// **Ephemeral identity**: a restart with a fresh nonce (a new process, or
-/// this same process retried after losing its own in-memory nonce) allocates
-/// a **new** id — the old id's `Member` entry lingers `Down`/address-less
-/// forever (ids are never reused, mirroring tablet ids), prunable later via
-/// the existing `RemoveMember`/decommission path like any other drained,
-/// unreferenced member. This is accepted ADR 0036 semantics, not a gap — see
-/// that ADR's "Back-compat / operator semantics" section. An operator who
-/// wants durable identity across restarts should keep using `--node I`.
-///
-/// # Errors
-/// An `io::Error` (`TimedOut`) if no seed answers [`JoinInfo`](ClientRequest::JoinInfo)
-/// or [`AllocateNodeId`](ClientRequest::AllocateNodeId) within
-/// [`JOIN_DISCOVERY_BUDGET`], or (as [`run_node_join`]) a bind / engine-open
-/// failure.
-pub async fn run_node_join_allocated(
-    seeds: Vec<SocketAddr>,
-    addrs: RoleAddrs,
-    dir: &Path,
-    backend: StorageBackend,
-    labels: BTreeMap<String, String>,
-) -> std::io::Result<Node> {
-    if seeds.is_empty() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "join needs at least one --seed address",
-        ));
-    }
-    let (original_control_ids, peers, client_route, admin_addrs) =
-        discover_join_info(&seeds).await?;
-
-    let nonce = generate_join_nonce();
-    let my_id = allocate_node_id(&seeds, nonce, labels).await?;
-
-    let bound = Node::bind(my_id, addrs, dir).await?;
-
-    finish_combined_join(
-        bound,
-        my_id,
-        addrs.client,
-        addrs.admin,
-        original_control_ids,
-        peers,
-        client_route,
-        admin_addrs,
-        backend,
-    )
-    .await
-}
-
-/// Start node `index` as a **data-only seed/join member** (ADR 0035 PR5): the
+/// Start a node as a **data-only seed/join member** (ADR 0035 PR5): the
 /// data-only counterpart of [`run_node_join`], reusing its `JoinInfo`
-/// discovery + `Status` collision guard verbatim
-/// ([`discover_join_info`]/[`check_join_collision`]) but constructing the
+/// discovery + identity-claim shape verbatim
+/// ([`discover_join_info`]/[`claim_join_identity`]) but constructing the
 /// **`Remote`** data-role assembly ([`BoundDataNode::start_data_with`])
 /// instead of a combined-mode node with a local control `RaftCore`. CLI:
-/// `animusd data --seed ADDR[,ADDR...] --node I [--dir D] [--ephemeral]`.
+/// `animusd data --seed ADDR[,ADDR...] [--id NAME] --base-port P [--dir D]
+/// [--ephemeral]`.
 ///
 /// The discovered `original_control_ids` (the seed's `JoinInfo`
 /// reply) feed both `heartbeat_loop`'s failure-detection target and, via the
@@ -7165,15 +7107,15 @@ pub async fn run_node_join_allocated(
 /// # Errors
 /// As [`run_node_join`]: an `io::Error` (`InvalidInput`) if `addrs` has the
 /// wrong role shape, `TimedOut` if no seed answers within
-/// [`JOIN_DISCOVERY_BUDGET`], `AlreadyExists` if the collision guard rejects
-/// a conflicting address book at this index, or a bind / engine-open
-/// failure.
+/// [`JOIN_DISCOVERY_BUDGET`], `AlreadyExists` if an explicit `--id` collides
+/// with a different existing registration, or a bind / engine-open failure.
 pub async fn run_node_data_join(
     seeds: Vec<SocketAddr>,
-    index: usize,
+    id: Option<NodeId>,
     addrs: RoleAddrs,
     dir: &Path,
     backend: StorageBackend,
+    labels: BTreeMap<String, String>,
 ) -> std::io::Result<Node> {
     if seeds.is_empty() {
         return Err(std::io::Error::new(
@@ -7181,30 +7123,26 @@ pub async fn run_node_data_join(
             "join needs at least one --seed address",
         ));
     }
-    let my_id = config::node_id(index);
-
     let (original_control_ids, peers, client_route, admin_addrs) =
         discover_join_info(&seeds).await?;
-    check_join_collision(
-        &seeds,
-        index,
-        my_id,
-        &NodeAddrs {
-            internal: addrs.internal.to_string(),
-            client: addrs.client.to_string(),
-            admin: addrs.admin.to_string(),
-            role: "data".to_string(),
-        },
-    )
-    .await?;
 
-    let bound = Node::bind_data(my_id, addrs, dir).await?;
+    let mine = NodeAddrs {
+        internal: addrs.internal.to_string(),
+        client: addrs.client.to_string(),
+        admin: addrs.admin.to_string(),
+        role: "data".to_string(),
+    };
+    let my_id = claim_join_identity(&seeds, id, &mine, &labels).await?;
+    let my_client_addr = addrs.client;
+    let my_admin_addr = addrs.admin;
+
+    let bound = Node::bind_data(my_id.clone(), addrs, dir).await?;
 
     finish_data_join(
         bound,
         my_id,
-        addrs.client,
-        addrs.admin,
+        my_client_addr,
+        my_admin_addr,
         original_control_ids,
         peers,
         client_route,
@@ -7216,8 +7154,7 @@ pub async fn run_node_data_join(
 
 /// The **data-only** dual of [`finish_combined_join`]: the shared "merge
 /// discovered peers/route/admin → derive control seeds → `start_data_with`"
-/// tail of [`run_node_data_join`] (an operator-indexed id) and
-/// [`run_node_data_join_allocated`] (ADR 0036's cluster-allocated id).
+/// tail of [`run_node_data_join`].
 #[allow(clippy::too_many_arguments)] // mirrors `finish_combined_join`'s shape
 async fn finish_data_join(
     bound: BoundDataNode,
@@ -7260,57 +7197,6 @@ async fn finish_data_join(
             admin_addrs,
         )
         .await
-}
-
-/// Start a node as a **data-only, cluster-allocated-id seed/join member**
-/// (ADR 0036): the data-only dual of [`run_node_join_allocated`], for
-/// `animusd data --seed ADDR[,ADDR...] --base-port P` with **no `--node`**.
-/// Reuses [`discover_join_info`] verbatim, **skips
-/// [`check_join_collision`] entirely** (nothing to collide with a freshly
-/// minted id), asks the cluster for an id via [`allocate_node_id`], and
-/// finishes through [`finish_data_join`] — the same shape
-/// [`run_node_join_allocated`] uses for the combined-mode role. See that
-/// function's doc for the ephemeral-identity trade-off (a restart with a
-/// fresh nonce allocates a new id; the old one lingers `Down`, prunable via
-/// `RemoveMember`).
-///
-/// # Errors
-/// As [`run_node_join_allocated`]: an `io::Error` (`InvalidInput`) if `addrs`
-/// has the wrong role shape, `TimedOut` if no seed answers within
-/// [`JOIN_DISCOVERY_BUDGET`], or a bind / engine-open failure.
-pub async fn run_node_data_join_allocated(
-    seeds: Vec<SocketAddr>,
-    addrs: RoleAddrs,
-    dir: &Path,
-    backend: StorageBackend,
-    labels: BTreeMap<String, String>,
-) -> std::io::Result<Node> {
-    if seeds.is_empty() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "join needs at least one --seed address",
-        ));
-    }
-    let (original_control_ids, peers, client_route, admin_addrs) =
-        discover_join_info(&seeds).await?;
-
-    let nonce = generate_join_nonce();
-    let my_id = allocate_node_id(&seeds, nonce, labels).await?;
-
-    let bound = Node::bind_data(my_id, addrs, dir).await?;
-
-    finish_data_join(
-        bound,
-        my_id,
-        addrs.client,
-        addrs.admin,
-        original_control_ids,
-        peers,
-        client_route,
-        admin_addrs,
-        backend,
-    )
-    .await
 }
 
 /// Upper bound on a client-protocol frame (the `u32` length prefix is
@@ -7511,6 +7397,7 @@ mod split_fence_tests {
             let addrs = free_addrs(5);
             let config = ClusterConfig {
                 nodes: vec![RoleAddrs {
+                    id: crate::config::node_id(0),
                     role: NodeRole::Both,
                     internal: addrs[0],
                     client: addrs[1],
@@ -7794,6 +7681,8 @@ mod auto_split_median_tests {
 /// modules in this file.
 #[cfg(test)]
 mod status_wire_compat_tests {
+    use animus_env::nid;
+
     use crate::ClientResponse;
 
     /// A `Status` reply serialized before `control_voters` existed (no such
@@ -7806,7 +7695,7 @@ mod status_wire_compat_tests {
             metadata: Default::default(),
             leader_hint: None,
             watermark: 7,
-            control_voters: [0, 1, 2].into_iter().collect(),
+            control_voters: [0, 1, 2].into_iter().map(nid).collect(),
         };
         let mut value = serde_json::to_value(&reply).expect("Status serializes");
         // `ClientResponse` derives `Serialize`/`Deserialize` via serde's

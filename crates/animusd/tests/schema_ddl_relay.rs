@@ -11,6 +11,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use animus_env::nid;
 use animusd::{
     ClientRequest, ClientResponse, ColumnType, MetaCommand, Node, ReplicationMode, TableSchema,
     read_frame,
@@ -39,6 +40,7 @@ async fn bring_up(n: usize, dir: &std::path::Path) -> (Vec<Node>, animusd::Clust
         let addrs = support::free_addrs(n * 5);
         let nodes_cfg: Vec<animusd::RoleAddrs> = (0..n)
             .map(|i| animusd::RoleAddrs {
+                id: animusd::config::node_id(i),
                 role: animusd::config::NodeRole::Both,
                 internal: addrs[5 * i],
                 client: addrs[5 * i + 1],
@@ -197,7 +199,7 @@ async fn schema_ddl_on_a_follower_is_relayed_to_the_leader() {
     let bad = call(
         config.nodes[leader].client,
         ClientRequest::ProposeSchema(MetaCommand::UpsertMember {
-            node: 999,
+            node: nid(999),
             labels: std::collections::BTreeMap::new(),
             status: animusd::NodeStatus::Active,
         }),
@@ -209,7 +211,7 @@ async fn schema_ddl_on_a_follower_is_relayed_to_the_leader() {
     );
     // And it really did not take effect (member 999 was never registered).
     assert!(
-        !nodes[leader].metadata().members.contains_key(&999),
+        !nodes[leader].metadata().members.contains_key(&nid(999)),
         "rejected command must not have been applied"
     );
 

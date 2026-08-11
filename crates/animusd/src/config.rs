@@ -22,16 +22,43 @@ use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
 
 use animus_env::NodeId;
+#[cfg(test)]
+use animus_env::nid;
+use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
 
 use crate::RoleAddrs;
 
-/// The node id for config index `index`. Ids are still plain `u64`s in this
-/// PR (ADR 0040 PR1 only unifies the *identity*, not the type — see the ADR)
-/// — a node's id is simply its position in the config.
+/// The conventional (unpadded) node id for config index `index` — `"n{index}"`
+/// (ADR 0040 PR3: `NodeId` is now a validated string, not an arithmetic
+/// `u64`). This is the *default minting convention* every generator in this
+/// module uses; it is **not** re-derived from a loaded config at runtime —
+/// once a config exists, a node's true identity is its own [`RoleAddrs::id`]
+/// field (which may have been zero-padded by [`ClusterConfig::generate`] for
+/// `n >= 10`, or hand-edited by an operator). Kept as a free function because
+/// dozens of tests use it purely to predict what id a freshly `generate`d
+/// small (`n < 10`, hence unpadded) cluster assigns index `i` — see
+/// `minted_id` for the width-aware variant `generate`/`generate_split`
+/// actually embed.
 #[must_use]
 pub fn node_id(index: usize) -> NodeId {
-    index as NodeId
+    NodeId::new_unchecked(format!("n{index}"))
+}
+
+/// The id `generate`/`generate_split` actually embed for index `i` out of
+/// `total` nodes: `"n{i}"`, zero-padded to the width of `total - 1` once
+/// `total >= 10` — otherwise byte-identical to [`node_id`]. Zero-padding
+/// keeps ids in **lexicographic == numeric** order (`"n10" < "n2"` otherwise,
+/// ADR 0040 §6 call-out #7); below 10 nodes there is nothing to reorder, so
+/// the common small test/dev cluster keeps the plain, already-relied-upon
+/// `"n{i}"` convention.
+fn minted_id(i: usize, total: usize) -> NodeId {
+    if total >= 10 {
+        let width = (total.saturating_sub(1)).to_string().len();
+        NodeId::new_unchecked(format!("n{i:0width$}"))
+    } else {
+        node_id(i)
+    }
 }
 
 /// Which role(s) a [`RoleAddrs`] entry runs (ADR 0035).
@@ -96,6 +123,7 @@ impl ClusterConfig {
             .map(|i| {
                 let p = |role: u16| SocketAddr::new(host, base_port + (i as u16) * 5 + role);
                 RoleAddrs {
+                    id: minted_id(i, n),
                     role: NodeRole::Both,
                     internal: p(0),
                     client: p(1),
@@ -125,6 +153,7 @@ impl ClusterConfig {
                     NodeRole::Data
                 };
                 RoleAddrs {
+                    id: minted_id(i, total),
                     role,
                     internal: p(0),
                     client: p(1),
@@ -177,7 +206,10 @@ impl ClusterConfig {
     /// unchanged — `0..len()`.
     #[must_use]
     pub fn control_ids(&self) -> Vec<NodeId> {
-        self.control_indexes().into_iter().map(node_id).collect()
+        self.control_indexes()
+            .into_iter()
+            .map(|i| self.nodes[i].id.clone())
+            .collect()
     }
 
     /// The ids of nodes that actually run the data role — the universe from
@@ -186,7 +218,10 @@ impl ClusterConfig {
     /// mode this is unchanged — every node's id.
     #[must_use]
     pub fn data_ids(&self) -> Vec<NodeId> {
-        self.data_indexes().into_iter().map(node_id).collect()
+        self.data_indexes()
+            .into_iter()
+            .map(|i| self.nodes[i].id.clone())
+            .collect()
     }
 
     /// The whole cluster's internal peer address book: every node's id → its
@@ -201,8 +236,7 @@ impl ClusterConfig {
     pub fn peer_book(&self) -> BTreeMap<NodeId, SocketAddr> {
         self.nodes
             .iter()
-            .enumerate()
-            .map(|(i, a)| (node_id(i), a.internal))
+            .map(|a| (a.id.clone(), a.internal))
             .collect()
     }
 
@@ -218,9 +252,22 @@ impl ClusterConfig {
     /// Parse from JSON.
     ///
     /// # Errors
-    /// Returns a `serde_json` error if the text is not a valid config.
+    /// Returns a `serde_json` error if the text is not a valid config, or if
+    /// two entries claim the same [`RoleAddrs::id`] (ADR 0040 PR3: ids are
+    /// now explicit and must be unique — a duplicate is a hard load-time
+    /// error, not a silently-shadowed entry).
     pub fn from_json(text: &str) -> serde_json::Result<Self> {
-        serde_json::from_str(text)
+        let cfg: Self = serde_json::from_str(text)?;
+        let mut seen = std::collections::BTreeSet::new();
+        for n in &cfg.nodes {
+            if !seen.insert(n.id.clone()) {
+                return Err(serde_json::Error::custom(format!(
+                    "duplicate node id {:?} in config",
+                    n.id
+                )));
+            }
+        }
+        Ok(cfg)
     }
 }
 
@@ -245,8 +292,8 @@ mod tests {
     fn generated_config_is_combined_mode() {
         let cfg = ClusterConfig::generate(3, "127.0.0.1".parse().unwrap(), 7000);
         assert!(cfg.nodes.iter().all(|a| a.role == NodeRole::Both));
-        assert_eq!(cfg.control_ids(), vec![0, 1, 2]);
-        assert_eq!(cfg.data_ids(), vec![0, 1, 2]);
+        assert_eq!(cfg.control_ids(), vec![nid(0), nid(1), nid(2)]);
+        assert_eq!(cfg.data_ids(), vec![nid(0), nid(1), nid(2)]);
     }
 
     #[test]
@@ -275,8 +322,8 @@ mod tests {
 
     #[test]
     fn ids_follow_convention() {
-        assert_eq!(node_id(2), 2);
-        assert_eq!(node_id(0), 0);
+        assert_eq!(node_id(2), nid(2));
+        assert_eq!(node_id(0), nid(0));
     }
 
     #[test]
@@ -313,5 +360,39 @@ mod tests {
         for i in 0..5 {
             assert!(book.contains_key(&node_id(i)));
         }
+    }
+
+    #[test]
+    fn generated_ids_are_zero_padded_at_ten_or_more_nodes() {
+        // ADR 0040 §6 call-out #7: `"n10" < "n2"` lexicographically, so a
+        // generated config of >= 10 nodes must zero-pad to keep id order
+        // matching index order.
+        let cfg = ClusterConfig::generate(11, "127.0.0.1".parse().unwrap(), 7000);
+        let ids: Vec<String> = cfg.nodes.iter().map(|n| n.id.to_string()).collect();
+        let mut sorted = ids.clone();
+        sorted.sort();
+        assert_eq!(ids, sorted, "lexicographic id order must match index order");
+        assert_eq!(cfg.nodes[0].id.to_string(), "n00");
+        assert_eq!(cfg.nodes[10].id.to_string(), "n10");
+    }
+
+    #[test]
+    fn below_ten_nodes_ids_stay_unpadded() {
+        // Below the zero-pad threshold, `generate` must stay byte-identical
+        // to the long-standing `node_id`/`nid` convention every existing
+        // test relies on.
+        let cfg = ClusterConfig::generate(9, "127.0.0.1".parse().unwrap(), 7000);
+        assert_eq!(cfg.nodes[0].id, node_id(0));
+        assert_eq!(cfg.nodes[8].id, node_id(8));
+        assert_eq!(cfg.nodes[8].id.to_string(), "n8");
+    }
+
+    #[test]
+    fn duplicate_ids_are_rejected_at_load() {
+        let mut cfg = ClusterConfig::generate(2, "127.0.0.1".parse().unwrap(), 7000);
+        cfg.nodes[1].id = cfg.nodes[0].id.clone();
+        let err = ClusterConfig::from_json(&cfg.to_json())
+            .expect_err("a config with two entries claiming the same id must be rejected");
+        assert!(err.to_string().contains("duplicate node id"));
     }
 }

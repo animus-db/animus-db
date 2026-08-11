@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use animus_control::ProposeResult;
 use animus_cp_data::RaftKvNode;
+use animus_env::nid;
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::MemoryEngine;
 use futures::executor::block_on;
@@ -22,7 +23,13 @@ fn group(seed: u64) -> (Simulator, Vec<KvNode>) {
     let sim = Simulator::new(seed);
     let nodes = NODES
         .iter()
-        .map(|&id| RaftKvNode::start(sim.env(id), NODES.to_vec(), MemoryEngine::new()))
+        .map(|&id| {
+            RaftKvNode::start(
+                sim.env(nid(id)),
+                NODES.iter().copied().map(nid).collect(),
+                MemoryEngine::new(),
+            )
+        })
         .collect();
     (sim, nodes)
 }
@@ -88,7 +95,7 @@ fn writes_survive_a_leader_kill() {
     let old = leader(&nodes, &[0, 1, 2], seed);
     let survivors: Vec<usize> = (0..3).filter(|&i| i != old).collect();
     for &s in &survivors {
-        sim.partition_pair(old as u64, s as u64);
+        sim.partition_pair(nid(old as u64), nid(s as u64));
     }
     sim.run_for(Duration::from_secs(3)); // survivors re-elect
 
@@ -105,7 +112,7 @@ fn writes_survive_a_leader_kill() {
 
     // Heal the partition; the old leader rejoins and catches up to `after`.
     for &s in &survivors {
-        sim.heal(old as u64, s as u64);
+        sim.heal(nid(old as u64), nid(s as u64));
     }
     sim.run_for(Duration::from_secs(3));
     assert_eq!(

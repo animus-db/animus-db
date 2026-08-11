@@ -14,6 +14,7 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use animus_consensus::{AccordNode, Key, TxnId};
+use animus_env::nid;
 use animus_sim::{SimEnv, Simulator};
 use futures::executor::block_on;
 
@@ -23,7 +24,7 @@ fn cluster(seed: u64) -> (Simulator, Vec<AccordNode<SimEnv>>) {
     let sim = Simulator::new(seed);
     let nodes = NODES
         .iter()
-        .map(|&id| AccordNode::start(sim.env(id), NODES.to_vec()))
+        .map(|&id| AccordNode::start(sim.env(nid(id)), NODES.iter().copied().map(nid).collect()))
         .collect();
     (sim, nodes)
 }
@@ -60,14 +61,14 @@ fn uncontended_transaction_commits_on_the_fast_path() {
     );
 
     // It committed + executed on every replica at the same timestamp.
-    let e0 = nodes[0].committed_execute_at(txn);
+    let e0 = nodes[0].committed_execute_at(txn.clone());
     for (i, n) in nodes.iter().enumerate() {
         assert!(
-            n.is_applied(txn),
+            n.is_applied(txn.clone()),
             "node {i} did not execute txn (seed={seed})"
         );
         assert_eq!(
-            n.committed_execute_at(txn),
+            n.committed_execute_at(txn.clone()),
             e0,
             "node {i} disagrees on the fast-path timestamp (seed={seed})"
         );
@@ -96,23 +97,23 @@ fn fast_path_commit_is_recoverable_after_coordinator_death() {
     // commits. Stay well under the failure-detector bound.
     sim.run_for(Duration::from_millis(150));
     assert!(
-        nodes[0].committed_execute_at(txn).is_some(),
+        nodes[0].committed_execute_at(txn.clone()).is_some(),
         "coordinator should have fast-committed before we kill it (seed={seed})"
     );
-    let committed_at = nodes[0].committed_execute_at(txn);
+    let committed_at = nodes[0].committed_execute_at(txn.clone());
 
     // Now the coordinator dies, and the two replicas that recovery will use are
     // isolated from it (they may not have learned the Commit). Recovery must
     // reconstruct the same decision from a quorum that excludes node 0.
-    sim.stop(0);
+    sim.stop(nid(0));
     let recoverer = &nodes[4];
-    recoverer.recover(txn);
+    recoverer.recover(txn.clone());
     sim.run_for(Duration::from_secs(3));
 
     // Every surviving replica committed it at the *same* timestamp the fast path
     // chose — a fast decision was never lost or contradicted.
     for (i, n) in nodes.iter().enumerate().skip(1) {
-        let e = n.committed_execute_at(txn);
+        let e = n.committed_execute_at(txn.clone());
         assert_eq!(
             e, committed_at,
             "survivor {i} recovered a different timestamp than the fast-path \
@@ -120,12 +121,12 @@ fn fast_path_commit_is_recoverable_after_coordinator_death() {
              (seed={seed})"
         );
         assert!(
-            n.is_applied(txn),
+            n.is_applied(txn.clone()),
             "survivor {i} did not execute the recovered txn (seed={seed})"
         );
         assert_eq!(
             store_writer(n, 7),
-            Some(txn),
+            Some(txn.clone()),
             "survivor {i} store missing the write (seed={seed})"
         );
     }
@@ -140,19 +141,19 @@ fn fast_path_recovery_is_consistent_across_seeds() {
         let (mut sim, nodes) = cluster(seed);
         let txn = nodes[0].submit(keys(&[3, 4]));
         sim.run_for(Duration::from_millis(150));
-        let committed_at = nodes[0].committed_execute_at(txn);
+        let committed_at = nodes[0].committed_execute_at(txn.clone());
         assert!(
             committed_at.is_some(),
             "coordinator should have committed before death (seed={seed})"
         );
 
-        sim.stop(0);
-        nodes[4].recover(txn);
+        sim.stop(nid(0));
+        nodes[4].recover(txn.clone());
         sim.run_for(Duration::from_secs(3));
 
         for (i, n) in nodes.iter().enumerate().skip(1) {
             assert_eq!(
-                n.committed_execute_at(txn),
+                n.committed_execute_at(txn.clone()),
                 committed_at,
                 "survivor {i} diverged from the fast-path commit (seed={seed})"
             );
@@ -167,7 +168,7 @@ fn fast_path_run_is_reproducible_from_seed() {
         let (mut sim, nodes) = cluster(seed);
         let txn = nodes[0].submit(keys(&[7]));
         sim.run_for(Duration::from_millis(150));
-        sim.stop(0);
+        sim.stop(nid(0));
         nodes[4].recover(txn);
         sim.run_for(Duration::from_secs(2));
         sim.trace_lines()

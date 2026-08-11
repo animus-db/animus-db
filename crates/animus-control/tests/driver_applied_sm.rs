@@ -9,7 +9,7 @@
 use animus_control::persist::WalRecord;
 use animus_control::raft::{RaftCore, StateMachine};
 use animus_control::{ProposeResult, RaftMsg};
-use animus_env::{Nanos, NodeId};
+use animus_env::{Nanos, NodeId, nid};
 use serde::{Deserialize, Serialize};
 
 /// A toy key-value command (what a tablet's Raft log would carry).
@@ -40,7 +40,7 @@ type KvCore = RaftCore<KvCommand, KvUnit>;
 #[test]
 fn driver_applied_core_buffers_effects_instead_of_applying_in_core() {
     let mut wal: Vec<WalRecord<KvCommand, KvUnit>> = Vec::new();
-    let mut core: KvCore = RaftCore::new(0, &[0], Nanos(0), 7);
+    let mut core: KvCore = RaftCore::new(nid(0), &[nid(0)], Nanos(0), 7);
     core.tick(Nanos(1_000_000_000), 7); // election timeout -> sole leader (appends a NoOp at index 1)
     assert!(core.is_leader());
 
@@ -92,11 +92,11 @@ fn driver_applied_core_buffers_effects_instead_of_applying_in_core() {
 /// and feeding it one granted vote (its own + node 1 = majority of 3).
 fn elect_sole_leader(group: &[NodeId]) -> KvCore {
     let now = Nanos(1_000_000_000);
-    let mut leader: KvCore = RaftCore::new(group[0], group, Nanos(0), 7);
+    let mut leader: KvCore = RaftCore::new(group[0].clone(), group, Nanos(0), 7);
     let _ = leader.tick(now, 7); // election timeout -> pre-candidate, PreVote
     // A pre-vote grant tips the pre-candidacy into a real, term-bumping election.
     let _ = leader.handle(
-        group[1],
+        group[1].clone(),
         RaftMsg::PreVoteResp {
             term: leader.term() + 1,
             granted: true,
@@ -105,7 +105,7 @@ fn elect_sole_leader(group: &[NodeId]) -> KvCore {
         7,
     );
     let _ = leader.handle(
-        group[1],
+        group[1].clone(),
         RaftMsg::RequestVoteResp {
             term: leader.term(),
             granted: true,
@@ -141,9 +141,9 @@ fn pump_to_follower(
                 if let RaftMsg::InstallSnapshot { total, .. } = &msg {
                     snapshot_totals.push(*total);
                 }
-                next.extend(follower.handle(leader_id, msg, now, 7));
+                next.extend(follower.handle(leader_id.clone(), msg, now, 7));
             } else if to == leader_id {
-                next.extend(leader.handle(follower_id, msg, now, 7));
+                next.extend(leader.handle(follower_id.clone(), msg, now, 7));
             }
             // Messages to any other peer are dropped (that node is absent here).
         }
@@ -170,17 +170,17 @@ fn pump_to_follower(
 /// becomes leader and must ship a non-empty image to a fresh node 2.
 #[test]
 fn caught_up_node_reships_non_empty_snapshot() {
-    const GROUP: [NodeId; 3] = [0, 1, 2];
+    let group: [NodeId; 3] = [nid(0), nid(1), nid(2)];
     let now = Nanos(1_000_000_000);
 
     // --- Source leader (node 0): commit some commands, set an engine image, snapshot.
-    let mut src = elect_sole_leader(&GROUP);
+    let mut src = elect_sole_leader(&group);
     for i in 0..5u64 {
         if let ProposeResult::Accepted { index } = src.propose(KvCommand::Put { key: i, value: i })
         {
             // One follower ack (node 1) is a majority of 3 -> commit advances.
             let _ = src.handle(
-                1,
+                nid(1),
                 RaftMsg::AppendEntriesResp {
                     term: src.term(),
                     success: true,
@@ -208,12 +208,12 @@ fn caught_up_node_reships_non_empty_snapshot() {
     assert!(!image.is_empty());
 
     // --- Node 1 catches up from node 0 via InstallSnapshot.
-    let mut mid: KvCore = RaftCore::new(1, &GROUP, Nanos(0), 7);
+    let mut mid: KvCore = RaftCore::new(nid(1), &group, Nanos(0), 7);
     let hb = Nanos(now.0 + 1_000_000_000); // past the heartbeat deadline
     // First exchange: node 0 backtracks to the compacted prefix, finds no
     // materialized image, sends nothing, and raises the lazy-build request.
     let pending = src.tick(hb, 7);
-    let totals = pump_to_follower(&mut src, &mut mid, 0, 1, pending);
+    let totals = pump_to_follower(&mut src, &mut mid, nid(0), nid(1), pending);
     assert!(
         totals.iter().all(|&t| t == 0),
         "nothing (and certainly no 0-byte chunk labeled as an image) ships before \
@@ -228,7 +228,7 @@ fn caught_up_node_reships_non_empty_snapshot() {
     // The next heartbeat retry actually ships the chunks.
     let hb1b = Nanos(hb.0 + 1_000_000_000);
     let pending = src.tick(hb1b, 7);
-    let totals = pump_to_follower(&mut src, &mut mid, 0, 1, pending);
+    let totals = pump_to_follower(&mut src, &mut mid, nid(0), nid(1), pending);
     assert!(
         totals.iter().any(|&t| t > 0),
         "node 0 should have shipped a non-empty image to node 1, totals={totals:?}"
@@ -251,7 +251,7 @@ fn caught_up_node_reships_non_empty_snapshot() {
     let _ = mid.tick(later, 7); // -> pre-candidate (term unchanged)
     // A pre-vote grant tips it into the real election, bumping the term above node 0's.
     let _ = mid.handle(
-        2,
+        nid(2),
         RaftMsg::PreVoteResp {
             term: mid.term() + 1,
             granted: true,
@@ -260,7 +260,7 @@ fn caught_up_node_reships_non_empty_snapshot() {
         7,
     );
     let _ = mid.handle(
-        2,
+        nid(2),
         RaftMsg::RequestVoteResp {
             term: mid.term(),
             granted: true,
@@ -270,7 +270,7 @@ fn caught_up_node_reships_non_empty_snapshot() {
     );
     assert!(mid.is_leader(), "node 1 should have won the re-election");
 
-    let mut fresh: KvCore = RaftCore::new(2, &GROUP, Nanos(0), 7);
+    let mut fresh: KvCore = RaftCore::new(nid(2), &group, Nanos(0), 7);
     // The crux (the second-hop invariant, now in its **lazy** form): node 1 only
     // ever obtained its state via an install and retains no image bytes in the
     // core — it must *request a regeneration* rather than ship a 0-byte image
@@ -278,7 +278,7 @@ fn caught_up_node_reships_non_empty_snapshot() {
     // never caught up).
     let hb2 = Nanos(later.0 + 1_000_000_000);
     let pending2 = mid.tick(hb2, 7);
-    let totals2 = pump_to_follower(&mut mid, &mut fresh, 1, 2, pending2);
+    let totals2 = pump_to_follower(&mut mid, &mut fresh, nid(1), nid(2), pending2);
     assert!(
         totals2.iter().all(|&t| t == 0),
         "no 0-byte image may ship while unmaterialized, totals={totals2:?}"
@@ -292,7 +292,7 @@ fn caught_up_node_reships_non_empty_snapshot() {
     mid.set_snapshot_blob(mid_installed.1.clone());
     let hb2b = Nanos(hb2.0 + 1_000_000_000);
     let pending2 = mid.tick(hb2b, 7);
-    let totals2 = pump_to_follower(&mut mid, &mut fresh, 1, 2, pending2);
+    let totals2 = pump_to_follower(&mut mid, &mut fresh, nid(1), nid(2), pending2);
     assert!(
         totals2.iter().any(|&t| t > 0),
         "re-shipped snapshot was EMPTY (the bug): a node that caught up via install \

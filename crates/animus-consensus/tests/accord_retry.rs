@@ -14,6 +14,7 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use animus_consensus::{AccordNode, Key, TxnId};
+use animus_env::nid;
 use animus_sim::{NetConfig, SimEnv, Simulator};
 
 const NODES: [u64; 3] = [0, 1, 2];
@@ -31,7 +32,7 @@ fn lossy_cluster(seed: u64, drop: f64) -> (Simulator, Vec<AccordNode<SimEnv>>) {
     sim.set_net_config(cfg);
     let nodes = NODES
         .iter()
-        .map(|&id| AccordNode::start(sim.env(id), NODES.to_vec()))
+        .map(|&id| AccordNode::start(sim.env(nid(id)), NODES.iter().copied().map(nid).collect()))
         .collect();
     (sim, nodes)
 }
@@ -51,12 +52,12 @@ fn transaction_commits_under_message_loss() {
 
     for (i, n) in nodes.iter().enumerate() {
         assert!(
-            n.is_applied(a),
+            n.is_applied(a.clone()),
             "node {i} never executed the transaction under message loss (seed={seed})"
         );
         assert_eq!(
-            n.committed_execute_at(a),
-            nodes[0].committed_execute_at(a),
+            n.committed_execute_at(a.clone()),
+            nodes[0].committed_execute_at(a.clone()),
             "node {i} committed at a different timestamp (seed={seed})"
         );
     }
@@ -76,7 +77,7 @@ fn conflicting_transactions_commit_under_loss() {
 
     for (i, n) in nodes.iter().enumerate() {
         assert!(
-            n.is_applied(a) && n.is_applied(b),
+            n.is_applied(a.clone()) && n.is_applied(b.clone()),
             "node {i} did not execute both txns under loss (seed={seed})"
         );
     }
@@ -109,7 +110,7 @@ fn retry_commits_across_seeds() {
         sim.run_for(Duration::from_secs(40));
         for (i, n) in nodes.iter().enumerate() {
             assert!(
-                n.is_applied(a),
+                n.is_applied(a.clone()),
                 "node {i} never executed under loss (seed={seed})"
             );
         }

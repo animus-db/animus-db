@@ -16,6 +16,7 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use animus_env::NodeId;
 use animusd::{ClientRequest, ClientResponse, ClusterConfig, Node, RoleAddrs, read_frame};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -64,7 +65,7 @@ async fn admin_get(addr: SocketAddr, path: &str) -> (u16, Value) {
 
 /// The full replicated tablet map, `TabletId -> (replicas, epoch)`, from a
 /// node's `/admin/status` (`Metadata`, identical on every node).
-async fn tablet_map(admin_addr: SocketAddr) -> BTreeMap<u64, (Vec<u64>, u64)> {
+async fn tablet_map(admin_addr: SocketAddr) -> BTreeMap<u64, (Vec<NodeId>, u64)> {
     let (_s, v) = admin_get(admin_addr, "/admin/status").await;
     v["tablets"]
         .as_object()
@@ -75,7 +76,7 @@ async fn tablet_map(admin_addr: SocketAddr) -> BTreeMap<u64, (Vec<u64>, u64)> {
                 .as_array()
                 .expect("replicas is an array")
                 .iter()
-                .filter_map(Value::as_u64)
+                .filter_map(|r| r.as_str()?.parse::<NodeId>().ok())
                 .collect();
             let epoch = t["epoch"].as_u64().expect("epoch is a number");
             (
@@ -89,19 +90,19 @@ async fn tablet_map(admin_addr: SocketAddr) -> BTreeMap<u64, (Vec<u64>, u64)> {
 /// Per-node replica counts across every tablet, seeded 0 for every id in
 /// `raftkv_ids` so an as-yet-untouched node shows up as a genuine minimum.
 fn replica_counts(
-    map: &BTreeMap<u64, (Vec<u64>, u64)>,
-    raftkv_ids: &[u64],
-) -> BTreeMap<u64, usize> {
-    let mut counts: BTreeMap<u64, usize> = raftkv_ids.iter().map(|&id| (id, 0)).collect();
+    map: &BTreeMap<u64, (Vec<NodeId>, u64)>,
+    raftkv_ids: &[NodeId],
+) -> BTreeMap<NodeId, usize> {
+    let mut counts: BTreeMap<NodeId, usize> = raftkv_ids.iter().map(|id| (id.clone(), 0)).collect();
     for (replicas, _) in map.values() {
-        for &r in replicas {
-            *counts.entry(r).or_insert(0) += 1;
+        for r in replicas {
+            *counts.entry(r.clone()).or_insert(0) += 1;
         }
     }
     counts
 }
 
-fn imbalance(counts: &BTreeMap<u64, usize>) -> usize {
+fn imbalance(counts: &BTreeMap<NodeId, usize>) -> usize {
     let max = counts.values().copied().max().unwrap_or(0);
     let min = counts.values().copied().min().unwrap_or(0);
     max - min
@@ -110,7 +111,7 @@ fn imbalance(counts: &BTreeMap<u64, usize>) -> usize {
 /// This node's own hosted-groups view (`/admin/raftkv`): `tablet -> voters`,
 /// only for tablets this node currently hosts (per-process mode, so this is
 /// genuinely node-local, not the shared `--cluster N` aggregate).
-async fn hosted_voters(admin_addr: SocketAddr) -> BTreeMap<u64, Vec<u64>> {
+async fn hosted_voters(admin_addr: SocketAddr) -> BTreeMap<u64, Vec<NodeId>> {
     let (_s, v) = admin_get(admin_addr, "/admin/raftkv").await;
     v["groups"]
         .as_array()
@@ -118,10 +119,10 @@ async fn hosted_voters(admin_addr: SocketAddr) -> BTreeMap<u64, Vec<u64>> {
         .flatten()
         .filter_map(|g| {
             let tablet = g["tablet"].as_u64()?;
-            let voters: Vec<u64> = g["voters"]
+            let voters: Vec<NodeId> = g["voters"]
                 .as_array()?
                 .iter()
-                .filter_map(Value::as_u64)
+                .filter_map(|r| r.as_str()?.parse::<NodeId>().ok())
                 .collect();
             Some((tablet, voters))
         })
@@ -139,6 +140,7 @@ async fn bring_up(n: usize, dir: &std::path::Path) -> (Vec<Node>, ClusterConfig)
         let cfg = ClusterConfig {
             nodes: (0..n)
                 .map(|i| RoleAddrs {
+                    id: animusd::config::node_id(i),
                     role: animusd::config::NodeRole::Both,
                     internal: a[5 * i],
                     client: a[5 * i + 1],

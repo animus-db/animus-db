@@ -14,7 +14,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use animus_env::EnvExt;
+use animus_env::{EnvExt, nid};
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::{LsmEngine, LsmOptions, StorageEngine};
 use futures::executor::block_on;
@@ -35,7 +35,7 @@ fn opts() -> LsmOptions {
 }
 
 fn open(sim: &Simulator) -> LsmEngine<SimEnv> {
-    block_on(LsmEngine::open_with(sim.env(0), PREFIX, opts())).expect("open")
+    block_on(LsmEngine::open_with(sim.env(nid(0)), PREFIX, opts())).expect("open")
 }
 
 fn key(i: u64) -> String {
@@ -119,7 +119,7 @@ fn burst_of_writes_is_bounded_and_converges_once_driven() {
     let done = Arc::new(AtomicBool::new(false));
     let done_writer = Arc::clone(&done);
     let writer = e.clone();
-    sim.env(0).spawn_task(async move {
+    sim.env(nid(0)).spawn_task(async move {
         for i in 0..n {
             writer
                 .put(key(i).as_bytes(), value(i).as_bytes(), i + 1)
@@ -167,7 +167,7 @@ fn default_behavior_is_still_fully_synchronous() {
     let sim = Simulator::new(3);
     let mut o = opts();
     o.background_maintenance = false;
-    let e = block_on(LsmEngine::open_with(sim.env(0), PREFIX, o)).expect("open");
+    let e = block_on(LsmEngine::open_with(sim.env(nid(0)), PREFIX, o)).expect("open");
     block_on(async {
         for i in 0..40u64 {
             e.put(key(i).as_bytes(), value(i).as_bytes(), i + 1)

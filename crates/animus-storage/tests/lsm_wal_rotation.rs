@@ -8,7 +8,7 @@
 //! buffered/un-synced; a crash drops the buffer), so every property is reproducible
 //! from the seed in the assertion messages.
 
-use animus_env::Disk;
+use animus_env::{Disk, nid};
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::{LsmEngine, LsmOptions, StorageEngine};
 use futures::executor::block_on;
@@ -33,7 +33,7 @@ fn opts() -> LsmOptions {
 }
 
 fn open(sim: &Simulator) -> LsmEngine<SimEnv> {
-    block_on(LsmEngine::open_with(sim.env(0), PREFIX, opts())).expect("open")
+    block_on(LsmEngine::open_with(sim.env(nid(0)), PREFIX, opts())).expect("open")
 }
 
 /// Many writes roll the WAL across several segments; the active segment number
@@ -49,7 +49,7 @@ fn writes_span_multiple_wal_segments() {
         flush_threshold_bytes: 1 << 20,
         ..opts()
     };
-    let e = block_on(LsmEngine::open_with(sim.env(0), PREFIX, no_flush)).expect("open");
+    let e = block_on(LsmEngine::open_with(sim.env(nid(0)), PREFIX, no_flush)).expect("open");
     block_on(async {
         for i in 0u64..40 {
             let k = format!("key-{i:04}");
@@ -105,7 +105,7 @@ fn flush_removes_covered_segments() {
     // file must be gone from disk.
     let live = e.wal_segments();
     let lowest_live = *live.iter().min().expect("at least the active segment");
-    let env = sim.env(0);
+    let env = sim.env(nid(0));
     block_on(async {
         // Probe the segment files below the lowest live one: all removed.
         for seg in 0..lowest_live {
@@ -169,7 +169,7 @@ fn recovery_replays_all_live_segments() {
     }
     // Power loss: drop un-synced bytes (none past the last synced WAL append, since
     // every write syncs before returning) and all volatile state.
-    sim.crash(0);
+    sim.crash(nid(0));
 
     let e = open(&sim);
     block_on(async {
@@ -216,7 +216,7 @@ fn crash_mid_rotation_recovers_all_acked_writes() {
             "seed={seed}: expected rotation and/or a flush to have happened",
         );
     }
-    sim.crash(0);
+    sim.crash(nid(0));
 
     let e = open(&sim);
     block_on(async {
@@ -232,7 +232,7 @@ fn crash_mid_rotation_recovers_all_acked_writes() {
 
     // Reopen again (idempotent recovery): replaying the same live segments a second
     // time must not change the observable state.
-    sim.crash(0);
+    sim.crash(nid(0));
     let e2 = open(&sim);
     block_on(async {
         assert_eq!(
@@ -282,7 +282,7 @@ fn open_removes_orphan_wal_segments_below_the_live_set() {
         // Inject a durable orphan segment file *below* the live set: this is exactly
         // what a crash-after-swap-before-remove leaves behind. Its number is below
         // the lowest live segment, so it must be treated as a covered orphan.
-        let live = block_on(LsmEngine::open_with(sim.env(0), PREFIX, opts()))
+        let live = block_on(LsmEngine::open_with(sim.env(nid(0)), PREFIX, opts()))
             .unwrap()
             .wal_segments();
         let lowest_live = *live.iter().min().unwrap();
@@ -298,7 +298,7 @@ fn open_removes_orphan_wal_segments_below_the_live_set() {
             e.test_write_orphan_wal_segment(orphan_seg, b"garbage-orphan-not-replayed\n")
                 .await;
         });
-        let env = sim.env(0);
+        let env = sim.env(nid(0));
         assert!(
             block_on(env.size(&format!("{PREFIX}wal-{orphan_seg:06}"))).unwrap() > 0,
             "seed={seed}: orphan should be present before reopen"
@@ -308,7 +308,7 @@ fn open_removes_orphan_wal_segments_below_the_live_set() {
     // Reopen: the orphan below the live set is removed, and every acked write is
     // still recovered correctly (orphan removal does not perturb recovery).
     let e = open(&sim);
-    let env = sim.env(0);
+    let env = sim.env(nid(0));
     block_on(async {
         let live = e.wal_segments();
         let lowest_live = *live.iter().min().unwrap();
@@ -360,7 +360,7 @@ fn interleaved_flush_and_rotation_recover() {
             e.flush_count(),
         );
     }
-    sim.crash(0);
+    sim.crash(nid(0));
     let e = open(&sim);
     block_on(async {
         for i in 0u64..200 {

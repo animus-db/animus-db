@@ -115,7 +115,10 @@ async fn admin(
     (status, value)
 }
 
-async fn drain_status(admin_addr: SocketAddr, node: u64) -> (u16, serde_json::Value) {
+async fn drain_status(
+    admin_addr: SocketAddr,
+    node: &animus_env::NodeId,
+) -> (u16, serde_json::Value) {
     admin(
         admin_addr,
         "GET",
@@ -125,14 +128,19 @@ async fn drain_status(admin_addr: SocketAddr, node: u64) -> (u16, serde_json::Va
     .await
 }
 
-async fn remove_member(admin_addr: SocketAddr, node: u64) -> (u16, serde_json::Value) {
-    let body = serde_json::json!({"node": node}).to_string();
+async fn remove_member(
+    admin_addr: SocketAddr,
+    node: &animus_env::NodeId,
+) -> (u16, serde_json::Value) {
+    let body = serde_json::json!({"node": node.to_string()}).to_string();
     admin(admin_addr, "POST", "/admin/member/remove", Some(&body)).await
 }
 
 /// Every member's status, `raftkv_id -> "Active"/"Down"/...`, from
 /// `/admin/status`.
-async fn member_statuses(admin_addr: SocketAddr) -> std::collections::BTreeMap<u64, String> {
+async fn member_statuses(
+    admin_addr: SocketAddr,
+) -> std::collections::BTreeMap<animus_env::NodeId, String> {
     let (_s, v) = admin(admin_addr, "GET", "/admin/status", None).await;
     v["members"]
         .as_object()
@@ -140,7 +148,7 @@ async fn member_statuses(admin_addr: SocketAddr) -> std::collections::BTreeMap<u
         .iter()
         .map(|(id, m)| {
             (
-                id.parse().expect("member id key is numeric"),
+                id.parse().expect("member id key is a valid NodeId"),
                 m["status"].as_str().expect("status is a string").to_owned(),
             )
         })
@@ -151,7 +159,10 @@ async fn member_statuses(admin_addr: SocketAddr) -> std::collections::BTreeMap<u
 /// `tests/seed_join.rs::table_with_replica`'s doc for why the through-only-
 /// this-node checks below must target a table this returns, not an arbitrary
 /// one).
-async fn table_with_replica(admin_addr: SocketAddr, raftkv_id: u64) -> Option<String> {
+async fn table_with_replica(
+    admin_addr: SocketAddr,
+    raftkv_id: &animus_env::NodeId,
+) -> Option<String> {
     let (_s, v) = admin(admin_addr, "GET", "/admin/status", None).await;
     v["tablets"]
         .as_object()
@@ -162,8 +173,8 @@ async fn table_with_replica(admin_addr: SocketAddr, raftkv_id: u64) -> Option<St
                 .as_array()
                 .expect("replicas is an array")
                 .iter()
-                .filter_map(serde_json::Value::as_u64)
-                .any(|r| r == raftkv_id);
+                .filter_map(|r| r.as_str())
+                .any(|r| r == raftkv_id.as_str());
             has_replica
                 .then(|| t["table"].as_str().map(str::to_owned))
                 .flatten()
@@ -284,7 +295,7 @@ async fn decommission_drains_removes_and_allows_id_reuse() {
     let hosted_table: String = {
         let discover = async {
             loop {
-                if let Some(table) = table_with_replica(core_admin[0], join_raftkv_id).await {
+                if let Some(table) = table_with_replica(core_admin[0], &join_raftkv_id).await {
                     return table;
                 }
                 sleep(Duration::from_millis(300)).await;
@@ -308,7 +319,7 @@ async fn decommission_drains_removes_and_allows_id_reuse() {
     // this way, regardless of its status.
     {
         let core_raftkv_id = animusd::config::node_id(0);
-        let (status, body) = remove_member(core_admin[leader], core_raftkv_id).await;
+        let (status, body) = remove_member(core_admin[leader], &core_raftkv_id).await;
         assert_eq!(
             status, 409,
             "removing an original core member should be refused: {body}"
@@ -317,7 +328,7 @@ async fn decommission_drains_removes_and_allows_id_reuse() {
 
     // 4. Refusal: the joined node is still Active — not drained yet.
     {
-        let (status, body) = remove_member(core_admin[leader], join_raftkv_id).await;
+        let (status, body) = remove_member(core_admin[leader], &join_raftkv_id).await;
         assert_eq!(
             status, 409,
             "removing an Active member should be refused: {body}"
@@ -335,7 +346,7 @@ async fn decommission_drains_removes_and_allows_id_reuse() {
     // actually moved every tablet off it, and it is no longer Active.
     let drained = async {
         loop {
-            let (status, body) = drain_status(core_admin[leader], join_raftkv_id).await;
+            let (status, body) = drain_status(core_admin[leader], &join_raftkv_id).await;
             if status == 200 {
                 let remaining = body["tablets_remaining"].as_u64().unwrap_or(u64::MAX);
                 let node_status = body["status"].as_str().unwrap_or("");
@@ -355,7 +366,7 @@ async fn decommission_drains_removes_and_allows_id_reuse() {
     // member is now fully drained, so this proves the leader check itself,
     // not a leftover "not drained" rejection.
     {
-        let (status, body) = remove_member(core_admin[follower], join_raftkv_id).await;
+        let (status, body) = remove_member(core_admin[follower], &join_raftkv_id).await;
         assert_eq!(
             status, 409,
             "remove on a follower's admin port should be refused: {body}"
@@ -369,7 +380,7 @@ async fn decommission_drains_removes_and_allows_id_reuse() {
 
     // 8. Remove on the leader.
     {
-        let (status, body) = remove_member(core_admin[leader], join_raftkv_id).await;
+        let (status, body) = remove_member(core_admin[leader], &join_raftkv_id).await;
         assert_eq!(status, 200, "remove failed: {body}");
     }
 
@@ -442,7 +453,7 @@ async fn decommission_drains_removes_and_allows_id_reuse() {
 }
 
 /// `/admin/raftkv`'s `groups`: `(tablet, hosting node, is_leader)`.
-async fn raftkv_groups(admin_addr: SocketAddr) -> Vec<(u64, u64, bool)> {
+async fn raftkv_groups(admin_addr: SocketAddr) -> Vec<(u64, animus_env::NodeId, bool)> {
     let (status, body) = admin(admin_addr, "GET", "/admin/raftkv", None).await;
     if status != 200 {
         return Vec::new();
@@ -454,7 +465,11 @@ async fn raftkv_groups(admin_addr: SocketAddr) -> Vec<(u64, u64, bool)> {
                 .map(|g| {
                     (
                         g["tablet"].as_u64().expect("tablet"),
-                        g["node"].as_u64().expect("node"),
+                        g["node"]
+                            .as_str()
+                            .expect("node")
+                            .parse()
+                            .expect("node id parses"),
                         g["is_leader"].as_bool().expect("is_leader"),
                     )
                 })
@@ -518,7 +533,7 @@ async fn dashboard_health_recovers_after_decommission_shrink() {
     println!("joined ids: {joined_ids:?}");
 
     // Pick the first joined node to drain + remove (5 -> 4).
-    let (target_id, _target_addrs) = joined_ids[0];
+    let (target_id, _target_addrs) = joined_ids[0].clone();
     let leader = leader_index(&core_nodes);
 
     {
@@ -528,7 +543,7 @@ async fn dashboard_health_recovers_after_decommission_shrink() {
     }
     let drained = async {
         loop {
-            let (status, body) = drain_status(core_admin[leader], target_id).await;
+            let (status, body) = drain_status(core_admin[leader], &target_id).await;
             if status == 200 {
                 let remaining = body["tablets_remaining"].as_u64().unwrap_or(u64::MAX);
                 let node_status = body["status"].as_str().unwrap_or("");
@@ -543,7 +558,7 @@ async fn dashboard_health_recovers_after_decommission_shrink() {
         .await
         .unwrap_or_else(|_| panic!("target node never finished draining"));
     {
-        let (status, body) = remove_member(core_admin[leader], target_id).await;
+        let (status, body) = remove_member(core_admin[leader], &target_id).await;
         assert_eq!(status, 200, "remove failed: {body}");
     }
     let removed = async {
@@ -574,37 +589,25 @@ async fn dashboard_health_recovers_after_decommission_shrink() {
     survivor_admin.push(joined_ids[1].1.admin);
 
     let (_status, status_body) = admin(survivor_admin[0], "GET", "/admin/status", None).await;
-    let member_statuses: std::collections::BTreeMap<u64, String> = status_body["members"]
+    // Member ids are `NodeId` strings now (ADR 0040 PR3) — only the *values*
+    // (status strings / replica counts) matter below, so the key type just
+    // needs to parse without panicking, not carry real `NodeId` semantics.
+    let member_statuses: std::collections::BTreeMap<String, String> = status_body["members"]
         .as_object()
         .unwrap()
         .iter()
-        .map(|(id, m)| {
-            (
-                id.parse().unwrap(),
-                m["status"].as_str().unwrap().to_owned(),
-            )
-        })
+        .map(|(id, m)| (id.clone(), m["status"].as_str().unwrap().to_owned()))
         .collect();
-    let tablets: std::collections::BTreeMap<u64, Vec<u64>> = status_body["tablets"]
+    let tablets: std::collections::BTreeMap<u64, usize> = status_body["tablets"]
         .as_object()
         .unwrap()
         .iter()
-        .map(|(id, t)| {
-            (
-                id.parse().unwrap(),
-                t["replicas"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .filter_map(serde_json::Value::as_u64)
-                    .collect(),
-            )
-        })
+        .map(|(id, t)| (id.parse().unwrap(), t["replicas"].as_array().unwrap().len()))
         .collect();
     println!("member_statuses: {member_statuses:?}");
     println!("tablets: {tablets:?}");
 
-    let mut groups_by_tablet: std::collections::BTreeMap<u64, Vec<(u64, bool)>> =
+    let mut groups_by_tablet: std::collections::BTreeMap<u64, Vec<(animus_env::NodeId, bool)>> =
         std::collections::BTreeMap::new();
     for &addr in &survivor_admin {
         for (tablet, node, is_leader) in raftkv_groups(addr).await {
@@ -622,7 +625,7 @@ async fn dashboard_health_recovers_after_decommission_shrink() {
     for (tablet, replicas) in &tablets {
         let gs = groups_by_tablet.get(tablet).cloned().unwrap_or_default();
         let has_leader = gs.iter().any(|(_, l)| *l);
-        let configured = replicas.len();
+        let configured = *replicas;
         if !has_leader {
             leaderless += 1;
             println!("tablet {tablet} is LEADERLESS: gs={gs:?}");
@@ -722,7 +725,7 @@ async fn decommission_refuses_live_control_voter_then_succeeds_after_control_rem
     let target = (0..3usize)
         .find(|&i| i != leader)
         .expect("a non-leader exists in a 3-node core");
-    let target_control_id = target as u64;
+    let target_control_id = animusd::config::node_id(target);
     let target_raftkv_id = animusd::config::node_id(target);
     let leader_admin = core_admin[leader];
 
@@ -735,7 +738,7 @@ async fn decommission_refuses_live_control_voter_then_succeeds_after_control_rem
     }
     let drained = async {
         loop {
-            let (status, body) = drain_status(leader_admin, target_raftkv_id).await;
+            let (status, body) = drain_status(leader_admin, &target_raftkv_id).await;
             if status == 200 {
                 let remaining = body["tablets_remaining"].as_u64().unwrap_or(u64::MAX);
                 let node_status = body["status"].as_str().unwrap_or("");
@@ -753,7 +756,7 @@ async fn decommission_refuses_live_control_voter_then_succeeds_after_control_rem
     // 5. Refusal: fully drained, but its control id is STILL a live voter —
     // `/admin/member/remove` refuses (409), naming the control-plane reason.
     {
-        let (status, body) = remove_member(leader_admin, target_raftkv_id).await;
+        let (status, body) = remove_member(leader_admin, &target_raftkv_id).await;
         assert_eq!(
             status, 409,
             "removing a still-live control voter should be refused: {body}"
@@ -785,7 +788,9 @@ async fn decommission_refuses_live_control_voter_then_succeeds_after_control_rem
             let (status, body) = admin(leader_admin, "GET", "/admin/control/members", None).await;
             if status == 200
                 && let Some(voters) = body["voters"].as_array()
-                && !voters.iter().any(|v| v.as_u64() == Some(target_control_id))
+                && !voters
+                    .iter()
+                    .any(|v| v.as_str() == Some(target_control_id.as_str()))
             {
                 return;
             }
@@ -801,7 +806,7 @@ async fn decommission_refuses_live_control_voter_then_succeeds_after_control_rem
     // config (ADR 0037), not a static original-members snapshot that would
     // have refused forever (the pre-ADR-0037 behavior).
     {
-        let (status, body) = remove_member(leader_admin, target_raftkv_id).await;
+        let (status, body) = remove_member(leader_admin, &target_raftkv_id).await;
         assert_eq!(
             status, 200,
             "removing the now-control-removed node should succeed: {body}"

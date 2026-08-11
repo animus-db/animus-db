@@ -89,10 +89,23 @@ with the bug it guards against where one bit during development.
   to the optimized `f+⌊(f+1)/2⌋` without implementing Accord's full
   PreAcceptOk-witness recovery. The tighter bound lets two conflicting txns
   fast-commit at the same `logical` (ordered by node tiebreak), so storage
-  versions are **`mvcc_version(ts) = (logical<<16)|node`**, never `logical`
-  alone — and `mvcc_version` hard-`assert!`s its encoding contract
-  (`node < 2^16`, `logical < 2^48`); a violation would silently collapse two
-  timestamps into one version and LWW would keep an arbitrary winner.
+  versions are **`mvcc_version(ts) = (logical<<16)|node_index`**, never
+  `logical` alone — and `mvcc_version` hard-`assert!`s its encoding contract
+  (`node_index < 2^16`, `logical < 2^48`); a violation would silently
+  collapse two timestamps into one version and LWW would keep an arbitrary
+  winner. **ADR 0040 PR3**: `NodeId` is a validated string now (no longer a
+  small dense `u64`), so it can't be bit-packed directly — `node_index`
+  folds in the node's position in the **sorted, closed, static** replica set
+  instead (every replica derives the same index for the same id since the
+  set is closed for this testbed crate). This is deliberately narrower than
+  introducing an opaque `NodeIdx` type for `Timestamp`/`Ballot.node`
+  generally: `core.rs` reads `txn.node`/`ballot.node` *semantically*
+  (`is_recovery_nominee`/`handle_superseded` compare it against real
+  survivor `NodeId`s for actual coordination decisions, not just as an
+  ordering tiebreak), so an index would need constant reverse-translation
+  there for no simplification — the index trick is scoped to this one
+  purely-numeric MVCC-storage-encoding boundary in `node.rs`
+  (`node_index`/`mvcc_version`), not threaded through the protocol core.
 - **Two execution gates, both required** (`next_applicable`):
   `conflicts_clear_for` (direct key conflicts — judged against every conflicting
   txn known in *any* phase, not just committed ones; gating only on committed

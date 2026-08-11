@@ -13,7 +13,7 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use animus_consensus::{AccordNode, Key, PersistedState, TxnId, WalRecord};
-use animus_env::Disk;
+use animus_env::{Disk, nid};
 use animus_sim::{SimEnv, Simulator};
 use futures::executor::block_on;
 
@@ -25,7 +25,7 @@ fn cluster(seed: u64) -> (Simulator, Vec<AccordNode<SimEnv>>) {
     let sim = Simulator::new(seed);
     let nodes = NODES
         .iter()
-        .map(|&id| AccordNode::start(sim.env(id), NODES.to_vec()))
+        .map(|&id| AccordNode::start(sim.env(nid(id)), NODES.iter().copied().map(nid).collect()))
         .collect();
     (sim, nodes)
 }
@@ -131,7 +131,7 @@ fn restart_from_truncated_wal_recovers_identical_state() {
     // Everything applied on node 2; capture its full executed view + WAL size.
     for (k, id) in ids.iter().enumerate() {
         assert!(
-            nodes[2].is_applied(*id),
+            nodes[2].is_applied(id.clone()),
             "node 2 did not apply txn for key {k} (seed={seed})"
         );
     }
@@ -144,8 +144,8 @@ fn restart_from_truncated_wal_recovers_identical_state() {
     );
 
     // Restart node 2 on the same (truncated) disk — it recovers from snapshot+tail.
-    sim.stop(2);
-    nodes[2] = AccordNode::start(sim.env(2), NODES.to_vec());
+    sim.stop(nid(2));
+    nodes[2] = AccordNode::start(sim.env(nid(2)), NODES.iter().copied().map(nid).collect());
     sim.run_for(Duration::from_secs(2));
 
     // Identical execution order and store after recovering from the truncated WAL.

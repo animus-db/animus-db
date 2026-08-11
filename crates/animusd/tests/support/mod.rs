@@ -44,6 +44,7 @@ fn single_node_config() -> ClusterConfig {
     let a = free_addrs(5);
     ClusterConfig {
         nodes: vec![RoleAddrs {
+            id: animusd::config::node_id(0),
             role: animusd::config::NodeRole::Both,
             internal: a[0],
             client: a[1],
@@ -121,6 +122,7 @@ pub async fn bring_up_deadline(
         let addrs = free_addrs(n * 5);
         let nodes_cfg: Vec<RoleAddrs> = (0..n)
             .map(|i| RoleAddrs {
+                id: animusd::config::node_id(i),
                 role: NodeRole::Both,
                 internal: addrs[5 * i],
                 client: addrs[5 * i + 1],
@@ -176,6 +178,7 @@ pub async fn grow_deadline(
         let mut nodes_cfg = base.nodes.clone();
         for i in 0..extra {
             nodes_cfg.push(RoleAddrs {
+                id: animusd::config::node_id(base_n + i),
                 role: NodeRole::Both,
                 internal: addrs[5 * i],
                 client: addrs[5 * i + 1],
@@ -219,16 +222,18 @@ pub async fn grow_deadline(
     }
 }
 
-/// Join a fresh **combined-mode**, index-addressed node against `seeds` via
-/// `run_node_join`, retrying the (allocate-ports + join) as a unit against a
-/// wall-clock `deadline` rather than a fixed attempt count. Generalized from
-/// the identical fixed-16-attempt/50ms helper duplicated in `decommission.rs`
-/// and `seed_join.rs`: under `cargo test --workspace`-level port-TOCTOU
-/// contention, 16 attempts (0.8s total) could exhaust while the port churn
-/// was still transient, surfacing as a spurious "could not join node N"
-/// panic rather than a real join bug. Trade-off (same as
-/// [`restart_same_addrs`]): a genuinely-broken join now takes up to
-/// `deadline` to report instead of failing in under a second.
+/// Join a fresh **combined-mode**, explicit-id node against `seeds` via
+/// `run_node_join` (ADR 0040 PR4: `--id` replaces the old `--node I` index —
+/// `index` is used only to derive a deterministic, readable test id,
+/// `config::node_id(index)`, and the data dir), retrying the allocate-ports-
+/// and-join step as a unit against a wall-clock `deadline` rather than a
+/// fixed attempt count. Generalized from the identical fixed-16-attempt/50ms
+/// helper duplicated in `decommission.rs` and `seed_join.rs`: under `cargo
+/// test --workspace`-level port-TOCTOU contention, 16 attempts (0.8s total)
+/// could exhaust while the port churn was still transient, surfacing as a
+/// spurious "could not join node N" panic rather than a real join bug.
+/// Trade-off (same as [`restart_same_addrs`]): a genuinely-broken join now
+/// takes up to `deadline` to report instead of failing in under a second.
 ///
 /// Returns the node, the addresses it actually bound, and the data dir it
 /// used (a caller that needs to rejoin at the exact same addresses/dir, e.g.
@@ -244,7 +249,9 @@ pub async fn join_fresh_deadline(
     let mut attempt: u64 = 0;
     loop {
         let raw = free_addrs(5);
+        let id = animusd::config::node_id(index);
         let addrs = RoleAddrs {
+            id: id.clone(),
             role: NodeRole::Both,
             internal: raw[0],
             client: raw[1],
@@ -253,7 +260,16 @@ pub async fn join_fresh_deadline(
             admin: raw[4],
         };
         let node_dir = dir.join(format!("join-{index}-{attempt}"));
-        match animusd::run_node_join(seeds.to_vec(), index, addrs, &node_dir, backend).await {
+        match animusd::run_node_join(
+            seeds.to_vec(),
+            Some(id),
+            addrs.clone(),
+            &node_dir,
+            backend,
+            BTreeMap::new(),
+        )
+        .await
+        {
             Ok(node) => return (node, addrs, node_dir),
             Err(e) => {
                 assert!(
@@ -267,7 +283,7 @@ pub async fn join_fresh_deadline(
     }
 }
 
-/// Join a fresh **data-only**, index-addressed node against `seeds` via
+/// Join a fresh **data-only**, explicit-id node against `seeds` via
 /// `run_node_data_join` — the data-only dual of [`join_fresh_deadline`],
 /// generalized from `data_join.rs`'s own fixed-16-attempt/50ms helper.
 pub async fn join_data_fresh_deadline(
@@ -281,7 +297,9 @@ pub async fn join_data_fresh_deadline(
     let mut attempt: u64 = 0;
     loop {
         let raw = free_addrs(5);
+        let id = animusd::config::node_id(index);
         let addrs = RoleAddrs {
+            id: id.clone(),
             role: NodeRole::Data,
             internal: raw[0],
             client: raw[1],
@@ -290,7 +308,16 @@ pub async fn join_data_fresh_deadline(
             admin: raw[4],
         };
         let node_dir = dir.join(format!("data-join-{index}-{attempt}"));
-        match animusd::run_node_data_join(seeds.to_vec(), index, addrs, &node_dir, backend).await {
+        match animusd::run_node_data_join(
+            seeds.to_vec(),
+            Some(id),
+            addrs,
+            &node_dir,
+            backend,
+            BTreeMap::new(),
+        )
+        .await
+        {
             Ok(node) => return node,
             Err(e) => {
                 assert!(
@@ -304,12 +331,13 @@ pub async fn join_data_fresh_deadline(
     }
 }
 
-/// Join a fresh **combined-mode, cluster-allocated-id** node against `seeds`
-/// (ADR 0036) via `run_node_join_allocated` — the allocated-id counterpart of
-/// [`join_fresh_deadline`], generalized from `seed_join_allocated.rs`'s own
-/// fixed-16-attempt/50ms helper. `label` disambiguates the data dir across
-/// concurrent callers sharing one `dir` (unlike the `--node`-indexed helper,
-/// there is no index to name it after).
+/// Join a fresh **combined-mode, self-minted-id** node against `seeds` (ADR
+/// 0040 Decision B/C, `run_node_join` with `id: None`) — the minted-id
+/// counterpart of [`join_fresh_deadline`], generalized from
+/// `seed_join_allocated.rs`'s own fixed-16-attempt/50ms helper. `label`
+/// disambiguates the data dir across concurrent callers sharing one `dir`
+/// (unlike the explicit-id helper, there is no id known upfront to name it
+/// after).
 pub async fn join_allocated_fresh_deadline(
     seeds: &[SocketAddr],
     dir: &Path,
@@ -322,6 +350,9 @@ pub async fn join_allocated_fresh_deadline(
     loop {
         let raw = free_addrs(5);
         let addrs = RoleAddrs {
+            // Unread placeholder: the real id is self-minted pre-bind
+            // (ADR 0040 Decision B) — never derived from `addrs.id`.
+            id: animus_env::NodeId::new_unchecked("pending-mint"),
             role: NodeRole::Both,
             internal: raw[0],
             client: raw[1],
@@ -330,9 +361,10 @@ pub async fn join_allocated_fresh_deadline(
             admin: raw[4],
         };
         let node_dir = dir.join(format!("join-alloc-{label}-{attempt}"));
-        match animusd::run_node_join_allocated(
+        match animusd::run_node_join(
             seeds.to_vec(),
-            addrs,
+            None,
+            addrs.clone(),
             &node_dir,
             backend,
             BTreeMap::new(),
@@ -343,7 +375,7 @@ pub async fn join_allocated_fresh_deadline(
             Err(e) => {
                 assert!(
                     tokio::time::Instant::now() < hard_deadline,
-                    "could not join (allocated id) within {deadline:?}: {e}"
+                    "could not join (minted id) within {deadline:?}: {e}"
                 );
                 sleep(Duration::from_millis(50)).await;
                 attempt += 1;
@@ -352,9 +384,8 @@ pub async fn join_allocated_fresh_deadline(
     }
 }
 
-/// Join a fresh **data-only, cluster-allocated-id** node against `seeds`
-/// (ADR 0036) via `run_node_data_join_allocated` — the data-only dual of
-/// [`join_allocated_fresh_deadline`].
+/// Join a fresh **data-only, self-minted-id** node against `seeds` (ADR 0040
+/// Decision B/C) — the data-only dual of [`join_allocated_fresh_deadline`].
 pub async fn join_data_allocated_fresh_deadline(
     seeds: &[SocketAddr],
     dir: &Path,
@@ -367,6 +398,8 @@ pub async fn join_data_allocated_fresh_deadline(
     loop {
         let raw = free_addrs(5);
         let addrs = RoleAddrs {
+            // See `join_allocated_fresh_deadline`'s identical placeholder.
+            id: animus_env::NodeId::new_unchecked("pending-mint"),
             role: NodeRole::Data,
             internal: raw[0],
             client: raw[1],
@@ -375,8 +408,9 @@ pub async fn join_data_allocated_fresh_deadline(
             admin: raw[4],
         };
         let node_dir = dir.join(format!("data-join-alloc-{label}-{attempt}"));
-        match animusd::run_node_data_join_allocated(
+        match animusd::run_node_data_join(
             seeds.to_vec(),
+            None,
             addrs,
             &node_dir,
             backend,
@@ -388,7 +422,7 @@ pub async fn join_data_allocated_fresh_deadline(
             Err(e) => {
                 assert!(
                     tokio::time::Instant::now() < hard_deadline,
-                    "could not join as a data node (allocated id) within {deadline:?}: {e}"
+                    "could not join as a data node (minted id) within {deadline:?}: {e}"
                 );
                 sleep(Duration::from_millis(50)).await;
                 attempt += 1;
@@ -422,6 +456,7 @@ pub async fn bring_up_split(
                     NodeRole::Data
                 };
                 RoleAddrs {
+                    id: animusd::config::node_id(i),
                     role,
                     internal: addrs[5 * i],
                     client: addrs[5 * i + 1],

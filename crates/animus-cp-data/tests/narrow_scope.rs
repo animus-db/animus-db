@@ -26,6 +26,7 @@ use std::time::Duration;
 
 use animus_control::ProposeResult;
 use animus_cp_data::{RaftKvNode, StorageScope};
+use animus_env::nid;
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::{MemoryEngine, StorageEngine};
 use animus_tablet::KeyRange;
@@ -44,8 +45,8 @@ fn group(seed: u64) -> (Simulator, Vec<KvNode>) {
         .iter()
         .map(|&id| {
             RaftKvNode::start_scoped(
-                sim.env(id),
-                NODES.to_vec(),
+                sim.env(nid(id)),
+                NODES.iter().copied().map(nid).collect(),
                 MemoryEngine::new(),
                 StorageScope::new(b"T:".to_vec(), KeyRange::whole()),
             )
@@ -91,7 +92,7 @@ fn narrowing_excludes_already_handed_off_data_from_future_snapshots() {
     let lagging = (0..3).find(|&i| i != l).expect("a follower exists");
 
     // Crash the lagging follower immediately — it misses everything below.
-    sim.crash(NODES[lagging]);
+    sim.crash(nid(NODES[lagging]));
 
     // Write into BOTH the soon-to-be-kept ("lo") and soon-to-be-handed-off
     // ("hi") portions while the scope is still whole.
@@ -136,7 +137,7 @@ fn narrowing_excludes_already_handed_off_data_from_future_snapshots() {
     // Bring the lagging replica back: its log is far behind the leader's
     // compacted (and now range-narrowed) base, so it must catch up via
     // InstallSnapshot.
-    sim.restart(NODES[lagging]);
+    sim.restart(nid(NODES[lagging]));
     sim.run_for(Duration::from_secs(6));
 
     // It has every "kept" write...

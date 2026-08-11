@@ -408,13 +408,13 @@ async fn data_node_failure_is_detected_and_repaired_onto_a_spare() {
 
         let spare = data_raftkv_ids
             .iter()
-            .copied()
             .find(|id| !replicas_before.contains(id))
+            .cloned()
             .expect("a spare data node exists");
-        let killed_id = replicas_before[0];
+        let killed_id = replicas_before[0].clone();
         let victim_idx = data_raftkv_ids
             .iter()
-            .position(|&id| id == killed_id)
+            .position(|id| *id == killed_id)
             .unwrap();
         let killed_node = data_nodes.remove(victim_idx);
         killed_node.shutdown_graceful().await;
@@ -505,10 +505,10 @@ async fn decommission_a_data_node_over_split_deployment_via_the_control_leader()
         // actually give it a real replica before decommissioning it; this
         // proves the flow drains a node that genuinely hosts data, not an
         // already-idle one.
-        let target_id = data_raftkv_ids[3];
+        let target_id = data_raftkv_ids[3].clone();
         let hosted_table = timeout(Duration::from_secs(90), async {
             loop {
-                if let Some(t) = table_with_replica(&control_nodes[0], target_id) {
+                if let Some(t) = table_with_replica(&control_nodes[0], target_id.clone()) {
                     return t;
                 }
                 sleep(Duration::from_millis(300)).await;
@@ -697,6 +697,7 @@ async fn bring_up_split_durable(
                     NodeRole::Data
                 };
                 RoleAddrs {
+                    id: animusd::config::node_id(i),
                     role,
                     internal: addrs[5 * i],
                     client: addrs[5 * i + 1],
@@ -988,13 +989,13 @@ async fn control_leader_and_data_node_failure_simultaneously_still_converges() {
 
         let spare = data_raftkv_ids
             .iter()
-            .copied()
             .find(|id| !replicas_before.contains(id))
+            .cloned()
             .expect("a spare data node exists");
-        let killed_data_id = replicas_before[0];
+        let killed_data_id = replicas_before[0].clone();
         let victim_idx = data_raftkv_ids
             .iter()
-            .position(|&id| id == killed_data_id)
+            .position(|id| *id == killed_data_id)
             .unwrap();
 
         // A write loop spanning BOTH simultaneous failures: each key gets
@@ -1193,10 +1194,10 @@ async fn decommission_racing_a_tablet_split_converges_with_no_data_loss() {
         .await
         .expect("tablet was not provisioned with 3 replicas in 20s");
 
-        let victim_id = replicas_before[0];
+        let victim_id = replicas_before[0].clone();
         let victim_idx = data_raftkv_ids
             .iter()
-            .position(|&id| id == victim_id)
+            .position(|id| *id == victim_id)
             .unwrap();
         let leader_idx = control_nodes
             .iter()

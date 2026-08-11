@@ -9,6 +9,7 @@
 //! flushes/compacts as it goes, so an "estimate too low" failure mode would
 //! silently under-count a tablet and delay a split it actually needs).
 
+use animus_env::nid;
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::{LsmEngine, LsmOptions, StorageEngine};
 use futures::executor::block_on;
@@ -32,7 +33,7 @@ fn opts() -> LsmOptions {
 }
 
 fn open(sim: &Simulator) -> LsmEngine<SimEnv> {
-    block_on(LsmEngine::open_with(sim.env(0), PREFIX, opts())).expect("open")
+    block_on(LsmEngine::open_with(sim.env(nid(0)), PREFIX, opts())).expect("open")
 }
 
 /// A generous flush threshold so several small `put`s stay in the memtable
@@ -42,7 +43,7 @@ fn open(sim: &Simulator) -> LsmEngine<SimEnv> {
 fn open_wide_memtable(sim: &Simulator) -> LsmEngine<SimEnv> {
     let mut o = opts();
     o.flush_threshold_bytes = 1 << 20;
-    block_on(LsmEngine::open_with(sim.env(0), PREFIX, o)).expect("open")
+    block_on(LsmEngine::open_with(sim.env(nid(0)), PREFIX, o)).expect("open")
 }
 
 /// The exact byte total (`key.len() + value.len()`) of every `(k, v)` pair

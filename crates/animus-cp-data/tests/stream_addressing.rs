@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use animus_control::ProposeResult;
 use animus_cp_data::{RaftKvNode, StorageScope};
+use animus_env::nid;
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::MemoryEngine;
 use futures::executor::block_on;
@@ -30,8 +31,8 @@ fn hosted_group(sim: &Simulator, stream: u64) -> Vec<KvNode> {
         .iter()
         .map(|&id| {
             RaftKvNode::start_hosted(
-                sim.env(id),
-                NODES.to_vec(),
+                sim.env(nid(id)),
+                NODES.iter().copied().map(nid).collect(),
                 MemoryEngine::new(),
                 StorageScope::whole(),
                 stream,

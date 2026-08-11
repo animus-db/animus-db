@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use animus_consensus::{AccordNode, Key, TxnId};
-use animus_env::EnvExt;
+use animus_env::{EnvExt, nid};
 use animus_sim::{SimEnv, Simulator};
 use futures::executor::block_on;
 
@@ -33,7 +33,7 @@ fn local_cluster(seed: u64) -> (Simulator, Vec<AccordNode<SimEnv>>) {
     let sim = Simulator::new(seed);
     let nodes = NODES
         .iter()
-        .map(|&id| AccordNode::start(sim.env(id), NODES.to_vec()))
+        .map(|&id| AccordNode::start(sim.env(nid(id)), NODES.iter().copied().map(nid).collect()))
         .collect();
     (sim, nodes)
 }
@@ -53,7 +53,10 @@ fn submit_writes_stores_the_actual_value() {
     sim.run_for(Duration::from_secs(3));
 
     for (i, n) in nodes.iter().enumerate() {
-        assert!(n.is_applied(txn), "node {i} did not execute (seed={seed})");
+        assert!(
+            n.is_applied(txn.clone()),
+            "node {i} did not execute (seed={seed})"
+        );
         assert_eq!(
             store_value(n, 7).as_deref(),
             Some(&b"hello"[..]),
@@ -86,7 +89,7 @@ fn conflicting_values_resolve_in_agreed_order() {
         .filter(|t| *t == a || *t == b)
         .collect();
     assert_eq!(order.len(), 2, "both executed (seed={seed})");
-    let second = *order.last().unwrap();
+    let second = order.last().unwrap().clone();
     let expected: &[u8] = if second == a { b"AAA" } else { b"BBB" };
 
     for (i, n) in nodes.iter().enumerate() {
@@ -110,7 +113,10 @@ fn read_observes_actual_value() {
 
     let r = nodes[1].submit_read(keys(&[9]));
     sim.run_for(Duration::from_secs(2));
-    assert!(nodes[1].is_applied(r), "read executed (seed={seed})");
+    assert!(
+        nodes[1].is_applied(r.clone()),
+        "read executed (seed={seed})"
+    );
 
     let observed = nodes[1].read_value_result(r).expect("read result present");
     assert_eq!(
@@ -129,12 +135,12 @@ fn value_recovers_from_disk() {
 
     let txn = nodes[0].submit_writes(writes(&[(3, b"durable")]));
     sim.run_for(Duration::from_secs(3));
-    assert!(nodes[2].is_applied(txn));
+    assert!(nodes[2].is_applied(txn.clone()));
     assert_eq!(store_value(&nodes[2], 3).as_deref(), Some(&b"durable"[..]));
 
     // Stop node 2, restart it fresh; it recovers from its WAL.
-    sim.stop(2);
-    nodes[2] = AccordNode::start(sim.env(2), NODES.to_vec());
+    sim.stop(nid(2));
+    nodes[2] = AccordNode::start(sim.env(nid(2)), NODES.iter().copied().map(nid).collect());
     sim.run_for(Duration::from_secs(2));
 
     assert!(
@@ -177,10 +183,14 @@ fn interactive_read_modify_write_carries_value() {
     });
     sim.run_for(Duration::from_secs(5));
 
-    let txn = committed.lock().unwrap().expect("interactive committed");
+    let txn = committed
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("interactive committed");
     for (i, n) in nodes.iter().enumerate() {
         assert!(
-            n.is_applied(txn),
+            n.is_applied(txn.clone()),
             "node {i} did not apply the RMW (seed={seed})"
         );
         assert_eq!(

@@ -50,19 +50,24 @@
 //! ## Full fidelity, not a partial mirror
 //!
 //! Every [`MetaCommand`] variant is mirrored, including the legacy
-//! `RegisterCpAddr` and the two monotonic id-allocator counters
-//! (`next_tablet_id`/`next_alloc_id`) and the `AllocateNodeId` idempotency
-//! ledger (`node_id_allocations`) — none of these were in PR1's
-//! [`EntityKind`] set, so this module's own PR2 changes to `syskv.rs` added
-//! [`syskv::EntityKind::Counter`]/[`syskv::EntityKind::CpMemberAddr`]/
-//! [`syskv::EntityKind::NodeIdAlloc`]. The payoff: [`rebuild_metadata_from_engine`]
-//! produces a `Metadata` that is `PartialEq`-identical to the real in-core
-//! one, not "identical modulo a documented gap" — which is exactly what the
-//! differential-oracle test asserts.
+//! `RegisterCpAddr` and the monotonic tablet-id-allocator counter
+//! (`next_tablet_id`) — none of these were in PR1's [`EntityKind`] set, so
+//! this module's own PR2 changes to `syskv.rs` added
+//! [`syskv::EntityKind::Counter`]/[`syskv::EntityKind::CpMemberAddr`] (a
+//! third PR2 variant, `NodeIdAlloc`, mirrored the ADR 0036 allocator's
+//! idempotency ledger — removed in ADR 0040 PR4 along with the allocator;
+//! `MetaCommand::RegisterNode`'s claim lives entirely in the already-mirrored
+//! `Member`/`NodeAddrs` kinds, no separate ledger needed). The payoff:
+//! [`rebuild_metadata_from_engine`] produces a `Metadata` that is
+//! `PartialEq`-identical to the real in-core one, not "identical modulo a
+//! documented gap" — which is exactly what the differential-oracle test
+//! asserts.
 
 use std::collections::BTreeMap;
 
 use animus_env::NodeId;
+#[cfg(test)]
+use animus_env::nid;
 use animus_placement::PlacementPolicy;
 use animus_storage::{StorageEngine, StorageError};
 use animus_tablet::{Tablet, TabletId};
@@ -73,11 +78,10 @@ use crate::schema::TableSchema;
 use crate::syskv::{self, DecodedKey, EntityKind};
 
 /// The counter name for `Metadata::next_tablet_id` under
-/// [`EntityKind::Counter`] (`syskv::counter_key`).
+/// [`EntityKind::Counter`] (`syskv::counter_key`). The ADR 0036 allocator's
+/// own sibling counter (`NEXT_ALLOC_ID_COUNTER`) was removed in ADR 0040 PR4
+/// along with the allocator itself.
 pub const NEXT_TABLET_ID_COUNTER: &str = "next_tablet_id";
-/// The counter name for `Metadata::next_alloc_id` under
-/// [`EntityKind::Counter`] (`syskv::counter_key`).
-pub const NEXT_ALLOC_ID_COUNTER: &str = "next_alloc_id";
 
 /// One system-keyspace mutation an applied [`MetaCommand`] implies. The
 /// mirror loop (`node.rs`) translates these into per-key-LWW
@@ -155,7 +159,7 @@ pub fn apply_and_derive_mirror(
             // explicitly so this match stays exhaustive without a wildcard.
         }
         MetaCommand::UpsertMember { node, .. } => {
-            writes.push(put_json(syskv::member_key(*node), &meta.members[node]));
+            writes.push(put_json(syskv::member_key(node), &meta.members[node]));
         }
         MetaCommand::CreateTablet { tablet, .. } => {
             writes.push(put_json(syskv::tablet_key(*tablet), &meta.tablets[tablet]));
@@ -178,7 +182,7 @@ pub fn apply_and_derive_mirror(
             writes.push(KeyWrite::Delete(syskv::policy_key(*right)));
             writes.push(KeyWrite::Put(syskv::merged_key(*right), Vec::new()));
             for id in dead_cp_member_ids(&pre_cp_member_tablets, meta) {
-                writes.push(KeyWrite::Delete(syskv::cp_member_addr_key(id)));
+                writes.push(KeyWrite::Delete(syskv::cp_member_addr_key(&id)));
             }
         }
         MetaCommand::SetTabletPolicy { tablet, policy } => match policy {
@@ -200,7 +204,7 @@ pub fn apply_and_derive_mirror(
                 writes.push(KeyWrite::Delete(syskv::policy_key(*id)));
             }
             for id in dead_cp_member_ids(&pre_cp_member_tablets, meta) {
-                writes.push(KeyWrite::Delete(syskv::cp_member_addr_key(id)));
+                writes.push(KeyWrite::Delete(syskv::cp_member_addr_key(&id)));
             }
         }
         MetaCommand::CreateTableIndex { table, .. }
@@ -221,27 +225,34 @@ pub fn apply_and_derive_mirror(
                 addr: addr.clone(),
                 tablet: *tablet,
             };
-            writes.push(put_json(syskv::cp_member_addr_key(*id), &entry));
+            writes.push(put_json(syskv::cp_member_addr_key(id), &entry));
         }
         MetaCommand::RegisterNodeAddrs { node, addrs } => {
-            writes.push(put_json(syskv::node_addrs_key(*node), addrs));
+            writes.push(put_json(syskv::node_addrs_key(node), addrs));
         }
         MetaCommand::RemoveMember { node } => {
-            writes.push(KeyWrite::Delete(syskv::member_key(*node)));
-            writes.push(KeyWrite::Delete(syskv::node_addrs_key(*node)));
-            writes.push(KeyWrite::Delete(syskv::cp_member_addr_key(*node)));
+            writes.push(KeyWrite::Delete(syskv::member_key(node)));
+            writes.push(KeyWrite::Delete(syskv::node_addrs_key(node)));
+            writes.push(KeyWrite::Delete(syskv::cp_member_addr_key(node)));
         }
-        MetaCommand::AllocateNodeId { nonce, .. } => {
-            let node_id = meta.node_id_allocations[nonce];
+        MetaCommand::RegisterNode { node, .. } => {
+            // `apply_and_derive_mirror` only reaches here when `outcome ==
+            // Applied`, but that no longer guarantees `members[node]` is
+            // present: `RegisterNode`'s apply never claims a `members` row
+            // for a control-role registration (`addrs.role == "control"` —
+            // see its own doc for why), and it can also apply as a
+            // members-row *repair* against an id that already has an
+            // identical `node_addrs` entry but somehow lost its members row.
+            // `node_addrs[node]` alone is always guaranteed (this arm is the
+            // only command that ever writes it out unconditionally on
+            // `Applied`).
+            if let Some(member) = meta.members.get(node) {
+                writes.push(put_json(syskv::member_key(node), member));
+            }
             writes.push(put_json(
-                syskv::member_key(node_id),
-                &meta.members[&node_id],
+                syskv::node_addrs_key(node),
+                &meta.node_addrs[node],
             ));
-            writes.push(KeyWrite::Put(
-                syskv::node_id_alloc_key(nonce),
-                node_id.to_be_bytes().to_vec(),
-            ));
-            writes.push(put_counter(NEXT_ALLOC_ID_COUNTER, meta.next_alloc_id));
         }
     }
     (outcome, writes)
@@ -256,7 +267,7 @@ pub fn apply_and_derive_mirror(
 fn dead_cp_member_ids(pre: &BTreeMap<NodeId, TabletId>, meta: &Metadata) -> Vec<NodeId> {
     pre.iter()
         .filter(|(_, tablet)| !meta.tablets.contains_key(tablet))
-        .map(|(&id, _)| id)
+        .map(|(id, _)| id.clone())
         .collect()
 }
 
@@ -284,6 +295,19 @@ fn decode_u64(bytes: &[u8]) -> u64 {
         .try_into()
         .expect("system-keyspace u64 value is exactly 8 bytes");
     u64::from_be_bytes(array)
+}
+
+/// Decode a [`NodeId`]'s raw UTF-8 bytes (ADR 0040 PR3: a node id's key/value
+/// bytes are its raw string bytes, not an 8-byte big-endian `u64` — see
+/// `syskv::member_key`'s doc). Bypasses [`NodeId::propose`]'s charset
+/// validation via [`NodeId::new_unchecked`] — this id was already validated
+/// once at whatever intake boundary first proposed it; this is a trusted,
+/// already-replicated round-trip, not fresh untrusted input. Panics on
+/// non-UTF-8 bytes — this module never writes anything else at a node-id
+/// key, so that would be an internal bug.
+fn decode_node_id(bytes: Vec<u8>) -> NodeId {
+    let s = String::from_utf8(bytes).expect("system-keyspace node id is UTF-8");
+    NodeId::new_unchecked(s)
 }
 
 /// Rebuild a [`Metadata`] purely from a [`StorageEngine`]'s live system
@@ -347,7 +371,7 @@ fn apply_put(meta: &mut Metadata, key: &[u8], value: &[u8]) {
         EntityKind::Member => {
             let member: Member =
                 serde_json::from_slice(value).expect("mirrored member value decodes");
-            meta.members.insert(decode_u64(&id), member);
+            meta.members.insert(decode_node_id(id), member);
         }
         EntityKind::Schema => {
             let name = String::from_utf8(id).expect("schema id is UTF-8");
@@ -363,7 +387,7 @@ fn apply_put(meta: &mut Metadata, key: &[u8], value: &[u8]) {
         EntityKind::NodeAddrs => {
             let addrs: NodeAddrs =
                 serde_json::from_slice(value).expect("mirrored node-addrs value decodes");
-            meta.node_addrs.insert(decode_u64(&id), addrs);
+            meta.node_addrs.insert(decode_node_id(id), addrs);
         }
         EntityKind::Keyspace => {
             let name = String::from_utf8(id).expect("keyspace id is UTF-8");
@@ -376,22 +400,16 @@ fn apply_put(meta: &mut Metadata, key: &[u8], value: &[u8]) {
             let value = decode_u64(value);
             if id == NEXT_TABLET_ID_COUNTER.as_bytes() {
                 meta.next_tablet_id = value;
-            } else if id == NEXT_ALLOC_ID_COUNTER.as_bytes() {
-                meta.next_alloc_id = value;
             }
         }
         EntityKind::CpMemberAddr => {
-            let node = decode_u64(&id);
+            let node = decode_node_id(id);
             let entry: CpMemberAddrEntry =
                 serde_json::from_slice(value).expect("mirrored cp-member-addr value decodes");
-            meta.cp_member_addrs.insert(node, entry.addr);
+            meta.cp_member_addrs.insert(node.clone(), entry.addr);
             if let Some(tablet) = entry.tablet {
                 meta.cp_member_tablets.insert(node, tablet);
             }
-        }
-        EntityKind::NodeIdAlloc => {
-            let nonce = String::from_utf8(id).expect("node-id-alloc nonce is UTF-8");
-            meta.node_id_allocations.insert(nonce, decode_u64(value));
         }
     }
 }
@@ -408,7 +426,7 @@ fn apply_delete(meta: &mut Metadata, key: &[u8]) {
             meta.tablets.remove(&TabletId(decode_u64(&id)));
         }
         EntityKind::Member => {
-            meta.members.remove(&decode_u64(&id));
+            meta.members.remove(&decode_node_id(id));
         }
         EntityKind::Schema => {
             let name = String::from_utf8(id).expect("schema id is UTF-8");
@@ -418,7 +436,7 @@ fn apply_delete(meta: &mut Metadata, key: &[u8]) {
             meta.policies.remove(&TabletId(decode_u64(&id)));
         }
         EntityKind::NodeAddrs => {
-            meta.node_addrs.remove(&decode_u64(&id));
+            meta.node_addrs.remove(&decode_node_id(id));
         }
         EntityKind::Keyspace => {
             let name = String::from_utf8(id).expect("keyspace id is UTF-8");
@@ -434,13 +452,9 @@ fn apply_delete(meta: &mut Metadata, key: &[u8]) {
             // `Put`) — listed for match exhaustiveness.
         }
         EntityKind::CpMemberAddr => {
-            let node = decode_u64(&id);
+            let node = decode_node_id(id);
             meta.cp_member_addrs.remove(&node);
             meta.cp_member_tablets.remove(&node);
-        }
-        EntityKind::NodeIdAlloc => {
-            // Never deleted in practice (an idempotency ledger entry is
-            // permanent) — listed for match exhaustiveness.
         }
     }
 }
@@ -476,7 +490,7 @@ mod tests {
     fn upsert_member_writes_the_member() {
         let mut meta = Metadata::default();
         let command = MetaCommand::UpsertMember {
-            node: 1,
+            node: nid(1),
             labels: BTreeMap::new(),
             status: NodeStatus::Active,
         };
@@ -484,7 +498,7 @@ mod tests {
         assert_eq!(outcome, ApplyOutcome::Applied);
         assert_eq!(
             writes,
-            vec![put_json(syskv::member_key(1), &meta.members[&1])]
+            vec![put_json(syskv::member_key(&nid(1)), &meta.members[&nid(1)])]
         );
     }
 
@@ -495,7 +509,7 @@ mod tests {
             tablet: TabletId(1),
             table: None,
             range: KeyRange::whole(),
-            replicas: vec![1, 2],
+            replicas: vec![nid(1), nid(2)],
         };
         let (outcome, writes) = apply_and_derive_mirror(&mut meta, &command);
         assert_eq!(outcome, ApplyOutcome::Applied);
@@ -515,7 +529,7 @@ mod tests {
             tablet: TabletId(1),
             table: None,
             range: KeyRange::whole(),
-            replicas: vec![1],
+            replicas: vec![nid(1)],
         };
         let _ = apply_and_derive_mirror(&mut meta, &create);
         let (outcome, writes) = apply_and_derive_mirror(&mut meta, &create);
@@ -532,13 +546,13 @@ mod tests {
                 tablet: TabletId(1),
                 table: None,
                 range: KeyRange::whole(),
-                replicas: vec![1],
+                replicas: vec![nid(1)],
             },
         );
         let command = MetaCommand::CasTabletReplicas {
             tablet: TabletId(1),
             expected_epoch: Epoch::INITIAL,
-            replicas: vec![1, 2],
+            replicas: vec![nid(1), nid(2)],
         };
         let (outcome, writes) = apply_and_derive_mirror(&mut meta, &command);
         assert_eq!(outcome, ApplyOutcome::Applied);
@@ -560,7 +574,7 @@ mod tests {
                 tablet: TabletId(1),
                 table: None,
                 range: KeyRange::whole(),
-                replicas: vec![1],
+                replicas: vec![nid(1)],
             },
         );
         let _ = apply_and_derive_mirror(
@@ -601,7 +615,7 @@ mod tests {
                 tablet: TabletId(1),
                 table: Some("t".to_string()),
                 range: KeyRange::whole().split_at(&[5]).unwrap().0,
-                replicas: vec![1],
+                replicas: vec![nid(1)],
             },
         );
         // Directly seed the second tablet + the legacy address-book entry
@@ -610,10 +624,15 @@ mod tests {
         let right_range = KeyRange::whole().split_at(&[5]).unwrap().1;
         meta.tablets.insert(
             TabletId(2),
-            Tablet::with_table(TabletId(2), Some("t".to_string()), right_range, vec![1]),
+            Tablet::with_table(
+                TabletId(2),
+                Some("t".to_string()),
+                right_range,
+                vec![nid(1)],
+            ),
         );
-        meta.cp_member_addrs.insert(99, "addr:1".to_string());
-        meta.cp_member_tablets.insert(99, TabletId(2));
+        meta.cp_member_addrs.insert(nid(99), "addr:1".to_string());
+        meta.cp_member_tablets.insert(nid(99), TabletId(2));
 
         let command = MetaCommand::MergeTablets {
             left: TabletId(1),
@@ -630,7 +649,7 @@ mod tests {
                 KeyWrite::Delete(syskv::tablet_key(TabletId(2))),
                 KeyWrite::Delete(syskv::policy_key(TabletId(2))),
                 KeyWrite::Put(syskv::merged_key(TabletId(2)), Vec::new()),
-                KeyWrite::Delete(syskv::cp_member_addr_key(99)),
+                KeyWrite::Delete(syskv::cp_member_addr_key(&nid(99))),
             ]
         );
         assert!(meta.cp_member_addrs.is_empty());
@@ -645,7 +664,7 @@ mod tests {
                 tablet: TabletId(1),
                 table: None,
                 range: KeyRange::whole(),
-                replicas: vec![1],
+                replicas: vec![nid(1)],
             },
         );
         let set = MetaCommand::SetTabletPolicy {
@@ -750,7 +769,7 @@ mod tests {
                 tablet: TabletId(1),
                 table: Some("t".to_string()),
                 range: KeyRange::whole(),
-                replicas: vec![1],
+                replicas: vec![nid(1)],
             },
         );
         let _ = apply_and_derive_mirror(
@@ -760,8 +779,8 @@ mod tests {
                 policy: Some(PlacementPolicy::simple("p", 1)),
             },
         );
-        meta.cp_member_addrs.insert(7, "addr".to_string());
-        meta.cp_member_tablets.insert(7, TabletId(1));
+        meta.cp_member_addrs.insert(nid(7), "addr".to_string());
+        meta.cp_member_tablets.insert(nid(7), TabletId(1));
 
         let command = MetaCommand::DropTableTablets {
             table: "t".to_string(),
@@ -773,7 +792,7 @@ mod tests {
             vec![
                 KeyWrite::Delete(syskv::tablet_key(TabletId(1))),
                 KeyWrite::Delete(syskv::policy_key(TabletId(1))),
-                KeyWrite::Delete(syskv::cp_member_addr_key(7)),
+                KeyWrite::Delete(syskv::cp_member_addr_key(&nid(7))),
             ]
         );
 
@@ -884,11 +903,11 @@ mod tests {
                 tablet: TabletId(1),
                 table: None,
                 range: KeyRange::whole(),
-                replicas: vec![1],
+                replicas: vec![nid(1)],
             },
         );
         let command = MetaCommand::RegisterCpAddr {
-            id: 5,
+            id: nid(5),
             addr: "127.0.0.1:9".to_string(),
             tablet: Some(TabletId(1)),
         };
@@ -897,7 +916,7 @@ mod tests {
         assert_eq!(
             writes,
             vec![put_json(
-                syskv::cp_member_addr_key(5),
+                syskv::cp_member_addr_key(&nid(5)),
                 &CpMemberAddrEntry {
                     addr: "127.0.0.1:9".to_string(),
                     tablet: Some(TabletId(1)),
@@ -909,6 +928,16 @@ mod tests {
     #[test]
     fn register_node_addrs_writes_the_address_book_entry() {
         let mut meta = Metadata::default();
+        // ADR 0040 PR4: `RegisterNodeAddrs` is update-only — establish the
+        // claim first (standing in for a config-bootstrapped member).
+        let _ = apply_and_derive_mirror(
+            &mut meta,
+            &MetaCommand::UpsertMember {
+                node: nid(3),
+                labels: BTreeMap::new(),
+                status: NodeStatus::Active,
+            },
+        );
         let addrs = NodeAddrs {
             internal: "a".to_string(),
             client: "b".to_string(),
@@ -916,12 +945,15 @@ mod tests {
             role: "combined".to_string(),
         };
         let command = MetaCommand::RegisterNodeAddrs {
-            node: 3,
+            node: nid(3),
             addrs: addrs.clone(),
         };
         let (outcome, writes) = apply_and_derive_mirror(&mut meta, &command);
         assert_eq!(outcome, ApplyOutcome::Applied);
-        assert_eq!(writes, vec![put_json(syskv::node_addrs_key(3), &addrs)]);
+        assert_eq!(
+            writes,
+            vec![put_json(syskv::node_addrs_key(&nid(3)), &addrs)]
+        );
     }
 
     #[test]
@@ -930,47 +962,49 @@ mod tests {
         let _ = apply_and_derive_mirror(
             &mut meta,
             &MetaCommand::UpsertMember {
-                node: 4,
+                node: nid(4),
                 labels: BTreeMap::new(),
                 status: NodeStatus::Leaving,
             },
         );
-        let command = MetaCommand::RemoveMember { node: 4 };
+        let command = MetaCommand::RemoveMember { node: nid(4) };
         let (outcome, writes) = apply_and_derive_mirror(&mut meta, &command);
         assert_eq!(outcome, ApplyOutcome::Applied);
         assert_eq!(
             writes,
             vec![
-                KeyWrite::Delete(syskv::member_key(4)),
-                KeyWrite::Delete(syskv::node_addrs_key(4)),
-                KeyWrite::Delete(syskv::cp_member_addr_key(4)),
+                KeyWrite::Delete(syskv::member_key(&nid(4))),
+                KeyWrite::Delete(syskv::node_addrs_key(&nid(4))),
+                KeyWrite::Delete(syskv::cp_member_addr_key(&nid(4))),
             ]
         );
     }
 
     #[test]
-    fn allocate_node_id_writes_member_ledger_entry_and_counter() {
+    fn register_node_writes_member_and_addrs_atomically() {
         let mut meta = Metadata::default();
-        let command = MetaCommand::AllocateNodeId {
-            nonce: "join-1".to_string(),
+        let addrs = NodeAddrs {
+            internal: "127.0.0.1:9910".to_string(),
+            client: "127.0.0.1:9010".to_string(),
+            admin: "127.0.0.1:9510".to_string(),
+            role: "combined".to_string(),
+        };
+        let command = MetaCommand::RegisterNode {
+            node: nid(910),
+            addrs: addrs.clone(),
             labels: BTreeMap::new(),
         };
         let (outcome, writes) = apply_and_derive_mirror(&mut meta, &command);
         assert_eq!(outcome, ApplyOutcome::Applied);
-        let node_id = meta.node_id_allocations["join-1"];
         assert_eq!(
             writes,
             vec![
-                put_json(syskv::member_key(node_id), &meta.members[&node_id]),
-                KeyWrite::Put(
-                    syskv::node_id_alloc_key("join-1"),
-                    node_id.to_be_bytes().to_vec()
-                ),
-                put_counter(NEXT_ALLOC_ID_COUNTER, meta.next_alloc_id),
+                put_json(syskv::member_key(&nid(910)), &meta.members[&nid(910)]),
+                put_json(syskv::node_addrs_key(&nid(910)), &addrs),
             ]
         );
 
-        // Idempotent replay of the same nonce mints nothing new.
+        // Idempotent replay of an identical registration mints nothing new.
         let (outcome, writes) = apply_and_derive_mirror(&mut meta, &command);
         assert_eq!(outcome, ApplyOutcome::NoOp);
         assert!(writes.is_empty());
@@ -989,7 +1023,7 @@ mod tests {
         let mut direct = Metadata::default();
         let commands = [
             MetaCommand::UpsertMember {
-                node: 1,
+                node: nid(1),
                 labels: BTreeMap::new(),
                 status: NodeStatus::Active,
             },
@@ -997,7 +1031,7 @@ mod tests {
                 tablet: TabletId(1),
                 table: Some("t".to_string()),
                 range: KeyRange::whole(),
-                replicas: vec![1],
+                replicas: vec![nid(1)],
             },
             MetaCommand::SetTabletPolicy {
                 tablet: TabletId(1),
@@ -1010,8 +1044,14 @@ mod tests {
             MetaCommand::CreateKeyspace {
                 keyspace: "ks".to_string(),
             },
-            MetaCommand::AllocateNodeId {
-                nonce: "join-1".to_string(),
+            MetaCommand::RegisterNode {
+                node: nid(2),
+                addrs: NodeAddrs {
+                    internal: "127.0.0.1:9902".to_string(),
+                    client: "127.0.0.1:9002".to_string(),
+                    admin: "127.0.0.1:9502".to_string(),
+                    role: "combined".to_string(),
+                },
                 labels: BTreeMap::new(),
             },
         ];
@@ -1052,15 +1092,20 @@ mod tests {
             tablet: TabletId(1),
             table: Some("t".to_string()),
             range: KeyRange::whole().split_at(&[5]).unwrap().0,
-            replicas: vec![1],
+            replicas: vec![nid(1)],
         });
         let right_range = KeyRange::whole().split_at(&[5]).unwrap().1;
         base.tablets.insert(
             TabletId(2),
-            Tablet::with_table(TabletId(2), Some("t".to_string()), right_range, vec![1]),
+            Tablet::with_table(
+                TabletId(2),
+                Some("t".to_string()),
+                right_range,
+                vec![nid(1)],
+            ),
         );
-        base.cp_member_addrs.insert(99, "addr:1".to_string());
-        base.cp_member_tablets.insert(99, TabletId(2));
+        base.cp_member_addrs.insert(nid(99), "addr:1".to_string());
+        base.cp_member_tablets.insert(nid(99), TabletId(2));
 
         let command = MetaCommand::MergeTablets {
             left: TabletId(1),

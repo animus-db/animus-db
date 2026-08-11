@@ -64,24 +64,24 @@
 //!   gets a clean `409` it can retry, not a hang or a silent no-op, and the
 //!   retry succeeds once the winner has committed.
 //! - [`omitted_node_add_mints_an_id_and_converges_to_a_live_voter`] (ADR 0037
-//!   hardening trio's PR3 — wires ADR 0036's allocator into `control-add`,
-//!   closing ADR 0037's own "Coordination with ADR 0036" deferral):
-//!   `POST /admin/control/member/add` with `node` omitted mints a fresh id
-//!   from `MetaCommand::AllocateNodeId` instead of requiring one, at/above
-//!   `ALLOC_ID_BASE`, and converges to a live voter exactly like an
-//!   operator-supplied id does.
+//!   hardening trio's PR3, re-based onto ADR 0040 Decision B/C in PR4):
+//!   `POST /admin/control/member/add` with `node` omitted self-mints a fresh
+//!   id (`NodeId::mint`) instead of requiring one, and converges to a live
+//!   voter exactly like an operator-supplied id does.
 //! - [`concurrent_omitted_node_adds_mint_distinct_ids_and_both_become_voters`]:
 //!   the omitted-node dual of `concurrent_control_add_surfaces_in_flight_as_
 //!   a_clean_retryable_error` — two concurrent omitted-node adds each mint
-//!   (the allocator itself never collides), but their `change_membership`
-//!   calls race like any other concurrent pair; the loser retries (a fresh
-//!   omitted-node call, necessarily minting a second distinct id) and both a
-//!   winner and a second id eventually become voters.
-//! - [`add_control_member_collision_shapes`] gained a third case: manually
-//!   targeting the allocated range (`node` at/above `ALLOC_ID_BASE`) stays
-//!   refused even now that this same action can mint ids there itself for an
-//!   omitted `node` — the refusal is unconditional for an operator-supplied
-//!   id, never bypassed.
+//!   (a 128-bit mint colliding is astronomically unlikely, and the
+//!   registration CAS would catch it structurally even if it happened), but
+//!   their `change_membership` calls race like any other concurrent pair;
+//!   the loser retries (a fresh omitted-node call, necessarily minting a
+//!   second distinct id) and both a winner and a second id eventually become
+//!   voters.
+//! - [`add_control_member_collision_shapes`] (ADR 0040 Decision C): an id
+//!   that already names an existing data-plane member now succeeds
+//!   (promotion, not a conflict — see that test's own doc for why this
+//!   flipped from a 409 refusal); there is no more reserved numeric range to
+//!   refuse manually targeting.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -89,6 +89,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use animus_control::node::CONTROL_PEER_LIVENESS_TIMEOUT;
+use animus_env::nid;
 use animusd::config::NodeRole;
 use animusd::{ClusterConfig, MetaCommand, Node, NodeStatus, RoleAddrs};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -147,13 +148,24 @@ async fn control_members(admin_addr: SocketAddr) -> (u16, serde_json::Value) {
 /// *and* data ids, so there is no id within `{0,1,2}` that is "a data-plane
 /// member but not a control voter" — this mints a genuinely distinct one).
 async fn add_member(admin_addr: SocketAddr, node: u64) -> (u16, serde_json::Value) {
-    let body = serde_json::json!({"node": node}).to_string();
+    let body = serde_json::json!({"node": nid(node).to_string()}).to_string();
     admin(admin_addr, "POST", "/admin/member/add", Some(&body)).await
 }
 
 async fn add_control_member(
     admin_addr: SocketAddr,
     node: u64,
+    addr: SocketAddr,
+) -> (u16, serde_json::Value) {
+    add_control_member_raw(admin_addr, &nid(node).to_string(), addr).await
+}
+
+/// The raw-string-id form of [`add_control_member`] — needed to submit an id
+/// this test knows in advance is not `nid`-shaped (e.g. an allocator-range
+/// `"alloc-…"` id, ADR 0040 PR3's reserved mint prefix).
+async fn add_control_member_raw(
+    admin_addr: SocketAddr,
+    node: &str,
     addr: SocketAddr,
 ) -> (u16, serde_json::Value) {
     let body = serde_json::json!({"node": node, "addr": addr.to_string()}).to_string();
@@ -178,6 +190,15 @@ async fn add_control_member_allocated(
     admin(admin_addr, "POST", "/admin/control/member/add", Some(&body)).await
 }
 
+/// Whether `id` looks like a [`NodeId::mint`](animus_env::NodeId::mint)
+/// output — exactly 22 chars (128 bits of base64url, unpadded). ADR 0040
+/// retired the ADR 0036 allocator's reserved-range/prefix convention along
+/// with the allocator itself; uniqueness is now enforced structurally by the
+/// registration CAS, not a namespace, so this is a shape sanity check only.
+fn looks_minted(id: &animus_env::NodeId) -> bool {
+    id.as_str().chars().count() == 22
+}
+
 async fn remove_control_member(admin_addr: SocketAddr, node: u64) -> (u16, serde_json::Value) {
     remove_control_member_forced(admin_addr, node, false).await
 }
@@ -189,7 +210,7 @@ async fn remove_control_member_forced(
     node: u64,
     force: bool,
 ) -> (u16, serde_json::Value) {
-    let body = serde_json::json!({"node": node, "force": force}).to_string();
+    let body = serde_json::json!({"node": nid(node).to_string(), "force": force}).to_string();
     admin(
         admin_addr,
         "POST",
@@ -199,10 +220,12 @@ async fn remove_control_member_forced(
     .await
 }
 
-fn voters_of(body: &serde_json::Value) -> Option<Vec<u64>> {
-    body["voters"]
-        .as_array()
-        .map(|a| a.iter().filter_map(serde_json::Value::as_u64).collect())
+fn voters_of(body: &serde_json::Value) -> Option<Vec<animus_env::NodeId>> {
+    body["voters"].as_array().map(|a| {
+        a.iter()
+            .filter_map(|v| v.as_str()?.parse::<animus_env::NodeId>().ok())
+            .collect()
+    })
 }
 
 /// Bring up an `n`-node **combined-mode** core, one process per node — the
@@ -212,6 +235,7 @@ async fn bring_up_combined(n: usize, dir: &Path) -> (Vec<Node>, ClusterConfig) {
         let addrs = support::free_addrs(n * 5);
         let nodes_cfg: Vec<RoleAddrs> = (0..n)
             .map(|i| RoleAddrs {
+                id: animusd::config::node_id(i),
                 role: NodeRole::Both,
                 internal: addrs[5 * i],
                 client: addrs[5 * i + 1],
@@ -281,6 +305,7 @@ async fn join_control_nonvoter(
     for attempt in 0..16 {
         let raw = support::free_addrs(5);
         let addrs = RoleAddrs {
+            id: nid(new_control_id),
             role: NodeRole::Control,
             internal: raw[0],
             client: raw[1],
@@ -289,8 +314,8 @@ async fn join_control_nonvoter(
             admin: raw[4],
         };
         let bound = match animusd::Node::bind_control(
-            new_control_id,
-            addrs,
+            nid(new_control_id),
+            addrs.clone(),
             dir.join(format!("grow-{attempt}")),
         )
         .await
@@ -341,7 +366,7 @@ async fn grow_control_group_converges_everywhere() {
     for &a in &control_admin {
         let (status, body) = control_members(a).await;
         assert_eq!(status, 200, "control/members failed: {body}");
-        assert_eq!(voters_of(&body), Some(vec![0, 1, 2]));
+        assert_eq!(voters_of(&body), Some(vec![nid(0), nid(1), nid(2)]));
     }
 
     // Bring up a 5th node as a quiet non-voter (id 4 — free: `bring_up_split`'s
@@ -351,6 +376,33 @@ async fn grow_control_group_converges_everywhere() {
     let (grown, grown_addrs) = join_control_nonvoter(&config, new_id, dir.path()).await;
     let grown_admin = grown.admin_addr();
     let grown_control_addr = grown_addrs.internal;
+
+    // Wait for `grown`'s own one-shot self-registration (`MetaCommand::
+    // RegisterNode`'s CAS, ADR 0040 PR4) to land on the real cluster before
+    // adding it as a control voter — the same "confirm it's up first"
+    // sequencing `runtime_added_voter_survives_leadership_change_to_a_
+    // different_original_voter` documents (mirrors the real operator
+    // runbook, plan §3): calling `control/member/add` before this node's own
+    // registration has landed races two *independent* proposals for the
+    // same id's `node_addrs` entry against each other, and the CAS
+    // correctly refuses whichever loses that race rather than silently
+    // clobbering it (unlike the pre-ADR-0040 blind-overwrite behavior this
+    // supersedes) — so the test must sequence around it, not rely on
+    // eventual convergence through a rejection.
+    timeout(Duration::from_secs(15), async {
+        loop {
+            if control_nodes[leader_idx]
+                .metadata()
+                .node_addrs
+                .contains_key(&nid(new_id))
+            {
+                return;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("grown node's own self-registration never landed on the real cluster");
 
     // Add it via the admin endpoint, on the leader.
     let (status, body) =
@@ -366,7 +418,7 @@ async fn grow_control_group_converges_everywhere() {
         let converged = async {
             loop {
                 let (status, body) = control_members(a).await;
-                if status == 200 && voters_of(&body) == Some(vec![0, 1, 2, 4]) {
+                if status == 200 && voters_of(&body) == Some(vec![nid(0), nid(1), nid(2), nid(4)]) {
                     return;
                 }
                 sleep(Duration::from_millis(200)).await;
@@ -383,15 +435,19 @@ async fn grow_control_group_converges_everywhere() {
     }
 }
 
-/// Refusal to add a colliding id: an id that already names a live control
-/// voter is an idempotent success (not an error); an id that already names a
-/// data-plane member is refused; an id at/above `ALLOC_ID_BASE` is refused
-/// **even after** the ADR 0037 hardening trio's PR3 taught this same action
-/// to mint ids in that exact range for an omitted `node` — manually
-/// targeting the allocated range stays blocked regardless (see
-/// `admin_add_control_member`'s doc: only its own `None` branch may skip this
-/// check, for the id *it itself* just minted, never for an operator-supplied
-/// one).
+/// Collision shapes for `POST /admin/control/member/add` (ADR 0040 Decision
+/// C, re-basing the ADR 0037/hardening-trio behavior this test used to
+/// cover): an id that already names a live control voter is an idempotent
+/// success (not an error, unchanged); an id that already names an existing
+/// **data-plane** member is now **also** an idempotent success — promoting an
+/// already-registered member to a control voter is the common case, not a
+/// conflict, since ADR 0040 PR1 unified the id space (one identity per node,
+/// no more separate control-id range for an existing member to collide
+/// with). There is no more reserved numeric range to refuse manually
+/// targeting — `ALLOC_ID_BASE` and the whole allocator are gone; the only
+/// remaining collision shape is a **genuinely different** registration for
+/// the same id (proven at the `RegisterNode` CAS level in `animus-control`'s
+/// `tests/register_node_cas.rs`, not re-proven here).
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn add_control_member_collision_shapes() {
     let dir = tempfile::tempdir().unwrap();
@@ -409,10 +465,10 @@ async fn add_control_member_collision_shapes() {
         );
     }
 
-    // Collides with an existing data-plane member that is not a control
-    // voter (a plain growth-style member registered directly via
-    // `POST /admin/member/add`, at an id well outside this combined
-    // cluster's own bring-up ids `{0,1,2}` and below `ALLOC_ID_BASE`).
+    // An existing data-plane member (not yet a control voter) — promoting it
+    // now succeeds (ADR 0040: no more separate control-id range to collide
+    // with; "must already be a registered member OR get registered in the
+    // same action" — this exercises the "already a member" half).
     {
         let (status, body) = add_member(admin_addrs[leader], 50).await;
         assert_eq!(
@@ -421,24 +477,8 @@ async fn add_control_member_collision_shapes() {
         );
         let (status, body) = add_control_member(admin_addrs[leader], 50, admin_addrs[leader]).await;
         assert_eq!(
-            status, 409,
-            "adding a control voter at an existing member's id should be refused: {body}"
-        );
-    }
-
-    // At/above the cluster-allocated id range: refused outright, still, even
-    // though this same action now mints ids in exactly this range for its
-    // own omitted-`node` path (see this test's own doc).
-    {
-        let (status, body) = add_control_member(
-            admin_addrs[leader],
-            animus_control::meta::ALLOC_ID_BASE,
-            admin_addrs[leader],
-        )
-        .await;
-        assert_eq!(
-            status, 409,
-            "adding a control voter at/above ALLOC_ID_BASE should be refused: {body}"
+            status, 200,
+            "promoting an existing data-plane member to a control voter should succeed: {body}"
         );
     }
 
@@ -523,7 +563,7 @@ async fn remove_control_voter_refusals_transfer_and_quorum_warnings() {
             if status == 200
                 && let Some(v) = voters_of(&body)
                 && v.len() == 2
-                && !v.contains(&non_leader_voter)
+                && !v.contains(&nid(non_leader_voter))
             {
                 return;
             }
@@ -641,9 +681,9 @@ async fn runtime_added_voter_survives_leadership_change_to_a_different_original_
     let (grown, grown_addrs) = join_control_nonvoter(&config, new_id, dir.path()).await;
     let grown_control_addr = grown_addrs.internal;
 
-    // Wait for `grown`'s own one-shot self-registration (`ClientCtx::
-    // register_node_addrs`, relayed since it starts life a non-voter) to
-    // land on the REAL cluster (checked via an original voter's applied
+    // Wait for `grown`'s own one-shot self-registration (`MetaCommand::
+    // RegisterNode`'s CAS, ADR 0040 PR4, relayed since it starts life a
+    // non-voter) to land on the REAL cluster (checked via an original voter's applied
     // `Metadata` — `grown`'s OWN view stays permanently empty until it is
     // actually added as a voter below: a quiet non-voter receives no real
     // Raft replication at all, by design, so it structurally can never
@@ -659,7 +699,11 @@ async fn runtime_added_voter_survives_leadership_change_to_a_different_original_
     // not the race a too-hasty add would hit.
     let self_registered_on_cluster = async {
         loop {
-            if nodes[adder].metadata().node_addrs.contains_key(&new_id) {
+            if nodes[adder]
+                .metadata()
+                .node_addrs
+                .contains_key(&nid(new_id))
+            {
                 return;
             }
             sleep(Duration::from_millis(50)).await;
@@ -684,7 +728,7 @@ async fn runtime_added_voter_survives_leadership_change_to_a_different_original_
         let converged = async {
             loop {
                 let (status, body) = control_members(a).await;
-                if status == 200 && voters_of(&body) == Some(vec![0, 1, 2, 3]) {
+                if status == 200 && voters_of(&body) == Some(vec![nid(0), nid(1), nid(2), nid(3)]) {
                     return;
                 }
                 sleep(Duration::from_millis(100)).await;
@@ -725,7 +769,7 @@ async fn runtime_added_voter_survives_leadership_change_to_a_different_original_
     // The config is unaffected by the transfer alone — still all 4 voters.
     let (status, body) = control_members(admin_addrs[new_leader_idx]).await;
     assert_eq!(status, 200, "control/members failed: {body}");
-    assert_eq!(voters_of(&body), Some(vec![0, 1, 2, 3]));
+    assert_eq!(voters_of(&body), Some(vec![nid(0), nid(1), nid(2), nid(3)]));
 
     // The real proof: propose something new *through the new (different)
     // leader* and confirm it replicates to the runtime-added voter's own
@@ -738,7 +782,7 @@ async fn runtime_added_voter_survives_leadership_change_to_a_different_original_
     let label_key = "adr0037_pr4_regression".to_string();
     assert!(
         nodes[new_leader_idx].propose_meta(MetaCommand::UpsertMember {
-            node: 12_345,
+            node: nid(12_345),
             labels: BTreeMap::from([(label_key.clone(), "1".to_string())]),
             status: NodeStatus::Down,
         }),
@@ -749,7 +793,7 @@ async fn runtime_added_voter_survives_leadership_change_to_a_different_original_
             if grown
                 .metadata()
                 .members
-                .get(&12_345)
+                .get(&nid(12_345))
                 .and_then(|m| m.labels.get(&label_key))
                 .is_some()
             {
@@ -849,7 +893,7 @@ async fn removing_a_live_voter_while_another_is_already_dead_is_refused_without_
             v.sort_unstable();
             v
         }),
-        Some(vec![0, 1, 2]),
+        Some(vec![nid(0), nid(1), nid(2)]),
         "a refused removal must not change the live voter set: {body}"
     );
 
@@ -1057,7 +1101,7 @@ async fn concurrent_control_add_surfaces_in_flight_as_a_clean_retryable_error() 
             let (status, body) = control_members(leader_admin).await;
             if status == 200
                 && let Some(v) = voters_of(&body)
-                && v.contains(&winner_id)
+                && v.contains(&nid(winner_id))
             {
                 return;
             }
@@ -1090,16 +1134,14 @@ async fn concurrent_control_add_surfaces_in_flight_as_a_clean_retryable_error() 
     }
 }
 
-/// **ADR 0037 hardening trio's PR3**: `POST /admin/control/member/add` with
-/// `node` omitted mints a fresh id from the control plane's own ADR 0036
-/// allocator (`MetaCommand::AllocateNodeId`, via `ClientCtx::allocate_node_id`
-/// — the exact same helper the wire-level join path uses) instead of
+/// **ADR 0037 hardening trio's PR3, re-based onto ADR 0040 Decision B/C in
+/// PR4**: `POST /admin/control/member/add` with `node` omitted self-mints a
+/// fresh id (`NodeId::mint` off the leader's own bound `Env`) instead of
 /// requiring an operator-chosen one, then proceeds through the identical
-/// address-registration + `change_membership` tail — closing ADR 0037's own
-/// "Coordination with ADR 0036" deferral. Proves: the response carries the
-/// minted id, it is at/above `ALLOC_ID_BASE` (the allocator's disjoint
-/// range), and it converges to a live voter via the existing
-/// `GET /admin/control/members` poll — the same convergence signal
+/// address-registration (now `RegisterNode`'s CAS) + `change_membership`
+/// tail. Proves: the response carries the minted id (shaped like a real
+/// mint — [`looks_minted`]), and it converges to a live voter via the
+/// existing `GET /admin/control/members` poll — the same convergence signal
 /// `concurrent_control_add_surfaces_in_flight_as_a_clean_retryable_error`
 /// already trusts for the operator-supplied path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -1116,13 +1158,14 @@ async fn omitted_node_add_mints_an_id_and_converges_to_a_live_voter() {
         status, 200,
         "omitted-node control/member/add failed: {body}"
     );
-    let minted = body["node"]
-        .as_u64()
-        .expect("the response carries the minted `node`");
+    let minted: animus_env::NodeId = body["node"]
+        .as_str()
+        .expect("the response carries the minted `node`")
+        .parse()
+        .expect("minted node id parses");
     assert!(
-        minted >= animus_control::meta::ALLOC_ID_BASE,
-        "minted id {minted} should be at/above ALLOC_ID_BASE ({})",
-        animus_control::meta::ALLOC_ID_BASE
+        looks_minted(&minted),
+        "minted id {minted} should look like a NodeId::mint output"
     );
 
     let converged = async {
@@ -1182,13 +1225,15 @@ async fn concurrent_omitted_node_adds_mint_distinct_ids_and_both_become_voters()
             "unexpected status for a concurrent omitted-node add: {body}"
         );
     }
-    let successes: Vec<u64> = [&r1, &r2]
+    let successes: Vec<animus_env::NodeId> = [&r1, &r2]
         .iter()
         .filter(|(status, _)| *status == 200)
         .map(|(_, body)| {
             body["node"]
-                .as_u64()
+                .as_str()
                 .expect("a successful omitted-node add carries the minted `node`")
+                .parse()
+                .expect("minted node id parses")
         })
         .collect();
     assert_eq!(
@@ -1196,10 +1241,10 @@ async fn concurrent_omitted_node_adds_mint_distinct_ids_and_both_become_voters()
         1,
         "exactly one concurrent omitted-node add should win outright: r1={r1:?}, r2={r2:?}"
     );
-    let winner_id = successes[0];
+    let winner_id = successes[0].clone();
     assert!(
-        winner_id >= animus_control::meta::ALLOC_ID_BASE,
-        "minted id {winner_id} should be at/above ALLOC_ID_BASE"
+        looks_minted(&winner_id),
+        "minted id {winner_id} should look like a NodeId::mint output"
     );
 
     let winner_converged = async {
@@ -1225,21 +1270,21 @@ async fn concurrent_omitted_node_adds_mint_distinct_ids_and_both_become_voters()
     while tokio::time::Instant::now() < retry_deadline {
         let (status, body) = add_control_member_allocated(leader_admin, admin_addrs[leader]).await;
         if status == 200 {
-            second_id = body["node"].as_u64();
+            second_id = body["node"].as_str().and_then(|s| s.parse().ok());
             break;
         }
         last_body = body;
         sleep(Duration::from_millis(150)).await;
     }
-    let second_id = second_id
+    let second_id: animus_env::NodeId = second_id
         .unwrap_or_else(|| panic!("the retried omitted-node add never succeeded: {last_body}"));
     assert_ne!(
         second_id, winner_id,
         "the retry must mint an id distinct from the winner's"
     );
     assert!(
-        second_id >= animus_control::meta::ALLOC_ID_BASE,
-        "minted id {second_id} should be at/above ALLOC_ID_BASE"
+        looks_minted(&second_id),
+        "minted id {second_id} should look like a NodeId::mint output"
     );
 
     let second_converged = async {

@@ -9,6 +9,7 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use animus_consensus::{AccordNode, Key, TxnId};
+use animus_env::nid;
 use animus_sim::{SimEnv, Simulator};
 
 const NODES: [u64; 3] = [0, 1, 2];
@@ -17,7 +18,7 @@ fn cluster(seed: u64) -> (Simulator, Vec<AccordNode<SimEnv>>) {
     let sim = Simulator::new(seed);
     let nodes = NODES
         .iter()
-        .map(|&id| AccordNode::start(sim.env(id), NODES.to_vec()))
+        .map(|&id| AccordNode::start(sim.env(nid(id)), NODES.iter().copied().map(nid).collect()))
         .collect();
     (sim, nodes)
 }
@@ -50,7 +51,10 @@ fn single_transaction_commits_on_all_replicas() {
     );
 
     // Every replica committed it at the same execution timestamp.
-    let exec: Vec<Option<_>> = nodes.iter().map(|n| n.committed_execute_at(txn)).collect();
+    let exec: Vec<Option<_>> = nodes
+        .iter()
+        .map(|n| n.committed_execute_at(txn.clone()))
+        .collect();
     assert!(
         exec.iter().all(|e| *e == exec[0]),
         "execution timestamp diverged across replicas: {exec:?} (seed={seed})"
@@ -117,11 +121,12 @@ fn disjoint_transactions_have_no_dependency() {
 
     for n in &nodes {
         assert!(
-            n.committed_execute_at(a).is_some() && n.committed_execute_at(b).is_some(),
+            n.committed_execute_at(a.clone()).is_some()
+                && n.committed_execute_at(b.clone()).is_some(),
             "both disjoint txns must commit everywhere (seed={seed})"
         );
-        let deps_a = n.committed_deps(a).unwrap_or_default();
-        let deps_b = n.committed_deps(b).unwrap_or_default();
+        let deps_a = n.committed_deps(a.clone()).unwrap_or_default();
+        let deps_b = n.committed_deps(b.clone()).unwrap_or_default();
         assert!(
             !deps_a.contains(&b) && !deps_b.contains(&a),
             "disjoint txns must not depend on each other (seed={seed})"
@@ -148,8 +153,8 @@ fn run_is_reproducible_from_seed() {
 fn assert_committed_consistently(nodes: &[AccordNode<SimEnv>], a: TxnId, b: TxnId, seed: u64) {
     let mut order: Option<bool> = None;
     for (i, n) in nodes.iter().enumerate() {
-        let ea = n.committed_execute_at(a);
-        let eb = n.committed_execute_at(b);
+        let ea = n.committed_execute_at(a.clone());
+        let eb = n.committed_execute_at(b.clone());
         assert!(
             ea.is_some() && eb.is_some(),
             "node {i} missing a commit: a={ea:?} b={eb:?} (seed={seed})"
@@ -174,7 +179,7 @@ fn assert_committed_consistently(nodes: &[AccordNode<SimEnv>], a: TxnId, b: TxnI
     let a_first = order.unwrap();
     let (first, second) = if a_first { (a, b) } else { (b, a) };
     for (i, n) in nodes.iter().enumerate() {
-        let deps_second = n.committed_deps(second).unwrap_or_default();
+        let deps_second = n.committed_deps(second.clone()).unwrap_or_default();
         assert!(
             deps_second.contains(&first),
             "node {i}: later txn must depend on earlier conflicting txn (seed={seed})"

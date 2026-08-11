@@ -55,7 +55,7 @@ pub enum WalRecord {
     /// A coordinator-chosen execution timestamp and dependency set were adopted
     /// via `Accept`. `accepted_ballot` is the proposal ballot under which they
     /// were adopted (ADR 0011, recovery ballots): the original coordinator's
-    /// [`Ballot::ZERO`], or a recovery coordinator's higher ballot. A recovering
+    /// [`Ballot::zero()`], or a recovery coordinator's higher ballot. A recovering
     /// node reports it in `RecoverOk` so a later recoverer adopts the
     /// highest-ballot proposal, and a restarted replica keeps its promise.
     Accepted {
@@ -63,7 +63,7 @@ pub enum WalRecord {
         execute_at: Timestamp,
         deps: BTreeSet<TxnId>,
         /// The ballot under which this `(execute_at, deps)` was accepted.
-        /// `#[serde(default)]` ⇒ [`Ballot::ZERO`] for forward-compat.
+        /// `#[serde(default)]` ⇒ [`Ballot::zero()`] for forward-compat.
         #[serde(default)]
         accepted_ballot: Ballot,
     },
@@ -72,7 +72,7 @@ pub enum WalRecord {
     /// recoverers). Recorded durably so a restarted replica does not renege on a
     /// promise and let a superseded recoverer win. Additive — older WALs simply
     /// have no `Promised` records, so a recovered replica's promise floor is
-    /// [`Ballot::ZERO`].
+    /// [`Ballot::zero()`].
     Promised { txn: TxnId, ballot: Ballot },
     /// The final `(execute_at, deps)` was recorded via `Commit`. This is the
     /// durable agreement point: after this record is fsynced the replica may
@@ -93,11 +93,11 @@ pub enum WalRecord {
         /// Whether the transaction is read-only.
         #[serde(default)]
         read_only: bool,
-        /// The **ballot** this commit was decided under (ADR 0011): `Ballot::ZERO`
+        /// The **ballot** this commit was decided under (ADR 0011): `Ballot::zero()`
         /// for the original coordinator, the recovery ballot for a recovered one.
         /// Recorded so a restarted replica keeps the highest commit-ballot it saw
         /// and still fences a stale lower-ballot `Commit`. `#[serde(default)]` ⇒
-        /// `Ballot::ZERO` for forward-compat.
+        /// `Ballot::zero()` for forward-compat.
         #[serde(default)]
         commit_ballot: Ballot,
     },
@@ -126,7 +126,7 @@ pub enum WalRecord {
 impl WalRecord {
     /// The transaction this record concerns. A [`WalRecord::Snapshot`] covers many
     /// transactions at once, so it has no single id — it returns
-    /// [`TxnId::ZERO`](crate::Timestamp::ZERO); callers handle `Snapshot`
+    /// [`TxnId::ZERO`](crate::Timestamp::zero()); callers handle `Snapshot`
     /// explicitly (see [`PersistedState::replay`]) and never key it by `txn()`.
     #[must_use]
     pub fn txn(&self) -> TxnId {
@@ -135,8 +135,8 @@ impl WalRecord {
             | WalRecord::Accepted { txn, .. }
             | WalRecord::Committed { txn, .. }
             | WalRecord::Promised { txn, .. }
-            | WalRecord::Applied { txn } => *txn,
-            WalRecord::Snapshot { .. } => crate::timestamp::Timestamp::ZERO,
+            | WalRecord::Applied { txn } => txn.clone(),
+            WalRecord::Snapshot { .. } => crate::timestamp::Timestamp::zero(),
         }
     }
 }
@@ -164,16 +164,16 @@ pub struct PersistedTxn {
     pub read_only: bool,
     /// The highest recovery ballot this replica promised durably (ADR 0011). A
     /// restarted replica must not accept a `Recover`/`Accept` below this, or a
-    /// superseded recoverer could win. [`Ballot::ZERO`] if it never promised.
+    /// superseded recoverer could win. [`Ballot::zero()`] if it never promised.
     pub promised: Ballot,
     /// The ballot under which `execute_at`/`deps` were last accepted (via
     /// `Accept`). Reported in `RecoverOk` so a later recoverer adopts the
-    /// highest-ballot proposal. [`Ballot::ZERO`] if only PreAccepted.
+    /// highest-ballot proposal. [`Ballot::zero()`] if only PreAccepted.
     pub accepted_ballot: Ballot,
     /// The highest ballot a **`Commit`** for this transaction was decided under
     /// (ADR 0011). A restarted replica fences any later `Commit` below this, so a
     /// stale original-coordinator commit cannot revert a recovered decision.
-    /// [`Ballot::ZERO`] if not committed, or committed only by the original.
+    /// [`Ballot::zero()`] if not committed, or committed only by the original.
     pub commit_ballot: Ballot,
 }
 
@@ -214,7 +214,7 @@ impl PersistedState {
                     entry.keys.extend(keys);
                     entry.write_keys.extend(write_keys);
                     entry.write_values.extend(write_values);
-                    entry.execute_at = entry.execute_at.max(execute_at);
+                    entry.execute_at = entry.execute_at.clone().max(execute_at);
                     entry.deps.extend(deps);
                     entry.phase = entry.phase.max_phase(Phase::PreAccepted);
                     entry.read_only |= read_only;
@@ -226,19 +226,20 @@ impl PersistedState {
                     ..
                 } => {
                     let entry = state.txns.entry(txn).or_default();
-                    entry.execute_at = entry.execute_at.max(execute_at);
+                    entry.execute_at = entry.execute_at.clone().max(execute_at);
                     entry.deps.extend(deps);
                     entry.phase = entry.phase.max_phase(Phase::Accepted);
                     // The accepted ballot only advances (a later Accept ran under
                     // a higher ballot); keep the max so the recovered replica
                     // reports the most-recent proposal it ever accepted.
-                    entry.accepted_ballot = entry.accepted_ballot.max(accepted_ballot);
+                    entry.accepted_ballot =
+                        entry.accepted_ballot.clone().max(accepted_ballot.clone());
                     // Accepting under a ballot also implies having promised it.
-                    entry.promised = entry.promised.max(accepted_ballot);
+                    entry.promised = entry.promised.clone().max(accepted_ballot);
                 }
                 WalRecord::Promised { ballot, .. } => {
                     let entry = state.txns.entry(txn).or_default();
-                    entry.promised = entry.promised.max(ballot);
+                    entry.promised = entry.promised.clone().max(ballot);
                 }
                 WalRecord::Committed {
                     keys,
@@ -264,12 +265,12 @@ impl PersistedState {
                     if not_yet_committed || commit_ballot >= entry.commit_ballot {
                         entry.execute_at = execute_at;
                         entry.deps = deps;
-                        entry.commit_ballot = entry.commit_ballot.max(commit_ballot);
+                        entry.commit_ballot = entry.commit_ballot.clone().max(commit_ballot);
                     }
                     entry.phase = entry.phase.max_phase(Phase::Committed);
                 }
                 WalRecord::Applied { .. } => {
-                    let entry = state.txns.entry(txn).or_default();
+                    let entry = state.txns.entry(txn.clone()).or_default();
                     if !entry.applied {
                         entry.applied = true;
                         state.applied_order.push(txn);
@@ -287,14 +288,15 @@ impl PersistedState {
                         entry.keys.extend(st.keys);
                         entry.write_keys.extend(st.write_keys);
                         entry.write_values.extend(st.write_values);
-                        entry.execute_at = entry.execute_at.max(st.execute_at);
+                        entry.execute_at = entry.execute_at.clone().max(st.execute_at);
                         entry.deps.extend(st.deps);
                         entry.phase = entry.phase.max_phase(st.phase);
                         entry.applied |= st.applied;
                         entry.read_only |= st.read_only;
-                        entry.promised = entry.promised.max(st.promised);
-                        entry.accepted_ballot = entry.accepted_ballot.max(st.accepted_ballot);
-                        entry.commit_ballot = entry.commit_ballot.max(st.commit_ballot);
+                        entry.promised = entry.promised.clone().max(st.promised);
+                        entry.accepted_ballot =
+                            entry.accepted_ballot.clone().max(st.accepted_ballot);
+                        entry.commit_ballot = entry.commit_ballot.clone().max(st.commit_ballot);
                     }
                     // Preserve the snapshotted execution order, appending any txns
                     // not already recorded (the snapshot is the prefix; the tail

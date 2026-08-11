@@ -44,6 +44,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use animus_env::NodeId;
 use animus_tablet::TabletId;
 use animusd::{
     ClientRequest, ClientResponse, ClusterConfig, MetaCommand, Node, RoleAddrs, read_frame,
@@ -68,6 +69,7 @@ async fn bring_up(n: usize, dir: &Path) -> (Vec<Node>, ClusterConfig, Vec<PathBu
         let config = ClusterConfig {
             nodes: (0..n)
                 .map(|i| RoleAddrs {
+                    id: animusd::config::node_id(i),
                     role: animusd::config::NodeRole::Both,
                     internal: a[5 * i],
                     client: a[5 * i + 1],
@@ -140,7 +142,7 @@ async fn admin_get(addr: SocketAddr, path: &str) -> Option<(u16, Value)> {
 /// This node's `(is_leader, voters)` for `tablet` from its node-local
 /// `/admin/raftkv` view, or `None` if the node doesn't host the tablet's group
 /// (never formed, or released) / is unreachable.
-async fn tablet_group(admin_addr: SocketAddr, tablet: TabletId) -> Option<(bool, Vec<u64>)> {
+async fn tablet_group(admin_addr: SocketAddr, tablet: TabletId) -> Option<(bool, Vec<NodeId>)> {
     let (_s, v) = admin_get(admin_addr, "/admin/raftkv").await?;
     let g = v["groups"]
         .as_array()?
@@ -149,7 +151,7 @@ async fn tablet_group(admin_addr: SocketAddr, tablet: TabletId) -> Option<(bool,
     let voters = g["voters"]
         .as_array()?
         .iter()
-        .filter_map(Value::as_u64)
+        .filter_map(|r| r.as_str()?.parse::<NodeId>().ok())
         .collect();
     Some((g["is_leader"].as_bool().unwrap_or(false), voters))
 }
@@ -282,8 +284,8 @@ async fn form_kv_group(nodes: &[Node], clients: &[SocketAddr]) -> usize {
 
 /// Commit a `CasTabletReplicas` on the control leader (epoch-CAS), retrying past
 /// racing epoch bumps / leadership moves until the tablet map shows `replicas`.
-async fn set_replicas(nodes: &[Node], tablet: TabletId, replicas: &[u64]) {
-    let want: std::collections::BTreeSet<u64> = replicas.iter().copied().collect();
+async fn set_replicas(nodes: &[Node], tablet: TabletId, replicas: &[NodeId]) {
+    let want: std::collections::BTreeSet<NodeId> = replicas.iter().cloned().collect();
     let change = async {
         loop {
             if let Some(epoch) = nodes[0].metadata().tablets.get(&tablet).map(|t| t.epoch) {
@@ -298,11 +300,11 @@ async fn set_replicas(nodes: &[Node], tablet: TabletId, replicas: &[u64]) {
                     }
                 }
             }
-            let now: Option<std::collections::BTreeSet<u64>> = nodes[0]
+            let now: Option<std::collections::BTreeSet<NodeId>> = nodes[0]
                 .metadata()
                 .tablets
                 .get(&tablet)
-                .map(|t| t.replicas.iter().copied().collect());
+                .map(|t| t.replicas.iter().cloned().collect());
             if now.as_ref() == Some(&want) {
                 return;
             }
@@ -325,7 +327,7 @@ async fn moved_off_replica_is_stopped_and_its_scope_erased() {
         let (nodes, config, dirs) = bring_up(4, tmp.path()).await;
         await_bootstrap(&nodes).await;
         let raftkv_ids = config.data_ids(); // [0, 1, 2, 3]
-        let spare = raftkv_ids[3];
+        let spare = raftkv_ids[3].clone();
         let clients: Vec<SocketAddr> = config.nodes.iter().map(|a| a.client).collect();
 
         let leader_idx = form_kv_group(&nodes, &clients).await;
@@ -336,12 +338,12 @@ async fn moved_off_replica_is_stopped_and_its_scope_erased() {
         let drop_idx = (0..3)
             .find(|&i| i != leader_idx)
             .expect("a follower replica");
-        let dropped_id = raftkv_ids[drop_idx];
-        let kept: Vec<u64> = raftkv_ids[..3]
+        let dropped_id = raftkv_ids[drop_idx].clone();
+        let kept: Vec<NodeId> = raftkv_ids[..3]
             .iter()
-            .copied()
-            .filter(|&id| id != dropped_id)
-            .chain([spare])
+            .filter(|&id| *id != dropped_id)
+            .cloned()
+            .chain([spare.clone()])
             .collect();
         assert_eq!(kept.len(), 3);
         set_replicas(&nodes, KV_TABLET, &kept).await;
@@ -396,7 +398,7 @@ async fn release_survives_a_restart_replay() {
         let (nodes, config, dirs) = bring_up(4, tmp.path()).await;
         await_bootstrap(&nodes).await;
         let raftkv_ids = config.data_ids();
-        let spare = raftkv_ids[3];
+        let spare = raftkv_ids[3].clone();
         let clients: Vec<SocketAddr> = config.nodes.iter().map(|a| a.client).collect();
 
         // Two tables, both provisioned onto the same first-3 replica set (nodes
@@ -428,7 +430,7 @@ async fn release_survives_a_restart_replay() {
         let drop_idx = (0..3)
             .find(|&i| i != leader_idx)
             .expect("a follower replica");
-        let dropped_id = raftkv_ids[drop_idx];
+        let dropped_id = raftkv_ids[drop_idx].clone();
         // Sanity: the dropped node really is a replica of `other` (so the inverse
         // check below is meaningful).
         assert!(
@@ -439,11 +441,11 @@ async fn release_survives_a_restart_replay() {
                 .is_some_and(|t| t.replicas.contains(&dropped_id)),
             "the dropped node must also be a replica of `other`"
         );
-        let kept: Vec<u64> = raftkv_ids[..3]
+        let kept: Vec<NodeId> = raftkv_ids[..3]
             .iter()
-            .copied()
-            .filter(|&id| id != dropped_id)
-            .chain([spare])
+            .filter(|&id| *id != dropped_id)
+            .cloned()
+            .chain([spare.clone()])
             .collect();
         set_replicas(&nodes, KV_TABLET, &kept).await;
 
@@ -545,7 +547,7 @@ async fn a_joining_spare_is_never_released() {
         let (nodes, config, dirs) = bring_up(4, tmp.path()).await;
         await_bootstrap(&nodes).await;
         let raftkv_ids = config.data_ids();
-        let spare = raftkv_ids[3];
+        let spare = raftkv_ids[3].clone();
         let clients: Vec<SocketAddr> = config.nodes.iter().map(|a| a.client).collect();
 
         let leader_idx = form_kv_group(&nodes, &clients).await;
@@ -555,7 +557,7 @@ async fn a_joining_spare_is_never_released() {
         let kill_idx = (0..3)
             .find(|&i| i != leader_idx)
             .expect("a follower replica");
-        let killed_id = raftkv_ids[kill_idx];
+        let killed_id = raftkv_ids[kill_idx].clone();
         nodes[kill_idx].shutdown();
         let survivors: Vec<usize> = (0..4).filter(|&i| i != kill_idx).collect();
 
@@ -646,7 +648,7 @@ async fn split_then_immediate_release_spares_the_new_siblings_data() {
         let (nodes, config, _dirs) = bring_up(4, tmp.path()).await;
         await_bootstrap(&nodes).await;
         let raftkv_ids = config.data_ids();
-        let spare = raftkv_ids[3];
+        let spare = raftkv_ids[3].clone();
         let clients: Vec<SocketAddr> = config.nodes.iter().map(|a| a.client).collect();
 
         let leader_idx = form_kv_group(&nodes, &clients).await;
@@ -662,12 +664,12 @@ async fn split_then_immediate_release_spares_the_new_siblings_data() {
         let drop_idx = (0..3)
             .find(|&i| i != leader_idx)
             .expect("a follower replica");
-        let dropped_id = raftkv_ids[drop_idx];
-        let kept: Vec<u64> = raftkv_ids[..3]
+        let dropped_id = raftkv_ids[drop_idx].clone();
+        let kept: Vec<NodeId> = raftkv_ids[..3]
             .iter()
-            .copied()
-            .filter(|&id| id != dropped_id)
-            .chain([spare])
+            .filter(|&id| *id != dropped_id)
+            .cloned()
+            .chain([spare.clone()])
             .collect();
 
         // Propose the split AND the parent's replica-set CAS **back-to-back on
@@ -715,7 +717,7 @@ async fn split_then_immediate_release_spares_the_new_siblings_data() {
         );
 
         // Wait for both to actually commit + replicate cluster-wide.
-        let want_replicas: std::collections::BTreeSet<u64> = kept.iter().copied().collect();
+        let want_replicas: std::collections::BTreeSet<NodeId> = kept.iter().cloned().collect();
         let committed = async {
             loop {
                 if nodes.iter().all(|n| {
@@ -724,7 +726,7 @@ async fn split_then_immediate_release_spares_the_new_siblings_data() {
                         && m.tablets.get(&KV_TABLET).is_some_and(|t| {
                             t.replicas
                                 .iter()
-                                .copied()
+                                .cloned()
                                 .collect::<std::collections::BTreeSet<_>>()
                                 == want_replicas
                         })

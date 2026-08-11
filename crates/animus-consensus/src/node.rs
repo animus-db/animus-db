@@ -127,6 +127,12 @@ pub struct AccordNode<E: Env> {
     storage: MemoryEngine,
     /// Results of executed read-only transactions (see [`ReadResults`]).
     reads: ReadResults,
+    /// The closed, static replica set, **sorted** — the canonical order every
+    /// replica derives the same [`node_index`] from, independent of whatever
+    /// order a caller happened to list nodes in. See [`mvcc_version`]'s doc
+    /// for why this exists (ADR 0040 PR3: node ids are strings now, so the
+    /// old `(logical << 16) | node.as_u64()` MVCC encoding no longer applies).
+    all_nodes: Arc<Vec<NodeId>>,
 }
 
 impl<E: Env> Clone for AccordNode<E> {
@@ -136,6 +142,7 @@ impl<E: Env> Clone for AccordNode<E> {
             core: Arc::clone(&self.core),
             storage: self.storage.clone(),
             reads: Arc::clone(&self.reads),
+            all_nodes: Arc::clone(&self.all_nodes),
         }
     }
 }
@@ -149,18 +156,22 @@ impl<E: Env> AccordNode<E> {
         let storage = MemoryEngine::new();
         let core = Arc::new(Mutex::new(AccordCore::new(env.node_id(), &all_nodes)));
         let reads: ReadResults = Arc::new(Mutex::new(BTreeMap::new()));
+        let mut sorted_nodes = all_nodes.clone();
+        sorted_nodes.sort();
+        let all_nodes_sorted = Arc::new(sorted_nodes);
         let node = AccordNode {
             env: env.clone(),
             core: Arc::clone(&core),
             storage: storage.clone(),
             reads: Arc::clone(&reads),
+            all_nodes: Arc::clone(&all_nodes_sorted),
         };
         env.spawn_task(drive(
             env.clone(),
             Arc::clone(&core),
             storage,
             reads,
-            all_nodes,
+            Arc::clone(&all_nodes_sorted),
         ));
         // Retry tick: re-send un-acknowledged protocol messages for in-flight
         // rounds so a dropped fire-and-forget `send` no longer strands a
@@ -171,6 +182,7 @@ impl<E: Env> AccordNode<E> {
             Arc::clone(&core),
             node.storage.clone(),
             Arc::clone(&node.reads),
+            Arc::clone(&all_nodes_sorted),
         ));
         // Failure-detector tick: auto-trigger recovery of a transaction that has
         // been held un-committed past a time bound without progressing — its
@@ -181,6 +193,7 @@ impl<E: Env> AccordNode<E> {
             Arc::clone(&core),
             node.storage.clone(),
             Arc::clone(&node.reads),
+            Arc::clone(&all_nodes_sorted),
         ));
         node
     }
@@ -190,7 +203,14 @@ impl<E: Env> AccordNode<E> {
     /// durable state the burst depends on), and returns the transaction id.
     pub fn submit(&self, keys: BTreeSet<Key>) -> TxnId {
         let (txn, outs) = self.lock().submit(keys);
-        persist_then_ship(&self.env, &self.core, &self.storage, &self.reads, outs);
+        persist_then_ship(
+            &self.env,
+            &self.core,
+            &self.storage,
+            &self.reads,
+            &self.all_nodes,
+            outs,
+        );
         txn
     }
 
@@ -202,7 +222,14 @@ impl<E: Env> AccordNode<E> {
     /// holds for the returned id.
     pub fn submit_read(&self, keys: BTreeSet<Key>) -> TxnId {
         let (txn, outs) = self.lock().submit_read(keys);
-        persist_then_ship(&self.env, &self.core, &self.storage, &self.reads, outs);
+        persist_then_ship(
+            &self.env,
+            &self.core,
+            &self.storage,
+            &self.reads,
+            &self.all_nodes,
+            outs,
+        );
         txn
     }
 
@@ -217,7 +244,14 @@ impl<E: Env> AccordNode<E> {
     /// dependency tracking.
     pub fn submit_rw(&self, read_keys: BTreeSet<Key>, write_keys: BTreeSet<Key>) -> TxnId {
         let (txn, outs) = self.lock().submit_rw(read_keys, write_keys);
-        persist_then_ship(&self.env, &self.core, &self.storage, &self.reads, outs);
+        persist_then_ship(
+            &self.env,
+            &self.core,
+            &self.storage,
+            &self.reads,
+            &self.all_nodes,
+            outs,
+        );
         txn
     }
 
@@ -231,7 +265,14 @@ impl<E: Env> AccordNode<E> {
     /// [`AccordCore::submit_writes`].
     pub fn submit_writes(&self, writes: BTreeMap<Key, Vec<u8>>) -> TxnId {
         let (txn, outs) = self.lock().submit_writes(writes);
-        persist_then_ship(&self.env, &self.core, &self.storage, &self.reads, outs);
+        persist_then_ship(
+            &self.env,
+            &self.core,
+            &self.storage,
+            &self.reads,
+            &self.all_nodes,
+            outs,
+        );
         txn
     }
 
@@ -250,7 +291,14 @@ impl<E: Env> AccordNode<E> {
         writes: BTreeMap<Key, Vec<u8>>,
     ) -> TxnId {
         let (txn, outs) = self.lock().submit_writes_rw(read_keys, writes);
-        persist_then_ship(&self.env, &self.core, &self.storage, &self.reads, outs);
+        persist_then_ship(
+            &self.env,
+            &self.core,
+            &self.storage,
+            &self.reads,
+            &self.all_nodes,
+            outs,
+        );
         txn
     }
 
@@ -259,7 +307,14 @@ impl<E: Env> AccordNode<E> {
     /// consistent commit. See [`AccordCore::recover`].
     pub fn recover(&self, txn: TxnId) {
         let outs = self.lock().recover(txn);
-        persist_then_ship(&self.env, &self.core, &self.storage, &self.reads, outs);
+        persist_then_ship(
+            &self.env,
+            &self.core,
+            &self.storage,
+            &self.reads,
+            &self.all_nodes,
+            outs,
+        );
     }
 
     /// The result of an executed read-only transaction: the writer this replica
@@ -528,8 +583,28 @@ fn storage_key(key: Key) -> Vec<u8> {
 
 /// Bits of the MVCC [`Version`](animus_storage::Version) reserved for the node-id
 /// tiebreak of an execution timestamp (see [`mvcc_version`]). 16 bits ⇒ up to
-/// 65 535 distinct node ids; the high 48 bits carry the logical clock.
+/// 65 535 distinct nodes in the replica set; the high 48 bits carry the logical
+/// clock.
 const MVCC_NODE_BITS: u32 = 16;
+
+/// This node's small, stable position (0-based) in the **sorted**, closed,
+/// static replica set — the canonical index [`mvcc_version`] folds into its
+/// low bits in place of the pre-ADR-0040-PR3 `NodeId::as_u64()` (node ids are
+/// validated strings now, not small dense integers, so they can no longer be
+/// bit-packed directly). Sorting `all_nodes` before indexing — rather than
+/// trusting whatever order a caller happened to list nodes in — is what makes
+/// every replica derive the *same* index for the *same* id regardless of its
+/// own copy's order: the crate's membership is closed and static (no
+/// reconfiguration), so every node constructs `all_nodes` from an identical
+/// *set*, and sorting picks the one order every replica agrees on. Panics if
+/// `node` is not a member of `all_nodes` — a timestamp minted by a node
+/// outside the closed replica set would be a protocol bug, not a data
+/// problem worth threading a `Result` through every call site for.
+fn node_index(all_nodes: &[NodeId], node: &NodeId) -> u64 {
+    all_nodes.binary_search(node).unwrap_or_else(|_| {
+        panic!("timestamp node id {node} is not a member of the closed replica set")
+    }) as u64
+}
 
 /// The MVCC storage version for an Accord execution timestamp, **preserving the
 /// full `(logical, node)` total order** — not just `logical`.
@@ -547,22 +622,29 @@ const MVCC_NODE_BITS: u32 = 16;
 /// on every replica. A read uses the same encoding, so `get_at` still observes
 /// every write ordered before the read and none after.
 ///
+/// **ADR 0040 PR3**: `ts.node` is now a validated string, not a small dense
+/// `u64` — it can no longer be folded into the low bits directly, so this
+/// folds in [`node_index`] (the node's position in the sorted, closed replica
+/// set) instead. The set is closed and static for this crate (no
+/// reconfiguration, ADR 0018/0019's testbed scope), so the index is a stable,
+/// deterministic per-replica-set constant, not a per-run coincidence.
+///
 /// # Contract (hard-checked)
 ///
-/// The encoding is injective only for `ts.node < 2^16` and `ts.logical < 2^48`.
-/// Outside those bounds two distinct timestamps would silently collapse to one
-/// version and per-key LWW would keep an arbitrary winner — a silent-corruption
-/// failure a consistency testbed must never mask — so the guards are hard
-/// `assert!`s (they do **not** vanish in release builds, unlike the
-/// `debug_assert!`s they replaced). The bounds are unreachable in practice here:
-/// the testbed uses small node ids and logical clocks advance by small
+/// The encoding is injective only for `all_nodes.len() < 2^16` and
+/// `ts.logical < 2^48`. Outside those bounds two distinct timestamps would
+/// silently collapse to one version and per-key LWW would keep an arbitrary
+/// winner — a silent-corruption failure a consistency testbed must never
+/// mask — so the guards are hard `assert!`s (they do **not** vanish in
+/// release builds). The bounds are unreachable in practice here: the testbed
+/// uses small replica sets and logical clocks advance by small
 /// per-transaction increments.
-fn mvcc_version(ts: Timestamp) -> u64 {
+fn mvcc_version(all_nodes: &[NodeId], ts: &Timestamp) -> u64 {
+    let node = node_index(all_nodes, &ts.node);
     assert!(
-        ts.node < (1 << MVCC_NODE_BITS),
-        "node id {} exceeds the {MVCC_NODE_BITS}-bit MVCC tiebreak field; \
-         the (logical, node) -> u64 version encoding would collide",
-        ts.node
+        node < (1 << MVCC_NODE_BITS),
+        "node index {node} exceeds the {MVCC_NODE_BITS}-bit MVCC tiebreak field; \
+         the (logical, node) -> u64 version encoding would collide"
     );
     assert!(
         ts.logical < (1 << (64 - MVCC_NODE_BITS)),
@@ -571,26 +653,38 @@ fn mvcc_version(ts: Timestamp) -> u64 {
         ts.logical,
         64 - MVCC_NODE_BITS
     );
-    (ts.logical << MVCC_NODE_BITS) | ts.node
+    (ts.logical << MVCC_NODE_BITS) | node
 }
 
 /// Encode a transaction id as the stored value (the executed effect is "write
-/// my id"): `(logical, node)` as two big-endian u64s.
+/// my id"): the logical clock as a big-endian `u64`, then the node id as a
+/// length-prefixed UTF-8 string (ADR 0040 PR3 — this is a plain value blob,
+/// not the MVCC version itself, so it has no fixed-width contract to keep;
+/// unlike `mvcc_version` it needs no replica-set-relative index).
 fn encode_txn(txn: TxnId) -> Vec<u8> {
-    let mut v = Vec::with_capacity(16);
+    let node_bytes = txn.node.as_str().as_bytes();
+    let mut v = Vec::with_capacity(8 + 4 + node_bytes.len());
     v.extend_from_slice(&txn.logical.to_be_bytes());
-    v.extend_from_slice(&txn.node.to_be_bytes());
+    v.extend_from_slice(&(node_bytes.len() as u32).to_be_bytes());
+    v.extend_from_slice(node_bytes);
     v
 }
 
-/// Inverse of [`encode_txn`].
+/// Inverse of [`encode_txn`]. Bypasses [`NodeId::propose`]'s charset
+/// validation via `NodeId::new_unchecked` — this id was already validated
+/// once (this crate only ever mints ids via the trusted `nid`/`Env::node_id`
+/// path, never from untrusted external input).
 fn decode_txn(bytes: &[u8]) -> Option<TxnId> {
-    if bytes.len() != 16 {
+    if bytes.len() < 12 {
         return None;
     }
     let logical = u64::from_be_bytes(bytes[0..8].try_into().ok()?);
-    let node = u64::from_be_bytes(bytes[8..16].try_into().ok()?);
-    Some(Timestamp::new(logical, node))
+    let len = u32::from_be_bytes(bytes[8..12].try_into().ok()?) as usize;
+    if bytes.len() != 12 + len {
+        return None;
+    }
+    let node = std::str::from_utf8(&bytes[12..12 + len]).ok()?;
+    Some(Timestamp::new(logical, NodeId::new_unchecked(node)))
 }
 
 /// Drain the core's pending durable records and execution effects, append +
@@ -606,6 +700,7 @@ fn persist_then_ship<E: Env>(
     core: &Arc<Mutex<AccordCore>>,
     storage: &MemoryEngine,
     reads: &ReadResults,
+    all_nodes: &Arc<Vec<NodeId>>,
     outs: Vec<Out>,
 ) {
     let (records, applies, read_effects) = {
@@ -615,6 +710,7 @@ fn persist_then_ship<E: Env>(
     let env = env.clone();
     let storage = storage.clone();
     let reads = Arc::clone(reads);
+    let all_nodes = Arc::clone(all_nodes);
     let compact_core = Arc::clone(core);
     env.clone().spawn_task(async move {
         for record in &records {
@@ -629,8 +725,8 @@ fn persist_then_ship<E: Env>(
         // same drain as a write it orders after sees that write (the core only
         // emits a read effect once its earlier-ordered conflicts are `Applied`,
         // so their write effects were drained no later than this one).
-        apply_all(&storage, &applies).await;
-        satisfy_reads(&storage, &reads, &read_effects).await;
+        apply_all(&storage, &all_nodes, &applies).await;
+        satisfy_reads(&storage, &all_nodes, &reads, &read_effects).await;
         // Now that the records are durable, compact the WAL if enough has applied:
         // collapse the appended per-phase history into one snapshot record (ADR
         // 0011, log truncation). Safe here because the appends above are fsynced.
@@ -684,18 +780,18 @@ async fn maybe_compact<E: Env>(env: &E, core: &Arc<Mutex<AccordCore>>) {
 /// The write lands in the local `storage` engine via `merge` (per-key LWW —
 /// idempotent and commutative, so a re-apply on recovery converges, and
 /// `store_writer`/`store_value` read it back).
-async fn apply_all(storage: &MemoryEngine, applies: &[ApplyEffect]) {
+async fn apply_all(storage: &MemoryEngine, all_nodes: &[NodeId], applies: &[ApplyEffect]) {
     for effect in applies {
         // The default value (no caller-supplied bytes) is the txn's own id — the
         // classic register effect, which `store_writer` decodes back. A caller who
         // supplied an arbitrary value (`submit_writes`/`InteractiveTxn::write_value`)
         // gets exactly those bytes written (arbitrary write values, ADR 0011).
-        let default_value = encode_txn(effect.txn);
+        let default_value = encode_txn(effect.txn.clone());
         // Stamp the write with the full `(execute_at, txn)` order, not just the
         // logical component, so two conflicting writes that agreed the same logical
         // timestamp still converge to the agreed (node-tiebroken) winner under the
         // store's per-key LWW. See [`mvcc_version`].
-        let version = mvcc_version(effect.version);
+        let version = mvcc_version(all_nodes, &effect.version);
         for &key in &effect.keys {
             let sk = storage_key(key);
             let value = effect.values.get(&key).unwrap_or(&default_value);
@@ -717,14 +813,19 @@ async fn apply_all(storage: &MemoryEngine, applies: &[ApplyEffect]) {
 /// it (lower MVCC version) and none after. This is sound because the core only
 /// emits a read's [`ReadEffect`] once every earlier-ordered conflicting write has
 /// `Applied`.
-async fn satisfy_reads(storage: &MemoryEngine, reads: &ReadResults, read_effects: &[ReadEffect]) {
+async fn satisfy_reads(
+    storage: &MemoryEngine,
+    all_nodes: &[NodeId],
+    reads: &ReadResults,
+    read_effects: &[ReadEffect],
+) {
     for effect in read_effects {
         // Read as of the read's full `(execute_at, txn)` order (same encoding as
         // the write version, [`mvcc_version`]): `get_at` returns the greatest write
         // with a packed version `<=` the read's, i.e. every write ordered before
         // the read and none after (txn ids are distinct, so no write collides with
         // the read's own version).
-        let version = mvcc_version(effect.version);
+        let version = mvcc_version(all_nodes, &effect.version);
         let mut observed: BTreeMap<Key, Option<Vec<u8>>> = BTreeMap::new();
         for &key in &effect.keys {
             let sk = storage_key(key);
@@ -738,7 +839,7 @@ async fn satisfy_reads(storage: &MemoryEngine, reads: &ReadResults, read_effects
         reads
             .lock()
             .expect("read results poisoned")
-            .insert(effect.txn, observed);
+            .insert(effect.txn.clone(), observed);
     }
 }
 
@@ -750,7 +851,7 @@ async fn drive<E: Env>(
     core: Arc<Mutex<AccordCore>>,
     storage: MemoryEngine,
     reads: ReadResults,
-    all_nodes: Vec<NodeId>,
+    all_nodes: Arc<Vec<NodeId>>,
 ) {
     // Recover from the WAL before serving anything.
     let bytes = env.read(WAL).await.unwrap_or_default();
@@ -765,8 +866,8 @@ async fn drive<E: Env>(
             // the recovered reads in that order.
             (guard.drain_apply(), guard.drain_reads())
         };
-        apply_all(&storage, &applies).await;
-        satisfy_reads(&storage, &reads, &read_effects).await;
+        apply_all(&storage, &all_nodes, &applies).await;
+        satisfy_reads(&storage, &all_nodes, &reads, &read_effects).await;
     }
 
     loop {
@@ -783,7 +884,7 @@ async fn drive<E: Env>(
         };
         // Durable before action: fsync the core's state changes (e.g. a Commit
         // we just executed) before applying effects and shipping messages.
-        persist_then_ship(&env, &core, &storage, &reads, outs);
+        persist_then_ship(&env, &core, &storage, &reads, &all_nodes, outs);
     }
 }
 
@@ -814,6 +915,7 @@ async fn retry_loop<E: Env>(
     core: Arc<Mutex<AccordCore>>,
     storage: MemoryEngine,
     reads: ReadResults,
+    all_nodes: Arc<Vec<NodeId>>,
 ) {
     let mut interval = RETRY_BASE_INTERVAL;
     // The number of messages owed on the previous tick, to detect progress.
@@ -835,7 +937,7 @@ async fn retry_loop<E: Env>(
         }
         last_owed = owed;
         if !outs.is_empty() {
-            persist_then_ship(&env, &core, &storage, &reads, outs);
+            persist_then_ship(&env, &core, &storage, &reads, &all_nodes, outs);
         }
     }
 }
@@ -896,6 +998,7 @@ async fn liveness_loop<E: Env>(
     core: Arc<Mutex<AccordCore>>,
     storage: MemoryEngine,
     reads: ReadResults,
+    all_nodes: Arc<Vec<NodeId>>,
 ) {
     // Per-txn stall tracking. A txn drops out once it commits (no longer in
     // `uncommitted_txns`), so this stays bounded by the in-flight set.
@@ -911,17 +1014,17 @@ async fn liveness_loop<E: Env>(
             tracked.retain(|txn, _| uncommitted.contains(txn));
 
             let mut due = Vec::new();
-            for &txn in &uncommitted {
+            for txn in &uncommitted {
                 // A txn this node is itself coordinating/recovering is driven by
                 // its own retry tick; never self-recover it.
-                if c.is_driving(txn) {
-                    tracked.remove(&txn);
+                if c.is_driving(txn.clone()) {
+                    tracked.remove(txn);
                     continue;
                 }
-                let Some(fp) = c.progress_fingerprint(txn) else {
+                let Some(fp) = c.progress_fingerprint(txn.clone()) else {
                     continue;
                 };
-                let entry = tracked.entry(txn).or_insert(Liveness {
+                let entry = tracked.entry(txn.clone()).or_insert(Liveness {
                     fingerprint: fp,
                     stale_ticks: 0,
                     tier: 0,
@@ -938,8 +1041,8 @@ async fn liveness_loop<E: Env>(
                     // The bound tripped with no progress: suspect the coordinator
                     // dead. Recover only if this node is the deterministic nominee
                     // at the current escalation tier (keeps duels rare).
-                    if c.is_recovery_nominee(txn, entry.tier) {
-                        due.push(txn);
+                    if c.is_recovery_nominee(txn.clone(), entry.tier) {
+                        due.push(txn.clone());
                     }
                     // Reset the window and promote the tier so, if this nominee's
                     // recovery does not take (e.g. the nominee was itself
@@ -960,7 +1063,7 @@ async fn liveness_loop<E: Env>(
                 c.recover(txn)
             };
             if !outs.is_empty() {
-                persist_then_ship(&env, &core, &storage, &reads, outs);
+                persist_then_ship(&env, &core, &storage, &reads, &all_nodes, outs);
             }
         }
     }

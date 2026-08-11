@@ -12,7 +12,8 @@
 //! these keys and shadow-mirrors them into a `StorageEngine` **after** the
 //! unchanged in-core `Metadata::apply` still runs (`DRIVER_APPLIED` stays
 //! `false` — dual-write, zero behavior change). PR2 also added three
-//! [`EntityKind`] variants (`Counter`/`CpMemberAddr`/`NodeIdAlloc`) this
+//! [`EntityKind`] variants (`Counter`/`CpMemberAddr`, plus a third, `NodeIdAlloc`,
+//! since removed in ADR 0040 PR4 with the allocator it mirrored) this
 //! module's doc covers inline where they're declared.
 //!
 //! ## Key layout
@@ -50,6 +51,8 @@
 //! should reuse the primitive directly rather than triplicate it.
 
 use animus_env::NodeId;
+#[cfg(test)]
+use animus_env::nid;
 use animus_tablet::{TabletId, escape};
 
 /// The top-level namespace no user table or keyspace name may claim. Reserved
@@ -81,17 +84,19 @@ pub fn is_reserved_name(name: &str) -> bool {
 /// One system-keyspace entity kind (ADR 0038). Each gets its own segment so a
 /// command touches only the keys of the entities it actually mutates.
 ///
-/// The last three variants (`Counter`, `CpMemberAddr`, `NodeIdAlloc`) were
-/// added in PR2 alongside the mirror itself (`mirror.rs`) — PR1 only encoded
-/// the seven fields a shadow rebuild can reconstruct without them, but a
-/// **byte-identical** `Metadata` round trip (the differential-oracle test)
-/// also needs `Metadata`'s two monotonic id allocators
-/// (`next_tablet_id`/`next_alloc_id`), the `AllocateNodeId` idempotency ledger
-/// (`node_id_allocations`), and the legacy CP-member address book
+/// `Counter`/`CpMemberAddr` were added in PR2 alongside the mirror itself
+/// (`mirror.rs`) — PR1 only encoded the seven fields a shadow rebuild can
+/// reconstruct without them, but a **byte-identical** `Metadata` round trip
+/// (the differential-oracle test) also needs `Metadata`'s monotonic tablet-id
+/// allocator (`next_tablet_id`) and the legacy CP-member address book
 /// (`cp_member_addrs`/`cp_member_tablets`) — so PR2 extends the enum rather
-/// than leaving those fields unmirrored. Additive: every PR1 key a running
-/// system produced still decodes identically (`from_segment` only gained
-/// arms, `as_str` only gained cases).
+/// than leaving those fields unmirrored. A third PR2 variant, `NodeIdAlloc`
+/// (the ADR 0036 `AllocateNodeId` idempotency ledger), was **removed in ADR
+/// 0040 PR4** alongside the allocator it mirrored — `RegisterNode`'s claim
+/// lives entirely in the already-mirrored `Member`/`NodeAddrs` kinds, no
+/// separate ledger needed. Additive since: every PR1 key a running system
+/// produced still decodes identically (`from_segment` only gained arms,
+/// `as_str` only gained cases).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum EntityKind {
     /// A tablet (`Metadata::tablets`), keyed by [`TabletId`].
@@ -111,23 +116,21 @@ pub enum EntityKind {
     /// A never-pruned merge marker (`Metadata::merged_tablets`), keyed by the
     /// merged-away [`TabletId`].
     Merged,
-    /// A monotonic id-allocator counter (`Metadata::next_tablet_id` /
-    /// `Metadata::next_alloc_id`), keyed by a fixed ASCII counter name (PR2:
-    /// `mirror::NEXT_TABLET_ID_COUNTER` / `mirror::NEXT_ALLOC_ID_COUNTER`).
-    /// Not a per-`MetaCommand` entity — a process-wide scalar — but shaped as
-    /// an ordinary entity key (one segment, one id) rather than a bespoke
-    /// watermark-style key (like [`applied_index_key`]) so a new counter can
-    /// be added later without inventing a third key shape.
+    /// A monotonic id-allocator counter (`Metadata::next_tablet_id`), keyed
+    /// by a fixed ASCII counter name (PR2: `mirror::NEXT_TABLET_ID_COUNTER`;
+    /// the ADR 0036 allocator's sibling counter, `next_alloc_id` /
+    /// `NEXT_ALLOC_ID_COUNTER`, was removed in ADR 0040 PR4 along with the
+    /// allocator itself). Not a per-`MetaCommand` entity — a process-wide
+    /// scalar — but shaped as an ordinary entity key (one segment, one id)
+    /// rather than a bespoke watermark-style key (like
+    /// [`applied_index_key`]) so a new counter can be added later without
+    /// inventing a third key shape.
     Counter,
     /// A legacy CP-group member's address registration
     /// (`Metadata::cp_member_addrs`/`Metadata::cp_member_tablets`, mutated
     /// only by the back-compat-only `MetaCommand::RegisterCpAddr`), keyed by
     /// [`NodeId`] (PR2).
     CpMemberAddr,
-    /// One `MetaCommand::AllocateNodeId` idempotency-ledger entry
-    /// (`Metadata::node_id_allocations`), keyed by the join attempt's nonce
-    /// string (PR2).
-    NodeIdAlloc,
 }
 
 impl EntityKind {
@@ -148,7 +151,6 @@ impl EntityKind {
             EntityKind::Merged => "merged",
             EntityKind::Counter => "counter",
             EntityKind::CpMemberAddr => "cp_member_addr",
-            EntityKind::NodeIdAlloc => "node_id_alloc",
         }
     }
 
@@ -170,7 +172,6 @@ impl EntityKind {
             b"merged" => EntityKind::Merged,
             b"counter" => EntityKind::Counter,
             b"cp_member_addr" => EntityKind::CpMemberAddr,
-            b"node_id_alloc" => EntityKind::NodeIdAlloc,
             _ => return None,
         })
     }
@@ -254,10 +255,13 @@ pub fn tablet_key(id: TabletId) -> Vec<u8> {
     entity_key(EntityKind::Tablet, &id.0.to_be_bytes())
 }
 
-/// A [`NodeId`]'s key under [`EntityKind::Member`].
+/// A [`NodeId`]'s key under [`EntityKind::Member`]. ADR 0040 PR3: a node id
+/// is now a validated UTF-8 string, not a fixed-width `u64` — the key encodes
+/// its raw bytes (still escaped + prefix-free via [`entity_key`]) instead of
+/// 8 big-endian bytes.
 #[must_use]
-pub fn member_key(id: NodeId) -> Vec<u8> {
-    entity_key(EntityKind::Member, &id.to_be_bytes())
+pub fn member_key(id: &NodeId) -> Vec<u8> {
+    entity_key(EntityKind::Member, id.as_str().as_bytes())
 }
 
 /// A table name's key under [`EntityKind::Schema`].
@@ -272,10 +276,11 @@ pub fn policy_key(id: TabletId) -> Vec<u8> {
     entity_key(EntityKind::Policy, &id.0.to_be_bytes())
 }
 
-/// A [`NodeId`]'s key under [`EntityKind::NodeAddrs`].
+/// A [`NodeId`]'s key under [`EntityKind::NodeAddrs`]. See [`member_key`]'s
+/// doc for the ADR 0040 PR3 string-id encoding change.
 #[must_use]
-pub fn node_addrs_key(id: NodeId) -> Vec<u8> {
-    entity_key(EntityKind::NodeAddrs, &id.to_be_bytes())
+pub fn node_addrs_key(id: &NodeId) -> Vec<u8> {
+    entity_key(EntityKind::NodeAddrs, id.as_str().as_bytes())
 }
 
 /// A keyspace name's key under [`EntityKind::Keyspace`].
@@ -291,25 +296,18 @@ pub fn merged_key(id: TabletId) -> Vec<u8> {
 }
 
 /// A named counter's key under [`EntityKind::Counter`] (PR2). `name` is a
-/// fixed ASCII constant (`mirror::NEXT_TABLET_ID_COUNTER` /
-/// `mirror::NEXT_ALLOC_ID_COUNTER`), not user input.
+/// fixed ASCII constant (`mirror::NEXT_TABLET_ID_COUNTER`), not user input.
 #[must_use]
 pub fn counter_key(name: &str) -> Vec<u8> {
     entity_key(EntityKind::Counter, name.as_bytes())
 }
 
 /// A [`NodeId`]'s key under [`EntityKind::CpMemberAddr`] (PR2, the legacy
-/// `Metadata::cp_member_addrs`/`cp_member_tablets` pair).
+/// `Metadata::cp_member_addrs`/`cp_member_tablets` pair). See [`member_key`]'s
+/// doc for the ADR 0040 PR3 string-id encoding change.
 #[must_use]
-pub fn cp_member_addr_key(id: NodeId) -> Vec<u8> {
-    entity_key(EntityKind::CpMemberAddr, &id.to_be_bytes())
-}
-
-/// A join attempt's nonce string's key under [`EntityKind::NodeIdAlloc`]
-/// (PR2, `Metadata::node_id_allocations`).
-#[must_use]
-pub fn node_id_alloc_key(nonce: &str) -> Vec<u8> {
-    entity_key(EntityKind::NodeIdAlloc, nonce.as_bytes())
+pub fn cp_member_addr_key(id: &NodeId) -> Vec<u8> {
+    entity_key(EntityKind::CpMemberAddr, id.as_str().as_bytes())
 }
 
 /// The decoded form of a system-keyspace key ([`decode_key`]'s result).
@@ -379,7 +377,7 @@ pub fn decode_key(key: &[u8]) -> Option<DecodedKey> {
 mod tests {
     use super::*;
 
-    const ALL_KINDS: [EntityKind; 10] = [
+    const ALL_KINDS: [EntityKind; 9] = [
         EntityKind::Tablet,
         EntityKind::Member,
         EntityKind::Schema,
@@ -389,7 +387,6 @@ mod tests {
         EntityKind::Merged,
         EntityKind::Counter,
         EntityKind::CpMemberAddr,
-        EntityKind::NodeIdAlloc,
     ];
 
     // --- reserved-name guard -------------------------------------------------
@@ -438,12 +435,12 @@ mod tests {
 
     #[test]
     fn member_key_round_trips() {
-        let key = member_key(7);
+        let key = member_key(&nid(7));
         assert_eq!(
             decode_key(&key),
             Some(DecodedKey::Entity {
                 kind: EntityKind::Member,
-                id: 7u64.to_be_bytes().to_vec(),
+                id: b"n7".to_vec(),
             })
         );
     }
@@ -474,12 +471,12 @@ mod tests {
 
     #[test]
     fn node_addrs_key_round_trips() {
-        let key = node_addrs_key(300);
+        let key = node_addrs_key(&nid(300));
         assert_eq!(
             decode_key(&key),
             Some(DecodedKey::Entity {
                 kind: EntityKind::NodeAddrs,
-                id: 300u64.to_be_bytes().to_vec(),
+                id: b"n300".to_vec(),
             })
         );
     }
@@ -530,24 +527,12 @@ mod tests {
 
     #[test]
     fn cp_member_addr_key_round_trips() {
-        let key = cp_member_addr_key(1301);
+        let key = cp_member_addr_key(&nid(1301));
         assert_eq!(
             decode_key(&key),
             Some(DecodedKey::Entity {
                 kind: EntityKind::CpMemberAddr,
-                id: 1301u64.to_be_bytes().to_vec(),
-            })
-        );
-    }
-
-    #[test]
-    fn node_id_alloc_key_round_trips() {
-        let key = node_id_alloc_key("join-1");
-        assert_eq!(
-            decode_key(&key),
-            Some(DecodedKey::Entity {
-                kind: EntityKind::NodeIdAlloc,
-                id: b"join-1".to_vec(),
+                id: b"n1301".to_vec(),
             })
         );
     }
@@ -632,6 +617,54 @@ mod tests {
                     "key {a:?} is a prefix of distinct key {b:?}"
                 );
             }
+        }
+    }
+
+    /// ADR 0040 PR3: node ids are now strings, and the string-id escaping
+    /// machinery must reject exactly the collision class a naive
+    /// concatenation would hit — one minted id's string being a literal
+    /// prefix of another's (e.g. `"n1"` vs `"n10"`, or `nid`-style ids at
+    /// different digit widths). Exercises the real `member_key`/
+    /// `node_addrs_key`/`cp_member_addr_key` helpers directly (not just the
+    /// generic `entity_key` the test above already covers) so a regression in
+    /// any one of them is caught even if the others stay correct.
+    #[test]
+    fn string_ids_sharing_a_literal_prefix_do_not_collide() {
+        let prefix_pairs = [(nid(1), nid(10)), (nid(1), nid(12)), (nid(9), nid(99))];
+        for (short, long) in prefix_pairs {
+            assert!(
+                long.as_str().starts_with(short.as_str()),
+                "test fixture: {long} should literally start with {short}"
+            );
+            let mut keys = vec![
+                member_key(&short),
+                member_key(&long),
+                node_addrs_key(&short),
+                node_addrs_key(&long),
+                cp_member_addr_key(&short),
+                cp_member_addr_key(&long),
+            ];
+            let sorted = {
+                let mut k = keys.clone();
+                k.sort();
+                k
+            };
+            // No two keys collide or prefix one another.
+            for (i, a) in keys.iter().enumerate() {
+                for (j, b) in keys.iter().enumerate() {
+                    if i == j {
+                        continue;
+                    }
+                    assert!(
+                        !b.starts_with(a.as_slice()),
+                        "key for {short}/{long} pair: {a:?} prefixes {b:?}"
+                    );
+                }
+            }
+            keys.sort();
+            assert_eq!(keys, sorted);
+            keys.dedup();
+            assert_eq!(keys.len(), 6, "every key must be distinct");
         }
     }
 

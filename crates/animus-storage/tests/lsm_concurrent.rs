@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use animus_env::ProdEnv;
+use animus_env::{ProdEnv, nid};
 use animus_storage::{LsmEngine, LsmOptions, StorageEngine};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -28,7 +28,9 @@ async fn concurrent_writers_do_not_deadlock() {
     let dir = std::env::temp_dir().join(format!("animus-gc-deadlock-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let addr = "127.0.0.1:0".parse().unwrap();
-    let (env, _bound) = ProdEnv::bind(0, addr, &dir).await.expect("bind ProdEnv");
+    let (env, _bound) = ProdEnv::bind(nid(0), addr, &dir)
+        .await
+        .expect("bind ProdEnv");
     let lsm = LsmEngine::open(env, "db-").await.expect("open lsm");
 
     // Many rounds of many concurrent writers to disjoint keys. `merge` (per-key
@@ -75,7 +77,9 @@ async fn scans_survive_concurrent_compaction() {
     let dir = std::env::temp_dir().join(format!("animus-read-compact-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let addr = "127.0.0.1:0".parse().unwrap();
-    let (env, _bound) = ProdEnv::bind(0, addr, &dir).await.expect("bind ProdEnv");
+    let (env, _bound) = ProdEnv::bind(nid(0), addr, &dir)
+        .await
+        .expect("bind ProdEnv");
     // Tiny thresholds: flush almost every few writes, compact every 2 L0 tables —
     // so flushes + compactions (which remove old files) run continuously under the
     // scanners.
@@ -196,7 +200,9 @@ async fn concurrent_writers_with_flushes_lose_no_acked_write() {
     let dir = std::env::temp_dir().join(format!("animus-flush-race-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let addr = "127.0.0.1:0".parse().unwrap();
-    let (env, _bound) = ProdEnv::bind(0, addr, &dir).await.expect("bind ProdEnv");
+    let (env, _bound) = ProdEnv::bind(nid(0), addr, &dir)
+        .await
+        .expect("bind ProdEnv");
     let opts = LsmOptions {
         flush_threshold_bytes: 1024,
         compaction_trigger: 2,
@@ -258,7 +264,9 @@ async fn concurrent_writers_with_flushes_lose_no_acked_write() {
     // ...and after a restart (fresh env + engine over the same directory), so a
     // write surviving only until its WAL segment was wrongly GC'd is caught.
     drop(lsm);
-    let (env2, _bound2) = ProdEnv::bind(0, addr, &dir).await.expect("rebind ProdEnv");
+    let (env2, _bound2) = ProdEnv::bind(nid(0), addr, &dir)
+        .await
+        .expect("rebind ProdEnv");
     let reopened = LsmEngine::open_with(env2, "db-", opts)
         .await
         .expect("reopen lsm after restart");
@@ -276,7 +284,9 @@ async fn forced_flush_under_live_load_loses_no_acked_write() {
     let dir = std::env::temp_dir().join(format!("animus-admin-flush-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let addr = "127.0.0.1:0".parse().unwrap();
-    let (env, _bound) = ProdEnv::bind(0, addr, &dir).await.expect("bind ProdEnv");
+    let (env, _bound) = ProdEnv::bind(nid(0), addr, &dir)
+        .await
+        .expect("bind ProdEnv");
     let opts = LsmOptions {
         flush_threshold_bytes: 2048,
         compaction_trigger: 2,
@@ -351,7 +361,9 @@ async fn forced_flush_under_live_load_loses_no_acked_write() {
 
     // And it recovers: a reopen re-validates the manifest + replays the WAL.
     drop(lsm);
-    let (env2, _bound2) = ProdEnv::bind(0, addr, &dir).await.expect("rebind ProdEnv");
+    let (env2, _bound2) = ProdEnv::bind(nid(0), addr, &dir)
+        .await
+        .expect("rebind ProdEnv");
     let reopened = LsmEngine::open_with(env2, "db-", opts)
         .await
         .expect("reopen lsm after forced-flush load");
@@ -369,7 +381,9 @@ async fn overlapping_flush_now_calls_do_not_corrupt() {
     let dir = std::env::temp_dir().join(format!("animus-double-flush-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let addr = "127.0.0.1:0".parse().unwrap();
-    let (env, _bound) = ProdEnv::bind(0, addr, &dir).await.expect("bind ProdEnv");
+    let (env, _bound) = ProdEnv::bind(nid(0), addr, &dir)
+        .await
+        .expect("bind ProdEnv");
     // Large threshold: only the forced flushes flush, so they are the ones racing.
     let opts = LsmOptions {
         flush_threshold_bytes: 10 * 1024 * 1024,
@@ -457,7 +471,9 @@ async fn overlapping_flush_now_calls_do_not_corrupt() {
     assert_all_present(&lsm, &expected, "live").await;
 
     drop(lsm);
-    let (env2, _bound2) = ProdEnv::bind(0, addr, &dir).await.expect("rebind ProdEnv");
+    let (env2, _bound2) = ProdEnv::bind(nid(0), addr, &dir)
+        .await
+        .expect("rebind ProdEnv");
     let reopened = LsmEngine::open_with(env2, "db-", opts)
         .await
         .expect("reopen lsm after overlapping flushes");

@@ -27,7 +27,7 @@ use std::time::Duration;
 use animus_control::node::heartbeat_loop;
 use animus_control::raft::ProposeResult;
 use animus_control::{MetaCommand, Metadata, NodeStatus, RaftNode};
-use animus_env::EnvExt;
+use animus_env::{EnvExt, NodeId, nid};
 use animus_placement::PlacementPolicy;
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::MemoryEngine;
@@ -52,12 +52,21 @@ fn cluster(seed: u64) -> (Simulator, Vec<RaftNode<SimEnv>>) {
     let sim = Simulator::new(seed);
     let nodes = CONTROL
         .iter()
-        .map(|&id| RaftNode::start(sim.env(id), CONTROL.to_vec(), MemoryEngine::new()))
+        .map(|&id| {
+            RaftNode::start(
+                sim.env(nid(id)),
+                CONTROL.iter().copied().map(nid).collect(),
+                MemoryEngine::new(),
+            )
+        })
         .collect();
     // Every data node heartbeats the control group — see this file's doc.
     for (id, _, _) in DATA_NODES {
-        let env = sim.env(id);
-        env.spawn_task(heartbeat_loop(env.clone(), CONTROL.to_vec()));
+        let env = sim.env(nid(id));
+        env.spawn_task(heartbeat_loop(
+            env.clone(),
+            CONTROL.iter().copied().map(nid).collect(),
+        ));
     }
     (sim, nodes)
 }
@@ -83,8 +92,8 @@ fn labels(region: &str, zone: &str) -> BTreeMap<String, String> {
         .collect()
 }
 
-fn zone_of(meta: &Metadata, node: u64) -> String {
-    meta.members[&node].labels["zone"].clone()
+fn zone_of(meta: &Metadata, node: &NodeId) -> String {
+    meta.members[node].labels["zone"].clone()
 }
 
 fn policy() -> PlacementPolicy {
@@ -107,7 +116,7 @@ fn run(seed: u64) {
     for (id, region, zone) in DATA_NODES {
         assert!(matches!(
             nodes[leader].propose(MetaCommand::UpsertMember {
-                node: id,
+                node: nid(id),
                 labels: labels(region, zone),
                 status: NodeStatus::Active,
             }),
@@ -125,7 +134,7 @@ fn run(seed: u64) {
             tablet: TABLET,
             table: None,
             range: KeyRange::whole(),
-            replicas: initial.clone(),
+            replicas: initial.clone().into_iter().map(nid).collect(),
         }),
         ProposeResult::Accepted { .. }
     ));
@@ -151,15 +160,15 @@ fn run(seed: u64) {
     assert_residency_and_spread(&meta, &after_fresh, seed);
 
     // --- Fault: a placed replica's member dies. ---
-    let dead = after_fresh[0];
-    let dead_zone = zone_of(&meta, dead);
+    let dead = after_fresh[0].clone();
+    let dead_zone = zone_of(&meta, &dead);
     // Stop its heartbeat too: otherwise the (pre-existing, unchanged) `Down` →
     // `Active` recovery rule would immediately revert this manual `Down` the
     // moment `detect_loop` next sees a heartbeat still arriving from it.
-    sim.crash(dead);
+    sim.crash(dead.clone());
     assert!(matches!(
         nodes[leader].propose(MetaCommand::UpsertMember {
-            node: dead,
+            node: dead.clone(),
             labels: meta.members[&dead].labels.clone(),
             status: NodeStatus::Down,
         }),
@@ -191,9 +200,13 @@ fn run(seed: u64) {
                 "node {i}: survivor {kept} needlessly moved (seed={seed})"
             );
         }
-        let replacement = *placed.iter().find(|n| !after_fresh.contains(n)).unwrap();
+        let replacement = placed
+            .iter()
+            .find(|n| !after_fresh.contains(n))
+            .unwrap()
+            .clone();
         assert_eq!(
-            zone_of(&m, replacement),
+            zone_of(&m, &replacement),
             dead_zone,
             "node {i}: replacement should reuse the dead zone (seed={seed})"
         );
@@ -210,13 +223,14 @@ fn run(seed: u64) {
     );
 }
 
-fn assert_residency_and_spread(meta: &Metadata, placed: &[u64], seed: u64) {
+fn assert_residency_and_spread(meta: &Metadata, placed: &[NodeId], seed: u64) {
     assert_eq!(placed.len(), 3, "wrong replica count (seed={seed})");
+    let eu_ids: Vec<NodeId> = (10..=15).map(nid).collect();
     assert!(
-        placed.iter().all(|n| (10..20).contains(n)),
+        placed.iter().all(|n| eu_ids.contains(n)),
         "residency lost: {placed:?} (seed={seed})"
     );
-    let mut zones: Vec<String> = placed.iter().map(|n| zone_of(meta, *n)).collect();
+    let mut zones: Vec<String> = placed.iter().map(|n| zone_of(meta, n)).collect();
     zones.sort();
     zones.dedup();
     assert_eq!(zones.len(), 3, "spread lost: {placed:?} (seed={seed})");
@@ -231,7 +245,7 @@ fn reconcile_is_reproducible_from_seed() {
         let leader = leader_among(&nodes, &[0, 1, 2]);
         for (id, region, zone) in DATA_NODES {
             nodes[leader].propose(MetaCommand::UpsertMember {
-                node: id,
+                node: nid(id),
                 labels: labels(region, zone),
                 status: NodeStatus::Active,
             });
@@ -241,16 +255,16 @@ fn reconcile_is_reproducible_from_seed() {
             tablet: TABLET,
             table: None,
             range: KeyRange::whole(),
-            replicas: vec![10, 12, 14],
+            replicas: vec![nid(10), nid(12), nid(14)],
         });
         nodes[leader].propose(MetaCommand::SetTabletPolicy {
             tablet: TABLET,
             policy: Some(policy()),
         });
         sim.run_for(Duration::from_secs(3));
-        let dead = nodes[leader].metadata().tablets[&TABLET].replicas[0];
+        let dead = nodes[leader].metadata().tablets[&TABLET].replicas[0].clone();
         let dead_labels = nodes[leader].metadata().members[&dead].labels.clone();
-        sim.crash(dead);
+        sim.crash(dead.clone());
         nodes[leader].propose(MetaCommand::UpsertMember {
             node: dead,
             labels: dead_labels,

@@ -19,6 +19,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, mpsc};
 
+#[cfg(test)]
+use crate::nid;
 use crate::{
     Clock, Coresident, Disk, Env, Envelope, MetricsHandle, Nanos, Network, NodeId, Rng, Spawner,
 };
@@ -385,21 +387,32 @@ async fn open_append(path: &std::path::Path) -> std::io::Result<tokio::fs::File>
         .await
 }
 
-/// Read length-prefixed `[from: u64][stream: u64][len: u32][payload]` frames
-/// until EOF (ADR 0026 added the `stream` field; the rest of the frame is
-/// unchanged). These are the *raw*, not-yet-demultiplexed frames off one
-/// accepted connection — `spawn_pump` fans them out by `stream` into an env's
+/// Read length-prefixed `[from_len: u32][from: utf8 bytes][stream: u64][len:
+/// u32][payload]` frames until EOF (ADR 0040 PR3 changed `from` from a fixed
+/// `u64` to a length-prefixed UTF-8 string, since node ids are strings now;
+/// ADR 0026 added the `stream` field; the rest of the frame is unchanged).
+/// These are the *raw*, not-yet-demultiplexed frames off one accepted
+/// connection — `spawn_pump` fans them out by `stream` into an env's
 /// [`Demux`].
 async fn read_frames(
     mut stream: TcpStream,
     tx: mpsc::UnboundedSender<Envelope>,
 ) -> std::io::Result<()> {
     loop {
-        let from = match stream.read_u64().await {
-            Ok(v) => v,
+        let from_len = match stream.read_u32().await {
+            Ok(v) => v as usize,
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(e) => return Err(e),
         };
+        let mut from_bytes = vec![0u8; from_len];
+        stream.read_exact(&mut from_bytes).await?;
+        let from_str = String::from_utf8(from_bytes)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.utf8_error()))?;
+        // The sending side only ever writes an id that already passed
+        // `NodeId::propose` (or the wire-trusted `nid`/test-support path) at
+        // its own intake boundary — re-validating here would just duplicate
+        // that check for no benefit, so this uses the unchecked constructor.
+        let from = NodeId::new_unchecked(from_str);
         let msg_stream = stream.read_u64().await?;
         let len = stream.read_u32().await? as usize;
         let mut payload = vec![0u8; len];
@@ -490,6 +503,38 @@ impl Rng for ProdEnv {
     }
 }
 
+/// A minimal [`Rng`] usable at a CLI **pre-bind** boundary — before any
+/// [`ProdEnv`] exists to draw from at all (a joining process mints/validates
+/// its identity, over the network, before ever binding a listener). Real OS
+/// randomness (`rand::rngs::OsRng`), byte-for-byte the same source
+/// [`ProdEnv`]'s own [`Rng`] impl above draws from.
+///
+/// This is the ADR 0040 replacement for `generate_join_nonce`'s narrower,
+/// bespoke OS-randomness exception (ADR 0036): rather than a one-off function
+/// scoped to a single call site with its own hand-written justification,
+/// pre-bind entropy now has one sanctioned, reusable home on the `Rng` trait
+/// itself — any future pre-bind caller reaches for this instead of
+/// reinventing the exception. Still the same narrow carve-out from the
+/// `Env`-seam rule (ADR 0003): **only** for a genuine pre-bind CLI boundary
+/// no `SimEnv` test ever drives (a joining process's own `NodeId::mint` call,
+/// before `Node::bind`/`ProdEnv::bind` exist) — anything that runs in-process
+/// on a live, already-bound node (e.g. `admin_add_control_member`'s minted-id
+/// path) must keep drawing from its own bound env's `Rng` instead
+/// (`leader.env().next_u64()`), never this type, so a `SimEnv` test can still
+/// drive it deterministically.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PreBindRng;
+
+impl Rng for PreBindRng {
+    fn next_u64(&self) -> u64 {
+        rand::RngCore::next_u64(&mut rand::rngs::OsRng)
+    }
+
+    fn fill_bytes(&self, dst: &mut [u8]) {
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, dst);
+    }
+}
+
 #[async_trait::async_trait]
 impl Network for ProdEnv {
     async fn send_stream(&self, to: NodeId, stream: u64, payload: Vec<u8>) {
@@ -507,14 +552,17 @@ impl Network for ProdEnv {
                     // the address lands. A *genuinely* missing peer surfaces as the
                     // higher-level symptom (no leader / no progress) with its own
                     // logging, so this stays at debug to avoid alarming noise.
-                    tracing::debug!(to, "send to peer with no known address (dropped)");
+                    tracing::debug!(
+                        to = %to,
+                        "send to peer with no known address (dropped)"
+                    );
                     return;
                 }
             }
         };
         // Fire-and-forget semantics: a transport error is the network dropping
         // the message, not an error to the caller (see `Network::send`).
-        let from = self.inner.node_id;
+        let from = &self.inner.node_id;
         // Grab (or create) this address's connection slot. The map lock is a
         // `StdMutex` and must not be held across an `.await` — clone the
         // per-address `Arc` out and drop the guard before any I/O.
@@ -523,7 +571,7 @@ impl Network for ProdEnv {
             Arc::clone(conns.entry(addr).or_default())
         };
         if let Err(err) = send_frame_pooled(&slot, addr, from, stream, &payload).await {
-            tracing::debug!(?err, to, "send failed (dropped)");
+            tracing::debug!(?err, to = %to, "send failed (dropped)");
         }
     }
 
@@ -556,6 +604,7 @@ impl Coresident for ProdEnv {
         );
         let demux = Arc::new(StdMutex::new(Demux::default()));
         let pump_abort = spawn_pump(slot.inbox, Arc::clone(&demux));
+        let sib_data_dir = self.inner.data_dir.join(format!("sib-{id}"));
         Self {
             inner: Arc::new(Inner {
                 node_id: id,
@@ -564,7 +613,7 @@ impl Coresident for ProdEnv {
                 local_addr: slot.addr,
                 pool: Arc::clone(&self.inner.pool),
                 conns: Arc::clone(&self.inner.conns),
-                data_dir: self.inner.data_dir.join(format!("sib-{id}")),
+                data_dir: sib_data_dir,
                 dir_synced: StdMutex::new(BTreeSet::new()),
                 demux,
                 tasks: StdMutex::new(vec![slot.accept_abort, pump_abort]),
@@ -638,7 +687,7 @@ fn spawn_accept(
 async fn send_frame_pooled(
     slot: &Mutex<Option<TcpStream>>,
     addr: SocketAddr,
-    from: NodeId,
+    from: &NodeId,
     msg_stream: u64,
     payload: &[u8],
 ) -> std::io::Result<()> {
@@ -665,17 +714,20 @@ async fn connect_nodelay(addr: SocketAddr) -> std::io::Result<TcpStream> {
     Ok(stream)
 }
 
-/// Write one length-prefixed `[from: u64][stream: u64][len: u32][payload]`
-/// frame (ADR 0026 added the `stream` field) over a pooled connection — the
-/// receive side (`read_frames`, which already loops until EOF) needs no
-/// further change.
+/// Write one length-prefixed `[from_len: u32][from: utf8 bytes][stream:
+/// u64][len: u32][payload]` frame (ADR 0040 PR3 length-prefixed the `from`
+/// field to carry a string id instead of a fixed `u64`; ADR 0026 added the
+/// `stream` field) over a pooled connection — the receive side
+/// (`read_frames`, which already loops until EOF) needs no further change.
 async fn write_frame(
     conn: &mut TcpStream,
-    from: NodeId,
+    from: &NodeId,
     msg_stream: u64,
     payload: &[u8],
 ) -> std::io::Result<()> {
-    conn.write_u64(from).await?;
+    let from_bytes = from.as_str().as_bytes();
+    conn.write_u32(from_bytes.len() as u32).await?;
+    conn.write_all(from_bytes).await?;
     conn.write_u64(msg_stream).await?;
     conn.write_u32(payload.len() as u32).await?;
     conn.write_all(payload).await?;
@@ -874,7 +926,7 @@ impl Spawner for ProdEnv {
 
 impl Env for ProdEnv {
     fn node_id(&self) -> NodeId {
-        self.inner.node_id
+        self.inner.node_id.clone()
     }
 
     fn metrics(&self) -> MetricsHandle {
@@ -904,7 +956,7 @@ mod tests {
     #[tokio::test]
     async fn disk_creates_parent_dirs_for_nested_file() {
         let dir = unique_tmp_dir();
-        let (env, _addr) = ProdEnv::bind(0, "127.0.0.1:0".parse().unwrap(), &dir)
+        let (env, _addr) = ProdEnv::bind(nid(0), "127.0.0.1:0".parse().unwrap(), &dir)
             .await
             .expect("bind");
 
@@ -928,16 +980,20 @@ mod tests {
     #[tokio::test]
     async fn disk_list_is_own_files_sorted_nonrecursive() {
         let dir = unique_tmp_dir();
-        let missing = ProdEnv::bind(0, "127.0.0.1:0".parse().unwrap(), dir.join("never-written"))
-            .await
-            .expect("bind")
-            .0;
+        let missing = ProdEnv::bind(
+            nid(0),
+            "127.0.0.1:0".parse().unwrap(),
+            dir.join("never-written"),
+        )
+        .await
+        .expect("bind")
+        .0;
         assert_eq!(
             missing.list().await.expect("list missing"),
             Vec::<String>::new()
         );
 
-        let (env, _addr) = ProdEnv::bind(1, "127.0.0.1:0".parse().unwrap(), &dir)
+        let (env, _addr) = ProdEnv::bind(nid(1), "127.0.0.1:0".parse().unwrap(), &dir)
             .await
             .expect("bind");
         env.append("db-wal", b"w").await.expect("append");
@@ -966,17 +1022,17 @@ mod tests {
         let dir_b = unique_tmp_dir();
         let loop0 = || "127.0.0.1:0".parse::<SocketAddr>().unwrap();
         // Two physical nodes, each with a one-slot sibling pool.
-        let (a, _) = ProdEnv::bind_with_pool(0, loop0(), &[loop0()], &dir_a)
+        let (a, _) = ProdEnv::bind_with_pool(nid(0), loop0(), &[loop0()], &dir_a)
             .await
             .expect("bind a");
-        let (b, _) = ProdEnv::bind_with_pool(1, loop0(), &[loop0()], &dir_b)
+        let (b, _) = ProdEnv::bind_with_pool(nid(1), loop0(), &[loop0()], &dir_b)
             .await
             .expect("bind b");
 
         // Mint a co-resident group member on each node (ids 300, 301).
-        let a_sib = a.sibling(300);
-        let b_sib = b.sibling(301);
-        assert_eq!(a_sib.node_id(), 300);
+        let a_sib = a.sibling(nid(300));
+        let b_sib = b.sibling(nid(301));
+        assert_eq!(a_sib.node_id(), nid(300));
         assert_ne!(
             a_sib.local_addr(),
             a.local_addr(),
@@ -985,10 +1041,12 @@ mod tests {
 
         // Distribute the freshly-minted addresses (what the 3b peer-sync loop does
         // from replicated Metadata) onto the parents — siblings share the book.
-        let book: BTreeMap<NodeId, SocketAddr> =
-            [(300, a_sib.local_addr()), (301, b_sib.local_addr())]
-                .into_iter()
-                .collect();
+        let book: BTreeMap<NodeId, SocketAddr> = [
+            (nid(300), a_sib.local_addr()),
+            (nid(301), b_sib.local_addr()),
+        ]
+        .into_iter()
+        .collect();
         a.set_peers(book.clone());
         b.set_peers(book);
 
@@ -999,13 +1057,13 @@ mod tests {
         };
         // Give the receiver a moment to park on its inbox, then send.
         tokio::time::sleep(Duration::from_millis(50)).await;
-        b_sib.send(300, b"hello-cp-sibling".to_vec()).await;
+        b_sib.send(nid(300), b"hello-cp-sibling".to_vec()).await;
 
         let env = tokio::time::timeout(Duration::from_secs(5), recv_handle)
             .await
             .expect("recv timed out")
             .expect("recv task");
-        assert_eq!(env.from, 301);
+        assert_eq!(env.from, nid(301));
         assert_eq!(env.payload, b"hello-cp-sibling");
 
         a.shutdown();
@@ -1033,9 +1091,13 @@ mod tests {
         let dir_a = unique_tmp_dir();
         let dir_b = unique_tmp_dir();
         let loop0 = || "127.0.0.1:0".parse::<SocketAddr>().unwrap();
-        let (a, a_addr) = ProdEnv::bind(0, loop0(), &dir_a).await.expect("bind a");
-        let (b, _) = ProdEnv::bind(1, loop0(), &dir_b).await.expect("bind b");
-        b.set_peers([(0, a_addr)].into_iter().collect());
+        let (a, a_addr) = ProdEnv::bind(nid(0), loop0(), &dir_a)
+            .await
+            .expect("bind a");
+        let (b, _) = ProdEnv::bind(nid(1), loop0(), &dir_b)
+            .await
+            .expect("bind b");
+        b.set_peers([(nid(0), a_addr)].into_iter().collect());
 
         // Two receive loops on `a`, one per stream, each collecting its frames'
         // first payload byte (the sequence number) into its own vector.
@@ -1065,7 +1127,7 @@ mod tests {
             let b = b.clone();
             tokio::spawn(async move {
                 for i in 0..N {
-                    b.send_stream(0, STREAM_X, vec![i]).await;
+                    b.send_stream(nid(0), STREAM_X, vec![i]).await;
                 }
             })
         };
@@ -1073,7 +1135,7 @@ mod tests {
             let b = b.clone();
             tokio::spawn(async move {
                 for i in 0..N {
-                    b.send_stream(0, STREAM_Y, vec![i]).await;
+                    b.send_stream(nid(0), STREAM_Y, vec![i]).await;
                 }
             })
         };
@@ -1114,9 +1176,9 @@ mod tests {
     /// `receiver` in the peer book. Returns `(sender, receiver, dirs)`.
     async fn bound_pair(dir_a: &PathBuf, dir_b: &PathBuf) -> (ProdEnv, ProdEnv, SocketAddr) {
         let loop0 = "127.0.0.1:0".parse::<SocketAddr>().unwrap();
-        let (a, _) = ProdEnv::bind(0, loop0, dir_a).await.expect("bind a");
-        let (b, b_addr) = ProdEnv::bind(1, loop0, dir_b).await.expect("bind b");
-        a.set_peers([(1, b_addr)].into_iter().collect());
+        let (a, _) = ProdEnv::bind(nid(0), loop0, dir_a).await.expect("bind a");
+        let (b, b_addr) = ProdEnv::bind(nid(1), loop0, dir_b).await.expect("bind b");
+        a.set_peers([(nid(1), b_addr)].into_iter().collect());
         (a, b, b_addr)
     }
 
@@ -1156,7 +1218,7 @@ mod tests {
             let a = a.clone();
             senders.push(tokio::spawn(async move {
                 for seq in 0..MSGS {
-                    a.send(1, framed_payload(task, seq)).await;
+                    a.send(nid(1), framed_payload(task, seq)).await;
                 }
             }));
         }
@@ -1169,7 +1231,7 @@ mod tests {
             let env = tokio::time::timeout(Duration::from_secs(30), b.recv())
                 .await
                 .expect("recv timed out — frames lost or transport deadlocked");
-            assert_eq!(env.from, 0);
+            assert_eq!(env.from, nid(0));
             assert!(env.payload.len() >= 16, "truncated frame");
             let task = u64::from_be_bytes(env.payload[0..8].try_into().unwrap());
             let seq = u64::from_be_bytes(env.payload[8..16].try_into().unwrap());
@@ -1208,7 +1270,7 @@ mod tests {
         let (a, b, b_addr) = bound_pair(&dir_a, &dir_b).await;
 
         // Establish (and cache) the connection with one delivered frame.
-        a.send(1, b"before-restart".to_vec()).await;
+        a.send(nid(1), b"before-restart".to_vec()).await;
         let env = tokio::time::timeout(Duration::from_secs(10), b.recv())
             .await
             .expect("first recv timed out");
@@ -1222,7 +1284,7 @@ mod tests {
         drop(b);
         let deadline = Instant::now() + Duration::from_secs(10);
         let b2 = loop {
-            match ProdEnv::bind(1, b_addr, &dir_b).await {
+            match ProdEnv::bind(nid(1), b_addr, &dir_b).await {
                 Ok((env, _)) => break env,
                 Err(err) => {
                     assert!(
@@ -1239,10 +1301,10 @@ mod tests {
         // so poll until a frame arrives.
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            a.send(1, b"after-restart".to_vec()).await;
+            a.send(nid(1), b"after-restart".to_vec()).await;
             match tokio::time::timeout(Duration::from_millis(200), b2.recv()).await {
                 Ok(env) => {
-                    assert_eq!(env.from, 0);
+                    assert_eq!(env.from, nid(0));
                     assert_eq!(env.payload, b"after-restart");
                     break;
                 }
@@ -1273,23 +1335,23 @@ mod tests {
         let dir_c = unique_tmp_dir();
         let (a, b, _b_addr) = bound_pair(&dir_a, &dir_b).await;
         let loop0 = "127.0.0.1:0".parse::<SocketAddr>().unwrap();
-        let (c, c_addr) = ProdEnv::bind(2, loop0, &dir_c).await.expect("bind c");
+        let (c, c_addr) = ProdEnv::bind(nid(2), loop0, &dir_c).await.expect("bind c");
 
         // Before merging, `a` has no route to `c` at all — a send is simply
         // dropped (see `Network::send`'s doc), not an error.
-        a.send(2, b"too-early".to_vec()).await;
+        a.send(nid(2), b"too-early".to_vec()).await;
 
-        a.merge_peer(2, c_addr);
+        a.merge_peer(nid(2), c_addr);
 
         // The pre-existing entry for `b` still works...
-        a.send(1, b"still-reachable".to_vec()).await;
+        a.send(nid(1), b"still-reachable".to_vec()).await;
         let env = tokio::time::timeout(Duration::from_secs(10), b.recv())
             .await
             .expect("recv from b timed out");
         assert_eq!(env.payload, b"still-reachable");
 
         // ...and the newly merged entry for `c` now works too.
-        a.send(2, b"newly-reachable".to_vec()).await;
+        a.send(nid(2), b"newly-reachable".to_vec()).await;
         let env = tokio::time::timeout(Duration::from_secs(10), c.recv())
             .await
             .expect("recv from c timed out");
@@ -1312,7 +1374,7 @@ mod tests {
     #[tokio::test]
     async fn replace_and_sync_fsync_dirs_and_read_back() {
         let dir = unique_tmp_dir();
-        let (env, _addr) = ProdEnv::bind(0, "127.0.0.1:0".parse().unwrap(), &dir)
+        let (env, _addr) = ProdEnv::bind(nid(0), "127.0.0.1:0".parse().unwrap(), &dir)
             .await
             .expect("bind");
 

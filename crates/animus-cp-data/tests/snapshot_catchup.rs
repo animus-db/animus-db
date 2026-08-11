@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use animus_control::ProposeResult;
 use animus_cp_data::RaftKvNode;
+use animus_env::nid;
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::MemoryEngine;
 use futures::executor::block_on;
@@ -21,7 +22,13 @@ fn group(seed: u64) -> (Simulator, Vec<KvNode>) {
     let sim = Simulator::new(seed);
     let nodes = NODES
         .iter()
-        .map(|&id| RaftKvNode::start(sim.env(id), NODES.to_vec(), MemoryEngine::new()))
+        .map(|&id| {
+            RaftKvNode::start(
+                sim.env(nid(id)),
+                NODES.iter().copied().map(nid).collect(),
+                MemoryEngine::new(),
+            )
+        })
         .collect();
     (sim, nodes)
 }
@@ -51,7 +58,7 @@ fn lagging_follower_catches_up_via_snapshot() {
 
     // Crash the lagging follower (so it stays at its old term — no rejoin churn).
     // The surviving two are still a majority.
-    sim.crash(lagging as u64);
+    sim.crash(nid(lagging as u64));
 
     // Write well past the compaction threshold (64) so the leader snapshots and
     // truncates the log prefix the crashed follower would have needed.
@@ -70,7 +77,7 @@ fn lagging_follower_catches_up_via_snapshot() {
     // Restart the lagging follower. Its log is far behind the leader's compacted
     // base, so the leader must catch it up with an InstallSnapshot (engine image),
     // then replay the post-snapshot log tail on top.
-    sim.restart(lagging as u64);
+    sim.restart(nid(lagging as u64));
     sim.run_for(Duration::from_secs(6));
 
     // The recovered follower's engine converged to every write (sample the range).

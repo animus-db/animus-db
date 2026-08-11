@@ -22,6 +22,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use animus_env::NodeId;
 use animus_tablet::{Epoch, TabletId};
 use animusd::{
     ClientRequest, ClientResponse, ClusterConfig, MetaCommand, Node, NodeStatus, RoleAddrs,
@@ -131,13 +132,13 @@ async fn admin_get(addr: SocketAddr, path: &str) -> (u16, Value) {
 
 /// The local group's `(is_leader, voters)` for the bootstrap tablet, from this
 /// node's node-local admin view (per-process: one group per node).
-async fn group_view(admin_addr: SocketAddr) -> Option<(bool, Vec<u64>)> {
+async fn group_view(admin_addr: SocketAddr) -> Option<(bool, Vec<NodeId>)> {
     let (_s, v) = admin_get(admin_addr, "/admin/raftkv").await;
     let g = v["groups"].as_array()?.iter().find(|g| g["tablet"] == 1)?;
     let voters = g["voters"]
         .as_array()?
         .iter()
-        .filter_map(|x| x.as_u64())
+        .filter_map(|x| x.as_str()?.parse::<NodeId>().ok())
         .collect();
     Some((g["is_leader"].as_bool().unwrap_or(false), voters))
 }
@@ -155,6 +156,7 @@ async fn bring_up(n: usize, dir: &std::path::Path) -> (Vec<Node>, ClusterConfig)
         let cfg = ClusterConfig {
             nodes: (0..n)
                 .map(|i| RoleAddrs {
+                    id: animusd::config::node_id(i),
                     role: animusd::config::NodeRole::Both,
                     internal: a[5 * i],
                     client: a[5 * i + 1],
@@ -224,10 +226,10 @@ async fn cp_group_follows_tablet_replica_set() {
     let drop_idx = (0..3)
         .find(|&i| i != leader_idx)
         .expect("a follower exists");
-    let kept: Vec<u64> = raftkv_ids
+    let kept: Vec<NodeId> = raftkv_ids
         .iter()
-        .copied()
-        .filter(|&id| id != raftkv_ids[drop_idx])
+        .filter(|&id| *id != raftkv_ids[drop_idx])
+        .cloned()
         .collect();
     assert_eq!(kept.len(), 2);
 
@@ -275,7 +277,7 @@ async fn cp_group_follows_tablet_replica_set() {
     // take one extra heartbeat round trip versus the old unconditional removal
     // — a wider, 60s timeout (matching this file's spare-replacement test
     // below) absorbs that under real `cargo test --workspace` contention.
-    let dropped = raftkv_ids[drop_idx];
+    let dropped = raftkv_ids[drop_idx].clone();
     let reconfigured = async {
         loop {
             if let Some((is_leader, voters)) = group_view(nodes[leader_idx].admin_addr()).await
@@ -301,7 +303,7 @@ async fn cp_group_follows_tablet_replica_set() {
 
 /// `group_view` that returns `None` instead of panicking when the admin endpoint is
 /// unreachable (a killed node), so the cascade test can poll only the survivors.
-async fn group_view_opt(addr: SocketAddr) -> Option<(bool, Vec<u64>)> {
+async fn group_view_opt(addr: SocketAddr) -> Option<(bool, Vec<NodeId>)> {
     if TcpStream::connect(addr).await.is_err() {
         return None;
     }
@@ -374,7 +376,7 @@ async fn failure_auto_replaces_replica_onto_spare() {
     let (nodes, config) = bring_up(4, dir.path()).await;
     await_bootstrap(&nodes).await;
     let raftkv_ids = config.data_ids(); // [0, 1, 2, 3]
-    let spare = raftkv_ids[3];
+    let spare = raftkv_ids[3].clone();
     let clients: Vec<SocketAddr> = config.nodes.iter().map(|a| a.client).collect();
 
     // ADR 0023: provision the `kv` tablet by writing first (no bootstrap tablet); it
@@ -407,7 +409,7 @@ async fn failure_auto_replaces_replica_onto_spare() {
     let kill_idx = (0..3)
         .find(|&i| i != leader_idx)
         .expect("a follower replica exists");
-    let killed_id = raftkv_ids[kill_idx];
+    let killed_id = raftkv_ids[kill_idx].clone();
     nodes[kill_idx].shutdown();
     let survivors: Vec<usize> = (0..4).filter(|&i| i != kill_idx).collect();
     let survivor_clients: Vec<SocketAddr> =

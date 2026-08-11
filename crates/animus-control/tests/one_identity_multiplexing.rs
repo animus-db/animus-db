@@ -24,11 +24,13 @@ use std::time::Duration;
 
 use animus_control::raft::ProposeResult;
 use animus_control::{MetaCommand, NodeStatus, RaftNode};
-use animus_env::{Clock, EnvExt, Network, NodeId};
+use animus_env::{Clock, EnvExt, Network, NodeId, nid};
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::MemoryEngine;
 
-const NODES: [NodeId; 3] = [0, 1, 2];
+fn nodes() -> [NodeId; 3] {
+    [nid(0), nid(1), nid(2)]
+}
 
 /// The stand-in "per-tablet" stream this test drives alongside the control
 /// plane's own `PRIMARY_STREAM` (0) — any value `>= 1` mirrors a real tablet
@@ -95,9 +97,9 @@ fn spawn_tablet_stream_traffic(env: &SimEnv, peers: &[NodeId]) -> PingLog {
         env.spawn_task(async move {
             let mut seq: u64 = 0;
             loop {
-                for &peer in &peers {
+                for peer in &peers {
                     send_env
-                        .send_stream(peer, TABLET_STREAM, encode_ping(seq))
+                        .send_stream(peer.clone(), TABLET_STREAM, encode_ping(seq))
                         .await;
                 }
                 seq += 1;
@@ -144,7 +146,7 @@ fn received_from(log: &PingLog, sender: NodeId) -> usize {
 /// arrive" (a demux that interleaved/reordered stream 7 with stream 0
 /// traffic could still deliver every byte, just out of order).
 fn assert_all_runs_ordered(log: &PingLog, seed: u64) {
-    for (&sender, seqs) in log.lock().expect("ping log poisoned").iter() {
+    for (sender, seqs) in log.lock().expect("ping log poisoned").iter() {
         for w in seqs.windows(2) {
             assert!(
                 w[0] < w[1],
@@ -163,13 +165,13 @@ fn assert_all_runs_ordered(log: &PingLog, seed: u64) {
 fn control_raft_and_tablet_stream_traffic_multiplex_on_one_node_id() {
     let seed = 0x0040_0001;
     let mut sim = Simulator::new(seed);
-    let envs: Vec<SimEnv> = NODES.iter().map(|&id| sim.env(id)).collect();
+    let envs: Vec<SimEnv> = nodes().iter().map(|id| sim.env(id.clone())).collect();
 
     // The control-plane RaftNode, exactly as `control_raft.rs` builds it —
     // one per id, riding PRIMARY_STREAM (stream 0) by default.
     let raft_nodes: Vec<RaftNode<SimEnv>> = envs
         .iter()
-        .map(|env| RaftNode::start(env.clone(), NODES.to_vec(), MemoryEngine::new()))
+        .map(|env| RaftNode::start(env.clone(), nodes().to_vec(), MemoryEngine::new()))
         .collect();
 
     // The stand-in tablet-group traffic on the SAME ids/envs, stream 7.
@@ -177,7 +179,11 @@ fn control_raft_and_tablet_stream_traffic_multiplex_on_one_node_id() {
         .iter()
         .enumerate()
         .map(|(i, env)| {
-            let peers: Vec<NodeId> = NODES.iter().copied().filter(|&id| id != NODES[i]).collect();
+            let peers: Vec<NodeId> = nodes()
+                .iter()
+                .filter(|&id| *id != nodes()[i])
+                .cloned()
+                .collect();
             spawn_tablet_stream_traffic(env, &peers)
         })
         .collect();
@@ -187,7 +193,7 @@ fn control_raft_and_tablet_stream_traffic_multiplex_on_one_node_id() {
     let leader = unique_leader(&raft_nodes, &[0, 1, 2], seed);
 
     assert!(matches!(
-        raft_nodes[leader].propose(upsert(10)),
+        raft_nodes[leader].propose(upsert(nid(10))),
         ProposeResult::Accepted { .. }
     ));
     sim.run_for(Duration::from_secs(1));
@@ -200,17 +206,17 @@ fn control_raft_and_tablet_stream_traffic_multiplex_on_one_node_id() {
             "control metadata diverged at node {i} before any fault (seed={seed})"
         );
     }
-    assert!(reference.members.contains_key(&10));
+    assert!(reference.members.contains_key(&nid(10)));
 
     // Every node has heard from both peers on TABLET_STREAM by now, and
     // every run is in order.
     for (i, log) in ping_logs.iter().enumerate() {
-        for &peer in &NODES {
-            if peer == NODES[i] {
+        for peer in &nodes() {
+            if *peer == nodes()[i] {
                 continue;
             }
             assert!(
-                received_from(log, peer) > 0,
+                received_from(log, peer.clone()) > 0,
                 "node {i} never received a TABLET_STREAM ping from {peer} in steady state \
                  (seed={seed})"
             );
@@ -225,11 +231,11 @@ fn control_raft_and_tablet_stream_traffic_multiplex_on_one_node_id() {
     let other = (0..3)
         .find(|&i| i != leader && i != follower)
         .expect("a third node exists");
-    sim.partition_pair(NODES[follower], NODES[leader]);
-    sim.partition_pair(NODES[follower], NODES[other]);
+    sim.partition_pair(nodes()[follower].clone(), nodes()[leader].clone());
+    sim.partition_pair(nodes()[follower].clone(), nodes()[other].clone());
 
     let pre_partition_counts: Vec<usize> = (0..3)
-        .map(|i| received_from(&ping_logs[i], NODES[follower]))
+        .map(|i| received_from(&ping_logs[i], nodes()[follower].clone()))
         .collect();
     sim.run_for(Duration::from_secs(2));
 
@@ -247,7 +253,7 @@ fn control_raft_and_tablet_stream_traffic_multiplex_on_one_node_id() {
         if i == follower {
             continue;
         }
-        let after = received_from(&ping_logs[i], NODES[follower]);
+        let after = received_from(&ping_logs[i], nodes()[follower].clone());
         assert_eq!(
             after, pre_partition_counts[i],
             "node {i} kept receiving TABLET_STREAM pings from the partitioned \
@@ -257,8 +263,8 @@ fn control_raft_and_tablet_stream_traffic_multiplex_on_one_node_id() {
     }
 
     // ---- Phase 3: heal — both streams recover -----------------------------
-    sim.heal(NODES[follower], NODES[leader]);
-    sim.heal(NODES[follower], NODES[other]);
+    sim.heal(nodes()[follower].clone(), nodes()[leader].clone());
+    sim.heal(nodes()[follower].clone(), nodes()[other].clone());
     sim.run_for(Duration::from_secs(2));
 
     for i in 0..3 {
@@ -266,7 +272,7 @@ fn control_raft_and_tablet_stream_traffic_multiplex_on_one_node_id() {
             continue;
         }
         assert!(
-            received_from(&ping_logs[i], NODES[follower]) > pre_partition_counts[i],
+            received_from(&ping_logs[i], nodes()[follower].clone()) > pre_partition_counts[i],
             "node {i} never resumed receiving TABLET_STREAM pings from {follower} after heal \
              (seed={seed})"
         );
@@ -293,11 +299,11 @@ fn control_raft_and_tablet_stream_traffic_multiplex_on_one_node_id() {
         .iter()
         .map(|&i| {
             let other = survivors.iter().copied().find(|&j| j != i).unwrap();
-            received_from(&ping_logs[i], NODES[other])
+            received_from(&ping_logs[i], nodes()[other].clone())
         })
         .collect();
 
-    sim.crash(NODES[leader]);
+    sim.crash(nodes()[leader].clone());
     sim.run_for(Duration::from_secs(3));
 
     let new_leader = unique_leader(&raft_nodes, &survivors, seed);
@@ -312,7 +318,7 @@ fn control_raft_and_tablet_stream_traffic_multiplex_on_one_node_id() {
         "survivor metadata diverged after leader kill (seed={seed})"
     );
     assert!(
-        a.members.contains_key(&10),
+        a.members.contains_key(&nid(10)),
         "pre-kill write lost (seed={seed})"
     );
 
@@ -323,7 +329,7 @@ fn control_raft_and_tablet_stream_traffic_multiplex_on_one_node_id() {
     for (idx, &i) in survivors.iter().enumerate() {
         let other = survivors.iter().copied().find(|&j| j != i).unwrap();
         assert!(
-            received_from(&ping_logs[i], NODES[other]) > pre_kill_counts[idx],
+            received_from(&ping_logs[i], nodes()[other].clone()) > pre_kill_counts[idx],
             "survivor {i} stopped receiving TABLET_STREAM pings from {other} across the \
              leader kill/re-election (seed={seed})"
         );
@@ -337,7 +343,7 @@ fn control_raft_and_tablet_stream_traffic_multiplex_on_one_node_id() {
 
     // The control plane can still make progress on the new leader.
     assert!(matches!(
-        raft_nodes[new_leader].propose(upsert(11)),
+        raft_nodes[new_leader].propose(upsert(nid(11))),
         ProposeResult::Accepted { .. }
     ));
     sim.run_for(Duration::from_secs(2));
@@ -345,12 +351,12 @@ fn control_raft_and_tablet_stream_traffic_multiplex_on_one_node_id() {
         raft_nodes[survivors[0]]
             .metadata()
             .members
-            .contains_key(&11)
+            .contains_key(&nid(11))
     );
     assert!(
         raft_nodes[survivors[1]]
             .metadata()
             .members
-            .contains_key(&11)
+            .contains_key(&nid(11))
     );
 }

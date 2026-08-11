@@ -1,14 +1,15 @@
-//! **Cluster-allocated member ids** (ADR 0036): `animusd join --seed
+//! **Self-minted member ids** (ADR 0040 Decision B/C): `animusd join --seed
 //! ADDR[,ADDR...] --base-port P` and `animusd data --seed ADDR[,ADDR...]
-//! --base-port P`, both with **no `--node`** — the control plane mints the
-//! joining node's id atomically from `MetaCommand::AllocateNodeId`'s
-//! monotonic allocator instead of an operator picking a small index. The
-//! sibling of `tests/seed_join.rs`/`tests/data_join.rs` (which cover the
-//! `--node`-indexed path, left completely untouched by this change); this
-//! file exercises only what's new: no-index discovery + allocation,
-//! concurrent allocation safety, the data-only dual, the ephemeral-identity
-//! restart semantics, and the `is_relayable_command` regression for
-//! `AllocateNodeId` through a follower-connected seed.
+//! --base-port P`, both with no `--id` — this node self-mints its own id
+//! (`NodeId::mint`) and claims it via `MetaCommand::RegisterNode`'s
+//! registration CAS instead of an operator picking a small index or proposing
+//! an explicit `--id`. The sibling of `tests/seed_join.rs`/`tests/
+//! data_join.rs` (which cover the explicit-`--id` path, left completely
+//! untouched by this change); this file exercises only what's new: no-id
+//! discovery + self-minting, concurrent-registration safety, the data-only
+//! dual, the ephemeral-identity restart semantics, and the
+//! `is_relayable_command` regression for `RegisterNode` through a
+//! follower-connected seed.
 //!
 //! Real TCP/time — polls with generous timeouts, not deterministic
 //! assertions (a flaky `ProdEnv` test is a real bug, per the root
@@ -128,18 +129,31 @@ async fn admin(
 /// bound-and-started [`Node`] (unlike `client_addr()`/`admin_addr()`), so the
 /// allocated id a join actually landed on is only observable this way (or by
 /// diffing `Metadata.members`).
-async fn own_raftkv_id(admin_addr: SocketAddr) -> u64 {
+async fn own_raftkv_id(admin_addr: SocketAddr) -> animus_env::NodeId {
     let (status, body) = admin(admin_addr, "GET", "/admin/config", None).await;
     assert_eq!(status, 200, "GET /admin/config failed: {body}");
     body["node_id"]
-        .as_u64()
-        .expect("node_id present and numeric")
+        .as_str()
+        .expect("node_id present and a string")
+        .parse()
+        .expect("node_id parses")
 }
 
-fn member_status(nodes: &[Node], id: u64) -> Option<NodeStatus> {
+fn member_status(nodes: &[Node], id: &animus_env::NodeId) -> Option<NodeStatus> {
     nodes
         .iter()
-        .find_map(|n| n.metadata().members.get(&id).map(|m| m.status))
+        .find_map(|n| n.metadata().members.get(id).map(|m| m.status))
+}
+
+/// Whether `id` looks like a [`NodeId::mint`](animus_env::NodeId::mint)
+/// output — exactly 22 chars (128 bits of base64url, unpadded). There is no
+/// reserved prefix to check anymore (ADR 0040 retired the ADR 0036
+/// allocator's `"alloc-"` convention along with the allocator itself):
+/// uniqueness is now enforced structurally by the registration CAS, not by a
+/// namespace convention, so this is a sanity check on shape, not a
+/// disjointness proof.
+fn looks_minted(id: &animus_env::NodeId) -> bool {
+    id.as_str().chars().count() == 22
 }
 
 /// A table whose tablet currently lists `raftkv_id` as a replica, if any —
@@ -149,12 +163,12 @@ fn member_status(nodes: &[Node], id: u64) -> Option<NodeStatus> {
 /// returns, not an arbitrary one. Reads straight off `Node::metadata()`
 /// rather than admin JSON (`Metadata.tablets` already carries `table` +
 /// `replicas`).
-fn table_with_replica(nodes: &[Node], raftkv_id: u64) -> Option<String> {
+fn table_with_replica(nodes: &[Node], raftkv_id: &animus_env::NodeId) -> Option<String> {
     nodes.iter().find_map(|n| {
         n.metadata()
             .tablets
             .values()
-            .find(|t| t.replicas.contains(&raftkv_id))
+            .find(|t| t.replicas.contains(raftkv_id))
             .and_then(|t| t.table.clone())
     })
 }
@@ -221,7 +235,7 @@ async fn await_value(clients: &[SocketAddr], table: &str, key: &[u8], want: &[u8
         .unwrap_or_else(|_| panic!("key {table}/{key:?} never read back as {want:?}"));
 }
 
-async fn await_active(nodes: &[Node], id: u64, secs: u64) {
+async fn await_active(nodes: &[Node], id: &animus_env::NodeId, secs: u64) {
     timeout(Duration::from_secs(secs), async {
         loop {
             if member_status(nodes, id) == Some(NodeStatus::Active) {
@@ -234,7 +248,7 @@ async fn await_active(nodes: &[Node], id: u64, secs: u64) {
     .unwrap_or_else(|_| panic!("node {id} never promoted to Active"));
 }
 
-async fn await_replica(nodes: &[Node], id: u64, secs: u64) -> String {
+async fn await_replica(nodes: &[Node], id: &animus_env::NodeId, secs: u64) -> String {
     timeout(Duration::from_secs(secs), async {
         loop {
             if let Some(table) = table_with_replica(nodes, id) {
@@ -270,13 +284,13 @@ async fn no_node_join_becomes_active_and_gets_a_replica() {
     .await;
     let joined_id = own_raftkv_id(joined.admin_addr()).await;
     assert!(
-        joined_id >= 1_000_000,
-        "allocated id {joined_id} must land in the ADR 0036 disjoint range, \
-         well above any --node-derived id"
+        looks_minted(&joined_id),
+        "self-minted id {joined_id} must look like a NodeId::mint output, \
+         distinct from any --id-proposed id"
     );
 
-    await_active(&core_nodes, joined_id, 20).await;
-    let hosted_table = await_replica(&core_nodes, joined_id, 90).await;
+    await_active(&core_nodes, &joined_id, 20).await;
+    let hosted_table = await_replica(&core_nodes, &joined_id, 90).await;
 
     put(&[joined.client_addr()], &hosted_table, b"k1", b"v1", 30).await;
     await_value(&core_clients, &hosted_table, b"k1", b"v1", 30).await;
@@ -327,10 +341,10 @@ async fn two_concurrent_allocated_joins_get_distinct_ids() {
         id_a, id_b,
         "two concurrent join attempts must never be allocated the same id"
     );
-    assert!(id_a >= 1_000_000 && id_b >= 1_000_000);
+    assert!(looks_minted(&id_a) && looks_minted(&id_b));
 
-    await_active(&core_nodes, id_a, 20).await;
-    await_active(&core_nodes, id_b, 20).await;
+    await_active(&core_nodes, &id_a, 20).await;
+    await_active(&core_nodes, &id_b, 20).await;
 
     node_a.shutdown();
     node_b.shutdown();
@@ -363,10 +377,10 @@ async fn data_only_allocated_join_becomes_active_and_gets_a_replica() {
     let joined =
         join_data_allocated_fresh(&seeds, dir.path(), "data", StorageBackend::Memory).await;
     let joined_id = own_raftkv_id(joined.admin_addr()).await;
-    assert!(joined_id >= 1_000_000);
+    assert!(looks_minted(&joined_id));
 
-    await_active(&control_nodes, joined_id, 20).await;
-    let hosted_table = await_replica(&control_nodes, joined_id, 90).await;
+    await_active(&control_nodes, &joined_id, 20).await;
+    let hosted_table = await_replica(&control_nodes, &joined_id, 90).await;
 
     put(&[joined.client_addr()], &hosted_table, b"k1", b"v1", 30).await;
     await_value(&data_clients, &hosted_table, b"k1", b"v1", 30).await;
@@ -407,7 +421,7 @@ async fn ephemeral_identity_restart_gets_a_new_id_old_left_down_and_prunable() {
     )
     .await;
     let old_id = own_raftkv_id(first.admin_addr()).await;
-    await_active(&core_nodes, old_id, 20).await;
+    await_active(&core_nodes, &old_id, 20).await;
 
     // 2. "Restart": the process goes away without ever decommissioning —
     // exactly the abandoned-join / ephemeral-identity shape this ADR
@@ -428,14 +442,14 @@ async fn ephemeral_identity_restart_gets_a_new_id_old_left_down_and_prunable() {
         "a fresh join attempt after the old process went away must get a new id, \
          never reuse the old one"
     );
-    await_active(&core_nodes, new_id, 20).await;
+    await_active(&core_nodes, &new_id, 20).await;
 
     // 4. The old id's member entry lingers — the unmodified ADR 0012
     // heartbeat/failure-detector chain marks it `Down` once its heartbeats
     // stop (no new mechanism needed for this).
     timeout(Duration::from_secs(20), async {
         loop {
-            if member_status(&core_nodes, old_id) == Some(NodeStatus::Down) {
+            if member_status(&core_nodes, &old_id) == Some(NodeStatus::Down) {
                 return;
             }
             sleep(Duration::from_millis(100)).await;
@@ -447,13 +461,13 @@ async fn ephemeral_identity_restart_gets_a_new_id_old_left_down_and_prunable() {
     // 5. Prunable via the existing decommission primitive — no new cleanup
     // mechanism was added for this ADR.
     let leader_admin = core_admin[leader_index(&core_nodes)];
-    let body = serde_json::json!({"node": old_id}).to_string();
+    let body = serde_json::json!({"node": old_id.to_string()}).to_string();
     let (status, resp) = admin(leader_admin, "POST", "/admin/member/remove", Some(&body)).await;
     assert_eq!(status, 200, "member/remove failed: {resp}");
 
     timeout(Duration::from_secs(20), async {
         loop {
-            if member_status(&core_nodes, old_id).is_none() {
+            if member_status(&core_nodes, &old_id).is_none() {
                 return;
             }
             sleep(Duration::from_millis(100)).await;
@@ -469,9 +483,9 @@ async fn ephemeral_identity_restart_gets_a_new_id_old_left_down_and_prunable() {
 }
 
 /// **Follower-connected seed** (the `is_relayable_command` regression for
-/// `MetaCommand::AllocateNodeId`, ADR 0036): a joiner whose *only* seed is a
-/// non-leader control node still completes the whole allocate-and-confirm
-/// round trip — proving `AllocateNodeId` is actually in the relay allowlist
+/// `MetaCommand::RegisterNode`, ADR 0040): a joiner whose *only* seed is a
+/// non-leader control node still completes the whole mint-and-confirm
+/// round trip — proving `RegisterNode` is actually in the relay allowlist
 /// (a missed entry would hang this join until `JOIN_DISCOVERY_BUDGET`
 /// expires, indistinguishable from "no seed answered").
 #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
@@ -495,9 +509,9 @@ async fn follower_connected_seed_completes_the_allocate_node_id_round_trip() {
     )
     .await;
     let joined_id = own_raftkv_id(joined.admin_addr()).await;
-    assert!(joined_id >= 1_000_000);
+    assert!(looks_minted(&joined_id));
 
-    await_active(&core_nodes, joined_id, 20).await;
+    await_active(&core_nodes, &joined_id, 20).await;
 
     joined.shutdown();
     for node in core_nodes {

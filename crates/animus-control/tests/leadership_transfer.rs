@@ -30,13 +30,14 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use animus_control::{MetaCommand, ProposeResult, RaftCore, RaftMsg, Role};
-use animus_env::{Nanos, NodeId};
-
-const GROUP: [NodeId; 3] = [0, 1, 2];
+use animus_env::{Nanos, NodeId, nid};
+fn group() -> [NodeId; 3] {
+    [nid(0), nid(1), nid(2)]
+}
 const NOW: Nanos = Nanos(1_000_000_000);
 
 fn set(ids: &[NodeId]) -> BTreeSet<NodeId> {
-    ids.iter().copied().collect()
+    ids.iter().cloned().collect()
 }
 
 fn after(base: Nanos, d: Duration) -> Nanos {
@@ -55,14 +56,14 @@ fn heartbeat(leader: NodeId, term: u64) -> RaftMsg {
     }
 }
 
-/// Elect node `GROUP[0]` leader of the 3-node group (see
+/// Elect node `group()[0]` leader of the 3-node group (see
 /// `membership_commit_gate.rs`'s identical helper). The election no-op sits
 /// **uncommitted** at index 1 until a follower acks it.
 fn elect_leader() -> RaftCore {
-    let mut core: RaftCore = RaftCore::new(GROUP[0], &GROUP, Nanos(0), 7);
+    let mut core: RaftCore = RaftCore::new(group()[0].clone(), &group(), Nanos(0), 7);
     let _ = core.tick(NOW, 7);
     let _ = core.handle(
-        GROUP[1],
+        group()[1].clone(),
         RaftMsg::PreVoteResp {
             term: core.term() + 1,
             granted: true,
@@ -71,7 +72,7 @@ fn elect_leader() -> RaftCore {
         7,
     );
     let _ = core.handle(
-        GROUP[1],
+        group()[1].clone(),
         RaftMsg::RequestVoteResp {
             term: core.term(),
             granted: true,
@@ -109,19 +110,22 @@ fn transfer_leadership_rejects_self_a_laggard_and_a_non_member() {
     // so a target reasonably close — not necessarily bang up to date — is
     // eligible; see `transfer_leadership_freezes_proposals_...` below for why
     // that relaxation is safe).
-    ack_all(&mut core, 2);
+    ack_all(&mut core, nid(2));
     assert!(
         core.commit_index() > 0,
         "sanity: commit should have advanced"
     );
 
-    assert!(!core.transfer_leadership(0, NOW), "cannot transfer to self");
     assert!(
-        !core.transfer_leadership(1, NOW),
+        !core.transfer_leadership(nid(0), NOW),
+        "cannot transfer to self"
+    );
+    assert!(
+        !core.transfer_leadership(nid(1), NOW),
         "node 1 has not acked anything yet (match_index 0 < commit_index)"
     );
     assert!(
-        !core.transfer_leadership(99, NOW),
+        !core.transfer_leadership(nid(99), NOW),
         "99 is not in the current configuration"
     );
 }
@@ -129,15 +133,15 @@ fn transfer_leadership_rejects_self_a_laggard_and_a_non_member() {
 #[test]
 fn transfer_leadership_arms_a_caught_up_target_and_is_retried_every_heartbeat() {
     let mut core = elect_leader();
-    ack_all(&mut core, 1); // commits the no-op + fully catches node 1 up
+    ack_all(&mut core, nid(1)); // commits the no-op + fully catches node 1 up
 
-    assert!(core.transfer_leadership(1, NOW));
+    assert!(core.transfer_leadership(nid(1), NOW));
 
     let hb1 = after(NOW, Duration::from_millis(60));
     let outs1 = core.tick(hb1, 7);
     let sent: Vec<_> = outs1
         .iter()
-        .filter(|(to, m)| *to == 1 && matches!(m, RaftMsg::TimeoutNow { .. }))
+        .filter(|(to, m)| *to == nid(1) && matches!(m, RaftMsg::TimeoutNow { .. }))
         .collect();
     assert_eq!(
         sent.len(),
@@ -151,7 +155,7 @@ fn transfer_leadership_arms_a_caught_up_target_and_is_retried_every_heartbeat() 
     let outs2 = core.tick(hb2, 7);
     let sent2 = outs2
         .iter()
-        .filter(|(to, m)| *to == 1 && matches!(m, RaftMsg::TimeoutNow { .. }))
+        .filter(|(to, m)| *to == nid(1) && matches!(m, RaftMsg::TimeoutNow { .. }))
         .count();
     assert_eq!(
         sent2, 1,
@@ -167,7 +171,7 @@ fn transfer_leadership_arms_a_caught_up_target_and_is_retried_every_heartbeat() 
 #[test]
 fn transfer_leadership_freezes_proposals_and_waits_for_last_log_index_before_timeout_now() {
     let mut core = elect_leader();
-    ack_all(&mut core, 1); // node 1 matches last_log_index (1) == commit_index (1)
+    ack_all(&mut core, nid(1)); // node 1 matches last_log_index (1) == commit_index (1)
 
     // Grow the log past what node 1 has seen — it is now only caught up to
     // `commit_index`, not `last_log_index`.
@@ -176,11 +180,11 @@ fn transfer_leadership_freezes_proposals_and_waits_for_last_log_index_before_tim
         ProposeResult::Accepted { .. }
     ));
     assert_eq!(core.last_log_index(), 2);
-    assert_eq!(core.peer_match(1), 1);
+    assert_eq!(core.peer_match(&nid(1)), 1);
     assert_eq!(core.commit_index(), 1, "the new entry isn't acked yet");
 
     // Still armable: node 1 is caught up to commit_index (relaxed gate).
-    assert!(core.transfer_leadership(1, NOW));
+    assert!(core.transfer_leadership(nid(1), NOW));
 
     // No TimeoutNow yet — node 1 hasn't reached last_log_index.
     let hb1 = after(NOW, Duration::from_millis(60));
@@ -193,7 +197,7 @@ fn transfer_leadership_freezes_proposals_and_waits_for_last_log_index_before_tim
     );
     // The frozen leader must still replicate normally so node 1 can catch up.
     let replicated_to_one = outs1.iter().any(|(to, m)| {
-        *to == 1 && matches!(m, RaftMsg::AppendEntries { entries, .. } if !entries.is_empty())
+        *to == nid(1) && matches!(m, RaftMsg::AppendEntries { entries, .. } if !entries.is_empty())
     });
     assert!(
         replicated_to_one,
@@ -203,12 +207,12 @@ fn transfer_leadership_freezes_proposals_and_waits_for_last_log_index_before_tim
     // While armed, new proposals are rejected — the log must stop growing.
     let rejected = core.propose(MetaCommand::NoOp);
     assert!(
-        matches!(rejected, ProposeResult::NotLeader { leader: Some(1) }),
+        matches!(&rejected, ProposeResult::NotLeader { leader: Some(l) } if *l == nid(1)),
         "propose must freeze (and hint the transfer target) while armed: {rejected:?}"
     );
-    let rejected_cm = core.change_membership(set(&[0, 1]));
+    let rejected_cm = core.change_membership(set(&[nid(0), nid(1)]));
     assert!(
-        matches!(rejected_cm, ProposeResult::NotLeader { leader: Some(1) }),
+        matches!(&rejected_cm, ProposeResult::NotLeader { leader: Some(l) } if *l == nid(1)),
         "change_membership must freeze while armed: {rejected_cm:?}"
     );
     assert_eq!(
@@ -218,14 +222,14 @@ fn transfer_leadership_freezes_proposals_and_waits_for_last_log_index_before_tim
     );
 
     // Node 1 catches up to last_log_index (e.g. via the replication above).
-    ack_all(&mut core, 1);
-    assert_eq!(core.peer_match(1), 2);
+    ack_all(&mut core, nid(1));
+    assert_eq!(core.peer_match(&nid(1)), 2);
 
     let hb2 = after(hb1, Duration::from_millis(60));
     let outs2 = core.tick(hb2, 7);
     let sent = outs2
         .iter()
-        .filter(|(to, m)| *to == 1 && matches!(m, RaftMsg::TimeoutNow { .. }))
+        .filter(|(to, m)| *to == nid(1) && matches!(m, RaftMsg::TimeoutNow { .. }))
         .count();
     assert_eq!(
         sent, 1,
@@ -246,7 +250,7 @@ fn transfer_leadership_aborts_and_resumes_proposing_if_the_target_never_catches_
     // the relaxed gate is meant to admit, relying on replication (which never
     // arrives here, as if node 1 crashed) to close the gap.
     assert_eq!(core.commit_index(), 0);
-    assert!(core.transfer_leadership(1, NOW));
+    assert!(core.transfer_leadership(nid(1), NOW));
 
     // Node 1 never acks (as if it crashed / is partitioned) — proposals stay
     // frozen while ticks advance short of the deadline, and TimeoutNow must
@@ -298,15 +302,15 @@ fn transfer_leadership_aborts_and_resumes_proposing_if_the_target_never_catches_
 #[test]
 fn re_arming_the_same_target_does_not_extend_the_deadline() {
     let mut core = elect_leader();
-    ack_all(&mut core, 1);
-    assert!(core.transfer_leadership(1, NOW));
+    ack_all(&mut core, nid(1));
+    assert!(core.transfer_leadership(nid(1), NOW));
 
     // Re-arm to the same target repeatedly, as if a caller polled every tick,
     // right up to (but not past) the original deadline.
     let mut t = NOW;
     for _ in 0..4 {
         t = after(t, Duration::from_millis(30));
-        assert!(core.transfer_leadership(1, t), "idempotent re-arm");
+        assert!(core.transfer_leadership(nid(1), t), "idempotent re-arm");
     }
     assert!(t.0 < NOW.0 + Duration::from_millis(150).as_nanos() as u64);
 
@@ -326,21 +330,21 @@ fn re_arming_the_same_target_does_not_extend_the_deadline() {
 #[test]
 fn transfer_leadership_does_not_survive_a_fresh_election_win() {
     let mut core = elect_leader();
-    ack_all(&mut core, 1);
-    assert!(core.transfer_leadership(1, NOW));
+    ack_all(&mut core, nid(1));
+    assert!(core.transfer_leadership(nid(1), NOW));
 
     // Deposed by a higher-term leader (node 2). The generic higher-term
     // step-down at the top of `handle` flips role/term before the message is
     // even dispatched to its specific handler.
     let depose_at = after(NOW, Duration::from_secs(1));
-    core.handle(2, heartbeat(2, core.term() + 1), depose_at, 7);
+    core.handle(nid(2), heartbeat(nid(2), core.term() + 1), depose_at, 7);
     assert_eq!(core.role(), Role::Follower);
 
     // Re-win a later election the normal way (pre-vote, then the real vote).
     let t = after(depose_at, Duration::from_secs(1));
     let _ = core.tick(t, 7); // election timeout -> pre-candidate
     let _ = core.handle(
-        1,
+        nid(1),
         RaftMsg::PreVoteResp {
             term: core.term() + 1,
             granted: true,
@@ -349,7 +353,7 @@ fn transfer_leadership_does_not_survive_a_fresh_election_win() {
         7,
     );
     let _ = core.handle(
-        1,
+        nid(1),
         RaftMsg::RequestVoteResp {
             term: core.term(),
             granted: true,
@@ -372,16 +376,16 @@ fn transfer_leadership_does_not_survive_a_fresh_election_win() {
 
 #[test]
 fn timeout_now_triggers_immediate_election_bypassing_pre_vote_and_costs_one_term() {
-    let mut core: RaftCore = RaftCore::new(1, &GROUP, Nanos(0), 7);
+    let mut core: RaftCore = RaftCore::new(nid(1), &group(), Nanos(0), 7);
     // A live leader's heartbeat gives this follower a "lease" that would make a
     // normal election-timeout tick only start a *pre-vote* round (see
     // pre_vote.rs), never campaign directly.
-    core.handle(0, heartbeat(0, 5), NOW, 7);
+    core.handle(nid(0), heartbeat(nid(0), 5), NOW, 7);
     assert_eq!(core.term(), 5);
     assert_eq!(core.role(), Role::Follower);
 
     let after_hb = after(NOW, Duration::from_millis(1));
-    let outs = core.handle(0, RaftMsg::TimeoutNow { term: 5 }, after_hb, 7);
+    let outs = core.handle(nid(0), RaftMsg::TimeoutNow { term: 5 }, after_hb, 7);
 
     assert_eq!(
         core.role(),
@@ -400,10 +404,10 @@ fn timeout_now_triggers_immediate_election_bypassing_pre_vote_and_costs_one_term
 #[test]
 fn timeout_now_is_ignored_when_stale_already_leader_or_not_a_voter() {
     // Stale term: this node already moved on from the term the transfer named.
-    let mut stale: RaftCore = RaftCore::new(1, &GROUP, Nanos(0), 7);
-    stale.handle(0, heartbeat(0, 5), NOW, 7);
+    let mut stale: RaftCore = RaftCore::new(nid(1), &group(), Nanos(0), 7);
+    stale.handle(nid(0), heartbeat(nid(0), 5), NOW, 7);
     let outs = stale.handle(
-        0,
+        nid(0),
         RaftMsg::TimeoutNow { term: 4 },
         after(NOW, Duration::from_millis(1)),
         7,
@@ -419,14 +423,14 @@ fn timeout_now_is_ignored_when_stale_already_leader_or_not_a_voter() {
     // Already the leader: nonsensical to timeout-now ourselves.
     let mut leader = elect_leader();
     let leader_term = leader.term();
-    let outs2 = leader.handle(1, RaftMsg::TimeoutNow { term: leader_term }, NOW, 7);
+    let outs2 = leader.handle(nid(1), RaftMsg::TimeoutNow { term: leader_term }, NOW, 7);
     assert!(outs2.is_empty());
     assert!(leader.is_leader());
 
     // Not a voter: this node's id was never part of the configuration.
-    let not_voter_group: [NodeId; 2] = [0, 2];
-    let mut not_voter: RaftCore = RaftCore::new(1, &not_voter_group, Nanos(0), 7);
-    let outs3 = not_voter.handle(0, RaftMsg::TimeoutNow { term: 0 }, NOW, 7);
+    let not_voter_group: [NodeId; 2] = [nid(0), nid(2)];
+    let mut not_voter: RaftCore = RaftCore::new(nid(1), &not_voter_group, Nanos(0), 7);
+    let outs3 = not_voter.handle(nid(0), RaftMsg::TimeoutNow { term: 0 }, NOW, 7);
     assert!(outs3.is_empty());
     assert_eq!(not_voter.role(), Role::Follower);
 }
@@ -443,10 +447,10 @@ fn timeout_now_is_ignored_when_stale_already_leader_or_not_a_voter() {
 #[test]
 fn departing_peer_keeps_receiving_the_removal_entry_until_it_acks() {
     let mut core = elect_leader();
-    ack_all(&mut core, 1);
-    ack_all(&mut core, 2);
+    ack_all(&mut core, nid(1));
+    ack_all(&mut core, nid(2));
 
-    let result = core.change_membership(set(&[0, 1]));
+    let result = core.change_membership(set(&[nid(0), nid(1)]));
     assert!(
         matches!(result, ProposeResult::Accepted { .. }),
         "{result:?}"
@@ -454,13 +458,13 @@ fn departing_peer_keeps_receiving_the_removal_entry_until_it_acks() {
     let removal_index = core.last_log_index();
 
     // Node 2 is out of the active configuration immediately.
-    assert!(!core.config().contains(&2));
+    assert!(!core.config().contains(&nid(2)));
 
     // But the next heartbeat must still target it, carrying the entry that
     // removed it.
     let hb1 = after(NOW, Duration::from_millis(60));
     let outs1 = core.tick(hb1, 7);
-    let to_two: Vec<_> = outs1.iter().filter(|(to, _)| *to == 2).collect();
+    let to_two: Vec<_> = outs1.iter().filter(|(to, _)| *to == nid(2)).collect();
     assert_eq!(
         to_two.len(),
         1,
@@ -481,7 +485,7 @@ fn departing_peer_keeps_receiving_the_removal_entry_until_it_acks() {
     // Once node 2 acks past the removal index, it durably has the config
     // excluding itself — stop targeting it.
     core.handle(
-        2,
+        nid(2),
         RaftMsg::AppendEntriesResp {
             term: core.term(),
             success: true,
@@ -493,7 +497,7 @@ fn departing_peer_keeps_receiving_the_removal_entry_until_it_acks() {
     let hb2 = after(hb1, Duration::from_millis(60));
     let outs2 = core.tick(hb2, 7);
     assert!(
-        outs2.iter().all(|(to, _)| *to != 2),
+        outs2.iter().all(|(to, _)| *to != nid(2)),
         "a caught-up departed peer must not be re-targeted: {outs2:?}"
     );
 }
@@ -504,16 +508,16 @@ fn departing_peer_keeps_receiving_the_removal_entry_until_it_acks() {
 #[test]
 fn a_peer_re_added_before_catching_up_on_removal_is_no_longer_departing() {
     let mut core = elect_leader();
-    ack_all(&mut core, 1);
-    ack_all(&mut core, 2);
+    ack_all(&mut core, nid(1));
+    ack_all(&mut core, nid(2));
 
     assert!(matches!(
-        core.change_membership(set(&[0, 1])),
+        core.change_membership(set(&[nid(0), nid(1)])),
         ProposeResult::Accepted { .. }
     ));
     // Commit the removal so a second single-server change is accepted.
     core.handle(
-        1,
+        nid(1),
         RaftMsg::AppendEntriesResp {
             term: core.term(),
             success: true,
@@ -523,16 +527,16 @@ fn a_peer_re_added_before_catching_up_on_removal_is_no_longer_departing() {
         7,
     );
     assert!(matches!(
-        core.change_membership(set(&[0, 1, 2])),
+        core.change_membership(set(&[nid(0), nid(1), nid(2)])),
         ProposeResult::Accepted { .. }
     ));
-    assert!(core.config().contains(&2));
+    assert!(core.config().contains(&nid(2)));
 
     // Node 2 is back in `peers`, so it is no longer separately tracked as
     // departing (no duplicate targeting).
     let hb = after(NOW, Duration::from_millis(60));
     let outs = core.tick(hb, 7);
-    let to_two = outs.iter().filter(|(to, _)| *to == 2).count();
+    let to_two = outs.iter().filter(|(to, _)| *to == nid(2)).count();
     assert_eq!(
         to_two, 1,
         "re-added peer should be targeted once, as an ordinary peer: {outs:?}"

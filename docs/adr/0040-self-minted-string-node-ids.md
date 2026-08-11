@@ -1,11 +1,14 @@
 # ADR 0040 — Self-minted string node identities and registration-CAS membership
 
-- **Status:** Accepted — staged implementation. **PR1 of this ADR's 6-PR stack
-  is what this commit lands: Decision A (one identity per node) only.**
-  Decisions B, C, and D below are accepted design but not yet built; each
-  lands in a later PR of the same stack (see "Staged implementation" below).
-  Do not read this ADR as describing the code as it stands today in full —
-  it describes the whole arc the stack is converging on.
+- **Status:** Accepted — staged implementation. **PR4 of this ADR's 6-PR
+  stack lands here: Decision C (the `RegisterNode` registration CAS,
+  retiring the ADR 0036 allocator) and the join-path/`control-add` half of
+  Decision D.** PR1 (Decision A, one identity per node), PR2 (the opaque
+  `NodeId` newtype), and PR3 (Decision B in full — the string
+  representation, config `id` fields, minting groundwork) already landed;
+  PR5 (doc/ADR-amendment cleanup) and PR6 (the orphan-member auto-reclaim
+  sweep) remain. Do not read this ADR as describing the code as it stands
+  today in full — it describes the whole arc the stack is converging on.
 - **Date:** 2026-08-11
 
 ## Context
@@ -109,7 +112,7 @@ exception (ADR 0003's one sanctioned deviation) — minting moves onto the
 seam, through a small `Rng` impl `animus_env::prod` exports for the CLI
 boundary, and through `SimEnv`'s existing seeded `Rng` for tests.
 
-### Decision C — registration-CAS membership (retires ADR 0036's allocator)
+### Decision C — registration-CAS membership (retires ADR 0036's allocator) (**PR4**)
 
 `MetaCommand::RegisterNode { node, addrs, labels }` replaces both the
 self-registration path and `MetaCommand::AllocateNodeId` entirely. Apply-time
@@ -125,7 +128,7 @@ retires `Metadata.next_alloc_id`/`node_id_allocations`, `ALLOC_ID_BASE`,
 `syskv::EntityKind::NodeIdAlloc`, and `generate_join_nonce`'s OS-randomness
 exception.
 
-### Decision D — config/CLI shape (clean break)
+### Decision D — config/CLI shape (clean break) (**config half landed PR3; join/`control-add` half landed PR4**)
 
 Config files gain an explicit per-node `id: String` field (validated unique
 at load). `gen-config` mints `"n0".."n{N-1}"` (zero-padded once `N >= 10` —
@@ -133,9 +136,15 @@ lexicographic string order, not numeric). `--config FILE --node I` keeps `I`
 as a positional *index* into the config; the entry's own `id` is the
 identity. `join`/`data --seed`'s `--node I` sugar is removed outright; `--id
 NAME` proposes a durable identity, omitting it self-mints an ephemeral one
-(ADR 0036's contract, carried forward). This is a **clean break**: per this
-repo's standing "no live deployments" rule, no config/wire/WAL back-compat
-with any pre-ADR-0040 deployment is provided or attempted.
+(ADR 0036's contract, carried forward). `control-add`'s omitted-`node` form
+mints the same way (`NodeId::mint` off the leader's own bound `Env`) and its
+operator-supplied form drops the `ALLOC_ID_BASE`-range refusal (no ranges
+exist anymore) — an id that already names an existing data-plane member now
+*succeeds* (promotion, not a conflict: ADR 0040 PR1 already unified the id
+space, so there is no separate control-id range left to collide with). This
+is a **clean break**: per this repo's standing "no live deployments" rule, no
+config/wire/WAL back-compat with any pre-ADR-0040 deployment is provided or
+attempted.
 
 ## Consequences
 
@@ -186,18 +195,33 @@ with any pre-ADR-0040 deployment is provided or attempted.
 
 This is a 6-PR stack, each independently reviewable, stacked in this order:
 
-1. **PR1 (this commit)** — Decision A: one identity per node, `NodeId` still
+1. **PR1 (landed)** — Decision A: one identity per node, `NodeId` still
    `u64`. Everything in "Decision A" above.
-2. **PR2** — `NodeId(u64)` newtype (stays `Copy`, no arithmetic, `Display`,
-   a `nid(u64)` test helper); a behavior-, wire-, and WAL-byte-neutral
-   mechanical sweep proving the type is opaque before any representation
-   change lands.
-3. **PR3** — Decision B in full: `NodeId(Arc<str>)`, the charset, config `id`
-   fields + `gen-config`/`--cluster*` minting, `syskv`/`mirror`/`codec.rs`
-   encodings, the `ProdEnv` wire frame, dashboard JS sorts, CLI arg types.
-4. **PR4** — Decision C: `RegisterNode` CAS + self-minting; retires the ADR
-   0036 allocator (`AllocateNodeId`, the ledger, `ALLOC_ID_BASE`,
-   `NodeIdAlloc`, `generate_join_nonce`'s exception, `check_join_collision`).
+2. **PR2 (landed)** — `NodeId(u64)` newtype (stays `Copy`, no arithmetic,
+   `Display`, a `nid(u64)` test helper); a behavior-, wire-, and WAL-byte-
+   neutral mechanical sweep proving the type is opaque before any
+   representation change lands.
+3. **PR3 (landed)** — Decision B in full: `NodeId(Arc<str>)`, the charset,
+   config `id` fields + `gen-config`/`--cluster*` minting, `syskv`/`mirror`/
+   `codec.rs` encodings, the `ProdEnv` wire frame, dashboard JS sorts, CLI arg
+   types. PR3 also shipped a deliberate one-PR shim (`meta::alloc_node_id`/
+   `parse_alloc_id`, an `"alloc-{n}"`-prefixed string mint over the old
+   `AllocateNodeId` counter) so the allocator kept working with string ids for
+   exactly one PR before PR4 retired it outright.
+4. **PR4 (this commit)** — Decision C in full (`NodeId::mint`,
+   `MetaCommand::RegisterNode`'s registration CAS, `is_relayable_command`) and
+   the join-path/`control-add` half of Decision D: retires the ADR 0036
+   allocator and PR3's shim alike (`AllocateNodeId`, `next_alloc_id`/
+   `node_id_allocations`, `ALLOC_ID_BASE`, `alloc_node_id`/`parse_alloc_id`,
+   `syskv::EntityKind::NodeIdAlloc`, `generate_join_nonce`'s OS-randomness
+   exception — replaced by `animus_env::prod::PreBindRng`,
+   `check_join_collision`, `ClientRequest::AllocateNodeId`/
+   `ClientResponse::NodeIdAllocated`); `join`/`data --seed` drop `--node I`
+   for `--id NAME` (validated, durable) or self-mint (omitted, ephemeral);
+   `admin_add_control_member` mints via the leader's own `Env` and deletes the
+   `ALLOC_ID_BASE`-range refusal (no ranges exist anymore) and the
+   "already exists as a member" refusal (promoting an existing member to a
+   control voter is the common case now, not a conflict).
 5. **PR5** — cleanup/docs: delete `Coresident`; amendment stanzas on ADRs
    0012, 0026, 0030, 0032, 0035, 0036, 0037, 0038 (this ADR's own Decision
    text above previews what each amendment will say); `docs/engineering-

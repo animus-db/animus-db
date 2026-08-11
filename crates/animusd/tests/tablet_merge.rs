@@ -31,6 +31,7 @@ async fn bring_up(
         let addrs = support::free_addrs(n * 5);
         let nodes_cfg: Vec<animusd::RoleAddrs> = (0..n)
             .map(|i| animusd::RoleAddrs {
+                id: animusd::config::node_id(i),
                 role: animusd::config::NodeRole::Both,
                 internal: addrs[5 * i],
                 client: addrs[5 * i + 1],

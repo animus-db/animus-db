@@ -7,7 +7,7 @@
 
 use animus_control::persist::PersistedState;
 use animus_control::raft::{RaftCore, StateMachine};
-use animus_env::Nanos;
+use animus_env::{Nanos, nid};
 use serde::{Deserialize, Serialize};
 
 /// A toy KV command: set a key, or the election no-op.
@@ -52,7 +52,7 @@ fn persist(
 #[test]
 fn raft_core_drives_an_arbitrary_state_machine() {
     let mut wal = Vec::new();
-    let mut core: KvCore = RaftCore::new(0, &[0], Nanos(0), 7);
+    let mut core: KvCore = RaftCore::new(nid(0), &[nid(0)], Nanos(0), 7);
     core.tick(Nanos(1_000_000_000), 7); // election timeout -> sole leader
     persist(&mut core, &mut wal);
     assert!(core.is_leader(), "single-node group elects itself");
@@ -84,8 +84,13 @@ fn raft_core_drives_an_arbitrary_state_machine() {
     // store — the generic snapshot/recovery path works for a non-Metadata SM.
     core.snapshot();
     let image = core.wal_image();
-    let recovered: KvCore =
-        RaftCore::recovered(0, &[0], PersistedState::replay(image), Nanos(0), 7);
+    let recovered: KvCore = RaftCore::recovered(
+        nid(0),
+        &[nid(0)],
+        PersistedState::replay(image),
+        Nanos(0),
+        7,
+    );
     assert_eq!(
         recovered.state(),
         core.state(),
@@ -93,7 +98,8 @@ fn raft_core_drives_an_arbitrary_state_machine() {
     );
 
     // And recovery from the full WAL tail (no snapshot) re-applies correctly.
-    let from_wal: KvCore = RaftCore::recovered(0, &[0], PersistedState::replay(wal), Nanos(0), 7);
+    let from_wal: KvCore =
+        RaftCore::recovered(nid(0), &[nid(0)], PersistedState::replay(wal), Nanos(0), 7);
     // The recovered node re-elects and re-advances commit over its tail.
     let mut from_wal = from_wal;
     from_wal.tick(Nanos(2_000_000_000), 7);

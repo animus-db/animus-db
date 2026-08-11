@@ -25,6 +25,7 @@ use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
 mod support;
+use animus_env::nid;
 use support::{await_data_nodes_active, await_leader, bring_up_split};
 
 async fn call(addr: SocketAddr, req: ClientRequest) -> Option<ClientResponse> {
@@ -127,12 +128,13 @@ async fn add_control_member(
     node: u64,
     addr: SocketAddr,
 ) -> (u16, serde_json::Value) {
-    let body = serde_json::json!({"node": node, "addr": addr.to_string()}).to_string();
+    let body =
+        serde_json::json!({"node": nid(node).to_string(), "addr": addr.to_string()}).to_string();
     admin(admin_addr, "POST", "/admin/control/member/add", Some(&body)).await
 }
 
 async fn remove_control_member(admin_addr: SocketAddr, node: u64) -> (u16, serde_json::Value) {
-    let body = serde_json::json!({"node": node}).to_string();
+    let body = serde_json::json!({"node": nid(node).to_string()}).to_string();
     admin(
         admin_addr,
         "POST",
@@ -142,10 +144,12 @@ async fn remove_control_member(admin_addr: SocketAddr, node: u64) -> (u16, serde
     .await
 }
 
-fn voters_of(body: &serde_json::Value) -> Option<Vec<u64>> {
-    body["voters"]
-        .as_array()
-        .map(|a| a.iter().filter_map(serde_json::Value::as_u64).collect())
+fn voters_of(body: &serde_json::Value) -> Option<Vec<String>> {
+    body["voters"].as_array().map(|a| {
+        a.iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect()
+    })
 }
 
 /// Join a **quiet non-voter** control-only node to the split deployment
@@ -165,6 +169,7 @@ async fn join_control_nonvoter(
     for attempt in 0..16 {
         let raw = support::free_addrs(5);
         let addrs = RoleAddrs {
+            id: nid(new_control_id),
             role: NodeRole::Control,
             internal: raw[0],
             client: raw[1],
@@ -173,8 +178,8 @@ async fn join_control_nonvoter(
             admin: raw[4],
         };
         let bound = match animusd::Node::bind_control(
-            new_control_id,
-            addrs,
+            nid(new_control_id),
+            addrs.clone(),
             dir.join(format!("grow-{new_control_id}-{attempt}")),
         )
         .await
@@ -208,11 +213,12 @@ async fn join_control_nonvoter(
 /// Poll `GET /admin/control/members` on every address in `probes` until each
 /// reports exactly `want` as its voter set.
 async fn await_voters_everywhere(probes: &[SocketAddr], want: &[u64], secs: u64, what: &str) {
+    let want: Vec<String> = want.iter().map(|&n| nid(n).to_string()).collect();
     for &addr in probes {
         let converged = async {
             loop {
                 let (status, body) = control_members(addr).await;
-                if status == 200 && voters_of(&body).as_deref() == Some(want) {
+                if status == 200 && voters_of(&body).as_deref() == Some(want.as_slice()) {
                     return;
                 }
                 sleep(Duration::from_millis(150)).await;
@@ -308,6 +314,30 @@ async fn grow_then_replace_a_voter_over_a_split_deployment_with_live_data_traffi
         let (grown, grown_addrs) = join_control_nonvoter(&config, new_id, dir.path()).await;
         let grown_admin = grown.admin_addr();
         let grown_control_addr = grown_addrs.internal;
+
+        // Wait for `grown`'s own one-shot self-registration (`MetaCommand::
+        // RegisterNode`'s CAS, ADR 0040 PR4) to land before adding it as a
+        // control voter — calling `control/member/add` first races two
+        // *independent* proposals for the same id's `node_addrs` entry
+        // against each other, and the CAS correctly refuses whichever loses
+        // (unlike the pre-ADR-0040 blind-overwrite behavior this
+        // supersedes) — mirrors `control_membership_admin.rs`'s identical
+        // "confirm it's up first" sequencing (plan §3's real operator
+        // runbook).
+        timeout(Duration::from_secs(15), async {
+            loop {
+                if control_nodes[leader_idx]
+                    .metadata()
+                    .node_addrs
+                    .contains_key(&nid(new_id))
+                {
+                    return;
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("grown node's own self-registration never landed on the real cluster");
 
         let (status, body) =
             add_control_member(control_admin[leader_idx], new_id, grown_control_addr).await;

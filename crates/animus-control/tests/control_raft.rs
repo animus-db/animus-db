@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use animus_control::raft::ProposeResult;
 use animus_control::{MetaCommand, Metadata, NodeStatus, RaftNode};
+use animus_env::nid;
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::MemoryEngine;
 use animus_tablet::{Epoch, KeyRange, TabletId};
@@ -19,7 +20,13 @@ fn cluster(seed: u64) -> (Simulator, Vec<RaftNode<SimEnv>>) {
     let sim = Simulator::new(seed);
     let nodes = NODES
         .iter()
-        .map(|&id| RaftNode::start(sim.env(id), NODES.to_vec(), MemoryEngine::new()))
+        .map(|&id| {
+            RaftNode::start(
+                sim.env(nid(id)),
+                NODES.iter().copied().map(nid).collect(),
+                MemoryEngine::new(),
+            )
+        })
         .collect();
     (sim, nodes)
 }
@@ -41,7 +48,7 @@ fn unique_leader(nodes: &[RaftNode<SimEnv>], live: &[usize], seed: u64) -> usize
 
 fn upsert(node: u64) -> MetaCommand {
     MetaCommand::UpsertMember {
-        node,
+        node: nid(node),
         labels: [("region".to_string(), "eu-west".to_string())]
             .into_iter()
             .collect(),
@@ -62,7 +69,7 @@ fn elects_a_single_stable_leader() {
         assert_eq!(n.term(), term, "term disagreement (seed={seed})");
         assert_eq!(
             n.leader(),
-            Some(leader as u64),
+            Some(nid(leader as u64)),
             "leader disagreement (seed={seed})"
         );
     }
@@ -87,7 +94,7 @@ fn replicates_metadata_in_total_order() {
             tablet: TabletId(1),
             table: None,
             range: KeyRange::whole(),
-            replicas: NODES.to_vec(),
+            replicas: NODES.iter().copied().map(nid).collect(),
         }),
         ProposeResult::Accepted { .. }
     ));
@@ -97,7 +104,7 @@ fn replicates_metadata_in_total_order() {
     assert_eq!(
         nodes[follower].propose(upsert(99)),
         ProposeResult::NotLeader {
-            leader: Some(leader as u64)
+            leader: Some(nid(leader as u64))
         }
     );
 
@@ -139,12 +146,12 @@ fn survives_leader_kill_without_divergence() {
     let survivors: Vec<usize> = (0..3).filter(|&i| i != old_leader).collect();
     let pre_kill_meta = nodes[survivors[0]].metadata();
     assert!(
-        pre_kill_meta.members.contains_key(&7),
+        pre_kill_meta.members.contains_key(&nid(7)),
         "committed write not replicated pre-kill"
     );
 
     // Kill the leader; the survivors must re-elect among themselves.
-    sim.crash(old_leader as u64);
+    sim.crash(nid(old_leader as u64));
     sim.run_for(Duration::from_secs(3));
 
     let new_leader = unique_leader(&nodes, &survivors, seed);
@@ -165,7 +172,7 @@ fn survives_leader_kill_without_divergence() {
         "survivor metadata diverged after leader kill (seed={seed})"
     );
     assert!(
-        a.members.contains_key(&7),
+        a.members.contains_key(&nid(7)),
         "acknowledged write lost across leader kill (seed={seed})"
     );
 
@@ -175,8 +182,8 @@ fn survives_leader_kill_without_divergence() {
         ProposeResult::Accepted { .. }
     ));
     sim.run_for(Duration::from_secs(2));
-    assert!(nodes[survivors[0]].metadata().members.contains_key(&8));
-    assert!(nodes[survivors[1]].metadata().members.contains_key(&8));
+    assert!(nodes[survivors[0]].metadata().members.contains_key(&nid(8)));
+    assert!(nodes[survivors[1]].metadata().members.contains_key(&nid(8)));
 }
 
 #[test]
@@ -190,18 +197,18 @@ fn cas_epoch_transactions_are_enforced() {
         tablet: TabletId(1),
         table: None,
         range: KeyRange::whole(),
-        replicas: vec![0, 1, 2],
+        replicas: vec![nid(0), nid(1), nid(2)],
     });
     // A correct-epoch CAS, then a stale-epoch CAS (must be rejected on apply).
     nodes[leader].propose(MetaCommand::CasTabletReplicas {
         tablet: TabletId(1),
         expected_epoch: Epoch::INITIAL,
-        replicas: vec![0, 1],
+        replicas: vec![nid(0), nid(1)],
     });
     nodes[leader].propose(MetaCommand::CasTabletReplicas {
         tablet: TabletId(1),
         expected_epoch: Epoch::INITIAL, // stale: epoch is now 2
-        replicas: vec![2],
+        replicas: vec![nid(2)],
     });
     sim.run_for(Duration::from_secs(2));
 
@@ -213,7 +220,7 @@ fn cas_epoch_transactions_are_enforced() {
     );
     assert_eq!(
         tablet.replicas,
-        vec![0, 1],
+        vec![nid(0), nid(1)],
         "stale CAS must not have taken effect"
     );
 

@@ -17,13 +17,13 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use animus_control::{MetaCommand, NodeStatus, PersistedState, RaftNode, WalRecord, mirror};
-use animus_env::{Disk, EnvExt};
+use animus_env::{Disk, EnvExt, nid};
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::MemoryEngine;
 
 fn upsert(node: u64) -> MetaCommand {
     MetaCommand::UpsertMember {
-        node,
+        node: nid(node),
         labels: BTreeMap::new(),
         status: NodeStatus::Active,
     }
@@ -46,7 +46,7 @@ async fn driver_truncates_the_wal_and_the_engine_stays_the_source_of_truth() {
     let seed = 0x_C0FFEE;
     let mut sim = Simulator::new(seed);
     let engine = MemoryEngine::new();
-    let node = RaftNode::start(sim.env(0), vec![0], engine.clone()); // single-node group
+    let node = RaftNode::start(sim.env(nid(0)), vec![nid(0)], engine.clone()); // single-node group
     sim.run_for(Duration::from_secs(1)); // elect
 
     for i in 0..80 {
@@ -105,7 +105,7 @@ fn crash_during_sustained_compaction_recovers_to_the_uninterrupted_reference_sta
     // Reference: an uninterrupted run at the same seed.
     let reference = {
         let mut sim = Simulator::new(seed);
-        let node = RaftNode::start(sim.env(0), vec![0], MemoryEngine::new());
+        let node = RaftNode::start(sim.env(nid(0)), vec![nid(0)], MemoryEngine::new());
         sim.run_for(Duration::from_secs(1));
         for i in 0..200u64 {
             node.propose(upsert(i));
@@ -119,7 +119,7 @@ fn crash_during_sustained_compaction_recovers_to_the_uninterrupted_reference_sta
     // restart on the same disk *and* the same (durable) engine.
     let mut sim = Simulator::new(seed);
     let engine = MemoryEngine::new();
-    let node = RaftNode::start(sim.env(0), vec![0], engine.clone());
+    let node = RaftNode::start(sim.env(nid(0)), vec![nid(0)], engine.clone());
     sim.run_for(Duration::from_secs(1));
     for i in 0..200u64 {
         node.propose(upsert(i));
@@ -127,9 +127,9 @@ fn crash_during_sustained_compaction_recovers_to_the_uninterrupted_reference_sta
     // Advance just long enough for compaction/snapshot-image activity to be
     // underway, then crash with no graceful flush.
     sim.run_for(Duration::from_millis(750));
-    sim.stop(0);
+    sim.stop(nid(0));
 
-    let node = RaftNode::start(sim.env(0), vec![0], engine);
+    let node = RaftNode::start(sim.env(nid(0)), vec![nid(0)], engine);
     sim.run_for(Duration::from_secs(4));
 
     assert_eq!(

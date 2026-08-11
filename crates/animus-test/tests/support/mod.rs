@@ -54,7 +54,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use animus_consensus::{AccordNode, Key, TxnId};
-use animus_env::{Clock, EnvExt, Rng};
+use animus_env::{Clock, EnvExt, Rng, nid};
 use animus_sim::{NetConfig, SimEnv, Simulator};
 use animus_test::history::{Mop, Process};
 use animus_test::{History, Recorder, check_convergence, check_cycles, check_durability};
@@ -731,7 +731,10 @@ fn slow_links() -> NetConfig {
 /// Construct pure-Accord replica `i` ([`AccordNode::start`] — local execution +
 /// snapshot reads, the serialization authority).
 fn make_node(sim: &Simulator, all: &[u64], i: usize) -> AccordNode<SimEnv> {
-    AccordNode::start(sim.env(ACCORD_IDS[i]), all.to_vec())
+    AccordNode::start(
+        sim.env(nid(ACCORD_IDS[i])),
+        all.iter().copied().map(nid).collect(),
+    )
 }
 
 impl Cluster {
@@ -786,7 +789,7 @@ impl Cluster {
                 let cut = a - minority;
                 for &m in &ids[cut..] {
                     for &o in &ids[..cut] {
-                        self.sim.partition_pair(m, o);
+                        self.sim.partition_pair(nid(m), nid(o));
                     }
                 }
             }
@@ -798,7 +801,7 @@ impl Cluster {
                 // window (a full mesh partition) — consensus cannot make a quorum.
                 for i in 0..a {
                     for j in (i + 1)..a {
-                        self.sim.partition_pair(ids[i], ids[j]);
+                        self.sim.partition_pair(nid(ids[i]), nid(ids[j]));
                     }
                 }
             }
@@ -807,18 +810,18 @@ impl Cluster {
                 // Isolate from all Accord peers.
                 for &o in &ids {
                     if o != victim {
-                        self.sim.partition_pair(victim, o);
+                        self.sim.partition_pair(nid(victim), nid(o));
                     }
                 }
             }
             NemesisAction::Crash => {
                 let victim = ids[a - 1];
-                self.sim.crash(victim);
+                self.sim.crash(nid(victim));
                 self.crashed.insert(victim);
             }
             NemesisAction::StopRestart => {
                 let victim = ids[a - 1];
-                self.sim.stop(victim);
+                self.sim.stop(nid(victim));
                 // Start a fresh node on the same id (recovers from its WAL).
                 let fresh = make_node(&self.sim, &ids, a - 1);
                 self.nodes[a - 1] = fresh;
@@ -827,7 +830,7 @@ impl Cluster {
                 // Crash the first *Accord* replica (distinct from `Crash`, which
                 // downs the last one) — losing a hot consensus node.
                 let victim = ids[0];
-                self.sim.crash(victim);
+                self.sim.crash(nid(victim));
                 self.crashed.insert(victim);
             }
             NemesisAction::HealAll => {
@@ -835,13 +838,13 @@ impl Cluster {
                 let all: Vec<u64> = ids.clone();
                 for i in 0..all.len() {
                     for j in (i + 1)..all.len() {
-                        self.sim.heal(all[i], all[j]);
+                        self.sim.heal(nid(all[i]), nid(all[j]));
                     }
                 }
                 // Restart anything still crashed.
                 let crashed: Vec<u64> = self.crashed.iter().copied().collect();
                 for v in crashed {
-                    self.sim.restart(v);
+                    self.sim.restart(nid(v));
                 }
                 self.crashed.clear();
                 self.sim.set_net_config(NetConfig::default());
@@ -1029,7 +1032,7 @@ async fn run_read(
         .invoke(proc, env.now().0, invoke_mops);
 
     let txn = node.submit_read(keys.clone());
-    let observed = if wait_applied(node, txn).await {
+    let observed = if wait_applied(node, txn.clone()).await {
         node.read_value_result(txn)
     } else {
         None
@@ -1077,7 +1080,7 @@ async fn wait_applied(node: &AccordNode<SimEnv>, txn: TxnId) -> bool {
     let env = node.env().clone();
     let deadline = env.now().0 + OP_BUDGET.as_nanos() as u64;
     loop {
-        if node.is_applied(txn) {
+        if node.is_applied(txn.clone()) {
             return true;
         }
         if env.now().0 >= deadline {

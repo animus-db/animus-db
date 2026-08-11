@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use animus_control::{MetaCommand, NodeStatus, RaftNode};
-use animus_env::{Env, NodeId, ProdEnv};
+use animus_env::{Env, NodeId, ProdEnv, nid};
 use animus_storage::MemoryEngine;
 use tokio::time::{Instant, sleep, timeout};
 
@@ -32,7 +32,7 @@ fn unique_tmp_dir() -> std::path::PathBuf {
 
 fn upsert(node: u64) -> MetaCommand {
     MetaCommand::UpsertMember {
-        node,
+        node: nid(node),
         labels: BTreeMap::new(),
         status: NodeStatus::Joining,
     }
@@ -66,7 +66,7 @@ async fn grow_three_to_five_under_real_time_stays_live() {
     const MAX_TERM_DELTA: u64 = 30;
 
     timeout(Duration::from_secs(90), async {
-        let group: Vec<NodeId> = vec![0, 1, 2];
+        let group: Vec<NodeId> = vec![nid(0), nid(1), nid(2)];
         let dirs: Vec<_> = (0..5).map(|_| unique_tmp_dir()).collect();
         let loop0 = || "127.0.0.1:0".parse::<SocketAddr>().unwrap();
 
@@ -76,7 +76,9 @@ async fn grow_three_to_five_under_real_time_stays_live() {
         // on the first three.
         let mut envs = Vec::new();
         for (i, dir) in dirs.iter().enumerate() {
-            let (env, _addr) = ProdEnv::bind(i as u64, loop0(), dir).await.expect("bind");
+            let (env, _addr) = ProdEnv::bind(nid(i as u64), loop0(), dir)
+                .await
+                .expect("bind");
             envs.push(env);
         }
         let book: BTreeMap<NodeId, SocketAddr> =
@@ -104,12 +106,16 @@ async fn grow_three_to_five_under_real_time_stays_live() {
         // includes itself and the current three voters; the current three
         // don't yet know about it) — the same shape as a real freshly-started
         // `animusd control` growth process.
-        let node3 = RaftNode::start(envs[3].clone(), vec![0, 1, 2, 3], MemoryEngine::new());
+        let node3 = RaftNode::start(
+            envs[3].clone(),
+            vec![nid(0), nid(1), nid(2), nid(3)],
+            MemoryEngine::new(),
+        );
         let leader_idx = wait_for_leader(&original).await;
         let leader = original[leader_idx];
         assert!(
             matches!(
-                leader.change_membership([0u64, 1, 2, 3].into_iter().collect()),
+                leader.change_membership([0u64, 1, 2, 3].into_iter().map(nid).collect()),
                 animus_control::ProposeResult::Accepted { .. }
             ),
             "growing 3 -> 4 should be accepted as a single-server delta"
@@ -130,12 +136,16 @@ async fn grow_three_to_five_under_real_time_stays_live() {
         // Grow again, 4 -> 5, against whichever node is leader now (may have
         // moved during the first growth step's scheduling jitter).
         let quartet = [&node0, &node1, &node2, &node3];
-        let node4 = RaftNode::start(envs[4].clone(), vec![0, 1, 2, 3, 4], MemoryEngine::new());
+        let node4 = RaftNode::start(
+            envs[4].clone(),
+            vec![nid(0), nid(1), nid(2), nid(3), nid(4)],
+            MemoryEngine::new(),
+        );
         let leader_idx = wait_for_leader(&quartet).await;
         let leader = quartet[leader_idx];
         assert!(
             matches!(
-                leader.change_membership([0u64, 1, 2, 3, 4].into_iter().collect()),
+                leader.change_membership([0u64, 1, 2, 3, 4].into_iter().map(nid).collect()),
                 animus_control::ProposeResult::Accepted { .. }
             ),
             "growing 4 -> 5 should be accepted as a single-server delta"
@@ -181,13 +191,13 @@ async fn grow_three_to_five_under_real_time_stays_live() {
                 leaders.len() <= 1,
                 "more than one node believes itself leader at once: {leaders:?}"
             );
-            if let Some(&current) = leaders.first()
-                && last_leader != Some(current)
+            if let Some(current) = leaders.first()
+                && last_leader.as_ref() != Some(current)
             {
                 if last_leader.is_some() {
                     transitions += 1;
                 }
-                last_leader = Some(current);
+                last_leader = Some(current.clone());
             }
             sleep(Duration::from_millis(100)).await;
         }

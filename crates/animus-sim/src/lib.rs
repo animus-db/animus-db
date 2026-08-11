@@ -281,8 +281,8 @@ struct SimState {
 
 impl SimState {
     /// The effective disk fault model for `node`: its override, else the global.
-    fn disk_cfg_for(&self, node: NodeId) -> &DiskConfig {
-        self.node_disk_cfg.get(&node).unwrap_or(&self.disk_cfg)
+    fn disk_cfg_for(&self, node: &NodeId) -> &DiskConfig {
+        self.node_disk_cfg.get(node).unwrap_or(&self.disk_cfg)
     }
 
     /// Sample error injection for one disk op on `node`. Draws RNG **only**
@@ -296,14 +296,14 @@ impl SimState {
         op: &'static str,
         file: &str,
     ) -> Option<std::io::Error> {
-        let threshold = self.disk_cfg_for(node).error_threshold;
+        let threshold = self.disk_cfg_for(&node).error_threshold;
         if threshold == 0 || self.rng.next_u64() >= threshold {
             return None;
         }
         let t = self.clock;
         self.trace.push(TraceEvent::DiskFault {
             t,
-            node,
+            node: node.clone(),
             op,
             file: file.to_owned(),
         });
@@ -410,8 +410,10 @@ impl Simulator {
     #[must_use]
     pub fn env(&self, node: NodeId) -> SimEnv {
         let mut st = self.shared.lock();
-        st.nodes.insert(node);
-        st.inboxes.entry((node, PRIMARY_STREAM)).or_default();
+        st.nodes.insert(node.clone());
+        st.inboxes
+            .entry((node.clone(), PRIMARY_STREAM))
+            .or_default();
         SimEnv {
             shared: Arc::clone(&self.shared),
             node_id: node,
@@ -446,7 +448,7 @@ impl Simulator {
         let mut guard = self.shared.lock();
         let st = &mut *guard;
         let t = st.clock;
-        let Some(f) = st.disks.get_mut(&(node, file.to_owned())) else {
+        let Some(f) = st.disks.get_mut(&(node.clone(), file.to_owned())) else {
             return false;
         };
         let Some(b) = f.durable.get_mut(offset as usize) else {
@@ -471,14 +473,14 @@ impl Simulator {
     /// Symmetrically partition `a` and `b` from each other.
     pub fn partition_pair(&self, a: NodeId, b: NodeId) {
         let mut st = self.shared.lock();
-        st.partitions.insert((a, b));
+        st.partitions.insert((a.clone(), b.clone()));
         st.partitions.insert((b, a));
     }
 
     /// Heal any partition between `from` and `to` (both directions).
     pub fn heal(&self, from: NodeId, to: NodeId) {
         let mut st = self.shared.lock();
-        st.partitions.remove(&(from, to));
+        st.partitions.remove(&(from.clone(), to.clone()));
         st.partitions.remove(&(to, from));
     }
 
@@ -498,7 +500,7 @@ impl Simulator {
     pub fn crash(&self, node: NodeId) {
         let mut guard = self.shared.lock();
         let st = &mut *guard;
-        st.crashed.insert(node);
+        st.crashed.insert(node.clone());
         // Clear every stream's inbox for this node (ADR 0026): a crashed node's
         // whole inbox is volatile, not just its primary stream's.
         let inbox_keys: Vec<_> = st
@@ -522,7 +524,7 @@ impl Simulator {
             st.recv_wakers.remove(&k);
         }
         let (torn, corrupt) = {
-            let cfg = st.disk_cfg_for(node);
+            let cfg = st.disk_cfg_for(&node);
             (cfg.torn_tail_on_crash, cfg.corrupt_on_crash)
         };
         let keys: Vec<_> = st
@@ -552,7 +554,7 @@ impl Simulator {
             f.buffered.clear();
             st.trace.push(TraceEvent::DiskTear {
                 t,
-                node,
+                node: node.clone(),
                 file: k.1.clone(),
                 kept,
                 dropped,
@@ -563,7 +565,7 @@ impl Simulator {
                 f.durable[offset] ^= 0xFF;
                 st.trace.push(TraceEvent::DiskCorrupt {
                     t,
-                    node,
+                    node: node.clone(),
                     file: k.1,
                     offset: offset as u64,
                 });
@@ -589,7 +591,7 @@ impl Simulator {
             st.crashed.remove(&node);
             st.task_owner
                 .iter()
-                .filter(|&(_, &owner)| owner == node)
+                .filter(|(_, owner)| **owner == node)
                 .map(|(&task, _)| task)
                 .collect()
         };
@@ -611,7 +613,7 @@ impl Simulator {
         let task_ids: Vec<TaskId> = st
             .task_owner
             .iter()
-            .filter(|&(_, &owner)| owner == node)
+            .filter(|(_, owner)| **owner == node)
             .map(|(&task, _)| task)
             .collect();
         for task in task_ids {
@@ -788,7 +790,7 @@ impl Simulator {
                     st.timer_wakers.remove(&id)
                 }
                 Event::Deliver { to, env } => {
-                    let from = env.from;
+                    let from = env.from.clone();
                     let stream = env.stream;
                     if st.crashed.contains(&to) {
                         st.trace.push(TraceEvent::Drop {
@@ -799,7 +801,7 @@ impl Simulator {
                             reason: "crashed",
                         });
                         None
-                    } else if st.partitions.contains(&(from, to)) {
+                    } else if st.partitions.contains(&(from.clone(), to.clone())) {
                         st.trace.push(TraceEvent::Drop {
                             t,
                             from,
@@ -813,11 +815,14 @@ impl Simulator {
                         st.trace.push(TraceEvent::Deliver {
                             t,
                             from,
-                            to,
+                            to: to.clone(),
                             stream,
                             len,
                         });
-                        st.inboxes.entry((to, stream)).or_default().push_back(env);
+                        st.inboxes
+                            .entry((to.clone(), stream))
+                            .or_default()
+                            .push_back(env);
                         st.recv_wakers.remove(&(to, stream))
                     }
                 }
@@ -868,13 +873,13 @@ impl RngTrait for SimEnv {
 impl Network for SimEnv {
     async fn send_stream(&self, to: NodeId, stream: u64, payload: Vec<u8>) {
         let mut st = self.shared.lock();
-        let from = self.node_id;
+        let from = self.node_id.clone();
         let t = st.clock;
         let len = payload.len();
         st.trace.push(TraceEvent::Send {
             t,
-            from,
-            to,
+            from: from.clone(),
+            to: to.clone(),
             stream,
             len,
         });
@@ -929,7 +934,7 @@ impl Network for SimEnv {
     async fn recv_stream(&self, stream: u64) -> Envelope {
         Recv {
             shared: Arc::clone(&self.shared),
-            node: self.node_id,
+            node: self.node_id.clone(),
             stream,
         }
         .await
@@ -940,10 +945,10 @@ impl Network for SimEnv {
 impl Disk for SimEnv {
     async fn append(&self, file: &str, bytes: &[u8]) -> std::io::Result<()> {
         let mut st = self.shared.lock();
-        if let Some(e) = st.inject_disk_fault(self.node_id, "append", file) {
+        if let Some(e) = st.inject_disk_fault(self.node_id.clone(), "append", file) {
             return Err(e);
         }
-        let key = (self.node_id, file.to_owned());
+        let key = (self.node_id.clone(), file.to_owned());
         st.disks
             .entry(key)
             .or_default()
@@ -954,10 +959,10 @@ impl Disk for SimEnv {
 
     async fn sync(&self, file: &str) -> std::io::Result<()> {
         let mut st = self.shared.lock();
-        if let Some(e) = st.inject_disk_fault(self.node_id, "sync", file) {
+        if let Some(e) = st.inject_disk_fault(self.node_id.clone(), "sync", file) {
             return Err(e);
         }
-        let key = (self.node_id, file.to_owned());
+        let key = (self.node_id.clone(), file.to_owned());
         if let Some(f) = st.disks.get_mut(&key) {
             let mut buffered = std::mem::take(&mut f.buffered);
             f.durable.append(&mut buffered);
@@ -967,10 +972,10 @@ impl Disk for SimEnv {
 
     async fn read(&self, file: &str) -> std::io::Result<Vec<u8>> {
         let mut st = self.shared.lock();
-        if let Some(e) = st.inject_disk_fault(self.node_id, "read", file) {
+        if let Some(e) = st.inject_disk_fault(self.node_id.clone(), "read", file) {
             return Err(e);
         }
-        let key = (self.node_id, file.to_owned());
+        let key = (self.node_id.clone(), file.to_owned());
         Ok(st.disks.get(&key).map_or_else(Vec::new, |f| {
             let mut out = f.durable.clone();
             out.extend_from_slice(&f.buffered);
@@ -980,10 +985,10 @@ impl Disk for SimEnv {
 
     async fn read_at(&self, file: &str, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
         let mut st = self.shared.lock();
-        if let Some(e) = st.inject_disk_fault(self.node_id, "read_at", file) {
+        if let Some(e) = st.inject_disk_fault(self.node_id.clone(), "read_at", file) {
             return Err(e);
         }
-        let key = (self.node_id, file.to_owned());
+        let key = (self.node_id.clone(), file.to_owned());
         Ok(st.disks.get(&key).map_or_else(Vec::new, |f| {
             // The durable + buffered view, sliced — mirrors `read`. A crash clears
             // `buffered`, so an un-synced tail is correctly invisible afterward.
@@ -1004,7 +1009,7 @@ impl Disk for SimEnv {
 
     async fn size(&self, file: &str) -> std::io::Result<u64> {
         let st = self.shared.lock();
-        let key = (self.node_id, file.to_owned());
+        let key = (self.node_id.clone(), file.to_owned());
         Ok(st
             .disks
             .get(&key)
@@ -1013,7 +1018,7 @@ impl Disk for SimEnv {
 
     async fn remove(&self, file: &str) -> std::io::Result<()> {
         let mut st = self.shared.lock();
-        let key = (self.node_id, file.to_owned());
+        let key = (self.node_id.clone(), file.to_owned());
         st.disks.remove(&key);
         Ok(())
     }
@@ -1024,10 +1029,10 @@ impl Disk for SimEnv {
         // fault fails the swap cleanly (temp-file + rename semantics: the old
         // contents remain fully intact).
         let mut st = self.shared.lock();
-        if let Some(e) = st.inject_disk_fault(self.node_id, "replace", file) {
+        if let Some(e) = st.inject_disk_fault(self.node_id.clone(), "replace", file) {
             return Err(e);
         }
-        let key = (self.node_id, file.to_owned());
+        let key = (self.node_id.clone(), file.to_owned());
         let f = st.disks.entry(key).or_default();
         f.durable = bytes.to_vec();
         f.buffered.clear();
@@ -1040,7 +1045,7 @@ impl Disk for SimEnv {
         // first possible key yields its file names already in lexicographic order.
         Ok(st
             .disks
-            .range((self.node_id, String::new())..)
+            .range((self.node_id.clone(), String::new())..)
             .take_while(|((node, _), _)| *node == self.node_id)
             .map(|((_, name), _)| name.clone())
             .collect())
@@ -1053,7 +1058,7 @@ impl Spawner for SimEnv {
         let task = st.next_task_id;
         st.next_task_id += 1;
         st.tasks.insert(task, Some(fut));
-        st.task_owner.insert(task, self.node_id);
+        st.task_owner.insert(task, self.node_id.clone());
         st.trace.push(TraceEvent::Spawn { task });
         drop(st);
         self.shared.push_ready(task);
@@ -1062,7 +1067,7 @@ impl Spawner for SimEnv {
 
 impl Env for SimEnv {
     fn node_id(&self) -> NodeId {
-        self.node_id
+        self.node_id.clone()
     }
 }
 
@@ -1076,8 +1081,8 @@ impl Coresident for SimEnv {
     fn sibling(&self, id: NodeId) -> Self {
         {
             let mut st = self.shared.lock();
-            st.nodes.insert(id);
-            st.inboxes.entry((id, PRIMARY_STREAM)).or_default();
+            st.nodes.insert(id.clone());
+            st.inboxes.entry((id.clone(), PRIMARY_STREAM)).or_default();
         }
         SimEnv {
             shared: Arc::clone(&self.shared),
@@ -1134,7 +1139,7 @@ impl Future for Recv {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Envelope> {
         let mut st = self.shared.lock();
-        let key = (self.node, self.stream);
+        let key = (self.node.clone(), self.stream);
         if let Some(env) = st.inboxes.get_mut(&key).and_then(VecDeque::pop_front) {
             Poll::Ready(env)
         } else {

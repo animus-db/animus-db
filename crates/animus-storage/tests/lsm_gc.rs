@@ -10,6 +10,7 @@
 //! These run under the deterministic `SimEnv`, so every property is reproducible
 //! from the seed in the assertion messages.
 
+use animus_env::nid;
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::{LsmEngine, LsmOptions, Snapshot, StorageEngine};
 use futures::executor::block_on;
@@ -32,7 +33,7 @@ fn opts(grace: u64) -> LsmOptions {
 }
 
 fn open(sim: &Simulator, grace: u64) -> LsmEngine<SimEnv> {
-    block_on(LsmEngine::open_with(sim.env(0), PREFIX, opts(grace))).expect("open")
+    block_on(LsmEngine::open_with(sim.env(nid(0)), PREFIX, opts(grace))).expect("open")
 }
 
 /// A tombstone that has aged below the GC floor is reclaimed during compaction:

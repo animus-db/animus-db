@@ -5,6 +5,7 @@
 use std::time::Duration;
 
 use animus_control::{MetaCommand, Metadata, RaftNode};
+use animus_env::nid;
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::MemoryEngine;
 use animus_tablet::{Epoch, KeyRange, TabletId};
@@ -21,7 +22,13 @@ fn cluster(seed: u64) -> (Simulator, Vec<RaftNode<SimEnv>>) {
     let sim = Simulator::new(seed);
     let nodes = NODES
         .iter()
-        .map(|&id| RaftNode::start(sim.env(id), NODES.to_vec(), MemoryEngine::new()))
+        .map(|&id| {
+            RaftNode::start(
+                sim.env(nid(id)),
+                NODES.iter().copied().map(nid).collect(),
+                MemoryEngine::new(),
+            )
+        })
         .collect();
     (sim, nodes)
 }
@@ -55,7 +62,7 @@ fn split_then_merge_round_trips_through_raft() {
         tablet: TabletId(1),
         table: None,
         range: KeyRange::whole(),
-        replicas: NODES.to_vec(),
+        replicas: NODES.iter().copied().map(nid).collect(),
     });
     nodes[l].propose(MetaCommand::SplitTablet {
         tablet: TabletId(1),
@@ -136,13 +143,13 @@ fn merge_rejects_a_stale_epoch_racing_a_concurrent_replica_change() {
         tablet: TabletId(1),
         table: None,
         range: KeyRange::new(b"".to_vec(), Some(b"m".to_vec())),
-        replicas: NODES.to_vec(),
+        replicas: NODES.iter().copied().map(nid).collect(),
     });
     nodes[l].propose(MetaCommand::CreateTablet {
         tablet: TabletId(2),
         table: None,
         range: KeyRange::new(b"m".to_vec(), None),
-        replicas: NODES.to_vec(),
+        replicas: NODES.iter().copied().map(nid).collect(),
     });
     sim.run_for(Duration::from_secs(2));
 
@@ -151,7 +158,7 @@ fn merge_rejects_a_stale_epoch_racing_a_concurrent_replica_change() {
     nodes[l].propose(MetaCommand::CasTabletReplicas {
         tablet: TabletId(1),
         expected_epoch: Epoch::INITIAL,
-        replicas: vec![NODES[0], NODES[1]],
+        replicas: vec![nid(NODES[0]), nid(NODES[1])],
     });
     nodes[l].propose(MetaCommand::MergeTablets {
         left: TabletId(1),
@@ -170,7 +177,7 @@ fn merge_rejects_a_stale_epoch_racing_a_concurrent_replica_change() {
     assert_eq!(meta.tablets.len(), 2, "the stale merge must not apply");
     assert_eq!(
         meta.tablets[&TabletId(1)].replicas,
-        vec![NODES[0], NODES[1]]
+        vec![nid(NODES[0]), nid(NODES[1])]
     );
     assert_eq!(meta.tablets[&TabletId(1)].epoch, Epoch(2));
     assert!(!meta.merged_tablets.contains(&TabletId(2)));
@@ -198,7 +205,7 @@ fn racing_splits_at_the_same_epoch_only_one_applies() {
         tablet: TabletId(1),
         table: None,
         range: KeyRange::whole(),
-        replicas: NODES.to_vec(),
+        replicas: NODES.iter().copied().map(nid).collect(),
     });
     sim.run_for(Duration::from_secs(2));
 
@@ -247,13 +254,13 @@ fn invalid_split_and_merge_are_rejected_deterministically() {
         tablet: TabletId(1),
         table: None,
         range: KeyRange::new(b"a".to_vec(), Some(b"c".to_vec())),
-        replicas: vec![0, 1],
+        replicas: vec![nid(0), nid(1)],
     });
     meta.apply(&MetaCommand::CreateTablet {
         tablet: TabletId(9),
         table: None,
         range: KeyRange::new(b"x".to_vec(), Some(b"z".to_vec())),
-        replicas: vec![0, 1],
+        replicas: vec![nid(0), nid(1)],
     });
 
     use animus_control::ApplyOutcome::Rejected;
@@ -294,13 +301,13 @@ fn merge_rejects_tablets_from_different_tables() {
         tablet: TabletId(1),
         table: Some("users".to_owned()),
         range: KeyRange::new(b"".to_vec(), Some(b"m".to_vec())),
-        replicas: vec![0, 1],
+        replicas: vec![nid(0), nid(1)],
     });
     meta.apply(&MetaCommand::CreateTablet {
         tablet: TabletId(2),
         table: Some("orders".to_owned()),
         range: KeyRange::new(b"m".to_vec(), None),
-        replicas: vec![0, 1],
+        replicas: vec![nid(0), nid(1)],
     });
 
     use animus_control::ApplyOutcome::Rejected;
@@ -332,7 +339,7 @@ fn split_child_inherits_the_source_policy() {
             tablet: TabletId(1),
             table: Some("users".to_owned()),
             range: KeyRange::whole(),
-            replicas: vec![10, 11, 12],
+            replicas: vec![nid(10), nid(11), nid(12)],
         }),
         Applied
     );
@@ -367,7 +374,7 @@ fn split_child_inherits_the_source_policy() {
             tablet: TabletId(3),
             table: None,
             range: KeyRange::whole(),
-            replicas: vec![10, 11, 12],
+            replicas: vec![nid(10), nid(11), nid(12)],
         }),
         Applied
     );

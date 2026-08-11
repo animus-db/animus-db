@@ -15,7 +15,10 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
 
 pub mod prod;
 pub use prod::ProdEnv;
@@ -24,7 +27,195 @@ pub mod metrics;
 pub use metrics::{Metric, MetricSink, MetricSnapshot, MetricsHandle};
 
 /// Stable identifier for a node in the cluster.
-pub type NodeId = u64;
+///
+/// **ADR 0040 PR3**: `NodeId` is now a validated, opaque **string** wrapped in
+/// an `Arc<str>` (dropping `Copy` — every `.copied()` over a `NodeId` became
+/// `.cloned()`; the clone is one refcount bump, not a byte copy). Three ways
+/// to build one:
+///
+/// - [`NodeId::propose`] — validates the charset (`[A-Za-z0-9._-]{1,64}`,
+///   rejecting `@` — the leader-hint wire format is `leader_hint={id}@{addr}`
+///   — and any other punctuation/whitespace/`/`) and is the **only** path a
+///   node-supplied identity (config `id` field, `--id`, an admin `add`
+///   request) may go through. Every intake boundary must call this, not
+///   construct a `NodeId` some other way.
+/// - [`NodeId::mint`] (ADR 0040 PR4) — self-mints a random 22-char id off the
+///   `Rng` seam for a node that doesn't propose an explicit one. Never
+///   trusted probabilistically unique on its own — see its own doc and
+///   `animus-control`'s `MetaCommand::RegisterNode` (the registration CAS
+///   that makes uniqueness structural, not statistical).
+/// - [`NodeId::new_unchecked`] — bypasses validation. Reserved for
+///   deserializing an id that was already validated once (wire frames, WAL
+///   replay, `serde` round-trips of already-stored `Metadata`) and for the
+///   test-support [`nid`] helper. Never call this on untrusted input.
+///
+/// `Display`/`Debug` print the raw string; `serde` is `#[serde(transparent)]`
+/// (a plain JSON string) but note this means `serde`-driven deserialization
+/// (e.g. `serde_json::from_str` on a whole config file) does **not** run
+/// [`NodeId::propose`]'s charset check — callers that accept configuration
+/// from outside this process must explicitly re-validate every parsed id
+/// (see `animusd::config` for the config-load call site).
+///
+/// See `docs/adr/0040-self-minted-string-node-ids.md`.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct NodeId(Arc<str>);
+
+/// A proposed node id failed [`NodeId::propose`]'s charset validation.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "invalid node id {raw:?}: ids must be 1-64 chars of [A-Za-z0-9._-] \
+     (no '@', '/', or whitespace)"
+)]
+pub struct InvalidNodeId {
+    /// The rejected input, for the error message.
+    pub raw: String,
+}
+
+/// The accepted charset for a *proposed* node id (config/CLI/admin intake):
+/// ASCII letters, digits, `.`, `_`, `-`. Deliberately excludes `@` (the
+/// leader-hint wire format is `leader_hint={id}@{addr}` — `topology.rs`),
+/// `/`, and whitespace.
+fn is_valid_node_id_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-'
+}
+
+/// Maximum length (chars) of a proposed node id.
+pub const NODE_ID_MAX_LEN: usize = 64;
+
+impl NodeId {
+    /// Validate and wrap a node-proposed id. The only sanctioned entry point
+    /// for an identity a human or config file chose — see the type's doc
+    /// comment for why every intake boundary must go through this.
+    ///
+    /// # Errors
+    /// Returns [`InvalidNodeId`] if `s` is empty, longer than
+    /// [`NODE_ID_MAX_LEN`] chars, or contains any character outside
+    /// `[A-Za-z0-9._-]`.
+    pub fn propose(s: &str) -> Result<NodeId, InvalidNodeId> {
+        if s.is_empty()
+            || s.chars().count() > NODE_ID_MAX_LEN
+            || !s.chars().all(is_valid_node_id_char)
+        {
+            return Err(InvalidNodeId { raw: s.to_string() });
+        }
+        Ok(NodeId(Arc::from(s)))
+    }
+
+    /// Wrap a string as a [`NodeId`] **without** charset validation.
+    ///
+    /// Reserved for: deserializing an id that was already validated once
+    /// (wire frames, WAL/snapshot replay, an already-stored `Metadata`
+    /// round-tripping through `serde`), and the [`nid`] test-support
+    /// constructor. Never call this on a node/operator-supplied string —
+    /// use [`NodeId::propose`] instead.
+    #[must_use]
+    pub fn new_unchecked(s: impl Into<Arc<str>>) -> Self {
+        NodeId(s.into())
+    }
+
+    /// The raw string, borrowed.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Self-mint a fresh id from 128 bits drawn off the [`Rng`] seam (ADR
+    /// 0040 Decision B/C): two [`Rng::next_u64`] draws packed into 16 bytes,
+    /// base64url-encoded (unpadded) into a 22-char string. Every character of
+    /// the base64url alphabet (`A-Za-z0-9-_`) already lies within
+    /// [`NodeId::propose`]'s accepted charset, so a minted id is always
+    /// structurally valid without re-running that check — this bypasses it
+    /// directly via [`NodeId::new_unchecked`], the same way the test-support
+    /// [`nid`] helper does.
+    ///
+    /// **Never trusted probabilistically as globally unique on its own** —
+    /// uniqueness is enforced by a registration compare-and-swap on the
+    /// replicated cluster state (`MetaCommand::RegisterNode`, `animus-control`),
+    /// not by this draw. A caller that hits a collision (astronomically
+    /// unlikely, but structurally possible) re-mints and retries. See
+    /// `docs/adr/0040-self-minted-string-node-ids.md` Decision C.
+    ///
+    /// Sim callers pass a `SimEnv` handle (its own seeded `Rng`, so minting
+    /// stays a pure function of the run's seed); production join paths mint
+    /// at the CLI boundary via [`prod::PreBindRng`] — the sanctioned home of
+    /// real entropy for a process that has no bound `Env` yet.
+    #[must_use]
+    pub fn mint<R: Rng + ?Sized>(rng: &R) -> NodeId {
+        let hi = rng.next_u64();
+        let lo = rng.next_u64();
+        let mut bytes = [0u8; 16];
+        bytes[0..8].copy_from_slice(&hi.to_be_bytes());
+        bytes[8..16].copy_from_slice(&lo.to_be_bytes());
+        NodeId::new_unchecked(base64url_nopad(&bytes))
+    }
+}
+
+/// Unpadded base64url-encode `bytes` (RFC 4648 §5 alphabet: `A-Za-z0-9-_`,
+/// no `=` padding) — hand-rolled rather than a new dependency, mirroring this
+/// codebase's existing hand-rolled-primitives convention (e.g. `animusd`'s
+/// HTTP parser). The only caller is [`NodeId::mint`] (16 bytes in, 22 chars
+/// out); kept general over the input length since there is nothing
+/// `NodeId`-specific about the encoding itself.
+fn base64url_nopad(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = u32::from(chunk[0]);
+        let b1 = u32::from(*chunk.get(1).unwrap_or(&0));
+        let b2 = u32::from(*chunk.get(2).unwrap_or(&0));
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(ALPHABET[((n >> 18) & 0x3F) as usize] as char);
+        out.push(ALPHABET[((n >> 12) & 0x3F) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(ALPHABET[((n >> 6) & 0x3F) as usize] as char);
+        }
+        if chunk.len() > 2 {
+            out.push(ALPHABET[(n & 0x3F) as usize] as char);
+        }
+    }
+    out
+}
+
+impl std::str::FromStr for NodeId {
+    type Err = InvalidNodeId;
+
+    /// Parses via [`NodeId::propose`] — CLI/config text always goes through
+    /// validation.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        NodeId::propose(s)
+    }
+}
+
+impl std::fmt::Display for NodeId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&*self.0, f)
+    }
+}
+
+impl std::fmt::Debug for NodeId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&*self.0, f)
+    }
+}
+
+/// Test-support constructor: `nid(n)` builds the `n`th test node id, formatted
+/// `"n{n}"` (e.g. `nid(2)` is `"n2"`).
+///
+/// Homed here (no feature gate — it's trivial) so every crate's test code can
+/// reach it without duplicating a helper. Introduced in ADR 0040 PR2 as
+/// `NodeId::new(n)` (then a bare `u64` newtype) so the mechanical sweep of
+/// `~195 sim.env(...)` and `~89 RaftCore::new`/`RaftNode::start` call sites
+/// across the test fleet happened exactly once; ADR 0040 PR3 reformats this
+/// function's body to mint the `"n{n}"` string and no test call site needed to
+/// change again. Bypasses [`NodeId::propose`] validation via
+/// [`NodeId::new_unchecked`] (deliberately — the `"n{n}"` shape is always
+/// valid, and this must stay infallible for the ~89 call sites that use it in
+/// non-`Result` contexts).
+#[must_use]
+pub fn nid(n: u64) -> NodeId {
+    NodeId::new_unchecked(format!("n{n}"))
+}
 
 /// A monotonic instant, measured in nanoseconds since the environment started.
 ///
@@ -280,4 +471,110 @@ pub trait Coresident: Env {
     /// `id` must be distinct from this handle's and from any other live instance
     /// on the node (the caller owns id allocation, as with the initial group).
     fn sibling(&self, id: NodeId) -> Self;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+    /// A deterministic, scripted [`Rng`] for testing `mint`'s draw shape —
+    /// yields a fixed sequence of `u64`s, then falls back to a trivial
+    /// incrementing counter once exhausted (so a test can script only the
+    /// draws it cares about and let the rest be "whatever, just distinct").
+    /// Atomics, not `Cell`, since [`Rng`] requires `Send + Sync`.
+    struct ScriptedRng {
+        script: Vec<u64>,
+        pos: AtomicUsize,
+        fallback: AtomicU64,
+    }
+
+    impl ScriptedRng {
+        fn new(script: Vec<u64>) -> Self {
+            ScriptedRng {
+                script,
+                pos: AtomicUsize::new(0),
+                fallback: AtomicU64::new(0xF000_0000_0000_0000),
+            }
+        }
+    }
+
+    impl Rng for ScriptedRng {
+        fn next_u64(&self) -> u64 {
+            let i = self.pos.fetch_add(1, Ordering::Relaxed);
+            if i < self.script.len() {
+                self.script[i]
+            } else {
+                self.fallback.fetch_add(1, Ordering::Relaxed)
+            }
+        }
+
+        fn fill_bytes(&self, dst: &mut [u8]) {
+            for b in dst {
+                *b = self.next_u64() as u8;
+            }
+        }
+    }
+
+    #[test]
+    fn base64url_nopad_matches_known_vectors() {
+        // RFC 4648 test vectors (base64url is identical to base64 except for
+        // the last two alphabet characters, none of which these hit).
+        assert_eq!(base64url_nopad(b""), "");
+        assert_eq!(base64url_nopad(b"f"), "Zg");
+        assert_eq!(base64url_nopad(b"fo"), "Zm8");
+        assert_eq!(base64url_nopad(b"foo"), "Zm9v");
+        assert_eq!(base64url_nopad(b"foob"), "Zm9vYg");
+        assert_eq!(base64url_nopad(b"fooba"), "Zm9vYmE");
+        assert_eq!(base64url_nopad(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn base64url_nopad_never_emits_padding_or_standard_base64_chars() {
+        let bytes: Vec<u8> = (0..=255).collect();
+        let out = base64url_nopad(&bytes);
+        assert!(!out.contains('='), "must be unpadded");
+        assert!(!out.contains('+') && !out.contains('/'), "must be url-safe");
+    }
+
+    #[test]
+    fn mint_produces_a_22_char_id_within_the_proposed_charset() {
+        let rng = ScriptedRng::new(vec![0x1234_5678_9abc_def0, 0x0fed_cba9_8765_4321]);
+        let id = NodeId::mint(&rng);
+        assert_eq!(id.as_str().chars().count(), 22, "id: {id}");
+        // Every minted id must independently pass `propose`'s own charset
+        // check — a minted id that failed this would be silently invalid
+        // wherever it later round-trips through `propose` (e.g. re-parsed
+        // from a config file after being written there once).
+        assert!(
+            NodeId::propose(id.as_str()).is_ok(),
+            "minted id {id} must satisfy NodeId::propose's charset"
+        );
+    }
+
+    #[test]
+    fn mint_is_a_pure_function_of_the_rng_draws() {
+        // Same scripted draws in, same id out — minting itself has no hidden
+        // state; determinism (under `SimEnv`) rests entirely on the `Rng`
+        // seam being deterministic, not on anything in `mint`.
+        let a = NodeId::mint(&ScriptedRng::new(vec![1, 2]));
+        let b = NodeId::mint(&ScriptedRng::new(vec![1, 2]));
+        assert_eq!(a, b);
+
+        let c = NodeId::mint(&ScriptedRng::new(vec![1, 3]));
+        assert_ne!(a, c, "a different draw must mint a different id");
+    }
+
+    #[test]
+    fn many_mints_never_collide() {
+        // Not a uniqueness *proof* (that's the registration CAS's job, ADR
+        // 0040 Decision C) — just a sanity check that ordinary draws don't
+        // trivially alias each other (e.g. an off-by-one in the byte
+        // packing that silently discards entropy).
+        let rng = ScriptedRng::new(Vec::new()); // pure fallback-counter draws
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..2000 {
+            assert!(seen.insert(NodeId::mint(&rng)), "unexpected mint collision");
+        }
+    }
 }

@@ -6,6 +6,7 @@
 
 use std::time::Duration;
 
+use animus_env::nid;
 use animusd::{ClientRequest, ClientResponse, Node, bind_cluster, read_frame, start_cluster};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
@@ -68,7 +69,10 @@ async fn cluster_serves_put_get_and_status_over_tcp() {
             // (`config::control_id`).
             assert_eq!(
                 control_voters,
-                std::collections::BTreeSet::from([0, 1, 2]),
+                std::collections::BTreeSet::from([0, 1, 2])
+                    .into_iter()
+                    .map(nid)
+                    .collect(),
                 "combined node's Status did not carry the live control-voter set"
             );
         }

@@ -32,10 +32,14 @@ animus get    <node-addr> <table> <key>
 - It depends on `animusd` only for the shared protocol types and frame helpers
   (`ClientRequest`/`ClientResponse`, `read_frame`/`write_frame`) — it does
   **not** speak the internal `Network`.
-- `print_response` also handles `ClientResponse::JoinInfo` (ADR 0032) and
-  `ClientResponse::NodeIdAllocated` (ADR 0036): the join-discovery and
-  cluster-allocated-id replies `animusd join`/`data --seed` consume at
-  startup — not CLI subcommands of their own. **`ClientResponse` gaining a
+- `print_response` also handles `ClientResponse::JoinInfo` (ADR 0032): the
+  join-discovery reply `animusd join`/`data --seed` consumes at startup —
+  not a CLI subcommand of its own. (`ClientResponse::NodeIdAllocated`, ADR
+  0036's join-time reply, is **deleted** as of ADR 0040 PR4 — the join path
+  no longer has a dedicated wire request/response pair for minting an id at
+  all; it claims one via `MetaCommand::RegisterNode`, relayed over the
+  already-exhaustive `ProposeSchema`/`Status` primitives, so no new
+  `ClientResponse` variant was needed here.) **`ClientResponse` gaining a
   variant means `print_response`'s `match` stops compiling until it's
   handled here too** — this is a separate exhaustiveness site from
   `animusd`'s own `is_relayable_command`/`ClientRequest` dispatch; both need
@@ -65,7 +69,7 @@ drain-status <admin-addr> <node-id>
 remove <admin-addr> <node-id>
 decommission <admin-addr> <node-id> [--force-control-remove]  # composite, see below (ADR 0037 PR4)
 control-add <leader-admin-addr> <node-id> <new-node-admin-addr>      # ADR 0037 PR3 (operator-supplied id)
-control-add <leader-admin-addr> <new-node-control-addr>              # hardening PR3 (allocator-minted id)
+control-add <leader-admin-addr> <new-node-control-addr>              # hardening PR3 (self-minted id, ADR 0040 PR4)
 control-remove <leader-admin-addr> <node-id> [--force]               # ADR 0037 PR3; --force: hardening PR2
 control-grow <leader-admin-addr> <node-id> <admin-addr> [<node-id> <admin-addr>...]
 ```
@@ -104,19 +108,24 @@ control-grow <leader-admin-addr> <node-id> <admin-addr> [<node-id> <admin-addr>.
   multi-server delta), each waiting for its own catch-up before the next.
   `control-add`/`control-remove`/`control-grow` all target the **leader's**
   admin address, same "not relayed" discipline as `decommission`.
-- **`control-add` also has a 2-arg, allocator-minted-id form** (the ADR 0037
+- **`control-add` also has a 2-arg, self-minted-id form** (the ADR 0037
   hardening trio's PR3, closing ADR 0037's own "Coordination with ADR 0036"
-  deferral — locked decision: disambiguate by **arity**, no `--auto` flag):
+  deferral — locked decision: disambiguate by **arity**, no `--auto` flag;
+  re-based onto ADR 0040 Decision B/C's self-minting + registration CAS in
+  PR4, replacing the ADR 0036 allocator this originally wired into):
   `control-add <leader-admin-addr> <new-node-control-addr>` — note the single
   positional here is the new voter's **internal control-Raft** address
   directly, *not* an admin address to resolve via `/admin/config` like the
   3-arg form: there is no id yet to look a running node up by (the id is
-  minted server-side, inside the same admin call, from the ADR 0036
-  allocator — `run_control_add_allocated`). It prints the minted id and
-  returns — there is no known admin port to poll for catch-up convergence,
-  since the physical process at that address may not even be running yet:
-  the operator's next step is to start it there with `--node <minted-id>`.
-  `run_control_add`'s own operator-supplied form is unchanged.
+  self-minted server-side, inside the same admin call, via `NodeId::mint` —
+  `run_control_add_allocated`). It prints the minted id and returns — there
+  is no known admin port to poll for catch-up convergence, since the
+  physical process at that address may not even be running yet: the
+  operator's next step is to start it there with `--id <minted-id>` (e.g.
+  `animusd join --seed <any-node> --id <minted-id> --base-port <port>`).
+  `run_control_add`'s own operator-supplied form is unchanged except that
+  the id is now re-validated via `NodeId::propose` and the old
+  "`ALLOC_ID_BASE`-range" refusal is gone (no ranges exist anymore).
 - **`control-remove ... [--force]` (ADR 0037 hardening PR2, PR #136, the quorum-guard
   liveness fix)**: the server now refuses a removal that would leave fewer
   than a majority of the *resulting* voters reachable (per
