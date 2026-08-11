@@ -50,15 +50,18 @@
 //! ## Full fidelity, not a partial mirror
 //!
 //! Every [`MetaCommand`] variant is mirrored, including the legacy
-//! `RegisterCpAddr` and the two monotonic id-allocator counters
-//! (`next_tablet_id`/`next_alloc_id`) and the `AllocateNodeId` idempotency
-//! ledger (`node_id_allocations`) — none of these were in PR1's
-//! [`EntityKind`] set, so this module's own PR2 changes to `syskv.rs` added
-//! [`syskv::EntityKind::Counter`]/[`syskv::EntityKind::CpMemberAddr`]/
-//! [`syskv::EntityKind::NodeIdAlloc`]. The payoff: [`rebuild_metadata_from_engine`]
-//! produces a `Metadata` that is `PartialEq`-identical to the real in-core
-//! one, not "identical modulo a documented gap" — which is exactly what the
-//! differential-oracle test asserts.
+//! `RegisterCpAddr` and the monotonic tablet-id-allocator counter
+//! (`next_tablet_id`) — none of these were in PR1's [`EntityKind`] set, so
+//! this module's own PR2 changes to `syskv.rs` added
+//! [`syskv::EntityKind::Counter`]/[`syskv::EntityKind::CpMemberAddr`] (a
+//! third PR2 variant, `NodeIdAlloc`, mirrored the ADR 0036 allocator's
+//! idempotency ledger — removed in ADR 0040 PR4 along with the allocator;
+//! `MetaCommand::RegisterNode`'s claim lives entirely in the already-mirrored
+//! `Member`/`NodeAddrs` kinds, no separate ledger needed). The payoff:
+//! [`rebuild_metadata_from_engine`] produces a `Metadata` that is
+//! `PartialEq`-identical to the real in-core one, not "identical modulo a
+//! documented gap" — which is exactly what the differential-oracle test
+//! asserts.
 
 use std::collections::BTreeMap;
 
@@ -75,11 +78,10 @@ use crate::schema::TableSchema;
 use crate::syskv::{self, DecodedKey, EntityKind};
 
 /// The counter name for `Metadata::next_tablet_id` under
-/// [`EntityKind::Counter`] (`syskv::counter_key`).
+/// [`EntityKind::Counter`] (`syskv::counter_key`). The ADR 0036 allocator's
+/// own sibling counter (`NEXT_ALLOC_ID_COUNTER`) was removed in ADR 0040 PR4
+/// along with the allocator itself.
 pub const NEXT_TABLET_ID_COUNTER: &str = "next_tablet_id";
-/// The counter name for `Metadata::next_alloc_id` under
-/// [`EntityKind::Counter`] (`syskv::counter_key`).
-pub const NEXT_ALLOC_ID_COUNTER: &str = "next_alloc_id";
 
 /// One system-keyspace mutation an applied [`MetaCommand`] implies. The
 /// mirror loop (`node.rs`) translates these into per-key-LWW
@@ -233,17 +235,24 @@ pub fn apply_and_derive_mirror(
             writes.push(KeyWrite::Delete(syskv::node_addrs_key(node)));
             writes.push(KeyWrite::Delete(syskv::cp_member_addr_key(node)));
         }
-        MetaCommand::AllocateNodeId { nonce, .. } => {
-            let node_id = meta.node_id_allocations[nonce].clone();
+        MetaCommand::RegisterNode { node, .. } => {
+            // `apply_and_derive_mirror` only reaches here when `outcome ==
+            // Applied`, but that no longer guarantees `members[node]` is
+            // present: `RegisterNode`'s apply never claims a `members` row
+            // for a control-role registration (`addrs.role == "control"` —
+            // see its own doc for why), and it can also apply as a
+            // members-row *repair* against an id that already has an
+            // identical `node_addrs` entry but somehow lost its members row.
+            // `node_addrs[node]` alone is always guaranteed (this arm is the
+            // only command that ever writes it out unconditionally on
+            // `Applied`).
+            if let Some(member) = meta.members.get(node) {
+                writes.push(put_json(syskv::member_key(node), member));
+            }
             writes.push(put_json(
-                syskv::member_key(&node_id),
-                &meta.members[&node_id],
+                syskv::node_addrs_key(node),
+                &meta.node_addrs[node],
             ));
-            writes.push(KeyWrite::Put(
-                syskv::node_id_alloc_key(nonce),
-                node_id.as_str().as_bytes().to_vec(),
-            ));
-            writes.push(put_counter(NEXT_ALLOC_ID_COUNTER, meta.next_alloc_id));
         }
     }
     (outcome, writes)
@@ -391,8 +400,6 @@ fn apply_put(meta: &mut Metadata, key: &[u8], value: &[u8]) {
             let value = decode_u64(value);
             if id == NEXT_TABLET_ID_COUNTER.as_bytes() {
                 meta.next_tablet_id = value;
-            } else if id == NEXT_ALLOC_ID_COUNTER.as_bytes() {
-                meta.next_alloc_id = value;
             }
         }
         EntityKind::CpMemberAddr => {
@@ -403,11 +410,6 @@ fn apply_put(meta: &mut Metadata, key: &[u8], value: &[u8]) {
             if let Some(tablet) = entry.tablet {
                 meta.cp_member_tablets.insert(node, tablet);
             }
-        }
-        EntityKind::NodeIdAlloc => {
-            let nonce = String::from_utf8(id).expect("node-id-alloc nonce is UTF-8");
-            meta.node_id_allocations
-                .insert(nonce, decode_node_id(value.to_vec()));
         }
     }
 }
@@ -453,10 +455,6 @@ fn apply_delete(meta: &mut Metadata, key: &[u8]) {
             let node = decode_node_id(id);
             meta.cp_member_addrs.remove(&node);
             meta.cp_member_tablets.remove(&node);
-        }
-        EntityKind::NodeIdAlloc => {
-            // Never deleted in practice (an idempotency ledger entry is
-            // permanent) — listed for match exhaustiveness.
         }
     }
 }
@@ -930,6 +928,16 @@ mod tests {
     #[test]
     fn register_node_addrs_writes_the_address_book_entry() {
         let mut meta = Metadata::default();
+        // ADR 0040 PR4: `RegisterNodeAddrs` is update-only — establish the
+        // claim first (standing in for a config-bootstrapped member).
+        let _ = apply_and_derive_mirror(
+            &mut meta,
+            &MetaCommand::UpsertMember {
+                node: nid(3),
+                labels: BTreeMap::new(),
+                status: NodeStatus::Active,
+            },
+        );
         let addrs = NodeAddrs {
             internal: "a".to_string(),
             client: "b".to_string(),
@@ -973,28 +981,30 @@ mod tests {
     }
 
     #[test]
-    fn allocate_node_id_writes_member_ledger_entry_and_counter() {
+    fn register_node_writes_member_and_addrs_atomically() {
         let mut meta = Metadata::default();
-        let command = MetaCommand::AllocateNodeId {
-            nonce: "join-1".to_string(),
+        let addrs = NodeAddrs {
+            internal: "127.0.0.1:9910".to_string(),
+            client: "127.0.0.1:9010".to_string(),
+            admin: "127.0.0.1:9510".to_string(),
+            role: "combined".to_string(),
+        };
+        let command = MetaCommand::RegisterNode {
+            node: nid(910),
+            addrs: addrs.clone(),
             labels: BTreeMap::new(),
         };
         let (outcome, writes) = apply_and_derive_mirror(&mut meta, &command);
         assert_eq!(outcome, ApplyOutcome::Applied);
-        let node_id = meta.node_id_allocations["join-1"].clone();
         assert_eq!(
             writes,
             vec![
-                put_json(syskv::member_key(&node_id), &meta.members[&node_id]),
-                KeyWrite::Put(
-                    syskv::node_id_alloc_key("join-1"),
-                    node_id.as_str().as_bytes().to_vec()
-                ),
-                put_counter(NEXT_ALLOC_ID_COUNTER, meta.next_alloc_id),
+                put_json(syskv::member_key(&nid(910)), &meta.members[&nid(910)]),
+                put_json(syskv::node_addrs_key(&nid(910)), &addrs),
             ]
         );
 
-        // Idempotent replay of the same nonce mints nothing new.
+        // Idempotent replay of an identical registration mints nothing new.
         let (outcome, writes) = apply_and_derive_mirror(&mut meta, &command);
         assert_eq!(outcome, ApplyOutcome::NoOp);
         assert!(writes.is_empty());
@@ -1034,8 +1044,14 @@ mod tests {
             MetaCommand::CreateKeyspace {
                 keyspace: "ks".to_string(),
             },
-            MetaCommand::AllocateNodeId {
-                nonce: "join-1".to_string(),
+            MetaCommand::RegisterNode {
+                node: nid(2),
+                addrs: NodeAddrs {
+                    internal: "127.0.0.1:9902".to_string(),
+                    client: "127.0.0.1:9002".to_string(),
+                    admin: "127.0.0.1:9502".to_string(),
+                    role: "combined".to_string(),
+                },
                 labels: BTreeMap::new(),
             },
         ];

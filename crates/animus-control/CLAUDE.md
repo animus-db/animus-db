@@ -68,8 +68,11 @@ per-tablet CP data plane (`animus-cp-data`).
     *definition* (ADR 0013).
   - `SetTableMode` — set a table's serving mode.
   - `CreateKeyspace` / `DropKeyspace` — keyspace lifecycle.
-  - `RegisterNodeAddrs` (ADR 0032 PR1) — idempotent register/overwrite of a
-    member's full `NodeAddrs`; every node proposes this once at startup.
+  - `RegisterNodeAddrs` (ADR 0032 PR1) — **update-only since ADR 0040 PR4**:
+    idempotent register/overwrite of an *already-claimed* member's full
+    `NodeAddrs` — rejects outright if `node` is absent from both `members`
+    and `node_addrs` (nothing to update yet; see `RegisterNode` below, the
+    sole path that creates a fresh claim).
   - `RegisterCpAddr` — the predecessor of `RegisterNodeAddrs`, carrying an
     optional `tablet` association (ADR 0024 GC). **Kept for WAL back-compat
     only — no longer proposed by `animusd`'s startup path.**
@@ -78,16 +81,27 @@ per-tablet CP data plane (`animus-cp-data`).
     already (idempotent), `Leaving`/`Down` (never `Active`/`Joining`), and
     unreferenced by any tablet (`Metadata::tablets_referencing`, also the
     drain-complete predicate `/admin/member/drain-status` reports).
-  - `AllocateNodeId` (ADR 0036) — atomically mint a fresh member id from the
-    `ALLOC_ID_BASE`-disjoint monotonic allocator (`Metadata.next_alloc_id`)
-    and register it `Down` with the given labels, no address yet. Idempotent
-    on `nonce` (`Metadata.node_id_allocations: BTreeMap<String, NodeId>`, the
-    idempotency ledger) — a proposer retry with the same nonce is a `NoOp`
-    that returns the identical, already-minted id, never a second one. No
-    epoch-CAS needed: uniqueness comes from the same monotonic-floor-plus-
-    presence-check discipline `SplitTablet`'s allocator guard already uses
-    for tablet ids. `Metadata::next_free_alloc_id` is this allocator's
-    `next_free_tablet_id` analogue.
+  - `RegisterNode` (ADR 0040 Decision C, PR4) — the **sole claim path** for a
+    fresh node identity, retiring ADR 0036's `AllocateNodeId` monotonic
+    allocator entirely (and the one-PR `alloc_node_id`/`parse_alloc_id`/
+    `ALLOC_ID_BASE` string-mint shim PR3 shipped in its place). `node` may be
+    self-minted (`NodeId::mint`) or operator-/config-proposed
+    (`NodeId::propose`) — this command treats both identically. The CAS key
+    is **`Metadata::node_addrs` alone, not `members`**: an id absent from
+    `node_addrs` claims the address slot (inserting a `Down` `Member` with
+    `labels` too, but *only* if `members` doesn't already have an entry —
+    membership can be independently pre-established by `UpsertMember`'s
+    bootstrap insert or `admin_add_member`'s operator-labeled row, both of
+    which carry no address for this apply to compare against); a
+    byte-identical re-registration is `NoOp` (the idempotent-retry and ADR
+    0032 rejoin cases); a *different* `NodeAddrs` already on file is
+    `Rejected` — the real collision. See `MetaCommand::RegisterNode`'s own
+    doc for why keying on `node_addrs` rather than the full
+    `NodeAddrs`+`labels` pair is load-bearing, not an oversight (a
+    labels-inclusive CAS breaks the moment two *independent* commands can
+    each partially establish the same identity, which several call sites in
+    `animusd` do) — and `docs/engineering-lessons.md`'s entry for the
+    integration-test failure that caught the naive design.
 
 - **`raft.rs`** — `RaftCore<C, S>`: the synchronous, I/O-free Raft state
   machine, **generic over its command `C` and applied state-machine `S`**
@@ -300,16 +314,20 @@ per-tablet CP data plane (`animus-cp-data`).
   dependency-light of this crate, there's no such constraint here). One
   `EntityKind` per `Metadata` collection: the PR1 set
   (`Tablet`/`Member`/`Schema`/`Policy`/`NodeAddrs`/`Keyspace`/`Merged`) plus
-  PR2's `Counter` (the two monotonic id allocators,
-  `next_tablet_id`/`next_alloc_id`, keyed by a fixed counter name),
+  PR2's `Counter` (the monotonic tablet-id allocator, `next_tablet_id`, keyed
+  by a fixed counter name — its ADR 0036 sibling counter, `next_alloc_id`,
+  was removed in ADR 0040 PR4 along with the allocator itself),
   `CpMemberAddr` (the legacy `cp_member_addrs`/`cp_member_tablets` pair,
-  combined into one value per `NodeId`), and `NodeIdAlloc` (the
-  `AllocateNodeId` idempotency ledger, `node_id_allocations`, keyed by
-  nonce) — added so the mirror can reconstruct a **byte-identical**
-  `Metadata`, not one with a documented gap. Plus typed `tablet_key`/
-  `member_key`/`schema_key`/`policy_key`/`node_addrs_key`/`keyspace_key`/
-  `merged_key`/`counter_key`/`cp_member_addr_key`/`node_id_alloc_key`
-  helpers and a dedicated `applied_index_key()` watermark (a sibling of the
+  combined into one value per `NodeId`) — added so the mirror can reconstruct
+  a **byte-identical** `Metadata`, not one with a documented gap. A third PR2
+  variant, `NodeIdAlloc` (the ADR 0036 `AllocateNodeId` idempotency ledger,
+  `node_id_allocations`, keyed by nonce), was **removed in ADR 0040 PR4**
+  along with the allocator it mirrored — `RegisterNode`'s claim lives
+  entirely in the already-mirrored `Member`/`NodeAddrs` kinds, no separate
+  ledger needed. Plus typed `tablet_key`/`member_key`/`schema_key`/
+  `policy_key`/`node_addrs_key`/`keyspace_key`/`merged_key`/`counter_key`/
+  `cp_member_addr_key` helpers and a dedicated `applied_index_key()`
+  watermark (a sibling of the
   entity-kind segment, not under one — mirrors `animus-cp-data`'s
   `engine_applied_index`). `decode_key` inverts every `*_key` helper for the
   mirror's own engine-scan path (`mirror::rebuild_metadata_from_engine`) and
@@ -770,9 +788,14 @@ heartbeats). The 25 binaries:
   real-thread proof that the apply task's real engine I/O (now on a separate
   task from consensus) never blocks heartbeat/`AppendEntries` processing
   long enough to trip the election timeout.
-- **`node_id_allocation.rs`** — `MetaCommand::AllocateNodeId` (ADR 0036): the
-  monotonic allocator mints distinct ids under concurrent proposals, a
-  replayed nonce is idempotent, and the counter survives a restart.
+- **`register_node_cas.rs`** (ADR 0040 PR4, supersedes the deleted
+  `node_id_allocation.rs`) — `MetaCommand::RegisterNode`'s registration CAS:
+  two concurrent registrations with distinct ids both land and every
+  replica agrees; a leader killed mid-registration converges to the one
+  claim on an identical retry (never a second entry); a follower-connected
+  proposer relays via the leader hint (the `is_relayable_command`
+  regression); a *different* registration for an already-claimed id is
+  rejected outright, never silently overwritten.
 - **`control_membership.rs`** — `RaftNode::change_membership`/
   `transfer_leadership` (ADR 0037 PR1): add/remove a voter and catch it up,
   reject a multi-server delta / leader self-removal / a second change while

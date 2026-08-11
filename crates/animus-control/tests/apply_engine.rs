@@ -12,7 +12,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use animus_control::{MetaCommand, NodeStatus, RaftNode, mirror};
+use animus_control::{MetaCommand, NodeAddrs, NodeStatus, RaftNode, mirror};
 use animus_env::nid;
 use animus_placement::PlacementPolicy;
 use animus_sim::{SimEnv, Simulator};
@@ -108,8 +108,14 @@ fn run_scenario(seed: u64) {
             tablet: TabletId(1),
             policy: Some(PlacementPolicy::simple("p", 2)),
         });
-        nodes[leader].propose(MetaCommand::AllocateNodeId {
-            nonce: format!("join-{seed}"),
+        nodes[leader].propose(MetaCommand::RegisterNode {
+            node: nid(900),
+            addrs: NodeAddrs {
+                internal: "127.0.0.1:9900".to_string(),
+                client: "127.0.0.1:9000".to_string(),
+                admin: "127.0.0.1:9500".to_string(),
+                role: "combined".to_string(),
+            },
             labels: BTreeMap::new(),
         });
         sim.run_for(Duration::from_secs(2));

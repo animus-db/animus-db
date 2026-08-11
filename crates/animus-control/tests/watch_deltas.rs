@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use animus_control::mirror::apply_key_write;
-use animus_control::{DeltaRing, MetaCommand, Metadata, NodeStatus, RaftNode, mirror};
+use animus_control::{DeltaRing, MetaCommand, Metadata, NodeAddrs, NodeStatus, RaftNode, mirror};
 use animus_env::{MetricsHandle, nid};
 use animus_placement::PlacementPolicy;
 use animus_sim::{SimEnv, Simulator};
@@ -67,7 +67,7 @@ fn assert_delta_matches_full_fetch(
 
 /// The primary differential oracle: a delta-applied mirror stays
 /// byte-identical to a full fetch through a mixed scenario (membership,
-/// schema, tablet create/split/drop-table, keyspace, node-id-allocation),
+/// schema, tablet create/split/drop-table, keyspace, node registration),
 /// checked at multiple points as the scenario progresses — seed-swept.
 #[test]
 fn delta_applied_mirror_matches_full_fetch_through_a_mixed_scenario() {
@@ -122,8 +122,14 @@ fn run_scenario(seed: u64) {
             tablet: TabletId(1),
             policy: Some(PlacementPolicy::simple("p", 2)),
         });
-        nodes[leader].propose(MetaCommand::AllocateNodeId {
-            nonce: format!("join-{seed}"),
+        nodes[leader].propose(MetaCommand::RegisterNode {
+            node: nid(900),
+            addrs: NodeAddrs {
+                internal: "127.0.0.1:9900".to_string(),
+                client: "127.0.0.1:9000".to_string(),
+                admin: "127.0.0.1:9500".to_string(),
+                role: "combined".to_string(),
+            },
             labels: BTreeMap::new(),
         });
         sim.run_for(Duration::from_secs(2));

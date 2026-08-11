@@ -18,43 +18,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::schema::{IndexDef, SchemaCatalog, TableName, TableSchema};
 
-/// The floor of the **cluster-allocated member id** counter (ADR 0036).
-///
-/// **ADR 0040 PR3 shim, removed in ADR 0040 PR4.** PR4 retires this whole
-/// allocator (`AllocateNodeId`, this counter, `node_id_allocations`) in favor
-/// of self-minted random ids + a registration CAS (ADR 0040 Decision C) — but
-/// deleting it a PR early would be out of this PR's scope (string
-/// representation + explicit config ids), so it stays wired exactly as
-/// before, just minting a *string* id instead of a raw `u64`:
-/// [`alloc_node_id`] formats the counter as `"alloc-{n}"` — the `"alloc-"`
-/// prefix (disjoint from `nid`'s `"n{n}"` test ids and from any operator- or
-/// config-proposed id, since [`NodeId::propose`](animus_env::NodeId::propose)
-/// accepts `-` but a config author has no reason to start an id with this
-/// exact reserved word) is what now keeps a minted id from colliding with an
-/// operator-chosen one — no more numeric floor comparison, since ids are no
-/// longer ordered by magnitude. This crate has no dependency on `animusd`, so
-/// the disjointness is still only documented in prose, same as before.
-pub const ALLOC_ID_BASE: u64 = 1_000_000;
-
-/// The reserved prefix every allocator-minted id carries (see
-/// [`ALLOC_ID_BASE`]'s doc — this whole mechanism is a PR3 shim, removed in
-/// ADR 0040 PR4).
-const ALLOC_ID_PREFIX: &str = "alloc-";
-
-/// Mint the allocator's `n`th id as `"alloc-{n}"` (PR3 shim, removed in PR4).
-pub fn alloc_node_id(n: u64) -> NodeId {
-    NodeId::new_unchecked(format!("{ALLOC_ID_PREFIX}{n}"))
-}
-
-/// Parse an allocator-minted id back to its counter value, if `id` carries
-/// the `"alloc-"` prefix (PR3 shim, removed in PR4). `pub` so a caller
-/// (`animusd`'s `admin_add_control_member`) can tell an operator-supplied id
-/// apart from the allocator's own reserved range without a numeric floor
-/// comparison (ids are no longer ordered by magnitude).
-pub fn parse_alloc_id(id: &NodeId) -> Option<u64> {
-    id.as_str().strip_prefix(ALLOC_ID_PREFIX)?.parse().ok()
-}
-
 /// Lifecycle status of a cluster member.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NodeStatus {
@@ -185,8 +148,10 @@ pub struct Metadata {
     #[serde(default)]
     pub next_tablet_id: u64,
     /// Replicated **node address book** (ADR 0032 PR1): every member's full
-    /// address set (raftkv/client/admin), keyed by its raftkv id. Mutated only
-    /// through [`MetaCommand::RegisterNodeAddrs`]. Unlike [`Metadata::cp_member_addrs`]
+    /// address set (raftkv/client/admin), keyed by its raftkv id. Mutated by
+    /// [`MetaCommand::RegisterNode`] (the sole claim path, ADR 0040 Decision
+    /// C) at first registration and [`MetaCommand::RegisterNodeAddrs`]
+    /// (update-only) thereafter. Unlike [`Metadata::cp_member_addrs`]
     /// (internal raftkv addresses only, including transient split-sibling/CP-group
     /// member ids that are never full cluster members), this is populated once per
     /// **node** at startup, closing the ADR 0030 gap where a pre-growth node's
@@ -220,38 +185,6 @@ pub struct Metadata {
     /// set).
     #[serde(default)]
     pub merged_tablets: BTreeSet<TabletId>,
-    /// The next **cluster-allocated member id** to hand out (ADR 0036) — a
-    /// monotonic allocator over the [`ALLOC_ID_BASE`]-disjoint range,
-    /// mirroring [`Metadata::next_tablet_id`]'s discipline exactly: bumped
-    /// past every id [`MetaCommand::AllocateNodeId`] mints, so two
-    /// concurrent allocations can't derive the same id, and a never-reused
-    /// id can't alias a stale, still-`Down`, address-less member entry left
-    /// behind by an abandoned join attempt (see that command's doc).
-    /// `#[serde(default = "default_next_alloc_id")]` keeps a pre-ADR-0036
-    /// snapshot loading at the base rather than `0`, which would otherwise
-    /// collide with (and be rejected below) every operator-chosen id —
-    /// [`Metadata::next_free_alloc_id`] also folds in the highest existing
-    /// allocation, so this is a floor, not the sole source of truth.
-    #[serde(default = "default_next_alloc_id")]
-    pub next_alloc_id: u64,
-    /// The **idempotency ledger** for [`MetaCommand::AllocateNodeId`] (ADR
-    /// 0036): every nonce a join attempt has ever proposed, mapped to the id
-    /// it was (or would have been, on a retry) allocated. Bounded by "one
-    /// entry per join attempt ever made" — the same accepted, unbounded-but-
-    /// slow growth already accepted for [`Metadata::merged_tablets`].
-    /// `#[serde(default)]` keeps a pre-ADR-0036 snapshot loading (empty map).
-    #[serde(default)]
-    pub node_id_allocations: BTreeMap<String, NodeId>,
-}
-
-/// [`Metadata::next_alloc_id`]'s missing-field default: [`ALLOC_ID_BASE`],
-/// not `0` — a decoded pre-ADR-0036 snapshot has no allocations yet, so
-/// starting the counter at the base (rather than `0`, which would immediately
-/// collide with real, small operator-chosen ids) is both correct and the
-/// obviously-intended value, mirroring `NodeAddrs::role`'s
-/// historically-accurate-default reasoning.
-fn default_next_alloc_id() -> u64 {
-    ALLOC_ID_BASE
 }
 
 /// A mutation of [`Metadata`], replicated through Raft and applied in log order.
@@ -407,13 +340,26 @@ pub enum MetaCommand {
         #[serde(default)]
         tablet: Option<TabletId>,
     },
-    /// Register (or update) a **node's full address book** (ADR 0032 PR1): the
-    /// client/admin/raftkv listen addresses of member `id`, stored in
-    /// [`Metadata::node_addrs`]. Idempotent: a no-op if `id` already maps to an
-    /// identical [`NodeAddrs`]. Superset of [`MetaCommand::RegisterCpAddr`] for
-    /// the client/admin axes — every node proposes this once at startup so any
-    /// other node (including one that joined earlier and never restarted) can
-    /// resolve it as a forward/relay target.
+    /// Update (or re-affirm) an **already-claimed** node's full address book
+    /// (ADR 0032 PR1; tightened to update-only by ADR 0040 PR4): the
+    /// client/admin/internal listen addresses of member `id`, stored in
+    /// [`Metadata::node_addrs`]. Superset of [`MetaCommand::RegisterCpAddr`]
+    /// for the client/admin axes — every already-established node proposes
+    /// this at startup (and whenever an address changes) so any other node
+    /// (including one that joined earlier and never restarted) can resolve
+    /// it as a forward/relay target.
+    ///
+    /// **ADR 0040 Decision C**: this command **never claims a fresh id** —
+    /// `id` must already be present in [`Metadata::members`] or
+    /// [`Metadata::node_addrs`] (a config-bootstrapped member, or one already
+    /// registered via [`MetaCommand::RegisterNode`]), or apply **rejects**
+    /// it. [`MetaCommand::RegisterNode`] is now the *sole* path that inserts
+    /// a brand-new member — see its own doc for why: an unguarded "blind
+    /// idempotent insert" here would let two racing proposers for the same
+    /// never-before-seen id land on two different `NodeAddrs` with no CAS to
+    /// catch it, first-committer-silently-wins. Idempotent: a no-op if `id`
+    /// already maps to an identical [`NodeAddrs`]; otherwise overwrites (an
+    /// address genuinely changed, e.g. a replacement process on new ports).
     RegisterNodeAddrs { node: NodeId, addrs: NodeAddrs },
     /// **Decommission** a drained member (ADR 0032 PR3): the second half of
     /// `drain` (which only marks a member `Leaving` and lets the placement
@@ -446,35 +392,81 @@ pub enum MetaCommand {
     /// raftkv id re-registers and rejoins exactly like a fresh join. The
     /// decommission flow's real last step is stopping the process.
     RemoveMember { node: NodeId },
-    /// **Cluster-allocated member id** (ADR 0036): atomically mint a fresh,
-    /// never-reused member id from the [`ALLOC_ID_BASE`]-disjoint monotonic
-    /// allocator and register it [`Down`](NodeStatus::Down) with `labels` and
-    /// no address yet — the address arrives later via the joiner's own,
-    /// unchanged [`MetaCommand::RegisterNodeAddrs`] self-registration. This
-    /// is the *hard* alternative to an operator picking a `--node I` index by
-    /// hand: uniqueness comes from the same monotonic-floor-plus-presence-
-    /// check discipline [`MetaCommand::SplitTablet`]'s allocator guard
-    /// already uses for tablet ids, evaluated identically on every replica,
-    /// so no epoch-CAS or pre-bind collision check is needed — two proposers
-    /// racing through this command can never both mint the same id.
+    /// **Registration compare-and-swap** (ADR 0040 Decision C): the *sole*
+    /// path that claims a fresh node identity, retiring ADR 0036's
+    /// `AllocateNodeId` monotonic allocator entirely. `node` may be a
+    /// self-minted random id ([`NodeId::mint`](animus_env::NodeId::mint)) or
+    /// an operator-/config-proposed one
+    /// ([`NodeId::propose`](animus_env::NodeId::propose)) — this command
+    /// doesn't care which; uniqueness is enforced identically either way, by
+    /// this apply, not by how the id was chosen.
     ///
-    /// `nonce` is a **joiner-generated idempotency key**: replaying the same
-    /// nonce (a proposer retry after an `Accepted`-but-unconfirmed propose —
-    /// the durable-before-visible discipline every proposer here must respect,
-    /// root `CLAUDE.md`) applies as a no-op that returns the identical,
-    /// already-allocated id, recorded once in
-    /// [`Metadata::node_id_allocations`] — so a retried join attempt can never
-    /// mint a second id for itself, and a genuinely distinct join attempt
-    /// (a different nonce) always gets a fresh one.
+    /// Apply semantics (evaluated identically on every replica, so a race
+    /// between two proposers always resolves the same way everywhere) are
+    /// keyed on [`Metadata::node_addrs`] **alone** — not on
+    /// [`Metadata::members`], deliberately:
+    /// - `node` **absent from `node_addrs`**: claims the address slot
+    ///   (`Applied`), and inserts a [`Down`](NodeStatus::Down) [`Member`]
+    ///   with `labels` too, *iff* `members` doesn't already have an entry for
+    ///   `node` — an already-existing member row (from `UpsertMember`'s
+    ///   bootstrap insert, or `admin_add_member`'s operator-labeled `Down`
+    ///   row, both wholly decoupled commands that carry no address) is left
+    ///   untouched, never overwritten with this call's own (possibly
+    ///   label-less) view. The existing `Down → Active` promotion chain (ADR
+    ///   0030 §1, the failure detector's first-heartbeat observation) is
+    ///   unchanged from here either way.
+    /// - `node` **present in `node_addrs`, byte-identical** to what's
+    ///   proposed: `NoOp` (or `Applied` if it *also* had to repair a missing
+    ///   `members` row) — the idempotent case, covering *both* a proposer's
+    ///   retry after an accepted-but-unconfirmed propose (the
+    ///   durable-before-visible discipline every proposer here must respect,
+    ///   root `CLAUDE.md`) *and* the ADR 0032 same-identity rejoin (a
+    ///   restarted process at the same operator-proposed id, registering the
+    ///   identical address book again).
+    /// - `node` **present in `node_addrs`, but a *different* entry**:
+    ///   `Rejected` — the id's address is already held by someone else. A
+    ///   caller with a **minted** id re-mints and retries (ports are never
+    ///   derived from ids under this scheme, so nothing needs rebinding); a
+    ///   caller with a **proposed** id fails loudly instead (an operator/config
+    ///   collision is a real conflict to report, not to paper over).
     ///
-    /// An abandoned join attempt (the process crashes before ever
-    /// self-registering an address) leaves its allocated id `Down` and
-    /// address-less **forever** — this is accepted, not a leak to fix: ids
-    /// are never reused (mirroring tablet ids), and the entry is prunable
-    /// through the existing [`MetaCommand::RemoveMember`] path exactly like
-    /// any other drained, unreferenced member, once an operator notices it.
-    AllocateNodeId {
-        nonce: String,
+    /// **Why `node_addrs`, not `members`, is the CAS key**: this command is
+    /// the *one* self-registration call every node shape makes at startup —
+    /// including a fresh bootstrap node whose id `bootstrap()`'s own
+    /// `UpsertMember` also claims, a growth node whose id `admin_add_member`
+    /// also claims, and (with no other claim path *at all*) a permanently-
+    /// non-voter control-only growth node. Comparing `labels`/`members` here
+    /// too would make this call race destructively against whichever of
+    /// those decoupled commands wins first (a labels mismatch is not a real
+    /// identity collision — it's just "some other command got here first
+    /// with its own view of this member's labels"); the actual identity
+    /// collision this CAS exists to prevent is always visible in
+    /// `node_addrs` alone, since that's the one field only this command ever
+    /// writes.
+    ///
+    /// **Never claims [`Metadata::members`] for a control-only registration**
+    /// (`addrs.role == "control"`, plain string comparison — this crate never
+    /// otherwise interprets `NodeAddrs.role`, but this one structural
+    /// invariant is load-bearing enough to enforce here rather than trust
+    /// every caller to preserve by convention): `members` is *data-plane*
+    /// membership, and the placement engine's `active_candidates` (ADR 0005)
+    /// treats any `Active` entry there as a real tablet-replica candidate — a
+    /// control-only node has no `raftkv` role or storage engine and can never
+    /// actually host one, so letting it appear in `members` at all (even
+    /// `Down`, since the failure detector promotes any heartbeating `Down`
+    /// entry on its own, ADR 0012) would silently corrupt placement the
+    /// moment it's picked. `node_addrs` still claims normally either way —
+    /// only the membership side effect is gated.
+    ///
+    /// An abandoned join attempt (the process crashes before ever becoming
+    /// `Active`) leaves its claimed id `Down` forever — accepted, not a leak
+    /// to fix: ids are never reused (mirroring tablet ids), and the entry is
+    /// prunable through the existing [`MetaCommand::RemoveMember`] path
+    /// exactly like any other drained, unreferenced member, once an operator
+    /// notices it (an automatic sweep is future work, ADR 0040 PR6).
+    RegisterNode {
+        node: NodeId,
+        addrs: NodeAddrs,
         labels: BTreeMap<String, String>,
     },
 }
@@ -994,6 +986,16 @@ impl Metadata {
                 }
             }
             MetaCommand::RegisterNodeAddrs { node, addrs } => {
+                // ADR 0040 PR4: update-only — never claims a fresh id.
+                // `MetaCommand::RegisterNode` is the sole claim path now; a
+                // node absent from both `members` and `node_addrs` has no
+                // existing claim this command could legitimately update.
+                if !self.members.contains_key(node) && !self.node_addrs.contains_key(node) {
+                    return ApplyOutcome::Rejected(
+                        "node id not yet a registered member — register it via \
+                         MetaCommand::RegisterNode first",
+                    );
+                }
                 if self.node_addrs.get(node) == Some(addrs) {
                     ApplyOutcome::NoOp
                 } else {
@@ -1019,27 +1021,91 @@ impl Metadata {
                 self.cp_member_tablets.remove(node);
                 ApplyOutcome::Applied
             }
-            MetaCommand::AllocateNodeId { nonce, labels } => {
-                if self.node_id_allocations.contains_key(nonce) {
-                    // Idempotent replay of an already-served join attempt
-                    // (same house style as `RegisterNodeAddrs`'s identical-
-                    // input no-op) — the caller re-reads the id from
-                    // `node_id_allocations`, never from this outcome alone.
-                    return ApplyOutcome::NoOp;
+            MetaCommand::RegisterNode {
+                node,
+                addrs,
+                labels,
+            } => {
+                // The CAS is keyed on `node_addrs` alone, not `members` —
+                // membership can legitimately already exist via a wholly
+                // decoupled path (`UpsertMember`'s bootstrap insert,
+                // `admin_add_member`'s operator-labeled `Down` row) *before*
+                // this node ever gets to self-register its own address book,
+                // and none of those paths carry an address for this apply to
+                // compare against. Treating "member present, addrs absent"
+                // as an unclaimed address slot — rather than folding
+                // `members` into the collision test — is what lets a single
+                // shared self-registration call site serve every node shape
+                // (a fresh bootstrap node racing its own `bootstrap()`
+                // insert, a growth node racing its own `admin_add_member`,
+                // and a permanently-non-voter control-only growth node with
+                // *no other claim path at all*) without any of them
+                // fighting over which command's labels/status wins — those
+                // stay whatever the *other*, decoupled command already set,
+                // untouched here.
+                // **Never claim `members` for a control-only registration**
+                // (`addrs.role == "control"`): `Metadata::members` is
+                // *data-plane* membership — the placement engine's
+                // `active_candidates` (ADR 0005) treats every `Active` entry
+                // there as a real tablet-replica candidate, and the failure
+                // detector promotes any heartbeating `Down` entry to
+                // `Active` on its own (ADR 0012) — a control-only node has
+                // no `raftkv` role, no storage engine, and can never
+                // actually host a tablet, so letting it appear in `members`
+                // at all (even transiently `Down`) would make it a
+                // placement candidate that silently corrupts serving the
+                // moment it's picked. Before ADR 0040 PR4, no command ever
+                // proposed membership for a control-only node (self-
+                // registration only ever touched `node_addrs`, via
+                // `RegisterNodeAddrs`); this is that same invariant, now
+                // enforced structurally in the one command that could
+                // otherwise violate it, instead of merely by no caller
+                // happening to ask.
+                let claims_membership = addrs.role != "control";
+                match self.node_addrs.get(node) {
+                    Some(existing) if existing == addrs => {
+                        // Idempotent: a proposer retry after an accepted-
+                        // but-unconfirmed propose, or the ADR 0032
+                        // same-identity rejoin (a restarted process
+                        // re-registering its own, unchanged address book).
+                        // Still make sure the member row exists (a repair,
+                        // never a label/status overwrite of one that does).
+                        if claims_membership && !self.members.contains_key(node) {
+                            self.members.insert(
+                                node.clone(),
+                                Member {
+                                    labels: labels.clone(),
+                                    status: NodeStatus::Down,
+                                },
+                            );
+                            return ApplyOutcome::Applied;
+                        }
+                        ApplyOutcome::NoOp
+                    }
+                    Some(_) => {
+                        // A genuinely different address book is already on
+                        // file for this id — the real collision case.
+                        ApplyOutcome::Rejected(
+                            "node id already claimed by a different registration",
+                        )
+                    }
+                    None => {
+                        // Unclaimed address slot: claim it, and claim
+                        // membership too iff nothing else already has (and
+                        // this is a data-capable registration).
+                        self.node_addrs.insert(node.clone(), addrs.clone());
+                        if claims_membership && !self.members.contains_key(node) {
+                            self.members.insert(
+                                node.clone(),
+                                Member {
+                                    labels: labels.clone(),
+                                    status: NodeStatus::Down,
+                                },
+                            );
+                        }
+                        ApplyOutcome::Applied
+                    }
                 }
-                let n = self.next_free_alloc_id_n();
-                let node_id = alloc_node_id(n);
-                self.next_alloc_id = n + 1;
-                self.node_id_allocations
-                    .insert(nonce.clone(), node_id.clone());
-                self.members.insert(
-                    node_id,
-                    Member {
-                        labels: labels.clone(),
-                        status: NodeStatus::Down,
-                    },
-                );
-                ApplyOutcome::Applied
             }
         }
     }
@@ -1157,45 +1223,6 @@ impl Metadata {
     pub fn next_free_tablet_id(&self) -> TabletId {
         let highest = self.tablets.keys().map(|t| t.0).max().unwrap_or(0);
         TabletId(self.next_tablet_id.max(highest + 1).max(1))
-    }
-
-    /// The next cluster-allocated member id a proposer should mint (ADR
-    /// 0036) — the [`ALLOC_ID_BASE`]-range dual of
-    /// [`next_free_tablet_id`](Self::next_free_tablet_id): folds the
-    /// monotonic `next_alloc_id` counter together with the highest id
-    /// already seen in either `members` or `node_id_allocations` (so a
-    /// pre-counter snapshot, or one whose counter somehow lagged a recorded
-    /// allocation, still allocates strictly above every id it has ever
-    /// handed out) and a floor of [`ALLOC_ID_BASE`] itself. Race-safe by
-    /// construction, same as the tablet allocator: [`MetaCommand::
-    /// AllocateNodeId`]'s apply always calls this immediately before
-    /// minting, under the single-threaded state-machine apply, so two
-    /// concurrent proposals are simply applied in some log order — the
-    /// second sees the first's bumped counter.
-    #[must_use]
-    pub fn next_free_alloc_id(&self) -> NodeId {
-        alloc_node_id(self.next_free_alloc_id_n())
-    }
-
-    /// The numeric counter value backing [`Metadata::next_free_alloc_id`]
-    /// (PR3 shim, removed in PR4 along with the rest of the allocator).
-    fn next_free_alloc_id_n(&self) -> u64 {
-        let highest_member = self
-            .members
-            .keys()
-            .filter_map(parse_alloc_id)
-            .max()
-            .unwrap_or(0);
-        let highest_allocation = self
-            .node_id_allocations
-            .values()
-            .filter_map(parse_alloc_id)
-            .max()
-            .unwrap_or(0);
-        self.next_alloc_id
-            .max(highest_member + 1)
-            .max(highest_allocation + 1)
-            .max(ALLOC_ID_BASE)
     }
 }
 
@@ -1405,7 +1432,12 @@ mod tests {
 
     /// `RegisterNodeAddrs` (ADR 0032 PR1) records a node's full address book,
     /// is idempotent on an identical re-register, and overwrites on a real
-    /// change — mirroring `RegisterCpAddr`'s own contract.
+    /// change — mirroring `RegisterCpAddr`'s own contract. **ADR 0040 PR4**:
+    /// `RegisterNodeAddrs` is update-only now, so this pre-establishes each
+    /// id's claim via `UpsertMember` first (standing in for a config-
+    /// bootstrapped member) — `register_node_addrs_rejects_an_unclaimed_id`
+    /// covers the "no prior claim" rejection this test used to also exercise
+    /// implicitly.
     #[test]
     fn register_node_addrs_records_updates_and_is_idempotent() {
         let mut m = Metadata::default();
@@ -1415,6 +1447,13 @@ mod tests {
             admin: format!("127.0.0.1:{}", 9500 + suffix),
             role: "combined".to_string(),
         };
+        for node in [300, 301] {
+            m.apply(&MetaCommand::UpsertMember {
+                node: nid(node),
+                labels: BTreeMap::new(),
+                status: NodeStatus::Active,
+            });
+        }
 
         // First registration applies and is readable.
         assert_eq!(
@@ -1482,6 +1521,15 @@ mod tests {
     fn register_node_addrs_records_the_role() {
         let mut m = Metadata::default();
         for (node, role) in [(0, "control"), (300, "data"), (301, "combined")] {
+            // ADR 0040 PR4: `RegisterNodeAddrs` is update-only — establish
+            // each id's claim first (standing in for a config-bootstrapped
+            // member), mirroring `register_node_addrs_records_updates_and_
+            // is_idempotent`'s adaptation above.
+            m.apply(&MetaCommand::UpsertMember {
+                node: nid(node),
+                labels: BTreeMap::new(),
+                status: NodeStatus::Active,
+            });
             assert_eq!(
                 m.apply(&MetaCommand::RegisterNodeAddrs {
                     node: nid(node),
@@ -2114,169 +2162,271 @@ mod tests {
         assert_eq!(decoded, m);
     }
 
-    /// The cluster-allocated member id allocator (ADR 0036) is monotonic and
-    /// its range is disjoint from every small, manually-configured id (a
-    /// handful of ordinary `UpsertMember`s, standing in for any realistic
-    /// `--node I` node count) — mirroring
-    /// `next_tablet_id_is_monotonic_across_create_and_split`'s coverage for
-    /// the tablet allocator this one is deliberately shaped after.
-    #[test]
-    fn allocate_node_id_is_monotonic_and_disjoint_from_small_manual_ids() {
-        let mut m = Metadata::default();
-        // A handful of ordinary, small manually-configured members —
-        // comfortably below `ALLOC_ID_BASE` for any realistic node count.
-        for node in [0u64, 1, 300, 301, 302] {
-            m.apply(&MetaCommand::UpsertMember {
-                node: nid(node),
-                labels: BTreeMap::new(),
-                status: NodeStatus::Active,
-            });
+    /// A helper `NodeAddrs` builder for the `RegisterNode`/`RegisterNodeAddrs`
+    /// CAS tests below — mirrors the existing `addrs(suffix)` idiom used by
+    /// `register_node_addrs_records_updates_and_is_idempotent`.
+    fn cas_addrs(suffix: u16) -> NodeAddrs {
+        NodeAddrs {
+            internal: format!("127.0.0.1:{}", 9300 + suffix),
+            client: format!("127.0.0.1:{}", 9000 + suffix),
+            admin: format!("127.0.0.1:{}", 9500 + suffix),
+            role: "combined".to_string(),
         }
-
-        assert_eq!(m.next_free_alloc_id(), alloc_node_id(ALLOC_ID_BASE));
-        assert_eq!(
-            m.apply(&MetaCommand::AllocateNodeId {
-                nonce: "join-1".to_owned(),
-                labels: BTreeMap::new(),
-            }),
-            ApplyOutcome::Applied
-        );
-        let first = m
-            .node_id_allocations
-            .get("join-1")
-            .expect("recorded")
-            .clone();
-        assert_eq!(
-            first,
-            alloc_node_id(ALLOC_ID_BASE),
-            "first allocation lands at the base"
-        );
-        // Disjointness is now by *namespace* (the reserved `"alloc-"` prefix),
-        // not by magnitude — string ids aren't ordered by "size" the way the
-        // old raw-`u64` scheme was (`"alloc-1000000"` sorts *before* `"n302"`
-        // lexicographically, so an `>` comparison here would be a false
-        // negative for the very property this test means to prove).
-        assert!(
-            parse_alloc_id(&first).is_some(),
-            "an allocator-minted id must carry the reserved \"alloc-\" prefix"
-        );
-        for node in [0u64, 1, 300, 301, 302] {
-            assert_ne!(
-                first,
-                nid(node),
-                "allocated id must never collide with a small manual id"
-            );
-        }
-
-        // A second, distinct join attempt allocates strictly past the first —
-        // the counter never goes backward.
-        assert_eq!(
-            m.apply(&MetaCommand::AllocateNodeId {
-                nonce: "join-2".to_owned(),
-                labels: BTreeMap::new(),
-            }),
-            ApplyOutcome::Applied
-        );
-        let second = m
-            .node_id_allocations
-            .get("join-2")
-            .expect("recorded")
-            .clone();
-        assert_eq!(
-            parse_alloc_id(&second).unwrap(),
-            parse_alloc_id(&first).unwrap() + 1
-        );
-        assert_eq!(
-            parse_alloc_id(&m.next_free_alloc_id()).unwrap(),
-            parse_alloc_id(&second).unwrap() + 1
-        );
     }
 
-    /// Replaying the **same nonce** (a proposer retry after an `Accepted`-
-    /// but-unconfirmed propose) is a no-op that returns the identical,
-    /// already-allocated id — never a second one — and mutates nothing else
-    /// (no bump of `next_alloc_id`, no second `members` entry). A genuinely
-    /// **different** nonce always gets a fresh id.
+    /// **ADR 0040 Decision C, the core claim case**: `RegisterNode` on a
+    /// genuinely unclaimed id (absent from both `members` and `node_addrs`)
+    /// inserts a `Down` member with the given labels **and** the address
+    /// book entry, atomically, in one apply.
     #[test]
-    fn allocate_node_id_same_nonce_is_idempotent_distinct_nonces_get_distinct_ids() {
-        let mut m = Metadata::default();
-        let alloc = |nonce: &str| MetaCommand::AllocateNodeId {
-            nonce: nonce.to_owned(),
-            labels: BTreeMap::new(),
-        };
-
-        assert_eq!(m.apply(&alloc("retry-me")), ApplyOutcome::Applied);
-        let id = m
-            .node_id_allocations
-            .get("retry-me")
-            .expect("recorded")
-            .clone();
-        let after_first = m.clone();
-
-        // A retry with the same nonce: no-op, identical id, no further
-        // mutation of `Metadata` at all (proposer-observable state is
-        // unchanged, not just the returned id).
-        assert_eq!(m.apply(&alloc("retry-me")), ApplyOutcome::NoOp);
-        assert_eq!(*m.node_id_allocations.get("retry-me").unwrap(), id);
-        assert_eq!(m, after_first, "a same-nonce replay must mutate nothing");
-
-        // A third, distinct nonce still gets a fresh id.
-        assert_eq!(m.apply(&alloc("different-attempt")), ApplyOutcome::Applied);
-        let other = m
-            .node_id_allocations
-            .get("different-attempt")
-            .expect("recorded")
-            .clone();
-        assert_ne!(other, id);
-    }
-
-    /// A successful allocation registers the id in `members` as `Down` with
-    /// the given labels and no address — the address arrives later via the
-    /// joiner's own `RegisterNodeAddrs` self-registration, unchanged.
-    #[test]
-    fn allocate_node_id_registers_the_member_down_with_labels() {
+    fn register_node_claims_an_unclaimed_id_with_member_and_addrs_atomically() {
         let mut m = Metadata::default();
         let mut labels = BTreeMap::new();
         labels.insert("region".to_owned(), "eu-west".to_owned());
 
         assert_eq!(
-            m.apply(&MetaCommand::AllocateNodeId {
-                nonce: "join-1".to_owned(),
+            m.apply(&MetaCommand::RegisterNode {
+                node: nid(900),
+                addrs: cas_addrs(0),
                 labels: labels.clone(),
             }),
             ApplyOutcome::Applied
         );
-        let id = m
-            .node_id_allocations
-            .get("join-1")
-            .expect("recorded")
-            .clone();
-        let member = m.members.get(&id).expect("member registered");
+        let member = m.members.get(&nid(900)).expect("member registered");
         assert_eq!(member.status, NodeStatus::Down);
         assert_eq!(member.labels, labels);
-        assert!(
-            !m.node_addrs.contains_key(&id),
-            "no address yet — that's a separate, later self-registration"
+        assert_eq!(m.node_addrs.get(&nid(900)), Some(&cas_addrs(0)));
+    }
+
+    /// A **minted-collision-then-retry-with-a-different-id** shape at the
+    /// state-machine level (ADR 0040 Decision C): a `RegisterNode` for an id
+    /// already claimed by someone else with a **different** registration is
+    /// `Rejected` and mutates nothing — the caller's own re-mint-and-retry
+    /// loop (`animusd`) then succeeds simply by proposing a *different* id,
+    /// proven here by the second `RegisterNode` (a distinct id) applying
+    /// cleanly. Also covers a **proposed**-id collision: the same rejection
+    /// is what makes `animusd`'s explicit-`--id` join path fail loudly
+    /// instead of silently overwriting someone else's claim.
+    #[test]
+    fn register_node_rejects_a_different_registration_for_a_claimed_id_then_a_distinct_id_succeeds()
+    {
+        let mut m = Metadata::default();
+        assert_eq!(
+            m.apply(&MetaCommand::RegisterNode {
+                node: nid(901),
+                addrs: cas_addrs(1),
+                labels: BTreeMap::new(),
+            }),
+            ApplyOutcome::Applied
+        );
+        let before = m.clone();
+
+        // Same id, different addrs: rejected, state untouched.
+        assert_eq!(
+            m.apply(&MetaCommand::RegisterNode {
+                node: nid(901),
+                addrs: cas_addrs(2),
+                labels: BTreeMap::new(),
+            }),
+            ApplyOutcome::Rejected("node id already claimed by a different registration")
+        );
+        assert_eq!(m, before, "a rejected collision must mutate nothing");
+
+        // Same id, same addrs but DIFFERENT labels: the CAS is keyed on
+        // `node_addrs` alone (see `MetaCommand::RegisterNode`'s doc for why),
+        // so this is *not* a collision — a `NoOp`, and the original labels
+        // are left untouched (this call's differing labels never overwrite
+        // them; whichever command first claimed membership owns them).
+        let mut other_labels = BTreeMap::new();
+        other_labels.insert("region".to_owned(), "eu-west".to_owned());
+        assert_eq!(
+            m.apply(&MetaCommand::RegisterNode {
+                node: nid(901),
+                addrs: cas_addrs(1),
+                labels: other_labels,
+            }),
+            ApplyOutcome::NoOp
+        );
+        assert_eq!(
+            m, before,
+            "a labels-only mismatch must mutate nothing either"
+        );
+
+        // The "re-mint and retry" case: a distinct id registers cleanly.
+        assert_eq!(
+            m.apply(&MetaCommand::RegisterNode {
+                node: nid(902),
+                addrs: cas_addrs(2),
+                labels: BTreeMap::new(),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert!(m.members.contains_key(&nid(901)) && m.members.contains_key(&nid(902)));
+    }
+
+    /// **Idempotent retry** (ADR 0040 Decision C): replaying the exact same
+    /// `RegisterNode` (identical `addrs` + `labels`) — whether a proposer's
+    /// retry after an accepted-but-unconfirmed propose, or a restarted
+    /// process re-registering its own unchanged identity — is a `NoOp`, not
+    /// a second insert or a rejection, and mutates nothing further.
+    #[test]
+    fn register_node_identical_replay_is_idempotent() {
+        let mut m = Metadata::default();
+        let mut labels = BTreeMap::new();
+        labels.insert("az".to_owned(), "eu-west-1a".to_owned());
+        let cmd = MetaCommand::RegisterNode {
+            node: nid(903),
+            addrs: cas_addrs(3),
+            labels: labels.clone(),
+        };
+        assert_eq!(m.apply(&cmd), ApplyOutcome::Applied);
+        let after_first = m.clone();
+
+        assert_eq!(m.apply(&cmd), ApplyOutcome::NoOp);
+        assert_eq!(m, after_first, "an identical replay must mutate nothing");
+    }
+
+    /// **ADR 0032 same-identity rejoin**: a `RegisterNode` for an id already
+    /// claimed **via a different command** (`UpsertMember`, e.g. a
+    /// config-bootstrapped original member) with byte-identical `addrs` +
+    /// `labels` is still a `NoOp`, not a rejection — `RegisterNode`'s
+    /// "claimed" check reads `members`/`node_addrs` directly, not "did I
+    /// insert this," so it agrees regardless of which command established
+    /// the claim.
+    #[test]
+    fn register_node_agrees_with_a_claim_established_by_upsert_member_and_register_node_addrs() {
+        let mut m = Metadata::default();
+        let mut labels = BTreeMap::new();
+        labels.insert("region".to_owned(), "eu-west".to_owned());
+        m.apply(&MetaCommand::UpsertMember {
+            node: nid(904),
+            labels: labels.clone(),
+            status: NodeStatus::Active,
+        });
+        m.apply(&MetaCommand::RegisterNodeAddrs {
+            node: nid(904),
+            addrs: cas_addrs(4),
+        });
+
+        assert_eq!(
+            m.apply(&MetaCommand::RegisterNode {
+                node: nid(904),
+                addrs: cas_addrs(4),
+                labels,
+            }),
+            ApplyOutcome::NoOp
         );
     }
 
-    /// A `Metadata` snapshot serialized before ADR 0036 (no `next_alloc_id`/
-    /// `node_id_allocations` fields in the JSON) still decodes: the counter
-    /// defaults to `ALLOC_ID_BASE` (not `0`, which would immediately collide
-    /// with real small ids) and the ledger defaults to empty — the same
-    /// `#[serde(default)]` back-compat contract every other additive field on
-    /// `Metadata` already carries.
+    /// **The bug this design point exists to prevent** (found via
+    /// `animusd`'s own `runtime_added_voter_survives_leadership_change_to_a_
+    /// different_original_voter` integration test going bimodal): a member
+    /// claimed via a wholly decoupled command (`UpsertMember`'s bootstrap
+    /// insert, or `admin_add_member`'s operator-labeled `Down` row) with
+    /// **no address yet** must still let `RegisterNode` claim the address
+    /// slot — if the CAS were keyed on `members` (not `node_addrs`), this
+    /// would misfire as "already claimed by a different registration"
+    /// forever (there is no address to compare against, so any proposed one
+    /// would look "different"), permanently starving the node's own
+    /// self-registration. This is exactly the shape a permanently-non-voter
+    /// control-only growth node hits: nothing else ever proposes
+    /// `UpsertMember` for it, so its own `RegisterNode` self-registration is
+    /// the *only* thing that ever creates its `members` row at all.
     #[test]
-    fn metadata_without_alloc_fields_still_decodes_at_the_base() {
-        let m = Metadata::default();
-        let mut value = serde_json::to_value(&m).expect("metadata serializes");
-        let obj = value.as_object_mut().expect("metadata is a JSON object");
-        obj.remove("next_alloc_id");
-        obj.remove("node_id_allocations");
-        let decoded: Metadata =
-            serde_json::from_value(value).expect("metadata without alloc fields still decodes");
-        assert_eq!(decoded.next_alloc_id, ALLOC_ID_BASE);
-        assert!(decoded.node_id_allocations.is_empty());
-        assert_eq!(decoded.next_free_alloc_id(), alloc_node_id(ALLOC_ID_BASE));
+    fn register_node_claims_an_address_for_a_member_already_claimed_without_one() {
+        let mut m = Metadata::default();
+        let mut labels = BTreeMap::new();
+        labels.insert("region".to_owned(), "eu-west".to_owned());
+        // Membership claimed first (e.g. `admin_add_member`), no address yet.
+        m.apply(&MetaCommand::UpsertMember {
+            node: nid(905),
+            labels: labels.clone(),
+            status: NodeStatus::Down,
+        });
+        assert!(!m.node_addrs.contains_key(&nid(905)));
+
+        // The node's own self-registration must still succeed...
+        assert_eq!(
+            m.apply(&MetaCommand::RegisterNode {
+                node: nid(905),
+                addrs: cas_addrs(5),
+                // Deliberately different/empty labels — proving they never
+                // clobber the labels `UpsertMember` already set.
+                labels: BTreeMap::new(),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(m.node_addrs.get(&nid(905)), Some(&cas_addrs(5)));
+        // ...and the pre-existing labels/status are untouched.
+        let member = m.members.get(&nid(905)).expect("member still present");
+        assert_eq!(
+            member.labels, labels,
+            "RegisterNode must never overwrite labels a different command already set"
+        );
+        assert_eq!(member.status, NodeStatus::Down);
+    }
+
+    /// **The bug an integration test caught** (`animusd`'s `control_only_
+    /// cluster_elects_leader_and_serves_status` and `mixed_cluster_put_via_
+    /// control_node_forwards_to_data_node` both went bimodal): a
+    /// control-only node's own self-registration must claim its
+    /// `node_addrs` entry but **never** a `Metadata::members` row — a
+    /// control-only node has no `raftkv` role and can never host a tablet,
+    /// so appearing in `members` at all (even `Down`, since the failure
+    /// detector promotes any heartbeating `Down` entry on its own) would
+    /// make it a placement candidate and silently corrupt tablet placement.
+    #[test]
+    fn register_node_never_claims_membership_for_a_control_role_registration() {
+        let mut m = Metadata::default();
+        let control_addrs = NodeAddrs {
+            internal: "127.0.0.1:9906".to_string(),
+            client: "127.0.0.1:9006".to_string(),
+            admin: "127.0.0.1:9506".to_string(),
+            role: "control".to_string(),
+        };
+        assert_eq!(
+            m.apply(&MetaCommand::RegisterNode {
+                node: nid(906),
+                addrs: control_addrs.clone(),
+                labels: BTreeMap::new(),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(m.node_addrs.get(&nid(906)), Some(&control_addrs));
+        assert!(
+            !m.members.contains_key(&nid(906)),
+            "a control-role registration must never create a members row"
+        );
+
+        // Idempotent replay: still no members row, still a clean NoOp.
+        assert_eq!(
+            m.apply(&MetaCommand::RegisterNode {
+                node: nid(906),
+                addrs: control_addrs,
+                labels: BTreeMap::new(),
+            }),
+            ApplyOutcome::NoOp
+        );
+        assert!(!m.members.contains_key(&nid(906)));
+    }
+
+    /// **ADR 0040 PR4 tightening**: `RegisterNodeAddrs` is update-only — a
+    /// totally unclaimed id (absent from both `members` and `node_addrs`)
+    /// is rejected, not silently registered. `RegisterNode` is the sole
+    /// claim path now.
+    #[test]
+    fn register_node_addrs_rejects_an_unclaimed_id() {
+        let mut m = Metadata::default();
+        assert_eq!(
+            m.apply(&MetaCommand::RegisterNodeAddrs {
+                node: nid(905),
+                addrs: cas_addrs(5),
+            }),
+            ApplyOutcome::Rejected(
+                "node id not yet a registered member — register it via \
+                 MetaCommand::RegisterNode first"
+            )
+        );
+        assert!(!m.node_addrs.contains_key(&nid(905)));
     }
 }

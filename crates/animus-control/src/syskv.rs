@@ -12,7 +12,8 @@
 //! these keys and shadow-mirrors them into a `StorageEngine` **after** the
 //! unchanged in-core `Metadata::apply` still runs (`DRIVER_APPLIED` stays
 //! `false` — dual-write, zero behavior change). PR2 also added three
-//! [`EntityKind`] variants (`Counter`/`CpMemberAddr`/`NodeIdAlloc`) this
+//! [`EntityKind`] variants (`Counter`/`CpMemberAddr`, plus a third, `NodeIdAlloc`,
+//! since removed in ADR 0040 PR4 with the allocator it mirrored) this
 //! module's doc covers inline where they're declared.
 //!
 //! ## Key layout
@@ -83,17 +84,19 @@ pub fn is_reserved_name(name: &str) -> bool {
 /// One system-keyspace entity kind (ADR 0038). Each gets its own segment so a
 /// command touches only the keys of the entities it actually mutates.
 ///
-/// The last three variants (`Counter`, `CpMemberAddr`, `NodeIdAlloc`) were
-/// added in PR2 alongside the mirror itself (`mirror.rs`) — PR1 only encoded
-/// the seven fields a shadow rebuild can reconstruct without them, but a
-/// **byte-identical** `Metadata` round trip (the differential-oracle test)
-/// also needs `Metadata`'s two monotonic id allocators
-/// (`next_tablet_id`/`next_alloc_id`), the `AllocateNodeId` idempotency ledger
-/// (`node_id_allocations`), and the legacy CP-member address book
+/// `Counter`/`CpMemberAddr` were added in PR2 alongside the mirror itself
+/// (`mirror.rs`) — PR1 only encoded the seven fields a shadow rebuild can
+/// reconstruct without them, but a **byte-identical** `Metadata` round trip
+/// (the differential-oracle test) also needs `Metadata`'s monotonic tablet-id
+/// allocator (`next_tablet_id`) and the legacy CP-member address book
 /// (`cp_member_addrs`/`cp_member_tablets`) — so PR2 extends the enum rather
-/// than leaving those fields unmirrored. Additive: every PR1 key a running
-/// system produced still decodes identically (`from_segment` only gained
-/// arms, `as_str` only gained cases).
+/// than leaving those fields unmirrored. A third PR2 variant, `NodeIdAlloc`
+/// (the ADR 0036 `AllocateNodeId` idempotency ledger), was **removed in ADR
+/// 0040 PR4** alongside the allocator it mirrored — `RegisterNode`'s claim
+/// lives entirely in the already-mirrored `Member`/`NodeAddrs` kinds, no
+/// separate ledger needed. Additive since: every PR1 key a running system
+/// produced still decodes identically (`from_segment` only gained arms,
+/// `as_str` only gained cases).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum EntityKind {
     /// A tablet (`Metadata::tablets`), keyed by [`TabletId`].
@@ -113,23 +116,21 @@ pub enum EntityKind {
     /// A never-pruned merge marker (`Metadata::merged_tablets`), keyed by the
     /// merged-away [`TabletId`].
     Merged,
-    /// A monotonic id-allocator counter (`Metadata::next_tablet_id` /
-    /// `Metadata::next_alloc_id`), keyed by a fixed ASCII counter name (PR2:
-    /// `mirror::NEXT_TABLET_ID_COUNTER` / `mirror::NEXT_ALLOC_ID_COUNTER`).
-    /// Not a per-`MetaCommand` entity — a process-wide scalar — but shaped as
-    /// an ordinary entity key (one segment, one id) rather than a bespoke
-    /// watermark-style key (like [`applied_index_key`]) so a new counter can
-    /// be added later without inventing a third key shape.
+    /// A monotonic id-allocator counter (`Metadata::next_tablet_id`), keyed
+    /// by a fixed ASCII counter name (PR2: `mirror::NEXT_TABLET_ID_COUNTER`;
+    /// the ADR 0036 allocator's sibling counter, `next_alloc_id` /
+    /// `NEXT_ALLOC_ID_COUNTER`, was removed in ADR 0040 PR4 along with the
+    /// allocator itself). Not a per-`MetaCommand` entity — a process-wide
+    /// scalar — but shaped as an ordinary entity key (one segment, one id)
+    /// rather than a bespoke watermark-style key (like
+    /// [`applied_index_key`]) so a new counter can be added later without
+    /// inventing a third key shape.
     Counter,
     /// A legacy CP-group member's address registration
     /// (`Metadata::cp_member_addrs`/`Metadata::cp_member_tablets`, mutated
     /// only by the back-compat-only `MetaCommand::RegisterCpAddr`), keyed by
     /// [`NodeId`] (PR2).
     CpMemberAddr,
-    /// One `MetaCommand::AllocateNodeId` idempotency-ledger entry
-    /// (`Metadata::node_id_allocations`), keyed by the join attempt's nonce
-    /// string (PR2).
-    NodeIdAlloc,
 }
 
 impl EntityKind {
@@ -150,7 +151,6 @@ impl EntityKind {
             EntityKind::Merged => "merged",
             EntityKind::Counter => "counter",
             EntityKind::CpMemberAddr => "cp_member_addr",
-            EntityKind::NodeIdAlloc => "node_id_alloc",
         }
     }
 
@@ -172,7 +172,6 @@ impl EntityKind {
             b"merged" => EntityKind::Merged,
             b"counter" => EntityKind::Counter,
             b"cp_member_addr" => EntityKind::CpMemberAddr,
-            b"node_id_alloc" => EntityKind::NodeIdAlloc,
             _ => return None,
         })
     }
@@ -297,8 +296,7 @@ pub fn merged_key(id: TabletId) -> Vec<u8> {
 }
 
 /// A named counter's key under [`EntityKind::Counter`] (PR2). `name` is a
-/// fixed ASCII constant (`mirror::NEXT_TABLET_ID_COUNTER` /
-/// `mirror::NEXT_ALLOC_ID_COUNTER`), not user input.
+/// fixed ASCII constant (`mirror::NEXT_TABLET_ID_COUNTER`), not user input.
 #[must_use]
 pub fn counter_key(name: &str) -> Vec<u8> {
     entity_key(EntityKind::Counter, name.as_bytes())
@@ -310,13 +308,6 @@ pub fn counter_key(name: &str) -> Vec<u8> {
 #[must_use]
 pub fn cp_member_addr_key(id: &NodeId) -> Vec<u8> {
     entity_key(EntityKind::CpMemberAddr, id.as_str().as_bytes())
-}
-
-/// A join attempt's nonce string's key under [`EntityKind::NodeIdAlloc`]
-/// (PR2, `Metadata::node_id_allocations`).
-#[must_use]
-pub fn node_id_alloc_key(nonce: &str) -> Vec<u8> {
-    entity_key(EntityKind::NodeIdAlloc, nonce.as_bytes())
 }
 
 /// The decoded form of a system-keyspace key ([`decode_key`]'s result).
@@ -386,7 +377,7 @@ pub fn decode_key(key: &[u8]) -> Option<DecodedKey> {
 mod tests {
     use super::*;
 
-    const ALL_KINDS: [EntityKind; 10] = [
+    const ALL_KINDS: [EntityKind; 9] = [
         EntityKind::Tablet,
         EntityKind::Member,
         EntityKind::Schema,
@@ -396,7 +387,6 @@ mod tests {
         EntityKind::Merged,
         EntityKind::Counter,
         EntityKind::CpMemberAddr,
-        EntityKind::NodeIdAlloc,
     ];
 
     // --- reserved-name guard -------------------------------------------------
@@ -543,18 +533,6 @@ mod tests {
             Some(DecodedKey::Entity {
                 kind: EntityKind::CpMemberAddr,
                 id: b"n1301".to_vec(),
-            })
-        );
-    }
-
-    #[test]
-    fn node_id_alloc_key_round_trips() {
-        let key = node_id_alloc_key("join-1");
-        assert_eq!(
-            decode_key(&key),
-            Some(DecodedKey::Entity {
-                kind: EntityKind::NodeIdAlloc,
-                id: b"join-1".to_vec(),
             })
         );
     }
