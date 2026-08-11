@@ -8,7 +8,6 @@
 //! Raft replica computes the identical accept/reject decision.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::net::SocketAddr;
 
 use animus_env::NodeId;
 use animus_placement::{Candidate, PlacementPolicy, rebalance_step, replan};
@@ -18,10 +17,11 @@ use serde::{Deserialize, Serialize};
 use crate::schema::{IndexDef, SchemaCatalog, TableName, TableSchema};
 
 /// The floor of the **cluster-allocated member id** range (ADR 0036):
-/// comfortably above `animusd`'s `RAFTKV_ID_BASE` (300) plus any realistic
-/// manually-configured `--node I` node count, so an id minted by
-/// [`Metadata::next_free_alloc_id`] can never collide with an operator-chosen
-/// `raftkv_id(I) = 300 + I`. This crate has no dependency on `animusd` (the
+/// comfortably above any realistic manually-configured `--node I` node count
+/// (`animusd`'s node id is now just the config index, ADR 0040 PR1 — one
+/// identity per node, no more separate `raftkv_id = 300 + I` offset), so an
+/// id minted by [`Metadata::next_free_alloc_id`] can never collide with an
+/// operator-chosen one. This crate has no dependency on `animusd` (the
 /// dependency runs the other way), so the disjointness is documented here in
 /// prose rather than enforced by sharing a constant — the same discipline
 /// already used for [`NodeAddrs::role`]'s plain-`String` vocabulary. Not
@@ -54,67 +54,45 @@ pub struct Member {
 
 /// A member's full address book (ADR 0032 PR1): every listen address a node
 /// exposes, replicated so any node can forward/relay to any other regardless
-/// of when it joined. Keyed by the member's **raftkv** id in
+/// of when it joined. Keyed by the member's node id in
 /// [`Metadata::node_addrs`] — the same id space as [`Metadata::cp_member_addrs`]
 /// (which this supersedes for the client/admin axes; `cp_member_addrs` is kept
-/// for WAL back-compat and the internal raftkv peer book).
+/// for WAL back-compat and the internal peer book).
+///
+/// **ADR 0040 PR1 (one identity per node)**: `raftkv` and `control` — two
+/// separate listen addresses for a node's two `ProdEnv` roles — merge into
+/// one `internal` field, since a node now runs exactly one internal env (the
+/// control Raft on stream 0, every hosted tablet's Raft group on its own
+/// stream ≥ 1, ADR 0026). This is a clean break — no wire/WAL back-compat
+/// with a pre-ADR-0040 deployment.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeAddrs {
-    /// The internal `raftkv` (per-tablet CP Raft) listen address.
-    pub raftkv: String,
+    /// This node's one internal `ProdEnv` listen address (ADR 0040 PR1):
+    /// carries the control-plane Raft and every per-tablet Raft group this
+    /// node hosts. Always populated at self-registration, for every role
+    /// (control-only, data-only, or combined) — unlike the pre-ADR-0040
+    /// `control`/`raftkv` pair, there is no role for which this is legitimately
+    /// absent, so a runtime-added control voter (`admin_add_control_member`)
+    /// needs no separate address-replication path either: its `internal`
+    /// address is either already registered (an existing node being promoted
+    /// to a voter) or supplied directly by the admin action.
+    pub internal: String,
     /// The plain client-protocol listen address.
     pub client: String,
     /// The admin/debug HTTP listen address.
     pub admin: String,
     /// This node's deployment role (ADR 0035): `"control"` / `"data"` /
     /// `"combined"`, the same vocabulary `animusd`'s `/admin/config` already
-    /// derives from its own `control_id`/`raftkv_id` presence. A node only
-    /// ever *authoritatively* knows its own role, so this is filled in and
-    /// proposed once, at self-registration time (mirroring `raftkv`/`client`/
-    /// `admin` themselves) — never inferred by a reader from anything else.
-    /// Plain `String`, not an `animusd`-side enum: `animus-control` has no
+    /// derives from its own role. A node only ever *authoritatively* knows
+    /// its own role, so this is filled in and proposed once, at
+    /// self-registration time (mirroring `internal`/`client`/`admin`
+    /// themselves) — never inferred by a reader from anything else. Plain
+    /// `String`, not an `animusd`-side enum: `animus-control` has no
     /// dependency on `animusd` (the dependency runs the other way), and
     /// every other field here is already an opaque wire-format string this
-    /// crate never interprets. `#[serde(default = "default_node_role")]`
-    /// keeps a pre-ADR-0035 snapshot/WAL record loading — every node that
-    /// ever proposed `RegisterNodeAddrs` before this field existed was, by
-    /// construction, a combined-mode node (ADR 0035's `Control`/`Data`
-    /// split didn't exist yet), so `"combined"` is the historically accurate
-    /// default, not just a placeholder.
+    /// crate never interprets.
     #[serde(default = "default_node_role")]
     pub role: String,
-    /// This node's **control-Raft** listen address (ADR 0037 PR4) — distinct
-    /// from `raftkv`/`client`/`admin` above, and typed as a real
-    /// [`SocketAddr`] rather than an opaque `String` like its siblings
-    /// (nothing here ever needs to carry a malformed/unparseable control
-    /// address, unlike the others, which predate this field and are kept as
-    /// `String` for back-compat with what's already on the wire). `None` for
-    /// every **statically**-configured control voter — its address comes
-    /// from `ClusterConfig` at each node's own process start (the same
-    /// static peer book every node has always built at bring-up), so there
-    /// is nothing to replicate there; this field exists **only** for a
-    /// voter added at runtime via `RaftNode::change_membership`
-    /// (`animusd`'s `admin_add_control_member`), which has no config file
-    /// entry on any other node. Populated by that one call site, pruned
-    /// (set back to `None`, not the whole entry — this node may still be a
-    /// data-role/combined member) by `admin_remove_control_member`.
-    /// `#[serde(default)]` for the same pre-this-field WAL/snapshot
-    /// back-compat reason `role` above documents — `Option<T>`'s own default
-    /// (`None`) is exactly right, no custom default fn needed.
-    ///
-    /// Read by every **control**-role node's own periodic
-    /// `control_peer_sync_loop` (`animusd`, the control-role dual of the
-    /// `raftkv` role's `peer_sync_loop`/`route_sync_loop` overlays) to merge
-    /// a runtime-added voter's address into *that node's own* control env
-    /// peer book (`ProdEnv::merge_peer`) — closing the gap where only the
-    /// leader that happened to run `admin_add_control_member` ever learned
-    /// the address (see that method's doc, and `ProdEnv::merge_peer`'s
-    /// "known scope limit"): a later leadership change or crash left every
-    /// *other* voter permanently unable to reach the new one. This is an
-    /// **overlay**, additive over the static book, exactly like ADR 0032
-    /// PR1's `node_addrs[*].raftkv`/`.client` pattern for the other two axes.
-    #[serde(default)]
-    pub control: Option<SocketAddr>,
 }
 
 fn default_node_role() -> String {
@@ -1388,11 +1366,10 @@ mod tests {
     fn register_node_addrs_records_updates_and_is_idempotent() {
         let mut m = Metadata::default();
         let addrs = |suffix: u16| NodeAddrs {
-            raftkv: format!("127.0.0.1:{}", 9300 + suffix),
+            internal: format!("127.0.0.1:{}", 9300 + suffix),
             client: format!("127.0.0.1:{}", 9000 + suffix),
             admin: format!("127.0.0.1:{}", 9500 + suffix),
             role: "combined".to_string(),
-            control: None,
         };
 
         // First registration applies and is readable.
@@ -1465,11 +1442,10 @@ mod tests {
                 m.apply(&MetaCommand::RegisterNodeAddrs {
                     node,
                     addrs: NodeAddrs {
-                        raftkv: format!("127.0.0.1:{}", 9300 + node),
+                        internal: format!("127.0.0.1:{}", 9300 + node),
                         client: format!("127.0.0.1:{}", 9000 + node),
                         admin: format!("127.0.0.1:{}", 9500 + node),
                         role: role.to_string(),
-                        control: None,
                     },
                 }),
                 ApplyOutcome::Applied
@@ -1487,11 +1463,10 @@ mod tests {
     #[test]
     fn node_addrs_without_role_field_defaults_to_combined() {
         let addrs = NodeAddrs {
-            raftkv: "127.0.0.1:9300".to_owned(),
+            internal: "127.0.0.1:9300".to_owned(),
             client: "127.0.0.1:9000".to_owned(),
             admin: "127.0.0.1:9500".to_owned(),
             role: "combined".to_string(),
-            control: None,
         };
         let mut value = serde_json::to_value(&addrs).expect("NodeAddrs serializes");
         value
@@ -1501,84 +1476,7 @@ mod tests {
         let decoded: NodeAddrs =
             serde_json::from_value(value).expect("NodeAddrs without role still decodes");
         assert_eq!(decoded.role, "combined");
-        assert_eq!(decoded.raftkv, addrs.raftkv);
-    }
-
-    /// A `NodeAddrs` JSON shape serialized before ADR 0037 (no `control`
-    /// field at all) still decodes, defaulting to `None` — every node that
-    /// ever proposed `RegisterNodeAddrs` before this field existed had no
-    /// runtime-added-control-voter concept at all, so `None` ("no known
-    /// control-Raft address for this node") is the historically accurate
-    /// default, exactly like `role`'s own back-compat test above.
-    #[test]
-    fn node_addrs_without_control_field_still_decodes() {
-        let addrs = NodeAddrs {
-            raftkv: "127.0.0.1:9300".to_owned(),
-            client: "127.0.0.1:9000".to_owned(),
-            admin: "127.0.0.1:9500".to_owned(),
-            role: "combined".to_string(),
-            control: Some("127.0.0.1:9700".parse().unwrap()),
-        };
-        let mut value = serde_json::to_value(&addrs).expect("NodeAddrs serializes");
-        value
-            .as_object_mut()
-            .expect("NodeAddrs is a JSON object")
-            .remove("control");
-        let decoded: NodeAddrs =
-            serde_json::from_value(value).expect("NodeAddrs without control still decodes");
-        assert_eq!(decoded.control, None);
-        assert_eq!(decoded.raftkv, addrs.raftkv);
-    }
-
-    /// `NodeAddrs.control` (ADR 0037 PR4) replicates alongside the rest of the
-    /// address book exactly like every other field here — a runtime-added
-    /// control voter's address registers as `Some`, and a later
-    /// re-registration that clears it back to `None` (mirroring
-    /// `admin_remove_control_member`'s address pruning on removal, which
-    /// re-registers the same entry with `control: None` rather than erasing
-    /// the whole `NodeAddrs` — the node may still be a data-role/combined
-    /// member) is a normal, replicated overwrite, not a special case.
-    #[test]
-    fn register_node_addrs_records_and_prunes_the_control_address() {
-        let mut m = Metadata::default();
-        let with_control = NodeAddrs {
-            raftkv: String::new(),
-            client: "127.0.0.1:9000".to_owned(),
-            admin: "127.0.0.1:9500".to_owned(),
-            role: "control".to_string(),
-            control: Some("127.0.0.1:9700".parse().unwrap()),
-        };
-        assert_eq!(
-            m.apply(&MetaCommand::RegisterNodeAddrs {
-                node: 3,
-                addrs: with_control.clone(),
-            }),
-            ApplyOutcome::Applied
-        );
-        assert_eq!(
-            m.node_addrs.get(&3).and_then(|a| a.control),
-            Some("127.0.0.1:9700".parse().unwrap())
-        );
-
-        // Pruned back to `None` (control-remove) — everything else is
-        // untouched, since this is a real member whose data/admin/client
-        // addresses must survive its control-voter status changing.
-        let pruned = NodeAddrs {
-            control: None,
-            ..with_control
-        };
-        assert_eq!(
-            m.apply(&MetaCommand::RegisterNodeAddrs {
-                node: 3,
-                addrs: pruned,
-            }),
-            ApplyOutcome::Applied
-        );
-        assert_eq!(m.node_addrs.get(&3).and_then(|a| a.control), None);
-        assert_eq!(
-            m.node_addrs.get(&3).map(|a| a.admin.as_str()),
-            Some("127.0.0.1:9500")
-        );
+        assert_eq!(decoded.internal, addrs.internal);
     }
 
     /// ADR 0024 address GC: a tablet-scoped `RegisterCpAddr` entry is pruned from
@@ -2119,11 +2017,10 @@ mod tests {
             m.apply(&MetaCommand::RegisterNodeAddrs {
                 node: 301,
                 addrs: NodeAddrs {
-                    raftkv: "127.0.0.1:9301".to_owned(),
+                    internal: "127.0.0.1:9301".to_owned(),
                     client: "127.0.0.1:9001".to_owned(),
                     admin: "127.0.0.1:9501".to_owned(),
                     role: "combined".to_string(),
-                    control: None,
                 },
             });
             m.apply(&MetaCommand::RegisterCpAddr {
@@ -2171,16 +2068,16 @@ mod tests {
     }
 
     /// The cluster-allocated member id allocator (ADR 0036) is monotonic and
-    /// its range is disjoint from every small, manually-configured id (the
-    /// `--node I` convention's `0..RAFTKV_ID_BASE+N`, modeled here by a
-    /// handful of ordinary `UpsertMember`s) — mirroring
+    /// its range is disjoint from every small, manually-configured id (a
+    /// handful of ordinary `UpsertMember`s, standing in for any realistic
+    /// `--node I` node count) — mirroring
     /// `next_tablet_id_is_monotonic_across_create_and_split`'s coverage for
     /// the tablet allocator this one is deliberately shaped after.
     #[test]
     fn allocate_node_id_is_monotonic_and_disjoint_from_small_manual_ids() {
         let mut m = Metadata::default();
         // A handful of ordinary, small manually-configured members —
-        // comfortably inside `0..RAFTKV_ID_BASE+N` for any realistic N.
+        // comfortably below `ALLOC_ID_BASE` for any realistic node count.
         for node in [0u64, 1, 300, 301, 302] {
             m.apply(&MetaCommand::UpsertMember {
                 node,
