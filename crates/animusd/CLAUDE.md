@@ -632,6 +632,40 @@ route below the edge through the same `ClientCtx` CP primitives.
   candidate and silently corrupt tablet placement the moment it's picked
   (caught by `tests/control_only.rs` going bimodal during this PR — see
   `docs/engineering-lessons.md`).
+- **Orphan-member auto-reclaim sweep (ADR 0040 PR6)**: the mechanism itself
+  (`Member.has_activated`, `Metadata::orphan_sweep_candidates`, the
+  `RemoveMember` claim-without-member extension, the leader-side volatile
+  `orphan_sweep_loop`) lives entirely in `animus-control` — see that
+  crate's `CLAUDE.md`. This crate's whole contribution is plumbing the
+  `orphan_sweep_after: Duration` knob from a config file/CLI flag down to
+  `RaftNode::start_with_orphan_sweep_after` — `Duration::ZERO` disables the
+  sweep outright. To avoid a wide, unrelated blast radius (touching the
+  many existing test call sites of `run_node_with`/`run_node_control`/
+  `start_cluster_with_auto_split*`/`start_split_cluster_with`, none of
+  which care about this knob), **every existing public entry point keeps
+  its exact signature**, defaulting internally to
+  `animus_control::node::DEFAULT_ORPHAN_SWEEP_AFTER` (10 minutes); a
+  parallel `_with_orphan_sweep_after`-suffixed (or, for the two
+  `start_*cluster*` functions, `_and_orphan_sweep_after`/
+  `_orphan_sweep_after`-suffixed) sibling function takes the explicit
+  `Duration` and is what `main.rs`'s new `--orphan-sweep-after SECS` flag
+  actually calls — mirroring the existing `auto_split_threshold`/
+  `auto_split_bytes_threshold` layered-wrapper convention this file already
+  uses, rather than introducing a `ClusterConfig` struct field (which would
+  have required updating the struct literal at every one of that config's
+  ~20 existing test call sites for one niche knob — a disproportionate
+  sweep for what the CLI flag already covers for every real deployment
+  shape). `run_node_growth`/`run_node_join` (`finish_combined_join`) are
+  deliberately **not** given their own `_with_orphan_sweep_after` variant —
+  a growth/join node always takes the default; wiring the flag through
+  those two entry points as well is future work if ever needed, not
+  required by this PR's scope. Only meaningful on a mode that runs a local
+  control `RaftNode` (every mode except `data`, which has none).
+  `/admin/raft`'s per-member view grew a `has_activated` field alongside
+  the existing `believes_alive` one (same signal the sweep gates on); the
+  Overview dashboard's node-row status text appends "(never activated)"
+  for a `Down` member with `has_activated: false` — the one minimal,
+  non-redesigning dashboard touch this PR makes.
 - **Control-plane membership change (ADR 0037 PR3)**: `ClientCtx::
   admin_add_control_member`/`admin_remove_control_member` (`lib.rs`, near
   `admin_add_member`/`admin_remove_member`) grow/shrink the control group's
@@ -823,7 +857,15 @@ route below the edge through the same `ClientCtx` CP primitives.
 that poll with timeouts, not deterministic assertions. The restart tests run both
 incarnations in the same runtime, calling `Node::shutdown()` between them. Two
 in-crate `#[cfg(test)] mod`s (`split_fence_tests`, `auto_split_median_tests`) live
-in `lib.rs` because they need private handles.
+in `lib.rs` because they need private handles. The ADR 0040 PR6 orphan-member
+sweep has **no dedicated test file here** — its mechanism is entirely
+`animus-control`'s (see that crate's `tests/orphan_sweep.rs`, the seeded
+`SimEnv` fault-injection suite), mirroring how the ADR 0012 failure detector
+it's patterned on is likewise tested there and not duplicated in this crate
+beyond the general `self_heal.rs` smoke test; this crate's own contribution
+(the config/CLI knob) is exercised implicitly by every existing test that
+starts a node through the now-defaulted `run_node_with`/`run_node_control`/
+`start_cluster_*` entry points.
 
 Test-file map (`tests/`):
 
