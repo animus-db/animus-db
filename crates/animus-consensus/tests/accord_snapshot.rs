@@ -131,7 +131,7 @@ fn restart_from_truncated_wal_recovers_identical_state() {
     // Everything applied on node 2; capture its full executed view + WAL size.
     for (k, id) in ids.iter().enumerate() {
         assert!(
-            nodes[2].is_applied(*id),
+            nodes[2].is_applied(id.clone()),
             "node 2 did not apply txn for key {k} (seed={seed})"
         );
     }

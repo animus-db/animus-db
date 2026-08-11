@@ -35,7 +35,7 @@ fn cluster(seed: u64) -> (Simulator, Vec<AccordNode<SimEnv>>) {
 
 /// Count the protocol `SEND`s originating from node `from` in the trace.
 fn sends_from(sim: &Simulator, from: u64) -> usize {
-    let needle = format!("SEND {from}->");
+    let needle = format!("SEND {}->", nid(from));
     sim.trace_lines()
         .iter()
         .filter(|l| l.contains(&needle))
@@ -97,7 +97,10 @@ fn backoff_still_converges_after_a_heal() {
     // Let the coordinator back off well into its capped interval while isolated.
     sim.run_for(Duration::from_secs(10));
     for n in &nodes {
-        assert!(!n.is_applied(txn), "must be stuck while partitioned");
+        assert!(
+            !n.is_applied(txn.clone()),
+            "must be stuck while partitioned"
+        );
     }
 
     // Heal and let the next retry carry it home.
@@ -107,12 +110,12 @@ fn backoff_still_converges_after_a_heal() {
 
     for (i, n) in nodes.iter().enumerate() {
         assert!(
-            n.is_applied(txn),
+            n.is_applied(txn.clone()),
             "node {i} never executed after heal — backoff must not strand it (seed={seed})"
         );
         assert_eq!(
-            n.committed_execute_at(txn),
-            nodes[0].committed_execute_at(txn),
+            n.committed_execute_at(txn.clone()),
+            nodes[0].committed_execute_at(txn.clone()),
             "node {i} committed at a different timestamp (seed={seed})"
         );
     }
@@ -140,7 +143,7 @@ fn backoff_converges_under_loss_across_seeds() {
         sim.run_for(Duration::from_secs(40));
         for (i, n) in nodes.iter().enumerate() {
             assert!(
-                n.is_applied(txn),
+                n.is_applied(txn.clone()),
                 "node {i} never executed under loss with backoff (seed={seed})"
             );
         }

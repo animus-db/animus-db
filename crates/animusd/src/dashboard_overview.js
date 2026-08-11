@@ -15,7 +15,12 @@ function renderOverview() {
   const tabletIds = Object.keys(tablets).map(Number).sort((a, b) => a - b);
   const groups = cpGroupsByTablet();
   const members = (status && status.members) || {};
-  const memberIds = Object.keys(members).map(Number).sort((a, b) => a - b);
+  // ADR 0040 PR3: member ids are now self-minted strings (`"n0"`, an
+  // allocator-minted `"alloc-…"`, or an arbitrary operator-proposed id), not
+  // small integers — a numeric `.map(Number)` would turn every one into
+  // `NaN`. Plain lexicographic sort (config/gen-config zero-pads generated
+  // ids specifically so this stays == numeric order for the common case).
+  const memberIds = Object.keys(members).sort();
   const nodeCount = memberIds.length || STATE.nodes.length;
 
   const h = computeHealth();

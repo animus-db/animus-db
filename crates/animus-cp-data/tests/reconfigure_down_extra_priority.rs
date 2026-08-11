@@ -87,15 +87,15 @@ fn down_extra_is_removed_first_regardless_of_id_order_and_without_a_catch_up_gat
     }
     let commit = nodes[l].commit_index();
     assert!(
-        nodes[l].peer_match(nid(x)) < commit,
+        nodes[l].peer_match(&nid(x)) < commit,
         "test setup: `x` must be lagging behind commit_index (peer_match={}, commit={commit})",
-        nodes[l].peer_match(nid(x))
+        nodes[l].peer_match(&nid(x))
     );
     // Sanity: `a` (the healthy extra `reconfigure_step` must NOT pick first)
     // is fully caught up — so the only reason a fixed removal of `b` could be
     // blocked is a catch-up gate misapplied to the wrong node.
     assert!(
-        nodes[l].peer_match(nid(a)) >= commit,
+        nodes[l].peer_match(&nid(a)) >= commit,
         "test setup: `a` must be fully caught up"
     );
 
@@ -107,7 +107,7 @@ fn down_extra_is_removed_first_regardless_of_id_order_and_without_a_catch_up_gat
         "must remove the Down extra `b` in one step, leaving {{leader, x, a}} — got {step:?} \
          (current config: {:?}, x lagging at {} < commit {commit})",
         nodes[l].config(),
-        nodes[l].peer_match(nid(x)),
+        nodes[l].peer_match(&nid(x)),
     );
     assert!(
         !nodes[l].config().contains(&nid(b)),

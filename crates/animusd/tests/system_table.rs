@@ -40,6 +40,7 @@ use tokio::time::{sleep, timeout};
 async fn bring_up_one(dir: &std::path::Path) -> Node {
     let addrs = free_addrs(5);
     let node_cfg = animusd::RoleAddrs {
+        id: animusd::config::node_id(0),
         role: animusd::config::NodeRole::Both,
         internal: addrs[0],
         client: addrs[1],
@@ -231,7 +232,7 @@ async fn system_table_lists_every_seeded_entity_kind() {
         assert!(matches!(resp, ClientResponse::PutOk), "{resp:?}");
         await_status(
             admin,
-            |s| s["cp_member_addrs"].get("9999").is_some(),
+            |s| s["cp_member_addrs"].get("n9999").is_some(),
             "cp_member_addr committed",
         )
         .await;
@@ -401,13 +402,13 @@ async fn system_table_lists_every_seeded_entity_kind() {
             "counter value is a raw u64 rendered as a JSON number: {counter_item}"
         );
 
-        let cp_addr_item = find("cp_member_addr", "9999");
+        let cp_addr_item = find("cp_member_addr", "n9999");
         assert!(cp_addr_item["value"].is_object());
 
         let node_id_alloc_item = find("node_id_alloc", "join-nonce-1");
         assert_eq!(
-            node_id_alloc_item["value"].as_u64(),
-            Some(allocated_id.as_u64()),
+            node_id_alloc_item["value"].as_str(),
+            Some(allocated_id.as_str()),
             "node_id_alloc value is the allocated id: {node_id_alloc_item}"
         );
 

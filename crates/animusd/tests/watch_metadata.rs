@@ -188,6 +188,7 @@ async fn restarted_control_node_resets_its_ring_and_pre_restart_watchers_fall_ba
             l.local_addr().unwrap()
         };
         animusd::RoleAddrs {
+            id: animusd::config::node_id(0),
             role: animusd::config::NodeRole::Control,
             internal: free(),
             client: free(),

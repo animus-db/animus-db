@@ -633,8 +633,8 @@ pub async fn send_heartbeat<E: Env>(env: &E, control: &[NodeId]) {
         node: env.node_id(),
     };
     let bytes = serde_json::to_vec(&msg).expect("heartbeat serializes");
-    for &c in control {
-        env.send(c, bytes.clone()).await;
+    for c in control {
+        env.send(c.clone(), bytes.clone()).await;
     }
 }
 
@@ -1311,9 +1311,9 @@ async fn detect_loop<E: Env>(
         // doc). A no-op for every member the detector already tracks.
         {
             let mut d = detector.lock().expect("detector poisoned");
-            for (&id, m) in &members {
-                if m.status == NodeStatus::Active && !d.tracks(id) {
-                    d.observe(id, now);
+            for (id, m) in &members {
+                if m.status == NodeStatus::Active && !d.tracks(id.clone()) {
+                    d.observe(id.clone(), now);
                 }
             }
         }

@@ -66,20 +66,20 @@ fn assert_committed_consistently(
     let mut agreed_deps: Option<BTreeSet<TxnId>> = None;
     let mut committed = 0;
     for (i, n) in nodes.iter().enumerate() {
-        if let Some(e) = n.committed_execute_at(txn) {
+        if let Some(e) = n.committed_execute_at(txn.clone()) {
             committed += 1;
-            match agreed {
+            match &agreed {
                 None => {
                     agreed = Some(e);
-                    agreed_deps = n.committed_deps(txn);
+                    agreed_deps = n.committed_deps(txn.clone());
                 }
                 Some(prev) => assert_eq!(
-                    prev, e,
+                    *prev, e,
                     "replica {i} committed at a different execute_at (seed={seed})"
                 ),
             }
             assert_eq!(
-                n.committed_deps(txn),
+                n.committed_deps(txn.clone()),
                 agreed_deps,
                 "replica {i} committed with different deps (seed={seed})"
             );
@@ -117,14 +117,14 @@ fn dead_coordinator_is_auto_recovered_within_bound() {
         // recovered transaction must commit + execute on every survivor.
         sim.run_for(Duration::from_secs(10));
 
-        let agreed = assert_committed_consistently(&nodes, txn, seed);
+        let agreed = assert_committed_consistently(&nodes, txn.clone(), seed);
         // Every survivor that applied it carries the recovered write; store converged.
         for &k in &[7u64, 8u64] {
             for n in &nodes {
-                if n.is_applied(txn) {
+                if n.is_applied(txn.clone()) {
                     assert_eq!(
                         store_writer(n, k),
-                        Some(txn),
+                        Some(txn.clone()),
                         "an applied replica missed the auto-recovered write on key {k} \
                          (seed={seed}); agreed execute_at={agreed:?}"
                     );
@@ -134,7 +134,7 @@ fn dead_coordinator_is_auto_recovered_within_bound() {
         // At least a quorum (the survivors) committed — recovery actually fired.
         let committed = nodes
             .iter()
-            .filter(|n| n.committed_execute_at(txn).is_some())
+            .filter(|n| n.committed_execute_at(txn.clone()).is_some())
             .count();
         assert!(
             committed >= 3,
@@ -173,16 +173,16 @@ fn escalating_auto_recoverers_converge() {
         sim.heal(nid(1), nid(4));
         sim.run_for(Duration::from_secs(3));
 
-        let _ = assert_committed_consistently(&nodes, txn, seed);
+        let _ = assert_committed_consistently(&nodes, txn.clone(), seed);
         // Among the nodes that committed, the store is converged on the key.
         let mut writers = Vec::new();
         for n in &nodes {
-            if n.is_applied(txn) {
+            if n.is_applied(txn.clone()) {
                 writers.push(store_writer(n, 15));
             }
         }
         assert!(
-            !writers.is_empty() && writers.iter().all(|w| *w == Some(txn)),
+            !writers.is_empty() && writers.iter().all(|w| *w == Some(txn.clone())),
             "escalating auto-recovery diverged the store (seed={seed})"
         );
     }
@@ -214,7 +214,7 @@ fn slow_but_progressing_coordinator_is_not_recovered() {
 
         // The original coordinator committed the transaction itself.
         assert!(
-            nodes[0].committed_execute_at(txn).is_some(),
+            nodes[0].committed_execute_at(txn.clone()).is_some(),
             "the slow-but-live coordinator never committed (seed={seed})"
         );
         let agreed = assert_committed_consistently(&nodes, txn, seed);
@@ -283,10 +283,10 @@ fn auto_recovery_preserves_write_value() {
         // Past the failure-detector bound (≈5s) so auto-recovery fires.
         sim.run_for(Duration::from_secs(10));
 
-        let _ = assert_committed_consistently(&nodes, txn, seed);
+        let _ = assert_committed_consistently(&nodes, txn.clone(), seed);
         let mut seen = 0;
         for n in &nodes {
-            if n.is_applied(txn) {
+            if n.is_applied(txn.clone()) {
                 seen += 1;
                 assert_eq!(
                     store_value(n, 42),

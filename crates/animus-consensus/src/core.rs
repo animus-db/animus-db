@@ -167,20 +167,20 @@ struct ReplicaTxn {
     /// 0011, duelling recoverers). A `Recover`/`Accept` carrying a *lower* ballot
     /// is rejected (the sender was superseded by a higher recoverer); a `Recover`
     /// reports this so the superseded recoverer can retry higher. The original
-    /// coordinator runs at [`Ballot::ZERO`], so promising any recovery ballot
+    /// coordinator runs at [`Ballot::zero()`], so promising any recovery ballot
     /// (`round >= 1`) also fences the original coordinator's late `Accept`.
     promised: Ballot,
     /// The ballot under which `execute_at`/`deps` were last **accepted** (via
-    /// `Accept`), or [`Ballot::ZERO`] if only PreAccepted. Reported in `RecoverOk`
+    /// `Accept`), or [`Ballot::zero()`] if only PreAccepted. Reported in `RecoverOk`
     /// so a recoverer adopts the `(execute_at, deps)` of the highest accepted
     /// ballot — the most recent proposal any replica committed to.
     accepted_ballot: Ballot,
     /// The **ballot a `Commit` was decided under** at this replica (ADR 0011): the
-    /// original coordinator commits at [`Ballot::ZERO`], a recovery coordinator at
+    /// original coordinator commits at [`Ballot::zero()`], a recovery coordinator at
     /// its higher ballot. A later `Commit` carrying a *lower* ballot is **ignored**
     /// (it cannot revert the recorded decision) — this fences a stale
     /// original-coordinator `Commit` that arrives after a higher-ballot recovered
-    /// commit (the failure-detector heal race). [`Ballot::ZERO`] until committed.
+    /// commit (the failure-detector heal race). [`Ballot::zero()`] until committed.
     commit_ballot: Ballot,
 }
 
@@ -218,7 +218,7 @@ struct Coordinating {
     /// here until every peer has it.
     commit_acks: BTreeSet<NodeId>,
     /// The **ballot** this coordinator's `Accept` round runs under (ADR 0011):
-    /// [`Ballot::ZERO`] for the original coordinator, the adopted recovery ballot
+    /// [`Ballot::zero()`] for the original coordinator, the adopted recovery ballot
     /// for a recovery coordinator. A replica rejects an `Accept` below its
     /// promised ballot, so a superseded recoverer's `Accept` is fenced.
     ballot: Ballot,
@@ -277,7 +277,7 @@ struct RecoverReply {
     execute_at: Timestamp,
     deps: BTreeSet<TxnId>,
     /// The ballot under which this replica last accepted `(execute_at, deps)`,
-    /// or [`Ballot::ZERO`] if only PreAccepted. The recoverer re-proposes the
+    /// or [`Ballot::zero()`] if only PreAccepted. The recoverer re-proposes the
     /// `(execute_at, deps)` carried by the reply with the **highest** accepted
     /// ballot (the most recent prior proposal) so duelling recoverers converge.
     accepted_ballot: Ballot,
@@ -400,12 +400,12 @@ impl AccordCore {
     /// global shard — no placement yet).
     #[must_use]
     pub fn new(id: NodeId, all_nodes: &[NodeId]) -> AccordCore {
-        let peers: Vec<NodeId> = all_nodes.iter().copied().filter(|n| *n != id).collect();
+        let peers: Vec<NodeId> = all_nodes.iter().filter(|n| **n != id).cloned().collect();
         AccordCore {
+            clock: LogicalClock::new(id.clone()),
             id,
             peers,
             cluster_size: all_nodes.len(),
-            clock: LogicalClock::new(id),
             txns: BTreeMap::new(),
             coordinating: BTreeMap::new(),
             recovering: BTreeMap::new(),
@@ -435,8 +435,8 @@ impl AccordCore {
     pub fn recovered(id: NodeId, all_nodes: &[NodeId], state: PersistedState) -> AccordCore {
         let mut core = AccordCore::new(id, all_nodes);
         for (txn, p) in state.txns {
-            core.clock.witness(txn);
-            core.clock.witness(p.execute_at);
+            core.clock.witness(txn.clone());
+            core.clock.witness(p.execute_at.clone());
             // An applied transaction recovers to the `Applied` phase even though
             // the phase-bearing records only reach `Committed`; the separate
             // `Applied` WAL record sets `p.applied`.
@@ -467,7 +467,7 @@ impl AccordCore {
         // original execution order. The order is durable (WAL `Applied` records),
         // so the re-applied store is identical to pre-crash.
         for txn in state.applied_order {
-            core.applied_order.push(txn);
+            core.applied_order.push(txn.clone());
             if let Some(t) = core.txns.get(&txn) {
                 // A recovered read re-emits a read effect; a write, a write effect
                 // (so the driver rebuilds the volatile store / re-satisfies reads
@@ -476,14 +476,14 @@ impl AccordCore {
                     core.pending_read.push(ReadEffect {
                         txn,
                         keys: t.keys.clone(),
-                        version: t.execute_at,
+                        version: t.execute_at.clone(),
                     });
                 } else {
                     core.pending_apply.push(ApplyEffect {
                         txn,
                         keys: t.write_keys.clone(),
                         values: t.write_values.clone(),
-                        version: t.execute_at,
+                        version: t.execute_at.clone(),
                     });
                 }
             }
@@ -549,7 +549,7 @@ impl AccordCore {
     /// This node's id.
     #[must_use]
     pub fn id(&self) -> NodeId {
-        self.id
+        self.id.clone()
     }
 
     /// The decisions this node has reached as a coordinator, in order.
@@ -566,7 +566,7 @@ impl AccordCore {
         self.txns
             .get(&txn)
             .filter(|t| t.phase >= Phase::Committed)
-            .map(|t| t.execute_at)
+            .map(|t| t.execute_at.clone())
     }
 
     /// The phase this replica has reached for `txn`, if known.
@@ -632,14 +632,14 @@ impl AccordCore {
     #[must_use]
     pub fn persisted_state(&self) -> PersistedState {
         let mut txns = BTreeMap::new();
-        for (&txn, t) in &self.txns {
+        for (txn, t) in &self.txns {
             txns.insert(
-                txn,
+                txn.clone(),
                 PersistedTxn {
                     keys: t.keys.clone(),
                     write_keys: t.write_keys.clone(),
                     write_values: t.write_values.clone(),
-                    execute_at: t.execute_at,
+                    execute_at: t.execute_at.clone(),
                     deps: t.deps.clone(),
                     // `Applied` is folded back into `phase` on recovery via the
                     // `applied` flag, mirroring how the WAL `Applied` record works:
@@ -651,9 +651,9 @@ impl AccordCore {
                     },
                     applied: t.phase == Phase::Applied,
                     read_only: t.read_only,
-                    promised: t.promised,
-                    accepted_ballot: t.accepted_ballot,
-                    commit_ballot: t.commit_ballot,
+                    promised: t.promised.clone(),
+                    accepted_ballot: t.accepted_ballot.clone(),
+                    commit_ballot: t.commit_ballot.clone(),
                 },
             );
         }
@@ -743,7 +743,7 @@ impl AccordCore {
         self.txns
             .iter()
             .filter(|(_, t)| t.phase < Phase::Committed)
-            .map(|(&txn, _)| txn)
+            .map(|(txn, _)| txn.clone())
             .collect()
     }
 
@@ -805,15 +805,15 @@ impl AccordCore {
         let nominee = self
             .all_nodes_sorted()
             .into_iter()
-            .filter(|&n| n != coordinator)
+            .filter(|n| *n != coordinator)
             .nth(tier);
-        nominee == Some(self.id)
+        nominee == Some(self.id.clone())
     }
 
     /// The full replica set (this node + peers), ascending by id. Deterministic.
     fn all_nodes_sorted(&self) -> Vec<NodeId> {
         let mut all: Vec<NodeId> = self.peers.clone();
-        all.push(self.id);
+        all.push(self.id.clone());
         all.sort_unstable();
         all
     }
@@ -843,15 +843,15 @@ impl AccordCore {
     #[must_use]
     pub fn resend_pending(&mut self) -> Vec<Out> {
         let mut outs = Vec::new();
-        for (&txn, c) in &self.coordinating {
+        for (txn, c) in &self.coordinating {
             match c.phase {
                 CoordPhase::PreAccept => {
-                    for &p in &self.peers {
-                        if !c.replies.contains_key(&p) {
+                    for p in &self.peers {
+                        if !c.replies.contains_key(p) {
                             outs.push((
-                                p,
+                                p.clone(),
                                 AccordMsg::PreAccept {
-                                    txn,
+                                    txn: txn.clone(),
                                     keys: c.keys.clone(),
                                     write_keys: c.write_keys.clone(),
                                     write_values: c.write_values.clone(),
@@ -863,14 +863,14 @@ impl AccordCore {
                 }
                 CoordPhase::Accept => {
                     if let Some((execute_at, deps)) = &c.chosen {
-                        for &p in &self.peers {
-                            if !c.replies.contains_key(&p) {
+                        for p in &self.peers {
+                            if !c.replies.contains_key(p) {
                                 outs.push((
-                                    p,
+                                    p.clone(),
                                     AccordMsg::Accept {
-                                        txn,
-                                        ballot: c.ballot,
-                                        execute_at: *execute_at,
+                                        txn: txn.clone(),
+                                        ballot: c.ballot.clone(),
+                                        execute_at: execute_at.clone(),
                                         deps: deps.clone(),
                                     },
                                 ));
@@ -880,14 +880,14 @@ impl AccordCore {
                 }
                 CoordPhase::Done => {
                     if let Some((execute_at, deps)) = &c.chosen {
-                        for &p in &self.peers {
-                            if !c.commit_acks.contains(&p) {
+                        for p in &self.peers {
+                            if !c.commit_acks.contains(p) {
                                 outs.push((
-                                    p,
+                                    p.clone(),
                                     AccordMsg::Commit {
-                                        txn,
-                                        ballot: c.ballot,
-                                        execute_at: *execute_at,
+                                        txn: txn.clone(),
+                                        ballot: c.ballot.clone(),
+                                        execute_at: execute_at.clone(),
                                         deps: deps.clone(),
                                         write_keys: c.write_keys.clone(),
                                         write_values: c.write_values.clone(),
@@ -900,14 +900,14 @@ impl AccordCore {
                 }
             }
         }
-        for (&txn, rec) in &self.recovering {
-            for &p in &self.peers {
-                if !rec.replies.contains_key(&p) {
+        for (txn, rec) in &self.recovering {
+            for p in &self.peers {
+                if !rec.replies.contains_key(p) {
                     outs.push((
-                        p,
+                        p.clone(),
                         AccordMsg::Recover {
-                            txn,
-                            ballot: rec.ballot,
+                            txn: txn.clone(),
+                            ballot: rec.ballot.clone(),
                         },
                     ));
                 }
@@ -1007,14 +1007,15 @@ impl AccordCore {
 
         // Apply to our own replica state and seed the coordinator's reply set
         // with our own PreAcceptOk (we are a replica of every txn in this slice).
-        let (ts, deps) = self.replica_pre_accept(t0, &keys, &write_keys, &write_values, read_only);
+        let (ts, deps) =
+            self.replica_pre_accept(t0.clone(), &keys, &write_keys, &write_values, read_only);
 
         let mut replies = BTreeMap::new();
-        replies.insert(self.id, (ts, deps));
+        replies.insert(self.id.clone(), (ts, deps));
         self.coordinating.insert(
-            t0,
+            t0.clone(),
             Coordinating {
-                t0,
+                t0: t0.clone(),
                 replies,
                 phase: CoordPhase::PreAccept,
                 recovery: false,
@@ -1026,18 +1027,18 @@ impl AccordCore {
                 commit_acks: BTreeSet::new(),
                 // The original coordinator runs at the zero ballot; only a
                 // recovery coordinator adopts a higher one.
-                ballot: Ballot::ZERO,
+                ballot: Ballot::zero(),
             },
         );
 
         let outs: Vec<Out> = self
             .peers
             .iter()
-            .map(|&p| {
+            .map(|p| {
                 (
-                    p,
+                    p.clone(),
                     AccordMsg::PreAccept {
-                        txn: t0,
+                        txn: t0.clone(),
                         keys: keys.clone(),
                         write_keys: write_keys.clone(),
                         write_values: write_values.clone(),
@@ -1049,7 +1050,7 @@ impl AccordCore {
 
         // A single-replica cluster (peers empty) can already have a quorum.
         let mut all = outs;
-        if let Some(extra) = self.try_advance_coordinator(t0) {
+        if let Some(extra) = self.try_advance_coordinator(t0.clone()) {
             all.extend(extra);
         }
         (t0, all)
@@ -1067,12 +1068,17 @@ impl AccordCore {
                 write_values,
                 read_only,
             } => {
-                let (ts, deps) =
-                    self.replica_pre_accept(txn, &keys, &write_keys, &write_values, read_only);
+                let (ts, deps) = self.replica_pre_accept(
+                    txn.clone(),
+                    &keys,
+                    &write_keys,
+                    &write_values,
+                    read_only,
+                );
                 vec![(from, AccordMsg::PreAcceptOk { txn, ts, deps })]
             }
             AccordMsg::PreAcceptOk { txn, ts, deps } => {
-                self.coordinator_record(from, txn, ts, deps);
+                self.coordinator_record(from, txn.clone(), ts, deps);
                 self.try_advance_coordinator(txn).unwrap_or_default()
             }
             AccordMsg::Accept {
@@ -1080,14 +1086,14 @@ impl AccordCore {
                 ballot,
                 execute_at,
                 deps,
-            } => match self.replica_accept(txn, ballot, execute_at, &deps) {
+            } => match self.replica_accept(txn.clone(), ballot, execute_at, &deps) {
                 Ok(()) => vec![(from, AccordMsg::AcceptOk { txn })],
                 // A higher recoverer fenced this `Accept`; tell the sender the
                 // ballot that superseded it so it stops (or retries higher).
                 Err(promised) => vec![(from, AccordMsg::AcceptNack { txn, promised })],
             },
             AccordMsg::AcceptOk { txn } => {
-                self.coordinator_record_accept(from, txn);
+                self.coordinator_record_accept(from, txn.clone());
                 self.try_advance_coordinator(txn).unwrap_or_default()
             }
             AccordMsg::AcceptNack { txn, promised } => self.handle_superseded(txn, promised),
@@ -1101,7 +1107,7 @@ impl AccordCore {
                 read_only,
             } => {
                 self.replica_commit(
-                    txn,
+                    txn.clone(),
                     ballot,
                     execute_at,
                     deps,
@@ -1120,28 +1126,30 @@ impl AccordCore {
                 }
                 Vec::new()
             }
-            AccordMsg::Recover { txn, ballot } => match self.replica_recover(txn, ballot) {
-                BallotReply::Promised(f) => vec![(
-                    from,
-                    AccordMsg::RecoverOk {
-                        txn,
-                        ballot,
-                        phase: f.phase,
-                        execute_at: f.execute_at,
-                        deps: f.deps,
-                        accepted_ballot: f.accepted_ballot,
-                        keys: f.keys,
-                        write_keys: f.write_keys,
-                        write_values: f.write_values,
-                        read_only: f.read_only,
-                    },
-                )],
-                // A higher recoverer already holds this txn; report its ballot so
-                // the superseded recoverer can retry strictly above it.
-                BallotReply::Nack(promised) => {
-                    vec![(from, AccordMsg::RecoverNack { txn, promised })]
+            AccordMsg::Recover { txn, ballot } => {
+                match self.replica_recover(txn.clone(), ballot.clone()) {
+                    BallotReply::Promised(f) => vec![(
+                        from,
+                        AccordMsg::RecoverOk {
+                            txn,
+                            ballot,
+                            phase: f.phase,
+                            execute_at: f.execute_at,
+                            deps: f.deps,
+                            accepted_ballot: f.accepted_ballot,
+                            keys: f.keys,
+                            write_keys: f.write_keys,
+                            write_values: f.write_values,
+                            read_only: f.read_only,
+                        },
+                    )],
+                    // A higher recoverer already holds this txn; report its ballot so
+                    // the superseded recoverer can retry strictly above it.
+                    BallotReply::Nack(promised) => {
+                        vec![(from, AccordMsg::RecoverNack { txn, promised })]
+                    }
                 }
-            },
+            }
             AccordMsg::RecoverOk {
                 txn,
                 ballot,
@@ -1157,13 +1165,13 @@ impl AccordCore {
                 let _ = read_only; // read-only-ness is derived from write_keys
                 // Ignore a `RecoverOk` for a *different* ballot than the round we
                 // are currently driving (a stale reply to a superseded attempt).
-                let current = self.recovering.get(&txn).map(|r| r.ballot);
+                let current = self.recovering.get(&txn).map(|r| r.ballot.clone());
                 if current != Some(ballot) {
                     return Vec::new();
                 }
                 self.recovery_record(
                     from,
-                    txn,
+                    txn.clone(),
                     RecoverReply {
                         phase,
                         execute_at,
@@ -1223,7 +1231,10 @@ impl AccordCore {
         if self.id <= promised.node {
             return Vec::new();
         }
-        let next = Ballot::next_above(promised.max(self.highest_promised(txn)), self.id);
+        let next = Ballot::next_above(
+            promised.max(self.highest_promised(txn.clone())),
+            self.id.clone(),
+        );
         self.start_recovery_at(txn, next)
     }
 
@@ -1241,7 +1252,7 @@ impl AccordCore {
         write_values: &BTreeMap<Key, Vec<u8>>,
         read_only: bool,
     ) -> (Timestamp, BTreeSet<TxnId>) {
-        self.clock.witness(txn);
+        self.clock.witness(txn.clone());
 
         // Conflicting transactions: any other txn this replica knows whose key
         // set intersects, regardless of phase. Its deps are exactly those.
@@ -1249,7 +1260,7 @@ impl AccordCore {
             .txns
             .iter()
             .filter(|(other, t)| **other != txn && !t.keys.is_disjoint(keys))
-            .map(|(other, _)| *other)
+            .map(|(other, _)| other.clone())
             .collect();
 
         // Proposed timestamp: t0, unless a conflicting txn already has a
@@ -1259,28 +1270,28 @@ impl AccordCore {
             .txns
             .iter()
             .filter(|(other, t)| **other != txn && !t.keys.is_disjoint(keys))
-            .map(|(_, t)| t.execute_at)
+            .map(|(_, t)| t.execute_at.clone())
             .max();
         let proposed = match max_conflict {
             Some(c) if c >= txn => {
                 self.clock.witness(c);
                 self.clock.mint()
             }
-            _ => txn,
+            _ => txn.clone(),
         };
 
         // Record (or refresh) our replica entry for this txn.
-        let entry = self.txns.entry(txn).or_insert_with(|| ReplicaTxn {
+        let entry = self.txns.entry(txn.clone()).or_insert_with(|| ReplicaTxn {
             keys: keys.clone(),
             write_keys: write_keys.clone(),
             write_values: write_values.clone(),
-            execute_at: txn,
+            execute_at: txn.clone(),
             deps: BTreeSet::new(),
             phase: Phase::PreAccepted,
             read_only,
-            promised: Ballot::ZERO,
-            accepted_ballot: Ballot::ZERO,
-            commit_ballot: Ballot::ZERO,
+            promised: Ballot::zero(),
+            accepted_ballot: Ballot::zero(),
+            commit_ballot: Ballot::zero(),
         });
         entry.keys.extend(keys.iter().copied());
         entry.write_keys.extend(write_keys.iter().copied());
@@ -1293,14 +1304,14 @@ impl AccordCore {
         if proposed > entry.execute_at {
             entry.execute_at = proposed;
         }
-        entry.deps.extend(deps.iter().copied());
+        entry.deps.extend(deps.iter().cloned());
         // The read-only flag is intrinsic to the transaction and authoritative
         // from `PreAccept`; but any known write key forces it `false` (a
         // read-modify-write is never read-only), so the flag stays consistent
         // with `write_keys` even if a `read_only=true` view raced in first.
         entry.read_only = (entry.read_only && read_only) && entry.write_keys.is_empty();
         let reply_deps = entry.deps.clone();
-        let reply_ts = entry.execute_at;
+        let reply_ts = entry.execute_at.clone();
         let record_keys = entry.keys.clone();
         let record_write_keys = entry.write_keys.clone();
         let record_write_values = entry.write_values.clone();
@@ -1312,7 +1323,7 @@ impl AccordCore {
             keys: record_keys,
             write_keys: record_write_keys,
             write_values: record_write_values,
-            execute_at: reply_ts,
+            execute_at: reply_ts.clone(),
             deps: reply_deps.clone(),
             read_only: record_read_only,
         });
@@ -1338,33 +1349,33 @@ impl AccordCore {
         if let Some(t) = self.txns.get(&txn)
             && ballot < t.promised
         {
-            return Err(t.promised);
+            return Err(t.promised.clone());
         }
-        self.clock.witness(execute_at);
-        let entry = self.txns.entry(txn).or_insert_with(|| ReplicaTxn {
+        self.clock.witness(execute_at.clone());
+        let entry = self.txns.entry(txn.clone()).or_insert_with(|| ReplicaTxn {
             keys: BTreeSet::new(),
             write_keys: BTreeSet::new(),
             write_values: BTreeMap::new(),
-            execute_at,
+            execute_at: execute_at.clone(),
             deps: BTreeSet::new(),
             phase: Phase::Accepted,
             read_only: false,
-            promised: Ballot::ZERO,
-            accepted_ballot: Ballot::ZERO,
-            commit_ballot: Ballot::ZERO,
+            promised: Ballot::zero(),
+            accepted_ballot: Ballot::zero(),
+            commit_ballot: Ballot::zero(),
         });
-        entry.execute_at = entry.execute_at.max(execute_at);
-        entry.deps.extend(deps.iter().copied());
+        entry.execute_at = entry.execute_at.clone().max(execute_at);
+        entry.deps.extend(deps.iter().cloned());
         if entry.phase == Phase::PreAccepted {
             entry.phase = Phase::Accepted;
         }
         // Accepting under `ballot` promises it (a later Accept/Recover below it is
         // fenced) and records it as the ballot the proposal was accepted under.
-        entry.promised = entry.promised.max(ballot);
-        entry.accepted_ballot = entry.accepted_ballot.max(ballot);
-        let record_ts = entry.execute_at;
+        entry.promised = entry.promised.clone().max(ballot.clone());
+        entry.accepted_ballot = entry.accepted_ballot.clone().max(ballot);
+        let record_ts = entry.execute_at.clone();
         let record_deps = entry.deps.clone();
-        let record_ballot = entry.accepted_ballot;
+        let record_ballot = entry.accepted_ballot.clone();
         self.pending.push(WalRecord::Accepted {
             txn,
             execute_at: record_ts,
@@ -1388,18 +1399,18 @@ impl AccordCore {
         write_values: BTreeMap<Key, Vec<u8>>,
         read_only: bool,
     ) {
-        self.clock.witness(execute_at);
-        let entry = self.txns.entry(txn).or_insert_with(|| ReplicaTxn {
+        self.clock.witness(execute_at.clone());
+        let entry = self.txns.entry(txn.clone()).or_insert_with(|| ReplicaTxn {
             keys: write_keys.clone(),
             write_keys: write_keys.clone(),
             write_values: write_values.clone(),
-            execute_at,
+            execute_at: execute_at.clone(),
             deps: BTreeSet::new(),
             phase: Phase::Committed,
             read_only,
-            promised: Ballot::ZERO,
-            accepted_ballot: Ballot::ZERO,
-            commit_ballot: Ballot::ZERO,
+            promised: Ballot::zero(),
+            accepted_ballot: Ballot::zero(),
+            commit_ballot: Ballot::zero(),
         });
         // The Commit carries the authoritative write set (so a replica that
         // missed PreAccept still executes the right write); the write keys are
@@ -1415,7 +1426,7 @@ impl AccordCore {
 
         // **Ballot fence on the decision.** A `Commit` whose ballot is *below* the
         // ballot a commit was already recorded under here is stale — e.g. a late
-        // original-coordinator `Commit` (`Ballot::ZERO`) arriving after a survivor's
+        // original-coordinator `Commit` (`Ballot::zero()`) arriving after a survivor's
         // higher-ballot recovered commit (the failure-detector heal race). Adopting
         // it would revert the recovered `(execute_at, deps)` and diverge the store,
         // so we **ignore** the decision part of it (the monotone facts above were
@@ -1433,15 +1444,15 @@ impl AccordCore {
         if entry.phase < Phase::Committed {
             entry.phase = Phase::Committed;
         }
-        entry.execute_at = execute_at;
+        entry.execute_at = execute_at.clone();
         entry.deps = deps.clone();
-        entry.commit_ballot = entry.commit_ballot.max(ballot);
+        entry.commit_ballot = entry.commit_ballot.clone().max(ballot);
         if entry.phase == Phase::Committed {
             let keys = entry.keys.clone();
             let record_write_keys = entry.write_keys.clone();
             let record_write_values = entry.write_values.clone();
             let record_read_only = entry.read_only;
-            let record_ballot = entry.commit_ballot;
+            let record_ballot = entry.commit_ballot.clone();
             self.pending.push(WalRecord::Committed {
                 txn,
                 keys,
@@ -1499,18 +1510,18 @@ impl AccordCore {
     /// gate ([`Self::deps_clear_for`]) are clear.
     fn next_applicable(&self) -> Option<TxnId> {
         let mut best: Option<(Timestamp, TxnId)> = None;
-        for (&txn, t) in &self.txns {
+        for (txn, t) in &self.txns {
             if t.phase != Phase::Committed {
                 continue; // not committed, or already applied
             }
-            if !self.conflicts_clear_for(txn, t.execute_at, &t.keys) {
+            if !self.conflicts_clear_for(txn.clone(), t.execute_at.clone(), &t.keys) {
                 continue;
             }
-            if !self.deps_clear_for(txn, t.execute_at, &t.deps) {
+            if !self.deps_clear_for(txn.clone(), t.execute_at.clone(), &t.deps) {
                 continue;
             }
-            let key = (t.execute_at, txn);
-            if best.is_none_or(|b| key < b) {
+            let key = (t.execute_at.clone(), txn.clone());
+            if best.as_ref().is_none_or(|b| key < *b) {
                 best = Some(key);
             }
         }
@@ -1531,14 +1542,15 @@ impl AccordCore {
     /// knows; the [`Self::deps_clear_for`] gate covers recorded (incl. transitive)
     /// dependencies whose keys it may not.
     fn conflicts_clear_for(&self, txn: TxnId, execute_at: Timestamp, keys: &BTreeSet<Key>) -> bool {
-        for (&other, o) in &self.txns {
-            if other == txn || o.keys.is_disjoint(keys) {
+        for (other, o) in &self.txns {
+            if *other == txn || o.keys.is_disjoint(keys) {
                 continue;
             }
             if o.phase < Phase::Committed {
                 return false; // order not yet final; it might land before us
             }
-            let orders_before = (o.execute_at, other) < (execute_at, txn);
+            let orders_before =
+                (o.execute_at.clone(), other.clone()) < (execute_at.clone(), txn.clone());
             if orders_before && o.phase != Phase::Applied {
                 return false; // an earlier-ordered conflict has not executed yet
             }
@@ -1568,11 +1580,11 @@ impl AccordCore {
     /// Deterministic (`BTreeSet` walk order); no allocation beyond the visited set
     /// and a small stack.
     fn deps_clear_for(&self, txn: TxnId, execute_at: Timestamp, deps: &BTreeSet<TxnId>) -> bool {
-        let here = (execute_at, txn);
+        let here = (execute_at, txn.clone());
         let mut visited: BTreeSet<TxnId> = BTreeSet::new();
-        let mut stack: Vec<TxnId> = deps.iter().copied().collect();
+        let mut stack: Vec<TxnId> = deps.iter().cloned().collect();
         while let Some(d) = stack.pop() {
-            if d == txn || !visited.insert(d) {
+            if d == txn || !visited.insert(d.clone()) {
                 continue;
             }
             match self.txns.get(&d) {
@@ -1582,14 +1594,14 @@ impl AccordCore {
                 Some(dt) if dt.phase < Phase::Committed => return false,
                 Some(dt) => {
                     // Committed: only a dep ordering *before* `txn` constrains it.
-                    if (dt.execute_at, d) < here {
+                    if (dt.execute_at.clone(), d) < here {
                         if dt.phase != Phase::Applied {
                             return false; // earlier-ordered predecessor not applied
                         }
                         // Recurse: its own (transitive) earlier predecessors must
                         // have applied too. A dep ordering after `txn` is skipped,
                         // so cycles are broken by the total order and the walk ends.
-                        stack.extend(dt.deps.iter().copied());
+                        stack.extend(dt.deps.iter().cloned());
                     }
                 }
             }
@@ -1613,7 +1625,7 @@ impl AccordCore {
                     t.keys.clone(),
                     t.write_keys.clone(),
                     t.write_values.clone(),
-                    t.execute_at,
+                    t.execute_at.clone(),
                     t.read_only,
                 )
             }
@@ -1622,7 +1634,7 @@ impl AccordCore {
         if read_only {
             // A pure read snapshots its full (read) key set.
             self.pending_read.push(ReadEffect {
-                txn,
+                txn: txn.clone(),
                 keys,
                 version: execute_at,
             });
@@ -1632,13 +1644,13 @@ impl AccordCore {
             // The caller-supplied values ride along (a key absent from
             // `write_values` defaults at the driver to the txn id).
             self.pending_apply.push(ApplyEffect {
-                txn,
+                txn: txn.clone(),
                 keys: write_keys,
                 values: write_values,
                 version: execute_at,
             });
         }
-        self.applied_order.push(txn);
+        self.applied_order.push(txn.clone());
         self.pending.push(WalRecord::Applied { txn });
     }
 
@@ -1667,7 +1679,7 @@ impl AccordCore {
             // self). We only need the *count*, so insert a placeholder.
             c.replies
                 .entry(from)
-                .or_insert_with(|| (Timestamp::ZERO, BTreeSet::new()));
+                .or_insert_with(|| (Timestamp::zero(), BTreeSet::new()));
         }
     }
 
@@ -1686,7 +1698,7 @@ impl AccordCore {
     fn advance_from_pre_accept(&mut self, txn: TxnId) -> Option<Vec<Out>> {
         let (replies, t0, recovery) = {
             let c = self.coordinating.get(&txn)?;
-            (c.replies.clone(), c.t0, c.recovery)
+            (c.replies.clone(), c.t0.clone(), c.recovery)
         };
 
         let fast_n = self.fast_quorum();
@@ -1727,43 +1739,43 @@ impl AccordCore {
         if replies.len() >= slow_n && !fast_still_possible {
             let execute_at = replies
                 .values()
-                .map(|(ts, _)| *ts)
+                .map(|(ts, _)| ts.clone())
                 .max()
-                .unwrap_or(t0)
+                .unwrap_or_else(|| t0.clone())
                 .max(t0);
             let mut deps = BTreeSet::new();
             for (_, d) in replies.values() {
-                deps.extend(d.iter().copied());
+                deps.extend(d.iter().cloned());
             }
-            // The ballot this Accept round runs under: `Ballot::ZERO` for the
+            // The ballot this Accept round runs under: `Ballot::zero()` for the
             // original coordinator, the adopted recovery ballot otherwise.
             let ballot = self
                 .coordinating
                 .get(&txn)
-                .map_or(Ballot::ZERO, |c| c.ballot);
+                .map_or(Ballot::zero(), |c| c.ballot.clone());
             // Move to Accept phase: reset replies, apply to ourselves, broadcast.
             // Our own Accept cannot be superseded by us (our ballot is our floor),
             // so this never self-Nacks.
-            let _ = self.replica_accept(txn, ballot, execute_at, &deps);
+            let _ = self.replica_accept(txn.clone(), ballot.clone(), execute_at.clone(), &deps);
             let mut self_replies = BTreeMap::new();
-            self_replies.insert(self.id, (execute_at, deps.clone()));
+            self_replies.insert(self.id.clone(), (execute_at.clone(), deps.clone()));
             if let Some(c) = self.coordinating.get_mut(&txn) {
                 c.phase = CoordPhase::Accept;
                 c.replies = self_replies;
-                c.chosen = Some((execute_at, deps.clone()));
+                c.chosen = Some((execute_at.clone(), deps.clone()));
                 // Past PreAccept now: the key set is no longer needed for retry.
                 c.keys = BTreeSet::new();
             }
             let mut outs: Vec<Out> = self
                 .peers
                 .iter()
-                .map(|&p| {
+                .map(|p| {
                     (
-                        p,
+                        p.clone(),
                         AccordMsg::Accept {
-                            txn,
-                            ballot,
-                            execute_at,
+                            txn: txn.clone(),
+                            ballot: ballot.clone(),
+                            execute_at: execute_at.clone(),
                             deps: deps.clone(),
                         },
                     )
@@ -1806,16 +1818,16 @@ impl AccordCore {
         fast_path: bool,
     ) -> Vec<Out> {
         let (read_only, write_keys, write_values, ballot) = self.coordinating.get(&txn).map_or(
-            (false, BTreeSet::new(), BTreeMap::new(), Ballot::ZERO),
+            (false, BTreeSet::new(), BTreeMap::new(), Ballot::zero()),
             |c| {
                 (
                     c.read_only,
                     c.write_keys.clone(),
                     c.write_values.clone(),
-                    // The ballot the decision is committed under: `Ballot::ZERO`
+                    // The ballot the decision is committed under: `Ballot::zero()`
                     // for the original coordinator, the recovery ballot otherwise.
                     // It fences a stale lower-ballot `Commit` at every replica.
-                    c.ballot,
+                    c.ballot.clone(),
                 )
             },
         );
@@ -1826,31 +1838,31 @@ impl AccordCore {
             c.phase = CoordPhase::Done;
             // Record the committed values so a retry tick can re-send `Commit`
             // to peers that have not yet acknowledged it.
-            c.chosen = Some((execute_at, deps.clone()));
+            c.chosen = Some((execute_at.clone(), deps.clone()));
         }
         self.replica_commit(
-            txn,
-            ballot,
-            execute_at,
+            txn.clone(),
+            ballot.clone(),
+            execute_at.clone(),
             deps.clone(),
             write_keys.clone(),
             write_values.clone(),
             read_only,
         );
         self.decisions.push(Decision {
-            txn,
-            execute_at,
+            txn: txn.clone(),
+            execute_at: execute_at.clone(),
             fast_path,
         });
         self.peers
             .iter()
-            .map(|&p| {
+            .map(|p| {
                 (
-                    p,
+                    p.clone(),
                     AccordMsg::Commit {
-                        txn,
-                        ballot,
-                        execute_at,
+                        txn: txn.clone(),
+                        ballot: ballot.clone(),
+                        execute_at: execute_at.clone(),
                         deps: deps.clone(),
                         write_keys: write_keys.clone(),
                         write_values: write_values.clone(),
@@ -1882,11 +1894,11 @@ impl AccordCore {
         }
         // Mint a recovery ballot strictly above the highest this node has already
         // promised for `txn` (ADR 0011, duelling recoverers): a first recovery is
-        // `round = 1` (above the original coordinator's [`Ballot::ZERO`]); a
+        // `round = 1` (above the original coordinator's [`Ballot::zero()`]); a
         // *re*-recovery after being superseded (a `RecoverNack`/`AcceptNack` raised
         // our promised floor) bumps strictly past whatever ballot fenced us, so the
         // retry can actually win. Two recoverers thus never share a ballot.
-        let ballot = Ballot::next_above(self.highest_promised(txn), self.id);
+        let ballot = Ballot::next_above(self.highest_promised(txn.clone()), self.id.clone());
         self.start_recovery_at(txn, ballot)
     }
 
@@ -1898,7 +1910,7 @@ impl AccordCore {
         // We are the recoverer, so we promise our own ballot and report our facts.
         // Our ballot is `>= ` our promise floor by construction, so this never
         // self-Nacks.
-        let f = match self.replica_recover(txn, ballot) {
+        let f = match self.replica_recover(txn.clone(), ballot.clone()) {
             BallotReply::Promised(f) => f,
             // Unreachable in practice (our ballot supersedes our own promise), but
             // stay total: if we somehow promised higher, do not recover lower.
@@ -1906,7 +1918,7 @@ impl AccordCore {
         };
         let mut replies = BTreeMap::new();
         replies.insert(
-            self.id,
+            self.id.clone(),
             RecoverReply {
                 phase: f.phase,
                 execute_at: f.execute_at,
@@ -1917,12 +1929,26 @@ impl AccordCore {
                 write_values: f.write_values,
             },
         );
-        self.recovering.insert(txn, Recovering { ballot, replies });
+        self.recovering.insert(
+            txn.clone(),
+            Recovering {
+                ballot: ballot.clone(),
+                replies,
+            },
+        );
 
         let outs: Vec<Out> = self
             .peers
             .iter()
-            .map(|&p| (p, AccordMsg::Recover { txn, ballot }))
+            .map(|p| {
+                (
+                    p.clone(),
+                    AccordMsg::Recover {
+                        txn: txn.clone(),
+                        ballot: ballot.clone(),
+                    },
+                )
+            })
             .collect();
         let mut all = outs;
         if let Some(extra) = self.try_advance_recovery(txn) {
@@ -1933,11 +1959,17 @@ impl AccordCore {
 
     /// The highest recovery ballot this node has promised for `txn` across its
     /// roles: the replica promise, plus any in-flight recovery this node is
-    /// driving. [`Ballot::ZERO`] if it has never promised one. A re-recovery mints
+    /// driving. [`Ballot::zero()`] if it has never promised one. A re-recovery mints
     /// strictly above this so it supersedes every ballot it has itself seen.
     fn highest_promised(&self, txn: TxnId) -> Ballot {
-        let replica = self.txns.get(&txn).map_or(Ballot::ZERO, |t| t.promised);
-        let recovering = self.recovering.get(&txn).map_or(Ballot::ZERO, |r| r.ballot);
+        let replica = self
+            .txns
+            .get(&txn)
+            .map_or(Ballot::zero(), |t| t.promised.clone());
+        let recovering = self
+            .recovering
+            .get(&txn)
+            .map_or(Ballot::zero(), |r| r.ballot.clone());
         replica.max(recovering)
     }
 
@@ -1945,7 +1977,7 @@ impl AccordCore {
     /// has already promised a strictly higher one) and, on a promise, report this
     /// replica's recorded state for `txn`. Promising fences any later
     /// `Recover`/`Accept` below `ballot` — including the original coordinator's
-    /// [`Ballot::ZERO`] `Accept` — so a superseded coordinator cannot still commit
+    /// [`Ballot::zero()`] `Accept` — so a superseded coordinator cannot still commit
     /// behind the winning recoverer's back (ADR 0011, duelling recoverers).
     ///
     /// If the replica had never heard of `txn`, it witnesses it now as a fresh
@@ -1954,39 +1986,39 @@ impl AccordCore {
     /// itself is durable (a `WalRecord::Promised`) so a restarted replica does not
     /// renege and let a superseded recoverer win.
     fn replica_recover(&mut self, txn: TxnId, ballot: Ballot) -> BallotReply {
-        self.clock.witness(txn);
+        self.clock.witness(txn.clone());
         // Reject a stale ballot: report the strictly-higher ballot we promised so
         // the superseded recoverer can retry above it (or give up).
         if let Some(t) = self.txns.get(&txn)
             && ballot < t.promised
         {
-            return BallotReply::Nack(t.promised);
+            return BallotReply::Nack(t.promised.clone());
         }
         // Never seen: witness as PreAccepted at t0 with no keys/deps known, and
         // record it durably like a `PreAccept` would.
         let mut newly_witnessed = false;
-        self.txns.entry(txn).or_insert_with(|| {
+        self.txns.entry(txn.clone()).or_insert_with(|| {
             newly_witnessed = true;
             ReplicaTxn {
                 keys: BTreeSet::new(),
                 write_keys: BTreeSet::new(),
                 write_values: BTreeMap::new(),
-                execute_at: txn,
+                execute_at: txn.clone(),
                 deps: BTreeSet::new(),
                 phase: Phase::PreAccepted,
                 read_only: false,
-                promised: Ballot::ZERO,
-                accepted_ballot: Ballot::ZERO,
-                commit_ballot: Ballot::ZERO,
+                promised: Ballot::zero(),
+                accepted_ballot: Ballot::zero(),
+                commit_ballot: Ballot::zero(),
             }
         });
         if newly_witnessed {
             self.pending.push(WalRecord::PreAccepted {
-                txn,
+                txn: txn.clone(),
                 keys: BTreeSet::new(),
                 write_keys: BTreeSet::new(),
                 write_values: BTreeMap::new(),
-                execute_at: txn,
+                execute_at: txn.clone(),
                 deps: BTreeSet::new(),
                 read_only: false,
             });
@@ -1995,14 +2027,14 @@ impl AccordCore {
         // Promise the ballot durably (it is `>=` our floor). A duplicate `Recover`
         // at the same ballot re-promises harmlessly (idempotent under `max`).
         if ballot > entry.promised {
-            entry.promised = ballot;
+            entry.promised = ballot.clone();
             self.pending.push(WalRecord::Promised { txn, ballot });
         }
         BallotReply::Promised(RecoverFacts {
             phase: entry.phase,
-            execute_at: entry.execute_at,
+            execute_at: entry.execute_at.clone(),
             deps: entry.deps.clone(),
-            accepted_ballot: entry.accepted_ballot,
+            accepted_ballot: entry.accepted_ballot.clone(),
             keys: entry.keys.clone(),
             write_keys: entry.write_keys.clone(),
             write_values: entry.write_values.clone(),
@@ -2011,7 +2043,7 @@ impl AccordCore {
     }
 
     fn recovery_record(&mut self, from: NodeId, txn: TxnId, reply: RecoverReply) {
-        self.clock.witness(reply.execute_at);
+        self.clock.witness(reply.execute_at.clone());
         if let Some(rec) = self.recovering.get_mut(&txn) {
             rec.replies.insert(from, reply);
         }
@@ -2025,7 +2057,7 @@ impl AccordCore {
     ///   verbatim** and broadcast `Commit` — a committed value is already
     ///   immutable, so the recovered decision must match it.
     /// - Else if any reply was **`Accept`ed** under some ballot (`accepted_ballot >
-    ///   Ballot::ZERO`), adopt the `(execute_at, deps)` of the reply with the
+    ///   Ballot::zero()`), adopt the `(execute_at, deps)` of the reply with the
     ///   **highest `accepted_ballot`** — the most recent prior proposal, which may
     ///   already have been committed by that recoverer, so a later recoverer must
     ///   re-propose it rather than invent a fresh timestamp. Two recoverers thus
@@ -2038,7 +2070,7 @@ impl AccordCore {
     fn try_advance_recovery(&mut self, txn: TxnId) -> Option<Vec<Out>> {
         let (ballot, replies) = {
             let rec = self.recovering.get(&txn)?;
-            (rec.ballot, rec.replies.clone())
+            (rec.ballot.clone(), rec.replies.clone())
         };
         if replies.len() < self.slow_quorum() {
             return None;
@@ -2073,9 +2105,9 @@ impl AccordCore {
         if let Some(r) = replies
             .values()
             .filter(|r| r.phase >= Phase::Committed)
-            .max_by_key(|r| r.execute_at)
+            .max_by_key(|r| r.execute_at.clone())
         {
-            let execute_at = r.execute_at;
+            let execute_at = r.execute_at.clone();
             let deps = r.deps.clone();
             return Some(self.commit_recovered(
                 txn,
@@ -2099,10 +2131,10 @@ impl AccordCore {
         // decision is freshly re-accepted on a quorum that has promised us.
         if let Some(r) = replies
             .values()
-            .filter(|r| r.accepted_ballot > Ballot::ZERO)
-            .max_by_key(|r| r.accepted_ballot)
+            .filter(|r| r.accepted_ballot > Ballot::zero())
+            .max_by_key(|r| r.accepted_ballot.clone())
         {
-            let execute_at = r.execute_at;
+            let execute_at = r.execute_at.clone();
             let deps = r.deps.clone();
             return Some(self.redrive_accept(
                 txn,
@@ -2126,18 +2158,18 @@ impl AccordCore {
         // never take the fast path (`advance_from_pre_accept` forces Accept →
         // Commit).
         let (ts, deps) = self.replica_pre_accept(
-            txn,
+            txn.clone(),
             &union_keys,
             &union_write_keys,
             &union_write_values,
             read_only,
         );
         let mut coord_replies: BTreeMap<NodeId, (Timestamp, BTreeSet<TxnId>)> = BTreeMap::new();
-        coord_replies.insert(self.id, (ts, deps));
+        coord_replies.insert(self.id.clone(), (ts, deps));
         self.coordinating.insert(
-            txn,
+            txn.clone(),
             Coordinating {
-                t0: txn,
+                t0: txn.clone(),
                 replies: coord_replies,
                 phase: CoordPhase::PreAccept,
                 recovery: true,
@@ -2155,11 +2187,11 @@ impl AccordCore {
         let mut outs: Vec<Out> = self
             .peers
             .iter()
-            .map(|&p| {
+            .map(|p| {
                 (
-                    p,
+                    p.clone(),
                     AccordMsg::PreAccept {
-                        txn,
+                        txn: txn.clone(),
                         keys: union_keys.clone(),
                         write_keys: union_write_keys.clone(),
                         write_values: union_write_values.clone(),
@@ -2196,20 +2228,20 @@ impl AccordCore {
         // before adopting the proposal: a recoverer may have missed the original
         // PreAccept. This folds the union keys/values into our replica entry.
         let _ = self.replica_pre_accept(
-            txn,
+            txn.clone(),
             &union_keys,
             &union_write_keys,
             &union_write_values,
             read_only,
         );
         // Apply the adopted Accept to ourselves under our ballot (cannot self-Nack).
-        let _ = self.replica_accept(txn, ballot, execute_at, &deps);
+        let _ = self.replica_accept(txn.clone(), ballot.clone(), execute_at.clone(), &deps);
         let mut self_replies: BTreeMap<NodeId, (Timestamp, BTreeSet<TxnId>)> = BTreeMap::new();
-        self_replies.insert(self.id, (execute_at, deps.clone()));
+        self_replies.insert(self.id.clone(), (execute_at.clone(), deps.clone()));
         self.coordinating.insert(
-            txn,
+            txn.clone(),
             Coordinating {
-                t0: txn,
+                t0: txn.clone(),
                 replies: self_replies,
                 phase: CoordPhase::Accept,
                 recovery: true,
@@ -2217,21 +2249,21 @@ impl AccordCore {
                 keys: BTreeSet::new(),
                 write_keys: union_write_keys.clone(),
                 write_values: union_write_values.clone(),
-                chosen: Some((execute_at, deps.clone())),
+                chosen: Some((execute_at.clone(), deps.clone())),
                 commit_acks: BTreeSet::new(),
-                ballot,
+                ballot: ballot.clone(),
             },
         );
         let mut outs: Vec<Out> = self
             .peers
             .iter()
-            .map(|&p| {
+            .map(|p| {
                 (
-                    p,
+                    p.clone(),
                     AccordMsg::Accept {
-                        txn,
-                        ballot,
-                        execute_at,
+                        txn: txn.clone(),
+                        ballot: ballot.clone(),
+                        execute_at: execute_at.clone(),
                         deps: deps.clone(),
                     },
                 )
@@ -2259,9 +2291,9 @@ impl AccordCore {
         read_only: bool,
     ) -> Vec<Out> {
         self.coordinating.insert(
-            txn,
+            txn.clone(),
             Coordinating {
-                t0: txn,
+                t0: txn.clone(),
                 replies: BTreeMap::new(),
                 phase: CoordPhase::PreAccept,
                 recovery: true,
@@ -2299,9 +2331,9 @@ mod tests {
             from,
             AccordMsg::Commit {
                 txn,
-                ballot: Ballot::ZERO,
+                ballot: Ballot::zero(),
                 execute_at,
-                deps: deps.iter().copied().collect(),
+                deps: deps.iter().cloned().collect(),
                 write_keys: write_keys.iter().copied().collect(),
                 write_values: BTreeMap::new(),
                 read_only: false,
@@ -2329,9 +2361,16 @@ mod tests {
 
         // Commit `t` first, with deps = {d}. The direct gate is clear (nothing
         // shares key b); the dependency gate must block on the unknown `d`.
-        commit(&mut core, nid(1), t, t, &[d], &[20]);
+        commit(
+            &mut core,
+            nid(1),
+            t.clone(),
+            t.clone(),
+            std::slice::from_ref(&d),
+            &[20],
+        );
         assert!(
-            !core.is_applied(t),
+            !core.is_applied(t.clone()),
             "t executed before its transitive dependency d was even known — \
              the dependency-closure gate failed (direct-only mis-order)"
         );
@@ -2339,9 +2378,9 @@ mod tests {
 
         // Now `d` commits, ordering before `t`. It applies first, then `t` becomes
         // applicable and applies — the agreed order [d, t].
-        commit(&mut core, nid(0), d, d, &[], &[10]);
-        assert!(core.is_applied(d), "d must apply (no predecessors)");
-        assert!(core.is_applied(t), "t must apply once d has");
+        commit(&mut core, nid(0), d.clone(), d.clone(), &[], &[10]);
+        assert!(core.is_applied(d.clone()), "d must apply (no predecessors)");
+        assert!(core.is_applied(t.clone()), "t must apply once d has");
         assert_eq!(
             core.applied_order(),
             &[d, t],
@@ -2361,15 +2400,29 @@ mod tests {
 
         // Commit t (dep m) then m (dep d): m orders before t, d before m. t and d
         // are disjoint; only the recursive closure links them.
-        commit(&mut core, nid(1), t, t, &[m], &[200]);
-        commit(&mut core, nid(1), m, m, &[d], &[100, 200]);
+        commit(
+            &mut core,
+            nid(1),
+            t.clone(),
+            t.clone(),
+            std::slice::from_ref(&m),
+            &[200],
+        );
+        commit(
+            &mut core,
+            nid(1),
+            m.clone(),
+            m.clone(),
+            std::slice::from_ref(&d),
+            &[100, 200],
+        );
         // m's predecessor d is still unknown → neither m nor t may apply.
         assert!(
-            !core.is_applied(m) && !core.is_applied(t),
+            !core.is_applied(m.clone()) && !core.is_applied(t.clone()),
             "m (and thus t) must block until the indirect predecessor d applies"
         );
 
-        commit(&mut core, nid(0), d, d, &[], &[100]);
+        commit(&mut core, nid(0), d.clone(), d.clone(), &[], &[100]);
         assert_eq!(
             core.applied_order(),
             &[d, m, t],
@@ -2463,15 +2516,29 @@ mod tests {
         let d = Timestamp::new(2, nid(0));
         let m = Timestamp::new(5, nid(1));
         let t = Timestamp::new(9, nid(0));
-        commit(&mut core, nid(0), d, d, &[], &[10]);
-        commit(&mut core, nid(1), m, m, &[d], &[10, 20]);
-        commit(&mut core, nid(0), t, t, &[m], &[20]);
+        commit(&mut core, nid(0), d.clone(), d.clone(), &[], &[10]);
+        commit(
+            &mut core,
+            nid(1),
+            m.clone(),
+            m.clone(),
+            std::slice::from_ref(&d),
+            &[10, 20],
+        );
+        commit(
+            &mut core,
+            nid(0),
+            t.clone(),
+            t.clone(),
+            std::slice::from_ref(&m),
+            &[20],
+        );
         // An uncommitted (PreAccepted-only) transaction this replica has witnessed.
         let pending = Timestamp::new(12, nid(1));
         core.handle(
             nid(1),
             AccordMsg::PreAccept {
-                txn: pending,
+                txn: pending.clone(),
                 keys: [30].into_iter().collect(),
                 write_keys: [30].into_iter().collect(),
                 write_values: BTreeMap::new(),
@@ -2480,7 +2547,11 @@ mod tests {
         );
 
         let before_order = core.applied_order().to_vec();
-        assert_eq!(before_order, vec![d, m, t], "all three applied in order");
+        assert_eq!(
+            before_order,
+            vec![d.clone(), m.clone(), t.clone()],
+            "all three applied in order"
+        );
 
         // Snapshot + compact image, then rebuild a fresh core from the image alone.
         core.snapshot();
@@ -2506,17 +2577,17 @@ mod tests {
         );
         for txn in [d, m, t] {
             assert!(
-                recovered.is_applied(txn),
+                recovered.is_applied(txn.clone()),
                 "recovered {txn:?} lost applied state"
             );
             assert_eq!(
-                recovered.committed_execute_at(txn),
-                core.committed_execute_at(txn),
+                recovered.committed_execute_at(txn.clone()),
+                core.committed_execute_at(txn.clone()),
                 "recovered {txn:?} execute_at diverged"
             );
             assert_eq!(
-                recovered.committed_deps(txn),
-                core.committed_deps(txn),
+                recovered.committed_deps(txn.clone()),
+                core.committed_deps(txn.clone()),
                 "recovered {txn:?} deps diverged"
             );
         }
@@ -2539,7 +2610,7 @@ mod tests {
     fn snapshot_is_noop_without_new_applies() {
         let mut core = AccordCore::new(nid(2), &[nid(0), nid(1), nid(2)]);
         let a = Timestamp::new(3, nid(0));
-        commit(&mut core, nid(0), a, a, &[], &[1]);
+        commit(&mut core, nid(0), a.clone(), a, &[], &[1]);
         core.snapshot();
         assert!(
             core.take_snapshot_dirty(),
@@ -2565,8 +2636,22 @@ mod tests {
 
         // Both committed, each carrying the other as a dep (Accord deps can be
         // mutual). a orders before b; the cycle must not stall execution.
-        commit(&mut core, nid(0), a, a, &[b], &[1]);
-        commit(&mut core, nid(1), b, b, &[a], &[1]);
+        commit(
+            &mut core,
+            nid(0),
+            a.clone(),
+            a.clone(),
+            std::slice::from_ref(&b),
+            &[1],
+        );
+        commit(
+            &mut core,
+            nid(1),
+            b.clone(),
+            b.clone(),
+            std::slice::from_ref(&a),
+            &[1],
+        );
         assert_eq!(
             core.applied_order(),
             &[a, b],

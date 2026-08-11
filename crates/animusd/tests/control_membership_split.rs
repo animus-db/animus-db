@@ -128,12 +128,13 @@ async fn add_control_member(
     node: u64,
     addr: SocketAddr,
 ) -> (u16, serde_json::Value) {
-    let body = serde_json::json!({"node": node, "addr": addr.to_string()}).to_string();
+    let body =
+        serde_json::json!({"node": nid(node).to_string(), "addr": addr.to_string()}).to_string();
     admin(admin_addr, "POST", "/admin/control/member/add", Some(&body)).await
 }
 
 async fn remove_control_member(admin_addr: SocketAddr, node: u64) -> (u16, serde_json::Value) {
-    let body = serde_json::json!({"node": node}).to_string();
+    let body = serde_json::json!({"node": nid(node).to_string()}).to_string();
     admin(
         admin_addr,
         "POST",
@@ -143,10 +144,12 @@ async fn remove_control_member(admin_addr: SocketAddr, node: u64) -> (u16, serde
     .await
 }
 
-fn voters_of(body: &serde_json::Value) -> Option<Vec<u64>> {
-    body["voters"]
-        .as_array()
-        .map(|a| a.iter().filter_map(serde_json::Value::as_u64).collect())
+fn voters_of(body: &serde_json::Value) -> Option<Vec<String>> {
+    body["voters"].as_array().map(|a| {
+        a.iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect()
+    })
 }
 
 /// Join a **quiet non-voter** control-only node to the split deployment
@@ -166,6 +169,7 @@ async fn join_control_nonvoter(
     for attempt in 0..16 {
         let raw = support::free_addrs(5);
         let addrs = RoleAddrs {
+            id: nid(new_control_id),
             role: NodeRole::Control,
             internal: raw[0],
             client: raw[1],
@@ -175,7 +179,7 @@ async fn join_control_nonvoter(
         };
         let bound = match animusd::Node::bind_control(
             nid(new_control_id),
-            addrs,
+            addrs.clone(),
             dir.join(format!("grow-{new_control_id}-{attempt}")),
         )
         .await
@@ -209,11 +213,12 @@ async fn join_control_nonvoter(
 /// Poll `GET /admin/control/members` on every address in `probes` until each
 /// reports exactly `want` as its voter set.
 async fn await_voters_everywhere(probes: &[SocketAddr], want: &[u64], secs: u64, what: &str) {
+    let want: Vec<String> = want.iter().map(|&n| nid(n).to_string()).collect();
     for &addr in probes {
         let converged = async {
             loop {
                 let (status, body) = control_members(addr).await;
-                if status == 200 && voters_of(&body).as_deref() == Some(want) {
+                if status == 200 && voters_of(&body).as_deref() == Some(want.as_slice()) {
                     return;
                 }
                 sleep(Duration::from_millis(150)).await;

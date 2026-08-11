@@ -256,10 +256,13 @@ pub fn tablet_key(id: TabletId) -> Vec<u8> {
     entity_key(EntityKind::Tablet, &id.0.to_be_bytes())
 }
 
-/// A [`NodeId`]'s key under [`EntityKind::Member`].
+/// A [`NodeId`]'s key under [`EntityKind::Member`]. ADR 0040 PR3: a node id
+/// is now a validated UTF-8 string, not a fixed-width `u64` — the key encodes
+/// its raw bytes (still escaped + prefix-free via [`entity_key`]) instead of
+/// 8 big-endian bytes.
 #[must_use]
-pub fn member_key(id: NodeId) -> Vec<u8> {
-    entity_key(EntityKind::Member, &id.as_u64().to_be_bytes())
+pub fn member_key(id: &NodeId) -> Vec<u8> {
+    entity_key(EntityKind::Member, id.as_str().as_bytes())
 }
 
 /// A table name's key under [`EntityKind::Schema`].
@@ -274,10 +277,11 @@ pub fn policy_key(id: TabletId) -> Vec<u8> {
     entity_key(EntityKind::Policy, &id.0.to_be_bytes())
 }
 
-/// A [`NodeId`]'s key under [`EntityKind::NodeAddrs`].
+/// A [`NodeId`]'s key under [`EntityKind::NodeAddrs`]. See [`member_key`]'s
+/// doc for the ADR 0040 PR3 string-id encoding change.
 #[must_use]
-pub fn node_addrs_key(id: NodeId) -> Vec<u8> {
-    entity_key(EntityKind::NodeAddrs, &id.as_u64().to_be_bytes())
+pub fn node_addrs_key(id: &NodeId) -> Vec<u8> {
+    entity_key(EntityKind::NodeAddrs, id.as_str().as_bytes())
 }
 
 /// A keyspace name's key under [`EntityKind::Keyspace`].
@@ -301,10 +305,11 @@ pub fn counter_key(name: &str) -> Vec<u8> {
 }
 
 /// A [`NodeId`]'s key under [`EntityKind::CpMemberAddr`] (PR2, the legacy
-/// `Metadata::cp_member_addrs`/`cp_member_tablets` pair).
+/// `Metadata::cp_member_addrs`/`cp_member_tablets` pair). See [`member_key`]'s
+/// doc for the ADR 0040 PR3 string-id encoding change.
 #[must_use]
-pub fn cp_member_addr_key(id: NodeId) -> Vec<u8> {
-    entity_key(EntityKind::CpMemberAddr, &id.as_u64().to_be_bytes())
+pub fn cp_member_addr_key(id: &NodeId) -> Vec<u8> {
+    entity_key(EntityKind::CpMemberAddr, id.as_str().as_bytes())
 }
 
 /// A join attempt's nonce string's key under [`EntityKind::NodeIdAlloc`]
@@ -440,12 +445,12 @@ mod tests {
 
     #[test]
     fn member_key_round_trips() {
-        let key = member_key(nid(7));
+        let key = member_key(&nid(7));
         assert_eq!(
             decode_key(&key),
             Some(DecodedKey::Entity {
                 kind: EntityKind::Member,
-                id: 7u64.to_be_bytes().to_vec(),
+                id: b"n7".to_vec(),
             })
         );
     }
@@ -476,12 +481,12 @@ mod tests {
 
     #[test]
     fn node_addrs_key_round_trips() {
-        let key = node_addrs_key(nid(300));
+        let key = node_addrs_key(&nid(300));
         assert_eq!(
             decode_key(&key),
             Some(DecodedKey::Entity {
                 kind: EntityKind::NodeAddrs,
-                id: 300u64.to_be_bytes().to_vec(),
+                id: b"n300".to_vec(),
             })
         );
     }
@@ -532,12 +537,12 @@ mod tests {
 
     #[test]
     fn cp_member_addr_key_round_trips() {
-        let key = cp_member_addr_key(nid(1301));
+        let key = cp_member_addr_key(&nid(1301));
         assert_eq!(
             decode_key(&key),
             Some(DecodedKey::Entity {
                 kind: EntityKind::CpMemberAddr,
-                id: 1301u64.to_be_bytes().to_vec(),
+                id: b"n1301".to_vec(),
             })
         );
     }
@@ -634,6 +639,54 @@ mod tests {
                     "key {a:?} is a prefix of distinct key {b:?}"
                 );
             }
+        }
+    }
+
+    /// ADR 0040 PR3: node ids are now strings, and the string-id escaping
+    /// machinery must reject exactly the collision class a naive
+    /// concatenation would hit — one minted id's string being a literal
+    /// prefix of another's (e.g. `"n1"` vs `"n10"`, or `nid`-style ids at
+    /// different digit widths). Exercises the real `member_key`/
+    /// `node_addrs_key`/`cp_member_addr_key` helpers directly (not just the
+    /// generic `entity_key` the test above already covers) so a regression in
+    /// any one of them is caught even if the others stay correct.
+    #[test]
+    fn string_ids_sharing_a_literal_prefix_do_not_collide() {
+        let prefix_pairs = [(nid(1), nid(10)), (nid(1), nid(12)), (nid(9), nid(99))];
+        for (short, long) in prefix_pairs {
+            assert!(
+                long.as_str().starts_with(short.as_str()),
+                "test fixture: {long} should literally start with {short}"
+            );
+            let mut keys = vec![
+                member_key(&short),
+                member_key(&long),
+                node_addrs_key(&short),
+                node_addrs_key(&long),
+                cp_member_addr_key(&short),
+                cp_member_addr_key(&long),
+            ];
+            let sorted = {
+                let mut k = keys.clone();
+                k.sort();
+                k
+            };
+            // No two keys collide or prefix one another.
+            for (i, a) in keys.iter().enumerate() {
+                for (j, b) in keys.iter().enumerate() {
+                    if i == j {
+                        continue;
+                    }
+                    assert!(
+                        !b.starts_with(a.as_slice()),
+                        "key for {short}/{long} pair: {a:?} prefixes {b:?}"
+                    );
+                }
+            }
+            keys.sort();
+            assert_eq!(keys, sorted);
+            keys.dedup();
+            assert_eq!(keys.len(), 6, "every key must be distinct");
         }
     }
 

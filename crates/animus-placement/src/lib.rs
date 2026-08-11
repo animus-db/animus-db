@@ -163,12 +163,12 @@ pub fn replan(
     policy: &PlacementPolicy,
 ) -> Result<Vec<NodeId>> {
     let eligible = eligible_domains(candidates, policy);
-    let eligible_ids: BTreeSet<NodeId> = eligible.iter().map(|(n, _)| *n).collect();
+    let eligible_ids: BTreeSet<NodeId> = eligible.iter().map(|(n, _)| n.clone()).collect();
     // Keep the survivors: current replicas that remain eligible.
     let keep: BTreeSet<NodeId> = current
         .iter()
-        .copied()
-        .filter(|n| eligible_ids.contains(n))
+        .filter(|n| eligible_ids.contains(*n))
+        .cloned()
         .collect();
     choose(&eligible, &keep, policy)
 }
@@ -215,7 +215,8 @@ pub fn rebalance_step<K: Ord + Copy>(
 ) -> Option<(K, Vec<NodeId>)> {
     // Per-node replica counts, seeded 0 for every candidate so an empty new node
     // is a genuine minimum (a destination), not simply absent.
-    let mut counts: BTreeMap<NodeId, usize> = candidates.iter().map(|c| (c.node, 0)).collect();
+    let mut counts: BTreeMap<NodeId, usize> =
+        candidates.iter().map(|c| (c.node.clone(), 0)).collect();
 
     // Only tablets whose *current* set already satisfies their policy count toward
     // load or are eligible to move; a violating set is the repair reconciler's job.
@@ -235,19 +236,19 @@ pub fn rebalance_step<K: Ord + Copy>(
     }
 
     // Sources most-loaded first; destinations least-loaded first (id-asc ties).
-    let mut sources: Vec<(NodeId, usize)> = counts.iter().map(|(&n, &c)| (n, c)).collect();
+    let mut sources: Vec<(NodeId, usize)> = counts.iter().map(|(n, &c)| (n.clone(), c)).collect();
     let mut dests = sources.clone();
     sources.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     dests.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
 
-    for &(src, src_count) in &sources {
-        for &(dst, dst_count) in &dests {
+    for (src, src_count) in &sources {
+        for (dst, dst_count) in &dests {
             // Only a pair whose imbalance a single move strictly reduces.
-            if src == dst || src_count < dst_count + 2 {
+            if src == dst || *src_count < dst_count + 2 {
                 continue;
             }
             for (k, replicas, policy) in &eligible {
-                if !replicas.contains(&src) || replicas.contains(&dst) {
+                if !replicas.contains(src) || replicas.contains(dst) {
                     continue;
                 }
                 let Some(dst_cand) = candidate_for(candidates, dst) else {
@@ -257,8 +258,8 @@ pub fn rebalance_step<K: Ord + Copy>(
                     continue;
                 }
                 let mut post: Vec<NodeId> =
-                    replicas.iter().copied().filter(|&n| n != src).collect();
-                post.push(dst);
+                    replicas.iter().filter(|&n| n != src).cloned().collect();
+                post.push(dst.clone());
                 post.sort_unstable();
                 if !set_satisfies(&post, candidates, policy) {
                     continue;
@@ -279,8 +280,8 @@ pub fn rebalance_step<K: Ord + Copy>(
 }
 
 /// The candidate for `node`, if it is in the pool.
-fn candidate_for(candidates: &[Candidate], node: NodeId) -> Option<&Candidate> {
-    candidates.iter().find(|c| c.node == node)
+fn candidate_for<'a>(candidates: &'a [Candidate], node: &NodeId) -> Option<&'a Candidate> {
+    candidates.iter().find(|c| &c.node == node)
 }
 
 /// Whether `replicas` satisfies `policy`'s **hard** constraints under the current
@@ -300,7 +301,7 @@ fn set_satisfies(replicas: &[NodeId], candidates: &[Candidate], policy: &Placeme
         return false;
     }
     for r in replicas {
-        match candidate_for(candidates, *r) {
+        match candidate_for(candidates, r) {
             Some(c) if policy.admits(c) => {}
             _ => return false,
         }
@@ -310,7 +311,7 @@ fn set_satisfies(replicas: &[NodeId], candidates: &[Candidate], policy: &Placeme
     {
         let mut seen: BTreeSet<&String> = BTreeSet::new();
         for r in replicas {
-            let Some(c) = candidate_for(candidates, *r) else {
+            let Some(c) = candidate_for(candidates, r) else {
                 return false;
             };
             let Some(domain) = c.labels.get(&sp.domain) else {
@@ -330,7 +331,7 @@ fn set_satisfies(replicas: &[NodeId], candidates: &[Candidate], policy: &Placeme
 fn max_per_domain(replicas: &[NodeId], candidates: &[Candidate], sp: &SpreadPolicy) -> usize {
     let mut counts: BTreeMap<Option<&String>, usize> = BTreeMap::new();
     for r in replicas {
-        let domain = candidate_for(candidates, *r).and_then(|c| c.labels.get(&sp.domain));
+        let domain = candidate_for(candidates, r).and_then(|c| c.labels.get(&sp.domain));
         *counts.entry(domain).or_default() += 1;
     }
     counts.values().copied().max().unwrap_or(0)
@@ -344,12 +345,15 @@ fn eligible_domains(candidates: &[Candidate], policy: &PlacementPolicy) -> Vec<(
         .iter()
         .filter(|c| policy.admits(c))
         .filter_map(|c| match &policy.spread {
-            Some(sp) => c.labels.get(&sp.domain).map(|d| (c.node, Some(d.clone()))),
-            None => Some((c.node, None)),
+            Some(sp) => c
+                .labels
+                .get(&sp.domain)
+                .map(|d| (c.node.clone(), Some(d.clone()))),
+            None => Some((c.node.clone(), None)),
         })
         .collect();
-    out.sort_by_key(|(n, _)| *n);
-    out.dedup_by_key(|(n, _)| *n);
+    out.sort_by(|(n, _), (m, _)| n.cmp(m));
+    out.dedup_by(|(n, _), (m, _)| n == m);
     out
 }
 
@@ -370,10 +374,15 @@ fn choose(
     // Bucket eligible nodes by domain; vectors stay node-sorted (input is).
     let mut domains: BTreeMap<Domain, Vec<NodeId>> = BTreeMap::new();
     for (node, domain) in eligible {
-        domains.entry(domain.clone()).or_default().push(*node);
+        domains
+            .entry(domain.clone())
+            .or_default()
+            .push(node.clone());
     }
-    let domain_of: BTreeMap<NodeId, Domain> =
-        eligible.iter().map(|(n, d)| (*n, d.clone())).collect();
+    let domain_of: BTreeMap<NodeId, Domain> = eligible
+        .iter()
+        .map(|(n, d)| (n.clone(), d.clone()))
+        .collect();
 
     if let Some(sp) = &policy.spread
         && sp.strict
@@ -395,8 +404,8 @@ fn choose(
             break;
         }
         if let Some(domain) = domain_of.get(node) {
-            chosen.push(*node);
-            taken.insert(*node);
+            chosen.push(node.clone());
+            taken.insert(node.clone());
             *count.get_mut(domain).expect("domain counted") += 1;
         }
     }
@@ -406,11 +415,12 @@ fn choose(
         let Some(domain) = least_loaded_domain(&domains, &count, &taken) else {
             break; // no candidates left
         };
-        let node = *domains[&domain]
+        let node = domains[&domain]
             .iter()
-            .find(|n| !taken.contains(n))
-            .expect("domain had a free node");
-        chosen.push(node);
+            .find(|n| !taken.contains(*n))
+            .expect("domain had a free node")
+            .clone();
+        chosen.push(node.clone());
         taken.insert(node);
         *count.get_mut(&domain).expect("domain counted") += 1;
     }

@@ -87,8 +87,8 @@ fn labels(region: &str, zone: &str) -> BTreeMap<String, String> {
         .collect()
 }
 
-fn zone_of(meta: &Metadata, node: u64) -> String {
-    meta.members[&nid(node)].labels["zone"].clone()
+fn zone_of(meta: &Metadata, node: &NodeId) -> String {
+    meta.members[node].labels["zone"].clone()
 }
 
 fn policy() -> PlacementPolicy {
@@ -97,8 +97,8 @@ fn policy() -> PlacementPolicy {
         .spread_across("zone", true)
 }
 
-fn status_of(meta: &Metadata, node: u64) -> NodeStatus {
-    meta.members[&nid(node)].status
+fn status_of(meta: &Metadata, node: &NodeId) -> NodeStatus {
+    meta.members[node].status
 }
 
 #[test]
@@ -149,7 +149,7 @@ fn run(seed: u64) {
     let meta = nodes[leader].metadata();
     for (id, _, _) in DATA_NODES {
         assert_eq!(
-            status_of(&meta, id),
+            status_of(&meta, &nid(id)),
             NodeStatus::Active,
             "member {id} flapped Down while heartbeating (seed={seed})"
         );
@@ -158,10 +158,10 @@ fn run(seed: u64) {
     assert_eq!(before.replicas, initial, "initial placement drifted");
 
     // --- Fault: one placed member crashes; its heartbeats stop. ---
-    let dead = initial[0];
-    let dead_zone = zone_of(&meta, dead.as_u64());
+    let dead = initial[0].clone();
+    let dead_zone = zone_of(&meta, &dead);
     let epoch_before = before.epoch;
-    sim.crash(dead);
+    sim.crash(dead.clone());
 
     // No manual `Down`, no test-driven reconcile: the leader's detector must
     // notice the silence (> DETECT_TIMEOUT) and commit `Down`, which the
@@ -172,7 +172,7 @@ fn run(seed: u64) {
         let m = node.metadata();
         // 1. Detected and committed Down on every control node.
         assert_eq!(
-            status_of(&m, dead.as_u64()),
+            status_of(&m, &dead),
             NodeStatus::Down,
             "node {i}: dead member not marked Down (seed={seed})"
         );
@@ -194,22 +194,26 @@ fn run(seed: u64) {
                 "node {i}: survivor {kept} needlessly moved (seed={seed})"
             );
         }
-        let replacement = *placed.iter().find(|n| !initial.contains(n)).unwrap();
+        let replacement = placed
+            .iter()
+            .find(|n| !initial.contains(n))
+            .unwrap()
+            .clone();
         assert_eq!(
-            zone_of(&m, (replacement).as_u64()),
+            zone_of(&m, &replacement),
             dead_zone,
             "node {i}: replacement should reuse the dead zone (seed={seed})"
         );
     }
 
     // --- Recovery: the member comes back and resumes heartbeating. ---
-    sim.restart(dead);
+    sim.restart(dead.clone());
     sim.run_for(Duration::from_secs(2));
 
     // 3. Detected recovery: the member returns to Active on every control node.
     for (i, node) in nodes.iter().enumerate() {
         assert_eq!(
-            status_of(&node.metadata(), dead.as_u64()),
+            status_of(&node.metadata(), &dead),
             NodeStatus::Active,
             "node {i}: recovered member not marked Active (seed={seed})"
         );
@@ -218,12 +222,12 @@ fn run(seed: u64) {
     // Idempotence at steady state: no further status churn once everyone is back.
     let stable: BTreeMap<u64, NodeStatus> = DATA_NODES
         .iter()
-        .map(|&(id, _, _)| (id, status_of(&nodes[leader].metadata(), id)))
+        .map(|&(id, _, _)| (id, status_of(&nodes[leader].metadata(), &nid(id))))
         .collect();
     sim.run_for(Duration::from_secs(2));
     for (&id, &st) in &stable {
         assert_eq!(
-            status_of(&nodes[leader].metadata(), id),
+            status_of(&nodes[leader].metadata(), &nid(id)),
             st,
             "member {id} status churned at steady state (seed={seed})"
         );
@@ -232,11 +236,12 @@ fn run(seed: u64) {
 
 fn assert_residency_and_spread(meta: &Metadata, placed: &[NodeId], seed: u64) {
     assert_eq!(placed.len(), 3, "wrong replica count (seed={seed})");
+    let eu_ids: Vec<NodeId> = (10..=15).map(nid).collect();
     assert!(
-        placed.iter().all(|n| (10..20).contains(&n.as_u64())),
+        placed.iter().all(|n| eu_ids.contains(n)),
         "residency lost: {placed:?} (seed={seed})"
     );
-    let mut zones: Vec<String> = placed.iter().map(|n| zone_of(meta, n.as_u64())).collect();
+    let mut zones: Vec<String> = placed.iter().map(|n| zone_of(meta, n)).collect();
     zones.sort();
     zones.dedup();
     assert_eq!(zones.len(), 3, "spread lost: {placed:?} (seed={seed})");

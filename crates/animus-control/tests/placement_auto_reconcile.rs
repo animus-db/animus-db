@@ -92,8 +92,8 @@ fn labels(region: &str, zone: &str) -> BTreeMap<String, String> {
         .collect()
 }
 
-fn zone_of(meta: &Metadata, node: u64) -> String {
-    meta.members[&nid(node)].labels["zone"].clone()
+fn zone_of(meta: &Metadata, node: &NodeId) -> String {
+    meta.members[node].labels["zone"].clone()
 }
 
 fn policy() -> PlacementPolicy {
@@ -160,15 +160,15 @@ fn run(seed: u64) {
     assert_residency_and_spread(&meta, &after_fresh, seed);
 
     // --- Fault: a placed replica's member dies. ---
-    let dead = after_fresh[0];
-    let dead_zone = zone_of(&meta, (dead).as_u64());
+    let dead = after_fresh[0].clone();
+    let dead_zone = zone_of(&meta, &dead);
     // Stop its heartbeat too: otherwise the (pre-existing, unchanged) `Down` →
     // `Active` recovery rule would immediately revert this manual `Down` the
     // moment `detect_loop` next sees a heartbeat still arriving from it.
-    sim.crash(dead);
+    sim.crash(dead.clone());
     assert!(matches!(
         nodes[leader].propose(MetaCommand::UpsertMember {
-            node: dead,
+            node: dead.clone(),
             labels: meta.members[&dead].labels.clone(),
             status: NodeStatus::Down,
         }),
@@ -200,9 +200,13 @@ fn run(seed: u64) {
                 "node {i}: survivor {kept} needlessly moved (seed={seed})"
             );
         }
-        let replacement = *placed.iter().find(|n| !after_fresh.contains(n)).unwrap();
+        let replacement = placed
+            .iter()
+            .find(|n| !after_fresh.contains(n))
+            .unwrap()
+            .clone();
         assert_eq!(
-            zone_of(&m, (replacement).as_u64()),
+            zone_of(&m, &replacement),
             dead_zone,
             "node {i}: replacement should reuse the dead zone (seed={seed})"
         );
@@ -221,11 +225,12 @@ fn run(seed: u64) {
 
 fn assert_residency_and_spread(meta: &Metadata, placed: &[NodeId], seed: u64) {
     assert_eq!(placed.len(), 3, "wrong replica count (seed={seed})");
+    let eu_ids: Vec<NodeId> = (10..=15).map(nid).collect();
     assert!(
-        placed.iter().all(|n| (10..20).contains(&n.as_u64())),
+        placed.iter().all(|n| eu_ids.contains(n)),
         "residency lost: {placed:?} (seed={seed})"
     );
-    let mut zones: Vec<String> = placed.iter().map(|n| zone_of(meta, n.as_u64())).collect();
+    let mut zones: Vec<String> = placed.iter().map(|n| zone_of(meta, n)).collect();
     zones.sort();
     zones.dedup();
     assert_eq!(zones.len(), 3, "spread lost: {placed:?} (seed={seed})");
@@ -257,9 +262,9 @@ fn reconcile_is_reproducible_from_seed() {
             policy: Some(policy()),
         });
         sim.run_for(Duration::from_secs(3));
-        let dead = nodes[leader].metadata().tablets[&TABLET].replicas[0];
+        let dead = nodes[leader].metadata().tablets[&TABLET].replicas[0].clone();
         let dead_labels = nodes[leader].metadata().members[&dead].labels.clone();
-        sim.crash(dead);
+        sim.crash(dead.clone());
         nodes[leader].propose(MetaCommand::UpsertMember {
             node: dead,
             labels: dead_labels,

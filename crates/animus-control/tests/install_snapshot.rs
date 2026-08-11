@@ -30,7 +30,9 @@ use animus_env::{Nanos, NodeId, nid};
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::MemoryEngine;
 
-const NODES: [NodeId; 3] = [nid(0), nid(1), nid(2)];
+fn member_ids() -> [NodeId; 3] {
+    [nid(0), nid(1), nid(2)]
+}
 
 fn upsert(node: u64) -> MetaCommand {
     MetaCommand::UpsertMember {
@@ -42,9 +44,15 @@ fn upsert(node: u64) -> MetaCommand {
 
 fn cluster(seed: u64) -> (Simulator, Vec<RaftNode<SimEnv>>) {
     let sim = Simulator::new(seed);
-    let nodes = NODES
+    let nodes = member_ids()
         .iter()
-        .map(|&id| RaftNode::start(sim.env(id), NODES.to_vec(), MemoryEngine::new()))
+        .map(|id| {
+            RaftNode::start(
+                sim.env(id.clone()),
+                member_ids().to_vec(),
+                MemoryEngine::new(),
+            )
+        })
         .collect();
     (sim, nodes)
 }
@@ -62,12 +70,12 @@ fn partitioned_follower_catches_up_via_install_snapshot() {
     sim.run_for(Duration::from_secs(2));
     let leader = unique_leader(&nodes, seed);
     let follower = (0..3).find(|&i| i != leader).unwrap();
-    let follower_id = NODES[follower];
+    let follower_id = member_ids()[follower].clone();
 
     // Isolate the follower from the rest of the cluster.
-    for &peer in &NODES {
-        if peer != follower_id {
-            sim.partition_pair(follower_id, peer);
+    for peer in &member_ids() {
+        if *peer != follower_id {
+            sim.partition_pair(follower_id.clone(), peer.clone());
         }
     }
 
@@ -94,9 +102,9 @@ fn partitioned_follower_catches_up_via_install_snapshot() {
     // AppendEntries (they're compacted), so it must InstallSnapshot — the real
     // apply task builds the on-demand image from its own engine on this path
     // (no manual intervention needed, unlike the hand-driven tests below).
-    for &peer in &NODES {
-        if peer != follower_id {
-            sim.heal(follower_id, peer);
+    for peer in &member_ids() {
+        if *peer != follower_id {
+            sim.heal(follower_id.clone(), peer.clone());
         }
     }
     sim.run_for(Duration::from_secs(4));
@@ -125,7 +133,7 @@ fn partitioned_follower_catches_up_via_install_snapshot() {
 /// chunk-production (leader) and reassembly (follower) paths.
 #[test]
 fn follower_catches_up_via_multi_chunk_snapshot() {
-    const PAIR: [NodeId; 2] = [nid(0), nid(1)];
+    let pair: [NodeId; 2] = [nid(0), nid(1)];
     let now = Nanos(1_000_000_000);
 
     // A synthetic system-keyspace image, several chunks long — stands in for
@@ -134,7 +142,7 @@ fn follower_catches_up_via_multi_chunk_snapshot() {
 
     // Elect node 0 leader of a two-node group: time out into a candidacy, then
     // feed it node 1's granted vote.
-    let mut leader: RaftCore = RaftCore::new(nid(0), &PAIR, Nanos(0), 7);
+    let mut leader: RaftCore = RaftCore::new(nid(0), &pair, Nanos(0), 7);
     let _ = leader.tick(now, 7); // election timeout -> pre-candidate, PreVote
     // A pre-vote grant tips the pre-candidacy into a real, term-bumping election.
     let _ = leader.handle(
@@ -188,7 +196,7 @@ fn follower_catches_up_via_multi_chunk_snapshot() {
 
     // Fresh follower; drive the chunk exchange to completion, counting the
     // distinct chunk offsets the leader sends.
-    let mut follower: RaftCore = RaftCore::new(nid(1), &PAIR, Nanos(0), 7);
+    let mut follower: RaftCore = RaftCore::new(nid(1), &pair, Nanos(0), 7);
     let mut offsets_sent: BTreeSet<u64> = BTreeSet::new();
 
     // Prime with a heartbeat. The fresh follower rejects the append (its log is
@@ -248,12 +256,12 @@ fn follower_catches_up_via_multi_chunk_snapshot() {
 /// chunk-stream; here the transfer is forced end-to-end.
 #[test]
 fn large_snapshot_ships_in_o_chunk_time_not_o_state() {
-    const PAIR: [NodeId; 2] = [nid(0), nid(1)];
+    let pair: [NodeId; 2] = [nid(0), nid(1)];
     let now = Nanos(1_000_000_000);
 
     // Elect node 0 leader of a two-node group: time out into a pre-candidacy, take a
     // pre-vote grant to tip into a real (term-bumping) election, then the vote.
-    let mut leader: RaftCore = RaftCore::new(nid(0), &PAIR, Nanos(0), 7);
+    let mut leader: RaftCore = RaftCore::new(nid(0), &pair, Nanos(0), 7);
     let _ = leader.tick(now, 7); // election timeout -> pre-candidate, PreVote
     let _ = leader.handle(
         nid(1),
@@ -307,7 +315,7 @@ fn large_snapshot_ships_in_o_chunk_time_not_o_state() {
     leader.set_snapshot_blob(image);
 
     // Pump a full multi-chunk transfer to a fresh follower, timing the wall clock.
-    let mut follower: RaftCore = RaftCore::new(nid(1), &PAIR, Nanos(0), 7);
+    let mut follower: RaftCore = RaftCore::new(nid(1), &pair, Nanos(0), 7);
     let started = std::time::Instant::now();
     let hb = Nanos(now.0 + 1_000_000_000);
     let mut pending: Vec<(NodeId, RaftMsg)> = leader.tick(hb, 7);
@@ -371,9 +379,9 @@ fn pump_snapshot(
                 if let RaftMsg::InstallSnapshot { total, .. } = &msg {
                     totals.push(*total);
                 }
-                next.extend(dst.handle(src_id, msg, now, 7));
+                next.extend(dst.handle(src_id.clone(), msg, now, 7));
             } else if to == src_id {
-                next.extend(src.handle(dst_id, msg, now, 7));
+                next.extend(src.handle(dst_id.clone(), msg, now, 7));
             }
             // Messages to the absent third node are dropped.
         }
@@ -399,7 +407,7 @@ fn caught_up_control_node_reships_non_empty() {
     let image = vec![0xEFu8; 3 * SNAPSHOT_CHUNK_BYTES + 42];
 
     // --- Source leader (node 0): commit enough members to compact a real snapshot.
-    let mut src: RaftCore = RaftCore::new(nid(0), &NODES, Nanos(0), 7);
+    let mut src: RaftCore = RaftCore::new(nid(0), &member_ids(), Nanos(0), 7);
     let _ = src.tick(now, 7); // election timeout -> pre-candidate, PreVote
     // A pre-vote grant (self + node 1 = majority) tips into a real election.
     let _ = src.handle(
@@ -441,7 +449,7 @@ fn caught_up_control_node_reships_non_empty() {
     src.set_snapshot_blob(image.clone());
 
     // --- Node 1 catches up from node 0 via InstallSnapshot.
-    let mut mid: RaftCore = RaftCore::new(nid(1), &NODES, Nanos(0), 7);
+    let mut mid: RaftCore = RaftCore::new(nid(1), &member_ids(), Nanos(0), 7);
     let hb = Nanos(now.0 + 1_000_000_000);
     let pending = src.tick(hb, 7);
     let totals = pump_snapshot(&mut src, &mut mid, nid(0), nid(1), pending);
@@ -482,7 +490,7 @@ fn caught_up_control_node_reships_non_empty() {
     // (now-current) engine before its next replication attempt.
     mid.set_snapshot_blob(image.clone());
 
-    let mut fresh: RaftCore = RaftCore::new(nid(2), &NODES, Nanos(0), 7);
+    let mut fresh: RaftCore = RaftCore::new(nid(2), &member_ids(), Nanos(0), 7);
     let hb2 = Nanos(later.0 + 1_000_000_000);
     let pending2 = mid.tick(hb2, 7);
     let totals2 = pump_snapshot(&mut mid, &mut fresh, nid(1), nid(2), pending2);

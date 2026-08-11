@@ -96,7 +96,7 @@ async fn combined_node_restart_recovers_control_metadata_via_shared_engine() {
         .members
         .keys()
         .next()
-        .copied()
+        .cloned()
         .expect("bootstrap registered at least one member");
 
     let table = "combined_meta_t";
@@ -127,7 +127,7 @@ async fn combined_node_restart_recovers_control_metadata_via_shared_engine() {
             tablet,
             table: Some(table.to_string()),
             range: KeyRange::whole(),
-            replicas: vec![member_id],
+            replicas: vec![member_id.clone()],
         }),
     )
     .await;
@@ -220,6 +220,7 @@ async fn combined_node_restart_recovers_control_metadata_via_shared_engine() {
 async fn ephemeral_control_only_restart_does_not_carry_over_metadata() {
     let dir = TempDir::new().unwrap();
     let addrs = animusd::RoleAddrs {
+        id: animusd::config::node_id(0),
         role: animusd::config::NodeRole::Control,
         internal: free_addr(),
         client: free_addr(),
@@ -229,7 +230,7 @@ async fn ephemeral_control_only_restart_does_not_carry_over_metadata() {
     };
 
     // --- First incarnation: propose a schema, then a hard shutdown. ---
-    let node = start_control(addrs, &dir.path().join("incarnation-0")).await;
+    let node = start_control(addrs.clone(), &dir.path().join("incarnation-0")).await;
     await_leader_only(&node).await;
     let table = "ephemeral_ctl_t";
     let resp = call(
@@ -258,7 +259,7 @@ async fn ephemeral_control_only_restart_does_not_carry_over_metadata() {
     // replacement pod's identity/routing stable), but a FRESH directory (a
     // genuinely stateless engine — no prior WAL, no prior system-keyspace
     // engine) and the SAME `--ephemeral` backend choice. ---
-    let node = start_control(addrs, &dir.path().join("incarnation-1")).await;
+    let node = start_control(addrs.clone(), &dir.path().join("incarnation-1")).await;
     await_leader_only(&node).await;
 
     // It re-bootstrapped cleanly (no panic, genuinely elected itself leader

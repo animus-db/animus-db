@@ -44,8 +44,9 @@ fn residency_restricts_to_matching_region() {
     let policy = PlacementPolicy::simple("eu", 3).require_label("region", "eu");
     let chosen = select_replicas(&pool, &policy).unwrap();
     assert_eq!(chosen.len(), 3);
+    let eu_ids: Vec<NodeId> = (10..20).map(nid).collect();
     assert!(
-        chosen.iter().all(|n| (10..20).contains(&n.as_u64())),
+        chosen.iter().all(|n| eu_ids.contains(n)),
         "a non-eu node was placed: {chosen:?}"
     );
 }

@@ -53,6 +53,14 @@ const RECONFIGURE_INTERVAL: Duration = Duration::from_millis(150);
 /// coincidentally catch all the way up between ticks and mask the bug).
 const WRITE_INTERVAL: Duration = Duration::from_millis(5);
 
+/// The numeric test index backing a `nid(n)`-formatted `"n{n}"` string id.
+fn idx(id: &NodeId) -> usize {
+    id.as_str()
+        .trim_start_matches('n')
+        .parse()
+        .expect("test node ids are nid(n)-formatted")
+}
+
 fn set(ids: &[u64]) -> BTreeSet<NodeId> {
     ids.iter().copied().map(nid).collect()
 }
@@ -163,9 +171,9 @@ fn reconfigure_step_relocates_a_write_hot_leader_under_sustained_writes() {
         ProposeResult::Accepted { .. }
     ));
     sim.run_for(Duration::from_secs(2));
-    for &id in &desired {
+    for id in &desired {
         assert_eq!(
-            futures::executor::block_on(nodes[id.as_u64() as usize].local_get(b"post")),
+            futures::executor::block_on(nodes[idx(id)].local_get(b"post")),
             Some(b"v".to_vec()),
             "node {id} missing the post-transfer write"
         );

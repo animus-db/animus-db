@@ -427,7 +427,7 @@ fn raft_view(ctx: &ClientCtx) -> Value {
     let members: Vec<Value> = meta
         .members
         .keys()
-        .map(|id| json!({"node": id, "believes_alive": r.believes_alive(*id)}))
+        .map(|id| json!({"node": id, "believes_alive": r.believes_alive(id.clone())}))
         .collect();
     json!({
         "role": format!("{:?}", r.role()),
@@ -877,17 +877,19 @@ async fn system_table(ctx: &ClientCtx, q: &str) -> (u16, Value) {
     )
 }
 
-/// Whether `kind`'s entity id is a big-endian `u64` (a `TabletId`/`NodeId`) —
-/// see [`system_table_id_display`].
+/// Whether `kind`'s entity id is a big-endian `u64` (a `TabletId`) — see
+/// [`system_table_id_display`]. **ADR 0040 PR3**: `Member`/`NodeAddrs`/
+/// `CpMemberAddr` are keyed by `NodeId` now, and `NodeId` is a validated
+/// UTF-8 string, not a fixed-width `u64` (`member_key`/`node_addrs_key`/
+/// `cp_member_addr_key` all encode `id.as_str().as_bytes()`) — they moved
+/// out of this list. Leaving them in would occasionally *silently*
+/// misrender a coincidentally-8-byte-long id (e.g. `"n1234567"`) as a bogus
+/// decoded number instead of the real string, rather than just falling
+/// through to the string branch every time as it did for any other length.
 fn system_table_id_is_numeric(kind: syskv::EntityKind) -> bool {
     matches!(
         kind,
-        syskv::EntityKind::Tablet
-            | syskv::EntityKind::Member
-            | syskv::EntityKind::Policy
-            | syskv::EntityKind::NodeAddrs
-            | syskv::EntityKind::Merged
-            | syskv::EntityKind::CpMemberAddr
+        syskv::EntityKind::Tablet | syskv::EntityKind::Policy | syskv::EntityKind::Merged
     )
 }
 
@@ -895,8 +897,9 @@ fn system_table_id_is_numeric(kind: syskv::EntityKind) -> bool {
 /// ([`system_table_id_is_numeric`]) is 8 big-endian bytes, rendered as a
 /// decimal **string** (not a JSON number — a `u64` can exceed `f64`'s exact
 /// integer range, and JSON has no native 64-bit integer type); every other
-/// kind's id is a UTF-8 name, rendered verbatim (lossy on malformed UTF-8,
-/// defensive only — this module never writes anything else there).
+/// kind's id is a UTF-8 name (a `NodeId` string, a schema/keyspace name, or a
+/// join nonce), rendered verbatim (lossy on malformed UTF-8, defensive only
+/// — this module never writes anything else there).
 fn system_table_id_display(kind: syskv::EntityKind, id: &[u8]) -> Value {
     if system_table_id_is_numeric(kind) {
         match <[u8; 8]>::try_from(id) {
@@ -912,10 +915,12 @@ fn system_table_id_display(kind: syskv::EntityKind, id: &[u8]) -> Value {
 /// `animus_control::mirror::apply_put`'s decode exactly: `Tablet`/`Member`/
 /// `Schema`/`Policy`/`NodeAddrs`/`CpMemberAddr` are `serde_json` passthrough
 /// (`null` on a malformed value — defensive only, every real writer produces
-/// valid JSON here); `Counter`/`NodeIdAlloc` are a raw big-endian `u64`
-/// (`null` if not exactly 8 bytes); `Keyspace`/`Merged` are presence-only
-/// (their value is always empty) — always `null`, regardless of the actual
-/// bytes.
+/// valid JSON here); `Counter` is a raw big-endian `u64` (`null` if not
+/// exactly 8 bytes); `NodeIdAlloc`'s value is the minted `NodeId` itself — a
+/// UTF-8 string (ADR 0040 PR3: `NodeId` is a validated string now, not a
+/// `u64`, so this is no longer the same 8-byte encoding `Counter` uses);
+/// `Keyspace`/`Merged` are presence-only (their value is always empty) —
+/// always `null`, regardless of the actual bytes.
 fn system_table_value_display(kind: syskv::EntityKind, value: &[u8]) -> Value {
     match kind {
         syskv::EntityKind::Tablet
@@ -926,12 +931,15 @@ fn system_table_value_display(kind: syskv::EntityKind, value: &[u8]) -> Value {
         | syskv::EntityKind::CpMemberAddr => {
             serde_json::from_slice::<Value>(value).unwrap_or(Value::Null)
         }
-        syskv::EntityKind::Counter | syskv::EntityKind::NodeIdAlloc => {
-            match <[u8; 8]>::try_from(value) {
-                Ok(bytes) => json!(u64::from_be_bytes(bytes)),
-                Err(_) => Value::Null,
-            }
-        }
+        syskv::EntityKind::Counter => match <[u8; 8]>::try_from(value) {
+            Ok(bytes) => json!(u64::from_be_bytes(bytes)),
+            Err(_) => Value::Null,
+        },
+        // ADR 0040 PR3: the value here is the minted `NodeId` itself (a
+        // UTF-8 string, `mirror::decode_node_id`'s exact format), not a raw
+        // counter — `Counter`'s 8-byte-u64 decode used to also fit this
+        // (NodeId was itself a `u64`), but no longer does.
+        syskv::EntityKind::NodeIdAlloc => json!(key_str(value)),
         syskv::EntityKind::Keyspace | syskv::EntityKind::Merged => Value::Null,
     }
 }
@@ -1165,7 +1173,7 @@ fn action_drain(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
         Ok(r) => r,
         Err(e) => return e,
     };
-    match ctx.admin_drain(req.node) {
+    match ctx.admin_drain(req.node.clone()) {
         Ok(()) => (
             200,
             json!({"ok": true, "node": req.node, "status": "Leaving"}),
@@ -1193,7 +1201,7 @@ fn member_drain_status(ctx: &ClientCtx, q: &str) -> (u16, Value) {
         );
     };
     let meta = ctx.effective_metadata();
-    let tablets_remaining = meta.tablets_referencing(node);
+    let tablets_remaining = meta.tablets_referencing(&node);
     let status = meta.members.get(&node).map_or(json!("absent"), |m| {
         serde_json::to_value(m.status).unwrap_or(Value::Null)
     });
@@ -1216,7 +1224,7 @@ fn action_remove_member(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
         Ok(r) => r,
         Err(e) => return e,
     };
-    match ctx.admin_remove_member(req.node) {
+    match ctx.admin_remove_member(req.node.clone()) {
         Ok(()) => (200, json!({"ok": true, "node": req.node, "removed": true})),
         Err(e) => (409, json!({"error": e})),
     }
@@ -1232,7 +1240,7 @@ async fn action_add_member(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
         Ok(r) => r,
         Err(e) => return e,
     };
-    match ctx.admin_add_member(req.node, req.labels).await {
+    match ctx.admin_add_member(req.node.clone(), req.labels).await {
         Ok(()) => (200, json!({"ok": true, "node": req.node})),
         Err(e) => (504, json!({"error": e})),
     }
@@ -1299,7 +1307,10 @@ async fn action_remove_control_member(ctx: &ClientCtx, body: &[u8]) -> (u16, Val
         Ok(r) => r,
         Err(e) => return e,
     };
-    match ctx.admin_remove_control_member(req.node, req.force).await {
+    match ctx
+        .admin_remove_control_member(req.node.clone(), req.force)
+        .await
+    {
         Ok(outcome) => (
             200,
             json!({"ok": true, "node": req.node, "warning": outcome.warning}),

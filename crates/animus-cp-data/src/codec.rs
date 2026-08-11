@@ -76,10 +76,17 @@ fn put_opt_bytes(out: &mut Vec<u8>, b: &Option<Vec<u8>>) {
     }
 }
 
+/// A node id as a length-prefixed UTF-8 string (ADR 0040 PR3: node ids are
+/// validated strings now, not small dense `u64`s, so this replaces the old
+/// fixed-width `u64` encoding — a persisted-format break, fresh clusters only).
+fn put_node_id(out: &mut Vec<u8>, n: &NodeId) {
+    put_bytes(out, n.as_str().as_bytes());
+}
+
 fn put_node_set(out: &mut Vec<u8>, s: &BTreeSet<NodeId>) {
     out.extend_from_slice(&(s.len() as u32).to_be_bytes());
-    for &n in s {
-        put_u64(out, n.as_u64());
+    for n in s {
+        put_node_id(out, n);
     }
 }
 
@@ -153,11 +160,22 @@ impl<'a> Cursor<'a> {
         }
     }
 
+    /// A node id: a length-prefixed UTF-8 string (ADR 0040 PR3). Bypasses
+    /// [`NodeId::propose`]'s charset validation via `NodeId::new_unchecked` —
+    /// this id was already validated once at whatever intake boundary first
+    /// proposed it; a wire/snapshot round-trip is a trusted decode, not fresh
+    /// untrusted input.
+    fn node_id(&mut self) -> Result<NodeId, DecodeError> {
+        let bytes = self.bytes()?;
+        let s = String::from_utf8(bytes).map_err(|e| format!("node id is not UTF-8: {e}"))?;
+        Ok(NodeId::new_unchecked(s))
+    }
+
     fn node_set(&mut self) -> Result<BTreeSet<NodeId>, DecodeError> {
         let len = self.u32()?;
         let mut s = BTreeSet::new();
         for _ in 0..len {
-            s.insert(NodeId::new(self.u64()?));
+            s.insert(self.node_id()?);
         }
         Ok(s)
     }
@@ -298,7 +316,7 @@ fn put_raft(out: &mut Vec<u8>, m: &RaftMsg<KvCommand>) {
         } => {
             put_u8(out, 0);
             put_u64(out, *term);
-            put_u64(out, candidate.as_u64());
+            put_node_id(out, candidate);
             put_u64(out, *last_log_index);
             put_u64(out, *last_log_term);
         }
@@ -315,7 +333,7 @@ fn put_raft(out: &mut Vec<u8>, m: &RaftMsg<KvCommand>) {
         } => {
             put_u8(out, 2);
             put_u64(out, *term);
-            put_u64(out, candidate.as_u64());
+            put_node_id(out, candidate);
             put_u64(out, *last_log_index);
             put_u64(out, *last_log_term);
         }
@@ -334,7 +352,7 @@ fn put_raft(out: &mut Vec<u8>, m: &RaftMsg<KvCommand>) {
         } => {
             put_u8(out, 4);
             put_u64(out, *term);
-            put_u64(out, leader.as_u64());
+            put_node_id(out, leader);
             put_u64(out, *prev_log_index);
             put_u64(out, *prev_log_term);
             out.extend_from_slice(&(entries.len() as u32).to_be_bytes());
@@ -366,7 +384,7 @@ fn put_raft(out: &mut Vec<u8>, m: &RaftMsg<KvCommand>) {
         } => {
             put_u8(out, 6);
             put_u64(out, *term);
-            put_u64(out, leader.as_u64());
+            put_node_id(out, leader);
             put_u64(out, *last_index);
             put_u64(out, *last_term);
             put_u64(out, *offset);
@@ -387,7 +405,7 @@ fn put_raft(out: &mut Vec<u8>, m: &RaftMsg<KvCommand>) {
         }
         RaftMsg::Heartbeat { node } => {
             put_u8(out, 8);
-            put_u64(out, node.as_u64());
+            put_node_id(out, node);
         }
         RaftMsg::TimeoutNow { term } => {
             put_u8(out, 9);
@@ -400,7 +418,7 @@ fn read_raft(c: &mut Cursor<'_>) -> Result<RaftMsg<KvCommand>, DecodeError> {
     Ok(match c.u8()? {
         0 => RaftMsg::PreVote {
             term: c.u64()?,
-            candidate: NodeId::new(c.u64()?),
+            candidate: c.node_id()?,
             last_log_index: c.u64()?,
             last_log_term: c.u64()?,
         },
@@ -410,7 +428,7 @@ fn read_raft(c: &mut Cursor<'_>) -> Result<RaftMsg<KvCommand>, DecodeError> {
         },
         2 => RaftMsg::RequestVote {
             term: c.u64()?,
-            candidate: NodeId::new(c.u64()?),
+            candidate: c.node_id()?,
             last_log_index: c.u64()?,
             last_log_term: c.u64()?,
         },
@@ -420,7 +438,7 @@ fn read_raft(c: &mut Cursor<'_>) -> Result<RaftMsg<KvCommand>, DecodeError> {
         },
         4 => {
             let term = c.u64()?;
-            let leader = NodeId::new(c.u64()?);
+            let leader = c.node_id()?;
             let prev_log_index = c.u64()?;
             let prev_log_term = c.u64()?;
             let n = c.u32()?;
@@ -444,7 +462,7 @@ fn read_raft(c: &mut Cursor<'_>) -> Result<RaftMsg<KvCommand>, DecodeError> {
         },
         6 => RaftMsg::InstallSnapshot {
             term: c.u64()?,
-            leader: NodeId::new(c.u64()?),
+            leader: c.node_id()?,
             last_index: c.u64()?,
             last_term: c.u64()?,
             offset: c.u64()?,
@@ -458,9 +476,7 @@ fn read_raft(c: &mut Cursor<'_>) -> Result<RaftMsg<KvCommand>, DecodeError> {
             last_index: c.u64()?,
             next_offset: c.u64()?,
         },
-        8 => RaftMsg::Heartbeat {
-            node: NodeId::new(c.u64()?),
-        },
+        8 => RaftMsg::Heartbeat { node: c.node_id()? },
         9 => RaftMsg::TimeoutNow { term: c.u64()? },
         other => return Err(format!("unknown RaftMsg tag {other}")),
     })

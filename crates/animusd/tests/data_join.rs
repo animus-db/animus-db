@@ -120,7 +120,9 @@ async fn admin_get(addr: SocketAddr, path: &str) -> serde_json::Value {
 
 /// Every member's status, `raftkv_id -> "Active"/"Down"/...`, from
 /// `/admin/status` (mirrors `tests/seed_join.rs::member_statuses`).
-async fn member_statuses(admin_addr: SocketAddr) -> std::collections::BTreeMap<u64, String> {
+async fn member_statuses(
+    admin_addr: SocketAddr,
+) -> std::collections::BTreeMap<animus_env::NodeId, String> {
     let v = admin_get(admin_addr, "/admin/status").await;
     v["members"]
         .as_object()
@@ -128,7 +130,7 @@ async fn member_statuses(admin_addr: SocketAddr) -> std::collections::BTreeMap<u
         .iter()
         .map(|(id, m)| {
             (
-                id.parse().expect("member id key is numeric"),
+                id.parse().expect("member id key is a valid NodeId"),
                 m["status"].as_str().expect("status is a string").to_owned(),
             )
         })
@@ -140,7 +142,10 @@ async fn member_statuses(admin_addr: SocketAddr) -> std::collections::BTreeMap<u
 /// rebalancer only ever proposes a move while it improves the *global*
 /// imbalance, so a through-only-the-joined-node write must target a table
 /// this actually returns, not an arbitrary one.
-async fn table_with_replica(admin_addr: SocketAddr, raftkv_id: u64) -> Option<String> {
+async fn table_with_replica(
+    admin_addr: SocketAddr,
+    raftkv_id: &animus_env::NodeId,
+) -> Option<String> {
     let v = admin_get(admin_addr, "/admin/status").await;
     v["tablets"]
         .as_object()
@@ -151,8 +156,8 @@ async fn table_with_replica(admin_addr: SocketAddr, raftkv_id: u64) -> Option<St
                 .as_array()
                 .expect("replicas is an array")
                 .iter()
-                .filter_map(serde_json::Value::as_u64)
-                .any(|r| r == raftkv_id);
+                .filter_map(|r| r.as_str())
+                .any(|r| r == raftkv_id.as_str());
             has_replica
                 .then(|| t["table"].as_str().map(str::to_owned))
                 .flatten()
@@ -210,7 +215,7 @@ async fn data_node_joins_a_split_cluster_via_seed_and_gets_a_rebalanced_replica(
     let promoted = async {
         loop {
             let statuses = member_statuses(control_admin[0]).await;
-            if statuses.get(&join_raftkv_id.as_u64()).map(String::as_str) == Some("Active") {
+            if statuses.get(&join_raftkv_id).map(String::as_str) == Some("Active") {
                 return;
             }
             sleep(Duration::from_millis(100)).await;
@@ -226,9 +231,7 @@ async fn data_node_joins_a_split_cluster_via_seed_and_gets_a_rebalanced_replica(
     let hosted_table: String = {
         let discover = async {
             loop {
-                if let Some(table) =
-                    table_with_replica(control_admin[0], (join_raftkv_id).as_u64()).await
-                {
+                if let Some(table) = table_with_replica(control_admin[0], &join_raftkv_id).await {
                     return table;
                 }
                 sleep(Duration::from_millis(300)).await;

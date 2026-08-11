@@ -218,7 +218,7 @@ impl RemoteControlClient {
             .lock()
             .expect("leader hint poisoned")
             .as_ref()
-            .map(|(id, _)| *id)
+            .map(|(id, _)| id.clone())
     }
 
     pub(crate) fn leader_addr_hint(&self) -> Option<SocketAddr> {

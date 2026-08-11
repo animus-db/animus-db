@@ -148,13 +148,24 @@ async fn control_members(admin_addr: SocketAddr) -> (u16, serde_json::Value) {
 /// *and* data ids, so there is no id within `{0,1,2}` that is "a data-plane
 /// member but not a control voter" — this mints a genuinely distinct one).
 async fn add_member(admin_addr: SocketAddr, node: u64) -> (u16, serde_json::Value) {
-    let body = serde_json::json!({"node": node}).to_string();
+    let body = serde_json::json!({"node": nid(node).to_string()}).to_string();
     admin(admin_addr, "POST", "/admin/member/add", Some(&body)).await
 }
 
 async fn add_control_member(
     admin_addr: SocketAddr,
     node: u64,
+    addr: SocketAddr,
+) -> (u16, serde_json::Value) {
+    add_control_member_raw(admin_addr, &nid(node).to_string(), addr).await
+}
+
+/// The raw-string-id form of [`add_control_member`] — needed to submit an id
+/// this test knows in advance is not `nid`-shaped (e.g. an allocator-range
+/// `"alloc-…"` id, ADR 0040 PR3's reserved mint prefix).
+async fn add_control_member_raw(
+    admin_addr: SocketAddr,
+    node: &str,
     addr: SocketAddr,
 ) -> (u16, serde_json::Value) {
     let body = serde_json::json!({"node": node, "addr": addr.to_string()}).to_string();
@@ -190,7 +201,7 @@ async fn remove_control_member_forced(
     node: u64,
     force: bool,
 ) -> (u16, serde_json::Value) {
-    let body = serde_json::json!({"node": node, "force": force}).to_string();
+    let body = serde_json::json!({"node": nid(node).to_string(), "force": force}).to_string();
     admin(
         admin_addr,
         "POST",
@@ -200,10 +211,12 @@ async fn remove_control_member_forced(
     .await
 }
 
-fn voters_of(body: &serde_json::Value) -> Option<Vec<u64>> {
-    body["voters"]
-        .as_array()
-        .map(|a| a.iter().filter_map(serde_json::Value::as_u64).collect())
+fn voters_of(body: &serde_json::Value) -> Option<Vec<animus_env::NodeId>> {
+    body["voters"].as_array().map(|a| {
+        a.iter()
+            .filter_map(|v| v.as_str()?.parse::<animus_env::NodeId>().ok())
+            .collect()
+    })
 }
 
 /// Bring up an `n`-node **combined-mode** core, one process per node — the
@@ -213,6 +226,7 @@ async fn bring_up_combined(n: usize, dir: &Path) -> (Vec<Node>, ClusterConfig) {
         let addrs = support::free_addrs(n * 5);
         let nodes_cfg: Vec<RoleAddrs> = (0..n)
             .map(|i| RoleAddrs {
+                id: animusd::config::node_id(i),
                 role: NodeRole::Both,
                 internal: addrs[5 * i],
                 client: addrs[5 * i + 1],
@@ -282,6 +296,7 @@ async fn join_control_nonvoter(
     for attempt in 0..16 {
         let raw = support::free_addrs(5);
         let addrs = RoleAddrs {
+            id: nid(new_control_id),
             role: NodeRole::Control,
             internal: raw[0],
             client: raw[1],
@@ -291,7 +306,7 @@ async fn join_control_nonvoter(
         };
         let bound = match animusd::Node::bind_control(
             nid(new_control_id),
-            addrs,
+            addrs.clone(),
             dir.join(format!("grow-{attempt}")),
         )
         .await
@@ -342,7 +357,7 @@ async fn grow_control_group_converges_everywhere() {
     for &a in &control_admin {
         let (status, body) = control_members(a).await;
         assert_eq!(status, 200, "control/members failed: {body}");
-        assert_eq!(voters_of(&body), Some(vec![0, 1, 2]));
+        assert_eq!(voters_of(&body), Some(vec![nid(0), nid(1), nid(2)]));
     }
 
     // Bring up a 5th node as a quiet non-voter (id 4 — free: `bring_up_split`'s
@@ -367,7 +382,7 @@ async fn grow_control_group_converges_everywhere() {
         let converged = async {
             loop {
                 let (status, body) = control_members(a).await;
-                if status == 200 && voters_of(&body) == Some(vec![0, 1, 2, 4]) {
+                if status == 200 && voters_of(&body) == Some(vec![nid(0), nid(1), nid(2), nid(4)]) {
                     return;
                 }
                 sleep(Duration::from_millis(200)).await;
@@ -427,19 +442,19 @@ async fn add_control_member_collision_shapes() {
         );
     }
 
-    // At/above the cluster-allocated id range: refused outright, still, even
+    // In the cluster-allocated id range: refused outright, still, even
     // though this same action now mints ids in exactly this range for its
     // own omitted-`node` path (see this test's own doc).
     {
-        let (status, body) = add_control_member(
+        let (status, body) = add_control_member_raw(
             admin_addrs[leader],
-            (animus_control::meta::ALLOC_ID_BASE).as_u64(),
+            &animus_control::meta::alloc_node_id(0).to_string(),
             admin_addrs[leader],
         )
         .await;
         assert_eq!(
             status, 409,
-            "adding a control voter at/above ALLOC_ID_BASE should be refused: {body}"
+            "adding a control voter in the allocator's reserved range should be refused: {body}"
         );
     }
 
@@ -524,7 +539,7 @@ async fn remove_control_voter_refusals_transfer_and_quorum_warnings() {
             if status == 200
                 && let Some(v) = voters_of(&body)
                 && v.len() == 2
-                && !v.contains(&non_leader_voter)
+                && !v.contains(&nid(non_leader_voter))
             {
                 return;
             }
@@ -689,7 +704,7 @@ async fn runtime_added_voter_survives_leadership_change_to_a_different_original_
         let converged = async {
             loop {
                 let (status, body) = control_members(a).await;
-                if status == 200 && voters_of(&body) == Some(vec![0, 1, 2, 3]) {
+                if status == 200 && voters_of(&body) == Some(vec![nid(0), nid(1), nid(2), nid(3)]) {
                     return;
                 }
                 sleep(Duration::from_millis(100)).await;
@@ -730,7 +745,7 @@ async fn runtime_added_voter_survives_leadership_change_to_a_different_original_
     // The config is unaffected by the transfer alone — still all 4 voters.
     let (status, body) = control_members(admin_addrs[new_leader_idx]).await;
     assert_eq!(status, 200, "control/members failed: {body}");
-    assert_eq!(voters_of(&body), Some(vec![0, 1, 2, 3]));
+    assert_eq!(voters_of(&body), Some(vec![nid(0), nid(1), nid(2), nid(3)]));
 
     // The real proof: propose something new *through the new (different)
     // leader* and confirm it replicates to the runtime-added voter's own
@@ -854,7 +869,7 @@ async fn removing_a_live_voter_while_another_is_already_dead_is_refused_without_
             v.sort_unstable();
             v
         }),
-        Some(vec![0, 1, 2]),
+        Some(vec![nid(0), nid(1), nid(2)]),
         "a refused removal must not change the live voter set: {body}"
     );
 
@@ -1062,7 +1077,7 @@ async fn concurrent_control_add_surfaces_in_flight_as_a_clean_retryable_error() 
             let (status, body) = control_members(leader_admin).await;
             if status == 200
                 && let Some(v) = voters_of(&body)
-                && v.contains(&winner_id)
+                && v.contains(&nid(winner_id))
             {
                 return;
             }
@@ -1121,12 +1136,14 @@ async fn omitted_node_add_mints_an_id_and_converges_to_a_live_voter() {
         status, 200,
         "omitted-node control/member/add failed: {body}"
     );
-    let minted = body["node"]
-        .as_u64()
-        .expect("the response carries the minted `node`");
+    let minted: animus_env::NodeId = body["node"]
+        .as_str()
+        .expect("the response carries the minted `node`")
+        .parse()
+        .expect("minted node id parses");
     assert!(
-        minted >= (animus_control::meta::ALLOC_ID_BASE).as_u64(),
-        "minted id {minted} should be at/above ALLOC_ID_BASE ({})",
+        animus_control::meta::parse_alloc_id(&minted).is_some(),
+        "minted id {minted} should be in the allocator's reserved range ({})",
         animus_control::meta::ALLOC_ID_BASE
     );
 
@@ -1187,13 +1204,15 @@ async fn concurrent_omitted_node_adds_mint_distinct_ids_and_both_become_voters()
             "unexpected status for a concurrent omitted-node add: {body}"
         );
     }
-    let successes: Vec<u64> = [&r1, &r2]
+    let successes: Vec<animus_env::NodeId> = [&r1, &r2]
         .iter()
         .filter(|(status, _)| *status == 200)
         .map(|(_, body)| {
             body["node"]
-                .as_u64()
+                .as_str()
                 .expect("a successful omitted-node add carries the minted `node`")
+                .parse()
+                .expect("minted node id parses")
         })
         .collect();
     assert_eq!(
@@ -1201,10 +1220,10 @@ async fn concurrent_omitted_node_adds_mint_distinct_ids_and_both_become_voters()
         1,
         "exactly one concurrent omitted-node add should win outright: r1={r1:?}, r2={r2:?}"
     );
-    let winner_id = successes[0];
+    let winner_id = successes[0].clone();
     assert!(
-        winner_id >= (animus_control::meta::ALLOC_ID_BASE).as_u64(),
-        "minted id {winner_id} should be at/above ALLOC_ID_BASE"
+        animus_control::meta::parse_alloc_id(&winner_id).is_some(),
+        "minted id {winner_id} should be in the allocator's reserved range"
     );
 
     let winner_converged = async {
@@ -1230,21 +1249,21 @@ async fn concurrent_omitted_node_adds_mint_distinct_ids_and_both_become_voters()
     while tokio::time::Instant::now() < retry_deadline {
         let (status, body) = add_control_member_allocated(leader_admin, admin_addrs[leader]).await;
         if status == 200 {
-            second_id = body["node"].as_u64();
+            second_id = body["node"].as_str().and_then(|s| s.parse().ok());
             break;
         }
         last_body = body;
         sleep(Duration::from_millis(150)).await;
     }
-    let second_id = second_id
+    let second_id: animus_env::NodeId = second_id
         .unwrap_or_else(|| panic!("the retried omitted-node add never succeeded: {last_body}"));
     assert_ne!(
         second_id, winner_id,
         "the retry must mint an id distinct from the winner's"
     );
     assert!(
-        second_id >= (animus_control::meta::ALLOC_ID_BASE).as_u64(),
-        "minted id {second_id} should be at/above ALLOC_ID_BASE"
+        animus_control::meta::parse_alloc_id(&second_id).is_some(),
+        "minted id {second_id} should be in the allocator's reserved range"
     );
 
     let second_converged = async {

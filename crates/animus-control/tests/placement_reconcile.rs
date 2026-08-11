@@ -21,7 +21,7 @@ use std::time::Duration;
 use animus_control::node::heartbeat_loop;
 use animus_control::raft::ProposeResult;
 use animus_control::{MetaCommand, Metadata, NodeStatus, RaftNode};
-use animus_env::{EnvExt, nid};
+use animus_env::{EnvExt, NodeId, nid};
 use animus_placement::{Candidate, PlacementPolicy, replan, select_replicas};
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::MemoryEngine;
@@ -91,12 +91,12 @@ fn active_candidates(meta: &Metadata) -> Vec<Candidate> {
     meta.members
         .iter()
         .filter(|(_, m)| m.status == NodeStatus::Active)
-        .map(|(id, m)| Candidate::new(*id, m.labels.clone()))
+        .map(|(id, m)| Candidate::new(id.clone(), m.labels.clone()))
         .collect()
 }
 
-fn zone_of(meta: &Metadata, node: u64) -> String {
-    meta.members[&nid(node)].labels["zone"].clone()
+fn zone_of(meta: &Metadata, node: &NodeId) -> String {
+    meta.members[node].labels["zone"].clone()
 }
 
 #[test]
@@ -129,14 +129,12 @@ fn run(seed: u64) {
     let meta = nodes[leader].metadata();
     let replicas = select_replicas(&active_candidates(&meta), &policy).unwrap();
     assert_eq!(replicas.len(), 3);
+    let eu_ids: Vec<_> = (10..=15).map(nid).collect();
     assert!(
-        replicas.iter().all(|n| (10..20).contains(&n.as_u64())),
+        replicas.iter().all(|n| eu_ids.contains(n)),
         "placed outside EU: {replicas:?} (seed={seed})"
     );
-    let mut zones: Vec<String> = replicas
-        .iter()
-        .map(|n| zone_of(&meta, (*n).as_u64()))
-        .collect();
+    let mut zones: Vec<String> = replicas.iter().map(|n| zone_of(&meta, n)).collect();
     zones.sort();
     assert_eq!(
         zones,
@@ -157,15 +155,15 @@ fn run(seed: u64) {
 
     // --- Fault: a placed replica dies, and a control follower crashes. ---
     let current = nodes[leader].metadata().tablets[&TABLET].replicas.clone();
-    let dead = current[0];
-    let dead_zone = zone_of(&nodes[leader].metadata(), (dead).as_u64());
+    let dead = current[0].clone();
+    let dead_zone = zone_of(&nodes[leader].metadata(), &dead);
 
     // Stop its heartbeat too — otherwise the (pre-existing, unchanged) `Down` ->
     // `Active` recovery rule would immediately revert this manual `Down`.
-    sim.crash(dead);
+    sim.crash(dead.clone());
     assert!(matches!(
         nodes[leader].propose(MetaCommand::UpsertMember {
-            node: dead,
+            node: dead.clone(),
             labels: nodes[leader].metadata().members[&dead].labels.clone(),
             status: NodeStatus::Down,
         }),
@@ -224,19 +222,19 @@ fn run(seed: u64) {
             "epoch not bumped (seed={seed})"
         );
         assert!(!placed.contains(&dead));
-        let mut zs: Vec<String> = placed.iter().map(|n| zone_of(&m, (*n).as_u64())).collect();
+        let mut zs: Vec<String> = placed.iter().map(|n| zone_of(&m, n)).collect();
         zs.sort();
         zs.dedup();
         assert_eq!(zs.len(), 3, "spread lost after reconcile (seed={seed})");
         assert!(
-            placed.iter().all(|n| (10..20).contains(&n.as_u64())),
+            placed.iter().all(|n| eu_ids.contains(n)),
             "residency lost (seed={seed})"
         );
     }
     // The replacement came from the dead replica's zone (minimal, like-for-like).
-    let replacement = *new.iter().find(|n| !current.contains(n)).unwrap();
+    let replacement = new.iter().find(|n| !current.contains(n)).unwrap().clone();
     assert_eq!(
-        zone_of(&nodes[leader].metadata(), (replacement).as_u64()),
+        zone_of(&nodes[leader].metadata(), &replacement),
         dead_zone,
         "replacement should reuse the dead replica's zone (seed={seed})"
     );

@@ -44,6 +44,7 @@ fn single_node_config() -> ClusterConfig {
     let a = free_addrs(5);
     ClusterConfig {
         nodes: vec![RoleAddrs {
+            id: animusd::config::node_id(0),
             role: animusd::config::NodeRole::Both,
             internal: a[0],
             client: a[1],
@@ -121,6 +122,7 @@ pub async fn bring_up_deadline(
         let addrs = free_addrs(n * 5);
         let nodes_cfg: Vec<RoleAddrs> = (0..n)
             .map(|i| RoleAddrs {
+                id: animusd::config::node_id(i),
                 role: NodeRole::Both,
                 internal: addrs[5 * i],
                 client: addrs[5 * i + 1],
@@ -176,6 +178,7 @@ pub async fn grow_deadline(
         let mut nodes_cfg = base.nodes.clone();
         for i in 0..extra {
             nodes_cfg.push(RoleAddrs {
+                id: animusd::config::node_id(base_n + i),
                 role: NodeRole::Both,
                 internal: addrs[5 * i],
                 client: addrs[5 * i + 1],
@@ -245,6 +248,7 @@ pub async fn join_fresh_deadline(
     loop {
         let raw = free_addrs(5);
         let addrs = RoleAddrs {
+            id: animusd::config::node_id(index),
             role: NodeRole::Both,
             internal: raw[0],
             client: raw[1],
@@ -253,7 +257,8 @@ pub async fn join_fresh_deadline(
             admin: raw[4],
         };
         let node_dir = dir.join(format!("join-{index}-{attempt}"));
-        match animusd::run_node_join(seeds.to_vec(), index, addrs, &node_dir, backend).await {
+        match animusd::run_node_join(seeds.to_vec(), index, addrs.clone(), &node_dir, backend).await
+        {
             Ok(node) => return (node, addrs, node_dir),
             Err(e) => {
                 assert!(
@@ -282,6 +287,7 @@ pub async fn join_data_fresh_deadline(
     loop {
         let raw = free_addrs(5);
         let addrs = RoleAddrs {
+            id: animusd::config::node_id(index),
             role: NodeRole::Data,
             internal: raw[0],
             client: raw[1],
@@ -322,6 +328,10 @@ pub async fn join_allocated_fresh_deadline(
     loop {
         let raw = free_addrs(5);
         let addrs = RoleAddrs {
+            // Unread placeholder: the real id is minted server-side by
+            // `run_node_join_allocated` (ADR 0036) — never derived from
+            // `addrs.id`.
+            id: animus_env::NodeId::new_unchecked("pending-alloc"),
             role: NodeRole::Both,
             internal: raw[0],
             client: raw[1],
@@ -332,7 +342,7 @@ pub async fn join_allocated_fresh_deadline(
         let node_dir = dir.join(format!("join-alloc-{label}-{attempt}"));
         match animusd::run_node_join_allocated(
             seeds.to_vec(),
-            addrs,
+            addrs.clone(),
             &node_dir,
             backend,
             BTreeMap::new(),
@@ -367,6 +377,8 @@ pub async fn join_data_allocated_fresh_deadline(
     loop {
         let raw = free_addrs(5);
         let addrs = RoleAddrs {
+            // See `join_allocated_fresh_deadline`'s identical placeholder.
+            id: animus_env::NodeId::new_unchecked("pending-alloc"),
             role: NodeRole::Data,
             internal: raw[0],
             client: raw[1],
@@ -422,6 +434,7 @@ pub async fn bring_up_split(
                     NodeRole::Data
                 };
                 RoleAddrs {
+                    id: animusd::config::node_id(i),
                     role,
                     internal: addrs[5 * i],
                     client: addrs[5 * i + 1],

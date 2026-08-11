@@ -92,11 +92,11 @@ fn driver_applied_core_buffers_effects_instead_of_applying_in_core() {
 /// and feeding it one granted vote (its own + node 1 = majority of 3).
 fn elect_sole_leader(group: &[NodeId]) -> KvCore {
     let now = Nanos(1_000_000_000);
-    let mut leader: KvCore = RaftCore::new(group[0], group, Nanos(0), 7);
+    let mut leader: KvCore = RaftCore::new(group[0].clone(), group, Nanos(0), 7);
     let _ = leader.tick(now, 7); // election timeout -> pre-candidate, PreVote
     // A pre-vote grant tips the pre-candidacy into a real, term-bumping election.
     let _ = leader.handle(
-        group[1],
+        group[1].clone(),
         RaftMsg::PreVoteResp {
             term: leader.term() + 1,
             granted: true,
@@ -105,7 +105,7 @@ fn elect_sole_leader(group: &[NodeId]) -> KvCore {
         7,
     );
     let _ = leader.handle(
-        group[1],
+        group[1].clone(),
         RaftMsg::RequestVoteResp {
             term: leader.term(),
             granted: true,
@@ -141,9 +141,9 @@ fn pump_to_follower(
                 if let RaftMsg::InstallSnapshot { total, .. } = &msg {
                     snapshot_totals.push(*total);
                 }
-                next.extend(follower.handle(leader_id, msg, now, 7));
+                next.extend(follower.handle(leader_id.clone(), msg, now, 7));
             } else if to == leader_id {
-                next.extend(leader.handle(follower_id, msg, now, 7));
+                next.extend(leader.handle(follower_id.clone(), msg, now, 7));
             }
             // Messages to any other peer are dropped (that node is absent here).
         }
@@ -170,11 +170,11 @@ fn pump_to_follower(
 /// becomes leader and must ship a non-empty image to a fresh node 2.
 #[test]
 fn caught_up_node_reships_non_empty_snapshot() {
-    const GROUP: [NodeId; 3] = [nid(0), nid(1), nid(2)];
+    let group: [NodeId; 3] = [nid(0), nid(1), nid(2)];
     let now = Nanos(1_000_000_000);
 
     // --- Source leader (node 0): commit some commands, set an engine image, snapshot.
-    let mut src = elect_sole_leader(&GROUP);
+    let mut src = elect_sole_leader(&group);
     for i in 0..5u64 {
         if let ProposeResult::Accepted { index } = src.propose(KvCommand::Put { key: i, value: i })
         {
@@ -208,7 +208,7 @@ fn caught_up_node_reships_non_empty_snapshot() {
     assert!(!image.is_empty());
 
     // --- Node 1 catches up from node 0 via InstallSnapshot.
-    let mut mid: KvCore = RaftCore::new(nid(1), &GROUP, Nanos(0), 7);
+    let mut mid: KvCore = RaftCore::new(nid(1), &group, Nanos(0), 7);
     let hb = Nanos(now.0 + 1_000_000_000); // past the heartbeat deadline
     // First exchange: node 0 backtracks to the compacted prefix, finds no
     // materialized image, sends nothing, and raises the lazy-build request.
@@ -270,7 +270,7 @@ fn caught_up_node_reships_non_empty_snapshot() {
     );
     assert!(mid.is_leader(), "node 1 should have won the re-election");
 
-    let mut fresh: KvCore = RaftCore::new(nid(2), &GROUP, Nanos(0), 7);
+    let mut fresh: KvCore = RaftCore::new(nid(2), &group, Nanos(0), 7);
     // The crux (the second-hop invariant, now in its **lazy** form): node 1 only
     // ever obtained its state via an install and retains no image bytes in the
     // core — it must *request a regeneration* rather than ship a 0-byte image

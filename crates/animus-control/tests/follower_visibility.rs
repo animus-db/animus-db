@@ -29,7 +29,9 @@ use animus_env::{Nanos, NodeId, nid};
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::MemoryEngine;
 
-const NODES: [NodeId; 3] = [nid(0), nid(1), nid(2)];
+fn member_ids() -> [NodeId; 3] {
+    [nid(0), nid(1), nid(2)]
+}
 
 fn upsert(node: u64) -> MetaCommand {
     MetaCommand::UpsertMember {
@@ -59,7 +61,7 @@ fn drained_contains_member(core: &mut RaftCore, node: u64) -> bool {
 #[test]
 fn follower_applies_on_commit_without_its_own_fsync() {
     // A follower in term 1 that has not fsynced anything (durable_index == 0).
-    let mut follower = RaftCore::new(nid(0), &NODES, Nanos(0), 7);
+    let mut follower = RaftCore::new(nid(0), &member_ids(), Nanos(0), 7);
     assert_eq!(follower.role(), Role::Follower);
     assert_eq!(follower.durable_index(), 0, "nothing fsynced yet");
 
@@ -146,7 +148,7 @@ fn leader_stays_durability_gated_on_its_own_proposal() {
 /// moves forward across the role change.
 #[test]
 fn follower_to_leader_keeps_applied_then_gates_new_proposals() {
-    let mut node = RaftCore::new(nid(0), &NODES, Nanos(0), 7);
+    let mut node = RaftCore::new(nid(0), &member_ids(), Nanos(0), 7);
 
     // As a follower, learn + commit an entry without any local fsync.
     node.handle(
@@ -224,9 +226,15 @@ fn follower_to_leader_keeps_applied_then_gates_new_proposals() {
 
 fn cluster(seed: u64) -> (Simulator, Vec<RaftNode<SimEnv>>) {
     let sim = Simulator::new(seed);
-    let nodes = NODES
+    let nodes = member_ids()
         .iter()
-        .map(|&id| RaftNode::start(sim.env(id), NODES.to_vec(), MemoryEngine::new()))
+        .map(|id| {
+            RaftNode::start(
+                sim.env(id.clone()),
+                member_ids().to_vec(),
+                MemoryEngine::new(),
+            )
+        })
         .collect();
     (sim, nodes)
 }

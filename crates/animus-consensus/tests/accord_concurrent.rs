@@ -116,8 +116,11 @@ async fn concurrent_conflicting_coordinators_do_not_deadlock() {
     // Liveness: every replica executes all three transactions, within a bound.
     let live = {
         let nodes = nodes.clone();
+        let txns_for_poll = txns.clone();
         poll_until(Duration::from_secs(30), move || {
-            nodes.iter().all(|n| txns.iter().all(|&t| n.is_applied(t)))
+            nodes
+                .iter()
+                .all(|n| txns_for_poll.iter().all(|t| n.is_applied(t.clone())))
         })
         .await
     };
@@ -207,8 +210,11 @@ async fn many_concurrent_rounds_make_progress() {
         // Drive the round to completion on every replica before the next.
         let live = {
             let nodes = nodes.clone();
+            let txns_for_poll = txns.clone();
             poll_until(Duration::from_secs(30), move || {
-                nodes.iter().all(|n| txns.iter().all(|&t| n.is_applied(t)))
+                nodes
+                    .iter()
+                    .all(|n| txns_for_poll.iter().all(|t| n.is_applied(t.clone())))
             })
             .await
         };

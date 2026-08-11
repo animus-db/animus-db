@@ -63,7 +63,7 @@ fn unique_leader(nodes: &[RaftNode<SimEnv>], live: &[usize], seed: u64) -> usize
 }
 
 fn set(ids: &[u64]) -> BTreeSet<u64> {
-    ids.iter().copied().collect()
+    ids.iter().cloned().collect()
 }
 
 /// A plain metadata write used only to generate/observe log churn (mirrors

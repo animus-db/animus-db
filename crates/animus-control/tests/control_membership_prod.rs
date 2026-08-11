@@ -191,13 +191,13 @@ async fn grow_three_to_five_under_real_time_stays_live() {
                 leaders.len() <= 1,
                 "more than one node believes itself leader at once: {leaders:?}"
             );
-            if let Some(&current) = leaders.first()
-                && last_leader != Some(current)
+            if let Some(current) = leaders.first()
+                && last_leader.as_ref() != Some(current)
             {
                 if last_leader.is_some() {
                     transitions += 1;
                 }
-                last_leader = Some(current);
+                last_leader = Some(current.clone());
             }
             sleep(Duration::from_millis(100)).await;
         }

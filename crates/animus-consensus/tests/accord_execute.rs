@@ -41,11 +41,11 @@ fn keys(ks: &[Key]) -> BTreeSet<Key> {
 
 /// Filter a replica's full applied order down to just `(a, b)`, giving the
 /// relative execution order of the two transactions of interest.
-fn relative_order(applied: &[TxnId], a: TxnId, b: TxnId) -> Vec<TxnId> {
+fn relative_order(applied: &[TxnId], a: &TxnId, b: &TxnId) -> Vec<TxnId> {
     applied
         .iter()
-        .copied()
-        .filter(|&t| t == a || t == b)
+        .filter(|t| *t == a || *t == b)
+        .cloned()
         .collect()
 }
 
@@ -64,20 +64,20 @@ fn conflicting_transactions_execute_in_consistent_order() {
     // Both executed on every replica.
     for (i, n) in nodes.iter().enumerate() {
         assert!(
-            n.is_applied(a) && n.is_applied(b),
+            n.is_applied(a.clone()) && n.is_applied(b.clone()),
             "node {i} did not execute both txns (seed={seed})"
         );
     }
 
     // Every replica executed them in the same relative order.
-    let order0 = relative_order(&nodes[0].applied_order(), a, b);
+    let order0 = relative_order(&nodes[0].applied_order(), &a, &b);
     assert_eq!(
         order0.len(),
         2,
         "both must appear in the order (seed={seed})"
     );
     for (i, n) in nodes.iter().enumerate() {
-        let order = relative_order(&n.applied_order(), a, b);
+        let order = relative_order(&n.applied_order(), &a, &b);
         assert_eq!(
             order, order0,
             "node {i} executed conflicting txns in a different order (seed={seed})"
@@ -86,11 +86,11 @@ fn conflicting_transactions_execute_in_consistent_order() {
 
     // The shared key's last writer is the transaction executed *second* — and it
     // is identical on every replica (the executed store converged).
-    let last = *order0.last().unwrap();
+    let last = order0.last().unwrap().clone();
     for (i, n) in nodes.iter().enumerate() {
         assert_eq!(
             store_writer(n, 7),
-            Some(last),
+            Some(last.clone()),
             "node {i} store diverged on the shared key (seed={seed})"
         );
     }
@@ -108,23 +108,24 @@ fn execution_order_consistent_across_seeds() {
         sim.run_for(Duration::from_secs(5));
 
         let reference = nodes[0].applied_order();
+        let group = [a.clone(), b.clone(), c.clone()];
         for (i, n) in nodes.iter().enumerate() {
-            for &t in &[a, b, c] {
+            for t in &group {
                 assert!(
-                    n.is_applied(t),
+                    n.is_applied(t.clone()),
                     "node {i} missing an execution (seed={seed})"
                 );
             }
             // Restricted to the three conflicting txns, the order is identical.
             let mut want: Vec<TxnId> = reference
                 .iter()
-                .copied()
-                .filter(|t| [a, b, c].contains(t))
+                .filter(|t| group.contains(t))
+                .cloned()
                 .collect();
             let got: Vec<TxnId> = n
                 .applied_order()
                 .into_iter()
-                .filter(|t| [a, b, c].contains(t))
+                .filter(|t| group.contains(t))
                 .collect();
             want.dedup();
             assert_eq!(got, want, "node {i} execution order diverged (seed={seed})");
@@ -155,11 +156,11 @@ fn replica_recovers_executed_state_from_disk() {
     sim.run_for(Duration::from_secs(3));
 
     // Capture node 2's executed view before the restart.
-    let before_order = relative_order(&nodes[2].applied_order(), a, b);
+    let before_order = relative_order(&nodes[2].applied_order(), &a, &b);
     let before_writer = store_writer(&nodes[2], 3);
     assert_eq!(before_order.len(), 2, "node 2 executed both (seed={seed})");
     assert!(before_writer.is_some());
-    assert!(nodes[2].is_applied(a) && nodes[2].is_applied(b));
+    assert!(nodes[2].is_applied(a.clone()) && nodes[2].is_applied(b.clone()));
 
     // Stop node 2's process: tasks + volatile state die; the WAL on disk stays.
     sim.stop(nid(2));
@@ -170,11 +171,11 @@ fn replica_recovers_executed_state_from_disk() {
 
     // It recovered both transactions, their execution order, and the store.
     assert!(
-        nodes[2].is_applied(a) && nodes[2].is_applied(b),
+        nodes[2].is_applied(a.clone()) && nodes[2].is_applied(b.clone()),
         "recovered node lost an executed txn (seed={seed})"
     );
     assert_eq!(
-        relative_order(&nodes[2].applied_order(), a, b),
+        relative_order(&nodes[2].applied_order(), &a, &b),
         before_order,
         "recovered node lost its execution order (seed={seed})"
     );

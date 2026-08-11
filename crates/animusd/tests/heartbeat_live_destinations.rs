@@ -99,12 +99,13 @@ async fn add_control_member(
     node: u64,
     addr: SocketAddr,
 ) -> (u16, serde_json::Value) {
-    let body = serde_json::json!({"node": node, "addr": addr.to_string()}).to_string();
+    let body =
+        serde_json::json!({"node": nid(node).to_string(), "addr": addr.to_string()}).to_string();
     admin(admin_addr, "POST", "/admin/control/member/add", Some(&body)).await
 }
 
 async fn remove_control_member(admin_addr: SocketAddr, node: u64) -> (u16, serde_json::Value) {
-    let body = serde_json::json!({"node": node}).to_string();
+    let body = serde_json::json!({"node": nid(node).to_string()}).to_string();
     admin(
         admin_addr,
         "POST",
@@ -114,10 +115,12 @@ async fn remove_control_member(admin_addr: SocketAddr, node: u64) -> (u16, serde
     .await
 }
 
-fn voters_of(body: &serde_json::Value) -> Option<Vec<u64>> {
-    body["voters"]
-        .as_array()
-        .map(|a| a.iter().filter_map(serde_json::Value::as_u64).collect())
+fn voters_of(body: &serde_json::Value) -> Option<Vec<String>> {
+    body["voters"].as_array().map(|a| {
+        a.iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect()
+    })
 }
 
 /// Whether `GET /admin/raft` on `admin_addr` currently reports `node` alive.
@@ -126,12 +129,13 @@ async fn believes_alive(admin_addr: SocketAddr, node: u64) -> bool {
     if status != 200 {
         return false;
     }
+    let want = nid(node).to_string();
     body["members"]
         .as_array()
         .and_then(|members| {
             members
                 .iter()
-                .find(|m| m["node"].as_u64() == Some(node))
+                .find(|m| m["node"].as_str() == Some(want.as_str()))
                 .and_then(|m| m["believes_alive"].as_bool())
         })
         .unwrap_or(false)
@@ -148,6 +152,7 @@ async fn join_control_nonvoter(
     for attempt in 0..16 {
         let raw = support::free_addrs(5);
         let addrs = RoleAddrs {
+            id: nid(new_control_id),
             role: NodeRole::Control,
             internal: raw[0],
             client: raw[1],
@@ -157,7 +162,7 @@ async fn join_control_nonvoter(
         };
         let bound = match animusd::Node::bind_control(
             nid(new_control_id),
-            addrs,
+            addrs.clone(),
             dir.join(format!("grow-{attempt}")),
         )
         .await
@@ -250,7 +255,9 @@ async fn heartbeat_reaches_a_runtime_added_voter_after_it_becomes_leader() {
         let converged = async {
             loop {
                 let (status, body) = control_members(a).await;
-                if status == 200 && voters_of(&body) == Some(vec![0, 1]) {
+                if status == 200
+                    && voters_of(&body) == Some(vec!["n0".to_string(), "n1".to_string()])
+                {
                     return;
                 }
                 sleep(Duration::from_millis(100)).await;
@@ -289,7 +296,10 @@ async fn heartbeat_reaches_a_runtime_added_voter_after_it_becomes_leader() {
     // The config is unaffected by the transfer alone — still both voters.
     let (status, body) = control_members(grown_admin).await;
     assert_eq!(status, 200, "control/members failed: {body}");
-    assert_eq!(voters_of(&body), Some(vec![0, 1]));
+    assert_eq!(
+        voters_of(&body),
+        Some(vec!["n0".to_string(), "n1".to_string()])
+    );
 
     // Step 4: the real proof. Poll the new leader's own `/admin/raft` view
     // for `believes_alive: true` against node 0's raftkv id, and require it
@@ -300,7 +310,7 @@ async fn heartbeat_reaches_a_runtime_added_voter_after_it_becomes_leader() {
     // control-address merge into the raftkv env's own peer book).
     timeout(Duration::from_secs(20), async {
         loop {
-            if believes_alive(grown_admin, (node0_raftkv_id).as_u64()).await {
+            if believes_alive(grown_admin, 0).await {
                 return;
             }
             sleep(Duration::from_millis(100)).await;
@@ -318,7 +328,7 @@ async fn heartbeat_reaches_a_runtime_added_voter_after_it_becomes_leader() {
     let sustained_deadline = tokio::time::Instant::now() + Duration::from_millis(1_700);
     while tokio::time::Instant::now() < sustained_deadline {
         assert!(
-            believes_alive(grown_admin, (node0_raftkv_id).as_u64()).await,
+            believes_alive(grown_admin, 0).await,
             "node 0's heartbeats stopped reaching the runtime-added leader partway through \
              the sustained-liveness window"
         );

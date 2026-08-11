@@ -3072,6 +3072,68 @@ debugging anything that feels like it might have happened before.
   nonsensical type error) rather than silently. (ADR 0040 PR2, `animus-env`
   `NodeId` newtype sweep — corruption found and fixed in `animus-sim`,
   `animus-consensus`, `animus-cp-data`, and `animus-control` test files.)
+- **A `NodeId` representation change (`u64` → a validated string) breaks tests
+  that hardcode its *rendering*, not just its *type* — and these compile
+  clean, so only a green-then-red gate catches them.** ADR 0040 PR3 changed
+  `NodeId`'s `Display` from a bare integer (`"0"`) to `"n0"`/an
+  operator-proposed string/an allocator-minted `"alloc-…"`. Two distinct
+  failure shapes, neither a compile error: (1) `accord_backoff.rs`'s
+  `sends_from` helper built its trace-grep needle as
+  `format!("SEND {from}->")` with `from: u64` interpolated bare (`"SEND
+  0->"`), but the actual trace line now renders `"SEND n0->n1"` — the needle
+  silently matched **zero** lines forever, so a `sends >= 4` liveness
+  assertion failed at its *frozen, fixed* seed on every run, not
+  intermittently. Fix: build the needle from the same `NodeId` the trace
+  formatter uses (`format!("SEND {}->", nid(from))`), never re-derive a
+  numeric-looking string independently. (2) A test asserting an
+  allocator-minted id "never collides with a small manual id" via `first >
+  nid(302)` silently flipped from true to false: `"alloc-1000000"` sorts
+  *before* `"n302"` lexicographically (`'a' < 'n'`), even though the ids are
+  genuinely disjoint by their reserved-prefix *namespace*. **General rule:
+  after any type whose `Display`/`Ord` semantics change from "numeric
+  magnitude" to "opaque string," grep every test for `format!` needles built
+  from the raw numeric seed instead of the real formatted value, and for
+  `<`/`>`/`>=`/`<=` comparisons that encode a magnitude assumption — both
+  compile fine and fail (or silently stop testing anything) only at
+  execution.** (`animus-consensus/tests/accord_backoff.rs`,
+  `animus-control/src/meta.rs::allocate_node_id_is_monotonic_and_disjoint_
+  from_small_manual_ids`, ADR 0040 PR3.)
+- **A lowercase, single-letter-plus-parens test helper name (`fn c() -> T`)
+  can collide with an equally-terse, ubiquitous local variable of a
+  completely different type, and the resulting error reads as a type
+  mismatch far from the real cause.** Renaming a PR2-era `const C: NodeId`
+  (uppercase, never shadows anything) to a PR3-era `fn c() -> NodeId`
+  (lowercase, matching this codebase's `nid`-helper convention) collided with
+  `reconciler_corpus.rs`'s own near-universal `let mut c = Cluster::new(sim);`
+  scenario-harness variable — every `c()` call after that point parsed as
+  "call the local `Cluster` value named `c`," not the function, producing
+  "expected function, found `Cluster`" at a dozen unrelated-looking call
+  sites. **General rule: when a mechanical rename turns a `const` into a
+  `fn`, or otherwise introduces a new lowercase short binding, grep the
+  target file(s) for that exact identifier already in use as a *local
+  variable* before trusting the rename is safe** — a real type-level
+  namespace (`const`/`static`/type-level items don't shadow local `let`
+  bindings the same way a same-named `fn` at module scope does once called
+  with `()`) doesn't protect against this once the item becomes callable.
+  Fixed by renaming the function to a distinct name (`node_c`) instead of
+  chasing every shadowing call site. (`animus-cp-data/tests/
+  reconciler_corpus.rs`, ADR 0040 PR3.)
+- **Loosening a parsed type's charset can silently turn a test's "garbled,
+  must-be-rejected" fixture into a now-valid value the parser accepts.**
+  `animusd::topology::parse_not_leader_refusal`'s garbled-hint-suffix test
+  used `"notanumber"` as its not-a-real-id fixture — correct while `NodeId`
+  parsed as `u64` (that string could never parse), silently wrong once ADR
+  0040 PR3 gave `NodeId` a permissive `[A-Za-z0-9._-]{1,64}` charset:
+  `"notanumber"` is now syntactically a perfectly valid id, so the parse
+  that was supposed to fail-and-fall-back to "no hint" instead succeeded,
+  and the test failed asserting the old ("garbled") outcome against the new
+  (correct) one. Fix: use a fixture with a character truly outside the new
+  charset (a space), not a string that merely *used to* fail a stricter
+  parse. **General rule: when a validated type's accepted-charset widens,
+  grep tests for "deliberately invalid" string literals used as negative
+  fixtures — a literal that was invalid only by the old, narrower rule
+  needs replacing, not just recompiling.** (`animusd/src/topology.rs::
+  not_leader_refusal_tolerates_a_garbled_hint_suffix`, ADR 0040 PR3.)
 
 ### Parallel-agent orchestration
 - **Partition work by disjoint crate ownership — exactly one owner per shared

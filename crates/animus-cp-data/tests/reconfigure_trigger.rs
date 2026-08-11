@@ -80,6 +80,17 @@ fn set(ids: &[u64]) -> BTreeSet<NodeId> {
     ids.iter().copied().map(nid).collect()
 }
 
+/// The numeric test index backing a `nid(n)`-formatted `"n{n}"` string id —
+/// the inverse of `set`/`nid`, needed to look a `NodeId` back up in this
+/// file's `group: BTreeMap<u64, KvNode>` (keyed by the raw test index, not
+/// the `NodeId` itself).
+fn idx(id: &NodeId) -> u64 {
+    id.as_str()
+        .trim_start_matches('n')
+        .parse()
+        .expect("test node ids are nid(n)-formatted")
+}
+
 /// The control leader index, asserting exactly one among `0..3`.
 fn control_leader(nodes: &[RaftNode<SimEnv>]) -> usize {
     let ls: Vec<usize> = (0..nodes.len()).filter(|&i| nodes[i].is_leader()).collect();
@@ -172,7 +183,7 @@ fn run(seed: u64) {
     // control plane's replicated desired replica set for this tablet and step the
     // local group config toward it. Read committed metadata off a control replica
     // (a follower's `metadata()` is committed state). ---
-    for (&_id, node) in &group {
+    for node in group.values() {
         let ctrl = control[0].clone();
         let ctrl_down = control[0].clone();
         node.spawn_reconfigure_loop(
@@ -181,7 +192,7 @@ fn run(seed: u64) {
                 ctrl.metadata()
                     .tablets
                     .get(&TABLET)
-                    .map(|t| t.replicas.iter().copied().collect())
+                    .map(|t| t.replicas.iter().cloned().collect())
             },
             move || {
                 ctrl_down
@@ -189,7 +200,7 @@ fn run(seed: u64) {
                     .members
                     .iter()
                     .filter(|(_, m)| m.status == NodeStatus::Down)
-                    .map(|(id, _)| *id)
+                    .map(|(id, _)| id.clone())
                     .collect()
             },
         );
@@ -263,7 +274,7 @@ fn run(seed: u64) {
             .metadata()
             .tablets
             .get(&TABLET)
-            .map(|t| t.replicas.iter().copied().collect())
+            .map(|t| t.replicas.iter().cloned().collect())
             .unwrap_or_default();
         let cfg_ok = live
             .iter()
@@ -305,9 +316,9 @@ fn run(seed: u64) {
         ProposeResult::Accepted { .. }
     ));
     sim.run_for(Duration::from_secs(2));
-    for &id in &desired {
+    for id in &desired {
         assert_eq!(
-            block_on(group[&id.as_u64()].local_get(b"k2")),
+            block_on(group[&idx(id)].local_get(b"k2")),
             Some(b"v2".to_vec()),
             "node {id} (incl. the added spare) missing the post-reconfigure write (seed={seed})"
         );
@@ -354,7 +365,7 @@ fn auto_reconfigure_is_reproducible_from_seed() {
                 MemoryEngine::new(),
             ),
         );
-        for (&_id, node) in &group {
+        for node in group.values() {
             let ctrl = control[0].clone();
             let ctrl_down = control[0].clone();
             node.spawn_reconfigure_loop(
@@ -363,7 +374,7 @@ fn auto_reconfigure_is_reproducible_from_seed() {
                     ctrl.metadata()
                         .tablets
                         .get(&TABLET)
-                        .map(|t| t.replicas.iter().copied().collect())
+                        .map(|t| t.replicas.iter().cloned().collect())
                 },
                 move || {
                     ctrl_down
@@ -371,7 +382,7 @@ fn auto_reconfigure_is_reproducible_from_seed() {
                         .members
                         .iter()
                         .filter(|(_, m)| m.status == NodeStatus::Down)
-                        .map(|(id, _)| *id)
+                        .map(|(id, _)| id.clone())
                         .collect()
                 },
             );

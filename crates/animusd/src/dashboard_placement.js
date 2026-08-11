@@ -30,7 +30,9 @@ function renderPlacement() {
   const tablets = (status && status.tablets) || {};
   const groups = cpGroupsByTablet();
   const members = (status && status.members) || {};
-  const memberIds = Object.keys(members).map(Number).sort((a, b) => a - b);
+  // ADR 0040 PR3: node ids are strings now — see `dashboard_overview.js`'s
+  // identical comment for why a numeric sort/coercion would break here.
+  const memberIds = Object.keys(members).sort();
 
   $("pl-summary").textContent = `${memberIds.length} node(s) · ${Object.keys(tablets).length} tablet(s)`;
 
@@ -60,7 +62,7 @@ function renderPlacement() {
 
   document.querySelectorAll(".placement-card").forEach((el) =>
     el.addEventListener("click", () => {
-      const id = Number(el.dataset.node);
+      const id = el.dataset.node;
       placementSelectedNode = placementSelectedNode === id ? null : id;
       renderPlacement();
     }));

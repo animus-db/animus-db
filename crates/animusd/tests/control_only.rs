@@ -59,6 +59,7 @@ async fn bring_up_control(n: usize, dir: &std::path::Path) -> (Vec<Node>, animus
         let addrs = free_addrs(n * 5);
         let nodes_cfg: Vec<animusd::RoleAddrs> = (0..n)
             .map(|i| animusd::RoleAddrs {
+                id: animusd::config::node_id(i),
                 role: animusd::config::NodeRole::Control,
                 internal: addrs[5 * i],
                 client: addrs[5 * i + 1],
@@ -355,7 +356,7 @@ async fn force_active(nodes: &[Node], id: animus_env::NodeId) {
             }
             for n in nodes {
                 let _ = n.propose_meta(MetaCommand::UpsertMember {
-                    node: id,
+                    node: id.clone(),
                     labels: BTreeMap::new(),
                     status: NodeStatus::Active,
                 });
@@ -384,6 +385,7 @@ async fn mixed_cluster_put_via_control_node_forwards_to_data_node() {
             let addrs = free_addrs(4 * 5);
             let mut nodes_cfg: Vec<animusd::RoleAddrs> = (0..3)
                 .map(|i| animusd::RoleAddrs {
+                    id: animusd::config::node_id(i),
                     role: animusd::config::NodeRole::Control,
                     internal: addrs[5 * i],
                     client: addrs[5 * i + 1],
@@ -393,6 +395,7 @@ async fn mixed_cluster_put_via_control_node_forwards_to_data_node() {
                 })
                 .collect();
             nodes_cfg.push(animusd::RoleAddrs {
+                id: animusd::config::node_id(3),
                 role: animusd::config::NodeRole::Both,
                 internal: addrs[15],
                 client: addrs[16],

@@ -94,7 +94,7 @@ async fn propose_and_await(node: &Node, client_addr: SocketAddr, command: MetaCo
     let MetaCommand::UpsertMember { node: id, .. } = &command else {
         panic!("test only proposes UpsertMember");
     };
-    let id = *id;
+    let id = id.clone();
     timeout(Duration::from_secs(10), async {
         loop {
             if node.metadata().members.contains_key(&id) {
@@ -131,6 +131,7 @@ async fn control_only_mirror_engine_survives_a_real_process_restart() {
     let dir = TempDir::new().unwrap();
     let node_dir = dir.path().join("node-0");
     let addrs = animusd::RoleAddrs {
+        id: nid(0),
         role: animusd::config::NodeRole::Control,
         internal: free_addr(),
         client: free_addr(),
@@ -140,7 +141,7 @@ async fn control_only_mirror_engine_survives_a_real_process_restart() {
     };
 
     // --- First incarnation: propose a few commands, then shut down cleanly. ---
-    let node = start(addrs, &node_dir).await;
+    let node = start(addrs.clone(), &node_dir).await;
     await_leader(&node).await;
     for id in 0..3 {
         propose_and_await(&node, addrs.client, upsert(nid(id), NodeStatus::Down)).await;
@@ -158,7 +159,7 @@ async fn control_only_mirror_engine_survives_a_real_process_restart() {
     );
 
     // --- Second incarnation: same directory, same addresses. ---
-    let node = start(addrs, &node_dir).await;
+    let node = start(addrs.clone(), &node_dir).await;
     await_leader(&node).await;
     // The restarted node recovers its 3 pre-restart members from its own
     // control WAL (independent of the mirror) before we drive anything new
@@ -214,6 +215,7 @@ async fn control_only_schema_and_tablet_map_survive_a_hard_restart() {
     let dir = TempDir::new().unwrap();
     let node_dir = dir.path().join("node-0");
     let addrs = animusd::RoleAddrs {
+        id: nid(0),
         role: animusd::config::NodeRole::Control,
         internal: free_addr(),
         client: free_addr(),
@@ -227,7 +229,7 @@ async fn control_only_schema_and_tablet_map_survive_a_hard_restart() {
 
     // --- First incarnation: propose membership + schema + a tablet, then a
     // hard (non-graceful) shutdown. ---
-    let node = start(addrs, &node_dir).await;
+    let node = start(addrs.clone(), &node_dir).await;
     await_leader(&node).await;
     propose_and_await(&node, addrs.client, upsert(nid(7), NodeStatus::Down)).await;
 
@@ -296,7 +298,7 @@ async fn control_only_schema_and_tablet_map_survive_a_hard_restart() {
     // --- Second incarnation: same directory, same addresses — the DEDICATED
     // system-keyspace engine path (a control-only node has no separate
     // `raftkv` engine to fall back on). ---
-    let node = start(addrs, &node_dir).await;
+    let node = start(addrs.clone(), &node_dir).await;
     await_leader(&node).await;
     timeout(Duration::from_secs(10), async {
         loop {

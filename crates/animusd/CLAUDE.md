@@ -32,12 +32,22 @@ can't reach: `split_fence_tests` (lib.rs:6452) and `auto_split_median_tests`
 - **`main.rs`** — thin CLI wrapper; dispatches the invocation modes (below) and
   wires `otel::init_tracing` + the Ctrl-C graceful-shutdown path.
 - **`config.rs`** — `ClusterConfig` (per-process deployment config), `RoleAddrs`
-  (a node's five addresses + `role: NodeRole` = `Control`/`Data`/`Both`),
-  role-filtered accessors (`control_ids`/`data_ids`/`peer_book`),
-  `generate`/`generate_split`, and the **five-port stride** (`base_port +
-  5*i + {internal,client,dynamo,cql,admin}`; node id = `i` — ADR 0040 PR1
-  merged the pre-existing `control i` / `raftkv 300+i` pair into one
-  identity per node).
+  (a node's five addresses + `role: NodeRole` = `Control`/`Data`/`Both` +,
+  since ADR 0040 PR3, an explicit **`id: NodeId`** field — every config entry
+  now names its own identity rather than it being purely re-derived from
+  position; `ClusterConfig::from_json` hard-errors on a duplicate `id`
+  across entries), role-filtered accessors (`control_ids`/`data_ids`/
+  `peer_book`, which read each entry's own `id` field, not an index
+  re-derivation), `generate`/`generate_split`, and the **five-port stride**
+  (`base_port + 5*i + {internal,client,dynamo,cql,admin}`). `generate`/
+  `generate_split` mint `"n{i}"` (`config::node_id(i)`, still the
+  free-function convention `nid(u64)` mirrors for tests), **zero-padded**
+  once the cluster has ≥ 10 nodes (`minted_id`) so lexicographic id order
+  stays == numeric index order (`"n10" < "n2"` otherwise) — below that
+  threshold ids stay the plain unpadded `"n{i}"` every existing test already
+  assumes. ADR 0040 PR1 merged the pre-existing `control i` / `raftkv 300+i`
+  pair into one identity per node; PR3 made that identity a validated
+  string, not a `u64`.
 - **`control_handle.rs`** — the `ControlHandle` seam (ADR 0035 PR1):
   `Local(RaftNode<ProdEnv>)` for a node with real control Raft, vs.
   `Remote(RemoteControlClient)` for a data-only node reaching a separate control

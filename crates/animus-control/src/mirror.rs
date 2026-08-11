@@ -157,7 +157,7 @@ pub fn apply_and_derive_mirror(
             // explicitly so this match stays exhaustive without a wildcard.
         }
         MetaCommand::UpsertMember { node, .. } => {
-            writes.push(put_json(syskv::member_key(*node), &meta.members[node]));
+            writes.push(put_json(syskv::member_key(node), &meta.members[node]));
         }
         MetaCommand::CreateTablet { tablet, .. } => {
             writes.push(put_json(syskv::tablet_key(*tablet), &meta.tablets[tablet]));
@@ -180,7 +180,7 @@ pub fn apply_and_derive_mirror(
             writes.push(KeyWrite::Delete(syskv::policy_key(*right)));
             writes.push(KeyWrite::Put(syskv::merged_key(*right), Vec::new()));
             for id in dead_cp_member_ids(&pre_cp_member_tablets, meta) {
-                writes.push(KeyWrite::Delete(syskv::cp_member_addr_key(id)));
+                writes.push(KeyWrite::Delete(syskv::cp_member_addr_key(&id)));
             }
         }
         MetaCommand::SetTabletPolicy { tablet, policy } => match policy {
@@ -202,7 +202,7 @@ pub fn apply_and_derive_mirror(
                 writes.push(KeyWrite::Delete(syskv::policy_key(*id)));
             }
             for id in dead_cp_member_ids(&pre_cp_member_tablets, meta) {
-                writes.push(KeyWrite::Delete(syskv::cp_member_addr_key(id)));
+                writes.push(KeyWrite::Delete(syskv::cp_member_addr_key(&id)));
             }
         }
         MetaCommand::CreateTableIndex { table, .. }
@@ -223,30 +223,27 @@ pub fn apply_and_derive_mirror(
                 addr: addr.clone(),
                 tablet: *tablet,
             };
-            writes.push(put_json(syskv::cp_member_addr_key(*id), &entry));
+            writes.push(put_json(syskv::cp_member_addr_key(id), &entry));
         }
         MetaCommand::RegisterNodeAddrs { node, addrs } => {
-            writes.push(put_json(syskv::node_addrs_key(*node), addrs));
+            writes.push(put_json(syskv::node_addrs_key(node), addrs));
         }
         MetaCommand::RemoveMember { node } => {
-            writes.push(KeyWrite::Delete(syskv::member_key(*node)));
-            writes.push(KeyWrite::Delete(syskv::node_addrs_key(*node)));
-            writes.push(KeyWrite::Delete(syskv::cp_member_addr_key(*node)));
+            writes.push(KeyWrite::Delete(syskv::member_key(node)));
+            writes.push(KeyWrite::Delete(syskv::node_addrs_key(node)));
+            writes.push(KeyWrite::Delete(syskv::cp_member_addr_key(node)));
         }
         MetaCommand::AllocateNodeId { nonce, .. } => {
-            let node_id = meta.node_id_allocations[nonce];
+            let node_id = meta.node_id_allocations[nonce].clone();
             writes.push(put_json(
-                syskv::member_key(node_id),
+                syskv::member_key(&node_id),
                 &meta.members[&node_id],
             ));
             writes.push(KeyWrite::Put(
                 syskv::node_id_alloc_key(nonce),
-                node_id.as_u64().to_be_bytes().to_vec(),
+                node_id.as_str().as_bytes().to_vec(),
             ));
-            writes.push(put_counter(
-                NEXT_ALLOC_ID_COUNTER,
-                meta.next_alloc_id.as_u64(),
-            ));
+            writes.push(put_counter(NEXT_ALLOC_ID_COUNTER, meta.next_alloc_id));
         }
     }
     (outcome, writes)
@@ -261,7 +258,7 @@ pub fn apply_and_derive_mirror(
 fn dead_cp_member_ids(pre: &BTreeMap<NodeId, TabletId>, meta: &Metadata) -> Vec<NodeId> {
     pre.iter()
         .filter(|(_, tablet)| !meta.tablets.contains_key(tablet))
-        .map(|(&id, _)| id)
+        .map(|(id, _)| id.clone())
         .collect()
 }
 
@@ -289,6 +286,19 @@ fn decode_u64(bytes: &[u8]) -> u64 {
         .try_into()
         .expect("system-keyspace u64 value is exactly 8 bytes");
     u64::from_be_bytes(array)
+}
+
+/// Decode a [`NodeId`]'s raw UTF-8 bytes (ADR 0040 PR3: a node id's key/value
+/// bytes are its raw string bytes, not an 8-byte big-endian `u64` — see
+/// `syskv::member_key`'s doc). Bypasses [`NodeId::propose`]'s charset
+/// validation via [`NodeId::new_unchecked`] — this id was already validated
+/// once at whatever intake boundary first proposed it; this is a trusted,
+/// already-replicated round-trip, not fresh untrusted input. Panics on
+/// non-UTF-8 bytes — this module never writes anything else at a node-id
+/// key, so that would be an internal bug.
+fn decode_node_id(bytes: Vec<u8>) -> NodeId {
+    let s = String::from_utf8(bytes).expect("system-keyspace node id is UTF-8");
+    NodeId::new_unchecked(s)
 }
 
 /// Rebuild a [`Metadata`] purely from a [`StorageEngine`]'s live system
@@ -352,7 +362,7 @@ fn apply_put(meta: &mut Metadata, key: &[u8], value: &[u8]) {
         EntityKind::Member => {
             let member: Member =
                 serde_json::from_slice(value).expect("mirrored member value decodes");
-            meta.members.insert(NodeId::new(decode_u64(&id)), member);
+            meta.members.insert(decode_node_id(id), member);
         }
         EntityKind::Schema => {
             let name = String::from_utf8(id).expect("schema id is UTF-8");
@@ -368,7 +378,7 @@ fn apply_put(meta: &mut Metadata, key: &[u8], value: &[u8]) {
         EntityKind::NodeAddrs => {
             let addrs: NodeAddrs =
                 serde_json::from_slice(value).expect("mirrored node-addrs value decodes");
-            meta.node_addrs.insert(NodeId::new(decode_u64(&id)), addrs);
+            meta.node_addrs.insert(decode_node_id(id), addrs);
         }
         EntityKind::Keyspace => {
             let name = String::from_utf8(id).expect("keyspace id is UTF-8");
@@ -382,14 +392,14 @@ fn apply_put(meta: &mut Metadata, key: &[u8], value: &[u8]) {
             if id == NEXT_TABLET_ID_COUNTER.as_bytes() {
                 meta.next_tablet_id = value;
             } else if id == NEXT_ALLOC_ID_COUNTER.as_bytes() {
-                meta.next_alloc_id = NodeId::new(value);
+                meta.next_alloc_id = value;
             }
         }
         EntityKind::CpMemberAddr => {
-            let node = NodeId::new(decode_u64(&id));
+            let node = decode_node_id(id);
             let entry: CpMemberAddrEntry =
                 serde_json::from_slice(value).expect("mirrored cp-member-addr value decodes");
-            meta.cp_member_addrs.insert(node, entry.addr);
+            meta.cp_member_addrs.insert(node.clone(), entry.addr);
             if let Some(tablet) = entry.tablet {
                 meta.cp_member_tablets.insert(node, tablet);
             }
@@ -397,7 +407,7 @@ fn apply_put(meta: &mut Metadata, key: &[u8], value: &[u8]) {
         EntityKind::NodeIdAlloc => {
             let nonce = String::from_utf8(id).expect("node-id-alloc nonce is UTF-8");
             meta.node_id_allocations
-                .insert(nonce, NodeId::new(decode_u64(value)));
+                .insert(nonce, decode_node_id(value.to_vec()));
         }
     }
 }
@@ -414,7 +424,7 @@ fn apply_delete(meta: &mut Metadata, key: &[u8]) {
             meta.tablets.remove(&TabletId(decode_u64(&id)));
         }
         EntityKind::Member => {
-            meta.members.remove(&NodeId::new(decode_u64(&id)));
+            meta.members.remove(&decode_node_id(id));
         }
         EntityKind::Schema => {
             let name = String::from_utf8(id).expect("schema id is UTF-8");
@@ -424,7 +434,7 @@ fn apply_delete(meta: &mut Metadata, key: &[u8]) {
             meta.policies.remove(&TabletId(decode_u64(&id)));
         }
         EntityKind::NodeAddrs => {
-            meta.node_addrs.remove(&NodeId::new(decode_u64(&id)));
+            meta.node_addrs.remove(&decode_node_id(id));
         }
         EntityKind::Keyspace => {
             let name = String::from_utf8(id).expect("keyspace id is UTF-8");
@@ -440,7 +450,7 @@ fn apply_delete(meta: &mut Metadata, key: &[u8]) {
             // `Put`) — listed for match exhaustiveness.
         }
         EntityKind::CpMemberAddr => {
-            let node = NodeId::new(decode_u64(&id));
+            let node = decode_node_id(id);
             meta.cp_member_addrs.remove(&node);
             meta.cp_member_tablets.remove(&node);
         }
@@ -490,7 +500,7 @@ mod tests {
         assert_eq!(outcome, ApplyOutcome::Applied);
         assert_eq!(
             writes,
-            vec![put_json(syskv::member_key(nid(1)), &meta.members[&nid(1)])]
+            vec![put_json(syskv::member_key(&nid(1)), &meta.members[&nid(1)])]
         );
     }
 
@@ -641,7 +651,7 @@ mod tests {
                 KeyWrite::Delete(syskv::tablet_key(TabletId(2))),
                 KeyWrite::Delete(syskv::policy_key(TabletId(2))),
                 KeyWrite::Put(syskv::merged_key(TabletId(2)), Vec::new()),
-                KeyWrite::Delete(syskv::cp_member_addr_key(nid(99))),
+                KeyWrite::Delete(syskv::cp_member_addr_key(&nid(99))),
             ]
         );
         assert!(meta.cp_member_addrs.is_empty());
@@ -784,7 +794,7 @@ mod tests {
             vec![
                 KeyWrite::Delete(syskv::tablet_key(TabletId(1))),
                 KeyWrite::Delete(syskv::policy_key(TabletId(1))),
-                KeyWrite::Delete(syskv::cp_member_addr_key(nid(7))),
+                KeyWrite::Delete(syskv::cp_member_addr_key(&nid(7))),
             ]
         );
 
@@ -908,7 +918,7 @@ mod tests {
         assert_eq!(
             writes,
             vec![put_json(
-                syskv::cp_member_addr_key(nid(5)),
+                syskv::cp_member_addr_key(&nid(5)),
                 &CpMemberAddrEntry {
                     addr: "127.0.0.1:9".to_string(),
                     tablet: Some(TabletId(1)),
@@ -934,7 +944,7 @@ mod tests {
         assert_eq!(outcome, ApplyOutcome::Applied);
         assert_eq!(
             writes,
-            vec![put_json(syskv::node_addrs_key(nid(3)), &addrs)]
+            vec![put_json(syskv::node_addrs_key(&nid(3)), &addrs)]
         );
     }
 
@@ -955,9 +965,9 @@ mod tests {
         assert_eq!(
             writes,
             vec![
-                KeyWrite::Delete(syskv::member_key(nid(4))),
-                KeyWrite::Delete(syskv::node_addrs_key(nid(4))),
-                KeyWrite::Delete(syskv::cp_member_addr_key(nid(4))),
+                KeyWrite::Delete(syskv::member_key(&nid(4))),
+                KeyWrite::Delete(syskv::node_addrs_key(&nid(4))),
+                KeyWrite::Delete(syskv::cp_member_addr_key(&nid(4))),
             ]
         );
     }
@@ -971,16 +981,16 @@ mod tests {
         };
         let (outcome, writes) = apply_and_derive_mirror(&mut meta, &command);
         assert_eq!(outcome, ApplyOutcome::Applied);
-        let node_id = meta.node_id_allocations["join-1"];
+        let node_id = meta.node_id_allocations["join-1"].clone();
         assert_eq!(
             writes,
             vec![
-                put_json(syskv::member_key(node_id), &meta.members[&node_id]),
+                put_json(syskv::member_key(&node_id), &meta.members[&node_id]),
                 KeyWrite::Put(
                     syskv::node_id_alloc_key("join-1"),
-                    node_id.as_u64().to_be_bytes().to_vec()
+                    node_id.as_str().as_bytes().to_vec()
                 ),
-                put_counter(NEXT_ALLOC_ID_COUNTER, (meta.next_alloc_id).as_u64()),
+                put_counter(NEXT_ALLOC_ID_COUNTER, meta.next_alloc_id),
             ]
         );
 

@@ -374,7 +374,7 @@ mod tests {
     /// coordinator state — is what survives.
     #[test]
     fn survives_two_crash_restart_cycles_with_interleaved_tablets() {
-        const NODE: animus_env::NodeId = nid(0);
+        let node = nid(0);
         let t1 = TabletId(11);
         let t2 = TabletId(12);
 
@@ -382,7 +382,7 @@ mod tests {
 
         // Cycle 1: both tablets append their first entry.
         {
-            let env = sim.env(NODE);
+            let env = sim.env(node.clone());
             let wal = SharedWal::new();
             futures::executor::block_on(async {
                 wal.append(
@@ -407,11 +407,11 @@ mod tests {
                 .expect("t2 first append succeeds");
             });
         }
-        sim.stop(NODE);
+        sim.stop(node.clone());
 
         // Restart #1: recover, verify, then append a second entry each.
         {
-            let env = sim.env(NODE);
+            let env = sim.env(node.clone());
             let bytes = futures::executor::block_on(env.read(WAL)).expect("wal readable");
             let demuxed = PersistedState::<MetaCommand, Metadata>::replay_multiplexed(&bytes);
             assert_eq!(demuxed[&t1].log.len(), 1);
@@ -441,12 +441,12 @@ mod tests {
                 .expect("t2 second append succeeds");
             });
         }
-        sim.stop(NODE);
+        sim.stop(node.clone());
 
         // Restart #2: both tablets' full two-entry histories must be intact,
         // correctly ordered, and never cross-contaminated.
         {
-            let env = sim.env(NODE);
+            let env = sim.env(node.clone());
             let bytes = futures::executor::block_on(env.read(WAL)).expect("wal readable");
             let demuxed = PersistedState::<MetaCommand, Metadata>::replay_multiplexed(&bytes);
 

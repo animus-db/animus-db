@@ -89,12 +89,20 @@ fn register(sim: &Simulator, node: &RaftNode<SimEnv>, id: u64, lbls: BTreeMap<St
     ));
 }
 
+/// The numeric id backing a `nid(n)`-formatted `"n{n}"` string id.
+fn id_num(node: &animus_env::NodeId) -> u64 {
+    node.as_str()
+        .trim_start_matches('n')
+        .parse()
+        .expect("test node ids are nid(n)-formatted")
+}
+
 /// Per-node replica counts over `ids`, seeded 0.
 fn counts(meta: &Metadata, ids: &[u64]) -> BTreeMap<u64, usize> {
     let mut c: BTreeMap<u64, usize> = ids.iter().map(|&id| (id, 0)).collect();
     for t in meta.tablets.values() {
         for r in &t.replicas {
-            if let Some(n) = c.get_mut(&r.as_u64()) {
+            if let Some(n) = c.get_mut(&id_num(r)) {
                 *n += 1;
             }
         }

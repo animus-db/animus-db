@@ -18,7 +18,9 @@ use animus_env::{Nanos, NodeId, nid};
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::MemoryEngine;
 
-const NODES: [NodeId; 3] = [nid(0), nid(1), nid(2)];
+fn member_ids() -> [NodeId; 3] {
+    [nid(0), nid(1), nid(2)]
+}
 
 // ---- core-level, fully deterministic --------------------------------------
 
@@ -39,7 +41,7 @@ fn heartbeat(leader: NodeId, term: u64) -> RaftMsg {
 /// from winning a pre-vote and forcing an election.
 #[test]
 fn prevote_rejected_while_leader_lease_valid() {
-    let mut core: RaftCore = RaftCore::new(nid(0), &NODES, Nanos(0), 7);
+    let mut core: RaftCore = RaftCore::new(nid(0), &member_ids(), Nanos(0), 7);
     // Hear a heartbeat from leader 1 at term 5: this sets the leader hint and
     // resets the election timer (the lease).
     let hb_at = Nanos(1_000_000);
@@ -77,7 +79,7 @@ fn prevote_rejected_while_leader_lease_valid() {
 /// its own term.
 #[test]
 fn prevote_granted_after_lease_expires() {
-    let mut core: RaftCore = RaftCore::new(nid(0), &NODES, Nanos(0), 7);
+    let mut core: RaftCore = RaftCore::new(nid(0), &member_ids(), Nanos(0), 7);
     let hb_at = Nanos(1_000_000);
     core.handle(nid(1), heartbeat(nid(1), 5), hb_at, 7);
 
@@ -120,7 +122,7 @@ fn prevote_granted_after_lease_expires() {
 /// advances it to a real election.
 #[test]
 fn timeout_makes_pre_candidate_without_bumping_term() {
-    let mut core: RaftCore = RaftCore::new(nid(0), &NODES, Nanos(0), 7);
+    let mut core: RaftCore = RaftCore::new(nid(0), &member_ids(), Nanos(0), 7);
     core.handle(nid(1), heartbeat(nid(1), 5), Nanos(1_000_000), 7);
     assert_eq!(core.term(), 5);
 
@@ -150,9 +152,15 @@ fn timeout_makes_pre_candidate_without_bumping_term() {
 
 fn cluster(seed: u64) -> (Simulator, Vec<RaftNode<SimEnv>>) {
     let sim = Simulator::new(seed);
-    let nodes = NODES
+    let nodes = member_ids()
         .iter()
-        .map(|&id| RaftNode::start(sim.env(id), NODES.to_vec(), MemoryEngine::new()))
+        .map(|id| {
+            RaftNode::start(
+                sim.env(id.clone()),
+                member_ids().to_vec(),
+                MemoryEngine::new(),
+            )
+        })
         .collect();
     (sim, nodes)
 }

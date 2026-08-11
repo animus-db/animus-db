@@ -31,11 +31,13 @@ use std::time::Duration;
 
 use animus_control::{MetaCommand, ProposeResult, RaftCore, RaftMsg, Role};
 use animus_env::{Nanos, NodeId, nid};
-const GROUP: [NodeId; 3] = [nid(0), nid(1), nid(2)];
+fn group() -> [NodeId; 3] {
+    [nid(0), nid(1), nid(2)]
+}
 const NOW: Nanos = Nanos(1_000_000_000);
 
 fn set(ids: &[NodeId]) -> BTreeSet<NodeId> {
-    ids.iter().copied().collect()
+    ids.iter().cloned().collect()
 }
 
 fn after(base: Nanos, d: Duration) -> Nanos {
@@ -54,14 +56,14 @@ fn heartbeat(leader: NodeId, term: u64) -> RaftMsg {
     }
 }
 
-/// Elect node `GROUP[0]` leader of the 3-node group (see
+/// Elect node `group()[0]` leader of the 3-node group (see
 /// `membership_commit_gate.rs`'s identical helper). The election no-op sits
 /// **uncommitted** at index 1 until a follower acks it.
 fn elect_leader() -> RaftCore {
-    let mut core: RaftCore = RaftCore::new(GROUP[0], &GROUP, Nanos(0), 7);
+    let mut core: RaftCore = RaftCore::new(group()[0].clone(), &group(), Nanos(0), 7);
     let _ = core.tick(NOW, 7);
     let _ = core.handle(
-        GROUP[1],
+        group()[1].clone(),
         RaftMsg::PreVoteResp {
             term: core.term() + 1,
             granted: true,
@@ -70,7 +72,7 @@ fn elect_leader() -> RaftCore {
         7,
     );
     let _ = core.handle(
-        GROUP[1],
+        group()[1].clone(),
         RaftMsg::RequestVoteResp {
             term: core.term(),
             granted: true,
@@ -178,7 +180,7 @@ fn transfer_leadership_freezes_proposals_and_waits_for_last_log_index_before_tim
         ProposeResult::Accepted { .. }
     ));
     assert_eq!(core.last_log_index(), 2);
-    assert_eq!(core.peer_match(nid(1)), 1);
+    assert_eq!(core.peer_match(&nid(1)), 1);
     assert_eq!(core.commit_index(), 1, "the new entry isn't acked yet");
 
     // Still armable: node 1 is caught up to commit_index (relaxed gate).
@@ -205,12 +207,12 @@ fn transfer_leadership_freezes_proposals_and_waits_for_last_log_index_before_tim
     // While armed, new proposals are rejected — the log must stop growing.
     let rejected = core.propose(MetaCommand::NoOp);
     assert!(
-        matches!(rejected, ProposeResult::NotLeader { leader: Some(l) } if l == nid(1)),
+        matches!(&rejected, ProposeResult::NotLeader { leader: Some(l) } if *l == nid(1)),
         "propose must freeze (and hint the transfer target) while armed: {rejected:?}"
     );
     let rejected_cm = core.change_membership(set(&[nid(0), nid(1)]));
     assert!(
-        matches!(rejected_cm, ProposeResult::NotLeader { leader: Some(l) } if l == nid(1)),
+        matches!(&rejected_cm, ProposeResult::NotLeader { leader: Some(l) } if *l == nid(1)),
         "change_membership must freeze while armed: {rejected_cm:?}"
     );
     assert_eq!(
@@ -221,7 +223,7 @@ fn transfer_leadership_freezes_proposals_and_waits_for_last_log_index_before_tim
 
     // Node 1 catches up to last_log_index (e.g. via the replication above).
     ack_all(&mut core, nid(1));
-    assert_eq!(core.peer_match(nid(1)), 2);
+    assert_eq!(core.peer_match(&nid(1)), 2);
 
     let hb2 = after(hb1, Duration::from_millis(60));
     let outs2 = core.tick(hb2, 7);
@@ -374,7 +376,7 @@ fn transfer_leadership_does_not_survive_a_fresh_election_win() {
 
 #[test]
 fn timeout_now_triggers_immediate_election_bypassing_pre_vote_and_costs_one_term() {
-    let mut core: RaftCore = RaftCore::new(nid(1), &GROUP, Nanos(0), 7);
+    let mut core: RaftCore = RaftCore::new(nid(1), &group(), Nanos(0), 7);
     // A live leader's heartbeat gives this follower a "lease" that would make a
     // normal election-timeout tick only start a *pre-vote* round (see
     // pre_vote.rs), never campaign directly.
@@ -402,7 +404,7 @@ fn timeout_now_triggers_immediate_election_bypassing_pre_vote_and_costs_one_term
 #[test]
 fn timeout_now_is_ignored_when_stale_already_leader_or_not_a_voter() {
     // Stale term: this node already moved on from the term the transfer named.
-    let mut stale: RaftCore = RaftCore::new(nid(1), &GROUP, Nanos(0), 7);
+    let mut stale: RaftCore = RaftCore::new(nid(1), &group(), Nanos(0), 7);
     stale.handle(nid(0), heartbeat(nid(0), 5), NOW, 7);
     let outs = stale.handle(
         nid(0),

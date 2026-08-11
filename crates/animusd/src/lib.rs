@@ -52,7 +52,7 @@ mod topology;
 
 use control_handle::{ControlHandle, RemoteControlClient};
 
-use animus_control::meta::ALLOC_ID_BASE;
+use animus_control::meta::{ALLOC_ID_BASE, parse_alloc_id};
 use animus_control::node::{HEARTBEAT_INTERVAL, send_heartbeat};
 use animus_control::{PlacementPolicy, ProposeResult, RaftNode};
 use animus_cp_data::RaftKvNode;
@@ -885,8 +885,14 @@ pub enum ClientResponse {
 /// `raftkv` `Option<SocketAddr>` pair into this one required field — no
 /// wire/config back-compat with a pre-ADR-0040 deployment (fresh clusters
 /// required).
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RoleAddrs {
+    /// This node's self-minted/operator-proposed identity (ADR 0040 PR3):
+    /// every config entry now carries its own id explicitly instead of it
+    /// being purely derived from the entry's position in `nodes` — required
+    /// (no default; a clean break, fresh clusters only), and validated
+    /// unique across the whole config at load (`ClusterConfig::from_json`).
+    pub id: NodeId,
     /// Which role(s) this node runs (ADR 0035). Defaults to
     /// [`Both`](config::NodeRole::Both) when absent — the shape every config
     /// used before this field existed.
@@ -1072,7 +1078,7 @@ impl BoundNode {
     /// `(id, addr)` — the one entry this node contributes to the cluster peer
     /// book (ADR 0040 PR1: one identity, one internal `ProdEnv`, per node).
     pub fn peer_entries(&self) -> [(NodeId, SocketAddr); 1] {
-        [(self.id, self.internal_addr)]
+        [(self.id.clone(), self.internal_addr)]
     }
 
     /// The address clients connect to.
@@ -1183,7 +1189,7 @@ impl BoundNode {
         // cluster members are node ids), so the control plane's `detect_loop`
         // marks a crashed node `Down`.
         let hb_env = self.env.clone();
-        let my_id = self.id;
+        let my_id = self.id.clone();
         let my_addr = self.internal_addr;
         // Captured here (all `SocketAddr`, `Copy`) for the node-address-book
         // self-registration below (ADR 0032 PR1) — `self.client_listener`/
@@ -1195,7 +1201,7 @@ impl BoundNode {
         // The node's identity + bound addresses for the admin `/admin/config`
         // view (ADR 0020), captured before the env is consumed below.
         let admin_info = Arc::new(AdminInfo {
-            node_id: Some(self.id),
+            node_id: Some(self.id.clone()),
             internal_addr: Some(self.internal_addr),
             client_addr: self.client_addr,
             dynamo_addr: Some(self.dynamo_addr),
@@ -1322,7 +1328,7 @@ impl BoundNode {
         let data_role = DataRole {
             rmw_lock: Arc::new(tokio::sync::Mutex::new(())),
             raftkv_metrics,
-            base_id: my_id,
+            base_id: my_id.clone(),
         };
         let (ctx, mut tasks) = spawn_common_tail(
             ControlHandle::Local(raft.clone()),
@@ -1331,7 +1337,7 @@ impl BoundNode {
             admin_info,
             client_route,
             (
-                my_id,
+                my_id.clone(),
                 NodeAddrs {
                     internal: my_addr.to_string(),
                     client: my_client_addr.to_string(),
@@ -1360,15 +1366,15 @@ impl BoundNode {
         let reconciler = {
             let host_edge = edge.clone();
             let teardown_edge = edge.clone();
-            let base_id = my_id;
+            let base_id = my_id.clone();
             let on_teardown = move |tablet: TabletId| {
-                teardown_edge.unregister_raftkv(tablet, base_id);
+                teardown_edge.unregister_raftkv(tablet, base_id.clone());
             };
             match storage {
                 SharedEngine::Lsm(lsm) => CpReconciler::Lsm(Reconciler::new(
                     hook_env,
                     lsm,
-                    my_id,
+                    my_id.clone(),
                     table_scope_prefix,
                     move |tablet, node: &RaftKvNode<ProdEnv, LsmEngine<ProdEnv>>| {
                         host_edge.register_raftkv(tablet, CpGroup::Lsm(node.clone()));
@@ -1378,7 +1384,7 @@ impl BoundNode {
                 SharedEngine::Mem(mem) => CpReconciler::Mem(Reconciler::new(
                     hook_env,
                     mem,
-                    my_id,
+                    my_id.clone(),
                     table_scope_prefix,
                     move |tablet, node: &RaftKvNode<ProdEnv, MemoryEngine>| {
                         host_edge.register_raftkv(tablet, CpGroup::Mem(node.clone()));
@@ -1437,7 +1443,7 @@ impl BoundNode {
         if !control_ids.contains(&self.id) {
             let seeds: Vec<SocketAddr> = control_ids
                 .iter()
-                .filter_map(|id| ctx.route_addr(*id))
+                .filter_map(|id| ctx.route_addr(id.clone()))
                 .collect();
             tasks.push(tokio::spawn(remote_metadata_sync_loop(ctx.clone(), seeds)));
 
@@ -1584,7 +1590,8 @@ impl Node {
         data_dir: impl Into<PathBuf>,
     ) -> std::io::Result<BoundNode> {
         let dir = data_dir.into();
-        let (env, internal_addr) = ProdEnv::bind(id, addrs.internal, dir.join("internal")).await?;
+        let (env, internal_addr) =
+            ProdEnv::bind(id.clone(), addrs.internal, dir.join("internal")).await?;
         let client_listener = TcpListener::bind(addrs.client).await?;
         let client_addr = client_listener.local_addr()?;
         let dynamo_listener = TcpListener::bind(addrs.dynamo).await?;
@@ -1621,7 +1628,8 @@ impl Node {
         data_dir: impl Into<PathBuf>,
     ) -> std::io::Result<BoundControlNode> {
         let dir = data_dir.into();
-        let (env, internal_addr) = ProdEnv::bind(id, addrs.internal, dir.join("internal")).await?;
+        let (env, internal_addr) =
+            ProdEnv::bind(id.clone(), addrs.internal, dir.join("internal")).await?;
         let client_listener = TcpListener::bind(addrs.client).await?;
         let client_addr = client_listener.local_addr()?;
         let admin_listener = TcpListener::bind(addrs.admin).await?;
@@ -1651,7 +1659,8 @@ impl Node {
         data_dir: impl Into<PathBuf>,
     ) -> std::io::Result<BoundDataNode> {
         let dir = data_dir.into();
-        let (env, internal_addr) = ProdEnv::bind(id, addrs.internal, dir.join("internal")).await?;
+        let (env, internal_addr) =
+            ProdEnv::bind(id.clone(), addrs.internal, dir.join("internal")).await?;
         let client_listener = TcpListener::bind(addrs.client).await?;
         let client_addr = client_listener.local_addr()?;
         let dynamo_listener = TcpListener::bind(addrs.dynamo).await?;
@@ -1911,7 +1920,7 @@ impl BoundControlNode {
 
     /// `(id, addr)` — this node's entry in the cluster's peer book.
     pub fn peer_entry(&self) -> (NodeId, SocketAddr) {
-        (self.id, self.internal_addr)
+        (self.id.clone(), self.internal_addr)
     }
 
     /// Wire the peer address book into the control env and start the control
@@ -1969,7 +1978,7 @@ impl BoundControlNode {
         let envs = vec![self.env.clone()];
 
         let admin_info = Arc::new(AdminInfo {
-            node_id: Some(self.id),
+            node_id: Some(self.id.clone()),
             internal_addr: Some(self.internal_addr),
             client_addr: self.client_addr,
             dynamo_addr: None,
@@ -2120,7 +2129,7 @@ impl BoundDataNode {
     /// book (the [`BoundNode::peer_entries`] dual, minus the `control` entry
     /// a data-only node has none of).
     pub fn peer_entry(&self) -> (NodeId, SocketAddr) {
-        (self.id, self.internal_addr)
+        (self.id.clone(), self.internal_addr)
     }
 
     /// Wire the peer address book into the `raftkv` env and start the data
@@ -2176,7 +2185,7 @@ impl BoundDataNode {
         let sync_env = self.env.clone();
         let hook_env = self.env.clone();
         let hb_env = self.env.clone();
-        let my_id = self.id;
+        let my_id = self.id.clone();
         let my_addr = self.internal_addr;
         let my_client_addr = self.client_addr;
         let my_admin_addr = self.admin_addr;
@@ -2184,7 +2193,7 @@ impl BoundDataNode {
         let control = ControlHandle::Remote(RemoteControlClient::new(control_seeds.clone()));
 
         let admin_info = Arc::new(AdminInfo {
-            node_id: Some(self.id),
+            node_id: Some(self.id.clone()),
             internal_addr: Some(self.internal_addr),
             client_addr: self.client_addr,
             dynamo_addr: Some(self.dynamo_addr),
@@ -2222,7 +2231,7 @@ impl BoundDataNode {
         let data_role = DataRole {
             rmw_lock: Arc::new(tokio::sync::Mutex::new(())),
             raftkv_metrics,
-            base_id: my_id,
+            base_id: my_id.clone(),
         };
         let (ctx, mut tasks) = spawn_common_tail(
             control,
@@ -2231,7 +2240,7 @@ impl BoundDataNode {
             admin_info,
             client_route,
             (
-                my_id,
+                my_id.clone(),
                 NodeAddrs {
                     internal: my_addr.to_string(),
                     client: my_client_addr.to_string(),
@@ -2251,15 +2260,15 @@ impl BoundDataNode {
         let reconciler = {
             let host_edge = edge.clone();
             let teardown_edge = edge.clone();
-            let base_id = my_id;
+            let base_id = my_id.clone();
             let on_teardown = move |tablet: TabletId| {
-                teardown_edge.unregister_raftkv(tablet, base_id);
+                teardown_edge.unregister_raftkv(tablet, base_id.clone());
             };
             match storage {
                 SharedEngine::Lsm(lsm) => CpReconciler::Lsm(Reconciler::new(
                     hook_env,
                     lsm,
-                    my_id,
+                    my_id.clone(),
                     table_scope_prefix,
                     move |tablet, node: &RaftKvNode<ProdEnv, LsmEngine<ProdEnv>>| {
                         host_edge.register_raftkv(tablet, CpGroup::Lsm(node.clone()));
@@ -2269,7 +2278,7 @@ impl BoundDataNode {
                 SharedEngine::Mem(mem) => CpReconciler::Mem(Reconciler::new(
                     hook_env,
                     mem,
-                    my_id,
+                    my_id.clone(),
                     table_scope_prefix,
                     move |tablet, node: &RaftKvNode<ProdEnv, MemoryEngine>| {
                         host_edge.register_raftkv(tablet, CpGroup::Mem(node.clone()));
@@ -2833,7 +2842,7 @@ impl ClientCtx {
     /// node — no leader signal at all).
     fn control_leader_hint(&self) -> Option<(NodeId, SocketAddr)> {
         let id = self.control.leader()?;
-        let addr = self.route_addr(id)?;
+        let addr = self.route_addr(id.clone())?;
         Some((id, addr))
     }
 
@@ -3707,7 +3716,7 @@ impl ClientCtx {
         // base `raftkv` id, so the local replica's leader hint is already a
         // `client_route` key — no more base<->member translation needed.
         let leader = self.edge.local_cp(tablet).and_then(|n| n.leader())?;
-        let addr = self.route_addr(leader)?;
+        let addr = self.route_addr(leader.clone())?;
         Some((leader, addr))
     }
 
@@ -3983,7 +3992,7 @@ impl ClientCtx {
                     .members
                     .iter()
                     .filter(|(_, m)| m.status == NodeStatus::Active)
-                    .map(|(id, _)| *id)
+                    .map(|(id, _)| id.clone())
                     .collect();
                 replicas.truncate(MAX_REPLICATION_FACTOR);
                 if !replicas.is_empty() {
@@ -4225,7 +4234,7 @@ impl ClientCtx {
         }
         self.propose_and_await(
             MetaCommand::UpsertMember {
-                node,
+                node: node.clone(),
                 labels,
                 status: NodeStatus::Down,
             },
@@ -4322,7 +4331,7 @@ impl ClientCtx {
                 member.status
             ));
         }
-        let referenced = meta.tablets_referencing(node);
+        let referenced = meta.tablets_referencing(&node);
         if referenced > 0 {
             return Err(format!(
                 "node {node} still referenced by {referenced} tablet(s); wait for draining to \
@@ -4424,11 +4433,11 @@ impl ClientCtx {
         };
         let (node, minted) = match node {
             Some(node) => {
-                if node >= ALLOC_ID_BASE {
+                if parse_alloc_id(&node).is_some() {
                     return Err(format!(
-                        "node {node} is at or above the cluster-allocated id range \
+                        "node {node} is in the cluster-allocated id range \
                          (ALLOC_ID_BASE = {ALLOC_ID_BASE}); an operator-supplied control \
-                         voter id must stay below it"
+                         voter id must not collide with it"
                     ));
                 }
                 (node, false)
@@ -4466,13 +4475,16 @@ impl ClientCtx {
             // env — every other control-role node's `peer_sync_loop` only
             // ever learns an updated address from `Metadata.node_addrs`,
             // never from this call's local `merge_peer` side effect.
-            leader.env().merge_peer(node, addr);
+            leader.env().merge_peer(node.clone(), addr);
             let meta = self.control.metadata_cached();
             if let Some(mut addrs) = meta.node_addrs.get(&node).cloned()
                 && addrs.internal != addr.to_string()
             {
                 addrs.internal = addr.to_string();
-                let _ = leader.propose(MetaCommand::RegisterNodeAddrs { node, addrs });
+                let _ = leader.propose(MetaCommand::RegisterNodeAddrs {
+                    node: node.clone(),
+                    addrs,
+                });
             }
             return Ok(node);
         }
@@ -4499,15 +4511,18 @@ impl ClientCtx {
             role: "control".to_string(),
         });
         addrs.internal = addr.to_string();
-        match leader.propose(MetaCommand::RegisterNodeAddrs { node, addrs }) {
+        match leader.propose(MetaCommand::RegisterNodeAddrs {
+            node: node.clone(),
+            addrs,
+        }) {
             ProposeResult::Accepted { .. } => {}
             ProposeResult::NotLeader { .. } => {
                 return Err("control leadership moved; retry on the leader".into());
             }
         }
-        leader.env().merge_peer(node, addr);
+        leader.env().merge_peer(node.clone(), addr);
         let mut voters = current;
-        voters.insert(node);
+        voters.insert(node.clone());
         match leader.change_membership(voters) {
             ProposeResult::Accepted { .. } => Ok(node),
             ProposeResult::NotLeader { .. } => Err(
@@ -4589,7 +4604,7 @@ impl ClientCtx {
             ));
         }
         let remaining: BTreeSet<NodeId> =
-            current.iter().copied().filter(|&id| id != node).collect();
+            current.iter().filter(|&id| *id != node).cloned().collect();
         // Liveness-aware quorum-loss guard (ADR 0037 hardening PR2). The
         // original ADR 0037 guard counted only the *resulting* voter count
         // (refuse `< 1`, warn `== 1`) — which looks complete but misses the
@@ -4610,8 +4625,8 @@ impl ClientCtx {
         if !force {
             let dead: Vec<NodeId> = remaining
                 .iter()
-                .copied()
-                .filter(|&id| !leader.control_peer_believed_alive(id))
+                .filter(|id| !leader.control_peer_believed_alive((*id).clone()))
+                .cloned()
                 .collect();
             let live = remaining.len() - dead.len();
             let majority = remaining.len() / 2 + 1;
@@ -4631,10 +4646,10 @@ impl ClientCtx {
             }
         }
         if node == my_id {
-            let Some(&target) = current.iter().find(|&&id| id != my_id) else {
+            let Some(target) = current.iter().find(|&id| *id != my_id).cloned() else {
                 return Err("no other control voter available to transfer leadership to".into());
             };
-            if !leader.transfer_leadership(target) {
+            if !leader.transfer_leadership(target.clone()) {
                 return Err(format!(
                     "could not arm a leadership transfer to node {target} (already \
                      mid-transfer, or {target} has not caught up); retry"
@@ -4753,10 +4768,10 @@ async fn bootstrap(raft: RaftNode<ProdEnv>, raftkv_ids: Vec<NodeId>) {
             // (`ClientCtx::provision_tablet`), and the per-node join-host loop stands
             // its group up. Idempotent: only members not yet present are proposed.
             let meta = raft.metadata();
-            for &node in &raftkv_ids {
-                if !meta.members.contains_key(&node) {
+            for node in &raftkv_ids {
+                if !meta.members.contains_key(node) {
                     raft.propose(MetaCommand::UpsertMember {
-                        node,
+                        node: node.clone(),
                         labels: BTreeMap::new(),
                         status: NodeStatus::Active,
                     });
@@ -5266,7 +5281,7 @@ async fn tablet_host_reconciler_loop(ctx: ClientCtx, mut reconciler: CpReconcile
             .members
             .iter()
             .filter(|(_, m)| m.status == NodeStatus::Down)
-            .map(|(id, _)| *id)
+            .map(|(id, _)| id.clone())
             .collect();
         let view = MetadataView {
             tablets: meta.tablets,
@@ -5749,7 +5764,10 @@ impl ClientCtx {
         let want = addrs.clone();
         let _ = self
             .propose_and_await(
-                MetaCommand::RegisterNodeAddrs { node, addrs },
+                MetaCommand::RegisterNodeAddrs {
+                    node: node.clone(),
+                    addrs,
+                },
                 SCHEMA_COMMIT_TIMEOUT,
                 || async {
                     (self.effective_metadata().node_addrs.get(&node) == Some(&want)).then_some(())
@@ -5907,7 +5925,7 @@ impl ClientCtx {
                 self.effective_metadata()
                     .node_id_allocations
                     .get(&nonce)
-                    .copied()
+                    .cloned()
             })
             .await
         {
@@ -6193,6 +6211,7 @@ pub async fn bind_cluster(
     for i in 0..n {
         let addr = || SocketAddr::new(ip, 0);
         let addrs = RoleAddrs {
+            id: config::node_id(i),
             role: config::NodeRole::Both,
             internal: addr(),
             client: addr(),
@@ -6286,7 +6305,7 @@ async fn start_cluster_inner(
     // `BoundNode` rather than re-deriving from `control_ids`, so this stays
     // correct even if a future caller's `bound` isn't a contiguous `0..n`
     // index range.
-    let data_ids: Vec<NodeId> = bound.iter().map(|b| b.id).collect();
+    let data_ids: Vec<NodeId> = bound.iter().map(|b| b.id.clone()).collect();
     let peers: BTreeMap<NodeId, SocketAddr> =
         bound.iter().flat_map(BoundNode::peer_entries).collect();
     // Cross-node routing (ADR 0017 #3b / ADR 0013): map each node's one id to
@@ -6302,8 +6321,10 @@ async fn start_cluster_inner(
     // it live thereafter by overlaying `Metadata.node_addrs[*].client` (ADR
     // 0032 PR1) — so a node grown into the cluster later is still reachable
     // from every original node.
-    let client_route: BTreeMap<NodeId, SocketAddr> =
-        bound.iter().map(|b| (b.id, b.client_addr)).collect();
+    let client_route: BTreeMap<NodeId, SocketAddr> = bound
+        .iter()
+        .map(|b| (b.id.clone(), b.client_addr))
+        .collect();
     // Every node's admin address, so each node's dashboard (ADR 0021) can fan out
     // to the whole in-process cluster.
     let admin_addrs: Vec<SocketAddr> = bound.iter().map(BoundNode::admin_addr).collect();
@@ -6374,6 +6395,7 @@ pub async fn start_split_cluster_with(
     let mut control_bound = Vec::with_capacity(control_n);
     for i in 0..control_n {
         let addrs = RoleAddrs {
+            id: config::node_id(i),
             role: config::NodeRole::Control,
             internal: ephemeral(),
             client: ephemeral(),
@@ -6388,6 +6410,7 @@ pub async fn start_split_cluster_with(
     let mut data_bound = Vec::with_capacity(data_n);
     for i in control_n..total {
         let addrs = RoleAddrs {
+            id: config::node_id(i),
             role: config::NodeRole::Data,
             internal: ephemeral(),
             client: ephemeral(),
@@ -6406,10 +6429,12 @@ pub async fn start_split_cluster_with(
     // that same env).
     let control_peer_book: BTreeMap<NodeId, SocketAddr> = control_bound
         .iter()
-        .map(|b| (b.id, b.internal_addr))
+        .map(|b| (b.id.clone(), b.internal_addr))
         .collect();
-    let raftkv_peer_book: BTreeMap<NodeId, SocketAddr> =
-        data_bound.iter().map(|b| (b.id, b.internal_addr)).collect();
+    let raftkv_peer_book: BTreeMap<NodeId, SocketAddr> = data_bound
+        .iter()
+        .map(|b| (b.id.clone(), b.internal_addr))
+        .collect();
     let mut data_env_peers = raftkv_peer_book;
     data_env_peers.extend(control_peer_book.clone());
 
@@ -6418,10 +6443,10 @@ pub async fn start_split_cluster_with(
     // `run_node_control`/`run_node_data`'s per-process assembly.
     let mut client_route: BTreeMap<NodeId, SocketAddr> = BTreeMap::new();
     for b in &control_bound {
-        client_route.insert(b.id, b.client_addr);
+        client_route.insert(b.id.clone(), b.client_addr);
     }
     for b in &data_bound {
-        client_route.insert(b.id, b.client_addr);
+        client_route.insert(b.id.clone(), b.client_addr);
     }
 
     // The control deployment's client addresses — the discovery root each
@@ -6497,7 +6522,7 @@ pub async fn run_node_with(
     dir: impl Into<PathBuf>,
     backend: StorageBackend,
 ) -> std::io::Result<Node> {
-    let addrs = *config.nodes.get(index).ok_or_else(|| {
+    let addrs = config.nodes.get(index).cloned().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "node index out of range")
     })?;
     let bound = Node::bind(config::node_id(index), addrs, dir).await?;
@@ -6561,7 +6586,7 @@ pub async fn run_node_control(
     dir: impl Into<PathBuf>,
     backend: StorageBackend,
 ) -> std::io::Result<Node> {
-    let addrs = *config.nodes.get(index).ok_or_else(|| {
+    let addrs = config.nodes.get(index).cloned().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "node index out of range")
     })?;
     if !addrs.role.has_control() {
@@ -6624,7 +6649,7 @@ pub async fn run_node_data(
     dir: impl Into<PathBuf>,
     backend: StorageBackend,
 ) -> std::io::Result<Node> {
-    let addrs = *config.nodes.get(index).ok_or_else(|| {
+    let addrs = config.nodes.get(index).cloned().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "node index out of range")
     })?;
     if !addrs.role.has_data() {
@@ -6721,7 +6746,7 @@ pub async fn run_node_growth(
     dir: impl Into<PathBuf>,
     backend: StorageBackend,
 ) -> std::io::Result<Node> {
-    let addrs = *config.nodes.get(index).ok_or_else(|| {
+    let addrs = config.nodes.get(index).cloned().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "node index out of range")
     })?;
     let bound = Node::bind(config::node_id(index), addrs, dir).await?;
@@ -6875,13 +6900,15 @@ pub async fn run_node_join(
     // than surfacing `Node::bind`'s generic one later, once discovery/
     // collision-guard work has already happened.
     let my_id = config::node_id(index);
+    let my_client_addr = addrs.client;
+    let my_admin_addr = addrs.admin;
 
     let (original_control_ids, peers, client_route, admin_addrs) =
         discover_join_info(&seeds).await?;
     check_join_collision(
         &seeds,
         index,
-        my_id,
+        my_id.clone(),
         &NodeAddrs {
             internal: addrs.internal.to_string(),
             client: addrs.client.to_string(),
@@ -6891,13 +6918,13 @@ pub async fn run_node_join(
     )
     .await?;
 
-    let bound = Node::bind(my_id, addrs, dir).await?;
+    let bound = Node::bind(my_id.clone(), addrs, dir).await?;
 
     finish_combined_join(
         bound,
         my_id,
-        addrs.client,
-        addrs.admin,
+        my_client_addr,
+        my_admin_addr,
         original_control_ids,
         peers,
         client_route,
@@ -7126,14 +7153,16 @@ pub async fn run_node_join_allocated(
 
     let nonce = generate_join_nonce();
     let my_id = allocate_node_id(&seeds, nonce, labels).await?;
+    let my_client_addr = addrs.client;
+    let my_admin_addr = addrs.admin;
 
-    let bound = Node::bind(my_id, addrs, dir).await?;
+    let bound = Node::bind(my_id.clone(), addrs, dir).await?;
 
     finish_combined_join(
         bound,
         my_id,
-        addrs.client,
-        addrs.admin,
+        my_client_addr,
+        my_admin_addr,
         original_control_ids,
         peers,
         client_route,
@@ -7182,13 +7211,15 @@ pub async fn run_node_data_join(
         ));
     }
     let my_id = config::node_id(index);
+    let my_client_addr = addrs.client;
+    let my_admin_addr = addrs.admin;
 
     let (original_control_ids, peers, client_route, admin_addrs) =
         discover_join_info(&seeds).await?;
     check_join_collision(
         &seeds,
         index,
-        my_id,
+        my_id.clone(),
         &NodeAddrs {
             internal: addrs.internal.to_string(),
             client: addrs.client.to_string(),
@@ -7198,13 +7229,13 @@ pub async fn run_node_data_join(
     )
     .await?;
 
-    let bound = Node::bind_data(my_id, addrs, dir).await?;
+    let bound = Node::bind_data(my_id.clone(), addrs, dir).await?;
 
     finish_data_join(
         bound,
         my_id,
-        addrs.client,
-        addrs.admin,
+        my_client_addr,
+        my_admin_addr,
         original_control_ids,
         peers,
         client_route,
@@ -7296,14 +7327,16 @@ pub async fn run_node_data_join_allocated(
 
     let nonce = generate_join_nonce();
     let my_id = allocate_node_id(&seeds, nonce, labels).await?;
+    let my_client_addr = addrs.client;
+    let my_admin_addr = addrs.admin;
 
-    let bound = Node::bind_data(my_id, addrs, dir).await?;
+    let bound = Node::bind_data(my_id.clone(), addrs, dir).await?;
 
     finish_data_join(
         bound,
         my_id,
-        addrs.client,
-        addrs.admin,
+        my_client_addr,
+        my_admin_addr,
         original_control_ids,
         peers,
         client_route,
@@ -7511,6 +7544,7 @@ mod split_fence_tests {
             let addrs = free_addrs(5);
             let config = ClusterConfig {
                 nodes: vec![RoleAddrs {
+                    id: crate::config::node_id(0),
                     role: NodeRole::Both,
                     internal: addrs[0],
                     client: addrs[1],

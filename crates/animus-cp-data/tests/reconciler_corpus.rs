@@ -54,10 +54,18 @@ const TABLE: &str = "t";
 /// A driver env id used only to host each scenario's own top-level script
 /// task — never a cluster node id (900 is well clear of every scenario's
 /// {A,B,C} = {300,301,302}).
-const DRIVER_ID: NodeId = nid(900);
-const A: NodeId = nid(300);
-const B: NodeId = nid(301);
-const C: NodeId = nid(302);
+fn driver_id() -> NodeId {
+    nid(900)
+}
+fn a() -> NodeId {
+    nid(300)
+}
+fn b() -> NodeId {
+    nid(301)
+}
+fn node_c() -> NodeId {
+    nid(302)
+}
 
 const SCENARIO_BUDGET: Duration = Duration::from_secs(150);
 const SCENARIO_STEP: Duration = Duration::from_secs(1);
@@ -188,9 +196,9 @@ impl Cluster {
         let hl = Arc::clone(&hosted_log);
         let tl = Arc::clone(&teardown_log);
         let reconciler: Recon = Reconciler::new(
-            self.sim.env(id),
+            self.sim.env(id.clone()),
             storage.clone(),
-            id,
+            id.clone(),
             prefix_for,
             move |t, _n| hl.lock().unwrap().push(t),
             move |t| tl.lock().unwrap().push(t),
@@ -215,7 +223,7 @@ impl Cluster {
     /// scratch — reusing the SAME `MemoryEngine` (see
     /// [`add_node_with_storage`](Self::add_node_with_storage)'s doc).
     fn crash_restart(&mut self, id: NodeId) {
-        self.sim.stop(id);
+        self.sim.stop(id.clone());
         let storage = self.nodes.remove(&id).expect("node exists").storage;
         self.add_node_with_storage(id, storage);
     }
@@ -230,8 +238,8 @@ impl Cluster {
     }
 
     async fn tick_all(&mut self, ids: &[NodeId], view: &MetadataView) {
-        for &id in ids {
-            self.tick(id, view).await;
+        for id in ids {
+            self.tick(id.clone(), view).await;
         }
     }
 
@@ -261,7 +269,7 @@ impl Cluster {
 // ---------------------------------------------------------------------------
 
 /// Poll `check` every `step`, up to `tries` times; returns whether it ever
-/// held. A bounded, `env.sleep`-driven wait for a *real* Raft convergence
+/// held. a() bounded, `env.sleep`-driven wait for a *real* Raft convergence
 /// (election, replication, membership change) inside one scenario's own
 /// script — independent of the outer [`run`] harness's sim-wide safety net.
 async fn wait_until(
@@ -306,7 +314,7 @@ async fn remove_replica_for_real(
             return true;
         }
         if victim.is_leader() {
-            victim.transfer_leadership(heir_id);
+            victim.transfer_leadership(heir_id.clone());
         } else if heir.is_leader() {
             let _: ProposeResult = heir.change_membership(remaining.clone());
         }
@@ -328,7 +336,7 @@ fn assert_hosted_converged(
 ) {
     let expected: BTreeSet<TabletId> = expected.into_iter().collect();
     assert_eq!(
-        c.hosted_set(node),
+        c.hosted_set(node.clone()),
         expected,
         "node {node}: hosted set did not converge to the expected final placement"
     );
@@ -380,37 +388,37 @@ fn assert_all_stopped(handles: &[KvNode]) {
 /// the observable *state* does not drift, which is the property that
 /// actually matters to a caller.
 async fn assert_idempotent(c: &mut Cluster, node: NodeId, view: &MetadataView) {
-    let before_hosted = c.hosted_set(node);
-    let before_hosted_log = c.hosted_log(node);
-    let before_teardown_log = c.teardown_log(node);
+    let before_hosted = c.hosted_set(node.clone());
+    let before_hosted_log = c.hosted_log(node.clone());
+    let before_teardown_log = c.teardown_log(node.clone());
     let mut before_scopes = BTreeMap::new();
     let mut before_configs = BTreeMap::new();
     for &t in &before_hosted {
-        if let Some(h) = c.node(node).hosted_node(t) {
+        if let Some(h) = c.node(node.clone()).hosted_node(t) {
             before_scopes.insert(t, h.scope_range());
             before_configs.insert(t, h.config());
         }
     }
 
-    c.tick(node, view).await;
+    c.tick(node.clone(), view).await;
 
     assert_eq!(
-        c.hosted_set(node),
+        c.hosted_set(node.clone()),
         before_hosted,
         "idempotence: node {node}'s hosted set drifted on a repeat tick"
     );
     assert_eq!(
-        c.hosted_log(node),
+        c.hosted_log(node.clone()),
         before_hosted_log,
         "idempotence: on_host fired again on a repeat tick"
     );
     assert_eq!(
-        c.teardown_log(node),
+        c.teardown_log(node.clone()),
         before_teardown_log,
         "idempotence: on_teardown fired again on a repeat tick"
     );
     for &t in &before_hosted {
-        if let Some(h) = c.node(node).hosted_node(t) {
+        if let Some(h) = c.node(node.clone()).hosted_node(t) {
             assert_eq!(
                 h.scope_range(),
                 before_scopes[&t],
@@ -455,7 +463,7 @@ where
     Fut: Future<Output = ()> + Send + 'static,
 {
     let mut sim = Simulator::new(seed);
-    let driver_env = sim.env(DRIVER_ID);
+    let driver_env = sim.env(driver_id());
     let done = Arc::new(Mutex::new(false));
     let done2 = Arc::clone(&done);
     let sim_in_task = sim.clone();
@@ -626,24 +634,24 @@ fn corpus() -> Vec<Scenario> {
 
 fn scenario_fresh_single_node(seed: u64) {
     run(seed, |sim| async move {
-        let env = sim.env(A);
+        let env = sim.env(a());
         let mut c = Cluster::new(sim);
-        c.add_node(A);
+        c.add_node(a());
 
-        let v = view([tablet(1, b"", None, vec![A])]);
-        c.tick(A, &v).await;
+        let v = view([tablet(1, b"", None, vec![a()])]);
+        c.tick(a(), &v).await;
         env.sleep(Duration::from_secs(2)).await; // a lone voter self-elects fast
 
-        let h = c.node(A).hosted_node(TabletId(1)).unwrap().clone();
+        let h = c.node(a()).hosted_node(TabletId(1)).unwrap().clone();
         assert!(h.is_leader(), "a lone voter must self-elect");
         h.put(b"k1".to_vec(), b"v1".to_vec());
         env.sleep(Duration::from_secs(1)).await;
         assert_eq!(h.linearizable_get(b"k1").await, Some(b"v1".to_vec()));
 
-        assert_hosted_converged(&c, A, [TabletId(1)]);
-        assert_eq!(c.hosted_log(A), vec![TabletId(1)]);
-        assert!(c.teardown_log(A).is_empty());
-        assert_idempotent(&mut c, A, &v).await;
+        assert_hosted_converged(&c, a(), [TabletId(1)]);
+        assert_eq!(c.hosted_log(a()), vec![TabletId(1)]);
+        assert!(c.teardown_log(a()).is_empty());
+        assert_idempotent(&mut c, a(), &v).await;
     });
 }
 
@@ -653,17 +661,17 @@ fn scenario_fresh_single_node(seed: u64) {
 
 fn scenario_fresh_two_replica(seed: u64) {
     run(seed, |sim| async move {
-        let env = sim.env(A);
+        let env = sim.env(a());
         let mut c = Cluster::new(sim);
-        c.add_node(A);
-        c.add_node(B);
+        c.add_node(a());
+        c.add_node(b());
 
-        let v = view([tablet(1, b"", None, vec![A, B])]);
-        c.tick_all(&[A, B], &v).await;
+        let v = view([tablet(1, b"", None, vec![a(), b()])]);
+        c.tick_all(&[a(), b()], &v).await;
         env.sleep(Duration::from_secs(2)).await; // elect
 
-        let ha = c.node(A).hosted_node(TabletId(1)).unwrap().clone();
-        let hb = c.node(B).hosted_node(TabletId(1)).unwrap().clone();
+        let ha = c.node(a()).hosted_node(TabletId(1)).unwrap().clone();
+        let hb = c.node(b()).hosted_node(TabletId(1)).unwrap().clone();
         let leader = if ha.is_leader() { &ha } else { &hb };
         leader.put(b"k".to_vec(), b"v".to_vec());
         env.sleep(Duration::from_secs(1)).await;
@@ -681,10 +689,10 @@ fn scenario_fresh_two_replica(seed: u64) {
             "the follower never replicated the write"
         );
 
-        assert_hosted_converged(&c, A, [TabletId(1)]);
-        assert_hosted_converged(&c, B, [TabletId(1)]);
-        assert_idempotent(&mut c, A, &v).await;
-        assert_idempotent(&mut c, B, &v).await;
+        assert_hosted_converged(&c, a(), [TabletId(1)]);
+        assert_hosted_converged(&c, b(), [TabletId(1)]);
+        assert_idempotent(&mut c, a(), &v).await;
+        assert_idempotent(&mut c, b(), &v).await;
     });
 }
 
@@ -697,15 +705,15 @@ const BOUNDARY: &[u8] = b"m";
 
 fn scenario_split_narrow_sibling(seed: u64) {
     run(seed, |sim| async move {
-        let env = sim.env(A);
+        let env = sim.env(a());
         let mut c = Cluster::new(sim);
-        c.add_node(A);
+        c.add_node(a());
 
-        let v1 = view([tablet(1, b"", None, vec![A])]);
-        c.tick(A, &v1).await;
+        let v1 = view([tablet(1, b"", None, vec![a()])]);
+        c.tick(a(), &v1).await;
         env.sleep(Duration::from_secs(2)).await;
 
-        let h1 = c.node(A).hosted_node(TabletId(1)).unwrap().clone();
+        let h1 = c.node(a()).hosted_node(TabletId(1)).unwrap().clone();
         for i in 0..5u64 {
             h1.put(
                 format!("a{i:02}").into_bytes(),
@@ -719,8 +727,8 @@ fn scenario_split_narrow_sibling(seed: u64) {
         env.sleep(Duration::from_secs(1)).await;
 
         // Narrow the source to the lower half (the split's source-side effect).
-        let v2 = view([tablet(1, b"", Some(BOUNDARY), vec![A])]);
-        c.tick(A, &v2).await;
+        let v2 = view([tablet(1, b"", Some(BOUNDARY), vec![a()])]);
+        c.tick(a(), &v2).await;
         assert_eq!(
             h1.scope_range(),
             KeyRange::new(b"".to_vec(), Some(BOUNDARY.to_vec()))
@@ -729,13 +737,13 @@ fn scenario_split_narrow_sibling(seed: u64) {
         // Host the sibling covering the upper half — has_data finds the "z.."
         // keys already present, so it forms as a fresh, full-voter tablet.
         let v3 = view([
-            tablet(1, b"", Some(BOUNDARY), vec![A]),
-            tablet(2, BOUNDARY, None, vec![A]),
+            tablet(1, b"", Some(BOUNDARY), vec![a()]),
+            tablet(2, BOUNDARY, None, vec![a()]),
         ]);
-        c.tick(A, &v3).await;
+        c.tick(a(), &v3).await;
         env.sleep(Duration::from_secs(2)).await;
 
-        let h2 = c.node(A).hosted_node(TabletId(2)).unwrap().clone();
+        let h2 = c.node(a()).hosted_node(TabletId(2)).unwrap().clone();
         assert!(h2.is_leader(), "the fresh sibling must self-elect");
         for i in 0..5u64 {
             assert_eq!(
@@ -750,8 +758,8 @@ fn scenario_split_narrow_sibling(seed: u64) {
             );
         }
 
-        assert_hosted_converged(&c, A, [TabletId(1), TabletId(2)]);
-        assert_idempotent(&mut c, A, &v3).await;
+        assert_hosted_converged(&c, a(), [TabletId(1), TabletId(2)]);
+        assert_idempotent(&mut c, a(), &v3).await;
     });
 }
 
@@ -764,28 +772,28 @@ fn scenario_split_narrow_sibling(seed: u64) {
 
 fn scenario_rebalance_off_release(seed: u64) {
     run(seed, |sim| async move {
-        let env = sim.env(A);
-        let other_env = sim.env(B);
+        let env = sim.env(a());
+        let other_env = sim.env(b());
         let mut c = Cluster::new(sim);
-        c.add_node(A);
+        c.add_node(a());
 
-        let v1 = view([tablet(1, b"", None, vec![A, B])]);
-        c.tick(A, &v1).await;
+        let v1 = view([tablet(1, b"", None, vec![a(), b()])]);
+        c.tick(a(), &v1).await;
         env.sleep(Duration::from_secs(2)).await;
 
-        // B: a genuine second voter, constructed directly (this scenario only
+        // b(): a genuine second voter, constructed directly (this scenario only
         // needs a real second voter, not a second node's full lifecycle).
         let b_storage = MemoryEngine::new();
         let hb = KvNode::start_hosted(
             other_env,
-            vec![A, B],
+            vec![a(), b()],
             b_storage,
             StorageScope::new(prefix_for(TABLE), KeyRange::whole()),
             1,
         );
         env.sleep(Duration::from_secs(2)).await;
 
-        let ha = c.node(A).hosted_node(TabletId(1)).unwrap().clone();
+        let ha = c.node(a()).hosted_node(TabletId(1)).unwrap().clone();
         for i in 0..5u64 {
             let leader = if ha.is_leader() { &ha } else { &hb };
             leader.put(
@@ -801,54 +809,54 @@ fn scenario_rebalance_off_release(seed: u64) {
 
         // Narrow tablet 1 (the split's source-side effect) then host the
         // co-hosted sibling covering the upper half.
-        let v2 = view([tablet(1, b"", Some(BOUNDARY), vec![A, B])]);
-        c.tick(A, &v2).await;
+        let v2 = view([tablet(1, b"", Some(BOUNDARY), vec![a(), b()])]);
+        c.tick(a(), &v2).await;
         let v3 = view([
-            tablet(1, b"", Some(BOUNDARY), vec![A, B]),
-            tablet(2, BOUNDARY, None, vec![A]),
+            tablet(1, b"", Some(BOUNDARY), vec![a(), b()]),
+            tablet(2, BOUNDARY, None, vec![a()]),
         ]);
-        c.tick(A, &v3).await;
+        c.tick(a(), &v3).await;
         env.sleep(Duration::from_secs(2)).await;
 
-        let h2 = c.node(A).hosted_node(TabletId(2)).unwrap().clone();
+        let h2 = c.node(a()).hosted_node(TabletId(2)).unwrap().clone();
         assert_eq!(
             h2.local_get(b"z00").await,
             Some(b"hi0".to_vec()),
             "sanity: sibling data present before release"
         );
 
-        remove_replica_for_real(&env, &ha, A, &hb, B, [B].into_iter().collect()).await;
+        remove_replica_for_real(&env, &ha, a(), &hb, b(), [b()].into_iter().collect()).await;
 
         // Drive the release-confirm dampener to completion.
         let v4 = view([
-            tablet(1, b"", Some(BOUNDARY), vec![B]),
-            tablet(2, BOUNDARY, None, vec![A]),
+            tablet(1, b"", Some(BOUNDARY), vec![b()]),
+            tablet(2, BOUNDARY, None, vec![a()]),
         ]);
         for _ in 0..10 {
-            c.tick(A, &v4).await;
+            c.tick(a(), &v4).await;
             env.sleep(Duration::from_millis(50)).await;
         }
 
-        assert_hosted_converged(&c, A, [TabletId(2)]);
-        assert_eq!(c.hosted_log(A), vec![TabletId(1), TabletId(2)]);
-        assert_eq!(c.teardown_log(A), vec![TabletId(1)]);
+        assert_hosted_converged(&c, a(), [TabletId(2)]);
+        assert_eq!(c.hosted_log(a()), vec![TabletId(1), TabletId(2)]);
+        assert_eq!(c.teardown_log(a()), vec![TabletId(1)]);
         assert_all_stopped(&[ha]);
 
         for i in 0..5u64 {
             assert_absent(
-                c.storage(A),
+                c.storage(a()),
                 &physical(format!("a{i:02}").into_bytes().as_slice()),
             )
             .await;
             assert_present(
-                c.storage(A),
+                c.storage(a()),
                 &physical(format!("z{i:02}").into_bytes().as_slice()),
                 format!("hi{i}").into_bytes().as_slice(),
             )
             .await;
         }
 
-        assert_idempotent(&mut c, A, &v4).await;
+        assert_idempotent(&mut c, a(), &v4).await;
     });
 }
 
@@ -858,27 +866,27 @@ fn scenario_rebalance_off_release(seed: u64) {
 
 fn scenario_drop_table_reclaim(seed: u64) {
     run(seed, |sim| async move {
-        let env = sim.env(A);
+        let env = sim.env(a());
         let mut c = Cluster::new(sim);
-        c.add_node(A);
+        c.add_node(a());
 
-        let v1 = view([tablet(1, b"", None, vec![A])]);
-        c.tick(A, &v1).await;
+        let v1 = view([tablet(1, b"", None, vec![a()])]);
+        c.tick(a(), &v1).await;
         env.sleep(Duration::from_secs(2)).await;
 
-        let h1 = c.node(A).hosted_node(TabletId(1)).unwrap().clone();
+        let h1 = c.node(a()).hosted_node(TabletId(1)).unwrap().clone();
         h1.put(b"k".to_vec(), b"v".to_vec());
         env.sleep(Duration::from_secs(1)).await;
 
         let v2 = view([]); // the whole table dropped
-        c.tick(A, &v2).await;
+        c.tick(a(), &v2).await;
 
-        assert_hosted_converged(&c, A, []);
-        assert_eq!(c.teardown_log(A), vec![TabletId(1)]);
+        assert_hosted_converged(&c, a(), []);
+        assert_eq!(c.teardown_log(a()), vec![TabletId(1)]);
         assert_all_stopped(&[h1]);
-        assert_absent(c.storage(A), &physical(b"k")).await;
+        assert_absent(c.storage(a()), &physical(b"k")).await;
 
-        assert_idempotent(&mut c, A, &v2).await;
+        assert_idempotent(&mut c, a(), &v2).await;
     });
 }
 
@@ -888,45 +896,45 @@ fn scenario_drop_table_reclaim(seed: u64) {
 
 fn scenario_spare_join_promoted(seed: u64) {
     run(seed, |sim| async move {
-        let env = sim.env(A);
+        let env = sim.env(a());
         let mut c = Cluster::new(sim);
-        c.add_node(A);
-        c.add_node(B);
+        c.add_node(a());
+        c.add_node(b());
 
-        let v1 = view([tablet(1, b"", None, vec![A])]);
-        c.tick(A, &v1).await;
+        let v1 = view([tablet(1, b"", None, vec![a()])]);
+        c.tick(a(), &v1).await;
         env.sleep(Duration::from_secs(2)).await;
-        let ha = c.node(A).hosted_node(TabletId(1)).unwrap().clone();
+        let ha = c.node(a()).hosted_node(TabletId(1)).unwrap().clone();
         assert!(ha.is_leader());
 
-        // B is a spare: the tablet's replica set now includes it, at a bumped
+        // b() is a spare: the tablet's replica set now includes it, at a bumped
         // epoch — `plan_join_host` says "join as non-voter."
-        let v2 = tablet_at_epoch(1, b"", None, vec![A, B], 2);
+        let v2 = tablet_at_epoch(1, b"", None, vec![a(), b()], 2);
         let v2 = view([v2]);
-        c.tick(B, &v2).await;
-        let hb = c.node(B).hosted_node(TabletId(1)).unwrap().clone();
+        c.tick(b(), &v2).await;
+        let hb = c.node(b()).hosted_node(TabletId(1)).unwrap().clone();
         assert!(
-            !hb.config().contains(&B),
+            !hb.config().contains(&b()),
             "a spare must start as a non-voter, not already in its own config"
         );
 
-        // The leader's own Reconfigure action must promote B to a real voter.
+        // The leader's own Reconfigure action must promote b() to a real voter.
         for _ in 0..40 {
-            c.tick(A, &v2).await;
+            c.tick(a(), &v2).await;
             env.sleep(Duration::from_millis(100)).await;
-            if ha.config().contains(&B) {
+            if ha.config().contains(&b()) {
                 break;
             }
         }
         assert!(
-            ha.config().contains(&B),
+            ha.config().contains(&b()),
             "the leader never promoted the spare to a voter"
         );
 
-        assert_hosted_converged(&c, A, [TabletId(1)]);
-        assert_hosted_converged(&c, B, [TabletId(1)]);
-        assert_idempotent(&mut c, A, &v2).await;
-        assert_idempotent(&mut c, B, &v2).await;
+        assert_hosted_converged(&c, a(), [TabletId(1)]);
+        assert_hosted_converged(&c, b(), [TabletId(1)]);
+        assert_idempotent(&mut c, a(), &v2).await;
+        assert_idempotent(&mut c, b(), &v2).await;
     });
 }
 
@@ -936,25 +944,25 @@ fn scenario_spare_join_promoted(seed: u64) {
 
 fn scenario_growth_node_late_view(seed: u64) {
     run(seed, |sim| async move {
-        let env = sim.env(A);
+        let env = sim.env(a());
         let mut c = Cluster::new(sim);
-        c.add_node(A);
-        c.add_node(B);
+        c.add_node(a());
+        c.add_node(b());
 
-        let v = view([tablet(1, b"", None, vec![A, B])]);
-        // A ticks immediately and hosts; B's own reconciler is not ticked at
+        let v = view([tablet(1, b"", None, vec![a(), b()])]);
+        // a() ticks immediately and hosts; b()'s own reconciler is not ticked at
         // all yet — modelling a node whose control-plane view arrives late
         // (a just-grown cluster member's own control raft lagging, ADR 0030).
-        c.tick(A, &v).await;
+        c.tick(a(), &v).await;
         env.sleep(Duration::from_secs(5)).await;
-        assert_hosted_converged(&c, B, []); // B genuinely never ticked
+        assert_hosted_converged(&c, b(), []); // b() genuinely never ticked
 
-        // B's view finally arrives.
-        c.tick(B, &v).await;
+        // b()'s view finally arrives.
+        c.tick(b(), &v).await;
         env.sleep(Duration::from_secs(2)).await;
 
-        let ha = c.node(A).hosted_node(TabletId(1)).unwrap().clone();
-        let hb = c.node(B).hosted_node(TabletId(1)).unwrap().clone();
+        let ha = c.node(a()).hosted_node(TabletId(1)).unwrap().clone();
+        let hb = c.node(b()).hosted_node(TabletId(1)).unwrap().clone();
         let leader = if ha.is_leader() { &ha } else { &hb };
         leader.put(b"k".to_vec(), b"v".to_vec());
         env.sleep(Duration::from_secs(1)).await;
@@ -968,10 +976,10 @@ fn scenario_growth_node_late_view(seed: u64) {
             "the follower never replicated the write"
         );
 
-        assert_hosted_converged(&c, A, [TabletId(1)]);
-        assert_hosted_converged(&c, B, [TabletId(1)]);
-        assert_idempotent(&mut c, A, &v).await;
-        assert_idempotent(&mut c, B, &v).await;
+        assert_hosted_converged(&c, a(), [TabletId(1)]);
+        assert_hosted_converged(&c, b(), [TabletId(1)]);
+        assert_idempotent(&mut c, a(), &v).await;
+        assert_idempotent(&mut c, b(), &v).await;
     });
 }
 
@@ -981,30 +989,30 @@ fn scenario_growth_node_late_view(seed: u64) {
 
 fn scenario_reconfigure_down_replica(seed: u64) {
     run(seed, |sim| async move {
-        let env = sim.env(A);
+        let env = sim.env(a());
         let mut c = Cluster::new(sim);
-        c.add_node(A);
-        c.add_node(B);
-        c.add_node(C);
+        c.add_node(a());
+        c.add_node(b());
+        c.add_node(node_c());
 
-        let v1 = view([tablet(1, b"", None, vec![A, B, C])]);
-        c.tick_all(&[A, B, C], &v1).await;
+        let v1 = view([tablet(1, b"", None, vec![a(), b(), node_c()])]);
+        c.tick_all(&[a(), b(), node_c()], &v1).await;
         env.sleep(Duration::from_secs(2)).await;
 
-        let ha = c.node(A).hosted_node(TabletId(1)).unwrap().clone();
-        let hb = c.node(B).hosted_node(TabletId(1)).unwrap().clone();
+        let ha = c.node(a()).hosted_node(TabletId(1)).unwrap().clone();
+        let hb = c.node(b()).hosted_node(TabletId(1)).unwrap().clone();
 
-        // The control plane marks C down and no longer desires it. Tick
-        // EVERY node each round (not just whoever led at the start) — if C
+        // The control plane marks node_c() down and no longer desires it. Tick
+        // EVERY node each round (not just whoever led at the start) — if node_c()
         // itself happens to be the leader, `reconfigure_step` can't remove
         // itself directly (a Down *self* isn't eligible for the ungated
         // down-extra removal, which explicitly excludes `me`); it must first
         // transfer leadership to a member of `desired`, and the NEW leader's
         // OWN next tick is what actually performs the removal.
-        let v2 = view_with_down([tablet(1, b"", None, vec![A, B])], [C]);
-        let target: BTreeSet<NodeId> = [A, B].into_iter().collect();
+        let v2 = view_with_down([tablet(1, b"", None, vec![a(), b()])], [node_c()]);
+        let target: BTreeSet<NodeId> = [a(), b()].into_iter().collect();
         for _ in 0..80 {
-            c.tick_all(&[A, B, C], &v2).await;
+            c.tick_all(&[a(), b(), node_c()], &v2).await;
             env.sleep(Duration::from_millis(100)).await;
             if ha.config() == target && hb.config() == target {
                 break;
@@ -1012,13 +1020,13 @@ fn scenario_reconfigure_down_replica(seed: u64) {
         }
         assert_eq!(
             ha.config(),
-            [A, B].into_iter().collect::<BTreeSet<_>>(),
-            "the down replica was never removed from A's view of the group"
+            [a(), b()].into_iter().collect::<BTreeSet<_>>(),
+            "the down replica was never removed from a()'s view of the group"
         );
         assert_eq!(
             hb.config(),
-            [A, B].into_iter().collect::<BTreeSet<_>>(),
-            "the down replica was never removed from B's view of the group"
+            [a(), b()].into_iter().collect::<BTreeSet<_>>(),
+            "the down replica was never removed from b()'s view of the group"
         );
     });
 }
@@ -1030,23 +1038,23 @@ fn scenario_reconfigure_down_replica(seed: u64) {
 
 fn scenario_merge_widens_and_absorbs(seed: u64) {
     run(seed, |sim| async move {
-        let env = sim.env(A);
+        let env = sim.env(a());
         let mut c = Cluster::new(sim);
-        c.add_node(A);
+        c.add_node(a());
 
         // Two adjacent tablets — `MergeTablets` requires an identical
-        // replica set, trivially true here (both on the sole node A), and
+        // replica set, trivially true here (both on the sole node a()), and
         // both share one node-shared `MemoryEngine` (`Cluster::add_node`),
         // exactly like `animusd`'s one-LSM-per-node design (ADR 0026/0028).
         let v1 = view([
-            tablet(1, b"", Some(BOUNDARY), vec![A]),
-            tablet(2, BOUNDARY, None, vec![A]),
+            tablet(1, b"", Some(BOUNDARY), vec![a()]),
+            tablet(2, BOUNDARY, None, vec![a()]),
         ]);
-        c.tick(A, &v1).await;
+        c.tick(a(), &v1).await;
         env.sleep(Duration::from_secs(2)).await;
 
-        let h1 = c.node(A).hosted_node(TabletId(1)).unwrap().clone();
-        let h2 = c.node(A).hosted_node(TabletId(2)).unwrap().clone();
+        let h1 = c.node(a()).hosted_node(TabletId(1)).unwrap().clone();
+        let h2 = c.node(a()).hosted_node(TabletId(2)).unwrap().clone();
         assert!(
             h1.is_leader() && h2.is_leader(),
             "both lone voters self-elect"
@@ -1082,9 +1090,9 @@ fn scenario_merge_widens_and_absorbs(seed: u64) {
         // merged-away — the exact `Metadata` shape `MergeTablets`'s apply
         // produces. The widen is deferred one tick behind the absorb
         // (drain-before-widen, ADR 0033), so tick twice.
-        let v2 = view_with_merged([tablet(1, b"", None, vec![A])], [2]);
-        c.tick(A, &v2).await;
-        c.tick(A, &v2).await;
+        let v2 = view_with_merged([tablet(1, b"", None, vec![a()])], [2]);
+        c.tick(a(), &v2).await;
+        c.tick(a(), &v2).await;
         env.sleep(Duration::from_secs(1)).await;
 
         assert_eq!(
@@ -1115,10 +1123,10 @@ fn scenario_merge_widens_and_absorbs(seed: u64) {
         assert_all_stopped(&[h2]);
         // …but its data was never erased: a raw physical-key read against the
         // shared engine (independent of any group's scope) still finds it.
-        assert_present(c.storage(A), &physical(b"z00"), b"hi0").await;
+        assert_present(c.storage(a()), &physical(b"z00"), b"hi0").await;
 
-        assert_hosted_converged(&c, A, [TabletId(1)]);
-        assert_idempotent(&mut c, A, &v2).await;
+        assert_hosted_converged(&c, a(), [TabletId(1)]);
+        assert_idempotent(&mut c, a(), &v2).await;
     });
 }
 
@@ -1128,26 +1136,26 @@ fn scenario_merge_widens_and_absorbs(seed: u64) {
 
 fn scenario_idempotent_multi_tablet(seed: u64) {
     run(seed, |sim| async move {
-        let env = sim.env(A);
+        let env = sim.env(a());
         let mut c = Cluster::new(sim);
-        c.add_node(A);
-        c.add_node(B);
+        c.add_node(a());
+        c.add_node(b());
 
         let v = view([
-            tablet(1, b"", Some(BOUNDARY), vec![A, B]),
-            tablet(2, BOUNDARY, None, vec![A]),
+            tablet(1, b"", Some(BOUNDARY), vec![a(), b()]),
+            tablet(2, BOUNDARY, None, vec![a()]),
         ]);
-        c.tick_all(&[A, B], &v).await;
+        c.tick_all(&[a(), b()], &v).await;
         env.sleep(Duration::from_secs(2)).await;
 
-        assert_hosted_converged(&c, A, [TabletId(1), TabletId(2)]);
-        assert_hosted_converged(&c, B, [TabletId(1)]);
+        assert_hosted_converged(&c, a(), [TabletId(1), TabletId(2)]);
+        assert_hosted_converged(&c, b(), [TabletId(1)]);
 
         // Two extra ticks each, no drift at any point.
-        assert_idempotent(&mut c, A, &v).await;
-        assert_idempotent(&mut c, A, &v).await;
-        assert_idempotent(&mut c, B, &v).await;
-        assert_idempotent(&mut c, B, &v).await;
+        assert_idempotent(&mut c, a(), &v).await;
+        assert_idempotent(&mut c, a(), &v).await;
+        assert_idempotent(&mut c, b(), &v).await;
+        assert_idempotent(&mut c, b(), &v).await;
     });
 }
 
@@ -1158,20 +1166,20 @@ fn scenario_idempotent_multi_tablet(seed: u64) {
 
 fn scenario_reconfigure_self_removal(seed: u64) {
     run(seed, |sim| async move {
-        let env = sim.env(A);
+        let env = sim.env(a());
         let mut c = Cluster::new(sim);
-        c.add_node(A);
-        c.add_node(B);
-        c.add_node(C);
+        c.add_node(a());
+        c.add_node(b());
+        c.add_node(node_c());
 
-        let v1 = view([tablet(1, b"", None, vec![A, B, C])]);
-        c.tick_all(&[A, B, C], &v1).await;
+        let v1 = view([tablet(1, b"", None, vec![a(), b(), node_c()])]);
+        c.tick_all(&[a(), b(), node_c()], &v1).await;
         env.sleep(Duration::from_secs(2)).await;
 
-        let ha = c.node(A).hosted_node(TabletId(1)).unwrap().clone();
-        let hb = c.node(B).hosted_node(TabletId(1)).unwrap().clone();
-        let hc = c.node(C).hosted_node(TabletId(1)).unwrap().clone();
-        // A little write traffic so `commit_index` genuinely advances (the
+        let ha = c.node(a()).hosted_node(TabletId(1)).unwrap().clone();
+        let hb = c.node(b()).hosted_node(TabletId(1)).unwrap().clone();
+        let hc = c.node(node_c()).hosted_node(TabletId(1)).unwrap().clone();
+        // a() little write traffic so `commit_index` genuinely advances (the
         // transfer target must be caught up to it).
         let leader0 = if ha.is_leader() {
             &ha
@@ -1188,14 +1196,17 @@ fn scenario_reconfigure_self_removal(seed: u64) {
         // Find whoever leads NOW and desire everyone else — forcing the
         // "must remove the leader itself" branch regardless of who won.
         let (leader_id, leader): (NodeId, &KvNode) = if ha.is_leader() {
-            (A, &ha)
+            (a(), &ha)
         } else if hb.is_leader() {
-            (B, &hb)
+            (b(), &hb)
         } else {
-            (C, &hc)
+            (node_c(), &hc)
         };
-        let desired: BTreeSet<NodeId> = [A, B, C].into_iter().filter(|&n| n != leader_id).collect();
-        let v2 = view([tablet(1, b"", None, desired.iter().copied().collect())]);
+        let desired: BTreeSet<NodeId> = [a(), b(), node_c()]
+            .into_iter()
+            .filter(|n| *n != leader_id)
+            .collect();
+        let v2 = view([tablet(1, b"", None, desired.iter().cloned().collect())]);
 
         // Tick EVERY node each round: `reconfigure_step` first arms a
         // leadership transfer (the old leader can't remove itself directly),
@@ -1203,7 +1214,7 @@ fn scenario_reconfigure_self_removal(seed: u64) {
         // removal — ticking only the original leader id would stall forever
         // the instant leadership moves.
         for _ in 0..60 {
-            c.tick_all(&[A, B, C], &v2).await;
+            c.tick_all(&[a(), b(), node_c()], &v2).await;
             env.sleep(Duration::from_millis(100)).await;
             if !leader.config().contains(&leader_id) {
                 break;
@@ -1223,35 +1234,35 @@ fn scenario_reconfigure_self_removal(seed: u64) {
 
 fn scenario_crash_restart_single(seed: u64) {
     run(seed, |sim| async move {
-        let env = sim.env(A);
+        let env = sim.env(a());
         let mut c = Cluster::new(sim);
-        c.add_node(A);
+        c.add_node(a());
 
-        let v1 = view([tablet(1, b"", None, vec![A])]);
-        c.tick(A, &v1).await;
+        let v1 = view([tablet(1, b"", None, vec![a()])]);
+        c.tick(a(), &v1).await;
         env.sleep(Duration::from_secs(2)).await;
-        let h1 = c.node(A).hosted_node(TabletId(1)).unwrap().clone();
+        let h1 = c.node(a()).hosted_node(TabletId(1)).unwrap().clone();
         for i in 0..5u64 {
             h1.put(format!("k{i}").into_bytes(), format!("v{i}").into_bytes());
         }
         env.sleep(Duration::from_secs(1)).await;
 
-        c.crash_restart(A);
-        // Note: `env` (a `SimEnv` handle for node A) stays valid across the
+        c.crash_restart(a());
+        // Note: `env` (a `SimEnv` handle for node a()) stays valid across the
         // crash — `Clock::sleep` schedules against the simulator's global
         // timeline, not any per-node task list, so it's unaffected by
         // `Simulator::stop`'s task-killing (only tasks *spawned* on a node's
         // env, like `RaftKvNode`'s driver loop, get killed).
 
         // The restart view: unchanged replica set, but a bumped epoch — as if
-        // some unrelated placement event advanced it while A was down. WITHOUT
+        // some unrelated placement event advanced it while a() was down. WITHOUT
         // the `has_data` restart-upgrade, `plan_join_host` would say "join as
         // non-voter", which for a single-replica tablet can NEVER elect.
-        let v2 = view([tablet_at_epoch(1, b"", None, vec![A], 5)]);
-        c.tick(A, &v2).await;
+        let v2 = view([tablet_at_epoch(1, b"", None, vec![a()], 5)]);
+        c.tick(a(), &v2).await;
         env.sleep(Duration::from_secs(2)).await;
 
-        let h1b = c.node(A).hosted_node(TabletId(1)).unwrap().clone();
+        let h1b = c.node(a()).hosted_node(TabletId(1)).unwrap().clone();
         assert!(
             wait_until(&env, 50, Duration::from_millis(100), || h1b.is_leader()).await,
             "the restarted sole replica never re-elected itself (has_data upgrade failed)"
@@ -1264,8 +1275,8 @@ fn scenario_crash_restart_single(seed: u64) {
             );
         }
 
-        assert_hosted_converged(&c, A, [TabletId(1)]);
-        assert_idempotent(&mut c, A, &v2).await;
+        assert_hosted_converged(&c, a(), [TabletId(1)]);
+        assert_idempotent(&mut c, a(), &v2).await;
     });
 }
 
@@ -1275,37 +1286,37 @@ fn scenario_crash_restart_single(seed: u64) {
 
 fn scenario_crash_restart_follower(seed: u64) {
     run(seed, |sim| async move {
-        let env_a = sim.env(A);
+        let env_a = sim.env(a());
         let mut c = Cluster::new(sim);
-        c.add_node(A);
-        c.add_node(B);
+        c.add_node(a());
+        c.add_node(b());
 
-        let v1 = view([tablet(1, b"", None, vec![A, B])]);
-        c.tick_all(&[A, B], &v1).await;
+        let v1 = view([tablet(1, b"", None, vec![a(), b()])]);
+        c.tick_all(&[a(), b()], &v1).await;
         env_a.sleep(Duration::from_secs(2)).await;
 
-        let ha = c.node(A).hosted_node(TabletId(1)).unwrap().clone();
-        let hb = c.node(B).hosted_node(TabletId(1)).unwrap().clone();
+        let ha = c.node(a()).hosted_node(TabletId(1)).unwrap().clone();
+        let hb = c.node(b()).hosted_node(TabletId(1)).unwrap().clone();
         let leader = if ha.is_leader() { &ha } else { &hb };
         for i in 0..5u64 {
             leader.put(format!("k{i}").into_bytes(), format!("v{i}").into_bytes());
         }
         env_a.sleep(Duration::from_secs(2)).await;
 
-        // Restart B (whichever role it currently holds), at a bumped epoch —
-        // simulating an unrelated earlier reconfigure event, so B's own
+        // Restart b() (whichever role it currently holds), at a bumped epoch —
+        // simulating an unrelated earlier reconfigure event, so b()'s own
         // `has_data` (not epoch<=INITIAL) is what must drive full re-formation.
-        c.crash_restart(B);
-        let v2 = view([tablet_at_epoch(1, b"", None, vec![A, B], 3)]);
-        c.tick(B, &v2).await;
+        c.crash_restart(b());
+        let v2 = view([tablet_at_epoch(1, b"", None, vec![a(), b()], 3)]);
+        c.tick(b(), &v2).await;
         env_a.sleep(Duration::from_secs(1)).await;
-        c.tick(A, &v2).await; // A's own Reconfigure/no-op pass on the same view
+        c.tick(a(), &v2).await; // a()'s own Reconfigure/no-op pass on the same view
         env_a.sleep(Duration::from_secs(3)).await;
 
-        let hb2 = c.node(B).hosted_node(TabletId(1)).unwrap().clone();
+        let hb2 = c.node(b()).hosted_node(TabletId(1)).unwrap().clone();
         assert!(
             wait_until(&env_a, 80, Duration::from_millis(100), || {
-                hb2.config().contains(&B)
+                hb2.config().contains(&b())
             })
             .await,
             "the restarted follower never rejoined as a real voter"
@@ -1318,10 +1329,10 @@ fn scenario_crash_restart_follower(seed: u64) {
             );
         }
 
-        assert_hosted_converged(&c, A, [TabletId(1)]);
-        assert_hosted_converged(&c, B, [TabletId(1)]);
-        assert_idempotent(&mut c, A, &v2).await;
-        assert_idempotent(&mut c, B, &v2).await;
+        assert_hosted_converged(&c, a(), [TabletId(1)]);
+        assert_hosted_converged(&c, b(), [TabletId(1)]);
+        assert_idempotent(&mut c, a(), &v2).await;
+        assert_idempotent(&mut c, b(), &v2).await;
     });
 }
 
@@ -1333,33 +1344,33 @@ fn scenario_crash_restart_follower(seed: u64) {
 
 fn scenario_replay_epoch_flicker(seed: u64) {
     run(seed, |sim| async move {
-        let env = sim.env(A);
-        let other_env = sim.env(B);
+        let env = sim.env(a());
+        let other_env = sim.env(b());
         let mut c = Cluster::new(sim);
-        c.add_node(A);
+        c.add_node(a());
 
-        let v1 = view([tablet(1, b"", None, vec![A, B])]);
-        c.tick(A, &v1).await;
+        let v1 = view([tablet(1, b"", None, vec![a(), b()])]);
+        c.tick(a(), &v1).await;
         env.sleep(Duration::from_secs(2)).await;
 
         let b_storage = MemoryEngine::new();
         let hb = KvNode::start_hosted(
             other_env,
-            vec![A, B],
+            vec![a(), b()],
             b_storage,
             StorageScope::new(prefix_for(TABLE), KeyRange::whole()),
             1,
         );
         env.sleep(Duration::from_secs(2)).await;
-        let ha = c.node(A).hosted_node(TabletId(1)).unwrap().clone();
+        let ha = c.node(a()).hosted_node(TabletId(1)).unwrap().clone();
 
-        remove_replica_for_real(&env, &ha, A, &hb, B, [B].into_iter().collect()).await;
+        remove_replica_for_real(&env, &ha, a(), &hb, b(), [b()].into_iter().collect()).await;
 
         // One qualifying tick at epoch 2 (count -> 1).
-        let excluded_e2 = view([tablet_at_epoch(1, b"", None, vec![B], 2)]);
-        c.tick(A, &excluded_e2).await;
+        let excluded_e2 = view([tablet_at_epoch(1, b"", None, vec![b()], 2)]);
+        c.tick(a(), &excluded_e2).await;
         assert!(
-            c.node(A)
+            c.node(a())
                 .local_state()
                 .pending_release
                 .get(&TabletId(1))
@@ -1367,12 +1378,12 @@ fn scenario_replay_epoch_flicker(seed: u64) {
             "the first qualifying tick must start the confirm counter"
         );
 
-        // A "replay" epoch bump WHILE still excluded (e.g. an unrelated
+        // a() "replay" epoch bump WHILE still excluded (e.g. an unrelated
         // placement event) — the dampener must RESET, not advance.
-        let excluded_e3 = view([tablet_at_epoch(1, b"", None, vec![B], 3)]);
-        c.tick(A, &excluded_e3).await;
+        let excluded_e3 = view([tablet_at_epoch(1, b"", None, vec![b()], 3)]);
+        c.tick(a(), &excluded_e3).await;
         assert!(
-            c.node(A)
+            c.node(a())
                 .local_state()
                 .pending_release
                 .get(&TabletId(1))
@@ -1380,20 +1391,20 @@ fn scenario_replay_epoch_flicker(seed: u64) {
             "an epoch change mid-count must reset the confirm counter, not advance it"
         );
         assert!(
-            c.hosted_set(A).contains(&TabletId(1)),
+            c.hosted_set(a()).contains(&TabletId(1)),
             "no premature release"
         );
 
         // Now hold epoch 3 stable for the remaining confirm ticks.
         for _ in 0..5 {
-            c.tick(A, &excluded_e3).await;
+            c.tick(a(), &excluded_e3).await;
             env.sleep(Duration::from_millis(50)).await;
         }
 
-        assert_hosted_converged(&c, A, []);
-        assert_eq!(c.teardown_log(A), vec![TabletId(1)]);
+        assert_hosted_converged(&c, a(), []);
+        assert_eq!(c.teardown_log(a()), vec![TabletId(1)]);
         assert_all_stopped(&[ha]);
-        assert_idempotent(&mut c, A, &excluded_e3).await;
+        assert_idempotent(&mut c, a(), &excluded_e3).await;
     });
 }
 
@@ -1408,33 +1419,33 @@ fn scenario_replay_epoch_flicker(seed: u64) {
 
 fn scenario_replay_absent_then_present(seed: u64) {
     run(seed, |sim| async move {
-        let env = sim.env(A);
+        let env = sim.env(a());
         let mut c = Cluster::new(sim);
-        c.add_node(A);
+        c.add_node(a());
 
-        let v1 = view([tablet(1, b"", None, vec![A])]);
-        c.tick(A, &v1).await;
+        let v1 = view([tablet(1, b"", None, vec![a()])]);
+        c.tick(a(), &v1).await;
         env.sleep(Duration::from_secs(2)).await;
-        let h1 = c.node(A).hosted_node(TabletId(1)).unwrap().clone();
+        let h1 = c.node(a()).hosted_node(TabletId(1)).unwrap().clone();
         h1.put(b"k".to_vec(), b"v".to_vec());
         env.sleep(Duration::from_secs(1)).await;
-        assert_present(c.storage(A), &physical(b"k"), b"v").await;
+        assert_present(c.storage(a()), &physical(b"k"), b"v").await;
 
-        // A transient "absent" view (e.g. the caller ticked mid control-plane
+        // a() transient "absent" view (e.g. the caller ticked mid control-plane
         // WAL replay, before recovery reached the tablet's re-creation entry).
         let v_absent = view([]);
-        c.tick(A, &v_absent).await;
-        assert_hosted_converged(&c, A, []);
-        assert_eq!(c.teardown_log(A), vec![TabletId(1)]);
+        c.tick(a(), &v_absent).await;
+        assert_hosted_converged(&c, a(), []);
+        assert_eq!(c.teardown_log(a()), vec![TabletId(1)]);
         assert_all_stopped(&[h1]);
-        assert_absent(c.storage(A), &physical(b"k")).await;
+        assert_absent(c.storage(a()), &physical(b"k")).await;
 
         // The tablet "reappears" (replay catches up to its final, settled
         // state) — a brand-new Host, with no memory of the erased data.
-        let v_present_again = view([tablet(1, b"", None, vec![A])]);
-        c.tick(A, &v_present_again).await;
+        let v_present_again = view([tablet(1, b"", None, vec![a()])]);
+        c.tick(a(), &v_present_again).await;
         env.sleep(Duration::from_secs(2)).await;
-        let h1b = c.node(A).hosted_node(TabletId(1)).unwrap().clone();
+        let h1b = c.node(a()).hosted_node(TabletId(1)).unwrap().clone();
         assert!(h1b.is_leader());
         assert_eq!(
             h1b.linearizable_get(b"k").await,
@@ -1444,8 +1455,8 @@ fn scenario_replay_absent_then_present(seed: u64) {
              loses data; this is the contract boundary, not a bug here"
         );
 
-        assert_hosted_converged(&c, A, [TabletId(1)]);
-        assert_idempotent(&mut c, A, &v_present_again).await;
+        assert_hosted_converged(&c, a(), [TabletId(1)]);
+        assert_idempotent(&mut c, a(), &v_present_again).await;
     });
 }
 
@@ -1458,33 +1469,33 @@ fn scenario_replay_absent_then_present(seed: u64) {
 fn scenario_partition_blocks_release(seed: u64) {
     run(seed, |sim| async move {
         let sim2 = sim.clone();
-        let env = sim.env(A);
-        let other_env = sim.env(B);
+        let env = sim.env(a());
+        let other_env = sim.env(b());
         let mut c = Cluster::new(sim);
-        c.add_node(A);
+        c.add_node(a());
 
-        let v1 = view([tablet(1, b"", None, vec![A, B])]);
-        c.tick(A, &v1).await;
+        let v1 = view([tablet(1, b"", None, vec![a(), b()])]);
+        c.tick(a(), &v1).await;
         env.sleep(Duration::from_secs(2)).await;
 
         let b_storage = MemoryEngine::new();
         let hb = KvNode::start_hosted(
             other_env,
-            vec![A, B],
+            vec![a(), b()],
             b_storage,
             StorageScope::new(prefix_for(TABLE), KeyRange::whole()),
             1,
         );
         env.sleep(Duration::from_secs(2)).await;
-        let ha = c.node(A).hosted_node(TabletId(1)).unwrap().clone();
+        let ha = c.node(a()).hosted_node(TabletId(1)).unwrap().clone();
         for i in 0..3u64 {
             let leader = if ha.is_leader() { &ha } else { &hb };
             leader.put(format!("k{i}").into_bytes(), format!("v{i}").into_bytes());
         }
         env.sleep(Duration::from_secs(1)).await;
 
-        // If B currently leads, that's fine — either way we need B to be able
-        // to remove A while A is unreachable, so make B the leader first.
+        // If b() currently leads, that's fine — either way we need b() to be able
+        // to remove a() while a() is unreachable, so make b() the leader first.
         // Retried (never single-shot): `transfer_leadership`/`is_leader` can
         // transiently disagree with a concurrent election at seed depth.
         let became_leader = wait_until(&env, 80, Duration::from_millis(100), || {
@@ -1492,69 +1503,69 @@ fn scenario_partition_blocks_release(seed: u64) {
                 return true;
             }
             if ha.is_leader() {
-                ha.transfer_leadership(B);
+                ha.transfer_leadership(b());
             }
             false
         })
         .await;
-        assert!(became_leader, "B never took over leadership");
+        assert!(became_leader, "b() never took over leadership");
         env.sleep(Duration::from_millis(200)).await; // let any armed-transfer freeze clear
 
-        // Partition A away from B, then get B's removal proposal accepted
+        // Partition a() away from b(), then get b()'s removal proposal accepted
         // (it must NOT commit while partitioned — that's the whole point of
         // this scenario). Retried: `change_membership` can transiently
         // return `NotLeader` (e.g. a leadership-transfer freeze elsewhere, or
         // a fresh election) — a benign timing blip, not a reason to fail.
-        sim2.partition_pair(A, B);
+        sim2.partition_pair(a(), b());
         let accepted = wait_until(&env, 80, Duration::from_millis(100), || {
             matches!(
-                hb.change_membership([B].into_iter().collect()),
+                hb.change_membership([b()].into_iter().collect()),
                 ProposeResult::Accepted { .. }
             )
         })
         .await;
         assert!(
             accepted,
-            "B never got its removal proposal accepted while partitioned"
+            "b() never got its removal proposal accepted while partitioned"
         );
         env.sleep(Duration::from_secs(3)).await;
         assert!(
-            ha.config().contains(&A),
+            ha.config().contains(&a()),
             "a partitioned-away node must not observe an exclusion it never received"
         );
 
         // Feed the excluded metadata view anyway — Release must NOT fire since
         // the safety anchor (this node's own durable config) disagrees.
-        let v2 = view([tablet(1, b"", None, vec![B])]);
+        let v2 = view([tablet(1, b"", None, vec![b()])]);
         for _ in 0..8 {
-            c.tick(A, &v2).await;
+            c.tick(a(), &v2).await;
             env.sleep(Duration::from_millis(50)).await;
         }
-        assert_hosted_converged(&c, A, [TabletId(1)]);
+        assert_hosted_converged(&c, a(), [TabletId(1)]);
         assert!(
-            c.teardown_log(A).is_empty(),
+            c.teardown_log(a()).is_empty(),
             "release must not fire while partitioned"
         );
-        assert_present(c.storage(A), &physical(b"k0"), b"v0").await;
+        assert_present(c.storage(a()), &physical(b"k0"), b"v0").await;
 
-        // Heal — the removal entry finally reaches A, then release proceeds.
-        sim2.heal(A, B);
+        // Heal — the removal entry finally reaches a(), then release proceeds.
+        sim2.heal(a(), b());
         assert!(
             wait_until(&env, 80, Duration::from_millis(100), || !ha
                 .config()
-                .contains(&A))
+                .contains(&a()))
             .await,
-            "A's own durable config never excluded it after healing"
+            "a()'s own durable config never excluded it after healing"
         );
         for _ in 0..8 {
-            c.tick(A, &v2).await;
+            c.tick(a(), &v2).await;
             env.sleep(Duration::from_millis(50)).await;
         }
 
-        assert_hosted_converged(&c, A, []);
-        assert_eq!(c.teardown_log(A), vec![TabletId(1)]);
+        assert_hosted_converged(&c, a(), []);
+        assert_eq!(c.teardown_log(a()), vec![TabletId(1)]);
         assert_all_stopped(&[ha]);
-        assert_idempotent(&mut c, A, &v2).await;
+        assert_idempotent(&mut c, a(), &v2).await;
     });
 }
 
@@ -1569,25 +1580,25 @@ fn scenario_partition_blocks_release(seed: u64) {
 
 fn scenario_split_then_immediate_release(seed: u64) {
     run(seed, |sim| async move {
-        let env = sim.env(A);
-        let other_env = sim.env(B);
+        let env = sim.env(a());
+        let other_env = sim.env(b());
         let mut c = Cluster::new(sim);
-        c.add_node(A);
+        c.add_node(a());
 
-        let v1 = view([tablet(1, b"", None, vec![A, B])]);
-        c.tick(A, &v1).await;
+        let v1 = view([tablet(1, b"", None, vec![a(), b()])]);
+        c.tick(a(), &v1).await;
         env.sleep(Duration::from_secs(2)).await;
 
         let b_storage = MemoryEngine::new();
         let hb = KvNode::start_hosted(
             other_env,
-            vec![A, B],
+            vec![a(), b()],
             b_storage,
             StorageScope::new(prefix_for(TABLE), KeyRange::whole()),
             1,
         );
         env.sleep(Duration::from_secs(2)).await;
-        let ha = c.node(A).hosted_node(TabletId(1)).unwrap().clone();
+        let ha = c.node(a()).hosted_node(TabletId(1)).unwrap().clone();
         for i in 0..5u64 {
             let leader = if ha.is_leader() { &ha } else { &hb };
             leader.put(
@@ -1604,19 +1615,19 @@ fn scenario_split_then_immediate_release(seed: u64) {
         // Host the sibling (co-hosted, upper half) BEFORE the removal — this
         // node keeps replicating it after tablet 1 is released.
         let v_with_sibling = view([
-            tablet(1, b"", None, vec![A, B]), // tablet 1 still WIDE (pre-split) here
-            tablet(2, BOUNDARY, None, vec![A]),
+            tablet(1, b"", None, vec![a(), b()]), // tablet 1 still WIDE (pre-split) here
+            tablet(2, BOUNDARY, None, vec![a()]),
         ]);
-        c.tick(A, &v_with_sibling).await;
+        c.tick(a(), &v_with_sibling).await;
         env.sleep(Duration::from_secs(2)).await;
-        let h2 = c.node(A).hosted_node(TabletId(2)).unwrap().clone();
+        let h2 = c.node(a()).hosted_node(TabletId(2)).unwrap().clone();
         assert_eq!(h2.local_get(b"z00").await, Some(b"hi0".to_vec()));
 
         // The real removal completes WHILE tablet 1's scope is still WIDE —
-        // A's reconciler never got a chance to run NarrowScope for it (once
+        // a()'s reconciler never got a chance to run NarrowScope for it (once
         // excluded, `plan_join_host` returns None and phase 1 skips it
         // entirely — see `plan`'s Phase 1 doc).
-        remove_replica_for_real(&env, &ha, A, &hb, B, [B].into_iter().collect()).await;
+        remove_replica_for_real(&env, &ha, a(), &hb, b(), [b()].into_iter().collect()).await;
         assert_eq!(
             ha.scope_range(),
             KeyRange::whole(),
@@ -1626,33 +1637,33 @@ fn scenario_split_then_immediate_release(seed: u64) {
         // In ONE leap, this node's view shows tablet 1 BOTH narrowed (the
         // split committed) AND excluding it — zero ticks in between.
         let v_final = view([
-            tablet(1, b"", Some(BOUNDARY), vec![B]),
-            tablet(2, BOUNDARY, None, vec![A]),
+            tablet(1, b"", Some(BOUNDARY), vec![b()]),
+            tablet(2, BOUNDARY, None, vec![a()]),
         ]);
         for _ in 0..8 {
-            c.tick(A, &v_final).await;
+            c.tick(a(), &v_final).await;
             env.sleep(Duration::from_millis(50)).await;
         }
 
-        assert_hosted_converged(&c, A, [TabletId(2)]);
-        assert_eq!(c.teardown_log(A), vec![TabletId(1)]);
+        assert_hosted_converged(&c, a(), [TabletId(2)]);
+        assert_eq!(c.teardown_log(a()), vec![TabletId(1)]);
         assert_all_stopped(&[ha]);
 
         for i in 0..5u64 {
             assert_absent(
-                c.storage(A),
+                c.storage(a()),
                 &physical(format!("a{i:02}").into_bytes().as_slice()),
             )
             .await;
             assert_present(
-                c.storage(A),
+                c.storage(a()),
                 &physical(format!("z{i:02}").into_bytes().as_slice()),
                 format!("hi{i}").into_bytes().as_slice(),
             )
             .await;
         }
 
-        assert_idempotent(&mut c, A, &v_final).await;
+        assert_idempotent(&mut c, a(), &v_final).await;
     });
 }
 
@@ -1663,67 +1674,67 @@ fn scenario_split_then_immediate_release(seed: u64) {
 
 fn scenario_re_add_cancels_release(seed: u64) {
     run(seed, |sim| async move {
-        let env = sim.env(A);
-        let other_env = sim.env(B);
+        let env = sim.env(a());
+        let other_env = sim.env(b());
         let mut c = Cluster::new(sim);
-        c.add_node(A);
+        c.add_node(a());
 
-        let v1 = view([tablet(1, b"", None, vec![A, B])]);
-        c.tick(A, &v1).await;
+        let v1 = view([tablet(1, b"", None, vec![a(), b()])]);
+        c.tick(a(), &v1).await;
         env.sleep(Duration::from_secs(2)).await;
 
         let b_storage = MemoryEngine::new();
         let hb = KvNode::start_hosted(
             other_env,
-            vec![A, B],
+            vec![a(), b()],
             b_storage,
             StorageScope::new(prefix_for(TABLE), KeyRange::whole()),
             1,
         );
         env.sleep(Duration::from_secs(2)).await;
-        let ha = c.node(A).hosted_node(TabletId(1)).unwrap().clone();
+        let ha = c.node(a()).hosted_node(TabletId(1)).unwrap().clone();
 
-        remove_replica_for_real(&env, &ha, A, &hb, B, [B].into_iter().collect()).await;
+        remove_replica_for_real(&env, &ha, a(), &hb, b(), [b()].into_iter().collect()).await;
 
-        let excluded = view([tablet(1, b"", None, vec![B])]);
-        c.tick(A, &excluded).await;
+        let excluded = view([tablet(1, b"", None, vec![b()])]);
+        c.tick(a(), &excluded).await;
         assert!(
-            c.node(A)
+            c.node(a())
                 .local_state()
                 .pending_release
                 .contains_key(&TabletId(1)),
             "the first qualifying tick must start the confirm counter"
         );
 
-        // Metadata gains A back (a re-add — purely a metadata-level fact for
+        // Metadata gains a() back (a re-add — purely a metadata-level fact for
         // this scenario, mirroring `host.rs`'s `a_re_add_cancels_a_pending_release`
         // unit test: the candidacy check only inspects `Metadata.tablets[t]
         // .replicas`, independent of what this node's own durable Raft config
         // still (separately) says).
-        let readded = view([tablet(1, b"", None, vec![A, B])]);
-        c.tick(A, &readded).await;
+        let readded = view([tablet(1, b"", None, vec![a(), b()])]);
+        c.tick(a(), &readded).await;
         assert!(
-            !c.node(A)
+            !c.node(a())
                 .local_state()
                 .pending_release
                 .contains_key(&TabletId(1)),
             "a re-add must cancel the pending release outright"
         );
-        assert_hosted_converged(&c, A, [TabletId(1)]);
+        assert_hosted_converged(&c, a(), [TabletId(1)]);
         assert!(
-            c.teardown_log(A).is_empty(),
+            c.teardown_log(a()).is_empty(),
             "the tablet must never have been released"
         );
 
         // Ticking the re-added view repeatedly must not spuriously release it.
         for _ in 0..5 {
-            c.tick(A, &readded).await;
+            c.tick(a(), &readded).await;
             env.sleep(Duration::from_millis(50)).await;
         }
-        assert_hosted_converged(&c, A, [TabletId(1)]);
-        assert!(c.teardown_log(A).is_empty());
+        assert_hosted_converged(&c, a(), [TabletId(1)]);
+        assert!(c.teardown_log(a()).is_empty());
 
-        assert_idempotent(&mut c, A, &readded).await;
+        assert_idempotent(&mut c, a(), &readded).await;
     });
 }
 
@@ -1790,8 +1801,8 @@ fn reconciler_corpus_seed_expansion_is_additive_and_unique() {
     assert_eq!(seed_expand(scenario_cells(), 1).len(), base.len());
 }
 
-/// A single deterministic replay of one scenario twice must behave
-/// identically (ADR 0003) — same converged hosted set, same data. A cheap
+/// a() single deterministic replay of one scenario twice must behave
+/// identically (ADR 0003) — same converged hosted set, same data. a() cheap
 /// smoke test rather than a byte-identical history dump (this corpus has no
 /// `History` recorder, unlike the Elle corpora); reruns the cheapest scenario
 /// twice and cross-checks its own internal assertions pass both times (they

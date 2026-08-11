@@ -387,21 +387,32 @@ async fn open_append(path: &std::path::Path) -> std::io::Result<tokio::fs::File>
         .await
 }
 
-/// Read length-prefixed `[from: u64][stream: u64][len: u32][payload]` frames
-/// until EOF (ADR 0026 added the `stream` field; the rest of the frame is
-/// unchanged). These are the *raw*, not-yet-demultiplexed frames off one
-/// accepted connection — `spawn_pump` fans them out by `stream` into an env's
+/// Read length-prefixed `[from_len: u32][from: utf8 bytes][stream: u64][len:
+/// u32][payload]` frames until EOF (ADR 0040 PR3 changed `from` from a fixed
+/// `u64` to a length-prefixed UTF-8 string, since node ids are strings now;
+/// ADR 0026 added the `stream` field; the rest of the frame is unchanged).
+/// These are the *raw*, not-yet-demultiplexed frames off one accepted
+/// connection — `spawn_pump` fans them out by `stream` into an env's
 /// [`Demux`].
 async fn read_frames(
     mut stream: TcpStream,
     tx: mpsc::UnboundedSender<Envelope>,
 ) -> std::io::Result<()> {
     loop {
-        let from = match stream.read_u64().await {
-            Ok(v) => NodeId::new(v),
+        let from_len = match stream.read_u32().await {
+            Ok(v) => v as usize,
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(e) => return Err(e),
         };
+        let mut from_bytes = vec![0u8; from_len];
+        stream.read_exact(&mut from_bytes).await?;
+        let from_str = String::from_utf8(from_bytes)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.utf8_error()))?;
+        // The sending side only ever writes an id that already passed
+        // `NodeId::propose` (or the wire-trusted `nid`/test-support path) at
+        // its own intake boundary — re-validating here would just duplicate
+        // that check for no benefit, so this uses the unchecked constructor.
+        let from = NodeId::new_unchecked(from_str);
         let msg_stream = stream.read_u64().await?;
         let len = stream.read_u32().await? as usize;
         let mut payload = vec![0u8; len];
@@ -510,7 +521,7 @@ impl Network for ProdEnv {
                     // higher-level symptom (no leader / no progress) with its own
                     // logging, so this stays at debug to avoid alarming noise.
                     tracing::debug!(
-                        to = to.as_u64(),
+                        to = %to,
                         "send to peer with no known address (dropped)"
                     );
                     return;
@@ -519,7 +530,7 @@ impl Network for ProdEnv {
         };
         // Fire-and-forget semantics: a transport error is the network dropping
         // the message, not an error to the caller (see `Network::send`).
-        let from = self.inner.node_id;
+        let from = &self.inner.node_id;
         // Grab (or create) this address's connection slot. The map lock is a
         // `StdMutex` and must not be held across an `.await` — clone the
         // per-address `Arc` out and drop the guard before any I/O.
@@ -528,7 +539,7 @@ impl Network for ProdEnv {
             Arc::clone(conns.entry(addr).or_default())
         };
         if let Err(err) = send_frame_pooled(&slot, addr, from, stream, &payload).await {
-            tracing::debug!(?err, to = to.as_u64(), "send failed (dropped)");
+            tracing::debug!(?err, to = %to, "send failed (dropped)");
         }
     }
 
@@ -561,6 +572,7 @@ impl Coresident for ProdEnv {
         );
         let demux = Arc::new(StdMutex::new(Demux::default()));
         let pump_abort = spawn_pump(slot.inbox, Arc::clone(&demux));
+        let sib_data_dir = self.inner.data_dir.join(format!("sib-{id}"));
         Self {
             inner: Arc::new(Inner {
                 node_id: id,
@@ -569,7 +581,7 @@ impl Coresident for ProdEnv {
                 local_addr: slot.addr,
                 pool: Arc::clone(&self.inner.pool),
                 conns: Arc::clone(&self.inner.conns),
-                data_dir: self.inner.data_dir.join(format!("sib-{id}")),
+                data_dir: sib_data_dir,
                 dir_synced: StdMutex::new(BTreeSet::new()),
                 demux,
                 tasks: StdMutex::new(vec![slot.accept_abort, pump_abort]),
@@ -643,7 +655,7 @@ fn spawn_accept(
 async fn send_frame_pooled(
     slot: &Mutex<Option<TcpStream>>,
     addr: SocketAddr,
-    from: NodeId,
+    from: &NodeId,
     msg_stream: u64,
     payload: &[u8],
 ) -> std::io::Result<()> {
@@ -670,17 +682,20 @@ async fn connect_nodelay(addr: SocketAddr) -> std::io::Result<TcpStream> {
     Ok(stream)
 }
 
-/// Write one length-prefixed `[from: u64][stream: u64][len: u32][payload]`
-/// frame (ADR 0026 added the `stream` field) over a pooled connection — the
-/// receive side (`read_frames`, which already loops until EOF) needs no
-/// further change.
+/// Write one length-prefixed `[from_len: u32][from: utf8 bytes][stream:
+/// u64][len: u32][payload]` frame (ADR 0040 PR3 length-prefixed the `from`
+/// field to carry a string id instead of a fixed `u64`; ADR 0026 added the
+/// `stream` field) over a pooled connection — the receive side
+/// (`read_frames`, which already loops until EOF) needs no further change.
 async fn write_frame(
     conn: &mut TcpStream,
-    from: NodeId,
+    from: &NodeId,
     msg_stream: u64,
     payload: &[u8],
 ) -> std::io::Result<()> {
-    conn.write_u64(from.as_u64()).await?;
+    let from_bytes = from.as_str().as_bytes();
+    conn.write_u32(from_bytes.len() as u32).await?;
+    conn.write_all(from_bytes).await?;
     conn.write_u64(msg_stream).await?;
     conn.write_u32(payload.len() as u32).await?;
     conn.write_all(payload).await?;
@@ -879,7 +894,7 @@ impl Spawner for ProdEnv {
 
 impl Env for ProdEnv {
     fn node_id(&self) -> NodeId {
-        self.inner.node_id
+        self.inner.node_id.clone()
     }
 
     fn metrics(&self) -> MetricsHandle {

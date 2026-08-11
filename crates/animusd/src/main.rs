@@ -59,6 +59,7 @@
 use std::net::{IpAddr, SocketAddr};
 use std::process::ExitCode;
 
+use animus_env::NodeId;
 use animusd::{ClusterConfig, RoleAddrs};
 
 #[tokio::main]
@@ -434,6 +435,7 @@ async fn run_data_join(
     let base_port = base_port.unwrap_or(7100_u16.wrapping_add((index as u16).wrapping_mul(5)));
     let p = |role: u16| SocketAddr::new(ip, base_port.wrapping_add(role));
     let addrs = RoleAddrs {
+        id: animusd::config::node_id(index),
         role: animusd::config::NodeRole::Data,
         internal: p(0),
         client: p(1),
@@ -487,6 +489,11 @@ async fn run_data_join_allocated(
 
     let p = |role: u16| SocketAddr::new(ip, base_port.wrapping_add(role));
     let addrs = RoleAddrs {
+        // Unread placeholder: this node's real id is minted server-side
+        // (`allocate_node_id`, below) — `Node::bind_data` takes that id as
+        // its own separate argument, never `addrs.id`, for exactly this
+        // "not known until the cluster mints it" case.
+        id: NodeId::new_unchecked("pending-alloc"),
         role: animusd::config::NodeRole::Data,
         internal: p(0),
         client: p(1),
@@ -596,6 +603,7 @@ async fn run_join_indexed(
     let base_port = base_port.unwrap_or(7100_u16.wrapping_add((index as u16).wrapping_mul(5)));
     let p = |role: u16| SocketAddr::new(ip, base_port.wrapping_add(role));
     let addrs = RoleAddrs {
+        id: animusd::config::node_id(index),
         role: animusd::config::NodeRole::Both,
         internal: p(0),
         client: p(1),
@@ -639,6 +647,8 @@ async fn run_join_allocated(
 ) -> Result<(), String> {
     let p = |role: u16| SocketAddr::new(ip, base_port.wrapping_add(role));
     let addrs = RoleAddrs {
+        // See `run_data_join_allocated`'s identical placeholder above.
+        id: NodeId::new_unchecked("pending-alloc"),
         role: animusd::config::NodeRole::Both,
         internal: p(0),
         client: p(1),

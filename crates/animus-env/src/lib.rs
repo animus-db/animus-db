@@ -15,6 +15,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -27,82 +28,132 @@ pub use metrics::{Metric, MetricSink, MetricSnapshot, MetricsHandle};
 
 /// Stable identifier for a node in the cluster.
 ///
-/// **ADR 0040 PR2**: an opaque newtype over `u64` — the *representation*
-/// stays a plain `u64` (this PR is behavior-, wire-, and WAL-byte-neutral;
-/// `#[serde(transparent)]` means every JSON/WAL byte this type touches is
-/// identical to the bare `u64` this replaces), but the *type* no longer
-/// supports arithmetic. That's deliberate: it lets the compiler enumerate
-/// every remaining numeric-coupling site in one mechanical sweep, before PR3
-/// changes the representation to a validated string and none of those sites
-/// can quietly keep assuming "`NodeId` is a small dense integer" — see
-/// `docs/adr/0040-self-minted-string-node-ids.md`.
+/// **ADR 0040 PR3**: `NodeId` is now a validated, opaque **string** wrapped in
+/// an `Arc<str>` (dropping `Copy` — every `.copied()` over a `NodeId` became
+/// `.cloned()`; the clone is one refcount bump, not a byte copy). Two ways to
+/// build one:
 ///
-/// Construct one with [`NodeId::new`] (or `From<u64>`/[`nid`]); recover the
-/// raw value with [`NodeId::as_u64`] — kept deliberately narrow (only the few
-/// sites that must serialize/format the id as a number: metrics labels,
-/// dashboard JSON, `ProdEnv`'s wire frame, `syskv`'s big-endian key encoding,
-/// and the one pre-existing `ALLOC_ID_BASE` allocator arithmetic PR4 retires)
-/// rather than a broad numeric API that would defeat the point of this PR.
-#[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+/// - [`NodeId::propose`] — validates the charset (`[A-Za-z0-9._-]{1,64}`,
+///   rejecting `@` — the leader-hint wire format is `leader_hint={id}@{addr}`
+///   — and any other punctuation/whitespace/`/`) and is the **only** path a
+///   node-supplied identity (config `id` field, `--id`, an admin `add`
+///   request) may go through. Every intake boundary must call this, not
+///   construct a `NodeId` some other way.
+/// - [`NodeId::new_unchecked`] — bypasses validation. Reserved for
+///   deserializing an id that was already validated once (wire frames, WAL
+///   replay, `serde` round-trips of already-stored `Metadata`) and for the
+///   test-support [`nid`] helper. Never call this on untrusted input.
+///
+/// `Display`/`Debug` print the raw string; `serde` is `#[serde(transparent)]`
+/// (a plain JSON string) but note this means `serde`-driven deserialization
+/// (e.g. `serde_json::from_str` on a whole config file) does **not** run
+/// [`NodeId::propose`]'s charset check — callers that accept configuration
+/// from outside this process must explicitly re-validate every parsed id
+/// (see `animusd::config` for the config-load call site).
+///
+/// See `docs/adr/0040-self-minted-string-node-ids.md`.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct NodeId(u64);
+pub struct NodeId(Arc<str>);
 
-impl NodeId {
-    /// Wrap a raw `u64` as a [`NodeId`].
-    #[must_use]
-    pub const fn new(id: u64) -> Self {
-        NodeId(id)
-    }
-
-    /// Recover the raw `u64` — the narrow escape hatch for the handful of
-    /// sites that must serialize/format the id as a number (see the type's
-    /// doc comment).
-    #[must_use]
-    pub const fn as_u64(self) -> u64 {
-        self.0
-    }
+/// A proposed node id failed [`NodeId::propose`]'s charset validation.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "invalid node id {raw:?}: ids must be 1-64 chars of [A-Za-z0-9._-] \
+     (no '@', '/', or whitespace)"
+)]
+pub struct InvalidNodeId {
+    /// The rejected input, for the error message.
+    pub raw: String,
 }
 
-impl From<u64> for NodeId {
-    fn from(id: u64) -> Self {
-        NodeId(id)
+/// The accepted charset for a *proposed* node id (config/CLI/admin intake):
+/// ASCII letters, digits, `.`, `_`, `-`. Deliberately excludes `@` (the
+/// leader-hint wire format is `leader_hint={id}@{addr}` — `topology.rs`),
+/// `/`, and whitespace.
+fn is_valid_node_id_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-'
+}
+
+/// Maximum length (chars) of a proposed node id.
+pub const NODE_ID_MAX_LEN: usize = 64;
+
+impl NodeId {
+    /// Validate and wrap a node-proposed id. The only sanctioned entry point
+    /// for an identity a human or config file chose — see the type's doc
+    /// comment for why every intake boundary must go through this.
+    ///
+    /// # Errors
+    /// Returns [`InvalidNodeId`] if `s` is empty, longer than
+    /// [`NODE_ID_MAX_LEN`] chars, or contains any character outside
+    /// `[A-Za-z0-9._-]`.
+    pub fn propose(s: &str) -> Result<NodeId, InvalidNodeId> {
+        if s.is_empty()
+            || s.chars().count() > NODE_ID_MAX_LEN
+            || !s.chars().all(is_valid_node_id_char)
+        {
+            return Err(InvalidNodeId { raw: s.to_string() });
+        }
+        Ok(NodeId(Arc::from(s)))
+    }
+
+    /// Wrap a string as a [`NodeId`] **without** charset validation.
+    ///
+    /// Reserved for: deserializing an id that was already validated once
+    /// (wire frames, WAL/snapshot replay, an already-stored `Metadata`
+    /// round-tripping through `serde`), and the [`nid`] test-support
+    /// constructor. Never call this on a node/operator-supplied string —
+    /// use [`NodeId::propose`] instead.
+    #[must_use]
+    pub fn new_unchecked(s: impl Into<Arc<str>>) -> Self {
+        NodeId(s.into())
+    }
+
+    /// The raw string, borrowed.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
 impl std::str::FromStr for NodeId {
-    type Err = std::num::ParseIntError;
+    type Err = InvalidNodeId;
 
-    /// Parses a `u64` and wraps it — this PR keeps CLI/config/wire id
-    /// parsing semantics identical (parse the number, then wrap); PR3 is
-    /// where the accepted charset changes to a validated string.
+    /// Parses via [`NodeId::propose`] — CLI/config text always goes through
+    /// validation.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        s.parse::<u64>().map(NodeId)
+        NodeId::propose(s)
     }
 }
 
 impl std::fmt::Display for NodeId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(&self.0, f)
+        std::fmt::Display::fmt(&*self.0, f)
     }
 }
 
 impl std::fmt::Debug for NodeId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Debug::fmt(&self.0, f)
+        std::fmt::Debug::fmt(&*self.0, f)
     }
 }
 
-/// Test-support constructor: `nid(n)` builds the `n`th test node id.
+/// Test-support constructor: `nid(n)` builds the `n`th test node id, formatted
+/// `"n{n}"` (e.g. `nid(2)` is `"n2"`).
 ///
 /// Homed here (no feature gate — it's trivial) so every crate's test code can
-/// reach it without duplicating a helper. Introduced in ADR 0040 PR2 so the
-/// mechanical sweep of `~195 sim.env(...)` and `~89 RaftCore::new`/
-/// `RaftNode::start` call sites across the test fleet happens exactly once:
-/// PR3 reformats this function's body to mint `"n{n}"` strings and no test
-/// call site needs to change again.
+/// reach it without duplicating a helper. Introduced in ADR 0040 PR2 as
+/// `NodeId::new(n)` (then a bare `u64` newtype) so the mechanical sweep of
+/// `~195 sim.env(...)` and `~89 RaftCore::new`/`RaftNode::start` call sites
+/// across the test fleet happened exactly once; ADR 0040 PR3 reformats this
+/// function's body to mint the `"n{n}"` string and no test call site needed to
+/// change again. Bypasses [`NodeId::propose`] validation via
+/// [`NodeId::new_unchecked`] (deliberately — the `"n{n}"` shape is always
+/// valid, and this must stay infallible for the ~89 call sites that use it in
+/// non-`Result` contexts).
 #[must_use]
-pub const fn nid(n: u64) -> NodeId {
-    NodeId::new(n)
+pub fn nid(n: u64) -> NodeId {
+    NodeId::new_unchecked(format!("n{n}"))
 }
 
 /// A monotonic instant, measured in nanoseconds since the environment started.

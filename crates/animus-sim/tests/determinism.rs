@@ -27,7 +27,13 @@ fn build_ring(sim: &Simulator) {
                     continue; // park: token has finished its journey
                 }
                 env.sleep(Duration::from_micros(100)).await;
-                let next = nid((env.node_id().as_u64() + 1) % N);
+                let cur: u64 = env
+                    .node_id()
+                    .as_str()
+                    .trim_start_matches('n')
+                    .parse()
+                    .expect("ring node ids are nid(n)-formatted");
+                let next = nid((cur + 1) % N);
                 env.send(next, vec![hop + 1]).await;
             }
         });

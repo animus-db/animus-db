@@ -40,7 +40,7 @@ fn observed(node: &AccordNode<SimEnv>, r: TxnId, key: Key) -> Option<TxnId> {
     let result: BTreeMap<Key, Option<TxnId>> = node
         .read_result(r)
         .expect("read transaction has not executed on this replica");
-    *result.get(&key).expect("read covered this key")
+    result.get(&key).expect("read covered this key").clone()
 }
 
 /// A read ordered after a write observes that write; a read ordered before a
@@ -71,24 +71,24 @@ fn read_observes_writes_before_it_and_not_after() {
 
     for (i, n) in nodes.iter().enumerate() {
         assert!(
-            n.is_applied(r1) && n.is_applied(r2),
+            n.is_applied(r1.clone()) && n.is_applied(r2.clone()),
             "node {i} did not execute both reads (seed={seed})"
         );
         // R1 ordered after A and before B: it sees A, never B.
         assert_eq!(
-            observed(n, r1, 7),
-            Some(a),
+            observed(n, r1.clone(), 7),
+            Some(a.clone()),
             "node {i}: read R1 must observe write A (seed={seed})"
         );
         assert_ne!(
-            observed(n, r1, 7),
-            Some(b),
+            observed(n, r1.clone(), 7),
+            Some(b.clone()),
             "node {i}: read R1 must NOT observe the later write B (seed={seed})"
         );
         // R2 ordered after B: it sees B.
         assert_eq!(
-            observed(n, r2, 7),
-            Some(b),
+            observed(n, r2.clone(), 7),
+            Some(b.clone()),
             "node {i}: read R2 must observe write B (seed={seed})"
         );
     }
@@ -105,9 +105,9 @@ fn read_of_unwritten_key_observes_nothing() {
     sim.run_for(Duration::from_secs(2));
 
     for (i, n) in nodes.iter().enumerate() {
-        assert!(n.is_applied(r), "node {i} did not execute the read");
+        assert!(n.is_applied(r.clone()), "node {i} did not execute the read");
         assert_eq!(
-            observed(n, r, 99),
+            observed(n, r.clone(), 99),
             None,
             "node {i}: read of an unwritten key must observe nothing (seed={seed})"
         );
@@ -129,16 +129,22 @@ fn read_snapshot_consistent_across_replicas_and_seeds() {
         sim.run_for(Duration::from_secs(2));
 
         // Reference observation taken from node 0.
-        assert!(nodes[0].is_applied(r), "read not executed (seed={seed})");
-        let reference = nodes[0].read_result(r).unwrap();
+        assert!(
+            nodes[0].is_applied(r.clone()),
+            "read not executed (seed={seed})"
+        );
+        let reference = nodes[0].read_result(r.clone()).unwrap();
         // The read ordered after A, so it sees A on both keys.
-        assert_eq!(reference.get(&3), Some(&Some(a)), "seed={seed}");
+        assert_eq!(reference.get(&3), Some(&Some(a.clone())), "seed={seed}");
         assert_eq!(reference.get(&4), Some(&Some(a)), "seed={seed}");
 
         for (i, n) in nodes.iter().enumerate() {
-            assert!(n.is_applied(r), "node {i} read not executed (seed={seed})");
+            assert!(
+                n.is_applied(r.clone()),
+                "node {i} read not executed (seed={seed})"
+            );
             assert_eq!(
-                n.read_result(r),
+                n.read_result(r.clone()),
                 Some(reference.clone()),
                 "node {i}: read observation diverged from replica 0 (seed={seed})"
             );
@@ -159,7 +165,7 @@ fn read_result_recovers_from_disk() {
     let r = nodes[1].submit_read(keys(&[8]));
     sim.run_for(Duration::from_secs(2));
 
-    let before = nodes[2].read_result(r);
+    let before = nodes[2].read_result(r.clone());
     assert_eq!(before, Some(BTreeMap::from([(8u64, Some(a))])));
 
     // Stop node 2 (volatile state lost) and restart on the same disk.
@@ -168,7 +174,7 @@ fn read_result_recovers_from_disk() {
     sim.run_for(Duration::from_secs(2));
 
     assert!(
-        nodes[2].is_applied(r),
+        nodes[2].is_applied(r.clone()),
         "recovered node lost the executed read (seed={seed})"
     );
     assert_eq!(

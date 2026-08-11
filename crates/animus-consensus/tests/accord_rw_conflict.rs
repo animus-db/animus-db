@@ -60,18 +60,18 @@ fn read_then_write_hazard_is_ordered_consistently() {
 
     for (i, n) in nodes.iter().enumerate() {
         assert!(
-            n.is_applied(rw) && n.is_applied(w),
+            n.is_applied(rw.clone()) && n.is_applied(w.clone()),
             "node {i} did not execute both txns (seed={seed})"
         );
     }
 
     // Consistent relative order on every replica — the read of X made rw conflict
     // with w even though rw never writes X.
-    let reference = order_on(&nodes[0], rw, w);
+    let reference = order_on(&nodes[0], rw.clone(), w.clone());
     assert_eq!(reference.len(), 2, "both must execute (seed={seed})");
     for (i, n) in nodes.iter().enumerate() {
         assert_eq!(
-            order_on(n, rw, w),
+            order_on(n, rw.clone(), w.clone()),
             reference,
             "node {i} diverged on the read/write conflict order (seed={seed})"
         );
@@ -79,10 +79,10 @@ fn read_then_write_hazard_is_ordered_consistently() {
 
     // The conflict was recorded as a dependency: the second-ordered transaction
     // carries the first in its committed deps.
-    let first = reference[0];
-    let second = reference[1];
+    let first = reference[0].clone();
+    let second = reference[1].clone();
     let deps = nodes[0]
-        .committed_deps(second)
+        .committed_deps(second.clone())
         .expect("second txn committed");
     assert!(
         deps.contains(&first),
@@ -108,14 +108,14 @@ fn without_the_read_the_txns_are_disjoint() {
 
     for (i, n) in nodes.iter().enumerate() {
         assert!(
-            n.is_applied(rw) && n.is_applied(w),
+            n.is_applied(rw.clone()) && n.is_applied(w.clone()),
             "node {i} did not execute both txns (seed={seed})"
         );
     }
 
     // Disjoint: neither carries the other as a dependency.
-    let rw_deps = nodes[0].committed_deps(rw).expect("rw committed");
-    let w_deps = nodes[0].committed_deps(w).expect("w committed");
+    let rw_deps = nodes[0].committed_deps(rw.clone()).expect("rw committed");
+    let w_deps = nodes[0].committed_deps(w.clone()).expect("w committed");
     assert!(
         !rw_deps.contains(&w) && !w_deps.contains(&rw),
         "disjoint transactions must not depend on each other (seed={seed})"
@@ -132,12 +132,12 @@ fn read_then_write_hazard_consistent_across_seeds() {
         let w = nodes[2].submit(keys(&[10]));
         sim.run_for(Duration::from_secs(6));
 
-        let reference = order_on(&nodes[0], rw, w);
+        let reference = order_on(&nodes[0], rw.clone(), w.clone());
         assert_eq!(reference.len(), 2, "both must execute (seed={seed})");
         for (i, n) in nodes.iter().enumerate() {
-            assert!(n.is_applied(rw) && n.is_applied(w));
+            assert!(n.is_applied(rw.clone()) && n.is_applied(w.clone()));
             assert_eq!(
-                order_on(n, rw, w),
+                order_on(n, rw.clone(), w.clone()),
                 reference,
                 "node {i} diverged on read/write order (seed={seed})"
             );

@@ -55,20 +55,20 @@ fn assert_committed_consistently(
     let mut agreed_deps: Option<BTreeSet<TxnId>> = None;
     let mut committed_count = 0;
     for (i, n) in nodes.iter().enumerate() {
-        if let Some(e) = n.committed_execute_at(txn) {
+        if let Some(e) = n.committed_execute_at(txn.clone()) {
             committed_count += 1;
-            match agreed {
+            match &agreed {
                 None => {
                     agreed = Some(e);
-                    agreed_deps = n.committed_deps(txn);
+                    agreed_deps = n.committed_deps(txn.clone());
                 }
                 Some(prev) => assert_eq!(
-                    prev, e,
+                    *prev, e,
                     "replica {i} committed txn at a different execute_at (seed={seed})"
                 ),
             }
             assert_eq!(
-                n.committed_deps(txn),
+                n.committed_deps(txn.clone()),
                 agreed_deps,
                 "replica {i} committed txn with different deps (seed={seed})"
             );
@@ -107,21 +107,21 @@ fn two_concurrent_recoverers_converge() {
         sim.run_for(Duration::from_millis(200));
 
         // Two survivors race to recover the same transaction.
-        nodes[2].recover(txn);
-        nodes[4].recover(txn);
+        nodes[2].recover(txn.clone());
+        nodes[4].recover(txn.clone());
         sim.run_for(Duration::from_secs(3));
 
-        let agreed = assert_committed_consistently(&nodes, txn, seed);
+        let agreed = assert_committed_consistently(&nodes, txn.clone(), seed);
         // The survivors that can reach a quorum all execute it, converged store.
         for &k in &[7u64, 8u64] {
             let mut writers = Vec::new();
             for n in &nodes {
-                if n.is_applied(txn) {
+                if n.is_applied(txn.clone()) {
                     writers.push(store_writer(n, k));
                 }
             }
             assert!(
-                writers.iter().all(|w| *w == Some(txn)),
+                writers.iter().all(|w| *w == Some(txn.clone())),
                 "an applied replica missed the recovered write on key {k} (seed={seed}); \
                  agreed execute_at={agreed:?}"
             );
@@ -133,7 +133,7 @@ fn two_concurrent_recoverers_converge() {
 /// coordinator is fully partitioned away (never commits). A survivor recovers
 /// the transaction to a commit on the majority side; then the partition heals
 /// and the original coordinator rejoins — it must **not** be able to commit a
-/// *contradicting* decision (its stale `Ballot::ZERO` `Accept` is fenced by the
+/// *contradicting* decision (its stale `Ballot::zero()` `Accept` is fenced by the
 /// recoverer's promise), and the recovered decision stands on every replica.
 #[test]
 fn failover_under_partition_then_heal() {
@@ -149,26 +149,28 @@ fn failover_under_partition_then_heal() {
     sim.run_for(Duration::from_millis(200));
 
     // A survivor recovers it on the majority side {1,2,3,4}.
-    nodes[1].recover(txn);
+    nodes[1].recover(txn.clone());
     sim.run_for(Duration::from_secs(2));
 
-    let agreed = assert_committed_consistently(&nodes, txn, seed);
+    let agreed = assert_committed_consistently(&nodes, txn.clone(), seed);
     // The recovered write landed on the applied survivors.
     for n in &nodes {
-        if n.is_applied(txn) {
+        if n.is_applied(txn.clone()) {
             assert_eq!(
                 store_writer(n, 5),
-                Some(txn),
+                Some(txn.clone()),
                 "an applied survivor missed the recovered write (seed={seed})"
             );
         }
     }
     // Snapshot the survivors' decision before the heal.
-    let before: Vec<Option<animus_consensus::Timestamp>> =
-        nodes.iter().map(|n| n.committed_execute_at(txn)).collect();
+    let before: Vec<Option<animus_consensus::Timestamp>> = nodes
+        .iter()
+        .map(|n| n.committed_execute_at(txn.clone()))
+        .collect();
 
     // Heal: the original coordinator rejoins and its retry tick re-drives its
-    // stale PreAccept/Accept at Ballot::ZERO. Those are fenced by the survivors'
+    // stale PreAccept/Accept at Ballot::zero(). Those are fenced by the survivors'
     // recovery promise, so they cannot overturn the committed decision.
     for peer in [1, 2, 3, 4] {
         sim.heal(nid(0), nid(peer));
@@ -177,9 +179,9 @@ fn failover_under_partition_then_heal() {
 
     // No survivor's decision changed; the late coordinator did not revert it.
     for (i, n) in nodes.iter().enumerate() {
-        if let Some(b) = before[i] {
+        if let Some(b) = before[i].clone() {
             assert_eq!(
-                n.committed_execute_at(txn),
+                n.committed_execute_at(txn.clone()),
                 Some(b),
                 "replica {i} reverted a committed decision after heal (seed={seed})"
             );
@@ -206,11 +208,11 @@ fn recover_racing_original_commit() {
         let txn = nodes[0].submit(keys(&[3, 4]));
         // Let the commit get partway out, then race a recovery against it.
         sim.run_for(Duration::from_millis(40));
-        let early = nodes[0].committed_execute_at(txn);
-        nodes[3].recover(txn);
+        let early = nodes[0].committed_execute_at(txn.clone());
+        nodes[3].recover(txn.clone());
         sim.run_for(Duration::from_secs(2));
 
-        let agreed = assert_committed_consistently(&nodes, txn, seed);
+        let agreed = assert_committed_consistently(&nodes, txn.clone(), seed);
         // If the original coordinator had already committed before recovery
         // started, recovery must have adopted exactly that decision.
         if let Some(e) = early {
@@ -223,12 +225,12 @@ fn recover_racing_original_commit() {
         for &k in &[3u64, 4u64] {
             let mut writers = Vec::new();
             for n in &nodes {
-                if n.is_applied(txn) {
+                if n.is_applied(txn.clone()) {
                     writers.push(store_writer(n, k));
                 }
             }
             assert!(
-                writers.iter().all(|w| *w == Some(txn)),
+                writers.iter().all(|w| *w == Some(txn.clone())),
                 "applied store diverged on key {k} (seed={seed})"
             );
         }
@@ -257,19 +259,19 @@ fn recovery_survives_message_loss() {
         sim.run_for(Duration::from_millis(200));
 
         // A survivor recovers under loss; retries re-drive dropped messages.
-        nodes[2].recover(txn);
+        nodes[2].recover(txn.clone());
         sim.run_for(Duration::from_secs(8));
 
-        let _ = assert_committed_consistently(&nodes, txn, seed);
+        let _ = assert_committed_consistently(&nodes, txn.clone(), seed);
         // Every replica that committed and applied agrees on the writer.
         let mut writers = Vec::new();
         for n in &nodes {
-            if n.is_applied(txn) {
+            if n.is_applied(txn.clone()) {
                 writers.push(store_writer(n, 11));
             }
         }
         assert!(
-            !writers.is_empty() && writers.iter().all(|w| *w == Some(txn)),
+            !writers.is_empty() && writers.iter().all(|w| *w == Some(txn.clone())),
             "lossy recovery did not converge the store (seed={seed})"
         );
     }
@@ -293,16 +295,16 @@ fn superseded_recoverer_does_not_strand() {
     sim.run_for(Duration::from_millis(200));
 
     // Node 2 starts, then node 4 starts (a duelling, slightly-later recoverer).
-    nodes[2].recover(txn);
+    nodes[2].recover(txn.clone());
     sim.run_for(Duration::from_millis(5));
-    nodes[4].recover(txn);
+    nodes[4].recover(txn.clone());
     sim.run_for(Duration::from_secs(4));
 
-    let _ = assert_committed_consistently(&nodes, txn, seed);
+    let _ = assert_committed_consistently(&nodes, txn.clone(), seed);
     // A quorum reached at least Committed (none stuck mid-duel).
     let committed = nodes
         .iter()
-        .filter(|n| n.committed_execute_at(txn).is_some())
+        .filter(|n| n.committed_execute_at(txn.clone()).is_some())
         .count();
     assert!(
         committed >= 3,
@@ -322,7 +324,7 @@ fn duelling_recovery_is_reproducible_from_seed() {
             sim.partition_pair(nid(0), nid(peer));
         }
         sim.run_for(Duration::from_millis(200));
-        nodes[2].recover(txn);
+        nodes[2].recover(txn.clone());
         nodes[4].recover(txn);
         sim.run_for(Duration::from_secs(3));
         sim.trace_lines()

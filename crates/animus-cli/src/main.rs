@@ -138,10 +138,7 @@ async fn run_admin(args: &[String]) -> Result<(), String> {
         let rest = &args[2..];
         return match rest.len() {
             1 => run_control_add_allocated(addr, &rest[0]).await,
-            2 => {
-                let node: u64 = rest[0].parse().map_err(|_| "node id must be a number")?;
-                run_control_add(addr, node, &rest[1]).await
-            }
+            2 => run_control_add(addr, &rest[0], &rest[1]).await,
             _ => Err(
                 "control-add needs <new-node-admin-addr> (allocator-minted id) or \
                  <node-id> <new-node-admin-addr> (operator-supplied id)"
@@ -150,10 +147,7 @@ async fn run_admin(args: &[String]) -> Result<(), String> {
         };
     }
     if sub == "control-remove" {
-        let node: u64 = arg(2)
-            .ok_or("control-remove needs <node-id>")?
-            .parse()
-            .map_err(|_| "node id must be a number")?;
+        let node = arg(2).ok_or("control-remove needs <node-id>")?;
         let force = arg(3) == Some("--force");
         return run_control_remove(addr, node, force).await;
     }
@@ -228,20 +222,16 @@ async fn run_admin(args: &[String]) -> Result<(), String> {
                 .ok_or("reconfigure needs <tablet>")?
                 .parse()
                 .map_err(|_| "tablet must be a number")?;
-            let voters: Result<Vec<u64>, _> = arg(3)
+            let voters: Vec<&str> = arg(3)
                 .ok_or("reconfigure needs <voter,voter,...>")?
                 .split(',')
-                .map(|v| v.trim().parse::<u64>())
+                .map(str::trim)
                 .collect();
-            let voters = voters.map_err(|_| "voters must be comma-separated node ids")?;
             let body = serde_json::json!({"tablet": tablet, "voters": voters}).to_string();
             ("POST", "/admin/raftkv/reconfigure".into(), Some(body))
         }
         "drain" => {
-            let node: u64 = arg(2)
-                .ok_or("drain needs <node-id>")?
-                .parse()
-                .map_err(|_| "node id must be a number")?;
+            let node = arg(2).ok_or("drain needs <node-id>")?;
             let body = serde_json::json!({"node": node}).to_string();
             ("POST", "/admin/drain".into(), Some(body))
         }
@@ -254,10 +244,7 @@ async fn run_admin(args: &[String]) -> Result<(), String> {
             )
         }
         "remove" => {
-            let node: u64 = arg(2)
-                .ok_or("remove needs <node-id>")?
-                .parse()
-                .map_err(|_| "node id must be a number")?;
+            let node = arg(2).ok_or("remove needs <node-id>")?;
             let body = serde_json::json!({"node": node}).to_string();
             ("POST", "/admin/member/remove".into(), Some(body))
         }
@@ -317,8 +304,6 @@ async fn run_decommission(
     node: &str,
     force_control_remove: bool,
 ) -> Result<(), String> {
-    let node: u64 = node.parse().map_err(|_| "node id must be a number")?;
-
     // Unreachable / non-200 (e.g. an old binary with no such route, or a
     // follower's admin port before the caller even knows who leads):
     // skip the pre-check and let the ordinary flow's own final `remove`
@@ -328,7 +313,7 @@ async fn run_decommission(
             .ok()
             .and_then(|v| v.get("voters").cloned())
             .and_then(|v| v.as_array().cloned())
-            .is_some_and(|voters| voters.iter().any(|x| x.as_u64() == Some(node)));
+            .is_some_and(|voters| voters.iter().any(|x| x.as_str() == Some(node)));
         if is_live_voter {
             if !force_control_remove {
                 return Err(format!(
@@ -358,7 +343,7 @@ async fn run_decommission(
                     .ok()
                     .and_then(|v| v.get("voters").cloned())
                     .and_then(|v| v.as_array().cloned())
-                    .is_some_and(|voters| voters.iter().any(|x| x.as_u64() == Some(node)));
+                    .is_some_and(|voters| voters.iter().any(|x| x.as_str() == Some(node)));
                 if !still_voter {
                     println!(
                         "node {node} is no longer a control voter; \
@@ -435,7 +420,7 @@ async fn run_decommission(
 /// poll-to-convergence shape (bounded, no fixed sleep-and-hope).
 async fn run_control_add(
     leader_admin_addr: &str,
-    node: u64,
+    node: &str,
     new_node_admin_addr: &str,
 ) -> Result<(), String> {
     let (status, resp) = http_call(new_node_admin_addr, "GET", "/admin/config", None).await?;
@@ -474,7 +459,7 @@ async fn run_control_add(
             && let Ok(v) = serde_json::from_str::<serde_json::Value>(&resp)
             && v["voters"]
                 .as_array()
-                .is_some_and(|vs| vs.iter().any(|x| x.as_u64() == Some(node)))
+                .is_some_and(|vs| vs.iter().any(|x| x.as_str() == Some(node)))
         {
             println!("node {node} is now a control voter");
             return Ok(());
@@ -522,7 +507,7 @@ async fn run_control_add_allocated(
     let v: serde_json::Value = serde_json::from_str(&resp)
         .map_err(|e| format!("malformed control/member/add response: {e}"))?;
     let node = v["node"]
-        .as_u64()
+        .as_str()
         .ok_or("control/member/add response missing `node`")?;
     println!(
         "allocated control voter id {node} for {new_node_control_addr}; \
@@ -544,7 +529,11 @@ async fn run_control_add_allocated(
 /// flag: that one only says "run control-remove as part of decommission,"
 /// never "and skip control-remove's own safety checks" (see
 /// `run_decommission`'s doc and `animusd::ClientCtx::admin_remove_control_member`).
-async fn run_control_remove(leader_admin_addr: &str, node: u64, force: bool) -> Result<(), String> {
+async fn run_control_remove(
+    leader_admin_addr: &str,
+    node: &str,
+    force: bool,
+) -> Result<(), String> {
     let body = serde_json::json!({"node": node, "force": force}).to_string();
     let (status, resp) = http_call(
         leader_admin_addr,
@@ -575,9 +564,7 @@ async fn run_control_remove(leader_admin_addr: &str, node: u64, force: bool) -> 
 /// non-empty and even-length by the caller.
 async fn run_control_grow(leader_admin_addr: &str, pairs: &[String]) -> Result<(), String> {
     for chunk in pairs.chunks(2) {
-        let node: u64 = chunk[0]
-            .parse()
-            .map_err(|_| "node id must be a number".to_string())?;
+        let node = &chunk[0];
         let new_node_admin_addr = &chunk[1];
         run_control_add(leader_admin_addr, node, new_node_admin_addr).await?;
     }

@@ -229,7 +229,7 @@ pub enum Role {
 }
 
 /// Outcome of proposing a command.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProposeResult {
     /// Appended to the leader's log at `index` (will replicate + commit).
     Accepted { index: u64 },
@@ -424,9 +424,9 @@ where
 {
     /// Create a follower. `all_nodes` is the full membership (including `id`).
     pub fn new(id: NodeId, all_nodes: &[NodeId], now: Nanos, entropy: u64) -> Self {
-        let peers: Vec<NodeId> = all_nodes.iter().copied().filter(|n| *n != id).collect();
+        let peers: Vec<NodeId> = all_nodes.iter().filter(|n| **n != id).cloned().collect();
         let cluster_size = all_nodes.len();
-        let initial_config: BTreeSet<NodeId> = all_nodes.iter().copied().collect();
+        let initial_config: BTreeSet<NodeId> = all_nodes.iter().cloned().collect();
         let mut core = Self {
             id,
             peers,
@@ -520,7 +520,7 @@ where
         // (durable-gated, a no-op gate) once commit re-advances post-recovery.
         core.durable_index = core.last_log_index();
         // Already durable: do not re-emit it.
-        core.persisted_hard = (core.current_term, core.voted_for);
+        core.persisted_hard = (core.current_term, core.voted_for.clone());
         core.pending.clear();
         core
     }
@@ -555,7 +555,7 @@ where
         }
         image.push(WalRecord::Hard {
             term: self.current_term,
-            voted_for: self.voted_for,
+            voted_for: self.voted_for.clone(),
         });
         image.extend(self.log.iter().cloned().map(WalRecord::Append));
         image
@@ -597,7 +597,7 @@ where
         }
         bytes.extend(PersistedState::<C, S>::encode_record(&WalRecord::Hard {
             term: self.current_term,
-            voted_for: self.voted_for,
+            voted_for: self.voted_for.clone(),
         }));
         for entry in &self.log {
             bytes.extend(PersistedState::<C, S>::encode_record(&WalRecord::Append(
@@ -720,7 +720,7 @@ where
 
     /// Best-known leader id.
     pub fn leader(&self) -> Option<NodeId> {
-        self.leader_id
+        self.leader_id.clone()
     }
 
     /// Highest committed log index.
@@ -874,7 +874,7 @@ where
     /// Adopt `voters` as the active config and keep `peers`/`cluster_size` in sync,
     /// so every quorum/replication/election decision reflects it immediately.
     fn apply_config(&mut self, voters: BTreeSet<NodeId>) {
-        self.peers = voters.iter().copied().filter(|n| *n != self.id).collect();
+        self.peers = voters.iter().filter(|n| **n != self.id).cloned().collect();
         self.cluster_size = voters.len();
         self.config = voters;
     }
@@ -918,10 +918,10 @@ where
     pub fn change_membership(&mut self, voters: BTreeSet<NodeId>) -> ProposeResult {
         if self.role != Role::Leader {
             return ProposeResult::NotLeader {
-                leader: self.leader_id,
+                leader: self.leader_id.clone(),
             };
         }
-        if let Some(target) = self.transfer_target {
+        if let Some(target) = self.transfer_target.clone() {
             return ProposeResult::NotLeader {
                 leader: Some(target),
             };
@@ -939,7 +939,7 @@ where
         // commits — one round trip after election.
         if self.commit_index < self.first_term_index {
             return ProposeResult::NotLeader {
-                leader: Some(self.id),
+                leader: Some(self.id.clone()),
             };
         }
         let delta = self.config.symmetric_difference(&voters).count();
@@ -948,7 +948,7 @@ where
             // report not-accepted by returning the leader hint. (`delta == 0` is
             // also rejected — nothing to change.)
             return ProposeResult::NotLeader {
-                leader: Some(self.id),
+                leader: Some(self.id.clone()),
             };
         }
         let index = self.last_log_index() + 1;
@@ -970,8 +970,8 @@ where
     /// actually received everything before, say, removing a different voter out
     /// from under it.
     #[must_use]
-    pub fn peer_match(&self, node: NodeId) -> u64 {
-        self.match_index.get(&node).copied().unwrap_or(0)
+    pub fn peer_match(&self, node: &NodeId) -> u64 {
+        self.match_index.get(node).copied().unwrap_or(0)
     }
 
     /// The `now` at which this leader last heard an `AppendEntriesResp` (success
@@ -1033,11 +1033,11 @@ where
             || target == self.id
             || !self.config.contains(&target)
             || self.config_change_in_flight()
-            || self.peer_match(target) < self.commit_index
+            || self.peer_match(&target) < self.commit_index
         {
             return false;
         }
-        if self.transfer_target != Some(target) {
+        if self.transfer_target != Some(target.clone()) {
             self.transfer_target = Some(target);
             self.transfer_deadline =
                 Nanos(now.0.saturating_add(self.election_base.as_nanos() as u64));
@@ -1084,7 +1084,7 @@ where
             // brought back is no longer departing.
             if self.role == Role::Leader {
                 for removed in old_peers.iter().filter(|n| !self.peers.contains(n)) {
-                    self.departing.insert(*removed, entry.index);
+                    self.departing.insert(removed.clone(), entry.index);
                 }
             }
             self.departing.retain(|n, _| !self.peers.contains(n));
@@ -1105,9 +1105,9 @@ where
     /// Emit a hard-state record if the term or vote changed since last persisted.
     /// Called at the end of every public entry point.
     fn checkpoint_hard(&mut self) {
-        let hard = (self.current_term, self.voted_for);
+        let hard = (self.current_term, self.voted_for.clone());
         if hard != self.persisted_hard {
-            self.persisted_hard = hard;
+            self.persisted_hard = hard.clone();
             self.pending.push(WalRecord::Hard {
                 term: hard.0,
                 voted_for: hard.1,
@@ -1298,10 +1298,10 @@ where
     pub fn propose(&mut self, command: C) -> ProposeResult {
         if self.role != Role::Leader {
             return ProposeResult::NotLeader {
-                leader: self.leader_id,
+                leader: self.leader_id.clone(),
             };
         }
-        if let Some(target) = self.transfer_target {
+        if let Some(target) = self.transfer_target.clone() {
             return ProposeResult::NotLeader {
                 leader: Some(target),
             };
@@ -1410,9 +1410,9 @@ where
             let log_ok = last_log_term > self.last_log_term()
                 || (last_log_term == self.last_log_term()
                     && last_log_index >= self.last_log_index());
-            let can_vote = self.voted_for.is_none() || self.voted_for == Some(candidate);
+            let can_vote = self.voted_for.is_none() || self.voted_for == Some(candidate.clone());
             if can_vote && log_ok {
-                self.voted_for = Some(candidate);
+                self.voted_for = Some(candidate.clone());
                 self.reset_election_timer(now, entropy);
                 true
             } else {
@@ -1471,7 +1471,7 @@ where
         }
         // Valid leader for our term: become/stay follower and defer the timeout.
         self.role = Role::Follower;
-        self.leader_id = Some(leader);
+        self.leader_id = Some(leader.clone());
         self.reset_election_timer(now, entropy);
 
         // The leader's prev is behind our snapshot: those entries are already in
@@ -1550,11 +1550,11 @@ where
         // reachable right now, which is exactly the liveness signal
         // `peer_last_contact`/`control_peer_believed_alive` need. Stamped once
         // here, ahead of the branch, so both paths get it identically.
-        self.last_contact.insert(from, now);
+        self.last_contact.insert(from.clone(), now);
         if success {
-            let m = self.match_index.entry(from).or_insert(0);
+            let m = self.match_index.entry(from.clone()).or_insert(0);
             *m = (*m).max(match_index);
-            self.next_index.insert(from, match_index + 1);
+            self.next_index.insert(from.clone(), match_index + 1);
             self.maybe_advance_commit();
             self.apply();
             if self
@@ -1569,7 +1569,7 @@ where
             }
             Vec::new()
         } else {
-            let ni = self.next_index.entry(from).or_insert(1);
+            let ni = self.next_index.entry(from.clone()).or_insert(1);
             if *ni > 1 {
                 *ni -= 1;
             }
@@ -1609,7 +1609,7 @@ where
             )];
         }
         self.role = Role::Follower;
-        self.leader_id = Some(leader);
+        self.leader_id = Some(leader.clone());
         self.reset_election_timer(now, entropy);
 
         // Already at least this far along: drop any partial transfer and just
@@ -1785,9 +1785,9 @@ where
             if S::DRIVER_APPLIED && self.snapshot_offset.is_empty() {
                 self.snapshot_blob = None;
             }
-            let m = self.match_index.entry(from).or_insert(0);
+            let m = self.match_index.entry(from.clone()).or_insert(0);
             *m = (*m).max(last_index);
-            self.next_index.insert(from, last_index + 1);
+            self.next_index.insert(from.clone(), last_index + 1);
             self.maybe_advance_commit();
             self.apply();
             if self.next_index.get(&from).copied().unwrap_or(1) <= self.last_log_index() {
@@ -1796,7 +1796,7 @@ where
             return Vec::new();
         }
         // Still mid-transfer: record progress and ship the next chunk.
-        self.snapshot_offset.insert(from, next_offset);
+        self.snapshot_offset.insert(from.clone(), next_offset);
         self.replicate_to(from).into_iter().collect()
     }
 
@@ -1822,7 +1822,7 @@ where
         // vote are deliberately untouched.
         self.leader_id = None;
         self.pre_votes.clear();
-        self.pre_votes.insert(self.id);
+        self.pre_votes.insert(self.id.clone());
         self.reset_election_timer(now, entropy);
 
         // Single-node (or otherwise already a majority): skip straight to the real
@@ -1834,12 +1834,12 @@ where
         let prospective = self.current_term + 1;
         self.peers
             .iter()
-            .map(|&p| {
+            .map(|p| {
                 (
-                    p,
+                    p.clone(),
                     RaftMsg::PreVote {
                         term: prospective,
-                        candidate: self.id,
+                        candidate: self.id.clone(),
                         last_log_index: lli,
                         last_log_term: llt,
                     },
@@ -1858,10 +1858,10 @@ where
         }
         self.role = Role::Candidate;
         self.current_term += 1;
-        self.voted_for = Some(self.id);
+        self.voted_for = Some(self.id.clone());
         self.leader_id = None;
         self.votes.clear();
-        self.votes.insert(self.id);
+        self.votes.insert(self.id.clone());
         self.reset_election_timer(now, entropy);
 
         if self.votes.len() >= self.majority() {
@@ -1870,12 +1870,12 @@ where
         let (lli, llt) = (self.last_log_index(), self.last_log_term());
         self.peers
             .iter()
-            .map(|&p| {
+            .map(|p| {
                 (
-                    p,
+                    p.clone(),
                     RaftMsg::RequestVote {
                         term: self.current_term,
-                        candidate: self.id,
+                        candidate: self.id.clone(),
                         last_log_index: lli,
                         last_log_term: llt,
                     },
@@ -1886,11 +1886,11 @@ where
 
     fn become_leader(&mut self, now: Nanos) -> Vec<Out<C>> {
         self.role = Role::Leader;
-        self.leader_id = Some(self.id);
+        self.leader_id = Some(self.id.clone());
         let last = self.last_log_index();
-        for &p in &self.peers {
-            self.next_index.insert(p, last + 1);
-            self.match_index.insert(p, 0);
+        for p in self.peers.clone() {
+            self.next_index.insert(p.clone(), last + 1);
+            self.match_index.insert(p.clone(), 0);
             // Start every peer's liveness clock fresh on this leader's own
             // stint: an unresponsive peer must age out `CONTROL_PEER_LIVENESS_
             // TIMEOUT` after this leader took over, not be granted the
@@ -1931,10 +1931,11 @@ where
         // Include departing peers (see the `departing` field doc): a peer just
         // removed from `peers` still needs the removing entry replicated to it.
         let mut targets = self.peers.clone();
-        targets.extend(self.departing.keys().copied());
+        targets.extend(self.departing.keys().cloned());
         let mut outs: Vec<Out<C>> = targets
             .iter()
-            .filter_map(|&p| self.replicate_to(p))
+            .cloned()
+            .filter_map(|p| self.replicate_to(p))
             .collect();
         // Send `TimeoutNow` only once the target has actually caught all the way
         // up to `last_log_index` — arming (`transfer_leadership`) only requires
@@ -1944,8 +1945,8 @@ where
         // and truncate entries this leader had already accepted. Once true, keep
         // re-sending every heartbeat (see the `transfer_target` field doc) until
         // this node steps down — resilient to a single dropped message.
-        if let Some(target) = self.transfer_target
-            && self.peer_match(target) == self.last_log_index()
+        if let Some(target) = self.transfer_target.clone()
+            && self.peer_match(&target) == self.last_log_index()
         {
             outs.push((
                 target,
@@ -1983,7 +1984,7 @@ where
             peer,
             RaftMsg::AppendEntries {
                 term: self.current_term,
-                leader: self.id,
+                leader: self.id.clone(),
                 prev_log_index,
                 prev_log_term,
                 entries,
@@ -2036,7 +2037,7 @@ where
             peer,
             RaftMsg::InstallSnapshot {
                 term: self.current_term,
-                leader: self.id,
+                leader: self.id.clone(),
                 last_index: self.snapshot_index,
                 last_term: self.snapshot_term,
                 offset,

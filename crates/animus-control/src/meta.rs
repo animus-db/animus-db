@@ -18,19 +18,42 @@ use serde::{Deserialize, Serialize};
 
 use crate::schema::{IndexDef, SchemaCatalog, TableName, TableSchema};
 
-/// The floor of the **cluster-allocated member id** range (ADR 0036):
-/// comfortably above any realistic manually-configured `--node I` node count
-/// (`animusd`'s node id is now just the config index, ADR 0040 PR1 — one
-/// identity per node, no more separate `raftkv_id = 300 + I` offset), so an
-/// id minted by [`Metadata::next_free_alloc_id`] can never collide with an
-/// operator-chosen one. This crate has no dependency on `animusd` (the
-/// dependency runs the other way), so the disjointness is documented here in
-/// prose rather than enforced by sharing a constant — the same discipline
-/// already used for [`NodeAddrs::role`]'s plain-`String` vocabulary. Not
-/// enforced at apply time against a real cluster's chosen ids either (ADR
-/// 0036's explicit non-goal): a manually-configured cluster with more than
-/// ~1M nodes is not a realistic scenario this needs to guard against.
-pub const ALLOC_ID_BASE: NodeId = NodeId::new(1_000_000);
+/// The floor of the **cluster-allocated member id** counter (ADR 0036).
+///
+/// **ADR 0040 PR3 shim, removed in ADR 0040 PR4.** PR4 retires this whole
+/// allocator (`AllocateNodeId`, this counter, `node_id_allocations`) in favor
+/// of self-minted random ids + a registration CAS (ADR 0040 Decision C) — but
+/// deleting it a PR early would be out of this PR's scope (string
+/// representation + explicit config ids), so it stays wired exactly as
+/// before, just minting a *string* id instead of a raw `u64`:
+/// [`alloc_node_id`] formats the counter as `"alloc-{n}"` — the `"alloc-"`
+/// prefix (disjoint from `nid`'s `"n{n}"` test ids and from any operator- or
+/// config-proposed id, since [`NodeId::propose`](animus_env::NodeId::propose)
+/// accepts `-` but a config author has no reason to start an id with this
+/// exact reserved word) is what now keeps a minted id from colliding with an
+/// operator-chosen one — no more numeric floor comparison, since ids are no
+/// longer ordered by magnitude. This crate has no dependency on `animusd`, so
+/// the disjointness is still only documented in prose, same as before.
+pub const ALLOC_ID_BASE: u64 = 1_000_000;
+
+/// The reserved prefix every allocator-minted id carries (see
+/// [`ALLOC_ID_BASE`]'s doc — this whole mechanism is a PR3 shim, removed in
+/// ADR 0040 PR4).
+const ALLOC_ID_PREFIX: &str = "alloc-";
+
+/// Mint the allocator's `n`th id as `"alloc-{n}"` (PR3 shim, removed in PR4).
+pub fn alloc_node_id(n: u64) -> NodeId {
+    NodeId::new_unchecked(format!("{ALLOC_ID_PREFIX}{n}"))
+}
+
+/// Parse an allocator-minted id back to its counter value, if `id` carries
+/// the `"alloc-"` prefix (PR3 shim, removed in PR4). `pub` so a caller
+/// (`animusd`'s `admin_add_control_member`) can tell an operator-supplied id
+/// apart from the allocator's own reserved range without a numeric floor
+/// comparison (ids are no longer ordered by magnitude).
+pub fn parse_alloc_id(id: &NodeId) -> Option<u64> {
+    id.as_str().strip_prefix(ALLOC_ID_PREFIX)?.parse().ok()
+}
 
 /// Lifecycle status of a cluster member.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -210,7 +233,7 @@ pub struct Metadata {
     /// [`Metadata::next_free_alloc_id`] also folds in the highest existing
     /// allocation, so this is a floor, not the sole source of truth.
     #[serde(default = "default_next_alloc_id")]
-    pub next_alloc_id: NodeId,
+    pub next_alloc_id: u64,
     /// The **idempotency ledger** for [`MetaCommand::AllocateNodeId`] (ADR
     /// 0036): every nonce a join attempt has ever proposed, mapped to the id
     /// it was (or would have been, on a retry) allocated. Bounded by "one
@@ -227,7 +250,7 @@ pub struct Metadata {
 /// collide with real, small operator-chosen ids) is both correct and the
 /// obviously-intended value, mirroring `NodeAddrs::role`'s
 /// historically-accurate-default reasoning.
-fn default_next_alloc_id() -> NodeId {
+fn default_next_alloc_id() -> u64 {
     ALLOC_ID_BASE
 }
 
@@ -508,7 +531,7 @@ fn active_candidates(members: &BTreeMap<NodeId, Member>) -> Vec<Candidate> {
     members
         .iter()
         .filter(|(_, m)| m.status == NodeStatus::Active)
-        .map(|(id, m)| Candidate::new(*id, m.labels.clone()))
+        .map(|(id, m)| Candidate::new(id.clone(), m.labels.clone()))
         .collect()
 }
 
@@ -632,7 +655,7 @@ impl Metadata {
                 status,
             } => {
                 self.members.insert(
-                    *node,
+                    node.clone(),
                     Member {
                         labels: labels.clone(),
                         status: *status,
@@ -958,10 +981,10 @@ impl Metadata {
                 {
                     ApplyOutcome::NoOp
                 } else {
-                    self.cp_member_addrs.insert(*id, addr.clone());
+                    self.cp_member_addrs.insert(id.clone(), addr.clone());
                     match tablet {
                         Some(t) => {
-                            self.cp_member_tablets.insert(*id, *t);
+                            self.cp_member_tablets.insert(id.clone(), *t);
                         }
                         None => {
                             self.cp_member_tablets.remove(id);
@@ -974,7 +997,7 @@ impl Metadata {
                 if self.node_addrs.get(node) == Some(addrs) {
                     ApplyOutcome::NoOp
                 } else {
-                    self.node_addrs.insert(*node, addrs.clone());
+                    self.node_addrs.insert(node.clone(), addrs.clone());
                     ApplyOutcome::Applied
                 }
             }
@@ -987,7 +1010,7 @@ impl Metadata {
                 if matches!(member.status, NodeStatus::Active | NodeStatus::Joining) {
                     return ApplyOutcome::Rejected("not drained: member is Active or Joining");
                 }
-                if self.tablets_referencing(*node) > 0 {
+                if self.tablets_referencing(node) > 0 {
                     return ApplyOutcome::Rejected("still referenced by a tablet's replica set");
                 }
                 self.members.remove(node);
@@ -1004,9 +1027,11 @@ impl Metadata {
                     // `node_id_allocations`, never from this outcome alone.
                     return ApplyOutcome::NoOp;
                 }
-                let node_id = self.next_free_alloc_id();
-                self.next_alloc_id = NodeId::new(node_id.as_u64() + 1);
-                self.node_id_allocations.insert(nonce.clone(), node_id);
+                let n = self.next_free_alloc_id_n();
+                let node_id = alloc_node_id(n);
+                self.next_alloc_id = n + 1;
+                self.node_id_allocations
+                    .insert(nonce.clone(), node_id.clone());
                 self.members.insert(
                     node_id,
                     Member {
@@ -1032,7 +1057,7 @@ impl Metadata {
             .cp_member_tablets
             .iter()
             .filter(|(_, t)| !self.tablets.contains_key(t))
-            .map(|(&id, _)| id)
+            .map(|(id, _)| id.clone())
             .collect();
         for id in dead {
             self.cp_member_tablets.remove(&id);
@@ -1115,10 +1140,10 @@ impl Metadata {
     /// placement candidate pool entirely, and no repair path left (placement
     /// only ever chooses from `Active` members).
     #[must_use]
-    pub fn tablets_referencing(&self, node: NodeId) -> usize {
+    pub fn tablets_referencing(&self, node: &NodeId) -> usize {
         self.tablets
             .values()
-            .filter(|t| t.replicas.contains(&node))
+            .filter(|t| t.replicas.contains(node))
             .count()
     }
 
@@ -1149,26 +1174,28 @@ impl Metadata {
     /// second sees the first's bumped counter.
     #[must_use]
     pub fn next_free_alloc_id(&self) -> NodeId {
+        alloc_node_id(self.next_free_alloc_id_n())
+    }
+
+    /// The numeric counter value backing [`Metadata::next_free_alloc_id`]
+    /// (PR3 shim, removed in PR4 along with the rest of the allocator).
+    fn next_free_alloc_id_n(&self) -> u64 {
         let highest_member = self
             .members
             .keys()
-            .copied()
-            .filter(|&id| id >= ALLOC_ID_BASE)
+            .filter_map(parse_alloc_id)
             .max()
-            .unwrap_or(NodeId::new(0));
+            .unwrap_or(0);
         let highest_allocation = self
             .node_id_allocations
             .values()
-            .copied()
+            .filter_map(parse_alloc_id)
             .max()
-            .unwrap_or(NodeId::new(0));
-        NodeId::new(
-            self.next_alloc_id
-                .as_u64()
-                .max(highest_member.as_u64() + 1)
-                .max(highest_allocation.as_u64() + 1)
-                .max(ALLOC_ID_BASE.as_u64()),
-        )
+            .unwrap_or(0);
+        self.next_alloc_id
+            .max(highest_member + 1)
+            .max(highest_allocation + 1)
+            .max(ALLOC_ID_BASE)
     }
 }
 
@@ -1991,7 +2018,7 @@ mod tests {
             range: KeyRange::whole(),
             replicas: vec![nid(300), nid(301), nid(302)],
         });
-        assert_eq!(m.tablets_referencing(nid(301)), 1);
+        assert_eq!(m.tablets_referencing(&nid(301)), 1);
         assert_eq!(
             m.apply(&MetaCommand::RemoveMember { node: nid(301) }),
             ApplyOutcome::Rejected("still referenced by a tablet's replica set")
@@ -2048,7 +2075,7 @@ mod tests {
                 addr: "127.0.0.1:9301".to_owned(),
                 tablet: None,
             });
-            assert_eq!(m.tablets_referencing(nid(301)), 0);
+            assert_eq!(m.tablets_referencing(&nid(301)), 0);
 
             assert_eq!(
                 m.apply(&MetaCommand::RemoveMember { node: nid(301) }),
@@ -2106,7 +2133,7 @@ mod tests {
             });
         }
 
-        assert_eq!(m.next_free_alloc_id(), ALLOC_ID_BASE);
+        assert_eq!(m.next_free_alloc_id(), alloc_node_id(ALLOC_ID_BASE));
         assert_eq!(
             m.apply(&MetaCommand::AllocateNodeId {
                 nonce: "join-1".to_owned(),
@@ -2114,12 +2141,32 @@ mod tests {
             }),
             ApplyOutcome::Applied
         );
-        let first = *m.node_id_allocations.get("join-1").expect("recorded");
-        assert_eq!(first, ALLOC_ID_BASE, "first allocation lands at the base");
-        assert!(
-            first > nid(302),
-            "allocated id must never collide with a small manual id"
+        let first = m
+            .node_id_allocations
+            .get("join-1")
+            .expect("recorded")
+            .clone();
+        assert_eq!(
+            first,
+            alloc_node_id(ALLOC_ID_BASE),
+            "first allocation lands at the base"
         );
+        // Disjointness is now by *namespace* (the reserved `"alloc-"` prefix),
+        // not by magnitude — string ids aren't ordered by "size" the way the
+        // old raw-`u64` scheme was (`"alloc-1000000"` sorts *before* `"n302"`
+        // lexicographically, so an `>` comparison here would be a false
+        // negative for the very property this test means to prove).
+        assert!(
+            parse_alloc_id(&first).is_some(),
+            "an allocator-minted id must carry the reserved \"alloc-\" prefix"
+        );
+        for node in [0u64, 1, 300, 301, 302] {
+            assert_ne!(
+                first,
+                nid(node),
+                "allocated id must never collide with a small manual id"
+            );
+        }
 
         // A second, distinct join attempt allocates strictly past the first —
         // the counter never goes backward.
@@ -2130,9 +2177,19 @@ mod tests {
             }),
             ApplyOutcome::Applied
         );
-        let second = *m.node_id_allocations.get("join-2").expect("recorded");
-        assert_eq!(second.as_u64(), first.as_u64() + 1);
-        assert_eq!(m.next_free_alloc_id().as_u64(), second.as_u64() + 1);
+        let second = m
+            .node_id_allocations
+            .get("join-2")
+            .expect("recorded")
+            .clone();
+        assert_eq!(
+            parse_alloc_id(&second).unwrap(),
+            parse_alloc_id(&first).unwrap() + 1
+        );
+        assert_eq!(
+            parse_alloc_id(&m.next_free_alloc_id()).unwrap(),
+            parse_alloc_id(&second).unwrap() + 1
+        );
     }
 
     /// Replaying the **same nonce** (a proposer retry after an `Accepted`-
@@ -2149,7 +2206,11 @@ mod tests {
         };
 
         assert_eq!(m.apply(&alloc("retry-me")), ApplyOutcome::Applied);
-        let id = *m.node_id_allocations.get("retry-me").expect("recorded");
+        let id = m
+            .node_id_allocations
+            .get("retry-me")
+            .expect("recorded")
+            .clone();
         let after_first = m.clone();
 
         // A retry with the same nonce: no-op, identical id, no further
@@ -2161,10 +2222,11 @@ mod tests {
 
         // A third, distinct nonce still gets a fresh id.
         assert_eq!(m.apply(&alloc("different-attempt")), ApplyOutcome::Applied);
-        let other = *m
+        let other = m
             .node_id_allocations
             .get("different-attempt")
-            .expect("recorded");
+            .expect("recorded")
+            .clone();
         assert_ne!(other, id);
     }
 
@@ -2184,7 +2246,11 @@ mod tests {
             }),
             ApplyOutcome::Applied
         );
-        let id = *m.node_id_allocations.get("join-1").expect("recorded");
+        let id = m
+            .node_id_allocations
+            .get("join-1")
+            .expect("recorded")
+            .clone();
         let member = m.members.get(&id).expect("member registered");
         assert_eq!(member.status, NodeStatus::Down);
         assert_eq!(member.labels, labels);
@@ -2211,6 +2277,6 @@ mod tests {
             serde_json::from_value(value).expect("metadata without alloc fields still decodes");
         assert_eq!(decoded.next_alloc_id, ALLOC_ID_BASE);
         assert!(decoded.node_id_allocations.is_empty());
-        assert_eq!(decoded.next_free_alloc_id(), ALLOC_ID_BASE);
+        assert_eq!(decoded.next_free_alloc_id(), alloc_node_id(ALLOC_ID_BASE));
     }
 }

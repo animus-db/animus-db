@@ -45,7 +45,7 @@ pub struct FailureDetector {
 }
 
 /// The detector's verdict for a single tracked member.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Liveness {
     /// The member the verdict is about.
     pub node: NodeId,
@@ -85,7 +85,7 @@ impl FailureDetector {
     /// that membership no longer knows about, so it can prune them — keeps
     /// `last_seen` bounded and stops judging a removed member.
     pub fn tracked_ids(&self) -> impl Iterator<Item = NodeId> + '_ {
-        self.last_seen.keys().copied()
+        self.last_seen.keys().cloned()
     }
 
     /// Whether `node` is currently being tracked (has ever heartbeated).
@@ -113,8 +113,8 @@ impl FailureDetector {
     pub fn evaluate(&self, now: Nanos) -> Vec<Liveness> {
         self.last_seen
             .iter()
-            .map(|(&node, &last)| Liveness {
-                node,
+            .map(|(node, &last)| Liveness {
+                node: node.clone(),
                 alive: now.duration_since(last) <= self.timeout,
             })
             .collect()
@@ -164,7 +164,7 @@ mod tests {
         let now = Nanos(1_000 + 400_000_000);
         let v = d.evaluate(now);
         assert_eq!(
-            v.iter().map(|l| l.node).collect::<Vec<_>>(),
+            v.iter().map(|l| l.node.clone()).collect::<Vec<_>>(),
             vec![nid(10), nid(11), nid(12)]
         );
         assert!(!v[0].alive); // 10: stale

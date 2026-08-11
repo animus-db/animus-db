@@ -34,7 +34,7 @@ fn tablets<'a, K: Copy>(
 
 /// Per-node replica counts across `candidates`, seeded 0.
 fn counts(sets: &[(u32, Vec<NodeId>)], candidates: &[Candidate]) -> BTreeMap<NodeId, usize> {
-    let mut c: BTreeMap<NodeId, usize> = candidates.iter().map(|x| (x.node, 0)).collect();
+    let mut c: BTreeMap<NodeId, usize> = candidates.iter().map(|x| (x.node.clone(), 0)).collect();
     for (_, replicas) in sets {
         for r in replicas {
             if let Some(n) = c.get_mut(r) {
@@ -46,8 +46,8 @@ fn counts(sets: &[(u32, Vec<NodeId>)], candidates: &[Candidate]) -> BTreeMap<Nod
 }
 
 /// The zone label of `node` in the pool.
-fn zone_of(pool: &[Candidate], node: u64) -> String {
-    pool.iter().find(|c| c.node == nid(node)).unwrap().labels["zone"].clone()
+fn zone_of(pool: &[Candidate], node: &NodeId) -> String {
+    pool.iter().find(|c| &c.node == node).unwrap().labels["zone"].clone()
 }
 
 #[test]
@@ -131,7 +131,7 @@ fn strict_spread_blocks_a_domain_doubling_move() {
     ];
     let (_, new) = rebalance_step(&tablets(&sets, &policy), &cands).expect("a move");
     // Whatever move was chosen, strict spread holds: three distinct zones.
-    let mut zones: Vec<String> = new.iter().map(|n| zone_of(&cands, (*n).as_u64())).collect();
+    let mut zones: Vec<String> = new.iter().map(|n| zone_of(&cands, n)).collect();
     zones.sort();
     zones.dedup();
     assert_eq!(zones.len(), 3, "strict spread broken: {new:?}");
@@ -165,7 +165,7 @@ fn best_effort_spread_never_worsens() {
     // Max-per-domain did not increase from the pre-move set's 1.
     let mut per_zone: BTreeMap<String, usize> = BTreeMap::new();
     for n in &new {
-        *per_zone.entry(zone_of(&cands, (*n).as_u64())).or_default() += 1;
+        *per_zone.entry(zone_of(&cands, n)).or_default() += 1;
     }
     assert_eq!(
         *per_zone.values().max().unwrap(),

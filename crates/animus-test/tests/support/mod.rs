@@ -1032,7 +1032,7 @@ async fn run_read(
         .invoke(proc, env.now().0, invoke_mops);
 
     let txn = node.submit_read(keys.clone());
-    let observed = if wait_applied(node, txn).await {
+    let observed = if wait_applied(node, txn.clone()).await {
         node.read_value_result(txn)
     } else {
         None
@@ -1080,7 +1080,7 @@ async fn wait_applied(node: &AccordNode<SimEnv>, txn: TxnId) -> bool {
     let env = node.env().clone();
     let deadline = env.now().0 + OP_BUDGET.as_nanos() as u64;
     loop {
-        if node.is_applied(txn) {
+        if node.is_applied(txn.clone()) {
             return true;
         }
         if env.now().0 >= deadline {

@@ -85,12 +85,12 @@ fn racing_allocations_through_the_same_leader_mint_distinct_ids() {
         let a = meta
             .node_id_allocations
             .get("racer-a")
-            .copied()
+            .cloned()
             .unwrap_or_else(|| panic!("racer-a not allocated on replica {i} (seed={seed})"));
         let b = meta
             .node_id_allocations
             .get("racer-b")
-            .copied()
+            .cloned()
             .unwrap_or_else(|| panic!("racer-b not allocated on replica {i} (seed={seed})"));
         assert_ne!(a, b, "two distinct join attempts must get distinct ids");
         assert_eq!(
@@ -138,7 +138,7 @@ fn leader_killed_mid_allocation_same_nonce_retry_converges_to_one_id() {
         .metadata()
         .node_id_allocations
         .get("joiner-1")
-        .copied()
+        .cloned()
         .expect("committed allocation not replicated pre-kill");
 
     sim.crash(nid(old_leader as u64));
@@ -158,7 +158,7 @@ fn leader_killed_mid_allocation_same_nonce_retry_converges_to_one_id() {
         let id = meta
             .node_id_allocations
             .get("joiner-1")
-            .copied()
+            .cloned()
             .expect("joiner-1 must still be allocated after the retry");
         assert_eq!(
             id, pre_kill_id,
