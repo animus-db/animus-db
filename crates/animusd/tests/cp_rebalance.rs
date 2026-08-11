@@ -131,7 +131,7 @@ async fn hosted_voters(admin_addr: SocketAddr) -> BTreeMap<u64, Vec<u64>> {
 async fn bring_up(n: usize, dir: &std::path::Path) -> (Vec<Node>, ClusterConfig) {
     for attempt in 0..16 {
         let a: Vec<SocketAddr> = {
-            let ls: Vec<std::net::TcpListener> = (0..n * 6)
+            let ls: Vec<std::net::TcpListener> = (0..n * 5)
                 .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
                 .collect();
             ls.iter().map(|l| l.local_addr().unwrap()).collect()
@@ -140,12 +140,11 @@ async fn bring_up(n: usize, dir: &std::path::Path) -> (Vec<Node>, ClusterConfig)
             nodes: (0..n)
                 .map(|i| RoleAddrs {
                     role: animusd::config::NodeRole::Both,
-                    control: Some(a[6 * i]),
-                    client: a[6 * i + 1],
-                    dynamo: a[6 * i + 2],
-                    cql: a[6 * i + 3],
-                    raftkv: Some(a[6 * i + 4]),
-                    admin: a[6 * i + 5],
+                    internal: a[5 * i],
+                    client: a[5 * i + 1],
+                    dynamo: a[5 * i + 2],
+                    cql: a[5 * i + 3],
+                    admin: a[5 * i + 4],
                 })
                 .collect(),
         };
@@ -232,14 +231,14 @@ async fn cluster_grown_to_five_nodes_rebalances_existing_tablets() {
     let dir = tempfile::tempdir().unwrap();
     let (nodes, config) = bring_up(5, dir.path()).await;
     await_bootstrap(&nodes).await;
-    let raftkv_ids = config.raftkv_ids(); // [300, 301, 302, 303, 304]
+    let raftkv_ids = config.data_ids(); // [0, 1, 2, 3, 4]
     let admin_addrs: Vec<SocketAddr> = config.nodes.iter().map(|a| a.admin).collect();
     let clients: Vec<SocketAddr> = config.nodes.iter().map(|a| a.client).collect();
 
     // Provision several tables. ADR 0023: each table's tablet forms on first
     // write, on the first min(N, 3) *Active* raftkv members — with all 5 nodes
-    // already Active at bootstrap, every table lands on {300,301,302}, leaving
-    // 303/304 idle. This is the natural "grew the cluster before creating this
+    // already Active at bootstrap, every table lands on {0,1,2}, leaving
+    // 3/4 idle (ADR 0040 PR1: one id per node). This is the natural "grew the cluster before creating this
     // data" imbalance ADR 0029 exists to fix, with no membership-growing
     // machinery needed to set it up.
     for table in TABLES {
@@ -257,11 +256,11 @@ async fn cluster_grown_to_five_nodes_rebalances_existing_tablets() {
     );
     assert_eq!(
         initial_counts[&raftkv_ids[3]], 0,
-        "node 303 should start with no replicas: {initial_counts:?}"
+        "node 3 should start with no replicas: {initial_counts:?}"
     );
     assert_eq!(
         initial_counts[&raftkv_ids[4]], 0,
-        "node 304 should start with no replicas: {initial_counts:?}"
+        "node 4 should start with no replicas: {initial_counts:?}"
     );
 
     // Converge: poll the replicated tablet map until every node's replica
@@ -285,11 +284,11 @@ async fn cluster_grown_to_five_nodes_rebalances_existing_tablets() {
     let converged_counts = replica_counts(&converged_map, &raftkv_ids);
     assert!(
         converged_counts[&raftkv_ids[3]] > 0,
-        "node 303 never gained a replica: {converged_counts:?}"
+        "node 3 never gained a replica: {converged_counts:?}"
     );
     assert!(
         converged_counts[&raftkv_ids[4]] > 0,
-        "node 304 never gained a replica: {converged_counts:?}"
+        "node 4 never gained a replica: {converged_counts:?}"
     );
 
     // The data plane, not just metadata, must reflect the new placement: for

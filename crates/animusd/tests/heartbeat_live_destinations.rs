@@ -145,15 +145,14 @@ async fn join_control_nonvoter(
     dir: &Path,
 ) -> (Node, RoleAddrs) {
     for attempt in 0..16 {
-        let raw = support::free_addrs(6);
+        let raw = support::free_addrs(5);
         let addrs = RoleAddrs {
             role: NodeRole::Control,
-            control: Some(raw[0]),
+            internal: raw[0],
             client: raw[1],
             dynamo: raw[2],
             cql: raw[3],
-            raftkv: None,
-            admin: raw[5],
+            admin: raw[4],
         };
         let bound = match animusd::Node::bind_control(
             new_control_id,
@@ -171,17 +170,12 @@ async fn join_control_nonvoter(
         let mut client_route: std::collections::BTreeMap<animus_env::NodeId, SocketAddr> =
             std::collections::BTreeMap::new();
         for (i, a) in config.nodes.iter().enumerate() {
-            if a.role.has_control() {
-                client_route.insert(animusd::config::control_id(i), a.client);
-            }
-            if a.role.has_data() {
-                client_route.insert(animusd::config::raftkv_id(i), a.client);
-            }
+            client_route.insert(animusd::config::node_id(i), a.client);
         }
         let admin_addrs: Vec<SocketAddr> = config.nodes.iter().map(|n| n.admin).collect();
         let node = bound
             .start_control_with(
-                config.control_peer_book(),
+                config.peer_book(),
                 config.control_ids(),
                 client_route,
                 admin_addrs,
@@ -203,7 +197,7 @@ async fn heartbeat_reaches_a_runtime_added_voter_after_it_becomes_leader() {
     // list of exactly `{0}` (itself); no other control voter exists yet.
     let (node0, config) = support::start_single_node(dir.path(), StorageBackend::Memory).await;
     let node0_admin = node0.admin_addr();
-    let node0_raftkv_id = animusd::config::raftkv_id(0);
+    let node0_raftkv_id = animusd::config::node_id(0);
 
     timeout(Duration::from_secs(20), async {
         loop {
@@ -222,26 +216,16 @@ async fn heartbeat_reaches_a_runtime_added_voter_after_it_becomes_leader() {
     let new_id = 1u64;
     let (grown, grown_addrs) = join_control_nonvoter(&config, new_id, dir.path()).await;
     let grown_admin = grown.admin_addr();
-    let grown_control_addr = grown_addrs
-        .control
-        .expect("control-only node has a control addr");
+    let grown_control_addr = grown_addrs.internal;
 
     // `grown` self-registers its own `NodeAddrs` (relayed, since it starts
-    // life a non-voter — `ClientCtx::register_node_addrs`) and, because a
-    // non-voter can never observe its own commit through its own
-    // `effective_metadata()`, keeps re-proposing its (unmodified, `control:
-    // None`) desired value on every retry tick until that bounded loop
-    // exhausts (`SCHEMA_COMMIT_TIMEOUT`, 10s) — exactly the race
-    // `tests/control_membership_admin.rs::
-    // runtime_added_voter_survives_leadership_change_to_a_different_original_voter`
-    // documents and sequences around. Racing `control/member/add`'s `control:
-    // Some(addr)` write within that window lets a later retry clobber it back
-    // to `None` — which would silently re-break this very test's raftkv
-    // peer-book merge once `peer_sync_loop` next rebuilds from a
-    // `node_addrs[1].control == None` snapshot. Wait for the self-
-    // registration to land on the real cluster, then let the retry loop
-    // fully exhaust, before adding the voter — mirrors the real operator
-    // runbook's own "confirm it's up first" step.
+    // life a non-voter — `ClientCtx::register_node_addrs`) — its `internal`
+    // address is already correct from that very first self-registration
+    // (ADR 0040 PR1: one address per node, not a separate control/raftkv
+    // pair populated later by `control/member/add`). Wait for the
+    // self-registration to land on the real cluster before adding the
+    // voter — mirrors the real operator runbook's own "confirm it's up
+    // first" step.
     let self_registered = async {
         loop {
             if node0.metadata().node_addrs.contains_key(&new_id) {

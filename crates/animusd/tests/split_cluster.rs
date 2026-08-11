@@ -151,7 +151,7 @@ async fn control_leader_failover_under_live_data_traffic() {
         let (mut control_nodes, data_nodes, _config) = bring_up_split(3, 2, dir.path()).await;
         await_leader(&control_nodes).await;
         let data_raftkv_ids: Vec<animus_env::NodeId> =
-            (3..5).map(animusd::config::raftkv_id).collect();
+            (3..5).map(animusd::config::node_id).collect();
         await_data_nodes_active(&control_nodes, &data_raftkv_ids).await;
 
         let data_clients: Vec<SocketAddr> = data_nodes.iter().map(Node::client_addr).collect();
@@ -289,7 +289,7 @@ async fn split_and_merge_over_a_split_deployment() {
         let (control_nodes, data_nodes, _config) = bring_up_split(3, 2, dir.path()).await;
         await_leader(&control_nodes).await;
         let data_raftkv_ids: Vec<animus_env::NodeId> =
-            (3..5).map(animusd::config::raftkv_id).collect();
+            (3..5).map(animusd::config::node_id).collect();
         await_data_nodes_active(&control_nodes, &data_raftkv_ids).await;
 
         let data_clients: Vec<SocketAddr> = data_nodes.iter().map(Node::client_addr).collect();
@@ -386,7 +386,7 @@ async fn data_node_failure_is_detected_and_repaired_onto_a_spare() {
         let (control_nodes, mut data_nodes, _config) = bring_up_split(3, 4, dir.path()).await;
         await_leader(&control_nodes).await;
         let data_raftkv_ids: Vec<animus_env::NodeId> =
-            (3..7).map(animusd::config::raftkv_id).collect();
+            (3..7).map(animusd::config::node_id).collect();
         await_data_nodes_active(&control_nodes, &data_raftkv_ids).await;
 
         let data_clients: Vec<SocketAddr> = data_nodes.iter().map(Node::client_addr).collect();
@@ -492,7 +492,7 @@ async fn decommission_a_data_node_over_split_deployment_via_the_control_leader()
         let (control_nodes, mut data_nodes, _config) = bring_up_split(3, 4, dir.path()).await;
         await_leader(&control_nodes).await;
         let data_raftkv_ids: Vec<animus_env::NodeId> =
-            (3..7).map(animusd::config::raftkv_id).collect();
+            (3..7).map(animusd::config::node_id).collect();
         await_data_nodes_active(&control_nodes, &data_raftkv_ids).await;
 
         let data_clients: Vec<SocketAddr> = data_nodes.iter().map(Node::client_addr).collect();
@@ -688,7 +688,7 @@ async fn bring_up_split_durable(
 ) {
     let total = control_n + data_n;
     for attempt in 0..16 {
-        let addrs = free_addrs(total * 6);
+        let addrs = free_addrs(total * 5);
         let nodes_cfg: Vec<RoleAddrs> = (0..total)
             .map(|i| {
                 let role = if i < control_n {
@@ -698,12 +698,11 @@ async fn bring_up_split_durable(
                 };
                 RoleAddrs {
                     role,
-                    control: role.has_control().then_some(addrs[6 * i]),
-                    client: addrs[6 * i + 1],
-                    dynamo: addrs[6 * i + 2],
-                    cql: addrs[6 * i + 3],
-                    raftkv: role.has_data().then_some(addrs[6 * i + 4]),
-                    admin: addrs[6 * i + 5],
+                    internal: addrs[5 * i],
+                    client: addrs[5 * i + 1],
+                    dynamo: addrs[5 * i + 2],
+                    cql: addrs[5 * i + 3],
+                    admin: addrs[5 * i + 4],
                 }
             })
             .collect();
@@ -782,7 +781,7 @@ async fn restart_control(config: &ClusterConfig, index: usize, dir: &Path) -> No
                 if tokio::time::Instant::now() >= deadline {
                     panic!(
                         "control node {index} did not rebind on restart: {e}\n{}",
-                        listen_holders(config.nodes[index].control)
+                        listen_holders(Some(config.nodes[index].internal))
                     );
                 }
                 sleep(Duration::from_millis(50)).await;
@@ -858,7 +857,7 @@ async fn full_split_cluster_restart_recovers_metadata_and_data() {
             bring_up_split_durable(3, 1, dir.path()).await;
         await_leader(&control_nodes).await;
         let data_raftkv_ids: Vec<animus_env::NodeId> =
-            (3..4).map(animusd::config::raftkv_id).collect();
+            (3..4).map(animusd::config::node_id).collect();
         await_data_nodes_active(&control_nodes, &data_raftkv_ids).await;
 
         // Schema DDL + data, both meant to survive the full outage.
@@ -967,7 +966,7 @@ async fn control_leader_and_data_node_failure_simultaneously_still_converges() {
         let (mut control_nodes, mut data_nodes, _config) = bring_up_split(3, 4, dir.path()).await;
         await_leader(&control_nodes).await;
         let data_raftkv_ids: Vec<animus_env::NodeId> =
-            (3..7).map(animusd::config::raftkv_id).collect();
+            (3..7).map(animusd::config::node_id).collect();
         await_data_nodes_active(&control_nodes, &data_raftkv_ids).await;
 
         let data_clients: Vec<SocketAddr> = data_nodes.iter().map(Node::client_addr).collect();
@@ -1172,7 +1171,7 @@ async fn decommission_racing_a_tablet_split_converges_with_no_data_loss() {
         let (control_nodes, mut data_nodes, _config) = bring_up_split(3, 4, dir.path()).await;
         await_leader(&control_nodes).await;
         let data_raftkv_ids: Vec<animus_env::NodeId> =
-            (3..7).map(animusd::config::raftkv_id).collect();
+            (3..7).map(animusd::config::node_id).collect();
         await_data_nodes_active(&control_nodes, &data_raftkv_ids).await;
 
         let data_clients: Vec<SocketAddr> = data_nodes.iter().map(Node::client_addr).collect();

@@ -64,17 +64,16 @@ const KV_TABLET: TabletId = TabletId(1);
 /// data dirs so a test can assert on-disk WAL state and restart nodes in place.
 async fn bring_up(n: usize, dir: &Path) -> (Vec<Node>, ClusterConfig, Vec<PathBuf>) {
     for attempt in 0..16 {
-        let a = support::free_addrs(n * 6);
+        let a = support::free_addrs(n * 5);
         let config = ClusterConfig {
             nodes: (0..n)
                 .map(|i| RoleAddrs {
                     role: animusd::config::NodeRole::Both,
-                    control: Some(a[6 * i]),
-                    client: a[6 * i + 1],
-                    dynamo: a[6 * i + 2],
-                    cql: a[6 * i + 3],
-                    raftkv: Some(a[6 * i + 4]),
-                    admin: a[6 * i + 5],
+                    internal: a[5 * i],
+                    client: a[5 * i + 1],
+                    dynamo: a[5 * i + 2],
+                    cql: a[5 * i + 3],
+                    admin: a[5 * i + 4],
                 })
                 .collect(),
         };
@@ -260,7 +259,7 @@ where
 
 /// Provision the `kv` tablet (KV_TABLET) on nodes 0..3, wait for it to form with
 /// 3 voters + a leader, and return the leading node's index. The replica set is
-/// the first `min(N, RF=3)` Active members (raftkv 300..302 = node indices 0..2),
+/// the first `min(N, RF=3)` Active members (node ids 0..2),
 /// so node 3 (if present) is an idle spare.
 async fn form_kv_group(nodes: &[Node], clients: &[SocketAddr]) -> usize {
     put(clients, "kv", b"k0", b"v0", 30).await;
@@ -321,11 +320,11 @@ async fn set_replicas(nodes: &[Node], tablet: TabletId, replicas: &[u64]) {
 async fn moved_off_replica_is_stopped_and_its_scope_erased() {
     timeout(Duration::from_secs(120), async {
         let tmp = tempfile::tempdir().unwrap();
-        // 4 nodes, RF=3: kv lands on 300..302 (node indices 0..2); node 3 (303) is
+        // 4 nodes, RF=3: kv lands on ids 0..2; node 3 is
         // a spare, so we can move a replica off onto it and leave a stable RF-3 set.
         let (nodes, config, dirs) = bring_up(4, tmp.path()).await;
         await_bootstrap(&nodes).await;
-        let raftkv_ids = config.raftkv_ids(); // [300, 301, 302, 303]
+        let raftkv_ids = config.data_ids(); // [0, 1, 2, 3]
         let spare = raftkv_ids[3];
         let clients: Vec<SocketAddr> = config.nodes.iter().map(|a| a.client).collect();
 
@@ -355,7 +354,7 @@ async fn moved_off_replica_is_stopped_and_its_scope_erased() {
         .await;
         // …and erases its data (its per-tablet WAL file is deleted, and the
         // node-local storage view no longer serves the tablet).
-        let dropped_raftkv_dir = dirs[drop_idx].join("raftkv");
+        let dropped_raftkv_dir = dirs[drop_idx].join("internal");
         await_true(60, "dropped node's tablet WAL is reclaimed", || {
             let d = dropped_raftkv_dir.clone();
             async move { !tablet_wal_present(&d, KV_TABLET) }
@@ -396,7 +395,7 @@ async fn release_survives_a_restart_replay() {
         let tmp = tempfile::tempdir().unwrap();
         let (nodes, config, dirs) = bring_up(4, tmp.path()).await;
         await_bootstrap(&nodes).await;
-        let raftkv_ids = config.raftkv_ids();
+        let raftkv_ids = config.data_ids();
         let spare = raftkv_ids[3];
         let clients: Vec<SocketAddr> = config.nodes.iter().map(|a| a.client).collect();
 
@@ -450,7 +449,7 @@ async fn release_survives_a_restart_replay() {
 
         // Wait for the dropped node to release `kv`.
         let dropped_admin = config.nodes[drop_idx].admin;
-        let dropped_raftkv_dir = dirs[drop_idx].join("raftkv");
+        let dropped_raftkv_dir = dirs[drop_idx].join("internal");
         await_true(60, "kv released on the dropped node", || {
             let d = dropped_raftkv_dir.clone();
             async move {
@@ -538,14 +537,14 @@ async fn release_survives_a_restart_replay() {
 async fn a_joining_spare_is_never_released() {
     timeout(Duration::from_secs(150), async {
         let tmp = tempfile::tempdir().unwrap();
-        // 4 nodes, RF=3: kv on 300..302, spare 303. Kill a replica -> the reconciler
+        // 4 nodes, RF=3: kv on ids 0..2, spare id 3. Kill a replica -> the reconciler
         // moves the tablet onto the spare, which join-hosts a fresh (initially
         // non-voter, empty) group. The release phase must NEVER touch that spare's
         // group: the spare IS in the replica set, and the local-config gate +
         // epoch dampener absorb the brief non-voter window during the join.
         let (nodes, config, dirs) = bring_up(4, tmp.path()).await;
         await_bootstrap(&nodes).await;
-        let raftkv_ids = config.raftkv_ids();
+        let raftkv_ids = config.data_ids();
         let spare = raftkv_ids[3];
         let clients: Vec<SocketAddr> = config.nodes.iter().map(|a| a.client).collect();
 
@@ -586,7 +585,7 @@ async fn a_joining_spare_is_never_released() {
         // its WAL file is present, and it stays that way over a sustained window
         // (several release-GC ticks) — the regression on the gate + dampener.
         let spare_admin = config.nodes[3].admin;
-        let spare_raftkv_dir = dirs[3].join("raftkv");
+        let spare_raftkv_dir = dirs[3].join("internal");
         assert!(
             hosts_tablet(spare_admin, KV_TABLET).await,
             "the spare must host the tablet after joining"
@@ -646,7 +645,7 @@ async fn split_then_immediate_release_spares_the_new_siblings_data() {
         let tmp = tempfile::tempdir().unwrap();
         let (nodes, config, _dirs) = bring_up(4, tmp.path()).await;
         await_bootstrap(&nodes).await;
-        let raftkv_ids = config.raftkv_ids();
+        let raftkv_ids = config.data_ids();
         let spare = raftkv_ids[3];
         let clients: Vec<SocketAddr> = config.nodes.iter().map(|a| a.client).collect();
 

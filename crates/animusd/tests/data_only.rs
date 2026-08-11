@@ -81,7 +81,7 @@ async fn split_cluster_serves_reads_and_writes_across_data_nodes() {
         await_leader(&control_nodes).await;
 
         let data_raftkv_ids: Vec<animus_env::NodeId> =
-            (3..5).map(animusd::config::raftkv_id).collect();
+            (3..5).map(animusd::config::node_id).collect();
         await_data_nodes_active(&control_nodes, &data_raftkv_ids).await;
 
         // A `Put` issued against ONE data node's client port; a `Get`
@@ -270,19 +270,19 @@ async fn split_cluster_serves_reads_and_writes_across_data_nodes() {
         .await
         .expect("both data nodes never converged to hosting the tablet's CP group (20s)");
 
-        // A control-only node's own `/admin/config` still has no raftkv id
-        // (unchanged from ADR 0035 PR3); a data-only node's has no control
-        // id at all (ADR 0035 PR4's new case).
+        // Every node has one id and one internal address regardless of role
+        // (ADR 0040 PR1) — a data-only node included, even though it has no
+        // local control `RaftCore`.
         for n in &data_nodes {
             let (status, cfg) = admin_get(n.admin_addr(), "/admin/config").await;
             assert_eq!(status, 200);
             assert!(
-                cfg["control_id"].is_null(),
-                "a data-only node has no local control id: {cfg}"
+                !cfg["node_id"].is_null(),
+                "a data-only node still has its own id: {cfg}"
             );
             assert!(
-                cfg["addrs"]["control"].is_null(),
-                "a data-only node has no control address: {cfg}"
+                !cfg["addrs"]["internal"].is_null(),
+                "a data-only node still has its own internal address: {cfg}"
             );
         }
 
@@ -365,7 +365,7 @@ async fn data_node_falls_over_to_a_remaining_control_seed() {
         await_leader(&control_nodes).await;
 
         let data_raftkv_ids: Vec<animus_env::NodeId> =
-            (3..5).map(animusd::config::raftkv_id).collect();
+            (3..5).map(animusd::config::node_id).collect();
         await_data_nodes_active(&control_nodes, &data_raftkv_ids).await;
 
         // Stop a control node that is NOT the current leader (stopping the
@@ -434,7 +434,7 @@ async fn data_node_restart_rejoins_and_serves_reads_again() {
         await_leader(&control_nodes).await;
 
         let data_raftkv_ids: Vec<animus_env::NodeId> =
-            (3..5).map(animusd::config::raftkv_id).collect();
+            (3..5).map(animusd::config::node_id).collect();
         await_data_nodes_active(&control_nodes, &data_raftkv_ids).await;
 
         timeout(Duration::from_secs(20), async {
@@ -535,7 +535,7 @@ async fn data_node_observes_live_control_voters_after_a_fresh_fetch() {
         await_leader(&control_nodes).await;
 
         let expected: std::collections::BTreeSet<animus_env::NodeId> =
-            (0..3).map(animusd::config::control_id).collect();
+            (0..3).map(animusd::config::node_id).collect();
 
         // Converged-or-timeout poll (never a fixed sleep): the data node's
         // own `remote_metadata_sync_loop` only refreshes its

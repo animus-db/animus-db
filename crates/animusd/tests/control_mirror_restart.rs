@@ -112,9 +112,10 @@ async fn propose_and_await(node: &Node, client_addr: SocketAddr, command: MetaCo
 /// it, to verify durability independent of any node's own in-memory state.
 async fn read_mirror_from_disk(dir: &std::path::Path) -> animus_control::Metadata {
     // A fresh, throwaway `ProdEnv` bound at a scratch address but pointed at
-    // the SAME control directory the node's own control env used — disk
+    // the SAME internal directory the node's own env used (ADR 0040 PR1:
+    // one shared env, one directory, not a separate `control` subdir) — disk
     // content is keyed by directory, not by which port/id opened it.
-    let (env, _addr) = ProdEnv::bind(999_999, free_addr(), dir.join("control"))
+    let (env, _addr) = ProdEnv::bind(999_999, free_addr(), dir.join("internal"))
         .await
         .expect("bind a scratch env over the same directory");
     let engine: LsmEngine<ProdEnv> = LsmEngine::open(env, animusd::SYSKV_LSM_PREFIX)
@@ -131,11 +132,10 @@ async fn control_only_mirror_engine_survives_a_real_process_restart() {
     let node_dir = dir.path().join("node-0");
     let addrs = animusd::RoleAddrs {
         role: animusd::config::NodeRole::Control,
-        control: Some(free_addr()),
+        internal: free_addr(),
         client: free_addr(),
         dynamo: free_addr(),
         cql: free_addr(),
-        raftkv: None,
         admin: free_addr(),
     };
 
@@ -215,11 +215,10 @@ async fn control_only_schema_and_tablet_map_survive_a_hard_restart() {
     let node_dir = dir.path().join("node-0");
     let addrs = animusd::RoleAddrs {
         role: animusd::config::NodeRole::Control,
-        control: Some(free_addr()),
+        internal: free_addr(),
         client: free_addr(),
         dynamo: free_addr(),
         cql: free_addr(),
-        raftkv: None,
         admin: free_addr(),
     };
 

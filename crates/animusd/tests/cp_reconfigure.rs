@@ -147,7 +147,7 @@ async fn group_view(admin_addr: SocketAddr) -> Option<(bool, Vec<u64>)> {
 async fn bring_up(n: usize, dir: &std::path::Path) -> (Vec<Node>, ClusterConfig) {
     for attempt in 0..16 {
         let a: Vec<SocketAddr> = {
-            let ls: Vec<std::net::TcpListener> = (0..n * 6)
+            let ls: Vec<std::net::TcpListener> = (0..n * 5)
                 .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
                 .collect();
             ls.iter().map(|l| l.local_addr().unwrap()).collect()
@@ -156,12 +156,11 @@ async fn bring_up(n: usize, dir: &std::path::Path) -> (Vec<Node>, ClusterConfig)
             nodes: (0..n)
                 .map(|i| RoleAddrs {
                     role: animusd::config::NodeRole::Both,
-                    control: Some(a[6 * i]),
-                    client: a[6 * i + 1],
-                    dynamo: a[6 * i + 2],
-                    cql: a[6 * i + 3],
-                    raftkv: Some(a[6 * i + 4]),
-                    admin: a[6 * i + 5],
+                    internal: a[5 * i],
+                    client: a[5 * i + 1],
+                    dynamo: a[5 * i + 2],
+                    cql: a[5 * i + 3],
+                    admin: a[5 * i + 4],
                 })
                 .collect(),
         };
@@ -192,7 +191,7 @@ async fn cp_group_follows_tablet_replica_set() {
     let dir = tempfile::tempdir().unwrap();
     let (nodes, config) = bring_up(3, dir.path()).await;
     await_bootstrap(&nodes).await;
-    let raftkv_ids = config.raftkv_ids(); // [300, 301, 302]
+    let raftkv_ids = config.data_ids(); // [0, 1, 2]
 
     // ADR 0023: a fresh cluster has no data tablet — provision the `kv` tablet by
     // writing first, so the CP group forms (auto-provisioned on the first write).
@@ -368,18 +367,18 @@ async fn await_value(clients: &[SocketAddr], key: &[u8], want: &[u8], secs: u64)
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn failure_auto_replaces_replica_onto_spare() {
     // 4 nodes: RF=3, so the bootstrap tablet is placed on nodes 0..3 (raftkv
-    // 300..302) and node 3 (raftkv 303) is an idle spare. Killing a replica should
+    // ids 0..2) and node 3 is an idle spare. Killing a replica should
     // cascade: detector marks it Down -> reconciler swaps in the spare -> the group
     // reconfigures onto it and keeps serving.
     let dir = tempfile::tempdir().unwrap();
     let (nodes, config) = bring_up(4, dir.path()).await;
     await_bootstrap(&nodes).await;
-    let raftkv_ids = config.raftkv_ids(); // [300, 301, 302, 303]
+    let raftkv_ids = config.data_ids(); // [0, 1, 2, 3]
     let spare = raftkv_ids[3];
     let clients: Vec<SocketAddr> = config.nodes.iter().map(|a| a.client).collect();
 
     // ADR 0023: provision the `kv` tablet by writing first (no bootstrap tablet); it
-    // lands on the first RF=3 members (300..302), leaving 303 as the idle spare.
+    // lands on the first RF=3 members (ids 0..2), leaving id 3 as the idle spare.
     put(&clients, b"k0", b"v0", 30).await;
 
     // Wait for the group to form with 3 voters + a leader; write a key.

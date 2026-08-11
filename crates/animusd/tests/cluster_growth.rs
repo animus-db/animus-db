@@ -240,11 +240,11 @@ async fn cluster_grows_from_three_to_five_and_rebalances() {
     let base_admin: Vec<SocketAddr> = base_config.nodes.iter().map(|a| a.admin).collect();
 
     // 2. Create tables + write, entirely on the original 3 (every table's
-    // tablet lands on the first min(3, RF) Active members — {300,301,302}).
+    // tablet lands on the first min(3, RF) Active members — {0,1,2}).
     for table in TABLES {
         put(&base_clients, table, b"k0", b"v0", 30).await;
     }
-    let raftkv_ids_3 = base_config.raftkv_ids();
+    let raftkv_ids_3 = base_config.data_ids();
     let before_growth = tablet_map(base_admin[0]).await;
     assert_eq!(before_growth.len(), TABLES.len());
     let before_counts = replica_counts(&before_growth, &raftkv_ids_3);
@@ -259,8 +259,8 @@ async fn cluster_grows_from_three_to_five_and_rebalances() {
     // the original 3 — the online part of "online cluster growth".
     let (growth_nodes, expanded_config) = grow(&base_config, 2, dir.path()).await;
     nodes.extend(growth_nodes);
-    let all_raftkv_ids = expanded_config.raftkv_ids(); // [300, 301, 302, 303, 304]
-    let new_ids = &all_raftkv_ids[3..]; // [303, 304]
+    let all_raftkv_ids = expanded_config.data_ids(); // [0, 1, 2, 3, 4]
+    let new_ids = &all_raftkv_ids[3..]; // [3, 4]
     let all_admin: Vec<SocketAddr> = expanded_config.nodes.iter().map(|a| a.admin).collect();
     // A client list covering every node started so far — see `put`'s doc for
     // why this, not just `base_clients`, is the sound way to assert "still
@@ -275,7 +275,7 @@ async fn cluster_grows_from_three_to_five_and_rebalances() {
     // its own `heartbeat_loop`/detector promotion chain starts just as
     // immediately, so neither "not a member yet" nor even "not yet Active"
     // is a stable window to assert on any more — by the time `grow()`
-    // returns and this test can poll, `303`/`304` may already be fully
+    // returns and this test can poll, the new ids may already be fully
     // `Active` (observed live: a real race, not a hypothetical). The
     // meaningful invariant — every new node reaches `Active` promptly with
     // no operator action beyond starting it — is what step 5 already proves.
@@ -372,7 +372,7 @@ async fn cluster_grows_from_three_to_five_and_rebalances() {
     // `client_route` on the original 3 was a static, process-start-only
     // snapshot that never learned a grown node's address (the ADR 0030
     // documented residual gap) — a write landing on an original node for a
-    // tablet whose leader rebalancing just moved onto node 303/304 would have
+    // tablet whose leader rebalancing just moved onto the new nodes would have
     // no forward target at all. Now every node's `route_sync_loop` overlays
     // `Metadata.node_addrs[*].client` (populated by each node's own
     // `RegisterNodeAddrs` self-registration) onto its `client_route`, so this
@@ -474,7 +474,7 @@ async fn dashboard_health_recovers_after_grown_cluster_loses_an_original_node() 
 
     let (growth_nodes, expanded_config) = grow(&base_config, 2, dir.path()).await;
     nodes.extend(growth_nodes);
-    let all_raftkv_ids = expanded_config.raftkv_ids();
+    let all_raftkv_ids = expanded_config.data_ids();
     let new_ids = &all_raftkv_ids[3..];
     let all_admin: Vec<SocketAddr> = expanded_config.nodes.iter().map(|a| a.admin).collect();
 

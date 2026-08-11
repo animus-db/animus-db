@@ -28,16 +28,15 @@ mod support;
 /// torn down first (the documented port-TOCTOU mitigation, see the crate guide).
 async fn bring_up(n: usize, dir: &std::path::Path) -> (Vec<Node>, animusd::ClusterConfig) {
     for attempt in 0..16 {
-        let addrs = support::free_addrs(n * 6);
+        let addrs = support::free_addrs(n * 5);
         let nodes_cfg: Vec<animusd::RoleAddrs> = (0..n)
             .map(|i| animusd::RoleAddrs {
                 role: animusd::config::NodeRole::Both,
-                control: Some(addrs[6 * i]),
-                client: addrs[6 * i + 1],
-                dynamo: addrs[6 * i + 2],
-                cql: addrs[6 * i + 3],
-                raftkv: Some(addrs[6 * i + 4]),
-                admin: addrs[6 * i + 5],
+                internal: addrs[5 * i],
+                client: addrs[5 * i + 1],
+                dynamo: addrs[5 * i + 2],
+                cql: addrs[5 * i + 3],
+                admin: addrs[5 * i + 4],
             })
             .collect();
         let config = animusd::ClusterConfig { nodes: nodes_cfg };
@@ -167,11 +166,7 @@ async fn admin_interface_surfaces_state_and_actions() {
         // ---- /admin/config -------------------------------------------------
         let (s, config_view) = admin_get(admin_addr, "/admin/config").await;
         assert_eq!(s, 200);
-        assert_eq!(config_view["control_id"], 0, "node 0's control id");
-        assert_eq!(
-            config_view["raftkv_id"], 300,
-            "node 0's raftkv id (300 + 0)"
-        );
+        assert_eq!(config_view["node_id"], 0, "node 0's one id (ADR 0040 PR1)");
         assert_eq!(
             config_view["addrs"]["admin"].as_str(),
             Some(admin_addr.to_string().as_str()),

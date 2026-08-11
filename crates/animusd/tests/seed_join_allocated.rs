@@ -123,16 +123,17 @@ async fn admin(
     (status, value)
 }
 
-/// This node's own `raftkv_id`, off its own `/admin/config` — there is no
-/// direct Rust accessor for it on a bound-and-started [`Node`] (unlike
-/// `client_addr()`/`admin_addr()`), so the allocated id a join actually
-/// landed on is only observable this way (or by diffing `Metadata.members`).
+/// This node's own id (ADR 0040 PR1: one id per node, was `raftkv_id`), off
+/// its own `/admin/config` — there is no direct Rust accessor for it on a
+/// bound-and-started [`Node`] (unlike `client_addr()`/`admin_addr()`), so the
+/// allocated id a join actually landed on is only observable this way (or by
+/// diffing `Metadata.members`).
 async fn own_raftkv_id(admin_addr: SocketAddr) -> u64 {
     let (status, body) = admin(admin_addr, "GET", "/admin/config", None).await;
     assert_eq!(status, 200, "GET /admin/config failed: {body}");
-    body["raftkv_id"]
+    body["node_id"]
         .as_u64()
-        .expect("raftkv_id present and numeric")
+        .expect("node_id present and numeric")
 }
 
 fn member_status(nodes: &[Node], id: u64) -> Option<NodeStatus> {
@@ -349,7 +350,7 @@ async fn data_only_allocated_join_becomes_active_and_gets_a_replica() {
     let (control_nodes, data_nodes, _config) = support::bring_up_split(3, 2, dir.path()).await;
     support::await_leader(&control_nodes).await;
     let existing_data_raftkv_ids: Vec<animus_env::NodeId> =
-        (3..5).map(animusd::config::raftkv_id).collect();
+        (3..5).map(animusd::config::node_id).collect();
     support::await_data_nodes_active(&control_nodes, &existing_data_raftkv_ids).await;
 
     let data_clients: Vec<SocketAddr> = data_nodes.iter().map(Node::client_addr).collect();

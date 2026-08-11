@@ -180,7 +180,7 @@ async fn data_node_joins_a_split_cluster_via_seed_and_gets_a_rebalanced_replica(
     let (control_nodes, data_nodes, config) = bring_up_split(3, 2, dir.path()).await;
     await_leader(&control_nodes).await;
     let existing_data_raftkv_ids: Vec<animus_env::NodeId> =
-        (3..5).map(animusd::config::raftkv_id).collect();
+        (3..5).map(animusd::config::node_id).collect();
     await_data_nodes_active(&control_nodes, &existing_data_raftkv_ids).await;
 
     // 2. Create several independent tables and write through the existing
@@ -200,7 +200,7 @@ async fn data_node_joins_a_split_cluster_via_seed_and_gets_a_rebalanced_replica(
     let mut seeds: Vec<SocketAddr> = control_nodes.iter().map(Node::client_addr).collect();
     seeds.extend(data_clients.iter().copied());
     let join_index = config.len();
-    let join_raftkv_id = animusd::config::raftkv_id(join_index);
+    let join_raftkv_id = animusd::config::node_id(join_index);
     let joined = join_data_fresh(&seeds, join_index, dir.path(), StorageBackend::Memory).await;
 
     // 4. It becomes an Active member with zero operator admin calls from

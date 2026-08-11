@@ -189,11 +189,10 @@ async fn restarted_control_node_resets_its_ring_and_pre_restart_watchers_fall_ba
         };
         animusd::RoleAddrs {
             role: animusd::config::NodeRole::Control,
-            control: Some(free()),
+            internal: free(),
             client: free(),
             dynamo: free(),
             cql: free(),
-            raftkv: None,
             admin: free(),
         }
     };
