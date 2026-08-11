@@ -30,8 +30,7 @@ and the wire edges. One file: `src/lib.rs`.
 ## Tablets & ranges
 
 - `TabletId`, `Epoch` (`INITIAL`, `next()`), `TableName` (type alias),
-  `KeyRange`, `Tablet` (incl. `version_floor: u64` — the cross-group MVCC
-  version-floor fix, see below).
+  `KeyRange`, `Tablet`.
 - `Tablet` is **table-scoped** (ADR 0023): field `table: Option<TableName>`
   (`None` = a legacy whole-keyspace tablet). Constructors `new` /
   `new_for_table` / `with_table` (all normalize — sort/dedup — the replica
@@ -50,21 +49,15 @@ and the wire edges. One file: `src/lib.rs`.
 - `Epoch` is the **data-plane fencing token**: every placement change bumps it.
   The actual split/merge *state transitions* live in `animus-control`'s
   `Metadata::apply`; this crate provides the range primitives.
-- **`Tablet::version_floor` (cross-group LWW version-floor fix, confirmed
-  real — `docs/engineering-lessons.md` has the full writeup) closes a hazard
-  where a fresh/widened `animus-cp-data` group's own local Raft log index
-  (its MVCC version) could collide with a version a *different* group already
-  stamped for the same key on the node-shared `StorageEngine`.** `0` by
-  default (`#[serde(default)]`, and every existing `Tablet::new`/
-  `new_for_table`/`with_table` constructor) — byte-identical to using the raw
-  log index, so a tablet that has never been split/merged is completely
-  unaffected. Only `animus-control`'s `SplitTablet`/`MergeTablets` apply ever
-  set it (`source.version_floor + 1` for a fresh sibling, `max(left, right)
-  + 1` for a merge survivor) — a pure function of already-replicated state,
-  computed once by the control plane's own deterministic apply, so every data
-  replica reads the identical value. `animus-cp-data::RaftKvNode` is what
-  actually consumes it (`start_hosted_with_floor`/`bump_version_floor`/
-  `effective_version`); this crate just carries the field.
+- **`Tablet::version_floor` (the cross-group LWW version-floor fix) is
+  retired (ADR 0018 §2 amendment, PR2)**, replaced by HLC witnessing plus a
+  range seal in `animus-cp-data` — see that crate's `CLAUDE.md` and
+  `docs/engineering-lessons.md` for the design and the full writeup of the
+  hazard it used to close. `Tablet` no longer carries this field. The
+  split/merge provenance the seal design's reconciler gating needs
+  (`split_parents`/`absorbed_by`) lives entirely in `animus-control`'s
+  `Metadata`, not on `Tablet` itself — this crate has nothing to say about
+  it.
 - Serializable (`serde`) because tablets travel inside control-plane Raft log
   entries and data-plane routing views.
 - Dependency direction: `animus-control`, `animus-cql`, `animus-cp-data`, and

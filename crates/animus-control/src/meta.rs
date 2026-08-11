@@ -214,6 +214,32 @@ pub struct Metadata {
     /// set).
     #[serde(default)]
     pub merged_tablets: BTreeSet<TabletId>,
+    /// Split provenance (ADR 0018 PR2, the range-seal design): every split
+    /// child's id mapped to its source tablet's id, recorded by
+    /// [`MetaCommand::SplitTablet`]'s apply. Never pruned (tablet ids are
+    /// never reused, same discipline as [`Metadata::merged_tablets`]). This is
+    /// what lets a per-node tablet-host reconciler know **whose** seal marker
+    /// a fresh split child must observe before it may host
+    /// (`animus-cp-data`'s `host::HostAction::Host`) — the marker itself
+    /// lives in the (possibly shared) `StorageEngine`, keyed by the source's
+    /// tablet id, and this map is the only way to learn which source that is
+    /// once the source's own row may have narrowed (or, after further
+    /// splits/merges, changed shape) since the child was minted.
+    /// `#[serde(default)]` keeps pre-ADR-0018 snapshots loading (empty map).
+    #[serde(default)]
+    pub split_parents: BTreeMap<TabletId, TabletId>,
+    /// Merge provenance (ADR 0018 PR2, the range-seal design): every absorbed
+    /// tablet's id mapped to the surviving (`left`) tablet's id it was merged
+    /// into, recorded by [`MetaCommand::MergeTablets`]'s apply — the reverse
+    /// direction from [`Metadata::merged_tablets`] (which only records *that*
+    /// a tablet was absorbed, not *into whom*). Never pruned, same discipline
+    /// as `merged_tablets`/`split_parents`. Lets a survivor's reconciler find
+    /// every tablet id it has ever absorbed, to look up each one's seal
+    /// marker before widening past the range it handed off (the merge dual of
+    /// `split_parents`' gating). `#[serde(default)]` keeps pre-ADR-0018
+    /// snapshots loading (empty map).
+    #[serde(default)]
+    pub absorbed_by: BTreeMap<TabletId, TabletId>,
 }
 
 /// A mutation of [`Metadata`], replicated through Raft and applied in log order.
@@ -780,35 +806,24 @@ impl Metadata {
                 // The split child inherits the parent's table scope (ADR 0023): a
                 // split never crosses a table boundary, so both halves stay scoped
                 // to the same table.
-                let mut new_tablet = Tablet::with_table(
+                let new_tablet = Tablet::with_table(
                     *new_id,
                     source.table.clone(),
                     right,
                     source.replicas.clone(),
                 );
-                // Cross-group LWW version-floor fix: the new sibling is a brand-new
-                // data-plane Raft group whose own log index restarts low, but it
-                // immediately serves keys the *source* group already wrote at
-                // whatever (possibly much higher) index it had reached — on the
-                // same node-shared `StorageEngine` (ADR 0026/0028). Without a floor
-                // strictly past the source's, a subsequent write through the
-                // sibling could carry a version no higher than what's already
-                // stored, and per-key LWW would silently drop it (a write-confirm
-                // timeout, not corruption — but the write never lands). Bumping
-                // past `source.version_floor` (not `new_id`, which is a *different*
-                // monotonic sequence — see `Tablet::version_floor`'s doc) is both
-                // necessary and sufficient: it exceeds every version the source
-                // could ever have stamped, as long as the source's own local index
-                // never reaches `VERSION_FLOOR_SCALE` (`animus-cp-data`) between
-                // rescopes — astronomically generous given auto-split already caps
-                // a tablet's key/byte count long before that. The source's own
-                // floor is untouched (it never absorbs foreign data, only narrows).
-                new_tablet.version_floor = source.version_floor + 1;
                 let source = self.tablets.get_mut(tablet).expect("tablet present");
                 source.range = left;
                 source.epoch = source.epoch.next();
                 self.tablets.insert(*new_id, new_tablet);
                 self.next_tablet_id = self.next_tablet_id.max(new_id.0 + 1);
+                // ADR 0018 PR2 (range-seal design): record split provenance —
+                // never pruned, same discipline as `merged_tablets`. This is how
+                // the child's per-node reconciler later learns whose seal
+                // marker (keyed by the *source's* tablet id) it must observe in
+                // the shared engine before it may host — see
+                // `Metadata::split_parents`'s doc.
+                self.split_parents.insert(*new_id, *tablet);
                 // The split child inherits the source's placement policy (ADR 0029):
                 // without it the new sibling has no policy and is invisible to both
                 // the repair reconciler and the load rebalancer, so it would never
@@ -850,19 +865,9 @@ impl Metadata {
                     return ApplyOutcome::Rejected("tablets belong to different tables");
                 }
                 let new_end = r.range.end.clone();
-                // Cross-group LWW version-floor fix (the merge dual of
-                // `SplitTablet`'s, see `Tablet::version_floor`'s doc): `left`'s
-                // group keeps running unchanged, but is about to start serving
-                // keys `right`'s group already wrote under its own, unrelated
-                // index sequence on the same node-shared engine. Bump `left`'s
-                // floor past *both* current floors so every future write through
-                // `left` outranks anything either side ever stamped — read
-                // `r.version_floor` before `r` is dropped below.
-                let right_floor = r.version_floor;
                 let l = self.tablets.get_mut(left).expect("tablet present");
                 l.range.end = new_end;
                 l.epoch = l.epoch.next();
-                l.version_floor = l.version_floor.max(right_floor).saturating_add(1);
                 self.tablets.remove(right);
                 // The merged-away tablet can no longer be reconciled.
                 self.policies.remove(right);
@@ -870,6 +875,12 @@ impl Metadata {
                 // sibling" apart from "table dropped" (ADR 0033) — see
                 // `Metadata::merged_tablets`'s doc. Never pruned.
                 self.merged_tablets.insert(*right);
+                // ADR 0018 PR2 (range-seal design): record merge provenance —
+                // the reverse direction, never pruned. Lets `left`'s
+                // reconciler find every tablet id it has ever absorbed, to
+                // look up each one's seal marker before widening past the
+                // range it handed off — see `Metadata::absorbed_by`'s doc.
+                self.absorbed_by.insert(*right, *left);
                 // …and its CP members' addresses are dead (ADR 0024 GC).
                 self.prune_cp_member_addrs();
                 ApplyOutcome::Applied
@@ -1830,16 +1841,14 @@ mod tests {
         );
     }
 
-    /// Cross-group LWW version-floor fix (flagged in a PR #90 review comment,
-    /// root `CLAUDE.md`'s cross-group-LWW entry): `SplitTablet` seeds the new
-    /// sibling's `version_floor` strictly past the source's own — every
-    /// tablet's data-plane group stamps its own local Raft log index as the
-    /// MVCC version (`animus-cp-data`), so a fresh sibling group serving keys
-    /// the source already wrote at a (possibly much higher) index must never
-    /// restart at a version low enough to collide. The source's own floor is
-    /// untouched — it never absorbs foreign data, only narrows.
+    /// ADR 0018 PR2 (range-seal design, replacing the retired `version_floor`
+    /// cross-group-LWW fix): `SplitTablet` records split provenance
+    /// (`Metadata::split_parents`) so a child's reconciler can find its
+    /// source's seal marker. Chained across two splits to prove the map
+    /// always names the immediate parent, not some transitively-resolved
+    /// ancestor.
     #[test]
-    fn split_tablet_seeds_the_new_siblings_version_floor_past_the_sources() {
+    fn split_tablet_records_provenance_of_the_immediate_parent() {
         let mut m = Metadata::default();
         assert_eq!(
             m.apply(&MetaCommand::CreateTablet {
@@ -1850,7 +1859,7 @@ mod tests {
             }),
             ApplyOutcome::Applied
         );
-        assert_eq!(m.tablets[&TabletId(1)].version_floor, 0);
+        assert!(!m.split_parents.contains_key(&TabletId(1)));
 
         assert_eq!(
             m.apply(&MetaCommand::SplitTablet {
@@ -1861,15 +1870,10 @@ mod tests {
             }),
             ApplyOutcome::Applied
         );
-        // The source's own floor is unchanged (it never absorbs foreign data)…
-        assert_eq!(m.tablets[&TabletId(1)].version_floor, 0);
-        // …while the sibling's is strictly past it.
-        assert_eq!(m.tablets[&TabletId(2)].version_floor, 1);
+        assert_eq!(m.split_parents.get(&TabletId(2)), Some(&TabletId(1)));
 
-        // A second split (of the sibling, which now itself has a nonzero
-        // floor) must seed its own new child past ITS floor, not just past 0
-        // or the tablet id — proving the formula reads `version_floor`, not
-        // some other monotonic counter.
+        // A second split, of the sibling itself, must record ITS immediate
+        // parent (tablet 2), not tablet 1 (the ultimate ancestor).
         assert_eq!(
             m.apply(&MetaCommand::SplitTablet {
                 tablet: TabletId(2),
@@ -1879,17 +1883,17 @@ mod tests {
             }),
             ApplyOutcome::Applied
         );
-        assert_eq!(m.tablets[&TabletId(2)].version_floor, 1);
-        assert_eq!(m.tablets[&TabletId(3)].version_floor, 2);
+        assert_eq!(m.split_parents.get(&TabletId(3)), Some(&TabletId(2)));
+        // Provenance is permanent (never pruned).
+        assert_eq!(m.split_parents.get(&TabletId(2)), Some(&TabletId(1)));
     }
 
-    /// `MergeTablets` bumps the surviving `left`'s `version_floor` to
-    /// `max(left, right) + 1` — the merge dual of the split fix above. Built
-    /// with `right`'s floor *higher* than `left`'s (via a prior split) so the
-    /// test cannot pass by accident from a naive `left + 1` formula that
-    /// ignores `right` entirely.
+    /// `MergeTablets` records the reverse-direction provenance
+    /// (`Metadata::absorbed_by`) — the merge dual of the split-provenance fix
+    /// above — so the survivor's reconciler can find every tablet id it has
+    /// ever absorbed.
     #[test]
-    fn merge_tablets_bumps_the_survivors_version_floor_past_both_sides() {
+    fn merge_tablets_records_absorbed_by_provenance() {
         let mut m = Metadata::default();
         let mid = 0x8000_0000_0000_0000u64.to_be_bytes().to_vec();
         assert_eq!(
@@ -1910,37 +1914,6 @@ mod tests {
             }),
             ApplyOutcome::Applied
         );
-        // Give `right` (tablet 2) a HIGHER floor than `left` (tablet 1) via a
-        // split-and-merge-back-in dance is overkill — directly split tablet 2
-        // once (against a third, throwaway sibling) so its own floor becomes
-        // 1, strictly above tablet 1's untouched 0.
-        assert_eq!(
-            m.apply(&MetaCommand::SplitTablet {
-                tablet: TabletId(2),
-                expected_epoch: Epoch::INITIAL,
-                split_key: 0xC000_0000_0000_0000u64.to_be_bytes().to_vec(),
-                new_id: TabletId(3),
-            }),
-            ApplyOutcome::Applied
-        );
-        // Merge the throwaway sibling straight back into tablet 2, so tablet
-        // 2's range is whole again (abutting tablet 1) but its floor is now 2
-        // (bumped past both its own prior 0 and the throwaway's 1).
-        assert_eq!(
-            m.apply(&MetaCommand::MergeTablets {
-                left: TabletId(2),
-                expected_left_epoch: m.tablets[&TabletId(2)].epoch,
-                right: TabletId(3),
-                expected_right_epoch: m.tablets[&TabletId(3)].epoch,
-            }),
-            ApplyOutcome::Applied
-        );
-        assert_eq!(m.tablets[&TabletId(2)].version_floor, 2);
-        assert_eq!(m.tablets[&TabletId(1)].version_floor, 0);
-
-        // Now merge tablet 1 (`left`, floor 0) with tablet 2 (`right`, floor
-        // 2) — the survivor's floor must become `max(0, 2) + 1 = 3`, proving
-        // the formula reads BOTH sides, not just `left`.
         assert_eq!(
             m.apply(&MetaCommand::MergeTablets {
                 left: TabletId(1),
@@ -1950,8 +1923,33 @@ mod tests {
             }),
             ApplyOutcome::Applied
         );
-        assert_eq!(m.tablets[&TabletId(1)].version_floor, 3);
         assert!(!m.tablets.contains_key(&TabletId(2)));
+        assert_eq!(m.absorbed_by.get(&TabletId(2)), Some(&TabletId(1)));
+
+        // Split a fresh sibling off tablet 1 and merge it back in too — a
+        // survivor can accumulate more than one absorbed id over its
+        // lifetime, and each must resolve to it independently.
+        assert_eq!(
+            m.apply(&MetaCommand::SplitTablet {
+                tablet: TabletId(1),
+                expected_epoch: m.tablets[&TabletId(1)].epoch,
+                split_key: 0xC000_0000_0000_0000u64.to_be_bytes().to_vec(),
+                new_id: TabletId(3),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::MergeTablets {
+                left: TabletId(1),
+                expected_left_epoch: m.tablets[&TabletId(1)].epoch,
+                right: TabletId(3),
+                expected_right_epoch: m.tablets[&TabletId(3)].epoch,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(m.absorbed_by.get(&TabletId(3)), Some(&TabletId(1)));
+        // The first absorption's provenance is permanent (never pruned).
+        assert_eq!(m.absorbed_by.get(&TabletId(2)), Some(&TabletId(1)));
     }
 
     /// `DropTableTablets` (ADR 0024): removes every tablet scoped to the table —

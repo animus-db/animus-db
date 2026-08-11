@@ -46,7 +46,7 @@ use std::time::Duration;
 
 use animus_control::raft::{Out, RaftCore, RaftMsg, StateMachine};
 use animus_control::{PersistedState, ProposeResult};
-use animus_env::{Env, EnvExt, Metric, MetricsHandle, NodeId, PRIMARY_STREAM};
+use animus_env::{Env, EnvExt, Metric, MetricsHandle, Nanos, NodeId, PRIMARY_STREAM};
 use animus_storage::{MergeOp, StorageEngine};
 use animus_tablet::KeyRange;
 use futures::future::{Either, select};
@@ -57,6 +57,15 @@ use serde::{Deserialize, Serialize};
 mod codec;
 pub mod hlc;
 pub mod host;
+mod seal;
+
+use hlc::{Hlc, HlcTimestamp};
+
+/// The assumed maximum clock-offset bound across the cluster (ADR 0018 §2),
+/// threaded into every [`Hlc::new`] this crate constructs. Not yet consumed
+/// for uncertainty-interval read restarts (that lands with the read path in
+/// a later PR) — `Hlc::uncertainty_upper` is unused until then.
+const HLC_MAX_OFFSET: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// The **wake-on-propose** signal (ADR 0017 single-write-latency fix): a shared
 /// flag + executor-agnostic waker that lets a proposer (`put`/`delete`/`cas`/
@@ -306,7 +315,7 @@ impl Default for StorageScope {
 /// The data plane's Raft log command: a key-value mutation (or the election
 /// no-op). Keys/values are opaque bytes; ordering + durability come from Raft.
 ///
-/// **`fence`** (every mutating variant except `Split`) is the leader's own
+/// **`fence`** (every mutating variant except `Seal`) is the leader's own
 /// belief, stamped in **at propose time**, of this tablet's current key range.
 /// It rides inside the command like `Cas`'s `expected` — opaque to `RaftCore`,
 /// interpreted only by `apply_and_compact` — so every replica makes the
@@ -323,6 +332,13 @@ impl Default for StorageScope {
 /// behavior is unchanged); a narrower fence is set only by a `*_fenced`
 /// proposer, not yet used by any real caller (that lands with the
 /// single-command-split integration).
+///
+/// **`ts`** (every mutating variant, ADR 0018 §2/PR2) is the proposing
+/// leader's HLC commit timestamp, minted from its own per-group [`Hlc`] at
+/// *propose* time and packed ([`hlc::pack`]) as the engine's MVCC version at
+/// apply — replacing the retired `version_floor`-scaled Raft index. Riding
+/// inside the log entry (like `fence`) makes apply deterministic and
+/// idempotent: replay always computes the same version for the same command.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum KvCommand {
     /// Set `key` to `value`, iff `key` falls inside `fence` (see the type-level
@@ -332,24 +348,31 @@ pub enum KvCommand {
         key: Vec<u8>,
         value: Vec<u8>,
         fence: KeyRange,
+        ts: HlcTimestamp,
     },
     /// **Batch put**: set every `(key, value)` in one Raft log entry — one propose,
-    /// one commit round, one apply. All keys are merged at the entry's Raft `index`
-    /// (the shared MVCC version): the keys are distinct, so per-key LWW is
-    /// well-defined, and re-applying on recovery is idempotent exactly as a single
-    /// `Put` is. The throughput win over N individual `Put`s is one consensus round
-    /// for the whole batch instead of one per key (ADR 0017 — bulk-write batching).
-    /// Within one tablet the batch is atomic (it either commits whole or not at all);
-    /// a cross-tablet batch is split into one `Batch` per tablet by the caller and is
-    /// not atomic across tablets (matching DynamoDB `BatchWriteItem` semantics).
-    /// `fence` gates the *whole* batch: if any key falls outside it, none of the
-    /// batch applies (preserves the batch's atomicity — see the type-level doc).
+    /// one commit round, one apply. All keys are merged at the entry's shared HLC
+    /// commit timestamp (the shared MVCC version): the keys are distinct, so
+    /// per-key LWW is well-defined, and re-applying on recovery is idempotent
+    /// exactly as a single `Put` is. The throughput win over N individual `Put`s is
+    /// one consensus round for the whole batch instead of one per key (ADR 0017 —
+    /// bulk-write batching). Within one tablet the batch is atomic (it either
+    /// commits whole or not at all); a cross-tablet batch is split into one `Batch`
+    /// per tablet by the caller and is not atomic across tablets (matching
+    /// DynamoDB `BatchWriteItem` semantics). `fence` gates the *whole* batch: if
+    /// any key falls outside it, none of the batch applies (preserves the batch's
+    /// atomicity — see the type-level doc).
     Batch {
         puts: Vec<(Vec<u8>, Vec<u8>)>,
         fence: KeyRange,
+        ts: HlcTimestamp,
     },
     /// Remove `key` (a tombstone in the engine), iff `key` falls inside `fence`.
-    Delete { key: Vec<u8>, fence: KeyRange },
+    Delete {
+        key: Vec<u8>,
+        fence: KeyRange,
+        ts: HlcTimestamp,
+    },
     /// **Linearizable compare-and-swap**: set `key` to `value` iff the key's
     /// current committed value equals `expected` (`None` == "only if absent")
     /// *and* `key` falls inside `fence`. Evaluated at *apply* time against the
@@ -364,7 +387,20 @@ pub enum KvCommand {
         expected: Option<Vec<u8>>,
         value: Vec<u8>,
         fence: KeyRange,
+        ts: HlcTimestamp,
     },
+    /// **Range seal** (ADR 0018 §2 amendment, PR2 — see `seal.rs`'s module
+    /// doc for the full design): the leader of a range-handoff source (a
+    /// split's `NarrowScope`, or a merge's `Absorb`) commits this through its
+    /// **own** Raft log to mark `range` closed to any further mutation
+    /// ordered after it. Every replica applies its log in the same order, so
+    /// every replica agrees on exactly which entries are "after the seal" —
+    /// unlike `fence`, this is not itself gated by a fence (a seal IS a fence
+    /// change: it never touches engine data itself, only apply-time
+    /// bookkeeping + the durable marker key). No `fence` field: a seal always
+    /// applies (it is itself the authority tightening what future entries
+    /// may touch); see `apply_and_compact`'s `Seal` arm.
+    Seal { range: KeyRange, ts: HlcTimestamp },
     /// The leader's no-op-on-election (Raft); applies nothing.
     NoOp,
 }
@@ -510,18 +546,18 @@ pub struct RaftKvNode<E: Env, S: StorageEngine> {
     /// uses so several tablet groups can share one node's inbox (stream =
     /// tablet id) instead of each minting a distinct `Coresident` sibling id.
     stream: u64,
-    /// The MVCC version floor this group's apply logic adds to its own local
-    /// Raft log index before stamping a per-key LWW version on the (possibly
-    /// node-shared) `StorageEngine` — see `animus_tablet::Tablet::
-    /// version_floor`'s doc for the full cross-group-collision rationale.
-    /// `0` (every existing constructor) is byte-identical to using the raw
-    /// index, exactly today's behavior; only [`start_hosted_with_floor`]
-    /// (the real per-tablet hosting path, driven from replicated `Metadata`)
-    /// ever passes something else. Live-bumpable (never lowered) via
-    /// [`bump_version_floor`](Self::bump_version_floor) for the merge-survivor
-    /// case, where the group keeps running but must widen past a value only
-    /// known once the merge commits.
-    version_floor: Arc<AtomicU64>,
+    /// This group's per-node Hybrid Logical Clock (ADR 0018 §2/PR2), which
+    /// every mutating propose method mints a fresh `ts` from
+    /// (`hlc::HlcTimestamp`, packed as the engine MVCC version at apply —
+    /// see `apply_and_compact`). Replaces the retired `version_floor`
+    /// cross-group-LWW fix: rather than a structural version-space
+    /// separation, cross-group ordering now comes from **witnessing**
+    /// (`Hlc::witness`, at WAL recovery, on every received entry, on
+    /// snapshot install, and — the one witness this field's own
+    /// construction performs — at group start, off the shared engine's
+    /// `latest_version()`) plus, for the residual in-flight-write race
+    /// witnessing alone can't close, the **range seal** (`seal.rs`).
+    hlc: Arc<Hlc>,
 }
 
 impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
@@ -543,7 +579,6 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             metrics,
             StorageScope::whole(),
             PRIMARY_STREAM,
-            0,
         )
     }
 
@@ -554,7 +589,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// was started with; `scope` is what keeps them from colliding.
     pub fn start_scoped(env: E, all_nodes: Vec<NodeId>, storage: S, scope: StorageScope) -> Self {
         let metrics = env.metrics();
-        Self::start_inner(env, all_nodes, storage, metrics, scope, PRIMARY_STREAM, 0)
+        Self::start_inner(env, all_nodes, storage, metrics, scope, PRIMARY_STREAM)
     }
 
     /// Like [`start_scoped`](Self::start_scoped), but the group also sends/recvs
@@ -563,9 +598,9 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// by stream, typically the tablet id) instead of each minting a distinct
     /// `Coresident` sibling id. Combined with a shared `storage` + distinct
     /// `scope`s, this is the full "several tablets co-resident on one node" shape
-    /// `animusd`'s real hosting path (`cp_join_host`) uses. Version floor `0`
-    /// (raw log index) — see [`start_hosted_with_floor`](Self::start_hosted_with_floor)
-    /// for the cross-group-LWW-safe variant the real per-tablet reconciler uses.
+    /// `animusd`'s real hosting path (`cp_join_host`) uses — `stream` doubles as
+    /// this group's tablet id for the range-seal marker's key (`seal.rs`),
+    /// mirroring the reconciler's own `stream = tablet.0` convention.
     pub fn start_hosted(
         env: E,
         all_nodes: Vec<NodeId>,
@@ -574,36 +609,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         stream: u64,
     ) -> Self {
         let metrics = env.metrics();
-        Self::start_inner(env, all_nodes, storage, metrics, scope, stream, 0)
-    }
-
-    /// Like [`start_hosted`](Self::start_hosted), but seeds this group's MVCC
-    /// version floor (see [`RaftKvNode`]'s `version_floor` field doc and
-    /// `animus_tablet::Tablet::version_floor`) instead of defaulting to `0`.
-    /// This is the constructor the real per-node tablet-host reconciler uses
-    /// (`animus_tablet::Tablet::version_floor`, read from replicated
-    /// `Metadata` at `Host` time) — a split sibling or a restart-rehosted
-    /// tablet must never restart its own version accounting from scratch
-    /// when its scope may already contain data versioned by a *different*
-    /// group's log index sequence.
-    pub fn start_hosted_with_floor(
-        env: E,
-        all_nodes: Vec<NodeId>,
-        storage: S,
-        scope: StorageScope,
-        stream: u64,
-        version_floor: u64,
-    ) -> Self {
-        let metrics = env.metrics();
-        Self::start_inner(
-            env,
-            all_nodes,
-            storage,
-            metrics,
-            scope,
-            stream,
-            version_floor,
-        )
+        Self::start_inner(env, all_nodes, storage, metrics, scope, stream)
     }
 
     /// Like [`start`](Self::start), but records into the supplied `metrics` handle
@@ -623,11 +629,9 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             metrics,
             StorageScope::whole(),
             PRIMARY_STREAM,
-            0,
         )
     }
 
-    #[allow(clippy::too_many_arguments)] // internal constructor bundle
     fn start_inner(
         env: E,
         all_nodes: Vec<NodeId>,
@@ -635,7 +639,6 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         metrics: MetricsHandle,
         scope: StorageScope,
         stream: u64,
-        version_floor: u64,
     ) -> Self {
         let core = Arc::new(Mutex::new(RaftCore::new(
             env.node_id(),
@@ -651,7 +654,16 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         let engine_applied = Arc::new(AtomicU64::new(0));
         let wal_lock = Arc::new(AsyncMutex::new(()));
         let propose_signal = Arc::new(ProposeSignal::default());
-        let version_floor = Arc::new(AtomicU64::new(version_floor));
+        // Group-start witnessing (ADR 0018 §2 amendment): fold in whatever
+        // this (possibly shared, ADR 0026/0028) engine's highest MVCC
+        // version already reflects, so this group's own future mints never
+        // undercut a version any group ever stamped on it — subsuming the
+        // retired `version_floor` seeding for the steady-state case (a
+        // restart, a co-hosted sibling already present). `latest_version()`
+        // is engine-global and cheap/synchronous (`animus-storage`'s trait
+        // doc), so this needs no async step here.
+        let hlc = Arc::new(Hlc::new(env.node_id(), HLC_MAX_OFFSET));
+        hlc.witness(hlc::unpack(storage.latest_version()), env.now());
         let node = Self {
             env: env.clone(),
             core: Arc::clone(&core),
@@ -666,7 +678,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             metrics: metrics.clone(),
             scope: scope.clone(),
             stream,
-            version_floor: Arc::clone(&version_floor),
+            hlc: Arc::clone(&hlc),
         };
         // The consensus loop recovers from the WAL, then spawns the apply task
         // (so the apply task sees the recovered core + the correct
@@ -687,7 +699,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             metrics,
             scope,
             stream,
-            version_floor,
+            hlc,
         }));
         node
     }
@@ -759,7 +771,13 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// As [`put`](Self::put), but the leader stamps its own `fence` into the
     /// entry instead of the unconstrained default (see [`KvCommand`]'s doc).
     pub fn put_fenced(&self, key: Vec<u8>, value: Vec<u8>, fence: KeyRange) -> ProposeResult {
-        self.propose_and_wake(KvCommand::Put { key, value, fence })
+        let ts = self.hlc.mint(self.env.now());
+        self.propose_and_wake(KvCommand::Put {
+            key,
+            value,
+            fence,
+            ts,
+        })
     }
 
     /// Propose a **batch put**: commit every `(key, value)` as **one** Raft log
@@ -785,9 +803,10 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         puts: Vec<(Vec<u8>, Vec<u8>)>,
         fence: KeyRange,
     ) -> ProposeResult {
+        let ts = self.hlc.mint(self.env.now());
         record_propose(
             &self.metrics,
-            self.lock().propose(KvCommand::Batch { puts, fence }),
+            self.lock().propose(KvCommand::Batch { puts, fence, ts }),
         )
     }
 
@@ -801,7 +820,8 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// As [`delete`](Self::delete), but the leader stamps its own `fence` into
     /// the entry instead of the unconstrained default (see [`KvCommand`]'s doc).
     pub fn delete_fenced(&self, key: Vec<u8>, fence: KeyRange) -> ProposeResult {
-        self.propose_and_wake(KvCommand::Delete { key, fence })
+        let ts = self.hlc.mint(self.env.now());
+        self.propose_and_wake(KvCommand::Delete { key, fence, ts })
     }
 
     /// Propose a **linearizable compare-and-swap**: set `key` to `value` iff the
@@ -829,12 +849,28 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         value: Vec<u8>,
         fence: KeyRange,
     ) -> ProposeResult {
+        let ts = self.hlc.mint(self.env.now());
         self.propose_and_wake(KvCommand::Cas {
             key,
             expected,
             value,
             fence,
+            ts,
         })
+    }
+
+    /// Propose a **range seal** (ADR 0018 §2 amendment, PR2 — see `seal.rs`'s
+    /// module doc): mark `range` closed to any further mutation ordered after
+    /// this entry in this group's own Raft log. Leader-only (else a leader
+    /// hint, like every other propose method). Called by the tablet-host
+    /// reconciler (`host::Reconciler`) when executing a split source's
+    /// `NarrowScope` or an absorbed tablet's `Absorb` teardown — never by any
+    /// data-plane client. Idempotent to re-propose the identical `range`
+    /// (the marker key is keyed by `(tablet, range)`, so a repeat simply
+    /// refreshes it with a newer `ts` — see `seal.rs`).
+    pub fn propose_seal(&self, range: KeyRange) -> ProposeResult {
+        let ts = self.hlc.mint(self.env.now());
+        self.propose_and_wake(KvCommand::Seal { range, ts })
     }
 
     /// The recorded outcome of the CAS committed at Raft log `index` (the value
@@ -1120,32 +1156,6 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         self.scope.narrow(new_range);
     }
 
-    /// Raise this group's live MVCC version floor (see [`RaftKvNode`]'s
-    /// `version_floor` field doc) to `new_floor`, if higher than the current
-    /// value — never lowered, mirroring [`narrow_scope`](Self::narrow_scope)/
-    /// [`widen_scope`](Self::widen_scope)'s one-directional-only shape. This
-    /// is the merge-survivor case: unlike a split sibling (whose floor is
-    /// fixed once at [`start_hosted_with_floor`](Self::start_hosted_with_floor)
-    /// time, before the group ever proposes anything), a merge survivor's
-    /// group is *already running* when it must widen past a value only known
-    /// once `MetaCommand::MergeTablets` commits (`animus_tablet::Tablet::
-    /// version_floor`) — the caller (the per-node tablet-host reconciler)
-    /// calls this alongside [`widen_scope`](Self::widen_scope) for the same
-    /// `WidenScope` action, reading the tablet's current replicated
-    /// `version_floor` fresh each time (so it converges even if a tick is
-    /// missed) rather than computing it locally.
-    pub fn bump_version_floor(&self, new_floor: u64) {
-        self.version_floor.fetch_max(new_floor, Ordering::SeqCst);
-    }
-
-    /// This group's own current MVCC version floor — a point-in-time
-    /// snapshot, additive accessor (test/observability aid, mirroring
-    /// [`scope_range`](Self::scope_range)).
-    #[must_use]
-    pub fn version_floor(&self) -> u64 {
-        self.version_floor.load(Ordering::SeqCst)
-    }
-
     /// This group's own current [`StorageScope`] range (see its doc) — a
     /// point-in-time snapshot, additive accessor (ADR 0028 write-fence
     /// wiring). Lets a caller (e.g. `animusd`'s `cp_put_local`/
@@ -1348,12 +1358,22 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// Tombstones each key via [`StorageEngine::merge_tombstone`] (never
     /// [`StorageEngine::delete_range`], which enforces an engine-wide monotonic
     /// version floor a *shared* engine's independent per-tablet Raft groups don't
-    /// share) at this group's own `last_applied() + 1` — strictly greater than
-    /// every version this group ever wrote for these keys, since every merge it
-    /// ever performed was stamped at most its own applied index. Actual space
+    /// share) at a **fresh HLC timestamp minted from this group's own clock**
+    /// (ADR 0018 §2 amendment) — strictly greater than every version this
+    /// group ever wrote for these keys, since every merge it ever performed
+    /// packed a timestamp this same `Hlc` had already minted or witnessed.
+    /// `Hlc::mint` needs no live driver (it is a pure, I/O-free clock), so
+    /// this is safe to call after the group has halted. Actual space
     /// reclaim happens later via the engine's normal tombstone-GC compaction.
     pub async fn erase_scope(&self) {
-        let version = self.last_applied().saturating_add(1);
+        // ADR 0018 §2 amendment: the engine version is now the packed HLC
+        // commit timestamp, not the Raft log index — so the tombstone must
+        // be stamped from this group's own `Hlc::mint`, which is guaranteed
+        // to strictly exceed every timestamp this group has ever minted (and
+        // so every version this group ever wrote for these keys), the exact
+        // property the old `last_applied() + 1` scheme provided for the
+        // retired index-based version.
+        let version = hlc::pack(self.hlc.mint(self.env.now()));
         for (key, _) in self.local_scan(&[], None, None).await {
             let _ = self
                 .storage
@@ -1639,31 +1659,36 @@ async fn persist_wal<E: Env>(
         .mark_durable_through(through);
 }
 
-/// Scale factor between a tablet's `version_floor` "generation" and its own
-/// local Raft log index in the stamped MVCC version (`effective_version`,
-/// below) — see `animus_tablet::Tablet::version_floor`'s doc for the full
-/// cross-group-LWW-collision rationale this exists to close. `2^40` (~1.1
-/// trillion) is astronomically generous headroom for "how many commands can
-/// one tablet group apply between rescopes": `--auto-split` already caps a
-/// tablet at a few thousand to a few million keys/bytes long before its own
-/// local index could plausibly approach this, and every generation change
-/// (a split or a merge touching this tablet) strictly increases the floor,
-/// so any two generations are always separated by at least one full `SCALE`
-/// regardless of how much index space either one consumed.
-const VERSION_FLOOR_SCALE: u64 = 1 << 40;
+/// Whether `key` falls inside any range this group has already sealed
+/// (ADR 0018 §2 amendment): a `Seal` entry applies before every entry
+/// ordered after it, so `sealed` only ever needs entries seen so far in this
+/// pass (plus whatever the group-start rebuild found) — never the whole
+/// group's history looked up freshly each time.
+fn is_sealed(sealed: &[(KeyRange, HlcTimestamp)], key: &[u8]) -> bool {
+    sealed.iter().any(|(range, _)| range.contains(key))
+}
 
-/// The MVCC version a command at Raft log `index` stamps on the engine, given
-/// this group's current `floor` (`RaftKvNode::version_floor`, sourced from
-/// `animus_tablet::Tablet::version_floor` — `0` for a tablet that has never
-/// been split/merged, byte-identical to using `index` verbatim). Saturating
-/// arithmetic: an overflow here would require an unrealistic number of
-/// rescopes or applies (see `VERSION_FLOOR_SCALE`'s doc) and saturating is a
-/// strictly safer failure mode than wrapping (still monotonic, never *lower*
-/// than intended).
-fn effective_version(floor: u64, index: u64) -> u64 {
-    floor
-        .saturating_mul(VERSION_FLOOR_SCALE)
-        .saturating_add(index)
+/// Assert that `ts` is strictly greater than every `ts` this group has
+/// applied so far (the log-order-monotonicity invariant the whole HLC/
+/// witnessing design rests on — see `hlc.rs` and `seal.rs`'s module docs).
+/// `None` (the very first non-`NoOp` entry applied since this apply task
+/// started, including right after a restart) is trivially satisfied — a
+/// fresh `Hlc` at `HlcTimestamp::zero()` could otherwise collide with a
+/// same-instant first entry. **A failure here means the witnessing chain is
+/// broken**: either a leader change didn't witness its predecessor's last
+/// entry, or two leaders minted concurrently without one witnessing the
+/// other — a correctness bug, not a recoverable condition, so this is a hard
+/// `assert!`, matching `hlc::pack`'s own doctrine.
+fn assert_ts_monotonic(max_applied_ts: &mut Option<HlcTimestamp>, ts: HlcTimestamp) {
+    if let Some(prev) = *max_applied_ts {
+        assert!(
+            ts > prev,
+            "raftkv apply: HLC ts {ts:?} did not strictly exceed the last applied {prev:?} — \
+             the witnessing chain is broken (a leader change or concurrent leader failed to \
+             witness a predecessor's timestamp)"
+        );
+    }
+    *max_applied_ts = Some(ts);
 }
 
 /// Install any received snapshot, apply committed-and-durable commands to the
@@ -1673,6 +1698,13 @@ fn effective_version(floor: u64, index: u64) -> u64 {
 /// append processing (the driver-liveness fix). Returns whether it did any work, so
 /// the caller can back off when idle. `engine_applied` publishes engine progress
 /// (linearizable reads gate on it), and `wal_lock` guards the compaction rewrite.
+///
+/// `hlc` witnesses every entry received this pass (WAL recovery's own
+/// witnessing happens once, in `drive`, before this function is ever called —
+/// see that function's doc); `sealed`/`max_applied_ts` are this apply task's
+/// own sequential, single-writer bookkeeping (see `is_sealed`/
+/// `assert_ts_monotonic`), threaded by the caller across calls — never
+/// touched by any other task, so no `Arc`/lock is needed for either.
 #[allow(clippy::too_many_arguments)] // the apply task's shared-state bundle
 async fn apply_and_compact<E: Env, S: StorageEngine>(
     env: &E,
@@ -1685,13 +1717,12 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
     halted: &AtomicBool,
     metrics: &MetricsHandle,
     scope: &StorageScope,
-    version_floor: &AtomicU64,
+    tablet: u64,
+    hlc: &Hlc,
+    sealed: &mut Vec<(KeyRange, HlcTimestamp)>,
+    max_applied_ts: &mut Option<HlcTimestamp>,
 ) -> bool {
     let mut did_work = false;
-    // Read once per pass: `version_floor` only ever moves via `bump_version_floor`
-    // (merge), a rare operator-driven event, so a single snapshot for the whole
-    // pass is fine — no command in this pass needs a floor that changed mid-pass.
-    let floor = version_floor.load(Ordering::SeqCst);
 
     // Install a fully-received snapshot (a follower catching up) into the engine
     // *before* applying log-tail effects, so the tail merges on top of the base.
@@ -1702,12 +1733,17 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
     if let Some((last_index, bytes)) = pending_install {
         install_engine_image(storage, scope, &bytes).await;
         engine_applied.fetch_max(last_index, Ordering::SeqCst);
+        // Witnessing point (ADR 0018 §2 amendment): a snapshot can carry
+        // versions this node has never seen minted, so fold in the engine's
+        // new high-water mark before this node ever mints/compares again.
+        hlc.witness(hlc::unpack(storage.latest_version()), env.now());
         did_work = true;
     }
 
     // Apply the now-durable committed commands to the engine, in commit order.
-    // The Raft index is the MVCC version: per-key LWW then reproduces the agreed
-    // total order, and re-applying on recovery is idempotent.
+    // The packed HLC commit timestamp is the MVCC version: per-key LWW then
+    // reproduces the agreed cross-group order, and re-applying on recovery is
+    // idempotent (the same command always computes the same `ts`).
     let effects = core.lock().expect("raftkv core poisoned").drain_apply();
     if !effects.is_empty() {
         metrics.incr_by(Metric::CpApplies, effects.len() as u64);
@@ -1718,7 +1754,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
     // `merge`/`merge_tombstone` pays one `fsync` per command (the WAL group commit
     // only coalesces *concurrent* writers — there are none here). Accumulating the
     // run into one `merge_batch` collapses it to a single sync. A command that must
-    // *read* committed state (`Cas`, `Split`) first drains the pending run so its
+    // *read* committed state (`Cas`, `Seal`) first drains the pending run so its
     // read sees those writes; `NoOp` needs no drain but we keep ordering simple by
     // leaving the run intact across it (it mutates nothing).
     let mut pending: Vec<MergeOp> = Vec::new();
@@ -1730,48 +1766,56 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
     let mut max_index = 0u64;
     for (index, command) in effects {
         match command {
-            KvCommand::Put { key, value, fence } => {
+            KvCommand::Put {
+                key,
+                value,
+                fence,
+                ts,
+            } => {
+                assert_ts_monotonic(max_applied_ts, ts);
                 // Out-of-fence is a deterministic no-op: the fence rides in the
                 // entry itself (stamped by the leader at propose time), so every
                 // replica reaches this same accept/reject decision regardless of
                 // its own progress learning the tablet's range has changed (see
-                // `KvCommand`'s doc). The fence check is against the *logical*
-                // key; only the storage-bound `MergeOp` gets the physical
-                // address (see `StorageScope`'s doc — under the default scope
-                // this is an identity transform).
-                if fence.contains(&key) {
-                    pending.push(MergeOp::put(
-                        scope.physical(&key),
-                        value,
-                        effective_version(floor, index),
-                    ));
+                // `KvCommand`'s doc). A sealed-out key is the same shape (ADR 0018
+                // §2 amendment): the key fell in a range this group already
+                // handed off, so this entry — necessarily proposed by a leader
+                // that hadn't yet learned that — is rejected exactly like a fence
+                // miss. The fence/seal checks are against the *logical* key; only
+                // the storage-bound `MergeOp` gets the physical address (see
+                // `StorageScope`'s doc — under the default scope this is an
+                // identity transform).
+                if fence.contains(&key) && !is_sealed(sealed, &key) {
+                    pending.push(MergeOp::put(scope.physical(&key), value, hlc::pack(ts)));
                 }
             }
-            KvCommand::Batch { puts, fence } => {
-                // The fence gates the *whole* batch, not per-key: a batch is one
-                // atomic Raft entry (see `KvCommand::Batch`'s doc), so partially
-                // applying it on a fence miss would silently break that guarantee.
-                // Every key in the batch merges at this one entry's `index` (the
-                // shared MVCC version). The keys are distinct, so per-key LWW is
+            KvCommand::Batch { puts, fence, ts } => {
+                assert_ts_monotonic(max_applied_ts, ts);
+                // The fence/seal gates the *whole* batch, not per-key: a batch is
+                // one atomic Raft entry (see `KvCommand::Batch`'s doc), so
+                // partially applying it on a miss would silently break that
+                // guarantee. Every key in the batch merges at this one entry's
+                // shared `ts`. The keys are distinct, so per-key LWW is
                 // well-defined; `engine_applied` advances once past the whole batch
                 // at the end of the loop iteration (the batch is one entry). Composes
                 // with a future coalesced-fsync merge_batch (perf/lsm) — this is the
                 // normal per-key `merge` path that batching optimization refines.
-                if puts.iter().all(|(key, _)| fence.contains(key)) {
+                if puts
+                    .iter()
+                    .all(|(key, _)| fence.contains(key) && !is_sealed(sealed, key))
+                {
                     for (key, value) in &puts {
                         storage
-                            .merge(&scope.physical(key), value, effective_version(floor, index))
+                            .merge(&scope.physical(key), value, hlc::pack(ts))
                             .await
                             .expect("raftkv apply batch put");
                     }
                 }
             }
-            KvCommand::Delete { key, fence } => {
-                if fence.contains(&key) {
-                    pending.push(MergeOp::tombstone(
-                        scope.physical(&key),
-                        effective_version(floor, index),
-                    ));
+            KvCommand::Delete { key, fence, ts } => {
+                assert_ts_monotonic(max_applied_ts, ts);
+                if fence.contains(&key) && !is_sealed(sealed, &key) {
+                    pending.push(MergeOp::tombstone(scope.physical(&key), hlc::pack(ts)));
                 }
             }
             KvCommand::Cas {
@@ -1779,16 +1823,18 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 expected,
                 value,
                 fence,
+                ts,
             } => {
+                assert_ts_monotonic(max_applied_ts, ts);
                 // Drain the pending run so the CAS read observes every earlier
                 // committed write in this apply pass.
                 flush_pending(storage, &mut pending, metrics).await;
-                // A fenced-out CAS never reads/writes storage — it is recorded as
-                // `false` ("did not swap"), the same outcome shape a proposer
-                // already handles for an ordinary `expected` mismatch, so a
-                // confirm-poll on this index never hangs waiting for an outcome
+                // A fenced- or sealed-out CAS never reads/writes storage — it is
+                // recorded as `false` ("did not swap"), the same outcome shape a
+                // proposer already handles for an ordinary `expected` mismatch, so
+                // a confirm-poll on this index never hangs waiting for an outcome
                 // that will never come.
-                let swapped = if fence.contains(&key) {
+                let swapped = if fence.contains(&key) && !is_sealed(sealed, &key) {
                     // Read the key's *current committed* value (the latest applied,
                     // since we apply in commit order and earlier entries in this
                     // batch already merged above) and compare to `expected`. Equal
@@ -1805,11 +1851,11 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                         .map(|vv| vv.value);
                     let swapped = current == expected;
                     if swapped {
-                        // Same write path as `Put`: `effective_version(floor, index)`
-                        // is the MVCC version, so re-applying on recovery is
-                        // idempotent (per-key LWW).
+                        // Same write path as `Put`: `hlc::pack(ts)` is the MVCC
+                        // version, so re-applying on recovery is idempotent
+                        // (per-key LWW).
                         storage
-                            .merge(&physical_key, &value, effective_version(floor, index))
+                            .merge(&physical_key, &value, hlc::pack(ts))
                             .await
                             .expect("raftkv apply cas");
                     }
@@ -1821,6 +1867,26 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                     .expect("cas results poisoned")
                     .outcomes
                     .insert(index, swapped);
+            }
+            KvCommand::Seal { range, ts } => {
+                assert_ts_monotonic(max_applied_ts, ts);
+                // Applying a Seal writes its durable marker (the successor's
+                // observable witness, `seal.rs`) at `hlc::pack(ts)` — flush the
+                // pending run first so the marker's own version never precedes
+                // an already-queued write in this same pass (ordering hygiene,
+                // not a correctness requirement: the marker key is disjoint
+                // from every scoped key, see `seal.rs`).
+                flush_pending(storage, &mut pending, metrics).await;
+                let marker_key = seal::seal_marker_key(tablet, &range);
+                storage
+                    .merge(
+                        &marker_key,
+                        &seal::encode_seal_value(&range, ts),
+                        hlc::pack(ts),
+                    )
+                    .await
+                    .expect("raftkv apply seal marker");
+                sealed.push((range, ts));
             }
             KvCommand::NoOp => {}
         }
@@ -2032,7 +2098,40 @@ struct DriveState<E: Env, S: StorageEngine> {
     metrics: MetricsHandle,
     scope: StorageScope,
     stream: u64,
-    version_floor: Arc<AtomicU64>,
+    hlc: Arc<Hlc>,
+}
+
+/// The `ts` a mutating [`KvCommand`] variant carries, or `None` for `NoOp`
+/// (which carries none). The one place that knows every variant's `ts`
+/// field, shared by the WAL-recovery and entry-receipt witnessing sites.
+fn command_ts(command: &KvCommand) -> Option<HlcTimestamp> {
+    match command {
+        KvCommand::Put { ts, .. }
+        | KvCommand::Batch { ts, .. }
+        | KvCommand::Delete { ts, .. }
+        | KvCommand::Cas { ts, .. }
+        | KvCommand::Seal { ts, .. } => Some(*ts),
+        KvCommand::NoOp => None,
+    }
+}
+
+/// Witnessing point (ADR 0018 §2 amendment): fold every command's `ts` found
+/// in an incoming `AppendEntries`' entries into `hlc` — the "entry
+/// receipt/append on every replica" chokepoint. Deliberately witnesses
+/// **every** entry in the message, whether or not `RaftCore::handle` (called
+/// separately, right after) ultimately accepts it (e.g. a stale/conflicting
+/// term) — a witness that turns out to be unnecessary is always safe (it
+/// only ever advances the clock, never regresses it), while skipping one a
+/// genuinely-accepted entry needed would be a real gap. Other `RaftMsg`
+/// variants carry no commands and are ignored.
+fn witness_append_entries(hlc: &Hlc, msg: &RaftMsg<KvCommand>, now: Nanos) {
+    if let RaftMsg::AppendEntries { entries, .. } = msg {
+        for entry in entries {
+            if let Some(ts) = command_ts(&entry.command) {
+                hlc.witness(ts, now);
+            }
+        }
+    }
 }
 
 /// Idle back-off for the apply task: when there is nothing committed-and-durable to
@@ -2066,12 +2165,24 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         metrics,
         scope,
         stream,
-        version_floor,
+        hlc,
     } = st;
 
     let wal = wal_file(stream);
     let bytes = env.read(&wal).await.unwrap_or_default();
     let state = PersistedState::replay(PersistedState::decode(&bytes));
+    // Witnessing point (ADR 0018 §2 amendment): "WAL recovery, each recovered
+    // entry." Every command this node ever durably logged for this group —
+    // applied or not yet — must be witnessed before this node ever mints or
+    // compares a timestamp again, so a restart can never re-mint below
+    // anything it (or a predecessor leader whose entries it holds) already
+    // committed. Borrowed from `state.log` *before* `PersistedState::replay`'s
+    // output is consumed by `RaftCore::recovered` below.
+    for entry in &state.log {
+        if let Some(ts) = command_ts(&entry.command) {
+            hlc.witness(ts, env.now());
+        }
+    }
     if !state.is_empty() {
         let recovered =
             RaftCore::recovered(env.node_id(), &all_nodes, state, env.now(), env.next_u64());
@@ -2086,8 +2197,24 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         core.lock().expect("raftkv core poisoned").last_applied(),
         Ordering::SeqCst,
     );
-    // Spawn the apply task now — after recovery seeded the core + `engine_applied`,
-    // so it never merges against pre-recovery state.
+    // Rebuild this group's in-memory sealed-range set from the engine's own
+    // durable marker keys (ADR 0018 §2 amendment) — the deterministic
+    // recovery source, deliberately NOT the recovered log tail: compaction
+    // can truncate a `Seal` entry out of the log long before its rejection
+    // duty is done (a stale/un-ticked leader's late proposal can still land
+    // many entries later), so only the engine-durable marker — which
+    // survives compaction like any other key — is a complete source across
+    // a restart. See `seal.rs`'s module doc.
+    let (seal_start, seal_end) = seal::scan_bound(stream);
+    let sealed: Vec<(KeyRange, HlcTimestamp)> = storage
+        .scan(&seal_start, &seal_end)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(_, vv)| seal::decode_seal_value(&vv.value))
+        .collect();
+    // Spawn the apply task now — after recovery seeded the core + `engine_applied`
+    // + `sealed`, so it never merges against pre-recovery state.
     env.spawn_task(apply_loop(
         env.clone(),
         wal.clone(),
@@ -2100,7 +2227,9 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         apply_stopped,
         metrics.clone(),
         scope,
-        version_floor,
+        stream,
+        Arc::clone(&hlc),
+        sealed,
     ));
 
     loop {
@@ -2151,6 +2280,11 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
                 let entropy = env.next_u64();
                 match codec::decode_wire(&envelope.payload) {
                     Ok(KvWire::Raft(msg)) => {
+                        // Witnessing point (ADR 0018 §2 amendment): every
+                        // command entry this replica receives — leader or
+                        // follower alike — before the core decides whether to
+                        // accept it (see `witness_append_entries`'s doc).
+                        witness_append_entries(&hlc, &msg, env.now());
                         let raft_outs: Vec<Out<KvCommand>> = core
                             .lock()
                             .expect("raftkv core poisoned")
@@ -2236,8 +2370,17 @@ async fn apply_loop<E: Env, S: StorageEngine>(
     apply_stopped: Arc<AtomicBool>,
     metrics: MetricsHandle,
     scope: StorageScope,
-    version_floor: Arc<AtomicU64>,
+    stream: u64,
+    hlc: Arc<Hlc>,
+    mut sealed: Vec<(KeyRange, HlcTimestamp)>,
 ) {
+    // This apply task's own sequential, single-writer bookkeeping (see
+    // `apply_and_compact`'s doc): `sealed` is seeded from the engine-durable
+    // recovery scan `drive` already did; `max_applied_ts` starts `None` each
+    // time this task starts (including after a restart) — the first
+    // qualifying entry it processes is unconditionally accepted (see
+    // `assert_ts_monotonic`'s doc for why that boundary case is safe).
+    let mut max_applied_ts: Option<HlcTimestamp> = None;
     loop {
         if halted.load(Ordering::SeqCst) {
             apply_stopped.store(true, Ordering::SeqCst);
@@ -2254,7 +2397,10 @@ async fn apply_loop<E: Env, S: StorageEngine>(
             &halted,
             &metrics,
             &scope,
-            &version_floor,
+            stream,
+            &hlc,
+            &mut sealed,
+            &mut max_applied_ts,
         )
         .await;
         if !did_work {

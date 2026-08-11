@@ -175,12 +175,20 @@ pub fn apply_and_derive_mirror(
             if let Some(policy) = meta.policies.get(new_id) {
                 writes.push(put_json(syskv::policy_key(*new_id), policy));
             }
+            // ADR 0018 §2 amendment: mirror the split-provenance marker
+            // (`Metadata::split_parents`) the same way `merged_key` mirrors
+            // `merged_tablets` below.
+            writes.push(put_tablet_id(syskv::split_parent_key(*new_id), *tablet));
         }
         MetaCommand::MergeTablets { left, right, .. } => {
             writes.push(put_json(syskv::tablet_key(*left), &meta.tablets[left]));
             writes.push(KeyWrite::Delete(syskv::tablet_key(*right)));
             writes.push(KeyWrite::Delete(syskv::policy_key(*right)));
             writes.push(KeyWrite::Put(syskv::merged_key(*right), Vec::new()));
+            // ADR 0018 §2 amendment: mirror the merge-provenance marker
+            // (`Metadata::absorbed_by`) — the reverse-direction dual of
+            // `split_parent_key` above.
+            writes.push(put_tablet_id(syskv::absorbed_by_key(*right), *left));
             for id in dead_cp_member_ids(&pre_cp_member_tablets, meta) {
                 writes.push(KeyWrite::Delete(syskv::cp_member_addr_key(&id)));
             }
@@ -284,6 +292,14 @@ fn put_json<T: Serialize>(key: Vec<u8>, value: &T) -> KeyWrite {
 /// raw engine scan sorts by numeric value like every other numeric id here).
 fn put_counter(name: &str, value: u64) -> KeyWrite {
     KeyWrite::Put(syskv::counter_key(name), value.to_be_bytes().to_vec())
+}
+
+/// A [`KeyWrite::Put`] of a raw [`TabletId`] value (big-endian `u64`) at
+/// `key` — the value shape [`syskv::split_parent_key`]/
+/// [`syskv::absorbed_by_key`] use (ADR 0018 §2 amendment): a tablet id, not a
+/// JSON entity, mirroring [`put_counter`]'s primitive-value convention.
+fn put_tablet_id(key: Vec<u8>, id: TabletId) -> KeyWrite {
+    KeyWrite::Put(key, id.0.to_be_bytes().to_vec())
 }
 
 /// Decode an 8-byte big-endian `u64` written by [`put_counter`] or any
@@ -411,6 +427,14 @@ fn apply_put(meta: &mut Metadata, key: &[u8], value: &[u8]) {
                 meta.cp_member_tablets.insert(node, tablet);
             }
         }
+        EntityKind::SplitParent => {
+            meta.split_parents
+                .insert(TabletId(decode_u64(&id)), TabletId(decode_u64(value)));
+        }
+        EntityKind::AbsorbedBy => {
+            meta.absorbed_by
+                .insert(TabletId(decode_u64(&id)), TabletId(decode_u64(value)));
+        }
     }
 }
 
@@ -455,6 +479,17 @@ fn apply_delete(meta: &mut Metadata, key: &[u8]) {
             let node = decode_node_id(id);
             meta.cp_member_addrs.remove(&node);
             meta.cp_member_tablets.remove(&node);
+        }
+        EntityKind::SplitParent => {
+            // Never deleted in practice (`split_parents` is never pruned —
+            // same discipline as `merged_tablets`) — listed for match
+            // exhaustiveness.
+            meta.split_parents.remove(&TabletId(decode_u64(&id)));
+        }
+        EntityKind::AbsorbedBy => {
+            // Never deleted in practice (`absorbed_by` is never pruned) —
+            // listed for match exhaustiveness.
+            meta.absorbed_by.remove(&TabletId(decode_u64(&id)));
         }
     }
 }
@@ -599,6 +634,7 @@ mod tests {
                 put_json(syskv::tablet_key(TabletId(2)), &meta.tablets[&TabletId(2)]),
                 put_counter(NEXT_TABLET_ID_COUNTER, meta.next_tablet_id),
                 put_json(syskv::policy_key(TabletId(2)), &meta.policies[&TabletId(2)]),
+                put_tablet_id(syskv::split_parent_key(TabletId(2)), TabletId(1)),
             ]
         );
     }
@@ -649,6 +685,7 @@ mod tests {
                 KeyWrite::Delete(syskv::tablet_key(TabletId(2))),
                 KeyWrite::Delete(syskv::policy_key(TabletId(2))),
                 KeyWrite::Put(syskv::merged_key(TabletId(2)), Vec::new()),
+                put_tablet_id(syskv::absorbed_by_key(TabletId(2)), TabletId(1)),
                 KeyWrite::Delete(syskv::cp_member_addr_key(&nid(99))),
             ]
         );
