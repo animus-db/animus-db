@@ -557,22 +557,6 @@ impl ControlHandle {
         }
     }
 
-    /// Merge a single control-role peer address into **this node's own**
-    /// control env's peer book (ADR 0037 PR4) — a no-op for `Remote` (a
-    /// data-only node has no local control env to update). Driven every
-    /// tick by `crate::control_peer_sync_loop` off `Metadata.node_addrs[*]
-    /// .control`, the control-role dual of the `raftkv` role's
-    /// `peer_sync_loop`/`route_sync_loop` overlays — see that loop's doc for
-    /// why this exists (closing `ProdEnv::merge_peer`'s "known scope limit":
-    /// a runtime-added voter's address was previously only ever known to
-    /// whichever node happened to be leader at `admin_add_control_member`
-    /// time).
-    pub(crate) fn merge_control_peer(&self, id: NodeId, addr: SocketAddr) {
-        if let Self::Local(raft) = self {
-            raft.env().merge_peer(id, addr);
-        }
-    }
-
     /// This handle's recording metrics sink (aggregated into the `/metrics`
     /// export alongside the raftkv-role sink). A `Remote` handle's sink is a
     /// permanent no-op (see [`RemoteControlClient`]'s doc) — the raftkv-role
