@@ -503,6 +503,38 @@ impl Rng for ProdEnv {
     }
 }
 
+/// A minimal [`Rng`] usable at a CLI **pre-bind** boundary — before any
+/// [`ProdEnv`] exists to draw from at all (a joining process mints/validates
+/// its identity, over the network, before ever binding a listener). Real OS
+/// randomness (`rand::rngs::OsRng`), byte-for-byte the same source
+/// [`ProdEnv`]'s own [`Rng`] impl above draws from.
+///
+/// This is the ADR 0040 replacement for `generate_join_nonce`'s narrower,
+/// bespoke OS-randomness exception (ADR 0036): rather than a one-off function
+/// scoped to a single call site with its own hand-written justification,
+/// pre-bind entropy now has one sanctioned, reusable home on the `Rng` trait
+/// itself — any future pre-bind caller reaches for this instead of
+/// reinventing the exception. Still the same narrow carve-out from the
+/// `Env`-seam rule (ADR 0003): **only** for a genuine pre-bind CLI boundary
+/// no `SimEnv` test ever drives (a joining process's own `NodeId::mint` call,
+/// before `Node::bind`/`ProdEnv::bind` exist) — anything that runs in-process
+/// on a live, already-bound node (e.g. `admin_add_control_member`'s minted-id
+/// path) must keep drawing from its own bound env's `Rng` instead
+/// (`leader.env().next_u64()`), never this type, so a `SimEnv` test can still
+/// drive it deterministically.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PreBindRng;
+
+impl Rng for PreBindRng {
+    fn next_u64(&self) -> u64 {
+        rand::RngCore::next_u64(&mut rand::rngs::OsRng)
+    }
+
+    fn fill_bytes(&self, dst: &mut [u8]) {
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, dst);
+    }
+}
+
 #[async_trait::async_trait]
 impl Network for ProdEnv {
     async fn send_stream(&self, to: NodeId, stream: u64, payload: Vec<u8>) {
