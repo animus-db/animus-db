@@ -1,6 +1,8 @@
 # ADR 0018 — Cross-tablet transactions on the CP plane (2PC over per-tablet Raft + HLC + MVCC)
 
-- **Status:** Proposed
+- **Status:** Accepted — in delivery (PR1: HLC + sim clock skew landed;
+  PR2-PR7 sequenced). See the "Amendment (2026-08-11, PR1)" section below for
+  the build-time decisions settled at the start of delivery.
 - **Date:** 2026-08-03
 
 ## Context
@@ -197,3 +199,60 @@ ADR 0011 (Accord, the parallel leaderless transaction layer it deliberately does
 *not* extend here), ADR 0016 (pluggable replication), ADR 0014 (the Elle
 verification it reuses), and ADR 0003 (the determinism mandate that rules out
 TrueTime). The control plane (ADR 0001) remains the metadata authority.
+
+## Amendment (2026-08-11, PR1)
+
+PR1 (`crates/animus-cp-data/src/hlc.rs` + `animus-sim`'s per-node clock skew)
+is the first follow-up increment landing. Four build-time decisions were
+settled going in, sharpening the Decision section above:
+
+1. **The engine MVCC version is the packed HLC directly — `(wall_ms << 20) |
+   logical`, no node-id bits.** The Decision section above only says "the HLC
+   commit timestamp [becomes] the MVCC version"; PR1 settles the *encoding*:
+   `hlc::pack`/`hlc::unpack` fold in nothing beyond the HLC itself, replacing
+   the floor-scaled-Raft-index scheme (`effective_version = floor *
+   VERSION_FLOOR_SCALE + index`, ADR 0017/`animus-cp-data`'s current
+   `mvcc_version` invariant) from PR2 onward. Unlike
+   `animus-consensus::node::mvcc_version`'s `(logical, node)` encoding, a
+   string `NodeId` (ADR 0040) cannot be bit-packed into the low bits at all —
+   and per-key monotonicity across concurrent writers to the *same* key is
+   not this encoding's job to guarantee; that is the transaction layer's job,
+   via a per-tablet timestamp cache plus write-conflict pushes, asserted at
+   apply time (later PRs). `pack`/`unpack` hard-`assert!` their bit budgets
+   (never `debug_assert!`) for the same reason `mvcc_version` does: a silent
+   collision would be silent MVCC corruption, not a recoverable error.
+2. **Serializability, not merely snapshot isolation, via a per-tablet
+   read-timestamp cache + read-span refresh/restart.** The Decision section's
+   "serializable, not externally consistent" already rules out Spanner-style
+   external consistency; this settles the specific mechanism for full
+   serializability (as opposed to the weaker snapshot isolation an MVCC
+   timestamp alone gives): each tablet tracks the highest read timestamp
+   observed per key range, and a write that would land below an already-read
+   timestamp is pushed forward or the reader's span is refreshed/restarted —
+   the CockroachDB read-timestamp-cache mechanism, deferred to the PR that
+   lands the read path (after PR2's MVCC versioning).
+3. **The transaction record lives in the first participant's tablet group,**
+   keyed under a reserved sub-keyspace derived from the anchor key (the
+   CockroachDB model referenced throughout the Decision section) — not a
+   separate always-present system tablet. This is the concrete shape of
+   "a single transaction-status record... Raft-replicated in a designated
+   participant's group" (§3), settled for the PR that lands the record/intent
+   machinery (Follow-up step 2).
+4. **Delivery scope for the wire-facing surface**: atomic Dynamo
+   `TransactWriteItems`/`TransactGetItems` plus an `/admin/txns` observability
+   endpoint are in scope for this delivery. CQL LWT/atomic `BATCH` and Dynamo
+   idempotency-token/`CancellationReasons` fidelity are explicitly deferred
+   follow-ups, tracked separately from the Follow-up sequencing list above —
+   the CP transaction *mechanism* (2PC/HLC/MVCC/recovery/Elle corpus) is this
+   ADR's scope; wire-protocol fidelity beyond the two Dynamo atomic APIs is
+   not blocking it.
+
+PR1 itself adds only the pure `Hlc`/`HlcTimestamp`/`pack`/`unpack` primitives
+(no MVCC/storage integration yet — that is PR2) and an opt-in, default-zero,
+read-side-only per-node clock skew knob in `animus-sim`
+(`Simulator::set_clock_skew_for`), which PR1's own `hlc_skew.rs` integration
+test uses to prove the causality property this whole ADR's clock design rests
+on: a node whose clock reads *ahead* mints a timestamp, a node whose clock
+reads *behind* witnesses it, and the behind node's own next mint still
+strictly exceeds the ahead node's — clock skew perturbs readings, never
+causality.

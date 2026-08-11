@@ -55,6 +55,7 @@ use futures::task::AtomicWaker;
 use serde::{Deserialize, Serialize};
 
 mod codec;
+pub mod hlc;
 pub mod host;
 
 /// The **wake-on-propose** signal (ADR 0017 single-write-latency fix): a shared

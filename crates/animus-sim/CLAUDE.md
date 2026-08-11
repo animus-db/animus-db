@@ -21,6 +21,17 @@ function of one seed. This is the substrate every distributed test runs on.
   `corrupt_durable(node, file, offset)` (flip one durable byte — at-rest
   corruption of synced data, e.g. to hit an SSTable's per-block CRC).
 - Observability: `trace()` / `trace_lines()`, `now()`, `seed()`.
+- Clock skew (ADR 0018 §2 sim support): `set_clock_skew_for(node, skew_nanos)`
+  — a per-node signed-nanosecond offset applied only to that node's own
+  `Clock::now()` reads (mirrors the `set_disk_config_for` per-node-override
+  shape). **Opt-in and default-zero**: with no call, every node's `now()` is
+  byte-identical to the global clock, so this changes nothing for any
+  existing test. Clamped so a reading never underflows below 0 or overflows
+  `u64::MAX`. Deliberately **read-side only** — `sleep`'s timers still fire
+  against the single global timeline, since a per-node skewed *timeline*
+  would reorder the shared event loop and break determinism; skew models a
+  node's clock *reading* wrong (exactly what an HLC has to tolerate), not a
+  different flow of time for that node.
 
 ## What's non-obvious
 
@@ -92,4 +103,13 @@ traces across runs, reproducible partitions, and the crash/disk model;
 `tests/disk_faults.rs` asserts the opt-in disk fault model is default-off
 byte-identical and seed-reproducible when enabled. The storage-facing fault
 corpus (LSM torn-tail recovery, injected-error write paths, CRC on corrupted
-blocks) lives in `animus-storage/tests/lsm_disk_faults.rs`.
+blocks) lives in `animus-storage/tests/lsm_disk_faults.rs`. `tests/clock_skew.rs`
+(ADR 0018 §2 sim support) proves the clock-skew knob: per-node `now()` offsets
+by exactly its configured skew while an unskewed node tracks the global clock;
+a large negative skew clamps at 0 near time zero instead of underflowing; and
+the same seed + skew script reproduces an identical observed `now()` sequence
+(the determinism guarantee holds with skew configured, not just by default).
+The HLC-specific causality-under-skew property (a behind-clock node's mint
+still exceeds an ahead-clock node's) is tested in
+`animus-cp-data/tests/hlc_skew.rs`, since it needs both this crate and
+`animus_cp_data::hlc`.

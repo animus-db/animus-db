@@ -24,7 +24,7 @@ relevant ADR (or supersede it) in the same PR as the code change.
 | [0015](0015-observability.md) | Deterministic-safe observability seam (metrics) | Accepted |
 | [0016](0016-pluggable-replication-per-tablet-raft.md) | Pluggable replication: per-tablet Raft (CP) alongside the AP data plane | Accepted |
 | [0017](0017-per-tablet-raft-data-plane.md) | Per-tablet Raft data plane (leaderful, linearizable KV) | Accepted (§4/split superseded by 0028) |
-| [0018](0018-cross-tablet-transactions.md) | Cross-tablet transactions on the CP plane (2PC over per-tablet Raft + HLC + MVCC) | Proposed |
+| [0018](0018-cross-tablet-transactions.md) | Cross-tablet transactions on the CP plane (2PC over per-tablet Raft + HLC + MVCC) | Accepted — in delivery (PR1 landed: HLC + sim clock skew) |
 | [0019](0019-cp-only-v1-defer-ap.md) | v1 ships the CP plane only; the leaderless AP data plane is deferred | Accepted |
 | [0020](0020-admin-interface.md) | Admin / debug interface on a dedicated port (config, status, Raft + storage introspection, operator actions) | Accepted |
 | [0021](0021-web-dashboard.md) | Web dashboard over the admin JSON surface (observe + operator actions, static + self-contained) | Accepted |
