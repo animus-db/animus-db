@@ -1,14 +1,15 @@
-//! **Cluster-allocated member ids** (ADR 0036): `animusd join --seed
+//! **Self-minted member ids** (ADR 0040 Decision B/C): `animusd join --seed
 //! ADDR[,ADDR...] --base-port P` and `animusd data --seed ADDR[,ADDR...]
-//! --base-port P`, both with **no `--node`** — the control plane mints the
-//! joining node's id atomically from `MetaCommand::AllocateNodeId`'s
-//! monotonic allocator instead of an operator picking a small index. The
-//! sibling of `tests/seed_join.rs`/`tests/data_join.rs` (which cover the
-//! `--node`-indexed path, left completely untouched by this change); this
-//! file exercises only what's new: no-index discovery + allocation,
-//! concurrent allocation safety, the data-only dual, the ephemeral-identity
-//! restart semantics, and the `is_relayable_command` regression for
-//! `AllocateNodeId` through a follower-connected seed.
+//! --base-port P`, both with no `--id` — this node self-mints its own id
+//! (`NodeId::mint`) and claims it via `MetaCommand::RegisterNode`'s
+//! registration CAS instead of an operator picking a small index or proposing
+//! an explicit `--id`. The sibling of `tests/seed_join.rs`/`tests/
+//! data_join.rs` (which cover the explicit-`--id` path, left completely
+//! untouched by this change); this file exercises only what's new: no-id
+//! discovery + self-minting, concurrent-registration safety, the data-only
+//! dual, the ephemeral-identity restart semantics, and the
+//! `is_relayable_command` regression for `RegisterNode` through a
+//! follower-connected seed.
 //!
 //! Real TCP/time — polls with generous timeouts, not deterministic
 //! assertions (a flaky `ProdEnv` test is a real bug, per the root
@@ -144,6 +145,17 @@ fn member_status(nodes: &[Node], id: &animus_env::NodeId) -> Option<NodeStatus> 
         .find_map(|n| n.metadata().members.get(id).map(|m| m.status))
 }
 
+/// Whether `id` looks like a [`NodeId::mint`](animus_env::NodeId::mint)
+/// output — exactly 22 chars (128 bits of base64url, unpadded). There is no
+/// reserved prefix to check anymore (ADR 0040 retired the ADR 0036
+/// allocator's `"alloc-"` convention along with the allocator itself):
+/// uniqueness is now enforced structurally by the registration CAS, not by a
+/// namespace convention, so this is a sanity check on shape, not a
+/// disjointness proof.
+fn looks_minted(id: &animus_env::NodeId) -> bool {
+    id.as_str().chars().count() == 22
+}
+
 /// A table whose tablet currently lists `raftkv_id` as a replica, if any —
 /// mirrors `tests/seed_join.rs::table_with_replica`'s doc: rebalancing (ADR
 /// 0029) only ever proposes a move while it improves the *global* imbalance,
@@ -272,9 +284,9 @@ async fn no_node_join_becomes_active_and_gets_a_replica() {
     .await;
     let joined_id = own_raftkv_id(joined.admin_addr()).await;
     assert!(
-        animus_control::meta::parse_alloc_id(&joined_id).is_some(),
-        "allocated id {joined_id} must land in the ADR 0036 disjoint \
-         (\"alloc-\"-prefixed) range, distinct from any --node-derived id"
+        looks_minted(&joined_id),
+        "self-minted id {joined_id} must look like a NodeId::mint output, \
+         distinct from any --id-proposed id"
     );
 
     await_active(&core_nodes, &joined_id, 20).await;
@@ -329,10 +341,7 @@ async fn two_concurrent_allocated_joins_get_distinct_ids() {
         id_a, id_b,
         "two concurrent join attempts must never be allocated the same id"
     );
-    assert!(
-        animus_control::meta::parse_alloc_id(&id_a).is_some()
-            && animus_control::meta::parse_alloc_id(&id_b).is_some()
-    );
+    assert!(looks_minted(&id_a) && looks_minted(&id_b));
 
     await_active(&core_nodes, &id_a, 20).await;
     await_active(&core_nodes, &id_b, 20).await;
@@ -368,7 +377,7 @@ async fn data_only_allocated_join_becomes_active_and_gets_a_replica() {
     let joined =
         join_data_allocated_fresh(&seeds, dir.path(), "data", StorageBackend::Memory).await;
     let joined_id = own_raftkv_id(joined.admin_addr()).await;
-    assert!(animus_control::meta::parse_alloc_id(&joined_id).is_some());
+    assert!(looks_minted(&joined_id));
 
     await_active(&control_nodes, &joined_id, 20).await;
     let hosted_table = await_replica(&control_nodes, &joined_id, 90).await;
@@ -474,9 +483,9 @@ async fn ephemeral_identity_restart_gets_a_new_id_old_left_down_and_prunable() {
 }
 
 /// **Follower-connected seed** (the `is_relayable_command` regression for
-/// `MetaCommand::AllocateNodeId`, ADR 0036): a joiner whose *only* seed is a
-/// non-leader control node still completes the whole allocate-and-confirm
-/// round trip — proving `AllocateNodeId` is actually in the relay allowlist
+/// `MetaCommand::RegisterNode`, ADR 0040): a joiner whose *only* seed is a
+/// non-leader control node still completes the whole mint-and-confirm
+/// round trip — proving `RegisterNode` is actually in the relay allowlist
 /// (a missed entry would hang this join until `JOIN_DISCOVERY_BUDGET`
 /// expires, indistinguishable from "no seed answered").
 #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
@@ -500,7 +509,7 @@ async fn follower_connected_seed_completes_the_allocate_node_id_round_trip() {
     )
     .await;
     let joined_id = own_raftkv_id(joined.admin_addr()).await;
-    assert!(animus_control::meta::parse_alloc_id(&joined_id).is_some());
+    assert!(looks_minted(&joined_id));
 
     await_active(&core_nodes, &joined_id, 20).await;
 

@@ -47,10 +47,12 @@ function updateControlStorageNodeOptions() {
 // nested in the same "Control system keyspace" card, reusing `ctl-node`'s
 // control-role-only node selector so it never offers a node with no local
 // control engine at all. The kind filter lists EVERY EntityKind, including
-// the internal/legacy bookkeeping ones (Counter/NodeIdAlloc/CpMemberAddr) —
-// full transparency by the project owner's own call, labeled rather than
-// hidden, since hiding them would make "what does this node actually store"
-// a lie by omission.
+// the internal/legacy bookkeeping ones (Counter/CpMemberAddr) — full
+// transparency by the project owner's own call, labeled rather than hidden,
+// since hiding them would make "what does this node actually store" a lie
+// by omission. (A third such kind, NodeIdAlloc — the ADR 0036 allocator's
+// idempotency ledger — was removed in ADR 0040 PR4 along with the allocator
+// itself.)
 const SYSTEM_TABLE_KINDS = [
   ["", "(all kinds)"],
   ["tablet", "tablet"],
@@ -62,7 +64,6 @@ const SYSTEM_TABLE_KINDS = [
   ["merged", "merged"],
   ["counter", "counter (internal)"],
   ["cp_member_addr", "cp_member_addr (legacy)"],
-  ["node_id_alloc", "node_id_alloc (internal)"],
 ];
 
 // The forward-only pager's cursor for the CURRENTLY DISPLAYED page — `null`

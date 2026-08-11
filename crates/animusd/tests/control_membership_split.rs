@@ -315,6 +315,30 @@ async fn grow_then_replace_a_voter_over_a_split_deployment_with_live_data_traffi
         let grown_admin = grown.admin_addr();
         let grown_control_addr = grown_addrs.internal;
 
+        // Wait for `grown`'s own one-shot self-registration (`MetaCommand::
+        // RegisterNode`'s CAS, ADR 0040 PR4) to land before adding it as a
+        // control voter — calling `control/member/add` first races two
+        // *independent* proposals for the same id's `node_addrs` entry
+        // against each other, and the CAS correctly refuses whichever loses
+        // (unlike the pre-ADR-0040 blind-overwrite behavior this
+        // supersedes) — mirrors `control_membership_admin.rs`'s identical
+        // "confirm it's up first" sequencing (plan §3's real operator
+        // runbook).
+        timeout(Duration::from_secs(15), async {
+            loop {
+                if control_nodes[leader_idx]
+                    .metadata()
+                    .node_addrs
+                    .contains_key(&nid(new_id))
+                {
+                    return;
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("grown node's own self-registration never landed on the real cluster");
+
         let (status, body) =
             add_control_member(control_admin[leader_idx], new_id, grown_control_addr).await;
         assert_eq!(status, 200, "control/member/add (grow) failed: {body}");

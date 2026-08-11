@@ -7,20 +7,24 @@
 //! voter self-elects immediately, so bring-up is fast and this file doesn't
 //! need `support::free_addrs`'s multi-node port-TOCTOU retry dance):
 //!
-//! - `system_table_lists_every_seeded_entity_kind` — seeds all ten
+//! - `system_table_lists_every_seeded_entity_kind` — seeds all nine
 //!   [`animus_control::syskv::EntityKind`]s via the client protocol (a plain
 //!   `Put` auto-provisions a tablet, `ProposeSchema` reaches every other
 //!   `MetaCommand` this plane can mirror, a real split+merge produces a
-//!   `Merged` marker, `AllocateNodeId` produces the `NodeIdAlloc` ledger
-//!   entry), then asserts every kind appears with the exact value shape the
-//!   plan's decode table specifies, plus the `kind` query filter narrowing
-//!   correctly.
+//!   `Merged` marker; `member`/`node_addrs` come from the bootstrapped
+//!   node's own self-registration — ADR 0040 PR4 retired the ADR 0036
+//!   allocator's dedicated `NodeIdAlloc` ledger kind along with the
+//!   allocator itself, since `MetaCommand::RegisterNode`'s claim lives
+//!   entirely in the already-mirrored `member`/`node_addrs` kinds, no
+//!   separate ledger needed), then asserts every kind appears with the
+//!   exact value shape the plan's decode table specifies, plus the `kind`
+//!   query filter narrowing correctly.
 //! - `system_table_pagination_is_gapless_and_duplicate_free` — seeds many
 //!   `tablet` rows (one plain `Put` per distinct table auto-provisions one),
 //!   then walks the forward-only pager at a small `limit` and diffs the
 //!   concatenated pages against one unlimited fetch.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -237,20 +241,6 @@ async fn system_table_lists_every_seeded_entity_kind() {
         )
         .await;
 
-        // ---- NodeIdAlloc --------------------------------------------------------
-        let resp = call(
-            client,
-            ClientRequest::AllocateNodeId {
-                nonce: "join-nonce-1".to_string(),
-                labels: BTreeMap::new(),
-            },
-        )
-        .await;
-        let allocated_id = match resp {
-            ClientResponse::NodeIdAllocated { node } => node,
-            other => panic!("unexpected AllocateNodeId reply: {other:?}"),
-        };
-
         // ---- Merged: a real split, then merge the sibling back in ------------
         let resp = call(
             client,
@@ -297,7 +287,7 @@ async fn system_table_lists_every_seeded_entity_kind() {
         .await;
 
         // ---- every seeded kind eventually shows up in the browse surface ----
-        const EXPECT_KINDS: [&str; 10] = [
+        const EXPECT_KINDS: [&str; 9] = [
             "tablet",
             "member",
             "schema",
@@ -307,7 +297,6 @@ async fn system_table_lists_every_seeded_entity_kind() {
             "merged",
             "counter",
             "cp_member_addr",
-            "node_id_alloc",
         ];
         let full = timeout(Duration::from_secs(15), async {
             loop {
@@ -404,13 +393,6 @@ async fn system_table_lists_every_seeded_entity_kind() {
 
         let cp_addr_item = find("cp_member_addr", "n9999");
         assert!(cp_addr_item["value"].is_object());
-
-        let node_id_alloc_item = find("node_id_alloc", "join-nonce-1");
-        assert_eq!(
-            node_id_alloc_item["value"].as_str(),
-            Some(allocated_id.as_str()),
-            "node_id_alloc value is the allocated id: {node_id_alloc_item}"
-        );
 
         // ---- kind filter narrows correctly -----------------------------------
         let (s, filtered) = admin_get(admin, "/admin/system-table?kind=schema&limit=1000").await;

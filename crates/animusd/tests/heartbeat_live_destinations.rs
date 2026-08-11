@@ -225,13 +225,15 @@ async fn heartbeat_reaches_a_runtime_added_voter_after_it_becomes_leader() {
     let grown_control_addr = grown_addrs.internal;
 
     // `grown` self-registers its own `NodeAddrs` (relayed, since it starts
-    // life a non-voter — `ClientCtx::register_node_addrs`) — its `internal`
-    // address is already correct from that very first self-registration
-    // (ADR 0040 PR1: one address per node, not a separate control/raftkv
-    // pair populated later by `control/member/add`). Wait for the
-    // self-registration to land on the real cluster before adding the
-    // voter — mirrors the real operator runbook's own "confirm it's up
-    // first" step.
+    // life a non-voter — `MetaCommand::RegisterNode`'s CAS, ADR 0040 PR4)
+    // — its `internal` address is already correct from that very first
+    // self-registration (ADR 0040 PR1: one address per node, not a separate
+    // control/raftkv pair populated later by `control/member/add`). Wait
+    // for the self-registration to land on the real cluster before adding
+    // the voter — mirrors the real operator runbook's own "confirm it's up
+    // first" step; skipping this wait races two independent proposals for
+    // the same id's `node_addrs` entry, and the CAS correctly refuses
+    // whichever loses instead of silently overwriting it.
     let self_registered = async {
         loop {
             if node0.metadata().node_addrs.contains_key(&nid(new_id)) {

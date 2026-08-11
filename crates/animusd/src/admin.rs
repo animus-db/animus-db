@@ -742,10 +742,9 @@ async fn storage_scan(ctx: &ClientCtx, q: &str) -> (u16, Value) {
 /// keyspace** (`animus_control::syskv::RESERVED_NAMESPACE`): every mirrored
 /// `Metadata` entity (tablets, members, schemas, policies, the node address
 /// book, keyspaces, merge markers) **plus** the internal/legacy bookkeeping
-/// kinds (the two monotonic id-allocator counters, the legacy CP-member
-/// address book, the `AllocateNodeId` idempotency ledger) — full
-/// transparency by default, no kind hidden here; only the dashboard labels
-/// the internal/legacy ones for an operator's benefit.
+/// kinds (the monotonic tablet-id-allocator counter, the legacy CP-member
+/// address book) — full transparency by default, no kind hidden here; only
+/// the dashboard labels the internal/legacy ones for an operator's benefit.
 ///
 /// `{"available": false}` on a data-only node (`ctx.control_storage` is
 /// `None` — no local control role at all, ADR 0035), the same honest-absence
@@ -916,11 +915,8 @@ fn system_table_id_display(kind: syskv::EntityKind, id: &[u8]) -> Value {
 /// `Schema`/`Policy`/`NodeAddrs`/`CpMemberAddr` are `serde_json` passthrough
 /// (`null` on a malformed value — defensive only, every real writer produces
 /// valid JSON here); `Counter` is a raw big-endian `u64` (`null` if not
-/// exactly 8 bytes); `NodeIdAlloc`'s value is the minted `NodeId` itself — a
-/// UTF-8 string (ADR 0040 PR3: `NodeId` is a validated string now, not a
-/// `u64`, so this is no longer the same 8-byte encoding `Counter` uses);
-/// `Keyspace`/`Merged` are presence-only (their value is always empty) —
-/// always `null`, regardless of the actual bytes.
+/// exactly 8 bytes); `Keyspace`/`Merged` are presence-only (their value is
+/// always empty) — always `null`, regardless of the actual bytes.
 fn system_table_value_display(kind: syskv::EntityKind, value: &[u8]) -> Value {
     match kind {
         syskv::EntityKind::Tablet
@@ -935,11 +931,6 @@ fn system_table_value_display(kind: syskv::EntityKind, value: &[u8]) -> Value {
             Ok(bytes) => json!(u64::from_be_bytes(bytes)),
             Err(_) => Value::Null,
         },
-        // ADR 0040 PR3: the value here is the minted `NodeId` itself (a
-        // UTF-8 string, `mirror::decode_node_id`'s exact format), not a raw
-        // counter — `Counter`'s 8-byte-u64 decode used to also fit this
-        // (NodeId was itself a `u64`), but no longer does.
-        syskv::EntityKind::NodeIdAlloc => json!(key_str(value)),
         syskv::EntityKind::Keyspace | syskv::EntityKind::Merged => Value::Null,
     }
 }
@@ -1027,15 +1018,15 @@ struct AddMemberReq {
 }
 
 /// `POST /admin/control/member/add` request body (ADR 0037 PR3, `node`
-/// optional since the hardening trio's PR3): `node`, when given, is an
-/// **operator-supplied** control-plane voter id (below `ALLOC_ID_BASE` —
-/// see `ClientCtx::admin_add_control_member`'s doc); omitted (`null` or
-/// absent, `#[serde(default)]`), the control plane mints a fresh one from
-/// its own ADR 0036 allocator instead. `addr` is that node's internal
-/// control-Raft listen address, not its admin/client address. `labels` seed
-/// the minted member's topology labels (ignored for an operator-supplied
-/// `node`, which is never fresh — see the doc above), the same shape
-/// `AddMemberReq`'s does.
+/// optional since the hardening trio's PR3, re-based onto ADR 0040 Decision C
+/// in PR4): `node`, when given, is an **operator-supplied** control-plane
+/// voter id, re-validated via `NodeId::propose` (see
+/// `ClientCtx::admin_add_control_member`'s doc); omitted (`null` or absent,
+/// `#[serde(default)]`), the control plane self-mints one (`NodeId::mint`)
+/// instead. `addr` is that node's internal control-Raft listen address, not
+/// its admin/client address. `labels` seed the minted member's topology
+/// labels (ignored for an operator-supplied `node` that's already a member —
+/// see the doc above), the same shape `AddMemberReq`'s does.
 #[derive(Deserialize)]
 struct AddControlMemberReq {
     #[serde(default)]

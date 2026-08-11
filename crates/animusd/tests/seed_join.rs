@@ -74,7 +74,16 @@ async fn rejoin_same(
 ) -> Node {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
-        match animusd::run_node_join(seeds.to_vec(), index, addrs.clone(), dir, backend).await {
+        match animusd::run_node_join(
+            seeds.to_vec(),
+            Some(animusd::config::node_id(index)),
+            addrs.clone(),
+            dir,
+            backend,
+            std::collections::BTreeMap::new(),
+        )
+        .await
+        {
             Ok(node) => return node,
             Err(e) => {
                 assert!(
@@ -364,10 +373,11 @@ async fn node_joins_via_seed_with_no_expanded_config() {
     };
     let collision_result = animusd::run_node_join(
         core_clients.clone(),
-        join_index,
+        Some(join_raftkv_id.clone()),
         collision_addrs,
         &dir.path().join("collision"),
         StorageBackend::default(),
+        std::collections::BTreeMap::new(),
     )
     .await;
     let err = match collision_result {

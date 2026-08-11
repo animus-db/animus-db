@@ -47,7 +47,7 @@ const ADMIN_USAGE: &str = "  admin <subcommand> <admin-addr> [args]:\n    \
     drain-status <admin-addr> <node-id>\n    \
     remove <admin-addr> <node-id>\n    \
     decommission <admin-addr> <node-id> [--force-control-remove]\n    \
-    control-add <leader-admin-addr> <new-node-admin-addr>                    (allocator-minted id)\n    \
+    control-add <leader-admin-addr> <new-node-admin-addr>                    (self-minted id)\n    \
     control-add <leader-admin-addr> <node-id> <new-node-admin-addr>         (operator-supplied id)\n    \
     control-remove <leader-admin-addr> <node-id> [--force]\n    \
     control-grow <leader-admin-addr> <node-id> <admin-addr> [<node-id> <admin-addr>...]";
@@ -131,7 +131,7 @@ async fn run_admin(args: &[String]) -> Result<(), String> {
     //
     // `control-add` disambiguates its two forms by **arity** (ADR 0037
     // hardening trio's PR3, locked decision — no `--auto` flag): exactly one
-    // trailing arg is the allocator-minted-id form (`<new-node-admin-addr>`
+    // trailing arg is the self-minted-id form (`<new-node-admin-addr>`
     // only); exactly two is the operator-supplied-id form (`<node-id>
     // <new-node-admin-addr>`), unchanged from before this PR.
     if sub == "control-add" {
@@ -140,7 +140,7 @@ async fn run_admin(args: &[String]) -> Result<(), String> {
             1 => run_control_add_allocated(addr, &rest[0]).await,
             2 => run_control_add(addr, &rest[0], &rest[1]).await,
             _ => Err(
-                "control-add needs <new-node-admin-addr> (allocator-minted id) or \
+                "control-add needs <new-node-admin-addr> (self-minted id) or \
                  <node-id> <new-node-admin-addr> (operator-supplied id)"
                     .into(),
             ),
@@ -474,21 +474,22 @@ async fn run_control_add(
 }
 
 /// `animus admin control-add <leader-admin-addr> <new-node-control-addr>`
-/// (ADR 0037 hardening trio's PR3, the **allocator-minted-id** form — 2 args,
-/// disambiguated by arity in [`run_admin`]'s dispatch, locked decision: no
-/// `--auto` flag). Unlike [`run_control_add`]'s operator-supplied form, there
-/// is no id yet to look a running node up by, so this skips the
-/// `GET /admin/config` liveness/address-resolution step entirely: `addr` goes
-/// straight into the request as the new voter's internal control-Raft listen
-/// address, and the control plane mints a fresh id from its own ADR 0036
-/// allocator (`POST /admin/control/member/add` with `node` omitted), then
-/// registers `addr` for it and adds it as a voter — same one-call semantics
-/// as the operator-supplied form, just with the id decided server-side.
-/// Prints the minted id and returns — there is no known admin port to poll
-/// for catch-up convergence (the physical process at `addr` may not even be
-/// running yet by design: the operator's next step is to start it there
-/// configured with `--node <minted-id>`, at which point it starts replicating
-/// like any other freshly-added voter).
+/// (ADR 0037 hardening trio's PR3, the **self-minted-id** form since ADR 0040
+/// PR4 — 2 args, disambiguated by arity in [`run_admin`]'s dispatch, locked
+/// decision: no `--auto` flag). Unlike [`run_control_add`]'s operator-
+/// supplied form, there is no id yet to look a running node up by, so this
+/// skips the `GET /admin/config` liveness/address-resolution step entirely:
+/// `addr` goes straight into the request as the new voter's internal
+/// control-Raft listen address, and the control plane self-mints a fresh id
+/// (`NodeId::mint`, `POST /admin/control/member/add` with `node` omitted),
+/// then registers `addr` for it and adds it as a voter — same one-call
+/// semantics as the operator-supplied form, just with the id decided
+/// server-side. Prints the minted id and returns — there is no known admin
+/// port to poll for catch-up convergence (the physical process at `addr` may
+/// not even be running yet by design: the operator's next step is to start
+/// it there with `--id <minted-id>` — e.g. `animusd join --seed <any-node>
+/// --id <minted-id> --base-port <port>` — at which point it starts
+/// replicating like any other freshly-added voter).
 async fn run_control_add_allocated(
     leader_admin_addr: &str,
     new_node_control_addr: &str,
@@ -510,9 +511,8 @@ async fn run_control_add_allocated(
         .as_str()
         .ok_or("control/member/add response missing `node`")?;
     println!(
-        "allocated control voter id {node} for {new_node_control_addr}; \
-         start the new node's process there configured with --node {node} \
-         to complete the join"
+        "minted control voter id {node} for {new_node_control_addr}; \
+         start the new node's process there with --id {node} to complete the join"
     );
     Ok(())
 }
@@ -664,17 +664,10 @@ fn print_response(response: &ClientResponse) {
             println!("client route: {client_route:?}");
             println!("admin addrs: {admin_addrs:?}");
         }
-        // Cluster-allocated member id (ADR 0036): consumed programmatically
-        // by `animusd join`/`data --seed`'s no-`--node` startup path, not
-        // requested by any CLI subcommand of its own — printed raw if one
-        // ever surfaces here (mirroring `JoinInfo` above).
-        ClientResponse::NodeIdAllocated { node } => {
-            println!("allocated node id: {node}");
-        }
         // Incremental `WatchMetadata` reply (ADR 0038 PR5): consumed
         // programmatically by `RemoteControlClient`'s mirror sync, not
         // requested by any CLI subcommand of its own — printed raw if one
-        // ever surfaces here (mirroring `JoinInfo`/`NodeIdAllocated` above).
+        // ever surfaces here (mirroring `JoinInfo` above).
         ClientResponse::MetadataDelta {
             writes, watermark, ..
         } => {

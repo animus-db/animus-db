@@ -86,26 +86,30 @@ can't reach: `split_fence_tests` (lib.rs:6452) and `auto_split_median_tests`
 | `--config FILE --node I [--dir DIR] [--ephemeral]` | run node I of a config, combined mode (one process per node) |
 | `--cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B]` | run an N-node combined cluster in one process (dev) |
 | `--cluster-control N --cluster-data M [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B]` | run a whole split deployment in one process (dev, ADR 0035) |
-| `join --seed ADDR[,ADDR...] [--node I] [--ip A] [--base-port P] [--dir D] [--ephemeral]` | combined-mode seed/join startup (ADR 0032 PR2; `--node` omitted → ADR 0036 cluster-allocated id) |
+| `join --seed ADDR[,ADDR...] [--id NAME] --base-port P [--ip A] [--dir D] [--ephemeral]` | combined-mode seed/join startup (ADR 0032 PR2; ADR 0040 PR4: `--id` proposes a durable identity, omitted self-mints one) |
 | `control --config FILE --node I [--dir DIR] [--ephemeral]` | run node I as a control-only node (ADR 0035 PR3); `--ephemeral` (ADR 0038) selects a volatile in-memory system-keyspace engine instead of the durable on-disk default — `Metadata` does NOT survive a restart |
 | `data --config FILE --node I [--dir DIR] [--ephemeral]` | run node I as a data-only node (ADR 0035 PR4) |
-| `data --seed ADDR[,ADDR...] [--node I] [--ip A] [--base-port P] [--dir D] [--ephemeral]` | data-only seed/join (ADR 0035 PR5; `--node` omitted → ADR 0036 cluster-allocated id) |
+| `data --seed ADDR[,ADDR...] [--id NAME] --base-port P [--ip A] [--dir D] [--ephemeral]` | data-only seed/join (ADR 0035 PR5; ADR 0040 PR4: `--id` proposes a durable identity, omitted self-mints one) |
 
 `--auto-split K` (key count) and `--auto-split-bytes B` (byte size) are
-independent OR-gated triggers — either, both, or neither. `join`/`data --seed`
-derive six consecutive ports from `--base-port` (default `7100 + 6*I`) when
-`--node I` is given. **`--node I` is optional on `join`/`data --seed`** (ADR
-0036): omit it to have the control plane mint this node's id atomically from
-its own `MetaCommand::AllocateNodeId` monotonic allocator instead of an
-operator picking `I` — but then `--base-port` is **required** (an allocated
-id is not a small index, so there's no `7100 + 6*I` to fall back to) and the
-join is **ephemeral-identity**: a restart with a fresh dir gets a *new*
-allocated id, and the old id's `Member` entry lingers `Down`/address-less
-forever (never reused, prunable later via the existing `RemoveMember`/
-decommission path). `--node I`'s durable, restart-stable identity is
-unaffected — this is purely additive (`run_node_join_allocated`/
-`run_node_data_join_allocated` in `lib.rs`, alongside the untouched
-`run_node_join`/`run_node_data_join`).
+independent OR-gated triggers — either, both, or neither. **`--node I` is
+gone from `join`/`data --seed` entirely — a clean break (ADR 0040 PR4)**:
+there is no more index to derive a default port range from, so `--base-port`
+is **required** on both. `--id NAME` proposes a durable identity
+(`NodeId::propose` validates it at the CLI boundary); omitted, the node
+**self-mints** one (`NodeId::mint`, ADR 0040 Decision B) and claims it via
+`MetaCommand::RegisterNode`'s registration CAS (Decision C) — closing ADR
+0032's own documented residual race (two simultaneous joiners choosing the
+same identity) structurally, not just by convention. A self-minted join is
+**ephemeral-identity**: a restart with a fresh dir mints a *new* id, and the
+old id's `Member` entry lingers `Down`/address-less forever (never reused,
+prunable later via the existing `RemoveMember`/decommission path). `--id
+NAME`'s durable, restart-stable identity is unaffected. One unified entry
+point per role now (`run_node_join`/`run_node_data_join` in `lib.rs`, both
+taking `id: Option<NodeId>`) — the old `run_node_join_allocated`/
+`run_node_data_join_allocated` split is gone, along with
+`check_join_collision`/`generate_join_nonce` (superseded by the CAS and by
+`animus_env::prod::PreBindRng`, respectively).
 
 ## Deployment shapes (ADR 0035)
 
@@ -450,7 +454,7 @@ route below the edge through the same `ClientCtx` CP primitives.
   next page's lower bound is that key plus one `0x00` byte — exact and
   gap-free because `syskv` keys are provably prefix-free. Value decode
   mirrors `animus_control::mirror::apply_put` exactly (JSON passthrough for
-  six kinds; `Counter`/`NodeIdAlloc` as a raw `u64`; `Keyspace`/`Merged`
+  six kinds; `Counter` as a raw `u64`; `Keyspace`/`Merged`
   presence-only, always `null`); a numeric kind's `id` renders as a decimal
   string, not a JSON number. Every `EntityKind` is browsable, including the
   internal/legacy ones — full transparency by design, see
@@ -589,21 +593,45 @@ route below the edge through the same `ClientCtx` CP primitives.
   See the full `control_ids`/`admin.control_ids` static-vs-live audit in the
   ADR 0037 PR4 PR description (every other read is a legitimate seed/
   bootstrap use, left static on purpose).
-- **Cluster-allocated member ids (ADR 0036)** live in a disjoint id range
-  (`animus_control::meta::ALLOC_ID_BASE = 1_000_000`, far above any small
-  `--node I` index) so an allocated id can never collide with an
-  operator-chosen one — see `MetaCommand::AllocateNodeId`'s doc in
-  `animus-control` for the allocator itself. **ADR 0040 PR1 simplification**:
-  since a node now has exactly one id (no more separate control/raftkv id
-  pair), an allocated join's id *is* its one identity, full stop — the old
-  `config::synthetic_control_id_for` (`raftkv_id | (1 << 63)`, a *local,
-  non-replicated* placeholder control id derived from the freshly minted
-  raftkv id, since there was no small operator index to derive one from
-  otherwise) is gone; the discovered `original_control_ids` set simply
-  doesn't contain the new id, which is what makes it a structurally-safe
-  permanent non-voter now. `is_relayable_command` (below) must allow
-  `AllocateNodeId` — a joining process has no local control role at all yet,
-  so it is that process's *only* way to reach the real leader.
+- **Self-minted member ids (ADR 0040 Decision B/C, PR4) replace ADR 0036's
+  monotonic allocator entirely** — `AllocateNodeId`, `ALLOC_ID_BASE`, the
+  `next_alloc_id`/`node_id_allocations` ledger, `syskv::EntityKind::
+  NodeIdAlloc`, `generate_join_nonce`, and `check_join_collision` are all
+  **deleted**. A joining node self-mints (`NodeId::mint`, 22-char base64url
+  off `animus_env::prod::PreBindRng` at the pre-bind CLI boundary — the
+  narrow, reusable replacement for `generate_join_nonce`'s old bespoke
+  OS-randomness exception) or proposes an explicit `--id`, then claims it
+  via `MetaCommand::RegisterNode`'s registration CAS
+  (`register_node_over_wire`/`claim_join_identity` in `lib.rs`, reached over
+  the same `ClientRequest::ProposeSchema`/`Status` wire primitives every
+  other join round trip already uses — no new wire type needed) **before
+  ever binding a listener**: a minted collision (astronomically unlikely)
+  re-mints and retries; a proposed-id collision fails loudly
+  (`AlreadyExists`, naming the conflict). `is_relayable_command` (below) must
+  allow `RegisterNode` — a joining process has no local control role at all
+  yet, so relaying it is that process's *only* way to reach the real leader.
+  **ADR 0040 PR1 simplification carries forward unchanged**: since a node
+  has exactly one id (no more separate control/raftkv id pair), a
+  self-minted join's id *is* its one identity, full stop — the discovered
+  `original_control_ids` set simply doesn't contain it, which is what makes
+  it a structurally-safe permanent non-voter.
+  **`MetaCommand::RegisterNode` is also the *sole* self-registration
+  mechanism now** — `spawn_common_tail`'s one-shot startup task (every node
+  shape: a fresh bootstrap node, a growth node, or a permanently-non-voter
+  control-only growth node with no other claim path at all) proposes it
+  instead of the old address-only `RegisterNodeAddrs`, which is now
+  **update-only** (rejects an id absent from both `members` and
+  `node_addrs` — nothing to update yet). `RegisterNode`'s own CAS is keyed
+  on `node_addrs` alone (not `members`/`labels` — see its doc in
+  `animus-control` for why an equality check on those would race
+  destructively against `UpsertMember`'s bootstrap insert or
+  `admin_add_member`'s operator-labeled row) and **never claims a `members`
+  row for a control-only registration** (`NodeAddrs.role == "control"`) — a
+  control-only node has no `raftkv` role or storage engine and can never
+  host a tablet, so appearing in `members` at all would make it a placement
+  candidate and silently corrupt tablet placement the moment it's picked
+  (caught by `tests/control_only.rs` going bimodal during this PR — see
+  `docs/engineering-lessons.md`).
 - **Control-plane membership change (ADR 0037 PR3)**: `ClientCtx::
   admin_add_control_member`/`admin_remove_control_member` (`lib.rs`, near
   `admin_add_member`/`admin_remove_member`) grow/shrink the control group's
@@ -614,9 +642,11 @@ route below the edge through the same `ClientCtx` CP primitives.
   in-process handle can call it). `POST /admin/control/member/{add,remove}` +
   `GET /admin/control/members` in `admin.rs`; `animus admin
   control-{add,remove,grow}` in `animus-cli`. Add takes an **operator-
-  supplied** id below `animus_control::meta::ALLOC_ID_BASE` (the ADR 0036
-  allocator is not wired into this path — a stopgap, flagged as future work)
-  and the new voter's **internal control-Raft** address (distinct from its
+  supplied** id (originally: below `animus_control::meta::ALLOC_ID_BASE`, a
+  numeric range that no longer exists — see the later "Update" notes below
+  for the self-minted omitted-`node` form and ADR 0040 PR4's full retirement
+  of that range) and the new voter's **internal control-Raft** address
+  (distinct from its
   admin/client/raftkv ports — `animus admin control-add` resolves it from the
   new node's own `/admin/config` so the operator only ever deals in admin
   addresses). **The PR3 known scope limit is closed (ADR 0037 PR4)**: PR3
@@ -693,41 +723,49 @@ route below the edge through the same `ClientCtx` CP primitives.
   silent success) rather than trying to complete the removal itself once it
   has stepped down.
 
-  **Update (ADR 0037 hardening trio's PR3): the ADR 0036 allocator is now
-  wired into `control-add`**, closing the "Coordination with ADR 0036"
-  deferral above. `AddControlMemberReq.node` (`admin.rs`) is now
-  `Option<NodeId>` (`#[serde(default)]`); `admin_add_control_member`'s
-  signature is now `(node: Option<NodeId>, addr, labels) -> Result<NodeId,
-  String>` — `Some(id)` is byte-for-byte the old behavior (all three
-  refusals, including "at/above `ALLOC_ID_BASE`," still apply — an
-  operator-supplied id can never target the allocated range, full stop);
-  `None` draws a fresh nonce from `leader.env().next_u64()` (**not**
-  `generate_join_nonce`'s deliberate OS-randomness exception — this method
-  runs in-process on a live leader a `SimEnv` test can and does drive, so the
-  `Env`-seam rule applies here with no exception to invoke), mints via the
-  same private `allocate_node_id` helper the wire-level join path already
-  uses, then proceeds through the identical address-registration +
-  `change_membership` tail with the member-collision and `ALLOC_ID_BASE`
-  checks **skipped** for the minted id (they would reject the allocator's own
-  output — `AllocateNodeId`'s apply already inserted the `Down` `Member` row
-  as part of minting). The response's `"node"` is the effective id either
-  way. CLI: `control-add` disambiguates by **arity** (locked decision, no
-  `--auto` flag) — `control-add <leader-admin-addr> <new-node-admin-addr>`
-  (2 args, allocator-minted, `run_control_add_allocated`) alongside the
-  unchanged `control-add <leader-admin-addr> <node-id> <new-node-admin-addr>`
-  (3 args, operator-supplied, `run_control_add`) — see
-  `animus-cli/CLAUDE.md`'s own entry for why the 2-arg form's single
-  positional is a raw control-Raft address, not an admin address to resolve.
-  Regression: `tests/control_membership_admin.rs::
+  **Update (ADR 0037 hardening trio's PR3, re-based onto ADR 0040 Decision
+  B/C in PR4): `control-add`'s omitted-`node` form now self-mints instead of
+  drawing from an allocator**, closing the original "Coordination with ADR
+  0036" deferral for good (the allocator it once wired in is deleted).
+  `AddControlMemberReq.node` (`admin.rs`) is `Option<NodeId>`
+  (`#[serde(default)]`); `admin_add_control_member`'s signature is `(node:
+  Option<NodeId>, addr, labels) -> Result<NodeId, String>` — `Some(id)` is
+  re-validated via `NodeId::propose` (the old "at/above `ALLOC_ID_BASE`"
+  refusal is **deleted**, no ranges exist anymore); `None` mints via
+  `NodeId::mint(leader.env())` (**not** `animus_env::prod::PreBindRng`'s
+  pre-bind exception — this method runs in-process on a live leader a
+  `SimEnv` test can and does drive, so the `Env`-seam rule applies here with
+  no exception to invoke), re-minting up to `MAX_MINT_ATTEMPTS` times on a
+  (practically unreachable) collision. Either way, if `node` isn't already a
+  live voter: an **existing member** (already self-registered, e.g. a
+  combined node being promoted) just gets its `internal` address updated
+  (`RegisterNodeAddrs`, merged into whatever address book it already
+  published — never blindly replaced with an empty one, which would look
+  like a collision to a *different* node's earlier self-registration); an
+  **unclaimed** id goes through `register_node`'s `RegisterNode` CAS — the
+  old "already exists as a cluster member" refusal is **deleted** too
+  (promoting an existing data-plane member to a control voter is the common
+  case now, not a conflict — ADR 0040 PR1 already unified the id space, so
+  there is no separate control-id range left to collide with). The
+  response's `"node"` is the effective id either way. CLI: `control-add`
+  disambiguates by **arity** (locked decision, no `--auto` flag) —
+  `control-add <leader-admin-addr> <new-node-admin-addr>` (2 args,
+  self-minted, `run_control_add_allocated`) alongside the unchanged
+  `control-add <leader-admin-addr> <node-id> <new-node-admin-addr>` (3 args,
+  operator-supplied, `run_control_add`) — see `animus-cli/CLAUDE.md`'s own
+  entry for why the 2-arg form's single positional is a raw control-Raft
+  address, not an admin address to resolve. Regression:
+  `tests/control_membership_admin.rs::
   omitted_node_add_mints_an_id_and_converges_to_a_live_voter` +
   `concurrent_omitted_node_adds_mint_distinct_ids_and_both_become_voters` (two
-  concurrent omitted-node adds each mint without colliding — the allocator
-  itself is not the contended resource — but their `change_membership` calls
+  concurrent omitted-node adds each mint without colliding — a 128-bit mint
+  colliding is astronomically unlikely, and the registration CAS would catch
+  it structurally even if it happened — but their `change_membership` calls
   race like any other pair; the loser's own minted id is left as an
-  orphaned/abandoned `Down` member, accepted ADR 0036 semantics, while a
+  orphaned/abandoned `Down` member, accepted ADR 0040 semantics, while a
   retried omitted-node call mints a second, distinct id that becomes a
-  voter) + `add_control_member_collision_shapes`'s third case (manual
-  targeting of the allocated range still refused).
+  voter) + `add_control_member_collision_shapes` (an id that already names an
+  existing data-plane member now *succeeds*, promotion not a conflict).
 - **The CP group is durable by default** — one shared `LsmEngine` over the raftkv
   env, cloned into every tablet's `RaftKvNode`; acked writes survive restart. Files
   use a flat filename prefix (`LSM_PREFIX = "db-"`), not a subdirectory (`ProdEnv`'s
@@ -790,13 +828,24 @@ Test-file map (`tests/`):
 - `split_cluster.rs` — genuine multi-process split deployment scenarios: control
   failover, split+merge, failure repair, decommission, full restart (PR6).
 - `cluster_growth.rs` — 3→5 online growth without restarting the original 3.
-- `seed_join.rs` — combined-mode seed/join (happy/collision/rejoin).
+- `seed_join.rs` — combined-mode seed/join with an explicit `--id` (happy/
+  collision/rejoin — the collision case now asserts `AlreadyExists` from
+  `claim_join_identity`'s loud proposed-id-collision failure, ADR 0040 PR4).
+- `seed_join_allocated.rs` (ADR 0040 PR4, superseding the ADR 0036 name/
+  contents) — the self-minted-id counterpart: happy path, two concurrent
+  minted joins get distinct ids (both become `Active`), the data-only dual,
+  the ephemeral-identity restart semantics (a fresh join after the old
+  process goes away mints a *new* id; the old one settles `Down` and is
+  prunable via `RemoveMember` — the crash-mid-join orphan shape), and the
+  `is_relayable_command` regression for `RegisterNode` through a
+  follower-connected seed.
 - `decommission.rs` — full drain → remove flow + refusal shapes.
 - `control_membership_admin.rs` — control-plane membership-change admin API
   (ADR 0037 PR3): grow a control voter end to end (quiet non-voter →
   `POST /admin/control/member/add` → converges everywhere incl. a data-only
-  node's `Remote` mirror); add collision refusals (existing voter is
-  idempotent, existing member/`ALLOC_ID_BASE` are refused); remove's full
+  node's `Remote` mirror); add collision shapes (existing voter is
+  idempotent; existing data-plane member now *succeeds*, a promotion, ADR
+  0040 PR4); remove's full
   refusal/warning matrix (idempotent unknown-node no-op, non-leader voter
   removes cleanly, leader self-removal arms a transfer and refuses rather
   than silently completing, down-to-1-voter warns, down-to-0 is refused);
@@ -858,8 +907,10 @@ Test-file map (`tests/`):
   /admin/system-table` end to end: seeds every `EntityKind` via the client
   protocol (a plain `Put` auto-provisions a `Tablet`+bumps its `Counter`,
   `ProposeSchema` reaches `Schema`/`Policy`/`Keyspace`/the legacy
-  `CpMemberAddr`, a real split+merge produces a `Merged` marker,
-  `AllocateNodeId` produces `NodeIdAlloc`) and asserts every kind's exact
+  `CpMemberAddr`, a real split+merge produces a `Merged` marker; `Member`/
+  `NodeAddrs` come from the bootstrapped node's own self-registration — ADR
+  0040 PR4 retired the ADR 0036 allocator's dedicated `NodeIdAlloc` kind
+  along with the allocator itself) and asserts every kind's exact
   value shape, the `kind` filter, and an unrecognized-kind 400; a separate
   test seeds many `tablet` rows and diffs a small-`limit` forward-only
   pager walk against one unlimited scan for gaplessness/no-duplicates.
