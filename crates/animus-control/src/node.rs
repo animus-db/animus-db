@@ -2,7 +2,7 @@
 //! ferries time and messages between the network and the synchronous
 //! [`RaftCore`].
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -103,6 +103,27 @@ pub const CONTROL_PEER_LIVENESS_TIMEOUT: Duration = Duration::from_millis(500);
 /// suppressed — a heartbeat is positive evidence, with no false-positive risk —
 /// and the gate is purely `Env`-time based, so it stays deterministic.
 const LEADER_GRACE: Duration = DETECT_TIMEOUT;
+
+/// How often the leader re-evaluates orphan-member sweep eligibility (ADR
+/// 0040 PR6) — deliberately coarser than [`DETECT_INTERVAL`]/
+/// [`RECONCILE_INTERVAL`]: [`DEFAULT_ORPHAN_SWEEP_AFTER`] and any operator
+/// override are minutes-scale grace windows, so there is no benefit to
+/// checking every 100-500ms the way liveness/placement do, and a coarser tick
+/// means [`orphan_sweep_loop`] clones the placement-relevant `Metadata` view
+/// far less often.
+const ORPHAN_SWEEP_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Default grace period a sweep-eligible claim (ADR 0040 PR6 — a
+/// `node_addrs` entry, with or without a `members` row, that has never
+/// activated) must persist, continuously observed by **this leadership
+/// stint's own** volatile timer, before the leader proposes
+/// [`MetaCommand::RemoveMember`] for it. Ten minutes comfortably exceeds any
+/// legitimate join latency (DNS/dial retries, a slow disk-backed engine open,
+/// a queued `change_membership`) while still being short enough that an
+/// abandoned claim doesn't linger indefinitely. Configurable per deployment
+/// (`animusd`'s config file / CLI flag); `Duration::ZERO` disables the sweep
+/// entirely — see [`orphan_sweep_loop`]'s doc.
+pub const DEFAULT_ORPHAN_SWEEP_AFTER: Duration = Duration::from_secs(600);
 
 /// Executor-agnostic "applied index advanced" notification (ADR 0031 §trigger):
 /// lets a caller (the future per-node `TabletHostReconciler`) react to a
@@ -305,13 +326,43 @@ impl<E: Env> RaftNode<E> {
     /// the "configurable" half of the ring's design; a test proving
     /// eviction/fallback behavior without pushing thousands of entries
     /// constructs a small-bounded [`DeltaRing::with_bounds`] and passes it
-    /// here.
+    /// here. Uses [`DEFAULT_ORPHAN_SWEEP_AFTER`] for the orphan-member sweep
+    /// (ADR 0040 PR6) — see
+    /// [`start_with_orphan_sweep_after`](Self::start_with_orphan_sweep_after)
+    /// for a caller that wants a different grace period (or `Duration::ZERO`
+    /// to disable the sweep outright).
     pub fn start_with_ring_bounds<S: StorageEngine + 'static>(
         env: E,
         all_nodes: Vec<NodeId>,
         metrics: MetricsHandle,
         engine: S,
         delta_ring: DeltaRing,
+    ) -> Self {
+        Self::start_with_orphan_sweep_after(
+            env,
+            all_nodes,
+            metrics,
+            engine,
+            delta_ring,
+            DEFAULT_ORPHAN_SWEEP_AFTER,
+        )
+    }
+
+    /// Like [`start_with_ring_bounds`](Self::start_with_ring_bounds), but
+    /// with an explicit `orphan_sweep_after` (ADR 0040 PR6) instead of
+    /// [`DEFAULT_ORPHAN_SWEEP_AFTER`] — the knob `animusd`'s config
+    /// file/CLI flag threads through. `Duration::ZERO` disables the sweep
+    /// entirely (no loop is even spawned): a sweep-eligible claim then lingers
+    /// until an operator prunes it manually via the existing
+    /// [`MetaCommand::RemoveMember`] path, exactly as it did before this PR.
+    #[allow(clippy::too_many_arguments)] // the most general constructor; every other `start_*` is a thin default-filling wrapper over this one
+    pub fn start_with_orphan_sweep_after<S: StorageEngine + 'static>(
+        env: E,
+        all_nodes: Vec<NodeId>,
+        metrics: MetricsHandle,
+        engine: S,
+        delta_ring: DeltaRing,
+        orphan_sweep_after: Duration,
     ) -> Self {
         let core = Arc::new(Mutex::new(RaftCore::new(
             env.node_id(),
@@ -360,7 +411,27 @@ impl<E: Env> RaftNode<E> {
         // The failure detector evaluates member liveness on a timer and, when
         // leader, proposes `UpsertMember` transitions (ADR 0012). Like the
         // reconciler it only *proposes*, so it is safe to run on every node.
-        env.spawn_task(detect_loop(env.clone(), core, cache, detector, metrics));
+        env.spawn_task(detect_loop(
+            env.clone(),
+            Arc::clone(&core),
+            Arc::clone(&cache),
+            detector,
+            metrics.clone(),
+        ));
+        // The orphan-member sweep (ADR 0040 PR6): same "only proposes, safe
+        // on every node, only acts when leader" shape as the two loops
+        // above. `Duration::ZERO` means "disabled" — skip spawning the loop
+        // entirely rather than spawning one that would immediately sweep
+        // every candidate on its first tick.
+        if !orphan_sweep_after.is_zero() {
+            env.spawn_task(orphan_sweep_loop(
+                env.clone(),
+                core,
+                cache,
+                orphan_sweep_after,
+                metrics,
+            ));
+        }
         node
     }
 
@@ -1412,6 +1483,120 @@ fn transition(node: NodeId, member: &Member, status: NodeStatus) -> MetaCommand 
     }
 }
 
+/// The leader's orphan-member sweep (ADR 0040 PR6): on a slow timer, if this
+/// node is leader, auto-reclaim a node-identity claim
+/// ([`Metadata::orphan_sweep_candidates`]) that has never activated and has
+/// persisted, continuously, for at least `orphan_sweep_after` — proposing the
+/// existing [`MetaCommand::RemoveMember`] for it, exactly as an operator
+/// pruning it by hand would.
+///
+/// **Same template as [`detect_loop`] (ADR 0012's own doc calls this out as
+/// its own precedent)**: the *decision* — which claims are candidates at all
+/// — is the pure [`Metadata::orphan_sweep_candidates`]; this driver supplies
+/// only timing (over the `Env` seam, never a wall clock) and the propose. Two
+/// differences from `detect_loop`'s shape, both load-bearing:
+///
+/// - **The countdown lives here, not in `Metadata`.** A candidate's
+///   first-observed instant is tracked in a **volatile**, per-leadership-stint
+///   `BTreeMap<NodeId, Nanos>` (`first_seen`) — never replicated, mirroring
+///   `detect_loop`'s own `leader_since`/the [`FailureDetector`]'s volatile
+///   `last_seen` map. `Metadata` itself carries no wall-clock-derived state
+///   (ADR 0003) — only the `Down`/`has_activated` fields the *decision* reads,
+///   never a timestamp the *timing* would need to agree on across replicas.
+///   A leadership change (or this leader losing and regaining leadership)
+///   resets `first_seen` to empty — **acceptable, not a bug**: the sweep is
+///   convergent (a genuinely still-eligible claim just starts its countdown
+///   over under the new leader), only ever delayed, never skipped outright,
+///   and a real activation in the meantime cancels it structurally (see
+///   below) regardless of how many times the countdown restarts.
+/// - **The control-voter exclusion is this loop's own responsibility, not
+///   `Metadata::orphan_sweep_candidates`'s.** `RaftCore`'s live voter
+///   config (`core.config()`) is a wholly different part of the system from
+///   `Metadata` — a claim that is currently a live control voter (added via
+///   `admin_add_control_member`, independent of whether its own `members`
+///   row, if any, ever reached `Active`) must never be proposed for removal,
+///   so every tick intersects the pure candidate set against `!voters.contains(..)`
+///   before even starting (or continuing) a claim's countdown.
+///
+/// **Safety argument for the sweep racing a genuine late activation** (the
+/// catastrophic case this mechanism must never get wrong): this loop computes
+/// eligibility from a **snapshot** that can be stale by the time its
+/// `RemoveMember` proposal actually applies — a real activation
+/// (`liveness_transitions`'s `Down`→`Active` promotion, `detect_loop`) can
+/// commit first, in between. This is safe **not** because of anything in this
+/// loop, but because [`MetaCommand::RemoveMember`]'s own apply-time guard
+/// (unchanged by this PR) re-checks the member's status **at apply time**,
+/// against whatever the log already committed ahead of it: `Active`/`Joining`
+/// is rejected outright. So regardless of which order the two proposals are
+/// appended in, an already-`Active` member is never actually removed — the
+/// reverse interleaving (removal commits, then a stray late `UpsertMember`
+/// tries to resurrect it) cannot happen either, since `liveness_transitions`
+/// only ever proposes a transition for a member it finds present in the
+/// **same tick's own fresh read** of `Metadata` — once a member is gone, nothing
+/// proposes bringing it back except a fresh, independent
+/// [`MetaCommand::RegisterNode`] claim (a new registration, not a
+/// resurrection of the old one).
+async fn orphan_sweep_loop<E: Env>(
+    env: E,
+    core: Arc<Mutex<RaftCore>>,
+    cache: Arc<Mutex<Metadata>>,
+    orphan_sweep_after: Duration,
+    metrics: MetricsHandle,
+) {
+    // Per-leadership-stint volatile state: when this stint first observed
+    // each currently-eligible claim. Reset wholesale on any leadership/term
+    // change (see this fn's own doc).
+    let mut leader_since_term: Option<u64> = None;
+    let mut first_seen: BTreeMap<NodeId, animus_env::Nanos> = BTreeMap::new();
+    loop {
+        env.sleep(ORPHAN_SWEEP_CHECK_INTERVAL).await;
+        let now = env.now();
+        let (term_now, voters) = {
+            let core = core.lock().expect("raft core poisoned");
+            if !core.is_leader() {
+                leader_since_term = None;
+                first_seen.clear();
+                continue;
+            }
+            (core.term(), core.config())
+        };
+        if leader_since_term != Some(term_now) {
+            leader_since_term = Some(term_now);
+            first_seen.clear();
+        }
+        let candidates: BTreeSet<NodeId> = {
+            let meta = cache.lock().expect("cache poisoned");
+            meta.orphan_sweep_candidates()
+                .into_iter()
+                .filter(|id| !voters.contains(id))
+                .collect()
+        };
+        // Anything no longer a candidate (activated, became a control voter,
+        // got tablet-referenced, or was already removed by some other path)
+        // stops counting down — its countdown, if any, is simply forgotten,
+        // never resumed from where it left off if it becomes eligible again
+        // later (a fresh claim's own countdown, same as a brand-new one).
+        first_seen.retain(|id, _| candidates.contains(id));
+        for id in &candidates {
+            first_seen.entry(id.clone()).or_insert(now);
+        }
+        for id in &candidates {
+            let since = first_seen[id];
+            if now.duration_since(since) >= orphan_sweep_after {
+                metrics.incr(Metric::OrphanMembersSwept);
+                tracing::info!(
+                    node = %id,
+                    grace_period_secs = orphan_sweep_after.as_secs(),
+                    "orphan-member sweep: proposing removal of a never-activated claim"
+                );
+                core.lock()
+                    .expect("raft core poisoned")
+                    .propose(MetaCommand::RemoveMember { node: id.clone() });
+            }
+        }
+    }
+}
+
 /// Append and `fsync` any pending durable-state records to the WAL, then advance
 /// the core's durable watermark so the now-on-disk entries become client-visible
 /// (durable-before-visible, ADR 0009). Returns how many records were written.
@@ -1469,6 +1654,7 @@ mod tests {
             Member {
                 labels: BTreeMap::new(),
                 status,
+                has_activated: status == NodeStatus::Active,
             },
         );
         m
@@ -1520,6 +1706,30 @@ mod tests {
                 ..
             } if *node == nid(7)
         ));
+    }
+
+    /// **ADR 0040 PR6 safety argument, "no resurrection" half.** Once a
+    /// member has been removed from `Metadata.members` (by the orphan sweep
+    /// or an ordinary decommission alike), `liveness_transitions` — the
+    /// **only** production caller that ever proposes an `UpsertMember{Active}`
+    /// promotion — never proposes one for it, even if the detector still
+    /// privately tracks it as alive (a stray heartbeat that arrived after
+    /// removal). This is what makes a stray in-flight promotion structurally
+    /// incapable of resurrecting an already-removed claim: the decision
+    /// function is filtered by presence in the **same fresh `Metadata` read**
+    /// it is computed from, every tick, not by some snapshot a proposer took
+    /// once and might replay stale.
+    #[test]
+    fn liveness_transitions_never_proposes_for_an_absent_member() {
+        let empty: BTreeMap<NodeId, Member> = BTreeMap::new();
+        // The detector believes `nid(301)` alive (a heartbeat arrived), but
+        // `Metadata` no longer has a `members` row for it at all.
+        let det = detector_silent_since(nid(301), Nanos(1_000));
+        let now = Nanos(1_000);
+        assert!(
+            liveness_transitions(&empty, &det, now, true).is_empty(),
+            "must never propose a transition for a member `Metadata` doesn't have"
+        );
     }
 
     /// ADR 0032 PR3: a member `RemoveMember` has already pruned from

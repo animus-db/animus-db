@@ -202,12 +202,31 @@ pub enum Metric {
     /// was rejected (not leader, an in-flight change, a multi-server delta, or
     /// a leader self-removal).
     ControlReconfigureRejected,
+
+    // --- Orphan-member sweep (ADR 0040 PR6) ---
+    // Appended after the control-group-membership-change variants; every
+    // earlier variant's slot and the text-export order stay stable, so the
+    // snapshot remains byte-reproducible. Recorded by
+    // `animus_control::node`'s `orphan_sweep_loop` at the one site that knows
+    // the real outcome — a `RemoveMember` actually *proposed* for a
+    // never-activated claim once its volatile leader-side timer exceeds
+    // `orphan_sweep_after` (never on every tick, and never for a claim the
+    // leader is merely still watching).
+    /// The leader proposed `RemoveMember` for a claim (a `node_addrs` entry,
+    /// with or without a `members` row) its own volatile timer judged
+    /// sweep-eligible for at least `orphan_sweep_after` — never-activated,
+    /// not a control voter, not referenced by any tablet, not
+    /// decommissioning. Counts the *proposal*, not a confirmed commit (the
+    /// existing `RemoveMember` apply-time guard is the safety net — a
+    /// genuine late activation racing the proposal still shows up here even
+    /// if the proposal itself is rejected at apply).
+    OrphanMembersSwept,
 }
 
 impl Metric {
     /// Every metric, in a fixed order. The array index of a metric in `ALL` is
     /// its slot in the [`MetricSink`]; keep this in sync with the enum.
-    pub const ALL: [Metric; 43] = [
+    pub const ALL: [Metric; 44] = [
         Metric::ElectionsStarted,
         Metric::ElectionsWon,
         Metric::AppendEntriesSent,
@@ -251,6 +270,7 @@ impl Metric {
         Metric::CpReconfigureRejected,
         Metric::ControlReconfigureAccepted,
         Metric::ControlReconfigureRejected,
+        Metric::OrphanMembersSwept,
     ];
 
     /// The stable exported name of this metric (snake_case, used as the text
@@ -301,6 +321,7 @@ impl Metric {
             Metric::CpReconfigureRejected => "cp_reconfigure_rejected",
             Metric::ControlReconfigureAccepted => "control_reconfigure_accepted",
             Metric::ControlReconfigureRejected => "control_reconfigure_rejected",
+            Metric::OrphanMembersSwept => "control_orphan_members_swept",
         }
     }
 

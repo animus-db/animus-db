@@ -81,6 +81,14 @@ per-tablet CP data plane (`animus-cp-data`).
     already (idempotent), `Leaving`/`Down` (never `Active`/`Joining`), and
     unreferenced by any tablet (`Metadata::tablets_referencing`, also the
     drain-complete predicate `/admin/member/drain-status` reports).
+    **ADR 0040 PR6 extension**: when `node` has no `members` row at all, this
+    no longer treats it as a bare no-op — it prunes an orphaned
+    **claim-without-member** `node_addrs` entry too (the shape a
+    control-role `RegisterNode` produces, by design), so this command is a
+    complete removal for every claim shape `RegisterNode` can leave behind,
+    not just the data-plane one. This is what the orphan-member sweep
+    (below) proposes once a claim has gone unactivated past
+    `orphan_sweep_after`.
   - `RegisterNode` (ADR 0040 Decision C, PR4) — the **sole claim path** for a
     fresh node identity, retiring ADR 0036's `AllocateNodeId` monotonic
     allocator entirely (and the one-PR `alloc_node_id`/`parse_alloc_id`/
@@ -103,6 +111,32 @@ per-tablet CP data plane (`animus-cp-data`).
     `animusd` do) — and `docs/engineering-lessons.md`'s entry for the
     integration-test failure that caught the naive design.
 
+  `Member.has_activated: bool` (ADR 0040 PR6, `#[serde(default)]`) is
+  **sticky**: `Metadata::apply`'s `UpsertMember` arm sets it the moment a
+  member's status is *ever* recorded `Active` — by any caller, the ADR 0012
+  detector's `Down`→`Active` promotion or `bootstrap`'s direct `Active`
+  insert alike — and never clears it again, regardless of any later
+  transition. Deliberately **not** scoped to "only the detector's own
+  promotion": a bootstrap-declared member starts `Active` directly, never
+  passing through `Down`→`Active` at all, so a narrower rule would leave a
+  founding member's `has_activated` permanently `false` — indistinguishable
+  from a genuine orphan the instant it later legitimately crashes. This is
+  the field the orphan-member sweep (`node.rs`, below) keys on to
+  distinguish "never showed up" from "was alive, currently down."
+  `Metadata::orphan_sweep_candidates() -> BTreeSet<NodeId>` is the pure
+  candidate-set predicate the sweep's driver loop calls every tick: the
+  **union** of `members`' and `node_addrs`' keys (a claim can exist in
+  either, or both — `admin_add_member`'s bare `UpsertMember{Down}` growth
+  registration claims only `members`; a control-role `RegisterNode` claims
+  only `node_addrs`), filtered to `status == Down && !has_activated &&
+  tablets_referencing == 0` for a `members` row, or unconditionally
+  eligible for a claim-without-member id (its only remaining safety gate —
+  "is this currently a live control voter" — is the driver's job, since
+  `RaftCore`'s voter config lives nowhere in `Metadata`). A candidate set,
+  never a removal decision on its own — the driver still requires
+  persistence across `orphan_sweep_after` and the voter exclusion before
+  proposing anything.
+
 - **`raft.rs`** — `RaftCore<C, S>`: the synchronous, I/O-free Raft state
   machine, **generic over its command `C` and applied state-machine `S`**
   (defaults `MetaCommand` / `Metadata`, so existing references are unchanged).
@@ -117,7 +151,8 @@ per-tablet CP data plane (`animus-cp-data`).
 
 - **`node.rs`** — `RaftNode<E>`: the `Env` driver wrapping the core. Runs
   `reconcile_loop` (the leader's automatic placement reconciler + rebalancer),
-  `detect_loop` (the leader's failure detector, ADR 0012), and the
+  `detect_loop` (the leader's failure detector, ADR 0012), `orphan_sweep_loop`
+  (ADR 0040 PR6, below), and the
   `heartbeat_loop`/`send_heartbeat` helpers a member runs to heartbeat the
   control group. Records control-plane **metrics** (ADR 0015) via
   `record_outbound`/`record_transition`; `metrics()` exposes the handle and
@@ -635,6 +670,44 @@ per-tablet CP data plane (`animus-cp-data`).
   `ProdEnv`/TCP in `animusd/tests/self_heal.rs`). Detector state is per-node
   volatile; only transitions are replicated.
 
+- **Orphan-member auto-reclaim sweep (ADR 0040 PR6), same home and pattern as
+  the detector above.** `orphan_sweep_loop` is the leader's own volatile
+  timer for a class of `Metadata` claim the detector was never meant to
+  judge: a `RegisterNode`/`admin_add_member` claim whose node **never
+  showed up at all** (a crash-mid-join, or the losing racer of two
+  concurrent omitted-id `control-add`s) — as opposed to a real member
+  that's merely currently `Down`. On a coarse tick
+  (`ORPHAN_SWEEP_CHECK_INTERVAL`, 5s — minutes-scale grace periods don't
+  need liveness-detector cadence), the **leader** intersects
+  `Metadata::orphan_sweep_candidates()` against `!core.config().contains(id)`
+  (the live control-voter exclusion — `RaftCore`'s own config, which
+  `Metadata` cannot see) and tracks, in a **volatile**
+  `BTreeMap<NodeId, Nanos>` (`first_seen`, mirroring `detect_loop`'s own
+  `leader_since`), when *this leadership stint* first observed each
+  still-eligible candidate; once one has persisted for `orphan_sweep_after`
+  (config/CLI knob, default 10 minutes, `Duration::ZERO` disables the loop
+  outright — no loop is even spawned), it proposes the existing
+  `MetaCommand::RemoveMember` for it. A leadership change resets
+  `first_seen` wholesale — acceptable (convergent, just delayed: the new
+  leader's own countdown starts over) — and a real activation cancels a
+  countdown structurally (`has_activated` flips, so the next tick's
+  candidate set simply no longer contains it — no explicit cancellation
+  needed). **Safety argument for a sweep proposal racing a genuine late
+  activation** (the one property that must never fail): `RemoveMember`'s
+  own apply-time guard — unchanged, evaluated fresh against whatever
+  already committed ahead of it in the log — rejects `Active`/`Joining`
+  outright, so neither commit order ever removes an already-`Active`
+  member; and `liveness_transitions` (the sole production producer of a
+  promotion) only proposes one for a member present in that same tick's
+  fresh `Metadata` read, so a removed claim is never resurrected by a
+  stray late heartbeat either — both proven directly as pure
+  state-machine/decision-function properties in
+  `meta::tests::remove_member_never_removes_a_member_that_activated_first_
+  regardless_of_proposal_order` and
+  `node::tests::liveness_transitions_never_proposes_for_an_absent_member`,
+  not approximated through `SimEnv` timing. Full seeded fault-injection
+  suite: `tests/orphan_sweep.rs`.
+
 - **Replicated schema catalog (ADR 0013).** `Metadata.schemas` is mutated only by
   the `*TableSchema` commands, so it is Raft-replicated and recovered from the
   WAL/snapshot like all metadata (no `persist.rs`/`InstallSnapshot` change — the
@@ -801,6 +874,23 @@ heartbeats). The 25 binaries:
   proposer relays via the leader hint (the `is_relayable_command`
   regression); a *different* registration for an already-claimed id is
   rejected outright, never silently overwritten.
+- **`orphan_sweep.rs`** (ADR 0040 PR6) — the auto-reclaim sweep's full
+  seeded fault-injection suite, mirroring `failure_detection.rs`'s style
+  for its ADR-0012 sibling: crash-mid-join swept after
+  `orphan_sweep_after`; the losing racer of two concurrent omitted-id
+  `control-add`s swept while the winner (now a live control voter) is
+  protected; the control-role claim-without-member shape swept on its own;
+  its dual — a `members`-row-only claim with no `node_addrs` entry
+  (`admin_add_member`'s bare growth registration) — swept too; a
+  slow-but-legit joiner that activates before the grace period elapses
+  never swept; a member that was genuinely `Active` once and later went
+  `Down` never swept (`has_activated` guard); a leader failover
+  mid-countdown still converges, later, on the new leader's own timer; and
+  the sweep disabled (`Duration::ZERO`) keeps an orphan indefinitely. The
+  interleaving safety argument itself is proven separately, as a pure
+  state-machine/decision-function property (not timing-dependent), by
+  `meta.rs`'s and `node.rs`'s own in-crate unit tests — see this file's
+  `node.rs` entry above.
 - **`control_membership.rs`** — `RaftNode::change_membership`/
   `transfer_leadership` (ADR 0037 PR1): add/remove a voter and catch it up,
   reject a multi-server delta / leader self-removal / a second change while

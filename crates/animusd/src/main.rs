@@ -5,11 +5,11 @@
 //! ```text
 //! animusd gen-config --nodes N [--host H] [--base-port P]   # print a combined-mode cluster config (JSON)
 //! animusd gen-config --control-nodes N --data-nodes M [--host H] [--base-port P] # print a split-deployment config (ADR 0035)
-//! animusd --config FILE --node I [--dir DIR] [--ephemeral] # run node I of a cluster (one process)
-//! animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B] # run an N-node cluster in one process
-//! animusd --cluster-control N --cluster-data M [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B] # run a whole split deployment in one process (ADR 0035)
+//! animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] # run node I of a cluster (one process)
+//! animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B] [--orphan-sweep-after SECS] # run an N-node cluster in one process
+//! animusd --cluster-control N --cluster-data M [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B] [--orphan-sweep-after SECS] # run a whole split deployment in one process (ADR 0035)
 //! animusd join --seed ADDR[,ADDR...] [--id NAME] --base-port P [--dir D] [--ephemeral] # seed/join startup (ADR 0032 PR2; ADR 0040 PR4 self-minting if --id is omitted)
-//! animusd control --config FILE --node I [--dir DIR] [--ephemeral] # run node I as a control-only node (ADR 0035 PR3)
+//! animusd control --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] # run node I as a control-only node (ADR 0035 PR3)
 //! animusd data --config FILE --node I [--dir DIR] [--ephemeral] # run node I as a data-only node (ADR 0035 PR4)
 //! animusd data --seed ADDR[,ADDR...] [--id NAME] --base-port P [--dir D] [--ephemeral] # data-only seed/join (ADR 0035 PR5; ADR 0040 PR4 self-minting if --id is omitted)
 //! ```
@@ -60,10 +60,20 @@
 //! `animusd data` above. Each node still gets its own edge state and reaches
 //! every other node only through real forwarding/relay/mirror paths, exactly
 //! as the multi-process deployment does.
+//!
+//! `--orphan-sweep-after SECS` (ADR 0040 PR6) tunes the control-plane
+//! leader's own volatile auto-reclaim sweep of node-identity claims that
+//! never activated (a crash-mid-join, or the losing racer of two concurrent
+//! omitted-id registrations) — default 600s (10 minutes) if omitted, `0`
+//! disables it outright. Only meaningful on a mode that runs a local control
+//! `RaftNode` (every mode above except `data`, which has none); a plain
+//! `animusd data --config`/`--seed` has no orphan-sweep knob of its own since
+//! it never runs one.
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
 use std::process::ExitCode;
+use std::time::Duration;
 
 use animus_env::NodeId;
 use animusd::{ClusterConfig, RoleAddrs};
@@ -123,11 +133,11 @@ fn otel_instance_label(args: &[String]) -> String {
 const USAGE: &str = "usage:\n  \
     animusd gen-config --nodes N [--host H] [--base-port P]\n  \
     animusd gen-config --control-nodes N --data-nodes M [--host H] [--base-port P]\n  \
-    animusd --config FILE --node I [--dir DIR] [--ephemeral]\n  \
-    animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B]\n  \
-    animusd --cluster-control N --cluster-data M [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B]\n  \
+    animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS]\n  \
+    animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B] [--orphan-sweep-after SECS]\n  \
+    animusd --cluster-control N --cluster-data M [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B] [--orphan-sweep-after SECS]\n  \
     animusd join --seed ADDR[,ADDR...] [--id NAME] --base-port P [--ip A] [--dir D] [--ephemeral]\n  \
-    animusd control --config FILE --node I [--dir DIR] [--ephemeral]\n  \
+    animusd control --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS]\n  \
     animusd data --config FILE --node I [--dir DIR] [--ephemeral]\n  \
     animusd data --seed ADDR[,ADDR...] [--id NAME] --base-port P [--ip A] [--dir D] [--ephemeral]";
 
@@ -199,6 +209,12 @@ async fn run(args: &[String]) -> Result<(), String> {
     // scales with bytes, not key count). Either, both, or neither may be set;
     // when both are set, whichever threshold is hit first triggers.
     let mut auto_split_bytes: Option<u64> = None;
+    // `--orphan-sweep-after SECS` (ADR 0040 PR6): overrides
+    // `DEFAULT_ORPHAN_SWEEP_AFTER` (10 minutes) for the control-plane
+    // leader's auto-reclaim sweep of never-activated members; `0` disables
+    // it. Applies to every mode below that runs a local control `RaftNode`
+    // (`--config`/`--node`, `--cluster`, `--cluster-control`/`--cluster-data`).
+    let mut orphan_sweep_after: Option<u64> = None;
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -217,9 +233,13 @@ async fn run(args: &[String]) -> Result<(), String> {
             "--auto-split-bytes" => {
                 auto_split_bytes = Some(parse_next(&mut it, "--auto-split-bytes")?);
             }
+            "--orphan-sweep-after" => {
+                orphan_sweep_after = Some(parse_next(&mut it, "--orphan-sweep-after")?);
+            }
             other => return Err(format!("unknown argument `{other}`")),
         }
     }
+    let orphan_sweep_after = orphan_sweep_after_duration(orphan_sweep_after);
 
     if cluster_control.is_some() || cluster_data.is_some() {
         if config_path.is_some() || cluster.is_some() {
@@ -238,6 +258,7 @@ async fn run(args: &[String]) -> Result<(), String> {
             backend,
             auto_split,
             auto_split_bytes,
+            orphan_sweep_after,
         )
         .await;
     }
@@ -246,10 +267,19 @@ async fn run(args: &[String]) -> Result<(), String> {
         (Some(_), Some(_)) => Err("use either --config or --cluster, not both".into()),
         (Some(path), None) => {
             let index = node.ok_or("--config requires --node I")?;
-            run_single(&path, index, dir, backend).await
+            run_single(&path, index, dir, backend, orphan_sweep_after).await
         }
         (None, Some(n)) => {
-            run_in_process_cluster(n, ip, dir, backend, auto_split, auto_split_bytes).await
+            run_in_process_cluster(
+                n,
+                ip,
+                dir,
+                backend,
+                auto_split,
+                auto_split_bytes,
+                orphan_sweep_after,
+            )
+            .await
         }
         (None, None) => Err("nothing to do".into()),
     }
@@ -261,14 +291,21 @@ async fn run_single(
     index: usize,
     dir: Option<std::path::PathBuf>,
     backend: animusd::StorageBackend,
+    orphan_sweep_after: Duration,
 ) -> Result<(), String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("reading {path}: {e}"))?;
     let config = ClusterConfig::from_json(&text).map_err(|e| format!("parsing {path}: {e}"))?;
     let dir = dir.unwrap_or_else(|| std::env::temp_dir().join(format!("animusd-node-{index}")));
 
-    let node = animusd::run_node_with(&config, index, &dir, backend)
-        .await
-        .map_err(|e| format!("failed to start node {index}: {e}"))?;
+    let node = animusd::run_node_with_orphan_sweep_after(
+        &config,
+        index,
+        &dir,
+        backend,
+        orphan_sweep_after,
+    )
+    .await
+    .map_err(|e| format!("failed to start node {index}: {e}"))?;
     println!(
         "animusd: node {index}/{} up (CP) — client {} — dynamo http {} — cql {} — admin http://{}",
         config.len(),
@@ -292,6 +329,9 @@ async fn run_control(args: &[String]) -> Result<(), String> {
     let mut node: Option<usize> = None;
     let mut dir: Option<std::path::PathBuf> = None;
     let mut backend = animusd::StorageBackend::default();
+    // See `run`'s own `--orphan-sweep-after` doc (ADR 0040 PR6) — applies
+    // identically here since a control-only node runs a local `RaftNode` too.
+    let mut orphan_sweep_after: Option<u64> = None;
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -300,18 +340,28 @@ async fn run_control(args: &[String]) -> Result<(), String> {
             "--node" => node = Some(parse_next(&mut it, "--node")?),
             "--dir" => dir = Some(parse_next::<String>(&mut it, "--dir")?.into()),
             "--ephemeral" => backend = animusd::StorageBackend::Memory,
+            "--orphan-sweep-after" => {
+                orphan_sweep_after = Some(parse_next(&mut it, "--orphan-sweep-after")?);
+            }
             other => return Err(format!("unknown control argument `{other}`")),
         }
     }
+    let orphan_sweep_after = orphan_sweep_after_duration(orphan_sweep_after);
     let path = config_path.ok_or("control requires --config FILE")?;
     let index = node.ok_or("control requires --node I")?;
     let text = std::fs::read_to_string(&path).map_err(|e| format!("reading {path}: {e}"))?;
     let config = ClusterConfig::from_json(&text).map_err(|e| format!("parsing {path}: {e}"))?;
     let dir = dir.unwrap_or_else(|| std::env::temp_dir().join(format!("animusd-control-{index}")));
 
-    let node = animusd::run_node_control(&config, index, &dir, backend)
-        .await
-        .map_err(|e| format!("failed to start control node {index}: {e}"))?;
+    let node = animusd::run_node_control_with_orphan_sweep_after(
+        &config,
+        index,
+        &dir,
+        backend,
+        orphan_sweep_after,
+    )
+    .await
+    .map_err(|e| format!("failed to start control node {index}: {e}"))?;
     println!(
         "animusd: control node {index}/{} up — client {} — admin http://{}",
         config.len(),
@@ -576,6 +626,7 @@ async fn run_in_process_cluster(
     backend: animusd::StorageBackend,
     auto_split: Option<usize>,
     auto_split_bytes: Option<u64>,
+    orphan_sweep_after: Duration,
 ) -> Result<(), String> {
     if n == 0 {
         return Err("--cluster must be at least 1".into());
@@ -584,10 +635,15 @@ async fn run_in_process_cluster(
     let bound = animusd::bind_cluster(n, ip, &dir)
         .await
         .map_err(|e| format!("failed to bind cluster: {e}"))?;
-    let nodes =
-        animusd::start_cluster_with_auto_split_bytes(bound, backend, auto_split, auto_split_bytes)
-            .await
-            .map_err(|e| format!("failed to start cluster: {e}"))?;
+    let nodes = animusd::start_cluster_with_auto_split_bytes_and_orphan_sweep_after(
+        bound,
+        backend,
+        auto_split,
+        auto_split_bytes,
+        orphan_sweep_after,
+    )
+    .await
+    .map_err(|e| format!("failed to start cluster: {e}"))?;
 
     match (auto_split, auto_split_bytes) {
         (Some(k), Some(b)) => println!(
@@ -623,6 +679,7 @@ async fn run_in_process_cluster(
 /// `--cluster-control N --cluster-data M` dev-convenience sibling of
 /// `--cluster N` ([`run_in_process_cluster`]), backed by
 /// [`animusd::start_split_cluster_with`].
+#[allow(clippy::too_many_arguments)] // mirrors `start_split_cluster_with_orphan_sweep_after`'s own arity
 async fn run_in_process_split_cluster(
     control_n: usize,
     data_n: usize,
@@ -631,12 +688,13 @@ async fn run_in_process_split_cluster(
     backend: animusd::StorageBackend,
     auto_split: Option<usize>,
     auto_split_bytes: Option<u64>,
+    orphan_sweep_after: Duration,
 ) -> Result<(), String> {
     if control_n == 0 || data_n == 0 {
         return Err("--cluster-control and --cluster-data must each be at least 1".into());
     }
     let dir = dir.unwrap_or_else(|| std::env::temp_dir().join("animusd"));
-    let nodes = animusd::start_split_cluster_with(
+    let nodes = animusd::start_split_cluster_with_orphan_sweep_after(
         control_n,
         data_n,
         &dir,
@@ -644,6 +702,7 @@ async fn run_in_process_split_cluster(
         backend,
         auto_split,
         auto_split_bytes,
+        orphan_sweep_after,
     )
     .await
     .map_err(|e| format!("failed to start split cluster: {e}"))?;
@@ -700,4 +759,15 @@ fn parse_next<T: std::str::FromStr>(
     let raw = it.next().ok_or_else(|| format!("{flag} needs a value"))?;
     raw.parse()
         .map_err(|_| format!("invalid value for {flag}: `{raw}`"))
+}
+
+/// `--orphan-sweep-after SECS` (ADR 0040 PR6): `None` (the flag omitted) keeps
+/// `animus_control::node::DEFAULT_ORPHAN_SWEEP_AFTER` (10 minutes);
+/// `Some(0)` disables the sweep entirely, matching
+/// `RaftNode::start_with_orphan_sweep_after`'s own `Duration::ZERO` contract.
+fn orphan_sweep_after_duration(secs: Option<u64>) -> Duration {
+    secs.map_or(
+        animus_control::node::DEFAULT_ORPHAN_SWEEP_AFTER,
+        Duration::from_secs,
+    )
 }

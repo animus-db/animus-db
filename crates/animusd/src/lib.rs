@@ -52,7 +52,7 @@ mod topology;
 
 use control_handle::{ControlHandle, RemoteControlClient};
 
-use animus_control::node::{HEARTBEAT_INTERVAL, send_heartbeat};
+use animus_control::node::{DEFAULT_ORPHAN_SWEEP_AFTER, HEARTBEAT_INTERVAL, send_heartbeat};
 use animus_control::{PlacementPolicy, ProposeResult, RaftNode};
 use animus_cp_data::RaftKvNode;
 use animus_cp_data::host::{MetadataView, Reconciler};
@@ -1118,6 +1118,7 @@ impl BoundNode {
             None,
             None,
             vec![admin_addr],
+            DEFAULT_ORPHAN_SWEEP_AFTER,
         )
         .await
     }
@@ -1156,6 +1157,7 @@ impl BoundNode {
         auto_split_threshold: Option<usize>,
         auto_split_bytes_threshold: Option<u64>,
         cluster_admin_addrs: Vec<SocketAddr>,
+        orphan_sweep_after: Duration,
     ) -> std::io::Result<Node> {
         self.env.set_peers(peers.clone());
         // The initial (static) peer book + an env clone, kept for the
@@ -1266,18 +1268,25 @@ impl BoundNode {
         // (≥ 1, ADR 0026) on a separate clone below, so the two never collide
         // on the same inbox despite sharing one `NodeId`.
         let control_metrics = self.env.metrics();
+        // ADR 0040 PR6: `orphan_sweep_after` (config/CLI-knob, `Duration::ZERO`
+        // disables) is the same grace period the leader's own volatile
+        // orphan-member-sweep timer uses — see `animus_control::node`'s doc.
         let raft = match &storage {
-            SharedEngine::Lsm(lsm) => RaftNode::start_with_metrics(
+            SharedEngine::Lsm(lsm) => RaftNode::start_with_orphan_sweep_after(
                 self.env.clone(),
                 control_ids.clone(),
                 control_metrics,
                 lsm.clone(),
+                animus_control::DeltaRing::default(),
+                orphan_sweep_after,
             ),
-            SharedEngine::Mem(mem) => RaftNode::start_with_metrics(
+            SharedEngine::Mem(mem) => RaftNode::start_with_orphan_sweep_after(
                 self.env.clone(),
                 control_ids.clone(),
                 control_metrics,
                 mem.clone(),
+                animus_control::DeltaRing::default(),
+                orphan_sweep_after,
             ),
         };
         // Register this node's control handle in this **node's own**
@@ -1962,6 +1971,7 @@ impl BoundControlNode {
         client_route: BTreeMap<NodeId, SocketAddr>,
         cluster_admin_addrs: Vec<SocketAddr>,
         backend: StorageBackend,
+        orphan_sweep_after: Duration,
     ) -> std::io::Result<Node> {
         self.env.set_peers(peers.clone());
         let envs = vec![self.env.clone()];
@@ -2000,11 +2010,13 @@ impl BoundControlNode {
         let (raft, control_storage) = match backend {
             StorageBackend::Lsm => match LsmEngine::open(engine_env, SYSKV_LSM_PREFIX).await {
                 Ok(lsm) => (
-                    RaftNode::start_with_metrics(
+                    RaftNode::start_with_orphan_sweep_after(
                         self.env,
                         control_ids.clone(),
                         control_metrics,
                         lsm.clone(),
+                        animus_control::DeltaRing::default(),
+                        orphan_sweep_after,
                     ),
                     SharedEngine::Lsm(lsm),
                 ),
@@ -2017,11 +2029,13 @@ impl BoundControlNode {
             StorageBackend::Memory => {
                 let mem = MemoryEngine::new();
                 (
-                    RaftNode::start_with_metrics(
+                    RaftNode::start_with_orphan_sweep_after(
                         self.env,
                         control_ids.clone(),
                         control_metrics,
                         mem.clone(),
+                        animus_control::DeltaRing::default(),
+                        orphan_sweep_after,
                     ),
                     SharedEngine::Mem(mem),
                 )
@@ -6235,7 +6249,7 @@ pub async fn start_cluster_with(
     bound: Vec<BoundNode>,
     backend: StorageBackend,
 ) -> std::io::Result<Vec<Node>> {
-    start_cluster_inner(bound, backend, None, None).await
+    start_cluster_inner(bound, backend, None, None, DEFAULT_ORPHAN_SWEEP_AFTER).await
 }
 
 /// Like [`start_cluster`], but enables the **automatic split trigger** (Phase 2.4)
@@ -6249,7 +6263,14 @@ pub async fn start_cluster_auto_split(
     bound: Vec<BoundNode>,
     threshold: usize,
 ) -> std::io::Result<Vec<Node>> {
-    start_cluster_inner(bound, StorageBackend::default(), Some(threshold), None).await
+    start_cluster_inner(
+        bound,
+        StorageBackend::default(),
+        Some(threshold),
+        None,
+        DEFAULT_ORPHAN_SWEEP_AFTER,
+    )
+    .await
 }
 
 /// Like [`start_cluster_with`], but also enables the **automatic split trigger**
@@ -6263,7 +6284,7 @@ pub async fn start_cluster_with_auto_split(
     backend: StorageBackend,
     auto_split: Option<usize>,
 ) -> std::io::Result<Vec<Node>> {
-    start_cluster_inner(bound, backend, auto_split, None).await
+    start_cluster_inner(bound, backend, auto_split, None, DEFAULT_ORPHAN_SWEEP_AFTER).await
 }
 
 /// Like [`start_cluster_with_auto_split`], but also configures the **byte**
@@ -6280,7 +6301,39 @@ pub async fn start_cluster_with_auto_split_bytes(
     auto_split_keys: Option<usize>,
     auto_split_bytes: Option<u64>,
 ) -> std::io::Result<Vec<Node>> {
-    start_cluster_inner(bound, backend, auto_split_keys, auto_split_bytes).await
+    start_cluster_inner(
+        bound,
+        backend,
+        auto_split_keys,
+        auto_split_bytes,
+        DEFAULT_ORPHAN_SWEEP_AFTER,
+    )
+    .await
+}
+
+/// Like [`start_cluster_with_auto_split_bytes`], but also configures the
+/// **orphan-member sweep** grace period (ADR 0040 PR6, `animus_control::node`'s
+/// `orphan_sweep_after`) instead of [`DEFAULT_ORPHAN_SWEEP_AFTER`] —
+/// `Duration::ZERO` disables the sweep entirely. The knob `--cluster`'s
+/// `--orphan-sweep-after SECS` CLI flag threads through here.
+///
+/// # Errors
+/// Propagates a failure to open any node's CP group engine.
+pub async fn start_cluster_with_auto_split_bytes_and_orphan_sweep_after(
+    bound: Vec<BoundNode>,
+    backend: StorageBackend,
+    auto_split_keys: Option<usize>,
+    auto_split_bytes: Option<u64>,
+    orphan_sweep_after: Duration,
+) -> std::io::Result<Vec<Node>> {
+    start_cluster_inner(
+        bound,
+        backend,
+        auto_split_keys,
+        auto_split_bytes,
+        orphan_sweep_after,
+    )
+    .await
 }
 
 async fn start_cluster_inner(
@@ -6288,6 +6341,7 @@ async fn start_cluster_inner(
     backend: StorageBackend,
     auto_split_threshold: Option<usize>,
     auto_split_bytes_threshold: Option<u64>,
+    orphan_sweep_after: Duration,
 ) -> std::io::Result<Vec<Node>> {
     let n = bound.len();
     let control_ids: Vec<NodeId> = (0..n).map(config::node_id).collect();
@@ -6337,6 +6391,7 @@ async fn start_cluster_inner(
                 auto_split_threshold,
                 auto_split_bytes_threshold,
                 admin_addrs.clone(),
+                orphan_sweep_after,
             )
             .await?;
         nodes.push(node);
@@ -6380,6 +6435,38 @@ pub async fn start_split_cluster_with(
     backend: StorageBackend,
     auto_split_threshold: Option<usize>,
     auto_split_bytes_threshold: Option<u64>,
+) -> std::io::Result<Vec<Node>> {
+    start_split_cluster_with_orphan_sweep_after(
+        control_n,
+        data_n,
+        dir,
+        ip,
+        backend,
+        auto_split_threshold,
+        auto_split_bytes_threshold,
+        DEFAULT_ORPHAN_SWEEP_AFTER,
+    )
+    .await
+}
+
+/// Like [`start_split_cluster_with`], but also configures the
+/// **orphan-member sweep** grace period (ADR 0040 PR6) on every control-role
+/// node instead of [`DEFAULT_ORPHAN_SWEEP_AFTER`] — `Duration::ZERO` disables
+/// it entirely. The knob `--cluster-control`/`--cluster-data`'s
+/// `--orphan-sweep-after SECS` CLI flag threads through here.
+///
+/// # Errors
+/// As [`start_split_cluster_with`].
+#[allow(clippy::too_many_arguments)] // mirrors `start_split_cluster_with`'s own arity plus one knob
+pub async fn start_split_cluster_with_orphan_sweep_after(
+    control_n: usize,
+    data_n: usize,
+    dir: impl Into<PathBuf>,
+    ip: std::net::IpAddr,
+    backend: StorageBackend,
+    auto_split_threshold: Option<usize>,
+    auto_split_bytes_threshold: Option<u64>,
+    orphan_sweep_after: Duration,
 ) -> std::io::Result<Vec<Node>> {
     let dir = dir.into();
     let total = control_n + data_n;
@@ -6464,6 +6551,7 @@ pub async fn start_split_cluster_with(
                 client_route.clone(),
                 admin_addrs.clone(),
                 backend,
+                orphan_sweep_after,
             )
             .await?,
         );
@@ -6515,6 +6603,23 @@ pub async fn run_node_with(
     dir: impl Into<PathBuf>,
     backend: StorageBackend,
 ) -> std::io::Result<Node> {
+    run_node_with_orphan_sweep_after(config, index, dir, backend, DEFAULT_ORPHAN_SWEEP_AFTER).await
+}
+
+/// Like [`run_node_with`], but also configures the **orphan-member sweep**
+/// grace period (ADR 0040 PR6) instead of [`DEFAULT_ORPHAN_SWEEP_AFTER`] —
+/// `Duration::ZERO` disables it entirely. The knob `--config FILE --node I`'s
+/// `--orphan-sweep-after SECS` CLI flag threads through here.
+///
+/// # Errors
+/// As [`run_node_with`].
+pub async fn run_node_with_orphan_sweep_after(
+    config: &ClusterConfig,
+    index: usize,
+    dir: impl Into<PathBuf>,
+    backend: StorageBackend,
+    orphan_sweep_after: Duration,
+) -> std::io::Result<Node> {
     let addrs = config.nodes.get(index).cloned().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "node index out of range")
     })?;
@@ -6544,6 +6649,7 @@ pub async fn run_node_with(
             None,
             None,
             admin_addrs,
+            orphan_sweep_after,
         )
         .await
 }
@@ -6579,6 +6685,30 @@ pub async fn run_node_control(
     dir: impl Into<PathBuf>,
     backend: StorageBackend,
 ) -> std::io::Result<Node> {
+    run_node_control_with_orphan_sweep_after(
+        config,
+        index,
+        dir,
+        backend,
+        DEFAULT_ORPHAN_SWEEP_AFTER,
+    )
+    .await
+}
+
+/// Like [`run_node_control`], but also configures the **orphan-member sweep**
+/// grace period (ADR 0040 PR6) instead of [`DEFAULT_ORPHAN_SWEEP_AFTER`] —
+/// `Duration::ZERO` disables it entirely. The knob `animusd control`'s
+/// `--orphan-sweep-after SECS` CLI flag threads through here.
+///
+/// # Errors
+/// As [`run_node_control`].
+pub async fn run_node_control_with_orphan_sweep_after(
+    config: &ClusterConfig,
+    index: usize,
+    dir: impl Into<PathBuf>,
+    backend: StorageBackend,
+    orphan_sweep_after: Duration,
+) -> std::io::Result<Node> {
     let addrs = config.nodes.get(index).cloned().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "node index out of range")
     })?;
@@ -6610,6 +6740,7 @@ pub async fn run_node_control(
             client_route,
             admin_addrs,
             backend,
+            orphan_sweep_after,
         )
         .await
 }
@@ -6766,6 +6897,7 @@ pub async fn run_node_growth(
             None,
             None,
             admin_addrs,
+            DEFAULT_ORPHAN_SWEEP_AFTER,
         )
         .await
 }
@@ -6958,6 +7090,7 @@ async fn finish_combined_join(
             None,
             None,
             admin_addrs,
+            DEFAULT_ORPHAN_SWEEP_AFTER,
         )
         .await
 }

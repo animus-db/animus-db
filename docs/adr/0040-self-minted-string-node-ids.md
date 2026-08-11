@@ -1,20 +1,20 @@
 # ADR 0040 — Self-minted string node identities and registration-CAS membership
 
-- **Status:** Accepted — implemented (PR1–PR5; orphan sweep lands in PR6).
-  PR1 (Decision A, one identity per node), PR2 (the opaque `NodeId`
-  newtype), PR3 (Decision B in full — string representation, config `id`
-  fields, minting groundwork), PR4 (Decision C in full — the `RegisterNode`
-  registration CAS, retiring the ADR 0036 allocator — and the
-  join-path/`control-add` half of Decision D), and PR5 (this PR: the
-  amendment stanzas on every ADR this one touches, the CLAUDE.md/
-  engineering-lessons sweep, the vestigial `Coresident` deletion, and
-  dashboard id-truncation polish — see "Staged implementation" below for
-  what PR5 did and deliberately did *not* do) have all landed. Only PR6
-  (the orphan-member auto-reclaim sweep, ADR 0040 §10 of the delivery plan)
-  remains. Read the "Staged implementation" section for the couple of
-  places the shipped code diverged from this ADR's own narrative prose —
-  each is called out inline where it matters (Decision C's CAS key, in
-  particular).
+- **Status:** Accepted — implemented (PR1–PR6, complete). PR1 (Decision A,
+  one identity per node), PR2 (the opaque `NodeId` newtype), PR3 (Decision B
+  in full — string representation, config `id` fields, minting groundwork),
+  PR4 (Decision C in full — the `RegisterNode` registration CAS, retiring
+  the ADR 0036 allocator — and the join-path/`control-add` half of
+  Decision D), PR5 (the amendment stanzas on every ADR this one touches, the
+  CLAUDE.md/engineering-lessons sweep, the vestigial `Coresident` deletion,
+  and dashboard id-truncation polish), and **PR6 (this PR: the
+  orphan-member auto-reclaim sweep — `Member.has_activated`, the
+  control-plane leader's own volatile `orphan_sweep_after` timer, the
+  claim-without-member cleanup `MetaCommand::RemoveMember` gained, and the
+  config/CLI knob)** have all landed. Read the "Staged implementation"
+  section for the couple of places the shipped code diverged from this
+  ADR's own narrative prose — each is called out inline where it matters
+  (Decision C's CAS key, in particular).
 - **Date:** 2026-08-11
 
 ## Context
@@ -235,13 +235,50 @@ message was added or needed.
 - **The dashboard's `Object.keys(members).map(Number).sort(...)` idiom breaks
   outright** once ids are strings (PR3) — every such call site becomes a
   plain lexicographic sort; tablet-id sorts (still numeric) are unaffected.
-- **The operator-initiated Down-entry orphan class** (a registered-but-never-
-  activated member lingering forever) is explicitly *not* fixed by this PR —
-  it is the last PR of the stack (PR6): an auto-reclaim sweep on the
-  control-plane leader's own volatile timer, keyed on a new
-  `Member.has_activated` flag, proposing the existing `RemoveMember` after a
-  configurable TTL. Until PR6 ships, the bounded-but-operator-prunable stance
-  this ADR inherits from ADR 0036 remains the status quo.
+- **The operator-initiated Down-entry orphan class is now auto-reclaimed, not
+  merely bounded-and-operator-prunable (PR6, closing the stance this ADR
+  inherited from ADR 0036).** A registered-but-never-activated claim — a
+  crash-mid-join, or the losing racer of two concurrent omitted-id
+  `control-add`s — no longer lingers forever waiting for an operator to
+  notice it. `Member` gained a sticky `has_activated: bool` (set the moment
+  a member is ever recorded `Active`, by any caller — the ADR 0012
+  detector's `Down`→`Active` promotion or `bootstrap`'s direct `Active`
+  insert alike — never cleared again), which is exactly what distinguishes
+  "never showed up" (sweepable) from "was alive, currently down"
+  (repair/decommission territory, never sweepable). The control-plane
+  leader's own **volatile** timer (`animus_control::node::orphan_sweep_loop`,
+  the same home and pattern as the ADR 0012 failure detector — no
+  replicated wall clock, `Metadata::apply` stays a deterministic pure
+  function) tracks how long each sweep-eligible claim
+  (`Metadata::orphan_sweep_candidates`, itself pure) has persisted under
+  *this* leadership stint, excludes anything in the **live control-voter
+  set** (`RaftCore`'s own config — a fact `Metadata` cannot see, so this
+  exclusion is the driver's job, not the state machine's), and proposes the
+  existing `MetaCommand::RemoveMember` once `orphan_sweep_after` elapses
+  (default 10 minutes; `Duration::ZERO` disables the sweep entirely;
+  configurable via `animusd`'s config file/CLI flag). `RemoveMember` itself
+  gained one extension: it now also prunes the **claim-without-member**
+  shape (a `node_addrs` entry with no `members` row at all — exactly what a
+  control-role `RegisterNode` produces, since it never claims membership),
+  which it previously treated as an already-absent no-op, silently leaking
+  the address-book entry forever. Leadership change resets the volatile
+  timer (acceptable — convergent, just delayed: the new leader's own
+  countdown simply starts over). The safety argument for the catastrophic
+  case — a sweep proposal racing a genuine late activation must never
+  remove an already-`Active` member — is structural, not timing-dependent:
+  `RemoveMember`'s existing apply-time guard re-checks status fresh against
+  whatever already committed ahead of it in the log, rejecting
+  `Active`/`Joining` outright regardless of which order the two proposals
+  were computed in; and `liveness_transitions` (the sole production
+  producer of a promotion) only ever proposes one for a member it finds
+  present in that same tick's fresh `Metadata` read, so a removed claim is
+  never resurrected by a stray late heartbeat either. See
+  `crates/animus-control/CLAUDE.md`'s `node.rs`/`meta.rs` entries for the
+  mechanism and `crates/animus-control/tests/orphan_sweep.rs` for the full
+  seeded fault-injection suite (crash-mid-join, the losing-racer and
+  claim-without-member shapes, a slow-but-legit joiner activating in time,
+  a once-active member merely going `Down`, a leader failover mid-countdown
+  still converging, and the sweep disabled outright).
 
 ## Staged implementation
 
@@ -313,4 +350,8 @@ This is a 6-PR stack, each independently reviewable, stacked in this order:
      `docs/engineering-lessons.md` verified/extended; dashboard
      truncate-with-tooltip polish for 22-char minted ids (overview/
      placement/raft tables).
-6. **PR6** — the orphan-member auto-reclaim sweep described above.
+6. **PR6 (landed)** — the orphan-member auto-reclaim sweep described above:
+   `Member.has_activated`, `Metadata::orphan_sweep_candidates`, the
+   `RemoveMember` claim-without-member extension, the leader-side volatile
+   `orphan_sweep_loop` (`animus-control`), and the `orphan_sweep_after`
+   config-file/CLI knob (`animusd`).
