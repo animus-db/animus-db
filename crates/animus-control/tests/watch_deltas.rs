@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use animus_control::mirror::apply_key_write;
 use animus_control::{DeltaRing, MetaCommand, Metadata, NodeStatus, RaftNode, mirror};
-use animus_env::MetricsHandle;
+use animus_env::{MetricsHandle, nid};
 use animus_placement::PlacementPolicy;
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::MemoryEngine;
@@ -25,7 +25,7 @@ const NODES: [u64; 3] = [0, 1, 2];
 
 fn upsert(node: u64) -> MetaCommand {
     MetaCommand::UpsertMember {
-        node,
+        node: nid(node),
         labels: BTreeMap::new(),
         status: NodeStatus::Active,
     }
@@ -86,7 +86,13 @@ fn run_scenario(seed: u64) {
         let engines: Vec<MemoryEngine> = NODES.iter().map(|_| MemoryEngine::new()).collect();
         let nodes: Vec<RaftNode<SimEnv>> = NODES
             .iter()
-            .map(|&id| RaftNode::start(sim.env(id), NODES.to_vec(), engines[id as usize].clone()))
+            .map(|&id| {
+                RaftNode::start(
+                    sim.env(nid(id)),
+                    NODES.iter().copied().map(nid).collect(),
+                    engines[id as usize].clone(),
+                )
+            })
             .collect();
         sim.run_for(Duration::from_secs(2));
         let leader = unique_leader(&nodes, seed);
@@ -110,7 +116,7 @@ fn run_scenario(seed: u64) {
             tablet: TabletId(1),
             table: Some("orders".to_string()),
             range: KeyRange::whole(),
-            replicas: vec![10, 11],
+            replicas: vec![nid(10), nid(11)],
         });
         nodes[leader].propose(MetaCommand::SetTabletPolicy {
             tablet: TabletId(1),
@@ -148,7 +154,7 @@ fn run_scenario(seed: u64) {
         // MergeTablets' cp-member-addr prune exercises a `Delete` — the half
         // `rebuild_metadata_from_engine`'s bulk path never exercises.
         nodes[leader].propose(MetaCommand::RegisterCpAddr {
-            id: 999,
+            id: nid(999),
             addr: "127.0.0.1:9".to_string(),
             tablet: Some(TabletId(2)),
         });
@@ -215,7 +221,13 @@ fn ring_resets_across_a_restart_and_pre_restart_watchers_fall_back() {
         let engines: Vec<MemoryEngine> = NODES.iter().map(|_| MemoryEngine::new()).collect();
         let mut nodes: Vec<RaftNode<SimEnv>> = NODES
             .iter()
-            .map(|&id| RaftNode::start(sim.env(id), NODES.to_vec(), engines[id as usize].clone()))
+            .map(|&id| {
+                RaftNode::start(
+                    sim.env(nid(id)),
+                    NODES.iter().copied().map(nid).collect(),
+                    engines[id as usize].clone(),
+                )
+            })
             .collect();
         sim.run_for(Duration::from_secs(2));
         let leader = unique_leader(&nodes, seed);
@@ -228,11 +240,11 @@ fn ring_resets_across_a_restart_and_pre_restart_watchers_fall_back() {
 
         // Crash and restart a FOLLOWER on the same disk/engine.
         let follower = (0..3).find(|&i| i != leader).unwrap();
-        sim.stop(follower as u64);
+        sim.stop(nid(follower as u64));
         sim.run_for(Duration::from_millis(200));
         nodes[follower] = RaftNode::start(
-            sim.env(follower as u64),
-            NODES.to_vec(),
+            sim.env(nid(follower as u64)),
+            NODES.iter().copied().map(nid).collect(),
             engines[follower].clone(),
         );
         sim.run_for(Duration::from_secs(2));
@@ -291,8 +303,8 @@ fn a_small_ring_evicts_and_a_stale_watcher_falls_back() {
         let mut sim = Simulator::new(seed);
         let engine = MemoryEngine::new();
         let node = RaftNode::start_with_ring_bounds(
-            sim.env(0),
-            vec![0],
+            sim.env(nid(0)),
+            vec![nid(0)],
             MetricsHandle::noop(),
             engine,
             DeltaRing::with_bounds(3, usize::MAX),

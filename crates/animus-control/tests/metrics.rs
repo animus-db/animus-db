@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use animus_control::node::heartbeat_loop;
 use animus_control::{MetaCommand, NodeStatus, RaftNode};
-use animus_env::{EnvExt, Metric, MetricsHandle};
+use animus_env::{EnvExt, Metric, MetricsHandle, nid};
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::MemoryEngine;
 
@@ -41,8 +41,8 @@ fn cluster(seed: u64) -> (Simulator, Vec<RaftNode<SimEnv>>, Vec<MetricsHandle>) 
         .enumerate()
         .map(|(i, &id)| {
             RaftNode::start_with_metrics(
-                sim.env(id),
-                CONTROL.to_vec(),
+                sim.env(nid(id)),
+                CONTROL.iter().copied().map(nid).collect(),
                 handles[i].clone(),
                 MemoryEngine::new(),
             )
@@ -50,8 +50,11 @@ fn cluster(seed: u64) -> (Simulator, Vec<RaftNode<SimEnv>>, Vec<MetricsHandle>) 
         .collect();
     // One data member heartbeats the whole control group on a timer, so the
     // leader's failure detector has someone to track.
-    let env = sim.env(MEMBER);
-    env.spawn_task(heartbeat_loop(env.clone(), CONTROL.to_vec()));
+    let env = sim.env(nid(MEMBER));
+    env.spawn_task(heartbeat_loop(
+        env.clone(),
+        CONTROL.iter().copied().map(nid).collect(),
+    ));
     (sim, nodes, handles)
 }
 
@@ -105,23 +108,23 @@ fn run(seed: u64) {
 
     // Register the member Active so a later silence is an Active->Down edge.
     nodes[leader].propose(MetaCommand::UpsertMember {
-        node: MEMBER,
+        node: nid(MEMBER),
         labels: std::collections::BTreeMap::new(),
         status: NodeStatus::Active,
     });
     sim.run_for(Duration::from_secs(2));
     assert_eq!(
-        nodes[leader].metadata().members[&MEMBER].status,
+        nodes[leader].metadata().members[&nid(MEMBER)].status,
         NodeStatus::Active,
         "member should be Active before the crash (seed={seed})"
     );
 
     // --- Failure-detector down edge: crash the member; its heartbeats stop. ---
     let down_before = handles[leader].get(Metric::FailureDetectorDown);
-    sim.crash(MEMBER);
+    sim.crash(nid(MEMBER));
     sim.run_for(Duration::from_secs(2));
     assert_eq!(
-        nodes[leader].metadata().members[&MEMBER].status,
+        nodes[leader].metadata().members[&nid(MEMBER)].status,
         NodeStatus::Down,
         "leader should have committed Down for the silent member (seed={seed})"
     );
@@ -134,10 +137,10 @@ fn run(seed: u64) {
 
     // --- Failure-detector up edge: restart the member; heartbeats resume. ---
     let up_before = handles[leader].get(Metric::FailureDetectorUp);
-    sim.restart(MEMBER);
+    sim.restart(nid(MEMBER));
     sim.run_for(Duration::from_secs(2));
     assert_eq!(
-        nodes[leader].metadata().members[&MEMBER].status,
+        nodes[leader].metadata().members[&nid(MEMBER)].status,
         NodeStatus::Active,
         "leader should have committed the recovery (seed={seed})"
     );
@@ -158,14 +161,14 @@ fn metrics_are_reproducible_from_seed() {
         sim.run_for(Duration::from_secs(2));
         let leader = leader_index(&nodes);
         nodes[leader].propose(MetaCommand::UpsertMember {
-            node: MEMBER,
+            node: nid(MEMBER),
             labels: std::collections::BTreeMap::new(),
             status: NodeStatus::Active,
         });
         sim.run_for(Duration::from_secs(2));
-        sim.crash(MEMBER);
+        sim.crash(nid(MEMBER));
         sim.run_for(Duration::from_secs(2));
-        sim.restart(MEMBER);
+        sim.restart(nid(MEMBER));
         sim.run_for(Duration::from_secs(2));
         handles[leader].snapshot().to_text()
     }

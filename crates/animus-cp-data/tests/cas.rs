@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use animus_control::ProposeResult;
 use animus_cp_data::RaftKvNode;
+use animus_env::nid;
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::MemoryEngine;
 use futures::executor::block_on;
@@ -25,7 +26,13 @@ fn group(seed: u64) -> (Simulator, Vec<KvNode>) {
     let sim = Simulator::new(seed);
     let nodes = NODES
         .iter()
-        .map(|&id| RaftKvNode::start(sim.env(id), NODES.to_vec(), MemoryEngine::new()))
+        .map(|&id| {
+            RaftKvNode::start(
+                sim.env(nid(id)),
+                NODES.iter().copied().map(nid).collect(),
+                MemoryEngine::new(),
+            )
+        })
         .collect();
     (sim, nodes)
 }
@@ -222,7 +229,13 @@ fn successful_cas_survives_restart() {
     // We restart node 0, so build the group keeping ids to rebuild it.
     let mut nodes: Vec<KvNode> = NODES
         .iter()
-        .map(|&id| RaftKvNode::start(sim.env(id), NODES.to_vec(), MemoryEngine::new()))
+        .map(|&id| {
+            RaftKvNode::start(
+                sim.env(nid(id)),
+                NODES.iter().copied().map(nid).collect(),
+                MemoryEngine::new(),
+            )
+        })
         .collect();
     let mut sim = sim;
     sim.run_for(Duration::from_secs(2));
@@ -245,8 +258,12 @@ fn successful_cas_survives_restart() {
     // Stop node 0 (volatile state dies, synced WAL survives), then restart it with
     // a fresh engine: the driver replays the WAL and re-applies committed commands,
     // so the swapped value is recovered.
-    sim.stop(0);
-    nodes[0] = RaftKvNode::start(sim.env(0), NODES.to_vec(), MemoryEngine::new());
+    sim.stop(nid(0));
+    nodes[0] = RaftKvNode::start(
+        sim.env(nid(0)),
+        NODES.iter().copied().map(nid).collect(),
+        MemoryEngine::new(),
+    );
     sim.run_for(Duration::from_secs(4)); // recover + catch up
 
     assert_eq!(

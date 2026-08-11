@@ -26,6 +26,8 @@
 use std::net::SocketAddr;
 
 use animus_env::NodeId;
+#[cfg(test)]
+use animus_env::nid;
 use animus_tablet::{Tablet, TabletId};
 
 /// The tablet whose range contains `key`, chosen from `tablets` (already
@@ -185,7 +187,7 @@ mod tests {
         Tablet::new(
             TabletId(id),
             KeyRange::new(start.to_vec(), end.map(|e| e.to_vec())),
-            vec![300],
+            vec![nid(300)],
         )
     }
 
@@ -322,7 +324,7 @@ mod tests {
 
     #[test]
     fn not_leader_refusal_round_trips_with_a_hint() {
-        let hint = Some((7u64, addr(9001)));
+        let hint = Some((nid(7), addr(9001)));
         let msg = format_not_leader_refusal(hint);
         assert_eq!(parse_not_leader_refusal(&msg), Some(hint));
     }

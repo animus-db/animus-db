@@ -210,7 +210,7 @@ async fn data_node_joins_a_split_cluster_via_seed_and_gets_a_rebalanced_replica(
     let promoted = async {
         loop {
             let statuses = member_statuses(control_admin[0]).await;
-            if statuses.get(&join_raftkv_id).map(String::as_str) == Some("Active") {
+            if statuses.get(&join_raftkv_id.as_u64()).map(String::as_str) == Some("Active") {
                 return;
             }
             sleep(Duration::from_millis(100)).await;
@@ -226,7 +226,9 @@ async fn data_node_joins_a_split_cluster_via_seed_and_gets_a_rebalanced_replica(
     let hosted_table: String = {
         let discover = async {
             loop {
-                if let Some(table) = table_with_replica(control_admin[0], join_raftkv_id).await {
+                if let Some(table) =
+                    table_with_replica(control_admin[0], (join_raftkv_id).as_u64()).await
+                {
                     return table;
                 }
                 sleep(Duration::from_millis(300)).await;

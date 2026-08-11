@@ -8,7 +8,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use animus_env::{Clock, Disk, Env, EnvExt, Network};
+use animus_env::{Clock, Disk, Env, EnvExt, Network, nid};
 use animus_sim::Simulator;
 
 const N: u64 = 3;
@@ -18,7 +18,7 @@ const MAX_HOPS: u8 = 9;
 /// short think-time; node 0 kicks it off. The hop counter bounds the run.
 fn build_ring(sim: &Simulator) {
     for id in 0..N {
-        let env = sim.env(id);
+        let env = sim.env(nid(id));
         env.clone().spawn_task(async move {
             loop {
                 let msg = env.recv().await;
@@ -27,15 +27,15 @@ fn build_ring(sim: &Simulator) {
                     continue; // park: token has finished its journey
                 }
                 env.sleep(Duration::from_micros(100)).await;
-                let next = (env.node_id() + 1) % N;
+                let next = nid((env.node_id().as_u64() + 1) % N);
                 env.send(next, vec![hop + 1]).await;
             }
         });
     }
-    let starter = sim.env(0);
+    let starter = sim.env(nid(0));
     starter.clone().spawn_task(async move {
         starter.sleep(Duration::from_millis(1)).await;
-        starter.send(1, vec![0]).await;
+        starter.send(nid(1), vec![0]).await;
     });
 }
 
@@ -43,7 +43,7 @@ fn run_ring(seed: u64, partition_1_2: bool) -> Vec<String> {
     let mut sim = Simulator::new(seed);
     build_ring(&sim);
     if partition_1_2 {
-        sim.partition_pair(1, 2);
+        sim.partition_pair(nid(1), nid(2));
     }
     // Guard against a scenario that fails to settle; the ring is bounded so
     // this should never trip.
@@ -106,7 +106,7 @@ fn crash_drops_unsynced_disk_bytes() {
     // Phase 1: sync "aaa", then append un-synced "bbb"; capture the live view.
     let live_view = Arc::new(Mutex::new(Vec::new()));
     {
-        let env = sim.env(0);
+        let env = sim.env(nid(0));
         let live = Arc::clone(&live_view);
         env.clone().spawn_task(async move {
             env.append("wal", b"aaa").await.unwrap();
@@ -123,12 +123,12 @@ fn crash_drops_unsynced_disk_bytes() {
     );
 
     // Crash: the un-synced "bbb" must be lost; the synced "aaa" survives.
-    sim.crash(0);
-    sim.restart(0);
+    sim.crash(nid(0));
+    sim.restart(nid(0));
 
     let after = Arc::new(Mutex::new(Vec::new()));
     {
-        let env = sim.env(0);
+        let env = sim.env(nid(0));
         let out = Arc::clone(&after);
         env.clone().spawn_task(async move {
             *out.lock().unwrap() = env.read("wal").await.unwrap();
@@ -150,7 +150,7 @@ fn disk_random_access_size_remove_and_crash() {
     // Sync 10 durable bytes, then append 3 un-synced bytes.
     let snap = Arc::new(Mutex::new((Vec::new(), Vec::new(), 0u64, 0u64)));
     {
-        let env = sim.env(0);
+        let env = sim.env(nid(0));
         let out = Arc::clone(&snap);
         env.clone().spawn_task(async move {
             env.append("sst", b"0123456789").await.unwrap();
@@ -174,11 +174,11 @@ fn disk_random_access_size_remove_and_crash() {
     assert_eq!(past, 0, "size of a missing file is 0");
 
     // Crash drops the un-synced tail; random reads see only the durable prefix.
-    sim.crash(0);
-    sim.restart(0);
+    sim.crash(nid(0));
+    sim.restart(nid(0));
     let after = Arc::new(Mutex::new((0u64, Vec::new(), 0u64)));
     {
-        let env = sim.env(0);
+        let env = sim.env(nid(0));
         let out = Arc::clone(&after);
         env.clone().spawn_task(async move {
             let size = env.size("sst").await.unwrap(); // back to 10
@@ -210,7 +210,7 @@ fn restart_resumes_a_parked_recv() {
     // A receiver that records every message payload byte it observes.
     let seen = Arc::new(Mutex::new(Vec::<u8>::new()));
     {
-        let env = sim.env(0);
+        let env = sim.env(nid(0));
         let out = Arc::clone(&seen);
         env.clone().spawn_task(async move {
             loop {
@@ -223,9 +223,9 @@ fn restart_resumes_a_parked_recv() {
     // Deliver a first message and let it be processed, so the task is now parked
     // back on `recv()` with an empty inbox (its waker registered).
     {
-        let sender = sim.env(1);
+        let sender = sim.env(nid(1));
         sender.clone().spawn_task(async move {
-            sender.send(0, vec![1]).await;
+            sender.send(nid(0), vec![1]).await;
         });
     }
     sim.run_for(Duration::from_millis(10));
@@ -236,15 +236,15 @@ fn restart_resumes_a_parked_recv() {
     );
 
     // Crash the receiver while it is parked on `recv()`, then restart it.
-    sim.crash(0);
-    sim.restart(0);
+    sim.crash(nid(0));
+    sim.restart(nid(0));
 
     // Deliver another message after the restart; the re-armed task must wake and
     // process it.
     {
-        let sender = sim.env(1);
+        let sender = sim.env(nid(1));
         sender.clone().spawn_task(async move {
-            sender.send(0, vec![2]).await;
+            sender.send(nid(0), vec![2]).await;
         });
     }
     sim.run_for(Duration::from_millis(10));
@@ -267,8 +267,8 @@ fn disk_list_is_per_node_and_sorted() {
 
     let out = Arc::new(Mutex::new((Vec::new(), Vec::new())));
     {
-        let env = sim.env(0);
-        let other = sim.env(1);
+        let env = sim.env(nid(0));
+        let other = sim.env(nid(1));
         let snap = Arc::clone(&out);
         env.clone().spawn_task(async move {
             env.append("db-wal", b"w").await.unwrap();
@@ -307,7 +307,7 @@ fn run_multiplexed_streams(seed: u64) -> (Vec<u8>, Vec<u8>, Vec<String>) {
     let seen_a = Arc::new(Mutex::new(Vec::<u8>::new()));
     let seen_b = Arc::new(Mutex::new(Vec::<u8>::new()));
     {
-        let env = sim.env(1);
+        let env = sim.env(nid(1));
         let out = Arc::clone(&seen_a);
         env.clone().spawn_task(async move {
             for _ in 0..5 {
@@ -317,7 +317,7 @@ fn run_multiplexed_streams(seed: u64) -> (Vec<u8>, Vec<u8>, Vec<String>) {
         });
     }
     {
-        let env = sim.env(1);
+        let env = sim.env(nid(1));
         let out = Arc::clone(&seen_b);
         env.clone().spawn_task(async move {
             for _ in 0..5 {
@@ -328,11 +328,11 @@ fn run_multiplexed_streams(seed: u64) -> (Vec<u8>, Vec<u8>, Vec<String>) {
     }
     // Interleave sends on both streams from the same sender node.
     {
-        let sender = sim.env(0);
+        let sender = sim.env(nid(0));
         sender.clone().spawn_task(async move {
             for i in 0..5u8 {
-                sender.send_stream(1, STREAM_A, vec![i]).await;
-                sender.send_stream(1, STREAM_B, vec![100 + i]).await;
+                sender.send_stream(nid(1), STREAM_A, vec![i]).await;
+                sender.send_stream(nid(1), STREAM_B, vec![100 + i]).await;
             }
         });
     }

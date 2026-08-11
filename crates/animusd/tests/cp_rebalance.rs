@@ -16,6 +16,7 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use animus_env::NodeId;
 use animusd::{ClientRequest, ClientResponse, ClusterConfig, Node, RoleAddrs, read_frame};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -90,9 +91,9 @@ async fn tablet_map(admin_addr: SocketAddr) -> BTreeMap<u64, (Vec<u64>, u64)> {
 /// `raftkv_ids` so an as-yet-untouched node shows up as a genuine minimum.
 fn replica_counts(
     map: &BTreeMap<u64, (Vec<u64>, u64)>,
-    raftkv_ids: &[u64],
+    raftkv_ids: &[NodeId],
 ) -> BTreeMap<u64, usize> {
-    let mut counts: BTreeMap<u64, usize> = raftkv_ids.iter().map(|&id| (id, 0)).collect();
+    let mut counts: BTreeMap<u64, usize> = raftkv_ids.iter().map(|&id| (id.as_u64(), 0)).collect();
     for (replicas, _) in map.values() {
         for &r in replicas {
             *counts.entry(r).or_insert(0) += 1;
@@ -255,11 +256,13 @@ async fn cluster_grown_to_five_nodes_rebalances_existing_tablets() {
         "expected a real starting imbalance, got {initial_counts:?}"
     );
     assert_eq!(
-        initial_counts[&raftkv_ids[3]], 0,
+        initial_counts[&raftkv_ids[3].as_u64()],
+        0,
         "node 3 should start with no replicas: {initial_counts:?}"
     );
     assert_eq!(
-        initial_counts[&raftkv_ids[4]], 0,
+        initial_counts[&raftkv_ids[4].as_u64()],
+        0,
         "node 4 should start with no replicas: {initial_counts:?}"
     );
 
@@ -283,11 +286,11 @@ async fn cluster_grown_to_five_nodes_rebalances_existing_tablets() {
         .unwrap_or_else(|_| panic!("tablet replicas never spread across all 5 nodes within 120s"));
     let converged_counts = replica_counts(&converged_map, &raftkv_ids);
     assert!(
-        converged_counts[&raftkv_ids[3]] > 0,
+        converged_counts[&raftkv_ids[3].as_u64()] > 0,
         "node 3 never gained a replica: {converged_counts:?}"
     );
     assert!(
-        converged_counts[&raftkv_ids[4]] > 0,
+        converged_counts[&raftkv_ids[4].as_u64()] > 0,
         "node 4 never gained a replica: {converged_counts:?}"
     );
 

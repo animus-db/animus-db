@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use animus_env::{
-    BoxFuture, Clock, Disk, Env, EnvExt, Envelope, Nanos, Network, NodeId, Rng, Spawner,
+    BoxFuture, Clock, Disk, Env, EnvExt, Envelope, Nanos, Network, NodeId, Rng, Spawner, nid,
 };
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::{LsmEngine, LsmOptions, MergeOp, StorageEngine};
@@ -50,7 +50,7 @@ fn concurrent_writes_share_one_fsync() {
     let mut sim = Simulator::new(seed);
     let writes = 32u64;
     {
-        let engine = block_on(LsmEngine::open_with(sim.env(0), PREFIX, opts())).expect("open");
+        let engine = block_on(LsmEngine::open_with(sim.env(nid(0)), PREFIX, opts())).expect("open");
         // Spawn each write as its own task so they are all ready in the same drain
         // cycle and batch together (the leader yields once, letting the rest enqueue
         // before it flushes). A shared counter lets us wait for completion.
@@ -58,7 +58,7 @@ fn concurrent_writes_share_one_fsync() {
         for i in 0..writes {
             let e = engine.clone();
             let done = Arc::clone(&done);
-            sim.env(0).spawn_task(async move {
+            sim.env(nid(0)).spawn_task(async move {
                 let k = format!("k{i:03}");
                 e.put(k.as_bytes(), format!("v{i}").as_bytes(), i + 1)
                     .await
@@ -89,8 +89,8 @@ fn concurrent_writes_share_one_fsync() {
 
     // Crash + reopen: every acked write is durable (an ack means durable, even
     // though it shared its fsync with others).
-    sim.crash(0);
-    let engine = block_on(LsmEngine::open_with(sim.env(0), PREFIX, opts())).expect("reopen");
+    sim.crash(nid(0));
+    let engine = block_on(LsmEngine::open_with(sim.env(nid(0)), PREFIX, opts())).expect("reopen");
     block_on(async {
         for i in 0..writes {
             let k = format!("k{i:03}");
@@ -112,7 +112,7 @@ fn merge_batch_coalesces_one_fsync_and_is_durable() {
     let seed = 0x8A7C41;
     let sim = Simulator::new(seed);
     {
-        let engine = block_on(LsmEngine::open_with(sim.env(0), PREFIX, opts())).expect("open");
+        let engine = block_on(LsmEngine::open_with(sim.env(nid(0)), PREFIX, opts())).expect("open");
         block_on(async {
             // Seed one key at version 5 so a later batch op at version 3 loses LWW.
             engine.merge(b"loser", b"old", 5).await.expect("seed");
@@ -152,8 +152,8 @@ fn merge_batch_coalesces_one_fsync_and_is_durable() {
     }
 
     // Crash + reopen: every applied op is durable (an ack means durable).
-    sim.crash(0);
-    let engine = block_on(LsmEngine::open_with(sim.env(0), PREFIX, opts())).expect("reopen");
+    sim.crash(nid(0));
+    let engine = block_on(LsmEngine::open_with(sim.env(nid(0)), PREFIX, opts())).expect("reopen");
     block_on(async {
         assert_eq!(engine.get(b"b").await.unwrap().unwrap().value, b"2");
         assert_eq!(engine.get(b"c").await.unwrap().unwrap().value, b"3");
@@ -171,7 +171,7 @@ fn crash_drops_unfsynced_batch_tail() {
     let sim = Simulator::new(seed);
     // Interrupt the *second* group fsync: the first batch is durable (acked); the
     // second batch's append lands in the buffer but its fsync never persists.
-    let env = CrashEnv::new(sim.env(0), 2);
+    let env = CrashEnv::new(sim.env(nid(0)), 2);
 
     {
         let engine = block_on(LsmEngine::open_with(env.clone(), PREFIX, opts())).expect("open");
@@ -190,11 +190,11 @@ fn crash_drops_unfsynced_batch_tail() {
         });
     }
     // Power loss drops the buffered (un-synced) tail.
-    sim.crash(0);
+    sim.crash(nid(0));
 
     // Reopen on the durable disk: the acked write survives; the interrupted one is
     // gone (lost as a unit, exactly the writes whose group fsync did not complete).
-    let engine = block_on(LsmEngine::open_with(sim.env(0), PREFIX, opts())).expect("reopen");
+    let engine = block_on(LsmEngine::open_with(sim.env(nid(0)), PREFIX, opts())).expect("reopen");
     block_on(async {
         assert_eq!(
             engine.get(b"durable").await.unwrap().unwrap().value,

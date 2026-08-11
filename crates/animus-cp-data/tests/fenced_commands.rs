@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use animus_control::ProposeResult;
 use animus_cp_data::{RaftKvNode, StorageScope};
+use animus_env::nid;
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::MemoryEngine;
 use animus_tablet::KeyRange;
@@ -31,7 +32,13 @@ fn group(seed: u64) -> (Simulator, Vec<KvNode>) {
     let sim = Simulator::new(seed);
     let nodes = NODES
         .iter()
-        .map(|&id| RaftKvNode::start(sim.env(id), NODES.to_vec(), MemoryEngine::new()))
+        .map(|&id| {
+            RaftKvNode::start(
+                sim.env(nid(id)),
+                NODES.iter().copied().map(nid).collect(),
+                MemoryEngine::new(),
+            )
+        })
         .collect();
     (sim, nodes)
 }
@@ -46,8 +53,8 @@ fn scoped_group(seed: u64) -> (Simulator, Vec<KvNode>) {
         .iter()
         .map(|&id| {
             RaftKvNode::start_scoped(
-                sim.env(id),
-                NODES.to_vec(),
+                sim.env(nid(id)),
+                NODES.iter().copied().map(nid).collect(),
                 MemoryEngine::new(),
                 StorageScope::new(b"T:".to_vec(), KeyRange::whole()),
             )
@@ -293,7 +300,7 @@ fn fence_decision_is_per_entry_not_retroactively_reconsidered() {
     }
 
     // Kill the original leader and elect a new one from the survivors.
-    sim.stop(original_leader as u64);
+    sim.stop(nid(original_leader as u64));
     sim.run_for(Duration::from_secs(3));
     let new_leader = leader(&nodes, &survivors, seed);
 

@@ -18,6 +18,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use animus_env::nid;
 use animusd::{
     ClientRequest, ClientResponse, ClusterConfig, Node, NodeStatus, RoleAddrs, StorageBackend,
     read_frame,
@@ -139,7 +140,7 @@ async fn own_raftkv_id(admin_addr: SocketAddr) -> u64 {
 fn member_status(nodes: &[Node], id: u64) -> Option<NodeStatus> {
     nodes
         .iter()
-        .find_map(|n| n.metadata().members.get(&id).map(|m| m.status))
+        .find_map(|n| n.metadata().members.get(&nid(id)).map(|m| m.status))
 }
 
 /// A table whose tablet currently lists `raftkv_id` as a replica, if any —
@@ -154,7 +155,7 @@ fn table_with_replica(nodes: &[Node], raftkv_id: u64) -> Option<String> {
         n.metadata()
             .tablets
             .values()
-            .find(|t| t.replicas.contains(&raftkv_id))
+            .find(|t| t.replicas.contains(&nid(raftkv_id)))
             .and_then(|t| t.table.clone())
     })
 }

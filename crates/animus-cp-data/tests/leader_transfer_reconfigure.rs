@@ -37,7 +37,7 @@ use std::time::Duration;
 
 use animus_control::ProposeResult;
 use animus_cp_data::RaftKvNode;
-use animus_env::{Clock, EnvExt, NodeId};
+use animus_env::{Clock, EnvExt, NodeId, nid};
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::MemoryEngine;
 
@@ -54,7 +54,7 @@ const RECONFIGURE_INTERVAL: Duration = Duration::from_millis(150);
 const WRITE_INTERVAL: Duration = Duration::from_millis(5);
 
 fn set(ids: &[u64]) -> BTreeSet<NodeId> {
-    ids.iter().copied().collect()
+    ids.iter().copied().map(nid).collect()
 }
 
 /// The current leader among `nodes`, if exactly one reports it.
@@ -78,7 +78,13 @@ fn reconfigure_step_relocates_a_write_hot_leader_under_sustained_writes() {
     let mut sim = Simulator::new(seed);
     let nodes: Vec<KvNode> = IDS
         .iter()
-        .map(|&id| RaftKvNode::start(sim.env(id), IDS.to_vec(), MemoryEngine::new()))
+        .map(|&id| {
+            RaftKvNode::start(
+                sim.env(nid(id)),
+                IDS.iter().copied().map(nid).collect(),
+                MemoryEngine::new(),
+            )
+        })
         .collect();
     sim.run_for(Duration::from_secs(2));
     let l0 = leader_among(&nodes).expect("an initial leader");
@@ -86,7 +92,12 @@ fn reconfigure_step_relocates_a_write_hot_leader_under_sustained_writes() {
     // A move that must relocate leadership itself: drop the current leader
     // from the group entirely (the shape a drain, or a rebalance move that
     // happens to land on the current leader, produces — see ADR 0029 §1).
-    let desired: BTreeSet<NodeId> = IDS.iter().copied().filter(|&n| n != l0 as u64).collect();
+    let desired: BTreeSet<NodeId> = IDS
+        .iter()
+        .copied()
+        .filter(|&n| n != l0 as u64)
+        .map(nid)
+        .collect();
     assert_eq!(desired.len(), 2);
 
     // Every node runs the production automatic-reconfigure loop toward the
@@ -103,7 +114,7 @@ fn reconfigure_step_relocates_a_write_hot_leader_under_sustained_writes() {
     let write_nodes = nodes.clone();
     let stop = Arc::new(AtomicBool::new(false));
     let stop_writer = Arc::clone(&stop);
-    let writer_env = sim.env(IDS[0]);
+    let writer_env = sim.env(nid(IDS[0]));
     writer_env.clone().spawn_task(async move {
         let mut i: u64 = 0;
         while !stop_writer.load(Ordering::Relaxed) {
@@ -139,12 +150,12 @@ fn reconfigure_step_relocates_a_write_hot_leader_under_sustained_writes() {
     // The old leader is no longer a voter; the relocated group still serves
     // both old and new writes on the new configuration.
     assert!(
-        !nodes[l0].config().contains(&(l0 as u64)),
+        !nodes[l0].config().contains(&nid(l0 as u64)),
         "the relocated leader must have been dropped from the config"
     );
     let l1 = leader_among(&nodes).expect("a new leader after the transfer");
     assert!(
-        desired.contains(&(l1 as u64)),
+        desired.contains(&nid(l1 as u64)),
         "the new leader must be a member of the desired set"
     );
     assert!(matches!(
@@ -154,7 +165,7 @@ fn reconfigure_step_relocates_a_write_hot_leader_under_sustained_writes() {
     sim.run_for(Duration::from_secs(2));
     for &id in &desired {
         assert_eq!(
-            futures::executor::block_on(nodes[id as usize].local_get(b"post")),
+            futures::executor::block_on(nodes[id.as_u64() as usize].local_get(b"post")),
             Some(b"v".to_vec()),
             "node {id} missing the post-transfer write"
         );
@@ -171,7 +182,13 @@ fn reconfigure_step_arms_and_converges_even_while_proposing_every_tick() {
     let mut sim = Simulator::new(seed);
     let nodes: Vec<KvNode> = IDS
         .iter()
-        .map(|&id| RaftKvNode::start(sim.env(id), IDS.to_vec(), MemoryEngine::new()))
+        .map(|&id| {
+            RaftKvNode::start(
+                sim.env(nid(id)),
+                IDS.iter().copied().map(nid).collect(),
+                MemoryEngine::new(),
+            )
+        })
         .collect();
     sim.run_for(Duration::from_secs(2));
     let l0 = leader_among(&nodes).expect("an initial leader");

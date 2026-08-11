@@ -16,6 +16,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use animus_env::NodeId;
+#[cfg(test)]
+use animus_env::nid;
 use animus_tablet::TabletId;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -283,14 +285,15 @@ mod tests {
         let mut meta = Metadata::default();
         for i in 0..50u64 {
             meta.apply(&MetaCommand::UpsertMember {
-                node: i,
+                node: nid(i),
                 labels: std::collections::BTreeMap::from([("rack".to_string(), format!("r{i}"))]),
                 status: NodeStatus::Active,
             });
         }
         let last_index = 123u64;
         let last_term = 7u64;
-        let config: Option<BTreeSet<NodeId>> = Some(BTreeSet::from([0, 1, 2]));
+        let config: Option<BTreeSet<NodeId>> =
+            Some(BTreeSet::from([0, 1, 2]).into_iter().map(nid).collect());
 
         // The cached `snapshot_blob` is `serde_json::to_vec(&metadata)`.
         let blob = serde_json::to_vec(&meta).unwrap();
@@ -358,7 +361,7 @@ mod tests {
                 t1,
                 &WalRecord::Hard {
                     term: 1,
-                    voted_for: Some(300),
+                    voted_for: Some(nid(300)),
                 },
             ),
         );
@@ -367,26 +370,26 @@ mod tests {
                 t2,
                 &WalRecord::Hard {
                     term: 5,
-                    voted_for: Some(301),
+                    voted_for: Some(nid(301)),
                 },
             ),
         );
         bytes.extend(
             PersistedState::<MetaCommand, Metadata>::encode_tagged_record(
                 t1,
-                &WalRecord::Append(entry(1, 1, upsert(300))),
+                &WalRecord::Append(entry(1, 1, upsert(nid(300)))),
             ),
         );
         bytes.extend(
             PersistedState::<MetaCommand, Metadata>::encode_tagged_record(
                 t2,
-                &WalRecord::Append(entry(1, 5, upsert(301))),
+                &WalRecord::Append(entry(1, 5, upsert(nid(301)))),
             ),
         );
         bytes.extend(
             PersistedState::<MetaCommand, Metadata>::encode_tagged_record(
                 t1,
-                &WalRecord::Append(entry(2, 1, upsert(302))),
+                &WalRecord::Append(entry(2, 1, upsert(nid(302)))),
             ),
         );
 
@@ -395,14 +398,14 @@ mod tests {
         assert_eq!(demuxed.len(), 2);
         let s1 = &demuxed[&t1];
         assert_eq!(s1.term, 1);
-        assert_eq!(s1.voted_for, Some(300));
+        assert_eq!(s1.voted_for, Some(nid(300)));
         assert_eq!(s1.log.len(), 2);
         assert_eq!(s1.log[0].index, 1);
         assert_eq!(s1.log[1].index, 2);
 
         let s2 = &demuxed[&t2];
         assert_eq!(s2.term, 5);
-        assert_eq!(s2.voted_for, Some(301));
+        assert_eq!(s2.voted_for, Some(nid(301)));
         assert_eq!(s2.log.len(), 1);
     }
 
@@ -422,7 +425,7 @@ mod tests {
         bytes.extend(
             PersistedState::<MetaCommand, Metadata>::encode_tagged_record(
                 t1,
-                &WalRecord::Append(entry(1, 2, upsert(300))),
+                &WalRecord::Append(entry(1, 2, upsert(nid(300)))),
             ),
         );
         // Simulate a crash mid-write of a second tablet's record: a truncated
@@ -447,9 +450,9 @@ mod tests {
         let t1_records = vec![
             WalRecord::Hard {
                 term: 4,
-                voted_for: Some(300),
+                voted_for: Some(nid(300)),
             },
-            WalRecord::Append(entry(10, 4, upsert(300))),
+            WalRecord::Append(entry(10, 4, upsert(nid(300)))),
         ];
         let t2_records = vec![WalRecord::Hard {
             term: 1,

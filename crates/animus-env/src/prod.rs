@@ -19,6 +19,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, mpsc};
 
+#[cfg(test)]
+use crate::nid;
 use crate::{
     Clock, Coresident, Disk, Env, Envelope, MetricsHandle, Nanos, Network, NodeId, Rng, Spawner,
 };
@@ -396,7 +398,7 @@ async fn read_frames(
 ) -> std::io::Result<()> {
     loop {
         let from = match stream.read_u64().await {
-            Ok(v) => v,
+            Ok(v) => NodeId::new(v),
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(e) => return Err(e),
         };
@@ -507,7 +509,10 @@ impl Network for ProdEnv {
                     // the address lands. A *genuinely* missing peer surfaces as the
                     // higher-level symptom (no leader / no progress) with its own
                     // logging, so this stays at debug to avoid alarming noise.
-                    tracing::debug!(to, "send to peer with no known address (dropped)");
+                    tracing::debug!(
+                        to = to.as_u64(),
+                        "send to peer with no known address (dropped)"
+                    );
                     return;
                 }
             }
@@ -523,7 +528,7 @@ impl Network for ProdEnv {
             Arc::clone(conns.entry(addr).or_default())
         };
         if let Err(err) = send_frame_pooled(&slot, addr, from, stream, &payload).await {
-            tracing::debug!(?err, to, "send failed (dropped)");
+            tracing::debug!(?err, to = to.as_u64(), "send failed (dropped)");
         }
     }
 
@@ -675,7 +680,7 @@ async fn write_frame(
     msg_stream: u64,
     payload: &[u8],
 ) -> std::io::Result<()> {
-    conn.write_u64(from).await?;
+    conn.write_u64(from.as_u64()).await?;
     conn.write_u64(msg_stream).await?;
     conn.write_u32(payload.len() as u32).await?;
     conn.write_all(payload).await?;
@@ -904,7 +909,7 @@ mod tests {
     #[tokio::test]
     async fn disk_creates_parent_dirs_for_nested_file() {
         let dir = unique_tmp_dir();
-        let (env, _addr) = ProdEnv::bind(0, "127.0.0.1:0".parse().unwrap(), &dir)
+        let (env, _addr) = ProdEnv::bind(nid(0), "127.0.0.1:0".parse().unwrap(), &dir)
             .await
             .expect("bind");
 
@@ -928,16 +933,20 @@ mod tests {
     #[tokio::test]
     async fn disk_list_is_own_files_sorted_nonrecursive() {
         let dir = unique_tmp_dir();
-        let missing = ProdEnv::bind(0, "127.0.0.1:0".parse().unwrap(), dir.join("never-written"))
-            .await
-            .expect("bind")
-            .0;
+        let missing = ProdEnv::bind(
+            nid(0),
+            "127.0.0.1:0".parse().unwrap(),
+            dir.join("never-written"),
+        )
+        .await
+        .expect("bind")
+        .0;
         assert_eq!(
             missing.list().await.expect("list missing"),
             Vec::<String>::new()
         );
 
-        let (env, _addr) = ProdEnv::bind(1, "127.0.0.1:0".parse().unwrap(), &dir)
+        let (env, _addr) = ProdEnv::bind(nid(1), "127.0.0.1:0".parse().unwrap(), &dir)
             .await
             .expect("bind");
         env.append("db-wal", b"w").await.expect("append");
@@ -966,17 +975,17 @@ mod tests {
         let dir_b = unique_tmp_dir();
         let loop0 = || "127.0.0.1:0".parse::<SocketAddr>().unwrap();
         // Two physical nodes, each with a one-slot sibling pool.
-        let (a, _) = ProdEnv::bind_with_pool(0, loop0(), &[loop0()], &dir_a)
+        let (a, _) = ProdEnv::bind_with_pool(nid(0), loop0(), &[loop0()], &dir_a)
             .await
             .expect("bind a");
-        let (b, _) = ProdEnv::bind_with_pool(1, loop0(), &[loop0()], &dir_b)
+        let (b, _) = ProdEnv::bind_with_pool(nid(1), loop0(), &[loop0()], &dir_b)
             .await
             .expect("bind b");
 
         // Mint a co-resident group member on each node (ids 300, 301).
-        let a_sib = a.sibling(300);
-        let b_sib = b.sibling(301);
-        assert_eq!(a_sib.node_id(), 300);
+        let a_sib = a.sibling(nid(300));
+        let b_sib = b.sibling(nid(301));
+        assert_eq!(a_sib.node_id(), nid(300));
         assert_ne!(
             a_sib.local_addr(),
             a.local_addr(),
@@ -985,10 +994,12 @@ mod tests {
 
         // Distribute the freshly-minted addresses (what the 3b peer-sync loop does
         // from replicated Metadata) onto the parents — siblings share the book.
-        let book: BTreeMap<NodeId, SocketAddr> =
-            [(300, a_sib.local_addr()), (301, b_sib.local_addr())]
-                .into_iter()
-                .collect();
+        let book: BTreeMap<NodeId, SocketAddr> = [
+            (nid(300), a_sib.local_addr()),
+            (nid(301), b_sib.local_addr()),
+        ]
+        .into_iter()
+        .collect();
         a.set_peers(book.clone());
         b.set_peers(book);
 
@@ -999,13 +1010,13 @@ mod tests {
         };
         // Give the receiver a moment to park on its inbox, then send.
         tokio::time::sleep(Duration::from_millis(50)).await;
-        b_sib.send(300, b"hello-cp-sibling".to_vec()).await;
+        b_sib.send(nid(300), b"hello-cp-sibling".to_vec()).await;
 
         let env = tokio::time::timeout(Duration::from_secs(5), recv_handle)
             .await
             .expect("recv timed out")
             .expect("recv task");
-        assert_eq!(env.from, 301);
+        assert_eq!(env.from, nid(301));
         assert_eq!(env.payload, b"hello-cp-sibling");
 
         a.shutdown();
@@ -1033,9 +1044,13 @@ mod tests {
         let dir_a = unique_tmp_dir();
         let dir_b = unique_tmp_dir();
         let loop0 = || "127.0.0.1:0".parse::<SocketAddr>().unwrap();
-        let (a, a_addr) = ProdEnv::bind(0, loop0(), &dir_a).await.expect("bind a");
-        let (b, _) = ProdEnv::bind(1, loop0(), &dir_b).await.expect("bind b");
-        b.set_peers([(0, a_addr)].into_iter().collect());
+        let (a, a_addr) = ProdEnv::bind(nid(0), loop0(), &dir_a)
+            .await
+            .expect("bind a");
+        let (b, _) = ProdEnv::bind(nid(1), loop0(), &dir_b)
+            .await
+            .expect("bind b");
+        b.set_peers([(nid(0), a_addr)].into_iter().collect());
 
         // Two receive loops on `a`, one per stream, each collecting its frames'
         // first payload byte (the sequence number) into its own vector.
@@ -1065,7 +1080,7 @@ mod tests {
             let b = b.clone();
             tokio::spawn(async move {
                 for i in 0..N {
-                    b.send_stream(0, STREAM_X, vec![i]).await;
+                    b.send_stream(nid(0), STREAM_X, vec![i]).await;
                 }
             })
         };
@@ -1073,7 +1088,7 @@ mod tests {
             let b = b.clone();
             tokio::spawn(async move {
                 for i in 0..N {
-                    b.send_stream(0, STREAM_Y, vec![i]).await;
+                    b.send_stream(nid(0), STREAM_Y, vec![i]).await;
                 }
             })
         };
@@ -1114,9 +1129,9 @@ mod tests {
     /// `receiver` in the peer book. Returns `(sender, receiver, dirs)`.
     async fn bound_pair(dir_a: &PathBuf, dir_b: &PathBuf) -> (ProdEnv, ProdEnv, SocketAddr) {
         let loop0 = "127.0.0.1:0".parse::<SocketAddr>().unwrap();
-        let (a, _) = ProdEnv::bind(0, loop0, dir_a).await.expect("bind a");
-        let (b, b_addr) = ProdEnv::bind(1, loop0, dir_b).await.expect("bind b");
-        a.set_peers([(1, b_addr)].into_iter().collect());
+        let (a, _) = ProdEnv::bind(nid(0), loop0, dir_a).await.expect("bind a");
+        let (b, b_addr) = ProdEnv::bind(nid(1), loop0, dir_b).await.expect("bind b");
+        a.set_peers([(nid(1), b_addr)].into_iter().collect());
         (a, b, b_addr)
     }
 
@@ -1156,7 +1171,7 @@ mod tests {
             let a = a.clone();
             senders.push(tokio::spawn(async move {
                 for seq in 0..MSGS {
-                    a.send(1, framed_payload(task, seq)).await;
+                    a.send(nid(1), framed_payload(task, seq)).await;
                 }
             }));
         }
@@ -1169,7 +1184,7 @@ mod tests {
             let env = tokio::time::timeout(Duration::from_secs(30), b.recv())
                 .await
                 .expect("recv timed out — frames lost or transport deadlocked");
-            assert_eq!(env.from, 0);
+            assert_eq!(env.from, nid(0));
             assert!(env.payload.len() >= 16, "truncated frame");
             let task = u64::from_be_bytes(env.payload[0..8].try_into().unwrap());
             let seq = u64::from_be_bytes(env.payload[8..16].try_into().unwrap());
@@ -1208,7 +1223,7 @@ mod tests {
         let (a, b, b_addr) = bound_pair(&dir_a, &dir_b).await;
 
         // Establish (and cache) the connection with one delivered frame.
-        a.send(1, b"before-restart".to_vec()).await;
+        a.send(nid(1), b"before-restart".to_vec()).await;
         let env = tokio::time::timeout(Duration::from_secs(10), b.recv())
             .await
             .expect("first recv timed out");
@@ -1222,7 +1237,7 @@ mod tests {
         drop(b);
         let deadline = Instant::now() + Duration::from_secs(10);
         let b2 = loop {
-            match ProdEnv::bind(1, b_addr, &dir_b).await {
+            match ProdEnv::bind(nid(1), b_addr, &dir_b).await {
                 Ok((env, _)) => break env,
                 Err(err) => {
                     assert!(
@@ -1239,10 +1254,10 @@ mod tests {
         // so poll until a frame arrives.
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            a.send(1, b"after-restart".to_vec()).await;
+            a.send(nid(1), b"after-restart".to_vec()).await;
             match tokio::time::timeout(Duration::from_millis(200), b2.recv()).await {
                 Ok(env) => {
-                    assert_eq!(env.from, 0);
+                    assert_eq!(env.from, nid(0));
                     assert_eq!(env.payload, b"after-restart");
                     break;
                 }
@@ -1273,23 +1288,23 @@ mod tests {
         let dir_c = unique_tmp_dir();
         let (a, b, _b_addr) = bound_pair(&dir_a, &dir_b).await;
         let loop0 = "127.0.0.1:0".parse::<SocketAddr>().unwrap();
-        let (c, c_addr) = ProdEnv::bind(2, loop0, &dir_c).await.expect("bind c");
+        let (c, c_addr) = ProdEnv::bind(nid(2), loop0, &dir_c).await.expect("bind c");
 
         // Before merging, `a` has no route to `c` at all — a send is simply
         // dropped (see `Network::send`'s doc), not an error.
-        a.send(2, b"too-early".to_vec()).await;
+        a.send(nid(2), b"too-early".to_vec()).await;
 
-        a.merge_peer(2, c_addr);
+        a.merge_peer(nid(2), c_addr);
 
         // The pre-existing entry for `b` still works...
-        a.send(1, b"still-reachable".to_vec()).await;
+        a.send(nid(1), b"still-reachable".to_vec()).await;
         let env = tokio::time::timeout(Duration::from_secs(10), b.recv())
             .await
             .expect("recv from b timed out");
         assert_eq!(env.payload, b"still-reachable");
 
         // ...and the newly merged entry for `c` now works too.
-        a.send(2, b"newly-reachable".to_vec()).await;
+        a.send(nid(2), b"newly-reachable".to_vec()).await;
         let env = tokio::time::timeout(Duration::from_secs(10), c.recv())
             .await
             .expect("recv from c timed out");
@@ -1312,7 +1327,7 @@ mod tests {
     #[tokio::test]
     async fn replace_and_sync_fsync_dirs_and_read_back() {
         let dir = unique_tmp_dir();
-        let (env, _addr) = ProdEnv::bind(0, "127.0.0.1:0".parse().unwrap(), &dir)
+        let (env, _addr) = ProdEnv::bind(nid(0), "127.0.0.1:0".parse().unwrap(), &dir)
             .await
             .expect("bind");
 

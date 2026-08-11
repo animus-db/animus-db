@@ -35,7 +35,7 @@ use std::time::Duration;
 use animus_control::node::heartbeat_loop;
 use animus_control::{MetaCommand, NodeStatus, ProposeResult, RaftNode};
 use animus_cp_data::RaftKvNode;
-use animus_env::{EnvExt, NodeId};
+use animus_env::{EnvExt, NodeId, nid};
 use animus_placement::PlacementPolicy;
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::MemoryEngine;
@@ -77,7 +77,7 @@ fn policy() -> PlacementPolicy {
 }
 
 fn set(ids: &[u64]) -> BTreeSet<NodeId> {
-    ids.iter().copied().collect()
+    ids.iter().copied().map(nid).collect()
 }
 
 /// The control leader index, asserting exactly one among `0..3`.
@@ -127,12 +127,21 @@ fn run(seed: u64) {
     // --- Control plane (ids 0..3). ---
     let control: Vec<RaftNode<SimEnv>> = CONTROL
         .iter()
-        .map(|&id| RaftNode::start(sim.env(id), CONTROL.to_vec(), MemoryEngine::new()))
+        .map(|&id| {
+            RaftNode::start(
+                sim.env(nid(id)),
+                CONTROL.iter().copied().map(nid).collect(),
+                MemoryEngine::new(),
+            )
+        })
         .collect();
     // Every data member heartbeats the control group (so the detector sees them).
     for (id, _, _) in DATA_NODES {
-        let env = sim.env(id);
-        env.spawn_task(heartbeat_loop(env.clone(), CONTROL.to_vec()));
+        let env = sim.env(nid(id));
+        env.spawn_task(heartbeat_loop(
+            env.clone(),
+            CONTROL.iter().copied().map(nid).collect(),
+        ));
     }
 
     // --- Per-tablet Raft KV group. Voters start {10,12,14}; the spare 11 is
@@ -143,12 +152,20 @@ fn run(seed: u64) {
     for &id in &INITIAL_VOTERS {
         group.insert(
             id,
-            RaftKvNode::start(sim.env(id), INITIAL_VOTERS.to_vec(), MemoryEngine::new()),
+            RaftKvNode::start(
+                sim.env(nid(id)),
+                INITIAL_VOTERS.iter().copied().map(nid).collect(),
+                MemoryEngine::new(),
+            ),
         );
     }
     group.insert(
         11,
-        RaftKvNode::start(sim.env(11), INITIAL_VOTERS.to_vec(), MemoryEngine::new()),
+        RaftKvNode::start(
+            sim.env(nid(11)),
+            INITIAL_VOTERS.iter().copied().map(nid).collect(),
+            MemoryEngine::new(),
+        ),
     );
 
     // --- The epoch-driven-pull reconfigure loop on every group node: poll the
@@ -185,7 +202,7 @@ fn run(seed: u64) {
     for (id, region, zone) in DATA_NODES {
         assert!(matches!(
             control[cl].propose(MetaCommand::UpsertMember {
-                node: id,
+                node: nid(id),
                 labels: labels(region, zone),
                 status: NodeStatus::Active,
             }),
@@ -197,7 +214,7 @@ fn run(seed: u64) {
             tablet: TABLET,
             table: None,
             range: KeyRange::whole(),
-            replicas: INITIAL_VOTERS.to_vec(),
+            replicas: INITIAL_VOTERS.iter().copied().map(nid).collect(),
         }),
         ProposeResult::Accepted { .. }
     ));
@@ -213,7 +230,7 @@ fn run(seed: u64) {
     sim.run_for(Duration::from_secs(2));
     assert_eq!(
         control[cl].metadata().tablets[&TABLET].replicas,
-        INITIAL_VOTERS.to_vec(),
+        INITIAL_VOTERS.into_iter().map(nid).collect::<Vec<_>>(),
         "initial placement drifted (seed={seed})"
     );
     let l0 = group_leader(&group, &GROUP_IDS).expect("a group leader after settling");
@@ -233,7 +250,7 @@ fn run(seed: u64) {
     // --- Fault: the placed node 10 crashes (heartbeats stop). ---
     let dead = 10u64;
     let live: Vec<u64> = GROUP_IDS.iter().copied().filter(|&id| id != dead).collect();
-    sim.crash(dead);
+    sim.crash(nid(dead));
 
     // No manual Down, no manual change_membership: detector → reconciler →
     // group-leader reconfigure. Bounded poll until the control plane re-places the
@@ -290,7 +307,7 @@ fn run(seed: u64) {
     sim.run_for(Duration::from_secs(2));
     for &id in &desired {
         assert_eq!(
-            block_on(group[&id].local_get(b"k2")),
+            block_on(group[&id.as_u64()].local_get(b"k2")),
             Some(b"v2".to_vec()),
             "node {id} (incl. the added spare) missing the post-reconfigure write (seed={seed})"
         );
@@ -303,22 +320,39 @@ fn auto_reconfigure_is_reproducible_from_seed() {
         let sim = Simulator::new(seed);
         let control: Vec<RaftNode<SimEnv>> = CONTROL
             .iter()
-            .map(|&id| RaftNode::start(sim.env(id), CONTROL.to_vec(), MemoryEngine::new()))
+            .map(|&id| {
+                RaftNode::start(
+                    sim.env(nid(id)),
+                    CONTROL.iter().copied().map(nid).collect(),
+                    MemoryEngine::new(),
+                )
+            })
             .collect();
         for (id, _, _) in DATA_NODES {
-            let env = sim.env(id);
-            env.spawn_task(heartbeat_loop(env.clone(), CONTROL.to_vec()));
+            let env = sim.env(nid(id));
+            env.spawn_task(heartbeat_loop(
+                env.clone(),
+                CONTROL.iter().copied().map(nid).collect(),
+            ));
         }
         let mut group: BTreeMap<u64, KvNode> = BTreeMap::new();
         for &id in &INITIAL_VOTERS {
             group.insert(
                 id,
-                RaftKvNode::start(sim.env(id), INITIAL_VOTERS.to_vec(), MemoryEngine::new()),
+                RaftKvNode::start(
+                    sim.env(nid(id)),
+                    INITIAL_VOTERS.iter().copied().map(nid).collect(),
+                    MemoryEngine::new(),
+                ),
             );
         }
         group.insert(
             11,
-            RaftKvNode::start(sim.env(11), INITIAL_VOTERS.to_vec(), MemoryEngine::new()),
+            RaftKvNode::start(
+                sim.env(nid(11)),
+                INITIAL_VOTERS.iter().copied().map(nid).collect(),
+                MemoryEngine::new(),
+            ),
         );
         for (&_id, node) in &group {
             let ctrl = control[0].clone();
@@ -347,7 +381,7 @@ fn auto_reconfigure_is_reproducible_from_seed() {
         let cl = control_leader(&control);
         for (id, region, zone) in DATA_NODES {
             control[cl].propose(MetaCommand::UpsertMember {
-                node: id,
+                node: nid(id),
                 labels: labels(region, zone),
                 status: NodeStatus::Active,
             });
@@ -356,14 +390,14 @@ fn auto_reconfigure_is_reproducible_from_seed() {
             tablet: TABLET,
             table: None,
             range: KeyRange::whole(),
-            replicas: INITIAL_VOTERS.to_vec(),
+            replicas: INITIAL_VOTERS.iter().copied().map(nid).collect(),
         });
         control[cl].propose(MetaCommand::SetTabletPolicy {
             tablet: TABLET,
             policy: Some(policy()),
         });
         sim.run_for(Duration::from_secs(2));
-        sim.crash(10);
+        sim.crash(nid(10));
         sim.run_for(Duration::from_secs(10));
         sim.trace_lines()
     }

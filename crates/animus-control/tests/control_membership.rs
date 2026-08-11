@@ -25,6 +25,7 @@ use std::time::Duration;
 
 use animus_control::node::CONTROL_PEER_LIVENESS_TIMEOUT;
 use animus_control::{MetaCommand, NodeStatus, ProposeResult, RaftNode};
+use animus_env::{NodeId, nid};
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::MemoryEngine;
 
@@ -34,7 +35,13 @@ fn cluster(seed: u64, ids: &[u64]) -> (Simulator, Vec<RaftNode<SimEnv>>) {
     let sim = Simulator::new(seed);
     let nodes = ids
         .iter()
-        .map(|&id| RaftNode::start(sim.env(id), ids.to_vec(), MemoryEngine::new()))
+        .map(|&id| {
+            RaftNode::start(
+                sim.env(nid(id)),
+                ids.iter().copied().map(nid).collect(),
+                MemoryEngine::new(),
+            )
+        })
         .collect();
     (sim, nodes)
 }
@@ -63,7 +70,7 @@ fn set(ids: &[u64]) -> BTreeSet<u64> {
 /// `control_raft.rs`'s helper of the same shape) — not itself under test.
 fn upsert(node: u64) -> MetaCommand {
     MetaCommand::UpsertMember {
-        node,
+        node: nid(node),
         labels: BTreeMap::new(),
         status: NodeStatus::Active,
     }
@@ -94,11 +101,15 @@ fn add_a_node_grows_the_group_catches_up_and_joins_quorum() {
     // the other three nodes' own configs — what actually governs quorum and
     // replication — still exclude it, so node 3 stays a quiet non-voter until
     // `change_membership` actually adds it.
-    let node3 = RaftNode::start(sim.env(3), all_ids.to_vec(), MemoryEngine::new());
+    let node3 = RaftNode::start(
+        sim.env(nid(3)),
+        all_ids.iter().copied().map(nid).collect(),
+        MemoryEngine::new(),
+    );
 
     assert!(
         matches!(
-            nodes[l].change_membership(set(&all_ids)),
+            nodes[l].change_membership(set(&all_ids).into_iter().map(nid).collect()),
             ProposeResult::Accepted { .. }
         ),
         "seed={seed}: adding node 3 should be accepted as a single-server delta"
@@ -107,7 +118,7 @@ fn add_a_node_grows_the_group_catches_up_and_joins_quorum() {
 
     assert_eq!(
         node3.config(),
-        set(&all_ids),
+        set(&all_ids).into_iter().map(nid).collect(),
         "seed={seed}: node 3 should have adopted the grown config"
     );
     assert_eq!(
@@ -120,7 +131,7 @@ fn add_a_node_grows_the_group_catches_up_and_joins_quorum() {
     // leaving exactly 3 of the 4 voters alive (leader + one original follower
     // + node 3) — a majority only if node 3 actually acks.
     let extra_follower = (0..3).find(|&i| i != l).expect("an original follower");
-    sim.crash(extra_follower as u64);
+    sim.crash(nid(extra_follower as u64));
     assert!(
         matches!(
             nodes[l].propose(upsert(101)),
@@ -131,11 +142,11 @@ fn add_a_node_grows_the_group_catches_up_and_joins_quorum() {
     sim.run_for(Duration::from_secs(2));
 
     assert!(
-        nodes[l].metadata().members.contains_key(&101),
+        nodes[l].metadata().members.contains_key(&nid(101)),
         "seed={seed}: the write must commit via a 3-of-4 majority that includes node 3"
     );
     assert!(
-        node3.metadata().members.contains_key(&101),
+        node3.metadata().members.contains_key(&nid(101)),
         "seed={seed}: node 3 must have received/applied the post-join write"
     );
 }
@@ -161,7 +172,7 @@ fn remove_a_follower_shrinks_the_quorum() {
         .collect();
     assert!(
         matches!(
-            nodes[l].change_membership(set(&remaining)),
+            nodes[l].change_membership(set(&remaining).into_iter().map(nid).collect()),
             ProposeResult::Accepted { .. }
         ),
         "seed={seed}"
@@ -170,7 +181,7 @@ fn remove_a_follower_shrinks_the_quorum() {
 
     assert_eq!(
         nodes[l].config(),
-        set(&remaining),
+        set(&remaining).into_iter().map(nid).collect(),
         "seed={seed}: leader should have adopted the new config"
     );
     assert!(
@@ -181,11 +192,11 @@ fn remove_a_follower_shrinks_the_quorum() {
     for &i in &remaining {
         assert_eq!(
             nodes[i as usize].config(),
-            set(&remaining),
+            set(&remaining).into_iter().map(nid).collect(),
             "seed={seed}: node {i} should have adopted the new config"
         );
         assert!(
-            nodes[i as usize].metadata().members.contains_key(&2),
+            nodes[i as usize].metadata().members.contains_key(&nid(2)),
             "seed={seed}: node {i} missing the post-reconfig write"
         );
     }
@@ -226,7 +237,7 @@ fn removing_a_live_voter_while_a_third_is_already_dead_can_strand_the_group() {
     let followers: Vec<usize> = (0..3).filter(|&i| i != l).collect();
     let dead = followers[0];
     let live_follower = followers[1];
-    sim.crash(dead as u64);
+    sim.crash(nid(dead as u64));
     sim.run_for(Duration::from_secs(1));
 
     // The leader removes the OTHER (live) follower — a plain single-server
@@ -238,7 +249,7 @@ fn removing_a_live_voter_while_a_third_is_already_dead_can_strand_the_group() {
         .collect();
     assert!(
         matches!(
-            nodes[l].change_membership(remaining),
+            nodes[l].change_membership(remaining.into_iter().map(nid).collect()),
             ProposeResult::Accepted { .. }
         ),
         "seed={seed}: the core has no survivor-liveness guard; this must be accepted"
@@ -265,7 +276,7 @@ fn removing_a_live_voter_while_a_third_is_already_dead_can_strand_the_group() {
          risk, not merely asserting it in prose"
     );
     assert!(
-        !nodes[l].metadata().members.contains_key(&2),
+        !nodes[l].metadata().members.contains_key(&nid(2)),
         "seed={seed}: the post-stranding write must never actually commit"
     );
 }
@@ -282,14 +293,14 @@ fn rejects_a_multi_server_delta() {
     // disjoint majorities without joint consensus).
     assert!(
         matches!(
-            nodes[l].change_membership(set(&[0])),
+            nodes[l].change_membership(set(&[0]).into_iter().map(nid).collect()),
             ProposeResult::NotLeader { .. }
         ),
         "seed={seed}"
     );
     assert_eq!(
         nodes[l].config(),
-        set(&ids),
+        set(&ids).into_iter().map(nid).collect(),
         "seed={seed}: a rejected change must not touch the active config"
     );
 }
@@ -305,14 +316,14 @@ fn rejects_leader_self_removal() {
     let others: Vec<u64> = ids.iter().copied().filter(|&n| n != l as u64).collect();
     assert!(
         matches!(
-            nodes[l].change_membership(set(&others)),
+            nodes[l].change_membership(set(&others).into_iter().map(nid).collect()),
             ProposeResult::NotLeader { .. }
         ),
         "seed={seed}: change_membership must reject removing the current leader"
     );
     assert_eq!(
         nodes[l].config(),
-        set(&ids),
+        set(&ids).into_iter().map(nid).collect(),
         "seed={seed}: a rejected self-removal must not touch the active config"
     );
 }
@@ -329,7 +340,7 @@ fn rejects_a_change_while_one_is_in_flight() {
     // (only the leader has appended it so far).
     assert!(
         matches!(
-            nodes[l].change_membership(set(&[0, 1, 2, 3])),
+            nodes[l].change_membership(set(&[0, 1, 2, 3]).into_iter().map(nid).collect()),
             ProposeResult::Accepted { .. }
         ),
         "seed={seed}"
@@ -341,7 +352,7 @@ fn rejects_a_change_while_one_is_in_flight() {
     // server_delta`'s job, not this test's.
     assert!(
         matches!(
-            nodes[l].change_membership(set(&[0, 1, 2, 4])),
+            nodes[l].change_membership(set(&[0, 1, 2, 4]).into_iter().map(nid).collect()),
             ProposeResult::NotLeader { .. }
         ),
         "seed={seed}: a second change must be rejected while the first is uncommitted"
@@ -354,7 +365,7 @@ fn rejects_a_change_while_one_is_in_flight() {
     sim.run_for(Duration::from_secs(2));
     assert!(
         matches!(
-            nodes[l].change_membership(set(&[0, 1, 2, 3, 4])),
+            nodes[l].change_membership(set(&[0, 1, 2, 3, 4]).into_iter().map(nid).collect()),
             ProposeResult::Accepted { .. }
         ),
         "seed={seed}: the gate should reopen once the prior change committed"
@@ -379,7 +390,7 @@ fn transfer_then_remove_the_leader_succeeds() {
     // change_membership can never remove the leader directly...
     assert!(
         matches!(
-            nodes[l].change_membership(set(&others)),
+            nodes[l].change_membership(set(&others).into_iter().map(nid).collect()),
             ProposeResult::NotLeader { .. }
         ),
         "seed={seed}"
@@ -389,7 +400,7 @@ fn transfer_then_remove_the_leader_succeeds() {
     // complete (a TimeoutNow round trip, bounded by one election timeout).
     let target = others[0];
     assert!(
-        nodes[l].transfer_leadership(target),
+        nodes[l].transfer_leadership(nid(target)),
         "seed={seed}: arming a transfer to a caught-up voter should succeed"
     );
     sim.run_for(Duration::from_millis(500));
@@ -407,7 +418,8 @@ fn transfer_then_remove_the_leader_succeeds() {
     let survivors: Vec<u64> = ids.iter().copied().filter(|&n| n != l as u64).collect();
     assert!(
         matches!(
-            nodes[target as usize].change_membership(set(&survivors)),
+            nodes[target as usize]
+                .change_membership(set(&survivors).into_iter().map(nid).collect()),
             ProposeResult::Accepted { .. }
         ),
         "seed={seed}"
@@ -417,7 +429,7 @@ fn transfer_then_remove_the_leader_succeeds() {
     for &i in &survivors {
         assert_eq!(
             nodes[i as usize].config(),
-            set(&survivors),
+            set(&survivors).into_iter().map(nid).collect(),
             "seed={seed}: node {i} should have adopted the post-removal config"
         );
     }
@@ -458,7 +470,7 @@ fn crash_of_leader_mid_change_converges_either_way() {
         .collect();
     assert!(
         matches!(
-            nodes[l].change_membership(set(&remaining)),
+            nodes[l].change_membership(set(&remaining).into_iter().map(nid).collect()),
             ProposeResult::Accepted { .. }
         ),
         "seed={seed}"
@@ -466,7 +478,7 @@ fn crash_of_leader_mid_change_converges_either_way() {
 
     // Crash the leader immediately — before any guaranteed flush/replication
     // of the just-appended config entry.
-    sim.crash(l as u64);
+    sim.crash(nid(l as u64));
     sim.run_for(Duration::from_secs(3));
 
     let survivors: Vec<usize> = (0..4).filter(|&i| i != l).collect();
@@ -482,7 +494,8 @@ fn crash_of_leader_mid_change_converges_either_way() {
         );
     }
     assert!(
-        reference == set(&ids) || reference == set(&remaining),
+        reference == set(&ids).into_iter().map(nid).collect()
+            || reference == set(&remaining).into_iter().map(nid).collect(),
         "seed={seed}: config after a leader crash mid-change must be either the \
          pre-change or the (committed) post-change config, got {reference:?}"
     );
@@ -498,7 +511,7 @@ fn crash_of_leader_mid_change_converges_either_way() {
     sim.run_for(Duration::from_secs(2));
     for &i in &survivors {
         assert!(
-            nodes[i].metadata().members.contains_key(&2),
+            nodes[i].metadata().members.contains_key(&nid(2)),
             "seed={seed}: node {i} missing the post-crash write"
         );
     }
@@ -507,7 +520,7 @@ fn crash_of_leader_mid_change_converges_either_way() {
 #[test]
 fn run_is_deterministic_from_seed() {
     let seed = 0x3311;
-    fn scenario(seed: u64) -> (Vec<String>, BTreeSet<u64>) {
+    fn scenario(seed: u64) -> (Vec<String>, BTreeSet<NodeId>) {
         let ids = [0u64, 1, 2, 3];
         let (mut sim, nodes) = cluster(seed, &ids);
         sim.run_for(Duration::from_secs(2));
@@ -518,7 +531,7 @@ fn run_is_deterministic_from_seed() {
             .copied()
             .filter(|&n| n != victim as u64)
             .collect();
-        let _ = nodes[l].change_membership(set(&remaining));
+        let _ = nodes[l].change_membership(set(&remaining).into_iter().map(nid).collect());
         sim.run_for(Duration::from_secs(2));
         (sim.trace_lines(), nodes[l].config())
     }
@@ -567,13 +580,13 @@ fn restart_of_freshly_added_voter_mid_catchup_resumes_and_converges() {
     // ADR 0038 PR3).
     let engine3 = MemoryEngine::new();
     drop(RaftNode::start(
-        sim.env(3),
-        all_ids.to_vec(),
+        sim.env(nid(3)),
+        all_ids.iter().copied().map(nid).collect(),
         engine3.clone(),
     ));
     assert!(
         matches!(
-            nodes[l].change_membership(set(&all_ids)),
+            nodes[l].change_membership(set(&all_ids).into_iter().map(nid).collect()),
             ProposeResult::Accepted { .. }
         ),
         "seed={seed}: adding node 3 should be accepted as a single-server delta"
@@ -586,7 +599,7 @@ fn restart_of_freshly_added_voter_mid_catchup_resumes_and_converges() {
     // exercises the "possibly none, possibly partial" WAL/snapshot state the
     // plan calls out, without pinning the test to precise chunk-timing.
     sim.run_for(Duration::from_millis(50));
-    sim.stop(3);
+    sim.stop(nid(3));
 
     // The surviving 3-of-4 (the original group, none of whom needed node 3 to
     // form a majority) keeps making progress while node 3 is down.
@@ -602,7 +615,11 @@ fn restart_of_freshly_added_voter_mid_catchup_resumes_and_converges() {
     // snapshot it had (possibly none at all, if it was stopped before any
     // replication reached it) and resumes catch-up like any other restarted
     // follower.
-    let node3 = RaftNode::start(sim.env(3), all_ids.to_vec(), engine3);
+    let node3 = RaftNode::start(
+        sim.env(nid(3)),
+        all_ids.iter().copied().map(nid).collect(),
+        engine3,
+    );
     sim.run_for(Duration::from_secs(4));
 
     let reference = nodes[l].metadata();
@@ -613,7 +630,7 @@ fn restart_of_freshly_added_voter_mid_catchup_resumes_and_converges() {
     );
     assert_eq!(
         node3.config(),
-        set(&all_ids),
+        set(&all_ids).into_iter().map(nid).collect(),
         "seed={seed}: restarted freshly-added voter never adopted the grown config"
     );
 
@@ -621,7 +638,7 @@ fn restart_of_freshly_added_voter_mid_catchup_resumes_and_converges() {
     // leaving leader + node 3 + one original follower — a majority only if
     // node 3 really acks.
     let extra_follower = (0..3).find(|&i| i != l).expect("an original follower");
-    sim.crash(extra_follower as u64);
+    sim.crash(nid(extra_follower as u64));
     assert!(
         matches!(
             nodes[l].propose(upsert(100)),
@@ -631,7 +648,7 @@ fn restart_of_freshly_added_voter_mid_catchup_resumes_and_converges() {
     );
     sim.run_for(Duration::from_secs(2));
     assert!(
-        node3.metadata().members.contains_key(&100),
+        node3.metadata().members.contains_key(&nid(100)),
         "seed={seed}: restarted node 3 must help form quorum for a post-recovery write"
     );
 }
@@ -653,8 +670,8 @@ fn crash_mid_change_converges_across_many_seeds() {
             .copied()
             .filter(|&n| n != victim as u64)
             .collect();
-        let _ = nodes[l].change_membership(set(&remaining));
-        sim.crash(l as u64);
+        let _ = nodes[l].change_membership(set(&remaining).into_iter().map(nid).collect());
+        sim.crash(nid(l as u64));
         sim.run_for(Duration::from_secs(3));
         let survivors: Vec<usize> = (0..4).filter(|&i| i != l).collect();
         let _ = unique_leader(&nodes, &survivors, seed);
@@ -663,7 +680,8 @@ fn crash_mid_change_converges_across_many_seeds() {
             assert_eq!(nodes[i].config(), reference, "seed={seed}");
         }
         assert!(
-            reference == set(&ids) || reference == set(&remaining),
+            reference == set(&ids).into_iter().map(nid).collect()
+                || reference == set(&remaining).into_iter().map(nid).collect(),
             "seed={seed}: unexpected converged config {reference:?}"
         );
     }
@@ -692,22 +710,22 @@ fn last_contact_ages_out_a_partitioned_peer_but_not_a_healthy_one() {
     // Before any partition, the leader has heard from both peers recently
     // (heartbeat cadence keeps `last_contact` fresh).
     assert!(
-        nodes[l].control_peer_believed_alive(partitioned as u64),
+        nodes[l].control_peer_believed_alive(nid(partitioned as u64)),
         "seed={seed}: a never-partitioned peer should be believed alive"
     );
     assert!(
-        nodes[l].control_peer_believed_alive(healthy as u64),
+        nodes[l].control_peer_believed_alive(nid(healthy as u64)),
         "seed={seed}: a never-partitioned peer should be believed alive"
     );
     // Self is trivially alive.
     assert!(
-        nodes[l].control_peer_believed_alive(l as u64),
+        nodes[l].control_peer_believed_alive(nid(l as u64)),
         "seed={seed}: a node should always believe itself alive"
     );
 
     // Isolate `partitioned` from both other nodes.
-    sim.partition_pair(partitioned as u64, l as u64);
-    sim.partition_pair(partitioned as u64, healthy as u64);
+    sim.partition_pair(nid(partitioned as u64), nid(l as u64));
+    sim.partition_pair(nid(partitioned as u64), nid(healthy as u64));
 
     // Run well past the liveness timeout — several multiples, mirroring
     // `pre_vote.rs`'s generous margin for "many election/heartbeat rounds
@@ -716,22 +734,22 @@ fn last_contact_ages_out_a_partitioned_peer_but_not_a_healthy_one() {
     sim.run_for(CONTROL_PEER_LIVENESS_TIMEOUT * 6);
 
     assert!(
-        !nodes[l].control_peer_believed_alive(partitioned as u64),
+        !nodes[l].control_peer_believed_alive(nid(partitioned as u64)),
         "seed={seed}: a peer silent past CONTROL_PEER_LIVENESS_TIMEOUT should \
          no longer be believed alive"
     );
     assert!(
-        nodes[l].control_peer_believed_alive(healthy as u64),
+        nodes[l].control_peer_believed_alive(nid(healthy as u64)),
         "seed={seed}: a peer acking every heartbeat should stay believed \
          alive across the same window"
     );
 
     // Heal: the partitioned peer resumes acking and ages back in.
-    sim.heal(partitioned as u64, l as u64);
-    sim.heal(partitioned as u64, healthy as u64);
+    sim.heal(nid(partitioned as u64), nid(l as u64));
+    sim.heal(nid(partitioned as u64), nid(healthy as u64));
     sim.run_for(Duration::from_secs(1));
     assert!(
-        nodes[l].control_peer_believed_alive(partitioned as u64),
+        nodes[l].control_peer_believed_alive(nid(partitioned as u64)),
         "seed={seed}: a healed peer should be believed alive again once it \
          resumes acking"
     );

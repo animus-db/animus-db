@@ -10,6 +10,8 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+#[cfg(test)]
+use animus_env::nid;
 use animus_env::{Env, EnvExt, Metric, MetricsHandle, NodeId};
 use animus_storage::{MergeOp, StorageEngine};
 use futures::future::{Either, select};
@@ -1481,8 +1483,8 @@ mod tests {
     #[test]
     fn grace_period_suppresses_down_then_allows_it() {
         // An Active member that has been silent past DETECT_TIMEOUT.
-        let meta = meta_with(7, NodeStatus::Active);
-        let det = detector_silent_since(7, Nanos(0));
+        let meta = meta_with(nid(7), NodeStatus::Active);
+        let det = detector_silent_since(nid(7), Nanos(0));
         let now = Nanos(DETECT_TIMEOUT.as_nanos() as u64 + 1);
 
         // Inside the grace period (allow_down = false): no Down proposed.
@@ -1494,10 +1496,10 @@ mod tests {
         assert!(matches!(
             &outs[0],
             MetaCommand::UpsertMember {
-                node: 7,
+                node,
                 status: NodeStatus::Down,
                 ..
-            }
+            } if *node == nid(7)
         ));
     }
 
@@ -1505,18 +1507,18 @@ mod tests {
     fn recovery_is_allowed_even_during_grace() {
         // A Down member whose heartbeat just arrived recovers regardless of the
         // grace gate (positive evidence, no false-positive risk).
-        let meta = meta_with(7, NodeStatus::Down);
-        let det = detector_silent_since(7, Nanos(1_000));
+        let meta = meta_with(nid(7), NodeStatus::Down);
+        let det = detector_silent_since(nid(7), Nanos(1_000));
         let now = Nanos(1_000); // fresh heartbeat → alive
         let outs = liveness_transitions(&meta.members, &det, now, false);
         assert_eq!(outs.len(), 1);
         assert!(matches!(
             &outs[0],
             MetaCommand::UpsertMember {
-                node: 7,
+                node,
                 status: NodeStatus::Active,
                 ..
-            }
+            } if *node == nid(7)
         ));
     }
 
@@ -1525,15 +1527,15 @@ mod tests {
     /// still-tracked member is left alone.
     #[test]
     fn stale_tracked_ids_reports_only_removed_members() {
-        let meta = meta_with(7, NodeStatus::Active);
-        let mut det = detector_silent_since(7, Nanos(1_000));
-        det.observe(99, Nanos(1_000)); // 99 was tracked but is not in `meta.members`
-        assert_eq!(stale_tracked_ids(&meta.members, &det), vec![99]);
+        let meta = meta_with(nid(7), NodeStatus::Active);
+        let mut det = detector_silent_since(nid(7), Nanos(1_000));
+        det.observe(nid(99), Nanos(1_000)); // 99 was tracked but is not in `meta.members`
+        assert_eq!(stale_tracked_ids(&meta.members, &det), vec![nid(99)]);
 
         // Once `members` no longer has 7 either (a real removal), it joins the
         // stale set too.
         let empty: BTreeMap<NodeId, Member> = BTreeMap::new();
-        assert_eq!(stale_tracked_ids(&empty, &det), vec![7, 99]);
+        assert_eq!(stale_tracked_ids(&empty, &det), vec![nid(7), nid(99)]);
     }
 
     /// A `detect_loop` tick calling `forget` for every `stale_tracked_ids`
@@ -1542,12 +1544,12 @@ mod tests {
     /// is exercised end to end in `tests/failure_detection.rs`).
     #[test]
     fn forgetting_stale_tracked_ids_stops_tracking_them() {
-        let mut det = detector_silent_since(99, Nanos(1_000));
+        let mut det = detector_silent_since(nid(99), Nanos(1_000));
         let empty: BTreeMap<NodeId, Member> = BTreeMap::new();
         for id in stale_tracked_ids(&empty, &det) {
             det.forget(id);
         }
-        assert!(!det.tracks(99));
+        assert!(!det.tracks(nid(99)));
     }
 
     // --- ADR 0038 PR3: the apply task's watermark-gated tail replay ---------
@@ -1574,12 +1576,12 @@ mod tests {
     #[tokio::test]
     async fn apply_and_compact_is_a_no_op_when_the_watermark_already_covers_everything() {
         let sim = animus_sim::Simulator::new(0xF00D);
-        let env = sim.env(0);
+        let env = sim.env(nid(0));
 
-        let mut core = RaftCore::new(0, &[0], Nanos(0), 7);
+        let mut core = RaftCore::new(nid(0), &[nid(0)], Nanos(0), 7);
         core.tick(Nanos(1_000_000_000), 7); // sole leader; index 1 = election no-op
         for i in 0..5u64 {
-            core.propose(upsert(i)); // indices 2..=6
+            core.propose(upsert(nid(i))); // indices 2..=6
         }
         core.mark_durable_through(core.last_log_index());
         let last_applied = core.last_applied();
@@ -1647,12 +1649,12 @@ mod tests {
     #[tokio::test]
     async fn apply_and_compact_replays_only_the_tail_beyond_the_watermark() {
         let sim = animus_sim::Simulator::new(0xF00D);
-        let env = sim.env(0);
+        let env = sim.env(nid(0));
 
-        let mut core = RaftCore::new(0, &[0], Nanos(0), 7);
+        let mut core = RaftCore::new(nid(0), &[nid(0)], Nanos(0), 7);
         core.tick(Nanos(1_000_000_000), 7); // index 1: leader no-op
         for i in 0..5u64 {
-            core.propose(upsert(i)); // indices 2..=6
+            core.propose(upsert(nid(i))); // indices 2..=6
         }
         core.mark_durable_through(core.last_log_index());
         let last_applied = core.last_applied();
@@ -1672,8 +1674,8 @@ mod tests {
         // the crash happened right there.
         let mut shadow = Metadata::default();
         let _ = mirror::apply_and_derive_mirror(&mut shadow, &MetaCommand::NoOp);
-        let _ = mirror::apply_and_derive_mirror(&mut shadow, &upsert(0));
-        let _ = mirror::apply_and_derive_mirror(&mut shadow, &upsert(1));
+        let _ = mirror::apply_and_derive_mirror(&mut shadow, &upsert(nid(0)));
+        let _ = mirror::apply_and_derive_mirror(&mut shadow, &upsert(nid(1)));
         let mut watermark = 3; // covers indices 1..=3
 
         let did_work = meta_apply_and_compact(
@@ -1745,7 +1747,7 @@ mod tests {
                         // independent of any other node's prior state.
                         let (_, writes) = mirror::apply_and_derive_mirror(
                             &mut Metadata::default(),
-                            &upsert(i - 2),
+                            &upsert(nid(i - 2)),
                         );
                         writes
                     })

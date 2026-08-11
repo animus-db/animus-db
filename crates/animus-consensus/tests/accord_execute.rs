@@ -14,6 +14,7 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use animus_consensus::{AccordNode, Key, TxnId};
+use animus_env::nid;
 use animus_sim::{SimEnv, Simulator};
 use futures::executor::block_on;
 
@@ -29,7 +30,7 @@ fn cluster(seed: u64) -> (Simulator, Vec<AccordNode<SimEnv>>) {
     let sim = Simulator::new(seed);
     let nodes = NODES
         .iter()
-        .map(|&id| AccordNode::start(sim.env(id), NODES.to_vec()))
+        .map(|&id| AccordNode::start(sim.env(nid(id)), NODES.iter().copied().map(nid).collect()))
         .collect();
     (sim, nodes)
 }
@@ -161,10 +162,10 @@ fn replica_recovers_executed_state_from_disk() {
     assert!(nodes[2].is_applied(a) && nodes[2].is_applied(b));
 
     // Stop node 2's process: tasks + volatile state die; the WAL on disk stays.
-    sim.stop(2);
+    sim.stop(nid(2));
 
     // Start a fresh node on the same id/disk — it recovers from the WAL.
-    nodes[2] = AccordNode::start(sim.env(2), NODES.to_vec());
+    nodes[2] = AccordNode::start(sim.env(nid(2)), NODES.iter().copied().map(nid).collect());
     sim.run_for(Duration::from_secs(2));
 
     // It recovered both transactions, their execution order, and the store.

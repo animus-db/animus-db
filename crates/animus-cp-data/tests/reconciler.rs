@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use animus_cp_data::host::{MetadataView, Reconciler};
 use animus_cp_data::{RaftKvNode, StorageScope};
-use animus_env::{Clock, EnvExt};
+use animus_env::{Clock, EnvExt, nid};
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::{MemoryEngine, StorageEngine};
 use animus_tablet::{KeyRange, Tablet, TabletId};
@@ -51,7 +51,7 @@ fn tablet(id: u64, start: &[u8], end: Option<&[u8]>, replicas: Vec<u64>) -> Tabl
         TabletId(id),
         TABLE,
         KeyRange::new(start.to_vec(), end.map(<[u8]>::to_vec)),
-        replicas,
+        replicas.into_iter().map(nid).collect(),
     )
 }
 
@@ -99,8 +99,8 @@ fn poll_until(
 fn reconciler_hosts_narrows_releases_and_confirms_sparing_a_sibling() {
     let seed = 0x9EC0_0311;
     let mut sim = Simulator::new(seed);
-    let base_env = sim.env(BASE);
-    let other_env = sim.env(OTHER);
+    let base_env = sim.env(nid(BASE));
+    let other_env = sim.env(nid(OTHER));
 
     let storage = MemoryEngine::new();
     let reconciler_storage = storage.clone();
@@ -129,7 +129,7 @@ fn reconciler_hosts_narrows_releases_and_confirms_sparing_a_sibling() {
         let mut reconciler: Reconciler<SimEnv, MemoryEngine> = Reconciler::new(
             task_env.clone(),
             reconciler_storage,
-            BASE,
+            nid(BASE),
             prefix_for,
             move |tablet, _node| h_log.lock().unwrap().push(tablet),
             move |tablet| t_log.lock().unwrap().push(tablet),
@@ -146,7 +146,7 @@ fn reconciler_hosts_narrows_releases_and_confirms_sparing_a_sibling() {
         // not a second node's full lifecycle).
         let other = KvNode::start_hosted(
             other_env,
-            vec![BASE, OTHER],
+            vec![nid(BASE), nid(OTHER)],
             other_storage,
             StorageScope::new(prefix_for(TABLE), KeyRange::whole()),
             1,
@@ -207,7 +207,7 @@ fn reconciler_hosts_narrows_releases_and_confirms_sparing_a_sibling() {
         if base_h1.is_leader() {
             let mut armed = false;
             for _ in 0..50 {
-                if base_h1.transfer_leadership(OTHER) {
+                if base_h1.transfer_leadership(nid(OTHER)) {
                     armed = true;
                     break;
                 }
@@ -225,7 +225,7 @@ fn reconciler_hosts_narrows_releases_and_confirms_sparing_a_sibling() {
                 "OTHER never took over tablet 1's leadership"
             );
         }
-        let removed = other.change_membership([OTHER].into_iter().collect());
+        let removed = other.change_membership([OTHER].into_iter().map(nid).collect());
         assert!(
             matches!(removed, animus_control::ProposeResult::Accepted { .. }),
             "OTHER (leader) must accept removing BASE: {removed:?}"
@@ -234,12 +234,12 @@ fn reconciler_hosts_narrows_releases_and_confirms_sparing_a_sibling() {
         // peer keeps receiving the removal entry until it acks past it).
         for _ in 0..50 {
             task_env.sleep(Duration::from_millis(100)).await;
-            if !base_h1.config().contains(&BASE) {
+            if !base_h1.config().contains(&nid(BASE)) {
                 break;
             }
         }
         assert!(
-            !base_h1.config().contains(&BASE),
+            !base_h1.config().contains(&nid(BASE)),
             "BASE's own durable Raft config never excluded it after removal"
         );
 

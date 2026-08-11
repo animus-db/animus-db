@@ -1027,13 +1027,13 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
                 // overriding the event's own target module path.
                 if armed {
                     tracing::debug!(
-                        xfer_target = target,
+                        xfer_target = target.as_u64(),
                         commit,
                         "reconfigure_step: armed leadership transfer to remove self"
                     );
                 } else {
                     tracing::warn!(
-                        xfer_target = target,
+                        xfer_target = target.as_u64(),
                         commit,
                         "reconfigure_step: transfer_leadership rejected an apparently-eligible target"
                     );

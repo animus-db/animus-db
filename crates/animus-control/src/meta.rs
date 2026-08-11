@@ -10,6 +10,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use animus_env::NodeId;
+#[cfg(test)]
+use animus_env::nid;
 use animus_placement::{Candidate, PlacementPolicy, rebalance_step, replan};
 use animus_tablet::{Epoch, KeyRange, Tablet, TabletId};
 use serde::{Deserialize, Serialize};
@@ -28,7 +30,7 @@ use crate::schema::{IndexDef, SchemaCatalog, TableName, TableSchema};
 /// enforced at apply time against a real cluster's chosen ids either (ADR
 /// 0036's explicit non-goal): a manually-configured cluster with more than
 /// ~1M nodes is not a realistic scenario this needs to guard against.
-pub const ALLOC_ID_BASE: NodeId = 1_000_000;
+pub const ALLOC_ID_BASE: NodeId = NodeId::new(1_000_000);
 
 /// Lifecycle status of a cluster member.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1003,7 +1005,7 @@ impl Metadata {
                     return ApplyOutcome::NoOp;
                 }
                 let node_id = self.next_free_alloc_id();
-                self.next_alloc_id = node_id + 1;
+                self.next_alloc_id = NodeId::new(node_id.as_u64() + 1);
                 self.node_id_allocations.insert(nonce.clone(), node_id);
                 self.members.insert(
                     node_id,
@@ -1153,17 +1155,20 @@ impl Metadata {
             .copied()
             .filter(|&id| id >= ALLOC_ID_BASE)
             .max()
-            .unwrap_or(0);
+            .unwrap_or(NodeId::new(0));
         let highest_allocation = self
             .node_id_allocations
             .values()
             .copied()
             .max()
-            .unwrap_or(0);
-        self.next_alloc_id
-            .max(highest_member + 1)
-            .max(highest_allocation + 1)
-            .max(ALLOC_ID_BASE)
+            .unwrap_or(NodeId::new(0));
+        NodeId::new(
+            self.next_alloc_id
+                .as_u64()
+                .max(highest_member.as_u64() + 1)
+                .max(highest_allocation.as_u64() + 1)
+                .max(ALLOC_ID_BASE.as_u64()),
+        )
     }
 }
 
@@ -1337,25 +1342,37 @@ mod tests {
         };
 
         // First registration applies and is readable.
-        assert_eq!(m.apply(&reg(301, "127.0.0.1:9001")), ApplyOutcome::Applied);
         assert_eq!(
-            m.cp_member_addrs.get(&301).map(String::as_str),
+            m.apply(&reg(nid(301), "127.0.0.1:9001")),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.cp_member_addrs.get(&nid(301)).map(String::as_str),
             Some("127.0.0.1:9001")
         );
 
         // Re-registering the same address is a no-op (so a periodic re-register
         // does not churn the Raft log).
-        assert_eq!(m.apply(&reg(301, "127.0.0.1:9001")), ApplyOutcome::NoOp);
+        assert_eq!(
+            m.apply(&reg(nid(301), "127.0.0.1:9001")),
+            ApplyOutcome::NoOp
+        );
 
         // A changed address updates the entry.
-        assert_eq!(m.apply(&reg(301, "127.0.0.1:9002")), ApplyOutcome::Applied);
         assert_eq!(
-            m.cp_member_addrs.get(&301).map(String::as_str),
+            m.apply(&reg(nid(301), "127.0.0.1:9002")),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.cp_member_addrs.get(&nid(301)).map(String::as_str),
             Some("127.0.0.1:9002")
         );
 
         // A distinct member coexists.
-        assert_eq!(m.apply(&reg(401, "127.0.0.1:9101")), ApplyOutcome::Applied);
+        assert_eq!(
+            m.apply(&reg(nid(401), "127.0.0.1:9101")),
+            ApplyOutcome::Applied
+        );
         assert_eq!(m.cp_member_addrs.len(), 2);
     }
 
@@ -1375,17 +1392,17 @@ mod tests {
         // First registration applies and is readable.
         assert_eq!(
             m.apply(&MetaCommand::RegisterNodeAddrs {
-                node: 300,
+                node: nid(300),
                 addrs: addrs(0),
             }),
             ApplyOutcome::Applied
         );
-        assert_eq!(m.node_addrs.get(&300), Some(&addrs(0)));
+        assert_eq!(m.node_addrs.get(&nid(300)), Some(&addrs(0)));
 
         // Re-registering an identical address book is a no-op.
         assert_eq!(
             m.apply(&MetaCommand::RegisterNodeAddrs {
-                node: 300,
+                node: nid(300),
                 addrs: addrs(0),
             }),
             ApplyOutcome::NoOp
@@ -1394,17 +1411,17 @@ mod tests {
         // A changed address book overwrites the entry.
         assert_eq!(
             m.apply(&MetaCommand::RegisterNodeAddrs {
-                node: 300,
+                node: nid(300),
                 addrs: addrs(1),
             }),
             ApplyOutcome::Applied
         );
-        assert_eq!(m.node_addrs.get(&300), Some(&addrs(1)));
+        assert_eq!(m.node_addrs.get(&nid(300)), Some(&addrs(1)));
 
         // A distinct member coexists.
         assert_eq!(
             m.apply(&MetaCommand::RegisterNodeAddrs {
-                node: 301,
+                node: nid(301),
                 addrs: addrs(2),
             }),
             ApplyOutcome::Applied
@@ -1440,7 +1457,7 @@ mod tests {
         for (node, role) in [(0, "control"), (300, "data"), (301, "combined")] {
             assert_eq!(
                 m.apply(&MetaCommand::RegisterNodeAddrs {
-                    node,
+                    node: nid(node),
                     addrs: NodeAddrs {
                         internal: format!("127.0.0.1:{}", 9300 + node),
                         client: format!("127.0.0.1:{}", 9000 + node),
@@ -1450,7 +1467,10 @@ mod tests {
                 }),
                 ApplyOutcome::Applied
             );
-            assert_eq!(m.node_addrs.get(&node).map(|a| a.role.as_str()), Some(role));
+            assert_eq!(
+                m.node_addrs.get(&nid(node)).map(|a| a.role.as_str()),
+                Some(role)
+            );
         }
     }
 
@@ -1493,22 +1513,22 @@ mod tests {
                 tablet: TabletId(1),
                 table: Some("users".to_owned()),
                 range: KeyRange::whole(),
-                replicas: vec![1, 2, 3],
+                replicas: vec![nid(1), nid(2), nid(3)],
             },
             // Tablet-scoped members of tablet 1.
             MetaCommand::RegisterCpAddr {
-                id: 1301,
+                id: nid(1301),
                 addr: "127.0.0.1:9301".to_owned(),
                 tablet: Some(TabletId(1)),
             },
             MetaCommand::RegisterCpAddr {
-                id: 1302,
+                id: nid(1302),
                 addr: "127.0.0.1:9302".to_owned(),
                 tablet: Some(TabletId(1)),
             },
             // A legacy (tablet-less) member: never pruned.
             MetaCommand::RegisterCpAddr {
-                id: 301,
+                id: nid(301),
                 addr: "127.0.0.1:9001".to_owned(),
                 tablet: None,
             },
@@ -1526,12 +1546,12 @@ mod tests {
 
         let m = replay(&commands);
         // The dropped tablet's members were reclaimed from BOTH maps…
-        assert!(!m.cp_member_addrs.contains_key(&1301));
-        assert!(!m.cp_member_addrs.contains_key(&1302));
+        assert!(!m.cp_member_addrs.contains_key(&nid(1301)));
+        assert!(!m.cp_member_addrs.contains_key(&nid(1302)));
         assert!(m.cp_member_tablets.is_empty());
         // …the legacy entry survives.
         assert_eq!(
-            m.cp_member_addrs.get(&301).map(String::as_str),
+            m.cp_member_addrs.get(&nid(301)).map(String::as_str),
             Some("127.0.0.1:9001")
         );
 
@@ -1544,13 +1564,13 @@ mod tests {
         let mut m = m;
         assert_eq!(
             m.apply(&MetaCommand::RegisterCpAddr {
-                id: 1301,
+                id: nid(1301),
                 addr: "127.0.0.1:9301".to_owned(),
                 tablet: Some(TabletId(1)),
             }),
             ApplyOutcome::Rejected("no such tablet for cp addr")
         );
-        assert!(!m.cp_member_addrs.contains_key(&1301));
+        assert!(!m.cp_member_addrs.contains_key(&nid(1301)));
     }
 
     /// The `MergeTablets` removal path prunes the merged-away tablet's CP member
@@ -1564,7 +1584,7 @@ mod tests {
                 tablet: TabletId(1),
                 table: None,
                 range: KeyRange::new(Vec::new(), Some(mid.clone())),
-                replicas: vec![1, 2, 3],
+                replicas: vec![nid(1), nid(2), nid(3)],
             }),
             ApplyOutcome::Applied
         );
@@ -1573,14 +1593,14 @@ mod tests {
                 tablet: TabletId(2),
                 table: None,
                 range: KeyRange::new(mid, None),
-                replicas: vec![1, 2, 3],
+                replicas: vec![nid(1), nid(2), nid(3)],
             }),
             ApplyOutcome::Applied
         );
         for (id, tablet) in [(1301, 1u64), (2301, 2u64)] {
             assert_eq!(
                 m.apply(&MetaCommand::RegisterCpAddr {
-                    id,
+                    id: nid(id),
                     addr: format!("127.0.0.1:{id}"),
                     tablet: Some(TabletId(tablet)),
                 }),
@@ -1598,10 +1618,10 @@ mod tests {
             ApplyOutcome::Applied
         );
         // The merged-away right tablet's member is reclaimed; the survivor's stays.
-        assert!(!m.cp_member_addrs.contains_key(&2301));
-        assert!(!m.cp_member_tablets.contains_key(&2301));
-        assert!(m.cp_member_addrs.contains_key(&1301));
-        assert_eq!(m.cp_member_tablets.get(&1301), Some(&TabletId(1)));
+        assert!(!m.cp_member_addrs.contains_key(&nid(2301)));
+        assert!(!m.cp_member_tablets.contains_key(&nid(2301)));
+        assert!(m.cp_member_addrs.contains_key(&nid(1301)));
+        assert_eq!(m.cp_member_tablets.get(&nid(1301)), Some(&TabletId(1)));
         assert!(
             m.merged_tablets.contains(&TabletId(2)),
             "the merged-away tablet must be recorded (ADR 0033)"
@@ -1624,7 +1644,7 @@ mod tests {
                 tablet: TabletId(1),
                 table: None,
                 range: KeyRange::whole(),
-                replicas: vec![1, 2, 3],
+                replicas: vec![nid(1), nid(2), nid(3)],
             }),
             ApplyOutcome::Applied
         );
@@ -1675,7 +1695,7 @@ mod tests {
                 tablet: TabletId(1),
                 table: None,
                 range: KeyRange::new(Vec::new(), Some(mid.clone())),
-                replicas: vec![1, 2, 3],
+                replicas: vec![nid(1), nid(2), nid(3)],
             }),
             ApplyOutcome::Applied
         );
@@ -1684,7 +1704,7 @@ mod tests {
                 tablet: TabletId(2),
                 table: None,
                 range: KeyRange::new(mid.clone(), None),
-                replicas: vec![1, 2, 3],
+                replicas: vec![nid(1), nid(2), nid(3)],
             }),
             ApplyOutcome::Applied
         );
@@ -1743,7 +1763,7 @@ mod tests {
             tablet: TabletId(id),
             table: table.map(str::to_owned),
             range: KeyRange::whole(),
-            replicas: vec![1, 2, 3],
+            replicas: vec![nid(1), nid(2), nid(3)],
         };
         assert_eq!(m.apply(&create(1, Some("users"))), ApplyOutcome::Applied);
         assert_eq!(m.apply(&create(2, Some("orders"))), ApplyOutcome::Applied);
@@ -1799,7 +1819,7 @@ mod tests {
             tablet: TabletId(id),
             table: Some(table.to_owned()),
             range: KeyRange::whole(),
-            replicas: vec![1, 2, 3],
+            replicas: vec![nid(1), nid(2), nid(3)],
         };
 
         // Fresh metadata allocates id 1 (id 0 is reserved).
@@ -1826,7 +1846,7 @@ mod tests {
         let legacy = Metadata {
             tablets: [(
                 TabletId(7),
-                Tablet::new(TabletId(7), KeyRange::whole(), vec![1]),
+                Tablet::new(TabletId(7), KeyRange::whole(), vec![nid(1)]),
             )]
             .into_iter()
             .collect(),
@@ -1849,7 +1869,7 @@ mod tests {
             tablet: TabletId(id),
             table: Some(table.to_owned()),
             range: KeyRange::whole(),
-            replicas: vec![1, 2, 3],
+            replicas: vec![nid(1), nid(2), nid(3)],
         };
         assert_eq!(m.apply(&create(1, "users")), ApplyOutcome::Applied);
         assert_eq!(m.apply(&create(2, "orders")), ApplyOutcome::Applied);
@@ -1904,7 +1924,7 @@ mod tests {
                 tablet: TabletId(1),
                 table: Some("users".to_owned()),
                 range: KeyRange::whole(),
-                replicas: vec![1, 2, 3],
+                replicas: vec![nid(1), nid(2), nid(3)],
             }),
             ApplyOutcome::Applied
         );
@@ -1961,7 +1981,7 @@ mod tests {
     fn remove_member_rejects_while_referenced_by_a_tablet() {
         let mut m = Metadata::default();
         m.apply(&MetaCommand::UpsertMember {
-            node: 301,
+            node: nid(301),
             labels: BTreeMap::new(),
             status: NodeStatus::Leaving,
         });
@@ -1969,14 +1989,14 @@ mod tests {
             tablet: TabletId(1),
             table: Some("users".to_owned()),
             range: KeyRange::whole(),
-            replicas: vec![300, 301, 302],
+            replicas: vec![nid(300), nid(301), nid(302)],
         });
-        assert_eq!(m.tablets_referencing(301), 1);
+        assert_eq!(m.tablets_referencing(nid(301)), 1);
         assert_eq!(
-            m.apply(&MetaCommand::RemoveMember { node: 301 }),
+            m.apply(&MetaCommand::RemoveMember { node: nid(301) }),
             ApplyOutcome::Rejected("still referenced by a tablet's replica set")
         );
-        assert!(m.members.contains_key(&301));
+        assert!(m.members.contains_key(&nid(301)));
     }
 
     /// `RemoveMember` is rejected while the member is still `Active`/`Joining` —
@@ -1987,16 +2007,16 @@ mod tests {
         for status in [NodeStatus::Active, NodeStatus::Joining] {
             let mut m = Metadata::default();
             m.apply(&MetaCommand::UpsertMember {
-                node: 301,
+                node: nid(301),
                 labels: BTreeMap::new(),
                 status,
             });
             assert_eq!(
-                m.apply(&MetaCommand::RemoveMember { node: 301 }),
+                m.apply(&MetaCommand::RemoveMember { node: nid(301) }),
                 ApplyOutcome::Rejected("not drained: member is Active or Joining"),
                 "status {status:?} should block removal"
             );
-            assert!(m.members.contains_key(&301));
+            assert!(m.members.contains_key(&nid(301)));
         }
     }
 
@@ -2010,12 +2030,12 @@ mod tests {
         for status in [NodeStatus::Leaving, NodeStatus::Down] {
             let mut m = Metadata::default();
             m.apply(&MetaCommand::UpsertMember {
-                node: 301,
+                node: nid(301),
                 labels: BTreeMap::new(),
                 status,
             });
             m.apply(&MetaCommand::RegisterNodeAddrs {
-                node: 301,
+                node: nid(301),
                 addrs: NodeAddrs {
                     internal: "127.0.0.1:9301".to_owned(),
                     client: "127.0.0.1:9001".to_owned(),
@@ -2024,26 +2044,26 @@ mod tests {
                 },
             });
             m.apply(&MetaCommand::RegisterCpAddr {
-                id: 301,
+                id: nid(301),
                 addr: "127.0.0.1:9301".to_owned(),
                 tablet: None,
             });
-            assert_eq!(m.tablets_referencing(301), 0);
+            assert_eq!(m.tablets_referencing(nid(301)), 0);
 
             assert_eq!(
-                m.apply(&MetaCommand::RemoveMember { node: 301 }),
+                m.apply(&MetaCommand::RemoveMember { node: nid(301) }),
                 ApplyOutcome::Applied,
                 "status {status:?} should allow removal"
             );
-            assert!(!m.members.contains_key(&301));
-            assert!(!m.node_addrs.contains_key(&301));
-            assert!(!m.cp_member_addrs.contains_key(&301));
-            assert!(!m.cp_member_tablets.contains_key(&301));
+            assert!(!m.members.contains_key(&nid(301)));
+            assert!(!m.node_addrs.contains_key(&nid(301)));
+            assert!(!m.cp_member_addrs.contains_key(&nid(301)));
+            assert!(!m.cp_member_tablets.contains_key(&nid(301)));
 
             // Idempotent retry: already absent — `NoOp` (the file's convention
             // for nothing-changed applies), never `Rejected`.
             assert_eq!(
-                m.apply(&MetaCommand::RemoveMember { node: 301 }),
+                m.apply(&MetaCommand::RemoveMember { node: nid(301) }),
                 ApplyOutcome::NoOp
             );
         }
@@ -2058,7 +2078,7 @@ mod tests {
     fn metadata_round_trips_with_the_remove_member_variant_in_scope() {
         let mut m = Metadata::default();
         m.apply(&MetaCommand::UpsertMember {
-            node: 301,
+            node: nid(301),
             labels: BTreeMap::new(),
             status: NodeStatus::Active,
         });
@@ -2080,7 +2100,7 @@ mod tests {
         // comfortably below `ALLOC_ID_BASE` for any realistic node count.
         for node in [0u64, 1, 300, 301, 302] {
             m.apply(&MetaCommand::UpsertMember {
-                node,
+                node: nid(node),
                 labels: BTreeMap::new(),
                 status: NodeStatus::Active,
             });
@@ -2097,7 +2117,7 @@ mod tests {
         let first = *m.node_id_allocations.get("join-1").expect("recorded");
         assert_eq!(first, ALLOC_ID_BASE, "first allocation lands at the base");
         assert!(
-            first > 302,
+            first > nid(302),
             "allocated id must never collide with a small manual id"
         );
 
@@ -2111,8 +2131,8 @@ mod tests {
             ApplyOutcome::Applied
         );
         let second = *m.node_id_allocations.get("join-2").expect("recorded");
-        assert_eq!(second, first + 1);
-        assert_eq!(m.next_free_alloc_id(), second + 1);
+        assert_eq!(second.as_u64(), first.as_u64() + 1);
+        assert_eq!(m.next_free_alloc_id().as_u64(), second.as_u64() + 1);
     }
 
     /// Replaying the **same nonce** (a proposer retry after an `Accepted`-

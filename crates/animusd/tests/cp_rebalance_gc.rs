@@ -44,6 +44,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use animus_env::{NodeId, nid};
 use animus_tablet::TabletId;
 use animusd::{
     ClientRequest, ClientResponse, ClusterConfig, MetaCommand, Node, RoleAddrs, read_frame,
@@ -290,7 +291,7 @@ async fn set_replicas(nodes: &[Node], tablet: TabletId, replicas: &[u64]) {
                 let cmd = MetaCommand::CasTabletReplicas {
                     tablet,
                     expected_epoch: epoch,
-                    replicas: replicas.to_vec(),
+                    replicas: replicas.iter().copied().map(nid).collect(),
                 };
                 for node in nodes {
                     if node.is_control_leader() {
@@ -302,7 +303,7 @@ async fn set_replicas(nodes: &[Node], tablet: TabletId, replicas: &[u64]) {
                 .metadata()
                 .tablets
                 .get(&tablet)
-                .map(|t| t.replicas.iter().copied().collect());
+                .map(|t| t.replicas.iter().copied().map(NodeId::as_u64).collect());
             if now.as_ref() == Some(&want) {
                 return;
             }
@@ -342,6 +343,7 @@ async fn moved_off_replica_is_stopped_and_its_scope_erased() {
             .copied()
             .filter(|&id| id != dropped_id)
             .chain([spare])
+            .map(NodeId::as_u64)
             .collect();
         assert_eq!(kept.len(), 3);
         set_replicas(&nodes, KV_TABLET, &kept).await;
@@ -444,6 +446,7 @@ async fn release_survives_a_restart_replay() {
             .copied()
             .filter(|&id| id != dropped_id)
             .chain([spare])
+            .map(NodeId::as_u64)
             .collect();
         set_replicas(&nodes, KV_TABLET, &kept).await;
 
@@ -568,8 +571,8 @@ async fn a_joining_spare_is_never_released() {
                     if let Some((true, voters)) =
                         tablet_group(config.nodes[i].admin, KV_TABLET).await
                         && voters.len() == 3
-                        && voters.contains(&spare)
-                        && !voters.contains(&killed_id)
+                        && voters.contains(&spare.as_u64())
+                        && !voters.contains(&killed_id.as_u64())
                     {
                         return;
                     }
@@ -668,6 +671,7 @@ async fn split_then_immediate_release_spares_the_new_siblings_data() {
             .copied()
             .filter(|&id| id != dropped_id)
             .chain([spare])
+            .map(NodeId::as_u64)
             .collect();
 
         // Propose the split AND the parent's replica-set CAS **back-to-back on
@@ -709,7 +713,7 @@ async fn split_then_immediate_release_spares_the_new_siblings_data() {
             control_leader.propose_meta(MetaCommand::CasTabletReplicas {
                 tablet: KV_TABLET,
                 expected_epoch: source_epoch.next(),
-                replicas: kept.clone(),
+                replicas: kept.clone().into_iter().map(nid).collect(),
             }),
             "replica-set CAS proposal was rejected locally on the control leader"
         );
@@ -726,7 +730,7 @@ async fn split_then_immediate_release_spares_the_new_siblings_data() {
                                 .iter()
                                 .copied()
                                 .collect::<std::collections::BTreeSet<_>>()
-                                == want_replicas
+                                == want_replicas.iter().copied().map(nid).collect()
                         })
                 }) {
                     return;

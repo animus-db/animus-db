@@ -268,7 +268,7 @@ async fn node_joins_via_seed_with_no_expanded_config() {
     let promoted = async {
         loop {
             let statuses = member_statuses(core_admin[0]).await;
-            if statuses.get(&join_raftkv_id).map(String::as_str) == Some("Active") {
+            if statuses.get(&join_raftkv_id.as_u64()).map(String::as_str) == Some("Active") {
                 return;
             }
             sleep(Duration::from_millis(100)).await;
@@ -289,7 +289,9 @@ async fn node_joins_via_seed_with_no_expanded_config() {
     let hosted_table: String = {
         let discover = async {
             loop {
-                if let Some(table) = table_with_replica(core_admin[0], join_raftkv_id).await {
+                if let Some(table) =
+                    table_with_replica(core_admin[0], (join_raftkv_id).as_u64()).await
+                {
                     return table;
                 }
                 sleep(Duration::from_millis(300)).await;

@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use animus_control::ProposeResult;
 use animus_cp_data::{RaftKvNode, StorageScope};
-use animus_env::EnvExt;
+use animus_env::{EnvExt, nid};
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::{MemoryEngine, StorageEngine};
 use animus_tablet::KeyRange;
@@ -38,13 +38,23 @@ fn two_scoped_groups(sim: &Simulator, engine: MemoryEngine) -> (Vec<KvNode>, Vec
     let a = GROUP_A
         .iter()
         .map(|&id| {
-            RaftKvNode::start_scoped(sim.env(id), GROUP_A.to_vec(), engine.clone(), scope(b"A:"))
+            RaftKvNode::start_scoped(
+                sim.env(nid(id)),
+                GROUP_A.iter().copied().map(nid).collect(),
+                engine.clone(),
+                scope(b"A:"),
+            )
         })
         .collect();
     let b = GROUP_B
         .iter()
         .map(|&id| {
-            RaftKvNode::start_scoped(sim.env(id), GROUP_B.to_vec(), engine.clone(), scope(b"B:"))
+            RaftKvNode::start_scoped(
+                sim.env(nid(id)),
+                GROUP_B.iter().copied().map(nid).collect(),
+                engine.clone(),
+                scope(b"B:"),
+            )
         })
         .collect();
     (a, b)
@@ -198,7 +208,7 @@ fn snapshot_catchup_does_not_leak_the_sibling_scopes_data() {
     let la = leader(&nodes_a, seed);
     let lagging = (0..3).find(|&i| i != la).expect("a follower exists");
     // Crash (mute) the lagging follower so it misses everything below.
-    sim.crash(GROUP_A[lagging]);
+    sim.crash(nid(GROUP_A[lagging]));
 
     // Group A writes well past the compaction threshold (64) so the leader
     // snapshots + truncates the log prefix the crashed follower would need.
@@ -227,7 +237,7 @@ fn snapshot_catchup_does_not_leak_the_sibling_scopes_data() {
 
     // Bring the lagging replica back: its log is far behind the leader's
     // compacted base, so it must catch up via InstallSnapshot.
-    sim.restart(GROUP_A[lagging]);
+    sim.restart(nid(GROUP_A[lagging]));
     sim.run_for(Duration::from_secs(6));
 
     // The recovered replica has every one of group A's writes...

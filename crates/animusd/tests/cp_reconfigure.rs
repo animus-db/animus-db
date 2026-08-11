@@ -22,6 +22,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use animus_env::{NodeId, nid};
 use animus_tablet::{Epoch, TabletId};
 use animusd::{
     ClientRequest, ClientResponse, ClusterConfig, MetaCommand, Node, NodeStatus, RoleAddrs,
@@ -228,6 +229,7 @@ async fn cp_group_follows_tablet_replica_set() {
         .iter()
         .copied()
         .filter(|&id| id != raftkv_ids[drop_idx])
+        .map(NodeId::as_u64)
         .collect();
     assert_eq!(kept.len(), 2);
 
@@ -244,7 +246,7 @@ async fn cp_group_follows_tablet_replica_set() {
             let cmd = MetaCommand::CasTabletReplicas {
                 tablet: BOOTSTRAP_TABLET,
                 expected_epoch: epoch,
-                replicas: kept.clone(),
+                replicas: kept.clone().into_iter().map(nid).collect(),
             };
             for node in &nodes {
                 if node.is_control_leader() {
@@ -281,7 +283,7 @@ async fn cp_group_follows_tablet_replica_set() {
             if let Some((is_leader, voters)) = group_view(nodes[leader_idx].admin_addr()).await
                 && is_leader
                 && voters.len() == 2
-                && !voters.contains(&dropped)
+                && !voters.contains(&dropped.as_u64())
             {
                 return;
             }
@@ -439,8 +441,8 @@ async fn failure_auto_replaces_replica_onto_spare() {
             for &i in &survivors {
                 if let Some((true, voters)) = group_view_opt(config.nodes[i].admin).await
                     && voters.len() == 3
-                    && voters.contains(&spare)
-                    && !voters.contains(&killed_id)
+                    && voters.contains(&spare.as_u64())
+                    && !voters.contains(&killed_id.as_u64())
                 {
                     return;
                 }

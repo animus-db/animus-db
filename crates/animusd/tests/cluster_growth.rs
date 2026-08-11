@@ -25,6 +25,7 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use animus_env::{NodeId, nid};
 use animusd::{ClientRequest, ClientResponse, ClusterConfig, Node, read_frame};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -147,9 +148,9 @@ async fn member_statuses(admin_addr: SocketAddr) -> BTreeMap<u64, String> {
 
 fn replica_counts(
     map: &BTreeMap<u64, (Vec<u64>, u64)>,
-    raftkv_ids: &[u64],
+    raftkv_ids: &[NodeId],
 ) -> BTreeMap<u64, usize> {
-    let mut counts: BTreeMap<u64, usize> = raftkv_ids.iter().map(|&id| (id, 0)).collect();
+    let mut counts: BTreeMap<u64, usize> = raftkv_ids.iter().map(|&id| (id.as_u64(), 0)).collect();
     for (replicas, _) in map.values() {
         for &r in replicas {
             *counts.entry(r).or_insert(0) += 1;
@@ -250,7 +251,7 @@ async fn cluster_grows_from_three_to_five_and_rebalances() {
     let before_counts = replica_counts(&before_growth, &raftkv_ids_3);
     for &id in &raftkv_ids_3 {
         assert!(
-            before_counts[&id] > 0,
+            before_counts[&id.as_u64()] > 0,
             "every original node should host something pre-growth: {before_counts:?}"
         );
     }
@@ -306,7 +307,7 @@ async fn cluster_grows_from_three_to_five_and_rebalances() {
             let statuses = member_statuses(all_admin[0]).await;
             if new_ids
                 .iter()
-                .all(|id| statuses.get(id).map(String::as_str) == Some("Active"))
+                .all(|id| statuses.get(&id.as_u64()).map(String::as_str) == Some("Active"))
             {
                 return;
             }
@@ -321,7 +322,7 @@ async fn cluster_grows_from_three_to_five_and_rebalances() {
     // task 3): register a third, never-started raftkv id and confirm it stays
     // `Down` for well past the detector's own timing constants — it can never
     // heartbeat, so it can never be promoted.
-    let phantom_id = all_raftkv_ids[4] + 1000; // an id nothing will ever run
+    let phantom_id = nid(all_raftkv_ids[4].as_u64() + 1000); // an id nothing will ever run
     let (status, body) = admin(
         base_admin[0],
         "POST",
@@ -333,7 +334,7 @@ async fn cluster_grows_from_three_to_five_and_rebalances() {
     sleep(Duration::from_secs(2)).await;
     let statuses = member_statuses(all_admin[0]).await;
     assert_eq!(
-        statuses.get(&phantom_id).map(String::as_str),
+        statuses.get(&phantom_id.as_u64()).map(String::as_str),
         Some("Down"),
         "a never-booted declared node must not drift off Down: {statuses:?}"
     );
@@ -355,7 +356,7 @@ async fn cluster_grows_from_three_to_five_and_rebalances() {
         .unwrap_or_else(|_| panic!("tablet replicas never spread across all 5 nodes within 120s"));
     for &id in new_ids {
         assert!(
-            converged_counts[&id] > 0,
+            converged_counts[&id.as_u64()] > 0,
             "node {id} never gained a replica: {converged_counts:?}"
         );
     }
@@ -494,7 +495,7 @@ async fn dashboard_health_recovers_after_grown_cluster_loses_an_original_node() 
             let statuses = member_statuses(all_admin[0]).await;
             if new_ids
                 .iter()
-                .all(|id| statuses.get(id).map(String::as_str) == Some("Active"))
+                .all(|id| statuses.get(&id.as_u64()).map(String::as_str) == Some("Active"))
             {
                 return;
             }
@@ -536,9 +537,9 @@ async fn dashboard_health_recovers_after_grown_cluster_loses_an_original_node() 
         loop {
             let map = tablet_map(survivor_admin[0]).await;
             let statuses = member_statuses(survivor_admin[0]).await;
-            let all_ok = map
-                .values()
-                .all(|(replicas, _)| replicas.len() == 3 && !replicas.contains(&killed_id));
+            let all_ok = map.values().all(|(replicas, _)| {
+                replicas.len() == 3 && !replicas.contains(&killed_id.as_u64())
+            });
             if all_ok {
                 return (map, statuses);
             }

@@ -25,6 +25,7 @@ use std::time::Duration;
 use animus_control::ColumnType;
 use animus_control::raft::ProposeResult;
 use animus_control::{IndexDef, IndexKind, IndexProjection, MetaCommand, RaftNode, TableSchema};
+use animus_env::nid;
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::MemoryEngine;
 
@@ -39,7 +40,13 @@ fn cluster(seed: u64) -> (Simulator, Vec<RaftNode<SimEnv>>, Vec<MemoryEngine>) {
     let engines: Vec<MemoryEngine> = NODES.iter().map(|_| MemoryEngine::new()).collect();
     let nodes = NODES
         .iter()
-        .map(|&id| RaftNode::start(sim.env(id), NODES.to_vec(), engines[id as usize].clone()))
+        .map(|&id| {
+            RaftNode::start(
+                sim.env(nid(id)),
+                NODES.iter().copied().map(nid).collect(),
+                engines[id as usize].clone(),
+            )
+        })
         .collect();
     (sim, nodes, engines)
 }
@@ -152,11 +159,11 @@ fn run(seed: u64) {
     // 3. Restart a follower: its volatile state dies, its WAL survives. The index
     //    definition must come back from the replicated catalog, not local memory.
     let follower = (0..3).find(|&i| i != leader).unwrap();
-    sim.stop(follower as u64);
+    sim.stop(nid(follower as u64));
     sim.run_for(Duration::from_secs(1));
     nodes[follower] = RaftNode::start(
-        sim.env(follower as u64),
-        NODES.to_vec(),
+        sim.env(nid(follower as u64)),
+        NODES.iter().copied().map(nid).collect(),
         engines[follower].clone(),
     );
     sim.run_for(Duration::from_secs(3));
@@ -205,7 +212,7 @@ fn index_catalog_is_reproducible_from_seed() {
             index: email_index(),
         });
         sim.run_for(Duration::from_secs(1));
-        sim.crash(leader as u64);
+        sim.crash(nid(leader as u64));
         sim.run_for(Duration::from_secs(3));
         sim.trace_lines()
     }

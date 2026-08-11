@@ -24,11 +24,11 @@ use std::time::Duration;
 
 use animus_control::raft::ProposeResult;
 use animus_control::{MetaCommand, NodeStatus, RaftNode};
-use animus_env::{Clock, EnvExt, Network, NodeId};
+use animus_env::{Clock, EnvExt, Network, NodeId, nid};
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::MemoryEngine;
 
-const NODES: [NodeId; 3] = [0, 1, 2];
+const NODES: [NodeId; 3] = [nid(0), nid(1), nid(2)];
 
 /// The stand-in "per-tablet" stream this test drives alongside the control
 /// plane's own `PRIMARY_STREAM` (0) — any value `>= 1` mirrors a real tablet
@@ -187,7 +187,7 @@ fn control_raft_and_tablet_stream_traffic_multiplex_on_one_node_id() {
     let leader = unique_leader(&raft_nodes, &[0, 1, 2], seed);
 
     assert!(matches!(
-        raft_nodes[leader].propose(upsert(10)),
+        raft_nodes[leader].propose(upsert(nid(10))),
         ProposeResult::Accepted { .. }
     ));
     sim.run_for(Duration::from_secs(1));
@@ -200,7 +200,7 @@ fn control_raft_and_tablet_stream_traffic_multiplex_on_one_node_id() {
             "control metadata diverged at node {i} before any fault (seed={seed})"
         );
     }
-    assert!(reference.members.contains_key(&10));
+    assert!(reference.members.contains_key(&nid(10)));
 
     // Every node has heard from both peers on TABLET_STREAM by now, and
     // every run is in order.
@@ -312,7 +312,7 @@ fn control_raft_and_tablet_stream_traffic_multiplex_on_one_node_id() {
         "survivor metadata diverged after leader kill (seed={seed})"
     );
     assert!(
-        a.members.contains_key(&10),
+        a.members.contains_key(&nid(10)),
         "pre-kill write lost (seed={seed})"
     );
 
@@ -337,7 +337,7 @@ fn control_raft_and_tablet_stream_traffic_multiplex_on_one_node_id() {
 
     // The control plane can still make progress on the new leader.
     assert!(matches!(
-        raft_nodes[new_leader].propose(upsert(11)),
+        raft_nodes[new_leader].propose(upsert(nid(11))),
         ProposeResult::Accepted { .. }
     ));
     sim.run_for(Duration::from_secs(2));
@@ -345,12 +345,12 @@ fn control_raft_and_tablet_stream_traffic_multiplex_on_one_node_id() {
         raft_nodes[survivors[0]]
             .metadata()
             .members
-            .contains_key(&11)
+            .contains_key(&nid(11))
     );
     assert!(
         raft_nodes[survivors[1]]
             .metadata()
             .members
-            .contains_key(&11)
+            .contains_key(&nid(11))
     );
 }

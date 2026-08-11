@@ -83,6 +83,8 @@ use animus_env::NodeId;
 use crate::message::{AccordMsg, Out};
 use crate::persist::{PersistedState, PersistedTxn, WalRecord};
 use crate::timestamp::{Ballot, LogicalClock, Timestamp};
+#[cfg(test)]
+use animus_env::nid;
 
 /// A transaction identifier: its original proposed timestamp `t0`, which is
 /// globally unique (minted by exactly one coordinator). Doubles as the txn id.
@@ -2316,18 +2318,18 @@ mod tests {
     #[test]
     fn transitive_dep_blocks_execution_until_predecessor_applies() {
         // Replica id 2 in a 3-node cluster. We feed it Commits directly.
-        let mut core = AccordCore::new(2, &[0, 1, 2]);
+        let mut core = AccordCore::new(nid(2), &[nid(0), nid(1), nid(2)]);
 
         // `d` writes key {a}, orders *before* `t`. `t` writes key {b} (disjoint
         // from `d`), and was committed carrying `d` as a dependency — but this
         // replica never saw `d`'s PreAccept, so it knows `d` only as an id and
         // shares no key with it. A direct-conflict-only gate is blind to `d`.
-        let d = Timestamp::new(5, 0);
-        let t = Timestamp::new(10, 1);
+        let d = Timestamp::new(5, nid(0));
+        let t = Timestamp::new(10, nid(1));
 
         // Commit `t` first, with deps = {d}. The direct gate is clear (nothing
         // shares key b); the dependency gate must block on the unknown `d`.
-        commit(&mut core, 1, t, t, &[d], &[20]);
+        commit(&mut core, nid(1), t, t, &[d], &[20]);
         assert!(
             !core.is_applied(t),
             "t executed before its transitive dependency d was even known — \
@@ -2337,7 +2339,7 @@ mod tests {
 
         // Now `d` commits, ordering before `t`. It applies first, then `t` becomes
         // applicable and applies — the agreed order [d, t].
-        commit(&mut core, 0, d, d, &[], &[10]);
+        commit(&mut core, nid(0), d, d, &[], &[10]);
         assert!(core.is_applied(d), "d must apply (no predecessors)");
         assert!(core.is_applied(t), "t must apply once d has");
         assert_eq!(
@@ -2352,22 +2354,22 @@ mod tests {
     /// `t` never directly saw). `t` must wait for the *whole chain* d -> m -> t.
     #[test]
     fn transitive_closure_waits_for_indirect_predecessor() {
-        let mut core = AccordCore::new(2, &[0, 1, 2]);
-        let d = Timestamp::new(3, 0); // writes {a}
-        let m = Timestamp::new(6, 1); // writes {a, b} — bridges d and t
-        let t = Timestamp::new(9, 2); // writes {b}; dep set {m}
+        let mut core = AccordCore::new(nid(2), &[nid(0), nid(1), nid(2)]);
+        let d = Timestamp::new(3, nid(0)); // writes {a}
+        let m = Timestamp::new(6, nid(1)); // writes {a, b} — bridges d and t
+        let t = Timestamp::new(9, nid(2)); // writes {b}; dep set {m}
 
         // Commit t (dep m) then m (dep d): m orders before t, d before m. t and d
         // are disjoint; only the recursive closure links them.
-        commit(&mut core, 1, t, t, &[m], &[200]);
-        commit(&mut core, 1, m, m, &[d], &[100, 200]);
+        commit(&mut core, nid(1), t, t, &[m], &[200]);
+        commit(&mut core, nid(1), m, m, &[d], &[100, 200]);
         // m's predecessor d is still unknown → neither m nor t may apply.
         assert!(
             !core.is_applied(m) && !core.is_applied(t),
             "m (and thus t) must block until the indirect predecessor d applies"
         );
 
-        commit(&mut core, 0, d, d, &[], &[100]);
+        commit(&mut core, nid(0), d, d, &[], &[100]);
         assert_eq!(
             core.applied_order(),
             &[d, m, t],
@@ -2393,8 +2395,8 @@ mod tests {
             (7, 6),           // f=3: N-1 = 6
         ];
         for (n, expected) in cases {
-            let all: Vec<NodeId> = (0..n as u64).collect();
-            let core = AccordCore::new(0, &all);
+            let all: Vec<NodeId> = (0..n as u64).map(nid).collect();
+            let core = AccordCore::new(nid(0), &all);
             assert_eq!(
                 core.fast_quorum(),
                 expected,
@@ -2416,8 +2418,8 @@ mod tests {
     #[test]
     fn fast_path_decision_is_recoverable_under_f_failures() {
         for n in 1usize..=15 {
-            let all: Vec<NodeId> = (0..n as u64).collect();
-            let core = AccordCore::new(0, &all);
+            let all: Vec<NodeId> = (0..n as u64).map(nid).collect();
+            let core = AccordCore::new(nid(0), &all);
             let fast = core.fast_quorum();
             let slow = core.slow_quorum(); // = recovery quorum size
             let f = core.failure_tolerance();
@@ -2455,19 +2457,19 @@ mod tests {
     /// then rebuilds from `wal_image` alone and asserts the recovered state matches.
     #[test]
     fn snapshot_image_replays_to_identical_state() {
-        let mut core = AccordCore::new(2, &[0, 1, 2]);
+        let mut core = AccordCore::new(nid(2), &[nid(0), nid(1), nid(2)]);
         // A few committed, executed transactions plus one still in-flight, so the
         // snapshot must capture both applied (terminal) and uncommitted state.
-        let d = Timestamp::new(2, 0);
-        let m = Timestamp::new(5, 1);
-        let t = Timestamp::new(9, 0);
-        commit(&mut core, 0, d, d, &[], &[10]);
-        commit(&mut core, 1, m, m, &[d], &[10, 20]);
-        commit(&mut core, 0, t, t, &[m], &[20]);
+        let d = Timestamp::new(2, nid(0));
+        let m = Timestamp::new(5, nid(1));
+        let t = Timestamp::new(9, nid(0));
+        commit(&mut core, nid(0), d, d, &[], &[10]);
+        commit(&mut core, nid(1), m, m, &[d], &[10, 20]);
+        commit(&mut core, nid(0), t, t, &[m], &[20]);
         // An uncommitted (PreAccepted-only) transaction this replica has witnessed.
-        let pending = Timestamp::new(12, 1);
+        let pending = Timestamp::new(12, nid(1));
         core.handle(
-            1,
+            nid(1),
             AccordMsg::PreAccept {
                 txn: pending,
                 keys: [30].into_iter().collect(),
@@ -2493,7 +2495,7 @@ mod tests {
             "the compact image is a single Snapshot record"
         );
         let state = PersistedState::replay(image);
-        let recovered = AccordCore::recovered(2, &[0, 1, 2], state);
+        let recovered = AccordCore::recovered(nid(2), &[nid(0), nid(1), nid(2)], state);
 
         // The recovered core matches: same execution order, same committed
         // decisions, same phase for the in-flight transaction.
@@ -2535,9 +2537,9 @@ mod tests {
     /// pointless WAL rewrite.
     #[test]
     fn snapshot_is_noop_without_new_applies() {
-        let mut core = AccordCore::new(2, &[0, 1, 2]);
-        let a = Timestamp::new(3, 0);
-        commit(&mut core, 0, a, a, &[], &[1]);
+        let mut core = AccordCore::new(nid(2), &[nid(0), nid(1), nid(2)]);
+        let a = Timestamp::new(3, nid(0));
+        commit(&mut core, nid(0), a, a, &[], &[1]);
         core.snapshot();
         assert!(
             core.take_snapshot_dirty(),
@@ -2557,14 +2559,14 @@ mod tests {
     /// lower-ordered one applies first.
     #[test]
     fn dependency_cycle_is_broken_by_timestamp_order() {
-        let mut core = AccordCore::new(2, &[0, 1, 2]);
-        let a = Timestamp::new(4, 0); // writes {k}
-        let b = Timestamp::new(7, 1); // writes {k} — conflicts a, mutual deps
+        let mut core = AccordCore::new(nid(2), &[nid(0), nid(1), nid(2)]);
+        let a = Timestamp::new(4, nid(0)); // writes {k}
+        let b = Timestamp::new(7, nid(1)); // writes {k} — conflicts a, mutual deps
 
         // Both committed, each carrying the other as a dep (Accord deps can be
         // mutual). a orders before b; the cycle must not stall execution.
-        commit(&mut core, 0, a, a, &[b], &[1]);
-        commit(&mut core, 1, b, b, &[a], &[1]);
+        commit(&mut core, nid(0), a, a, &[b], &[1]);
+        commit(&mut core, nid(1), b, b, &[a], &[1]);
         assert_eq!(
             core.applied_order(),
             &[a, b],

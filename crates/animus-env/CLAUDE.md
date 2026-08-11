@@ -30,6 +30,26 @@ the production implementation; the deterministic implementation lives in
 
 ## What's non-obvious
 
+- **`NodeId` is an opaque newtype over `u64` (ADR 0040 PR2), not a type
+  alias.** `Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default` +
+  `Display`/`Debug` (both delegate straight to the inner `u64`, so printed
+  output is unchanged) + `#[serde(transparent)]` (every JSON/WAL byte is
+  byte-identical to the old bare `u64`) — but **no arithmetic, no `Add`, no
+  implicit numeric coercion**. Construct one with `NodeId::new(u64)` /
+  `From<u64>` / the test-support `nid(n: u64) -> NodeId` (also exported from
+  here, ungated — trivial enough not to need a feature/cfg gate, though
+  crates that only use it from `#[cfg(test)]` code should still import it
+  behind `#[cfg(test)]` to avoid an unused-import warning in the non-test
+  build); recover the raw value with `.as_u64()`. `.as_u64()` is a
+  deliberately **narrow** escape hatch — every call site is one of: a
+  metrics/tracing label, `ProdEnv`'s wire frame `[from: u64]...`, `syskv`'s
+  big-endian key encoding, `animus-cp-data`'s binary WAL/wire codec, the
+  MVCC version bit-packing in `animus-consensus`, or the ADR 0036 allocator
+  arithmetic `animus-control::meta` retires in a later PR — grep `.as_u64()`
+  before adding a new one, and prefer fixing the *call site* to carry a
+  `NodeId` instead. PR3 changes the representation to `Arc<str>`; this PR
+  proves (via the compiler, mechanically) that nothing outside those
+  sanctioned sites still assumes "`NodeId` is a small dense integer".
 - `Env` is a *supertrait*, not a bag of accessors: a handle **is** a `Clock` +
   `Rng` + `Network` + `Disk` + `Spawner`. Callers write `env.now()`,
   `env.send(..)`, `env.recv()` directly. Because components are `<E: Env>`, the

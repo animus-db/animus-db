@@ -13,6 +13,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use animus_control::{MetaCommand, NodeStatus, RaftNode, mirror};
+use animus_env::nid;
 use animus_placement::PlacementPolicy;
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::MemoryEngine;
@@ -22,7 +23,7 @@ const NODES: [u64; 3] = [0, 1, 2];
 
 fn upsert(node: u64) -> MetaCommand {
     MetaCommand::UpsertMember {
-        node,
+        node: nid(node),
         labels: BTreeMap::new(),
         status: NodeStatus::Active,
     }
@@ -75,7 +76,13 @@ fn run_scenario(seed: u64) {
         let engines: Vec<MemoryEngine> = NODES.iter().map(|_| MemoryEngine::new()).collect();
         let mut nodes: Vec<RaftNode<SimEnv>> = NODES
             .iter()
-            .map(|&id| RaftNode::start(sim.env(id), NODES.to_vec(), engines[id as usize].clone()))
+            .map(|&id| {
+                RaftNode::start(
+                    sim.env(nid(id)),
+                    NODES.iter().copied().map(nid).collect(),
+                    engines[id as usize].clone(),
+                )
+            })
             .collect();
         sim.run_for(Duration::from_secs(2));
         let leader = unique_leader(&nodes, seed);
@@ -95,7 +102,7 @@ fn run_scenario(seed: u64) {
             tablet: TabletId(1),
             table: Some("orders".to_string()),
             range: KeyRange::whole(),
-            replicas: vec![10, 11],
+            replicas: vec![nid(10), nid(11)],
         });
         nodes[leader].propose(MetaCommand::SetTabletPolicy {
             tablet: TabletId(1),
@@ -129,11 +136,11 @@ fn run_scenario(seed: u64) {
         // (durable) engine — recovery rebuilds the cache from the engine's
         // watermark and replays only the surviving log tail.
         let follower = (0..3).find(|&i| i != leader).unwrap();
-        sim.stop(follower as u64);
+        sim.stop(nid(follower as u64));
         sim.run_for(Duration::from_millis(200));
         nodes[follower] = RaftNode::start(
-            sim.env(follower as u64),
-            NODES.to_vec(),
+            sim.env(nid(follower as u64)),
+            NODES.iter().copied().map(nid).collect(),
             engines[follower].clone(),
         );
         sim.run_for(Duration::from_secs(3));

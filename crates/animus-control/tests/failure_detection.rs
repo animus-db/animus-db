@@ -22,7 +22,7 @@ use std::time::Duration;
 use animus_control::node::heartbeat_loop;
 use animus_control::raft::ProposeResult;
 use animus_control::{MetaCommand, Metadata, NodeStatus, RaftNode};
-use animus_env::EnvExt;
+use animus_env::{EnvExt, NodeId, nid};
 use animus_placement::PlacementPolicy;
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::MemoryEngine;
@@ -47,12 +47,21 @@ fn cluster(seed: u64) -> (Simulator, Vec<RaftNode<SimEnv>>) {
     let sim = Simulator::new(seed);
     let nodes: Vec<RaftNode<SimEnv>> = CONTROL
         .iter()
-        .map(|&id| RaftNode::start(sim.env(id), CONTROL.to_vec(), MemoryEngine::new()))
+        .map(|&id| {
+            RaftNode::start(
+                sim.env(nid(id)),
+                CONTROL.iter().copied().map(nid).collect(),
+                MemoryEngine::new(),
+            )
+        })
         .collect();
     // Every data member heartbeats the whole control group on a timer.
     for (id, _, _) in DATA_NODES {
-        let env = sim.env(id);
-        env.spawn_task(heartbeat_loop(env.clone(), CONTROL.to_vec()));
+        let env = sim.env(nid(id));
+        env.spawn_task(heartbeat_loop(
+            env.clone(),
+            CONTROL.iter().copied().map(nid).collect(),
+        ));
     }
     (sim, nodes)
 }
@@ -79,7 +88,7 @@ fn labels(region: &str, zone: &str) -> BTreeMap<String, String> {
 }
 
 fn zone_of(meta: &Metadata, node: u64) -> String {
-    meta.members[&node].labels["zone"].clone()
+    meta.members[&nid(node)].labels["zone"].clone()
 }
 
 fn policy() -> PlacementPolicy {
@@ -89,7 +98,7 @@ fn policy() -> PlacementPolicy {
 }
 
 fn status_of(meta: &Metadata, node: u64) -> NodeStatus {
-    meta.members[&node].status
+    meta.members[&nid(node)].status
 }
 
 #[test]
@@ -106,7 +115,7 @@ fn run(seed: u64) {
     for (id, region, zone) in DATA_NODES {
         assert!(matches!(
             nodes[leader].propose(MetaCommand::UpsertMember {
-                node: id,
+                node: nid(id),
                 labels: labels(region, zone),
                 status: NodeStatus::Active,
             }),
@@ -115,7 +124,7 @@ fn run(seed: u64) {
     }
 
     // Place a 3-replica tablet one-per-zone and pin it to EU/one-per-zone.
-    let initial = vec![10, 12, 14];
+    let initial = vec![nid(10), nid(12), nid(14)];
     assert!(matches!(
         nodes[leader].propose(MetaCommand::CreateTablet {
             tablet: TABLET,
@@ -150,7 +159,7 @@ fn run(seed: u64) {
 
     // --- Fault: one placed member crashes; its heartbeats stop. ---
     let dead = initial[0];
-    let dead_zone = zone_of(&meta, dead);
+    let dead_zone = zone_of(&meta, dead.as_u64());
     let epoch_before = before.epoch;
     sim.crash(dead);
 
@@ -163,7 +172,7 @@ fn run(seed: u64) {
         let m = node.metadata();
         // 1. Detected and committed Down on every control node.
         assert_eq!(
-            status_of(&m, dead),
+            status_of(&m, dead.as_u64()),
             NodeStatus::Down,
             "node {i}: dead member not marked Down (seed={seed})"
         );
@@ -187,7 +196,7 @@ fn run(seed: u64) {
         }
         let replacement = *placed.iter().find(|n| !initial.contains(n)).unwrap();
         assert_eq!(
-            zone_of(&m, replacement),
+            zone_of(&m, (replacement).as_u64()),
             dead_zone,
             "node {i}: replacement should reuse the dead zone (seed={seed})"
         );
@@ -200,7 +209,7 @@ fn run(seed: u64) {
     // 3. Detected recovery: the member returns to Active on every control node.
     for (i, node) in nodes.iter().enumerate() {
         assert_eq!(
-            status_of(&node.metadata(), dead),
+            status_of(&node.metadata(), dead.as_u64()),
             NodeStatus::Active,
             "node {i}: recovered member not marked Active (seed={seed})"
         );
@@ -221,13 +230,13 @@ fn run(seed: u64) {
     }
 }
 
-fn assert_residency_and_spread(meta: &Metadata, placed: &[u64], seed: u64) {
+fn assert_residency_and_spread(meta: &Metadata, placed: &[NodeId], seed: u64) {
     assert_eq!(placed.len(), 3, "wrong replica count (seed={seed})");
     assert!(
-        placed.iter().all(|n| (10..20).contains(n)),
+        placed.iter().all(|n| (10..20).contains(&n.as_u64())),
         "residency lost: {placed:?} (seed={seed})"
     );
-    let mut zones: Vec<String> = placed.iter().map(|n| zone_of(meta, *n)).collect();
+    let mut zones: Vec<String> = placed.iter().map(|n| zone_of(meta, n.as_u64())).collect();
     zones.sort();
     zones.dedup();
     assert_eq!(zones.len(), 3, "spread lost: {placed:?} (seed={seed})");
@@ -241,7 +250,7 @@ fn detection_is_reproducible_from_seed() {
         let leader = leader_among(&nodes, &[0, 1, 2]);
         for (id, region, zone) in DATA_NODES {
             nodes[leader].propose(MetaCommand::UpsertMember {
-                node: id,
+                node: nid(id),
                 labels: labels(region, zone),
                 status: NodeStatus::Active,
             });
@@ -250,16 +259,16 @@ fn detection_is_reproducible_from_seed() {
             tablet: TABLET,
             table: None,
             range: KeyRange::whole(),
-            replicas: vec![10, 12, 14],
+            replicas: vec![nid(10), nid(12), nid(14)],
         });
         nodes[leader].propose(MetaCommand::SetTabletPolicy {
             tablet: TABLET,
             policy: Some(policy()),
         });
         sim.run_for(Duration::from_secs(2));
-        sim.crash(10);
+        sim.crash(nid(10));
         sim.run_for(Duration::from_secs(2));
-        sim.restart(10);
+        sim.restart(nid(10));
         sim.run_for(Duration::from_secs(2));
         sim.trace_lines()
     }
@@ -294,7 +303,7 @@ fn removed_member_stops_being_tracked_by_the_detector() {
     let (node, region, zone) = DATA_NODES[0];
     assert!(matches!(
         nodes[leader].propose(MetaCommand::UpsertMember {
-            node,
+            node: nid(node),
             labels: labels(region, zone),
             status: NodeStatus::Active,
         }),
@@ -304,7 +313,7 @@ fn removed_member_stops_being_tracked_by_the_detector() {
     // Let it heartbeat and settle: the leader's detector genuinely tracks it.
     sim.run_for(Duration::from_secs(1));
     assert!(
-        nodes[leader].believes_alive(node),
+        nodes[leader].believes_alive(nid(node)),
         "member should be alive after heartbeating"
     );
 
@@ -312,17 +321,17 @@ fn removed_member_stops_being_tracked_by_the_detector() {
     // stopping the process), then drain + remove it. `RemoveMember`'s
     // apply-time guard requires the member to already be Leaving/Down and
     // unreferenced by any tablet — both true here.
-    sim.crash(node);
+    sim.crash(nid(node));
     assert!(matches!(
         nodes[leader].propose(MetaCommand::UpsertMember {
-            node,
+            node: nid(node),
             labels: labels(region, zone),
             status: NodeStatus::Down,
         }),
         ProposeResult::Accepted { .. }
     ));
     assert!(matches!(
-        nodes[leader].propose(MetaCommand::RemoveMember { node }),
+        nodes[leader].propose(MetaCommand::RemoveMember { node: nid(node) }),
         ProposeResult::Accepted { .. }
     ));
 
@@ -333,11 +342,11 @@ fn removed_member_stops_being_tracked_by_the_detector() {
     sim.run_for(Duration::from_millis(300));
 
     assert!(
-        !nodes[leader].metadata().members.contains_key(&node),
+        !nodes[leader].metadata().members.contains_key(&nid(node)),
         "member should be gone from Metadata after RemoveMember"
     );
     assert!(
-        !nodes[leader].believes_alive(node),
+        !nodes[leader].believes_alive(nid(node)),
         "the detector should have forgotten the removed member immediately, \
          well before its natural DETECT_TIMEOUT would have elapsed"
     );

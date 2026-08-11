@@ -15,6 +15,7 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use animus_consensus::{AccordNode, Key};
+use animus_env::nid;
 use animus_sim::{NetConfig, SimEnv, Simulator};
 
 const NODES: [u64; 3] = [0, 1, 2];
@@ -27,7 +28,7 @@ fn cluster(seed: u64) -> (Simulator, Vec<AccordNode<SimEnv>>) {
     let sim = Simulator::new(seed);
     let nodes = NODES
         .iter()
-        .map(|&id| AccordNode::start(sim.env(id), NODES.to_vec()))
+        .map(|&id| AccordNode::start(sim.env(nid(id)), NODES.iter().copied().map(nid).collect()))
         .collect();
     (sim, nodes)
 }
@@ -52,8 +53,8 @@ fn backoff_cuts_redundant_sends_while_stuck() {
 
     // Isolate the coordinator (node 0) from both peers: its PreAccept can never
     // be answered, so the round never completes and only the retry tick re-sends.
-    sim.partition_pair(0, 1);
-    sim.partition_pair(0, 2);
+    sim.partition_pair(nid(0), nid(1));
+    sim.partition_pair(nid(0), nid(2));
 
     nodes[0].submit(keys(&[1]));
 
@@ -89,8 +90,8 @@ fn backoff_still_converges_after_a_heal() {
     let seed = 0xBAC0_0002;
     let (mut sim, nodes) = cluster(seed);
 
-    sim.partition_pair(0, 1);
-    sim.partition_pair(0, 2);
+    sim.partition_pair(nid(0), nid(1));
+    sim.partition_pair(nid(0), nid(2));
 
     let txn = nodes[0].submit(keys(&[42]));
     // Let the coordinator back off well into its capped interval while isolated.
@@ -100,8 +101,8 @@ fn backoff_still_converges_after_a_heal() {
     }
 
     // Heal and let the next retry carry it home.
-    sim.heal(0, 1);
-    sim.heal(0, 2);
+    sim.heal(nid(0), nid(1));
+    sim.heal(nid(0), nid(2));
     sim.run_for(Duration::from_secs(10));
 
     for (i, n) in nodes.iter().enumerate() {
@@ -129,7 +130,9 @@ fn backoff_converges_under_loss_across_seeds() {
         sim.set_net_config(cfg);
         let nodes: Vec<AccordNode<SimEnv>> = NODES
             .iter()
-            .map(|&id| AccordNode::start(sim.env(id), NODES.to_vec()))
+            .map(|&id| {
+                AccordNode::start(sim.env(nid(id)), NODES.iter().copied().map(nid).collect())
+            })
             .collect();
         let mut sim = sim;
 
@@ -151,8 +154,8 @@ fn backoff_run_is_reproducible_from_seed() {
     let seed = 0xBAC0_0003;
     let trace = |seed| {
         let (mut sim, nodes) = cluster(seed);
-        sim.partition_pair(0, 1);
-        sim.partition_pair(0, 2);
+        sim.partition_pair(nid(0), nid(1));
+        sim.partition_pair(nid(0), nid(2));
         nodes[0].submit(keys(&[1]));
         sim.run_for(Duration::from_secs(15));
         sim.trace_lines()

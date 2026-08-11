@@ -14,6 +14,7 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use animus_consensus::{AccordNode, Key, TxnId};
+use animus_env::nid;
 use animus_sim::{SimEnv, Simulator};
 use futures::executor::block_on;
 
@@ -23,7 +24,7 @@ fn cluster(seed: u64) -> (Simulator, Vec<AccordNode<SimEnv>>) {
     let sim = Simulator::new(seed);
     let nodes = NODES
         .iter()
-        .map(|&id| AccordNode::start(sim.env(id), NODES.to_vec()))
+        .map(|&id| AccordNode::start(sim.env(nid(id)), NODES.iter().copied().map(nid).collect()))
         .collect();
     (sim, nodes)
 }
@@ -104,7 +105,7 @@ fn fast_path_commit_is_recoverable_after_coordinator_death() {
     // Now the coordinator dies, and the two replicas that recovery will use are
     // isolated from it (they may not have learned the Commit). Recovery must
     // reconstruct the same decision from a quorum that excludes node 0.
-    sim.stop(0);
+    sim.stop(nid(0));
     let recoverer = &nodes[4];
     recoverer.recover(txn);
     sim.run_for(Duration::from_secs(3));
@@ -146,7 +147,7 @@ fn fast_path_recovery_is_consistent_across_seeds() {
             "coordinator should have committed before death (seed={seed})"
         );
 
-        sim.stop(0);
+        sim.stop(nid(0));
         nodes[4].recover(txn);
         sim.run_for(Duration::from_secs(3));
 
@@ -167,7 +168,7 @@ fn fast_path_run_is_reproducible_from_seed() {
         let (mut sim, nodes) = cluster(seed);
         let txn = nodes[0].submit(keys(&[7]));
         sim.run_for(Duration::from_millis(150));
-        sim.stop(0);
+        sim.stop(nid(0));
         nodes[4].recover(txn);
         sim.run_for(Duration::from_secs(2));
         sim.trace_lines()

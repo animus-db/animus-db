@@ -22,6 +22,8 @@ use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
 
 use animus_env::NodeId;
+#[cfg(test)]
+use animus_env::nid;
 use serde::{Deserialize, Serialize};
 
 use crate::RoleAddrs;
@@ -31,7 +33,7 @@ use crate::RoleAddrs;
 /// — a node's id is simply its position in the config.
 #[must_use]
 pub fn node_id(index: usize) -> NodeId {
-    index as NodeId
+    NodeId::new(index as u64)
 }
 
 /// Which role(s) a [`RoleAddrs`] entry runs (ADR 0035).
@@ -245,8 +247,8 @@ mod tests {
     fn generated_config_is_combined_mode() {
         let cfg = ClusterConfig::generate(3, "127.0.0.1".parse().unwrap(), 7000);
         assert!(cfg.nodes.iter().all(|a| a.role == NodeRole::Both));
-        assert_eq!(cfg.control_ids(), vec![0, 1, 2]);
-        assert_eq!(cfg.data_ids(), vec![0, 1, 2]);
+        assert_eq!(cfg.control_ids(), vec![nid(0), nid(1), nid(2)]);
+        assert_eq!(cfg.data_ids(), vec![nid(0), nid(1), nid(2)]);
     }
 
     #[test]
@@ -275,8 +277,8 @@ mod tests {
 
     #[test]
     fn ids_follow_convention() {
-        assert_eq!(node_id(2), 2);
-        assert_eq!(node_id(0), 0);
+        assert_eq!(node_id(2), nid(2));
+        assert_eq!(node_id(0), nid(0));
     }
 
     #[test]

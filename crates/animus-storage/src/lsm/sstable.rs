@@ -49,6 +49,8 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(test)]
+use animus_env::nid;
 use animus_env::{Env, Metric, MetricsHandle};
 use serde::{Deserialize, Serialize};
 
@@ -655,7 +657,7 @@ mod tests {
     #[test]
     fn compressible_block_round_trips_and_shrinks() {
         let sim = Simulator::new(1);
-        let env = sim.env(0);
+        let env = sim.env(nid(0));
         block_on(async {
             // Highly repetitive values across many records => the block payload
             // compresses, so the writer picks BLOCK_LZ4.
@@ -702,7 +704,7 @@ mod tests {
     #[test]
     fn incompressible_block_is_stored_not_inflated() {
         let sim = Simulator::new(2);
-        let env = sim.env(0);
+        let env = sim.env(nid(0));
         block_on(async {
             // A pseudo-random, high-entropy value per record (seeded, deterministic)
             // that LZ4 cannot shrink.

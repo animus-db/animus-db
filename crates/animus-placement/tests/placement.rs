@@ -4,6 +4,7 @@
 
 use std::collections::BTreeMap;
 
+use animus_env::{NodeId, nid};
 use animus_placement::{Candidate, PlacementError, PlacementPolicy, replan, select_replicas};
 
 /// A candidate in `region` / `zone`.
@@ -12,12 +13,12 @@ fn node(id: u64, region: &str, zone: &str) -> Candidate {
         .into_iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
-    Candidate::new(id, labels)
+    Candidate::new(nid(id), labels)
 }
 
 /// The set of `zone` labels the chosen nodes occupy, given the full candidate
 /// pool.
-fn zones_of(chosen: &[u64], pool: &[Candidate]) -> Vec<String> {
+fn zones_of(chosen: &[NodeId], pool: &[Candidate]) -> Vec<String> {
     let mut z: Vec<String> = chosen
         .iter()
         .map(|n| pool.iter().find(|c| c.node == *n).unwrap().labels["zone"].clone())
@@ -44,7 +45,7 @@ fn residency_restricts_to_matching_region() {
     let chosen = select_replicas(&pool, &policy).unwrap();
     assert_eq!(chosen.len(), 3);
     assert!(
-        chosen.iter().all(|n| (10..20).contains(n)),
+        chosen.iter().all(|n| (10..20).contains(&n.as_u64())),
         "a non-eu node was placed: {chosen:?}"
     );
 }
@@ -58,7 +59,7 @@ fn spreads_replicas_across_distinct_domains() {
     let chosen = select_replicas(&pool, &policy).unwrap();
     // One replica per zone a/b/c — never both eu-zone-a nodes (10 and 11).
     assert_eq!(zones_of(&chosen, &pool), vec!["a", "b", "c"]);
-    assert!(!(chosen.contains(&10) && chosen.contains(&11)));
+    assert!(!(chosen.contains(&nid(10)) && chosen.contains(&nid(11))));
 }
 
 #[test]
@@ -136,19 +137,19 @@ fn replan_keeps_survivors_and_replaces_only_the_lost() {
     let current = select_replicas(&pool, &policy).unwrap(); // [10, 12, 13] (a, b, c)
 
     // Node 10 (zone a) is lost; the rest of the pool still has 11 in zone a.
-    let survivors: Vec<Candidate> = pool.iter().filter(|c| c.node != 10).cloned().collect();
+    let survivors: Vec<Candidate> = pool.iter().filter(|c| c.node != nid(10)).cloned().collect();
     let new = replan(&current, &survivors, &policy).unwrap();
 
     assert_eq!(new.len(), 3);
-    assert!(!new.contains(&10), "lost node not replaced: {new:?}");
+    assert!(!new.contains(&nid(10)), "lost node not replaced: {new:?}");
     // The two survivors are kept; only the lost replica moved.
-    for kept in current.iter().filter(|n| **n != 10) {
+    for kept in current.iter().filter(|n| **n != nid(10)) {
         assert!(new.contains(kept), "survivor {kept} was needlessly moved");
     }
     // Spread is preserved: still one replica per zone.
     assert_eq!(zones_of(&new, &pool), vec!["a", "b", "c"]);
     assert!(
-        new.contains(&11),
+        new.contains(&nid(11)),
         "replacement should be the other zone-a node"
     );
 }

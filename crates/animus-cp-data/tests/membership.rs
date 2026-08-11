@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use animus_control::ProposeResult;
 use animus_cp_data::RaftKvNode;
+use animus_env::nid;
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::MemoryEngine;
 use futures::executor::block_on;
@@ -22,7 +23,13 @@ fn group(seed: u64, ids: &[u64]) -> (Simulator, Vec<KvNode>) {
     let sim = Simulator::new(seed);
     let nodes = ids
         .iter()
-        .map(|&id| RaftKvNode::start(sim.env(id), ids.to_vec(), MemoryEngine::new()))
+        .map(|&id| {
+            RaftKvNode::start(
+                sim.env(nid(id)),
+                ids.iter().copied().map(nid).collect(),
+                MemoryEngine::new(),
+            )
+        })
         .collect();
     (sim, nodes)
 }
@@ -74,7 +81,7 @@ fn remove_a_follower_shrinks_the_quorum() {
         .filter(|&n| n != victim as u64)
         .collect();
     assert!(matches!(
-        nodes[l].change_membership(set(&remaining)),
+        nodes[l].change_membership(set(&remaining).into_iter().map(nid).collect()),
         ProposeResult::Accepted { .. }
     ));
     sim.run_for(Duration::from_secs(2));
@@ -83,7 +90,7 @@ fn remove_a_follower_shrinks_the_quorum() {
     // on the new 3-voter majority.
     assert_eq!(
         nodes[l].config(),
-        set(&remaining),
+        set(&remaining).into_iter().map(nid).collect(),
         "leader adopted the new config"
     );
     put(&nodes[l], b"k2", b"v2", seed);
@@ -97,7 +104,7 @@ fn remove_a_follower_shrinks_the_quorum() {
         );
         assert_eq!(
             n.config(),
-            set(&remaining),
+            set(&remaining).into_iter().map(nid).collect(),
             "node {i} adopted the new config"
         );
     }
@@ -110,7 +117,11 @@ fn add_a_node_grows_the_group_and_catches_it_up() {
     let ids = [0u64, 1, 2, 3];
     let (mut sim, nodes) = group(seed, &[0, 1, 2]); // only {0,1,2} are voters initially
     // Bring up node 3 as a (currently non-member) replica that will be added.
-    let node3 = RaftKvNode::start(sim.env(3), ids.to_vec(), MemoryEngine::new());
+    let node3 = RaftKvNode::start(
+        sim.env(nid(3)),
+        ids.iter().copied().map(nid).collect(),
+        MemoryEngine::new(),
+    );
     sim.run_for(Duration::from_secs(2));
     let l = leader(&nodes, &[0, 1, 2], seed);
     put(&nodes[l], b"k", b"v", seed);
@@ -118,7 +129,7 @@ fn add_a_node_grows_the_group_and_catches_it_up() {
 
     // Add node 3: 3 voters -> 4.
     assert!(matches!(
-        nodes[l].change_membership(set(&ids)),
+        nodes[l].change_membership(set(&ids).into_iter().map(nid).collect()),
         ProposeResult::Accepted { .. }
     ));
     sim.run_for(Duration::from_secs(3));
@@ -126,7 +137,7 @@ fn add_a_node_grows_the_group_and_catches_it_up() {
     // Node 3 joined the config and caught up to the data.
     assert_eq!(
         node3.config(),
-        set(&ids),
+        set(&ids).into_iter().map(nid).collect(),
         "added node adopted the new config"
     );
     assert_eq!(
@@ -156,13 +167,13 @@ fn reconfigure_off_a_failed_node() {
 
     // A follower dies.
     let dead = (0..4).find(|&i| i != l).expect("a follower");
-    sim.crash(dead as u64);
+    sim.crash(nid(dead as u64));
 
     // The leader reconfigures the dead node out (what the failure detector +
     // placement reconciler would drive): 4 voters -> 3.
     let survivors: Vec<u64> = ids.iter().copied().filter(|&n| n != dead as u64).collect();
     assert!(matches!(
-        nodes[l].change_membership(set(&survivors)),
+        nodes[l].change_membership(set(&survivors).into_iter().map(nid).collect()),
         ProposeResult::Accepted { .. }
     ));
     sim.run_for(Duration::from_secs(2));
@@ -190,17 +201,17 @@ fn rejects_multi_server_and_self_removal() {
 
     // Multi-server delta ({0,1,2} -> {0}) is rejected (would risk disjoint majorities).
     assert!(matches!(
-        nodes[l].change_membership(set(&[0])),
+        nodes[l].change_membership(set(&[0]).into_iter().map(nid).collect()),
         ProposeResult::NotLeader { .. }
     ));
     // Removing the leader itself is rejected (transfer leadership first).
     let others: Vec<u64> = ids.iter().copied().filter(|&n| n != l as u64).collect();
     assert!(matches!(
-        nodes[l].change_membership(set(&others)),
+        nodes[l].change_membership(set(&others).into_iter().map(nid).collect()),
         ProposeResult::NotLeader { .. }
     ));
     // Config is unchanged after the rejected attempts.
-    assert_eq!(nodes[l].config(), set(&ids));
+    assert_eq!(nodes[l].config(), set(&ids).into_iter().map(nid).collect());
 }
 
 #[test]
@@ -216,7 +227,7 @@ fn run_is_deterministic_from_seed() {
             .copied()
             .filter(|&n| n != victim as u64)
             .collect();
-        let _ = nodes[l].change_membership(set(&remaining));
+        let _ = nodes[l].change_membership(set(&remaining).into_iter().map(nid).collect());
         sim.run_for(Duration::from_secs(2));
         sim.trace_lines()
     };

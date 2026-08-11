@@ -558,11 +558,11 @@ const MVCC_NODE_BITS: u32 = 16;
 /// the testbed uses small node ids and logical clocks advance by small
 /// per-transaction increments.
 fn mvcc_version(ts: Timestamp) -> u64 {
+    let node = ts.node.as_u64();
     assert!(
-        ts.node < (1 << MVCC_NODE_BITS),
-        "node id {} exceeds the {MVCC_NODE_BITS}-bit MVCC tiebreak field; \
-         the (logical, node) -> u64 version encoding would collide",
-        ts.node
+        node < (1 << MVCC_NODE_BITS),
+        "node id {node} exceeds the {MVCC_NODE_BITS}-bit MVCC tiebreak field; \
+         the (logical, node) -> u64 version encoding would collide"
     );
     assert!(
         ts.logical < (1 << (64 - MVCC_NODE_BITS)),
@@ -571,7 +571,7 @@ fn mvcc_version(ts: Timestamp) -> u64 {
         ts.logical,
         64 - MVCC_NODE_BITS
     );
-    (ts.logical << MVCC_NODE_BITS) | ts.node
+    (ts.logical << MVCC_NODE_BITS) | node
 }
 
 /// Encode a transaction id as the stored value (the executed effect is "write
@@ -579,7 +579,7 @@ fn mvcc_version(ts: Timestamp) -> u64 {
 fn encode_txn(txn: TxnId) -> Vec<u8> {
     let mut v = Vec::with_capacity(16);
     v.extend_from_slice(&txn.logical.to_be_bytes());
-    v.extend_from_slice(&txn.node.to_be_bytes());
+    v.extend_from_slice(&txn.node.as_u64().to_be_bytes());
     v
 }
 
@@ -590,7 +590,7 @@ fn decode_txn(bytes: &[u8]) -> Option<TxnId> {
     }
     let logical = u64::from_be_bytes(bytes[0..8].try_into().ok()?);
     let node = u64::from_be_bytes(bytes[8..16].try_into().ok()?);
-    Some(Timestamp::new(logical, node))
+    Some(Timestamp::new(logical, NodeId::new(node)))
 }
 
 /// Drain the core's pending durable records and execution effects, append +

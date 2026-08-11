@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use animus_control::raft::ProposeResult;
 use animus_control::{MetaCommand, NodeStatus, RaftNode};
+use animus_env::nid;
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::MemoryEngine;
 
@@ -21,7 +22,13 @@ fn cluster(seed: u64) -> (Simulator, Vec<RaftNode<SimEnv>>) {
     let sim = Simulator::new(seed);
     let nodes = NODES
         .iter()
-        .map(|&id| RaftNode::start(sim.env(id), NODES.to_vec(), MemoryEngine::new()))
+        .map(|&id| {
+            RaftNode::start(
+                sim.env(nid(id)),
+                NODES.iter().copied().map(nid).collect(),
+                MemoryEngine::new(),
+            )
+        })
         .collect();
     (sim, nodes)
 }
@@ -134,7 +141,7 @@ fn leader_killed_mid_allocation_same_nonce_retry_converges_to_one_id() {
         .copied()
         .expect("committed allocation not replicated pre-kill");
 
-    sim.crash(old_leader as u64);
+    sim.crash(nid(old_leader as u64));
     sim.run_for(Duration::from_secs(3));
 
     let new_leader = unique_leader(&nodes, &survivors, seed);
@@ -195,7 +202,7 @@ fn follower_connected_proposer_relays_via_the_leader_hint() {
         ProposeResult::NotLeader { leader: hint } => {
             assert_eq!(
                 hint,
-                Some(leader as u64),
+                Some(nid(leader as u64)),
                 "the follower's hint must name the real leader (seed={seed})"
             );
         }

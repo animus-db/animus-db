@@ -22,6 +22,7 @@
 
 use std::time::Duration;
 
+use animus_env::NodeId;
 use animusd::{
     ClientRequest, ClientResponse, Node, StorageBackend, bind_cluster, read_frame, start_cluster,
     start_cluster_auto_split, start_cluster_with_auto_split_bytes,
@@ -175,7 +176,7 @@ async fn cp_member_addresses_register_and_replicate() {
     let nodes = start_cluster(bound).await.unwrap();
     await_bootstrap(&nodes).await;
 
-    let want: Vec<u64> = (0..3).map(animusd::config::node_id).collect();
+    let want: Vec<NodeId> = (0..3).map(animusd::config::node_id).collect();
     let replicated = async {
         loop {
             // Every node's replicated view has a parseable raftkv address for

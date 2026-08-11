@@ -19,8 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use animus_consensus::{AccordNode, Key, TxnId};
-use animus_env::ProdEnv;
-
+use animus_env::{NodeId, ProdEnv, nid};
 const NODES: [u64; 3] = [0, 1, 2];
 
 fn keys(ks: &[Key]) -> BTreeSet<Key> {
@@ -36,13 +35,13 @@ async fn cluster(tag: &str) -> (Vec<AccordNode<ProdEnv>>, std::path::PathBuf) {
 
     let loop_addr = "127.0.0.1:0".parse().unwrap();
     let mut envs = Vec::new();
-    let mut addrs: BTreeMap<u64, std::net::SocketAddr> = BTreeMap::new();
+    let mut addrs: BTreeMap<NodeId, std::net::SocketAddr> = BTreeMap::new();
     for &id in &NODES {
         let dir = base.join(format!("node-{id}"));
-        let (env, bound) = ProdEnv::bind(id, loop_addr, &dir)
+        let (env, bound) = ProdEnv::bind(nid(id), loop_addr, &dir)
             .await
             .expect("bind ProdEnv");
-        addrs.insert(id, bound);
+        addrs.insert(nid(id), bound);
         envs.push(env);
     }
     // Install the peer address book on every node before any send.
@@ -51,7 +50,7 @@ async fn cluster(tag: &str) -> (Vec<AccordNode<ProdEnv>>, std::path::PathBuf) {
     }
     let nodes = envs
         .into_iter()
-        .map(|env| AccordNode::start(env, NODES.to_vec()))
+        .map(|env| AccordNode::start(env, NODES.iter().copied().map(nid).collect()))
         .collect();
     (nodes, base)
 }

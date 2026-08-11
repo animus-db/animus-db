@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use animus_control::ProposeResult;
 use animus_cp_data::RaftKvNode;
+use animus_env::nid;
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::MemoryEngine;
 use futures::executor::block_on;
@@ -23,7 +24,13 @@ fn group(seed: u64) -> (Simulator, Vec<KvNode>) {
     let sim = Simulator::new(seed);
     let nodes = NODES
         .iter()
-        .map(|&id| RaftKvNode::start(sim.env(id), NODES.to_vec(), MemoryEngine::new()))
+        .map(|&id| {
+            RaftKvNode::start(
+                sim.env(nid(id)),
+                NODES.iter().copied().map(nid).collect(),
+                MemoryEngine::new(),
+            )
+        })
         .collect();
     (sim, nodes)
 }
@@ -107,7 +114,7 @@ fn batch_survives_a_leader_kill() {
     // Kill the leader: isolate it from the other two, who must re-elect.
     let survivors: Vec<usize> = (0..3).filter(|&i| i != l0).collect();
     for &s in &survivors {
-        sim.partition_pair(l0 as u64, s as u64);
+        sim.partition_pair(nid(l0 as u64), nid(s as u64));
     }
     sim.run_for(Duration::from_secs(3)); // survivors re-elect
 
@@ -130,7 +137,7 @@ fn batch_survives_a_leader_kill() {
 
     // Heal the old leader; it rejoins and catches up to the full batch.
     for &s in &survivors {
-        sim.heal(l0 as u64, s as u64);
+        sim.heal(nid(l0 as u64), nid(s as u64));
     }
     sim.run_for(Duration::from_secs(3));
     assert_all_present(&nodes, &[l0], &puts, seed);
@@ -142,7 +149,13 @@ fn batch_reapplies_idempotently_on_restart() {
     let sim = Simulator::new(seed);
     let mut nodes: Vec<KvNode> = NODES
         .iter()
-        .map(|&id| RaftKvNode::start(sim.env(id), NODES.to_vec(), MemoryEngine::new()))
+        .map(|&id| {
+            RaftKvNode::start(
+                sim.env(nid(id)),
+                NODES.iter().copied().map(nid).collect(),
+                MemoryEngine::new(),
+            )
+        })
         .collect();
     let mut sim = sim;
     sim.run_for(Duration::from_secs(2));
@@ -159,8 +172,12 @@ fn batch_reapplies_idempotently_on_restart() {
     // Stop node 0 (volatile engine dies, synced WAL survives), restart it with a
     // fresh engine: the driver replays the WAL, re-applying the one Batch entry —
     // idempotently, at the same MVCC index — so every key is recovered.
-    sim.stop(0);
-    nodes[0] = RaftKvNode::start(sim.env(0), NODES.to_vec(), MemoryEngine::new());
+    sim.stop(nid(0));
+    nodes[0] = RaftKvNode::start(
+        sim.env(nid(0)),
+        NODES.iter().copied().map(nid).collect(),
+        MemoryEngine::new(),
+    );
     sim.run_for(Duration::from_secs(4)); // recover + catch up
 
     assert_all_present(&nodes, &[0, 1, 2], &puts, seed);

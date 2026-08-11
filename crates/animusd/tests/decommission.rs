@@ -268,7 +268,7 @@ async fn decommission_drains_removes_and_allows_id_reuse() {
         loop {
             if member_statuses(core_admin[0])
                 .await
-                .get(&join_raftkv_id)
+                .get(&join_raftkv_id.as_u64())
                 .map(String::as_str)
                 == Some("Active")
             {
@@ -284,7 +284,9 @@ async fn decommission_drains_removes_and_allows_id_reuse() {
     let hosted_table: String = {
         let discover = async {
             loop {
-                if let Some(table) = table_with_replica(core_admin[0], join_raftkv_id).await {
+                if let Some(table) =
+                    table_with_replica(core_admin[0], (join_raftkv_id).as_u64()).await
+                {
                     return table;
                 }
                 sleep(Duration::from_millis(300)).await;
@@ -308,7 +310,7 @@ async fn decommission_drains_removes_and_allows_id_reuse() {
     // this way, regardless of its status.
     {
         let core_raftkv_id = animusd::config::node_id(0);
-        let (status, body) = remove_member(core_admin[leader], core_raftkv_id).await;
+        let (status, body) = remove_member(core_admin[leader], (core_raftkv_id).as_u64()).await;
         assert_eq!(
             status, 409,
             "removing an original core member should be refused: {body}"
@@ -317,7 +319,7 @@ async fn decommission_drains_removes_and_allows_id_reuse() {
 
     // 4. Refusal: the joined node is still Active — not drained yet.
     {
-        let (status, body) = remove_member(core_admin[leader], join_raftkv_id).await;
+        let (status, body) = remove_member(core_admin[leader], (join_raftkv_id).as_u64()).await;
         assert_eq!(
             status, 409,
             "removing an Active member should be refused: {body}"
@@ -335,7 +337,7 @@ async fn decommission_drains_removes_and_allows_id_reuse() {
     // actually moved every tablet off it, and it is no longer Active.
     let drained = async {
         loop {
-            let (status, body) = drain_status(core_admin[leader], join_raftkv_id).await;
+            let (status, body) = drain_status(core_admin[leader], (join_raftkv_id).as_u64()).await;
             if status == 200 {
                 let remaining = body["tablets_remaining"].as_u64().unwrap_or(u64::MAX);
                 let node_status = body["status"].as_str().unwrap_or("");
@@ -355,7 +357,7 @@ async fn decommission_drains_removes_and_allows_id_reuse() {
     // member is now fully drained, so this proves the leader check itself,
     // not a leftover "not drained" rejection.
     {
-        let (status, body) = remove_member(core_admin[follower], join_raftkv_id).await;
+        let (status, body) = remove_member(core_admin[follower], (join_raftkv_id).as_u64()).await;
         assert_eq!(
             status, 409,
             "remove on a follower's admin port should be refused: {body}"
@@ -369,7 +371,7 @@ async fn decommission_drains_removes_and_allows_id_reuse() {
 
     // 8. Remove on the leader.
     {
-        let (status, body) = remove_member(core_admin[leader], join_raftkv_id).await;
+        let (status, body) = remove_member(core_admin[leader], (join_raftkv_id).as_u64()).await;
         assert_eq!(status, 200, "remove failed: {body}");
     }
 
@@ -420,7 +422,7 @@ async fn decommission_drains_removes_and_allows_id_reuse() {
         loop {
             if member_statuses(core_admin[0])
                 .await
-                .get(&join_raftkv_id)
+                .get(&join_raftkv_id.as_u64())
                 .map(String::as_str)
                 == Some("Active")
             {
@@ -500,7 +502,7 @@ async fn dashboard_health_recovers_after_decommission_shrink() {
             loop {
                 if member_statuses(core_admin[0])
                     .await
-                    .get(&join_raftkv_id)
+                    .get(&join_raftkv_id.as_u64())
                     .map(String::as_str)
                     == Some("Active")
                 {
@@ -528,7 +530,7 @@ async fn dashboard_health_recovers_after_decommission_shrink() {
     }
     let drained = async {
         loop {
-            let (status, body) = drain_status(core_admin[leader], target_id).await;
+            let (status, body) = drain_status(core_admin[leader], (target_id).as_u64()).await;
             if status == 200 {
                 let remaining = body["tablets_remaining"].as_u64().unwrap_or(u64::MAX);
                 let node_status = body["status"].as_str().unwrap_or("");
@@ -543,7 +545,7 @@ async fn dashboard_health_recovers_after_decommission_shrink() {
         .await
         .unwrap_or_else(|_| panic!("target node never finished draining"));
     {
-        let (status, body) = remove_member(core_admin[leader], target_id).await;
+        let (status, body) = remove_member(core_admin[leader], (target_id).as_u64()).await;
         assert_eq!(status, 200, "remove failed: {body}");
     }
     let removed = async {
@@ -701,7 +703,7 @@ async fn decommission_refuses_live_control_voter_then_succeeds_after_control_rem
         loop {
             if member_statuses(core_admin[0])
                 .await
-                .get(&join_raftkv_id)
+                .get(&join_raftkv_id.as_u64())
                 .map(String::as_str)
                 == Some("Active")
             {
@@ -735,7 +737,7 @@ async fn decommission_refuses_live_control_voter_then_succeeds_after_control_rem
     }
     let drained = async {
         loop {
-            let (status, body) = drain_status(leader_admin, target_raftkv_id).await;
+            let (status, body) = drain_status(leader_admin, (target_raftkv_id).as_u64()).await;
             if status == 200 {
                 let remaining = body["tablets_remaining"].as_u64().unwrap_or(u64::MAX);
                 let node_status = body["status"].as_str().unwrap_or("");
@@ -753,7 +755,7 @@ async fn decommission_refuses_live_control_voter_then_succeeds_after_control_rem
     // 5. Refusal: fully drained, but its control id is STILL a live voter —
     // `/admin/member/remove` refuses (409), naming the control-plane reason.
     {
-        let (status, body) = remove_member(leader_admin, target_raftkv_id).await;
+        let (status, body) = remove_member(leader_admin, (target_raftkv_id).as_u64()).await;
         assert_eq!(
             status, 409,
             "removing a still-live control voter should be refused: {body}"
@@ -801,7 +803,7 @@ async fn decommission_refuses_live_control_voter_then_succeeds_after_control_rem
     // config (ADR 0037), not a static original-members snapshot that would
     // have refused forever (the pre-ADR-0037 behavior).
     {
-        let (status, body) = remove_member(leader_admin, target_raftkv_id).await;
+        let (status, body) = remove_member(leader_admin, (target_raftkv_id).as_u64()).await;
         assert_eq!(
             status, 200,
             "removing the now-control-removed node should succeed: {body}"

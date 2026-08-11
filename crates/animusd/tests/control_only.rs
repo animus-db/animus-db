@@ -19,6 +19,7 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use animus_env::nid;
 use animusd::{
     ClientRequest, ClientResponse, ColumnType, MetaCommand, Node, NodeStatus, TableSchema,
     read_frame,
@@ -423,7 +424,7 @@ async fn mixed_cluster_put_via_control_node_forwards_to_data_node() {
                 match animusd::run_node_growth(
                     &config,
                     3,
-                    vec![0, 1, 2],
+                    vec![nid(0), nid(1), nid(2)],
                     dir.path().join("data-3"),
                     animusd::StorageBackend::Memory,
                 )
@@ -446,7 +447,7 @@ async fn mixed_cluster_put_via_control_node_forwards_to_data_node() {
         // The data node's own id (ADR 0040 PR1 — one identity per node, was
         // `300 + 3 = 303`, now just `3`) must become `Active` before a
         // table's first tablet can be provisioned onto it.
-        force_active(&control_nodes, 3).await;
+        force_active(&control_nodes, nid(3)).await;
 
         // A `Put` sent to a CONTROL node's client port: `cp_put` provisions
         // the table's first tablet (replicas = the one Active data member),

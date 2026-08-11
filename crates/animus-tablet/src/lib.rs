@@ -20,6 +20,8 @@
 //! table starts as one tablet and **splits on demand** as it grows.
 
 use animus_env::NodeId;
+#[cfg(test)]
+use animus_env::nid;
 use serde::{Deserialize, Serialize};
 
 /// Width, in bytes, of a [`partition_token`] — a big-endian `u64`.
@@ -435,10 +437,14 @@ mod tests {
 
     #[test]
     fn replicas_are_normalized() {
-        let t = Tablet::new(TabletId(1), KeyRange::whole(), vec![3, 1, 2, 1]);
-        assert_eq!(t.replicas, vec![1, 2, 3]);
-        assert!(t.has_replica(2));
-        assert!(!t.has_replica(9));
+        let t = Tablet::new(
+            TabletId(1),
+            KeyRange::whole(),
+            vec![nid(3), nid(1), nid(2), nid(1)],
+        );
+        assert_eq!(t.replicas, vec![nid(1), nid(2), nid(3)]);
+        assert!(t.has_replica(nid(2)));
+        assert!(!t.has_replica(nid(9)));
         assert_eq!(t.epoch, Epoch::INITIAL);
     }
 
@@ -511,12 +517,12 @@ mod tests {
 
     #[test]
     fn table_scoped_tablet_serves_only_its_table() {
-        let t = Tablet::new_for_table(TabletId(1), "users", table_key_block("users"), vec![1]);
+        let t = Tablet::new_for_table(TabletId(1), "users", table_key_block("users"), vec![nid(1)]);
         assert_eq!(t.table.as_deref(), Some("users"));
         assert!(t.serves_table("users"));
         assert!(!t.serves_table("orders"));
         // The legacy whole-keyspace tablet serves any table.
-        let legacy = Tablet::new(TabletId(2), KeyRange::whole(), vec![1]);
+        let legacy = Tablet::new(TabletId(2), KeyRange::whole(), vec![nid(1)]);
         assert_eq!(legacy.table, None);
         assert!(legacy.serves_table("users") && legacy.serves_table("orders"));
     }

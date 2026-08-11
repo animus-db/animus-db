@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use animus_control::{MetaCommand, NodeStatus, RaftNode};
+use animus_env::nid;
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::MemoryEngine;
 
@@ -14,7 +15,7 @@ const NODES: [u64; 3] = [0, 1, 2];
 
 fn upsert(node: u64) -> MetaCommand {
     MetaCommand::UpsertMember {
-        node,
+        node: nid(node),
         labels: BTreeMap::new(),
         status: NodeStatus::Active,
     }
@@ -37,7 +38,13 @@ fn node_restarts_from_its_disk_and_rejoins() {
     let engines: Vec<MemoryEngine> = NODES.iter().map(|_| MemoryEngine::new()).collect();
     let mut nodes: Vec<RaftNode<SimEnv>> = NODES
         .iter()
-        .map(|&id| RaftNode::start(sim.env(id), NODES.to_vec(), engines[id as usize].clone()))
+        .map(|&id| {
+            RaftNode::start(
+                sim.env(nid(id)),
+                NODES.iter().copied().map(nid).collect(),
+                engines[id as usize].clone(),
+            )
+        })
         .collect();
 
     sim.run_for(Duration::from_secs(2));
@@ -58,7 +65,7 @@ fn node_restarts_from_its_disk_and_rejoins() {
     );
 
     // Stop the follower's process: tasks + volatile state gone, WAL on disk kept.
-    sim.stop(follower as u64);
+    sim.stop(nid(follower as u64));
 
     // The cluster keeps committing with the surviving majority while it is down.
     for id in 5..9 {
@@ -69,8 +76,8 @@ fn node_restarts_from_its_disk_and_rejoins() {
     // Start a fresh node on the same node id / disk — it recovers from the WAL
     // *and* the same (durable) engine, exactly like a real restart.
     nodes[follower] = RaftNode::start(
-        sim.env(follower as u64),
-        NODES.to_vec(),
+        sim.env(nid(follower as u64)),
+        NODES.iter().copied().map(nid).collect(),
         engines[follower].clone(),
     );
     sim.run_for(Duration::from_secs(3));

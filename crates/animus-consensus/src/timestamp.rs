@@ -7,6 +7,8 @@
 //! `(logical, node)` is the order transactions execute in.
 
 use animus_env::NodeId;
+#[cfg(test)]
+use animus_env::nid;
 use serde::{Deserialize, Serialize};
 
 /// A transaction timestamp: a logical clock value tagged with the node that
@@ -27,7 +29,7 @@ impl Timestamp {
     /// The zero timestamp (precedes every minted timestamp on a given node).
     pub const ZERO: Timestamp = Timestamp {
         logical: 0,
-        node: 0,
+        node: NodeId::new(0),
     };
 
     /// Construct a timestamp from its parts.
@@ -61,7 +63,10 @@ pub struct Ballot {
 
 impl Ballot {
     /// The original coordinator's implicit ballot (lower than every recoverer's).
-    pub const ZERO: Ballot = Ballot { round: 0, node: 0 };
+    pub const ZERO: Ballot = Ballot {
+        round: 0,
+        node: NodeId::new(0),
+    };
 
     /// A recovery ballot for `node` at `round`.
     #[must_use]
@@ -119,39 +124,42 @@ mod tests {
 
     #[test]
     fn order_is_logical_then_node() {
-        assert!(Timestamp::new(1, 9) < Timestamp::new(2, 0));
-        assert!(Timestamp::new(2, 0) < Timestamp::new(2, 1));
-        assert_eq!(Timestamp::new(3, 4), Timestamp::new(3, 4));
+        assert!(Timestamp::new(1, nid(9)) < Timestamp::new(2, nid(0)));
+        assert!(Timestamp::new(2, nid(0)) < Timestamp::new(2, nid(1)));
+        assert_eq!(Timestamp::new(3, nid(4)), Timestamp::new(3, nid(4)));
     }
 
     #[test]
     fn ballot_order_is_round_then_node() {
-        assert!(Ballot::ZERO < Ballot::new(1, 0));
-        assert!(Ballot::new(1, 9) < Ballot::new(2, 0));
-        assert!(Ballot::new(2, 0) < Ballot::new(2, 1));
-        assert_eq!(Ballot::new(3, 4), Ballot::new(3, 4));
+        assert!(Ballot::ZERO < Ballot::new(1, nid(0)));
+        assert!(Ballot::new(1, nid(9)) < Ballot::new(2, nid(0)));
+        assert!(Ballot::new(2, nid(0)) < Ballot::new(2, nid(1)));
+        assert_eq!(Ballot::new(3, nid(4)), Ballot::new(3, nid(4)));
     }
 
     #[test]
     fn ballot_next_above_supersedes() {
         // A recoverer always outranks the highest promised ballot, regardless of
         // which node held it.
-        let highest = Ballot::new(5, 2);
-        let mine = Ballot::next_above(highest, 0);
+        let highest = Ballot::new(5, nid(2));
+        let mine = Ballot::next_above(highest, nid(0));
         assert!(mine > highest, "next_above must supersede the highest seen");
         // From the zero (original-coordinator) ballot, the first recoverer is
         // round 1.
-        assert_eq!(Ballot::next_above(Ballot::ZERO, 1), Ballot::new(1, 1));
+        assert_eq!(
+            Ballot::next_above(Ballot::ZERO, nid(1)),
+            Ballot::new(1, nid(1))
+        );
     }
 
     #[test]
     fn mint_is_monotonic_across_witness() {
-        let mut clock = LogicalClock::new(7);
+        let mut clock = LogicalClock::new(nid(7));
         let a = clock.mint();
-        clock.witness(Timestamp::new(100, 2));
+        clock.witness(Timestamp::new(100, nid(2)));
         let b = clock.mint();
         assert!(b > a);
         assert!(b.logical > 100, "mint must outrank a witnessed peer");
-        assert_eq!(b.node, 7);
+        assert_eq!(b.node, nid(7));
     }
 }

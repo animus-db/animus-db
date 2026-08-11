@@ -12,6 +12,7 @@
 //! flushed, on-disk table (so without the fast path, deciding the LWW winner
 //! would have to fetch a block).
 
+use animus_env::nid;
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::{LsmEngine, LsmOptions, MergeOp, StorageEngine};
 use futures::executor::block_on;
@@ -33,7 +34,7 @@ fn opts(trust_monotonic_versions: bool) -> LsmOptions {
 
 fn open(sim: &Simulator, trust_monotonic_versions: bool) -> LsmEngine<SimEnv> {
     block_on(LsmEngine::open_with(
-        sim.env(0),
+        sim.env(nid(0)),
         PREFIX,
         opts(trust_monotonic_versions),
     ))

@@ -8,6 +8,7 @@
 //! resolve synchronously (no timers/recv), so we drive each future with
 //! `block_on` directly against `sim.env(node)` — deterministic and seed-pure.
 
+use animus_env::nid;
 use animus_sim::Simulator;
 use animus_storage::{LsmEngine, LsmOptions, Snapshot, StorageEngine, StorageError, WriteBatch};
 use futures::executor::block_on;
@@ -37,7 +38,7 @@ fn open(seed: u64) -> LsmEngine<animus_sim::SimEnv> {
         trust_monotonic_versions: false,
         background_maintenance: false,
     };
-    block_on(LsmEngine::open_with(sim.env(0), "db/", opts)).expect("open")
+    block_on(LsmEngine::open_with(sim.env(nid(0)), "db/", opts)).expect("open")
 }
 
 #[test]

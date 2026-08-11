@@ -24,7 +24,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use animus_control::mirror::rebuild_metadata_from_engine;
-use animus_env::{NodeId, ProdEnv};
+use animus_env::{NodeId, ProdEnv, nid};
 use animus_storage::LsmEngine;
 use animus_tablet::{KeyRange, TabletId};
 use animusd::{
@@ -115,7 +115,7 @@ async fn read_mirror_from_disk(dir: &std::path::Path) -> animus_control::Metadat
     // the SAME internal directory the node's own env used (ADR 0040 PR1:
     // one shared env, one directory, not a separate `control` subdir) — disk
     // content is keyed by directory, not by which port/id opened it.
-    let (env, _addr) = ProdEnv::bind(999_999, free_addr(), dir.join("internal"))
+    let (env, _addr) = ProdEnv::bind(nid(999_999), free_addr(), dir.join("internal"))
         .await
         .expect("bind a scratch env over the same directory");
     let engine: LsmEngine<ProdEnv> = LsmEngine::open(env, animusd::SYSKV_LSM_PREFIX)
@@ -143,7 +143,7 @@ async fn control_only_mirror_engine_survives_a_real_process_restart() {
     let node = start(addrs, &node_dir).await;
     await_leader(&node).await;
     for id in 0..3 {
-        propose_and_await(&node, addrs.client, upsert(id, NodeStatus::Down)).await;
+        propose_and_await(&node, addrs.client, upsert(nid(id), NodeStatus::Down)).await;
     }
     // Let the apply task catch up before shutting down.
     sleep(Duration::from_millis(500)).await;
@@ -175,7 +175,7 @@ async fn control_only_mirror_engine_survives_a_real_process_restart() {
     .expect("restarted node did not recover its pre-restart members in 10s");
 
     for id in 3..6 {
-        propose_and_await(&node, addrs.client, upsert(id, NodeStatus::Down)).await;
+        propose_and_await(&node, addrs.client, upsert(nid(id), NodeStatus::Down)).await;
     }
     let reference_after = node.metadata();
     assert_eq!(reference_after.members.len(), 6);
@@ -229,7 +229,7 @@ async fn control_only_schema_and_tablet_map_survive_a_hard_restart() {
     // hard (non-graceful) shutdown. ---
     let node = start(addrs, &node_dir).await;
     await_leader(&node).await;
-    propose_and_await(&node, addrs.client, upsert(7, NodeStatus::Down)).await;
+    propose_and_await(&node, addrs.client, upsert(nid(7), NodeStatus::Down)).await;
 
     let create_schema = MetaCommand::CreateTableSchema {
         table: table.to_string(),
@@ -252,7 +252,7 @@ async fn control_only_schema_and_tablet_map_survive_a_hard_restart() {
         tablet,
         table: Some(table.to_string()),
         range: KeyRange::whole(),
-        replicas: vec![300],
+        replicas: vec![nid(300)],
     };
     let resp = call(addrs.client, ClientRequest::ProposeSchema(create_tablet)).await;
     assert!(matches!(resp, ClientResponse::PutOk));
@@ -281,7 +281,7 @@ async fn control_only_schema_and_tablet_map_survive_a_hard_restart() {
 
     let mirrored_before = read_mirror_from_disk(&node_dir).await;
     assert!(
-        mirrored_before.members.contains_key(&7),
+        mirrored_before.members.contains_key(&nid(7)),
         "engine should hold the pre-restart member"
     );
     assert!(
@@ -301,7 +301,7 @@ async fn control_only_schema_and_tablet_map_survive_a_hard_restart() {
     timeout(Duration::from_secs(10), async {
         loop {
             let meta = node.metadata();
-            if meta.members.contains_key(&7)
+            if meta.members.contains_key(&nid(7))
                 && meta.has_table_schema(table)
                 && meta.tablets.contains_key(&tablet)
             {

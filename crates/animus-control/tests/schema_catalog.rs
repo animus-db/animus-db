@@ -20,6 +20,7 @@ use std::time::Duration;
 
 use animus_control::raft::ProposeResult;
 use animus_control::{ColumnDef, ColumnType, MetaCommand, RaftNode, ReplicationMode, TableSchema};
+use animus_env::nid;
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::MemoryEngine;
 
@@ -29,7 +30,13 @@ fn cluster(seed: u64) -> (Simulator, Vec<RaftNode<SimEnv>>) {
     let sim = Simulator::new(seed);
     let nodes = NODES
         .iter()
-        .map(|&id| RaftNode::start(sim.env(id), NODES.to_vec(), MemoryEngine::new()))
+        .map(|&id| {
+            RaftNode::start(
+                sim.env(nid(id)),
+                NODES.iter().copied().map(nid).collect(),
+                MemoryEngine::new(),
+            )
+        })
         .collect();
     (sim, nodes)
 }
@@ -148,7 +155,7 @@ fn run(seed: u64) {
     }
 
     // 3. Kill the leader; survivors re-elect and must still hold the schemas.
-    sim.crash(leader as u64);
+    sim.crash(nid(leader as u64));
     sim.run_for(Duration::from_secs(3));
     let survivors: Vec<usize> = (0..3).filter(|&i| i != leader).collect();
     let new_leader = unique_leader(&nodes, &survivors, seed);
@@ -242,7 +249,7 @@ fn set_table_mode_replicates_and_survives_leader_kill() {
     }
 
     // Kill the leader; the set mode survives on the durable survivors.
-    sim.crash(leader as u64);
+    sim.crash(nid(leader as u64));
     sim.run_for(Duration::from_secs(3));
     for i in (0..3).filter(|&i| i != leader) {
         assert_eq!(
@@ -282,7 +289,7 @@ fn create_keyspace_replicates_and_survives_leader_kill() {
         assert!(!node.metadata().has_keyspace("absent"));
     }
 
-    sim.crash(leader as u64);
+    sim.crash(nid(leader as u64));
     sim.run_for(Duration::from_secs(3));
     for i in (0..3).filter(|&i| i != leader) {
         assert!(
@@ -307,7 +314,7 @@ fn schema_catalog_is_reproducible_from_seed() {
             schema: events_schema(),
         });
         sim.run_for(Duration::from_secs(1));
-        sim.crash(leader as u64);
+        sim.crash(nid(leader as u64));
         sim.run_for(Duration::from_secs(3));
         sim.trace_lines()
     }

@@ -15,9 +15,8 @@
 use std::collections::BTreeSet;
 
 use animus_control::{ProposeResult, RaftCore, RaftMsg};
-use animus_env::{Nanos, NodeId};
-
-const GROUP: [NodeId; 3] = [0, 1, 2];
+use animus_env::{Nanos, NodeId, nid};
+const GROUP: [NodeId; 3] = [nid(0), nid(1), nid(2)];
 const NOW: Nanos = Nanos(1_000_000_000);
 
 fn set(ids: &[NodeId]) -> BTreeSet<NodeId> {
@@ -78,8 +77,10 @@ fn change_membership_rejects_until_the_no_op_commits_then_accepts() {
 
     // Gate closed: no config entry until an entry of this term commits.
     assert_eq!(
-        core.change_membership(set(&[0, 1])),
-        ProposeResult::NotLeader { leader: Some(0) },
+        core.change_membership(set(&[nid(0), nid(1)])),
+        ProposeResult::NotLeader {
+            leader: Some(nid(0))
+        },
         "a config change before the no-op commits must be rejected"
     );
     assert_eq!(
@@ -89,15 +90,15 @@ fn change_membership_rejects_until_the_no_op_commits_then_accepts() {
     );
 
     // One follower ack commits the no-op (majority of 3).
-    ack_all(&mut core, 1);
+    ack_all(&mut core, nid(1));
     assert_eq!(core.commit_index(), 1, "the no-op committed");
 
     // Gate open: the same change is now accepted and adopted immediately.
     assert!(matches!(
-        core.change_membership(set(&[0, 1])),
+        core.change_membership(set(&[nid(0), nid(1)])),
         ProposeResult::Accepted { index: 2 }
     ));
-    assert_eq!(core.config(), set(&[0, 1]));
+    assert_eq!(core.config(), set(&[nid(0), nid(1)]));
 }
 
 #[test]
@@ -114,16 +115,16 @@ fn first_term_index_is_leader_only() {
 #[test]
 fn single_server_rules_still_enforced_after_the_gate() {
     let mut core = elect_leader();
-    ack_all(&mut core, 1); // commit the no-op; the term gate is open
+    ack_all(&mut core, nid(1)); // commit the no-op; the term gate is open
 
     // Multi-server delta: {0,1,2} -> {0} removes two — needs joint consensus.
     assert!(matches!(
-        core.change_membership(set(&[0])),
+        core.change_membership(set(&[nid(0)])),
         ProposeResult::NotLeader { .. }
     ));
     // Leader self-removal: {1,2} drops the leader — transfer leadership first.
     assert!(matches!(
-        core.change_membership(set(&[1, 2])),
+        core.change_membership(set(&[nid(1), nid(2)])),
         ProposeResult::NotLeader { .. }
     ));
     // No-op delta: nothing to change.
@@ -134,24 +135,27 @@ fn single_server_rules_still_enforced_after_the_gate() {
 
     // A valid single-server add is accepted...
     assert!(matches!(
-        core.change_membership(set(&[0, 1, 2, 3])),
+        core.change_membership(set(&[nid(0), nid(1), nid(2), nid(3)])),
         ProposeResult::Accepted { .. }
     ));
     // ...and a second change is rejected while the first is in flight
     // (uncommitted config entry).
     assert!(matches!(
-        core.change_membership(set(&[0, 1, 2, 3, 4])),
+        core.change_membership(set(&[nid(0), nid(1), nid(2), nid(3), nid(4)])),
         ProposeResult::NotLeader { .. }
     ));
 
     // Commit the config entry (majority of the new 4-node config = 3: leader +
     // two follower acks), then the next single-server step is accepted.
-    ack_all(&mut core, 1);
-    ack_all(&mut core, 2);
+    ack_all(&mut core, nid(1));
+    ack_all(&mut core, nid(2));
     assert_eq!(core.commit_index(), core.last_log_index());
     assert!(matches!(
-        core.change_membership(set(&[0, 1, 2, 3, 4])),
+        core.change_membership(set(&[nid(0), nid(1), nid(2), nid(3), nid(4)])),
         ProposeResult::Accepted { .. }
     ));
-    assert_eq!(core.config(), set(&[0, 1, 2, 3, 4]));
+    assert_eq!(
+        core.config(),
+        set(&[nid(0), nid(1), nid(2), nid(3), nid(4)])
+    );
 }

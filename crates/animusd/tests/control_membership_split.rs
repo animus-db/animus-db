@@ -25,6 +25,7 @@ use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
 mod support;
+use animus_env::nid;
 use support::{await_data_nodes_active, await_leader, bring_up_split};
 
 async fn call(addr: SocketAddr, req: ClientRequest) -> Option<ClientResponse> {
@@ -173,7 +174,7 @@ async fn join_control_nonvoter(
             admin: raw[4],
         };
         let bound = match animusd::Node::bind_control(
-            new_control_id,
+            nid(new_control_id),
             addrs,
             dir.join(format!("grow-{new_control_id}-{attempt}")),
         )

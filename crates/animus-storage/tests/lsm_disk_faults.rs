@@ -29,7 +29,7 @@
 //!    isn't provably a trailing tear (a valid record still parses later in the
 //!    file — see `decode_wal`'s doc comment in `lsm.rs`).
 
-use animus_env::Disk;
+use animus_env::{Disk, nid};
 use animus_sim::{DiskConfig, SimEnv, Simulator};
 use animus_storage::{LsmEngine, LsmOptions, StorageEngine};
 use futures::executor::block_on;
@@ -66,7 +66,7 @@ fn churn_opts() -> LsmOptions {
 }
 
 fn open(sim: &Simulator, opts: LsmOptions) -> LsmEngine<SimEnv> {
-    block_on(LsmEngine::open_with(sim.env(0), PREFIX, opts)).expect("open")
+    block_on(LsmEngine::open_with(sim.env(nid(0)), PREFIX, opts)).expect("open")
 }
 
 fn key(i: u64) -> String {
@@ -99,7 +99,7 @@ fn first_frame_len(bytes: &[u8]) -> usize {
 /// frame, so if the tear happens to retain the whole frame the replay is an
 /// idempotent duplicate — the interesting cases are the partial ones.
 async fn buffer_unsynced_wal_record(sim: &Simulator, e: &LsmEngine<SimEnv>) {
-    let env = sim.env(0);
+    let env = sim.env(nid(0));
     let file = active_wal_file(e);
     let bytes = env.read(&file).await.expect("read wal segment");
     let frame_len = first_frame_len(&bytes);
@@ -134,7 +134,7 @@ fn torn_wal_tail_crash_recovers_all_acked_writes() {
                     buffer_unsynced_wal_record(&sim, &e).await;
                 });
             }
-            sim.crash(0);
+            sim.crash(nid(0));
 
             let e = open(&sim, wal_only_opts());
             block_on(async {
@@ -204,7 +204,7 @@ fn injected_wal_errors_surface_and_lose_no_acked_write() {
             "seed={seed}: some puts should have succeeded"
         );
 
-        sim.crash(0);
+        sim.crash(nid(0));
         let e = open(&sim, wal_only_opts());
         block_on(async {
             for &i in &acked {
@@ -256,7 +256,7 @@ fn injected_errors_during_flush_and_compaction_lose_no_acked_write() {
             "seed={seed}: some puts should have succeeded"
         );
 
-        sim.crash(0);
+        sim.crash(nid(0));
         let e = open(&sim, churn_opts());
         block_on(async {
             for &i in &acked {
@@ -310,7 +310,7 @@ fn corrupted_sstable_block_read_is_a_clean_error() {
     // per-block CRC covers `tag || payload`, so any flipped payload byte must
     // be detected).
     assert!(
-        sim.corrupt_durable(0, &sst_file, 1),
+        sim.corrupt_durable(nid(0), &sst_file, 1),
         "seed={seed}: corruption must land"
     );
     block_on(async {
@@ -345,13 +345,17 @@ fn corrupted_manifest_fails_open_cleanly() {
                 e.flush_now().await.unwrap(); // writes a real manifest
             });
         }
-        sim.crash(0);
-        if !sim.corrupt_durable(0, "db/MANIFEST", offset) {
+        sim.crash(nid(0));
+        if !sim.corrupt_durable(nid(0), "db/MANIFEST", offset) {
             continue; // manifest shorter than this offset; nothing to test
         }
         // Must be a clean error (or, for a byte the codec ignores, a clean
         // open) — never a panic.
-        match block_on(LsmEngine::open_with(sim.env(0), PREFIX, wal_only_opts())) {
+        match block_on(LsmEngine::open_with(
+            sim.env(nid(0)),
+            PREFIX,
+            wal_only_opts(),
+        )) {
             Ok(_) | Err(_) => {}
         }
     }
@@ -394,7 +398,7 @@ fn acked_writes_after_torn_tail_recovery_survive_second_restart() {
                 buffer_unsynced_wal_record(&sim, &e).await;
             });
         }
-        sim.crash(0); // tear: a partial record is left at the segment's end
+        sim.crash(nid(0)); // tear: a partial record is left at the segment's end
 
         // First recovery: correct (the torn line is skipped). Now write one
         // more record — it is acked (WAL-synced before returning).
@@ -418,7 +422,7 @@ fn acked_writes_after_torn_tail_recovery_survive_second_restart() {
         }
         // Clean restart: nothing is buffered (the put synced before returning),
         // so this crash tears nothing — it only forces a second replay.
-        sim.crash(0);
+        sim.crash(nid(0));
 
         let e = open(&sim, wal_only_opts());
         block_on(async {
@@ -461,17 +465,21 @@ fn corrupted_durable_wal_record_surfaces_loudly() {
             }
         });
     }
-    sim.crash(0);
+    sim.crash(nid(0));
     // Flip one byte inside the first (durable, acked) record of the WAL.
     assert!(
-        sim.corrupt_durable(0, &format!("{PREFIX}wal-000000"), 1),
+        sim.corrupt_durable(nid(0), &format!("{PREFIX}wal-000000"), 1),
         "seed={seed}: corruption must land"
     );
 
     // The engine must not silently drop an acked write: either `open` fails
     // loudly, or the write is still readable. Today neither holds — open
     // succeeds and k000 is gone.
-    match block_on(LsmEngine::open_with(sim.env(0), PREFIX, wal_only_opts())) {
+    match block_on(LsmEngine::open_with(
+        sim.env(nid(0)),
+        PREFIX,
+        wal_only_opts(),
+    )) {
         Err(_) => {} // loud failure: acceptable
         Ok(e) => block_on(async {
             assert_eq!(

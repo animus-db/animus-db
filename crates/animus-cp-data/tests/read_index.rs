@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use animus_control::ProposeResult;
 use animus_cp_data::RaftKvNode;
-use animus_env::EnvExt;
+use animus_env::{EnvExt, nid};
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::MemoryEngine;
 
@@ -24,7 +24,13 @@ fn group(seed: u64) -> (Simulator, Vec<KvNode>) {
     let sim = Simulator::new(seed);
     let nodes = NODES
         .iter()
-        .map(|&id| RaftKvNode::start(sim.env(id), NODES.to_vec(), MemoryEngine::new()))
+        .map(|&id| {
+            RaftKvNode::start(
+                sim.env(nid(id)),
+                NODES.iter().copied().map(nid).collect(),
+                MemoryEngine::new(),
+            )
+        })
         .collect();
     (sim, nodes)
 }
@@ -180,7 +186,7 @@ fn deposed_leader_does_not_serve_a_stale_read() {
     let old = leader(&nodes, &[0, 1, 2], seed);
     let survivors: Vec<usize> = (0..3).filter(|&i| i != old).collect();
     for &s in &survivors {
-        sim.partition_pair(old as u64, s as u64);
+        sim.partition_pair(nid(old as u64), nid(s as u64));
     }
     sim.run_for(Duration::from_secs(3));
     put(&nodes, &survivors, seed, b"x", b"new");
@@ -238,8 +244,8 @@ fn linearizable_read_succeeds_after_a_full_membership_rotation() {
     // reconciler-placed spare does (`cp_join_host`'s "others" shape):
     // `all_nodes` excludes self, so neither can campaign before a leader's
     // config entry actually adds it.
-    let node3 = RaftKvNode::start(sim.env(3), vec![1, 2], MemoryEngine::new());
-    let node4 = RaftKvNode::start(sim.env(4), vec![1, 2], MemoryEngine::new());
+    let node3 = RaftKvNode::start(sim.env(nid(3)), vec![nid(1), nid(2)], MemoryEngine::new());
+    let node4 = RaftKvNode::start(sim.env(nid(4)), vec![nid(1), nid(2)], MemoryEngine::new());
     sim.run_for(Duration::from_secs(1));
 
     // Four single-server steps rotate {0,1,2} -> {2,3,4}: add 3, add 4, remove
@@ -255,7 +261,7 @@ fn linearizable_read_succeeds_after_a_full_membership_rotation() {
         let l = leader(&nodes, &[0, 1, 2], seed);
         assert!(
             matches!(
-                nodes[l].change_membership(step.clone()),
+                nodes[l].change_membership(step.clone().into_iter().map(nid).collect()),
                 ProposeResult::Accepted { .. }
             ),
             "leader {l} rejected the step to {step:?} (seed={seed})"
@@ -279,7 +285,7 @@ fn linearizable_read_succeeds_after_a_full_membership_rotation() {
         .expect("exactly one of {2,3,4} should lead after the rotation");
     assert_eq!(
         leader_node.config(),
-        set(&[2, 3, 4]),
+        set(&[2, 3, 4]).into_iter().map(nid).collect(),
         "expected the rotation to have fully converged (leader={leader_id}, seed={seed})"
     );
     assert_eq!(

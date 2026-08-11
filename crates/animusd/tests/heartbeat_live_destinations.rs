@@ -42,6 +42,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
 
+use animus_env::nid;
 use animusd::config::NodeRole;
 use animusd::{ClusterConfig, Node, RoleAddrs, StorageBackend};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -155,7 +156,7 @@ async fn join_control_nonvoter(
             admin: raw[4],
         };
         let bound = match animusd::Node::bind_control(
-            new_control_id,
+            nid(new_control_id),
             addrs,
             dir.join(format!("grow-{attempt}")),
         )
@@ -228,7 +229,7 @@ async fn heartbeat_reaches_a_runtime_added_voter_after_it_becomes_leader() {
     // first" step.
     let self_registered = async {
         loop {
-            if node0.metadata().node_addrs.contains_key(&new_id) {
+            if node0.metadata().node_addrs.contains_key(&nid(new_id)) {
                 return;
             }
             sleep(Duration::from_millis(50)).await;
@@ -299,7 +300,7 @@ async fn heartbeat_reaches_a_runtime_added_voter_after_it_becomes_leader() {
     // control-address merge into the raftkv env's own peer book).
     timeout(Duration::from_secs(20), async {
         loop {
-            if believes_alive(grown_admin, node0_raftkv_id).await {
+            if believes_alive(grown_admin, (node0_raftkv_id).as_u64()).await {
                 return;
             }
             sleep(Duration::from_millis(100)).await;
@@ -317,7 +318,7 @@ async fn heartbeat_reaches_a_runtime_added_voter_after_it_becomes_leader() {
     let sustained_deadline = tokio::time::Instant::now() + Duration::from_millis(1_700);
     while tokio::time::Instant::now() < sustained_deadline {
         assert!(
-            believes_alive(grown_admin, node0_raftkv_id).await,
+            believes_alive(grown_admin, (node0_raftkv_id).as_u64()).await,
             "node 0's heartbeats stopped reaching the runtime-added leader partway through \
              the sustained-liveness window"
         );

@@ -25,15 +25,15 @@ use std::time::Duration;
 
 use animus_control::raft::{LogEntry, RaftMsg, Role};
 use animus_control::{MetaCommand, Metadata, NodeStatus, RaftCore, RaftNode, mirror};
-use animus_env::Nanos;
+use animus_env::{Nanos, NodeId, nid};
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::MemoryEngine;
 
-const NODES: [u64; 3] = [0, 1, 2];
+const NODES: [NodeId; 3] = [nid(0), nid(1), nid(2)];
 
 fn upsert(node: u64) -> MetaCommand {
     MetaCommand::UpsertMember {
-        node,
+        node: nid(node),
         labels: BTreeMap::new(),
         status: NodeStatus::Active,
     }
@@ -48,7 +48,7 @@ fn drained_contains_member(core: &mut RaftCore, node: u64) -> bool {
     for (_, command) in core.drain_apply() {
         let _ = mirror::apply_and_derive_mirror(&mut oracle, &command);
     }
-    oracle.members.contains_key(&node)
+    oracle.members.contains_key(&nid(node))
 }
 
 /// A **follower** applies a committed entry on commit — *without* its own local
@@ -59,7 +59,7 @@ fn drained_contains_member(core: &mut RaftCore, node: u64) -> bool {
 #[test]
 fn follower_applies_on_commit_without_its_own_fsync() {
     // A follower in term 1 that has not fsynced anything (durable_index == 0).
-    let mut follower = RaftCore::new(0, &NODES, Nanos(0), 7);
+    let mut follower = RaftCore::new(nid(0), &NODES, Nanos(0), 7);
     assert_eq!(follower.role(), Role::Follower);
     assert_eq!(follower.durable_index(), 0, "nothing fsynced yet");
 
@@ -72,10 +72,10 @@ fn follower_applies_on_commit_without_its_own_fsync() {
         config: None,
     };
     follower.handle(
-        1,
+        nid(1),
         RaftMsg::AppendEntries {
             term: 1,
-            leader: 1,
+            leader: nid(1),
             prev_log_index: 0,
             prev_log_term: 0,
             entries: vec![entry],
@@ -111,7 +111,7 @@ fn follower_applies_on_commit_without_its_own_fsync() {
 /// the shape of the `persistence.rs` regression.
 #[test]
 fn leader_stays_durability_gated_on_its_own_proposal() {
-    let mut leader = RaftCore::new(0, &[0], Nanos(0), 7);
+    let mut leader = RaftCore::new(nid(0), &[nid(0)], Nanos(0), 7);
     leader.tick(Nanos(1_000_000_000), 7); // election timeout -> sole leader
     assert_eq!(leader.role(), Role::Leader);
     // Make the leader's initial no-op durable so it isn't what we're observing.
@@ -146,14 +146,14 @@ fn leader_stays_durability_gated_on_its_own_proposal() {
 /// moves forward across the role change.
 #[test]
 fn follower_to_leader_keeps_applied_then_gates_new_proposals() {
-    let mut node = RaftCore::new(0, &NODES, Nanos(0), 7);
+    let mut node = RaftCore::new(nid(0), &NODES, Nanos(0), 7);
 
     // As a follower, learn + commit an entry without any local fsync.
     node.handle(
-        1,
+        nid(1),
         RaftMsg::AppendEntries {
             term: 1,
-            leader: 1,
+            leader: nid(1),
             prev_log_index: 0,
             prev_log_term: 0,
             entries: vec![LogEntry {
@@ -176,7 +176,7 @@ fn follower_to_leader_keeps_applied_then_gates_new_proposals() {
     node.tick(Nanos(1_000_000_000), 7); // -> pre-candidate, PreVote out (term still 1)
     assert_eq!(node.role(), Role::PreCandidate);
     node.handle(
-        1,
+        nid(1),
         RaftMsg::PreVoteResp {
             term: node.term() + 1, // the prospective term the pre-vote is for
             granted: true,
@@ -191,7 +191,7 @@ fn follower_to_leader_keeps_applied_then_gates_new_proposals() {
     );
     for granter in [1u64, 2u64] {
         node.handle(
-            granter,
+            nid(granter),
             RaftMsg::RequestVoteResp {
                 term: node.term(),
                 granted: true,
@@ -254,7 +254,7 @@ fn followers_reflect_a_committed_command() {
 
     for (i, n) in nodes.iter().enumerate() {
         assert!(
-            n.metadata().members.contains_key(&77),
+            n.metadata().members.contains_key(&nid(77)),
             "node {i} (leader={leader}) did not reflect the committed command (seed={seed})"
         );
     }

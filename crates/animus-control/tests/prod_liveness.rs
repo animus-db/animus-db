@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use animus_control::{MetaCommand, NodeStatus, RaftNode};
-use animus_env::{Env, NodeId, ProdEnv};
+use animus_env::{Env, NodeId, ProdEnv, nid};
 use animus_storage::{LsmEngine, MemoryEngine};
 use tokio::time::{sleep, timeout};
 
@@ -50,7 +50,7 @@ fn fat_member(node: u64, n_keys: usize) -> MetaCommand {
         labels.insert(format!("k{node}_{k}"), format!("v{k}"));
     }
     MetaCommand::UpsertMember {
-        node,
+        node: nid(node),
         labels,
         status: NodeStatus::Joining,
     }
@@ -67,7 +67,7 @@ async fn large_metadata_catch_up_stays_live() {
     const MAX_TERM_DELTA: u64 = 25;
 
     timeout(Duration::from_secs(90), async {
-        let group: Vec<NodeId> = vec![0, 1, 2];
+        let group: Vec<NodeId> = vec![nid(0), nid(1), nid(2)];
         let dirs: Vec<_> = (0..3).map(|_| unique_tmp_dir()).collect();
         let loop0 = || "127.0.0.1:0".parse::<SocketAddr>().unwrap();
 
@@ -75,7 +75,9 @@ async fn large_metadata_catch_up_stays_live() {
         // the Raft driver on nodes 0 and 1 — node 2 stays dark so it falls behind.
         let mut envs = Vec::new();
         for (i, dir) in dirs.iter().enumerate() {
-            let (env, _addr) = ProdEnv::bind(i as u64, loop0(), dir).await.expect("bind");
+            let (env, _addr) = ProdEnv::bind(nid(i as u64), loop0(), dir)
+                .await
+                .expect("bind");
             envs.push(env);
         }
         let book: BTreeMap<NodeId, SocketAddr> =
@@ -116,7 +118,7 @@ async fn large_metadata_catch_up_stays_live() {
         // whichever node leads may still hold the whole log and ship it cheaply.)
         for _ in 0..300 {
             leader.propose(MetaCommand::UpsertMember {
-                node: 999,
+                node: nid(999),
                 labels: BTreeMap::new(),
                 // `Joining`, not `Active` — see `fat_member`'s doc.
                 status: NodeStatus::Joining,
@@ -229,13 +231,15 @@ async fn sustained_metadata_churn_over_a_real_engine_stays_live() {
     const MAX_TRANSITIONS: u32 = 3;
 
     timeout(Duration::from_secs(120), async {
-        let group: Vec<NodeId> = vec![0, 1, 2];
+        let group: Vec<NodeId> = vec![nid(0), nid(1), nid(2)];
         let dirs: Vec<_> = (0..3).map(|_| unique_tmp_dir()).collect();
         let loop0 = || "127.0.0.1:0".parse::<SocketAddr>().unwrap();
 
         let mut envs = Vec::new();
         for (i, dir) in dirs.iter().enumerate() {
-            let (env, _addr) = ProdEnv::bind(i as u64, loop0(), dir).await.expect("bind");
+            let (env, _addr) = ProdEnv::bind(nid(i as u64), loop0(), dir)
+                .await
+                .expect("bind");
             envs.push(env);
         }
         let book: BTreeMap<NodeId, SocketAddr> =
@@ -298,7 +302,7 @@ async fn sustained_metadata_churn_over_a_real_engine_stays_live() {
                 last_leader_term = term_now;
             }
             nodes[leader_idx].propose(MetaCommand::UpsertMember {
-                node: 1_000 + i,
+                node: nid(1_000 + i),
                 labels: BTreeMap::new(),
                 // `Joining`, not `Active` — see `fat_member`'s doc above:
                 // the failure detector never judges this status, so this

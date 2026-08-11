@@ -18,7 +18,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use animus_control::mirror::rebuild_metadata_from_engine;
-use animus_env::ProdEnv;
+use animus_env::{ProdEnv, nid};
 use animus_storage::LsmEngine;
 use animus_tablet::{KeyRange, TabletId};
 use animusd::{
@@ -157,7 +157,7 @@ async fn combined_node_restart_recovers_control_metadata_via_shared_engine() {
     // system-keyspace mirror is real, independent of any node's own
     // in-memory state or of the restart path below.
     let raftkv_dir = node_dir.join("internal");
-    let (env, _addr) = ProdEnv::bind(999_999, free_addr(), raftkv_dir)
+    let (env, _addr) = ProdEnv::bind(nid(999_999), free_addr(), raftkv_dir)
         .await
         .expect("bind a scratch env over the same raftkv directory");
     let engine: LsmEngine<ProdEnv> = LsmEngine::open(env, animusd::LSM_PREFIX)

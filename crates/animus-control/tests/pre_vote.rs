@@ -14,11 +14,11 @@ use std::time::Duration;
 
 use animus_control::raft::{RaftCore, RaftMsg, Role};
 use animus_control::{MetaCommand, NodeStatus, RaftNode};
-use animus_env::{Nanos, NodeId};
+use animus_env::{Nanos, NodeId, nid};
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::MemoryEngine;
 
-const NODES: [u64; 3] = [0, 1, 2];
+const NODES: [NodeId; 3] = [nid(0), nid(1), nid(2)];
 
 // ---- core-level, fully deterministic --------------------------------------
 
@@ -39,21 +39,21 @@ fn heartbeat(leader: NodeId, term: u64) -> RaftMsg {
 /// from winning a pre-vote and forcing an election.
 #[test]
 fn prevote_rejected_while_leader_lease_valid() {
-    let mut core: RaftCore = RaftCore::new(0, &NODES, Nanos(0), 7);
+    let mut core: RaftCore = RaftCore::new(nid(0), &NODES, Nanos(0), 7);
     // Hear a heartbeat from leader 1 at term 5: this sets the leader hint and
     // resets the election timer (the lease).
     let hb_at = Nanos(1_000_000);
-    core.handle(1, heartbeat(1, 5), hb_at, 7);
+    core.handle(nid(1), heartbeat(nid(1), 5), hb_at, 7);
     assert_eq!(core.term(), 5);
     assert_eq!(core.role(), Role::Follower);
 
     // Node 2 solicits a pre-vote for its prospective term 6, still within our
     // lease (only a moment after the heartbeat).
     let outs = core.handle(
-        2,
+        nid(2),
         RaftMsg::PreVote {
             term: 6,
-            candidate: 2,
+            candidate: nid(2),
             last_log_index: 0,
             last_log_term: 0,
         },
@@ -63,7 +63,7 @@ fn prevote_rejected_while_leader_lease_valid() {
     assert!(
         matches!(
             outs.as_slice(),
-            [(2, RaftMsg::PreVoteResp { granted: false, .. })]
+            [(to, RaftMsg::PreVoteResp { granted: false, .. })] if *to == nid(2)
         ),
         "a live-leader lease must reject the pre-vote: {outs:?}"
     );
@@ -77,18 +77,18 @@ fn prevote_rejected_while_leader_lease_valid() {
 /// its own term.
 #[test]
 fn prevote_granted_after_lease_expires() {
-    let mut core: RaftCore = RaftCore::new(0, &NODES, Nanos(0), 7);
+    let mut core: RaftCore = RaftCore::new(nid(0), &NODES, Nanos(0), 7);
     let hb_at = Nanos(1_000_000);
-    core.handle(1, heartbeat(1, 5), hb_at, 7);
+    core.handle(nid(1), heartbeat(nid(1), 5), hb_at, 7);
 
     // Well past the election timeout (default base 150ms, spread < 300ms): the
     // lease has expired, so the leader is presumed gone.
     let later = Nanos(hb_at.0 + 400_000_000);
     let outs = core.handle(
-        2,
+        nid(2),
         RaftMsg::PreVote {
             term: 6,
-            candidate: 2,
+            candidate: nid(2),
             last_log_index: 0,
             last_log_term: 0,
         },
@@ -99,12 +99,12 @@ fn prevote_granted_after_lease_expires() {
         matches!(
             outs.as_slice(),
             [(
-                2,
+                to,
                 RaftMsg::PreVoteResp {
                     granted: true,
                     term: 6
                 }
-            )]
+            )] if *to == nid(2)
         ),
         "an expired lease + up-to-date log must grant the pre-vote: {outs:?}"
     );
@@ -120,8 +120,8 @@ fn prevote_granted_after_lease_expires() {
 /// advances it to a real election.
 #[test]
 fn timeout_makes_pre_candidate_without_bumping_term() {
-    let mut core: RaftCore = RaftCore::new(0, &NODES, Nanos(0), 7);
-    core.handle(1, heartbeat(1, 5), Nanos(1_000_000), 7);
+    let mut core: RaftCore = RaftCore::new(nid(0), &NODES, Nanos(0), 7);
+    core.handle(nid(1), heartbeat(nid(1), 5), Nanos(1_000_000), 7);
     assert_eq!(core.term(), 5);
 
     let outs = core.tick(Nanos(1_000_000_000), 7); // long past the timeout
@@ -188,8 +188,8 @@ fn isolated_follower_prevote_does_not_disturb_stable_leader() {
     let other = (0..3).find(|&i| i != leader && i != follower).unwrap();
 
     // Isolate the follower from both other nodes.
-    sim.partition_pair(follower as u64, leader as u64);
-    sim.partition_pair(follower as u64, other as u64);
+    sim.partition_pair(nid(follower as u64), nid(leader as u64));
+    sim.partition_pair(nid(follower as u64), nid(other as u64));
 
     // Let it sit isolated long enough for many election timeouts to fire.
     sim.run_for(Duration::from_secs(5));
@@ -214,8 +214,8 @@ fn isolated_follower_prevote_does_not_disturb_stable_leader() {
     );
 
     // Heal: the follower rejoins under the same term with no disruption.
-    sim.heal(follower as u64, leader as u64);
-    sim.heal(follower as u64, other as u64);
+    sim.heal(nid(follower as u64), nid(leader as u64));
+    sim.heal(nid(follower as u64), nid(other as u64));
     sim.run_for(Duration::from_secs(2));
 
     assert!(
@@ -229,7 +229,7 @@ fn isolated_follower_prevote_does_not_disturb_stable_leader() {
     );
     assert_eq!(
         nodes[follower].leader(),
-        Some(leader as u64),
+        Some(nid(leader as u64)),
         "the rejoined follower did not recognize the stable leader (seed={seed})"
     );
 }
@@ -246,7 +246,7 @@ fn election_still_succeeds_when_leader_is_gone() {
     let old_leader = leader_index(&nodes, &[0, 1, 2], seed);
     let old_term = nodes[old_leader].term();
 
-    sim.crash(old_leader as u64);
+    sim.crash(nid(old_leader as u64));
     sim.run_for(Duration::from_secs(4));
 
     let survivors: Vec<usize> = (0..3).filter(|&i| i != old_leader).collect();
@@ -259,7 +259,7 @@ fn election_still_succeeds_when_leader_is_gone() {
     // The new leader can make progress.
     assert!(matches!(
         nodes[new_leader].propose(MetaCommand::UpsertMember {
-            node: 42,
+            node: nid(42),
             labels: Default::default(),
             status: NodeStatus::Active,
         }),
@@ -268,7 +268,7 @@ fn election_still_succeeds_when_leader_is_gone() {
     sim.run_for(Duration::from_secs(2));
     for &s in &survivors {
         assert!(
-            nodes[s].metadata().members.contains_key(&42),
+            nodes[s].metadata().members.contains_key(&nid(42)),
             "post-election write did not replicate to survivor {s} (seed={seed})"
         );
     }

@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use animus_control::{MetaCommand, NodeStatus, RaftNode};
-use animus_env::EnvExt;
+use animus_env::{EnvExt, nid};
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::MemoryEngine;
 
@@ -21,7 +21,7 @@ const NODES: [u64; 3] = [0, 1, 2];
 
 fn upsert(node: u64) -> MetaCommand {
     MetaCommand::UpsertMember {
-        node,
+        node: nid(node),
         labels: std::collections::BTreeMap::new(),
         status: NodeStatus::Active,
     }
@@ -31,7 +31,13 @@ fn cluster(seed: u64) -> (Simulator, Vec<RaftNode<SimEnv>>) {
     let sim = Simulator::new(seed);
     let nodes = NODES
         .iter()
-        .map(|&id| RaftNode::start(sim.env(id), NODES.to_vec(), MemoryEngine::new()))
+        .map(|&id| {
+            RaftNode::start(
+                sim.env(nid(id)),
+                NODES.iter().copied().map(nid).collect(),
+                MemoryEngine::new(),
+            )
+        })
         .collect();
     (sim, nodes)
 }
@@ -96,7 +102,7 @@ fn watcher_wakes_when_a_proposal_applies() {
         "the watch's own latest() must have reached at least what the waiter observed"
     );
     assert!(
-        nodes[leader].metadata().members.contains_key(&41),
+        nodes[leader].metadata().members.contains_key(&nid(41)),
         "the applied index the watch reported must actually be visible via metadata()"
     );
 }
@@ -153,7 +159,7 @@ fn changed_resolves_immediately_when_the_advance_already_happened() {
     nodes[leader].propose(upsert(42));
     sim.run_for(Duration::from_secs(2));
     assert!(
-        nodes[leader].metadata().members.contains_key(&42),
+        nodes[leader].metadata().members.contains_key(&nid(42)),
         "setup: the proposal must already be applied before the watch is ever polled"
     );
 

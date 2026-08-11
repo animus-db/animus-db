@@ -10,7 +10,7 @@
 //! assertion is reproducible from a seed, and the recorded snapshot is asserted
 //! byte-identical across two runs of the same seed (the determinism guarantee).
 
-use animus_env::{Metric, MetricsHandle};
+use animus_env::{Metric, MetricsHandle, nid};
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::{LsmEngine, LsmOptions, StorageEngine};
 use futures::executor::block_on;
@@ -35,7 +35,7 @@ fn opts() -> LsmOptions {
 
 fn open(sim: &Simulator, metrics: MetricsHandle) -> LsmEngine<SimEnv> {
     block_on(LsmEngine::open_with_metrics(
-        sim.env(0),
+        sim.env(nid(0)),
         PREFIX,
         opts(),
         metrics,
@@ -193,7 +193,7 @@ fn tombstone_gc_is_recorded() {
     let metrics = MetricsHandle::recording();
     let grace = 64;
     let e = block_on(LsmEngine::open_with_metrics(
-        sim.env(0),
+        sim.env(nid(0)),
         PREFIX,
         LsmOptions {
             flush_threshold_bytes: 256,

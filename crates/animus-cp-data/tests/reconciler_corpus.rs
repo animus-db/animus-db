@@ -40,7 +40,7 @@ use std::time::Duration;
 use animus_control::ProposeResult;
 use animus_cp_data::host::{MetadataView, Reconciler};
 use animus_cp_data::{RaftKvNode, StorageScope};
-use animus_env::{Clock, EnvExt, NodeId};
+use animus_env::{Clock, EnvExt, NodeId, nid};
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::{MemoryEngine, StorageEngine};
 use animus_tablet::{Epoch, KeyRange, Tablet, TabletId};
@@ -54,10 +54,10 @@ const TABLE: &str = "t";
 /// A driver env id used only to host each scenario's own top-level script
 /// task — never a cluster node id (900 is well clear of every scenario's
 /// {A,B,C} = {300,301,302}).
-const DRIVER_ID: NodeId = 900;
-const A: NodeId = 300;
-const B: NodeId = 301;
-const C: NodeId = 302;
+const DRIVER_ID: NodeId = nid(900);
+const A: NodeId = nid(300);
+const B: NodeId = nid(301);
+const C: NodeId = nid(302);
 
 const SCENARIO_BUDGET: Duration = Duration::from_secs(150);
 const SCENARIO_STEP: Duration = Duration::from_secs(1);

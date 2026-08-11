@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use animus_consensus::{AccordNode, Key, TxnId};
-use animus_env::EnvExt;
+use animus_env::{EnvExt, nid};
 use animus_sim::{SimEnv, Simulator};
 use futures::executor::block_on;
 
@@ -33,7 +33,7 @@ fn local_cluster(seed: u64) -> (Simulator, Vec<AccordNode<SimEnv>>) {
     let sim = Simulator::new(seed);
     let nodes = NODES
         .iter()
-        .map(|&id| AccordNode::start(sim.env(id), NODES.to_vec()))
+        .map(|&id| AccordNode::start(sim.env(nid(id)), NODES.iter().copied().map(nid).collect()))
         .collect();
     (sim, nodes)
 }
@@ -133,8 +133,8 @@ fn value_recovers_from_disk() {
     assert_eq!(store_value(&nodes[2], 3).as_deref(), Some(&b"durable"[..]));
 
     // Stop node 2, restart it fresh; it recovers from its WAL.
-    sim.stop(2);
-    nodes[2] = AccordNode::start(sim.env(2), NODES.to_vec());
+    sim.stop(nid(2));
+    nodes[2] = AccordNode::start(sim.env(nid(2)), NODES.iter().copied().map(nid).collect());
     sim.run_for(Duration::from_secs(2));
 
     assert!(

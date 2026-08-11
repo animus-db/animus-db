@@ -16,6 +16,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use animus_consensus::{AccordNode, Key, TxnId};
+use animus_env::nid;
 use animus_sim::{SimEnv, Simulator};
 
 const NODES: [u64; 3] = [0, 1, 2];
@@ -24,7 +25,7 @@ fn cluster(seed: u64) -> (Simulator, Vec<AccordNode<SimEnv>>) {
     let sim = Simulator::new(seed);
     let nodes = NODES
         .iter()
-        .map(|&id| AccordNode::start(sim.env(id), NODES.to_vec()))
+        .map(|&id| AccordNode::start(sim.env(nid(id)), NODES.iter().copied().map(nid).collect()))
         .collect();
     (sim, nodes)
 }
@@ -162,8 +163,8 @@ fn read_result_recovers_from_disk() {
     assert_eq!(before, Some(BTreeMap::from([(8u64, Some(a))])));
 
     // Stop node 2 (volatile state lost) and restart on the same disk.
-    sim.stop(2);
-    nodes[2] = AccordNode::start(sim.env(2), NODES.to_vec());
+    sim.stop(nid(2));
+    nodes[2] = AccordNode::start(sim.env(nid(2)), NODES.iter().copied().map(nid).collect());
     sim.run_for(Duration::from_secs(2));
 
     assert!(

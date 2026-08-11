@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use animus_control::ProposeResult;
 use animus_cp_data::RaftKvNode;
-use animus_env::EnvExt;
+use animus_env::{EnvExt, nid};
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::MemoryEngine;
 
@@ -85,7 +85,13 @@ fn fresh_leader_case(seed: u64) {
     let mut sim = Simulator::new(seed);
     let nodes: Vec<KvNode> = NODES
         .iter()
-        .map(|&id| RaftKvNode::start(sim.env(id), NODES.to_vec(), MemoryEngine::new()))
+        .map(|&id| {
+            RaftKvNode::start(
+                sim.env(nid(id)),
+                NODES.iter().copied().map(nid).collect(),
+                MemoryEngine::new(),
+            )
+        })
         .collect();
     sim.run_for(Duration::from_secs(2));
 
@@ -107,8 +113,8 @@ fn fresh_leader_case(seed: u64) {
     // Cut the laggard off; everything from here on lands only on {old, heir}, so
     // the laggard falls ~40 entries behind — the new leader's no-op commit will
     // need that many next_index backtrack round-trips against it.
-    sim.partition_pair(old as u64, laggard as u64);
-    sim.partition_pair(heir as u64, laggard as u64);
+    sim.partition_pair(nid(old as u64), nid(laggard as u64));
+    sim.partition_pair(nid(heir as u64), nid(laggard as u64));
     for i in 0..40u32 {
         assert!(matches!(
             nodes[old].put(format!("filler-{i:02}").into_bytes(), b"f".to_vec()),
@@ -147,10 +153,10 @@ fn fresh_leader_case(seed: u64) {
 
     // Kill the old leader inside the window; heal the laggard so an election can
     // reach a majority. The heir's log is longest, so only it can win.
-    sim.crash(old as u64);
+    sim.crash(nid(old as u64));
     for &(a, b) in &[(heir, laggard), (old, laggard)] {
-        sim.heal(a as u64, b as u64);
-        sim.heal(b as u64, a as u64);
+        sim.heal(nid(a as u64), nid(b as u64));
+        sim.heal(nid(b as u64), nid(a as u64));
     }
     assert!(
         run_until_cond(

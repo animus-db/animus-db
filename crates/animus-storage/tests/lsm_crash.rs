@@ -15,6 +15,7 @@
 //!    swapped) loses nothing and reads no torn table: recovery keeps the old
 //!    inputs, the orphan merged file is ignored.
 
+use animus_env::nid;
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::{LsmEngine, LsmOptions, StorageEngine};
 use futures::executor::block_on;
@@ -38,7 +39,7 @@ fn opts() -> LsmOptions {
 }
 
 fn open(sim: &Simulator) -> LsmEngine<SimEnv> {
-    block_on(LsmEngine::open_with(sim.env(0), PREFIX, opts())).expect("open")
+    block_on(LsmEngine::open_with(sim.env(nid(0)), PREFIX, opts())).expect("open")
 }
 
 /// 1. Writes that returned (so were WAL-synced) survive a crash; the engine
@@ -58,7 +59,7 @@ fn synced_writes_survive_crash() {
     }
     // Power loss: drop un-synced bytes (there are none past the last synced WAL
     // append, since every write syncs before returning) and all volatile state.
-    sim.crash(0);
+    sim.crash(nid(0));
 
     let e = open(&sim);
     block_on(async {
@@ -103,7 +104,7 @@ fn flushed_sstable_survives_crash() {
             );
         });
     }
-    sim.crash(0);
+    sim.crash(nid(0));
 
     let e = open(&sim);
     block_on(async {
@@ -137,7 +138,7 @@ fn crash_mid_flush_recovers_via_wal() {
             e.test_write_orphan_sstable(b"orphan").await;
         });
     }
-    sim.crash(0); // drops the un-synced orphan SSTable bytes + memtable
+    sim.crash(nid(0)); // drops the un-synced orphan SSTable bytes + memtable
 
     let e = open(&sim);
     block_on(async {
@@ -190,7 +191,7 @@ fn crash_mid_compaction_keeps_old_tables() {
             e.test_write_orphan_sstable(b"merged").await;
         });
     }
-    sim.crash(0); // drops the un-synced merged file
+    sim.crash(nid(0)); // drops the un-synced merged file
 
     let e = open(&sim);
     block_on(async {

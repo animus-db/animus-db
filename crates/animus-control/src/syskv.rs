@@ -50,6 +50,8 @@
 //! should reuse the primitive directly rather than triplicate it.
 
 use animus_env::NodeId;
+#[cfg(test)]
+use animus_env::nid;
 use animus_tablet::{TabletId, escape};
 
 /// The top-level namespace no user table or keyspace name may claim. Reserved
@@ -257,7 +259,7 @@ pub fn tablet_key(id: TabletId) -> Vec<u8> {
 /// A [`NodeId`]'s key under [`EntityKind::Member`].
 #[must_use]
 pub fn member_key(id: NodeId) -> Vec<u8> {
-    entity_key(EntityKind::Member, &id.to_be_bytes())
+    entity_key(EntityKind::Member, &id.as_u64().to_be_bytes())
 }
 
 /// A table name's key under [`EntityKind::Schema`].
@@ -275,7 +277,7 @@ pub fn policy_key(id: TabletId) -> Vec<u8> {
 /// A [`NodeId`]'s key under [`EntityKind::NodeAddrs`].
 #[must_use]
 pub fn node_addrs_key(id: NodeId) -> Vec<u8> {
-    entity_key(EntityKind::NodeAddrs, &id.to_be_bytes())
+    entity_key(EntityKind::NodeAddrs, &id.as_u64().to_be_bytes())
 }
 
 /// A keyspace name's key under [`EntityKind::Keyspace`].
@@ -302,7 +304,7 @@ pub fn counter_key(name: &str) -> Vec<u8> {
 /// `Metadata::cp_member_addrs`/`cp_member_tablets` pair).
 #[must_use]
 pub fn cp_member_addr_key(id: NodeId) -> Vec<u8> {
-    entity_key(EntityKind::CpMemberAddr, &id.to_be_bytes())
+    entity_key(EntityKind::CpMemberAddr, &id.as_u64().to_be_bytes())
 }
 
 /// A join attempt's nonce string's key under [`EntityKind::NodeIdAlloc`]
@@ -438,7 +440,7 @@ mod tests {
 
     #[test]
     fn member_key_round_trips() {
-        let key = member_key(7);
+        let key = member_key(nid(7));
         assert_eq!(
             decode_key(&key),
             Some(DecodedKey::Entity {
@@ -474,7 +476,7 @@ mod tests {
 
     #[test]
     fn node_addrs_key_round_trips() {
-        let key = node_addrs_key(300);
+        let key = node_addrs_key(nid(300));
         assert_eq!(
             decode_key(&key),
             Some(DecodedKey::Entity {
@@ -530,7 +532,7 @@ mod tests {
 
     #[test]
     fn cp_member_addr_key_round_trips() {
-        let key = cp_member_addr_key(1301);
+        let key = cp_member_addr_key(nid(1301));
         assert_eq!(
             decode_key(&key),
             Some(DecodedKey::Entity {

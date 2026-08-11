@@ -20,6 +20,7 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use animus_consensus::{AccordNode, Key, TxnId};
+use animus_env::nid;
 use animus_sim::{NetConfig, SimEnv, Simulator};
 use futures::executor::block_on;
 
@@ -29,7 +30,7 @@ fn cluster(seed: u64) -> (Simulator, Vec<AccordNode<SimEnv>>) {
     let sim = Simulator::new(seed);
     let nodes = NODES
         .iter()
-        .map(|&id| AccordNode::start(sim.env(id), NODES.to_vec()))
+        .map(|&id| AccordNode::start(sim.env(nid(id)), NODES.iter().copied().map(nid).collect()))
         .collect();
     (sim, nodes)
 }
@@ -101,7 +102,7 @@ fn two_concurrent_recoverers_converge() {
         // single decision (adopting an existing commit, or agreeing a fresh one).
         sim.run_for(Duration::from_millis(30));
         for peer in [1, 2, 3, 4] {
-            sim.partition_pair(0, peer);
+            sim.partition_pair(nid(0), nid(peer));
         }
         sim.run_for(Duration::from_millis(200));
 
@@ -143,7 +144,7 @@ fn failover_under_partition_then_heal() {
     // PreAccept reaches the survivors, then the coordinator is isolated.
     sim.run_for(Duration::from_millis(30));
     for peer in [1, 2, 3, 4] {
-        sim.partition_pair(0, peer);
+        sim.partition_pair(nid(0), nid(peer));
     }
     sim.run_for(Duration::from_millis(200));
 
@@ -170,7 +171,7 @@ fn failover_under_partition_then_heal() {
     // stale PreAccept/Accept at Ballot::ZERO. Those are fenced by the survivors'
     // recovery promise, so they cannot overturn the committed decision.
     for peer in [1, 2, 3, 4] {
-        sim.heal(0, peer);
+        sim.heal(nid(0), nid(peer));
     }
     sim.run_for(Duration::from_secs(3));
 
@@ -247,7 +248,7 @@ fn recovery_survives_message_loss() {
         // PreAccept reaches the survivors, then the coordinator dies.
         sim.run_for(Duration::from_millis(30));
         for peer in [1, 2, 3, 4] {
-            sim.partition_pair(0, peer);
+            sim.partition_pair(nid(0), nid(peer));
         }
         // Now drop a meaningful fraction of the *recovery* traffic.
         let mut cfg = NetConfig::default();
@@ -287,7 +288,7 @@ fn superseded_recoverer_does_not_strand() {
     let txn = nodes[0].submit(keys(&[21]));
     sim.run_for(Duration::from_millis(30));
     for peer in [1, 2, 3, 4] {
-        sim.partition_pair(0, peer);
+        sim.partition_pair(nid(0), nid(peer));
     }
     sim.run_for(Duration::from_millis(200));
 
@@ -318,7 +319,7 @@ fn duelling_recovery_is_reproducible_from_seed() {
         let txn = nodes[0].submit(keys(&[7]));
         sim.run_for(Duration::from_millis(30));
         for peer in [1, 2, 3, 4] {
-            sim.partition_pair(0, peer);
+            sim.partition_pair(nid(0), nid(peer));
         }
         sim.run_for(Duration::from_millis(200));
         nodes[2].recover(txn);

@@ -24,7 +24,7 @@ use std::time::Duration;
 use animus_control::node::heartbeat_loop;
 use animus_control::raft::ProposeResult;
 use animus_control::{MetaCommand, Metadata, NodeStatus, RaftNode};
-use animus_env::EnvExt;
+use animus_env::{EnvExt, nid};
 use animus_placement::PlacementPolicy;
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::MemoryEngine;
@@ -39,7 +39,13 @@ fn cluster(seed: u64) -> (Simulator, Vec<RaftNode<SimEnv>>) {
     let sim = Simulator::new(seed);
     let nodes = CONTROL
         .iter()
-        .map(|&id| RaftNode::start(sim.env(id), CONTROL.to_vec(), MemoryEngine::new()))
+        .map(|&id| {
+            RaftNode::start(
+                sim.env(nid(id)),
+                CONTROL.iter().copied().map(nid).collect(),
+                MemoryEngine::new(),
+            )
+        })
         .collect();
     (sim, nodes)
 }
@@ -70,14 +76,17 @@ fn labels(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
 fn register(sim: &Simulator, node: &RaftNode<SimEnv>, id: u64, lbls: BTreeMap<String, String>) {
     assert!(matches!(
         node.propose(MetaCommand::UpsertMember {
-            node: id,
+            node: nid(id),
             labels: lbls,
             status: NodeStatus::Active,
         }),
         ProposeResult::Accepted { .. }
     ));
-    let env = sim.env(id);
-    env.spawn_task(heartbeat_loop(env.clone(), CONTROL.to_vec()));
+    let env = sim.env(nid(id));
+    env.spawn_task(heartbeat_loop(
+        env.clone(),
+        CONTROL.iter().copied().map(nid).collect(),
+    ));
 }
 
 /// Per-node replica counts over `ids`, seeded 0.
@@ -85,7 +94,7 @@ fn counts(meta: &Metadata, ids: &[u64]) -> BTreeMap<u64, usize> {
     let mut c: BTreeMap<u64, usize> = ids.iter().map(|&id| (id, 0)).collect();
     for t in meta.tablets.values() {
         for r in &t.replicas {
-            if let Some(n) = c.get_mut(r) {
+            if let Some(n) = c.get_mut(&r.as_u64()) {
                 *n += 1;
             }
         }
@@ -111,7 +120,7 @@ fn provision(node: &RaftNode<SimEnv>, initial: &[u64], policy: &PlacementPolicy)
                 tablet: TabletId(i),
                 table: None,
                 range: KeyRange::whole(),
-                replicas: initial.to_vec(),
+                replicas: initial.iter().copied().map(nid).collect(),
             }),
             ProposeResult::Accepted { .. }
         ));
@@ -211,10 +220,10 @@ fn rebalance_defers_to_violation_repair() {
     let dead = 10;
     // Stop its heartbeat too — otherwise the (pre-existing, unchanged) `Down` ->
     // `Active` recovery rule would immediately revert this manual `Down`.
-    sim.crash(dead);
+    sim.crash(nid(dead));
     assert!(matches!(
         nodes[leader].propose(MetaCommand::UpsertMember {
-            node: dead,
+            node: nid(dead),
             labels: labels(&[("region", "eu")]),
             status: NodeStatus::Down,
         }),
@@ -230,7 +239,10 @@ fn rebalance_defers_to_violation_repair() {
     for _ in 0..120 {
         sim.run_for(Duration::from_secs(1));
         let meta = nodes[leader].metadata();
-        let no_dead = meta.tablets.values().all(|t| !t.replicas.contains(&dead));
+        let no_dead = meta
+            .tablets
+            .values()
+            .all(|t| !t.replicas.contains(&nid(dead)));
         if no_dead && is_balanced(&meta, &live) {
             done = true;
             break;
@@ -240,7 +252,10 @@ fn rebalance_defers_to_violation_repair() {
     assert!(done, "did not repair+balance: {:?}", counts(&meta, &live));
     for t in meta.tablets.values() {
         assert_eq!(t.replicas.len(), 3, "a tablet lost its replication factor");
-        assert!(!t.replicas.contains(&dead), "dead replica still placed");
+        assert!(
+            !t.replicas.contains(&nid(dead)),
+            "dead replica still placed"
+        );
     }
 }
 
@@ -311,7 +326,7 @@ fn rebalance_preserves_residency_and_spread() {
         for (id, t) in &meta.tablets {
             // Residency: no US node ever hosts a replica.
             assert!(
-                t.replicas.iter().all(|r| *r != 15 && *r != 16),
+                t.replicas.iter().all(|r| *r != nid(15) && *r != nid(16)),
                 "tablet {id:?} placed on a US node (seed={seed}): {:?}",
                 t.replicas
             );
@@ -379,7 +394,7 @@ fn survives_leader_kill(seed: u64) {
     }
     // Let rebalancing get underway, then kill the control leader mid-flight.
     sim.run_for(Duration::from_secs(5));
-    sim.stop(leader as u64);
+    sim.stop(nid(leader as u64));
     let live: Vec<usize> = (0..3).filter(|&i| i != leader).collect();
 
     // A new leader must take over and finish rebalancing. Read committed state

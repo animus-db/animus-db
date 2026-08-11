@@ -28,6 +28,8 @@ use std::time::Duration;
 
 use animus_env::{Nanos, NodeId};
 
+#[cfg(test)]
+use animus_env::nid;
 /// A pure, deterministic heartbeat failure detector.
 ///
 /// Records the last instant a heartbeat was seen from each tracked member and,
@@ -128,42 +130,42 @@ mod tests {
     #[test]
     fn fresh_heartbeat_is_alive_and_stale_is_dead() {
         let mut d = FailureDetector::new(T);
-        d.observe(10, Nanos(1_000));
+        d.observe(nid(10), Nanos(1_000));
         // Within the timeout window: alive.
-        assert!(d.is_alive(10, Nanos(1_000 + 200_000_000)));
+        assert!(d.is_alive(nid(10), Nanos(1_000 + 200_000_000)));
         // Exactly at the timeout boundary: still alive (<=).
-        assert!(d.is_alive(10, Nanos(1_000 + 300_000_000)));
+        assert!(d.is_alive(nid(10), Nanos(1_000 + 300_000_000)));
         // Past the timeout: dead.
-        assert!(!d.is_alive(10, Nanos(1_000 + 300_000_001)));
+        assert!(!d.is_alive(nid(10), Nanos(1_000 + 300_000_001)));
     }
 
     #[test]
     fn untracked_member_is_dead() {
         let d = FailureDetector::new(T);
-        assert!(!d.is_alive(99, Nanos(0)));
-        assert!(!d.tracks(99));
+        assert!(!d.is_alive(nid(99), Nanos(0)));
+        assert!(!d.tracks(nid(99)));
     }
 
     #[test]
     fn observe_only_moves_forward() {
         let mut d = FailureDetector::new(T);
-        d.observe(10, Nanos(5_000));
+        d.observe(nid(10), Nanos(5_000));
         // A reordered older heartbeat must not rewind last-seen.
-        d.observe(10, Nanos(1_000));
-        assert!(d.is_alive(10, Nanos(5_000 + 300_000_000)));
+        d.observe(nid(10), Nanos(1_000));
+        assert!(d.is_alive(nid(10), Nanos(5_000 + 300_000_000)));
     }
 
     #[test]
     fn evaluate_is_sorted_and_classifies_each() {
         let mut d = FailureDetector::new(T);
-        d.observe(12, Nanos(1_000));
-        d.observe(10, Nanos(1_000));
-        d.observe(11, Nanos(1_000_000_000)); // far in the future relative to others
+        d.observe(nid(12), Nanos(1_000));
+        d.observe(nid(10), Nanos(1_000));
+        d.observe(nid(11), Nanos(1_000_000_000)); // far in the future relative to others
         let now = Nanos(1_000 + 400_000_000);
         let v = d.evaluate(now);
         assert_eq!(
             v.iter().map(|l| l.node).collect::<Vec<_>>(),
-            vec![10, 11, 12]
+            vec![nid(10), nid(11), nid(12)]
         );
         assert!(!v[0].alive); // 10: stale
         assert!(v[1].alive); // 11: fresh
@@ -173,20 +175,20 @@ mod tests {
     #[test]
     fn forget_stops_tracking() {
         let mut d = FailureDetector::new(T);
-        d.observe(10, Nanos(1_000));
-        assert!(d.tracks(10));
-        d.forget(10);
-        assert!(!d.tracks(10));
+        d.observe(nid(10), Nanos(1_000));
+        assert!(d.tracks(nid(10)));
+        d.forget(nid(10));
+        assert!(!d.tracks(nid(10)));
     }
 
     #[test]
     fn tracked_ids_lists_every_tracked_member_in_order() {
         let mut d = FailureDetector::new(T);
         assert_eq!(d.tracked_ids().collect::<Vec<_>>(), Vec::<NodeId>::new());
-        d.observe(12, Nanos(1_000));
-        d.observe(10, Nanos(1_000));
-        assert_eq!(d.tracked_ids().collect::<Vec<_>>(), vec![10, 12]);
-        d.forget(10);
-        assert_eq!(d.tracked_ids().collect::<Vec<_>>(), vec![12]);
+        d.observe(nid(12), Nanos(1_000));
+        d.observe(nid(10), Nanos(1_000));
+        assert_eq!(d.tracked_ids().collect::<Vec<_>>(), vec![nid(10), nid(12)]);
+        d.forget(nid(10));
+        assert_eq!(d.tracked_ids().collect::<Vec<_>>(), vec![nid(12)]);
     }
 }

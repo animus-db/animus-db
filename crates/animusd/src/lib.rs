@@ -7794,6 +7794,8 @@ mod auto_split_median_tests {
 /// modules in this file.
 #[cfg(test)]
 mod status_wire_compat_tests {
+    use animus_env::nid;
+
     use crate::ClientResponse;
 
     /// A `Status` reply serialized before `control_voters` existed (no such
@@ -7806,7 +7808,7 @@ mod status_wire_compat_tests {
             metadata: Default::default(),
             leader_hint: None,
             watermark: 7,
-            control_voters: [0, 1, 2].into_iter().collect(),
+            control_voters: [0, 1, 2].into_iter().map(nid).collect(),
         };
         let mut value = serde_json::to_value(&reply).expect("Status serializes");
         // `ClientResponse` derives `Serialize`/`Deserialize` via serde's

@@ -32,6 +32,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
+#[cfg(test)]
+use animus_env::nid;
 use animus_env::{Env, NodeId};
 use animus_storage::StorageEngine;
 use animus_tablet::{Epoch, KeyRange, Tablet, TabletId};
@@ -1015,7 +1017,7 @@ enum TeardownKind {
 mod tests {
     use super::*;
 
-    const BASE: NodeId = 300;
+    const BASE: NodeId = nid(300);
 
     fn tablet(id: u64, start: &[u8], end: Option<&[u8]>, replicas: Vec<NodeId>) -> Tablet {
         Tablet::new(
@@ -1067,7 +1069,10 @@ mod tests {
 
     #[test]
     fn join_host_skips_a_non_replica() {
-        assert_eq!(plan_join_host(BASE, &[301, 302], Epoch::INITIAL), None);
+        assert_eq!(
+            plan_join_host(BASE, &[nid(301), nid(302)], Epoch::INITIAL),
+            None
+        );
     }
 
     #[test]
@@ -1136,10 +1141,12 @@ mod tests {
 
     #[test]
     fn does_not_release_a_tablet_this_node_is_still_a_replica_of() {
-        let tablets: BTreeMap<TabletId, Tablet> =
-            [(TabletId(1), tablet(1, b"", None, vec![BASE, 301, 302]))]
-                .into_iter()
-                .collect();
+        let tablets: BTreeMap<TabletId, Tablet> = [(
+            TabletId(1),
+            tablet(1, b"", None, vec![BASE, nid(301), nid(302)]),
+        )]
+        .into_iter()
+        .collect();
         let hosted: BTreeSet<TabletId> = [TabletId(1)].into_iter().collect();
         assert_eq!(
             tablets_to_release(&hosted, &tablets, BASE),
@@ -1149,10 +1156,12 @@ mod tests {
 
     #[test]
     fn releases_a_hosted_present_tablet_this_node_is_no_longer_a_replica_of() {
-        let tablets: BTreeMap<TabletId, Tablet> =
-            [(TabletId(1), tablet(1, b"", None, vec![301, 302, 303]))]
-                .into_iter()
-                .collect();
+        let tablets: BTreeMap<TabletId, Tablet> = [(
+            TabletId(1),
+            tablet(1, b"", None, vec![nid(301), nid(302), nid(303)]),
+        )]
+        .into_iter()
+        .collect();
         let hosted: BTreeSet<TabletId> = [TabletId(1)].into_iter().collect();
         assert_eq!(
             tablets_to_release(&hosted, &tablets, BASE),
@@ -1173,8 +1182,8 @@ mod tests {
     #[test]
     fn reclaim_and_release_are_mutually_exclusive_port() {
         let tablets: BTreeMap<TabletId, Tablet> = [
-            (TabletId(1), tablet(1, b"", None, vec![BASE, 301])),
-            (TabletId(2), tablet(2, b"", None, vec![301, 302])),
+            (TabletId(1), tablet(1, b"", None, vec![BASE, nid(301)])),
+            (TabletId(2), tablet(2, b"", None, vec![nid(301), nid(302)])),
         ]
         .into_iter()
         .collect();
@@ -1195,9 +1204,9 @@ mod tests {
     #[test]
     fn plan_reclaim_and_release_are_mutually_exclusive_on_any_input() {
         let v = view([
-            (1, tablet(1, b"", None, vec![BASE, 301])), // still a replica -> neither
-            (2, tablet(2, b"", None, vec![301, 302])),  // present, moved off -> release
-                                                        // tablet 3 absent entirely -> reclaim
+            (1, tablet(1, b"", None, vec![BASE, nid(301)])), // still a replica -> neither
+            (2, tablet(2, b"", None, vec![nid(301), nid(302)])), // present, moved off -> release
+                                                             // tablet 3 absent entirely -> reclaim
         ]);
         let state = LocalState {
             hosted: [TabletId(1), TabletId(2), TabletId(3)]
@@ -1246,7 +1255,10 @@ mod tests {
 
     #[test]
     fn plan_on_a_converged_state_emits_no_actions_and_state_is_unchanged() {
-        let v = view([(1, tablet_for_table(1, "t", b"", None, vec![BASE, 301, 302]))]);
+        let v = view([(
+            1,
+            tablet_for_table(1, "t", b"", None, vec![BASE, nid(301), nid(302)]),
+        )]);
         let mut state = LocalState::default();
         state.hosted.insert(TabletId(1));
         let facts: BTreeMap<TabletId, TabletFacts> = [(
@@ -1501,7 +1513,7 @@ mod tests {
 
     #[test]
     fn plan_does_not_host_a_non_replica_tablet() {
-        let v = view([(1, tablet(1, b"", None, vec![301, 302]))]);
+        let v = view([(1, tablet(1, b"", None, vec![nid(301), nid(302)]))]);
         let state = LocalState::default();
         let (actions, next) = plan(&v, &BTreeMap::new(), &state, BASE);
         assert_eq!(actions, Vec::new());
@@ -1513,10 +1525,10 @@ mod tests {
     #[test]
     fn plan_reconfigures_only_tablets_this_node_leads_carrying_the_down_set() {
         let mut v = view([
-            (1, tablet(1, b"", None, vec![BASE, 301])),
-            (2, tablet(2, b"", None, vec![BASE, 302])),
+            (1, tablet(1, b"", None, vec![BASE, nid(301)])),
+            (2, tablet(2, b"", None, vec![BASE, nid(302)])),
         ]);
-        v.down.insert(302);
+        v.down.insert(nid(302));
         let state = LocalState {
             hosted: [TabletId(1), TabletId(2)].into_iter().collect(),
             ..Default::default()
@@ -1547,8 +1559,8 @@ mod tests {
             actions,
             vec![HostAction::Reconfigure {
                 tablet: TabletId(1),
-                desired: [BASE, 301].into_iter().collect(),
-                down: [302].into_iter().collect(),
+                desired: [BASE, nid(301)].into_iter().collect(),
+                down: [302].into_iter().map(nid).collect(),
             }]
         );
     }
@@ -1580,7 +1592,7 @@ mod tests {
     // === plan(): Release dampener semantics ==================================
 
     fn released_tablet_setup() -> (MetadataView, LocalState, BTreeMap<TabletId, TabletFacts>) {
-        let v = view([(1, tablet(1, b"", None, vec![301, 302]))]); // BASE moved off
+        let v = view([(1, tablet(1, b"", None, vec![nid(301), nid(302)]))]); // BASE moved off
         let mut state = LocalState::default();
         state.hosted.insert(TabletId(1));
         let facts: BTreeMap<TabletId, TabletFacts> = [(
@@ -1669,7 +1681,7 @@ mod tests {
             .tablets
             .get_mut(&TabletId(1))
             .expect("tablet")
-            .replicas = vec![BASE, 301, 302];
+            .replicas = vec![BASE, nid(301), nid(302)];
 
         let (actions, next2) = plan(&readded, &facts, &next1, BASE);
         assert!(
@@ -1692,7 +1704,7 @@ mod tests {
         // range, never the stale scope fact — this is the regression the
         // sibling-corruption bug (root CLAUDE.md) needs provable in a unit
         // test.
-        let v = view([(1, tablet(1, b"a", Some(b"m"), vec![301, 302]))]); // BASE moved off
+        let v = view([(1, tablet(1, b"a", Some(b"m"), vec![nid(301), nid(302)]))]); // BASE moved off
         let mut state = LocalState::default();
         state.hosted.insert(TabletId(1));
         let facts: BTreeMap<TabletId, TabletFacts> = [(
@@ -1729,7 +1741,7 @@ mod tests {
         // Present, moved off in Metadata — but this node's own durable Raft
         // config has not caught up yet (still lists itself), or there is no
         // local handle at all. Must never advance the confirm counter.
-        let v = view([(1, tablet(1, b"", None, vec![301, 302]))]);
+        let v = view([(1, tablet(1, b"", None, vec![nid(301), nid(302)]))]);
         let mut state = LocalState::default();
         state.hosted.insert(TabletId(1));
 

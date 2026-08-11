@@ -25,6 +25,8 @@ use std::collections::BTreeSet;
 
 use animus_control::raft::{LogEntry, RaftMsg};
 use animus_env::NodeId;
+#[cfg(test)]
+use animus_env::nid;
 use animus_tablet::KeyRange;
 
 use crate::{ImageEntry, KvCommand, KvWire};
@@ -77,7 +79,7 @@ fn put_opt_bytes(out: &mut Vec<u8>, b: &Option<Vec<u8>>) {
 fn put_node_set(out: &mut Vec<u8>, s: &BTreeSet<NodeId>) {
     out.extend_from_slice(&(s.len() as u32).to_be_bytes());
     for &n in s {
-        put_u64(out, n);
+        put_u64(out, n.as_u64());
     }
 }
 
@@ -155,7 +157,7 @@ impl<'a> Cursor<'a> {
         let len = self.u32()?;
         let mut s = BTreeSet::new();
         for _ in 0..len {
-            s.insert(self.u64()?);
+            s.insert(NodeId::new(self.u64()?));
         }
         Ok(s)
     }
@@ -296,7 +298,7 @@ fn put_raft(out: &mut Vec<u8>, m: &RaftMsg<KvCommand>) {
         } => {
             put_u8(out, 0);
             put_u64(out, *term);
-            put_u64(out, *candidate);
+            put_u64(out, candidate.as_u64());
             put_u64(out, *last_log_index);
             put_u64(out, *last_log_term);
         }
@@ -313,7 +315,7 @@ fn put_raft(out: &mut Vec<u8>, m: &RaftMsg<KvCommand>) {
         } => {
             put_u8(out, 2);
             put_u64(out, *term);
-            put_u64(out, *candidate);
+            put_u64(out, candidate.as_u64());
             put_u64(out, *last_log_index);
             put_u64(out, *last_log_term);
         }
@@ -332,7 +334,7 @@ fn put_raft(out: &mut Vec<u8>, m: &RaftMsg<KvCommand>) {
         } => {
             put_u8(out, 4);
             put_u64(out, *term);
-            put_u64(out, *leader);
+            put_u64(out, leader.as_u64());
             put_u64(out, *prev_log_index);
             put_u64(out, *prev_log_term);
             out.extend_from_slice(&(entries.len() as u32).to_be_bytes());
@@ -364,7 +366,7 @@ fn put_raft(out: &mut Vec<u8>, m: &RaftMsg<KvCommand>) {
         } => {
             put_u8(out, 6);
             put_u64(out, *term);
-            put_u64(out, *leader);
+            put_u64(out, leader.as_u64());
             put_u64(out, *last_index);
             put_u64(out, *last_term);
             put_u64(out, *offset);
@@ -385,7 +387,7 @@ fn put_raft(out: &mut Vec<u8>, m: &RaftMsg<KvCommand>) {
         }
         RaftMsg::Heartbeat { node } => {
             put_u8(out, 8);
-            put_u64(out, *node);
+            put_u64(out, node.as_u64());
         }
         RaftMsg::TimeoutNow { term } => {
             put_u8(out, 9);
@@ -398,7 +400,7 @@ fn read_raft(c: &mut Cursor<'_>) -> Result<RaftMsg<KvCommand>, DecodeError> {
     Ok(match c.u8()? {
         0 => RaftMsg::PreVote {
             term: c.u64()?,
-            candidate: c.u64()?,
+            candidate: NodeId::new(c.u64()?),
             last_log_index: c.u64()?,
             last_log_term: c.u64()?,
         },
@@ -408,7 +410,7 @@ fn read_raft(c: &mut Cursor<'_>) -> Result<RaftMsg<KvCommand>, DecodeError> {
         },
         2 => RaftMsg::RequestVote {
             term: c.u64()?,
-            candidate: c.u64()?,
+            candidate: NodeId::new(c.u64()?),
             last_log_index: c.u64()?,
             last_log_term: c.u64()?,
         },
@@ -418,7 +420,7 @@ fn read_raft(c: &mut Cursor<'_>) -> Result<RaftMsg<KvCommand>, DecodeError> {
         },
         4 => {
             let term = c.u64()?;
-            let leader = c.u64()?;
+            let leader = NodeId::new(c.u64()?);
             let prev_log_index = c.u64()?;
             let prev_log_term = c.u64()?;
             let n = c.u32()?;
@@ -442,7 +444,7 @@ fn read_raft(c: &mut Cursor<'_>) -> Result<RaftMsg<KvCommand>, DecodeError> {
         },
         6 => RaftMsg::InstallSnapshot {
             term: c.u64()?,
-            leader: c.u64()?,
+            leader: NodeId::new(c.u64()?),
             last_index: c.u64()?,
             last_term: c.u64()?,
             offset: c.u64()?,
@@ -456,7 +458,9 @@ fn read_raft(c: &mut Cursor<'_>) -> Result<RaftMsg<KvCommand>, DecodeError> {
             last_index: c.u64()?,
             next_offset: c.u64()?,
         },
-        8 => RaftMsg::Heartbeat { node: c.u64()? },
+        8 => RaftMsg::Heartbeat {
+            node: NodeId::new(c.u64()?),
+        },
         9 => RaftMsg::TimeoutNow { term: c.u64()? },
         other => return Err(format!("unknown RaftMsg tag {other}")),
     })
@@ -589,7 +593,7 @@ mod tests {
                     ],
                     fence: KeyRange::new(b"a".to_vec(), Some(b"z".to_vec())),
                 },
-                config: Some([1, 2, 3].into_iter().collect()),
+                config: Some([1, 2, 3].into_iter().map(nid).collect()),
             },
             LogEntry {
                 term: 4,
@@ -632,7 +636,7 @@ mod tests {
         let msgs: Vec<RaftMsg<KvCommand>> = vec![
             RaftMsg::PreVote {
                 term: 7,
-                candidate: 2,
+                candidate: nid(2),
                 last_log_index: 9,
                 last_log_term: 6,
             },
@@ -642,7 +646,7 @@ mod tests {
             },
             RaftMsg::RequestVote {
                 term: 7,
-                candidate: 2,
+                candidate: nid(2),
                 last_log_index: 9,
                 last_log_term: 6,
             },
@@ -652,7 +656,7 @@ mod tests {
             },
             RaftMsg::AppendEntries {
                 term: 7,
-                leader: 2,
+                leader: nid(2),
                 prev_log_index: 16,
                 prev_log_term: 3,
                 entries,
@@ -665,21 +669,21 @@ mod tests {
             },
             RaftMsg::InstallSnapshot {
                 term: 7,
-                leader: 2,
+                leader: nid(2),
                 last_index: 16,
                 last_term: 3,
                 offset: 1024,
                 data: vec![9; 300],
                 total: 4096,
                 done: false,
-                config: Some([2, 4].into_iter().collect()),
+                config: Some([2, 4].into_iter().map(nid).collect()),
             },
             RaftMsg::InstallSnapshotResp {
                 term: 7,
                 last_index: 0,
                 next_offset: 2048,
             },
-            RaftMsg::Heartbeat { node: 11 },
+            RaftMsg::Heartbeat { node: nid(11) },
             RaftMsg::TimeoutNow { term: 7 },
         ];
         for m in msgs {
@@ -738,7 +742,7 @@ mod tests {
         let value = vec![200u8; 1024];
         let wire = KvWire::Raft(RaftMsg::AppendEntries {
             term: 1,
-            leader: 0,
+            leader: nid(0),
             prev_log_index: 0,
             prev_log_term: 0,
             entries: vec![LogEntry {

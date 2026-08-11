@@ -17,6 +17,8 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+
 pub mod prod;
 pub use prod::ProdEnv;
 
@@ -24,7 +26,84 @@ pub mod metrics;
 pub use metrics::{Metric, MetricSink, MetricSnapshot, MetricsHandle};
 
 /// Stable identifier for a node in the cluster.
-pub type NodeId = u64;
+///
+/// **ADR 0040 PR2**: an opaque newtype over `u64` — the *representation*
+/// stays a plain `u64` (this PR is behavior-, wire-, and WAL-byte-neutral;
+/// `#[serde(transparent)]` means every JSON/WAL byte this type touches is
+/// identical to the bare `u64` this replaces), but the *type* no longer
+/// supports arithmetic. That's deliberate: it lets the compiler enumerate
+/// every remaining numeric-coupling site in one mechanical sweep, before PR3
+/// changes the representation to a validated string and none of those sites
+/// can quietly keep assuming "`NodeId` is a small dense integer" — see
+/// `docs/adr/0040-self-minted-string-node-ids.md`.
+///
+/// Construct one with [`NodeId::new`] (or `From<u64>`/[`nid`]); recover the
+/// raw value with [`NodeId::as_u64`] — kept deliberately narrow (only the few
+/// sites that must serialize/format the id as a number: metrics labels,
+/// dashboard JSON, `ProdEnv`'s wire frame, `syskv`'s big-endian key encoding,
+/// and the one pre-existing `ALLOC_ID_BASE` allocator arithmetic PR4 retires)
+/// rather than a broad numeric API that would defeat the point of this PR.
+#[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct NodeId(u64);
+
+impl NodeId {
+    /// Wrap a raw `u64` as a [`NodeId`].
+    #[must_use]
+    pub const fn new(id: u64) -> Self {
+        NodeId(id)
+    }
+
+    /// Recover the raw `u64` — the narrow escape hatch for the handful of
+    /// sites that must serialize/format the id as a number (see the type's
+    /// doc comment).
+    #[must_use]
+    pub const fn as_u64(self) -> u64 {
+        self.0
+    }
+}
+
+impl From<u64> for NodeId {
+    fn from(id: u64) -> Self {
+        NodeId(id)
+    }
+}
+
+impl std::str::FromStr for NodeId {
+    type Err = std::num::ParseIntError;
+
+    /// Parses a `u64` and wraps it — this PR keeps CLI/config/wire id
+    /// parsing semantics identical (parse the number, then wrap); PR3 is
+    /// where the accepted charset changes to a validated string.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        s.parse::<u64>().map(NodeId)
+    }
+}
+
+impl std::fmt::Display for NodeId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl std::fmt::Debug for NodeId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.0, f)
+    }
+}
+
+/// Test-support constructor: `nid(n)` builds the `n`th test node id.
+///
+/// Homed here (no feature gate — it's trivial) so every crate's test code can
+/// reach it without duplicating a helper. Introduced in ADR 0040 PR2 so the
+/// mechanical sweep of `~195 sim.env(...)` and `~89 RaftCore::new`/
+/// `RaftNode::start` call sites across the test fleet happens exactly once:
+/// PR3 reformats this function's body to mint `"n{n}"` strings and no test
+/// call site needs to change again.
+#[must_use]
+pub const fn nid(n: u64) -> NodeId {
+    NodeId::new(n)
+}
 
 /// A monotonic instant, measured in nanoseconds since the environment started.
 ///

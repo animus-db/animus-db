@@ -14,7 +14,7 @@
 use animus_control::persist::{PersistedState, WalRecord};
 use animus_control::raft::RaftCore;
 use animus_control::{MetaCommand, Metadata, mirror};
-use animus_env::Nanos;
+use animus_env::{Nanos, nid};
 use animus_tablet::{Epoch, KeyRange, TabletId};
 
 /// Simulate the driver's persist step: drain the core's pending WAL records into
@@ -42,7 +42,7 @@ fn drain_and_apply(core: &mut RaftCore, oracle: &mut Metadata) {
 /// `propose`, collecting every WAL record it emits along the way.
 fn run_single_node() -> (RaftCore, Vec<WalRecord>) {
     let mut wal = Vec::new();
-    let mut core = RaftCore::new(0, &[0], Nanos(0), 7);
+    let mut core = RaftCore::new(nid(0), &[nid(0)], Nanos(0), 7);
     persist(&mut core, &mut wal);
 
     // Election timeout → becomes leader (sole voter).
@@ -53,7 +53,7 @@ fn run_single_node() -> (RaftCore, Vec<WalRecord>) {
         tablet: TabletId(1),
         table: None,
         range: KeyRange::whole(),
-        replicas: vec![0],
+        replicas: vec![nid(0)],
     });
     persist(&mut core, &mut wal);
 
@@ -61,7 +61,7 @@ fn run_single_node() -> (RaftCore, Vec<WalRecord>) {
     core.propose(MetaCommand::CasTabletReplicas {
         tablet: TabletId(1),
         expected_epoch: Epoch::INITIAL,
-        replicas: vec![0],
+        replicas: vec![nid(0)],
     });
     persist(&mut core, &mut wal);
 
@@ -81,7 +81,7 @@ fn recovery_reapplies_the_tail_exactly_once() {
     );
 
     let state = PersistedState::replay(wal);
-    let mut recovered = RaftCore::recovered(0, &[0], state, Nanos(0), 7);
+    let mut recovered = RaftCore::recovered(nid(0), &[nid(0)], state, Nanos(0), 7);
     assert_eq!(recovered.term(), original.term(), "term not recovered");
 
     // Drive the recovered node: it re-elects (sole voter) and re-advances commit
@@ -145,7 +145,7 @@ fn wal_bytes_round_trip_and_tolerate_a_torn_tail() {
 #[test]
 fn a_command_is_visible_only_after_it_is_durable() {
     let mut wal = Vec::new();
-    let mut core = RaftCore::new(0, &[0], Nanos(0), 7);
+    let mut core = RaftCore::new(nid(0), &[nid(0)], Nanos(0), 7);
     core.tick(Nanos(1_000_000_000), 7); // election timeout -> sole leader
     persist(&mut core, &mut wal); // durable through the leader's initial no-op
     let mut oracle = Metadata::default();
@@ -157,7 +157,7 @@ fn a_command_is_visible_only_after_it_is_durable() {
         tablet: TabletId(1),
         table: None,
         range: KeyRange::whole(),
-        replicas: vec![0],
+        replicas: vec![nid(0)],
     });
     assert!(
         core.commit_index() > core.durable_index(),
@@ -172,8 +172,13 @@ fn a_command_is_visible_only_after_it_is_durable() {
     // Crash *before* the fsync: recover from the WAL as it actually stands (the
     // un-synced CreateTablet was never written). It is gone — but it was never
     // applicable, so nothing a client could have observed is lost.
-    let mut crashed =
-        RaftCore::recovered(0, &[0], PersistedState::replay(wal.clone()), Nanos(0), 7);
+    let mut crashed = RaftCore::recovered(
+        nid(0),
+        &[nid(0)],
+        PersistedState::replay(wal.clone()),
+        Nanos(0),
+        7,
+    );
     assert!(
         crashed.drain_apply().is_empty(),
         "an un-fsynced command does not survive a crash (and was never acked)"
@@ -193,7 +198,8 @@ fn a_command_is_visible_only_after_it_is_durable() {
     );
 
     // And now it survives a crash, because it was fsynced before it was applicable.
-    let mut survivor = RaftCore::recovered(0, &[0], PersistedState::replay(wal), Nanos(0), 7);
+    let mut survivor =
+        RaftCore::recovered(nid(0), &[nid(0)], PersistedState::replay(wal), Nanos(0), 7);
     survivor.tick(Nanos(2_000_000_000), 7); // re-elect + a current-term entry
     survivor.propose(MetaCommand::NoOp); // lets the recovered tail re-commit + apply
     let mut survivor_oracle = Metadata::default();

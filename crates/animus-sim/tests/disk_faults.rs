@@ -13,7 +13,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use animus_env::{Disk, EnvExt, Network};
+use animus_env::{Disk, EnvExt, Network, nid};
 use animus_sim::{DiskConfig, Simulator};
 
 /// A workload that interleaves disk ops with network sends. The sends draw RNG
@@ -24,12 +24,12 @@ fn run_disk_and_net_workload(seed: u64, cfg: Option<DiskConfig>) -> (Vec<String>
     let mut sim = Simulator::new(seed);
     if let Some(cfg) = cfg {
         sim.set_disk_config(cfg.clone());
-        sim.set_disk_config_for(0, cfg);
+        sim.set_disk_config_for(nid(0), cfg);
     }
     let out = Arc::new(Mutex::new(Vec::new()));
     {
-        let env = sim.env(0);
-        let sink = sim.env(1);
+        let env = sim.env(nid(0));
+        let sink = sim.env(nid(1));
         sink.clone().spawn_task(async move {
             loop {
                 let _ = sink.recv().await;
@@ -39,9 +39,9 @@ fn run_disk_and_net_workload(seed: u64, cfg: Option<DiskConfig>) -> (Vec<String>
         env.clone().spawn_task(async move {
             for i in 0..5u8 {
                 env.append("wal", &[i; 8]).await.unwrap();
-                env.send(1, vec![i]).await;
+                env.send(nid(1), vec![i]).await;
                 env.sync("wal").await.unwrap();
-                env.send(1, vec![i, i]).await;
+                env.send(nid(1), vec![i, i]).await;
             }
             env.append("wal", b"unsynced-tail").await.unwrap();
             *out.lock().unwrap() = env.read("wal").await.unwrap();
@@ -49,11 +49,11 @@ fn run_disk_and_net_workload(seed: u64, cfg: Option<DiskConfig>) -> (Vec<String>
         sim.run_for(Duration::from_millis(50));
     }
     // Crash + read back what survived.
-    sim.crash(0);
-    sim.restart(0);
+    sim.crash(nid(0));
+    sim.restart(nid(0));
     let after = Arc::new(Mutex::new(Vec::new()));
     {
-        let env = sim.env(0);
+        let env = sim.env(nid(0));
         let out = Arc::clone(&after);
         env.clone().spawn_task(async move {
             *out.lock().unwrap() = env.read("wal").await.unwrap();
@@ -106,7 +106,7 @@ fn injected_error_schedule_is_reproducible_from_the_seed() {
         let results = Arc::new(Mutex::new(Vec::new()));
         let mut sim = sim;
         {
-            let env = sim.env(0);
+            let env = sim.env(nid(0));
             let out = Arc::clone(&results);
             env.clone().spawn_task(async move {
                 for i in 0..30u8 {
@@ -145,12 +145,12 @@ fn per_node_disk_config_overrides_the_global() {
     let mut sim = Simulator::new(seed);
     let mut cfg = DiskConfig::default();
     cfg.set_error_prob(1.0);
-    sim.set_disk_config_for(0, cfg);
+    sim.set_disk_config_for(nid(0), cfg);
 
     let out = Arc::new(Mutex::new((None, None)));
     {
-        let e0 = sim.env(0);
-        let e1 = sim.env(1);
+        let e0 = sim.env(nid(0));
+        let e1 = sim.env(nid(1));
         let out = Arc::clone(&out);
         e0.clone().spawn_task(async move {
             let r0 = e0.append("f", b"x").await.is_ok();
@@ -175,7 +175,7 @@ fn torn_tail_crash_keeps_a_reproducible_strict_prefix() {
         cfg.torn_tail_on_crash = true;
         sim.set_disk_config(cfg);
         {
-            let env = sim.env(0);
+            let env = sim.env(nid(0));
             env.clone().spawn_task(async move {
                 env.append("wal", b"DURABLE!").await.unwrap();
                 env.sync("wal").await.unwrap();
@@ -183,11 +183,11 @@ fn torn_tail_crash_keeps_a_reproducible_strict_prefix() {
             });
             sim.run();
         }
-        sim.crash(0);
-        sim.restart(0);
+        sim.crash(nid(0));
+        sim.restart(nid(0));
         let out = Arc::new(Mutex::new(Vec::new()));
         {
-            let env = sim.env(0);
+            let env = sim.env(nid(0));
             let o = Arc::clone(&out);
             env.clone().spawn_task(async move {
                 *o.lock().unwrap() = env.read("wal").await.unwrap();
@@ -233,7 +233,7 @@ fn torn_tail_varies_by_seed_but_durable_prefix_never_torn() {
         cfg.torn_tail_on_crash = true;
         sim.set_disk_config(cfg);
         {
-            let env = sim.env(0);
+            let env = sim.env(nid(0));
             env.clone().spawn_task(async move {
                 env.append("wal", b"KEEP").await.unwrap();
                 env.sync("wal").await.unwrap();
@@ -243,11 +243,11 @@ fn torn_tail_varies_by_seed_but_durable_prefix_never_torn() {
             });
             sim.run();
         }
-        sim.crash(0);
-        sim.restart(0);
+        sim.crash(nid(0));
+        sim.restart(nid(0));
         let out = Arc::new(Mutex::new(Vec::new()));
         {
-            let env = sim.env(0);
+            let env = sim.env(nid(0));
             let o = Arc::clone(&out);
             env.clone().spawn_task(async move {
                 *o.lock().unwrap() = env.read("wal").await.unwrap();
@@ -280,7 +280,7 @@ fn corrupt_on_crash_flips_one_byte_in_the_retained_region() {
         cfg.corrupt_on_crash = true;
         sim.set_disk_config(cfg);
         {
-            let env = sim.env(0);
+            let env = sim.env(nid(0));
             env.clone().spawn_task(async move {
                 env.append("wal", b"KEEP").await.unwrap();
                 env.sync("wal").await.unwrap();
@@ -290,11 +290,11 @@ fn corrupt_on_crash_flips_one_byte_in_the_retained_region() {
             });
             sim.run();
         }
-        sim.crash(0);
-        sim.restart(0);
+        sim.crash(nid(0));
+        sim.restart(nid(0));
         let out = Arc::new(Mutex::new(Vec::new()));
         {
-            let env = sim.env(0);
+            let env = sim.env(nid(0));
             let o = Arc::clone(&out);
             env.clone().spawn_task(async move {
                 *o.lock().unwrap() = env.read("wal").await.unwrap();
@@ -344,23 +344,26 @@ fn corrupt_durable_flips_the_exact_byte() {
     let seed = 0xD15C_0005;
     let mut sim = Simulator::new(seed);
     {
-        let env = sim.env(0);
+        let env = sim.env(nid(0));
         env.clone().spawn_task(async move {
             env.append("sst", b"abcdef").await.unwrap();
             env.sync("sst").await.unwrap();
         });
         sim.run();
     }
-    assert!(sim.corrupt_durable(0, "sst", 2), "seed={seed}");
+    assert!(sim.corrupt_durable(nid(0), "sst", 2), "seed={seed}");
     assert!(
-        !sim.corrupt_durable(0, "sst", 99),
+        !sim.corrupt_durable(nid(0), "sst", 99),
         "offset past EOF must miss"
     );
-    assert!(!sim.corrupt_durable(0, "nope", 0), "unknown file must miss");
+    assert!(
+        !sim.corrupt_durable(nid(0), "nope", 0),
+        "unknown file must miss"
+    );
 
     let out = Arc::new(Mutex::new(Vec::new()));
     {
-        let env = sim.env(0);
+        let env = sim.env(nid(0));
         let o = Arc::clone(&out);
         env.clone().spawn_task(async move {
             *o.lock().unwrap() = env.read("sst").await.unwrap();

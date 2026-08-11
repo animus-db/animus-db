@@ -25,6 +25,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use animus_control::PlacementPolicy;
+use animus_env::nid;
 use animus_tablet::TabletId;
 use animusd::{ClientRequest, ClientResponse, ColumnType, MetaCommand, Node, TableSchema};
 use serde_json::Value;
@@ -221,7 +222,7 @@ async fn system_table_lists_every_seeded_entity_kind() {
         let resp = call(
             client,
             ClientRequest::ProposeSchema(MetaCommand::RegisterCpAddr {
-                id: 9999,
+                id: nid(9999),
                 addr: "127.0.0.1:1".to_string(),
                 tablet: Some(TabletId(1)),
             }),
@@ -406,7 +407,7 @@ async fn system_table_lists_every_seeded_entity_kind() {
         let node_id_alloc_item = find("node_id_alloc", "join-nonce-1");
         assert_eq!(
             node_id_alloc_item["value"].as_u64(),
-            Some(allocated_id),
+            Some(allocated_id.as_u64()),
             "node_id_alloc value is the allocated id: {node_id_alloc_item}"
         );
 

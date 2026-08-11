@@ -29,7 +29,7 @@ use std::time::Duration;
 
 use animus_control::ProposeResult;
 use animus_cp_data::RaftKvNode;
-use animus_env::NodeId;
+use animus_env::{NodeId, nid};
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::MemoryEngine;
 
@@ -38,7 +38,7 @@ type KvNode = RaftKvNode<SimEnv, MemoryEngine>;
 const IDS: [u64; 4] = [0, 1, 2, 3];
 
 fn set(ids: &[u64]) -> BTreeSet<NodeId> {
-    ids.iter().copied().collect()
+    ids.iter().copied().map(nid).collect()
 }
 
 fn leader_among(nodes: &[KvNode]) -> Option<usize> {
@@ -52,7 +52,13 @@ fn down_extra_is_removed_first_regardless_of_id_order_and_without_a_catch_up_gat
     let mut sim = Simulator::new(seed);
     let nodes: Vec<KvNode> = IDS
         .iter()
-        .map(|&id| RaftKvNode::start(sim.env(id), IDS.to_vec(), MemoryEngine::new()))
+        .map(|&id| {
+            RaftKvNode::start(
+                sim.env(nid(id)),
+                IDS.iter().copied().map(nid).collect(),
+                MemoryEngine::new(),
+            )
+        })
         .collect();
     sim.run_for(Duration::from_secs(2));
     let l = leader_among(&nodes).expect("an initial leader");
@@ -71,7 +77,7 @@ fn down_extra_is_removed_first_regardless_of_id_order_and_without_a_catch_up_gat
     // Make `x` (a `desired` survivor) lag behind `commit_index`: freeze it,
     // then commit further writes via the leader + the two extras (3-of-4 is
     // still a majority, so commit keeps advancing without `x`).
-    sim.crash(x);
+    sim.crash(nid(x));
     for i in 0..5 {
         assert!(matches!(
             nodes[l].put(format!("k{i}").into_bytes(), b"v".to_vec()),
@@ -81,15 +87,15 @@ fn down_extra_is_removed_first_regardless_of_id_order_and_without_a_catch_up_gat
     }
     let commit = nodes[l].commit_index();
     assert!(
-        nodes[l].peer_match(x) < commit,
+        nodes[l].peer_match(nid(x)) < commit,
         "test setup: `x` must be lagging behind commit_index (peer_match={}, commit={commit})",
-        nodes[l].peer_match(x)
+        nodes[l].peer_match(nid(x))
     );
     // Sanity: `a` (the healthy extra `reconfigure_step` must NOT pick first)
     // is fully caught up — so the only reason a fixed removal of `b` could be
     // blocked is a catch-up gate misapplied to the wrong node.
     assert!(
-        nodes[l].peer_match(a) >= commit,
+        nodes[l].peer_match(nid(a)) >= commit,
         "test setup: `a` must be fully caught up"
     );
 
@@ -101,14 +107,14 @@ fn down_extra_is_removed_first_regardless_of_id_order_and_without_a_catch_up_gat
         "must remove the Down extra `b` in one step, leaving {{leader, x, a}} — got {step:?} \
          (current config: {:?}, x lagging at {} < commit {commit})",
         nodes[l].config(),
-        nodes[l].peer_match(x),
+        nodes[l].peer_match(nid(x)),
     );
     assert!(
-        !nodes[l].config().contains(&b),
+        !nodes[l].config().contains(&nid(b)),
         "the Down extra must have been dropped from the config"
     );
     assert!(
-        nodes[l].config().contains(&a),
+        nodes[l].config().contains(&nid(a)),
         "the healthy extra must NOT have been touched by this single step"
     );
 }

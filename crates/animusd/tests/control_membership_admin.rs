@@ -89,6 +89,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use animus_control::node::CONTROL_PEER_LIVENESS_TIMEOUT;
+use animus_env::nid;
 use animusd::config::NodeRole;
 use animusd::{ClusterConfig, MetaCommand, Node, NodeStatus, RoleAddrs};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -289,7 +290,7 @@ async fn join_control_nonvoter(
             admin: raw[4],
         };
         let bound = match animusd::Node::bind_control(
-            new_control_id,
+            nid(new_control_id),
             addrs,
             dir.join(format!("grow-{attempt}")),
         )
@@ -432,7 +433,7 @@ async fn add_control_member_collision_shapes() {
     {
         let (status, body) = add_control_member(
             admin_addrs[leader],
-            animus_control::meta::ALLOC_ID_BASE,
+            (animus_control::meta::ALLOC_ID_BASE).as_u64(),
             admin_addrs[leader],
         )
         .await;
@@ -659,7 +660,11 @@ async fn runtime_added_voter_survives_leadership_change_to_a_different_original_
     // not the race a too-hasty add would hit.
     let self_registered_on_cluster = async {
         loop {
-            if nodes[adder].metadata().node_addrs.contains_key(&new_id) {
+            if nodes[adder]
+                .metadata()
+                .node_addrs
+                .contains_key(&nid(new_id))
+            {
                 return;
             }
             sleep(Duration::from_millis(50)).await;
@@ -738,7 +743,7 @@ async fn runtime_added_voter_survives_leadership_change_to_a_different_original_
     let label_key = "adr0037_pr4_regression".to_string();
     assert!(
         nodes[new_leader_idx].propose_meta(MetaCommand::UpsertMember {
-            node: 12_345,
+            node: nid(12_345),
             labels: BTreeMap::from([(label_key.clone(), "1".to_string())]),
             status: NodeStatus::Down,
         }),
@@ -749,7 +754,7 @@ async fn runtime_added_voter_survives_leadership_change_to_a_different_original_
             if grown
                 .metadata()
                 .members
-                .get(&12_345)
+                .get(&nid(12_345))
                 .and_then(|m| m.labels.get(&label_key))
                 .is_some()
             {
@@ -1120,7 +1125,7 @@ async fn omitted_node_add_mints_an_id_and_converges_to_a_live_voter() {
         .as_u64()
         .expect("the response carries the minted `node`");
     assert!(
-        minted >= animus_control::meta::ALLOC_ID_BASE,
+        minted >= (animus_control::meta::ALLOC_ID_BASE).as_u64(),
         "minted id {minted} should be at/above ALLOC_ID_BASE ({})",
         animus_control::meta::ALLOC_ID_BASE
     );
@@ -1198,7 +1203,7 @@ async fn concurrent_omitted_node_adds_mint_distinct_ids_and_both_become_voters()
     );
     let winner_id = successes[0];
     assert!(
-        winner_id >= animus_control::meta::ALLOC_ID_BASE,
+        winner_id >= (animus_control::meta::ALLOC_ID_BASE).as_u64(),
         "minted id {winner_id} should be at/above ALLOC_ID_BASE"
     );
 
@@ -1238,7 +1243,7 @@ async fn concurrent_omitted_node_adds_mint_distinct_ids_and_both_become_voters()
         "the retry must mint an id distinct from the winner's"
     );
     assert!(
-        second_id >= animus_control::meta::ALLOC_ID_BASE,
+        second_id >= (animus_control::meta::ALLOC_ID_BASE).as_u64(),
         "minted id {second_id} should be at/above ALLOC_ID_BASE"
     );
 

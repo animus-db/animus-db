@@ -17,6 +17,7 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use animus_consensus::{AccordNode, Key, TxnId};
+use animus_env::nid;
 use animus_sim::{SimEnv, Simulator};
 
 const NODES: [u64; 3] = [0, 1, 2];
@@ -29,7 +30,7 @@ fn cluster(seed: u64) -> (Simulator, Vec<AccordNode<SimEnv>>) {
     let sim = Simulator::new(seed);
     let nodes = NODES
         .iter()
-        .map(|&id| AccordNode::start(sim.env(id), NODES.to_vec()))
+        .map(|&id| AccordNode::start(sim.env(nid(id)), NODES.iter().copied().map(nid).collect()))
         .collect();
     (sim, nodes)
 }

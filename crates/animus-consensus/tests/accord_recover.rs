@@ -13,6 +13,7 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use animus_consensus::{AccordNode, Key, TxnId};
+use animus_env::nid;
 use animus_sim::{SimEnv, Simulator};
 use futures::executor::block_on;
 
@@ -22,7 +23,7 @@ fn cluster(seed: u64) -> (Simulator, Vec<AccordNode<SimEnv>>) {
     let sim = Simulator::new(seed);
     let nodes = NODES
         .iter()
-        .map(|&id| AccordNode::start(sim.env(id), NODES.to_vec()))
+        .map(|&id| AccordNode::start(sim.env(nid(id)), NODES.iter().copied().map(nid).collect()))
         .collect();
     (sim, nodes)
 }
@@ -53,8 +54,8 @@ fn recovery_commits_a_stranded_transaction() {
     // Node 0 cannot reach node 2 at all, and node 1's *reply* to node 0 is dropped
     // (the PreAccept 0→1 still gets through, so node 1 learns the keys). Node 0
     // thus has only its own vote and stalls; node 2 can still reach node 1.
-    sim.partition_pair(0, 2);
-    sim.partition(1, 0);
+    sim.partition_pair(nid(0), nid(2));
+    sim.partition(nid(1), nid(0));
 
     let txn = nodes[0].submit(keys(&[7]));
     // Settle the (failed) fast-quorum attempt, but stay **inside** the driver's
@@ -116,7 +117,7 @@ fn recovery_commits_a_stranded_transaction() {
 fn recovery_consistent_across_seeds() {
     for seed in 0xFA11_1000..0xFA11_1020 {
         let (mut sim, nodes) = cluster(seed);
-        sim.partition_pair(0, 2);
+        sim.partition_pair(nid(0), nid(2));
 
         let txn = nodes[0].submit(keys(&[3, 4]));
         sim.run_for(Duration::from_secs(1));
@@ -203,7 +204,7 @@ fn recovery_run_is_reproducible_from_seed() {
     let seed = 0xFA11_0003;
     let trace = |seed| {
         let (mut sim, nodes) = cluster(seed);
-        sim.partition_pair(0, 2);
+        sim.partition_pair(nid(0), nid(2));
         let txn = nodes[0].submit(keys(&[7]));
         sim.run_for(Duration::from_secs(1));
         nodes[2].recover(txn);
