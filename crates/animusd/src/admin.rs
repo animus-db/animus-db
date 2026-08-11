@@ -899,7 +899,11 @@ async fn system_table(ctx: &ClientCtx, q: &str) -> (u16, Value) {
 fn system_table_id_is_numeric(kind: syskv::EntityKind) -> bool {
     matches!(
         kind,
-        syskv::EntityKind::Tablet | syskv::EntityKind::Policy | syskv::EntityKind::Merged
+        syskv::EntityKind::Tablet
+            | syskv::EntityKind::Policy
+            | syskv::EntityKind::Merged
+            | syskv::EntityKind::SplitParent
+            | syskv::EntityKind::AbsorbedBy
     )
 }
 
@@ -928,6 +932,11 @@ fn system_table_id_display(kind: syskv::EntityKind, id: &[u8]) -> Value {
 /// valid JSON here); `Counter` is a raw big-endian `u64` (`null` if not
 /// exactly 8 bytes); `Keyspace`/`Merged` are presence-only (their value is
 /// always empty) — always `null`, regardless of the actual bytes.
+/// `SplitParent`/`AbsorbedBy` (ADR 0018 §2 amendment) store the other
+/// tablet's id as a raw big-endian `u64`, same shape as `Counter` but
+/// rendered as a decimal **string** (like a numeric entity id,
+/// [`system_table_id_display`]) since it too is a `TabletId`, not a scalar
+/// counter value.
 fn system_table_value_display(kind: syskv::EntityKind, value: &[u8]) -> Value {
     match kind {
         syskv::EntityKind::Tablet
@@ -943,6 +952,12 @@ fn system_table_value_display(kind: syskv::EntityKind, value: &[u8]) -> Value {
             Err(_) => Value::Null,
         },
         syskv::EntityKind::Keyspace | syskv::EntityKind::Merged => Value::Null,
+        syskv::EntityKind::SplitParent | syskv::EntityKind::AbsorbedBy => {
+            match <[u8; 8]>::try_from(value) {
+                Ok(bytes) => json!(u64::from_be_bytes(bytes).to_string()),
+                Err(_) => Value::Null,
+            }
+        }
     }
 }
 

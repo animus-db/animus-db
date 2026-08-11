@@ -5320,6 +5320,8 @@ async fn tablet_host_reconciler_loop(ctx: ClientCtx, mut reconciler: CpReconcile
             tablets: meta.tablets,
             down,
             merged: meta.merged_tablets,
+            split_parent: meta.split_parents,
+            absorbed_by: meta.absorbed_by,
         };
         reconciler.tick(&view).await;
     }

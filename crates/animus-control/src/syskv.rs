@@ -131,6 +131,15 @@ pub enum EntityKind {
     /// only by the back-compat-only `MetaCommand::RegisterCpAddr`), keyed by
     /// [`NodeId`] (PR2).
     CpMemberAddr,
+    /// A never-pruned split-provenance marker (`Metadata::split_parents`,
+    /// ADR 0018 §2 amendment), keyed by the split child's [`TabletId`]; the
+    /// value is the source tablet's id (big-endian `u64`, mirroring
+    /// [`Counter`](Self::Counter)'s value shape).
+    SplitParent,
+    /// A never-pruned merge-provenance marker (`Metadata::absorbed_by`, ADR
+    /// 0018 §2 amendment), keyed by the absorbed tablet's [`TabletId`]; the
+    /// value is the surviving tablet's id (big-endian `u64`).
+    AbsorbedBy,
 }
 
 impl EntityKind {
@@ -151,6 +160,8 @@ impl EntityKind {
             EntityKind::Merged => "merged",
             EntityKind::Counter => "counter",
             EntityKind::CpMemberAddr => "cp_member_addr",
+            EntityKind::SplitParent => "split_parent",
+            EntityKind::AbsorbedBy => "absorbed_by",
         }
     }
 
@@ -172,6 +183,8 @@ impl EntityKind {
             b"merged" => EntityKind::Merged,
             b"counter" => EntityKind::Counter,
             b"cp_member_addr" => EntityKind::CpMemberAddr,
+            b"split_parent" => EntityKind::SplitParent,
+            b"absorbed_by" => EntityKind::AbsorbedBy,
             _ => return None,
         })
     }
@@ -310,6 +323,20 @@ pub fn cp_member_addr_key(id: &NodeId) -> Vec<u8> {
     entity_key(EntityKind::CpMemberAddr, id.as_str().as_bytes())
 }
 
+/// A split child [`TabletId`]'s key under [`EntityKind::SplitParent`] (ADR
+/// 0018 §2 amendment).
+#[must_use]
+pub fn split_parent_key(child: TabletId) -> Vec<u8> {
+    entity_key(EntityKind::SplitParent, &child.0.to_be_bytes())
+}
+
+/// An absorbed [`TabletId`]'s key under [`EntityKind::AbsorbedBy`] (ADR 0018
+/// §2 amendment).
+#[must_use]
+pub fn absorbed_by_key(absorbed: TabletId) -> Vec<u8> {
+    entity_key(EntityKind::AbsorbedBy, &absorbed.0.to_be_bytes())
+}
+
 /// The decoded form of a system-keyspace key ([`decode_key`]'s result).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DecodedKey {
@@ -377,7 +404,7 @@ pub fn decode_key(key: &[u8]) -> Option<DecodedKey> {
 mod tests {
     use super::*;
 
-    const ALL_KINDS: [EntityKind; 9] = [
+    const ALL_KINDS: [EntityKind; 11] = [
         EntityKind::Tablet,
         EntityKind::Member,
         EntityKind::Schema,
@@ -387,6 +414,8 @@ mod tests {
         EntityKind::Merged,
         EntityKind::Counter,
         EntityKind::CpMemberAddr,
+        EntityKind::SplitParent,
+        EntityKind::AbsorbedBy,
     ];
 
     // --- reserved-name guard -------------------------------------------------

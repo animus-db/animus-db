@@ -29,6 +29,7 @@ use animus_env::NodeId;
 use animus_env::nid;
 use animus_tablet::KeyRange;
 
+use crate::hlc::HlcTimestamp;
 use crate::{ImageEntry, KvCommand, KvWire};
 
 /// First byte of every encoded frame — rejects foreign payloads (e.g. a JSON
@@ -39,9 +40,13 @@ const MAGIC: u8 = 0xCB;
 /// `Put`/`Batch`/`Delete`/`Cas` variants gained a `fence: KeyRange` field. `3`:
 /// `KvCommand::Split` (tag 4) is gone — split is now a single control-plane
 /// command, never a data-plane one (ADR 0028). `4`: `RaftMsg::TimeoutNow` (tag
-/// 9, ADR 0029 leadership transfer) added — pre-alpha, no cross-version
-/// compatibility is required.
-const VERSION: u8 = 4;
+/// 9, ADR 0029 leadership transfer) added. `5` (ADR 0018 §2/PR2): every
+/// mutating `KvCommand` variant gained a `ts: HlcTimestamp` field, and a new
+/// `KvCommand::Seal` variant (tag 6) was added — pre-alpha, no cross-version
+/// wire/disk compatibility is required (no live deployments), so a mixed-
+/// version decode fails loudly on the version check below rather than
+/// silently misreading the new field.
+const VERSION: u8 = 5;
 
 /// A decode failure: a description of what was malformed, surfaced loudly by
 /// the caller (logged + dropped; never silently misread).
@@ -214,15 +219,34 @@ fn read_key_range(c: &mut Cursor<'_>) -> Result<KeyRange, DecodeError> {
     })
 }
 
+/// ADR 0018 §2/PR2: an [`HlcTimestamp`] as fixed-width `(wall_ms: u64,
+/// logical: u32)`.
+fn put_ts(out: &mut Vec<u8>, ts: HlcTimestamp) {
+    put_u64(out, ts.wall_ms);
+    out.extend_from_slice(&ts.logical.to_be_bytes());
+}
+
+fn read_ts(c: &mut Cursor<'_>) -> Result<HlcTimestamp, DecodeError> {
+    let wall_ms = c.u64()?;
+    let logical = u32::from_be_bytes(c.take(4)?.try_into().expect("4B"));
+    Ok(HlcTimestamp { wall_ms, logical })
+}
+
 fn put_command(out: &mut Vec<u8>, c: &KvCommand) {
     match c {
-        KvCommand::Put { key, value, fence } => {
+        KvCommand::Put {
+            key,
+            value,
+            fence,
+            ts,
+        } => {
             put_u8(out, 0);
             put_bytes(out, key);
             put_bytes(out, value);
             put_key_range(out, fence);
+            put_ts(out, *ts);
         }
-        KvCommand::Batch { puts, fence } => {
+        KvCommand::Batch { puts, fence, ts } => {
             put_u8(out, 1);
             out.extend_from_slice(&(puts.len() as u32).to_be_bytes());
             for (k, v) in puts {
@@ -230,25 +254,34 @@ fn put_command(out: &mut Vec<u8>, c: &KvCommand) {
                 put_bytes(out, v);
             }
             put_key_range(out, fence);
+            put_ts(out, *ts);
         }
-        KvCommand::Delete { key, fence } => {
+        KvCommand::Delete { key, fence, ts } => {
             put_u8(out, 2);
             put_bytes(out, key);
             put_key_range(out, fence);
+            put_ts(out, *ts);
         }
         KvCommand::Cas {
             key,
             expected,
             value,
             fence,
+            ts,
         } => {
             put_u8(out, 3);
             put_bytes(out, key);
             put_opt_bytes(out, expected);
             put_bytes(out, value);
             put_key_range(out, fence);
+            put_ts(out, *ts);
         }
         KvCommand::NoOp => put_u8(out, 5),
+        KvCommand::Seal { range, ts } => {
+            put_u8(out, 6);
+            put_key_range(out, range);
+            put_ts(out, *ts);
+        }
     }
 }
 
@@ -258,6 +291,7 @@ fn read_command(c: &mut Cursor<'_>) -> Result<KvCommand, DecodeError> {
             key: c.bytes()?,
             value: c.bytes()?,
             fence: read_key_range(c)?,
+            ts: read_ts(c)?,
         },
         1 => {
             let n = c.u32()?;
@@ -268,19 +302,26 @@ fn read_command(c: &mut Cursor<'_>) -> Result<KvCommand, DecodeError> {
             KvCommand::Batch {
                 puts,
                 fence: read_key_range(c)?,
+                ts: read_ts(c)?,
             }
         }
         2 => KvCommand::Delete {
             key: c.bytes()?,
             fence: read_key_range(c)?,
+            ts: read_ts(c)?,
         },
         3 => KvCommand::Cas {
             key: c.bytes()?,
             expected: c.opt_bytes()?,
             value: c.bytes()?,
             fence: read_key_range(c)?,
+            ts: read_ts(c)?,
         },
         5 => KvCommand::NoOp,
+        6 => KvCommand::Seal {
+            range: read_key_range(c)?,
+            ts: read_ts(c)?,
+        },
         other => return Err(format!("unknown KvCommand tag {other}")),
     })
 }
@@ -586,6 +627,13 @@ mod tests {
         assert_eq!(format!("{w:?}"), format!("{back:?}"));
     }
 
+    /// A distinct [`HlcTimestamp`] fixture per test entry, so the round-trip
+    /// proves the field is actually threaded through (not accidentally
+    /// defaulted the same everywhere).
+    fn ts(wall_ms: u64, logical: u32) -> HlcTimestamp {
+        HlcTimestamp { wall_ms, logical }
+    }
+
     #[test]
     fn every_wire_variant_round_trips() {
         let entries = vec![
@@ -596,6 +644,7 @@ mod tests {
                     key: b"k".to_vec(),
                     value: vec![0, 255, 128],
                     fence: KeyRange::whole(),
+                    ts: ts(1, 0),
                 },
                 config: None,
             },
@@ -608,6 +657,7 @@ mod tests {
                         (Vec::new(), Vec::new()), // empty key/value survive
                     ],
                     fence: KeyRange::new(b"a".to_vec(), Some(b"z".to_vec())),
+                    ts: ts(2, 5),
                 },
                 config: Some([1, 2, 3].into_iter().map(nid).collect()),
             },
@@ -619,6 +669,7 @@ mod tests {
                     expected: None,
                     value: b"v".to_vec(),
                     fence: KeyRange::whole(),
+                    ts: ts(3, 0),
                 },
                 config: None,
             },
@@ -630,6 +681,7 @@ mod tests {
                     expected: Some(b"old".to_vec()),
                     value: b"new".to_vec(),
                     fence: KeyRange::new(b"a".to_vec(), None),
+                    ts: ts(4, 1),
                 },
                 config: None,
             },
@@ -639,6 +691,16 @@ mod tests {
                 command: KvCommand::Delete {
                     key: b"d".to_vec(),
                     fence: KeyRange::whole(),
+                    ts: ts(5, 0),
+                },
+                config: None,
+            },
+            LogEntry {
+                term: 5,
+                index: 22,
+                command: KvCommand::Seal {
+                    range: KeyRange::new(b"m".to_vec(), Some(b"z".to_vec())),
+                    ts: ts(6, 2),
                 },
                 config: None,
             },
@@ -768,6 +830,7 @@ mod tests {
                     key: b"key".to_vec(),
                     value: value.clone(),
                     fence: KeyRange::whole(),
+                    ts: ts(1, 0),
                 },
                 config: None,
             }],

@@ -48,10 +48,36 @@ Three modules:
   settled over `animus-consensus`'s `(logical, node)` scheme because a string
   `NodeId`, ADR 0040, can't bit-pack); the 20-bit `LOGICAL_BITS` budget is
   hard-`assert!`-checked in `pack` (never `debug_assert!` — a silent overflow
-  would silently collapse two distinct timestamps to one version). Not yet
-  wired into `RaftKvNode`'s apply path — that lands in PR2, which replaces the
-  current floor-scaled-Raft-index `mvcc_version` (see the Key invariants
-  section above) with this packed HLC.
+  would silently collapse two distinct timestamps to one version). **Wired
+  into `RaftKvNode`'s apply path since PR2** (see the Key invariants section
+  above): every mutating propose method mints `ts` from the group's own
+  `Hlc` (constructed with `HLC_MAX_OFFSET = 500ms`); `apply_and_compact`
+  stamps `hlc::pack(ts)` as the engine version. Witnessing happens at four
+  points — WAL recovery (`drive`, each recovered entry), every received
+  `AppendEntries` (`witness_append_entries`, before `RaftCore::handle`),
+  snapshot install, and group start (off the shared engine's
+  `latest_version()`, in `start_inner`) — the chain that keeps a group's
+  applied `ts` strictly increasing across restarts and leader changes,
+  asserted (hard, not `debug_assert!`) by `assert_ts_monotonic` at apply.
+- **`seal.rs`** (ADR 0018 §2 amendment, PR2) — the **range seal**: the
+  structural replacement for the retired `version_floor` cross-group-LWW
+  fix. `KvCommand::Seal { range, ts }` is proposed by a range-handoff
+  source (a split's `NarrowScope`, or a merge's `Absorb`, both wired in
+  `host.rs`'s `Reconciler`) through its own Raft log; every replica applies
+  its log in the same order, so a later-ordered mutating entry for a key
+  inside a sealed range is rejected at apply (`is_sealed`, checked against
+  a per-group in-memory `sealed: Vec<(KeyRange, HlcTimestamp)>` rebuilt at
+  group start from a durable **engine marker key** — deliberately from the
+  engine, not log replay, since compaction can truncate a `Seal` entry out
+  of the log long before its rejection duty is done). The marker's
+  physical key (`seal_marker_key`) lives under
+  `animus_control::syskv::RESERVED_NAMESPACE` — engine-global, outside
+  every `StorageScope` — keyed by `(source tablet id, sealed range)` so a
+  tablet can seal more than once over its lifetime without one seal
+  overwriting another's stored range. See the module's own doc for the
+  full key-disjointness proof (including why a naive `[0x00, 0x00]` lead
+  pair does **not** work: it collides with the legacy whole-keyspace
+  tablet's own scope prefix).
 
 ### lib.rs API
 
@@ -90,7 +116,7 @@ Three modules:
 - **Batch put** — `KvCommand::Batch(Vec<(k, v)>)` + `put_batch` commit **N
   keys as one Raft log entry** (one propose → one commit round → one apply),
   the bulk-write throughput primitive. Every key merges at the entry's shared
-  Raft `index` (per-key LWW is well-defined since keys are distinct); composes
+  `ts` (per-key LWW is well-defined since keys are distinct); composes
   with a coalesced-fsync `merge_batch`. Re-applies idempotently on recovery
   like a single `Put`.
 - **Linearizable CAS** — `cas(key, expected, value) -> ProposeResult` proposes
@@ -127,35 +153,56 @@ Three modules:
 
 State once here; cross-referenced from the sections below.
 
-- **The Raft log index is the MVCC version — scaled by this group's own
-  `version_floor` (cross-group LWW fix, confirmed real; full writeup in
-  `docs/engineering-lessons.md`).** Apply computes
-  `effective_version(floor, index) = floor * VERSION_FLOOR_SCALE + index`
-  (`VERSION_FLOOR_SCALE = 2^40`) and stamps *that* as the engine `version` at
-  all four apply sites (`Put`/`Batch`/`Delete`/`Cas`) — never the raw `index`
-  directly, so per-key LWW reproduces the agreed Raft total order and
-  re-applying on recovery stays idempotent (the same command always computes
-  the same `effective_version`). `floor` (`0` for a tablet that has never
-  been split/merged — byte-identical to using the raw index) closes a real
-  hazard: every tablet on a node shares one physical `StorageEngine`
-  (ADR 0026/0028), so a **fresh** group's own log index restarting low could
-  carry a version no higher than what a *different* group (the split source,
-  or an absorbed merge sibling) already stamped for the same key — and
-  per-key LWW (`StorageEngine::merge`) would silently drop the write.
-  `RaftKvNode::start_hosted_with_floor` seeds a fresh group's floor at
-  construction (`start_hosted`/`start`/`start_scoped`/`start_with_metrics`
-  all default to `0`, unchanged); `bump_version_floor` (a `fetch_max`,
-  mirroring `narrow_scope`/`widen_scope`'s one-directional shape) raises an
-  **already-running** group's floor for the merge-survivor case, called by
-  the reconciler alongside `widen_scope` for the same `WidenScope` action.
-  Both read `animus_tablet::Tablet::version_floor` — computed once by the
-  control plane's `SplitTablet`/`MergeTablets` apply, so every replica
-  converges on the identical value with no live per-replica computation.
-  `engine_applied` and the group's own Raft log-matching are untouched — only
-  the *storage-layer version number* a command stamps changes. Regression:
-  `tests/cross_group_lww.rs` (reproduces the hazard with an un-seeded
-  fresh/widened group, then proves the seeded/bumped variant keeps the write,
-  for both the split and merge shape).
+- **The packed HLC commit timestamp is the MVCC version (ADR 0018 §2
+  amendment, PR2 — replaces the retired `version_floor`-scaled Raft-index
+  invariant).** Every mutating `KvCommand` variant carries a `ts:
+  HlcTimestamp`, minted from the proposing leader's own per-group `Hlc` at
+  propose time; apply stamps `hlc::pack(ts)` as the engine `version` at all
+  four apply sites (`Put`/`Batch`/`Delete`/`Cas`) — never a Raft index — so
+  per-key LWW reproduces cross-group HLC order and re-applying on recovery
+  stays idempotent (the same command always computes the same `ts`, hence
+  the same version). This closes the same cross-group-shared-engine hazard
+  `version_floor` did (a fresh/widened group's own version sequence must
+  never undercut a different group's), but by **witnessing** instead of a
+  structural version-space separation:
+  - **Witnessing** (`Hlc::witness`) folds a just-observed timestamp into a
+    group's clock so its own future mints are guaranteed to exceed it. Four
+    points do this: WAL recovery (`drive`, every recovered log entry, before
+    `RaftCore::recovered` consumes the replay output); every received
+    `AppendEntries` (`witness_append_entries`, before `RaftCore::handle` —
+    every entry in the message, whether or not the core ultimately accepts
+    it, since a redundant witness is always safe); snapshot install
+    (`apply_and_compact`, after `install_engine_image`); and **group start**
+    (`start_inner`, off the shared engine's own `latest_version()` — this
+    alone subsumes the old floor-seeding for the steady-state case: a
+    restart, or a co-hosted sibling's data already present).
+  - **The range seal** (`seal.rs`) closes the one residual witnessing alone
+    cannot: an in-flight write from a source-group leader that hasn't yet
+    observed a split/merge, still in its own commit pipeline when the
+    handoff happens. A source proposes `KvCommand::Seal { range, ts }`
+    through its own log at handoff time (`host.rs`'s `Reconciler`, on a
+    split's `NarrowScope` and a merge's `Absorb`); apply rejects any
+    later-ordered mutating entry whose key falls in an already-sealed range,
+    regardless of that entry's own `ts` — because within one group, log
+    order and HLC order coincide (a leader's own `Hlc::mint` is monotonic;
+    a leader change is covered by witnessing), so "later-ordered" and
+    "higher-timestamped" are the same test, but it is the **log position**
+    that is authoritative. The reconciler gates a split child's `Host` /
+    a merge survivor's `WidenScope` on observing the relevant seal marker
+    locally first (`TabletFacts::parent_seal_observed`/`widen_seal_observed`,
+    `Metadata::split_parents`/`absorbed_by` provenance) — see `host.rs`'s own
+    entry below and `seal.rs`'s module doc for the full design, including
+    the key-disjointness proof.
+  - **A hard, non-`debug` assert** (`assert_ts_monotonic`, at apply) checks
+    every applied entry's `ts` strictly exceeds the previous one this group
+    applied — the load-bearing invariant the whole witnessing chain exists
+    to guarantee; a failure means the chain itself is broken (a missed
+    witness point), not a recoverable condition.
+  - `engine_applied` and the group's own Raft log-matching are untouched —
+    only the *storage-layer version number* a command stamps changes.
+    Regression: `tests/cross_group_lww.rs` (split/merge/seal-rejection/
+    in-flight-race/clock-skew shapes) and `tests/witnessing.rs`
+    (leader-change and restart-recovery monotonicity).
 - **CAS is decided at *apply* time, not propose time** — this is what makes it
   linearizable and contention-correct. `RaftCore` agrees only the order; `Cas`
   rides through as opaque data. Apply evaluates it in commit order against the
@@ -221,12 +268,17 @@ invariants and is directly `SimEnv`-testable.
   TabletFacts>, state: &LocalState, base_id: NodeId) -> (Vec<HostAction>,
   LocalState)`. Pure and synchronous — no `Env`, clock, RNG, or I/O.
   `MetadataView` is a small owned projection (`tablets`, `down`, **`merged`** —
-  ADR 0033, mirroring `Metadata::merged_tablets`), deliberately *not* the whole
+  ADR 0033, mirroring `Metadata::merged_tablets` — and, since ADR 0018 §2's
+  PR2 amendment, **`split_parent`**/**`absorbed_by`**, mirroring
+  `Metadata::split_parents`/`absorbed_by`), deliberately *not* the whole
   `animus_control::Metadata`, keeping the crate decoupled from the control
   plane's state shape. `TabletFacts` bundles the impure per-tablet inputs the
   caller gathers first (`hosted`, `is_leader`, `config_excludes_me`,
-  `scope_range`, `has_data`). `LocalState` is the pure mirror of `animusd`'s
-  `minted` claim set + `pending_release` epoch dampener, threaded call to call.
+  `scope_range`, `has_data`, and since PR2 `parent_seal_observed`/
+  `widen_seal_observed` — each an async, tablet-scoped engine scan for the
+  relevant seal marker, gathered only when actually needed). `LocalState` is
+  the pure mirror of `animusd`'s `minted` claim set + `pending_release` epoch
+  dampener, threaded call to call.
 - **`plan` never removes a tablet from `LocalState::hosted` on its own** when
   emitting a fallible teardown (`Reclaim`/`Release`) — real teardown is async
   and can time out. The caller calls `LocalState::confirm_torn_down` once its
@@ -269,8 +321,8 @@ Emitted in this fixed order: `NarrowScope`/`WidenScope` → `Host` →
 | Action | What it does |
 |--------|--------------|
 | `NarrowScope` | Narrow an already-hosted tablet's scope to its current metadata range — provably narrow-only (`is_subrange`). |
-| `WidenScope` | ADR 0033 dual: widen when the metadata range *grew* (the surviving `left` of a `MergeTablets`) — provably widen-only. A range neither subset nor superset of the live scope is a defensive no-op, never guessed. Deferred while an absorb is pending (see Key invariants). Also carries `version_floor` (read off `Tablet::version_floor`) so the executor bumps the survivor's cross-group LWW floor in the same pass (see the MVCC-version invariant above). |
-| `Host` | Stand up a fresh/joining/restarting tablet via `start_hosted`, with full or others-only config (`animusd::cp_join_host`'s exact decision). Carries `version_floor` (read off `Tablet::version_floor`) to seed the group's cross-group LWW floor (see the MVCC-version invariant above). |
+| `WidenScope` | ADR 0033 dual: widen when the metadata range *grew* (the surviving `left` of a `MergeTablets`) — provably widen-only. A range neither subset nor superset of the live scope is a defensive no-op, never guessed. Deferred while an absorb is pending, **and** (ADR 0018 §2 amendment) until this node's own engine contains the absorbed tablet's range-seal marker covering the widened portion (`TabletFacts::widen_seal_observed` — see the MVCC-version invariant above; replaces the retired `version_floor` bump). |
+| `Host` | Stand up a fresh/joining/restarting tablet via `start_hosted`, with full or others-only config (`animusd::cp_join_host`'s exact decision). A split child (named in `Metadata::split_parents`) is deferred until this node's own engine contains its parent's range-seal marker covering its own range (`TabletFacts::parent_seal_observed` — see the MVCC-version invariant above; replaces the retired `version_floor` seeding). A tablet with no parent (a bootstrapped fresh table, or a merge survivor) hosts immediately. |
 | `Reconfigure` | One `reconfigure_step` toward the desired replica set, for every tablet this node leads, carrying the down-set. Replanned every tick a node leads a group (a no-op once matched). |
 | `Release` | Tear down a tablet moved off this node, gated by `RELEASE_CONFIRM_TICKS` consecutive confirming calls at an unchanged epoch (the ADR 0029 dampener). Erases up to `erase_bound`, which is **always the tablet's current metadata range**, never a `TabletFacts::scope_range` fact — the sibling-sparing invariant this redesign makes structural. |
 | `Reclaim` | Tear down a tablet whose whole table was dropped; erases. |
@@ -437,6 +489,30 @@ internally).
   node whose clock reads ahead mints, a node whose clock reads behind
   witnesses it, and the behind node's next mint still strictly exceeds the
   ahead node's — causality survives clock skew.
+- `cross_group_lww.rs` (ADR 0018 §2 amendment, PR2) — cross-group MVCC
+  ordering under the range-seal design (retired the `version_floor` fix this
+  file used to prove): a split source seals its handed-off range and only
+  then does a fresh sibling host and win a subsequent overwrite; a merge's
+  absorbed group seals before teardown and the survivor's overwrite wins; a
+  write proposed through the same group after its own range is sealed is
+  rejected outright (the "wide fence, un-ticked leader" case); the **in-flight
+  race** the seal specifically exists for (an entry proposed with zero
+  intervening sim time before the split lands, mirroring
+  `reconciler_corpus.rs`'s zero-tick technique, driven through the real
+  `host::Reconciler` so the `parent_seal_observed` gate genuinely defers
+  hosting rather than the test having to reason about timing by hand) —
+  the successor's write must win regardless of whether the racing write ends
+  up applied-then-overridden or seal-rejected; and a clock-skew composition
+  test (the successor's node reads *behind* the source's the whole time and
+  still wins, proving the design depends on witnessing via the shared
+  engine, never wall-clock synchronization).
+- `witnessing.rs` (ADR 0018 §2 amendment, PR2) — the witnessing chain
+  directly: a leader change mid-writes keeps a group's applied `ts` strictly
+  increasing (a fresh `Hlc` on the new leader, causality carried across by
+  witnessing the old leader's entries as a follower); a genuine process
+  restart (`Simulator::stop`, not the network-only `crash`/`restart` pair)
+  re-witnesses its own recovered WAL, and the first write proposed after
+  recovery is timestamped strictly past everything recovered.
 - `metrics.rs` (ADR 0015) — CP-plane observability counters move under a known
   workload, threading a recording `MetricsHandle` via `start_with_metrics`:
   the *real outcome* moves each counter (accepted vs. not-leader-rejected

@@ -58,8 +58,7 @@ fn tablet(id: u64, start: &[u8], end: Option<&[u8]>, replicas: Vec<u64>) -> Tabl
 fn view(tablets: impl IntoIterator<Item = Tablet>) -> MetadataView {
     MetadataView {
         tablets: tablets.into_iter().map(|t| (t.id, t)).collect(),
-        down: Default::default(),
-        merged: Default::default(),
+        ..Default::default()
     }
 }
 

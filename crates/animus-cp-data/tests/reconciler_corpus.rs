@@ -114,8 +114,7 @@ fn tablet_at_epoch(
 fn view(tablets: impl IntoIterator<Item = Tablet>) -> MetadataView {
     MetadataView {
         tablets: tablets.into_iter().map(|t| (t.id, t)).collect(),
-        down: BTreeSet::new(),
-        merged: BTreeSet::new(),
+        ..Default::default()
     }
 }
 
@@ -126,19 +125,30 @@ fn view_with_down(
     MetadataView {
         tablets: tablets.into_iter().map(|t| (t.id, t)).collect(),
         down: down.into_iter().collect(),
-        merged: BTreeSet::new(),
+        ..Default::default()
     }
 }
 
 /// [`view`], but also marks `merged` tablet ids as merged-away (ADR 0033) —
 /// standing in for a `MetaCommand::MergeTablets` commit's effect on
-/// `Metadata::merged_tablets`.
-fn view_with_merged(
+/// `Metadata::merged_tablets` — and records `absorbed_by` provenance (ADR
+/// 0018 §2 amendment): every `merged` id mapped to `survivor`, standing in
+/// for the same commit's effect on `Metadata::absorbed_by`. Needed wherever
+/// a scenario expects a real `WidenScope` to fire: `plan`'s
+/// `widen_seal_observed` gate looks the absorbed id up via this map to find
+/// whose seal marker to check.
+fn view_with_merged_and_absorbed_by(
     tablets: impl IntoIterator<Item = Tablet>,
     merged: impl IntoIterator<Item = u64>,
+    survivor: u64,
 ) -> MetadataView {
+    let merged: BTreeSet<TabletId> = merged.into_iter().map(TabletId).collect();
     MetadataView {
-        merged: merged.into_iter().map(TabletId).collect(),
+        absorbed_by: merged
+            .iter()
+            .map(|&absorbed| (absorbed, TabletId(survivor)))
+            .collect(),
+        merged,
         ..view(tablets)
     }
 }
@@ -1090,7 +1100,7 @@ fn scenario_merge_widens_and_absorbs(seed: u64) {
         // merged-away — the exact `Metadata` shape `MergeTablets`'s apply
         // produces. The widen is deferred one tick behind the absorb
         // (drain-before-widen, ADR 0033), so tick twice.
-        let v2 = view_with_merged([tablet(1, b"", None, vec![a()])], [2]);
+        let v2 = view_with_merged_and_absorbed_by([tablet(1, b"", None, vec![a()])], [2], 1);
         c.tick(a(), &v2).await;
         c.tick(a(), &v2).await;
         env.sleep(Duration::from_secs(1)).await;

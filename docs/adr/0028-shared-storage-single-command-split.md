@@ -266,3 +266,17 @@ completes Stage B of). The control plane's epoch-CAS discipline
 (`CasTabletReplicas`, ADR 0005) is unchanged in shape — `SplitTablet` was
 always the same shape, it simply now carries the *entire* operation instead of
 one half of it.
+
+## Amendment (2026-08-11, ADR 0018 PR2)
+
+The fence (embedded per-entry, gating apply) closes the crossover window
+*within* one source group's own log — a stale-routed write proposed before
+the leader learned about the split still fails at apply if it falls outside
+the fence. It does **not**, on its own, stop the source group from
+*continuing to accept new writes* to the handed-off range indefinitely if its
+own leader simply never re-checks its scope (the "wide fence, un-ticked
+leader" case). ADR 0018 PR2's **range seal** closes that residual: once the
+source proposes `KvCommand::Seal` for the handed-off range, every
+later-ordered entry for a key inside it is rejected regardless of its own
+fence — a second, independent gate stacked on top of the fence, not a
+replacement for it. See ADR 0018's PR2 amendment for the full design.

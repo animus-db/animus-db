@@ -364,9 +364,14 @@ per-tablet CP data plane (`animus-cp-data`).
   `node_id_allocations`, keyed by nonce), was **removed in ADR 0040 PR4**
   along with the allocator it mirrored — `RegisterNode`'s claim lives
   entirely in the already-mirrored `Member`/`NodeAddrs` kinds, no separate
-  ledger needed. Plus typed `tablet_key`/`member_key`/`schema_key`/
+  ledger needed. Two more variants, `SplitParent`/`AbsorbedBy` (ADR 0018 §2
+  amendment, unrelated to this ADR's own PR numbering), mirror
+  `Metadata::split_parents`/`absorbed_by` — each keyed by a `TabletId` with
+  a raw big-endian-`u64` `TabletId` value (the same primitive-value shape
+  `Counter` uses, not a JSON entity). Plus typed `tablet_key`/`member_key`/`schema_key`/
   `policy_key`/`node_addrs_key`/`keyspace_key`/`merged_key`/`counter_key`/
-  `cp_member_addr_key` helpers and a dedicated `applied_index_key()`
+  `cp_member_addr_key`/`split_parent_key`/`absorbed_by_key` helpers and a
+  dedicated `applied_index_key()`
   watermark (a sibling of the
   entity-kind segment, not under one — mirrors `animus-cp-data`'s
   `engine_applied_index`). `decode_key` inverts every `*_key` helper for the
@@ -512,25 +517,26 @@ per-tablet CP data plane (`animus-cp-data`).
   (it reads two tablets from one snapshot). Any new tablet-mutating command must
   adopt the same guard.
 
-- **`SplitTablet`/`MergeTablets` also seed/bump `Tablet::version_floor`
-  (cross-group LWW version-floor fix, confirmed real — full writeup in
-  `docs/engineering-lessons.md`).** Every tablet a node hosts shares one
-  physical `StorageEngine` (ADR 0026/0028), and `animus-cp-data` stamps a
-  write's MVCC version from its **own** group's local Raft log index — which
-  restarts low/independent for a fresh group, so a split sibling or a merge
-  survivor could otherwise carry a version no higher than what a *different*
-  group already stamped for the same key, and per-key LWW would silently drop
-  the write. `SplitTablet` sets the new sibling's floor to
-  `source.version_floor + 1` (the source's own floor is untouched — it never
-  absorbs foreign data); `MergeTablets` bumps the surviving `left`'s floor to
-  `max(left, right) + 1` (checked against **both** sides deliberately —
-  `left`/`right` are chosen by key-range adjacency, not allocation order, so
-  `right`'s id/floor is not always the smaller one). Both are pure functions
-  of already-agreed `Metadata` state, computed once here so every data
-  replica reads the identical value instead of deriving it locally.
-  Regressions: `meta::tests::{split_tablet_seeds_the_new_siblings_version_
-  floor_past_the_sources, merge_tablets_bumps_the_survivors_version_floor_
-  past_both_sides}`.
+- **`SplitTablet`/`MergeTablets` record split/merge provenance
+  (`Metadata::split_parents`/`absorbed_by`, ADR 0018 §2 amendment) —
+  replaces the retired `Tablet::version_floor` cross-group-LWW fix.**
+  `SplitTablet` records `split_parents[new_id] = tablet` (the fresh sibling's
+  immediate source); `MergeTablets` records `absorbed_by[right] = left` (the
+  reverse direction from `merged_tablets`, which only records *that* `right`
+  was absorbed, not *into whom*). Neither is ever pruned — same discipline as
+  `merged_tablets` (tablet ids are never reused). Both are pure functions of
+  already-agreed `Metadata` state, computed once here so every data replica
+  reads the identical value instead of deriving it locally. Consumed by
+  `animus-cp-data`'s tablet-host reconciler to know **whose** range-seal
+  marker a split child/merge survivor must observe locally before hosting/
+  widening — see that crate's `CLAUDE.md` and ADR 0018's PR2 amendment for
+  the full design these replace `version_floor` with. Regressions:
+  `meta::tests::{split_tablet_records_provenance_of_the_immediate_parent,
+  merge_tablets_records_absorbed_by_provenance}`. Both fields are also
+  mirrored into the system keyspace (`syskv::EntityKind::{SplitParent,
+  AbsorbedBy}`, `mirror.rs`'s `apply_and_derive_mirror`/`apply_key_write`) so
+  the incremental delta-consumer path (ADR 0038 PR5) stays byte-identical to
+  a full `Metadata` fetch.
 
 - **`merged_tablets` is never pruned.** Tablet ids are never reused, so a
   recorded merge marker can never resurrect a wrong decision for a later id.

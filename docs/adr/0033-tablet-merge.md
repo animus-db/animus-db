@@ -207,3 +207,19 @@ This ADR amends ADR 0029 (closes the "merge is deferred" note) and extends
 ADR 0031 (two new planner actions, same fixed-order contract) and ADR 0028
 (the shared-storage/no-data-movement premise merge relies on, symmetrically
 to split).
+
+## Amendment (2026-08-11, ADR 0018 PR2)
+
+The `Absorb` drain (above) guarantees the absorbed group's own committed
+writes reach the engine before its WAL is deleted — a data-loss fix. It does
+**not**, on its own, stop a *very* stale absorbed-group leader from
+continuing to accept new writes for its own range after the merge has
+already committed and a survivor may already be serving it. ADR 0018 PR2's
+**range seal** closes that residual, the merge dual of ADR 0028's fence
+gap: the absorbed leader proposes `KvCommand::Seal` for its own full range
+from inside the same drain-wait this ADR's `Absorb` teardown already
+performs (so the seal is durably observable by the time the drain
+completes), and the survivor's `WidenScope` additionally waits for that
+seal (`Metadata::absorbed_by` provenance) before considering the widen
+safe — layered on top of, never a substitute for, the drain-before-widen
+sequencing above. See ADR 0018's PR2 amendment for the full design.

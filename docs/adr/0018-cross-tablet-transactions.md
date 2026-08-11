@@ -1,8 +1,11 @@
 # ADR 0018 — Cross-tablet transactions on the CP plane (2PC over per-tablet Raft + HLC + MVCC)
 
-- **Status:** Accepted — in delivery (PR1: HLC + sim clock skew landed;
-  PR2-PR7 sequenced). See the "Amendment (2026-08-11, PR1)" section below for
-  the build-time decisions settled at the start of delivery.
+- **Status:** Accepted — in delivery (PR1: HLC + sim clock skew landed; PR2:
+  HLC commit timestamps as the CP-plane MVCC version + the range-seal design
+  landed; PR3-PR7 sequenced). See the "Amendment (2026-08-11, PR1)" section
+  for the build-time decisions settled at the start of delivery, and the
+  "Amendment (2026-08-11, PR2)" section below for the range-seal design that
+  replaces `version_floor`.
 - **Date:** 2026-08-03
 
 ## Context
@@ -256,3 +259,116 @@ on: a node whose clock reads *ahead* mints a timestamp, a node whose clock
 reads *behind* witnesses it, and the behind node's own next mint still
 strictly exceeds the ahead node's — clock skew perturbs readings, never
 causality.
+
+## Amendment (2026-08-11, PR2)
+
+PR2 wires the HLC into `animus-cp-data`'s apply path — the engine's MVCC
+version is now `hlc::pack(cmd.ts)`, replacing the interim
+`version_floor`-scaled Raft-index scheme (ADR 0017/the crate's prior "Raft log
+index is the MVCC version" invariant) — and adds the **range seal**, the
+mechanism that closes the one residual race a structural version-space
+separation covered but plain HLC witnessing cannot.
+
+### 1. Why `version_floor` had to go, and why witnessing alone isn't enough
+
+`version_floor` worked by construction: a fresh/widened group's stamped
+version was scaled into a strictly higher numeric *band* than anything a
+different group on the same shared engine could ever stamp, so ordering was
+guaranteed **regardless of timing** — even a source-group write still stuck
+in its own commit pipeline, applying *after* the successor had already started
+serving, could never outrank the successor. That structural guarantee is
+exactly what a *timestamp*-based version cannot reproduce for free: two
+different groups' `Hlc` instances are only ordered by what each has actually
+minted or witnessed, and a write **still in flight** (proposed, not yet
+applied) hasn't been witnessed by anyone. Witnessing — folding a group's own
+recovered log, a received `AppendEntries`, an installed snapshot, or (at group
+start) the shared engine's own `latest_version()` into its `Hlc` — closes
+every case where causality has *already been observed by someone*, but it
+cannot see a write that hasn't landed anywhere yet. A timing bound to close
+that gap is exactly what ADR 0017 §3 forbids as a *correctness* mechanism.
+
+### 2. The range seal: an ordering-based fence, not a version-space one
+
+The replacement is structural in a different sense: instead of separating
+version *numbers*, it separates **log positions**. When a source tablet hands
+off a range (a split's `NarrowScope`, or a merge's `Absorb`), its leader
+proposes a **`KvCommand::Seal { range, ts }`** through its own Raft log before
+the range is considered handed off. Every replica of that group applies its
+log in the same total order, so every replica agrees on the exact position
+the seal occupies — and the apply-time rule is simple: **any later-ordered
+mutating entry whose key falls in a sealed range is rejected**, exactly like a
+fence miss, regardless of the entry's own embedded timestamp. Because within
+one group log order and HLC order coincide (a single leader's `Hlc::mint` is
+monotonic; a leader change is covered by witnessing the outgoing leader's
+last entry before the incoming one ever mints), "later-ordered" and
+"higher-timestamped" are the same test — but it is the **log position**, not
+the numeric comparison, that is authoritative, which is what lets the seal
+reject a write whose *proposer* simply hadn't learned about the split yet (the
+"wide fence, un-ticked leader" case) even though that write's own timestamp,
+minted after the fact, would otherwise look perfectly legitimate.
+
+The seal's durable witness for a co-hosted **successor** (a split child, or a
+merge survivor) is a **marker key written directly into the shared engine**,
+deliberately outside every `StorageScope` (ADR 0026/0028) so a successor can
+observe it with no scope machinery — keyed by `(source tablet id, sealed
+range)` rather than tablet id alone (a tablet can seal more than once over its
+lifetime; a tablet-id-only key would let a later seal silently overwrite an
+earlier one's stored range before every waiting successor observed it).
+
+**Key disjointness** was re-derived, not assumed: an earlier draft of this
+design proposed a bare `[0x00, 0x00]` lead pair, reasoning that
+`animus_tablet::escape` never emits it as an interior byte pair. That
+reasoning was correct but incomplete — `escape("")` (the *legacy
+whole-keyspace tablet's own* `StorageScope` prefix, `animusd::
+table_scope_prefix("")`) is **exactly** `[0x00, 0x00]`, a genuine collision.
+The shipped design instead reuses `animus_control::syskv::RESERVED_NAMESPACE`
+— already the sole, replicated-state-machine-enforced (`is_reserved_name`, at
+`CreateTableSchema`) reservation no user table may ever claim — and proves
+disjointness from `escape`'s own documented injective/prefix-free property:
+`escape(RESERVED_NAMESPACE)` can never equal or prefix-match
+`escape(other_table_name)` for any name that isn't itself
+`RESERVED_NAMESPACE`, and no schema can ever register under that name. See
+`crates/animus-cp-data/src/seal.rs`'s module doc for the full argument.
+
+### 3. Reconciler gating: the other half of the mechanism
+
+A seal only protects a range while a source group keeps mutating it; the
+matching obligation is that a **successor must not start serving that range
+until it can see the seal**. The tablet-host reconciler (`animus-cp-data`'s
+`host` module) gates on exactly this: a split child's `HostAction::Host` is
+deferred until this node's own engine contains the parent's seal marker
+covering the child's range (`Metadata::split_parents`, new provenance,
+mirroring `merged_tablets`'s never-pruned discipline); a merge survivor's
+`HostAction::WidenScope` is deferred until the absorbed tablet's seal marker
+covers the widened portion (`Metadata::absorbed_by`, the reverse-direction
+provenance). Both facts are gathered as bounded, tablet-scoped engine scans
+(`gather_facts`), keeping `plan` itself pure. The absorbed side proposes its
+seal from inside `Reconciler::teardown`'s existing Absorb drain-wait (ADR
+0033) — the same drain that already guarantees the absorbed group's committed
+log is fully applied before its WAL is deleted now also guarantees the seal
+itself is durably observable by the time the drain completes.
+
+**Liveness, not correctness, is what a stalled source jeopardizes**: a
+split/merge successor waiting for a source-group leader to seal stalls if that
+source group has no live quorum — but this is exactly the same liveness
+dependency every other cross-group handoff in this system already has (the
+data the successor would serve is owned by that same quorum), never a
+correctness gate on timing.
+
+### 4. What ships with PR2, what's deferred
+
+Also landing: witnessing at the four points needed for the design to be
+sound at all (WAL recovery, on every received `AppendEntries` entry, on
+snapshot install, and at group start off `latest_version()`); a hard,
+non-`debug` assert that every applied entry's `ts` strictly exceeds the
+previous one applied by the same group (the load-bearing monotonicity
+invariant — a failure means the witnessing chain itself is broken, not a
+recoverable condition); and `erase_scope`'s tombstone version moving from
+`last_applied() + 1` to a freshly minted `ts` (the same reasoning applies:
+`Hlc::mint` is guaranteed to exceed everything this group ever stamped).
+
+Deferred to later PRs in the sequence: the per-tablet read-timestamp cache
+and read-span refresh/restart mechanism for full serializability (PR1's
+Amendment §2 already named this; PR2 only lands the write-side version
+scheme it will sit on top of), and the transaction record/intent machinery
+itself (Follow-up steps 2+).
