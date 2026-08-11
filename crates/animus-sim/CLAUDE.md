@@ -58,11 +58,6 @@ function of one seed. This is the substrate every distributed test runs on.
   afterward and it recovers from disk — the real restart-and-rejoin path (see
   `animus-control/tests/restart.rs`). `crash` keeps the tasks running but mute;
   `stop` ends them.
-- `SimEnv` still implements `Coresident::sibling` (mint a co-resident inbox at
-  runtime, ADR 0017 D), but the mechanism is **vestigial**: production co-hosting
-  moved to multiplexed `(node, stream)` addressing (ADR 0026, below) and nothing
-  live calls `sibling` anymore. It touches only the `nodes`/`inboxes` maps (no
-  RNG draw, no timeline event), so keeping it costs determinism nothing.
 - Determinism invariants to preserve when editing: only `BTreeMap`/`BTreeSet`,
   RNG drawn only in deterministic order, no wall clock. Disk ops add no timeline
   events and — under the **default** `DiskConfig` — draw no RNG, so they don't
@@ -84,8 +79,7 @@ function of one seed. This is the substrate every distributed test runs on.
   pattern `Disk::list`'s node-prefix scan already used) to clear *every* stream
   of a crashed/stopped node, not just its primary one. `Simulator::env` still
   only pre-registers `PRIMARY_STREAM`'s inbox entry — any other stream is
-  created lazily on first send/recv, exactly like `Coresident::sibling` lazily
-  registers a whole new node id today. No new RNG draw or timeline event shape,
+  created lazily on first send/recv. No new RNG draw or timeline event shape,
   so the determinism argument (trace = pure function of the seed) is unchanged;
   `tests/determinism.rs::multiplexed_streams_are_isolated_and_deterministic`
   proves it directly (two streams to one node don't cross-talk, and the run —

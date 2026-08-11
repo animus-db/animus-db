@@ -173,7 +173,12 @@ per-tablet CP data plane (`animus-cp-data`).
   contacted this leadership stint (grace for a just-added voter, or any peer
   right after this node won an election); otherwise gated on its own
   `CONTROL_PEER_LIVENESS_TIMEOUT = 500ms` (deliberately **not** a reuse of
-  `DETECT_TIMEOUT`, which gates a structurally different raftkv-id signal).
+  `DETECT_TIMEOUT`: ADR 0040 PR1 has since put both signals in the *same* id
+  space — a node has exactly one id now — but they still answer different
+  questions, general network reachability (ADR 0012's heartbeat detector)
+  versus control-Raft-traffic reachability specifically, so sharing one
+  timeout constant would conflate two independently-tunable signals rather
+  than reflect that they now happen to key on the same space).
   `animusd`'s `admin_remove_control_member` is the consumer — see that
   crate's `CLAUDE.md`. Regression: `tests/control_membership.rs::
   last_contact_ages_out_a_partitioned_peer_but_not_a_healthy_one` (a
