@@ -24,27 +24,26 @@ per-tablet CP data plane (`animus-cp-data`).
   `Metadata::apply` is the deterministic state machine; `Metadata::reconcile`
   and `Metadata::rebalance` are the *pure* placement decisions (see Invariants).
   `Metadata` holds members, the tablet map, placement policies, the table-schema
-  catalog, keyspaces, `node_addrs` (member id → full `NodeAddrs { raftkv,
-  client, admin, role, control }`, ADR 0032 PR1) and the legacy
-  `cp_member_addrs` (kept for WAL back-compat). `NodeAddrs.role: String` (ADR
+  catalog, keyspaces, `node_addrs` (member id → full `NodeAddrs { internal,
+  client, admin, role }`, ADR 0032 PR1) and the legacy
+  `cp_member_addrs` (kept for WAL back-compat). **ADR 0040 PR1** merged the
+  pre-existing `raftkv`/`control` address pair into one `internal` field —
+  one identity per node, one internal env, means there is only one address
+  to replicate per node now; the old `control: Option<SocketAddr>` field
+  (ADR 0037 PR4, populated only for a control voter added at runtime, since
+  that address had no other replication path) is gone too — a runtime-added
+  voter's `internal` address is either already registered by its own
+  ordinary self-registration, or supplied directly by the admin action, so
+  there is no more separate gap to close there. `NodeAddrs.role: String` (ADR
   0035 residual follow-up, `#[serde(default = "combined")]` for WAL
   back-compat) is a member's own deployment role (`"control"`/`"data"`/
   `"combined"`) — a plain string, not an `animusd`-side enum, since this
   crate has no dependency on `animusd` and every other field here is already
   an opaque wire-format string this crate never interprets. A node only ever
   authoritatively knows its own role, so it is stamped once at
-  self-registration time like the other three fields; `animusd`'s
+  self-registration time like the other fields; `animusd`'s
   `/admin/peers` reads every *other* node's role straight off this field
   instead of fanning out to each node's own `/admin/config`.
-  `NodeAddrs.control: Option<SocketAddr>` (ADR 0037 PR4, `#[serde(default)]`)
-  is a genuinely-typed exception among these otherwise-opaque `String`
-  fields — populated **only** for a control voter added at runtime via
-  `RaftNode::change_membership` (`animusd`'s `admin_add_control_member`);
-  `None` for every statically-configured voter, whose address comes from
-  `ClusterConfig` at each node's own process start instead. Read by every
-  control-role `animusd` node's own `control_peer_sync_loop` to keep that
-  node's control env peer book current with runtime membership changes —
-  see that crate's `CLAUDE.md` for the gap this closes.
   `PlacementView` is the narrow (members + tablets + policies, no
   schema) clone that `RaftCore::placement_view()` hands the driver loops so they
   evaluate off the core lock instead of cloning the whole `Metadata` every tick.
@@ -127,11 +126,13 @@ per-tablet CP data plane (`animus-cp-data`).
   `POST /admin/control/member/{add,remove}` + `animus admin
   control-{add,remove,grow}` — see that crate's `CLAUDE.md`); this crate's
   own tests stay core-level only. **PR4 closes PR3's address-replication gap
-  and the static-vs-live `control_ids` audit** — `NodeAddrs.control` (above)
-  + `animusd`'s `control_peer_sync_loop`, and `admin_remove_member`'s
-  control-voter refusal moving to `self.control.config()` (the live Raft
-  config) instead of a static original-members list — see `animusd`'s
-  `CLAUDE.md` for both. `metadata_watch() -> MetadataWatch` (ADR
+  and the static-vs-live `control_ids` audit** — the address-replication half
+  was `NodeAddrs.control` + `animusd`'s `control_peer_sync_loop` (both since
+  superseded by ADR 0040 PR1's `internal` merge and single `peer_sync_loop`
+  — see that ADR); `admin_remove_member`'s control-voter refusal moving to
+  `self.control.config()` (the live Raft config) instead of a static
+  original-members list is unaffected — see `animusd`'s `CLAUDE.md` for
+  both. `metadata_watch() -> MetadataWatch` (ADR
   0031) is the executor-agnostic "applied index advanced" notification the
   per-node CP reconciler uses to react to a `Metadata` change without polling.
 
