@@ -2,7 +2,9 @@
 //! historical reads, tombstones, range delete, batch atomicity, and the
 //! monotonic-version contract.
 
-use animus_storage::{MemoryEngine, Snapshot, StorageEngine, StorageError, WriteBatch};
+use animus_storage::{
+    MemoryEngine, Snapshot, StorageEngine, StorageError, VersionedValue, WriteBatch,
+};
 use futures::executor::block_on;
 
 #[test]
@@ -17,6 +19,86 @@ fn historical_reads_see_old_versions() {
         assert_eq!(e.get_at(b"k", 15).await.unwrap().unwrap().value, b"v1");
         assert_eq!(e.get_at(b"k", 20).await.unwrap().unwrap().value, b"v2");
         assert_eq!(e.get(b"k").await.unwrap().unwrap().value, b"v2");
+    });
+}
+
+/// `scan_at` (ADR 0018 §2/PR2b): the range counterpart of `get_at`. Covers the
+/// case a naive "scan current, then get_at anything stale" approach would
+/// miss — a key deleted *after* the target version must still show up at its
+/// pre-deletion value, even though it is invisible to a `scan` of the
+/// engine's current (post-deletion) state.
+#[test]
+fn scan_at_sees_the_range_as_of_an_older_version_including_since_deleted_keys() {
+    block_on(async {
+        let e = MemoryEngine::new();
+        e.put(b"a", b"a1", 1).await.unwrap();
+        e.put(b"b", b"b1", 2).await.unwrap();
+        e.put(b"a", b"a2", 5).await.unwrap();
+        e.delete(b"b", 6).await.unwrap(); // "b" is gone as of "now"
+
+        // As of version 2: both keys are live.
+        assert_eq!(
+            e.scan_at(b"a", b"c", 2).await.unwrap(),
+            vec![
+                (
+                    b"a".to_vec(),
+                    VersionedValue {
+                        version: 1,
+                        value: b"a1".to_vec()
+                    }
+                ),
+                (
+                    b"b".to_vec(),
+                    VersionedValue {
+                        version: 2,
+                        value: b"b1".to_vec()
+                    }
+                ),
+            ],
+        );
+        // As of version 5: "a" moved to a2; "b" is still live (not yet deleted).
+        assert_eq!(
+            e.scan_at(b"a", b"c", 5).await.unwrap(),
+            vec![
+                (
+                    b"a".to_vec(),
+                    VersionedValue {
+                        version: 5,
+                        value: b"a2".to_vec()
+                    }
+                ),
+                (
+                    b"b".to_vec(),
+                    VersionedValue {
+                        version: 2,
+                        value: b"b1".to_vec()
+                    }
+                ),
+            ],
+        );
+        // As of "now" (post-delete): "b" is gone even though `scan` (its
+        // current-latest sibling) would never surface it as "was here".
+        assert_eq!(
+            e.scan_at(b"a", b"c", u64::MAX).await.unwrap(),
+            vec![(
+                b"a".to_vec(),
+                VersionedValue {
+                    version: 5,
+                    value: b"a2".to_vec()
+                }
+            )],
+        );
+        // Matches plain `scan` (latest) exactly.
+        assert_eq!(
+            e.scan_at(b"a", b"c", u64::MAX).await.unwrap(),
+            e.scan(b"a", b"c").await.unwrap(),
+        );
+
+        // Before anything existed: empty.
+        assert_eq!(e.scan_at(b"a", b"c", 0).await.unwrap(), Vec::new());
+
+        // Inverted range is rejected, like `scan`.
+        assert!(e.scan_at(b"c", b"a", 5).await.is_err());
     });
 }
 

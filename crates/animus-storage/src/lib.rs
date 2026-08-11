@@ -248,10 +248,50 @@ pub trait StorageEngine: Clone + Send + Sync {
     /// Scan the latest values for keys in `[start, end)`, ordered by key.
     async fn scan(&self, start: &[u8], end: &[u8]) -> Result<Vec<(Key, VersionedValue)>>;
 
+    /// Scan the values **as of `version`** for keys in `[start, end)`, ordered
+    /// by key — the range counterpart of [`get_at`](StorageEngine::get_at),
+    /// and the primitive the CP data plane's MVCC snapshot reads (ADR 0018
+    /// §2/PR2b) are built on. For every key that has *ever* had an entry in
+    /// the range (including one now tombstoned or superseded), returns the
+    /// greatest entry with version `≤ version`, omitting a key whose entry at
+    /// that version is a tombstone or that never had one. Unlike
+    /// [`scan`](StorageEngine::scan) (implicitly "as of now"), this can see a
+    /// key that has since been overwritten or deleted, exactly like
+    /// [`get_at`](StorageEngine::get_at) does for a single key — so, unlike
+    /// [`snapshot`](StorageEngine::snapshot) (which only ever pins the
+    /// engine's *current* latest version), it supports an arbitrary
+    /// **past** version.
+    ///
+    /// No default implementation: deriving one from the rest of this trait
+    /// would need per-key history within the range, and the trait's other
+    /// range method ([`entries_with_tombstones`](StorageEngine::entries_with_tombstones))
+    /// only ever exposes each key's *latest* record — not enough to answer
+    /// "what did this key look like as of an earlier version." Both engines
+    /// already carry this logic internally (it backs their own `scan`/`get_at`
+    /// at `version = latest`), so this is a thin, direct implementation on
+    /// each, not new logic.
+    async fn scan_at(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        version: Version,
+    ) -> Result<Vec<(Key, VersionedValue)>>;
+
     /// Every live (non-tombstoned) latest entry, as `(key, versioned value)`,
     /// ordered by key. This is the full digest anti-entropy reconciles against;
     /// it is `scan` over the whole keyspace.
     async fn entries(&self) -> Result<Vec<(Key, VersionedValue)>>;
+
+    /// Every live (non-tombstoned, as of `version`) entry across the *whole*
+    /// keyspace, ordered by key — [`entries`](StorageEngine::entries)'s
+    /// as-of-a-past-version counterpart, exactly like
+    /// [`scan_at`](StorageEngine::scan_at) is to
+    /// [`scan`](StorageEngine::scan). Needed only for an unbounded-above
+    /// snapshot scan with no finite physical bound at all (a caller with no
+    /// prefix to derive one from — a legacy/test-only shape; a real bounded
+    /// caller should always prefer `scan_at`, same cost trade-off as
+    /// `entries` vs `scan`).
+    async fn entries_at(&self, version: Version) -> Result<Vec<(Key, VersionedValue)>>;
 
     /// Every key's latest entry **including tombstones**, as
     /// `(key, Option<value>, version)` where `None` is a tombstone, ordered by

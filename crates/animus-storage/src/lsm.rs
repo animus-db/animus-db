@@ -2246,8 +2246,33 @@ impl<E: Env> StorageEngine for LsmEngine<E> {
         self.scan_at(start, end, Version::MAX).await
     }
 
+    async fn scan_at(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        version: Version,
+    ) -> Result<Vec<(Key, VersionedValue)>> {
+        if start > end {
+            return Err(StorageError::InvalidRange);
+        }
+        // Resolves to this type's own private inherent `scan_at` (line ~979)
+        // — inherent methods take priority over trait methods of the same
+        // name, exactly like `scan` above already relies on for `Version::MAX`.
+        self.scan_at(start, end, version).await
+    }
+
     async fn entries(&self) -> Result<Vec<(Key, VersionedValue)>> {
         let merged = self.merged_latest().await?;
+        Ok(merged
+            .into_iter()
+            .filter_map(|(k, (v, slot))| {
+                slot.map(|value| (k, VersionedValue { version: v, value }))
+            })
+            .collect())
+    }
+
+    async fn entries_at(&self, version: Version) -> Result<Vec<(Key, VersionedValue)>> {
+        let merged = self.merged_at(&[], None, version).await?;
         Ok(merged
             .into_iter()
             .filter_map(|(k, (v, slot))| {

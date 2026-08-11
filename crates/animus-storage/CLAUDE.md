@@ -22,8 +22,9 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
 
 - **The traits are `async`** (`#[async_trait::async_trait]`). The I/O-ish
   methods — `put`/`merge`/`merge_tombstone`/`delete`/`delete_range`/
-  `write_batch`/`get`/`get_at`/`scan`/`entries`/`entries_with_tombstones` on
-  `StorageEngine`, and `get`/`scan` on `Snapshot` — are `async fn`; callers
+  `write_batch`/`get`/`get_at`/`scan`/`scan_at`/`entries`/`entries_at`/
+  `entries_with_tombstones` on `StorageEngine`, and `get`/`scan` on
+  `Snapshot` — are `async fn`; callers
   `.await` them. This is so an on-disk LSM can reach the async `Disk` seam
   (SSTable block reads/flushes) behind the same trait. `snapshot()` and
   `latest_version()` (and `Snapshot::version()`) stay **synchronous** — pinning
@@ -47,6 +48,21 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
   `entries()` returns the full *live* digest; `entries_with_tombstones()`
   returns each key's latest record including tombstones (`(key, Option<value>,
   version)`). `put` keeps its global contract for single-writer callers.
+- **`scan_at(start, end, version)`/`entries_at(version)`** (ADR 0018 §2/PR2b)
+  are `scan`/`entries`'s as-of-a-past-version counterparts — the range/
+  whole-keyspace analogues of `get_at`, and the primitive the CP data
+  plane's MVCC snapshot reads (`RaftKvNode::read_at`/`scan_at`) are built
+  on. Unlike `get_at` (a required method with no useful default) and
+  `merge_batch`/`approx_bytes_in_range` (which *do* have a correct, if not
+  cheap, default derivable from the rest of the trait), these have **no
+  default**: `entries_with_tombstones` only ever exposes each key's
+  *latest* record, not enough history to answer "what did this key look
+  like as of an earlier version." Both engines already carried the exact
+  logic internally (`MemoryEngine`'s `Inner::scan_at` already retains full
+  per-key history and already backed `scan`/`snapshot`'s own `Snapshot::
+  scan`; `LsmEngine`'s private `scan_at`/`merged_at` already backed `scan`
+  at `version = Version::MAX`), so exposing them on the trait was a thin,
+  direct addition in each impl, not new logic.
 - **`merge_batch(Vec<MergeOp>)` coalesces a *sequential* run of merges into one WAL
   `fsync`.** Each `MergeOp` carries its **own** version (unlike `write_batch`, which
   stamps one version and uses `put`/monotonic-floor semantics) and applies with the
