@@ -426,8 +426,19 @@ fn raft_view(ctx: &ClientCtx) -> Value {
     let meta = r.metadata_cached();
     let members: Vec<Value> = meta
         .members
-        .keys()
-        .map(|id| json!({"node": id, "believes_alive": r.believes_alive(id.clone())}))
+        .iter()
+        .map(|(id, m)| {
+            json!({
+                "node": id,
+                "believes_alive": r.believes_alive(id.clone()),
+                // ADR 0040 PR6: surfaces the same signal the orphan-member
+                // sweep gates on — `false` alongside `status: "Down"` names
+                // exactly the claims that sweep will eventually reclaim
+                // (never activated), distinct from a real member that is
+                // merely currently down (`has_activated: true`).
+                "has_activated": m.has_activated,
+            })
+        })
         .collect();
     json!({
         "role": format!("{:?}", r.role()),

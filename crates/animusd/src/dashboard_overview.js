@@ -118,11 +118,18 @@ function renderOverview() {
       const up = m ? m.status === "Active" : !!(node && node.ok);
       const hostedCount = groups && Object.values(groups).flat().filter((x) => nodeIdOf(x.node) === id).length;
       const role = (node && ((node.config && node.config.role) || node.role)) || "data";
+      // ADR 0040 PR6: a `Down` member that has never activated is exactly
+      // the orphan-member sweep's eligibility signal (`has_activated:
+      // false`) — called out here, minimally, rather than as a new column,
+      // since it's the same "current status" text this row already shows.
+      const neverActivated = m && m.status === "Down" && m.has_activated === false;
       return {
         id, role, up,
         base: node && node.ok ? node.base : null,
         detail: `${hostedCount} tablet(s)`,
-        statusText: m ? m.status : (up ? "reachable" : "unreachable"),
+        statusText: m
+          ? (neverActivated ? "Down (never activated)" : m.status)
+          : (up ? "reachable" : "unreachable"),
       };
     });
   const nodeRow = (r) => `<div class="list-row">${dot(r.up ? "ok-dot" : "bad-dot")}
