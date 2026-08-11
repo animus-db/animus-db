@@ -9,7 +9,7 @@
 // leader — not for every row. No election-history section: this codebase
 // tracks only current Raft state, not a history of leadership transitions.
 // Depends on `dashboard_core.js` (STATE, $, esc, pill, dot, getJSON,
-// humanBytes, nodeRaftkvId, cpGroupsByTablet, autoSplitThresholds,
+// humanBytes, nodeIdOf, cpGroupsByTablet, autoSplitThresholds,
 // tabletStatus, tokenBound, gotoStorage).
 
 let tbTableFilter = "all";
@@ -62,7 +62,7 @@ function renderTablets() {
       ? `<span class="muted">—</span>`
       : `${esc(humanBytes(byteSize))}` + (byteOver ? " " + pill("warn", "over " + humanBytes(thresholds.bytes)) : "");
     const replicaDots = (t.replicas || []).map((rid) => {
-      const g = gs.find((x) => nodeRaftkvId(x.node) === rid);
+      const g = gs.find((x) => nodeIdOf(x.node) === rid);
       const cls = g ? (g.g.is_leader ? "ok-dot" : "dim-dot") : "bad-dot";
       const title = `node ${rid}` + (g ? (g.g.is_leader ? " (leader)" : " (follower)") : " (unreachable)");
       return `<span class="dot ${cls}" title="${esc(title)}"></span>`;
@@ -72,7 +72,7 @@ function renderTablets() {
       <td>${t.table ? esc(t.table) : `<span class="muted">—</span>`}</td>
       <td class="mono">${keysCell}</td>
       <td class="mono">${sizeCell}</td>
-      <td class="mono">${lead ? `node ${esc(nodeRaftkvId(lead.node))}` : `<span class="muted">—</span>`}</td>
+      <td class="mono">${lead ? `node ${esc(nodeIdOf(lead.node))}` : `<span class="muted">—</span>`}</td>
       <td><span class="replica-dots">${replicaDots}</span></td>
       <td>${pill(st, st)}</td>
     </tr>`;
@@ -102,7 +102,7 @@ function renderTabletDetail(tablets, groups) {
   const lead = gs.find((x) => x.g.is_leader);
 
   const replicaRows = (t.replicas || []).map((rid) => {
-    const g = gs.find((x) => nodeRaftkvId(x.node) === rid);
+    const g = gs.find((x) => nodeIdOf(x.node) === rid);
     const role = g ? (g.g.is_leader ? "leader" : "follower") : "unreachable";
     const dotCls = g ? (g.g.is_leader ? "ok-dot" : "dim-dot") : "bad-dot";
     const meta = g ? `t${g.g.term} · i${g.g.last_applied}` : "—";

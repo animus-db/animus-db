@@ -7,7 +7,7 @@
 // (The bulk-seed tool used to live here too; it writes real DynamoDB items
 // now, so it moved to the Data Browser's DynamoDB panel,
 // `dashboard_browser.js`.) Depends on `dashboard_core.js` (STATE, $, esc,
-// pill, getJSON, bytes, nodeRaftkvId, syncStorageUrl,
+// pill, getJSON, bytes, nodeIdOf, syncStorageUrl,
 // applyPendingStorageParams, pendingStorageParams).
 
 function renderStorageSelectors() {
@@ -161,7 +161,7 @@ function updateStorageNodeOptions() {
   const hosting = STATE.nodes.filter((n) => n.ok).filter(hostGroup);
   nsel.innerHTML = hosting.map((n) => {
     const tag = hostGroup(n).is_leader ? " · leader" : "";
-    return `<option value="${esc(n.base)}">node ${esc(nodeRaftkvId(n))} (${esc(n.addr)})${tag}</option>`;
+    return `<option value="${esc(n.base)}">node ${esc(nodeIdOf(n))} (${esc(n.addr)})${tag}</option>`;
   }).join("");
   if (prevN && [...nsel.options].some((o) => o.value === prevN)) nsel.value = prevN;
   $("st-hint").textContent = hosting.length ? ""

@@ -3,7 +3,7 @@
 // for the AnimusDB Console. `dashboard_overview.js`, `dashboard_placement.js`,
 // `dashboard_tablets.js`, `dashboard_browser.js`, and `dashboard_storage.js`
 // load after this file and call into it (STATE, $, esc, getJSON, postJSON,
-// pill, consoleLink, bytes, humanBytes, tokenBound, b64url, nodeRaftkvId, cpGroupsByTablet,
+// pill, consoleLink, bytes, humanBytes, tokenBound, b64url, nodeIdOf, cpGroupsByTablet,
 // autoSplitThresholds, tabletStatus, worstTabletStatus, statusDotClass, computeHealth,
 // activateTab, gotoStorage);
 // nothing here calls into them except `render()`, the single per-refresh
@@ -166,30 +166,25 @@ function consoleLink(base, id) {
 
 // ---- shared data-derivation helpers (used by more than one view) ----
 
-function nodeByRaftkv(id) {
-  return STATE.nodes.find((n) => n.ok && n.config && n.config.raftkv_id === id);
+function nodeById(id) {
+  return STATE.nodes.find((n) => n.ok && n.config && n.config.node_id === id);
 }
-// The raftkv (data-plane) id a CP-group/member row is keyed by — only ever
-// called on a node known to host data (a CP group's owning node, a
-// `Metadata.members` row), never a bare "which node is this" label, so
-// `null` (a control-only node, ADR 0035) never actually reaches here in
-// practice.
-function nodeRaftkvId(n) { return n.config ? n.config.raftkv_id : "?"; }
-// A human-facing "which node is this" label for an ARBITRARY node — unlike
-// `nodeRaftkvId` above, this must work for a control-only node too (ADR
-// 0035), which has no `raftkv_id` at all: prefer the raftkv id (the
-// identifier every other view already keys on), fall back to the control
-// id, and only show "?" if somehow neither is known.
+// The id a CP-group/member row is keyed by (ADR 0040 PR1: one identity per
+// node — was the raftkv id specifically, back when a node could have a
+// distinct control id; every node now has exactly one id, so this and
+// `nodeDisplayId` below are the same lookup).
+function nodeIdOf(n) { return n.config ? n.config.node_id : "?"; }
+// A human-facing "which node is this" label for an ARBITRARY node.
 function nodeDisplayId(n) {
   const c = n && n.config;
   if (!c) return "?";
-  return c.raftkv_id != null ? c.raftkv_id : (c.control_id != null ? c.control_id : "?");
+  return c.node_id != null ? c.node_id : "?";
 }
 
 // Collect every hosted CP group across reachable nodes, indexed by tablet id.
-// Each group carries its own owning node's raftkv id (`g.node`, from
-// `CpRaftView`) — resolve that to the real node, never the admin node that
-// happened to answer the request. Under `--cluster N` dev mode every node's
+// Each group carries its own owning node's id (`g.node`, from `CpRaftView`)
+// — resolve that to the real node, never the admin node that happened to
+// answer the request. Under `--cluster N` dev mode every node's
 // `/admin/raftkv` response lists *every* replica cluster-wide (the shared
 // `ClusterEdgeState`), so tagging a group with whichever node's fetch
 // returned it — rather than the group's real owner — mis-associates it: a
@@ -206,7 +201,7 @@ function cpGroupsByTablet() {
       const key = g.tablet + ":" + g.node;
       if (seen.has(key)) continue;
       seen.add(key);
-      const node = nodeByRaftkv(g.node) || { config: { raftkv_id: g.node }, ok: false };
+      const node = nodeById(g.node) || { config: { node_id: g.node }, ok: false };
       (map[g.tablet] = map[g.tablet] || []).push({ node, g });
     }
   }
