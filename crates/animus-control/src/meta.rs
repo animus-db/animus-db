@@ -38,6 +38,35 @@ pub struct Member {
     pub labels: BTreeMap<String, String>,
     /// Current lifecycle status.
     pub status: NodeStatus,
+    /// Whether this member has **ever** reached [`Active`](NodeStatus::Active)
+    /// (ADR 0040 PR6) — sticky once set, never cleared back to `false` by any
+    /// later transition. This is what distinguishes a member that "never
+    /// showed up" (a claim whose node crashed mid-join or lost a registration
+    /// race, eligible for the orphan-member sweep) from one that "was alive,
+    /// currently down" (repair/decommission territory — never sweepable).
+    ///
+    /// Deliberately **not** scoped to "the detector's own `Down`→`Active`
+    /// promotion" alone: a bootstrap-declared member starts `Active`
+    /// directly (ADR 0030 §3's phantom hardening), never passing through a
+    /// `Down`→`Active` transition at all, so gating this narrowly on that one
+    /// transition would leave a founding cluster member's `has_activated`
+    /// permanently `false` — and, the moment it later legitimately crashes
+    /// and is marked `Down`, indistinguishable from a genuine never-activated
+    /// orphan. `Metadata::apply`'s `UpsertMember` arm instead sets this
+    /// whenever the command's own desired status is `Active`, regardless of
+    /// the caller (the ADR 0012 detector's promotion, or `bootstrap`'s direct
+    /// `Active` insert) — a member is "has activated" the moment it is ever
+    /// recorded `Active`, by any path, which is exactly the safety property
+    /// the sweep needs. `#[serde(default)]` is needed only so this compiles
+    /// against every existing in-repo struct literal / WAL-format unit test
+    /// unchanged — per this repo's standing "no live deployments, fresh
+    /// clusters only" rule (`docs/engineering-lessons.md`), a genuine
+    /// pre-ADR-0040-PR6 snapshot loading as `false` for every member
+    /// (indistinguishable, at that instant, from a never-activated orphan)
+    /// is explicitly **not** a supported upgrade path — no migration is
+    /// attempted or required.
+    #[serde(default)]
+    pub has_activated: bool,
 }
 
 /// A member's full address book (ADR 0032 PR1): every listen address a node
@@ -646,11 +675,22 @@ impl Metadata {
                 labels,
                 status,
             } => {
+                // `has_activated` is sticky (ADR 0040 PR6): once a member has
+                // ever been recorded `Active` — by any caller, the ADR 0012
+                // detector's `Down`→`Active` promotion or `bootstrap`'s direct
+                // `Active` insert alike — it stays `true` forever, regardless
+                // of any later status this same command (or a future one)
+                // sets. See `Member::has_activated`'s own doc for why this is
+                // computed here, structurally, rather than left to whichever
+                // caller happens to drive a promotion.
+                let has_activated = self.members.get(node).is_some_and(|m| m.has_activated)
+                    || *status == NodeStatus::Active;
                 self.members.insert(
                     node.clone(),
                     Member {
                         labels: labels.clone(),
                         status: *status,
+                        has_activated,
                     },
                 );
                 ApplyOutcome::Applied
@@ -1005,8 +1045,34 @@ impl Metadata {
             }
             MetaCommand::RemoveMember { node } => {
                 let Some(member) = self.members.get(node) else {
-                    // Already absent: an idempotent retry (e.g. a proposer whose
-                    // confirm timed out after the command actually committed).
+                    // No `members` row for this id. Two shapes (ADR 0040
+                    // PR6): a genuinely already-removed id (an idempotent
+                    // retry, e.g. a proposer whose confirm timed out after
+                    // the command actually committed) — `NoOp`; or a
+                    // **claim-without-member** id (a control-role
+                    // `RegisterNode` claims `node_addrs` alone, never a
+                    // `members` row — see that command's own doc) whose
+                    // orphaned address-book claim this command should still
+                    // clean up, so `RemoveMember` is a complete removal for
+                    // every shape `RegisterNode` can produce, not just the
+                    // data-plane one. Distinguished purely by whether
+                    // `node_addrs` still has an entry to prune: nothing else
+                    // to gate on here — a claim-without-member id can never
+                    // be `Active`/`Joining` (it never claims `members` at
+                    // all) and can never be referenced by a tablet's replica
+                    // set (placement only ever chooses from `members`). The
+                    // one real safety check this shape needs — "is `node`
+                    // currently a live **control** voter" — is not this
+                    // state machine's to make: `RaftCore`'s voter config
+                    // lives in a wholly different part of the system, not in
+                    // `Metadata` at all, so the caller (the orphan-sweep
+                    // driver, or an admin action) must check it *before*
+                    // ever proposing this command.
+                    if self.node_addrs.remove(node).is_some() {
+                        self.cp_member_addrs.remove(node);
+                        self.cp_member_tablets.remove(node);
+                        return ApplyOutcome::Applied;
+                    }
                     return ApplyOutcome::NoOp;
                 };
                 if matches!(member.status, NodeStatus::Active | NodeStatus::Joining) {
@@ -1076,6 +1142,8 @@ impl Metadata {
                                 Member {
                                     labels: labels.clone(),
                                     status: NodeStatus::Down,
+                                    // A fresh claim: never activated yet.
+                                    has_activated: false,
                                 },
                             );
                             return ApplyOutcome::Applied;
@@ -1100,6 +1168,8 @@ impl Metadata {
                                 Member {
                                     labels: labels.clone(),
                                     status: NodeStatus::Down,
+                                    // A fresh claim: never activated yet.
+                                    has_activated: false,
                                 },
                             );
                         }
@@ -1211,6 +1281,63 @@ impl Metadata {
             .values()
             .filter(|t| t.replicas.contains(node))
             .count()
+    }
+
+    /// **ADR 0040 PR6**: every node-identity claim in this snapshot that is
+    /// eligible for the orphan-member sweep, judged purely from what
+    /// `Metadata` itself can see. This is a **candidate set, not a removal
+    /// decision** — the caller (the control-plane leader's own volatile
+    /// timer, `node.rs::orphan_sweep_loop`) still has to (a) require a
+    /// candidate to persist across `orphan_sweep_after` before proposing
+    /// anything (a one-tick candidate is not itself sweep-worthy — the whole
+    /// point is a *grace period*), and (b) exclude anything in the **current
+    /// control-voter set**, which is `RaftCore`'s own live config and lives
+    /// nowhere in `Metadata` — this state machine has no way to know it and
+    /// must not guess.
+    ///
+    /// Iterates the **union** of [`Metadata::members`] and
+    /// [`Metadata::node_addrs`]'s keys — a claim can exist in either, or
+    /// both, and this must catch every shape:
+    /// - **A `members` row exists** (whether or not `node_addrs` also has
+    ///   one — e.g. `admin_add_member`'s bare `UpsertMember{Down}` growth
+    ///   registration, which claims no address until the node itself
+    ///   self-registers one later): eligible iff `status ==
+    ///   `[`Down`](NodeStatus::Down)` (excludes `Active`/`Joining` — still
+    ///   live or forming — and `Leaving` — decommission territory, always
+    ///   already `has_activated` in practice since a member must have been
+    ///   `Active` to ever become `Leaving`), `!has_activated` (never showed
+    ///   up, as opposed to a real member that later went down), and it is
+    ///   unreferenced by any tablet's replica set (mirroring
+    ///   [`RemoveMember`](MetaCommand::RemoveMember)'s own apply-time guard —
+    ///   this predicate is a superset check, never a substitute for it: the
+    ///   sweep still proposes the real command, whose own guard is the
+    ///   actual safety net).
+    /// - **No `members` row at all**: the claim-without-member shape (a
+    ///   control-role [`RegisterNode`](MetaCommand::RegisterNode) claims only
+    ///   `node_addrs`, by design — see that command's doc). Always eligible
+    ///   by this predicate alone: it can never be `Active`/`Joining` (it
+    ///   never claims `members`) and can never be tablet-referenced
+    ///   (placement only ever chooses from `members`) — its only real
+    ///   safety gate is the control-voter exclusion the caller applies.
+    #[must_use]
+    pub fn orphan_sweep_candidates(&self) -> BTreeSet<NodeId> {
+        self.members
+            .keys()
+            .chain(self.node_addrs.keys())
+            .filter(|id| self.is_orphan_sweep_candidate(id))
+            .cloned()
+            .collect()
+    }
+
+    fn is_orphan_sweep_candidate(&self, node: &NodeId) -> bool {
+        match self.members.get(node) {
+            None => true,
+            Some(m) => {
+                m.status == NodeStatus::Down
+                    && !m.has_activated
+                    && self.tablets_referencing(node) == 0
+            }
+        }
     }
 
     /// The next tablet id a proposer should request when creating a tablet (ADR
@@ -2142,6 +2269,229 @@ mod tests {
                 ApplyOutcome::NoOp
             );
         }
+    }
+
+    /// **ADR 0040 PR6**: `RemoveMember` also prunes a **claim-without-member**
+    /// id — a `node_addrs` entry with no `members` row at all (the shape a
+    /// control-role `RegisterNode` always produces) — instead of treating it
+    /// as an already-absent no-op the way it did before this PR (which would
+    /// have leaked the address-book claim forever, since nothing else ever
+    /// removes a `node_addrs` entry with no member to gate on).
+    #[test]
+    fn remove_member_prunes_a_claim_without_a_members_row() {
+        let mut m = Metadata::default();
+        m.apply(&MetaCommand::RegisterNode {
+            node: nid(301),
+            addrs: NodeAddrs {
+                internal: "127.0.0.1:9301".to_owned(),
+                client: "127.0.0.1:9001".to_owned(),
+                admin: "127.0.0.1:9501".to_owned(),
+                role: "control".to_string(),
+            },
+            labels: BTreeMap::new(),
+        });
+        assert!(m.node_addrs.contains_key(&nid(301)));
+        assert!(
+            !m.members.contains_key(&nid(301)),
+            "test premise: a control-role registration never claims `members`"
+        );
+
+        assert_eq!(
+            m.apply(&MetaCommand::RemoveMember { node: nid(301) }),
+            ApplyOutcome::Applied
+        );
+        assert!(!m.node_addrs.contains_key(&nid(301)));
+
+        // Idempotent retry: already fully absent now — `NoOp`, matching the
+        // data-plane shape's own idempotent-retry contract.
+        assert_eq!(
+            m.apply(&MetaCommand::RemoveMember { node: nid(301) }),
+            ApplyOutcome::NoOp
+        );
+    }
+
+    /// **ADR 0040 PR6 safety argument.** The catastrophic case the orphan
+    /// sweep must never cause: an `Active` member removed because its
+    /// `RemoveMember` proposal was computed from a stale (pre-activation)
+    /// view. Proven directly and exhaustively as a state-machine property —
+    /// **regardless of which of the two commands a proposer computed first**,
+    /// applying them in either order never leaves an `Active` member
+    /// removed, because `RemoveMember`'s own apply-time guard re-checks
+    /// status fresh against whatever already committed ahead of it in the
+    /// log, not against whatever view the proposer that built it once saw.
+    #[test]
+    fn remove_member_never_removes_a_member_that_activated_first_regardless_of_proposal_order() {
+        // Order 1: activation commits first (the realistic case — the
+        // detector's promotion happened to land before the sweep's own
+        // stale-view proposal). The stale removal is rejected outright; the
+        // member stays exactly as activation left it.
+        let mut m = Metadata::default();
+        m.apply(&MetaCommand::UpsertMember {
+            node: nid(301),
+            labels: BTreeMap::new(),
+            status: NodeStatus::Down,
+        });
+        assert_eq!(
+            m.apply(&MetaCommand::UpsertMember {
+                node: nid(301),
+                labels: BTreeMap::new(),
+                status: NodeStatus::Active,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::RemoveMember { node: nid(301) }),
+            ApplyOutcome::Rejected("not drained: member is Active or Joining"),
+            "a stale removal proposal must never remove an already-Active member"
+        );
+        assert!(m.members.contains_key(&nid(301)));
+        assert_eq!(m.members[&nid(301)].status, NodeStatus::Active);
+
+        // Order 2: the removal genuinely commits first (the member really
+        // never activated in time) — this is the intended sweep outcome, not
+        // a bug. Removal succeeds; nothing here resurrects it (the actual
+        // "no resurrection via the normal detector path" argument is proven
+        // separately in `node::tests::
+        // liveness_transitions_never_proposes_for_an_absent_member`, since it
+        // exercises the crate-private decision function that is the only
+        // realistic producer of an `UpsertMember{Active}` command in this
+        // context).
+        let mut m2 = Metadata::default();
+        m2.apply(&MetaCommand::UpsertMember {
+            node: nid(301),
+            labels: BTreeMap::new(),
+            status: NodeStatus::Down,
+        });
+        assert_eq!(
+            m2.apply(&MetaCommand::RemoveMember { node: nid(301) }),
+            ApplyOutcome::Applied
+        );
+        assert!(!m2.members.contains_key(&nid(301)));
+    }
+
+    /// `Member::has_activated` is sticky: set the moment a member's status is
+    /// ever recorded `Active` (regardless of the caller — a fresh
+    /// `Down`→`Active` promotion or a direct `Active` insert alike, ADR 0040
+    /// PR6), and never cleared by a later transition to any other status.
+    #[test]
+    fn has_activated_is_sticky_once_the_member_is_ever_active() {
+        let mut m = Metadata::default();
+        // A direct `Active` insert (mirroring `bootstrap`'s shape) sets it
+        // immediately, with no prior `Down` state at all.
+        m.apply(&MetaCommand::UpsertMember {
+            node: nid(301),
+            labels: BTreeMap::new(),
+            status: NodeStatus::Active,
+        });
+        assert!(m.members[&nid(301)].has_activated);
+
+        // A later `Down` (a real crash) never clears it.
+        m.apply(&MetaCommand::UpsertMember {
+            node: nid(301),
+            labels: BTreeMap::new(),
+            status: NodeStatus::Down,
+        });
+        assert!(m.members[&nid(301)].has_activated);
+
+        // A fresh `Down` claim (never yet active) starts `false`.
+        m.apply(&MetaCommand::UpsertMember {
+            node: nid(302),
+            labels: BTreeMap::new(),
+            status: NodeStatus::Down,
+        });
+        assert!(!m.members[&nid(302)].has_activated);
+    }
+
+    /// `Metadata::orphan_sweep_candidates` (ADR 0040 PR6): the pure
+    /// candidate-set predicate, covering both shapes and every exclusion.
+    #[test]
+    fn orphan_sweep_candidates_covers_both_shapes_and_every_exclusion() {
+        let mut m = Metadata::default();
+
+        // Shape 1: a data-plane claim, never activated — a candidate.
+        m.apply(&MetaCommand::RegisterNode {
+            node: nid(900),
+            addrs: NodeAddrs {
+                internal: "127.0.0.1:9900".to_owned(),
+                client: "127.0.0.1:9000".to_owned(),
+                admin: "127.0.0.1:9950".to_owned(),
+                role: "combined".to_string(),
+            },
+            labels: BTreeMap::new(),
+        });
+        // Shape 2: a control-role claim-without-member — a candidate too.
+        m.apply(&MetaCommand::RegisterNode {
+            node: nid(901),
+            addrs: NodeAddrs {
+                internal: "127.0.0.1:9901".to_owned(),
+                client: "127.0.0.1:9001".to_owned(),
+                admin: "127.0.0.1:9951".to_owned(),
+                role: "control".to_string(),
+            },
+            labels: BTreeMap::new(),
+        });
+        // A member that activated, then went Down — NOT a candidate
+        // (`has_activated` guard).
+        m.apply(&MetaCommand::UpsertMember {
+            node: nid(902),
+            labels: BTreeMap::new(),
+            status: NodeStatus::Active,
+        });
+        m.apply(&MetaCommand::UpsertMember {
+            node: nid(902),
+            labels: BTreeMap::new(),
+            status: NodeStatus::Down,
+        });
+        m.apply(&MetaCommand::RegisterNodeAddrs {
+            node: nid(902),
+            addrs: NodeAddrs {
+                internal: "127.0.0.1:9902".to_owned(),
+                client: "127.0.0.1:9002".to_owned(),
+                admin: "127.0.0.1:9952".to_owned(),
+                role: "combined".to_string(),
+            },
+        });
+        // A never-activated claim, but still referenced by a tablet's
+        // replica set — NOT a candidate (mirrors `RemoveMember`'s own guard).
+        m.apply(&MetaCommand::RegisterNode {
+            node: nid(903),
+            addrs: NodeAddrs {
+                internal: "127.0.0.1:9903".to_owned(),
+                client: "127.0.0.1:9003".to_owned(),
+                admin: "127.0.0.1:9953".to_owned(),
+                role: "combined".to_string(),
+            },
+            labels: BTreeMap::new(),
+        });
+        m.apply(&MetaCommand::CreateTablet {
+            tablet: TabletId(1),
+            table: Some("users".to_owned()),
+            range: KeyRange::whole(),
+            replicas: vec![nid(903)],
+        });
+        // Shape 3: a `members`-row-only claim with **no** `node_addrs` entry
+        // at all (`admin_add_member`'s bare growth registration — a node
+        // declared `Down` ahead of its own later self-registration) — a
+        // candidate too, proving the union covers this shape, not just the
+        // `node_addrs`-keyed ones.
+        m.apply(&MetaCommand::UpsertMember {
+            node: nid(904),
+            labels: BTreeMap::new(),
+            status: NodeStatus::Down,
+        });
+
+        let candidates = m.orphan_sweep_candidates();
+        assert!(candidates.contains(&nid(900)), "shape 1 missing");
+        assert!(candidates.contains(&nid(901)), "shape 2 missing");
+        assert!(
+            !candidates.contains(&nid(902)),
+            "activated-then-down member must never be a candidate"
+        );
+        assert!(
+            !candidates.contains(&nid(903)),
+            "tablet-referenced claim must never be a candidate"
+        );
+        assert!(candidates.contains(&nid(904)), "shape 3 missing");
     }
 
     /// A `Metadata` snapshot serialized before ADR 0032 PR3 (no `RemoveMember`
