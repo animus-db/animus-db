@@ -45,8 +45,9 @@ const MAGIC: u8 = 0xCB;
 /// `KvCommand::Seal` variant (tag 6) was added — pre-alpha, no cross-version
 /// wire/disk compatibility is required (no live deployments), so a mixed-
 /// version decode fails loudly on the version check below rather than
-/// silently misreading the new field.
-const VERSION: u8 = 5;
+/// silently misreading the new field. `6` (ADR 0018 §2/PR2b):
+/// `KvCommand::ReadCeiling` (tag 7) was added.
+const VERSION: u8 = 6;
 
 /// A decode failure: a description of what was malformed, surfaced loudly by
 /// the caller (logged + dropped; never silently misread).
@@ -282,6 +283,10 @@ fn put_command(out: &mut Vec<u8>, c: &KvCommand) {
             put_key_range(out, range);
             put_ts(out, *ts);
         }
+        KvCommand::ReadCeiling { ts } => {
+            put_u8(out, 7);
+            put_ts(out, *ts);
+        }
     }
 }
 
@@ -322,6 +327,7 @@ fn read_command(c: &mut Cursor<'_>) -> Result<KvCommand, DecodeError> {
             range: read_key_range(c)?,
             ts: read_ts(c)?,
         },
+        7 => KvCommand::ReadCeiling { ts: read_ts(c)? },
         other => return Err(format!("unknown KvCommand tag {other}")),
     })
 }
@@ -705,8 +711,14 @@ mod tests {
                 config: None,
             },
             LogEntry {
-                term: 5,
+                term: 6,
                 index: 23,
+                command: KvCommand::ReadCeiling { ts: ts(7, 0) },
+                config: None,
+            },
+            LogEntry {
+                term: 6,
+                index: 24,
                 command: KvCommand::NoOp,
                 config: None,
             },

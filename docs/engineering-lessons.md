@@ -1268,6 +1268,44 @@ debugging anything that feels like it might have happened before.
   for claim-style commands must stop as soon as any read shows the claim
   ever existed, not only when the freshest read does. (`animusd::
   register_node`'s `effective_metadata()` fallback.)
+- **`Simulator::run_for(dur)` always advances the clock to the full
+  deadline once idle — it does not "return early" just because the future
+  you were driving already resolved.** `run_until`'s loop drains every ready
+  task, then either fires the next scheduled timeline event (if before the
+  deadline) or, once none remain, jumps `clock` straight to the deadline and
+  returns. A helper that calls `run_for(Duration::from_secs(2))` once *per
+  read* to drive a spawned `linearizable_get` therefore advances that read's
+  serve timestamp by a full 2 (virtual) seconds every single call — fine for
+  an ordinary read-reflects-a-write assertion, but fatal for anything that
+  cares about *how close together* consecutive reads' timestamps are (ADR
+  0018 §2/PR2b's ceiling-amortization test: the naive per-read-`run_for`
+  version advanced each read's ts by seconds, trivially exceeding the
+  500ms `HLC_MAX_OFFSET` window between every pair and making every read
+  propose its own ceiling). Fix: drive a whole sequential batch — spawn one
+  task that loops the operation N times with no artificial gap, then call
+  `run_for` **once** with a budget sized for the whole batch — which is also
+  what keeps consecutive real-world back-to-back operations' timestamps
+  genuinely close, matching the workload the amortization is meant to
+  cover. (`crates/animus-cp-data/tests/ts_cache.rs`.)
+- **Never `block_on` a `RaftKvNode` linearizable read (`linearizable_get`/
+  `_scan`, `read_at`/`scan_at`) — it hangs forever, not just "runs
+  synchronously."** `futures::executor::block_on` polls its future on its
+  own local executor, entirely separate from `Simulator`'s; a read barrier's
+  `.await` points (confirmation polling, at minimum) are timeline events
+  registered against the `Simulator`'s own clock, resolved only when
+  `Simulator::run_for`/`run_until` is *actively called* to step them. Call
+  `block_on` on such a future and nothing ever drives that clock forward —
+  the calling thread blocks on a future that can structurally never
+  complete. The fix (already documented in `animus-cp-data/CLAUDE.md`'s
+  Tests section, but easy to violate by habit when reaching for a "just
+  read this value" one-liner alongside genuinely synchronous calls like
+  `node.put(..)`): always drive a linearizable read as a spawned task +
+  `run_for`, the same shape every other test in the suite already uses —
+  never mix in a bare `block_on` for "just one more read" partway through a
+  test that's otherwise correctly using the spawned-task pattern. A hang
+  with near-zero CPU time consumed over the whole wall-clock duration (not
+  a busy spin) is the tell: something is waiting on a clock nobody is
+  advancing. (`crates/animus-cp-data/tests/ts_cache.rs`.)
 
 ### Code patterns
 - **A "full replace" update to `Arc`-shared cached state tolerates a bare
@@ -3312,6 +3350,37 @@ debugging anything that feels like it might have happened before.
   old convention into the new one, and preserving its signature is what
   keeps a large, otherwise-unrelated test suite's diff to nearly nothing.**
   (ADR 0040 PR4.)
+- **`Hlc::witness(remote, now)` is the wrong tool for disambiguating a
+  value that is *deliberately* far in the future relative to the clock's
+  own normal progression — witnessing doesn't just validate the value, it
+  adopts it as the clock's new baseline, poisoning every ordinary `mint`
+  that follows until real wall-clock time catches up.** ADR 0018 §2/PR2b's
+  logged-read-ceiling design proposes a ceiling candidate
+  `uncertainty_upper(ts) = ts.wall_ms + max_offset` (deliberately ~500ms
+  ahead, so ceiling proposals amortize across many reads instead of firing
+  per-read) — but two `ensure_ceiling_above` calls that happen to compute
+  the *same* millisecond-granular margin (`uncertainty_upper` collapses
+  `logical` to 0) would otherwise propose byte-identical `ReadCeiling`
+  entries, tripping the apply-time monotonicity assert every command must
+  satisfy. The obvious fix — `self.hlc.witness(margin, now)` to
+  disambiguate, since `witness`'s contract guarantees the result strictly
+  exceeds both the margin and everything previously minted/witnessed — is
+  actually a *worse* bug: witnessing a 500ms-future value drags the
+  group's own `Hlc` forward to match it, so the very next *ordinary* read
+  mints a `ts` already close to that inflated baseline, immediately
+  exceeding the ceiling just committed and forcing a fresh proposal —
+  turning an intended O(1)-amortized mechanism into O(N) (one proposal per
+  read), caught by a test that specifically drove many sequential reads
+  and counted proposals rather than just checking correctness. **General
+  rule: reach for `witness` only when the goal is genuinely "fold this
+  observed value into my notion of *now*"; when the goal is merely "make
+  this candidate value unique against others like it" without changing
+  what the clock reports for anything else, use a separate ratchet (a
+  small CAS loop over its own counter) instead — sharing the *same* clock
+  used for the rest of the system's ordinary time-keeping is exactly what
+  causes the leak.** (`RaftKvNode::next_ceiling_candidate`,
+  `crates/animus-cp-data/src/lib.rs`; regression in
+  `tests/ts_cache.rs`'s amortization test.)
 
 ### Parallel-agent orchestration
 - **A stacked series' final "docs/ADR finalization" PR must treat the stack's

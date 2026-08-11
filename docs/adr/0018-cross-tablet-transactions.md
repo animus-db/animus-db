@@ -2,10 +2,13 @@
 
 - **Status:** Accepted — in delivery (PR1: HLC + sim clock skew landed; PR2:
   HLC commit timestamps as the CP-plane MVCC version + the range-seal design
-  landed; PR3-PR7 sequenced). See the "Amendment (2026-08-11, PR1)" section
-  for the build-time decisions settled at the start of delivery, and the
-  "Amendment (2026-08-11, PR2)" section below for the range-seal design that
-  replaces `version_floor`.
+  landed; PR2b: MVCC snapshot reads at a timestamp + the read-timestamp
+  cache/logged read ceiling landed; PR3-PR7 sequenced). See the "Amendment
+  (2026-08-11, PR1)" section for the build-time decisions settled at the
+  start of delivery, the "Amendment (2026-08-11, PR2)" section for the
+  range-seal design that replaces `version_floor`, and the "Amendment
+  (2026-08-11, PR2b)" section below for the read path + serializability
+  write-push mechanism.
 - **Date:** 2026-08-03
 
 ## Context
@@ -372,3 +375,161 @@ and read-span refresh/restart mechanism for full serializability (PR1's
 Amendment §2 already named this; PR2 only lands the write-side version
 scheme it will sit on top of), and the transaction record/intent machinery
 itself (Follow-up steps 2+).
+
+## Amendment (2026-08-11, PR2b)
+
+PR2b lands two things: the MVCC **read path** at an explicit HLC timestamp
+(`RaftKvNode::read_at`/`scan_at`), and the concrete mechanism for PR1
+Amendment §2's promised **write-conflict push** — the per-tablet
+read-timestamp cache plus a **logged read ceiling** that makes served reads
+recoverable across a leader change. Both live in `animus-cp-data`
+(`ts_cache.rs`, `ceiling.rs`, and `RaftKvNode`'s propose/read paths in
+`lib.rs`); see that crate's `CLAUDE.md` for the file-level entry points.
+
+### 1. Snapshot reads: `read_at`/`scan_at`
+
+`read_at(key, ts)` and `scan_at(start, end, ts)` run the same ReadIndex
+barrier as `linearizable_get`/`_scan` (quorum-confirmed leadership,
+`engine_applied` caught up), then read the value(s) with MVCC version `≤
+hlc::pack(ts)` — `storage.get_at`/`scan_at` (a new `StorageEngine::scan_at`,
+alongside `get_at`; both engines already carried this logic internally, so
+exposing it is a thin, direct addition, not new logic) instead of the
+latest.
+
+**Semantics, precisely — this is a building block, not a transaction's
+read.** The result reflects every write with commit `ts' ≤ ts` that was
+already committed *and applied* on this leader before the barrier
+confirmed. A write with `ts' ≤ ts` still **in flight** (proposed, not yet
+committed/applied) at barrier time is *not* guaranteed to be reflected;
+closing that gap across multiple keys/tablets — so a multi-tablet
+transaction's read sees a single consistent snapshot regardless of what any
+one tablet's commit pipeline happens to be doing at read time — is the
+transaction protocol's job (intents, PR3+), not this primitive's.
+
+A `read_at`/`scan_at` whose `ts` has not yet been covered by a **committed
+read ceiling** (§3 below) is **refused**: both return the same
+`Option<Option<_>>` shape `linearizable_get_served` already established
+(outer `None` = not served — a failed barrier or, new here, an uncovered
+`ts`; inner `Some(None)` = genuinely absent). Unlike `linearizable_get`/
+`_scan` (which mint their own serve `ts` and so can always drive the
+ceiling forward themselves before serving), `read_at`/`scan_at` take a
+caller-supplied `ts` and deliberately do **not** rubber-stamp it forward —
+a caller gets the ceiling to cover its `ts` some other way first (the
+simplest: any ordinary linearizable read on the same group) and retries.
+
+### 2. The read-timestamp cache: write-conflict push
+
+The serializability half of PR1 Amendment §2: a write must never commit at
+a `ts` `≤` a `ts` at which the affected keys were already served to a
+reader — otherwise a reader could have already returned a snapshot that a
+later, lower-timestamped write silently invalidates.
+
+`ts_cache.rs`'s `TsCache` is **leader-local, in-memory, best-effort
+acceleration** — not the safety mechanism itself (that is §3). A
+two-generation rotating `BTreeMap<(start, end), HlcTimestamp>` (no
+`HashMap`/`HashSet`, per ADR 0003): every served read (`linearizable_get`/
+`_scan`, `read_at`/`scan_at`) bumps the span it read at the `ts` it was
+actually served at (a point read's span is `[key, key ++ [0x00])` — the
+immediate lexicographic successor, so it covers exactly that one key).
+`current` accumulates entries; once it exceeds a bound (4096), it rotates
+into `previous` (discarded), folding the dropped generation's highest `ts`
+into a coarse `low_water` floor that never regresses. **Over-conservative
+eviction is safe, never wrong**: a write pushed above a floor higher than
+strictly necessary is still a correct write, just a marginally
+later-timestamped one — the whole design only ever errs toward pushing
+writes *later*, never *earlier*.
+
+At propose time (`put`/`put_batch`/`delete`/`cas`, via `mint_pushed`), the
+leader mints its usual `ts`, computes `floor = ts_cache.max_overlapping(keys)`
+(folding the committed ceiling in too, via `raise_low_water` — see §3), and
+— if `ts` doesn't strictly exceed `floor` — witnesses `floor` into the
+group's `Hlc` and re-mints. One retry always suffices (`Hlc::witness`'s own
+contract guarantees the result strictly exceeds what it witnessed),
+asserted, not merely assumed.
+
+### 3. The logged read ceiling: leader-change safety
+
+A leader-local cache dies with the leader — a **new** leader's fresh cache
+starts empty, and could otherwise stamp a write below a read its
+*predecessor* served. The fix is **ordering-based**, mirroring the range
+seal's shape (§2 of the PR2 amendment): a leader that wants to serve a
+read at or above the ceiling it currently believes is committed proposes
+`KvCommand::ReadCeiling { ts }` through its **own** Raft log first, and no
+leader may ever serve a read at a `ts` not strictly below the highest
+`ReadCeiling` **committed and applied** in its group's log
+(`RaftKvNode::committed_ceiling`, a lock-free atomic the apply task
+advances). The candidate is `Hlc::uncertainty_upper(serve_ts)` (`serve_ts.
+wall_ms + max_offset`) — a comfortable margin so ceiling proposals amortize
+to roughly one per `HLC_MAX_OFFSET` (500ms) of wall time under continuous
+reads, not one per read; the common case (already covered) proposes
+nothing at all.
+
+**Safety argument.** Every served read had a `ts` strictly below some
+committed ceiling. On a **live leader change** (no restart), the new
+leader witnessed that ceiling's `ts` via ordinary `AppendEntries` receipt
+— `command_ts` (the single function both `witness_append_entries` and WAL
+recovery already fold into the group's `Hlc`) covers `ReadCeiling` exactly
+like every other variant — **before it could ever campaign**, since Raft
+leader completeness requires it to have every entry its predecessor
+committed. So the new leader's own future mints (and hence every write it
+proposes, further pushed by `mint_pushed` if needed) strictly exceed that
+ceiling, which strictly exceeds every read it covered. By induction this
+holds across any chain of leader changes.
+
+A **liveness** note, not a correctness one: a group that cannot commit (no
+quorum) cannot advance its ceiling, so it cannot serve a read above its
+current one either — reads degrade exactly when writes do, no new
+availability class.
+
+**A documented residual, not closed by this PR**: the argument above relies
+on a *live* replica's in-memory `Hlc` retaining what it witnessed. A
+process **restart** re-seeds `Hlc` from the recovered WAL tail plus the
+engine's `latest_version()` (`start_inner`'s existing group-start witness);
+a `ReadCeiling` entry carries no fence and makes no *scoped* engine write,
+so — like any other applied entry — it is eligible for compaction once
+`engine_applied` passes it, same as an ordinary write. A **read-only**
+workload (many ceiling proposals, zero interleaved writes) can therefore
+have its `ReadCeiling` entries compacted out of the log before any
+ordinary write's `ts` (which *would* durably raise `latest_version()`)
+happens to follow it. To close this gap regardless, apply also durably
+**merges a small marker key** (`ceiling.rs`, one key per tablet, always
+overwritten — disjointness proof mirrors `seal.rs`'s) at
+`hlc::pack(ceiling)`: this durably raises `storage.latest_version()`, so
+the *already-existing* group-start witness re-derives a floor covering the
+ceiling on any future restart with zero further changes to the witnessing
+chain, and `drive`'s recovery reads the marker back to seed
+`committed_ceiling` directly (mirroring how `sealed` is rebuilt from its
+own engine marker, not log replay). This is a **deviation from a strictly
+in-memory design** — a considered fix to a real gap found while writing
+this safety argument, not the "no engine write" shape first sketched, and
+flagged here precisely for that reason.
+
+**A second regression this PR's own gate run caught**: the ceiling
+candidate must be disambiguated against another `ensure_ceiling_above`
+call that independently computes the *same* millisecond-granular margin
+(`uncertainty_upper` collapses to `logical: 0`) — but disambiguating via
+`Hlc::witness` (the obvious choice) drags the *proposing leader's own*
+`Hlc` forward to match a margin that is deliberately `HLC_MAX_OFFSET` in
+the future, so the very next ordinary read's mint lands close to (and soon
+exceeds) the ceiling just committed — turning the intended O(1) amortized
+proposal rate into O(N). The fix is a **separate** CAS ratchet
+(`last_ceiling_candidate`) that disambiguates the candidate sequence
+without ever touching the clock ordinary reads/writes share. See
+`RaftKvNode::next_ceiling_candidate`'s doc for the full account; regression
+covered by `tests/ts_cache.rs`'s amortization test (which caught both this
+and the original collision independently, at `ANIMUS_RAFTKV_SEEDS`-driven
+depth via the shared corpus).
+
+### 4. What ships with PR2b, what's still deferred
+
+Landing: `read_at`/`scan_at`; `TsCache` + the propose-time write-push;
+`KvCommand::ReadCeiling` (internal-only — proposed exclusively by a group's
+own leader, never forwarded from a client, so no `animusd` command-relay
+allowlist needs updating); the durable ceiling marker; `StorageEngine::
+scan_at`/`entries_at` (new, additive trait methods alongside `get_at`/
+`entries`).
+
+Deferred: the transaction record/intent machinery itself (Follow-up step
+2), which is what will actually *use* `read_at`/`scan_at` as its snapshot
+read primitive and the write-push/ceiling design as the ordering
+substrate a transaction's commit timestamp is chosen against.

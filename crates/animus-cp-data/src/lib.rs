@@ -54,12 +54,15 @@ use futures::lock::Mutex as AsyncMutex;
 use futures::task::AtomicWaker;
 use serde::{Deserialize, Serialize};
 
+mod ceiling;
 mod codec;
 pub mod hlc;
 pub mod host;
 mod seal;
+mod ts_cache;
 
 use hlc::{Hlc, HlcTimestamp};
+use ts_cache::TsCache;
 
 /// The assumed maximum clock-offset bound across the cluster (ADR 0018 §2),
 /// threaded into every [`Hlc::new`] this crate constructs. Not yet consumed
@@ -401,6 +404,21 @@ pub enum KvCommand {
     /// applies (it is itself the authority tightening what future entries
     /// may touch); see `apply_and_compact`'s `Seal` arm.
     Seal { range: KeyRange, ts: HlcTimestamp },
+    /// **Logged read ceiling** (ADR 0018 §2/PR2b — see `ceiling.rs`'s module
+    /// doc): proposed by a group's own leader, through its **own** Raft log,
+    /// when it wants to serve a read at or above the highest ceiling
+    /// currently committed for this group. Apply is a no-op against the
+    /// engine's *scoped* data (no fence, like `Seal` — a ceiling carries no
+    /// keys to gate): it only advances the driver's `committed_ceiling`
+    /// watermark and (durability across compaction, see `ceiling.rs`)
+    /// merges a marker value at this tablet's ceiling key. **Internal
+    /// only** — proposed exclusively by a group's own leader in its own
+    /// read path (`RaftKvNode::ensure_ceiling_above`), never forwarded from
+    /// a client, so no `animusd` command-relay allowlist needs updating
+    /// (grepped: `animusd` never matches on individual `KvCommand`
+    /// variants — every client-facing propose goes through `RaftKvNode`'s
+    /// own `put`/`get`/`cas`/`scan` methods, not a raw command).
+    ReadCeiling { ts: HlcTimestamp },
     /// The leader's no-op-on-election (Raft); applies nothing.
     NoOp,
 }
@@ -558,6 +576,33 @@ pub struct RaftKvNode<E: Env, S: StorageEngine> {
     /// `latest_version()`) plus, for the residual in-flight-write race
     /// witnessing alone can't close, the **range seal** (`seal.rs`).
     hlc: Arc<Hlc>,
+    /// The per-tablet **read-timestamp cache** (ADR 0018 §2/PR2b,
+    /// `ts_cache.rs`): leader-local, in-memory, best-effort write-conflict
+    /// push. Bumped by every served read (`linearizable_get`/`_scan`,
+    /// `read_at`/`scan_at`); consulted at propose time by every mutating
+    /// method to push a write's `ts` above any read it would otherwise land
+    /// at or below. Losing it (a crash/restart) is always safe — see the
+    /// module doc.
+    ts_cache: Arc<Mutex<TsCache>>,
+    /// This group's **committed read ceiling** (ADR 0018 §2/PR2b,
+    /// `ceiling.rs`): the highest `KvCommand::ReadCeiling` timestamp this
+    /// group has *applied* so far, packed via [`hlc::pack`] for lock-free
+    /// access. A read may only be served at a `ts` strictly below this.
+    /// Updated by the apply task (`apply_and_compact`'s `ReadCeiling` arm);
+    /// read by this handle's own `ensure_ceiling_above`/`read_at`/`scan_at`.
+    committed_ceiling: Arc<AtomicU64>,
+    /// The highest `ReadCeiling` **candidate** this leader has ever
+    /// proposed (whether committed yet or not), packed via [`hlc::pack`] —
+    /// disambiguates two `ensure_ceiling_above` calls that independently
+    /// compute the same [`Hlc::uncertainty_upper`] margin (millisecond-
+    /// granular, so this collides more easily than an ordinary mint).
+    /// **Deliberately separate from `hlc`**: unlike `Hlc::witness`, bumping
+    /// this ratchet never feeds back into what `hlc.mint` produces for an
+    /// ordinary read/write, so proposing a ceiling never drags this
+    /// group's own future timestamps toward the (deliberately
+    /// future-shifted) margin — see `next_ceiling_candidate`'s doc for the
+    /// cascade that mistake caused.
+    last_ceiling_candidate: Arc<AtomicU64>,
 }
 
 impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
@@ -664,6 +709,9 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         // doc), so this needs no async step here.
         let hlc = Arc::new(Hlc::new(env.node_id(), HLC_MAX_OFFSET));
         hlc.witness(hlc::unpack(storage.latest_version()), env.now());
+        let ts_cache = Arc::new(Mutex::new(TsCache::new()));
+        let committed_ceiling = Arc::new(AtomicU64::new(0));
+        let last_ceiling_candidate = Arc::new(AtomicU64::new(0));
         let node = Self {
             env: env.clone(),
             core: Arc::clone(&core),
@@ -679,6 +727,9 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             scope: scope.clone(),
             stream,
             hlc: Arc::clone(&hlc),
+            ts_cache: Arc::clone(&ts_cache),
+            committed_ceiling: Arc::clone(&committed_ceiling),
+            last_ceiling_candidate,
         };
         // The consensus loop recovers from the WAL, then spawns the apply task
         // (so the apply task sees the recovered core + the correct
@@ -700,6 +751,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             scope,
             stream,
             hlc,
+            committed_ceiling,
         }));
         node
     }
@@ -759,6 +811,113 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         result
     }
 
+    /// This group's currently **committed read ceiling** (ADR 0018 §2/PR2b,
+    /// `ceiling.rs`): the highest `ReadCeiling` timestamp this group has
+    /// *applied* so far. A read may only be served at a `ts` strictly below
+    /// this — see `ensure_ceiling_above`/`read_at`/`scan_at`. Public as an
+    /// admin/debug accessor (ADR 0020), alongside `term`/`commit_index`/etc.
+    pub fn committed_ceiling(&self) -> HlcTimestamp {
+        hlc::unpack(self.committed_ceiling.load(Ordering::SeqCst))
+    }
+
+    /// Disambiguate a `ReadCeiling` candidate against every candidate this
+    /// leader has ever proposed (`last_ceiling_candidate`, a lock-free CAS
+    /// ratchet): if `margin` (already strictly above the read it covers,
+    /// from [`Hlc::uncertainty_upper`]) exceeds the highest candidate seen
+    /// so far, it wins outright; otherwise the highest-seen candidate's
+    /// `logical` component is bumped by one — cheap, since a genuine
+    /// collision (two calls computing the identical millisecond-granular
+    /// margin) is the rare case, not the common one.
+    ///
+    /// **Never uses `Hlc::witness` for this.** Witnessing a margin that
+    /// sits `HLC_MAX_OFFSET` in the *future* would drag this leader's own
+    /// `hlc` forward to match it — poisoning every ordinary `mint` right
+    /// after with an inflated baseline, so the *next* read's serve ts lands
+    /// close to (and soon exceeds) the ceiling just committed, forcing
+    /// another proposal almost immediately. That turns the intended O(1)
+    /// amortized proposal rate into O(N) — a real regression a seed-driven
+    /// test caught. This ratchet is a separate piece of state precisely so
+    /// disambiguating a ceiling candidate never touches the clock every
+    /// read/write proposer shares.
+    fn next_ceiling_candidate(&self, margin: HlcTimestamp) -> HlcTimestamp {
+        loop {
+            let last_packed = self.last_ceiling_candidate.load(Ordering::SeqCst);
+            let last = hlc::unpack(last_packed);
+            let candidate = if margin > last {
+                margin
+            } else {
+                // Bump the logical component; carry into wall_ms on the
+                // (astronomically unlikely) overflow, mirroring `Hlc`'s own
+                // carry rule — this is a monotonic ratchet, not a wraparound.
+                let bumped_logical = last.logical.wrapping_add(1);
+                if bumped_logical >= (1 << hlc::LOGICAL_BITS) {
+                    HlcTimestamp {
+                        wall_ms: last.wall_ms + 1,
+                        logical: 0,
+                    }
+                } else {
+                    HlcTimestamp {
+                        wall_ms: last.wall_ms,
+                        logical: bumped_logical,
+                    }
+                }
+            };
+            if self
+                .last_ceiling_candidate
+                .compare_exchange(
+                    last_packed,
+                    hlc::pack(candidate),
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                )
+                .is_ok()
+            {
+                return candidate;
+            }
+        }
+    }
+
+    /// Mint a write's `ts`, **pushed** above any read this group's
+    /// [`ts_cache`](Self::ts_cache) or committed read ceiling has already
+    /// served for `keys` (ADR 0018 §2/PR2b — the write-conflict-push half of
+    /// serializability): a write must never land at or below a timestamp
+    /// `keys` were already read at. Folds the committed ceiling in as an
+    /// additional floor (mirrors `ts_cache.rs::raise_low_water`'s doc): every
+    /// past read, by this leader or a predecessor, was served below *some*
+    /// committed ceiling, so pushing above the ceiling pushes above every
+    /// read anyone could have served, even one this leader-local cache has
+    /// no per-span record of.
+    ///
+    /// One retry always suffices: [`Hlc::witness`]'s own contract guarantees
+    /// the re-mint strictly exceeds the witnessed floor — asserted here,
+    /// not just assumed, since a failure would mean `Hlc::witness` itself
+    /// stopped upholding that contract (a correctness bug, not a
+    /// recoverable condition, matching `assert_ts_monotonic`'s doctrine).
+    fn mint_pushed<K: AsRef<[u8]>>(&self, keys: &[K]) -> HlcTimestamp {
+        let ts = self.hlc.mint(self.env.now());
+        let floor = {
+            // Opportunistically ratchet the cache's own `low_water` up to the
+            // current committed ceiling before querying it (never regresses —
+            // see `TsCache::raise_low_water`'s doc) — the mechanism that lets
+            // a freshly-elected leader's cache catch up to what its
+            // predecessor's ceiling already covered, with no separate
+            // "on leader change" event to detect.
+            let mut cache = self.ts_cache.lock().expect("ts cache poisoned");
+            cache.raise_low_water(self.committed_ceiling());
+            cache.max_overlapping(keys)
+        };
+        if ts > floor {
+            return ts;
+        }
+        let pushed = self.hlc.witness(floor, self.env.now());
+        assert!(
+            pushed > floor,
+            "raftkv write-push: witnessing the floor must strictly exceed it \
+             (floor={floor:?}, got={pushed:?}) — Hlc::witness's own contract is broken"
+        );
+        pushed
+    }
+
     /// Propose a write to this group. Honored only on the leader (otherwise
     /// returns the leader hint); the value is durable + applied once committed.
     /// Stamps `fence = KeyRange::whole()` (unconstrained — see
@@ -771,7 +930,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// As [`put`](Self::put), but the leader stamps its own `fence` into the
     /// entry instead of the unconstrained default (see [`KvCommand`]'s doc).
     pub fn put_fenced(&self, key: Vec<u8>, value: Vec<u8>, fence: KeyRange) -> ProposeResult {
-        let ts = self.hlc.mint(self.env.now());
+        let ts = self.mint_pushed(std::slice::from_ref(&key));
         self.propose_and_wake(KvCommand::Put {
             key,
             value,
@@ -803,7 +962,8 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         puts: Vec<(Vec<u8>, Vec<u8>)>,
         fence: KeyRange,
     ) -> ProposeResult {
-        let ts = self.hlc.mint(self.env.now());
+        let keys: Vec<&[u8]> = puts.iter().map(|(k, _)| k.as_slice()).collect();
+        let ts = self.mint_pushed(&keys);
         record_propose(
             &self.metrics,
             self.lock().propose(KvCommand::Batch { puts, fence, ts }),
@@ -820,7 +980,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// As [`delete`](Self::delete), but the leader stamps its own `fence` into
     /// the entry instead of the unconstrained default (see [`KvCommand`]'s doc).
     pub fn delete_fenced(&self, key: Vec<u8>, fence: KeyRange) -> ProposeResult {
-        let ts = self.hlc.mint(self.env.now());
+        let ts = self.mint_pushed(std::slice::from_ref(&key));
         self.propose_and_wake(KvCommand::Delete { key, fence, ts })
     }
 
@@ -849,7 +1009,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         value: Vec<u8>,
         fence: KeyRange,
     ) -> ProposeResult {
-        let ts = self.hlc.mint(self.env.now());
+        let ts = self.mint_pushed(std::slice::from_ref(&key));
         self.propose_and_wake(KvCommand::Cas {
             key,
             expected,
@@ -1211,11 +1371,25 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// 0033 read-path fix; the exact failure shape the root `CLAUDE.md`'s ADR
     /// 0029 read-barrier entry describes).
     pub async fn linearizable_get_served(&self, key: &[u8]) -> Option<Option<Vec<u8>>> {
-        if self.read_barrier().await {
-            Some(self.local_get(key).await)
-        } else {
-            None
+        if !self.read_barrier().await {
+            return None;
         }
+        // ADR 0018 §2/PR2b: serve at the leader's current mint, ensure the
+        // group's committed ceiling covers it (proposing/waiting for a fresh
+        // one if not — see `ensure_ceiling_above`'s doc), then bump the
+        // read-timestamp cache with the *actual* ts served, so a concurrent
+        // or later write to this key is pushed above it.
+        let ts = self.hlc.mint(self.env.now());
+        if !self.ensure_ceiling_above(ts).await {
+            return None;
+        }
+        let value = self.local_get(key).await;
+        let (start, end) = ts_cache::point_span(key);
+        self.ts_cache
+            .lock()
+            .expect("ts cache poisoned")
+            .bump(start, end, ts);
+        Some(value)
     }
 
     /// A **linearizable range scan** via ReadIndex (ADR 0017 / v1): the live
@@ -1236,7 +1410,22 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         if !self.read_barrier().await {
             return None;
         }
-        Some(self.local_scan(start, end, limit).await)
+        let ts = self.hlc.mint(self.env.now());
+        if !self.ensure_ceiling_above(ts).await {
+            return None;
+        }
+        let rows = self.local_scan(start, end, limit).await;
+        // Bump the *whole requested span* (not just the rows a `limit`
+        // happened to return): over-conservative, never wrong — a future
+        // write anywhere in `[start, end)` is still pushed above this read,
+        // exactly like a rotated-away `ts_cache` generation (see that
+        // module's doc).
+        self.ts_cache.lock().expect("ts cache poisoned").bump(
+            start.to_vec(),
+            end.map(<[u8]>::to_vec),
+            ts,
+        );
+        Some(rows)
     }
 
     /// This replica's live `(key, value)` pairs with `start <= key < end`, sorted
@@ -1323,6 +1512,128 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             pairs.truncate(n);
         }
         pairs
+    }
+
+    /// A **linearizable-anchored MVCC snapshot read** of `key` **as of**
+    /// `ts` (ADR 0018 §2/PR2b): runs the same ReadIndex barrier as
+    /// [`linearizable_get`](Self::linearizable_get) — this must still be
+    /// the confirmed leader, current on `engine_applied` — then reads the
+    /// value with version `≤ hlc::pack(ts)` instead of the latest.
+    ///
+    /// **Semantics, precisely**: the result reflects every write with
+    /// commit `ts' ≤ ts` that was already committed *and applied* on this
+    /// leader before the barrier confirmed. A write with `ts' ≤ ts` still
+    /// **in flight** (proposed, not yet committed/applied) at barrier time
+    /// is *not* guaranteed to be reflected — closing that gap across
+    /// multiple keys/tablets is the cross-tablet transaction protocol's job
+    /// (intents, PR3+), not this primitive's. This is the single-tablet
+    /// MVCC snapshot-read building block, not a transaction's read.
+    ///
+    /// Same `Option<Option<_>>` shape as
+    /// [`linearizable_get_served`](Self::linearizable_get_served): outer
+    /// `None` means **not served** — either the read barrier failed, *or*
+    /// `ts` is not yet strictly below this group's committed read ceiling
+    /// (`ceiling.rs`) and this call, unlike `linearizable_get`/`_scan`
+    /// (which mint their own serve `ts` and so can always drive the
+    /// ceiling forward themselves), does not drive the ceiling forward for
+    /// a caller-supplied `ts` — a `read_at` refusal is a signal to retry
+    /// after something else has advanced the ceiling past `ts` (e.g. a
+    /// `linearizable_get`/`_scan` on this group), or later. Inner
+    /// `Some(None)` is a genuine "absent as of `ts`".
+    pub async fn read_at(&self, key: &[u8], ts: HlcTimestamp) -> Option<Option<Vec<u8>>> {
+        if !self.read_barrier().await {
+            return None;
+        }
+        if self.committed_ceiling() <= ts {
+            return None;
+        }
+        let physical = self.scope.physical(key);
+        let value = self
+            .storage
+            .get_at(&physical, hlc::pack(ts))
+            .await
+            .ok()
+            .flatten()
+            .map(|vv| vv.value);
+        let (start, end) = ts_cache::point_span(key);
+        self.ts_cache
+            .lock()
+            .expect("ts cache poisoned")
+            .bump(start, end, ts);
+        Some(value)
+    }
+
+    /// The range counterpart of [`read_at`](Self::read_at): the live
+    /// `(key, value)` pairs with `start <= key < end` **as of `ts`**,
+    /// sorted by key — same barrier + ceiling-refusal contract as
+    /// `read_at`, and the same scope-bounding shape as
+    /// [`local_scan`](Self::local_scan) (bounded via `end`, or
+    /// `StorageScope::physical_bounds` when unbounded above, falling back
+    /// to a whole-engine [`StorageEngine::entries_at`] only for
+    /// `StorageScope::whole()`).
+    pub async fn scan_at(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+        ts: HlcTimestamp,
+    ) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
+        if !self.read_barrier().await {
+            return None;
+        }
+        if self.committed_ceiling() <= ts {
+            return None;
+        }
+        let version = hlc::pack(ts);
+        let rows: Vec<(Vec<u8>, Vec<u8>)> = match end {
+            Some(e) => self
+                .storage
+                .scan_at(
+                    &self.scope.physical(start),
+                    &self.scope.physical(e),
+                    version,
+                )
+                .await
+                .ok()
+                .into_iter()
+                .flatten()
+                .filter_map(|(k, vv)| {
+                    let logical = self.scope.strip_in_range(&k)?;
+                    Some((logical.to_vec(), vv.value))
+                })
+                .collect(),
+            None => match self.scope.physical_bounds().1 {
+                Some(physical_end) => self
+                    .storage
+                    .scan_at(&self.scope.physical(start), &physical_end, version)
+                    .await
+                    .ok()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|(k, vv)| {
+                        let logical = self.scope.strip_in_range(&k)?;
+                        Some((logical.to_vec(), vv.value))
+                    })
+                    .collect(),
+                None => self
+                    .storage
+                    .entries_at(version)
+                    .await
+                    .ok()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|(k, vv)| {
+                        let logical = self.scope.strip_in_range(&k)?;
+                        (logical >= start).then(|| (logical.to_vec(), vv.value))
+                    })
+                    .collect(),
+            },
+        };
+        self.ts_cache.lock().expect("ts cache poisoned").bump(
+            start.to_vec(),
+            end.map(<[u8]>::to_vec),
+            ts,
+        );
+        Some(rows)
     }
 
     /// A **cheap, range-scoped byte estimate** for this tablet (ADR 0034: the
@@ -1498,6 +1809,73 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             self.metrics.incr(Metric::CpReadBarriersTimedOut);
         }
         ok
+    }
+
+    /// Ensure this group's **committed read ceiling** (ADR 0018 §2/PR2b,
+    /// `ceiling.rs`) is strictly above `ts`, proposing a fresh
+    /// `KvCommand::ReadCeiling` (and waiting for it to commit + apply) if it
+    /// is not — the mechanism that makes a read served at `ts` recoverable
+    /// after a leader change (see `ceiling.rs`'s module doc for the full
+    /// safety argument). The candidate ceiling is
+    /// [`Hlc::uncertainty_upper`]`(ts)` (`ts.wall_ms + max_offset`): a
+    /// comfortable margin above `ts` so ceiling proposals amortize to
+    /// roughly one per `HLC_MAX_OFFSET` of wall time under continuous
+    /// reads at monotonically advancing timestamps, **not** one per read —
+    /// the common case (`committed_ceiling() > ts` already) proposes
+    /// nothing at all.
+    ///
+    /// Returns `false` if this node is not (or stops being) the leader, or
+    /// the proposal doesn't land within [`READ_TIMEOUT`] — the caller must
+    /// treat that exactly like a failed [`read_barrier`](Self::read_barrier)
+    /// (no read may be served).
+    async fn ensure_ceiling_above(&self, ts: HlcTimestamp) -> bool {
+        if self.committed_ceiling() > ts {
+            return true;
+        }
+        if !self.is_leader() {
+            return false;
+        }
+        // `uncertainty_upper` intentionally collapses to `(wall_ms +
+        // max_offset, logical: 0)` — millisecond-granular, not the full HLC
+        // total order. Two reads whose serve `ts` merely share a wall-clock
+        // millisecond (differing only in `logical`) would otherwise compute
+        // *byte-identical* margins; embedding that margin directly as the
+        // command's `ts` risks two separately-proposed `ReadCeiling`
+        // entries landing with the exact same `ts`, tripping the
+        // apply-time monotonicity assert every command must satisfy
+        // (`assert_ts_monotonic`) — a real, seed-found regression this
+        // comment exists to warn future edits away from.
+        //
+        // The fix is deliberately **not** `self.hlc.witness(margin, ..)`:
+        // witnessing a margin that is 500ms in the *future* would drag this
+        // leader's own `self.hlc` forward to match it, so every ordinary
+        // read immediately afterward mints a `ts` already close to that
+        // inflated baseline — catching up to (and exceeding) the very
+        // ceiling just proposed almost at once, forcing a fresh proposal
+        // on every subsequent read (a real regression this comment exists
+        // to warn future edits away from: it turns O(1) amortized
+        // proposals into O(N)). `next_ceiling_candidate` disambiguates
+        // via a **separate** ratchet that never feeds back into `self.hlc`
+        // (the clock every read/write proposer shares) — only the
+        // committed-ceiling candidate sequence itself.
+        let margin = self.hlc.uncertainty_upper(ts);
+        let candidate = self.next_ceiling_candidate(margin);
+        match self.propose_and_wake(KvCommand::ReadCeiling { ts: candidate }) {
+            ProposeResult::Accepted { .. } => {
+                self.metrics.incr(Metric::CpReadCeilingProposals);
+            }
+            ProposeResult::NotLeader { .. } => return false,
+        }
+        let deadline = self.env.now().0 + READ_TIMEOUT.as_nanos() as u64;
+        loop {
+            if self.committed_ceiling() > ts {
+                return true;
+            }
+            if !self.is_leader() || self.env.now().0 >= deadline {
+                return false;
+            }
+            self.env.sleep(READ_POLL).await;
+        }
     }
 
     /// Whether this node currently believes it is the group's leader.
@@ -1721,6 +2099,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
     hlc: &Hlc,
     sealed: &mut Vec<(KeyRange, HlcTimestamp)>,
     max_applied_ts: &mut Option<HlcTimestamp>,
+    committed_ceiling: &AtomicU64,
 ) -> bool {
     let mut did_work = false;
 
@@ -1887,6 +2266,29 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                     .await
                     .expect("raftkv apply seal marker");
                 sealed.push((range, ts));
+            }
+            KvCommand::ReadCeiling { ts } => {
+                assert_ts_monotonic(max_applied_ts, ts);
+                // No fence, no scoped engine write — a ceiling carries no
+                // keys (see `KvCommand::ReadCeiling`'s doc). Bump the
+                // driver's watermark unconditionally (`fetch_max`, since a
+                // stale re-application on recovery replay must never
+                // regress it) and durably merge the marker (ADR 0018 §2/
+                // PR2b, `ceiling.rs`) so this survives a restart even after
+                // compaction truncates this very log entry — see that
+                // module's doc for the full argument. Flush the pending run
+                // first, matching `Seal`'s ordering hygiene above.
+                committed_ceiling.fetch_max(hlc::pack(ts), Ordering::SeqCst);
+                flush_pending(storage, &mut pending, metrics).await;
+                let marker_key = ceiling::ceiling_marker_key(tablet);
+                storage
+                    .merge(
+                        &marker_key,
+                        &ceiling::encode_ceiling_value(ts),
+                        hlc::pack(ts),
+                    )
+                    .await
+                    .expect("raftkv apply read-ceiling marker");
             }
             KvCommand::NoOp => {}
         }
@@ -2099,6 +2501,7 @@ struct DriveState<E: Env, S: StorageEngine> {
     scope: StorageScope,
     stream: u64,
     hlc: Arc<Hlc>,
+    committed_ceiling: Arc<AtomicU64>,
 }
 
 /// The `ts` a mutating [`KvCommand`] variant carries, or `None` for `NoOp`
@@ -2110,7 +2513,8 @@ fn command_ts(command: &KvCommand) -> Option<HlcTimestamp> {
         | KvCommand::Batch { ts, .. }
         | KvCommand::Delete { ts, .. }
         | KvCommand::Cas { ts, .. }
-        | KvCommand::Seal { ts, .. } => Some(*ts),
+        | KvCommand::Seal { ts, .. }
+        | KvCommand::ReadCeiling { ts, .. } => Some(*ts),
         KvCommand::NoOp => None,
     }
 }
@@ -2166,6 +2570,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         scope,
         stream,
         hlc,
+        committed_ceiling,
     } = st;
 
     let wal = wal_file(stream);
@@ -2213,8 +2618,21 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         .into_iter()
         .filter_map(|(_, vv)| seal::decode_seal_value(&vv.value))
         .collect();
+    // Rebuild `committed_ceiling` from its own durable engine marker (ADR
+    // 0018 §2/PR2b, `ceiling.rs`) — the same "engine marker survives
+    // compaction, log replay might not" reasoning as `sealed` above. This is
+    // also what lets a restarted node re-witness a compacted-away ceiling:
+    // the marker's `merge` durably advanced `storage.latest_version()`, and
+    // this group's `Hlc` already witnessed that (`start_inner`'s group-start
+    // witness, above `drive`'s own caller) before this function ever ran.
+    let ceiling_key = ceiling::ceiling_marker_key(stream);
+    if let Ok(Some(vv)) = storage.get(&ceiling_key).await
+        && let Some(ts) = ceiling::decode_ceiling_value(&vv.value)
+    {
+        committed_ceiling.fetch_max(hlc::pack(ts), Ordering::SeqCst);
+    }
     // Spawn the apply task now — after recovery seeded the core + `engine_applied`
-    // + `sealed`, so it never merges against pre-recovery state.
+    // + `sealed` + `committed_ceiling`, so it never merges against pre-recovery state.
     env.spawn_task(apply_loop(
         env.clone(),
         wal.clone(),
@@ -2230,6 +2648,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         stream,
         Arc::clone(&hlc),
         sealed,
+        committed_ceiling,
     ));
 
     loop {
@@ -2373,6 +2792,7 @@ async fn apply_loop<E: Env, S: StorageEngine>(
     stream: u64,
     hlc: Arc<Hlc>,
     mut sealed: Vec<(KeyRange, HlcTimestamp)>,
+    committed_ceiling: Arc<AtomicU64>,
 ) {
     // This apply task's own sequential, single-writer bookkeeping (see
     // `apply_and_compact`'s doc): `sealed` is seeded from the engine-durable
@@ -2401,6 +2821,7 @@ async fn apply_loop<E: Env, S: StorageEngine>(
             &hlc,
             &mut sealed,
             &mut max_applied_ts,
+            &committed_ceiling,
         )
         .await;
         if !did_work {

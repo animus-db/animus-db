@@ -223,11 +223,34 @@ impl StorageEngine for MemoryEngine {
         Ok(self.lock().scan_at(start, end, Version::MAX))
     }
 
+    async fn scan_at(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        version: Version,
+    ) -> Result<Vec<(Key, VersionedValue)>> {
+        if start > end {
+            return Err(StorageError::InvalidRange);
+        }
+        Ok(self.lock().scan_at(start, end, version))
+    }
+
     async fn entries(&self) -> Result<Vec<(Key, VersionedValue)>> {
         let inner = self.lock();
         let mut out = Vec::new();
         for key in inner.data.keys() {
             if let Some(vv) = inner.read_at(key, Version::MAX) {
+                out.push((key.clone(), vv));
+            }
+        }
+        Ok(out)
+    }
+
+    async fn entries_at(&self, version: Version) -> Result<Vec<(Key, VersionedValue)>> {
+        let inner = self.lock();
+        let mut out = Vec::new();
+        for key in inner.data.keys() {
+            if let Some(vv) = inner.read_at(key, version) {
                 out.push((key.clone(), vv));
             }
         }

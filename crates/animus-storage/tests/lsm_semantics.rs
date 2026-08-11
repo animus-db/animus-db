@@ -56,6 +56,38 @@ fn historical_reads_see_old_versions() {
     });
 }
 
+/// `scan_at` (ADR 0018 §2/PR2b): the on-disk engine must agree with
+/// `MemoryEngine`'s `scan_at` semantics — a key deleted after the target
+/// version still surfaces at its pre-deletion value.
+#[test]
+fn scan_at_sees_the_range_as_of_an_older_version_including_since_deleted_keys() {
+    let e = open(15);
+    block_on(async {
+        e.put(b"a", b"a1", 1).await.unwrap();
+        e.put(b"b", b"b1", 2).await.unwrap();
+        e.put(b"a", b"a2", 5).await.unwrap();
+        e.delete(b"b", 6).await.unwrap();
+
+        let at2 = e.scan_at(b"a", b"c", 2).await.unwrap();
+        assert_eq!(at2.len(), 2);
+        assert_eq!(at2[0].1.value, b"a1");
+        assert_eq!(at2[1].1.value, b"b1");
+
+        let at5 = e.scan_at(b"a", b"c", 5).await.unwrap();
+        assert_eq!(at5.len(), 2);
+        assert_eq!(at5[0].1.value, b"a2");
+        assert_eq!(at5[1].1.value, b"b1");
+
+        let now = e.scan_at(b"a", b"c", u64::MAX).await.unwrap();
+        assert_eq!(now.len(), 1);
+        assert_eq!(now[0].0, b"a");
+        assert_eq!(now, e.scan(b"a", b"c").await.unwrap());
+
+        assert_eq!(e.scan_at(b"a", b"c", 0).await.unwrap(), Vec::new());
+        assert!(e.scan_at(b"c", b"a", 5).await.is_err());
+    });
+}
+
 #[test]
 fn delete_is_a_tombstone_not_history_loss() {
     let e = open(2);

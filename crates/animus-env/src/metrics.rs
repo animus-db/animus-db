@@ -221,12 +221,25 @@ pub enum Metric {
     /// genuine late activation racing the proposal still shows up here even
     /// if the proposal itself is rejected at apply).
     OrphanMembersSwept,
+
+    // --- Read-timestamp cache / logged read ceiling (ADR 0018 §2, PR2b) ---
+    // Appended after the orphan-sweep variant; every earlier variant's slot
+    // and the text-export order stay stable, so the snapshot remains
+    // byte-reproducible. Recorded by `animus-cp-data`'s `RaftKvNode` at the
+    // one site that knows the real outcome — a `ReadCeiling` command actually
+    // *committed* (not merely proposed, and never once per read: the whole
+    // point of the ceiling design is that it amortizes to roughly one
+    // proposal per `HLC_MAX_OFFSET` of wall time under continuous reads).
+    /// A `KvCommand::ReadCeiling` was accepted by this group's leader
+    /// (appended to its log) to raise the committed read ceiling above a
+    /// read this leader is about to serve.
+    CpReadCeilingProposals,
 }
 
 impl Metric {
     /// Every metric, in a fixed order. The array index of a metric in `ALL` is
     /// its slot in the [`MetricSink`]; keep this in sync with the enum.
-    pub const ALL: [Metric; 44] = [
+    pub const ALL: [Metric; 45] = [
         Metric::ElectionsStarted,
         Metric::ElectionsWon,
         Metric::AppendEntriesSent,
@@ -271,6 +284,7 @@ impl Metric {
         Metric::ControlReconfigureAccepted,
         Metric::ControlReconfigureRejected,
         Metric::OrphanMembersSwept,
+        Metric::CpReadCeilingProposals,
     ];
 
     /// The stable exported name of this metric (snake_case, used as the text
@@ -322,6 +336,7 @@ impl Metric {
             Metric::ControlReconfigureAccepted => "control_reconfigure_accepted",
             Metric::ControlReconfigureRejected => "control_reconfigure_rejected",
             Metric::OrphanMembersSwept => "control_orphan_members_swept",
+            Metric::CpReadCeilingProposals => "cp_read_ceiling_proposals",
         }
     }
 

@@ -78,6 +78,28 @@ Three modules:
   full key-disjointness proof (including why a naive `[0x00, 0x00]` lead
   pair does **not** work: it collides with the legacy whole-keyspace
   tablet's own scope prefix).
+- **`ts_cache.rs`** (ADR 0018 §2/PR2b) — the per-tablet **read-timestamp
+  cache** (`TsCache`): leader-local, in-memory, best-effort
+  write-conflict push. A two-generation rotating `BTreeMap<(start, end),
+  HlcTimestamp>` (`bump`/`max_overlapping`/`raise_low_water`); every served
+  read bumps the span it read at its serve ts, and a propose-time write
+  (`RaftKvNode::mint_pushed`) is pushed above any overlapping bump (and the
+  committed ceiling, folded in via `raise_low_water`) before it is
+  embedded in a command. Losing this cache (crash/restart) is always
+  **safe** — over-conservative, never incorrect; see the module doc and
+  the Key invariants entry below for why the real safety net is the
+  logged read ceiling, not this cache.
+- **`ceiling.rs`** (ADR 0018 §2/PR2b) — the **logged read ceiling**'s
+  durable marker: a single per-tablet engine-global key (`ceiling_marker_
+  key`, same `RESERVED_NAMESPACE`-under-`escape` disjointness proof as
+  `seal.rs`'s marker, distinct tag) always overwritten with the newest
+  `KvCommand::ReadCeiling` value, so `storage.latest_version()` durably
+  reflects it — the *existing* group-start witness (`start_inner`'s
+  `hlc.witness(unpack(storage.latest_version()), ..)`) then re-derives a
+  floor covering it on any future restart with no further changes, even
+  after the `ReadCeiling` log entry itself has been compacted away. See
+  the Key invariants entry below for the full mechanism and its safety
+  argument.
 
 ### lib.rs API
 
@@ -139,6 +161,21 @@ Three modules:
   whole-tablet materialization); the unbounded-above case derives its bound
   from `physical_bounds` rather than an `entries()` whole-engine scan (see
   "What's non-obvious").
+- **MVCC snapshot reads — `read_at`/`scan_at`** (ADR 0018 §2/PR2b) — the
+  same ReadIndex barrier as `linearizable_get`/`_scan`, then a read at MVCC
+  version `≤ hlc::pack(ts)` (`storage.get_at`/`scan_at`) instead of the
+  latest: every write with commit `ts' ≤ ts` already committed *and
+  applied* before the barrier confirmed, **not** one still in flight — the
+  single-tablet snapshot-read building block a cross-tablet transaction's
+  read will sit on (PR3+), not a transaction's read itself. Refuses (outer
+  `None`, same `Option<Option<_>>` shape as `linearizable_get_served`) a
+  `ts` not yet strictly below `committed_ceiling()` — see the write-push/
+  ceiling invariant below.
+- **`committed_ceiling()`** (ADR 0018 §2/PR2b, admin/debug accessor
+  alongside `term`/`commit_index`/etc.) — this group's highest *applied*
+  `KvCommand::ReadCeiling`, the floor `read_at`/`scan_at` check against and
+  `ensure_ceiling_above` (internal, called from every read-serving method)
+  drives forward by proposing a fresh one when needed.
 - **`KvWire`** — the data-plane wire enum wrapping `RaftMsg` plus the ReadIndex
   read-barrier probes (`ReadProbe`/`ReadProbeAck`). The probes are driver-only,
   so ReadIndex lives entirely in this crate and the shared `RaftCore`/`RaftMsg`
@@ -220,6 +257,49 @@ State once here; cross-referenced from the sections below.
   **never** `last_applied` (else a read could observe past the engine).
 - **Durable-before-visible** (ADR 0009): effects are only drained for fsynced
   entries, and the engine write follows the WAL `fsync`.
+- **Write-conflict push + the logged read ceiling (ADR 0018 §2/PR2b) —
+  the serializability half of the MVCC design.** A write must never commit
+  at a `ts ≤` a `ts` at which its keys were already served to a reader.
+  Two layers, deliberately separate:
+  - **`ts_cache.rs`'s `TsCache`** is leader-local, in-memory,
+    best-effort — every served read bumps the span it read at its serve
+    `ts`; every mutating propose (`RaftKvNode::mint_pushed`) checks its
+    minted `ts` against the highest overlapping bump (plus the committed
+    ceiling, folded in via `raise_low_water`) and, if not strictly above,
+    witnesses that floor and re-mints (one retry always suffices —
+    asserted, not assumed). Losing this cache (a crash/restart) is always
+    **safe**, never wrong: over-conservative pushes are still correct
+    writes, just marginally later-timestamped ones.
+  - **The logged read ceiling** (`ceiling.rs`, `KvCommand::ReadCeiling`) is
+    the actual safety net a leader-local cache alone can't be, across a
+    leader change: a leader may only serve a read at a `ts` strictly below
+    the highest `ReadCeiling` its group has **committed and applied**
+    (`RaftKvNode::committed_ceiling`), and proposes a fresh one
+    (`Hlc::uncertainty_upper(serve_ts)`, a comfortable margin so proposals
+    amortize to roughly one per `HLC_MAX_OFFSET` of wall time, not one per
+    read) when it wants to serve above the current one. Safety: every
+    served read had `ts` below some committed ceiling; a live leader
+    change's new leader already witnessed that ceiling's `ts` via ordinary
+    `AppendEntries` receipt (`command_ts` covers `ReadCeiling` like every
+    other variant) **before it could ever campaign** (Raft leader
+    completeness), so its own future mints — and hence every write it
+    proposes — strictly exceed it. A durable **engine marker**
+    (`ceiling.rs`, mirroring `seal.rs`'s marker shape) closes the residual
+    a purely in-memory design would leave: a read-only workload can
+    compact a `ReadCeiling` entry out of the log with no interleaved write
+    to otherwise raise `storage.latest_version()`, so the marker's own
+    merge does that job directly, letting the *existing* group-start
+    witness (`start_inner`) re-derive the floor on any future restart.
+    **Never disambiguate a ceiling candidate via `Hlc::witness`** — it
+    would drag the *proposing leader's own* clock forward to match a
+    value that's deliberately `HLC_MAX_OFFSET` in the future, poisoning
+    every ordinary mint right after and turning the intended O(1)
+    amortized proposal rate into O(N) (a real regression a seed-driven
+    test caught); `RaftKvNode::next_ceiling_candidate` is a **separate**
+    CAS ratchet for exactly this reason. See ADR 0018's PR2b amendment for
+    the full account, including the safety argument and the two
+    regressions this design's own gate run found. Regression:
+    `tests/ts_cache.rs`, `tests/snapshot_reads.rs`.
 - **Fences are per-entry, decided at apply, and backed by a pre-propose
   check.** Every replica's apply checks a command's key(s) against the fence
   **embedded in the log entry**, never a locally-polled value — so two
@@ -423,7 +503,7 @@ Emitted in this fixed order: `NarrowScope`/`WidenScope` → `Host` →
 
 ## Tests
 
-`cargo test -p animus-cp-data`. All 19 test binaries drive `SimEnv` — use
+`cargo test -p animus-cp-data`. All 24 test binaries drive `SimEnv` — use
 `run_for`/`run_until`, never `run()` (the driver has perpetual heartbeat/
 election timers). Linearizable reads are async (a read-barrier probe round), so
 drive them as spawned tasks + `run_for`, and never `block_on` a `tick()` whose
@@ -513,6 +593,32 @@ internally).
   restart (`Simulator::stop`, not the network-only `crash`/`restart` pair)
   re-witnesses its own recovered WAL, and the first write proposed after
   recovery is timestamped strictly past everything recovered.
+- `snapshot_reads.rs` (ADR 0018 §2/PR2b) — `read_at`/`scan_at` directly:
+  each sees exactly the version committed at or before `ts` (including a
+  value strictly between two writes' timestamps, and `scan_at` across
+  several keys); refused above the group's committed ceiling, then served
+  once a `linearizable_get` has driven the ceiling past it; a deposed/
+  partitioned leader's `read_at` returns not-served (outer `None`), never a
+  stale value — mirrors `read_index.rs`'s shape.
+- `ts_cache.rs` (ADR 0018 §2/PR2b) — the read-timestamp cache + logged read
+  ceiling integration properties (the rotation math itself is unit-tested
+  directly against `TsCache` in `src/ts_cache.rs`): a served read pushes
+  the next write's ts strictly above it; the load-bearing leader-change
+  test — leader A serves reads with its clock skewed 60s ahead, is
+  partitioned away, and leader B's subsequent write still lands strictly
+  above A's served-read ceiling, with a **negative control** proving a
+  bare, un-witnessed `Hlc` on B's own clock *would* have minted below it
+  (so the ceiling mechanism, not coincidental clock ordering, is what
+  saves it); ceiling proposals amortize (a handful, not one per read, over
+  hundreds of sequential reads, via a recording `MetricsHandle` and
+  `CpReadCeilingProposals`); a real node stays correct after thousands of
+  distinct-key reads via a single-voter group (majority = 1, so each read
+  barrier resolves at ~zero simulated cost). **Gotcha this file's own
+  history is the regression for**: never drive a linearizable read with a
+  per-call `run_for` budget when timing across *several* reads matters
+  (`run_for` always advances to its full deadline once idle), and never
+  `block_on` a linearizable read at all (see the root `docs/engineering-
+  lessons.md` Testing section for both).
 - `metrics.rs` (ADR 0015) — CP-plane observability counters move under a known
   workload, threading a recording `MetricsHandle` via `start_with_metrics`:
   the *real outcome* moves each counter (accepted vs. not-leader-rejected
