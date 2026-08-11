@@ -158,9 +158,21 @@ tr.selected { background: var(--surface2); }
 .stat-tile .value { font: 600 26px var(--font-mono); letter-spacing: -0.02em; }
 .stat-tile .sub { font: 400 12px var(--font-ui); color: var(--text3); margin-top: 4px; }
 
+/* A node id (ADR 0040 PR5): pre-ADR-0040 ids were short integers that never
+   overflowed a fixed-width column; a self-minted id is a 22-char base64url
+   string (`NodeId::mint`), so every id-bearing cell/label truncates with an
+   ellipsis instead of wrapping/overflowing its row — the full value is
+   always in the `title` tooltip (set by `idSpan()`, dashboard_core.js). The
+   base rule bounds to 100% of whatever width the call site's own class
+   (`.list-row .id`, `.replica-row .node`, …) already gives it; a handful of
+   contexts below widen that container so a *typical* minted id (22 chars)
+   mostly fits without eliding, reserving the ellipsis for a genuinely long
+   operator-proposed id. */
+.id-trunc { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: inline-block; vertical-align: bottom; }
+
 .list-row { display: flex; align-items: center; gap: 11px; padding: 9px 0; border-bottom: 1px solid var(--border); }
 .list-row:last-child { border-bottom: none; }
-.list-row .id { font: 500 12.5px var(--font-mono); width: 56px; }
+.list-row .id { font: 500 12.5px var(--font-mono); width: 92px; }
 .list-row .detail { font: 400 12px var(--font-ui); color: var(--text3); flex: 1; }
 .list-row .status-text { font: 500 11.5px var(--font-ui); }
 
@@ -178,7 +190,8 @@ tr.selected { background: var(--surface2); }
 .placement-card:hover { background: var(--surface2); }
 .placement-card.selected { background: var(--surface2); box-shadow: inset 0 0 0 1px var(--accent); }
 .placement-card .head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
-.placement-card .head .idw { display: flex; align-items: center; gap: 8px; font: 600 13.5px var(--font-mono); }
+.placement-card .head .idw { display: flex; align-items: center; gap: 8px; font: 600 13.5px var(--font-mono); min-width: 0; }
+.placement-card .head .idw .id-trunc { max-width: 120px; }
 .placement-card .status-text { font: 500 11px var(--font-ui); }
 .placement-card .labels { font: 400 11.5px var(--font-ui); color: var(--text3); margin-bottom: 8px; min-height: 1em; }
 .placement-card .foot { display: flex; gap: 12px; margin-top: 4px; padding-top: 11px; border-top: 1px solid var(--border); font: 400 11.5px var(--font-ui); color: var(--text2); }
@@ -192,8 +205,8 @@ tr.selected { background: var(--surface2); }
 .tablet-detail .sub { font: 400 12px var(--font-ui); color: var(--text3); margin-bottom: 16px; }
 .tablet-detail h3 { font: 600 11px var(--font-ui); color: var(--text3); margin: 0 0 9px; text-transform: none; }
 .tablet-detail .replica-row { display: flex; align-items: center; gap: 9px; padding: 7px 9px; background: var(--surface); border-radius: 6px; margin-bottom: 6px; }
-.tablet-detail .replica-row .node { font: 500 12px var(--font-mono); width: 44px; }
-.tablet-detail .replica-row .role { font: 500 11px var(--font-ui); width: 60px; }
+.tablet-detail .replica-row .node { font: 500 12px var(--font-mono); width: 72px; }
+.tablet-detail .replica-row .role { font: 500 11px var(--font-ui); width: 54px; }
 .tablet-detail .replica-row .meta { font: 400 10.5px var(--font-mono); color: var(--text3); }
 .tablet-detail .storage-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; font: 400 12px var(--font-ui); color: var(--text2); margin-bottom: 4px; }
 .tablet-detail .storage-grid.loading { color: var(--text3); font-style: italic; }

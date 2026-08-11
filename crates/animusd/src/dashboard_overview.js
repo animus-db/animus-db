@@ -5,8 +5,8 @@
 // admin console), a per-table breakdown (real data — the design's "Recent
 // activity" panel is dropped, since there is no backend event log to back
 // it), and a tablets-per-node balance chart. Depends on `dashboard_core.js`
-// having loaded first (STATE, $, esc, pill, dot, consoleLink, nodeIdOf,
-// nodeDisplayId, cpGroupsByTablet, tabletStatus, worstTabletStatus,
+// having loaded first (STATE, $, esc, pill, dot, idSpan, consoleLink,
+// nodeIdOf, nodeDisplayId, cpGroupsByTablet, tabletStatus, worstTabletStatus,
 // statusDotClass, computeHealth, activateTab).
 
 function renderOverview() {
@@ -126,7 +126,7 @@ function renderOverview() {
       };
     });
   const nodeRow = (r) => `<div class="list-row">${dot(r.up ? "ok-dot" : "bad-dot")}
-      <span class="id mono">${esc(r.id)}</span>
+      ${idSpan(r.id, "id mono")}
       <span class="muted" style="font-size:10px;text-transform:uppercase;letter-spacing:.03em">${esc(r.role)}</span>
       <span class="detail">${esc(r.detail)}</span>
       ${consoleLink(r.base, r.id)}
