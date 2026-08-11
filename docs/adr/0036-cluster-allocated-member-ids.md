@@ -1,9 +1,18 @@
 # ADR 0036 — Cluster-allocated member ids
 
-- **Status:** Accepted — implemented. Amends nothing (purely additive to ADR
-  0032). Amended by ADR 0037's hardening trio PR 3, which wires this
+- **Status:** Superseded by [ADR 0040](0040-self-minted-string-node-ids.md)
+  (2026-08-11). Amended by ADR 0037's hardening trio PR 3, which wired this
   allocator into `control-add` — see this doc's "Follow-on work" section
-  below for the pointer.
+  below for that pointer. **The whole mechanism this ADR describes is now
+  gone**: `MetaCommand::AllocateNodeId`, `Metadata.next_alloc_id`/
+  `node_id_allocations`, `ALLOC_ID_BASE`, `syskv::EntityKind::NodeIdAlloc`,
+  `config::synthetic_control_id_for`, and `generate_join_nonce`'s
+  OS-randomness exception are all deleted, replaced by self-minted string
+  `NodeId`s (`NodeId::mint`) plus a replicated registration
+  compare-and-swap (`MetaCommand::RegisterNode`) — see ADR 0040's Decisions
+  B and C. This doc is kept for historical context (the CAS-allocation
+  reasoning it argues for is exactly what ADR 0040 generalizes); do not
+  implement anything new against the design below.
 - **Date:** 2026-08-10
 
 ## Context
@@ -217,3 +226,33 @@ using `--node I`.
   member-collision and `ALLOC_ID_BASE` refusals skipped only for the id it
   just minted). See ADR 0037's "Coordination with ADR 0036" section for the
   mechanism. The system-keyspace half of this bullet remains open.
+
+## Superseded by ADR 0040
+
+[ADR 0040](0040-self-minted-string-node-ids.md) replaces this ADR's whole
+mechanism outright, in its own PR4: the monotonic `ALLOC_ID_BASE` counter +
+`node_id_allocations` idempotency ledger become a **self-minted, validated
+string** `NodeId` (`NodeId::mint`, two `Rng` draws base64url-encoded) plus a
+**replicated registration compare-and-swap** (`MetaCommand::RegisterNode`)
+instead of a monotonic-counter-plus-presence-check apply. The reasoning this
+ADR's Context section makes for CAS-style server-side allocation over a
+client-side guess carries over unchanged — ADR 0040 generalizes it rather
+than replacing the *argument*, only the mechanism: uniqueness no longer
+depends on ids being small dense integers from one counter, so the same
+CAS-style guarantee now works for an id space where any client can also
+*propose* its own durable name (this ADR's design had no room for that —
+every id was allocator-derived by construction).
+
+Also retired by ADR 0040 PR1 (which landed *before* PR4, since Option B did
+not require the string representation): `config::synthetic_control_id_for`'s
+top-bit placeholder-control-id trick this ADR's Decision section introduces.
+ADR 0040 unifies a node's control-Raft and data-plane identities into one id
+(Decision A) up front, so an allocated/minted join's id simply *is* its one
+identity — there is no second, control-side id space left to need a derived
+placeholder for.
+
+`generate_join_nonce`'s one deliberate `Env`-seam exception (this ADR's own
+"one deliberate `Env`-seam exception" section) is replaced by
+`animus_env::prod::PreBindRng` — a reusable, documented pre-bind entropy
+seam rather than a one-off function scoped to this allocator's single call
+site.

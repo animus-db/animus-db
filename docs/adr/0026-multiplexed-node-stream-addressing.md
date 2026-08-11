@@ -9,11 +9,20 @@
   (`CP_SIBLING_POOL`), and `cp_member_id`/`cp_base_id`/`cp_members_for`/
   `CP_SPLIT_ID_STRIDE` are **fully retired** for `animus-cp-data`/`animusd` —
   a tablet's CP group member id is simply its base `raftkv` id, at any split
-  depth. `animus-env`'s `Coresident` trait and its `SimEnv`/`ProdEnv` impls
-  are left in place (harmless, unused by this crate pair now) in case a
-  future capability needs the sub-trait pattern again; nothing in this
-  workspace currently calls `.sibling(...)`. See ADR 0028 for the shared-
-  storage decision Stage B's completion was bundled with.
+  depth. See ADR 0028 for the shared-storage decision Stage B's completion
+  was bundled with.
+  **Amended by [ADR 0040](0040-self-minted-string-node-ids.md) (2026-08-11):**
+  `(node, stream)` is now the **universal** address for every protocol
+  instance this codebase runs, not just the CP data plane — a combined
+  node's control-plane Raft rides `PRIMARY_STREAM` (stream 0) on the node's
+  one identity, exactly the same env every hosted tablet's group rides its
+  own stream on (ADR 0040 Decision A), closing the two-`ProdEnv`-per-node
+  split this ADR's Stage B work didn't itself touch. `animus-env`'s
+  `Coresident` trait and its `SimEnv`/`ProdEnv` impls (left in place by this
+  ADR "in case a future capability needs the sub-trait pattern again") were
+  **deleted outright** in ADR 0040 PR5 — the prediction that a future need
+  might revive them never materialized, and the stream axis this ADR
+  describes fully subsumed the one thing they were for.
 - **Date:** 2026-08-06
 
 ## Context

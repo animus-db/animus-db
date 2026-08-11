@@ -2,7 +2,10 @@
 
 - **Status:** Accepted — implemented in `animus-control`, `animusd`. Amends ADR
   0005/0012's placement + failure-detection reconciler and ADR 0029's automatic
-  rebalancer.
+  rebalancer. **Amended by [ADR 0040](0040-self-minted-string-node-ids.md)
+  (2026-08-11):** self-registration is now `MetaCommand::RegisterNode`'s
+  registration CAS, not a bare address-only proposal — see the amendment
+  section below.
 - **Date:** 2026-08-07
 
 ## Context
@@ -312,3 +315,20 @@ in production, plus a new admin API + CLI. This was a scope decision, not a
 safety one — nothing about this ADR's or ADR 0035's static-group design was
 wrong; ADR 0037 simply finishes the generalization ADR 0035 started for
 *discovery* (a `Remote`-style mirror) by also generalizing *reconfiguration*.
+
+## Amended by ADR 0040
+
+[ADR 0040](0040-self-minted-string-node-ids.md) replaces this ADR's
+"self-register" step (§1: a new node proposes its own `Member`/address entry)
+with `MetaCommand::RegisterNode`'s registration compare-and-swap — the *sole*
+claim path for a fresh node identity now, retiring the ADR 0036 allocator
+this ADR's own growth story once depended on for an unattended join. The
+`Down → Active` promotion chain this ADR establishes (§1) is completely
+unchanged: `RegisterNode` inserts exactly the same `Down` `Member` a bare
+self-registration always did, and the detector (ADR 0012) still requires a
+real heartbeat before promotion, regardless of which command created the
+row. What changes is only *how* a fresh identity gets claimed safely: a
+growth node now self-mints its own `NodeId` (or proposes an explicit one)
+and the replicated CAS — not a pre-bind address check — is what makes a
+collision structurally unreachable. This ADR's growth model (data-plane-only
+elasticity, a static control core) is otherwise untouched by ADR 0040.

@@ -12,10 +12,19 @@
   PR3's Consequences section left as future work. **PR6 (this amendment): a
   read-only admin browse surface** (`GET /admin/system-table` + a dashboard
   section) over the system keyspace this ADR built (see below).
-- **Date:** 2026-08-10 (PR3); amended 2026-08-10 (PR5); amended 2026-08-10 (PR6)
+- **Date:** 2026-08-10 (PR3); amended 2026-08-10 (PR5); amended 2026-08-10
+  (PR6); amended 2026-08-11 ([ADR 0040](0040-self-minted-string-node-ids.md))
 - **Amends:** ADR 0009 (in-house Raft over `Env`), ADR 0013 (replicated schema
   catalog), ADR 0028 (shared per-node storage), ADR 0031 (tablet-host
   reconciler + `metadata_watch`), ADR 0035 (control-plane separate deployment).
+- **Amended by ADR 0040 (2026-08-11):** `syskv::EntityKind::NodeIdAlloc` +
+  `node_id_alloc_key` (below, PR6's browse surface) are **removed** along
+  with the ADR 0036 allocator they mirrored — `RegisterNode`'s claim lives
+  entirely in the already-mirrored `Member`/`NodeAddrs` kinds now, no
+  separate ledger. Every `member_key`/`node_addrs_key`/`cp_member_addr_key`
+  (and every other syskv key touching a `NodeId`) encodes the id's **UTF-8
+  bytes**, not a fixed-width big-endian `u64` — see the "Value decode" /
+  `NodeIdAlloc` passages below, now historical for that one kind's shape.
 - **See also:** ADR 0039 works out this ADR's own Option B ("bootstrap system
   tablet," rejected below) in detail — design-only, not scheduled — and finds
   that its scaling payoff is gated on ADR 0018 (cross-tablet transactions),
