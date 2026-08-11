@@ -865,26 +865,26 @@ pub enum ClientResponse {
     },
 }
 
-/// Listen addresses for a node's endpoints (use port 0 for ephemeral): the
-/// control + **raftkv** (CP per-tablet Raft) internal `ProdEnv` roles + the client
-/// API + the DynamoDB HTTP and CQL endpoints. v1 (ADR 0019) is CP-only — the AP
-/// `data`/`coord` roles are gone.
+/// Listen addresses for a node's endpoints (use port 0 for ephemeral): one
+/// **internal** `ProdEnv` (ADR 0040 PR1 — one identity per node: the control
+/// Raft rides stream 0, every per-tablet Raft group its own stream ≥ 1) + the
+/// client API + the DynamoDB HTTP and CQL endpoints. v1 (ADR 0019) is
+/// CP-only — the AP `data`/`coord` roles are gone.
 ///
 /// **ADR 0035** adds [`role`](Self::role): a node declares whether it runs the
 /// control role, the data role, or both (`Both`, the default — and, before
-/// this ADR, the *only* shape). `control` and `raftkv` are therefore
-/// `Option` — `None` when the corresponding role isn't run (a data-only
-/// node has no `control` address; a control-only node has no `raftkv`
-/// address) — while `client`/`admin` (both roles serve them) and
-/// `dynamo`/`cql` (unused by a control-only node today, but already
-/// optional-by-default for older configs via `default_ephemeral_addr`, so
-/// there was no back-compat reason to change their type here) stay plain
-/// `SocketAddr`. See `crate::config::NodeRole` for the role-derived
-/// `ClusterConfig` helpers (`control_ids`/`raftkv_ids`/`control_peer_book`/
-/// `raftkv_peer_book`) that key off this field. This PR (ADR 0035 PR2) is the
-/// config layer only: every entry point still requires both `control` and
-/// `raftkv` to be `Some` (i.e. `Both`) — actually assembling a control-only
-/// or data-only *process* is PR3/PR4.
+/// this ADR, the *only* shape). `internal` is required for every role (a
+/// control-only node needs it for the control Raft; a data-only node needs it
+/// for its per-tablet Raft groups **and** for heartbeating the control group,
+/// ADR 0012) — only `dynamo`/`cql` stay meaningfully role-gated in practice
+/// (unused by a control-only node), and they stay plain `SocketAddr` as
+/// before. See `crate::config::NodeRole` for the role-derived `ClusterConfig`
+/// helpers (`control_ids`/`data_ids`/`peer_book`) that key off this field.
+///
+/// **Clean break (ADR 0040)**: this merges the pre-existing `control`/
+/// `raftkv` `Option<SocketAddr>` pair into this one required field — no
+/// wire/config back-compat with a pre-ADR-0040 deployment (fresh clusters
+/// required).
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct RoleAddrs {
     /// Which role(s) this node runs (ADR 0035). Defaults to
@@ -892,19 +892,11 @@ pub struct RoleAddrs {
     /// used before this field existed.
     #[serde(default)]
     pub role: config::NodeRole,
-    /// The control-plane Raft listen address. `None` for a data-only node
-    /// (ADR 0035); always `Some` for `Control`/`Both`. **Defaults to
-    /// `Some(ephemeral)`, not `None`, when the key is absent from JSON
-    /// entirely** — mirroring `dynamo`/`cql`/`admin`'s existing
-    /// "missing-in-an-old-config means ephemeral" contract below, so a
-    /// hand-truncated or pre-this-field config (which never declared `role`
-    /// either, hence defaults to `Both`) still means combined mode, not a
-    /// role/address mismatch. A JSON value of explicit `null` (which only a
-    /// role-aware writer, e.g. [`ClusterConfig::generate_split`], ever
-    /// produces) still deserializes to `None` — this default only applies
-    /// when the key is missing outright.
-    #[serde(default = "default_ephemeral_control_addr")]
-    pub control: Option<SocketAddr>,
+    /// This node's one internal `ProdEnv` listen address (ADR 0040 PR1): the
+    /// control-plane Raft (stream 0) and every per-tablet Raft group this
+    /// node hosts (stream = tablet id ≥ 1, ADR 0026) share it. Required for
+    /// every role.
+    pub internal: SocketAddr,
     pub client: SocketAddr,
     /// The DynamoDB JSON-over-HTTP endpoint. Defaults (when absent in older
     /// configs) to an ephemeral loopback port.
@@ -914,15 +906,6 @@ pub struct RoleAddrs {
     /// older configs) to an ephemeral loopback port.
     #[serde(default = "default_ephemeral_addr")]
     pub cql: SocketAddr,
-    /// The **leaderful CP** per-tablet Raft role's internal `ProdEnv` listen
-    /// address (ADR 0017 #3a) — the data plane. `None` for a control-only
-    /// node (ADR 0035); always `Some` for `Data`/`Both`. Same
-    /// missing-key-defaults-to-`Some(ephemeral)` back-compat reasoning as
-    /// `control` above (this is the field that actually matters for
-    /// back-compat: every pre-ADR-0017 config lacks `raftkv` entirely, and
-    /// must still mean "combined mode, give it an ephemeral raftkv port").
-    #[serde(default = "default_ephemeral_raftkv_addr")]
-    pub raftkv: Option<SocketAddr>,
     /// The **admin / debug** HTTP-JSON endpoint (ADR 0020) — a read-only
     /// introspection + operator-action surface on its own port, isolated from the
     /// client/dynamo/cql data edges. Defaults (when absent in older configs) to an
@@ -937,28 +920,13 @@ fn default_ephemeral_addr() -> SocketAddr {
     SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0)
 }
 
-/// `RoleAddrs.control`'s missing-key default (ADR 0035): `Some`, not `None`
-/// — see that field's doc.
-fn default_ephemeral_control_addr() -> Option<SocketAddr> {
-    Some(default_ephemeral_addr())
-}
-
-/// `RoleAddrs.raftkv`'s missing-key default (ADR 0035): `Some`, not `None`
-/// — see that field's doc.
-fn default_ephemeral_raftkv_addr() -> Option<SocketAddr> {
-    Some(default_ephemeral_addr())
-}
-
 /// A node whose listeners are bound but whose protocols are not yet started.
 /// Expose the bound addresses, assemble the cluster peer book, then
 /// [`start`](BoundNode::start).
 pub struct BoundNode {
-    control_id: NodeId,
-    raftkv_id: NodeId,
-    control_env: ProdEnv,
-    raftkv_env: ProdEnv,
-    control_addr: SocketAddr,
-    raftkv_addr: SocketAddr,
+    id: NodeId,
+    env: ProdEnv,
+    internal_addr: SocketAddr,
     client_listener: TcpListener,
     client_addr: SocketAddr,
     dynamo_listener: TcpListener,
@@ -974,22 +942,19 @@ pub struct BoundNode {
 /// onto every connection. The live CP-member address map is read from replicated
 /// `Metadata` at request time, not cached here.
 pub(crate) struct AdminInfo {
-    /// This node's control id, if it runs the control role (ADR 0035 PR4).
-    /// `None` on a **data-only** node (`ControlHandle::Remote`) — it has no
-    /// local control `RaftCore` at all, hence no control id of its own. Never
-    /// `None` for a control-only or combined-mode node — see
-    /// [`control_addr`](Self::control_addr)'s doc for the paired field.
-    pub(crate) control_id: Option<NodeId>,
-    /// This node's raftkv id, if it runs the data role (ADR 0035 PR3). `None`
-    /// on a control-only node, which never hosts a tablet.
-    pub(crate) raftkv_id: Option<NodeId>,
-    /// This node's control-plane Raft listen address, if it runs the control
-    /// role — see [`control_id`](Self::control_id)'s doc; `None` on a
-    /// data-only node for the identical reason.
-    pub(crate) control_addr: Option<SocketAddr>,
-    /// `None` on a control-only node (no `raftkv` env bound) — see
-    /// [`raftkv_id`](Self::raftkv_id)'s doc.
-    pub(crate) raftkv_addr: Option<SocketAddr>,
+    /// This node's one id (ADR 0040 PR1). `None` on a **data-only** node
+    /// (`ControlHandle::Remote`) — it has no local control `RaftCore`... but
+    /// under Option B a data-only node still has its own internal env/id, so
+    /// this is `None` only if this node has no internal role at all (never
+    /// happens today: every bound node has an id). Kept `Option` for the
+    /// admin-JSON call sites that used to distinguish "no control role"/"no
+    /// data role" — see [`internal_addr`](Self::internal_addr).
+    pub(crate) node_id: Option<NodeId>,
+    /// This node's one internal `ProdEnv` listen address (ADR 0040 PR1) —
+    /// carries the control Raft (stream 0) and every hosted tablet's Raft
+    /// group (stream ≥ 1). `None` only for a hand-built `AdminInfo` with no
+    /// internal role at all (doesn't occur in practice).
+    pub(crate) internal_addr: Option<SocketAddr>,
     pub(crate) client_addr: SocketAddr,
     /// `None` on a control-only node (the DynamoDB listener is never bound
     /// there, ADR 0035 PR3).
@@ -998,6 +963,12 @@ pub(crate) struct AdminInfo {
     /// ADR 0035 PR3).
     pub(crate) cql_addr: Option<SocketAddr>,
     pub(crate) admin_addr: SocketAddr,
+    /// This node's own deployment role (ADR 0035; ADR 0040 PR1 — no longer
+    /// inferred from `control_id`/`raftkv_id` presence, since there is only
+    /// one id now): `"control"`/`"data"`/`"combined"`, stamped literally by
+    /// whichever `start_*` assembled this node — the same string it also
+    /// self-registers into replicated `NodeAddrs.role`.
+    pub(crate) role: &'static str,
     /// The control-plane Raft group (all control ids).
     pub(crate) control_ids: Vec<NodeId>,
     /// The static peer address book this node was started with.
@@ -1036,12 +1007,9 @@ pub(crate) struct AdminInfo {
 /// [`Node::shutdown`] aborts all of it.
 ///
 /// `self_addrs` is `(id, addrs)` for this node's own `register_node_addrs`
-/// self-registration: a combined/data-role node registers under its
-/// **raftkv** id with a real `raftkv` address (the cluster's members are the
-/// raftkv ids); a control-only node has neither, so it registers under its
-/// **control** id with an empty `raftkv` field (parsed and skipped by every
-/// consumer that overlays `node_addrs[*].raftkv`, e.g. `peer_sync_loop` —
-/// "a peer entry whose address fails to parse is skipped").
+/// self-registration (ADR 0040 PR1: one id, one `internal` address, for
+/// every role — a control-only node registers a real `internal` address
+/// too, since it needs it for its own control Raft).
 #[allow(clippy::too_many_arguments)] // node assembly: control handle + edge + role + admin + routing
 fn spawn_common_tail(
     control: ControlHandle,
@@ -1101,13 +1069,10 @@ fn spawn_common_tail(
 }
 
 impl BoundNode {
-    /// `(control_id, addr)`, `(raftkv_id, addr)` — the entries this node
-    /// contributes to the cluster peer book (the two internal `ProdEnv` roles).
-    pub fn peer_entries(&self) -> [(NodeId, SocketAddr); 2] {
-        [
-            (self.control_id, self.control_addr),
-            (self.raftkv_id, self.raftkv_addr),
-        ]
+    /// `(id, addr)` — the one entry this node contributes to the cluster peer
+    /// book (ADR 0040 PR1: one identity, one internal `ProdEnv`, per node).
+    pub fn peer_entries(&self) -> [(NodeId, SocketAddr); 1] {
+        [(self.id, self.internal_addr)]
     }
 
     /// The address clients connect to.
@@ -1130,14 +1095,14 @@ impl BoundNode {
         self.admin_addr
     }
 
-    /// Wire the peer address book into every env and start all protocols, with
-    /// the CP group backed by the durable on-disk [`LsmEngine`]
-    /// ([`StorageBackend::Lsm`]). `control_ids` is the full control group.
-    /// Combined-mode-only convenience: derives the `data_raftkv_ids`
+    /// Wire the peer address book into the node's one env and start all
+    /// protocols, with the CP group backed by the durable on-disk
+    /// [`LsmEngine`] ([`StorageBackend::Lsm`]). `control_ids` is the full
+    /// control group. Combined-mode-only convenience: derives the `data_ids`
     /// [`start_with`](Self::start_with) now takes explicitly by assuming
-    /// every id in `control_ids` is also a data-role node's control id (true
-    /// for every caller of this simpler entry point — nothing calls it with
-    /// a split-role `control_ids`).
+    /// every id in `control_ids` is also a data-role node's id — trivially
+    /// true post-ADR-0040 (one identity per node) for every caller of this
+    /// simpler entry point.
     ///
     /// # Errors
     /// Propagates a failure to open the CP group's on-disk engine.
@@ -1147,14 +1112,11 @@ impl BoundNode {
         control_ids: Vec<NodeId>,
     ) -> std::io::Result<Node> {
         let admin_addr = self.admin_addr;
-        let data_raftkv_ids = control_ids
-            .iter()
-            .map(|&id| config::raftkv_id(id as usize))
-            .collect();
+        let data_ids = control_ids.clone();
         self.start_with(
             peers,
             control_ids,
-            data_raftkv_ids,
+            data_ids,
             StorageBackend::default(),
             ClusterEdgeState::new(),
             BTreeMap::new(),
@@ -1174,18 +1136,15 @@ impl BoundNode {
     /// (approximate) scoped-bytes trigger. Either, both, or neither may be
     /// `Some`; `(None, None)` (the default) disables auto-split entirely.
     ///
-    /// `data_raftkv_ids` (ADR 0035 PR2) is the set of `raftkv` ids
-    /// [`bootstrap`] auto-registers as `Active` data members — i.e. the ids
-    /// of nodes that actually run the **data** role. Before ADR 0035 this was
-    /// computed unconditionally as `(0..control_ids.len()).map(raftkv_id)`,
-    /// silently assuming every control-group index also ran the data role;
-    /// callers now compute it explicitly (in combined mode, still every
-    /// control id's paired `raftkv_id` — see [`ClusterConfig::raftkv_ids`] —
-    /// so combined-mode behavior is byte-for-byte unchanged). A growth/join
-    /// caller passes the **pre-growth** set here too, mirroring
-    /// `control_ids`: bootstrap must never auto-register a growth node itself
-    /// (it self-registers `Down` via `admin_add_member` instead, promoted to
-    /// `Active` by its own heartbeat — see `run_node_growth`'s doc).
+    /// `data_ids` is the set of ids [`bootstrap`] auto-registers as `Active`
+    /// data members — i.e. the ids of nodes that actually run the **data**
+    /// role. Callers compute it explicitly (in combined mode, every control
+    /// id is also a data id post-ADR-0040 — one identity per node — see
+    /// [`ClusterConfig::data_ids`]). A growth/join caller passes the
+    /// **pre-growth** set here too, mirroring `control_ids`: bootstrap must
+    /// never auto-register a growth node itself (it self-registers `Down`
+    /// via `admin_add_member` instead, promoted to `Active` by its own
+    /// heartbeat — see `run_node_growth`'s doc).
     ///
     /// # Errors
     /// Propagates a failure to open the CP group's on-disk engine (LSM backend
@@ -1195,7 +1154,7 @@ impl BoundNode {
         self,
         peers: BTreeMap<NodeId, SocketAddr>,
         control_ids: Vec<NodeId>,
-        data_raftkv_ids: Vec<NodeId>,
+        data_ids: Vec<NodeId>,
         backend: StorageBackend,
         edge: ClusterEdgeState,
         client_route: BTreeMap<NodeId, SocketAddr>,
@@ -1203,26 +1162,29 @@ impl BoundNode {
         auto_split_bytes_threshold: Option<u64>,
         cluster_admin_addrs: Vec<SocketAddr>,
     ) -> std::io::Result<Node> {
-        self.control_env.set_peers(peers.clone());
-        self.raftkv_env.set_peers(peers.clone());
-        // The initial (static) peer book + a `raftkv`-env clone, kept for the
-        // **peer-sync loop** (Phase 2.3a): it rebuilds the raftkv family's peer book
-        // as `static ∪ Metadata.cp_member_addrs` so a runtime-joined CP member
-        // becomes reachable.
+        self.env.set_peers(peers.clone());
+        // The initial (static) peer book + an env clone, kept for the
+        // **peer-sync loop** (ADR 0040 PR1: one identity per node, one
+        // shared internal env — this collapses the pre-PR1 `peer_sync_loop`/
+        // `control_peer_sync_loop` pair into one loop over one book): it
+        // rebuilds this node's env peer book as `static ∪ Metadata.
+        // cp_member_addrs ∪ Metadata.node_addrs[*].internal` so a
+        // runtime-joined member (CP group replica, split sibling, or
+        // runtime-added control voter alike) becomes reachable.
         let static_peers = peers;
-        let raftkv_sync_env = self.raftkv_env.clone();
-        // A `raftkv`-env clone for the per-node **tablet-host reconciler** (ADR
+        let sync_env = self.env.clone();
+        // An env clone for the per-node **tablet-host reconciler** (ADR
         // 0031 PR4): every tablet's group this node stands up runs on it,
-        // stream-addressed by tablet id (ADR 0026 Stage B) rather than a
-        // distinct per-tablet env/id.
-        let raftkv_hook_env = self.raftkv_env.clone();
-        // A `raftkv`-env clone for the **failure-detection heartbeat loop** (#3): each
-        // node heartbeats the control group *as its `raftkv` member id* (the cluster
-        // members are the `raftkv` ids), so the control plane's `detect_loop` marks a
-        // crashed CP node `Down`.
-        let raftkv_hb_env = self.raftkv_env.clone();
-        let my_raftkv_id = self.raftkv_id;
-        let my_raftkv_addr = self.raftkv_addr;
+        // stream-addressed by tablet id (ADR 0026 Stage B) — the same env
+        // that also carries the control-plane Raft on stream 0.
+        let hook_env = self.env.clone();
+        // An env clone for the **failure-detection heartbeat loop** (#3): each
+        // node heartbeats the control group *as its own member id* (the
+        // cluster members are node ids), so the control plane's `detect_loop`
+        // marks a crashed node `Down`.
+        let hb_env = self.env.clone();
+        let my_id = self.id;
+        let my_addr = self.internal_addr;
         // Captured here (all `SocketAddr`, `Copy`) for the node-address-book
         // self-registration below (ADR 0032 PR1) — `self.client_listener`/
         // `self.admin_listener` (not `Copy`) are moved into their `serve` tasks
@@ -1231,16 +1193,15 @@ impl BoundNode {
         let my_admin_addr = self.admin_addr;
 
         // The node's identity + bound addresses for the admin `/admin/config`
-        // view (ADR 0020), captured before the envs are consumed below.
+        // view (ADR 0020), captured before the env is consumed below.
         let admin_info = Arc::new(AdminInfo {
-            control_id: Some(self.control_id),
-            raftkv_id: Some(self.raftkv_id),
-            control_addr: Some(self.control_addr),
-            raftkv_addr: Some(self.raftkv_addr),
+            node_id: Some(self.id),
+            internal_addr: Some(self.internal_addr),
             client_addr: self.client_addr,
             dynamo_addr: Some(self.dynamo_addr),
             cql_addr: Some(self.cql_addr),
             admin_addr: self.admin_addr,
+            role: "combined",
             control_ids: control_ids.clone(),
             peers: static_peers.clone(),
             admin_addrs: if cluster_admin_addrs.is_empty() {
@@ -1252,17 +1213,18 @@ impl BoundNode {
             auto_split_bytes_threshold,
         });
 
-        // Keep clones of the two internal envs so [`Node::shutdown`] can abort
-        // every task they own (the two Raft drivers + accept loops), freeing their
-        // listener ports for a restart.
-        let envs = vec![self.control_env.clone(), self.raftkv_env.clone()];
+        // Keep a clone of the one internal env so [`Node::shutdown`] can abort
+        // every task it owns (both Raft drivers + the accept loop), freeing its
+        // listener port for a restart. ADR 0040 PR1: one shared env, so just
+        // one entry — kept as a `Vec` for shape-parity with the control-only/
+        // data-only `Node` variants (both single-env already).
+        let envs = vec![self.env.clone()];
 
-        // Capture the raftkv-role metrics sink before its env is consumed below.
-        // The control-plane sink is reached at request time via `raft.metrics()`
-        // (`RaftNode::start` records into `control_env.metrics()`); the CP group
-        // records into its own role env's sink. The `/metrics` endpoint aggregates
-        // both (ADR 0015).
-        let raftkv_metrics = self.raftkv_env.metrics();
+        // The one shared metrics sink (ADR 0040 PR1: control Raft and CP group
+        // now record into the *same* env's sink, not two distinct ones — see
+        // `ClientCtx::metrics_text`'s `is_same_sink` dedup). Captured before
+        // the env is consumed below.
+        let raftkv_metrics = self.env.metrics();
 
         // This node's **one shared storage engine** (ADR 0026/0028): every tablet
         // this node ever hosts — across every table — merges into it, confined by
@@ -1281,8 +1243,7 @@ impl BoundNode {
         // so it no longer needs a head start to win that race — see
         // `tablet_host_reconciler_loop`'s doc). No harm in keeping the order.
         let storage = match backend {
-            StorageBackend::Lsm => match LsmEngine::open(self.raftkv_env.clone(), LSM_PREFIX).await
-            {
+            StorageBackend::Lsm => match LsmEngine::open(self.env.clone(), LSM_PREFIX).await {
                 Ok(lsm) => SharedEngine::Lsm(lsm),
                 Err(e) => {
                     return Err(std::io::Error::other(format!(
@@ -1302,16 +1263,23 @@ impl BoundNode {
         // it), so no `StorageScope` wrapper is needed the way a per-tablet CP
         // group needs one — this is a genuinely global, node-wide keyspace,
         // not a per-tenant slice of one.
-        let control_metrics = self.control_env.metrics();
+        //
+        // ADR 0040 PR1: `RaftNode::start_with_metrics` gets its own clone of
+        // this node's one shared env — the control Raft rides stream 0
+        // (`PRIMARY_STREAM`, its `env.recv()`/`env.send()` default), and every
+        // per-tablet Raft group this node hosts rides its own tablet-id stream
+        // (≥ 1, ADR 0026) on a separate clone below, so the two never collide
+        // on the same inbox despite sharing one `NodeId`.
+        let control_metrics = self.env.metrics();
         let raft = match &storage {
             SharedEngine::Lsm(lsm) => RaftNode::start_with_metrics(
-                self.control_env,
+                self.env.clone(),
                 control_ids.clone(),
                 control_metrics,
                 lsm.clone(),
             ),
             SharedEngine::Mem(mem) => RaftNode::start_with_metrics(
-                self.control_env,
+                self.env.clone(),
                 control_ids.clone(),
                 control_metrics,
                 mem.clone(),
@@ -1354,7 +1322,7 @@ impl BoundNode {
         let data_role = DataRole {
             rmw_lock: Arc::new(tokio::sync::Mutex::new(())),
             raftkv_metrics,
-            base_id: my_raftkv_id,
+            base_id: my_id,
         };
         let (ctx, mut tasks) = spawn_common_tail(
             ControlHandle::Local(raft.clone()),
@@ -1363,18 +1331,12 @@ impl BoundNode {
             admin_info,
             client_route,
             (
-                my_raftkv_id,
+                my_id,
                 NodeAddrs {
-                    raftkv: my_raftkv_addr.to_string(),
+                    internal: my_addr.to_string(),
                     client: my_client_addr.to_string(),
                     admin: my_admin_addr.to_string(),
                     role: "combined".to_string(),
-                    // No control-Raft address here (ADR 0037 PR4): a
-                    // statically-configured voter's address comes from
-                    // `ClusterConfig` at every node's own bring-up, not this
-                    // self-registration — `control` exists only for a
-                    // runtime-added voter (`admin_add_control_member`).
-                    control: None,
                 },
             ),
             self.client_listener,
@@ -1398,15 +1360,15 @@ impl BoundNode {
         let reconciler = {
             let host_edge = edge.clone();
             let teardown_edge = edge.clone();
-            let base_id = my_raftkv_id;
+            let base_id = my_id;
             let on_teardown = move |tablet: TabletId| {
                 teardown_edge.unregister_raftkv(tablet, base_id);
             };
             match storage {
                 SharedEngine::Lsm(lsm) => CpReconciler::Lsm(Reconciler::new(
-                    raftkv_hook_env,
+                    hook_env,
                     lsm,
-                    my_raftkv_id,
+                    my_id,
                     table_scope_prefix,
                     move |tablet, node: &RaftKvNode<ProdEnv, LsmEngine<ProdEnv>>| {
                         host_edge.register_raftkv(tablet, CpGroup::Lsm(node.clone()));
@@ -1414,9 +1376,9 @@ impl BoundNode {
                     on_teardown,
                 )),
                 SharedEngine::Mem(mem) => CpReconciler::Mem(Reconciler::new(
-                    raftkv_hook_env,
+                    hook_env,
                     mem,
-                    my_raftkv_id,
+                    my_id,
                     table_scope_prefix,
                     move |tablet, node: &RaftKvNode<ProdEnv, MemoryEngine>| {
                         host_edge.register_raftkv(tablet, CpGroup::Mem(node.clone()));
@@ -1435,32 +1397,30 @@ impl BoundNode {
         // `shutdown` aborts all of it and releases the client/dynamo/cql
         // listener ports (these run on plain `tokio::spawn`, off the `Env`
         // network).
-        // ADR 0035 PR2: `data_raftkv_ids` is caller-supplied (see `start_with`'s
-        // doc) — no longer derived here from `control_ids.len()`, so a caller
+        // `data_ids` is caller-supplied (see `start_with`'s doc) — a caller
         // that scopes it to only the data-role nodes (or, for growth/join, the
         // pre-growth set) is respected exactly.
-        tasks.push(tokio::spawn(bootstrap(raft.clone(), data_raftkv_ids)));
+        tasks.push(tokio::spawn(bootstrap(raft.clone(), data_ids)));
 
-        // Peer-sync loop (Phase 2.3a): keep the raftkv family's peer book =
-        // `static ∪ Metadata.cp_member_addrs`, so a runtime-registered CP member
-        // (split sibling / joined node) becomes reachable for the group's internal
-        // Raft traffic. Runs on every node (harmless where no CP group is hosted).
+        // Peer-sync loop (ADR 0040 PR1: one loop over one shared env — this
+        // collapses the pre-PR1 `peer_sync_loop`/`control_peer_sync_loop`
+        // pair): keep this node's env peer book = `static ∪ Metadata.
+        // cp_member_addrs ∪ Metadata.node_addrs[*].internal`, so a
+        // runtime-registered member (split sibling / joined node / a control
+        // voter added at runtime) becomes reachable for both the control
+        // Raft and this node's per-tablet Raft groups alike (same env, same
+        // book). Runs on every node.
         tasks.push(tokio::spawn(peer_sync_loop(
             ctx.clone(),
-            raftkv_sync_env,
+            sync_env,
             static_peers.clone(),
         )));
 
-        // Control-role peer-sync loop (ADR 0037 PR4): the peer_sync_loop
-        // above's dual for the control env — keeps this node able to reach
-        // any control voter added at runtime. See its own doc.
-        tasks.push(tokio::spawn(control_peer_sync_loop(ctx.clone())));
-
         // **Control-plane-follower-less growth node mirror** (ADR 0030): this
         // node's own control role is a genuine voter of `control_ids` iff its own
-        // control id is *in* that set — the common case for every node started
+        // id is *in* that set — the common case for every node started
         // the normal way (`start`/`run_node_with`/`start_cluster_*`, which always
-        // pass a `control_ids` that includes `self.control_id`). A node started
+        // pass a `control_ids` that includes `self.id`). A node started
         // via `run_node_growth` deliberately passes the **pre-growth** control
         // group instead (it "needs no control-voter slot" — see that fn's doc),
         // so its own `RaftCore` permanently sits outside `control_ids`: it can
@@ -1474,7 +1434,7 @@ impl BoundNode {
         // node it lists) into `ctx.remote_metadata`, read via
         // `effective_metadata()`. A no-op (empty seed list, loop returns
         // immediately) for every other node.
-        if !control_ids.contains(&self.control_id) {
+        if !control_ids.contains(&self.id) {
             let seeds: Vec<SocketAddr> = control_ids
                 .iter()
                 .filter_map(|id| ctx.route_addr(*id))
@@ -1496,7 +1456,7 @@ impl BoundNode {
             // rather than the only path a growth node has in.
             {
                 let ctx = ctx.clone();
-                let node = my_raftkv_id;
+                let node = my_id;
                 tasks.push(tokio::spawn(async move {
                     let _ = ctx.admin_add_member(node, BTreeMap::new()).await;
                 }));
@@ -1504,10 +1464,10 @@ impl BoundNode {
         }
 
         // **Failure-detection heartbeat loop** (#3 / ADR 0012): every node heartbeats
-        // the control group *as its `raftkv` member id* (the cluster members are the
-        // `raftkv` ids, registered by `bootstrap`), so the control leader's
-        // `detect_loop` marks a crashed CP node `Down`. Runs on every node; the
-        // raftkv peer book includes the control addrs (the static book), so the
+        // the control group *as its own member id* (the cluster members are
+        // node ids, registered by `bootstrap`), so the control leader's
+        // `detect_loop` marks a crashed node `Down`. Runs on every node; the
+        // peer book includes the control addrs (the static book), so the
         // heartbeats reach the control group. **Live destinations (ADR 0037
         // closing PR)**: `heartbeat_loop_live` re-derives the target list from
         // `ctx.control.config()` each tick (falling back to this node's own
@@ -1516,7 +1476,7 @@ impl BoundNode {
         // needing this node to restart — see that function's doc.
         tasks.push(tokio::spawn(heartbeat_loop_live(
             ctx.clone(),
-            raftkv_hb_env,
+            hb_env,
             control_ids,
         )));
 
@@ -1610,53 +1570,21 @@ pub struct Node {
 }
 
 impl Node {
-    /// Bind this node's listeners (the control + raftkv internal envs + the client
-    /// TCP server + the DynamoDB HTTP and CQL endpoints) and create its data
-    /// directory.
-    ///
-    /// This PR (ADR 0035 PR2) is the config layer only: `Node::bind` still
-    /// unconditionally requires both a control and a raftkv address (i.e.
-    /// `addrs.role` must be [`Both`](config::NodeRole::Both), today's only
-    /// real shape) — a control-only or data-only `RoleAddrs` fails cleanly
-    /// here rather than binding a wrong/missing listener. Dedicated
-    /// control-only/data-only bind paths that only bind what each role needs
-    /// are PR3/PR4.
+    /// Bind this node's listeners (the one internal env + the client TCP
+    /// server + the DynamoDB HTTP and CQL endpoints) and create its data
+    /// directory (ADR 0040 PR1: one identity, one internal `ProdEnv`, per
+    /// node — the control Raft and every per-tablet Raft group this node
+    /// hosts share it, disambiguated by stream, ADR 0026).
     ///
     /// # Errors
-    /// Returns `InvalidInput` if `addrs` is missing the `control` or `raftkv`
-    /// address this combined-mode bind requires, or propagates any bind /
-    /// directory-creation failure.
+    /// Propagates any bind / directory-creation failure.
     pub async fn bind(
-        control_id: NodeId,
-        raftkv_id: NodeId,
+        id: NodeId,
         addrs: RoleAddrs,
         data_dir: impl Into<PathBuf>,
     ) -> std::io::Result<BoundNode> {
         let dir = data_dir.into();
-        let control_listen = addrs.control.ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Node::bind requires a control address (RoleAddrs.control is None — \
-                 a control-only/data-only split-deployment node isn't bindable through \
-                 this combined-mode path yet, ADR 0035 PR3/PR4)",
-            )
-        })?;
-        let (control_env, control_addr) =
-            ProdEnv::bind(control_id, control_listen, dir.join("control")).await?;
-        // The leaderful CP per-tablet Raft role's internal env (ADR 0017 #3a) — the
-        // v1 data plane; distinct id/port/dir from the control role (single-consumer
-        // inbox). Since ADR 0026 Stage B every tablet this node hosts shares this
-        // **one** env, addressed by `stream` (the tablet id) — no more per-tablet
-        // sibling inbox to pre-bind (`Coresident`/`CP_SIBLING_POOL` are gone).
-        let raftkv_listen = addrs.raftkv.ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Node::bind requires a raftkv address (RoleAddrs.raftkv is None — \
-                 see the control-address error above)",
-            )
-        })?;
-        let (raftkv_env, raftkv_addr) =
-            ProdEnv::bind(raftkv_id, raftkv_listen, dir.join("raftkv")).await?;
+        let (env, internal_addr) = ProdEnv::bind(id, addrs.internal, dir.join("internal")).await?;
         let client_listener = TcpListener::bind(addrs.client).await?;
         let client_addr = client_listener.local_addr()?;
         let dynamo_listener = TcpListener::bind(addrs.dynamo).await?;
@@ -1666,12 +1594,9 @@ impl Node {
         let admin_listener = TcpListener::bind(addrs.admin).await?;
         let admin_addr = admin_listener.local_addr()?;
         Ok(BoundNode {
-            control_id,
-            raftkv_id,
-            control_env,
-            raftkv_env,
-            control_addr,
-            raftkv_addr,
+            id,
+            env,
+            internal_addr,
             client_listener,
             client_addr,
             dynamo_listener,
@@ -1683,39 +1608,28 @@ impl Node {
         })
     }
 
-    /// Bind a **control-only** node's listeners (ADR 0035 PR3): the control
-    /// internal `ProdEnv` role plus the client + admin TCP listeners only —
-    /// no `raftkv` env, no dynamo/cql listeners. `addrs.control` must be
-    /// `Some` (a data-only `RoleAddrs` fails cleanly here); `addrs.raftkv` is
-    /// ignored (a mixed-topology config's data-role entries carry one, but a
-    /// control-role entry's own `raftkv` field — `None`, since
-    /// `ClusterConfig::generate_split` sets it that way — is never consulted).
+    /// Bind a **control-only** node's listeners (ADR 0035 PR3): the internal
+    /// `ProdEnv` (control Raft only — it hosts no tablet, so no stream ever
+    /// rides above 0) plus the client + admin TCP listeners only — no
+    /// dynamo/cql listeners.
     ///
     /// # Errors
-    /// Returns `InvalidInput` if `addrs.control` is `None`, or propagates any
-    /// bind / directory-creation failure.
+    /// Propagates any bind / directory-creation failure.
     pub async fn bind_control(
-        control_id: NodeId,
+        id: NodeId,
         addrs: RoleAddrs,
         data_dir: impl Into<PathBuf>,
     ) -> std::io::Result<BoundControlNode> {
         let dir = data_dir.into();
-        let control_listen = addrs.control.ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Node::bind_control requires a control address (RoleAddrs.control is None)",
-            )
-        })?;
-        let (control_env, control_addr) =
-            ProdEnv::bind(control_id, control_listen, dir.join("control")).await?;
+        let (env, internal_addr) = ProdEnv::bind(id, addrs.internal, dir.join("internal")).await?;
         let client_listener = TcpListener::bind(addrs.client).await?;
         let client_addr = client_listener.local_addr()?;
         let admin_listener = TcpListener::bind(addrs.admin).await?;
         let admin_addr = admin_listener.local_addr()?;
         Ok(BoundControlNode {
-            control_id,
-            control_env,
-            control_addr,
+            id,
+            env,
+            internal_addr,
             client_listener,
             client_addr,
             admin_listener,
@@ -1723,33 +1637,21 @@ impl Node {
         })
     }
 
-    /// Bind a **data-only** node's listeners (ADR 0035 PR4): the `raftkv`
-    /// internal `ProdEnv` role plus the client/dynamo/cql/admin TCP
-    /// listeners — no control env at all (a data-only node holds no local
-    /// control `RaftCore`, `Node::bind_control`'s exact dual). `addrs.raftkv`
-    /// must be `Some` (a control-only `RoleAddrs` fails cleanly here);
-    /// `addrs.control` is ignored (a mixed-topology config's control-role
-    /// entries carry one, but a data-role entry's own `control` field —
-    /// `None`, since `ClusterConfig::generate_split` sets it that way — is
-    /// never consulted).
+    /// Bind a **data-only** node's listeners (ADR 0035 PR4): the internal
+    /// `ProdEnv` (every per-tablet Raft group this node hosts, plus its own
+    /// failure-detection heartbeats to the control group — no local control
+    /// `RaftCore` at all, `Node::bind_control`'s exact dual) plus the
+    /// client/dynamo/cql/admin TCP listeners.
     ///
     /// # Errors
-    /// Returns `InvalidInput` if `addrs.raftkv` is `None`, or propagates any
-    /// bind / directory-creation failure.
+    /// Propagates any bind / directory-creation failure.
     pub async fn bind_data(
-        raftkv_id: NodeId,
+        id: NodeId,
         addrs: RoleAddrs,
         data_dir: impl Into<PathBuf>,
     ) -> std::io::Result<BoundDataNode> {
         let dir = data_dir.into();
-        let raftkv_listen = addrs.raftkv.ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Node::bind_data requires a raftkv address (RoleAddrs.raftkv is None)",
-            )
-        })?;
-        let (raftkv_env, raftkv_addr) =
-            ProdEnv::bind(raftkv_id, raftkv_listen, dir.join("raftkv")).await?;
+        let (env, internal_addr) = ProdEnv::bind(id, addrs.internal, dir.join("internal")).await?;
         let client_listener = TcpListener::bind(addrs.client).await?;
         let client_addr = client_listener.local_addr()?;
         let dynamo_listener = TcpListener::bind(addrs.dynamo).await?;
@@ -1759,9 +1661,9 @@ impl Node {
         let admin_listener = TcpListener::bind(addrs.admin).await?;
         let admin_addr = admin_listener.local_addr()?;
         Ok(BoundDataNode {
-            raftkv_id,
-            raftkv_env,
-            raftkv_addr,
+            id,
+            env,
+            internal_addr,
             client_listener,
             client_addr,
             dynamo_listener,
@@ -1975,16 +1877,16 @@ async fn wait_all_finished(tasks: &[tokio::task::JoinHandle<()>]) {
 const CP_GC_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A **control-only** node (ADR 0035 PR3) whose listeners are bound but not
-/// yet started — the control-only counterpart of [`BoundNode`]. Binds only
-/// the control internal `ProdEnv` role plus the client + admin TCP
-/// listeners; no `raftkv` env, no dynamo/cql listeners, no CP storage engine
-/// (a control node never hosts a tablet or speaks a data-plane wire
-/// protocol). See [`Node::bind_control`] to construct one and
+/// yet started — the control-only counterpart of [`BoundNode`]. Binds the
+/// one internal `ProdEnv` (ADR 0040 PR1) plus the client + admin TCP
+/// listeners; no dynamo/cql listeners, no CP storage engine (a control node
+/// never hosts a tablet or speaks a data-plane wire protocol). See
+/// [`Node::bind_control`] to construct one and
 /// [`start_control_with`](Self::start_control_with) to start it.
 pub struct BoundControlNode {
-    control_id: NodeId,
-    control_env: ProdEnv,
-    control_addr: SocketAddr,
+    id: NodeId,
+    env: ProdEnv,
+    internal_addr: SocketAddr,
     client_listener: TcpListener,
     client_addr: SocketAddr,
     admin_listener: TcpListener,
@@ -1999,7 +1901,7 @@ impl BoundControlNode {
 
     /// The control-plane Raft listen address.
     pub fn control_addr(&self) -> SocketAddr {
-        self.control_addr
+        self.internal_addr
     }
 
     /// The address the admin / debug HTTP endpoint listens on (ADR 0020).
@@ -2007,11 +1909,9 @@ impl BoundControlNode {
         self.admin_addr
     }
 
-    /// `(control_id, addr)` — this node's entry in the cluster's *control*
-    /// peer book (the `BoundNode::peer_entries` dual, minus the `raftkv`
-    /// entry a control-only node has none of).
+    /// `(id, addr)` — this node's entry in the cluster's peer book.
     pub fn peer_entry(&self) -> (NodeId, SocketAddr) {
-        (self.control_id, self.control_addr)
+        (self.id, self.internal_addr)
     }
 
     /// Wire the peer address book into the control env and start the control
@@ -2065,20 +1965,19 @@ impl BoundControlNode {
         cluster_admin_addrs: Vec<SocketAddr>,
         backend: StorageBackend,
     ) -> std::io::Result<Node> {
-        self.control_env.set_peers(peers.clone());
-        let envs = vec![self.control_env.clone()];
+        self.env.set_peers(peers.clone());
+        let envs = vec![self.env.clone()];
 
         let admin_info = Arc::new(AdminInfo {
-            control_id: Some(self.control_id),
-            raftkv_id: None,
-            control_addr: Some(self.control_addr),
-            raftkv_addr: None,
+            node_id: Some(self.id),
+            internal_addr: Some(self.internal_addr),
             client_addr: self.client_addr,
             dynamo_addr: None,
             cql_addr: None,
             admin_addr: self.admin_addr,
+            role: "control",
             control_ids: control_ids.clone(),
-            peers,
+            peers: peers.clone(),
             admin_addrs: if cluster_admin_addrs.is_empty() {
                 vec![self.admin_addr]
             } else {
@@ -2088,12 +1987,13 @@ impl BoundControlNode {
             auto_split_bytes_threshold: None,
         });
 
-        let control_metrics = self.control_env.metrics();
-        // A control-only node has only its own `control` env/dir to open a
-        // dedicated engine on (no separate `raftkv` env the way combined mode
-        // reuses) — clone it for the engine, keep the original for the
-        // `RaftNode` itself.
-        let engine_env = self.control_env.clone();
+        let control_metrics = self.env.metrics();
+        // A control-only node has only its own one env/dir to open a
+        // dedicated engine on — clone it for the engine, keep the original
+        // for the `RaftNode` itself.
+        let engine_env = self.env.clone();
+        // Keep a clone for peer-sync (below) before the env is consumed.
+        let sync_env = self.env.clone();
         // Keep a clone of this control-only node's dedicated engine for admin
         // introspection (`/admin/storage/control`, ADR 0038 PR4) — a second,
         // read-only handle onto the same live engine; the apply task's own
@@ -2103,7 +2003,7 @@ impl BoundControlNode {
             StorageBackend::Lsm => match LsmEngine::open(engine_env, SYSKV_LSM_PREFIX).await {
                 Ok(lsm) => (
                     RaftNode::start_with_metrics(
-                        self.control_env,
+                        self.env,
                         control_ids.clone(),
                         control_metrics,
                         lsm.clone(),
@@ -2120,7 +2020,7 @@ impl BoundControlNode {
                 let mem = MemoryEngine::new();
                 (
                     RaftNode::start_with_metrics(
-                        self.control_env,
+                        self.env,
                         control_ids.clone(),
                         control_metrics,
                         mem.clone(),
@@ -2144,16 +2044,12 @@ impl BoundControlNode {
             admin_info,
             client_route,
             (
-                self.control_id,
+                self.id,
                 NodeAddrs {
-                    raftkv: String::new(),
+                    internal: self.internal_addr.to_string(),
                     client: self.client_addr.to_string(),
                     admin: self.admin_addr.to_string(),
                     role: "control".to_string(),
-                    // Same reasoning as the combined-mode self-registration
-                    // above: statically-configured, so its address comes
-                    // from `ClusterConfig`, not this call (ADR 0037 PR4).
-                    control: None,
                 },
             ),
             self.client_listener,
@@ -2161,10 +2057,10 @@ impl BoundControlNode {
             Some(control_storage),
         );
 
-        // Control-role peer-sync loop (ADR 0037 PR4) — see its own doc; a
-        // control-only node needs it exactly as much as a combined node
-        // does (both hold a genuine `ControlHandle::Local`).
-        tasks.push(tokio::spawn(control_peer_sync_loop(ctx.clone())));
+        // Peer-sync loop (ADR 0040 PR1) — a control-only node needs it
+        // exactly as much as a combined node does, to reach a runtime-added
+        // control voter's address.
+        tasks.push(tokio::spawn(peer_sync_loop(ctx.clone(), sync_env, peers)));
 
         Ok(Node {
             raft: ControlHandle::Local(raft),
@@ -2181,14 +2077,14 @@ impl BoundControlNode {
 
 /// A **data-only** node (ADR 0035 PR4) whose listeners are bound but not yet
 /// started — the data-only counterpart of [`BoundNode`] (which is
-/// [`BoundControlNode`]'s own dual). Binds only the `raftkv` internal
-/// `ProdEnv` role plus the client/dynamo/cql/admin TCP listeners; no control
-/// env, no local control `RaftCore`, no bootstrap. See [`Node::bind_data`] to
+/// [`BoundControlNode`]'s own dual). Binds the one internal `ProdEnv` (ADR
+/// 0040 PR1) plus the client/dynamo/cql/admin TCP listeners; no local
+/// control `RaftCore`, no bootstrap. See [`Node::bind_data`] to
 /// construct one and [`start_data_with`](Self::start_data_with) to start it.
 pub struct BoundDataNode {
-    raftkv_id: NodeId,
-    raftkv_env: ProdEnv,
-    raftkv_addr: SocketAddr,
+    id: NodeId,
+    env: ProdEnv,
+    internal_addr: SocketAddr,
     client_listener: TcpListener,
     client_addr: SocketAddr,
     dynamo_listener: TcpListener,
@@ -2220,11 +2116,11 @@ impl BoundDataNode {
         self.admin_addr
     }
 
-    /// `(raftkv_id, addr)` — this node's entry in the cluster's *raftkv* peer
+    /// `(id, addr)` — this node's entry in the cluster's *raftkv* peer
     /// book (the [`BoundNode::peer_entries`] dual, minus the `control` entry
     /// a data-only node has none of).
     pub fn peer_entry(&self) -> (NodeId, SocketAddr) {
-        (self.raftkv_id, self.raftkv_addr)
+        (self.id, self.internal_addr)
     }
 
     /// Wire the peer address book into the `raftkv` env and start the data
@@ -2275,27 +2171,26 @@ impl BoundDataNode {
         auto_split_bytes_threshold: Option<u64>,
         cluster_admin_addrs: Vec<SocketAddr>,
     ) -> std::io::Result<Node> {
-        self.raftkv_env.set_peers(peers.clone());
+        self.env.set_peers(peers.clone());
         let static_peers = peers;
-        let raftkv_sync_env = self.raftkv_env.clone();
-        let raftkv_hook_env = self.raftkv_env.clone();
-        let raftkv_hb_env = self.raftkv_env.clone();
-        let my_raftkv_id = self.raftkv_id;
-        let my_raftkv_addr = self.raftkv_addr;
+        let sync_env = self.env.clone();
+        let hook_env = self.env.clone();
+        let hb_env = self.env.clone();
+        let my_id = self.id;
+        let my_addr = self.internal_addr;
         let my_client_addr = self.client_addr;
         let my_admin_addr = self.admin_addr;
 
         let control = ControlHandle::Remote(RemoteControlClient::new(control_seeds.clone()));
 
         let admin_info = Arc::new(AdminInfo {
-            control_id: None,
-            raftkv_id: Some(self.raftkv_id),
-            control_addr: None,
-            raftkv_addr: Some(self.raftkv_addr),
+            node_id: Some(self.id),
+            internal_addr: Some(self.internal_addr),
             client_addr: self.client_addr,
             dynamo_addr: Some(self.dynamo_addr),
             cql_addr: Some(self.cql_addr),
             admin_addr: self.admin_addr,
+            role: "data",
             control_ids: control_ids.clone(),
             peers: static_peers.clone(),
             admin_addrs: if cluster_admin_addrs.is_empty() {
@@ -2307,14 +2202,13 @@ impl BoundDataNode {
             auto_split_bytes_threshold,
         });
 
-        let envs = vec![self.raftkv_env.clone()];
-        let raftkv_metrics = self.raftkv_env.metrics();
+        let envs = vec![self.env.clone()];
+        let raftkv_metrics = self.env.metrics();
 
         // Same shared-engine assembly as `BoundNode::start_with` — see that
         // method's doc.
         let storage = match backend {
-            StorageBackend::Lsm => match LsmEngine::open(self.raftkv_env.clone(), LSM_PREFIX).await
-            {
+            StorageBackend::Lsm => match LsmEngine::open(self.env.clone(), LSM_PREFIX).await {
                 Ok(lsm) => SharedEngine::Lsm(lsm),
                 Err(e) => {
                     return Err(std::io::Error::other(format!(
@@ -2328,7 +2222,7 @@ impl BoundDataNode {
         let data_role = DataRole {
             rmw_lock: Arc::new(tokio::sync::Mutex::new(())),
             raftkv_metrics,
-            base_id: my_raftkv_id,
+            base_id: my_id,
         };
         let (ctx, mut tasks) = spawn_common_tail(
             control,
@@ -2337,15 +2231,12 @@ impl BoundDataNode {
             admin_info,
             client_route,
             (
-                my_raftkv_id,
+                my_id,
                 NodeAddrs {
-                    raftkv: my_raftkv_addr.to_string(),
+                    internal: my_addr.to_string(),
                     client: my_client_addr.to_string(),
                     admin: my_admin_addr.to_string(),
                     role: "data".to_string(),
-                    // A data-only node has no control role at all (ADR 0037
-                    // PR4's `control` field is moot here).
-                    control: None,
                 },
             ),
             self.client_listener,
@@ -2360,15 +2251,15 @@ impl BoundDataNode {
         let reconciler = {
             let host_edge = edge.clone();
             let teardown_edge = edge.clone();
-            let base_id = my_raftkv_id;
+            let base_id = my_id;
             let on_teardown = move |tablet: TabletId| {
                 teardown_edge.unregister_raftkv(tablet, base_id);
             };
             match storage {
                 SharedEngine::Lsm(lsm) => CpReconciler::Lsm(Reconciler::new(
-                    raftkv_hook_env,
+                    hook_env,
                     lsm,
-                    my_raftkv_id,
+                    my_id,
                     table_scope_prefix,
                     move |tablet, node: &RaftKvNode<ProdEnv, LsmEngine<ProdEnv>>| {
                         host_edge.register_raftkv(tablet, CpGroup::Lsm(node.clone()));
@@ -2376,9 +2267,9 @@ impl BoundDataNode {
                     on_teardown,
                 )),
                 SharedEngine::Mem(mem) => CpReconciler::Mem(Reconciler::new(
-                    raftkv_hook_env,
+                    hook_env,
                     mem,
-                    my_raftkv_id,
+                    my_id,
                     table_scope_prefix,
                     move |tablet, node: &RaftKvNode<ProdEnv, MemoryEngine>| {
                         host_edge.register_raftkv(tablet, CpGroup::Mem(node.clone()));
@@ -2395,7 +2286,7 @@ impl BoundDataNode {
 
         tasks.push(tokio::spawn(peer_sync_loop(
             ctx.clone(),
-            raftkv_sync_env,
+            sync_env,
             static_peers.clone(),
         )));
 
@@ -2415,7 +2306,7 @@ impl BoundDataNode {
         // broadcast tiers are this node's *only* path to the real cluster.
         {
             let ctx = ctx.clone();
-            let node = my_raftkv_id;
+            let node = my_id;
             tasks.push(tokio::spawn(async move {
                 let _ = ctx.admin_add_member(node, BTreeMap::new()).await;
             }));
@@ -2428,7 +2319,7 @@ impl BoundDataNode {
         // seed until the first one lands.
         tasks.push(tokio::spawn(heartbeat_loop_live(
             ctx.clone(),
-            raftkv_hb_env,
+            hb_env,
             control_ids,
         )));
 
@@ -4193,19 +4084,21 @@ impl ClientCtx {
     /// Render this node's **live** metrics as the ADR 0015 text export
     /// (`name value` lines), aggregated across the node's role sink(s).
     ///
-    /// A combined-mode/data-role node runs two internal `ProdEnv` roles on
-    /// distinct ids — control (Raft) and raftkv (the CP group) — and each
-    /// records into its **own** sink (`RaftNode::start` records into the
-    /// control env's sink; the CP group into the raftkv env's). A
-    /// control-only node (ADR 0035 PR3) has only the control sink — there is
-    /// no raftkv env to aggregate. This sums whichever sink(s) exist
-    /// counter-by-counter and takes the max of the leadership gauge
-    /// (leadership is the control plane's, recorded only in the control
-    /// sink). The snapshots are read **at call time**, so the export reflects
-    /// current activity rather than a cached value.
+    /// A combined node (ADR 0040 PR1: one identity, one internal `ProdEnv`
+    /// per node) records the control Raft and the CP group into the **same**
+    /// sink now — `self.control.metrics()` and `data.raftkv_metrics` are the
+    /// identical handle there, so this only pushes the raftkv-role snapshot
+    /// when it is a genuinely distinct sink (a `ControlHandle::Remote`
+    /// data-only node, whose `metrics()` is a permanent no-op) — else summing
+    /// would double-count every counter. A control-only node (ADR 0035 PR3)
+    /// has only the control sink — there is no data role to aggregate. The
+    /// snapshots are read **at call time**, so the export reflects current
+    /// activity rather than a cached value.
     pub(crate) fn metrics_text(&self) -> String {
         let mut snaps = vec![self.control.metrics().snapshot()];
-        if let Some(data) = &self.data {
+        if let Some(data) = &self.data
+            && !data.raftkv_metrics.is_same_sink(self.control.metrics())
+        {
             snaps.push(data.raftkv_metrics.snapshot());
         }
         let mut counters: BTreeMap<Metric, u64> = BTreeMap::new();
@@ -4237,7 +4130,9 @@ impl ClientCtx {
     /// sink(s), exactly as the text export.
     pub(crate) fn metrics_json(&self) -> (BTreeMap<String, u64>, i64) {
         let mut snaps = vec![self.control.metrics().snapshot()];
-        if let Some(data) = &self.data {
+        if let Some(data) = &self.data
+            && !data.raftkv_metrics.is_same_sink(self.control.metrics())
+        {
             snaps.push(data.raftkv_metrics.snapshot());
         }
         let mut counters: BTreeMap<String, u64> = BTreeMap::new();
@@ -4365,11 +4260,12 @@ impl ClientCtx {
     /// the actual authority (a race between two admin callers is still
     /// resolved there, deterministically, same as every other CAS-style
     /// command in this codebase):
-    /// - `node`'s paired **control** id (`node - RAFTKV_ID_BASE`, guarded
-    ///   against underflow for a `node` below the base) is a **currently
-    ///   live** control-plane voter (ADR 0037 — this reads `self.control.
-    ///   config()`, the live Raft config, **not** a static original-members
-    ///   list). Before ADR 0037 the control group was static (ADR 0030) and
+    /// - `node` is itself a **currently live** control-plane voter (ADR 0037
+    ///   — this reads `self.control.config()`, the live Raft config, **not**
+    ///   a static original-members list; ADR 0040 PR1 removed the old
+    ///   raftkv-id-to-control-id arithmetic bridge — a node has only one id
+    ///   now, so this is a direct membership check). Before ADR 0037 the
+    ///   control group was static (ADR 0030) and
     ///   this check read `self.admin.control_ids`, the process-start
     ///   snapshot — a genuine "is this id part of the control plane" decision
     ///   that a static read gets wrong the instant the group becomes elastic
@@ -4407,19 +4303,13 @@ impl ClientCtx {
         let Some(leader) = self.edge.leader_handle() else {
             return Err(self.not_leader_error());
         };
-        if let Some(control_id) = node.checked_sub(config::RAFTKV_ID_BASE)
-            && self
-                .control
-                .config()
-                .unwrap_or_default()
-                .contains(&control_id)
-        {
+        if self.control.config().unwrap_or_default().contains(&node) {
             return Err(format!(
-                "node {node} is a CURRENT control-plane voter (control id \
-                 {control_id}); the control group is elastic now (ADR 0037) — \
-                 control-remove it first (`animus admin control-remove`), or run \
-                 `animus admin decommission --force-control-remove`, which does \
-                 that for you before proceeding"
+                "node {node} is a CURRENT control-plane voter; the control group \
+                 is elastic now (ADR 0037) — control-remove it first (`animus \
+                 admin control-remove`), or run `animus admin decommission \
+                 --force-control-remove`, which does that for you before \
+                 proceeding"
             ));
         }
         let meta = self.control.metadata_cached();
@@ -4572,18 +4462,16 @@ impl ClientCtx {
             // own local peer-book entry in case `addr` changed (e.g. a
             // replacement process at the same id) — cheap and harmless
             // either way. Also re-propose the *replicated* address if it
-            // changed (ADR 0037 PR4): `merge_peer` alone only updates this
-            // leader's own env, exactly the known scope limit that motivated
-            // adding `NodeAddrs.control` in the first place — every other
-            // control-role node's `control_peer_sync_loop` only ever learns
-            // an updated address from `Metadata.node_addrs`, never from this
-            // call's local `merge_peer` side effect.
+            // changed: `merge_peer` alone only updates this leader's own
+            // env — every other control-role node's `peer_sync_loop` only
+            // ever learns an updated address from `Metadata.node_addrs`,
+            // never from this call's local `merge_peer` side effect.
             leader.env().merge_peer(node, addr);
             let meta = self.control.metadata_cached();
             if let Some(mut addrs) = meta.node_addrs.get(&node).cloned()
-                && addrs.control != Some(addr)
+                && addrs.internal != addr.to_string()
             {
-                addrs.control = Some(addr);
+                addrs.internal = addr.to_string();
                 let _ = leader.propose(MetaCommand::RegisterNodeAddrs { node, addrs });
             }
             return Ok(node);
@@ -4599,19 +4487,18 @@ impl ClientCtx {
         // (e.g. a self-registration this same process already made for its
         // client/admin addresses, or — for a minted id — the `Down`, address-
         // less `Member` row `AllocateNodeId`'s own apply just inserted)
-        // rather than blindly overwriting it, then stamp `control` — the
-        // field this action exists to populate (ADR 0037 PR4): replicated so
-        // every control-role node's own `control_peer_sync_loop` can reach
-        // the new voter, not just this leader's own env (see
-        // `ProdEnv::merge_peer`'s doc for the gap this closes).
+        // rather than blindly overwriting it, then stamp `internal` — the
+        // field this action exists to populate: replicated so every
+        // control-role node's own `peer_sync_loop` can reach the new voter,
+        // not just this leader's own env (see `ProdEnv::merge_peer`'s doc for
+        // the gap this closes).
         let mut addrs = meta.node_addrs.get(&node).cloned().unwrap_or(NodeAddrs {
-            raftkv: String::new(),
+            internal: String::new(),
             client: String::new(),
             admin: String::new(),
             role: "control".to_string(),
-            control: None,
         });
-        addrs.control = Some(addr);
+        addrs.internal = addr.to_string();
         match leader.propose(MetaCommand::RegisterNodeAddrs { node, addrs }) {
             ProposeResult::Accepted { .. } => {}
             ProposeResult::NotLeader { .. } => {
@@ -4652,22 +4539,18 @@ impl ClientCtx {
     /// silently swallow.
     ///
     /// The plan's second warning trigger — "every *other* remaining voter is
-    /// currently marked Down" — is **deliberately not implemented as
-    /// `ControlHandle::believes_alive`**, which is the wrong id space: the
-    /// failure detector only ever observes heartbeats keyed by **raftkv**
-    /// ids (`heartbeat_loop` runs only on the data role, ADR 0012 — see the
-    /// root `CLAUDE.md`'s "cluster's members are the raftkv ids, not the
-    /// control ids" gotcha), so `believes_alive(control_id)` is always
-    /// `false` for a genuine control voter — permanently "believed dead" for
-    /// reasons that have nothing to do with actual liveness, which would
-    /// make this warning fire unconditionally rather than only when it is
-    /// actually informative. A combined-mode voter's paired raftkv id
-    /// (`RAFTKV_ID_BASE + control_id`) is only a *naming convention*, not a
-    /// structural guarantee for an id an operator chose freely at
-    /// `control-add` time, so bridging id spaces here would be guessing, not
-    /// reading a real signal. Left as follow-up work if a real per-control-
-    /// voter liveness signal is added later (see
-    /// `docs/engineering-lessons.md`).
+    /// currently marked Down" — was **historically** not implementable via
+    /// `ControlHandle::believes_alive` (pre-ADR-0040, that signal was keyed
+    /// on a distinct **raftkv** id space the control ids didn't share, ADR
+    /// 0012 — see `docs/engineering-lessons.md`'s "id-space mismatch" entry
+    /// for the full story). ADR 0037 hardening PR2 instead added a genuinely
+    /// control-id-native signal (`RaftCore::peer_last_contact`/
+    /// `RaftNode::control_peer_believed_alive`, see below) rather than wait
+    /// for the id-space unification; ADR 0040 PR1 has since dissolved the
+    /// mismatch structurally (one id per node), but the dedicated
+    /// control-Raft-traffic-based signal remains the more precise one (a
+    /// voter can be reachable-for-heartbeats but unable to actually
+    /// replicate, or vice versa) and is unchanged here.
     ///
     /// **Removing the current leader's own slot** needs a leadership transfer
     /// first (`RaftCore::change_membership` always rejects leader self-
@@ -4784,25 +4667,13 @@ impl ClientCtx {
         };
         match leader.change_membership(remaining) {
             ProposeResult::Accepted { .. } => {
-                // Prune the replicated control address (ADR 0037 PR4) —
-                // mirrors `RemoveMember`'s own address pruning, but only the
-                // `control` field, not the whole `NodeAddrs` entry: `node`
-                // may still be a data-role/combined cluster member after
-                // losing its control-voter status, and its `raftkv`/
-                // `client`/`admin` addresses must survive. Best-effort: a
-                // stray leftover address is harmless bookkeeping (every
-                // control-role node's `control_peer_sync_loop` simply keeps
-                // `merge_peer`-ing an address for an id no longer in the
-                // live Raft config, which nothing ever addresses), so a
-                // races-with-a-fresh-leadership-change failure here does not
-                // fail the removal itself — the removal already committed.
-                let meta = self.control.metadata_cached();
-                if let Some(mut addrs) = meta.node_addrs.get(&node).cloned()
-                    && addrs.control.is_some()
-                {
-                    addrs.control = None;
-                    let _ = leader.propose(MetaCommand::RegisterNodeAddrs { node, addrs });
-                }
+                // ADR 0040 PR1: there is no more separate `control` address
+                // field to prune — `node`'s one `internal` address is shared
+                // by every role it runs, and it may still be a data-role/
+                // combined cluster member after losing its control-voter
+                // status, so `Metadata.node_addrs[node]` is left exactly as
+                // is (its own `peer_sync_loop`'s ordinary self-registration
+                // keeps it current regardless of voter status).
                 Ok(ControlRemoveOutcome { warning })
             }
             ProposeResult::NotLeader { .. } => Err(
@@ -4901,23 +4772,16 @@ async fn bootstrap(raft: RaftNode<ProdEnv>, raftkv_ids: Vec<NodeId>) {
 /// reachable promptly; the work is a cheap map rebuild + `set_peers`.
 const PEER_SYNC_INTERVAL: Duration = Duration::from_millis(200);
 
-/// Keep the `raftkv` env family's peer book = the **static** book ∪ the replicated
-/// `Metadata.cp_member_addrs` ∪ `Metadata.node_addrs[*].raftkv` ∪
-/// `Metadata.node_addrs[*].control` (Phase 2.3a address distribution, extended
-/// by ADR 0032 PR1's node address book — a node's own `raftkv` address is
-/// registered there too, so a node that joined via `RegisterNodeAddrs` alone,
-/// without ever going through `RegisterCpAddr`, is still reachable; and by ADR
-/// 0037's closing PR — a runtime-added control voter's `.control` address must
-/// land in this **raftkv**-env book too, not just a control-role node's own
-/// control env via `control_peer_sync_loop`, because [`heartbeat_loop_live`]
-/// sends `RaftMsg::Heartbeat` to a control id over *this very env*: without
-/// this merge, `ProdEnv::send` silently drops the heartbeat for any control
-/// voter added after this node's own bring-up, even once
-/// `heartbeat_loop_live` names it as a destination — see that function's doc
-/// and `docs/engineering-lessons.md`'s two-staleness-axes entry for the full
-/// story). `set_peers` replaces the book and a `sibling` env shares the same
-/// book `Arc`, so syncing the `raftkv` env reaches every co-resident CP
-/// group. Idempotent each tick; runs for the life of the node (a perpetual
+/// Keep this node's one internal env's peer book = the **static** book ∪ the
+/// replicated `Metadata.cp_member_addrs` ∪ `Metadata.node_addrs[*].internal`
+/// (ADR 0032 PR1's node address book, ADR 0040 PR1's merge of the old
+/// `raftkv`/`control` address pair into one `internal` field — a runtime-
+/// registered member's address, whatever role it runs, lands in this one
+/// book: this is the same env that carries the control Raft, every hosted
+/// tablet's Raft group, and this node's own failure-detection heartbeats, so
+/// there is exactly one peer book to keep current, not the pre-PR1
+/// `peer_sync_loop`/`control_peer_sync_loop` pair). `set_peers` replaces the
+/// book each tick; idempotent, runs for the life of the node (a perpetual
 /// loop, aborted on `shutdown`). A peer entry whose address fails to parse is
 /// skipped (the control plane stores it opaquely).
 ///
@@ -4926,11 +4790,7 @@ const PEER_SYNC_INTERVAL: Duration = Duration::from_millis(200);
 /// of the real cluster's `cp_member_addrs`/`node_addrs` — instead of its own
 /// never-replicated local raft; every other node is unaffected (`effective_metadata`
 /// passes through to `raft.metadata()` there).
-async fn peer_sync_loop(
-    ctx: ClientCtx,
-    raftkv_env: ProdEnv,
-    static_peers: BTreeMap<NodeId, SocketAddr>,
-) {
+async fn peer_sync_loop(ctx: ClientCtx, env: ProdEnv, static_peers: BTreeMap<NodeId, SocketAddr>) {
     loop {
         let mut book = static_peers.clone();
         let meta = ctx.effective_metadata();
@@ -4940,14 +4800,11 @@ async fn peer_sync_loop(
             }
         }
         for (id, addrs) in meta.node_addrs {
-            if let Ok(sa) = addrs.raftkv.parse::<SocketAddr>() {
+            if let Ok(sa) = addrs.internal.parse::<SocketAddr>() {
                 book.insert(id, sa);
             }
-            if let Some(addr) = addrs.control {
-                book.insert(id, addr);
-            }
         }
-        raftkv_env.set_peers(book);
+        env.set_peers(book);
         tokio::time::sleep(PEER_SYNC_INTERVAL).await;
     }
 }
@@ -4972,52 +4829,6 @@ async fn route_sync_loop(ctx: ClientCtx, static_route: BTreeMap<NodeId, SocketAd
             }
         }
         *ctx.client_route.lock().expect("client route poisoned") = book;
-        tokio::time::sleep(PEER_SYNC_INTERVAL).await;
-    }
-}
-
-/// Keep every **control**-role node's own control env peer book current with
-/// runtime-added control voters (ADR 0037 PR4): merges `Metadata.node_addrs
-/// [*].control` into `ctx.control` via [`ControlHandle::merge_control_peer`]
-/// each tick — the control-role dual of [`peer_sync_loop`]'s raftkv overlay
-/// and [`route_sync_loop`]'s client-route overlay, closing the gap
-/// `ProdEnv::merge_peer`'s own doc names: before this loop existed, a
-/// runtime-added voter's address was known only to whichever node happened
-/// to be leader at `admin_add_control_member` time, so a later leadership
-/// change or crash left every *other* voter (and any newly-added voter after
-/// *that*) permanently unable to reach it.
-///
-/// Spawned only where `ctx.control` is genuinely [`ControlHandle::Local`] —
-/// [`BoundNode::start_with`] (combined) and [`BoundControlNode::
-/// start_control_with`] (control-only) — never on a data-only node
-/// ([`BoundDataNode::start_data_with`]), which has no local control env at
-/// all; `merge_control_peer` itself is also a no-op on `Remote`, so spawning
-/// it there would just be a wasted task, not a bug.
-///
-/// A no-op, not a gap, for every **statically**-configured voter: its
-/// address comes from `ClusterConfig` at every node's own process start
-/// (unchanged, the same static book every node has always built at
-/// bring-up) and its `NodeAddrs.control` stays `None` (see that field's own
-/// doc) — this loop only ever has something to merge for a voter added
-/// after the fact.
-///
-/// Uses [`ControlHandle::merge_control_peer`] (incremental), not a full
-/// `set_peers` rebuild like [`peer_sync_loop`]: unlike the raftkv/
-/// client-route overlays, there is no separate "static control peer book"
-/// parameter to layer under here — each control-role node's own static book
-/// was already installed once, directly, at `RaftNode::start`, and a
-/// periodic *partial* rebuild (this loop only ever sees `control` addresses,
-/// never the full peer set) would have to either omit or somehow
-/// reconstruct that static portion on every tick; incremental `merge_peer`
-/// sidesteps the question entirely by never touching an entry this loop
-/// didn't itself add.
-async fn control_peer_sync_loop(ctx: ClientCtx) {
-    loop {
-        for (id, addrs) in ctx.effective_metadata().node_addrs {
-            if let Some(addr) = addrs.control {
-                ctx.control.merge_control_peer(id, addr);
-            }
-        }
         tokio::time::sleep(PEER_SYNC_INTERVAL).await;
     }
 }
@@ -6368,7 +6179,7 @@ impl ClientCtx {
 }
 
 /// Bind an `n`-node cluster on `ip` with ephemeral ports and the conventional
-/// ids (control `i`, raftkv `300+i`), each under `dir/node-i`.
+/// ids (node `i`, ADR 0040 PR1), each under `dir/node-i`.
 ///
 /// # Errors
 /// Propagates any bind failure.
@@ -6383,20 +6194,13 @@ pub async fn bind_cluster(
         let addr = || SocketAddr::new(ip, 0);
         let addrs = RoleAddrs {
             role: config::NodeRole::Both,
-            control: Some(addr()),
+            internal: addr(),
             client: addr(),
             dynamo: addr(),
             cql: addr(),
-            raftkv: Some(addr()),
             admin: addr(),
         };
-        let node = Node::bind(
-            config::control_id(i),
-            config::raftkv_id(i),
-            addrs,
-            dir.join(format!("node-{i}")),
-        )
-        .await?;
+        let node = Node::bind(config::node_id(i), addrs, dir.join(format!("node-{i}"))).await?;
         nodes.push(node);
     }
     Ok(nodes)
@@ -6474,33 +6278,32 @@ async fn start_cluster_inner(
     auto_split_bytes_threshold: Option<u64>,
 ) -> std::io::Result<Vec<Node>> {
     let n = bound.len();
-    let control_ids: Vec<NodeId> = (0..n).map(config::control_id).collect();
-    // ADR 0035 PR2: `bind_cluster` (the only producer of a `Vec<BoundNode>`
+    let control_ids: Vec<NodeId> = (0..n).map(config::node_id).collect();
+    // ADR 0040 PR1: `bind_cluster` (the only producer of a `Vec<BoundNode>`
     // this function is ever called with) always assembles combined-mode
-    // (`Both`-role) nodes, so every bound node's own `raftkv_id` is a genuine
-    // data-role member — read straight off each `BoundNode` rather than
-    // re-deriving from `control_ids`, so this stays correct even if a future
-    // caller's `bound` isn't a contiguous `0..n` index range.
-    let data_raftkv_ids: Vec<NodeId> = bound.iter().map(|b| b.raftkv_id).collect();
+    // (`Both`-role) nodes, so every bound node's own id is a genuine
+    // data-role member too (one identity per node) — read straight off each
+    // `BoundNode` rather than re-deriving from `control_ids`, so this stays
+    // correct even if a future caller's `bound` isn't a contiguous `0..n`
+    // index range.
+    let data_ids: Vec<NodeId> = bound.iter().map(|b| b.id).collect();
     let peers: BTreeMap<NodeId, SocketAddr> =
         bound.iter().flat_map(BoundNode::peer_entries).collect();
-    // Cross-node routing (ADR 0017 #3b / ADR 0013): map each node's CP group
-    // member id (`raftkv_id`) **and** its control id to that node's client API
-    // address, so an op landing on a node that isn't the relevant leader
-    // forwards to the leader's node — identical to the per-process path
-    // (`run_node_with`). `--cluster N` gives **each node its own
-    // `ClusterEdgeState`** (below), matching one-process-per-node exactly:
-    // cross-node reach happens only through this real forwarding/relay path,
-    // never a shared in-process registry (root `CLAUDE.md`'s documented
-    // "shared edge masks per-node bugs" gotcha — this removes the sharing).
-    // This is only the **static seed**: `start_with` hands it to each node's
-    // own `route_sync_loop`, which keeps it live thereafter by overlaying
-    // `Metadata.node_addrs[*].client` (ADR 0032 PR1) — so a node grown into
-    // the cluster later is still reachable from every original node.
-    let client_route: BTreeMap<NodeId, SocketAddr> = bound
-        .iter()
-        .flat_map(|b| [(b.raftkv_id, b.client_addr), (b.control_id, b.client_addr)])
-        .collect();
+    // Cross-node routing (ADR 0017 #3b / ADR 0013): map each node's one id to
+    // that node's client API address, so an op landing on a node that isn't
+    // the relevant leader forwards to the leader's node — identical to the
+    // per-process path (`run_node_with`). `--cluster N` gives **each node its
+    // own `ClusterEdgeState`** (below), matching one-process-per-node
+    // exactly: cross-node reach happens only through this real
+    // forwarding/relay path, never a shared in-process registry (root
+    // `CLAUDE.md`'s documented "shared edge masks per-node bugs" gotcha —
+    // this removes the sharing). This is only the **static seed**:
+    // `start_with` hands it to each node's own `route_sync_loop`, which keeps
+    // it live thereafter by overlaying `Metadata.node_addrs[*].client` (ADR
+    // 0032 PR1) — so a node grown into the cluster later is still reachable
+    // from every original node.
+    let client_route: BTreeMap<NodeId, SocketAddr> =
+        bound.iter().map(|b| (b.id, b.client_addr)).collect();
     // Every node's admin address, so each node's dashboard (ADR 0021) can fan out
     // to the whole in-process cluster.
     let admin_addrs: Vec<SocketAddr> = bound.iter().map(BoundNode::admin_addr).collect();
@@ -6510,7 +6313,7 @@ async fn start_cluster_inner(
             .start_with(
                 peers.clone(),
                 control_ids.clone(),
-                data_raftkv_ids.clone(),
+                data_ids.clone(),
                 backend,
                 // A fresh, node-local edge-state set per node — never shared
                 // across the in-process cluster (see the `client_route`
@@ -6536,8 +6339,8 @@ async fn start_cluster_inner(
 /// [`ClusterConfig::generate_split`] + `animusd control`/`animusd data`
 /// (real separate processes): same id/index convention (control-role
 /// indexes `0..control_n`, data-role indexes `control_n..control_n+data_n`,
-/// `config::control_id`/`config::raftkv_id` applied straight to those
-/// indexes) and same per-node `dir/node-{index}` subdirectory layout as
+/// `config::node_id` applied straight to those indexes) and same per-node
+/// `dir/node-{index}` subdirectory layout as
 /// [`bind_cluster`]/[`start_cluster_inner`], just role-split instead of every
 /// node being `Both`.
 ///
@@ -6572,59 +6375,53 @@ pub async fn start_split_cluster_with(
     for i in 0..control_n {
         let addrs = RoleAddrs {
             role: config::NodeRole::Control,
-            control: Some(ephemeral()),
+            internal: ephemeral(),
             client: ephemeral(),
             dynamo: ephemeral(),
             cql: ephemeral(),
-            raftkv: None,
             admin: ephemeral(),
         };
         control_bound.push(
-            Node::bind_control(config::control_id(i), addrs, dir.join(format!("node-{i}"))).await?,
+            Node::bind_control(config::node_id(i), addrs, dir.join(format!("node-{i}"))).await?,
         );
     }
     let mut data_bound = Vec::with_capacity(data_n);
     for i in control_n..total {
         let addrs = RoleAddrs {
             role: config::NodeRole::Data,
-            control: None,
+            internal: ephemeral(),
             client: ephemeral(),
             dynamo: ephemeral(),
             cql: ephemeral(),
-            raftkv: Some(ephemeral()),
             admin: ephemeral(),
         };
-        data_bound.push(
-            Node::bind_data(config::raftkv_id(i), addrs, dir.join(format!("node-{i}"))).await?,
-        );
+        data_bound
+            .push(Node::bind_data(config::node_id(i), addrs, dir.join(format!("node-{i}"))).await?);
     }
 
-    let control_ids: Vec<NodeId> = (0..control_n).map(config::control_id).collect();
+    let control_ids: Vec<NodeId> = (0..control_n).map(config::node_id).collect();
 
     // Each role's own internal peer book, plus the union a data node's single
-    // `raftkv` env needs (its `heartbeat_loop` targets the control ids over
-    // that same env — `ClusterConfig::control_peer_book`'s doc explains why
-    // `raftkv_peer_book()` alone isn't enough).
+    // internal env needs (its `heartbeat_loop` targets the control ids over
+    // that same env).
     let control_peer_book: BTreeMap<NodeId, SocketAddr> = control_bound
         .iter()
-        .map(|b| (b.control_id, b.control_addr))
+        .map(|b| (b.id, b.internal_addr))
         .collect();
-    let raftkv_peer_book: BTreeMap<NodeId, SocketAddr> = data_bound
-        .iter()
-        .map(|b| (b.raftkv_id, b.raftkv_addr))
-        .collect();
+    let raftkv_peer_book: BTreeMap<NodeId, SocketAddr> =
+        data_bound.iter().map(|b| (b.id, b.internal_addr)).collect();
     let mut data_env_peers = raftkv_peer_book;
     data_env_peers.extend(control_peer_book.clone());
 
-    // Cross-node routing (ADR 0017 #3b / ADR 0013): every control id and
-    // every raftkv id resolves to its node's client API address, exactly like
+    // Cross-node routing (ADR 0017 #3b / ADR 0013): every node's id resolves
+    // to its node's client API address, exactly like
     // `run_node_control`/`run_node_data`'s per-process assembly.
     let mut client_route: BTreeMap<NodeId, SocketAddr> = BTreeMap::new();
     for b in &control_bound {
-        client_route.insert(b.control_id, b.client_addr);
+        client_route.insert(b.id, b.client_addr);
     }
     for b in &data_bound {
-        client_route.insert(b.raftkv_id, b.client_addr);
+        client_route.insert(b.id, b.client_addr);
     }
 
     // The control deployment's client addresses — the discovery root each
@@ -6703,25 +6500,17 @@ pub async fn run_node_with(
     let addrs = *config.nodes.get(index).ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "node index out of range")
     })?;
-    let bound = Node::bind(
-        config::control_id(index),
-        config::raftkv_id(index),
-        addrs,
-        dir,
-    )
-    .await?;
+    let bound = Node::bind(config::node_id(index), addrs, dir).await?;
     // One node per process: a fresh per-process edge-state set (it registers only
     // this node's control handle — cross-process proposal forwarding is future
     // work, ADR 0013).
     //
-    // Cross-process routing (ADR 0017 #3b): map each node's CP group member id
-    // (`raftkv_id`, for CP data ops — A1) **and** its control id (for schema-DDL
-    // relay — A2) to that node's **client API** address, so an op landing on a node
-    // that isn't the relevant leader forwards to the leader's node.
+    // Cross-process routing (ADR 0017 #3b): map each node's one id to that
+    // node's **client API** address, so an op landing on a node that isn't
+    // the relevant leader forwards to the leader's node.
     let mut client_route: BTreeMap<NodeId, SocketAddr> = BTreeMap::new();
     for (i, addrs) in config.nodes.iter().enumerate() {
-        client_route.insert(config::raftkv_id(i), addrs.client);
-        client_route.insert(config::control_id(i), addrs.client);
+        client_route.insert(config::node_id(i), addrs.client);
     }
     // Every node's admin address from the shared config, so this node's dashboard
     // (ADR 0021) can fan out to the whole cluster.
@@ -6730,7 +6519,7 @@ pub async fn run_node_with(
         .start_with(
             config.peer_book(),
             config.control_ids(),
-            config.raftkv_ids(),
+            config.data_ids(),
             backend,
             ClusterEdgeState::new(),
             client_route,
@@ -6781,22 +6570,15 @@ pub async fn run_node_control(
             "node index does not run the control role",
         ));
     }
-    let bound = Node::bind_control(config::control_id(index), addrs, dir).await?;
+    let bound = Node::bind_control(config::node_id(index), addrs, dir).await?;
 
-    // Cross-node routing (ADR 0017 #3b / ADR 0013): map every control-role
-    // node's control id and every data-role node's raftkv id to that node's
-    // client API address, so a data op or a schema-DDL relay landing on this
-    // control node forwards to the right node — the same shape
-    // `run_node_with` builds, role-filtered (a control-only entry has no
-    // `raftkv` id to route to; a data-only entry has no `control` id).
+    // Cross-node routing (ADR 0017 #3b / ADR 0013): map every node's id to
+    // its client API address, so a data op or a schema-DDL relay landing on
+    // this control node forwards to the right node — the same shape
+    // `run_node_with` builds.
     let mut client_route: BTreeMap<NodeId, SocketAddr> = BTreeMap::new();
     for (i, a) in config.nodes.iter().enumerate() {
-        if a.role.has_control() {
-            client_route.insert(config::control_id(i), a.client);
-        }
-        if a.role.has_data() {
-            client_route.insert(config::raftkv_id(i), a.client);
-        }
+        client_route.insert(config::node_id(i), a.client);
     }
     // Every node's admin address from the shared config, so this node's
     // dashboard (ADR 0021) can fan out to the whole cluster (control and data
@@ -6805,7 +6587,7 @@ pub async fn run_node_control(
 
     bound
         .start_control_with(
-            config.control_peer_book(),
+            config.peer_book(),
             config.control_ids(),
             client_route,
             admin_addrs,
@@ -6858,11 +6640,11 @@ pub async fn run_node_data(
             "config has no control-role node for this data node to mirror",
         ));
     }
-    let bound = Node::bind_data(config::raftkv_id(index), addrs, dir).await?;
+    let bound = Node::bind_data(config::node_id(index), addrs, dir).await?;
 
     // The control deployment's **client**-API addresses — the mirror/
     // leader-hint discovery root (ADR 0035 §1/§4), a wholly different address
-    // axis from the internal `raftkv`-env peer book below.
+    // axis from the internal env peer book below.
     let control_client_addrs: Vec<SocketAddr> = config
         .nodes
         .iter()
@@ -6870,18 +6652,11 @@ pub async fn run_node_data(
         .map(|a| a.client)
         .collect();
 
-    // Cross-node routing (ADR 0017 #3b / ADR 0013): map every control-role
-    // node's control id and every data-role node's raftkv id to that node's
-    // client API address — the same shape `run_node_control` builds,
-    // role-filtered (a data-only entry has no `control` id to route to).
+    // Cross-node routing (ADR 0017 #3b / ADR 0013): map every node's id to
+    // its client API address — the same shape `run_node_control` builds.
     let mut client_route: BTreeMap<NodeId, SocketAddr> = BTreeMap::new();
     for (i, a) in config.nodes.iter().enumerate() {
-        if a.role.has_control() {
-            client_route.insert(config::control_id(i), a.client);
-        }
-        if a.role.has_data() {
-            client_route.insert(config::raftkv_id(i), a.client);
-        }
+        client_route.insert(config::node_id(i), a.client);
     }
     // Every node's admin address from the shared config, so this node's
     // dashboard fan-out (ADR 0021) covers the whole split deployment.
@@ -6889,12 +6664,9 @@ pub async fn run_node_data(
 
     bound
         .start_data_with(
-            // This node's `raftkv` env peer book: the union of every
-            // data-role node's `raftkv` address and every control-role
-            // node's `control` address — `ClusterConfig::peer_book`, not
-            // `raftkv_peer_book()` alone (see `control_peer_book`'s doc for
-            // why: `heartbeat_loop` below sends to `control_ids` over this
-            // very env).
+            // This node's internal env peer book: every node in the
+            // deployment (`ClusterConfig::peer_book`) — `heartbeat_loop`
+            // below sends to `control_ids` over this very env.
             config.peer_book(),
             control_ids,
             control_client_addrs,
@@ -6952,35 +6724,24 @@ pub async fn run_node_growth(
     let addrs = *config.nodes.get(index).ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "node index out of range")
     })?;
-    let bound = Node::bind(
-        config::control_id(index),
-        config::raftkv_id(index),
-        addrs,
-        dir,
-    )
-    .await?;
+    let bound = Node::bind(config::node_id(index), addrs, dir).await?;
     let mut client_route: BTreeMap<NodeId, SocketAddr> = BTreeMap::new();
     for (i, addrs) in config.nodes.iter().enumerate() {
-        client_route.insert(config::raftkv_id(i), addrs.client);
-        client_route.insert(config::control_id(i), addrs.client);
+        client_route.insert(config::node_id(i), addrs.client);
     }
     let admin_addrs: Vec<SocketAddr> = config.nodes.iter().map(|n| n.admin).collect();
-    // ADR 0035 PR2: `bootstrap` must never auto-register this growth node
-    // itself (it self-registers `Down` via `admin_add_member` instead, see
-    // this fn's doc) — so, mirroring `original_control_ids`, scope
-    // `data_raftkv_ids` to the **pre-growth** set's paired raftkv ids, not
-    // `config`'s (expanded) `raftkv_ids()`. Identical to what `start_with`
-    // used to derive unconditionally from `control_ids.len()` before this
-    // parameter existed.
-    let data_raftkv_ids: Vec<NodeId> = original_control_ids
-        .iter()
-        .map(|&id| config::raftkv_id(id as usize))
-        .collect();
+    // `bootstrap` must never auto-register this growth node itself (it
+    // self-registers `Down` via `admin_add_member` instead, see this fn's
+    // doc) — so, mirroring `original_control_ids`, scope `data_ids` to the
+    // **pre-growth** set (one identity per node, ADR 0040 PR1 — the
+    // pre-growth control ids ARE the pre-growth data ids), not `config`'s
+    // (expanded) `data_ids()`.
+    let data_ids: Vec<NodeId> = original_control_ids.clone();
     bound
         .start_with(
             config.peer_book(),
             original_control_ids,
-            data_raftkv_ids,
+            data_ids,
             backend,
             ClusterEdgeState::new(),
             client_route,
@@ -7072,7 +6833,7 @@ async fn poll_seeds_for(
 /// growth-node block) — no separate step is needed here for either.
 ///
 /// **Collision guard.** Before binding, this checks the `Status` reply's
-/// `node_addrs` for an existing entry at `config::raftkv_id(index)`: an
+/// `node_addrs` for an existing entry at `config::node_id(index)`: an
 /// **identical** entry (the same three addresses) is a *rejoin* of this
 /// exact node (a restart with the same index/addresses/dir) and this
 /// proceeds normally; a **different** entry means `index` is already
@@ -7109,49 +6870,32 @@ pub async fn run_node_join(
             "join needs at least one --seed address",
         ));
     }
-    // ADR 0035 PR2 is the config layer only: `run_node_join` still only
-    // supports joining as a combined-mode (`Both`-role) node — fail fast with
-    // a join-specific message rather than surfacing `Node::bind`'s generic
-    // one later, once discovery/collision-guard work has already happened.
-    let my_raftkv_addr = addrs.raftkv.ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "join needs a raftkv address (RoleAddrs.raftkv is None) — \
-             data-only join is ADR 0035 PR3/PR4 (see `run_node_data_join`)",
-        )
-    })?;
-    if addrs.control.is_none() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "join needs a control address (RoleAddrs.control is None) — \
-             control-only join is ADR 0035 PR3/PR4",
-        ));
-    }
-    let my_control_id = config::control_id(index);
-    let my_raftkv_id = config::raftkv_id(index);
+    // `run_node_join` still only supports joining as a combined-mode
+    // (`Both`-role) node — fail fast with a join-specific message rather
+    // than surfacing `Node::bind`'s generic one later, once discovery/
+    // collision-guard work has already happened.
+    let my_id = config::node_id(index);
 
     let (original_control_ids, peers, client_route, admin_addrs) =
         discover_join_info(&seeds).await?;
     check_join_collision(
         &seeds,
         index,
-        my_raftkv_id,
+        my_id,
         &NodeAddrs {
-            raftkv: my_raftkv_addr.to_string(),
+            internal: addrs.internal.to_string(),
             client: addrs.client.to_string(),
             admin: addrs.admin.to_string(),
             role: "combined".to_string(),
-            control: None,
         },
     )
     .await?;
 
-    let bound = Node::bind(my_control_id, my_raftkv_id, addrs, dir).await?;
+    let bound = Node::bind(my_id, addrs, dir).await?;
 
     finish_combined_join(
         bound,
-        my_control_id,
-        my_raftkv_id,
+        my_id,
         addrs.client,
         addrs.admin,
         original_control_ids,
@@ -7163,24 +6907,24 @@ pub async fn run_node_join(
     .await
 }
 
-/// The shared "merge discovered peers/route/admin → build `data_raftkv_ids`
-/// → `start_with`" tail of every **combined-mode** seed/join entry point —
+/// The shared "merge discovered peers/route/admin → build `data_ids` →
+/// `start_with`" tail of every **combined-mode** seed/join entry point —
 /// [`run_node_join`] (an operator-indexed id) and
 /// [`run_node_join_allocated`] (ADR 0036's cluster-allocated id): once a
-/// joiner has bound its listeners and knows its own ids and client address,
-/// finishing the join is identical regardless of *how* it picked those ids.
+/// joiner has bound its listener and knows its own id and client address,
+/// finishing the join is identical regardless of *how* it picked that id.
 /// Merges this node's own entries into the discovered peer/route/admin sets
 /// — the same union `run_node_growth`'s expanded-config construction already
 /// produces, just built from a discovery reply instead of a pre-assembled
-/// config — then starts the node exactly like `run_node_growth` does; ADR
-/// 0035 PR2's own note applies unchanged: `bootstrap` must never
-/// auto-register the joining node itself, so `data_raftkv_ids` is scoped to
-/// the pre-growth set discovered via `JoinInfo`, never including this node.
-#[allow(clippy::too_many_arguments)] // a join's ids + addrs + discovered sets, no natural grouping
+/// config — then starts the node exactly like `run_node_growth` does:
+/// `bootstrap` must never auto-register the joining node itself, so
+/// `data_ids` is scoped to the pre-growth set discovered via `JoinInfo`
+/// (one identity per node, ADR 0040 PR1 — the pre-growth control ids ARE the
+/// pre-growth data ids), never including this node.
+#[allow(clippy::too_many_arguments)] // a join's id + addrs + discovered sets, no natural grouping
 async fn finish_combined_join(
     bound: BoundNode,
-    my_control_id: NodeId,
-    my_raftkv_id: NodeId,
+    my_id: NodeId,
     my_client_addr: SocketAddr,
     my_admin_addr: SocketAddr,
     original_control_ids: Vec<NodeId>,
@@ -7192,21 +6936,17 @@ async fn finish_combined_join(
     for (id, addr) in bound.peer_entries() {
         peers.insert(id, addr);
     }
-    client_route.insert(my_raftkv_id, my_client_addr);
-    client_route.insert(my_control_id, my_client_addr);
+    client_route.insert(my_id, my_client_addr);
     if !admin_addrs.contains(&my_admin_addr) {
         admin_addrs.push(my_admin_addr);
     }
 
-    let data_raftkv_ids: Vec<NodeId> = original_control_ids
-        .iter()
-        .map(|&id| config::raftkv_id(id as usize))
-        .collect();
+    let data_ids: Vec<NodeId> = original_control_ids.clone();
     bound
         .start_with(
             peers,
             original_control_ids,
-            data_raftkv_ids,
+            data_ids,
             backend,
             ClusterEdgeState::new(),
             client_route,
@@ -7344,12 +7084,15 @@ async fn allocate_node_id(
 /// nothing to collide with an id that was just freshly minted by
 /// construction — then asks the cluster itself for the id
 /// ([`allocate_node_id`], keyed by a nonce generated once here at the CLI
-/// boundary, [`generate_join_nonce`]) before binding anything. This node's
-/// own control id is a [`config::synthetic_control_id_for`] placeholder
-/// derived from the allocated raftkv id — a structurally safe permanent
-/// non-voter, exactly like a `--node`-indexed join's real `control_id(index)`
-/// serves the identical purpose (see that function's doc). Everything past
-/// binding is the same [`finish_combined_join`] tail `run_node_join` uses.
+/// boundary, [`generate_join_nonce`]) before binding anything. **ADR 0040
+/// PR1 simplification**: one identity per node means the allocated id *is*
+/// this node's one id, full stop — no separate synthetic-control-id
+/// placeholder is needed (pre-PR1, a combined node needed a distinct local
+/// control id derived from its raftkv id; that whole derivation is gone).
+/// It is a structurally safe permanent non-voter simply because
+/// `original_control_ids` (the discovered pre-growth voter set) never
+/// contains it. Everything past binding is the same [`finish_combined_join`]
+/// tail `run_node_join` uses.
 ///
 /// **Ephemeral identity**: a restart with a fresh nonce (a new process, or
 /// this same process retried after losing its own in-memory nonce) allocates
@@ -7378,36 +7121,17 @@ pub async fn run_node_join_allocated(
             "join needs at least one --seed address",
         ));
     }
-    // Same combined-mode role requirement as `run_node_join` — see that
-    // entry point's doc for why (ADR 0035 PR2 is the config layer only).
-    addrs.raftkv.ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "join needs a raftkv address (RoleAddrs.raftkv is None) — \
-             data-only join is `run_node_data_join_allocated`",
-        )
-    })?;
-    if addrs.control.is_none() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "join needs a control address (RoleAddrs.control is None) — \
-             control-only join is ADR 0035 PR3/PR4",
-        ));
-    }
-
     let (original_control_ids, peers, client_route, admin_addrs) =
         discover_join_info(&seeds).await?;
 
     let nonce = generate_join_nonce();
-    let my_raftkv_id = allocate_node_id(&seeds, nonce, labels).await?;
-    let my_control_id = config::synthetic_control_id_for(my_raftkv_id);
+    let my_id = allocate_node_id(&seeds, nonce, labels).await?;
 
-    let bound = Node::bind(my_control_id, my_raftkv_id, addrs, dir).await?;
+    let bound = Node::bind(my_id, addrs, dir).await?;
 
     finish_combined_join(
         bound,
-        my_control_id,
-        my_raftkv_id,
+        my_id,
         addrs.client,
         addrs.admin,
         original_control_ids,
@@ -7427,10 +7151,7 @@ pub async fn run_node_join_allocated(
 /// instead of a combined-mode node with a local control `RaftCore`. CLI:
 /// `animusd data --seed ADDR[,ADDR...] --node I [--dir D] [--ephemeral]`.
 ///
-/// `addrs.control` must be `None` and `addrs.raftkv` must be `Some` — the
-/// dual of `run_node_join`'s own role check (that entry point rejects a
-/// missing `raftkv` address as "data-only join is PR3/PR4"; this one is that
-/// PR3/PR4). The discovered `original_control_ids` (the seed's `JoinInfo`
+/// The discovered `original_control_ids` (the seed's `JoinInfo`
 /// reply) feed both `heartbeat_loop`'s failure-detection target and, via the
 /// merged `client_route`, [`RemoteControlClient::new`]'s `control_seeds` — the
 /// discovery root this node's mirror sync/long-poll watch loop
@@ -7460,42 +7181,28 @@ pub async fn run_node_data_join(
             "join needs at least one --seed address",
         ));
     }
-    let my_raftkv_addr = addrs.raftkv.ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "data join needs a raftkv address (RoleAddrs.raftkv is None)",
-        )
-    })?;
-    if addrs.control.is_some() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "data join must not have a control address (RoleAddrs.control is Some) — \
-             use `animusd join` for a combined-mode join",
-        ));
-    }
-    let my_raftkv_id = config::raftkv_id(index);
+    let my_id = config::node_id(index);
 
     let (original_control_ids, peers, client_route, admin_addrs) =
         discover_join_info(&seeds).await?;
     check_join_collision(
         &seeds,
         index,
-        my_raftkv_id,
+        my_id,
         &NodeAddrs {
-            raftkv: my_raftkv_addr.to_string(),
+            internal: addrs.internal.to_string(),
             client: addrs.client.to_string(),
             admin: addrs.admin.to_string(),
             role: "data".to_string(),
-            control: None,
         },
     )
     .await?;
 
-    let bound = Node::bind_data(my_raftkv_id, addrs, dir).await?;
+    let bound = Node::bind_data(my_id, addrs, dir).await?;
 
     finish_data_join(
         bound,
-        my_raftkv_id,
+        my_id,
         addrs.client,
         addrs.admin,
         original_control_ids,
@@ -7514,7 +7221,7 @@ pub async fn run_node_data_join(
 #[allow(clippy::too_many_arguments)] // mirrors `finish_combined_join`'s shape
 async fn finish_data_join(
     bound: BoundDataNode,
-    my_raftkv_id: NodeId,
+    my_id: NodeId,
     my_client_addr: SocketAddr,
     my_admin_addr: SocketAddr,
     original_control_ids: Vec<NodeId>,
@@ -7527,7 +7234,7 @@ async fn finish_data_join(
     // peer entry, no control id of its own to add).
     let (peer_id, peer_addr) = bound.peer_entry();
     peers.insert(peer_id, peer_addr);
-    client_route.insert(my_raftkv_id, my_client_addr);
+    client_route.insert(my_id, my_client_addr);
     if !admin_addrs.contains(&my_admin_addr) {
         admin_addrs.push(my_admin_addr);
     }
@@ -7584,31 +7291,17 @@ pub async fn run_node_data_join_allocated(
             "join needs at least one --seed address",
         ));
     }
-    addrs.raftkv.ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "data join needs a raftkv address (RoleAddrs.raftkv is None)",
-        )
-    })?;
-    if addrs.control.is_some() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "data join must not have a control address (RoleAddrs.control is Some) — \
-             use `run_node_join_allocated` for a combined-mode join",
-        ));
-    }
-
     let (original_control_ids, peers, client_route, admin_addrs) =
         discover_join_info(&seeds).await?;
 
     let nonce = generate_join_nonce();
-    let my_raftkv_id = allocate_node_id(&seeds, nonce, labels).await?;
+    let my_id = allocate_node_id(&seeds, nonce, labels).await?;
 
-    let bound = Node::bind_data(my_raftkv_id, addrs, dir).await?;
+    let bound = Node::bind_data(my_id, addrs, dir).await?;
 
     finish_data_join(
         bound,
-        my_raftkv_id,
+        my_id,
         addrs.client,
         addrs.admin,
         original_control_ids,
@@ -7815,16 +7508,15 @@ mod split_fence_tests {
     async fn stale_routed_write_for_a_split_childs_key_is_rejected_not_lost() {
         timeout(Duration::from_secs(60), async {
             let dir = tempfile::tempdir().expect("tempdir");
-            let addrs = free_addrs(6);
+            let addrs = free_addrs(5);
             let config = ClusterConfig {
                 nodes: vec![RoleAddrs {
                     role: NodeRole::Both,
-                    control: Some(addrs[0]),
+                    internal: addrs[0],
                     client: addrs[1],
                     dynamo: addrs[2],
                     cql: addrs[3],
-                    raftkv: Some(addrs[4]),
-                    admin: addrs[5],
+                    admin: addrs[4],
                 }],
             };
             let node = run_node(&config, 0, dir.path().join("node-0"))

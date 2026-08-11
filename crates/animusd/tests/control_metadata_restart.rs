@@ -156,7 +156,7 @@ async fn combined_node_restart_recovers_control_metadata_via_shared_engine() {
     // and rebuild `Metadata` from it directly, proving the control plane's
     // system-keyspace mirror is real, independent of any node's own
     // in-memory state or of the restart path below.
-    let raftkv_dir = node_dir.join("raftkv");
+    let raftkv_dir = node_dir.join("internal");
     let (env, _addr) = ProdEnv::bind(999_999, free_addr(), raftkv_dir)
         .await
         .expect("bind a scratch env over the same raftkv directory");
@@ -221,11 +221,10 @@ async fn ephemeral_control_only_restart_does_not_carry_over_metadata() {
     let dir = TempDir::new().unwrap();
     let addrs = animusd::RoleAddrs {
         role: animusd::config::NodeRole::Control,
-        control: Some(free_addr()),
+        internal: free_addr(),
         client: free_addr(),
         dynamo: free_addr(),
         cql: free_addr(),
-        raftkv: None,
         admin: free_addr(),
     };
 

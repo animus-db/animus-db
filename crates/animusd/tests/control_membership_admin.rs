@@ -140,6 +140,17 @@ async fn control_members(admin_addr: SocketAddr) -> (u16, serde_json::Value) {
     admin(admin_addr, "GET", "/admin/control/members", None).await
 }
 
+/// `POST /admin/member/add` (ADR 0030 online growth) — registers a plain
+/// data-plane member with no control role at all, the collision target
+/// `add_control_member_collision_shapes` needs (ADR 0040 PR1: with one
+/// identity per node, a combined cluster's own bring-up ids are both control
+/// *and* data ids, so there is no id within `{0,1,2}` that is "a data-plane
+/// member but not a control voter" — this mints a genuinely distinct one).
+async fn add_member(admin_addr: SocketAddr, node: u64) -> (u16, serde_json::Value) {
+    let body = serde_json::json!({"node": node}).to_string();
+    admin(admin_addr, "POST", "/admin/member/add", Some(&body)).await
+}
+
 async fn add_control_member(
     admin_addr: SocketAddr,
     node: u64,
@@ -198,16 +209,15 @@ fn voters_of(body: &serde_json::Value) -> Option<Vec<u64>> {
 /// same shape `tests/decommission.rs::bring_up` uses.
 async fn bring_up_combined(n: usize, dir: &Path) -> (Vec<Node>, ClusterConfig) {
     for attempt in 0..16 {
-        let addrs = support::free_addrs(n * 6);
+        let addrs = support::free_addrs(n * 5);
         let nodes_cfg: Vec<RoleAddrs> = (0..n)
             .map(|i| RoleAddrs {
                 role: NodeRole::Both,
-                control: Some(addrs[6 * i]),
-                client: addrs[6 * i + 1],
-                dynamo: addrs[6 * i + 2],
-                cql: addrs[6 * i + 3],
-                raftkv: Some(addrs[6 * i + 4]),
-                admin: addrs[6 * i + 5],
+                internal: addrs[5 * i],
+                client: addrs[5 * i + 1],
+                dynamo: addrs[5 * i + 2],
+                cql: addrs[5 * i + 3],
+                admin: addrs[5 * i + 4],
             })
             .collect();
         let config = ClusterConfig { nodes: nodes_cfg };
@@ -269,15 +279,14 @@ async fn join_control_nonvoter(
     dir: &Path,
 ) -> (Node, RoleAddrs) {
     for attempt in 0..16 {
-        let raw = support::free_addrs(6);
+        let raw = support::free_addrs(5);
         let addrs = RoleAddrs {
             role: NodeRole::Control,
-            control: Some(raw[0]),
+            internal: raw[0],
             client: raw[1],
             dynamo: raw[2],
             cql: raw[3],
-            raftkv: None,
-            admin: raw[5],
+            admin: raw[4],
         };
         let bound = match animusd::Node::bind_control(
             new_control_id,
@@ -294,17 +303,12 @@ async fn join_control_nonvoter(
         };
         let mut client_route: BTreeMap<animus_env::NodeId, SocketAddr> = BTreeMap::new();
         for (i, a) in config.nodes.iter().enumerate() {
-            if a.role.has_control() {
-                client_route.insert(animusd::config::control_id(i), a.client);
-            }
-            if a.role.has_data() {
-                client_route.insert(animusd::config::raftkv_id(i), a.client);
-            }
+            client_route.insert(animusd::config::node_id(i), a.client);
         }
         let admin_addrs: Vec<SocketAddr> = config.nodes.iter().map(|n| n.admin).collect();
         let node = bound
             .start_control_with(
-                config.control_peer_book(),
+                config.peer_book(),
                 config.control_ids(),
                 client_route,
                 admin_addrs,
@@ -340,14 +344,13 @@ async fn grow_control_group_converges_everywhere() {
         assert_eq!(voters_of(&body), Some(vec![0, 1, 2]));
     }
 
-    // Bring up the 4th node as a quiet non-voter (control id 3 — free: control
-    // ids in this split config are {0,1,2}, raftkv ids start at 300).
-    let new_id = 3u64;
+    // Bring up a 5th node as a quiet non-voter (id 4 — free: `bring_up_split`'s
+    // 3 control-only + 1 data-only nodes already claim ids `{0,1,2,3}` under
+    // ADR 0040 PR1's one-identity-per-node scheme).
+    let new_id = 4u64;
     let (grown, grown_addrs) = join_control_nonvoter(&config, new_id, dir.path()).await;
     let grown_admin = grown.admin_addr();
-    let grown_control_addr = grown_addrs
-        .control
-        .expect("control-only node has a control addr");
+    let grown_control_addr = grown_addrs.internal;
 
     // Add it via the admin endpoint, on the leader.
     let (status, body) =
@@ -363,7 +366,7 @@ async fn grow_control_group_converges_everywhere() {
         let converged = async {
             loop {
                 let (status, body) = control_members(a).await;
-                if status == 200 && voters_of(&body) == Some(vec![0, 1, 2, 3]) {
+                if status == 200 && voters_of(&body) == Some(vec![0, 1, 2, 4]) {
                     return;
                 }
                 sleep(Duration::from_millis(200)).await;
@@ -371,7 +374,7 @@ async fn grow_control_group_converges_everywhere() {
         };
         timeout(Duration::from_secs(30), converged)
             .await
-            .unwrap_or_else(|_| panic!("node at {a} never converged to voters {{0,1,2,3}}"));
+            .unwrap_or_else(|_| panic!("node at {a} never converged to voters {{0,1,2,4}}"));
     }
 
     grown.shutdown();
@@ -406,10 +409,17 @@ async fn add_control_member_collision_shapes() {
         );
     }
 
-    // Collides with an existing data-plane member (raftkv id 300).
+    // Collides with an existing data-plane member that is not a control
+    // voter (a plain growth-style member registered directly via
+    // `POST /admin/member/add`, at an id well outside this combined
+    // cluster's own bring-up ids `{0,1,2}` and below `ALLOC_ID_BASE`).
     {
-        let (status, body) =
-            add_control_member(admin_addrs[leader], 300, admin_addrs[leader]).await;
+        let (status, body) = add_member(admin_addrs[leader], 50).await;
+        assert_eq!(
+            status, 200,
+            "registering the collision member failed: {body}"
+        );
+        let (status, body) = add_control_member(admin_addrs[leader], 50, admin_addrs[leader]).await;
         assert_eq!(
             status, 409,
             "adding a control voter at an existing member's id should be refused: {body}"
@@ -629,9 +639,7 @@ async fn runtime_added_voter_survives_leadership_change_to_a_different_original_
     // Add a 4th control voter through the current leader (`adder`).
     let new_id = 3u64;
     let (grown, grown_addrs) = join_control_nonvoter(&config, new_id, dir.path()).await;
-    let grown_control_addr = grown_addrs
-        .control
-        .expect("control-only node has a control addr");
+    let grown_control_addr = grown_addrs.internal;
 
     // Wait for `grown`'s own one-shot self-registration (`ClientCtx::
     // register_node_addrs`, relayed since it starts life a non-voter) to

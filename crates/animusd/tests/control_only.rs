@@ -51,21 +51,19 @@ async fn call(addr: SocketAddr, req: ClientRequest) -> ClientResponse {
 /// steal one in the window).
 async fn bring_up_control(n: usize, dir: &std::path::Path) -> (Vec<Node>, animusd::ClusterConfig) {
     for attempt in 0..16 {
-        // Six addresses per index even though a control-only entry only ever
-        // binds two of them (control, client, admin) — `RoleAddrs::dynamo`/
-        // `cql` aren't `Option` (ADR 0035 PR2 kept them plain), and matching
-        // the six-port stride keeps this config trivially comparable to a
-        // combined-mode one.
-        let addrs = free_addrs(n * 6);
+        // Five addresses per index even though a control-only entry only ever
+        // binds three of them (internal, client, admin) — `RoleAddrs::dynamo`/
+        // `cql` aren't `Option`, and matching the five-port stride (ADR 0040
+        // PR1) keeps this config trivially comparable to a combined-mode one.
+        let addrs = free_addrs(n * 5);
         let nodes_cfg: Vec<animusd::RoleAddrs> = (0..n)
             .map(|i| animusd::RoleAddrs {
                 role: animusd::config::NodeRole::Control,
-                control: Some(addrs[6 * i]),
-                client: addrs[6 * i + 1],
-                dynamo: addrs[6 * i + 2],
-                cql: addrs[6 * i + 3],
-                raftkv: None,
-                admin: addrs[6 * i + 5],
+                internal: addrs[5 * i],
+                client: addrs[5 * i + 1],
+                dynamo: addrs[5 * i + 2],
+                cql: addrs[5 * i + 3],
+                admin: addrs[5 * i + 4],
             })
             .collect();
         let config = animusd::ClusterConfig { nodes: nodes_cfg };
@@ -165,12 +163,12 @@ async fn control_only_cluster_elects_leader_and_serves_status() {
             let (s, config_view) = admin_get(node.admin_addr(), "/admin/config").await;
             assert_eq!(s, 200, "admin/config on {}", node.admin_addr());
             assert!(
-                config_view["raftkv_id"].is_null(),
-                "a control-only node has no raftkv id: {config_view}"
+                !config_view["node_id"].is_null(),
+                "every node has one id (ADR 0040 PR1), control-only included: {config_view}"
             );
             assert!(
-                config_view["addrs"]["raftkv"].is_null(),
-                "a control-only node has no raftkv address: {config_view}"
+                !config_view["addrs"]["internal"].is_null(),
+                "every role binds the one internal address (ADR 0040 PR1): {config_view}"
             );
             assert!(
                 config_view["addrs"]["dynamo"].is_null(),
@@ -382,26 +380,24 @@ async fn mixed_cluster_put_via_control_node_forwards_to_data_node() {
         // trio's voter set, and it mirrors the trio's `Metadata` via
         // `remote_metadata_sync_loop`.
         let (control_nodes, config, data_node) = 'bring_up: loop {
-            let addrs = free_addrs(4 * 6);
+            let addrs = free_addrs(4 * 5);
             let mut nodes_cfg: Vec<animusd::RoleAddrs> = (0..3)
                 .map(|i| animusd::RoleAddrs {
                     role: animusd::config::NodeRole::Control,
-                    control: Some(addrs[6 * i]),
-                    client: addrs[6 * i + 1],
-                    dynamo: addrs[6 * i + 2],
-                    cql: addrs[6 * i + 3],
-                    raftkv: None,
-                    admin: addrs[6 * i + 5],
+                    internal: addrs[5 * i],
+                    client: addrs[5 * i + 1],
+                    dynamo: addrs[5 * i + 2],
+                    cql: addrs[5 * i + 3],
+                    admin: addrs[5 * i + 4],
                 })
                 .collect();
             nodes_cfg.push(animusd::RoleAddrs {
                 role: animusd::config::NodeRole::Both,
-                control: Some(addrs[18]),
-                client: addrs[19],
-                dynamo: addrs[20],
-                cql: addrs[21],
-                raftkv: Some(addrs[22]),
-                admin: addrs[23],
+                internal: addrs[15],
+                client: addrs[16],
+                dynamo: addrs[17],
+                cql: addrs[18],
+                admin: addrs[19],
             });
             let config = animusd::ClusterConfig { nodes: nodes_cfg };
 
@@ -447,9 +443,10 @@ async fn mixed_cluster_put_via_control_node_forwards_to_data_node() {
 
         await_leader(&control_nodes).await;
 
-        // The data node's raftkv id (300 + 3 = 303) must become `Active`
-        // before a table's first tablet can be provisioned onto it.
-        force_active(&control_nodes, 303).await;
+        // The data node's own id (ADR 0040 PR1 — one identity per node, was
+        // `300 + 3 = 303`, now just `3`) must become `Active` before a
+        // table's first tablet can be provisioned onto it.
+        force_active(&control_nodes, 3).await;
 
         // A `Put` sent to a CONTROL node's client port: `cp_put` provisions
         // the table's first tablet (replicas = the one Active data member),

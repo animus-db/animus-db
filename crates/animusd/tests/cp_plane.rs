@@ -165,7 +165,7 @@ async fn reads_and_writes_route_through_the_raft_group() {
 /// node can forward/relay to any other. Here we assert the bootstrap members
 /// register and the entries replicate cluster-wide: every node sees a
 /// parseable `raftkv` address for each of the 3 CP group member ids
-/// (`raftkv_id(0..3)` = 300/301/302).
+/// (node ids `0..3`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn cp_member_addresses_register_and_replicate() {
     let dir = tempfile::tempdir().unwrap();
@@ -175,7 +175,7 @@ async fn cp_member_addresses_register_and_replicate() {
     let nodes = start_cluster(bound).await.unwrap();
     await_bootstrap(&nodes).await;
 
-    let want: Vec<u64> = (0..3).map(animusd::config::raftkv_id).collect();
+    let want: Vec<u64> = (0..3).map(animusd::config::node_id).collect();
     let replicated = async {
         loop {
             // Every node's replicated view has a parseable raftkv address for
@@ -185,7 +185,7 @@ async fn cp_member_addresses_register_and_replicate() {
                 want.iter().all(|id| {
                     m.node_addrs
                         .get(id)
-                        .and_then(|a| a.raftkv.parse::<std::net::SocketAddr>().ok())
+                        .and_then(|a| a.internal.parse::<std::net::SocketAddr>().ok())
                         .is_some()
                 })
             });

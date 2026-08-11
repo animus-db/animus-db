@@ -14,7 +14,6 @@
 use std::process::ExitCode;
 use std::time::Duration;
 
-use animusd::config::RAFTKV_ID_BASE;
 use animusd::{ClientRequest, ClientResponse, read_frame, write_frame};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -288,14 +287,14 @@ async fn run_admin(args: &[String]) -> Result<(), String> {
 ///
 /// **Combined-node-is-a-control-voter flow (ADR 0037 PR4, plan §7/§8):**
 /// `animusd`'s own `admin_remove_member` refuses the final `/admin/member/
-/// remove` step outright while `node`'s paired **control** id (`node -
-/// RAFTKV_ID_BASE`, the same combined-mode convention `animus admin
-/// control-add/-remove` already use) is a *current, live* control-plane
-/// voter (`ClientCtx::admin_remove_member`'s doc) — that server-side check is
-/// the actual authority. This flow adds a **friendlier, fail-fast** CLI-side
-/// pre-check so an operator doesn't drain a node for two minutes only to have
-/// the final step refused: it asks `GET /admin/control/members` up front and,
-/// if `node`'s control id is listed as a live voter:
+/// remove` step outright while `node` itself (ADR 0040 PR1: one identity per
+/// node — there is no more separate control id to derive) is a *current,
+/// live* control-plane voter (`ClientCtx::admin_remove_member`'s doc) — that
+/// server-side check is the actual authority. This flow adds a **friendlier,
+/// fail-fast** CLI-side pre-check so an operator doesn't drain a node for two
+/// minutes only to have the final step refused: it asks `GET
+/// /admin/control/members` up front and, if `node` is listed as a live
+/// voter:
 /// - without `force_control_remove`: refuses immediately with a clear
 ///   message naming the two-phase path, before ever touching `/admin/drain`;
 /// - with `force_control_remove`: runs the control-plane-membership removal
@@ -320,44 +319,38 @@ async fn run_decommission(
 ) -> Result<(), String> {
     let node: u64 = node.parse().map_err(|_| "node id must be a number")?;
 
-    if let Some(control_id) = node.checked_sub(RAFTKV_ID_BASE)
-        // Unreachable / non-200 (e.g. an old binary with no such route, or a
-        // follower's admin port before the caller even knows who leads):
-        // skip the pre-check and let the ordinary flow's own final `remove`
-        // step surface the authoritative refusal, if any.
-        && let Ok((200, resp)) = http_call(addr, "GET", "/admin/control/members", None).await
-    {
+    // Unreachable / non-200 (e.g. an old binary with no such route, or a
+    // follower's admin port before the caller even knows who leads):
+    // skip the pre-check and let the ordinary flow's own final `remove`
+    // step surface the authoritative refusal, if any.
+    if let Ok((200, resp)) = http_call(addr, "GET", "/admin/control/members", None).await {
         let is_live_voter = serde_json::from_str::<serde_json::Value>(&resp)
             .ok()
             .and_then(|v| v.get("voters").cloned())
             .and_then(|v| v.as_array().cloned())
-            .is_some_and(|voters| voters.iter().any(|x| x.as_u64() == Some(control_id)));
+            .is_some_and(|voters| voters.iter().any(|x| x.as_u64() == Some(node)));
         if is_live_voter {
             if !force_control_remove {
                 return Err(format!(
-                    "node {node} (control id {control_id}) is a current \
-                     control-plane voter; decommissioning it requires \
-                     removing it from the control group first. Retry with \
-                     `--force-control-remove`, or run `animus admin \
-                     control-remove {addr} {control_id}` yourself first"
+                    "node {node} is a current control-plane voter; \
+                     decommissioning it requires removing it from the control \
+                     group first. Retry with `--force-control-remove`, or run \
+                     `animus admin control-remove {addr} {node}` yourself first"
                 ));
             }
-            println!(
-                "node {node} is a control voter (control id {control_id}); \
-                 removing it from the control group first..."
-            );
+            println!("node {node} is a control voter; removing it from the control group first...");
             // `--force-control-remove` does NOT imply `--force`: these are
             // separate, independently-explicit escape hatches (see
             // `run_control_remove`'s doc). If the removal itself is refused
             // by the liveness guard, the operator must retry with `animus
-            // admin control-remove <addr> <control_id> --force` explicitly.
-            run_control_remove(addr, control_id, false).await?;
+            // admin control-remove <addr> <node> --force` explicitly.
+            run_control_remove(addr, node, false).await?;
             let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
             loop {
                 let (status, resp) = http_call(addr, "GET", "/admin/control/members", None).await?;
                 if status != 200 {
                     return Err(format!(
-                        "control/members failed while polling for {control_id}'s \
+                        "control/members failed while polling for {node}'s \
                          removal (HTTP {status}): {resp}"
                     ));
                 }
@@ -365,17 +358,17 @@ async fn run_decommission(
                     .ok()
                     .and_then(|v| v.get("voters").cloned())
                     .and_then(|v| v.as_array().cloned())
-                    .is_some_and(|voters| voters.iter().any(|x| x.as_u64() == Some(control_id)));
+                    .is_some_and(|voters| voters.iter().any(|x| x.as_u64() == Some(node)));
                 if !still_voter {
                     println!(
-                        "node {node} (control id {control_id}) is no longer a \
-                         control voter; proceeding with decommission..."
+                        "node {node} is no longer a control voter; \
+                         proceeding with decommission..."
                     );
                     break;
                 }
                 if tokio::time::Instant::now() >= deadline {
                     return Err(format!(
-                        "control id {control_id} was still a live voter 30s \
+                        "node {node} was still a live control voter 30s \
                          after control-remove; retry"
                     ));
                 }

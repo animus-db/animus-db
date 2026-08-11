@@ -145,7 +145,7 @@ async fn in_process_split_cluster_serves_writes_and_reports_roles() {
     // by the unmodified ADR 0012 heartbeat/detector chain (no test-side
     // force — mirrors `support::await_data_nodes_active`).
     let data_raftkv_ids: Vec<animus_env::NodeId> = (0..DATA_N)
-        .map(|i| animusd::config::raftkv_id(CONTROL_N + i))
+        .map(|i| animusd::config::node_id(CONTROL_N + i))
         .collect();
     timeout(Duration::from_secs(20), async {
         loop {
@@ -254,7 +254,7 @@ async fn fixed_control_node_write_read_is_deterministic() {
     .expect("control deployment did not elect a leader in 20s");
 
     let data_raftkv_ids: Vec<animus_env::NodeId> = (0..DATA_N)
-        .map(|i| animusd::config::raftkv_id(CONTROL_N + i))
+        .map(|i| animusd::config::node_id(CONTROL_N + i))
         .collect();
     timeout(Duration::from_secs(20), async {
         loop {
@@ -327,7 +327,7 @@ async fn single_shot_first_write_through_control_node_succeeds() {
     .expect("control deployment did not elect a leader in 20s");
 
     let data_raftkv_ids: Vec<animus_env::NodeId> = (0..DATA_N)
-        .map(|i| animusd::config::raftkv_id(CONTROL_N + i))
+        .map(|i| animusd::config::node_id(CONTROL_N + i))
         .collect();
     timeout(Duration::from_secs(20), async {
         loop {

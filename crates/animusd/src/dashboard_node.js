@@ -28,7 +28,7 @@ function renderNodeIdentity() {
     return;
   }
   const c = s.config;
-  const id = c.raftkv_id != null ? c.raftkv_id : c.control_id;
+  const id = c.node_id;
   $("nd-summary").textContent = `node ${id} · ${c.role}`;
   const addrRows = Object.entries(c.addrs || {})
     .filter(([, v]) => v != null)

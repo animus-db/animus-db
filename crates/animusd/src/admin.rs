@@ -308,22 +308,15 @@ async fn dispatch(ctx: &ClientCtx, request: &http::HttpRequest) -> (u16, String)
 
 // ---- read-only views ----------------------------------------------------
 
-/// This node's own deployment role, derived from the same two `Option`s the
-/// dashboard would otherwise have to null-check itself (ADR 0035 PR6) —
-/// `"control"` (no `raftkv_id`), `"data"` (no `control_id`), or `"combined"`
-/// (both present, every shape before ADR 0035 and still what `--cluster N`/
-/// plain `--config`/`--node` assemble). A node only ever authoritatively
-/// knows its *own* role this way; any *other* node's role is read from its
+/// This node's own deployment role — stamped literally at assembly time
+/// (ADR 0040 PR1: no longer inferred from `control_id`/`raftkv_id` presence,
+/// since a node has only one id now). A node only ever authoritatively knows
+/// its *own* role this way; any *other* node's role is read from its
 /// self-registered `NodeAddrs.role` in replicated `Metadata` instead (see
 /// [`peers_view`]) — this helper is only ever called with `ctx.admin`, never
 /// with data derived from a peer.
 fn node_role_str(a: &AdminInfo) -> &'static str {
-    match (a.control_id.is_some(), a.raftkv_id.is_some()) {
-        (true, false) => "control",
-        (false, true) => "data",
-        (true, true) => "combined",
-        (false, false) => "unknown", // structurally shouldn't happen
-    }
+    a.role
 }
 
 fn config_view(ctx: &ClientCtx) -> Value {
@@ -343,21 +336,20 @@ fn config_view(ctx: &ClientCtx) -> Value {
     let role = node_role_str(a);
     json!({
         "role": role,
-        // `null` on a data-only node (ADR 0035 PR4) — it has no local control
-        // `RaftCore`/id at all.
-        "control_id": a.control_id,
-        // `null` on a control-only node (ADR 0035 PR3) — it has no raftkv id.
-        "raftkv_id": a.raftkv_id,
+        // ADR 0040 PR1: one identity per node — `control_id`/`raftkv_id`
+        // merge into one `node_id`. `null` only for a hand-built `AdminInfo`
+        // with no internal role at all (doesn't occur in practice).
+        "node_id": a.node_id,
         "control_ids": a.control_ids,
         "addrs": {
-            // `null` on a data-only node — see `control_id` above.
-            "control": a.control_addr.map(|x| x.to_string()),
+            // ADR 0040 PR1: the one internal `ProdEnv` address (was
+            // `control`/`raftkv`, now merged).
+            "internal": a.internal_addr.map(|x| x.to_string()),
             "client": a.client_addr.to_string(),
             // `null` on a control-only node — these listeners are never bound
             // there.
             "dynamo": a.dynamo_addr.map(|x| x.to_string()),
             "cql": a.cql_addr.map(|x| x.to_string()),
-            "raftkv": a.raftkv_addr.map(|x| x.to_string()),
             "admin": a.admin_addr.to_string(),
         },
         "peers": peers,

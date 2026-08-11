@@ -32,11 +32,12 @@ can't reach: `split_fence_tests` (lib.rs:6452) and `auto_split_median_tests`
 - **`main.rs`** — thin CLI wrapper; dispatches the invocation modes (below) and
   wires `otel::init_tracing` + the Ctrl-C graceful-shutdown path.
 - **`config.rs`** — `ClusterConfig` (per-process deployment config), `RoleAddrs`
-  (a node's six addresses + `role: NodeRole` = `Control`/`Data`/`Both`),
-  role-filtered accessors (`control_ids`/`raftkv_ids`/`control_peer_book`/
-  `raftkv_peer_book`/`peer_book`), `generate`/`generate_split`, and the
-  **six-port stride** (`base_port + 6*i + {control,client,dynamo,cql,raftkv,
-  admin}`; node ids: control `i`, raftkv `300+i`).
+  (a node's five addresses + `role: NodeRole` = `Control`/`Data`/`Both`),
+  role-filtered accessors (`control_ids`/`data_ids`/`peer_book`),
+  `generate`/`generate_split`, and the **five-port stride** (`base_port +
+  5*i + {internal,client,dynamo,cql,admin}`; node id = `i` — ADR 0040 PR1
+  merged the pre-existing `control i` / `raftkv 300+i` pair into one
+  identity per node).
 - **`control_handle.rs`** — the `ControlHandle` seam (ADR 0035 PR1):
   `Local(RaftNode<ProdEnv>)` for a node with real control Raft, vs.
   `Remote(RemoteControlClient)` for a data-only node reaching a separate control
@@ -489,10 +490,16 @@ route below the edge through the same `ClientCtx` CP primitives.
 
 ## Gotchas
 
-- **A node runs two internal `ProdEnv` roles on distinct ids** — control (id `i`)
-  and raftkv (id `300+i`) — because one inbox is single-consumer; never run two
-  protocols on one node id. The client API is a plain TCP server, *not* on the
-  `Network` — a non-leader forwards over a fresh client connection.
+- **A node runs one internal `ProdEnv`, on one id (ADR 0040 PR1)** — the control
+  Raft rides `PRIMARY_STREAM` (stream 0, ADR 0026's default); every per-tablet
+  Raft group this node hosts rides its own stream (`stream = tablet_id`, which
+  floors at 1), so the two never collide on the one shared inbox. Before ADR
+  0040, a combined node bound *two* `ProdEnv`s on two distinct ids (`control
+  i` / `raftkv 300+i`) purely because one inbox was single-consumer — ADR 0026
+  made that unnecessary by letting one id host several protocol instances,
+  and ADR 0040 PR1 is "actually stop paying for the second id." The client API
+  is a plain TCP server, *not* on the `Network` — a non-leader forwards over a
+  fresh client connection.
 - **`ClusterEdgeState` is scoped to one NODE** (ADR 0031 PR2), created fresh per
   node — even in `--cluster N`, which previously shared one instance across the
   cluster and masked cross-process bugs. Holds this node's own control handle, its
@@ -507,11 +514,13 @@ route below the edge through the same `ClientCtx` CP primitives.
   `--ephemeral` does NOT make the control/raftkv WALs ephemeral (it only selects
   the CP-data `StorageBackend`). Two concurrent `--cluster N` runs contend on the
   same on-disk WALs — always pass a fresh explicit `--dir` for a throwaway run.
-- **The cluster's members are the raftkv ids, not the control ids** — `bootstrap`
-  (leader-only, idempotent) registers `300+i` as `Active`. Failure detection runs
-  over `ProdEnv`: each node's `heartbeat_loop_live` heartbeats the control group
-  *as its raftkv id*, so the control leader's `detect_loop` marks a crashed CP
-  node `Down`. **`heartbeat_loop_live`'s destination list is now live (ADR 0037
+- **The cluster's members are node ids** (ADR 0040 PR1 — before this, "the
+  raftkv ids, not the control ids"; the two are now the same id space) —
+  `bootstrap` (leader-only, idempotent) registers each data-role node's own id
+  as `Active`. Failure detection runs over `ProdEnv`: each node's
+  `heartbeat_loop_live` heartbeats the control group *as its own member id*,
+  so the control leader's `detect_loop` marks a crashed node `Down`.
+  **`heartbeat_loop_live`'s destination list is now live (ADR 0037
   hardening PR1, PR #134 — closing the ADR 0037 PR4 audit's deferred gap)**: it
   re-derives the control-group target list from `ctx.control.config()` every
   tick, instead of the bring-up-time `control_ids` snapshot the older
@@ -521,10 +530,13 @@ route below the edge through the same `ClientCtx` CP primitives.
   data-only node falls back to the static list until its first live
   `Status`/`WatchMetadata` reply lands. **Closing this needed a second,
   previously-undocumented fix the original deferral text never named**:
-  `peer_sync_loop` (`lib.rs`, near `control_peer_sync_loop` below) now also
-  merges `Metadata.node_addrs[*].control` into the raftkv env's own peer
-  book — without it, a live destination list alone is still inert, since
-  `ProdEnv::send` silently drops a heartbeat aimed at an address-less peer.
+  `peer_sync_loop` (`lib.rs`) also merges `Metadata.node_addrs[*].internal`
+  (ADR 0040 PR1 — was `.control`/`.raftkv`, now one field; this loop is also
+  the sole survivor of what used to be a `peer_sync_loop`/
+  `control_peer_sync_loop` pair, collapsed into one loop over one shared env's
+  peer book) into the node's own peer book — without it, a live destination
+  list alone is still inert, since `ProdEnv::send` silently drops a heartbeat
+  aimed at an address-less peer.
   See `docs/engineering-lessons.md`'s entry on this PR for the
   two-staleness-axes mini-lesson (a static-destination-list audit must also
   check the transport address book) and ADR 0037's "Known deferrals" section
@@ -568,19 +580,20 @@ route below the edge through the same `ClientCtx` CP primitives.
   ADR 0037 PR4 PR description (every other read is a legitimate seed/
   bootstrap use, left static on purpose).
 - **Cluster-allocated member ids (ADR 0036)** live in a disjoint id range
-  (`animus_control::meta::ALLOC_ID_BASE = 1_000_000`, far above
-  `config::RAFTKV_ID_BASE = 300`) so an allocated id can never collide with an
-  operator-chosen `--node I` id — see `MetaCommand::AllocateNodeId`'s doc in
-  `animus-control` for the allocator itself. `config::synthetic_control_id_for`
-  (`raftkv_id | (1 << 63)`) derives a combined-mode allocated join's *local,
-  non-replicated* placeholder control id from its freshly minted raftkv id
-  (there's no small operator index to derive one from, unlike `control_id
-  (index)`) — never written to `Metadata`, never dialed by another process,
-  purely a structurally-safe permanent-non-voter placeholder exactly like a
-  `--node`-indexed join's real control id serves. `is_relayable_command`
-  (below) must allow `AllocateNodeId` — a joining process has no local
-  control role at all yet, so it is that process's *only* way to reach the
-  real leader.
+  (`animus_control::meta::ALLOC_ID_BASE = 1_000_000`, far above any small
+  `--node I` index) so an allocated id can never collide with an
+  operator-chosen one — see `MetaCommand::AllocateNodeId`'s doc in
+  `animus-control` for the allocator itself. **ADR 0040 PR1 simplification**:
+  since a node now has exactly one id (no more separate control/raftkv id
+  pair), an allocated join's id *is* its one identity, full stop — the old
+  `config::synthetic_control_id_for` (`raftkv_id | (1 << 63)`, a *local,
+  non-replicated* placeholder control id derived from the freshly minted
+  raftkv id, since there was no small operator index to derive one from
+  otherwise) is gone; the discovered `original_control_ids` set simply
+  doesn't contain the new id, which is what makes it a structurally-safe
+  permanent non-voter now. `is_relayable_command` (below) must allow
+  `AllocateNodeId` — a joining process has no local control role at all yet,
+  so it is that process's *only* way to reach the real leader.
 - **Control-plane membership change (ADR 0037 PR3)**: `ClientCtx::
   admin_add_control_member`/`admin_remove_control_member` (`lib.rs`, near
   `admin_add_member`/`admin_remove_member`) grow/shrink the control group's
@@ -622,11 +635,12 @@ route below the edge through the same `ClientCtx` CP primitives.
   bring-up had to sequence around).
   Remove's original quorum-loss warning (down to 1 voter) was the only
   implemented trigger — the plan's second trigger ("every other voter
-  believed Down") was originally dropped: `ControlHandle::believes_alive` is
-  keyed to **raftkv** ids (see the "cluster's members are the raftkv ids,
-  not the control ids" gotcha above), so calling it with a control id is
-  always `false`, not "unknown" — see the engineering-lessons "id-space
-  mismatch" entry.
+  believed Down") was originally dropped: pre-ADR-0040,
+  `ControlHandle::believes_alive` was keyed to a distinct **raftkv** id space
+  the control ids didn't share, so calling it with a control id was always
+  `false`, not "unknown" — see the engineering-lessons "id-space mismatch"
+  entry. ADR 0040 PR1 has since dissolved that mismatch structurally (one id
+  per node), but the dedicated signal below remains the more precise one.
 
   **Update (ADR 0037 hardening PR2, PR #136, the quorum-guard liveness fix): a real
   survivor-liveness trigger now exists**, via a genuinely control-id-native

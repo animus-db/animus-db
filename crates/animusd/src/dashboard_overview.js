@@ -5,7 +5,7 @@
 // admin console), a per-table breakdown (real data — the design's "Recent
 // activity" panel is dropped, since there is no backend event log to back
 // it), and a tablets-per-node balance chart. Depends on `dashboard_core.js`
-// having loaded first (STATE, $, esc, pill, dot, consoleLink, nodeRaftkvId,
+// having loaded first (STATE, $, esc, pill, dot, consoleLink, nodeIdOf,
 // nodeDisplayId, cpGroupsByTablet, tabletStatus, worstTabletStatus,
 // statusDotClass, computeHealth, activateTab).
 
@@ -31,7 +31,7 @@ function renderOverview() {
     .filter((n) => (n.ok && n.config && n.config.role === "control") ||
       (!(n.ok && n.config) && n.role === "control"))
     .map((n) => ({
-      id: (n.config && n.config.control_id != null) ? n.config.control_id : n.addr,
+      id: (n.config && n.config.node_id != null) ? n.config.node_id : n.addr,
       role: "control", up: n.ok, base: n.ok ? n.base : null,
       detail: n.ok ? ((n.raft && n.raft.is_leader) ? "control leader" : "control node") : "control node",
       statusText: n.ok ? "reachable" : "unreachable",
@@ -51,11 +51,8 @@ function renderOverview() {
   // which shows up in the healthy banner's forming count instead, called out
   // explicitly as NOT at risk. A lingering `Down` member with nothing left
   // depending on it is also not degrading; `downCount` is still called out
-  // for context. `nodeDisplayId`, not `nodeRaftkvId` — the control leader may
-  // be a control-ONLY node (ADR 0035), which has no `raftkv_id` at all
-  // (`null`); `nodeDisplayId` falls back to `control_id` so a split
-  // deployment's control leader shows a real node number instead of "node
-  // null".
+  // for context. `nodeDisplayId` renders this node's one id (ADR 0040 PR1 —
+  // there is no more separate raftkv/control id pair to fall back between).
   const bannerSummary = h.status === "critical"
     ? (!h.controlLeader
         ? "No control-plane leader known — the cluster cannot accept metadata changes right now."
@@ -109,12 +106,12 @@ function renderOverview() {
   // `/admin/peers` itself, ADR 0035 residual follow-up) so a node whose own
   // fan-out hasn't resolved yet still reads as its real role instead of a
   // generic guess.
-  const dataRows = (memberIds.length ? memberIds : STATE.nodes.filter((n) => n.ok).map((n) => n.config.raftkv_id))
+  const dataRows = (memberIds.length ? memberIds : STATE.nodes.filter((n) => n.ok).map((n) => n.config.node_id))
     .map((id) => {
       const m = members[id];
-      const node = nodeByRaftkv(id);
+      const node = nodeById(id);
       const up = m ? m.status === "Active" : !!(node && node.ok);
-      const hostedCount = groups && Object.values(groups).flat().filter((x) => nodeRaftkvId(x.node) === id).length;
+      const hostedCount = groups && Object.values(groups).flat().filter((x) => nodeIdOf(x.node) === id).length;
       const role = (node && ((node.config && node.config.role) || node.role)) || "data";
       return {
         id, role, up,
@@ -162,7 +159,7 @@ function renderOverview() {
   $("ov-tables").innerHTML = tableRows || `<div class="empty">no tables yet</div>`;
 
   // ---- balance: tablets per node ----
-  const counts = memberIds.map((id) => (Object.values(groups).flat().filter((x) => nodeRaftkvId(x.node) === id).length));
+  const counts = memberIds.map((id) => (Object.values(groups).flat().filter((x) => nodeIdOf(x.node) === id).length));
   const downSet = new Set(memberIds.filter((id) => members[id] && members[id].status !== "Active"));
   const max = Math.max(...counts, 0);
   const min = counts.length ? Math.min(...counts) : 0;

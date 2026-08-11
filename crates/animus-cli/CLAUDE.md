@@ -82,11 +82,11 @@ control-grow <leader-admin-addr> <node-id> <admin-addr> [<node-id> <admin-addr>.
   PR4)**: `run_decommission` asks `GET /admin/control/members` up front
   (best-effort — an old binary/route-miss just skips this pre-check and
   falls through to the ordinary flow, whose own final `remove` step still
-  carries the authoritative refusal); if the target's paired **control** id
-  (`node - RAFTKV_ID_BASE`, the same combined-mode convention `control-add`/
-  `control-remove` already use) is a live voter, it refuses immediately
-  (before ever draining) unless `--force-control-remove` is passed, in which
-  case it runs `control-remove` + polls to convergence *first*, then falls
+  carries the authoritative refusal); if `node` itself (ADR 0040 PR1: one
+  identity per node — there is no more separate control id to derive) is a
+  live voter, it refuses immediately (before ever draining) unless
+  `--force-control-remove` is passed, in which case it runs `control-remove`
+  + polls to convergence *first*, then falls
   through to the unchanged drain → drain-status → remove flow. The
   authoritative refusal always lives server-side in `admin_remove_member`
   (`animusd`) — this is a friendlier, fail-fast CLI-side mirror of it, not a

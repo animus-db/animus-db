@@ -254,7 +254,7 @@ async fn node_joins_via_seed_with_no_expanded_config() {
     // 2. Join a 4th node passing ONLY the core's client addresses as seeds —
     // no expanded config object anywhere in this test.
     let join_index = core_config.len();
-    let join_raftkv_id = animusd::config::raftkv_id(join_index);
+    let join_raftkv_id = animusd::config::node_id(join_index);
     let (joined, joined_addrs, joined_dir) = join_fresh(
         &core_clients,
         join_index,
@@ -346,15 +346,14 @@ async fn node_joins_via_seed_with_no_expanded_config() {
     // 7. Collision: joining at the SAME index with DIFFERENT addresses must
     // fail loudly (the collision guard), and the cluster stays unharmed.
     let collision_addrs = {
-        let raw = support::free_addrs(6);
+        let raw = support::free_addrs(5);
         RoleAddrs {
             role: animusd::config::NodeRole::Both,
-            control: Some(raw[0]),
+            internal: raw[0],
             client: raw[1],
             dynamo: raw[2],
             cql: raw[3],
-            raftkv: Some(raw[4]),
-            admin: raw[5],
+            admin: raw[4],
         }
     };
     let collision_result = animusd::run_node_join(

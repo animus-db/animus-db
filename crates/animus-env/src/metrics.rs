@@ -439,6 +439,18 @@ impl MetricsHandle {
     pub fn snapshot(&self) -> MetricSnapshot {
         self.sink.snapshot()
     }
+
+    /// Whether `self` and `other` record into the **same** underlying sink
+    /// (`Arc::ptr_eq`) — i.e. two handles obtained from the same `Env`
+    /// (possibly via distinct clones/roles). ADR 0040 PR1 merged a combined
+    /// node's two internal `ProdEnv` roles into one, so a caller that used to
+    /// aggregate "the control-role sink" and "the raftkv-role sink" as two
+    /// distinct handles must first check they aren't now the same handle
+    /// (summing a snapshot with itself would double-count every counter).
+    #[must_use]
+    pub fn is_same_sink(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.sink, &other.sink)
+    }
 }
 
 /// An exported point-in-time view of all metrics, in deterministic order.

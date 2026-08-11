@@ -255,7 +255,7 @@ async fn decommission_drains_removes_and_allows_id_reuse() {
     // 2. Join a 4th node so it gains a real tablet replica via rebalancing —
     // the data-plane hosted-voters signal, not just a `Metadata` member.
     let join_index = core_config.len();
-    let join_raftkv_id = animusd::config::raftkv_id(join_index);
+    let join_raftkv_id = animusd::config::node_id(join_index);
     let (joined, _joined_addrs, _joined_dir) = join_fresh(
         &core_clients,
         join_index,
@@ -307,7 +307,7 @@ async fn decommission_drains_removes_and_allows_id_reuse() {
     // 3. Refusal: an original control-core member can never be decommissioned
     // this way, regardless of its status.
     {
-        let core_raftkv_id = animusd::config::raftkv_id(0);
+        let core_raftkv_id = animusd::config::node_id(0);
         let (status, body) = remove_member(core_admin[leader], core_raftkv_id).await;
         assert_eq!(
             status, 409,
@@ -488,7 +488,7 @@ async fn dashboard_health_recovers_after_decommission_shrink() {
     let mut joined_ids = Vec::new();
     for i in 0..2 {
         let join_index = core_config.len() + i;
-        let join_raftkv_id = animusd::config::raftkv_id(join_index);
+        let join_raftkv_id = animusd::config::node_id(join_index);
         let (node, addrs, _node_dir) = join_fresh(
             &core_clients,
             join_index,
@@ -696,7 +696,7 @@ async fn decommission_refuses_live_control_voter_then_succeeds_after_control_rem
         StorageBackend::default(),
     )
     .await;
-    let join_raftkv_id = animusd::config::raftkv_id(join_index);
+    let join_raftkv_id = animusd::config::node_id(join_index);
     let promoted = async {
         loop {
             if member_statuses(core_admin[0])
@@ -723,7 +723,7 @@ async fn decommission_refuses_live_control_voter_then_succeeds_after_control_rem
         .find(|&i| i != leader)
         .expect("a non-leader exists in a 3-node core");
     let target_control_id = target as u64;
-    let target_raftkv_id = animusd::config::raftkv_id(target);
+    let target_raftkv_id = animusd::config::node_id(target);
     let leader_admin = core_admin[leader];
 
     // 4. Drain the target and poll to convergence — its replicas relocate to

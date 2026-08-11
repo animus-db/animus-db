@@ -163,15 +163,14 @@ async fn join_control_nonvoter(
     dir: &Path,
 ) -> (Node, RoleAddrs) {
     for attempt in 0..16 {
-        let raw = support::free_addrs(6);
+        let raw = support::free_addrs(5);
         let addrs = RoleAddrs {
             role: NodeRole::Control,
-            control: Some(raw[0]),
+            internal: raw[0],
             client: raw[1],
             dynamo: raw[2],
             cql: raw[3],
-            raftkv: None,
-            admin: raw[5],
+            admin: raw[4],
         };
         let bound = match animusd::Node::bind_control(
             new_control_id,
@@ -188,17 +187,12 @@ async fn join_control_nonvoter(
         };
         let mut client_route: BTreeMap<animus_env::NodeId, SocketAddr> = BTreeMap::new();
         for (i, a) in config.nodes.iter().enumerate() {
-            if a.role.has_control() {
-                client_route.insert(animusd::config::control_id(i), a.client);
-            }
-            if a.role.has_data() {
-                client_route.insert(animusd::config::raftkv_id(i), a.client);
-            }
+            client_route.insert(animusd::config::node_id(i), a.client);
         }
         let admin_addrs: Vec<SocketAddr> = config.nodes.iter().map(|n| n.admin).collect();
         let node = bound
             .start_control_with(
-                config.control_peer_book(),
+                config.peer_book(),
                 config.control_ids(),
                 client_route,
                 admin_addrs,
@@ -238,11 +232,12 @@ async fn await_voters_everywhere(probes: &[SocketAddr], want: &[u64], secs: u64,
 async fn grow_then_replace_a_voter_over_a_split_deployment_with_live_data_traffic() {
     timeout(Duration::from_secs(150), async {
         let dir = tempfile::tempdir().unwrap();
-        // 3 control-only (ids 0,1,2) + 2 data-only (raftkv ids 303,304).
+        // 3 control-only (ids 0,1,2) + 2 data-only (ids 3,4 — ADR 0040 PR1:
+        // one identity per node).
         let (control_nodes, data_nodes, config) = bring_up_split(3, 2, dir.path()).await;
         await_leader(&control_nodes).await;
         let data_raftkv_ids: Vec<animus_env::NodeId> =
-            (3..5).map(animusd::config::raftkv_id).collect();
+            (3..5).map(animusd::config::node_id).collect();
         await_data_nodes_active(&control_nodes, &data_raftkv_ids).await;
 
         let data_clients: Vec<SocketAddr> = data_nodes.iter().map(Node::client_addr).collect();
@@ -307,12 +302,12 @@ async fn grow_then_replace_a_voter_over_a_split_deployment_with_live_data_traffi
             .iter()
             .position(Node::is_control_leader)
             .expect("no control leader");
-        let new_id = 3u64;
+        // Free id: `bring_up_split(3, 2, ..)`'s 5 nodes already claim
+        // `{0,1,2,3,4}`.
+        let new_id = 5u64;
         let (grown, grown_addrs) = join_control_nonvoter(&config, new_id, dir.path()).await;
         let grown_admin = grown.admin_addr();
-        let grown_control_addr = grown_addrs
-            .control
-            .expect("control-only node has a control addr");
+        let grown_control_addr = grown_addrs.internal;
 
         let (status, body) =
             add_control_member(control_admin[leader_idx], new_id, grown_control_addr).await;
@@ -321,7 +316,7 @@ async fn grow_then_replace_a_voter_over_a_split_deployment_with_live_data_traffi
         let mut probes = control_admin.clone();
         probes.push(grown_admin);
         probes.extend(data_admin.iter().copied());
-        await_voters_everywhere(&probes, &[0, 1, 2, 3], 30, "post-grow").await;
+        await_voters_everywhere(&probes, &[0, 1, 2, 5], 30, "post-grow").await;
 
         // Data traffic still flows after the grow.
         put(&data_clients, "membership_t", b"post-grow", b"ok", 20).await;
@@ -394,14 +389,12 @@ async fn grow_then_replace_a_voter_over_a_split_deployment_with_live_data_traffi
         )
         .await;
 
-        // Add a brand-new voter (id 4) as the replacement.
-        let replacement_id = 4u64;
+        // Add a brand-new voter (a fresh, still-unused id) as the replacement.
+        let replacement_id = 6u64;
         let (replacement, replacement_addrs) =
             join_control_nonvoter(&config, replacement_id, dir.path()).await;
         let replacement_admin = replacement.admin_addr();
-        let replacement_control_addr = replacement_addrs
-            .control
-            .expect("control-only node has a control addr");
+        let replacement_control_addr = replacement_addrs.internal;
 
         // Find whichever surviving node (the two live originals, or the
         // just-grown 4th) is currently leader.

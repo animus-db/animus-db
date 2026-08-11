@@ -910,11 +910,10 @@ mod tests {
     fn register_node_addrs_writes_the_address_book_entry() {
         let mut meta = Metadata::default();
         let addrs = NodeAddrs {
-            raftkv: "a".to_string(),
+            internal: "a".to_string(),
             client: "b".to_string(),
             admin: "c".to_string(),
             role: "combined".to_string(),
-            control: None,
         };
         let command = MetaCommand::RegisterNodeAddrs {
             node: 3,

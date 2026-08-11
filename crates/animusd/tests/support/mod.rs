@@ -41,16 +41,15 @@ pub fn free_addrs(count: usize) -> Vec<SocketAddr> {
 
 /// A single-node config pinned to fresh ephemeral addresses.
 fn single_node_config() -> ClusterConfig {
-    let a = free_addrs(6);
+    let a = free_addrs(5);
     ClusterConfig {
         nodes: vec![RoleAddrs {
             role: animusd::config::NodeRole::Both,
-            control: Some(a[0]),
+            internal: a[0],
             client: a[1],
             dynamo: a[2],
             cql: a[3],
-            raftkv: Some(a[4]),
-            admin: a[5],
+            admin: a[4],
         }],
     }
 }
@@ -119,16 +118,15 @@ pub async fn bring_up_deadline(
     let hard_deadline = tokio::time::Instant::now() + deadline;
     let mut attempt: u64 = 0;
     loop {
-        let addrs = free_addrs(n * 6);
+        let addrs = free_addrs(n * 5);
         let nodes_cfg: Vec<RoleAddrs> = (0..n)
             .map(|i| RoleAddrs {
                 role: NodeRole::Both,
-                control: Some(addrs[6 * i]),
-                client: addrs[6 * i + 1],
-                dynamo: addrs[6 * i + 2],
-                cql: addrs[6 * i + 3],
-                raftkv: Some(addrs[6 * i + 4]),
-                admin: addrs[6 * i + 5],
+                internal: addrs[5 * i],
+                client: addrs[5 * i + 1],
+                dynamo: addrs[5 * i + 2],
+                cql: addrs[5 * i + 3],
+                admin: addrs[5 * i + 4],
             })
             .collect();
         let config = ClusterConfig { nodes: nodes_cfg };
@@ -174,17 +172,16 @@ pub async fn grow_deadline(
     let hard_deadline = tokio::time::Instant::now() + deadline;
     let mut attempt: u64 = 0;
     loop {
-        let addrs = free_addrs(extra * 6);
+        let addrs = free_addrs(extra * 5);
         let mut nodes_cfg = base.nodes.clone();
         for i in 0..extra {
             nodes_cfg.push(RoleAddrs {
                 role: NodeRole::Both,
-                control: Some(addrs[6 * i]),
-                client: addrs[6 * i + 1],
-                dynamo: addrs[6 * i + 2],
-                cql: addrs[6 * i + 3],
-                raftkv: Some(addrs[6 * i + 4]),
-                admin: addrs[6 * i + 5],
+                internal: addrs[5 * i],
+                client: addrs[5 * i + 1],
+                dynamo: addrs[5 * i + 2],
+                cql: addrs[5 * i + 3],
+                admin: addrs[5 * i + 4],
             });
         }
         let expanded = ClusterConfig { nodes: nodes_cfg };
@@ -246,15 +243,14 @@ pub async fn join_fresh_deadline(
     let hard_deadline = tokio::time::Instant::now() + deadline;
     let mut attempt: u64 = 0;
     loop {
-        let raw = free_addrs(6);
+        let raw = free_addrs(5);
         let addrs = RoleAddrs {
             role: NodeRole::Both,
-            control: Some(raw[0]),
+            internal: raw[0],
             client: raw[1],
             dynamo: raw[2],
             cql: raw[3],
-            raftkv: Some(raw[4]),
-            admin: raw[5],
+            admin: raw[4],
         };
         let node_dir = dir.join(format!("join-{index}-{attempt}"));
         match animusd::run_node_join(seeds.to_vec(), index, addrs, &node_dir, backend).await {
@@ -284,15 +280,14 @@ pub async fn join_data_fresh_deadline(
     let hard_deadline = tokio::time::Instant::now() + deadline;
     let mut attempt: u64 = 0;
     loop {
-        let raw = free_addrs(6);
+        let raw = free_addrs(5);
         let addrs = RoleAddrs {
             role: NodeRole::Data,
-            control: None,
+            internal: raw[0],
             client: raw[1],
             dynamo: raw[2],
             cql: raw[3],
-            raftkv: Some(raw[4]),
-            admin: raw[5],
+            admin: raw[4],
         };
         let node_dir = dir.join(format!("data-join-{index}-{attempt}"));
         match animusd::run_node_data_join(seeds.to_vec(), index, addrs, &node_dir, backend).await {
@@ -325,15 +320,14 @@ pub async fn join_allocated_fresh_deadline(
     let hard_deadline = tokio::time::Instant::now() + deadline;
     let mut attempt: u64 = 0;
     loop {
-        let raw = free_addrs(6);
+        let raw = free_addrs(5);
         let addrs = RoleAddrs {
             role: NodeRole::Both,
-            control: Some(raw[0]),
+            internal: raw[0],
             client: raw[1],
             dynamo: raw[2],
             cql: raw[3],
-            raftkv: Some(raw[4]),
-            admin: raw[5],
+            admin: raw[4],
         };
         let node_dir = dir.join(format!("join-alloc-{label}-{attempt}"));
         match animusd::run_node_join_allocated(
@@ -371,15 +365,14 @@ pub async fn join_data_allocated_fresh_deadline(
     let hard_deadline = tokio::time::Instant::now() + deadline;
     let mut attempt: u64 = 0;
     loop {
-        let raw = free_addrs(6);
+        let raw = free_addrs(5);
         let addrs = RoleAddrs {
             role: NodeRole::Data,
-            control: None,
+            internal: raw[0],
             client: raw[1],
             dynamo: raw[2],
             cql: raw[3],
-            raftkv: Some(raw[4]),
-            admin: raw[5],
+            admin: raw[4],
         };
         let node_dir = dir.join(format!("data-join-alloc-{label}-{attempt}"));
         match animusd::run_node_data_join_allocated(
@@ -420,7 +413,7 @@ pub async fn bring_up_split(
 ) -> (Vec<Node>, Vec<Node>, ClusterConfig) {
     let total = control_n + data_n;
     for attempt in 0..16 {
-        let addrs = free_addrs(total * 6);
+        let addrs = free_addrs(total * 5);
         let nodes_cfg: Vec<RoleAddrs> = (0..total)
             .map(|i| {
                 let role = if i < control_n {
@@ -430,12 +423,11 @@ pub async fn bring_up_split(
                 };
                 RoleAddrs {
                     role,
-                    control: role.has_control().then_some(addrs[6 * i]),
-                    client: addrs[6 * i + 1],
-                    dynamo: addrs[6 * i + 2],
-                    cql: addrs[6 * i + 3],
-                    raftkv: role.has_data().then_some(addrs[6 * i + 4]),
-                    admin: addrs[6 * i + 5],
+                    internal: addrs[5 * i],
+                    client: addrs[5 * i + 1],
+                    dynamo: addrs[5 * i + 2],
+                    cql: addrs[5 * i + 3],
+                    admin: addrs[5 * i + 4],
                 }
             })
             .collect();

@@ -27,16 +27,15 @@ mod support;
 /// mitigation, see the crate guide).
 async fn bring_up(n: usize, dir: &std::path::Path) -> (Vec<Node>, animusd::ClusterConfig) {
     for attempt in 0..16 {
-        let addrs = support::free_addrs(n * 6);
+        let addrs = support::free_addrs(n * 5);
         let nodes_cfg: Vec<animusd::RoleAddrs> = (0..n)
             .map(|i| animusd::RoleAddrs {
                 role: animusd::config::NodeRole::Both,
-                control: Some(addrs[6 * i]),
-                client: addrs[6 * i + 1],
-                dynamo: addrs[6 * i + 2],
-                cql: addrs[6 * i + 3],
-                raftkv: Some(addrs[6 * i + 4]),
-                admin: addrs[6 * i + 5],
+                internal: addrs[5 * i],
+                client: addrs[5 * i + 1],
+                dynamo: addrs[5 * i + 2],
+                cql: addrs[5 * i + 3],
+                admin: addrs[5 * i + 4],
             })
             .collect();
         let config = animusd::ClusterConfig { nodes: nodes_cfg };
@@ -271,15 +270,15 @@ async fn dashboard_serves_spa_with_cors_and_peers() {
         assert_eq!(s, 200, "dashboard_core.js is served");
         assert!(
             core_js.contains("function nodeDisplayId"),
-            "dashboard_core.js defines nodeDisplayId (falls back to control_id \
-             for a control-only leader, ADR 0035)"
+            "dashboard_core.js defines nodeDisplayId (renders a node's one id, \
+             ADR 0040 PR1 — works for a control-only leader too, since every \
+             role now has exactly one id)"
         );
         let (s, _, overview_js) = raw(admin_addr, "GET", "/admin/ui/dashboard_overview.js").await;
         assert_eq!(s, 200, "dashboard_overview.js is served");
         assert!(
             overview_js.contains("nodeDisplayId(h.controlLeader)"),
-            "the control-plane tile/banner label the leader via nodeDisplayId, \
-             not nodeRaftkvId (which is null for a control-only leader)"
+            "the control-plane tile/banner label the leader via nodeDisplayId"
         );
         assert!(
             overview_js.contains("config.role"),
@@ -313,7 +312,7 @@ async fn dashboard_role_gating_split_deployment() {
         let (control_nodes, data_nodes, _config) = support::bring_up_split(1, 1, dir.path()).await;
         support::await_leader(&control_nodes).await;
         let data_raftkv_ids: Vec<animus_env::NodeId> =
-            (1..2).map(animusd::config::raftkv_id).collect();
+            (1..2).map(animusd::config::node_id).collect();
         support::await_data_nodes_active(&control_nodes, &data_raftkv_ids).await;
 
         let control_admin = control_nodes[0].admin_addr();

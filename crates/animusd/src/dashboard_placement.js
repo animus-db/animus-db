@@ -5,7 +5,7 @@
 // CPU/mem/disk bars: nothing in this codebase samples host resources, and
 // fabricating them would violate this admin tool's ground-truth-data ethos.
 // Click a card to see that node's tablets. Depends on `dashboard_core.js`
-// (STATE, $, esc, pill, dot, nodeRaftkvId, cpGroupsByTablet, tabletStatus,
+// (STATE, $, esc, pill, dot, nodeIdOf, cpGroupsByTablet, tabletStatus,
 // gotoStorage) having loaded first.
 
 let placementSelectedNode = null;
@@ -19,7 +19,7 @@ function tabletsForNode(nodeId, tablets, groups) {
     .map((id) => {
       const t = tablets[id];
       const gs = groups[id] || [];
-      const rep = gs.find((x) => nodeRaftkvId(x.node) === nodeId);
+      const rep = gs.find((x) => nodeIdOf(x.node) === nodeId);
       const role = rep ? (rep.g.is_leader ? "leader" : "follower") : "unreachable";
       return { id, table: t.table || "—", role, status: tabletStatus(t, gs) };
     });
@@ -42,7 +42,7 @@ function renderPlacement() {
 
   $("pl-grid").innerHTML = memberIds.map((id) => {
     const m = members[id];
-    const node = nodeByRaftkv(id);
+    const node = nodeById(id);
     const up = m ? m.status === "Active" : !!(node && node.ok);
     const forNode = tabletsForNode(id, tablets, groups);
     const leaderCount = forNode.filter((t) => t.role === "leader").length;
@@ -70,7 +70,7 @@ function renderPlacement() {
     return;
   }
   const forNode = tabletsForNode(placementSelectedNode, tablets, groups);
-  const selNode = nodeByRaftkv(placementSelectedNode);
+  const selNode = nodeById(placementSelectedNode);
   $("pl-node-title").innerHTML = `Tablets on node ${esc(placementSelectedNode)}
     ${consoleLink(selNode && selNode.ok ? selNode.base : null, placementSelectedNode)}`;
   $("pl-node-tablets").innerHTML = forNode.length ? `<table>

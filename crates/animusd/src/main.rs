@@ -428,18 +428,18 @@ async fn run_data_join(
         return Err("data --seed requires at least one address".into());
     }
 
-    // Same six-port-per-index stride as `run_join`/`gen-config`, minus the
-    // control port this data-only node never binds (left `None` below).
-    let base_port = base_port.unwrap_or(7100_u16.wrapping_add((index as u16).wrapping_mul(6)));
+    // Same five-port-per-index stride as `run_join`/`gen-config` (ADR 0040
+    // PR1: one internal address per node, not a separate control/raftkv
+    // pair).
+    let base_port = base_port.unwrap_or(7100_u16.wrapping_add((index as u16).wrapping_mul(5)));
     let p = |role: u16| SocketAddr::new(ip, base_port.wrapping_add(role));
     let addrs = RoleAddrs {
         role: animusd::config::NodeRole::Data,
-        control: None,
+        internal: p(0),
         client: p(1),
         dynamo: p(2),
         cql: p(3),
-        raftkv: Some(p(4)),
-        admin: p(5),
+        admin: p(4),
     };
     let dir =
         dir.unwrap_or_else(|| std::env::temp_dir().join(format!("animusd-data-join-{index}")));
@@ -488,12 +488,11 @@ async fn run_data_join_allocated(
     let p = |role: u16| SocketAddr::new(ip, base_port.wrapping_add(role));
     let addrs = RoleAddrs {
         role: animusd::config::NodeRole::Data,
-        control: None,
+        internal: p(0),
         client: p(1),
         dynamo: p(2),
         cql: p(3),
-        raftkv: Some(p(4)),
-        admin: p(5),
+        admin: p(4),
     };
     let dir = dir.unwrap_or_else(|| {
         std::env::temp_dir().join(format!("animusd-data-join-alloc-{base_port}"))
@@ -586,24 +585,23 @@ async fn run_join_indexed(
     dir: Option<std::path::PathBuf>,
     backend: animusd::StorageBackend,
 ) -> Result<(), String> {
-    // Six consecutive ports, same stride/role order as `ClusterConfig::generate`
-    // (control/client/dynamo/cql/raftkv/admin) — defaults to `7100 + 6*index`,
-    // mirroring `gen-config`'s own per-node base port so a joined node's
-    // default addresses land in the same conventional range as a
-    // `gen-config`-generated cluster's node `index`, without colliding with
-    // it (each index's 6-port block is disjoint). Pass `--base-port`
+    // Five consecutive ports, same stride/role order as `ClusterConfig::generate`
+    // (internal/client/dynamo/cql/admin, ADR 0040 PR1) — defaults to
+    // `7100 + 5*index`, mirroring `gen-config`'s own per-node base port so a
+    // joined node's default addresses land in the same conventional range as
+    // a `gen-config`-generated cluster's node `index`, without colliding
+    // with it (each index's 5-port block is disjoint). Pass `--base-port`
     // explicitly for anything less conventional (a different host, a
     // manually-chosen port range).
-    let base_port = base_port.unwrap_or(7100_u16.wrapping_add((index as u16).wrapping_mul(6)));
+    let base_port = base_port.unwrap_or(7100_u16.wrapping_add((index as u16).wrapping_mul(5)));
     let p = |role: u16| SocketAddr::new(ip, base_port.wrapping_add(role));
     let addrs = RoleAddrs {
         role: animusd::config::NodeRole::Both,
-        control: Some(p(0)),
+        internal: p(0),
         client: p(1),
         dynamo: p(2),
         cql: p(3),
-        raftkv: Some(p(4)),
-        admin: p(5),
+        admin: p(4),
     };
     let dir = dir.unwrap_or_else(|| std::env::temp_dir().join(format!("animusd-join-{index}")));
 
@@ -642,12 +640,11 @@ async fn run_join_allocated(
     let p = |role: u16| SocketAddr::new(ip, base_port.wrapping_add(role));
     let addrs = RoleAddrs {
         role: animusd::config::NodeRole::Both,
-        control: Some(p(0)),
+        internal: p(0),
         client: p(1),
         dynamo: p(2),
         cql: p(3),
-        raftkv: Some(p(4)),
-        admin: p(5),
+        admin: p(4),
     };
     let dir =
         dir.unwrap_or_else(|| std::env::temp_dir().join(format!("animusd-join-alloc-{base_port}")));
