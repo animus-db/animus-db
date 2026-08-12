@@ -631,6 +631,15 @@ fn scenario_cells() -> Vec<Scenario> {
             "re_add_after_exclusion_cancels_pending_release",
             scenario_re_add_cancels_release
         ),
+        // --- ADR 0018 §2 amendment fix (the split_cluster.rs livelock) ---------
+        scenario!(
+            "absorb_follower_waits_for_committed_seal_before_tearing_down",
+            scenario_absorb_follower_waits_for_committed_seal
+        ),
+        scenario!(
+            "narrow_seal_survives_a_late_promotion_after_narrowing_as_a_follower",
+            scenario_narrow_seal_survives_a_late_promotion
+        ),
     ]
 }
 
@@ -1745,6 +1754,209 @@ fn scenario_re_add_cancels_release(seed: u64) {
         assert!(c.teardown_log(a()).is_empty());
 
         assert_idempotent(&mut c, a(), &readded).await;
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Scenario 18: ADR 0018 §2 amendment fix (the split_cluster.rs livelock) —
+// a follower's Absorb teardown must never race ahead of a COMMITTED
+// range-seal covering it. Ticking the follower alone, before the leader has
+// ever been ticked with the merge view (so no seal has been proposed at
+// all), must stall rather than tear down; the whole merge must still
+// converge once the leader gets its own turn.
+// ---------------------------------------------------------------------------
+
+fn scenario_absorb_follower_waits_for_committed_seal(seed: u64) {
+    run(seed, |sim| async move {
+        let env = sim.env(a());
+        let mut c = Cluster::new(sim);
+        c.add_node(a());
+        c.add_node(b());
+
+        // Two adjacent tablets, both replicated on {a, b} — tablet 1 the
+        // eventual merge survivor, tablet 2 the tablet about to be absorbed.
+        let v1 = view([
+            tablet(1, b"", Some(BOUNDARY), vec![a(), b()]),
+            tablet(2, BOUNDARY, None, vec![a(), b()]),
+        ]);
+        c.tick_all(&[a(), b()], &v1).await;
+        env.sleep(Duration::from_secs(2)).await; // elect both groups
+
+        let h2a = c.node(a()).hosted_node(TabletId(2)).unwrap().clone();
+        let h2b = c.node(b()).hosted_node(TabletId(2)).unwrap().clone();
+        let (leader2_id, follower2_id) = if h2a.is_leader() {
+            (a(), b())
+        } else {
+            assert!(h2b.is_leader(), "tablet 2 must have elected some leader");
+            (b(), a())
+        };
+
+        let v2 = view_with_merged_and_absorbed_by([tablet(1, b"", None, vec![a(), b()])], [2], 1);
+
+        // Tick ONLY the follower of tablet 2 — the leader has not been
+        // ticked with the merge view at all yet, so no seal has been
+        // proposed anywhere. Before the fix, a replica's own "nothing
+        // pending locally" drain check was satisfied trivially on the very
+        // first check (there was never anything to wait for — the seal
+        // simply didn't exist yet), so this single tick alone tore the
+        // group down immediately: exactly the regression a real
+        // multi-process deployment exposed deterministically
+        // (`split_cluster.rs`, see `docs/engineering-lessons.md`) — a fast
+        // follower destroying its own copy before the seal could ever
+        // commit, permanently stranding a 2-voter group below quorum.
+        c.tick(follower2_id.clone(), &v2).await;
+
+        assert!(
+            c.node(follower2_id.clone())
+                .hosted_node(TabletId(2))
+                .is_some(),
+            "the follower must NOT tear down tablet 2 before observing a locally-committed \
+             seal covering it — tearing down here is the exact split_cluster.rs regression"
+        );
+
+        // Give the leader its turn: `plan`'s `HostAction::ProposeSeal` is a
+        // persistent, re-derived-every-tick condition (not a one-shot side
+        // effect), so the leader proposes and (as sole-ish, fast-committing
+        // 2-voter group) commits the seal on this tick.
+        c.tick(leader2_id.clone(), &v2).await;
+        env.sleep(Duration::from_secs(1)).await;
+
+        // Both replicas' own subsequent retries now observe the committed
+        // seal and converge: tablet 2 torn down everywhere, tablet 1 widened
+        // to cover the whole range on both nodes.
+        let mut converged = false;
+        for _ in 0..20 {
+            c.tick(follower2_id.clone(), &v2).await;
+            c.tick(leader2_id.clone(), &v2).await;
+            env.sleep(Duration::from_millis(200)).await;
+            if c.node(a()).hosted_node(TabletId(2)).is_none()
+                && c.node(b()).hosted_node(TabletId(2)).is_none()
+                && c.node(a()).hosted_node(TabletId(1)).unwrap().scope_range() == KeyRange::whole()
+                && c.node(b()).hosted_node(TabletId(1)).unwrap().scope_range() == KeyRange::whole()
+            {
+                converged = true;
+                break;
+            }
+        }
+        assert!(
+            converged,
+            "the merge never converged after the leader got a chance to propose the seal"
+        );
+
+        assert_hosted_converged(&c, a(), [TabletId(1)]);
+        assert_hosted_converged(&c, b(), [TabletId(1)]);
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Scenario 19: ADR 0018 §2 amendment fix (the split_cluster.rs livelock),
+// split side — the replica that first narrows its own scope while a
+// FOLLOWER, and is only LATER promoted to sole leader (its own leadership
+// transfer having removed the original leader outright), must still
+// eventually propose the split's range-seal. A one-shot design — propose
+// only as an immediate side effect of the same tick that narrows — can
+// never satisfy this: by the time this replica is promoted, its own local
+// scope already matches the target range, so the mismatch that would have
+// re-triggered the attempt is permanently gone. `pending_seals` must be a
+// condition re-derived fresh every tick, independent of local scope state.
+// ---------------------------------------------------------------------------
+
+fn scenario_narrow_seal_survives_a_late_promotion(seed: u64) {
+    run(seed, |sim| async move {
+        let env = sim.env(a());
+        let mut c = Cluster::new(sim);
+        c.add_node(a());
+        c.add_node(b());
+
+        let v1 = view([tablet(1, b"", None, vec![a(), b()])]);
+        c.tick_all(&[a(), b()], &v1).await;
+        env.sleep(Duration::from_secs(2)).await; // elect
+
+        let h1a = c.node(a()).hosted_node(TabletId(1)).unwrap().clone();
+        let h1b = c.node(b()).hosted_node(TabletId(1)).unwrap().clone();
+        let (leader0_id, leader0, follower_id, follower) = if h1a.is_leader() {
+            (a(), h1a.clone(), b(), h1b.clone())
+        } else {
+            assert!(h1b.is_leader(), "tablet 1 must have elected some leader");
+            (b(), h1b.clone(), a(), h1a.clone())
+        };
+
+        // The split's atomic control-plane effect (ADR 0028): the source
+        // narrows AND the fresh child appears in the SAME view, with
+        // provenance recorded — mirrors `MetaCommand::SplitTablet`'s single
+        // apply exactly (unlike `scenario_split_narrow_sibling`'s
+        // deliberately staged introduction, which isn't required to be
+        // atomic since it only exercises `plan`'s reaction one step at a
+        // time).
+        let v2 = MetadataView {
+            tablets: [
+                tablet(1, b"", Some(BOUNDARY), vec![a(), b()]),
+                tablet(2, BOUNDARY, None, vec![a(), b()]),
+            ]
+            .into_iter()
+            .map(|t| (t.id, t))
+            .collect(),
+            split_parent: [(TabletId(2), TabletId(1))].into_iter().collect(),
+            ..Default::default()
+        };
+
+        // Tick ONLY the follower — it narrows its own scope unconditionally
+        // (regardless of leadership) but, correctly, proposes nothing (not
+        // leader). The leader is never ticked with `v2` at all here.
+        c.tick(follower_id.clone(), &v2).await;
+        assert_eq!(
+            follower.scope_range(),
+            KeyRange::new(b"".to_vec(), Some(BOUNDARY.to_vec())),
+            "the follower must still narrow its own scope locally"
+        );
+        assert!(
+            c.node(follower_id.clone())
+                .hosted_node(TabletId(2))
+                .is_none(),
+            "the child must not host until the parent's seal is observed"
+        );
+
+        // Force a REAL leadership change: remove the ORIGINAL leader from
+        // tablet 1's Raft config outright, leaving the follower — the one
+        // that already narrowed while it was NOT leader — as the sole
+        // remaining voter (hence trivially its new leader).
+        remove_replica_for_real(
+            &env,
+            &leader0,
+            leader0_id.clone(),
+            &follower,
+            follower_id.clone(),
+            [follower_id.clone()].into_iter().collect(),
+        )
+        .await;
+        assert!(follower.is_leader(), "the sole remaining voter must lead");
+
+        // Tick the (now-leader, already-narrowed) follower again with the
+        // SAME view. Its own local scope already matches `v2`'s target
+        // range, so a one-shot "propose only as a side effect of narrowing"
+        // design has nothing left to trigger on — this is the exact
+        // regression: `pending_seals` must instead keep naming this range
+        // until a covering seal is actually observed, independent of local
+        // scope state, so this now-leader tick finally proposes it.
+        let mut child_hosted = false;
+        for _ in 0..20 {
+            c.tick(follower_id.clone(), &v2).await;
+            env.sleep(Duration::from_millis(200)).await;
+            if c.node(follower_id.clone())
+                .hosted_node(TabletId(2))
+                .is_some()
+            {
+                child_hosted = true;
+                break;
+            }
+        }
+        assert!(
+            child_hosted,
+            "the split's child never hosted — the promoted replica never proposed the \
+             parent's range-seal (the split_cluster.rs regression)"
+        );
+
+        assert_hosted_converged(&c, follower_id, [TabletId(1), TabletId(2)]);
     });
 }
 

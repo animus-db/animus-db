@@ -151,6 +151,38 @@ pub struct TabletFacts {
     /// newly-widened portion. Irrelevant (left at its default `false`) when
     /// no widen is pending.
     pub widen_seal_observed: bool,
+    /// **ADR 0018 §2 amendment, fix (the split_cluster.rs livelock)**: every
+    /// range this *already-hosted* tablet still owes a committed range-seal
+    /// for, but whose local engine does not yet contain — gathered fresh
+    /// every tick, never cached. Two sources, both re-derived from scratch
+    /// each call (see `gather_facts`): (1) a **split handoff** — for each
+    /// child of this tablet named in [`MetadataView::split_parent`], the
+    /// child's own current metadata range, if this node's engine lacks a
+    /// seal marker covering it; (2) an **absorb handoff** — this tablet's
+    /// own current live scope, if this tablet itself is named in
+    /// [`MetadataView::merged`] and this node's engine lacks a seal marker
+    /// covering it. [`plan`] turns each entry into a
+    /// [`HostAction::ProposeSeal`], executed only if this node is currently
+    /// the tablet's leader.
+    ///
+    /// **Why this must be a persistent, re-derived-every-tick condition and
+    /// not a one-shot side effect of the tick that first narrows/tears
+    /// down**: the tick that first notices "my scope needs narrowing" (or
+    /// "my tablet was absorbed") happens independently on every replica, on
+    /// its own timer, and is not synchronized with *which* replica happens
+    /// to hold leadership at that exact instant. A one-shot design — narrow
+    /// (or tear down) unconditionally, and *only if I also happen to be
+    /// leader right now* also propose the seal — has no second chance if
+    /// leadership isn't held by anyone at that precise tick (e.g. mid
+    /// leadership transfer): the local mutation that would have re-derived
+    /// the trigger already happened, so the seal is simply never proposed by
+    /// anyone. Re-deriving this fact from durable state every tick instead
+    /// means whichever replica *eventually* holds leadership gets its
+    /// chance, however leadership shuffles relative to the local scope
+    /// change or teardown. See `docs/engineering-lessons.md` for the full
+    /// story (this is what produced the deterministic `split_cluster.rs`
+    /// failures under a genuine multi-process split deployment).
+    pub pending_seals: Vec<KeyRange>,
 }
 
 /// This node's persistent-for-the-life-of-the-process bookkeeping that
@@ -286,39 +318,9 @@ fn is_subrange(inner: &KeyRange, outer: &KeyRange) -> bool {
     outer.contains_range(inner)
 }
 
-/// The range a split's `NarrowScope` just handed off, given the group's
-/// scope `old` (just before narrowing) and `new` (the tablet's current
-/// metadata range, just narrowed to) — ADR 0018 §2 amendment, the input to
-/// [`RaftKvNode::propose_seal`](crate::RaftKvNode::propose_seal).
-///
-/// A split's `NarrowScope` always narrows **from the right only**:
-/// `MetaCommand::SplitTablet` (`animus-control`) sets the source's range to
-/// `left = [start, split_key)`, so `new.start == old.start` and `new.end` is
-/// the split key, strictly less than (or newly `Some`, if `old.end` was
-/// `None`) `old.end`. The handed-off range is therefore exactly `[new.end,
-/// old.end)` — which is also, by construction, the fresh sibling's own
-/// metadata range (`right = [split_key, old.end)`), so a split child's own
-/// range is always exactly what its source seals for it.
-///
-/// `None` if `new.end` is absent (a `NarrowScope` is never emitted for an
-/// unbounded-above target — `plan`'s own `is_subrange` precondition rules
-/// this out) or if `new.start != old.start` (defensive: a `NarrowScope` that
-/// somehow narrowed from the left too would not correspond to any split this
-/// design models — nothing to seal rather than guessing a range).
-fn handed_off_range(old: &KeyRange, new: &KeyRange) -> Option<KeyRange> {
-    if new.start != old.start {
-        return None;
-    }
-    let new_end = new.end.clone()?;
-    Some(KeyRange {
-        start: new_end,
-        end: old.end.clone(),
-    })
-}
-
 /// The range a merge's `WidenScope` is about to absorb, given the group's
 /// scope `old` (just before widening) and `new` (the tablet's current, wider
-/// metadata range) — the merge dual of [`handed_off_range`].
+/// metadata range).
 ///
 /// A merge's `WidenScope` always widens **from the right only**:
 /// `MetaCommand::MergeTablets` (`animus-control`) only ever extends the
@@ -328,7 +330,16 @@ fn handed_off_range(old: &KeyRange, new: &KeyRange) -> Option<KeyRange> {
 ///
 /// `None` if `old.end` is absent (a scope already unbounded above has
 /// nothing further right to absorb — not reachable in practice) or if
-/// `new.start != old.start` (defensive, mirroring `handed_off_range`).
+/// `new.start != old.start` (defensive).
+///
+/// (A split's dual — the range a `NarrowScope` just handed off — used to
+/// live here too as `handed_off_range`, computed from the source's own
+/// before/after scope. It's gone: `gather_facts`'s `pending_seals` now
+/// derives a split child's handed-off range directly from the child's own
+/// metadata range (`view.tablets`), which is — by construction, a split
+/// child's range is always exactly what its source seals for it — the
+/// identical value, without needing the source's pre-narrow scope at all.
+/// See `TabletFacts::pending_seals`'s doc.)
 fn absorbed_range(old: &KeyRange, new: &KeyRange) -> Option<KeyRange> {
     if new.start != old.start {
         return None;
@@ -358,17 +369,40 @@ async fn seal_covers<S: StorageEngine>(storage: &S, tablet: u64, needed: &KeyRan
 /// (`animusd`, PR4) executes these against its own live `ProdEnv` state;
 /// `plan` itself performs no I/O.
 ///
-/// Emitted in a fixed overall order — every [`NarrowScope`](Self::NarrowScope)/
+/// Emitted in a fixed overall order — every [`ProposeSeal`](Self::ProposeSeal)
+/// action, then every [`NarrowScope`](Self::NarrowScope)/
 /// [`WidenScope`](Self::WidenScope) action, then every [`Host`](Self::Host),
 /// then every [`Reconfigure`](Self::Reconfigure), then every
 /// [`Release`](Self::Release)/[`Reclaim`](Self::Reclaim)/[`Absorb`](Self::Absorb)
-/// — mirroring the existing loops' relative priority (adjust a still-hosted
+/// — mirroring the existing loops' relative priority (give a pending seal a
+/// chance to land before anything that gates on it; adjust a still-hosted
 /// tablet's scope before deciding anything else about it; stand up a
 /// newly-placed tablet before reconfiguring anyone; reconcile membership
 /// before tearing anything down). Within each group, tablets are emitted in
 /// `TabletId` order (a `BTreeMap` iteration is deterministic on every node).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostAction {
+    /// (Re-)propose this already-hosted tablet's own range-seal for `range`,
+    /// if this node is currently its leader — ADR 0018 §2 amendment fix.
+    /// Derived from [`TabletFacts::pending_seals`], a **persistent condition
+    /// re-checked every tick** (not a one-shot side effect bundled into
+    /// [`NarrowScope`](Self::NarrowScope)'s or
+    /// [`Absorb`](Self::Absorb)'s own tick, as it used to be) — see that
+    /// field's doc for why a one-shot design can silently never propose the
+    /// seal at all. A no-op execution-side if this node isn't currently the
+    /// tablet's leader (harmless — whichever replica eventually *is* leader
+    /// will see the same still-pending condition next tick and propose it
+    /// then). Re-proposing an already-covered range is impossible by
+    /// construction (`pending_seals` stops naming it once this node's own
+    /// engine observes a covering seal marker).
+    ProposeSeal {
+        /// The (already-hosted) tablet whose own group should propose the
+        /// seal — the range handed off (a split child's range) or the
+        /// tablet's own current scope (an absorb handoff).
+        tablet: TabletId,
+        /// The range to seal.
+        range: KeyRange,
+    },
     /// Narrow this already-hosted tablet's live `StorageScope` range to match
     /// its current metadata range (a split narrowed the *source* tablet's
     /// range in `Metadata`, but the already-running group's own scope object
@@ -517,6 +551,24 @@ pub fn plan(
     // gone from `view.tablets`) but sound, deterministic, and merges are rare
     // operator actions: the deferral costs one reconcile tick.
     let absorbing = state.hosted.iter().any(|t| view.merged.contains(t));
+
+    // --- Phase 0: (re-)propose any range-seal this node's own hosted groups
+    // still owe (ADR 0018 §2 amendment fix). `TabletFacts::pending_seals` is
+    // re-derived from scratch every tick — a persistent condition, not a
+    // one-shot side effect bundled into this same tick's `NarrowScope`/
+    // `Absorb` handling — so whichever replica eventually holds leadership
+    // for the tablet gets a chance to propose it, however leadership
+    // shuffles relative to the local scope change or teardown. See
+    // `TabletFacts::pending_seals`'s doc for the full "why a one-shot design
+    // can silently never propose the seal at all" argument.
+    for (&tablet, f) in facts {
+        for range in &f.pending_seals {
+            actions.push(HostAction::ProposeSeal {
+                tablet,
+                range: range.clone(),
+            });
+        }
+    }
 
     // --- Phase 1: narrow an already-hosted tablet's scope, or host a
     // newly-placed one. `to_host` batches the Host actions so every
@@ -847,22 +899,25 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
 
         for action in actions {
             match action {
+                HostAction::ProposeSeal { tablet, range } => {
+                    // ADR 0018 §2 amendment, fix: the seal-proposal side
+                    // effect used to be bundled one-shot into this same
+                    // tick's `NarrowScope`/`Absorb` handling below — now it's
+                    // its own persistent, re-derived-every-tick action (see
+                    // `TabletFacts::pending_seals`'s doc). A no-op if this
+                    // node isn't currently the tablet's leader; harmless,
+                    // since `plan` will keep re-emitting this action every
+                    // tick the seal remains unobserved, so whichever replica
+                    // eventually holds leadership gets its chance.
+                    if let Some(node) = self.hosted.get(&tablet)
+                        && node.is_leader()
+                    {
+                        node.propose_seal(range);
+                    }
+                }
                 HostAction::NarrowScope { tablet, range } => {
                     if let Some(node) = self.hosted.get(&tablet) {
-                        // ADR 0018 §2 amendment: capture the pre-narrow scope
-                        // BEFORE narrowing, so the handed-off range (the
-                        // portion this narrow just gave up) can be computed
-                        // and sealed. A split's `NarrowScope` always narrows
-                        // from the right only (the source keeps its `start`,
-                        // its `end` shrinks to the split key) — see
-                        // `handed_off_range`'s doc.
-                        let old = node.scope_range();
-                        node.narrow_scope(range.clone());
-                        if node.is_leader()
-                            && let Some(handed_off) = handed_off_range(&old, &range)
-                        {
-                            node.propose_seal(handed_off);
-                        }
+                        node.narrow_scope(range);
                     }
                 }
                 HostAction::WidenScope { tablet, range } => {
@@ -938,6 +993,32 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
                 }
                 _ => false,
             };
+            // ADR 0018 §2 amendment, fix (the split_cluster.rs livelock): a
+            // persistent, re-derived-every-tick condition — never a one-shot
+            // side effect of the tick that first narrows/tears down. Two
+            // sources: (1) a split handoff — every child of *this* tablet
+            // named in `view.split_parent`, whose range this node's engine
+            // doesn't yet have a covering seal marker for; (2) an absorb
+            // handoff — this tablet's own current scope, if this tablet
+            // itself was absorbed (`view.merged`) and this node's engine
+            // doesn't yet have a covering seal marker for it either. See
+            // `TabletFacts::pending_seals`'s doc for the full argument.
+            let mut pending_seals = Vec::new();
+            for (&child, parent) in &view.split_parent {
+                if *parent != tablet {
+                    continue;
+                }
+                if let Some(child_t) = view.tablets.get(&child)
+                    && !seal_covers(&self.storage, tablet.0, &child_t.range).await
+                {
+                    pending_seals.push(child_t.range.clone());
+                }
+            }
+            if view.merged.contains(&tablet)
+                && !seal_covers(&self.storage, tablet.0, &scope_range).await
+            {
+                pending_seals.push(scope_range.clone());
+            }
             facts.insert(
                 tablet,
                 TabletFacts {
@@ -948,6 +1029,7 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
                     has_data: false,
                     parent_seal_observed: false,
                     widen_seal_observed,
+                    pending_seals,
                 },
             );
         }
@@ -1050,44 +1132,64 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
     /// acked writes on this node (the observed ADR 0033 regression: a write
     /// acked by the absorbed group's leader right before the merge, not yet
     /// engine-applied on the follower that hosts the survivor's leader, read
-    /// back as a definitive "absent"). On a drain timeout: if the engine has
-    /// at least caught up to the *locally known* commit, proceed with a loud
-    /// warning (the residual — entries this replica never learned were
-    /// committed because the leader's own teardown won the race — is bounded
-    /// and documented in ADR 0033; the data still lives in the engines of the
-    /// replicas that did drain); if even that hasn't caught up (apply stuck),
-    /// re-register and retry next tick like every other teardown failure.
+    /// back as a definitive "absent").
+    ///
+    /// **Also requires (ADR 0018 §2 amendment, fix) that this replica's own
+    /// engine already contains a COMMITTED range-seal marker covering this
+    /// tablet's own scope — not merely "nothing pending locally".** The seal
+    /// itself is proposed elsewhere now (`plan`'s `HostAction::ProposeSeal`,
+    /// re-derived every tick — see `TabletFacts::pending_seals`'s doc), but
+    /// this teardown is what must never let a replica race ahead of it: the
+    /// original "nothing pending locally" check alone is satisfied trivially
+    /// by a quiescent replica that hasn't even received the seal proposal
+    /// yet, which is exactly the bug a real multi-process deployment exposed
+    /// deterministically (`split_cluster.rs` — see `docs/engineering-
+    /// lessons.md`) — a fast follower could tear itself down (deleting its
+    /// WAL, the only local copy) before the leader had even proposed the
+    /// seal, dropping the group below quorum and permanently stranding it as
+    /// accepted-but-never-committed.
+    ///
+    /// **This gate is self-supporting, not a deadlock risk**: requiring every
+    /// absorbed replica to observe the seal locally before tearing down means
+    /// every replica stays alive — and hence the quorum needed to commit the
+    /// seal in the first place stays intact — for exactly as long as it takes
+    /// the seal to actually commit. Nothing here can starve a healthy group:
+    /// the same majority that would have accepted any other write accepts
+    /// this one. If the group has genuinely lost quorum for an unrelated
+    /// reason (a real double failure), this correctly stalls loudly rather
+    /// than tearing down early — correctness over liveness, the doctrine this
+    /// crate uses everywhere else a durability/visibility gate is at stake.
+    ///
+    /// On a drain timeout: the **original** stuck-apply escape hatch (proceed
+    /// anyway with a loud warning) fires **only** when the seal is already
+    /// locally observed and it's purely the engine-merge watermark lagging a
+    /// local commit — never when the seal itself hasn't committed yet. A
+    /// stuck seal always retries next tick instead (logged loudly on every
+    /// retry past the timeout, so a genuinely quorum-dead absorbed group is
+    /// visible to operators, not silently waved through).
     async fn teardown(&mut self, tablet: TabletId, kind: TeardownKind) {
         let Some(node) = self.hosted.remove(&tablet) else {
             return;
         };
         if matches!(kind, TeardownKind::Absorb) {
-            // ADR 0018 §2 amendment: propose this tablet's own range-seal
-            // BEFORE draining, while the driver is still live — one seal for
-            // the whole absorbed range (this tablet is about to be torn down
-            // for good, unlike a split source, which can seal more than once
-            // over its life). Only the leader's proposal actually commits;
-            // every OTHER replica's own `teardown` call for the same tablet
-            // harmlessly no-ops here. The drain wait below then covers this
-            // entry too, exactly like any other committed-but-not-yet-applied
-            // write — so the survivor never observes the marker before this
-            // replica's engine has caught up to it.
-            if node.is_leader() {
-                node.propose_seal(node.scope_range());
-            }
+            // The seal proposal itself is no longer made here — see
+            // `plan`'s `HostAction::ProposeSeal` and this fn's own doc above.
+            let seal_range = node.scope_range();
             let deadline = self.env.now().saturating_add(ABSORB_DRAIN_TIMEOUT);
-            let fully_drained = |node: &RaftKvNode<E, S>| {
+            loop {
                 let commit = node.commit_index();
                 let log_end = node.snapshot_index() + node.log_len() as u64;
-                commit >= log_end && node.engine_applied_index() >= commit
-            };
-            loop {
-                if fully_drained(&node) {
+                let raft_drained = commit >= log_end && node.engine_applied_index() >= commit;
+                let seal_observed = seal_covers(&self.storage, tablet.0, &seal_range).await;
+                if raft_drained && seal_observed {
                     break;
                 }
                 if self.env.now() >= deadline {
-                    if node.engine_applied_index() >= node.commit_index() {
-                        // Residual accepted with a loud signal — see doc above.
+                    if seal_observed && node.engine_applied_index() >= node.commit_index() {
+                        // The ORIGINAL stuck-apply residual this escape
+                        // hatch exists for: the seal is already locally
+                        // applied, only the engine merge itself lags the
+                        // local commit — see doc above.
                         tracing::warn!(
                             tablet = tablet.0,
                             "reconciler: absorb drain timed out with an uncommitted local \
@@ -1096,10 +1198,15 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
                         );
                         break;
                     }
+                    // A stuck seal COMMIT never takes the escape hatch above
+                    // — see this fn's doc for why that would reopen the
+                    // exact race this gate exists to close.
                     tracing::warn!(
                         tablet = tablet.0,
-                        "reconciler: absorb drain did not catch the engine up to the \
-                         local commit in time; retrying next tick"
+                        seal_observed,
+                        "reconciler: absorb drain/seal did not converge in time; retrying \
+                         next tick (a stuck seal commit stalls this teardown indefinitely \
+                         by design — correctness over liveness)"
                     );
                     self.hosted.insert(tablet, node);
                     return;
@@ -1442,6 +1549,7 @@ mod tests {
                 has_data: false,
                 parent_seal_observed: false,
                 widen_seal_observed: false,
+                pending_seals: Vec::new(),
             },
         )]
         .into_iter()
