@@ -103,12 +103,9 @@ fn txn_write(
     budget: Duration,
 ) -> Option<HlcTimestamp> {
     let n = node.clone();
-    drive(
-        sim,
-        node.env(),
-        budget,
-        async move { n.txn_write(writes).await },
-    )
+    drive(sim, node.env(), budget, async move {
+        n.txn_write("t", writes).await
+    })
     .flatten()
 }
 
@@ -193,7 +190,7 @@ fn abort_path_restores_the_value_that_existed_before_the_intent() {
     let n = nodes[l].clone();
     let kk = k.clone();
     let (txn_id, record_key) = drive(&mut sim, nodes[l].env(), SETTLE, async move {
-        n.txn_stage(vec![(kk, Some(b"staged".to_vec()))]).await
+        n.txn_stage("t", vec![(kk, Some(b"staged".to_vec()))]).await
     })
     .flatten()
     .unwrap_or_else(|| panic!("txn_stage did not complete (seed={seed})"));
@@ -259,7 +256,7 @@ fn a_pending_read_blocks_then_serves_once_committed() {
     let n = nodes[l].clone();
     let kk = k.clone();
     let (txn_id, record_key) = drive(&mut sim, nodes[l].env(), SETTLE, async move {
-        n.txn_stage(vec![(kk, Some(b"new".to_vec()))]).await
+        n.txn_stage("t", vec![(kk, Some(b"new".to_vec()))]).await
     })
     .flatten()
     .unwrap_or_else(|| panic!("txn_stage did not complete (seed={seed})"));
@@ -329,7 +326,7 @@ fn intent_and_record_markers_never_leak_into_a_scan() {
     let n = nodes[l].clone();
     let kk = staged_key.clone();
     let staged = drive(&mut sim, nodes[l].env(), SETTLE, async move {
-        n.txn_stage(vec![(kk, Some(b"pending-value".to_vec()))])
+        n.txn_stage("t", vec![(kk, Some(b"pending-value".to_vec()))])
             .await
     })
     .flatten();
@@ -443,10 +440,10 @@ fn stage_into_a_sealed_range_is_rejected_wholesale() {
     // `Some((txn_id, record_key))` once the entry has committed and
     // applied, even though apply silently no-ops every write in it.
     let staged = drive(&mut sim, node.env(), SETTLE, async move {
-        n.txn_stage(vec![
-            (kk1, Some(b"v1".to_vec())),
-            (kk2, Some(b"v2".to_vec())),
-        ])
+        n.txn_stage(
+            "t",
+            vec![(kk1, Some(b"v1".to_vec())), (kk2, Some(b"v2".to_vec()))],
+        )
         .await
     })
     .flatten();

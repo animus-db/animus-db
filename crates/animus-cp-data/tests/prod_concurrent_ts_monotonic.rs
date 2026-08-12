@@ -181,7 +181,7 @@ async fn concurrent_writes_and_reads_never_violate_ts_monotonicity() {
 /// `propose_ordered_aux` critical section a plain `put` does.
 async fn txn_write_then_confirm(leader: &KvNode, key: Vec<u8>, value: Vec<u8>) {
     leader
-        .txn_write(vec![(key.clone(), Some(value.clone()))])
+        .txn_write("t", vec![(key.clone(), Some(value.clone()))])
         .await
         .expect("txn_write did not complete (leader stepped down?)");
     let got = leader.linearizable_get(&key).await;

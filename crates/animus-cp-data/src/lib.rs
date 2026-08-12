@@ -64,7 +64,7 @@ mod txn;
 
 use hlc::{Hlc, HlcTimestamp};
 use ts_cache::TsCache;
-pub use txn::TxnId;
+pub use txn::{TxnDecisionStatus, TxnId, TxnOutcome};
 
 /// The assumed maximum clock-offset bound across the cluster (ADR 0018 §2),
 /// threaded into every [`Hlc::new`] this crate constructs. Not yet consumed
@@ -436,19 +436,38 @@ pub enum KvCommand {
     /// variants — every client-facing propose goes through `RaftKvNode`'s
     /// own `put`/`get`/`cas`/`scan` methods, not a raw command).
     ReadCeiling { ts: HlcTimestamp },
-    /// **Transaction stage** (ADR 0018 §2, PR3 — see `txn.rs`'s module
-    /// doc): create/refresh `txn_id`'s `Pending` record at `record_key`
-    /// (the anchor-token-derived reserved key `txn::record_key` computed
-    /// once by the proposer) and merge every entry of `writes` as an
-    /// `Envelope::Intent`. `fence` gates the **whole** stage — every write
-    /// key *and* `record_key` — atomically: any single key falling
-    /// outside it (or an already-sealed range) makes the entire entry a
-    /// no-op, matching `Batch`'s all-or-nothing semantics (a partial stage
-    /// would let a reader observe some of a transaction's intents but not
-    /// others). This is the degenerate single-participant "prepare".
+    /// **Transaction stage** (ADR 0018 §2, PR3/PR4 — see `txn.rs`'s module
+    /// doc): merge every entry of `writes` as an `Envelope::Intent`
+    /// (carrying `record_table` alongside `record_key`, ADR 0018 §2/PR4, so
+    /// a reader that can't resolve the intent locally knows which table's
+    /// tablet to route a status query to) and, **iff `is_anchor`**,
+    /// additionally create/refresh `txn_id`'s `Pending` record at
+    /// `record_key` itself. `fence` gates the **whole** stage — every write
+    /// key, plus `record_key` when `is_anchor` — atomically: any single key
+    /// falling outside it (or an already-sealed range) makes the entire
+    /// entry a no-op, matching `Batch`'s all-or-nothing semantics (a
+    /// partial stage would let a reader observe some of a transaction's
+    /// intents but not others).
+    ///
+    /// **`is_anchor: false`** (ADR 0018 §2/PR4 — a non-anchor participant's
+    /// own stage in a multi-participant 2PC) merges intents only:
+    /// `record_key`/`record_table` name the **anchor's** record, which
+    /// lives in a different tablet's (indeed possibly a different table's)
+    /// keyspace entirely and is never checked against this group's own
+    /// `fence` or written here — only `writes`' own keys are. `spans` is
+    /// unused in this case (it only ever feeds a locally-created
+    /// `TxnRecord`, which a non-anchor stage never creates).
+    ///
+    /// **`is_anchor: true`** (the single-participant degenerate case, PR3,
+    /// and a multi-participant transaction's anchor tablet, PR4) is
+    /// byte-for-byte PR3's original behavior: `record_key` must itself
+    /// fall inside `fence` (it is this tablet's own reserved key), and a
+    /// fresh `Pending` `TxnRecord` is created there alongside the intents.
     TxnStage {
         txn_id: TxnId,
         record_key: Vec<u8>,
+        record_table: String,
+        is_anchor: bool,
         writes: Vec<(Vec<u8>, Option<Vec<u8>>)>,
         spans: Vec<KeyRange>,
         fence: KeyRange,
@@ -478,21 +497,35 @@ pub enum KvCommand {
         ts: HlcTimestamp,
     },
     /// **Transaction resolve**: for each key in `keys` still holding
-    /// `txn_id`'s intent, rewrite it to its final form per the
-    /// already-decided record at `record_key` — committed: the staged
-    /// value (or a tombstone, for a staged delete) at `ts`; aborted: the
-    /// value this key held immediately before the intent, restored
-    /// forward at `ts` (never a tombstone, which would incorrectly shadow
-    /// that older value — see `txn.rs`'s module doc). A key whose stored
-    /// value is no longer that exact intent (already resolved, or
-    /// overwritten by something newer) is left untouched — idempotent on
-    /// WAL replay. No `fence`: every key here was already fence-checked at
-    /// `TxnStage` time; resolve only ever converts an already-staged
-    /// intent, never introduces new data outside that prior fence.
+    /// `txn_id`'s intent, rewrite it to its final form per `outcome` —
+    /// committed: the staged value (or a tombstone, for a staged delete)
+    /// at `ts`; aborted: the value this key held immediately before the
+    /// intent, restored forward at `ts` (never a tombstone, which would
+    /// incorrectly shadow that older value — see `txn.rs`'s module doc). A
+    /// key whose stored value is no longer that exact intent (already
+    /// resolved, or overwritten by something newer) is left untouched —
+    /// idempotent on WAL replay. No `fence`: every key here was already
+    /// fence-checked at `TxnStage` time; resolve only ever converts an
+    /// already-staged intent, never introduces new data outside that
+    /// prior fence.
+    ///
+    /// **`outcome` is carried explicitly (ADR 0018 §2/PR4), not
+    /// re-derived by reading `record_key` locally** (PR3's original
+    /// shape): a non-anchor participant's own `keys` never share this
+    /// tablet's scope with the record (see `KvCommand::TxnStage`'s
+    /// `is_anchor` doc) — the record lives on the anchor's tablet only, so
+    /// this group has no local copy to read at all. The coordinator (or,
+    /// for the single-participant degenerate case, this same group acting
+    /// as its own coordinator) already knows the decision by the time it
+    /// proposes a resolve — it just committed/aborted the record itself,
+    /// or learned the outcome from whoever did — so threading it through
+    /// here removes the local-record dependency entirely, uniformly for
+    /// every participant including the anchor.
     TxnResolve {
         txn_id: TxnId,
         record_key: Vec<u8>,
         keys: Vec<Vec<u8>>,
+        outcome: txn::TxnOutcome,
         ts: HlcTimestamp,
     },
     /// The leader's no-op-on-election (Raft); applies nothing.
@@ -583,13 +616,55 @@ struct CasResults {
 }
 
 /// The outcome of resolving one raw, envelope-tagged stored value against a
-/// read (ADR 0018 §2/PR3): either a value has been determined (`Value`,
-/// `Some` present / `None` absent), or the covering transaction is still
-/// undecided (`Pending`) — see `RaftKvNode::resolve_once_step`'s doc for the
-/// exact per-status rules.
+/// read (ADR 0018 §2/PR3, extended PR4): either a value has been determined
+/// (`Value`, `Some` present / `None` absent); the covering transaction's
+/// **local** record is `Pending` (this same tablet holds the record — the
+/// single-participant/anchor case — but it hasn't decided yet); or the
+/// record could not be found in this tablet's own scope at all (`Foreign`
+/// — either it genuinely lives on another tablet, ADR 0018 §2/PR4's
+/// multi-participant case, or the anchor's own stage just hasn't applied
+/// here yet) — see `RaftKvNode::resolve_once_step`'s doc for the exact
+/// per-status rules. A caller with no cross-tablet resolver treats `Pending`
+/// and `Foreign` identically (both are "can't resolve locally, retry");
+/// [`linearizable_get_served_fast`](RaftKvNode::linearizable_get_served_fast)
+/// is the one caller that acts on `Foreign` differently.
 enum ResolveStep {
     Value(Option<Vec<u8>>),
     Pending,
+    Foreign(IntentInfo),
+}
+
+/// Everything a caller needs to chase down an intent's covering transaction
+/// on another tablet (ADR 0018 §2/PR4): the transaction's identity, its
+/// record's logical key, and the **table** whose tablet ring owns that key
+/// (a record key alone doesn't identify a table — see `txn::Envelope::Intent`'s
+/// doc). Returned by [`RaftKvNode::peek_intent`]/exposed via
+/// [`ResolveStep::Foreign`]; consumed by a coordinator (`animusd`) that
+/// routes a `ClientRequest::TxnStatus` to `record_table`/`record_key`'s
+/// owning tablet, then calls
+/// [`RaftKvNode::resolve_intent_given_status`](RaftKvNode::resolve_intent_given_status)
+/// with the reply.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IntentInfo {
+    pub txn_id: TxnId,
+    pub record_key: Vec<u8>,
+    pub record_table: String,
+    pub staged_value: Option<Vec<u8>>,
+}
+
+/// The outcome of a **non-blocking, single-attempt** linearizable read (ADR
+/// 0018 §2/PR4) — see [`RaftKvNode::linearizable_get_served_fast`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FastRead {
+    /// The value is already resolved (present, or genuinely absent).
+    Value(Option<Vec<u8>>),
+    /// A **local** record covers this key and is still `Pending` — the
+    /// caller may fall back to the bounded local wait
+    /// ([`RaftKvNode::linearizable_get_served`]) or retry later.
+    Pending,
+    /// The intent's record could not be found in this tablet's own scope —
+    /// see [`IntentInfo`]'s doc for how a caller resolves it.
+    Foreign(IntentInfo),
 }
 
 /// WAL filename stem for a tablet group's Raft log (distinct from the control
@@ -1277,16 +1352,27 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         })
     }
 
-    /// **Stage** phase of the degenerate single-participant 2PC (ADR 0018
-    /// §2/PR3 — see `txn.rs`'s module doc): mint a fresh [`TxnId`],
-    /// compute its record key from `writes`' first (anchor) key's own
-    /// partition token, and propose `KvCommand::TxnStage` for the whole
-    /// batch as one atomic Raft entry. Leader-only (`None` otherwise, like
-    /// every other propose-and-wait method here). Returns the `TxnId` +
-    /// record key once the stage has committed *and applied* on this
-    /// leader — feed both into [`txn_decide`](Self::txn_decide), or use
-    /// the one-shot [`txn_write`](Self::txn_write) for the common
-    /// commit-only path.
+    /// **Anchor stage** phase of a 2PC (ADR 0018 §2/PR3, generalized to
+    /// multi-participant in PR4 — see `txn.rs`'s module doc): mint a fresh
+    /// [`TxnId`], compute its record key from `writes`' first (anchor)
+    /// key's own partition token, and propose `KvCommand::TxnStage` (with
+    /// `is_anchor: true`) for the whole batch as one atomic Raft entry.
+    /// Leader-only (`None` otherwise, like every other propose-and-wait
+    /// method here). Returns the `TxnId` + record key once the stage has
+    /// committed *and applied* on this leader — feed both into
+    /// [`txn_decide`](Self::txn_decide) for the single-participant case, or
+    /// into [`txn_stage_participant`](Self::txn_stage_participant)/
+    /// [`txn_commit_at_least`](Self::txn_commit_at_least)/
+    /// [`txn_resolve`](Self::txn_resolve) for a multi-participant
+    /// coordinator (`animusd`'s `cp_txn`), or use the one-shot
+    /// [`txn_write`](Self::txn_write) for the single-tablet commit-only
+    /// path.
+    ///
+    /// `table` is this tablet's own table name, embedded into every intent
+    /// merged here (`record_table`) so any reader — on this tablet or
+    /// another — always knows which table's tablet ring owns the record
+    /// (ADR 0018 §2/PR4; a bare token doesn't identify a table, since two
+    /// tables' rings can assign the same token to different rows).
     ///
     /// # Panics
     /// If `writes` is empty, or its anchor key is shorter than
@@ -1295,6 +1381,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// a caller invariant, not a recoverable condition.
     pub async fn txn_stage(
         &self,
+        table: &str,
         writes: Vec<(Vec<u8>, Option<Vec<u8>>)>,
     ) -> Option<(TxnId, Vec<u8>)> {
         assert!(
@@ -1312,6 +1399,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         let token = anchor[..animus_tablet::TOKEN_BYTES].to_vec();
         let keys: Vec<Vec<u8>> = writes.iter().map(|(k, _)| k.clone()).collect();
         let fence = self.scope_range();
+        let record_table = table.to_owned();
         let (result, (txn_id, record_key)) = self.propose_ordered_aux(|| {
             let ts = self.mint_pushed(&keys);
             let txn_id = TxnId {
@@ -1326,6 +1414,8 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             let cmd = KvCommand::TxnStage {
                 txn_id: txn_id.clone(),
                 record_key: record_key.clone(),
+                record_table,
+                is_anchor: true,
                 writes: writes.clone(),
                 spans,
                 fence: fence.clone(),
@@ -1342,12 +1432,159 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             .then_some((txn_id, record_key))
     }
 
+    /// **Participant stage** phase of a multi-participant 2PC (ADR 0018
+    /// §2/PR4): stage `writes` as intents referencing an **already-known**
+    /// anchor record (`txn_id`/`record_key`/`record_table`, as returned by
+    /// the anchor's own [`txn_stage`](Self::txn_stage)) — proposes
+    /// `KvCommand::TxnStage` with `is_anchor: false`, so no record is
+    /// created or touched on *this* group; only `writes`' own keys are
+    /// fenced/merged. Returns this participant's own stage timestamp (the
+    /// coordinator witnesses it toward the eventual commit timestamp) once
+    /// committed *and applied*; `None` if this node is not the leader or
+    /// the stage times out.
+    pub async fn txn_stage_participant(
+        &self,
+        txn_id: TxnId,
+        record_key: Vec<u8>,
+        record_table: String,
+        writes: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+    ) -> Option<HlcTimestamp> {
+        assert!(
+            !writes.is_empty(),
+            "raftkv txn_stage_participant: writes must be non-empty"
+        );
+        let keys: Vec<Vec<u8>> = writes.iter().map(|(k, _)| k.clone()).collect();
+        let fence = self.scope_range();
+        let (result, ts) = self.propose_ordered_aux(|| {
+            let ts = self.mint_pushed(&keys);
+            let cmd = KvCommand::TxnStage {
+                txn_id: txn_id.clone(),
+                record_key: record_key.clone(),
+                record_table: record_table.clone(),
+                is_anchor: false,
+                writes: writes.clone(),
+                spans: Vec::new(), // unused: no local record is ever created here.
+                fence: fence.clone(),
+                ts,
+            };
+            (cmd, ts)
+        });
+        let index = match result {
+            ProposeResult::Accepted { index } => index,
+            ProposeResult::NotLeader { .. } => return None,
+        };
+        self.wait_applied(index).await.then_some(ts)
+    }
+
+    /// Mint a ts that strictly exceeds `min_ts` **and** this group's own
+    /// `last_proposed_ts` floor (mirrors [`mint_pushed`](Self::mint_pushed)/
+    /// [`propose_seal`](Self::propose_seal)'s identical witness-and-floor
+    /// shape) — the primitive [`txn_commit_at_least`](Self::txn_commit_at_least)
+    /// uses to honor a coordinator-supplied commit timestamp candidate
+    /// while still respecting this group's own log-order monotonicity
+    /// invariant (ADR 0018 §2/PR4).
+    fn mint_at_least(&self, min_ts: HlcTimestamp) -> HlcTimestamp {
+        let ts = self.hlc.mint(self.env.now());
+        let floor = min_ts.max(hlc::unpack(self.last_proposed_ts.load(Ordering::SeqCst)));
+        if ts > floor {
+            return ts;
+        }
+        let pushed = self.hlc.witness(floor, self.env.now());
+        assert!(
+            pushed > floor,
+            "raftkv mint_at_least: witnessing the floor must strictly exceed it \
+             (floor={floor:?}, got={pushed:?}) — Hlc::witness's own contract is broken"
+        );
+        pushed
+    }
+
+    /// **Commit** the anchor's record at (at least) `min_ts` (ADR 0018
+    /// §2/PR4 — the multi-participant coordinator's atomic commit point):
+    /// proposes `KvCommand::TxnCommit` at a ts that strictly exceeds both
+    /// `min_ts` (the coordinator's candidate — the max of every
+    /// participant's acked stage ts, "pushed above" per the protocol) and
+    /// this group's own log floor, via [`mint_at_least`](Self::mint_at_least).
+    /// Returns the **actual** committed ts (which may exceed `min_ts` if
+    /// this group's own floor was already past it) once applied — this
+    /// return value, not the caller's original candidate, is the
+    /// transaction's canonical `commit_ts`: every participant's
+    /// [`txn_resolve`](Self::txn_resolve) must be called with exactly this
+    /// value. `None` if this node is not the leader or the commit times
+    /// out.
+    ///
+    /// Unlike [`txn_decide`](Self::txn_decide), this does **not** also
+    /// resolve any keys — a multi-participant coordinator resolves the
+    /// anchor's own keys via a separate [`txn_resolve`](Self::txn_resolve)
+    /// call, exactly like every other participant, once the commit here
+    /// has confirmed.
+    pub async fn txn_commit_at_least(
+        &self,
+        txn_id: TxnId,
+        record_key: Vec<u8>,
+        min_ts: HlcTimestamp,
+    ) -> Option<HlcTimestamp> {
+        let (result, ts) = self.propose_ordered_aux(|| {
+            let ts = self.mint_at_least(min_ts);
+            let cmd = KvCommand::TxnCommit {
+                txn_id: txn_id.clone(),
+                record_key: record_key.clone(),
+                ts,
+            };
+            (cmd, ts)
+        });
+        let index = match result {
+            ProposeResult::Accepted { index } => index,
+            ProposeResult::NotLeader { .. } => return None,
+        };
+        self.wait_applied(index).await.then_some(ts)
+    }
+
+    /// **Resolve** `keys` still holding `txn_id`'s intent on **this**
+    /// group, per the already-decided `outcome` (ADR 0018 §2/PR4): the one
+    /// low-level primitive both [`txn_decide`](Self::txn_decide) (the
+    /// single-participant/anchor-local path) and a multi-participant
+    /// coordinator (every participant, including the anchor's own keys)
+    /// use — see `KvCommand::TxnResolve`'s doc for why `outcome` travels
+    /// explicitly instead of being re-derived from a local record. Returns
+    /// this group's own resolve ts (the MVCC version stamped on every
+    /// resolved key here — **not** necessarily `outcome`'s `commit_ts`,
+    /// which is only a comparison value, see the type's doc) once
+    /// committed and applied; `None` if this node is not the leader or the
+    /// resolve times out. A resolve failure does **not** undo the already-
+    /// durable commit/abort decision — it just leaves the intent(s)
+    /// unresolved for a later resolver to pick up (PR5's in-doubt
+    /// recovery), or for a reader hitting the intent to resolve on demand
+    /// (see [`resolve_intent_given_status`](Self::resolve_intent_given_status)).
+    pub async fn txn_resolve(
+        &self,
+        txn_id: TxnId,
+        record_key: Vec<u8>,
+        keys: Vec<Vec<u8>>,
+        outcome: txn::TxnOutcome,
+    ) -> Option<HlcTimestamp> {
+        let (result, ts) = self.propose_ordered_aux(|| {
+            let ts = self.mint_pushed(&keys);
+            let cmd = KvCommand::TxnResolve {
+                txn_id: txn_id.clone(),
+                record_key: record_key.clone(),
+                keys: keys.clone(),
+                outcome: outcome.clone(),
+                ts,
+            };
+            (cmd, ts)
+        });
+        let index = match result {
+            ProposeResult::Accepted { index } => index,
+            ProposeResult::NotLeader { .. } => return None,
+        };
+        self.wait_applied(index).await.then_some(ts)
+    }
+
     /// **Commit or abort** a previously-[staged](Self::txn_stage)
-    /// transaction, then **resolve** its intents (ADR 0018 §2/PR3) —
-    /// deliberately **three** separate log entries (stage was the first),
-    /// fully synchronous end to end: PR4 collapses/parallelizes this
-    /// across multiple participant groups; don't optimize now. `keys` must
-    /// be the same keys `txn_stage` was called with. Returns the decision
+    /// single-participant transaction, then **resolve** its intents (ADR
+    /// 0018 §2/PR3) — deliberately **three** separate log entries (stage
+    /// was the first), fully synchronous end to end. `keys` must be the
+    /// same keys `txn_stage` was called with. Returns the decision
     /// timestamp once every phase has committed and applied; `None` if
     /// this node stopped being the leader at any point.
     ///
@@ -1355,6 +1592,13 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// commit/abort decision itself, which is already durable — it just
     /// leaves the intent(s) unresolved for a later resolver to pick up
     /// (PR5's in-doubt recovery).
+    ///
+    /// **PR4 note**: this remains the single-participant convenience
+    /// (`keys` must all be local to this same anchor group); a
+    /// multi-participant coordinator instead drives
+    /// [`txn_commit_at_least`](Self::txn_commit_at_least) (the anchor) and
+    /// [`txn_resolve`](Self::txn_resolve) (every participant, anchor
+    /// included) directly.
     pub async fn txn_decide(
         &self,
         txn_id: TxnId,
@@ -1387,21 +1631,14 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             return None;
         }
 
-        let (resolve_result, ()) = self.propose_ordered_aux(|| {
-            let ts = self.mint_pushed(&keys);
-            (
-                KvCommand::TxnResolve {
-                    txn_id: txn_id.clone(),
-                    record_key: record_key.clone(),
-                    keys: keys.clone(),
-                    ts,
-                },
-                (),
-            )
-        });
-        if let ProposeResult::Accepted { index } = resolve_result {
-            self.wait_applied(index).await;
-        }
+        let outcome = if commit {
+            txn::TxnOutcome::Committed {
+                commit_ts: decision_ts,
+            }
+        } else {
+            txn::TxnOutcome::Aborted
+        };
+        self.txn_resolve(txn_id, record_key, keys, outcome).await;
 
         Some(decision_ts)
     }
@@ -1411,13 +1648,37 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// [resolve](Self::txn_decide) — the degenerate 2PC through this
     /// **one** Raft group (ADR 0018 §2/PR3, Follow-up step 2). `writes`'
     /// first entry is the *anchor*: its partition token anchors the txn
-    /// record (see `txn.rs`). Returns the commit timestamp once every
-    /// phase has committed and applied; `None` if this node stopped being
-    /// the leader at any point.
-    pub async fn txn_write(&self, writes: Vec<(Vec<u8>, Option<Vec<u8>>)>) -> Option<HlcTimestamp> {
+    /// record (see `txn.rs`). `table` is this tablet's own table name (see
+    /// [`txn_stage`](Self::txn_stage)'s doc). Returns the commit timestamp
+    /// once every phase has committed and applied; `None` if this node
+    /// stopped being the leader at any point.
+    pub async fn txn_write(
+        &self,
+        table: &str,
+        writes: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+    ) -> Option<HlcTimestamp> {
         let keys: Vec<Vec<u8>> = writes.iter().map(|(k, _)| k.clone()).collect();
-        let (txn_id, record_key) = self.txn_stage(writes).await?;
+        let (txn_id, record_key) = self.txn_stage(table, writes).await?;
         self.txn_decide(txn_id, record_key, keys, true).await
+    }
+
+    /// **Status query** for `txn_id`'s record at `record_key`, served
+    /// straight off this replica's own scoped storage (ADR 0018 §2/PR4) —
+    /// used both by a cross-tablet `ClientRequest::TxnStatus` handler
+    /// (`animusd`) and directly by a caller that already knows it is
+    /// talking to the record's own anchor tablet. Runs the same ReadIndex
+    /// barrier as [`linearizable_get`](Self::linearizable_get) (only the
+    /// confirmed leader serves this), so `None` covers both "not served"
+    /// (barrier failed) and "no record found yet" (the stage hasn't
+    /// committed/applied here yet — the caller retries).
+    pub async fn txn_status_local(&self, record_key: &[u8]) -> Option<txn::TxnDecisionStatus> {
+        if !self.read_barrier().await {
+            return None;
+        }
+        let physical = self.scope.physical(record_key);
+        let vv = self.storage.get(&physical).await.ok().flatten()?;
+        let record = txn::decode_record(&vv.value)?;
+        Some(record.status.to_public())
     }
 
     /// Poll [`engine_applied_index`](Self::engine_applied_index) until it
@@ -1739,8 +2000,56 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         self.scope.range()
     }
 
+    /// Resolve an intent whose covering transaction's **decided status is
+    /// already known** (ADR 0018 §2/PR4) — the decision logic shared by
+    /// [`resolve_once_step`](Self::resolve_once_step) (the local-record
+    /// path) and [`resolve_intent_given_status`](Self::resolve_intent_given_status)
+    /// (the cross-tablet, externally-supplied-status path): `Pending`
+    /// can't resolve yet; `Committed` at or before `read_ts` (`None` =
+    /// "latest") serves `staged_value`; `Committed` strictly after
+    /// `read_ts`, or `Aborted`, serves whatever `physical_key` held
+    /// immediately before this intent (rewinding to `vv_version - 1` —
+    /// never a tombstone, which would incorrectly shadow an older,
+    /// still-live committed value — see `txn.rs`'s module doc).
+    async fn resolve_decided(
+        &self,
+        physical_key: &[u8],
+        vv_version: u64,
+        staged_value: Option<Vec<u8>>,
+        read_ts: Option<HlcTimestamp>,
+        status: &txn::TxnDecisionStatus,
+    ) -> ResolveStep {
+        match status {
+            txn::TxnDecisionStatus::Committed { commit_ts }
+                if read_ts.is_none_or(|rt| *commit_ts <= rt) =>
+            {
+                ResolveStep::Value(staged_value)
+            }
+            txn::TxnDecisionStatus::Committed { .. } | txn::TxnDecisionStatus::Aborted => {
+                let prior = self
+                    .storage
+                    .get_at(physical_key, vv_version.saturating_sub(1))
+                    .await
+                    .ok()
+                    .flatten();
+                ResolveStep::Value(
+                    prior.and_then(|pvv| match txn::decode_envelope(&pvv.value) {
+                        txn::Envelope::Committed(v) => Some(v),
+                        // A prior intent (an unresolved nested conflict — a
+                        // PR5+ concern, see `txn.rs`'s doc): conservatively
+                        // treat as absent rather than ever leak raw envelope
+                        // bytes to a caller.
+                        txn::Envelope::Intent { .. } => None,
+                    }),
+                )
+            }
+            txn::TxnDecisionStatus::Pending => ResolveStep::Pending,
+        }
+    }
+
     /// The outcome of resolving one raw, envelope-tagged stored value
-    /// against a read (ADR 0018 §2/PR3) — see [`resolve_once`](Self::resolve_once).
+    /// against a read (ADR 0018 §2/PR3, extended PR4) — see
+    /// [`resolve_once`](Self::resolve_once).
     async fn resolve_once_step(
         &self,
         physical_key: &[u8],
@@ -1752,11 +2061,20 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             txn::Envelope::Intent {
                 txn_id,
                 record_key,
+                record_table,
                 staged_value,
             } => {
-                // Single-participant invariant (PR3): the record lives in
-                // this same tablet's scope, so a plain scoped `get` finds
-                // it with no cross-group lookup.
+                // The record lives in the **anchor's** tablet, which is
+                // this same tablet's scope for a single-participant
+                // transaction (PR3) or the anchor's own stage (PR4), but a
+                // *different* tablet's scope entirely for a non-anchor
+                // participant's own read (ADR 0018 §2/PR4) — a plain
+                // scoped `get` only ever finds a *local* record, so a miss
+                // here is reported as `Foreign` (carrying enough routing
+                // info — `record_table`/`record_key` — for a caller that
+                // can reach other tablets, e.g. `animusd`'s
+                // `linearizable_get_served_fast`, to chase it down) rather
+                // than assumed to be a structural impossibility as PR3 did.
                 let record = self
                     .storage
                     .get(&self.scope.physical(&record_key))
@@ -1765,45 +2083,29 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
                     .flatten()
                     .and_then(|r| txn::decode_record(&r.value));
                 match record {
-                    Some(r) if r.txn_id == txn_id => match r.status {
-                        // `read_ts: None` means "latest" (a linearizable or
-                        // raw local read) — always serve a committed
-                        // intent regardless of its own `commit_ts`. A
-                        // `Some(rt)` snapshot read only serves it if the
-                        // commit happened at or before `rt`; a commit
-                        // strictly *after* the snapshot is as invisible to
-                        // it as an abort would be — see the module doc.
-                        txn::TxnStatus::Committed { commit_ts }
-                            if read_ts.is_none_or(|rt| commit_ts <= rt) =>
-                        {
-                            ResolveStep::Value(staged_value)
-                        }
-                        txn::TxnStatus::Committed { .. } | txn::TxnStatus::Aborted => {
-                            let prior = self
-                                .storage
-                                .get_at(physical_key, vv.version.saturating_sub(1))
-                                .await
-                                .ok()
-                                .flatten();
-                            ResolveStep::Value(prior.and_then(|pvv| {
-                                match txn::decode_envelope(&pvv.value) {
-                                    txn::Envelope::Committed(v) => Some(v),
-                                    // A prior intent (an unresolved nested
-                                    // conflict — a PR4 concern, see
-                                    // `txn.rs`'s doc): conservatively treat
-                                    // as absent rather than ever leak raw
-                                    // envelope bytes to a caller.
-                                    txn::Envelope::Intent { .. } => None,
-                                }
-                            }))
-                        }
-                        txn::TxnStatus::Pending => ResolveStep::Pending,
-                    },
-                    // Record missing or belongs to a different txn:
-                    // shouldn't happen structurally (see `txn.rs`'s doc) —
-                    // treat conservatively as pending rather than ever
-                    // guess at a value.
-                    _ => ResolveStep::Pending,
+                    Some(r) if r.txn_id == txn_id => {
+                        self.resolve_decided(
+                            physical_key,
+                            vv.version,
+                            staged_value,
+                            read_ts,
+                            &r.status.to_public(),
+                        )
+                        .await
+                    }
+                    // Record missing locally (foreign, or the anchor's own
+                    // stage genuinely hasn't applied here yet) or a mismatched
+                    // txn_id (shouldn't happen structurally, see `txn.rs`'s
+                    // doc) — a caller with no cross-tablet resolver treats
+                    // this identically to `Pending` (see `read_resolved`'s
+                    // doc); a caller that can chase it down
+                    // (`linearizable_get_served_fast`) gets the routing info.
+                    _ => ResolveStep::Foreign(IntentInfo {
+                        txn_id,
+                        record_key,
+                        record_table,
+                        staged_value,
+                    }),
                 }
             }
         }
@@ -1833,7 +2135,12 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             };
             match self.resolve_once_step(physical_key, vv, read_ts).await {
                 ResolveStep::Value(v) => return Some(v),
-                ResolveStep::Pending => {
+                // `Foreign` (no cross-tablet resolver available here) is
+                // treated identically to `Pending` — see `ResolveStep`'s
+                // doc; a caller that *can* chase a foreign record down uses
+                // `linearizable_get_served_fast` instead of this bounded
+                // internal retry.
+                ResolveStep::Pending | ResolveStep::Foreign(_) => {
                     if self.env.now().0 >= deadline {
                         return None;
                     }
@@ -1887,7 +2194,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         let vv = self.storage.get(&physical).await.ok().flatten()?;
         match self.resolve_once_step(&physical, vv, None).await {
             ResolveStep::Value(v) => v,
-            ResolveStep::Pending => None,
+            ResolveStep::Pending | ResolveStep::Foreign(_) => None,
         }
     }
 
@@ -1940,6 +2247,104 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             .expect("ts cache poisoned")
             .bump(start, end, ts);
         Some(value)
+    }
+
+    /// A **non-blocking, single-attempt** linearizable read of `key` (ADR
+    /// 0018 §2/PR4) — same ReadIndex barrier + ceiling-drive as
+    /// [`linearizable_get_served`](Self::linearizable_get_served), but
+    /// makes exactly **one** resolution attempt instead of retrying a
+    /// still-undecided intent for up to [`INTENT_WAIT_TIMEOUT`]. Lets a
+    /// caller that can act on an unresolved intent itself (e.g. `animusd`'s
+    /// `cp_get_local`, which can chase a foreign record down via a
+    /// cross-tablet `TxnStatus` query) react immediately instead of paying
+    /// the bounded internal wait first. `None` means the read barrier
+    /// itself failed (not/no-longer the leader, or the probe timed out) —
+    /// the same "not served" contract as
+    /// [`linearizable_get_served`](Self::linearizable_get_served).
+    pub async fn linearizable_get_served_fast(&self, key: &[u8]) -> Option<FastRead> {
+        if !self.read_barrier().await {
+            return None;
+        }
+        let ts = self.hlc.mint(self.env.now());
+        if !self.ensure_ceiling_above(ts).await {
+            return None;
+        }
+        let physical = self.scope.physical(key);
+        let Some(vv) = self.storage.get(&physical).await.ok().flatten() else {
+            let (start, end) = ts_cache::point_span(key);
+            self.ts_cache
+                .lock()
+                .expect("ts cache poisoned")
+                .bump(start, end, ts);
+            return Some(FastRead::Value(None));
+        };
+        let step = self.resolve_once_step(&physical, vv, None).await;
+        if let ResolveStep::Value(_) = &step {
+            let (start, end) = ts_cache::point_span(key);
+            self.ts_cache
+                .lock()
+                .expect("ts cache poisoned")
+                .bump(start, end, ts);
+        }
+        Some(match step {
+            ResolveStep::Value(v) => FastRead::Value(v),
+            ResolveStep::Pending => FastRead::Pending,
+            ResolveStep::Foreign(info) => FastRead::Foreign(info),
+        })
+    }
+
+    /// Resolve `key`'s currently-stored intent given an **externally
+    /// determined** decision `status` (ADR 0018 §2/PR4) — the counterpart
+    /// to [`linearizable_get_served_fast`](Self::linearizable_get_served_fast)'s
+    /// `Foreign` outcome: a caller that routed a cross-tablet
+    /// `ClientRequest::TxnStatus` query to the intent's actual record owner
+    /// and got back a decided (or still-`Pending`) status feeds it back
+    /// here to finish the read, without this tablet ever needing a local
+    /// copy of the record. Re-reads the current value at `key` (in case it
+    /// changed since the caller last observed it) and, only if it is
+    /// **still** the identical intent (`txn_id` matches), applies
+    /// [`resolve_decided`](Self::resolve_decided)'s logic; otherwise (already
+    /// resolved locally, or overwritten by something newer) falls through to
+    /// an ordinary [`resolve_once_step`](Self::resolve_once_step) so the
+    /// caller still gets a correct answer for whatever is there *now*.
+    ///
+    /// `None` means "no key at all right now" is impossible to distinguish
+    /// from "still can't resolve" in a single non-blocking shape here, so
+    /// this mirrors [`ResolveStep`]'s own contract instead: returns
+    /// `Some(None)` for a genuinely absent value, `Some(Some(v))` for a
+    /// resolved value, and `None` if the status was `Pending` or the key
+    /// vanished entirely underneath (caller retries).
+    pub async fn resolve_intent_given_status(
+        &self,
+        key: &[u8],
+        read_ts: Option<HlcTimestamp>,
+        txn_id: &TxnId,
+        status: txn::TxnDecisionStatus,
+    ) -> Option<Option<Vec<u8>>> {
+        let physical = self.scope.physical(key);
+        let vv = self.storage.get(&physical).await.ok().flatten()?;
+        match txn::decode_envelope(&vv.value) {
+            txn::Envelope::Committed(v) => Some(Some(v)),
+            txn::Envelope::Intent {
+                txn_id: found,
+                staged_value,
+                ..
+            } if &found == txn_id => {
+                match self
+                    .resolve_decided(&physical, vv.version, staged_value, read_ts, &status)
+                    .await
+                {
+                    ResolveStep::Value(v) => Some(v),
+                    ResolveStep::Pending | ResolveStep::Foreign(_) => None,
+                }
+            }
+            // No longer our intent (already resolved, or superseded) —
+            // resolve whatever is actually there now instead.
+            _ => match self.resolve_once_step(&physical, vv, read_ts).await {
+                ResolveStep::Value(v) => Some(v),
+                ResolveStep::Pending | ResolveStep::Foreign(_) => None,
+            },
+        }
     }
 
     /// A **linearizable range scan** via ReadIndex (ADR 0017 / v1): the live
@@ -2097,7 +2502,36 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// after something else has advanced the ceiling past `ts` (e.g. a
     /// `linearizable_get`/`_scan` on this group), or later. Inner
     /// `Some(None)` is a genuine "absent as of `ts`".
+    ///
+    /// **Uncertainty-interval restart** (ADR 0018 §2, PR4): serializable
+    /// (not externally-consistent) ordering across independently-clocked
+    /// tablet groups means a version *committed* just after `ts`, within
+    /// this leader's clock uncertainty, could actually be causally
+    /// concurrent with (or even causally prior to) whatever minted `ts` —
+    /// serving a bare "absent" in that case risks a torn snapshot. So when
+    /// this read finds **no value at `ts`** but a version exists in
+    /// `(ts, uncertainty_upper(ts)]`, it restarts **once** at that higher
+    /// timestamp (`Hlc::uncertainty_upper`, the same margin the read-
+    /// ceiling design already uses) and serves at the restarted point
+    /// instead — a bounded *liveness* cost (one extra round, counted via
+    /// `Metric::CpUncertaintyRestarts`), never a correctness one: the
+    /// restart only ever moves the serve timestamp **later**, so it can
+    /// only pick up more committed data, never lose any. Bounded to one
+    /// restart, matching the ADR's "bounded restarts, then serve at the
+    /// restarted ts" contract.
     pub async fn read_at(&self, key: &[u8], ts: HlcTimestamp) -> Option<Option<Vec<u8>>> {
+        self.read_at_inner(key, ts, true).await
+    }
+
+    /// The shared implementation behind [`read_at`](Self::read_at);
+    /// `allow_restart: false` on the one recursive call the uncertainty
+    /// check makes, so a restart can never itself trigger a second restart.
+    async fn read_at_inner(
+        &self,
+        key: &[u8],
+        ts: HlcTimestamp,
+        allow_restart: bool,
+    ) -> Option<Option<Vec<u8>>> {
         if !self.read_barrier().await {
             return None;
         }
@@ -2108,6 +2542,23 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         let value = self
             .read_resolved(&physical, Some(ts), Some(hlc::pack(ts)))
             .await?;
+        if allow_restart && value.is_none() {
+            let upper = self.hlc.uncertainty_upper(ts);
+            // A version strictly above `ts` but at or below `upper` means
+            // something could have committed within the uncertainty
+            // window — restart there instead of serving a possibly-torn
+            // "absent". A miss (no such version, or the ceiling doesn't
+            // yet cover `upper` so the restart itself would just refuse)
+            // falls through to serving the original observation as-is.
+            if let Some(latest) = self.storage.get(&physical).await.ok().flatten() {
+                let ts_version = hlc::pack(ts);
+                let upper_version = hlc::pack(upper);
+                if latest.version > ts_version && latest.version <= upper_version {
+                    self.metrics.incr(Metric::CpUncertaintyRestarts);
+                    return Box::pin(self.read_at_inner(key, upper, false)).await;
+                }
+            }
+        }
         let (start, end) = ts_cache::point_span(key);
         self.ts_cache
             .lock()
@@ -2908,6 +3359,8 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
             KvCommand::TxnStage {
                 txn_id,
                 record_key,
+                record_table,
+                is_anchor,
                 writes,
                 spans,
                 fence,
@@ -2916,36 +3369,49 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 assert_ts_monotonic(max_applied_ts, ts);
                 // Whole-or-nothing, matching `Batch`: a partial stage would
                 // let a reader observe some of a transaction's intents but
-                // not others (see `KvCommand::TxnStage`'s doc).
+                // not others (see `KvCommand::TxnStage`'s doc). A
+                // non-anchor participant's `record_key` names the
+                // **anchor's** record — a key in a different tablet's (or
+                // even a different table's) keyspace entirely — so it is
+                // never checked against or written into *this* group's own
+                // fence/engine (ADR 0018 §2/PR4).
+                let record_in_fence =
+                    !is_anchor || (fence.contains(&record_key) && !is_sealed(sealed, &record_key));
                 let all_in_fence = writes
                     .iter()
                     .all(|(k, _)| fence.contains(k) && !is_sealed(sealed, k))
-                    && fence.contains(&record_key)
-                    && !is_sealed(sealed, &record_key);
+                    && record_in_fence;
                 if all_in_fence {
                     flush_pending(storage, &mut pending, metrics).await;
                     let version = hlc::pack(ts);
                     for (key, staged_value) in &writes {
-                        let env = txn::encode_intent(&txn_id, &record_key, staged_value.as_deref());
+                        let env = txn::encode_intent(
+                            &txn_id,
+                            &record_key,
+                            &record_table,
+                            staged_value.as_deref(),
+                        );
                         storage
                             .merge(&scope.physical(key), &env, version)
                             .await
                             .expect("raftkv apply txn stage intent");
                     }
-                    let record = txn::TxnRecord {
-                        txn_id,
-                        status: txn::TxnStatus::Pending,
-                        intent_spans: spans,
-                        created_ts: ts,
-                    };
-                    storage
-                        .merge(
-                            &scope.physical(&record_key),
-                            &txn::encode_record(&record),
-                            version,
-                        )
-                        .await
-                        .expect("raftkv apply txn stage record");
+                    if is_anchor {
+                        let record = txn::TxnRecord {
+                            txn_id,
+                            status: txn::TxnStatus::Pending,
+                            intent_spans: spans,
+                            created_ts: ts,
+                        };
+                        storage
+                            .merge(
+                                &scope.physical(&record_key),
+                                &txn::encode_record(&record),
+                                version,
+                            )
+                            .await
+                            .expect("raftkv apply txn stage record");
+                    }
                 }
             }
             KvCommand::TxnCommit {
@@ -3055,29 +3521,24 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
             }
             KvCommand::TxnResolve {
                 txn_id,
-                record_key,
+                record_key: _record_key,
                 keys,
+                outcome,
                 ts,
             } => {
                 assert_ts_monotonic(max_applied_ts, ts);
                 flush_pending(storage, &mut pending, metrics).await;
-                let physical_record = scope.physical(&record_key);
-                // `Some(Some(commit_ts))` = committed at `commit_ts`;
-                // `Some(None)` = aborted; `None` = not yet decided (or the
-                // record vanished/mismatched) — resolve is a no-op this
-                // pass in every `None` case.
-                let decided: Option<Option<HlcTimestamp>> = storage
-                    .get(&physical_record)
-                    .await
-                    .expect("raftkv txn resolve record read")
-                    .and_then(|vv| txn::decode_record(&vv.value))
-                    .filter(|r| r.txn_id == txn_id)
-                    .and_then(|r| match r.status {
-                        txn::TxnStatus::Committed { commit_ts } => Some(Some(commit_ts)),
-                        txn::TxnStatus::Aborted => Some(None),
-                        txn::TxnStatus::Pending => None,
-                    });
-                if let Some(outcome) = decided {
+                // ADR 0018 §2/PR4: `outcome` is carried explicitly by the
+                // command rather than re-derived by reading `record_key`
+                // locally — see `KvCommand::TxnResolve`'s doc. This is what
+                // lets a non-anchor participant (whose own tablet never
+                // holds the record at all) resolve its own intents
+                // uniformly with the anchor.
+                {
+                    let outcome_commit_ts: Option<HlcTimestamp> = match &outcome {
+                        txn::TxnOutcome::Committed { commit_ts } => Some(*commit_ts),
+                        txn::TxnOutcome::Aborted => None,
+                    };
                     let version = hlc::pack(ts);
                     for key in &keys {
                         let physical_key = scope.physical(key);
@@ -3102,7 +3563,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                         let Some(staged_value) = intent else {
                             continue;
                         };
-                        match outcome {
+                        match outcome_commit_ts {
                             Some(_commit_ts) => match staged_value {
                                 // Committed: the staged value becomes the
                                 // committed value.

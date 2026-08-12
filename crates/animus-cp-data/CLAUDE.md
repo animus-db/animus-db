@@ -115,7 +115,18 @@ Three modules:
   (and `docs/engineering-lessons.md`'s Code-patterns entry for the
   general technique). `is_record_key` is what `lib.rs`'s scan paths and
   `has_data` filter on. See the Key invariants entry below and ADR 0018's
-  PR3 amendment for the full design.
+  PR3 amendment for the full design. **Since ADR 0018 §2/PR4**:
+  `Envelope::Intent` gained a `record_table: String` field (the anchor's
+  own table name, stamped into every intent) — a record key alone doesn't
+  identify which table's tablet ring owns it (tables' rings are
+  independent, ADR 0022/0023, so two tables can assign the same token to
+  different rows), and a non-anchor participant's own reader needs it to
+  route a cross-tablet `TxnStatus` query. Also new: `TxnOutcome` (`pub`,
+  re-exported) — the `Committed{commit_ts}`/`Aborted` decision, carried
+  explicitly by `KvCommand::TxnResolve` rather than re-derived from a local
+  record (a non-anchor participant's tablet never has one); and
+  `TxnDecisionStatus` (`pub`, re-exported) — the public mirror of
+  `TxnStatus` a cross-tablet status query reads back.
 
 ### lib.rs API
 
@@ -167,16 +178,46 @@ Three modules:
   deterministically fails the swap (never guesses a match or an absence) —
   see the Key invariants entry below.
 - **Single-participant transactions — `txn_stage`/`txn_decide`/`txn_write`**
-  (ADR 0018 §2/PR3) — the degenerate single-Raft-group 2PC. `txn_stage(writes)
-  -> Option<(TxnId, Vec<u8>)>` proposes `KvCommand::TxnStage` (the first
-  write's key is the *anchor*, whose partition token anchors the record —
-  see `txn.rs`) and returns the minted `TxnId` + record key once applied.
-  `txn_decide(txn_id, record_key, keys, commit) -> Option<HlcTimestamp>`
-  commits or aborts, then resolves every key in `keys` — three log entries,
-  fully synchronous (PR4 collapses/parallelizes this across multiple
-  participant groups). `txn_write(writes) -> Option<HlcTimestamp>` is the
+  (ADR 0018 §2/PR3) — the degenerate single-Raft-group 2PC. `txn_stage(table,
+  writes) -> Option<(TxnId, Vec<u8>)>` proposes `KvCommand::TxnStage` (the
+  first write's key is the *anchor*, whose partition token anchors the
+  record — see `txn.rs`; `table` is embedded into every intent as
+  `record_table`, ADR 0018 §2/PR4) and returns the minted `TxnId` + record
+  key once applied. `txn_decide(txn_id, record_key, keys, commit) ->
+  Option<HlcTimestamp>` commits or aborts, then resolves every key in
+  `keys` — three log entries, fully synchronous; this remains the
+  single-participant/anchor-local convenience (`keys` must all be local to
+  the anchor). `txn_write(table, writes) -> Option<HlcTimestamp>` is the
   one-shot commit-only convenience (`txn_stage` + `txn_decide(.., commit:
   true)`). All leader-only (`None` if not leader / a phase times out).
+- **Multi-participant transactions** (ADR 0018 §2/PR4) — the primitives a
+  cross-tablet coordinator (`animusd::ClientCtx::cp_txn`) composes; see the
+  ADR's PR4 amendment for the full protocol.
+  `txn_stage_participant(txn_id, record_key, record_table, writes) ->
+  Option<HlcTimestamp>` stages a **non-anchor** participant's writes as
+  intents referencing an already-known anchor record — no record is
+  created or touched on this group. `txn_commit_at_least(txn_id,
+  record_key, min_ts) -> Option<HlcTimestamp>` commits the anchor's record
+  at a ts that strictly exceeds both `min_ts` (the coordinator's
+  candidate — the max of every participant's acked stage ts) and this
+  group's own log floor (`mint_at_least`, mirroring `mint_pushed`'s
+  witness-and-floor shape), returning the **actual** ts used — the
+  transaction's canonical `commit_ts`, since this may exceed `min_ts` if
+  this group's own floor already had. `txn_resolve(txn_id, record_key,
+  keys, outcome: TxnOutcome) -> Option<HlcTimestamp>` is the one low-level
+  resolve primitive used identically by the anchor's own keys and every
+  other participant's (and internally by `txn_decide`). `txn_status_local(
+  record_key) -> Option<TxnDecisionStatus>` is a ReadIndex-consistent
+  status read for a caller that already knows it's talking to the
+  record's own tablet. `linearizable_get_served_fast(key) ->
+  Option<FastRead>` is a non-blocking, single-attempt linearizable read —
+  `FastRead::Foreign(IntentInfo)` is the new outcome an intent whose
+  record isn't found in this tablet's own scope produces (carrying
+  `txn_id`/`record_key`/`record_table`/`staged_value`), alongside the
+  existing `Value`/`Pending`. `resolve_intent_given_status(key, read_ts,
+  txn_id, status) -> Option<Option<Vec<u8>>>` finishes a read given an
+  externally-obtained status (from a cross-tablet query), re-checking the
+  key still holds that exact intent first.
 - **Admin/debug accessors** (ADR 0020, consumed by `animusd`) — read-only
   `role`/`term`/`commit_index`/`last_applied`/`durable_index`/
   `snapshot_index`/`log_len` (thin locks over `RaftCore`), and `storage()` (a
@@ -409,6 +450,26 @@ State once here; cross-referenced from the sections below.
   prod_concurrent_ts_monotonic.rs`'s `concurrent_txn_writes_and_reads_never_
   violate_ts_monotonicity` (the PR2 mint/propose-ordering regression's
   coverage extended to the new commands).
+  - **Multi-participant 2PC (ADR 0018 §2/PR4)**: `KvCommand::TxnStage`
+    gained `record_table`/`is_anchor`; a non-anchor participant's own
+    stage merges intents only (`record_key`/`record_table` name the
+    **anchor's** record — a different tablet's, possibly a different
+    table's, keyspace entirely — so it is never checked against or
+    written into this group's own fence/engine). `KvCommand::TxnResolve`
+    gained an explicit `outcome: TxnOutcome` field — the decision travels
+    with the command rather than being re-derived by reading `record_key`
+    locally, since a non-anchor participant's tablet never holds a local
+    copy to read at all; this is uniformly true for the anchor's own
+    resolve too (same primitive, `txn_resolve`). A reader that can't
+    resolve an intent locally (`ResolveStep::Foreign`, carrying an
+    `IntentInfo`) is a **new**, distinct outcome from `Pending` — a
+    caller with no cross-tablet resolver (the internal `read_resolved`
+    retry loop) treats them identically; `linearizable_get_served_fast`
+    is the one caller that acts on `Foreign` differently, handing the
+    routing info to `animusd`'s cross-tablet `TxnStatus` query. See the
+    ADR's PR4 amendment for the full protocol, the record-key
+    cross-tablet-routing answer, and the deliberate deviations from the
+    spec. Regression: `tests/txn_multi.rs`.
 - **`engine_applied` vs `last_applied`.** The two-task split (below) means the
   core's `last_applied` (a buffer cursor the consensus loop advances) *leads*
   the engine. Linearizable reads therefore gate on the separate
@@ -459,6 +520,14 @@ State once here; cross-referenced from the sections below.
     the full account, including the safety argument and the two
     regressions this design's own gate run found. Regression:
     `tests/ts_cache.rs`, `tests/snapshot_reads.rs`.
+- **Uncertainty-interval read restarts (ADR 0018 §2/PR4).** `RaftKvNode::
+  read_at` restarts **once** at `Hlc::uncertainty_upper(ts)` when it
+  observes no value at `ts` but a version exists in `(ts,
+  uncertainty_upper(ts)]` — a bounded *liveness* cost (counted via
+  `Metric::CpUncertaintyRestarts`), never a correctness one: the restart
+  only ever moves the serve timestamp later, so it can only pick up more
+  committed data, never lose any. Not wired into `linearizable_get_served`
+  (serves at "latest", where the question doesn't apply) or scans.
 - **Fences are per-entry, decided at apply, and backed by a pre-propose
   check.** Every replica's apply checks a command's key(s) against the fence
   **embedded in the log entry**, never a locally-polled value — so two
@@ -800,6 +869,24 @@ guards is provably unreachable under `SimEnv`'s single-threaded scheduler.
   the recovered one; a stage proposed into an already-sealed range
   committing/applying as a whole-or-nothing no-op (`propose_seal` directly,
   mirroring `cross_group_lww.rs`'s shape); and seed reproducibility.
+- `txn_multi.rs` (ADR 0018 §2/PR4) — the multi-participant suite: two- and
+  three-scoped-group atomic commits, visible on every replica of every
+  participant group (`shared_engine.rs`'s harness style — a minimal
+  in-test coordinator over the raw `RaftKvNode` handles, mirroring what
+  `animusd::ClientCtx::cp_txn` does over real forwarding); abort cleanup
+  (every staged participant's key reverts to its pre-transaction value);
+  foreign-intent resolution end to end
+  (`linearizable_get_served_fast`'s `FastRead::Foreign` →
+  `txn_status_local` on the anchor → `resolve_intent_given_status` on the
+  participant, with no local record ever existing on the participant's own
+  tablet); a participant's stage into an already-sealed range as a true
+  engine-level no-op (confirmed directly via `local_get`, since the
+  propose outcome alone can't distinguish it from a genuine stage); a
+  participant leader-kill during prepare converging to a clean abort with
+  no half-staged intent surviving re-election; and a five-seed
+  reproducibility sweep. See the ADR's PR4 amendment for the full design
+  (including the `record_table` routing-info answer and the deliberate
+  deviations from the spec).
 - `snapshot_reads.rs` (ADR 0018 §2/PR2b) — `read_at`/`scan_at` directly:
   each sees exactly the version committed at or before `ts` (including a
   value strictly between two writes' timestamps, and `scan_at` across

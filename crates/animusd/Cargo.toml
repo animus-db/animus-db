@@ -30,6 +30,9 @@ animus-cql.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+# `futures::future::join_all` — the multi-participant 2PC coordinator's
+# concurrent-prepare fan-out (ADR 0018 §2/PR4, `ClientCtx::cp_txn`).
+futures.workspace = true
 # Real (non-`Env`) randomness, used in exactly one deliberate, narrowly
 # commented place: `generate_join_nonce` at the CLI pre-bind boundary of a
 # cluster-allocated-id join (ADR 0036) — a leaf that never runs under

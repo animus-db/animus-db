@@ -30,7 +30,7 @@ use animus_env::nid;
 use animus_tablet::KeyRange;
 
 use crate::hlc::HlcTimestamp;
-use crate::txn::TxnId;
+use crate::txn::{TxnId, TxnOutcome};
 use crate::{ImageEntry, KvCommand, KvWire};
 
 /// First byte of every encoded frame — rejects foreign payloads (e.g. a JSON
@@ -52,7 +52,12 @@ const MAGIC: u8 = 0xCB;
 /// were added — pre-alpha, no cross-version compatibility required, so
 /// again a mixed-version decode fails loudly rather than silently
 /// misreading the new variants.
-const VERSION: u8 = 7;
+/// `8` (ADR 0018 §2/PR4): `TxnStage` gained `record_table: String`/
+/// `is_anchor: bool` (multi-participant staging — see `KvCommand::TxnStage`'s
+/// doc); `TxnResolve` gained `outcome: TxnOutcome` (the decision travels
+/// explicitly instead of being re-derived from a local record) — again a
+/// clean version bump, no wire/disk back-compat required.
+const VERSION: u8 = 8;
 
 /// A decode failure: a description of what was malformed, surfaced loudly by
 /// the caller (logged + dropped; never silently misread).
@@ -251,6 +256,28 @@ fn read_txn_id(c: &mut Cursor<'_>) -> Result<TxnId, DecodeError> {
     })
 }
 
+/// ADR 0018 §2/PR4: `TxnOutcome`'s decision travels explicitly inside
+/// `KvCommand::TxnResolve` — see that variant's doc.
+fn put_txn_outcome(out: &mut Vec<u8>, o: &TxnOutcome) {
+    match o {
+        TxnOutcome::Committed { commit_ts } => {
+            put_u8(out, 0);
+            put_ts(out, *commit_ts);
+        }
+        TxnOutcome::Aborted => put_u8(out, 1),
+    }
+}
+
+fn read_txn_outcome(c: &mut Cursor<'_>) -> Result<TxnOutcome, DecodeError> {
+    Ok(match c.u8()? {
+        0 => TxnOutcome::Committed {
+            commit_ts: read_ts(c)?,
+        },
+        1 => TxnOutcome::Aborted,
+        other => return Err(format!("unknown TxnOutcome tag {other}")),
+    })
+}
+
 fn put_command(out: &mut Vec<u8>, c: &KvCommand) {
     match c {
         KvCommand::Put {
@@ -308,6 +335,8 @@ fn put_command(out: &mut Vec<u8>, c: &KvCommand) {
         KvCommand::TxnStage {
             txn_id,
             record_key,
+            record_table,
+            is_anchor,
             writes,
             spans,
             fence,
@@ -316,6 +345,8 @@ fn put_command(out: &mut Vec<u8>, c: &KvCommand) {
             put_u8(out, 8);
             put_txn_id(out, txn_id);
             put_bytes(out, record_key);
+            put_bytes(out, record_table.as_bytes());
+            put_bool(out, *is_anchor);
             out.extend_from_slice(&(writes.len() as u32).to_be_bytes());
             for (k, v) in writes {
                 put_bytes(out, k);
@@ -352,6 +383,7 @@ fn put_command(out: &mut Vec<u8>, c: &KvCommand) {
             txn_id,
             record_key,
             keys,
+            outcome,
             ts,
         } => {
             put_u8(out, 11);
@@ -361,6 +393,7 @@ fn put_command(out: &mut Vec<u8>, c: &KvCommand) {
             for k in keys {
                 put_bytes(out, k);
             }
+            put_txn_outcome(out, outcome);
             put_ts(out, *ts);
         }
     }
@@ -407,6 +440,9 @@ fn read_command(c: &mut Cursor<'_>) -> Result<KvCommand, DecodeError> {
         8 => {
             let txn_id = read_txn_id(c)?;
             let record_key = c.bytes()?;
+            let record_table = String::from_utf8(c.bytes()?)
+                .map_err(|_| "TxnStage record_table not utf8".to_string())?;
+            let is_anchor = c.bool()?;
             let n = c.u32()?;
             let mut writes = Vec::with_capacity(n as usize);
             for _ in 0..n {
@@ -420,6 +456,8 @@ fn read_command(c: &mut Cursor<'_>) -> Result<KvCommand, DecodeError> {
             KvCommand::TxnStage {
                 txn_id,
                 record_key,
+                record_table,
+                is_anchor,
                 writes,
                 spans,
                 fence: read_key_range(c)?,
@@ -444,10 +482,12 @@ fn read_command(c: &mut Cursor<'_>) -> Result<KvCommand, DecodeError> {
             for _ in 0..n {
                 keys.push(c.bytes()?);
             }
+            let outcome = read_txn_outcome(c)?;
             KvCommand::TxnResolve {
                 txn_id,
                 record_key,
                 keys,
+                outcome,
                 ts: read_ts(c)?,
             }
         }
@@ -848,6 +888,8 @@ mod tests {
                         node: nid(3),
                     },
                     record_key: b"record".to_vec(),
+                    record_table: "orders".to_string(),
+                    is_anchor: true,
                     writes: vec![
                         (b"k1".to_vec(), Some(b"v1".to_vec())),
                         (b"k2".to_vec(), None), // a staged delete
@@ -894,6 +936,9 @@ mod tests {
                     },
                     record_key: b"record".to_vec(),
                     keys: vec![b"k1".to_vec(), b"k2".to_vec()],
+                    outcome: crate::txn::TxnOutcome::Committed {
+                        commit_ts: ts(9, 0),
+                    },
                     ts: ts(9, 2),
                 },
                 config: None,
