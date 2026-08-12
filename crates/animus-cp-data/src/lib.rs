@@ -449,6 +449,44 @@ pub enum KvCommand {
     /// partial stage would let a reader observe some of a transaction's
     /// intents but not others).
     ///
+    /// **A target key already holding an unresolved intent from a
+    /// *different* transaction also makes the whole entry a no-op (ADR
+    /// 0018 §2/PR6, task #16's fix)** — writers **push** intents (CRDB's
+    /// term for this), never silently overwrite one. This closes a real
+    /// durability hole a corpus depth run found: overwriting a
+    /// still-undecided-at-the-time intent doesn't erase it (MVCC keeps it
+    /// as an older version), and if the *overwriting* transaction later
+    /// aborts, its restore does a **one-hop-back** `get_at` that can land
+    /// on that stale intent instead of a genuinely committed value or true
+    /// absence — a chain a later correct resolve can never repair (its
+    /// commit's own ts is lower than the wrong restore's, so LWW loses).
+    /// Chasing the version chain back multiple hops to fix this on the
+    /// *read* side was considered and rejected: an intermediate hop
+    /// skipped over could belong to a transaction that *later* commits,
+    /// and that transaction's own eventual resolve-rewrite would then lose
+    /// to the restore's higher ts the same unrepairable way — the
+    /// corruption moves, it doesn't go away. Rejecting the overwrite at
+    /// **apply time** instead makes the corrupt chain structurally
+    /// unrepresentable: a target key can only ever hold at most one txn's
+    /// unresolved intent at a time, so an abort-restore's one-hop lookback
+    /// is now *always* sound (genuinely committed, or genuinely absent —
+    /// never another live intent). A plain `Put`/`Batch`/`Cas` over a
+    /// foreign intent is **not** rejected (analyzed safe — see `txn.rs`'s
+    /// module doc for the argument: it's a genuine overwrite serialized
+    /// strictly after the intent's own transaction, so that transaction's
+    /// eventual resolve-rewrite correctly loses to it via ordinary LWW,
+    /// and a snapshot read below the overwrite's ts still correctly
+    /// resolves the buried intent). Same-txn re-staging (a WAL-replay
+    /// re-application, or an ordinary duplicate stage) is not blocked —
+    /// matched by `txn_id` equality, never by mere presence of *an*
+    /// intent. The rejected caller (the coordinator, or a recovery pusher)
+    /// must push the blocking transaction (`txn_record_view`/`txn_recover`
+    /// on it, using the blocker's own `txn_id` this no-op makes newly
+    /// visible — the routing info is already carried by
+    /// `IntentInfo`/`FastRead::Foreign` for exactly this purpose) and
+    /// retry, bounded, before giving up — mirroring what a *read* already
+    /// does against a foreign pending intent.
+    ///
     /// **`is_anchor: false`** (ADR 0018 §2/PR4 — a non-anchor participant's
     /// own stage in a multi-participant 2PC) merges intents only:
     /// `record_key`/`record_table` name the **anchor's** record, which
@@ -1716,25 +1754,47 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         pushed
     }
 
-    /// **Commit** the anchor's record at (at least) `min_ts` (ADR 0018
-    /// §2/PR4 — the multi-participant coordinator's atomic commit point):
-    /// proposes `KvCommand::TxnCommit` at a ts that strictly exceeds both
-    /// `min_ts` (the coordinator's candidate — the max of every
-    /// participant's acked stage ts, "pushed above" per the protocol) and
-    /// this group's own log floor, via [`mint_at_least`](Self::mint_at_least).
-    /// Returns the **actual** committed ts (which may exceed `min_ts` if
-    /// this group's own floor was already past it) once applied — this
-    /// return value, not the caller's original candidate, is the
-    /// transaction's canonical `commit_ts`: every participant's
-    /// [`txn_resolve`](Self::txn_resolve) must be called with exactly this
-    /// value. `None` if this node is not the leader or the commit times
-    /// out.
+    /// **Attempt to commit** the anchor's record at (at least) `min_ts`
+    /// (ADR 0018 §2/PR4 — the multi-participant coordinator's atomic commit
+    /// point): proposes `KvCommand::TxnCommit` at a ts that strictly
+    /// exceeds both `min_ts` (the coordinator's candidate — the max of
+    /// every participant's acked stage ts, "pushed above" per the
+    /// protocol) and this group's own log floor, via
+    /// [`mint_at_least`](Self::mint_at_least). `None` if this node is not
+    /// the leader or the proposal times out.
+    ///
+    /// # `Some(ts)` does **not** mean this call's own commit decided the
+    /// record — only that its `TxnCommit` *entry applied*
+    ///
+    /// This is the single most important caveat on this method (ADR 0018
+    /// §2/PR6, found live by the multi-tablet transaction corpus's
+    /// `anchor_leader_kill_mid` scenario, where a coordinator's own
+    /// `Some(ts)` was mistaken for "committed" and falsely ack'd a
+    /// transaction a racing recovery push had already, correctly,
+    /// aborted): since recovery makes a **second, independent decider**
+    /// legal (ADR 0018 §2/PR5's decision-semantics amendment) and a
+    /// same-outcome-different-ts duplicate commit is now a legal no-op
+    /// rather than an assert (ADR 0018 §2/PR6), this call's own entry can
+    /// apply as a **no-op** against a record some other decider already
+    /// flipped — to `Committed` at a *different* ts, or to `Aborted`
+    /// entirely — and `wait_applied` still reports success, because the
+    /// *entry* genuinely applied; the *decision* just wasn't this call's.
+    /// **Every caller must re-read the record's actual status
+    /// ([`txn_status_local`](Self::txn_status_local)/
+    /// [`txn_record_view`](Self::txn_record_view)) after this call,
+    /// `Some` or `None`, and act on *that* — never treat a `Some(ts)`
+    /// return as "committed," and never resolve any key using this
+    /// method's own returned `ts` as the outcome's `commit_ts` (source it
+    /// from the post-call status read instead, e.g.
+    /// `TxnDecisionStatus::Committed { commit_ts }`) — see `animusd::
+    /// ClientCtx::txn_decide_anchor` for the reference implementation of
+    /// this discipline.**
     ///
     /// Unlike [`txn_decide`](Self::txn_decide), this does **not** also
     /// resolve any keys — a multi-participant coordinator resolves the
     /// anchor's own keys via a separate [`txn_resolve`](Self::txn_resolve)
-    /// call, exactly like every other participant, once the commit here
-    /// has confirmed.
+    /// call, exactly like every other participant, once the actual
+    /// decision (from the re-read, not this call's return value) is known.
     pub async fn txn_commit_at_least(
         &self,
         txn_id: TxnId,
@@ -2427,10 +2487,23 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
                 ResolveStep::Value(
                     prior.and_then(|pvv| match txn::decode_envelope(&pvv.value) {
                         txn::Envelope::Committed(v) => Some(v),
-                        // A prior intent (an unresolved nested conflict — a
-                        // PR5+ concern, see `txn.rs`'s doc): conservatively
-                        // treat as absent rather than ever leak raw envelope
-                        // bytes to a caller.
+                        // A prior intent: **should be unreachable since ADR
+                        // 0018 §2/PR6 (task #16)** — `KvCommand::TxnStage`'s
+                        // apply-time writer-push-intents guard now rejects a
+                        // stage over any key still holding another
+                        // transaction's unresolved intent, so one hop back
+                        // from *this* intent's own version can only ever be
+                        // a genuinely committed value or true absence (see
+                        // `KvCommand::TxnStage`'s doc for the durability
+                        // argument this closes — a corpus depth run found a
+                        // corrupted MVCC version chain that made an
+                        // already-committed value permanently unreadable).
+                        // Kept as a defensive fallback rather than an
+                        // assert: this function has no way to distinguish
+                        // "the invariant broke" from "an older, pre-fix WAL
+                        // entry replayed on recovery" — conservatively
+                        // treating it as absent (never leaking raw envelope
+                        // bytes to a caller) is still correct either way.
                         txn::Envelope::Intent { .. } => None,
                     }),
                 )
@@ -3562,6 +3635,31 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
         // versions this node has never seen minted, so fold in the engine's
         // new high-water mark before this node ever mints/compares again.
         hlc.witness(hlc::unpack(storage.latest_version()), env.now());
+        // ADR 0018 §2/PR6 corrective note: the `TxnTracker` must be rebuilt
+        // from the freshly-installed image, exactly like `start_inner`
+        // already does at group start, and for the identical reason
+        // (`TxnTracker`'s own doc: compaction — and a snapshot install is
+        // exactly that, from the receiving replica's perspective — can
+        // skip straight past the individual `TxnStage`/`TxnCommit`/
+        // `TxnAbort` log entries a catching-up replica would otherwise have
+        // relied on to keep its tracker in sync). Before this fix, a
+        // replica that caught up via `InstallSnapshot` (rather than
+        // replaying every log entry individually) could be left with a
+        // **stale** `pending` entry for a transaction the engine itself
+        // already reflects as decided — the resolver loop would then find
+        // it "Pending" forever from this replica's own (stale) tracker,
+        // repeatedly re-proposing a no-op decide (harmless since the
+        // duelling-decider fix above makes that safe) but never
+        // transitioning it into `unresolved_decided`, so the resolver never
+        // proactively resolves the participant's intent (only an on-demand
+        // foreign-intent read, which doesn't consult the tracker at all,
+        // would still find it). Found live by the ADR 0018 multi-tablet
+        // transaction corpus's `anchor_leader_kill_early` scenario (seed
+        // 3924719889167511385): a leader-killed-then-healed replica caught
+        // up via snapshot install partway through a transaction's own
+        // lifecycle, precisely reproducing this gap.
+        *txn_tracker.lock().expect("txn tracker poisoned") =
+            rebuild_txn_tracker(storage, scope).await;
         did_work = true;
     }
 
@@ -3793,6 +3891,44 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                          never a resurrection)"
                     );
                 }
+                // ADR 0018 §2/PR6 (task #16): writers **push** intents —
+                // a target key already holding an *unresolved* intent from
+                // a *different* transaction blocks this whole stage, rather
+                // than silently overwriting it, so an abort-restore's own
+                // one-hop-back lookback can never land on another still-
+                // live intent (see `KvCommand::TxnStage`'s doc for the full
+                // durability argument this closes). Same-txn re-staging
+                // (a WAL-replay re-application) is unaffected — matched by
+                // `txn_id` equality, not mere presence of *an* intent.
+                let blocked_by = 'blocked: {
+                    for (key, _) in &writes {
+                        let Some(vv) = storage
+                            .get(&scope.physical(key))
+                            .await
+                            .expect("raftkv txn stage conflict read")
+                        else {
+                            continue;
+                        };
+                        if let txn::Envelope::Intent {
+                            txn_id: blocker, ..
+                        } = txn::decode_envelope(&vv.value)
+                            && blocker != txn_id
+                        {
+                            break 'blocked Some((key.clone(), blocker));
+                        }
+                    }
+                    None
+                };
+                if let Some((blocked_key, blocker)) = &blocked_by {
+                    tracing::warn!(
+                        ?txn_id,
+                        blocking_txn = ?blocker,
+                        ?blocked_key,
+                        "raftkv: TxnStage blocked by another transaction's unresolved intent \
+                         on a target key — whole-or-nothing no-op (the proposer must push the \
+                         blocking transaction and retry)"
+                    );
+                }
                 // Whole-or-nothing, matching `Batch`: a partial stage would
                 // let a reader observe some of a transaction's intents but
                 // not others (see `KvCommand::TxnStage`'s doc). A
@@ -3804,6 +3940,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 let record_in_fence =
                     !is_anchor || (fence.contains(&record_key) && !is_sealed(sealed, &record_key));
                 let all_in_fence = !already_decided
+                    && blocked_by.is_none()
                     && writes
                         .iter()
                         .all(|(k, _)| fence.contains(k) && !is_sealed(sealed, k))
@@ -3911,18 +4048,52 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                         // decision, nothing to do (the tracker was already
                         // updated the first time this applied).
                         txn::TxnStatus::Committed { commit_ts } if commit_ts == ts => {}
-                        // Two different `commit_ts` values for one record is
-                        // impossible by construction — it would mean two
-                        // committed flips both "won" the *same* log
-                        // position, which cannot happen (this arm only ever
-                        // runs once per applied entry, in this group's own
-                        // single, totally-ordered log). A genuine protocol
-                        // bug, not a recoverable condition — keep the assert.
-                        txn::TxnStatus::Committed { commit_ts } => panic!(
-                            "raftkv txn commit: protocol bug — {txn_id:?} already committed \
-                             at {commit_ts:?}, cannot also commit at {ts:?} (same log, two \
-                             different commit timestamps for one record)"
-                        ),
+                        // ADR 0018 §2/PR6 corrective note: a **second**,
+                        // differently-timestamped `TxnCommit` for an
+                        // already-`Committed` record is NOT "impossible by
+                        // construction" the way PR5 originally assumed —
+                        // `txn_commit_at_least`'s own `mint_at_least` is not
+                        // idempotent across calls (each proposes a *fresh*
+                        // ts), so two independent, individually well-formed
+                        // deciders (a coordinator whose own round trip is
+                        // still genuinely in flight — `animusd`'s own
+                        // `CLIENT_TIMEOUT`, 10s, comfortably exceeds
+                        // `RECOVERY_GRACE`, 5s — racing the recovery
+                        // resolver's own post-grace push) can each conclude
+                        // "commit" and each get their own entry accepted;
+                        // whichever applies first is definitionally the
+                        // winner (this group's one totally-ordered log is
+                        // still the sole arbiter), and this second entry is
+                        // exactly the same *legal* duelling-decider shape as
+                        // the `Aborted` arm below — a logged no-op, never an
+                        // assert. The one case that stays a hard assert
+                        // (impossible by construction, no live decider
+                        // reachable) is two *conflicting* decisions racing
+                        // to a genuinely-simultaneous first-applied log
+                        // position, which cannot happen in one sequential
+                        // log — that invariant is unaffected; this arm only
+                        // relaxes "same outcome, different ts". Every
+                        // resolve caller (`ClientCtx::cp_txn`/`txn_recover`,
+                        // `txn_resolver_loop`) already re-reads the record's
+                        // *actual* decided status before resolving anything
+                        // (never assumes its own proposal won), and the
+                        // `TxnTracker` update below only ever happens on the
+                        // *first*-applied decision (the losing entry never
+                        // touches it) — so no caller can ever resolve using
+                        // a losing, stale `commit_ts`. See the ADR's PR6
+                        // amendment for the full account (found live by the
+                        // multi-tablet transaction corpus under
+                        // participant-leader-kill fault injection).
+                        txn::TxnStatus::Committed { commit_ts } => {
+                            tracing::warn!(
+                                ?txn_id,
+                                first_commit_ts = ?commit_ts,
+                                second_commit_ts = ?ts,
+                                "raftkv: TxnCommit lost to an earlier-applied TxnCommit on the \
+                                 same record, at a different ts (duelling deciders reaching the \
+                                 same outcome independently — log order is the ballot); no-op"
+                            );
+                        }
                         // ADR 0018 §2/PR5 (decision-semantics amendment):
                         // recovery makes duelling deciders legal — a
                         // still-live coordinator's commit can race a
@@ -4053,7 +4224,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
             }
             KvCommand::TxnResolve {
                 txn_id,
-                record_key: _record_key,
+                record_key,
                 keys,
                 outcome,
                 ts,
@@ -4082,8 +4253,83 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                         txn::TxnOutcome::Committed { commit_ts } => Some(*commit_ts),
                         txn::TxnOutcome::Aborted => None,
                     };
+                    // ADR 0018 §2/PR6 hardening (defense-in-depth, not a
+                    // reproduced bug): every current decider
+                    // (`animusd`'s ordinary `cp_txn` commit path and its
+                    // recovery pusher alike — see `txn_commit_at_least`/
+                    // `txn_abort`'s doc) already re-reads the record's
+                    // *actual* decided status before resolving, rather than
+                    // trusting its own candidate outcome. But nothing at
+                    // apply time structurally enforced that discipline —
+                    // a future caller that resolved from a stale/assumed
+                    // outcome instead of a re-read would be
+                    // LWW-unrepairable (this key's version chain would
+                    // carry a wrong-outcome rewrite no later correct
+                    // resolve can undo). When this group holds
+                    // `record_key` locally — i.e. this is the anchor's own
+                    // group for `txn_id` — cross-check the carried
+                    // `outcome` against the record's real `status` and
+                    // refuse to resolve on a mismatch, whole-or-nothing,
+                    // rather than silently applying the wrong outcome.
+                    // **No known live violator as of PR6; guards a class,
+                    // not a reproduced bug** (see the PR6 audit recorded
+                    // in `docs/engineering-lessons.md` and ADR 0018's PR5
+                    // amendment §1's corrective note).
+                    //
+                    // A non-anchor participant's own apply cannot run this
+                    // check at all — its tablet never holds a copy of
+                    // `record_key`'s record (that's the entire reason
+                    // `outcome` travels explicitly on this command; see
+                    // `KvCommand::TxnResolve`'s doc). That residual is
+                    // accepted, not fixed, here: closing it would need the
+                    // resolver to also carry the record's own decision
+                    // `ts` so a participant could at least reject an
+                    // outcome inconsistent with it, which is left for a
+                    // future PR if the cost proves worth it.
+                    let outcome_mismatch = match storage
+                        .get(&scope.physical(&record_key))
+                        .await
+                        .expect("raftkv txn resolve record read")
+                        .and_then(|vv| txn::decode_record(&vv.value))
+                    {
+                        Some(record) if record.txn_id == txn_id => match (&record.status, &outcome)
+                        {
+                            (
+                                txn::TxnStatus::Committed { commit_ts: rec_ts },
+                                txn::TxnOutcome::Committed { commit_ts: out_ts },
+                            ) => rec_ts != out_ts,
+                            (txn::TxnStatus::Aborted, txn::TxnOutcome::Aborted) => false,
+                            // Resolving before the record itself ever
+                            // decided, or a flat Committed-vs-Aborted
+                            // disagreement — either way, a mismatch.
+                            _ => true,
+                        },
+                        // No local record for this exact `txn_id` — either
+                        // a non-anchor participant (nothing to check), or
+                        // this group is the anchor but hasn't applied its
+                        // own decision yet in this same batch (can't
+                        // happen: `TxnCommit`/`TxnAbort` always apply
+                        // strictly before the `TxnResolve` that follows
+                        // them — see `txn_commit_at_least`/`txn_abort`'s
+                        // callers). Proceed either way; this is the
+                        // expected, common case.
+                        _ => false,
+                    };
+                    if outcome_mismatch {
+                        tracing::warn!(
+                            ?txn_id,
+                            ?record_key,
+                            carried_outcome = ?outcome,
+                            "raftkv: TxnResolve's carried outcome does not match the anchor's own \
+                             decided record — skipping resolve as defense-in-depth (no known live \
+                             violator as of PR6; guards a class, not a reproduced bug)"
+                        );
+                    }
                     let version = hlc::pack(ts);
                     for key in &keys {
+                        if outcome_mismatch {
+                            continue; // whole-or-nothing: skip every key, not just this one
+                        }
                         let physical_key = scope.physical(key);
                         let Some(vv) = storage
                             .get(&physical_key)
@@ -4139,7 +4385,24 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                                 // `vv.version - 1` is guaranteed to sit
                                 // strictly below the intent's own version
                                 // and at/above this key's true prior
-                                // version.
+                                // version. **This one-hop-back lookback is
+                                // sound only because ADR 0018 §2/PR6 (task
+                                // #16)'s apply-time writer-push-intents
+                                // guard (`KvCommand::TxnStage`'s doc)
+                                // structurally rules out another
+                                // transaction's own unresolved intent ever
+                                // having been written at that prior
+                                // version** — before that fix, an
+                                // overwriting transaction's own later abort
+                                // could land here on a still-live intent
+                                // from the transaction it overwrote,
+                                // blindly re-merging its raw envelope bytes
+                                // (a corpus depth run's original finding:
+                                // the corrupted-MVCC-chain durability
+                                // hole). `pvv.value` below is therefore
+                                // always either a `Committed` envelope or
+                                // (via the `None` arm) genuinely absent —
+                                // never another live `Intent`.
                                 let prior = storage
                                     .get_at(&physical_key, vv.version.saturating_sub(1))
                                     .await

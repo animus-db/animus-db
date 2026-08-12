@@ -203,8 +203,22 @@ tablet is the **anchor** (mints the `TxnId`/record key, via
 `intent_spans` names every participant, not just the anchor's own writes),
 every other tablet is a **participant** (`txn_stage_participant`). Prepare
 runs the anchor first, then every participant **concurrently**
-(`futures::future::join_all`); `staged` tracks every participant that needs
-resolving, the anchor's own keys included (PR5: `txn_decide_anchor` no
+(`futures::future::join_all`) — both through `ClientCtx::
+txn_prepare_pushing` (ADR 0018 §2/PR6, task #16), not `txn_prepare`
+directly: a stage call returning `Ok(..)` only means its entry *applied*,
+never that it genuinely wrote an intent — `KvCommand::TxnStage`'s
+apply-time writer-push-intents guard rejects (whole-or-nothing) a target
+key already holding a *different* transaction's unresolved intent, exactly
+like a fence/seal miss. `txn_prepare_pushing` verifies every staged key via
+`ClientCtx::txn_verify` (the same wire-routed `RaftKvNode::
+txn_verify_staged` a recovery push already uses) after each attempt,
+retrying (`TXN_STAGE_PUSH_ATTEMPTS`, backed off by `TXN_STAGE_PUSH_
+BACKOFF`) before returning a client-facing conflict error — without this, a
+blocked stage would look identical to a genuine one, and the transaction
+would go on to commit without that key's write ever having happened, a
+worse atomicity violation than the durability hole this whole fix closes.
+`staged` tracks every participant that needs resolving, the anchor's own
+keys included (PR5: `txn_decide_anchor` no
 longer resolves anything inline — see below). Any prepare failure, or a
 failed pre-commit precondition re-check, proposes an abort on the anchor. On
 success, `commit_ts` is the anchor's own `txn_commit_at_least` result,

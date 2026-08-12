@@ -1033,6 +1033,45 @@ chain itself is broken, not a recoverable protocol outcome. See
 for the exact four-way match (win / idempotent replay / duelling-decider
 no-op / impossible-conflict assert).
 
+*(Corrective note, 2026-08-12, PR6: "impossible by construction" was wrong
+— found live, deterministically, by the multi-tablet transaction corpus's
+`participant_leader_kill_early` scenario (seed 2743871795844702347), no
+exotic fault sequence needed. `txn_commit_at_least`'s own `mint_at_least`
+is not idempotent across calls — each proposes a **fresh** `commit_ts` —
+so two independent, individually well-formed deciders (a still-live
+coordinator whose own round trip is genuinely slow, and the recovery
+resolver acting past `RECOVERY_GRACE`) can each conclude "commit" for the
+same `txn_id` and each get their own `TxnCommit` entry accepted, with
+**different** minted timestamps. This is not a contrived edge case:
+`animusd`'s own `CLIENT_TIMEOUT` (10s, the budget `cp_forward`'s
+hinted-retry uses during prepare) is *longer* than `RECOVERY_GRACE` (5s),
+so a coordinator whose commit round trip is merely slow — a leader
+election taking a few seconds, well within ordinary fault tolerance — can
+still be genuinely in flight past the point recovery is allowed to take
+over. Fixed: this arm is now the same **legal, logged no-op** as the
+`Aborted` arm below it — "same outcome, different timestamp" is exactly as
+safe as "different outcome" duelling, since whichever entry the log orders
+first still wins unconditionally and every real caller already re-reads
+the record's actual decided status before resolving anything (never a
+stale, losing `commit_ts` — see the torn-resolve audit this fix's own
+review performed, confirming `ClientCtx::cp_txn`/`txn_recover`/
+`txn_resolver_loop` all already source every resolve's `outcome` from a
+post-decision re-read). The one case that remains genuinely impossible —
+and stays a hard assert — is two **conflicting** decisions (`Committed` at
+two different ts, both claiming to be the *actual* content, as opposed to
+a second attempt at the *same* logical decision) racing to the same log
+position, which one sequential log structurally rules out. Regression:
+`animus-cp-data/tests/txn_recovery.rs`'s
+`duelling_commits_at_different_timestamps_the_second_is_a_no_op_never_a_panic`
++ its seed sweep. A related gap this fix's own verification surfaced: the
+snapshot-catchup path (`apply_and_compact`'s `install_engine_image` branch)
+never rebuilt a replica's in-memory `TxnTracker` from the freshly-installed
+image, unlike `start_inner`'s identical rebuild at group start (for the
+identical reason — a snapshot skips the individual `TxnStage`/`TxnCommit`
+entries the tracker relies on) — a replica catching up via `InstallSnapshot`
+could be left with a stale `pending` entry for an already-decided
+transaction. Fixed the same way, by calling `rebuild_txn_tracker` there too.)*
+
 Every caller that decides — `animusd::ClientCtx::txn_decide_anchor` (the
 ordinary coordinator path) and `ClientCtx::txn_recover` (recovery, below) —
 must **re-read the record's actual status** after proposing and report
@@ -1045,6 +1084,103 @@ with no inline resolve) return only the *proposed* ts, so
 }`, not `{ ts }`) — internal-only wire type, never sent bare, so this is a
 clean break with no back-compat concern (house convention: fresh clusters
 only).
+
+### 1b. Staging over another transaction's unresolved intent: writers push, never overwrite (task #16)
+
+A second, distinct durability hole the multi-tablet corpus found at depth
+(`ANIMUS_TXN_SEEDS=10`, `coordinator_abandon_prepare_s01`, seed
+16358087571531249382 — no fault injection needed, just ordinary sequential
+same-key traffic from one client) — genuinely a **different** bug from §1
+above, not another symptom of the same one. As originally shipped (PR3),
+`KvCommand::TxnStage`'s apply merges every write as a fresh `Envelope::
+Intent` **unconditionally**, exactly like an ordinary `Put` — no check
+against whatever the key currently holds. Single-writer-per-key workloads
+make this reachable in the most ordinary way: a client's transaction stages
+its own anchor key, is abandoned before ever deciding (a crashed or merely
+slow coordinator, `abandon_after_prepare` in the corpus's own workload
+model), and a *later* transaction from the *same* client stages the *same*
+key again — overwriting the first transaction's still-`Pending` intent
+with its own.
+
+That overwrite doesn't erase the old intent — MVCC keeps every version, so
+the first transaction's intent survives, just no longer the *latest*
+version. The corruption surfaces later: if the *second* (overwriting)
+transaction is the one that eventually gets decided `Aborted` (its own
+participants never staged, say), its abort-restore does what §"The value
+envelope" above describes — a **one-hop-back** `get_at(key, its own intent
+version - 1)` — and that one hop back lands on the **first** transaction's
+still-live intent, not a genuinely committed value or true absence. The
+restore then blindly re-merges that raw intent envelope as the key's new
+value, at the *second* transaction's own resolve-time mint — a timestamp
+strictly *higher* than the first transaction's own eventual, correct
+`commit_ts` (whenever recovery gets around to deciding it). Once a later,
+correct resolve tries to write the real value at that lower, correct
+`commit_ts`, it loses via ordinary per-key LWW: the wrong, higher-ts
+restore already won. The genuinely committed value becomes **permanently**
+unreadable, not merely delayed — physically still present in the MVCC
+history, but unreachable, since every read/resolve path only ever looks
+one version back.
+
+Two shapes were considered for the fix, one rejected:
+
+- **Chase the version chain back multiple hops on the *read* side**
+  (keep overwriting legal; when a restore meets a prior intent, keep
+  walking backward until a `Committed` value or true absence). Rejected as
+  unsound: an intermediate hop skipped over this way could belong to a
+  transaction that *later commits* — and that transaction's own eventual
+  resolve-rewrite would then lose to the restore's higher ts the exact
+  same unrepairable way. The corruption just moves to a different
+  transaction; it doesn't go away.
+- **Reject the overwrite at *apply* time** (shipped): `KvCommand::
+  TxnStage`'s apply now checks every target key's *current* value before
+  merging anything; if it's an `Envelope::Intent` naming a **different**
+  `txn_id`, the whole stage is a no-op — whole-or-nothing, exactly like a
+  fence/seal miss (same-txn re-staging, a WAL-replay re-application, is
+  unaffected — matched by `txn_id` equality, never mere presence of *an*
+  intent). This is CockroachDB's writers-push-intents discipline, and it
+  makes the corrupt chain **structurally unrepresentable**: a key can hold
+  at most one transaction's unresolved intent at a time, so an
+  abort-restore's one-hop-back lookback is now *always* sound. See
+  `KvCommand::TxnStage`'s own doc (`animus-cp-data/src/lib.rs`) for the
+  full argument, including why a plain `Put`/`Batch`/`Cas` over a foreign
+  intent is *not* similarly rejected (analyzed safe: it's a genuine
+  overwrite serialized strictly after the intent's own transaction, so
+  that transaction's eventual resolve-rewrite correctly loses to it via
+  ordinary LWW — no corrupt chain results, since nothing tries to look
+  "one hop back" past an ordinary write the way abort-restore does past an
+  intent).
+
+**The other half of this fix is proposer-side, not just apply-side**: a
+stage call returning `Some(ts)` only ever meant "this entry applied" (the
+same footgun §1's own duelling-decider fix already had to correct for
+`txn_commit_at_least`/`txn_abort` — never "my content genuinely landed").
+Once a blocked stage can no-op at apply, a coordinator that doesn't check
+would go on to commit a transaction **without one of its own writes ever
+having happened** — a new, worse atomicity violation than the one this fix
+exists to close. `animusd::ClientCtx::txn_prepare_pushing` (wrapping
+`txn_prepare`) and the corpus's own `stage_anchor_pushing`/
+`stage_participant_pushing` now verify every staged key via
+`RaftKvNode::txn_verify_staged` (the same primitive a recovery push already
+uses to check a participant's own stage) after each attempt, retrying
+(bounded — a short backoff, giving the blocking transaction room to clear
+via its own coordinator or `txn_resolver_loop`'s passive sweep past
+`RECOVERY_GRACE`) before reporting a client-facing conflict error.
+Deliberately **not** yet implemented: proactively identifying and pushing
+the *specific* blocking transaction by name — the read-side machinery to
+attribute a *local* (same-group) pending intent to a specific `txn_id`
+doesn't exist yet (`ResolveStep`/`FastRead`'s `Pending` variant carries no
+identity), so today's retry is a passive backoff, not an active push. Worth
+closing separately if this proves too slow in practice; noted, not
+deferred silently.
+
+Regression: `animus-cp-data/tests/txn_recovery.rs`'s
+`stage_over_a_foreign_pending_intent_no_ops_then_a_pushed_retry_succeeds`
+(the apply-time rejection plus the proposer-side push-and-retry, end to
+end) and `abort_restore_never_meets_another_transactions_intent`
+(reconstructs the exact three-transaction sequence that used to corrupt
+the chain and proves it can no longer arise); the corpus's own depth cell
+(`coordinator_abandon_prepare_s01`, noted above) is the end-to-end
+regression, green at `ANIMUS_TXN_SEEDS=10`.
 
 ### 2. `intent_spans` didn't cover what recovery needs — a real gap, closed structurally
 
