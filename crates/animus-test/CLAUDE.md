@@ -31,6 +31,7 @@ Env knobs at a glance (details in the sections below):
 | `ANIMUS_CORPUS_FULL=1` | off | extended Accord-corpus dimensions (breadth) |
 | `ANIMUS_RAFTKV_SEEDS=K` | 1 | K seed variants per raftkv-corpus cell |
 | `ANIMUS_RAFTKV_LSM=1` | off | run the whole raftkv corpus over `LsmEngine<SimEnv>` |
+| `ANIMUS_TXN_SEEDS=K` | 1 | K seed variants per multi-tablet transaction-corpus cell (ADR 0018) |
 
 ## What's non-obvious
 
@@ -130,6 +131,123 @@ The Accord-targeted suite exercises `check_cycles` under contention:
   A `StopRestart` on this tier re-opens the engine via `LsmEngine::open_with`
   on the same per-node prefix — engine recovery *plus* Raft-WAL re-apply
   (idempotent).
+
+### Elle-against-cross-tablet-transactions: the multi-tablet corpus (ADR 0018 §4, PR6)
+
+- `txn_serializable.rs` — the multi-tablet counterpart to the single-Raft-group
+  `raftkv_linearizable.rs` corpus, proving ADR 0018's 2PC transaction protocol
+  (`animus-cp-data`'s `txn_stage_anchor`/`txn_stage_participant`/
+  `txn_commit_at_least`/`txn_resolve`/recovery primitives) serializable under
+  fault injection, at depth. **Self-contained, like `raftkv_linearizable.rs`**
+  — an in-test coordinator (`run_txn`) reimplements `animusd::
+  ClientCtx::cp_txn`'s protocol directly over raw `RaftKvNode` handles
+  (mirroring `animus-cp-data/tests/txn_multi.rs`'s harness style), and a
+  `push`/`recovery_resolve` pair (adapted from `animus-cp-data/tests/
+  txn_recovery.rs`'s helpers of the same name, made async-native) plus a
+  `resolver_loop` mirror `animusd::ClientCtx::txn_recover`/
+  `txn_resolver_loop`. **This proves the protocol, not the wire layer** —
+  `animusd/tests/cp_txn.rs`'s real multi-process `ProdEnv` cluster is the
+  separate acceptance test for the actual wire coordinator; the two are
+  complementary, not overlapping.
+- **Topology**: 3 independent tablet Raft groups (`t0`/`t1`/`t2`, 3 replicas
+  each), so a transaction spans 2–3 *independent leaders, independent `Hlc`
+  clocks, independent commit pipelines* — unlike the single-Raft-group
+  raftkv corpus (where a cycle can only mean a forked/stale read),
+  `check_cycles` finding zero cycles here is a real, non-vacuous
+  cross-tablet serializability claim.
+- **Keyspace and single-writer-per-key, including read-modify-write.** Nine
+  keys (3 groups × 3 clients), single-writer-per-key **throughout** — the
+  rmw shape included. An earlier draft gave the rmw shape its own
+  multi-writer "shared" keys and a live corpus run immediately found a
+  spurious `check_cycles` cycle: the storage layer's plain `TxnStage` merge
+  is an unconditional overwrite (like `Put`) with no CAS-style conflict
+  check, so two transactions racing to stage the *same* key silently
+  clobber each other — exactly the hazard single-writer-per-key exists to
+  rule out for the other two shapes, and it turns out to bind on rmw too.
+  The shipped design instead has rmw append to 2 of the client's *own*
+  owned keys, conditioned on a precondition read of a *different* client's
+  key (in the one group this transaction doesn't write to) — never two
+  transactions writing the same key, but still genuine G2/write-skew teeth
+  (the commit depends on a read of something a concurrently-running
+  transaction writes).
+- **Three shapes**: write-only multi-key (never a begin-time read — same
+  discipline as the raftkv/Accord corpora, with one addition: a
+  provably-rolled-back append must never leak into a later write's encoded
+  prefix, so the client's list cache is only advanced on `Committed`/
+  `Indeterminate`, never a confirmed `Aborted`); read-only multi-key via
+  `quiescent_multi_read` (below) — plus a separate single-key point-read
+  shape exercising the foreign-intent read-path push
+  (`linearizable_get_served_fast` → cross-tablet `TxnStatus` →
+  `resolve_intent_given_status`, lifted per PR5 §4); and read-modify-write
+  (above).
+- **The read-only shape's snapshot mechanism went through three redesigns
+  before it stopped producing false-positive torn reads** — each one found
+  by a *different* corpus scenario, none of them a real protocol bug.
+  `quiescent_multi_read` (the current design) reads every key **at
+  latest**, **concurrently** (`futures::future::join_all`, never a
+  sequential per-key loop), after proactively force-resolving each one
+  (`force_durably_resolve_key`), and accepts the result only once two
+  consecutive concurrent rounds agree byte-for-byte — if nothing changed
+  between two independent rounds, no transaction was in flight touching
+  any involved key during that whole window, so the read is genuinely
+  consistent, not just probably fine. The two abandoned designs, in order:
+  (1) a single coordinator-minted `read_at` snapshot ts — undermined by
+  `RaftKvNode::mint_pushed`'s write-conflict floor, which can stamp a write
+  *above* whatever ceiling an **earlier** future-padded read already
+  pushed that group's ceiling to, and since `Hlc::mint` is monotonic that
+  becomes a **permanent** floor, so no margin (fixed or dynamically
+  sampled) closes it — the group's clock only ever ratchets further ahead
+  of wall-clock, never back (found by `participant_leader_kill_early`,
+  then again by plain `baseline`, no fault injection at all); (2)
+  force-resolve once, then read every key sequentially — a slow key's own
+  resolve/read can itself take real sim time, so a transaction touching an
+  *earlier*, already-read key can still land before a *later* key in the
+  same list is read (found by `baseline_read_heavy`). See
+  `quiescent_multi_read`'s own doc in `txn_serializable.rs` for the full
+  account, including the exact seeds and observed symptoms for all three
+  rounds.
+- **Stage attempts push, never overwrite, and the coordinator must verify
+  (ADR 0018 §2/PR6, task #16)** — a *different*, genuine durability bug
+  this corpus found at depth (`ANIMUS_TXN_SEEDS=10`,
+  `coordinator_abandon_prepare_s01`, seed 16358087571531249382, no fault
+  injection needed): `KvCommand::TxnStage`'s apply now rejects
+  (whole-or-nothing) a target key already holding a *different*
+  transaction's unresolved intent, closing a corrupted-MVCC-version-chain
+  hole an abandoned-then-overwritten-then-aborted transaction sequence
+  could otherwise produce (full account in ADR 0018's PR5 amendment §1b).
+  Since a stage call returning `Some(..)` only ever meant "this entry
+  applied," never "my content landed," the corpus's coordinator
+  (`stage_anchor_pushing`/`stage_participant_pushing`, mirroring
+  `animusd::ClientCtx::txn_prepare_pushing`) now verifies every staged key
+  via `RaftKvNode::txn_verify_staged` after each attempt, retrying
+  (`STAGE_PUSH_ATTEMPTS`, backed off) before reporting the whole
+  transaction `Aborted` — without this, a blocked stage would look
+  identical to a genuine one, and the corpus's own coordinator would have
+  reintroduced the exact atomicity violation this fix exists to close (a
+  transaction "committing" without one of its own writes ever having
+  happened).
+- **Recovery push + resolver loop, and the fault matrix.** `push` and the
+  per-scenario `resolver_loop` are the corpus's proof that a
+  coordinator-abandoned transaction still converges: `Workload::
+  abandon_prepare_pct`/`abandon_commit_pct` model a coordinator that stops
+  mid-2PC (after a successful prepare, or after a confirmed-but-unresolved
+  commit) — recorded `info`, never `fail` (house rule). ~25 frozen cells:
+  3 baselines (default/rmw-heavy/read-heavy mix), 2 coordinator-abandon
+  cells, participant/anchor leader-kill × 3 timings each, partition-during-
+  prepare × 3 timings, lossy links, clock skew within/beyond
+  `HLC_MAX_OFFSET` (beyond is a **liveness**-only knob — some reads may time
+  out, `check_cycles` must stay green throughout, per the ADR's Decision
+  section), and 6 compound cells crossing abandonment/faults/workload mix.
+  Depth knob **`ANIMUS_TXN_SEEDS`** (default 1 = frozen; `seed_expand`'s
+  usual variant-0-keeps-the-canonical-seed convention).
+- **A single-decider assumption in the recovery protocol itself, found by
+  this corpus under real fault injection**: see the ADR 0018 PR6 amendment
+  for the full account — the coordinator's own decide attempt and the
+  resolver's independent recovery push can both legitimately conclude
+  "commit" for the same transaction with *different* minted timestamps if
+  the coordinator's own round trip is still genuinely in flight past
+  `RECOVERY_GRACE`, and the apply path's "two different commit timestamps
+  is impossible by construction" assert does not tolerate that.
 
 ### Scaling coverage: the two env knobs + the topology split (ADR 0014)
 

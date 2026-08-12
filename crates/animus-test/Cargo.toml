@@ -22,4 +22,5 @@ animus-control.workspace = true
 animus-consensus.workspace = true
 animus-cp-data.workspace = true
 animus-storage.workspace = true
+animus-tablet.workspace = true
 futures.workspace = true
