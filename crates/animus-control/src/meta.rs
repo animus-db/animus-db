@@ -1712,6 +1712,96 @@ mod tests {
         assert_eq!(decoded.internal, addrs.internal);
     }
 
+    /// Idempotency guard for a tablet whose recorded policy targets more
+    /// replicas than there are eligible candidates (the exact shape
+    /// `animusd::ClientCtx::provision_tablet` now deliberately creates on a
+    /// small cluster — a fix to ADR 0005's placement policy, see
+    /// `docs/engineering-lessons.md`): `replan` returns
+    /// `PlacementError::InsufficientCandidates`, and `reconcile_placement`'s
+    /// `.ok()?` must silently skip that tablet, not panic or somehow force a
+    /// too-small set through. Calling `reconcile()` repeatedly against the
+    /// identical, still-under-candidated state must keep yielding **zero**
+    /// proposals every time — proof there is no proposal storm (a
+    /// leader that kept re-proposing the same doomed-to-reject command every
+    /// tick would still be harmless *correctness*-wise, epoch-CAS makes a
+    /// second acceptance impossible, but would be needless churn this test
+    /// rules out directly).
+    #[test]
+    fn reconcile_with_insufficient_candidates_is_a_stable_noop() {
+        let mut m = Metadata::default();
+        assert_eq!(
+            m.apply(&MetaCommand::UpsertMember {
+                node: nid(1),
+                labels: BTreeMap::new(),
+                status: NodeStatus::Active,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTablet {
+                tablet: TabletId(1),
+                table: Some("t".to_owned()),
+                range: KeyRange::whole(),
+                replicas: vec![nid(1)],
+            }),
+            ApplyOutcome::Applied
+        );
+        // The target RF (3), not the single available candidate — exactly
+        // what the fixed `provision_tablet` now always records.
+        assert_eq!(
+            m.apply(&MetaCommand::SetTabletPolicy {
+                tablet: TabletId(1),
+                policy: Some(PlacementPolicy::simple("cp-rf", 3)),
+            }),
+            ApplyOutcome::Applied
+        );
+
+        // Only 1 of the 3 required candidates exists: `replan` must error,
+        // and `reconcile()` must propose nothing — repeatedly, across
+        // several simulated ticks, with no state mutation in between.
+        for tick in 0..5 {
+            assert_eq!(
+                m.reconcile(),
+                Vec::new(),
+                "tick {tick}: expected zero proposals with only 1 of 3 required \
+                 candidates Active — a proposal here would be a storm against a \
+                 policy that can never be satisfied yet"
+            );
+        }
+
+        // Once enough candidates exist, the exact same policy (unchanged
+        // since creation) now correctly grows the tablet — proving this
+        // isn't merely "reconcile never grows anything," but specifically
+        // "reconcile correctly waits for real eligibility."
+        assert_eq!(
+            m.apply(&MetaCommand::UpsertMember {
+                node: nid(2),
+                labels: BTreeMap::new(),
+                status: NodeStatus::Active,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::UpsertMember {
+                node: nid(3),
+                labels: BTreeMap::new(),
+                status: NodeStatus::Active,
+            }),
+            ApplyOutcome::Applied
+        );
+        let proposals = m.reconcile();
+        assert_eq!(
+            proposals.len(),
+            1,
+            "expected exactly one CasTabletReplicas proposal now that 3 candidates exist: {proposals:?}"
+        );
+        assert!(matches!(
+            &proposals[0],
+            MetaCommand::CasTabletReplicas { tablet, replicas, .. }
+                if *tablet == TabletId(1) && replicas.len() == 3
+        ));
+    }
+
     /// ADR 0024 address GC: a tablet-scoped `RegisterCpAddr` entry is pruned from
     /// both maps when its tablet leaves the map (`DropTableTablets` /
     /// `MergeTablets`); a registration for an absent tablet is rejected (the
