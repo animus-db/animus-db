@@ -689,11 +689,19 @@ fn print_response(response: &ClientResponse) {
         ClientResponse::TxnPrepared { txn_id, ts, .. } => {
             println!("txn {txn_id:?} prepared at {ts:?}");
         }
-        ClientResponse::TxnDecided { ts } => {
-            println!("txn decided at {ts:?}");
+        ClientResponse::TxnDecided { outcome } => {
+            println!("txn decided: {outcome:?}");
         }
         ClientResponse::TxnStatusReply { status } => {
             println!("txn status: {status:?}");
+        }
+        // Internal recovery RPCs (ADR 0018 §2/PR5) — never requested by any
+        // CLI subcommand; printed raw if one ever surfaces here.
+        ClientResponse::TxnRecordViewReply { status, .. } => {
+            println!("txn record view: {status:?}");
+        }
+        ClientResponse::TxnVerifyReply { staged } => {
+            println!("txn verify: staged={staged}");
         }
     }
 }

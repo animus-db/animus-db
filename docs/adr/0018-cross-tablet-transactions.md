@@ -7,14 +7,16 @@
   the value envelope + the txn record/intent/resolve machinery through one
   Raft group — landed; PR4: multi-participant 2PC across tablet Raft
   groups, the wire-level coordinator, foreign-intent resolution, and
-  uncertainty-interval read restarts — landed; PR5-PR7 sequenced). See the
-  "Amendment (2026-08-11, PR1)" section for the build-time decisions settled
-  at the start of delivery, the "Amendment (2026-08-11, PR2)" section for
-  the range-seal design that replaces `version_floor`, the "Amendment
-  (2026-08-11, PR2b)" section for the read path + serializability
-  write-push mechanism, the "Amendment (2026-08-12, PR3)" section for the
-  record/intent/resolve machinery, and the "Amendment (2026-08-12, PR4)"
-  section below for multi-participant 2PC.
+  uncertainty-interval read restarts — landed; PR5: in-doubt transaction
+  recovery + the per-node intent-resolver background task — landed; PR6-PR7
+  sequenced). See the "Amendment (2026-08-11, PR1)" section for the
+  build-time decisions settled at the start of delivery, the "Amendment
+  (2026-08-11, PR2)" section for the range-seal design that replaces
+  `version_floor`, the "Amendment (2026-08-11, PR2b)" section for the read
+  path + serializability write-push mechanism, the "Amendment (2026-08-12,
+  PR3)" section for the record/intent/resolve machinery, the "Amendment
+  (2026-08-12, PR4)" section for multi-participant 2PC, and the "Amendment
+  (2026-08-12, PR5)" section below for in-doubt recovery + the resolver.
 - **Date:** 2026-08-03
 
 ## Context
@@ -140,7 +142,10 @@ is a load-bearing implementation detail settled at build time.
   record to a decision (commit iff all intents are present, else abort) — the
   CockroachDB "no blocking on a dead coordinator" property. This is the
   cross-tablet analogue of Accord's recovery (ADR 0011) and the CP plane's own
-  membership/split recovery (ADR 0017).
+  membership/split recovery (ADR 0017). **Built in PR5** — see the "Amendment
+  (2026-08-12, PR5)" section for the concrete push protocol, the grace-period
+  liveness knob, the decision-semantics fix that makes duelling deciders legal,
+  and the per-node resolver background task.
 
 ### 4. Determinism and verification
 
@@ -986,3 +991,265 @@ a missing arm here is exactly the bimodal per-process flake the house
 lesson on forwarding-enum additions warns about); several transactions run
 concurrently, each individually atomic; and a violated precondition
 aborting the whole transaction with neither participant's write landing.
+
+## Amendment (2026-08-12, PR5)
+
+PR5 lands Follow-up step 4: **in-doubt recovery** off a crashed coordinator,
+plus the per-node **intent-resolver background task** that both drives it
+proactively and lets PR4's synchronous, blocking resolve become asynchronous
+and best-effort — the deliberate deviation PR4's own amendment flagged and
+promised to revisit once this landed.
+
+### 1. Decision semantics: the log position is the ballot, not who proposed first
+
+PR3 made a second, *conflicting* decision on an already-decided record
+(`Committed` → `Abort`, or a commit at a different `commit_ts`) an assert —
+sound when only one actor (the coordinator) could ever propose a decision.
+Recovery makes a **second, independent decider** a normal part of the
+protocol, so duelling deciders are now legal: a still-live coordinator's
+commit can race a recovery pusher's abort (or vice versa), and *both*
+proposals are individually well-formed. The fix is not a new consensus
+mechanism — it is recognizing that one already exists: **the anchor's own
+Raft log is the sole arbiter**. A `TxnRecord` lives in exactly one Raft log
+(the anchor's), every replica of that group applies its log in the same
+total order, and `TxnStatus::Pending -> Committed/Aborted` moves exactly
+once — so whichever proposal's entry the log orders **first** is definitionally
+the one that gets to flip it; every later, conflicting proposal for the
+same `txn_id` finds the record already decided and is a **logged no-op**
+(`tracing::warn!`, naming both outcomes), never a panic. No Accord-style
+ballots (ADR 0011) are needed for this, unlike a genuinely leaderless
+protocol: a ballot exists to establish a *total order* among independent
+proposers with no other arbiter — here the log position already **is**
+that total order, for free, because every decision proposal for one record
+funnels through the same one Raft group.
+
+The one case that stays a hard assert: two committed flips at **two
+different** `commit_ts` values. That is impossible by construction (this
+match arm runs once per applied log entry, in one group's own totally
+ordered log — there is no way for "two different commits both won the
+same log position"), so it remains what it always was: proof the witnessing
+chain itself is broken, not a recoverable protocol outcome. See
+`apply_and_compact`'s `TxnCommit`/`TxnAbort` arms in `animus-cp-data/src/lib.rs`
+for the exact four-way match (win / idempotent replay / duelling-decider
+no-op / impossible-conflict assert).
+
+Every caller that decides — `animusd::ClientCtx::txn_decide_anchor` (the
+ordinary coordinator path) and `ClientCtx::txn_recover` (recovery, below) —
+must **re-read the record's actual status** after proposing and report
+*that*, never assume its own proposal won: `RaftKvNode::txn_commit_at_least`/
+`txn_abort` (a new abort-only primitive, the dual of `txn_commit_at_least`
+with no inline resolve) return only the *proposed* ts, so
+`txn_decide_anchor` always follows up with `txn_status_local` and returns a
+`TxnOutcome` — the record's real, decided outcome — not a bare timestamp.
+`ClientResponse::TxnDecided` changed shape to match (`{ outcome: TxnOutcome
+}`, not `{ ts }`) — internal-only wire type, never sent bare, so this is a
+clean break with no back-compat concern (house convention: fresh clusters
+only).
+
+### 2. `intent_spans` didn't cover what recovery needs — a real gap, closed structurally
+
+Recovery's "for each span in the record's `intent_spans`, ask the owning
+participant whether it's staged" (§3 below) assumes the anchor's record
+already knows every participant. It didn't: PR3/PR4 shipped `intent_spans`
+populated **only from the anchor's own writes** (`txn_stage_participant`
+passed `spans: Vec::new()`, "no local record is ever created here" — sound
+for PR3's single-participant case, silently insufficient once PR4 added
+real participants). The record had zero visibility into which *other*
+tablets/tables a transaction touched, and no table name to route by even if
+it had spans for them.
+
+Closed exactly like PR4 closed the analogous `record_table` gap:
+`animusd::ClientCtx::cp_txn` already computes the full write set grouped by
+`(table, tablet)` *before* staging anything, so it can hand the anchor's
+stage the complete cross-participant list up front.
+`TxnRecord::intent_spans`/`KvCommand::TxnStage.spans` changed from
+`Vec<KeyRange>` to `Vec<(String, KeyRange)>` — every key any participant
+ever staged, table name attached, the anchor's own writes included — and
+`RaftKvNode::txn_stage_anchor` (a new method; `txn_stage` becomes a thin
+single-participant wrapper calling it with an empty participant list) takes
+the caller-supplied cross-participant spans and merges them with the
+anchor's own. This is an internal wire/record-format change only (`codec.rs`
+`VERSION` bumped 8 → 9); no back-compat concern per house convention.
+
+### 3. The recovery protocol: "push"
+
+Any actor holding a foreign-or-local `Pending` intent past
+[`RECOVERY_GRACE`](../../crates/animus-cp-data/src/lib.rs) (5s of HLC wall
+time — a pure liveness knob; grace only affects *when* a push may act,
+never *what* it decides once it does, per §1's argument) may drive the
+transaction to a decision. `animusd::ClientCtx::txn_recover(record_table,
+record_key, txn_id)` is the pusher, callable both from a reader that just
+hit a stale intent (§4) and from the resolver loop's own sweep (§5):
+
+1. **Read the record** (`RaftKvNode::txn_record_view` — the recovery-view
+   dual of `txn_status_local`, also returning `intent_spans`/`created_ts` —
+   reached over the wire via a new internal-only `ClientRequest::
+   TxnRecordView`). Already decided → resolve every participant and return
+   the decision; nothing more to do.
+2. **Grace check.** `Pending` and `now < created_ts.wall_ms + RECOVERY_GRACE`
+   → decline (report `Pending`, propose nothing) — a still-live coordinator
+   is given room to finish its own ordinary in-flight commit.
+3. **Verify every participant.** `Pending` and stale: for each `(table,
+   span)` in `intent_spans`, ask that table's tablet leader whether it
+   still holds a live intent for `txn_id` over `span`
+   (`RaftKvNode::txn_verify_staged`, a new primitive — a bounded scoped scan
+   of the engine for the raw envelope, since `span` is always the exact
+   single-key point-span `txn::immediate_successor` builds; reached over the
+   wire via a new internal-only `ClientRequest::TxnVerify`). All staged →
+   propose `TxnCommit` (`txn_commit_at_least`, floored at the record's own
+   `created_ts`); any missing (or any verify query itself failing —
+   conservative: "not confirmed staged" reads as "missing") → propose
+   `TxnAbort` (`txn_abort`).
+4. **Re-read and act on the actual outcome** (§1) — either proposal may
+   lose to a concurrent decision.
+5. **Resolve** every participant per the final, actual decision
+   (`ClientCtx::recovery_resolve`, grouping `intent_spans` by table and
+   issuing one `txn_resolve_participant` call per table — the exact same
+   primitive the ordinary coordinator path uses).
+
+**Safety argument.** A recovery *commit* requires every participant
+independently verified staged — exactly the coordinator's own commit
+precondition — so a recovery commit and a coordinator's own commit are
+**the same decision**, arrived at independently; there is no scenario where
+recovery commits something the coordinator would have aborted. A recovery
+*abort* can race a still-live coordinator's late prepare/commit — the
+coordinator's subsequent `TxnCommit` simply no-ops against the already-
+`Aborted` record (§1) and the client correctly sees an abort, a legitimate
+outcome (a genuinely slow coordinator loses no data — nothing had committed
+yet). This is why grace is liveness-only: whether recovery even attempts
+step 3 changes only *when* a decision might be pushed, never *what* it
+decides.
+
+### 4. Read-path push — lift, scoped to the foreign-intent path
+
+The ADR's Decision section (§3) already promised "a read may wait or push"
+for a `Pending` intent; PR3/PR4 shipped only the "wait" half (a bounded
+retry, then not-served). PR5 lifts this for the **foreign-intent** read
+path (`animusd::ClientCtx::cp_get_local_resolving`, the one that already has
+a network round trip available to it): a still-`Pending` — or failed —
+`TxnStatus` query now calls `txn_recover` before giving up, rather than
+immediately reporting "retry." `txn_recover`'s own grace check means this
+never disturbs an ordinary in-flight transaction; it only shortens the
+window in which a stale one is visible as "pending, retry."
+
+**Deliberately not lifted for the locally-`Pending` case** (the
+single-participant/anchor read path, `RaftKvNode`'s own bounded
+`read_resolved` retry) — that retry lives inside `animus-cp-data`, with no
+network layer to reach other participants even if it wanted to push
+immediately; it still relies on the resolver loop (§5) to eventually push a
+stale local record, which converges within `RECOVERY_GRACE` plus one
+resolver tick regardless. **Scans keep the existing silent-omission
+behavior** (unchanged from PR3/PR4) — full scan-push scheduling remains
+future work, per the same scoping PR4's own amendment already established
+for the point-read-only foreign-intent path.
+
+### 5. The resolver background task
+
+Per-group tracking (`animus-cp-data`'s `TxnTracker`, `lib.rs`): every group
+that ever anchors a transaction maintains `pending: BTreeMap<TxnId,
+(record_key, created_ts)>` (inserted when a `TxnStage` with `is_anchor:
+true` first creates the record; removed the moment this group's own apply
+flips `Pending -> Committed/Aborted` — a losing, later conflicting decision
+touches neither map, since the winning one already did) and
+`unresolved_decided: BTreeMap<TxnId, (record_key, TxnOutcome)>` (inserted on
+that same transition; removed once *any* `TxnResolve` for that `txn_id`
+applies on this group). The second map is a **documented, deliberately
+approximate but still-safe** signal — a group can only observe resolves
+that land on *itself*, so "removed" really means "the anchor's own local
+resolve happened," not "every participant's intents were rewritten"; a
+resolver that stops tracking slightly early never loses correctness (a
+straggling remote intent is still resolved on demand the moment any reader
+hits it, §4), only background promptness is marginally weaker in that
+residual case. **Rebuilt at group start** (`rebuild_txn_tracker`) via one
+bounded scope scan for `txn::is_record_key` markers — deliberately not
+derived from log replay (compaction can truncate a `TxnStage`/`TxnCommit`
+entry out of the log long before the record's own lifecycle is done, the
+same reasoning `sealed`/`committed_ceiling` already document for their own
+rebuild-from-engine-marker designs), the same accepted cost `has_data`/
+`engine_image` already pay. Exposed via `RaftKvNode::pending_txns`/
+`unresolved_decided` — cheap, lock-and-clone, no barrier.
+
+A documented residual: since a `TxnRecord` is never pruned once decided (no
+record/intent GC exists yet — accepted future work, per the ADR's own
+Consequences section on MVCC GC), a restart's rebuild scan re-adds **every**
+historical decided record it finds to `unresolved_decided`, not just
+genuinely-still-unresolved ones — the resolver loop then harmlessly
+re-attempts an already-resolved `TxnResolve` for these (idempotent, a
+no-op) until its own tracking entry clears again. A real cost at scale, not
+a correctness issue; record/intent GC is out of PR5's scope.
+
+`animusd::txn_resolver_loop` (data-role-gated, spawned alongside the
+tablet-host reconciler and `auto_split_loop` in both `BoundNode::start_with`
+and `BoundDataNode::start_data_with`): every `TXN_RESOLVER_INTERVAL` (1s,
+plain fixed interval — no jitter, matching every sibling loop's own shape),
+for each tablet group this node currently **leads**
+(`ctx.edge.hosted_groups()`, empty on a control-only node), pushes every
+`pending_txns()` entry via `txn_recover` (declining harmlessly if still
+within grace) and fans a resolve out for every `unresolved_decided()` entry
+(re-reading the record's own `intent_spans` via `txn_record_view` first,
+since the tracker only carries `(record_key, outcome)`).
+
+### 6. `cp_txn`'s resolve becomes asynchronous — the PR4 deviation, lifted
+
+PR4's own amendment flagged resolving every participant *before* acking the
+client as a deliberate, temporary deviation from the ADR's "ack, then
+resolve asynchronously" design, specifically because the infrastructure
+that would make an un-awaited resolve *safe to abandon* didn't exist yet.
+It now does: once the anchor's commit is durable (the atomic commit point,
+unchanged), `cp_txn` returns immediately and spawns a background,
+best-effort resolve of every participant — the anchor's own keys included,
+now resolved via the identical `txn_resolve_participant` call as every
+other participant, not a special inline step inside
+`txn_decide_anchor` (which resolves nothing at all now — see §1). A crash
+right after this spawn leaves nothing ambiguous: the commit is already
+durable and visible (a foreign-intent read resolves it on the fly, §4;
+`unresolved_decided` tracks it for the resolver loop, §5) — this is
+strictly *safer* than the interim synchronous shape, not merely faster, since
+a stuck/slow participant's resolve latency (or forwarding failure) no
+longer holds the client's own response hostage.
+
+The **abort** paths (a failed prepare, a failed precondition re-check, or a
+commit attempt that itself lost to a recovery abort) still resolve
+**synchronously** before returning — there is no successful ack to speed up
+on an error return, so the extra safety margin there costs nothing.
+
+### 7. What ships with PR5, what's still deferred
+
+Landing: the decision-semantics fix (§1); the `intent_spans` structural fix
+(§2); the full recovery push protocol + two new internal wire requests,
+`TxnRecordView`/`TxnVerify` (§3); the foreign-intent read-path push (§4);
+the per-group `TxnTracker` + rebuild-at-start + `txn_resolver_loop` (§5);
+async post-ack resolve on the commit path (§6); three new metrics
+(`CpTxnRecoveredCommitted`/`CpTxnRecoveredAborted`/`CpTxnResolverRuns`).
+
+Deferred: `/admin/txns` observability (PR7, unchanged from the PR4
+amendment's own note); record/intent GC (accepted future cost, §5); push
+scheduling for a scan and for a locally-`Pending` read (§4); the
+multi-tablet Elle corpus (Follow-up step 5, PR6) — the safety net that lets
+this and every prior step be trusted at depth under fault injection.
+
+### 8. Tests
+
+`animus-cp-data/tests/txn_recovery.rs` (`SimEnv`, deterministic): a recovery
+push commits when every participant genuinely staged past grace (both keys
+visible on every replica of both groups); a push aborts when a participant
+never staged (every value restored); a recovery abort beating a late
+coordinator commit with no assert (driving both proposals explicitly,
+confirming the actual status is the abort); two duelling recoverers'
+conflicting proposals converging on one identical status with no assert
+(zero intervening sim time, mirroring `cross_group_lww.rs`'s in-flight-race
+technique); a push declining before grace elapses; `pending_txns`
+surviving a genuine process restart via the rebuild scan (a single-voter
+group, mirroring `witnessing.rs`'s own restart idiom); and a five-seed
+reproducibility sweep of the headline recovery-commit shape.
+
+`animusd/tests/cp_txn.rs` (`ProdEnv`, real 3-process cluster + a genuine
+pre-split table): a coordinator crash between prepare and decide — driven
+by sending the internal `TxnPrepare` wire requests directly (mirroring
+exactly what `cp_txn` does over the network) and then simply never sending
+`TxnDecide`/`TxnResolve`, since `cp_txn` runs synchronously inside one
+request handler with no separate long-lived coordinator process to
+literally kill — converging to a committed read from an uninvolved node
+within grace + resolver margin; and the dual, a commit already applied but
+never resolved, converging via ordinary reads with no grace wait needed at
+all (the record is already decided).

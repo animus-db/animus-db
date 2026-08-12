@@ -1313,6 +1313,35 @@ debugging anything that feels like it might have happened before.
   advancing. (`crates/animus-cp-data/tests/ts_cache.rs`.)
 
 ### Code patterns
+- **A field on a durable record shipped ahead of the feature that will read
+  it back can be structurally present but semantically empty — the type
+  checker cannot catch "nobody actually populated this for the case that
+  matters," only a caller that greps every writer can.** ADR 0018's
+  `TxnRecord::intent_spans` (`animus-cp-data/src/txn.rs`) shipped in PR3
+  (single-participant transactions) computed purely from the anchor's own
+  writes — sound at the time, since the anchor was the only participant
+  that existed. PR4 added real multi-participant transactions but never
+  revisited the field: a non-anchor stage passed `spans: Vec::new()`
+  ("no local record is ever created here" — true, but irrelevant to
+  whether the *anchor's* record should have known about this participant
+  anyway). The field kept compiling, kept round-tripping through
+  encode/decode, and kept *looking* like "the transaction's spans" right
+  up until PR5 needed to actually walk every participant for recovery and
+  found the anchor's own record had never heard of anyone else. This is
+  the same shape as PR4's own `record_table` fix one PR earlier (a bare
+  record key not carrying the routing info a *later* feature needed) — a
+  recurring pattern worth naming: **when a staged delivery's early PR
+  creates a durable record/marker type "to be filled in as the design
+  grows," the PR that actually needs the fuller picture must grep every
+  site that constructs the type, not trust the field's presence/type
+  signature as evidence it was fully populated for every case that now
+  exists.** The fix pattern is also identical both times: whoever has the
+  complete picture *before* the type is ever constructed (a coordinator
+  that already grouped every participant by table/tablet) hands the fuller
+  data to the constructor explicitly, rather than the constructor trying
+  to reconstruct it locally from information it structurally doesn't have.
+  See `docs/adr/0018-cross-tablet-transactions.md`'s PR5 amendment §2 for
+  the full account and the closing fix.
 - **A "full replace" update to `Arc`-shared cached state tolerates a bare
   monotonic-watermark check-then-mutate race; an "apply an incremental delta
   onto the existing cache" update to the *same* shared state does not, and

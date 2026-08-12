@@ -191,40 +191,65 @@ between pre-check and apply. `cp_get_local`/`cp_scan_local` run the read-side du
 request errors retryably rather than serving a false "absent" (for scans, avoids a
 silent truncation). See the in-crate `split_fence_tests`.
 
-## Multi-participant transactions (ADR 0018 §2/PR4)
+## Multi-participant transactions (ADR 0018 §2/PR4, recovery in PR5)
 
 `ClientCtx::cp_txn(writes, preconditions) -> Result<HlcTimestamp, String>` is
 the coordinator for a cross-tablet (possibly cross-table) atomic transaction,
 reachable via `ClientRequest::Txn`. It groups `writes`
 (`(table, key, Option<value>)`) by owning tablet; the **first** write's
 tablet is the **anchor** (mints the `TxnId`/record key, via
-`RaftKvNode::txn_stage`), every other tablet is a **participant**
-(`txn_stage_participant`). Prepare runs the anchor first, then every
-participant **concurrently** (`futures::future::join_all`); any participant
-failure aborts the anchor (`txn_decide(.., commit: false)`, bundled
-abort+resolve) and best-effort resolve-aborts every participant that did
-stage. On success, `commit_ts` is the anchor's own `txn_commit_at_least`
-result, floored at the max of every participant's acked stage ts — the
-**single Raft commit on the anchor's record is the atomic commit point**;
-every participant (anchor's own keys included) is then resolved with that
-canonical `commit_ts` **synchronously**, before the call returns (not
-async-post-ack — see the ADR's PR4 amendment for why, and what PR5's
-resolver-task infrastructure will let this become later).
+`RaftKvNode::txn_stage_anchor` — passed every *other* participant's
+`(table, span)` list up front, ADR 0018 §2/PR5, so the record's own
+`intent_spans` names every participant, not just the anchor's own writes),
+every other tablet is a **participant** (`txn_stage_participant`). Prepare
+runs the anchor first, then every participant **concurrently**
+(`futures::future::join_all`); `staged` tracks every participant that needs
+resolving, the anchor's own keys included (PR5: `txn_decide_anchor` no
+longer resolves anything inline — see below). Any prepare failure, or a
+failed pre-commit precondition re-check, proposes an abort on the anchor. On
+success, `commit_ts` is the anchor's own `txn_commit_at_least` result,
+floored at the max of every participant's acked stage ts — the **single
+Raft commit on the anchor's record is the atomic commit point**.
 
-**New internal-only `ClientRequest` variants — `TxnPrepare`/`TxnDecide`/
-`TxnResolve`/`TxnStatus` — are never sent bare**, only wrapped in
-`Forwarded` (the top-level `handle_request` dispatcher rejects a bare one
-with an error); their real handling lives in `cp_serve_forwarded`'s match
-only. Routed by the **actual data key** being staged/resolved (`table` +
-`writes[0]`/`keys[0]`), never `record_key` for `TxnPrepare`/`TxnResolve` —
-a non-anchor participant's `record_key` names the anchor's record, which
-lives in a *different* tablet's (possibly a different table's) keyspace
-entirely (see `RaftKvNode::txn.rs`'s `record_table` doc). `TxnDecide`/
-`TxnStatus` always target the anchor's own tablet, so routing by
+**Every decide attempt reports the record's ACTUAL outcome, never what was
+asked for (ADR 0018 §2/PR5 decision-semantics amendment)**:
+`txn_decide_anchor` proposes commit or abort, then always re-reads
+`txn_status_local` and returns a `TxnOutcome` — recovery makes duelling
+deciders legal (a still-live coordinator's commit can lose to a concurrent
+recovery abort, or vice versa; the anchor's own Raft log position is the
+sole arbiter, never who proposed first), so `cp_txn` branches on the actual
+outcome at every decide point (an abort attempt that turns out to have
+raced a recovery commit reports success, not the original failure; a
+commit attempt that lost to a recovery abort reports the abort, not a false
+success).
+
+**Resolve is asynchronous, post-ack, on the successful-commit path (ADR
+0018 §2/PR5 — the PR4 amendment's own flagged deviation, now lifted)**:
+once the anchor's commit is durable, `cp_txn` returns immediately and
+spawns (`tokio::spawn`) a best-effort resolve of every participant, the
+anchor's own keys included, in the background — safe now that
+`txn_resolver_loop` exists as the safety net for whatever this spawn
+doesn't get to. The abort paths still resolve synchronously before
+returning (no successful ack to speed up on an error return).
+
+**Internal-only `ClientRequest` variants — `TxnPrepare`/`TxnDecide`/
+`TxnResolve`/`TxnStatus`/`TxnRecordView`/`TxnVerify` — are never sent
+bare**, only wrapped in `Forwarded` (the top-level `handle_request`
+dispatcher rejects a bare one with an error); their real handling lives in
+`cp_serve_forwarded`'s match only. Routed by the **actual data key** being
+staged/resolved/verified (`table` + `writes[0]`/`keys[0]`/`span.start`),
+never `record_key` for `TxnPrepare`/`TxnResolve` — a non-anchor
+participant's `record_key` names the anchor's record, which lives in a
+*different* tablet's (possibly a different table's) keyspace entirely (see
+`RaftKvNode::txn.rs`'s `record_table` doc). `TxnDecide`/`TxnStatus`/
+`TxnRecordView` always target the anchor's own tablet, so routing by
 `record_key` there is correct. These are data-plane RPCs, not
 `MetaCommand`s — `is_relayable_command` (control-plane schema-DDL relay
 gating) does not apply to them; grepped and confirmed per the house lesson
-on adding a variant to a forwarded command enum.
+on adding a variant to a forwarded command enum. **`TxnDecide` no longer
+resolves anything and its reply carries the record's actual `TxnOutcome`**,
+not a bare ts (see above) — an internal-only wire shape change, no
+back-compat concern.
 
 **Foreign-intent read resolution** (`ClientCtx::cp_get_local_resolving`,
 used by `cp_read`'s `Local` arm and `cp_serve_forwarded`'s `Get` arm — the
@@ -233,10 +258,41 @@ original `cp_get_local` stays test-only, used by the in-crate
 `ClientCtx` around it): tries `RaftKvNode::linearizable_get_served_fast`
 first; on `FastRead::Foreign`, routes a `TxnStatus` query to the intent's
 actual record owner and finishes the read via
-`RaftKvNode::resolve_intent_given_status` once decided, falling back to a
-retryable error while still `Pending` (the caller's own retry loop tries
-again). A locally-`Pending` intent (the single-participant/anchor case)
-still falls back to the bounded internal wait, unchanged from PR3.
+`RaftKvNode::resolve_intent_given_status` once decided. **ADR 0018 §2/PR5
+(lifting the PR4 amendment's flagged deferral)**: a still-`Pending` (or
+failed) status query now calls `ClientCtx::txn_recover` before giving up,
+rather than immediately reporting "retry" — `txn_recover`'s own grace check
+means an ordinary in-flight transaction is never disturbed by this. A
+locally-`Pending` intent (the single-participant/anchor case) still falls
+back to the bounded internal wait, unchanged from PR3 — `txn_resolver_loop`
+is what eventually pushes a stale local record instead.
+
+**In-doubt recovery (ADR 0018 §2/PR5)**: `ClientCtx::txn_recover(
+record_table, record_key, txn_id) -> Result<TxnDecisionStatus, String>` is
+the "push" — any actor holding a foreign-or-local `Pending` intent past
+`animus_cp_data::RECOVERY_GRACE` (5s, liveness-only) may call it. Reads the
+record (`txn_record_view`, the new `TxnRecordView` recovery-view dual of
+`txn_status_local`); already decided → resolve and return; `Pending` and
+not yet stale → decline (`Pending`, propose nothing); `Pending` and stale →
+verify every `(table, span)` in `intent_spans` (`txn_verify`, does the
+owning tablet still hold a live intent — `RaftKvNode::txn_verify_staged`
+over the wire); all staged → propose `TxnCommit`, any missing → propose
+`TxnAbort`; re-read the actual outcome (never trust the proposal) and
+resolve every participant (`recovery_resolve`, grouping `intent_spans` by
+table). See the ADR's PR5 amendment for the full safety argument (why a
+recovery commit and a coordinator's own commit are always the same
+decision, and why a recovery abort racing a live coordinator is a
+legitimate, safe outcome, never data loss).
+
+`txn_resolver_loop` (`lib.rs`, data-role-gated, spawned alongside the
+tablet-host reconciler and `auto_split_loop` in both `BoundNode::start_with`
+and `BoundDataNode::start_data_with`, `TXN_RESOLVER_INTERVAL` = 1s, plain
+fixed interval): for each tablet group this node currently **leads**, pushes
+every `RaftKvNode::pending_txns()` entry via `txn_recover` and fans a
+resolve out for every `unresolved_decided()` entry — the proactive half of
+recovery, and what makes `cp_txn`'s async resolve (above) safe to leave
+un-awaited. Three new metrics: `CpTxnRecoveredCommitted`/
+`CpTxnRecoveredAborted`/`CpTxnResolverRuns`.
 
 **A wire-reachable panic found (and fixed) while testing this**:
 `RaftKvNode::txn_stage`'s anchor-key-length assert (ADR 0022, `TOKEN_BYTES`)
@@ -249,10 +305,19 @@ lessons.md` for the general lesson.
 Tests: `tests/cp_txn.rs` (real 3-process cluster + a genuine pre-split
 table) — multi-tablet atomicity, the follower-connected forwarding
 regression (the identical transaction issued from every node in turn),
-concurrent transactions each individually atomic, and a violated
-precondition aborting the whole transaction. The 2PC mechanics themselves
-are proven deterministically at the primitive level in `animus-cp-data`'s
-`tests/txn_multi.rs`.
+concurrent transactions each individually atomic, a violated precondition
+aborting the whole transaction, and (ADR 0018 §2/PR5) a coordinator crash
+between prepare and decide — driven by sending the internal `TxnPrepare`
+wire requests directly (mirroring exactly what `cp_txn` does over the
+network) and then simply never sending `TxnDecide`/`TxnResolve`, since
+`cp_txn` runs synchronously inside one request handler with no separate
+long-lived coordinator process to literally kill — converging to a
+committed read from an uninvolved node within grace + resolver margin, plus
+its dual (a commit already applied but never resolved, converging via
+ordinary reads with no grace wait needed at all). The 2PC mechanics
+themselves, and PR5's recovery/decision-semantics fix, are proven
+deterministically at the primitive level in `animus-cp-data`'s
+`tests/txn_multi.rs`/`tests/txn_recovery.rs`.
 
 ## Control-plane access
 
