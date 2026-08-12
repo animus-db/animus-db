@@ -30,6 +30,7 @@ use animus_env::nid;
 use animus_tablet::KeyRange;
 
 use crate::hlc::HlcTimestamp;
+use crate::txn::TxnId;
 use crate::{ImageEntry, KvCommand, KvWire};
 
 /// First byte of every encoded frame — rejects foreign payloads (e.g. a JSON
@@ -46,8 +47,12 @@ const MAGIC: u8 = 0xCB;
 /// wire/disk compatibility is required (no live deployments), so a mixed-
 /// version decode fails loudly on the version check below rather than
 /// silently misreading the new field. `6` (ADR 0018 §2/PR2b):
-/// `KvCommand::ReadCeiling` (tag 7) was added.
-const VERSION: u8 = 6;
+/// `KvCommand::ReadCeiling` (tag 7) was added. `7` (ADR 0018 §2/PR3):
+/// `KvCommand::TxnStage`/`TxnCommit`/`TxnAbort`/`TxnResolve` (tags 8-11)
+/// were added — pre-alpha, no cross-version compatibility required, so
+/// again a mixed-version decode fails loudly rather than silently
+/// misreading the new variants.
+const VERSION: u8 = 7;
 
 /// A decode failure: a description of what was malformed, surfaced loudly by
 /// the caller (logged + dropped; never silently misread).
@@ -233,6 +238,19 @@ fn read_ts(c: &mut Cursor<'_>) -> Result<HlcTimestamp, DecodeError> {
     Ok(HlcTimestamp { wall_ms, logical })
 }
 
+/// ADR 0018 §2/PR3: a [`TxnId`] as `(ts, node)`.
+fn put_txn_id(out: &mut Vec<u8>, id: &TxnId) {
+    put_ts(out, id.ts);
+    put_node_id(out, &id.node);
+}
+
+fn read_txn_id(c: &mut Cursor<'_>) -> Result<TxnId, DecodeError> {
+    Ok(TxnId {
+        ts: read_ts(c)?,
+        node: c.node_id()?,
+    })
+}
+
 fn put_command(out: &mut Vec<u8>, c: &KvCommand) {
     match c {
         KvCommand::Put {
@@ -287,6 +305,64 @@ fn put_command(out: &mut Vec<u8>, c: &KvCommand) {
             put_u8(out, 7);
             put_ts(out, *ts);
         }
+        KvCommand::TxnStage {
+            txn_id,
+            record_key,
+            writes,
+            spans,
+            fence,
+            ts,
+        } => {
+            put_u8(out, 8);
+            put_txn_id(out, txn_id);
+            put_bytes(out, record_key);
+            out.extend_from_slice(&(writes.len() as u32).to_be_bytes());
+            for (k, v) in writes {
+                put_bytes(out, k);
+                put_opt_bytes(out, v);
+            }
+            out.extend_from_slice(&(spans.len() as u32).to_be_bytes());
+            for s in spans {
+                put_key_range(out, s);
+            }
+            put_key_range(out, fence);
+            put_ts(out, *ts);
+        }
+        KvCommand::TxnCommit {
+            txn_id,
+            record_key,
+            ts,
+        } => {
+            put_u8(out, 9);
+            put_txn_id(out, txn_id);
+            put_bytes(out, record_key);
+            put_ts(out, *ts);
+        }
+        KvCommand::TxnAbort {
+            txn_id,
+            record_key,
+            ts,
+        } => {
+            put_u8(out, 10);
+            put_txn_id(out, txn_id);
+            put_bytes(out, record_key);
+            put_ts(out, *ts);
+        }
+        KvCommand::TxnResolve {
+            txn_id,
+            record_key,
+            keys,
+            ts,
+        } => {
+            put_u8(out, 11);
+            put_txn_id(out, txn_id);
+            put_bytes(out, record_key);
+            out.extend_from_slice(&(keys.len() as u32).to_be_bytes());
+            for k in keys {
+                put_bytes(out, k);
+            }
+            put_ts(out, *ts);
+        }
     }
 }
 
@@ -328,6 +404,53 @@ fn read_command(c: &mut Cursor<'_>) -> Result<KvCommand, DecodeError> {
             ts: read_ts(c)?,
         },
         7 => KvCommand::ReadCeiling { ts: read_ts(c)? },
+        8 => {
+            let txn_id = read_txn_id(c)?;
+            let record_key = c.bytes()?;
+            let n = c.u32()?;
+            let mut writes = Vec::with_capacity(n as usize);
+            for _ in 0..n {
+                writes.push((c.bytes()?, c.opt_bytes()?));
+            }
+            let n = c.u32()?;
+            let mut spans = Vec::with_capacity(n as usize);
+            for _ in 0..n {
+                spans.push(read_key_range(c)?);
+            }
+            KvCommand::TxnStage {
+                txn_id,
+                record_key,
+                writes,
+                spans,
+                fence: read_key_range(c)?,
+                ts: read_ts(c)?,
+            }
+        }
+        9 => KvCommand::TxnCommit {
+            txn_id: read_txn_id(c)?,
+            record_key: c.bytes()?,
+            ts: read_ts(c)?,
+        },
+        10 => KvCommand::TxnAbort {
+            txn_id: read_txn_id(c)?,
+            record_key: c.bytes()?,
+            ts: read_ts(c)?,
+        },
+        11 => {
+            let txn_id = read_txn_id(c)?;
+            let record_key = c.bytes()?;
+            let n = c.u32()?;
+            let mut keys = Vec::with_capacity(n as usize);
+            for _ in 0..n {
+                keys.push(c.bytes()?);
+            }
+            KvCommand::TxnResolve {
+                txn_id,
+                record_key,
+                keys,
+                ts: read_ts(c)?,
+            }
+        }
         other => return Err(format!("unknown KvCommand tag {other}")),
     })
 }
@@ -717,8 +840,67 @@ mod tests {
                 config: None,
             },
             LogEntry {
-                term: 6,
+                term: 7,
                 index: 24,
+                command: KvCommand::TxnStage {
+                    txn_id: TxnId {
+                        ts: ts(8, 0),
+                        node: nid(3),
+                    },
+                    record_key: b"record".to_vec(),
+                    writes: vec![
+                        (b"k1".to_vec(), Some(b"v1".to_vec())),
+                        (b"k2".to_vec(), None), // a staged delete
+                    ],
+                    spans: vec![KeyRange::new(b"k1".to_vec(), Some(b"k1\x00".to_vec()))],
+                    fence: KeyRange::whole(),
+                    ts: ts(8, 1),
+                },
+                config: None,
+            },
+            LogEntry {
+                term: 7,
+                index: 25,
+                command: KvCommand::TxnCommit {
+                    txn_id: TxnId {
+                        ts: ts(8, 0),
+                        node: nid(3),
+                    },
+                    record_key: b"record".to_vec(),
+                    ts: ts(9, 0),
+                },
+                config: None,
+            },
+            LogEntry {
+                term: 7,
+                index: 26,
+                command: KvCommand::TxnAbort {
+                    txn_id: TxnId {
+                        ts: ts(8, 0),
+                        node: nid(3),
+                    },
+                    record_key: b"record".to_vec(),
+                    ts: ts(9, 1),
+                },
+                config: None,
+            },
+            LogEntry {
+                term: 7,
+                index: 27,
+                command: KvCommand::TxnResolve {
+                    txn_id: TxnId {
+                        ts: ts(8, 0),
+                        node: nid(3),
+                    },
+                    record_key: b"record".to_vec(),
+                    keys: vec![b"k1".to_vec(), b"k2".to_vec()],
+                    ts: ts(9, 2),
+                },
+                config: None,
+            },
+            LogEntry {
+                term: 6,
+                index: 28,
                 command: KvCommand::NoOp,
                 config: None,
             },

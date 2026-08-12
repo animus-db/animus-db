@@ -353,15 +353,28 @@ fn assert_hosted_converged(
 }
 
 /// (b) **Data safety, present** — `key` reads back as `value` from `node`'s
-/// raw local engine (a physical, already-prefixed key).
+/// raw local engine (a physical, already-prefixed key). Every caller here
+/// passes the plain client-level `value`; this strips the ADR 0018 §2/PR3
+/// committed-value envelope (a leading `0` tag byte every apply-path write
+/// now wraps its value in — `animus_cp_data::txn`, internal to the crate)
+/// so callers don't each need to know about it, mirroring what
+/// `RaftKvNode::local_get` does for a scoped read.
 async fn assert_present(storage: &MemoryEngine, key: &[u8], value: &[u8]) {
     let got = storage
         .get(key)
         .await
         .expect("engine read ok")
         .map(|vv| vv.value);
+    let unwrapped = got.as_deref().map(|raw| {
+        assert_eq!(
+            raw.first().copied(),
+            Some(0u8),
+            "key {key:?}: expected a committed-value envelope (tag 0), got {raw:?}"
+        );
+        &raw[1..]
+    });
     assert_eq!(
-        got.as_deref(),
+        unwrapped,
         Some(value),
         "key {key:?} must be present with value {value:?}, got {got:?}"
     );

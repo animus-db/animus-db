@@ -310,13 +310,19 @@ fn reconciler_hosts_narrows_releases_and_confirms_sparing_a_sibling() {
     // ...but the co-hosted sibling's keys — on the SAME shared engine, SAME
     // table prefix — are completely untouched: this is the sibling-sparing
     // erase-bound invariant this whole design exists to make structural.
+    // The stored bytes carry the ADR 0018 §2/PR3 committed-value envelope
+    // (a leading `0` tag byte, `animus_cp_data`'s apply path wraps every
+    // committed value) — this reads the engine directly (not through
+    // `local_get`, which unwraps it), so the expected bytes below do too.
     for i in 0..5u64 {
         let key = physical(format!("z{i:02}").as_bytes());
+        let mut expected = vec![0u8];
+        expected.extend_from_slice(format!("hi{i}").as_bytes());
         assert_eq!(
             block_on(storage.get(&key))
                 .expect("engine read ok")
                 .map(|vv| vv.value),
-            Some(format!("hi{i}").into_bytes()),
+            Some(expected),
             "co-hosted sibling tablet 2's key z{i:02} must survive tablet 1's release"
         );
     }
