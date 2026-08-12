@@ -427,6 +427,35 @@ async fn grow_then_replace_a_voter_over_a_split_deployment_with_live_data_traffi
         let replacement_admin = replacement.admin_addr();
         let replacement_control_addr = replacement_addrs.internal;
 
+        // Wait for `replacement`'s own one-shot self-registration
+        // (`MetaCommand::RegisterNode`'s CAS, ADR 0040 PR4) to land before
+        // adding it as a control voter — the identical race, and identical
+        // fix, as the "grown node's own self-registration" wait above:
+        // calling `control/member/add` first races two *independent*
+        // proposals for the same id's `node_addrs` entry against each other,
+        // and the CAS correctly refuses whichever loses. Poll any surviving
+        // control node (an original, or `grown`) rather than a fixed index —
+        // `dead_original` is no longer live by this point.
+        timeout(Duration::from_secs(15), async {
+            loop {
+                let seen = (0..3usize).filter(|&i| i != dead_original).any(|i| {
+                    control_nodes[i]
+                        .metadata()
+                        .node_addrs
+                        .contains_key(&nid(replacement_id))
+                }) || grown
+                    .metadata()
+                    .node_addrs
+                    .contains_key(&nid(replacement_id));
+                if seen {
+                    return;
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("replacement node's own self-registration never landed on the real cluster");
+
         // Find whichever surviving node (the two live originals, or the
         // just-grown 4th) is currently leader.
         let leader_admin = {
