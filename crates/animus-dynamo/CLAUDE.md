@@ -69,8 +69,8 @@ adapter wedge. The transport (HTTP, sockets) and the distributed routing live in
   can route an item through `animus-data` without instantiating a local `Table`.
 - `wire` module — the DynamoDB JSON translation: `decode_request(target, body)
   -> Operation` (CreateTable/PutItem/GetItem/DeleteItem/Query/Scan/**UpdateItem**/
-  **BatchWriteItem**/**TransactWriteItems**; `CreateTable` decodes
-  `GlobalSecondaryIndexes` (hash-only or composite) + `LocalSecondaryIndexes`,
+  **BatchWriteItem**/**TransactWriteItems**/**TransactGetItems**; `CreateTable`
+  decodes `GlobalSecondaryIndexes` (hash-only or composite) + `LocalSecondaryIndexes`,
   each with an optional `Projection` (`ALL`/`KEYS_ONLY`/`INCLUDE`), `Query` an
   optional `IndexName` + a sort condition (allowed on a composite GSI / LSI),
   `Scan` a `Limit`/`ExclusiveStartKey`/`FilterExpression`, GetItem/Query/Scan an
@@ -80,8 +80,12 @@ adapter wedge. The transport (HTTP, sockets) and the distributed routing live in
   `UpdateExpression` into `Vec<UpdateAction>` + `UpdateReturnValues`
   (`NONE`/`ALL_OLD`/`ALL_NEW`); `BatchWriteItem` a `RequestItems` map of
   `Put`/`Delete` `WriteRequest`s per table; `TransactWriteItems` a list of
-  `TransactAction` (`Put`/`Delete`/`Update`/`ConditionCheck`)). The AttributeValue
-  codec encodes/decodes the full type set incl. `M`/`L`/`SS`/`NS`/`BS`.
+  `TransactAction` (`Put`/`Delete`/`Update`/`ConditionCheck`) — **atomic since
+  ADR 0018 §2/PR7**, via `animusd`'s `ClientCtx::cp_txn`, not merely decoded
+  here; `TransactGetItems` (new, PR7) a list of `TransactGet` (table + key +
+  optional projection) — a consistent multi-key read, `run_transact_get` in
+  `animusd`). The AttributeValue codec encodes/decodes the full type set incl.
+  `M`/`L`/`SS`/`NS`/`BS`.
   `Projection` (with `apply` / the free `project`) is a pure **dotted document-path**
   filter (`a.b`, reconstructing nested maps); `ReturnValues` (`None`/`AllOld`)
   drives `write_response`, `UpdateReturnValues` drives `update_response`, and
@@ -164,12 +168,19 @@ adapter wedge. The transport (HTTP, sockets) and the distributed routing live in
   so there is no double read) and `write_response` echoes it under `Attributes`.
   `UpdateItem` additionally supports `ALL_NEW` (`update_response`); `UPDATED_OLD`/
   `UPDATED_NEW` remain deferred.
-- **`UpdateItem`/`BatchWriteItem`/`TransactWriteItems`** are decoded here and run
-  at the `animusd` edge. `UpdateItem` is read-modify-write of one item applying
-  `SET`/`REMOVE` (upsert when absent); `BatchWriteItem` applies `Put`/`Delete`
-  per request (no batch atomicity); `TransactWriteItems` applies condition-gated
-  `Put`/`Delete`/`Update`/`ConditionCheck` in order — **honoring each condition
-  but without cross-action rollback** (true ACID via Accord, ADR 0011, is deferred).
+- **`UpdateItem`/`BatchWriteItem`/`TransactWriteItems`/`TransactGetItems`** are
+  decoded here and run at the `animusd` edge. `UpdateItem` is read-modify-write
+  of one item applying `SET`/`REMOVE` (upsert when absent); `BatchWriteItem`
+  applies `Put`/`Delete` per request (no batch atomicity — a DynamoDB-faithful
+  design choice, unlike `TransactWriteItems` below). **`TransactWriteItems` is
+  atomic since ADR 0018 §2/PR7**: every condition-gated `Put`/`Delete`/`Update`/
+  `ConditionCheck` action commits whole-or-nothing across however many
+  tablets/tables it spans, via `animusd`'s `ClientCtx::cp_txn` — see that
+  ADR's PR7 amendment for the condition-evaluation/precondition layering
+  (and a documented cross-node OCC limitation for a write action's own
+  condition, found while building it). **`TransactGetItems`** (new, PR7) is a
+  consistent multi-key read — a quiescence-confirmed serializable snapshot,
+  not a wait-free one; see the same amendment.
 - **Secondary-index *entry data* is edge-local, not replicated — but is no
   longer silently incomplete after a restart or on a node that missed the
   writes.** The GSI/LSI *definitions* live in the control plane's replicated
@@ -194,9 +205,12 @@ adapter wedge. The transport (HTTP, sockets) and the distributed routing live in
   quorum range scan; only an *index* query still needs this edge-local
   bookkeeping, since a range scan can't serve an index's alternate key
   ordering.)
-- **Still deferred** (don't represent as a full adapter): truly atomic
-  `TransactWriteItems`, `BatchGetItem`, list-index document paths (`a[0]`),
-  `ADD`/`DELETE` `UpdateExpression` arithmetic. The
+- **Still deferred** (don't represent as a full adapter): `BatchGetItem`,
+  list-index document paths (`a[0]`), `ADD`/`DELETE` `UpdateExpression`
+  arithmetic, `TransactWriteItems`/`TransactGetItems` idempotency tokens
+  (`ClientRequestToken`) and full per-action `CancellationReasons` fidelity
+  (ADR 0018 §2/PR7 shipped atomicity itself; these wire-fidelity details
+  remain simplified). The
   `Scan`/`Query` `FilterExpression` reuses the `ConditionExpression` predicate
   subset (`attribute_exists`/`attribute_not_exists`/`a = :v`), not the fuller
   filter grammar. `animus-cql` would map onto the same core the same way.
@@ -206,9 +220,9 @@ adapter wedge. The transport (HTTP, sockets) and the distributed routing live in
 `cargo test -p animus-dynamo` — `item_api.rs` over `MemoryEngine` (incl.
 `query_with` sort conditions), plus `wire`, `condition`, `registry`, and `schema`
 unit tests (JSON decode/encode incl. document/set types + document-path projection
-+ ReturnValues + UpdateItem/BatchWriteItem/TransactWriteItems decode + index
-projection types, base64 round-trip, tombstone, sort/condition predicates,
-GSI/LSI write/overwrite/delete + index
++ ReturnValues + UpdateItem/BatchWriteItem/TransactWriteItems/TransactGetItems
+decode + index projection types, base64 round-trip, tombstone, sort/condition
+predicates, GSI/LSI write/overwrite/delete + index
 query, multiple GSIs, composite-index sort narrowing, `sync_indexes` preserving
 entries on an unchanged shape + dropping a removed index, and the DynamoDB↔control
 `TableSchema` + `IndexDef` bridge). The wire protocol is exercised end-to-end over real HTTP in
@@ -216,9 +230,17 @@ entries on an unchanged shape + dropping a removed index, and the DynamoDB↔con
 (CreateTable/Query/conditional writes), `tests/dynamo_indexes.rs` (Scan with
 pagination + filter, and a GSI write-then-query), `tests/dynamo_documents.rs`
 (document/set types, projection, `ReturnValues: ALL_OLD`, multiple + composite
-GSIs, and an LSI), and `tests/dynamo_schema.rs` (**CreateTable consuming the
+GSIs, and an LSI), `tests/dynamo_schema.rs` (**CreateTable consuming the
 replicated catalog — surviving a node restart**, plus UpdateItem/BatchWriteItem/
 TransactWriteItems, document-path projection, a `KEYS_ONLY` GSI projection, and
 **`scan_and_query_read_live_storage_after_restart`** — base `Query`/`Scan` return
 the rows from live storage after a restart wipes the registry, proving they no
-longer depend on any in-memory written-key tracking).
+longer depend on any in-memory written-key tracking), and `tests/dynamo_txn.rs`
+(ADR 0018 §2/PR7 — atomic `TransactWriteItems`/`TransactGetItems` over a
+genuine multi-process, pre-split-table cluster: cross-tablet atomic
+visibility through a follower-connected client, a failing `ConditionCheck`
+cancelling the whole transaction, `TransactGetItems` never observing a torn
+pair under a concurrent writer, same-node concurrent transactions racing a
+shared conditioned key resolving to one winner, and `/admin/txns` showing a
+pending record during a simulated coordinator stall then clearing once
+recovery decides it).

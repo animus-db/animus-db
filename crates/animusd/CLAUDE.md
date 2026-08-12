@@ -561,8 +561,13 @@ route below the edge through the same `ClientCtx` CP primitives.
   *entry data* stays in-memory, maintained from observed writes and **lazily
   backfilled** on first index query (`backfill_index_if_needed`). Base-table
   `Query`/`Scan` use `cp_scan` (no in-memory key tracking). Surface also covers
-  `UpdateItem`/`BatchWriteItem`/`TransactWriteItems` (condition-gated, not yet
-  atomic). `DeleteItem` writes a tombstone *value*.
+  `UpdateItem`/`BatchWriteItem` (condition-gated, per-request/per-tablet
+  atomicity only) and, since ADR 0018 §2/PR7, **atomic** `TransactWriteItems`
+  (whole-or-nothing across however many tablets/tables it spans, via
+  `ClientCtx::cp_txn`) and `TransactGetItems` (a quiescence-confirmed
+  consistent multi-key read) — see that ADR's PR7 amendment for the
+  condition-evaluation layering and a documented cross-node OCC limitation
+  for a write action's own condition. `DeleteItem` writes a tombstone *value*.
 - **CQL v4** (`cql.rs`, `RoleAddrs.cql`) — `STARTUP`/`OPTIONS` handshake +
   `QUERY`/`PREPARE`/`EXECUTE` via the pure `animus_cql` crate. `CREATE TABLE`
   proposes a typed schema into the replicated catalog (incl. clustering/compound
@@ -576,7 +581,7 @@ route below the edge through the same `ClientCtx` CP primitives.
   node*, isolated between nodes, lost on restart); prepared ids are
   content-addressed (FNV-1a of the text).
 - **Admin / debug** (`admin.rs`, `RoleAddrs.admin`, ADR 0020) — read-only `GET`
-  views (`/admin/{config,status,peers,raft,raftkv,storage/*,metrics,metrics/
+  views (`/admin/{config,status,peers,raft,raftkv,txns,storage/*,metrics,metrics/
   history,member/drain-status,health,control/members}`) + gated `POST` actions
   (`/admin/{tablet/split,tablet/merge,storage/flush,storage/compact,raftkv/
   reconfigure,drain,member/add,member/remove,control/member/add,control/
@@ -596,6 +601,18 @@ route below the edge through the same `ClientCtx` CP primitives.
   straight off replicated `Metadata.node_addrs[*].role` — closing the gap
   where role was only knowable by fetching that specific node's own
   `/admin/config` first; `admin_addrs` itself is unchanged.
+  **`GET /admin/txns` (ADR 0018 §2/PR7)** mirrors `/admin/raftkv`'s own
+  node-local, one-entry-per-hosted-tablet shape (`CpGroup::txn_view`): each
+  entry's `pending` lists this group's still-`Pending` anchored transaction
+  records (record key, created timestamp, age vs. `RECOVERY_GRACE`, and a
+  best-effort `intent_spans` summary — the one field costing a real
+  `ReadIndex` round trip per pending entry, via `RaftKvNode::
+  txn_record_view`, since a tablet anchors only a handful of these at once);
+  `unresolved_decided` lists decided-but-not-yet-locally-resolved records.
+  Pure observer, no gated action — the existing `txn_resolver_loop`/
+  `ClientCtx::txn_recover` machinery already drives every record listed here
+  to resolution with no operator action; manual resolution is deferred, and
+  so is a dedicated dashboard tab (ADR 0021/0035 scope discipline).
   **`GET /admin/storage/control` (ADR 0038 PR4)** surfaces the
   **control-plane's own system-keyspace engine** stats (LSM levels/SSTables/
   memtable + WAL segments/durable_seq/rotations) — the control-plane
@@ -1139,6 +1156,16 @@ Test-file map (`tests/`):
   `dynamo_indexes.rs` / `dynamo_schema.rs` — the DynamoDB edge (wire round-trip,
   conditional writes, document paths, GSI/LSI, replicated+restart-surviving
   schema/index).
+- `dynamo_txn.rs` (ADR 0018 §2/PR7) — atomic `TransactWriteItems`/
+  `TransactGetItems` over a genuine multi-process, pre-split-table cluster:
+  cross-tablet atomic visibility through a follower-connected client, a
+  failing `ConditionCheck` cancelling the whole transaction (the old
+  serial-loop implementation's exact counter-example), `TransactGetItems`
+  never observing a torn pair under a concurrent writer, same-node
+  concurrent transactions racing a shared conditioned key resolving to one
+  winner, and `/admin/txns` showing a pending record during a simulated
+  coordinator stall (driven via the internal `TxnPrepare` wire request
+  directly, mirroring `cp_txn.rs`) then clearing once recovery decides it.
 - `cql_wire.rs` / `cql_clustering.rs` / `cql_durable_schema.rs` — the CQL edge
   (typed round-trip, compound keys, durable replicated schema).
 - `admin_endpoint.rs` — admin views + gated actions + data writes + bulk seed.

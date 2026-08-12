@@ -56,7 +56,7 @@ use animus_control::node::{DEFAULT_ORPHAN_SWEEP_AFTER, HEARTBEAT_INTERVAL, send_
 use animus_control::{PlacementPolicy, ProposeResult, RaftNode};
 use animus_cp_data::hlc::HlcTimestamp;
 use animus_cp_data::host::{MetadataView, Reconciler};
-use animus_cp_data::{FastRead, RaftKvNode, TxnDecisionStatus, TxnId, TxnOutcome};
+use animus_cp_data::{FastRead, RaftKvNode, TxnDecisionStatus, TxnId, TxnOutcome, TxnRecordView};
 use animus_env::{Clock, Env, Metric, MetricsHandle, NodeId, ProdEnv};
 use animus_storage::{
     Key, LsmEngine, MemoryEngine, SsTableView, StorageEngine, StorageError, VersionedValue,
@@ -364,6 +364,76 @@ impl CpGroup {
         match self {
             CpGroup::Lsm(n) => view!(n),
             CpGroup::Mem(n) => view!(n),
+        }
+    }
+
+    /// This group's transaction-tracker view for `/admin/txns` (ADR 0018 §2/
+    /// PR7): `pending_txns()`/`unresolved_decided()` (cheap lock-and-clone, no
+    /// barrier — see `TxnTracker`'s doc in `animus-cp-data`) plus, for each
+    /// pending record, a best-effort `txn_record_view` (a real ReadIndex
+    /// round trip) for its `intent_spans` — acceptable since a tablet
+    /// anchors only a handful of pending transactions at once. `age_ms`/
+    /// `past_grace` are computed against this node's own clock at request
+    /// time (`env().now()`), mirroring `ClientCtx::txn_recover`'s own
+    /// `now_ms` derivation.
+    async fn txn_view(&self, tablet: TabletId) -> admin::CpTxnView {
+        let node = self.env().node_id();
+        let now_ms = self.env().now().0 / 1_000_000;
+
+        macro_rules! pending_and_unresolved {
+            ($n:expr) => {
+                ($n.pending_txns(), $n.unresolved_decided())
+            };
+        }
+        let (pending, unresolved_decided) = match self {
+            CpGroup::Lsm(n) => pending_and_unresolved!(n),
+            CpGroup::Mem(n) => pending_and_unresolved!(n),
+        };
+
+        let mut pending_views = Vec::with_capacity(pending.len());
+        for (txn_id, (record_key, created_ts)) in pending {
+            let view: Option<TxnRecordView> = match self {
+                CpGroup::Lsm(n) => n.txn_record_view(&record_key).await,
+                CpGroup::Mem(n) => n.txn_record_view(&record_key).await,
+            };
+            let intent_spans = view.map(|v| {
+                v.intent_spans
+                    .iter()
+                    .map(|(table, span)| {
+                        let end = span
+                            .end
+                            .as_deref()
+                            .map(admin::key_display)
+                            .unwrap_or_else(|| "..".to_owned());
+                        format!("{table}: {}..{end}", admin::key_display(&span.start))
+                    })
+                    .collect()
+            });
+            let age_ms = now_ms.saturating_sub(created_ts.wall_ms);
+            pending_views.push(admin::PendingTxnView {
+                txn_id: format!("{txn_id:?}"),
+                record_key: admin::key_display(&record_key),
+                created_wall_ms: created_ts.wall_ms,
+                age_ms,
+                past_grace: age_ms >= animus_cp_data::RECOVERY_GRACE.as_millis() as u64,
+                intent_spans,
+            });
+        }
+
+        let unresolved_views = unresolved_decided
+            .into_iter()
+            .map(|(txn_id, (record_key, outcome))| admin::UnresolvedTxnView {
+                txn_id: format!("{txn_id:?}"),
+                record_key: admin::key_display(&record_key),
+                outcome: format!("{outcome:?}"),
+            })
+            .collect();
+
+        admin::CpTxnView {
+            tablet: tablet.0,
+            node,
+            pending: pending_views,
+            unresolved_decided: unresolved_views,
         }
     }
 

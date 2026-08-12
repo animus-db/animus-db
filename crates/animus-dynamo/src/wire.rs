@@ -12,7 +12,9 @@
 //! ## Supported subset
 //!
 //! Operations: `CreateTable`, `PutItem`, `GetItem`, `DeleteItem`, `Query`,
-//! `Scan`. AttributeValue types: the scalars `S` (string), `N` (number, carried
+//! `Scan`, `UpdateItem`, `BatchWriteItem`, `TransactWriteItems` (atomic, ADR
+//! 0018 §2/PR7), `TransactGetItems` (a consistent multi-key read, ADR 0018 §2/
+//! PR7). AttributeValue types: the scalars `S` (string), `N` (number, carried
 //! as text), `B` (binary, base64), `BOOL`, `NULL`; the document types `M` (map)
 //! and `L` (list); and the set types `SS`/`NS`/`BS` — matching
 //! [`AttributeValue`]. `PutItem` / `DeleteItem` accept a small
@@ -218,6 +220,20 @@ impl TransactAction {
     }
 }
 
+/// One item of a `TransactGetItems` request: a plain key read against `table`,
+/// with an optional per-item projection (mirrors `GetItem`'s own `key`/
+/// `projection` shape — `TransactGetItems`'s wire form is `{"Get": {TableName,
+/// Key, ProjectionExpression}}` per entry).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransactGet {
+    /// Target table.
+    pub table: String,
+    /// The key attributes.
+    pub key: Item,
+    /// Optional projection (the attributes to return; `None` = all).
+    pub projection: Option<Projection>,
+}
+
 /// A decoded DynamoDB wire operation (the supported subset).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Operation {
@@ -316,16 +332,26 @@ pub enum Operation {
         requests: BTreeMap<String, Vec<WriteRequest>>,
     },
     /// `TransactWriteItems`: a list of condition-gated put/delete/update/check
-    /// actions. See the (documented) non-atomicity caveat at the edge.
+    /// actions, applied **atomically** (ADR 0018 §2/PR7 — via `ClientCtx::cp_txn`,
+    /// whole-or-nothing across however many tablets/tables the actions span).
     TransactWriteItems {
         /// The transaction's actions, in order.
         actions: Vec<TransactAction>,
     },
+    /// `TransactGetItems`: a consistent multi-key read (ADR 0018 §2/PR7 — a
+    /// **serializable snapshot via quiescence-confirmation**, not a wait-free
+    /// one; see `animusd::dynamo::run_transact_get`'s doc for the exact
+    /// mechanism and its honest semantics).
+    TransactGetItems {
+        /// The keys to read, in request order (the response echoes this order).
+        gets: Vec<TransactGet>,
+    },
 }
 
 impl Operation {
-    /// The single table this operation targets, if it has one. `BatchWriteItem`
-    /// and `TransactWriteItems` span multiple tables, so they return `None`.
+    /// The single table this operation targets, if it has one. `BatchWriteItem`,
+    /// `TransactWriteItems`, and `TransactGetItems` span multiple tables, so
+    /// they return `None`.
     #[must_use]
     pub fn table(&self) -> Option<&str> {
         match self {
@@ -336,7 +362,9 @@ impl Operation {
             | Operation::Query { table, .. }
             | Operation::Scan { table, .. }
             | Operation::UpdateItem { table, .. } => Some(table),
-            Operation::BatchWriteItem { .. } | Operation::TransactWriteItems { .. } => None,
+            Operation::BatchWriteItem { .. }
+            | Operation::TransactWriteItems { .. }
+            | Operation::TransactGetItems { .. } => None,
         }
     }
 }
@@ -353,7 +381,10 @@ pub struct WireError {
 }
 
 impl WireError {
-    fn validation(message: impl Into<String>) -> Self {
+    /// A malformed or invalid request (e.g. too many `TransactWriteItems`
+    /// actions, or two actions on the same item).
+    #[must_use]
+    pub fn validation(message: impl Into<String>) -> Self {
         Self {
             code: "ValidationException",
             message: message.into(),
@@ -383,6 +414,23 @@ impl WireError {
     pub fn conditional_check_failed(message: impl Into<String>) -> Self {
         Self {
             code: "ConditionalCheckFailedException",
+            message: message.into(),
+        }
+    }
+
+    /// A `TransactWriteItems`/`TransactGetItems` request was cancelled — a
+    /// condition failure, a lost race against a concurrent write, or an
+    /// internal 2PC abort (ADR 0018 §2/PR7). This is the DynamoDB exception
+    /// type real `TransactWriteItems`/`TransactGetItems` failures use (as
+    /// opposed to the bare `ConditionalCheckFailedException` a single-item
+    /// conditional `PutItem`/`DeleteItem`/`UpdateItem` returns) — **simple
+    /// form**: a single human message, not AWS's per-action
+    /// `CancellationReasons` array (explicitly deferred, ADR 0018 PR1
+    /// amendment decision 4 / the PR7 amendment).
+    #[must_use]
+    pub fn transaction_canceled(message: impl Into<String>) -> Self {
+        Self {
+            code: "TransactionCanceledException",
             message: message.into(),
         }
     }
@@ -478,6 +526,7 @@ pub fn decode_request(target: &str, body: &[u8]) -> Result<Operation, WireError>
         "UpdateItem" => decode_update_item(obj),
         "BatchWriteItem" => decode_batch_write(obj),
         "TransactWriteItems" => decode_transact_write(obj),
+        "TransactGetItems" => decode_transact_get(obj),
         _ => Err(WireError::unknown_operation(target)),
     }
 }
@@ -698,6 +747,34 @@ fn decode_transact_write(obj: &Map<String, Value>) -> Result<Operation, WireErro
         actions.push(action);
     }
     Ok(Operation::TransactWriteItems { actions })
+}
+
+/// Decode a `TransactGetItems` body: `{"TransactItems": [{"Get": {TableName,
+/// Key, ProjectionExpression}}, ..]}`.
+fn decode_transact_get(obj: &Map<String, Value>) -> Result<Operation, WireError> {
+    let items = obj
+        .get("TransactItems")
+        .and_then(Value::as_array)
+        .ok_or_else(|| WireError::validation("missing array field `TransactItems`"))?;
+    let mut gets = Vec::with_capacity(items.len());
+    for entry in items {
+        let e = entry
+            .as_object()
+            .ok_or_else(|| WireError::validation("each `TransactItems` entry must be an object"))?;
+        let inner = e
+            .get("Get")
+            .and_then(Value::as_object)
+            .ok_or_else(|| WireError::validation("each transact-get item is `{\"Get\": {..}}`"))?;
+        let table = table_name(inner)?;
+        let key = decode_sub_item(inner, "Key")?;
+        let projection = decode_projection(inner)?;
+        gets.push(TransactGet {
+            table,
+            key,
+            projection,
+        });
+    }
+    Ok(Operation::TransactGetItems { gets })
 }
 
 /// Decode the attribute-map at `field` of a nested request object into an [`Item`].
@@ -1391,6 +1468,27 @@ pub fn get_item_response(item: Option<&Item>) -> String {
 #[must_use]
 pub fn empty_response() -> String {
     "{}".to_string()
+}
+
+/// The JSON body for a successful `TransactGetItems`: `{"Responses": [{"Item":
+/// {..}} | {}, ..]}`, one entry per requested key **in request order** — an
+/// absent item is `{}` at that slot (matching `GetItem`'s own encoding), never
+/// omitted (the response must stay index-aligned with the request).
+#[must_use]
+pub fn transact_get_response(items: &[Option<Item>]) -> String {
+    let responses: Vec<Value> = items
+        .iter()
+        .map(|item| {
+            let mut obj = Map::new();
+            if let Some(item) = item {
+                obj.insert("Item".into(), encode_item(item));
+            }
+            Value::Object(obj)
+        })
+        .collect();
+    let mut obj = Map::new();
+    obj.insert("Responses".into(), Value::Array(responses));
+    serde_json::to_string(&Value::Object(obj)).expect("transact-get response serializes")
 }
 
 /// The JSON body for a successful write echoing `ReturnValues`. `old` is the

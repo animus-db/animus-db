@@ -1,22 +1,30 @@
 # ADR 0018 — Cross-tablet transactions on the CP plane (2PC over per-tablet Raft + HLC + MVCC)
 
-- **Status:** Accepted — in delivery (PR1: HLC + sim clock skew landed; PR2:
-  HLC commit timestamps as the CP-plane MVCC version + the range-seal design
-  landed; PR2b: MVCC snapshot reads at a timestamp + the read-timestamp
-  cache/logged read ceiling landed; PR3: single-participant transactions —
-  the value envelope + the txn record/intent/resolve machinery through one
-  Raft group — landed; PR4: multi-participant 2PC across tablet Raft
-  groups, the wire-level coordinator, foreign-intent resolution, and
-  uncertainty-interval read restarts — landed; PR5: in-doubt transaction
-  recovery + the per-node intent-resolver background task — landed; PR6-PR7
-  sequenced). See the "Amendment (2026-08-11, PR1)" section for the
-  build-time decisions settled at the start of delivery, the "Amendment
-  (2026-08-11, PR2)" section for the range-seal design that replaces
-  `version_floor`, the "Amendment (2026-08-11, PR2b)" section for the read
-  path + serializability write-push mechanism, the "Amendment (2026-08-12,
-  PR3)" section for the record/intent/resolve machinery, the "Amendment
-  (2026-08-12, PR4)" section for multi-participant 2PC, and the "Amendment
-  (2026-08-12, PR5)" section below for in-doubt recovery + the resolver.
+- **Status:** Accepted — implemented (PR1-PR7 + corpus-found fixes; CQL
+  transactional surface, idempotency tokens, CancellationReasons fidelity,
+  and manual txn-resolution admin actions deferred). PR1: HLC + sim clock
+  skew; PR2: HLC commit timestamps as the CP-plane MVCC version + the
+  range-seal design; PR2b: MVCC snapshot reads at a timestamp + the
+  read-timestamp cache/logged read ceiling; PR3: single-participant
+  transactions — the value envelope + the txn record/intent/resolve
+  machinery through one Raft group; PR4: multi-participant 2PC across
+  tablet Raft groups, the wire-level coordinator, foreign-intent
+  resolution, and uncertainty-interval read restarts; PR5: in-doubt
+  transaction recovery + the per-node intent-resolver background task; PR6:
+  the multi-tablet Elle serializability corpus + the protocol hardening
+  fixes it found; PR7: atomic Dynamo `TransactWriteItems`, the new
+  `TransactGetItems`, and the `/admin/txns` observability surface. See the
+  "Amendment (2026-08-11, PR1)" section for the build-time decisions
+  settled at the start of delivery, the "Amendment (2026-08-11, PR2)"
+  section for the range-seal design that replaces `version_floor`, the
+  "Amendment (2026-08-11, PR2b)" section for the read path +
+  serializability write-push mechanism, the "Amendment (2026-08-12, PR3)"
+  section for the record/intent/resolve machinery, the "Amendment
+  (2026-08-12, PR4)" section for multi-participant 2PC, the "Amendment
+  (2026-08-12, PR5)" section for in-doubt recovery + the resolver, and the
+  "Amendment (2026-08-12, PR7)" section below for the Dynamo transactional
+  surface + observability (PR6's corpus findings are cited there directly,
+  since PR6 itself landed no separate ADR amendment).
 - **Date:** 2026-08-03
 
 ## Context
@@ -1489,3 +1497,197 @@ literally kill — converging to a committed read from an uninvolved node
 within grace + resolver margin; and the dual, a commit already applied but
 never resolved, converging via ordinary reads with no grace wait needed at
 all (the record is already decided).
+
+## Amendment (2026-08-12, PR7)
+
+PR7 lands the last item of the delivery scope PR1's amendment (decision 4)
+named: atomic Dynamo `TransactWriteItems`, the new `TransactGetItems`, and
+the `/admin/txns` observability surface — rewiring `animusd::dynamo`'s
+transactional edge onto `ClientCtx::cp_txn`/`cp_read` instead of the
+serial, documented-non-atomic loop it shipped with, and flipping this ADR's
+own Status line to **implemented**.
+
+### 1. `TransactWriteItems` becomes atomic
+
+`dynamo.rs::run_transact` no longer applies each action in list order with
+no rollback (the old, honestly-documented gap). It now: resolves every
+action's key, evaluates its `ConditionExpression` (if any) via one
+ordinary linearizable pre-read, computes each `Put`/`Delete`/`Update`
+action's write payload, and stages the whole batch as one
+[`ClientCtx::cp_txn`](../../crates/animusd/src/lib.rs) call — whole-or-
+nothing across however many tablets/tables the actions span. A condition
+that evaluates false rejects the request **before `cp_txn` is ever
+called** (nothing staged, nothing to unwind); a `cp_txn` abort (a lost 2PC
+race, or a `ConditionCheck` precondition that changed between prepare and
+commit) is reported the same way. Every key may be touched by at most one
+action (validated up front, matching DynamoDB's own rule) — `cp_txn`'s
+`writes` has no per-key conflict concept of its own. The GSI/LSI edge
+index (`note_put`/`note_delete`) is updated **after** the atomic commit
+lands, never per-action, so an aborted transaction never leaks a write
+into a secondary index.
+
+**Failure shape**: any condition failure or `cp_txn` abort is now a
+`TransactionCanceledException` — the real DynamoDB exception type for a
+transaction — not the bare `ConditionalCheckFailedException` a single-item
+conditional write returns (the old code used the latter even inside a
+transaction; this was a minor pre-existing inaccuracy this rewrite
+corrects as a side effect of getting the exception type right, not a
+new regression). **Simple form only**: one message, not AWS's per-action
+`CancellationReasons` array — deferred, per PR1's amendment decision 4.
+
+**A real design flaw found and fixed while building this, not merely
+anticipated**: an early version fed *every* condition-gated action's
+observed value into `cp_txn`'s precondition mechanism, including a
+`Put`/`Delete`/`Update`'s own key. `cp_txn`'s precondition check re-reads
+a key once before staging and again right before the commit decision —
+but a **write** action's own key, by the time that re-read runs, already
+holds *this same transaction's* own freshly-staged, still-`Pending`
+intent. The re-read cannot resolve until the transaction itself decides,
+which hasn't happened yet (the decide step is later in `cp_txn`'s own
+control flow), so it blocks in `ClientCtx::cp_read`'s retry loop —
+**not indefinitely**, but until the *background* `txn_resolver_loop`
+(a separate task) eventually pushes the now-stale-past-`RECOVERY_GRACE`
+record to a decision via in-doubt recovery, several seconds later, at
+which point the read finally returns the freshly-committed value — which
+of course differs from what the pre-stage check observed, so `cp_txn`
+reports a spurious "value changed" cancellation. This was caught by an
+existing regression, `animusd/tests/dynamo_schema.rs`'s
+`extended_surface`, which went from passing in under a second to failing
+several seconds later with exactly this misleading error.
+
+**The fix, and the resulting asymmetry**: only a `ConditionCheck`'s
+observed value becomes a `cp_txn` precondition. A `ConditionCheck`'s key
+is, by construction, never one this same transaction writes (the
+duplicate-item-per-transaction rule guarantees this), so its re-read
+observes an ordinary committed value throughout — exactly the cross-key
+read-modify-write guard `cp_txn`'s own precondition design already exists
+for (see the PR4 amendment §6's own note on this). A **write** action's
+own `ConditionExpression` is protected only by the one-time pre-read this
+function performs, itself serialized against this node's other RMWs by
+`ctx.data().rmw_lock` held across the whole call — the identical
+guarantee a single-item conditional `PutItem`/`DeleteItem`/`UpdateItem`
+always had, no stronger. **This is a known, documented limitation, not
+silently accepted**: two `TransactWriteItems` requests racing a
+write-action's own condition on the same key through *different* nodes
+have no OCC protection today (same-node races are still correctly
+serialized, `animusd/tests/dynamo_txn.rs`'s
+`concurrent_transact_write_items_on_a_shared_key_resolve_one_winner`).
+Closing it fully would need a new primitive — a `cp_txn` precondition
+variant that can distinguish "unchanged, but now covered by this same
+transaction's own in-flight intent" from "changed by someone else,"
+which does not exist yet. Flagged as follow-up, not solved here.
+
+### 2. `TransactGetItems`: a consistent multi-key read
+
+New — no non-atomic prior implementation to replace. `dynamo.rs::
+run_transact_get` reads every requested key **concurrently**
+(`futures::future::join_all`, via the ordinary [`ClientCtx::cp_read`]
+machinery — linearizable, intent-resolving, works from any node), and
+only accepts the round once **two consecutive concurrent rounds agree
+byte-for-byte on every key** (`quiescent_multi_get`). Bounded to
+[`TRANSACT_GET_MAX_ROUNDS`] (4) rounds; a snapshot that never quiesces
+(sustained contention on one of the requested keys) reports a retryable
+`TransactionCanceledException` rather than ever returning a possibly-torn
+result.
+
+**Semantics, honestly**: this is a **serializable snapshot via
+quiescence-confirmation, retry-on-contention** — not a wait-free
+snapshot, and not externally consistent (consistent with this ADR's own
+Decision section §2, which already rules out Spanner-style external
+consistency). If nothing changed between two independent observations, no
+transaction was in flight touching any involved key during that whole
+window, so the read is genuinely consistent — not merely probably so, but
+also not obtained without possible retries under contention.
+
+**Why this exact design, not a simpler one — the PR6 corpus's own
+findings, cited directly since PR6 landed no separate ADR amendment of its
+own.** The multi-tablet Elle serializability corpus
+(`animus-test/tests/txn_serializable.rs`, a sibling PR) needed three
+designs for its own analogous "read several keys as of one moment"
+problem before it stopped producing false-positive torn reads, and the
+final one is what this PR reuses:
+
+1. **A single coordinator-minted `read_at` snapshot timestamp** —
+   rejected as **structurally unsound**, not merely awkward:
+   `RaftKvNode::mint_pushed`'s write-conflict floor stamps a subsequent
+   write *above* whatever ceiling a prior future-padded read already
+   pushed that group's committed ceiling to, and since a group's `Hlc`
+   only ever ratchets forward, that becomes a **permanent** floor no
+   fixed or dynamically-sampled margin can close (the "ceiling ratchet"
+   problem). Found by the corpus's `participant_leader_kill_early` and
+   independently by its plain `baseline` scenario.
+2. **Force-resolve once, then read sequentially** — undermined by a slow
+   key observing a much later moment than a fast one (real sim/wall time
+   elapses between reads in the same "snapshot").
+3. **A single concurrent round** (this PR's own design, minus the second
+   confirming round) — narrows the window to one round trip but doesn't
+   eliminate it; group-to-group `ReadIndex` latency still varies. Found
+   by the corpus's `compound_abandon_prepare_and_partition` scenario.
+
+Two-round agreement (design 3 plus the confirming round) is what actually
+closes it, for the reason stated above. `dynamo.rs`'s `quiescent_multi_get`
+is a direct port of the corpus's `quiescent_multi_read`, substituting
+`ClientCtx::cp_read` (which already gives cross-process forwarding and
+on-the-fly intent resolution) for the corpus's own in-test
+`linearizable_get_served` calls.
+
+### 3. `/admin/txns` (ADR 0020 discipline)
+
+`GET /admin/txns` — a **pure observer**, no gated action — mirrors
+`/admin/raftkv`'s own shape exactly: one entry per hosted tablet
+(`CpGroup::txn_view`, `crates/animusd/src/lib.rs`), node-local (a
+cluster-wide picture is a client-side fan-out over every node's own
+`/admin/txns`, same as `/admin/raftkv`). Each hosted group's entry lists:
+
+- **`pending`** — this group's `TxnTracker::pending` (record_key,
+  created_ts, age vs. `RECOVERY_GRACE`, and — the one field costing a real
+  ReadIndex round trip rather than the cheap lock-and-clone the rest of
+  this view is — a best-effort `intent_spans` summary per participant, via
+  `RaftKvNode::txn_record_view`).
+- **`unresolved_decided`** — this group's `TxnTracker::unresolved_decided`
+  (record_key, the decided `TxnOutcome`).
+
+**No manual-resolution POST action** — deferred. The existing
+`txn_resolver_loop`/`ClientCtx::txn_recover` machinery (ADR 0018 §2/PR5)
+already drives every record listed here to a decision, and every
+participant to a resolve, with no operator action required; this endpoint
+is observability only. No dashboard tab either (ADR 0021/0035 scope
+discipline) — a future PR's concern if operators want one.
+
+### 4. Metrics
+
+Four new, append-only `Metric` variants (`animus-env/src/metrics.rs`):
+`DynamoTransactWritesCommitted`/`DynamoTransactWritesCanceled`
+(`run_transact`'s two terminal outcomes, including the all-`ConditionCheck`
+fallback path) and `DynamoTransactGetsOk`/`DynamoTransactGetsRetried`
+(`quiescent_multi_get`'s outcome — `Retried` covers both "needed more than
+the first confirming round to quiesce" and "never quiesced, reported
+retryable" cases; one counter for both, since both are the identical
+contention signal and PR7's scope capped this delivery at four new
+variants total).
+
+### 5. What ships with PR7, what's still deferred
+
+Landing: atomic `TransactWriteItems` via `cp_txn`; the new
+`TransactGetItems` (quiescence-confirmed multi-key read); `/admin/txns`;
+four metrics; `animusd/tests/dynamo_txn.rs` (cross-tablet atomic
+visibility through a follower-connected client; a failing `ConditionCheck`
+cancelling a whole transaction that would have partially applied under
+the old serial loop; `TransactGetItems` never observing a torn pair under
+a concurrent writer; same-node concurrent transactions racing a shared
+conditioned key resolving to exactly one winner with the loser's own
+other key never landing; `/admin/txns` showing a pending record during a
+simulated coordinator stall and clearing once recovery decides it).
+
+Deferred (per PR1's amendment decision 4, unchanged): CQL LWT/atomic
+`BATCH`; Dynamo `ClientRequestToken` idempotency; full per-action
+`CancellationReasons` fidelity. Newly identified and deferred by this PR:
+cross-node OCC for a write action's own `ConditionExpression` (§1's
+documented asymmetry above); `/admin/txns` manual resolution actions (§3).
+Record/intent GC remains out of scope (ADR 0018 §2/PR5's own note).
+
+No new `ClientRequest`/wire variant was needed — `cp_txn`/`cp_read`
+already existed and already route/forward correctly (proven generically
+by `cp_txn.rs`'s own follower-connected regression); this PR is entirely
+an `animusd::dynamo` + `animus-dynamo::wire` + `animus-env::metrics` +
+`animusd::admin`/`CpGroup` change.
