@@ -3861,3 +3861,16 @@ debugging anything that feels like it might have happened before.
   and re-running) plus `self_heal.rs` itself, now green. See
   `animus-cp-data/CLAUDE.md`'s `propose_ordered`/`next_ceiling_candidate`
   entries for the full mechanism.
+  **The generalizable lesson**: *an invariant spanning two locks is not an
+  invariant.* `Hlc`'s own mutex made minting monotonic in isolation;
+  `core`'s mutex made proposing (log-order) serial in isolation — but
+  nothing tied the two together, so "mint order == log order" was true by
+  coincidence under low contention and false under real concurrency. A
+  monotonic source feeding an ordered sink (a clock feeding a log, a
+  sequence number feeding a queue, a version counter feeding a commit) must
+  mint and enqueue in **one** critical section, or the two invariants each
+  hold individually while their composition doesn't. When reviewing code
+  that reads "compute X, then use X somewhere ordered," ask what stops a
+  second caller's "compute X" from running between those two steps — if
+  the answer is "nothing, but it's fine because X's own source is
+  monotonic," that reasoning is the bug.

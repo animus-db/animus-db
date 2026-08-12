@@ -8,16 +8,16 @@
 //! doc are correct) — it was that minting a proposal's `ts`
 //! (`mint_pushed`/`next_ceiling_candidate`) and appending that proposal to the
 //! Raft log (`core.propose(..)`) used to be two separate, unsynchronized
-//! steps with **no `.await` between them** at all. Under `SimEnv`'s
-//! single-threaded cooperative scheduler, two sequential non-yielding
-//! function calls can never be preempted mid-way by another task — so this
-//! race is **not expressible in `SimEnv`** no matter how a scenario is
-//! scripted; it only exists under genuine OS-thread parallelism
-//! (`ProdEnv`'s multi-threaded tokio runtime), where two concurrent
-//! proposers' calls can physically interleave between any two instructions.
-//! This is the house "`SimEnv` proves logic/ordering, not real-thread
-//! liveness" lesson in its purest form. Every other regression in this
-//! crate's suite drives `SimEnv`; this one deliberately can't.
+//! steps with **no `.await` between them** at all. `SimEnv`'s single-threaded
+//! executor only ever yields control at an `.await` point — mint-then-propose
+//! was one uninterrupted *synchronous* stretch of code, so two tasks racing
+//! to run it could never actually interleave under `SimEnv`, no matter how a
+//! scenario is scripted; only genuine OS-thread parallelism (`ProdEnv`'s
+//! multi-threaded tokio runtime) can preempt one task's synchronous code
+//! between any two instructions to let another run. This is the house
+//! "`SimEnv` proves logic/ordering, not real-thread liveness" lesson made
+//! concrete. Every other regression in this crate's suite drives `SimEnv`;
+//! this one deliberately can't.
 //!
 //! The fix (`RaftKvNode::propose_ordered`) makes "compute this proposal's
 //! `ts`" and "append it to the Raft log" one atomic step under the group's
