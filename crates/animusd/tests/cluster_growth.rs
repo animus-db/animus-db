@@ -302,21 +302,23 @@ async fn cluster_grows_from_three_to_five_and_rebalances() {
     // group (its raftkv env's peer book already has the original control
     // addresses — the expanded config lists them), so it should flip from
     // `Down` to `Active` within a few heartbeat/detect cycles.
-    let promoted = async {
-        loop {
+    //
+    // Idle-progress poll, not a flat deadline — member status is read via
+    // `/admin/status`, which is a view of the ADR 0038 async apply task's
+    // cache and so carries no contention-independent latency bound; see
+    // `support::poll_until_or_stalled`'s doc.
+    support::poll_until_or_stalled(
+        all_admin[0],
+        "added nodes never promoted to Active",
+        Duration::from_millis(100),
+        || async {
             let statuses = member_statuses(all_admin[0]).await;
-            if new_ids
+            new_ids
                 .iter()
                 .all(|id| statuses.get(id).map(String::as_str) == Some("Active"))
-            {
-                return;
-            }
-            sleep(Duration::from_millis(100)).await;
-        }
-    };
-    timeout(Duration::from_secs(20), promoted)
-        .await
-        .unwrap_or_else(|_| panic!("added nodes never promoted to Active"));
+        },
+    )
+    .await;
 
     // 6. A phantom that never boots must NOT become Active (ADR 0030 hardening,
     // task 3): register a third, never-started raftkv id and confirm it stays
@@ -340,20 +342,20 @@ async fn cluster_grows_from_three_to_five_and_rebalances() {
     );
 
     // 7. Rebalancing: poll until every raftkv id's replica count is within 1 of
-    // every other's, including the two new nodes.
-    let converged = async {
-        loop {
+    // every other's, including the two new nodes. Idle-progress poll — the
+    // tablet map is read via `/admin/status`'s apply-task cache; see
+    // `support::poll_until_or_stalled`'s doc.
+    support::poll_until_or_stalled(
+        base_admin[0],
+        "tablet replicas never spread across all 5 nodes",
+        Duration::from_millis(300),
+        || async {
             let map = tablet_map(base_admin[0]).await;
-            let counts = replica_counts(&map, &all_raftkv_ids);
-            if imbalance(&counts) <= 1 {
-                return counts;
-            }
-            sleep(Duration::from_millis(300)).await;
-        }
-    };
-    let converged_counts = timeout(Duration::from_secs(120), converged)
-        .await
-        .unwrap_or_else(|_| panic!("tablet replicas never spread across all 5 nodes within 120s"));
+            imbalance(&replica_counts(&map, &all_raftkv_ids)) <= 1
+        },
+    )
+    .await;
+    let converged_counts = replica_counts(&tablet_map(base_admin[0]).await, &all_raftkv_ids);
     for id in new_ids {
         assert!(
             converged_counts[id] > 0,
@@ -392,35 +394,33 @@ async fn cluster_grows_from_three_to_five_and_rebalances() {
     // admin addresses too (ADR 0032 PR1 closes the same gap for the dashboard's
     // fan-out seed, `admin.rs::peers_view`'s union of the static `admin_addrs`
     // with the replicated `Metadata.node_addrs[*].admin`).
-    let peers_include_grown = async {
-        loop {
+    // Idle-progress poll — `/admin/peers`' `admin_addrs` union is fed by the
+    // same apply-task cache; see `support::poll_until_or_stalled`'s doc.
+    support::poll_until_or_stalled(
+        base_admin[0],
+        "an original node's /admin/peers never listed the grown nodes' admin addrs",
+        Duration::from_millis(200),
+        || async {
             let (status, body) = admin(base_admin[0], "GET", "/admin/peers", None).await;
-            if status == 200 {
-                let listed: Vec<String> = body["admin_addrs"]
-                    .as_array()
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(Value::as_str)
-                            .map(str::to_owned)
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let all_present = expanded_config
-                    .nodes
-                    .iter()
-                    .all(|n| listed.contains(&n.admin.to_string()));
-                if all_present {
-                    return;
-                }
+            if status != 200 {
+                return false;
             }
-            sleep(Duration::from_millis(200)).await;
-        }
-    };
-    timeout(Duration::from_secs(20), peers_include_grown)
-        .await
-        .unwrap_or_else(|_| {
-            panic!("an original node's /admin/peers never listed the grown nodes' admin addrs")
-        });
+            let listed: Vec<String> = body["admin_addrs"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default();
+            expanded_config
+                .nodes
+                .iter()
+                .all(|n| listed.contains(&n.admin.to_string()))
+        },
+    )
+    .await;
 
     for node in nodes {
         node.shutdown();
@@ -494,35 +494,33 @@ async fn dashboard_health_recovers_after_grown_cluster_loses_an_original_node() 
         assert_eq!(status, 200, "admin add-member failed for {id}: {body}");
     }
 
-    let promoted = async {
-        loop {
+    // Idle-progress polls, not flat deadlines — see
+    // `support::poll_until_or_stalled`'s doc (and the first test above, which
+    // hits this identical shape).
+    support::poll_until_or_stalled(
+        all_admin[0],
+        "added nodes never promoted to Active",
+        Duration::from_millis(100),
+        || async {
             let statuses = member_statuses(all_admin[0]).await;
-            if new_ids
+            new_ids
                 .iter()
                 .all(|id| statuses.get(id).map(String::as_str) == Some("Active"))
-            {
-                return;
-            }
-            sleep(Duration::from_millis(100)).await;
-        }
-    };
-    timeout(Duration::from_secs(20), promoted)
-        .await
-        .unwrap_or_else(|_| panic!("added nodes never promoted to Active"));
+        },
+    )
+    .await;
 
-    let converged = async {
-        loop {
+    support::poll_until_or_stalled(
+        base_admin[0],
+        "tablet replicas never spread across all 5 nodes",
+        Duration::from_millis(300),
+        || async {
             let map = tablet_map(base_admin[0]).await;
-            let counts = replica_counts(&map, &all_raftkv_ids);
-            if imbalance(&counts) <= 1 {
-                return counts;
-            }
-            sleep(Duration::from_millis(300)).await;
-        }
-    };
-    let converged_counts = timeout(Duration::from_secs(120), converged)
-        .await
-        .unwrap_or_else(|_| panic!("tablet replicas never spread across all 5 nodes within 120s"));
+            imbalance(&replica_counts(&map, &all_raftkv_ids)) <= 1
+        },
+    )
+    .await;
+    let converged_counts = replica_counts(&tablet_map(base_admin[0]).await, &all_raftkv_ids);
     println!("post-growth converged counts: {converged_counts:?}");
 
     // Kill an ORIGINAL core node (index 0) -- it can never be decommissioned
@@ -536,23 +534,23 @@ async fn dashboard_health_recovers_after_grown_cluster_loses_an_original_node() 
     println!("killed node {killed_id} (index {kill_idx})");
 
     // Wait for every tablet to drop the dead replica and be repaired back to
-    // 3 live replicas (RF=3), polling from a survivor.
-    let repaired = async {
-        loop {
+    // 3 live replicas (RF=3), polling from a survivor. Idle-progress poll —
+    // the tablet map is read via a survivor's own `/admin/status` apply-task
+    // cache, the same as every other poll in this file; see
+    // `support::poll_until_or_stalled`'s doc.
+    support::poll_until_or_stalled(
+        survivor_admin[0],
+        "tablets never repaired off the dead node",
+        Duration::from_millis(300),
+        || async {
             let map = tablet_map(survivor_admin[0]).await;
-            let statuses = member_statuses(survivor_admin[0]).await;
-            let all_ok = map
-                .values()
-                .all(|(replicas, _)| replicas.len() == 3 && !replicas.contains(&killed_id));
-            if all_ok {
-                return (map, statuses);
-            }
-            sleep(Duration::from_millis(300)).await;
-        }
-    };
-    let (final_map, final_statuses) = timeout(Duration::from_secs(120), repaired)
-        .await
-        .unwrap_or_else(|_| panic!("tablets never repaired off the dead node within 120s"));
+            map.values()
+                .all(|(replicas, _)| replicas.len() == 3 && !replicas.contains(&killed_id))
+        },
+    )
+    .await;
+    let final_map = tablet_map(survivor_admin[0]).await;
+    let final_statuses = member_statuses(survivor_admin[0]).await;
     println!("post-repair tablet map: {final_map:?}");
     println!("post-repair member statuses: {final_statuses:?}");
 

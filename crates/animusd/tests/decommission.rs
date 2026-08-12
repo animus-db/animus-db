@@ -413,7 +413,12 @@ async fn decommission_drains_removes_and_allows_id_reuse() {
     // window, and only fails once that watermark has stopped advancing
     // for `IDLE_STALL_TIMEOUT` with the member still present — plus an
     // outer backstop against genuine deadlock. See
-    // `docs/engineering-lessons.md`.
+    // `docs/engineering-lessons.md`. This shape is now also factored into
+    // `support::poll_until_or_stalled` (added once `cluster_growth.rs`
+    // needed the identical pattern at several call sites) — kept hand-rolled
+    // here rather than migrated, since this file's version already reads
+    // `/admin/status` inline alongside the removal-specific `members_gone`/
+    // `addrs_gone` check below.
     const IDLE_STALL_TIMEOUT: Duration = Duration::from_secs(60);
     const OVERALL_BACKSTOP: Duration = Duration::from_secs(300);
     let removed = async {

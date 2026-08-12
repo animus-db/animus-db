@@ -8,12 +8,15 @@
 #![allow(dead_code)]
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use animusd::config::NodeRole;
 use animusd::{ClusterConfig, Node, RoleAddrs, StorageBackend};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
 /// Default wall-clock deadline for the `*_deadline` join/bring-up helpers
@@ -554,4 +557,107 @@ pub async fn await_data_nodes_active(
     })
     .await
     .expect("data nodes did not become Active in 20s");
+}
+
+/// Idle-stall bound for [`poll_until_or_stalled`] — how long the answering
+/// node's own apply-task watermark may sit frozen while its condition is
+/// still unmet before that is treated as a real stall rather than
+/// contention-driven lag. Matches `decommission.rs`'s original
+/// `IDLE_STALL_TIMEOUT` (PR #146) so every caller of this shape, across both
+/// files, reads as one convention.
+pub const IDLE_STALL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Outer wall-clock backstop for [`poll_until_or_stalled`], guarding against
+/// a genuine deadlock even while the watermark keeps inching forward.
+pub const OVERALL_BACKSTOP: Duration = Duration::from_secs(300);
+
+/// One-shot `GET /admin/raft` on `addr`, returning its `engine_applied_index`
+/// field if the request and parse both succeed (`None` on any failure —
+/// callers treat that as "no progress signal this tick", not a hard error,
+/// since a momentarily-unreachable node is exactly the kind of transient
+/// blip this whole poll shape exists to ride out). Deliberately minimal
+/// (GET-only, no request body) rather than reusing a test file's own richer
+/// `admin()` helper (which also POSTs) — this module has no reason to grow a
+/// full HTTP client.
+async fn engine_applied_index(addr: SocketAddr) -> Option<u64> {
+    let mut stream = TcpStream::connect(addr).await.ok()?;
+    let request = "GET /admin/raft HTTP/1.0\r\nHost: animus\r\nConnection: close\r\n\r\n";
+    stream.write_all(request.as_bytes()).await.ok()?;
+    stream.flush().await.ok()?;
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).await.ok()?;
+    let text = String::from_utf8(raw).ok()?;
+    let (head, payload) = text.split_once("\r\n\r\n")?;
+    let status: u16 = head
+        .lines()
+        .next()?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()?;
+    if status != 200 {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(payload).ok()?;
+    value["engine_applied_index"].as_u64()
+}
+
+/// Poll `condition` to convergence for an eventual property that is read
+/// through a node's ADR 0038 async apply-task cache (`/admin/status`, a
+/// tablet map, member statuses, `/admin/peers`, ...) — which has **no
+/// contention-independent latency bound** (see `docs/engineering-lessons.md`'s
+/// DRIVER_APPLIED entry): a flat wall-clock deadline around such a wait is
+/// either too tight (spurious failure under `cargo test --workspace`-scale
+/// contention, or even just several concurrent tests in one binary) or too
+/// loose (no diagnostic value when something is genuinely stuck).
+///
+/// Instead, poll `condition` at `poll_interval`, and alongside it require
+/// **forward progress** of `progress_addr`'s own `/admin/raft`
+/// `engine_applied_index` — pick a node whose view `condition` itself reads,
+/// so "no progress" genuinely means "the thing feeding this condition is
+/// stuck", not merely "some other node is stuck". Fails only once that
+/// watermark has made no progress for [`IDLE_STALL_TIMEOUT`] with
+/// `condition` still unmet, or once the [`OVERALL_BACKSTOP`] wall-clock
+/// budget expires — whichever comes first. `what` names the awaited property
+/// in both panic messages.
+///
+/// Factored out of `decommission.rs`'s original hand-rolled "Idle-progress
+/// poll, not a flat deadline" block (PR #146) once `cluster_growth.rs`
+/// needed the identical shape at several call sites.
+pub async fn poll_until_or_stalled<C, Fut>(
+    progress_addr: SocketAddr,
+    what: &str,
+    poll_interval: Duration,
+    mut condition: C,
+) where
+    C: FnMut() -> Fut,
+    Fut: Future<Output = bool>,
+{
+    let overall_deadline = tokio::time::Instant::now() + OVERALL_BACKSTOP;
+    let mut last_progress_at = tokio::time::Instant::now();
+    let mut last_engine_applied: Option<u64> = None;
+    loop {
+        if condition().await {
+            return;
+        }
+        if let Some(engine_applied) = engine_applied_index(progress_addr).await {
+            if last_engine_applied != Some(engine_applied) {
+                last_engine_applied = Some(engine_applied);
+                last_progress_at = tokio::time::Instant::now();
+            } else if last_progress_at.elapsed() >= IDLE_STALL_TIMEOUT {
+                panic!(
+                    "{what}: never converged, and the apply task's engine_applied_index has \
+                     been stuck at {engine_applied} for {IDLE_STALL_TIMEOUT:?} — this is no \
+                     longer contention-driven lag, something is actually stuck"
+                );
+            }
+        }
+        if tokio::time::Instant::now() >= overall_deadline {
+            panic!(
+                "{what}: never converged within the {OVERALL_BACKSTOP:?} backstop, despite \
+                 apply-task progress (last engine_applied_index={last_engine_applied:?})"
+            );
+        }
+        sleep(poll_interval).await;
+    }
 }
