@@ -66,7 +66,12 @@ const MAGIC: u8 = 0xCB;
 /// `orphan_created_ts: Option<HlcTimestamp>` — a recovery pusher that finds
 /// no record at all synthesizes one directly in the `Aborted` state (see
 /// `KvCommand::TxnAbort`'s doc). Same house convention.
-const VERSION: u8 = 10;
+/// `11` (ADR 0018 §2 apply-time write-key conditions amendment):
+/// `TxnStage` gained `conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>` —
+/// own-key byte-level OCC preconditions checked at apply (see
+/// `KvCommand::TxnStage`'s doc). Same house convention: a clean bump, no
+/// cross-version compatibility.
+const VERSION: u8 = 11;
 
 /// A decode failure: a description of what was malformed, surfaced loudly by
 /// the caller (logged + dropped; never silently misread).
@@ -368,6 +373,7 @@ fn put_command(out: &mut Vec<u8>, c: &KvCommand) {
             is_anchor,
             writes,
             spans,
+            conditions,
             fence,
             ts,
         } => {
@@ -385,6 +391,11 @@ fn put_command(out: &mut Vec<u8>, c: &KvCommand) {
             for (table, span) in spans {
                 put_bytes(out, table.as_bytes());
                 put_key_range(out, span);
+            }
+            out.extend_from_slice(&(conditions.len() as u32).to_be_bytes());
+            for (k, expected) in conditions {
+                put_bytes(out, k);
+                put_opt_bytes(out, expected);
             }
             put_key_range(out, fence);
             put_ts(out, *ts);
@@ -487,6 +498,11 @@ fn read_command(c: &mut Cursor<'_>) -> Result<KvCommand, DecodeError> {
                     .map_err(|_| "TxnStage span table not utf8".to_string())?;
                 spans.push((table, read_key_range(c)?));
             }
+            let n = c.u32()?;
+            let mut conditions = Vec::with_capacity(n as usize);
+            for _ in 0..n {
+                conditions.push((c.bytes()?, c.opt_bytes()?));
+            }
             KvCommand::TxnStage {
                 txn_id,
                 record_key,
@@ -494,6 +510,7 @@ fn read_command(c: &mut Cursor<'_>) -> Result<KvCommand, DecodeError> {
                 is_anchor,
                 writes,
                 spans,
+                conditions,
                 fence: read_key_range(c)?,
                 ts: read_ts(c)?,
             }
@@ -933,6 +950,10 @@ mod tests {
                         "orders".to_string(),
                         KeyRange::new(b"k1".to_vec(), Some(b"k1\x00".to_vec())),
                     )],
+                    conditions: vec![
+                        (b"k1".to_vec(), Some(b"expected1".to_vec())),
+                        (b"k2".to_vec(), None), // must be absent
+                    ],
                     fence: KeyRange::whole(),
                     ts: ts(8, 1),
                 },

@@ -1064,15 +1064,15 @@ async fn stage_anchor_pushing(
             let val = val.clone();
             let participant_spans = participant_spans.clone();
             async move {
-                node.txn_stage_anchor(table, vec![(key, val)], participant_spans)
+                node.txn_stage_anchor(table, vec![(key, val)], participant_spans, Vec::new())
                     .await
             }
         })
         .await;
-        if let Some((txn_id, _)) = &staged
+        if let Some((txn_id, _, _outcome)) = &staged
             && stage_landed(env, nodes, &key, txn_id).await
         {
-            return staged;
+            return staged.map(|(txn_id, record_key, _outcome)| (txn_id, record_key));
         }
         if attempt + 1 < STAGE_PUSH_ATTEMPTS {
             env.sleep(STAGE_PUSH_BACKOFF).await;
@@ -1101,13 +1101,19 @@ async fn stage_participant_pushing(
             let key = key.clone();
             let val = val.clone();
             async move {
-                node.txn_stage_participant(txn_id, record_key, record_table, vec![(key, val)])
-                    .await
+                node.txn_stage_participant(
+                    txn_id,
+                    record_key,
+                    record_table,
+                    vec![(key, val)],
+                    Vec::new(),
+                )
+                .await
             }
         })
         .await;
         if ts.is_some() && stage_landed(env, nodes, &key, &txn_id).await {
-            return ts;
+            return ts.map(|(ts, _outcome)| ts);
         }
         if attempt + 1 < STAGE_PUSH_ATTEMPTS {
             env.sleep(STAGE_PUSH_BACKOFF).await;

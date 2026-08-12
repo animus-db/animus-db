@@ -730,47 +730,44 @@ enum IndexNote {
 /// **Condition evaluation, precisely — this is a layered design, not a
 /// direct translation.** A DynamoDB `ConditionExpression`
 /// (`attribute_exists`/`attribute_not_exists`/`attr = value`) is not
-/// something [`ClientCtx::cp_txn`] understands — its own precondition
-/// mechanism is a plain byte-equality check against a raw stored value (a
-/// deliberate simplification documented on `cp_txn` itself: "re-checks
-/// every precondition by value" rather than at an HLC read timestamp). This
-/// function evaluates the *semantic* condition itself, once, via an
+/// something [`ClientCtx::cp_txn`] understands directly — `cp_txn` (and
+/// the `animus-cp-data` primitive underneath it, `KvCommand::TxnStage`'s
+/// `conditions` field) speaks plain byte-level OCC: "the key's current
+/// committed value must equal exactly these bytes" (or must be absent).
+/// This function evaluates the *semantic* condition itself, once, via an
 /// ordinary linearizable pre-read of every condition-gated key (a
 /// `ConditionCheck`, or a `Put`/`Delete`/`Update` carrying its own
-/// `condition`) — a false condition rejects the whole request **before
-/// `cp_txn` is ever called**, so nothing has been staged and there is
-/// nothing to unwind.
+/// `condition`), then **compiles a true evaluation into an equality
+/// condition on the exact bytes just read** — a false condition rejects
+/// the whole request **before `cp_txn` is ever called**, so nothing has
+/// been staged and there is nothing to unwind.
 ///
-/// **Only a `ConditionCheck`'s observed value becomes a `cp_txn`
-/// precondition — a write action's own condition does not, even though it
-/// was evaluated the same way.** This looks like an inconsistency but is
-/// load-bearing: `cp_txn`'s precondition mechanism re-reads the key once
-/// before staging and again right before the commit decision, aborting if
-/// the value changed. A `ConditionCheck`'s key is, by construction, never
-/// one this transaction writes (the duplicate-item check below guarantees
-/// every action targets a distinct key), so that re-read observes an
-/// ordinary committed value throughout — exactly the cross-key RMW guard
-/// `cp_txn`'s own precondition design is for. A **write** action's own key
-/// is different: by the time `cp_txn` would re-read it, *this same
-/// transaction* has already staged an unresolved intent there, so the
-/// "re-read" would retry against its own in-flight write — which cannot
-/// resolve until the transaction itself decides, which hasn't happened yet.
-/// This was found the hard way (not reasoned out in advance): an earlier
-/// version of this function fed a conditioned `Put`'s own pre-read into
-/// `cp_txn`'s preconditions, and `crates/animusd/tests/dynamo_schema.rs`'s
-/// `extended_surface` test started failing — not with a timeout, but with a
-/// spurious "value changed" cancellation several seconds later. The
-/// self-read blocks in `cp_read`'s own retry loop until the *background*
-/// `txn_resolver_loop` (a separate task) pushes the stale-past-
-/// `RECOVERY_GRACE` record to a decision via recovery — at which point the
-/// read finally returns the now-committed value, which of course differs
-/// from the pre-stage observation, so `cp_txn` reports a cancellation that
-/// has nothing to do with a real conflict. A write's own condition is
-/// therefore protected only by this function's one-time pre-read (the same
-/// protection `PutItem`/`DeleteItem`/`UpdateItem` already give outside a
-/// transaction, via `ctx.data().rmw_lock`, below) — a narrower guarantee
-/// than a `ConditionCheck` gets, but the only one `cp_txn`'s mechanism can
-/// give without this self-referential stall. See the PR7 ADR amendment.
+/// **Two different `cp_txn` mechanisms, one per condition kind — since the
+/// ADR 0018 §2 apply-time write-key conditions amendment, both give full
+/// cross-node OCC.** A `ConditionCheck`'s observed value becomes an
+/// ordinary `preconditions` entry (`cp_txn`'s pre-existing cross-key
+/// mechanism: re-read once before staging, once more right before the
+/// commit decision) — its key is, by construction, never one this
+/// transaction writes (the duplicate-item check below guarantees every
+/// action targets a distinct key), so that re-read always observes an
+/// ordinary committed value. A **write** action's own key is different:
+/// its `preconditions`-style re-read would retry against *this same
+/// transaction's* own freshly-staged, still-unresolved intent (found the
+/// hard way while building the original PR7 design — see the ADR's PR7
+/// amendment for the full stall account: the re-read blocked in `cp_read`'s
+/// retry loop for several seconds until the background `txn_resolver_loop`
+/// forced a decision, producing a spurious "value changed" cancellation
+/// unrelated to any real conflict). This amendment's fix is a **different
+/// primitive for exactly this case**: a write action's own condition
+/// becomes a `write_conditions` entry, checked once against the key's
+/// *pre-intent committed* value directly inside `TxnStage`'s own apply arm
+/// — no re-read, so no self-reference to stall against. `ctx.data().
+/// rmw_lock`, held below, is no longer what makes a write's own condition
+/// correct across nodes (that's `cp_txn`'s apply-time OCC now, proven by
+/// `animusd/tests/dynamo_txn.rs`'s cross-node racing-conditional-writes
+/// regression); it stays only to serialize this node's own conditional
+/// writes against each other for throughput/ordering, the same role it
+/// plays for a plain single-item `PutItem`/`DeleteItem`/`UpdateItem`.
 ///
 /// **Every key is touched by at most one action** (validated up front,
 /// matching DynamoDB's own "cannot include multiple operations on one
@@ -781,9 +778,10 @@ enum IndexNote {
 /// client-visible error.
 ///
 /// **Failure exception shape**: any condition failure, or a `cp_txn` abort
-/// (a lost 2PC race, or a `ConditionCheck` precondition that changed
-/// underneath this request), is reported as `TransactionCanceledException`
-/// — the real DynamoDB exception type for a transaction (as opposed to
+/// (a lost 2PC race, an own-key `write_conditions` failure, or a
+/// `ConditionCheck` precondition that changed underneath this request), is
+/// reported as `TransactionCanceledException` — the real DynamoDB
+/// exception type for a transaction (as opposed to
 /// `ConditionalCheckFailedException`, which only a single-item conditional
 /// write returns) — in **simple form**: one message, not AWS's per-action
 /// `CancellationReasons` array (explicitly deferred, ADR 0018 PR1 amendment
@@ -816,15 +814,16 @@ async fn run_transact(
     // Serialize against this node's other RMWs across the whole pre-read/
     // evaluate/commit span — exactly like every other conditional write here
     // (`PutItem`/`DeleteItem`/`UpdateItem`). `cp_txn`'s own cross-tablet 2PC
-    // is what makes the *commit* atomic; this lock only prevents two
-    // transactions (or a transaction and an ordinary conditional write) on
-    // THIS node from interleaving their condition checks — see this
-    // function's own doc for why a write action's own condition has no
-    // stronger guarantee than that.
+    // (now including apply-time `write_conditions` OCC for a write action's
+    // own condition, ADR 0018 §2 amendment) is what makes the commit —
+    // *and* every condition's cross-node correctness — atomic; this lock
+    // only smooths same-node throughput/ordering between two conditional
+    // writes on THIS node, it is no longer load-bearing for correctness.
     let _rmw = ctx.data().rmw_lock.lock().await;
 
     let mut writes: Vec<crate::TxnTableWrite> = Vec::new();
     let mut preconditions: Vec<crate::TxnPrecondition> = Vec::new();
+    let mut write_conditions: Vec<crate::TxnWriteCondition> = Vec::new();
     let mut index_notes: Vec<(String, Vec<u8>, IndexNote)> = Vec::new();
     let mut seen: BTreeSet<(String, Vec<u8>)> = BTreeSet::new();
 
@@ -907,12 +906,20 @@ async fn run_transact(
             }
         }
 
-        // Only a `ConditionCheck`'s observed value becomes a `cp_txn`
-        // precondition — see this function's own doc for why a write
-        // action's own condition must not (the self-referential-stall bug
-        // found while writing this).
-        if is_condition_check && let Some(observed) = raw {
-            preconditions.push((table, data_key, observed));
+        // A `ConditionCheck`'s observed value becomes an ordinary cross-key
+        // `cp_txn` precondition; a **write** action's own condition instead
+        // becomes an own-key `write_conditions` entry (ADR 0018 §2
+        // apply-time write-key conditions amendment) — two different
+        // `cp_txn` mechanisms for two structurally different cases, see
+        // this function's own doc. An unconditioned `Update`'s own
+        // mandatory read (`needs_read` above) must NOT gain an implicit
+        // condition here — only `condition.is_some()` does.
+        if let Some(observed) = raw {
+            if is_condition_check {
+                preconditions.push((table, data_key, observed));
+            } else if condition.is_some() {
+                write_conditions.push((table, data_key, observed));
+            }
         }
     }
 
@@ -937,7 +944,7 @@ async fn run_transact(
         return Ok(wire::empty_response());
     }
 
-    match ctx.cp_txn(writes, preconditions).await {
+    match ctx.cp_txn(writes, preconditions, write_conditions).await {
         Ok(_commit_ts) => {
             // Update the edge-local GSI/LSI index after the durable atomic
             // commit (mirroring `PutItem`/`DeleteItem`'s own post-write

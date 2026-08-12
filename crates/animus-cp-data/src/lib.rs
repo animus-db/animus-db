@@ -64,7 +64,7 @@ mod txn;
 
 use hlc::{Hlc, HlcTimestamp};
 use ts_cache::TsCache;
-pub use txn::{TxnDecisionStatus, TxnId, TxnOutcome};
+pub use txn::{StageOutcome, TxnDecisionStatus, TxnId, TxnOutcome};
 
 /// The assumed maximum clock-offset bound across the cluster (ADR 0018 §2),
 /// threaded into every [`Hlc::new`] this crate constructs. Not yet consumed
@@ -512,6 +512,26 @@ pub enum KvCommand {
     /// transaction touched from the anchor's record alone — closing a real
     /// gap PR3/PR4 left open (see `txn::TxnRecord::intent_spans`'s doc for
     /// the full account).
+    ///
+    /// **`conditions` (ADR 0018 §2 apply-time write-key conditions
+    /// amendment)**: `(key, expected)` pairs — `expected: Some(bytes)` means
+    /// `key`'s current *committed* value (envelope-unwrapped, the same
+    /// read discipline `Cas` uses) must equal `bytes` exactly; `None` means
+    /// it must be absent. Deliberately **byte-level OCC, not a rich
+    /// expression** — this crate speaks bytes; a caller (the Dynamo edge)
+    /// evaluates its own richer `ConditionExpression` against a pre-read and
+    /// compiles the result to "the value must still be exactly what I read"
+    /// before it ever reaches here. Every `key` here is expected to also be
+    /// one of `writes`' own keys (an **own-key** condition on a value this
+    /// same stage is about to write) — a condition on a key this
+    /// transaction does *not* write has no self-referential-stall problem
+    /// to solve and belongs in the ordinary cross-key `cp_txn` precondition
+    /// mechanism instead (re-read once before staging, once before the
+    /// commit decision — see `animusd::ClientCtx::cp_txn`'s doc). **Any**
+    /// condition failing no-ops the *whole* stage, composing with the
+    /// existing fence/seal/foreign-intent whole-or-nothing behavior — see
+    /// this variant's apply arm and [`StageOutcome`] for how a caller learns
+    /// *which* reason a stage no-op'd for.
     TxnStage {
         txn_id: TxnId,
         record_key: Vec<u8>,
@@ -519,6 +539,7 @@ pub enum KvCommand {
         is_anchor: bool,
         writes: Vec<(Vec<u8>, Option<Vec<u8>>)>,
         spans: Vec<(String, KeyRange)>,
+        conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>,
         fence: KeyRange,
         ts: HlcTimestamp,
     },
@@ -700,6 +721,20 @@ struct ReadState {
 #[derive(Default)]
 struct CasResults {
     outcomes: BTreeMap<u64, bool>,
+}
+
+/// Per-`TxnStage` outcomes recorded at apply time, keyed by the entry's
+/// **Raft log index** — the [`StageOutcome`] introspection primitive (ADR
+/// 0018 §2 apply-time write-key conditions amendment), mirroring
+/// [`CasResults`] exactly: every replica records the identical value (the
+/// stage is decided deterministically in commit order against the same
+/// committed engine state), and a proposer polls until its entry applies,
+/// then reads its index here (see
+/// [`RaftKvNode::stage_outcome`]/[`RaftKvNode::txn_stage_anchor`]/
+/// [`RaftKvNode::txn_stage_participant`]).
+#[derive(Default)]
+struct StageOutcomes {
+    outcomes: BTreeMap<u64, StageOutcome>,
 }
 
 /// This group's own in-memory index of the transaction records it holds
@@ -907,6 +942,9 @@ pub struct RaftKvNode<E: Env, S: StorageEngine> {
     storage: S,
     reads: Arc<Mutex<ReadState>>,
     cas: Arc<Mutex<CasResults>>,
+    /// Per-`TxnStage` apply-time outcomes (ADR 0018 §2 apply-time write-key
+    /// conditions amendment) — see [`StageOutcomes`]'s doc.
+    stage: Arc<Mutex<StageOutcomes>>,
     /// Highest Raft log index the **apply task** has merged into the engine. The
     /// consensus loop advances the core's `last_applied` (its buffer cursor) as soon
     /// as entries are committed+durable, but the async apply task lags behind
@@ -1098,6 +1136,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         )));
         let reads = Arc::new(Mutex::new(ReadState::default()));
         let cas = Arc::new(Mutex::new(CasResults::default()));
+        let stage = Arc::new(Mutex::new(StageOutcomes::default()));
         let halted = Arc::new(AtomicBool::new(false));
         let stopped = Arc::new(AtomicBool::new(false));
         let apply_stopped = Arc::new(AtomicBool::new(false));
@@ -1130,6 +1169,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             storage: storage.clone(),
             reads: Arc::clone(&reads),
             cas: Arc::clone(&cas),
+            stage: Arc::clone(&stage),
             engine_applied: Arc::clone(&engine_applied),
             halted: Arc::clone(&halted),
             stopped: Arc::clone(&stopped),
@@ -1155,6 +1195,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             storage,
             reads,
             cas,
+            stage,
             engine_applied,
             wal_lock,
             halted,
@@ -1611,8 +1652,9 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         &self,
         table: &str,
         writes: Vec<(Vec<u8>, Option<Vec<u8>>)>,
-    ) -> Option<(TxnId, Vec<u8>)> {
-        self.txn_stage_anchor(table, writes, Vec::new()).await
+    ) -> Option<(TxnId, Vec<u8>, StageOutcome)> {
+        self.txn_stage_anchor(table, writes, Vec::new(), Vec::new())
+            .await
     }
 
     /// As [`txn_stage`](Self::txn_stage), but for a genuine multi-participant
@@ -1624,16 +1666,31 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// `intent_spans` — the structural fix that lets recovery learn which
     /// other tablets/tables a transaction touched (see
     /// `txn::TxnRecord::intent_spans`'s doc). `txn_stage` itself is the
-    /// single-participant convenience (`participant_spans: Vec::new()`).
+    /// single-participant convenience (`participant_spans: Vec::new()`,
+    /// `conditions: Vec::new()`).
+    ///
+    /// **`conditions`** (ADR 0018 §2 apply-time write-key conditions
+    /// amendment): own-key byte-level OCC preconditions checked at apply —
+    /// see `KvCommand::TxnStage`'s doc. The returned [`StageOutcome`] is
+    /// what tells the caller whether the stage actually landed, and if not,
+    /// why (a final `ConditionFailed`, a retryable `IntentBlocked`, or a
+    /// structural `Fenced`) — the `TxnId`/record key are always returned
+    /// once the entry *applies* at all (mirroring the pre-existing contract:
+    /// `None` here still means "not leader, or the entry never applied",
+    /// never "the stage was rejected").
     ///
     /// # Panics
-    /// Same as [`txn_stage`](Self::txn_stage).
+    /// If `writes` is empty, or its anchor key is shorter than
+    /// `animus_tablet::TOKEN_BYTES` — every real data-plane key
+    /// unconditionally leads with the partition token (ADR 0022); this is
+    /// a caller invariant, not a recoverable condition.
     pub async fn txn_stage_anchor(
         &self,
         table: &str,
         writes: Vec<(Vec<u8>, Option<Vec<u8>>)>,
         participant_spans: Vec<(String, KeyRange)>,
-    ) -> Option<(TxnId, Vec<u8>)> {
+        conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+    ) -> Option<(TxnId, Vec<u8>, StageOutcome)> {
         assert!(
             !writes.is_empty(),
             "raftkv txn_stage: writes must be non-empty"
@@ -1674,6 +1731,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
                 is_anchor: true,
                 writes: writes.clone(),
                 spans,
+                conditions,
                 fence: fence.clone(),
                 ts,
             };
@@ -1683,9 +1741,8 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             ProposeResult::Accepted { index } => index,
             ProposeResult::NotLeader { .. } => return None,
         };
-        self.wait_applied(index)
-            .await
-            .then_some((txn_id, record_key))
+        let outcome = self.wait_stage_outcome(index).await?;
+        Some((txn_id, record_key, outcome))
     }
 
     /// **Participant stage** phase of a multi-participant 2PC (ADR 0018
@@ -1698,13 +1755,20 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// coordinator witnesses it toward the eventual commit timestamp) once
     /// committed *and applied*; `None` if this node is not the leader or
     /// the stage times out.
+    ///
+    /// **`conditions`** (ADR 0018 §2 apply-time write-key conditions
+    /// amendment): as [`txn_stage_anchor`](Self::txn_stage_anchor)'s own
+    /// `conditions` — see `KvCommand::TxnStage`'s doc. The returned
+    /// [`StageOutcome`] tells the caller whether this participant's stage
+    /// actually landed, and if not, why.
     pub async fn txn_stage_participant(
         &self,
         txn_id: TxnId,
         record_key: Vec<u8>,
         record_table: String,
         writes: Vec<(Vec<u8>, Option<Vec<u8>>)>,
-    ) -> Option<HlcTimestamp> {
+        conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+    ) -> Option<(HlcTimestamp, StageOutcome)> {
         assert!(
             !writes.is_empty(),
             "raftkv txn_stage_participant: writes must be non-empty"
@@ -1720,6 +1784,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
                 is_anchor: false,
                 writes: writes.clone(),
                 spans: Vec::new(), // unused: no local record is ever created here.
+                conditions,
                 fence: fence.clone(),
                 ts,
             };
@@ -1729,7 +1794,8 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             ProposeResult::Accepted { index } => index,
             ProposeResult::NotLeader { .. } => return None,
         };
-        self.wait_applied(index).await.then_some(ts)
+        let outcome = self.wait_stage_outcome(index).await?;
+        Some((ts, outcome))
     }
 
     /// Mint a ts that strictly exceeds `min_ts` **and** this group's own
@@ -2017,7 +2083,18 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         writes: Vec<(Vec<u8>, Option<Vec<u8>>)>,
     ) -> Option<HlcTimestamp> {
         let keys: Vec<Vec<u8>> = writes.iter().map(|(k, _)| k.clone()).collect();
-        let (txn_id, record_key) = self.txn_stage(table, writes).await?;
+        let (txn_id, record_key, outcome) = self.txn_stage(table, writes).await?;
+        // ADR 0018 §2 apply-time write-key conditions amendment: a stage
+        // that applied but didn't land (blocked by a foreign intent, or a
+        // fence/seal miss) must not be followed by a commit — this used to
+        // be a latent gap here (the same one `animusd::ClientCtx::
+        // txn_prepare_pushing` was built to close on the coordinator path,
+        // see `KvCommand::TxnStage`'s doc): `txn_stage`'s old `Option<(TxnId,
+        // Vec<u8>)>` return only ever meant "the entry applied," never "my
+        // writes actually staged."
+        if outcome != StageOutcome::Staged {
+            return None;
+        }
         self.txn_decide(txn_id, record_key, keys, true).await
     }
 
@@ -2152,11 +2229,61 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         }
     }
 
+    /// Poll [`stage_outcome`](Self::stage_outcome) for `index` directly,
+    /// bounded by [`CAS_TIMEOUT`]/[`CAS_POLL`] — mirrors
+    /// [`compare_and_swap`](Self::compare_and_swap)'s own outcome-polling
+    /// loop, **not** [`wait_applied`](Self::wait_applied) followed by a
+    /// separate fetch.
+    ///
+    /// **This distinction is load-bearing, found by the ADR 0018 §4 corpus
+    /// at depth (`ANIMUS_TXN_SEEDS=5`)**: `wait_applied`'s contract is
+    /// "`engine_applied_index() >= index`," which a **snapshot install**
+    /// can satisfy by jumping straight past `index` (a follower catching up
+    /// after losing leadership, `apply_and_compact`'s `install_engine_image`
+    /// branch) without this replica ever having individually processed —
+    /// hence recorded a [`StageOutcome`] for — the entry at that exact
+    /// index (an install/compaction globs many commands' effects into one
+    /// engine image, discarding any way to report a per-entry outcome for
+    /// anything the image already covers). So for every other command here,
+    /// "applied" and "has a recorded outcome" coincide, but for `TxnStage`
+    /// they do not: `wait_applied(index).await == true` does **not**
+    /// guarantee `stage_outcome(index)` is `Some`. Polling the outcome
+    /// directly (like CAS always has) makes this method's own `None` mean
+    /// exactly what every other propose-and-wait method's `None` means —
+    /// "give up, caller retries" — instead of ever hard-`expect`ing a fact
+    /// that isn't actually guaranteed.
+    async fn wait_stage_outcome(&self, index: u64) -> Option<StageOutcome> {
+        let deadline = self.env.now().0 + CAS_TIMEOUT.as_nanos() as u64;
+        loop {
+            if let Some(outcome) = self.stage_outcome(index) {
+                return Some(outcome);
+            }
+            if !self.is_leader() || self.env.now().0 >= deadline {
+                return None;
+            }
+            self.env.sleep(CAS_POLL).await;
+        }
+    }
+
     /// The recorded outcome of the CAS committed at Raft log `index` (the value
     /// [`cas`](Self::cas) returned in [`ProposeResult::Accepted`]): `Some(true)`
     /// if the swap happened, `Some(false)` if `expected` did not match, or `None`
     /// if that index has not applied on this replica yet. Every replica records
     /// the identical outcome (the decision is deterministic in commit order).
+    /// The recorded outcome of the `TxnStage` committed at Raft log `index`
+    /// (ADR 0018 §2 apply-time write-key conditions amendment) — `None` if
+    /// that index has not applied on this replica yet. Mirrors
+    /// [`cas_result`](Self::cas_result) exactly; see [`StageOutcome`]'s doc
+    /// for what each variant means to a caller.
+    pub fn stage_outcome(&self, index: u64) -> Option<StageOutcome> {
+        self.stage
+            .lock()
+            .expect("stage outcomes poisoned")
+            .outcomes
+            .get(&index)
+            .cloned()
+    }
+
     pub fn cas_result(&self, index: u64) -> Option<bool> {
         self.cas
             .lock()
@@ -3608,6 +3735,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
     core: &Arc<Mutex<KvCore>>,
     storage: &S,
     cas: &Arc<Mutex<CasResults>>,
+    stage: &Arc<Mutex<StageOutcomes>>,
     engine_applied: &AtomicU64,
     wal_lock: &AsyncMutex<()>,
     halted: &AtomicBool,
@@ -3855,6 +3983,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 is_anchor,
                 writes,
                 spans,
+                conditions,
                 fence,
                 ts,
             } => {
@@ -3945,7 +4074,58 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                         .iter()
                         .all(|(k, _)| fence.contains(k) && !is_sealed(sealed, k))
                     && record_in_fence;
-                if all_in_fence {
+                // ADR 0018 §2 apply-time write-key conditions amendment:
+                // evaluate this stage's own-key conditions (byte-level OCC
+                // — see `KvCommand::TxnStage`'s doc) once, only when the
+                // stage is otherwise eligible to proceed at all — a
+                // condition check never masks a more fundamental fence/
+                // seal/foreign-intent/already-decided rejection, and those
+                // reasons are exactly what `StageOutcome` still needs to
+                // tell apart from a genuine condition failure. Drain the
+                // pending run first (mirrors `Cas`'s own
+                // read-after-flush-pending discipline) so a condition
+                // observes every earlier committed write in this same
+                // apply pass.
+                let condition_failure: Option<Vec<u8>> = if all_in_fence && !conditions.is_empty() {
+                    flush_pending(storage, &mut pending, metrics).await;
+                    let mut failure = None;
+                    for (key, expected) in &conditions {
+                        let raw = storage
+                            .get(&scope.physical(key))
+                            .await
+                            .expect("raftkv txn stage condition read");
+                        let matches = match raw.map(|vv| txn::decode_envelope(&vv.value)) {
+                            None => expected.is_none(),
+                            Some(txn::Envelope::Committed(v)) => Some(v) == *expected,
+                            // Same-txn re-staging (a WAL-replay
+                            // re-application): this exact stage already
+                            // landed this exact intent at this exact key,
+                            // which means this exact deterministic check
+                            // already passed the first time it ran — trust
+                            // that instead of re-evaluating against an
+                            // intent envelope that no longer holds "the
+                            // value before this stage" at all.
+                            Some(txn::Envelope::Intent {
+                                txn_id: blocker, ..
+                            }) if blocker == txn_id => true,
+                            // A *foreign* intent here would already have
+                            // been caught by `blocked_by` above (every
+                            // condition key is expected to also be a write
+                            // key) — but never silently treat an
+                            // unresolvable "current value" as a match.
+                            Some(txn::Envelope::Intent { .. }) => false,
+                        };
+                        if !matches {
+                            failure = Some(key.clone());
+                            break;
+                        }
+                    }
+                    failure
+                } else {
+                    None
+                };
+                let stage_ok = all_in_fence && condition_failure.is_none();
+                if stage_ok {
                     flush_pending(storage, &mut pending, metrics).await;
                     let version = hlc::pack(ts);
                     for (key, staged_value) in &writes {
@@ -3988,6 +4168,34 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                             .insert(txn_id, (record_key, ts));
                     }
                 }
+                // ADR 0018 §2 apply-time write-key conditions amendment:
+                // record *why*, not just whether, this stage no-op'd — see
+                // `StageOutcome`'s doc for the coordinator-facing meaning of
+                // each variant. Priority mirrors the gates above: a
+                // structural fence/seal-miss or already-decided race
+                // (`Fenced`) and a foreign-intent block (`IntentBlocked`)
+                // both pre-empt ever evaluating this stage's own
+                // conditions, so they take priority over `ConditionFailed`
+                // here too.
+                let outcome = if already_decided {
+                    txn::StageOutcome::Fenced
+                } else if let Some((blocked_key, blocker)) = blocked_by {
+                    txn::StageOutcome::IntentBlocked {
+                        key: blocked_key,
+                        txn_id: blocker,
+                    }
+                } else if !all_in_fence {
+                    txn::StageOutcome::Fenced
+                } else if let Some(key) = condition_failure {
+                    txn::StageOutcome::ConditionFailed { key }
+                } else {
+                    txn::StageOutcome::Staged
+                };
+                stage
+                    .lock()
+                    .expect("stage outcomes poisoned")
+                    .outcomes
+                    .insert(index, outcome);
             }
             KvCommand::TxnCommit {
                 txn_id,
@@ -4626,6 +4834,7 @@ struct DriveState<E: Env, S: StorageEngine> {
     storage: S,
     reads: Arc<Mutex<ReadState>>,
     cas: Arc<Mutex<CasResults>>,
+    stage: Arc<Mutex<StageOutcomes>>,
     engine_applied: Arc<AtomicU64>,
     wal_lock: Arc<AsyncMutex<()>>,
     halted: Arc<AtomicBool>,
@@ -4700,6 +4909,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         storage,
         reads,
         cas,
+        stage,
         engine_applied,
         wal_lock,
         halted,
@@ -4790,6 +5000,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         Arc::clone(&core),
         storage,
         cas,
+        stage,
         Arc::clone(&engine_applied),
         Arc::clone(&wal_lock),
         Arc::clone(&halted),
@@ -4935,6 +5146,7 @@ async fn apply_loop<E: Env, S: StorageEngine>(
     core: Arc<Mutex<KvCore>>,
     storage: S,
     cas: Arc<Mutex<CasResults>>,
+    stage: Arc<Mutex<StageOutcomes>>,
     engine_applied: Arc<AtomicU64>,
     wal_lock: Arc<AsyncMutex<()>>,
     halted: Arc<AtomicBool>,
@@ -4965,6 +5177,7 @@ async fn apply_loop<E: Env, S: StorageEngine>(
             &core,
             &storage,
             &cas,
+            &stage,
             &engine_applied,
             &wal_lock,
             &halted,
@@ -5092,13 +5305,15 @@ mod pr5_orphan_and_resurrection_tests {
                     record_key_b,
                     "orders".to_string(),
                     vec![(kb_clone, Some(b"debited".to_vec()))],
+                    Vec::new(),
                 )
                 .await
             },
         )
         .flatten();
-        assert!(
-            stage_ts.is_some(),
+        assert_eq!(
+            stage_ts.as_ref().map(|(_, outcome)| outcome.clone()),
+            Some(StageOutcome::Staged),
             "participant stage should succeed (seed={seed})"
         );
 
@@ -5157,6 +5372,7 @@ mod pr5_orphan_and_resurrection_tests {
                     "accounts".to_string(),
                     KeyRange::new(kb.clone(), Some(participant_span_end.clone())),
                 )],
+                conditions: Vec::new(),
                 fence: fence.clone(),
                 ts,
             };

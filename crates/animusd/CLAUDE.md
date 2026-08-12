@@ -193,9 +193,19 @@ silent truncation). See the in-crate `split_fence_tests`.
 
 ## Multi-participant transactions (ADR 0018 §2/PR4, recovery in PR5)
 
-`ClientCtx::cp_txn(writes, preconditions) -> Result<HlcTimestamp, String>` is
-the coordinator for a cross-tablet (possibly cross-table) atomic transaction,
-reachable via `ClientRequest::Txn`. It groups `writes`
+`ClientCtx::cp_txn(writes, preconditions, write_conditions) ->
+Result<HlcTimestamp, String>` is the coordinator for a cross-tablet
+(possibly cross-table) atomic transaction, reachable via `ClientRequest::
+Txn`. **`write_conditions`** (ADR 0018 §2's 2026-08-12 follow-up amendment)
+is `(table, key, expected)` own-key byte-level OCC conditions — `key` MUST
+be one of `writes`' own keys (validated; `Err` otherwise) — grouped by
+`(table, tablet)` alongside `writes` and threaded straight to the owning
+tablet's own `TxnStage.conditions` (`animus_cp_data::KvCommand::TxnStage`),
+checked at apply, not re-read: this is a **structurally distinct**
+mechanism from `preconditions` below, not an overload of it — see
+`TxnWriteCondition`'s doc for why conflating the two is exactly the
+self-referential-stall bug the PR7 amendment documented and this one
+closes. It groups `writes`
 (`(table, key, Option<value>)`) by owning tablet; the **first** write's
 tablet is the **anchor** (mints the `TxnId`/record key, via
 `RaftKvNode::txn_stage_anchor` — passed every *other* participant's
@@ -209,14 +219,19 @@ directly: a stage call returning `Ok(..)` only means its entry *applied*,
 never that it genuinely wrote an intent — `KvCommand::TxnStage`'s
 apply-time writer-push-intents guard rejects (whole-or-nothing) a target
 key already holding a *different* transaction's unresolved intent, exactly
-like a fence/seal miss. `txn_prepare_pushing` verifies every staged key via
-`ClientCtx::txn_verify` (the same wire-routed `RaftKvNode::
-txn_verify_staged` a recovery push already uses) after each attempt,
-retrying (`TXN_STAGE_PUSH_ATTEMPTS`, backed off by `TXN_STAGE_PUSH_
-BACKOFF`) before returning a client-facing conflict error — without this, a
-blocked stage would look identical to a genuine one, and the transaction
-would go on to commit without that key's write ever having happened, a
-worse atomicity violation than the durability hole this whole fix closes.
+like a fence/seal miss (and, since the 2026-08-12 amendment, its own-key
+`conditions` can reject it too). **Since that amendment**,
+`txn_prepare_pushing` branches directly on `txn_prepare`'s own returned
+`animus_cp_data::StageOutcome` instead of a separate post-hoc
+`ClientCtx::txn_verify` round trip (the apply arm already knows
+definitively whether — and why — a stage no-op'd, so a second read to
+re-derive the same fact is redundant): `Staged` succeeds; `IntentBlocked`
+retries (bounded, `TXN_STAGE_PUSH_ATTEMPTS`/`TXN_STAGE_PUSH_BACKOFF`,
+unchanged behavior — without this, a blocked stage would look identical to
+a genuine one, and the transaction would go on to commit without that
+key's write ever having happened, a worse atomicity violation than the
+durability hole PR6 closed); `ConditionFailed`/`Fenced` fail immediately,
+never retried (retrying an identical stage cannot change either outcome).
 `staged` tracks every participant that needs resolving, the anchor's own
 keys included (PR5: `txn_decide_anchor` no
 longer resolves anything inline — see below). Any prepare failure, or a
@@ -566,8 +581,13 @@ route below the edge through the same `ClientCtx` CP primitives.
   (whole-or-nothing across however many tablets/tables it spans, via
   `ClientCtx::cp_txn`) and `TransactGetItems` (a quiescence-confirmed
   consistent multi-key read) — see that ADR's PR7 amendment for the
-  condition-evaluation layering and a documented cross-node OCC limitation
-  for a write action's own condition. `DeleteItem` writes a tombstone *value*.
+  condition-evaluation layering. **Since the ADR 0018 §2 2026-08-12
+  follow-up amendment**, a write action's own `ConditionExpression` has
+  full **cross-node** OCC (apply-time `write_conditions`, not just
+  same-node `rmw_lock` protection) — the PR7 amendment's own documented
+  limitation is closed; see that later amendment and `dynamo.rs::
+  run_transact`'s doc for the layered design. `DeleteItem` writes a
+  tombstone *value*.
 - **CQL v4** (`cql.rs`, `RoleAddrs.cql`) — `STARTUP`/`OPTIONS` handshake +
   `QUERY`/`PREPARE`/`EXECUTE` via the pure `animus_cql` crate. `CREATE TABLE`
   proposes a typed schema into the replicated catalog (incl. clustering/compound
@@ -1166,6 +1186,21 @@ Test-file map (`tests/`):
   winner, and `/admin/txns` showing a pending record during a simulated
   coordinator stall (driven via the internal `TxnPrepare` wire request
   directly, mirroring `cp_txn.rs`) then clearing once recovery decides it.
+  **Since the ADR 0018 §2 2026-08-12 follow-up amendment**:
+  `cross_node_racing_own_key_conditional_writes_resolve_exactly_one_winner`
+  — the test the PR7 amendment's own limitation made impossible to write —
+  two clients issuing through **different** nodes' Dynamo listeners race a
+  `Put` with an own-key condition on the same key; exactly one commits, the
+  loser gets a genuine `TransactionCanceledException`, proving the OCC is
+  now cross-node, not merely same-node (the pre-existing
+  `concurrent_transact_write_items_on_a_shared_key_resolve_one_winner`
+  above stays green, unchanged — same-node races were always correctly
+  serialized); `own_key_condition_failure_cancels_a_multi_tablet_
+  transaction_wholly` — an own-key condition failing on one tablet leaves
+  no partial state on the other; `own_key_condition_completes_quickly_
+  with_no_recovery_grace_stall` — the PR7 stall-bug's exact shape (a
+  condition on a write's own key) now completes in well under
+  `RECOVERY_GRACE`, proving that regression stays dead.
 - `cql_wire.rs` / `cql_clustering.rs` / `cql_durable_schema.rs` — the CQL edge
   (typed round-trip, compound keys, durable replicated schema).
 - `admin_endpoint.rs` — admin views + gated actions + data writes + bulk seed.

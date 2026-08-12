@@ -121,6 +121,7 @@ fn stage_anchor(
         n.txn_stage(table, writes).await
     })
     .flatten()
+    .map(|(txn_id, record_key, _outcome)| (txn_id, record_key))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -134,10 +135,11 @@ fn stage_participant(
 ) -> Option<HlcTimestamp> {
     let n = node.clone();
     drive(sim, node.env(), SETTLE, async move {
-        n.txn_stage_participant(txn_id, record_key, record_table, writes)
+        n.txn_stage_participant(txn_id, record_key, record_table, writes, Vec::new())
             .await
     })
     .flatten()
+    .map(|(ts, _outcome)| ts)
 }
 
 fn commit_at_least(

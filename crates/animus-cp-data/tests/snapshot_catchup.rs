@@ -149,7 +149,7 @@ fn snapshot_catchup_carries_txn_records_and_intents() {
     };
     let n = nodes[l].clone();
     let kk = staged_key.clone();
-    let (txn_id, record_key) = drive(
+    let (txn_id, record_key, _outcome) = drive(
         &mut sim,
         nodes[l].env(),
         Duration::from_secs(5),

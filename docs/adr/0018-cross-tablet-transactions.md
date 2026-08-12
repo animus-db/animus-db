@@ -1,30 +1,36 @@
 # ADR 0018 — Cross-tablet transactions on the CP plane (2PC over per-tablet Raft + HLC + MVCC)
 
-- **Status:** Accepted — implemented (PR1-PR7 + corpus-found fixes; CQL
-  transactional surface, idempotency tokens, CancellationReasons fidelity,
-  and manual txn-resolution admin actions deferred). PR1: HLC + sim clock
-  skew; PR2: HLC commit timestamps as the CP-plane MVCC version + the
-  range-seal design; PR2b: MVCC snapshot reads at a timestamp + the
-  read-timestamp cache/logged read ceiling; PR3: single-participant
-  transactions — the value envelope + the txn record/intent/resolve
-  machinery through one Raft group; PR4: multi-participant 2PC across
-  tablet Raft groups, the wire-level coordinator, foreign-intent
-  resolution, and uncertainty-interval read restarts; PR5: in-doubt
-  transaction recovery + the per-node intent-resolver background task; PR6:
-  the multi-tablet Elle serializability corpus + the protocol hardening
-  fixes it found; PR7: atomic Dynamo `TransactWriteItems`, the new
-  `TransactGetItems`, and the `/admin/txns` observability surface. See the
-  "Amendment (2026-08-11, PR1)" section for the build-time decisions
+- **Status:** Accepted — implemented (PR1-PR7 + corpus-found fixes + the
+  apply-time write-key conditions follow-up; CQL transactional surface,
+  idempotency tokens, CancellationReasons fidelity, and manual
+  txn-resolution admin actions deferred). PR1: HLC + sim clock skew; PR2:
+  HLC commit timestamps as the CP-plane MVCC version + the range-seal
+  design; PR2b: MVCC snapshot reads at a timestamp + the read-timestamp
+  cache/logged read ceiling; PR3: single-participant transactions — the
+  value envelope + the txn record/intent/resolve machinery through one Raft
+  group; PR4: multi-participant 2PC across tablet Raft groups, the
+  wire-level coordinator, foreign-intent resolution, and
+  uncertainty-interval read restarts; PR5: in-doubt transaction recovery +
+  the per-node intent-resolver background task; PR6: the multi-tablet Elle
+  serializability corpus + the protocol hardening fixes it found; PR7:
+  atomic Dynamo `TransactWriteItems`, the new `TransactGetItems`, and the
+  `/admin/txns` observability surface; the **follow-up (2026-08-12)**:
+  apply-time write-key conditions — upgrading a `TransactWriteItems` write
+  action's own `ConditionExpression` from PR7's same-node-only protection
+  to full cross-node OCC, closing that PR's own documented deviation. See
+  the "Amendment (2026-08-11, PR1)" section for the build-time decisions
   settled at the start of delivery, the "Amendment (2026-08-11, PR2)"
   section for the range-seal design that replaces `version_floor`, the
   "Amendment (2026-08-11, PR2b)" section for the read path +
   serializability write-push mechanism, the "Amendment (2026-08-12, PR3)"
   section for the record/intent/resolve machinery, the "Amendment
   (2026-08-12, PR4)" section for multi-participant 2PC, the "Amendment
-  (2026-08-12, PR5)" section for in-doubt recovery + the resolver, and the
-  "Amendment (2026-08-12, PR7)" section below for the Dynamo transactional
+  (2026-08-12, PR5)" section for in-doubt recovery + the resolver, the
+  "Amendment (2026-08-12, PR7)" section for the Dynamo transactional
   surface + observability (PR6's corpus findings are cited there directly,
-  since PR6 itself landed no separate ADR amendment).
+  since PR6 itself landed no separate ADR amendment), and the "Amendment
+  (2026-08-12, follow-up)" section below for the apply-time conditions
+  mechanism.
 - **Date:** 2026-08-03
 
 ## Context
@@ -1691,3 +1697,177 @@ already existed and already route/forward correctly (proven generically
 by `cp_txn.rs`'s own follower-connected regression); this PR is entirely
 an `animusd::dynamo` + `animus-dynamo::wire` + `animus-env::metrics` +
 `animusd::admin`/`CpGroup` change.
+
+## Amendment (2026-08-12, follow-up)
+
+This follow-up closes the one item the PR7 amendment §1 identified and
+deferred: a `TransactWriteItems` write action's own `ConditionExpression`
+had only same-node protection (`ctx.data().rmw_lock`), not the cross-node
+OCC every other condition-gated path in this system gets. It does not
+change any wire-facing behavior — the failure shape, exception type, and
+`ConditionCheck` semantics are unchanged — only *which mechanism* protects
+a write's own condition, and *how strong* that protection is.
+
+### 1. The primitive: byte-level OCC checked at apply, not a re-read
+
+`animus_cp_data::KvCommand::TxnStage` gains a `conditions: Vec<(Vec<u8>,
+Option<Vec<u8>>)>` field — `(key, expected)` pairs, `expected: Some(bytes)`
+meaning the key's current *committed* value must equal `bytes` exactly,
+`None` meaning it must be absent. This is deliberately **not** a rich
+expression evaluator: `animus-cp-data` already speaks exactly this
+byte-level shape for `Cas`, and the layering rule this amendment settles is
+the same one that shape already implies — the data plane speaks bytes; a
+richer caller (the Dynamo edge) evaluates its own `ConditionExpression`
+against a pre-read and compiles a true evaluation down to "the value must
+still be exactly what I just read," the same OCC primitive `Cas` already
+gives a single-key conditional write.
+
+**Evaluated at *apply*, inside `TxnStage`'s own arm, against the key's
+pre-intent committed value** — envelope-unwrapped, the identical read
+discipline `Cas`'s own apply arm already uses (`Envelope::Committed(v)` →
+`Some(v)`; absent → `None`; a *foreign* intent → never a match, since "the
+current committed value" is ambiguous while one is live, mirroring `Cas`'s
+own "an intent always fails the swap" rule). **Same-txn re-staging (a
+WAL-replay re-application) is handled the same way `TxnStage`'s existing
+writer-push-intents guard already handles it**: if the key already holds
+*this exact transaction's own* intent (the entry being replayed already
+applied it once), the condition is trusted rather than re-evaluated
+against an envelope that no longer holds "the value before this stage" at
+all — replay-safe by the same reasoning the pre-existing `blocked_by` check
+already relies on.
+
+**Priority against the pre-existing whole-or-nothing gates, since a
+condition failure is a *new* reason a stage can no-op alongside the
+existing ones**: an already-decided record or a fence/seal miss is checked
+first (this replica structurally cannot serve the stage at all, regardless
+of any condition); a foreign unresolved intent on a target key is checked
+next (the current committed value is ambiguous, so evaluating a condition
+at all would be unsound, not just redundant); only once both of those pass
+are this stage's own `conditions` evaluated. **Any** condition failing
+no-ops the *whole* stage, composing with the pre-existing whole-or-nothing
+behavior (a multi-key stage with one failing condition stages **none** of
+its keys, not just the conditioned one).
+
+### 2. `StageOutcome`: distinguishing *why*, not just *whether*
+
+Every `TxnStage` now records a `StageOutcome` at apply time, keyed by Raft
+log index exactly like `Cas`'s own `CasResults` (`RaftKvNode::
+stage_outcome`) — `Staged` (landed), `ConditionFailed { key }` (a **final**
+cancellation — the condition was checked against the current committed
+value, so retrying the identical stage changes nothing), `IntentBlocked {
+key, txn_id }` (the pre-existing foreign-intent no-op, ADR 0018 §2/PR6,
+now named instead of only inferred after the fact via a separate
+`txn_verify` read), and `Fenced` (a structural rejection — a fence/seal
+miss, or a late anchor stage racing an already-decided recovery outcome).
+`txn_stage_anchor`/`txn_stage_participant` return it directly (`Option<(..,
+StageOutcome)>` instead of the bare `Option<(..)>` that used to mean only
+"the entry applied"); `animusd`'s `ClientRequest::TxnPrepare`/
+`ClientResponse::TxnPrepared` carry `conditions`/`outcome` across the wire
+the same way (internal-only variants, no back-compat concern, per house
+convention).
+
+**This also simplifies `animusd::ClientCtx::txn_prepare_pushing`**: PR6's
+own fix for the foreign-intent case had no way to learn *why* a stage
+no-op'd from the propose layer alone, so it re-read every staged key via a
+separate `txn_verify` round trip after the fact just to infer "was I
+blocked." Since the apply arm now reports the reason directly,
+`txn_prepare_pushing` branches on the returned `StageOutcome` instead:
+`Staged` succeeds, `IntentBlocked` retries (bounded, backed off — unchanged
+behavior), `ConditionFailed`/`Fenced` fail immediately, never retried. This
+removes the extra round trip entirely — a genuine simplification, not just
+a rename.
+
+**A corpus-found correctness gap in the new introspection itself, not the
+condition mechanism**: an early version of `txn_stage_anchor`/
+`txn_stage_participant` paired `wait_applied(index)` (which only confirms
+`engine_applied_index() >= index`) with a hard `stage_outcome(index)
+.expect(..)` — reasoning that "applied" and "outcome recorded" were the
+same fact, true for every other command here. They are not, for
+`TxnStage` specifically: a replica catching up via a **snapshot install**
+(after losing leadership, `apply_and_compact`'s `install_engine_image`
+branch) can advance `engine_applied` straight past `index` without ever
+individually processing — hence recording an outcome for — the entry at
+that exact index (the image globs many commands' effects together,
+discarding any per-entry outcome for anything it already covers).
+`ANIMUS_TXN_SEEDS=5` over the multi-tablet corpus (`animus-test/tests/
+txn_serializable.rs`) hit this deterministically as a hard panic, not a
+hang or a wrong answer. Fixed by replacing the two-step wait-then-fetch
+with a single polling loop over `stage_outcome` directly (a new
+`wait_stage_outcome`, mirroring `compare_and_swap`'s own outcome-polling
+loop — which never had this bug, since it was never split into two steps
+in the first place): `None` on timeout, exactly like every other
+propose-and-wait method's pre-existing "give up, caller retries" contract,
+never a hard-`expect`ed fact that turns out not to be guaranteed. See
+`docs/engineering-lessons.md` for the general lesson this generalizes to.
+
+### 3. The coordinator: `cp_txn` gains `write_conditions`
+
+`animusd::ClientCtx::cp_txn` gains a third parameter, `write_conditions:
+Vec<(String, Vec<u8>, Option<Vec<u8>>)>` — `(table, key, expected)`, where
+`key` MUST be one of `writes`' own keys (validated; an `Err` otherwise).
+This is a **structurally distinct** mechanism from the pre-existing
+`preconditions` parameter, not an overload of it: `preconditions` is
+`cp_txn`'s own cross-key re-read-based OCC (checked once before staging,
+once more before the commit decision) — sound only for a key this
+transaction does *not* write, which is exactly why feeding a write's own
+condition through it was the PR7-documented stall bug (the re-read would
+retry against this same transaction's own in-flight intent, blocking until
+the *background* resolver forced a decision past `RECOVERY_GRACE`).
+`write_conditions` instead threads straight down to the owning tablet's own
+`TxnStage` `conditions` field — grouped by `(table, tablet)` alongside
+`writes` itself, no re-read, no self-reference to stall against.
+
+### 4. `dynamo.rs::run_transact`: two mechanisms, matched to two cases
+
+A `Put`/`Delete`/`Update` action's own `ConditionExpression` is still
+evaluated exactly as before (one linearizable pre-read, the existing
+expression evaluator) — what changes is where the *result* goes: instead
+of being dropped (protected only by `ctx.data().rmw_lock` serializing this
+node's own conditional writes), a true evaluation's observed bytes become a
+`write_conditions` entry. A `ConditionCheck` action's observed value is
+still routed to `preconditions`, unchanged — its key is never one this
+transaction writes (the pre-existing duplicate-item-per-transaction rule
+guarantees this), so the cross-key mechanism was always sound for it and
+still is. `ctx.data().rmw_lock` remains held across the whole call, but is
+no longer what makes a write's own condition correct across nodes — it
+now only serializes this node's own conditional writes against each other
+for throughput/ordering, the identical role it plays for a plain
+single-item `PutItem`/`DeleteItem`/`UpdateItem`.
+
+**Semantics, precisely**: this is full OCC on a write's own conditioned
+key — a concurrent committed change to that key between the pre-read and
+the stage's apply cancels the transaction with `TransactionCanceledException`
+(correct DynamoDB behavior: the condition is evaluated against the item at
+transaction time), and a spurious cancellation on an ABA-identical value is
+impossible, since the check is byte-for-byte equality against the exact
+value read, not a version counter.
+
+### 5. What this closes, what stays deferred
+
+Closes the PR7 amendment §1's own documented gap in full: "two
+`TransactWriteItems` requests racing a write-action's own condition on the
+same key through *different* nodes" now resolve to exactly one winner,
+proven by `animusd/tests/dynamo_txn.rs`'s
+`cross_node_racing_own_key_conditional_writes_resolve_exactly_one_winner`
+(issued through two different nodes' Dynamo listeners, unlike the
+pre-existing same-node
+`concurrent_transact_write_items_on_a_shared_key_resolve_one_winner`,
+which stays green unchanged); `own_key_condition_failure_cancels_a_multi_
+tablet_transaction_wholly` proves an own-key condition failure on one
+tablet still cancels the whole cross-tablet transaction, no partial state
+on the other tablet; `own_key_condition_completes_quickly_with_no_
+recovery_grace_stall` proves the PR7 stall-bug's exact shape (a condition
+on a write's own key) now completes in well under `RECOVERY_GRACE`, not
+merely "doesn't hang forever" — the regression that motivated PR7's own
+fix stays dead by construction (the new mechanism has no re-read to stall
+on at all, not just a faster one).
+
+Unchanged, still deferred: CQL LWT/atomic `BATCH`; Dynamo
+`ClientRequestToken` idempotency; full per-action `CancellationReasons`
+fidelity (a condition failure is still reported as one message, not AWS's
+per-action array); `/admin/txns` manual resolution actions. Record/intent
+GC remains out of scope (ADR 0018 §2/PR5's own note).
+
+Codec: `animus-cp-data`'s wire/image `VERSION` bumped 10 → 11
+(`TxnStage.conditions`) — internal format only, no cross-version
+compatibility required (no live deployments, house convention).
