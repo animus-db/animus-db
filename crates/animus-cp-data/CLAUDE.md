@@ -240,6 +240,38 @@ State once here; cross-referenced from the sections below.
     Regression: `tests/cross_group_lww.rs` (split/merge/seal-rejection/
     in-flight-race/clock-skew shapes) and `tests/witnessing.rs`
     (leader-change and restart-recovery monotonicity).
+  - **`propose_ordered` (found via `animusd`'s `self_heal.rs` panicking under
+    real concurrent client load): minting a proposal's `ts` and appending it
+    to the Raft log must be one atomic step, not two.** Every mutating
+    propose method (`put_fenced`/`put_batch_fenced`/`delete_fenced`/
+    `cas_fenced`/`propose_seal`, plus `ensure_ceiling_above`'s `ReadCeiling`)
+    now computes its `ts` **while holding the group's own `core` lock**
+    (`propose_ordered`, `lib.rs`), immediately followed by `core.propose(..)`
+    in the same critical section — not two separate, unsynchronized calls.
+    Two proposers could otherwise mint ts=A then ts=B (A < B, correctly
+    monotonic as *mints* — `Hlc`'s own mutex guarantees that much) but race
+    to actually append to the log in the *opposite* order, so apply would
+    see ts=B then ts=A, a real decrease. **This is a `ProdEnv`-only bug —
+    provably unreachable under `SimEnv`**: the original code had no
+    `.await` point between minting and proposing, so two tasks could never
+    interleave there under `SimEnv`'s single-threaded cooperative scheduler;
+    only genuine OS-thread parallelism can. `propose_ordered` also floors
+    every ts-producing path on a new `last_proposed_ts` (this leader's own
+    last-*logged*, not just last-*applied*, ts) — `committed_ceiling`/
+    `ts_cache` only reflect *applied* state, which the apply task can lag
+    the consensus loop on by design (the driver-liveness split above), so a
+    write proposed right after an as-yet-unapplied `ReadCeiling` this same
+    leader just logged must still check against it. **A second, narrower bug
+    surfaced once the first was fixed**: `next_ceiling_candidate`'s ratchet
+    must never hand back `last_proposed_ts` (or its own history)
+    *unmodified* as a candidate — only ever as a floor to strictly exceed —
+    or a `ReadCeiling` proposed right after a write can tie that write's
+    exact ts. See `next_ceiling_candidate`'s doc and `docs/engineering-
+    lessons.md` for both the full mechanism and the diagnostic story.
+    Regression: `tests/prod_concurrent_ts_monotonic.rs` — deliberately the
+    one real-thread `ProdEnv` test in a crate whose other 24 binaries are
+    all `SimEnv`, since this specific race needs genuine thread parallelism
+    to express at all.
 - **CAS is decided at *apply* time, not propose time** — this is what makes it
   linearizable and contention-correct. `RaftCore` agrees only the order; `Cas`
   rides through as opaque data. Apply evaluates it in commit order against the
@@ -503,12 +535,14 @@ Emitted in this fixed order: `NarrowScope`/`WidenScope` → `Host` →
 
 ## Tests
 
-`cargo test -p animus-cp-data`. All 24 test binaries drive `SimEnv` — use
-`run_for`/`run_until`, never `run()` (the driver has perpetual heartbeat/
-election timers). Linearizable reads are async (a read-barrier probe round), so
-drive them as spawned tasks + `run_for`, and never `block_on` a `tick()` whose
-planned action tears a group down (`Reconciler::teardown` polls `env.sleep()`
-internally).
+`cargo test -p animus-cp-data`. All but one of the 25 test binaries drive
+`SimEnv` — use `run_for`/`run_until`, never `run()` (the driver has perpetual
+heartbeat/election timers). Linearizable reads are async (a read-barrier probe
+round), so drive them as spawned tasks + `run_for`, and never `block_on` a
+`tick()` whose planned action tears a group down (`Reconciler::teardown` polls
+`env.sleep()` internally). The one exception is `prod_concurrent_ts_monotonic.rs`
+(below) — a real-thread `ProdEnv` test, deliberately, because the race it
+guards is provably unreachable under `SimEnv`'s single-threaded scheduler.
 
 - `single_tablet.rs` (B.1) — a group elects, replicates writes, applies on
   every replica across a leader kill; `engine_applied_index` confirms a
@@ -593,6 +627,14 @@ internally).
   restart (`Simulator::stop`, not the network-only `crash`/`restart` pair)
   re-witnesses its own recovered WAL, and the first write proposed after
   recovery is timestamped strictly past everything recovered.
+- `prod_concurrent_ts_monotonic.rs` — the **real-thread `ProdEnv`** regression
+  for `propose_ordered`'s fix (`lib.rs`, this file's `CLAUDE.md` entry above):
+  a real 3-node group under many concurrent put+linearizable-get client tasks
+  (real OS-thread parallelism, `#[tokio::test(flavor = "multi_thread")]`),
+  asserting no `assert_ts_monotonic` panic and every write reads back
+  correctly. The one test in this crate that can't be `SimEnv` — the mint/
+  propose-ordering race it guards has no `.await` point for two tasks to
+  interleave at under `SimEnv`'s single-threaded cooperative scheduler.
 - `snapshot_reads.rs` (ADR 0018 §2/PR2b) — `read_at`/`scan_at` directly:
   each sees exactly the version committed at or before `ts` (including a
   value strictly between two writes' timestamps, and `scan_at` across

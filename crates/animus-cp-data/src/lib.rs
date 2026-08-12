@@ -603,6 +603,22 @@ pub struct RaftKvNode<E: Env, S: StorageEngine> {
     /// future-shifted) margin — see `next_ceiling_candidate`'s doc for the
     /// cascade that mistake caused.
     last_ceiling_candidate: Arc<AtomicU64>,
+    /// The `ts` of the **last command this leader has itself proposed**
+    /// (appended to its own Raft log), packed via [`hlc::pack`] — **not**
+    /// `committed_ceiling`, which only reflects what has been *applied*.
+    /// Every ts-producing path (`mint_pushed`, `next_ceiling_candidate`, and
+    /// [`propose_seal`](Self::propose_seal)'s bare mint) must additionally
+    /// exceed this floor, and [`propose_ordered`](Self::propose_ordered)
+    /// advances it, all inside the same held `core` lock — the fix for a
+    /// real regression: a write's own `mint_pushed` floor check only
+    /// consulted `ts_cache`/`committed_ceiling` (both applied-time state),
+    /// so it could still mint below a `ReadCeiling` that had *already been
+    /// appended to the log* (its artificially-`HLC_MAX_OFFSET`-ahead `ts`,
+    /// via `Hlc::uncertainty_upper`) but not yet applied — the apply task
+    /// lags the consensus loop by design (ADR 0017's driver-liveness
+    /// split), so "already logged" and "already applied" are never the same
+    /// instant. See `propose_ordered`'s doc and `docs/engineering-lessons.md`.
+    last_proposed_ts: Arc<AtomicU64>,
 }
 
 impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
@@ -712,6 +728,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         let ts_cache = Arc::new(Mutex::new(TsCache::new()));
         let committed_ceiling = Arc::new(AtomicU64::new(0));
         let last_ceiling_candidate = Arc::new(AtomicU64::new(0));
+        let last_proposed_ts = Arc::new(AtomicU64::new(0));
         let node = Self {
             env: env.clone(),
             core: Arc::clone(&core),
@@ -730,6 +747,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             ts_cache: Arc::clone(&ts_cache),
             committed_ceiling: Arc::clone(&committed_ceiling),
             last_ceiling_candidate,
+            last_proposed_ts,
         };
         // The consensus loop recovers from the WAL, then spawns the apply task
         // (so the apply task sees the recovered core + the correct
@@ -798,13 +816,59 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         self.config().len() / 2 + 1
     }
 
-    /// Propose `command` through the core and, if it was appended (leader), **wake
-    /// the consensus loop** so it replicates the new entry at once rather than
-    /// waiting for the next heartbeat tick (wake-on-propose, ADR 0017). A
-    /// `NotLeader` result appends nothing, so there is nothing to replicate — no
-    /// wake. The core lock is dropped before the notify.
-    fn propose_and_wake(&self, command: KvCommand) -> ProposeResult {
-        let result = record_propose(&self.metrics, self.lock().propose(command));
+    /// Propose a command **built while holding the core lock**, so computing its
+    /// `ts` (via [`mint_pushed`](Self::mint_pushed), [`next_ceiling_candidate`]
+    /// (Self::next_ceiling_candidate), or a bare [`Hlc::mint`]) and appending it
+    /// to the Raft log happen as one atomic step relative to every other
+    /// proposer on this group.
+    ///
+    /// **Why this is load-bearing, not defensive:** every ts-minting path here
+    /// only guarantees monotonicity *relative to whatever it observes at the
+    /// moment it mints* — the log order that decides *apply* order (and hence
+    /// what `assert_ts_monotonic` checks) was, before this method existed, a
+    /// completely separate race: `ts = self.mint_pushed(..)` then, *as a second,
+    /// unsynchronized step*, `self.propose_and_wake(command)` (the method this
+    /// replaced). Two concurrent proposers on the same leader could mint ts=A
+    /// then ts=B (A < B, correctly monotonic *as mints*) but race to actually
+    /// call `core.propose(..)` in the *opposite* order — B's entry landing at
+    /// a lower log index than A's — so apply would process ts=B then ts=A, a
+    /// real decrease. This is exactly what tripped `assert_ts_monotonic` under
+    /// `animusd`'s concurrent-client-load smoke test (`self_heal.rs`) once
+    /// enough real parallelism (`ProdEnv`'s multi-threaded tokio runtime)
+    /// widened the window between "mint" and "propose" enough to hit it. Since
+    /// every proposal to one group already funnels through this same `core`
+    /// mutex to get ordered *at all*, holding it across ts computation too adds
+    /// no new bottleneck — it just closes the gap between the two steps that
+    /// already needed to agree. See `docs/engineering-lessons.md`.
+    ///
+    /// Also advances [`last_proposed_ts`](Self::last_proposed_ts) to `command`'s
+    /// own `ts` **iff the propose actually lands** (`Accepted`, still inside
+    /// this same held lock) — the floor every ts-producing path
+    /// (`mint_pushed`/`next_ceiling_candidate`/[`propose_seal`](Self::
+    /// propose_seal)'s bare mint) must additionally exceed, closing the
+    /// residual gap serializing propose order alone doesn't: an
+    /// already-*proposed* (logged) entry's `ts` can still exceed
+    /// `committed_ceiling`/`ts_cache` (both only reflect *applied* state —
+    /// the apply task lags the consensus loop by design), so without this a
+    /// later write could still mint below an as-yet-unapplied `ReadCeiling`
+    /// this same leader just logged.
+    ///
+    /// Wakes the consensus loop on acceptance (wake-on-propose, ADR 0017), same
+    /// as before. `build` must not itself try to lock `core` (deadlock — it is
+    /// already held) — every current caller only touches `hlc`/`ts_cache`/
+    /// `last_ceiling_candidate`/`last_proposed_ts`, none of which anything else
+    /// locks `core` while holding.
+    fn propose_ordered<F: FnOnce() -> KvCommand>(&self, build: F) -> ProposeResult {
+        let mut core = self.lock();
+        let command = build();
+        let ts = command_ts(&command);
+        let result = record_propose(&self.metrics, core.propose(command));
+        if matches!(result, ProposeResult::Accepted { .. })
+            && let Some(ts) = ts
+        {
+            self.last_proposed_ts.store(hlc::pack(ts), Ordering::SeqCst);
+        }
+        drop(core);
         if matches!(result, ProposeResult::Accepted { .. }) {
             self.propose_signal.notify();
         }
@@ -839,10 +903,37 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// test caught. This ratchet is a separate piece of state precisely so
     /// disambiguating a ceiling candidate never touches the clock every
     /// read/write proposer shares.
+    ///
+    /// Also floored by [`last_proposed_ts`](Self::last_proposed_ts) — this
+    /// leader's own last-*logged* `ts`, not just `committed_ceiling`'s
+    /// applied one (see `propose_ordered`'s doc) — so a ceiling proposed
+    /// right after a regular write this same leader just logged (but the
+    /// apply task hasn't caught up to yet) still lands strictly above it.
+    /// Folding it in here, rather than via `Hlc::witness`, keeps the
+    /// no-witness invariant above intact: `last_proposed_ts` is a plain
+    /// floor read, not a clock advance.
     fn next_ceiling_candidate(&self, margin: HlcTimestamp) -> HlcTimestamp {
         loop {
             let last_packed = self.last_ceiling_candidate.load(Ordering::SeqCst);
-            let last = hlc::unpack(last_packed);
+            // The candidate must strictly exceed **both** this ratchet's own
+            // history (`last_ceiling_candidate` — the original regression
+            // this loop already guarded against) **and** `last_proposed_ts`
+            // (this leader's last-*logged* ts, `propose_ordered`'s doc) — not
+            // merely equal either. Folding them into one `last` and reusing
+            // the exact same bump-on-not-exceeding branch below for both is
+            // deliberate: an earlier version of this fix took
+            // `margin.max(last_proposed_ts)` as a `floor` and returned it
+            // **unmodified** whenever it beat `last_ceiling_candidate` — but
+            // unlike `margin` (always freshly `HLC_MAX_OFFSET` in the
+            // future, so using it as-is was safe), `last_proposed_ts` is a
+            // value some *other* command just used, so returning it
+            // unmodified reproposed the exact same ts — a real regression a
+            // `ProdEnv` concurrent-load test caught (see `docs/engineering-
+            // lessons.md`). Only the ratchet's own bump branch is safe to
+            // hand back verbatim; `margin` and `last_proposed_ts` both only
+            // ever act as a floor to strictly exceed.
+            let last = hlc::unpack(last_packed)
+                .max(hlc::unpack(self.last_proposed_ts.load(Ordering::SeqCst)));
             let candidate = if margin > last {
                 margin
             } else {
@@ -895,7 +986,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// recoverable condition, matching `assert_ts_monotonic`'s doctrine).
     fn mint_pushed<K: AsRef<[u8]>>(&self, keys: &[K]) -> HlcTimestamp {
         let ts = self.hlc.mint(self.env.now());
-        let floor = {
+        let cache_floor = {
             // Opportunistically ratchet the cache's own `low_water` up to the
             // current committed ceiling before querying it (never regresses —
             // see `TsCache::raise_low_water`'s doc) — the mechanism that lets
@@ -906,6 +997,13 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             cache.raise_low_water(self.committed_ceiling());
             cache.max_overlapping(keys)
         };
+        // Also floored by this leader's own last-*logged* ts (`propose_
+        // ordered`'s doc) — `committed_ceiling`/the cache above only reflect
+        // *applied* state, which the apply task can lag the consensus loop
+        // on by design, so a write proposed right after a `ReadCeiling` this
+        // same leader already logged (but hasn't applied yet) must still
+        // check against it here, not just the applied ceiling.
+        let floor = cache_floor.max(hlc::unpack(self.last_proposed_ts.load(Ordering::SeqCst)));
         if ts > floor {
             return ts;
         }
@@ -930,12 +1028,14 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// As [`put`](Self::put), but the leader stamps its own `fence` into the
     /// entry instead of the unconstrained default (see [`KvCommand`]'s doc).
     pub fn put_fenced(&self, key: Vec<u8>, value: Vec<u8>, fence: KeyRange) -> ProposeResult {
-        let ts = self.mint_pushed(std::slice::from_ref(&key));
-        self.propose_and_wake(KvCommand::Put {
-            key,
-            value,
-            fence,
-            ts,
+        self.propose_ordered(|| {
+            let ts = self.mint_pushed(std::slice::from_ref(&key));
+            KvCommand::Put {
+                key,
+                value,
+                fence,
+                ts,
+            }
         })
     }
 
@@ -962,12 +1062,11 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         puts: Vec<(Vec<u8>, Vec<u8>)>,
         fence: KeyRange,
     ) -> ProposeResult {
-        let keys: Vec<&[u8]> = puts.iter().map(|(k, _)| k.as_slice()).collect();
-        let ts = self.mint_pushed(&keys);
-        record_propose(
-            &self.metrics,
-            self.lock().propose(KvCommand::Batch { puts, fence, ts }),
-        )
+        self.propose_ordered(|| {
+            let keys: Vec<&[u8]> = puts.iter().map(|(k, _)| k.as_slice()).collect();
+            let ts = self.mint_pushed(&keys);
+            KvCommand::Batch { puts, fence, ts }
+        })
     }
 
     /// Propose a delete (tombstone) to this group. Stamps `fence =
@@ -980,8 +1079,10 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// As [`delete`](Self::delete), but the leader stamps its own `fence` into
     /// the entry instead of the unconstrained default (see [`KvCommand`]'s doc).
     pub fn delete_fenced(&self, key: Vec<u8>, fence: KeyRange) -> ProposeResult {
-        let ts = self.mint_pushed(std::slice::from_ref(&key));
-        self.propose_and_wake(KvCommand::Delete { key, fence, ts })
+        self.propose_ordered(|| {
+            let ts = self.mint_pushed(std::slice::from_ref(&key));
+            KvCommand::Delete { key, fence, ts }
+        })
     }
 
     /// Propose a **linearizable compare-and-swap**: set `key` to `value` iff the
@@ -1009,13 +1110,15 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         value: Vec<u8>,
         fence: KeyRange,
     ) -> ProposeResult {
-        let ts = self.mint_pushed(std::slice::from_ref(&key));
-        self.propose_and_wake(KvCommand::Cas {
-            key,
-            expected,
-            value,
-            fence,
-            ts,
+        self.propose_ordered(|| {
+            let ts = self.mint_pushed(std::slice::from_ref(&key));
+            KvCommand::Cas {
+                key,
+                expected,
+                value,
+                fence,
+                ts,
+            }
         })
     }
 
@@ -1029,8 +1132,27 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// (the marker key is keyed by `(tablet, range)`, so a repeat simply
     /// refreshes it with a newer `ts` — see `seal.rs`).
     pub fn propose_seal(&self, range: KeyRange) -> ProposeResult {
-        let ts = self.hlc.mint(self.env.now());
-        self.propose_and_wake(KvCommand::Seal { range, ts })
+        self.propose_ordered(|| {
+            let ts = self.hlc.mint(self.env.now());
+            // Same `last_proposed_ts` floor as `mint_pushed` (see
+            // `propose_ordered`'s doc) — a seal is a mutating log entry like
+            // any other and must not land below an as-yet-unapplied
+            // `ReadCeiling` this leader already logged.
+            let floor = hlc::unpack(self.last_proposed_ts.load(Ordering::SeqCst));
+            let ts = if ts > floor {
+                ts
+            } else {
+                let pushed = self.hlc.witness(floor, self.env.now());
+                assert!(
+                    pushed > floor,
+                    "raftkv propose_seal: witnessing the last-proposed floor must strictly \
+                     exceed it (floor={floor:?}, got={pushed:?}) — Hlc::witness's own contract \
+                     is broken"
+                );
+                pushed
+            };
+            KvCommand::Seal { range, ts }
+        })
     }
 
     /// The recorded outcome of the CAS committed at Raft log `index` (the value
@@ -1858,9 +1980,19 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         // via a **separate** ratchet that never feeds back into `self.hlc`
         // (the clock every read/write proposer shares) — only the
         // committed-ceiling candidate sequence itself.
-        let margin = self.hlc.uncertainty_upper(ts);
-        let candidate = self.next_ceiling_candidate(margin);
-        match self.propose_and_wake(KvCommand::ReadCeiling { ts: candidate }) {
+        //
+        // That ratchet's own CAS loop only serializes a ReadCeiling proposal
+        // against *other* ReadCeiling proposals (the regression above) — it
+        // never touched `core`'s lock, so it did nothing to order a
+        // ReadCeiling against a *concurrent write*'s `mint_pushed`. Computing
+        // `candidate` inside `propose_ordered` (which now also wraps every
+        // write proposer) is what closes that residual: see the doc on
+        // `propose_ordered` for the shared root cause both fixes address.
+        match self.propose_ordered(|| {
+            let margin = self.hlc.uncertainty_upper(ts);
+            let candidate = self.next_ceiling_candidate(margin);
+            KvCommand::ReadCeiling { ts: candidate }
+        }) {
             ProposeResult::Accepted { .. } => {
                 self.metrics.incr(Metric::CpReadCeilingProposals);
             }
@@ -2290,6 +2422,9 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                     .await
                     .expect("raftkv apply read-ceiling marker");
             }
+            // No `assert_ts_monotonic` call here, deliberately: `NoOp` carries
+            // no `ts` at all (`command_ts` returns `None` for it), so there is
+            // nothing to check monotonicity of.
             KvCommand::NoOp => {}
         }
         max_index = index; // ascending; watermark advances after the final flush

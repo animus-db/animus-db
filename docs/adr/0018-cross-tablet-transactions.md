@@ -272,6 +272,17 @@ index is the MVCC version" invariant) — and adds the **range seal**, the
 mechanism that closes the one residual race a structural version-space
 separation covered but plain HLC witnessing cannot.
 
+*(Corrective note, 2026-08-12: as shipped, PR2 implicitly assumed "mint order
+== log order" on a leader without enforcing it — two concurrent proposers
+could mint in one order and append in the other, inverting applied `ts` order
+under real-thread load (caught by `assert_ts_monotonic`, the hard assert this
+amendment prescribed, via a `ProdEnv` multi-thread test — `SimEnv` cannot
+express a preemption between two non-yielding calls). Fixed by
+`propose_ordered`: minting and appending are one critical section under the
+group's existing propose lock, plus a `last_proposed_ts` strict-floor so
+ceiling/push logic also orders against proposed-but-not-yet-applied entries.
+Mint order **is** log order — enforced, not assumed.)*
+
 ### 1. Why `version_floor` had to go, and why witnessing alone isn't enough
 
 `version_floor` worked by construction: a fresh/widened group's stamped

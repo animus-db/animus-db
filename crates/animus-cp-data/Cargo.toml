@@ -24,3 +24,9 @@ tracing.workspace = true
 [dev-dependencies]
 animus-sim.workspace = true
 animus-placement.workspace = true
+# Real-thread `ProdEnv` regression (`tests/prod_concurrent_ts_monotonic.rs`):
+# the mint/propose-ordering race this guards is provably unreachable under
+# `SimEnv`'s single-threaded cooperative scheduler (no `.await` point exists
+# between minting a ts and appending it to the log for two tasks to
+# interleave at), so this one test needs genuine OS-thread parallelism.
+tokio.workspace = true
