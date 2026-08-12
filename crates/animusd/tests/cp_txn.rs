@@ -109,6 +109,7 @@ async fn decide_via_any_node(
                         record_key: record_key.clone(),
                         commit,
                         min_commit_ts,
+                        orphan_created_ts: None,
                     },
                 )
                 .await

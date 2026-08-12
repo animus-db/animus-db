@@ -239,7 +239,13 @@ Three modules:
   `intent_spans`/`created_ts`). `txn_verify_staged(span, txn_id) ->
   Option<bool>` answers "does this tablet still hold a live intent for
   `txn_id` over `span`" via a small bounded scoped scan of the raw
-  envelope. `pending_txns()`/`unresolved_decided()` expose this group's
+  envelope. `txn_abort_orphan(txn_id, record_key, created_ts) ->
+  Option<HlcTimestamp>` is the orphan-record dual of `txn_abort`:
+  synthesizes a fresh `Aborted` tombstone if (and only if) no record
+  exists yet for `record_key` — used when a pusher's `txn_record_view`
+  query finds nothing at all (a real possibility: the anchor's own stage
+  can silently no-op on a fence/seal miss just like a participant's
+  already could). `pending_txns()`/`unresolved_decided()` expose this group's
   `TxnTracker` snapshot (cheap lock-and-clone) — see the Key invariants
   entry below for the tracker's insert/remove rules and rebuild-at-start
   source, and `animusd::txn_recover`/`txn_resolver_loop` for how these
@@ -525,6 +531,34 @@ State once here; cross-referenced from the sections below.
     `txn_stage` is now a thin single-participant wrapper). `codec.rs`
     `VERSION` bumped 8 → 9 (internal wire/record format only, no
     back-compat concern).
+  - **Orphan records + the resurrection guard** (a corner the
+    `intent_spans` fix's own review caught): PR4's prepare phase stages
+    every participant concurrently, so a participant's own stage can
+    succeed while the *anchor's* own `TxnStage` — which would create the
+    record — never lands (the same fence/seal-miss gap PR4 already
+    documented for a participant's stage, now recognized to apply to the
+    anchor's own stage too: `wait_applied` only confirms the entry
+    *applied*, never that its content check succeeded). Two fixes:
+    `KvCommand::TxnAbort` gained `orphan_created_ts: Option<HlcTimestamp>`
+    (`codec.rs` `VERSION` bumped 9 → 10) — `Some` means "no record exists
+    at all; synthesize a fresh `Aborted` tombstone directly" (a new
+    primitive, `RaftKvNode::txn_abort_orphan`) instead of the ordinary
+    "missing record is a fence-miss no-op." An absent record can only ever
+    decide abort (committing needs a participant list to verify against,
+    which only the record itself would have provided). Second,
+    `apply_and_compact`'s `TxnStage` arm now checks — before merging
+    anything, only for `is_anchor: true` — whether a **decided** record
+    for this exact `txn_id` already exists; if so the whole entry no-ops
+    (logged), never resurrecting it to `Pending`. `IntentInfo` gained a
+    `version: HlcTimestamp` field (the intent's own applied timestamp) as
+    the grace-clock substitute a pusher uses when no record exists to read
+    `created_ts` from. Regression: the in-crate
+    `pr5_orphan_and_resurrection_tests` module (`lib.rs`) — not an
+    external `tests/` file, since reproducing "a late `TxnStage` for an
+    already-known `txn_id`" needs `pub(crate)` access (`txn::record_key`,
+    a direct `KvCommand::TxnStage` construction, `propose_ordered_aux`/
+    `mint_pushed`) the public `txn_stage_anchor` (always mints a *fresh*
+    id) cannot express.
   - **New recovery primitives**: `RaftKvNode::txn_record_view` (the
     recovery-view dual of `txn_status_local`, also returning
     `intent_spans`/`created_ts`) and `txn_verify_staged` (does this tablet
@@ -848,6 +882,13 @@ round), so drive them as spawned tasks + `run_for`, and never `block_on` a
 `env.sleep()` internally). The one exception is `prod_concurrent_ts_monotonic.rs`
 (below) — a real-thread `ProdEnv` test, deliberately, because the race it
 guards is provably unreachable under `SimEnv`'s single-threaded scheduler.
+There is also one **in-crate** `#[cfg(test)] mod` at the bottom of `lib.rs`
+itself (`pr5_orphan_and_resurrection_tests`, ADR 0018 §2/PR5's §2b) —
+`cargo test -p animus-cp-data --lib` runs it; it needs `pub(crate)` access
+(`txn::record_key`, a direct `KvCommand::TxnStage` construction,
+`propose_ordered_aux`/`mint_pushed`) no external `tests/` file can reach, to
+build a "late `TxnStage` for an already-known `txn_id`" scenario the public
+API (which always mints a *fresh* id) cannot express.
 
 - `single_tablet.rs` (B.1) — a group elects, replicates writes, applies on
   every replica across a leader kill; `engine_applied_index` confirms a
@@ -993,10 +1034,21 @@ guards is provably unreachable under `SimEnv`'s single-threaded scheduler.
   decision-semantics fix's core regression); two duelling recoverers'
   conflicting proposals converging on one identical status with no assert
   (zero intervening sim time, mirroring `cross_group_lww.rs`'s
-  in-flight-race technique); a push declining before grace elapses;
-  `pending_txns` surviving a genuine process restart via the rebuild scan
-  (a single-voter group, mirroring `witnessing.rs`'s own restart idiom, to
-  sidestep which-of-three-replicas-becomes-leader-again nondeterminism a
+  in-flight-race technique); a push declining before grace elapses; an
+  orphan intent with no record anywhere (`push_aborts_an_orphan_intent_
+  with_no_record_anywhere`, the record-absent branch of §2b's fix) — the
+  anchor's whole range sealed first (`propose_seal`, `txn_single.rs`'s
+  already-sealed-range technique) so its own stage silently no-ops, still
+  handing back a genuine, minted `(txn_id, record_key)` with no record ever
+  written on the anchor and a real participant intent referencing it —
+  decided abort past grace via `txn_abort_orphan` (`push`'s own
+  record-absent branch, added alongside this test), the synthesized
+  tombstone confirmed to carry empty `intent_spans`, and the triggering
+  intent resolved away directly by the caller (never via the tombstone's
+  own spans — it has none); `pending_txns` surviving a genuine process
+  restart via the rebuild scan (a single-voter group, mirroring
+  `witnessing.rs`'s own restart idiom, to sidestep
+  which-of-three-replicas-becomes-leader-again nondeterminism a
   multi-voter restart would add for no benefit to what this test proves);
   and a five-seed reproducibility sweep. **Gotcha this file's own test
   authoring is the regression for**: its `drive` helper's `sim.run_for(budget)`

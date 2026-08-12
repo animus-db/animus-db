@@ -1342,6 +1342,30 @@ debugging anything that feels like it might have happened before.
   to reconstruct it locally from information it structurally doesn't have.
   See `docs/adr/0018-cross-tablet-transactions.md`'s PR5 amendment §2 for
   the full account and the closing fix.
+  **Update: fixing a gap like this one is worth a second pass asking "what
+  if this record doesn't exist at all yet?"** — review of the fix above
+  (a second reviewer, not the original implementer) immediately surfaced a
+  further corner the fix itself didn't close: PR4's prepare phase stages
+  participants *concurrently*, so a participant's own intent can be
+  discovered by a reader while the record that would name it never gets
+  created at all (the anchor's own stage can silently no-op on a
+  fence/seal miss, exactly like a participant's already could — the same
+  class of gap, just on the *other* side of the anchor/participant split).
+  Any "read this record to decide what to do" path needs a **third**
+  branch beyond "found, decided" / "found, pending" — **"not found at
+  all"** — with its own safe decision (here: always abort, never commit,
+  since committing needs a participant list only the record would have
+  provided), *and* a symmetric guard against a **late arrival of the
+  thing that would have created the record** overwriting whatever that
+  third branch already decided (a "resurrection" hazard — the same
+  first-decision-wins principle the original fix already established for
+  *conflicting* decisions, extended to record *creation* itself). The
+  general check to run whenever a fix makes some entity's *fields* more
+  complete: does the fix's own precondition ("the entity exists") still
+  hold in every case the system can reach, or did fixing the fields
+  quietly assume creation is atomic with the read that discovers a need
+  for it? See the PR5 amendment's §2b for the full closing fix and its
+  regression test.
 - **A "full replace" update to `Arc`-shared cached state tolerates a bare
   monotonic-watermark check-then-mutate race; an "apply an incremental delta
   onto the existing cache" update to the *same* shared state does not, and

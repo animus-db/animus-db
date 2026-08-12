@@ -268,21 +268,41 @@ back to the bounded internal wait, unchanged from PR3 — `txn_resolver_loop`
 is what eventually pushes a stale local record instead.
 
 **In-doubt recovery (ADR 0018 §2/PR5)**: `ClientCtx::txn_recover(
-record_table, record_key, txn_id) -> Result<TxnDecisionStatus, String>` is
-the "push" — any actor holding a foreign-or-local `Pending` intent past
-`animus_cp_data::RECOVERY_GRACE` (5s, liveness-only) may call it. Reads the
-record (`txn_record_view`, the new `TxnRecordView` recovery-view dual of
-`txn_status_local`); already decided → resolve and return; `Pending` and
-not yet stale → decline (`Pending`, propose nothing); `Pending` and stale →
-verify every `(table, span)` in `intent_spans` (`txn_verify`, does the
-owning tablet still hold a live intent — `RaftKvNode::txn_verify_staged`
-over the wire); all staged → propose `TxnCommit`, any missing → propose
-`TxnAbort`; re-read the actual outcome (never trust the proposal) and
-resolve every participant (`recovery_resolve`, grouping `intent_spans` by
-table). See the ADR's PR5 amendment for the full safety argument (why a
-recovery commit and a coordinator's own commit are always the same
-decision, and why a recovery abort racing a live coordinator is a
-legitimate, safe outcome, never data loss).
+record_table, record_key, txn_id, intent_ts_hint) ->
+Result<TxnDecisionStatus, String>` is the "push" — any actor holding a
+foreign-or-local `Pending` intent past `animus_cp_data::RECOVERY_GRACE`
+(5s, liveness-only) may call it. Reads the record (`txn_record_view`, the
+`TxnRecordView` recovery-view dual of `txn_status_local`); already decided
+→ resolve and return; `Pending` and not yet stale → decline (`Pending`,
+propose nothing); `Pending` and stale → verify every `(table, span)` in
+`intent_spans` (`txn_verify`, does the owning tablet still hold a live
+intent — `RaftKvNode::txn_verify_staged` over the wire); all staged →
+propose `TxnCommit`, any missing → propose `TxnAbort`; re-read the actual
+outcome (never trust the proposal) and resolve every participant
+(`recovery_resolve`, grouping `intent_spans` by table). See the ADR's PR5
+amendment for the full safety argument (why a recovery commit and a
+coordinator's own commit are always the same decision, and why a recovery
+abort racing a live coordinator is a legitimate, safe outcome, never data
+loss).
+
+**No record at all (ADR 0018 §2/PR5's orphan-record fix, §2b)**: a real,
+already-acknowledged possibility — the anchor's own `TxnStage` can silently
+no-op on a fence/seal miss, exactly like a participant's already could
+(PR4's own documented gap, now applying to the anchor's own stage too), so
+a pusher's `txn_record_view` query can come back empty even though a
+participant genuinely staged. `intent_ts_hint` (the foreign-intent read
+path's own `FastRead::Foreign`/`IntentInfo::version` — the orphaned
+intent's applied timestamp) is the only trustworthy grace-clock substitute
+in that case; with none supplied (the resolver loop's own sweep never has
+one, since `pending_txns()` only ever tracks a genuine local record), the
+call declines. Past grace on that substitute, `txn_recover` proposes an
+**orphan-abort tombstone** (`txn_decide_anchor`'s `orphan_created_ts`
+parameter → `RaftKvNode::txn_abort_orphan`) — always an abort, never a
+commit (an absent record gives no participant list to verify "all staged"
+against). A **late-arriving** genuine anchor `TxnStage` for that same
+`txn_id` then finds the tombstone and no-ops instead of resurrecting it to
+`Pending` — `apply_and_compact`'s own resurrection guard, not anything
+`animusd` has to arrange.
 
 `txn_resolver_loop` (`lib.rs`, data-role-gated, spawned alongside the
 tablet-host reconciler and `auto_split_loop` in both `BoundNode::start_with`

@@ -502,10 +502,30 @@ pub enum KvCommand {
     /// **Transaction abort**: the `Aborted` dual of `TxnCommit` — see its
     /// doc for the fence/idempotency/protocol-bug-assert argument, which
     /// applies identically here.
+    ///
+    /// **`orphan_created_ts` (ADR 0018 §2/PR5's orphan-record fix)**: `None`
+    /// is the ordinary case above (a missing record is a silent fence-miss
+    /// no-op). `Some(created_ts)` is a **recovery pusher that found no
+    /// record at all** — a real, already-acknowledged possibility (the
+    /// anchor's own `TxnStage` can silently no-op at apply on a fence/seal
+    /// miss, exactly like a participant's stage already could, PR4, even
+    /// though the coordinator went on to stage participants successfully).
+    /// In that case apply **synthesizes** a fresh `TxnRecord` directly in
+    /// the `Aborted` state (a CRDB-style "abort tombstone") using
+    /// `created_ts` as its `created_ts` field (the pusher's only
+    /// trustworthy substitute — see `IntentInfo::version`'s doc) and empty
+    /// `intent_spans` (unknown — a documented residual, see
+    /// `apply_and_compact`'s arm). This is always safe: it can never
+    /// resurrect or clobber a record that already exists (that path is
+    /// unchanged, `Some`/`None` alike), and a late-arriving genuine anchor
+    /// `TxnStage` for the same `txn_id` finds this tombstone and no-ops
+    /// instead of overwriting it back to `Pending` (`KvCommand::TxnStage`'s
+    /// own resurrection guard).
     TxnAbort {
         txn_id: TxnId,
         record_key: Vec<u8>,
         ts: HlcTimestamp,
+        orphan_created_ts: Option<HlcTimestamp>,
     },
     /// **Transaction resolve**: for each key in `keys` still holding
     /// `txn_id`'s intent, rewrite it to its final form per `outcome` —
@@ -779,6 +799,18 @@ pub struct IntentInfo {
     pub record_key: Vec<u8>,
     pub record_table: String,
     pub staged_value: Option<Vec<u8>>,
+    /// **ADR 0018 §2/PR5**: the intent's own applied HLC timestamp
+    /// (unpacked from its engine version — `assert_ts_monotonic`'s own
+    /// invariant guarantees this is a real, meaningful point in this
+    /// group's causal history). A recovery pusher whose `TxnStatus`/
+    /// `TxnRecordView` query finds **no record at all** (a real,
+    /// already-acknowledged possibility — the anchor's own stage can
+    /// silently no-op at apply time on a fence/seal miss, exactly like a
+    /// participant's stage already could, PR4) has no `created_ts` to
+    /// grace-gate against; this is the documented substitute, since it's
+    /// the only trustworthy timestamp anyone still holds for this
+    /// transaction in that case. See `ClientCtx::txn_recover`'s doc.
+    pub version: HlcTimestamp,
 }
 
 /// A recovery pusher's view of a transaction record (ADR 0018 §2/PR5) — the
@@ -1748,6 +1780,53 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
                 txn_id: txn_id.clone(),
                 record_key: record_key.clone(),
                 ts,
+                orphan_created_ts: None,
+            };
+            (cmd, ts)
+        });
+        let index = match result {
+            ProposeResult::Accepted { index } => index,
+            ProposeResult::NotLeader { .. } => return None,
+        };
+        self.wait_applied(index).await.then_some(ts)
+    }
+
+    /// **Abort an orphan intent with no record at all** (ADR 0018 §2/PR5,
+    /// the corner PR5's own review found: PR4's prepare phase is
+    /// concurrent, so a participant's own stage can succeed and be
+    /// discovered by a reader while the *anchor's* `TxnStage` — which
+    /// would have created this transaction's record — never lands here at
+    /// all, e.g. a fence/seal miss the coordinator's propose outcome alone
+    /// can't distinguish from a genuine stage, PR4's own documented gap,
+    /// now applied to the anchor's own stage too). A recovery pusher whose
+    /// `txn_record_view` query finds nothing calls this instead of
+    /// [`txn_abort`](Self::txn_abort): proposes `KvCommand::TxnAbort` with
+    /// `orphan_created_ts: Some(created_ts)`, which **synthesizes** a fresh
+    /// `Aborted` record if (and only if) none exists yet — see
+    /// `KvCommand::TxnAbort`'s doc for the full safety argument (it can
+    /// never resurrect/clobber an existing record; that path is
+    /// unconditionally unchanged). `created_ts` should be the pusher's
+    /// best available substitute for a real `created_ts` — typically the
+    /// orphaned intent's own applied timestamp
+    /// ([`IntentInfo::version`](IntentInfo)), since no genuine record ever
+    /// existed to read one from. Returns the proposed ts once applied
+    /// (same "not necessarily the actual final status" caveat as
+    /// [`txn_abort`](Self::txn_abort) — a concurrent decision, e.g. the
+    /// coordinator's own late-but-successful commit, can still win; the
+    /// caller must re-read).
+    pub async fn txn_abort_orphan(
+        &self,
+        txn_id: TxnId,
+        record_key: Vec<u8>,
+        created_ts: HlcTimestamp,
+    ) -> Option<HlcTimestamp> {
+        let (result, ts) = self.propose_ordered_aux(|| {
+            let ts = self.mint_pushed(std::slice::from_ref(&record_key));
+            let cmd = KvCommand::TxnAbort {
+                txn_id: txn_id.clone(),
+                record_key: record_key.clone(),
+                ts,
+                orphan_created_ts: Some(created_ts),
             };
             (cmd, ts)
         });
@@ -1838,6 +1917,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
                     txn_id: txn_id.clone(),
                     record_key: record_key.clone(),
                     ts,
+                    orphan_created_ts: None,
                 }
             };
             (cmd, ts)
@@ -2417,6 +2497,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
                         record_key,
                         record_table,
                         staged_value,
+                        version: hlc::unpack(vv.version),
                     }),
                 }
             }
@@ -3680,6 +3761,38 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 ts,
             } => {
                 assert_ts_monotonic(max_applied_ts, ts);
+                // ADR 0018 §2/PR5 resurrection guard: PR4's prepare phase
+                // is concurrent, so the anchor's own `TxnStage` (this
+                // entry, when `is_anchor`) can arrive **after** a recovery
+                // pusher has already decided this transaction — the
+                // pusher found an orphaned participant intent, got no
+                // record back, and created an `Aborted` tombstone
+                // (`KvCommand::TxnAbort`'s `orphan_created_ts` case). A
+                // late-arriving genuine stage must never resurrect a
+                // `Pending` record over an already-decided one (nor write
+                // fresh intents nobody will ever resolve, since this
+                // record's `intent_spans` — fixed at creation — likely
+                // doesn't name them): first decision wins, exactly like
+                // `TxnCommit`/`TxnAbort`'s own duelling-decider no-op.
+                // Only meaningful for `is_anchor`: a non-anchor
+                // participant's own tablet never holds the record to check
+                // against at all (see the doc below for why that's fine).
+                let already_decided = is_anchor
+                    && storage
+                        .get(&scope.physical(&record_key))
+                        .await
+                        .expect("raftkv txn stage record read")
+                        .and_then(|vv| txn::decode_record(&vv.value))
+                        .is_some_and(|r| r.txn_id == txn_id && r.status != txn::TxnStatus::Pending);
+                if already_decided {
+                    tracing::warn!(
+                        ?txn_id,
+                        ?record_key,
+                        "raftkv: TxnStage arrived after this record already decided — no-op \
+                         (a late anchor stage racing a recovery decision; first decision wins, \
+                         never a resurrection)"
+                    );
+                }
                 // Whole-or-nothing, matching `Batch`: a partial stage would
                 // let a reader observe some of a transaction's intents but
                 // not others (see `KvCommand::TxnStage`'s doc). A
@@ -3690,9 +3803,10 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 // fence/engine (ADR 0018 §2/PR4).
                 let record_in_fence =
                     !is_anchor || (fence.contains(&record_key) && !is_sealed(sealed, &record_key));
-                let all_in_fence = writes
-                    .iter()
-                    .all(|(k, _)| fence.contains(k) && !is_sealed(sealed, k))
+                let all_in_fence = !already_decided
+                    && writes
+                        .iter()
+                        .all(|(k, _)| fence.contains(k) && !is_sealed(sealed, k))
                     && record_in_fence;
                 if all_in_fence {
                     flush_pending(storage, &mut pending, metrics).await;
@@ -3836,6 +3950,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 txn_id,
                 record_key,
                 ts,
+                orphan_created_ts,
             } => {
                 assert_ts_monotonic(max_applied_ts, ts);
                 flush_pending(storage, &mut pending, metrics).await;
@@ -3846,7 +3961,50 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                     .expect("raftkv txn abort read")
                     .and_then(|vv| txn::decode_record(&vv.value));
                 match current {
-                    None => {}
+                    // ADR 0018 §2/PR5: no record exists at all — either
+                    // the ordinary fence-miss no-op (unchanged: the
+                    // anchor's own stage never landed here, `None` is
+                    // this arm's caller-supplied signal that this isn't a
+                    // recovery push), or a recovery pusher's orphan-abort
+                    // tombstone (`Some(created_ts)`): synthesize a fresh
+                    // `Aborted` record directly. Safe unconditionally —
+                    // there is no existing record here to resurrect or
+                    // clobber (that's the `Some(r) => ..` arm below,
+                    // untouched). `intent_spans` is empty: unknown, since
+                    // no real record ever existed to learn participants
+                    // from — a documented residual (proactive resolver
+                    // fan-out can't reach unlisted participants this way;
+                    // on-demand resolution via any reader hitting any of
+                    // their own intents is unaffected, since that path
+                    // routes through this record's `record_table`/
+                    // `record_key` — carried in the intent envelope
+                    // itself — never through `intent_spans`).
+                    None => {
+                        if let Some(created_ts) = orphan_created_ts {
+                            let record = txn::TxnRecord {
+                                txn_id: txn_id.clone(),
+                                status: txn::TxnStatus::Aborted,
+                                intent_spans: Vec::new(),
+                                created_ts,
+                            };
+                            storage
+                                .merge(
+                                    &physical_record,
+                                    &txn::encode_record(&record),
+                                    hlc::pack(ts),
+                                )
+                                .await
+                                .expect("raftkv apply txn orphan-abort tombstone");
+                            tracing::warn!(
+                                ?txn_id,
+                                ?record_key,
+                                ?created_ts,
+                                "raftkv: recovery created an orphan-abort tombstone (no record \
+                                 ever existed for this txn_id — a stale intent with a crashed \
+                                 or fence/seal-missed anchor stage)"
+                            );
+                        }
+                    }
                     Some(r) if r.txn_id != txn_id => {
                         panic!(
                             "raftkv txn abort: record at {record_key:?} belongs to a \
@@ -4559,6 +4717,294 @@ async fn apply_loop<E: Env, S: StorageEngine>(
         .await;
         if !did_work {
             env.sleep(APPLY_IDLE_POLL).await;
+        }
+    }
+}
+
+/// **In-crate regression** for the orphan-record recovery + resurrection
+/// guard (ADR 0018 §2/PR5, the corner the team lead's review of the
+/// `intent_spans` fix flagged): lives here, not in `tests/txn_recovery.rs`,
+/// because reproducing "a late-arriving anchor `TxnStage` for an
+/// **already-known** `txn_id`" needs `pub(crate)` access
+/// (`txn::record_key`, a direct `KvCommand::TxnStage` construction, and the
+/// private `propose_ordered_aux`/`mint_pushed` primitives) — the public
+/// `RaftKvNode::txn_stage_anchor` always **mints a fresh** `TxnId`, so it
+/// cannot express "the identical, already-referenced transaction arrives
+/// late"; an external integration test genuinely cannot construct this
+/// scenario at all.
+#[cfg(test)]
+mod pr5_orphan_and_resurrection_tests {
+    use super::*;
+    use animus_env::nid;
+    use animus_sim::{SimEnv, Simulator};
+    use animus_storage::MemoryEngine;
+    use std::sync::Mutex as StdMutex;
+
+    type KvNode = RaftKvNode<SimEnv, MemoryEngine>;
+
+    fn drive<T: Send + 'static>(
+        sim: &mut Simulator,
+        env: &SimEnv,
+        budget: Duration,
+        fut: impl Future<Output = T> + Send + 'static,
+    ) -> Option<T> {
+        let slot: Arc<StdMutex<Option<T>>> = Arc::new(StdMutex::new(None));
+        let s = Arc::clone(&slot);
+        env.clone().spawn_task(async move {
+            let v = fut.await;
+            *s.lock().unwrap() = Some(v);
+        });
+        sim.run_for(budget);
+        slot.lock().unwrap().take()
+    }
+
+    fn key(token: u8, tail: &[u8]) -> Vec<u8> {
+        let mut k = vec![token; animus_tablet::TOKEN_BYTES];
+        k.extend_from_slice(tail);
+        k
+    }
+
+    /// **The full scenario the team lead's review named**: a pusher aborts
+    /// a record-less orphan intent (no anchor record ever existed — the
+    /// coordinator's own anchor `TxnStage` silently no-op'd, or never
+    /// landed); a late-arriving genuine anchor `TxnStage` for that exact
+    /// `txn_id` then no-ops against the tombstone instead of resurrecting
+    /// a `Pending` record; and the coordinator's own (also-late) commit
+    /// attempt converges to the same `Aborted` outcome. Final state: every
+    /// intent resolved away, no zombie `Pending` anywhere, no assert.
+    #[test]
+    fn orphan_abort_survives_a_late_anchor_stage_and_a_late_coordinator_commit() {
+        let seed = 0xA5B1_0001u64;
+        let mut sim = Simulator::new(seed);
+        let engine = MemoryEngine::new();
+        let id_a = nid(9001);
+        let id_b = nid(9011);
+        let node_a: KvNode = RaftKvNode::start_scoped(
+            sim.env(id_a.clone()),
+            vec![id_a.clone()],
+            engine.clone(),
+            StorageScope::new(b"orders:".to_vec(), KeyRange::whole()),
+        );
+        let node_b: KvNode = RaftKvNode::start_scoped(
+            sim.env(id_b.clone()),
+            vec![id_b.clone()],
+            engine.clone(),
+            StorageScope::new(b"accounts:".to_vec(), KeyRange::whole()),
+        );
+        sim.run_for(Duration::from_secs(2)); // elect (single voter each)
+
+        let ka = key(1, b":order");
+        let kb = key(2, b":balance");
+
+        // Hand-construct the transaction's identity: `TxnId`'s fields are
+        // `pub`, and `txn::record_key` is `pub(crate)` — both reachable
+        // here, unlike from an external integration test. This stands in
+        // for "the coordinator's anchor `TxnStage` call reported success
+        // (`Some((txn_id, record_key))`, since `wait_applied` only checks
+        // the entry APPLIED, never that it actually wrote anything) while
+        // its apply silently no-op'd" — PR4's own documented fence/seal-miss
+        // gap, now applying to the anchor's own stage too.
+        let anchor_token = &ka[..animus_tablet::TOKEN_BYTES];
+        let txn_id = TxnId {
+            ts: HlcTimestamp {
+                wall_ms: 1_000,
+                logical: 0,
+            },
+            node: id_a.clone(),
+        };
+        let record_key = txn::record_key(anchor_token, &txn_id);
+
+        // The participant stages for real, referencing this txn_id/record_key
+        // exactly as if the anchor's own stage had genuinely succeeded.
+        let n_b = node_b.clone();
+        let (txn_id_b, record_key_b) = (txn_id.clone(), record_key.clone());
+        let kb_clone = kb.clone();
+        let stage_ts = drive(
+            &mut sim,
+            node_b.env(),
+            Duration::from_millis(300),
+            async move {
+                n_b.txn_stage_participant(
+                    txn_id_b,
+                    record_key_b,
+                    "orders".to_string(),
+                    vec![(kb_clone, Some(b"debited".to_vec()))],
+                )
+                .await
+            },
+        )
+        .flatten();
+        assert!(
+            stage_ts.is_some(),
+            "participant stage should succeed (seed={seed})"
+        );
+
+        // Recovery discovers the orphan (group A has no record at all for
+        // this txn_id) and creates the abort tombstone directly.
+        let n_a = node_a.clone();
+        let (txn_id_o, record_key_o) = (txn_id.clone(), record_key.clone());
+        let created_ts_hint = HlcTimestamp {
+            wall_ms: 900,
+            logical: 0,
+        };
+        let orphan_ts = drive(
+            &mut sim,
+            node_a.env(),
+            Duration::from_millis(300),
+            async move {
+                n_a.txn_abort_orphan(txn_id_o, record_key_o, created_ts_hint)
+                    .await
+            },
+        )
+        .flatten();
+        assert!(
+            orphan_ts.is_some(),
+            "orphan-abort tombstone proposal should be accepted (seed={seed})"
+        );
+        let status = drive(&mut sim, node_a.env(), Duration::from_millis(300), {
+            let n = node_a.clone();
+            let rk = record_key.clone();
+            async move { n.txn_status_local(&rk).await }
+        })
+        .flatten();
+        assert_eq!(
+            status,
+            Some(TxnDecisionStatus::Aborted),
+            "the orphan-abort tombstone should be Aborted (seed={seed})"
+        );
+
+        // "The anchor stage arrives late": propose the genuine
+        // `KvCommand::TxnStage` for this exact (already-decided) txn_id
+        // directly — `RaftKvNode::txn_stage_anchor` cannot express this
+        // (it always mints a fresh id), so this in-crate test builds the
+        // command by hand via the same private primitives
+        // `txn_stage_anchor` itself uses internally.
+        let anchor_writes = vec![(ka.clone(), Some(b"placed".to_vec()))];
+        let fence = node_a.scope_range();
+        let participant_span_end = txn::immediate_successor(&kb);
+        let (result, late_ts) = node_a.propose_ordered_aux(|| {
+            let ts = node_a.mint_pushed(std::slice::from_ref(&ka));
+            let cmd = KvCommand::TxnStage {
+                txn_id: txn_id.clone(),
+                record_key: record_key.clone(),
+                record_table: "orders".to_string(),
+                is_anchor: true,
+                writes: anchor_writes.clone(),
+                spans: vec![(
+                    "accounts".to_string(),
+                    KeyRange::new(kb.clone(), Some(participant_span_end.clone())),
+                )],
+                fence: fence.clone(),
+                ts,
+            };
+            (cmd, ts)
+        });
+        let late_index = match result {
+            ProposeResult::Accepted { index } => index,
+            other => panic!("late anchor stage proposal rejected: {other:?} (seed={seed})"),
+        };
+        let applied = drive(&mut sim, node_a.env(), Duration::from_millis(300), {
+            let n = node_a.clone();
+            async move { n.wait_applied(late_index).await }
+        });
+        assert_eq!(
+            applied,
+            Some(true),
+            "the late entry itself must still apply (as a no-op) (seed={seed}, ts={late_ts:?})"
+        );
+
+        // No resurrection: the anchor's own key was never written (no
+        // zombie intent), and the record is still exactly the Aborted
+        // tombstone from before — never flipped back to Pending.
+        let anchor_local = drive(&mut sim, node_a.env(), Duration::from_millis(300), {
+            let n = node_a.clone();
+            let k = ka.clone();
+            async move { n.local_get(&k).await }
+        })
+        .flatten();
+        assert_eq!(
+            anchor_local, None,
+            "the late anchor stage must not write the anchor's own key — the whole entry must \
+             no-op against the already-decided record (seed={seed})"
+        );
+        let status_after_late_stage = drive(&mut sim, node_a.env(), Duration::from_millis(300), {
+            let n = node_a.clone();
+            let rk = record_key.clone();
+            async move { n.txn_status_local(&rk).await }
+        })
+        .flatten();
+        assert_eq!(
+            status_after_late_stage,
+            Some(TxnDecisionStatus::Aborted),
+            "the record must still be Aborted — the late stage must never resurrect it to \
+             Pending (seed={seed})"
+        );
+
+        // "The coordinator's commit": a still-live coordinator, unaware of
+        // any of this, tries to commit — this must also no-op against the
+        // already-Aborted record (the decision-semantics fix), never panic.
+        let commit_ts = drive(&mut sim, node_a.env(), Duration::from_millis(300), {
+            let n = node_a.clone();
+            let txn_id = txn_id.clone();
+            let record_key = record_key.clone();
+            async move {
+                n.txn_commit_at_least(txn_id, record_key, txn_id_hint_floor())
+                    .await
+            }
+        })
+        .flatten();
+        assert!(
+            commit_ts.is_some(),
+            "the commit PROPOSAL itself still succeeds at the Raft level (seed={seed})"
+        );
+        let final_status = drive(&mut sim, node_a.env(), Duration::from_millis(300), {
+            let n = node_a.clone();
+            let rk = record_key.clone();
+            async move { n.txn_status_local(&rk).await }
+        })
+        .flatten();
+        assert_eq!(
+            final_status,
+            Some(TxnDecisionStatus::Aborted),
+            "the coordinator's late commit must lose to the already-applied abort (seed={seed})"
+        );
+
+        // Resolve everywhere per the final, actual decision — no zombie
+        // Pending intent survives.
+        drive(&mut sim, node_b.env(), Duration::from_millis(300), {
+            let n = node_b.clone();
+            let txn_id = txn_id.clone();
+            let record_key = record_key.clone();
+            let kb = kb.clone();
+            async move {
+                n.txn_resolve(txn_id, record_key, vec![kb], txn::TxnOutcome::Aborted)
+                    .await
+            }
+        });
+        let b_final = drive(&mut sim, node_b.env(), Duration::from_millis(300), {
+            let n = node_b.clone();
+            let kb = kb.clone();
+            async move { n.local_get(&kb).await }
+        })
+        .flatten();
+        assert_eq!(
+            b_final, None,
+            "the participant's key must revert to its pre-transaction (absent) value — no \
+             zombie Pending intent (seed={seed})"
+        );
+    }
+
+    /// A ts safely below the group's current floor is fine here — this
+    /// mirrors the coordinator's own candidate-ts computation
+    /// (`max(anchor stage ts, every participant's acked stage ts)`); the
+    /// point under test is the *decision* outcome (Aborted, no assert),
+    /// never the exact ts `txn_commit_at_least` would have used — see
+    /// `mint_at_least`'s own floor-enforcement doc for why a caller's
+    /// candidate is always safe to pass through unmodified.
+    fn txn_id_hint_floor() -> HlcTimestamp {
+        HlcTimestamp {
+            wall_ms: 1_000,
+            logical: 0,
         }
     }
 }

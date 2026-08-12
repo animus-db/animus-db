@@ -1071,6 +1071,77 @@ the caller-supplied cross-participant spans and merges them with the
 anchor's own. This is an internal wire/record-format change only (`codec.rs`
 `VERSION` bumped 8 → 9); no back-compat concern per house convention.
 
+### 2b. A gap the `intent_spans` review caught: orphan records and the resurrection guard
+
+Review of §2's fix surfaced an adjacent corner it did not by itself close:
+PR4's prepare phase stages every participant **concurrently**, so a
+participant's own `TxnStage` can succeed and be discovered by a reader
+while the *anchor's* own `TxnStage` — which is what would create the
+transaction's record at all — never lands. This is not hypothetical: it is
+PR4's own documented fence/seal-miss gap ("a participant's stage into an
+already-sealed range is a true no-op... the coordinator can't distinguish
+it from a genuine stage via the propose outcome alone"), now recognized to
+apply symmetrically to the **anchor's** own stage — `wait_applied` only
+confirms the entry *applied*, never that its whole-or-nothing content
+check actually succeeded, so a coordinator can believe `txn_stage_anchor`
+succeeded (and go on to stage participants for real) even though no record
+was ever created.
+
+Two consequences, both closed this pass:
+
+1. **A pusher's `TxnStatus`/`TxnRecordView` query can find no record at
+   all.** There is no `created_ts` to grace-gate against in that case.
+   `IntentInfo` gained a `version: HlcTimestamp` field (the orphaned
+   intent's own applied timestamp, unpacked from its engine version — the
+   only trustworthy substitute clock a pusher still holds) and
+   `ClientCtx::txn_recover` gained an `intent_ts_hint: Option<HlcTimestamp>`
+   parameter threaded from it. Past grace on that substitute, the pusher
+   **synthesizes** a fresh `TxnRecord` directly in the `Aborted` state (a
+   CRDB-style "abort tombstone") via a new primitive,
+   `RaftKvNode::txn_abort_orphan` (`KvCommand::TxnAbort` gained an
+   `orphan_created_ts: Option<HlcTimestamp>` field — `Some` means
+   "synthesize if absent" instead of the ordinary "missing record is a
+   fence-miss no-op"). **An absent record can only ever decide abort,
+   never commit** — committing requires positively verifying every
+   participant staged, which requires a candidate participant list the
+   record alone would have provided; with no record, there is nothing to
+   verify against, so aborting is the only sound decision (mirroring §3's
+   safety argument: a recovery abort is always a legitimate outcome, never
+   data loss, since nothing had committed yet).
+2. **A late-arriving genuine anchor `TxnStage` for that same `txn_id` is a
+   resurrection hazard.** Without a guard, it would unconditionally
+   overwrite the tombstone back to `Pending` (and re-stage the anchor's own
+   intents, which nothing would ever now resolve, since the record's own
+   `intent_spans` — fixed at whichever creation happened first — likely
+   doesn't name them). `apply_and_compact`'s `TxnStage` arm now checks,
+   before merging anything, whether a **decided** record for this exact
+   `txn_id` already exists at `record_key` (only meaningful for
+   `is_anchor: true` — a non-anchor participant's own tablet never holds
+   the record to check against, which is fine: that side's stale intents
+   are still resolved on demand the moment any reader hits them, §4,
+   unaffected by whether the anchor's own tablet resurrected anything) —
+   if so, the **whole entry no-ops** (logged, `tracing::warn!`), exactly
+   the same "first decision wins" principle §1 already established for
+   duelling deciders, now extended to record **creation** itself, not just
+   flips of an existing one.
+
+Regression: `animus-cp-data/src/lib.rs`'s in-crate
+`pr5_orphan_and_resurrection_tests` module (not the external
+`tests/txn_recovery.rs` — reproducing "a late `TxnStage` for an
+**already-known** `txn_id`" needs `pub(crate)` access:
+`txn::record_key`, a direct `KvCommand::TxnStage` construction, and the
+private `propose_ordered_aux`/`mint_pushed` primitives, since the public
+`RaftKvNode::txn_stage_anchor` always mints a *fresh* `TxnId` and so cannot
+express "the identical transaction arrives late" at all). The one test
+drives the full scenario: a participant stages against a hand-built
+txn_id/record_key with no anchor record ever created; a pusher creates the
+orphan-abort tombstone; the genuine (late) anchor `TxnStage` for that exact
+identity no-ops against it (confirmed directly — the anchor's own key is
+never written); a still-live coordinator's own commit attempt also no-ops
+(via §1's existing mechanism) and the record stays `Aborted`; and resolving
+everywhere leaves no zombie `Pending` intent anywhere. No assert fires at
+any step.
+
 ### 3. The recovery protocol: "push"
 
 Any actor holding a foreign-or-local `Pending` intent past
@@ -1131,6 +1202,17 @@ a network round trip available to it): a still-`Pending` — or failed —
 immediately reporting "retry." `txn_recover`'s own grace check means this
 never disturbs an ordinary in-flight transaction; it only shortens the
 window in which a stale one is visible as "pending, retry."
+
+`txn_recover` is also where §2b's record-absent branch actually executes:
+`cp_get_local_resolving` already carries the foreign intent's own applied
+version (`IntentInfo::version`) from the `Foreign` read outcome, so it can
+hand `txn_recover` an `intent_ts_hint` unconditionally — the ordinary
+record-exists path ignores it entirely, and only the record-absent branch
+consults it as the grace-check substitute for a `created_ts` that was never
+written. The reader then resolves its **own** key directly against
+whatever status comes back, never through the (possibly empty)
+`intent_spans` of a freshly-synthesized tombstone — see §2b's safety
+argument for why an orphan tombstone can't know about any participant.
 
 **Deliberately not lifted for the locally-`Pending` case** (the
 single-participant/anchor read path, `RaftKvNode`'s own bounded
@@ -1216,11 +1298,13 @@ on an error return, so the extra safety margin there costs nothing.
 ### 7. What ships with PR5, what's still deferred
 
 Landing: the decision-semantics fix (§1); the `intent_spans` structural fix
-(§2); the full recovery push protocol + two new internal wire requests,
-`TxnRecordView`/`TxnVerify` (§3); the foreign-intent read-path push (§4);
-the per-group `TxnTracker` + rebuild-at-start + `txn_resolver_loop` (§5);
-async post-ack resolve on the commit path (§6); three new metrics
-(`CpTxnRecoveredCommitted`/`CpTxnRecoveredAborted`/`CpTxnResolverRuns`).
+(§2) and the adjacent orphan-record/resurrection-guard fix it surfaced on
+review (§2b); the full recovery push protocol + two new internal wire
+requests, `TxnRecordView`/`TxnVerify` (§3); the foreign-intent read-path
+push (§4); the per-group `TxnTracker` + rebuild-at-start +
+`txn_resolver_loop` (§5); async post-ack resolve on the commit path (§6);
+three new metrics (`CpTxnRecoveredCommitted`/`CpTxnRecoveredAborted`/
+`CpTxnResolverRuns`).
 
 Deferred: `/admin/txns` observability (PR7, unchanged from the PR4
 amendment's own note); record/intent GC (accepted future cost, §5); push
@@ -1238,10 +1322,26 @@ coordinator commit with no assert (driving both proposals explicitly,
 confirming the actual status is the abort); two duelling recoverers'
 conflicting proposals converging on one identical status with no assert
 (zero intervening sim time, mirroring `cross_group_lww.rs`'s in-flight-race
-technique); a push declining before grace elapses; `pending_txns`
-surviving a genuine process restart via the rebuild scan (a single-voter
-group, mirroring `witnessing.rs`'s own restart idiom); and a five-seed
-reproducibility sweep of the headline recovery-commit shape.
+technique); a push declining before grace elapses; an orphan intent with no
+record anywhere (§2b) — the anchor's own range sealed first so its stage
+silently no-ops, leaving a real, minted `(txn_id, record_key)` with no
+record ever written on the anchor and a genuine participant intent
+referencing it — decided abort past grace via `txn_abort_orphan`, the
+synthesized tombstone confirmed to carry empty `intent_spans` (proving
+`push`'s own `recovery_resolve` pass over it is correctly a no-op), and the
+triggering intent resolved away by the caller directly, restoring its
+pre-transaction committed value; `pending_txns` surviving a genuine process
+restart via the rebuild scan (a single-voter group, mirroring
+`witnessing.rs`'s own restart idiom); and a five-seed reproducibility sweep
+of the headline recovery-commit shape.
+
+`animus-cp-data/src/lib.rs`'s in-crate `pr5_orphan_and_resurrection_tests`
+module (§2b): the orphan-abort-then-late-anchor-stage-then-late-coordinator-
+commit regression, requiring `pub(crate)` access (`txn::record_key`, a
+direct `KvCommand::TxnStage` construction, `propose_ordered_aux`/
+`mint_pushed`) an external integration test cannot reach, since the public
+`txn_stage_anchor` always mints a fresh `TxnId` and so cannot express "the
+identical, already-referenced transaction arrives late."
 
 `animusd/tests/cp_txn.rs` (`ProdEnv`, real 3-process cluster + a genuine
 pre-split table): a coordinator crash between prepare and decide — driven

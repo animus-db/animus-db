@@ -20,6 +20,7 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use animus_control::ProposeResult;
 use animus_cp_data::hlc::HlcTimestamp;
 use animus_cp_data::{RaftKvNode, StorageScope, TxnDecisionStatus, TxnId, TxnOutcome};
 use animus_env::{Clock, EnvExt, nid};
@@ -163,6 +164,20 @@ fn abort_only(
     .flatten()
 }
 
+fn abort_orphan(
+    sim: &mut Simulator,
+    node: &KvNode,
+    txn_id: TxnId,
+    record_key: Vec<u8>,
+    created_ts: HlcTimestamp,
+) -> Option<HlcTimestamp> {
+    let n = node.clone();
+    drive(sim, node.env(), SETTLE, async move {
+        n.txn_abort_orphan(txn_id, record_key, created_ts).await
+    })
+    .flatten()
+}
+
 fn resolve(
     sim: &mut Simulator,
     node: &KvNode,
@@ -248,16 +263,55 @@ fn recovery_resolve(
 
 /// The test mirror of `ClientCtx::txn_recover` — the full push protocol,
 /// steps (a)-(e) of the ADR's PR5 amendment, driven over raw handles.
-/// `lookup(table)` stands in for `cp_route`. Returns the record's actual,
-/// final status.
+/// `lookup(table)` stands in for `cp_route`. `intent_ts_hint` is only
+/// consulted when the record is absent entirely (ADR 0018 §2/PR5's
+/// orphan-record fix, §2b) — the triggering intent's own applied ts,
+/// substituting for the `created_ts` a genuine record would have carried;
+/// pass `None` when the caller knows a record exists (every ordinary push).
+/// Returns the record's actual, final status.
 fn push(
     sim: &mut Simulator,
     anchor: &KvNode,
     record_key: Vec<u8>,
     txn_id: TxnId,
+    intent_ts_hint: Option<HlcTimestamp>,
     lookup: &dyn Fn(&str) -> KvNode,
 ) -> TxnDecisionStatus {
-    let view = record_view(sim, anchor, record_key.clone()).expect("record exists");
+    let view = match record_view(sim, anchor, record_key.clone()) {
+        Some(v) => v,
+        None => {
+            // Record-absent path: there is no `created_ts` to grace-check
+            // against, so the intent's own applied ts stands in (mirrors
+            // `ClientCtx::txn_recover`'s identical branch).
+            let hint = intent_ts_hint.expect(
+                "a record-absent push must be given the triggering intent's own ts as a grace hint",
+            );
+            let now_ms = anchor.env().now().0 / 1_000_000;
+            if now_ms < hint.wall_ms + animus_cp_data::RECOVERY_GRACE.as_millis() as u64 {
+                return TxnDecisionStatus::Pending;
+            }
+            abort_orphan(sim, anchor, txn_id.clone(), record_key.clone(), hint)
+                .expect("orphan-abort proposal accepted");
+            let final_view = record_view(sim, anchor, record_key.clone())
+                .expect("txn_abort_orphan must have created the tombstone record");
+            // A freshly-synthesized tombstone knows nothing of any
+            // participant (an absent record never had a chance to record
+            // `intent_spans`) — `recovery_resolve` is a no-op here by
+            // construction. Resolving the intent that actually triggered
+            // this push is the caller's job (mirroring a real reader:
+            // `cp_get_local_resolving` resolves its OWN key directly with
+            // the returned status, never via the record's `intent_spans`).
+            recovery_resolve(
+                sim,
+                record_key,
+                txn_id,
+                &final_view.intent_spans,
+                &final_view.status,
+                lookup,
+            );
+            return final_view.status;
+        }
+    };
     if !matches!(view.status, TxnDecisionStatus::Pending) {
         recovery_resolve(
             sim,
@@ -359,7 +413,7 @@ fn push_commits_when_every_participant_staged_and_grace_elapsed() {
             other => panic!("unexpected table {other}"),
         }
     };
-    let status = push(&mut sim, &nodes_a[la], record_key, txn_id, &lookup);
+    let status = push(&mut sim, &nodes_a[la], record_key, txn_id, None, &lookup);
     assert!(
         matches!(status, TxnDecisionStatus::Committed { .. }),
         "expected a recovery commit (seed={seed}), got {status:?}"
@@ -424,7 +478,7 @@ fn push_aborts_when_a_participant_never_staged() {
             other => panic!("unexpected table {other}"),
         }
     };
-    let status = push(&mut sim, &nodes_a[la], record_key, txn_id, &lookup);
+    let status = push(&mut sim, &nodes_a[la], record_key, txn_id, None, &lookup);
     assert_eq!(
         status,
         TxnDecisionStatus::Aborted,
@@ -624,7 +678,14 @@ fn push_declines_before_grace_elapses() {
             other => panic!("unexpected table {other}"),
         }
     };
-    let status = push(&mut sim, &nodes_a[la], record_key.clone(), txn_id, &lookup);
+    let status = push(
+        &mut sim,
+        &nodes_a[la],
+        record_key.clone(),
+        txn_id,
+        None,
+        &lookup,
+    );
     assert_eq!(
         status,
         TxnDecisionStatus::Pending,
@@ -633,6 +694,146 @@ fn push_declines_before_grace_elapses() {
     // Still genuinely Pending on the anchor — nothing was proposed.
     let status = status_local(&mut sim, &nodes_a[la], record_key).expect("record exists");
     assert_eq!(status, TxnDecisionStatus::Pending);
+}
+
+/// **Orphan record — no record exists anywhere** (ADR 0018 §2/PR5's
+/// follow-up fix, §2b): PR4's prepare phase stages every participant
+/// concurrently, so a participant's own stage can genuinely land while the
+/// *anchor's* own `TxnStage` — which would create the record — never
+/// actually writes it (here: the anchor's whole range is sealed first, so
+/// its stage entry applies as a whole-or-nothing no-op; `wait_applied` only
+/// confirms the ENTRY applied, never that its content check succeeded, the
+/// same gap `txn_multi.rs` already documents for a *participant's* stage,
+/// now recognized to apply to the anchor's own stage too). A pusher's
+/// `txn_record_view` therefore finds NOTHING. Past grace (measured off the
+/// triggering intent's own applied ts, since there's no record `created_ts`
+/// to read), the pusher must still decide — abort, by CREATING the record in
+/// the `Aborted` state directly (`txn_abort_orphan`) — and the caller then
+/// resolves the intent that triggered it away, restoring its prior value.
+#[test]
+fn push_aborts_an_orphan_intent_with_no_record_anywhere() {
+    let seed = 0x9A08;
+    let mut sim = Simulator::new(seed);
+    let engine = MemoryEngine::new();
+    let nodes_a = start_group(&sim, &GROUP_A, engine.clone(), b"orders:");
+    let nodes_b = start_group(&sim, &GROUP_B, engine.clone(), b"accounts:");
+    sim.run_for(ELECT);
+
+    let la = leader(&nodes_a, seed, "A");
+    let lb = leader(&nodes_b, seed, "B");
+    let ka = key(1, b":order");
+    let kb = key(2, b":balance");
+    let mut end_b = kb.clone();
+    end_b.push(0);
+    let span_b = KeyRange::new(kb.clone(), Some(end_b));
+
+    // `kb` already holds a committed value before the transaction ever
+    // starts, so recovery's restore-to-prior-value behavior has something
+    // real to prove.
+    let seeded = nodes_b[lb].put(kb.clone(), b"prior".to_vec());
+    assert!(matches!(seeded, ProposeResult::Accepted { .. }));
+    sim.run_for(ELECT);
+    assert_eq!(
+        block_on(nodes_b[lb].local_get(&kb)),
+        Some(b"prior".to_vec())
+    );
+
+    // Seal the anchor's whole range FIRST — its own stage entry (the one
+    // that would normally create the record) silently no-ops against it at
+    // apply, a whole-or-nothing fence/seal miss (`txn_single.rs`'s
+    // already-sealed-range shape).
+    let sealed = nodes_a[la].propose_seal(nodes_a[la].scope_range());
+    assert!(matches!(sealed, ProposeResult::Accepted { .. }));
+    sim.run_for(ELECT);
+
+    let (txn_id, record_key) = stage_anchor(
+        &mut sim,
+        &nodes_a[la],
+        "orders",
+        vec![(ka.clone(), Some(b"placed".to_vec()))],
+        vec![("accounts".to_string(), span_b)],
+    )
+    .expect("the propose itself still applies — it's the content that no-ops");
+
+    assert!(
+        record_view(&mut sim, &nodes_a[la], record_key.clone()).is_none(),
+        "the anchor's own stage must have no-op'd against the seal, leaving no record \
+         at all (seed={seed})"
+    );
+
+    // The participant's own stage is NOT sealed, and lands genuinely — the
+    // parallel-prepare gap: an intent now exists with no record anywhere to
+    // check it against.
+    stage_participant(
+        &mut sim,
+        &nodes_b[lb],
+        txn_id.clone(),
+        record_key.clone(),
+        "orders".to_string(),
+        vec![(kb.clone(), Some(b"debited".to_vec()))],
+    )
+    .expect("participant stage");
+    assert_eq!(
+        block_on(nodes_b[lb].local_get(&kb)),
+        None,
+        "the intent hides the prior value until resolved (seed={seed})"
+    );
+
+    sim.run_for(PAST_GRACE);
+
+    let lookup = |table: &str| -> KvNode {
+        match table {
+            "orders" => nodes_a[la].clone(),
+            "accounts" => nodes_b[lb].clone(),
+            other => panic!("unexpected table {other}"),
+        }
+    };
+    let status = push(
+        &mut sim,
+        &nodes_a[la],
+        record_key.clone(),
+        txn_id.clone(),
+        Some(txn_id.ts),
+        &lookup,
+    );
+    assert_eq!(
+        status,
+        TxnDecisionStatus::Aborted,
+        "an orphan intent with no record anywhere can only ever be decided abort \
+         (seed={seed})"
+    );
+
+    // The tombstone `txn_abort_orphan` created is genuinely Aborted, and
+    // still knows nothing of any participant — proving `push`'s own
+    // `recovery_resolve` pass over it was a no-op, not a silent skip of a
+    // real span.
+    let tombstone = record_view(&mut sim, &nodes_a[la], record_key.clone())
+        .expect("the orphan-abort tombstone must exist");
+    assert_eq!(tombstone.status, TxnDecisionStatus::Aborted);
+    assert!(tombstone.intent_spans.is_empty());
+
+    // The reader that actually hit the foreign intent resolves it directly
+    // against the decided status — exactly what `cp_get_local_resolving`
+    // does with `txn_recover`'s return value, never via the tombstone's own
+    // (empty) `intent_spans`.
+    resolve(
+        &mut sim,
+        &nodes_b[lb],
+        txn_id,
+        record_key,
+        vec![kb.clone()],
+        TxnOutcome::Aborted,
+    );
+    sim.run_for(SETTLE);
+    assert_eq!(
+        block_on(nodes_b[lb].local_get(&kb)),
+        Some(b"prior".to_vec()),
+        "kb must revert to its pre-transaction committed value, never a tombstone or \
+         the staged one (seed={seed})"
+    );
+    // The anchor's own key never existed to begin with (the seal blocked
+    // it) — confirm recovery didn't fabricate it.
+    assert_eq!(block_on(nodes_a[la].local_get(&ka)), None);
 }
 
 /// (f) **Resolver-tracking survives a restart**: `pending_txns` reflects a
@@ -774,7 +975,7 @@ fn recovery_commit_is_reproducible_across_seeds() {
                 other => panic!("unexpected table {other}"),
             }
         };
-        let status = push(&mut sim, &nodes_a[la], record_key, txn_id, &lookup);
+        let status = push(&mut sim, &nodes_a[la], record_key, txn_id, None, &lookup);
         assert!(
             matches!(status, TxnDecisionStatus::Committed { .. }),
             "expected a recovery commit (seed={seed}), got {status:?}"

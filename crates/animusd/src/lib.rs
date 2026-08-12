@@ -568,6 +568,20 @@ impl CpGroup {
         }
     }
 
+    /// **Abort an orphan intent with no record at all** (a fresh `Aborted`
+    /// tombstone). See [`RaftKvNode::txn_abort_orphan`].
+    async fn txn_abort_orphan(
+        &self,
+        txn_id: TxnId,
+        record_key: Vec<u8>,
+        created_ts: HlcTimestamp,
+    ) -> Option<HlcTimestamp> {
+        match self {
+            CpGroup::Lsm(n) => n.txn_abort_orphan(txn_id, record_key, created_ts).await,
+            CpGroup::Mem(n) => n.txn_abort_orphan(txn_id, record_key, created_ts).await,
+        }
+    }
+
     /// **Recovery view of a record** (status + intent_spans + created_ts).
     /// See [`RaftKvNode::txn_record_view`].
     async fn txn_record_view(&self, record_key: &[u8]) -> Option<animus_cp_data::TxnRecordView> {
@@ -856,12 +870,21 @@ pub enum ClientRequest {
     /// `ClientCtx::txn_decide_anchor`, the one caller, for the full
     /// rationale (including why the reply now carries the record's
     /// **actual** decided outcome, not just a proposed ts).
+    ///
+    /// **`orphan_created_ts` (ADR 0018 §2/PR5's orphan-record fix)**:
+    /// `Some(created_ts)` means "no record exists at all — synthesize an
+    /// `Aborted` tombstone directly" (`RaftKvNode::txn_abort_orphan`),
+    /// overriding `commit`/`min_commit_ts` entirely (an orphan can only
+    /// ever be aborted — see `ClientCtx::txn_recover`'s doc for why). `None`
+    /// is the ordinary commit/abort-of-an-existing-record case, unchanged.
     TxnDecide {
         table: String,
         txn_id: TxnId,
         record_key: Vec<u8>,
         commit: bool,
         min_commit_ts: HlcTimestamp,
+        #[serde(default)]
+        orphan_created_ts: Option<HlcTimestamp>,
     },
     /// **Internal 2PC coordinator RPC — every participant including the
     /// anchor, never sent bare** (ADR 0018 §2/PR4): resolve `keys` on
@@ -3410,7 +3433,12 @@ impl ClientCtx {
                         // `Pending`) if grace hasn't elapsed yet, so this is
                         // never premature.
                         match self
-                            .txn_recover(&info.record_table, &info.record_key, &info.txn_id)
+                            .txn_recover(
+                                &info.record_table,
+                                &info.record_key,
+                                &info.txn_id,
+                                Some(info.version),
+                            )
                             .await
                         {
                             Ok(s) => s,
@@ -3931,6 +3959,13 @@ impl ClientCtx {
     /// sole arbiter — see `apply_and_compact`'s `TxnCommit`/`TxnAbort`
     /// arms). The caller MUST act on the returned outcome, never assume the
     /// decision it asked for is the one that happened.
+    ///
+    /// `orphan_created_ts: Some(created_ts)` (ADR 0018 §2/PR5's
+    /// orphan-record fix) overrides `commit`/`min_commit_ts` entirely: this
+    /// call is a recovery pusher that found **no record at all** for
+    /// `txn_id` (see [`txn_recover`](Self::txn_recover)'s doc) and must
+    /// synthesize an `Aborted` tombstone (`RaftKvNode::txn_abort_orphan`)
+    /// rather than proposing against a record that doesn't exist.
     async fn txn_decide_anchor(
         &self,
         table: &str,
@@ -3938,10 +3973,16 @@ impl ClientCtx {
         record_key: Vec<u8>,
         commit: bool,
         min_commit_ts: HlcTimestamp,
+        orphan_created_ts: Option<HlcTimestamp>,
     ) -> Result<TxnOutcome, String> {
         match self.cp_route(table, &record_key).await {
             CpRoute::Local(leader) => {
-                if commit {
+                if let Some(created_ts) = orphan_created_ts {
+                    leader
+                        .txn_abort_orphan(txn_id.clone(), record_key.clone(), created_ts)
+                        .await
+                        .ok_or("CP group leader moved during orphan abort; retry")?;
+                } else if commit {
                     leader
                         .txn_commit_at_least(txn_id.clone(), record_key.clone(), min_commit_ts)
                         .await
@@ -3972,6 +4013,7 @@ impl ClientCtx {
                     record_key: record_key.clone(),
                     commit,
                     min_commit_ts,
+                    orphan_created_ts,
                 };
                 match self.cp_forward(table, &record_key, addr, request).await {
                     ClientResponse::TxnDecided { outcome } => Ok(outcome),
@@ -4193,19 +4235,41 @@ impl ClientCtx {
     /// 1. Read the record ([`txn_record_view`](Self::txn_record_view)). If
     ///    already decided, resolve every participant and return the
     ///    decision — no need to re-decide.
-    /// 2. If `Pending` and not yet past grace, decline (`Pending`) — a live
+    /// 2. **If no record exists at all** (ADR 0018 §2/PR5's orphan-record
+    ///    fix — a real, already-acknowledged possibility: PR4's prepare
+    ///    phase is concurrent, so a participant's own stage can succeed and
+    ///    be discovered by a reader while the *anchor's* `TxnStage` — which
+    ///    would create this transaction's record — never lands at all,
+    ///    e.g. a fence/seal miss the coordinator's propose outcome alone
+    ///    can't distinguish from a genuine stage, PR4's own documented gap,
+    ///    now applying to the anchor's own stage too): there is no
+    ///    `created_ts` to grace-gate against. `intent_ts_hint` (typically
+    ///    the orphaned intent's own applied timestamp,
+    ///    [`animus_cp_data::IntentInfo::version`]) is the pusher's only
+    ///    trustworthy substitute; with none supplied, decline
+    ///    conservatively (never wrongly abort something we can't even
+    ///    time-bound). Past grace on that substitute, this can ONLY ever
+    ///    decide **abort** — an absent record means there is no candidate
+    ///    participant list to verify "all staged" against, so committing
+    ///    would be unsound; aborting is always safe (see
+    ///    [`RaftKvNode::txn_abort_orphan`]'s doc). The synthesized
+    ///    tombstone also closes a related hazard: a **late-arriving**
+    ///    genuine anchor `TxnStage` for this same `txn_id` finds it and
+    ///    no-ops instead of resurrecting a `Pending` record
+    ///    (`KvCommand::TxnStage`'s own resurrection guard).
+    /// 3. If `Pending` and not yet past grace, decline (`Pending`) — a live
     ///    coordinator may still be working on it.
-    /// 3. If `Pending` and stale: verify every `(table, span)` in
+    /// 4. If `Pending` and stale: verify every `(table, span)` in
     ///    `intent_spans` ([`txn_verify`](Self::txn_verify)). All staged →
     ///    propose `TxnCommit`; any missing (or any verify query itself
     ///    failing — conservatively treated as "not confirmed staged") →
     ///    propose `TxnAbort`.
-    /// 4. Either proposal may **lose** to a concurrent decision (a
+    /// 5. Either proposal may **lose** to a concurrent decision (a
     ///    still-live coordinator, or a duelling recoverer) — re-read the
     ///    record's actual status and act on THAT, never on what was
     ///    proposed (see `txn_decide_anchor`'s doc for the identical
     ///    argument on the coordinator side).
-    /// 5. Resolve every participant per the final, actual decision.
+    /// 6. Resolve every participant per the final, actual decision.
     ///
     /// **Grace is liveness-only**: whether this call even attempts step 3
     /// affects only *when* a decision might be pushed, never *what* it
@@ -4221,8 +4285,59 @@ impl ClientCtx {
         record_table: &str,
         record_key: &[u8],
         txn_id: &TxnId,
+        intent_ts_hint: Option<HlcTimestamp>,
     ) -> Result<TxnDecisionStatus, String> {
-        let view = self.txn_record_view(record_table, record_key).await?;
+        let view = match self.txn_record_view(record_table, record_key).await {
+            Ok(view) => view,
+            Err(_) => {
+                // Step 1b: no record at all. Without a substitute clock we
+                // cannot tell "genuinely stale" from "the anchor's stage is
+                // simply still in flight" — decline rather than guess.
+                let Some(hint_ts) = intent_ts_hint else {
+                    return Ok(TxnDecisionStatus::Pending);
+                };
+                let now_ms = match self.cp_route(record_table, record_key).await {
+                    CpRoute::Local(leader) => leader.env().now().0 / 1_000_000,
+                    _ => tokio::time::Instant::now().elapsed().as_millis() as u64,
+                };
+                if now_ms < hint_ts.wall_ms + animus_cp_data::RECOVERY_GRACE.as_millis() as u64 {
+                    return Ok(TxnDecisionStatus::Pending);
+                }
+                // Always an abort — see this method's own doc for why an
+                // absent record can never safely commit.
+                let proposed = self
+                    .txn_decide_anchor(
+                        record_table,
+                        txn_id.clone(),
+                        record_key.to_vec(),
+                        false,
+                        HlcTimestamp::zero(),
+                        Some(hint_ts),
+                    )
+                    .await?;
+                let decided_status = outcome_to_status(&proposed);
+                // Re-read for whatever `intent_spans` now exist (typically
+                // empty for a fresh tombstone — this pusher only ever knew
+                // about the one intent that triggered it, not the whole
+                // transaction's participant set, since no record existed
+                // to learn that from). A failure here is harmless: the
+                // caller that triggered this push (e.g.
+                // `cp_get_local_resolving`) still finishes its own read
+                // off the returned status regardless of whether this
+                // fan-out resolve runs.
+                if let Ok(final_view) = self.txn_record_view(record_table, record_key).await {
+                    self.recovery_resolve(
+                        txn_id.clone(),
+                        record_key.to_vec(),
+                        &final_view.intent_spans,
+                        &decided_status,
+                    )
+                    .await;
+                }
+                self.record_recovery_metric(&proposed);
+                return Ok(decided_status);
+            }
+        };
         if !matches!(view.status, TxnDecisionStatus::Pending) {
             self.recovery_resolve(
                 txn_id.clone(),
@@ -4268,6 +4383,7 @@ impl ClientCtx {
                 record_key.to_vec(),
                 all_staged,
                 candidate,
+                None,
             )
             .await?;
 
@@ -4280,8 +4396,17 @@ impl ClientCtx {
         )
         .await;
 
+        self.record_recovery_metric(&proposed);
+        Ok(decided_status)
+    }
+
+    /// Records the `CpTxnRecoveredCommitted`/`CpTxnRecoveredAborted` metric
+    /// for a just-completed recovery decision — shared by both
+    /// [`txn_recover`](Self::txn_recover) branches (the ordinary decided-
+    /// record path and the orphan-record path).
+    fn record_recovery_metric(&self, proposed: &TxnOutcome) {
         if let Some(data) = self.data.as_ref() {
-            match &proposed {
+            match proposed {
                 TxnOutcome::Committed { .. } => {
                     data.raftkv_metrics.incr(Metric::CpTxnRecoveredCommitted);
                 }
@@ -4290,8 +4415,6 @@ impl ClientCtx {
                 }
             }
         }
-
-        Ok(decided_status)
     }
 
     /// **Multi-participant transaction** (ADR 0018 §2/PR4): atomically write
@@ -4495,6 +4618,7 @@ impl ClientCtx {
                     record_key.clone(),
                     false,
                     candidate,
+                    None,
                 )
                 .await
             {
@@ -4522,6 +4646,7 @@ impl ClientCtx {
                     record_key.clone(),
                     false,
                     candidate,
+                    None,
                 )
                 .await
             {
@@ -4550,6 +4675,7 @@ impl ClientCtx {
                     record_key.clone(),
                     true,
                     candidate,
+                    None,
                 )
                 .await?
             {
@@ -5326,6 +5452,7 @@ impl ClientCtx {
                 record_key,
                 commit,
                 min_commit_ts,
+                orphan_created_ts,
             } => {
                 let tablet = self.tablet_for(&table, &record_key);
                 let Some(leader) = tablet.and_then(|t| self.edge.cp_leader(t)) else {
@@ -5337,7 +5464,15 @@ impl ClientCtx {
                 // which may differ from what was proposed (a duelling
                 // recovery decision may have already won). See
                 // `ClientCtx::txn_decide_anchor`'s doc for the full account.
-                let decide_ok = if commit {
+                // `orphan_created_ts` overrides `commit`/`min_commit_ts`
+                // entirely — a recovery pusher that found no record at all
+                // (the orphan-record fix).
+                let decide_ok = if let Some(created_ts) = orphan_created_ts {
+                    leader
+                        .txn_abort_orphan(txn_id.clone(), record_key.clone(), created_ts)
+                        .await
+                        .is_some()
+                } else if commit {
                     leader
                         .txn_commit_at_least(txn_id.clone(), record_key.clone(), min_commit_ts)
                         .await
@@ -6715,7 +6850,11 @@ async fn txn_resolver_loop(ctx: ClientCtx) {
             };
 
             for (txn_id, (record_key, _created_ts)) in group.pending_txns() {
-                if let Err(e) = ctx.txn_recover(&table, &record_key, &txn_id).await {
+                // No intent hint needed/available here — `pending_txns` only
+                // ever tracks a genuine, locally-anchored `Pending` record
+                // (never an orphan), so `txn_recover`'s record-absent branch
+                // is unreachable from this caller by construction.
+                if let Err(e) = ctx.txn_recover(&table, &record_key, &txn_id, None).await {
                     tracing::debug!(
                         tablet = tablet.0,
                         ?txn_id,
