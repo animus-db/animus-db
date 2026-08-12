@@ -100,6 +100,22 @@ Three modules:
   after the `ReadCeiling` log entry itself has been compacted away. See
   the Key invariants entry below for the full mechanism and its safety
   argument.
+- **`txn.rs`** (ADR 0018 §2/PR3) — the **single-participant transaction**
+  machinery: the 1-byte-tagged value **envelope** (`Envelope::Committed`/
+  `Intent`) every apply-path write now wraps its value in, and the
+  transaction **record** (`TxnId`, `TxnStatus`, `TxnRecord`) that is the
+  atomic commit point. Unlike `seal.rs`/`ceiling.rs`'s engine-global
+  markers, a txn record has to be an ordinary **in-scope logical key** of
+  the anchor tablet (so it replicates/snapshots/splits like real data);
+  `record_key` derives it from the anchor write's own 8-byte partition
+  token plus a lead-byte pair (`[0x00, 0x02]`) proved disjoint from every
+  real key sharing that token via a structural argument about
+  `animus_tablet::escape`'s own encoding (never `escape(pk)`'s first two
+  bytes, for any `pk`) — see the module's own doc for the full proof
+  (and `docs/engineering-lessons.md`'s Code-patterns entry for the
+  general technique). `is_record_key` is what `lib.rs`'s scan paths and
+  `has_data` filter on. See the Key invariants entry below and ADR 0018's
+  PR3 amendment for the full design.
 
 ### lib.rs API
 
@@ -146,7 +162,21 @@ Three modules:
   "only if absent"); `cas_result(index) -> Option<bool>` reads the outcome
   recorded at the `Accepted { index }`; `compare_and_swap` is the all-in-one
   (propose on leader, wait for apply, return the outcome — `None` if not
-  leader / times out). All additive; existing signatures unchanged.
+  leader / times out). All additive; existing signatures unchanged. **Since
+  PR3**: a current value covered by a `Pending`/unresolved intent
+  deterministically fails the swap (never guesses a match or an absence) —
+  see the Key invariants entry below.
+- **Single-participant transactions — `txn_stage`/`txn_decide`/`txn_write`**
+  (ADR 0018 §2/PR3) — the degenerate single-Raft-group 2PC. `txn_stage(writes)
+  -> Option<(TxnId, Vec<u8>)>` proposes `KvCommand::TxnStage` (the first
+  write's key is the *anchor*, whose partition token anchors the record —
+  see `txn.rs`) and returns the minted `TxnId` + record key once applied.
+  `txn_decide(txn_id, record_key, keys, commit) -> Option<HlcTimestamp>`
+  commits or aborts, then resolves every key in `keys` — three log entries,
+  fully synchronous (PR4 collapses/parallelizes this across multiple
+  participant groups). `txn_write(writes) -> Option<HlcTimestamp>` is the
+  one-shot commit-only convenience (`txn_stage` + `txn_decide(.., commit:
+  true)`). All leader-only (`None` if not leader / a phase times out).
 - **Admin/debug accessors** (ADR 0020, consumed by `animusd`) — read-only
   `role`/`term`/`commit_index`/`last_applied`/`durable_index`/
   `snapshot_index`/`log_len` (thin locks over `RaftCore`), and `storage()` (a
@@ -167,10 +197,12 @@ Three modules:
   latest: every write with commit `ts' ≤ ts` already committed *and
   applied* before the barrier confirmed, **not** one still in flight — the
   single-tablet snapshot-read building block a cross-tablet transaction's
-  read will sit on (PR3+), not a transaction's read itself. Refuses (outer
+  read will sit on (PR4+), not a transaction's read itself. Refuses (outer
   `None`, same `Option<Option<_>>` shape as `linearizable_get_served`) a
   `ts` not yet strictly below `committed_ceiling()` — see the write-push/
-  ceiling invariant below.
+  ceiling invariant below. **Since PR3**: a stored value may itself be an
+  intent, resolved against `ts` per the Key invariants entry below
+  (`RaftKvNode::read_resolved`) before this method ever returns.
 - **`committed_ceiling()`** (ADR 0018 §2/PR2b, admin/debug accessor
   alongside `term`/`commit_index`/etc.) — this group's highest *applied*
   `KvCommand::ReadCeiling`, the floor `read_at`/`scan_at` check against and
@@ -319,6 +351,64 @@ State once here; cross-referenced from the sections below.
   racing from the same `expected` have exactly one winner (whichever Raft
   ordered first). Outcome is stashed in driver `CasResults` keyed by the log
   index (a `BTreeMap<u64,bool>`).
+- **The value envelope + single-participant transactions (ADR 0018 §2/PR3,
+  `txn.rs`).** Every value the apply path merges into the engine
+  (`Put`/`Batch`/`Cas`, and a `TxnResolve`'s final rewrite) is 1-byte-tagged:
+  `0` = committed (the rest is the raw value), `1` = an intent naming the
+  staging `TxnId`, its record's logical key, and the staged value (`None` =
+  a staged delete). Every read path unwraps it before a value reaches a
+  caller: `local_get`/`linearizable_get`/`_served`/`read_at` resolve via
+  `RaftKvNode::read_resolved` (a bounded retry while the covering
+  transaction is `Pending` — `INTENT_WAIT_TIMEOUT`/`_POLL` — full push/wait
+  scheduling is PR4); `local_scan`/`scan_at`/`linearizable_scan` resolve via
+  `resolve_scan_rows`, **non-blocking** — a still-`Pending` row is silently
+  omitted rather than retried. Resolution: `Committed{commit_ts}` at or
+  before the read's own timestamp serves the staged value; `Aborted` (or a
+  `Committed` strictly *after* the read's timestamp, equally invisible to
+  that snapshot) serves the value the key held immediately before the
+  intent, restored by rewinding to `get_at(key, intent_version - 1)` —
+  **never** a tombstone, which would incorrectly shadow that older,
+  still-live committed value.
+  - **The txn record lives *inside* the anchor tablet's own `StorageScope`**
+    — an ordinary in-scope logical key, not an engine-global marker like
+    `seal.rs`/`ceiling.rs` — so it replicates/snapshots/splits exactly like
+    real data. Its key (`txn::record_key`) is `token(8 bytes) || [0x00,
+    0x02] || encode(txn_id)`, `token` being the anchor write's own
+    partition token; disjointness from every real key sharing that token
+    is proved structurally from `animus_tablet::escape`'s own encoding rule
+    (never emits `[0x00, 0x02, ..]` as a real key's post-token lead), not a
+    reserved-name convention — see `txn.rs`'s module doc for the full
+    proof. `txn::is_record_key` is what every scan path (and `has_data`)
+    filters on so this internal key never leaks to a client.
+  - **`erase_scope` deliberately does NOT go through `local_scan`** (which
+    filters record keys and resolves values) — it uses its own
+    `raw_scoped_keys`, since drop-table GC must physically erase everything
+    this scope ever wrote (ordinary values, still-pending intents, and txn
+    records alike), not just what a read would ever serve.
+  - **`TxnCommit`/`TxnAbort` carry no `fence`**, like `Seal`/`ReadCeiling`: a
+    2PC decision must be durable and final regardless of any later range
+    change, and neither ever touches user data — only the record key. A
+    *conflicting* second decision on an already-decided record (a different
+    `commit_ts`, or committing an already-aborted one) is a protocol-bug
+    hard assert, mirroring `assert_ts_monotonic`'s doctrine — not a
+    silently-tolerated case. `TxnStage`'s fence/seal check is whole-or-
+    nothing across every write key *and* the record key, matching `Batch`.
+  - **A residual, documented gap**: a tablet split's `split_key` is an
+    arbitrary existing row's key (`animusd::auto_split_loop`'s
+    byte-weighted median), not token-aligned, so a split racing an
+    in-flight transaction could in principle separate a token's rows (and
+    its txn record) across two sibling tablets. Deferred to PR4+, per
+    `txn.rs`'s module doc and ADR 0018's PR3 amendment §2.
+  Regression: `tests/txn_single.rs` (commit/abort paths, a committed
+  delete's real tombstone, a pending read blocking then serving once
+  committed, intent/record markers never leaking into a scan, crash/restart
+  WAL-replay idempotency, a stage into an already-sealed range rejected
+  wholesale); `tests/snapshot_catchup.rs`'s
+  `snapshot_catchup_carries_txn_records_and_intents` (records/intents ship
+  through `engine_image` like ordinary data); `tests/
+  prod_concurrent_ts_monotonic.rs`'s `concurrent_txn_writes_and_reads_never_
+  violate_ts_monotonicity` (the PR2 mint/propose-ordering regression's
+  coverage extended to the new commands).
 - **`engine_applied` vs `last_applied`.** The two-task split (below) means the
   core's `last_applied` (a buffer cursor the consensus loop advances) *leads*
   the engine. Linearizable reads therefore gate on the separate
@@ -629,7 +719,11 @@ guards is provably unreachable under `SimEnv`'s single-threaded scheduler.
   proven to fail against the pre-fix source.
 - `snapshot_catchup.rs` (A.2) — crash a follower, write past the compaction
   threshold, restart → it catches up via a streaming `InstallSnapshot`
-  carrying the leader's engine image.
+  carrying the leader's engine image. `snapshot_catchup_carries_txn_records_
+  and_intents` (ADR 0018 §2/PR3) extends this: stages (never decides) a
+  transaction before the compacting write burst, confirms the
+  snapshot-caught-up follower's raw engine holds the identical still-
+  `Pending` intent envelope, then resolves and confirms convergence.
 - `narrow_scope.rs` — `narrow_scope` makes a group's `StorageScope` range
   live-narrowable (the split-source shape, so `engine_image` stops shipping the
   handed-off portion); `narrow_then_erase_scope_spares_a_co_hosted_siblings_
@@ -687,6 +781,25 @@ guards is provably unreachable under `SimEnv`'s single-threaded scheduler.
   correctly. The one test in this crate that can't be `SimEnv` — the mint/
   propose-ordering race it guards has no `.await` point for two tasks to
   interleave at under `SimEnv`'s single-threaded cooperative scheduler.
+  `concurrent_txn_writes_and_reads_never_violate_ts_monotonicity` (ADR 0018
+  §2/PR3) extends the identical hammer to `txn_write` (stage + commit +
+  resolve, three proposals per call through the same critical section) —
+  the regression that the new commands didn't reopen the race.
+- `txn_single.rs` (ADR 0018 §2/PR3) — the single-participant transaction
+  suite: the commit path visible via `read_at`/`local_get`/a scan; the
+  abort path restoring the prior committed value (never a tombstone or the
+  staged one); a committed staged-delete producing a real tombstone; a
+  linearizable read of a `Pending`-intent key blocking (confirmed via a
+  short `run_for` budget under `INTENT_WAIT_TIMEOUT`) then serving once
+  committed; a scan over a mix of committed rows and a still-staged intent
+  returning exactly the committed rows (no record-marker/intent bytes
+  leak, no early/garbled staged value); crash/restart WAL-replay
+  idempotency (`Simulator::stop` + a fresh `RaftKvNode::start` on the same
+  engine, mirroring `witnessing.rs`'s idiom) re-deriving the identical
+  committed value and a post-restart commit ts still strictly exceeding
+  the recovered one; a stage proposed into an already-sealed range
+  committing/applying as a whole-or-nothing no-op (`propose_seal` directly,
+  mirroring `cross_group_lww.rs`'s shape); and seed reproducibility.
 - `snapshot_reads.rs` (ADR 0018 §2/PR2b) — `read_at`/`scan_at` directly:
   each sees exactly the version committed at or before `ts` (including a
   value strictly between two writes' timestamps, and `scan_at` across

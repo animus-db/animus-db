@@ -60,9 +60,11 @@ pub mod hlc;
 pub mod host;
 mod seal;
 mod ts_cache;
+mod txn;
 
 use hlc::{Hlc, HlcTimestamp};
 use ts_cache::TsCache;
+pub use txn::TxnId;
 
 /// The assumed maximum clock-offset bound across the cluster (ADR 0018 §2),
 /// threaded into every [`Hlc::new`] this crate constructs. Not yet consumed
@@ -240,6 +242,11 @@ impl StorageScope {
             .lock()
             .expect("storage scope range poisoned")
             .clone();
+        // ADR 0018 §2/PR3: a txn-record marker key (`txn::is_record_key`)
+        // is internal bookkeeping, not user data — a tablet holding only a
+        // record (an in-flight transaction, no other writes ever landed)
+        // must still read as "no data" for the reforming-vs-fresh-join
+        // decision this presence check exists for.
         match &range.end {
             Some(end) => {
                 let physical_start = self.physical(&range.start);
@@ -247,7 +254,12 @@ impl StorageScope {
                 storage
                     .scan(&physical_start, &physical_end)
                     .await
-                    .map(|rows| !rows.is_empty())
+                    .map(|rows| {
+                        rows.iter().any(|(k, _)| {
+                            self.strip_in_range(k)
+                                .is_some_and(|logical| !txn::is_record_key(logical))
+                        })
+                    })
                     .unwrap_or(false)
             }
             // Open-ended range: no finite physical upper bound to scan, so
@@ -256,7 +268,12 @@ impl StorageScope {
             None => storage
                 .entries()
                 .await
-                .map(|rows| rows.iter().any(|(k, _)| self.strip_in_range(k).is_some()))
+                .map(|rows| {
+                    rows.iter().any(|(k, _)| {
+                        self.strip_in_range(k)
+                            .is_some_and(|logical| !txn::is_record_key(logical))
+                    })
+                })
                 .unwrap_or(false),
         }
     }
@@ -419,6 +436,65 @@ pub enum KvCommand {
     /// variants — every client-facing propose goes through `RaftKvNode`'s
     /// own `put`/`get`/`cas`/`scan` methods, not a raw command).
     ReadCeiling { ts: HlcTimestamp },
+    /// **Transaction stage** (ADR 0018 §2, PR3 — see `txn.rs`'s module
+    /// doc): create/refresh `txn_id`'s `Pending` record at `record_key`
+    /// (the anchor-token-derived reserved key `txn::record_key` computed
+    /// once by the proposer) and merge every entry of `writes` as an
+    /// `Envelope::Intent`. `fence` gates the **whole** stage — every write
+    /// key *and* `record_key` — atomically: any single key falling
+    /// outside it (or an already-sealed range) makes the entire entry a
+    /// no-op, matching `Batch`'s all-or-nothing semantics (a partial stage
+    /// would let a reader observe some of a transaction's intents but not
+    /// others). This is the degenerate single-participant "prepare".
+    TxnStage {
+        txn_id: TxnId,
+        record_key: Vec<u8>,
+        writes: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+        spans: Vec<KeyRange>,
+        fence: KeyRange,
+        ts: HlcTimestamp,
+    },
+    /// **Transaction commit**: flip `txn_id`'s record at `record_key` to
+    /// `Committed { commit_ts: ts }` iff currently `Pending` (a re-apply at
+    /// the identical `ts` is an idempotent no-op; a *different* `ts` on an
+    /// already-committed record, or committing an already-aborted one, is
+    /// a protocol-bug hard assert — see `apply_and_compact`'s arm). No
+    /// `fence`, deliberately, like `Seal`/`ReadCeiling`: a 2PC decision
+    /// must be durable and final regardless of any later range change, and
+    /// this only ever touches the record key itself, never user data. A
+    /// missing record (the stage never landed — fenced/sealed out) is a
+    /// silent no-op, matching this crate's fence-miss doctrine.
+    TxnCommit {
+        txn_id: TxnId,
+        record_key: Vec<u8>,
+        ts: HlcTimestamp,
+    },
+    /// **Transaction abort**: the `Aborted` dual of `TxnCommit` — see its
+    /// doc for the fence/idempotency/protocol-bug-assert argument, which
+    /// applies identically here.
+    TxnAbort {
+        txn_id: TxnId,
+        record_key: Vec<u8>,
+        ts: HlcTimestamp,
+    },
+    /// **Transaction resolve**: for each key in `keys` still holding
+    /// `txn_id`'s intent, rewrite it to its final form per the
+    /// already-decided record at `record_key` — committed: the staged
+    /// value (or a tombstone, for a staged delete) at `ts`; aborted: the
+    /// value this key held immediately before the intent, restored
+    /// forward at `ts` (never a tombstone, which would incorrectly shadow
+    /// that older value — see `txn.rs`'s module doc). A key whose stored
+    /// value is no longer that exact intent (already resolved, or
+    /// overwritten by something newer) is left untouched — idempotent on
+    /// WAL replay. No `fence`: every key here was already fence-checked at
+    /// `TxnStage` time; resolve only ever converts an already-staged
+    /// intent, never introduces new data outside that prior fence.
+    TxnResolve {
+        txn_id: TxnId,
+        record_key: Vec<u8>,
+        keys: Vec<Vec<u8>>,
+        ts: HlcTimestamp,
+    },
     /// The leader's no-op-on-election (Raft); applies nothing.
     NoOp,
 }
@@ -473,6 +549,14 @@ const CAS_TIMEOUT: Duration = Duration::from_secs(5);
 /// Poll granularity while a CAS waits for its committed outcome.
 const CAS_POLL: Duration = Duration::from_millis(20);
 
+/// How long a point read ([`RaftKvNode::read_resolved`]) retries a still-
+/// `Pending` intent before giving up and reporting "not served" (ADR 0018
+/// §2/PR3). Full push/wait scheduling for an in-flight transaction is PR4;
+/// this bounded poll is the interim contract.
+const INTENT_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Poll granularity while a read waits for a `Pending` intent to resolve.
+const INTENT_WAIT_POLL: Duration = Duration::from_millis(20);
+
 /// Compact (snapshot the engine + truncate the Raft log prefix) once this many
 /// entries have been applied past the current snapshot base, bounding the WAL.
 const COMPACT_THRESHOLD: u64 = 64;
@@ -496,6 +580,16 @@ struct ReadState {
 #[derive(Default)]
 struct CasResults {
     outcomes: BTreeMap<u64, bool>,
+}
+
+/// The outcome of resolving one raw, envelope-tagged stored value against a
+/// read (ADR 0018 §2/PR3): either a value has been determined (`Value`,
+/// `Some` present / `None` absent), or the covering transaction is still
+/// undecided (`Pending`) — see `RaftKvNode::resolve_once_step`'s doc for the
+/// exact per-status rules.
+enum ResolveStep {
+    Value(Option<Vec<u8>>),
+    Pending,
 }
 
 /// WAL filename stem for a tablet group's Raft log (distinct from the control
@@ -875,6 +969,34 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         result
     }
 
+    /// As [`propose_ordered`](Self::propose_ordered), but `build` also hands
+    /// back an arbitrary `aux` value computed in the same call (still
+    /// inside the held `core` lock) — used by the txn propose methods
+    /// (ADR 0018 §2/PR3), which need the `TxnId`/record key/ts they just
+    /// minted for the *next* step of the flow (stage -> commit/abort ->
+    /// resolve), not just the bare [`ProposeResult`]. `aux` is returned
+    /// regardless of whether the propose was accepted — every caller here
+    /// only trusts it once it has confirmed `Accepted`.
+    fn propose_ordered_aux<T, F: FnOnce() -> (KvCommand, T)>(
+        &self,
+        build: F,
+    ) -> (ProposeResult, T) {
+        let mut core = self.lock();
+        let (command, aux) = build();
+        let ts = command_ts(&command);
+        let result = record_propose(&self.metrics, core.propose(command));
+        if matches!(result, ProposeResult::Accepted { .. })
+            && let Some(ts) = ts
+        {
+            self.last_proposed_ts.store(hlc::pack(ts), Ordering::SeqCst);
+        }
+        drop(core);
+        if matches!(result, ProposeResult::Accepted { .. }) {
+            self.propose_signal.notify();
+        }
+        (result, aux)
+    }
+
     /// This group's currently **committed read ceiling** (ADR 0018 §2/PR2b,
     /// `ceiling.rs`): the highest `ReadCeiling` timestamp this group has
     /// *applied* so far. A read may only be served at a `ts` strictly below
@@ -1153,6 +1275,168 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             };
             KvCommand::Seal { range, ts }
         })
+    }
+
+    /// **Stage** phase of the degenerate single-participant 2PC (ADR 0018
+    /// §2/PR3 — see `txn.rs`'s module doc): mint a fresh [`TxnId`],
+    /// compute its record key from `writes`' first (anchor) key's own
+    /// partition token, and propose `KvCommand::TxnStage` for the whole
+    /// batch as one atomic Raft entry. Leader-only (`None` otherwise, like
+    /// every other propose-and-wait method here). Returns the `TxnId` +
+    /// record key once the stage has committed *and applied* on this
+    /// leader — feed both into [`txn_decide`](Self::txn_decide), or use
+    /// the one-shot [`txn_write`](Self::txn_write) for the common
+    /// commit-only path.
+    ///
+    /// # Panics
+    /// If `writes` is empty, or its anchor key is shorter than
+    /// `animus_tablet::TOKEN_BYTES` — every real data-plane key
+    /// unconditionally leads with the partition token (ADR 0022); this is
+    /// a caller invariant, not a recoverable condition.
+    pub async fn txn_stage(
+        &self,
+        writes: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+    ) -> Option<(TxnId, Vec<u8>)> {
+        assert!(
+            !writes.is_empty(),
+            "raftkv txn_stage: writes must be non-empty"
+        );
+        let anchor = &writes[0].0;
+        assert!(
+            anchor.len() >= animus_tablet::TOKEN_BYTES,
+            "raftkv txn_stage: anchor key must lead with the {}-byte partition token \
+             (ADR 0022) — got {} bytes",
+            animus_tablet::TOKEN_BYTES,
+            anchor.len()
+        );
+        let token = anchor[..animus_tablet::TOKEN_BYTES].to_vec();
+        let keys: Vec<Vec<u8>> = writes.iter().map(|(k, _)| k.clone()).collect();
+        let fence = self.scope_range();
+        let (result, (txn_id, record_key)) = self.propose_ordered_aux(|| {
+            let ts = self.mint_pushed(&keys);
+            let txn_id = TxnId {
+                ts,
+                node: self.env.node_id(),
+            };
+            let record_key = txn::record_key(&token, &txn_id);
+            let spans = keys
+                .iter()
+                .map(|k| KeyRange::new(k.clone(), Some(txn::immediate_successor(k))))
+                .collect();
+            let cmd = KvCommand::TxnStage {
+                txn_id: txn_id.clone(),
+                record_key: record_key.clone(),
+                writes: writes.clone(),
+                spans,
+                fence: fence.clone(),
+                ts,
+            };
+            (cmd, (txn_id, record_key))
+        });
+        let index = match result {
+            ProposeResult::Accepted { index } => index,
+            ProposeResult::NotLeader { .. } => return None,
+        };
+        self.wait_applied(index)
+            .await
+            .then_some((txn_id, record_key))
+    }
+
+    /// **Commit or abort** a previously-[staged](Self::txn_stage)
+    /// transaction, then **resolve** its intents (ADR 0018 §2/PR3) —
+    /// deliberately **three** separate log entries (stage was the first),
+    /// fully synchronous end to end: PR4 collapses/parallelizes this
+    /// across multiple participant groups; don't optimize now. `keys` must
+    /// be the same keys `txn_stage` was called with. Returns the decision
+    /// timestamp once every phase has committed and applied; `None` if
+    /// this node stopped being the leader at any point.
+    ///
+    /// A resolve failure (not leader / timed out) does **not** undo the
+    /// commit/abort decision itself, which is already durable — it just
+    /// leaves the intent(s) unresolved for a later resolver to pick up
+    /// (PR5's in-doubt recovery).
+    pub async fn txn_decide(
+        &self,
+        txn_id: TxnId,
+        record_key: Vec<u8>,
+        keys: Vec<Vec<u8>>,
+        commit: bool,
+    ) -> Option<HlcTimestamp> {
+        let (decide_result, decision_ts) = self.propose_ordered_aux(|| {
+            let ts = self.mint_pushed(std::slice::from_ref(&record_key));
+            let cmd = if commit {
+                KvCommand::TxnCommit {
+                    txn_id: txn_id.clone(),
+                    record_key: record_key.clone(),
+                    ts,
+                }
+            } else {
+                KvCommand::TxnAbort {
+                    txn_id: txn_id.clone(),
+                    record_key: record_key.clone(),
+                    ts,
+                }
+            };
+            (cmd, ts)
+        });
+        let decide_index = match decide_result {
+            ProposeResult::Accepted { index } => index,
+            ProposeResult::NotLeader { .. } => return None,
+        };
+        if !self.wait_applied(decide_index).await {
+            return None;
+        }
+
+        let (resolve_result, ()) = self.propose_ordered_aux(|| {
+            let ts = self.mint_pushed(&keys);
+            (
+                KvCommand::TxnResolve {
+                    txn_id: txn_id.clone(),
+                    record_key: record_key.clone(),
+                    keys: keys.clone(),
+                    ts,
+                },
+                (),
+            )
+        });
+        if let ProposeResult::Accepted { index } = resolve_result {
+            self.wait_applied(index).await;
+        }
+
+        Some(decision_ts)
+    }
+
+    /// One-shot **single-participant transaction**: [stage](Self::txn_stage)
+    /// every `(key, Option<value>)` in `writes` as intents, commit, then
+    /// [resolve](Self::txn_decide) — the degenerate 2PC through this
+    /// **one** Raft group (ADR 0018 §2/PR3, Follow-up step 2). `writes`'
+    /// first entry is the *anchor*: its partition token anchors the txn
+    /// record (see `txn.rs`). Returns the commit timestamp once every
+    /// phase has committed and applied; `None` if this node stopped being
+    /// the leader at any point.
+    pub async fn txn_write(&self, writes: Vec<(Vec<u8>, Option<Vec<u8>>)>) -> Option<HlcTimestamp> {
+        let keys: Vec<Vec<u8>> = writes.iter().map(|(k, _)| k.clone()).collect();
+        let (txn_id, record_key) = self.txn_stage(writes).await?;
+        self.txn_decide(txn_id, record_key, keys, true).await
+    }
+
+    /// Poll [`engine_applied_index`](Self::engine_applied_index) until it
+    /// reaches `index` (the proposed entry has committed *and applied* on
+    /// this leader), bounded by [`CAS_TIMEOUT`]/[`CAS_POLL`] — the same
+    /// confirm-by-index shape [`compare_and_swap`](Self::compare_and_swap)
+    /// uses. `false` if this node stops being the leader or the deadline
+    /// passes first.
+    async fn wait_applied(&self, index: u64) -> bool {
+        let deadline = self.env.now().0 + CAS_TIMEOUT.as_nanos() as u64;
+        loop {
+            if self.engine_applied_index() >= index {
+                return true;
+            }
+            if !self.is_leader() || self.env.now().0 >= deadline {
+                return false;
+            }
+            self.env.sleep(CAS_POLL).await;
+        }
     }
 
     /// The recorded outcome of the CAS committed at Raft log `index` (the value
@@ -1455,16 +1739,156 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         self.scope.range()
     }
 
+    /// The outcome of resolving one raw, envelope-tagged stored value
+    /// against a read (ADR 0018 §2/PR3) — see [`resolve_once`](Self::resolve_once).
+    async fn resolve_once_step(
+        &self,
+        physical_key: &[u8],
+        vv: animus_storage::VersionedValue,
+        read_ts: Option<HlcTimestamp>,
+    ) -> ResolveStep {
+        match txn::decode_envelope(&vv.value) {
+            txn::Envelope::Committed(v) => ResolveStep::Value(Some(v)),
+            txn::Envelope::Intent {
+                txn_id,
+                record_key,
+                staged_value,
+            } => {
+                // Single-participant invariant (PR3): the record lives in
+                // this same tablet's scope, so a plain scoped `get` finds
+                // it with no cross-group lookup.
+                let record = self
+                    .storage
+                    .get(&self.scope.physical(&record_key))
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|r| txn::decode_record(&r.value));
+                match record {
+                    Some(r) if r.txn_id == txn_id => match r.status {
+                        // `read_ts: None` means "latest" (a linearizable or
+                        // raw local read) — always serve a committed
+                        // intent regardless of its own `commit_ts`. A
+                        // `Some(rt)` snapshot read only serves it if the
+                        // commit happened at or before `rt`; a commit
+                        // strictly *after* the snapshot is as invisible to
+                        // it as an abort would be — see the module doc.
+                        txn::TxnStatus::Committed { commit_ts }
+                            if read_ts.is_none_or(|rt| commit_ts <= rt) =>
+                        {
+                            ResolveStep::Value(staged_value)
+                        }
+                        txn::TxnStatus::Committed { .. } | txn::TxnStatus::Aborted => {
+                            let prior = self
+                                .storage
+                                .get_at(physical_key, vv.version.saturating_sub(1))
+                                .await
+                                .ok()
+                                .flatten();
+                            ResolveStep::Value(prior.and_then(|pvv| {
+                                match txn::decode_envelope(&pvv.value) {
+                                    txn::Envelope::Committed(v) => Some(v),
+                                    // A prior intent (an unresolved nested
+                                    // conflict — a PR4 concern, see
+                                    // `txn.rs`'s doc): conservatively treat
+                                    // as absent rather than ever leak raw
+                                    // envelope bytes to a caller.
+                                    txn::Envelope::Intent { .. } => None,
+                                }
+                            }))
+                        }
+                        txn::TxnStatus::Pending => ResolveStep::Pending,
+                    },
+                    // Record missing or belongs to a different txn:
+                    // shouldn't happen structurally (see `txn.rs`'s doc) —
+                    // treat conservatively as pending rather than ever
+                    // guess at a value.
+                    _ => ResolveStep::Pending,
+                }
+            }
+        }
+    }
+
+    /// Fetch `physical_key` (`version_ceiling: Some(v)` = as of engine
+    /// version `v`, i.e. `read_at`/`scan_at`'s snapshot bound; `None` =
+    /// latest) and resolve any intent found against `read_ts` (see
+    /// [`resolve_once_step`](Self::resolve_once_step)), **retrying** while
+    /// the covering transaction is still `Pending`, bounded by
+    /// [`INTENT_WAIT_TIMEOUT`] — full push/wait scheduling is PR4. Outer
+    /// `None` = gave up waiting; `Some(None)` = genuinely absent.
+    async fn read_resolved(
+        &self,
+        physical_key: &[u8],
+        read_ts: Option<HlcTimestamp>,
+        version_ceiling: Option<u64>,
+    ) -> Option<Option<Vec<u8>>> {
+        let deadline = self.env.now().0 + INTENT_WAIT_TIMEOUT.as_nanos() as u64;
+        loop {
+            let vv = match version_ceiling {
+                Some(v) => self.storage.get_at(physical_key, v).await.ok().flatten(),
+                None => self.storage.get(physical_key).await.ok().flatten(),
+            };
+            let Some(vv) = vv else {
+                return Some(None);
+            };
+            match self.resolve_once_step(physical_key, vv, read_ts).await {
+                ResolveStep::Value(v) => return Some(v),
+                ResolveStep::Pending => {
+                    if self.env.now().0 >= deadline {
+                        return None;
+                    }
+                    self.env.sleep(INTENT_WAIT_POLL).await;
+                }
+            }
+        }
+    }
+
+    /// Drop the crate's internal txn-record marker keys
+    /// (`txn::is_record_key`) from a raw, scope-stripped `(logical_key,
+    /// VersionedValue)` row set and resolve every remaining row's value
+    /// envelope against `read_ts` (`None` = latest) — the shared scan
+    /// post-processing step for [`local_scan`](Self::local_scan)/
+    /// [`scan_at`](Self::scan_at) (ADR 0018 §2/PR3).
+    ///
+    /// **Best-effort, non-blocking** — unlike the point-read path
+    /// ([`read_resolved`](Self::read_resolved)): a still-`Pending` intent
+    /// is silently omitted from the result rather than retried. Full
+    /// push/wait for a scan is deferred to PR4.
+    async fn resolve_scan_rows(
+        &self,
+        rows: Vec<(Vec<u8>, animus_storage::VersionedValue)>,
+        read_ts: Option<HlcTimestamp>,
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut out = Vec::with_capacity(rows.len());
+        for (key, vv) in rows {
+            if txn::is_record_key(&key) {
+                continue;
+            }
+            let physical = self.scope.physical(&key);
+            if let ResolveStep::Value(Some(v)) =
+                self.resolve_once_step(&physical, vv, read_ts).await
+            {
+                out.push((key, v));
+            }
+        }
+        out
+    }
+
     /// Read `key` from this replica's **local engine**. NOTE: this is a local read
     /// — it is *not* yet linearizable (that is ReadIndex, Stage B.2). It is used by
     /// tests to observe a replica's applied state and to confirm convergence.
+    ///
+    /// A key currently covered by a **`Pending`** intent (ADR 0018 §2/PR3)
+    /// reads as absent here (`None`) — this is a raw, non-blocking peek, not
+    /// the retry-then-serve contract [`linearizable_get`](Self::linearizable_get)
+    /// gives a resolved/committed value.
     pub async fn local_get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        self.storage
-            .get(&self.scope.physical(key))
-            .await
-            .ok()
-            .flatten()
-            .map(|vv| vv.value)
+        let physical = self.scope.physical(key);
+        let vv = self.storage.get(&physical).await.ok().flatten()?;
+        match self.resolve_once_step(&physical, vv, None).await {
+            ResolveStep::Value(v) => v,
+            ResolveStep::Pending => None,
+        }
     }
 
     /// A **linearizable** read of `key` via **ReadIndex** (ADR 0017): only the
@@ -1505,7 +1929,11 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         if !self.ensure_ceiling_above(ts).await {
             return None;
         }
-        let value = self.local_get(key).await;
+        // ADR 0018 §2/PR3: unlike `local_get`'s raw peek, a linearizable
+        // read retries (bounded) a still-`Pending` intent rather than
+        // reporting a false absence — see `read_resolved`'s doc.
+        let physical = self.scope.physical(key);
+        let value = self.read_resolved(&physical, None, None).await?;
         let (start, end) = ts_cache::point_span(key);
         self.ts_cache
             .lock()
@@ -1590,7 +2018,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         // Under the default (whole) scope this is byte-for-byte the prior
         // behavior: `physical` is the identity and `strip_in_range` always
         // succeeds.
-        let mut pairs: Vec<(Vec<u8>, Vec<u8>)> = match end {
+        let raw: Vec<(Vec<u8>, animus_storage::VersionedValue)> = match end {
             Some(e) => self
                 .storage
                 .scan(&self.scope.physical(start), &self.scope.physical(e))
@@ -1600,7 +2028,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
                 .flatten()
                 .filter_map(|(k, vv)| {
                     let logical = self.scope.strip_in_range(&k)?;
-                    Some((logical.to_vec(), vv.value))
+                    Some((logical.to_vec(), vv))
                 })
                 .collect(),
             None => match self.scope.physical_bounds().1 {
@@ -1613,7 +2041,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
                     .flatten()
                     .filter_map(|(k, vv)| {
                         let logical = self.scope.strip_in_range(&k)?;
-                        Some((logical.to_vec(), vv.value))
+                        Some((logical.to_vec(), vv))
                     })
                     .collect(),
                 None => self
@@ -1625,11 +2053,18 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
                     .flatten()
                     .filter_map(|(k, vv)| {
                         let logical = self.scope.strip_in_range(&k)?;
-                        (logical >= start).then(|| (logical.to_vec(), vv.value))
+                        (logical >= start).then(|| (logical.to_vec(), vv))
                     })
                     .collect(),
             },
         };
+        // ADR 0018 §2/PR3: filter out this crate's internal txn-record
+        // marker keys and resolve every remaining row's value envelope
+        // (`resolve_scan_rows`'s doc) — applied *before* `limit` so an
+        // internal marker key or a still-`Pending` row interleaved in the
+        // requested range never silently consumes one of the caller's
+        // requested slots.
+        let mut pairs = self.resolve_scan_rows(raw, None).await;
         if let Some(n) = limit {
             pairs.truncate(n);
         }
@@ -1671,12 +2106,8 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         }
         let physical = self.scope.physical(key);
         let value = self
-            .storage
-            .get_at(&physical, hlc::pack(ts))
-            .await
-            .ok()
-            .flatten()
-            .map(|vv| vv.value);
+            .read_resolved(&physical, Some(ts), Some(hlc::pack(ts)))
+            .await?;
         let (start, end) = ts_cache::point_span(key);
         self.ts_cache
             .lock()
@@ -1706,7 +2137,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             return None;
         }
         let version = hlc::pack(ts);
-        let rows: Vec<(Vec<u8>, Vec<u8>)> = match end {
+        let raw: Vec<(Vec<u8>, animus_storage::VersionedValue)> = match end {
             Some(e) => self
                 .storage
                 .scan_at(
@@ -1720,7 +2151,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
                 .flatten()
                 .filter_map(|(k, vv)| {
                     let logical = self.scope.strip_in_range(&k)?;
-                    Some((logical.to_vec(), vv.value))
+                    Some((logical.to_vec(), vv))
                 })
                 .collect(),
             None => match self.scope.physical_bounds().1 {
@@ -1733,7 +2164,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
                     .flatten()
                     .filter_map(|(k, vv)| {
                         let logical = self.scope.strip_in_range(&k)?;
-                        Some((logical.to_vec(), vv.value))
+                        Some((logical.to_vec(), vv))
                     })
                     .collect(),
                 None => self
@@ -1745,11 +2176,15 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
                     .flatten()
                     .filter_map(|(k, vv)| {
                         let logical = self.scope.strip_in_range(&k)?;
-                        (logical >= start).then(|| (logical.to_vec(), vv.value))
+                        (logical >= start).then(|| (logical.to_vec(), vv))
                     })
                     .collect(),
             },
         };
+        // See `local_scan`'s identical comment: filter + resolve before
+        // any caller-side limit is applied (`scan_at` itself takes no
+        // limit, but keeps the same shared post-processing shape).
+        let rows = self.resolve_scan_rows(raw, Some(ts)).await;
         self.ts_cache.lock().expect("ts cache poisoned").bump(
             start.to_vec(),
             end.map(<[u8]>::to_vec),
@@ -1807,11 +2242,45 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         // property the old `last_applied() + 1` scheme provided for the
         // retired index-based version.
         let version = hlc::pack(self.hlc.mint(self.env.now()));
-        for (key, _) in self.local_scan(&[], None, None).await {
+        // Deliberately **not** `local_scan` (ADR 0018 §2/PR3): that now
+        // filters out this crate's internal txn-record marker keys and
+        // resolves intents to what a *client* would see — exactly the
+        // wrong thing here, which must physically erase everything this
+        // scope ever wrote (ordinary values, still-pending intents, and
+        // txn records alike), not just what a read would ever serve.
+        for key in self.raw_scoped_keys().await {
             let _ = self
                 .storage
                 .merge_tombstone(&self.scope.physical(&key), version)
                 .await;
+        }
+    }
+
+    /// Every logical key currently physically present in this group's own
+    /// scope — **raw**, bypassing both the record-key filter and
+    /// value-envelope resolution [`local_scan`](Self::local_scan) applies.
+    /// The only caller is [`erase_scope`](Self::erase_scope).
+    async fn raw_scoped_keys(&self) -> Vec<Vec<u8>> {
+        let (physical_start, physical_end) = self.scope.physical_bounds();
+        match physical_end {
+            Some(e) => self
+                .storage
+                .scan(&physical_start, &e)
+                .await
+                .ok()
+                .into_iter()
+                .flatten()
+                .filter_map(|(k, _)| self.scope.strip_in_range(&k).map(<[u8]>::to_vec))
+                .collect(),
+            None => self
+                .storage
+                .entries()
+                .await
+                .ok()
+                .into_iter()
+                .flatten()
+                .filter_map(|(k, _)| self.scope.strip_in_range(&k).map(<[u8]>::to_vec))
+                .collect(),
         }
     }
 
@@ -2297,7 +2766,11 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 // `StorageScope`'s doc — under the default scope this is an
                 // identity transform).
                 if fence.contains(&key) && !is_sealed(sealed, &key) {
-                    pending.push(MergeOp::put(scope.physical(&key), value, hlc::pack(ts)));
+                    pending.push(MergeOp::put(
+                        scope.physical(&key),
+                        txn::encode_committed(&value),
+                        hlc::pack(ts),
+                    ));
                 }
             }
             KvCommand::Batch { puts, fence, ts } => {
@@ -2317,7 +2790,11 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 {
                     for (key, value) in &puts {
                         storage
-                            .merge(&scope.physical(key), value, hlc::pack(ts))
+                            .merge(
+                                &scope.physical(key),
+                                &txn::encode_committed(value),
+                                hlc::pack(ts),
+                            )
                             .await
                             .expect("raftkv apply batch put");
                     }
@@ -2355,18 +2832,24 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                     // whichever Raft put first, since the first swap moves the
                     // committed value and the second's compare then fails.
                     let physical_key = scope.physical(&key);
-                    let current = storage
-                        .get(&physical_key)
-                        .await
-                        .expect("raftkv cas read")
-                        .map(|vv| vv.value);
-                    let swapped = current == expected;
+                    let raw = storage.get(&physical_key).await.expect("raftkv cas read");
+                    // ADR 0018 §2/PR3: a pending (or otherwise unresolved)
+                    // intent makes "the current committed value" ambiguous
+                    // — every replica deterministically fails the swap
+                    // rather than ever guessing at a match or an absence.
+                    // PR4 revisits CAS-vs-in-flight-txn interaction
+                    // (push/wait the blocking transaction).
+                    let swapped = match raw.map(|vv| txn::decode_envelope(&vv.value)) {
+                        None => expected.is_none(),
+                        Some(txn::Envelope::Committed(v)) => Some(v) == expected,
+                        Some(txn::Envelope::Intent { .. }) => false,
+                    };
                     if swapped {
                         // Same write path as `Put`: `hlc::pack(ts)` is the MVCC
                         // version, so re-applying on recovery is idempotent
                         // (per-key LWW).
                         storage
-                            .merge(&physical_key, &value, hlc::pack(ts))
+                            .merge(&physical_key, &txn::encode_committed(&value), hlc::pack(ts))
                             .await
                             .expect("raftkv apply cas");
                     }
@@ -2421,6 +2904,256 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                     )
                     .await
                     .expect("raftkv apply read-ceiling marker");
+            }
+            KvCommand::TxnStage {
+                txn_id,
+                record_key,
+                writes,
+                spans,
+                fence,
+                ts,
+            } => {
+                assert_ts_monotonic(max_applied_ts, ts);
+                // Whole-or-nothing, matching `Batch`: a partial stage would
+                // let a reader observe some of a transaction's intents but
+                // not others (see `KvCommand::TxnStage`'s doc).
+                let all_in_fence = writes
+                    .iter()
+                    .all(|(k, _)| fence.contains(k) && !is_sealed(sealed, k))
+                    && fence.contains(&record_key)
+                    && !is_sealed(sealed, &record_key);
+                if all_in_fence {
+                    flush_pending(storage, &mut pending, metrics).await;
+                    let version = hlc::pack(ts);
+                    for (key, staged_value) in &writes {
+                        let env = txn::encode_intent(&txn_id, &record_key, staged_value.as_deref());
+                        storage
+                            .merge(&scope.physical(key), &env, version)
+                            .await
+                            .expect("raftkv apply txn stage intent");
+                    }
+                    let record = txn::TxnRecord {
+                        txn_id,
+                        status: txn::TxnStatus::Pending,
+                        intent_spans: spans,
+                        created_ts: ts,
+                    };
+                    storage
+                        .merge(
+                            &scope.physical(&record_key),
+                            &txn::encode_record(&record),
+                            version,
+                        )
+                        .await
+                        .expect("raftkv apply txn stage record");
+                }
+            }
+            KvCommand::TxnCommit {
+                txn_id,
+                record_key,
+                ts,
+            } => {
+                assert_ts_monotonic(max_applied_ts, ts);
+                flush_pending(storage, &mut pending, metrics).await;
+                let physical_record = scope.physical(&record_key);
+                let current = storage
+                    .get(&physical_record)
+                    .await
+                    .expect("raftkv txn commit read")
+                    .and_then(|vv| txn::decode_record(&vv.value));
+                match current {
+                    // The stage never landed here (fenced/sealed out at
+                    // propose time) — nothing to commit. Matches this
+                    // crate's fence-miss doctrine: a deterministic, silent
+                    // no-op, never a surfaced error.
+                    None => {}
+                    Some(r) if r.txn_id != txn_id => {
+                        // `record_key` is derived from `txn_id` itself
+                        // (`txn::record_key`); a mismatch means two
+                        // different transactions computed the identical
+                        // key — a real bug, not a recoverable condition.
+                        panic!(
+                            "raftkv txn commit: record at {record_key:?} belongs to a \
+                             different txn ({:?} != {txn_id:?})",
+                            r.txn_id
+                        );
+                    }
+                    Some(r) => match r.status {
+                        txn::TxnStatus::Pending => {
+                            let record = txn::TxnRecord {
+                                status: txn::TxnStatus::Committed { commit_ts: ts },
+                                ..r
+                            };
+                            storage
+                                .merge(
+                                    &physical_record,
+                                    &txn::encode_record(&record),
+                                    hlc::pack(ts),
+                                )
+                                .await
+                                .expect("raftkv apply txn commit");
+                        }
+                        // Idempotent WAL-replay re-application: identical
+                        // decision, nothing to do.
+                        txn::TxnStatus::Committed { commit_ts } if commit_ts == ts => {}
+                        txn::TxnStatus::Committed { commit_ts } => panic!(
+                            "raftkv txn commit: protocol bug — {txn_id:?} already committed \
+                             at {commit_ts:?}, cannot also commit at {ts:?}"
+                        ),
+                        txn::TxnStatus::Aborted => panic!(
+                            "raftkv txn commit: protocol bug — {txn_id:?} already aborted, \
+                             cannot also commit"
+                        ),
+                    },
+                }
+            }
+            KvCommand::TxnAbort {
+                txn_id,
+                record_key,
+                ts,
+            } => {
+                assert_ts_monotonic(max_applied_ts, ts);
+                flush_pending(storage, &mut pending, metrics).await;
+                let physical_record = scope.physical(&record_key);
+                let current = storage
+                    .get(&physical_record)
+                    .await
+                    .expect("raftkv txn abort read")
+                    .and_then(|vv| txn::decode_record(&vv.value));
+                match current {
+                    None => {}
+                    Some(r) if r.txn_id != txn_id => {
+                        panic!(
+                            "raftkv txn abort: record at {record_key:?} belongs to a \
+                             different txn ({:?} != {txn_id:?})",
+                            r.txn_id
+                        );
+                    }
+                    Some(r) => match r.status {
+                        txn::TxnStatus::Pending => {
+                            let record = txn::TxnRecord {
+                                status: txn::TxnStatus::Aborted,
+                                ..r
+                            };
+                            storage
+                                .merge(
+                                    &physical_record,
+                                    &txn::encode_record(&record),
+                                    hlc::pack(ts),
+                                )
+                                .await
+                                .expect("raftkv apply txn abort");
+                        }
+                        // Idempotent WAL-replay re-application.
+                        txn::TxnStatus::Aborted => {}
+                        txn::TxnStatus::Committed { .. } => panic!(
+                            "raftkv txn abort: protocol bug — {txn_id:?} already committed, \
+                             cannot also abort"
+                        ),
+                    },
+                }
+            }
+            KvCommand::TxnResolve {
+                txn_id,
+                record_key,
+                keys,
+                ts,
+            } => {
+                assert_ts_monotonic(max_applied_ts, ts);
+                flush_pending(storage, &mut pending, metrics).await;
+                let physical_record = scope.physical(&record_key);
+                // `Some(Some(commit_ts))` = committed at `commit_ts`;
+                // `Some(None)` = aborted; `None` = not yet decided (or the
+                // record vanished/mismatched) — resolve is a no-op this
+                // pass in every `None` case.
+                let decided: Option<Option<HlcTimestamp>> = storage
+                    .get(&physical_record)
+                    .await
+                    .expect("raftkv txn resolve record read")
+                    .and_then(|vv| txn::decode_record(&vv.value))
+                    .filter(|r| r.txn_id == txn_id)
+                    .and_then(|r| match r.status {
+                        txn::TxnStatus::Committed { commit_ts } => Some(Some(commit_ts)),
+                        txn::TxnStatus::Aborted => Some(None),
+                        txn::TxnStatus::Pending => None,
+                    });
+                if let Some(outcome) = decided {
+                    let version = hlc::pack(ts);
+                    for key in &keys {
+                        let physical_key = scope.physical(key);
+                        let Some(vv) = storage
+                            .get(&physical_key)
+                            .await
+                            .expect("raftkv txn resolve key read")
+                        else {
+                            continue; // nothing left here to resolve
+                        };
+                        let intent = match txn::decode_envelope(&vv.value) {
+                            txn::Envelope::Intent {
+                                txn_id: found,
+                                staged_value,
+                                ..
+                            } if found == txn_id => Some(staged_value),
+                            // Already resolved, or a different/newer txn's
+                            // intent has since overwritten this key —
+                            // nothing of ours left here. Idempotent no-op.
+                            _ => None,
+                        };
+                        let Some(staged_value) = intent else {
+                            continue;
+                        };
+                        match outcome {
+                            Some(_commit_ts) => match staged_value {
+                                // Committed: the staged value becomes the
+                                // committed value.
+                                Some(v) => {
+                                    storage
+                                        .merge(&physical_key, &txn::encode_committed(&v), version)
+                                        .await
+                                        .expect("raftkv apply txn resolve commit");
+                                }
+                                // A staged delete resolves to an actual
+                                // tombstone — the only place `TxnResolve`
+                                // writes one, since it's finalizing an
+                                // already-decided delete, not guessing.
+                                None => {
+                                    storage
+                                        .merge_tombstone(&physical_key, version)
+                                        .await
+                                        .expect("raftkv apply txn resolve commit delete");
+                                }
+                            },
+                            None => {
+                                // Aborted: restore whatever this key held
+                                // immediately before the intent — never a
+                                // tombstone, which would incorrectly shadow
+                                // that older, still-live committed value
+                                // (see `txn.rs`'s module doc). Every
+                                // version this group has ever applied is
+                                // strictly increasing
+                                // (`assert_ts_monotonic`), so
+                                // `vv.version - 1` is guaranteed to sit
+                                // strictly below the intent's own version
+                                // and at/above this key's true prior
+                                // version.
+                                let prior = storage
+                                    .get_at(&physical_key, vv.version.saturating_sub(1))
+                                    .await
+                                    .expect("raftkv txn resolve prior read");
+                                match prior {
+                                    Some(pvv) => storage
+                                        .merge(&physical_key, &pvv.value, version)
+                                        .await
+                                        .expect("raftkv apply txn resolve abort restore"),
+                                    None => storage
+                                        .merge_tombstone(&physical_key, version)
+                                        .await
+                                        .expect("raftkv apply txn resolve abort restore tombstone"),
+                                };
+                            }
+                        }
+                    }
+                }
             }
             // No `assert_ts_monotonic` call here, deliberately: `NoOp` carries
             // no `ts` at all (`command_ts` returns `None` for it), so there is
@@ -2649,7 +3382,11 @@ fn command_ts(command: &KvCommand) -> Option<HlcTimestamp> {
         | KvCommand::Delete { ts, .. }
         | KvCommand::Cas { ts, .. }
         | KvCommand::Seal { ts, .. }
-        | KvCommand::ReadCeiling { ts, .. } => Some(*ts),
+        | KvCommand::ReadCeiling { ts, .. }
+        | KvCommand::TxnStage { ts, .. }
+        | KvCommand::TxnCommit { ts, .. }
+        | KvCommand::TxnAbort { ts, .. }
+        | KvCommand::TxnResolve { ts, .. } => Some(*ts),
         KvCommand::NoOp => None,
     }
 }

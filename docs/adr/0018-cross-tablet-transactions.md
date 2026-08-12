@@ -3,12 +3,15 @@
 - **Status:** Accepted — in delivery (PR1: HLC + sim clock skew landed; PR2:
   HLC commit timestamps as the CP-plane MVCC version + the range-seal design
   landed; PR2b: MVCC snapshot reads at a timestamp + the read-timestamp
-  cache/logged read ceiling landed; PR3-PR7 sequenced). See the "Amendment
-  (2026-08-11, PR1)" section for the build-time decisions settled at the
-  start of delivery, the "Amendment (2026-08-11, PR2)" section for the
-  range-seal design that replaces `version_floor`, and the "Amendment
-  (2026-08-11, PR2b)" section below for the read path + serializability
-  write-push mechanism.
+  cache/logged read ceiling landed; PR3: single-participant transactions —
+  the value envelope + the txn record/intent/resolve machinery through one
+  Raft group — landed; PR4-PR7 sequenced). See the "Amendment (2026-08-11,
+  PR1)" section for the build-time decisions settled at the start of
+  delivery, the "Amendment (2026-08-11, PR2)" section for the range-seal
+  design that replaces `version_floor`, the "Amendment (2026-08-11, PR2b)"
+  section for the read path + serializability write-push mechanism, and the
+  "Amendment (2026-08-12, PR3)" section below for the record/intent/resolve
+  machinery.
 - **Date:** 2026-08-03
 
 ## Context
@@ -589,3 +592,157 @@ Deferred: the transaction record/intent machinery itself (Follow-up step
 2), which is what will actually *use* `read_at`/`scan_at` as its snapshot
 read primitive and the write-push/ceiling design as the ordering
 substrate a transaction's commit timestamp is chosen against.
+
+## Amendment (2026-08-12, PR3)
+
+PR3 lands Follow-up step 2: the **single-participant "degenerate 2PC"** —
+the transaction record + intent + resolve machinery through **one** Raft
+group. This is the first PR that actually stages/decides/resolves a
+transaction rather than only building primitives it will need; PR4
+generalizes it across multiple participant groups.
+
+### 1. The value envelope
+
+Every value the CP apply path merges into the engine (`Put`/`Batch`/`Cas`,
+and a `TxnResolve`'s final rewrite) is now a 1-byte-tagged envelope: tag
+`0` = a committed value (the rest of the bytes are the value, byte-for-byte
+what the caller supplied); tag `1` = an intent, naming the staging
+transaction, its record's own logical key, and the value the key will take
+if the transaction commits (`None` = a staged delete). Tombstones
+themselves stay untagged (the engine's own per-key tombstone bit) — the
+envelope only ever wraps an actual value. Every read path
+(`local_get`/`linearizable_get`/`_served`/`read_at`/`local_scan`/`scan_at`)
+unwraps it before a value ever reaches a caller; a scan additionally
+filters out the record marker keys below. `animus-cp-data/src/codec.rs`'s
+`VERSION` was bumped alongside the four new `KvCommand` variants (below),
+so a mixed-version decode fails loudly rather than silently misreading a
+pre-envelope value — this codebase's standing "fresh clusters only, no
+live-deployment migration path" rule (no wire/WAL back-compat is required)
+means no encode-time fallback was needed.
+
+### 2. The transaction record: identity, key scheme, and locality
+
+A `TxnId` is `(HlcTimestamp, NodeId)` — the timestamp is the transaction's
+own stage-time commit-attempt `ts`, and the node is a tiebreak: different
+tablet groups run independent `Hlc` instances that never witness each
+other directly, so two different groups' leaders can in principle mint
+the identical `(wall_ms, logical)` pair. A `TxnRecord` holds `{txn_id,
+status: Pending|Committed{commit_ts}|Aborted, intent_spans, created_ts}`;
+`status` moves once, `Pending` -> `Committed`/`Aborted`, and every
+reader/resolver's decision is a pure function of that one flip.
+
+Per the PR1 amendment's decision 3, the record lives **inside** the first
+(anchor) participant's own tablet, not a separate always-on system tablet
+— unlike the range-seal/read-ceiling markers (`seal.rs`/`ceiling.rs`),
+which are deliberately **engine-global** (outside every `StorageScope`),
+a txn record has to be an ordinary in-scope logical key of one specific
+tablet, so it replicates through that tablet's own Raft log, ships with
+`engine_image` snapshots, and moves with a split/merge exactly like the
+anchor's own data would.
+
+That locality choice means the seal/ceiling markers' disjointness trick
+(reserve a name — `RESERVED_NAMESPACE` — no user table may ever claim,
+since the marker lives *outside* every scope) doesn't apply: a record has
+to be provably disjoint from an arbitrary table's own row keys, which are
+fully client-controlled bytes with no analogous reservation available.
+The record key is `token(8 bytes) || [0x00, 0x02] || encode(txn_id)`,
+where `token` is the anchor write's own 8-byte partition token (ADR 0022
+— every data-plane key leads with one, unconditionally). Disjointness is
+proved structurally from `animus_tablet::escape`'s own encoding rule
+(never emits a lone `0x00`; every literal `0x00` byte doubles to `0x00
+0x01`; the whole encoding always terminates `0x00 0x00`): a real key's
+post-token suffix, `escape(pk) ++ rk`, can only ever start `[0x00, 0x00]`
+(empty `pk`) or `[0x00, 0x01, ..]` (`pk` starting with a literal `0x00`)
+when it starts with `0x00` at all — never `[0x00, 0x02, ..]`, for *any*
+`pk`/`rk` whatsoever, however the fully-arbitrary `rk` suffix is chosen.
+See `animus-cp-data/src/txn.rs`'s module doc for the full proof and
+`docs/engineering-lessons.md`'s Code-patterns entry for the general
+technique (find a byte position the *encoding itself* constrains, not a
+naming convention, when a marker must live inside client-controlled key
+space).
+
+**A residual, documented, not closed by this PR**: a tablet split's
+`split_key` is an arbitrary existing row's own key
+(`animusd::auto_split_loop`'s byte-weighted median), not necessarily
+token-aligned, so in principle a single token's rows — and, per this
+design, its txn record — could end up split across two sibling tablets by
+a split racing an in-flight transaction. PR3 is deliberately
+single-participant/single-tablet in scope; split-vs.-in-flight-txn
+interaction is a PR4+ concern, mirroring how the range seal itself needed
+a dedicated amendment once genuine concurrent splits were exercised
+(the PR2 amendment's corrective note #2).
+
+### 3. Four new `KvCommand` variants, one Raft group
+
+`TxnStage { txn_id, record_key, writes, spans, fence, ts }` creates/
+refreshes the `Pending` record and merges every write as an intent —
+whole-or-nothing against `fence`/the range seal, exactly like `Batch`: a
+partial stage would let a reader observe some of a transaction's intents
+but not others. `TxnCommit`/`TxnAbort { txn_id, record_key, ts }` flip the
+record `Pending -> Committed{commit_ts: ts}`/`Aborted` — deliberately
+**no** `fence`, like `Seal`/`ReadCeiling`: a 2PC decision must be durable
+and final regardless of any later range change, and neither ever touches
+user data, only the record key. Re-applying the identical decision on WAL
+replay is an idempotent no-op; a *conflicting* second decision (a
+different `commit_ts`, or committing an already-aborted record) is a
+protocol-bug hard assert, not a silently-tolerated case. `TxnResolve {
+txn_id, record_key, keys, ts }` rewrites each key still holding that
+txn's intent to its final form per the record's already-decided status:
+committed → the staged value (or a real tombstone, for a staged delete);
+aborted → the value the key held **immediately before** the intent,
+restored forward at `ts` by rewinding to the version just below the
+intent's own applied version (`get_at(key, intent_version - 1)`) — never
+a tombstone, which would incorrectly shadow that older, still-live
+committed value. A key whose stored value is no longer that exact intent
+(already resolved, or overwritten by something newer) is left untouched.
+
+`RaftKvNode::txn_stage`/`txn_decide`/`txn_write` are the leader-side API:
+`txn_write` is the one-shot convenience (stage, mint a fresh commit ts,
+commit, resolve — deliberately **three** log entries, fully synchronous;
+PR4 collapses/parallelizes this across multiple participant groups, not
+here); `txn_stage`/`txn_decide` split it for a caller (or a test) that
+needs to abort instead, or drive the phases independently.
+
+### 4. The read path: resolving an intent
+
+A read that encounters an intent looks up its named record (in this same
+tablet's scope — the single-participant invariant) and acts on its
+status: `Committed` at or before the read's own timestamp serves the
+staged value; `Aborted` — or a `Committed` **after** the read's timestamp,
+equally invisible to that snapshot — serves the pre-intent value via the
+rewind described above; `Pending` is a **bounded retry** at a point read
+(`local_get`/`linearizable_get`/`read_at`, `RaftKvNode::read_resolved`,
+push/wait scheduling deferred to PR4) or a **silent omission** at a scan
+(`local_scan`/`scan_at`/`linearizable_scan`, non-blocking by design in
+this PR — full push/wait for a scan is also PR4). `local_get` itself
+never retries at all (a raw, non-blocking peek, its existing documented
+contract) — only the barrier-gated `linearizable_get`/`read_at` retry.
+
+A `Cas` whose current-value read hits a pending intent fails
+deterministically (`false`, never a guess at a match or an absence) —
+every replica reaches the identical decision, so contention correctness
+is preserved; PR4 revisits CAS-vs-in-flight-txn interaction (push/abort
+the blocking transaction instead of just failing).
+
+### 5. What ships with PR3, what's still deferred
+
+Landing: the value envelope; `TxnId`/`TxnStatus`/`TxnRecord`/`Envelope`
+(`txn.rs`); the four new `KvCommand` variants + their wire codec support
+(`codec.rs` `VERSION` bump); `txn_stage`/`txn_decide`/`txn_write`;
+scan-side record-marker filtering; a `SimEnv` test suite (commit path,
+abort path, a committed delete's real tombstone, a pending read blocking
+then serving once committed, intent/record markers never leaking into a
+scan, crash/restart WAL-replay idempotency, snapshot-catchup carrying
+records/intents like ordinary data, and a stage into an already-sealed
+range being rejected wholesale) plus a `ProdEnv` concurrent hammer
+extending the PR2 mint/propose-ordering regression's coverage to the new
+commands.
+
+Deferred to PR4+: multi-participant 2PC across two or more Raft groups
+(prepare/commit/async resolution as genuinely separate network round
+trips, not all local to one group); in-doubt recovery off a crashed
+coordinator; push/wait scheduling for a `Pending` read (rather than a
+bounded retry-then-fail) and for a scan; CAS-vs-in-flight-txn interaction
+beyond a deterministic fail; the split-vs-in-flight-txn interaction noted
+in §2; and the multi-tablet Elle corpus (Follow-up step 5), the safety
+net that lets this and the prior steps be trusted at depth.
