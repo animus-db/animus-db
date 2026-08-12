@@ -1570,3 +1570,87 @@ fn abort_restore_never_meets_another_transactions_intent() {
          from an overwriting transaction that was rejected (seed={seed})"
     );
 }
+
+/// ADR 0018 §2/PR6 hardening: the apply-time defense-in-depth check on
+/// `KvCommand::TxnResolve` (see `apply_and_compact`'s arm) rejects a resolve
+/// whose carried `outcome` disagrees with the anchor's own decided record,
+/// whole-or-nothing, rather than silently applying it. There is no known
+/// live caller that gets this wrong — every real decider (`animusd`'s
+/// ordinary coordinator path and its recovery pusher alike) already
+/// re-reads the record's actual status before resolving — so this test
+/// exercises the guard directly via the low-level `txn_resolve` primitive
+/// (itself `pub`, since a multi-participant coordinator must call it with
+/// an already-decided `outcome` rather than deriving one locally) with a
+/// deliberately wrong outcome standing in for a hypothetical future caller
+/// that skipped the re-read.
+#[test]
+fn a_resolve_carrying_the_wrong_outcome_no_ops_against_the_anchors_own_record() {
+    let seed = 0xB16E;
+    let mut sim = Simulator::new(seed);
+    let engine = MemoryEngine::new();
+    let nodes_a = start_group(&sim, &GROUP_A, engine.clone(), b"orders:");
+    sim.run_for(ELECT);
+    let la = leader(&nodes_a, seed, "A");
+    let ka = key(1, b":order");
+    let mut end = ka.clone();
+    end.push(0);
+    let span = KeyRange::new(ka.clone(), Some(end));
+
+    let (txn_id, record_key) = stage_anchor(
+        &mut sim,
+        &nodes_a[la],
+        "orders",
+        vec![(ka.clone(), Some(b"placed".to_vec()))],
+        Vec::new(),
+    )
+    .expect("anchor stage");
+    let commit_ts = commit_at_least(
+        &mut sim,
+        &nodes_a[la],
+        txn_id.clone(),
+        record_key.clone(),
+        txn_id.ts,
+    )
+    .expect("commit applies");
+
+    // Resolve with an outcome that flatly disagrees with what the record
+    // actually decided (`Aborted` when the record is genuinely `Committed`)
+    // — the entry itself still applies (propose/apply always accepts a
+    // well-formed command), but the guard must refuse to act on it.
+    resolve(
+        &mut sim,
+        &nodes_a[la],
+        txn_id.clone(),
+        record_key.clone(),
+        vec![ka.clone()],
+        TxnOutcome::Aborted,
+    );
+    sim.run_for(SETTLE);
+
+    // Rejected: the intent is still live, completely untouched — never
+    // resolved into an incorrect abort-restore that would have erased
+    // "placed" and left the key absent.
+    assert_eq!(
+        verify_staged(&mut sim, &nodes_a[la], span, txn_id.clone()),
+        Some(true),
+        "a mismatched-outcome resolve must no-op, leaving the intent live (seed={seed})"
+    );
+
+    // A second resolve with the real, re-read outcome lands cleanly —
+    // proving the guard blocks only the wrong outcome, not resolution
+    // itself.
+    resolve(
+        &mut sim,
+        &nodes_a[la],
+        txn_id,
+        record_key,
+        vec![ka.clone()],
+        TxnOutcome::Committed { commit_ts },
+    );
+    sim.run_for(SETTLE);
+    assert_eq!(
+        block_on(nodes_a[la].local_get(&ka)),
+        Some(b"placed".to_vec()),
+        "seed={seed}"
+    );
+}

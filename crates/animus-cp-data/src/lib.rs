@@ -4224,7 +4224,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
             }
             KvCommand::TxnResolve {
                 txn_id,
-                record_key: _record_key,
+                record_key,
                 keys,
                 outcome,
                 ts,
@@ -4253,8 +4253,83 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                         txn::TxnOutcome::Committed { commit_ts } => Some(*commit_ts),
                         txn::TxnOutcome::Aborted => None,
                     };
+                    // ADR 0018 §2/PR6 hardening (defense-in-depth, not a
+                    // reproduced bug): every current decider
+                    // (`animusd`'s ordinary `cp_txn` commit path and its
+                    // recovery pusher alike — see `txn_commit_at_least`/
+                    // `txn_abort`'s doc) already re-reads the record's
+                    // *actual* decided status before resolving, rather than
+                    // trusting its own candidate outcome. But nothing at
+                    // apply time structurally enforced that discipline —
+                    // a future caller that resolved from a stale/assumed
+                    // outcome instead of a re-read would be
+                    // LWW-unrepairable (this key's version chain would
+                    // carry a wrong-outcome rewrite no later correct
+                    // resolve can undo). When this group holds
+                    // `record_key` locally — i.e. this is the anchor's own
+                    // group for `txn_id` — cross-check the carried
+                    // `outcome` against the record's real `status` and
+                    // refuse to resolve on a mismatch, whole-or-nothing,
+                    // rather than silently applying the wrong outcome.
+                    // **No known live violator as of PR6; guards a class,
+                    // not a reproduced bug** (see the PR6 audit recorded
+                    // in `docs/engineering-lessons.md` and ADR 0018's PR5
+                    // amendment §1's corrective note).
+                    //
+                    // A non-anchor participant's own apply cannot run this
+                    // check at all — its tablet never holds a copy of
+                    // `record_key`'s record (that's the entire reason
+                    // `outcome` travels explicitly on this command; see
+                    // `KvCommand::TxnResolve`'s doc). That residual is
+                    // accepted, not fixed, here: closing it would need the
+                    // resolver to also carry the record's own decision
+                    // `ts` so a participant could at least reject an
+                    // outcome inconsistent with it, which is left for a
+                    // future PR if the cost proves worth it.
+                    let outcome_mismatch = match storage
+                        .get(&scope.physical(&record_key))
+                        .await
+                        .expect("raftkv txn resolve record read")
+                        .and_then(|vv| txn::decode_record(&vv.value))
+                    {
+                        Some(record) if record.txn_id == txn_id => match (&record.status, &outcome)
+                        {
+                            (
+                                txn::TxnStatus::Committed { commit_ts: rec_ts },
+                                txn::TxnOutcome::Committed { commit_ts: out_ts },
+                            ) => rec_ts != out_ts,
+                            (txn::TxnStatus::Aborted, txn::TxnOutcome::Aborted) => false,
+                            // Resolving before the record itself ever
+                            // decided, or a flat Committed-vs-Aborted
+                            // disagreement — either way, a mismatch.
+                            _ => true,
+                        },
+                        // No local record for this exact `txn_id` — either
+                        // a non-anchor participant (nothing to check), or
+                        // this group is the anchor but hasn't applied its
+                        // own decision yet in this same batch (can't
+                        // happen: `TxnCommit`/`TxnAbort` always apply
+                        // strictly before the `TxnResolve` that follows
+                        // them — see `txn_commit_at_least`/`txn_abort`'s
+                        // callers). Proceed either way; this is the
+                        // expected, common case.
+                        _ => false,
+                    };
+                    if outcome_mismatch {
+                        tracing::warn!(
+                            ?txn_id,
+                            ?record_key,
+                            carried_outcome = ?outcome,
+                            "raftkv: TxnResolve's carried outcome does not match the anchor's own \
+                             decided record — skipping resolve as defense-in-depth (no known live \
+                             violator as of PR6; guards a class, not a reproduced bug)"
+                        );
+                    }
                     let version = hlc::pack(ts);
                     for key in &keys {
+                        if outcome_mismatch {
+                            continue; // whole-or-nothing: skip every key, not just this one
+                        }
                         let physical_key = scope.physical(key);
                         let Some(vv) = storage
                             .get(&physical_key)
