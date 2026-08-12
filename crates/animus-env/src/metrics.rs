@@ -262,12 +262,35 @@ pub enum Metric {
     /// One `txn_resolver_loop` tick ran to completion on this node (over
     /// however many locally-led tablet groups it walked).
     CpTxnResolverRuns,
+
+    // --- Dynamo transactional surface (ADR 0018 §2, PR7) --- Appended after
+    // the resolver-runs variant; every earlier variant's slot and the
+    // text-export order stay stable, so the snapshot remains
+    // byte-reproducible. Recorded by `animusd::dynamo` at the one site that
+    // knows the real outcome of each request.
+    /// A `TransactWriteItems` request committed atomically (`ClientCtx::cp_txn`
+    /// returned `Ok`).
+    DynamoTransactWritesCommitted,
+    /// A `TransactWriteItems` request was cancelled — a condition failure or a
+    /// lost 2PC race (`ClientCtx::cp_txn` returned `Err`, or a condition
+    /// evaluated false before staging began).
+    DynamoTransactWritesCanceled,
+    /// A `TransactGetItems` request returned a quiescence-confirmed consistent
+    /// snapshot on its **first** confirming round (no retry needed).
+    DynamoTransactGetsOk,
+    /// A `TransactGetItems` request needed at least one extra round beyond the
+    /// first confirming pair before its snapshot quiesced (still returned
+    /// `Ok`), or exhausted its bounded retries without quiescing (returned a
+    /// retryable `TransactionCanceledException`) — both are contention
+    /// signals, hence one counter (see `run_transact_get`'s doc for why the
+    /// two aren't split further).
+    DynamoTransactGetsRetried,
 }
 
 impl Metric {
     /// Every metric, in a fixed order. The array index of a metric in `ALL` is
     /// its slot in the [`MetricSink`]; keep this in sync with the enum.
-    pub const ALL: [Metric; 49] = [
+    pub const ALL: [Metric; 53] = [
         Metric::ElectionsStarted,
         Metric::ElectionsWon,
         Metric::AppendEntriesSent,
@@ -317,6 +340,10 @@ impl Metric {
         Metric::CpTxnRecoveredCommitted,
         Metric::CpTxnRecoveredAborted,
         Metric::CpTxnResolverRuns,
+        Metric::DynamoTransactWritesCommitted,
+        Metric::DynamoTransactWritesCanceled,
+        Metric::DynamoTransactGetsOk,
+        Metric::DynamoTransactGetsRetried,
     ];
 
     /// The stable exported name of this metric (snake_case, used as the text
@@ -373,6 +400,10 @@ impl Metric {
             Metric::CpTxnRecoveredCommitted => "cp_txn_recovered_committed",
             Metric::CpTxnRecoveredAborted => "cp_txn_recovered_aborted",
             Metric::CpTxnResolverRuns => "cp_txn_resolver_runs",
+            Metric::DynamoTransactWritesCommitted => "dynamo_transact_writes_committed",
+            Metric::DynamoTransactWritesCanceled => "dynamo_transact_writes_canceled",
+            Metric::DynamoTransactGetsOk => "dynamo_transact_gets_ok",
+            Metric::DynamoTransactGetsRetried => "dynamo_transact_gets_retried",
         }
     }
 

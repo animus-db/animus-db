@@ -716,7 +716,12 @@ async fn extended_surface() {
         "u4 not written: {body}"
     );
 
-    // A failing transaction condition rejects the whole request.
+    // A failing transaction condition rejects the whole request. Since ADR
+    // 0018 §2/PR7 (atomic TransactWriteItems), a transaction's own condition
+    // failure is a `TransactionCanceledException` — the real DynamoDB
+    // exception type for a transaction — not the bare
+    // `ConditionalCheckFailedException` a single-item conditional write
+    // returns (see `dynamo.rs::run_transact`'s doc).
     let (status, body) = dynamo(
         addr,
         "DynamoDB_20120810.TransactWriteItems",
@@ -727,7 +732,7 @@ async fn extended_surface() {
     .await;
     assert_eq!(status, 400, "expected condition failure: {body}");
     assert!(
-        body.contains("ConditionalCheckFailedException"),
-        "expected ConditionalCheckFailedException, got: {body}"
+        body.contains("TransactionCanceledException"),
+        "expected TransactionCanceledException, got: {body}"
     );
 }

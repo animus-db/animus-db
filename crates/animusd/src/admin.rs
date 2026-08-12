@@ -25,6 +25,7 @@
 //! - `GET  /admin/status`              — the full replicated `Metadata`
 //! - `GET  /admin/raft`                — control-plane Raft state
 //! - `GET  /admin/raftkv`              — per hosted CP group Raft state
+//! - `GET  /admin/txns`                — per hosted CP group transaction-tracker state (ADR 0018 §2/PR7)
 //! - `GET  /admin/storage/lsm`         — LSM levels / SSTables / memtable (`?tablet=`)
 //! - `GET  /admin/storage/control`     — control-plane system-keyspace engine stats (ADR 0038 PR4)
 //! - `GET  /admin/storage/wal`         — WAL segments + sizes (`?tablet=`)
@@ -111,6 +112,67 @@ pub(crate) struct CpRaftView {
     /// gates on (`CpGroup::approx_bytes`), which is scoped but approximate.
     /// Always `Some` — both backends can be scanned.
     pub(crate) byte_size: Option<u64>,
+}
+
+/// One entry of a group's `pending: BTreeMap<TxnId, (record_key, created_ts)>`
+/// (ADR 0018 §2/PR5's `TxnTracker`) for the `/admin/txns` view (ADR 0018 §2/
+/// PR7). Built by [`crate::CpGroup::txn_view`].
+#[derive(serde::Serialize)]
+pub(crate) struct PendingTxnView {
+    /// `Debug`-formatted `TxnId` (`{ts, node}`) — a stable, if not pretty,
+    /// display; this is a debug surface, not a wire-facing identifier.
+    pub(crate) txn_id: String,
+    /// [`key_display`] of the record's own logical key (this tablet's the
+    /// anchor, so it lives in this tablet's own scope).
+    pub(crate) record_key: String,
+    /// The record's own stage-time HLC wall clock, in milliseconds.
+    pub(crate) created_wall_ms: u64,
+    /// How long this record has sat `Pending`, in milliseconds, as of this
+    /// node's own clock at request time.
+    pub(crate) age_ms: u64,
+    /// Whether `age_ms` has passed `RECOVERY_GRACE` — i.e. whether any actor
+    /// encountering this record's intents is now eligible to push it to a
+    /// decision (`ClientCtx::txn_recover`), not merely decline as still
+    /// in-flight.
+    pub(crate) past_grace: bool,
+    /// `"{table}: {start}..{end}"` per participant this transaction staged
+    /// (`TxnRecordView::intent_spans`), or `None` if the record's own
+    /// `intent_spans` couldn't be read (e.g. a mid-election leader) — a
+    /// best-effort barrier-gated read per pending entry, acceptable here
+    /// since a tablet anchors only a handful of pending transactions at
+    /// once; unlike `pending_txns()`/`unresolved_decided()` themselves
+    /// (cheap lock-and-clone, no barrier), this one field costs a real
+    /// ReadIndex round trip.
+    pub(crate) intent_spans: Option<Vec<String>>,
+}
+
+/// One entry of a group's `unresolved_decided: BTreeMap<TxnId, (record_key,
+/// outcome)>` (ADR 0018 §2/PR5's `TxnTracker`) for the `/admin/txns` view.
+#[derive(serde::Serialize)]
+pub(crate) struct UnresolvedTxnView {
+    pub(crate) txn_id: String,
+    pub(crate) record_key: String,
+    /// `"Committed{commit_ts: ..}"` or `"Aborted"` (`Debug`-formatted
+    /// `TxnOutcome`).
+    pub(crate) outcome: String,
+}
+
+/// This group's transaction-tracker view for `/admin/txns` (ADR 0018 §2/PR7,
+/// the observability surface PR4/PR5's own amendments deferred to this PR) —
+/// the read-only counterpart to `CpRaftView`, built the same way
+/// (`crate::CpGroup::txn_view`, one entry per hosted tablet, merged
+/// cluster-wide client-side exactly like `/admin/raftkv` — see that route's
+/// own doc for why `node` is carried explicitly). **Read-only**: no
+/// manual-resolution POST action exists (deferred, ADR 0018 PR7 amendment) —
+/// use the existing `txn_resolver_loop`/`ClientCtx::txn_recover` machinery,
+/// which already drives every record here to a decision past
+/// `RECOVERY_GRACE` with no operator action needed.
+#[derive(serde::Serialize)]
+pub(crate) struct CpTxnView {
+    pub(crate) tablet: u64,
+    pub(crate) node: NodeId,
+    pub(crate) pending: Vec<PendingTxnView>,
+    pub(crate) unresolved_decided: Vec<UnresolvedTxnView>,
 }
 
 /// Accept loop for the admin HTTP endpoint. One task per connection; HTTP/1.1
@@ -261,6 +323,7 @@ async fn dispatch(ctx: &ClientCtx, request: &http::HttpRequest) -> (u16, String)
         ),
         ("GET", "/admin/raft") => (200, raft_view(ctx)),
         ("GET", "/admin/raftkv") => (200, raftkv_view(ctx).await),
+        ("GET", "/admin/txns") => (200, txns_view(ctx).await),
         ("GET", "/admin/storage/lsm") => storage_lsm(ctx, q).await,
         ("GET", "/admin/storage/control") => storage_control(ctx).await,
         ("GET", "/admin/storage/wal") => storage_wal(ctx, q).await,
@@ -493,6 +556,22 @@ async fn raftkv_view(ctx: &ClientCtx) -> Value {
     let mut groups: Vec<CpRaftView> = Vec::new();
     for (t, g) in ctx.edge.hosted_groups() {
         groups.push(g.raft_view(t).await);
+    }
+    json!({ "hosts_cp": !groups.is_empty(), "groups": groups })
+}
+
+/// `GET /admin/txns` (ADR 0018 §2/PR7) — this node's own per-hosted-tablet
+/// transaction-tracker view (pending + unresolved-decided records), the
+/// observability surface the PR4/PR5 amendments deferred to this PR. Built
+/// the same way `raftkv_view` is: one `CpTxnView` per hosted tablet
+/// (`CpGroup::txn_view`), node-local — a cluster-wide picture is a
+/// client-side fan-out over every node's own `/admin/txns`, exactly like
+/// `/admin/raftkv` (see that route's own doc). Pure observer, no gated
+/// action: manual transaction resolution is deferred (see `CpTxnView`'s doc).
+async fn txns_view(ctx: &ClientCtx) -> Value {
+    let mut groups: Vec<CpTxnView> = Vec::new();
+    for (t, g) in ctx.edge.hosted_groups() {
+        groups.push(g.txn_view(t).await);
     }
     json!({ "hosts_cp": !groups.is_empty(), "groups": groups })
 }
@@ -1732,7 +1811,7 @@ fn parse_token_base64(s: &str) -> Option<Vec<u8>> {
 /// or one shorter than the token width — is shown as text unchanged. Inverse of
 /// [`parse_key_display`], so a token-prefixed key shown in the browse view
 /// round-trips back through the key inspector.
-fn key_display(bytes: &[u8]) -> String {
+pub(crate) fn key_display(bytes: &[u8]) -> String {
     let printable = |b: &u8| (0x20..0x7f).contains(b);
     if bytes.len() < TOKEN_BYTES || bytes[..TOKEN_BYTES].iter().all(printable) {
         return String::from_utf8_lossy(bytes).into_owned();

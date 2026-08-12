@@ -20,17 +20,25 @@
 //! ## Operations and storage mapping
 //!
 //! Supported: `CreateTable`, `PutItem`, `GetItem`, `DeleteItem`, `Query`,
-//! `Scan`, `UpdateItem`, `BatchWriteItem`, `TransactWriteItems`. The data-plane
-//! key for an item is `escape(table) || escape(pk) || sk` (so tables share one
-//! keyspace without colliding). The data plane has no native delete, so
-//! `DeleteItem` writes a tombstone value that `GetItem` reads back as absent.
-//! `UpdateItem` is a read-modify-write (`SET`/`REMOVE`); `BatchWriteItem` commits
-//! each table's put/delete requests as **one Raft entry per tablet** (the CP
-//! batch-put primitive, ADR 0017 — one consensus round for the batch instead of
-//! one per key), atomic within a tablet and non-atomic across tablets (DynamoDB
-//! semantics); `TransactWriteItems` applies condition-gated actions in order but
-//! **without cross-action atomicity** (true ACID via Accord, ADR 0011, is deferred
-//! — see [`run_transact`]).
+//! `Scan`, `UpdateItem`, `BatchWriteItem`, `TransactWriteItems`,
+//! `TransactGetItems`. The data-plane key for an item is `escape(table) ||
+//! escape(pk) || sk` (so tables share one keyspace without colliding). The data
+//! plane has no native delete, so `DeleteItem` writes a tombstone value that
+//! `GetItem` reads back as absent. `UpdateItem` is a read-modify-write
+//! (`SET`/`REMOVE`); `BatchWriteItem` commits each table's put/delete requests
+//! as **one Raft entry per tablet** (the CP batch-put primitive, ADR 0017 — one
+//! consensus round for the batch instead of one per key), atomic within a
+//! tablet and non-atomic across tablets (DynamoDB semantics).
+//!
+//! `TransactWriteItems` **is atomic** (ADR 0018 §2/PR7): every condition-gated
+//! `Put`/`Delete`/`Update`/`ConditionCheck` action commits whole-or-nothing
+//! across however many tablets/tables it spans, via
+//! [`ClientCtx::cp_txn`](crate::ClientCtx::cp_txn) — see [`run_transact`]'s doc
+//! for the exact condition-evaluation/precondition layering and the deferred
+//! per-action `CancellationReasons` fidelity. `TransactGetItems` is a
+//! **consistent multi-key read** (new, ADR 0018 §2/PR7) — see
+//! [`run_transact_get`]'s doc for its quiescence-confirmation semantics (a
+//! serializable snapshot via retry-on-contention, not a wait-free one).
 //!
 //! ## Per-table schemas: the replicated catalog (ADR 0013)
 //!
@@ -111,17 +119,19 @@
 //! returns the index's declared projected attributes (applied at the edge after
 //! the base item is read).
 
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 use animus_control::{MetaCommand, Metadata, ReplicationMode};
 use animus_dynamo::wire::{
-    self, Operation, Projection, ReturnValues, TransactAction, UpdateAction, UpdateReturnValues,
-    WireError, WriteRequest,
+    self, Operation, Projection, ReturnValues, TransactAction, TransactGet, UpdateAction,
+    UpdateReturnValues, WireError, WriteRequest,
 };
 use animus_dynamo::{
     AttributeValue, ConditionExpression, Item, SortKeyCondition, TableSchema,
     schema as schema_bridge, storage_key,
 };
+use animus_env::Metric;
 use animus_tablet::partition_token;
 use tokio::net::{TcpListener, TcpStream};
 
@@ -134,6 +144,22 @@ const SCHEMA_COMMIT_TIMEOUT: Duration = Duration::from_secs(5);
 /// How often `CreateTable` re-checks (and re-proposes against the current leader)
 /// while waiting for the schema to commit.
 const SCHEMA_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Max actions per `TransactWriteItems` request / keys per `TransactGetItems`
+/// request (ADR 0018 §2/PR7) — DynamoDB's own limit (1-100 items); we don't
+/// replicate AWS's fuller request-size validation, just this simple cap.
+const MAX_TRANSACT_ITEMS: usize = 100;
+
+/// Bounded rounds `run_transact_get`'s quiescent read gives a multi-key
+/// snapshot to stabilize: the first round, a confirming round, then up to
+/// [`TRANSACT_GET_MAX_ROUNDS`] `- 2` further retries (ADR 0018 §2/PR6's
+/// corpus finding — see `run_transact_get`'s doc for why two-round agreement,
+/// not a single coordinator-minted timestamp, is what actually closes this).
+const TRANSACT_GET_MAX_ROUNDS: usize = 4;
+/// Delay between `run_transact_get` rounds once two consecutive rounds have
+/// disagreed — gives an in-flight transaction touching the read keys a
+/// moment to finish landing before the next round samples again.
+const TRANSACT_GET_POLL: Duration = Duration::from_millis(20);
 
 /// This node's snapshot of the replicated [`Metadata`](animus_control::Metadata).
 /// The schema catalog is Raft-replicated, so this node's committed view is sound
@@ -526,14 +552,16 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             Ok(wire::batch_write_response())
         }
         Operation::TransactWriteItems { actions } => {
-            // Hold the per-node RMW lock across the whole transaction so its
-            // condition checks + writes can't interleave with another RMW on this
-            // node. The per-action helpers (`put_item`/`delete_item`/
-            // `run_update_item`) deliberately take no lock — they run under this
-            // guard, and a tokio Mutex is not reentrant.
-            let _rmw = ctx.data().rmw_lock.lock().await;
+            // Unlike the old serial-loop implementation, atomicity now comes
+            // from `ClientCtx::cp_txn` (a real cross-tablet 2PC), not this
+            // node's `rmw_lock` — `run_transact` still takes it across its own
+            // pre-read/evaluate pass (mirroring every other conditional write
+            // here) so two transactions on this node can't interleave their
+            // condition checks, but the lock is not what makes the *commit*
+            // atomic.
             run_transact(ctx, meta, &actions).await
         }
+        Operation::TransactGetItems { gets } => run_transact_get(ctx, meta, &gets).await,
     }
 }
 
@@ -646,67 +674,6 @@ async fn create_table(
     Ok(wire::create_table_response(table, schema, indexes))
 }
 
-/// `PutItem` core (the `TransactWriteItems` per-action path): resolve the key,
-/// optionally gate on `condition`, quorum-write, and update the key index.
-/// Returns the prior item (for `ReturnValues`). Takes no RMW lock itself — the
-/// transact caller already holds `ctx.data().rmw_lock` across the whole transaction.
-async fn put_item(
-    ctx: &ClientCtx,
-    meta: &Metadata,
-    table: &str,
-    item: &Item,
-    condition: Option<&ConditionExpression>,
-) -> Result<Option<Item>, WireError> {
-    let (pk, sk) = resolve_key(ctx, meta, table, item)?;
-    let key = item_key(&pk, sk.as_ref());
-    let old = if condition.is_some() {
-        quorum_read(ctx, meta, table, &key).await?
-    } else {
-        None
-    };
-    if let Some(cond) = condition
-        && !cond.evaluate(old.as_ref())
-    {
-        return Err(WireError::conditional_check_failed(
-            "the conditional request failed",
-        ));
-    }
-    let value = wire::encode_stored_item(item);
-    quorum_write(ctx, meta, table, &key, &value).await?;
-    note_put(ctx, table, &key, item);
-    Ok(old)
-}
-
-/// `DeleteItem` core (the `TransactWriteItems` per-action path): resolve the
-/// key, optionally gate on `condition`, quorum-write a tombstone, and drop the
-/// key from the index. Returns the prior item (for `ReturnValues`). Takes no RMW
-/// lock itself — the transact caller already holds `ctx.data().rmw_lock`.
-async fn delete_item(
-    ctx: &ClientCtx,
-    meta: &Metadata,
-    table: &str,
-    key_item: &Item,
-    condition: Option<&ConditionExpression>,
-) -> Result<Option<Item>, WireError> {
-    let (pk, sk) = resolve_key(ctx, meta, table, key_item)?;
-    let key = item_key(&pk, sk.as_ref());
-    let old = if condition.is_some() {
-        quorum_read(ctx, meta, table, &key).await?
-    } else {
-        None
-    };
-    if let Some(cond) = condition
-        && !cond.evaluate(old.as_ref())
-    {
-        return Err(WireError::conditional_check_failed(
-            "the conditional request failed",
-        ));
-    }
-    quorum_write(ctx, meta, table, &key, &wire::encode_tombstone()).await?;
-    note_delete(ctx, table, &key);
-    Ok(old)
-}
-
 /// `UpdateItem`: read-modify-write. Reads the current item, applies the SET/REMOVE
 /// actions (starting from the key attributes when the item is absent — an upsert,
 /// as in DynamoDB), gating on an optional `condition`, then quorum-writes the new
@@ -744,69 +711,384 @@ async fn run_update_item(
     ))
 }
 
-/// `TransactWriteItems`: apply each condition-gated action in order. **Not truly
-/// atomic** — there is no cross-action rollback (full Accord-backed transactional
-/// writes are deferred; ADR 0011): if action *k* fails its condition, actions
-/// before it have already been applied. We *do* honor each action's condition (so
-/// a failed `ConditionCheck`/conditional write rejects the request), giving the
-/// common "assert-then-write" use the right answer; the documented gap is the
-/// all-or-nothing guarantee. The caller holds `ctx.data().rmw_lock` across the call, so
-/// the whole transaction is serialized against this node's other RMWs.
+/// What a committed `TransactWriteItems` action does to the edge-local
+/// GSI/LSI index after the atomic commit lands (`note_put`/`note_delete`,
+/// applied post-commit — see [`run_transact`]'s doc for why this happens
+/// after `cp_txn` returns rather than per-action, unlike the old serial-loop
+/// implementation).
+enum IndexNote {
+    Put(Item),
+    Delete,
+}
+
+/// `TransactWriteItems`: apply every condition-gated action **atomically**
+/// (ADR 0018 §2/PR7), replacing the old serial-loop implementation's
+/// documented non-atomicity gap. Every action either lands, or none do — no
+/// partial application is ever observable, whether the failure is a
+/// condition evaluating false or a losing race in the underlying 2PC.
+///
+/// **Condition evaluation, precisely — this is a layered design, not a
+/// direct translation.** A DynamoDB `ConditionExpression`
+/// (`attribute_exists`/`attribute_not_exists`/`attr = value`) is not
+/// something [`ClientCtx::cp_txn`] understands — its own precondition
+/// mechanism is a plain byte-equality check against a raw stored value (a
+/// deliberate simplification documented on `cp_txn` itself: "re-checks
+/// every precondition by value" rather than at an HLC read timestamp). This
+/// function evaluates the *semantic* condition itself, once, via an
+/// ordinary linearizable pre-read of every condition-gated key (a
+/// `ConditionCheck`, or a `Put`/`Delete`/`Update` carrying its own
+/// `condition`) — a false condition rejects the whole request **before
+/// `cp_txn` is ever called**, so nothing has been staged and there is
+/// nothing to unwind.
+///
+/// **Only a `ConditionCheck`'s observed value becomes a `cp_txn`
+/// precondition — a write action's own condition does not, even though it
+/// was evaluated the same way.** This looks like an inconsistency but is
+/// load-bearing: `cp_txn`'s precondition mechanism re-reads the key once
+/// before staging and again right before the commit decision, aborting if
+/// the value changed. A `ConditionCheck`'s key is, by construction, never
+/// one this transaction writes (the duplicate-item check below guarantees
+/// every action targets a distinct key), so that re-read observes an
+/// ordinary committed value throughout — exactly the cross-key RMW guard
+/// `cp_txn`'s own precondition design is for. A **write** action's own key
+/// is different: by the time `cp_txn` would re-read it, *this same
+/// transaction* has already staged an unresolved intent there, so the
+/// "re-read" would retry against its own in-flight write — which cannot
+/// resolve until the transaction itself decides, which hasn't happened yet.
+/// This was found the hard way (not reasoned out in advance): an earlier
+/// version of this function fed a conditioned `Put`'s own pre-read into
+/// `cp_txn`'s preconditions, and `crates/animusd/tests/dynamo_schema.rs`'s
+/// `extended_surface` test started failing — not with a timeout, but with a
+/// spurious "value changed" cancellation several seconds later. The
+/// self-read blocks in `cp_read`'s own retry loop until the *background*
+/// `txn_resolver_loop` (a separate task) pushes the stale-past-
+/// `RECOVERY_GRACE` record to a decision via recovery — at which point the
+/// read finally returns the now-committed value, which of course differs
+/// from the pre-stage observation, so `cp_txn` reports a cancellation that
+/// has nothing to do with a real conflict. A write's own condition is
+/// therefore protected only by this function's one-time pre-read (the same
+/// protection `PutItem`/`DeleteItem`/`UpdateItem` already give outside a
+/// transaction, via `ctx.data().rmw_lock`, below) — a narrower guarantee
+/// than a `ConditionCheck` gets, but the only one `cp_txn`'s mechanism can
+/// give without this self-referential stall. See the PR7 ADR amendment.
+///
+/// **Every key is touched by at most one action** (validated up front,
+/// matching DynamoDB's own "cannot include multiple operations on one
+/// item" rule, and the structural precondition of the paragraph above) —
+/// `cp_txn`'s `writes` has no concept of "these two entries are for the
+/// same key," so two actions racing to write the same key within one
+/// request would otherwise silently resolve by list order, not a
+/// client-visible error.
+///
+/// **Failure exception shape**: any condition failure, or a `cp_txn` abort
+/// (a lost 2PC race, or a `ConditionCheck` precondition that changed
+/// underneath this request), is reported as `TransactionCanceledException`
+/// — the real DynamoDB exception type for a transaction (as opposed to
+/// `ConditionalCheckFailedException`, which only a single-item conditional
+/// write returns) — in **simple form**: one message, not AWS's per-action
+/// `CancellationReasons` array (explicitly deferred, ADR 0018 PR1 amendment
+/// decision 4 / the PR7 amendment).
+///
+/// **The all-`ConditionCheck` corner case**: `cp_txn` requires at least one
+/// write to anchor its 2PC record on. A request with no `Put`/`Delete`/
+/// `Update` at all (every action a bare `ConditionCheck`) has nothing to
+/// stage, so this falls back to a second, immediate by-value re-check of
+/// every condition (mirroring `cp_txn`'s own pre-commit refresh) instead of
+/// calling it — the same OCC guarantee, just without a durable transaction
+/// record backing the window. A narrow, documented limitation of this
+/// corner case (see the PR7 ADR amendment), not the common path.
 async fn run_transact(
     ctx: &ClientCtx,
     meta: &Metadata,
     actions: &[TransactAction],
 ) -> Result<String, WireError> {
+    if actions.is_empty() {
+        return Err(WireError::validation(
+            "TransactWriteItems requires at least one action",
+        ));
+    }
+    if actions.len() > MAX_TRANSACT_ITEMS {
+        return Err(WireError::validation(format!(
+            "TransactWriteItems supports at most {MAX_TRANSACT_ITEMS} actions"
+        )));
+    }
+
+    // Serialize against this node's other RMWs across the whole pre-read/
+    // evaluate/commit span — exactly like every other conditional write here
+    // (`PutItem`/`DeleteItem`/`UpdateItem`). `cp_txn`'s own cross-tablet 2PC
+    // is what makes the *commit* atomic; this lock only prevents two
+    // transactions (or a transaction and an ordinary conditional write) on
+    // THIS node from interleaving their condition checks — see this
+    // function's own doc for why a write action's own condition has no
+    // stronger guarantee than that.
+    let _rmw = ctx.data().rmw_lock.lock().await;
+
+    let mut writes: Vec<crate::TxnTableWrite> = Vec::new();
+    let mut preconditions: Vec<crate::TxnPrecondition> = Vec::new();
+    let mut index_notes: Vec<(String, Vec<u8>, IndexNote)> = Vec::new();
+    let mut seen: BTreeSet<(String, Vec<u8>)> = BTreeSet::new();
+
     for action in actions {
-        match action {
+        let table = action.table().to_owned();
+        let (key_item, condition): (&Item, Option<&ConditionExpression>) = match action {
             TransactAction::Put {
-                table,
-                item,
-                condition,
-            } => {
-                put_item(ctx, meta, table, item, condition.as_ref()).await?;
+                item, condition, ..
+            } => (item, condition.as_ref()),
+            TransactAction::Delete { key, condition, .. } => (key, condition.as_ref()),
+            TransactAction::Update { key, condition, .. } => (key, condition.as_ref()),
+            TransactAction::ConditionCheck { key, condition, .. } => (key, Some(condition)),
+        };
+        let is_condition_check = matches!(action, TransactAction::ConditionCheck { .. });
+        let (pk, sk) = resolve_key(ctx, meta, &table, key_item)?;
+        let data_key = item_key(&pk, sk.as_ref());
+        if !seen.insert((table.clone(), data_key.clone())) {
+            return Err(WireError::validation(
+                "Transaction request cannot include multiple operations on one item",
+            ));
+        }
+
+        // An `Update` always needs a pre-read (to compute its new value); a
+        // `Put`/`Delete`/`ConditionCheck` only needs one if it carries a
+        // condition to evaluate.
+        let needs_read = condition.is_some() || matches!(action, TransactAction::Update { .. });
+        let raw = if needs_read {
+            Some(raw_quorum_read(ctx, meta, &table, &data_key).await?)
+        } else {
+            None
+        };
+        let decoded = match &raw {
+            Some(Some(bytes)) => wire::decode_stored_item(bytes)?,
+            _ => None,
+        };
+        if let Some(cond) = condition
+            && !cond.evaluate(decoded.as_ref())
+        {
+            return Err(WireError::transaction_canceled(
+                "a transaction condition check failed",
+            ));
+        }
+
+        match action {
+            TransactAction::Put { item, .. } => {
+                writes.push((
+                    table.clone(),
+                    data_key.clone(),
+                    Some(wire::encode_stored_item(item)),
+                ));
+                index_notes.push((
+                    table.clone(),
+                    data_key.clone(),
+                    IndexNote::Put(item.clone()),
+                ));
             }
-            TransactAction::Delete {
-                table,
-                key,
-                condition,
-            } => {
-                delete_item(ctx, meta, table, key, condition.as_ref()).await?;
+            TransactAction::Delete { .. } => {
+                writes.push((
+                    table.clone(),
+                    data_key.clone(),
+                    Some(wire::encode_tombstone()),
+                ));
+                index_notes.push((table.clone(), data_key.clone(), IndexNote::Delete));
             }
             TransactAction::Update {
-                table,
-                key,
-                actions,
-                condition,
+                actions: update_actions,
+                ..
             } => {
-                run_update_item(
-                    ctx,
-                    meta,
-                    table,
-                    key,
-                    actions,
-                    condition.as_ref(),
-                    UpdateReturnValues::None,
-                )
-                .await?;
+                let base = decoded.clone().unwrap_or_else(|| key_item.clone());
+                let new = wire::apply_update(base, update_actions);
+                writes.push((
+                    table.clone(),
+                    data_key.clone(),
+                    Some(wire::encode_stored_item(&new)),
+                ));
+                index_notes.push((table.clone(), data_key.clone(), IndexNote::Put(new)));
             }
-            TransactAction::ConditionCheck {
-                table,
-                key,
-                condition,
-            } => {
-                let (pk, sk) = resolve_key(ctx, meta, table, key)?;
-                let data_key = item_key(&pk, sk.as_ref());
-                let current = quorum_read(ctx, meta, table, &data_key).await?;
-                if !condition.evaluate(current.as_ref()) {
-                    return Err(WireError::conditional_check_failed(
-                        "a transaction condition check failed",
-                    ));
-                }
+            TransactAction::ConditionCheck { .. } => {
+                // No write — the condition was already validated above.
             }
         }
+
+        // Only a `ConditionCheck`'s observed value becomes a `cp_txn`
+        // precondition — see this function's own doc for why a write
+        // action's own condition must not (the self-referential-stall bug
+        // found while writing this).
+        if is_condition_check && let Some(observed) = raw {
+            preconditions.push((table, data_key, observed));
+        }
     }
-    Ok(wire::empty_response())
+
+    if writes.is_empty() {
+        // Every action was a `ConditionCheck` — see this function's doc for
+        // why this is a documented, narrow fallback rather than a call to
+        // `cp_txn` (which requires at least one write to anchor on).
+        for (table, key, expected) in &preconditions {
+            let actual = raw_quorum_read(ctx, meta, table, key).await?;
+            if &actual != expected {
+                ctx.data()
+                    .raftkv_metrics
+                    .incr(Metric::DynamoTransactWritesCanceled);
+                return Err(WireError::transaction_canceled(
+                    "a transaction condition check failed",
+                ));
+            }
+        }
+        ctx.data()
+            .raftkv_metrics
+            .incr(Metric::DynamoTransactWritesCommitted);
+        return Ok(wire::empty_response());
+    }
+
+    match ctx.cp_txn(writes, preconditions).await {
+        Ok(_commit_ts) => {
+            // Update the edge-local GSI/LSI index after the durable atomic
+            // commit (mirroring `PutItem`/`DeleteItem`'s own post-write
+            // bookkeeping), never before — an index update racing ahead of
+            // a transaction that goes on to abort would leak a write that
+            // never happened into `Query`/`Scan` over a secondary index.
+            for (table, key, note) in index_notes {
+                match note {
+                    IndexNote::Put(item) => note_put(ctx, &table, &key, &item),
+                    IndexNote::Delete => note_delete(ctx, &table, &key),
+                }
+            }
+            ctx.data()
+                .raftkv_metrics
+                .incr(Metric::DynamoTransactWritesCommitted);
+            Ok(wire::empty_response())
+        }
+        Err(e) => {
+            ctx.data()
+                .raftkv_metrics
+                .incr(Metric::DynamoTransactWritesCanceled);
+            Err(WireError::transaction_canceled(format!(
+                "transaction cancelled: {e}"
+            )))
+        }
+    }
+}
+
+/// `TransactGetItems`: a consistent multi-key read (ADR 0018 §2/PR7, new — no
+/// prior non-atomic implementation to replace).
+///
+/// **Semantics, precisely — a serializable snapshot via
+/// quiescence-confirmation, not a wait-free one.** The ADR 0018 §2/PR6
+/// multi-tablet Elle corpus needed three redesigns of this exact problem
+/// before it stopped producing false-positive torn reads (see
+/// `animus-test/tests/txn_serializable.rs`'s `quiescent_multi_read` doc for
+/// the full account): a single coordinator-minted `read_at` snapshot
+/// timestamp is **structurally unsound** — `RaftKvNode::mint_pushed`'s
+/// write-conflict floor stamps a write *above* whatever ceiling a prior
+/// future-padded read already pushed that group's committed ceiling to, and
+/// since a group's `Hlc` only ever ratchets forward, that becomes a
+/// **permanent** floor no fixed or dynamically-sampled margin can close;
+/// force-resolving once then reading sequentially is undermined by a slow
+/// key observing a much later moment than a fast one. The design that
+/// actually closes it: read every key **at latest, concurrently**
+/// (`ClientCtx::cp_read`, which already gives ReadIndex linearizability +
+/// intent resolution + cross-process forwarding), and accept the round only
+/// once **two consecutive concurrent rounds agree byte-for-byte on every
+/// key** — if nothing changed between two independent observations, no
+/// transaction was in flight touching any involved key during that whole
+/// window, so the read is genuinely consistent, not merely probably so.
+/// Bounded to [`TRANSACT_GET_MAX_ROUNDS`] rounds; a snapshot that never
+/// quiesces (sustained contention on one of the requested keys) reports a
+/// retryable `TransactionCanceledException` rather than ever returning a
+/// possibly-torn result.
+async fn run_transact_get(
+    ctx: &ClientCtx,
+    meta: &Metadata,
+    gets: &[TransactGet],
+) -> Result<String, WireError> {
+    if gets.is_empty() {
+        return Err(WireError::validation(
+            "TransactGetItems requires at least one item",
+        ));
+    }
+    if gets.len() > MAX_TRANSACT_ITEMS {
+        return Err(WireError::validation(format!(
+            "TransactGetItems supports at most {MAX_TRANSACT_ITEMS} items"
+        )));
+    }
+
+    let mut keys: Vec<(String, Vec<u8>)> = Vec::with_capacity(gets.len());
+    let mut seen: BTreeSet<(String, Vec<u8>)> = BTreeSet::new();
+    for g in gets {
+        let (pk, sk) = resolve_key(ctx, meta, &g.table, &g.key)?;
+        let data_key = item_key(&pk, sk.as_ref());
+        if !seen.insert((g.table.clone(), data_key.clone())) {
+            return Err(WireError::validation(
+                "Transaction request cannot include multiple operations on one item",
+            ));
+        }
+        keys.push((g.table.clone(), data_key));
+    }
+
+    let raw = quiescent_multi_get(ctx, &keys).await?;
+
+    let mut items: Vec<Option<Item>> = Vec::with_capacity(gets.len());
+    for bytes in raw {
+        let item = match bytes {
+            Some(b) => wire::decode_stored_item(&b)?,
+            None => None,
+        };
+        items.push(item);
+    }
+    for (g, item) in gets.iter().zip(items.iter_mut()) {
+        if let Some(projection) = &g.projection
+            && let Some(present) = item.take()
+        {
+            *item = Some(wire::project(Some(projection), &present));
+        }
+    }
+    Ok(wire::transact_get_response(&items))
+}
+
+/// The quiescence-confirmation read loop backing [`run_transact_get`]: read
+/// every `(table, key)` concurrently (`futures::future::join_all` — never a
+/// sequential per-key loop, which would let a slow key observe a much later
+/// moment than a fast one) via the ordinary [`ClientCtx::cp_read`] machinery
+/// (works from any node — routes/forwards to each key's own tablet leader,
+/// resolves any intent it meets), retried as a whole until two consecutive
+/// rounds agree byte-for-byte on every key, bounded by
+/// [`TRANSACT_GET_MAX_ROUNDS`]. See [`run_transact_get`]'s doc for why this
+/// two-round-agreement shape is what actually gives a multi-key read joint
+/// consistency, and why the two single-round designs it replaced were each
+/// found unsound by the ADR 0018 §2/PR6 corpus.
+async fn quiescent_multi_get(
+    ctx: &ClientCtx,
+    keys: &[(String, Vec<u8>)],
+) -> Result<Vec<Option<Vec<u8>>>, WireError> {
+    let mut previous: Option<Vec<Option<Vec<u8>>>> = None;
+    for round_idx in 0..TRANSACT_GET_MAX_ROUNDS {
+        let futs = keys
+            .iter()
+            .map(|(table, key)| ctx.cp_read(table, key.clone()));
+        let round: Vec<Result<Option<Vec<u8>>, String>> = futures::future::join_all(futs).await;
+        let mut values = Vec::with_capacity(round.len());
+        for r in round {
+            values.push(r.map_err(|e| internal(&e))?);
+        }
+        if previous.as_ref() == Some(&values) {
+            if round_idx > 1 {
+                ctx.data()
+                    .raftkv_metrics
+                    .incr(Metric::DynamoTransactGetsRetried);
+            } else {
+                ctx.data().raftkv_metrics.incr(Metric::DynamoTransactGetsOk);
+            }
+            return Ok(values);
+        }
+        previous = Some(values);
+        if round_idx + 1 < TRANSACT_GET_MAX_ROUNDS {
+            tokio::time::sleep(TRANSACT_GET_POLL).await;
+        }
+    }
+    ctx.data()
+        .raftkv_metrics
+        .incr(Metric::DynamoTransactGetsRetried);
+    Err(WireError::transaction_canceled(
+        "TransactGetItems could not observe a quiescent snapshot of every key within budget; \
+         retry",
+    ))
 }
 
 /// Serve a `Query`. A **base-table** query (`index` is `None`) is a **native
@@ -1294,14 +1576,17 @@ async fn quorum_write(
         .map_err(|e| internal(&e))
 }
 
-/// Linearizable CP read of `key`, decoding the stored DynamoDB item (an absent
-/// key — including one tombstoned by a `DeleteItem` sentinel — reads as `None`).
-async fn quorum_read(
+/// Linearizable CP read of `key`, returning the **raw stored bytes** (the
+/// tagged envelope `quorum_read` decodes, or a `DeleteItem` tombstone
+/// sentinel verbatim) — the building block for anything that needs to hand
+/// the exact observed bytes onward (a `cp_txn` OCC precondition,
+/// `TransactGetItems`'s quiescent read), not just the decoded [`Item`].
+async fn raw_quorum_read(
     ctx: &ClientCtx,
     meta: &Metadata,
     table: &str,
     key: &[u8],
-) -> Result<Option<Item>, WireError> {
+) -> Result<Option<Vec<u8>>, WireError> {
     // A table with no tablet has no data (ADR 0023) — read as absent without waiting
     // on routing for a tablet that does not exist. The gate short-circuits a
     // **linearizable** read, so it must not conclude "absent" from the (possibly
@@ -1317,11 +1602,20 @@ async fn quorum_read(
     if !meta.has_table_tablet(table) && !metadata_fresh(ctx).await.has_table_tablet(table) {
         return Ok(None);
     }
-    match ctx
-        .cp_read(table, key.to_vec())
+    ctx.cp_read(table, key.to_vec())
         .await
-        .map_err(|e| internal(&e))?
-    {
+        .map_err(|e| internal(&e))
+}
+
+/// Linearizable CP read of `key`, decoding the stored DynamoDB item (an absent
+/// key — including one tombstoned by a `DeleteItem` sentinel — reads as `None`).
+async fn quorum_read(
+    ctx: &ClientCtx,
+    meta: &Metadata,
+    table: &str,
+    key: &[u8],
+) -> Result<Option<Item>, WireError> {
+    match raw_quorum_read(ctx, meta, table, key).await? {
         Some(bytes) => wire::decode_stored_item(&bytes),
         None => Ok(None),
     }
