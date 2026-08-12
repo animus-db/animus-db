@@ -108,8 +108,14 @@ fn write_push_after_a_served_read_the_next_write_lands_strictly_above_it() {
     // covering it (`uncertainty_upper(serve_ts)`), so `committed_ceiling()`
     // afterward is a real, upper-bounding proxy for "the highest ts any read
     // just served could have been at."
+    // A tight budget, deliberately well under `HLC_MAX_OFFSET` (500ms): a
+    // healthy 3-node group's ReadIndex round trip resolves in a handful of
+    // heartbeat intervals, and `run_for` always burns its *entire* budget
+    // even once idle (the house `SimEnv` gotcha) — a generous budget here
+    // would race sim time straight past the pushed-ahead ceiling before the
+    // negative control below ever gets to check it.
     assert_eq!(
-        lin_read(&mut sim, &nodes[l], b"k", Duration::from_secs(2)),
+        lin_read(&mut sim, &nodes[l], b"k", Duration::from_millis(100)),
         Some(b"v0".to_vec())
     );
     let ceiling_after_read = nodes[l].committed_ceiling();
@@ -118,8 +124,27 @@ fn write_push_after_a_served_read_the_next_write_lands_strictly_above_it() {
         "sanity: the read must have driven a real ceiling (seed={seed})"
     );
 
+    // Negative control (mirrors test 2's below): prove the push is what
+    // saves this write, not coincidental clock advancement — a bare,
+    // fresh, un-pushed `Hlc` minting *right now* would land at or below
+    // the ceiling `uncertainty_upper` deliberately shifted `HLC_MAX_OFFSET`
+    // into the future. If this ever failed, the assertion below would
+    // prove nothing (the write would have landed above regardless of
+    // `mint_pushed`'s witness-retry branch ever firing).
+    let bare_mint =
+        Hlc::new(nid(l as u64), Duration::from_millis(500)).mint(sim.env(nid(l as u64)).now());
+    assert!(
+        bare_mint <= ceiling_after_read,
+        "test fixture: a bare mint right now must NOT already exceed the \
+         pushed-ahead ceiling, or the write-push retry below proves nothing \
+         (bare_mint={bare_mint:?} ceiling={ceiling_after_read:?}, seed={seed})"
+    );
+
     // Overwrite k; its committed ts must strictly exceed the ceiling that
-    // now covers the just-served read.
+    // now covers the just-served read — only reachable via `mint_pushed`'s
+    // witness-retry branch (`RaftKvNode::mint_pushed`, PR2b's newest logic),
+    // proven necessary by the negative control just above, not by real time
+    // having simply caught up to the ceiling on its own.
     put(&nodes, &[0, 1, 2], seed, b"k", b"v1");
     sim.run_for(Duration::from_secs(1));
     let write_ts = ts_of(&nodes[l], b"k");
