@@ -247,12 +247,27 @@ pub enum Metric {
     /// A linearizable/snapshot read restarted once at a higher timestamp
     /// because a version existed within its clock-uncertainty window.
     CpUncertaintyRestarts,
+
+    // --- In-doubt transaction recovery + the resolver loop (ADR 0018 §2,
+    // PR5) --- Appended after the uncertainty-restarts variant; every
+    // earlier variant's slot and the text-export order stay stable, so the
+    // snapshot remains byte-reproducible. Recorded by `animusd`'s
+    // `ClientCtx::txn_recover`/`txn_resolver_loop`.
+    /// A recovery push (`ClientCtx::txn_recover`) drove a stale `Pending`
+    /// record to `Committed` (every participant verified staged).
+    CpTxnRecoveredCommitted,
+    /// A recovery push drove a stale `Pending` record to `Aborted` (at
+    /// least one participant's intent was missing).
+    CpTxnRecoveredAborted,
+    /// One `txn_resolver_loop` tick ran to completion on this node (over
+    /// however many locally-led tablet groups it walked).
+    CpTxnResolverRuns,
 }
 
 impl Metric {
     /// Every metric, in a fixed order. The array index of a metric in `ALL` is
     /// its slot in the [`MetricSink`]; keep this in sync with the enum.
-    pub const ALL: [Metric; 46] = [
+    pub const ALL: [Metric; 49] = [
         Metric::ElectionsStarted,
         Metric::ElectionsWon,
         Metric::AppendEntriesSent,
@@ -299,6 +314,9 @@ impl Metric {
         Metric::OrphanMembersSwept,
         Metric::CpReadCeilingProposals,
         Metric::CpUncertaintyRestarts,
+        Metric::CpTxnRecoveredCommitted,
+        Metric::CpTxnRecoveredAborted,
+        Metric::CpTxnResolverRuns,
     ];
 
     /// The stable exported name of this metric (snake_case, used as the text
@@ -352,6 +370,9 @@ impl Metric {
             Metric::OrphanMembersSwept => "control_orphan_members_swept",
             Metric::CpReadCeilingProposals => "cp_read_ceiling_proposals",
             Metric::CpUncertaintyRestarts => "cp_uncertainty_restarts",
+            Metric::CpTxnRecoveredCommitted => "cp_txn_recovered_committed",
+            Metric::CpTxnRecoveredAborted => "cp_txn_recovered_aborted",
+            Metric::CpTxnResolverRuns => "cp_txn_resolver_runs",
         }
     }
 

@@ -57,7 +57,16 @@ const MAGIC: u8 = 0xCB;
 /// doc); `TxnResolve` gained `outcome: TxnOutcome` (the decision travels
 /// explicitly instead of being re-derived from a local record) — again a
 /// clean version bump, no wire/disk back-compat required.
-const VERSION: u8 = 8;
+/// `9` (ADR 0018 §2/PR5): `TxnStage.spans` changed from `Vec<KeyRange>` to
+/// `Vec<(String, KeyRange)>` — every span now carries its own table name,
+/// closing a real gap PR3/PR4 left open (see `txn::TxnRecord::intent_spans`'s
+/// doc for the full account). Same house convention: a clean bump, no
+/// cross-version compatibility.
+/// `10` (ADR 0018 §2/PR5, orphan-record fix): `TxnAbort` gained
+/// `orphan_created_ts: Option<HlcTimestamp>` — a recovery pusher that finds
+/// no record at all synthesizes one directly in the `Aborted` state (see
+/// `KvCommand::TxnAbort`'s doc). Same house convention.
+const VERSION: u8 = 10;
 
 /// A decode failure: a description of what was malformed, surfaced loudly by
 /// the caller (logged + dropped; never silently misread).
@@ -243,6 +252,26 @@ fn read_ts(c: &mut Cursor<'_>) -> Result<HlcTimestamp, DecodeError> {
     Ok(HlcTimestamp { wall_ms, logical })
 }
 
+/// ADR 0018 §2/PR5: an `Option<HlcTimestamp>` — mirrors [`put_opt_bytes`]'s
+/// presence-tag shape (`KvCommand::TxnAbort`'s `orphan_created_ts`).
+fn put_opt_ts(out: &mut Vec<u8>, ts: &Option<HlcTimestamp>) {
+    match ts {
+        None => put_u8(out, 0),
+        Some(ts) => {
+            put_u8(out, 1);
+            put_ts(out, *ts);
+        }
+    }
+}
+
+fn read_opt_ts(c: &mut Cursor<'_>) -> Result<Option<HlcTimestamp>, DecodeError> {
+    match c.u8()? {
+        0 => Ok(None),
+        1 => Ok(Some(read_ts(c)?)),
+        other => Err(format!("bad opt_ts tag {other}")),
+    }
+}
+
 /// ADR 0018 §2/PR3: a [`TxnId`] as `(ts, node)`.
 fn put_txn_id(out: &mut Vec<u8>, id: &TxnId) {
     put_ts(out, id.ts);
@@ -353,8 +382,9 @@ fn put_command(out: &mut Vec<u8>, c: &KvCommand) {
                 put_opt_bytes(out, v);
             }
             out.extend_from_slice(&(spans.len() as u32).to_be_bytes());
-            for s in spans {
-                put_key_range(out, s);
+            for (table, span) in spans {
+                put_bytes(out, table.as_bytes());
+                put_key_range(out, span);
             }
             put_key_range(out, fence);
             put_ts(out, *ts);
@@ -373,11 +403,13 @@ fn put_command(out: &mut Vec<u8>, c: &KvCommand) {
             txn_id,
             record_key,
             ts,
+            orphan_created_ts,
         } => {
             put_u8(out, 10);
             put_txn_id(out, txn_id);
             put_bytes(out, record_key);
             put_ts(out, *ts);
+            put_opt_ts(out, orphan_created_ts);
         }
         KvCommand::TxnResolve {
             txn_id,
@@ -451,7 +483,9 @@ fn read_command(c: &mut Cursor<'_>) -> Result<KvCommand, DecodeError> {
             let n = c.u32()?;
             let mut spans = Vec::with_capacity(n as usize);
             for _ in 0..n {
-                spans.push(read_key_range(c)?);
+                let table = String::from_utf8(c.bytes()?)
+                    .map_err(|_| "TxnStage span table not utf8".to_string())?;
+                spans.push((table, read_key_range(c)?));
             }
             KvCommand::TxnStage {
                 txn_id,
@@ -473,6 +507,7 @@ fn read_command(c: &mut Cursor<'_>) -> Result<KvCommand, DecodeError> {
             txn_id: read_txn_id(c)?,
             record_key: c.bytes()?,
             ts: read_ts(c)?,
+            orphan_created_ts: read_opt_ts(c)?,
         },
         11 => {
             let txn_id = read_txn_id(c)?;
@@ -894,7 +929,10 @@ mod tests {
                         (b"k1".to_vec(), Some(b"v1".to_vec())),
                         (b"k2".to_vec(), None), // a staged delete
                     ],
-                    spans: vec![KeyRange::new(b"k1".to_vec(), Some(b"k1\x00".to_vec()))],
+                    spans: vec![(
+                        "orders".to_string(),
+                        KeyRange::new(b"k1".to_vec(), Some(b"k1\x00".to_vec())),
+                    )],
                     fence: KeyRange::whole(),
                     ts: ts(8, 1),
                 },
@@ -923,6 +961,24 @@ mod tests {
                     },
                     record_key: b"record".to_vec(),
                     ts: ts(9, 1),
+                    orphan_created_ts: None,
+                },
+                config: None,
+            },
+            // ADR 0018 §2/PR5's orphan-record fix: the `Some` branch of
+            // `orphan_created_ts` (a recovery pusher synthesizing an
+            // abort tombstone for a `txn_id` with no record at all).
+            LogEntry {
+                term: 7,
+                index: 26,
+                command: KvCommand::TxnAbort {
+                    txn_id: TxnId {
+                        ts: ts(8, 0),
+                        node: nid(3),
+                    },
+                    record_key: b"record".to_vec(),
+                    ts: ts(9, 1),
+                    orphan_created_ts: Some(ts(7, 5)),
                 },
                 config: None,
             },

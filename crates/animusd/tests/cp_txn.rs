@@ -28,6 +28,289 @@ use tokio::time::{sleep, timeout};
 
 mod support;
 
+/// Send `request` wrapped in `ClientRequest::Forwarded` directly to `addr`
+/// — the shape `ClientCtx::cp_forward` uses internally, and the mechanism
+/// [`prepare_via_any_node`]/the coordinator-crash tests below use to drive
+/// the 2PC prepare phase **without** a coordinator ever completing the
+/// transaction (simulating a crash between prepare and decide/resolve —
+/// see those tests' own doc for why this is the cleanest way to express
+/// that over a real `ProdEnv` cluster: `ClientCtx::cp_txn` runs to
+/// completion synchronously inside one request handler, so there is no
+/// separate long-lived "coordinator process" to kill after prepare and
+/// before decide; driving the internal wire requests directly and simply
+/// never sending the rest is the equivalent event).
+async fn call_forwarded(addr: SocketAddr, request: ClientRequest) -> ClientResponse {
+    call(
+        addr,
+        ClientRequest::Forwarded {
+            request: Box::new(request),
+            traceparent: None,
+        },
+    )
+    .await
+}
+
+/// `Forwarded { TxnPrepare }` only succeeds when sent directly to a
+/// tablet's own current group leader (`cp_serve_forwarded` never
+/// re-forwards) — this cycles through every node in `addrs` until one
+/// replies `TxnPrepared`, bounded by an overall timeout. Mirrors a real
+/// coordinator's own one-hop routing, done by hand since this is
+/// deliberately bypassing `ClientCtx::cp_txn`'s own routing.
+async fn prepare_via_any_node(
+    addrs: &[SocketAddr],
+    request: ClientRequest,
+) -> (
+    animus_cp_data::TxnId,
+    Vec<u8>,
+    String,
+    animus_cp_data::hlc::HlcTimestamp,
+) {
+    timeout(Duration::from_secs(20), async {
+        loop {
+            for &addr in addrs {
+                if let ClientResponse::TxnPrepared {
+                    txn_id,
+                    record_key,
+                    record_table,
+                    ts,
+                } = call_forwarded(addr, request.clone()).await
+                {
+                    return (txn_id, record_key, record_table, ts);
+                }
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("prepare did not succeed against any node within 20s")
+}
+
+/// As [`prepare_via_any_node`], but for `Forwarded { TxnDecide }` — used by
+/// the "commit already applied, but never resolved" dual below to drive
+/// the anchor's own decision directly, bypassing `ClientCtx::cp_txn`
+/// entirely (which would also resolve every participant before returning —
+/// exactly the step this test needs to skip).
+async fn decide_via_any_node(
+    addrs: &[SocketAddr],
+    table: String,
+    txn_id: animus_cp_data::TxnId,
+    record_key: Vec<u8>,
+    commit: bool,
+    min_commit_ts: animus_cp_data::hlc::HlcTimestamp,
+) -> animus_cp_data::TxnOutcome {
+    timeout(Duration::from_secs(20), async {
+        loop {
+            for &addr in addrs {
+                if let ClientResponse::TxnDecided { outcome } = call_forwarded(
+                    addr,
+                    ClientRequest::TxnDecide {
+                        table: table.clone(),
+                        txn_id: txn_id.clone(),
+                        record_key: record_key.clone(),
+                        commit,
+                        min_commit_ts,
+                        orphan_created_ts: None,
+                    },
+                )
+                .await
+                {
+                    return outcome;
+                }
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("decide did not succeed against any node within 20s")
+}
+
+/// **Coordinator crash between prepare and decide** (ADR 0018 §2/PR5): both
+/// participants stage successfully, but nobody ever proposes a commit or
+/// abort — the shape a coordinator process crashing right after `cp_txn`'s
+/// prepare phase takes. `ClientCtx::cp_txn` runs synchronously inside one
+/// request handler with no separate long-lived coordinator process to
+/// literally kill, so this drives the internal `TxnPrepare` wire requests
+/// directly (`prepare_via_any_node`, mirroring exactly what `cp_txn` itself
+/// does over the network) and simply stops there — the cleanest way to
+/// express "the coordinator is gone" over a real multi-process cluster
+/// without a dedicated test hook. A plain `Get` of the staged (still
+/// `Pending`) key from a **different, uninvolved** node must, within
+/// `RECOVERY_GRACE` plus resolver/read-push margin, converge to the
+/// committed value — proving in-doubt recovery, not any coordinator, is
+/// what finishes this transaction.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn coordinator_crash_between_prepare_and_decide_recovers_to_commit() {
+    let n = 3;
+    let dir = tempfile::tempdir().unwrap();
+    let (nodes, config) = bring_up(n, dir.path()).await;
+    await_bootstrap(&nodes).await;
+    let addr0 = config.nodes[0].client;
+    let all_addrs: Vec<SocketAddr> = config.nodes.iter().map(|c| c.client).collect();
+
+    put_until_ok(addr0, "txn_t5", b"k1", b"seed-lower").await;
+    put_until_ok(addr0, "txn_t5", b"k9", b"seed-upper").await;
+    split_and_settle(&nodes, addr0, "txn_t5", b"k5").await;
+
+    let lower_key = txn_key("k2", "-crash");
+    let upper_key = txn_key("k8", "-crash");
+
+    // Prepare (stage) the anchor — mints the txn id + record key.
+    let (txn_id, record_key, record_table, _ts) = prepare_via_any_node(
+        &all_addrs,
+        ClientRequest::TxnPrepare {
+            table: "txn_t5".to_string(),
+            anchor: None,
+            writes: vec![(lower_key.clone(), Some(b"lower-recovered".to_vec()))],
+        },
+    )
+    .await;
+
+    // Prepare the participant, referencing the anchor's record. Both are
+    // now genuinely staged — every recovery push must decide Committed.
+    prepare_via_any_node(
+        &all_addrs,
+        ClientRequest::TxnPrepare {
+            table: "txn_t5".to_string(),
+            anchor: Some((txn_id.clone(), record_key.clone(), record_table.clone())),
+            writes: vec![(upper_key.clone(), Some(b"upper-recovered".to_vec()))],
+        },
+    )
+    .await;
+
+    // Never send TxnDecide/TxnResolve — "the coordinator crashed here."
+    // Read from a node not otherwise involved in driving prepare (routing
+    // above cycled through all of them, so this is best-effort — the point
+    // is a plain client `Get`, not a special recovery-aware call).
+    let reader = config.nodes[(0) % n].client;
+    for (key, expected) in [
+        (lower_key.clone(), b"lower-recovered".to_vec()),
+        (upper_key.clone(), b"upper-recovered".to_vec()),
+    ] {
+        let got = timeout(Duration::from_secs(30), async {
+            loop {
+                match call(
+                    reader,
+                    ClientRequest::Get {
+                        key: key.clone(),
+                        table: "txn_t5".to_string(),
+                    },
+                )
+                .await
+                {
+                    v @ ClientResponse::Value(Some(_)) => return v,
+                    _ => sleep(Duration::from_millis(200)).await,
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "key {key:?} never recovered to a committed value within 30s \
+                 (RECOVERY_GRACE + resolver/read-push margin)"
+            )
+        });
+        assert_eq!(got, ClientResponse::Value(Some(expected)));
+    }
+
+    for node in &nodes {
+        node.shutdown();
+    }
+}
+
+/// **The dual: commit already applied, but never resolved.** The anchor's
+/// own decision (`TxnDecide { commit: true }`) is driven directly — the
+/// record is genuinely `Committed` — but `TxnResolve` is never sent to
+/// either participant, so both keys sit as still-staged intents forever
+/// unless something resolves them. Reads must still converge to the
+/// committed value (via the foreign-intent read-path's status query, which
+/// finds the record already decided — no grace wait needed at all, unlike
+/// the still-`Pending` case above) or via `txn_resolver_loop`'s own
+/// periodic fan-out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn commit_already_applied_but_unresolved_converges_via_reads() {
+    let n = 3;
+    let dir = tempfile::tempdir().unwrap();
+    let (nodes, config) = bring_up(n, dir.path()).await;
+    await_bootstrap(&nodes).await;
+    let addr0 = config.nodes[0].client;
+    let all_addrs: Vec<SocketAddr> = config.nodes.iter().map(|c| c.client).collect();
+
+    put_until_ok(addr0, "txn_t6", b"k1", b"seed-lower").await;
+    put_until_ok(addr0, "txn_t6", b"k9", b"seed-upper").await;
+    split_and_settle(&nodes, addr0, "txn_t6", b"k5").await;
+
+    let lower_key = txn_key("k2", "-done");
+    let upper_key = txn_key("k8", "-done");
+
+    let (txn_id, record_key, record_table, anchor_ts) = prepare_via_any_node(
+        &all_addrs,
+        ClientRequest::TxnPrepare {
+            table: "txn_t6".to_string(),
+            anchor: None,
+            writes: vec![(lower_key.clone(), Some(b"lower-done".to_vec()))],
+        },
+    )
+    .await;
+    prepare_via_any_node(
+        &all_addrs,
+        ClientRequest::TxnPrepare {
+            table: "txn_t6".to_string(),
+            anchor: Some((txn_id.clone(), record_key.clone(), record_table.clone())),
+            writes: vec![(upper_key.clone(), Some(b"upper-done".to_vec()))],
+        },
+    )
+    .await;
+
+    let outcome = decide_via_any_node(
+        &all_addrs,
+        "txn_t6".to_string(),
+        txn_id.clone(),
+        record_key.clone(),
+        true,
+        anchor_ts,
+    )
+    .await;
+    assert!(
+        matches!(outcome, animus_cp_data::TxnOutcome::Committed { .. }),
+        "the anchor's own decision should be a genuine commit here: {outcome:?}"
+    );
+
+    // No `TxnResolve` ever sent. A read from any node must still converge —
+    // both via the immediate on-the-fly intent resolution (the record is
+    // already decided, so this needs no grace wait) and, given enough
+    // time, `txn_resolver_loop` finishing the actual rewrite in the
+    // background.
+    let reader = config.nodes[1 % n].client;
+    for (key, expected) in [
+        (lower_key, b"lower-done".to_vec()),
+        (upper_key, b"upper-done".to_vec()),
+    ] {
+        let got = timeout(Duration::from_secs(15), async {
+            loop {
+                match call(
+                    reader,
+                    ClientRequest::Get {
+                        key: key.clone(),
+                        table: "txn_t6".to_string(),
+                    },
+                )
+                .await
+                {
+                    v @ ClientResponse::Value(Some(_)) => return v,
+                    _ => sleep(Duration::from_millis(150)).await,
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("key {key:?} never converged within 15s"));
+        assert_eq!(got, ClientResponse::Value(Some(expected)));
+    }
+
+    for node in &nodes {
+        node.shutdown();
+    }
+}
+
 /// A key at least [`TOKEN_BYTES`]-long (ADR 0022's floor `cp_txn` enforces
 /// for every transaction write, since `RaftKvNode::txn_stage`'s anchor-key
 /// assert is now wire-reachable — see `cp_txn`'s doc), embedding `suffix`

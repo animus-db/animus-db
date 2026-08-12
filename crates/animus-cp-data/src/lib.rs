@@ -463,13 +463,24 @@ pub enum KvCommand {
     /// byte-for-byte PR3's original behavior: `record_key` must itself
     /// fall inside `fence` (it is this tablet's own reserved key), and a
     /// fresh `Pending` `TxnRecord` is created there alongside the intents.
+    ///
+    /// **`spans` (ADR 0018 §2/PR5)**: `(table, span)` pairs for **every**
+    /// key this transaction stages anywhere — every participant's writes,
+    /// the anchor's own included — not just this stage's own `writes`. Only
+    /// meaningful (and only ever stored, into the freshly-created
+    /// `TxnRecord::intent_spans`) when `is_anchor`; a non-anchor stage
+    /// passes an empty `Vec` (it never creates a record). This is what lets
+    /// PR5's recovery push learn which *other* tablets/tables a
+    /// transaction touched from the anchor's record alone — closing a real
+    /// gap PR3/PR4 left open (see `txn::TxnRecord::intent_spans`'s doc for
+    /// the full account).
     TxnStage {
         txn_id: TxnId,
         record_key: Vec<u8>,
         record_table: String,
         is_anchor: bool,
         writes: Vec<(Vec<u8>, Option<Vec<u8>>)>,
-        spans: Vec<KeyRange>,
+        spans: Vec<(String, KeyRange)>,
         fence: KeyRange,
         ts: HlcTimestamp,
     },
@@ -491,10 +502,30 @@ pub enum KvCommand {
     /// **Transaction abort**: the `Aborted` dual of `TxnCommit` — see its
     /// doc for the fence/idempotency/protocol-bug-assert argument, which
     /// applies identically here.
+    ///
+    /// **`orphan_created_ts` (ADR 0018 §2/PR5's orphan-record fix)**: `None`
+    /// is the ordinary case above (a missing record is a silent fence-miss
+    /// no-op). `Some(created_ts)` is a **recovery pusher that found no
+    /// record at all** — a real, already-acknowledged possibility (the
+    /// anchor's own `TxnStage` can silently no-op at apply on a fence/seal
+    /// miss, exactly like a participant's stage already could, PR4, even
+    /// though the coordinator went on to stage participants successfully).
+    /// In that case apply **synthesizes** a fresh `TxnRecord` directly in
+    /// the `Aborted` state (a CRDB-style "abort tombstone") using
+    /// `created_ts` as its `created_ts` field (the pusher's only
+    /// trustworthy substitute — see `IntentInfo::version`'s doc) and empty
+    /// `intent_spans` (unknown — a documented residual, see
+    /// `apply_and_compact`'s arm). This is always safe: it can never
+    /// resurrect or clobber a record that already exists (that path is
+    /// unchanged, `Some`/`None` alike), and a late-arriving genuine anchor
+    /// `TxnStage` for the same `txn_id` finds this tombstone and no-ops
+    /// instead of overwriting it back to `Pending` (`KvCommand::TxnStage`'s
+    /// own resurrection guard).
     TxnAbort {
         txn_id: TxnId,
         record_key: Vec<u8>,
         ts: HlcTimestamp,
+        orphan_created_ts: Option<HlcTimestamp>,
     },
     /// **Transaction resolve**: for each key in `keys` still holding
     /// `txn_id`'s intent, rewrite it to its final form per `outcome` —
@@ -590,6 +621,24 @@ const INTENT_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Poll granularity while a read waits for a `Pending` intent to resolve.
 const INTENT_WAIT_POLL: Duration = Duration::from_millis(20);
 
+/// **Recovery grace period** (ADR 0018 §2/PR5): how long a transaction
+/// record may sit `Pending` before any actor holding a foreign-or-local
+/// pending intent may push it to a decision — the CockroachDB "no blocking
+/// on a dead coordinator" property the Decision section's Recovery bullet
+/// promises. Compared against the record's own `created_ts.wall_ms` (an
+/// HLC, ADR 0003 — never a raw wall-clock `Instant`), since the pusher may
+/// be a different node than the one that minted the record.
+///
+/// **Liveness-only tuning — correctness never depends on this value** (ADR
+/// 0017 §3's discipline, restated for recovery in the decision-semantics
+/// amendment): a push may fire sooner or later than this and the outcome is
+/// still safe, because a recovery decision is never trusted merely for
+/// having been proposed — the anchor's own Raft log position is the sole
+/// arbiter of which decision (if more than one is ever proposed) actually
+/// wins (see `apply_and_compact`'s `TxnCommit`/`TxnAbort` arms). Grace only
+/// affects *when* recovery may act, never *what* it decides.
+pub const RECOVERY_GRACE: Duration = Duration::from_secs(5);
+
 /// Compact (snapshot the engine + truncate the Raft log prefix) once this many
 /// entries have been applied past the current snapshot base, bounding the WAL.
 const COMPACT_THRESHOLD: u64 = 64;
@@ -613,6 +662,106 @@ struct ReadState {
 #[derive(Default)]
 struct CasResults {
     outcomes: BTreeMap<u64, bool>,
+}
+
+/// This group's own in-memory index of the transaction records it holds
+/// (ADR 0018 §2/PR5) — populated **only** on a group that anchors at least
+/// one transaction (a non-anchor `TxnStage` never creates a record, so a
+/// pure-participant group's tracker stays empty). Drives `animusd`'s
+/// `txn_resolver_loop`: which records to push past their grace period, and
+/// which decided records still owe a resolve fan-out.
+///
+/// **Rebuilt at group start** (`rebuild_txn_tracker`) via one bounded scope
+/// scan for `txn::is_record_key` markers — deliberately not derived from
+/// log replay (the same reasoning `sealed`/`committed_ceiling` already
+/// document: compaction can truncate the `TxnStage`/`TxnCommit` entries out
+/// of the log long before the record's own lifecycle is done, so only the
+/// engine-durable record itself is a complete source across a restart) —
+/// then kept current by `apply_and_compact` as it processes the live log
+/// tail.
+#[derive(Default)]
+struct TxnTracker {
+    /// `txn_id -> (record_key, created_ts)` for every record this group
+    /// currently holds `Pending`. Inserted when a `TxnStage` with
+    /// `is_anchor: true` (first) creates the record; removed the moment
+    /// this group's own apply flips it `Pending -> Committed`/`Aborted` (a
+    /// losing, conflicting decision that arrives afterward is a logged
+    /// no-op — see `apply_and_compact`'s `TxnCommit`/`TxnAbort` arms — and
+    /// touches neither map, since the winning decision already did).
+    pending: BTreeMap<TxnId, (Vec<u8>, HlcTimestamp)>,
+    /// `txn_id -> (record_key, outcome)` for every record this group has
+    /// decided but has not yet seen **any** matching `TxnResolve` apply
+    /// here. Inserted on the `Pending -> Committed`/`Aborted` transition;
+    /// removed as soon as a `TxnResolve` for this `txn_id` applies on this
+    /// same group.
+    ///
+    /// **Deliberately approximate, documented, and still safe**: this
+    /// group can only observe resolves that apply on *itself* — for a
+    /// multi-participant transaction, every other participant's own
+    /// `TxnResolve` applies on a *different* tablet's group entirely, with
+    /// no ack back to the anchor. So this entry tracks "has the anchor
+    /// group's own local resolve happened" (which fires whenever *any*
+    /// resolve for this `txn_id` lands here — its own keys' resolve, or a
+    /// resolver-loop retry that happens to hit this group first), not "have
+    /// every participant's intents actually been rewritten." A resolver
+    /// that stops tracking a transaction slightly early never loses
+    /// correctness — a straggling unresolved remote intent is still
+    /// resolved on demand the moment any reader hits it (the foreign-intent
+    /// read-path push, ADR 0018 §2/PR5 §3) — only background promptness is
+    /// (very slightly) weaker in that residual case.
+    unresolved_decided: BTreeMap<TxnId, (Vec<u8>, txn::TxnOutcome)>,
+}
+
+/// Rebuild a [`TxnTracker`] from `storage`'s own durable records within
+/// `scope` (ADR 0018 §2/PR5) — see the type's doc for why this, not log
+/// replay, is the recovery source. Mirrors `StorageScope::has_data`'s
+/// scoped-scan-with-unbounded-fallback shape (a bounded scan when the live
+/// range has a finite end, else the same whole-engine-then-filter fallback
+/// `engine_image`/`has_data` already use for an unbounded range).
+async fn rebuild_txn_tracker<S: StorageEngine>(storage: &S, scope: &StorageScope) -> TxnTracker {
+    let range = scope.range();
+    let rows: Vec<(Vec<u8>, animus_storage::VersionedValue)> = match &range.end {
+        Some(end) => {
+            let physical_start = scope.physical(&range.start);
+            let physical_end = scope.physical(end);
+            storage
+                .scan(&physical_start, &physical_end)
+                .await
+                .unwrap_or_default()
+        }
+        None => storage.entries().await.unwrap_or_default(),
+    };
+    let mut tracker = TxnTracker::default();
+    for (physical_key, vv) in rows {
+        let Some(logical) = scope.strip_in_range(&physical_key) else {
+            continue;
+        };
+        if !txn::is_record_key(logical) {
+            continue;
+        }
+        let Some(record) = txn::decode_record(&vv.value) else {
+            continue;
+        };
+        match record.status {
+            txn::TxnStatus::Pending => {
+                tracker
+                    .pending
+                    .insert(record.txn_id, (logical.to_vec(), record.created_ts));
+            }
+            txn::TxnStatus::Committed { commit_ts } => {
+                tracker.unresolved_decided.insert(
+                    record.txn_id,
+                    (logical.to_vec(), txn::TxnOutcome::Committed { commit_ts }),
+                );
+            }
+            txn::TxnStatus::Aborted => {
+                tracker
+                    .unresolved_decided
+                    .insert(record.txn_id, (logical.to_vec(), txn::TxnOutcome::Aborted));
+            }
+        }
+    }
+    tracker
 }
 
 /// The outcome of resolving one raw, envelope-tagged stored value against a
@@ -650,6 +799,32 @@ pub struct IntentInfo {
     pub record_key: Vec<u8>,
     pub record_table: String,
     pub staged_value: Option<Vec<u8>>,
+    /// **ADR 0018 §2/PR5**: the intent's own applied HLC timestamp
+    /// (unpacked from its engine version — `assert_ts_monotonic`'s own
+    /// invariant guarantees this is a real, meaningful point in this
+    /// group's causal history). A recovery pusher whose `TxnStatus`/
+    /// `TxnRecordView` query finds **no record at all** (a real,
+    /// already-acknowledged possibility — the anchor's own stage can
+    /// silently no-op at apply time on a fence/seal miss, exactly like a
+    /// participant's stage already could, PR4) has no `created_ts` to
+    /// grace-gate against; this is the documented substitute, since it's
+    /// the only trustworthy timestamp anyone still holds for this
+    /// transaction in that case. See `ClientCtx::txn_recover`'s doc.
+    pub version: HlcTimestamp,
+}
+
+/// A recovery pusher's view of a transaction record (ADR 0018 §2/PR5) — the
+/// public mirror of `txn::TxnRecord` a cross-tablet caller reads back via
+/// [`RaftKvNode::txn_record_view`], carrying everything
+/// `animusd::ClientCtx::txn_recover` needs to drive the push protocol
+/// without this crate exposing its internal record representation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TxnRecordView {
+    pub status: TxnDecisionStatus,
+    /// Every key this transaction staged anywhere, as `(table, span)` pairs
+    /// — see `txn::TxnRecord::intent_spans`'s doc.
+    pub intent_spans: Vec<(String, KeyRange)>,
+    pub created_ts: HlcTimestamp,
 }
 
 /// The outcome of a **non-blocking, single-attempt** linearizable read (ADR
@@ -788,6 +963,13 @@ pub struct RaftKvNode<E: Env, S: StorageEngine> {
     /// split), so "already logged" and "already applied" are never the same
     /// instant. See `propose_ordered`'s doc and `docs/engineering-lessons.md`.
     last_proposed_ts: Arc<AtomicU64>,
+    /// This group's transaction-record tracker (ADR 0018 §2/PR5) —
+    /// `animusd`'s `txn_resolver_loop` reads it via
+    /// [`pending_txns`](Self::pending_txns)/
+    /// [`unresolved_decided`](Self::unresolved_decided). See [`TxnTracker`]'s
+    /// doc for the exact insert/remove rules and the rebuild-at-start
+    /// source.
+    txn_tracker: Arc<Mutex<TxnTracker>>,
 }
 
 impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
@@ -898,6 +1080,12 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         let committed_ceiling = Arc::new(AtomicU64::new(0));
         let last_ceiling_candidate = Arc::new(AtomicU64::new(0));
         let last_proposed_ts = Arc::new(AtomicU64::new(0));
+        // Rebuilt asynchronously inside `drive` (a scoped engine scan needs
+        // `.await`, unlike every other piece of group-start state here) —
+        // starts empty and is populated before the apply task's first pass,
+        // mirroring `sealed`/`committed_ceiling`'s own rebuild-then-spawn
+        // ordering.
+        let txn_tracker = Arc::new(Mutex::new(TxnTracker::default()));
         let node = Self {
             env: env.clone(),
             core: Arc::clone(&core),
@@ -917,6 +1105,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             committed_ceiling: Arc::clone(&committed_ceiling),
             last_ceiling_candidate,
             last_proposed_ts,
+            txn_tracker: Arc::clone(&txn_tracker),
         };
         // The consensus loop recovers from the WAL, then spawns the apply task
         // (so the apply task sees the recovered core + the correct
@@ -939,6 +1128,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             stream,
             hlc,
             committed_ceiling,
+            txn_tracker,
         }));
         node
     }
@@ -1384,6 +1574,28 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         table: &str,
         writes: Vec<(Vec<u8>, Option<Vec<u8>>)>,
     ) -> Option<(TxnId, Vec<u8>)> {
+        self.txn_stage_anchor(table, writes, Vec::new()).await
+    }
+
+    /// As [`txn_stage`](Self::txn_stage), but for a genuine multi-participant
+    /// coordinator (ADR 0018 §2/PR5): `participant_spans` names **every
+    /// other** participant's `(table, span)` pairs (the coordinator already
+    /// knows the full write set, grouped by tablet, before staging
+    /// anything — see `animusd::ClientCtx::cp_txn`), merged with this
+    /// stage's own anchor spans into the freshly-created record's
+    /// `intent_spans` — the structural fix that lets recovery learn which
+    /// other tablets/tables a transaction touched (see
+    /// `txn::TxnRecord::intent_spans`'s doc). `txn_stage` itself is the
+    /// single-participant convenience (`participant_spans: Vec::new()`).
+    ///
+    /// # Panics
+    /// Same as [`txn_stage`](Self::txn_stage).
+    pub async fn txn_stage_anchor(
+        &self,
+        table: &str,
+        writes: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+        participant_spans: Vec<(String, KeyRange)>,
+    ) -> Option<(TxnId, Vec<u8>)> {
         assert!(
             !writes.is_empty(),
             "raftkv txn_stage: writes must be non-empty"
@@ -1407,10 +1619,16 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
                 node: self.env.node_id(),
             };
             let record_key = txn::record_key(&token, &txn_id);
-            let spans = keys
+            let mut spans: Vec<(String, KeyRange)> = keys
                 .iter()
-                .map(|k| KeyRange::new(k.clone(), Some(txn::immediate_successor(k))))
+                .map(|k| {
+                    (
+                        record_table.clone(),
+                        KeyRange::new(k.clone(), Some(txn::immediate_successor(k))),
+                    )
+                })
                 .collect();
+            spans.extend(participant_spans.clone());
             let cmd = KvCommand::TxnStage {
                 txn_id: txn_id.clone(),
                 record_key: record_key.clone(),
@@ -1539,6 +1757,86 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         self.wait_applied(index).await.then_some(ts)
     }
 
+    /// **Abort** the anchor's record at `record_key` (ADR 0018 §2/PR5) — the
+    /// `Abort`-only dual of [`txn_commit_at_least`](Self::txn_commit_at_least):
+    /// proposes `KvCommand::TxnAbort` alone, **without** also resolving any
+    /// keys (unlike [`txn_decide`](Self::txn_decide), which bundles
+    /// abort+resolve for the single-participant convenience). A
+    /// multi-participant caller (`animusd`'s `cp_txn`, or a recovery push)
+    /// resolves every participant separately via
+    /// [`txn_resolve`](Self::txn_resolve), exactly like the commit path
+    /// already does. Returns the proposed abort ts once applied — **not**
+    /// necessarily the record's actual final status: a concurrent decision
+    /// (an in-flight coordinator, or a duelling recoverer) may have already
+    /// committed the record first, in which case this abort applies as a
+    /// logged no-op (see `apply_and_compact`'s `TxnAbort` arm and the
+    /// decision-semantics amendment) — the caller must re-read the actual
+    /// status (e.g. [`txn_status_local`](Self::txn_status_local)) to report
+    /// honestly, never assume its own proposal won.
+    pub async fn txn_abort(&self, txn_id: TxnId, record_key: Vec<u8>) -> Option<HlcTimestamp> {
+        let (result, ts) = self.propose_ordered_aux(|| {
+            let ts = self.mint_pushed(std::slice::from_ref(&record_key));
+            let cmd = KvCommand::TxnAbort {
+                txn_id: txn_id.clone(),
+                record_key: record_key.clone(),
+                ts,
+                orphan_created_ts: None,
+            };
+            (cmd, ts)
+        });
+        let index = match result {
+            ProposeResult::Accepted { index } => index,
+            ProposeResult::NotLeader { .. } => return None,
+        };
+        self.wait_applied(index).await.then_some(ts)
+    }
+
+    /// **Abort an orphan intent with no record at all** (ADR 0018 §2/PR5,
+    /// the corner PR5's own review found: PR4's prepare phase is
+    /// concurrent, so a participant's own stage can succeed and be
+    /// discovered by a reader while the *anchor's* `TxnStage` — which
+    /// would have created this transaction's record — never lands here at
+    /// all, e.g. a fence/seal miss the coordinator's propose outcome alone
+    /// can't distinguish from a genuine stage, PR4's own documented gap,
+    /// now applied to the anchor's own stage too). A recovery pusher whose
+    /// `txn_record_view` query finds nothing calls this instead of
+    /// [`txn_abort`](Self::txn_abort): proposes `KvCommand::TxnAbort` with
+    /// `orphan_created_ts: Some(created_ts)`, which **synthesizes** a fresh
+    /// `Aborted` record if (and only if) none exists yet — see
+    /// `KvCommand::TxnAbort`'s doc for the full safety argument (it can
+    /// never resurrect/clobber an existing record; that path is
+    /// unconditionally unchanged). `created_ts` should be the pusher's
+    /// best available substitute for a real `created_ts` — typically the
+    /// orphaned intent's own applied timestamp
+    /// ([`IntentInfo::version`](IntentInfo)), since no genuine record ever
+    /// existed to read one from. Returns the proposed ts once applied
+    /// (same "not necessarily the actual final status" caveat as
+    /// [`txn_abort`](Self::txn_abort) — a concurrent decision, e.g. the
+    /// coordinator's own late-but-successful commit, can still win; the
+    /// caller must re-read).
+    pub async fn txn_abort_orphan(
+        &self,
+        txn_id: TxnId,
+        record_key: Vec<u8>,
+        created_ts: HlcTimestamp,
+    ) -> Option<HlcTimestamp> {
+        let (result, ts) = self.propose_ordered_aux(|| {
+            let ts = self.mint_pushed(std::slice::from_ref(&record_key));
+            let cmd = KvCommand::TxnAbort {
+                txn_id: txn_id.clone(),
+                record_key: record_key.clone(),
+                ts,
+                orphan_created_ts: Some(created_ts),
+            };
+            (cmd, ts)
+        });
+        let index = match result {
+            ProposeResult::Accepted { index } => index,
+            ProposeResult::NotLeader { .. } => return None,
+        };
+        self.wait_applied(index).await.then_some(ts)
+    }
+
     /// **Resolve** `keys` still holding `txn_id`'s intent on **this**
     /// group, per the already-decided `outcome` (ADR 0018 §2/PR4): the one
     /// low-level primitive both [`txn_decide`](Self::txn_decide) (the
@@ -1619,6 +1917,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
                     txn_id: txn_id.clone(),
                     record_key: record_key.clone(),
                     ts,
+                    orphan_created_ts: None,
                 }
             };
             (cmd, ts)
@@ -1679,6 +1978,99 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         let vv = self.storage.get(&physical).await.ok().flatten()?;
         let record = txn::decode_record(&vv.value)?;
         Some(record.status.to_public())
+    }
+
+    /// **Recovery view** of `txn_id`'s record at `record_key` (ADR 0018
+    /// §2/PR5): like [`txn_status_local`](Self::txn_status_local), but also
+    /// returns `intent_spans`/`created_ts` — everything a recovery pusher
+    /// needs to verify every participant and, once decided, resolve every
+    /// one of them (see [`TxnRecordView`]'s doc). Same ReadIndex barrier +
+    /// `None` contract as `txn_status_local`.
+    pub async fn txn_record_view(&self, record_key: &[u8]) -> Option<TxnRecordView> {
+        if !self.read_barrier().await {
+            return None;
+        }
+        let physical = self.scope.physical(record_key);
+        let vv = self.storage.get(&physical).await.ok().flatten()?;
+        let record = txn::decode_record(&vv.value)?;
+        Some(TxnRecordView {
+            status: record.status.to_public(),
+            intent_spans: record.intent_spans,
+            created_ts: record.created_ts,
+        })
+    }
+
+    /// **Recovery primitive** (ADR 0018 §2/PR5): does this tablet currently
+    /// hold a **live intent** for `txn_id` anywhere in `span`? A recovery
+    /// pusher calls this on every participant named in a record's
+    /// `intent_spans` (routed by `span.start`) before deciding whether to
+    /// push the anchor's record to `Committed` (every span staged) or
+    /// `Aborted` (any missing). Same ReadIndex barrier as
+    /// [`linearizable_get`](Self::linearizable_get) — `None` = not served
+    /// (barrier failed or this node isn't the leader), `Some(bool)` = this
+    /// participant's own live answer.
+    ///
+    /// Deliberately reads the **raw** envelope via a direct scoped scan,
+    /// not [`local_scan`](Self::local_scan)/`resolve_scan_rows` — those
+    /// silently omit a still-`Pending` row (the right behavior for an
+    /// ordinary client-facing scan, the wrong one here: we need to see
+    /// "still staged" as a positive signal, not have it vanish). `span` is
+    /// expected to be a tight, single-key point-span in practice (the shape
+    /// `txn::immediate_successor` builds), so this is a small bounded scan,
+    /// never a whole-tablet one — a bounded scoped scan over the span is an
+    /// accepted cost here (ADR 0018 §2/PR5's own design note).
+    pub async fn txn_verify_staged(&self, span: &KeyRange, txn_id: &TxnId) -> Option<bool> {
+        if !self.read_barrier().await {
+            return None;
+        }
+        let start = self.scope.physical(&span.start);
+        let end = match &span.end {
+            Some(e) => self.scope.physical(e),
+            None => return Some(false), // an unbounded span can't be a point-span this crate ever built
+        };
+        let rows = self
+            .storage
+            .scan(&start, &end)
+            .await
+            .ok()
+            .unwrap_or_default();
+        Some(rows.iter().any(|(_, vv)| {
+            matches!(
+                txn::decode_envelope(&vv.value),
+                txn::Envelope::Intent { txn_id: found, .. } if &found == txn_id
+            )
+        }))
+    }
+
+    /// This group's currently-tracked `Pending` records (ADR 0018 §2/PR5):
+    /// `txn_id -> (record_key, created_ts)` — empty on a pure-participant
+    /// group (only an anchor stage ever creates a record). `animusd`'s
+    /// `txn_resolver_loop` walks this on every locally-led group to find
+    /// records past [`RECOVERY_GRACE`] and push them via `txn_recover`. A
+    /// cheap in-memory snapshot (no barrier, no I/O) — see [`TxnTracker`]'s
+    /// doc for the insert/remove rules and the rebuild-at-start source.
+    #[must_use]
+    pub fn pending_txns(&self) -> BTreeMap<TxnId, (Vec<u8>, HlcTimestamp)> {
+        self.txn_tracker
+            .lock()
+            .expect("txn tracker poisoned")
+            .pending
+            .clone()
+    }
+
+    /// This group's currently-tracked decided-but-not-yet-locally-resolved
+    /// records (ADR 0018 §2/PR5): `txn_id -> (record_key, outcome)`.
+    /// `animusd`'s `txn_resolver_loop` walks this on every locally-led
+    /// (anchor) group and fans a `TxnResolve` out to every table named in
+    /// the record's own `intent_spans`. See [`TxnTracker`]'s doc for why
+    /// this is a deliberately approximate (but still safe) signal.
+    #[must_use]
+    pub fn unresolved_decided(&self) -> BTreeMap<TxnId, (Vec<u8>, txn::TxnOutcome)> {
+        self.txn_tracker
+            .lock()
+            .expect("txn tracker poisoned")
+            .unresolved_decided
+            .clone()
     }
 
     /// Poll [`engine_applied_index`](Self::engine_applied_index) until it
@@ -2105,6 +2497,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
                         record_key,
                         record_table,
                         staged_value,
+                        version: hlc::unpack(vv.version),
                     }),
                 }
             }
@@ -3152,6 +3545,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
     sealed: &mut Vec<(KeyRange, HlcTimestamp)>,
     max_applied_ts: &mut Option<HlcTimestamp>,
     committed_ceiling: &AtomicU64,
+    txn_tracker: &Mutex<TxnTracker>,
 ) -> bool {
     let mut did_work = false;
 
@@ -3367,6 +3761,38 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 ts,
             } => {
                 assert_ts_monotonic(max_applied_ts, ts);
+                // ADR 0018 §2/PR5 resurrection guard: PR4's prepare phase
+                // is concurrent, so the anchor's own `TxnStage` (this
+                // entry, when `is_anchor`) can arrive **after** a recovery
+                // pusher has already decided this transaction — the
+                // pusher found an orphaned participant intent, got no
+                // record back, and created an `Aborted` tombstone
+                // (`KvCommand::TxnAbort`'s `orphan_created_ts` case). A
+                // late-arriving genuine stage must never resurrect a
+                // `Pending` record over an already-decided one (nor write
+                // fresh intents nobody will ever resolve, since this
+                // record's `intent_spans` — fixed at creation — likely
+                // doesn't name them): first decision wins, exactly like
+                // `TxnCommit`/`TxnAbort`'s own duelling-decider no-op.
+                // Only meaningful for `is_anchor`: a non-anchor
+                // participant's own tablet never holds the record to check
+                // against at all (see the doc below for why that's fine).
+                let already_decided = is_anchor
+                    && storage
+                        .get(&scope.physical(&record_key))
+                        .await
+                        .expect("raftkv txn stage record read")
+                        .and_then(|vv| txn::decode_record(&vv.value))
+                        .is_some_and(|r| r.txn_id == txn_id && r.status != txn::TxnStatus::Pending);
+                if already_decided {
+                    tracing::warn!(
+                        ?txn_id,
+                        ?record_key,
+                        "raftkv: TxnStage arrived after this record already decided — no-op \
+                         (a late anchor stage racing a recovery decision; first decision wins, \
+                         never a resurrection)"
+                    );
+                }
                 // Whole-or-nothing, matching `Batch`: a partial stage would
                 // let a reader observe some of a transaction's intents but
                 // not others (see `KvCommand::TxnStage`'s doc). A
@@ -3377,9 +3803,10 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 // fence/engine (ADR 0018 §2/PR4).
                 let record_in_fence =
                     !is_anchor || (fence.contains(&record_key) && !is_sealed(sealed, &record_key));
-                let all_in_fence = writes
-                    .iter()
-                    .all(|(k, _)| fence.contains(k) && !is_sealed(sealed, k))
+                let all_in_fence = !already_decided
+                    && writes
+                        .iter()
+                        .all(|(k, _)| fence.contains(k) && !is_sealed(sealed, k))
                     && record_in_fence;
                 if all_in_fence {
                     flush_pending(storage, &mut pending, metrics).await;
@@ -3398,7 +3825,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                     }
                     if is_anchor {
                         let record = txn::TxnRecord {
-                            txn_id,
+                            txn_id: txn_id.clone(),
                             status: txn::TxnStatus::Pending,
                             intent_spans: spans,
                             created_ts: ts,
@@ -3411,6 +3838,17 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                             )
                             .await
                             .expect("raftkv apply txn stage record");
+                        // ADR 0018 §2/PR5: track this freshly-created (or
+                        // re-staged/replayed) `Pending` record so
+                        // `animusd`'s resolver loop can find it without a
+                        // full re-scan. Idempotent: re-inserting the same
+                        // `(record_key, created_ts)` on a WAL-replay
+                        // re-application is harmless.
+                        txn_tracker
+                            .lock()
+                            .expect("txn tracker poisoned")
+                            .pending
+                            .insert(txn_id, (record_key, ts));
                     }
                 }
             }
@@ -3458,18 +3896,53 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                                 )
                                 .await
                                 .expect("raftkv apply txn commit");
+                            // ADR 0018 §2/PR5: the first (winning) decision
+                            // on this record — move it out of `pending` and
+                            // into `unresolved_decided` for the resolver
+                            // loop to fan out.
+                            let mut t = txn_tracker.lock().expect("txn tracker poisoned");
+                            t.pending.remove(&txn_id);
+                            t.unresolved_decided.insert(
+                                txn_id,
+                                (record_key, txn::TxnOutcome::Committed { commit_ts: ts }),
+                            );
                         }
                         // Idempotent WAL-replay re-application: identical
-                        // decision, nothing to do.
+                        // decision, nothing to do (the tracker was already
+                        // updated the first time this applied).
                         txn::TxnStatus::Committed { commit_ts } if commit_ts == ts => {}
+                        // Two different `commit_ts` values for one record is
+                        // impossible by construction — it would mean two
+                        // committed flips both "won" the *same* log
+                        // position, which cannot happen (this arm only ever
+                        // runs once per applied entry, in this group's own
+                        // single, totally-ordered log). A genuine protocol
+                        // bug, not a recoverable condition — keep the assert.
                         txn::TxnStatus::Committed { commit_ts } => panic!(
                             "raftkv txn commit: protocol bug — {txn_id:?} already committed \
-                             at {commit_ts:?}, cannot also commit at {ts:?}"
+                             at {commit_ts:?}, cannot also commit at {ts:?} (same log, two \
+                             different commit timestamps for one record)"
                         ),
-                        txn::TxnStatus::Aborted => panic!(
-                            "raftkv txn commit: protocol bug — {txn_id:?} already aborted, \
-                             cannot also commit"
-                        ),
+                        // ADR 0018 §2/PR5 (decision-semantics amendment):
+                        // recovery makes duelling deciders legal — a
+                        // still-live coordinator's commit can race a
+                        // recovery pusher's abort. The anchor's own Raft log
+                        // is the sole arbiter: whichever decision applied
+                        // FIRST already flipped the record and updated the
+                        // tracker; this later, losing proposal is a logged
+                        // no-op, never an assert. A caller must re-read the
+                        // record's actual status (`txn_status_local`) to
+                        // report honestly rather than assume its own
+                        // proposal won.
+                        txn::TxnStatus::Aborted => {
+                            tracing::warn!(
+                                ?txn_id,
+                                commit_ts = ?ts,
+                                "raftkv: TxnCommit lost to a prior TxnAbort on the same record \
+                                 (duelling decider — both outcomes are legal, log order is the \
+                                 ballot); no-op"
+                            );
+                        }
                     },
                 }
             }
@@ -3477,6 +3950,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 txn_id,
                 record_key,
                 ts,
+                orphan_created_ts,
             } => {
                 assert_ts_monotonic(max_applied_ts, ts);
                 flush_pending(storage, &mut pending, metrics).await;
@@ -3487,7 +3961,50 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                     .expect("raftkv txn abort read")
                     .and_then(|vv| txn::decode_record(&vv.value));
                 match current {
-                    None => {}
+                    // ADR 0018 §2/PR5: no record exists at all — either
+                    // the ordinary fence-miss no-op (unchanged: the
+                    // anchor's own stage never landed here, `None` is
+                    // this arm's caller-supplied signal that this isn't a
+                    // recovery push), or a recovery pusher's orphan-abort
+                    // tombstone (`Some(created_ts)`): synthesize a fresh
+                    // `Aborted` record directly. Safe unconditionally —
+                    // there is no existing record here to resurrect or
+                    // clobber (that's the `Some(r) => ..` arm below,
+                    // untouched). `intent_spans` is empty: unknown, since
+                    // no real record ever existed to learn participants
+                    // from — a documented residual (proactive resolver
+                    // fan-out can't reach unlisted participants this way;
+                    // on-demand resolution via any reader hitting any of
+                    // their own intents is unaffected, since that path
+                    // routes through this record's `record_table`/
+                    // `record_key` — carried in the intent envelope
+                    // itself — never through `intent_spans`).
+                    None => {
+                        if let Some(created_ts) = orphan_created_ts {
+                            let record = txn::TxnRecord {
+                                txn_id: txn_id.clone(),
+                                status: txn::TxnStatus::Aborted,
+                                intent_spans: Vec::new(),
+                                created_ts,
+                            };
+                            storage
+                                .merge(
+                                    &physical_record,
+                                    &txn::encode_record(&record),
+                                    hlc::pack(ts),
+                                )
+                                .await
+                                .expect("raftkv apply txn orphan-abort tombstone");
+                            tracing::warn!(
+                                ?txn_id,
+                                ?record_key,
+                                ?created_ts,
+                                "raftkv: recovery created an orphan-abort tombstone (no record \
+                                 ever existed for this txn_id — a stale intent with a crashed \
+                                 or fence/seal-missed anchor stage)"
+                            );
+                        }
+                    }
                     Some(r) if r.txn_id != txn_id => {
                         panic!(
                             "raftkv txn abort: record at {record_key:?} belongs to a \
@@ -3509,13 +4026,28 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                                 )
                                 .await
                                 .expect("raftkv apply txn abort");
+                            let mut t = txn_tracker.lock().expect("txn tracker poisoned");
+                            t.pending.remove(&txn_id);
+                            t.unresolved_decided
+                                .insert(txn_id, (record_key, txn::TxnOutcome::Aborted));
                         }
                         // Idempotent WAL-replay re-application.
                         txn::TxnStatus::Aborted => {}
-                        txn::TxnStatus::Committed { .. } => panic!(
-                            "raftkv txn abort: protocol bug — {txn_id:?} already committed, \
-                             cannot also abort"
-                        ),
+                        // ADR 0018 §2/PR5: the dual of `TxnCommit`'s
+                        // duelling-decider no-op above — this abort lost to
+                        // a prior commit on the same record. Legal, logged,
+                        // never an assert; see that arm's doc for the full
+                        // argument.
+                        txn::TxnStatus::Committed { commit_ts } => {
+                            tracing::warn!(
+                                ?txn_id,
+                                ?commit_ts,
+                                abort_ts = ?ts,
+                                "raftkv: TxnAbort lost to a prior TxnCommit on the same record \
+                                 (duelling decider — both outcomes are legal, log order is the \
+                                 ballot); no-op"
+                            );
+                        }
                     },
                 }
             }
@@ -3528,6 +4060,17 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
             } => {
                 assert_ts_monotonic(max_applied_ts, ts);
                 flush_pending(storage, &mut pending, metrics).await;
+                // ADR 0018 §2/PR5: this group can only ever observe a
+                // resolve for a `txn_id` it itself anchors (see
+                // `TxnTracker::unresolved_decided`'s doc for the documented,
+                // safe approximation) — a plain `remove` on a `txn_id` this
+                // group never tracked (a pure participant applying its own
+                // resolve) is a harmless no-op.
+                txn_tracker
+                    .lock()
+                    .expect("txn tracker poisoned")
+                    .unresolved_decided
+                    .remove(&txn_id);
                 // ADR 0018 §2/PR4: `outcome` is carried explicitly by the
                 // command rather than re-derived by reading `record_key`
                 // locally — see `KvCommand::TxnResolve`'s doc. This is what
@@ -3831,6 +4374,7 @@ struct DriveState<E: Env, S: StorageEngine> {
     stream: u64,
     hlc: Arc<Hlc>,
     committed_ceiling: Arc<AtomicU64>,
+    txn_tracker: Arc<Mutex<TxnTracker>>,
 }
 
 /// The `ts` a mutating [`KvCommand`] variant carries, or `None` for `NoOp`
@@ -3904,6 +4448,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         stream,
         hlc,
         committed_ceiling,
+        txn_tracker,
     } = st;
 
     let wal = wal_file(stream);
@@ -3964,8 +4509,18 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
     {
         committed_ceiling.fetch_max(hlc::pack(ts), Ordering::SeqCst);
     }
+    // Rebuild this group's transaction-record tracker (ADR 0018 §2/PR5) from
+    // the engine's own durable records — the same "engine marker survives
+    // compaction, log replay might not" reasoning as `sealed`/
+    // `committed_ceiling` above: a `TxnStage`/`TxnCommit`/`TxnAbort` entry can
+    // be compacted out of the log long before the record's own lifecycle is
+    // done. One bounded scope scan for `txn::is_record_key` markers, the
+    // accepted cost this crate already pays for `has_data`/`engine_image`.
+    let rebuilt_tracker = rebuild_txn_tracker(&storage, &scope).await;
+    *txn_tracker.lock().expect("txn tracker poisoned") = rebuilt_tracker;
     // Spawn the apply task now — after recovery seeded the core + `engine_applied`
-    // + `sealed` + `committed_ceiling`, so it never merges against pre-recovery state.
+    // + `sealed` + `committed_ceiling` + `txn_tracker`, so it never merges
+    // against pre-recovery state.
     env.spawn_task(apply_loop(
         env.clone(),
         wal.clone(),
@@ -3982,6 +4537,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         Arc::clone(&hlc),
         sealed,
         committed_ceiling,
+        txn_tracker,
     ));
 
     loop {
@@ -4126,6 +4682,7 @@ async fn apply_loop<E: Env, S: StorageEngine>(
     hlc: Arc<Hlc>,
     mut sealed: Vec<(KeyRange, HlcTimestamp)>,
     committed_ceiling: Arc<AtomicU64>,
+    txn_tracker: Arc<Mutex<TxnTracker>>,
 ) {
     // This apply task's own sequential, single-writer bookkeeping (see
     // `apply_and_compact`'s doc): `sealed` is seeded from the engine-durable
@@ -4155,10 +4712,299 @@ async fn apply_loop<E: Env, S: StorageEngine>(
             &mut sealed,
             &mut max_applied_ts,
             &committed_ceiling,
+            &txn_tracker,
         )
         .await;
         if !did_work {
             env.sleep(APPLY_IDLE_POLL).await;
+        }
+    }
+}
+
+/// **In-crate regression** for the orphan-record recovery + resurrection
+/// guard (ADR 0018 §2/PR5, the corner the team lead's review of the
+/// `intent_spans` fix flagged): lives here, not in `tests/txn_recovery.rs`,
+/// because reproducing "a late-arriving anchor `TxnStage` for an
+/// **already-known** `txn_id`" needs `pub(crate)` access
+/// (`txn::record_key`, a direct `KvCommand::TxnStage` construction, and the
+/// private `propose_ordered_aux`/`mint_pushed` primitives) — the public
+/// `RaftKvNode::txn_stage_anchor` always **mints a fresh** `TxnId`, so it
+/// cannot express "the identical, already-referenced transaction arrives
+/// late"; an external integration test genuinely cannot construct this
+/// scenario at all.
+#[cfg(test)]
+mod pr5_orphan_and_resurrection_tests {
+    use super::*;
+    use animus_env::nid;
+    use animus_sim::{SimEnv, Simulator};
+    use animus_storage::MemoryEngine;
+    use std::sync::Mutex as StdMutex;
+
+    type KvNode = RaftKvNode<SimEnv, MemoryEngine>;
+
+    fn drive<T: Send + 'static>(
+        sim: &mut Simulator,
+        env: &SimEnv,
+        budget: Duration,
+        fut: impl Future<Output = T> + Send + 'static,
+    ) -> Option<T> {
+        let slot: Arc<StdMutex<Option<T>>> = Arc::new(StdMutex::new(None));
+        let s = Arc::clone(&slot);
+        env.clone().spawn_task(async move {
+            let v = fut.await;
+            *s.lock().unwrap() = Some(v);
+        });
+        sim.run_for(budget);
+        slot.lock().unwrap().take()
+    }
+
+    fn key(token: u8, tail: &[u8]) -> Vec<u8> {
+        let mut k = vec![token; animus_tablet::TOKEN_BYTES];
+        k.extend_from_slice(tail);
+        k
+    }
+
+    /// **The full scenario the team lead's review named**: a pusher aborts
+    /// a record-less orphan intent (no anchor record ever existed — the
+    /// coordinator's own anchor `TxnStage` silently no-op'd, or never
+    /// landed); a late-arriving genuine anchor `TxnStage` for that exact
+    /// `txn_id` then no-ops against the tombstone instead of resurrecting
+    /// a `Pending` record; and the coordinator's own (also-late) commit
+    /// attempt converges to the same `Aborted` outcome. Final state: every
+    /// intent resolved away, no zombie `Pending` anywhere, no assert.
+    #[test]
+    fn orphan_abort_survives_a_late_anchor_stage_and_a_late_coordinator_commit() {
+        let seed = 0xA5B1_0001u64;
+        let mut sim = Simulator::new(seed);
+        let engine = MemoryEngine::new();
+        let id_a = nid(9001);
+        let id_b = nid(9011);
+        let node_a: KvNode = RaftKvNode::start_scoped(
+            sim.env(id_a.clone()),
+            vec![id_a.clone()],
+            engine.clone(),
+            StorageScope::new(b"orders:".to_vec(), KeyRange::whole()),
+        );
+        let node_b: KvNode = RaftKvNode::start_scoped(
+            sim.env(id_b.clone()),
+            vec![id_b.clone()],
+            engine.clone(),
+            StorageScope::new(b"accounts:".to_vec(), KeyRange::whole()),
+        );
+        sim.run_for(Duration::from_secs(2)); // elect (single voter each)
+
+        let ka = key(1, b":order");
+        let kb = key(2, b":balance");
+
+        // Hand-construct the transaction's identity: `TxnId`'s fields are
+        // `pub`, and `txn::record_key` is `pub(crate)` — both reachable
+        // here, unlike from an external integration test. This stands in
+        // for "the coordinator's anchor `TxnStage` call reported success
+        // (`Some((txn_id, record_key))`, since `wait_applied` only checks
+        // the entry APPLIED, never that it actually wrote anything) while
+        // its apply silently no-op'd" — PR4's own documented fence/seal-miss
+        // gap, now applying to the anchor's own stage too.
+        let anchor_token = &ka[..animus_tablet::TOKEN_BYTES];
+        let txn_id = TxnId {
+            ts: HlcTimestamp {
+                wall_ms: 1_000,
+                logical: 0,
+            },
+            node: id_a.clone(),
+        };
+        let record_key = txn::record_key(anchor_token, &txn_id);
+
+        // The participant stages for real, referencing this txn_id/record_key
+        // exactly as if the anchor's own stage had genuinely succeeded.
+        let n_b = node_b.clone();
+        let (txn_id_b, record_key_b) = (txn_id.clone(), record_key.clone());
+        let kb_clone = kb.clone();
+        let stage_ts = drive(
+            &mut sim,
+            node_b.env(),
+            Duration::from_millis(300),
+            async move {
+                n_b.txn_stage_participant(
+                    txn_id_b,
+                    record_key_b,
+                    "orders".to_string(),
+                    vec![(kb_clone, Some(b"debited".to_vec()))],
+                )
+                .await
+            },
+        )
+        .flatten();
+        assert!(
+            stage_ts.is_some(),
+            "participant stage should succeed (seed={seed})"
+        );
+
+        // Recovery discovers the orphan (group A has no record at all for
+        // this txn_id) and creates the abort tombstone directly.
+        let n_a = node_a.clone();
+        let (txn_id_o, record_key_o) = (txn_id.clone(), record_key.clone());
+        let created_ts_hint = HlcTimestamp {
+            wall_ms: 900,
+            logical: 0,
+        };
+        let orphan_ts = drive(
+            &mut sim,
+            node_a.env(),
+            Duration::from_millis(300),
+            async move {
+                n_a.txn_abort_orphan(txn_id_o, record_key_o, created_ts_hint)
+                    .await
+            },
+        )
+        .flatten();
+        assert!(
+            orphan_ts.is_some(),
+            "orphan-abort tombstone proposal should be accepted (seed={seed})"
+        );
+        let status = drive(&mut sim, node_a.env(), Duration::from_millis(300), {
+            let n = node_a.clone();
+            let rk = record_key.clone();
+            async move { n.txn_status_local(&rk).await }
+        })
+        .flatten();
+        assert_eq!(
+            status,
+            Some(TxnDecisionStatus::Aborted),
+            "the orphan-abort tombstone should be Aborted (seed={seed})"
+        );
+
+        // "The anchor stage arrives late": propose the genuine
+        // `KvCommand::TxnStage` for this exact (already-decided) txn_id
+        // directly — `RaftKvNode::txn_stage_anchor` cannot express this
+        // (it always mints a fresh id), so this in-crate test builds the
+        // command by hand via the same private primitives
+        // `txn_stage_anchor` itself uses internally.
+        let anchor_writes = vec![(ka.clone(), Some(b"placed".to_vec()))];
+        let fence = node_a.scope_range();
+        let participant_span_end = txn::immediate_successor(&kb);
+        let (result, late_ts) = node_a.propose_ordered_aux(|| {
+            let ts = node_a.mint_pushed(std::slice::from_ref(&ka));
+            let cmd = KvCommand::TxnStage {
+                txn_id: txn_id.clone(),
+                record_key: record_key.clone(),
+                record_table: "orders".to_string(),
+                is_anchor: true,
+                writes: anchor_writes.clone(),
+                spans: vec![(
+                    "accounts".to_string(),
+                    KeyRange::new(kb.clone(), Some(participant_span_end.clone())),
+                )],
+                fence: fence.clone(),
+                ts,
+            };
+            (cmd, ts)
+        });
+        let late_index = match result {
+            ProposeResult::Accepted { index } => index,
+            other => panic!("late anchor stage proposal rejected: {other:?} (seed={seed})"),
+        };
+        let applied = drive(&mut sim, node_a.env(), Duration::from_millis(300), {
+            let n = node_a.clone();
+            async move { n.wait_applied(late_index).await }
+        });
+        assert_eq!(
+            applied,
+            Some(true),
+            "the late entry itself must still apply (as a no-op) (seed={seed}, ts={late_ts:?})"
+        );
+
+        // No resurrection: the anchor's own key was never written (no
+        // zombie intent), and the record is still exactly the Aborted
+        // tombstone from before — never flipped back to Pending.
+        let anchor_local = drive(&mut sim, node_a.env(), Duration::from_millis(300), {
+            let n = node_a.clone();
+            let k = ka.clone();
+            async move { n.local_get(&k).await }
+        })
+        .flatten();
+        assert_eq!(
+            anchor_local, None,
+            "the late anchor stage must not write the anchor's own key — the whole entry must \
+             no-op against the already-decided record (seed={seed})"
+        );
+        let status_after_late_stage = drive(&mut sim, node_a.env(), Duration::from_millis(300), {
+            let n = node_a.clone();
+            let rk = record_key.clone();
+            async move { n.txn_status_local(&rk).await }
+        })
+        .flatten();
+        assert_eq!(
+            status_after_late_stage,
+            Some(TxnDecisionStatus::Aborted),
+            "the record must still be Aborted — the late stage must never resurrect it to \
+             Pending (seed={seed})"
+        );
+
+        // "The coordinator's commit": a still-live coordinator, unaware of
+        // any of this, tries to commit — this must also no-op against the
+        // already-Aborted record (the decision-semantics fix), never panic.
+        let commit_ts = drive(&mut sim, node_a.env(), Duration::from_millis(300), {
+            let n = node_a.clone();
+            let txn_id = txn_id.clone();
+            let record_key = record_key.clone();
+            async move {
+                n.txn_commit_at_least(txn_id, record_key, txn_id_hint_floor())
+                    .await
+            }
+        })
+        .flatten();
+        assert!(
+            commit_ts.is_some(),
+            "the commit PROPOSAL itself still succeeds at the Raft level (seed={seed})"
+        );
+        let final_status = drive(&mut sim, node_a.env(), Duration::from_millis(300), {
+            let n = node_a.clone();
+            let rk = record_key.clone();
+            async move { n.txn_status_local(&rk).await }
+        })
+        .flatten();
+        assert_eq!(
+            final_status,
+            Some(TxnDecisionStatus::Aborted),
+            "the coordinator's late commit must lose to the already-applied abort (seed={seed})"
+        );
+
+        // Resolve everywhere per the final, actual decision — no zombie
+        // Pending intent survives.
+        drive(&mut sim, node_b.env(), Duration::from_millis(300), {
+            let n = node_b.clone();
+            let txn_id = txn_id.clone();
+            let record_key = record_key.clone();
+            let kb = kb.clone();
+            async move {
+                n.txn_resolve(txn_id, record_key, vec![kb], txn::TxnOutcome::Aborted)
+                    .await
+            }
+        });
+        let b_final = drive(&mut sim, node_b.env(), Duration::from_millis(300), {
+            let n = node_b.clone();
+            let kb = kb.clone();
+            async move { n.local_get(&kb).await }
+        })
+        .flatten();
+        assert_eq!(
+            b_final, None,
+            "the participant's key must revert to its pre-transaction (absent) value — no \
+             zombie Pending intent (seed={seed})"
+        );
+    }
+
+    /// A ts safely below the group's current floor is fine here — this
+    /// mirrors the coordinator's own candidate-ts computation
+    /// (`max(anchor stage ts, every participant's acked stage ts)`); the
+    /// point under test is the *decision* outcome (Aborted, no assert),
+    /// never the exact ts `txn_commit_at_least` would have used — see
+    /// `mint_at_least`'s own floor-enforcement doc for why a caller's
+    /// candidate is always safe to pass through unmodified.
+    fn txn_id_hint_floor() -> HlcTimestamp {
+        HlcTimestamp {
+            wall_ms: 1_000,
+            logical: 0,
         }
     }
 }

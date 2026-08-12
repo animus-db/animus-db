@@ -157,7 +157,27 @@ pub(crate) enum TxnStatus {
 pub(crate) struct TxnRecord {
     pub txn_id: TxnId,
     pub status: TxnStatus,
-    pub intent_spans: Vec<KeyRange>,
+    /// **ADR 0018 §2/PR5**: every key this transaction staged **anywhere**
+    /// — every participant's writes, the anchor's own included — as
+    /// `(table, span)` pairs, `span` the point-span
+    /// (`[key, immediate_successor(key))`) shape [`immediate_successor`]
+    /// builds. This is a structural fix to a gap PR3/PR4 left open: as
+    /// those PRs shipped, `intent_spans` was only ever populated from the
+    /// anchor's *own* writes (`txn_stage_participant` passed `spans:
+    /// Vec::new()`, "no local record is ever created here") and carried no
+    /// table name — so recovery (PR5) had no way to learn which *other*
+    /// tablets/tables a transaction touched, or where to route a
+    /// cross-tablet verification/resolve query for them. The coordinator
+    /// (`animusd::ClientCtx::cp_txn`) already computes the full write set
+    /// grouped by `(table, tablet)` before staging anything, so it hands
+    /// the anchor's stage the complete cross-participant list up front
+    /// (mirroring exactly how PR4 closed the analogous `record_table`
+    /// routing gap). A recovery pusher walks every entry here, routes to
+    /// `table`'s tablet by `span.start` (the exact key), and asks that
+    /// tablet's leader whether it still holds a live intent for this txn
+    /// (`RaftKvNode::txn_verify_staged`) or resolves it once the record has
+    /// decided (`ClientCtx::txn_resolve_participant`).
+    pub intent_spans: Vec<(String, KeyRange)>,
     pub created_ts: HlcTimestamp,
 }
 
@@ -302,6 +322,13 @@ fn put_key_range(out: &mut Vec<u8>, r: &KeyRange) {
     put_opt_bytes(out, r.end.as_deref());
 }
 
+/// ADR 0018 §2/PR5: a `TxnRecord::intent_spans` entry — the table name
+/// alongside its span, so a recovery pusher can route to the right tablet.
+fn put_table_span(out: &mut Vec<u8>, table: &str, r: &KeyRange) {
+    put_bytes(out, table.as_bytes());
+    put_key_range(out, r);
+}
+
 fn put_txn_id(out: &mut Vec<u8>, id: &TxnId) {
     put_ts(out, id.ts);
     put_bytes(out, id.node.as_str().as_bytes());
@@ -354,6 +381,13 @@ impl<'a> Cursor<'a> {
             start: self.bytes()?,
             end: self.opt_bytes()?,
         })
+    }
+
+    /// The exact inverse of [`put_table_span`].
+    fn table_span(&mut self) -> Option<(String, KeyRange)> {
+        let table = String::from_utf8(self.bytes()?).ok()?;
+        let range = self.key_range()?;
+        Some((table, range))
     }
 
     fn node_id(&mut self) -> Option<NodeId> {
@@ -455,8 +489,8 @@ pub(crate) fn encode_record(r: &TxnRecord) -> Vec<u8> {
         TxnStatus::Aborted => put_u8(&mut out, 2),
     }
     put_u32(&mut out, r.intent_spans.len() as u32);
-    for s in &r.intent_spans {
-        put_key_range(&mut out, s);
+    for (table, span) in &r.intent_spans {
+        put_table_span(&mut out, table, span);
     }
     put_ts(&mut out, r.created_ts);
     out
@@ -478,7 +512,7 @@ pub(crate) fn decode_record(bytes: &[u8]) -> Option<TxnRecord> {
     let n = c.u32()?;
     let mut intent_spans = Vec::with_capacity(n as usize);
     for _ in 0..n {
-        intent_spans.push(c.key_range()?);
+        intent_spans.push(c.table_span()?);
     }
     let created_ts = c.ts()?;
     Some(TxnRecord {
@@ -620,8 +654,11 @@ mod tests {
     #[test]
     fn record_round_trips_every_status() {
         let spans = vec![
-            KeyRange::new(b"a".to_vec(), Some(b"m".to_vec())),
-            KeyRange::new(b"m".to_vec(), None),
+            (
+                "orders".to_string(),
+                KeyRange::new(b"a".to_vec(), Some(b"m".to_vec())),
+            ),
+            ("shipments".to_string(), KeyRange::new(b"m".to_vec(), None)),
         ];
         for status in [
             TxnStatus::Pending,

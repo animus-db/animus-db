@@ -57,7 +57,7 @@ use animus_control::{PlacementPolicy, ProposeResult, RaftNode};
 use animus_cp_data::hlc::HlcTimestamp;
 use animus_cp_data::host::{MetadataView, Reconciler};
 use animus_cp_data::{FastRead, RaftKvNode, TxnDecisionStatus, TxnId, TxnOutcome};
-use animus_env::{Env, Metric, MetricsHandle, NodeId, ProdEnv};
+use animus_env::{Clock, Env, Metric, MetricsHandle, NodeId, ProdEnv};
 use animus_storage::{
     Key, LsmEngine, MemoryEngine, SsTableView, StorageEngine, StorageError, VersionedValue,
     WalRecordView,
@@ -95,6 +95,21 @@ type TxnPrecondition = (String, Vec<u8>, Option<Vec<u8>>);
 /// but kept as a distinct alias since the two mean different things (a
 /// value to write vs. a value to check).
 type TxnTableWrite = (String, Vec<u8>, Option<Vec<u8>>);
+
+/// A decided [`TxnOutcome`]'s public-status mirror (ADR 0018 §2/PR5) — the
+/// two types mean the same thing (`Committed`/`Aborted`) but come from
+/// different call sites (`TxnOutcome` is what a coordinator/recovery pusher
+/// constructs and resolves with; `TxnDecisionStatus` is what a status/record
+/// view read reports, and additionally has a `Pending` variant a decided
+/// outcome can never be).
+fn outcome_to_status(o: &TxnOutcome) -> TxnDecisionStatus {
+    match o {
+        TxnOutcome::Committed { commit_ts } => TxnDecisionStatus::Committed {
+            commit_ts: *commit_ts,
+        },
+        TxnOutcome::Aborted => TxnDecisionStatus::Aborted,
+    }
+}
 
 /// A hosted leaderful CP per-tablet Raft group on this node (ADR 0017 #3a) — the
 /// v1 data plane (ADR 0019). It is backed by either the durable on-disk
@@ -505,21 +520,6 @@ impl CpGroup {
         }
     }
 
-    /// **Single-participant commit-or-abort-then-resolve.** See
-    /// [`RaftKvNode::txn_decide`].
-    async fn txn_decide(
-        &self,
-        txn_id: TxnId,
-        record_key: Vec<u8>,
-        keys: Vec<Vec<u8>>,
-        commit: bool,
-    ) -> Option<HlcTimestamp> {
-        match self {
-            CpGroup::Lsm(n) => n.txn_decide(txn_id, record_key, keys, commit).await,
-            CpGroup::Mem(n) => n.txn_decide(txn_id, record_key, keys, commit).await,
-        }
-    }
-
     /// **Status query** against this group's own record. See
     /// [`RaftKvNode::txn_status_local`].
     async fn txn_status_local(&self, record_key: &[u8]) -> Option<TxnDecisionStatus> {
@@ -555,6 +555,66 @@ impl CpGroup {
                 n.resolve_intent_given_status(key, None, txn_id, status)
                     .await
             }
+        }
+    }
+
+    // ---- in-doubt transaction recovery (ADR 0018 §2/PR5) ------------------
+
+    /// **Abort-only** (no inline resolve). See [`RaftKvNode::txn_abort`].
+    async fn txn_abort(&self, txn_id: TxnId, record_key: Vec<u8>) -> Option<HlcTimestamp> {
+        match self {
+            CpGroup::Lsm(n) => n.txn_abort(txn_id, record_key).await,
+            CpGroup::Mem(n) => n.txn_abort(txn_id, record_key).await,
+        }
+    }
+
+    /// **Abort an orphan intent with no record at all** (a fresh `Aborted`
+    /// tombstone). See [`RaftKvNode::txn_abort_orphan`].
+    async fn txn_abort_orphan(
+        &self,
+        txn_id: TxnId,
+        record_key: Vec<u8>,
+        created_ts: HlcTimestamp,
+    ) -> Option<HlcTimestamp> {
+        match self {
+            CpGroup::Lsm(n) => n.txn_abort_orphan(txn_id, record_key, created_ts).await,
+            CpGroup::Mem(n) => n.txn_abort_orphan(txn_id, record_key, created_ts).await,
+        }
+    }
+
+    /// **Recovery view of a record** (status + intent_spans + created_ts).
+    /// See [`RaftKvNode::txn_record_view`].
+    async fn txn_record_view(&self, record_key: &[u8]) -> Option<animus_cp_data::TxnRecordView> {
+        match self {
+            CpGroup::Lsm(n) => n.txn_record_view(record_key).await,
+            CpGroup::Mem(n) => n.txn_record_view(record_key).await,
+        }
+    }
+
+    /// **Does this tablet still hold a live intent for `txn_id` over
+    /// `span`?** See [`RaftKvNode::txn_verify_staged`].
+    async fn txn_verify_staged(&self, span: &KeyRange, txn_id: &TxnId) -> Option<bool> {
+        match self {
+            CpGroup::Lsm(n) => n.txn_verify_staged(span, txn_id).await,
+            CpGroup::Mem(n) => n.txn_verify_staged(span, txn_id).await,
+        }
+    }
+
+    /// This group's currently-tracked `Pending` records. See
+    /// [`RaftKvNode::pending_txns`].
+    fn pending_txns(&self) -> BTreeMap<TxnId, (Vec<u8>, HlcTimestamp)> {
+        match self {
+            CpGroup::Lsm(n) => n.pending_txns(),
+            CpGroup::Mem(n) => n.pending_txns(),
+        }
+    }
+
+    /// This group's currently-tracked decided-but-unresolved records. See
+    /// [`RaftKvNode::unresolved_decided`].
+    fn unresolved_decided(&self) -> BTreeMap<TxnId, (Vec<u8>, TxnOutcome)> {
+        match self {
+            CpGroup::Lsm(n) => n.unresolved_decided(),
+            CpGroup::Mem(n) => n.unresolved_decided(),
         }
     }
 
@@ -798,20 +858,33 @@ pub enum ClientRequest {
     },
     /// **Internal 2PC coordinator RPC — anchor only, never sent bare**
     /// (ADR 0018 §2/PR4): commit or abort `txn_id`'s record at `record_key`
-    /// (on `table`'s tablet leader — always the anchor's own table), then
-    /// resolve `keys` (the anchor's own staged keys) inline. `commit: true`
-    /// uses `min_commit_ts` as the floor for `RaftKvNode::txn_commit_at_least`
-    /// (the coordinator's candidate commit timestamp — the max of every
-    /// participant's acked stage ts, per the protocol); `commit: false`
-    /// ignores it and uses `RaftKvNode::txn_decide`'s bundled abort+resolve.
-    /// See `ClientCtx::txn_decide_anchor`, the one caller.
+    /// (on `table`'s tablet leader — always the anchor's own table).
+    /// `commit: true` uses `min_commit_ts` as the floor for
+    /// `RaftKvNode::txn_commit_at_least` (the coordinator's candidate commit
+    /// timestamp — the max of every participant's acked stage ts, per the
+    /// protocol); `commit: false` uses `RaftKvNode::txn_abort`.
+    ///
+    /// **Resolves nothing** (ADR 0018 §2/PR5, a change from PR4's shape):
+    /// the caller resolves every participant, the anchor's own keys
+    /// included, uniformly via a separate `TxnResolve` — see
+    /// `ClientCtx::txn_decide_anchor`, the one caller, for the full
+    /// rationale (including why the reply now carries the record's
+    /// **actual** decided outcome, not just a proposed ts).
+    ///
+    /// **`orphan_created_ts` (ADR 0018 §2/PR5's orphan-record fix)**:
+    /// `Some(created_ts)` means "no record exists at all — synthesize an
+    /// `Aborted` tombstone directly" (`RaftKvNode::txn_abort_orphan`),
+    /// overriding `commit`/`min_commit_ts` entirely (an orphan can only
+    /// ever be aborted — see `ClientCtx::txn_recover`'s doc for why). `None`
+    /// is the ordinary commit/abort-of-an-existing-record case, unchanged.
     TxnDecide {
         table: String,
         txn_id: TxnId,
         record_key: Vec<u8>,
-        keys: Vec<Vec<u8>>,
         commit: bool,
         min_commit_ts: HlcTimestamp,
+        #[serde(default)]
+        orphan_created_ts: Option<HlcTimestamp>,
     },
     /// **Internal 2PC coordinator RPC — every participant including the
     /// anchor, never sent bare** (ADR 0018 §2/PR4): resolve `keys` on
@@ -835,6 +908,23 @@ pub enum ClientRequest {
     /// (or still-pending) status. See `ClientCtx::txn_status`, the one
     /// caller (from `cp_get_local`'s foreign-intent path).
     TxnStatus { table: String, record_key: Vec<u8> },
+    /// **Internal recovery RPC — never sent bare** (ADR 0018 §2/PR5): the
+    /// recovery-view dual of [`TxnStatus`](Self::TxnStatus) — like it, but
+    /// also returns `intent_spans`/`created_ts`, everything a recovery
+    /// pusher needs (`RaftKvNode::txn_record_view`). See
+    /// `ClientCtx::txn_record_view`, the one caller.
+    TxnRecordView { table: String, record_key: Vec<u8> },
+    /// **Internal recovery RPC — never sent bare** (ADR 0018 §2/PR5): does
+    /// `table`'s tablet leader still hold a live intent for `txn_id`
+    /// anywhere in `span` (`RaftKvNode::txn_verify_staged`)? A recovery
+    /// pusher sends one of these per `(table, span)` entry in a record's
+    /// `intent_spans` before deciding whether every participant staged.
+    /// See `ClientCtx::txn_verify`, the one caller.
+    TxnVerify {
+        table: String,
+        span: KeyRange,
+        txn_id: TxnId,
+    },
 }
 
 /// Whether `command` may be **relayed to the control leader** via
@@ -1050,12 +1140,28 @@ pub enum ClientResponse {
         record_table: String,
         ts: HlcTimestamp,
     },
-    /// Reply to [`TxnDecide`](ClientRequest::TxnDecide): the anchor's
-    /// decision (commit or abort) landed at `ts`.
-    TxnDecided { ts: HlcTimestamp },
+    /// Reply to [`TxnDecide`](ClientRequest::TxnDecide): the record's
+    /// **actual, applied** decision (ADR 0018 §2/PR5 — no longer just "the
+    /// ts my own proposal landed at": with recovery, a coordinator's
+    /// commit/abort proposal can lose to a concurrent recovery decision on
+    /// the same record, so the caller must report the record's real,
+    /// possibly-different outcome, never assume its own proposal won — see
+    /// the decision-semantics amendment).
+    TxnDecided { outcome: TxnOutcome },
     /// Reply to [`TxnStatus`](ClientRequest::TxnStatus): the record's
     /// current (possibly still-`Pending`) status.
     TxnStatusReply { status: TxnDecisionStatus },
+    /// Reply to [`TxnRecordView`](ClientRequest::TxnRecordView) (ADR 0018
+    /// §2/PR5).
+    TxnRecordViewReply {
+        status: TxnDecisionStatus,
+        intent_spans: Vec<(String, KeyRange)>,
+        created_ts: HlcTimestamp,
+    },
+    /// Reply to [`TxnVerify`](ClientRequest::TxnVerify) (ADR 0018 §2/PR5):
+    /// does the answering tablet still hold a live intent for the queried
+    /// `txn_id` over the queried span?
+    TxnVerifyReply { staged: bool },
 }
 
 /// Listen addresses for a node's endpoints (use port 0 for ephemeral): one
@@ -1712,6 +1818,16 @@ impl BoundNode {
             ctx.clone(),
             reconciler,
         )));
+
+        // **In-doubt transaction recovery + resolver** (ADR 0018 §2/PR5):
+        // periodically pushes stale `Pending` records past their grace
+        // period and fans out `TxnResolve` for decided-but-unresolved ones,
+        // over every tablet this node currently leads. Data-role-only (it
+        // walks `ctx.edge.hosted_groups()`, empty on a control-only node) —
+        // harmless to run on every data-capable node the same way
+        // `auto_split_loop`/the reconciler do (each tick checks leadership
+        // per tablet).
+        tasks.push(tokio::spawn(txn_resolver_loop(ctx.clone())));
 
         // Auto-split loop (Phase 2.4 / ADR 0034), opt-in: a node splits a tablet
         // it leads once it exceeds **either** configured threshold (it checks
@@ -3272,12 +3388,24 @@ impl ClientCtx {
     /// record's actual owner and, once decided, finishes the read via
     /// [`RaftKvNode::resolve_intent_given_status`] — the exact round trip
     /// `foreign_intent_resolves_via_the_anchor_records_status` (`animus-cp-
-    /// data`'s `tests/txn_multi.rs`) proves at the primitive level. Falls
-    /// back to the bounded local wait ([`cp_get_local`](Self::cp_get_local))
-    /// for a **locally**-`Pending` intent (the single-participant/anchor
-    /// case, unchanged from PR3) and for the still-undecided or
-    /// status-query-failed foreign case (the caller's own retry loop —
-    /// `cp_read`'s `"; retry"` handling — tries again).
+    /// data`'s `tests/txn_multi.rs`) proves at the primitive level.
+    ///
+    /// **ADR 0018 §2/PR5 (lifting PR4's deferral)**: a still-`Pending`
+    /// status (or a failed status query — the same "can't confirm, treat
+    /// conservatively" posture) no longer immediately reports "retry" —
+    /// this pushes the transaction via [`txn_recover`](Self::txn_recover)
+    /// first. `txn_recover` itself declines (returns `Pending`, unchanged
+    /// behavior) while the record hasn't sat `Pending` past
+    /// [`animus_cp_data::RECOVERY_GRACE`] yet — a still-live coordinator's
+    /// ordinary in-flight commit is never disturbed by this.
+    ///
+    /// Falls back to the bounded local wait
+    /// ([`cp_get_local`](Self::cp_get_local)) for a **locally**-`Pending`
+    /// intent (the single-participant/anchor case, unchanged from PR3 — the
+    /// background `txn_resolver_loop`, not this synchronous read path, is
+    /// what eventually pushes a stale local record) and for the
+    /// still-undecided foreign case after a declined push (the caller's own
+    /// retry loop — `cp_read`'s `"; retry"` handling — tries again).
     async fn cp_get_local_resolving(
         &self,
         leader: &CpGroup,
@@ -3295,10 +3423,32 @@ impl ClientCtx {
                 None => Err("CP group leader moved; retry".into()),
             },
             Some(FastRead::Foreign(info)) => {
-                match self.txn_status(&info.record_table, &info.record_key).await {
-                    Ok(
-                        status @ (TxnDecisionStatus::Committed { .. } | TxnDecisionStatus::Aborted),
-                    ) => {
+                let status = match self.txn_status(&info.record_table, &info.record_key).await {
+                    Ok(TxnDecisionStatus::Pending) | Err(_) => {
+                        // ADR 0018 §2/PR5 (lifting PR4's deferral): rather
+                        // than immediately reporting "still pending, retry",
+                        // push it — the record may just be stale (its
+                        // coordinator crashed) rather than genuinely
+                        // in-flight. `txn_recover` itself declines (returns
+                        // `Pending`) if grace hasn't elapsed yet, so this is
+                        // never premature.
+                        match self
+                            .txn_recover(
+                                &info.record_table,
+                                &info.record_key,
+                                &info.txn_id,
+                                Some(info.version),
+                            )
+                            .await
+                        {
+                            Ok(s) => s,
+                            Err(_) => TxnDecisionStatus::Pending,
+                        }
+                    }
+                    Ok(s) => s,
+                };
+                match status {
+                    TxnDecisionStatus::Committed { .. } | TxnDecisionStatus::Aborted => {
                         match leader
                             .resolve_intent_given_status(key, &info.txn_id, status)
                             .await
@@ -3307,7 +3457,7 @@ impl ClientCtx {
                             None => Err("transaction resolution race; retry".into()),
                         }
                     }
-                    Ok(TxnDecisionStatus::Pending) | Err(_) => {
+                    TxnDecisionStatus::Pending => {
                         Err("transaction covering this key is still pending; retry".into())
                     }
                 }
@@ -3789,44 +3939,71 @@ impl ClientCtx {
     }
 
     /// **Commit or abort** `txn_id`'s record at `record_key` on `table`'s
-    /// (the anchor's own) tablet leader, resolving `keys` (the anchor's own
-    /// staged keys) inline — the wire-routed counterpart of
+    /// (the anchor's own) tablet leader — the wire-routed counterpart of
     /// [`RaftKvNode::txn_commit_at_least`] (`commit: true`, floored at
-    /// `min_commit_ts`) / [`RaftKvNode::txn_decide`] (`commit: false`).
-    /// Returns the decision timestamp (the transaction's canonical
-    /// `commit_ts` when committing).
+    /// `min_commit_ts`) / [`RaftKvNode::txn_abort`] (`commit: false`).
+    ///
+    /// **Deliberately resolves nothing** (ADR 0018 §2/PR5 — a change from
+    /// the PR4 shape, which bundled the anchor's own keys' resolve into
+    /// this call): resolving every participant, the anchor's own keys
+    /// included, is now the caller's uniform job (`cp_txn`'s `resolve_all`),
+    /// so a record's `intent_spans` — and hence what a recovery pusher
+    /// verifies/resolves — never has to special-case "the anchor's keys are
+    /// resolved differently from everyone else's."
+    ///
+    /// **Returns the record's ACTUAL, applied decision** (ADR 0018 §2/PR5
+    /// decision-semantics amendment), never just "the ts my own proposal
+    /// landed at": recovery makes duelling deciders legal, so this
+    /// `commit`/`abort` proposal can lose to a concurrent recovery decision
+    /// on the very same record (the anchor's own Raft log position is the
+    /// sole arbiter — see `apply_and_compact`'s `TxnCommit`/`TxnAbort`
+    /// arms). The caller MUST act on the returned outcome, never assume the
+    /// decision it asked for is the one that happened.
+    ///
+    /// `orphan_created_ts: Some(created_ts)` (ADR 0018 §2/PR5's
+    /// orphan-record fix) overrides `commit`/`min_commit_ts` entirely: this
+    /// call is a recovery pusher that found **no record at all** for
+    /// `txn_id` (see [`txn_recover`](Self::txn_recover)'s doc) and must
+    /// synthesize an `Aborted` tombstone (`RaftKvNode::txn_abort_orphan`)
+    /// rather than proposing against a record that doesn't exist.
     async fn txn_decide_anchor(
         &self,
         table: &str,
         txn_id: TxnId,
         record_key: Vec<u8>,
-        keys: Vec<Vec<u8>>,
         commit: bool,
         min_commit_ts: HlcTimestamp,
-    ) -> Result<HlcTimestamp, String> {
+        orphan_created_ts: Option<HlcTimestamp>,
+    ) -> Result<TxnOutcome, String> {
         match self.cp_route(table, &record_key).await {
             CpRoute::Local(leader) => {
-                if commit {
-                    let commit_ts = leader
+                if let Some(created_ts) = orphan_created_ts {
+                    leader
+                        .txn_abort_orphan(txn_id.clone(), record_key.clone(), created_ts)
+                        .await
+                        .ok_or("CP group leader moved during orphan abort; retry")?;
+                } else if commit {
+                    leader
                         .txn_commit_at_least(txn_id.clone(), record_key.clone(), min_commit_ts)
                         .await
                         .ok_or("CP group leader moved during anchor commit; retry")?;
-                    leader
-                        .txn_resolve(
-                            txn_id,
-                            record_key,
-                            keys,
-                            TxnOutcome::Committed { commit_ts },
-                        )
-                        .await;
-                    Ok(commit_ts)
                 } else {
                     leader
-                        .txn_decide(txn_id, record_key, keys, false)
+                        .txn_abort(txn_id.clone(), record_key.clone())
                         .await
-                        .ok_or_else(|| {
-                            "CP group leader moved during anchor abort; retry".to_string()
-                        })
+                        .ok_or("CP group leader moved during anchor abort; retry")?;
+                }
+                match leader.txn_status_local(&record_key).await {
+                    Some(TxnDecisionStatus::Committed { commit_ts }) => {
+                        Ok(TxnOutcome::Committed { commit_ts })
+                    }
+                    Some(TxnDecisionStatus::Aborted) => Ok(TxnOutcome::Aborted),
+                    Some(TxnDecisionStatus::Pending) => Err(
+                        "txn decide: record still Pending immediately after its own decide \
+                         applied — protocol bug"
+                            .into(),
+                    ),
+                    None => Err("CP group leader moved after decide; retry".into()),
                 }
             }
             CpRoute::Forward(addr) => {
@@ -3834,12 +4011,12 @@ impl ClientCtx {
                     table: table.to_owned(),
                     txn_id,
                     record_key: record_key.clone(),
-                    keys,
                     commit,
                     min_commit_ts,
+                    orphan_created_ts,
                 };
                 match self.cp_forward(table, &record_key, addr, request).await {
-                    ClientResponse::TxnDecided { ts } => Ok(ts),
+                    ClientResponse::TxnDecided { outcome } => Ok(outcome),
                     ClientResponse::Error(e) => Err(e),
                     other => Err(format!(
                         "unexpected reply to forwarded TxnDecide: {other:?}"
@@ -3925,6 +4102,321 @@ impl ClientCtx {
         }
     }
 
+    // ---- in-doubt transaction recovery (ADR 0018 §2/PR5) ------------------
+
+    /// **Cross-tablet recovery view** for `txn_id`'s record at `record_key`
+    /// (`record_table`'s own tablet) — the recovery-view dual of
+    /// [`txn_status`](Self::txn_status): also returns `intent_spans`/
+    /// `created_ts`, everything [`txn_recover`](Self::txn_recover) needs.
+    async fn txn_record_view(
+        &self,
+        record_table: &str,
+        record_key: &[u8],
+    ) -> Result<animus_cp_data::TxnRecordView, String> {
+        match self.cp_route(record_table, record_key).await {
+            CpRoute::Local(leader) => leader
+                .txn_record_view(record_key)
+                .await
+                .ok_or_else(|| "CP group leader moved, or no record yet; retry".to_string()),
+            CpRoute::Forward(addr) => {
+                let request = ClientRequest::TxnRecordView {
+                    table: record_table.to_owned(),
+                    record_key: record_key.to_vec(),
+                };
+                match self
+                    .cp_forward(record_table, record_key, addr, request)
+                    .await
+                {
+                    ClientResponse::TxnRecordViewReply {
+                        status,
+                        intent_spans,
+                        created_ts,
+                    } => Ok(animus_cp_data::TxnRecordView {
+                        status,
+                        intent_spans,
+                        created_ts,
+                    }),
+                    ClientResponse::Error(e) => Err(e),
+                    other => Err(format!(
+                        "unexpected reply to forwarded TxnRecordView: {other:?}"
+                    )),
+                }
+            }
+            CpRoute::None => Err("no CP group leader reachable for txn record view".into()),
+        }
+    }
+
+    /// **Cross-tablet staged-intent check**: does `table`'s tablet leader
+    /// still hold a live intent for `txn_id` anywhere in `span`? Routed by
+    /// `span.start` (an exact key — every span a record carries is the
+    /// point-span shape `txn::immediate_successor` builds).
+    async fn txn_verify(
+        &self,
+        table: &str,
+        span: &KeyRange,
+        txn_id: &TxnId,
+    ) -> Result<bool, String> {
+        match self.cp_route(table, &span.start).await {
+            CpRoute::Local(leader) => leader
+                .txn_verify_staged(span, txn_id)
+                .await
+                .ok_or_else(|| "CP group leader moved during txn verify; retry".to_string()),
+            CpRoute::Forward(addr) => {
+                let request = ClientRequest::TxnVerify {
+                    table: table.to_owned(),
+                    span: span.clone(),
+                    txn_id: txn_id.clone(),
+                };
+                match self.cp_forward(table, &span.start, addr, request).await {
+                    ClientResponse::TxnVerifyReply { staged } => Ok(staged),
+                    ClientResponse::Error(e) => Err(e),
+                    other => Err(format!(
+                        "unexpected reply to forwarded TxnVerify: {other:?}"
+                    )),
+                }
+            }
+            CpRoute::None => Err("no CP group leader reachable for txn verify".into()),
+        }
+    }
+
+    /// Resolve every `(table, span)` in `intent_spans` per `status`
+    /// (best-effort, fire-and-forget on any individual routing failure —
+    /// see [`txn_resolve_participant`](Self::txn_resolve_participant)'s own
+    /// doc): groups spans by table (a span's own exact key,
+    /// `span.start`, is the key to resolve — every span this crate ever
+    /// builds is a single-key point-span) and issues one
+    /// `txn_resolve_participant` call per table. A no-op if `status` is
+    /// still `Pending` (nothing to resolve yet).
+    async fn recovery_resolve(
+        &self,
+        txn_id: TxnId,
+        record_key: Vec<u8>,
+        intent_spans: &[(String, KeyRange)],
+        status: &TxnDecisionStatus,
+    ) {
+        let outcome = match status {
+            TxnDecisionStatus::Committed { commit_ts } => TxnOutcome::Committed {
+                commit_ts: *commit_ts,
+            },
+            TxnDecisionStatus::Aborted => TxnOutcome::Aborted,
+            TxnDecisionStatus::Pending => return,
+        };
+        let mut by_table: BTreeMap<String, Vec<Vec<u8>>> = BTreeMap::new();
+        for (table, span) in intent_spans {
+            by_table
+                .entry(table.clone())
+                .or_default()
+                .push(span.start.clone());
+        }
+        for (table, keys) in by_table {
+            let _ = self
+                .txn_resolve_participant(
+                    &table,
+                    txn_id.clone(),
+                    record_key.clone(),
+                    keys,
+                    outcome.clone(),
+                )
+                .await;
+        }
+    }
+
+    /// **Push a transaction record to a decision** (ADR 0018 §2/PR5's
+    /// "recovery" mechanism — the CockroachDB "no blocking on a dead
+    /// coordinator" property the Decision section's Recovery bullet
+    /// promises): any actor holding a foreign-or-local `Pending` intent past
+    /// [`animus_cp_data::RECOVERY_GRACE`] may call this to drive the
+    /// transaction to a decision. Callable both from a reader that just hit
+    /// a stale `Pending` intent (the read-path push) and from
+    /// `txn_resolver_loop`'s own periodic sweep.
+    ///
+    /// **Protocol** (see the ADR's PR5 amendment for the full safety
+    /// argument):
+    /// 1. Read the record ([`txn_record_view`](Self::txn_record_view)). If
+    ///    already decided, resolve every participant and return the
+    ///    decision — no need to re-decide.
+    /// 2. **If no record exists at all** (ADR 0018 §2/PR5's orphan-record
+    ///    fix — a real, already-acknowledged possibility: PR4's prepare
+    ///    phase is concurrent, so a participant's own stage can succeed and
+    ///    be discovered by a reader while the *anchor's* `TxnStage` — which
+    ///    would create this transaction's record — never lands at all,
+    ///    e.g. a fence/seal miss the coordinator's propose outcome alone
+    ///    can't distinguish from a genuine stage, PR4's own documented gap,
+    ///    now applying to the anchor's own stage too): there is no
+    ///    `created_ts` to grace-gate against. `intent_ts_hint` (typically
+    ///    the orphaned intent's own applied timestamp,
+    ///    [`animus_cp_data::IntentInfo::version`]) is the pusher's only
+    ///    trustworthy substitute; with none supplied, decline
+    ///    conservatively (never wrongly abort something we can't even
+    ///    time-bound). Past grace on that substitute, this can ONLY ever
+    ///    decide **abort** — an absent record means there is no candidate
+    ///    participant list to verify "all staged" against, so committing
+    ///    would be unsound; aborting is always safe (see
+    ///    [`RaftKvNode::txn_abort_orphan`]'s doc). The synthesized
+    ///    tombstone also closes a related hazard: a **late-arriving**
+    ///    genuine anchor `TxnStage` for this same `txn_id` finds it and
+    ///    no-ops instead of resurrecting a `Pending` record
+    ///    (`KvCommand::TxnStage`'s own resurrection guard).
+    /// 3. If `Pending` and not yet past grace, decline (`Pending`) — a live
+    ///    coordinator may still be working on it.
+    /// 4. If `Pending` and stale: verify every `(table, span)` in
+    ///    `intent_spans` ([`txn_verify`](Self::txn_verify)). All staged →
+    ///    propose `TxnCommit`; any missing (or any verify query itself
+    ///    failing — conservatively treated as "not confirmed staged") →
+    ///    propose `TxnAbort`.
+    /// 5. Either proposal may **lose** to a concurrent decision (a
+    ///    still-live coordinator, or a duelling recoverer) — re-read the
+    ///    record's actual status and act on THAT, never on what was
+    ///    proposed (see `txn_decide_anchor`'s doc for the identical
+    ///    argument on the coordinator side).
+    /// 6. Resolve every participant per the final, actual decision.
+    ///
+    /// **Grace is liveness-only**: whether this call even attempts step 3
+    /// affects only *when* a decision might be pushed, never *what* it
+    /// decides once pushed — a recovery commit requires every span
+    /// independently verified staged, exactly the coordinator's own commit
+    /// precondition, so a recovery commit and a coordinator's own commit
+    /// are the SAME decision; a recovery abort can only ever race a
+    /// still-live coordinator's late prepare, in which case the
+    /// coordinator's own subsequent commit attempt simply loses (step 4's
+    /// mechanism) and the client correctly sees an abort.
+    pub(crate) async fn txn_recover(
+        &self,
+        record_table: &str,
+        record_key: &[u8],
+        txn_id: &TxnId,
+        intent_ts_hint: Option<HlcTimestamp>,
+    ) -> Result<TxnDecisionStatus, String> {
+        let view = match self.txn_record_view(record_table, record_key).await {
+            Ok(view) => view,
+            Err(_) => {
+                // Step 1b: no record at all. Without a substitute clock we
+                // cannot tell "genuinely stale" from "the anchor's stage is
+                // simply still in flight" — decline rather than guess.
+                let Some(hint_ts) = intent_ts_hint else {
+                    return Ok(TxnDecisionStatus::Pending);
+                };
+                let now_ms = match self.cp_route(record_table, record_key).await {
+                    CpRoute::Local(leader) => leader.env().now().0 / 1_000_000,
+                    _ => tokio::time::Instant::now().elapsed().as_millis() as u64,
+                };
+                if now_ms < hint_ts.wall_ms + animus_cp_data::RECOVERY_GRACE.as_millis() as u64 {
+                    return Ok(TxnDecisionStatus::Pending);
+                }
+                // Always an abort — see this method's own doc for why an
+                // absent record can never safely commit.
+                let proposed = self
+                    .txn_decide_anchor(
+                        record_table,
+                        txn_id.clone(),
+                        record_key.to_vec(),
+                        false,
+                        HlcTimestamp::zero(),
+                        Some(hint_ts),
+                    )
+                    .await?;
+                let decided_status = outcome_to_status(&proposed);
+                // Re-read for whatever `intent_spans` now exist (typically
+                // empty for a fresh tombstone — this pusher only ever knew
+                // about the one intent that triggered it, not the whole
+                // transaction's participant set, since no record existed
+                // to learn that from). A failure here is harmless: the
+                // caller that triggered this push (e.g.
+                // `cp_get_local_resolving`) still finishes its own read
+                // off the returned status regardless of whether this
+                // fan-out resolve runs.
+                if let Ok(final_view) = self.txn_record_view(record_table, record_key).await {
+                    self.recovery_resolve(
+                        txn_id.clone(),
+                        record_key.to_vec(),
+                        &final_view.intent_spans,
+                        &decided_status,
+                    )
+                    .await;
+                }
+                self.record_recovery_metric(&proposed);
+                return Ok(decided_status);
+            }
+        };
+        if !matches!(view.status, TxnDecisionStatus::Pending) {
+            self.recovery_resolve(
+                txn_id.clone(),
+                record_key.to_vec(),
+                &view.intent_spans,
+                &view.status,
+            )
+            .await;
+            return Ok(view.status);
+        }
+
+        // Grace check (liveness-only — see this method's own doc): compare
+        // against any reachable env's wall clock, since the pusher may be a
+        // different node than the one that minted the record. `cp_route`
+        // always resolves *some* local or forwarded leader for `record_key`
+        // itself, so re-route here rather than plumb a fresh `Env` handle
+        // through just for a clock read.
+        let now_ms = match self.cp_route(record_table, record_key).await {
+            CpRoute::Local(leader) => leader.env().now().0 / 1_000_000,
+            // A forwarded caller has no local env to read; approximate with
+            // this node's own — the grace window is generous (seconds) and
+            // liveness-only, so modest cross-node clock skew here is
+            // harmless (it can only shift *when* a push is attempted).
+            _ => tokio::time::Instant::now().elapsed().as_millis() as u64,
+        };
+        if now_ms < view.created_ts.wall_ms + animus_cp_data::RECOVERY_GRACE.as_millis() as u64 {
+            return Ok(TxnDecisionStatus::Pending);
+        }
+
+        let mut all_staged = true;
+        for (table, span) in &view.intent_spans {
+            match self.txn_verify(table, span, txn_id).await {
+                Ok(true) => {}
+                Ok(false) | Err(_) => all_staged = false,
+            }
+        }
+
+        let candidate = view.created_ts;
+        let proposed = self
+            .txn_decide_anchor(
+                record_table,
+                txn_id.clone(),
+                record_key.to_vec(),
+                all_staged,
+                candidate,
+                None,
+            )
+            .await?;
+
+        let decided_status = outcome_to_status(&proposed);
+        self.recovery_resolve(
+            txn_id.clone(),
+            record_key.to_vec(),
+            &view.intent_spans,
+            &decided_status,
+        )
+        .await;
+
+        self.record_recovery_metric(&proposed);
+        Ok(decided_status)
+    }
+
+    /// Records the `CpTxnRecoveredCommitted`/`CpTxnRecoveredAborted` metric
+    /// for a just-completed recovery decision — shared by both
+    /// [`txn_recover`](Self::txn_recover) branches (the ordinary decided-
+    /// record path and the orphan-record path).
+    fn record_recovery_metric(&self, proposed: &TxnOutcome) {
+        if let Some(data) = self.data.as_ref() {
+            match proposed {
+                TxnOutcome::Committed { .. } => {
+                    data.raftkv_metrics.incr(Metric::CpTxnRecoveredCommitted);
+                }
+                TxnOutcome::Aborted => {
+                    data.raftkv_metrics.incr(Metric::CpTxnRecoveredAborted);
+                }
+            }
+        }
+    }
+
     /// **Multi-participant transaction** (ADR 0018 §2/PR4): atomically write
     /// every `(table, key, Option<value>)` in `writes` across however many
     /// tablets they span. `preconditions` — `(table, key, expected)`,
@@ -3947,25 +4439,39 @@ impl ClientCtx {
     /// correct for the stated goal, but not byte-for-byte the ADR's
     /// mechanism. Flagged here and in the ADR amendment as a follow-up.
     ///
-    /// **Flow** (ADR 0018 §3/the PR4 amendment): group `writes` by owning
+    /// **Flow** (ADR 0018 §3, the PR4 amendment, and the PR5 amendment
+    /// lifting its one deliberate deviation): group `writes` by owning
     /// tablet; the first write's tablet is the **anchor** (stages first,
     /// synchronously — it mints the `TxnId`/record key every participant
-    /// needs). Every other participant then stages **concurrently**
-    /// (`futures::future::join_all`). Any prepare failure aborts the anchor
-    /// (`TxnDecide { commit: false }`, which bundles abort+resolve) and
-    /// best-effort resolve-aborts every participant that did stage, then
-    /// returns the failure. On success, `commit_ts` is the anchor's own
-    /// `txn_commit_at_least` result, floored at the max of every
-    /// participant's acked stage ts (the "coordinator mint pushed above
-    /// every participant's acked stage ts" step) — the single Raft commit on
-    /// the anchor's record IS the atomic commit point. Every participant
-    /// (anchor included) is then resolved with that canonical `commit_ts`
-    /// before this call returns (a **synchronous** resolve, not the ADR's
-    /// "async post-ack" shape — see the amendment for why: PR5 is where the
-    /// in-doubt recovery/resolver-task infrastructure that would make an
-    /// async resolve safe to leave un-awaited actually lands; doing it
-    /// synchronously here is simpler and strictly safer in the meantime, at
-    /// the cost of a small amount of extra client-visible latency).
+    /// needs, and its record's `intent_spans` name **every** participant,
+    /// ADR 0018 §2/PR5). Every other participant then stages
+    /// **concurrently** (`futures::future::join_all`). `staged` tracks
+    /// every participant that actually needs resolving, the anchor's own
+    /// keys included (PR5: `txn_decide_anchor` no longer resolves anything
+    /// inline). Any prepare failure — or a failed pre-commit precondition
+    /// re-check — proposes an abort on the anchor; on success, `commit_ts`
+    /// is the anchor's own `txn_commit_at_least` result, floored at the max
+    /// of every participant's acked stage ts — the single Raft commit on
+    /// the anchor's record IS the atomic commit point.
+    ///
+    /// **Every decide attempt reports the record's ACTUAL outcome, not what
+    /// was asked for** (ADR 0018 §2/PR5 decision-semantics amendment): with
+    /// recovery, a duelling decider is legal — an abort attempt can lose to
+    /// a concurrent recovery *commit* (every participant genuinely staged,
+    /// from recovery's independent point of view), and a commit attempt can
+    /// lose to a concurrent recovery *abort*. This method always branches
+    /// on what actually happened, never on which decision it proposed.
+    ///
+    /// **Resolve is asynchronous, post-ack, on the successful-commit path**
+    /// (ADR 0018 §2/PR5 — the PR4 amendment's own flagged deviation, now
+    /// lifted): once the anchor's commit is durable, this returns
+    /// immediately and spawns a best-effort resolve of every participant
+    /// (anchor's own keys included) in the background — safe to leave
+    /// un-awaited now that `txn_resolver_loop` exists as the safety net
+    /// that eventually finishes any resolve this spawn doesn't get to (a
+    /// crash, a transient forward failure). The abort paths still resolve
+    /// synchronously before returning — there is no successful ack to speed
+    /// up on an error return, so the extra safety margin costs nothing.
     pub(crate) async fn cp_txn(
         &self,
         writes: Vec<TxnTableWrite>,
@@ -4052,8 +4558,14 @@ impl ClientCtx {
         });
         let participant_results = futures::future::join_all(participant_futs).await;
 
+        // ADR 0018 §2/PR5: `staged` now tracks *every* participant this
+        // transaction actually touches, the anchor's own keys included —
+        // `txn_decide_anchor` no longer resolves anything inline (recovery
+        // needs the record's `intent_spans` to already list every
+        // participant uniformly, and the resolve fan-out below treats them
+        // identically too).
         let mut candidate = anchor_ts;
-        let mut staged: Vec<(String, Vec<Vec<u8>>)> = Vec::new();
+        let mut staged: Vec<(String, Vec<Vec<u8>>)> = vec![(anchor_table.clone(), anchor_keys)];
         let mut first_err: Option<String> = None;
         for (table, keys, result) in participant_results {
             match result {
@@ -4069,90 +4581,131 @@ impl ClientCtx {
             }
         }
 
-        if let Some(reason) = first_err {
-            // Best-effort abort: the anchor's own decide (bundles abort +
-            // resolve of the anchor's own keys), plus a resolve-abort on
-            // every participant that did stage.
-            let _ = self
-                .txn_decide_anchor(
-                    &anchor_table,
-                    txn_id.clone(),
-                    record_key.clone(),
-                    anchor_keys,
-                    false,
-                    candidate,
-                )
-                .await;
-            for (table, keys) in staged {
-                let _ = self
-                    .txn_resolve_participant(
-                        &table,
-                        txn_id.clone(),
-                        record_key.clone(),
-                        keys,
-                        TxnOutcome::Aborted,
-                    )
-                    .await;
-            }
-            return Err(format!("transaction aborted: {reason}"));
-        }
-
-        // Precondition check #2 (pre-commit refresh — see this method's own
-        // doc for why this is a value re-check, not the ADR's ts-based one).
-        if !preconditions.is_empty() {
-            let recheck = self.check_preconditions(&preconditions).await?;
-            if recheck != observed {
-                let _ = self
-                    .txn_decide_anchor(
-                        &anchor_table,
-                        txn_id.clone(),
-                        record_key.clone(),
-                        anchor_keys,
-                        false,
-                        candidate,
-                    )
-                    .await;
+        // Resolve every staged participant (best-effort, fire-and-forget —
+        // a resolve failure never blocks a decision already durable on the
+        // anchor; the resolver loop, ADR 0018 §2/PR5, is the safety net
+        // that eventually finishes it).
+        let resolve_all = |outcome: TxnOutcome, staged: Vec<(String, Vec<Vec<u8>>)>| {
+            let this = self.clone();
+            let txn_id = txn_id.clone();
+            let record_key = record_key.clone();
+            async move {
                 for (table, keys) in staged {
-                    let _ = self
+                    let _ = this
                         .txn_resolve_participant(
                             &table,
                             txn_id.clone(),
                             record_key.clone(),
                             keys,
-                            TxnOutcome::Aborted,
+                            outcome.clone(),
                         )
                         .await;
                 }
-                return Err(
-                    "transaction aborted: a precondition changed between prepare and commit; \
-                     retry"
-                        .into(),
-                );
             }
-        }
+        };
 
-        let commit_ts = self
-            .txn_decide_anchor(
-                &anchor_table,
-                txn_id.clone(),
-                record_key.clone(),
-                anchor_keys,
-                true,
-                candidate,
-            )
-            .await?;
-        for (table, keys) in staged {
-            let _ = self
-                .txn_resolve_participant(
-                    &table,
+        if let Some(reason) = first_err {
+            // ADR 0018 §2/PR5 decision-semantics amendment: this abort
+            // attempt can itself lose to a concurrent recovery *commit* on
+            // the same record (every participant genuinely staged after
+            // all, from recovery's independent point of view) — report the
+            // record's **actual** outcome, never assume the abort we asked
+            // for is what happened.
+            match self
+                .txn_decide_anchor(
+                    &anchor_table,
                     txn_id.clone(),
                     record_key.clone(),
-                    keys,
-                    TxnOutcome::Committed { commit_ts },
+                    false,
+                    candidate,
+                    None,
                 )
-                .await;
+                .await
+            {
+                Ok(TxnOutcome::Aborted) => {
+                    resolve_all(TxnOutcome::Aborted, staged).await;
+                    Err(format!("transaction aborted: {reason}"))
+                }
+                Ok(TxnOutcome::Committed { commit_ts }) => {
+                    resolve_all(TxnOutcome::Committed { commit_ts }, staged).await;
+                    Ok(commit_ts)
+                }
+                Err(e) => Err(format!(
+                    "transaction aborted: {reason} (and abort itself failed: {e})"
+                )),
+            }
+        } else if !preconditions.is_empty()
+            && self.check_preconditions(&preconditions).await? != observed
+        {
+            // Precondition check #2 (pre-commit refresh — see this method's own
+            // doc for why this is a value re-check, not the ADR's ts-based one).
+            match self
+                .txn_decide_anchor(
+                    &anchor_table,
+                    txn_id.clone(),
+                    record_key.clone(),
+                    false,
+                    candidate,
+                    None,
+                )
+                .await
+            {
+                Ok(TxnOutcome::Aborted) => {
+                    resolve_all(TxnOutcome::Aborted, staged).await;
+                    Err(
+                        "transaction aborted: a precondition changed between prepare and commit; \
+                         retry"
+                            .into(),
+                    )
+                }
+                Ok(TxnOutcome::Committed { commit_ts }) => {
+                    resolve_all(TxnOutcome::Committed { commit_ts }, staged).await;
+                    Ok(commit_ts)
+                }
+                Err(e) => Err(format!(
+                    "transaction aborted: a precondition changed between prepare and commit \
+                     (and abort itself failed: {e})"
+                )),
+            }
+        } else {
+            match self
+                .txn_decide_anchor(
+                    &anchor_table,
+                    txn_id.clone(),
+                    record_key.clone(),
+                    true,
+                    candidate,
+                    None,
+                )
+                .await?
+            {
+                TxnOutcome::Committed { commit_ts } => {
+                    // ADR 0018 §2/PR5: the deviation PR4 flagged, lifted —
+                    // the anchor's commit is already durable and IS the
+                    // atomic commit point (the client can be told "done"
+                    // right now); every participant's resolve (anchor's own
+                    // keys included) is best-effort and can safely happen
+                    // after the ack, since a crash here leaves nothing
+                    // ambiguous — `txn_resolver_loop` finishes it. This is
+                    // strictly safer than the interim synchronous shape,
+                    // not merely faster: it no longer holds the client
+                    // response hostage to every participant's own
+                    // liveness/latency.
+                    tokio::spawn(resolve_all(TxnOutcome::Committed { commit_ts }, staged));
+                    Ok(commit_ts)
+                }
+                // The anchor's own commit lost to a concurrent recovery
+                // abort (a duelling decider, ADR 0018 §2/PR5) — report the
+                // abort honestly rather than a false success.
+                TxnOutcome::Aborted => {
+                    resolve_all(TxnOutcome::Aborted, staged).await;
+                    Err(
+                        "transaction aborted: lost to a concurrent in-doubt-recovery decision"
+                            .into(),
+                    )
+                }
+            }
         }
-        Ok(commit_ts)
     }
 
     /// Read every `(table, key)` in `preconditions` (an ordinary
@@ -4897,40 +5450,60 @@ impl ClientCtx {
                 table,
                 txn_id,
                 record_key,
-                keys,
                 commit,
                 min_commit_ts,
+                orphan_created_ts,
             } => {
                 let tablet = self.tablet_for(&table, &record_key);
                 let Some(leader) = tablet.and_then(|t| self.edge.cp_leader(t)) else {
                     return self.not_leader_refusal(tablet);
                 };
-                if commit {
-                    match leader
+                // ADR 0018 §2/PR5: resolves nothing here (the caller does,
+                // uniformly, for every participant including the anchor's
+                // own keys) — and reports the record's ACTUAL decision,
+                // which may differ from what was proposed (a duelling
+                // recovery decision may have already won). See
+                // `ClientCtx::txn_decide_anchor`'s doc for the full account.
+                // `orphan_created_ts` overrides `commit`/`min_commit_ts`
+                // entirely — a recovery pusher that found no record at all
+                // (the orphan-record fix).
+                let decide_ok = if let Some(created_ts) = orphan_created_ts {
+                    leader
+                        .txn_abort_orphan(txn_id.clone(), record_key.clone(), created_ts)
+                        .await
+                        .is_some()
+                } else if commit {
+                    leader
                         .txn_commit_at_least(txn_id.clone(), record_key.clone(), min_commit_ts)
                         .await
-                    {
-                        Some(commit_ts) => {
-                            leader
-                                .txn_resolve(
-                                    txn_id,
-                                    record_key,
-                                    keys,
-                                    TxnOutcome::Committed { commit_ts },
-                                )
-                                .await;
-                            ClientResponse::TxnDecided { ts: commit_ts }
-                        }
-                        None => ClientResponse::Error(
-                            "CP group leader moved during anchor commit; retry".into(),
-                        ),
-                    }
+                        .is_some()
                 } else {
-                    match leader.txn_decide(txn_id, record_key, keys, false).await {
-                        Some(ts) => ClientResponse::TxnDecided { ts },
-                        None => ClientResponse::Error(
-                            "CP group leader moved during anchor abort; retry".into(),
-                        ),
+                    leader
+                        .txn_abort(txn_id.clone(), record_key.clone())
+                        .await
+                        .is_some()
+                };
+                if !decide_ok {
+                    return ClientResponse::Error(
+                        "CP group leader moved during anchor decide; retry".into(),
+                    );
+                }
+                match leader.txn_status_local(&record_key).await {
+                    Some(TxnDecisionStatus::Committed { commit_ts }) => {
+                        ClientResponse::TxnDecided {
+                            outcome: TxnOutcome::Committed { commit_ts },
+                        }
+                    }
+                    Some(TxnDecisionStatus::Aborted) => ClientResponse::TxnDecided {
+                        outcome: TxnOutcome::Aborted,
+                    },
+                    Some(TxnDecisionStatus::Pending) => ClientResponse::Error(
+                        "txn decide: record still Pending immediately after its own decide \
+                         applied — protocol bug"
+                            .into(),
+                    ),
+                    None => {
+                        ClientResponse::Error("CP group leader moved after decide; retry".into())
                     }
                 }
             }
@@ -4965,6 +5538,41 @@ impl ClientCtx {
                     None => ClientResponse::Error(
                         "CP group leader moved, or no record yet, during status query; retry"
                             .into(),
+                    ),
+                }
+            }
+            // ADR 0018 §2/PR5: the two recovery-only internal RPCs — see
+            // `ClientCtx::txn_record_view`/`txn_verify`, the one callers.
+            ClientRequest::TxnRecordView { table, record_key } => {
+                let tablet = self.tablet_for(&table, &record_key);
+                let Some(leader) = tablet.and_then(|t| self.edge.cp_leader(t)) else {
+                    return self.not_leader_refusal(tablet);
+                };
+                match leader.txn_record_view(&record_key).await {
+                    Some(view) => ClientResponse::TxnRecordViewReply {
+                        status: view.status,
+                        intent_spans: view.intent_spans,
+                        created_ts: view.created_ts,
+                    },
+                    None => ClientResponse::Error(
+                        "CP group leader moved, or no record yet, during record view query; retry"
+                            .into(),
+                    ),
+                }
+            }
+            ClientRequest::TxnVerify {
+                table,
+                span,
+                txn_id,
+            } => {
+                let tablet = self.tablet_for(&table, &span.start);
+                let Some(leader) = tablet.and_then(|t| self.edge.cp_leader(t)) else {
+                    return self.not_leader_refusal(tablet);
+                };
+                match leader.txn_verify_staged(&span, &txn_id).await {
+                    Some(staged) => ClientResponse::TxnVerifyReply { staged },
+                    None => ClientResponse::Error(
+                        "CP group leader moved during txn verify; retry".into(),
                     ),
                 }
             }
@@ -6206,6 +6814,78 @@ async fn tablet_host_reconciler_loop(ctx: ClientCtx, mut reconciler: CpReconcile
     }
 }
 
+/// How often [`txn_resolver_loop`] sweeps this node's locally-led tablet
+/// groups (ADR 0018 §2/PR5). A plain fixed interval — no jitter — matching
+/// the existing `RECONCILE_FALLBACK_INTERVAL`/`AUTO_SPLIT_INTERVAL` loops'
+/// own shape; this is a background safety net, not a latency-sensitive
+/// path, so the simpler fixed cadence was preferred over adding a jitter
+/// source for a background loop none of its siblings use either.
+const TXN_RESOLVER_INTERVAL: Duration = Duration::from_secs(1);
+
+/// The **intent-resolver background task** (ADR 0018 §2/PR5) — what makes a
+/// crashed coordinator harmless (the Decision section's Recovery bullet)
+/// and lets [`ClientCtx::cp_txn`]'s successful-commit resolve be async/
+/// best-effort rather than synchronous: on every tick, for each tablet
+/// group this node currently **leads** (`ctx.edge.hosted_groups()`, no-op
+/// on a control-only node — it hosts none), push every stale `Pending`
+/// record ([`RaftKvNode::pending_txns`], via
+/// [`ClientCtx::txn_recover`]) and fan out a resolve for every
+/// decided-but-not-yet-locally-resolved one
+/// ([`RaftKvNode::unresolved_decided`]). Errors are logged and swallowed —
+/// this is a best-effort background sweep; the next tick retries.
+async fn txn_resolver_loop(ctx: ClientCtx) {
+    loop {
+        tokio::time::sleep(TXN_RESOLVER_INTERVAL).await;
+        for (tablet, group) in ctx.edge.hosted_groups() {
+            if !group.is_leader() {
+                continue;
+            }
+            let Some(table) = ctx
+                .effective_metadata()
+                .tablets
+                .get(&tablet)
+                .and_then(|t| t.table.clone())
+            else {
+                continue; // legacy whole-keyspace tablet, or a stale view — skip this tick
+            };
+
+            for (txn_id, (record_key, _created_ts)) in group.pending_txns() {
+                // No intent hint needed/available here — `pending_txns` only
+                // ever tracks a genuine, locally-anchored `Pending` record
+                // (never an orphan), so `txn_recover`'s record-absent branch
+                // is unreachable from this caller by construction.
+                if let Err(e) = ctx.txn_recover(&table, &record_key, &txn_id, None).await {
+                    tracing::debug!(
+                        tablet = tablet.0,
+                        ?txn_id,
+                        error = %e,
+                        "txn_resolver_loop: recovery push failed this tick"
+                    );
+                }
+            }
+            for (txn_id, (record_key, outcome)) in group.unresolved_decided() {
+                // `unresolved_decided` only carries `(record_key, outcome)`
+                // — re-read the record's own `intent_spans` (every
+                // participant table this transaction touched) rather than
+                // guess it.
+                let Ok(view) = ctx.txn_record_view(&table, &record_key).await else {
+                    continue; // transient — retried next tick
+                };
+                ctx.recovery_resolve(
+                    txn_id,
+                    record_key,
+                    &view.intent_spans,
+                    &outcome_to_status(&outcome),
+                )
+                .await;
+            }
+        }
+        if let Some(data) = ctx.data.as_ref() {
+            data.raftkv_metrics.incr(Metric::CpTxnResolverRuns);
+        }
+    }
+}
+
 /// How often [`metrics_sample_loop`] takes a metrics snapshot for the
 /// dashboard's history sparklines. Not the determinism-critical `Metric`/
 /// `MetricSink` seam itself (that stays timestamp-free) — this loop only
@@ -6512,6 +7192,8 @@ fn request_kind(request: &ClientRequest) -> &'static str {
         ClientRequest::TxnDecide { .. } => "txn_decide",
         ClientRequest::TxnResolve { .. } => "txn_resolve",
         ClientRequest::TxnStatus { .. } => "txn_status",
+        ClientRequest::TxnRecordView { .. } => "txn_record_view",
+        ClientRequest::TxnVerify { .. } => "txn_verify",
     }
 }
 
@@ -6608,22 +7290,25 @@ async fn handle_request(ctx: &ClientCtx, request: ClientRequest) -> ClientRespon
             Ok(commit_ts) => ClientResponse::TxnCommitted { commit_ts },
             Err(e) => ClientResponse::Error(e),
         },
-        // The four internal 2PC coordinator RPCs below are **never sent as a
-        // bare top-level request** — a coordinator only ever reaches them
-        // wrapped in `Forwarded` (even a Local route calls the `CpGroup`
-        // method directly, in-process, no wire round trip at all — see
-        // `ClientCtx::txn_prepare`/`txn_decide_anchor`/
-        // `txn_resolve_participant`/`txn_status`). Grepped alongside every
-        // other gating site per the house lesson on adding a variant to a
-        // forwarded command enum (`docs/engineering-lessons.md`): these are
-        // data-plane RPCs, not `MetaCommand`s, so `is_relayable_command`
-        // (control-plane schema-DDL relay gating) does not apply to them —
-        // their real handling lives in `ClientCtx::cp_serve_forwarded`'s
-        // match, reached only via the `Forwarded` arm above.
+        // The six internal 2PC/recovery coordinator RPCs below are **never
+        // sent as a bare top-level request** — a coordinator only ever
+        // reaches them wrapped in `Forwarded` (even a Local route calls the
+        // `CpGroup` method directly, in-process, no wire round trip at all
+        // — see `ClientCtx::txn_prepare`/`txn_decide_anchor`/
+        // `txn_resolve_participant`/`txn_status`/`txn_record_view`/
+        // `txn_verify`). Grepped alongside every other gating site per the
+        // house lesson on adding a variant to a forwarded command enum
+        // (`docs/engineering-lessons.md`): these are data-plane RPCs, not
+        // `MetaCommand`s, so `is_relayable_command` (control-plane
+        // schema-DDL relay gating) does not apply to them — their real
+        // handling lives in `ClientCtx::cp_serve_forwarded`'s match,
+        // reached only via the `Forwarded` arm above.
         ClientRequest::TxnPrepare { .. }
         | ClientRequest::TxnDecide { .. }
         | ClientRequest::TxnResolve { .. }
-        | ClientRequest::TxnStatus { .. } => ClientResponse::Error(
+        | ClientRequest::TxnStatus { .. }
+        | ClientRequest::TxnRecordView { .. }
+        | ClientRequest::TxnVerify { .. } => ClientResponse::Error(
             "this request is an internal 2PC coordinator RPC and must be sent wrapped in \
              Forwarded, never as a bare top-level request"
                 .into(),
