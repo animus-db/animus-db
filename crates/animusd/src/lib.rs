@@ -3960,22 +3960,39 @@ impl ClientCtx {
         let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
         loop {
             // Fresh, not `metadata_cached()` (ADR 0035 PR4): the "no tablet
-            // yet" branch below picks the tablet's **initial, permanent**
-            // replica set from `meta.members` — `CreateTablet` only ever
-            // succeeds once per table (idempotent, first-committer wins), so
-            // a stale mirror read here isn't a transient staleness a later
-            // retry heals, it silently and *permanently* under-replicates
-            // the tablet (no periodic re-check ever grows a recorded RF
-            // policy after the fact). This mattered only theoretically for a
-            // `Local` handle (control replication lag is sub-millisecond),
-            // but a `Remote` data node's mirror is *routinely* a poll
-            // interval stale (ADR 0035 §5) — caught live by
-            // `tests/data_only.rs` flaking on exactly this race (a freshly
-            // `Active`-promoted second data member not yet visible to a
-            // still-catching-up mirror at the moment the first write
-            // provisioned the table).
+            // yet" branch below picks the tablet's *initial* replica set from
+            // `meta.members`, and a `Remote` data node's mirror is routinely a
+            // poll interval stale (ADR 0035 §5) — `metadata_fresh()` avoids
+            // needlessly under-sizing that initial set on a node whose own
+            // read is avoidably behind.
+            //
+            // But freshness of the READ is not enough on its own to make the
+            // recorded POLICY correct, and — after this exact race recurred
+            // under `cluster_growth.rs`'s heavy three-concurrent-cluster load
+            // (see `docs/engineering-lessons.md`) — the policy below is
+            // deliberately no longer derived from `t.replicas.len()` at all.
+            // **The invariant is: the policy always records the *target* RF
+            // (`MAX_REPLICATION_FACTOR`), never whatever the replica set's
+            // size happened to be at creation.** `CreateTablet` only ever
+            // succeeds once per table (idempotent, first-committer wins) and
+            // may legitimately mint a *smaller* initial set if fewer than
+            // `MAX_REPLICATION_FACTOR` members are `Active` yet at that
+            // instant — even a maximally fresh read can observe a cluster
+            // that is still mid-bootstrap, promoting its own members one
+            // commit at a time. Recording the *target* rather than the
+            // *observation* is what makes that best-effort initial set
+            // self-heal: `reconcile_placement`'s existing violation-repair
+            // path (the same one that replaces a later-killed replica)
+            // proposes a `CasTabletReplicas` growing it to
+            // `MAX_REPLICATION_FACTOR` the moment enough candidates are
+            // `Active`, with no separate "did the RF ever get set right"
+            // mechanism needed. A too-low RF baked from a point-in-time
+            // observation, by contrast, is invisible to that machinery
+            // forever — `reconcile_placement` only fixes *violations of the
+            // recorded policy*, so an under-observed RF just becomes a new,
+            // permanently-satisfied target.
             let meta = self.control.metadata_fresh().await;
-            if let Some((&tablet, t)) = meta.tablets_for_table(table).next() {
+            if let Some((&tablet, _)) = meta.tablets_for_table(table).next() {
                 // The tablet exists; ensure its RF policy is set, then we're done. The
                 // caller's op routes through `cp_route`, which itself waits for the
                 // group to form/elect (`CLIENT_TIMEOUT`), so provisioning need not
@@ -3985,7 +4002,7 @@ impl ClientCtx {
                 }
                 self.propose_schema(&MetaCommand::SetTabletPolicy {
                     tablet,
-                    policy: Some(PlacementPolicy::simple("cp-rf", t.replicas.len())),
+                    policy: Some(PlacementPolicy::simple("cp-rf", MAX_REPLICATION_FACTOR)),
                 })
                 .await;
             } else {

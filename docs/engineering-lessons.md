@@ -3715,3 +3715,80 @@ debugging anything that feels like it might have happened before.
   during the stall, or whether it runs but its `replan`/rebalance step
   concludes no action is needed for a still-under-replicated tablet whose
   only remaining replicas are both non-voting growth nodes.
+
+  **Update: root-caused, and it's the second branch above, not a livelock at
+  all.** Instrumenting `reconcile_loop` directly (a raw `eprintln!` per tick,
+  removed before committing) showed it ticking exactly on schedule the
+  entire time, correctly leader-elected, with a fully accurate `PlacementView`
+  — and correctly computing **zero** proposals, every tick. The leader was
+  never stuck; it was correctly enforcing a policy that was itself wrong.
+  Tracing into `animus_placement::replan` found it: the stuck tablet's
+  recorded RF was **2**, not 3 like its siblings — `2` replicas legitimately
+  satisfies a policy of RF 2 forever, no matter how large the cluster grows.
+  The bug was in `animusd::ClientCtx::provision_tablet`
+  (`crates/animusd/src/lib.rs`): a tablet's placement policy was set to
+  `PlacementPolicy::simple("cp-rf", t.replicas.len())` — the size of its
+  *initial* replica set, observed at creation — instead of the fixed target
+  `MAX_REPLICATION_FACTOR`. Under `cluster_growth.rs`'s heavy
+  three-concurrent-cluster contention, the very first `put()` on a
+  freshly-bootstrapped 3-node cluster could race ahead of all 3 original
+  members' `Active` promotion landing in `Metadata`, provisioning the
+  table's tablet with only 2 replicas — a legitimate, expected best-effort
+  *initial* set — but then permanently recording RF 2 as the *policy*,
+  which growing the cluster to 5 nodes later never revisited (`reconcile_
+  placement` only repairs *violations of the recorded policy* — an
+  under-observed RF simply becomes a new, permanently-satisfied target).
+  Fixed by no longer deriving the policy from the observed replica count at
+  all: it now always records `MAX_REPLICATION_FACTOR`, so a best-effort
+  under-sized *initial* set self-heals via the reconciler's existing
+  violation-repair path (the same one that already replaces a killed
+  replica) the moment enough candidates are `Active` — see `provision_
+  tablet`'s own doc, `meta::tests::reconcile_with_insufficient_candidates_
+  is_a_stable_noop` (the "no proposal storm while under-candidated" proof),
+  and `animusd/tests/tablet_rf_self_heals.rs` (the end-to-end regression:
+  provision on a genuinely 2-node cluster, grow to 3, assert the tablet
+  grows to 3 replicas too — which fails/hangs against the unfixed code,
+  confirmed by temporarily reverting the fix and re-running it). Two
+  generalizable lessons follow, below.
+- **A "frozen" progress signal can mean "correctly nothing to do," not
+  "stuck" — instrument the decision loop itself before assuming
+  starvation.** The investigation above spent real time on two starvation-
+  shaped hypotheses (a parked/starved reconcile task; cross-test port reuse
+  poisoning a connection) before a direct `eprintln!` inside `reconcile_
+  loop` — printing `is_leader`, the full `PlacementView`, and the proposal
+  count every tick — immediately showed the loop healthy and the *decision*
+  wrong. A frozen `engine_applied_index`/`commit_index` (the generic
+  progress signal from the DRIVER_APPLIED entry above) only tells you
+  "nothing committed" — it cannot distinguish a starved proposer from a
+  proposer that correctly has nothing to propose. When a progress signal is
+  frozen for far longer than any documented contention precedent (here:
+  200s+ solid vs. the ~60s the DRIVER_APPLIED entry above had already
+  characterized as normal-under-load), don't keep widening the timeout or
+  chasing scheduling theories — instrument the specific decision function in
+  the loop that would need to fire, and read its actual inputs/output. It is
+  almost always cheaper than the starvation hypotheses it rules out.
+- **Recording a policy derived from a point-in-time observation makes a
+  transient condition permanent — record the *target*, and let
+  reconciliation close the gap from observation to intent.**
+  `provision_tablet` conflated two different things that happened to be
+  computed from the same data at creation time: the tablet's *initial*
+  replica set (legitimately best-effort — however many candidates are
+  `Active` right now) and its *policy* (a durable, ongoing commitment to a
+  desired state). Deriving the policy from the initial set's observed size
+  meant a transient "not everyone has promoted yet" moment got baked in
+  forever, because nothing ever re-derives an already-recorded policy from
+  a fresher observation. The fix wasn't reading fresher data (that was
+  already tried once for this exact call site — see the `metadata_fresh()`
+  entry above — and only narrowed the window, it didn't close it, because
+  *any* read, however fresh, can still land inside a real convergence-in-
+  progress). The fix was to stop deriving the policy from an observation at
+  all: record the fixed target, and lean on the reconciler's existing
+  violation-repair path (already proven correct for "a replica died,
+  replace it") to grow an under-sized initial set the moment reality
+  catches up to the target. General check: when code sets a persistent,
+  non-retried field from "whatever I can currently observe," ask whether
+  that quantity is supposed to be an *intent* (should stay fixed regardless
+  of when it's read) or a *snapshot* (fine to vary with timing) — and if
+  it's an intent, a downstream repair loop must be able to re-derive and
+  close the gap, not just react to future violations of whatever got
+  recorded first.

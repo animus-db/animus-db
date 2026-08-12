@@ -241,7 +241,16 @@ node's routinely-stale mirror makes that window wide. The type system can't catc
 this (`Remote` and `Local` both compile). Grep every `metadata_cached()` call
 site when adding a `ControlHandle` consumer. `provision_tablet` was fixed for
 exactly this (RF silently pinned at 1); see the root `CLAUDE.md`
-engineering-lessons log.
+engineering-lessons log. **That fix only closed the READ side (a stale
+`Remote` mirror) — it did not close the deeper hazard, which recurred later
+under heavy concurrent load and got its own fix**: `provision_tablet`'s
+`SetTabletPolicy` no longer derives a tablet's RF from `t.replicas.len()` (the
+observed size of its *initial* replica set) at all, even off a maximally
+fresh read — it always records the fixed target `MAX_REPLICATION_FACTOR`, so
+a best-effort under-sized initial set self-heals via `reconcile_placement`
+the moment enough candidates are `Active`, rather than the observed size
+becoming a silently-permanent policy. See the engineering-lessons entry on
+this recurrence and `tests/tablet_rf_self_heals.rs`.
 
 **`Remote` internals** (`RemoteControlClient`): `seeds` (the control deployment's
 client-API addresses), a polled `mirror`, and a `leader_hint`. `metadata_fresh()`
@@ -890,6 +899,12 @@ Test-file map (`tests/`):
 - `split_cluster.rs` — genuine multi-process split deployment scenarios: control
   failover, split+merge, failure repair, decommission, full restart (PR6).
 - `cluster_growth.rs` — 3→5 online growth without restarting the original 3.
+- `tablet_rf_self_heals.rs` — regression for the placement-policy fix above:
+  provisions a table on a genuinely 2-node cluster (so the tablet's *initial*
+  replica set is structurally sized 2, no timing race needed), grows to 3
+  nodes, and asserts the tablet's replica set grows to 3 — only possible if
+  `provision_tablet` recorded the policy's RF as the target
+  (`MAX_REPLICATION_FACTOR`) rather than the initial observed replica count.
 - `seed_join.rs` — combined-mode seed/join with an explicit `--id` (happy/
   collision/rejoin — the collision case now asserts `AlreadyExists` from
   `claim_join_identity`'s loud proposed-id-collision failure, ADR 0040 PR4).
