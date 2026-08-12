@@ -283,6 +283,46 @@ group's existing propose lock, plus a `last_proposed_ts` strict-floor so
 ceiling/push logic also orders against proposed-but-not-yet-applied entries.
 Mint order **is** log order — enforced, not assumed.)*
 
+*(Corrective note #2, 2026-08-12: as shipped, PR2's reconciler gating (§3
+below) also had an unretried one-shot proposal bug, independent of the
+mint-order bug above — caught deterministically by a genuine multi-process
+split-cluster deployment (control-only + data-only roles, ADR 0035), where it
+permanently stalled both a split's child hosting and a merge's survivor
+widening. The seal proposal used to be bundled as a side effect of the same
+tick that performed the local, irreversible action it was supposed to
+precede — `NarrowScope`'s local scope mutation (leader-gated propose inline),
+or `Absorb`'s teardown (leader-gated propose, then a drain-wait gated only on
+"nothing pending locally", not on the seal itself). Both are one-shot: the
+local mutation happens unconditionally regardless of leadership, and once it
+has happened the condition that would re-trigger the proposal attempt is
+gone — so if leadership isn't held by the replica processing that exact tick
+(a leadership change mid-handoff; an independent per-node reconcile timer in
+a genuine multi-process deployment, not a combined node's synchronized
+loops), the seal is never proposed by anyone, ever. Worse on the absorb side:
+a follower's "nothing pending locally" drain check is satisfied trivially
+before the leader has even proposed the seal, so a fast follower could tear
+its own copy down first — destroying quorum before the leader's own,
+now-orphaned proposal could ever commit.
+Fixed two ways: (1) the seal proposal is now `plan`'s
+`HostAction::ProposeSeal`, derived from a **persistent condition**
+(`TabletFacts::pending_seals`) re-checked from scratch every tick — "does a
+covering seal marker exist in my own engine yet" — independent of whether
+this replica's local scope/teardown state has already changed, so whichever
+replica eventually holds leadership gets its chance, however leadership
+shuffles relative to the local mutation. (2) `Reconciler::teardown`'s Absorb
+drain now additionally requires a **locally-observed committed** seal
+covering this tablet's own scope before proceeding — never "nothing pending
+locally" alone. This gate is self-supporting, not a deadlock risk: requiring
+every absorbed replica to observe the seal before tearing down is exactly
+what keeps every replica — hence the quorum needed to commit the seal in the
+first place — alive for as long as it takes the seal to actually commit; a
+genuinely quorum-dead group (an unrelated double failure) correctly stalls
+loudly instead of tearing down early, per this system's usual
+correctness-over-liveness doctrine for a durability/visibility gate. See
+`crates/animus-cp-data/CLAUDE.md`'s Key Invariants entry and
+`docs/engineering-lessons.md` for the full mechanism and the diagnostic
+story.)*
+
 ### 1. Why `version_floor` had to go, and why witnessing alone isn't enough
 
 `version_floor` worked by construction: a fresh/widened group's stamped
@@ -356,11 +396,16 @@ mirroring `merged_tablets`'s never-pruned discipline); a merge survivor's
 `HostAction::WidenScope` is deferred until the absorbed tablet's seal marker
 covers the widened portion (`Metadata::absorbed_by`, the reverse-direction
 provenance). Both facts are gathered as bounded, tablet-scoped engine scans
-(`gather_facts`), keeping `plan` itself pure. The absorbed side proposes its
-seal from inside `Reconciler::teardown`'s existing Absorb drain-wait (ADR
-0033) — the same drain that already guarantees the absorbed group's committed
-log is fully applied before its WAL is deleted now also guarantees the seal
-itself is durably observable by the time the drain completes.
+(`gather_facts`), keeping `plan` itself pure.
+
+*(As shipped, the seal proposal itself was a one-shot side effect bundled
+into the same tick as the local `NarrowScope` mutation or the `Absorb`
+drain-wait — see Corrective note #2 above for the bug this produced and its
+fix: proposing the seal is now `plan`'s own `HostAction::ProposeSeal`, a
+persistent condition re-derived every tick, decoupled entirely from the
+local scope mutation / teardown timing; and the absorbed side's drain-wait
+additionally requires the seal to be locally observed as **committed**, not
+merely "nothing pending locally", before a replica may tear itself down.)*
 
 **Liveness, not correctness, is what a stalled source jeopardizes**: a
 split/merge successor waiting for a source-group leader to seal stalls if that

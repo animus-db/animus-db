@@ -230,6 +230,43 @@ State once here; cross-referenced from the sections below.
     `Metadata::split_parents`/`absorbed_by` provenance) — see `host.rs`'s own
     entry below and `seal.rs`'s module doc for the full design, including
     the key-disjointness proof.
+  - **Proposing (and, on the absorbed side, waiting out) the seal is one
+    atomic critical section spanning both mint and log-append — and it is a
+    persistent condition, re-derived every tick, never a one-shot side
+    effect of the tick that performs the local irreversible action it
+    precedes.** As shipped, both halves were one-shot: `NarrowScope`
+    proposed the seal inline, only if this replica happened to be leader at
+    the exact tick it first narrowed its own scope (a mismatch condition
+    that vanishes, on that replica, the instant the narrow runs — so a
+    replica that narrows while a *follower*, then is later promoted to
+    leader, never gets a second chance); `Absorb`'s teardown proposed the
+    seal once (leader-gated) then waited only for "nothing pending
+    locally" — satisfied trivially by a quiescent replica that hasn't even
+    received the proposal yet, so a fast follower could tear its own copy
+    down (deleting the only local WAL) *before* the leader ever proposed,
+    stranding the seal below quorum forever. A genuine multi-process split
+    deployment (independent per-node reconcile timers, real network
+    latency — `animusd/tests/split_cluster.rs`) exposed both
+    deterministically. Fixed: `host.rs`'s `gather_facts` computes
+    `TabletFacts::pending_seals` fresh every tick — every range this
+    tablet's own hosted group still owes a *committed* seal for, checked
+    via the same `seal_covers` engine scan regardless of local scope/
+    teardown state — and `plan` turns each into `HostAction::ProposeSeal`
+    (leader-gated at execution, harmless no-op otherwise, replanned every
+    tick until observed); `Reconciler::teardown`'s Absorb drain additionally
+    requires `seal_covers` locally before proceeding, never "nothing
+    pending" alone. This gate is self-supporting, not a deadlock: requiring
+    every absorbed replica to observe the seal before tearing down is
+    exactly what keeps every replica — hence the quorum needed to commit
+    the seal — alive for as long as it takes to commit; a genuinely
+    quorum-dead group (an unrelated double failure) correctly stalls loudly
+    instead of tearing down early. See ADR 0018's PR2 amendment corrective
+    note #2 and `docs/engineering-lessons.md` for the full story.
+    Regression: `tests/reconciler_corpus.rs`'s
+    `absorb_follower_waits_for_committed_seal_before_tearing_down`/
+    `narrow_seal_survives_a_late_promotion_after_narrowing_as_a_follower`
+    (both proven to fail against the pre-fix code); the originating
+    `animusd/tests/split_cluster.rs` pair is the end-to-end acceptance.
   - **A hard, non-`debug` assert** (`assert_ts_monotonic`, at apply) checks
     every applied entry's `ts` strictly exceeds the previous one this group
     applied — the load-bearing invariant the whole witnessing chain exists
@@ -354,15 +391,29 @@ State once here; cross-referenced from the sections below.
   reconciler's watch fires on the merge commit within ms) would silently never
   reach the engine. The drain (`ABSORB_DRAIN_TIMEOUT`) waits — while the driver
   is live — for commit to cover the full local log and engine-applied to cover
-  that commit; on timeout with engine ≥ local-commit it proceeds with a loud
-  warning (documented residual), else retries next tick. `plan`'s `absorbing`
-  gate (any `state.hosted ∩ view.merged` tablet defers every `WidenScope`)
-  sequences drain-before-widen across the two otherwise-independent actions.
-  This is ADR 0033 post-merge hardening — the 1-in-5 `ProdEnv` flake in
-  `animusd`'s `tablet_merge.rs` was a real, permanent false-"absent". The
-  read-side halves (`linearizable_get_served`'s served/absent disambiguation;
-  `animusd`'s `cp_get_local`/`cp_scan_local` scope pre-checks) live in this
-  crate's `RaftKvNode` + `animusd` — see the root `CLAUDE.md` and ADR 0033.
+  that commit **and** (ADR 0018 §2 amendment fix, below) for this replica's
+  own engine to locally observe a *committed* range-seal covering this
+  tablet's scope — never proceeding on "nothing pending locally" alone, which
+  a quiescent replica satisfies trivially before the seal has even been
+  proposed. On timeout: the original stuck-apply escape hatch (proceed with a
+  loud warning) fires only when the seal is already locally observed and it's
+  purely the engine-merge watermark lagging a local commit; a stuck seal
+  *commit* never takes that escape hatch — it retries next tick instead,
+  logging loudly on every retry past the timeout so a genuinely quorum-dead
+  absorbed group is visible to operators rather than silently torn down.
+  `plan`'s `absorbing` gate (any `state.hosted ∩ view.merged` tablet defers
+  every `WidenScope`) sequences drain-before-widen across the two otherwise-
+  independent actions. This is ADR 0033 post-merge hardening — the 1-in-5
+  `ProdEnv` flake in `animusd`'s `tablet_merge.rs` was a real, permanent
+  false-"absent"; the seal-commit gate above is a *second*, later hardening
+  pass over the same drain (see the range-seal bullet above and ADR 0018's
+  PR2 amendment corrective note #2) — a fast replica racing ahead of the
+  seal's own commit is a distinct hazard from racing ahead of an ordinary
+  write's engine-apply, caught only once a genuine multi-process split
+  deployment exposed it. The read-side halves (`linearizable_get_served`'s
+  served/absent disambiguation; `animusd`'s `cp_get_local`/`cp_scan_local`
+  scope pre-checks) live in this crate's `RaftKvNode` + `animusd` — see the
+  root `CLAUDE.md` and ADR 0033.
 
 ## The host module
 
@@ -427,11 +478,12 @@ invariants and is directly `SimEnv`-testable.
 
 ### HostAction
 
-Emitted in this fixed order: `NarrowScope`/`WidenScope` → `Host` →
-`Reconfigure` → `Release`/`Reclaim`/`Absorb`.
+Emitted in this fixed order: `ProposeSeal` → `NarrowScope`/`WidenScope` →
+`Host` → `Reconfigure` → `Release`/`Reclaim`/`Absorb`.
 
 | Action | What it does |
 |--------|--------------|
+| `ProposeSeal` | ADR 0018 §2 amendment fix: (re-)propose this already-hosted tablet's own range-seal for a range named in `TabletFacts::pending_seals` — a split handoff (a child of this tablet still lacking a locally-observed covering seal) or an absorb handoff (this tablet's own scope, once `view.merged` names it, still lacking one). A no-op at execution unless this node currently leads the tablet. **Persistent, re-derived every tick from `gather_facts`'s own `seal_covers` scan — never a one-shot side effect of the `NarrowScope`/`Absorb` tick that used to bundle it**, so whichever replica eventually holds leadership gets its chance regardless of when leadership shuffles relative to the local scope mutation or teardown. |
 | `NarrowScope` | Narrow an already-hosted tablet's scope to its current metadata range — provably narrow-only (`is_subrange`). |
 | `WidenScope` | ADR 0033 dual: widen when the metadata range *grew* (the surviving `left` of a `MergeTablets`) — provably widen-only. A range neither subset nor superset of the live scope is a defensive no-op, never guessed. Deferred while an absorb is pending, **and** (ADR 0018 §2 amendment) until this node's own engine contains the absorbed tablet's range-seal marker covering the widened portion (`TabletFacts::widen_seal_observed` — see the MVCC-version invariant above; replaces the retired `version_floor` bump). |
 | `Host` | Stand up a fresh/joining/restarting tablet via `start_hosted`, with full or others-only config (`animusd::cp_join_host`'s exact decision). A split child (named in `Metadata::split_parents`) is deferred until this node's own engine contains its parent's range-seal marker covering its own range (`TabletFacts::parent_seal_observed` — see the MVCC-version invariant above; replaces the retired `version_floor` seeding). A tablet with no parent (a bootstrapped fresh table, or a merge survivor) hosts immediately. |
@@ -693,7 +745,7 @@ list (`scenario_cells()`), a depth knob, and coverage/seed-expansion guards.
   `partition_pair`/`heal`/`env`) while the outer test drives `run_for`/
   `run_until` (the `&mut self` methods) — cloning just hands out another
   reference to the same `Arc`-backed world, like `SimEnv`'s own `Clone`.
-- **The 18 frozen scenarios** (`ANIMUS_RECONCILER_SEEDS`, default 1 =
+- **The 19 frozen scenarios** (`ANIMUS_RECONCILER_SEEDS`, default 1 =
   byte-identical; variant 0 keeps each cell's canonical name-derived seed):
   fresh-host (whole-keyspace + two-replica), split-narrows-source,
   rebalance-off-releases (sparing a sibling), drop-table-reclaims,
@@ -713,7 +765,20 @@ list (`scenario_cells()`), a depth knob, and coverage/seed-expansion guards.
   crate defect), partition-during-removal-blocks-release-until-healed,
   split-then-immediate-release-zero-ticks (the deterministic version of the
   real split-then-immediate-release sibling-corruption race — the `ProdEnv`
-  version only reproduced ~3/5 runs), re-add-after-exclusion-cancels-release.
+  version only reproduced ~3/5 runs), re-add-after-exclusion-cancels-release,
+  and (ADR 0018 §2 amendment fix, the `split_cluster.rs` livelock — see the
+  Key invariants entry above) two scenarios that make the fixed race
+  deterministic under `SimEnv` by controlling per-node tick order by hand:
+  `absorb_follower_waits_for_committed_seal_before_tearing_down` (tick only
+  the follower of a to-be-absorbed tablet, with the leader never having been
+  ticked with the merge view at all — proven to tear down prematurely against
+  the pre-fix code, converges once the leader gets its own tick post-fix) and
+  `narrow_seal_survives_a_late_promotion_after_narrowing_as_a_follower` (tick
+  only a follower with the split view — it narrows locally without proposing,
+  as expected — then force a *real* Raft membership removal promoting that
+  same replica to sole leader, and prove it still eventually proposes the
+  seal, which the pre-fix one-shot-per-tick design structurally cannot do
+  once that replica's own local scope already matches the target).
 - **Invariant checks, generic across scenarios**: (a) hosting convergence
   (`assert_hosted_converged`); (b) data safety (`assert_present`/
   `assert_absent`, raw physical-key reads — survivors readable, released/
