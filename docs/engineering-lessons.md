@@ -3585,6 +3585,203 @@ debugging anything that feels like it might have happened before.
   belongs at the boundary (`cp_txn` now validates and returns a clean
   `Err`), not by softening the assert itself, which is still the right
   contract for the trusted internal callers.
+- **Building the ADR 0018 multi-tablet transaction corpus (PR6) surfaced a
+  real protocol bug and four harness bugs, all in the same short
+  investigation, with a common thread: "the same outcome, computed a second
+  time by a different actor, is not automatically the same value."**
+  1. **`TxnCommit`'s apply arm treated "already Committed, different
+     `commit_ts`" as impossible-by-construction and hard-asserted on it —
+     it wasn't impossible.** `txn_commit_at_least`'s own `mint_at_least`
+     mints a *fresh* timestamp every call; a still-live coordinator's own
+     commit round trip and the recovery resolver's independent post-grace
+     push can each legitimately decide "commit" for the same transaction
+     with *different* minted values, and `animusd`'s own `CLIENT_TIMEOUT`
+     (10s) being longer than `RECOVERY_GRACE` (5s) makes the overlap window
+     reachable under nothing more exotic than an ordinary leader election —
+     found live, deterministically, on the corpus's first fault-injection
+     scenario. Fixed by extending the existing `Committed`-vs-`Aborted`
+     duelling-decider no-op to also cover same-outcome-different-ts (first
+     log position still wins, unconditionally) — see ADR 0018's PR5
+     amendment §1 corrective note and `animus-cp-data/CLAUDE.md`'s
+     "In-doubt recovery + decision semantics" entry. **The generalizable
+     rule**: when a design lets two independent deciders each reach a
+     conclusion (not just "commit vs. abort" but the *exact value* of a
+     commit), a hard assert on "impossible for them to disagree" needs a
+     stronger argument than "only one entity ever decides" — audit what
+     happens when a *second*, equally legitimate decider computes the
+     *same* answer through a *different* computation.
+  2. **A resolve-side helper's OWN caller resolving with a *hardcoded*
+     outcome, computed before checking what actually happened, is a torn
+     resolve waiting to happen** — my own corpus coordinator's abort path
+     proposed an abort, then unconditionally resolved every staged key as
+     `Aborted` without re-reading the record's actual decided status first
+     (a concurrent recovery commit could have already won). Fixed by
+     re-reading before resolving, matching the discipline `ClientCtx::
+     cp_txn`/`txn_recover` already follow in production (confirmed by
+     auditing every real resolve call site — none of them had this bug;
+     only my own test harness did).
+  3. **A read-resolution helper that only *serves one read correctly* is
+     not the same thing as a helper that *durably fixes storage*** —
+     `RaftKvNode::resolve_intent_given_status` (and `animusd::ClientCtx::
+     cp_get_local_resolving`, which calls it) compute the right answer for
+     *this one read* without ever proposing a `TxnResolve`; the physical
+     envelope stays an unresolved intent forever unless something else
+     (the proactive resolver loop) does the durable rewrite. This is
+     documented, accepted production behavior (`TxnTracker::
+     unresolved_decided`'s own doc: an anchor stops tracking a transaction
+     once *its own* keys resolve, even if a participant's intent on a
+     different tablet never gets a proactive fan-out — "still resolved on
+     demand the moment any reader hits it" means the *read* is correct,
+     not that storage settles) — but a test harness's own "read the final
+     state" check that uses a **raw, non-resolving** read (as this corpus's
+     `final_state` deliberately does, to keep a meaningful cross-replica
+     comparison) will never trigger that on-demand path for a key nobody
+     reads again, and will misreport a durably-committed-but-never-resolved
+     value as data loss. Fixed with a test-only helper that, unlike the
+     production read path, *does* propose an actual `TxnResolve` once a
+     foreign intent's status is known. **The general lesson**: when a
+     system's "eventual consistency" story rests on "any reader passing by
+     will fix it," a test that deliberately never reads the data again
+     needs its own explicit "make sure something reads it" step — don't
+     assume a converged-or-timeout poll alone reproduces that guarantee if
+     the poll's own read path doesn't exercise the same code path a real
+     reader would.
+  4. **A helper that picks "the first replica reporting `is_leader() ==
+     true`" must exclude replicas known to be faulted, or it can talk to a
+     frozen, isolated node instead of the genuine leader** — a crashed
+     replica keeps answering `is_leader() == true` from its last-known,
+     pre-crash state forever (it never learns it lost the term; it's
+     muted, not shut down). `raftkv_linearizable.rs`'s own `leader_among`
+     helper already excludes known-crashed indices for exactly this
+     reason; a new harness written independently (this corpus's own
+     `leader_of`) didn't replicate it. Fixed more robustly than
+     "thread a crashed-set through every call site": pick the reporting
+     replica with the **highest `term()`** instead of the first by array
+     index — any real election strictly increments the term, so a frozen
+     replica's stale term can never out-rank a genuine new leader,
+     without needing any external fault-tracking state at all.
+  5. **A multi-participant intent must carry the ANCHOR's own table name,
+     never the participant's own** — `record_table` (stamped into every
+     `Envelope::Intent`) exists precisely so a reader hitting a foreign
+     intent knows where to route its `TxnStatus` query; passing the
+     participant's own table name there instead (an easy copy-paste-shaped
+     mistake when the staging loop's own iteration variable is already
+     named `table`) means that query always looks for the record in the
+     wrong tablet's scope, finds nothing, and the intent never resolves —
+     on demand or otherwise. Caught only by tracing one specific stuck
+     key's own `IntentInfo` byte-for-byte back to which key's 8-byte token
+     the record's own key was actually derived from, since the symptom
+     (durability check reports one committed append as lost) looks
+     identical to several other, unrelated causes.
+  **Diagnostic lesson**: every one of these was found by adding a
+  temporary, narrowly-targeted `eprintln!` at the exact decision point
+  (which arm of a match fired, what a specific key's own `FastRead`
+  variant was, what a specific txn_id's tracker state was on each resolver
+  tick) and re-running the *one* failing scenario in isolation — never by
+  guessing from the failure message alone. Four of these five bugs
+  produced the *same* durability-check symptom ("lost acknowledged
+  append") with completely different root causes; only tracing the actual
+  runtime state, one hypothesis at a time, distinguished them — a lesson
+  worth restating from this file's own Hlc/`propose_ordered` entry above,
+  now at the scale of "chasing a bug through several confounding layers,"
+  not just one.
+
+- **Continuing to run the same corpus at depth after fixing one corpus-found
+  bug found a second, unrelated one — and then a third layer, once the
+  fix for the second bug was itself checked at depth.** Three separate
+  findings, each only visible once the previous one stopped masking it:
+  1. **The happy-path commit-report footgun is the mirror image of the
+     abort-path one, and re-auditing every "decide, then report" call
+     site after finding one instance doesn't catch the sibling** — the
+     corpus's own coordinator (`run_txn`) fixed its *abort* path's
+     torn-resolve bug (item 2 in the entry above) but its *commit* path
+     still reported success straight off `txn_commit_at_least`'s
+     `Some(ts)`, the identical "entry applied ≠ my decision won" mistake,
+     just on the opposite branch. Found by a *different* corpus scenario
+     (`anchor_leader_kill_mid`) than the one that found the abort-path bug
+     — the two bugs happened to need different fault shapes to trigger.
+     Fixed by always re-reading the record's actual status after every
+     decide attempt, commit or abort alike, matching what a full
+     re-audit of every *production* decide call site
+     (`txn_decide_anchor`, `txn_recover`, and the apply-time `TxnTracker`
+     bookkeeping itself) already confirmed they do correctly. **The
+     lesson**: fixing one branch of a two-branch bug class doesn't mean
+     the other branch got checked — a hypothesis this specific ("does the
+     code re-read before reporting, at *every* decide point, not just the
+     one the failing test happened to exercise") is worth stating and
+     checking explicitly, not inferred from one green test.
+  2. **A multi-key snapshot-read heuristic needed three redesigns before
+     it stopped producing false-positive torn reads, and each of the
+     first two replacements introduced a *new*, narrower race that only
+     the next depth run exposed** — `animus-test`'s cross-tablet
+     transaction corpus's read-only shape: (a) a single future-padded
+     `read_at` snapshot ts turned out to be structurally undermined by
+     the write-conflict-push mechanism (`RaftKvNode::mint_pushed`) itself
+     — a write can be stamped *above* whatever ceiling an **earlier**
+     read already pushed that group's clock to, and since `Hlc::mint` is
+     monotonic that's a **permanent** floor, so no margin (fixed or
+     dynamically sampled from the group's own state) can close it; (b)
+     replacing it with "force-resolve once, then read every key
+     sequentially" fixed that but introduced a *narrower* race — a slow
+     key's own resolve/read can itself take real time, so a transaction
+     touching an *earlier*, already-read key can still land before a
+     *later* key in the same list is read; (c) making both passes
+     **concurrent** (`futures::future::join_all`) narrowed the window to
+     one round trip but *still* didn't eliminate it — group-to-group
+     ReadIndex latency doesn't start in perfect lockstep even when every
+     future is spawned at the same instant. The design that actually
+     closed it: read **twice**, concurrently, and only accept the result
+     once two consecutive rounds agree byte-for-byte — a positive proof
+     of quiescence (nothing was in flight during the whole window),
+     rather than a narrower and narrower guess at "surely nothing changed
+     this fast." **The generalizable lesson**: when a "make this
+     consistent" fix for a distributed read keeps getting narrower races
+     rather than zero races, the fixable-margin approach is probably the
+     wrong shape entirely — look for a **verifiable stability condition**
+     (two independent observations agreeing) instead of a **tighter
+     timing bound**, which can always be beaten by one more layer of
+     concurrency the previous fix didn't anticipate.
+  3. **Overwriting another transaction's still-unresolved intent doesn't
+     erase it — MVCC keeps the old version — and a later transaction's
+     own abort-restore only ever looks *one hop* back, so it can land on
+     that stale intent instead of a real committed value, permanently
+     hiding it.** Found at seed depth (`ANIMUS_TXN_SEEDS=10`), not in the
+     frozen corpus — needs three sequential same-key transactions from one
+     client (single-writer-per-key workloads make this the *ordinary*
+     case, not a contrived one): the first commits, the second overwrites
+     it and is abandoned before deciding, the third stages over the
+     second's still-live intent (silently succeeding, pre-fix) and later
+     gets decided `Aborted` — its restore's one-hop-back `get_at` finds
+     the *second* transaction's intent, not the first's real value, and
+     blindly re-merges it at a timestamp *higher* than the first
+     transaction's own eventual correct `commit_ts`, so a later correct
+     resolve can never win that race via ordinary LWW. Chasing the
+     version chain back *multiple* hops on the read side was the obvious
+     first fix and the wrong one: an intermediate hop skipped over could
+     belong to a transaction that *later commits*, moving the identical
+     unrepairable-LWW-loss corruption onto a *different* transaction
+     rather than removing it. The fix that actually closes it structurally
+     is CockroachDB's writers-push-intents discipline: reject the
+     overwrite at **apply time** (a target key already holding a
+     *different* transaction's unresolved intent makes the whole stage a
+     no-op, whole-or-nothing, exactly like a fence/seal miss), so a key
+     can hold at most one live intent at a time and a one-hop-back
+     lookback is *always* sound. **This required a second, proposer-side
+     fix to be safe at all**: since a stage call returning `Some(ts)` only
+     ever meant "the entry applied," a coordinator that didn't check would
+     go on to commit a transaction *without one of its own writes ever
+     having happened* — worse than the original bug. Every coordinator
+     (production `animusd::ClientCtx::txn_prepare_pushing` and the
+     corpus's own `stage_anchor_pushing`/`stage_participant_pushing`) now
+     verifies each staged key genuinely landed (`txn_verify_staged`, the
+     same primitive a recovery push already uses) and retries, bounded,
+     before giving up. **The generalizable lesson**: "reject the bad write
+     at apply time" and "the proposer must not assume Some(ts) means my
+     content is really there" are not two independent hardening options to
+     pick between — a system with the second discipline already
+     established (task #15's fix, above) needs it applied to *every* new
+     apply-time rejection too, or the rejection alone just moves the false
+     success from "wrong outcome" to "silently missing write."
 
 ### Parallel-agent orchestration
 - **A stacked series' final "docs/ADR finalization" PR must treat the stack's

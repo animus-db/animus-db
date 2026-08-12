@@ -991,3 +991,582 @@ fn recovery_commit_is_reproducible_across_seeds() {
         );
     }
 }
+
+/// **ADR 0018 §2/PR6 corrective note**: two independent decide-attempts for
+/// the *same* transaction — each individually well-formed, each proposing a
+/// **freshly minted** `commit_ts` via `mint_at_least` (not idempotent
+/// across calls) — must never panic even though they disagree on the exact
+/// timestamp. `TxnCommit`'s apply arm used to treat "already `Committed` at
+/// a *different* `commit_ts`" as impossible-by-construction (a hard
+/// assert); it is not: a still-live coordinator's own decide attempt
+/// (`animusd`'s `CLIENT_TIMEOUT`, 10s) can genuinely still be in flight
+/// past `RECOVERY_GRACE` (5s), racing the recovery resolver's own
+/// independent post-grace push — both individually correct ("commit" is
+/// the right answer either way), only the exact minted value differs. This
+/// regresses the corpus-found bug directly: the ADR 0018 multi-tablet
+/// transaction corpus's `participant_leader_kill_early` scenario (seed
+/// 2743871795844702347) hit this precisely, deterministically, under
+/// nothing more exotic than a single participant leader kill. The first
+/// entry to *apply* still wins unconditionally (this group's one
+/// totally-ordered log remains the sole arbiter); the second is now a
+/// logged no-op, exactly like the pre-existing `Committed`-vs-`Aborted`
+/// duelling case — and, since every real caller
+/// (`ClientCtx::cp_txn`/`txn_recover`, `txn_resolver_loop`) already
+/// re-reads the record's actual decided status before resolving anything
+/// (never assumes its own proposal won) and the `TxnTracker` update only
+/// ever happens on the first-applied decision, no caller can ever resolve
+/// using the losing, stale `commit_ts` — no torn resolve.
+#[test]
+fn duelling_commits_at_different_timestamps_the_second_is_a_no_op_never_a_panic() {
+    let seed = 0x9C01;
+    let mut sim = Simulator::new(seed);
+    let engine = MemoryEngine::new();
+    let nodes_a = start_group(&sim, &GROUP_A, engine.clone(), b"orders:");
+    sim.run_for(ELECT);
+    let la = leader(&nodes_a, seed, "A");
+    let ka = key(1, b":order");
+
+    let (txn_id, record_key) = stage_anchor(
+        &mut sim,
+        &nodes_a[la],
+        "orders",
+        vec![(ka.clone(), Some(b"placed".to_vec()))],
+        Vec::new(),
+    )
+    .expect("anchor stage");
+
+    // Two independent decide-attempts, mirroring a still-live coordinator
+    // racing the recovery resolver — both propose a commit for the SAME
+    // txn_id at the same floor, but `mint_at_least` mints a fresh ts every
+    // call, so they genuinely disagree on the exact value.
+    let ts1 = commit_at_least(
+        &mut sim,
+        &nodes_a[la],
+        txn_id.clone(),
+        record_key.clone(),
+        txn_id.ts,
+    )
+    .expect("first commit attempt applies");
+    let ts2 = commit_at_least(
+        &mut sim,
+        &nodes_a[la],
+        txn_id.clone(),
+        record_key.clone(),
+        txn_id.ts,
+    )
+    .expect("second commit attempt ALSO applies as a legal, logged no-op — never panics");
+    assert_ne!(
+        ts1, ts2,
+        "test must exercise genuinely different timestamps (seed={seed})"
+    );
+
+    // The FIRST-applied decision wins — the record reflects ts1, never ts2.
+    let status = status_local(&mut sim, &nodes_a[la], record_key.clone()).expect("record exists");
+    assert_eq!(
+        status,
+        TxnDecisionStatus::Committed { commit_ts: ts1 },
+        "seed={seed}"
+    );
+
+    // Resolving with the re-read (correct, winning) outcome lands the
+    // committed value cleanly — no torn resolve from the second, no-op'd
+    // decision ever having touched anything.
+    resolve(
+        &mut sim,
+        &nodes_a[la],
+        txn_id,
+        record_key,
+        vec![ka.clone()],
+        TxnOutcome::Committed { commit_ts: ts1 },
+    );
+    sim.run_for(SETTLE);
+    assert_eq!(
+        block_on(nodes_a[la].local_get(&ka)),
+        Some(b"placed".to_vec()),
+        "seed={seed}"
+    );
+}
+
+/// The duelling-commit no-op is deterministic and reproducible across seeds
+/// — mirrors `recovery_commit_is_reproducible_across_seeds`'s shape.
+#[test]
+fn duelling_commits_at_different_timestamps_are_reproducible_across_seeds() {
+    for seed in [0x9C11u64, 0x9C12, 0x9C13, 0x9C14, 0x9C15] {
+        let mut sim = Simulator::new(seed);
+        let engine = MemoryEngine::new();
+        let nodes_a = start_group(&sim, &GROUP_A, engine.clone(), b"orders:");
+        sim.run_for(ELECT);
+        let la = leader(&nodes_a, seed, "A");
+        let ka = key(1, b":order");
+
+        let (txn_id, record_key) = stage_anchor(
+            &mut sim,
+            &nodes_a[la],
+            "orders",
+            vec![(ka.clone(), Some(b"placed".to_vec()))],
+            Vec::new(),
+        )
+        .expect("anchor stage");
+
+        let ts1 = commit_at_least(
+            &mut sim,
+            &nodes_a[la],
+            txn_id.clone(),
+            record_key.clone(),
+            txn_id.ts,
+        )
+        .unwrap_or_else(|| panic!("first commit attempt applies (seed={seed})"));
+        let ts2 = commit_at_least(
+            &mut sim,
+            &nodes_a[la],
+            txn_id.clone(),
+            record_key.clone(),
+            txn_id.ts,
+        )
+        .unwrap_or_else(|| panic!("second commit attempt applies as a no-op (seed={seed})"));
+        assert_ne!(ts1, ts2, "seed={seed}");
+
+        let status = status_local(&mut sim, &nodes_a[la], record_key).expect("record exists");
+        assert_eq!(
+            status,
+            TxnDecisionStatus::Committed { commit_ts: ts1 },
+            "seed={seed}"
+        );
+    }
+}
+
+/// **Torn-resolve regression** (ADR 0018 §2/PR6, load-bearing per the
+/// amendment's own review): duplicate same-outcome commits at different
+/// timestamps must not just avoid a panic (the test above) — every
+/// participant of the transaction must end up resolved *consistently*,
+/// using the record's one, re-read, first-applied outcome, never a losing
+/// decider's own candidate. Two participants (unlike the single-group test
+/// above, so there is a genuine "every participant" to check): the anchor
+/// group's own key and a second group's participant key.
+#[test]
+fn duelling_commits_resolve_every_participant_consistently_never_torn() {
+    let seed = 0x9C21;
+    let mut sim = Simulator::new(seed);
+    let engine = MemoryEngine::new();
+    let nodes_a = start_group(&sim, &GROUP_A, engine.clone(), b"orders:");
+    let nodes_b = start_group(&sim, &GROUP_B, engine.clone(), b"accounts:");
+    sim.run_for(ELECT);
+    let la = leader(&nodes_a, seed, "A");
+    let lb = leader(&nodes_b, seed, "B");
+    let ka = key(1, b":order");
+    let kb = key(2, b":balance");
+    let mut end_b = kb.clone();
+    end_b.push(0);
+    let span_b = KeyRange::new(kb.clone(), Some(end_b));
+
+    let (txn_id, record_key) = stage_anchor(
+        &mut sim,
+        &nodes_a[la],
+        "orders",
+        vec![(ka.clone(), Some(b"placed".to_vec()))],
+        vec![("accounts".to_string(), span_b)],
+    )
+    .expect("anchor stage");
+    stage_participant(
+        &mut sim,
+        &nodes_b[lb],
+        txn_id.clone(),
+        record_key.clone(),
+        "orders".to_string(),
+        vec![(kb.clone(), Some(b"debited".to_vec()))],
+    )
+    .expect("participant stage");
+
+    // First decide-attempt (mirroring a still-live coordinator) — wins.
+    let ts1 = commit_at_least(
+        &mut sim,
+        &nodes_a[la],
+        txn_id.clone(),
+        record_key.clone(),
+        txn_id.ts,
+    )
+    .expect("first commit attempt applies");
+
+    // Sourced from a re-read, exactly like every real caller (the ADR 0018
+    // §2/PR6 torn-resolve audit) — never a candidate ts, never a second
+    // decider's own proposal.
+    let status = status_local(&mut sim, &nodes_a[la], record_key.clone()).expect("record exists");
+    assert_eq!(
+        status,
+        TxnDecisionStatus::Committed { commit_ts: ts1 },
+        "seed={seed}"
+    );
+    let outcome = TxnOutcome::Committed { commit_ts: ts1 };
+    // **Gotcha found writing this test**: `txn_resolve`'s own applied `ts`
+    // (the MVCC version every resolved key is physically stamped at) is a
+    // *fresh mint on the resolving group's own leader*, not `commit_ts` —
+    // see `RaftKvNode::txn_resolve`'s doc ("not necessarily `outcome`'s
+    // `commit_ts`, which is only a comparison value"). So `ts_resolve_a`/
+    // `ts_resolve_b` below, not `ts1`, are each group's own physical
+    // resolve version.
+    let ts_resolve_a = resolve(
+        &mut sim,
+        &nodes_a[la],
+        txn_id.clone(),
+        record_key.clone(),
+        vec![ka.clone()],
+        outcome.clone(),
+    )
+    .expect("anchor resolve applies");
+    let ts_resolve_b = resolve(
+        &mut sim,
+        &nodes_b[lb],
+        txn_id.clone(),
+        record_key.clone(),
+        vec![kb.clone()],
+        outcome,
+    )
+    .expect("participant resolve applies");
+    sim.run_for(SETTLE);
+
+    // Every replica of both groups sees the committed value — nothing
+    // torn between the anchor's own key and the participant's.
+    for (i, n) in nodes_a.iter().enumerate() {
+        assert_eq!(
+            block_on(n.local_get(&ka)),
+            Some(b"placed".to_vec()),
+            "group A replica {i} torn (seed={seed})"
+        );
+    }
+    for (i, n) in nodes_b.iter().enumerate() {
+        assert_eq!(
+            block_on(n.local_get(&kb)),
+            Some(b"debited".to_vec()),
+            "group B replica {i} torn (seed={seed})"
+        );
+    }
+
+    // **Now** the second, losing decide-attempt (mirroring a recovery
+    // resolver racing in after the coordinator already won and resolved) —
+    // applied *after* both keys are physically resolved, so this proves the
+    // loser's timestamp has zero effect on anything already converged, not
+    // just that the record itself ignores it.
+    let ts2 = commit_at_least(
+        &mut sim,
+        &nodes_a[la],
+        txn_id.clone(),
+        record_key.clone(),
+        txn_id.ts,
+    )
+    .expect("second commit attempt applies as a no-op");
+    assert_ne!(ts1, ts2, "seed={seed}");
+    assert!(
+        ts1 < ts2,
+        "test assumes ts1 is the earlier mint (seed={seed})"
+    );
+
+    // A snapshot read strictly between "everything is resolved" and the
+    // loser's own ts sees BOTH participants' committed values together —
+    // the all-or-nothing visibility the torn-resolve hazard would have
+    // broken, and proof the losing decider's ts2 never un-resolves
+    // anything. **Not** a read between ts1/ts2 directly: `read_at`'s
+    // intent resolution is single-tablet only (see its own doc — "the
+    // single-tablet snapshot-read building block ..., not a transaction's
+    // read itself"), and a participant's own resolve is stamped at its own
+    // fresh mint (`ts_resolve_b` above), never at the anchor's `commit_ts`
+    // — so a read timestamped between ts1 and ts2 landing *before*
+    // `ts_resolve_b` would find the participant's key still physically an
+    // unresolved (foreign, from this tablet's own perspective) intent at
+    // that historical version, and `read_at` has no cross-tablet resolver
+    // to chase it down (unlike the latest-read path, `animusd`'s
+    // `cp_get_local_resolving`). Bootstrap each group's read ceiling past
+    // `ts_between` first (`read_at`'s own documented contract, ADR 0018
+    // §2/PR2b).
+    let ts_between = HlcTimestamp {
+        wall_ms: ts_resolve_a
+            .wall_ms
+            .max(ts_resolve_b.wall_ms)
+            .midpoint(ts2.wall_ms),
+        logical: 0,
+    };
+    assert!(
+        ts_between > ts_resolve_a && ts_between > ts_resolve_b && ts_between < ts2,
+        "seed={seed}: test assumes both resolves precede ts_between, which precedes ts2          (ts_resolve_a={ts_resolve_a:?}, ts_resolve_b={ts_resolve_b:?},          ts_between={ts_between:?}, ts2={ts2:?})"
+    );
+    // A generous budget, not `SETTLE` — `read_at`'s own bootstrap-then-
+    // retry (ADR 0018 §2/PR2b §1) needs real room here, unlike this
+    // file's grace-boundary tests, which deliberately keep `SETTLE` tight.
+    const READ_AT_BUDGET: Duration = Duration::from_secs(2);
+    let _ = drive(&mut sim, nodes_a[la].env(), READ_AT_BUDGET, {
+        let n = nodes_a[la].clone();
+        let ka = ka.clone();
+        async move { n.linearizable_get(&ka).await }
+    });
+    let _ = drive(&mut sim, nodes_b[lb].env(), READ_AT_BUDGET, {
+        let n = nodes_b[lb].clone();
+        let kb = kb.clone();
+        async move { n.linearizable_get(&kb).await }
+    });
+    let read_a = drive(&mut sim, nodes_a[la].env(), READ_AT_BUDGET, {
+        let n = nodes_a[la].clone();
+        let ka = ka.clone();
+        async move { n.read_at(&ka, ts_between).await }
+    })
+    .flatten();
+    let read_b = drive(&mut sim, nodes_b[lb].env(), READ_AT_BUDGET, {
+        let n = nodes_b[lb].clone();
+        let kb = kb.clone();
+        async move { n.read_at(&kb, ts_between).await }
+    })
+    .flatten();
+    assert_eq!(
+        read_a,
+        Some(Some(b"placed".to_vec())),
+        "seed={seed}: group A must be visible at ts_between"
+    );
+    assert_eq!(
+        read_b,
+        Some(Some(b"debited".to_vec())),
+        "seed={seed}: group B must be visible at ts_between (all-or-nothing, never torn)"
+    );
+}
+
+/// ADR 0018 §2/PR6 (task #16): the apply-time writer-push-intents guard
+/// (`KvCommand::TxnStage`'s doc) rejects a stage whose target key already
+/// holds another transaction's still-unresolved intent, whole-or-nothing,
+/// rather than silently overwriting it — the fix for a genuine durability
+/// hole a corpus depth run found (a corrupted MVCC version chain that made
+/// an already-committed value permanently unreadable; see the same fix's
+/// `abort_restore_never_meets_another_transactions_intent` for that
+/// property directly). This test proves the coordinator-visible half:
+/// a blocked stage still "applies" (its own entry commits through Raft,
+/// like a fence/seal miss) but writes nothing, and once the blocking
+/// transaction is pushed to a decision, a retried stage over the same key
+/// succeeds.
+#[test]
+fn stage_over_a_foreign_pending_intent_no_ops_then_a_pushed_retry_succeeds() {
+    let seed = 0xB16C;
+    let mut sim = Simulator::new(seed);
+    let engine = MemoryEngine::new();
+    let nodes_a = start_group(&sim, &GROUP_A, engine.clone(), b"orders:");
+    sim.run_for(ELECT);
+    let la = leader(&nodes_a, seed, "A");
+    let ka = key(1, b":order");
+    let mut end = ka.clone();
+    end.push(0);
+    let span = KeyRange::new(ka.clone(), Some(end));
+
+    // txn1 stages the anchor's own key and is left `Pending` — an
+    // abandoned coordinator, the same shape that originally let a second
+    // transaction's stage silently overwrite it.
+    let (txn1, record1) = stage_anchor(
+        &mut sim,
+        &nodes_a[la],
+        "orders",
+        vec![(ka.clone(), Some(b"v1".to_vec()))],
+        vec![],
+    )
+    .expect("txn1 stages");
+
+    // txn2's own stage over the SAME key: the entry itself still applies
+    // (confirmed by the `Some` below — matching a fence/seal miss's own
+    // "wait_applied only confirms applied, never that content landed"
+    // shape) but is a true no-op — key ka still belongs to txn1.
+    let (txn2, record2) = stage_anchor(
+        &mut sim,
+        &nodes_a[la],
+        "orders",
+        vec![(ka.clone(), Some(b"v2".to_vec()))],
+        vec![],
+    )
+    .expect("txn2's own stage entry still applies (as a whole-or-nothing no-op)");
+    assert_eq!(
+        verify_staged(&mut sim, &nodes_a[la], span.clone(), txn2.clone()),
+        Some(false),
+        "txn2's stage must have no-op'd — key ka still belongs to txn1 (seed={seed})"
+    );
+    assert_eq!(
+        record_view(&mut sim, &nodes_a[la], record2.clone()),
+        None,
+        "a rejected anchor stage must not create a record either (seed={seed})"
+    );
+
+    // Past grace, push txn1 to a decision (mirroring a coordinator or
+    // recovery pusher discovering the blocker and driving it to completion
+    // — the exact mechanism `animusd::ClientCtx::txn_prepare_pushing`'s own
+    // backoff-and-retry leaves to this same push protocol).
+    sim.run_for(PAST_GRACE);
+    let lookup = |_: &str| nodes_a[la].clone();
+    let status1 = push(
+        &mut sim,
+        &nodes_a[la],
+        record1.clone(),
+        txn1.clone(),
+        None,
+        &lookup,
+    );
+    // Not pinning the exact `commit_ts`: `mint_at_least` floors it at this
+    // group's own current clock, which has run well past `txn1.ts` by now
+    // (`PAST_GRACE`'s own 6s advance) — only the outcome matters here.
+    assert!(
+        matches!(status1, TxnDecisionStatus::Committed { .. }),
+        "txn1 (no participants) must be pushed to a commit, got {status1:?} (seed={seed})"
+    );
+    assert_eq!(
+        block_on(nodes_a[la].local_get(&ka)),
+        Some(b"v1".to_vec()),
+        "txn1's own committed value must be visible before the retry (seed={seed})"
+    );
+
+    // Retry txn2's stage now that key ka is a plain committed value, not
+    // an unresolved intent — it must succeed this time.
+    let (txn2_retry, record2_retry) = stage_anchor(
+        &mut sim,
+        &nodes_a[la],
+        "orders",
+        vec![(ka.clone(), Some(b"v2".to_vec()))],
+        vec![],
+    )
+    .expect("txn2's retried stage applies");
+    assert_eq!(
+        verify_staged(&mut sim, &nodes_a[la], span, txn2_retry.clone()),
+        Some(true),
+        "txn2's retried stage must have genuinely landed (seed={seed})"
+    );
+    let commit2 = commit_at_least(
+        &mut sim,
+        &nodes_a[la],
+        txn2_retry.clone(),
+        record2_retry.clone(),
+        txn2_retry.ts,
+    )
+    .expect("txn2 commit applies");
+    resolve(
+        &mut sim,
+        &nodes_a[la],
+        txn2_retry,
+        record2_retry,
+        vec![ka.clone()],
+        TxnOutcome::Committed { commit_ts: commit2 },
+    );
+    assert_eq!(
+        block_on(nodes_a[la].local_get(&ka)),
+        Some(b"v2".to_vec()),
+        "txn2's own committed value must be visible after the retry (seed={seed})"
+    );
+}
+
+/// ADR 0018 §2/PR6 (task #16): the property the apply-time
+/// writer-push-intents guard makes structurally true — an abort-restore's
+/// one-hop-back `get_at` can never land on another transaction's intent,
+/// only a genuinely committed value or true absence. Directly reconstructs
+/// the sequence that used to corrupt the MVCC version chain (found by a
+/// corpus depth run, `ANIMUS_TXN_SEEDS=10`, `coordinator_abandon_prepare_
+/// s01`, seed 16358087571531249382): a committed value, a second
+/// transaction that overwrites it and is abandoned before resolving, and a
+/// third transaction's own stage attempt over that same still-unresolved
+/// intent — under the pre-fix code the third transaction's stage would
+/// have silently overwritten the second's intent, and the third
+/// transaction's own later abort-restore would then have found the
+/// second's stale intent instead of the real committed value (or, one
+/// layer deeper, absence) — permanently hiding it, since a later correct
+/// resolve's lower ts always loses that race via ordinary LWW.
+#[test]
+fn abort_restore_never_meets_another_transactions_intent() {
+    let seed = 0xB16D;
+    let mut sim = Simulator::new(seed);
+    let engine = MemoryEngine::new();
+    let nodes_a = start_group(&sim, &GROUP_A, engine.clone(), b"orders:");
+    sim.run_for(ELECT);
+    let la = leader(&nodes_a, seed, "A");
+    let ka = key(1, b":order");
+    let mut end = ka.clone();
+    end.push(0);
+    let span = KeyRange::new(ka.clone(), Some(end));
+
+    // txn1 commits key ka = v1.
+    let (txn1, record1) = stage_anchor(
+        &mut sim,
+        &nodes_a[la],
+        "orders",
+        vec![(ka.clone(), Some(b"v1".to_vec()))],
+        vec![],
+    )
+    .expect("txn1 stages");
+    let commit1 = commit_at_least(
+        &mut sim,
+        &nodes_a[la],
+        txn1.clone(),
+        record1.clone(),
+        txn1.ts,
+    )
+    .expect("txn1 commit applies");
+    resolve(
+        &mut sim,
+        &nodes_a[la],
+        txn1,
+        record1,
+        vec![ka.clone()],
+        TxnOutcome::Committed { commit_ts: commit1 },
+    );
+
+    // txn2 stages OVER the committed value (a plain overwrite of a
+    // `Committed` value is legal — only overwriting an *unresolved intent*
+    // is rejected) and is left `Pending`: an abandoned coordinator.
+    let (txn2, record2) = stage_anchor(
+        &mut sim,
+        &nodes_a[la],
+        "orders",
+        vec![(ka.clone(), Some(b"v2".to_vec()))],
+        vec![],
+    )
+    .expect("txn2 stages");
+    assert_eq!(
+        verify_staged(&mut sim, &nodes_a[la], span.clone(), txn2.clone()),
+        Some(true),
+        "txn2 must genuinely stage over a committed value (seed={seed})"
+    );
+
+    // txn3's own stage attempt over the SAME key: pre-fix, this would have
+    // silently overwritten txn2's still-unresolved intent. Now it is
+    // rejected outright, so txn2's intent is never disturbed and txn3
+    // creates no record at all — there is nothing left to (mis)decide for
+    // txn3, so the corrupt chain the pre-fix code could produce here is
+    // structurally unrepresentable.
+    let (txn3, record3) = stage_anchor(
+        &mut sim,
+        &nodes_a[la],
+        "orders",
+        vec![(ka.clone(), Some(b"v3".to_vec()))],
+        vec![],
+    )
+    .expect("txn3's own stage entry still applies (as a whole-or-nothing no-op)");
+    assert_eq!(
+        verify_staged(&mut sim, &nodes_a[la], span, txn3.clone()),
+        Some(false),
+        "txn3 must be rejected — key ka still belongs to txn2 (seed={seed})"
+    );
+    assert_eq!(
+        record_view(&mut sim, &nodes_a[la], record3),
+        None,
+        "a rejected anchor stage creates no record — nothing left to (mis)decide for \
+         txn3 (seed={seed})"
+    );
+
+    // Abort txn2 (the mechanism — its own coordinator giving up, or a
+    // recovery push — doesn't matter here) and confirm the restore finds
+    // txn1's real committed value, never a stale intent: `get_at(key,
+    // txn2's own intent version - 1)` can only ever land on a genuinely
+    // committed value or true absence now, since no other transaction's
+    // intent could ever have been written in between.
+    abort_only(&mut sim, &nodes_a[la], txn2.clone(), record2.clone()).expect("txn2 abort applies");
+    resolve(
+        &mut sim,
+        &nodes_a[la],
+        txn2,
+        record2,
+        vec![ka.clone()],
+        TxnOutcome::Aborted,
+    );
+    assert_eq!(
+        block_on(nodes_a[la].local_get(&ka)),
+        Some(b"v1".to_vec()),
+        "txn2's abort-restore must find txn1's real committed value, never a stale intent \
+         from an overwriting transaction that was rejected (seed={seed})"
+    );
+}

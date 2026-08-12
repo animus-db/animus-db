@@ -466,6 +466,44 @@ State once here; cross-referenced from the sections below.
     hard assert, mirroring `assert_ts_monotonic`'s doctrine — not a
     silently-tolerated case. `TxnStage`'s fence/seal check is whole-or-
     nothing across every write key *and* the record key, matching `Batch`.
+  - **Writers push intents, never overwrite one (ADR 0018 §2/PR6, task
+    #16)**: `TxnStage`'s apply also rejects (whole-or-nothing, same shape
+    as the fence/seal check) any target key whose *current* value is an
+    unresolved `Envelope::Intent` naming a **different** `txn_id` (same-txn
+    re-staging — idempotent WAL replay — is unaffected). This closes a real
+    durability hole a corpus depth run found: overwriting a still-
+    unresolved intent doesn't erase it (MVCC keeps every version), so if
+    the *overwriting* transaction later aborts, its restore's one-hop-back
+    `get_at` (see the value-envelope entry above) can land on that stale
+    intent instead of a genuinely committed value or true absence — a
+    chain a later correct resolve can never repair (its own lower
+    `commit_ts` always loses that race via ordinary LWW), permanently
+    hiding an already-committed value. Chasing the version chain back
+    multiple hops on the *read* side was considered and rejected as
+    unsound (an intermediate hop skipped over could belong to a
+    transaction that *later* commits, moving the same corruption onto it);
+    rejecting the overwrite at apply time instead makes the corrupt chain
+    structurally unrepresentable — see `KvCommand::TxnStage`'s own doc for
+    the full argument, including why a plain `Put`/`Batch`/`Cas` over a
+    foreign intent stays legal (analyzed safe: a genuine overwrite
+    serialized strictly after the intent's own transaction, so that
+    transaction's eventual resolve loses to it via ordinary LWW — no chain
+    results). **The proposer-side half matters just as much**: a stage
+    call returning `Some(ts)` only ever meant "this entry applied," never
+    "my content landed" (the same footgun the PR6 duelling-decider fix
+    above already corrected for `txn_commit_at_least`/`txn_abort`) — so
+    `animusd::ClientCtx::txn_prepare_pushing` and the multi-tablet corpus's
+    own `stage_anchor_pushing`/`stage_participant_pushing` now verify every
+    staged key via `txn_verify_staged` after each attempt, retrying
+    (bounded, short backoff) before reporting a client-facing conflict;
+    without this, a blocked stage would look identical to a genuine one,
+    and a transaction could commit without one of its own writes ever
+    having happened. Regression:
+    `tests/txn_recovery.rs`'s
+    `stage_over_a_foreign_pending_intent_no_ops_then_a_pushed_retry_succeeds`
+    and `abort_restore_never_meets_another_transactions_intent`; see ADR
+    0018's PR5 amendment §1b for the full account and the corpus depth
+    seed that found it.
   - **A residual, documented gap**: a tablet split's `split_key` is an
     arbitrary existing row's key (`animusd::auto_split_loop`'s
     byte-weighted median), not token-aligned, so a split racing an
@@ -510,11 +548,23 @@ State once here; cross-referenced from the sections below.
     **first**-applied decision wins (log position is the ballot — every
     replica applies its one Raft log in the same total order), and any
     later conflicting proposal is a logged no-op (`tracing::warn!`, both
-    outcomes named), never a panic." The one case that stays a hard
-    assert: two `Committed` flips at **two different** `commit_ts`
-    values — impossible by construction (this match arm runs once per
-    applied entry, in one totally-ordered log), so it remains proof the
-    witnessing chain itself is broken. A new abort-only primitive,
+    outcomes named), never a panic." **Since ADR 0018 §2/PR6**: this now
+    also covers two `Committed` flips at **two different** `commit_ts`
+    values — PR5 shipped this as a hard assert ("impossible by
+    construction"), but it isn't: `txn_commit_at_least`'s own
+    `mint_at_least` mints a fresh ts every call, so a still-live
+    coordinator's own commit attempt and the recovery resolver's
+    independent post-grace push can each legitimately conclude "commit"
+    with *different* timestamps — found live, deterministically, by the
+    multi-tablet transaction corpus's `participant_leader_kill_early`
+    scenario (`animusd`'s own `CLIENT_TIMEOUT`, 10s, is longer than
+    `RECOVERY_GRACE`, 5s, so this is reachable under nothing more exotic
+    than an ordinary leader election). Same-outcome-different-ts is now
+    exactly as legal a duelling-decider shape as different-outcome
+    duelling; the *only* remaining hard assert is two genuinely
+    **conflicting** decisions racing the same log position, which one
+    sequential log still rules out. See ADR 0018's PR5 amendment §1's
+    corrective note for the full account. A new abort-only primitive,
     `RaftKvNode::txn_abort` (the dual of `txn_commit_at_least`, no inline
     resolve), lets a caller decide without also resolving — every decider
     (`animusd`'s ordinary coordinator path and its recovery pusher alike)
@@ -1050,13 +1100,39 @@ API (which always mints a *fresh* id) cannot express.
   `witnessing.rs`'s own restart idiom, to sidestep
   which-of-three-replicas-becomes-leader-again nondeterminism a
   multi-voter restart would add for no benefit to what this test proves);
-  and a five-seed reproducibility sweep. **Gotcha this file's own test
+  a five-seed reproducibility sweep; and (ADR 0018 §2/PR6)
+  `duelling_commits_at_different_timestamps_the_second_is_a_no_op_never_a_panic`
+  + its own five-seed sweep — two independent `txn_commit_at_least` calls
+  for the same `txn_id` at the same floor, proven to mint genuinely
+  different timestamps, the second confirmed a no-op (never a panic) and
+  the record correctly reflecting the first's ts; regresses the
+  corpus-found bug directly. **Gotcha this file's own test
   authoring is the regression for**: its `drive` helper's `sim.run_for(budget)`
   always advances the full `budget` regardless of when the future actually
   completes (the same gotcha `ts_cache.rs`'s history warns about) — this
   file's `SETTLE` is deliberately 300ms, not `txn_multi.rs`'s 2s, because
   the grace-boundary tests need to reason precisely about how much sim time
-  has elapsed relative to `RECOVERY_GRACE`.
+  has elapsed relative to `RECOVERY_GRACE`. Also (ADR 0018 §2/PR6):
+  `duelling_commits_resolve_every_participant_consistently_never_torn` —
+  two independent `txn_commit_at_least` calls across a two-group
+  transaction, both resolved from a re-read (never a losing decider's own
+  candidate), asserting every replica of both groups converges on the
+  identical value and that a `read_at` snapshot straddling the two decide
+  attempts' timestamps sees both participants' committed values together
+  (never one without the other); and (ADR 0018 §2/PR6, task #16)
+  `stage_over_a_foreign_pending_intent_no_ops_then_a_pushed_retry_succeeds`
+  (a second transaction's stage over a still-`Pending` key is a true
+  no-op — confirmed via `txn_verify_staged` and that no record gets
+  created — until the blocking transaction is pushed to a decision, after
+  which a retried stage succeeds) and
+  `abort_restore_never_meets_another_transactions_intent` (reconstructs
+  the exact three-transaction sequence that used to corrupt the MVCC
+  version chain — a committed value, a second transaction overwriting it
+  and abandoned before resolving, a third transaction's own stage attempt
+  over that still-unresolved intent — and proves the third transaction's
+  stage is now rejected outright, so the second transaction's own later
+  abort-restore correctly finds the first transaction's real committed
+  value, never a stale intent).
 - `snapshot_reads.rs` (ADR 0018 §2/PR2b) — `read_at`/`scan_at` directly:
   each sees exactly the version committed at or before `ts` (including a
   value strictly between two writes' timestamps, and `scan_at` across

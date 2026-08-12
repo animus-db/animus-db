@@ -662,6 +662,15 @@ const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
 /// enough that the total wait stays a small fraction of [`CLIENT_TIMEOUT`]
 /// (which still hard-bounds the whole sequence).
 const FORWARD_ELECTION_BACKOFF: Duration = Duration::from_millis(100);
+/// Bounded attempts [`ClientCtx::txn_prepare_pushing`] gives a stage blocked
+/// by another transaction's unresolved intent (ADR 0018 §2/PR6, task #16)
+/// before giving up and reporting a client-facing conflict error.
+const TXN_STAGE_PUSH_ATTEMPTS: u32 = 3;
+/// Backoff between [`ClientCtx::txn_prepare_pushing`]'s retry attempts —
+/// room for the blocking transaction to clear (its own coordinator
+/// finishing, or `txn_resolver_loop`'s passive sweep once past
+/// `animus_cp_data::RECOVERY_GRACE`), not a hard liveness bound.
+const TXN_STAGE_PUSH_BACKOFF: Duration = Duration::from_millis(250);
 /// The bootstrap CP group's replication factor (ADR 0017 #3a): the group spans the
 /// first `min(N, MAX_REPLICATION_FACTOR)` nodes' `raftkv` ids. Dynamic CP placement
 /// over more nodes is later v1 work.
@@ -3938,6 +3947,66 @@ impl ClientCtx {
         }
     }
 
+    /// [`txn_prepare`](Self::txn_prepare), verified: a stage attempt
+    /// returning `Ok(..)` only means its *entry applied* — since ADR 0018
+    /// §2/PR6 (task #16), it can still have no-op'd internally if any
+    /// target key already held another transaction's unresolved intent
+    /// (the apply-time writer-push-intents guard `KvCommand::TxnStage`'s
+    /// doc describes, closing the chained-stale-intent durability hole a
+    /// corpus depth run found). Without this check, a blocked stage would
+    /// look identical to a genuine one at the propose layer, and the
+    /// transaction would go on to commit **without that key's write ever
+    /// having happened** — a new, worse atomicity violation than the one
+    /// this whole fix exists to close.
+    ///
+    /// Verifies every staged key actually holds *this* transaction's own
+    /// intent (`ClientCtx::txn_verify`, the same primitive a recovery push
+    /// already uses to check a participant's own stage) and, if any key
+    /// was blocked, retries the whole stage after a short backoff — bounded
+    /// (`TXN_STAGE_PUSH_ATTEMPTS`), mirroring the bounded retry a *read*
+    /// already does against a foreign pending intent. The backoff alone
+    /// (not an explicit push of the blocker's own identity — the read-side
+    /// machinery to attribute a *local* pending intent to a specific
+    /// txn_id doesn't exist yet, a gap worth closing separately if this
+    /// proves too slow in practice) gives the blocking transaction room to
+    /// clear on its own: its own coordinator finishing, or
+    /// `txn_resolver_loop`'s passive per-second sweep pushing it once past
+    /// `RECOVERY_GRACE`. Exhausting every attempt returns a client-facing
+    /// error rather than ever reporting success for an unstaged key.
+    async fn txn_prepare_pushing(
+        &self,
+        table: &str,
+        anchor: Option<(TxnId, Vec<u8>, String)>,
+        writes: Vec<TxnWrite>,
+    ) -> Result<(TxnId, Vec<u8>, String, HlcTimestamp), String> {
+        let keys: Vec<Vec<u8>> = writes.iter().map(|(k, _)| k.clone()).collect();
+        for attempt in 0..TXN_STAGE_PUSH_ATTEMPTS {
+            let (txn_id, record_key, record_table, ts) = self
+                .txn_prepare(table, anchor.clone(), writes.clone())
+                .await?;
+            let mut blocked = false;
+            for key in &keys {
+                let mut end = key.clone();
+                end.push(0);
+                let span = KeyRange::new(key.clone(), Some(end));
+                if !matches!(self.txn_verify(table, &span, &txn_id).await, Ok(true)) {
+                    blocked = true;
+                    break;
+                }
+            }
+            if !blocked {
+                return Ok((txn_id, record_key, record_table, ts));
+            }
+            if attempt + 1 < TXN_STAGE_PUSH_ATTEMPTS {
+                tokio::time::sleep(TXN_STAGE_PUSH_BACKOFF).await;
+            }
+        }
+        Err(format!(
+            "txn prepare: stage on table `{table}` was blocked by another transaction's \
+             unresolved intent on a target key, even after {TXN_STAGE_PUSH_ATTEMPTS} attempts"
+        ))
+    }
+
     /// **Commit or abort** `txn_id`'s record at `record_key` on `table`'s
     /// (the anchor's own) tablet leader — the wire-routed counterpart of
     /// [`RaftKvNode::txn_commit_at_least`] (`commit: true`, floored at
@@ -4187,6 +4256,16 @@ impl ClientCtx {
     /// builds is a single-key point-span) and issues one
     /// `txn_resolve_participant` call per table. A no-op if `status` is
     /// still `Pending` (nothing to resolve yet).
+    ///
+    /// ADR 0018 §2/PR6 torn-resolve audit: `status` must always be a
+    /// **post-decision re-read** (`txn_status_local`/`txn_record_view`,
+    /// or `TxnTracker::unresolved_decided`'s own tracked outcome — itself
+    /// only ever inserted at the moment this group's own apply flips
+    /// `Pending -> Committed`/`Aborted`, ADR 0018 §2/PR5), never a
+    /// decider's own candidate/proposed ts. Every caller in this crate
+    /// (`cp_txn`'s `resolve_all`, `txn_recover` below,
+    /// `txn_resolver_loop`) already satisfies this; verified by this
+    /// audit, not merely assumed.
     async fn recovery_resolve(
         &self,
         txn_id: TxnId,
@@ -4537,8 +4616,9 @@ impl ClientCtx {
         let (anchor_table, _anchor_tablet) = anchor_gk;
         let anchor_keys: Vec<Vec<u8>> = anchor_writes.iter().map(|(k, _)| k.clone()).collect();
 
-        let (txn_id, record_key, record_table, anchor_ts) =
-            self.txn_prepare(&anchor_table, None, anchor_writes).await?;
+        let (txn_id, record_key, record_table, anchor_ts) = self
+            .txn_prepare_pushing(&anchor_table, None, anchor_writes)
+            .await?;
 
         // Every other participant stages concurrently.
         let participant_gks: Vec<(String, TabletId)> = order.into_iter().skip(1).collect();
@@ -4551,7 +4631,7 @@ impl ClientCtx {
             let record_table = record_table.clone();
             async move {
                 let result = self
-                    .txn_prepare(&table, Some((txn_id, record_key, record_table)), writes)
+                    .txn_prepare_pushing(&table, Some((txn_id, record_key, record_table)), writes)
                     .await;
                 (table, keys, result)
             }
@@ -4585,6 +4665,17 @@ impl ClientCtx {
         // a resolve failure never blocks a decision already durable on the
         // anchor; the resolver loop, ADR 0018 §2/PR5, is the safety net
         // that eventually finishes it).
+        //
+        // ADR 0018 §2/PR6 torn-resolve audit: every call site below passes
+        // an `outcome` sourced from `txn_decide_anchor`'s own `Ok(..)`
+        // return, which is itself always a **post-decision re-read**
+        // (`txn_status_local`, inside `txn_decide_anchor`) — never the
+        // caller's own proposed/candidate ts. This is load-bearing: once a
+        // same-outcome-different-ts duplicate commit is a legal no-op
+        // (ADR 0018 §2/PR6) rather than an assert, resolving with a
+        // losing decider's own candidate instead of the actual, winning
+        // decision would be exactly the torn-resolve hazard that
+        // amendment's own review flagged.
         let resolve_all = |outcome: TxnOutcome, staged: Vec<(String, Vec<Vec<u8>>)>| {
             let this = self.clone();
             let txn_id = txn_id.clone();
