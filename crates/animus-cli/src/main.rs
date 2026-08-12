@@ -676,6 +676,25 @@ fn print_response(response: &ClientResponse) {
                 writes.len()
             );
         }
+        // Multi-participant transaction replies (ADR 0018 §2/PR4): consumed
+        // programmatically by `ClientCtx::cp_txn`'s own coordinator logic
+        // and by tests driving the client protocol directly — not
+        // requested by any CLI subcommand of its own yet (that's tracked
+        // for a later PR, alongside the Dynamo `TransactWriteItems`
+        // surface). Printed raw if one ever surfaces here, mirroring
+        // `JoinInfo`/`MetadataDelta` above.
+        ClientResponse::TxnCommitted { commit_ts } => {
+            println!("txn committed at {commit_ts:?}");
+        }
+        ClientResponse::TxnPrepared { txn_id, ts, .. } => {
+            println!("txn {txn_id:?} prepared at {ts:?}");
+        }
+        ClientResponse::TxnDecided { ts } => {
+            println!("txn decided at {ts:?}");
+        }
+        ClientResponse::TxnStatusReply { status } => {
+            println!("txn status: {status:?}");
+        }
     }
 }
 

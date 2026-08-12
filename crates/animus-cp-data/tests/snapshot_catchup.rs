@@ -154,7 +154,7 @@ fn snapshot_catchup_carries_txn_records_and_intents() {
         nodes[l].env(),
         Duration::from_secs(5),
         async move {
-            n.txn_stage(vec![(kk, Some(b"staged-value".to_vec()))])
+            n.txn_stage("t", vec![(kk, Some(b"staged-value".to_vec()))])
                 .await
         },
     )

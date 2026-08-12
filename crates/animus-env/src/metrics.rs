@@ -234,12 +234,25 @@ pub enum Metric {
     /// (appended to its log) to raise the committed read ceiling above a
     /// read this leader is about to serve.
     CpReadCeilingProposals,
+
+    // --- Multi-participant transactions (ADR 0018 §2, PR4) ---
+    // Appended after the read-ceiling variant; every earlier variant's slot
+    // and the text-export order stay stable, so the snapshot remains
+    // byte-reproducible. Recorded by `animus-cp-data`'s `RaftKvNode` at the
+    // one site that knows the real outcome — a read that observed no value
+    // at `ts` but a version within `(ts, uncertainty_upper(ts)]`, and
+    // therefore restarted once at the higher timestamp (ADR 0018 §2: the
+    // uncertainty-interval mechanism, never a false negative — the restart
+    // is what proves it, not a client-visible error).
+    /// A linearizable/snapshot read restarted once at a higher timestamp
+    /// because a version existed within its clock-uncertainty window.
+    CpUncertaintyRestarts,
 }
 
 impl Metric {
     /// Every metric, in a fixed order. The array index of a metric in `ALL` is
     /// its slot in the [`MetricSink`]; keep this in sync with the enum.
-    pub const ALL: [Metric; 45] = [
+    pub const ALL: [Metric; 46] = [
         Metric::ElectionsStarted,
         Metric::ElectionsWon,
         Metric::AppendEntriesSent,
@@ -285,6 +298,7 @@ impl Metric {
         Metric::ControlReconfigureRejected,
         Metric::OrphanMembersSwept,
         Metric::CpReadCeilingProposals,
+        Metric::CpUncertaintyRestarts,
     ];
 
     /// The stable exported name of this metric (snake_case, used as the text
@@ -337,6 +351,7 @@ impl Metric {
             Metric::ControlReconfigureRejected => "control_reconfigure_rejected",
             Metric::OrphanMembersSwept => "control_orphan_members_swept",
             Metric::CpReadCeilingProposals => "cp_read_ceiling_proposals",
+            Metric::CpUncertaintyRestarts => "cp_uncertainty_restarts",
         }
     }
 

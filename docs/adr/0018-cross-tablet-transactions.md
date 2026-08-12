@@ -5,13 +5,16 @@
   landed; PR2b: MVCC snapshot reads at a timestamp + the read-timestamp
   cache/logged read ceiling landed; PR3: single-participant transactions —
   the value envelope + the txn record/intent/resolve machinery through one
-  Raft group — landed; PR4-PR7 sequenced). See the "Amendment (2026-08-11,
-  PR1)" section for the build-time decisions settled at the start of
-  delivery, the "Amendment (2026-08-11, PR2)" section for the range-seal
-  design that replaces `version_floor`, the "Amendment (2026-08-11, PR2b)"
-  section for the read path + serializability write-push mechanism, and the
-  "Amendment (2026-08-12, PR3)" section below for the record/intent/resolve
-  machinery.
+  Raft group — landed; PR4: multi-participant 2PC across tablet Raft
+  groups, the wire-level coordinator, foreign-intent resolution, and
+  uncertainty-interval read restarts — landed; PR5-PR7 sequenced). See the
+  "Amendment (2026-08-11, PR1)" section for the build-time decisions settled
+  at the start of delivery, the "Amendment (2026-08-11, PR2)" section for
+  the range-seal design that replaces `version_floor`, the "Amendment
+  (2026-08-11, PR2b)" section for the read path + serializability
+  write-push mechanism, the "Amendment (2026-08-12, PR3)" section for the
+  record/intent/resolve machinery, and the "Amendment (2026-08-12, PR4)"
+  section below for multi-participant 2PC.
 - **Date:** 2026-08-03
 
 ## Context
@@ -746,3 +749,240 @@ bounded retry-then-fail) and for a scan; CAS-vs-in-flight-txn interaction
 beyond a deterministic fail; the split-vs-in-flight-txn interaction noted
 in §2; and the multi-tablet Elle corpus (Follow-up step 5), the safety
 net that lets this and the prior steps be trusted at depth.
+
+## Amendment (2026-08-12, PR4)
+
+PR4 lands Follow-up step 3: **multi-participant 2PC across two or more
+Raft groups** — the coordinator that generalizes PR3's degenerate,
+single-group "2PC" into a genuine cross-tablet (and, since tablets are
+table-scoped, ADR 0022/0023, potentially cross-table) atomic transaction —
+plus two mechanisms the multi-participant design exposed a real need for:
+foreign-intent read resolution, and uncertainty-interval read restarts.
+
+### 1. The record-key routing question, answered
+
+PR3's `KvCommand::TxnStage` assumed the record it creates always lives in
+the *same* tablet as the stage that creates it (true by construction for a
+single-participant transaction). PR4 breaks that: a non-anchor
+participant's own `TxnStage` must merge intents referencing the **anchor's**
+record, which lives on a different tablet — and, since tablets are
+table-scoped, potentially a different **table's** ring entirely, whose
+token space is independent of this tablet's own (two tables' rings can and
+do assign the identical partition token to different rows). A record's key
+(`token || [0x00, 0x02] || encode(txn_id)`, `txn.rs`) therefore does **not**
+by itself identify which table's tablet owns it — exactly the gap flagged
+as a stop-and-report item going in. **Confirmed as a real gap, and closed
+structurally**: `Envelope::Intent` gained a `record_table: String` field
+(the anchor's own table name), stamped into every intent `KvCommand::
+TxnStage` merges, anchor and participant stages alike. A reader that can't
+resolve an intent locally now has everything it needs — `record_table` +
+`record_key` — to route a cross-tablet `TxnStatus` query to the record's
+actual owner (§3 below). `KvCommand::TxnStage` also gained `is_anchor: bool`
+(only an anchor stage's `record_key` is checked against/lives in this
+group's own `fence`; a participant stage's `writes` still are, but
+`record_key` is never touched here at all) and `record_table`.
+
+A second, related simplification: `KvCommand::TxnResolve` no longer
+re-derives its committed/aborted outcome by reading `record_key` locally
+(PR3's shape) — it now carries an explicit `outcome: TxnOutcome` field. This
+isn't just a PR4-specific patch: a non-anchor participant's own tablet
+never holds the record at all, so the old "read it locally" path would
+have silently done nothing (a `None` record, treated as `Pending` by PR3's
+existing fence-miss-style doctrine) for every participant resolve. Carrying
+the decision explicitly is sound uniformly for the anchor's own resolve too
+(same code path, `RaftKvNode::txn_resolve`, used by both) and removes a
+local-record dependency `TxnResolve` never actually needed for correctness
+— the coordinator (or, for the single-participant case, `txn_decide`
+itself) always already knows the decision by the time it proposes a
+resolve.
+
+### 2. The protocol, concretely (`RaftKvNode` primitives + `animusd::
+ClientCtx::cp_txn`)
+
+The primitives (`animus-cp-data`, `lib.rs`):
+
+- `txn_stage(table, writes) -> (TxnId, record_key)` — PR3's method,
+  unchanged in shape but now also embeds `record_table = table` into every
+  intent, and is the **anchor**-only entry point (`is_anchor: true`).
+- `txn_stage_participant(txn_id, record_key, record_table, writes) ->
+  stage_ts` — new: a non-anchor participant's stage, referencing an
+  already-known anchor record (`is_anchor: false`); creates/touches no
+  record.
+- `txn_commit_at_least(txn_id, record_key, min_ts) -> commit_ts` — new: the
+  anchor commits its record at a ts that strictly exceeds **both**
+  `min_ts` (the coordinator's candidate — see below) and this group's own
+  log floor (`mint_at_least`, the same witness-and-floor shape `mint_pushed`/
+  `propose_seal` already use) — returning the **actual** ts used, which may
+  exceed `min_ts` if this group's own floor already had. This returned
+  value, never the caller's original candidate, is the transaction's
+  canonical `commit_ts`.
+- `txn_resolve(txn_id, record_key, keys, outcome) -> ts` — new: the one
+  low-level resolve primitive, used identically for the anchor's own keys
+  and every other participant's.
+- `txn_status_local(record_key) -> TxnDecisionStatus` — new: a
+  ReadIndex-barrier-consistent read of this tablet's own record, for a
+  caller that already knows it's talking to the record's owner (the
+  cross-tablet query's server side).
+- `linearizable_get_served_fast(key) -> FastRead` — new: like
+  `linearizable_get_served` but a single, non-blocking resolution attempt;
+  `FastRead::Foreign(IntentInfo)` (carrying `txn_id`/`record_key`/
+  `record_table`/`staged_value`) is the new outcome a foreign intent
+  produces, alongside the existing `Value`/`Pending`.
+- `resolve_intent_given_status(key, read_ts, txn_id, status) ->
+  Option<Vec<u8>>` — new: finishes a read given an externally-obtained
+  status (from a `TxnStatus` round trip), re-checking the key still holds
+  that exact intent before applying the same commit/abort logic PR3's local
+  path uses.
+
+The coordinator (`animusd::ClientCtx::cp_txn`, reachable via the new
+`ClientRequest::Txn { writes, preconditions }`):
+
+1. Group `writes` (`(table, key, Option<value>)`) by owning tablet
+   (auto-provisioning each distinct table's first tablet on demand, as
+   `cp_write` does). The **first** write's tablet is the **anchor**.
+2. **Prepare**: stage the anchor first (it mints the `TxnId`/record key
+   every participant needs), then every other participant **concurrently**
+   (`futures::future::join_all`) via `ClientCtx::txn_prepare`, which routes
+   exactly like every other CP op (serve locally, or forward one hop via
+   the new `ClientRequest::TxnPrepare`). Any participant's stage failing
+   aborts: propose `TxnAbort` on the anchor (`RaftKvNode::txn_decide`'s
+   bundled abort+resolve) and best-effort resolve-abort every participant
+   that *did* stage, then return the failure.
+3. **Commit**: `candidate = max(anchor's own stage ts, every participant's
+   acked stage ts)`; `commit_ts = ` the anchor's `txn_commit_at_least`
+   result at that candidate — **the single Raft commit on the anchor's
+   record is the atomic commit point** (the same argument PR3's decision
+   already established, now for N participants: once that one entry
+   commits, the transaction *is* committed, full stop, regardless of
+   whether any participant's own intents are ever resolved).
+4. **Resolve**: every participant (anchor's own keys included) is resolved
+   with the canonical `commit_ts` via `ClientCtx::txn_resolve_participant`
+   (routed like `TxnPrepare`, via the new `ClientRequest::TxnResolve`) —
+   **before** this call returns to the client, not async-post-ack (see §5's
+   "what PR5 owns" for why).
+
+### 3. Reads meeting a foreign intent
+
+A reader (`animusd::ClientCtx::cp_get_local_resolving`, the wire-facing
+counterpart of PR3's `cp_get_local`) tries
+`linearizable_get_served_fast` first. On `FastRead::Foreign(info)`, it
+routes a new `ClientRequest::TxnStatus { table: info.record_table,
+record_key: info.record_key }` to that tablet's leader (locally or
+forwarded, same routing as any other CP op), which answers with
+`RaftKvNode::txn_status_local`. A `Committed`/`Aborted` reply lets the
+reader finish via `resolve_intent_given_status`; a `Pending` reply (or a
+failed status query) reports a retryable "transaction still pending"
+error — the caller's own retry loop (`cp_read`'s `"; retry"` handling)
+tries again. A **locally**-`Pending` intent (the single-participant/anchor
+case, unchanged from PR3) still falls back to the bounded internal wait
+(`linearizable_get_served`).
+
+**Scope of this PR's foreign-intent handling**: wired into the point-read
+path (`Get`) only — `Scan`/`read_at` keep PR3's existing local-only
+resolution (a still-unresolved foreign intent is silently omitted from a
+scan, or reported as an ordinary "not found locally" for `read_at`). Full
+push/wait scheduling for a scan, and pushing a blocking read rather than
+retrying, are still PR5+ concerns per the PR3 amendment's own deferral list
+— this PR only adds the *cross-tablet routing* half for the one path that
+needed it to demonstrate atomic multi-tablet visibility end to end.
+
+### 4. Uncertainty-interval read restarts
+
+The Decision section's promised mechanism (§2: "a read may have to wait
+out, or restart at a higher timestamp past, values written within the
+interval") lands here: `RaftKvNode::read_at` now restarts **once** at
+`Hlc::uncertainty_upper(ts)` when it observes no value at `ts` but a
+version exists in `(ts, uncertainty_upper(ts)]` — over-conservative,
+never wrong (the restart only ever moves the serve timestamp later, so it
+can only pick up more committed data, never lose any), and bounded to one
+restart (the recursive call disables further restarts). Counted via the
+new `Metric::CpUncertaintyRestarts` (append-only, after
+`CpReadCeilingProposals`). Not yet wired into `linearizable_get_served`
+(which serves at "latest", where the question doesn't apply the same way)
+or into scans — a snapshot-read-specific mechanism for now, matching where
+the ADR's own language ("a read") was narrowest.
+
+### 5. What PR5 owns (deferred, not closed here)
+
+- **In-doubt recovery**: nothing here resolves a transaction left
+  `Pending` forever by a coordinator that crashed between prepare and
+  commit/abort. The anchor's record is durable (Raft-replicated), so the
+  *information* needed to resolve it exists; PR5 is where a resolver
+  actually acts on it (a background task, or a reader's own push, per the
+  Decision section's "any actor encountering a pending intent can drive the
+  transaction record to a decision" promise).
+- **Push/wait scheduling for a still-`Pending` foreign or local intent**:
+  this PR's coordinator and its foreign-intent read path both retry-then-
+  give-up (bounded); actually *pushing* the blocking transaction (aborting
+  a stale one, or waiting more intelligently) is PR5's resolver-task scope.
+- **The intent-resolver background task** itself, and the `/admin/txns`
+  observability surface (PR7).
+
+### 6. Deliberate deviations from the spec, flagged honestly
+
+- **Resolve is synchronous, not async-post-ack.** The protocol sketch calls
+  for acking the client once the anchor commits, then resolving
+  participants asynchronously. This PR resolves every participant
+  **before** returning to the client instead: the infrastructure that would
+  make an un-awaited async resolve *safe to abandon* (a background
+  resolver retrying it, PR5) doesn't exist yet, so doing it inline is
+  simpler and strictly safer in the meantime, at the cost of a small amount
+  of extra client-visible latency. Revisit once PR5 lands.
+- **The single-tablet case is not special-cased onto `RaftKvNode::
+  txn_write`.** `cp_txn`'s general N-participant path degenerates to zero
+  participants for a single-tablet transaction, which costs the identical
+  three log entries (stage/commit/resolve) `txn_write` does — so nothing is
+  lost by using one uniform code path instead of a dedicated fast path, and
+  the risk of two divergent implementations is avoided. `txn_write` itself
+  is untouched and still used directly by `animus-cp-data`'s own tests.
+- **Condition-reads (`cp_txn`'s `preconditions`) refresh by value, not by
+  HLC timestamp.** The spec describes evaluating preconditions at a read
+  timestamp `R` and refreshing via a timestamped re-read only if the final
+  `commit_ts` exceeds `R`. Exposing an ordinary linearizable read's serve
+  timestamp back to a wire caller isn't plumbed on the client protocol yet
+  (only `read_at`'s caller-chosen `ts` is) — implementing this precisely
+  would need a new primitive. `cp_txn` instead re-checks every precondition
+  **by value** (an ordinary linearizable read, once before staging and once
+  right before the commit decision) and aborts on any mismatch — correct
+  for the stated goal (catching a conflicting write that lands between
+  prepare and commit) without the extra wire primitive, but not
+  byte-for-byte the ADR's mechanism. Flagged as a follow-up, not silently
+  substituted.
+- **A wire-reachable panic, found and fixed during PR4's own test
+  writing**: `RaftKvNode::txn_stage`'s hard `assert!` that its anchor key is
+  at least `TOKEN_BYTES` long was a sound "caller invariant" when only
+  trusted internal callers (tests, a token-shaped Dynamo/CQL key) ever
+  reached it. `ClientRequest::Txn` is the first wire-facing caller that can
+  hand it an arbitrary client-supplied key — an unvalidated short key would
+  have panicked the whole node process. `ClientCtx::cp_txn` now validates
+  every write's key length up front and returns a clean, client-facing
+  error instead of ever reaching that assert. See `docs/engineering-
+  lessons.md` for the general lesson (a wire-reachable caller of a method
+  with a documented "caller invariant, not a recoverable condition" assert
+  must itself validate that invariant, not trust the assert to protect the
+  process).
+
+### 7. Tests
+
+`animus-cp-data/tests/txn_multi.rs` (`SimEnv`, deterministic): two- and
+three-participant atomic commits (visible on every replica of every
+group); abort cleanup (every staged key reverts, nothing left dangling);
+foreign-intent resolution end to end (`FastRead::Foreign` →
+`txn_status_local` → `resolve_intent_given_status`, the exact round trip
+`animusd` performs over the network); a stage into an already-sealed range
+as a true engine-level no-op (the coordinator can't distinguish it from a
+genuine stage via the propose outcome alone — directly confirmed via
+`local_get`); a participant leader-kill during prepare converging to a
+clean abort with no half-staged intent surviving re-election; and a
+five-seed reproducibility sweep of the two-participant commit shape.
+
+`animusd/tests/cp_txn.rs` (`ProdEnv`, real 3-process cluster + a genuine
+pre-split table): a multi-tablet transaction committing atomically and
+being read back via a different node than it was issued through; the
+**follower-connected regression** — the identical transaction issued from
+**every** node in turn (proving the `TxnPrepare`/`TxnDecide`/`TxnResolve`
+forwarding arms this PR adds to `cp_serve_forwarded` are wired correctly —
+a missing arm here is exactly the bimodal per-process flake the house
+lesson on forwarding-enum additions warns about); several transactions run
+concurrently, each individually atomic; and a violated precondition
+aborting the whole transaction with neither participant's write landing.

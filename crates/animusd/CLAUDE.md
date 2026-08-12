@@ -191,6 +191,69 @@ between pre-check and apply. `cp_get_local`/`cp_scan_local` run the read-side du
 request errors retryably rather than serving a false "absent" (for scans, avoids a
 silent truncation). See the in-crate `split_fence_tests`.
 
+## Multi-participant transactions (ADR 0018 §2/PR4)
+
+`ClientCtx::cp_txn(writes, preconditions) -> Result<HlcTimestamp, String>` is
+the coordinator for a cross-tablet (possibly cross-table) atomic transaction,
+reachable via `ClientRequest::Txn`. It groups `writes`
+(`(table, key, Option<value>)`) by owning tablet; the **first** write's
+tablet is the **anchor** (mints the `TxnId`/record key, via
+`RaftKvNode::txn_stage`), every other tablet is a **participant**
+(`txn_stage_participant`). Prepare runs the anchor first, then every
+participant **concurrently** (`futures::future::join_all`); any participant
+failure aborts the anchor (`txn_decide(.., commit: false)`, bundled
+abort+resolve) and best-effort resolve-aborts every participant that did
+stage. On success, `commit_ts` is the anchor's own `txn_commit_at_least`
+result, floored at the max of every participant's acked stage ts — the
+**single Raft commit on the anchor's record is the atomic commit point**;
+every participant (anchor's own keys included) is then resolved with that
+canonical `commit_ts` **synchronously**, before the call returns (not
+async-post-ack — see the ADR's PR4 amendment for why, and what PR5's
+resolver-task infrastructure will let this become later).
+
+**New internal-only `ClientRequest` variants — `TxnPrepare`/`TxnDecide`/
+`TxnResolve`/`TxnStatus` — are never sent bare**, only wrapped in
+`Forwarded` (the top-level `handle_request` dispatcher rejects a bare one
+with an error); their real handling lives in `cp_serve_forwarded`'s match
+only. Routed by the **actual data key** being staged/resolved (`table` +
+`writes[0]`/`keys[0]`), never `record_key` for `TxnPrepare`/`TxnResolve` —
+a non-anchor participant's `record_key` names the anchor's record, which
+lives in a *different* tablet's (possibly a different table's) keyspace
+entirely (see `RaftKvNode::txn.rs`'s `record_table` doc). `TxnDecide`/
+`TxnStatus` always target the anchor's own tablet, so routing by
+`record_key` there is correct. These are data-plane RPCs, not
+`MetaCommand`s — `is_relayable_command` (control-plane schema-DDL relay
+gating) does not apply to them; grepped and confirmed per the house lesson
+on adding a variant to a forwarded command enum.
+
+**Foreign-intent read resolution** (`ClientCtx::cp_get_local_resolving`,
+used by `cp_read`'s `Local` arm and `cp_serve_forwarded`'s `Get` arm — the
+original `cp_get_local` stays test-only, used by the in-crate
+`split_fence_tests`, which drives a raw `CpGroup` handle with no
+`ClientCtx` around it): tries `RaftKvNode::linearizable_get_served_fast`
+first; on `FastRead::Foreign`, routes a `TxnStatus` query to the intent's
+actual record owner and finishes the read via
+`RaftKvNode::resolve_intent_given_status` once decided, falling back to a
+retryable error while still `Pending` (the caller's own retry loop tries
+again). A locally-`Pending` intent (the single-participant/anchor case)
+still falls back to the bounded internal wait, unchanged from PR3.
+
+**A wire-reachable panic found (and fixed) while testing this**:
+`RaftKvNode::txn_stage`'s anchor-key-length assert (ADR 0022, `TOKEN_BYTES`)
+was a sound "caller invariant" before `ClientRequest::Txn` existed — no
+untrusted caller could reach it with an arbitrary key. `cp_txn` now
+validates every write's key length up front and returns a client-facing
+error instead of ever reaching that assert. See `docs/engineering-
+lessons.md` for the general lesson.
+
+Tests: `tests/cp_txn.rs` (real 3-process cluster + a genuine pre-split
+table) — multi-tablet atomicity, the follower-connected forwarding
+regression (the identical transaction issued from every node in turn),
+concurrent transactions each individually atomic, and a violated
+precondition aborting the whole transaction. The 2PC mechanics themselves
+are proven deterministically at the primitive level in `animus-cp-data`'s
+`tests/txn_multi.rs`.
+
 ## Control-plane access
 
 `ClientCtx.control` is a `ControlHandle`, not a bare `RaftNode`. Reads split by

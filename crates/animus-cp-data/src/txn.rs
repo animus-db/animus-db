@@ -161,6 +161,48 @@ pub(crate) struct TxnRecord {
     pub created_ts: HlcTimestamp,
 }
 
+/// A transaction's **decided** outcome (ADR 0018 §2/PR4) — the `Committed`/
+/// `Aborted` half of [`TxnStatus`], carried explicitly wherever a decision
+/// must travel to a tablet that doesn't (and, for a non-anchor participant,
+/// structurally can't) hold the record itself: [`KvCommand::TxnResolve`]'s
+/// `outcome` field, and the wire reply to a cross-tablet status query. Unlike
+/// `TxnStatus` this crate keeps `pub(crate)`, this is `pub` — a multi-
+/// participant coordinator (`animusd`) constructs/matches it directly.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TxnOutcome {
+    Committed { commit_ts: HlcTimestamp },
+    Aborted,
+}
+
+/// A transaction's status as observed by a caller with **no local record
+/// access** (ADR 0018 §2/PR4) — the public mirror of [`TxnStatus`] a
+/// cross-tablet `TxnStatus` query (or any other external caller) reads back.
+/// `From`/`Into` `TxnStatus` round-trip losslessly; kept as a distinct public
+/// type rather than making `TxnStatus` itself `pub` so this crate's internal
+/// record-storage representation stays free to change independently of the
+/// wire-facing shape.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TxnDecisionStatus {
+    Pending,
+    Committed { commit_ts: HlcTimestamp },
+    Aborted,
+}
+
+impl TxnStatus {
+    /// The public mirror of this status (ADR 0018 §2/PR4) — see
+    /// [`TxnDecisionStatus`]'s doc.
+    #[must_use]
+    pub(crate) fn to_public(&self) -> TxnDecisionStatus {
+        match self {
+            TxnStatus::Pending => TxnDecisionStatus::Pending,
+            TxnStatus::Committed { commit_ts } => TxnDecisionStatus::Committed {
+                commit_ts: *commit_ts,
+            },
+            TxnStatus::Aborted => TxnDecisionStatus::Aborted,
+        }
+    }
+}
+
 /// The 1-byte-tagged value envelope every apply-path write now wraps its
 /// value in — see the module doc.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -174,6 +216,19 @@ pub(crate) enum Envelope {
         /// context, regardless of how many distinct tokens a
         /// single-tablet transaction's writes happen to span.
         record_key: Vec<u8>,
+        /// **ADR 0018 §2/PR4**: the name of the table whose tablet owns
+        /// `record_key`. A record's key alone (`token || [0x00, RECORD_TAG]
+        /// || txn_id`) does **not** identify which table's tablet ring it
+        /// belongs to — tablets are table-scoped (ADR 0022/0023), so two
+        /// different tables' rings can and do assign the identical
+        /// partition token to different rows. A reader on a *different*
+        /// tablet than the anchor's (a non-anchor participant's own read,
+        /// or any reader racing an unresolved intent) has no other way to
+        /// route a cross-tablet status query to the record's actual owner.
+        /// A single-participant transaction (PR3) never needed this since
+        /// the record was always local; carrying it here costs one string
+        /// per intent and closes the routing gap PR4 needs.
+        record_table: String,
         staged_value: Option<Vec<u8>>,
     },
 }
@@ -329,11 +384,13 @@ pub(crate) fn encode_committed(value: &[u8]) -> Vec<u8> {
 pub(crate) fn encode_intent(
     txn_id: &TxnId,
     record_key: &[u8],
+    record_table: &str,
     staged_value: Option<&[u8]>,
 ) -> Vec<u8> {
     let mut out = vec![1];
     put_txn_id(&mut out, txn_id);
     put_bytes(&mut out, record_key);
+    put_bytes(&mut out, record_table.as_bytes());
     put_opt_bytes(&mut out, staged_value);
     out
 }
@@ -363,12 +420,18 @@ pub(crate) fn decode_envelope(bytes: &[u8]) -> Envelope {
             let record_key = c
                 .bytes()
                 .expect("txn: malformed intent envelope (record_key)");
+            let record_table = String::from_utf8(
+                c.bytes()
+                    .expect("txn: malformed intent envelope (record_table)"),
+            )
+            .expect("txn: malformed intent envelope (record_table not utf8)");
             let staged_value = c
                 .opt_bytes()
                 .expect("txn: malformed intent envelope (staged_value)");
             Envelope::Intent {
                 txn_id,
                 record_key,
+                record_table,
                 staged_value,
             }
         }
@@ -522,15 +585,17 @@ mod tests {
         let id = txn(7);
         let record = record_key(&[0; TOKEN_BYTES], &id);
         for staged in [Some(b"v".to_vec()), None] {
-            let bytes = encode_intent(&id, &record, staged.as_deref());
+            let bytes = encode_intent(&id, &record, "orders", staged.as_deref());
             match decode_envelope(&bytes) {
                 Envelope::Intent {
                     txn_id,
                     record_key: rk,
+                    record_table,
                     staged_value,
                 } => {
                     assert_eq!(txn_id, id);
                     assert_eq!(rk, record);
+                    assert_eq!(record_table, "orders");
                     assert_eq!(staged_value, staged);
                 }
                 Envelope::Committed(_) => panic!("expected Intent"),
