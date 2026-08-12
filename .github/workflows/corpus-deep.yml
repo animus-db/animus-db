@@ -15,6 +15,10 @@ on:
         description: "Seeds per structural cell (ANIMUS_CORPUS_SEEDS)"
         required: false
         default: "40"
+      txn_seeds:
+        description: "Seeds per structural cell (ANIMUS_TXN_SEEDS, ADR 0018 multi-tablet txn corpus)"
+        required: false
+        default: "40"
 
 env:
   CARGO_TERM_COLOR: always
@@ -42,3 +46,12 @@ jobs:
           ANIMUS_CORPUS_SEEDS: ${{ github.event.inputs.seeds || '40' }}
           ANIMUS_CORPUS_FULL: "1"
         run: cargo test -p animus-test --test corpus -- --nocapture
+
+      # ADR 0018's multi-tablet cross-transaction corpus: the 2PC protocol
+      # (stage/commit/resolve + the recovery push) under fault injection,
+      # scaled to depth. Each scenario is a pure function of its seed, so a
+      # failure names one scenario + seed and is replayable.
+      - name: deep multi-tablet transaction corpus (ADR 0018 serializability)
+        env:
+          ANIMUS_TXN_SEEDS: ${{ github.event.inputs.txn_seeds || '40' }}
+        run: cargo test -p animus-test --test txn_serializable -- --nocapture
