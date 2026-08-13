@@ -519,22 +519,23 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
         }
         Operation::Scan {
             table,
+            index,
             limit,
             exclusive_start_key,
             filter,
             projection,
-            // Accept-and-ignore, same as `GetItem` above — a base `Scan` is
-            // always linearizable here.
-            consistent_read: _,
+            consistent_read,
         } => {
             run_scan(
                 ctx,
                 meta,
                 &table,
+                index.as_deref(),
                 limit,
                 exclusive_start_key,
                 filter.as_ref(),
                 projection.as_ref(),
+                consistent_read,
             )
             .await
         }
@@ -1491,7 +1492,54 @@ async fn run_lsi_query(
     Ok(wire::query_response(&items))
 }
 
-/// Serve a `Scan` via a **native quorum range scan** ([`DataClient::scan`]) over
+/// A `Scan`: the base table, or (ADR 0041 §5) a secondary index when `index`
+/// is set. `mirror_catalog_schema` is hoisted here (rather than duplicated in
+/// each of the three bodies below) so both the base and index paths see an
+/// up-to-date registry mirror before resolving anything.
+#[allow(clippy::too_many_arguments)] // mirrors `run_query`'s own full decoded shape
+async fn run_scan(
+    ctx: &ClientCtx,
+    meta: &Metadata,
+    table: &str,
+    index: Option<&str>,
+    limit: Option<usize>,
+    exclusive_start_key: Option<Item>,
+    filter: Option<&ConditionExpression>,
+    projection: Option<&Projection>,
+    consistent_read: bool,
+) -> Result<String, WireError> {
+    mirror_catalog_schema(ctx, meta, table);
+    match index {
+        Some(index) => {
+            run_index_scan(
+                ctx,
+                meta,
+                table,
+                index,
+                limit,
+                exclusive_start_key,
+                filter,
+                projection,
+                consistent_read,
+            )
+            .await
+        }
+        None => {
+            run_base_scan(
+                ctx,
+                meta,
+                table,
+                limit,
+                exclusive_start_key,
+                filter,
+                projection,
+            )
+            .await
+        }
+    }
+}
+
+/// Serve a base-table `Scan` via a **native quorum range scan** (`cp_scan`) over
 /// the whole table's data-plane key range `[escape(table), …)` — no in-memory
 /// key tracking. The scan returns live `(key, value)` pairs in key order across a
 /// read quorum (tombstones already excluded by the data plane); the edge decodes
@@ -1501,14 +1549,15 @@ async fn run_lsi_query(
 /// DynamoDB pagination is layered on top: `exclusive_start_key` resolves to the
 /// storage key to scan strictly *after* (so each page's range starts at the
 /// cursor); `limit` caps the **examined** (decoded, live) items and is **pushed
-/// down** to the native scan (fetching windows of the remaining count, continuing
-/// past DynamoDB tombstone values so they never consume a slot) — a small page on
-/// a large table reads ~limit rows, not the whole table. The page boundary always
-/// lands on a live, decodable item; when the page is truncated the
-/// `LastEvaluatedKey` is that boundary item's key attributes. The cursor thus
-/// advances over the **live data-plane keys** the scan returned — not a tracked
-/// set — so it is correct after a restart or on a follower that never saw a write.
-async fn run_scan(
+/// down** to the native scan via [`paginated_table_examine`] (fetching windows of
+/// the remaining count, continuing past DynamoDB tombstone values so they never
+/// consume a slot) — a small page on a large table reads ~limit rows, not the
+/// whole table. The page boundary always lands on a live, decodable item; when
+/// the page is truncated the `LastEvaluatedKey` is that boundary item's key
+/// attributes. The cursor thus advances over the **live data-plane keys** the
+/// scan returned — not a tracked set — so it is correct after a restart or on a
+/// follower that never saw a write.
+async fn run_base_scan(
     ctx: &ClientCtx,
     meta: &Metadata,
     table: &str,
@@ -1517,7 +1566,6 @@ async fn run_scan(
     filter: Option<&ConditionExpression>,
     projection: Option<&Projection>,
 ) -> Result<String, WireError> {
-    mirror_catalog_schema(ctx, meta, table);
     if !table_known(ctx, meta, table) {
         return Err(registry_error(animus_dynamo::RegistryError::NoSuchTable(
             table.to_owned(),
@@ -1535,45 +1583,15 @@ async fn run_scan(
         }
         None => Vec::new(),
     };
-    // The native scan returns live data-plane pairs in key order. A DynamoDB
-    // `DeleteItem` stores a *tombstone value* (a live pair to the data plane), so
-    // decode each and drop the ones that decode to a tombstone — those items are
-    // logically absent and are neither examined nor counted.
-    //
-    // `Limit` is **pushed down** to the native scan (which pushes it per tablet —
-    // `cp_scan` passes each tablet's leader only the remaining count and stops
-    // fanning out once filled), so a `Limit=10` page on a large table ships ~10
-    // rows instead of the whole table, and pagination stays O(page) per page (the
-    // cursor becomes the next page's range start). We fetch `limit + 1` live items
-    // to know whether the page is truncated. A DynamoDB tombstone *value* is live
-    // to the data plane but must not consume a `Limit` slot, so when a fetched
-    // window decodes short (tombstones in range), continue the scan from just past
-    // the last raw key until the window is filled or the range is exhausted —
-    // the page boundary then always lands on a live, decodable item, so its key
-    // attributes are recoverable for `LastEvaluatedKey`.
     let want = limit.map(|n| n.saturating_add(1));
-    let mut examined: Vec<(Vec<u8>, Item)> = Vec::new();
-    let mut cursor = from;
-    loop {
-        let fetch = want.map(|w| w - examined.len());
-        let pairs = native_scan(ctx, table, &cursor, None, fetch).await?;
-        // Fewer raw pairs than asked (or an unbounded fetch) ⇒ the range is done.
-        let exhausted = fetch.is_none_or(|f| pairs.len() < f);
-        let last_raw_key = pairs.last().map(|(k, _)| k.clone());
-        for (key, value) in pairs {
-            if let Some(item) = wire::decode_stored_item(&value)? {
-                examined.push((key, item));
-            }
-        }
-        if exhausted || want.is_some_and(|w| examined.len() >= w) {
-            break;
-        }
-        // Tombstone values consumed part of the window: resume strictly past the
-        // last raw key scanned (keys are unique, so append a 0x00).
-        let mut next = last_raw_key.expect("non-exhausted fetch returned pairs");
-        next.push(0x00);
-        cursor = next;
-    }
+    // A DynamoDB `DeleteItem` stores a *tombstone value* (a live pair to the
+    // data plane, decoding to `None`); `paginated_table_examine` continues past
+    // it without consuming a `Limit` slot.
+    let (mut examined, _exhausted) =
+        paginated_table_examine(ctx, table, from, want, |_key, value| {
+            wire::decode_stored_item(value)
+        })
+        .await?;
     let truncated = limit.is_some_and(|n| examined.len() > n);
     if let Some(n) = limit {
         examined.truncate(n);
@@ -1599,6 +1617,390 @@ async fn run_scan(
         scanned,
         last_evaluated_key.as_ref(),
     ))
+}
+
+/// A secondary-index `Scan` (ADR 0041 §5): dispatches to the GSI or LSI native
+/// scan per the index's replicated **kind**, mirroring [`run_index_query`]'s
+/// identical dispatch (an unknown index is the same `NoSuchIndex`
+/// `ValidationException`). `ConsistentRead: true` against a **global** index
+/// is rejected here too, matching DynamoDB exactly and `run_index_query`'s own
+/// enforcement point — see that function's doc.
+#[allow(clippy::too_many_arguments)] // mirrors `run_index_query`'s own full decoded shape
+async fn run_index_scan(
+    ctx: &ClientCtx,
+    meta: &Metadata,
+    table: &str,
+    index: &str,
+    limit: Option<usize>,
+    exclusive_start_key: Option<Item>,
+    filter: Option<&ConditionExpression>,
+    projection: Option<&Projection>,
+    consistent_read: bool,
+) -> Result<String, WireError> {
+    if !table_known(ctx, meta, table) {
+        return Err(registry_error(animus_dynamo::RegistryError::NoSuchTable(
+            table.to_owned(),
+        )));
+    }
+    let Some(idx) = meta
+        .table_indexes(table)
+        .iter()
+        .find(|d| d.name == index)
+        .cloned()
+    else {
+        return Err(registry_error(animus_dynamo::RegistryError::NoSuchIndex(
+            index.to_owned(),
+        )));
+    };
+    if consistent_read && idx.kind == IndexKind::Global {
+        return Err(WireError::validation(format!(
+            "ConsistentRead is not supported for global secondary index `{index}` \
+             (a GSI is maintained asynchronously; use a base-table or LSI Scan for \
+             a strongly consistent read)"
+        )));
+    }
+    match idx.kind {
+        IndexKind::Global => {
+            run_gsi_scan(
+                ctx,
+                meta,
+                table,
+                &idx,
+                limit,
+                exclusive_start_key,
+                filter,
+                projection,
+            )
+            .await
+        }
+        IndexKind::Local => {
+            run_lsi_scan(
+                ctx,
+                meta,
+                table,
+                &idx,
+                limit,
+                exclusive_start_key,
+                filter,
+                projection,
+            )
+            .await
+        }
+    }
+}
+
+/// A **GSI** `Scan` (ADR 0041 §5): the base-`Scan` machinery
+/// ([`paginated_table_examine`]) reused against the index's own hidden table
+/// (`index_table_name`), fanned across *its* tablets in token order exactly
+/// like [`run_base_scan`] — the only differences are the target table and the
+/// pagination cursor's shape (see [`gsi_key_item_of`]/[`gsi_resume_key`]'s
+/// docs for why a GSI cursor carries both the index's own key and the base
+/// table's key). A hidden table with no tablet yet (nothing has drained) reads
+/// as empty, the same gate [`run_gsi_query`] uses.
+#[allow(clippy::too_many_arguments)] // mirrors `run_gsi_query`'s own full decoded shape
+async fn run_gsi_scan(
+    ctx: &ClientCtx,
+    meta: &Metadata,
+    table: &str,
+    idx: &IndexDef,
+    limit: Option<usize>,
+    exclusive_start_key: Option<Item>,
+    filter: Option<&ConditionExpression>,
+    projection: Option<&Projection>,
+) -> Result<String, WireError> {
+    let index_table = dynamo_index::index_table_name(table, &idx.name);
+    if !meta.has_table_tablet(&index_table) {
+        return Ok(wire::scan_response(&[], 0, None));
+    }
+    let base = schema_for(meta, table);
+    let from = match &exclusive_start_key {
+        Some(key_item) => gsi_resume_key(key_item, &base, idx)?,
+        None => Vec::new(),
+    };
+    let want = limit.map(|n| n.saturating_add(1));
+    // A GSI row is never stored as a DynamoDB tombstone (ADR 0041 §4's
+    // as-built note — the drain prunes with a real engine delete), so `keep`
+    // only needs to guard against a corrupt row, mirroring `run_gsi_query`'s
+    // own "skip rather than fail the whole query" defensiveness.
+    let (mut examined, _exhausted) =
+        paginated_table_examine(ctx, &index_table, from, want, |_key, value| {
+            wire::decode_stored_item(value)
+        })
+        .await?;
+    let truncated = limit.is_some_and(|n| examined.len() > n);
+    if let Some(n) = limit {
+        examined.truncate(n);
+    }
+    let scanned = examined.len();
+    let last_evaluated_key = if truncated {
+        examined
+            .last()
+            .and_then(|(_, item)| gsi_key_item_of(item, &base, idx))
+    } else {
+        None
+    };
+    let mut items = Vec::new();
+    for (_key, item) in &examined {
+        if filter.is_none_or(|f| f.evaluate(Some(item))) {
+            items.push(wire::project(projection, item));
+        }
+    }
+    Ok(wire::scan_response(
+        &items,
+        scanned,
+        last_evaluated_key.as_ref(),
+    ))
+}
+
+/// An **LSI** `Scan` (ADR 0041 §5): a **table-wide** linearizable fan-out over
+/// the base table's `KIND_LSI` scope (`ClientCtx::cp_scan_kind_table`) — unlike
+/// an LSI `Query`, which is scoped to one base partition and hence one tablet,
+/// a table-wide `Scan` sweeps every tablet of `table`'s own ring. One
+/// partition's LSI rows across *every* declared index interleave within that
+/// scope ([`animus_dynamo::index::lsi_index_prefix`]'s layout — sorted by
+/// index name ahead of the alt-sort value), so [`paginated_kind_examine`]'s
+/// `keep` closure filters each raw row to the requested index by its own key
+/// (`parse_lsi_row_key`) — a row of a *different* index is skipped without
+/// consuming a `Limit` slot, exactly like a tombstone in the base scan.
+/// `ConsistentRead: true` is accepted (already true — an LSI row commits
+/// atomically with its base row).
+#[allow(clippy::too_many_arguments)] // mirrors `run_lsi_query`'s own full decoded shape
+async fn run_lsi_scan(
+    ctx: &ClientCtx,
+    meta: &Metadata,
+    table: &str,
+    idx: &IndexDef,
+    limit: Option<usize>,
+    exclusive_start_key: Option<Item>,
+    filter: Option<&ConditionExpression>,
+    projection: Option<&Projection>,
+) -> Result<String, WireError> {
+    if !meta.has_table_tablet(table) {
+        return Ok(wire::scan_response(&[], 0, None));
+    }
+    let base = schema_for(meta, table);
+    let from = match &exclusive_start_key {
+        Some(key_item) => lsi_resume_key(key_item, &base, idx)?,
+        None => Vec::new(),
+    };
+    let want = limit.map(|n| n.saturating_add(1));
+    let idx_name = idx.name.clone();
+    let (mut examined, _exhausted) =
+        paginated_kind_examine(ctx, table, KIND_LSI, from, want, move |key, value| {
+            let within = key.get(TOKEN_BYTES..).unwrap_or(&[]);
+            let Some(parsed) = dynamo_index::parse_lsi_row_key(within) else {
+                return Ok(None); // a malformed key; skip defensively
+            };
+            if parsed.index != idx_name {
+                return Ok(None); // this partition's *other* LSI's row
+            }
+            wire::decode_stored_item(value)
+        })
+        .await?;
+    let truncated = limit.is_some_and(|n| examined.len() > n);
+    if let Some(n) = limit {
+        examined.truncate(n);
+    }
+    let scanned = examined.len();
+    let last_evaluated_key = if truncated {
+        examined
+            .last()
+            .and_then(|(_, item)| lsi_key_item_of(item, &base, idx))
+    } else {
+        None
+    };
+    let mut items = Vec::new();
+    for (_key, item) in &examined {
+        if filter.is_none_or(|f| f.evaluate(Some(item))) {
+            items.push(wire::project(projection, item));
+        }
+    }
+    Ok(wire::scan_response(
+        &items,
+        scanned,
+        last_evaluated_key.as_ref(),
+    ))
+}
+
+/// Fetch up to `want` (`None` = unbounded) *kept* rows starting at `cursor`,
+/// from a plain table-wide native scan (`ClientCtx::cp_scan`, via
+/// [`native_scan`]) — the pagination discipline every base/GSI `Scan` shares:
+/// `limit` is pushed down as the remaining count, and a window that comes up
+/// short because `keep` skipped some of it (a DynamoDB delete tombstone) is
+/// topped up by resuming strictly past the last raw key seen, so a page's
+/// count is never short just because a fetch window happened to land on
+/// skipped rows. Returns the examined `(raw key, decoded item)` pairs and
+/// whether the underlying range is now exhausted.
+async fn paginated_table_examine(
+    ctx: &ClientCtx,
+    table: &str,
+    mut cursor: Vec<u8>,
+    want: Option<usize>,
+    keep: impl Fn(&[u8], &[u8]) -> Result<Option<Item>, WireError>,
+) -> Result<(Vec<(Vec<u8>, Item)>, bool), WireError> {
+    let mut examined: Vec<(Vec<u8>, Item)> = Vec::new();
+    loop {
+        let fetch = want.map(|w| w - examined.len());
+        let pairs = native_scan(ctx, table, &cursor, None, fetch).await?;
+        let exhausted = fetch.is_none_or(|f| pairs.len() < f);
+        let last_raw_key = pairs.last().map(|(k, _)| k.clone());
+        for (key, value) in &pairs {
+            if let Some(item) = keep(key, value)? {
+                examined.push((key.clone(), item));
+            }
+        }
+        if exhausted || want.is_some_and(|w| examined.len() >= w) {
+            return Ok((examined, exhausted));
+        }
+        let mut next = last_raw_key.expect("non-exhausted fetch returned pairs");
+        next.push(0x00);
+        cursor = next;
+    }
+}
+
+/// [`paginated_table_examine`]'s dual over a table-wide **kind-scoped** fan-out
+/// (`ClientCtx::cp_scan_kind_table`) — the LSI `Scan` read primitive. Identical
+/// windowed-continuation discipline, generalized so `run_lsi_scan`'s `keep`
+/// can skip an interleaved *other* index's row without consuming a `Limit`
+/// slot, the same way the table-wide variant skips a tombstone.
+async fn paginated_kind_examine(
+    ctx: &ClientCtx,
+    table: &str,
+    kind: u8,
+    mut cursor: Vec<u8>,
+    want: Option<usize>,
+    keep: impl Fn(&[u8], &[u8]) -> Result<Option<Item>, WireError>,
+) -> Result<(Vec<(Vec<u8>, Item)>, bool), WireError> {
+    let mut examined: Vec<(Vec<u8>, Item)> = Vec::new();
+    loop {
+        let fetch = want.map(|w| w - examined.len());
+        let pairs = ctx
+            .cp_scan_kind_table(table, kind, cursor.clone(), None, fetch)
+            .await
+            .map_err(|e| internal(&e))?;
+        let exhausted = fetch.is_none_or(|f| pairs.len() < f);
+        let last_raw_key = pairs.last().map(|(k, _)| k.clone());
+        for (key, value) in &pairs {
+            if let Some(item) = keep(key, value)? {
+                examined.push((key.clone(), item));
+            }
+        }
+        if exhausted || want.is_some_and(|w| examined.len() >= w) {
+            return Ok((examined, exhausted));
+        }
+        let mut next = last_raw_key.expect("non-exhausted fetch returned pairs");
+        next.push(0x00);
+        cursor = next;
+    }
+}
+
+/// The `LastEvaluatedKey`/`ExclusiveStartKey` shape for a **GSI** scan page
+/// boundary: the index's own hash/sort attributes *and* the base table's key
+/// attributes — real DynamoDB's GSI cursor carries both (a GSI is sparse and
+/// can duplicate an index key across items), and resuming needs the full row
+/// key ([`dynamo_index::gsi_row_key`]), not just the index's own key. Both
+/// attribute sets are always present in the stored item regardless of the
+/// index's declared projection (`projected_item` always keeps the key
+/// attributes), so this never needs a base-table read-back. `None` if `item`
+/// is somehow missing one of them (shouldn't happen for a row this edge
+/// wrote).
+fn gsi_key_item_of(item: &Item, base: &TableSchema, idx: &IndexDef) -> Option<Item> {
+    let mut key = Item::new();
+    key.insert(
+        idx.hash_attribute.clone(),
+        item.get(&idx.hash_attribute)?.clone(),
+    );
+    if let Some(sort) = &idx.sort_attribute {
+        key.insert(sort.clone(), item.get(sort)?.clone());
+    }
+    key.insert(
+        base.partition_key.clone(),
+        item.get(&base.partition_key)?.clone(),
+    );
+    if let Some(sk) = &base.sort_key
+        && let Some(v) = item.get(sk)
+    {
+        key.insert(sk.clone(), v.clone());
+    }
+    Some(key)
+}
+
+/// Invert [`gsi_key_item_of`]: rebuild the raw GSI row key an
+/// `ExclusiveStartKey` names, exactly matching [`dynamo_index::gsi_row_key`]'s
+/// own layout, then advance one byte past it (keys are unique) so the resumed
+/// scan starts strictly after the cursor.
+fn gsi_resume_key(
+    key_item: &Item,
+    base: &TableSchema,
+    idx: &IndexDef,
+) -> Result<Vec<u8>, WireError> {
+    let missing =
+        |attr: &str| WireError::validation(format!("ExclusiveStartKey missing attribute `{attr}`"));
+    let ihash = key_item
+        .get(&idx.hash_attribute)
+        .ok_or_else(|| missing(&idx.hash_attribute))?;
+    let isort = match &idx.sort_attribute {
+        Some(sort) => Some(key_item.get(sort).ok_or_else(|| missing(sort))?),
+        None => None,
+    };
+    let base_pk = key_item
+        .get(&base.partition_key)
+        .ok_or_else(|| missing(&base.partition_key))?;
+    let base_sk = base.sort_key.as_ref().and_then(|sk| key_item.get(sk));
+    let mut after = token_prefixed(
+        ihash,
+        &dynamo_index::gsi_row_key(ihash, isort, base_pk, base_sk),
+    );
+    after.push(0x00);
+    Ok(after)
+}
+
+/// The `LastEvaluatedKey`/`ExclusiveStartKey` shape for an **LSI** scan page
+/// boundary: the index's own alternate-sort attribute *and* the base table's
+/// key attributes (an LSI's hash is always the base partition key, so that
+/// attribute alone would be ambiguous across items). `None` if `idx` is
+/// malformed (no sort attribute — shouldn't occur for a real LSI) or `item`
+/// is missing an expected attribute.
+fn lsi_key_item_of(item: &Item, base: &TableSchema, idx: &IndexDef) -> Option<Item> {
+    let sort_attr = idx.sort_attribute.as_ref()?;
+    let mut key = Item::new();
+    key.insert(sort_attr.clone(), item.get(sort_attr)?.clone());
+    key.insert(
+        base.partition_key.clone(),
+        item.get(&base.partition_key)?.clone(),
+    );
+    if let Some(sk) = &base.sort_key
+        && let Some(v) = item.get(sk)
+    {
+        key.insert(sk.clone(), v.clone());
+    }
+    Some(key)
+}
+
+/// Invert [`lsi_key_item_of`]: rebuild the raw LSI row key an
+/// `ExclusiveStartKey` names, exactly matching [`dynamo_index::lsi_row_key`]'s
+/// own layout, then advance one byte past it.
+fn lsi_resume_key(
+    key_item: &Item,
+    base: &TableSchema,
+    idx: &IndexDef,
+) -> Result<Vec<u8>, WireError> {
+    let missing =
+        |attr: &str| WireError::validation(format!("ExclusiveStartKey missing attribute `{attr}`"));
+    let sort_attr = idx.sort_attribute.as_ref().ok_or_else(|| {
+        WireError::validation(format!("index `{}` has no sort attribute", idx.name))
+    })?;
+    let alt_sort = key_item.get(sort_attr).ok_or_else(|| missing(sort_attr))?;
+    let base_pk = key_item
+        .get(&base.partition_key)
+        .ok_or_else(|| missing(&base.partition_key))?;
+    let base_sk = base.sort_key.as_ref().and_then(|sk| key_item.get(sk));
+    let mut after = token_prefixed(
+        base_pk,
+        &dynamo_index::lsi_row_key(base_pk, &idx.name, alt_sort, base_sk),
+    );
+    after.push(0x00);
+    Ok(after)
 }
 
 /// Build the key-attribute-only [`Item`] (the `LastEvaluatedKey` shape) for a

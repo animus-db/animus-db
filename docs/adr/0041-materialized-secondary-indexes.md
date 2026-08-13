@@ -433,6 +433,80 @@ here.
 > `ConsistentRead: true`), which is why both shipped unnoticed with the read
 > path itself.
 
+> **As-built corrective note (2026-08-13, `Scan` with `IndexName` — the last
+> functional gap in this ADR's scope).** This section's body already says
+> "An index `Query`/`Scan`" throughout, as though both shipped together; in
+> fact only `Query` did with the §5 read-path PR above — a `Scan` against a
+> secondary index returned `ValidationException: unsupported operation` (no
+> `IndexName` decode existed at all) until now. `Operation::Scan` gained an
+> `index: Option<String>` (decoded from `IndexName`, `animus-dynamo::wire`);
+> `animusd::dynamo::run_scan` dispatches exactly like `run_query` — base table
+> when absent, else `run_gsi_scan`/`run_lsi_scan` by the index's replicated
+> kind, with the identical `ConsistentRead`-against-a-GSI rejection.
+>
+> **The pagination cursor, decided explicitly rather than left implicit**: a
+> GSI `Scan`'s `LastEvaluatedKey`/`ExclusiveStartKey` is `{index hash attr,
+> index sort attr?, base pk, base sk?}` — real DynamoDB's own GSI cursor
+> shape — because the hidden table's engine key is `escape(ihash) ||
+> escape(isort)? || escape(base_pk) || base_sk` (§3's `gsi_row_key`), not the
+> base table's key, so resuming needs the *whole* row key, not just the
+> index's own half of it. An LSI `Scan`'s cursor is `{alt-sort attr, base pk,
+> base sk?}` for the parallel reason. Both attribute sets are always present
+> in a stored index row regardless of its declared projection (`ALL`/
+> `KEYS_ONLY`/`INCLUDE` all keep the key attributes — §2's `projected_item`),
+> so building either cursor never needs a base-table read-back. This is a
+> genuinely different shape from a base `Scan`'s cursor (`{pk, sk?}`) — an
+> index `Scan`'s `LastEvaluatedKey` is *not* interchangeable with a base
+> `Scan`'s, by design, matching DynamoDB itself.
+>
+> **A GSI `Scan` reuses the base `Scan`'s own pagination machinery
+> unmodified** (`animusd::dynamo::paginated_table_examine`, factored out of
+> the base path's loop) — fanning across the hidden table's *own* tablets via
+> the ordinary `cp_scan`, no new CP primitive. **An LSI `Scan` needed one**:
+> unlike an LSI `Query` (scoped to one base partition, hence one tablet by
+> construction), a `Scan` must sweep the *whole* base table's ring, so
+> `ClientCtx::cp_scan_kind_table` is `cp_scan`'s per-table fan-out generalized
+> to a kind scope — identical range math, one `KindScan` per overlapping
+> tablet instead of one base `Scan` request per tablet.
+>
+> **`end: None` (unbounded above) on a kind-scoped scan is new, and it is a
+> real primitive change, not a convenience.** §3 already establishes that no
+> discriminator rides inside a kind-scoped logical key, so a scan of it was
+> always going to need *some* upper bound; before this, every caller
+> (an LSI `Query`, the GSI drain's own `pending_changes`) supplied one that
+> was always finite by construction. A table-wide LSI `Scan`'s fan-out has no
+> such luxury for its tail tablet: no finite byte string can bound an LSI
+> row's keyspace in general, because its trailing base-sort-key segment has
+> no length limit (the same reason `StorageScope::physical_bounds` exists at
+> all for the *base* scope, §4a's `local_scan`/`linearizable_scan`). The fix
+> mirrors that existing precedent exactly rather than inventing a new one:
+> `RaftKvNode::local_scan_kind`/`linearizable_scan_kind` changed from a
+> mandatory `end: &[u8]` to `end: Option<&[u8]>`, deriving the bound from
+> **the kind scope's own** `physical_bounds()` when the caller has none to
+> give — never from the caller, and never a whole-engine `entries()` scan, so
+> it stays confined to this one scope of this one tablet exactly as before.
+>
+> **Filtering an interleaved-but-foreign row without spending a `Limit`
+> slot.** §3 places every LSI's rows in one shared `KIND_LSI` scope per
+> partition, sorted by index name ahead of the alt-sort value
+> (`lsi_index_prefix`) — fine for a `Query`, which already narrows to one
+> index's own sub-prefix, but a table-wide `Scan`'s per-tablet fetch window
+> necessarily crosses every index sharing that space. `run_lsi_scan` filters
+> each raw row to the requested index by its own key (`parse_lsi_row_key`)
+> and, on a miss, skips it **without counting it toward `Limit`** — the exact
+> windowed-continuation discipline the base `Scan` already uses to skip a
+> DynamoDB delete tombstone, generalized (`paginated_kind_examine`, the kind-
+> scoped twin of the base path's `paginated_table_examine`) rather than
+> reimplemented.
+>
+> `ConsistentRead: true` against a GSI `Scan` is rejected exactly like a GSI
+> `Query`; against an LSI `Scan` (and the base table's own) it is accepted,
+> also exactly like `Query`. Regression: `animus-dynamo`'s `wire` unit tests
+> (decode) and `animusd/tests/dynamo_index_scan.rs` (end to end — pagination
+> draining every row, the `ConsistentRead` matrix, an LSI `Scan`'s
+> no-cross-index-leakage issued through every node of the cluster in turn,
+> and a `FilterExpression` over LSI-scanned rows).
+
 Adding or dropping an index on a **populated** table (`UpdateTable`, with an
 `IndexStatus` lifecycle and a backfill) is **deferred to a follow-up**; indexes
 remain declarable at `CreateTable` time, as today. The backfill is the drain

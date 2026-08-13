@@ -308,10 +308,19 @@ pub enum Operation {
         /// that rejects it, once `index` names a global index.
         consistent_read: bool,
     },
-    /// `Scan`: a full-table read with pagination and an optional filter.
+    /// `Scan`: a full-table read with pagination and an optional filter — or,
+    /// when `index` is set, the identical pagination/filter contract over a
+    /// secondary index's own rows instead of the base table (ADR 0041 §5): a
+    /// GSI scans its own hidden table's rows, an LSI scans the base table's
+    /// `KIND_LSI` scope filtered to that one index. Unlike `Query`, an index
+    /// `Scan` has no `KeyConditionExpression`/partition-equality narrowing —
+    /// DynamoDB's own contract, since a `Scan` never takes a key condition on
+    /// the base table either.
     Scan {
         /// Target table name.
         table: String,
+        /// The secondary index to scan, if any (else the base table).
+        index: Option<String>,
         /// Max items to return this page (`None` = all remaining).
         limit: Option<usize>,
         /// The exclusive start key (pagination cursor) from a previous page.
@@ -320,9 +329,11 @@ pub enum Operation {
         filter: Option<ConditionExpression>,
         /// Optional projection (the attributes to return; `None` = all).
         projection: Option<Projection>,
-        /// Decoded but **accept-and-ignore** (ADR 0041 §5) — a base-table
-        /// `Scan` is always linearizable here, so `ConsistentRead: true` is
-        /// already true and needs no enforcement.
+        /// `ConsistentRead` (default `false`). Decoded but **accept-and-
+        /// ignore** for the base table or an LSI (both linearizable here
+        /// already); an error against a **GSI** — the `animusd` edge is the
+        /// one place that rejects it, mirroring `Query`'s identical
+        /// enforcement point (ADR 0041 §5).
         consistent_read: bool,
     },
     /// `UpdateItem`: read-modify-write the item at `key`, applying `actions`
@@ -1224,9 +1235,16 @@ fn decode_consistent_read(obj: &Map<String, Value>) -> bool {
 
 /// Decode a `Scan` body: an optional `Limit`, an optional `ExclusiveStartKey`
 /// (the AttributeValue-map cursor from a previous page's `LastEvaluatedKey`),
-/// and an optional `FilterExpression` (the `ConditionExpression` predicate set).
+/// an optional `FilterExpression` (the `ConditionExpression` predicate set),
+/// and an optional `IndexName` (ADR 0041 §5 — scans a secondary index's own
+/// rows instead of the base table; no `KeyConditionExpression` here, unlike
+/// `Query` — DynamoDB's `Scan` never takes one, index or not).
 fn decode_scan(obj: &Map<String, Value>) -> Result<Operation, WireError> {
     let table = table_name(obj)?;
+    let index = obj
+        .get("IndexName")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
     let limit = match obj.get("Limit") {
         None | Some(Value::Null) => None,
         Some(v) => Some(
@@ -1248,6 +1266,7 @@ fn decode_scan(obj: &Map<String, Value>) -> Result<Operation, WireError> {
     let consistent_read = decode_consistent_read(obj);
     Ok(Operation::Scan {
         table,
+        index,
         limit,
         exclusive_start_key,
         filter,
@@ -2482,6 +2501,7 @@ mod tests {
         match decode_request("DynamoDB_20120810.Scan", body).unwrap() {
             Operation::Scan {
                 table,
+                index,
                 limit,
                 exclusive_start_key,
                 filter,
@@ -2489,6 +2509,7 @@ mod tests {
                 consistent_read,
             } => {
                 assert_eq!(table, "t");
+                assert_eq!(index, None);
                 assert_eq!(limit, Some(2));
                 assert_eq!(exclusive_start_key.unwrap().get("id"), Some(&s("k5")));
                 assert_eq!(
@@ -2497,6 +2518,21 @@ mod tests {
                 );
                 assert_eq!(projection, None);
                 assert!(!consistent_read, "default is false");
+            }
+            other => panic!("expected Scan, got {other:?}"),
+        }
+    }
+
+    /// `Scan` decodes an `IndexName` (ADR 0041 §5), same as `Query` — and
+    /// omitting it leaves `index` `None` (already covered above by
+    /// `decodes_scan_with_limit_and_filter`).
+    #[test]
+    fn decodes_scan_against_an_index() {
+        let body = br#"{"TableName":"t","IndexName":"by-email","Limit":5}"#;
+        match decode_request("DynamoDB_20120810.Scan", body).unwrap() {
+            Operation::Scan { table, index, .. } => {
+                assert_eq!(table, "t");
+                assert_eq!(index.as_deref(), Some("by-email"));
             }
             other => panic!("expected Scan, got {other:?}"),
         }

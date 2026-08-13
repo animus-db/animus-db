@@ -151,7 +151,7 @@ async fn bare_kind_scan_is_refused() {
         table: "events".to_owned(),
         kind: KIND_LSI,
         start: Vec::new(),
-        end: vec![0xFF],
+        end: Some(vec![0xFF]),
     };
     animusd::write_frame(&mut stream, &request)
         .await

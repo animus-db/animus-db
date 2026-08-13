@@ -219,17 +219,30 @@ Three modules:
   DynamoDB Streams will read (ADR 0041 §4a) and could even differ across
   replicas.
   **`local_get_kind(kind, key)` / `local_scan_kind(kind, start, end)`** are the
-  read side — an LSI `Query`, and the GSI drain's sweep of change records
-  (whose keys are HLC-suffixed, so key order *is* commit order). Deliberately
-  simpler than `local_get`/`local_scan`: a non-base scope only ever holds
-  **committed** values, because only `KindBatch` writes those scopes and
-  `TxnStage` stages intents solely on client-named (base-kind) keys — so there
-  is no intent to resolve, and a non-committed envelope reads as *absent*
-  rather than being silently unwrapped. `local_scan_kind` is bounded on both
-  ends on purpose: every caller scans one partition's contiguous sub-range, and
-  an unbounded form would make an accidental full-tablet read easy to write. An
-  unknown kind reads absent / scans empty rather than aliasing onto a real
-  scope.
+  read side — an LSI `Query`/`Scan`, and the GSI drain's sweep of change
+  records (whose keys are HLC-suffixed, so key order *is* commit order).
+  Deliberately simpler than `local_get`/`local_scan`: a non-base scope only
+  ever holds **committed** values, because only `KindBatch` writes those
+  scopes and `TxnStage` stages intents solely on client-named (base-kind)
+  keys — so there is no intent to resolve, and a non-committed envelope reads
+  as *absent* rather than being silently unwrapped. An unknown kind reads
+  absent / scans empty rather than aliasing onto a real scope.
+  **`end: Option<&[u8]>` (ADR 0041 §5, 2026-08-13)** — originally bounded on
+  both ends unconditionally ("every caller scans one partition's contiguous
+  sub-range"), until the LSI `Scan` read path (`animusd`'s
+  `cp_scan_kind_table`) needed a genuinely unbounded-above kind-scoped scan
+  for a table-wide fan-out's tail tablet. `end == None` now mirrors
+  `local_scan`/`linearizable_scan`'s identical handling for the base scope:
+  the bound is derived from **this kind scope's own** `physical_bounds()`
+  (never the caller's), because no finite byte string can bound an LSI row's
+  keyspace in general (a trailing base-sort-key segment has no length
+  limit) — the same reason `pending_changes` (the GSI drain's own
+  whole-`KIND_CHANGE`-scope sweep) derives its own bound
+  rather than accepting one. This does not reopen "an unbounded form would
+  make an accidental full-tablet read easy to write": the bound still comes
+  from the kind scope's own prefix, never `entries()`, so it can only ever
+  read this one scope, on this one tablet, of however many kinds and tablets
+  share the node's engine.
 - **Fenced commands** (ADR 0026) — `put_fenced`/`delete_fenced`/`cas_fenced`/
   `put_batch_fenced` (and unfenced siblings using `KeyRange::whole()`) carry a
   `fence: KeyRange` *inside the proposed command*, stamped by the leader at

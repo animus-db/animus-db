@@ -168,8 +168,16 @@ sibling — the LSI `Query` read primitive: unlike `cp_scan`'s per-table
 fan-out, `start`/`end` must resolve to the *same* tablet (an LSI query is
 scoped to one base partition, hence one tablet, checked rather than assumed),
 served locally via `RaftKvNode::linearizable_scan_kind` or forwarded via the
-new internal-only `ClientRequest::KindScan` (refused bare, exactly like
-`KindWrite`; handled only inside `cp_serve_forwarded`).
+internal-only `ClientRequest::KindScan` (refused bare, exactly like
+`KindWrite`; handled only inside `cp_serve_forwarded`). **`cp_scan_kind_table`
+(ADR 0041 §5, 2026-08-13)** is its table-wide fan-out sibling — the LSI
+`Scan` read primitive — mirroring `cp_scan`'s per-table tablet fan-out
+exactly, but issuing a kind-scoped `cp_scan_kind_one`/`KindScan` per
+overlapping tablet instead of a base one; `end: None` (unbounded above) is
+now legal on `KindScan` too, resolved inside `RaftKvNode::
+linearizable_scan_kind` itself for the one tablet whose own range is
+open-ended, never computed by the caller (see `dynamo.rs`'s DynamoDB-wire
+edge entry above for why no finite byte string could do that job here).
 
 **`cp_write`/`cp_delete` do NOT auto-provision a table's first tablet** —
 unlike most of their write-side siblings (`cp_put`, `cp_kind_write`,
@@ -723,7 +731,86 @@ route below the edge through the same `ClientCtx` CP primitives.
   those branches). The decode has no way to know an index's kind (that lives
   in the replicated catalog, not the wire), so `Operation::Query` always
   carries the field through undecided; only `animusd` — with `Metadata` in
-  hand — makes the accept/reject call. Surface also covers
+  hand — makes the accept/reject call.
+
+  **`Scan` with `IndexName` (ADR 0041 §5, 2026-08-13, closing the last
+  functional gap in the stack).** `Operation::Scan` gained an `index: Option<
+  String>` decoded from `IndexName` (`animus-dynamo`), and `dynamo.rs::run_scan`
+  dispatches exactly like `run_query`: base table when absent, else
+  `run_index_scan` → `run_gsi_scan`/`run_lsi_scan` by the index's replicated
+  kind, with the identical `ConsistentRead`-against-a-GSI rejection
+  (`run_index_scan`, mirroring `run_index_query`'s enforcement point).
+  - **GSI `Scan`** reuses the base-`Scan` pagination discipline
+    (`paginated_table_examine`, factored out of `run_base_scan`'s own loop) but
+    scans the index's own hidden table directly, fanned across *its* tablets
+    in token order by the ordinary `cp_scan`/`native_scan` — no new CP
+    primitive needed, since a GSI's hidden table is an ordinary table. The
+    pagination cursor is **not** the base `Query`'s `{pk, sk}` shape: a GSI
+    cursor is `{index hash attr, index sort attr?, base pk, base sk?}`
+    (`gsi_key_item_of`/`gsi_resume_key`) — real DynamoDB's own GSI cursor
+    shape, needed because the hidden table's *engine key* is
+    `escape(ihash)||escape(isort)?||escape(base_pk)||base_sk`
+    (`dynamo_index::gsi_row_key`), not the base table's key, so resuming
+    needs the full row key, not just the index's own. Both attribute sets
+    are always present in the stored row regardless of the index's declared
+    projection (`projected_item` always keeps the key attributes), so no
+    base-table read-back is needed to build the cursor either. A hidden
+    table with no tablet yet reads as empty, the same gate `run_gsi_query`
+    uses.
+  - **LSI `Scan`** is genuinely new machinery: a table-wide, linearizable fan-
+    out over the base table's `KIND_LSI` scope, since (unlike an LSI `Query`,
+    scoped to one partition/tablet) a `Scan` must sweep every tablet of the
+    table's own ring. `ClientCtx::cp_scan_kind_table` is `cp_scan`'s
+    kind-scoped sibling — same per-tablet range math, but calling
+    `cp_scan_kind_one`/`ClientRequest::KindScan` per overlapping tablet
+    instead of the base `Scan` request. **`end: None` (unbounded above) now
+    means something new for a kind-scoped scan**: `RaftKvNode::
+    local_scan_kind`/`linearizable_scan_kind` (`animus-cp-data`) changed from
+    `end: &[u8]` (mandatory) to `end: Option<&[u8]>`, mirroring
+    `local_scan`/`linearizable_scan`'s identical unbounded-above handling for
+    the base scope — deriving the bound from the kind scope's *own* physical
+    prefix (`StorageScope::physical_bounds`) when the caller has none to
+    give. This was necessary, not a convenience: no finite byte string can
+    bound an LSI row's keyspace in general (a trailing base-sort-key segment
+    has no length limit), so the tail tablet of a table-wide fan-out
+    genuinely cannot be bounded by anything the `animusd` caller could
+    construct itself — the same reason `RaftKvNode::pending_changes` derives
+    its own bound internally rather than taking one. One partition's rows
+    across *every* declared LSI interleave within `KIND_LSI`
+    (`lsi_index_prefix`'s layout — sorted by index name ahead of the alt-sort
+    value), so `run_lsi_scan`'s `keep` closure (via the kind-scoped pagination
+    twin `paginated_kind_examine`) filters each raw row to the requested
+    index by its own key (`parse_lsi_row_key`) — a different index's row is
+    skipped **without consuming a `Limit` slot**, the exact same
+    windowed-continuation trick the base `Scan` already uses to skip a
+    DynamoDB delete tombstone. The LSI cursor shape is `{alt-sort attr, base
+    pk, base sk?}` (`lsi_key_item_of`/`lsi_resume_key`). `ConsistentRead:
+    true` is accepted (already true — an LSI row commits atomically with its
+    base row).
+  - **Deliberate simplification, not yet closed**: `cp_scan_kind_table`
+    doesn't push a `limit` down into a single tablet's own kind-scan call
+    (`linearizable_scan_kind` has no limit parameter at all — every existing
+    caller fetches a whole bounded range) — it fetches one tablet's *entire*
+    matching sub-range, then truncates the fan-out's accumulated result. Fine
+    at the scale every test here exercises; a very LSI-heavy single tablet
+    would need a `limit` parameter added to the `animus-cp-data` primitive
+    itself to bound that one tablet's own read cost precisely, the way base
+    `Scan`'s `cp_scan`/`native_scan` already do.
+
+  Regression (wire decode): `animus-dynamo`'s `wire` unit tests
+  (`decodes_scan_against_an_index`). Regression (end to end):
+  `tests/dynamo_index_scan.rs` — GSI `Scan` pagination draining every row
+  across `LastEvaluatedKey` pages (converged-or-timeout first, since the
+  drain is async), `ConsistentRead: true` rejection against a GSI `Scan`
+  (and acceptance against the base table's/an LSI's), an LSI `Scan` returning
+  exactly the requested index's rows with no cross-index/cross-partition
+  leakage — issued through **every** node of the cluster in turn (the
+  `kind_scan.rs` forwarding-regression pattern, exercising
+  `cp_scan_kind_table`'s forwarded `KindScan` per tablet), and a
+  `FilterExpression` over LSI-scanned rows (both unpaginated and walked
+  across pages).
+
+  Surface also covers
   `UpdateItem`/`BatchWriteItem` (condition-gated, per-request/per-tablet
   atomicity only) and, since ADR 0018 §2/PR7, **atomic** `TransactWriteItems`
   (whole-or-nothing across however many tablets/tables it spans, via
@@ -1357,6 +1444,16 @@ Test-file map (`tests/`):
   LSI `Query`, its base `Query`, and a base `GetItem` are all accepted
   (accept-and-ignore, since every one of those reads is already
   linearizable here).
+- `dynamo_index_scan.rs` (ADR 0041 §5) — `Scan` with `IndexName` end to end,
+  the last functional gap in the secondary-index stack: a GSI `Scan`'s
+  `LastEvaluatedKey` pagination walk drains every row exactly once
+  (converged-or-timeout first); `ConsistentRead: true` rejected against a GSI
+  `Scan` and accepted against the base table's/an LSI's; an LSI `Scan`
+  returns exactly the requested index's rows with no leakage from a sibling
+  LSI's interleaved rows or duplication across partitions, issued through
+  every node of the cluster in turn (proving `cp_scan_kind_table`'s forwarded
+  `KindScan` path per tablet); a `FilterExpression` over LSI-scanned rows,
+  unpaginated and walked across pages.
 - `dynamo_txn.rs` (ADR 0018 §2/PR7) — atomic `TransactWriteItems`/
   `TransactGetItems` over a genuine multi-process, pre-split-table cluster:
   cross-tablet atomic visibility through a follower-connected client, a

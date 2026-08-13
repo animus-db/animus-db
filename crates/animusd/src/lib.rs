@@ -220,13 +220,13 @@ impl CpGroup {
     }
 
     /// Linearizable ReadIndex range scan of a non-base row-kind scope (ADR
-    /// 0041 §3) — the LSI `Query` read primitive. See
-    /// [`RaftKvNode::linearizable_scan_kind`].
+    /// 0041 §3) — the LSI `Query`/`Scan` read primitive. `end: None` is
+    /// unbounded above. See [`RaftKvNode::linearizable_scan_kind`].
     async fn linearizable_scan_kind(
         &self,
         kind: u8,
         start: &[u8],
-        end: &[u8],
+        end: Option<&[u8]>,
     ) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
         match self {
             CpGroup::Lsm(n) => n.linearizable_scan_kind(kind, start, end).await,
@@ -941,11 +941,12 @@ pub enum ClientRequest {
     /// **Internal index-read RPC — never sent bare, only wrapped in
     /// [`Forwarded`](Self::Forwarded)** (ADR 0041 §5): a **linearizable**
     /// range scan of one of `table`'s non-base row-kind scopes over
-    /// `[start, end)` — the forwarding payload behind an LSI `Query`
-    /// (`KIND_LSI`). Unlike [`Scan`](Self::Scan), `start`/`end` must resolve
-    /// to the **same tablet** (an LSI query is scoped to one base partition,
-    /// which is one tablet by construction), so this is never a per-table
-    /// fan-out.
+    /// `[start, end)` — the per-tablet forwarding payload behind both an LSI
+    /// `Query` (single-tablet, `ClientCtx::cp_scan_kind`) and an LSI `Scan`'s
+    /// table-wide fan-out (`ClientCtx::cp_scan_kind_table`, one `KindScan`
+    /// per overlapping tablet). `end: None` is unbounded above — the tail
+    /// tablet of a table-wide fan-out, mirroring [`Scan`](Self::Scan)'s own
+    /// `end: None` unbounded-above convention.
     ///
     /// Bare delivery is rejected for the same reason [`KindWrite`](Self::KindWrite)
     /// is: this reads a scope a client operation never names directly, and
@@ -956,7 +957,8 @@ pub enum ClientRequest {
         table: String,
         kind: u8,
         start: Vec<u8>,
-        end: Vec<u8>,
+        #[serde(default)]
+        end: Option<Vec<u8>>,
     },
     /// Read the latest value at `key` of `table` (linearizable CP ReadIndex on the
     /// group leader). `table` is **required** (ADR 0023).
@@ -5506,11 +5508,90 @@ impl ClientCtx {
                  an LSI query is scoped to one partition"
             ));
         }
+        self.cp_scan_kind_one(table, kind, start, Some(end)).await
+    }
+
+    /// A **table-wide fan-out** of the kind-scoped scan (ADR 0041 §5) — the
+    /// LSI `Scan` read primitive. Unlike [`cp_scan_kind`](Self::cp_scan_kind)'s
+    /// single-tablet routing (an LSI `Query` is scoped to one base partition,
+    /// hence one tablet by construction), a table-wide `Scan` against an LSI
+    /// sweeps every tablet of `table`'s own ring in token order — mirroring
+    /// [`cp_scan`](Self::cp_scan)'s per-table fan-out exactly, but scanning
+    /// each overlapping tablet's `kind`-scoped scope instead of its base
+    /// scope. `end == None` is unbounded above (a whole-table scan); the one
+    /// tablet whose *own* metadata range end is also `None` (an unsplit or
+    /// not-yet-split tail tablet) is asked to scan `[sub_start, None)` too —
+    /// no finite byte string can bound a kind scope's logical keyspace in
+    /// general (see [`RaftKvNode::linearizable_scan_kind`]'s doc), so that
+    /// bound is derived inside the primitive itself, not computed here.
+    pub(crate) async fn cp_scan_kind_table(
+        &self,
+        table: &str,
+        kind: u8,
+        start: Vec<u8>,
+        end: Option<Vec<u8>>,
+        limit: Option<usize>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
+        // The table's tablets overlapping [start, end), in token order — the
+        // identical range math `cp_scan` uses (see that method's doc for the
+        // `effective_metadata()` staleness-audit rationale, which applies
+        // here unchanged).
+        let mut ranges: Vec<KeyRange> = self
+            .effective_metadata()
+            .tablets_for_table(table)
+            .map(|(_, t)| t.range.clone())
+            .filter(|r| {
+                end.as_deref().is_none_or(|e| r.start.as_slice() < e)
+                    && r.end.as_deref().is_none_or(|re| start.as_slice() < re)
+            })
+            .collect();
+        ranges.sort();
+        let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for r in ranges {
+            if let Some(l) = limit
+                && out.len() >= l
+            {
+                break;
+            }
+            let sub_start = start.clone().max(r.start);
+            let sub_end: Option<Vec<u8>> = match (r.end, &end) {
+                (None, e) => e.clone(),
+                (Some(re), None) => Some(re),
+                (Some(re), Some(e)) => Some(re.min(e.clone())),
+            };
+            if let Some(se) = &sub_end
+                && sub_start.as_slice() >= se.as_slice()
+            {
+                continue;
+            }
+            out.extend(
+                self.cp_scan_kind_one(table, kind, sub_start, sub_end)
+                    .await?,
+            );
+        }
+        if let Some(l) = limit {
+            out.truncate(l);
+        }
+        Ok(out)
+    }
+
+    /// Scan a single tablet's kind-scoped sub-range on its group leader (the
+    /// body both [`cp_scan_kind`](Self::cp_scan_kind) and
+    /// [`cp_scan_kind_table`](Self::cp_scan_kind_table) call). `start`
+    /// resolves to exactly one tablet of `table`, so it routes/forwards like
+    /// any other CP op. `end == None` is unbounded above.
+    async fn cp_scan_kind_one(
+        &self,
+        table: &str,
+        kind: u8,
+        start: Vec<u8>,
+        end: Option<Vec<u8>>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
         let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
         loop {
             let err = match self.cp_route(table, &start).await {
                 CpRoute::Local(leader) => {
-                    match Self::cp_scan_kind_local(&leader, kind, &start, &end).await {
+                    match Self::cp_scan_kind_local(&leader, kind, &start, end.as_deref()).await {
                         Ok(p) => return Ok(p),
                         Err(e) => e,
                     }
@@ -5546,14 +5627,14 @@ impl ClientCtx {
     /// kind-scan dual of [`cp_scan_local`](Self::cp_scan_local): a scope that
     /// has not yet caught up to the metadata-derived request window (a
     /// merge's widen in flight) would otherwise silently truncate the results
-    /// rather than error.
+    /// rather than error. `end == None` is unbounded above.
     async fn cp_scan_kind_local(
         leader: &CpGroup,
         kind: u8,
         start: &[u8],
-        end: &[u8],
+        end: Option<&[u8]>,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
-        let requested = KeyRange::new(start.to_vec(), Some(end.to_vec()));
+        let requested = KeyRange::new(start.to_vec(), end.map(<[u8]>::to_vec));
         if !leader.scope_range().contains_range(&requested) {
             return Err(format!(
                 "scan window {requested:?} outside tablet's current range (stale routing, likely a split/merge crossover); retry"
@@ -6146,7 +6227,7 @@ impl ClientCtx {
                 let Some(leader) = tablet.and_then(|t| self.edge.cp_leader(t)) else {
                     return self.not_leader_refusal(tablet);
                 };
-                match Self::cp_scan_kind_local(&leader, kind, &start, &end).await {
+                match Self::cp_scan_kind_local(&leader, kind, &start, end.as_deref()).await {
                     Ok(p) => ClientResponse::Pairs(p),
                     Err(e) => ClientResponse::Error(e),
                 }

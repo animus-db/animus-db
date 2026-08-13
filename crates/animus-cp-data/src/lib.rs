@@ -2973,30 +2973,55 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// Scan a **non-base row-kind scope** (ADR 0041 §3) over `[start, end)`,
     /// in key order, returning committed values only.
     ///
-    /// The read primitive behind an LSI `Query` (the `KIND_LSI` scope) and the
-    /// GSI drain's sweep of pending change records (`KIND_CHANGE`, whose keys
-    /// are HLC-suffixed, so key order *is* commit order). Bounded on both ends:
-    /// unlike [`local_scan`](Self::local_scan) there is no unbounded-above
-    /// form, because every caller here scans one partition's contiguous
-    /// sub-range and an accidental whole-scope scan would be a silent
-    /// full-tablet read.
+    /// The read primitive behind an LSI `Query`/`Scan` (the `KIND_LSI`
+    /// scope) and the GSI drain's sweep of pending change records
+    /// (`KIND_CHANGE`, whose keys are HLC-suffixed, so key order *is* commit
+    /// order). `end == None` is **unbounded above** — scan to the end of
+    /// this scope's own keyspace — mirroring
+    /// [`local_scan`](Self::local_scan)'s identical unbounded-above handling
+    /// for the base scope: a table-wide LSI `Scan`'s tail tablet has no
+    /// finite byte string that could bound it in general (an LSI row's
+    /// trailing base-sort-key segment has no length limit), so the bound is
+    /// derived internally from this kind scope's own physical prefix
+    /// (`StorageScope::physical_bounds`) rather than trusted to a caller.
     ///
     /// An unknown `kind` scans as empty.
     pub async fn local_scan_kind(
         &self,
         kind: u8,
         start: &[u8],
-        end: &[u8],
+        end: Option<&[u8]>,
     ) -> Vec<(Vec<u8>, Vec<u8>)> {
         let Some(scope) = self.kind_scopes.get(kind as usize) else {
             return Vec::new();
         };
-        self.storage
-            .scan(&scope.physical(start), &scope.physical(end))
-            .await
-            .ok()
-            .into_iter()
-            .flatten()
+        let raw: Vec<(Vec<u8>, animus_storage::VersionedValue)> = match end {
+            Some(e) => self
+                .storage
+                .scan(&scope.physical(start), &scope.physical(e))
+                .await
+                .ok()
+                .into_iter()
+                .flatten()
+                .collect(),
+            None => match scope.physical_bounds().1 {
+                Some(physical_end) => self
+                    .storage
+                    .scan(&scope.physical(start), &physical_end)
+                    .await
+                    .ok()
+                    .into_iter()
+                    .flatten()
+                    .collect(),
+                // Only `StorageScope::whole()` (no real prefix) — not a real
+                // tablet's kind scope, which always has a non-`0xFF`-ending
+                // prefix (the scope selector byte itself) and so always
+                // yields a finite `physical_bounds` upper bound. Mirrors
+                // `pending_changes`'s identical fallback.
+                None => Vec::new(),
+            },
+        };
+        raw.into_iter()
             .filter_map(|(k, vv)| {
                 let logical = scope.strip_in_range(&k)?.to_vec();
                 match txn::decode_envelope(&vv.value) {
@@ -3010,24 +3035,22 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// A **linearizable** range scan of a non-base row-kind scope (ADR 0041
     /// §3) via ReadIndex — the read-barrier dual of
     /// [`local_scan_kind`](Self::local_scan_kind), and the read primitive
-    /// behind an LSI `Query` (the `KIND_LSI` scope). Same barrier + ceiling
-    /// drive as [`linearizable_scan`](Self::linearizable_scan): only the
-    /// confirmed leader serves it, so a deposed leader returns `None` rather
-    /// than a stale/partial range.
+    /// behind an LSI `Query`/`Scan` (the `KIND_LSI` scope). Same barrier +
+    /// ceiling drive as [`linearizable_scan`](Self::linearizable_scan): only
+    /// the confirmed leader serves it, so a deposed leader returns `None`
+    /// rather than a stale/partial range. `end == None` is unbounded above —
+    /// see [`local_scan_kind`](Self::local_scan_kind)'s doc.
     ///
     /// A non-base scope only ever holds **committed** values (see
     /// [`local_scan_kind`](Self::local_scan_kind)'s doc — only
     /// [`KvCommand::KindBatch`] writes them, and it always commits outright),
     /// so there is no intent to resolve here, unlike
     /// [`linearizable_scan`](Self::linearizable_scan)'s base-scope reads.
-    /// Bounded on both ends, like `local_scan_kind` — every caller scans one
-    /// partition's contiguous sub-range, and an unbounded form would make an
-    /// accidental full-tablet read easy to write.
     pub async fn linearizable_scan_kind(
         &self,
         kind: u8,
         start: &[u8],
-        end: &[u8],
+        end: Option<&[u8]>,
     ) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
         if !self.read_barrier().await {
             return None;
@@ -3042,7 +3065,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         // pushed above this read regardless of how many rows it returned.
         self.ts_cache.lock().expect("ts cache poisoned").bump(
             start.to_vec(),
-            Some(end.to_vec()),
+            end.map(<[u8]>::to_vec),
             ts,
         );
         Some(rows)

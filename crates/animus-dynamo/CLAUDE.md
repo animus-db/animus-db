@@ -119,7 +119,12 @@ adapter wedge. The transport (HTTP, sockets) and the distributed routing live in
   decodes `GlobalSecondaryIndexes` (hash-only or composite) + `LocalSecondaryIndexes`,
   each with an optional `Projection` (`ALL`/`KEYS_ONLY`/`INCLUDE`), `Query` an
   optional `IndexName` + a sort condition (allowed on a composite GSI / LSI),
-  `Scan` a `Limit`/`ExclusiveStartKey`/`FilterExpression`, GetItem/Query/Scan an
+  `Scan` a `Limit`/`ExclusiveStartKey`/`FilterExpression` and, since ADR 0041
+  §5 (2026-08-13), its own optional `IndexName` (`Operation::Scan.index`,
+  `decode_scan`) — unlike `Query`, no sort condition, since a DynamoDB `Scan`
+  never takes a `KeyConditionExpression`, index or not (the GSI-vs-LSI
+  kind-dispatch and `ConsistentRead` enforcement live at the `animusd` edge,
+  same as `Query`'s own `IndexName`), GetItem/Query/Scan an
   optional `ProjectionExpression`/`AttributesToGet`, Put/DeleteItem an optional
   `ReturnValues`, plus the existing `ConditionExpression` on writes and
   `KeyConditionExpression` on Query; `GetItem`/`Query`/`Scan` all decode an
@@ -190,6 +195,24 @@ adapter wedge. The transport (HTTP, sockets) and the distributed routing live in
   a prefix bumps the last byte to `0x01`) lives at the `animusd` edge.
   `Table::query_with` is the *local-engine* equivalent (a real engine scan),
   used by the item-API tests.
+  **`Scan` with `IndexName` (ADR 0041 §5, 2026-08-13) reuses the same two
+  scans**, just table-wide instead of one hash value: a GSI `Scan` fans across
+  the hidden table's *own* tablets (an ordinary `cp_scan`, nothing new); an
+  LSI `Scan` needed a genuinely new primitive, since an LSI `Query` is
+  scoped to one partition/tablet by construction but a `Scan` must sweep the
+  base table's *whole* ring — `ClientCtx::cp_scan_kind_table`, `cp_scan`'s
+  kind-scoped fan-out sibling. One partition's rows across every declared
+  LSI interleave within `KIND_LSI` (sorted by index name ahead of the
+  alt-sort value — `index::lsi_index_prefix`'s doc), so an LSI `Scan` filters
+  each raw row to the requested index by its own key
+  (`parse_lsi_row_key`), skipping a foreign index's row without consuming a
+  `Limit` slot — the exact same windowed-continuation trick a base `Scan`
+  already uses to skip a DynamoDB delete tombstone. `Scan` has no sort
+  condition at all (index or not — DynamoDB's own contract), so there is no
+  `Equals`-narrowing analogue here; `FilterExpression`/pagination otherwise
+  work identically to a base `Scan`, with an index-appropriate
+  `LastEvaluatedKey` cursor shape (see `animusd/CLAUDE.md`'s DynamoDB wire
+  entry for exactly what that shape is and why).
 - **Secondary indexes** (any number per table, GSI + LSI) are materialized
   **replicated data-plane rows** (ADR 0041), not anything this crate's
   registry tracks. An LSI row is written atomically with the base row
@@ -303,10 +326,13 @@ partition not interleaving, footprint round-trip + sort-invariance under
 out-of-order insertion, change-record round-trip + event naming, and
 `peel_escaped` rejecting malformed segments), and `wire` unit tests for
 `ConsistentRead` decode (ADR 0041 §5, 2026-08-13 fix: `true` decodes on
-`GetItem`/`Query`/`Scan` alike, and it defaults to `false` when omitted).
-The rejection itself (`true` against a GSI `Query` only) is
+`GetItem`/`Query`/`Scan` alike, and it defaults to `false` when omitted) and
+`Scan`'s own `IndexName` decode (`decodes_scan_against_an_index`, ADR 0041
+§5, 2026-08-13 — with and without, mirroring `Query`'s identical coverage).
+The rejection itself (`true` against a GSI `Query`/`Scan` only) is
 `animusd`-only — this crate never sees the replicated catalog needed to know
-an index's kind — and is end-to-end tested in `tests/dynamo_consistent_read.rs`.
+an index's kind — and is end-to-end tested in `tests/dynamo_consistent_read.rs`
+(`Query`) and `tests/dynamo_index_scan.rs` (`Scan`).
 The wire protocol is exercised end-to-end over real HTTP in
 `animusd`'s `tests/dynamo_wire.rs` (Put/Get/Delete), `tests/dynamo_extended.rs`
 (CreateTable/Query/conditional writes), `tests/dynamo_indexes.rs` (Scan with
@@ -321,7 +347,13 @@ longer depend on any in-memory written-key tracking), `tests/dynamo_gsi_drain.rs
 (ADR 0041 §4/§5 — the drain materializing + pruning a GSI's hidden-table rows,
 then a real `Query` against it), `tests/kind_scan.rs` (ADR 0041 §5 — the LSI
 `Query` native read path forwarding correctly through a non-leader node, and a
-bare `KindScan`'s refusal), and `tests/dynamo_txn.rs`
+bare `KindScan`'s refusal), `tests/dynamo_index_scan.rs` (ADR 0041 §5,
+2026-08-13 — `Scan` with `IndexName`: a GSI `Scan`'s `LastEvaluatedKey`
+pagination draining every row exactly once, `ConsistentRead` rejection/
+acceptance parity with `Query`, an LSI `Scan` returning only the requested
+index's rows with no cross-index/cross-partition leakage issued through
+every node in turn, and a `FilterExpression` over LSI-scanned rows), and
+`tests/dynamo_txn.rs`
 (ADR 0018 §2/PR7 — atomic `TransactWriteItems`/`TransactGetItems` over a
 genuine multi-process, pre-split-table cluster: cross-tablet atomic
 visibility through a follower-connected client, a failing `ConditionCheck`

@@ -372,7 +372,8 @@ fn kind_scoped_reads_see_their_own_scope_and_no_other() {
     // A scan is ordered, confined to its scope, and honours its bounds.
     let mut end = logical(b"alice", b"\x01");
     *end.last_mut().unwrap() += 1;
-    let rows = block_on(nodes[l].local_scan_kind(KIND_LSI, &logical(b"alice", b"\x01"), &end));
+    let rows =
+        block_on(nodes[l].local_scan_kind(KIND_LSI, &logical(b"alice", b"\x01"), Some(&end)));
     assert_eq!(
         rows,
         vec![
@@ -381,11 +382,11 @@ fn kind_scoped_reads_see_their_own_scope_and_no_other() {
         ]
     );
     assert!(
-        block_on(nodes[l].local_scan_kind(KIND_CHANGE, &logical(b"alice", b"\x01"), &end))
+        block_on(nodes[l].local_scan_kind(KIND_CHANGE, &logical(b"alice", b"\x01"), Some(&end)))
             .is_empty()
     );
 
     // An unknown kind is inert rather than aliasing onto a real scope.
     assert_eq!(block_on(nodes[l].local_get_kind(200, &base)), None);
-    assert!(block_on(nodes[l].local_scan_kind(200, &base, &end)).is_empty());
+    assert!(block_on(nodes[l].local_scan_kind(200, &base, Some(&end))).is_empty());
 }
