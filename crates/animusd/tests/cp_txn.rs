@@ -163,6 +163,7 @@ async fn coordinator_crash_between_prepare_and_decide_recovers_to_commit() {
             anchor: None,
             writes: vec![(lower_key.clone(), Some(b"lower-recovered".to_vec()))],
             conditions: Vec::new(),
+            participant_spans: Vec::new(),
         },
     )
     .await;
@@ -176,6 +177,7 @@ async fn coordinator_crash_between_prepare_and_decide_recovers_to_commit() {
             anchor: Some((txn_id.clone(), record_key.clone(), record_table.clone())),
             writes: vec![(upper_key.clone(), Some(b"upper-recovered".to_vec()))],
             conditions: Vec::new(),
+            participant_spans: Vec::new(),
         },
     )
     .await;
@@ -252,6 +254,7 @@ async fn commit_already_applied_but_unresolved_converges_via_reads() {
             anchor: None,
             writes: vec![(lower_key.clone(), Some(b"lower-done".to_vec()))],
             conditions: Vec::new(),
+            participant_spans: Vec::new(),
         },
     )
     .await;
@@ -262,6 +265,7 @@ async fn commit_already_applied_but_unresolved_converges_via_reads() {
             anchor: Some((txn_id.clone(), record_key.clone(), record_table.clone())),
             writes: vec![(upper_key.clone(), Some(b"upper-done".to_vec()))],
             conditions: Vec::new(),
+            participant_spans: Vec::new(),
         },
     )
     .await;

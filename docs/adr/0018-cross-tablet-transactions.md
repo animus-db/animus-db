@@ -1221,6 +1221,56 @@ the caller-supplied cross-participant spans and merges them with the
 anchor's own. This is an internal wire/record-format change only (`codec.rs`
 `VERSION` bumped 8 → 9); no back-compat concern per house convention.
 
+**Corrective note (2026-08-12, task #18): the paragraph above describes what
+the *primitive* (`RaftKvNode::txn_stage_anchor`) correctly supports — it does
+not describe what `ClientCtx::cp_txn` actually did.** As shipped by this PR
+(and unchanged through every subsequent PR up to and including PR7), `cp_txn`
+never called `txn_stage_anchor` with a real cross-participant list at all —
+its anchor-stage call site went through `RaftKvNode::txn_stage` (equivalently,
+`txn_stage_anchor` with an **empty** participant list), so every production
+multi-participant transaction's `intent_spans` named only the anchor's own
+keys, never any other participant's. `animus-cp-data`'s own tests
+(`tests/txn_recovery.rs`, and `animus-test/tests/txn_serializable.rs`) never
+caught this because they call `txn_stage_anchor` directly with a hand-built
+participant list — they exercise the primitive, not `cp_txn`'s wiring of it.
+
+**Why this was a real, exploitable atomicity violation, not merely an
+observability gap**: §3's recovery decides `all_staged` by verifying only the
+spans the record actually lists (`ClientCtx::txn_recover`'s `for (table, span)
+in &view.intent_spans` loop). A transaction whose coordinator staged the
+anchor and then died **before ever attempting a participant's own stage**
+was, to recovery, indistinguishable from a single-participant transaction
+that staged completely — `all_staged` came back `true` trivially (the
+too-short list's one entry genuinely had staged), so recovery **committed**
+a transaction whose participant write never happened anywhere. One half of
+an intended atomic write became durably visible while the other half
+silently never landed, and nothing ever revisited the decision. Confirmed
+live: a wire-level test driving the exact `TxnPrepare` bytes the unfixed
+`cp_txn` sent in this scenario reliably reproduced a wrongly-`Committed`
+record and a visible anchor-key value within ~7s (well under
+`RECOVERY_GRACE` + margin) — the two existing PR5 coordinator-crash
+regressions (`animusd/tests/cp_txn.rs`) never exercised this failure mode
+because both always staged *every* participant genuinely before letting
+recovery run, so the verification loop's incompleteness — checking a list
+that was silently too short — was never actually reached against a case
+where it would have mattered.
+
+**The fix**: `cp_txn` now computes the participant `(table, span)` list from
+the same `groups` map it already builds for staging (everything left in
+`groups` after the anchor's own entry is removed *is* every other
+participant) and threads it through `txn_prepare`/`txn_prepare_pushing` into
+the anchor's stage call — locally via `CpGroup::txn_stage` (now calling
+`txn_stage_anchor` directly instead of the single-participant `txn_stage`
+convenience), or over the wire via a new
+`ClientRequest::TxnPrepare::participant_spans` field (`#[serde(default)]`,
+internal-only, no back-compat concern). Regression:
+`animusd/tests/txn_recovery_participant_spans.rs`'s
+`anchor_only_stage_with_a_declared_but_unstaged_participant_recovers_to_abort`
+— the anchor stages with the (now correctly populated) participant span
+included, the participant is deliberately never staged, and recovery is
+confirmed to decide `Aborted`, never letting the anchor's key become
+visible.
+
 ### 2b. A gap the `intent_spans` review caught: orphan records and the resurrection guard
 
 Review of §2's fix surfaced an adjacent corner it did not by itself close:

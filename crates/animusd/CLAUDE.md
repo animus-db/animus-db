@@ -211,7 +211,23 @@ tablet is the **anchor** (mints the `TxnId`/record key, via
 `RaftKvNode::txn_stage_anchor` — passed every *other* participant's
 `(table, span)` list up front, ADR 0018 §2/PR5, so the record's own
 `intent_spans` names every participant, not just the anchor's own writes),
-every other tablet is a **participant** (`txn_stage_participant`). Prepare
+every other tablet is a **participant** (`txn_stage_participant`).
+
+**This is now genuinely true — it was not, from PR5 through PR7 (task #18,
+2026-08-12 fix)**: `cp_txn`'s anchor-stage call site actually went through
+`RaftKvNode::txn_stage` (an empty participant list) the whole time, so
+`intent_spans` only ever named the anchor's own keys in production. That was
+a real recovery-path atomicity violation, not just an observability gap —
+see ADR 0018's corrective note on its own §2 for the full mechanism, the
+confirming wire-level test, and why the existing PR5 coordinator-crash
+regressions never caught it. `cp_txn` now computes the full participant
+`(table, span)` list from its own `groups` map (populated right after
+removing the anchor's own entry) and threads it through `txn_prepare`/
+`txn_prepare_pushing` — `CpGroup::txn_stage` calls `txn_stage_anchor`
+directly now, and `ClientRequest::TxnPrepare` gained a `participant_spans`
+field for the forwarded case.
+
+Prepare
 runs the anchor first, then every participant **concurrently**
 (`futures::future::join_all`) — both through `ClientCtx::
 txn_prepare_pushing` (ADR 0018 §2/PR6, task #16), not `txn_prepare`
@@ -367,6 +383,15 @@ ordinary reads with no grace wait needed at all). The 2PC mechanics
 themselves, and PR5's recovery/decision-semantics fix, are proven
 deterministically at the primitive level in `animus-cp-data`'s
 `tests/txn_multi.rs`/`tests/txn_recovery.rs`.
+
+`tests/txn_recovery_participant_spans.rs` (task #18, 2026-08-12) is the
+regression for the `participant_spans` wiring fix above: stages the anchor
+with the participant's span correctly declared (matching what the fixed
+coordinator now sends), never stages the participant at all, and confirms
+`/admin/txns`'s `intent_spans` names both keys and that recovery decides
+`Aborted` — the anchor's own key must never become visible. See ADR 0018's
+corrective note for the full mechanism and the confirming pre-fix failing
+run.
 
 ## Control-plane access
 
