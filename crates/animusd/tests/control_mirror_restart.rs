@@ -44,9 +44,39 @@ async fn call(addr: SocketAddr, req: ClientRequest) -> ClientResponse {
         .expect("a reply")
 }
 
+/// `count` distinct free ephemeral addresses, allocated **simultaneously**.
+///
+/// Holding every listener until they are all bound is load-bearing twice over.
+/// It guarantees the addresses are *distinct* — allocating them one at a time
+/// releases each port before probing the next, so the OS is free to hand the
+/// same port back and a node would then be configured with (say) `internal ==
+/// client`. And it releases them in one instant rather than five, shrinking the
+/// documented port-TOCTOU window (see `support::free_addrs`, and the retry in
+/// [`start`] that rides out the rest of it).
+fn free_addrs(count: usize) -> Vec<SocketAddr> {
+    let listeners: Vec<std::net::TcpListener> = (0..count)
+        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+        .collect();
+    listeners.iter().map(|l| l.local_addr().unwrap()).collect()
+    // listeners dropped here, freeing the ports for the caller to bind.
+}
+
 fn free_addr() -> SocketAddr {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    l.local_addr().unwrap()
+    free_addrs(1)[0]
+}
+
+/// The five addresses a node's roles bind, allocated as one distinct set.
+fn role_addrs(id: NodeId) -> animusd::RoleAddrs {
+    let a = free_addrs(5);
+    animusd::RoleAddrs {
+        id,
+        role: animusd::config::NodeRole::Control,
+        internal: a[0],
+        client: a[1],
+        dynamo: a[2],
+        cql: a[3],
+        admin: a[4],
+    }
 }
 
 async fn await_leader(node: &Node) {
@@ -67,9 +97,27 @@ async fn await_leader(node: &Node) {
 /// mirror engine attached over the durable `LsmEngine` backend.
 async fn start(addrs: animusd::RoleAddrs, dir: &std::path::Path) -> Node {
     let config = animusd::ClusterConfig { nodes: vec![addrs] };
-    animusd::run_node_control(&config, 0, dir, animusd::StorageBackend::Lsm)
-        .await
-        .expect("control-only node starts")
+    // Bounded rebind retry against the documented port-TOCTOU: another test
+    // binary's `free_addrs` probe can hold a just-freed port for microseconds,
+    // and this test cannot re-allocate around a thief — both call sites are
+    // pinned to the addresses captured up front, because *rebinding the same
+    // addresses is what the restart half is testing*. Same shape and reasoning
+    // as `support::restart_same_addrs`; this file predates that helper and
+    // carries its own control-only bring-up, which is how it missed the
+    // mitigation. A genuinely occupied port still fails at the deadline.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        match animusd::run_node_control(&config, 0, dir, animusd::StorageBackend::Lsm).await {
+            Ok(node) => return node,
+            Err(e) => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "control-only node did not start/rebind within 30s: {e}"
+                );
+                sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
 }
 
 fn upsert(node: NodeId, status: NodeStatus) -> MetaCommand {
@@ -130,15 +178,7 @@ async fn read_mirror_from_disk(dir: &std::path::Path) -> animus_control::Metadat
 async fn control_only_mirror_engine_survives_a_real_process_restart() {
     let dir = TempDir::new().unwrap();
     let node_dir = dir.path().join("node-0");
-    let addrs = animusd::RoleAddrs {
-        id: nid(0),
-        role: animusd::config::NodeRole::Control,
-        internal: free_addr(),
-        client: free_addr(),
-        dynamo: free_addr(),
-        cql: free_addr(),
-        admin: free_addr(),
-    };
+    let addrs = role_addrs(nid(0));
 
     // --- First incarnation: propose a few commands, then shut down cleanly. ---
     let node = start(addrs.clone(), &node_dir).await;
@@ -214,15 +254,7 @@ async fn control_only_mirror_engine_survives_a_real_process_restart() {
 async fn control_only_schema_and_tablet_map_survive_a_hard_restart() {
     let dir = TempDir::new().unwrap();
     let node_dir = dir.path().join("node-0");
-    let addrs = animusd::RoleAddrs {
-        id: nid(0),
-        role: animusd::config::NodeRole::Control,
-        internal: free_addr(),
-        client: free_addr(),
-        dynamo: free_addr(),
-        cql: free_addr(),
-        admin: free_addr(),
-    };
+    let addrs = role_addrs(nid(0));
 
     let table = "ctl_meta_t";
     let tablet = TabletId(4242);
