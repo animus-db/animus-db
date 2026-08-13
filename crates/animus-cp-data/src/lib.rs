@@ -456,6 +456,19 @@ pub enum KvCommand {
     KindBatch {
         /// `(row kind, logical key, value)` — `None` writes a tombstone.
         writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
+        /// An optional **change-log record** to append in the same entry:
+        /// `(key prefix, encoded record)`.
+        ///
+        /// Its key is completed at **apply** as `prefix || hlc::pack(ts)`, using
+        /// this entry's own commit timestamp, and it lands in the
+        /// [`KIND_CHANGE`] scope. The proposer deliberately cannot supply that
+        /// suffix: `ts` is minted inside `propose_ordered` and is the only
+        /// timestamp that agrees with the entry's commit order, so letting an
+        /// edge guess it would silently break the ordering the log exists to
+        /// provide (ADR 0041 §4a — DynamoDB Streams reads these in commit
+        /// order). Making it structural also means the record can never be
+        /// keyed inconsistently across replicas.
+        change_log: Option<(Vec<u8>, Vec<u8>)>,
         fence: KeyRange,
         ts: HlcTimestamp,
     },
@@ -1644,8 +1657,12 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// Stamps `fence = KeyRange::whole()`; use
     /// [`put_kind_batch_fenced`](Self::put_kind_batch_fenced) to stamp a
     /// narrower one.
-    pub fn put_kind_batch(&self, writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>) -> ProposeResult {
-        self.put_kind_batch_fenced(writes, KeyRange::whole())
+    pub fn put_kind_batch(
+        &self,
+        writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
+        change_log: Option<(Vec<u8>, Vec<u8>)>,
+    ) -> ProposeResult {
+        self.put_kind_batch_fenced(writes, change_log, KeyRange::whole())
     }
 
     /// As [`put_kind_batch`](Self::put_kind_batch), but the leader stamps its
@@ -1656,12 +1673,18 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     pub fn put_kind_batch_fenced(
         &self,
         writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
+        change_log: Option<(Vec<u8>, Vec<u8>)>,
         fence: KeyRange,
     ) -> ProposeResult {
         self.propose_ordered(|| {
             let keys: Vec<&[u8]> = writes.iter().map(|(_, k, _)| k.as_slice()).collect();
             let ts = self.mint_pushed(&keys);
-            KvCommand::KindBatch { writes, fence, ts }
+            KvCommand::KindBatch {
+                writes,
+                change_log,
+                fence,
+                ts,
+            }
         })
     }
 
@@ -4004,7 +4027,12 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                     }
                 }
             }
-            KvCommand::KindBatch { writes, fence, ts } => {
+            KvCommand::KindBatch {
+                writes,
+                change_log,
+                fence,
+                ts,
+            } => {
                 assert_ts_monotonic(max_applied_ts, ts);
                 // Gated as one unit, exactly like `Batch` — an index write that
                 // half-applied would leave an LSI row describing a base row
@@ -4035,6 +4063,19 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                             )),
                             None => pending.push(MergeOp::tombstone(physical, hlc::pack(ts))),
                         }
+                    }
+                    // The change-log record's key is completed here, with THIS
+                    // entry's commit timestamp — the only one that agrees with
+                    // the entry's position in the log, and so the only one that
+                    // makes the log readable in commit order (ADR 0041 §4a).
+                    if let Some((prefix, record)) = &change_log {
+                        let mut key = prefix.clone();
+                        key.extend_from_slice(&hlc::pack(ts).to_be_bytes());
+                        pending.push(MergeOp::put(
+                            kind_scopes[KIND_CHANGE as usize].physical(&key),
+                            txn::encode_committed(record),
+                            hlc::pack(ts),
+                        ));
                     }
                 }
             }

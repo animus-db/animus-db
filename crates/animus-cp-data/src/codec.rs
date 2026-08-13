@@ -338,13 +338,26 @@ fn put_command(out: &mut Vec<u8>, c: &KvCommand) {
             put_key_range(out, fence);
             put_ts(out, *ts);
         }
-        KvCommand::KindBatch { writes, fence, ts } => {
+        KvCommand::KindBatch {
+            writes,
+            change_log,
+            fence,
+            ts,
+        } => {
             put_u8(out, 12);
             out.extend_from_slice(&(writes.len() as u32).to_be_bytes());
             for (kind, k, v) in writes {
                 put_u8(out, *kind);
                 put_bytes(out, k);
                 put_opt_bytes(out, v);
+            }
+            match change_log {
+                None => put_u8(out, 0),
+                Some((prefix, record)) => {
+                    put_u8(out, 1);
+                    put_bytes(out, prefix);
+                    put_bytes(out, record);
+                }
             }
             put_key_range(out, fence);
             put_ts(out, *ts);
@@ -481,8 +494,14 @@ fn read_command(c: &mut Cursor<'_>) -> Result<KvCommand, DecodeError> {
             for _ in 0..n {
                 writes.push((c.u8()?, c.bytes()?, c.opt_bytes()?));
             }
+            let change_log = match c.u8()? {
+                0 => None,
+                1 => Some((c.bytes()?, c.bytes()?)),
+                other => return Err(format!("invalid change_log tag {other}")),
+            };
             KvCommand::KindBatch {
                 writes,
+                change_log,
                 fence: read_key_range(c)?,
                 ts: read_ts(c)?,
             }

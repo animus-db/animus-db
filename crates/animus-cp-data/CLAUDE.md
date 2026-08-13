@@ -210,6 +210,14 @@ Three modules:
   scope, never part of the key. One `fence` gates the **whole** entry (every
   kind shares the tablet's single range); a write naming an unknown kind is
   skipped with a warning rather than mis-filed into another kind's keyspace.
+  The optional **`change_log: Option<(prefix, record)>`** rides the same entry:
+  its key is completed at **apply** as `prefix || hlc::pack(ts)` in the
+  `KIND_CHANGE` scope, from *this entry's own* commit timestamp. The proposer
+  deliberately cannot supply that suffix — `ts` is minted inside
+  `propose_ordered`, and it is the only timestamp that agrees with the entry's
+  position in the log, so an edge-chosen one would silently mis-order the log
+  DynamoDB Streams will read (ADR 0041 §4a) and could even differ across
+  replicas.
 - **Fenced commands** (ADR 0026) — `put_fenced`/`delete_fenced`/`cas_fenced`/
   `put_batch_fenced` (and unfenced siblings using `KeyRange::whole()`) carry a
   `fence: KeyRange` *inside the proposed command*, stamped by the leader at
@@ -1088,7 +1096,10 @@ API (which always mints a *fresh* id) cannot express.
   stale one, and an out-of-fence key blocks the **whole** entry. That last test
   asserts its own setup (`fence.contains(base)` yet `!fence.contains(lsi)`)
   because the obvious fence — `KeyRange::new(k, Some(k))` — is *empty* under
-  half-open semantics, which would make "nothing applied" prove nothing.
+  half-open semantics, which would make "nothing applied" prove nothing. A
+  fourth test pins the change-log contract: two writes leave **two** records
+  under one prefix (a collapsing marker would leave one), in commit order, each
+  suffixed by a strictly-increasing packed 8-byte HLC.
 - `narrow_scope.rs` — `narrow_scope` makes a group's `StorageScope` range
   live-narrowable (the split-source shape, so `engine_image` stops shipping the
   handed-off portion); `narrow_then_erase_scope_spares_a_co_hosted_siblings_

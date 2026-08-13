@@ -96,12 +96,15 @@ fn one_entry_writes_every_kind_into_its_own_scope() {
 
     assert!(
         matches!(
-            nodes[l].put_kind_batch(vec![
-                (KIND_BASE, base.clone(), Some(b"item".to_vec())),
-                (KIND_LSI, lsi.clone(), Some(b"lsi-row".to_vec())),
-                (KIND_CHANGE, change.clone(), Some(b"change".to_vec())),
-                (KIND_FOOTPRINT, footprint.clone(), Some(b"fp".to_vec())),
-            ]),
+            nodes[l].put_kind_batch(
+                vec![
+                    (KIND_BASE, base.clone(), Some(b"item".to_vec())),
+                    (KIND_LSI, lsi.clone(), Some(b"lsi-row".to_vec())),
+                    (KIND_CHANGE, change.clone(), Some(b"change".to_vec())),
+                    (KIND_FOOTPRINT, footprint.clone(), Some(b"fp".to_vec())),
+                ],
+                None
+            ),
             ProposeResult::Accepted { .. }
         ),
         "leader {l} rejected the kind batch (seed={seed})"
@@ -165,10 +168,13 @@ fn one_entry_adds_a_new_index_row_and_removes_the_stale_one() {
     let new_row = logical(b"alice", b"\x01age31");
 
     assert!(matches!(
-        nodes[l].put_kind_batch(vec![
-            (KIND_BASE, base.clone(), Some(b"age=30".to_vec())),
-            (KIND_LSI, old_row.clone(), Some(b"row".to_vec())),
-        ]),
+        nodes[l].put_kind_batch(
+            vec![
+                (KIND_BASE, base.clone(), Some(b"age=30".to_vec())),
+                (KIND_LSI, old_row.clone(), Some(b"row".to_vec())),
+            ],
+            None
+        ),
         ProposeResult::Accepted { .. }
     ));
     sim.run_for(Duration::from_secs(2));
@@ -177,11 +183,14 @@ fn one_entry_adds_a_new_index_row_and_removes_the_stale_one() {
     // The overwrite: new base value, new index row, stale index row tombstoned —
     // all in one entry, so no replica can ever observe the pair disagreeing.
     assert!(matches!(
-        nodes[l].put_kind_batch(vec![
-            (KIND_BASE, base.clone(), Some(b"age=31".to_vec())),
-            (KIND_LSI, old_row.clone(), None),
-            (KIND_LSI, new_row.clone(), Some(b"row".to_vec())),
-        ]),
+        nodes[l].put_kind_batch(
+            vec![
+                (KIND_BASE, base.clone(), Some(b"age=31".to_vec())),
+                (KIND_LSI, old_row.clone(), None),
+                (KIND_LSI, new_row.clone(), Some(b"row".to_vec())),
+            ],
+            None
+        ),
         ProposeResult::Accepted { .. }
     ));
     sim.run_for(Duration::from_secs(2));
@@ -237,6 +246,7 @@ fn an_out_of_fence_key_blocks_the_whole_entry() {
                 (KIND_BASE, inside.clone(), Some(b"item".to_vec())),
                 (KIND_LSI, lsi.clone(), Some(b"lsi-row".to_vec())),
             ],
+            None,
             fence,
         ),
         ProposeResult::Accepted { .. }
@@ -258,4 +268,68 @@ fn an_out_of_fence_key_blocks_the_whole_entry() {
             "node {i} applied the out-of-fence half (seed={seed})"
         );
     }
+}
+
+#[test]
+fn the_change_log_key_is_the_entrys_own_commit_timestamp() {
+    // The proposer supplies only a key *prefix*; apply completes it with this
+    // entry's commit `ts`. That is what makes the log readable in commit order
+    // (ADR 0041 §4a) — an edge cannot know the ts, since it is minted inside
+    // `propose_ordered`, so letting it guess would silently mis-order the log.
+    let seed = 0x0041_0004;
+    let (mut sim, nodes) = group(seed);
+    sim.run_for(Duration::from_secs(2));
+    let l = leader(&nodes, seed);
+
+    let base = logical(b"alice", b"");
+    let prefix = logical(b"alice", b"");
+
+    for (i, v) in [b"v1".to_vec(), b"v2".to_vec()].into_iter().enumerate() {
+        assert!(
+            matches!(
+                nodes[l].put_kind_batch(
+                    vec![(KIND_BASE, base.clone(), Some(v.clone()))],
+                    Some((prefix.clone(), format!("rec{i}").into_bytes())),
+                ),
+                ProposeResult::Accepted { .. }
+            ),
+            "write {i} rejected (seed={seed})"
+        );
+        sim.run_for(Duration::from_secs(1));
+    }
+
+    // Two writes ⇒ two distinct, non-colliding log records under one prefix
+    // (a single collapsing marker would have left one), in commit order.
+    let scope_start = nodes[l].physical_key(KIND_CHANGE, &prefix);
+    let mut scope_end = scope_start.clone();
+    *scope_end.last_mut().unwrap() += 1;
+    let rows = block_on(nodes[l].storage().scan(&scope_start, &scope_end)).expect("scan ok");
+    let values: Vec<Vec<u8>> = rows
+        .iter()
+        .map(|(_, vv)| {
+            assert_eq!(vv.value.first().copied(), Some(0u8), "committed envelope");
+            vv.value[1..].to_vec()
+        })
+        .collect();
+    assert_eq!(
+        values,
+        vec![b"rec0".to_vec(), b"rec1".to_vec()],
+        "the log must be non-collapsing and in commit order (seed={seed})"
+    );
+
+    // And each record's key really is the prefix plus that write's commit ts,
+    // so the suffix is strictly increasing rather than an edge-chosen value.
+    let suffixes: Vec<Vec<u8>> = rows
+        .iter()
+        .map(|(k, _)| k[scope_start.len()..].to_vec())
+        .collect();
+    assert_eq!(suffixes.len(), 2);
+    assert!(
+        suffixes[0] < suffixes[1],
+        "commit timestamps must increase (seed={seed})"
+    );
+    assert!(
+        suffixes.iter().all(|s| s.len() == 8),
+        "each suffix is a packed 8-byte HLC (seed={seed})"
+    );
 }
