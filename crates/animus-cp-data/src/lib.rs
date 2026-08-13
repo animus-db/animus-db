@@ -3007,6 +3007,44 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             .collect()
     }
 
+    /// Every pending change-log record this tablet holds, in **commit order**
+    /// (ADR 0041 §4): `(record key, encoded record)`.
+    ///
+    /// A whole-`KIND_CHANGE`-scope sweep, bounded by this tablet's own scope
+    /// (`physical_bounds`, never `entries()` — a node's tablets share one
+    /// engine, so a whole-engine scan would read every co-resident tablet's
+    /// data too). Deliberately a named, purpose-built method rather than an
+    /// unbounded variant of [`local_scan_kind`](Self::local_scan_kind): this is
+    /// the one caller that legitimately wants the whole scope, and keeping the
+    /// general API bounded stops an accidental full-tablet read being a typo
+    /// away.
+    ///
+    /// Key order is commit order because a record's key ends in its own commit
+    /// HLC (see [`KvCommand::KindBatch`]'s `change_log`), so a drain processing
+    /// these front-to-back sees each key's mutations in the order they
+    /// committed.
+    pub async fn pending_changes(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let scope = &self.kind_scopes[KIND_CHANGE as usize];
+        let (start, end) = scope.physical_bounds();
+        let Some(end) = end else {
+            return Vec::new(); // only `StorageScope::whole()`; no real tablet
+        };
+        self.storage
+            .scan(&start, &end)
+            .await
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(|(k, vv)| {
+                let logical = scope.strip_in_range(&k)?.to_vec();
+                match txn::decode_envelope(&vv.value) {
+                    txn::Envelope::Committed(v) => Some((logical, v)),
+                    txn::Envelope::Intent { .. } => None,
+                }
+            })
+            .collect()
+    }
+
     /// A **linearizable** read of `key` via **ReadIndex** (ADR 0017): only the
     /// leader can serve it. Records `read_index = commit_index`, confirms it is
     /// still leader by a quorum of peers acking its current term (a read-barrier

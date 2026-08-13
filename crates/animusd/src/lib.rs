@@ -31,6 +31,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub mod config;
+mod index_drain;
 pub mod otel;
 pub use config::ClusterConfig;
 // Re-exported so callers (CLI, tests, operators) can inspect a node's cached
@@ -184,6 +185,37 @@ impl CpGroup {
         match self {
             CpGroup::Lsm(n) => n.put_kind_batch_fenced(writes, change_log, fence),
             CpGroup::Mem(n) => n.put_kind_batch_fenced(writes, change_log, fence),
+        }
+    }
+
+    /// Every pending change-log record this tablet holds, in commit order
+    /// (ADR 0041 §4). See [`RaftKvNode::pending_changes`].
+    pub(crate) async fn pending_changes(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
+        match self {
+            CpGroup::Lsm(n) => n.pending_changes().await,
+            CpGroup::Mem(n) => n.pending_changes().await,
+        }
+    }
+
+    /// A bounded base-scope scan over `[start, end)` in key order — the
+    /// partition-range read the GSI drain recomputes an item's index rows from.
+    pub(crate) async fn local_scan_bounded(
+        &self,
+        start: &[u8],
+        end: &[u8],
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        match self {
+            CpGroup::Lsm(n) => n.local_scan(start, Some(end), None).await,
+            CpGroup::Mem(n) => n.local_scan(start, Some(end), None).await,
+        }
+    }
+
+    /// Read one key of a non-base row-kind scope (ADR 0041 §3). See
+    /// [`RaftKvNode::local_get_kind`].
+    pub(crate) async fn local_get_kind(&self, kind: u8, key: &[u8]) -> Option<Vec<u8>> {
+        match self {
+            CpGroup::Lsm(n) => n.local_get_kind(kind, key).await,
+            CpGroup::Mem(n) => n.local_get_kind(kind, key).await,
         }
     }
 
@@ -2017,6 +2049,12 @@ impl BoundNode {
         // per tablet).
         tasks.push(tokio::spawn(txn_resolver_loop(ctx.clone())));
 
+        // GSI drain (ADR 0041 §4): materializes global secondary indexes from
+        // the change records indexed writes leave behind. Data-role-only and
+        // per-tablet leadership-checked, exactly like `txn_resolver_loop` above
+        // — a node that leads no tablet does nothing each tick.
+        tasks.push(tokio::spawn(index_drain::index_drain_loop(ctx.clone())));
+
         // Auto-split loop (Phase 2.4 / ADR 0034), opt-in: a node splits a tablet
         // it leads once it exceeds **either** configured threshold (it checks
         // leadership per tablet, so running it on every node is harmless).
@@ -2860,6 +2898,12 @@ impl BoundDataNode {
             ctx.clone(),
             reconciler,
         )));
+
+        // GSI drain (ADR 0041 §4): materializes global secondary indexes from
+        // the change records indexed writes leave behind. Data-role-only and
+        // per-tablet leadership-checked, exactly like `txn_resolver_loop` above
+        // — a node that leads no tablet does nothing each tick.
+        tasks.push(tokio::spawn(index_drain::index_drain_loop(ctx.clone())));
 
         if auto_split_threshold.is_some() || auto_split_bytes_threshold.is_some() {
             tasks.push(tokio::spawn(auto_split_loop(
@@ -3813,6 +3857,77 @@ impl ClientCtx {
                     table: table.to_owned(),
                     writes,
                     change_log,
+                };
+                Self::ok_or_err(
+                    self.cp_forward(table, &first, addr, request).await,
+                    "forwarded CP kind write",
+                )
+            }
+            CpRoute::None => Err("no CP group leader reachable".into()),
+        }
+    }
+
+    /// As [`cp_kind_write`](Self::cp_kind_write), but for a batch with **no
+    /// base-kind write** — the GSI drain's footprint update plus the change
+    /// records it consumes, which touch no client-visible row.
+    ///
+    /// Confirmation therefore cannot probe a base row; this waits on the
+    /// proposal being accepted and applied instead. That is weaker than
+    /// `cp_kind_write`'s value-equality probe, and safe only because the
+    /// drain is idempotent: a batch that silently no-ops (a fence miss) leaves
+    /// the change records in place, so the next tick simply redoes the same
+    /// reconciliation.
+    pub(crate) async fn cp_kind_write_raw(
+        &self,
+        table: &str,
+        writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
+    ) -> Result<(), String> {
+        let Some(first) = writes.first().map(|(_, k, _)| k.clone()) else {
+            return Ok(());
+        };
+        match self.cp_route(table, &first).await {
+            CpRoute::Local(leader) => {
+                let fence = leader.scope_range();
+                for (_, key, _) in &writes {
+                    if !fence.contains(key) {
+                        return Err("kind write outside this group's live range; retry".into());
+                    }
+                }
+                // Confirm on the batch's *intended effect* — the first record
+                // it consumes being gone — rather than on `Accepted`, which only
+                // means "appended to the leader's log". A fenced-out entry
+                // commits as a no-op, so acking on acceptance alone would report
+                // a reconciliation that never landed; the drain would then never
+                // revisit it, since it believes the records are consumed.
+                let probe = writes
+                    .iter()
+                    .find(|(kind, _, v)| *kind == animus_cp_data::KIND_CHANGE && v.is_none())
+                    .map(|(_, k, _)| k.clone());
+                match leader.put_kind_batch_fenced(writes, None, fence) {
+                    ProposeResult::Accepted { .. } => {}
+                    other => return Err(format!("kind write not accepted: {other:?}")),
+                }
+                let Some(probe) = probe else {
+                    return Ok(()); // nothing consumed; nothing to confirm
+                };
+                let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
+                while tokio::time::Instant::now() < deadline {
+                    if leader
+                        .local_get_kind(animus_cp_data::KIND_CHANGE, &probe)
+                        .await
+                        .is_none()
+                    {
+                        return Ok(());
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err("index drain batch did not apply in time".into())
+            }
+            CpRoute::Forward(addr) => {
+                let request = ClientRequest::KindWrite {
+                    table: table.to_owned(),
+                    writes,
+                    change_log: None,
                 };
                 Self::ok_or_err(
                     self.cp_forward(table, &first, addr, request).await,

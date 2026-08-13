@@ -198,7 +198,7 @@ async fn metadata_fresh(ctx: &ClientCtx) -> Metadata {
 /// The DynamoDB key schema for `table`, resolved from the **replicated catalog**
 /// (ADR 0013) when present, else the legacy `pk`/`sk` convention so a
 /// pre-`CreateTable` client keeps working.
-fn schema_for(meta: &Metadata, table: &str) -> TableSchema {
+pub(crate) fn schema_for(meta: &Metadata, table: &str) -> TableSchema {
     match meta.table_schema(table) {
         Some(control) => schema_bridge::to_dynamo(control),
         None => TableSchema::composite("pk", "sk"),
@@ -1572,7 +1572,7 @@ fn token_prefixed(pk: &AttributeValue, within: &[u8]) -> Vec<u8> {
 
 /// The attributes an index row carries, per its declared projection.
 /// `None` means "every attribute" (`ALL`).
-fn projected_item(item: &Item, base: &TableSchema, idx: &IndexDef) -> Item {
+pub(crate) fn projected_item(item: &Item, base: &TableSchema, idx: &IndexDef) -> Item {
     let keep: Option<Vec<&str>> = match &idx.projection {
         CtlProjection::All => None,
         CtlProjection::KeysOnly => Some(Vec::new()),

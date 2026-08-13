@@ -355,14 +355,19 @@ fn peel_escaped(bytes: &[u8]) -> Option<(Vec<u8>, &[u8])> {
 // ---------------------------------------------------------------------------
 
 /// One GSI row a base item currently occupies.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct FootprintEntry {
-    /// The index's name.
+    /// The index's name — also names the hidden table the row lives in
+    /// ([`index_table_name`]).
     pub index: String,
-    /// The index hash value's raw key bytes at the time the row was written.
-    pub hash: Vec<u8>,
-    /// The index sort value's raw key bytes (`None` for a hash-only GSI).
-    pub sort: Option<Vec<u8>>,
+    /// The row's **full data-plane key**, token included.
+    ///
+    /// Stored whole rather than as its `(hash, sort)` components on purpose:
+    /// the drain's only use for a footprint entry is to *delete the row it
+    /// names*, and a key it can pass straight to a write needs no rebuilding —
+    /// which would otherwise mean reconstructing `AttributeValue`s from raw key
+    /// bytes just to re-derive a key the writer already had.
+    pub key: Vec<u8>,
 }
 
 /// Where a base **item**'s GSI rows currently live (ADR 0041 §4).
@@ -683,8 +688,7 @@ mod tests {
             b"42".to_vec(),
             vec![FootprintEntry {
                 index: "byEmail".to_owned(),
-                hash: b"a@b.c".to_vec(),
-                sort: None,
+                key: b"rowkey".to_vec(),
             }],
         );
         let decoded = IndexFootprint::decode(&fp.encode()).expect("decodes");
@@ -700,8 +704,7 @@ mod tests {
     fn footprint_stays_sorted_however_items_are_inserted() {
         let entry = |n: &str| FootprintEntry {
             index: n.to_owned(),
-            hash: b"h".to_vec(),
-            sort: None,
+            key: b"rowkey".to_vec(),
         };
         let mut fp = IndexFootprint::default();
         // Deliberately out of order — the encoding must not depend on call order
