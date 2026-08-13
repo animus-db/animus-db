@@ -436,6 +436,29 @@ pub enum KvCommand {
         fence: KeyRange,
         ts: HlcTimestamp,
     },
+    /// **Multi-kind atomic batch** (ADR 0041 §3/§4): like [`Batch`](Self::Batch),
+    /// but every write names the **row kind** whose scope it lands in, and may
+    /// be a tombstone (`None`) as well as a put.
+    ///
+    /// This is the primitive secondary-index maintenance rests on. A single
+    /// entry writes the base row, its LSI rows, the partition's GSI footprint
+    /// and a change-log record — and, critically, *deletes the stale LSI rows
+    /// the overwrite invalidated* — as one Raft log entry: one propose, one
+    /// commit round, one apply. An LSI is strongly consistent precisely because
+    /// its rows commit in the same entry as the base row they derive from, and
+    /// a change record can never be lost relative to the write it describes.
+    ///
+    /// Every kind of one tablet shares that tablet's single `KeyRange`, so one
+    /// `fence` gates them all; as with `Batch` it gates the **whole** entry, or
+    /// partial application would break exactly the atomicity this exists for.
+    /// Keys are logical (token-leading, ADR 0022) — the kind selects the scope,
+    /// it is never part of the key.
+    KindBatch {
+        /// `(row kind, logical key, value)` — `None` writes a tombstone.
+        writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
+        fence: KeyRange,
+        ts: HlcTimestamp,
+    },
     /// Remove `key` (a tombstone in the engine), iff `key` falls inside `fence`.
     Delete {
         key: Vec<u8>,
@@ -1604,6 +1627,41 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             let keys: Vec<&[u8]> = puts.iter().map(|(k, _)| k.as_slice()).collect();
             let ts = self.mint_pushed(&keys);
             KvCommand::Batch { puts, fence, ts }
+        })
+    }
+
+    /// Propose a **multi-kind atomic batch** (ADR 0041 §3/§4): commit writes
+    /// spanning several of this tablet's row-kind scopes as **one** Raft log
+    /// entry. A `None` value writes a tombstone, so one entry can add the new
+    /// index rows *and* remove the stale ones an overwrite invalidated.
+    ///
+    /// The primitive secondary-index maintenance rests on: an LSI is strongly
+    /// consistent because its rows commit in the same entry as the base row
+    /// they derive from, and a change-log record can never be lost relative to
+    /// the write it describes. Keys are **logical** and token-leading
+    /// (ADR 0022); the kind selects the scope and is never part of the key.
+    ///
+    /// Stamps `fence = KeyRange::whole()`; use
+    /// [`put_kind_batch_fenced`](Self::put_kind_batch_fenced) to stamp a
+    /// narrower one.
+    pub fn put_kind_batch(&self, writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>) -> ProposeResult {
+        self.put_kind_batch_fenced(writes, KeyRange::whole())
+    }
+
+    /// As [`put_kind_batch`](Self::put_kind_batch), but the leader stamps its
+    /// own `fence` into the entry. If **any** key falls outside `fence`, none of
+    /// the batch applies — the fence gates the whole atomic entry, since a
+    /// half-applied index write is exactly what colocating the kinds exists to
+    /// prevent.
+    pub fn put_kind_batch_fenced(
+        &self,
+        writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
+        fence: KeyRange,
+    ) -> ProposeResult {
+        self.propose_ordered(|| {
+            let keys: Vec<&[u8]> = writes.iter().map(|(_, k, _)| k.as_slice()).collect();
+            let ts = self.mint_pushed(&keys);
+            KvCommand::KindBatch { writes, fence, ts }
         })
     }
 
@@ -3946,6 +4004,40 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                     }
                 }
             }
+            KvCommand::KindBatch { writes, fence, ts } => {
+                assert_ts_monotonic(max_applied_ts, ts);
+                // Gated as one unit, exactly like `Batch` — an index write that
+                // half-applied would leave an LSI row describing a base row
+                // that never landed, which is the one thing colocating them was
+                // supposed to make impossible. Every kind shares this tablet's
+                // single range, so one fence covers them all.
+                if writes
+                    .iter()
+                    .all(|(_, key, _)| fence.contains(key) && !is_sealed(sealed, key))
+                {
+                    for (kind, key, value) in &writes {
+                        // An unknown kind cannot be applied anywhere safe (this
+                        // build has no scope for it) and must not silently land
+                        // in another kind's keyspace. It can only arise from a
+                        // peer proposing a kind this build predates, so skip it
+                        // rather than guess — the same call this crate's
+                        // snapshot install makes for an unknown-kind entry.
+                        let Some(kscope) = kind_scopes.get(*kind as usize) else {
+                            tracing::warn!(kind, "KindBatch write of unknown row kind skipped");
+                            continue;
+                        };
+                        let physical = kscope.physical(key);
+                        match value {
+                            Some(v) => pending.push(MergeOp::put(
+                                physical,
+                                txn::encode_committed(v),
+                                hlc::pack(ts),
+                            )),
+                            None => pending.push(MergeOp::tombstone(physical, hlc::pack(ts))),
+                        }
+                    }
+                }
+            }
             KvCommand::Delete { key, fence, ts } => {
                 assert_ts_monotonic(max_applied_ts, ts);
                 if fence.contains(&key) && !is_sealed(sealed, &key) {
@@ -4988,6 +5080,7 @@ fn command_ts(command: &KvCommand) -> Option<HlcTimestamp> {
     match command {
         KvCommand::Put { ts, .. }
         | KvCommand::Batch { ts, .. }
+        | KvCommand::KindBatch { ts, .. }
         | KvCommand::Delete { ts, .. }
         | KvCommand::Cas { ts, .. }
         | KvCommand::Seal { ts, .. }

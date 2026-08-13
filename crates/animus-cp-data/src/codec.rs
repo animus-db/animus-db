@@ -338,6 +338,17 @@ fn put_command(out: &mut Vec<u8>, c: &KvCommand) {
             put_key_range(out, fence);
             put_ts(out, *ts);
         }
+        KvCommand::KindBatch { writes, fence, ts } => {
+            put_u8(out, 12);
+            out.extend_from_slice(&(writes.len() as u32).to_be_bytes());
+            for (kind, k, v) in writes {
+                put_u8(out, *kind);
+                put_bytes(out, k);
+                put_opt_bytes(out, v);
+            }
+            put_key_range(out, fence);
+            put_ts(out, *ts);
+        }
         KvCommand::Delete { key, fence, ts } => {
             put_u8(out, 2);
             put_bytes(out, key);
@@ -460,6 +471,18 @@ fn read_command(c: &mut Cursor<'_>) -> Result<KvCommand, DecodeError> {
             }
             KvCommand::Batch {
                 puts,
+                fence: read_key_range(c)?,
+                ts: read_ts(c)?,
+            }
+        }
+        12 => {
+            let n = c.u32()?;
+            let mut writes = Vec::with_capacity(n as usize);
+            for _ in 0..n {
+                writes.push((c.u8()?, c.bytes()?, c.opt_bytes()?));
+            }
+            KvCommand::KindBatch {
+                writes,
                 fence: read_key_range(c)?,
                 ts: read_ts(c)?,
             }

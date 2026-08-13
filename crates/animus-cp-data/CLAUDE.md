@@ -198,6 +198,18 @@ Three modules:
   `ts_cache`, `witnessing`, `snapshot_catchup`) broke on exactly that
   assumption. Tests without a node handle (`reconciler`, `reconciler_corpus`,
   `narrow_scope`) push `KIND_BASE` explicitly in their own `physical` helper.
+- **`KvCommand::KindBatch`** (ADR 0041 §3/§4, codec tag 12) — the multi-kind
+  atomic batch: `put_kind_batch`/`put_kind_batch_fenced` commit
+  `(kind, logical key, Option<value>)` writes spanning several of a tablet's
+  row-kind scopes as **one** Raft log entry. A `None` value tombstones, so one
+  entry adds an overwrite's new index rows *and* removes the stale ones. This is
+  the primitive materialized secondary indexes rest on: an LSI is strongly
+  consistent because its rows commit in the same entry as the base row they
+  derive from, and a change-log record can never be lost relative to the write
+  it describes. Keys stay **logical and token-leading** — the kind selects the
+  scope, never part of the key. One `fence` gates the **whole** entry (every
+  kind shares the tablet's single range); a write naming an unknown kind is
+  skipped with a warning rather than mis-filed into another kind's keyspace.
 - **Fenced commands** (ADR 0026) — `put_fenced`/`delete_fenced`/`cas_fenced`/
   `put_batch_fenced` (and unfenced siblings using `KeyRange::whole()`) carry a
   `fence: KeyRange` *inside the proposed command*, stamped by the leader at
@@ -1070,6 +1082,13 @@ API (which always mints a *fresh* id) cannot express.
   transaction before the compacting write burst, confirms the
   snapshot-caught-up follower's raw engine holds the identical still-
   `Pending` intent envelope, then resolves and confirms convergence.
+- `kind_batch.rs` (ADR 0041) — `KindBatch` writes each kind into **its own**
+  scope (asserted with two byte-identical logical keys under different kinds
+  that must not alias), one entry adds a new index row while tombstoning the
+  stale one, and an out-of-fence key blocks the **whole** entry. That last test
+  asserts its own setup (`fence.contains(base)` yet `!fence.contains(lsi)`)
+  because the obvious fence — `KeyRange::new(k, Some(k))` — is *empty* under
+  half-open semantics, which would make "nothing applied" prove nothing.
 - `narrow_scope.rs` — `narrow_scope` makes a group's `StorageScope` range
   live-narrowable (the split-source shape, so `engine_image` stops shipping the
   handed-off portion); `narrow_then_erase_scope_spares_a_co_hosted_siblings_
