@@ -157,6 +157,24 @@ Three modules:
   non-`0xFF` byte) — `None` only for `whole()` or an all-`0xFF` prefix — so a
   periodic byte-estimate over an unbounded-above logical range never degrades
   into a whole-engine scan.
+  **`with_kind(kind)`** (ADR 0041 §3, *primitive landed, group wiring still to
+  come*) derives a **sibling scope for one row kind** — prefix `prefix ||
+  [kind]`, over **the very same `Arc<Mutex<KeyRange>>`**, so one `narrow`/
+  `widen` moves every kind at once and a split can never leave two kinds
+  disagreeing about what the tablet owns. `KIND_BASE`/`KIND_LSI`/
+  `KIND_CHANGE`/`KIND_FOOTPRINT`, enumerated by `ALL_KINDS`, are the selectors
+  (they live *here*, not in `animus-dynamo`: the wire adapter only builds
+  logical keys, the scope choice is a data-plane concern). Two kinds of one
+  tablet differ in their prefix's final byte at equal length so neither
+  prefixes the other, and two tables are already separated one level up by
+  `escape`'s prefix-freedom. **Why kinds are scopes and not a discriminator
+  byte in the key**: a tablet is a `[start, end)` range over *token* space, so
+  a kind above the token would stop its ownership being one contiguous range
+  (breaking `KeyRange`/the router/split); and `txn_stage` **asserts** a logical
+  key leads with the ADR 0022 token (`anchor[..TOKEN_BYTES]`), deriving every
+  `TxnRecord::intent_span` from it — so a kind byte in the logical key would
+  have forced a rewrite of every span, fence, record key and seal marker in the
+  ADR 0018 2PC machinery.
 - **Fenced commands** (ADR 0026) — `put_fenced`/`delete_fenced`/`cas_fenced`/
   `put_batch_fenced` (and unfenced siblings using `KeyRange::whole()`) carry a
   `fence: KeyRange` *inside the proposed command*, stamped by the leader at

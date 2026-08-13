@@ -68,22 +68,6 @@ use crate::{AttributeValue, Item, escape};
 /// `syskv::is_reserved_name` gate.
 pub const INDEX_TABLE_SEPARATOR: char = '$';
 
-/// Scope selector: base item rows — the ADR 0022 keyspace, unchanged.
-pub const KIND_BASE: u8 = 0x00;
-/// Scope selector: local-secondary-index rows (colocated, ADR 0041 §2).
-pub const KIND_LSI: u8 = 0x01;
-/// Scope selector: change-log records (ADR 0041 §4/§4a).
-pub const KIND_CHANGE: u8 = 0x02;
-/// Scope selector: GSI footprints (ADR 0041 §4).
-pub const KIND_FOOTPRINT: u8 = 0x03;
-
-/// Every row-kind scope a base table's tablet group owns, in selector order.
-///
-/// The one place the set is enumerated: `animus-cp-data` derives a sibling
-/// `StorageScope` per entry (prefix `escape(table) || KIND`, all sharing the
-/// group's one `KeyRange`), and drop-table GC erases each in turn.
-pub const ALL_KINDS: [u8; 4] = [KIND_BASE, KIND_LSI, KIND_CHANGE, KIND_FOOTPRINT];
-
 /// The hidden table a global secondary index's rows live in: `<base>$<index>`
 /// (ADR 0041 §1). It gets its own per-table hash ring, tablets, split/merge, GC
 /// and storage scope, exactly like a user table.
@@ -116,7 +100,7 @@ pub fn is_index_table_name(name: &str) -> bool {
 /// Every key starting with `prefix` compares less than that bound, and the bound
 /// itself is the first key past them. Panics on an empty prefix or one ending
 /// `0xFF` — neither can occur for a prefix this module builds, since each ends in
-/// a discriminator byte or `escape`'s `0x00` terminator.
+/// `escape`'s `0x00` terminator.
 #[must_use]
 pub fn range_end(prefix: &[u8]) -> Vec<u8> {
     let mut end = prefix.to_vec();
@@ -138,7 +122,7 @@ pub fn range_end(prefix: &[u8]) -> Vec<u8> {
 // physically.
 
 /// The within-table key of a base item row: `escape(pk) || sk`, in the
-/// [`KIND_BASE`] scope.
+/// `KIND_BASE` scope.
 ///
 /// Byte-identical to [`crate::storage_key`] — ADR 0022's layout, unchanged by
 /// ADR 0041. Kept as a named alias so index-maintenance code reads uniformly
@@ -150,13 +134,13 @@ pub fn base_row_key(pk: &AttributeValue, sk: Option<&AttributeValue>) -> Vec<u8>
 
 /// The prefix every base row of `pk`'s partition starts with: `escape(pk)`. A
 /// base `Query` is `[base_partition_prefix, range_end(base_partition_prefix))`
-/// within the [`KIND_BASE`] scope.
+/// within the `KIND_BASE` scope.
 #[must_use]
 pub fn base_partition_prefix(pk: &AttributeValue) -> Vec<u8> {
     escape(&pk.key_bytes())
 }
 
-/// The within-table key of one LSI row, in the [`KIND_LSI`] scope:
+/// The within-table key of one LSI row, in the `KIND_LSI` scope:
 /// `escape(pk) || escape(index) || escape(alt_sort) || sk`.
 ///
 /// `sk` is the **base** sort key, which makes the row unique when two items in
@@ -188,7 +172,7 @@ pub fn lsi_index_prefix(pk: &AttributeValue, index: &str) -> Vec<u8> {
     key
 }
 
-/// The within-table key of a change-log record, in the [`KIND_CHANGE`] scope:
+/// The within-table key of a change-log record, in the `KIND_CHANGE` scope:
 /// `escape(pk) || hlc`.
 ///
 /// `hlc` must be a **fixed-width, big-endian, order-preserving** encoding of the
@@ -205,7 +189,7 @@ pub fn change_record_key(pk: &AttributeValue, hlc: &[u8]) -> Vec<u8> {
 
 /// The prefix every change record of `pk`'s partition starts with:
 /// `escape(pk)`. The drain (and, later, a stream shard reader) scans
-/// `[change_prefix, range_end(change_prefix))` of the [`KIND_CHANGE`] scope in
+/// `[change_prefix, range_end(change_prefix))` of the `KIND_CHANGE` scope in
 /// commit order.
 #[must_use]
 pub fn change_prefix(pk: &AttributeValue) -> Vec<u8> {
@@ -213,7 +197,7 @@ pub fn change_prefix(pk: &AttributeValue) -> Vec<u8> {
 }
 
 /// The within-table key of a partition's GSI footprint, in the
-/// [`KIND_FOOTPRINT`] scope: `escape(pk)`.
+/// `KIND_FOOTPRINT` scope: `escape(pk)`.
 ///
 /// One per **partition key**, not per item: see [`IndexFootprint`].
 #[must_use]
@@ -322,7 +306,7 @@ pub struct LsiRowRef {
 /// Recover `(base_pk, index, alt_sort, base_sk)` from an LSI row key.
 ///
 /// The caller must already know this is an LSI row — it came from the
-/// [`KIND_LSI`] scope, which is what identifies it now that no discriminator
+/// `KIND_LSI` scope, which is what identifies it now that no discriminator
 /// rides in the key. Returns `None` only if a segment is malformed or the index
 /// name is not UTF-8.
 #[must_use]
@@ -577,7 +561,6 @@ mod tests {
         let pk = s("alice");
         assert_eq!(footprint_key(&pk), base_partition_prefix(&pk));
         assert_eq!(footprint_key(&pk), change_prefix(&pk));
-        assert_eq!(ALL_KINDS.len(), 4, "four scopes share one tablet's range");
     }
 
     #[test]

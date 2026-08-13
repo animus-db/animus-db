@@ -156,6 +156,23 @@ pub struct StorageScope {
     range: Arc<Mutex<KeyRange>>,
 }
 
+/// Row-kind scope selector: base item rows — the ADR 0022 keyspace.
+pub const KIND_BASE: u8 = 0x00;
+/// Row-kind scope selector: local-secondary-index rows (ADR 0041 §2).
+pub const KIND_LSI: u8 = 0x01;
+/// Row-kind scope selector: change-log records (ADR 0041 §4/§4a).
+pub const KIND_CHANGE: u8 = 0x02;
+/// Row-kind scope selector: GSI footprints (ADR 0041 §4).
+pub const KIND_FOOTPRINT: u8 = 0x03;
+
+/// Every row-kind scope a tablet group owns, in selector order (ADR 0041 §3).
+///
+/// The single place the set is enumerated: a group derives one sibling
+/// [`StorageScope`] per entry at start, the snapshot image iterates it, and
+/// drop-table GC erases each in turn. Adding a kind here is what makes it
+/// exist everywhere at once.
+pub const ALL_KINDS: [u8; 4] = [KIND_BASE, KIND_LSI, KIND_CHANGE, KIND_FOOTPRINT];
+
 impl StorageScope {
     /// No prefix, the whole keyspace — every physical-key operation is an
     /// identity transform (today's dedicated-engine behavior).
@@ -173,6 +190,29 @@ impl StorageScope {
         Self {
             prefix,
             range: Arc::new(Mutex::new(range)),
+        }
+    }
+
+    /// A **sibling scope of the same tablet group**, holding a different row
+    /// kind (ADR 0041 §3): the prefix extended by `kind`, over **the very same
+    /// live `KeyRange`** — literally the same `Arc`, so one
+    /// [`narrow`](Self::narrow) moves every kind at once and a split or merge
+    /// can never leave two kinds disagreeing about what this tablet owns.
+    ///
+    /// Every kind of one tablet is `prefix || [kind]`, so two kinds differ in
+    /// their final byte at equal length and neither prefixes the other; two
+    /// *tables* are already separated one level up by `escape`'s own
+    /// prefix-freedom. That is what lets the kinds share an engine without a
+    /// discriminator inside the logical key — which they must, because
+    /// [`RaftKvNode::txn_stage`] asserts a logical key leads with the ADR 0022
+    /// partition token and derives every transaction intent span from it.
+    #[must_use]
+    pub fn with_kind(&self, kind: u8) -> Self {
+        let mut prefix = self.prefix.clone();
+        prefix.push(kind);
+        Self {
+            prefix,
+            range: Arc::clone(&self.range),
         }
     }
 
@@ -5208,6 +5248,80 @@ async fn apply_loop<E: Env, S: StorageEngine>(
 /// cannot express "the identical, already-referenced transaction arrives
 /// late"; an external integration test genuinely cannot construct this
 /// scenario at all.
+#[cfg(test)]
+mod kind_scope_tests {
+    use super::*;
+    use animus_tablet::escape;
+
+    /// A table's parent scope, as `animusd::table_scope_prefix` builds it.
+    fn table_scope(name: &[u8]) -> StorageScope {
+        StorageScope::new(escape(name), KeyRange::whole())
+    }
+
+    #[test]
+    fn sibling_scopes_share_one_live_range() {
+        let parent = table_scope(b"users");
+        let base = parent.with_kind(KIND_BASE);
+        let log = parent.with_kind(KIND_CHANGE);
+
+        // Narrowing through *any* handle moves every kind: a split must never
+        // leave two kinds disagreeing about what this tablet owns (ADR 0041 §3).
+        let narrowed = KeyRange::new(b"m".to_vec(), Some(b"n".to_vec()));
+        base.narrow(narrowed.clone());
+        assert_eq!(log.range(), narrowed);
+        assert_eq!(parent.range(), narrowed);
+    }
+
+    #[test]
+    fn no_kind_can_read_another_kinds_key() {
+        let parent = table_scope(b"users");
+        let logical = b"\x01\x02logical-key".to_vec();
+        for &mine in &ALL_KINDS {
+            let scope = parent.with_kind(mine);
+            let physical = scope.physical(&logical);
+            assert_eq!(
+                scope.strip_in_range(&physical),
+                Some(logical.as_slice()),
+                "a kind must read back its own key"
+            );
+            for &other in ALL_KINDS.iter().filter(|k| **k != mine) {
+                assert_eq!(
+                    parent.with_kind(other).strip_in_range(&physical),
+                    None,
+                    "kind {other:#04x} must not see kind {mine:#04x}'s key"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn one_tables_kinds_never_collide_with_another_tables() {
+        let logical = b"logical".to_vec();
+        let users = table_scope(b"users").with_kind(KIND_CHANGE);
+        // `users2`'s raw name has `users`' as a prefix on purpose — `escape`'s
+        // prefix-freedom one level up is what keeps the two tables apart, and
+        // appending a kind byte must not undo it.
+        let users2 = table_scope(b"users2").with_kind(KIND_CHANGE);
+        assert_eq!(users2.strip_in_range(&users.physical(&logical)), None);
+        assert_eq!(users.strip_in_range(&users2.physical(&logical)), None);
+    }
+
+    #[test]
+    fn a_kinds_prefix_is_the_parents_plus_one_byte() {
+        // The property `physical_bounds` on the parent relies on: every kind
+        // lives physically *under* the parent's prefix, so a whole-tablet sweep
+        // (drop-table GC, the snapshot image) can bound on the parent and then
+        // sort entries out by kind.
+        let parent = table_scope(b"users");
+        let parent_physical = parent.physical(b"");
+        for &kind in &ALL_KINDS {
+            let child_physical = parent.with_kind(kind).physical(b"");
+            assert!(child_physical.starts_with(&parent_physical));
+            assert_eq!(child_physical.len(), parent_physical.len() + 1);
+        }
+    }
+}
+
 #[cfg(test)]
 mod pr5_orphan_and_resurrection_tests {
     use super::*;
