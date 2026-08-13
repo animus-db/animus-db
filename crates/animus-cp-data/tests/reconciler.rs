@@ -40,8 +40,11 @@ fn prefix_for(table: &str) -> Vec<u8> {
     table.as_bytes().to_vec()
 }
 
+/// ADR 0041 §3: a group's physical prefix is its parent scope's prefix
+/// (`prefix_for(TABLE)`) plus the row-kind byte — ordinary data is `KIND_BASE`.
 fn physical(key: &[u8]) -> Vec<u8> {
     let mut out = prefix_for(TABLE);
+    out.push(animus_cp_data::KIND_BASE);
     out.extend_from_slice(key);
     out
 }

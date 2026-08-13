@@ -178,11 +178,15 @@ report its own shape.
 an index `Query` is one range scan that returns items directly — no base-table
 fan-out read. This is both DynamoDB's behaviour and the point of an index.
 
-*(The **base** logical key is unchanged from ADR 0022 — `token || escape(pk) ||
-sk`. Nothing existing moves on disk, and the CQL edge needs no change: the new
-kinds are new scopes alongside the base one, and `Put`/`PutBatch` keep meaning
-"the base kind". Only the snapshot image gains a per-entry kind tag, which is a
-format break the repo's no-live-deployments constraint makes free.)*
+*(The **base logical key is unchanged** from ADR 0022 — `token || escape(pk) ||
+sk` — which is the part that matters: no code that builds, parses, fences, or
+spans a key moves, and the CQL edge needs no change at all. `Put`/`PutBatch`
+keep meaning "the base kind". **Physical** keys do shift, by the one kind byte
+now in every scope prefix — including for `StorageScope::whole()`, which stops
+being an identity transform — and the snapshot image gains a per-entry kind tag.
+Both are format breaks the repo's no-live-deployments constraint makes free, but
+"nothing moves on disk" would be the wrong claim: a cluster's bytes are laid out
+differently, they are simply laid out consistently.)*
 
 ### 4. GSI maintenance is a per-tablet change log plus a derivative drain
 

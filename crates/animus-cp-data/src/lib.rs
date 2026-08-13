@@ -173,6 +173,15 @@ pub const KIND_FOOTPRINT: u8 = 0x03;
 /// exist everywhere at once.
 pub const ALL_KINDS: [u8; 4] = [KIND_BASE, KIND_LSI, KIND_CHANGE, KIND_FOOTPRINT];
 
+/// The sibling scope set a tablet group owns, derived from its **parent**
+/// scope (`escape(table)` + this tablet's range), indexed by kind selector.
+///
+/// Every entry shares the parent's one live `KeyRange`
+/// ([`StorageScope::with_kind`]), so narrowing any of them narrows all.
+fn kind_scopes(parent: &StorageScope) -> [StorageScope; ALL_KINDS.len()] {
+    ALL_KINDS.map(|kind| parent.with_kind(kind))
+}
+
 impl StorageScope {
     /// No prefix, the whole keyspace — every physical-key operation is an
     /// identity transform (today's dedicated-engine behavior).
@@ -1015,7 +1024,18 @@ pub struct RaftKvNode<E: Env, S: StorageEngine> {
     /// This group's confinement within `storage` — see [`StorageScope`]'s doc.
     /// `StorageScope::whole()` (the default for every existing constructor)
     /// makes every physical-key operation an identity transform.
+    ///
+    /// Bound to the **base row kind** (ADR 0041 §3), so every read, write,
+    /// fence, txn record and byte estimate that has always used `scope` still
+    /// addresses exactly the base data. Other kinds go through
+    /// [`kind_scopes`](Self::kind_scopes).
     scope: StorageScope,
+    /// Every row kind's scope, indexed by selector (ADR 0041 §3) — the base
+    /// entry is the same scope as [`scope`](Self::scope). All share one live
+    /// `KeyRange`, so a split narrows every kind together. Iterated wherever an
+    /// operation is about the *whole tablet* rather than one kind: the snapshot
+    /// image and drop-table GC's erase.
+    kind_scopes: [StorageScope; ALL_KINDS.len()],
     /// This group's network multiplexing key (ADR 0026 Stage B): every send/recv
     /// goes out on `(peer, stream)`/`(self, stream)` instead of a peer's default
     /// inbox. `PRIMARY_STREAM` (the default for every existing constructor) is
@@ -1168,6 +1188,16 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         scope: StorageScope,
         stream: u64,
     ) -> Self {
+        // ADR 0041 §3: callers hand in the tablet's **parent** scope
+        // (`escape(table)` + this tablet's range); the group owns one sibling
+        // per row kind beneath it, all sharing the parent's single live
+        // `KeyRange`. `self.scope` is deliberately bound to the *base* kind, so
+        // every pre-existing call site — reads, writes, fences, txn records,
+        // `approx_bytes` — keeps operating on exactly the data it always did,
+        // with no edit. Binding `approx_bytes` to the base scope this way is
+        // also the ADR 0034 fix: auto-split stops measuring change-log churn.
+        let kind_scopes = kind_scopes(&scope);
+        let scope = kind_scopes[KIND_BASE as usize].clone();
         let core = Arc::new(Mutex::new(RaftCore::new(
             env.node_id(),
             &all_nodes,
@@ -1217,6 +1247,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             propose_signal: Arc::clone(&propose_signal),
             metrics: metrics.clone(),
             scope: scope.clone(),
+            kind_scopes: kind_scopes.clone(),
             stream,
             hlc: Arc::clone(&hlc),
             ts_cache: Arc::clone(&ts_cache),
@@ -1244,6 +1275,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             propose_signal,
             metrics,
             scope,
+            kind_scopes,
             stream,
             hlc,
             committed_ceiling,
@@ -3332,39 +3364,17 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         // wrong thing here, which must physically erase everything this
         // scope ever wrote (ordinary values, still-pending intents, and
         // txn records alike), not just what a read would ever serve.
-        for key in self.raw_scoped_keys().await {
-            let _ = self
-                .storage
-                .merge_tombstone(&self.scope.physical(&key), version)
-                .await;
-        }
-    }
-
-    /// Every logical key currently physically present in this group's own
-    /// scope — **raw**, bypassing both the record-key filter and
-    /// value-envelope resolution [`local_scan`](Self::local_scan) applies.
-    /// The only caller is [`erase_scope`](Self::erase_scope).
-    async fn raw_scoped_keys(&self) -> Vec<Vec<u8>> {
-        let (physical_start, physical_end) = self.scope.physical_bounds();
-        match physical_end {
-            Some(e) => self
-                .storage
-                .scan(&physical_start, &e)
-                .await
-                .ok()
-                .into_iter()
-                .flatten()
-                .filter_map(|(k, _)| self.scope.strip_in_range(&k).map(<[u8]>::to_vec))
-                .collect(),
-            None => self
-                .storage
-                .entries()
-                .await
-                .ok()
-                .into_iter()
-                .flatten()
-                .filter_map(|(k, _)| self.scope.strip_in_range(&k).map(<[u8]>::to_vec))
-                .collect(),
+        // ADR 0041 §3: erase **every** row kind, not just the base scope this
+        // group's `self.scope` addresses — a dropped table's LSI rows, change
+        // log and footprints are just as much its data, and leaving them
+        // behind would strand bytes no later reader can even name.
+        for scope in &self.kind_scopes {
+            for key in raw_scoped_keys(&self.storage, scope).await {
+                let _ = self
+                    .storage
+                    .merge_tombstone(&scope.physical(&key), version)
+                    .await;
+            }
         }
     }
 
@@ -3588,6 +3598,27 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         &self.storage
     }
 
+    /// The physical, engine-global key this group stores logical `key` under,
+    /// for a given row `kind` (ADR 0041 §3).
+    ///
+    /// The companion to [`storage`](Self::storage): anything reading this
+    /// group's bytes straight off a (possibly node-shared) engine — a
+    /// diagnostic, or a test asserting what a replica physically holds — must
+    /// address them through the same scope the group writes them under, not by
+    /// assembling the layout itself. Hard-coding `prefix || key` was correct
+    /// only while a group had exactly one scope; it silently stopped being
+    /// correct when kinds arrived, which is precisely the breakage this exists
+    /// to prevent recurring.
+    ///
+    /// An unknown `kind` falls back to the base scope.
+    #[must_use]
+    pub fn physical_key(&self, kind: u8, key: &[u8]) -> Vec<u8> {
+        self.kind_scopes
+            .get(kind as usize)
+            .unwrap_or(&self.scope)
+            .physical(key)
+    }
+
     // ---- admin / debug introspection (ADR 0020) -------------------------
     // Read-only projections of this group's Raft state, mirroring the control
     // plane's `RaftNode` accessors. Each takes the core lock briefly and returns
@@ -3781,6 +3812,10 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
     halted: &AtomicBool,
     metrics: &MetricsHandle,
     scope: &StorageScope,
+    // `kind_scopes`: every row kind (ADR 0041 §3). Only the snapshot image
+    // and its install span the whole tablet; all other work here is base-kind
+    // work through `scope`.
+    kind_scopes: &[StorageScope; ALL_KINDS.len()],
     tablet: u64,
     hlc: &Hlc,
     sealed: &mut Vec<(KeyRange, HlcTimestamp)>,
@@ -3797,7 +3832,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
         .expect("raftkv core poisoned")
         .drain_pending_install();
     if let Some((last_index, bytes)) = pending_install {
-        install_engine_image(storage, scope, &bytes).await;
+        install_engine_image(storage, kind_scopes, &bytes).await;
         engine_applied.fetch_max(last_index, Ordering::SeqCst);
         // Witnessing point (ADR 0018 §2 amendment): a snapshot can carry
         // versions this node has never seen minted, so fold in the engine's
@@ -4721,7 +4756,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
         // and only when a follower is actually waiting on a snapshot.
         let image = if image_needed {
             metrics.incr(Metric::CpSnapshotImageBuilds);
-            Some(engine_image(storage, scope).await)
+            Some(engine_image(storage, kind_scopes).await)
         } else {
             None
         };
@@ -4807,8 +4842,12 @@ async fn flush_pending<S: StorageEngine>(
         .expect("raftkv apply merge batch");
 }
 
-/// One key's snapshot entry: `(key, value-or-tombstone, version)`.
-pub(crate) type ImageEntry = (Vec<u8>, Option<Vec<u8>>, u64);
+/// One key's snapshot entry: `(row kind, key, value-or-tombstone, version)`.
+///
+/// The kind (ADR 0041 §3) is what lets one image carry a whole tablet — every
+/// row kind's scope — while the key stays the *logical* key within its own
+/// scope, so the receiver can re-prefix it under its own scope set.
+pub(crate) type ImageEntry = (u8, Vec<u8>, Option<Vec<u8>>, u64);
 
 /// Serialize this scope's contents (including tombstones) as the snapshot
 /// image shipped to a lagging follower. Bounded to `scope` (prefix **and**
@@ -4817,18 +4856,56 @@ pub(crate) type ImageEntry = (Vec<u8>, Option<Vec<u8>>, u64);
 /// duplicate them into whichever engine receives it, corrupting a group that
 /// never agreed to those writes through its own Raft log. Under the default
 /// (whole) scope this is byte-for-byte the prior unbounded behavior.
-async fn engine_image<S: StorageEngine>(storage: &S, scope: &StorageScope) -> Vec<u8> {
-    let entries: Vec<ImageEntry> = storage
+/// Every logical key currently physically present in one `scope` — **raw**,
+/// bypassing both the record-key filter and the value-envelope resolution
+/// [`RaftKvNode::local_scan`] applies. The only caller is
+/// [`RaftKvNode::erase_scope`], which sweeps each of a tablet's row-kind scopes
+/// in turn (ADR 0041 §3); a free function rather than a method because it is
+/// per-*scope*, not per-group.
+async fn raw_scoped_keys<S: StorageEngine>(storage: &S, scope: &StorageScope) -> Vec<Vec<u8>> {
+    let (physical_start, physical_end) = scope.physical_bounds();
+    match physical_end {
+        Some(e) => storage
+            .scan(&physical_start, &e)
+            .await
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(|(k, _)| scope.strip_in_range(&k).map(<[u8]>::to_vec))
+            .collect(),
+        None => storage
+            .entries()
+            .await
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(|(k, _)| scope.strip_in_range(&k).map(<[u8]>::to_vec))
+            .collect(),
+    }
+}
+
+async fn engine_image<S: StorageEngine>(
+    storage: &S,
+    kind_scopes: &[StorageScope; ALL_KINDS.len()],
+) -> Vec<u8> {
+    // One pass over the engine, classified by kind (ADR 0041 §3): a tablet's
+    // scopes are disjoint, so each physical key is claimed by at most one of
+    // them — `strip_in_range` on the wrong kind returns `None`, which is also
+    // what excludes a co-resident sibling tablet's data from this image.
+    let rows = storage
         .entries_with_tombstones()
         .await
-        .expect("raftkv engine scan")
-        .into_iter()
-        .filter_map(|(k, v, version)| {
-            scope
-                .strip_in_range(&k)
-                .map(|logical| (logical.to_vec(), v, version))
-        })
-        .collect();
+        .expect("raftkv engine scan");
+    let mut entries: Vec<ImageEntry> = Vec::new();
+    for (k, v, version) in rows {
+        let claimed = ALL_KINDS
+            .iter()
+            .zip(kind_scopes)
+            .find_map(|(kind, scope)| scope.strip_in_range(&k).map(|l| (*kind, l.to_vec())));
+        if let Some((kind, logical)) = claimed {
+            entries.push((kind, logical, v, version));
+        }
+    }
     codec::encode_image(&entries)
 }
 
@@ -4837,7 +4914,11 @@ async fn engine_image<S: StorageEngine>(storage: &S, scope: &StorageScope) -> Ve
 /// The wire image carries *logical* keys (stripped by the sender's
 /// `engine_image`); each is re-prefixed to *this* replica's own `scope`
 /// before writing into the (possibly shared) engine.
-async fn install_engine_image<S: StorageEngine>(storage: &S, scope: &StorageScope, bytes: &[u8]) {
+async fn install_engine_image<S: StorageEngine>(
+    storage: &S,
+    kind_scopes: &[StorageScope; ALL_KINDS.len()],
+    bytes: &[u8],
+) {
     let entries: Vec<ImageEntry> = match codec::decode_image(bytes) {
         Ok(e) => e,
         Err(err) => {
@@ -4845,7 +4926,15 @@ async fn install_engine_image<S: StorageEngine>(storage: &S, scope: &StorageScop
             return;
         }
     };
-    for (key, value, version) in entries {
+    for (kind, key, value, version) in entries {
+        // An unknown kind can only come from a peer that knows a row kind this
+        // build does not (ALL_KINDS grew). Dropping it is the safe read: this
+        // replica has no scope to put it in, and silently mis-filing it under
+        // another kind would corrupt that kind's keyspace.
+        let Some(scope) = kind_scopes.get(kind as usize) else {
+            tracing::warn!(kind, "snapshot image entry of unknown row kind dropped");
+            continue;
+        };
         let physical = scope.physical(&key);
         match value {
             Some(v) => {
@@ -4882,7 +4971,10 @@ struct DriveState<E: Env, S: StorageEngine> {
     apply_stopped: Arc<AtomicBool>,
     propose_signal: Arc<ProposeSignal>,
     metrics: MetricsHandle,
+    /// The **base**-kind scope (ADR 0041 §3) — see [`RaftKvNode::scope`].
     scope: StorageScope,
+    /// Every row kind's scope, for the whole-tablet snapshot image.
+    kind_scopes: [StorageScope; ALL_KINDS.len()],
     stream: u64,
     hlc: Arc<Hlc>,
     committed_ceiling: Arc<AtomicU64>,
@@ -4958,6 +5050,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         propose_signal,
         metrics,
         scope,
+        kind_scopes,
         stream,
         hlc,
         committed_ceiling,
@@ -5047,6 +5140,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         apply_stopped,
         metrics.clone(),
         scope,
+        kind_scopes,
         stream,
         Arc::clone(&hlc),
         sealed,
@@ -5193,6 +5287,7 @@ async fn apply_loop<E: Env, S: StorageEngine>(
     apply_stopped: Arc<AtomicBool>,
     metrics: MetricsHandle,
     scope: StorageScope,
+    kind_scopes: [StorageScope; ALL_KINDS.len()],
     stream: u64,
     hlc: Arc<Hlc>,
     mut sealed: Vec<(KeyRange, HlcTimestamp)>,
@@ -5223,6 +5318,7 @@ async fn apply_loop<E: Env, S: StorageEngine>(
             &halted,
             &metrics,
             &scope,
+            &kind_scopes,
             stream,
             &hlc,
             &mut sealed,

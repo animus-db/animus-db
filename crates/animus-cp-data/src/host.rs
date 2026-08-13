@@ -1044,7 +1044,16 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
                 (self.prefix_for)(t.table.as_deref().unwrap_or_default()),
                 t.range.clone(),
             );
-            let has_data = scope.has_data(&self.storage).await;
+            // ADR 0041 §3: ask the **base**-kind scope. `scope` here is the
+            // parent, whose prefix every kind sits under — stripping it would
+            // leave a leading kind byte ahead of the token and the range check
+            // would be meaningless. Base rows are also the right signal for the
+            // reforming-vs-fresh-join question this answers: the other kinds
+            // only ever exist alongside base rows.
+            let has_data = scope
+                .with_kind(crate::KIND_BASE)
+                .has_data(&self.storage)
+                .await;
             // ADR 0018 §2 amendment: a split child must observe its parent's
             // seal before hosting — see `MetadataView::split_parent`'s doc.
             let parent_seal_observed = match view.split_parent.get(&tablet) {

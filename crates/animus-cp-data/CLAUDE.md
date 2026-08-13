@@ -157,9 +157,9 @@ Three modules:
   non-`0xFF` byte) — `None` only for `whole()` or an all-`0xFF` prefix — so a
   periodic byte-estimate over an unbounded-above logical range never degrades
   into a whole-engine scan.
-  **`with_kind(kind)`** (ADR 0041 §3, *primitive landed, group wiring still to
-  come*) derives a **sibling scope for one row kind** — prefix `prefix ||
-  [kind]`, over **the very same `Arc<Mutex<KeyRange>>`**, so one `narrow`/
+  **`with_kind(kind)`** (ADR 0041 §3) derives a **sibling scope for one row
+  kind** — prefix `prefix || [kind]`, over **the very same
+  `Arc<Mutex<KeyRange>>`**, so one `narrow`/
   `widen` moves every kind at once and a split can never leave two kinds
   disagreeing about what the tablet owns. `KIND_BASE`/`KIND_LSI`/
   `KIND_CHANGE`/`KIND_FOOTPRINT`, enumerated by `ALL_KINDS`, are the selectors
@@ -175,6 +175,29 @@ Three modules:
   `TxnRecord::intent_span` from it — so a kind byte in the logical key would
   have forced a rewrite of every span, fence, record key and seal marker in the
   ADR 0018 2PC machinery.
+- **A group owns a scope *set*, not one scope** (ADR 0041 §3). `start_*` takes
+  the tablet's **parent** scope and derives `kind_scopes` from it;
+  **`self.scope` is bound to the base kind**, which is why every pre-existing
+  read, write, fence, txn record and `approx_bytes` kept working with no edit —
+  and why `approx_bytes` now measures *only* base data, the ADR 0034 fix that
+  stops auto-split reacting to change-log churn. Only genuinely whole-tablet
+  operations iterate the set: `engine_image`/`install_engine_image` (every
+  `ImageEntry` gained a leading kind byte, codec `VERSION` 12 — one image
+  carries every scope, and an entry of an unknown kind is dropped with a warn
+  rather than mis-filed) and `erase_scope` (drop-table GC must reclaim a
+  dropped table's LSI rows, change log and footprints too, not just its base
+  rows). `host.rs`'s pre-hosting presence check asks
+  `scope.with_kind(KIND_BASE).has_data(..)` — the parent scope would strip only
+  its own prefix and range-check a leading kind byte, which is meaningless.
+- **`StorageScope::whole()` is no longer an identity transform.** Its base-kind
+  scope prefixes one `KIND_BASE` byte, so *any* group's physical key is
+  `prefix || kind || logical`. Anything reading a group's bytes straight off the
+  engine must go through **`RaftKvNode::physical_key(kind, key)`** rather than
+  assembling `prefix || key` itself — hard-coding the layout was correct only
+  while a group had exactly one scope, and four tests (`snapshot_reads`,
+  `ts_cache`, `witnessing`, `snapshot_catchup`) broke on exactly that
+  assumption. Tests without a node handle (`reconciler`, `reconciler_corpus`,
+  `narrow_scope`) push `KIND_BASE` explicitly in their own `physical` helper.
 - **Fenced commands** (ADR 0026) — `put_fenced`/`delete_fenced`/`cas_fenced`/
   `put_batch_fenced` (and unfenced siblings using `KeyRange::whole()`) carry a
   `fence: KeyRange` *inside the proposed command*, stamped by the leader at

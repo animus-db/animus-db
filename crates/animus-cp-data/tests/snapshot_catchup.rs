@@ -185,9 +185,13 @@ fn snapshot_catchup_carries_txn_records_and_intents() {
     // `Pending` intent as absent (its documented, non-blocking-peek
     // contract), so confirm the *raw* stored bytes instead: tag `1`
     // (`Envelope::Intent`, `txn.rs`), never a bare/undecorated value.
-    let raw = block_on(nodes[lagging].storage().get(&staged_key))
-        .expect("engine read ok")
-        .unwrap_or_else(|| panic!("follower {lagging} missing the staged intent (seed={seed})"));
+    let raw = block_on(
+        nodes[lagging]
+            .storage()
+            .get(&nodes[lagging].physical_key(animus_cp_data::KIND_BASE, &staged_key)),
+    )
+    .expect("engine read ok")
+    .unwrap_or_else(|| panic!("follower {lagging} missing the staged intent (seed={seed})"));
     assert_eq!(
         raw.value.first().copied(),
         Some(1u8),
