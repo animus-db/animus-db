@@ -69,9 +69,11 @@ const MAGIC: u8 = 0xCB;
 /// `11` (ADR 0018 §2 apply-time write-key conditions amendment):
 /// `TxnStage` gained `conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>` —
 /// own-key byte-level OCC preconditions checked at apply (see
-/// `KvCommand::TxnStage`'s doc). Same house convention: a clean bump, no
-/// cross-version compatibility.
-const VERSION: u8 = 11;
+/// `KvCommand::TxnStage`'s doc). `12` (ADR 0041 §3): every snapshot
+/// `ImageEntry` gained a leading **row-kind** byte, so one image carries every
+/// one of a tablet's per-kind storage scopes. Same house convention: a clean
+/// bump, no cross-version compatibility.
+const VERSION: u8 = 12;
 
 /// A decode failure: a description of what was malformed, surfaced loudly by
 /// the caller (logged + dropped; never silently misread).
@@ -336,6 +338,30 @@ fn put_command(out: &mut Vec<u8>, c: &KvCommand) {
             put_key_range(out, fence);
             put_ts(out, *ts);
         }
+        KvCommand::KindBatch {
+            writes,
+            change_log,
+            fence,
+            ts,
+        } => {
+            put_u8(out, 12);
+            out.extend_from_slice(&(writes.len() as u32).to_be_bytes());
+            for (kind, k, v) in writes {
+                put_u8(out, *kind);
+                put_bytes(out, k);
+                put_opt_bytes(out, v);
+            }
+            match change_log {
+                None => put_u8(out, 0),
+                Some((prefix, record)) => {
+                    put_u8(out, 1);
+                    put_bytes(out, prefix);
+                    put_bytes(out, record);
+                }
+            }
+            put_key_range(out, fence);
+            put_ts(out, *ts);
+        }
         KvCommand::Delete { key, fence, ts } => {
             put_u8(out, 2);
             put_bytes(out, key);
@@ -458,6 +484,24 @@ fn read_command(c: &mut Cursor<'_>) -> Result<KvCommand, DecodeError> {
             }
             KvCommand::Batch {
                 puts,
+                fence: read_key_range(c)?,
+                ts: read_ts(c)?,
+            }
+        }
+        12 => {
+            let n = c.u32()?;
+            let mut writes = Vec::with_capacity(n as usize);
+            for _ in 0..n {
+                writes.push((c.u8()?, c.bytes()?, c.opt_bytes()?));
+            }
+            let change_log = match c.u8()? {
+                0 => None,
+                1 => Some((c.bytes()?, c.bytes()?)),
+                other => return Err(format!("invalid change_log tag {other}")),
+            };
+            KvCommand::KindBatch {
+                writes,
+                change_log,
                 fence: read_key_range(c)?,
                 ts: read_ts(c)?,
             }
@@ -807,7 +851,8 @@ pub(crate) fn encode_image(entries: &[ImageEntry]) -> Vec<u8> {
     put_u8(&mut out, MAGIC);
     put_u8(&mut out, VERSION);
     out.extend_from_slice(&(entries.len() as u32).to_be_bytes());
-    for (key, value, version) in entries {
+    for (kind, key, value, version) in entries {
+        put_u8(&mut out, *kind);
         put_bytes(&mut out, key);
         put_opt_bytes(&mut out, value);
         put_u64(&mut out, *version);
@@ -830,7 +875,7 @@ pub(crate) fn decode_image(bytes: &[u8]) -> Result<Vec<ImageEntry>, DecodeError>
     let n = c.u32()?;
     let mut entries = Vec::with_capacity(n as usize);
     for _ in 0..n {
-        entries.push((c.bytes()?, c.opt_bytes()?, c.u64()?));
+        entries.push((c.u8()?, c.bytes()?, c.opt_bytes()?, c.u64()?));
     }
     c.finish()?;
     Ok(entries)
@@ -1090,9 +1135,11 @@ mod tests {
     #[test]
     fn image_round_trips_including_tombstones() {
         let entries: Vec<ImageEntry> = vec![
-            (b"a".to_vec(), Some(vec![0, 1, 255]), 3),
-            (b"b".to_vec(), None, 9), // tombstone
-            (Vec::new(), Some(Vec::new()), 0),
+            (crate::KIND_BASE, b"a".to_vec(), Some(vec![0, 1, 255]), 3),
+            (crate::KIND_BASE, b"b".to_vec(), None, 9), // tombstone
+            (crate::KIND_LSI, b"a".to_vec(), Some(vec![7]), 4),
+            (crate::KIND_CHANGE, b"a".to_vec(), Some(vec![8]), 5),
+            (crate::KIND_FOOTPRINT, Vec::new(), Some(Vec::new()), 0),
         ];
         let bytes = encode_image(&entries);
         assert_eq!(decode_image(&bytes).expect("decodes"), entries);

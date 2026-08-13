@@ -21,11 +21,14 @@
 //! - `create_table_index_survives_node_restart` proves the GSI definition survives a
 //!   restart (Raft WAL): after the registry is wiped, a GSI `Query` still works,
 //!   recovered from the replicated catalog, not process-local memory — and returns
-//!   the **pre-restart item without re-writing it** (the first index query lazily
-//!   backfills the edge-local entry data from a base-table scan).
+//!   the **pre-restart item without re-writing it**: the index's hidden table is
+//!   durable, replicated data (ADR 0041), not a rebuilt-from-writes in-memory
+//!   index, so there is no backfill to perform or need.
 //! - `extended_surface` mirrors `dynamo_extended.rs`: a 3-node in-process cluster
-//!   exercises UpdateItem, BatchWriteItem, TransactWriteItems, a document-path
-//!   projection, and a `KEYS_ONLY` GSI projection.
+//!   exercises UpdateItem, BatchWriteItem, TransactWriteItems (the latter on a
+//!   dedicated unindexed table — `dynamo_index_writes.rs` covers
+//!   `TransactWriteItems`' own ADR 0041 rejection on an *indexed* one), a
+//!   document-path projection, and a `KEYS_ONLY` GSI projection.
 //!
 //! Real time/sockets (the ProdEnv edge), so we poll with generous timeouts.
 
@@ -128,6 +131,33 @@ async fn await_table_schema(node: &Node, table: &str) {
     timeout(Duration::from_secs(20), visible)
         .await
         .unwrap_or_else(|_| panic!("table {table} schema not recovered within 20s"));
+}
+
+/// Poll a GSI `Query` until `accept` is satisfied, returning the last body
+/// observed. A GSI is materialized **asynchronously** by the drain (ADR 0041
+/// §4/§5) — DynamoDB's own eventually-consistent contract — so every
+/// assertion against one must be a converged-or-timeout poll, never a fixed
+/// sleep followed by a one-shot check.
+async fn await_gsi_query(addr: SocketAddr, body: &str, accept: impl Fn(&str) -> bool) -> String {
+    let last = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let seen = std::sync::Arc::clone(&last);
+    let converged = async move {
+        loop {
+            let (status, got) = dynamo(addr, "DynamoDB_20120810.Query", body).await;
+            if status == 200 && accept(&got) {
+                return got;
+            }
+            *seen.lock().unwrap() = got;
+            sleep(Duration::from_millis(100)).await;
+        }
+    };
+    match timeout(Duration::from_secs(15), converged).await {
+        Ok(body) => body,
+        Err(_) => panic!(
+            "GSI query never converged within 15s (last saw: {})",
+            last.lock().unwrap()
+        ),
+    }
 }
 
 async fn stop(node: Node) {
@@ -435,9 +465,11 @@ async fn create_table_index_replicates_to_second_node() {
     assert_eq!(status, 200, "PutItem failed: {body}");
 
     // Query the GSI on the SECOND node's edge. That node never saw the CreateTable
-    // through its own registry — it must have rebuilt the index machinery from the
-    // replicated definition (mirror_catalog_schema → sync_indexes), then indexed the
-    // write it observed. Poll until the write has propagated/observed.
+    // through its own registry — it resolves the index's *shape* from the
+    // replicated definition (mirror_catalog_schema → sync_indexes) and reads the
+    // index's hidden table natively; the row itself is materialized by whichever
+    // node's drain leads the base tablet, asynchronously (ADR 0041 §4/§5). Poll
+    // until it has propagated/converged.
     let addr1 = nodes[1].dynamo_addr();
     let queried = async {
         loop {
@@ -558,22 +590,20 @@ async fn create_table_index_survives_node_restart() {
     );
 
     // A GSI Query must work after the restart — **without re-writing anything**:
-    // the edge rebuilds the index *machinery* from the recovered catalog
-    // (mirror_catalog_schema → sync_indexes), and the first index query lazily
-    // **backfills** the entry data from a base-table scan of the durably stored
-    // items (previously the entries were rebuilt only from writes observed by
-    // this process, so a post-restart index query silently returned nothing
-    // until the item was re-put).
-    let (status, body) = dynamo(
+    // the edge rebuilds the index *definition* bookkeeping from the recovered
+    // catalog (mirror_catalog_schema → sync_indexes), and the index's hidden
+    // table is durable, replicated data (ADR 0041) — no backfill needed or
+    // possible any more, since indexes are only declarable at `CreateTable`
+    // time. A GSI is still eventually consistent by contract, so this is a
+    // converged-or-timeout poll.
+    let body = await_gsi_query(
         dynamo_addr,
-        "DynamoDB_20120810.Query",
         r#"{"TableName":"users","IndexName":"by-email",
             "KeyConditionExpression":"email = :e",
             "ExpressionAttributeValues":{":e":{"S":"a@x"}}}"#,
+        |b| b.contains("\"Count\":1"),
     )
     .await;
-    assert_eq!(status, 200, "GSI query after restart failed: {body}");
-    assert!(body.contains("\"Count\":1"), "expected one match: {body}");
     assert!(body.contains(r#""v":{"N":"7"}"#), "value missing: {body}");
 
     stop(node).await;
@@ -648,17 +678,16 @@ async fn extended_surface() {
     );
 
     // KEYS_ONLY GSI query returns only the key attributes (id + email), not the
-    // base item's other attributes (age/profile).
-    let (status, body) = dynamo(
+    // base item's other attributes (age/profile). Materialized asynchronously
+    // by the drain (ADR 0041 §4/§5), so this is a converged-or-timeout poll.
+    let body = await_gsi_query(
         addr,
-        "DynamoDB_20120810.Query",
         r#"{"TableName":"users","IndexName":"by-email",
             "KeyConditionExpression":"email = :e",
             "ExpressionAttributeValues":{":e":{"S":"a@x"}}}"#,
+        |b| b.contains("\"Count\":1"),
     )
     .await;
-    assert_eq!(status, 200, "index Query failed: {body}");
-    assert!(body.contains("\"Count\":1"), "expected one match: {body}");
     assert!(body.contains(r#""id":{"S":"u1"}"#), "id missing: {body}");
     assert!(
         body.contains(r#""email":{"S":"a@x"}"#),
@@ -691,15 +720,38 @@ async fn extended_surface() {
     assert_eq!(status, 200);
     assert_eq!(body, "{}", "u1 should be deleted: {body}");
 
-    // TransactWriteItems: a ConditionCheck that u2 exists + a conditional Put of
-    // u4 only if absent. Both hold, so it succeeds.
+    // TransactWriteItems: exercised against a **separate, unindexed** table —
+    // `users` carries a GSI, and ADR 0041's write-coverage fix rejects any
+    // `TransactWriteItems` request whose writes touch an indexed table (see
+    // this file's `transact_write_items_rejected_on_indexed_table` and
+    // `dynamo_index_writes.rs` for that rejection itself). This section keeps
+    // covering the ordinary TransactWriteItems mechanics — a ConditionCheck +
+    // a conditional Put, and a failing condition — on a table with no
+    // secondary index, exactly like `dynamo_txn.rs`'s own coverage.
+    let (status, body) = dynamo(
+        addr,
+        "DynamoDB_20120810.CreateTable",
+        r#"{"TableName":"notes","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "CreateTable(notes) failed: {body}");
+    let (status, body) = dynamo(
+        addr,
+        "DynamoDB_20120810.PutItem",
+        r#"{"TableName":"notes","Item":{"id":{"S":"n2"}}}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "PutItem(n2) failed: {body}");
+
+    // A ConditionCheck that n2 exists + a conditional Put of n4 only if
+    // absent. Both hold, so it succeeds.
     let (status, body) = dynamo(
         addr,
         "DynamoDB_20120810.TransactWriteItems",
         r#"{"TransactItems":[
-            {"ConditionCheck":{"TableName":"users","Key":{"id":{"S":"u2"}},
+            {"ConditionCheck":{"TableName":"notes","Key":{"id":{"S":"n2"}},
                                "ConditionExpression":"attribute_exists(id)"}},
-            {"Put":{"TableName":"users","Item":{"id":{"S":"u4"},"email":{"S":"d@x"}},
+            {"Put":{"TableName":"notes","Item":{"id":{"S":"n4"},"body":{"S":"d@x"}},
                     "ConditionExpression":"attribute_not_exists(id)"}}]}"#,
     )
     .await;
@@ -707,13 +759,13 @@ async fn extended_surface() {
     let (status, body) = dynamo(
         addr,
         "DynamoDB_20120810.GetItem",
-        r#"{"TableName":"users","Key":{"id":{"S":"u4"}}}"#,
+        r#"{"TableName":"notes","Key":{"id":{"S":"n4"}}}"#,
     )
     .await;
     assert_eq!(status, 200);
     assert!(
-        body.contains(r#""email":{"S":"d@x"}"#),
-        "u4 not written: {body}"
+        body.contains(r#""body":{"S":"d@x"}"#),
+        "n4 not written: {body}"
     );
 
     // A failing transaction condition rejects the whole request. Since ADR
@@ -726,7 +778,7 @@ async fn extended_surface() {
         addr,
         "DynamoDB_20120810.TransactWriteItems",
         r#"{"TransactItems":[
-            {"ConditionCheck":{"TableName":"users","Key":{"id":{"S":"nope"}},
+            {"ConditionCheck":{"TableName":"notes","Key":{"id":{"S":"nope"}},
                                "ConditionExpression":"attribute_exists(id)"}}]}"#,
     )
     .await;

@@ -31,6 +31,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub mod config;
+mod index_drain;
 pub mod otel;
 pub use config::ClusterConfig;
 // Re-exported so callers (CLI, tests, operators) can inspect a node's cached
@@ -168,6 +169,68 @@ impl CpGroup {
         match self {
             CpGroup::Lsm(n) => n.put_batch_fenced(puts, fence),
             CpGroup::Mem(n) => n.put_batch_fenced(puts, fence),
+        }
+    }
+
+    /// As [`put_fenced`](Self::put_fenced), but for a **multi-kind atomic
+    /// batch** — base row, LSI rows, footprint and an optional change-log
+    /// record as one Raft entry (ADR 0041 §3/§4). See
+    /// [`RaftKvNode::put_kind_batch_fenced`].
+    fn put_kind_batch_fenced(
+        &self,
+        writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
+        change_log: Option<(Vec<u8>, Vec<u8>)>,
+        fence: KeyRange,
+    ) -> ProposeResult {
+        match self {
+            CpGroup::Lsm(n) => n.put_kind_batch_fenced(writes, change_log, fence),
+            CpGroup::Mem(n) => n.put_kind_batch_fenced(writes, change_log, fence),
+        }
+    }
+
+    /// Every pending change-log record this tablet holds, in commit order
+    /// (ADR 0041 §4). See [`RaftKvNode::pending_changes`].
+    pub(crate) async fn pending_changes(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
+        match self {
+            CpGroup::Lsm(n) => n.pending_changes().await,
+            CpGroup::Mem(n) => n.pending_changes().await,
+        }
+    }
+
+    /// A bounded base-scope scan over `[start, end)` in key order — the
+    /// partition-range read the GSI drain recomputes an item's index rows from.
+    pub(crate) async fn local_scan_bounded(
+        &self,
+        start: &[u8],
+        end: &[u8],
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        match self {
+            CpGroup::Lsm(n) => n.local_scan(start, Some(end), None).await,
+            CpGroup::Mem(n) => n.local_scan(start, Some(end), None).await,
+        }
+    }
+
+    /// Read one key of a non-base row-kind scope (ADR 0041 §3). See
+    /// [`RaftKvNode::local_get_kind`].
+    pub(crate) async fn local_get_kind(&self, kind: u8, key: &[u8]) -> Option<Vec<u8>> {
+        match self {
+            CpGroup::Lsm(n) => n.local_get_kind(kind, key).await,
+            CpGroup::Mem(n) => n.local_get_kind(kind, key).await,
+        }
+    }
+
+    /// Linearizable ReadIndex range scan of a non-base row-kind scope (ADR
+    /// 0041 §3) — the LSI `Query`/`Scan` read primitive. `end: None` is
+    /// unbounded above. See [`RaftKvNode::linearizable_scan_kind`].
+    async fn linearizable_scan_kind(
+        &self,
+        kind: u8,
+        start: &[u8],
+        end: Option<&[u8]>,
+    ) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
+        match self {
+            CpGroup::Lsm(n) => n.linearizable_scan_kind(kind, start, end).await,
+            CpGroup::Mem(n) => n.linearizable_scan_kind(kind, start, end).await,
         }
     }
 
@@ -853,6 +916,49 @@ pub enum ClientRequest {
     PutBatch {
         entries: Vec<(Vec<u8>, Vec<u8>)>,
         table: String,
+    },
+    /// **Internal index-maintenance RPC — never sent bare, only wrapped in
+    /// [`Forwarded`](Self::Forwarded)** (ADR 0041 §3/§4): commit `writes`
+    /// spanning several of one tablet's row-kind scopes, plus an optional
+    /// change-log record, as **one** `KvCommand::KindBatch` Raft entry.
+    ///
+    /// Every key here belongs to the **same tablet** (they share a partition
+    /// key, hence a token — the caller checks this before proposing), which is
+    /// what makes an LSI row atomic with the base row it derives from.
+    ///
+    /// Bare delivery is rejected because this is the DynamoDB edge's own
+    /// maintenance primitive, not a client operation: a client sending one
+    /// could write arbitrary bytes straight into a table's LSI/change-log
+    /// scopes and desynchronise its indexes from its base rows. `Put`/
+    /// `PutBatch` remain the client-facing writes, and they only ever reach
+    /// the base kind.
+    KindWrite {
+        table: String,
+        writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
+        #[serde(default)]
+        change_log: Option<(Vec<u8>, Vec<u8>)>,
+    },
+    /// **Internal index-read RPC — never sent bare, only wrapped in
+    /// [`Forwarded`](Self::Forwarded)** (ADR 0041 §5): a **linearizable**
+    /// range scan of one of `table`'s non-base row-kind scopes over
+    /// `[start, end)` — the per-tablet forwarding payload behind both an LSI
+    /// `Query` (single-tablet, `ClientCtx::cp_scan_kind`) and an LSI `Scan`'s
+    /// table-wide fan-out (`ClientCtx::cp_scan_kind_table`, one `KindScan`
+    /// per overlapping tablet). `end: None` is unbounded above — the tail
+    /// tablet of a table-wide fan-out, mirroring [`Scan`](Self::Scan)'s own
+    /// `end: None` unbounded-above convention.
+    ///
+    /// Bare delivery is rejected for the same reason [`KindWrite`](Self::KindWrite)
+    /// is: this reads a scope a client operation never names directly, and
+    /// exposing it bare would let an arbitrary caller read a table's
+    /// LSI/change-log/footprint bytes by kind number rather than through the
+    /// DynamoDB surface that interprets them.
+    KindScan {
+        table: String,
+        kind: u8,
+        start: Vec<u8>,
+        #[serde(default)]
+        end: Option<Vec<u8>>,
     },
     /// Read the latest value at `key` of `table` (linearizable CP ReadIndex on the
     /// group leader). `table` is **required** (ADR 0023).
@@ -1980,6 +2086,12 @@ impl BoundNode {
         // per tablet).
         tasks.push(tokio::spawn(txn_resolver_loop(ctx.clone())));
 
+        // GSI drain (ADR 0041 §4): materializes global secondary indexes from
+        // the change records indexed writes leave behind. Data-role-only and
+        // per-tablet leadership-checked, exactly like `txn_resolver_loop` above
+        // — a node that leads no tablet does nothing each tick.
+        tasks.push(tokio::spawn(index_drain::index_drain_loop(ctx.clone())));
+
         // Auto-split loop (Phase 2.4 / ADR 0034), opt-in: a node splits a tablet
         // it leads once it exceeds **either** configured threshold (it checks
         // leadership per tablet, so running it on every node is harmless).
@@ -2823,6 +2935,12 @@ impl BoundDataNode {
             ctx.clone(),
             reconciler,
         )));
+
+        // GSI drain (ADR 0041 §4): materializes global secondary indexes from
+        // the change records indexed writes leave behind. Data-role-only and
+        // per-tablet leadership-checked, exactly like `txn_resolver_loop` above
+        // — a node that leads no tablet does nothing each tick.
+        tasks.push(tokio::spawn(index_drain::index_drain_loop(ctx.clone())));
 
         if auto_split_threshold.is_some() || auto_split_bytes_threshold.is_some() {
             tasks.push(tokio::spawn(auto_split_loop(
@@ -3734,6 +3852,172 @@ impl ClientCtx {
     /// arbitrary `N` (the wire edge caps its own surface). Provisions `table`'s first
     /// tablet on demand, like [`cp_write`](Self::cp_write). The bulk-write throughput
     /// primitive behind DynamoDB `BatchWriteItem` and the admin bulk seeder.
+    /// Commit a **multi-kind atomic batch** for one item (ADR 0041 §3/§4):
+    /// `writes` spanning this tablet's base/LSI/footprint scopes plus an
+    /// optional change-log record, as one Raft entry.
+    ///
+    /// Every write must belong to the **same tablet** — they share the item's
+    /// partition key, hence its token. That is checked here rather than
+    /// assumed: a batch straddling two tablets cannot be atomic, and silently
+    /// committing only the first tablet's share is exactly the torn
+    /// base-row-without-its-index-row state this whole mechanism exists to
+    /// prevent. A caller that needs several partitions issues one call each.
+    pub(crate) async fn cp_kind_write(
+        &self,
+        table: &str,
+        writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
+        change_log: Option<(Vec<u8>, Vec<u8>)>,
+    ) -> Result<(), String> {
+        let Some(first) = writes.first().map(|(_, k, _)| k.clone()) else {
+            return Ok(());
+        };
+        // Auto-provision the table's tablet on first write (ADR 0023), as
+        // `cp_write`/`cp_batch_write` do.
+        if !self.effective_metadata().has_table_tablet(table) {
+            self.provision_tablet(table).await?;
+        }
+        let tablet = self
+            .tablet_for(table, &first)
+            .ok_or_else(|| format!("no tablet owns a kind-batch key of table `{table}`"))?;
+        for (_, key, _) in &writes {
+            if self.tablet_for(table, key) != Some(tablet) {
+                return Err(format!(
+                    "kind-batch keys of table `{table}` span more than one tablet; \
+                     an atomic index write must stay within one partition"
+                ));
+            }
+        }
+        match self.cp_route(table, &first).await {
+            CpRoute::Local(leader) => Self::cp_kind_local(&leader, writes, change_log).await,
+            CpRoute::Forward(addr) => {
+                let request = ClientRequest::KindWrite {
+                    table: table.to_owned(),
+                    writes,
+                    change_log,
+                };
+                Self::ok_or_err(
+                    self.cp_forward(table, &first, addr, request).await,
+                    "forwarded CP kind write",
+                )
+            }
+            CpRoute::None => Err("no CP group leader reachable".into()),
+        }
+    }
+
+    /// As [`cp_kind_write`](Self::cp_kind_write), but for a batch with **no
+    /// base-kind write** — the GSI drain's footprint update plus the change
+    /// records it consumes, which touch no client-visible row.
+    ///
+    /// Confirmation therefore cannot probe a base row; this waits on the
+    /// proposal being accepted and applied instead. That is weaker than
+    /// `cp_kind_write`'s value-equality probe, and safe only because the
+    /// drain is idempotent: a batch that silently no-ops (a fence miss) leaves
+    /// the change records in place, so the next tick simply redoes the same
+    /// reconciliation.
+    pub(crate) async fn cp_kind_write_raw(
+        &self,
+        table: &str,
+        writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
+    ) -> Result<(), String> {
+        let Some(first) = writes.first().map(|(_, k, _)| k.clone()) else {
+            return Ok(());
+        };
+        match self.cp_route(table, &first).await {
+            CpRoute::Local(leader) => {
+                let fence = leader.scope_range();
+                for (_, key, _) in &writes {
+                    if !fence.contains(key) {
+                        return Err("kind write outside this group's live range; retry".into());
+                    }
+                }
+                // Confirm on the batch's *intended effect* — the first record
+                // it consumes being gone — rather than on `Accepted`, which only
+                // means "appended to the leader's log". A fenced-out entry
+                // commits as a no-op, so acking on acceptance alone would report
+                // a reconciliation that never landed; the drain would then never
+                // revisit it, since it believes the records are consumed.
+                let probe = writes
+                    .iter()
+                    .find(|(kind, _, v)| *kind == animus_cp_data::KIND_CHANGE && v.is_none())
+                    .map(|(_, k, _)| k.clone());
+                match leader.put_kind_batch_fenced(writes, None, fence) {
+                    ProposeResult::Accepted { .. } => {}
+                    other => return Err(format!("kind write not accepted: {other:?}")),
+                }
+                let Some(probe) = probe else {
+                    return Ok(()); // nothing consumed; nothing to confirm
+                };
+                let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
+                while tokio::time::Instant::now() < deadline {
+                    if leader
+                        .local_get_kind(animus_cp_data::KIND_CHANGE, &probe)
+                        .await
+                        .is_none()
+                    {
+                        return Ok(());
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err("index drain batch did not apply in time".into())
+            }
+            CpRoute::Forward(addr) => {
+                let request = ClientRequest::KindWrite {
+                    table: table.to_owned(),
+                    writes,
+                    change_log: None,
+                };
+                Self::ok_or_err(
+                    self.cp_forward(table, &first, addr, request).await,
+                    "forwarded CP kind write",
+                )
+            }
+            CpRoute::None => Err("no CP group leader reachable".into()),
+        }
+    }
+
+    /// Propose a `KindBatch` on a **known-leader** local handle and confirm it.
+    ///
+    /// Confirmation probes the batch's **base-kind** write, the one row a
+    /// client can observe: `poll_probe` reads through the group's base scope,
+    /// so an LSI/footprint/change-log write is not observable to it. Every
+    /// caller includes a base write (a put's item, or a delete's tombstone
+    /// *value*), so there is always a probe; a batch with none is refused
+    /// rather than acked unconfirmed — a fenced-out entry commits as a no-op,
+    /// so acking without a probe would falsely report a write that never
+    /// happened (the hazard `cp_batch_local`'s doc spells out).
+    async fn cp_kind_local(
+        leader: &CpGroup,
+        writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
+        change_log: Option<(Vec<u8>, Vec<u8>)>,
+    ) -> Result<(), String> {
+        let probe = writes
+            .iter()
+            .find(|(kind, _, v)| *kind == animus_cp_data::KIND_BASE && v.is_some())
+            .map(|(_, k, v)| (k.clone(), v.clone().expect("filtered to Some")));
+        let Some((probe_key, probe_val)) = probe else {
+            return Err("a kind batch must carry a base-kind write to confirm on".into());
+        };
+        // Pre-propose range check, the same reasoning as `cp_batch_propose`:
+        // a fenced-out entry applies as a no-op, and the probe below would then
+        // just time out with a generic error instead of a clean routing error.
+        let fence = leader.scope_range();
+        for (_, key, _) in &writes {
+            if !fence.contains(key) {
+                return Err("kind write outside this group's live range; retry".into());
+            }
+        }
+        match leader.put_kind_batch_fenced(writes, change_log, fence) {
+            ProposeResult::Accepted { .. } => {}
+            other => return Err(format!("kind write not accepted: {other:?}")),
+        }
+        let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
+        if Self::poll_probe(leader, &probe_key, &probe_val, deadline).await {
+            Ok(())
+        } else {
+            Err("CP kind write did not commit in time".into())
+        }
+    }
+
     pub(crate) async fn cp_batch_write(
         &self,
         table: &str,
@@ -5199,6 +5483,169 @@ impl ClientCtx {
         }
     }
 
+    /// Linearizable CP range scan of one of `table`'s non-base row-kind
+    /// scopes over `[start, end)` (ADR 0041 §3/§5) — the LSI `Query` read
+    /// primitive. **Not** a per-table fan-out like [`cp_scan`](Self::cp_scan):
+    /// an LSI query is scoped to one base partition, which is one tablet by
+    /// construction (the same tablet the base row itself lives on), so
+    /// `start` and `end` must resolve to that same tablet — checked here
+    /// rather than assumed, mirroring [`cp_kind_write`](Self::cp_kind_write)'s
+    /// cross-tablet guard: silently scanning only the first tablet's share of
+    /// a straddling range would be a silent partial read.
+    pub(crate) async fn cp_scan_kind(
+        &self,
+        table: &str,
+        kind: u8,
+        start: Vec<u8>,
+        end: Vec<u8>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
+        let start_tablet = self
+            .tablet_for(table, &start)
+            .ok_or_else(|| format!("no tablet owns the kind-scan start of table `{table}`"))?;
+        if self.tablet_for(table, &end) != Some(start_tablet) {
+            return Err(format!(
+                "kind-scan range of table `{table}` spans more than one tablet; \
+                 an LSI query is scoped to one partition"
+            ));
+        }
+        self.cp_scan_kind_one(table, kind, start, Some(end)).await
+    }
+
+    /// A **table-wide fan-out** of the kind-scoped scan (ADR 0041 §5) — the
+    /// LSI `Scan` read primitive. Unlike [`cp_scan_kind`](Self::cp_scan_kind)'s
+    /// single-tablet routing (an LSI `Query` is scoped to one base partition,
+    /// hence one tablet by construction), a table-wide `Scan` against an LSI
+    /// sweeps every tablet of `table`'s own ring in token order — mirroring
+    /// [`cp_scan`](Self::cp_scan)'s per-table fan-out exactly, but scanning
+    /// each overlapping tablet's `kind`-scoped scope instead of its base
+    /// scope. `end == None` is unbounded above (a whole-table scan); the one
+    /// tablet whose *own* metadata range end is also `None` (an unsplit or
+    /// not-yet-split tail tablet) is asked to scan `[sub_start, None)` too —
+    /// no finite byte string can bound a kind scope's logical keyspace in
+    /// general (see [`RaftKvNode::linearizable_scan_kind`]'s doc), so that
+    /// bound is derived inside the primitive itself, not computed here.
+    pub(crate) async fn cp_scan_kind_table(
+        &self,
+        table: &str,
+        kind: u8,
+        start: Vec<u8>,
+        end: Option<Vec<u8>>,
+        limit: Option<usize>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
+        // The table's tablets overlapping [start, end), in token order — the
+        // identical range math `cp_scan` uses (see that method's doc for the
+        // `effective_metadata()` staleness-audit rationale, which applies
+        // here unchanged).
+        let mut ranges: Vec<KeyRange> = self
+            .effective_metadata()
+            .tablets_for_table(table)
+            .map(|(_, t)| t.range.clone())
+            .filter(|r| {
+                end.as_deref().is_none_or(|e| r.start.as_slice() < e)
+                    && r.end.as_deref().is_none_or(|re| start.as_slice() < re)
+            })
+            .collect();
+        ranges.sort();
+        let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for r in ranges {
+            if let Some(l) = limit
+                && out.len() >= l
+            {
+                break;
+            }
+            let sub_start = start.clone().max(r.start);
+            let sub_end: Option<Vec<u8>> = match (r.end, &end) {
+                (None, e) => e.clone(),
+                (Some(re), None) => Some(re),
+                (Some(re), Some(e)) => Some(re.min(e.clone())),
+            };
+            if let Some(se) = &sub_end
+                && sub_start.as_slice() >= se.as_slice()
+            {
+                continue;
+            }
+            out.extend(
+                self.cp_scan_kind_one(table, kind, sub_start, sub_end)
+                    .await?,
+            );
+        }
+        if let Some(l) = limit {
+            out.truncate(l);
+        }
+        Ok(out)
+    }
+
+    /// Scan a single tablet's kind-scoped sub-range on its group leader (the
+    /// body both [`cp_scan_kind`](Self::cp_scan_kind) and
+    /// [`cp_scan_kind_table`](Self::cp_scan_kind_table) call). `start`
+    /// resolves to exactly one tablet of `table`, so it routes/forwards like
+    /// any other CP op. `end == None` is unbounded above.
+    async fn cp_scan_kind_one(
+        &self,
+        table: &str,
+        kind: u8,
+        start: Vec<u8>,
+        end: Option<Vec<u8>>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
+        let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
+        loop {
+            let err = match self.cp_route(table, &start).await {
+                CpRoute::Local(leader) => {
+                    match Self::cp_scan_kind_local(&leader, kind, &start, end.as_deref()).await {
+                        Ok(p) => return Ok(p),
+                        Err(e) => e,
+                    }
+                }
+                CpRoute::Forward(addr) => {
+                    let request = ClientRequest::KindScan {
+                        table: table.to_owned(),
+                        kind,
+                        start: start.clone(),
+                        end: end.clone(),
+                    };
+                    match self.cp_forward(table, &start, addr, request).await {
+                        ClientResponse::Pairs(p) => return Ok(p),
+                        ClientResponse::Error(e) => e,
+                        other => {
+                            return Err(format!(
+                                "unexpected reply to forwarded CP kind scan: {other:?}"
+                            ));
+                        }
+                    }
+                }
+                CpRoute::None => return Err("no CP group leader reachable".into()),
+            };
+            if !Self::read_should_retry(&err) || tokio::time::Instant::now() >= deadline {
+                return Err(err);
+            }
+            tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+        }
+    }
+
+    /// Serve a linearizable **kind-scoped scan** on a known-leader local
+    /// handle, enforcing the read-side scope pre-check (ADR 0033) — the
+    /// kind-scan dual of [`cp_scan_local`](Self::cp_scan_local): a scope that
+    /// has not yet caught up to the metadata-derived request window (a
+    /// merge's widen in flight) would otherwise silently truncate the results
+    /// rather than error. `end == None` is unbounded above.
+    async fn cp_scan_kind_local(
+        leader: &CpGroup,
+        kind: u8,
+        start: &[u8],
+        end: Option<&[u8]>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
+        let requested = KeyRange::new(start.to_vec(), end.map(<[u8]>::to_vec));
+        if !leader.scope_range().contains_range(&requested) {
+            return Err(format!(
+                "scan window {requested:?} outside tablet's current range (stale routing, likely a split/merge crossover); retry"
+            ));
+        }
+        match leader.linearizable_scan_kind(kind, start, end).await {
+            Some(p) => Ok(p),
+            None => Err("CP group leader moved; retry".into()),
+        }
+    }
+
     /// Propose a CP write on a **known-leader** local handle and wait until it is
     /// committed + durable + applied before returning — durable-before-ack.
     ///
@@ -5703,6 +6150,25 @@ impl ClientCtx {
                     Err(e) => ClientResponse::Error(e),
                 }
             }
+            ClientRequest::KindWrite {
+                table,
+                writes,
+                change_log,
+            } => {
+                // Every write shares one tablet (they share a partition key), so
+                // resolve the leader by the first key and serve the whole entry.
+                let Some(first) = writes.first().map(|(_, k, _)| k.clone()) else {
+                    return ClientResponse::PutOk; // empty batch is a no-op
+                };
+                let tablet = self.tablet_for(&table, &first);
+                let Some(leader) = tablet.and_then(|t| self.edge.cp_leader(t)) else {
+                    return self.not_leader_refusal(tablet);
+                };
+                match Self::cp_kind_local(&leader, writes, change_log).await {
+                    Ok(()) => ClientResponse::PutOk,
+                    Err(e) => ClientResponse::Error(e),
+                }
+            }
             ClientRequest::Get { key, table } => {
                 let tablet = self.tablet_for(&table, &key);
                 match tablet.and_then(|t| self.edge.cp_leader(t)) {
@@ -5743,6 +6209,25 @@ impl ClientCtx {
                 // scope lagging the metadata-derived scan window would
                 // silently truncate results, not error.
                 match Self::cp_scan_local(&leader, &start, end.as_deref(), limit).await {
+                    Ok(p) => ClientResponse::Pairs(p),
+                    Err(e) => ClientResponse::Error(e),
+                }
+            }
+            // ADR 0041 §5: the LSI `Query` forwarding payload. `start`/`end`
+            // resolve to one tablet by construction (the forwarder already
+            // checked this in `cp_scan_kind`), so resolve the leader by
+            // `start` alone.
+            ClientRequest::KindScan {
+                table,
+                kind,
+                start,
+                end,
+            } => {
+                let tablet = self.tablet_for(&table, &start);
+                let Some(leader) = tablet.and_then(|t| self.edge.cp_leader(t)) else {
+                    return self.not_leader_refusal(tablet);
+                };
+                match Self::cp_scan_kind_local(&leader, kind, &start, end.as_deref()).await {
                     Ok(p) => ClientResponse::Pairs(p),
                     Err(e) => ClientResponse::Error(e),
                 }
@@ -7539,6 +8024,8 @@ fn request_kind(request: &ClientRequest) -> &'static str {
         ClientRequest::Status => "status",
         ClientRequest::Put { .. } => "put",
         ClientRequest::PutBatch { .. } => "put_batch",
+        ClientRequest::KindWrite { .. } => "kind_write",
+        ClientRequest::KindScan { .. } => "kind_scan",
         ClientRequest::Get { .. } => "get",
         ClientRequest::Scan { .. } => "scan",
         ClientRequest::Delete { .. } => "delete",
@@ -7665,6 +8152,29 @@ async fn handle_request(ctx: &ClientCtx, request: ClientRequest) -> ClientRespon
         // schema-DDL relay gating) does not apply to them — their real
         // handling lives in `ClientCtx::cp_serve_forwarded`'s match,
         // reached only via the `Forwarded` arm above.
+        // ADR 0041 §3/§4: the DynamoDB edge's index-maintenance primitive, not
+        // a client operation — see `ClientRequest::KindWrite`'s doc for why a
+        // bare one is refused rather than served. Like the 2PC RPCs below it is
+        // a data-plane request, not a `MetaCommand`, so `is_relayable_command`
+        // (control-plane schema-DDL relay gating) does not apply; its real
+        // handling lives in `cp_serve_forwarded`'s match, reached only through
+        // the `Forwarded` arm above.
+        ClientRequest::KindWrite { .. } => ClientResponse::Error(
+            "this request is an internal index-maintenance RPC and must be sent wrapped in \
+             `Forwarded`"
+                .into(),
+        ),
+        // ADR 0041 §5: the LSI `Query` read primitive, the read-side dual of
+        // `KindWrite` just above and refused for the identical reason — a
+        // bare caller could otherwise read a table's LSI/change-log/
+        // footprint bytes by kind number directly, bypassing the DynamoDB
+        // surface that interprets them. Not a `MetaCommand`, so
+        // `is_relayable_command` does not apply; real handling lives in
+        // `cp_serve_forwarded`'s match, reached only through `Forwarded`.
+        ClientRequest::KindScan { .. } => ClientResponse::Error(
+            "this request is an internal index-read RPC and must be sent wrapped in `Forwarded`"
+                .into(),
+        ),
         ClientRequest::TxnPrepare { .. }
         | ClientRequest::TxnDecide { .. }
         | ClientRequest::TxnResolve { .. }
@@ -8086,9 +8596,10 @@ impl ClientCtx {
         })
     }
 
-    /// Drop `table` **and garbage-collect its data** (ADR 0024): remove the
-    /// schema from the replicated catalog, then remove the table's tablets from
-    /// the replicated tablet map — the trigger each hosting node's per-node
+    /// Drop `table` **and garbage-collect its data** (ADR 0024), cascading to
+    /// every GSI's hidden index table (ADR 0041 §5): remove the schema from the
+    /// replicated catalog, then remove every affected table's tablets from the
+    /// replicated tablet map — the trigger each hosting node's per-node
     /// tablet-host reconciler (ADR 0031 PR4) converges on by stopping its
     /// local group and deleting its engine + WAL files. This is the real
     /// `DROP TABLE` sink (CQL + the admin
@@ -8096,11 +8607,87 @@ impl ClientCtx {
     /// the schema-only primitive (the admin panel's schema-only drop) — an
     /// `ALTER TABLE` now mutates the schema in place via
     /// [`replace_table_schema`](Self::replace_table_schema) and never GCs data.
-    /// Returns once both the schema and
-    /// the tablets have left this node's replicated metadata; the per-node file
+    /// Returns once the schema and every tablet (base **and** hidden index)
+    /// have left this node's replicated metadata; the per-node file
     /// reclamation continues asynchronously on every replica.
+    ///
+    /// **Cascade order is load-bearing for convergence under a crash-and-retry
+    /// (ADR 0041 §5's as-built note)**:
+    ///
+    /// 1. **Enumerate the table's GSIs and drop each hidden table's tablets
+    ///    first**, while the definitions are still enumerable — a base
+    ///    table's LSIs need no separate step (colocated in the base table's
+    ///    own tablets, reclaimed by step 3's `erase_scope`, which walks every
+    ///    row kind). The read is [`metadata_fresh`](Self::metadata_fresh), not
+    ///    a cached/mirrored view: this is a **permanent** decision (once step
+    ///    2 removes the schema, the defs are gone for good), so it must not
+    ///    read stale. A crash here leaves the base schema and its defs
+    ///    intact, so a retry re-enumerates and finishes any hidden table this
+    ///    attempt didn't reach.
+    /// 2. **Drop the base schema** (which deletes the GSI/LSI *definitions*
+    ///    with it). A crash here leaves a state where step 1's hidden-table
+    ///    drops already landed but the base tablets have not — a retry's
+    ///    step 1 finds no GSIs left to enumerate (already gone) and proceeds
+    ///    straight to step 3.
+    /// 3. **Drop the base table's own tablets** (base rows, colocated LSI
+    ///    rows, the change log, and footprints — all four `StorageScope`
+    ///    kinds sharing one tablet group, reclaimed together by
+    ///    `CpGroup::erase_scope` iterating `kind_scopes`). A crash here
+    ///    leaves the schema gone but the base tablets present — a retry's
+    ///    steps 1/2 are no-ops (idempotent) and it finishes step 3.
+    ///
+    /// **Belt-and-suspenders second sweep**: the GSI drain provisions a
+    /// hidden table's first tablet *lazily*, and can do so **concurrently**
+    /// with this drop (a change record drained mid-drop, racing step 1's
+    /// enumeration). After step 3, sweep the tablet map itself — not the
+    /// now-gone index definitions — for any tablet named `<table>$<index>`
+    /// ([`animus_dynamo::split_index_table_name`]) and drop those too. This
+    /// is keyed on the tablet map, so it also cleans up any orphan left by a
+    /// **pre-fix** drop that never cascaded at all. `drain_tablet`'s own
+    /// provisioning and `reconcile_partition`'s writes race this drop
+    /// harmlessly — both error paths are logged-and-swallowed by
+    /// `index_drain_loop` (best-effort convergence; the next tick just
+    /// retries), and once this table's groups leave `hosted_groups()` (the
+    /// reconciler's `Reclaim` teardown), the drain simply stops sweeping
+    /// them.
     pub(crate) async fn drop_table(&self, table: String) -> Result<(), String> {
+        let indexes = self.metadata_fresh().await.table_indexes(&table).to_vec();
+        for idx in indexes
+            .iter()
+            .filter(|idx| idx.kind == animus_control::schema::IndexKind::Global)
+        {
+            let index_table = animus_dynamo::index_table_name(&table, &idx.name);
+            self.drop_table_tablets(index_table).await?;
+        }
+
         self.drop_table_schema(table.clone()).await?;
+        self.drop_table_tablets(table.clone()).await?;
+
+        let orphans: BTreeSet<String> = self
+            .effective_metadata()
+            .tablets
+            .values()
+            .filter_map(|t| t.table.as_deref())
+            .filter(|name| {
+                animus_dynamo::split_index_table_name(name).is_some_and(|(base, _)| base == table)
+            })
+            .map(str::to_owned)
+            .collect();
+        for orphan in orphans {
+            self.drop_table_tablets(orphan).await?;
+        }
+        Ok(())
+    }
+
+    /// Propose `MetaCommand::DropTableTablets` for `table` and wait until every
+    /// tablet scoped to it has left this node's replicated metadata (ADR 0024).
+    /// Shared by [`drop_table`](Self::drop_table)'s base-table drop and its
+    /// GSI-hidden-table cascade (ADR 0041 §5) — same command, same
+    /// commit-wait discipline either way. `table` need not have a schema
+    /// entry: a hidden index table never has one, and `DropTableTablets`'s
+    /// apply is keyed purely on the tablet map (`tablets_for_table`), not the
+    /// schema catalog.
+    async fn drop_table_tablets(&self, table: String) -> Result<(), String> {
         let command = MetaCommand::DropTableTablets {
             table: table.clone(),
         };
@@ -8109,9 +8696,10 @@ impl ClientCtx {
         // creation yet, so local absence cannot prove there is nothing to drop
         // (and `propose_and_await` returns on its first poll in that state).
         // The command is idempotent (`NoOp`) on the leader when there truly is
-        // nothing. (A *schema'd* table is safe either way — the schema-drop
-        // wait above already forced this replica past the tablet's creation in
-        // the log — but a plain-client table skips that wait.)
+        // nothing. (A *schema'd* base table is safe either way — the
+        // schema-drop wait already forced this replica past the tablet's
+        // creation in the log — but a plain-client table, or a hidden index
+        // table with no schema wait at all, skips that forcing.)
         self.propose_schema(&command).await;
         // `effective_metadata()`, not `self.control.metadata_cached()`
         // directly (ADR 0035 PR5 staleness-audit fix): the latter is

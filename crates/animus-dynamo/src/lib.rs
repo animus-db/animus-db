@@ -23,11 +23,16 @@ use animus_storage::{StorageEngine, Version};
 use serde::{Deserialize, Serialize};
 
 pub mod condition;
+pub mod index;
 pub mod registry;
 pub mod schema;
 pub mod wire;
 
 pub use condition::{ConditionExpression, SortKeyCondition};
+pub use index::{
+    ChangeRecord, FootprintEntry, GsiRowRef, IndexFootprint, ItemFootprint, LsiRowRef,
+    index_table_name, is_index_table_name, split_index_table_name,
+};
 pub use registry::{
     GlobalSecondaryIndex, IndexProjection, LocalSecondaryIndex, RegistryError, SchemaRegistry,
     SecondaryIndex,

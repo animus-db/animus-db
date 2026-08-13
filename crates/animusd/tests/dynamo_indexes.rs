@@ -87,6 +87,37 @@ async fn dynamo(addr: std::net::SocketAddr, target: &str, body: &str) -> (u16, S
     (status, payload.to_string())
 }
 
+/// Poll a GSI `Query` until `accept` is satisfied, returning the last body
+/// observed. A GSI is materialized **asynchronously** by the drain (ADR 0041
+/// §4/§5) — DynamoDB's own eventually-consistent contract — so every
+/// assertion against one must be a converged-or-timeout poll, never a fixed
+/// sleep followed by a one-shot check.
+async fn await_gsi_query(
+    addr: std::net::SocketAddr,
+    body: &str,
+    accept: impl Fn(&str) -> bool,
+) -> String {
+    let last = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let seen = std::sync::Arc::clone(&last);
+    let converged = async move {
+        loop {
+            let (status, got) = dynamo(addr, "DynamoDB_20120810.Query", body).await;
+            if status == 200 && accept(&got) {
+                return got;
+            }
+            *seen.lock().unwrap() = got;
+            sleep(Duration::from_millis(100)).await;
+        }
+    };
+    match timeout(Duration::from_secs(15), converged).await {
+        Ok(body) => body,
+        Err(_) => panic!(
+            "GSI query never converged within 15s (last saw: {})",
+            last.lock().unwrap()
+        ),
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn scan_paginates_a_whole_table() {
     let dir = tempfile::tempdir().unwrap();
@@ -218,19 +249,22 @@ async fn gsi_write_then_query() {
     // (the query target ≠ the create node; cross-node reads race replication).
     await_table_index(&nodes[1], "users", "by-email").await;
 
-    // Query the GSI for a@x (from a different node → quorum read): u1 and u3.
-    let (status, body) = dynamo(
+    // Query the GSI for a@x (from a different node → native scan of the hidden
+    // index table): u1 and u3. A GSI is materialized **asynchronously** by the
+    // drain (ADR 0041 §4/§5), so this is a converged-or-timeout poll, never a
+    // fixed sleep + one-shot assert.
+    let body = await_gsi_query(
         addr1,
-        "DynamoDB_20120810.Query",
         r#"{"TableName":"users","IndexName":"by-email",
             "KeyConditionExpression":"email = :e",
             "ExpressionAttributeValues":{":e":{"S":"a@x"}}}"#,
+        |b| {
+            b.contains("\"Count\":2")
+                && b.contains(r#""id":{"S":"u1"}"#)
+                && b.contains(r#""id":{"S":"u3"}"#)
+        },
     )
     .await;
-    assert_eq!(status, 200, "GSI query failed: {body}");
-    assert!(body.contains("\"Count\":2"), "got: {body}");
-    assert!(body.contains(r#""id":{"S":"u1"}"#), "got: {body}");
-    assert!(body.contains(r#""id":{"S":"u3"}"#), "got: {body}");
     assert!(!body.contains(r#""id":{"S":"u2"}"#), "got: {body}");
 
     // Deleting u3 removes it from the index.
@@ -241,17 +275,15 @@ async fn gsi_write_then_query() {
     )
     .await;
     assert_eq!(status, 200);
-    let (status, body) = dynamo(
+    let body = await_gsi_query(
         addr1,
-        "DynamoDB_20120810.Query",
         r#"{"TableName":"users","IndexName":"by-email",
             "KeyConditionExpression":"email = :e",
             "ExpressionAttributeValues":{":e":{"S":"a@x"}}}"#,
+        |b| b.contains("\"Count\":1") && b.contains(r#""id":{"S":"u1"}"#),
     )
     .await;
-    assert_eq!(status, 200);
-    assert!(body.contains("\"Count\":1"), "after delete: {body}");
-    assert!(body.contains(r#""id":{"S":"u1"}"#), "after delete: {body}");
+    assert!(!body.contains(r#""id":{"S":"u3"}"#), "after delete: {body}");
 
     // Querying an undeclared index is a ValidationException.
     let (status, body) = dynamo(

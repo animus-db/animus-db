@@ -156,6 +156,32 @@ pub struct StorageScope {
     range: Arc<Mutex<KeyRange>>,
 }
 
+/// Row-kind scope selector: base item rows — the ADR 0022 keyspace.
+pub const KIND_BASE: u8 = 0x00;
+/// Row-kind scope selector: local-secondary-index rows (ADR 0041 §2).
+pub const KIND_LSI: u8 = 0x01;
+/// Row-kind scope selector: change-log records (ADR 0041 §4/§4a).
+pub const KIND_CHANGE: u8 = 0x02;
+/// Row-kind scope selector: GSI footprints (ADR 0041 §4).
+pub const KIND_FOOTPRINT: u8 = 0x03;
+
+/// Every row-kind scope a tablet group owns, in selector order (ADR 0041 §3).
+///
+/// The single place the set is enumerated: a group derives one sibling
+/// [`StorageScope`] per entry at start, the snapshot image iterates it, and
+/// drop-table GC erases each in turn. Adding a kind here is what makes it
+/// exist everywhere at once.
+pub const ALL_KINDS: [u8; 4] = [KIND_BASE, KIND_LSI, KIND_CHANGE, KIND_FOOTPRINT];
+
+/// The sibling scope set a tablet group owns, derived from its **parent**
+/// scope (`escape(table)` + this tablet's range), indexed by kind selector.
+///
+/// Every entry shares the parent's one live `KeyRange`
+/// ([`StorageScope::with_kind`]), so narrowing any of them narrows all.
+fn kind_scopes(parent: &StorageScope) -> [StorageScope; ALL_KINDS.len()] {
+    ALL_KINDS.map(|kind| parent.with_kind(kind))
+}
+
 impl StorageScope {
     /// No prefix, the whole keyspace — every physical-key operation is an
     /// identity transform (today's dedicated-engine behavior).
@@ -173,6 +199,29 @@ impl StorageScope {
         Self {
             prefix,
             range: Arc::new(Mutex::new(range)),
+        }
+    }
+
+    /// A **sibling scope of the same tablet group**, holding a different row
+    /// kind (ADR 0041 §3): the prefix extended by `kind`, over **the very same
+    /// live `KeyRange`** — literally the same `Arc`, so one
+    /// [`narrow`](Self::narrow) moves every kind at once and a split or merge
+    /// can never leave two kinds disagreeing about what this tablet owns.
+    ///
+    /// Every kind of one tablet is `prefix || [kind]`, so two kinds differ in
+    /// their final byte at equal length and neither prefixes the other; two
+    /// *tables* are already separated one level up by `escape`'s own
+    /// prefix-freedom. That is what lets the kinds share an engine without a
+    /// discriminator inside the logical key — which they must, because
+    /// [`RaftKvNode::txn_stage`] asserts a logical key leads with the ADR 0022
+    /// partition token and derives every transaction intent span from it.
+    #[must_use]
+    pub fn with_kind(&self, kind: u8) -> Self {
+        let mut prefix = self.prefix.clone();
+        prefix.push(kind);
+        Self {
+            prefix,
+            range: Arc::clone(&self.range),
         }
     }
 
@@ -384,6 +433,42 @@ pub enum KvCommand {
     /// atomicity — see the type-level doc).
     Batch {
         puts: Vec<(Vec<u8>, Vec<u8>)>,
+        fence: KeyRange,
+        ts: HlcTimestamp,
+    },
+    /// **Multi-kind atomic batch** (ADR 0041 §3/§4): like [`Batch`](Self::Batch),
+    /// but every write names the **row kind** whose scope it lands in, and may
+    /// be a tombstone (`None`) as well as a put.
+    ///
+    /// This is the primitive secondary-index maintenance rests on. A single
+    /// entry writes the base row, its LSI rows, the partition's GSI footprint
+    /// and a change-log record — and, critically, *deletes the stale LSI rows
+    /// the overwrite invalidated* — as one Raft log entry: one propose, one
+    /// commit round, one apply. An LSI is strongly consistent precisely because
+    /// its rows commit in the same entry as the base row they derive from, and
+    /// a change record can never be lost relative to the write it describes.
+    ///
+    /// Every kind of one tablet shares that tablet's single `KeyRange`, so one
+    /// `fence` gates them all; as with `Batch` it gates the **whole** entry, or
+    /// partial application would break exactly the atomicity this exists for.
+    /// Keys are logical (token-leading, ADR 0022) — the kind selects the scope,
+    /// it is never part of the key.
+    KindBatch {
+        /// `(row kind, logical key, value)` — `None` writes a tombstone.
+        writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
+        /// An optional **change-log record** to append in the same entry:
+        /// `(key prefix, encoded record)`.
+        ///
+        /// Its key is completed at **apply** as `prefix || hlc::pack(ts)`, using
+        /// this entry's own commit timestamp, and it lands in the
+        /// [`KIND_CHANGE`] scope. The proposer deliberately cannot supply that
+        /// suffix: `ts` is minted inside `propose_ordered` and is the only
+        /// timestamp that agrees with the entry's commit order, so letting an
+        /// edge guess it would silently break the ordering the log exists to
+        /// provide (ADR 0041 §4a — DynamoDB Streams reads these in commit
+        /// order). Making it structural also means the record can never be
+        /// keyed inconsistently across replicas.
+        change_log: Option<(Vec<u8>, Vec<u8>)>,
         fence: KeyRange,
         ts: HlcTimestamp,
     },
@@ -975,7 +1060,18 @@ pub struct RaftKvNode<E: Env, S: StorageEngine> {
     /// This group's confinement within `storage` — see [`StorageScope`]'s doc.
     /// `StorageScope::whole()` (the default for every existing constructor)
     /// makes every physical-key operation an identity transform.
+    ///
+    /// Bound to the **base row kind** (ADR 0041 §3), so every read, write,
+    /// fence, txn record and byte estimate that has always used `scope` still
+    /// addresses exactly the base data. Other kinds go through
+    /// [`kind_scopes`](Self::kind_scopes).
     scope: StorageScope,
+    /// Every row kind's scope, indexed by selector (ADR 0041 §3) — the base
+    /// entry is the same scope as [`scope`](Self::scope). All share one live
+    /// `KeyRange`, so a split narrows every kind together. Iterated wherever an
+    /// operation is about the *whole tablet* rather than one kind: the snapshot
+    /// image and drop-table GC's erase.
+    kind_scopes: [StorageScope; ALL_KINDS.len()],
     /// This group's network multiplexing key (ADR 0026 Stage B): every send/recv
     /// goes out on `(peer, stream)`/`(self, stream)` instead of a peer's default
     /// inbox. `PRIMARY_STREAM` (the default for every existing constructor) is
@@ -1128,6 +1224,16 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         scope: StorageScope,
         stream: u64,
     ) -> Self {
+        // ADR 0041 §3: callers hand in the tablet's **parent** scope
+        // (`escape(table)` + this tablet's range); the group owns one sibling
+        // per row kind beneath it, all sharing the parent's single live
+        // `KeyRange`. `self.scope` is deliberately bound to the *base* kind, so
+        // every pre-existing call site — reads, writes, fences, txn records,
+        // `approx_bytes` — keeps operating on exactly the data it always did,
+        // with no edit. Binding `approx_bytes` to the base scope this way is
+        // also the ADR 0034 fix: auto-split stops measuring change-log churn.
+        let kind_scopes = kind_scopes(&scope);
+        let scope = kind_scopes[KIND_BASE as usize].clone();
         let core = Arc::new(Mutex::new(RaftCore::new(
             env.node_id(),
             &all_nodes,
@@ -1177,6 +1283,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             propose_signal: Arc::clone(&propose_signal),
             metrics: metrics.clone(),
             scope: scope.clone(),
+            kind_scopes: kind_scopes.clone(),
             stream,
             hlc: Arc::clone(&hlc),
             ts_cache: Arc::clone(&ts_cache),
@@ -1204,6 +1311,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             propose_signal,
             metrics,
             scope,
+            kind_scopes,
             stream,
             hlc,
             committed_ceiling,
@@ -1532,6 +1640,51 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             let keys: Vec<&[u8]> = puts.iter().map(|(k, _)| k.as_slice()).collect();
             let ts = self.mint_pushed(&keys);
             KvCommand::Batch { puts, fence, ts }
+        })
+    }
+
+    /// Propose a **multi-kind atomic batch** (ADR 0041 §3/§4): commit writes
+    /// spanning several of this tablet's row-kind scopes as **one** Raft log
+    /// entry. A `None` value writes a tombstone, so one entry can add the new
+    /// index rows *and* remove the stale ones an overwrite invalidated.
+    ///
+    /// The primitive secondary-index maintenance rests on: an LSI is strongly
+    /// consistent because its rows commit in the same entry as the base row
+    /// they derive from, and a change-log record can never be lost relative to
+    /// the write it describes. Keys are **logical** and token-leading
+    /// (ADR 0022); the kind selects the scope and is never part of the key.
+    ///
+    /// Stamps `fence = KeyRange::whole()`; use
+    /// [`put_kind_batch_fenced`](Self::put_kind_batch_fenced) to stamp a
+    /// narrower one.
+    pub fn put_kind_batch(
+        &self,
+        writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
+        change_log: Option<(Vec<u8>, Vec<u8>)>,
+    ) -> ProposeResult {
+        self.put_kind_batch_fenced(writes, change_log, KeyRange::whole())
+    }
+
+    /// As [`put_kind_batch`](Self::put_kind_batch), but the leader stamps its
+    /// own `fence` into the entry. If **any** key falls outside `fence`, none of
+    /// the batch applies — the fence gates the whole atomic entry, since a
+    /// half-applied index write is exactly what colocating the kinds exists to
+    /// prevent.
+    pub fn put_kind_batch_fenced(
+        &self,
+        writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
+        change_log: Option<(Vec<u8>, Vec<u8>)>,
+        fence: KeyRange,
+    ) -> ProposeResult {
+        self.propose_ordered(|| {
+            let keys: Vec<&[u8]> = writes.iter().map(|(_, k, _)| k.as_slice()).collect();
+            let ts = self.mint_pushed(&keys);
+            KvCommand::KindBatch {
+                writes,
+                change_log,
+                fence,
+                ts,
+            }
         })
     }
 
@@ -2791,6 +2944,171 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         }
     }
 
+    /// Read one key of a **non-base row-kind scope** (ADR 0041 §3) — an LSI
+    /// row, a footprint, or a change-log record.
+    ///
+    /// Deliberately simpler than [`local_get`](Self::local_get): those scopes
+    /// only ever hold **committed** values, so there is no intent to resolve.
+    /// Only [`KvCommand::KindBatch`] writes them, and it always commits
+    /// outright; `TxnStage` stages intents solely on keys a client named, which
+    /// are base-kind keys by construction. A non-committed envelope here would
+    /// mean that invariant had broken, so it reads as absent rather than being
+    /// silently unwrapped.
+    ///
+    /// An unknown `kind` reads as absent.
+    pub async fn local_get_kind(&self, kind: u8, key: &[u8]) -> Option<Vec<u8>> {
+        let scope = self.kind_scopes.get(kind as usize)?;
+        let vv = self
+            .storage
+            .get(&scope.physical(key))
+            .await
+            .ok()
+            .flatten()?;
+        match txn::decode_envelope(&vv.value) {
+            txn::Envelope::Committed(v) => Some(v),
+            txn::Envelope::Intent { .. } => None,
+        }
+    }
+
+    /// Scan a **non-base row-kind scope** (ADR 0041 §3) over `[start, end)`,
+    /// in key order, returning committed values only.
+    ///
+    /// The read primitive behind an LSI `Query`/`Scan` (the `KIND_LSI`
+    /// scope) and the GSI drain's sweep of pending change records
+    /// (`KIND_CHANGE`, whose keys are HLC-suffixed, so key order *is* commit
+    /// order). `end == None` is **unbounded above** — scan to the end of
+    /// this scope's own keyspace — mirroring
+    /// [`local_scan`](Self::local_scan)'s identical unbounded-above handling
+    /// for the base scope: a table-wide LSI `Scan`'s tail tablet has no
+    /// finite byte string that could bound it in general (an LSI row's
+    /// trailing base-sort-key segment has no length limit), so the bound is
+    /// derived internally from this kind scope's own physical prefix
+    /// (`StorageScope::physical_bounds`) rather than trusted to a caller.
+    ///
+    /// An unknown `kind` scans as empty.
+    pub async fn local_scan_kind(
+        &self,
+        kind: u8,
+        start: &[u8],
+        end: Option<&[u8]>,
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let Some(scope) = self.kind_scopes.get(kind as usize) else {
+            return Vec::new();
+        };
+        let raw: Vec<(Vec<u8>, animus_storage::VersionedValue)> = match end {
+            Some(e) => self
+                .storage
+                .scan(&scope.physical(start), &scope.physical(e))
+                .await
+                .ok()
+                .into_iter()
+                .flatten()
+                .collect(),
+            None => match scope.physical_bounds().1 {
+                Some(physical_end) => self
+                    .storage
+                    .scan(&scope.physical(start), &physical_end)
+                    .await
+                    .ok()
+                    .into_iter()
+                    .flatten()
+                    .collect(),
+                // Only `StorageScope::whole()` (no real prefix) — not a real
+                // tablet's kind scope, which always has a non-`0xFF`-ending
+                // prefix (the scope selector byte itself) and so always
+                // yields a finite `physical_bounds` upper bound. Mirrors
+                // `pending_changes`'s identical fallback.
+                None => Vec::new(),
+            },
+        };
+        raw.into_iter()
+            .filter_map(|(k, vv)| {
+                let logical = scope.strip_in_range(&k)?.to_vec();
+                match txn::decode_envelope(&vv.value) {
+                    txn::Envelope::Committed(v) => Some((logical, v)),
+                    txn::Envelope::Intent { .. } => None,
+                }
+            })
+            .collect()
+    }
+
+    /// A **linearizable** range scan of a non-base row-kind scope (ADR 0041
+    /// §3) via ReadIndex — the read-barrier dual of
+    /// [`local_scan_kind`](Self::local_scan_kind), and the read primitive
+    /// behind an LSI `Query`/`Scan` (the `KIND_LSI` scope). Same barrier +
+    /// ceiling drive as [`linearizable_scan`](Self::linearizable_scan): only
+    /// the confirmed leader serves it, so a deposed leader returns `None`
+    /// rather than a stale/partial range. `end == None` is unbounded above —
+    /// see [`local_scan_kind`](Self::local_scan_kind)'s doc.
+    ///
+    /// A non-base scope only ever holds **committed** values (see
+    /// [`local_scan_kind`](Self::local_scan_kind)'s doc — only
+    /// [`KvCommand::KindBatch`] writes them, and it always commits outright),
+    /// so there is no intent to resolve here, unlike
+    /// [`linearizable_scan`](Self::linearizable_scan)'s base-scope reads.
+    pub async fn linearizable_scan_kind(
+        &self,
+        kind: u8,
+        start: &[u8],
+        end: Option<&[u8]>,
+    ) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
+        if !self.read_barrier().await {
+            return None;
+        }
+        let ts = self.hlc.mint(self.env.now());
+        if !self.ensure_ceiling_above(ts).await {
+            return None;
+        }
+        let rows = self.local_scan_kind(kind, start, end).await;
+        // Bump the *whole requested span*, mirroring `linearizable_scan`'s
+        // identical reasoning — a future write anywhere in `[start, end)` is
+        // pushed above this read regardless of how many rows it returned.
+        self.ts_cache.lock().expect("ts cache poisoned").bump(
+            start.to_vec(),
+            end.map(<[u8]>::to_vec),
+            ts,
+        );
+        Some(rows)
+    }
+
+    /// Every pending change-log record this tablet holds, in **commit order**
+    /// (ADR 0041 §4): `(record key, encoded record)`.
+    ///
+    /// A whole-`KIND_CHANGE`-scope sweep, bounded by this tablet's own scope
+    /// (`physical_bounds`, never `entries()` — a node's tablets share one
+    /// engine, so a whole-engine scan would read every co-resident tablet's
+    /// data too). Deliberately a named, purpose-built method rather than an
+    /// unbounded variant of [`local_scan_kind`](Self::local_scan_kind): this is
+    /// the one caller that legitimately wants the whole scope, and keeping the
+    /// general API bounded stops an accidental full-tablet read being a typo
+    /// away.
+    ///
+    /// Key order is commit order because a record's key ends in its own commit
+    /// HLC (see [`KvCommand::KindBatch`]'s `change_log`), so a drain processing
+    /// these front-to-back sees each key's mutations in the order they
+    /// committed.
+    pub async fn pending_changes(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let scope = &self.kind_scopes[KIND_CHANGE as usize];
+        let (start, end) = scope.physical_bounds();
+        let Some(end) = end else {
+            return Vec::new(); // only `StorageScope::whole()`; no real tablet
+        };
+        self.storage
+            .scan(&start, &end)
+            .await
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(|(k, vv)| {
+                let logical = scope.strip_in_range(&k)?.to_vec();
+                match txn::decode_envelope(&vv.value) {
+                    txn::Envelope::Committed(v) => Some((logical, v)),
+                    txn::Envelope::Intent { .. } => None,
+                }
+            })
+            .collect()
+    }
+
     /// A **linearizable** read of `key` via **ReadIndex** (ADR 0017): only the
     /// leader can serve it. Records `read_index = commit_index`, confirms it is
     /// still leader by a quorum of peers acking its current term (a read-barrier
@@ -3292,39 +3610,17 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         // wrong thing here, which must physically erase everything this
         // scope ever wrote (ordinary values, still-pending intents, and
         // txn records alike), not just what a read would ever serve.
-        for key in self.raw_scoped_keys().await {
-            let _ = self
-                .storage
-                .merge_tombstone(&self.scope.physical(&key), version)
-                .await;
-        }
-    }
-
-    /// Every logical key currently physically present in this group's own
-    /// scope — **raw**, bypassing both the record-key filter and
-    /// value-envelope resolution [`local_scan`](Self::local_scan) applies.
-    /// The only caller is [`erase_scope`](Self::erase_scope).
-    async fn raw_scoped_keys(&self) -> Vec<Vec<u8>> {
-        let (physical_start, physical_end) = self.scope.physical_bounds();
-        match physical_end {
-            Some(e) => self
-                .storage
-                .scan(&physical_start, &e)
-                .await
-                .ok()
-                .into_iter()
-                .flatten()
-                .filter_map(|(k, _)| self.scope.strip_in_range(&k).map(<[u8]>::to_vec))
-                .collect(),
-            None => self
-                .storage
-                .entries()
-                .await
-                .ok()
-                .into_iter()
-                .flatten()
-                .filter_map(|(k, _)| self.scope.strip_in_range(&k).map(<[u8]>::to_vec))
-                .collect(),
+        // ADR 0041 §3: erase **every** row kind, not just the base scope this
+        // group's `self.scope` addresses — a dropped table's LSI rows, change
+        // log and footprints are just as much its data, and leaving them
+        // behind would strand bytes no later reader can even name.
+        for scope in &self.kind_scopes {
+            for key in raw_scoped_keys(&self.storage, scope).await {
+                let _ = self
+                    .storage
+                    .merge_tombstone(&scope.physical(&key), version)
+                    .await;
+            }
         }
     }
 
@@ -3548,6 +3844,27 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         &self.storage
     }
 
+    /// The physical, engine-global key this group stores logical `key` under,
+    /// for a given row `kind` (ADR 0041 §3).
+    ///
+    /// The companion to [`storage`](Self::storage): anything reading this
+    /// group's bytes straight off a (possibly node-shared) engine — a
+    /// diagnostic, or a test asserting what a replica physically holds — must
+    /// address them through the same scope the group writes them under, not by
+    /// assembling the layout itself. Hard-coding `prefix || key` was correct
+    /// only while a group had exactly one scope; it silently stopped being
+    /// correct when kinds arrived, which is precisely the breakage this exists
+    /// to prevent recurring.
+    ///
+    /// An unknown `kind` falls back to the base scope.
+    #[must_use]
+    pub fn physical_key(&self, kind: u8, key: &[u8]) -> Vec<u8> {
+        self.kind_scopes
+            .get(kind as usize)
+            .unwrap_or(&self.scope)
+            .physical(key)
+    }
+
     // ---- admin / debug introspection (ADR 0020) -------------------------
     // Read-only projections of this group's Raft state, mirroring the control
     // plane's `RaftNode` accessors. Each takes the core lock briefly and returns
@@ -3741,6 +4058,10 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
     halted: &AtomicBool,
     metrics: &MetricsHandle,
     scope: &StorageScope,
+    // `kind_scopes`: every row kind (ADR 0041 §3). Only the snapshot image
+    // and its install span the whole tablet; all other work here is base-kind
+    // work through `scope`.
+    kind_scopes: &[StorageScope; ALL_KINDS.len()],
     tablet: u64,
     hlc: &Hlc,
     sealed: &mut Vec<(KeyRange, HlcTimestamp)>,
@@ -3757,7 +4078,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
         .expect("raftkv core poisoned")
         .drain_pending_install();
     if let Some((last_index, bytes)) = pending_install {
-        install_engine_image(storage, scope, &bytes).await;
+        install_engine_image(storage, kind_scopes, &bytes).await;
         engine_applied.fetch_max(last_index, Ordering::SeqCst);
         // Witnessing point (ADR 0018 §2 amendment): a snapshot can carry
         // versions this node has never seen minted, so fold in the engine's
@@ -3868,6 +4189,58 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                             )
                             .await
                             .expect("raftkv apply batch put");
+                    }
+                }
+            }
+            KvCommand::KindBatch {
+                writes,
+                change_log,
+                fence,
+                ts,
+            } => {
+                assert_ts_monotonic(max_applied_ts, ts);
+                // Gated as one unit, exactly like `Batch` — an index write that
+                // half-applied would leave an LSI row describing a base row
+                // that never landed, which is the one thing colocating them was
+                // supposed to make impossible. Every kind shares this tablet's
+                // single range, so one fence covers them all.
+                if writes
+                    .iter()
+                    .all(|(_, key, _)| fence.contains(key) && !is_sealed(sealed, key))
+                {
+                    for (kind, key, value) in &writes {
+                        // An unknown kind cannot be applied anywhere safe (this
+                        // build has no scope for it) and must not silently land
+                        // in another kind's keyspace. It can only arise from a
+                        // peer proposing a kind this build predates, so skip it
+                        // rather than guess — the same call this crate's
+                        // snapshot install makes for an unknown-kind entry.
+                        let Some(kscope) = kind_scopes.get(*kind as usize) else {
+                            tracing::warn!(kind, "KindBatch write of unknown row kind skipped");
+                            continue;
+                        };
+                        let physical = kscope.physical(key);
+                        match value {
+                            Some(v) => pending.push(MergeOp::put(
+                                physical,
+                                txn::encode_committed(v),
+                                hlc::pack(ts),
+                            )),
+                            None => pending.push(MergeOp::tombstone(physical, hlc::pack(ts))),
+                        }
+                    }
+                    // The change-log record's key is completed here, with THIS
+                    // entry's commit timestamp — the only one that agrees with
+                    // the entry's position in the log, and so the only one that
+                    // makes the log readable in commit order (ADR 0041 §4a).
+                    if let Some((prefix, record)) = &change_log {
+                        let mut key = prefix.clone();
+                        key.extend_from_slice(&hlc::pack(ts).to_be_bytes());
+                        pending.push(MergeOp::put(
+                            kind_scopes[KIND_CHANGE as usize].physical(&key),
+                            txn::encode_committed(record),
+                            hlc::pack(ts),
+                        ));
                     }
                 }
             }
@@ -4681,7 +5054,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
         // and only when a follower is actually waiting on a snapshot.
         let image = if image_needed {
             metrics.incr(Metric::CpSnapshotImageBuilds);
-            Some(engine_image(storage, scope).await)
+            Some(engine_image(storage, kind_scopes).await)
         } else {
             None
         };
@@ -4767,8 +5140,12 @@ async fn flush_pending<S: StorageEngine>(
         .expect("raftkv apply merge batch");
 }
 
-/// One key's snapshot entry: `(key, value-or-tombstone, version)`.
-pub(crate) type ImageEntry = (Vec<u8>, Option<Vec<u8>>, u64);
+/// One key's snapshot entry: `(row kind, key, value-or-tombstone, version)`.
+///
+/// The kind (ADR 0041 §3) is what lets one image carry a whole tablet — every
+/// row kind's scope — while the key stays the *logical* key within its own
+/// scope, so the receiver can re-prefix it under its own scope set.
+pub(crate) type ImageEntry = (u8, Vec<u8>, Option<Vec<u8>>, u64);
 
 /// Serialize this scope's contents (including tombstones) as the snapshot
 /// image shipped to a lagging follower. Bounded to `scope` (prefix **and**
@@ -4777,18 +5154,56 @@ pub(crate) type ImageEntry = (Vec<u8>, Option<Vec<u8>>, u64);
 /// duplicate them into whichever engine receives it, corrupting a group that
 /// never agreed to those writes through its own Raft log. Under the default
 /// (whole) scope this is byte-for-byte the prior unbounded behavior.
-async fn engine_image<S: StorageEngine>(storage: &S, scope: &StorageScope) -> Vec<u8> {
-    let entries: Vec<ImageEntry> = storage
+/// Every logical key currently physically present in one `scope` — **raw**,
+/// bypassing both the record-key filter and the value-envelope resolution
+/// [`RaftKvNode::local_scan`] applies. The only caller is
+/// [`RaftKvNode::erase_scope`], which sweeps each of a tablet's row-kind scopes
+/// in turn (ADR 0041 §3); a free function rather than a method because it is
+/// per-*scope*, not per-group.
+async fn raw_scoped_keys<S: StorageEngine>(storage: &S, scope: &StorageScope) -> Vec<Vec<u8>> {
+    let (physical_start, physical_end) = scope.physical_bounds();
+    match physical_end {
+        Some(e) => storage
+            .scan(&physical_start, &e)
+            .await
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(|(k, _)| scope.strip_in_range(&k).map(<[u8]>::to_vec))
+            .collect(),
+        None => storage
+            .entries()
+            .await
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(|(k, _)| scope.strip_in_range(&k).map(<[u8]>::to_vec))
+            .collect(),
+    }
+}
+
+async fn engine_image<S: StorageEngine>(
+    storage: &S,
+    kind_scopes: &[StorageScope; ALL_KINDS.len()],
+) -> Vec<u8> {
+    // One pass over the engine, classified by kind (ADR 0041 §3): a tablet's
+    // scopes are disjoint, so each physical key is claimed by at most one of
+    // them — `strip_in_range` on the wrong kind returns `None`, which is also
+    // what excludes a co-resident sibling tablet's data from this image.
+    let rows = storage
         .entries_with_tombstones()
         .await
-        .expect("raftkv engine scan")
-        .into_iter()
-        .filter_map(|(k, v, version)| {
-            scope
-                .strip_in_range(&k)
-                .map(|logical| (logical.to_vec(), v, version))
-        })
-        .collect();
+        .expect("raftkv engine scan");
+    let mut entries: Vec<ImageEntry> = Vec::new();
+    for (k, v, version) in rows {
+        let claimed = ALL_KINDS
+            .iter()
+            .zip(kind_scopes)
+            .find_map(|(kind, scope)| scope.strip_in_range(&k).map(|l| (*kind, l.to_vec())));
+        if let Some((kind, logical)) = claimed {
+            entries.push((kind, logical, v, version));
+        }
+    }
     codec::encode_image(&entries)
 }
 
@@ -4797,7 +5212,11 @@ async fn engine_image<S: StorageEngine>(storage: &S, scope: &StorageScope) -> Ve
 /// The wire image carries *logical* keys (stripped by the sender's
 /// `engine_image`); each is re-prefixed to *this* replica's own `scope`
 /// before writing into the (possibly shared) engine.
-async fn install_engine_image<S: StorageEngine>(storage: &S, scope: &StorageScope, bytes: &[u8]) {
+async fn install_engine_image<S: StorageEngine>(
+    storage: &S,
+    kind_scopes: &[StorageScope; ALL_KINDS.len()],
+    bytes: &[u8],
+) {
     let entries: Vec<ImageEntry> = match codec::decode_image(bytes) {
         Ok(e) => e,
         Err(err) => {
@@ -4805,7 +5224,15 @@ async fn install_engine_image<S: StorageEngine>(storage: &S, scope: &StorageScop
             return;
         }
     };
-    for (key, value, version) in entries {
+    for (kind, key, value, version) in entries {
+        // An unknown kind can only come from a peer that knows a row kind this
+        // build does not (ALL_KINDS grew). Dropping it is the safe read: this
+        // replica has no scope to put it in, and silently mis-filing it under
+        // another kind would corrupt that kind's keyspace.
+        let Some(scope) = kind_scopes.get(kind as usize) else {
+            tracing::warn!(kind, "snapshot image entry of unknown row kind dropped");
+            continue;
+        };
         let physical = scope.physical(&key);
         match value {
             Some(v) => {
@@ -4842,7 +5269,10 @@ struct DriveState<E: Env, S: StorageEngine> {
     apply_stopped: Arc<AtomicBool>,
     propose_signal: Arc<ProposeSignal>,
     metrics: MetricsHandle,
+    /// The **base**-kind scope (ADR 0041 §3) — see [`RaftKvNode::scope`].
     scope: StorageScope,
+    /// Every row kind's scope, for the whole-tablet snapshot image.
+    kind_scopes: [StorageScope; ALL_KINDS.len()],
     stream: u64,
     hlc: Arc<Hlc>,
     committed_ceiling: Arc<AtomicU64>,
@@ -4856,6 +5286,7 @@ fn command_ts(command: &KvCommand) -> Option<HlcTimestamp> {
     match command {
         KvCommand::Put { ts, .. }
         | KvCommand::Batch { ts, .. }
+        | KvCommand::KindBatch { ts, .. }
         | KvCommand::Delete { ts, .. }
         | KvCommand::Cas { ts, .. }
         | KvCommand::Seal { ts, .. }
@@ -4918,6 +5349,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         propose_signal,
         metrics,
         scope,
+        kind_scopes,
         stream,
         hlc,
         committed_ceiling,
@@ -5007,6 +5439,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         apply_stopped,
         metrics.clone(),
         scope,
+        kind_scopes,
         stream,
         Arc::clone(&hlc),
         sealed,
@@ -5153,6 +5586,7 @@ async fn apply_loop<E: Env, S: StorageEngine>(
     apply_stopped: Arc<AtomicBool>,
     metrics: MetricsHandle,
     scope: StorageScope,
+    kind_scopes: [StorageScope; ALL_KINDS.len()],
     stream: u64,
     hlc: Arc<Hlc>,
     mut sealed: Vec<(KeyRange, HlcTimestamp)>,
@@ -5183,6 +5617,7 @@ async fn apply_loop<E: Env, S: StorageEngine>(
             &halted,
             &metrics,
             &scope,
+            &kind_scopes,
             stream,
             &hlc,
             &mut sealed,
@@ -5208,6 +5643,80 @@ async fn apply_loop<E: Env, S: StorageEngine>(
 /// cannot express "the identical, already-referenced transaction arrives
 /// late"; an external integration test genuinely cannot construct this
 /// scenario at all.
+#[cfg(test)]
+mod kind_scope_tests {
+    use super::*;
+    use animus_tablet::escape;
+
+    /// A table's parent scope, as `animusd::table_scope_prefix` builds it.
+    fn table_scope(name: &[u8]) -> StorageScope {
+        StorageScope::new(escape(name), KeyRange::whole())
+    }
+
+    #[test]
+    fn sibling_scopes_share_one_live_range() {
+        let parent = table_scope(b"users");
+        let base = parent.with_kind(KIND_BASE);
+        let log = parent.with_kind(KIND_CHANGE);
+
+        // Narrowing through *any* handle moves every kind: a split must never
+        // leave two kinds disagreeing about what this tablet owns (ADR 0041 §3).
+        let narrowed = KeyRange::new(b"m".to_vec(), Some(b"n".to_vec()));
+        base.narrow(narrowed.clone());
+        assert_eq!(log.range(), narrowed);
+        assert_eq!(parent.range(), narrowed);
+    }
+
+    #[test]
+    fn no_kind_can_read_another_kinds_key() {
+        let parent = table_scope(b"users");
+        let logical = b"\x01\x02logical-key".to_vec();
+        for &mine in &ALL_KINDS {
+            let scope = parent.with_kind(mine);
+            let physical = scope.physical(&logical);
+            assert_eq!(
+                scope.strip_in_range(&physical),
+                Some(logical.as_slice()),
+                "a kind must read back its own key"
+            );
+            for &other in ALL_KINDS.iter().filter(|k| **k != mine) {
+                assert_eq!(
+                    parent.with_kind(other).strip_in_range(&physical),
+                    None,
+                    "kind {other:#04x} must not see kind {mine:#04x}'s key"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn one_tables_kinds_never_collide_with_another_tables() {
+        let logical = b"logical".to_vec();
+        let users = table_scope(b"users").with_kind(KIND_CHANGE);
+        // `users2`'s raw name has `users`' as a prefix on purpose — `escape`'s
+        // prefix-freedom one level up is what keeps the two tables apart, and
+        // appending a kind byte must not undo it.
+        let users2 = table_scope(b"users2").with_kind(KIND_CHANGE);
+        assert_eq!(users2.strip_in_range(&users.physical(&logical)), None);
+        assert_eq!(users.strip_in_range(&users2.physical(&logical)), None);
+    }
+
+    #[test]
+    fn a_kinds_prefix_is_the_parents_plus_one_byte() {
+        // The property `physical_bounds` on the parent relies on: every kind
+        // lives physically *under* the parent's prefix, so a whole-tablet sweep
+        // (drop-table GC, the snapshot image) can bound on the parent and then
+        // sort entries out by kind.
+        let parent = table_scope(b"users");
+        let parent_physical = parent.physical(b"");
+        for &kind in &ALL_KINDS {
+            let child_physical = parent.with_kind(kind).physical(b"");
+            assert!(child_physical.starts_with(&parent_physical));
+            assert_eq!(child_physical.len(), parent_physical.len() + 1);
+        }
+    }
+}
+
 #[cfg(test)]
 mod pr5_orphan_and_resurrection_tests {
     use super::*;

@@ -13,8 +13,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use animus_control::ProposeResult;
-use animus_cp_data::RaftKvNode;
 use animus_cp_data::hlc::{Hlc, HlcTimestamp};
+use animus_cp_data::{KIND_BASE, RaftKvNode};
 use animus_env::{Clock, EnvExt, Metric, nid};
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::{MemoryEngine, StorageEngine};
@@ -66,7 +66,7 @@ fn put(nodes: &[KvNode], live: &[usize], seed: u64, key: &[u8], value: &[u8]) {
 }
 
 fn ts_of(node: &KvNode, key: &[u8]) -> HlcTimestamp {
-    let version = block_on(node.storage().get(key))
+    let version = block_on(node.storage().get(&node.physical_key(KIND_BASE, key)))
         .expect("engine read ok")
         .unwrap_or_else(|| panic!("key {key:?} missing"))
         .version;

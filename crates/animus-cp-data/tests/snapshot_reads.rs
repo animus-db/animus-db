@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use animus_control::ProposeResult;
-use animus_cp_data::RaftKvNode;
 use animus_cp_data::hlc::{self, HlcTimestamp};
+use animus_cp_data::{KIND_BASE, RaftKvNode};
 use animus_env::{EnvExt, nid};
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::{MemoryEngine, StorageEngine};
@@ -61,12 +61,12 @@ fn put(nodes: &[KvNode], live: &[usize], seed: u64, key: &[u8], value: &[u8]) {
     );
 }
 
-/// The packed MVCC version `storage.get(key)` records for `key` on `node`
-/// (every node in this file uses `StorageScope::whole()`, so the physical
-/// key is the identity), unpacked back to the `HlcTimestamp` that committed
-/// it.
+/// The packed MVCC version `storage.get(key)` records for `key` on `node`,
+/// unpacked back to the `HlcTimestamp` that committed it. Addresses the engine
+/// through `physical_key` rather than assuming a layout: since ADR 0041 §3 even
+/// a `StorageScope::whole()` group prefixes its rows with a row-kind byte.
 fn ts_of(node: &KvNode, key: &[u8]) -> HlcTimestamp {
-    let version = block_on(node.storage().get(key))
+    let version = block_on(node.storage().get(&node.physical_key(KIND_BASE, key)))
         .expect("engine read ok")
         .unwrap_or_else(|| panic!("key {key:?} missing"))
         .version;

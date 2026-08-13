@@ -157,6 +157,92 @@ Three modules:
   non-`0xFF` byte) — `None` only for `whole()` or an all-`0xFF` prefix — so a
   periodic byte-estimate over an unbounded-above logical range never degrades
   into a whole-engine scan.
+  **`with_kind(kind)`** (ADR 0041 §3) derives a **sibling scope for one row
+  kind** — prefix `prefix || [kind]`, over **the very same
+  `Arc<Mutex<KeyRange>>`**, so one `narrow`/
+  `widen` moves every kind at once and a split can never leave two kinds
+  disagreeing about what the tablet owns. `KIND_BASE`/`KIND_LSI`/
+  `KIND_CHANGE`/`KIND_FOOTPRINT`, enumerated by `ALL_KINDS`, are the selectors
+  (they live *here*, not in `animus-dynamo`: the wire adapter only builds
+  logical keys, the scope choice is a data-plane concern). Two kinds of one
+  tablet differ in their prefix's final byte at equal length so neither
+  prefixes the other, and two tables are already separated one level up by
+  `escape`'s prefix-freedom. **Why kinds are scopes and not a discriminator
+  byte in the key**: a tablet is a `[start, end)` range over *token* space, so
+  a kind above the token would stop its ownership being one contiguous range
+  (breaking `KeyRange`/the router/split); and `txn_stage` **asserts** a logical
+  key leads with the ADR 0022 token (`anchor[..TOKEN_BYTES]`), deriving every
+  `TxnRecord::intent_span` from it — so a kind byte in the logical key would
+  have forced a rewrite of every span, fence, record key and seal marker in the
+  ADR 0018 2PC machinery.
+- **A group owns a scope *set*, not one scope** (ADR 0041 §3). `start_*` takes
+  the tablet's **parent** scope and derives `kind_scopes` from it;
+  **`self.scope` is bound to the base kind**, which is why every pre-existing
+  read, write, fence, txn record and `approx_bytes` kept working with no edit —
+  and why `approx_bytes` now measures *only* base data, the ADR 0034 fix that
+  stops auto-split reacting to change-log churn. Only genuinely whole-tablet
+  operations iterate the set: `engine_image`/`install_engine_image` (every
+  `ImageEntry` gained a leading kind byte, codec `VERSION` 12 — one image
+  carries every scope, and an entry of an unknown kind is dropped with a warn
+  rather than mis-filed) and `erase_scope` (drop-table GC must reclaim a
+  dropped table's LSI rows, change log and footprints too, not just its base
+  rows). `host.rs`'s pre-hosting presence check asks
+  `scope.with_kind(KIND_BASE).has_data(..)` — the parent scope would strip only
+  its own prefix and range-check a leading kind byte, which is meaningless.
+- **`StorageScope::whole()` is no longer an identity transform.** Its base-kind
+  scope prefixes one `KIND_BASE` byte, so *any* group's physical key is
+  `prefix || kind || logical`. Anything reading a group's bytes straight off the
+  engine must go through **`RaftKvNode::physical_key(kind, key)`** rather than
+  assembling `prefix || key` itself — hard-coding the layout was correct only
+  while a group had exactly one scope, and four tests (`snapshot_reads`,
+  `ts_cache`, `witnessing`, `snapshot_catchup`) broke on exactly that
+  assumption. Tests without a node handle (`reconciler`, `reconciler_corpus`,
+  `narrow_scope`) push `KIND_BASE` explicitly in their own `physical` helper.
+- **`KvCommand::KindBatch`** (ADR 0041 §3/§4, codec tag 12) — the multi-kind
+  atomic batch: `put_kind_batch`/`put_kind_batch_fenced` commit
+  `(kind, logical key, Option<value>)` writes spanning several of a tablet's
+  row-kind scopes as **one** Raft log entry. A `None` value tombstones, so one
+  entry adds an overwrite's new index rows *and* removes the stale ones. This is
+  the primitive materialized secondary indexes rest on: an LSI is strongly
+  consistent because its rows commit in the same entry as the base row they
+  derive from, and a change-log record can never be lost relative to the write
+  it describes. Keys stay **logical and token-leading** — the kind selects the
+  scope, never part of the key. One `fence` gates the **whole** entry (every
+  kind shares the tablet's single range); a write naming an unknown kind is
+  skipped with a warning rather than mis-filed into another kind's keyspace.
+  The optional **`change_log: Option<(prefix, record)>`** rides the same entry:
+  its key is completed at **apply** as `prefix || hlc::pack(ts)` in the
+  `KIND_CHANGE` scope, from *this entry's own* commit timestamp. The proposer
+  deliberately cannot supply that suffix — `ts` is minted inside
+  `propose_ordered`, and it is the only timestamp that agrees with the entry's
+  position in the log, so an edge-chosen one would silently mis-order the log
+  DynamoDB Streams will read (ADR 0041 §4a) and could even differ across
+  replicas.
+  **`local_get_kind(kind, key)` / `local_scan_kind(kind, start, end)`** are the
+  read side — an LSI `Query`/`Scan`, and the GSI drain's sweep of change
+  records (whose keys are HLC-suffixed, so key order *is* commit order).
+  Deliberately simpler than `local_get`/`local_scan`: a non-base scope only
+  ever holds **committed** values, because only `KindBatch` writes those
+  scopes and `TxnStage` stages intents solely on client-named (base-kind)
+  keys — so there is no intent to resolve, and a non-committed envelope reads
+  as *absent* rather than being silently unwrapped. An unknown kind reads
+  absent / scans empty rather than aliasing onto a real scope.
+  **`end: Option<&[u8]>` (ADR 0041 §5, 2026-08-13)** — originally bounded on
+  both ends unconditionally ("every caller scans one partition's contiguous
+  sub-range"), until the LSI `Scan` read path (`animusd`'s
+  `cp_scan_kind_table`) needed a genuinely unbounded-above kind-scoped scan
+  for a table-wide fan-out's tail tablet. `end == None` now mirrors
+  `local_scan`/`linearizable_scan`'s identical handling for the base scope:
+  the bound is derived from **this kind scope's own** `physical_bounds()`
+  (never the caller's), because no finite byte string can bound an LSI row's
+  keyspace in general (a trailing base-sort-key segment has no length
+  limit) — the same reason `pending_changes` (the GSI drain's own
+  whole-`KIND_CHANGE`-scope sweep) derives its own bound
+  rather than accepting one. This does not reopen "an unbounded form would
+  make an accidental full-tablet read easy to write": the bound still comes
+  from the kind scope's own prefix, never `entries()`, so it can only ever
+  read this one scope, on this one tablet, of however many kinds and tablets
+  share the node's engine.
 - **Fenced commands** (ADR 0026) — `put_fenced`/`delete_fenced`/`cas_fenced`/
   `put_batch_fenced` (and unfenced siblings using `KeyRange::whole()`) carry a
   `fence: KeyRange` *inside the proposed command*, stamped by the leader at
@@ -1029,6 +1115,16 @@ API (which always mints a *fresh* id) cannot express.
   transaction before the compacting write burst, confirms the
   snapshot-caught-up follower's raw engine holds the identical still-
   `Pending` intent envelope, then resolves and confirms convergence.
+- `kind_batch.rs` (ADR 0041) — `KindBatch` writes each kind into **its own**
+  scope (asserted with two byte-identical logical keys under different kinds
+  that must not alias), one entry adds a new index row while tombstoning the
+  stale one, and an out-of-fence key blocks the **whole** entry. That last test
+  asserts its own setup (`fence.contains(base)` yet `!fence.contains(lsi)`)
+  because the obvious fence — `KeyRange::new(k, Some(k))` — is *empty* under
+  half-open semantics, which would make "nothing applied" prove nothing. A
+  fourth test pins the change-log contract: two writes leave **two** records
+  under one prefix (a collapsing marker would leave one), in commit order, each
+  suffixed by a strictly-increasing packed 8-byte HLC.
 - `narrow_scope.rs` — `narrow_scope` makes a group's `StorageScope` range
   live-narrowable (the split-source shape, so `engine_image` stops shipping the
   handed-off portion); `narrow_then_erase_scope_spares_a_co_hosted_siblings_

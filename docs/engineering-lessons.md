@@ -15,6 +15,26 @@ Read the section relevant to your task before starting work; grep it when
 debugging anything that feels like it might have happened before.
 
 ### Testing
+- **A hand-rolled HTTP test helper that reads the response with
+  `read_to_end` MUST send `Connection: close` — an HTTP/1.1 request without
+  it deadlocks against a keep-alive server, and the hang lands on the
+  *first* request, before any of the test's own bounded assertions can
+  fire.** The server (correctly, per HTTP/1.1 defaults) keeps the connection
+  open and parks waiting for a next request; the helper waits for EOF that
+  never comes. The ADR 0041 GSI-drain e2e test shipped with exactly this
+  bug in its `dynamo()` helper — every *other* dynamo test's helper sends
+  `Connection: close`, this one was written fresh and dropped it — and the
+  result was a test that hung ~47 minutes (until externally killed) at
+  `CreateTable`, while masquerading as the drain bug it existed to expose.
+  Corollary, the meta-lesson that cost the real time: **a WIP handoff's
+  "known broken" note describes the last run its author observed, not
+  necessarily the committed code — re-verify the recorded failure signature
+  (run the test, watch *where* it stops) before debugging from the note.**
+  The note said "times out waiting for the first index rows" (a clean 30s
+  bounded panic); the committed helper couldn't even reach that assertion.
+  The two bugs were independent, and fixing the noted one first while the
+  unnoted one hid behind it turned a 30-second failure into an apparent
+  hang. (`animusd` `tests/dynamo_gsi_drain.rs`, 2026-08-13.)
 - **Promoting a per-file test helper (`free_addrs`, `start_single_node`) into
   the shared `tests/support/mod.rs` makes every consumer that doesn't call
   every helper trip `dead_code` under `cargo build`/`clippy -D warnings` — this
@@ -1329,8 +1349,61 @@ debugging anything that feels like it might have happened before.
   with near-zero CPU time consumed over the whole wall-clock duration (not
   a busy spin) is the tell: something is waiting on a clock nobody is
   advancing. (`crates/animus-cp-data/tests/ts_cache.rs`.)
+- **Prove a new regression test actually catches the bug by running it
+  against the pre-fix code, not just against the fix.** A test that passes
+  post-fix is consistent with "the test works" *and* with "the test asserts
+  the wrong thing and would pass either way" — the two are indistinguishable
+  from a single green run. The cheap check: `git stash push -- <fixed
+  file(s)>`, re-run the new test, confirm it fails with the expected
+  symptom, `git stash pop`. For the ADR 0041 drop-table-cascade fix
+  (`ClientCtx::drop_table` in `animusd/src/lib.rs`), this caught nothing
+  wrong — but it's the difference between "I wrote an assertion" and "I
+  verified the assertion is load-bearing," and it costs one extra
+  `cargo test` invocation. Worth doing for any fix landing with exactly one
+  new regression test, especially when the bug is an *omission* (a cascade
+  step that never ran) rather than a wrong-value computation, since an
+  omission bug is the shape most likely to also be missing from a
+  carelessly-written test.
+- **A cascading delete across replicated definitions must read the
+  definitions *before* deleting whatever they're keyed on, and needs a
+  second sweep keyed on a structural invariant for anything that can be
+  provisioned concurrently with the delete.** `ClientCtx::drop_table` (ADR
+  0041 §5) enumerates a table's GSI `IndexDef`s via `metadata_fresh` before
+  dropping the base schema — reversing the order would delete the base
+  schema (and the defs riding on it) first, leaving nothing to enumerate on
+  a retry after a mid-drop crash. But enumeration-then-cascade only catches
+  what existed at enumeration time; a background process that lazily
+  provisions the very thing being cascaded (here, the GSI drain
+  provisioning a hidden table's first tablet) can race a fresh one into
+  existence afterward. The fix pairs the definition-keyed pass with a
+  second sweep keyed on a structural invariant that survives the
+  definitions' deletion — here, the tablet map's own `<base>$<index>` naming
+  convention (`animus_dynamo::split_index_table_name`), not the (by-then-gone)
+  `IndexDef`s. The second sweep is what also makes the fix retroactive: it
+  cleans up orphans left by every **pre-fix** drop, for free, since it
+  depends on nothing the fix itself created. (`crates/animusd/src/lib.rs`,
+  `ClientCtx::drop_table`, 2026-08-13.)
 
 ### Code patterns
+- **When one member of a family of sibling primitives lacks the family's
+  implicit behavior, a caller written from the family's reputation gets a
+  structural, permanent failure — check the specific primitive's contract,
+  not its siblings'.** `ClientCtx`'s CP write-side primitives almost all
+  auto-provision a table's first tablet on demand (`cp_put`,
+  `cp_kind_write`, `cp_batch_write`, `cp_batch_write_patient`, `cp_txn`,
+  the Dynamo edge's `quorum_write`) — but `cp_write` itself, the rawest of
+  them, does **not**: every existing caller provisioned upstream, so the
+  gap was invisible. The ADR 0041 GSI drain then wrote a *brand-new*
+  table's rows (a GSI's hidden index table, which nothing upstream ever
+  provisions) through `cp_write`, and the result wasn't slowness but
+  *never*: `cp_route` waited out its full `CLIENT_TIMEOUT` on a table with
+  no tablet, failed, and the next 200ms tick repeated it, forever — while
+  reading exactly like the "first convergence is just slow" hypothesis the
+  handoff note recorded. The fix (the drain provisions lazily, first tick
+  with records to apply) matters less than the diagnostic: when a
+  convergence loop makes zero progress ever, suspect a step whose
+  precondition is *never* established, and check who was supposed to
+  establish it. (`animusd/src/index_drain.rs::drain_tablet`, 2026-08-13.)
 - **A field on a durable record shipped ahead of the feature that will read
   it back can be structurally present but semantically empty — the type
   checker cannot catch "nobody actually populated this for the case that
@@ -3953,6 +4026,130 @@ debugging anything that feels like it might have happened before.
   correctness rests on *when a resource is released* (holding listeners) is
   especially prone to being "simplified" into a broken loop, so say so in the
   doc comment. (`animusd/tests/control_mirror_restart.rs`.)
+- **A `BTreeMap` with a non-string key cannot round-trip through `serde_json`
+  at all — and ADR 0003 actively steers you into writing one.** The
+  determinism rule says "no `HashMap` in logic, use `BTreeMap`" (lint-enforced
+  via `clippy.toml`), and the repo convention says data-plane values
+  (de)serialize with `serde_json`. For a **byte-keyed** map those two rules
+  collide: `BTreeMap<Vec<u8>, T>` derives `Serialize` happily, compiles
+  clean, passes clippy — and then fails at **runtime** with
+  `Error("key must be a string")`, because a JSON object key must be a
+  string. Nothing in the type system or the gates catches it; only executing
+  the encode does. Hit while building ADR 0041's `IndexFootprint`
+  (`animus-dynamo/src/index.rs`), whose natural shape is "GSI rows keyed by
+  base sort key". **The fix that keeps both rules**: a `Vec<Struct>` held
+  **sorted by the key field**, with the ordering invariant maintained by the
+  single mutator (`set_item`) and lookup by `binary_search_by`. That is
+  deterministic by construction (the encoding cannot depend on insertion
+  order), JSON-native, and no slower at the sizes involved. **The
+  generalizable practice**: every new durable/serialized type gets an
+  `encode`→`decode` **round-trip unit test** in the same change, not just
+  tests of its constructors and accessors — a round-trip is the only thing
+  that executes the serializer, and for `serde_json` the serializer is where
+  a whole class of key-shape errors lives. A test asserting the *sort
+  invariant under out-of-order insertion* is worth pairing with it, since
+  that invariant is now what determinism rests on.
+
+- **A test that reassembles a mapping the production type already owns is a
+  second, silently-diverging copy of the spec.** `StorageScope` maps a logical
+  key to its physical engine key (`prefix || key`), and `StorageScope::whole()`
+  was documented as "every physical-key operation is an identity transform."
+  Seven test files had quietly baked that in — reading `node.storage().get(k)`
+  with a *logical* `k`, or building `physical()` as `prefix_for(TABLE) || key` —
+  so they were asserting against a hand-copied duplicate of the mapping rather
+  than the mapping itself. When ADR 0041 §3 inserted a row-kind byte
+  (`prefix || kind || key`, making `whole()` no longer the identity), every one
+  of those copies became wrong at once. **This time the divergence was loud** —
+  the reads returned `None` and the tests failed — but that was luck, not
+  design: a mapping change that made a test read the *wrong existing key*
+  instead of a missing one would have failed silently or, worse, passed. **The
+  practice**: when a type owns a logical→physical (or encode→store) mapping,
+  give callers a public accessor for it (here `RaftKvNode::physical_key(kind,
+  key)`) and let nothing outside reimplement it — a test that needs the physical
+  key should *ask*, and a test with no handle to ask through should at least
+  name the layout element explicitly rather than inheriting it by omission.
+  Corollary for the doc: "X is the identity transform" invites callers to skip
+  the mapping entirely, which is the most brittle form of this duplication —
+  prefer documenting *that a mapping exists* over documenting that it currently
+  happens to be free.
+
+- **A write path's siblings can silently diverge in feature coverage, and
+  nothing but a grep of every writer catches it.** ADR 0041's index-maintaining
+  write path (`animusd::dynamo::index_aware_write` → `kind_writes_for_item`,
+  committing an item's LSI rows + GSI change-log record atomically with the
+  base row) was wired into the single-item `PutItem`/`DeleteItem` handlers
+  only. `UpdateItem` (`run_update_item`), `BatchWriteItem`, and
+  `TransactWriteItems` (`run_transact`) all still commit through the plain
+  `quorum_write`/`cp_batch_write`/`cp_txn` primitives that predate ADR 0041 —
+  so a table's secondary indexes silently never see a write made exclusively
+  through any of those three ops, with no error, no warning, and no test
+  currently exercising that combination (every existing GSI/LSI test happens
+  to write through `PutItem`). This was found while replacing the old
+  edge-local in-memory index (which every write path *did* feed, via a
+  shared `note_put`/`note_delete` post-write hook) with the native
+  replicated-row read path (ADR 0041 §5) — deleting that shared hook removed
+  the one place all four write paths' index-maintenance obligations were
+  unified, which is what made the pre-existing gap visible instead of merely
+  latent. The general lesson (the same shape as this file's
+  `ClientCtx::cp_write`/`cp_put` entry above): when a family of write
+  operations is supposed to share one piece of derived-data maintenance,
+  check *every member of the family* against the primitive that actually
+  does it, not just the one the feature's own tests happen to exercise — a
+  new mechanism wired into only the "obvious" call site looks complete right
+  up until a sibling silently doesn't participate. Left unfixed here
+  (deliberately out of scope for the read-path PR that found it — see
+  "Separate PRs for incidental bugs"); tracked in `animusd/CLAUDE.md`'s and
+  `animus-dynamo/CLAUDE.md`'s ADR 0041 entries.
+
+  **Resolution (2026-08-13).** `UpdateItem` and `BatchWriteItem` now route
+  through `index_aware_write` (the latter per-item, and only for a table
+  that actually has an index — an unindexed table keeps its no-read
+  `cp_batch_write` fast path unchanged). `TransactWriteItems` did **not**
+  get the same treatment — it is rejected outright (`ValidationException`)
+  whenever any write action targets an indexed table, because closing this
+  gap for real would mean giving `cp_txn`'s `KvCommand::TxnStage` a
+  multi-kind-write extension (staging LSI rows + a change record atomically
+  with a transactional base-row write), which is a genuine `animus-cp-data`
+  protocol change, not a `dynamo.rs`-local fix — named as a follow-up in ADR
+  0041's as-built note under §2. The generalizable half of this entry
+  stands on its own; the corollary worth keeping: **when the honest fix for
+  one sibling in a "family of write operations" reaches into a lower layer's
+  protocol, a loud rejection of that one combination is a legitimate
+  interim closure of a correctness gap** — better than either leaving it
+  silently wrong or scope-creeping a wire-edge fix into a data-plane
+  protocol change. Regression: `animusd/tests/dynamo_index_writes.rs`.
+
+- **When a "bounded on both ends" primitive's stated reason is "every caller
+  scans one contiguous sub-range," that's a fact about the callers that
+  exist *today*, not an invariant of the primitive — check whether a new
+  caller's shape still satisfies it before reusing it unmodified.**
+  `RaftKvNode::local_scan_kind`/`linearizable_scan_kind` (ADR 0041 §3) took a
+  mandatory `end: &[u8]`, documented as deliberate: every existing caller (an
+  LSI `Query`, the GSI drain's `pending_changes`) always had a finite bound
+  in hand, so an unbounded form "would make an accidental full-tablet read
+  easy to write." That reasoning is sound for those callers and wrong as a
+  universal law: a table-wide LSI `Scan`'s fan-out (added in the same ADR's
+  §5 follow-up) needs its tail tablet scanned unbounded-above, and *no
+  finite byte string the caller could construct actually bounds it* — an LSI
+  row's trailing base-sort-key segment has no length limit, so any fixed
+  suffix (even one built from the maximum-width token) can be exceeded by a
+  longer real key sharing its prefix. The fix wasn't "find a big enough
+  bound" (structurally impossible) but recognizing the primitive already had
+  the right shape one level up: `local_scan`/`linearizable_scan` (the base
+  scope's equivalent) had solved exactly this by deriving the bound from
+  **the scope's own** `StorageScope::physical_bounds()` when the caller
+  passes `None`, rather than trusting the caller to supply one — mirroring
+  that (changing `end` to `Option<&[u8]>`, falling back to the kind scope's
+  own `physical_bounds()`) closed the gap without reopening the
+  accidental-full-scan risk the original design worried about, because the
+  bound still comes from the scope's own prefix, never `entries()`. The
+  general move: before copying "bounded because every caller today has a
+  bound" onto a new caller that structurally can't have one, check whether a
+  *sibling* primitive already solved the same problem for the *other* scope
+  — the fix is usually "generalize that," not "invent a new escape hatch."
+  (`crates/animus-cp-data/src/lib.rs::local_scan_kind`/
+  `linearizable_scan_kind`; `crates/animusd/src/lib.rs::cp_scan_kind_table`;
+  ADR 0041 §5's 2026-08-13 as-built note, 2026-08-13.)
 
 ### Parallel-agent orchestration
 - **A stacked series' final "docs/ADR finalization" PR must treat the stack's

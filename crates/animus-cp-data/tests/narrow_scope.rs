@@ -225,8 +225,11 @@ fn narrow_then_erase_scope_spares_a_co_hosted_siblings_data() {
     // Capture the sibling's raw versioned records (bypassing scope filtering
     // entirely, straight off the engine) so the post-erase assertion below can
     // confirm the version is untouched too, not just the value.
+    // ADR 0041 §3: a group's physical prefix is its parent scope's prefix plus
+    // the row-kind byte, so ordinary data lives under `T:` + `KIND_BASE`.
     let physical = |key: &[u8]| {
         let mut out = b"T:".to_vec();
+        out.push(animus_cp_data::KIND_BASE);
         out.extend_from_slice(key);
         out
     };
