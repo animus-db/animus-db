@@ -73,6 +73,7 @@ async fn prepare_via_any_node(
                     record_key,
                     record_table,
                     ts,
+                    outcome: _,
                 } = call_forwarded(addr, request.clone()).await
                 {
                     return (txn_id, record_key, record_table, ts);
@@ -161,6 +162,7 @@ async fn coordinator_crash_between_prepare_and_decide_recovers_to_commit() {
             table: "txn_t5".to_string(),
             anchor: None,
             writes: vec![(lower_key.clone(), Some(b"lower-recovered".to_vec()))],
+            conditions: Vec::new(),
         },
     )
     .await;
@@ -173,6 +175,7 @@ async fn coordinator_crash_between_prepare_and_decide_recovers_to_commit() {
             table: "txn_t5".to_string(),
             anchor: Some((txn_id.clone(), record_key.clone(), record_table.clone())),
             writes: vec![(upper_key.clone(), Some(b"upper-recovered".to_vec()))],
+            conditions: Vec::new(),
         },
     )
     .await;
@@ -248,6 +251,7 @@ async fn commit_already_applied_but_unresolved_converges_via_reads() {
             table: "txn_t6".to_string(),
             anchor: None,
             writes: vec![(lower_key.clone(), Some(b"lower-done".to_vec()))],
+            conditions: Vec::new(),
         },
     )
     .await;
@@ -257,6 +261,7 @@ async fn commit_already_applied_but_unresolved_converges_via_reads() {
             table: "txn_t6".to_string(),
             anchor: Some((txn_id.clone(), record_key.clone(), record_table.clone())),
             writes: vec![(upper_key.clone(), Some(b"upper-done".to_vec()))],
+            conditions: Vec::new(),
         },
     )
     .await;
@@ -486,6 +491,7 @@ async fn multi_tablet_txn_commits_atomically_across_a_split_table() {
                     ),
                 ],
                 preconditions: vec![],
+                write_conditions: vec![],
             },
         ),
     )
@@ -569,6 +575,7 @@ async fn txn_through_every_node_including_followers_succeeds() {
                         ),
                     ],
                     preconditions: vec![],
+                    write_conditions: vec![],
                 },
             ),
         )
@@ -642,6 +649,7 @@ async fn concurrent_transactions_are_individually_atomic() {
                                 ),
                             ],
                             preconditions: vec![],
+                            write_conditions: vec![],
                         },
                     ),
                 )
@@ -734,6 +742,7 @@ async fn violated_precondition_aborts_the_whole_transaction() {
                     lower_key.clone(),
                     Some(b"wrong-expected-value".to_vec()),
                 )],
+                write_conditions: vec![],
             },
         ),
     )

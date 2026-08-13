@@ -186,24 +186,35 @@ Three modules:
   see the Key invariants entry below.
 - **Single-participant transactions — `txn_stage`/`txn_decide`/`txn_write`**
   (ADR 0018 §2/PR3) — the degenerate single-Raft-group 2PC. `txn_stage(table,
-  writes) -> Option<(TxnId, Vec<u8>)>` proposes `KvCommand::TxnStage` (the
-  first write's key is the *anchor*, whose partition token anchors the
-  record — see `txn.rs`; `table` is embedded into every intent as
-  `record_table`, ADR 0018 §2/PR4) and returns the minted `TxnId` + record
-  key once applied. `txn_decide(txn_id, record_key, keys, commit) ->
-  Option<HlcTimestamp>` commits or aborts, then resolves every key in
-  `keys` — three log entries, fully synchronous; this remains the
-  single-participant/anchor-local convenience (`keys` must all be local to
-  the anchor). `txn_write(table, writes) -> Option<HlcTimestamp>` is the
-  one-shot commit-only convenience (`txn_stage` + `txn_decide(.., commit:
-  true)`). All leader-only (`None` if not leader / a phase times out).
+  writes, conditions) -> Option<(TxnId, Vec<u8>, StageOutcome)>` proposes
+  `KvCommand::TxnStage` (the first write's key is the *anchor*, whose
+  partition token anchors the record — see `txn.rs`; `table` is embedded
+  into every intent as `record_table`, ADR 0018 §2/PR4; `conditions`/
+  `StageOutcome` are the apply-time write-key conditions amendment, see the
+  bullet below) and returns the minted `TxnId` + record key + outcome once
+  the entry applies (`Option` still means only "not leader / never
+  applied" — whether the stage's *content* actually landed is now
+  `StageOutcome`, not the `Option` itself). `txn_decide(txn_id, record_key,
+  keys, commit) -> Option<HlcTimestamp>` commits or aborts, then resolves
+  every key in `keys` — three log entries, fully synchronous; this remains
+  the single-participant/anchor-local convenience (`keys` must all be
+  local to the anchor). `txn_write(table, writes) -> Option<HlcTimestamp>`
+  is the one-shot commit-only convenience (`txn_stage` + `txn_decide(..,
+  commit: true)`, `conditions: Vec::new()`) — since the amendment below, it
+  also checks `txn_stage`'s returned `StageOutcome` and returns `None`
+  rather than proceeding to decide if the stage didn't genuinely land (a
+  latent gap this convenience had before: `Option::is_some()` alone used
+  to mean only "the entry applied," not "my writes actually staged"). All
+  leader-only (`None` if not leader / a phase times out).
 - **Multi-participant transactions** (ADR 0018 §2/PR4) — the primitives a
   cross-tablet coordinator (`animusd::ClientCtx::cp_txn`) composes; see the
   ADR's PR4 amendment for the full protocol.
-  `txn_stage_participant(txn_id, record_key, record_table, writes) ->
-  Option<HlcTimestamp>` stages a **non-anchor** participant's writes as
-  intents referencing an already-known anchor record — no record is
-  created or touched on this group. `txn_commit_at_least(txn_id,
+  `txn_stage_participant(txn_id, record_key, record_table, writes,
+  conditions) -> Option<(HlcTimestamp, StageOutcome)>` stages a
+  **non-anchor** participant's writes as intents referencing an
+  already-known anchor record — no record is created or touched on this
+  group; `conditions`/`StageOutcome` are the apply-time write-key
+  conditions amendment, see the bullet below. `txn_commit_at_least(txn_id,
   record_key, min_ts) -> Option<HlcTimestamp>` commits the anchor's record
   at a ts that strictly exceeds both `min_ts` (the coordinator's
   candidate — the max of every participant's acked stage ts) and this
@@ -226,13 +237,14 @@ Three modules:
   externally-obtained status (from a cross-tablet query), re-checking the
   key still holds that exact intent first.
 - **In-doubt recovery** (ADR 0018 §2/PR5) — `txn_stage_anchor(table,
-  writes, participant_spans) -> Option<(TxnId, Vec<u8>)>` is the general
-  anchor-stage entry point (`txn_stage` is now a thin wrapper passing an
-  empty `participant_spans`): `participant_spans` names every *other*
-  participant's `(table, span)` pairs, merged into the freshly-created
-  record's `intent_spans` alongside this stage's own — the structural fix
-  that gives recovery something to verify participants against at all (see
-  `txn::TxnRecord::intent_spans`'s doc). `txn_abort(txn_id, record_key) ->
+  writes, participant_spans, conditions) -> Option<(TxnId, Vec<u8>,
+  StageOutcome)>` is the general anchor-stage entry point (`txn_stage` is
+  now a thin wrapper passing an empty `participant_spans`/`conditions`):
+  `participant_spans` names every *other* participant's `(table, span)`
+  pairs, merged into the freshly-created record's `intent_spans` alongside
+  this stage's own — the structural fix that gives recovery something to
+  verify participants against at all (see `txn::TxnRecord::intent_spans`'s
+  doc). `txn_abort(txn_id, record_key) ->
   Option<HlcTimestamp>` is the abort-only dual of `txn_commit_at_least` (no
   inline resolve). `txn_record_view(record_key) -> Option<TxnRecordView>`
   is the recovery-view dual of `txn_status_local` (also returns
@@ -250,6 +262,25 @@ Three modules:
   entry below for the tracker's insert/remove rules and rebuild-at-start
   source, and `animusd::txn_recover`/`txn_resolver_loop` for how these
   compose into the actual push protocol.
+- **Apply-time write-key conditions** (ADR 0018 §2 follow-up amendment) —
+  `KvCommand::TxnStage` gained `conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>`:
+  own-key byte-level OCC (`Cas`-shaped — `Some(bytes)` must equal exactly,
+  `None` must be absent), checked at apply against the key's pre-intent
+  committed value, whole-or-nothing across the stage like every other
+  `TxnStage` rejection. `StageOutcome` (`pub`, re-exported) is the
+  per-stage introspection this feeds — `Staged`/`ConditionFailed { key
+  }`/`IntentBlocked { key, txn_id }`/`Fenced` — recorded at apply time keyed
+  by Raft log index exactly like `Cas`'s own `CasResults`, read back via
+  `stage_outcome(index)`. `ConditionFailed` is final (retrying an identical
+  stage changes nothing); `IntentBlocked` is the pre-existing PR6
+  foreign-intent no-op, now named instead of only inferred after the fact;
+  `Fenced` covers a fence/seal miss or a late anchor stage racing an
+  already-decided record. Layering: this crate speaks bytes only — a
+  richer caller (the Dynamo edge, `animusd::dynamo::run_transact`)
+  evaluates its own expression against a pre-read and compiles a true
+  result down to this exact byte-equality shape. See the ADR's
+  2026-08-12 follow-up amendment for the full design, including a
+  corpus-found gotcha in the introspection primitive itself (below).
 - **Admin/debug accessors** (ADR 0020, consumed by `animusd`) — read-only
   `role`/`term`/`commit_index`/`last_applied`/`durable_index`/
   `snapshot_index`/`log_len` (thin locks over `RaftCore`), and `storage()` (a
@@ -424,6 +455,26 @@ State once here; cross-referenced from the sections below.
   racing from the same `expected` have exactly one winner (whichever Raft
   ordered first). Outcome is stashed in driver `CasResults` keyed by the log
   index (a `BTreeMap<u64,bool>`).
+- **`TxnStage`'s own-key conditions are decided at *apply* time too (ADR
+  0018 §2 follow-up amendment), the identical CAS-style discipline** —
+  `conditions: Vec<(key, expected)>` evaluated against each key's current
+  committed value inside the same apply arm that decides the pre-existing
+  fence/seal/foreign-intent gates, recording a `StageOutcome` per Raft log
+  index in a driver `StageOutcomes` (`BTreeMap<u64, StageOutcome>`)
+  mirroring `CasResults` exactly. **`wait_applied(index).await == true`
+  does NOT imply `stage_outcome(index)` is `Some` — found by the ADR 0018
+  §4 corpus at `ANIMUS_TXN_SEEDS=5`**: a snapshot install (a replica
+  catching up after losing leadership) can advance `engine_applied` past
+  `index` without this replica ever individually applying — hence
+  recording an outcome for — the entry at that exact index (the install
+  globs many commands together). `txn_stage_anchor`/`_participant` poll
+  `stage_outcome` directly instead (`wait_stage_outcome`, mirroring
+  `compare_and_swap`'s own outcome-polling loop, which never had this bug
+  since it was never a separate wait-then-fetch step) — `None` on timeout,
+  the same "give up, caller retries" contract every other propose-and-wait
+  method here already has, never a hard-`expect`ed fact that turns out not
+  to be guaranteed. See the ADR's 2026-08-12 amendment and
+  `docs/engineering-lessons.md` for the general lesson.
 - **The value envelope + single-participant transactions (ADR 0018 §2/PR3,
   `txn.rs`).** Every value the apply path merges into the engine
   (`Put`/`Batch`/`Cas`, and a `TxnResolve`'s final rewrite) is 1-byte-tagged:
@@ -1133,6 +1184,22 @@ API (which always mints a *fresh* id) cannot express.
   stage is now rejected outright, so the second transaction's own later
   abort-restore correctly finds the first transaction's real committed
   value, never a stale intent).
+- `txn_conditions.rs` (ADR 0018 §2 follow-up amendment) — the apply-time
+  write-key conditions suite, single-Raft-group harness style like
+  `txn_single.rs` (conditions are entirely a `TxnStage` apply-arm concern,
+  no multi-participant coordinator needed): a matching condition (present
+  value, and separately "must be absent" on a genuinely absent key) stages
+  and commits; a mismatched value and a violated "must be absent" both
+  reject the whole stage as `ConditionFailed { key }`, the absence case
+  proven with a *second*, unconditioned key in the same multi-key stage to
+  show whole-or-nothing (neither key staged, not just the conditioned
+  one); a key already holding a *different* transaction's unresolved
+  intent reports `IntentBlocked`, not `ConditionFailed`, even when the
+  condition would (irrelevantly) have evaluated true against the
+  blocker's own staged value — proving the foreign-intent gate is checked
+  before a condition is ever evaluated, per the priority order the ADR
+  amendment settles; crash/restart WAL-replay idempotency for a
+  condition-gated commit; a five-seed determinism sweep.
 - `snapshot_reads.rs` (ADR 0018 §2/PR2b) — `read_at`/`scan_at` directly:
   each sees exactly the version committed at or before `ts` (including a
   value strictly between two writes' timestamps, and `scan_at` across

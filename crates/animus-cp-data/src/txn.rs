@@ -194,6 +194,50 @@ pub enum TxnOutcome {
     Aborted,
 }
 
+/// The result of one **apply-time `TxnStage`** attempt (ADR 0018 §2 apply-time
+/// write-key conditions amendment), recorded per Raft log index the same way
+/// `CasResults` records a `Cas`'s outcome — every replica computes the
+/// identical value deterministically (same commit order, same committed
+/// engine state), so a proposer can poll for it once its entry applies.
+///
+/// **Distinguishing *why* a stage no-op'd, not just *whether* it did, is the
+/// whole point of this type** — the three no-op reasons need different
+/// coordinator reactions: [`ConditionFailed`](Self::ConditionFailed) is a
+/// **final** cancellation (retrying changes nothing — the condition was
+/// evaluated against the current committed value, so retrying without a
+/// fresh client-side re-read would just fail identically); the
+/// `KvCommand::TxnStage` doc's foreign-intent no-op
+/// ([`IntentBlocked`](Self::IntentBlocked)) is worth **retrying** once the
+/// blocker clears (the coordinator pushes it, ADR 0018 §2/PR6); a fence/seal
+/// miss or a late anchor stage racing an already-decided record
+/// ([`Fenced`](Self::Fenced)) means this replica structurally cannot serve
+/// this stage at all (the coordinator's routing was stale, or a recovery
+/// pusher won the race) — also not worth retrying the identical stage
+/// unchanged.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StageOutcome {
+    /// Every write in this stage landed as an intent (and, for the anchor,
+    /// its `Pending` record was created).
+    Staged,
+    /// A key in `conditions` did not hold the expected committed value (or
+    /// expected absence) — the whole stage no-op'd, whole-or-nothing, like
+    /// every other `TxnStage` rejection. `key` is the first condition that
+    /// failed (evaluated in `conditions`' own order).
+    ConditionFailed { key: Vec<u8> },
+    /// A key in `writes` already held a **different** transaction's
+    /// unresolved intent (`KvCommand::TxnStage`'s writer-push-intents guard,
+    /// ADR 0018 §2/PR6) — the whole stage no-op'd. `txn_id` is the blocking
+    /// transaction, so a pusher can push it directly.
+    IntentBlocked { key: Vec<u8>, txn_id: TxnId },
+    /// The stage was rejected for a structural reason unrelated to this
+    /// transaction's own conditions or a foreign intent: a key (or the
+    /// anchor's own record key) fell outside this group's current fence/was
+    /// already sealed out, or (anchor-only) this exact `txn_id`'s record was
+    /// already decided by a concurrent recovery push before this genuine
+    /// stage arrived (see `KvCommand::TxnStage`'s resurrection-guard doc).
+    Fenced,
+}
+
 /// A transaction's status as observed by a caller with **no local record
 /// access** (ADR 0018 §2/PR4) — the public mirror of [`TxnStatus`] a
 /// cross-tablet `TxnStatus` query (or any other external caller) reads back.

@@ -189,7 +189,7 @@ fn abort_path_restores_the_value_that_existed_before_the_intent() {
     // Stage a would-be overwrite, then decide to ABORT it.
     let n = nodes[l].clone();
     let kk = k.clone();
-    let (txn_id, record_key) = drive(&mut sim, nodes[l].env(), SETTLE, async move {
+    let (txn_id, record_key, _outcome) = drive(&mut sim, nodes[l].env(), SETTLE, async move {
         n.txn_stage("t", vec![(kk, Some(b"staged".to_vec()))]).await
     })
     .flatten()
@@ -255,7 +255,7 @@ fn a_pending_read_blocks_then_serves_once_committed() {
     let k = key(b"acct-4", b"balance");
     let n = nodes[l].clone();
     let kk = k.clone();
-    let (txn_id, record_key) = drive(&mut sim, nodes[l].env(), SETTLE, async move {
+    let (txn_id, record_key, _outcome) = drive(&mut sim, nodes[l].env(), SETTLE, async move {
         n.txn_stage("t", vec![(kk, Some(b"new".to_vec()))]).await
     })
     .flatten()

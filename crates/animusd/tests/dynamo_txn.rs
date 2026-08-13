@@ -188,6 +188,7 @@ async fn prepare_via_any_node(
                     record_key,
                     record_table,
                     ts,
+                    outcome: _,
                 } = call_forwarded(addr, request.clone()).await
                 {
                     return (txn_id, record_key, record_table, ts);
@@ -672,6 +673,7 @@ async fn admin_txns_shows_a_pending_record_then_clears_after_recovery() {
             table: "admintxn".to_string(),
             anchor: None,
             writes: vec![(b"admin-txn-key".to_vec(), Some(b"pending-value".to_vec()))],
+            conditions: Vec::new(),
         },
     )
     .await;
@@ -760,6 +762,237 @@ async fn admin_txns_shows_a_pending_record_then_clears_after_recovery() {
     .await
     .expect("admin-txn-key never converged to committed");
     assert_eq!(got, ClientResponse::Value(Some(b"pending-value".to_vec())));
+
+    for node in &nodes {
+        node.shutdown();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// (f) ADR 0018 §2 apply-time write-key conditions amendment: a write
+// action's own `ConditionExpression` now has real CROSS-NODE OCC, not just
+// the same-node protection `concurrent_transact_write_items_on_a_shared_
+// key_resolve_one_winner` above already proved.
+// ---------------------------------------------------------------------------
+
+/// **The test PR7 couldn't write.** Two clients on DIFFERENT nodes both read
+/// the same (absent) initial state and race a `TransactWriteItems` whose own
+/// `Put` carries a condition on that exact key it also writes — the
+/// self-referential case the PR7 amendment documented as protected only by
+/// `ctx.data().rmw_lock` (same-node only). Since this amendment, the
+/// condition is checked at *apply* time on the tablet itself
+/// (`animus_cp_data::KvCommand::TxnStage`'s `conditions`), so which node
+/// issued the request no longer matters: exactly one commits, the loser gets
+/// a genuine `TransactionCanceledException`, and the final state reflects
+/// exactly one write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn cross_node_racing_own_key_conditional_writes_resolve_exactly_one_winner() {
+    let n = 3;
+    let dir = tempfile::tempdir().unwrap();
+    let (nodes, config) = bring_up(n, dir.path()).await;
+    await_bootstrap(&nodes).await;
+    let addr_a = config.nodes[0].dynamo;
+    let addr_b = config.nodes[1].dynamo;
+
+    let (status, body) = dynamo(
+        addr_a,
+        "DynamoDB_20120810.CreateTable",
+        r#"{"TableName":"txitems_cross","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
+            "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}]}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "CreateTable failed: {body}");
+
+    let table = "txitems_cross".to_string();
+    let shared = "cross-node-shared".to_string();
+    let body_a = format!(
+        r#"{{"TransactItems":[
+            {{"Put":{{"TableName":"{table}","Item":{{"id":{{"S":"{shared}"}},"owner":{{"S":"a"}}}},
+                    "ConditionExpression":"attribute_not_exists(id)"}}}}]}}"#
+    );
+    let body_b = format!(
+        r#"{{"TransactItems":[
+            {{"Put":{{"TableName":"{table}","Item":{{"id":{{"S":"{shared}"}},"owner":{{"S":"b"}}}},
+                    "ConditionExpression":"attribute_not_exists(id)"}}}}]}}"#
+    );
+
+    let (resp_a, resp_b) = timeout(Duration::from_secs(15), async {
+        tokio::join!(
+            dynamo(addr_a, "DynamoDB_20120810.TransactWriteItems", &body_a),
+            dynamo(addr_b, "DynamoDB_20120810.TransactWriteItems", &body_b),
+        )
+    })
+    .await
+    .expect("racing cross-node conditional writes did not both resolve within 15s");
+
+    let wins = [&resp_a, &resp_b].iter().filter(|(s, _)| *s == 200).count();
+    assert_eq!(
+        wins, 1,
+        "exactly one cross-node racing transaction should commit, got a={resp_a:?} b={resp_b:?}"
+    );
+    let (loser_status, loser_body) = if resp_a.0 == 200 { &resp_b } else { &resp_a };
+    assert_eq!(
+        *loser_status, 400,
+        "the losing cross-node transaction must be cancelled: {loser_body}"
+    );
+    assert!(
+        loser_body.contains("TransactionCanceledException"),
+        "expected TransactionCanceledException, got: {loser_body}"
+    );
+
+    // Final state, read from a THIRD node, reflects exactly one write.
+    let (status, body) = dynamo(
+        config.nodes[2 % n].dynamo,
+        "DynamoDB_20120810.GetItem",
+        &format!(r#"{{"TableName":"{table}","Key":{{"id":{{"S":"{shared}"}}}}}}"#),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(
+        body.contains(r#""owner":{"S":"a"}"#) || body.contains(r#""owner":{"S":"b"}"#),
+        "the shared key must reflect exactly one committed write, not both/neither: {body}"
+    );
+
+    for node in &nodes {
+        node.shutdown();
+    }
+}
+
+/// **An own-key condition failure cancels a multi-tablet transaction
+/// wholly** — the own-key-condition counterpart of `failing_condition_
+/// check_cancels_the_whole_transaction` above (which exercises a
+/// `ConditionCheck` action's failure, a structurally different code path).
+/// The conditioned `Put` targets one tablet (below the split) and fails its
+/// own condition; the other tablet's action (above the split, no condition
+/// of its own) must never land either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn own_key_condition_failure_cancels_a_multi_tablet_transaction_wholly() {
+    let n = 3;
+    let dir = tempfile::tempdir().unwrap();
+    let (nodes, config) = bring_up(n, dir.path()).await;
+    await_bootstrap(&nodes).await;
+    let addr0 = config.nodes[0].dynamo;
+    let client0 = config.nodes[0].client;
+
+    let (lower_id, upper_id) = create_table_pre_split(&nodes, addr0, client0, "txitems_e").await;
+
+    // Pre-seed the lower-tablet key so its own `attribute_not_exists`
+    // condition is guaranteed to fail.
+    let (status, body) = dynamo(
+        addr0,
+        "DynamoDB_20120810.PutItem",
+        &format!(
+            r#"{{"TableName":"txitems_e","Item":{{"id":{{"S":"{lower_id}"}},"v":{{"S":"original"}}}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "pre-seed failed: {body}");
+
+    let (status, body) = dynamo(
+        addr0,
+        "DynamoDB_20120810.TransactWriteItems",
+        &format!(
+            r#"{{"TransactItems":[
+                {{"Put":{{"TableName":"txitems_e","Item":{{"id":{{"S":"{lower_id}"}},"v":{{"S":"overwrite"}}}},
+                        "ConditionExpression":"attribute_not_exists(id)"}}}},
+                {{"Put":{{"TableName":"txitems_e","Item":{{"id":{{"S":"{upper_id}"}},"v":{{"S":"should-not-land"}}}}}}}}]}}"#
+        ),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "the own-key condition failure should cancel the whole transaction: {body}"
+    );
+    assert!(
+        body.contains("TransactionCanceledException"),
+        "expected TransactionCanceledException, got: {body}"
+    );
+
+    // The conditioned key keeps its ORIGINAL value, never the overwrite.
+    let (status, body) = dynamo(
+        addr0,
+        "DynamoDB_20120810.GetItem",
+        &format!(r#"{{"TableName":"txitems_e","Key":{{"id":{{"S":"{lower_id}"}}}}}}"#),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(
+        body.contains(r#""v":{"S":"original"}"#),
+        "the conditioned key must keep its original value, never the overwrite: {body}"
+    );
+
+    // The OTHER tablet's action — carrying no condition of its own — must
+    // never have landed either: no partial state on the other tablet.
+    let (status, body) = dynamo(
+        addr0,
+        "DynamoDB_20120810.GetItem",
+        &format!(r#"{{"TableName":"txitems_e","Key":{{"id":{{"S":"{upper_id}"}}}}}}"#),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        body, "{}",
+        "the OTHER tablet's action must never land when an own-key condition on a \
+         DIFFERENT tablet fails: {body}"
+    );
+
+    for node in &nodes {
+        node.shutdown();
+    }
+}
+
+/// **The PR7 stall regression stays dead.** A `TransactWriteItems` `Put`
+/// carrying a `ConditionExpression` on its own key — the exact shape that,
+/// before PR7's fix, fed the pre-read into `cp_txn`'s cross-key precondition
+/// mechanism and stalled for `RECOVERY_GRACE` (5s) waiting on its own
+/// in-flight intent (see `run_transact`'s doc). PR7's own fix (never routing
+/// a write's own condition through that mechanism) already killed the
+/// stall; this amendment's apply-time OCC must not reintroduce it — and
+/// structurally can't, since the condition is checked once, inside the same
+/// atomic apply step that stages the intent, never as a second read of a
+/// key this same transaction just staged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn own_key_condition_completes_quickly_with_no_recovery_grace_stall() {
+    let n = 3;
+    let dir = tempfile::tempdir().unwrap();
+    let (nodes, config) = bring_up(n, dir.path()).await;
+    await_bootstrap(&nodes).await;
+    let addr0 = config.nodes[0].dynamo;
+
+    let (status, body) = dynamo(
+        addr0,
+        "DynamoDB_20120810.CreateTable",
+        r#"{"TableName":"txitems_f","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
+            "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}]}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "CreateTable failed: {body}");
+
+    let started = std::time::Instant::now();
+    let (status, body) = timeout(
+        Duration::from_secs(2),
+        dynamo(
+            addr0,
+            "DynamoDB_20120810.TransactWriteItems",
+            r#"{"TransactItems":[
+                {"Put":{"TableName":"txitems_f","Item":{"id":{"S":"stall-guard"},"v":{"S":"v1"}},
+                        "ConditionExpression":"attribute_not_exists(id)"}}]}"#,
+        ),
+    )
+    .await
+    .expect(
+        "an own-key conditioned TransactWriteItems must complete within 2s, never stall for \
+         RECOVERY_GRACE (the PR7 stall-bug shape)",
+    );
+    assert_eq!(
+        status, 200,
+        "the own-key conditioned transaction should commit: {body}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "own-key condition must not stall (elapsed={:?})",
+        started.elapsed()
+    );
 
     for node in &nodes {
         node.shutdown();
