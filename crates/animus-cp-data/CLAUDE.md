@@ -218,6 +218,18 @@ Three modules:
   position in the log, so an edge-chosen one would silently mis-order the log
   DynamoDB Streams will read (ADR 0041 §4a) and could even differ across
   replicas.
+  **`local_get_kind(kind, key)` / `local_scan_kind(kind, start, end)`** are the
+  read side — an LSI `Query`, and the GSI drain's sweep of change records
+  (whose keys are HLC-suffixed, so key order *is* commit order). Deliberately
+  simpler than `local_get`/`local_scan`: a non-base scope only ever holds
+  **committed** values, because only `KindBatch` writes those scopes and
+  `TxnStage` stages intents solely on client-named (base-kind) keys — so there
+  is no intent to resolve, and a non-committed envelope reads as *absent*
+  rather than being silently unwrapped. `local_scan_kind` is bounded on both
+  ends on purpose: every caller scans one partition's contiguous sub-range, and
+  an unbounded form would make an accidental full-tablet read easy to write. An
+  unknown kind reads absent / scans empty rather than aliasing onto a real
+  scope.
 - **Fenced commands** (ADR 0026) — `put_fenced`/`delete_fenced`/`cas_fenced`/
   `put_batch_fenced` (and unfenced siblings using `KeyRange::whole()`) carry a
   `fence: KeyRange` *inside the proposed command*, stamped by the leader at

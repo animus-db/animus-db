@@ -333,3 +333,59 @@ fn the_change_log_key_is_the_entrys_own_commit_timestamp() {
         "each suffix is a packed 8-byte HLC (seed={seed})"
     );
 }
+
+#[test]
+fn kind_scoped_reads_see_their_own_scope_and_no_other() {
+    let seed = 0x0041_0005;
+    let (mut sim, nodes) = group(seed);
+    sim.run_for(Duration::from_secs(2));
+    let l = leader(&nodes, seed);
+
+    let base = logical(b"alice", b"");
+    let row_a = logical(b"alice", b"\x01a");
+    let row_b = logical(b"alice", b"\x01b");
+
+    assert!(matches!(
+        nodes[l].put_kind_batch(
+            vec![
+                (KIND_BASE, base.clone(), Some(b"item".to_vec())),
+                (KIND_LSI, row_a.clone(), Some(b"ra".to_vec())),
+                (KIND_LSI, row_b.clone(), Some(b"rb".to_vec())),
+            ],
+            None,
+        ),
+        ProposeResult::Accepted { .. }
+    ));
+    sim.run_for(Duration::from_secs(2));
+
+    // A kind read sees its own scope's value...
+    assert_eq!(
+        block_on(nodes[l].local_get_kind(KIND_LSI, &row_a)),
+        Some(b"ra".to_vec())
+    );
+    // ...and never another kind's, even for a key that exists there.
+    assert_eq!(block_on(nodes[l].local_get_kind(KIND_LSI, &base)), None);
+    assert_eq!(block_on(nodes[l].local_get_kind(KIND_CHANGE, &row_a)), None);
+    // The base row stays invisible to the LSI scope and vice versa.
+    assert_eq!(block_on(nodes[l].local_get(&row_a)), None);
+
+    // A scan is ordered, confined to its scope, and honours its bounds.
+    let mut end = logical(b"alice", b"\x01");
+    *end.last_mut().unwrap() += 1;
+    let rows = block_on(nodes[l].local_scan_kind(KIND_LSI, &logical(b"alice", b"\x01"), &end));
+    assert_eq!(
+        rows,
+        vec![
+            (row_a.clone(), b"ra".to_vec()),
+            (row_b.clone(), b"rb".to_vec())
+        ]
+    );
+    assert!(
+        block_on(nodes[l].local_scan_kind(KIND_CHANGE, &logical(b"alice", b"\x01"), &end))
+            .is_empty()
+    );
+
+    // An unknown kind is inert rather than aliasing onto a real scope.
+    assert_eq!(block_on(nodes[l].local_get_kind(200, &base)), None);
+    assert!(block_on(nodes[l].local_scan_kind(200, &base, &end)).is_empty());
+}

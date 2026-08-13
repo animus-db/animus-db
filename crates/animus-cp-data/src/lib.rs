@@ -2944,6 +2944,69 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         }
     }
 
+    /// Read one key of a **non-base row-kind scope** (ADR 0041 §3) — an LSI
+    /// row, a footprint, or a change-log record.
+    ///
+    /// Deliberately simpler than [`local_get`](Self::local_get): those scopes
+    /// only ever hold **committed** values, so there is no intent to resolve.
+    /// Only [`KvCommand::KindBatch`] writes them, and it always commits
+    /// outright; `TxnStage` stages intents solely on keys a client named, which
+    /// are base-kind keys by construction. A non-committed envelope here would
+    /// mean that invariant had broken, so it reads as absent rather than being
+    /// silently unwrapped.
+    ///
+    /// An unknown `kind` reads as absent.
+    pub async fn local_get_kind(&self, kind: u8, key: &[u8]) -> Option<Vec<u8>> {
+        let scope = self.kind_scopes.get(kind as usize)?;
+        let vv = self
+            .storage
+            .get(&scope.physical(key))
+            .await
+            .ok()
+            .flatten()?;
+        match txn::decode_envelope(&vv.value) {
+            txn::Envelope::Committed(v) => Some(v),
+            txn::Envelope::Intent { .. } => None,
+        }
+    }
+
+    /// Scan a **non-base row-kind scope** (ADR 0041 §3) over `[start, end)`,
+    /// in key order, returning committed values only.
+    ///
+    /// The read primitive behind an LSI `Query` (the `KIND_LSI` scope) and the
+    /// GSI drain's sweep of pending change records (`KIND_CHANGE`, whose keys
+    /// are HLC-suffixed, so key order *is* commit order). Bounded on both ends:
+    /// unlike [`local_scan`](Self::local_scan) there is no unbounded-above
+    /// form, because every caller here scans one partition's contiguous
+    /// sub-range and an accidental whole-scope scan would be a silent
+    /// full-tablet read.
+    ///
+    /// An unknown `kind` scans as empty.
+    pub async fn local_scan_kind(
+        &self,
+        kind: u8,
+        start: &[u8],
+        end: &[u8],
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let Some(scope) = self.kind_scopes.get(kind as usize) else {
+            return Vec::new();
+        };
+        self.storage
+            .scan(&scope.physical(start), &scope.physical(end))
+            .await
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(|(k, vv)| {
+                let logical = scope.strip_in_range(&k)?.to_vec();
+                match txn::decode_envelope(&vv.value) {
+                    txn::Envelope::Committed(v) => Some((logical, v)),
+                    txn::Envelope::Intent { .. } => None,
+                }
+            })
+            .collect()
+    }
+
     /// A **linearizable** read of `key` via **ReadIndex** (ADR 0017): only the
     /// leader can serve it. Records `read_index = commit_index`, confirms it is
     /// still leader by a quorum of peers acking its current term (a read-barrier
