@@ -67,6 +67,30 @@ adapter wedge. The transport (HTTP, sockets) and the distributed routing live in
   the catalog.
 - `storage_key(pk, sk)` — the data-plane key for an item, exposed so a caller
   can route an item through `animus-data` without instantiating a local `Table`.
+- `index` module (**ADR 0041, codec only — not yet wired**) — every byte layout
+  materialized secondary indexes introduce, kept pure so the `animusd` edge, the
+  CQL edge and the drain agree by construction. Like `storage_key` these are
+  **within-table** keys: the ADR 0022 partition token is prepended at the
+  `animusd` edge, and each builder documents *which* value to token-hash (the
+  base partition key for base/LSI/marker keys, the **index hash value** for a GSI
+  row — that difference is why a GSI is a separate table). Row kinds within a
+  base partition are separated by one discriminator byte after `escape(pk)`:
+  `KIND_BASE` `0x00` (`base_row_key`), `KIND_LSI` `0x01` (`lsi_row_key` /
+  `lsi_index_prefix`), `KIND_CHANGE` `0x02` (`change_record_key` /
+  `change_prefix`), `KIND_FOOTPRINT` `0x03` (`footprint_key`); `row_kind` reads it
+  back and `range_end` bounds any prefix. A GSI row needs no discriminator
+  (`gsi_row_key` / `gsi_hash_prefix` / `gsi_hash_sort_prefix`), living in the
+  hidden table `index_table_name(base, index)` = `<base>$<index>`
+  (`split_index_table_name` / `is_index_table_name`). `parse_gsi_row_key` /
+  `parse_lsi_row_key` recover the base key by peeling escaped segments —
+  `parse_gsi_row_key` takes a `composite` flag because a hash-only index's
+  `escape(base_pk)` sits exactly where a composite index's `escape(isort)` would,
+  so the layout is otherwise ambiguous. `IndexFootprint` (of `ItemFootprint` /
+  `FootprintEntry`) records *where* an item's GSI rows are, never their values —
+  the drain deletes whatever it names that a recomputation didn't produce, which
+  is what makes a stale row structurally impossible. `ChangeRecord` carries
+  `base_sk` + old/new images and `event_name()`
+  (`INSERT`/`MODIFY`/`REMOVE`).
 - `wire` module — the DynamoDB JSON translation: `decode_request(target, body)
   -> Operation` (CreateTable/PutItem/GetItem/DeleteItem/Query/Scan/**UpdateItem**/
   **BatchWriteItem**/**TransactWriteItems**/**TransactGetItems**; `CreateTable`
@@ -98,8 +122,8 @@ adapter wedge. The transport (HTTP, sockets) and the distributed routing live in
 
 ## What's non-obvious
 
-- The `wire`, `condition`, `registry`, and `schema` modules are all **pure** — no
-  I/O, no storage, no network, `BTreeMap`/`BTreeSet` only (ADR 0003).
+- The `wire`, `condition`, `registry`, `schema`, and `index` modules are all
+  **pure** — no I/O, no storage, no network, `BTreeMap`/`BTreeSet` only (ADR 0003).
   `animusd::dynamo` owns the HTTP edge, **proposes `CreateTable`'s key schema into
   the control plane's replicated catalog (ADR 0013)** and reads schemas back from
   `Metadata`, holds one process-wide `SchemaRegistry` (now only GSI/LSI + the
@@ -225,7 +249,15 @@ decode + index projection types, base64 round-trip, tombstone, sort/condition
 predicates, GSI/LSI write/overwrite/delete + index
 query, multiple GSIs, composite-index sort narrowing, `sync_indexes` preserving
 entries on an unchanged shape + dropping a removed index, and the DynamoDB↔control
-`TableSchema` + `IndexDef` bridge). The wire protocol is exercised end-to-end over real HTTP in
+`TableSchema` + `IndexDef` bridge), plus `index` unit tests (ADR 0041: the four
+row kinds sorting into disjoint blocks so a base range excludes every other kind,
+prefix-freedom across a partition whose key prefixes another's, change records
+sorting in commit order, base-key recovery from composite/hash-only GSI rows and
+from LSI rows — including values containing `0x00` bytes, two LSIs on one
+partition not interleaving, footprint round-trip + sort-invariance under
+out-of-order insertion, change-record round-trip + event naming, and
+`peel_escaped` rejecting malformed segments).
+The wire protocol is exercised end-to-end over real HTTP in
 `animusd`'s `tests/dynamo_wire.rs` (Put/Get/Delete), `tests/dynamo_extended.rs`
 (CreateTable/Query/conditional writes), `tests/dynamo_indexes.rs` (Scan with
 pagination + filter, and a GSI write-then-query), `tests/dynamo_documents.rs`
