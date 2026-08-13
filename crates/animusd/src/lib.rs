@@ -171,6 +171,22 @@ impl CpGroup {
         }
     }
 
+    /// As [`put_fenced`](Self::put_fenced), but for a **multi-kind atomic
+    /// batch** — base row, LSI rows, footprint and an optional change-log
+    /// record as one Raft entry (ADR 0041 §3/§4). See
+    /// [`RaftKvNode::put_kind_batch_fenced`].
+    fn put_kind_batch_fenced(
+        &self,
+        writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
+        change_log: Option<(Vec<u8>, Vec<u8>)>,
+        fence: KeyRange,
+    ) -> ProposeResult {
+        match self {
+            CpGroup::Lsm(n) => n.put_kind_batch_fenced(writes, change_log, fence),
+            CpGroup::Mem(n) => n.put_kind_batch_fenced(writes, change_log, fence),
+        }
+    }
+
     /// As [`put_fenced`](Self::put_fenced), but for a delete (tombstone). See
     /// [`RaftKvNode::delete_fenced`].
     fn delete_fenced(&self, key: Vec<u8>, fence: KeyRange) -> ProposeResult {
@@ -853,6 +869,27 @@ pub enum ClientRequest {
     PutBatch {
         entries: Vec<(Vec<u8>, Vec<u8>)>,
         table: String,
+    },
+    /// **Internal index-maintenance RPC — never sent bare, only wrapped in
+    /// [`Forwarded`](Self::Forwarded)** (ADR 0041 §3/§4): commit `writes`
+    /// spanning several of one tablet's row-kind scopes, plus an optional
+    /// change-log record, as **one** `KvCommand::KindBatch` Raft entry.
+    ///
+    /// Every key here belongs to the **same tablet** (they share a partition
+    /// key, hence a token — the caller checks this before proposing), which is
+    /// what makes an LSI row atomic with the base row it derives from.
+    ///
+    /// Bare delivery is rejected because this is the DynamoDB edge's own
+    /// maintenance primitive, not a client operation: a client sending one
+    /// could write arbitrary bytes straight into a table's LSI/change-log
+    /// scopes and desynchronise its indexes from its base rows. `Put`/
+    /// `PutBatch` remain the client-facing writes, and they only ever reach
+    /// the base kind.
+    KindWrite {
+        table: String,
+        writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
+        #[serde(default)]
+        change_log: Option<(Vec<u8>, Vec<u8>)>,
     },
     /// Read the latest value at `key` of `table` (linearizable CP ReadIndex on the
     /// group leader). `table` is **required** (ADR 0023).
@@ -3734,6 +3771,101 @@ impl ClientCtx {
     /// arbitrary `N` (the wire edge caps its own surface). Provisions `table`'s first
     /// tablet on demand, like [`cp_write`](Self::cp_write). The bulk-write throughput
     /// primitive behind DynamoDB `BatchWriteItem` and the admin bulk seeder.
+    /// Commit a **multi-kind atomic batch** for one item (ADR 0041 §3/§4):
+    /// `writes` spanning this tablet's base/LSI/footprint scopes plus an
+    /// optional change-log record, as one Raft entry.
+    ///
+    /// Every write must belong to the **same tablet** — they share the item's
+    /// partition key, hence its token. That is checked here rather than
+    /// assumed: a batch straddling two tablets cannot be atomic, and silently
+    /// committing only the first tablet's share is exactly the torn
+    /// base-row-without-its-index-row state this whole mechanism exists to
+    /// prevent. A caller that needs several partitions issues one call each.
+    pub(crate) async fn cp_kind_write(
+        &self,
+        table: &str,
+        writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
+        change_log: Option<(Vec<u8>, Vec<u8>)>,
+    ) -> Result<(), String> {
+        let Some(first) = writes.first().map(|(_, k, _)| k.clone()) else {
+            return Ok(());
+        };
+        // Auto-provision the table's tablet on first write (ADR 0023), as
+        // `cp_write`/`cp_batch_write` do.
+        if !self.effective_metadata().has_table_tablet(table) {
+            self.provision_tablet(table).await?;
+        }
+        let tablet = self
+            .tablet_for(table, &first)
+            .ok_or_else(|| format!("no tablet owns a kind-batch key of table `{table}`"))?;
+        for (_, key, _) in &writes {
+            if self.tablet_for(table, key) != Some(tablet) {
+                return Err(format!(
+                    "kind-batch keys of table `{table}` span more than one tablet; \
+                     an atomic index write must stay within one partition"
+                ));
+            }
+        }
+        match self.cp_route(table, &first).await {
+            CpRoute::Local(leader) => Self::cp_kind_local(&leader, writes, change_log).await,
+            CpRoute::Forward(addr) => {
+                let request = ClientRequest::KindWrite {
+                    table: table.to_owned(),
+                    writes,
+                    change_log,
+                };
+                Self::ok_or_err(
+                    self.cp_forward(table, &first, addr, request).await,
+                    "forwarded CP kind write",
+                )
+            }
+            CpRoute::None => Err("no CP group leader reachable".into()),
+        }
+    }
+
+    /// Propose a `KindBatch` on a **known-leader** local handle and confirm it.
+    ///
+    /// Confirmation probes the batch's **base-kind** write, the one row a
+    /// client can observe: `poll_probe` reads through the group's base scope,
+    /// so an LSI/footprint/change-log write is not observable to it. Every
+    /// caller includes a base write (a put's item, or a delete's tombstone
+    /// *value*), so there is always a probe; a batch with none is refused
+    /// rather than acked unconfirmed — a fenced-out entry commits as a no-op,
+    /// so acking without a probe would falsely report a write that never
+    /// happened (the hazard `cp_batch_local`'s doc spells out).
+    async fn cp_kind_local(
+        leader: &CpGroup,
+        writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
+        change_log: Option<(Vec<u8>, Vec<u8>)>,
+    ) -> Result<(), String> {
+        let probe = writes
+            .iter()
+            .find(|(kind, _, v)| *kind == animus_cp_data::KIND_BASE && v.is_some())
+            .map(|(_, k, v)| (k.clone(), v.clone().expect("filtered to Some")));
+        let Some((probe_key, probe_val)) = probe else {
+            return Err("a kind batch must carry a base-kind write to confirm on".into());
+        };
+        // Pre-propose range check, the same reasoning as `cp_batch_propose`:
+        // a fenced-out entry applies as a no-op, and the probe below would then
+        // just time out with a generic error instead of a clean routing error.
+        let fence = leader.scope_range();
+        for (_, key, _) in &writes {
+            if !fence.contains(key) {
+                return Err("kind write outside this group's live range; retry".into());
+            }
+        }
+        match leader.put_kind_batch_fenced(writes, change_log, fence) {
+            ProposeResult::Accepted { .. } => {}
+            other => return Err(format!("kind write not accepted: {other:?}")),
+        }
+        let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
+        if Self::poll_probe(leader, &probe_key, &probe_val, deadline).await {
+            Ok(())
+        } else {
+            Err("CP kind write did not commit in time".into())
+        }
+    }
+
     pub(crate) async fn cp_batch_write(
         &self,
         table: &str,
@@ -5703,6 +5835,25 @@ impl ClientCtx {
                     Err(e) => ClientResponse::Error(e),
                 }
             }
+            ClientRequest::KindWrite {
+                table,
+                writes,
+                change_log,
+            } => {
+                // Every write shares one tablet (they share a partition key), so
+                // resolve the leader by the first key and serve the whole entry.
+                let Some(first) = writes.first().map(|(_, k, _)| k.clone()) else {
+                    return ClientResponse::PutOk; // empty batch is a no-op
+                };
+                let tablet = self.tablet_for(&table, &first);
+                let Some(leader) = tablet.and_then(|t| self.edge.cp_leader(t)) else {
+                    return self.not_leader_refusal(tablet);
+                };
+                match Self::cp_kind_local(&leader, writes, change_log).await {
+                    Ok(()) => ClientResponse::PutOk,
+                    Err(e) => ClientResponse::Error(e),
+                }
+            }
             ClientRequest::Get { key, table } => {
                 let tablet = self.tablet_for(&table, &key);
                 match tablet.and_then(|t| self.edge.cp_leader(t)) {
@@ -7539,6 +7690,7 @@ fn request_kind(request: &ClientRequest) -> &'static str {
         ClientRequest::Status => "status",
         ClientRequest::Put { .. } => "put",
         ClientRequest::PutBatch { .. } => "put_batch",
+        ClientRequest::KindWrite { .. } => "kind_write",
         ClientRequest::Get { .. } => "get",
         ClientRequest::Scan { .. } => "scan",
         ClientRequest::Delete { .. } => "delete",
@@ -7665,6 +7817,18 @@ async fn handle_request(ctx: &ClientCtx, request: ClientRequest) -> ClientRespon
         // schema-DDL relay gating) does not apply to them — their real
         // handling lives in `ClientCtx::cp_serve_forwarded`'s match,
         // reached only via the `Forwarded` arm above.
+        // ADR 0041 §3/§4: the DynamoDB edge's index-maintenance primitive, not
+        // a client operation — see `ClientRequest::KindWrite`'s doc for why a
+        // bare one is refused rather than served. Like the 2PC RPCs below it is
+        // a data-plane request, not a `MetaCommand`, so `is_relayable_command`
+        // (control-plane schema-DDL relay gating) does not apply; its real
+        // handling lives in `cp_serve_forwarded`'s match, reached only through
+        // the `Forwarded` arm above.
+        ClientRequest::KindWrite { .. } => ClientResponse::Error(
+            "this request is an internal index-maintenance RPC and must be sent wrapped in \
+             `Forwarded`"
+                .into(),
+        ),
         ClientRequest::TxnPrepare { .. }
         | ClientRequest::TxnDecide { .. }
         | ClientRequest::TxnResolve { .. }

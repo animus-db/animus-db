@@ -122,14 +122,16 @@
 use std::collections::BTreeSet;
 use std::time::Duration;
 
+use animus_control::schema::{IndexDef, IndexKind, IndexProjection as CtlProjection};
 use animus_control::{MetaCommand, Metadata, ReplicationMode};
+use animus_cp_data::{KIND_BASE, KIND_LSI};
 use animus_dynamo::wire::{
     self, Operation, Projection, ReturnValues, TransactAction, TransactGet, UpdateAction,
     UpdateReturnValues, WireError, WriteRequest,
 };
 use animus_dynamo::{
-    AttributeValue, ConditionExpression, Item, SortKeyCondition, TableSchema,
-    schema as schema_bridge, storage_key,
+    AttributeValue, ChangeRecord, ConditionExpression, Item, SortKeyCondition, TableSchema,
+    index as dynamo_index, schema as schema_bridge, storage_key,
 };
 use animus_env::Metric;
 use animus_tablet::partition_token;
@@ -398,7 +400,18 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
                 ));
             }
             let value = wire::encode_stored_item(&item);
-            quorum_write(ctx, meta, &table, &key, &value).await?;
+            index_aware_write(
+                ctx,
+                meta,
+                &table,
+                &pk,
+                sk.as_ref(),
+                &key,
+                value,
+                old.as_ref(),
+                Some(&item),
+            )
+            .await?;
             note_put(ctx, &table, &key, &item);
             Ok(wire::write_response(return_values, old.as_ref()))
         }
@@ -432,7 +445,18 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
                 ));
             }
             let value = wire::encode_tombstone();
-            quorum_write(ctx, meta, &table, &data_key, &value).await?;
+            index_aware_write(
+                ctx,
+                meta,
+                &table,
+                &pk,
+                sk.as_ref(),
+                &data_key,
+                value,
+                old.as_ref(),
+                None,
+            )
+            .await?;
             note_delete(ctx, &table, &data_key);
             Ok(wire::write_response(return_values, old.as_ref()))
         }
@@ -1499,6 +1523,156 @@ fn registry_error(err: animus_dynamo::RegistryError) -> WireError {
 /// 0021) builds its rows through this exact function — seeded keys must match
 /// what this edge computes byte-for-byte, or seeded items are unreachable via
 /// `GetItem`/`Query`.
+/// Commit one item write, maintaining this table's colocated index rows and its
+/// change log atomically with the base row when it has any (ADR 0041 §2/§4).
+///
+/// A table with **no** secondary indexes takes the ordinary single-key write
+/// path unchanged, so it pays nothing for machinery it does not use.
+#[allow(clippy::too_many_arguments)] // one item write's full identity + before/after
+async fn index_aware_write(
+    ctx: &ClientCtx,
+    meta: &Metadata,
+    table: &str,
+    pk: &AttributeValue,
+    sk: Option<&AttributeValue>,
+    base_key: &[u8],
+    base_value: Vec<u8>,
+    old: Option<&Item>,
+    new: Option<&Item>,
+) -> Result<(), WireError> {
+    match kind_writes_for_item(meta, table, pk, sk, base_key, base_value.clone(), old, new) {
+        Some((writes, change_log)) => ctx
+            .cp_kind_write(table, writes, Some(change_log))
+            .await
+            .map_err(|e| internal(&format!("index-maintaining write failed: {e}"))),
+        None => quorum_write(ctx, meta, table, base_key, &base_value).await,
+    }
+}
+
+/// One entry of a multi-kind atomic batch: `(row kind, key, value-or-tombstone)`.
+type KindWrite = (u8, Vec<u8>, Option<Vec<u8>>);
+
+/// A change-log record to append in the same entry: `(key prefix, encoded
+/// record)`. The commit-timestamp suffix is added at apply (ADR 0041 §4a).
+type ChangeLog = (Vec<u8>, Vec<u8>);
+
+/// Everything one item write commits beyond a plain base-row put: the
+/// multi-kind writes and the change-log record that accompanies them.
+type IndexedWrite = (Vec<KindWrite>, ChangeLog);
+
+/// The data-plane key for a within-table key of `pk`'s partition: the ADR 0022
+/// token prefix plus `within`. The token is over `escape(pk)`, exactly as
+/// [`item_key`] computes it, so every row kind of one item lands in the same
+/// tablet — which is what lets them commit atomically (ADR 0041 §2).
+fn token_prefixed(pk: &AttributeValue, within: &[u8]) -> Vec<u8> {
+    let mut key = partition_token(&storage_key(pk, None)).to_vec();
+    key.extend_from_slice(within);
+    key
+}
+
+/// The attributes an index row carries, per its declared projection.
+/// `None` means "every attribute" (`ALL`).
+fn projected_item(item: &Item, base: &TableSchema, idx: &IndexDef) -> Item {
+    let keep: Option<Vec<&str>> = match &idx.projection {
+        CtlProjection::All => None,
+        CtlProjection::KeysOnly => Some(Vec::new()),
+        CtlProjection::Include(extra) => Some(extra.iter().map(String::as_str).collect()),
+    };
+    let Some(extra) = keep else {
+        return item.clone();
+    };
+    // The key attributes are always present, whatever the projection: the base
+    // table's keys (so the row can name its item) plus this index's own.
+    let mut names: Vec<&str> = vec![base.partition_key.as_str()];
+    if let Some(sk) = &base.sort_key {
+        names.push(sk.as_str());
+    }
+    names.push(idx.hash_attribute.as_str());
+    if let Some(sort) = &idx.sort_attribute {
+        names.push(sort.as_str());
+    }
+    names.extend(extra);
+    item.iter()
+        .filter(|(name, _)| names.contains(&name.as_str()))
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect()
+}
+
+/// Build the multi-kind atomic batch one item write commits (ADR 0041 §2/§4):
+/// the base row, this item's LSI rows (adding the new, removing whatever the
+/// previous value occupied), and a change-log record.
+///
+/// **GSI rows are deliberately absent.** A GSI hashes by its own key, so its
+/// rows live in a different table's tablets and cannot join this entry; the
+/// drain materializes them asynchronously from the change record this writes.
+/// An LSI *can* be here precisely because it hashes by the base partition key.
+///
+/// Returns `None` when the table has no secondary indexes at all — the caller
+/// then keeps the plain single-key write path, so an unindexed table pays
+/// nothing for this machinery.
+#[allow(clippy::too_many_arguments)] // one item write's full identity + before/after
+fn kind_writes_for_item(
+    meta: &Metadata,
+    table: &str,
+    pk: &AttributeValue,
+    sk: Option<&AttributeValue>,
+    base_key: &[u8],
+    base_value: Vec<u8>,
+    old: Option<&Item>,
+    new: Option<&Item>,
+) -> Option<IndexedWrite> {
+    let indexes = meta.table_indexes(table);
+    if indexes.is_empty() {
+        return None;
+    }
+    let base = schema_for(meta, table);
+    let base = &base;
+    let mut writes: Vec<KindWrite> = vec![(KIND_BASE, base_key.to_vec(), Some(base_value))];
+
+    for idx in indexes.iter().filter(|i| i.kind == IndexKind::Local) {
+        let Some(sort_attr) = &idx.sort_attribute else {
+            continue; // an LSI always declares one; a malformed def is skipped
+        };
+        let old_alt = old.and_then(|i| i.get(sort_attr));
+        let new_alt = new.and_then(|i| i.get(sort_attr));
+        // Remove the row the previous value occupied, unless it is the very row
+        // the new value writes (an unchanged sort attribute) — deleting and
+        // re-putting the same key in one entry would depend on ordering.
+        if let Some(prev) = old_alt
+            && old_alt != new_alt
+        {
+            writes.push((
+                KIND_LSI,
+                token_prefixed(pk, &dynamo_index::lsi_row_key(pk, &idx.name, prev, sk)),
+                None,
+            ));
+        }
+        if let Some(next) = new_alt {
+            let item = new.expect("a new alt value implies a new item");
+            writes.push((
+                KIND_LSI,
+                token_prefixed(pk, &dynamo_index::lsi_row_key(pk, &idx.name, next, sk)),
+                Some(wire::encode_stored_item(&projected_item(item, base, idx))),
+            ));
+        }
+    }
+
+    // The sort key's raw bytes, derived through the public key codec rather than
+    // `AttributeValue::key_bytes` (crate-private to `animus-dynamo`): the full
+    // storage key minus the partition-key prefix is exactly that suffix.
+    let base_sk = storage_key(pk, sk)[storage_key(pk, None).len()..].to_vec();
+    let record = ChangeRecord {
+        base_sk,
+        old_image: old.cloned(),
+        new_image: new.cloned(),
+    };
+    let change_log = (
+        token_prefixed(pk, &dynamo_index::change_prefix(pk)),
+        record.encode(),
+    );
+    Some((writes, change_log))
+}
+
 pub(crate) fn item_key(pk: &AttributeValue, sk: Option<&AttributeValue>) -> Vec<u8> {
     let pk_escaped = storage_key(pk, None); // == escape(pk)
     let mut key = partition_token(&pk_escaped).to_vec();

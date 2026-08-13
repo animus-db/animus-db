@@ -599,7 +599,24 @@ route below the edge through the same `ClientCtx` CP primitives.
   waits for commit (survives restart); a node reconciles its local registry from
   `Metadata::table_indexes` via `mirror_catalog_schema`/`sync_indexes`. Index
   *entry data* stays in-memory, maintained from observed writes and **lazily
-  backfilled** on first index query (`backfill_index_if_needed`). Base-table
+  backfilled** on first index query (`backfill_index_if_needed`) — still the
+  **read** path, but no longer the only writer: since ADR 0041 an indexed
+  table's `PutItem`/`DeleteItem` goes through `index_aware_write` →
+  `ClientCtx::cp_kind_write`, committing the base row, this item's **LSI rows**
+  (adding the new, removing whatever the previous value occupied) and a
+  **change-log record** as one `KvCommand::KindBatch` Raft entry. An LSI can
+  ride that entry because it hashes by the base partition key; a **GSI cannot**
+  (its rows live in their own hidden table's tablets) and is materialized
+  asynchronously by the drain from those change records. A table with no
+  indexes keeps the plain single-key write path, paying nothing.
+  `ClientRequest::KindWrite` is the forwarding payload — **internal-only,
+  refused bare** (a client could otherwise write arbitrary bytes into a table's
+  LSI/change scopes and desynchronise its indexes), handled only inside
+  `cp_serve_forwarded`; it is a data-plane RPC, not a `MetaCommand`, so
+  `is_relayable_command` does not apply. `cp_kind_write` **verifies every key
+  maps to one tablet** rather than assuming it: a batch straddling two tablets
+  cannot be atomic, and committing only the first tablet's share is exactly the
+  torn base-row-without-its-index-row state the mechanism exists to prevent. Base-table
   `Query`/`Scan` use `cp_scan` (no in-memory key tracking). Surface also covers
   `UpdateItem`/`BatchWriteItem` (condition-gated, per-request/per-tablet
   atomicity only) and, since ADR 0018 §2/PR7, **atomic** `TransactWriteItems`
